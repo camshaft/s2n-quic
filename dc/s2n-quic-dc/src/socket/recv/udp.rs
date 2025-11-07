@@ -2,17 +2,43 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
-    socket::recv::{pool, router::Router},
+    msg::{addr::Addr, cmsg},
+    socket::{pool, recv::router::Router},
     stream::socket::{fd::udp, Socket},
 };
 use std::{io, os::fd::AsRawFd, task::Poll};
 
+/// Receives a packet into a pre-allocated stack buffer and discards it.
+///
+/// This is used as a fallback when the packet allocator is exhausted. We still
+/// need to drain the socket so the kernel doesn't hold packets indefinitely,
+/// but we have no memory to route them into.
+#[inline]
+fn blackhole_recv<S: AsRawFd>(socket: &S) {
+    let mut addr = Addr::default();
+    let mut cmsg_recv = cmsg::Receiver::default();
+    let mut buf = [0u8; 1]; // minimal buffer just to drain one packet
+    let iov = io::IoSliceMut::new(&mut buf);
+    let _ = udp::recv(
+        socket,
+        &mut addr,
+        &mut cmsg_recv,
+        &mut [iov],
+        Default::default(),
+    );
+}
+
 /// Receives packets from a blocking [`std::net::UdpSocket`] and dispatches into the provided [`Router`]
-pub fn blocking<S: AsRawFd, R: Router>(socket: S, mut alloc: pool::Pool, mut router: R) {
+pub fn blocking<S: AsRawFd, R: Router>(socket: S, alloc: pool::Pool, mut router: R) {
     while router.is_open() {
-        let mut unfilled = alloc.alloc_or_grow();
+        let Some(mut unfilled) = alloc.alloc() else {
+            // Allocator exhausted — drain the socket to make progress but discard the packet
+            blackhole_recv(&socket);
+            continue;
+        };
+
         while router.is_open() {
-            let res = unfilled.recv_with(|addr, cmsg, buffer| {
+            let res = unfilled.fill_with(|addr, cmsg, buffer| {
                 udp::recv(&socket, addr, cmsg, &mut [buffer], Default::default())
             });
 
@@ -34,13 +60,20 @@ pub fn blocking<S: AsRawFd, R: Router>(socket: S, mut alloc: pool::Pool, mut rou
 }
 
 /// Receives packets from a non-blocking [`std::net::UdpSocket`] and dispatches into the provided [`Router`]
-pub async fn non_blocking<S: Socket, R: Router>(socket: S, mut alloc: pool::Pool, mut router: R) {
+pub async fn non_blocking<S: Socket, R: Router>(socket: S, alloc: pool::Pool, mut router: R) {
     let mut pending = None;
     core::future::poll_fn(move |cx| {
         while router.is_open() {
-            let unfilled = pending.take().unwrap_or_else(|| alloc.alloc_or_grow());
+            let unfilled = pending.take().or_else(|| alloc.alloc());
 
-            let res = unfilled.recv_with(|addr, cmsg, buffer| {
+            let Some(unfilled) = unfilled else {
+                // Allocator exhausted — we can't receive right now.
+                // TODO: apply backpressure / yield and retry
+                tracing::warn!("packet allocator exhausted on recv path");
+                return Poll::Pending;
+            };
+
+            let res = unfilled.fill_with(|addr, cmsg, buffer| {
                 match socket.poll_recv(cx, addr, cmsg, &mut [buffer]) {
                     Poll::Pending => Err(io::ErrorKind::WouldBlock.into()),
                     Poll::Ready(Ok(len)) => Ok(len),

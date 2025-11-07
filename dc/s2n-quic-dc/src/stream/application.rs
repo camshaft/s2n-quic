@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
-    credentials::Id,
+    credentials::{Credentials, Id},
     event::{self, EndpointPublisher as _},
     stream::{
         recv::application::{self as recv, Reader},
@@ -160,15 +160,19 @@ where
     }
 
     #[inline]
+    pub(crate) fn credentials(&self) -> &Credentials {
+        self.read.credentials()
+    }
+
+    #[inline]
     pub fn set_read_mode(&mut self, read_mode: recv::ReadMode) -> &mut Self {
         self.read.set_read_mode(read_mode);
         self
     }
 
     #[inline]
-    pub fn set_ack_mode(&mut self, ack_mode: recv::AckMode) -> &mut Self {
-        self.read.set_ack_mode(ack_mode);
-        self
+    pub fn keep_alive(&self, enabled: bool) {
+        self.write.keep_alive(enabled);
     }
 
     #[inline]

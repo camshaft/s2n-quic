@@ -1474,6 +1474,41 @@ pub mod api {
     }
     #[derive(Clone, Debug)]
     #[non_exhaustive]
+    #[doc = " Indicates that a packet was abandoned when the connection closed before it was acknowledged"]
+    pub struct StreamPacketAbandoned {
+        #[doc = " The total size of the packet"]
+        pub packet_len: usize,
+        #[doc = " The size of the application data in the packet"]
+        pub payload_len: usize,
+        #[doc = " The packet number of the abandoned packet"]
+        pub packet_number: u64,
+        #[doc = " The offset in the stream of the first byte in the packet"]
+        pub stream_offset: u64,
+        #[doc = " The time the packet was originally sent"]
+        pub time_sent: Timestamp,
+        #[doc = " The amount of time between when the packet was sent and when it was abandoned"]
+        pub lifetime: core::time::Duration,
+        pub is_retransmission: bool,
+    }
+    #[cfg(any(test, feature = "testing"))]
+    impl crate::event::snapshot::Fmt for StreamPacketAbandoned {
+        fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
+            let mut fmt = fmt.debug_struct("StreamPacketAbandoned");
+            fmt.field("packet_len", &self.packet_len);
+            fmt.field("payload_len", &self.payload_len);
+            fmt.field("packet_number", &self.packet_number);
+            fmt.field("stream_offset", &self.stream_offset);
+            fmt.field("time_sent", &self.time_sent);
+            fmt.field("lifetime", &self.lifetime);
+            fmt.field("is_retransmission", &self.is_retransmission);
+            fmt.finish()
+        }
+    }
+    impl Event for StreamPacketAbandoned {
+        const NAME: &'static str = "stream:packet_abandoned";
+    }
+    #[derive(Clone, Debug)]
+    #[non_exhaustive]
     #[doc = " Indicates that a packet was retransmitted on a stream but was not actually lost"]
     pub struct StreamPacketSpuriouslyRetransmitted {
         #[doc = " The total size of the packet"]
@@ -1524,6 +1559,48 @@ pub mod api {
     }
     impl Event for StreamMaxDataReceived {
         const NAME: &'static str = "stream:max_data_received";
+    }
+    #[derive(Clone, Debug)]
+    #[non_exhaustive]
+    #[doc = " Indicates that the stream transmitted a packet with a DATA_BLOCKED frame"]
+    pub struct StreamDataBlockedTransmitted {
+        #[doc = " The packet number of the probe packet"]
+        pub packet_number: u64,
+        #[doc = " The offset in the stream where the sender is blocked"]
+        pub stream_offset: u64,
+    }
+    #[cfg(any(test, feature = "testing"))]
+    impl crate::event::snapshot::Fmt for StreamDataBlockedTransmitted {
+        fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
+            let mut fmt = fmt.debug_struct("StreamDataBlockedTransmitted");
+            fmt.field("packet_number", &self.packet_number);
+            fmt.field("stream_offset", &self.stream_offset);
+            fmt.finish()
+        }
+    }
+    impl Event for StreamDataBlockedTransmitted {
+        const NAME: &'static str = "stream:data_blocked_transmitted";
+    }
+    #[derive(Clone, Debug)]
+    #[non_exhaustive]
+    #[doc = " Indicates that the stream received a packet with a DATA_BLOCKED frame"]
+    pub struct StreamDataBlockedReceived {
+        #[doc = " The packet number of the probe packet"]
+        pub packet_number: u64,
+        #[doc = " The offset in the stream where the sender is blocked"]
+        pub stream_offset: u64,
+    }
+    #[cfg(any(test, feature = "testing"))]
+    impl crate::event::snapshot::Fmt for StreamDataBlockedReceived {
+        fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
+            let mut fmt = fmt.debug_struct("StreamDataBlockedReceived");
+            fmt.field("packet_number", &self.packet_number);
+            fmt.field("stream_offset", &self.stream_offset);
+            fmt.finish()
+        }
+    }
+    impl Event for StreamDataBlockedReceived {
+        const NAME: &'static str = "stream:data_blocked_received";
     }
     #[derive(Clone, Debug)]
     #[non_exhaustive]
@@ -1769,6 +1846,165 @@ pub mod api {
     }
     impl<'a> Event for DcConnectionTimeout<'a> {
         const NAME: &'static str = "dc:connection_timeout";
+    }
+    #[derive(Clone, Debug)]
+    #[non_exhaustive]
+    #[doc = " Called when a transmission is scheduled for immediate transmission"]
+    pub struct EndpointUdpImmediateTransmissionScheduled<'a> {
+        pub peer_address: SocketAddress<'a>,
+        pub buffer_size: u16,
+        pub segment_size: u16,
+        pub segment_count: u16,
+    }
+    #[cfg(any(test, feature = "testing"))]
+    impl<'a> crate::event::snapshot::Fmt for EndpointUdpImmediateTransmissionScheduled<'a> {
+        fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
+            let mut fmt = fmt.debug_struct("EndpointUdpImmediateTransmissionScheduled");
+            fmt.field("peer_address", &self.peer_address);
+            fmt.field("buffer_size", &self.buffer_size);
+            fmt.field("segment_size", &self.segment_size);
+            fmt.field("segment_count", &self.segment_count);
+            fmt.finish()
+        }
+    }
+    impl<'a> Event for EndpointUdpImmediateTransmissionScheduled<'a> {
+        const NAME: &'static str = "endpoint:udp:immediate_transmission_scheduled";
+    }
+    #[derive(Clone, Debug)]
+    #[non_exhaustive]
+    #[doc = " Called when a transmission is scheduled in the future"]
+    pub struct EndpointUdpTransmissionScheduled<'a> {
+        pub peer_address: SocketAddress<'a>,
+        pub buffer_size: u16,
+        pub segment_size: u16,
+        pub segment_count: u16,
+        pub delay: core::time::Duration,
+    }
+    #[cfg(any(test, feature = "testing"))]
+    impl<'a> crate::event::snapshot::Fmt for EndpointUdpTransmissionScheduled<'a> {
+        fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
+            let mut fmt = fmt.debug_struct("EndpointUdpTransmissionScheduled");
+            fmt.field("peer_address", &self.peer_address);
+            fmt.field("buffer_size", &self.buffer_size);
+            fmt.field("segment_size", &self.segment_size);
+            fmt.field("segment_count", &self.segment_count);
+            fmt.field("delay", &self.delay);
+            fmt.finish()
+        }
+    }
+    impl<'a> Event for EndpointUdpTransmissionScheduled<'a> {
+        const NAME: &'static str = "endpoint:udp:transmission_scheduled";
+    }
+    #[derive(Clone, Debug)]
+    #[non_exhaustive]
+    #[doc = " Called when a transmission is rejected"]
+    pub struct EndpointUdpTransmissionRejected<'a> {
+        pub peer_address: SocketAddress<'a>,
+        pub buffer_size: u16,
+        pub segment_size: u16,
+        pub segment_count: u16,
+        pub delay: core::time::Duration,
+        pub backoff: core::time::Duration,
+    }
+    #[cfg(any(test, feature = "testing"))]
+    impl<'a> crate::event::snapshot::Fmt for EndpointUdpTransmissionRejected<'a> {
+        fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
+            let mut fmt = fmt.debug_struct("EndpointUdpTransmissionRejected");
+            fmt.field("peer_address", &self.peer_address);
+            fmt.field("buffer_size", &self.buffer_size);
+            fmt.field("segment_size", &self.segment_size);
+            fmt.field("segment_count", &self.segment_count);
+            fmt.field("delay", &self.delay);
+            fmt.field("backoff", &self.backoff);
+            fmt.finish()
+        }
+    }
+    impl<'a> Event for EndpointUdpTransmissionRejected<'a> {
+        const NAME: &'static str = "endpoint:udp:transmission_rejected";
+    }
+    #[derive(Clone, Debug)]
+    #[non_exhaustive]
+    pub struct EndpointUdpPacketTransmitted<'a> {
+        pub peer_address: SocketAddress<'a>,
+        pub buffer_size: u16,
+        pub segment_size: u16,
+        pub segment_count: u16,
+    }
+    #[cfg(any(test, feature = "testing"))]
+    impl<'a> crate::event::snapshot::Fmt for EndpointUdpPacketTransmitted<'a> {
+        fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
+            let mut fmt = fmt.debug_struct("EndpointUdpPacketTransmitted");
+            fmt.field("peer_address", &self.peer_address);
+            fmt.field("buffer_size", &self.buffer_size);
+            fmt.field("segment_size", &self.segment_size);
+            fmt.field("segment_count", &self.segment_count);
+            fmt.finish()
+        }
+    }
+    impl<'a> Event for EndpointUdpPacketTransmitted<'a> {
+        const NAME: &'static str = "endpoint:udp:packet_transmitted";
+    }
+    #[derive(Clone, Debug)]
+    #[non_exhaustive]
+    pub struct EndpointUdpTransmitErrored<'a> {
+        pub peer_address: SocketAddress<'a>,
+        pub buffer_size: u16,
+        pub segment_size: u16,
+        pub segment_count: u16,
+        pub error: &'a std::io::Error,
+    }
+    #[cfg(any(test, feature = "testing"))]
+    impl<'a> crate::event::snapshot::Fmt for EndpointUdpTransmitErrored<'a> {
+        fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
+            let mut fmt = fmt.debug_struct("EndpointUdpTransmitErrored");
+            fmt.field("peer_address", &self.peer_address);
+            fmt.field("buffer_size", &self.buffer_size);
+            fmt.field("segment_size", &self.segment_size);
+            fmt.field("segment_count", &self.segment_count);
+            fmt.field("error", &self.error);
+            fmt.finish()
+        }
+    }
+    impl<'a> Event for EndpointUdpTransmitErrored<'a> {
+        const NAME: &'static str = "endpoint:udp:transmit_errored";
+    }
+    #[derive(Clone, Debug)]
+    #[non_exhaustive]
+    pub struct EndpointUdpPacketReceived<'a> {
+        pub peer_address: SocketAddress<'a>,
+        pub buffer_size: u16,
+        pub segment_size: u16,
+        pub segment_count: u16,
+    }
+    #[cfg(any(test, feature = "testing"))]
+    impl<'a> crate::event::snapshot::Fmt for EndpointUdpPacketReceived<'a> {
+        fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
+            let mut fmt = fmt.debug_struct("EndpointUdpPacketReceived");
+            fmt.field("peer_address", &self.peer_address);
+            fmt.field("buffer_size", &self.buffer_size);
+            fmt.field("segment_size", &self.segment_size);
+            fmt.field("segment_count", &self.segment_count);
+            fmt.finish()
+        }
+    }
+    impl<'a> Event for EndpointUdpPacketReceived<'a> {
+        const NAME: &'static str = "endpoint:udp:packet_received";
+    }
+    #[derive(Clone, Debug)]
+    #[non_exhaustive]
+    pub struct EndpointUdpReceiveErrored<'a> {
+        pub error: &'a std::io::Error,
+    }
+    #[cfg(any(test, feature = "testing"))]
+    impl<'a> crate::event::snapshot::Fmt for EndpointUdpReceiveErrored<'a> {
+        fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
+            let mut fmt = fmt.debug_struct("EndpointUdpReceiveErrored");
+            fmt.field("error", &self.error);
+            fmt.finish()
+        }
+    }
+    impl<'a> Event for EndpointUdpReceiveErrored<'a> {
+        const NAME: &'static str = "endpoint:udp:receive_errored";
     }
     #[derive(Clone, Debug)]
     #[non_exhaustive]
@@ -3237,6 +3473,25 @@ pub mod tracing {
             tracing :: event ! (target : "stream_packet_acked" , parent : id , tracing :: Level :: DEBUG , { packet_len = tracing :: field :: debug (packet_len) , payload_len = tracing :: field :: debug (payload_len) , packet_number = tracing :: field :: debug (packet_number) , stream_offset = tracing :: field :: debug (stream_offset) , time_sent = tracing :: field :: debug (time_sent) , lifetime = tracing :: field :: debug (lifetime) , is_retransmission = tracing :: field :: debug (is_retransmission) });
         }
         #[inline]
+        fn on_stream_packet_abandoned(
+            &self,
+            context: &Self::ConnectionContext,
+            _meta: &api::ConnectionMeta,
+            event: &api::StreamPacketAbandoned,
+        ) {
+            let id = context.id();
+            let api::StreamPacketAbandoned {
+                packet_len,
+                payload_len,
+                packet_number,
+                stream_offset,
+                time_sent,
+                lifetime,
+                is_retransmission,
+            } = event;
+            tracing :: event ! (target : "stream_packet_abandoned" , parent : id , tracing :: Level :: DEBUG , { packet_len = tracing :: field :: debug (packet_len) , payload_len = tracing :: field :: debug (payload_len) , packet_number = tracing :: field :: debug (packet_number) , stream_offset = tracing :: field :: debug (stream_offset) , time_sent = tracing :: field :: debug (time_sent) , lifetime = tracing :: field :: debug (lifetime) , is_retransmission = tracing :: field :: debug (is_retransmission) });
+        }
+        #[inline]
         fn on_stream_packet_spuriously_retransmitted(
             &self,
             context: &Self::ConnectionContext,
@@ -3267,6 +3522,34 @@ pub mod tracing {
                 new_max_data,
             } = event;
             tracing :: event ! (target : "stream_max_data_received" , parent : id , tracing :: Level :: DEBUG , { increase = tracing :: field :: debug (increase) , new_max_data = tracing :: field :: debug (new_max_data) });
+        }
+        #[inline]
+        fn on_stream_data_blocked_transmitted(
+            &self,
+            context: &Self::ConnectionContext,
+            _meta: &api::ConnectionMeta,
+            event: &api::StreamDataBlockedTransmitted,
+        ) {
+            let id = context.id();
+            let api::StreamDataBlockedTransmitted {
+                packet_number,
+                stream_offset,
+            } = event;
+            tracing :: event ! (target : "stream_data_blocked_transmitted" , parent : id , tracing :: Level :: DEBUG , { packet_number = tracing :: field :: debug (packet_number) , stream_offset = tracing :: field :: debug (stream_offset) });
+        }
+        #[inline]
+        fn on_stream_data_blocked_received(
+            &self,
+            context: &Self::ConnectionContext,
+            _meta: &api::ConnectionMeta,
+            event: &api::StreamDataBlockedReceived,
+        ) {
+            let id = context.id();
+            let api::StreamDataBlockedReceived {
+                packet_number,
+                stream_offset,
+            } = event;
+            tracing :: event ! (target : "stream_data_blocked_received" , parent : id , tracing :: Level :: DEBUG , { packet_number = tracing :: field :: debug (packet_number) , stream_offset = tracing :: field :: debug (stream_offset) });
         }
         #[inline]
         fn on_stream_control_packet_transmitted(
@@ -3356,6 +3639,110 @@ pub mod tracing {
             let parent = self.parent(meta);
             let api::DcConnectionTimeout { peer_address } = event;
             tracing :: event ! (target : "dc_connection_timeout" , parent : parent , tracing :: Level :: DEBUG , { peer_address = tracing :: field :: debug (peer_address) });
+        }
+        #[inline]
+        fn on_endpoint_udp_immediate_transmission_scheduled(
+            &self,
+            meta: &api::EndpointMeta,
+            event: &api::EndpointUdpImmediateTransmissionScheduled,
+        ) {
+            let parent = self.parent(meta);
+            let api::EndpointUdpImmediateTransmissionScheduled {
+                peer_address,
+                buffer_size,
+                segment_size,
+                segment_count,
+            } = event;
+            tracing :: event ! (target : "endpoint_udp_immediate_transmission_scheduled" , parent : parent , tracing :: Level :: DEBUG , { peer_address = tracing :: field :: debug (peer_address) , buffer_size = tracing :: field :: debug (buffer_size) , segment_size = tracing :: field :: debug (segment_size) , segment_count = tracing :: field :: debug (segment_count) });
+        }
+        #[inline]
+        fn on_endpoint_udp_transmission_scheduled(
+            &self,
+            meta: &api::EndpointMeta,
+            event: &api::EndpointUdpTransmissionScheduled,
+        ) {
+            let parent = self.parent(meta);
+            let api::EndpointUdpTransmissionScheduled {
+                peer_address,
+                buffer_size,
+                segment_size,
+                segment_count,
+                delay,
+            } = event;
+            tracing :: event ! (target : "endpoint_udp_transmission_scheduled" , parent : parent , tracing :: Level :: DEBUG , { peer_address = tracing :: field :: debug (peer_address) , buffer_size = tracing :: field :: debug (buffer_size) , segment_size = tracing :: field :: debug (segment_size) , segment_count = tracing :: field :: debug (segment_count) , delay = tracing :: field :: debug (delay) });
+        }
+        #[inline]
+        fn on_endpoint_udp_transmission_rejected(
+            &self,
+            meta: &api::EndpointMeta,
+            event: &api::EndpointUdpTransmissionRejected,
+        ) {
+            let parent = self.parent(meta);
+            let api::EndpointUdpTransmissionRejected {
+                peer_address,
+                buffer_size,
+                segment_size,
+                segment_count,
+                delay,
+                backoff,
+            } = event;
+            tracing :: event ! (target : "endpoint_udp_transmission_rejected" , parent : parent , tracing :: Level :: DEBUG , { peer_address = tracing :: field :: debug (peer_address) , buffer_size = tracing :: field :: debug (buffer_size) , segment_size = tracing :: field :: debug (segment_size) , segment_count = tracing :: field :: debug (segment_count) , delay = tracing :: field :: debug (delay) , backoff = tracing :: field :: debug (backoff) });
+        }
+        #[inline]
+        fn on_endpoint_udp_packet_transmitted(
+            &self,
+            meta: &api::EndpointMeta,
+            event: &api::EndpointUdpPacketTransmitted,
+        ) {
+            let parent = self.parent(meta);
+            let api::EndpointUdpPacketTransmitted {
+                peer_address,
+                buffer_size,
+                segment_size,
+                segment_count,
+            } = event;
+            tracing :: event ! (target : "endpoint_udp_packet_transmitted" , parent : parent , tracing :: Level :: DEBUG , { peer_address = tracing :: field :: debug (peer_address) , buffer_size = tracing :: field :: debug (buffer_size) , segment_size = tracing :: field :: debug (segment_size) , segment_count = tracing :: field :: debug (segment_count) });
+        }
+        #[inline]
+        fn on_endpoint_udp_transmit_errored(
+            &self,
+            meta: &api::EndpointMeta,
+            event: &api::EndpointUdpTransmitErrored,
+        ) {
+            let parent = self.parent(meta);
+            let api::EndpointUdpTransmitErrored {
+                peer_address,
+                buffer_size,
+                segment_size,
+                segment_count,
+                error,
+            } = event;
+            tracing :: event ! (target : "endpoint_udp_transmit_errored" , parent : parent , tracing :: Level :: DEBUG , { peer_address = tracing :: field :: debug (peer_address) , buffer_size = tracing :: field :: debug (buffer_size) , segment_size = tracing :: field :: debug (segment_size) , segment_count = tracing :: field :: debug (segment_count) , error = tracing :: field :: debug (error) });
+        }
+        #[inline]
+        fn on_endpoint_udp_packet_received(
+            &self,
+            meta: &api::EndpointMeta,
+            event: &api::EndpointUdpPacketReceived,
+        ) {
+            let parent = self.parent(meta);
+            let api::EndpointUdpPacketReceived {
+                peer_address,
+                buffer_size,
+                segment_size,
+                segment_count,
+            } = event;
+            tracing :: event ! (target : "endpoint_udp_packet_received" , parent : parent , tracing :: Level :: DEBUG , { peer_address = tracing :: field :: debug (peer_address) , buffer_size = tracing :: field :: debug (buffer_size) , segment_size = tracing :: field :: debug (segment_size) , segment_count = tracing :: field :: debug (segment_count) });
+        }
+        #[inline]
+        fn on_endpoint_udp_receive_errored(
+            &self,
+            meta: &api::EndpointMeta,
+            event: &api::EndpointUdpReceiveErrored,
+        ) {
+            let parent = self.parent(meta);
+            let api::EndpointUdpReceiveErrored { error } = event;
+            tracing :: event ! (target : "endpoint_udp_receive_errored" , parent : parent , tracing :: Level :: DEBUG , { error = tracing :: field :: debug (error) });
         }
         #[inline]
         fn on_path_secret_map_initialized(
@@ -5159,6 +5546,46 @@ pub mod builder {
         }
     }
     #[derive(Clone, Debug)]
+    #[doc = " Indicates that a packet was abandoned when the connection closed before it was acknowledged"]
+    pub struct StreamPacketAbandoned {
+        #[doc = " The total size of the packet"]
+        pub packet_len: usize,
+        #[doc = " The size of the application data in the packet"]
+        pub payload_len: usize,
+        #[doc = " The packet number of the abandoned packet"]
+        pub packet_number: u64,
+        #[doc = " The offset in the stream of the first byte in the packet"]
+        pub stream_offset: u64,
+        #[doc = " The time the packet was originally sent"]
+        pub time_sent: Timestamp,
+        #[doc = " The amount of time between when the packet was sent and when it was abandoned"]
+        pub lifetime: core::time::Duration,
+        pub is_retransmission: bool,
+    }
+    impl IntoEvent<api::StreamPacketAbandoned> for StreamPacketAbandoned {
+        #[inline]
+        fn into_event(self) -> api::StreamPacketAbandoned {
+            let StreamPacketAbandoned {
+                packet_len,
+                payload_len,
+                packet_number,
+                stream_offset,
+                time_sent,
+                lifetime,
+                is_retransmission,
+            } = self;
+            api::StreamPacketAbandoned {
+                packet_len: packet_len.into_event(),
+                payload_len: payload_len.into_event(),
+                packet_number: packet_number.into_event(),
+                stream_offset: stream_offset.into_event(),
+                time_sent: time_sent.into_event(),
+                lifetime: lifetime.into_event(),
+                is_retransmission: is_retransmission.into_event(),
+            }
+        }
+    }
+    #[derive(Clone, Debug)]
     #[doc = " Indicates that a packet was retransmitted on a stream but was not actually lost"]
     pub struct StreamPacketSpuriouslyRetransmitted {
         #[doc = " The total size of the packet"]
@@ -5212,6 +5639,48 @@ pub mod builder {
             api::StreamMaxDataReceived {
                 increase: increase.into_event(),
                 new_max_data: new_max_data.into_event(),
+            }
+        }
+    }
+    #[derive(Clone, Debug)]
+    #[doc = " Indicates that the stream transmitted a packet with a DATA_BLOCKED frame"]
+    pub struct StreamDataBlockedTransmitted {
+        #[doc = " The packet number of the probe packet"]
+        pub packet_number: u64,
+        #[doc = " The offset in the stream where the sender is blocked"]
+        pub stream_offset: u64,
+    }
+    impl IntoEvent<api::StreamDataBlockedTransmitted> for StreamDataBlockedTransmitted {
+        #[inline]
+        fn into_event(self) -> api::StreamDataBlockedTransmitted {
+            let StreamDataBlockedTransmitted {
+                packet_number,
+                stream_offset,
+            } = self;
+            api::StreamDataBlockedTransmitted {
+                packet_number: packet_number.into_event(),
+                stream_offset: stream_offset.into_event(),
+            }
+        }
+    }
+    #[derive(Clone, Debug)]
+    #[doc = " Indicates that the stream received a packet with a DATA_BLOCKED frame"]
+    pub struct StreamDataBlockedReceived {
+        #[doc = " The packet number of the probe packet"]
+        pub packet_number: u64,
+        #[doc = " The offset in the stream where the sender is blocked"]
+        pub stream_offset: u64,
+    }
+    impl IntoEvent<api::StreamDataBlockedReceived> for StreamDataBlockedReceived {
+        #[inline]
+        fn into_event(self) -> api::StreamDataBlockedReceived {
+            let StreamDataBlockedReceived {
+                packet_number,
+                stream_offset,
+            } = self;
+            api::StreamDataBlockedReceived {
+                packet_number: packet_number.into_event(),
+                stream_offset: stream_offset.into_event(),
             }
         }
     }
@@ -5397,6 +5866,184 @@ pub mod builder {
             let DcConnectionTimeout { peer_address } = self;
             api::DcConnectionTimeout {
                 peer_address: peer_address.into_event(),
+            }
+        }
+    }
+    #[derive(Clone, Debug)]
+    #[doc = " Called when a transmission is scheduled for immediate transmission"]
+    pub struct EndpointUdpImmediateTransmissionScheduled<'a> {
+        pub peer_address: SocketAddress<'a>,
+        pub buffer_size: u16,
+        pub segment_size: u16,
+        pub segment_count: u16,
+    }
+    impl<'a> IntoEvent<api::EndpointUdpImmediateTransmissionScheduled<'a>>
+        for EndpointUdpImmediateTransmissionScheduled<'a>
+    {
+        #[inline]
+        fn into_event(self) -> api::EndpointUdpImmediateTransmissionScheduled<'a> {
+            let EndpointUdpImmediateTransmissionScheduled {
+                peer_address,
+                buffer_size,
+                segment_size,
+                segment_count,
+            } = self;
+            api::EndpointUdpImmediateTransmissionScheduled {
+                peer_address: peer_address.into_event(),
+                buffer_size: buffer_size.into_event(),
+                segment_size: segment_size.into_event(),
+                segment_count: segment_count.into_event(),
+            }
+        }
+    }
+    #[derive(Clone, Debug)]
+    #[doc = " Called when a transmission is scheduled in the future"]
+    pub struct EndpointUdpTransmissionScheduled<'a> {
+        pub peer_address: SocketAddress<'a>,
+        pub buffer_size: u16,
+        pub segment_size: u16,
+        pub segment_count: u16,
+        pub delay: core::time::Duration,
+    }
+    impl<'a> IntoEvent<api::EndpointUdpTransmissionScheduled<'a>>
+        for EndpointUdpTransmissionScheduled<'a>
+    {
+        #[inline]
+        fn into_event(self) -> api::EndpointUdpTransmissionScheduled<'a> {
+            let EndpointUdpTransmissionScheduled {
+                peer_address,
+                buffer_size,
+                segment_size,
+                segment_count,
+                delay,
+            } = self;
+            api::EndpointUdpTransmissionScheduled {
+                peer_address: peer_address.into_event(),
+                buffer_size: buffer_size.into_event(),
+                segment_size: segment_size.into_event(),
+                segment_count: segment_count.into_event(),
+                delay: delay.into_event(),
+            }
+        }
+    }
+    #[derive(Clone, Debug)]
+    #[doc = " Called when a transmission is rejected"]
+    pub struct EndpointUdpTransmissionRejected<'a> {
+        pub peer_address: SocketAddress<'a>,
+        pub buffer_size: u16,
+        pub segment_size: u16,
+        pub segment_count: u16,
+        pub delay: core::time::Duration,
+        pub backoff: core::time::Duration,
+    }
+    impl<'a> IntoEvent<api::EndpointUdpTransmissionRejected<'a>>
+        for EndpointUdpTransmissionRejected<'a>
+    {
+        #[inline]
+        fn into_event(self) -> api::EndpointUdpTransmissionRejected<'a> {
+            let EndpointUdpTransmissionRejected {
+                peer_address,
+                buffer_size,
+                segment_size,
+                segment_count,
+                delay,
+                backoff,
+            } = self;
+            api::EndpointUdpTransmissionRejected {
+                peer_address: peer_address.into_event(),
+                buffer_size: buffer_size.into_event(),
+                segment_size: segment_size.into_event(),
+                segment_count: segment_count.into_event(),
+                delay: delay.into_event(),
+                backoff: backoff.into_event(),
+            }
+        }
+    }
+    #[derive(Clone, Debug)]
+    pub struct EndpointUdpPacketTransmitted<'a> {
+        pub peer_address: SocketAddress<'a>,
+        pub buffer_size: u16,
+        pub segment_size: u16,
+        pub segment_count: u16,
+    }
+    impl<'a> IntoEvent<api::EndpointUdpPacketTransmitted<'a>> for EndpointUdpPacketTransmitted<'a> {
+        #[inline]
+        fn into_event(self) -> api::EndpointUdpPacketTransmitted<'a> {
+            let EndpointUdpPacketTransmitted {
+                peer_address,
+                buffer_size,
+                segment_size,
+                segment_count,
+            } = self;
+            api::EndpointUdpPacketTransmitted {
+                peer_address: peer_address.into_event(),
+                buffer_size: buffer_size.into_event(),
+                segment_size: segment_size.into_event(),
+                segment_count: segment_count.into_event(),
+            }
+        }
+    }
+    #[derive(Clone, Debug)]
+    pub struct EndpointUdpTransmitErrored<'a> {
+        pub peer_address: SocketAddress<'a>,
+        pub buffer_size: u16,
+        pub segment_size: u16,
+        pub segment_count: u16,
+        pub error: &'a std::io::Error,
+    }
+    impl<'a> IntoEvent<api::EndpointUdpTransmitErrored<'a>> for EndpointUdpTransmitErrored<'a> {
+        #[inline]
+        fn into_event(self) -> api::EndpointUdpTransmitErrored<'a> {
+            let EndpointUdpTransmitErrored {
+                peer_address,
+                buffer_size,
+                segment_size,
+                segment_count,
+                error,
+            } = self;
+            api::EndpointUdpTransmitErrored {
+                peer_address: peer_address.into_event(),
+                buffer_size: buffer_size.into_event(),
+                segment_size: segment_size.into_event(),
+                segment_count: segment_count.into_event(),
+                error: error.into_event(),
+            }
+        }
+    }
+    #[derive(Clone, Debug)]
+    pub struct EndpointUdpPacketReceived<'a> {
+        pub peer_address: SocketAddress<'a>,
+        pub buffer_size: u16,
+        pub segment_size: u16,
+        pub segment_count: u16,
+    }
+    impl<'a> IntoEvent<api::EndpointUdpPacketReceived<'a>> for EndpointUdpPacketReceived<'a> {
+        #[inline]
+        fn into_event(self) -> api::EndpointUdpPacketReceived<'a> {
+            let EndpointUdpPacketReceived {
+                peer_address,
+                buffer_size,
+                segment_size,
+                segment_count,
+            } = self;
+            api::EndpointUdpPacketReceived {
+                peer_address: peer_address.into_event(),
+                buffer_size: buffer_size.into_event(),
+                segment_size: segment_size.into_event(),
+                segment_count: segment_count.into_event(),
+            }
+        }
+    }
+    #[derive(Clone, Debug)]
+    pub struct EndpointUdpReceiveErrored<'a> {
+        pub error: &'a std::io::Error,
+    }
+    impl<'a> IntoEvent<api::EndpointUdpReceiveErrored<'a>> for EndpointUdpReceiveErrored<'a> {
+        #[inline]
+        fn into_event(self) -> api::EndpointUdpReceiveErrored<'a> {
+            let EndpointUdpReceiveErrored { error } = self;
+            api::EndpointUdpReceiveErrored {
+                error: error.into_event(),
             }
         }
     }
@@ -6729,6 +7376,18 @@ mod traits {
             let _ = meta;
             let _ = event;
         }
+        #[doc = "Called when the `StreamPacketAbandoned` event is triggered"]
+        #[inline]
+        fn on_stream_packet_abandoned(
+            &self,
+            context: &Self::ConnectionContext,
+            meta: &api::ConnectionMeta,
+            event: &api::StreamPacketAbandoned,
+        ) {
+            let _ = context;
+            let _ = meta;
+            let _ = event;
+        }
         #[doc = "Called when the `StreamPacketSpuriouslyRetransmitted` event is triggered"]
         #[inline]
         fn on_stream_packet_spuriously_retransmitted(
@@ -6748,6 +7407,30 @@ mod traits {
             context: &Self::ConnectionContext,
             meta: &api::ConnectionMeta,
             event: &api::StreamMaxDataReceived,
+        ) {
+            let _ = context;
+            let _ = meta;
+            let _ = event;
+        }
+        #[doc = "Called when the `StreamDataBlockedTransmitted` event is triggered"]
+        #[inline]
+        fn on_stream_data_blocked_transmitted(
+            &self,
+            context: &Self::ConnectionContext,
+            meta: &api::ConnectionMeta,
+            event: &api::StreamDataBlockedTransmitted,
+        ) {
+            let _ = context;
+            let _ = meta;
+            let _ = event;
+        }
+        #[doc = "Called when the `StreamDataBlockedReceived` event is triggered"]
+        #[inline]
+        fn on_stream_data_blocked_received(
+            &self,
+            context: &Self::ConnectionContext,
+            meta: &api::ConnectionMeta,
+            event: &api::StreamDataBlockedReceived,
         ) {
             let _ = context;
             let _ = meta;
@@ -6829,6 +7512,76 @@ mod traits {
             &self,
             meta: &api::EndpointMeta,
             event: &api::DcConnectionTimeout,
+        ) {
+            let _ = meta;
+            let _ = event;
+        }
+        #[doc = "Called when the `EndpointUdpImmediateTransmissionScheduled` event is triggered"]
+        #[inline]
+        fn on_endpoint_udp_immediate_transmission_scheduled(
+            &self,
+            meta: &api::EndpointMeta,
+            event: &api::EndpointUdpImmediateTransmissionScheduled,
+        ) {
+            let _ = meta;
+            let _ = event;
+        }
+        #[doc = "Called when the `EndpointUdpTransmissionScheduled` event is triggered"]
+        #[inline]
+        fn on_endpoint_udp_transmission_scheduled(
+            &self,
+            meta: &api::EndpointMeta,
+            event: &api::EndpointUdpTransmissionScheduled,
+        ) {
+            let _ = meta;
+            let _ = event;
+        }
+        #[doc = "Called when the `EndpointUdpTransmissionRejected` event is triggered"]
+        #[inline]
+        fn on_endpoint_udp_transmission_rejected(
+            &self,
+            meta: &api::EndpointMeta,
+            event: &api::EndpointUdpTransmissionRejected,
+        ) {
+            let _ = meta;
+            let _ = event;
+        }
+        #[doc = "Called when the `EndpointUdpPacketTransmitted` event is triggered"]
+        #[inline]
+        fn on_endpoint_udp_packet_transmitted(
+            &self,
+            meta: &api::EndpointMeta,
+            event: &api::EndpointUdpPacketTransmitted,
+        ) {
+            let _ = meta;
+            let _ = event;
+        }
+        #[doc = "Called when the `EndpointUdpTransmitErrored` event is triggered"]
+        #[inline]
+        fn on_endpoint_udp_transmit_errored(
+            &self,
+            meta: &api::EndpointMeta,
+            event: &api::EndpointUdpTransmitErrored,
+        ) {
+            let _ = meta;
+            let _ = event;
+        }
+        #[doc = "Called when the `EndpointUdpPacketReceived` event is triggered"]
+        #[inline]
+        fn on_endpoint_udp_packet_received(
+            &self,
+            meta: &api::EndpointMeta,
+            event: &api::EndpointUdpPacketReceived,
+        ) {
+            let _ = meta;
+            let _ = event;
+        }
+        #[doc = "Called when the `EndpointUdpReceiveErrored` event is triggered"]
+        #[inline]
+        fn on_endpoint_udp_receive_errored(
+            &self,
+            meta: &api::EndpointMeta,
+            event: &api::EndpointUdpReceiveErrored,
         ) {
             let _ = meta;
             let _ = event;
@@ -7640,6 +8393,16 @@ mod traits {
             self.as_ref().on_stream_packet_acked(context, meta, event);
         }
         #[inline]
+        fn on_stream_packet_abandoned(
+            &self,
+            context: &Self::ConnectionContext,
+            meta: &api::ConnectionMeta,
+            event: &api::StreamPacketAbandoned,
+        ) {
+            self.as_ref()
+                .on_stream_packet_abandoned(context, meta, event);
+        }
+        #[inline]
         fn on_stream_packet_spuriously_retransmitted(
             &self,
             context: &Self::ConnectionContext,
@@ -7658,6 +8421,26 @@ mod traits {
         ) {
             self.as_ref()
                 .on_stream_max_data_received(context, meta, event);
+        }
+        #[inline]
+        fn on_stream_data_blocked_transmitted(
+            &self,
+            context: &Self::ConnectionContext,
+            meta: &api::ConnectionMeta,
+            event: &api::StreamDataBlockedTransmitted,
+        ) {
+            self.as_ref()
+                .on_stream_data_blocked_transmitted(context, meta, event);
+        }
+        #[inline]
+        fn on_stream_data_blocked_received(
+            &self,
+            context: &Self::ConnectionContext,
+            meta: &api::ConnectionMeta,
+            event: &api::StreamDataBlockedReceived,
+        ) {
+            self.as_ref()
+                .on_stream_data_blocked_received(context, meta, event);
         }
         #[inline]
         fn on_stream_control_packet_transmitted(
@@ -7722,6 +8505,66 @@ mod traits {
             event: &api::DcConnectionTimeout,
         ) {
             self.as_ref().on_dc_connection_timeout(meta, event);
+        }
+        #[inline]
+        fn on_endpoint_udp_immediate_transmission_scheduled(
+            &self,
+            meta: &api::EndpointMeta,
+            event: &api::EndpointUdpImmediateTransmissionScheduled,
+        ) {
+            self.as_ref()
+                .on_endpoint_udp_immediate_transmission_scheduled(meta, event);
+        }
+        #[inline]
+        fn on_endpoint_udp_transmission_scheduled(
+            &self,
+            meta: &api::EndpointMeta,
+            event: &api::EndpointUdpTransmissionScheduled,
+        ) {
+            self.as_ref()
+                .on_endpoint_udp_transmission_scheduled(meta, event);
+        }
+        #[inline]
+        fn on_endpoint_udp_transmission_rejected(
+            &self,
+            meta: &api::EndpointMeta,
+            event: &api::EndpointUdpTransmissionRejected,
+        ) {
+            self.as_ref()
+                .on_endpoint_udp_transmission_rejected(meta, event);
+        }
+        #[inline]
+        fn on_endpoint_udp_packet_transmitted(
+            &self,
+            meta: &api::EndpointMeta,
+            event: &api::EndpointUdpPacketTransmitted,
+        ) {
+            self.as_ref()
+                .on_endpoint_udp_packet_transmitted(meta, event);
+        }
+        #[inline]
+        fn on_endpoint_udp_transmit_errored(
+            &self,
+            meta: &api::EndpointMeta,
+            event: &api::EndpointUdpTransmitErrored,
+        ) {
+            self.as_ref().on_endpoint_udp_transmit_errored(meta, event);
+        }
+        #[inline]
+        fn on_endpoint_udp_packet_received(
+            &self,
+            meta: &api::EndpointMeta,
+            event: &api::EndpointUdpPacketReceived,
+        ) {
+            self.as_ref().on_endpoint_udp_packet_received(meta, event);
+        }
+        #[inline]
+        fn on_endpoint_udp_receive_errored(
+            &self,
+            meta: &api::EndpointMeta,
+            event: &api::EndpointUdpReceiveErrored,
+        ) {
+            self.as_ref().on_endpoint_udp_receive_errored(meta, event);
         }
         #[inline]
         fn on_path_secret_map_initialized(
@@ -8509,6 +9352,16 @@ mod traits {
             (self.1).on_stream_packet_acked(&context.1, meta, event);
         }
         #[inline]
+        fn on_stream_packet_abandoned(
+            &self,
+            context: &Self::ConnectionContext,
+            meta: &api::ConnectionMeta,
+            event: &api::StreamPacketAbandoned,
+        ) {
+            (self.0).on_stream_packet_abandoned(&context.0, meta, event);
+            (self.1).on_stream_packet_abandoned(&context.1, meta, event);
+        }
+        #[inline]
         fn on_stream_packet_spuriously_retransmitted(
             &self,
             context: &Self::ConnectionContext,
@@ -8527,6 +9380,26 @@ mod traits {
         ) {
             (self.0).on_stream_max_data_received(&context.0, meta, event);
             (self.1).on_stream_max_data_received(&context.1, meta, event);
+        }
+        #[inline]
+        fn on_stream_data_blocked_transmitted(
+            &self,
+            context: &Self::ConnectionContext,
+            meta: &api::ConnectionMeta,
+            event: &api::StreamDataBlockedTransmitted,
+        ) {
+            (self.0).on_stream_data_blocked_transmitted(&context.0, meta, event);
+            (self.1).on_stream_data_blocked_transmitted(&context.1, meta, event);
+        }
+        #[inline]
+        fn on_stream_data_blocked_received(
+            &self,
+            context: &Self::ConnectionContext,
+            meta: &api::ConnectionMeta,
+            event: &api::StreamDataBlockedReceived,
+        ) {
+            (self.0).on_stream_data_blocked_received(&context.0, meta, event);
+            (self.1).on_stream_data_blocked_received(&context.1, meta, event);
         }
         #[inline]
         fn on_stream_control_packet_transmitted(
@@ -8595,6 +9468,69 @@ mod traits {
         ) {
             (self.0).on_dc_connection_timeout(meta, event);
             (self.1).on_dc_connection_timeout(meta, event);
+        }
+        #[inline]
+        fn on_endpoint_udp_immediate_transmission_scheduled(
+            &self,
+            meta: &api::EndpointMeta,
+            event: &api::EndpointUdpImmediateTransmissionScheduled,
+        ) {
+            (self.0).on_endpoint_udp_immediate_transmission_scheduled(meta, event);
+            (self.1).on_endpoint_udp_immediate_transmission_scheduled(meta, event);
+        }
+        #[inline]
+        fn on_endpoint_udp_transmission_scheduled(
+            &self,
+            meta: &api::EndpointMeta,
+            event: &api::EndpointUdpTransmissionScheduled,
+        ) {
+            (self.0).on_endpoint_udp_transmission_scheduled(meta, event);
+            (self.1).on_endpoint_udp_transmission_scheduled(meta, event);
+        }
+        #[inline]
+        fn on_endpoint_udp_transmission_rejected(
+            &self,
+            meta: &api::EndpointMeta,
+            event: &api::EndpointUdpTransmissionRejected,
+        ) {
+            (self.0).on_endpoint_udp_transmission_rejected(meta, event);
+            (self.1).on_endpoint_udp_transmission_rejected(meta, event);
+        }
+        #[inline]
+        fn on_endpoint_udp_packet_transmitted(
+            &self,
+            meta: &api::EndpointMeta,
+            event: &api::EndpointUdpPacketTransmitted,
+        ) {
+            (self.0).on_endpoint_udp_packet_transmitted(meta, event);
+            (self.1).on_endpoint_udp_packet_transmitted(meta, event);
+        }
+        #[inline]
+        fn on_endpoint_udp_transmit_errored(
+            &self,
+            meta: &api::EndpointMeta,
+            event: &api::EndpointUdpTransmitErrored,
+        ) {
+            (self.0).on_endpoint_udp_transmit_errored(meta, event);
+            (self.1).on_endpoint_udp_transmit_errored(meta, event);
+        }
+        #[inline]
+        fn on_endpoint_udp_packet_received(
+            &self,
+            meta: &api::EndpointMeta,
+            event: &api::EndpointUdpPacketReceived,
+        ) {
+            (self.0).on_endpoint_udp_packet_received(meta, event);
+            (self.1).on_endpoint_udp_packet_received(meta, event);
+        }
+        #[inline]
+        fn on_endpoint_udp_receive_errored(
+            &self,
+            meta: &api::EndpointMeta,
+            event: &api::EndpointUdpReceiveErrored,
+        ) {
+            (self.0).on_endpoint_udp_receive_errored(meta, event);
+            (self.1).on_endpoint_udp_receive_errored(meta, event);
         }
         #[inline]
         fn on_path_secret_map_initialized(
@@ -8978,6 +9914,29 @@ mod traits {
         fn on_endpoint_initialized(&self, event: builder::EndpointInitialized);
         #[doc = "Publishes a `DcConnectionTimeout` event to the publisher's subscriber"]
         fn on_dc_connection_timeout(&self, event: builder::DcConnectionTimeout);
+        #[doc = "Publishes a `EndpointUdpImmediateTransmissionScheduled` event to the publisher's subscriber"]
+        fn on_endpoint_udp_immediate_transmission_scheduled(
+            &self,
+            event: builder::EndpointUdpImmediateTransmissionScheduled,
+        );
+        #[doc = "Publishes a `EndpointUdpTransmissionScheduled` event to the publisher's subscriber"]
+        fn on_endpoint_udp_transmission_scheduled(
+            &self,
+            event: builder::EndpointUdpTransmissionScheduled,
+        );
+        #[doc = "Publishes a `EndpointUdpTransmissionRejected` event to the publisher's subscriber"]
+        fn on_endpoint_udp_transmission_rejected(
+            &self,
+            event: builder::EndpointUdpTransmissionRejected,
+        );
+        #[doc = "Publishes a `EndpointUdpPacketTransmitted` event to the publisher's subscriber"]
+        fn on_endpoint_udp_packet_transmitted(&self, event: builder::EndpointUdpPacketTransmitted);
+        #[doc = "Publishes a `EndpointUdpTransmitErrored` event to the publisher's subscriber"]
+        fn on_endpoint_udp_transmit_errored(&self, event: builder::EndpointUdpTransmitErrored);
+        #[doc = "Publishes a `EndpointUdpPacketReceived` event to the publisher's subscriber"]
+        fn on_endpoint_udp_packet_received(&self, event: builder::EndpointUdpPacketReceived);
+        #[doc = "Publishes a `EndpointUdpReceiveErrored` event to the publisher's subscriber"]
+        fn on_endpoint_udp_receive_errored(&self, event: builder::EndpointUdpReceiveErrored);
         #[doc = "Publishes a `PathSecretMapInitialized` event to the publisher's subscriber"]
         fn on_path_secret_map_initialized(&self, event: builder::PathSecretMapInitialized);
         #[doc = "Publishes a `PathSecretMapUninitialized` event to the publisher's subscriber"]
@@ -9308,6 +10267,64 @@ mod traits {
             self.subscriber.on_event(&self.meta, &event);
         }
         #[inline]
+        fn on_endpoint_udp_immediate_transmission_scheduled(
+            &self,
+            event: builder::EndpointUdpImmediateTransmissionScheduled,
+        ) {
+            let event = event.into_event();
+            self.subscriber
+                .on_endpoint_udp_immediate_transmission_scheduled(&self.meta, &event);
+            self.subscriber.on_event(&self.meta, &event);
+        }
+        #[inline]
+        fn on_endpoint_udp_transmission_scheduled(
+            &self,
+            event: builder::EndpointUdpTransmissionScheduled,
+        ) {
+            let event = event.into_event();
+            self.subscriber
+                .on_endpoint_udp_transmission_scheduled(&self.meta, &event);
+            self.subscriber.on_event(&self.meta, &event);
+        }
+        #[inline]
+        fn on_endpoint_udp_transmission_rejected(
+            &self,
+            event: builder::EndpointUdpTransmissionRejected,
+        ) {
+            let event = event.into_event();
+            self.subscriber
+                .on_endpoint_udp_transmission_rejected(&self.meta, &event);
+            self.subscriber.on_event(&self.meta, &event);
+        }
+        #[inline]
+        fn on_endpoint_udp_packet_transmitted(&self, event: builder::EndpointUdpPacketTransmitted) {
+            let event = event.into_event();
+            self.subscriber
+                .on_endpoint_udp_packet_transmitted(&self.meta, &event);
+            self.subscriber.on_event(&self.meta, &event);
+        }
+        #[inline]
+        fn on_endpoint_udp_transmit_errored(&self, event: builder::EndpointUdpTransmitErrored) {
+            let event = event.into_event();
+            self.subscriber
+                .on_endpoint_udp_transmit_errored(&self.meta, &event);
+            self.subscriber.on_event(&self.meta, &event);
+        }
+        #[inline]
+        fn on_endpoint_udp_packet_received(&self, event: builder::EndpointUdpPacketReceived) {
+            let event = event.into_event();
+            self.subscriber
+                .on_endpoint_udp_packet_received(&self.meta, &event);
+            self.subscriber.on_event(&self.meta, &event);
+        }
+        #[inline]
+        fn on_endpoint_udp_receive_errored(&self, event: builder::EndpointUdpReceiveErrored) {
+            let event = event.into_event();
+            self.subscriber
+                .on_endpoint_udp_receive_errored(&self.meta, &event);
+            self.subscriber.on_event(&self.meta, &event);
+        }
+        #[inline]
         fn on_path_secret_map_initialized(&self, event: builder::PathSecretMapInitialized) {
             let event = event.into_event();
             self.subscriber
@@ -9625,6 +10642,8 @@ mod traits {
         fn on_stream_packet_lost(&self, event: builder::StreamPacketLost);
         #[doc = "Publishes a `StreamPacketAcked` event to the publisher's subscriber"]
         fn on_stream_packet_acked(&self, event: builder::StreamPacketAcked);
+        #[doc = "Publishes a `StreamPacketAbandoned` event to the publisher's subscriber"]
+        fn on_stream_packet_abandoned(&self, event: builder::StreamPacketAbandoned);
         #[doc = "Publishes a `StreamPacketSpuriouslyRetransmitted` event to the publisher's subscriber"]
         fn on_stream_packet_spuriously_retransmitted(
             &self,
@@ -9632,6 +10651,10 @@ mod traits {
         );
         #[doc = "Publishes a `StreamMaxDataReceived` event to the publisher's subscriber"]
         fn on_stream_max_data_received(&self, event: builder::StreamMaxDataReceived);
+        #[doc = "Publishes a `StreamDataBlockedTransmitted` event to the publisher's subscriber"]
+        fn on_stream_data_blocked_transmitted(&self, event: builder::StreamDataBlockedTransmitted);
+        #[doc = "Publishes a `StreamDataBlockedReceived` event to the publisher's subscriber"]
+        fn on_stream_data_blocked_received(&self, event: builder::StreamDataBlockedReceived);
         #[doc = "Publishes a `StreamControlPacketTransmitted` event to the publisher's subscriber"]
         fn on_stream_control_packet_transmitted(
             &self,
@@ -9907,6 +10930,15 @@ mod traits {
             self.subscriber.on_event(&self.meta, &event);
         }
         #[inline]
+        fn on_stream_packet_abandoned(&self, event: builder::StreamPacketAbandoned) {
+            let event = event.into_event();
+            self.subscriber
+                .on_stream_packet_abandoned(self.context, &self.meta, &event);
+            self.subscriber
+                .on_connection_event(self.context, &self.meta, &event);
+            self.subscriber.on_event(&self.meta, &event);
+        }
+        #[inline]
         fn on_stream_packet_spuriously_retransmitted(
             &self,
             event: builder::StreamPacketSpuriouslyRetransmitted,
@@ -9926,6 +10958,24 @@ mod traits {
             let event = event.into_event();
             self.subscriber
                 .on_stream_max_data_received(self.context, &self.meta, &event);
+            self.subscriber
+                .on_connection_event(self.context, &self.meta, &event);
+            self.subscriber.on_event(&self.meta, &event);
+        }
+        #[inline]
+        fn on_stream_data_blocked_transmitted(&self, event: builder::StreamDataBlockedTransmitted) {
+            let event = event.into_event();
+            self.subscriber
+                .on_stream_data_blocked_transmitted(self.context, &self.meta, &event);
+            self.subscriber
+                .on_connection_event(self.context, &self.meta, &event);
+            self.subscriber.on_event(&self.meta, &event);
+        }
+        #[inline]
+        fn on_stream_data_blocked_received(&self, event: builder::StreamDataBlockedReceived) {
+            let event = event.into_event();
+            self.subscriber
+                .on_stream_data_blocked_received(self.context, &self.meta, &event);
             self.subscriber
                 .on_connection_event(self.context, &self.meta, &event);
             self.subscriber.on_event(&self.meta, &event);
@@ -10027,6 +11077,13 @@ pub mod testing {
             pub stream_connect_error: AtomicU64,
             pub endpoint_initialized: AtomicU64,
             pub dc_connection_timeout: AtomicU64,
+            pub endpoint_udp_immediate_transmission_scheduled: AtomicU64,
+            pub endpoint_udp_transmission_scheduled: AtomicU64,
+            pub endpoint_udp_transmission_rejected: AtomicU64,
+            pub endpoint_udp_packet_transmitted: AtomicU64,
+            pub endpoint_udp_transmit_errored: AtomicU64,
+            pub endpoint_udp_packet_received: AtomicU64,
+            pub endpoint_udp_receive_errored: AtomicU64,
             pub path_secret_map_initialized: AtomicU64,
             pub path_secret_map_uninitialized: AtomicU64,
             pub path_secret_map_background_handshake_requested: AtomicU64,
@@ -10119,6 +11176,13 @@ pub mod testing {
                     stream_connect_error: AtomicU64::new(0),
                     endpoint_initialized: AtomicU64::new(0),
                     dc_connection_timeout: AtomicU64::new(0),
+                    endpoint_udp_immediate_transmission_scheduled: AtomicU64::new(0),
+                    endpoint_udp_transmission_scheduled: AtomicU64::new(0),
+                    endpoint_udp_transmission_rejected: AtomicU64::new(0),
+                    endpoint_udp_packet_transmitted: AtomicU64::new(0),
+                    endpoint_udp_transmit_errored: AtomicU64::new(0),
+                    endpoint_udp_packet_received: AtomicU64::new(0),
+                    endpoint_udp_receive_errored: AtomicU64::new(0),
                     path_secret_map_initialized: AtomicU64::new(0),
                     path_secret_map_uninitialized: AtomicU64::new(0),
                     path_secret_map_background_handshake_requested: AtomicU64::new(0),
@@ -10480,6 +11544,90 @@ pub mod testing {
                 event: &api::DcConnectionTimeout,
             ) {
                 self.dc_connection_timeout.fetch_add(1, Ordering::Relaxed);
+                let meta = crate::event::snapshot::Fmt::to_snapshot(meta);
+                let event = crate::event::snapshot::Fmt::to_snapshot(event);
+                let out = format!("{meta:?} {event:?}");
+                self.output.lock().unwrap().push(out);
+            }
+            fn on_endpoint_udp_immediate_transmission_scheduled(
+                &self,
+                meta: &api::EndpointMeta,
+                event: &api::EndpointUdpImmediateTransmissionScheduled,
+            ) {
+                self.endpoint_udp_immediate_transmission_scheduled
+                    .fetch_add(1, Ordering::Relaxed);
+                let meta = crate::event::snapshot::Fmt::to_snapshot(meta);
+                let event = crate::event::snapshot::Fmt::to_snapshot(event);
+                let out = format!("{meta:?} {event:?}");
+                self.output.lock().unwrap().push(out);
+            }
+            fn on_endpoint_udp_transmission_scheduled(
+                &self,
+                meta: &api::EndpointMeta,
+                event: &api::EndpointUdpTransmissionScheduled,
+            ) {
+                self.endpoint_udp_transmission_scheduled
+                    .fetch_add(1, Ordering::Relaxed);
+                let meta = crate::event::snapshot::Fmt::to_snapshot(meta);
+                let event = crate::event::snapshot::Fmt::to_snapshot(event);
+                let out = format!("{meta:?} {event:?}");
+                self.output.lock().unwrap().push(out);
+            }
+            fn on_endpoint_udp_transmission_rejected(
+                &self,
+                meta: &api::EndpointMeta,
+                event: &api::EndpointUdpTransmissionRejected,
+            ) {
+                self.endpoint_udp_transmission_rejected
+                    .fetch_add(1, Ordering::Relaxed);
+                let meta = crate::event::snapshot::Fmt::to_snapshot(meta);
+                let event = crate::event::snapshot::Fmt::to_snapshot(event);
+                let out = format!("{meta:?} {event:?}");
+                self.output.lock().unwrap().push(out);
+            }
+            fn on_endpoint_udp_packet_transmitted(
+                &self,
+                meta: &api::EndpointMeta,
+                event: &api::EndpointUdpPacketTransmitted,
+            ) {
+                self.endpoint_udp_packet_transmitted
+                    .fetch_add(1, Ordering::Relaxed);
+                let meta = crate::event::snapshot::Fmt::to_snapshot(meta);
+                let event = crate::event::snapshot::Fmt::to_snapshot(event);
+                let out = format!("{meta:?} {event:?}");
+                self.output.lock().unwrap().push(out);
+            }
+            fn on_endpoint_udp_transmit_errored(
+                &self,
+                meta: &api::EndpointMeta,
+                event: &api::EndpointUdpTransmitErrored,
+            ) {
+                self.endpoint_udp_transmit_errored
+                    .fetch_add(1, Ordering::Relaxed);
+                let meta = crate::event::snapshot::Fmt::to_snapshot(meta);
+                let event = crate::event::snapshot::Fmt::to_snapshot(event);
+                let out = format!("{meta:?} {event:?}");
+                self.output.lock().unwrap().push(out);
+            }
+            fn on_endpoint_udp_packet_received(
+                &self,
+                meta: &api::EndpointMeta,
+                event: &api::EndpointUdpPacketReceived,
+            ) {
+                self.endpoint_udp_packet_received
+                    .fetch_add(1, Ordering::Relaxed);
+                let meta = crate::event::snapshot::Fmt::to_snapshot(meta);
+                let event = crate::event::snapshot::Fmt::to_snapshot(event);
+                let out = format!("{meta:?} {event:?}");
+                self.output.lock().unwrap().push(out);
+            }
+            fn on_endpoint_udp_receive_errored(
+                &self,
+                meta: &api::EndpointMeta,
+                event: &api::EndpointUdpReceiveErrored,
+            ) {
+                self.endpoint_udp_receive_errored
+                    .fetch_add(1, Ordering::Relaxed);
                 let meta = crate::event::snapshot::Fmt::to_snapshot(meta);
                 let event = crate::event::snapshot::Fmt::to_snapshot(event);
                 let out = format!("{meta:?} {event:?}");
@@ -10932,8 +12080,11 @@ pub mod testing {
         pub stream_packet_received: AtomicU64,
         pub stream_packet_lost: AtomicU64,
         pub stream_packet_acked: AtomicU64,
+        pub stream_packet_abandoned: AtomicU64,
         pub stream_packet_spuriously_retransmitted: AtomicU64,
         pub stream_max_data_received: AtomicU64,
+        pub stream_data_blocked_transmitted: AtomicU64,
+        pub stream_data_blocked_received: AtomicU64,
         pub stream_control_packet_transmitted: AtomicU64,
         pub stream_control_packet_received: AtomicU64,
         pub stream_receiver_errored: AtomicU64,
@@ -10941,6 +12092,13 @@ pub mod testing {
         pub connection_closed: AtomicU64,
         pub endpoint_initialized: AtomicU64,
         pub dc_connection_timeout: AtomicU64,
+        pub endpoint_udp_immediate_transmission_scheduled: AtomicU64,
+        pub endpoint_udp_transmission_scheduled: AtomicU64,
+        pub endpoint_udp_transmission_rejected: AtomicU64,
+        pub endpoint_udp_packet_transmitted: AtomicU64,
+        pub endpoint_udp_transmit_errored: AtomicU64,
+        pub endpoint_udp_packet_received: AtomicU64,
+        pub endpoint_udp_receive_errored: AtomicU64,
         pub path_secret_map_initialized: AtomicU64,
         pub path_secret_map_uninitialized: AtomicU64,
         pub path_secret_map_background_handshake_requested: AtomicU64,
@@ -11056,8 +12214,11 @@ pub mod testing {
                 stream_packet_received: AtomicU64::new(0),
                 stream_packet_lost: AtomicU64::new(0),
                 stream_packet_acked: AtomicU64::new(0),
+                stream_packet_abandoned: AtomicU64::new(0),
                 stream_packet_spuriously_retransmitted: AtomicU64::new(0),
                 stream_max_data_received: AtomicU64::new(0),
+                stream_data_blocked_transmitted: AtomicU64::new(0),
+                stream_data_blocked_received: AtomicU64::new(0),
                 stream_control_packet_transmitted: AtomicU64::new(0),
                 stream_control_packet_received: AtomicU64::new(0),
                 stream_receiver_errored: AtomicU64::new(0),
@@ -11065,6 +12226,13 @@ pub mod testing {
                 connection_closed: AtomicU64::new(0),
                 endpoint_initialized: AtomicU64::new(0),
                 dc_connection_timeout: AtomicU64::new(0),
+                endpoint_udp_immediate_transmission_scheduled: AtomicU64::new(0),
+                endpoint_udp_transmission_scheduled: AtomicU64::new(0),
+                endpoint_udp_transmission_rejected: AtomicU64::new(0),
+                endpoint_udp_packet_transmitted: AtomicU64::new(0),
+                endpoint_udp_transmit_errored: AtomicU64::new(0),
+                endpoint_udp_packet_received: AtomicU64::new(0),
+                endpoint_udp_receive_errored: AtomicU64::new(0),
                 path_secret_map_initialized: AtomicU64::new(0),
                 path_secret_map_uninitialized: AtomicU64::new(0),
                 path_secret_map_background_handshake_requested: AtomicU64::new(0),
@@ -11765,6 +12933,20 @@ pub mod testing {
                 self.output.lock().unwrap().push(out);
             }
         }
+        fn on_stream_packet_abandoned(
+            &self,
+            _context: &Self::ConnectionContext,
+            meta: &api::ConnectionMeta,
+            event: &api::StreamPacketAbandoned,
+        ) {
+            self.stream_packet_abandoned.fetch_add(1, Ordering::Relaxed);
+            if self.location.is_some() {
+                let meta = crate::event::snapshot::Fmt::to_snapshot(meta);
+                let event = crate::event::snapshot::Fmt::to_snapshot(event);
+                let out = format!("{meta:?} {event:?}");
+                self.output.lock().unwrap().push(out);
+            }
+        }
         fn on_stream_packet_spuriously_retransmitted(
             &self,
             _context: &Self::ConnectionContext,
@@ -11787,6 +12969,36 @@ pub mod testing {
             event: &api::StreamMaxDataReceived,
         ) {
             self.stream_max_data_received
+                .fetch_add(1, Ordering::Relaxed);
+            if self.location.is_some() {
+                let meta = crate::event::snapshot::Fmt::to_snapshot(meta);
+                let event = crate::event::snapshot::Fmt::to_snapshot(event);
+                let out = format!("{meta:?} {event:?}");
+                self.output.lock().unwrap().push(out);
+            }
+        }
+        fn on_stream_data_blocked_transmitted(
+            &self,
+            _context: &Self::ConnectionContext,
+            meta: &api::ConnectionMeta,
+            event: &api::StreamDataBlockedTransmitted,
+        ) {
+            self.stream_data_blocked_transmitted
+                .fetch_add(1, Ordering::Relaxed);
+            if self.location.is_some() {
+                let meta = crate::event::snapshot::Fmt::to_snapshot(meta);
+                let event = crate::event::snapshot::Fmt::to_snapshot(event);
+                let out = format!("{meta:?} {event:?}");
+                self.output.lock().unwrap().push(out);
+            }
+        }
+        fn on_stream_data_blocked_received(
+            &self,
+            _context: &Self::ConnectionContext,
+            meta: &api::ConnectionMeta,
+            event: &api::StreamDataBlockedReceived,
+        ) {
+            self.stream_data_blocked_received
                 .fetch_add(1, Ordering::Relaxed);
             if self.location.is_some() {
                 let meta = crate::event::snapshot::Fmt::to_snapshot(meta);
@@ -11884,6 +13096,90 @@ pub mod testing {
             event: &api::DcConnectionTimeout,
         ) {
             self.dc_connection_timeout.fetch_add(1, Ordering::Relaxed);
+            let meta = crate::event::snapshot::Fmt::to_snapshot(meta);
+            let event = crate::event::snapshot::Fmt::to_snapshot(event);
+            let out = format!("{meta:?} {event:?}");
+            self.output.lock().unwrap().push(out);
+        }
+        fn on_endpoint_udp_immediate_transmission_scheduled(
+            &self,
+            meta: &api::EndpointMeta,
+            event: &api::EndpointUdpImmediateTransmissionScheduled,
+        ) {
+            self.endpoint_udp_immediate_transmission_scheduled
+                .fetch_add(1, Ordering::Relaxed);
+            let meta = crate::event::snapshot::Fmt::to_snapshot(meta);
+            let event = crate::event::snapshot::Fmt::to_snapshot(event);
+            let out = format!("{meta:?} {event:?}");
+            self.output.lock().unwrap().push(out);
+        }
+        fn on_endpoint_udp_transmission_scheduled(
+            &self,
+            meta: &api::EndpointMeta,
+            event: &api::EndpointUdpTransmissionScheduled,
+        ) {
+            self.endpoint_udp_transmission_scheduled
+                .fetch_add(1, Ordering::Relaxed);
+            let meta = crate::event::snapshot::Fmt::to_snapshot(meta);
+            let event = crate::event::snapshot::Fmt::to_snapshot(event);
+            let out = format!("{meta:?} {event:?}");
+            self.output.lock().unwrap().push(out);
+        }
+        fn on_endpoint_udp_transmission_rejected(
+            &self,
+            meta: &api::EndpointMeta,
+            event: &api::EndpointUdpTransmissionRejected,
+        ) {
+            self.endpoint_udp_transmission_rejected
+                .fetch_add(1, Ordering::Relaxed);
+            let meta = crate::event::snapshot::Fmt::to_snapshot(meta);
+            let event = crate::event::snapshot::Fmt::to_snapshot(event);
+            let out = format!("{meta:?} {event:?}");
+            self.output.lock().unwrap().push(out);
+        }
+        fn on_endpoint_udp_packet_transmitted(
+            &self,
+            meta: &api::EndpointMeta,
+            event: &api::EndpointUdpPacketTransmitted,
+        ) {
+            self.endpoint_udp_packet_transmitted
+                .fetch_add(1, Ordering::Relaxed);
+            let meta = crate::event::snapshot::Fmt::to_snapshot(meta);
+            let event = crate::event::snapshot::Fmt::to_snapshot(event);
+            let out = format!("{meta:?} {event:?}");
+            self.output.lock().unwrap().push(out);
+        }
+        fn on_endpoint_udp_transmit_errored(
+            &self,
+            meta: &api::EndpointMeta,
+            event: &api::EndpointUdpTransmitErrored,
+        ) {
+            self.endpoint_udp_transmit_errored
+                .fetch_add(1, Ordering::Relaxed);
+            let meta = crate::event::snapshot::Fmt::to_snapshot(meta);
+            let event = crate::event::snapshot::Fmt::to_snapshot(event);
+            let out = format!("{meta:?} {event:?}");
+            self.output.lock().unwrap().push(out);
+        }
+        fn on_endpoint_udp_packet_received(
+            &self,
+            meta: &api::EndpointMeta,
+            event: &api::EndpointUdpPacketReceived,
+        ) {
+            self.endpoint_udp_packet_received
+                .fetch_add(1, Ordering::Relaxed);
+            let meta = crate::event::snapshot::Fmt::to_snapshot(meta);
+            let event = crate::event::snapshot::Fmt::to_snapshot(event);
+            let out = format!("{meta:?} {event:?}");
+            self.output.lock().unwrap().push(out);
+        }
+        fn on_endpoint_udp_receive_errored(
+            &self,
+            meta: &api::EndpointMeta,
+            event: &api::EndpointUdpReceiveErrored,
+        ) {
+            self.endpoint_udp_receive_errored
+                .fetch_add(1, Ordering::Relaxed);
             let meta = crate::event::snapshot::Fmt::to_snapshot(meta);
             let event = crate::event::snapshot::Fmt::to_snapshot(event);
             let out = format!("{meta:?} {event:?}");
@@ -12335,8 +13631,11 @@ pub mod testing {
         pub stream_packet_received: AtomicU64,
         pub stream_packet_lost: AtomicU64,
         pub stream_packet_acked: AtomicU64,
+        pub stream_packet_abandoned: AtomicU64,
         pub stream_packet_spuriously_retransmitted: AtomicU64,
         pub stream_max_data_received: AtomicU64,
+        pub stream_data_blocked_transmitted: AtomicU64,
+        pub stream_data_blocked_received: AtomicU64,
         pub stream_control_packet_transmitted: AtomicU64,
         pub stream_control_packet_received: AtomicU64,
         pub stream_receiver_errored: AtomicU64,
@@ -12344,6 +13643,13 @@ pub mod testing {
         pub connection_closed: AtomicU64,
         pub endpoint_initialized: AtomicU64,
         pub dc_connection_timeout: AtomicU64,
+        pub endpoint_udp_immediate_transmission_scheduled: AtomicU64,
+        pub endpoint_udp_transmission_scheduled: AtomicU64,
+        pub endpoint_udp_transmission_rejected: AtomicU64,
+        pub endpoint_udp_packet_transmitted: AtomicU64,
+        pub endpoint_udp_transmit_errored: AtomicU64,
+        pub endpoint_udp_packet_received: AtomicU64,
+        pub endpoint_udp_receive_errored: AtomicU64,
         pub path_secret_map_initialized: AtomicU64,
         pub path_secret_map_uninitialized: AtomicU64,
         pub path_secret_map_background_handshake_requested: AtomicU64,
@@ -12449,8 +13755,11 @@ pub mod testing {
                 stream_packet_received: AtomicU64::new(0),
                 stream_packet_lost: AtomicU64::new(0),
                 stream_packet_acked: AtomicU64::new(0),
+                stream_packet_abandoned: AtomicU64::new(0),
                 stream_packet_spuriously_retransmitted: AtomicU64::new(0),
                 stream_max_data_received: AtomicU64::new(0),
+                stream_data_blocked_transmitted: AtomicU64::new(0),
+                stream_data_blocked_received: AtomicU64::new(0),
                 stream_control_packet_transmitted: AtomicU64::new(0),
                 stream_control_packet_received: AtomicU64::new(0),
                 stream_receiver_errored: AtomicU64::new(0),
@@ -12458,6 +13767,13 @@ pub mod testing {
                 connection_closed: AtomicU64::new(0),
                 endpoint_initialized: AtomicU64::new(0),
                 dc_connection_timeout: AtomicU64::new(0),
+                endpoint_udp_immediate_transmission_scheduled: AtomicU64::new(0),
+                endpoint_udp_transmission_scheduled: AtomicU64::new(0),
+                endpoint_udp_transmission_rejected: AtomicU64::new(0),
+                endpoint_udp_packet_transmitted: AtomicU64::new(0),
+                endpoint_udp_transmit_errored: AtomicU64::new(0),
+                endpoint_udp_packet_received: AtomicU64::new(0),
+                endpoint_udp_receive_errored: AtomicU64::new(0),
                 path_secret_map_initialized: AtomicU64::new(0),
                 path_secret_map_uninitialized: AtomicU64::new(0),
                 path_secret_map_background_handshake_requested: AtomicU64::new(0),
@@ -12716,6 +14032,71 @@ pub mod testing {
         }
         fn on_dc_connection_timeout(&self, event: builder::DcConnectionTimeout) {
             self.dc_connection_timeout.fetch_add(1, Ordering::Relaxed);
+            let event = event.into_event();
+            let event = crate::event::snapshot::Fmt::to_snapshot(&event);
+            let out = format!("{event:?}");
+            self.output.lock().unwrap().push(out);
+        }
+        fn on_endpoint_udp_immediate_transmission_scheduled(
+            &self,
+            event: builder::EndpointUdpImmediateTransmissionScheduled,
+        ) {
+            self.endpoint_udp_immediate_transmission_scheduled
+                .fetch_add(1, Ordering::Relaxed);
+            let event = event.into_event();
+            let event = crate::event::snapshot::Fmt::to_snapshot(&event);
+            let out = format!("{event:?}");
+            self.output.lock().unwrap().push(out);
+        }
+        fn on_endpoint_udp_transmission_scheduled(
+            &self,
+            event: builder::EndpointUdpTransmissionScheduled,
+        ) {
+            self.endpoint_udp_transmission_scheduled
+                .fetch_add(1, Ordering::Relaxed);
+            let event = event.into_event();
+            let event = crate::event::snapshot::Fmt::to_snapshot(&event);
+            let out = format!("{event:?}");
+            self.output.lock().unwrap().push(out);
+        }
+        fn on_endpoint_udp_transmission_rejected(
+            &self,
+            event: builder::EndpointUdpTransmissionRejected,
+        ) {
+            self.endpoint_udp_transmission_rejected
+                .fetch_add(1, Ordering::Relaxed);
+            let event = event.into_event();
+            let event = crate::event::snapshot::Fmt::to_snapshot(&event);
+            let out = format!("{event:?}");
+            self.output.lock().unwrap().push(out);
+        }
+        fn on_endpoint_udp_packet_transmitted(&self, event: builder::EndpointUdpPacketTransmitted) {
+            self.endpoint_udp_packet_transmitted
+                .fetch_add(1, Ordering::Relaxed);
+            let event = event.into_event();
+            let event = crate::event::snapshot::Fmt::to_snapshot(&event);
+            let out = format!("{event:?}");
+            self.output.lock().unwrap().push(out);
+        }
+        fn on_endpoint_udp_transmit_errored(&self, event: builder::EndpointUdpTransmitErrored) {
+            self.endpoint_udp_transmit_errored
+                .fetch_add(1, Ordering::Relaxed);
+            let event = event.into_event();
+            let event = crate::event::snapshot::Fmt::to_snapshot(&event);
+            let out = format!("{event:?}");
+            self.output.lock().unwrap().push(out);
+        }
+        fn on_endpoint_udp_packet_received(&self, event: builder::EndpointUdpPacketReceived) {
+            self.endpoint_udp_packet_received
+                .fetch_add(1, Ordering::Relaxed);
+            let event = event.into_event();
+            let event = crate::event::snapshot::Fmt::to_snapshot(&event);
+            let out = format!("{event:?}");
+            self.output.lock().unwrap().push(out);
+        }
+        fn on_endpoint_udp_receive_errored(&self, event: builder::EndpointUdpReceiveErrored) {
+            self.endpoint_udp_receive_errored
+                .fetch_add(1, Ordering::Relaxed);
             let event = event.into_event();
             let event = crate::event::snapshot::Fmt::to_snapshot(&event);
             let out = format!("{event:?}");
@@ -13256,6 +14637,15 @@ pub mod testing {
                 self.output.lock().unwrap().push(out);
             }
         }
+        fn on_stream_packet_abandoned(&self, event: builder::StreamPacketAbandoned) {
+            self.stream_packet_abandoned.fetch_add(1, Ordering::Relaxed);
+            let event = event.into_event();
+            if self.location.is_some() {
+                let event = crate::event::snapshot::Fmt::to_snapshot(&event);
+                let out = format!("{event:?}");
+                self.output.lock().unwrap().push(out);
+            }
+        }
         fn on_stream_packet_spuriously_retransmitted(
             &self,
             event: builder::StreamPacketSpuriouslyRetransmitted,
@@ -13271,6 +14661,26 @@ pub mod testing {
         }
         fn on_stream_max_data_received(&self, event: builder::StreamMaxDataReceived) {
             self.stream_max_data_received
+                .fetch_add(1, Ordering::Relaxed);
+            let event = event.into_event();
+            if self.location.is_some() {
+                let event = crate::event::snapshot::Fmt::to_snapshot(&event);
+                let out = format!("{event:?}");
+                self.output.lock().unwrap().push(out);
+            }
+        }
+        fn on_stream_data_blocked_transmitted(&self, event: builder::StreamDataBlockedTransmitted) {
+            self.stream_data_blocked_transmitted
+                .fetch_add(1, Ordering::Relaxed);
+            let event = event.into_event();
+            if self.location.is_some() {
+                let event = crate::event::snapshot::Fmt::to_snapshot(&event);
+                let out = format!("{event:?}");
+                self.output.lock().unwrap().push(out);
+            }
+        }
+        fn on_stream_data_blocked_received(&self, event: builder::StreamDataBlockedReceived) {
+            self.stream_data_blocked_received
                 .fetch_add(1, Ordering::Relaxed);
             let event = event.into_event();
             if self.location.is_some() {

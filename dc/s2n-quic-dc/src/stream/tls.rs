@@ -18,10 +18,10 @@
 //! forces. This will also eliminate the Mutex wrapping the s2n-tls connection.
 
 use s2n_quic_core::{
-    buffer::{reader::Incremental, writer::Storage as _, Writer as _},
+    buffer::{reader::Incremental, Writer as _},
     event::IntoEvent,
     inet::ExplicitCongestionNotification,
-    time::{Clock, Timestamp},
+    time::Clock,
     varint::VarInt,
 };
 use std::{
@@ -29,12 +29,12 @@ use std::{
     io,
     sync::{Arc, Mutex},
     task::Poll,
-    time::Duration,
 };
 use tokio::net::TcpStream;
 
 use crate::{
     msg,
+    socket::pool::Pool,
     stream::{
         environment::{tokio::Environment, Environment as _},
         recv,
@@ -373,34 +373,35 @@ unsafe extern "C" fn send_io_cb<'a, M>(ctx: *mut core::ffi::c_void, buf: *const 
 where
     M: 'a + super::send::application::state::Message,
 {
-    let message = ctx.cast::<M>().as_mut::<'a>().unwrap();
+    let _message = ctx.cast::<M>().as_mut::<'a>().unwrap();
 
     let mut buf = std::slice::from_raw_parts(buf, len as usize);
 
     while !buf.is_empty() {
-        let part = buf
+        let _part = buf
             .split_off(..buf.len().clamp(0, u16::MAX as usize))
             .unwrap();
         // FIXME: this return whether it allocated or not, we should have the event for that here too.
-        message.push(part.len(), |mut b| {
-            b.put_slice(part);
+        todo!();
+        //message.push(part.len(), |mut b| {
+        //    b.put_slice(part);
 
-            crate::stream::send::application::transmission::Event {
-                packet_number: VarInt::ZERO,
-                info: crate::stream::send::application::transmission::Info {
-                    // Soundness critical to get this right - it's used to set the segment length we
-                    // wrote to the socket.
-                    packet_len: part.len() as u16,
-                    retransmission: None,
-                    stream_offset: VarInt::ZERO,
-                    payload_len: 0,
-                    included_fin: Default::default(),
-                    time_sent: unsafe { Timestamp::from_duration(Duration::from_millis(1)) },
-                    ecn: Default::default(),
-                },
-                has_more_app_data: false,
-            }
-        });
+        // crate::stream::send::application::transmission::Event {
+        //     packet_number: VarInt::ZERO,
+        //     info: crate::stream::send::application::transmission::Info {
+        //         // Soundness critical to get this right - it's used to set the segment length we
+        //         // wrote to the socket.
+        //         packet_len: part.len() as u16,
+        //         retransmission: None,
+        //         stream_offset: VarInt::ZERO,
+        //         payload_len: 0,
+        //         included_fin: Default::default(),
+        //         time_sent: unsafe { Timestamp::from_duration(Duration::from_millis(1)) },
+        //         ecn: Default::default(),
+        //     },
+        //     has_more_app_data: false,
+        // }
+        //});
     }
 
     i32::try_from(len).unwrap()
@@ -629,6 +630,7 @@ where
                 context: subscriber_ctx,
             },
             s2n_connection: Some(s2n_connection),
+            segment_alloc: Pool::new(u16::MAX),
         }
     };
 
@@ -667,7 +669,7 @@ where
     });
 
     let read = crate::stream::recv::application::Builder::new(endpoint_type, env.reader_rt());
-    let write = crate::stream::send::application::Builder::new(env.writer_rt());
+    let write = crate::stream::send::application::Builder::new(env.writer_rt(), None);
 
     Ok(crate::stream::application::Builder {
         read,

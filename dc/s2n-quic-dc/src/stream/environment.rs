@@ -3,8 +3,10 @@
 
 use crate::{
     clock,
+    credentials::Credentials,
     either::Either,
     event,
+    socket::pool,
     stream::{recv, runtime, socket, TransportFeatures},
 };
 use core::future::Future;
@@ -121,8 +123,9 @@ pub struct SocketSet<R, W = R> {
     pub application: Box<dyn socket::application::Builder>,
     pub read_worker: Option<R>,
     pub write_worker: Option<W>,
+    pub transmission_pool: pool::Pool,
     pub remote_addr: SocketAddress,
-    pub source_queue_id: Option<VarInt>,
+    pub local_queue_id: Option<VarInt>,
 }
 
 type SetupResult<ReadWorker, WriteWorker> =
@@ -133,7 +136,11 @@ pub trait Peer<E: Environment> {
     type WriteWorkerSocket: WriteWorkerSocket;
 
     fn features(&self) -> TransportFeatures;
-    fn setup(self, env: &E) -> SetupResult<Self::ReadWorkerSocket, Self::WriteWorkerSocket>;
+    fn setup(
+        self,
+        env: &E,
+        credentials: &Credentials,
+    ) -> SetupResult<Self::ReadWorkerSocket, Self::WriteWorkerSocket>;
 }
 
 pub trait ReadWorkerSocket {

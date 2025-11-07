@@ -13,6 +13,8 @@ pub use bpf::Pair;
 #[cfg(not(target_os = "linux"))]
 pub use pair::Pair;
 
+pub mod pool;
 pub mod recv;
+pub mod send;
 
 pub use s2n_quic_platform::socket::options::{Options, ReusePort};

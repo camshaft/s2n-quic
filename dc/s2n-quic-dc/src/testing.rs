@@ -339,3 +339,35 @@ impl Pair {
 pub fn pair_sync() -> (client::Provider, server::Provider) {
     Pair::default().build_sync()
 }
+
+pub fn send_busy_poll() -> crate::busy_poll::Pool {
+    static POOL: BusyPool = BusyPool::new();
+    POOL.get()
+}
+
+pub fn recv_busy_poll() -> crate::busy_poll::Pool {
+    static POOL: BusyPool = BusyPool::new();
+    POOL.get()
+}
+
+struct BusyPool(std::sync::OnceLock<crate::busy_poll::Pool>);
+
+impl BusyPool {
+    const fn new() -> Self {
+        Self(std::sync::OnceLock::new())
+    }
+
+    fn get(&self) -> crate::busy_poll::Pool {
+        self.0
+            .get_or_init(|| {
+                let mut handles = vec![];
+                for _ in 0..2 {
+                    let (handle, runner) = crate::busy_poll::Handle::new();
+                    std::thread::spawn(move || runner.run());
+                    handles.push(handle);
+                }
+                handles.into()
+            })
+            .clone()
+    }
+}

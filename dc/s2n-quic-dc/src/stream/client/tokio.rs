@@ -313,26 +313,40 @@ pub struct Builder {
     linger: Option<Duration>,
     send_buffer: Option<usize>,
     recv_buffer: Option<usize>,
+    send_socket_workers: udp_pool::Workers,
+    recv_socket_workers: udp_pool::Workers,
+    enable_tcp: bool,
+    enable_udp: bool,
 }
 
 impl Builder {
-    pub fn with_tcp(self, enabled: bool) -> Self {
-        self.with_default_protocol(if enabled {
-            socket::Protocol::Tcp
+    pub fn with_tcp(mut self, enabled: bool) -> Self {
+        self.enable_tcp = enabled;
+
+        if !self.enable_udp && enabled {
+            self.with_default_protocol(socket::Protocol::Tcp)
         } else {
-            socket::Protocol::Udp
-        })
+            self
+        }
     }
 
-    pub fn with_udp(self, enabled: bool) -> Self {
-        self.with_default_protocol(if enabled {
-            socket::Protocol::Udp
+    pub fn with_udp(mut self, enabled: bool) -> Self {
+        self.enable_udp = enabled;
+
+        if !self.enable_tcp && enabled {
+            self.with_default_protocol(socket::Protocol::Udp)
         } else {
-            socket::Protocol::Tcp
-        })
+            self
+        }
     }
 
     pub fn with_default_protocol(mut self, protocol: socket::Protocol) -> Self {
+        match protocol {
+            socket::Protocol::Tcp => self.enable_tcp = true,
+            socket::Protocol::Udp => self.enable_udp = true,
+            _ => {}
+        }
+
         self.default_protocol = Some(protocol);
         self
     }
@@ -369,6 +383,16 @@ impl Builder {
         self
     }
 
+    pub fn with_send_socket_workers(mut self, workers: udp_pool::Workers) -> Self {
+        self.send_socket_workers = workers;
+        self
+    }
+
+    pub fn with_recv_socket_workers(mut self, workers: udp_pool::Workers) -> Self {
+        self.recv_socket_workers = workers;
+        self
+    }
+
     #[inline]
     pub fn build<H: Handshake + Clone, S: event::Subscriber + Clone>(
         self,
@@ -385,8 +409,16 @@ impl Builder {
 
         let mut env = env::Builder::new(subscriber).with_socket_options(options);
 
-        let pool = udp_pool::Config::new(handshake.map().clone());
-        env = env.with_pool(pool);
+        if self.enable_tcp {
+            env = env.with_tcp_transmission_pool(socket::pool::Pool::new(u16::MAX));
+        }
+
+        if self.enable_udp {
+            let mut pool = udp_pool::Config::new(handshake.map().clone());
+            pool.send_workers = self.send_socket_workers;
+            pool.recv_workers = self.recv_socket_workers;
+            env = env.with_pool(pool);
+        }
 
         if let Some(threads) = self.background_threads {
             env = env.with_threads(threads);
@@ -427,13 +459,14 @@ where
     // TODO emit events (https://github.com/aws/s2n-quic/issues/2676)
 
     // TODO potentially branch on not using the recv pool if we're under a certain concurrency?
-    let stream = if env.has_recv_pool() {
-        let peer = env::udp::Pooled(acceptor_addr.into());
-        endpoint::open_stream(env, entry, peer, None)?
-    } else {
-        let peer = env::udp::Owned(acceptor_addr.into(), recv_buffer());
-        endpoint::open_stream(env, entry, peer, None)?
-    };
+    if !env.has_recv_pool() {
+        return Err(io::Error::new(
+            io::ErrorKind::Other,
+            "UDP protocol requires configuring the recv pool",
+        ));
+    }
+    let peer = env::udp::Pooled(acceptor_addr.into());
+    let stream = endpoint::open_stream(env, entry, peer, None)?;
 
     // build the stream inside the application context
     let stream = stream.connect()?;
@@ -587,11 +620,16 @@ where
     .into();
     let local_port = socket.local_addr()?.port();
 
+    let transmission_pool = env
+        .tcp_transmission_pool()
+        .expect("no transmission pool")
+        .clone();
     let peer = env::tcp::Registered {
         socket,
         peer_addr,
         local_port,
         recv_buffer: recv_buffer(),
+        transmission_pool,
     };
 
     let stream = endpoint::open_stream(env, entry, peer, None)?;
@@ -624,11 +662,16 @@ where
     let local_port = socket.local_addr()?.port();
     let peer_addr = socket.peer_addr()?.into();
 
+    let transmission_pool = env
+        .tcp_transmission_pool()
+        .expect("no transmission pool")
+        .clone();
     let peer = env::tcp::Registered {
         socket,
         peer_addr,
         local_port,
         recv_buffer: recv_buffer(),
+        transmission_pool,
     };
 
     // TODO emit events (https://github.com/aws/s2n-quic/issues/2676)

@@ -13,9 +13,9 @@ use s2n_quic_core::ensure;
 use std::{collections::VecDeque, ops::ControlFlow, sync::Mutex, task::Waker};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Error {
+pub enum Error<T> {
     /// The queue ID is not associated with a stream
-    Unallocated,
+    Unallocated(T),
     /// The queue has been closed and won't reopen
     Closed,
 }
@@ -36,7 +36,7 @@ impl s2n_quic_core::probe::Arg for Half {
     }
 }
 
-impl From<Closed> for Error {
+impl<T> From<Closed> for Error<T> {
     #[inline]
     fn from(_: Closed) -> Self {
         Self::Closed
@@ -99,12 +99,12 @@ impl<T> Queue<T> {
     }
 
     #[inline]
-    pub fn push(&self, value: T) -> Result<Option<T>, Error> {
+    pub fn push(&self, value: T) -> Result<Option<T>, Error<T>> {
         let mut inner = self.lock()?;
         // check if the queue is permanently closed
         ensure!(inner.is_open, Err(Error::Closed));
         // check if the queue is temporarily closed
-        ensure!(inner.has_receiver, Err(Error::Unallocated));
+        ensure!(inner.has_receiver, Err(Error::Unallocated(value)));
 
         let prev = if inner.capacity == inner.queue.len() {
             inner.queue.pop_front()

@@ -3,9 +3,8 @@
 
 use crate::{
     clock::Timer,
-    credentials::Id,
+    credentials::{Credentials, Id},
     event::{self, ConnectionPublisher as _},
-    msg,
     stream::{
         recv, runtime,
         shared::{AcceptState, ArcShared, ShutdownKind},
@@ -30,8 +29,6 @@ use std::{io, net::SocketAddr};
 mod builder;
 pub use builder::Builder;
 
-pub use crate::stream::recv::shared::AckMode;
-
 /// Defines what strategy to use when writing to the provided buffer
 #[derive(Clone, Copy, Debug, Default)]
 pub enum ReadMode {
@@ -52,9 +49,7 @@ where
 {
     shared: ArcShared<Sub>,
     sockets: socket::ArcApplication,
-    send_buffer: msg::send::Message,
     read_mode: ReadMode,
-    ack_mode: AckMode,
     timer: Option<Timer>,
     local_state: LocalState,
     runtime: runtime::ArcHandle<Sub>,
@@ -140,6 +135,10 @@ where
         &self.0.shared.credentials().id
     }
 
+    pub(crate) fn credentials(&self) -> &Credentials {
+        self.0.shared.credentials()
+    }
+
     #[inline]
     pub fn protocol(&self) -> socket::Protocol {
         self.0.sockets.protocol()
@@ -148,12 +147,6 @@ where
     #[inline]
     pub fn set_read_mode(&mut self, read_mode: ReadMode) -> &mut Self {
         self.0.read_mode = read_mode;
-        self
-    }
-
-    #[inline]
-    pub fn set_ack_mode(&mut self, ack_mode: AckMode) -> &mut Self {
-        self.0.ack_mode = ack_mode;
         self
     }
 
@@ -174,6 +167,17 @@ where
     where
         S: buffer::writer::Storage,
     {
+        #[cfg(debug_assertions)]
+        let _span = {
+            use s2n_quic_core::varint::VarInt;
+            let peer_addr = self.0.shared.remote_addr();
+            let flow_id = self.0.shared.credentials();
+            let local_queue_id = self.0.shared.local_queue_id().map(VarInt::as_u64);
+            let remote_queue_id = self.0.shared.remote_queue_id().as_u64();
+            tracing::warn_span!("poll_read_info", %peer_addr, %flow_id, local_queue_id, remote_queue_id, actor = "application::recv")
+                .entered()
+        };
+
         let start_time = self.0.shared.clock.get_time();
         let capacity = out_buf.remaining_capacity();
 
@@ -227,12 +231,7 @@ where
         let sockets = &self.sockets;
         let transport_features = sockets.features();
 
-        let mut reader = shared.receiver.application_guard(
-            self.ack_mode,
-            &mut self.send_buffer,
-            shared,
-            sockets,
-        )?;
+        let mut reader = shared.receiver.application_guard(shared, sockets)?;
         let reader = &mut *reader;
 
         loop {
@@ -389,7 +388,7 @@ where
 
         // let the peer know if we shut down cleanly
         let kind = if std::thread::panicking() {
-            ShutdownKind::Panicking
+            ShutdownKind::Errored
         } else {
             ShutdownKind::Normal
         };

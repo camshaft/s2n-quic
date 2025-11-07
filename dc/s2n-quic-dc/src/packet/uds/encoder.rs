@@ -13,7 +13,7 @@ pub fn encode<E: Encoder>(
     encoder: &mut E,
     ciphersuite: &Ciphersuite,
     export_secret: &[u8],
-    application_params: &ApplicationParams,
+    _application_params: &ApplicationParams,
     encode_time: u64,
     payload: &[u8],
 ) -> usize {
@@ -28,7 +28,7 @@ pub fn encode<E: Encoder>(
 
     encoder.encode(&APP_PARAMS_VERSION);
 
-    encoder.encode(application_params);
+    // encoder.encode(application_params);
 
     encoder.encode(&encode_time);
 

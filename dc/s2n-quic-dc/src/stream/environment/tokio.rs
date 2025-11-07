@@ -29,6 +29,7 @@ where
     writer_rt: Option<runtime::Shared<Sub>>,
     thread_name_prefix: Option<String>,
     threads: Option<usize>,
+    tcp_transmission_pool: Option<socket::pool::Pool>,
     pool: Option<PoolConfig>,
     acceptor: Option<accept::Sender<Sub>>,
     subscriber: Sub,
@@ -57,6 +58,7 @@ where
             thread_name_prefix: None,
             threads: None,
             acceptor: None,
+            tcp_transmission_pool: None,
             pool: None,
             subscriber,
         }
@@ -82,6 +84,11 @@ where
         self
     }
 
+    pub fn with_tcp_transmission_pool(mut self, pool: socket::pool::Pool) -> Self {
+        self.tcp_transmission_pool = Some(pool);
+        self
+    }
+
     #[inline]
     pub fn build(self) -> io::Result<Environment<Sub>> {
         let Self {
@@ -92,6 +99,7 @@ where
             writer_rt,
             thread_name_prefix,
             threads,
+            tcp_transmission_pool,
             pool,
             acceptor,
             subscriber,
@@ -100,7 +108,10 @@ where
         let gso = gso.unwrap_or_else(|| {
             // rather than clamping it to the max burst size, let the CCA be the only
             // component that controls send quantums
-            features::gso::MAX_SEGMENTS.into()
+
+            // TODO figure out why GSO isn't working very well
+            features::gso::MaxSegments::try_from(1).unwrap().into()
+            // features::gso::MAX_SEGMENTS.into()
         });
         let socket_options = socket_options.unwrap_or_default();
 
@@ -134,6 +145,7 @@ where
             socket_options,
             reader_rt,
             writer_rt,
+            tcp_transmission_pool,
             recv_pool: None,
             subscriber,
         };
@@ -155,6 +167,7 @@ pub struct Environment<Sub> {
     reader_rt: runtime::Shared<Sub>,
     writer_rt: runtime::Shared<Sub>,
     subscriber: Sub,
+    tcp_transmission_pool: Option<socket::pool::Pool>,
     recv_pool: Option<Arc<pool::Pool>>,
 }
 
@@ -195,6 +208,11 @@ where
     #[inline]
     pub fn pool_addr(&self) -> Option<SocketAddr> {
         self.recv_pool.as_ref().map(|v| v.local_addr())
+    }
+
+    #[inline]
+    pub fn tcp_transmission_pool(&self) -> Option<&socket::pool::Pool> {
+        self.tcp_transmission_pool.as_ref()
     }
 }
 

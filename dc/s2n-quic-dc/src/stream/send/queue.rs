@@ -2,115 +2,113 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
+    clock::precision,
     event::{self, ConnectionPublisher},
-    msg::{addr, segment},
+    socket::pool::{self, descriptor},
     stream::{
-        send::{
-            application::{self, transmission},
-            buffer,
-            state::Transmission,
-        },
+        send::{application, application::state::PushError, state::transmission},
         shared,
         socket::Socket,
     },
 };
-use bytes::buf::UninitSlice;
 use core::task::{Context, Poll};
 use s2n_quic_core::{
-    assume, buffer::reader, ensure, inet::ExplicitCongestionNotification, ready, time::Clock,
+    ensure,
+    inet::SocketAddress,
+    ready,
+    recovery::bandwidth::Bandwidth,
+    time::{timer, Clock, Timer},
+    varint::VarInt,
 };
-use s2n_quic_platform::features::Gso;
-use std::{collections::VecDeque, io};
+use std::{
+    io::{self, IoSliceMut},
+    time::Duration,
+};
 
-/// An enqueued segment waiting to be transmitted on the socket
-#[derive(Debug)]
-pub struct Segment {
-    ecn: ExplicitCongestionNotification,
-    buffer: buffer::Segment,
-    offset: u16,
-}
-
-impl Segment {
-    #[inline]
-    fn as_slice(&self) -> &[u8] {
-        &self.buffer[self.offset as usize..]
-    }
-}
-
-pub struct Message<'a> {
-    batch: &'a mut Option<Vec<Transmission>>,
+pub struct Message<'a, TransmissionAlloc> {
     queue: &'a mut Queue,
     max_segments: usize,
-    segment_alloc: &'a buffer::Allocator,
+    remote_address: &'a SocketAddress,
+    segment_alloc: &'a pool::Pool,
+    transmission_alloc: TransmissionAlloc,
 }
 
-impl application::state::Message for Message<'_> {
+impl<TransmissionAlloc> application::state::Message for Message<'_, TransmissionAlloc>
+where
+    TransmissionAlloc: Fn() -> transmission::Entry,
+{
     #[inline]
     fn max_segments(&self) -> usize {
         self.max_segments
     }
 
     #[inline]
-    fn push<P: FnOnce(&mut UninitSlice) -> transmission::Event<()>>(
+    fn push_with<P: FnOnce(IoSliceMut) -> transmission::Event>(
         &mut self,
-        buffer_len: usize,
         p: P,
-    ) -> Option<usize> {
-        let (mut buffer, buf_source) = self.segment_alloc.alloc(buffer_len);
+    ) -> Result<usize, PushError> {
+        let buffer = self.segment_alloc.alloc().ok_or(PushError::Alloc)?;
+        let mut event = None;
+        let descriptor = buffer
+            .fill_with(|addr, _cmsg, payload| {
+                addr.set(*self.remote_address);
+                let evt = p(payload);
+                let len = evt.info.packet_len;
+                event = Some(evt);
+                <Result<_, core::convert::Infallible>>::Ok(len as _)
+            })
+            .unwrap();
 
-        let transmission = {
-            let buffer = buffer.make_mut();
+        let descriptor = descriptor.take_filled();
 
-            debug_assert!(buffer.capacity() >= buffer_len);
+        let accepted_len = self.queue.push_segment(
+            &self.transmission_alloc,
+            event.unwrap(),
+            descriptor,
+            self.max_segments,
+        );
 
-            let slice = UninitSlice::uninit(buffer.spare_capacity_mut());
+        Ok(accepted_len)
+    }
 
-            let transmission = p(slice);
-
-            unsafe {
-                let packet_len = transmission.info.packet_len;
-                assume!(buffer.capacity() >= packet_len as usize);
-                buffer.set_len(packet_len as usize);
-            }
-
-            transmission
-        };
-
-        let transmission::Event {
-            packet_number,
-            info,
-            has_more_app_data,
-        } = transmission;
-
-        let ecn = info.ecn;
-
-        if let Some(batch) = self.batch.as_mut() {
-            let info = info.map(|_| buffer.clone());
-
-            batch.push(transmission::Event {
-                packet_number,
-                info,
-                has_more_app_data,
-            });
-        }
-
-        self.queue.segments.push_back(Segment {
-            ecn,
-            buffer,
-            offset: 0,
-        });
-
-        match buf_source {
-            buffer::Source::Pool => None,
-            buffer::Source::Fresh => Some(buffer_len),
-        }
+    #[inline]
+    fn push(&mut self, event: transmission::Event, descriptor: descriptor::Filled) -> usize {
+        self.queue.push_segment(
+            &self.transmission_alloc,
+            event,
+            descriptor,
+            self.max_segments,
+        )
     }
 }
 
 #[derive(Debug, Default)]
+struct Checker {
+    #[cfg(debug_assertions)]
+    last_packet_number: Option<VarInt>,
+}
+
+impl Checker {
+    #[inline]
+    fn on_transmission(&mut self, packet_number: VarInt) {
+        let _ = packet_number;
+        #[cfg(debug_assertions)]
+        {
+            if let Some(last_packet_number) = self.last_packet_number {
+                assert!(
+                    packet_number > last_packet_number,
+                    "packet number must be greater than the last packet number"
+                );
+            }
+            self.last_packet_number = Some(packet_number);
+        }
+    }
+}
+
+#[derive(Debug)]
 pub struct Queue {
     /// Holds any segments that haven't been flushed to the socket
-    segments: VecDeque<Segment>,
+    builder: transmission::Builder,
     /// How many bytes we've accepted from the caller of `poll_write`, but actually returned
     /// `Poll::Pending` for. This many bytes will be skipped the next time `poll_write` is called.
     ///
@@ -118,12 +116,31 @@ pub struct Queue {
     /// outstanding packets to the underlying socket. Experience has shown applications rely on
     /// TCP's behavior, which never really requires `flush` or `shutdown` to progress the stream.
     accepted_len: usize,
+    /// The current bandwidth of the queue
+    bandwidth: Bandwidth,
+    /// The next time the queue is allowed to transmit
+    next_transmission_time: Option<precision::Timestamp>,
+    transmission_timer: Timer,
+    checker: Checker,
+}
+
+impl Default for Queue {
+    fn default() -> Self {
+        Self {
+            builder: transmission::Builder::default(),
+            accepted_len: 0,
+            bandwidth: Bandwidth::INFINITY,
+            next_transmission_time: None,
+            transmission_timer: Default::default(),
+            checker: Checker::default(),
+        }
+    }
 }
 
 impl Queue {
     #[inline]
     pub fn is_empty(&self) -> bool {
-        self.segments.is_empty()
+        self.builder.is_empty()
     }
 
     #[inline]
@@ -132,34 +149,80 @@ impl Queue {
     }
 
     #[inline]
-    pub fn push_buffer<B, F, E>(
+    pub fn set_bandwidth(&mut self, bandwidth: Bandwidth) {
+        self.bandwidth = bandwidth;
+    }
+
+    /// Sets the initial transmission time for rate-limited connection starts.
+    ///
+    /// When set, the first packet will not be sent until this time, allowing
+    /// client-side rate limiting of new connections to a peer.
+    #[inline]
+    pub fn set_initial_transmission_time(&mut self, time: precision::Timestamp) {
+        self.next_transmission_time = Some(time);
+    }
+
+    pub fn append(&mut self, other: &mut Self) {
+        self.builder.append(&mut other.builder);
+        self.accepted_len += other.accepted_len;
+        self.bandwidth = self.bandwidth.max(other.bandwidth);
+    }
+
+    #[inline]
+    pub fn push_buffer<A, F, O>(
         &mut self,
-        buf: &mut B,
-        batch: &mut Option<Vec<Transmission>>,
+        remote_address: &SocketAddress,
         max_segments: usize,
-        segment_alloc: &buffer::Allocator,
+        segment_alloc: &pool::Pool,
+        transmission_alloc: A,
         push: F,
-    ) -> Result<(), E>
+    ) -> O
     where
-        B: reader::Storage,
-        F: FnOnce(&mut Message, &mut reader::storage::Tracked<B>) -> Result<(), E>,
+        A: Fn() -> transmission::Entry,
+        F: FnOnce(&mut Message<A>) -> O,
     {
         let mut message = Message {
-            batch,
             queue: self,
             max_segments,
             segment_alloc,
+            transmission_alloc,
+            remote_address,
         };
 
-        let mut buf = buf.track_read();
+        push(&mut message)
+    }
 
-        push(&mut message, &mut buf)?;
+    fn push_segment(
+        &mut self,
+        transmission_alloc: impl Fn() -> transmission::Entry,
+        event: transmission::Event,
+        mut descriptor: descriptor::Filled,
+        max_segments: usize,
+    ) -> usize {
+        let transmission::Event {
+            packet_number,
+            info,
+            meta,
+        } = event;
 
-        // record how many bytes we encrypted/buffered so we only return Ready once everything has
-        // been flushed
-        self.accepted_len += buf.consumed_len();
+        let application_len = info.payload_len;
 
-        Ok(())
+        descriptor.set_ecn(info.ecn);
+
+        self.checker.on_transmission(packet_number);
+
+        self.builder.push_segment(
+            (packet_number, info),
+            meta,
+            application_len,
+            descriptor,
+            max_segments,
+            transmission_alloc,
+        );
+
+        self.accepted_len += application_len as usize;
+
+        application_len as usize
     }
 
     #[inline]
@@ -168,9 +231,6 @@ impl Queue {
         cx: &mut Context,
         limit: usize,
         socket: &S,
-        addr: &addr::Addr,
-        segment_alloc: &buffer::Allocator,
-        gso: &Gso,
         clock: &C,
         subscriber: &shared::Subscriber<Sub>,
     ) -> Poll<Result<usize, io::Error>>
@@ -179,16 +239,7 @@ impl Queue {
         C: ?Sized + Clock,
         Sub: event::Subscriber,
     {
-        ready!(self.poll_flush_segments(
-            cx,
-            socket,
-            addr,
-            segment_alloc,
-            gso,
-            // cache the timestamps to avoid fetching too many
-            &s2n_quic_core::time::clock::Cached::new(clock),
-            subscriber
-        ))?;
+        ready!(self.poll_flush_segments(cx, socket, clock, subscriber))?;
 
         // Consume accepted credits
         let accepted = limit.min(self.accepted_len);
@@ -201,9 +252,6 @@ impl Queue {
         &mut self,
         cx: &mut Context,
         socket: &S,
-        addr: &addr::Addr,
-        segment_alloc: &buffer::Allocator,
-        gso: &Gso,
         clock: &C,
         subscriber: &shared::Subscriber<Sub>,
     ) -> Poll<Result<(), io::Error>>
@@ -212,148 +260,128 @@ impl Queue {
         C: ?Sized + Clock,
         Sub: event::Subscriber,
     {
-        ensure!(!self.segments.is_empty(), Poll::Ready(Ok(())));
-
-        let default_addr = addr::Addr::new(Default::default());
-
-        let addr = if socket.features().is_connected() {
-            // no need to load the socket addr if the stream is already connected
-            &default_addr
-        } else {
-            addr
-        };
+        ensure!(!self.builder.is_empty(), Poll::Ready(Ok(())));
 
         if socket.features().is_stream() {
-            self.poll_flush_segments_stream(cx, socket, addr, segment_alloc, clock, subscriber)
+            self.poll_flush_segments_stream(cx, socket, clock, subscriber)
         } else {
-            self.poll_flush_segments_datagram(
-                cx,
-                socket,
-                addr,
-                segment_alloc,
-                gso,
-                clock,
-                subscriber,
-            )
+            self.poll_flush_segments_datagram(cx, socket, clock, subscriber)
         }
     }
 
     #[inline]
     fn poll_flush_segments_stream<S, C, Sub>(
         &mut self,
-        cx: &mut Context,
-        socket: &S,
-        addr: &addr::Addr,
-        segment_alloc: &buffer::Allocator,
-        clock: &C,
-        subscriber: &shared::Subscriber<Sub>,
+        _cx: &mut Context,
+        _socket: &S,
+        _clock: &C,
+        _subscriber: &shared::Subscriber<Sub>,
     ) -> Poll<Result<(), io::Error>>
     where
         S: ?Sized + Socket,
         C: ?Sized + Clock,
         Sub: event::Subscriber,
     {
-        while !self.segments.is_empty() {
-            let mut provided_len = 0;
-            let segments = segment::Batch::new(
-                self.segments.iter().map(|v| {
-                    let slice = v.as_slice();
-                    provided_len += slice.len();
-                    (v.ecn, v.as_slice())
-                }),
-                &socket.features(),
-            );
+        // let default_addr = addr::Addr::new(Default::default());
 
-            let ecn = segments.ecn();
+        // while !self.segments.is_empty() {
+        //     let mut provided_len = 0;
+        //     let segments = segment::Batch::new(
+        //         self.segments.iter().map(|v| {
+        //             let slice = v.as_slice();
+        //             provided_len += slice.len();
+        //             (v.ecn, v.as_slice())
+        //         }),
+        //         &socket.features(),
+        //     );
 
-            let result = socket.poll_send(cx, addr, ecn, &segments);
+        //     let ecn = segments.ecn();
 
-            let now = clock.get_time();
+        //     let result = socket.poll_send(cx, addr, ecn, &segments);
 
-            drop(segments);
+        //     let now = clock.get_time();
 
-            match result {
-                Poll::Ready(Ok(written_len)) => {
-                    subscriber.publisher(now).on_stream_write_socket_flushed(
-                        event::builder::StreamWriteSocketFlushed {
-                            provided_len,
-                            committed_len: written_len,
-                        },
-                    );
+        //     drop(segments);
 
-                    self.consume_segments(written_len, segment_alloc);
+        //     match result {
+        //         Poll::Ready(Ok(written_len)) => {
+        //             subscriber.publisher(now).on_stream_write_socket_flushed(
+        //                 event::builder::StreamWriteSocketFlushed {
+        //                     provided_len,
+        //                     committed_len: written_len,
+        //                 },
+        //             );
 
-                    // keep trying to drain the buffer
-                    continue;
-                }
-                Poll::Ready(Err(err)) => {
-                    subscriber.publisher(now).on_stream_write_socket_errored(
-                        event::builder::StreamWriteSocketErrored {
-                            provided_len,
-                            errno: err.raw_os_error(),
-                        },
-                    );
+        //             self.consume_segments(written_len);
 
-                    // the socket encountered an error so clear everything out since we're shutting
-                    // down
-                    self.segments.clear();
-                    self.accepted_len = 0;
-                    return Err(err).into();
-                }
-                Poll::Pending => {
-                    subscriber.publisher(now).on_stream_write_socket_blocked(
-                        event::builder::StreamWriteSocketBlocked { provided_len },
-                    );
+        //             // keep trying to drain the buffer
+        //             continue;
+        //         }
+        //         Poll::Ready(Err(err)) => {
+        //             subscriber.publisher(now).on_stream_write_socket_errored(
+        //                 event::builder::StreamWriteSocketErrored {
+        //                     provided_len,
+        //                     errno: err.raw_os_error(),
+        //                 },
+        //             );
 
-                    return Poll::Pending;
-                }
-            }
-        }
+        //             // the socket encountered an error so clear everything out since we're shutting
+        //             // down
+        //             self.segments.clear();
+        //             self.accepted_len = 0;
+        //             return Err(err).into();
+        //         }
+        //         Poll::Pending => {
+        //             subscriber.publisher(now).on_stream_write_socket_blocked(
+        //                 event::builder::StreamWriteSocketBlocked { provided_len },
+        //             );
 
-        Ok(()).into()
+        //             return Poll::Pending;
+        //         }
+        //     }
+        // }
+
+        // Ok(()).into()
+        todo!()
     }
 
     #[inline]
-    fn consume_segments(&mut self, consumed: usize, segment_alloc: &buffer::Allocator) {
-        ensure!(consumed > 0);
+    #[expect(dead_code)]
+    fn consume_segments(&mut self, _consumed: usize) {
+        // ensure!(consumed > 0);
 
-        let mut remaining = consumed;
+        // let mut remaining = consumed;
 
-        while let Some(mut segment) = self.segments.pop_front() {
-            if let Some(r) = remaining.checked_sub(segment.as_slice().len()) {
-                remaining = r;
+        // while let Some(mut segment) = self.segments.pop_front() {
+        //     if let Some(r) = remaining.checked_sub(segment.as_slice().len()) {
+        //         remaining = r;
 
-                // try to reuse the buffer for future allocations
-                segment_alloc.free(segment.buffer);
+        //         // if we don't have any remaining bytes to pop then we're done
+        //         ensure!(remaining > 0, break);
 
-                // if we don't have any remaining bytes to pop then we're done
-                ensure!(remaining > 0, break);
+        //         continue;
+        //     }
 
-                continue;
-            }
+        //     segment.offset += core::mem::take(&mut remaining) as u16;
 
-            segment.offset += core::mem::take(&mut remaining) as u16;
+        //     debug_assert!(!segment.as_slice().is_empty());
 
-            debug_assert!(!segment.as_slice().is_empty());
+        //     self.segments.push_front(segment);
+        //     break;
+        // }
 
-            self.segments.push_front(segment);
-            break;
-        }
-
-        debug_assert_eq!(
-            remaining, 0,
-            "consumed ({consumed}) with too many bytes remaining ({remaining})"
-        );
+        // debug_assert_eq!(
+        //     remaining, 0,
+        //     "consumed ({consumed}) with too many bytes remaining ({remaining})"
+        // );
+        todo!()
     }
 
     #[inline]
     fn poll_flush_segments_datagram<S, C, Sub>(
         &mut self,
-        cx: &mut Context,
+        _cx: &mut Context,
         socket: &S,
-        addr: &addr::Addr,
-        segment_alloc: &buffer::Allocator,
-        gso: &Gso,
         clock: &C,
         subscriber: &shared::Subscriber<Sub>,
     ) -> Poll<Result<(), io::Error>>
@@ -362,71 +390,57 @@ impl Queue {
         C: ?Sized + Clock,
         Sub: event::Subscriber,
     {
-        let mut max_segments = gso.max_segments();
+        self.transmission_timer.cancel();
 
-        while !self.segments.is_empty() {
-            let mut provided_len = 0;
-
-            // construct all of the segments we're going to send in this batch
-            let segments = segment::Batch::new(
-                self.segments
-                    .iter()
-                    .map(|v| {
-                        let slice = v.as_slice();
-                        provided_len += slice.len();
-                        (v.ecn, slice)
-                    })
-                    .take(max_segments),
-                &socket.features(),
-            );
-
-            let ecn = segments.ecn();
-
-            let result = socket.poll_send(cx, addr, ecn, &segments);
-
+        while let Some((batch, application_len)) = self.builder.pop_front() {
             let now = clock.get_time();
 
-            match &result {
-                Poll::Ready(Ok(_len)) => {
-                    subscriber.publisher(now).on_stream_write_socket_flushed(
-                        event::builder::StreamWriteSocketFlushed {
-                            provided_len,
-                            // if the syscall went through, then we wrote the whole thing
-                            committed_len: provided_len,
-                        },
-                    );
-                }
-                Poll::Ready(Err(error)) => {
-                    subscriber.publisher(now).on_stream_write_socket_errored(
-                        event::builder::StreamWriteSocketErrored {
-                            provided_len,
-                            errno: error.raw_os_error(),
-                        },
-                    );
+            let transmission_time = self.next_transmission_time;
+            let transmission_len = batch.total_len as u64;
 
-                    if gso.handle_socket_error(error).is_some() {
-                        // update the max_segments value if it was changed due to the error
-                        max_segments = 1;
-                    }
-                }
-                Poll::Pending => {
-                    subscriber.publisher(now).on_stream_write_socket_blocked(
-                        event::builder::StreamWriteSocketBlocked { provided_len },
-                    );
-                }
+            let res = if let Some(transmission_time) = transmission_time {
+                socket.send_transmission_at(batch, transmission_time.into())
+            } else {
+                socket.send_transmission(batch);
+                Ok(())
             };
 
-            // consume the segments that we transmitted
-            let segment_count = segments.len();
-            drop(segments);
-            for segment in self.segments.drain(..segment_count) {
-                // try to reuse the buffer for future allocations
-                segment_alloc.free(segment.buffer);
+            // schedule the transmission immediately
+            if let Err((batch, mut wheel_time)) = res {
+                // If the target time is in the past it means the wheel is overloaded so we need to back off a bit
+                if wheel_time.has_elapsed(now) {
+                    wheel_time += Duration::from_millis(2);
+                }
+
+                // Once the transmission timer expires then allow a packet to be inserted at the front
+                self.next_transmission_time = None;
+                self.builder.push_front(batch, application_len);
+                self.transmission_timer.set(wheel_time);
+
+                return Poll::Pending;
             }
 
-            ready!(result)?;
+            // Compute the next transmission time given the amount of bytes we're transmitting and the bandwidth
+            let delay = transmission_len / self.bandwidth;
+            let transmission_time = transmission_time.unwrap_or_else(|| now.into());
+            self.next_transmission_time = Some(transmission_time + delay);
+
+            let provided_len = application_len as usize;
+            subscriber.publisher(now).on_stream_write_socket_flushed(
+                event::builder::StreamWriteSocketFlushed {
+                    provided_len,
+                    // if the syscall went through, then we wrote the whole thing
+                    committed_len: provided_len,
+                },
+            );
         }
 
         Ok(()).into()
+    }
+}
+
+impl timer::Provider for Queue {
+    fn timers<Q: timer::Query>(&self, query: &mut Q) -> timer::Result {
+        self.transmission_timer.timers(query)
     }
 }

@@ -21,6 +21,8 @@ const fn min_u16(a: u16, b: u16) -> u16 {
     }
 }
 
+pub const MAX_UDP_PAYLOAD: u16 = 9001 - IPV4_HEADER_LEN - UDP_HEADER_LEN;
+
 /// The maximum number of segments in sendmsg calls
 ///
 /// From <https://elixir.bootlin.com/linux/v6.8.7/source/include/uapi/linux/uio.h#L28>

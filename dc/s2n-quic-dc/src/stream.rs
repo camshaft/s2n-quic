@@ -15,7 +15,7 @@ pub mod client;
 pub mod crypto;
 pub mod endpoint;
 pub mod environment;
-pub mod pacer;
+pub mod load_balance;
 pub mod packet_map;
 pub mod packet_number;
 pub mod processing;

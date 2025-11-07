@@ -3,7 +3,7 @@
 
 use super::*;
 use crate::{
-    socket::recv,
+    socket::pool,
     stream::Actor,
     testing::{ext::*, sim},
 };
@@ -22,10 +22,19 @@ enum Op {
     DropDispatcher,
 }
 
+fn creds(key_id: u32) -> Credentials {
+    let id = credentials::Id::from([32u8; 16]);
+    let key_id = VarInt::from_u32(key_id);
+    Credentials { id, key_id }
+}
+
 struct Model {
     oracle: Oracle,
     alloc: Option<Allocator>,
     dispatch: Option<Dispatch>,
+    #[allow(dead_code)]
+    unroutable_packets: mpsc::Receiver<desc::Filled>,
+    key_id: u32,
 }
 
 impl Default for Model {
@@ -43,13 +52,16 @@ impl Model {
         } else {
             Allocator::new(stream_cap, control_cap)
         };
-        let dispatch = alloc.dispatcher();
+        let (tx, unroutable_packets) = mpsc::new(64);
+        let dispatch = alloc.dispatcher(tx);
         let oracle = Oracle::new(packets);
 
         Self {
             oracle,
             alloc: Some(alloc),
             dispatch: Some(dispatch),
+            unroutable_packets,
+            key_id: 0,
         }
     }
 
@@ -83,7 +95,9 @@ impl Model {
         let Some(alloc) = self.alloc.as_mut() else {
             return;
         };
-        let (control, stream) = alloc.alloc_or_grow(None);
+        let key_id = self.key_id;
+        self.key_id += 1;
+        let (control, stream) = alloc.alloc_or_grow(&creds(key_id));
         self.oracle.on_alloc(control, stream);
     }
 
@@ -101,7 +115,7 @@ impl Model {
         };
 
         let (packet_id, packet) = self.oracle.packets.create();
-        let res = dispatch.send_control(queue_id, packet);
+        let res = dispatch.send_control(queue_id, None, packet);
         self.oracle.on_control_dispatch(queue_id, packet_id, res);
     }
 
@@ -115,7 +129,7 @@ impl Model {
         };
 
         let (packet_id, packet) = self.oracle.packets.create();
-        let res = dispatch.send_stream(queue_id, packet);
+        let res = dispatch.send_stream(queue_id, None, packet);
         self.oracle.on_stream_dispatch(queue_id, packet_id, res);
     }
 }
@@ -158,12 +172,7 @@ impl Oracle {
         );
     }
 
-    fn on_control_dispatch(
-        &mut self,
-        idx: VarInt,
-        packet_id: u64,
-        result: Result<Option<desc::Filled>, Error>,
-    ) {
+    fn on_control_dispatch(&mut self, idx: VarInt, packet_id: u64, result: Result<(), Error<()>>) {
         let Some(channel) = self.control.get(&idx) else {
             assert!(result.is_err());
             return;
@@ -181,12 +190,7 @@ impl Oracle {
         );
     }
 
-    fn on_stream_dispatch(
-        &mut self,
-        idx: VarInt,
-        packet_id: u64,
-        result: Result<Option<desc::Filled>, Error>,
-    ) {
+    fn on_stream_dispatch(&mut self, idx: VarInt, packet_id: u64, result: Result<(), Error<()>>) {
         let Some(channel) = self.stream.get(&idx) else {
             assert!(result.is_err());
             return;
@@ -228,31 +232,32 @@ impl Oracle {
 
 #[derive(Clone)]
 struct Packets {
-    packets: recv::pool::Pool,
+    packets: pool::Pool,
     packet_id: u64,
 }
 
 impl Default for Packets {
     fn default() -> Self {
         Self {
-            packets: recv::pool::Pool::new(8, 8),
+            packets: pool::Pool::new(8),
             packet_id: Default::default(),
         }
     }
 }
 
 impl Packets {
-    fn create(&mut self) -> (u64, recv::descriptor::Filled) {
+    fn create(&mut self) -> (u64, pool::descriptor::Filled) {
         let packet_id = self.packet_id;
         self.packet_id += 1;
-        let unfilled = self.packets.alloc_or_grow();
+        let unfilled = self.packets.alloc().unwrap();
         let packet = unfilled
-            .recv_with(|_addr, _cmsg, mut payload| {
+            .fill_with(|_addr, _cmsg, mut payload| {
                 let v = packet_id.to_be_bytes();
                 payload[..v.len()].copy_from_slice(&v);
                 <std::io::Result<_>>::Ok(v.len())
             })
             .unwrap()
+            .into_iter()
             .next()
             .unwrap();
         (packet_id, packet)
@@ -285,8 +290,8 @@ fn alloc_drop_notify() {
         let control_cap = 1;
         let mut alloc = Allocator::new(stream_cap, control_cap);
 
-        for _ in 0..2 {
-            let (stream, control) = alloc.alloc_or_grow(None);
+        for id in 0..2 {
+            let (stream, control) = alloc.alloc_or_grow(&creds(id));
 
             async move {
                 stream.recv(Actor::Application).await.unwrap_err();
@@ -313,18 +318,15 @@ fn alloc_drop_notify() {
 #[test]
 fn associated_credentials() {
     check!().exhaustive().run(|| {
-        let mut alloc = Allocator::new(1, 1);
+        let mut alloc = Allocator::new_non_zero(1, 1);
         let alloc = &mut alloc;
-        let mut key_id = VarInt::ZERO;
+        let mut key_id = 0;
         let key_id = &mut key_id;
 
         let mut alloc_one = move || {
-            let creds = Credentials {
-                id: credentials::Id::default(),
-                key_id: *key_id,
-            };
+            let creds = creds(*key_id);
             *key_id += 1;
-            let (stream, control) = alloc.alloc_or_grow(Some(&creds));
+            let (stream, control) = alloc.alloc_or_grow(&creds);
             let keys = alloc.pool.keys();
 
             move || {
@@ -390,8 +392,11 @@ fn stress_test() {
         });
 
         let alloc = s.spawn(move || {
+            let mut key_id = 0;
             while IS_OPEN.load(Ordering::Relaxed) {
-                let (control, stream) = alloc.alloc_or_grow(None);
+                let creds = creds(key_id);
+                key_id += 1;
+                let (control, stream) = alloc.alloc_or_grow(&creds);
                 stream_send.send(stream).unwrap();
                 control_send.send(control).unwrap();
             }

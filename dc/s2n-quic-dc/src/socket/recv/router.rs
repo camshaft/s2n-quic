@@ -5,7 +5,7 @@ use crate::{
     credentials::{self, Credentials},
     packet::{self, stream},
     path::secret,
-    socket::recv::descriptor,
+    socket::pool::descriptor,
 };
 use s2n_codec::DecoderBufferMut;
 use s2n_quic_core::{
@@ -26,7 +26,7 @@ pub use with_map::WithMap;
 pub use zero_router::ZeroRouter;
 
 /// Routes incoming packet segments to the appropriate destination
-pub trait Router {
+pub trait Router: 'static {
     /// Wraps `self` in a router that intercepts secret control messages and forwards
     /// them to the provided [`secret::Map`].
     #[inline]
@@ -62,7 +62,7 @@ pub trait Router {
         let remote_address = segment.remote_address().get();
         let ecn = segment.ecn();
         let decoder = DecoderBufferMut::new(segment.payload_mut());
-        match decoder.decode_parameterized(self.tag_len()) {
+        match decoder.decode_parameterized::<packet::Packet>(self.tag_len()) {
             // We don't check `remaining` since we currently assume one packet per segment.
             // If we ever support multiple packets per segment, we'll need to split the segment up even
             // further and correctly dispatch to the right place.
@@ -73,12 +73,17 @@ pub trait Router {
                         "packet = {packet:?}, remaining = {remaining:?}"
                     );
                 }
+
                 match packet {
                     packet::Packet::Control(packet) => {
                         let tag = packet.tag();
                         let stream_id = packet.stream_id().copied();
                         let credentials = *packet.credentials();
-                        tracing::trace!(?tag, ?stream_id, ?credentials, "parsed_control_packet");
+
+                        #[cfg(debug_assertions)]
+                        let _span = tracing::info_span!("recv::control", peer_addr = %remote_address, flow_id = %credentials).entered();
+
+                        tracing::trace!(?tag, ?stream_id, %credentials, "parsed_control_packet");
                         self.handle_control_packet(remote_address, ecn, packet);
                         self.dispatch_control_packet(tag, stream_id, credentials, segment);
                     }
@@ -86,16 +91,36 @@ pub trait Router {
                         let tag = packet.tag();
                         let stream_id = *packet.stream_id();
                         let credentials = *packet.credentials();
-                        tracing::trace!(?tag, ?stream_id, ?credentials, "parsed_stream_packet");
+
+                        #[cfg(debug_assertions)]
+                        let _span = tracing::info_span!("recv::stream", peer_addr = %remote_address, flow_id = %credentials).entered();
+
+                        tracing::trace!(?tag, ?stream_id, %credentials, "parsed_stream_packet");
                         self.handle_stream_packet(remote_address, ecn, packet);
                         self.dispatch_stream_packet(tag, stream_id, credentials, segment);
                     }
                     packet::Packet::Datagram(packet) => {
                         let tag = packet.tag();
                         let credentials = *packet.credentials();
-                        tracing::trace!(?tag, ?credentials, "parsed_datagram_packet");
+
+                        #[cfg(debug_assertions)]
+                        let _span = tracing::info_span!("recv::datagram", peer_addr = %remote_address, flow_id = %credentials).entered();
+
+                        tracing::trace!(?tag, %credentials, "parsed_datagram_packet");
                         self.handle_datagram_packet(remote_address, ecn, packet);
                         self.dispatch_datagram_packet(tag, credentials, segment);
+                    }
+                    packet::Packet::FlowReset(packet) => {
+                        let tag = packet.tag();
+                        let queue_id = packet.queue_id();
+                        let credentials = *packet.credentials();
+
+                        #[cfg(debug_assertions)]
+                        let _span = tracing::info_span!("recv::flow_reset", peer_addr = %remote_address, flow_id = %credentials).entered();
+
+                        tracing::trace!(?tag, ?queue_id, %credentials, "parsed_flow_reset_packet");
+                        self.handle_flow_reset_packet(remote_address, ecn, packet);
+                        self.dispatch_flow_reset_packet(tag, queue_id, credentials, segment);
                     }
                     packet::Packet::StaleKey(packet) => {
                         tracing::trace!(?packet, "parsed_stale_key_packet");
@@ -147,10 +172,11 @@ pub trait Router {
     ) {
         warn!(
             unhandled_packet = "control",
+            router = core::any::type_name::<Self>(),
             ?tag,
             ?id,
-            ?credentials,
-            remote_address = ?segment.remote_address(),
+            %credentials,
+            remote_address = %segment.remote_address(),
             packet_len = segment.len()
         );
     }
@@ -176,10 +202,11 @@ pub trait Router {
     ) {
         warn!(
             unhandled_packet = "stream",
+            router = core::any::type_name::<Self>(),
             ?tag,
             ?id,
-            ?credentials,
-            remote_address = ?segment.remote_address(),
+            %credentials,
+            remote_address = %segment.remote_address(),
             packet_len = segment.len()
         );
     }
@@ -204,9 +231,40 @@ pub trait Router {
     ) {
         warn!(
             unhandled_packet = "datagram",
+            router = core::any::type_name::<Self>(),
             ?tag,
-            ?credentials,
-            remote_address = ?segment.remote_address(),
+            %credentials,
+            remote_address = %segment.remote_address(),
+            packet_len = segment.len()
+        );
+    }
+
+    #[inline(always)]
+    fn handle_flow_reset_packet(
+        &mut self,
+        remote_address: SocketAddress,
+        ecn: ExplicitCongestionNotification,
+        packet: packet::secret_control::flow_reset::Packet,
+    ) {
+        let _ = ecn;
+        self.on_unhandled_packet(remote_address, packet::Packet::FlowReset(packet));
+    }
+
+    #[inline]
+    fn dispatch_flow_reset_packet(
+        &mut self,
+        tag: packet::secret_control::flow_reset::Tag,
+        queue_id: VarInt,
+        credentials: Credentials,
+        segment: descriptor::Filled,
+    ) {
+        warn!(
+            unhandled_packet = "flow_reset",
+            router = core::any::type_name::<Self>(),
+            ?tag,
+            queue_id = queue_id.as_u64(),
+            %credentials,
+            remote_address = %segment.remote_address(),
             packet_len = segment.len()
         );
     }
@@ -229,9 +287,10 @@ pub trait Router {
     ) {
         warn!(
             unhandled_packet = "stale_key",
+            router = core::any::type_name::<Self>(),
             ?queue_id,
-            ?credentials,
-            remote_address = ?segment.remote_address(),
+            %credentials,
+            remote_address = %segment.remote_address(),
             packet_len = segment.len()
         );
     }
@@ -254,9 +313,10 @@ pub trait Router {
     ) {
         warn!(
             unhandled_packet = "replay_detected",
+            router = core::any::type_name::<Self>(),
             ?queue_id,
-            ?credentials,
-            remote_address = ?segment.remote_address(),
+            %credentials,
+            remote_address = %segment.remote_address(),
             packet_len = segment.len()
         );
     }
@@ -278,16 +338,17 @@ pub trait Router {
     ) {
         warn!(
             unhandled_packet = "unknown_path_secret",
+            router = core::any::type_name::<Self>(),
             ?queue_id,
-            ?credentials,
-            remote_address = ?segment.remote_address(),
+            %credentials,
+            remote_address = %segment.remote_address(),
             packet_len = segment.len()
         );
     }
 
     #[inline]
     fn on_unhandled_packet(&mut self, remote_address: SocketAddress, packet: packet::Packet) {
-        warn!(unhandled_packet = ?packet, ?remote_address)
+        warn!(unhandled_packet = ?packet, %remote_address)
     }
 
     #[inline]
@@ -298,8 +359,9 @@ pub trait Router {
         segment: descriptor::Filled,
     ) {
         warn!(
+            router = core::any::type_name::<Self>(),
             ?error,
-            ?remote_address,
+            %remote_address,
             packet_len = segment.len(),
             "failed to decode packet"
         );

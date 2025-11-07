@@ -21,7 +21,6 @@ use crate::{
 use core::num::{NonZeroU16, NonZeroUsize};
 use s2n_quic_core::ensure;
 use std::{io, net::SocketAddr, time::Duration};
-use tokio::io::unix::AsyncFd;
 use tracing::Instrument as _;
 
 // The kernel contends on fdtable lock when calling accept to locate free file
@@ -35,7 +34,6 @@ use tracing::Instrument as _;
 pub const MAX_TCP_WORKERS: usize = 4;
 
 pub mod tcp;
-pub mod udp;
 pub mod uds;
 
 // This trait is a solution to abstract local_addr and map methods
@@ -133,6 +131,8 @@ pub struct Builder {
     send_buffer: Option<usize>,
     recv_buffer: Option<usize>,
     reuse_addr: Option<bool>,
+    send_socket_workers: udp_pool::Workers,
+    recv_socket_workers: udp_pool::Workers,
 }
 
 impl Default for Builder {
@@ -150,6 +150,8 @@ impl Default for Builder {
             send_buffer: None,
             recv_buffer: None,
             reuse_addr: None,
+            send_socket_workers: Default::default(),
+            recv_socket_workers: Default::default(),
         }
     }
 }
@@ -236,6 +238,16 @@ impl Builder {
     common_builder_methods!();
     manager_builder_methods!();
 
+    pub fn with_send_socket_workers(mut self, workers: udp_pool::Workers) -> Self {
+        self.send_socket_workers = workers;
+        self
+    }
+
+    pub fn with_recv_socket_workers(mut self, workers: udp_pool::Workers) -> Self {
+        self.recv_socket_workers = workers;
+        self
+    }
+
     pub fn build<H: Handshake + Clone, S: event::Subscriber + Clone>(
         mut self,
         handshake: H,
@@ -262,9 +274,7 @@ impl Builder {
             .with_threads(concurrency)
             .with_acceptor(stream_sender.clone());
 
-        let enable_udp_pool = true;
-
-        if self.enable_udp && enable_udp_pool {
+        if self.enable_udp {
             // configure the socket options with the specified address
             let mut options = socket::Options::new(self.acceptor_addr);
 
@@ -277,13 +287,19 @@ impl Builder {
 
             pool.reuse_port = concurrency > 1;
             pool.accept_flavor = self.accept_flavor;
+            pool.send_workers = self.send_socket_workers;
+            pool.recv_workers = self.recv_socket_workers;
 
             env = env.with_pool(pool);
         }
 
+        if self.enable_tcp {
+            env = env.with_tcp_transmission_pool(socket::pool::Pool::new(u16::MAX));
+        }
+
         let env = env.build()?;
 
-        if self.enable_udp && enable_udp_pool {
+        if self.enable_udp {
             // update the address with the selected port
             self.acceptor_addr = env.pool_addr().unwrap();
             // don't use the owned socket acceptor
@@ -400,13 +416,14 @@ impl<H: Handshake + Clone, S: event::Subscriber + Clone> Start<'_, H, S> {
         debug_assert!(self.enable_tcp);
         debug_assert!(self.enable_udp);
 
-        let (local_addr, udp_socket, tcp_socket) =
+        let (local_addr, _udp_socket, tcp_socket) =
             super::spawn_initial_wildcard_pair(self.server.local_addr, |addr| {
                 self.socket_opts(addr)
             })?;
         self.server.local_addr = local_addr;
-        self.spawn_udp(udp_socket)?;
+        // self.spawn_udp(udp_socket)?;
         self.spawn_tcp(tcp_socket)?;
+
         Ok(())
     }
 
@@ -422,8 +439,7 @@ impl<H: Handshake + Clone, S: event::Subscriber + Clone> Start<'_, H, S> {
             for idx in 0..count {
                 match protocol {
                     socket::Protocol::Udp => {
-                        let socket = self.socket_opts(self.server.local_addr).build_udp()?;
-                        self.spawn_udp(socket)?;
+                        unimplemented!("owned UDP sockets are no longer supported")
                     }
                     socket::Protocol::Tcp => {
                         if idx + already_running >= MAX_TCP_WORKERS {
@@ -471,36 +487,36 @@ impl<H: Handshake + Clone, S: event::Subscriber + Clone> Start<'_, H, S> {
         options
     }
 
-    #[inline]
-    fn spawn_udp(&mut self, socket: std::net::UdpSocket) -> io::Result<()> {
-        // if this is the first socket being spawned then update the local address
-        if self.server.local_addr.port() == 0 {
-            self.server.local_addr = socket.local_addr()?;
-        }
+    // #[inline]
+    // fn spawn_udp(&mut self, socket: std::net::UdpSocket) -> io::Result<()> {
+    //     // if this is the first socket being spawned then update the local address
+    //     if self.server.local_addr.port() == 0 {
+    //         self.server.local_addr = socket.local_addr()?;
+    //     }
 
-        let socket = AsyncFd::new(socket)?;
-        let id = self.id();
+    //     let socket = AsyncFd::new(socket)?;
+    //     let id = self.id();
 
-        let acceptor = udp::Acceptor::new(
-            id,
-            socket,
-            &self.stream_sender,
-            &self.server.env,
-            self.server.handshake.map(),
-            self.accept_flavor,
-        )
-        .run();
+    //     let acceptor = udp::Acceptor::new(
+    //         id,
+    //         socket,
+    //         &self.stream_sender,
+    //         &self.server.env,
+    //         self.server.handshake.map(),
+    //         self.accept_flavor,
+    //     )
+    //     .run();
 
-        if self.span.is_disabled() {
-            self.server.acceptor_rt.spawn(acceptor);
-        } else {
-            self.server
-                .acceptor_rt
-                .spawn(acceptor.instrument(self.span.clone()));
-        }
+    //     if self.span.is_disabled() {
+    //         self.server.acceptor_rt.spawn(acceptor);
+    //     } else {
+    //         self.server
+    //             .acceptor_rt
+    //             .spawn(acceptor.instrument(self.span.clone()));
+    //     }
 
-        Ok(())
-    }
+    //     Ok(())
+    // }
 
     #[inline]
     fn spawn_tcp(&mut self, socket: std::net::TcpListener) -> io::Result<()> {

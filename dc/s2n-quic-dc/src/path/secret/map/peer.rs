@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::{dc, seal, Bidirectional, Credentials, Entry, Id, Map, TransportFeatures};
+use s2n_quic_core::time::Timestamp;
 use std::sync::Arc;
 
 pub struct Peer {
@@ -28,6 +29,16 @@ impl Peer {
         let keys = self.entry.bidi_local(features);
 
         (keys, self.entry.parameters())
+    }
+
+    /// Atomically claims the next connection slot for rate limiting.
+    ///
+    /// Returns the `Timestamp` at which the caller should start sending packets.
+    /// This can be used to initialize the transmission wheel's start time rather
+    /// than starting at `now`.
+    #[inline]
+    pub fn next_connection_time(&self, now: Timestamp) -> Timestamp {
+        self.entry.next_connection_time(now)
     }
 
     #[inline]

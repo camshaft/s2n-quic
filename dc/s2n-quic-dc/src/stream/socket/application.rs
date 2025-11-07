@@ -42,6 +42,15 @@ impl<T: ?Sized + Application> Application for Arc<T> {
 
 pub struct Single<S>(pub(crate) S);
 
+impl<S: Socket> core::ops::Deref for Single<S> {
+    type Target = S;
+
+    #[inline(always)]
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
 impl<S: Socket> Application for Single<S> {
     #[inline]
     fn protocol(&self) -> Protocol {

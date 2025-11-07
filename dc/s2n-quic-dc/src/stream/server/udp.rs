@@ -13,27 +13,34 @@ use crate::{
     msg,
     packet::stream,
     path::secret,
-    socket::recv::{descriptor, router::Router},
+    socket::{
+        pool::{self, descriptor},
+        recv::router::Router,
+    },
     stream::{
         endpoint,
         environment::{udp, Environment},
+        load_balance::PickTwo,
         recv::dispatch::{Allocator, Dispatch},
         socket, TransportFeatures,
     },
+    sync::mpsc,
 };
 use s2n_quic_core::{
     event::IntoEvent,
     inet::{ExplicitCongestionNotification, SocketAddress},
     time::Clock,
+    varint::VarInt,
 };
 use std::{io, sync::Arc};
 use tracing::debug;
 
-pub struct Acceptor<Env, S, W>
+pub struct Acceptor<Env, S, W, R>
 where
     Env: Environment,
     S: socket::application::Application,
     W: socket::Socket,
+    R: socket::Socket,
 {
     sender: accept::Sender<Env::Subscriber>,
     env: Env,
@@ -43,15 +50,19 @@ where
     queues: Allocator,
     is_open: bool,
     packet: InitialPacket,
-    application_socket: Arc<S>,
+    transmission_pool: pool::Pool,
+    application_sockets: Box<[Arc<S>]>,
     worker_socket: Arc<W>,
+    secret_socket: R,
+    load_balancer: PickTwo,
 }
 
-impl<Env, S, W> Acceptor<Env, S, W>
+impl<Env, S, W, R> Acceptor<Env, S, W, R>
 where
     Env: Environment,
     S: socket::application::Application,
     W: socket::Socket,
+    R: socket::Socket,
 {
     pub fn new(
         env: Env,
@@ -59,10 +70,13 @@ where
         secrets: secret::Map,
         accept_flavor: accept::Flavor,
         queues: Allocator,
-        application_socket: Arc<S>,
+        application_sockets: Box<[Arc<S>]>,
         worker_socket: Arc<W>,
+        secret_socket: R,
+        transmission_pool: pool::Pool,
+        unroutable_packets: mpsc::Sender<descriptor::Filled>,
     ) -> Self {
-        let dispatch = queues.dispatcher();
+        let dispatch = queues.dispatcher(unroutable_packets);
         let packet = InitialPacket::empty();
         Self {
             sender,
@@ -73,18 +87,22 @@ where
             queues,
             is_open: true,
             packet,
-            application_socket,
+            transmission_pool,
+            application_sockets,
             worker_socket,
+            secret_socket,
+            load_balancer: PickTwo::new(),
         }
     }
 }
 
-impl<Env, S, W> Router for Acceptor<Env, S, W>
+impl<Env, S, W, R> Router for Acceptor<Env, S, W, R>
 where
-    Env: Environment,
+    Env: Environment + 'static,
     Env::Subscriber: Clone,
     S: socket::application::Application,
     W: socket::Socket,
+    R: socket::Socket,
 {
     #[inline]
     fn is_open(&self) -> bool {
@@ -109,16 +127,26 @@ where
         credentials: Credentials,
         segment: descriptor::Filled,
     ) {
+        let peer_addr = segment.remote_address().get();
+
+        #[cfg(debug_assertions)]
+        let _span = tracing::warn_span!("stream", %peer_addr, flow_id = %credentials).entered();
+
+        tracing::debug!(%peer_addr, flow_id = %credentials, "routing zero queue");
+
         // check to see if these credentials are associated with an active stream
         if let Some(queue_id) = self.dispatch.queue_id_for_key(&credentials) {
             tracing::trace!(%queue_id, "credential_cache_hit");
-            let _ = self.dispatch.send_stream(queue_id, segment);
+            let _ = self
+                .dispatch
+                .send_stream(queue_id, Some(&credentials), segment);
             return;
         }
 
-        let peer_addr = segment.remote_address().get();
+        let (control, stream) = self.queues.alloc_or_grow(&credentials);
 
-        let (control, stream) = self.queues.alloc_or_grow(Some(&credentials));
+        debug_assert_ne!(control.queue_id(), VarInt::ZERO);
+
         // inject the packet into the stream queue
         let _ = stream.push(segment);
 
@@ -133,8 +161,15 @@ where
             .subscriber()
             .create_connection_context(&meta, &info);
 
-        let application_socket = self.application_socket.clone();
+        // Use "pick 2" load balancing to select an application socket
+        let idx = self.load_balancer.select(
+            &self.application_sockets,
+            |socket| Arc::strong_count(socket),
+            |upper_bound| rand::random_range(..upper_bound),
+        );
+        let application_socket = self.application_sockets[idx].clone();
         let worker_socket = self.worker_socket.clone();
+        let transmission_pool = self.transmission_pool.clone();
 
         let peer = udp::Pooled {
             peer_addr,
@@ -142,6 +177,7 @@ where
             stream,
             application_socket,
             worker_socket,
+            transmission_pool,
         };
 
         let mut secret_control = vec![];
@@ -152,12 +188,14 @@ where
             &mut secret_control,
         ) {
             Ok(result) => result,
-            Err(_error) => {
+            Err(error) => {
+                tracing::debug!(?error, "failed to derive stream credentials");
+
                 if !secret_control.is_empty() {
                     let addr = msg::addr::Addr::new(peer_addr);
                     let ecn = Default::default();
                     let buffer = &[io::IoSlice::new(&secret_control)];
-                    let _ = self.worker_socket.try_send(&addr, ecn, buffer);
+                    let _ = self.secret_socket.try_send(&addr, ecn, buffer);
                 }
                 return;
             }
@@ -228,6 +266,33 @@ where
                 debug!("application accept queue dropped; shutting down");
                 self.is_open = false;
             }
+        }
+    }
+
+    #[inline]
+    fn handle_control_packet(
+        &mut self,
+        _remote_address: SocketAddress,
+        _ecn: ExplicitCongestionNotification,
+        _packet: crate::packet::control::decoder::Packet,
+    ) {
+    }
+
+    #[inline]
+    fn dispatch_control_packet(
+        &mut self,
+        _tag: crate::packet::control::Tag,
+        _id: Option<stream::Id>,
+        credentials: Credentials,
+        segment: descriptor::Filled,
+    ) {
+        // check to see if these credentials are associated with an active stream
+        if let Some(queue_id) = self.dispatch.queue_id_for_key(&credentials) {
+            tracing::trace!(%queue_id, "credential_cache_hit");
+            let _ = self
+                .dispatch
+                .send_control(queue_id, Some(&credentials), segment);
+            return;
         }
     }
 }

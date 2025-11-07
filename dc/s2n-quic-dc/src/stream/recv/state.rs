@@ -2,17 +2,15 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
-    allocator::Allocator,
-    clock,
     credentials::Credentials,
     crypto::{self, UninitSlice},
     event,
     packet::{control, stream},
     stream::{
         recv::{
-            ack,
             error::{self, Error},
             packet,
+            shared::TransmitQueue,
         },
         shared::AcceptState,
         TransportFeatures, DEFAULT_IDLE_TIMEOUT,
@@ -24,10 +22,8 @@ use s2n_quic_core::{
     buffer::{self, reader::storage::Infallible as _},
     dc::ApplicationParams,
     endpoint::Location,
-    ensure,
-    frame::{self, ack::EcnCounts},
+    ensure, frame,
     inet::ExplicitCongestionNotification,
-    packet::number::PacketNumberSpace,
     ready,
     stream::state::Receiver,
     time::{
@@ -37,6 +33,9 @@ use s2n_quic_core::{
     varint::VarInt,
 };
 
+mod max_data;
+mod transmission;
+
 #[derive(Clone, Copy, Debug)]
 struct ErrorState {
     error: Error,
@@ -45,19 +44,15 @@ struct ErrorState {
 
 #[derive(Debug)]
 pub struct State {
-    ecn_counts: EcnCounts,
     control_packet_number: u64,
-    stream_ack: ack::Space,
-    recovery_ack: ack::Space,
-    pub(crate) state: Receiver,
+    transmission: transmission::Transmission,
+    state: Receiver,
     idle_timer: Timer,
     idle_timeout: Duration,
     // maintains a stable tick timer to avoid timer churn in the platform timer
     tick_timer: Timer,
-    _should_transmit: bool,
     is_reliable: bool,
-    max_data: VarInt,
-    max_data_window: VarInt,
+    max_data: max_data::MaxData,
     error: Option<ErrorState>,
     fin_ack_packet_number: Option<VarInt>,
     features: TransportFeatures,
@@ -77,8 +72,9 @@ impl State {
         let (initial_max_data, max_data_window) = if features.is_flow_controlled() {
             (VarInt::MAX, VarInt::MAX)
         } else {
-            let initial_max_data = params.remote_max_data;
-            let data_window = params.local_recv_max_data;
+            let initial_max_data = params.local_recv_max_data;
+            // use the send data window for the actual window after the stream has been accepted
+            let data_window = params.local_send_max_data;
             (initial_max_data, data_window)
         };
 
@@ -93,17 +89,13 @@ impl State {
 
         Self {
             is_reliable: stream_id.is_reliable,
-            ecn_counts: Default::default(),
             control_packet_number: Default::default(),
-            stream_ack: Default::default(),
-            recovery_ack: Default::default(),
+            transmission: Default::default(),
             state: Default::default(),
             idle_timer,
             idle_timeout,
             tick_timer,
-            _should_transmit: false,
-            max_data: initial_max_data,
-            max_data_window,
+            max_data: max_data::MaxData::new(initial_max_data, max_data_window),
             error: None,
             fin_ack_packet_number: None,
             features,
@@ -163,33 +155,28 @@ impl State {
             out_buf.infallible_copy_into(chunk);
         }
 
-        // Only increase the max data if the application has accepted the stream.
-        if matches!(accept_state, AcceptState::Accepted) {
-            let new_max_data = out_buf
-                .current_offset()
-                .saturating_add(self.max_data_window);
-
-            // record our new max data value
-            if new_max_data > self.max_data {
-                // TODO make this smarter to avoid sending too many MAX_DATA frames
-                self.max_data = new_max_data;
-                self.needs_transmission("new_max_data");
-            }
-        }
-
-        // if we know the final offset then update the sate
+        // if we know the final offset then update the state
         if out_buf.final_offset().is_some() {
             let _ = self.state.on_receive_fin();
         }
 
         // if we've received everything then update the state
         if out_buf.has_buffered_fin() && self.state.on_receive_all_data().is_ok() {
-            self.needs_transmission("receive_all_data");
+            // send an immediate ACK to confirm we received all data
+            self.transmission.on_receive_all_data();
         }
 
         // if we've completely drained the out buffer try transitioning to the final state
-        if out_buf.is_consumed() && self.state.on_app_read_all_data().is_ok() {
-            self.needs_transmission("app_read_all_data");
+        if out_buf.is_consumed() {
+            let _ = self.state.on_app_read_all_data();
+            // no need to transmit here - the sender has likely already received our
+            // receive_all_data
+        }
+
+        // Only increase the max data if the application has accepted the stream.
+        if matches!(accept_state, AcceptState::Accepted) {
+            self.max_data
+                .on_read(out_buf.current_offset(), out_buf.final_offset());
         }
     }
 
@@ -235,9 +222,9 @@ impl State {
         if self.features.is_stream() {
             // if the transport is streaming then we expect packet numbers in order
             let expected_pn = self
+                .transmission
                 .stream_ack
-                .packets
-                .max_value()
+                .max_received_packet()
                 .map_or(0, |v| v.as_u64() + 1);
             let actual_pn = packet.packet_number().as_u64();
             ensure!(
@@ -359,7 +346,7 @@ impl State {
 
             tracing::error!(
                 message = "max data exceeded",
-                allowed = packet.receiver.max_data.as_u64(),
+                allowed = packet.receiver.max_data.value().as_u64(),
                 requested = packet
                     .packet
                     .stream_offset()
@@ -474,10 +461,7 @@ impl State {
         ensure!(!self.features.is_flow_controlled(), true);
 
         self.max_data
-            .as_u64()
-            .checked_sub(packet.payload().len() as u64)
-            .and_then(|v| v.checked_sub(packet.stream_offset().as_u64()))
-            .is_some()
+            .ensure_packet(packet.stream_offset(), packet.payload().len() as u64)
     }
 
     #[inline]
@@ -500,28 +484,30 @@ impl State {
         );
 
         let space = match packet.tag().packet_space() {
-            stream::PacketSpace::Stream => &mut self.stream_ack,
-            stream::PacketSpace::Recovery => &mut self.recovery_ack,
+            stream::PacketSpace::Stream => &mut self.transmission.stream_ack,
+            stream::PacketSpace::Recovery => &mut self.transmission.recovery_ack,
         };
         ensure!(
             space.filter.on_packet(packet).is_ok(),
             Err(error::Kind::Duplicate.err())
         );
 
-        let packet_number = PacketNumberSpace::Initial.new_packet_number(packet.packet_number());
-        if let Err(err) = space.packets.insert_packet_number(packet_number) {
-            tracing::debug!("could not record packet number {packet_number} with error {err:?}");
-        }
+        let packet_number = packet.packet_number();
 
-        // if we got a new packet then we'll need to transmit an ACK
-        // TODO make this smarter to avoid sending too many ACKs
-        self.needs_transmission("new_packet");
+        space.on_packet_received(packet_number, clock.get_time());
 
         // update the idle timer since we received a valid packet
         if matches!(self.state, Receiver::Recv | Receiver::SizeKnown)
             || packet.stream_offset() == VarInt::ZERO
         {
             self.update_idle_timer(clock);
+
+            // ACK immediately during active reception for congestion control feedback
+            self.transmission.on_new_packet_active();
+        } else {
+            // After receiving all data, rate-limit ACKs to avoid storms while still
+            // confirming delivery for the sender's probes
+            self.transmission.on_new_packet_draining(clock);
         }
 
         for frame in packet.control_frames_mut() {
@@ -543,13 +529,23 @@ impl State {
                     self.on_error(error, Location::Remote, publisher);
                     return Err(error);
                 }
+                frame::Frame::DataBlocked(data_blocked) => {
+                    publisher.on_stream_data_blocked_received(
+                        event::builder::StreamDataBlockedReceived {
+                            packet_number: packet_number.as_u64(),
+                            stream_offset: data_blocked.data_limit.as_u64(),
+                        },
+                    );
+                    // respond to the sender with our current MAX_DATA value if they're behind
+                    self.max_data.on_data_blocked(data_blocked.data_limit);
+                }
                 _ => {
                     // ignore other frames for now
                 }
             }
         }
 
-        self.ecn_counts.increment(ecn);
+        self.transmission.increment_ecn(ecn);
 
         if !self.is_reliable {
             // TODO should we perform loss detection on the receiver and reset the stream if we have a big
@@ -564,7 +560,11 @@ impl State {
 
     #[inline]
     pub fn should_transmit(&self) -> bool {
-        self._should_transmit
+        let mut enabled = self.transmission.is_queued();
+        if matches!(self.state, Receiver::Recv | Receiver::SizeKnown) {
+            enabled |= self.max_data.is_queued();
+        }
+        enabled
     }
 
     #[inline]
@@ -582,29 +582,11 @@ impl State {
     }
 
     #[inline]
-    fn needs_transmission(&mut self, reason: &str) {
-        if self.error.is_none() {
-            // we only transmit errors for reliable + flow-controlled transports
-            if self.features.is_reliable() && self.features.is_flow_controlled() {
-                tracing::trace!(skipping_transmission = reason);
-                return;
-            }
-        }
-
-        if !self._should_transmit {
-            tracing::trace!(needs_transmission = reason);
-        }
-        self._should_transmit = true;
-    }
-
-    #[inline]
     fn on_next_expected_control_packet(&mut self, next_expected_control_packet: VarInt) {
         if let Some(largest_delivered_control_packet) =
             next_expected_control_packet.checked_sub(VarInt::from_u8(1))
         {
-            self.stream_ack
-                .on_largest_delivered_packet(largest_delivered_control_packet);
-            self.recovery_ack
+            self.transmission
                 .on_largest_delivered_packet(largest_delivered_control_packet);
 
             if let Some(fin_ack_packet_number) = self.fin_ack_packet_number {
@@ -637,12 +619,6 @@ impl State {
     }
 
     #[inline]
-    fn ecn(&self) -> ExplicitCongestionNotification {
-        // TODO how do we decide what to send on control messages
-        ExplicitCongestionNotification::Ect0
-    }
-
-    #[inline]
     #[track_caller]
     pub fn on_error<E, Pub>(&mut self, error: E, source: Location, publisher: &Pub)
     where
@@ -652,17 +628,17 @@ impl State {
         let error = Error::from(error);
         debug_assert!(error.is_fatal(&self.features));
         let _ = self.state.on_reset();
-        self.stream_ack.clear();
-        self.recovery_ack.clear();
+        self.transmission.clear();
 
         // make sure we haven't already set the error from something else
         ensure!(self.error.is_none());
+        let is_idle_timeout = matches!(error.kind(), error::Kind::IdleTimeout);
         self.error = Some(ErrorState { error, source });
         publisher
             .on_stream_receiver_errored(event::builder::StreamReceiverErrored { error, source });
 
-        if matches!(source, Location::Local) {
-            self.needs_transmission("on_error");
+        if matches!(source, Location::Local) && !is_idle_timeout {
+            self.transmission.on_error();
         } else {
             let _ = self.state.on_app_read_reset();
             self.silent_shutdown();
@@ -704,12 +680,13 @@ impl State {
             did_transition |= self.state.on_app_read_reset().is_ok();
             if did_transition {
                 self.on_error(error::Kind::IdleTimeout, Location::Local, publisher);
-                // override the transmission since we're just timing out
-                self._should_transmit = false;
             }
 
             return;
         }
+
+        // check if the throttled ACK timer has expired
+        self.transmission.on_timeout(clock);
 
         // if the tick timer expired, then copy the current idle timeout target
         if self.tick_timer.poll_expiration(now).is_ready() {
@@ -741,27 +718,25 @@ impl State {
 
     #[inline]
     fn silent_shutdown(&mut self) {
-        self._should_transmit = false;
         self.idle_timer.cancel();
         self.tick_timer.cancel();
-        self.stream_ack.clear();
-        self.recovery_ack.clear();
+        self.transmission.clear();
         tracing::trace!("silent_shutdown");
     }
 
     #[inline]
-    pub fn on_transmit<K, A, Clk, Pub>(
+    pub fn on_transmit<K, T, Clk, Pub>(
         &mut self,
         key: &K,
         credentials: &Credentials,
         stream_id: stream::Id,
         source_queue_id: Option<VarInt>,
-        output: &mut A,
+        queue: &mut T,
         clock: &Clk,
         publisher: &Pub,
     ) where
         K: crypto::seal::control::Stream,
-        A: Allocator,
+        T: TransmitQueue,
         Clk: Clock + ?Sized,
         Pub: event::ConnectionPublisher,
     {
@@ -775,174 +750,120 @@ impl State {
             credentials,
             stream_id,
             source_queue_id,
-            output,
-            // avoid querying the clock for every transmitted packet
-            &clock::Cached::new(clock),
+            queue,
+            clock,
             publisher,
         )
     }
 
     #[inline]
-    fn on_transmit_ack<K, A, Clk, Pub>(
+    fn on_transmit_ack<K, T, Clk, Pub>(
         &mut self,
         key: &K,
         credentials: &Credentials,
         stream_id: stream::Id,
         source_queue_id: Option<VarInt>,
-        output: &mut A,
-        _clock: &Clk,
+        queue: &mut T,
+        clock: &Clk,
         publisher: &Pub,
     ) where
         K: crypto::seal::control::Stream,
-        A: Allocator,
+        T: TransmitQueue,
         Clk: Clock + ?Sized,
         Pub: event::ConnectionPublisher,
     {
         ensure!(self.should_transmit());
 
-        let mtu = self.mtu();
+        // get how many intervals we're tracking - the more there are, the more loss the network
+        // is experiencing
+        let intervals = self.transmission.interval_len();
 
-        output.set_ecn(self.ecn());
+        // The value of `20` is somewhat arbitrary but doing some worst-case math the ACK ranges with
+        // 20 segments would consume about 20-25% of the packet this is a good starting point.
+        // We dont't want to go too much lower otherwise we end up spamming ACKs.
+        let duplicate_threshold = 20;
 
-        let packet_number = self.next_pn();
+        let mut should_duplicate = false;
 
-        ensure!(let Some(segment) = output.alloc());
+        // if the number of intervals is large then we should duplicate the ACKs to try and recover
+        should_duplicate |= intervals > duplicate_threshold;
 
-        let buffer = output.get_mut(&segment);
-        buffer.resize(mtu as _, 0);
+        // if we have recovery packets then the network is likely lossy so we duplicate the ACKs to increase the
+        // likelihood that the sender will recover
+        should_duplicate |= self.transmission.has_recovery()
+            && matches!(self.state, Receiver::Recv | Receiver::SizeKnown);
 
-        let encoder = EncoderBuffer::new(buffer);
+        let count = if should_duplicate { 2 } else { 1 };
 
-        // TODO compute this by storing the time that we received the max packet number
-        let ack_delay = VarInt::ZERO;
+        for _ in 0..count {
+            let res = queue.push_with(|mut buffer| {
+                let mtu = self.mtu();
 
-        let max_data = frame::MaxData {
-            maximum_data: self.max_data,
-        };
-        let max_data_encoding_size: VarInt = max_data.encoding_size().try_into().unwrap();
+                // output.set_ecn(self.ecn());
 
-        // compute the recovery ACKs first so we have enough space for those - if we run out, the sender will
-        // convert the stream PNs anyway
-        let (recovery_ack, max_data_encoding_size) =
-            self.recovery_ack
-                .encoding(max_data_encoding_size, ack_delay, None, mtu);
+                let packet_number = self.next_pn();
 
-        let (stream_ack, max_data_encoding_size) = self.stream_ack.encoding(
-            max_data_encoding_size,
-            ack_delay,
-            Some(self.ecn_counts),
-            mtu,
-        );
+                let encoder = EncoderBuffer::new(&mut buffer[..]);
 
-        let encoding_size = max_data_encoding_size;
+                let max_data = self.max_data.frame();
+                let encoding_size: VarInt = max_data.encoding_size().try_into().unwrap();
 
-        tracing::trace!(?stream_ack, ?recovery_ack, ?max_data);
+                let (stream_ack, recovery_ack, encoding_size) =
+                    self.transmission.encoding(encoding_size, mtu, clock);
 
-        let frame = ((max_data, stream_ack), recovery_ack);
+                tracing::trace!(?stream_ack, ?recovery_ack, ?max_data);
 
-        let result = control::encoder::encode(
-            encoder,
-            source_queue_id,
-            Some(stream_id),
-            packet_number,
-            VarInt::ZERO,
-            &mut &[][..],
-            encoding_size,
-            &frame,
-            key,
-            credentials,
-        );
+                let frame = ((max_data, stream_ack), recovery_ack);
 
-        match result {
-            0 => {
-                output.free(segment);
-                return;
-            }
-            packet_len => {
-                buffer.truncate(packet_len);
+                let packet_len = control::encoder::encode(
+                    encoder,
+                    source_queue_id,
+                    Some(stream_id),
+                    packet_number,
+                    VarInt::ZERO,
+                    &mut &[][..],
+                    encoding_size,
+                    &frame,
+                    key,
+                    credentials,
+                );
 
-                // get how many intervals we're tracking - the more there are, the more loss the network
-                // is experiencing
-                let intervals = self.stream_ack.packets.interval_len()
-                    + self.recovery_ack.packets.interval_len();
-
-                // The value of `20` is somewhat arbitrary but doing some worst-case math the ACK ranges with
-                // 20 segments would consume about 20-25% of the packet this is a good starting point.
-                // We dont't want to go too much lower otherwise we end up spamming ACKs.
-                let mut duplicate_threshold = 20;
-
-                let mut should_duplicate = false;
-
-                // if the number of intervals is large then we should duplicate the ACKs to try and recover
-                should_duplicate |= intervals > duplicate_threshold;
-
-                // if we have recovery packets then the network is likely lossy so we duplicate the ACKs to increase the
-                // likelihood that the sender will recover
-                should_duplicate |= !self.recovery_ack.packets.is_empty();
-
-                let duplicate = if should_duplicate {
-                    Some(buffer.clone())
-                } else {
-                    None
-                };
-
-                output.push(segment);
-
-                if let Some(buffer) = duplicate {
-                    loop {
-                        let Some(segment) = output.alloc() else {
-                            break;
-                        };
-                        let buf = output.get_mut(&segment);
-                        if intervals > duplicate_threshold {
-                            buf.extend_from_slice(&buffer);
-                            output.push(segment);
-
-                            // exponentially increase the threshold
-                            duplicate_threshold *= 2;
-
-                            continue;
-                        } else {
-                            *buf = buffer;
-                            output.push(segment);
-                            break;
-                        }
-                    }
+                if packet_len == 0 {
+                    return 0;
                 }
+
+                publisher.on_stream_control_packet_transmitted(
+                    event::builder::StreamControlPacketTransmitted {
+                        packet_len,
+                        control_data_len: encoding_size.as_u64() as usize,
+                        packet_number: packet_number.as_u64(),
+                    },
+                );
+
+                self.on_packet_sent(packet_number);
+
+                packet_len
+            });
+
+            if res.is_err() {
+                break;
             }
         }
-
-        // make sure we sent a packet
-        ensure!(!output.is_empty());
-
-        publisher.on_stream_control_packet_transmitted(
-            event::builder::StreamControlPacketTransmitted {
-                packet_len: result,
-                control_data_len: encoding_size.as_u64() as usize,
-                packet_number: packet_number.as_u64(),
-            },
-        );
-
-        // record the max value we've seen for removing old packet numbers
-        self.stream_ack.on_transmit(packet_number);
-        self.recovery_ack.on_transmit(packet_number);
-
-        self.on_packet_sent(packet_number);
     }
 
     #[inline]
-    fn on_transmit_error<K, A, Clk, Pub>(
+    fn on_transmit_error<K, T, Clk, Pub>(
         &mut self,
         control_key: &K,
         credentials: &Credentials,
         stream_id: stream::Id,
         source_queue_id: Option<VarInt>,
-        output: &mut A,
+        queue: &mut T,
         _clock: &Clk,
         publisher: &Pub,
     ) where
         K: crypto::seal::control::Stream,
-        A: Allocator,
+        T: TransmitQueue,
         Clk: Clock + ?Sized,
         Pub: event::ConnectionPublisher,
     {
@@ -953,65 +874,49 @@ impl State {
         // Only transmit errors that we originated
         ensure!(matches!(error.source, Location::Local));
 
-        let mtu = self.mtu() as usize;
+        let _ = queue.push_with(|mut buffer| {
+            let packet_number = self.next_pn();
 
-        output.set_ecn(self.ecn());
+            let encoder = EncoderBuffer::new(&mut buffer[..]);
 
-        let packet_number = self.next_pn();
+            let frame = error
+                .error
+                .connection_close()
+                .unwrap_or_else(|| s2n_quic_core::transport::Error::NO_ERROR.into());
 
-        ensure!(let Some(segment) = output.alloc());
+            let encoding_size = frame.encoding_size().try_into().unwrap();
 
-        let buffer = output.get_mut(&segment);
-        buffer.resize(mtu, 0);
+            let result = control::encoder::encode(
+                encoder,
+                source_queue_id,
+                Some(stream_id),
+                packet_number,
+                VarInt::ZERO,
+                &mut &[][..],
+                encoding_size,
+                &frame,
+                control_key,
+                credentials,
+            );
 
-        let encoder = EncoderBuffer::new(buffer);
-
-        let frame = error
-            .error
-            .connection_close()
-            .unwrap_or_else(|| s2n_quic_core::transport::Error::NO_ERROR.into());
-
-        let encoding_size = frame.encoding_size().try_into().unwrap();
-
-        let result = control::encoder::encode(
-            encoder,
-            source_queue_id,
-            Some(stream_id),
-            packet_number,
-            VarInt::ZERO,
-            &mut &[][..],
-            encoding_size,
-            &frame,
-            control_key,
-            credentials,
-        );
-
-        match result {
-            0 => {
-                output.free(segment);
-                return;
+            if result == 0 {
+                return 0;
             }
-            packet_len => {
-                buffer.truncate(packet_len);
-                output.push(segment);
-            }
-        }
 
-        tracing::debug!(connection_close = ?frame);
+            tracing::debug!(connection_close = ?frame);
 
-        publisher.on_stream_control_packet_transmitted(
-            event::builder::StreamControlPacketTransmitted {
-                packet_len: result,
-                control_data_len: encoding_size.as_u64() as usize,
-                packet_number: packet_number.as_u64(),
-            },
-        );
+            publisher.on_stream_control_packet_transmitted(
+                event::builder::StreamControlPacketTransmitted {
+                    packet_len: result,
+                    control_data_len: encoding_size.as_u64() as usize,
+                    packet_number: packet_number.as_u64(),
+                },
+            );
 
-        // clean things up
-        self.stream_ack.clear();
-        self.recovery_ack.clear();
+            self.on_packet_sent(packet_number);
 
-        self.on_packet_sent(packet_number);
+            result
+        });
     }
 
     #[inline]
@@ -1029,7 +934,8 @@ impl State {
         }
 
         self.control_packet_number += 1;
-        self._should_transmit = false;
+        self.transmission.on_transmit(packet_number);
+        self.max_data.on_transmit();
     }
 }
 
@@ -1038,6 +944,7 @@ impl timer::Provider for State {
     fn timers<Q: timer::Query>(&self, query: &mut Q) -> timer::Result {
         self.idle_timer.timers(query)?;
         self.tick_timer.timers(query)?;
+        self.transmission.timers(query)?;
         Ok(())
     }
 }

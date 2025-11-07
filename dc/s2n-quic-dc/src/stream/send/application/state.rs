@@ -5,15 +5,15 @@ use crate::{
     credentials::Credentials,
     crypto::seal,
     event::{self, ConnectionPublisher},
-    packet::stream::{self, encoder},
+    packet::stream::{self, encoder, PacketSpace},
+    socket::pool::descriptor,
     stream::{
         packet_number,
-        send::{application::transmission, error::Error, flow, path},
+        send::{error::Error, flow, path, state::transmission},
         tls::S2nTlsConnection,
         TransportFeatures,
     },
 };
-use bytes::buf::UninitSlice;
 use s2n_codec::EncoderBuffer;
 use s2n_quic_core::{
     buffer::{self, reader::Storage as _, Reader as _},
@@ -21,17 +21,29 @@ use s2n_quic_core::{
     time::Clock,
     varint::VarInt,
 };
+use std::io::IoSliceMut;
+
+/// Error returned by [`Message::push_with`] when a packet buffer cannot be allocated.
+#[derive(Debug)]
+pub enum PushError {
+    /// The packet allocator is exhausted.
+    Alloc,
+    /// The packet was empty
+    EmptyPacket,
+}
 
 pub trait Message {
     fn max_segments(&self) -> usize;
 
-    /// Returns Some(bytes) if we allocated a buffer of size bytes.
-    /// None if no buffer was allocated.
-    fn push<P: FnOnce(&mut UninitSlice) -> transmission::Event<()>>(
+    /// Allocates a packet buffer, fills it via the callback, and pushes it.
+    ///
+    /// Returns `Ok(bytes)` on success or `Err(PushError)` if the push fails
+    fn push_with<P: FnOnce(IoSliceMut) -> transmission::Event>(
         &mut self,
-        buffer_len: usize,
         p: P,
-    ) -> Option<usize>;
+    ) -> Result<usize, PushError>;
+
+    fn push(&mut self, event: transmission::Event, descriptor: descriptor::Filled) -> usize;
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -60,7 +72,7 @@ impl State {
     where
         E: seal::Application,
         I: buffer::reader::Storage<Error = core::convert::Infallible>,
-        Clk: Clock,
+        Clk: Clock + ?Sized,
         M: Message,
         Pub: ConnectionPublisher,
     {
@@ -95,24 +107,19 @@ impl State {
         };
 
         loop {
-            let packet_number = packet_number.next()?;
-
             let buffer_len = {
                 let estimated_len = reader.buffered_len() + max_header_len;
                 (max_record_size as usize).min(estimated_len)
             };
 
-            let res = message.push(buffer_len, |buffer| {
+            let res = message.push_with(|mut buffer| {
+                let packet_number = packet_number.next().unwrap();
+
                 let stream_offset = reader.current_offset();
+                let mut reader = reader.with_read_limit(buffer_len);
                 let mut reader = reader.track_read();
 
-                let buffer = unsafe {
-                    // SAFETY: `buffer` is a valid `UninitSlice` but `EncoderBuffer` expects to
-                    // write into a `&mut [u8]`. Here we construct a `&mut [u8]` since
-                    // `EncoderBuffer` never actually reads from the slice and only writes to it.
-                    core::slice::from_raw_parts_mut(buffer.as_mut_ptr(), buffer.len())
-                };
-                let encoder = EncoderBuffer::new(buffer);
+                let encoder = EncoderBuffer::new(&mut buffer[..]);
                 let packet_len = encoder::encode(
                     encoder,
                     source_queue_id,
@@ -136,9 +143,13 @@ impl State {
 
                 let has_more_app_data = credits.initial_len > total_payload_len;
 
-                let included_fin = reader
-                    .final_offset()
+                let final_offset = reader.final_offset();
+                let included_final_byte = final_offset
                     .is_some_and(|fin| stream_offset.as_u64() + payload_len as u64 == fin.as_u64());
+
+                let flags = transmission::Flags::empty()
+                    .with_included_final_offset(final_offset.is_some())
+                    .with_included_final_byte(included_final_byte);
 
                 let time_sent = clock.get_time();
                 publisher.on_stream_packet_transmitted(event::builder::StreamPacketTransmitted {
@@ -146,35 +157,48 @@ impl State {
                     payload_len: payload_len as usize,
                     packet_number: packet_number.as_u64(),
                     stream_offset: stream_offset.as_u64(),
-                    is_fin: included_fin,
+                    is_fin: included_final_byte,
                     is_retransmission: false,
                 });
 
                 let info = transmission::Info {
                     packet_len,
-                    retransmission: if stream_id.is_reliable {
-                        Some(())
-                    } else {
-                        None
-                    },
+                    descriptor: None,
                     stream_offset,
                     payload_len,
-                    included_fin,
+                    flags,
                     time_sent,
                     ecn: path.ecn,
+                };
+
+                let meta = transmission::Meta {
+                    has_more_app_data,
+                    packet_space: PacketSpace::Stream,
+                    final_offset,
+                    span: Default::default(),
                 };
 
                 transmission::Event {
                     packet_number,
                     info,
-                    has_more_app_data,
+                    meta,
                 }
             });
 
-            if let Some(allocated_len) = res {
-                publisher.on_stream_write_allocated(crate::event::builder::StreamWriteAllocated {
-                    allocated_len,
-                });
+            match res {
+                Ok(allocated_len) => {
+                    publisher.on_stream_write_allocated(
+                        crate::event::builder::StreamWriteAllocated { allocated_len },
+                    );
+                }
+                Err(PushError::Alloc) => {
+                    // We ran out of packet buffers; bail out
+                    break;
+                }
+                Err(PushError::EmptyPacket) => {
+                    // We couldn't fit anything into the packet; bail out
+                    break;
+                }
             }
 
             // bail if we've transmitted everything

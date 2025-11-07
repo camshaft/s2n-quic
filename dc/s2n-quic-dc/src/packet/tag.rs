@@ -31,6 +31,7 @@ pub enum Tag {
     Stream(super::stream::Tag),
     Datagram(super::datagram::Tag),
     Control(super::control::Tag),
+    FlowReset(super::secret_control::flow_reset::Tag),
     StaleKey(super::secret_control::stale_key::Tag),
     ReplayDetected(super::secret_control::replay_detected::Tag),
     UnknownPathSecret(super::secret_control::unknown_path_secret::Tag),
@@ -43,6 +44,7 @@ impl From<Tag> for u8 {
             Tag::Stream(v) => v.into(),
             Tag::Datagram(v) => v.into(),
             Tag::Control(v) => v.into(),
+            Tag::FlowReset(v) => v.into(),
             Tag::StaleKey(v) => v.into(),
             Tag::ReplayDetected(v) => v.into(),
             Tag::UnknownPathSecret(v) => v.into(),
@@ -66,6 +68,10 @@ decoder_value!(
                     let (tag, buffer) = buffer.decode()?;
                     Ok((Self::Control(tag), buffer))
                 }
+                super::secret_control::flow_reset::Tag::VALUE => {
+                    let (tag, buffer) = buffer.decode()?;
+                    Ok((Self::FlowReset(tag), buffer))
+                }
                 super::secret_control::stale_key::Tag::VALUE
                 | super::secret_control::stale_key::Tag::VALUE_WITH_QUEUE_ID => {
                     let (tag, buffer) = buffer.decode()?;
@@ -82,7 +88,7 @@ decoder_value!(
                     Ok((Self::UnknownPathSecret(tag), buffer))
                 }
                 // reserve this range for other packet types
-                0b0110_0011 | 0b0110_0111 | 0b0110_1000..=0b0111_1111 => Err(
+                0b0110_0011 | 0b0110_1000..=0b0111_1111 => Err(
                     s2n_codec::DecoderError::InvariantViolation("unexpected packet tag"),
                 ),
                 0b1000_0000..=0b1111_1111 => Err(s2n_codec::DecoderError::InvariantViolation(

@@ -6,6 +6,7 @@ use crate::{
     credentials::Credentials,
     event::{self, IntoEvent as _},
     packet::stream,
+    socket::pool,
     stream::{
         recv::shared as recv,
         send::{application, shared as send},
@@ -40,18 +41,22 @@ pub enum Half {
 #[derive(Debug, Clone, Copy)]
 pub enum ShutdownKind {
     Normal,
-    Panicking,
+    Errored,
     Pruned,
+    FlowReset,
 }
 
 impl ShutdownKind {
+    pub const ERRORED_CODE: u8 = 0x01;
     pub const PRUNED_CODE: u8 = 0x02;
+    pub const FLOW_RESET: u8 = 0x03;
 
     pub fn error_code(&self) -> Option<u8> {
         match self {
             ShutdownKind::Normal => None,
-            ShutdownKind::Panicking => Some(0x01),
+            ShutdownKind::Errored => Some(Self::ERRORED_CODE),
             ShutdownKind::Pruned => Some(Self::PRUNED_CODE),
+            ShutdownKind::FlowReset => Some(Self::FLOW_RESET),
         }
     }
 }
@@ -65,15 +70,62 @@ pub enum AcceptState {
 
 pub type ArcShared<Sub> = Arc<Shared<Sub, dyn Clock>>;
 
+pub struct CompletionQueue<T>(UnsafeCell<Option<T>>);
+
+impl<T: Clone> CompletionQueue<T> {
+    pub fn uninit() -> Self {
+        Self(UnsafeCell::new(None))
+    }
+
+    #[inline]
+    pub unsafe fn set(&self, value: T) {
+        let weak = unsafe { &mut *self.0.get() };
+        *weak = Some(value);
+    }
+
+    pub unsafe fn load(&self) -> T {
+        unsafe {
+            let v = &*self.0.get();
+            s2n_quic_core::assume!(v.is_some());
+            v.clone().unwrap()
+        }
+    }
+}
+
+unsafe impl<T: Send> Send for CompletionQueue<T> {}
+unsafe impl<T: Sync> Sync for CompletionQueue<T> {}
+
 pub struct Shared<Subscriber, Clk>
 where
     Subscriber: event::Subscriber,
-    Clk: ?Sized + Clock,
+    Clk: Clock + ?Sized,
 {
     pub receiver: recv::State,
     pub sender: send::State,
     pub crypto: Crypto,
     pub common: Common<Subscriber, Clk>,
+}
+
+impl<S, Clk> recv::AsShared for Shared<S, Clk>
+where
+    S: event::Subscriber,
+    Clk: Clock + ?Sized,
+{
+    #[inline]
+    fn as_shared(&self) -> &recv::State {
+        &self.receiver
+    }
+}
+
+impl<S, Clk> send::AsShared for Shared<S, Clk>
+where
+    S: event::Subscriber,
+    Clk: Clock + ?Sized,
+{
+    #[inline]
+    fn as_shared(&self) -> &send::State {
+        &self.sender
+    }
 }
 
 impl<Sub, C> Shared<Sub, C>
@@ -90,9 +142,6 @@ where
     ) {
         match handshake {
             handshake::State::ClientQueueIdObserved => {
-                // stop sending our `queue_id` since the server has observed it
-                self.local_queue_id.store(u64::MAX, Ordering::Relaxed);
-
                 // allow the server to pick a different port on the first response
                 self.remote_port
                     .store(remote_addr.port(), Ordering::Relaxed);
@@ -106,9 +155,6 @@ where
                 }
             }
             handshake::State::ServerQueueIdObserved => {
-                // stop sending our `queue_id` since the client has observed it
-                self.local_queue_id.store(u64::MAX, Ordering::Relaxed);
-
                 // no need to update the remote_queue_id value since we saw it on the first packet
                 let _ = handshake.on_observation_finished();
             }
@@ -126,13 +172,7 @@ where
             Ordering::Relaxed,
         );
     }
-}
 
-impl<Sub, C> Shared<Sub, C>
-where
-    Sub: event::Subscriber,
-    C: ?Sized + Clock,
-{
     #[inline]
     pub fn last_peer_activity(&self) -> Timestamp {
         let timestamp = self.last_peer_activity.load(Ordering::Relaxed);
@@ -142,10 +182,10 @@ where
 
     #[inline]
     pub fn stream_id(&self) -> stream::Id {
-        let queue_id = self.remote_queue_id.load(Ordering::Relaxed);
+        let queue_id = self.remote_queue_id();
         // TODO support alternative modes
         stream::Id {
-            queue_id: unsafe { VarInt::new_unchecked(queue_id) },
+            queue_id,
             is_reliable: true,
             is_bidirectional: true,
         }
@@ -155,6 +195,12 @@ where
     pub fn local_queue_id(&self) -> Option<VarInt> {
         let queue_id = self.local_queue_id.load(Ordering::Relaxed);
         VarInt::new(queue_id).ok()
+    }
+
+    #[inline]
+    pub fn remote_queue_id(&self) -> VarInt {
+        let queue_id = self.remote_queue_id.load(Ordering::Relaxed);
+        unsafe { VarInt::new_unchecked(queue_id) }
     }
 
     #[inline]
@@ -186,7 +232,7 @@ where
 impl<Sub, C> ops::Deref for Shared<Sub, C>
 where
     Sub: event::Subscriber,
-    C: ?Sized + Clock,
+    C: Clock + ?Sized,
 {
     type Target = Common<Sub, C>;
 
@@ -199,7 +245,7 @@ where
 pub struct Common<Sub, Clk>
 where
     Sub: event::Subscriber,
-    Clk: ?Sized + Clock,
+    Clk: Clock + ?Sized,
 {
     pub gso: features::Gso,
     pub(super) remote_port: AtomicU16,
@@ -209,6 +255,7 @@ where
     /// The last time we received a packet from the peer
     pub last_peer_activity: AtomicU64,
     pub closed_halves: AtomicU8,
+    pub segment_alloc: pool::Pool,
     pub subscriber: Subscriber<Sub>,
     pub s2n_connection: Option<S2nTlsConnection>,
     pub clock: Clk,
@@ -217,7 +264,7 @@ where
 impl<Sub, Clk> Common<Sub, Clk>
 where
     Sub: event::Subscriber,
-    Clk: ?Sized + Clock,
+    Clk: Clock + ?Sized,
 {
     #[inline]
     pub fn ensure_open(&self) -> std::io::Result<()> {
@@ -299,7 +346,7 @@ where
 impl<Sub, Clk> Drop for Common<Sub, Clk>
 where
     Sub: event::Subscriber,
-    Clk: ?Sized + Clock,
+    Clk: Clock + ?Sized,
 {
     #[inline]
     fn drop(&mut self) {

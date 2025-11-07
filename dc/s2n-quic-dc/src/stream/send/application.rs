@@ -2,12 +2,12 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
-    clock,
+    clock::Timer,
     credentials::Id,
     event::{self, ConnectionPublisher},
-    msg,
+    packet::stream::PacketSpace,
     stream::{
-        pacer, runtime,
+        runtime,
         send::{flow, queue},
         shared::{ArcShared, ShutdownKind},
         socket,
@@ -19,13 +19,16 @@ use core::{
     sync::atomic::Ordering,
     task::{Context, Poll},
 };
-use s2n_quic_core::{buffer, ensure, ready, task::waker, time::Timestamp};
+use s2n_quic_core::{
+    buffer, ensure, ready,
+    task::waker,
+    time::{clock::Timer as _, timer::Provider, Timestamp},
+};
 use std::{io, net::SocketAddr};
 use tracing::trace;
 
 mod builder;
 pub mod state;
-pub mod transmission;
 
 use crate::stream::socket::Application;
 pub use builder::Builder;
@@ -39,7 +42,7 @@ where
     shared: ArcShared<Sub>,
     sockets: socket::ArcApplication,
     queue: queue::Queue,
-    pacer: pacer::Naive,
+    timer: Timer,
     status: Status,
     runtime: runtime::ArcHandle<Sub>,
 }
@@ -98,6 +101,11 @@ where
     }
 
     #[inline]
+    pub fn keep_alive(&self, enabled: bool) {
+        self.0.shared.sender.keep_alive(enabled);
+    }
+
+    #[inline]
     pub async fn write_from<S>(&mut self, buf: &mut S) -> io::Result<usize>
     where
         S: buffer::reader::storage::Infallible,
@@ -151,6 +159,17 @@ where
     where
         S: buffer::reader::storage::Infallible,
     {
+        #[cfg(debug_assertions)]
+        let _span = {
+            use s2n_quic_core::varint::VarInt;
+            let peer_addr = self.0.shared.remote_addr();
+            let flow_id = self.0.shared.credentials();
+            let local_queue_id = self.0.shared.local_queue_id().map(VarInt::as_u64);
+            let remote_queue_id = self.0.shared.remote_queue_id().as_u64();
+            tracing::warn_span!("poll_write_from", %peer_addr, %flow_id, local_queue_id, remote_queue_id, actor = "application::send")
+                .entered()
+        };
+
         let start_time = self.0.shared.clock.get_time();
         let provided_len = buf.buffered_len();
 
@@ -176,6 +195,20 @@ where
 
     /// Shutdown the stream for writing.
     pub fn shutdown(&mut self) -> io::Result<()> {
+        #[cfg(debug_assertions)]
+        let _span = {
+            let peer_addr = self.0.shared.remote_addr();
+            let flow_id = self.0.shared.credentials();
+            let local_queue_id = self
+                .0
+                .shared
+                .local_queue_id()
+                .map(s2n_quic_core::varint::VarInt::as_u64);
+            let remote_queue_id = self.0.shared.remote_queue_id().as_u64();
+            tracing::warn_span!("shutdown", %peer_addr, %flow_id, local_queue_id, remote_queue_id, actor = "application::send")
+                .entered()
+        };
+
         self.0.shutdown(ShutdownType::Explicit)
     }
 }
@@ -215,7 +248,6 @@ where
 
         let app = self.shared.application();
         let max_header_len = app.max_header_len();
-        let max_segments = self.shared.gso.max_segments();
 
         // create a flow request from the provided application input
         let initial_len = buf.buffered_len();
@@ -226,6 +258,7 @@ where
         };
 
         let path = self.shared.sender.path.load();
+        let max_segments = self.shared.gso.max_segments().min(path.send_quantum as _);
 
         let features = self.sockets.features();
 
@@ -244,30 +277,23 @@ where
 
         trace!(?credits);
 
-        let mut batch = if features.is_reliable() {
-            // the protocol does recovery for us so no need to track the transmissions
-            None
-        } else {
-            // if we are using unreliable sockets then we need to write transmissions to a batch for the
-            // worker to track for recovery
-
-            let batch = self
-                .shared
-                .sender
-                .application_transmission_queue
-                .alloc_batch(msg::segment::MAX_COUNT);
-            Some(batch)
-        };
-
         let stream_id = self.shared.stream_id();
         let local_queue_id = self.shared.local_queue_id();
 
+        if !features.is_flow_controlled() {
+            self.queue.set_bandwidth(self.shared.sender.bandwidth());
+        }
+
         self.queue.push_buffer(
-            buf,
-            &mut batch,
+            &self.shared.remote_addr(),
             max_segments,
-            &self.shared.sender.segment_alloc,
-            |output, buf| {
+            &self.shared.segment_alloc,
+            || {
+                self.shared
+                    .sender
+                    .alloc_transmission(max_segments, PacketSpace::Stream)
+            },
+            |message| {
                 self.shared.crypto.seal_with(
                     |sealer| {
                         // push packets for transmission into our queue
@@ -281,8 +307,8 @@ where
                             &self.shared.s2n_connection,
                             &stream_id,
                             local_queue_id,
-                            &clock::Cached::new(&self.shared.clock),
-                            output,
+                            &self.shared.clock,
+                            message,
                             &features,
                             &self.shared.publisher(),
                         )
@@ -299,12 +325,6 @@ where
             },
         )?;
 
-        if let Some(batch) = batch {
-            // send the transmission information off to the worker before flushing to the socket so the
-            // worker is prepared to handle ACKs from the peer
-            self.shared.sender.push_to_worker(batch)?;
-        }
-
         // flush the queue of packets to the socket
         self.poll_flush_buffer(cx, usize::MAX)
     }
@@ -315,23 +335,27 @@ where
         cx: &mut Context,
         limit: usize,
     ) -> Poll<Result<usize, io::Error>> {
-        // if we're actually writing to the socket then we need to pace
-        if !self.queue.is_empty() {
-            ready!(self.pacer.poll_pacing(cx, &self.shared.clock));
+        loop {
+            ready!(self.timer.poll_ready(cx));
+
+            let res = self.queue.poll_flush(
+                cx,
+                limit,
+                self.sockets.write_application(),
+                &mut self.timer,
+                &self.shared.subscriber,
+            )?;
+
+            match res {
+                Poll::Ready(len) => {
+                    return Ok(len).into();
+                }
+                Poll::Pending => {
+                    self.timer.update(self.queue.next_expiration().unwrap());
+                    continue;
+                }
+            }
         }
-
-        let len = ready!(self.queue.poll_flush(
-            cx,
-            limit,
-            self.sockets.write_application(),
-            &msg::addr::Addr::new(self.shared.remote_addr()),
-            &self.shared.sender.segment_alloc,
-            &self.shared.gso,
-            &self.shared.clock,
-            &self.shared.subscriber,
-        ))?;
-
-        Ok(len).into()
     }
 
     #[inline]
@@ -382,11 +406,12 @@ where
 
             let is_panicking = matches!(ty, ShutdownType::Drop { is_panicking: true });
             let shutdown_kind = if is_panicking {
-                ShutdownKind::Panicking
+                ShutdownKind::Errored
             } else {
                 ShutdownKind::Normal
             };
-            self.shared.sender.shutdown(queue, shutdown_kind);
+            let queue = core::mem::take(&mut self.queue);
+            self.shared.sender.shutdown(shutdown_kind, queue);
             return Ok(());
         }
 
@@ -562,9 +587,6 @@ where
             cx,
             usize::MAX,
             sockets.write_application(),
-            &msg::addr::Addr::new(shared.remote_addr()),
-            &shared.sender.segment_alloc,
-            &shared.gso,
             &shared.clock,
             &shared.subscriber,
         ));

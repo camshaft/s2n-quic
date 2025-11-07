@@ -2,10 +2,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
-    allocator::Allocator,
     clock::Timer,
-    event, msg,
+    event,
+    packet::stream::PacketSpace,
     stream::{
+        send::{application::state::PushError, state::transmission},
         shared::{AcceptState, ArcShared, ShutdownKind},
         socket::Socket,
         Actor,
@@ -13,7 +14,12 @@ use crate::{
 };
 use core::task::{Context, Poll};
 use s2n_quic_core::{
-    buffer, dc::ApplicationParams, endpoint, ensure, ready, time::clock::Timer as _,
+    buffer,
+    dc::ApplicationParams,
+    endpoint, ensure,
+    inet::{ExplicitCongestionNotification, SocketAddress},
+    ready,
+    time::clock::Timer as _,
 };
 use std::{io, time::Duration};
 use tracing::{debug, trace};
@@ -71,13 +77,14 @@ where
 {
     shared: ArcShared<Sub>,
     last_observed_epoch: u64,
-    send_buffer: msg::send::Message,
     state: waiting::State,
     peek_timer: Timer,
     idle_timer: Timer,
     idle_timeout_duration: Duration,
     backoff: u8,
+    should_transmit: bool,
     socket: S,
+    transmission_buffer: transmission::Builder,
     accept_state: AcceptState,
 }
 
@@ -93,7 +100,6 @@ where
         endpoint: endpoint::Type,
         parameters: &ApplicationParams,
     ) -> Self {
-        let send_buffer = msg::send::Message::new(shared.remote_addr(), shared.gso.clone());
         let idle_timeout_duration = parameters
             .max_idle_timeout()
             .unwrap_or_else(|| Duration::from_secs(30));
@@ -111,13 +117,14 @@ where
         Self {
             shared,
             last_observed_epoch: 0,
-            send_buffer,
             state,
             peek_timer,
             idle_timer,
             idle_timeout_duration,
             backoff: 0,
+            should_transmit: false,
             socket,
+            transmission_buffer: Default::default(),
             accept_state: AcceptState::Waiting,
         }
     }
@@ -129,9 +136,17 @@ where
 
     #[inline]
     pub fn poll(&mut self, cx: &mut Context) -> Poll<()> {
+        #[cfg(debug_assertions)]
+        let _span = {
+            use s2n_quic_core::varint::VarInt;
+            let local_queue_id = self.shared.local_queue_id().map(VarInt::as_u64);
+            let remote_queue_id = self.shared.remote_queue_id().as_u64();
+            tracing::warn_span!("worker::recv::poll", local_queue_id, remote_queue_id).entered()
+        };
+
         s2n_quic_core::task::waker::debug_assert_contract(cx, |cx| {
             ready!(self.poll_impl(cx));
-            tracing::debug!("read worker shutting down");
+            tracing::trace!("read worker shutting down");
             Poll::Ready(())
         })
     }
@@ -150,6 +165,11 @@ where
             return Poll::Ready(());
         }
 
+        if let Poll::Ready(Err(err)) = self.poll_transmit(cx) {
+            tracing::error!(transmit_error = ?err);
+            return Poll::Ready(());
+        }
+
         // go until we get into the finished state
         if let waiting::State::Finished = &self.state {
             return Poll::Ready(());
@@ -159,8 +179,18 @@ where
             let target = self.shared.last_peer_activity() + self.idle_timeout_duration;
             self.idle_timer.update(target);
             if self.idle_timer.poll_ready(cx).is_ready() {
+                let publisher = self.shared.publisher();
+                self.shared.receiver.notify_error(
+                    super::ErrorKind::IdleTimeout.err(),
+                    endpoint::Location::Local,
+                    &publisher,
+                );
                 return Poll::Ready(());
             }
+        }
+
+        if self.should_transmit {
+            cx.waker().wake_by_ref();
         }
 
         Poll::Pending
@@ -230,7 +260,7 @@ where
                     // on each packet to see if it should intercept and respond with an old control packet
                     // in case the sender didn't see the control packet. This is similar to TCP Reuse/Recycle.
                     let now = self.shared.clock.get_time();
-                    let target = now + Duration::from_millis(500);
+                    let target = now + Duration::from_secs(5);
                     self.peek_timer.update(target);
                 }
                 waiting::State::TimeWait => {
@@ -256,12 +286,23 @@ where
 
     #[inline]
     fn is_application_progressing(&mut self) -> bool {
+        let state = self.shared.receiver.application_state();
+
+        self.should_transmit |= state.wants_ack;
+
         // check to see if the application shut down
-        if let super::shared::ApplicationState::Closed { shutdown_kind } =
-            self.shared.receiver.application_state()
-        {
+        if let super::shared::ApplicationStatus::Closed { shutdown_kind } = state.status {
             if matches!(shutdown_kind, ShutdownKind::Pruned) {
                 // if the stream was pruned then we don't need to do anything else
+                let publisher = self.shared.publisher();
+                self.shared.receiver.notify_error(
+                    super::ErrorKind::ApplicationError {
+                        error: ShutdownKind::PRUNED_CODE.into(),
+                    }
+                    .err(),
+                    endpoint::Location::Local,
+                    &publisher,
+                );
                 let _ = self.state.on_finished();
                 self.peek_timer.cancel();
                 self.idle_timer.cancel();
@@ -269,12 +310,16 @@ where
             }
 
             if let Ok(Some(mut recv)) = self.shared.receiver.worker_try_lock() {
-                // check to see if we have anything in the reassembler as well
-                let is_buffer_empty = recv.payload_is_empty() && recv.reassembler.is_empty();
+                let mut should_error = true;
+
+                // check to see if we have anything in the reassembler - if so indicate that we
+                // didn't read the whole thing
+                should_error &= !recv.reassembler.is_reading_complete();
+                should_error &= recv.reassembler.total_received_len() > 0;
 
                 let error = if let Some(code) = shutdown_kind.error_code() {
                     code
-                } else if !is_buffer_empty {
+                } else if should_error {
                     // we still had data in our buffer so notify the sender
                     ErrorCode::Application as u8
                 } else {
@@ -323,13 +368,12 @@ where
 
     #[inline]
     fn poll_drain_recv_socket(&mut self, cx: &mut Context) -> Poll<io::Result<()>> {
-        let mut should_transmit = false;
         let mut received_packets = 0;
 
-        let _res = self.process_packets(cx, &mut received_packets, &mut should_transmit);
+        let _res = self.process_packets(cx, &mut received_packets);
 
         ensure!(
-            should_transmit,
+            self.should_transmit,
             if received_packets == 0 {
                 Poll::Pending
             } else {
@@ -337,14 +381,25 @@ where
             }
         );
 
+        self.poll_transmit(cx)
+    }
+
+    #[inline]
+    fn poll_transmit(&mut self, cx: &mut Context) -> Poll<io::Result<()>> {
+        let state = self.shared.receiver.application_state();
+        self.should_transmit |= state.wants_ack;
+        ensure!(self.should_transmit, Poll::Ready(Ok(())));
+
         // send an ACK if needed
         if let Some(mut recv) = self.shared.receiver.worker_try_lock()? {
-            // use the latest value rather than trying to transmit an old one
-            if !self.send_buffer.is_empty() {
-                let _ = self.send_buffer.drain();
-            }
-
-            recv.fill_transmit_queue(&self.shared, &mut self.send_buffer);
+            let mut transmission_queue = TransmissionQueue {
+                buffer: &mut self.transmission_buffer,
+                socket_address: self.shared.remote_addr(),
+                max_segments: self.shared.gso.max_segments(),
+                shared: &self.shared,
+            };
+            recv.fill_transmit_queue(&self.shared, &mut transmission_queue);
+            self.should_transmit = false;
 
             if recv.receiver.state().is_data_received() {
                 let _ = self.state.on_data_received();
@@ -353,6 +408,8 @@ where
             if recv.receiver.is_finished() {
                 let _ = self.state.on_finished();
             }
+        } else {
+            cx.waker().wake_by_ref();
         }
 
         ready!(self.poll_flush_socket(cx))?;
@@ -365,7 +422,6 @@ where
         &mut self,
         cx: &mut Context,
         received_packets: &mut usize,
-        should_transmit: &mut bool,
     ) -> io::Result<()> {
         // loop until we hit Pending from the socket
         loop {
@@ -374,13 +430,12 @@ where
             let Some(mut recv) = self.shared.receiver.worker_try_lock()? else {
                 // if the application is locking the state then we don't want to transmit, since it
                 // will do that for us
-                *should_transmit = false;
                 break;
             };
 
             // make sure to process any left over packets, if any
             if !recv.payload_is_empty() {
-                *should_transmit |= recv.process_recv_buffer(
+                self.should_transmit |= recv.process_recv_buffer(
                     &mut buffer::writer::storage::Empty,
                     &self.shared,
                     self.socket.features(),
@@ -404,7 +459,7 @@ where
             *received_packets += 1;
 
             // process the packet we just received
-            *should_transmit |= recv.process_recv_buffer(
+            self.should_transmit |= recv.process_recv_buffer(
                 &mut buffer::writer::storage::Empty,
                 &self.shared,
                 self.socket.features(),
@@ -416,9 +471,20 @@ where
     }
 
     #[inline]
-    fn poll_flush_socket(&mut self, cx: &mut Context) -> Poll<io::Result<()>> {
-        while !self.send_buffer.is_empty() {
-            ready!(self.socket.poll_send_buffer(cx, &mut self.send_buffer))?;
+    fn poll_flush_socket(&mut self, _cx: &mut Context) -> Poll<io::Result<()>> {
+        let count = self.transmission_buffer.len();
+        ensure!(count > 0, Poll::Ready(Ok(())));
+
+        // Only transmit the last two packets we have pending
+        if count > 2 {
+            self.transmission_buffer.clear_head(count - 2);
+            debug_assert_eq!(self.transmission_buffer.len(), 2);
+        }
+
+        for (mut entry, _application_len) in self.transmission_buffer.drain() {
+            // don't subscribe to completion events
+            entry.completion = None;
+            self.socket.send_transmission(entry);
         }
 
         Ok(()).into()
@@ -436,5 +502,82 @@ where
         let target = now + timeout;
 
         self.peek_timer.update(target);
+    }
+}
+
+struct TransmissionQueue<'a, Sub>
+where
+    Sub: event::Subscriber,
+{
+    buffer: &'a mut transmission::Builder,
+    socket_address: SocketAddress,
+    max_segments: usize,
+    shared: &'a ArcShared<Sub>,
+}
+
+impl<Sub> super::shared::TransmitQueue for TransmissionQueue<'_, Sub>
+where
+    Sub: event::Subscriber,
+{
+    fn push_with<F: FnOnce(io::IoSliceMut) -> usize>(&mut self, f: F) -> Result<usize, PushError> {
+        let Some(descriptor) = self.shared.segment_alloc.alloc() else {
+            // Packet allocator exhausted — skip this transmission
+            return Err(PushError::Alloc);
+        };
+        let descriptor = match descriptor.fill_with(|addr, _cmsg, payload| {
+            let len = f(payload);
+            addr.set(self.socket_address);
+            if len == 0 {
+                return Err(());
+            }
+            Ok(len)
+        }) {
+            Ok(segments) => segments,
+            Err((_unfilled, ())) => return Err(PushError::EmptyPacket),
+        };
+        let mut descriptor = descriptor.take_filled();
+
+        let ecn = ExplicitCongestionNotification::Ect0;
+        let now = self.shared.clock.get_time();
+
+        descriptor.set_ecn(ecn);
+
+        let max_segments = self.max_segments;
+
+        let len: u16 = descriptor.len();
+
+        let info = transmission::Info {
+            packet_len: 0,
+            descriptor: None.into(),
+            stream_offset: Default::default(),
+            payload_len: 0,
+            flags: Default::default(),
+            time_sent: now,
+            ecn,
+        };
+
+        let meta = transmission::Meta {
+            packet_space: PacketSpace::Recovery,
+            has_more_app_data: false,
+            final_offset: None,
+            span: Default::default(),
+        };
+
+        let transmission_alloc = || {
+            self.shared
+                .sender
+                .alloc_transmission(max_segments, PacketSpace::Recovery)
+        };
+
+        self.buffer.push_segment(
+            (Default::default(), info),
+            meta,
+            0,
+            descriptor,
+            max_segments,
+            transmission_alloc,
+        );
+
+        Ok(len as _)
     }
 }

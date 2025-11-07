@@ -16,11 +16,11 @@ use std::collections::VecDeque;
 
 macro_rules! impl_recv {
     ($name:ident, $field:ident, $half:expr) => {
-        pub struct $name<T: 'static, Key: 'static> {
+        pub struct $name<T: 'static, Key: 'static + Copy> {
             descriptor: Descriptor<T, Key>,
         }
 
-        impl<T: 'static, Key: 'static> $name<T, Key> {
+        impl<T: 'static, Key: 'static + Copy> $name<T, Key> {
             #[inline]
             pub(super) fn new(descriptor: Descriptor<T, Key>) -> Self {
                 Self { descriptor }
@@ -101,7 +101,7 @@ macro_rules! impl_recv {
             }
         }
 
-        impl<T: 'static, Key: 'static> fmt::Debug for $name<T, Key> {
+        impl<T: 'static, Key: 'static + Copy> fmt::Debug for $name<T, Key> {
             fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
                 f.debug_struct(stringify!($name))
                     .field("queue_id", &self.queue_id())
@@ -109,7 +109,7 @@ macro_rules! impl_recv {
             }
         }
 
-        impl<T: 'static, Key: 'static> Drop for $name<T, Key> {
+        impl<T: 'static, Key: 'static + Copy> Drop for $name<T, Key> {
             #[inline]
             fn drop(&mut self) {
                 unsafe {
@@ -123,11 +123,11 @@ macro_rules! impl_recv {
 impl_recv!(Control, control_queue, Half::Control);
 impl_recv!(Stream, stream_queue, Half::Stream);
 
-pub struct Sender<T: 'static, Key: 'static> {
+pub struct Sender<T: 'static, Key: 'static + Copy> {
     descriptor: Descriptor<T, Key>,
 }
 
-impl<T: 'static, Key: 'static> Clone for Sender<T, Key> {
+impl<T: 'static, Key: 'static + Copy> Clone for Sender<T, Key> {
     #[inline]
     fn clone(&self) -> Self {
         unsafe {
@@ -138,14 +138,19 @@ impl<T: 'static, Key: 'static> Clone for Sender<T, Key> {
     }
 }
 
-impl<T: 'static, Key: 'static> Sender<T, Key> {
+impl<T: 'static, Key: 'static + Copy> Sender<T, Key> {
     #[inline]
     pub(super) fn new(descriptor: Descriptor<T, Key>) -> Self {
         Self { descriptor }
     }
 
     #[inline]
-    pub fn send_stream(&self, item: T) -> Result<Option<T>, Error> {
+    pub fn key(&self) -> Option<Key> {
+        unsafe { self.descriptor.key() }
+    }
+
+    #[inline]
+    pub fn send_stream(&self, item: T) -> Result<Option<T>, Error<T>> {
         unsafe {
             let prev = self.descriptor.stream_queue().push(item)?;
             probes::on_send(self.descriptor.queue_id(), Half::Stream, prev.is_some());
@@ -154,7 +159,7 @@ impl<T: 'static, Key: 'static> Sender<T, Key> {
     }
 
     #[inline]
-    pub fn send_control(&self, item: T) -> Result<Option<T>, Error> {
+    pub fn send_control(&self, item: T) -> Result<Option<T>, Error<T>> {
         unsafe {
             let prev = self.descriptor.control_queue().push(item)?;
             probes::on_send(self.descriptor.queue_id(), Half::Control, prev.is_some());
@@ -163,7 +168,7 @@ impl<T: 'static, Key: 'static> Sender<T, Key> {
     }
 }
 
-impl<T: 'static, Key: 'static> Drop for Sender<T, Key> {
+impl<T: 'static, Key: 'static + Copy> Drop for Sender<T, Key> {
     #[inline]
     fn drop(&mut self) {
         unsafe {

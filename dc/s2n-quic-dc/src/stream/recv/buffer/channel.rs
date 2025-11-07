@@ -4,7 +4,7 @@
 use super::Dispatch;
 use crate::{
     event,
-    socket::recv::descriptor::Filled,
+    socket::pool::descriptor::Filled,
     stream::{
         recv::{
             self,

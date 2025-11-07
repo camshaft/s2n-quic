@@ -9,6 +9,7 @@ use super::{
     probes,
 };
 use std::{
+    collections::VecDeque,
     hash::Hash,
     sync::{Arc, Mutex},
 };
@@ -29,15 +30,15 @@ pub(super) trait FreeList<T, Key>: 'static + Send + Sync {
 /// Note that this uses a [`Vec`] instead of [`std::collections::VecDeque`], which acts more
 /// like a stack than a queue. This is to prefer more-recently used descriptors which should
 /// hopefully reduce the number of cache misses.
-pub(super) struct FreeVec<T: 'static, Key: 'static> {
+pub(super) struct FreeVec<T: 'static, Key: 'static + Copy> {
     inner: Mutex<FreeInner<T, Key>>,
     keys: Keys<Key>,
 }
 
-impl<T: 'static, Key: 'static> FreeVec<T, Key> {
+impl<T: 'static, Key: 'static + Copy> FreeVec<T, Key> {
     #[inline]
     pub fn new(initial_cap: usize, keys: Keys<Key>) -> (Arc<Self>, Arc<Memory<T, Key>>) {
-        let descriptors = Vec::with_capacity(initial_cap);
+        let descriptors = VecDeque::with_capacity(initial_cap);
         let regions = Vec::with_capacity(1);
         let inner = FreeInner {
             descriptors,
@@ -54,12 +55,12 @@ impl<T: 'static, Key: 'static> FreeVec<T, Key> {
     }
 
     #[inline]
-    pub fn alloc(&self, key: Option<&Key>) -> Option<(Control<T, Key>, Stream<T, Key>)>
+    pub fn alloc(&self, key: &Key) -> Option<(Control<T, Key>, Stream<T, Key>)>
     where
         Key: Copy + Eq + Hash,
     {
         let mut inner = self.inner.lock().unwrap();
-        let descriptor = inner.descriptors.pop()?;
+        let descriptor = inner.descriptors.pop_front()?;
 
         #[cfg(debug_assertions)]
         assert!(
@@ -73,21 +74,20 @@ impl<T: 'static, Key: 'static> FreeVec<T, Key> {
 
         unsafe {
             // SAFETY: the descriptor is only owned by the free list
-            if let Some(key) = key {
-                self.keys.insert(*key, descriptor.queue_id());
-            }
-            let (control, stream) = descriptor.into_receiver_pair(key.copied());
+            self.keys.insert(*key, descriptor.queue_id());
+            let (control, stream) = descriptor.into_receiver_pair(*key);
             Some((Control::new(control), Stream::new(stream)))
         }
     }
 
     #[inline]
-    pub fn record_region(&self, region: Region<T, Key>, mut descriptors: Vec<Descriptor<T, Key>>) {
+    pub fn record_region(&self, region: Region<T, Key>, descriptors: Vec<Descriptor<T, Key>>) {
         let mut inner = self.inner.lock().unwrap();
         inner.regions.push(region);
         let prev = inner.total;
         let next = prev + descriptors.len();
         inner.total = next;
+        let mut descriptors: VecDeque<_> = descriptors.into();
         inner.descriptors.append(&mut descriptors);
         // Even though the `descriptors` is now empty (`len=0`), it still owns
         // capacity and will need to be freed. Drop the lock before interacting
@@ -109,26 +109,27 @@ impl<T: 'static, Key: 'static> FreeVec<T, Key> {
 ///
 /// Once dropped, the pool and all associated descriptors will be
 /// freed after the last handle is dropped.
-pub(super) struct Memory<T: 'static, Key: 'static>(Arc<FreeVec<T, Key>>);
+pub(super) struct Memory<T: 'static, Key: 'static + Copy>(Arc<FreeVec<T, Key>>);
 
-impl<T: 'static, Key: 'static> Drop for Memory<T, Key> {
+impl<T: 'static, Key: 'static + Copy> Drop for Memory<T, Key> {
     #[inline]
     fn drop(&mut self) {
         drop(self.0.try_free());
     }
 }
 
-impl<T: 'static + Send + Sync, Key: 'static + Send + Sync> FreeList<T, Key> for FreeVec<T, Key>
+impl<T, Key> FreeList<T, Key> for FreeVec<T, Key>
 where
     T: 'static + Send + Sync,
-    Key: 'static + Send + Sync + Eq + Hash,
+    Key: 'static + Copy + Send + Sync + Eq + Hash,
 {
     #[inline]
     fn free(&self, mut descriptor: Descriptor<T, Key>) -> Option<Box<dyn 'static + Send>> {
-        if let Some(key) = unsafe {
+        let key = unsafe {
             // SAFETY: the descriptor is only owned by the free list
             descriptor.take_key()
-        } {
+        };
+        if let Some(key) = key {
             self.keys.remove(&key);
         }
 
@@ -142,7 +143,7 @@ where
             inner.active
         );
 
-        inner.descriptors.push(descriptor);
+        inner.descriptors.push_back(descriptor);
         if inner.open {
             return None;
         }
@@ -152,8 +153,8 @@ where
     }
 }
 
-struct FreeInner<T: 'static, Key: 'static> {
-    descriptors: Vec<Descriptor<T, Key>>,
+struct FreeInner<T: 'static, Key: 'static + Copy> {
+    descriptors: VecDeque<Descriptor<T, Key>>,
     regions: Vec<Region<T, Key>>,
     total: usize,
     open: bool,
@@ -161,7 +162,7 @@ struct FreeInner<T: 'static, Key: 'static> {
     active: std::collections::BTreeSet<usize>,
 }
 
-impl<T: 'static, Key: 'static> FreeInner<T, Key> {
+impl<T: 'static, Key: 'static + Copy> FreeInner<T, Key> {
     #[inline(never)] // this is rarely called
     fn try_free(&mut self) -> Option<Self> {
         #[cfg(debug_assertions)]
@@ -176,7 +177,7 @@ impl<T: 'static, Key: 'static> FreeInner<T, Key> {
         Some(core::mem::replace(
             self,
             FreeInner {
-                descriptors: Vec::new(),
+                descriptors: VecDeque::new(),
                 regions: Vec::new(),
                 total: 0,
                 open: false,
@@ -187,7 +188,7 @@ impl<T: 'static, Key: 'static> FreeInner<T, Key> {
     }
 }
 
-impl<T: 'static, Key: 'static> Drop for FreeInner<T, Key> {
+impl<T: 'static, Key: 'static + Copy> Drop for FreeInner<T, Key> {
     #[inline]
     fn drop(&mut self) {
         if self.descriptors.is_empty() {

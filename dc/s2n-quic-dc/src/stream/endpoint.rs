@@ -22,7 +22,12 @@ use s2n_quic_core::{
     varint::VarInt,
 };
 use std::{io, sync::Arc};
-use tracing::{debug_span, Instrument as _};
+use tracing::Instrument as _;
+
+#[cfg(not(debug_assertions))]
+use tracing::debug_span as worker_span;
+#[cfg(debug_assertions)]
+use tracing::warn_span as worker_span;
 
 use super::environment::{ReadWorkerSocket as _, WriteWorkerSocket as _};
 
@@ -59,6 +64,11 @@ where
 
     let now = env.clock().get_time();
 
+    // Claim a rate-limited connection slot for this peer. The returned timestamp
+    // may be in the future, which will cause the transmission wheel to delay
+    // sending the first packet until that time.
+    let start_time = entry.next_connection_time(now);
+
     let meta = event::api::ConnectionMeta {
         id: 0, // TODO use an actual connection ID
         timestamp: now.into_event(),
@@ -70,6 +80,7 @@ where
 
     build_stream(
         now,
+        Some(start_time),
         env,
         peer,
         stream_id,
@@ -139,6 +150,7 @@ where
 
     let res = build_stream(
         now,
+        None, // no rate limiting for accepted streams
         env,
         peer,
         stream_id,
@@ -165,6 +177,7 @@ where
 #[inline]
 fn build_stream<Env, P>(
     now: Timestamp,
+    start_time: Option<Timestamp>,
     env: &Env,
     peer: P,
     stream_id: packet::stream::Id,
@@ -181,8 +194,9 @@ where
 {
     let features = peer.features();
 
-    let (sockets, recv_buffer) = peer.setup(env)?;
-    let source_queue_id = sockets.source_queue_id;
+    let (sockets, recv_buffer) = peer.setup(env, &crypto.credentials)?;
+    let local_queue_id = sockets.local_queue_id;
+    let remote_queue_id = stream_id.queue_id;
 
     // construct shared reader state
     let reader = recv::shared::State::new(
@@ -195,6 +209,8 @@ where
     );
 
     let writer = {
+        let _span = worker_span!("shared::writer", local_queue_id = %local_queue_id.unwrap(), peer_addr = %sockets.remote_addr, flow_id = %crypto.credentials).entered();
+
         let worker = sockets
             .write_worker
             .map(|socket| (send::state::State::new(stream_id, &parameters), socket));
@@ -203,7 +219,7 @@ where
             if let Some((worker, _socket)) = worker.as_ref() {
                 let flow_offset = worker.flow_offset();
                 let send_quantum = worker.send_quantum_packets();
-                let bandwidth = Some(worker.cca.bandwidth());
+                let bandwidth = Some(worker.bandwidth());
 
                 (flow_offset, send_quantum, bandwidth)
             } else {
@@ -248,20 +264,28 @@ where
             credentials: UnsafeCell::new(crypto.credentials),
         };
 
+        // use the start time, if possible, to avoid timing out early
+        let last_peer_activity = start_time.unwrap_or(now);
+        let last_peer_activity =
+            unsafe { last_peer_activity.as_duration().as_micros() as u64 }.into();
+
+        let local_queue_id = if let Some(id) = local_queue_id {
+            id.as_u64()
+        } else {
+            // use MAX as `None`
+            u64::MAX
+        }
+        .into();
+
         shared::Common {
             clock: env.clock().clone(),
             gso: env.gso(),
             remote_port: remote_addr.port().into(),
-            remote_queue_id: stream_id.queue_id.as_u64().into(),
-            local_queue_id: if let Some(id) = source_queue_id {
-                id.as_u64()
-            } else {
-                // use MAX as `None`
-                u64::MAX
-            }
-            .into(),
-            last_peer_activity: Default::default(),
+            remote_queue_id: remote_queue_id.as_u64().into(),
+            local_queue_id,
+            last_peer_activity,
             fixed,
+            segment_alloc: sockets.transmission_pool,
             closed_halves: 0u8.into(),
             subscriber: shared::Subscriber {
                 subscriber,
@@ -290,10 +314,21 @@ where
         crypto,
     });
 
+    // Set a self-referential reference for completion queues
+    let weak = Arc::downgrade(&shared);
+    unsafe {
+        shared.sender.completion_handle.set(weak);
+    }
+
     // spawn the read worker
     if let Some(socket) = sockets.read_worker {
         let socket = socket.setup();
         let shared = shared.clone();
+
+        let peer_addr = shared.remote_addr();
+        let flow_id = shared.credentials();
+        let local_queue_id = shared.local_queue_id().map(VarInt::as_u64);
+        let span = worker_span!("worker::read", %peer_addr, %flow_id, local_queue_id, actor = "worker::recv");
 
         let task = async move {
             let mut reader = recv::worker::Worker::new(socket, shared, endpoint_type, &parameters);
@@ -315,8 +350,6 @@ where
             .await;
         };
 
-        let span = debug_span!("worker::read");
-
         if span.is_disabled() {
             env.spawn_reader(task);
         } else {
@@ -328,6 +361,11 @@ where
     if let Some((worker, socket)) = writer.1 {
         let (socket, recv_buffer) = socket.setup();
         let shared = shared.clone();
+
+        let peer_addr = shared.remote_addr();
+        let flow_id = shared.credentials();
+        let local_queue_id = shared.local_queue_id().map(VarInt::as_u64);
+        let span = worker_span!("worker::write", %peer_addr, %flow_id, local_queue_id, actor = "worker::send");
 
         let task = async move {
             let mut writer = send::worker::Worker::new(
@@ -356,8 +394,6 @@ where
             .await;
         };
 
-        let span = debug_span!("worker::write");
-
         if span.is_disabled() {
             env.spawn_writer(task);
         } else {
@@ -366,7 +402,7 @@ where
     }
 
     let read = recv::application::Builder::new(endpoint_type, env.reader_rt());
-    let write = send::application::Builder::new(env.writer_rt());
+    let write = send::application::Builder::new(env.writer_rt(), start_time);
 
     let stream = application::Builder {
         read,

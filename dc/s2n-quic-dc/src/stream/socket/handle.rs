@@ -2,14 +2,20 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::{Protocol, TransportFeatures};
-use crate::msg::{self, addr::Addr, cmsg};
+use crate::{
+    msg::{self, addr::Addr, cmsg},
+    socket::send::completion::Completer as _,
+    stream::send::state::transmission,
+};
 use core::task::{Context, Poll};
-use s2n_quic_core::inet::ExplicitCongestionNotification;
+use s2n_quic_core::{inet::ExplicitCongestionNotification, time::Timestamp};
 use std::{
     io::{self, IoSlice, IoSliceMut},
     net::SocketAddr,
     sync::Arc,
 };
+
+pub use transmission::Entry as Transmission;
 
 pub type Flags = libc::c_int;
 
@@ -58,8 +64,24 @@ pub trait Socket: 'static + Send + Sync {
     ) -> Poll<io::Result<usize>>;
 
     #[inline]
-    fn try_send_buffer(&self, msg: &mut msg::send::Message) -> io::Result<usize> {
-        msg.send_with(|addr, ecn, iov| self.try_send(addr, ecn, iov))
+    fn send_transmission(&self, msg: Transmission) {
+        msg.send_with(|addr, ecn, iov| {
+            let _ = self.try_send(addr, ecn, iov);
+        });
+        if let Some(completion) = msg.completion.as_ref().and_then(|c| c.upgrade()) {
+            completion.complete(msg);
+        }
+    }
+
+    #[inline]
+    fn send_transmission_at(
+        &self,
+        msg: Transmission,
+        time: Timestamp,
+    ) -> Result<(), (Transmission, Timestamp)> {
+        let _ = time;
+        self.send_transmission(msg);
+        Ok(())
     }
 
     /// Tries to send data on the socket, returning `Err(WouldBlock)` if none could be sent.
@@ -69,15 +91,6 @@ pub trait Socket: 'static + Send + Sync {
         ecn: ExplicitCongestionNotification,
         buffer: &[IoSlice],
     ) -> io::Result<usize>;
-
-    #[inline]
-    fn poll_send_buffer(
-        &self,
-        cx: &mut Context,
-        msg: &mut msg::send::Message,
-    ) -> Poll<io::Result<usize>> {
-        msg.poll_send_with(|addr, ecn, iov| self.poll_send(cx, addr, ecn, iov))
-    }
 
     /// Sends data on the socket
     fn poll_send(
@@ -156,6 +169,20 @@ macro_rules! impl_box {
                 buffer: &[IoSlice],
             ) -> io::Result<usize> {
                 (**self).try_send(addr, ecn, buffer)
+            }
+
+            #[inline(always)]
+            fn send_transmission(&self, msg: Transmission) {
+                (**self).send_transmission(msg)
+            }
+
+            #[inline(always)]
+            fn send_transmission_at(
+                &self,
+                msg: Transmission,
+                time: Timestamp,
+            ) -> Result<(), (Transmission, Timestamp)> {
+                (**self).send_transmission_at(msg, time)
             }
 
             #[inline(always)]

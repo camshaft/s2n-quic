@@ -3,7 +3,7 @@
 
 use crate::{
     clock::Timer,
-    event, msg,
+    event,
     stream::{
         recv::application::{Inner, LocalState, Reader},
         runtime,
@@ -36,7 +36,6 @@ where
     pub fn build(self, shared: ArcShared<Sub>, sockets: socket::ArcApplication) -> Reader<Sub> {
         let Self { endpoint, runtime } = self;
 
-        let remote_addr = shared.remote_addr();
         // we only need a timer for unreliable transports
         let is_reliable = sockets.features().is_reliable();
         let timer = if is_reliable {
@@ -44,8 +43,6 @@ where
         } else {
             Some(Timer::new(&shared.clock))
         };
-        let gso = shared.gso.clone();
-        let send_buffer = msg::send::Message::new(remote_addr, gso);
         // If the transport is reliable then it's handling ACKs. Otherwise, the application is sending
         // ACKs so we want to do a little more compute per `read` call, if the application buffer allows
         // for it.
@@ -54,7 +51,6 @@ where
         } else {
             ReadMode::UntilFull
         };
-        let ack_mode = Default::default();
         let local_state = match endpoint {
             // reliable transports on the client need to read at least one packet in order to
             // process secret control packets
@@ -68,9 +64,7 @@ where
         Reader(ManuallyDrop::new(Box::new(Inner {
             shared,
             sockets,
-            send_buffer,
             read_mode,
-            ack_mode,
             timer,
             local_state,
             runtime,

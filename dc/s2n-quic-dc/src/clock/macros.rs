@@ -21,7 +21,7 @@ macro_rules! impl_clock {
         impl Default for Clock {
             #[inline]
             fn default() -> Self {
-                Self(Instant::now())
+                Self(root())
             }
         }
 
@@ -30,6 +30,14 @@ macro_rules! impl_clock {
             fn get_time(&self) -> Timestamp {
                 let time = self.0.elapsed();
                 unsafe { Timestamp::from_duration(time) }
+            }
+        }
+
+        impl crate::clock::precision::Clock for Clock {
+            #[inline]
+            fn now(&self) -> crate::clock::precision::Timestamp {
+                let nanos = self.0.elapsed().as_nanos() as u64;
+                crate::clock::precision::Timestamp { nanos }
             }
         }
 
@@ -61,16 +69,13 @@ macro_rules! impl_clock {
         impl super::Sleep for Sleep {
             #[inline]
             fn update(self: Pin<&mut Self>, target: Timestamp) {
-                let target = unsafe { target.as_duration() };
-
-                // floor the delay to milliseconds to reduce timer churn
-                let delay = Duration::from_millis(target.as_millis() as u64);
+                let delay = unsafe { target.as_duration() };
 
                 let target = self.clock.0 + delay;
 
                 // if the clock has changed let the sleep future know
                 trace!(update = ?target);
-                self.project().sleep.reset(target);
+                self.project().sleep.reset(target.into());
             }
         }
 
@@ -78,6 +83,10 @@ macro_rules! impl_clock {
             #[inline]
             fn sleep(&self, amount: Duration) -> (SleepHandle, Timestamp) {
                 self.clock.sleep(amount)
+            }
+
+            fn timer(&self) ->super::Timer {
+               super::Timer::new(self)
             }
         }
 
@@ -94,7 +103,7 @@ macro_rules! impl_clock {
             #[inline]
             fn sleep(&self, amount: Duration) -> (SleepHandle, Timestamp) {
                 let now = Instant::now();
-                let sleep = sleep_until(now + amount);
+                let sleep = sleep_until((now + amount).into());
                 let sleep = Sleep {
                     clock: self.clone(),
                     sleep,
@@ -103,6 +112,10 @@ macro_rules! impl_clock {
                 let target = now.saturating_duration_since(self.0);
                 let target = unsafe { Timestamp::from_duration(target) };
                 (sleep, target)
+            }
+
+            fn timer(&self) ->super::Timer {
+               super::Timer::new(self)
             }
         }
     };

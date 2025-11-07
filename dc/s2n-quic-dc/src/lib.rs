@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 pub mod allocator;
+pub mod busy_poll;
 pub mod clock;
 pub mod congestion;
 pub mod control;
@@ -10,10 +11,10 @@ pub mod crypto;
 pub mod datagram;
 pub mod either;
 pub mod event;
+pub mod intrusive_queue;
 pub mod msg;
 pub mod packet;
 pub mod path;
-pub mod pool;
 pub mod psk;
 pub mod random;
 pub mod recovery;

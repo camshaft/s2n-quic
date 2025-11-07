@@ -28,7 +28,7 @@ pub(super) struct Descriptor<T, Key> {
     phantom: PhantomData<DescriptorInner<T, Key>>,
 }
 
-impl<T: 'static, Key: 'static> Descriptor<T, Key> {
+impl<T: 'static, Key: 'static + Copy> Descriptor<T, Key> {
     #[inline]
     pub(super) fn new(ptr: NonNull<DescriptorInner<T, Key>>) -> Self {
         Self {
@@ -70,6 +70,18 @@ impl<T: 'static, Key: 'static> Descriptor<T, Key> {
         self.inner().id
     }
 
+    #[inline]
+    pub unsafe fn key(&self) -> Option<Key> {
+        {
+            *self.inner().key.get()
+        }
+    }
+
+    #[inline]
+    pub unsafe fn take_key(&mut self) -> Option<Key> {
+        { &mut *self.inner().key.get() }.take()
+    }
+
     /// # Safety
     ///
     /// The caller needs to guarantee the [`Descriptor`] is still allocated.
@@ -86,14 +98,6 @@ impl<T: 'static, Key: 'static> Descriptor<T, Key> {
         &self.inner().control
     }
 
-    /// # Safety
-    ///
-    /// * The caller needs to guarantee the [`Descriptor`] is still allocated.
-    /// * The caller needs to have unique access to the [`Descriptor`].
-    pub unsafe fn take_key(&mut self) -> Option<Key> {
-        core::ptr::replace(self.inner().key.get(), None)
-    }
-
     #[inline]
     fn inner(&self) -> &DescriptorInner<T, Key> {
         unsafe { self.ptr.as_ref() }
@@ -103,7 +107,7 @@ impl<T: 'static, Key: 'static> Descriptor<T, Key> {
     ///
     /// * The [`Descriptor`] needs to be marked as free of receivers
     #[inline]
-    pub unsafe fn into_receiver_pair(self, key: Option<Key>) -> (Self, Self) {
+    pub unsafe fn into_receiver_pair(self, key: Key) -> (Self, Self) {
         let inner = self.inner();
 
         // open the queues back up for receiving
@@ -111,7 +115,7 @@ impl<T: 'static, Key: 'static> Descriptor<T, Key> {
 
         // set the key on the descriptor
         // SAFETY: the descriptor is fully owned by the caller
-        let _ = core::ptr::replace(inner.key.get(), key);
+        inner.key.get().write(Some(key));
 
         probes::on_receiver_open(inner.id);
 

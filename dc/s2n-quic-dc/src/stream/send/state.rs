@@ -7,16 +7,15 @@ use crate::{
     crypto, event,
     packet::{
         self,
-        stream::{self, decoder, encoder},
+        stream::{self, decoder, encoder, PacketSpace},
     },
     recovery,
     stream::{
         processing,
         send::{
-            application, buffer,
+            application::state::{Message, PushError},
             error::{self, Error},
             filter::Filter,
-            transmission::Type as TransmissionType,
         },
         DEFAULT_IDLE_TIMEOUT,
     },
@@ -33,8 +32,8 @@ use s2n_quic_core::{
     interval_set::IntervalSet,
     packet::number::PacketNumberSpace,
     path::{ecn, INITIAL_PTO_BACKOFF},
-    random, ready,
-    recovery::{Pto, RttEstimator},
+    random,
+    recovery::{bandwidth::Bandwidth, Pto, RttEstimator},
     stream::state,
     time::{
         timer::{self, Provider as _},
@@ -42,112 +41,119 @@ use s2n_quic_core::{
     },
     varint::VarInt,
 };
-use slotmap::SlotMap;
-use std::collections::{BinaryHeap, VecDeque};
-use tracing::{debug, trace};
+use std::collections::BinaryHeap;
+use tracing::trace;
 
-pub mod probe;
+mod fin;
+mod keep_alive;
+mod max_data;
+mod probe;
+mod reset;
 pub mod retransmission;
 pub mod transmission;
 
 type PacketMap<Info> = s2n_quic_core::packet::number::Map<Info>;
 
-pub type Transmission = application::transmission::Event<buffer::Segment>;
-
-slotmap::new_key_type! {
-    pub struct BufferIndex;
-}
-
-#[derive(Clone, Debug)]
-pub enum TransmitIndex {
-    Stream(BufferIndex, buffer::Segment),
-    Recovery(BufferIndex),
-}
-
 #[derive(Debug)]
 pub struct SentStreamPacket {
-    info: transmission::Info<BufferIndex>,
+    info: transmission::Info,
     cc_info: congestion::PacketInfo,
 }
 
 #[derive(Debug)]
 pub struct SentRecoveryPacket {
-    info: transmission::Info<BufferIndex>,
+    info: transmission::Info,
     cc_info: congestion::PacketInfo,
-    max_stream_packet_number: VarInt,
+    max_stream_packet_number_lost: VarInt,
 }
 
-#[derive(Clone, Copy, Debug)]
-pub struct ErrorState {
-    pub error: Error,
-    pub source: Location,
+#[derive(Clone, Debug, Default)]
+pub struct InflightCounters {
+    pub probes: u32,
+    pub with_payload: u32,
+    pub with_final_offset: u32,
+    pub with_reset: u32,
 }
 
-impl ErrorState {
-    fn as_frame(&self) -> Option<frame::ConnectionClose<'static>> {
-        // No need to send the peer an error if they sent it
-        if matches!(self.source, Location::Remote) {
-            return None;
+impl InflightCounters {
+    pub fn on_transmit(&mut self, info: &transmission::Info) {
+        self.update(info, |count| *count += 1);
+    }
+
+    pub fn on_finish(&mut self, info: &transmission::Info) {
+        self.update(info, |count| *count -= 1);
+    }
+
+    fn update(&mut self, info: &transmission::Info, mut update: impl FnMut(&mut u32)) {
+        if info.is_probe() {
+            update(&mut self.probes);
         }
 
-        use error::Kind;
-
-        match self.error.kind {
-            Kind::ApplicationError { error } => Some(frame::ConnectionClose {
-                error_code: VarInt::new(*error).unwrap(),
-                frame_type: None,
-                reason: None,
-            }),
-            Kind::TransportError { code } => Some(frame::ConnectionClose {
-                error_code: code,
-                frame_type: Some(VarInt::from_u16(0)),
-                reason: None,
-            }),
-            _ => Some(frame::ConnectionClose {
-                error_code: VarInt::from_u16(1),
-                frame_type: None,
-                reason: None,
-            }),
+        if info.payload_len > 0 {
+            update(&mut self.with_payload);
         }
+
+        if info.flags.included_final_offset() {
+            update(&mut self.with_final_offset);
+        }
+
+        if info.flags.included_reset() {
+            update(&mut self.with_reset);
+        }
+    }
+
+    pub fn has_inflight_packets(
+        &self,
+        unacked_ranges: &IntervalSet<VarInt>,
+        fin: &fin::Fin,
+        reset: &reset::Reset,
+    ) -> bool {
+        let mut has_inflight_packets = !unacked_ranges.is_empty() && self.with_payload > 0;
+        has_inflight_packets |= !fin.is_acked() && self.with_final_offset > 0;
+        has_inflight_packets |= reset.waiting_ack() && self.with_reset > 0;
+        has_inflight_packets
     }
 }
 
+const MAX_TX_OFFSET: VarInt = VarInt::from_u32(64 * 1024);
+
 #[derive(Debug)]
 pub struct State {
-    pub rtt_estimator: RttEstimator,
-    pub sent_stream_packets: PacketMap<SentStreamPacket>,
-    pub stream_packet_buffers: SlotMap<BufferIndex, buffer::Segment>,
-    pub max_stream_packet_number: VarInt,
-    pub sent_recovery_packets: PacketMap<SentRecoveryPacket>,
-    pub recovery_packet_buffers: SlotMap<BufferIndex, Vec<u8>>,
-    pub free_packet_buffers: Vec<Vec<u8>>,
-    pub recovery_packet_number: u64,
-    pub last_sent_recovery_packet: Option<Timestamp>,
-    pub transmit_queue: VecDeque<TransmitIndex>,
-    pub state: state::Sender,
-    pub control_filter: Filter,
-    pub retransmissions: BinaryHeap<retransmission::Segment<BufferIndex>>,
-    pub next_expected_control_packet: VarInt,
-    pub cca: congestion::Controller,
-    pub ecn: ecn::Controller,
-    pub pto: Pto,
-    pub pto_backoff: u32,
-    pub idle_timer: Timer,
-    pub idle_timeout: Duration,
-    pub error: Option<ErrorState>,
-    pub unacked_ranges: IntervalSet<VarInt>,
-    pub max_sent_offset: VarInt,
-    pub max_data: VarInt,
-    pub local_max_data_window: VarInt,
-    pub peer_activity: Option<PeerActivity>,
-    pub max_datagram_size: u16,
-    pub max_sent_segment_size: u16,
-    pub is_reliable: bool,
+    rtt_estimator: RttEstimator,
+    sent_stream_packets: PacketMap<SentStreamPacket>,
+    max_stream_packet_number: VarInt,
+    max_stream_packet_number_lost: VarInt,
+    sent_recovery_packets: PacketMap<SentRecoveryPacket>,
+    recovery_packet_number: u64,
+    last_sent_packet: Option<Timestamp>,
+    control_filter: Filter,
+    next_expected_control_packet: VarInt,
+    cca: congestion::Controller,
+    ecn: ecn::Controller,
+    pto: Pto,
+    pto_backoff: u32,
+    counters: InflightCounters,
+    idle_timer: Timer,
+    idle_timeout: Duration,
+    reset: reset::Reset,
+    unacked_ranges: IntervalSet<VarInt>,
+    max_data: max_data::MaxData,
+    max_tx_offset: VarInt,
+    local_max_data_window: VarInt,
+    peer_activity: Option<PeerActivity>,
+    max_datagram_size: u16,
+    max_sent_segment_size: u16,
+    is_reliable: bool,
+    fin: fin::Fin,
+    keep_alive: keep_alive::KeepAlive,
+    retransmissions: BinaryHeap<retransmission::Segment>,
+    #[cfg(debug_assertions)]
+    pending_retransmissions: IntervalSet<VarInt>,
 }
 
 #[derive(Clone, Copy, Debug)]
 pub struct PeerActivity {
-    pub newly_acked_packets: bool,
+    pub made_progress: bool,
 }
 
 impl State {
@@ -162,45 +168,46 @@ impl State {
         unacked_ranges.insert(VarInt::ZERO..=VarInt::MAX).unwrap();
 
         let cca = congestion::Controller::new(max_datagram_size);
-        let max_sent_offset = VarInt::ZERO;
+
+        let max_tx_offset = MAX_TX_OFFSET;
 
         Self {
             next_expected_control_packet: VarInt::ZERO,
             rtt_estimator: recovery::rtt_estimator(),
             cca,
             sent_stream_packets: Default::default(),
-            stream_packet_buffers: Default::default(),
             max_stream_packet_number: VarInt::ZERO,
+            max_stream_packet_number_lost: VarInt::ZERO,
             sent_recovery_packets: Default::default(),
-            recovery_packet_buffers: Default::default(),
             recovery_packet_number: 0,
-            last_sent_recovery_packet: None,
-            free_packet_buffers: Default::default(),
-            transmit_queue: Default::default(),
+            last_sent_packet: None,
             control_filter: Default::default(),
             ecn: ecn::Controller::default(),
-            state: Default::default(),
-            retransmissions: Default::default(),
             pto: Pto::default(),
             pto_backoff: INITIAL_PTO_BACKOFF,
+            counters: Default::default(),
             idle_timer: Default::default(),
             idle_timeout: params.max_idle_timeout().unwrap_or(DEFAULT_IDLE_TIMEOUT),
-            error: None,
+            reset: Default::default(),
             unacked_ranges,
-            max_sent_offset,
-            max_data: initial_max_data,
+            max_data: max_data::MaxData::new(initial_max_data),
+            max_tx_offset,
             local_max_data_window: local_max_data,
             peer_activity: None,
             max_datagram_size,
             max_sent_segment_size: 0,
             is_reliable: stream_id.is_reliable,
+            fin: Default::default(),
+            retransmissions: Default::default(),
+            keep_alive: Default::default(),
+            #[cfg(debug_assertions)]
+            pending_retransmissions: Default::default(),
         }
     }
 
     /// Initializes the worker as a client
     #[inline]
     pub fn init_client(&mut self, clock: &impl Clock) {
-        debug_assert!(self.state.is_ready());
         // make sure a packet gets sent soon if the application doesn't
         self.force_arm_pto_timer(clock);
         self.update_idle_timer(clock);
@@ -208,43 +215,72 @@ impl State {
 
     #[inline]
     pub fn init_server(&mut self, clock: &impl Clock) {
-        debug_assert!(self.state.is_ready());
         self.update_idle_timer(clock);
     }
 
     /// Returns the current flow offset
     #[inline]
     pub fn flow_offset(&self) -> VarInt {
-        let cca_offset = {
-            let mut extra_window = self
-                .cca
-                .congestion_window()
-                .saturating_sub(self.cca.bytes_in_flight());
+        self.max_tx_offset
+            .min(self.max_data.max_data())
+            .min(self.local_offset())
+            .min(self.cca_offset())
+    }
 
-            // only give CCA credits to the application if we were able to retransmit everything considered lost
-            if !self.retransmissions.is_empty() {
-                extra_window = 0;
-            }
+    pub fn state(&self) -> state::Sender {
+        if let Some(state) = self.reset.state() {
+            return state;
+        }
 
-            self.max_sent_offset + extra_window as usize
-        };
+        if self.unacked_ranges.is_empty() {
+            return if self.fin.is_acked() {
+                state::Sender::DataRecvd
+            } else {
+                state::Sender::DataSent
+            };
+        }
 
-        let local_offset = {
-            let unacked_start = self.unacked_ranges.min_value().unwrap_or_default();
-            let local_max_data_window = self.local_max_data_window;
+        state::Sender::Send
+    }
 
-            unacked_start.saturating_add(local_max_data_window)
-        };
+    fn cca_offset(&self) -> VarInt {
+        let mut extra_window = self
+            .cca
+            .congestion_window()
+            .saturating_sub(self.cca.bytes_in_flight());
 
-        let remote_offset = self.max_data;
+        // only give CCA credits to the application if we were able to retransmit everything considered lost
+        if !self.retransmissions.is_empty() {
+            extra_window = 0;
+        }
 
-        cca_offset.min(local_offset).min(remote_offset)
+        self.max_data.max_sent_offset() + extra_window as usize
+    }
+
+    fn local_offset(&self) -> VarInt {
+        self.unacked_ranges
+            .min_value()
+            .map_or(VarInt::MAX, |unacked_start| {
+                unacked_start.saturating_add(self.local_max_data_window)
+            })
     }
 
     #[inline]
     pub fn send_quantum_packets(&self) -> u8 {
         let send_quantum = (self.cca.send_quantum() as u64).div_ceil(self.max_datagram_size as u64);
         send_quantum.try_into().unwrap_or(u8::MAX)
+    }
+
+    pub fn bandwidth(&self) -> Bandwidth {
+        self.cca.bandwidth()
+    }
+
+    pub fn keep_alive(&mut self, enabled: bool, clock: &impl Clock) {
+        let target = self
+            .idle_timer
+            .next_expiration()
+            .unwrap_or_else(|| clock.get_time());
+        self.keep_alive.set(enabled, target, self.idle_timeout);
     }
 
     /// Called by the worker when it receives a control packet from the peer
@@ -256,8 +292,7 @@ impl State {
         packet: &mut packet::control::decoder::Packet,
         random: &mut dyn random::Generator,
         clock: &Clk,
-        transmission_queue: &application::transmission::Queue<buffer::Segment>,
-        segment_alloc: &buffer::Allocator,
+        transmission_queue: &transmission::Queue,
         publisher: &Pub,
     ) -> Result<(), processing::Error>
     where
@@ -272,13 +307,12 @@ impl State {
             random,
             clock,
             transmission_queue,
-            segment_alloc,
             publisher,
         ) {
             Ok(None) => {}
             Ok(Some(error)) => return Err(error),
             Err(error) => {
-                self.on_error(error, Location::Local, publisher);
+                self.on_error(error, Location::Local, clock, publisher);
             }
         }
 
@@ -295,8 +329,7 @@ impl State {
         packet: &mut packet::control::decoder::Packet,
         random: &mut dyn random::Generator,
         clock: &Clk,
-        transmission_queue: &application::transmission::Queue<buffer::Segment>,
-        segment_alloc: &buffer::Allocator,
+        transmission_queue: &transmission::Queue,
         publisher: &Pub,
     ) -> Result<Option<processing::Error>, Error>
     where
@@ -335,9 +368,10 @@ impl State {
         }
 
         let recv_time = clock.get_time();
-        let mut newly_acked = false;
+        let mut made_progress = false;
         let mut max_acked_stream = None;
         let mut max_acked_recovery = None;
+        let mut max_acked_tx_time = None;
         let mut loaded_transmit_queue = false;
 
         for frame in packet.control_frames_mut() {
@@ -355,7 +389,7 @@ impl State {
                 FrameMut::Ack(ack) => {
                     if !core::mem::replace(&mut loaded_transmit_queue, true) {
                         // make sure we have a current view of the application transmissions
-                        self.load_transmission_queue(transmission_queue);
+                        self.load_completion_queue(transmission_queue, clock);
                     }
 
                     if ack.ecn_counts.is_some() {
@@ -363,10 +397,10 @@ impl State {
                             &ack,
                             random,
                             &recv_time,
-                            &mut newly_acked,
+                            &mut made_progress,
                             &mut max_acked_stream,
                             &mut max_acked_recovery,
-                            segment_alloc,
+                            &mut max_acked_tx_time,
                             publisher,
                         )?;
                     } else {
@@ -374,42 +408,25 @@ impl State {
                             &ack,
                             random,
                             &recv_time,
-                            &mut newly_acked,
+                            &mut made_progress,
                             &mut max_acked_stream,
                             &mut max_acked_recovery,
-                            segment_alloc,
+                            &mut max_acked_tx_time,
                             publisher,
                         )?;
                     }
                 }
                 FrameMut::MaxData(frame) => {
-                    if self.max_data < frame.maximum_data {
-                        let diff = frame.maximum_data.saturating_sub(self.max_data);
-
+                    if let Some(diff) = self.max_data.on_max_data_frame(frame.maximum_data) {
                         publisher.on_stream_max_data_received(
                             event::builder::StreamMaxDataReceived {
                                 increase: diff.as_u64(),
                                 new_max_data: frame.maximum_data.as_u64(),
                             },
                         );
-
-                        self.max_data = frame.maximum_data;
                     }
                 }
                 FrameMut::ConnectionClose(close) => {
-                    debug!(connection_close = ?close, state = ?self.state);
-
-                    // if there was no error and we transmitted everything then just shut the
-                    // stream down
-                    if close.error_code == VarInt::ZERO && close.frame_type.is_some() {
-                        self.unacked_ranges.clear();
-                        self.try_finish();
-                        return Ok(None);
-                    }
-
-                    // no need to transmit a reset back to the peer - just close it
-                    let _ = self.state.on_send_reset();
-                    let _ = self.state.on_recv_reset_ack();
                     let error = if close.frame_type.is_some() {
                         error::Kind::TransportError {
                             code: close.error_code,
@@ -421,42 +438,63 @@ impl State {
                     };
 
                     let error = error.err();
-                    self.on_error(error, Location::Remote, publisher);
+                    self.on_error(error, Location::Remote, clock, publisher);
                     return Err(error);
                 }
                 _ => continue,
             }
         }
 
-        for (space, pn) in [
-            (stream::PacketSpace::Stream, max_acked_stream),
-            (stream::PacketSpace::Recovery, max_acked_recovery),
-        ] {
-            if let Some(pn) = pn {
-                self.detect_lost_packets(random, &recv_time, space, pn, publisher)?;
+        // Perform loss detection across both packet number spaces using the max ACK'd TX time
+        // This ensures we use a consistent loss window based on the most recently acknowledged packet
+        if let Some(max_tx_time) = max_acked_tx_time {
+            // Time threshold: loss_delay = max(kTimeThreshold * max(smoothed_rtt, latest_rtt), kGranularity)
+            let loss_delay = {
+                let rtt = self
+                    .rtt_estimator
+                    .smoothed_rtt()
+                    .max(self.rtt_estimator.latest_rtt());
+                // kTimeThreshold is typically 9/8 per RFC
+                let time_threshold = rtt + rtt / 8;
+                // kGranularity is typically 1ms
+                time_threshold.max(Duration::from_millis(1))
+            };
+
+            let loss_time = max_tx_time.checked_sub(loss_delay);
+
+            for (space, pn) in [
+                (stream::PacketSpace::Stream, max_acked_stream),
+                (stream::PacketSpace::Recovery, max_acked_recovery),
+            ] {
+                self.detect_lost_packets(random, &recv_time, space, pn, loss_time, publisher)?;
             }
         }
 
-        self.on_peer_activity(newly_acked);
-
-        // try to transition to the final state if we've sent all of the data
-        self.try_finish();
+        self.on_peer_activity(made_progress || self.max_data.is_blocked());
 
         Ok(None)
     }
 
-    #[inline]
-    fn try_finish(&mut self) {
-        // check if we still have pending data
-        ensure!(self.unacked_ranges.is_empty());
+    pub fn on_fin_known(&mut self, final_offset: VarInt) {
+        ensure!(self.fin.on_known(final_offset).is_ok());
+        self.unacked_ranges
+            .remove(final_offset..=VarInt::MAX)
+            .unwrap();
+        self.keep_alive.on_fin_known();
 
-        // check if we are still ok
-        ensure!(self.error.is_none());
+        trace!(%final_offset, ?self.unacked_ranges, "fin known");
+    }
 
-        // try to transition to the final state if it's a valid transition
-        ensure!(self.state.on_recv_all_acks().is_ok());
+    pub fn next_expected_control_packet(&self) -> VarInt {
+        self.next_expected_control_packet
+    }
 
-        self.clean_up();
+    pub fn max_datagram_size(&self) -> u16 {
+        self.max_datagram_size
+    }
+
+    pub fn error(&self) -> Option<(&error::Error, Location)> {
+        self.reset.error()
     }
 
     #[inline]
@@ -465,10 +503,10 @@ impl State {
         ack: &frame::Ack<Ack>,
         random: &mut dyn random::Generator,
         clock: &Clk,
-        newly_acked: &mut bool,
+        made_progress: &mut bool,
         max_acked_stream: &mut Option<VarInt>,
         max_acked_recovery: &mut Option<VarInt>,
-        segment_alloc: &buffer::Allocator,
+        max_acked_tx_time: &mut Option<Timestamp>,
         publisher: &Pub,
     ) -> Result<(), Error>
     where
@@ -505,14 +543,22 @@ impl State {
                             cca_args = Some((packet.info.time_sent, packet.cc_info));
                         }
 
-                        // free the retransmission segment
-                        if let Some(segment) = packet.info.retransmission {
-                            if let Some(segment) = self.stream_packet_buffers.remove(segment) {
-                                // push the segment so the application can reuse it
-                                if segment.capacity() >= self.max_sent_segment_size as usize {
-                                    segment_alloc.free(segment);
-                                }
-                            }
+                        // Track the max ACK'd TX time across all packet spaces for loss detection
+                        *max_acked_tx_time = (*max_acked_tx_time).max(Some(packet.info.time_sent));
+
+                        self.counters.on_finish(&packet.info);
+
+                        // If we got an ACK for a packet that included the final offset then notify the fin state
+                        if packet.info.flags.included_final_offset() {
+                            self.fin.on_ack();
+                        }
+
+                        if packet.info.flags.included_reset() {
+                            self.reset.on_ack();
+                        }
+
+                        if !packet.info.is_probe() {
+                            *made_progress = true;
                         }
 
                         publisher.on_stream_packet_acked(event::builder::StreamPacketAcked {
@@ -524,10 +570,9 @@ impl State {
                             lifetime: clock
                                 .get_time()
                                 .saturating_duration_since(packet.info.time_sent),
-                            is_retransmission: packet.info.retransmission.is_some(),
+                            is_retransmission: PacketSpace::$space.is_recovery()
+                                && !packet.info.is_probe(),
                         });
-
-                        *newly_acked = true;
                     }
                 }
             };
@@ -548,25 +593,23 @@ impl State {
                 |packet_number: VarInt, sent_packet: &SentRecoveryPacket| {
                     *max_acked_recovery = (*max_acked_recovery).max(Some(packet_number));
                     *max_acked_stream =
-                        (*max_acked_stream).max(Some(sent_packet.max_stream_packet_number));
-
-                    // increase the max stream packet if this was a probe
-                    if sent_packet.info.retransmission.is_none() {
-                        self.max_stream_packet_number = self
-                            .max_stream_packet_number
-                            .max(sent_packet.max_stream_packet_number + 1);
-                    }
+                        (*max_acked_stream).max(Some(sent_packet.max_stream_packet_number_lost));
                 }
             );
         };
 
         if let Some((time_sent, cc_info)) = cca_args {
-            let rtt_sample = clock.get_time().saturating_duration_since(time_sent);
+            let now = clock.get_time();
+            let ack_delay = ack.ack_delay();
+            let rtt_sample = now
+                .saturating_duration_since(time_sent)
+                .saturating_sub(ack_delay)
+                .max(Duration::from_micros(1));
 
             self.rtt_estimator.update_rtt(
-                ack.ack_delay(),
+                Duration::ZERO,
                 rtt_sample,
-                clock.get_time(),
+                now,
                 true,
                 PacketNumberSpace::ApplicationData,
             );
@@ -577,7 +620,7 @@ impl State {
                 cc_info,
                 &self.rtt_estimator,
                 random,
-                clock.get_time(),
+                now,
             );
         }
 
@@ -590,25 +633,47 @@ impl State {
         random: &mut dyn random::Generator,
         clock: &Clk,
         packet_space: stream::PacketSpace,
-        max: VarInt,
+        max_acked_pn: Option<VarInt>,
+        loss_time: Option<Timestamp>,
         publisher: &Pub,
     ) -> Result<(), Error>
     where
         Clk: Clock,
         Pub: event::ConnectionPublisher,
     {
-        let Some(loss_threshold) = max.checked_sub(VarInt::from_u8(2)) else {
-            return Ok(());
-        };
+        // Packet number threshold
+        let pn_threshold = max_acked_pn.and_then(|max_pn| max_pn.checked_sub(VarInt::from_u8(3)));
 
-        let mut is_unrecoverable = false;
+        let is_unrecoverable = false;
 
         macro_rules! impl_loss_detection {
             ($sent_packets:ident, $on_packet:expr) => {{
                 let lost_min = PacketNumberSpace::Initial.new_packet_number(VarInt::ZERO);
-                let lost_max = PacketNumberSpace::Initial.new_packet_number(loss_threshold);
+                let mut lost_max = None;
+
+                for (num, packet) in self.$sent_packets.iter() {
+                    // A packet is considered lost if it meets either condition:
+                    // 1. Time threshold: sent before loss_time
+                    // 2. Packet number threshold: packet number <= max_acked_pn - 3
+                    let lost_by_time = loss_time.map_or(false, |loss_time| packet.info.time_sent <= loss_time);
+                    let lost_by_pn = pn_threshold
+                        .map_or(false, |threshold| num.as_u64() <= threshold.as_u64());
+
+                    if lost_by_time || lost_by_pn {
+                        lost_max = Some(num);
+                        continue;
+                    }
+
+                    break;
+                }
+
+                let Some(lost_max) = lost_max else {
+                    return Ok(());
+                };
+
                 let range = s2n_quic_core::packet::number::PacketNumberRange::new(lost_min, lost_max);
-                for (num, packet) in self.$sent_packets.remove_range(range) {
+                for (num, mut packet) in self.$sent_packets.remove_range(range) {
+                    let num_varint = unsafe { VarInt::new_unchecked(num.as_u64()) };
                     // TODO create a path and publisher
                     // self.ecn.on_packet_loss(packet.time_sent, packet.ecn, now, path, publisher);
 
@@ -628,18 +693,17 @@ impl State {
                         packet_number: num.as_u64(),
                         time_sent: packet.info.time_sent.into_event(),
                         lifetime: now.saturating_duration_since(packet.info.time_sent),
-                        is_retransmission: packet.info.retransmission.is_some(),
+                        is_retransmission: packet_space.is_recovery() && !packet.info.is_probe(),
                     });
 
                     #[allow(clippy::redundant_closure_call)]
-                    ($on_packet)(&packet);
+                    ($on_packet)(num_varint, &packet);
 
-                    if let Some((segment, retransmission)) = packet.info.retransmit_copy() {
-                        // the stream segment was cleaned up so no need to retransmit
-                        if !self.stream_packet_buffers.contains_key(segment) {
-                            continue;
-                        }
+                    self.counters.on_finish(&packet.info);
 
+                    // TODO don't retransmit if the range is already ACK'd elsewhere
+
+                    if let Some(retransmission) = packet.info.try_retransmit() {
                         // update our local packet number to be at least 1 more than the largest lost
                         // packet number
                         let min_recovery_packet_number = num.as_u64() + 1;
@@ -648,21 +712,23 @@ impl State {
 
                         self.retransmissions.push(retransmission);
                     } else {
-                        // we can only recover reliable streams
-                        is_unrecoverable |= packet.info.payload_len > 0 && !self.is_reliable;
+                        // TODO how do we know if the retransmission is in-flight or not?
                     }
                 }
             }}
         }
 
         match packet_space {
-            stream::PacketSpace::Stream => impl_loss_detection!(sent_stream_packets, |_| {}),
+            stream::PacketSpace::Stream => impl_loss_detection!(sent_stream_packets, |_, _| {}),
             stream::PacketSpace::Recovery => {
-                impl_loss_detection!(sent_recovery_packets, |sent_packet: &SentRecoveryPacket| {
-                    self.max_stream_packet_number = self
-                        .max_stream_packet_number
-                        .max(sent_packet.max_stream_packet_number + 1);
-                })
+                impl_loss_detection!(
+                    sent_recovery_packets,
+                    |_packet_number: VarInt, sent_packet: &SentRecoveryPacket| {
+                        self.max_stream_packet_number_lost = self
+                            .max_stream_packet_number_lost
+                            .max(sent_packet.max_stream_packet_number_lost + 1);
+                    }
+                )
             }
         }
 
@@ -676,56 +742,12 @@ impl State {
         Ok(())
     }
 
-    /// Takes the oldest stream packets and tries to make them into PTO packets
-    ///
-    /// This ensures that we're not wasting resources by sending empty payloads, especially
-    /// when there's outstanding data waiting to be ACK'd.
-    fn make_stream_packets_as_pto_probes(&mut self) {
-        // check to see if we have in-flight stream segments
-        ensure!(!self.sent_stream_packets.is_empty());
-        // only reliable streams store segments
-        ensure!(self.is_reliable);
-
-        let pto = self.pto.transmissions() as usize;
-
-        // check if we already have retransmissions scheduled
-        let Some(mut remaining) = pto.checked_sub(self.retransmissions.len()) else {
-            return;
-        };
-
-        // iterate until remaining is 0.
-        //
-        // This nested loop a bit weird but it's intentional - if we have `remaining == 2` but only have a single
-        // in-flight stream segment then we want to transmit that segment `remaining` times.
-        while remaining > 0 {
-            for (num, packet) in self.sent_stream_packets.iter().take(remaining) {
-                let Some((_segment, retransmission)) = packet.info.retransmit_copy() else {
-                    // unreliable streams don't store segments so bail early - this was checked above
-                    return;
-                };
-
-                // update our local packet number to be at least 1 more than the largest lost
-                // packet number
-                let min_recovery_packet_number = num.as_u64() + 1;
-                self.recovery_packet_number =
-                    self.recovery_packet_number.max(min_recovery_packet_number);
-
-                self.retransmissions.push(retransmission);
-
-                // consider this as a PTO
-                remaining -= 1;
-            }
-        }
-    }
-
     #[inline]
-    fn on_peer_activity(&mut self, newly_acked_packets: bool) {
+    fn on_peer_activity(&mut self, made_progress: bool) {
         if let Some(prev) = self.peer_activity.as_mut() {
-            prev.newly_acked_packets |= newly_acked_packets;
+            prev.made_progress |= made_progress;
         } else {
-            self.peer_activity = Some(PeerActivity {
-                newly_acked_packets,
-            });
+            self.peer_activity = Some(PeerActivity { made_progress });
         }
     }
 
@@ -737,6 +759,14 @@ impl State {
         self.update_idle_timer(clock);
         self.update_pto_timer(clock);
 
+        if self.has_inflight_packets() {
+            debug_assert!(self.pto.is_armed());
+        }
+
+        if self.unacked_ranges.is_empty() && self.fin.is_acked() {
+            debug_assert!(self.state().is_terminal());
+        }
+
         trace!(
             unacked_ranges = ?self.unacked_ranges,
             retransmissions = self.retransmissions.len(),
@@ -744,30 +774,28 @@ impl State {
             recovery_packets_in_flight = self.sent_recovery_packets.iter().count(),
             pto_timer = ?self.pto.next_expiration(),
             idle_timer = ?self.idle_timer.next_expiration(),
+            ?self.counters,
+            state = ?self.state(),
+            ?self.fin,
         );
+
+        self.invariants();
     }
 
     #[inline]
     fn process_peer_activity(&mut self) {
-        let Some(PeerActivity {
-            newly_acked_packets,
-        }) = self.peer_activity.take()
-        else {
+        let Some(PeerActivity { made_progress }) = self.peer_activity.take() else {
             return;
         };
 
-        if newly_acked_packets {
+        // If the peer is making progress then reset our PTO backoff. Otherwise, we could
+        // get caught in a loop.
+        if made_progress {
             self.reset_pto_timer();
         }
 
-        // force probing when we've sent all of the data but haven't got an ACK for the final
-        // offset
-        if self.state.is_data_sent() && self.stream_packet_buffers.is_empty() {
-            self.pto.force_transmit();
-        }
-
         // re-arm the idle timer as long as we're not in terminal state
-        if !self.state.is_terminal() {
+        if !self.state().is_terminal() {
             self.idle_timer.cancel();
         }
     }
@@ -780,54 +808,56 @@ impl State {
         publisher: &Pub,
     ) where
         Clk: Clock,
-        Ld: FnOnce() -> Timestamp,
+        Ld: Fn() -> Timestamp,
         Pub: event::ConnectionPublisher,
     {
         if self.poll_idle_timer(clock, load_last_activity).is_ready() {
-            self.on_error(error::Kind::IdleTimeout, Location::Local, publisher);
-            // we don't actually want to send any packets on idle timeout
-            let _ = self.state.on_send_reset();
-            let _ = self.state.on_recv_reset_ack();
+            self.on_error(error::Kind::IdleTimeout, Location::Local, clock, publisher);
             return;
         }
 
+        let packets_in_flight = self.has_inflight_packets();
+
         if self
             .pto
-            .on_timeout(self.has_inflight_packets(), clock.get_time())
+            .on_timeout(packets_in_flight, clock.get_time())
             .is_ready()
         {
             // TODO where does this come from
             let max_pto_backoff = 1024;
             self.pto_backoff = self.pto_backoff.saturating_mul(2).min(max_pto_backoff);
         }
+
+        let _ = self.max_data.on_timeout(clock, self.idle_timeout);
+        let _ = self.keep_alive.on_timeout(clock, self.idle_timeout);
     }
 
     #[inline]
     fn poll_idle_timer<Clk, Ld>(&mut self, clock: &Clk, load_last_activity: Ld) -> Poll<()>
     where
         Clk: Clock,
-        Ld: FnOnce() -> Timestamp,
+        Ld: Fn() -> Timestamp,
     {
         let now = clock.get_time();
 
-        // check the idle timer first
-        ready!(self.idle_timer.poll_expiration(now));
+        for i in 0..2 {
+            if let Some(expiration) = self.idle_timer.next_expiration() {
+                if !expiration.has_elapsed(now) {
+                    return Poll::Pending;
+                }
+                self.idle_timer.cancel();
+                if i > 0 {
+                    break;
+                }
+            }
 
-        // if that expired then load the last activity from the peer and update the idle timer with
-        // the value
-        let last_peer_activity = load_last_activity();
-        self.update_idle_timer(&last_peer_activity);
-
-        // check the idle timer once more before returning
-        ready!(self.idle_timer.poll_expiration(now));
+            // if that expired then load the last activity from the peer and update the idle timer with
+            // the value
+            let last_peer_activity = load_last_activity();
+            self.update_idle_timer(&last_peer_activity);
+        }
 
         Poll::Ready(())
-    }
-
-    /// Returns `true` if there are any outstanding stream segments
-    #[inline]
-    fn has_inflight_packets(&self) -> bool {
-        !self.stream_packet_buffers.is_empty()
     }
 
     #[inline]
@@ -835,22 +865,28 @@ impl State {
         ensure!(!self.idle_timer.is_armed());
 
         let now = clock.get_time();
-        self.idle_timer.set(now + self.idle_timeout);
+        let target = now + self.idle_timeout;
+        self.idle_timer.set(target);
+        self.keep_alive
+            .on_idle_timer_update(target, self.idle_timeout);
     }
 
     #[inline]
     fn update_pto_timer(&mut self, clock: &impl Clock) {
         ensure!(!self.pto.is_armed());
 
-        // if we have stream packet buffers in flight then arm the PTO
-        let mut should_arm = self.has_inflight_packets();
+        if self.has_inflight_packets() {
+            self.force_arm_pto_timer(clock);
+        }
+    }
 
-        // if we've sent all of the data/reset and are waiting to clean things up
-        should_arm |= self.state.is_data_sent() || self.state.is_reset_sent();
-
-        ensure!(should_arm);
-
-        self.force_arm_pto_timer(clock);
+    fn has_inflight_packets(&self) -> bool {
+        let mut has_inflight =
+            self.counters
+                .has_inflight_packets(&self.unacked_ranges, &self.fin, &self.reset);
+        // If we're blocked on flow control we also need to keep the PTO armed
+        has_inflight |= self.max_data.is_inflight();
+        has_inflight
     }
 
     #[inline]
@@ -875,37 +911,63 @@ impl State {
     /// Called by the worker thread when it becomes aware of the application having transmitted a
     /// segment
     #[inline]
-    pub fn load_transmission_queue(
-        &mut self,
-        queue: &application::transmission::Queue<buffer::Segment>,
-    ) -> bool {
-        let mut did_transmit_stream = false;
+    pub fn load_completion_queue(&mut self, queue: &transmission::Queue, clock: &impl Clock) {
+        let mut should_reset_pto = false;
 
-        for Transmission {
-            packet_number,
-            info,
-            has_more_app_data,
-        } in queue.drain()
-        {
+        queue.drain_completion_queue(|transmission| {
+            let (packet_number, mut info) = transmission.info;
+
+            // Use the actual transmission time rather than when it was submitted to give better RTT estimates
+            debug_assert!(
+                transmission.transmission_time.has_elapsed(clock.get_time()),
+                "{} >= {}",
+                clock.get_time(),
+                transmission.transmission_time
+            );
+            info.time_sent = transmission.transmission_time;
+
+            let meta = transmission.meta;
+            let has_more_app_data = meta.has_more_app_data;
             self.max_sent_segment_size = self.max_sent_segment_size.max(info.packet_len);
-            let info = info.map(|buffer| self.stream_packet_buffers.insert(buffer));
+
+            // Check if we need to update the fin state
+            if let Some(final_offset) = meta.final_offset {
+                self.on_fin_known(final_offset);
+                self.fin.on_transmit();
+            }
+
+            // Store the buffer so we can retransmit if lost
+            if info.payload_len > 0 {
+                info.descriptor = Some(transmission.segment);
+            }
+
+            if meta.packet_space.is_stream() {
+                should_reset_pto = true;
+            }
+
+            #[cfg(debug_assertions)]
+            tracing::trace!(
+                ?meta.packet_space,
+                %packet_number,
+                ?info,
+                "transmission_complete"
+            );
+
             self.on_transmit_segment(
-                stream::PacketSpace::Stream,
+                meta.packet_space,
                 packet_number,
                 info,
                 has_more_app_data,
+                clock,
             );
-            did_transmit_stream = true;
-        }
+        });
 
-        if did_transmit_stream {
+        if should_reset_pto {
             // if we just sent some packets then we can use those as probes
             self.reset_pto_timer();
         }
 
         self.invariants();
-
-        did_transmit_stream
     }
 
     #[inline]
@@ -913,22 +975,26 @@ impl State {
         &mut self,
         packet_space: stream::PacketSpace,
         packet_number: VarInt,
-        info: transmission::Info<BufferIndex>,
+        info: transmission::Info,
         has_more_app_data: bool,
+        clock: &impl Clock,
     ) {
         // the BBR implementation requires monotonic time so track that
         let mut cca_time_sent = info.time_sent;
 
         match packet_space {
             stream::PacketSpace::Stream => {
-                if let Some(min) = self.last_sent_recovery_packet {
+                if let Some(min) = self.last_sent_packet {
                     cca_time_sent = info.time_sent.max(min);
                 }
             }
             stream::PacketSpace::Recovery => {
-                self.last_sent_recovery_packet = Some(info.time_sent);
+                if let Some(min) = self.last_sent_packet {
+                    cca_time_sent = info.time_sent.max(min);
+                }
             }
         }
+        self.last_sent_packet = Some(cca_time_sent);
 
         let cc_info = self.cca.on_packet_sent(
             cca_time_sent,
@@ -938,51 +1004,97 @@ impl State {
         );
 
         // update the max offset that we've transmitted
-        self.max_sent_offset = self.max_sent_offset.max(info.end_offset());
-
-        // try to transition to start sending
-        let _ = self.state.on_send_stream();
-        if info.included_fin {
-            // clear out the unacked ranges that we're no longer tracking
-            let final_offset = info.end_offset();
-            let _ = self.unacked_ranges.remove(final_offset..);
-
-            // if the transmission included the final offset, then transition to that state
-            let _ = self.state.on_send_fin();
-        }
+        self.max_data.on_transmit(
+            info.end_offset(),
+            clock,
+            self.idle_timeout,
+            self.max_datagram_size,
+        );
+        self.counters.on_transmit(&info);
 
         if let stream::PacketSpace::Recovery = packet_space {
             let packet_number = PacketNumberSpace::Initial.new_packet_number(packet_number);
-            let max_stream_packet_number = self.max_stream_packet_number;
+            let max_stream_packet_number_lost = self
+                .max_stream_packet_number_lost
+                .max(self.max_stream_packet_number + 1);
+
+            #[cfg(debug_assertions)]
+            let _ = self.pending_retransmissions.remove(info.range());
+
+            if cfg!(debug_assertions)
+                && !self.sent_recovery_packets.is_empty()
+                && self
+                    .sent_recovery_packets
+                    .get_range()
+                    .max()
+                    .is_some_and(|v| v >= packet_number)
+            {
+                panic!("application packet numbers should be transmitted in order {packet_number:?}: {info:?} - {:?}", self.sent_recovery_packets);
+            }
+
             self.sent_recovery_packets.insert(
                 packet_number,
                 SentRecoveryPacket {
                     info,
                     cc_info,
-                    max_stream_packet_number,
+                    max_stream_packet_number_lost,
                 },
             );
         } else {
+            if packet_number == VarInt::ZERO {
+                debug_assert_eq!(packet_number, self.max_stream_packet_number);
+            } else {
+                debug_assert_eq!(
+                    packet_number,
+                    self.max_stream_packet_number + 1,
+                    "application packet numbers should be transmitted in order {info:?}"
+                );
+            }
             self.max_stream_packet_number = self.max_stream_packet_number.max(packet_number);
+
+            self.max_stream_packet_number_lost = self
+                .max_stream_packet_number
+                .max(self.max_stream_packet_number_lost)
+                + 1;
+
+            self.max_tx_offset = self.max_tx_offset.max(info.end_offset() + MAX_TX_OFFSET);
+            self.recovery_packet_number = self
+                .recovery_packet_number
+                .max(self.max_stream_packet_number.as_u64() + 1);
+
             let packet_number = PacketNumberSpace::Initial.new_packet_number(packet_number);
             self.sent_stream_packets
                 .insert(packet_number, SentStreamPacket { info, cc_info });
         }
     }
 
+    fn requires_transmission(&self) -> bool {
+        let mut enabled = false;
+
+        enabled |= self.pto.transmissions() > 0;
+        enabled |= self.fin.is_queued();
+        enabled |= self.reset.is_queued();
+        enabled |= self.max_data.is_queued();
+        enabled |= self.keep_alive.is_queued();
+
+        enabled
+    }
+
     #[inline]
-    pub fn fill_transmit_queue<C, Clk, Pub>(
+    pub fn fill_transmit_queue<C, Clk, M, Pub>(
         &mut self,
         control_key: &C,
         credentials: &Credentials,
         stream_id: &stream::Id,
         source_queue_id: Option<VarInt>,
         clock: &Clk,
+        packets: &mut M,
         publisher: &Pub,
     ) -> Result<(), Error>
     where
         C: crypto::seal::control::Stream,
         Clk: Clock,
+        M: Message,
         Pub: event::ConnectionPublisher,
     {
         if let Err(error) = self.fill_transmit_queue_impl(
@@ -991,9 +1103,10 @@ impl State {
             stream_id,
             source_queue_id,
             clock,
+            packets,
             publisher,
         ) {
-            self.on_error(error, Location::Local, publisher);
+            self.on_error(error, Location::Local, clock, publisher);
             return Err(error);
         }
 
@@ -1001,44 +1114,56 @@ impl State {
     }
 
     #[inline]
-    fn fill_transmit_queue_impl<C, Clk, Pub>(
+    fn fill_transmit_queue_impl<C, Clk, M, Pub>(
         &mut self,
         control_key: &C,
         credentials: &Credentials,
         stream_id: &stream::Id,
         source_queue_id: Option<VarInt>,
         clock: &Clk,
+        packets: &mut M,
         publisher: &Pub,
     ) -> Result<(), Error>
     where
         C: crypto::seal::control::Stream,
         Clk: Clock,
+        M: Message,
         Pub: event::ConnectionPublisher,
     {
+        self.process_peer_activity();
+
         // skip a packet number if we're probing
         if self.pto.transmissions() > 0 {
-            self.recovery_packet_number += 1;
-
-            // Try making some existing stream packets as probes instead of transmitting empty ones
-            self.make_stream_packets_as_pto_probes();
+            self.recovery_packet_number =
+                (self.recovery_packet_number + 1).max(*self.max_stream_packet_number + 1);
         }
 
-        self.try_transmit_retransmissions(control_key, clock, publisher)?;
-        self.try_transmit_probe(control_key, credentials, stream_id, source_queue_id, clock)?;
+        self.try_transmit_retransmissions(control_key, clock, packets, publisher)?;
+        self.try_transmit_probe(
+            control_key,
+            credentials,
+            stream_id,
+            source_queue_id,
+            packets,
+            clock,
+            publisher,
+        )?;
 
         Ok(())
     }
 
     #[inline]
-    fn try_transmit_retransmissions<C, Clk, Pub>(
+    fn try_transmit_retransmissions<C, Clk, M, Pub>(
         &mut self,
         control_key: &C,
         clock: &Clk,
+        packets: &mut M,
         publisher: &Pub,
     ) -> Result<(), Error>
     where
         C: crypto::seal::control::Stream,
         Clk: Clock,
+        M: Message,
         Pub: event::ConnectionPublisher,
     {
         // We'll only have retransmissions if we're reliable
@@ -1058,56 +1183,48 @@ impl State {
                 );
             }
 
-            let Some(segment) = self.stream_packet_buffers.get_mut(retransmission.segment) else {
-                // the segment was acknowledged by another packet so remove it
-                let _ = self
-                    .retransmissions
-                    .pop()
-                    .expect("retransmission should be available");
-                continue;
-            };
-            let buffer = segment.make_mut();
-
-            debug_assert!(!buffer.is_empty(), "empty retransmission buffer submitted");
+            let mut info = self
+                .retransmissions
+                .pop()
+                .expect("retransmission should be available");
 
             let packet_number =
                 VarInt::new(self.recovery_packet_number).expect("2^62 is a lot of packets");
             self.recovery_packet_number += 1;
 
-            {
-                let buffer = DecoderBufferMut::new(buffer);
-                match decoder::Packet::retransmit(
-                    buffer,
-                    stream::PacketSpace::Recovery,
-                    packet_number,
-                    control_key,
-                ) {
-                    Ok(info) => info,
-                    Err(err) => {
-                        // this shouldn't ever happen
-                        debug_assert!(false, "{err:?}");
-                        return Err(error::Kind::RetransmissionFailure.err());
+            let packet_len = {
+                let buffer = info.descriptor.payload_mut();
+
+                debug_assert!(!buffer.is_empty(), "empty retransmission buffer submitted");
+
+                {
+                    let buffer = DecoderBufferMut::new(buffer);
+                    match decoder::Packet::retransmit(
+                        buffer,
+                        stream::PacketSpace::Recovery,
+                        packet_number,
+                        control_key,
+                    ) {
+                        Ok(info) => info,
+                        Err(err) => {
+                            // this shouldn't ever happen
+                            debug_assert!(false, "{err:?}");
+                            return Err(error::Kind::RetransmissionFailure.err());
+                        }
                     }
                 }
+
+                buffer.len() as u16
             };
 
             let time_sent = clock.get_time();
-            let packet_len = buffer.len() as u16;
 
             {
-                let info = self
-                    .retransmissions
-                    .pop()
-                    .expect("retransmission should be available");
-
-                // enqueue the transmission
-                self.transmit_queue
-                    .push_back(TransmitIndex::Stream(info.segment, segment.clone()));
-
                 let stream_offset = info.stream_offset;
                 let payload_len = info.payload_len;
-                let included_fin = info.included_fin;
-                let retransmission = Some(info.segment);
+                let flags = info.flags;
+                debug_assert!(!flags.is_probe(), "probes should not be retransmitted");
+                let descriptor = info.descriptor;
 
                 // TODO store this as part of the packet queue
                 let ecn = ExplicitCongestionNotification::Ect0;
@@ -1116,10 +1233,26 @@ impl State {
                     packet_len,
                     stream_offset,
                     payload_len,
-                    included_fin,
-                    retransmission,
+                    flags,
+                    descriptor: None,
                     time_sent,
                     ecn,
+                };
+
+                #[cfg(debug_assertions)]
+                let _ = self.pending_retransmissions.insert(info.range());
+
+                let meta = transmission::Meta {
+                    packet_space: PacketSpace::Recovery,
+                    has_more_app_data: true,
+                    final_offset: self.fin.value(),
+                    span: Default::default(),
+                };
+
+                let event = transmission::Event {
+                    info,
+                    meta,
+                    packet_number,
                 };
 
                 publisher.on_stream_packet_transmitted(event::builder::StreamPacketTransmitted {
@@ -1127,16 +1260,17 @@ impl State {
                     stream_offset: stream_offset.as_u64(),
                     payload_len: payload_len as usize,
                     packet_number: packet_number.as_u64(),
-                    is_fin: included_fin,
+                    is_fin: flags.included_final_byte(),
                     is_retransmission: true,
                 });
-
-                self.on_transmit_segment(stream::PacketSpace::Recovery, packet_number, info, false);
 
                 // consider this transmission a probe if needed
                 if self.pto.transmissions() > 0 {
                     self.pto.on_transmit_once();
                 }
+                self.keep_alive.on_transmit();
+
+                packets.push(event, descriptor);
             }
         }
 
@@ -1144,203 +1278,197 @@ impl State {
     }
 
     #[inline]
-    pub fn try_transmit_probe<C, Clk>(
+    pub fn try_transmit_probe<C, M, Clk, Pub>(
         &mut self,
         control_key: &C,
         credentials: &Credentials,
         stream_id: &stream::Id,
         source_queue_id: Option<VarInt>,
+        packets: &mut M,
         clock: &Clk,
+        publisher: &Pub,
     ) -> Result<(), Error>
     where
         C: crypto::seal::control::Stream,
         Clk: Clock,
+        M: Message,
+        Pub: event::ConnectionPublisher,
     {
-        while self.pto.transmissions() > 0 {
+        while self.requires_transmission() {
             // probes are not congestion-controlled
-
-            let packet_number =
-                VarInt::new(self.recovery_packet_number).expect("2^62 is a lot of packets");
-            self.recovery_packet_number += 1;
-
-            let mut buffer = self.free_packet_buffers.pop().unwrap_or_default();
-
-            // resize the buffer to what we need
-            {
+            let res = packets.push_with(|mut buffer| {
                 let min_len = stream::encoder::MAX_RETRANSMISSION_HEADER_LEN + 128;
+                assert!(buffer.len() >= min_len);
 
-                if buffer.capacity() < min_len {
-                    buffer.reserve(min_len - buffer.len());
+                let packet_number =
+                    VarInt::new(self.recovery_packet_number).expect("2^62 is a lot of packets");
+                self.recovery_packet_number += 1;
+
+                let offset = self.max_data.max_sent_offset();
+                let final_offset = self.fin.try_transmit();
+
+                let included_final_byte = Some(offset) == final_offset;
+                let included_final_offset = final_offset.is_some();
+                let mut flags = transmission::Flags::empty()
+                    .with_included_final_byte(included_final_byte)
+                    .with_included_final_offset(included_final_offset)
+                    .with_probe(true);
+
+                let mut payload = probe::Probe {
+                    offset,
+                    final_offset,
+                };
+
+                // Include DATA_BLOCKED frame when blocked on flow control
+                let data_blocked = self.max_data.try_transmit_data_blocked();
+                let reset_frame = self.reset.try_transmit();
+
+                let ping = if self.pto.transmissions() > 0 || self.keep_alive.is_queued() {
+                    Some(frame::Ping)
+                } else {
+                    None
+                };
+
+                if data_blocked.is_some() {
+                    publisher.on_stream_data_blocked_transmitted(
+                        event::builder::StreamDataBlockedTransmitted {
+                            stream_offset: offset.as_u64(),
+                            packet_number: packet_number.as_u64(),
+                        },
+                    );
                 }
 
-                unsafe {
-                    debug_assert!(buffer.capacity() >= min_len);
-                    buffer.set_len(min_len);
+                if reset_frame.is_some() {
+                    flags = flags.with_included_reset(true);
+                }
+
+                let control_data = (ping, (data_blocked, reset_frame));
+                let control_data_len = VarInt::try_from(control_data.encoding_size()).unwrap();
+
+                let encoder = EncoderBuffer::new(&mut buffer);
+                let packet_len = encoder::probe(
+                    encoder,
+                    source_queue_id,
+                    *stream_id,
+                    packet_number,
+                    self.next_expected_control_packet,
+                    VarInt::ZERO,
+                    &mut &[][..],
+                    control_data_len,
+                    &control_data,
+                    &mut payload,
+                    control_key,
+                    credentials,
+                );
+
+                let payload_len = 0;
+
+                debug_assert!(
+                    packet_len < u16::MAX as usize,
+                    "cannot write larger packets than 2^16"
+                );
+                let packet_len = packet_len as u16;
+
+                let time_sent = clock.get_time();
+
+                let ecn = ExplicitCongestionNotification::Ect0;
+
+                let info = transmission::Info {
+                    packet_len,
+                    stream_offset: offset,
+                    payload_len,
+                    flags,
+                    descriptor: None,
+                    time_sent,
+                    ecn,
+                };
+
+                let meta = transmission::Meta {
+                    packet_space: PacketSpace::Recovery,
+                    has_more_app_data: false,
+                    final_offset,
+                    span: Default::default(),
+                };
+
+                transmission::Event {
+                    packet_number,
+                    info,
+                    meta,
+                }
+            });
+
+            match res {
+                Ok(_) => {}
+                Err(PushError::Alloc) => {
+                    // We weren't able to allocate any packets so we'll need to try again later
+                    // TODO how do we know when?
+                    break;
+                }
+                Err(PushError::EmptyPacket) => {
+                    // We shouldn't ever write an empty packet
+                    debug_assert!(false, "probe packet should never be empty");
+                    break;
                 }
             }
 
-            let offset = self.max_sent_offset;
-            let final_offset = if self.state.is_data_sent() {
-                Some(offset)
-            } else {
-                None
-            };
-
-            let mut payload = probe::Probe {
-                offset,
-                final_offset,
-            };
-
-            let mut control_data_len = VarInt::ZERO;
-            let control_data = if let Some(error) = self.error.as_ref() {
-                if let Some(frame) = error.as_frame() {
-                    control_data_len = VarInt::try_from(frame.encoding_size()).unwrap();
-
-                    Some(frame)
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
-
-            let encoder = EncoderBuffer::new(&mut buffer);
-            let packet_len = encoder::probe(
-                encoder,
-                source_queue_id,
-                *stream_id,
-                packet_number,
-                self.next_expected_control_packet,
-                VarInt::ZERO,
-                &mut &[][..],
-                control_data_len,
-                &control_data,
-                &mut payload,
-                control_key,
-                credentials,
-            );
-
-            let payload_len = 0;
-            let included_fin = final_offset.is_some();
-            buffer.truncate(packet_len);
-
-            debug_assert!(
-                packet_len < u16::MAX as usize,
-                "cannot write larger packets than 2^16"
-            );
-            let packet_len = packet_len as u16;
-
-            let time_sent = clock.get_time();
-
-            // TODO store this as part of the packet queue
-            let ecn = ExplicitCongestionNotification::Ect0;
-
-            // enqueue the transmission
-            let buffer_index = self.recovery_packet_buffers.insert(buffer);
-            self.transmit_queue
-                .push_back(TransmitIndex::Recovery(buffer_index));
-
-            let info = transmission::Info {
-                packet_len,
-                stream_offset: offset,
-                payload_len,
-                included_fin,
-                retransmission: None, // PTO packets are not retransmitted
-                time_sent,
-                ecn,
-            };
-
-            self.on_transmit_segment(stream::PacketSpace::Recovery, packet_number, info, false);
-
-            self.pto.on_transmit_once();
+            if self.pto.transmissions() > 0 {
+                self.pto.on_transmit_once();
+            }
+            self.keep_alive.on_transmit();
         }
 
         Ok(())
     }
 
     #[inline]
-    pub fn transmit_queue_iter<Clk: Clock>(
-        &mut self,
-        clock: &Clk,
-    ) -> impl Iterator<Item = (ExplicitCongestionNotification, &[u8])> + '_ {
-        let ecn = self
-            .ecn
-            .ecn(s2n_quic_core::transmission::Mode::Normal, clock.get_time());
-        let recovery_packet_buffers = &self.recovery_packet_buffers;
-
-        self.transmit_queue.iter().filter_map(move |index| {
-            let buf = match index {
-                TransmitIndex::Stream(_index, segment) => segment.as_slice(),
-                TransmitIndex::Recovery(index) => recovery_packet_buffers.get(*index)?,
-            };
-
-            Some((ecn, buf))
-        })
-    }
-
-    #[inline]
-    pub fn on_transmit_queue(&mut self, count: usize) {
-        for transmission in self.transmit_queue.drain(..count) {
-            match transmission {
-                TransmitIndex::Stream(index, _segment) => {
-                    // make sure the packet wasn't freed between when we wanted to transmit and
-                    // when we actually did
-                    ensure!(self.stream_packet_buffers.get(index).is_some(), continue);
-                }
-                TransmitIndex::Recovery(index) => {
-                    // make sure the packet wasn't freed between when we wanted to transmit and
-                    // when we actually did
-                    let Some(mut buffer) = self.recovery_packet_buffers.remove(index) else {
-                        continue;
-                    };
-                    buffer.clear();
-                    self.free_packet_buffers.push(buffer);
-                }
-            };
-        }
-    }
-
-    #[inline]
     #[track_caller]
-    pub fn on_error<E, Pub>(&mut self, error: E, source: Location, publisher: &Pub)
-    where
+    pub fn on_error<E, Clk, Pub>(
+        &mut self,
+        error: E,
+        source: Location,
+        clock: &Clk,
+        publisher: &Pub,
+    ) where
         Error: From<E>,
+        Clk: Clock,
         Pub: event::ConnectionPublisher,
     {
-        ensure!(self.error.is_none());
         let error = Error::from(error);
-        self.error = Some(ErrorState { error, source });
+        ensure!(self.reset.on_error(error, source).is_ok());
         publisher.on_stream_sender_errored(event::builder::StreamSenderErrored { error, source });
-        let _ = self.state.on_queue_reset();
 
-        self.clean_up();
-        self.pto.force_transmit();
-    }
+        // Emit abandon events for all unacknowledged stream packets
+        let now = clock.get_time();
+        for (num, packet) in self.sent_stream_packets.iter() {
+            publisher.on_stream_packet_abandoned(event::builder::StreamPacketAbandoned {
+                packet_len: packet.info.packet_len as usize,
+                stream_offset: packet.info.stream_offset.as_u64(),
+                payload_len: packet.info.payload_len as usize,
+                packet_number: num.as_u64(),
+                time_sent: packet.info.time_sent.into_event(),
+                lifetime: now.saturating_duration_since(packet.info.time_sent),
+                is_retransmission: false,
+            });
+        }
 
-    #[inline]
-    fn clean_up(&mut self) {
+        // Emit abandon events for all unacknowledged recovery packets
+        for (num, packet) in self.sent_recovery_packets.iter() {
+            publisher.on_stream_packet_abandoned(event::builder::StreamPacketAbandoned {
+                packet_len: packet.info.packet_len as usize,
+                stream_offset: packet.info.stream_offset.as_u64(),
+                payload_len: packet.info.payload_len as usize,
+                packet_number: num.as_u64(),
+                time_sent: packet.info.time_sent.into_event(),
+                lifetime: now.saturating_duration_since(packet.info.time_sent),
+                is_retransmission: true,
+            });
+        }
+
         self.retransmissions.clear();
-        let min = PacketNumberSpace::Initial.new_packet_number(VarInt::ZERO);
-        let max = PacketNumberSpace::Initial.new_packet_number(VarInt::MAX);
-        let range = s2n_quic_core::packet::number::PacketNumberRange::new(min, max);
-        let _ = self.sent_stream_packets.remove_range(range);
-        let _ = self.sent_recovery_packets.remove_range(range);
-
-        self.idle_timer.cancel();
-        self.pto.cancel();
+        self.sent_stream_packets.clear();
+        self.sent_recovery_packets.clear();
         self.unacked_ranges.clear();
-
-        self.transmit_queue.clear();
-        for buffer in self.stream_packet_buffers.drain() {
-            // TODO push buffer into free segment queue
-            let _ = buffer;
-        }
-        for (_idx, mut buffer) in self.recovery_packet_buffers.drain() {
-            buffer.clear();
-            self.free_packet_buffers.push(buffer);
-        }
-
-        self.invariants();
+        self.keep_alive.on_shutdown();
     }
 
     #[cfg(debug_assertions)]
@@ -1356,7 +1484,9 @@ impl State {
                     continue;
                 }
 
-                unacked_ranges.remove(packet.info.range()).unwrap();
+                if packet.info.descriptor.is_some() {
+                    unacked_ranges.remove(packet.info.range()).unwrap();
+                }
             }
 
             for (_pn, packet) in self.sent_recovery_packets.iter() {
@@ -1364,7 +1494,9 @@ impl State {
                     continue;
                 }
 
-                unacked_ranges.remove(packet.info.range()).unwrap();
+                if packet.info.descriptor.is_some() {
+                    unacked_ranges.remove(packet.info.range()).unwrap();
+                }
             }
 
             for v in self.retransmissions.iter() {
@@ -1372,6 +1504,10 @@ impl State {
                     continue;
                 }
                 unacked_ranges.remove(v.range()).unwrap();
+            }
+
+            for range in self.pending_retransmissions.inclusive_ranges() {
+                unacked_ranges.remove(range).unwrap();
             }
 
             assert!(
@@ -1390,9 +1526,11 @@ impl timer::Provider for State {
     #[inline]
     fn timers<Q: timer::Query>(&self, query: &mut Q) -> timer::Result {
         // if we're in a terminal state then no timers are needed
-        ensure!(!self.state.is_terminal(), Ok(()));
+        ensure!(!self.state().is_terminal(), Ok(()));
         self.pto.timers(query)?;
+        self.max_data.timers(query)?;
         self.idle_timer.timers(query)?;
+        self.keep_alive.timers(query)?;
         Ok(())
     }
 }

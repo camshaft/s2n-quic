@@ -237,6 +237,12 @@ impl<V> Map<V> {
         Iter::new(self)
     }
 
+    /// Gets an iterator over the sent packet entries, sorted by PacketNumber
+    #[inline]
+    pub fn iter_mut(&mut self) -> IterMut<'_, V> {
+        IterMut::new(self)
+    }
+
     /// Returns true if there are no entries
     #[inline]
     pub fn is_empty(&self) -> bool {
@@ -338,70 +344,76 @@ impl<V> Map<V> {
     }
 }
 
-/// An iterator over all of the contained packet numbers
-///
-/// This iterator is optimized to reduce the amount of bounds checks being performed
-#[derive(Debug)]
-pub struct Iter<'a, V> {
-    packets: &'a Map<V>,
-    packet_number: Option<PacketNumber>,
-    index: usize,
-    remaining: usize,
-}
-
-impl<'a, V> Iter<'a, V> {
-    #[inline]
-    fn new(packets: &'a Map<V>) -> Self {
-        let start = packets.start;
-        let end = packets.end;
-        let index = packets.index;
-
-        let mut iter = Self {
-            packets,
-            packet_number: Some(start),
-            index,
-            // start with an empty iterator
-            remaining: 0,
-        };
-
-        // make sure we have at least one packet
-        if iter.packets.is_empty() {
-            return iter;
+macro_rules! impl_iter {
+    ($name:ident, [$($lt:tt)*], $split:ident) => {
+        /// An iterator over all of the contained packet numbers
+        ///
+        /// This iterator is optimized to reduce the amount of bounds checks being performed
+        #[derive(Debug)]
+        pub struct $name<'a, V> {
+            iter: core::iter::Chain<core::slice::$name<'a, Option<V>>, core::slice::$name<'a, Option<V>>>,
+            packet_number: Option<PacketNumber>,
+            remaining: usize,
         }
 
-        // set the number of remaining entries based on the bounded range
-        iter.remaining = (end.as_u64() - start.as_u64()) as usize;
-        // we always have at least 1 items since the range is inclusive
-        iter.remaining += 1;
+        impl<'a, V> $name<'a, V> {
+            #[inline]
+            fn new(packets: $($lt)* Map<V>) -> Self {
+                let start = packets.start;
+                let end = packets.end;
+                let index = packets.index;
+                let len = packets.values.len();
 
-        debug_assert!(iter.remaining <= iter.packets.values.len());
+                let (tail, head) = packets.values.$split(index);
+                let iter = head.into_iter().chain(tail);
 
-        iter
-    }
-}
+                let mut iter = Self {
+                    iter,
+                    packet_number: Some(start),
+                    // start with an empty iterator
+                    remaining: 0,
+                };
 
-impl<'a, V> Iterator for Iter<'a, V> {
-    type Item = (PacketNumber, &'a V);
+                // make sure we have at least one packet
+                if len == 0 {
+                    return iter;
+                }
 
-    #[inline]
-    fn next(&mut self) -> Option<Self::Item> {
-        while self.remaining > 0 {
-            self.remaining -= 1;
+                // set the number of remaining entries based on the bounded range
+                iter.remaining = (end.as_u64() - start.as_u64()) as usize;
+                // we always have at least 1 items since the range is inclusive
+                iter.remaining += 1;
 
-            let packet_number = self.packet_number?;
-            self.packet_number = packet_number.next();
+                debug_assert!(iter.remaining <= len);
 
-            let index = self.index;
-            self.index = (index + 1) % self.packets.values.len();
-
-            if let Some(info) = self.packets.values[index].as_ref() {
-                return Some((packet_number, info));
+                iter
             }
         }
 
-        None
-    }
+        impl<'a, V> Iterator for $name<'a, V> {
+            type Item = (PacketNumber, $($lt)* V);
+
+            #[inline]
+            fn next(&mut self) -> Option<Self::Item> {
+                while self.remaining > 0 {
+                    self.remaining -= 1;
+
+                    let packet_number = self.packet_number?;
+                    self.packet_number = packet_number.next();
+
+                    if let Some(Some(info)) = self.iter.next() {
+                        return Some((packet_number, info));
+                    }
+                }
+
+                None
+            }
+        }
+    };
 }
+
+impl_iter!(Iter, [&'a], split_at);
+impl_iter!(IterMut, [&'a mut], split_at_mut);
 
 /// An iterator which removes a set of packet numbers in a range
 ///

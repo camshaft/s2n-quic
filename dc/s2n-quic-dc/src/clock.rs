@@ -13,6 +13,7 @@ mod macros;
 
 #[cfg(any(test, feature = "testing"))]
 pub mod bach;
+pub mod precision;
 #[cfg(feature = "tokio")]
 pub mod tokio;
 pub use time::clock::Cached;
@@ -25,12 +26,7 @@ pub type SleepHandle = Pin<Box<dyn Sleep>>;
 pub trait Clock: 'static + Send + Sync + fmt::Debug + time::Clock {
     fn sleep(&self, amount: Duration) -> (SleepHandle, Timestamp);
 
-    fn timer(&self) -> Timer
-    where
-        Self: Sized,
-    {
-        Timer::new(self)
-    }
+    fn timer(&self) -> Timer;
 }
 
 impl<A, B> Clock for Either<A, B>
@@ -42,6 +38,13 @@ where
         match self {
             Either::A(a) => a.sleep(amount),
             Either::B(b) => b.sleep(amount),
+        }
+    }
+
+    fn timer(&self) -> Timer {
+        match self {
+            Either::A(a) => a.timer(),
+            Either::B(b) => b.timer(),
         }
     }
 }
@@ -85,7 +88,9 @@ impl Timer {
         /// the future.
         const INITIAL_TIMEOUT: Duration = Duration::from_secs(1);
 
-        Self::new_with_timeout(clock, INITIAL_TIMEOUT)
+        let mut timer = Self::new_with_timeout(clock, INITIAL_TIMEOUT);
+        timer.cancel();
+        timer
     }
 
     #[inline]
@@ -109,6 +114,12 @@ impl Timer {
         use time::clock::Timer;
         self.update(target);
         core::future::poll_fn(|cx| self.poll_ready(cx)).await
+    }
+}
+
+impl time::Clock for Timer {
+    fn get_time(&self) -> Timestamp {
+        self.sleep.get_time()
     }
 }
 

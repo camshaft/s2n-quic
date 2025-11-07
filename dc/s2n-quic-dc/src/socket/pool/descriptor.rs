@@ -1,82 +1,83 @@
 // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::msg::{addr::Addr, cmsg};
+use crate::{
+    allocator,
+    msg::{self, addr::Addr, cmsg},
+};
 use core::fmt;
 use s2n_quic_core::inet::ExplicitCongestionNotification;
 use std::{
-    io::IoSliceMut,
-    marker::PhantomData,
+    alloc::Layout,
+    io::{IoSlice, IoSliceMut},
     ptr::NonNull,
-    sync::{
-        atomic::{AtomicUsize, Ordering},
-        Arc,
-    },
+    sync::atomic::{AtomicUsize, Ordering},
 };
 use tracing::trace;
 
-/// Callback which releases a descriptor back into the free list
-pub(super) trait FreeList: 'static + Send + Sync {
-    /// Frees a descriptor back into the free list
-    ///
-    /// Once the free list has been closed and all descriptors returned, the `free` function
-    /// should return an object that can be dropped to release all of the memory associated
-    /// with the descriptor pool. This works around any issues around the "Stacked Borrows"
-    /// model by deferring freeing memory borrowed by `self`.
-    fn free(&self, descriptor: Descriptor) -> Option<Box<dyn 'static + Send>>;
-}
-
-/// A pointer to a single descriptor in a group
+/// A pointer to a single descriptor
 ///
-/// Fundamentally, this is similar to something like `Arc<DescriptorInner>`. However,
-/// unlike [`Arc`] which frees back to the global allocator, a Descriptor deallocates into
-/// the backing [`FreeList`].
+/// Each descriptor owns a contiguous allocation containing:
+/// `[Header | Addr | payload bytes]`
+///
+/// Reference counting allows splitting a filled descriptor into multiple
+/// segments (e.g., for GRO). When the last reference is dropped, the entire
+/// allocation is freed through [`allocator::packet::dealloc`].
 pub(super) struct Descriptor {
-    ptr: NonNull<DescriptorInner>,
-    phantom: PhantomData<DescriptorInner>,
+    ptr: NonNull<Header>,
 }
 
 impl Descriptor {
+    /// Allocates a new descriptor with the given payload `capacity`.
+    ///
+    /// Returns `None` if the packet subheap is exhausted.
     #[inline]
-    pub(super) fn new(ptr: NonNull<DescriptorInner>) -> Self {
-        Self {
-            ptr,
-            phantom: PhantomData,
+    fn alloc(capacity: u16) -> Option<Self> {
+        let (layout, addr_offset, _payload_offset) = Header::layout(capacity);
+
+        let ptr = allocator::packet::alloc(layout)?;
+
+        unsafe {
+            let base = ptr.as_ptr();
+
+            // Payload is uninitialized - callers must fill before reading
+
+            // Initialize the Header at the start of the allocation
+            let inner_ptr = base.cast::<Header>();
+            inner_ptr.write(Header {
+                capacity,
+                references: AtomicUsize::new(1),
+            });
+
+            // Initialize the Addr
+            let addr_ptr = base.add(addr_offset).cast::<Addr>();
+            addr_ptr.write(Addr::default());
+
+            Some(Self {
+                ptr: NonNull::new_unchecked(inner_ptr),
+            })
         }
     }
 
-    /// # Safety
-    ///
-    /// This should only be called once the caller can guarantee the descriptor is no longer
-    /// used.
     #[inline]
-    pub(super) unsafe fn drop_in_place(&self) {
-        core::ptr::drop_in_place(self.ptr.as_ptr());
-    }
-
-    #[cfg(debug_assertions)]
-    pub(super) fn as_usize(&self) -> usize {
-        self.ptr.as_ptr().addr()
-    }
-
-    #[inline]
-    pub(super) fn id(&self) -> u32 {
-        self.inner().id
-    }
-
-    #[inline]
-    fn inner(&self) -> &DescriptorInner {
+    fn inner(&self) -> &Header {
         unsafe { self.ptr.as_ref() }
     }
 
     #[inline]
     fn addr(&self) -> &Addr {
-        unsafe { self.inner().address.as_ref() }
+        unsafe {
+            let base = self.ptr.as_ptr().cast::<u8>();
+            &*base.add(self.inner().addr_offset()).cast::<Addr>()
+        }
     }
 
     #[inline]
     fn data(&self) -> NonNull<u8> {
-        self.inner().payload
+        unsafe {
+            let base = self.ptr.as_ptr().cast::<u8>();
+            NonNull::new_unchecked(base.add(self.inner().payload_offset()))
+        }
     }
 
     /// # Safety
@@ -86,7 +87,7 @@ impl Descriptor {
     #[inline]
     unsafe fn into_filled(self, len: u16, ecn: ExplicitCongestionNotification) -> Filled {
         let inner = self.inner();
-        trace!(fill = inner.id, len, ?ecn);
+        trace!(fill = ?self.ptr, len, ?ecn);
         debug_assert!(len <= inner.capacity);
 
         // we can use relaxed since this only happens after it is filled, which was done by a single owner
@@ -108,11 +109,8 @@ impl Descriptor {
         // > the object.
         let inner = self.inner();
         inner.references.fetch_add(1, Ordering::Relaxed);
-        trace!(clone = inner.id);
-        Self {
-            ptr: self.ptr,
-            phantom: PhantomData,
-        }
+        trace!(clone = ?self.ptr);
+        Self { ptr: self.ptr }
     }
 
     /// # Safety
@@ -128,15 +126,14 @@ impl Descriptor {
         // based on the implementation in:
         // https://github.com/rust-lang/rust/blob/28b83ee59698ae069f5355b8e03f976406f410f5/library/alloc/src/sync.rs#L2551
         if desc_ref != 1 {
-            trace!(drop_desc_ref = inner.id);
+            trace!(drop_desc_ref = ?self.ptr);
             return;
         }
 
         core::sync::atomic::fence(Ordering::Acquire);
 
-        let storage = inner.free(self);
-        trace!(free_desc = inner.id, state = %"filled");
-        drop(storage);
+        trace!(free_desc = ?self.ptr, state = %"filled");
+        self.dealloc();
     }
 
     /// # Safety
@@ -145,76 +142,73 @@ impl Descriptor {
     /// * After calling this method, the descriptor handle should not be used
     #[inline]
     unsafe fn drop_unfilled(&self) {
+        trace!(free_desc = ?self.ptr, state = %"unfilled");
+        self.dealloc();
+    }
+
+    /// Deallocates the entire contiguous allocation for this descriptor.
+    ///
+    /// # Safety
+    ///
+    /// Must only be called when there are no remaining references.
+    #[inline]
+    unsafe fn dealloc(&self) {
         let inner = self.inner();
-        let storage = inner.free(self);
-        trace!(free_desc = inner.id, state = %"unfilled");
-        let _ = inner;
-        drop(storage);
+        let (layout, _addr_offset, _payload_offset) = Header::layout(inner.capacity);
+        let base = self.ptr.cast::<u8>();
+
+        // Static assertion: Header and Addr must not have non-trivial Drop impls,
+        // since we dealloc without dropping them.
+        const {
+            assert!(!core::mem::needs_drop::<Header>());
+            assert!(!core::mem::needs_drop::<Addr>());
+        }
+
+        allocator::packet::dealloc(base, layout);
     }
 }
 
 unsafe impl Send for Descriptor {}
 unsafe impl Sync for Descriptor {}
 
-pub(super) struct DescriptorInner {
-    /// An identifier for the descriptor
-    ///
-    /// This can be used by the pool implementation to map the descriptor to an internal
-    /// detail, e.g. in AF_XDP it passes around UMEM offsets.
-    id: u32,
+struct Header {
     /// The maximum capacity for this descriptor
     capacity: u16,
-    /// The pointer to the descriptor address
-    address: NonNull<Addr>,
-    /// The pointer to the descriptor payload
-    payload: NonNull<u8>,
     /// The number of active references for this descriptor.
     ///
     /// This refcount allows for splitting descriptors into multiple segments
     /// and then correctly freeing the descriptor once the last segment is dropped.
     references: AtomicUsize,
-    /// A reference back to the free list
-    free_list: Arc<dyn FreeList>,
 }
 
-impl DescriptorInner {
-    /// # Safety
+impl Header {
+    /// Computes the layout for the contiguous allocation:
+    /// `[Header | Addr | payload bytes]`
     ///
-    /// `address` must be a valid pointer (i.e., safe to create `&Addr` from it with lifetime bounded by the `Arc<dyn FreeList>`)
-    ///
-    /// `payload` must point to a valid region of memory that is at least `capacity` bytes
-    /// long. Additionally it must be initialized to valid memory.
-    ///
-    /// `memory` must be initialized.
-    pub(super) unsafe fn new(
-        id: u32,
-        capacity: u16,
-        address: NonNull<Addr>,
-        payload: NonNull<u8>,
-        free_list: Arc<dyn FreeList>,
-    ) -> Self {
-        Self {
-            id,
-            capacity,
-            address,
-            payload,
-            references: AtomicUsize::new(0),
-            free_list,
-        }
+    /// Returns `(layout, addr_offset, payload_offset)`.
+    #[inline]
+    const fn layout(capacity: u16) -> (Layout, usize, usize) {
+        let inner = Layout::new::<Header>();
+        let Ok((with_addr, addr_offset)) = inner.extend(Layout::new::<Addr>()) else {
+            panic!("not enough space for addr");
+        };
+        let Ok(payload_layout) = Layout::array::<u8>(capacity as usize) else {
+            panic!("not enough space for payload");
+        };
+        let Ok((with_payload, payload_offset)) = with_addr.extend(payload_layout) else {
+            panic!("not enough space for payload");
+        };
+        (with_payload.pad_to_align(), addr_offset, payload_offset)
     }
 
-    /// Frees the descriptor back into the pool
-    ///
-    /// # Safety
-    ///
-    /// * The descriptor must not be referenced (`references == 0`)
     #[inline]
-    unsafe fn free(&self, desc: &Descriptor) -> Option<Box<dyn 'static + Send>> {
-        debug_assert_eq!(desc.inner().references.load(Ordering::Relaxed), 0);
-        self.free_list.free(Descriptor {
-            ptr: desc.ptr,
-            phantom: PhantomData,
-        })
+    const fn addr_offset(&self) -> usize {
+        Self::layout(self.capacity).1
+    }
+
+    #[inline]
+    const fn payload_offset(&self) -> usize {
+        Self::layout(self.capacity).2
     }
 }
 
@@ -224,37 +218,42 @@ pub struct Unfilled {
     ///
     /// This needs to be an [`Option`] to allow for both consuming the descriptor
     /// into a [`Filled`] after receiving a packet or dropping the [`Unfilled`] and
-    /// releasing it back into the packet pool.
+    /// releasing it back into the packet allocator.
     desc: Option<Descriptor>,
 }
 
 impl fmt::Debug for Unfilled {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        let desc = self.desc.as_ref().expect("invalid state");
-        f.debug_struct("Unfilled").field("id", &desc.id()).finish()
+        f.debug_struct("Unfilled").finish()
     }
 }
 
 impl Unfilled {
-    /// Creates an [`Unfilled`] descriptor from a raw [`Descriptor`].
+    /// Allocates a new unfilled packet with the given payload capacity.
+    ///
+    /// Returns `None` if the packet subheap is exhausted.
     #[inline]
-    pub(super) fn from_descriptor(desc: Descriptor) -> Self {
-        Self { desc: Some(desc) }
+    pub fn new(capacity: u16) -> Option<Self> {
+        let desc = Descriptor::alloc(capacity)?;
+        Some(Self { desc: Some(desc) })
     }
 
     /// Fills the packet with the given callback, if the callback is successful
     #[inline]
-    pub fn recv_with<F, E>(mut self, f: F) -> Result<Segments, (Self, E)>
+    pub fn fill_with<F, E>(mut self, f: F) -> Result<Segments, (Self, E)>
     where
         F: FnOnce(&mut Addr, &mut cmsg::Receiver, IoSliceMut) -> Result<usize, E>,
     {
         let desc = self.desc.take().expect("invalid state");
-        let inner = desc.inner();
-        let addr = unsafe { &mut *inner.address.as_ptr() };
-        let capacity = inner.capacity as usize;
+        let capacity = desc.inner().capacity as usize;
+        let addr = unsafe {
+            let base = desc.ptr.as_ptr().cast::<u8>();
+            &mut *base.add(desc.inner().addr_offset()).cast::<Addr>()
+        };
         let data = unsafe {
-            // SAFETY: a pool implementation is required to initialize all payload bytes
-            core::slice::from_raw_parts_mut(inner.payload.as_ptr(), capacity)
+            // SAFETY: the payload region was allocated with at least `capacity` bytes
+            let base = desc.ptr.as_ptr().cast::<u8>();
+            core::slice::from_raw_parts_mut(base.add(desc.inner().payload_offset()), capacity)
         };
         let iov = IoSliceMut::new(data);
         let mut cmsg = cmsg::Receiver::default();
@@ -276,7 +275,7 @@ impl Unfilled {
             desc.into_filled(len, cmsg.ecn())
         };
         let segments = Segments {
-            descriptor: Some(desc),
+            descriptor: desc,
             segment_len: cmsg.segment_len(),
         };
         Ok(segments)
@@ -287,7 +286,6 @@ impl Drop for Unfilled {
     #[inline]
     fn drop(&mut self) {
         if let Some(desc) = self.desc.take() {
-            // put the descriptor back in the pool if it wasn't filled
             unsafe {
                 // SAFETY: the descriptor is in the `unfilled` state and no longer used
                 desc.drop_unfilled();
@@ -313,20 +311,14 @@ pub struct Filled {
 
 impl fmt::Debug for Filled {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        let alt = f.alternate();
-
-        let mut s = f.debug_struct("Filled");
-        s.field("id", &self.desc.id())
-            .field("remote_address", &self.remote_address().get())
-            .field("ecn", &self.ecn);
-
-        if alt {
-            s.field("payload", &self.payload());
-        } else {
-            s.field("payload_len", &self.len);
-        }
-
-        s.finish()
+        f.debug_struct("Filled")
+            .field(
+                "remote_address",
+                &format_args!("{}", self.remote_address().get()),
+            )
+            .field("ecn", &self.ecn)
+            .field("payload_len", &self.len)
+            .finish()
     }
 }
 
@@ -335,6 +327,10 @@ impl Filled {
     #[inline]
     pub fn ecn(&self) -> ExplicitCongestionNotification {
         self.ecn
+    }
+
+    pub fn set_ecn(&mut self, ecn: ExplicitCongestionNotification) {
+        self.ecn = ecn;
     }
 
     /// Returns the length of the payload
@@ -440,7 +436,7 @@ impl Filled {
 impl Drop for Filled {
     #[inline]
     fn drop(&mut self) {
-        // decrement the reference count, which may put the descriptor back into the pool once
+        // decrement the reference count, which may deallocate the descriptor once
         // it reaches 0
         unsafe {
             // SAFETY: the descriptor is in the `filled` state and the handle is no longer used
@@ -449,16 +445,88 @@ impl Drop for Filled {
     }
 }
 
+pub struct Segments {
+    descriptor: Filled,
+    segment_len: u16,
+}
+
+impl Segments {
+    pub fn new(descriptor: Filled, segment_len: u16) -> Self {
+        let segment_len = if segment_len == 0 {
+            descriptor.len()
+        } else {
+            segment_len.min(descriptor.len())
+        };
+        Self {
+            descriptor,
+            segment_len,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.descriptor.len() == 0
+    }
+
+    pub fn total_payload_len(&self) -> u16 {
+        self.descriptor.len()
+    }
+
+    pub fn take_filled(self) -> Filled {
+        self.descriptor
+    }
+
+    pub fn send_with<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(&Addr, ExplicitCongestionNotification, &[IoSlice]) -> R,
+    {
+        let addr = self.descriptor.remote_address();
+        let ecn = self.descriptor.ecn();
+        let payload = self.descriptor.payload();
+
+        let segment_len = if self.segment_len == 0 {
+            payload.len()
+        } else {
+            payload.len().min(self.segment_len as _)
+        };
+
+        debug_assert!(payload.len().div_ceil(segment_len) <= msg::segment::MAX_COUNT);
+
+        let mut segments = [IoSlice::new(&[]); msg::segment::MAX_COUNT];
+
+        let mut count = 0;
+        for (segment, ioslice) in payload.chunks(segment_len).zip(segments.iter_mut()) {
+            *ioslice = IoSlice::new(segment);
+            count += 1;
+        }
+
+        let segments = &segments[..count];
+        f(addr, ecn, segments)
+    }
+}
+
+impl IntoIterator for Segments {
+    type Item = Filled;
+    type IntoIter = SegmentsIter;
+
+    #[inline]
+    fn into_iter(self) -> Self::IntoIter {
+        SegmentsIter {
+            descriptor: Some(self.descriptor),
+            segment_len: self.segment_len,
+        }
+    }
+}
+
 /// An iterator over all of the filled segments in a packet
 ///
 /// This is used for when the socket interface allows for receiving multiple packets
 /// in a single syscall, e.g. GRO.
-pub struct Segments {
+pub struct SegmentsIter {
     descriptor: Option<Filled>,
     segment_len: u16,
 }
 
-impl Iterator for Segments {
+impl Iterator for SegmentsIter {
     type Item = Filled;
 
     #[inline]

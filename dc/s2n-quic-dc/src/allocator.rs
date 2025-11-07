@@ -1,39 +1,46 @@
 // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use s2n_quic_core::inet::{ExplicitCongestionNotification, SocketAddress};
+//! Memory allocator abstraction.
 
-pub trait Allocator {
-    type Segment: Segment;
-    type Retransmission: Segment;
+use std::{alloc::Layout, ptr::NonNull};
 
-    fn alloc(&mut self) -> Option<Self::Segment>;
+macro_rules! subheap {
+    ($name:ident) => {
+        pub mod $name {
+            use super::*;
 
-    fn get<'a>(&'a self, segment: &'a Self::Segment) -> &'a Vec<u8>;
-    fn get_mut<'a>(&'a mut self, segment: &'a Self::Segment) -> &'a mut Vec<u8>;
+            /// Allocates memory with the given layout.
+            ///
+            /// Returns `None` if the allocator cannot satisfy the request. Currently this
+            /// only happens for zero-sized layouts; once backed by a bounded subheap,
+            /// `None` will indicate the memory budget is exhausted.
+            #[inline]
+            pub fn alloc(layout: Layout) -> Option<NonNull<u8>> {
+                if layout.size() == 0 {
+                    return None;
+                }
 
-    fn push(&mut self, segment: Self::Segment);
-    fn push_with_retransmission(&mut self, segment: Self::Segment) -> Self::Retransmission;
-    fn retransmit(&mut self, segment: Self::Retransmission) -> Self::Segment;
-    fn retransmit_copy(&mut self, retransmission: &Self::Retransmission) -> Option<Self::Segment>;
+                let ptr = unsafe {
+                    // SAFETY: layout is non-zero size
+                    std::alloc::alloc(layout)
+                };
 
-    fn can_push(&self) -> bool;
-    fn is_empty(&self) -> bool;
-    fn segment_len(&self) -> Option<u16>;
+                NonNull::new(ptr)
+            }
 
-    fn free(&mut self, segment: Self::Segment);
-    fn free_retransmission(&mut self, segment: Self::Retransmission);
-
-    fn ecn(&self) -> ExplicitCongestionNotification;
-    fn set_ecn(&mut self, ecn: ExplicitCongestionNotification);
-
-    fn remote_address(&self) -> SocketAddress;
-    fn set_remote_address(&mut self, addr: SocketAddress);
-    fn set_remote_port(&mut self, port: u16);
-
-    fn force_clear(&mut self);
+            /// Deallocates memory previously obtained from [`alloc`].
+            ///
+            /// # Safety
+            ///
+            /// * `ptr` must have been returned by a prior call to [`alloc`] with the same `layout`.
+            /// * The memory must not have been previously deallocated.
+            #[inline]
+            pub unsafe fn dealloc(ptr: NonNull<u8>, layout: Layout) {
+                std::alloc::dealloc(ptr.as_ptr(), layout);
+            }
+        }
+    };
 }
 
-pub trait Segment: 'static + Send + core::fmt::Debug {
-    fn leak(&mut self);
-}
+subheap!(packet);

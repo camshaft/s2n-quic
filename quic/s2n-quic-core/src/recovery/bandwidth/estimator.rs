@@ -4,10 +4,13 @@
 use crate::{event, event::IntoEvent, recovery::congestion_controller::Publisher, time::Timestamp};
 use core::{
     cmp::{max, Ordering},
+    fmt,
     time::Duration,
 };
 use num_rational::Ratio;
 use num_traits::Inv;
+
+const ONE_SECOND_IN_NANOS: u64 = Duration::from_secs(1).as_nanos() as u64;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 /// Bandwidth-related data tracked for each sent packet
@@ -40,9 +43,30 @@ pub struct PacketInfo {
 /// reducing the likelihood of panicking due to overflow.
 ///
 /// The maximum (non-infinite) value that can be represented is ~1 TB/second.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[derive(Copy, Clone, Eq, PartialEq)]
 pub struct Bandwidth {
     nanos_per_kibibyte: u64,
+}
+
+impl fmt::Debug for Bandwidth {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let nanos_per_kibibyte = self.nanos_per_kibibyte as f64;
+        let bytes_per_second = (ONE_SECOND_IN_NANOS << KIBIBYTE_SHIFT) as f64 / nanos_per_kibibyte;
+        let bits_per_second = bytes_per_second * 8.0;
+        let mut prefix = "";
+
+        let mut value = bits_per_second;
+        let prefixes = [("G", 1e9), ("M", 1e6), ("k", 1e3)];
+        for (candidate, scale) in prefixes {
+            if bits_per_second >= scale {
+                prefix = candidate;
+                value /= scale;
+                break;
+            }
+        }
+
+        write!(f, "{value:.2} {prefix}bps")
+    }
 }
 
 // 2^10 = 1024 bytes in kibibyte
@@ -83,8 +107,6 @@ impl Bandwidth {
 
     /// Represents the bandwidth as bytes per second
     pub fn as_bytes_per_second(&self) -> u64 {
-        const ONE_SECOND_IN_NANOS: u64 = Duration::from_secs(1).as_nanos() as u64;
-
         if *self == Bandwidth::INFINITY {
             return u64::MAX;
         }

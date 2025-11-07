@@ -1,18 +1,18 @@
 // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use super::{free_list, handle::Sender};
+use super::{free_list, handle::Sender, queue::Error};
 use s2n_quic_core::varint::VarInt;
 use std::{
     hash::Hash,
     sync::{Arc, RwLock},
 };
 
-pub struct State<T: 'static, Key: 'static> {
+pub struct State<T: 'static, Key: 'static + Copy> {
     pub(super) pages: RwLock<SenderPages<T, Key>>,
 }
 
-impl<T: 'static, Key: 'static> State<T, Key>
+impl<T: 'static, Key: 'static + Copy> State<T, Key>
 where
     Key: Eq + Hash,
 {
@@ -24,14 +24,14 @@ where
     }
 }
 
-pub struct Senders<T: 'static, Key: 'static, const PAGE_SIZE: usize> {
+pub struct Senders<T: 'static, Key: 'static + Copy, const PAGE_SIZE: usize> {
     pub(super) state: Arc<State<T, Key>>,
     pub(super) local: Vec<Arc<[Sender<T, Key>]>>,
     pub(super) memory_handle: Arc<free_list::Memory<T, Key>>,
     pub(super) base: VarInt,
 }
 
-impl<T: 'static, Key: 'static, const PAGE_SIZE: usize> Clone for Senders<T, Key, PAGE_SIZE> {
+impl<T: 'static, Key: 'static + Copy, const PAGE_SIZE: usize> Clone for Senders<T, Key, PAGE_SIZE> {
     fn clone(&self) -> Self {
         Self {
             state: self.state.clone(),
@@ -42,11 +42,16 @@ impl<T: 'static, Key: 'static, const PAGE_SIZE: usize> Clone for Senders<T, Key,
     }
 }
 
-impl<T: 'static, Key: 'static, const PAGE_SIZE: usize> Senders<T, Key, PAGE_SIZE> {
+impl<T: 'static, Key: 'static + Copy, const PAGE_SIZE: usize> Senders<T, Key, PAGE_SIZE> {
     #[inline]
-    pub fn lookup<F: FnOnce(&Sender<T, Key>)>(&mut self, queue_id: VarInt, f: F) {
+    pub fn lookup<F: FnOnce(&Sender<T, Key>, T) -> Result<Option<T>, Error<T>>>(
+        &mut self,
+        queue_id: VarInt,
+        value: T,
+        f: F,
+    ) -> Result<Option<T>, Error<T>> {
         let Some(queue_id) = queue_id.checked_sub(self.base) else {
-            return;
+            return Err(Error::Unallocated(value));
         };
         let queue_id = queue_id.as_u64() as usize;
         let page = queue_id / PAGE_SIZE;
@@ -54,12 +59,12 @@ impl<T: 'static, Key: 'static, const PAGE_SIZE: usize> Senders<T, Key, PAGE_SIZE
 
         if self.local.len() <= page {
             let Ok(senders) = self.state.pages.read() else {
-                return;
+                return Err(Error::Unallocated(value));
             };
 
             // the senders haven't been updated
             if self.local.len() == senders.pages.len() {
-                return;
+                return Err(Error::Unallocated(value));
             }
 
             self.local
@@ -67,21 +72,21 @@ impl<T: 'static, Key: 'static, const PAGE_SIZE: usize> Senders<T, Key, PAGE_SIZE
         }
 
         let Some(page) = self.local.get(page) else {
-            return;
+            return Err(Error::Unallocated(value));
         };
         let Some(sender) = page.get(offset) else {
-            return;
+            return Err(Error::Unallocated(value));
         };
-        f(sender)
+        f(sender, value)
     }
 }
 
-pub(super) struct SenderPages<T: 'static, Key: 'static> {
+pub(super) struct SenderPages<T: 'static, Key: 'static + Copy> {
     pub(super) pages: Vec<Arc<[Sender<T, Key>]>>,
     pub(super) epoch: VarInt,
 }
 
-impl<T: 'static, Key: 'static> SenderPages<T, Key> {
+impl<T: 'static, Key: 'static + Copy> SenderPages<T, Key> {
     #[inline]
     pub(super) fn new(epoch: VarInt) -> Self {
         Self {

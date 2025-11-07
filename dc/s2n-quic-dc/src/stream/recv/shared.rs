@@ -2,13 +2,12 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
-    allocator::Allocator,
-    clock,
     either::Either,
-    event, msg,
+    event,
     packet::{stream, Packet},
     stream::{
         recv::{self, buffer::Buffer as _},
+        send::application::state::PushError,
         shared::{self, handshake, AcceptState, ArcShared, ShutdownKind},
         socket::{self, Socket},
         Actor, TransportFeatures,
@@ -33,7 +32,7 @@ use s2n_quic_core::{
     varint::VarInt,
 };
 use std::{
-    io,
+    io::{self, IoSliceMut},
     sync::{
         atomic::{AtomicU64, AtomicU8, Ordering},
         Mutex, MutexGuard,
@@ -42,42 +41,57 @@ use std::{
 
 pub type RecvBuffer = Either<recv::buffer::Local, recv::buffer::Channel>;
 
-/// Who will send ACKs?
-#[derive(Clone, Copy, Debug, Default)]
-pub enum AckMode {
-    /// The application task is sending ACKs
-    #[default]
-    Application,
-    /// The worker task is sending ACKs
-    Worker,
+#[derive(Debug)]
+pub struct ApplicationState {
+    pub status: ApplicationStatus,
+    pub wants_ack: bool,
 }
 
-pub enum ApplicationState {
+#[derive(Debug)]
+pub enum ApplicationStatus {
     Open,
     Closed { shutdown_kind: ShutdownKind },
 }
 
+impl ApplicationStatus {
+    fn from_u8(value: u8) -> Self {
+        for (kind, mask) in ApplicationState::SHUTDOWN_KINDS {
+            if value & mask != 0 {
+                return Self::Closed {
+                    shutdown_kind: *kind,
+                };
+            }
+        }
+
+        Self::Open
+    }
+}
+
 impl ApplicationState {
     const IS_CLOSED_MASK: u8 = 1;
-    const IS_PANICKING_MASK: u8 = 1 << 1;
+    const IS_ERRORED_MASK: u8 = 1 << 1;
     const IS_PRUNED_MASK: u8 = 1 << 2;
+    const IS_FLOW_RESET_MASK: u8 = 1 << 3;
+    const WANTS_ACK: u8 = 1 << 4;
+
+    const SHUTDOWN_KINDS: &[(ShutdownKind, u8)] = &[
+        (ShutdownKind::Normal, Self::IS_CLOSED_MASK),
+        (ShutdownKind::Errored, Self::IS_ERRORED_MASK),
+        (ShutdownKind::Pruned, Self::IS_PRUNED_MASK),
+        (ShutdownKind::FlowReset, Self::IS_FLOW_RESET_MASK),
+    ];
 
     #[inline]
     fn load(shared: &AtomicU8) -> Self {
-        let value = shared.load(Ordering::Acquire);
-        if value == 0 {
-            return Self::Open;
-        }
+        let mask = u8::MAX ^ Self::WANTS_ACK;
+        let value = shared.fetch_and(mask, Ordering::Acquire);
+        let status = ApplicationStatus::from_u8(value);
+        let wants_ack = value & Self::WANTS_ACK != 0;
+        Self { status, wants_ack }
+    }
 
-        let shutdown_kind = if (value & Self::IS_PRUNED_MASK) != 0 {
-            ShutdownKind::Pruned
-        } else if (value & Self::IS_PANICKING_MASK) != 0 {
-            ShutdownKind::Panicking
-        } else {
-            ShutdownKind::Normal
-        };
-
-        Self::Closed { shutdown_kind }
+    fn wants_ack(shared: &AtomicU8) {
+        shared.fetch_or(Self::WANTS_ACK, Ordering::Release);
     }
 
     #[inline]
@@ -86,8 +100,11 @@ impl ApplicationState {
 
         match kind {
             ShutdownKind::Normal => {}
-            ShutdownKind::Panicking => {
-                value |= Self::IS_PANICKING_MASK;
+            ShutdownKind::Errored => {
+                value |= Self::IS_ERRORED_MASK;
+            }
+            ShutdownKind::FlowReset => {
+                value |= Self::IS_FLOW_RESET_MASK;
             }
             ShutdownKind::Pruned => {
                 value |= Self::IS_PRUNED_MASK;
@@ -98,7 +115,10 @@ impl ApplicationState {
     }
 }
 
-#[derive(Debug)]
+pub trait AsShared: 'static + Send + Sync {
+    fn as_shared(&self) -> &State;
+}
+
 pub struct State {
     inner: Mutex<Inner>,
     application_epoch: AtomicU64,
@@ -153,8 +173,6 @@ impl State {
     #[inline]
     pub fn application_guard<'a, Sub>(
         &'a self,
-        ack_mode: AckMode,
-        send_buffer: &'a mut msg::send::Message,
         shared: &'a ArcShared<Sub>,
         sockets: &'a dyn socket::Application,
     ) -> io::Result<AppGuard<'a, Sub>>
@@ -175,8 +193,6 @@ impl State {
 
         Ok(AppGuard {
             inner,
-            ack_mode,
-            send_buffer,
             shared,
             sockets,
             initial_state,
@@ -245,11 +261,53 @@ impl State {
     }
 
     #[inline]
-    pub fn worker_try_lock(&self) -> io::Result<Option<MutexGuard<'_, Inner>>> {
+    pub fn worker_try_lock(&self) -> io::Result<Option<WorkerGuard<'_>>> {
         match self.inner.try_lock() {
-            Ok(lock) => Ok(Some(lock)),
+            Ok(inner) => Ok(Some(WorkerGuard {
+                inner: ManuallyDrop::new(inner),
+            })),
             Err(std::sync::TryLockError::WouldBlock) => Ok(None),
             Err(_) => Err(io::Error::other("shared recv state has been poisoned")),
+        }
+    }
+}
+
+pub struct WorkerGuard<'a> {
+    inner: ManuallyDrop<MutexGuard<'a, Inner>>,
+}
+
+impl core::ops::Deref for WorkerGuard<'_> {
+    type Target = Inner;
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl core::ops::DerefMut for WorkerGuard<'_> {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.inner
+    }
+}
+
+impl Drop for WorkerGuard<'_> {
+    #[inline]
+    fn drop(&mut self) {
+        let waker = if !self.reassembler.is_empty() {
+            self.application_waker.take()
+        } else {
+            None
+        };
+
+        unsafe {
+            // SAFETY: inner is no longer used
+            ManuallyDrop::drop(&mut self.inner);
+        }
+
+        if let Some(waker) = waker {
+            waker.wake();
         }
     }
 }
@@ -259,8 +317,6 @@ where
     Sub: event::Subscriber,
 {
     inner: ManuallyDrop<MutexGuard<'a, Inner>>,
-    ack_mode: AckMode,
-    send_buffer: &'a mut msg::send::Message,
     shared: &'a ArcShared<Sub>,
     sockets: &'a dyn socket::Application,
     initial_state: state::Receiver,
@@ -282,30 +338,8 @@ where
             false
         );
 
-        match self.ack_mode {
-            AckMode::Application => {
-                self.inner
-                    .fill_transmit_queue(self.shared, self.send_buffer);
-
-                ensure!(!self.send_buffer.is_empty(), false);
-
-                let did_send = self
-                    .sockets
-                    .read_application()
-                    .try_send_buffer(self.send_buffer)
-                    .is_ok();
-
-                // clear out the sender buffer if we didn't already
-                let _ = self.send_buffer.drain();
-
-                // only wake the worker if we weren't able to transmit the ACK
-                !did_send
-            }
-            AckMode::Worker => {
-                // only wake the worker if the receiver says we should
-                self.inner.receiver.should_transmit()
-            }
-        }
+        // only wake the worker if the receiver says we should
+        self.inner.receiver.should_transmit()
     }
 }
 
@@ -347,17 +381,25 @@ where
         }
 
         if wake_worker_for_ack && !current_state.is_terminal() {
-            // TODO wake the worker
+            ApplicationState::wants_ack(&self.shared.receiver.application_state);
+            self.shared.receiver.worker_waker.wake_forced();
+            return;
         }
 
         // no need to look at anything if the state didn't change
         ensure!(self.initial_state != current_state);
+        ensure!(self.buffer.is_empty());
+        ensure!(self.reassembler.is_empty());
 
         // shut down the worker if we're in a terminal state
         if current_state.is_terminal() {
             self.shared.receiver.shutdown(ShutdownKind::Normal);
         }
     }
+}
+
+pub trait TransmitQueue {
+    fn push_with<F: FnOnce(IoSliceMut) -> usize>(&mut self, f: F) -> Result<usize, PushError>;
 }
 
 pub struct Inner {
@@ -385,12 +427,10 @@ impl Inner {
     }
 
     #[inline]
-    pub fn fill_transmit_queue<Sub>(
-        &mut self,
-        shared: &ArcShared<Sub>,
-        send_buffer: &mut msg::send::Message,
-    ) where
+    pub fn fill_transmit_queue<Sub, T>(&mut self, shared: &ArcShared<Sub>, transmit_queue: &mut T)
+    where
         Sub: event::Subscriber,
+        T: TransmitQueue,
     {
         let stream_id = shared.stream_id();
         let source_queue_id = shared.local_queue_id();
@@ -403,15 +443,10 @@ impl Inner {
             shared.credentials(),
             stream_id,
             source_queue_id,
-            send_buffer,
+            transmit_queue,
             &shared.clock,
             &shared.publisher(),
         );
-
-        ensure!(!send_buffer.is_empty());
-
-        // Update the remote address with the latest value
-        send_buffer.set_remote_address(shared.remote_addr());
     }
 
     #[inline]
@@ -435,12 +470,8 @@ impl Inner {
             &mut subscriber.publisher(clock.get_time()),
         );
 
-        // If we haven't received anything yet, it's possible this stream might be rejected by the sender worker so we need
-        // to store the waker if that happens
-        if matches!(actor, Actor::Application)
-            && matches!(self.handshake, handshake::State::ClientInit)
-            && res.is_pending()
-        {
+        // If we haven't received anything yet store the waker so we can wake up
+        if matches!(actor, Actor::Application) && res.is_pending() {
             self.application_waker = Some(cx.waker().clone());
         }
 
@@ -458,8 +489,7 @@ impl Inner {
     where
         Sub: event::Subscriber,
     {
-        let clock = clock::Cached::new(&shared.clock);
-        let clock = &clock;
+        let clock = &shared.clock;
         let publisher = shared.publisher_with_timestamp(clock.get_time());
 
         // try copying data out of the reassembler into the application buffer
@@ -475,7 +505,8 @@ impl Inner {
                     let res = conn.read(&mut self.buffer, &mut out_buf);
 
                     if res.is_ok() && out_buf.final_offset().is_some() {
-                        let _ = self.receiver.state.on_receive_fin();
+                        // let _ = self.receiver.state().on_receive_fin();
+                        todo!()
                     }
 
                     res
@@ -703,6 +734,38 @@ where
                 if IS_STREAM {
                     self.receiver.check_error()?;
                 }
+
+                Ok(())
+            }
+            Packet::FlowReset(packet) => {
+                if packet.credentials() != self.shared.credentials() {
+                    return if IS_STREAM {
+                        Err(recv::error::Kind::CredentialMismatch {
+                            expected: *self.shared.credentials(),
+                            actual: *packet.credentials(),
+                        }
+                        .into())
+                    } else {
+                        Ok(())
+                    };
+                }
+
+                let Some(packet) = self
+                    .shared
+                    .crypto
+                    .map()
+                    .handle_flow_reset_packet(&packet, &(*remote_addr).into())
+                else {
+                    // TODO
+                    return Ok(());
+                };
+
+                let error = recv::ErrorKind::ApplicationError {
+                    error: packet.code.into(),
+                };
+
+                self.receiver
+                    .on_error(error, Location::Remote, &self.publisher);
 
                 Ok(())
             }

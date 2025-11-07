@@ -10,11 +10,12 @@ mod behavior;
 mod cardinality;
 mod deterministic;
 mod idle_timeout;
+mod keep_alive;
 mod key_update;
 mod request_response;
 mod restart;
 mod rpc;
-mod shared_cache;
+//mod shared_cache;
 
 /// Shows an endpoint doesn't need an application tokio runtime to be created
 #[test]

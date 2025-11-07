@@ -96,6 +96,12 @@ pub struct Credentials {
     pub key_id: KeyId,
 }
 
+impl fmt::Display for Credentials {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{}:{}", self.id, self.key_id)
+    }
+}
+
 impl Hash for Credentials {
     #[inline]
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {

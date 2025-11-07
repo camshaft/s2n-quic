@@ -1,69 +1,179 @@
 // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use super::udp::{ApplicationSocket, RecvSocket, WorkerSocket};
+use super::udp::{ApplicationSendSocket, ArcSocket, WorkerSendSocket};
 use crate::{
+    clock::{tokio::Clock, Clock as _},
     credentials::Credentials,
     event,
-    socket::recv::{pool::Pool as Packets, router::Router, udp},
+    socket::{
+        pool::{self, Pool as Packets},
+        recv::{router::Router, udp},
+        send,
+    },
     stream::{
-        environment::{tokio::Environment, udp::Config},
+        self,
+        environment::{
+            tokio::Environment,
+            udp::{Config, Workers},
+            Environment as _,
+        },
+        load_balance::PickTwo,
         recv::dispatch::{Allocator as Queues, Control, Stream},
         server::{accept, udp::Acceptor},
-        socket::{application::Single, fd::udp::CachedAddr, SendOnly, Tracing},
+        socket::{application::Single, BusyPoll, Events, Gso, SendOnly, Tracing},
     },
 };
 use s2n_quic_platform::socket::options::{Options, ReusePort};
 use std::{
-    io::{self, Result},
+    io::Result,
     net::{SocketAddr, UdpSocket},
-    sync::{
-        atomic::{AtomicUsize, Ordering},
-        Arc, Mutex,
-    },
+    sync::{Arc, Mutex},
 };
 use tokio::io::unix::AsyncFd;
 use tracing::Instrument;
 
 pub(super) struct Pool {
-    sockets: Box<[Socket]>,
-    current: AtomicUsize,
-    mask: usize,
+    sockets: Box<[PoolSocket]>,
     local_addr: SocketAddr,
+    transmission_pool: pool::Pool,
+    load_balancer: PickTwo,
 }
 
-struct Socket {
-    recv_socket: RecvSocket,
-    application_socket: ApplicationSocket,
-    worker_socket: WorkerSocket,
-    queue: Mutex<Queues>,
+struct PoolSocket {
+    socket: ArcSocket,
+    worker: WorkerSendSocket,
+    application: Box<[ApplicationSendSocket]>,
+    recv_queue: Mutex<Queues>,
 }
 
-impl Socket {
-    fn new(socket: UdpSocket, queue: Queues) -> io::Result<Self> {
-        let recv_socket = Arc::new(socket);
+macro_rules! spawn_span {
+    ($span:expr, $task:ident, | $spanned:ident | $spawn:block) => {
+        let span = $span;
+        if span.is_disabled() {
+            let $spanned = $task;
+            $spawn
+        } else {
+            let $spanned = ($task).instrument(span);
+            $spawn
+        }
+    };
+}
 
-        let local_addr = recv_socket.local_addr()?;
+impl PoolSocket {
+    fn new(socket: UdpSocket, recv_queue: Mutex<Queues>, config: &Config, clock: &Clock) -> Self {
+        let socket = Arc::new(socket);
+        let local_addr = socket.local_addr().unwrap();
 
-        let send_socket = Tracing(SendOnly(CachedAddr::new(recv_socket.clone(), local_addr)));
+        let create_socket = || {
+            let wheel = send::wheel::Wheel::new(config.send_wheel_horizon, clock);
+            let socket = stream::socket::Wheel::new(wheel, local_addr.into());
+            Tracing(socket)
+        };
 
-        let application_socket = Arc::new(Single(send_socket.clone()));
+        let worker = Arc::new(create_socket());
 
-        let worker_socket = Arc::new(send_socket);
+        let application = (0..config.priority_levels)
+            .map(|_| Arc::new(Single(create_socket())))
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
 
-        Ok(Socket {
-            recv_socket,
-            application_socket,
-            worker_socket,
-            queue: Mutex::new(queue),
-        })
+        Self {
+            worker,
+            application,
+            socket,
+            recv_queue,
+        }
+    }
+
+    fn create_send_socket_worker(
+        &self,
+        config: &Config,
+        env: &Environment<impl event::Subscriber + Clone>,
+        timer: impl crate::clock::precision::Timer + Send + 'static,
+        wake_mode: impl send::udp::WakeMode + Send + 'static,
+    ) -> impl core::future::Future<Output = ()> + Send + 'static {
+        let socket = Tracing(Gso(SendOnly(self.socket.clone()), env.gso.clone()));
+        let socket = Events::new(socket, env.subscriber.clone(), env.clock());
+
+        let mut wheels = vec![send::wheel::Wheel::clone(&self.worker)];
+
+        for application in &self.application {
+            wheels.push(send::wheel::Wheel::clone(application));
+        }
+
+        let token_bucket = config.bucket();
+
+        send::udp::non_blocking(socket, wheels, timer, token_bucket, wake_mode)
+    }
+
+    fn spawn_non_blocking_send_worker(
+        &self,
+        config: &Config,
+        env: &Environment<impl event::Subscriber + Clone>,
+    ) {
+        let timer = env.clock().timer();
+        let wake_mode = send::udp::WithWaker;
+        let task = self.create_send_socket_worker(config, env, timer, wake_mode);
+        let span = tracing::trace_span!("send_socket_worker");
+        spawn_span!(span, task, |task| {
+            env.writer_rt.spawn(task);
+        });
+    }
+
+    fn spawn_non_blocking_recv_worker(
+        &self,
+        _config: &Config,
+        env: &Environment<impl event::Subscriber + Clone>,
+        alloc: pool::Pool,
+        router: impl Router + Send + 'static,
+    ) {
+        let socket = Tracing(AsyncFd::new(self.socket.clone()).unwrap());
+        let socket = Events::new(socket, env.subscriber.clone(), env.clock());
+        let task = udp::non_blocking(socket, alloc, router);
+        let span = tracing::trace_span!("recv_socket_worker");
+        spawn_span!(span, task, |task| {
+            env.reader_rt.spawn(task);
+        });
+    }
+
+    fn spawn_busy_poll_send_worker(
+        &self,
+        config: &Config,
+        env: &Environment<impl event::Subscriber + Clone>,
+        handle: &crate::busy_poll::Handle,
+    ) {
+        let timer = crate::busy_poll::clock::Timer::new(env.clock());
+        let wake_mode = send::udp::BusyPoll;
+        let task = self.create_send_socket_worker(config, env, timer, wake_mode);
+        let span = tracing::trace_span!("send_socket_worker");
+        spawn_span!(span, task, |task| {
+            handle.spawn_with_priority(task, config.flow_priority);
+        });
+    }
+
+    fn spawn_busy_poll_recv_worker(
+        &self,
+        config: &Config,
+        env: &Environment<impl event::Subscriber + Clone>,
+        alloc: pool::Pool,
+        router: impl Router + Send + 'static,
+        handle: &crate::busy_poll::Handle,
+    ) {
+        let socket = BusyPoll(self.socket.clone());
+        let socket = Events::new(socket, env.subscriber.clone(), env.clock());
+        let task = udp::non_blocking(socket, alloc, router);
+        let span = tracing::trace_span!("recv_socket_worker");
+        spawn_span!(span, task, |task| {
+            handle.spawn_with_priority(task, config.flow_priority);
+        });
     }
 }
 
 impl Pool {
     pub fn new<Sub>(
         env: &Environment<Sub>,
-        mut workers: usize,
+        workers: usize,
         mut config: Config,
         acceptor: Option<accept::Sender<Sub>>,
     ) -> Result<Self>
@@ -72,47 +182,60 @@ impl Pool {
     {
         debug_assert_ne!(workers, 0);
 
-        if workers > 1 {
-            workers = workers.next_power_of_two();
+        let options = env.socket_options.clone();
+
+        config.send_workers.set_default(workers);
+        config.recv_workers.set_default(workers);
+
+        if acceptor.is_some() && config.socket_count() > 1 {
+            config.reuse_port = true;
         }
 
-        let mask = workers - 1;
+        let create_queue = || {
+            if acceptor.is_some() {
+                Queues::new_non_zero(config.stream_recv_queue, config.control_recv_queue)
+            } else {
+                Queues::new(config.stream_recv_queue, config.control_recv_queue)
+            }
+        };
+        let sockets = Self::create_workers(&env.clock(), options, &config, create_queue)?;
 
-        let mut options = env.socket_options.clone();
-        options.blocking = config.blocking;
-
-        if config.workers.is_none() {
-            config.workers = Some(workers);
-        }
-        let sockets = Self::create_workers(options, &config)?;
-
-        let local_addr = sockets[0].recv_socket.local_addr()?;
+        let local_addr = sockets[0].socket.local_addr()?;
         if cfg!(debug_assertions) && config.reuse_port {
             for socket in sockets.iter().skip(1) {
-                debug_assert_eq!(local_addr, socket.recv_socket.local_addr()?);
+                debug_assert_eq!(local_addr, socket.socket.local_addr()?);
             }
         }
 
-        let max_packet_size = config.max_packet_size;
-        let packet_count = config.packet_count;
-        let create_packets = || Packets::new(max_packet_size, packet_count);
+        let unroutable_packets = {
+            // TODO pace these packets
+            let socket = Tracing(SendOnly(sockets[0].socket.clone()));
+            let (tx, task) = config.unroutable_packets(socket);
+
+            env.reader_rt.spawn(task);
+
+            tx
+        };
+
+        let transmission_pool = config.tx_packet_pool();
 
         macro_rules! spawn {
             ($create_router:expr) => {
-                if config.blocking {
-                    Self::spawn_blocking(&sockets, create_packets, $create_router)
-                } else {
-                    let _rt = env.reader_rt.enter();
-                    Self::spawn_non_blocking(&sockets, create_packets, $create_router)?;
-                }
+                let _rt = env.reader_rt.enter();
+                Self::spawn_non_blocking(env, &config, &sockets, $create_router)?;
             };
         }
 
         if let Some(sender) = acceptor {
-            spawn!(|_packets: &Packets, socket: &Socket| {
-                let queues = socket.queue.lock().unwrap();
-                let app_socket = socket.application_socket.clone();
-                let worker_socket = socket.worker_socket.clone();
+            // Collect all application sockets from all workers for load balancing
+            let app_sockets: Box<[_]> = sockets.iter().map(|s| s.application[0].clone()).collect();
+
+            spawn!(|_packets: &Packets, socket: &PoolSocket| {
+                let queues = socket.recv_queue.lock().unwrap();
+                let worker_socket = socket.worker.clone();
+
+                // TODO pace these packets
+                let secret_socket = Tracing(SendOnly(sockets[0].socket.clone()));
 
                 let acceptor = Acceptor::new(
                     env.clone(),
@@ -120,108 +243,136 @@ impl Pool {
                     config.map.clone(),
                     config.accept_flavor,
                     queues.clone(),
-                    app_socket,
+                    app_sockets.clone(),
                     worker_socket,
+                    secret_socket,
+                    transmission_pool.clone(),
+                    unroutable_packets.clone(),
                 );
 
-                let router = queues.dispatcher().with_map(config.map.clone());
+                let router = queues
+                    .dispatcher(unroutable_packets.clone())
+                    .with_map(config.map.clone());
                 router.with_zero_router(acceptor)
             });
         } else {
-            spawn!(|_packets: &Packets, socket: &Socket| {
-                let dispatch = socket.queue.lock().unwrap().dispatcher();
+            spawn!(|_packets: &Packets, socket: &PoolSocket| {
+                let dispatch = socket
+                    .recv_queue
+                    .lock()
+                    .unwrap()
+                    .dispatcher(unroutable_packets.clone());
                 dispatch.with_map(config.map.clone())
             });
         }
 
         Ok(Self {
             sockets: sockets.into(),
-            current: AtomicUsize::new(0),
-            mask,
             local_addr,
+            transmission_pool,
+            load_balancer: PickTwo::new(),
         })
     }
 
     pub fn alloc(
         &self,
-        credentials: Option<&Credentials>,
-    ) -> (Control, Stream, ApplicationSocket, WorkerSocket) {
-        let idx = self.current.fetch_add(1, Ordering::Relaxed);
-        let idx = idx & self.mask;
-        let socket = &self.sockets[idx];
-        let (control, stream) = socket.queue.lock().unwrap().alloc_or_grow(credentials);
-        let app_socket = socket.application_socket.clone();
-        let worker_socket = socket.worker_socket.clone();
+        credentials: &Credentials,
+    ) -> (
+        Control,
+        Stream,
+        ApplicationSendSocket,
+        WorkerSendSocket,
+        pool::Pool,
+    ) {
+        let idx = self.load_balancer.select(
+            &self.sockets,
+            |socket| Arc::strong_count(&socket.application[0]),
+            |upper_bound| rand::random_range(..upper_bound),
+        );
 
-        (control, stream, app_socket, worker_socket)
+        let socket = &self.sockets[idx];
+
+        let (control, stream) = socket.recv_queue.lock().unwrap().alloc_or_grow(credentials);
+
+        // Application sockets currently only have 1 priority
+        // TODO take this in as a parameter
+        let priority = 0;
+
+        let worker_socket = socket.worker.clone();
+        let app_socket = socket.application[priority].clone();
+        let transmission_pool = self.transmission_pool.clone();
+
+        (
+            control,
+            stream,
+            app_socket,
+            worker_socket,
+            transmission_pool,
+        )
     }
 
     pub fn local_addr(&self) -> SocketAddr {
         self.local_addr
     }
 
-    fn spawn_blocking<R>(
-        sockets: &[Socket],
-        create_packets: impl Fn() -> Packets,
-        create_router: impl Fn(&Packets, &Socket) -> R,
-    ) where
-        R: 'static + Send + Router,
-    {
-        for (udp_socket_worker, socket) in sockets.iter().enumerate() {
-            let packets = create_packets();
-            let router = create_router(&packets, socket);
-            let recv_socket = socket.recv_socket.clone();
-            let span = tracing::trace_span!("udp_socket_worker", udp_socket_worker);
-            std::thread::spawn(move || {
-                let _span = span.entered();
-                udp::blocking(recv_socket, packets, router);
-            });
-        }
-    }
-
     fn spawn_non_blocking<R>(
-        sockets: &[Socket],
-        create_packets: impl Fn() -> Packets,
-        create_router: impl Fn(&Packets, &Socket) -> R,
+        env: &Environment<impl event::Subscriber + Clone>,
+        config: &Config,
+        sockets: &[PoolSocket],
+        create_router: impl Fn(&Packets, &PoolSocket) -> R,
     ) -> Result<()>
     where
         R: 'static + Send + Router,
     {
         for (udp_socket_worker, socket) in sockets.iter().enumerate() {
-            let packets = create_packets();
-            let router = create_router(&packets, socket);
-            let recv_socket = AsyncFd::new(socket.recv_socket.clone())?;
-            let span = tracing::trace_span!("udp_socket_worker", udp_socket_worker);
-            let task = async move {
-                udp::non_blocking(recv_socket, packets, router).await;
-            };
-            if span.is_disabled() {
-                tokio::spawn(task);
-            } else {
-                tokio::spawn(task.instrument(span));
+            let alloc = config.rx_packet_pool();
+            let router = create_router(&alloc, socket);
+
+            match &config.send_workers {
+                Workers::BusyPoll(pool) => {
+                    let idx = udp_socket_worker % pool.len();
+                    let handle = &pool[idx];
+                    socket.spawn_busy_poll_send_worker(config, env, handle);
+                }
+                Workers::Environment(_) => {
+                    socket.spawn_non_blocking_send_worker(config, env);
+                }
+            }
+
+            match &config.recv_workers {
+                Workers::BusyPoll(pool) => {
+                    let idx = udp_socket_worker % pool.len();
+                    let handle = &pool[idx];
+                    socket.spawn_busy_poll_recv_worker(config, env, alloc, router, handle);
+                }
+                Workers::Environment(_) => {
+                    socket.spawn_non_blocking_recv_worker(config, env, alloc, router);
+                }
             }
         }
         Ok(())
     }
 
-    fn create_workers(mut options: Options, config: &Config) -> Result<Vec<Socket>> {
+    fn create_workers(
+        clock: &Clock,
+        mut options: Options,
+        config: &Config,
+        create_queue: impl Fn() -> Queues,
+    ) -> Result<Vec<PoolSocket>> {
         let mut sockets = vec![];
-
-        let stream_cap = config.stream_queue;
-        let control_cap = config.control_queue;
 
         let shared_queue = if config.reuse_port {
             // if we are reusing the port, we need to share the queue_ids
-            Some(Queues::new_non_zero(stream_cap, control_cap))
+            Some(create_queue())
         } else {
             // otherwise, each worker can get its own queue to reduce thread contention
             None
         };
 
-        let workers = config.workers.unwrap_or(1).max(1);
+        let socket_count = config.socket_count();
 
-        for i in 0..workers {
-            let socket = if i == 0 && workers > 1 {
+        for i in 0..socket_count {
+            let socket = if i == 0 && socket_count > 1 {
                 if config.reuse_port {
                     // set reuse port after we bind for the first socket
                     options.reuse_port = ReusePort::AfterBind;
@@ -244,10 +395,11 @@ impl Pool {
             let queue = if let Some(shared_queue) = &shared_queue {
                 shared_queue.clone()
             } else {
-                Queues::new(stream_cap, control_cap)
+                create_queue()
             };
 
-            let socket = Socket::new(socket, queue)?;
+            let queue = Mutex::new(queue);
+            let socket = PoolSocket::new(socket, queue, config, clock);
 
             sockets.push(socket);
         }

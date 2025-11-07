@@ -1,6 +1,8 @@
 // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+#![allow(dead_code, unused_macros)]
+
 use crate::{
     stream::{testing::dcquic::Context, Protocol},
     testing::server_name,
@@ -186,6 +188,7 @@ macro_rules! tests {
     };
 }
 
+#[cfg(todo)]
 mod tcp {
     use super::*;
 

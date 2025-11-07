@@ -1,18 +1,38 @@
 // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use super::{Protocol, Socket, TransportFeatures};
+use super::{handle::Transmission, Protocol, Socket, TransportFeatures};
 use crate::msg::{addr::Addr, cmsg};
 use core::task::{Context, Poll};
-use s2n_quic_core::inet::ExplicitCongestionNotification;
+use s2n_quic_core::{inet::ExplicitCongestionNotification, time::Timestamp};
 use std::{
     io::{self, IoSlice, IoSliceMut},
     net::SocketAddr,
+    ops::Deref,
 };
 use tracing::trace;
 
 #[derive(Clone)]
 pub struct Tracing<S: Socket>(pub S);
+
+impl<S: Socket> Deref for Tracing<S> {
+    type Target = S;
+
+    #[inline(always)]
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+macro_rules! local_addr {
+    ($self:expr) => {
+        if let Ok(addr) = $self.local_addr() {
+            addr
+        } else {
+            SocketAddr::from(([0, 0, 0, 0], 0))
+        }
+    };
+}
 
 impl<S: Socket> Socket for Tracing<S> {
     #[inline(always)]
@@ -37,7 +57,7 @@ impl<S: Socket> Socket for Tracing<S> {
         trace!(
             operation = %"poll_peek_len",
             protocol = ?self.protocol(),
-            local_addr = ?self.local_addr(),
+            local_addr = %local_addr!(self),
             result = ?result,
         );
 
@@ -58,8 +78,8 @@ impl<S: Socket> Socket for Tracing<S> {
             Poll::Ready(Ok(_)) => trace!(
                 operation = %"poll_recv",
                 protocol = ?self.protocol(),
-                local_addr = ?self.local_addr(),
-                remote_addr = ?addr,
+                local_addr = %local_addr!(self),
+                peer_addr = %addr.get(),
                 ecn = ?cmsg.ecn(),
                 segments = buffer.len(),
                 segment_len = cmsg.segment_len(),
@@ -72,7 +92,7 @@ impl<S: Socket> Socket for Tracing<S> {
             _ => trace!(
                 operation = %"poll_recv",
                 protocol = ?self.protocol(),
-                local_addr = ?self.local_addr(),
+                local_addr = %local_addr!(self),
                 segments = buffer.len(),
                 buffer_len = {
                     let v: usize = buffer.iter().map(|s| s.len()).sum();
@@ -97,8 +117,8 @@ impl<S: Socket> Socket for Tracing<S> {
         trace!(
             operation = %"try_send",
             protocol = ?self.protocol(),
-            local_addr = ?self.local_addr(),
-            remote_addr = ?addr,
+            local_addr = %local_addr!(self),
+            peer_addr = %addr.get(),
             ?ecn,
             segments = buffer.len(),
             segment_len = buffer.first().map_or(0, |s| s.len()),
@@ -109,6 +129,35 @@ impl<S: Socket> Socket for Tracing<S> {
             result = ?result,
         );
 
+        result
+    }
+
+    #[inline]
+    fn send_transmission(&self, msg: Transmission) {
+        trace!(
+            operation = %"send_transmission",
+            protocol = ?self.protocol(),
+            local_addr = %local_addr!(self),
+            ?msg,
+        );
+
+        self.0.send_transmission(msg)
+    }
+
+    #[inline]
+    fn send_transmission_at(
+        &self,
+        msg: Transmission,
+        time: Timestamp,
+    ) -> Result<(), (Transmission, Timestamp)> {
+        let result = self.0.send_transmission_at(msg, time);
+        trace!(
+            operation = %"send_transmission_at",
+            protocol = ?self.protocol(),
+            local_addr = %local_addr!(self),
+            ?time,
+            result = ?result,
+        );
         result
     }
 
@@ -125,8 +174,8 @@ impl<S: Socket> Socket for Tracing<S> {
         trace!(
             operation = %"poll_send",
             protocol = ?self.protocol(),
-            local_addr = ?self.local_addr(),
-            remote_addr = ?addr,
+            local_addr = %local_addr!(self),
+            peer_addr = %addr.get(),
             ?ecn,
             segments = buffer.len(),
             segment_len = buffer.first().map_or(0, |s| s.len()),
@@ -147,7 +196,7 @@ impl<S: Socket> Socket for Tracing<S> {
         trace!(
             operation = %"send_finish",
             protocol = ?self.protocol(),
-            local_addr = ?self.local_addr(),
+            local_addr = %local_addr!(self),
             result = ?result,
         );
 
