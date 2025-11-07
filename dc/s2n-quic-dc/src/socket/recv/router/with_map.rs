@@ -80,6 +80,29 @@ impl<Inner: Router> Router for WithMap<Inner> {
     }
 
     #[inline]
+    fn handle_flow_reset_packet(
+        &mut self,
+        remote_address: SocketAddress,
+        ecn: ExplicitCongestionNotification,
+        packet: packet::secret_control::flow_reset::Packet,
+    ) {
+        self.inner
+            .handle_flow_reset_packet(remote_address, ecn, packet);
+    }
+
+    #[inline]
+    fn dispatch_flow_reset_packet(
+        &mut self,
+        tag: packet::secret_control::flow_reset::Tag,
+        queue_id: s2n_quic_core::varint::VarInt,
+        credentials: Credentials,
+        segment: descriptor::Filled,
+    ) {
+        self.inner
+            .dispatch_flow_reset_packet(tag, queue_id, credentials, segment);
+    }
+
+    #[inline]
     fn handle_datagram_packet(
         &mut self,
         remote_address: SocketAddress,

@@ -131,7 +131,7 @@ where
     pub fn poll(&mut self, cx: &mut Context) -> Poll<()> {
         s2n_quic_core::task::waker::debug_assert_contract(cx, |cx| {
             ready!(self.poll_impl(cx));
-            tracing::debug!("read worker shutting down");
+            tracing::trace!("read worker shutting down");
             Poll::Ready(())
         })
     }

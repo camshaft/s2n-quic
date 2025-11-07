@@ -27,7 +27,6 @@ use s2n_quic_core::{
     ensure,
     frame::{self, ack::EcnCounts},
     inet::ExplicitCongestionNotification,
-    packet::number::PacketNumberSpace,
     ready,
     stream::state::Receiver,
     time::{
@@ -236,8 +235,7 @@ impl State {
             // if the transport is streaming then we expect packet numbers in order
             let expected_pn = self
                 .stream_ack
-                .packets
-                .max_value()
+                .max_received_packet()
                 .map_or(0, |v| v.as_u64() + 1);
             let actual_pn = packet.packet_number().as_u64();
             ensure!(
@@ -508,10 +506,7 @@ impl State {
             Err(error::Kind::Duplicate.err())
         );
 
-        let packet_number = PacketNumberSpace::Initial.new_packet_number(packet.packet_number());
-        if let Err(err) = space.packets.insert_packet_number(packet_number) {
-            tracing::debug!("could not record packet number {packet_number} with error {err:?}");
-        }
+        space.on_packet_received(packet.packet_number(), clock.get_time());
 
         // if we got a new packet then we'll need to transmit an ACK
         // TODO make this smarter to avoid sending too many ACKs
@@ -657,11 +652,12 @@ impl State {
 
         // make sure we haven't already set the error from something else
         ensure!(self.error.is_none());
+        let is_idle_timeout = matches!(error.kind(), error::Kind::IdleTimeout);
         self.error = Some(ErrorState { error, source });
         publisher
             .on_stream_receiver_errored(event::builder::StreamReceiverErrored { error, source });
 
-        if matches!(source, Location::Local) {
+        if matches!(source, Location::Local) && !is_idle_timeout {
             self.needs_transmission("on_error");
         } else {
             let _ = self.state.on_app_read_reset();
@@ -790,7 +786,7 @@ impl State {
         stream_id: stream::Id,
         source_queue_id: Option<VarInt>,
         output: &mut A,
-        _clock: &Clk,
+        clock: &Clk,
         publisher: &Pub,
     ) where
         K: crypto::seal::control::Stream,
@@ -813,9 +809,6 @@ impl State {
 
         let encoder = EncoderBuffer::new(buffer);
 
-        // TODO compute this by storing the time that we received the max packet number
-        let ack_delay = VarInt::ZERO;
-
         let max_data = frame::MaxData {
             maximum_data: self.max_data,
         };
@@ -825,14 +818,11 @@ impl State {
         // convert the stream PNs anyway
         let (recovery_ack, max_data_encoding_size) =
             self.recovery_ack
-                .encoding(max_data_encoding_size, ack_delay, None, mtu);
+                .encoding(max_data_encoding_size, None, mtu, clock);
 
-        let (stream_ack, max_data_encoding_size) = self.stream_ack.encoding(
-            max_data_encoding_size,
-            ack_delay,
-            Some(self.ecn_counts),
-            mtu,
-        );
+        let (stream_ack, max_data_encoding_size) =
+            self.stream_ack
+                .encoding(max_data_encoding_size, Some(self.ecn_counts), mtu, clock);
 
         let encoding_size = max_data_encoding_size;
 
@@ -863,8 +853,7 @@ impl State {
 
                 // get how many intervals we're tracking - the more there are, the more loss the network
                 // is experiencing
-                let intervals = self.stream_ack.packets.interval_len()
-                    + self.recovery_ack.packets.interval_len();
+                let intervals = self.stream_ack.interval_len() + self.recovery_ack.interval_len();
 
                 // The value of `20` is somewhat arbitrary but doing some worst-case math the ACK ranges with
                 // 20 segments would consume about 20-25% of the packet this is a good starting point.
@@ -878,7 +867,7 @@ impl State {
 
                 // if we have recovery packets then the network is likely lossy so we duplicate the ACKs to increase the
                 // likelihood that the sender will recover
-                should_duplicate |= !self.recovery_ack.packets.is_empty();
+                should_duplicate |= !self.recovery_ack.is_empty();
 
                 let duplicate = if should_duplicate {
                     Some(buffer.clone())

@@ -291,6 +291,7 @@ pub struct Builder {
     linger: Option<Duration>,
     send_buffer: Option<usize>,
     recv_buffer: Option<usize>,
+    socket_workers: Option<usize>,
 }
 
 impl Builder {
@@ -347,6 +348,11 @@ impl Builder {
         self
     }
 
+    pub fn with_socket_workers(mut self, workers: usize) -> Self {
+        self.socket_workers = Some(workers);
+        self
+    }
+
     #[inline]
     pub fn build<H: Handshake + Clone, S: event::Subscriber + Clone>(
         self,
@@ -363,7 +369,12 @@ impl Builder {
 
         let mut env = env::Builder::new(subscriber).with_socket_options(options);
 
-        let pool = udp_pool::Config::new(handshake.map().clone());
+        let mut pool = udp_pool::Config::new(handshake.map().clone());
+
+        if let Some(workers) = self.socket_workers {
+            pool.workers = Some(workers);
+        }
+
         env = env.with_pool(pool);
 
         if let Some(threads) = self.background_threads {

@@ -58,8 +58,13 @@ pub enum ApplicationState {
 
 impl ApplicationState {
     const IS_CLOSED_MASK: u8 = 1;
-    const IS_PANICKING_MASK: u8 = 1 << 1;
+    const IS_ERRORED_MASK: u8 = 1 << 1;
     const IS_PRUNED_MASK: u8 = 1 << 2;
+
+    const SHUTDOWN_KINDS: &[(ShutdownKind, u8)] = &[
+        (ShutdownKind::Errored, Self::IS_ERRORED_MASK),
+        (ShutdownKind::Pruned, Self::IS_PRUNED_MASK),
+    ];
 
     #[inline]
     fn load(shared: &AtomicU8) -> Self {
@@ -68,13 +73,13 @@ impl ApplicationState {
             return Self::Open;
         }
 
-        let shutdown_kind = if (value & Self::IS_PRUNED_MASK) != 0 {
-            ShutdownKind::Pruned
-        } else if (value & Self::IS_PANICKING_MASK) != 0 {
-            ShutdownKind::Panicking
-        } else {
-            ShutdownKind::Normal
-        };
+        let mut shutdown_kind = ShutdownKind::Normal;
+        for (kind, mask) in Self::SHUTDOWN_KINDS {
+            if value & mask != 0 {
+                shutdown_kind = *kind;
+                break;
+            }
+        }
 
         Self::Closed { shutdown_kind }
     }
@@ -85,8 +90,8 @@ impl ApplicationState {
 
         match kind {
             ShutdownKind::Normal => {}
-            ShutdownKind::Panicking => {
-                value |= Self::IS_PANICKING_MASK;
+            ShutdownKind::Errored => {
+                value |= Self::IS_ERRORED_MASK;
             }
             ShutdownKind::Pruned => {
                 value |= Self::IS_PRUNED_MASK;
@@ -694,6 +699,38 @@ where
                 if IS_STREAM {
                     self.receiver.check_error()?;
                 }
+
+                Ok(())
+            }
+            Packet::FlowReset(packet) => {
+                if packet.credentials() != self.shared.credentials() {
+                    return if IS_STREAM {
+                        Err(recv::error::Kind::CredentialMismatch {
+                            expected: *self.shared.credentials(),
+                            actual: *packet.credentials(),
+                        }
+                        .into())
+                    } else {
+                        Ok(())
+                    };
+                }
+
+                let Some(packet) = self
+                    .shared
+                    .crypto
+                    .map()
+                    .handle_flow_reset_packet(&packet, &(*remote_addr).into())
+                else {
+                    // TODO
+                    return Ok(());
+                };
+
+                let error = recv::ErrorKind::ApplicationError {
+                    error: packet.code.into(),
+                };
+
+                self.receiver
+                    .on_error(error, Location::Remote, &self.publisher);
 
                 Ok(())
             }

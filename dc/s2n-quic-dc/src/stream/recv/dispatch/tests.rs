@@ -26,6 +26,8 @@ struct Model {
     oracle: Oracle,
     alloc: Option<Allocator>,
     dispatch: Option<Dispatch>,
+    #[allow(dead_code)]
+    unroutable_packets: mpsc::Receiver<desc::Filled>,
 }
 
 impl Default for Model {
@@ -43,13 +45,15 @@ impl Model {
         } else {
             Allocator::new(stream_cap, control_cap)
         };
-        let dispatch = alloc.dispatcher();
+        let (tx, unroutable_packets) = mpsc::new(64);
+        let dispatch = alloc.dispatcher(tx);
         let oracle = Oracle::new(packets);
 
         Self {
             oracle,
             alloc: Some(alloc),
             dispatch: Some(dispatch),
+            unroutable_packets,
         }
     }
 
@@ -101,7 +105,7 @@ impl Model {
         };
 
         let (packet_id, packet) = self.oracle.packets.create();
-        let res = dispatch.send_control(queue_id, packet);
+        let res = dispatch.send_control(queue_id, None, packet);
         self.oracle.on_control_dispatch(queue_id, packet_id, res);
     }
 
@@ -115,7 +119,7 @@ impl Model {
         };
 
         let (packet_id, packet) = self.oracle.packets.create();
-        let res = dispatch.send_stream(queue_id, packet);
+        let res = dispatch.send_stream(queue_id, None, packet);
         self.oracle.on_stream_dispatch(queue_id, packet_id, res);
     }
 }
@@ -158,12 +162,7 @@ impl Oracle {
         );
     }
 
-    fn on_control_dispatch(
-        &mut self,
-        idx: VarInt,
-        packet_id: u64,
-        result: Result<Option<desc::Filled>, Error>,
-    ) {
+    fn on_control_dispatch(&mut self, idx: VarInt, packet_id: u64, result: Result<(), Error<()>>) {
         let Some(channel) = self.control.get(&idx) else {
             assert!(result.is_err());
             return;
@@ -181,12 +180,7 @@ impl Oracle {
         );
     }
 
-    fn on_stream_dispatch(
-        &mut self,
-        idx: VarInt,
-        packet_id: u64,
-        result: Result<Option<desc::Filled>, Error>,
-    ) {
+    fn on_stream_dispatch(&mut self, idx: VarInt, packet_id: u64, result: Result<(), Error<()>>) {
         let Some(channel) = self.stream.get(&idx) else {
             assert!(result.is_err());
             return;

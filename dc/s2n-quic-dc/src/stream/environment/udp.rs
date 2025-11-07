@@ -2,7 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
+    packet::Packet,
     path::secret::Map,
+    socket::recv::descriptor,
     stream::{
         environment::{Environment, Peer, SetupResult, SocketSet},
         recv::{
@@ -13,8 +15,9 @@ use crate::{
         server::accept,
         socket, TransportFeatures,
     },
-    sync::mpsc::Capacity,
+    sync::mpsc::{self, Capacity},
 };
+use s2n_codec::{DecoderBufferMut, DecoderParameterizedValueMut};
 use s2n_quic_core::inet::{IpAddress, IpV4Address, IpV6Address, SocketAddress, Unspecified};
 use std::sync::Arc;
 
@@ -55,6 +58,87 @@ impl Config {
             workers: None,
             map,
         }
+    }
+
+    pub fn unroutable_packets<S>(
+        &self,
+        socket: S,
+    ) -> (
+        mpsc::Sender<descriptor::Filled>,
+        impl core::future::Future<Output = ()> + Send + Sync + 'static,
+    )
+    where
+        S: Send + Sync + 'static + crate::stream::socket::Socket,
+    {
+        let (tx, rx) = mpsc::new::<descriptor::Filled>(4096);
+        let map = self.map.clone();
+        let task = async move {
+            let mut out_buffer = [0u8; 1500];
+
+            while let Ok(mut descriptor) = rx.recv_front().await {
+                let peer = descriptor.remote_address().get().into();
+                let buffer = DecoderBufferMut::new(descriptor.payload_mut());
+                let Ok((packet, _)) = Packet::decode_parameterized_mut(16, buffer) else {
+                    continue;
+                };
+                let params = match packet {
+                    Packet::Stream(packet) => {
+                        let credentials = *packet.credentials();
+                        let stream_id = *packet.stream_id();
+                        Some((credentials, stream_id.queue_id))
+                    }
+                    Packet::Datagram(packet) => {
+                        // datagrams are not routable
+                        let _ = packet;
+                        None
+                    }
+                    Packet::Control(packet) => {
+                        let credentials = *packet.credentials();
+                        let stream_id = packet.stream_id();
+                        stream_id.map(|stream_id| (credentials, stream_id.queue_id))
+                    }
+                    Packet::FlowReset(packet) => {
+                        // Don't reply to flow reset packets to avoid looping
+                        let _ = packet;
+                        None
+                    }
+                    Packet::StaleKey(packet) => {
+                        let _ = map.handle_stale_key_packet(&packet, &peer);
+                        None
+                    }
+                    Packet::ReplayDetected(packet) => {
+                        let _ = map.handle_replay_detected_packet(&packet, &peer);
+                        None
+                    }
+                    Packet::UnknownPathSecret(packet) => {
+                        let _ = map.handle_unknown_path_secret_packet(&packet, &peer);
+                        None
+                    }
+                };
+
+                let Some((credentials, queue_id)) = params else {
+                    continue;
+                };
+
+                let packet = crate::packet::secret_control::FlowReset {
+                    credentials,
+                    wire_version: crate::packet::WireVersion::ZERO,
+                    queue_id,
+                    code: crate::stream::shared::ShutdownKind::ERRORED_CODE.into(),
+                };
+
+                let Some(len) = map.sign_flow_reset_packet(&packet, &mut out_buffer) else {
+                    continue;
+                };
+
+                let remote_addr = descriptor.remote_address();
+                let ecn = Default::default();
+                let buffer = &out_buffer[..len];
+                let buffer = &[std::io::IoSlice::new(buffer)];
+                let _ = socket.try_send(remote_addr, ecn, buffer);
+            }
+        };
+        (tx, task)
     }
 }
 

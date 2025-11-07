@@ -145,7 +145,12 @@ impl<T: 'static, Key: 'static> Sender<T, Key> {
     }
 
     #[inline]
-    pub fn send_stream(&self, item: T) -> Result<Option<T>, Error> {
+    pub fn key(&self) -> Option<&Key> {
+        unsafe { self.descriptor.key() }
+    }
+
+    #[inline]
+    pub fn send_stream(&self, item: T) -> Result<Option<T>, Error<T>> {
         unsafe {
             let prev = self.descriptor.stream_queue().push(item)?;
             probes::on_send(self.descriptor.queue_id(), Half::Stream, prev.is_some());
@@ -154,7 +159,7 @@ impl<T: 'static, Key: 'static> Sender<T, Key> {
     }
 
     #[inline]
-    pub fn send_control(&self, item: T) -> Result<Option<T>, Error> {
+    pub fn send_control(&self, item: T) -> Result<Option<T>, Error<T>> {
         unsafe {
             let prev = self.descriptor.control_queue().push(item)?;
             probes::on_send(self.descriptor.queue_id(), Half::Control, prev.is_some());

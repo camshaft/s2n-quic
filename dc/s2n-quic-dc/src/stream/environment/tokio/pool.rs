@@ -93,6 +93,15 @@ impl Pool {
             }
         }
 
+        let unroutable_packets = {
+            let socket = sockets[0].worker_socket.clone();
+            let (tx, task) = config.unroutable_packets(socket);
+
+            env.reader_rt.spawn(task);
+
+            tx
+        };
+
         let max_packet_size = config.max_packet_size;
         let packet_count = config.packet_count;
         let create_packets = || Packets::new(max_packet_size, packet_count);
@@ -122,14 +131,21 @@ impl Pool {
                     queues.clone(),
                     app_socket,
                     worker_socket,
+                    unroutable_packets.clone(),
                 );
 
-                let router = queues.dispatcher().with_map(config.map.clone());
+                let router = queues
+                    .dispatcher(unroutable_packets.clone())
+                    .with_map(config.map.clone());
                 router.with_zero_router(acceptor)
             });
         } else {
             spawn!(|_packets: &Packets, socket: &Socket| {
-                let dispatch = socket.queue.lock().unwrap().dispatcher();
+                let dispatch = socket
+                    .queue
+                    .lock()
+                    .unwrap()
+                    .dispatcher(unroutable_packets.clone());
                 dispatch.with_map(config.map.clone())
             });
         }

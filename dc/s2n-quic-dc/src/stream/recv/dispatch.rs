@@ -5,10 +5,9 @@ use crate::{
     credentials::{self, Credentials},
     packet,
     socket::recv::descriptor as desc,
-    sync::ring_deque,
+    sync::{mpsc, ring_deque},
 };
 use s2n_quic_core::{inet::SocketAddress, varint::VarInt};
-use tracing::debug;
 
 mod descriptor;
 mod free_list;
@@ -28,7 +27,7 @@ mod tests;
 /// branches in the allocator logic around growth.
 const PAGE_SIZE: usize = if cfg!(debug_assertions) { 8 } else { 256 };
 
-pub type Error = queue::Error;
+pub type Error<T = desc::Filled> = queue::Error<T>;
 pub type Control = handle::Control<desc::Filled, Credentials>;
 pub type Stream = handle::Stream<desc::Filled, Credentials>;
 
@@ -73,10 +72,11 @@ impl Allocator {
     }
 
     #[inline]
-    pub fn dispatcher(&self) -> Dispatch {
+    pub fn dispatcher(&self, on_unroutable: mpsc::Sender<desc::Filled>) -> Dispatch {
         Dispatch {
             senders: self.pool.senders(),
             keys: self.pool.keys(),
+            on_unroutable,
             is_open: true,
         }
     }
@@ -98,6 +98,7 @@ impl Allocator {
 pub struct Dispatch {
     senders: sender::Senders<desc::Filled, Credentials, PAGE_SIZE>,
     keys: keys::Keys<Credentials>,
+    on_unroutable: mpsc::Sender<desc::Filled>,
     is_open: bool,
 }
 
@@ -106,66 +107,76 @@ impl Dispatch {
     pub fn send_control(
         &mut self,
         queue_id: VarInt,
+        _credentials: Option<&Credentials>,
         segment: desc::Filled,
-    ) -> Result<Option<desc::Filled>, Error> {
+    ) -> Result<(), Error<()>> {
         let payload_len = segment.len();
-        let mut res = Err(Error::Unallocated);
-        self.senders.lookup(queue_id, |sender| {
-            res = sender.send_control(segment);
+        let res = self.senders.lookup(queue_id, segment, |sender, segment| {
+            // if credentials.is_some() && sender.key() != credentials {
+            //     return Err(Error::Unallocated(segment));
+            // }
+
+            sender.send_control(segment)
         });
 
-        match &res {
+        match res {
             Ok(prev) => {
+                // TODO add overflow event for metrics
                 tracing::trace!(
                     %queue_id,
                     payload_len,
                     overflow = prev.is_some(),
                     "send_control"
                 );
+                Ok(())
             }
-            Err(error) => {
-                if matches!(error, Error::Closed) {
-                    self.is_open = false;
-                }
-                // TODO increment metrics
-                debug!(%queue_id, "unroutable control packet");
+            Err(Error::Closed) => {
+                self.is_open = false;
+                Err(queue::Error::Closed)
+            }
+            Err(Error::Unallocated(segment)) => {
+                let _ = self.on_unroutable.send_back(segment);
+                Err(queue::Error::Unallocated(()))
             }
         }
-
-        res
     }
 
     #[inline]
     pub fn send_stream(
         &mut self,
         queue_id: VarInt,
+        _credentials: Option<&Credentials>,
         segment: desc::Filled,
-    ) -> Result<Option<desc::Filled>, Error> {
+    ) -> Result<(), Error<()>> {
         let payload_len = segment.len();
-        let mut res = Err(Error::Unallocated);
-        self.senders.lookup(queue_id, |sender| {
-            res = sender.send_stream(segment);
+        let res = self.senders.lookup(queue_id, segment, |sender, segment| {
+            // if credentials.is_some() && sender.key() != credentials {
+            //     return Err(Error::Unallocated(segment));
+            // }
+
+            sender.send_stream(segment)
         });
 
-        match &res {
+        match res {
             Ok(prev) => {
+                // TODO add overflow event for metrics
                 tracing::trace!(
                     %queue_id,
                     payload_len,
                     overflow = prev.is_some(),
                     "send_stream"
                 );
+                Ok(())
             }
-            Err(error) => {
-                if matches!(error, Error::Closed) {
-                    self.is_open = false;
-                }
-                // TODO increment metrics
-                debug!(%queue_id, "unroutable stream packet");
+            Err(Error::Closed) => {
+                self.is_open = false;
+                Err(queue::Error::Closed)
+            }
+            Err(Error::Unallocated(segment)) => {
+                let _ = self.on_unroutable.send_back(segment);
+                Err(queue::Error::Unallocated(()))
             }
         }
-
-        res
     }
 
     #[inline]
@@ -200,14 +211,14 @@ impl crate::socket::recv::router::Router for Dispatch {
         &mut self,
         _tag: packet::control::Tag,
         id: Option<packet::stream::Id>,
-        _credentials: credentials::Credentials,
+        credentials: credentials::Credentials,
         segment: desc::Filled,
     ) {
         let Some(id) = id else {
             return;
         };
 
-        let _ = self.send_control(id.queue_id, segment);
+        let _ = self.send_control(id.queue_id, Some(&credentials), segment);
     }
 
     /// implement this so we don't get warnings about not handling it
@@ -225,10 +236,57 @@ impl crate::socket::recv::router::Router for Dispatch {
         &mut self,
         _tag: packet::stream::Tag,
         id: packet::stream::Id,
-        _credentials: credentials::Credentials,
+        credentials: credentials::Credentials,
         segment: desc::Filled,
     ) {
-        let _ = self.send_stream(id.queue_id, segment);
+        let _ = self.send_stream(id.queue_id, Some(&credentials), segment);
+    }
+
+    #[inline(always)]
+    fn handle_flow_reset_packet(
+        &mut self,
+        _remote_address: SocketAddress,
+        _ecn: s2n_quic_core::inet::ExplicitCongestionNotification,
+        _packet: packet::secret_control::flow_reset::Packet,
+    ) {
+    }
+
+    #[inline]
+    fn dispatch_flow_reset_packet(
+        &mut self,
+        _tag: packet::secret_control::flow_reset::Tag,
+        queue_id: VarInt,
+        _credentials: Credentials,
+        segment: desc::Filled,
+    ) {
+        let payload_len = segment.len();
+        let res = self.senders.lookup(queue_id, segment, |sender, segment| {
+            // try to send to the stream queue first and fall back to the control queue
+            match sender.send_stream(segment) {
+                Ok(v) => Ok(v),
+                Err(Error::Closed) => Err(Error::Closed),
+                Err(Error::Unallocated(segment)) => sender.send_control(segment),
+            }
+        });
+
+        match res {
+            Ok(prev) => {
+                // TODO add overflow event for metrics
+                tracing::trace!(
+                    %queue_id,
+                    payload_len,
+                    overflow = prev.is_some(),
+                    "send_stream"
+                );
+            }
+            Err(Error::Closed) => {
+                self.is_open = false;
+            }
+            Err(Error::Unallocated(segment)) => {
+                // Don't route these since they are sent in response to unroutable packets
+                let _ = segment;
+            }
+        }
     }
 
     /// implement this so we don't get warnings about not handling it
@@ -250,7 +308,7 @@ impl crate::socket::recv::router::Router for Dispatch {
         let Some(queue_id) = queue_id else {
             return;
         };
-        let _ = self.send_control(queue_id, segment);
+        let _ = self.send_control(queue_id, None, segment);
     }
 
     /// implement this so we don't get warnings about not handling it
@@ -272,7 +330,7 @@ impl crate::socket::recv::router::Router for Dispatch {
         let Some(queue_id) = queue_id else {
             return;
         };
-        let _ = self.send_control(queue_id, segment);
+        let _ = self.send_control(queue_id, None, segment);
     }
 
     #[inline]
@@ -293,6 +351,6 @@ impl crate::socket::recv::router::Router for Dispatch {
         let Some(queue_id) = queue_id else {
             return;
         };
-        let _ = self.send_control(queue_id, segment);
+        let _ = self.send_control(queue_id, None, segment);
     }
 }

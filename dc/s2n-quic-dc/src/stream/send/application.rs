@@ -375,7 +375,7 @@ where
 
             let is_panicking = matches!(ty, ShutdownType::Drop { is_panicking: true });
             let shutdown_kind = if is_panicking {
-                ShutdownKind::Panicking
+                ShutdownKind::Errored
             } else {
                 ShutdownKind::Normal
             };

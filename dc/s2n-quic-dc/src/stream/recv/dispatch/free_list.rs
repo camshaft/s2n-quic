@@ -9,6 +9,7 @@ use super::{
     probes,
 };
 use std::{
+    collections::VecDeque,
     hash::Hash,
     sync::{Arc, Mutex},
 };
@@ -37,7 +38,7 @@ pub(super) struct FreeVec<T: 'static, Key: 'static> {
 impl<T: 'static, Key: 'static> FreeVec<T, Key> {
     #[inline]
     pub fn new(initial_cap: usize, keys: Keys<Key>) -> (Arc<Self>, Arc<Memory<T, Key>>) {
-        let descriptors = Vec::with_capacity(initial_cap);
+        let descriptors = VecDeque::with_capacity(initial_cap);
         let regions = Vec::with_capacity(1);
         let inner = FreeInner {
             descriptors,
@@ -59,7 +60,7 @@ impl<T: 'static, Key: 'static> FreeVec<T, Key> {
         Key: Copy + Eq + Hash,
     {
         let mut inner = self.inner.lock().unwrap();
-        let descriptor = inner.descriptors.pop()?;
+        let descriptor = inner.descriptors.pop_front()?;
 
         #[cfg(debug_assertions)]
         assert!(
@@ -82,12 +83,13 @@ impl<T: 'static, Key: 'static> FreeVec<T, Key> {
     }
 
     #[inline]
-    pub fn record_region(&self, region: Region<T, Key>, mut descriptors: Vec<Descriptor<T, Key>>) {
+    pub fn record_region(&self, region: Region<T, Key>, descriptors: Vec<Descriptor<T, Key>>) {
         let mut inner = self.inner.lock().unwrap();
         inner.regions.push(region);
         let prev = inner.total;
         let next = prev + descriptors.len();
         inner.total = next;
+        let mut descriptors: VecDeque<_> = descriptors.into();
         inner.descriptors.append(&mut descriptors);
         // Even though the `descriptors` is now empty (`len=0`), it still owns
         // capacity and will need to be freed. Drop the lock before interacting
@@ -142,7 +144,7 @@ where
             inner.active
         );
 
-        inner.descriptors.push(descriptor);
+        inner.descriptors.push_back(descriptor);
         if inner.open {
             return None;
         }
@@ -153,7 +155,7 @@ where
 }
 
 struct FreeInner<T: 'static, Key: 'static> {
-    descriptors: Vec<Descriptor<T, Key>>,
+    descriptors: VecDeque<Descriptor<T, Key>>,
     regions: Vec<Region<T, Key>>,
     total: usize,
     open: bool,
@@ -176,7 +178,7 @@ impl<T: 'static, Key: 'static> FreeInner<T, Key> {
         Some(core::mem::replace(
             self,
             FreeInner {
-                descriptors: Vec::new(),
+                descriptors: VecDeque::new(),
                 regions: Vec::new(),
                 total: 0,
                 open: false,

@@ -383,7 +383,7 @@ where
 
         // let the peer know if we shut down cleanly
         let kind = if std::thread::panicking() {
-            ShutdownKind::Panicking
+            ShutdownKind::Errored
         } else {
             ShutdownKind::Normal
         };

@@ -37,6 +37,14 @@ pub trait Store: 'static + Send + Sync {
 
     fn handle_unexpected_packet(&self, packet: &Packet, peer: &SocketAddr);
 
+    fn sign_flow_reset_packet(&self, packet: &control::FlowReset, out: &mut [u8]) -> Option<usize>;
+
+    fn handle_flow_reset_packet<'a>(
+        &self,
+        packet: &'a control::flow_reset::Packet,
+        peer: &SocketAddr,
+    ) -> Option<&'a control::FlowReset>;
+
     fn handle_stale_key_packet<'a>(
         &self,
         packet: &'a control::stale_key::Packet,

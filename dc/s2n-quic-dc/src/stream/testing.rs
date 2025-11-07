@@ -354,7 +354,12 @@ impl Client {
             Some(self.params()),
             &server.map,
             server_addr,
-            Some(server.params()),
+            Some({
+                let mut params = server.params();
+                params.remote_max_data =
+                    s2n_quic_core::varint::VarInt::from_u16(MAX_DATAGRAM_SIZE * 10);
+                params
+            }),
         );
 
         // cache hit already tracked above
@@ -365,6 +370,7 @@ impl Client {
 
     fn params(&self) -> ApplicationParams {
         let mut params = dc::testing::TEST_APPLICATION_PARAMS;
+        params.remote_max_data = s2n_quic_core::varint::VarInt::from_u16(MAX_DATAGRAM_SIZE * 10);
         params.max_datagram_size = self.mtu.unwrap_or(MAX_DATAGRAM_SIZE).into();
         params
     }

@@ -743,6 +743,9 @@ where
             Packet::Control(_) => {
                 // no action for now. FIXME: Add metrics.
             }
+            Packet::FlowReset(_) => {
+                // no action for now. FIXME: Add metrics.
+            }
             Packet::StaleKey(packet) => {
                 let _ = self.handle_stale_key_packet(packet, peer);
             }
@@ -753,6 +756,59 @@ where
                 let _ = self.handle_unknown_path_secret_packet(packet, peer);
             }
         }
+    }
+
+    fn sign_flow_reset_packet(&self, packet: &control::FlowReset, out: &mut [u8]) -> Option<usize> {
+        let Some(entry) = self.ids.get(packet.credentials.id) else {
+            return None;
+        };
+        let len = packet.encode(s2n_codec::EncoderBuffer::new(out), &entry.control_sealer());
+        Some(len)
+    }
+
+    fn handle_flow_reset_packet<'a>(
+        &self,
+        packet: &'a control::flow_reset::Packet,
+        peer: &SocketAddr,
+    ) -> Option<&'a control::FlowReset> {
+        let peer_address = SocketAddress::from(*peer);
+        // let peer_address = peer_address.into_event();
+
+        // self.subscriber()
+        //     .on_stale_key_packet_received(event::builder::StaleKeyPacketReceived {
+        //         credential_id: packet.credential_id().into_event(),
+        //         peer_address,
+        //     });
+
+        let Some(entry) = self.ids.get(*packet.credential_id()) else {
+            // self.subscriber()
+            //     .on_stale_key_packet_dropped(event::builder::StaleKeyPacketDropped {
+            //         credential_id: packet.credential_id().into_event(),
+            //         peer_address,
+            //     });
+            return None;
+        };
+
+        let key = entry.control_opener();
+
+        let Some(packet) = packet.authenticate(&key) else {
+            // self.subscriber().on_stale_key_packet_rejected(
+            //     event::builder::StaleKeyPacketRejected {
+            //         credential_id: packet.credential_id().into_event(),
+            //         peer_address,
+            //     },
+            // );
+
+            return None;
+        };
+
+        // self.subscriber()
+        //     .on_stale_key_packet_accepted(event::builder::StaleKeyPacketAccepted {
+        //         credential_id: packet.credential_id.into_event(),
+        //         peer_address,
+        //     });
+
+        Some(packet)
     }
 
     fn handle_unknown_path_secret_packet<'a>(

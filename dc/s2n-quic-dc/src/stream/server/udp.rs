@@ -15,6 +15,7 @@ use crate::{
         recv::dispatch::{Allocator, Dispatch},
         socket, TransportFeatures,
     },
+    sync::mpsc,
 };
 use s2n_quic_core::{
     event::IntoEvent,
@@ -56,8 +57,9 @@ where
         queues: Allocator,
         application_socket: Arc<S>,
         worker_socket: Arc<W>,
+        unroutable_packets: mpsc::Sender<descriptor::Filled>,
     ) -> Self {
-        let dispatch = queues.dispatcher();
+        let dispatch = queues.dispatcher(unroutable_packets);
         let packet = InitialPacket::empty();
         Self {
             sender,
@@ -107,7 +109,9 @@ where
         // check to see if these credentials are associated with an active stream
         if let Some(queue_id) = self.dispatch.queue_id_for_key(&credentials) {
             tracing::trace!(%queue_id, "credential_cache_hit");
-            let _ = self.dispatch.send_stream(queue_id, segment);
+            let _ = self
+                .dispatch
+                .send_stream(queue_id, Some(&credentials), segment);
             return;
         }
 
