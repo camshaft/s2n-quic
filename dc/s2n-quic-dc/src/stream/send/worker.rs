@@ -198,7 +198,7 @@ where
     pub fn poll(&mut self, cx: &mut Context) -> Poll<()> {
         s2n_quic_core::task::waker::debug_assert_contract(cx, |cx| {
             ready!(self.poll_impl(cx));
-            tracing::debug!("write worker shutting down");
+            tracing::trace!("write worker shutting down");
             Poll::Ready(())
         })
     }
@@ -625,6 +625,15 @@ where
                         self.remote_queue_id = remote_queue_id;
                     }
                 }
+            }
+            Packet::FlowReset(packet) => {
+                ensure!(packet.credentials() == &credentials, Ok(()));
+
+                secret_control!(packet, handle_flow_reset_packet, |packet| {
+                    ApplicationError {
+                        error: packet.code.into(),
+                    }
+                })
             }
             Packet::StaleKey(packet) => {
                 secret_control!(packet, handle_stale_key_packet, |packet| {

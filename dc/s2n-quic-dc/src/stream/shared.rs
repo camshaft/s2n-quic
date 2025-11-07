@@ -39,17 +39,18 @@ pub enum Half {
 #[derive(Debug, Clone, Copy)]
 pub enum ShutdownKind {
     Normal,
-    Panicking,
+    Errored,
     Pruned,
 }
 
 impl ShutdownKind {
+    pub const ERRORED_CODE: u8 = 0x01;
     pub const PRUNED_CODE: u8 = 0x02;
 
     pub fn error_code(&self) -> Option<u8> {
         match self {
             ShutdownKind::Normal => None,
-            ShutdownKind::Panicking => Some(0x01),
+            ShutdownKind::Errored => Some(Self::ERRORED_CODE),
             ShutdownKind::Pruned => Some(Self::PRUNED_CODE),
         }
     }

@@ -89,6 +89,14 @@ impl<T: 'static, Key: 'static> Descriptor<T, Key> {
 
     /// # Safety
     ///
+    /// The caller needs to guarantee the [`Descriptor`] is still allocated.
+    #[inline]
+    pub unsafe fn key(&self) -> Option<&Key> {
+        unsafe { &*self.inner().key.get() }.as_ref()
+    }
+
+    /// # Safety
+    ///
     /// * The caller needs to guarantee the [`Descriptor`] is still allocated.
     /// * The caller needs to have unique access to the [`Descriptor`].
     pub unsafe fn take_key(&mut self) -> Option<Key> {

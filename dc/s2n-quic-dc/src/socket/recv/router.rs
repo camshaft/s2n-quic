@@ -97,6 +97,14 @@ pub trait Router {
                         self.handle_datagram_packet(remote_address, ecn, packet);
                         self.dispatch_datagram_packet(tag, credentials, segment);
                     }
+                    packet::Packet::FlowReset(packet) => {
+                        let tag = packet.tag();
+                        let queue_id = packet.queue_id();
+                        let credentials = *packet.credentials();
+                        tracing::trace!(?tag, ?queue_id, ?credentials, "parsed_flow_reset_packet");
+                        self.handle_flow_reset_packet(remote_address, ecn, packet);
+                        self.dispatch_flow_reset_packet(tag, queue_id, credentials, segment);
+                    }
                     packet::Packet::StaleKey(packet) => {
                         tracing::trace!(?packet, "parsed_stale_key_packet");
                         let queue_id = packet.queue_id();
@@ -205,6 +213,35 @@ pub trait Router {
         warn!(
             unhandled_packet = "datagram",
             ?tag,
+            ?credentials,
+            remote_address = ?segment.remote_address(),
+            packet_len = segment.len()
+        );
+    }
+
+    #[inline(always)]
+    fn handle_flow_reset_packet(
+        &mut self,
+        remote_address: SocketAddress,
+        ecn: ExplicitCongestionNotification,
+        packet: packet::secret_control::flow_reset::Packet,
+    ) {
+        let _ = ecn;
+        self.on_unhandled_packet(remote_address, packet::Packet::FlowReset(packet));
+    }
+
+    #[inline]
+    fn dispatch_flow_reset_packet(
+        &mut self,
+        tag: packet::secret_control::flow_reset::Tag,
+        queue_id: VarInt,
+        credentials: Credentials,
+        segment: descriptor::Filled,
+    ) {
+        warn!(
+            unhandled_packet = "flow_reset",
+            ?tag,
+            queue_id = queue_id.as_u64(),
             ?credentials,
             remote_address = ?segment.remote_address(),
             packet_len = segment.len()

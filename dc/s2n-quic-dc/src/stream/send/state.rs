@@ -561,12 +561,16 @@ impl State {
         };
 
         if let Some((time_sent, cc_info)) = cca_args {
-            let rtt_sample = clock.get_time().saturating_duration_since(time_sent);
+            let now = clock.get_time();
+            let ack_delay = ack.ack_delay();
+            let rtt_sample = now
+                .saturating_duration_since(time_sent)
+                .saturating_sub(ack_delay);
 
             self.rtt_estimator.update_rtt(
-                ack.ack_delay(),
+                Duration::ZERO,
                 rtt_sample,
-                clock.get_time(),
+                now,
                 true,
                 PacketNumberSpace::ApplicationData,
             );
@@ -577,7 +581,7 @@ impl State {
                 cc_info,
                 &self.rtt_estimator,
                 random,
-                clock.get_time(),
+                now,
             );
         }
 
@@ -797,7 +801,7 @@ impl State {
             .is_ready()
         {
             // TODO where does this come from
-            let max_pto_backoff = 1024;
+            let max_pto_backoff = 128;
             self.pto_backoff = self.pto_backoff.saturating_mul(2).min(max_pto_backoff);
         }
     }
@@ -848,9 +852,13 @@ impl State {
         // if we've sent all of the data/reset and are waiting to clean things up
         should_arm |= self.state.is_data_sent() || self.state.is_reset_sent();
 
-        ensure!(should_arm);
+        should_arm |= self.max_sent_offset == self.max_data;
 
-        self.force_arm_pto_timer(clock);
+        if !should_arm {
+            self.pto_backoff = INITIAL_PTO_BACKOFF;
+        } else {
+            self.force_arm_pto_timer(clock);
+        }
     }
 
     #[inline]
@@ -1309,12 +1317,15 @@ impl State {
     {
         ensure!(self.error.is_none());
         let error = Error::from(error);
+        let is_idle_timeout = matches!(error.kind(), error::Kind::IdleTimeout);
         self.error = Some(ErrorState { error, source });
         publisher.on_stream_sender_errored(event::builder::StreamSenderErrored { error, source });
         let _ = self.state.on_queue_reset();
 
         self.clean_up();
-        self.pto.force_transmit();
+        if !is_idle_timeout {
+            self.pto.force_transmit();
+        }
     }
 
     #[inline]

@@ -127,6 +127,7 @@ pub struct Builder {
     send_buffer: Option<usize>,
     recv_buffer: Option<usize>,
     reuse_addr: Option<bool>,
+    socket_workers: Option<usize>,
 }
 
 impl Default for Builder {
@@ -144,6 +145,7 @@ impl Default for Builder {
             send_buffer: None,
             recv_buffer: None,
             reuse_addr: None,
+            socket_workers: None,
         }
     }
 }
@@ -230,6 +232,11 @@ impl Builder {
     common_builder_methods!();
     manager_builder_methods!();
 
+    pub fn with_socket_workers(mut self, workers: usize) -> Self {
+        self.socket_workers = Some(workers);
+        self
+    }
+
     pub fn build<H: Handshake + Clone, S: event::Subscriber + Clone>(
         mut self,
         handshake: H,
@@ -271,6 +278,10 @@ impl Builder {
 
             pool.reuse_port = concurrency > 1;
             pool.accept_flavor = self.accept_flavor;
+
+            if let Some(workers) = self.socket_workers {
+                pool.workers = Some(workers);
+            }
 
             env = env.with_pool(pool);
         }

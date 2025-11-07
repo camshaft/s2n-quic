@@ -7,6 +7,18 @@ use s2n_codec::{
 
 macro_rules! impl_packet {
     ($name:ident) => {
+        impl_packet!($name, {
+            pub fn queue_id(&self) -> Option<s2n_quic_core::varint::VarInt> {
+                self.value.queue_id
+            }
+
+            #[inline]
+            pub fn credential_id(&self) -> &crate::credentials::Id {
+                &self.value.credential_id
+            }
+        });
+    };
+    ($name:ident, { $($impls:tt)* }) => {
         #[derive(Clone, Copy, Debug)]
         pub struct Packet<'a> {
             header: &'a [u8],
@@ -28,11 +40,6 @@ macro_rules! impl_packet {
             }
 
             #[inline]
-            pub fn credential_id(&self) -> &crate::credentials::Id {
-                &self.value.credential_id
-            }
-
-            #[inline]
             pub fn authenticate<C>(&self, crypto: &C) -> Option<&$name>
             where
                 C: crate::crypto::open::control::Secret,
@@ -48,10 +55,7 @@ macro_rules! impl_packet {
                 Some(value)
             }
 
-            #[inline]
-            pub fn queue_id(&self) -> Option<s2n_quic_core::varint::VarInt> {
-                self.value.queue_id
-            }
+            $($impls)*
         }
     };
 }

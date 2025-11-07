@@ -28,7 +28,7 @@ pub fn encode<E: Encoder>(
 
     encoder.encode(&APP_PARAMS_VERSION);
 
-    encoder.encode(application_params);
+    // encoder.encode(application_params);
 
     encoder.encode(&encode_time);
 

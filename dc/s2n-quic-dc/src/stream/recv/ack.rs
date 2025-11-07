@@ -4,9 +4,10 @@
 use crate::packet::stream::decoder::Packet;
 use s2n_codec::EncoderValue;
 use s2n_quic_core::{
-    ack,
+    ack, ensure,
     frame::{self, ack::EcnCounts},
-    packet::number::{PacketNumberSpace, SlidingWindow, SlidingWindowError},
+    packet::number::{PacketNumber, PacketNumberSpace, SlidingWindow, SlidingWindowError},
+    time::{Clock, Timestamp},
     varint::VarInt,
 };
 
@@ -25,8 +26,9 @@ impl StreamFilter {
 
 #[derive(Debug)]
 pub struct Space {
-    pub packets: ack::Ranges,
-    pub transmission: ack::transmission::Set,
+    packets: ack::Ranges,
+    transmission: ack::transmission::Set,
+    max_received_packet_time: Option<Timestamp>,
     pub filter: StreamFilter,
 }
 
@@ -37,6 +39,7 @@ impl Default for Space {
             packets: ack::Ranges::new(usize::MAX),
             transmission: Default::default(),
             filter: Default::default(),
+            max_received_packet_time: None,
         }
     }
 }
@@ -50,19 +53,52 @@ impl Space {
         }
     }
 
+    pub fn max_received_packet(&self) -> Option<PacketNumber> {
+        self.packets.max_value()
+    }
+
+    pub fn interval_len(&self) -> usize {
+        self.packets.interval_len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.packets.is_empty()
+    }
+
+    pub fn ack_delay(&self, now: Timestamp) -> VarInt {
+        let delay = self
+            .max_received_packet_time
+            .map(|time| now.saturating_duration_since(time))
+            .unwrap_or_default();
+        VarInt::try_from(delay.as_micros()).unwrap_or(VarInt::MAX)
+    }
+
+    pub fn on_packet_received(&mut self, packet_number: VarInt, now: Timestamp) {
+        let packet_number = PacketNumberSpace::Initial.new_packet_number(packet_number);
+        ensure!(self.packets.insert_packet_number(packet_number).is_ok());
+        if self.packets.max_value() == Some(packet_number) {
+            self.max_received_packet_time = Some(now);
+        }
+    }
+
     #[inline]
     pub fn clear(&mut self) {
         self.packets.clear();
     }
 
     #[inline]
-    pub fn encoding(
+    pub fn encoding<Clk>(
         &mut self,
         max_data_encoding_size: VarInt,
-        ack_delay: VarInt,
         ecn_counts: Option<EcnCounts>,
         mtu: u16,
-    ) -> (Option<frame::Ack<&ack::Ranges>>, VarInt) {
+        clock: &Clk,
+    ) -> (Option<frame::Ack<&ack::Ranges>>, VarInt)
+    where
+        Clk: Clock + ?Sized,
+    {
+        let ack_delay = self.ack_delay(clock.get_time());
+
         loop {
             if self.packets.is_empty() {
                 return (None, max_data_encoding_size);

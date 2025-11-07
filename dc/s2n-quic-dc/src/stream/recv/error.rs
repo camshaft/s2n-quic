@@ -243,6 +243,9 @@ impl From<Kind> for std::io::ErrorKind {
             Kind::TransportError { .. } => ErrorKind::ConnectionAborted,
             Kind::ApplicationError { .. } => ErrorKind::ConnectionReset,
             Kind::UnexpectedPacket {
+                packet: packet::Kind::FlowReset,
+            } => ErrorKind::ConnectionReset,
+            Kind::UnexpectedPacket {
                 packet:
                     packet::Kind::UnknownPathSecret
                     | packet::Kind::StaleKey

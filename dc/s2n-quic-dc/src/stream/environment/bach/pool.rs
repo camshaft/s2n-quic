@@ -95,6 +95,15 @@ impl Pool {
         let packet_count = config.packet_count;
         let create_packets = || Packets::new(max_packet_size, packet_count);
 
+        let unroutable_packets = {
+            let socket = sockets[0].worker_socket.clone();
+            let (tx, task) = config.unroutable_packets(socket);
+
+            bach::spawn(task);
+
+            tx
+        };
+
         macro_rules! spawn {
             ($create_router:expr) => {
                 Self::spawn_non_blocking(&sockets, create_packets, $create_router)?;
@@ -115,14 +124,21 @@ impl Pool {
                     queues.clone(),
                     app_socket,
                     worker_socket,
+                    unroutable_packets.clone(),
                 );
 
-                let router = queues.dispatcher().with_map(config.map.clone());
+                let router = queues
+                    .dispatcher(unroutable_packets.clone())
+                    .with_map(config.map.clone());
                 router.with_zero_router(acceptor)
             });
         } else {
             spawn!(|_packets: &Packets, socket: &Socket| {
-                let dispatch = socket.queue.lock().unwrap().dispatcher();
+                let dispatch = socket
+                    .queue
+                    .lock()
+                    .unwrap()
+                    .dispatcher(unroutable_packets.clone());
                 dispatch.with_map(config.map.clone())
             });
         }

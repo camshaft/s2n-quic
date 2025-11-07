@@ -1,7 +1,7 @@
 // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use super::{free_list, handle::Sender};
+use super::{free_list, handle::Sender, queue::Error};
 use s2n_quic_core::varint::VarInt;
 use std::{
     hash::Hash,
@@ -44,9 +44,14 @@ impl<T: 'static, Key: 'static, const PAGE_SIZE: usize> Clone for Senders<T, Key,
 
 impl<T: 'static, Key: 'static, const PAGE_SIZE: usize> Senders<T, Key, PAGE_SIZE> {
     #[inline]
-    pub fn lookup<F: FnOnce(&Sender<T, Key>)>(&mut self, queue_id: VarInt, f: F) {
+    pub fn lookup<F: FnOnce(&Sender<T, Key>, T) -> Result<Option<T>, Error<T>>>(
+        &mut self,
+        queue_id: VarInt,
+        value: T,
+        f: F,
+    ) -> Result<Option<T>, Error<T>> {
         let Some(queue_id) = queue_id.checked_sub(self.base) else {
-            return;
+            return Err(Error::Unallocated(value));
         };
         let queue_id = queue_id.as_u64() as usize;
         let page = queue_id / PAGE_SIZE;
@@ -54,12 +59,12 @@ impl<T: 'static, Key: 'static, const PAGE_SIZE: usize> Senders<T, Key, PAGE_SIZE
 
         if self.local.len() <= page {
             let Ok(senders) = self.state.pages.read() else {
-                return;
+                return Err(Error::Unallocated(value));
             };
 
             // the senders haven't been updated
             if self.local.len() == senders.pages.len() {
-                return;
+                return Err(Error::Unallocated(value));
             }
 
             self.local
@@ -67,12 +72,12 @@ impl<T: 'static, Key: 'static, const PAGE_SIZE: usize> Senders<T, Key, PAGE_SIZE
         }
 
         let Some(page) = self.local.get(page) else {
-            return;
+            return Err(Error::Unallocated(value));
         };
         let Some(sender) = page.get(offset) else {
-            return;
+            return Err(Error::Unallocated(value));
         };
-        f(sender)
+        f(sender, value)
     }
 }
 
