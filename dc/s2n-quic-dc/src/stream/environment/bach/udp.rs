@@ -6,7 +6,7 @@ use crate::{
     stream::{
         environment::{bach::Environment, Peer, SetupResult},
         recv::{buffer, dispatch::Control},
-        socket::{application::Single, Tracing},
+        socket::{application::Single, Tracing, Wheel},
         TransportFeatures,
     },
 };
@@ -14,9 +14,9 @@ use bach::net::UdpSocket;
 use s2n_quic_core::inet::SocketAddress;
 use std::sync::Arc;
 
-pub(super) type RecvSocket = Arc<UdpSocket>;
-pub(super) type WorkerSocket = Arc<Tracing<RecvSocket>>;
-pub(super) type ApplicationSocket = Arc<Single<Tracing<RecvSocket>>>;
+pub(super) type ArcSocket = Arc<UdpSocket>;
+pub(super) type WorkerSendSocket = Arc<Tracing<Wheel>>;
+pub(super) type ApplicationSendSocket = Arc<Single<Tracing<Wheel>>>;
 
 #[derive(Debug)]
 pub struct Pooled(pub SocketAddress);
@@ -25,8 +25,8 @@ impl<Sub> Peer<Environment<Sub>> for Pooled
 where
     Sub: event::Subscriber + Clone,
 {
-    type ReadWorkerSocket = WorkerSocket;
-    type WriteWorkerSocket = (WorkerSocket, buffer::Channel<Control>);
+    type ReadWorkerSocket = WorkerSendSocket;
+    type WriteWorkerSocket = (WorkerSendSocket, buffer::Channel<Control>);
 
     #[inline]
     fn features(&self) -> TransportFeatures {

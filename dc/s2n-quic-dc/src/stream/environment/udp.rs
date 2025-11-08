@@ -4,7 +4,8 @@
 use crate::{
     packet::Packet,
     path::secret::Map,
-    socket::pool::descriptor,
+    psk::io::DEFAULT_MTU,
+    socket::{pool::descriptor, send::wheel::DEFAULT_GRANULARITY_US},
     stream::{
         environment::{Environment, Peer, SetupResult, SocketSet},
         recv::{
@@ -18,21 +19,29 @@ use crate::{
     sync::mpsc::{self, Capacity},
 };
 use s2n_codec::{DecoderBufferMut, DecoderParameterizedValueMut};
-use s2n_quic_core::inet::{IpAddress, IpV4Address, IpV6Address, SocketAddress, Unspecified};
-use std::sync::Arc;
+use s2n_quic_core::{
+    inet::{IpAddress, IpV4Address, IpV6Address, SocketAddress, Unspecified},
+    recovery::MAX_BURST_PACKETS,
+    time::token_bucket::TokenBucket,
+};
+use std::{sync::Arc, time::Duration};
 
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub struct Config {
     pub blocking: bool,
     pub reuse_port: bool,
-    pub stream_queue: Capacity,
-    pub control_queue: Capacity,
+    pub stream_recv_queue: Capacity,
+    pub control_recv_queue: Capacity,
     pub max_packet_size: u16,
     pub packet_count: usize,
     pub accept_flavor: accept::Flavor,
     pub workers: Option<usize>,
     pub map: Map,
+    // Send worker configuration
+    pub send_wheel_horizon: Duration,
+    pub max_bitrate_bps: u64,
+    pub priority_levels: usize,
 }
 
 impl Config {
@@ -41,13 +50,13 @@ impl Config {
             blocking: false,
             reuse_port: false,
             // TODO tune these defaults
-            stream_queue: Capacity {
+            stream_recv_queue: Capacity {
                 max: 4096,
                 initial: 256,
             },
 
             // set the control queue depth shallow, since we really only need the most recent ones
-            control_queue: Capacity { max: 8, initial: 8 },
+            control_recv_queue: Capacity { max: 8, initial: 8 },
 
             // Allocate 1MB at a time
             max_packet_size: u16::MAX,
@@ -57,7 +66,29 @@ impl Config {
 
             workers: None,
             map,
+
+            // Send worker defaults
+            send_wheel_horizon: Duration::from_millis(100),
+            max_bitrate_bps: 5_000_000_000, // 5 Gbps (EC2 per-flow limit)
+            priority_levels: 2,             // 0 = control, 1+ = application
         }
+    }
+
+    pub(crate) fn token_bucket(&self) -> TokenBucket {
+        // Convert bits per second to bytes per interval
+        // bytes_per_interval = (bits_per_second * interval_microseconds) / 8_000_000
+        let bytes_per_interval = (self.max_bitrate_bps * DEFAULT_GRANULARITY_US) / 8_000_000;
+        // make sure at least one burst goes through each iteration
+        let bytes_per_interval =
+            bytes_per_interval.max(DEFAULT_MTU as u64 * MAX_BURST_PACKETS as u64);
+        let refill_interval = Duration::from_micros(DEFAULT_GRANULARITY_US);
+        let burst = bytes_per_interval; // 1x multiplier
+
+        TokenBucket::builder()
+            .with_max(burst)
+            .with_refill_interval(refill_interval)
+            .with_refill_amount(bytes_per_interval)
+            .build()
     }
 
     pub fn unroutable_packets<S>(
