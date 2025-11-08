@@ -8,11 +8,21 @@ use s2n_quic_core::inet::ExplicitCongestionNotification;
 use std::{
     io::{self, IoSlice, IoSliceMut},
     net::SocketAddr,
+    ops::Deref,
 };
 use tracing::trace;
 
 #[derive(Clone)]
 pub struct Tracing<S: Socket>(pub S);
+
+impl<S: Socket> Deref for Tracing<S> {
+    type Target = S;
+
+    #[inline(always)]
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
 
 impl<S: Socket> Socket for Tracing<S> {
     #[inline(always)]

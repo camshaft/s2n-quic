@@ -4,7 +4,7 @@
 use super::{handle::Transmission, Protocol, Socket, TransportFeatures};
 use crate::{
     msg::{addr::Addr, cmsg},
-    socket::send,
+    socket::send::{self, wheel::DEFAULT_GRANULARITY_US},
     stream::send::state::transmission::Info,
 };
 use core::task::{Context, Poll};
@@ -16,13 +16,13 @@ use std::{
 };
 
 #[derive(Clone)]
-pub struct Wheel<const GRANULARITY_US: u64 = 8> {
+pub struct Wheel<const GRANULARITY_US: u64 = DEFAULT_GRANULARITY_US> {
     wheel: send::wheel::Wheel<Info<()>, GRANULARITY_US>,
     local_addr: SocketAddr,
 }
 
 impl<const GRANULARITY_US: u64> Wheel<GRANULARITY_US> {
-    pub fn new<Clk: s2n_quic_core::time::Clock>(
+    pub fn new(
         wheel: send::wheel::Wheel<Info<()>, GRANULARITY_US>,
         local_addr: SocketAddr,
     ) -> Self {

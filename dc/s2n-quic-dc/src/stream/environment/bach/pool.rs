@@ -1,69 +1,104 @@
 // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use super::udp::{ApplicationSocket, RecvSocket, WorkerSocket};
+use super::udp::{ApplicationSendSocket, ArcSocket, WorkerSendSocket};
 use crate::{
+    clock::bach::Clock,
     credentials::Credentials,
     event,
     socket::{
         pool::Pool as Packets,
         recv::{router::Router, udp},
+        send,
     },
     stream::{
-        environment::{bach::Environment, udp::Config},
+        self,
+        environment::{bach::Environment, udp::Config, Environment as _},
         recv::dispatch::{Allocator as Queues, Control, Stream},
         server::{accept, udp::Acceptor},
         socket::{application::Single, Tracing},
     },
 };
-use bach::net::{socket, SocketAddr, UdpSocket};
+use bach::{
+    net::{socket, SocketAddr, UdpSocket},
+    rand::Any,
+};
 use s2n_quic_platform::socket::options::{Options, ReusePort};
 use std::{
-    io::{self, Result},
-    sync::{
-        atomic::{AtomicUsize, Ordering},
-        Arc, Mutex,
-    },
+    io::Result,
+    sync::{Arc, Mutex},
 };
 use tracing::Instrument;
 
 pub(super) struct Pool {
-    sockets: Box<[Socket]>,
-    current: AtomicUsize,
-    mask: usize,
+    sockets: Box<[PoolSocket]>,
     local_addr: SocketAddr,
 }
 
-struct Socket {
-    recv_socket: RecvSocket,
-    application_socket: ApplicationSocket,
-    worker_socket: WorkerSocket,
-    queue: Mutex<Queues>,
+struct PoolSocket {
+    socket: ArcSocket,
+    worker: WorkerSendSocket,
+    application: Box<[ApplicationSendSocket]>,
+    recv_queue: Mutex<Queues>,
 }
 
-impl Socket {
-    fn new(socket: UdpSocket, queue: Queues) -> io::Result<Self> {
-        let recv_socket = Arc::new(socket);
+impl PoolSocket {
+    fn new(
+        socket: Arc<UdpSocket>,
+        recv_queue: Mutex<Queues>,
+        config: &Config,
+        clock: &Clock,
+    ) -> Self {
+        let local_addr = socket.local_addr().unwrap();
 
-        let send_socket = Tracing(recv_socket.clone());
+        let create_socket = || {
+            let wheel = send::wheel::Wheel::new(config.send_wheel_horizon, clock);
+            stream::socket::Wheel::new(wheel, local_addr)
+        };
 
-        let application_socket = Arc::new(Single(send_socket.clone()));
+        let worker = Arc::new(Tracing(create_socket()));
 
-        let worker_socket = Arc::new(send_socket);
+        let application = (0..config.priority_levels)
+            .map(|_| Arc::new(Single(Tracing(create_socket()))))
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
 
-        Ok(Socket {
-            recv_socket,
-            application_socket,
-            worker_socket,
-            queue: Mutex::new(queue),
-        })
+        Self {
+            worker,
+            application,
+            socket,
+            recv_queue,
+        }
+    }
+
+    fn spawn_send_worker(&self, config: &Config, clock: Clock) {
+        let socket = self.socket.clone();
+
+        let mut wheels = vec![(***self.worker).clone()];
+
+        for application in &self.application {
+            wheels.push((*****application).clone());
+        }
+
+        let token_bucket = config.token_bucket();
+
+        let span = tracing::trace_span!("send_socket_worker");
+        let task = async move {
+            send::udp::non_blocking(socket, wheels, clock, token_bucket).await;
+        };
+
+        if span.is_disabled() {
+            bach::spawn(task);
+        } else {
+            bach::spawn(task.instrument(span));
+        }
     }
 }
 
 impl Pool {
     pub fn new<Sub>(
         env: &Environment<Sub>,
-        mut workers: usize,
+        workers: usize,
         mut config: Config,
         acceptor: Option<accept::Sender<Sub>>,
     ) -> Result<Self>
@@ -72,25 +107,19 @@ impl Pool {
     {
         debug_assert_ne!(workers, 0);
 
-        if workers > 1 {
-            workers = workers.next_power_of_two();
-        }
-
-        let mask = workers - 1;
-
         let options = env.socket_options.clone();
 
         if config.workers.is_none() {
             config.workers = Some(workers);
         }
 
-        let sockets = Self::create_workers(options, &config)?;
+        let sockets = Self::create_workers(&env.clock(), options, &config)?;
 
-        let local_addr = sockets[0].recv_socket.local_addr()?;
+        let local_addr = sockets[0].socket.local_addr()?;
 
         if cfg!(debug_assertions) && config.reuse_port {
             for socket in sockets.iter().skip(1) {
-                debug_assert_eq!(local_addr, socket.recv_socket.local_addr()?);
+                debug_assert_eq!(local_addr, socket.socket.local_addr()?);
             }
         }
 
@@ -99,7 +128,7 @@ impl Pool {
         let create_packets = || Packets::new(max_packet_size, packet_count);
 
         let unroutable_packets = {
-            let socket = sockets[0].worker_socket.clone();
+            let socket = sockets[0].worker.clone();
             let (tx, task) = config.unroutable_packets(socket);
 
             bach::spawn(task);
@@ -109,15 +138,15 @@ impl Pool {
 
         macro_rules! spawn {
             ($create_router:expr) => {
-                Self::spawn_non_blocking(&sockets, create_packets, $create_router)?;
+                Self::spawn_non_blocking(env, &config, &sockets, create_packets, $create_router)?;
             };
         }
 
         if let Some(sender) = acceptor {
-            spawn!(|_packets: &Packets, socket: &Socket| {
-                let queues = socket.queue.lock().unwrap();
-                let app_socket = socket.application_socket.clone();
-                let worker_socket = socket.worker_socket.clone();
+            spawn!(|_packets: &Packets, socket: &PoolSocket| {
+                let queues = socket.recv_queue.lock().unwrap();
+                let app_socket = socket.application[0].clone();
+                let worker_socket = socket.worker.clone();
 
                 let acceptor = Acceptor::new(
                     env.clone(),
@@ -136,9 +165,9 @@ impl Pool {
                 router.with_zero_router(acceptor)
             });
         } else {
-            spawn!(|_packets: &Packets, socket: &Socket| {
+            spawn!(|_packets: &Packets, socket: &PoolSocket| {
                 let dispatch = socket
-                    .queue
+                    .recv_queue
                     .lock()
                     .unwrap()
                     .dispatcher(unroutable_packets.clone());
@@ -148,8 +177,6 @@ impl Pool {
 
         Ok(Self {
             sockets: sockets.into(),
-            current: AtomicUsize::new(0),
-            mask,
             local_addr,
         })
     }
@@ -157,33 +184,67 @@ impl Pool {
     pub fn alloc(
         &self,
         credentials: Option<&Credentials>,
-    ) -> (Control, Stream, ApplicationSocket, WorkerSocket) {
-        let idx = self.current.fetch_add(1, Ordering::Relaxed);
-        let idx = idx & self.mask;
+    ) -> (Control, Stream, ApplicationSendSocket, WorkerSendSocket) {
+        // "Pick 2" worker selection
+        let idx = self.pick_worker();
+
         let socket = &self.sockets[idx];
-        let (control, stream) = socket.queue.lock().unwrap().alloc_or_grow(credentials);
-        let app_socket = socket.application_socket.clone();
-        let worker_socket = socket.worker_socket.clone();
+
+        let (control, stream) = socket.recv_queue.lock().unwrap().alloc_or_grow(credentials);
+
+        // Application sockets currently only have 1 priority
+        // TODO take this in as a parameter
+        let priority = 0;
+
+        let worker_socket = socket.worker.clone();
+        let app_socket = socket.application[priority].clone();
 
         (control, stream, app_socket, worker_socket)
+    }
+
+    /// Implements "pick 2" load balancing: select two random workers and choose the one with lower queue length
+    fn pick_worker(&self) -> usize {
+        if self.sockets.len() == 1 {
+            return 0;
+        }
+
+        let idx1: usize = (0..self.sockets.len()).any();
+        let mut idx2: usize = (0..self.sockets.len() - 1).any();
+        // shift the second index up so they're non-overlapping
+        if idx2 >= idx1 {
+            idx2 += 1;
+        }
+
+        // Choose the worker with lower queue length
+        let len1 = self.sockets[idx1].application[0].len();
+        let len2 = self.sockets[idx2].application[0].len();
+
+        if len1 <= len2 {
+            idx1
+        } else {
+            idx2
+        }
     }
 
     pub fn local_addr(&self) -> SocketAddr {
         self.local_addr
     }
 
-    fn spawn_non_blocking<R>(
-        sockets: &[Socket],
+    fn spawn_non_blocking<Sub, R>(
+        env: &Environment<Sub>,
+        config: &Config,
+        sockets: &[PoolSocket],
         create_packets: impl Fn() -> Packets,
-        create_router: impl Fn(&Packets, &Socket) -> R,
+        create_router: impl Fn(&Packets, &PoolSocket) -> R,
     ) -> Result<()>
     where
+        Sub: event::Subscriber + Clone,
         R: 'static + Send + Router,
     {
         for (udp_socket_worker, socket) in sockets.iter().enumerate() {
             let packets = create_packets();
             let router = create_router(&packets, socket);
-            let recv_socket = socket.recv_socket.clone();
+            let recv_socket = socket.socket.clone();
             let span = tracing::trace_span!("udp_socket_worker", udp_socket_worker);
             let task = async move {
                 udp::non_blocking(recv_socket, packets, router).await;
@@ -193,15 +254,21 @@ impl Pool {
             } else {
                 bach::spawn(task.instrument(span));
             }
+
+            socket.spawn_send_worker(config, env.clock())
         }
         Ok(())
     }
 
-    fn create_workers(mut options: Options, config: &Config) -> Result<Vec<Socket>> {
+    fn create_workers(
+        clock: &Clock,
+        mut options: Options,
+        config: &Config,
+    ) -> Result<Vec<PoolSocket>> {
         let mut sockets = vec![];
 
-        let stream_cap = config.stream_queue;
-        let control_cap = config.control_queue;
+        let stream_cap = config.stream_recv_queue;
+        let control_cap = config.control_recv_queue;
 
         let shared_queue = if config.reuse_port {
             // if we are reusing the port, we need to share the queue_ids
@@ -240,7 +307,9 @@ impl Pool {
                 Queues::new(stream_cap, control_cap)
             };
 
-            let socket = Socket::new(socket, queue)?;
+            let socket = Arc::new(socket);
+            let queue = Mutex::new(queue);
+            let socket = PoolSocket::new(socket, queue, config, clock);
 
             sockets.push(socket);
         }
