@@ -2,9 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
-    allocator::Allocator,
     clock::Timer,
-    event, msg,
+    event,
+    socket::pool::Pool,
     stream::{
         shared::{AcceptState, ArcShared, ShutdownKind},
         socket::Socket,
@@ -71,7 +71,6 @@ where
 {
     shared: ArcShared<Sub>,
     last_observed_epoch: u64,
-    send_buffer: msg::send::Message,
     state: waiting::State,
     peek_timer: Timer,
     idle_timer: Timer,
@@ -93,7 +92,6 @@ where
         endpoint: endpoint::Type,
         parameters: &ApplicationParams,
     ) -> Self {
-        let send_buffer = msg::send::Message::new(shared.remote_addr(), shared.gso.clone());
         let idle_timeout_duration = parameters
             .max_idle_timeout()
             .unwrap_or_else(|| Duration::from_secs(30));
@@ -111,7 +109,6 @@ where
         Self {
             shared,
             last_observed_epoch: 0,
-            send_buffer,
             state,
             peek_timer,
             idle_timer,
@@ -340,11 +337,12 @@ where
         // send an ACK if needed
         if let Some(mut recv) = self.shared.receiver.worker_try_lock()? {
             // use the latest value rather than trying to transmit an old one
-            if !self.send_buffer.is_empty() {
-                let _ = self.send_buffer.drain();
-            }
+            // if !self.send_buffer.is_empty() {
+            //     let _ = self.send_buffer.drain();
+            // }
 
-            recv.fill_transmit_queue(&self.shared, &mut self.send_buffer);
+            // recv.fill_transmit_queue(&self.shared, &mut self.send_buffer);
+            todo!();
 
             if recv.receiver.state().is_data_received() {
                 let _ = self.state.on_data_received();
@@ -417,9 +415,10 @@ where
 
     #[inline]
     fn poll_flush_socket(&mut self, cx: &mut Context) -> Poll<io::Result<()>> {
-        while !self.send_buffer.is_empty() {
-            ready!(self.socket.poll_send_buffer(cx, &mut self.send_buffer))?;
-        }
+        // while !self.send_buffer.is_empty() {
+        //     ready!(self.socket.poll_send_buffer(cx, &mut self.send_buffer))?;
+        // }
+        todo!();
 
         Ok(()).into()
     }

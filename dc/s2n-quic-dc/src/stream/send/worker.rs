@@ -403,12 +403,14 @@ where
                     let publisher = self.shared.publisher();
                     let stream_id = self.shared.stream_id();
                     let source_queue_id = self.shared.local_queue_id();
+                    let pool = todo!();
                     let _ = self.sender.fill_transmit_queue(
                         control_sealer,
                         self.shared.credentials(),
                         &stream_id,
                         source_queue_id,
                         &self.shared.clock,
+                        pool,
                         &publisher,
                     );
                 }
@@ -419,7 +421,6 @@ where
                         usize::MAX,
                         &self.socket,
                         &addr::Addr::new(self.shared.remote_addr()),
-                        &self.shared.sender.segment_alloc,
                         &self.shared.gso,
                         &self.shared.clock,
                         &self.shared.subscriber,
@@ -445,12 +446,14 @@ where
                     let publisher = self.shared.publisher();
                     let stream_id = self.shared.stream_id();
                     let source_queue_id = self.shared.local_queue_id();
+                    let pool = todo!();
                     let _ = self.sender.fill_transmit_queue(
                         control_sealer,
                         self.shared.credentials(),
                         &stream_id,
                         source_queue_id,
                         &self.shared.clock,
+                        pool,
                         &publisher,
                     );
 
@@ -613,7 +616,6 @@ where
                     self.random,
                     &self.clock,
                     &self.shared.sender.application_transmission_queue,
-                    &self.shared.sender.segment_alloc,
                     self.publisher,
                 );
 

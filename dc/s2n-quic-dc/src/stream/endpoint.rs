@@ -229,7 +229,8 @@ where
         };
 
         // construct shared writer state
-        let state = send::shared::State::new(flow, path, bandwidth);
+        let pool = todo!();
+        let state = send::shared::State::new(flow, path, pool, bandwidth);
 
         (state, worker)
     };

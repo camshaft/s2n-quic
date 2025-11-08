@@ -4,7 +4,7 @@
 use crate::{
     credentials::{self, Credentials},
     packet,
-    socket::recv::descriptor as desc,
+    socket::pool::descriptor as desc,
     sync::{mpsc, ring_deque},
 };
 use s2n_quic_core::{inet::SocketAddress, varint::VarInt};

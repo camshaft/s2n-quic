@@ -2,11 +2,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
-    allocator::Allocator,
     clock,
     either::Either,
     event, msg,
     packet::{stream, Packet},
+    socket::pool::Pool,
     stream::{
         recv::{self, buffer::Buffer as _},
         shared::{self, handshake, AcceptState, ArcShared, ShutdownKind},
@@ -158,7 +158,6 @@ impl State {
     pub fn application_guard<'a, Sub>(
         &'a self,
         ack_mode: AckMode,
-        send_buffer: &'a mut msg::send::Message,
         shared: &'a ArcShared<Sub>,
         sockets: &'a dyn socket::Application,
     ) -> io::Result<AppGuard<'a, Sub>>
@@ -180,7 +179,6 @@ impl State {
         Ok(AppGuard {
             inner,
             ack_mode,
-            send_buffer,
             shared,
             sockets,
             initial_state,
@@ -264,7 +262,6 @@ where
 {
     inner: ManuallyDrop<MutexGuard<'a, Inner>>,
     ack_mode: AckMode,
-    send_buffer: &'a mut msg::send::Message,
     shared: &'a ArcShared<Sub>,
     sockets: &'a dyn socket::Application,
     initial_state: state::Receiver,
@@ -288,19 +285,20 @@ where
 
         match self.ack_mode {
             AckMode::Application => {
-                self.inner
-                    .fill_transmit_queue(self.shared, self.send_buffer);
+                // self.inner
+                //     .fill_transmit_queue(self.shared, self.send_buffer);
 
-                ensure!(!self.send_buffer.is_empty(), false);
+                // ensure!(!self.send_buffer.is_empty(), false);
 
-                let did_send = self
-                    .sockets
-                    .read_application()
-                    .try_send_buffer(self.send_buffer)
-                    .is_ok();
+                // let did_send = self
+                //     .sockets
+                //     .read_application()
+                //     .try_send_buffer(self.send_buffer)
+                //     .is_ok();
 
-                // clear out the sender buffer if we didn't already
-                let _ = self.send_buffer.drain();
+                // // clear out the sender buffer if we didn't already
+                // let _ = self.send_buffer.drain();
+                let did_send: bool = todo!();
 
                 // only wake the worker if we weren't able to transmit the ACK
                 !did_send
@@ -389,11 +387,8 @@ impl Inner {
     }
 
     #[inline]
-    pub fn fill_transmit_queue<Sub>(
-        &mut self,
-        shared: &ArcShared<Sub>,
-        send_buffer: &mut msg::send::Message,
-    ) where
+    pub fn fill_transmit_queue<Sub>(&mut self, shared: &ArcShared<Sub>, pool: &Pool)
+    where
         Sub: event::Subscriber,
     {
         let stream_id = shared.stream_id();
@@ -407,15 +402,16 @@ impl Inner {
             shared.credentials(),
             stream_id,
             source_queue_id,
-            send_buffer,
+            pool,
             &shared.clock,
             &shared.publisher(),
         );
 
-        ensure!(!send_buffer.is_empty());
+        // ensure!(!send_buffer.is_empty());
 
         // Update the remote address with the latest value
-        send_buffer.set_remote_address(shared.remote_addr());
+        // send_buffer.set_remote_address(shared.remote_addr());
+        todo!()
     }
 
     #[inline]

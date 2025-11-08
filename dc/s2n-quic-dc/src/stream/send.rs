@@ -2,7 +2,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
 pub mod application;
-pub mod buffer;
 mod error;
 pub mod filter;
 pub mod flow;

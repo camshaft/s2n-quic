@@ -12,12 +12,14 @@ mod send_only;
 #[cfg(feature = "tokio")]
 mod tokio;
 mod tracing;
+mod wheel;
 
 pub use self::tracing::Tracing;
 pub use crate::socket::*;
 pub use application::Application;
 pub use handle::{Ext, Flags, Socket};
 pub use send_only::SendOnly;
+pub use wheel::Wheel;
 
 pub type ArcApplication = std::sync::Arc<dyn Application>;
 

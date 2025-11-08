@@ -45,7 +45,7 @@ where
             Some(Timer::new(&shared.clock))
         };
         let gso = shared.gso.clone();
-        let send_buffer = msg::send::Message::new(remote_addr, gso);
+        // let send_buffer = msg::send::Message::new(remote_addr, gso);
         // If the transport is reliable then it's handling ACKs. Otherwise, the application is sending
         // ACKs so we want to do a little more compute per `read` call, if the application buffer allows
         // for it.
@@ -68,7 +68,6 @@ where
         Reader(ManuallyDrop::new(Box::new(Inner {
             shared,
             sockets,
-            send_buffer,
             read_mode,
             ack_mode,
             timer,

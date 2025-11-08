@@ -2,11 +2,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
+    socket::pool::{descriptor, Pool},
     stream::{
         packet_number,
         send::{
-            application::transmission, buffer, error::Error, flow, path, queue::Queue,
-            state::Transmission,
+            application::transmission, error::Error, flow, path, queue::Queue, state::Transmission,
         },
         shared::ShutdownKind,
     },
@@ -18,6 +18,7 @@ use core::{
 };
 use crossbeam_queue::SegQueue;
 use s2n_quic_core::recovery::bandwidth::Bandwidth;
+use std::sync::Arc;
 use tracing::trace;
 
 #[derive(Debug)]
@@ -41,8 +42,8 @@ pub struct State {
     ///
     /// We use an unbounded sender since we already rely on flow control to apply backpressure
     worker_queue: SegQueue<Message>,
-    pub application_transmission_queue: transmission::Queue<buffer::Segment>,
-    pub segment_alloc: buffer::Allocator,
+    pub application_transmission_queue: transmission::Queue<Arc<descriptor::Filled>>,
+    pub segment_alloc: Pool,
 }
 
 impl fmt::Debug for State {
@@ -60,6 +61,7 @@ impl State {
     pub fn new(
         flow: flow::non_blocking::State,
         path: path::Info,
+        segment_alloc: Pool,
         bandwidth: Option<Bandwidth>,
     ) -> Self {
         let path = path::State::new(path);
@@ -73,7 +75,7 @@ impl State {
             worker_waker: Default::default(),
             worker_queue: Default::default(),
             application_transmission_queue: Default::default(),
-            segment_alloc: Default::default(),
+            segment_alloc,
         }
     }
 

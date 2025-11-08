@@ -3,13 +3,15 @@
 
 use crate::{
     msg::addr::Addr,
-    socket::recv::descriptor::{Descriptor, DescriptorInner, FreeList, Unfilled},
+    socket::pool::descriptor::{Descriptor, DescriptorInner, FreeList, Unfilled},
 };
 use std::{
     alloc::Layout,
     ptr::NonNull,
     sync::{Arc, Mutex},
 };
+
+pub mod descriptor;
 
 #[derive(Clone)]
 pub struct Pool {
@@ -28,7 +30,7 @@ impl Pool {
     #[inline]
     pub fn new(max_packet_size: u16, packet_count: usize) -> Self {
         let free = Free::new(packet_count);
-        let mut pool = Pool {
+        let pool = Pool {
             free,
             max_packet_size,
             packet_count,
@@ -43,7 +45,7 @@ impl Pool {
     }
 
     #[inline]
-    pub fn alloc_or_grow(&mut self) -> Unfilled {
+    pub fn alloc_or_grow(&self) -> Unfilled {
         loop {
             if let Some(descriptor) = self.free.alloc() {
                 return descriptor;
@@ -53,7 +55,7 @@ impl Pool {
     }
 
     #[inline(never)] // this should happen rarely
-    fn grow(&mut self) {
+    fn grow(&self) {
         let (region, layout) = Region::alloc(self.max_packet_size, self.packet_count);
 
         let ptr = region.ptr;
@@ -312,7 +314,7 @@ impl Drop for FreeInner {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{socket::recv::descriptor::Filled, testing::init_tracing};
+    use crate::{socket::pool::descriptor::Filled, testing::init_tracing};
     use bolero::{check, TypeGenerator};
     use std::{
         collections::{HashMap, VecDeque},
@@ -413,7 +415,7 @@ mod tests {
             let segment_count = segment_count as usize;
             let mut actual_segment_count = 0;
 
-            let res = unfilled.recv_with(|addr, cmsg, mut payload| {
+            let res = unfilled.fill_with(|addr, cmsg, mut payload| {
                 if port == 0 {
                     return Err(());
                 }
@@ -447,7 +449,7 @@ mod tests {
                     references.insert(*epoch, actual_segment_count);
                 }
 
-                for (idx, segment) in segments.enumerate() {
+                for (idx, segment) in segments.into_iter().enumerate() {
                     // we allow only one segment to be empty. this makes it easier to log when we get empty packets, which are unexpected
                     if segment.is_empty() {
                         assert_eq!(actual_segment_count, 0);

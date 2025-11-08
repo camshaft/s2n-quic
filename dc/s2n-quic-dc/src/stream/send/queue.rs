@@ -4,10 +4,10 @@
 use crate::{
     event::{self, ConnectionPublisher},
     msg::{addr, segment},
+    socket::pool::{descriptor, Pool},
     stream::{
         send::{
             application::{self, transmission},
-            buffer,
             state::Transmission,
         },
         shared,
@@ -26,14 +26,14 @@ use std::{collections::VecDeque, io};
 #[derive(Debug)]
 pub struct Segment {
     ecn: ExplicitCongestionNotification,
-    buffer: buffer::Segment,
+    buffer: descriptor::Filled,
     offset: u16,
 }
 
 impl Segment {
     #[inline]
     fn as_slice(&self) -> &[u8] {
-        &self.buffer[self.offset as usize..]
+        &self.buffer.payload()[self.offset as usize..]
     }
 }
 
@@ -41,7 +41,7 @@ pub struct Message<'a> {
     batch: &'a mut Option<Vec<Transmission>>,
     queue: &'a mut Queue,
     max_segments: usize,
-    segment_alloc: &'a buffer::Allocator,
+    segment_alloc: &'a Pool,
 }
 
 impl application::state::Message for Message<'_> {
@@ -56,43 +56,47 @@ impl application::state::Message for Message<'_> {
         buffer_len: usize,
         p: P,
     ) -> Option<usize> {
-        let (mut buffer, buf_source) = self.segment_alloc.alloc(buffer_len);
+        // let buffer = self.segment_alloc.alloc()?;
+        let buffer = todo!();
+        let ecn = todo!();
 
-        let transmission = {
-            let buffer = buffer.make_mut();
+        // let transmission = {
+        //     todo!()
+        //     // let buffer = buffer.make_mut();
 
-            debug_assert!(buffer.capacity() >= buffer_len);
+        //     // debug_assert!(buffer.capacity() >= buffer_len);
 
-            let slice = UninitSlice::uninit(buffer.spare_capacity_mut());
+        //     // let slice = UninitSlice::uninit(buffer.spare_capacity_mut());
 
-            let transmission = p(slice);
+        //     // let transmission = p(slice);
 
-            unsafe {
-                let packet_len = transmission.info.packet_len;
-                assume!(buffer.capacity() >= packet_len as usize);
-                buffer.set_len(packet_len as usize);
-            }
+        //     // unsafe {
+        //     //     let packet_len = transmission.info.packet_len;
+        //     //     assume!(buffer.capacity() >= packet_len as usize);
+        //     //     buffer.set_len(packet_len as usize);
+        //     // }
 
-            transmission
-        };
+        //     // transmission
+        // };
 
-        let transmission::Event {
-            packet_number,
-            info,
-            has_more_app_data,
-        } = transmission;
+        // let transmission::Event {
+        //     packet_number,
+        //     info,
+        //     has_more_app_data,
+        // } = transmission;
 
-        let ecn = info.ecn;
+        // let ecn = info.ecn;
 
-        if let Some(batch) = self.batch.as_mut() {
-            let info = info.map(|_| buffer.clone());
+        // if let Some(batch) = self.batch.as_mut() {
+        //     // let info = info.map(|_| buffer.clone());
+        //     let info = todo!();
 
-            batch.push(transmission::Event {
-                packet_number,
-                info,
-                has_more_app_data,
-            });
-        }
+        //     batch.push(transmission::Event {
+        //         packet_number,
+        //         info,
+        //         has_more_app_data,
+        //     });
+        // }
 
         self.queue.segments.push_back(Segment {
             ecn,
@@ -100,10 +104,7 @@ impl application::state::Message for Message<'_> {
             offset: 0,
         });
 
-        match buf_source {
-            buffer::Source::Pool => None,
-            buffer::Source::Fresh => Some(buffer_len),
-        }
+        Some(buffer_len)
     }
 }
 
@@ -137,7 +138,7 @@ impl Queue {
         buf: &mut B,
         batch: &mut Option<Vec<Transmission>>,
         max_segments: usize,
-        segment_alloc: &buffer::Allocator,
+        segment_alloc: &Pool,
         push: F,
     ) -> Result<(), E>
     where
@@ -169,7 +170,6 @@ impl Queue {
         limit: usize,
         socket: &S,
         addr: &addr::Addr,
-        segment_alloc: &buffer::Allocator,
         gso: &Gso,
         clock: &C,
         subscriber: &shared::Subscriber<Sub>,
@@ -183,7 +183,6 @@ impl Queue {
             cx,
             socket,
             addr,
-            segment_alloc,
             gso,
             // cache the timestamps to avoid fetching too many
             &s2n_quic_core::time::clock::Cached::new(clock),
@@ -202,7 +201,6 @@ impl Queue {
         cx: &mut Context,
         socket: &S,
         addr: &addr::Addr,
-        segment_alloc: &buffer::Allocator,
         gso: &Gso,
         clock: &C,
         subscriber: &shared::Subscriber<Sub>,
@@ -224,17 +222,9 @@ impl Queue {
         };
 
         if socket.features().is_stream() {
-            self.poll_flush_segments_stream(cx, socket, addr, segment_alloc, clock, subscriber)
+            self.poll_flush_segments_stream(cx, socket, addr, clock, subscriber)
         } else {
-            self.poll_flush_segments_datagram(
-                cx,
-                socket,
-                addr,
-                segment_alloc,
-                gso,
-                clock,
-                subscriber,
-            )
+            self.poll_flush_segments_datagram(cx, socket, addr, gso, clock, subscriber)
         }
     }
 
@@ -244,7 +234,6 @@ impl Queue {
         cx: &mut Context,
         socket: &S,
         addr: &addr::Addr,
-        segment_alloc: &buffer::Allocator,
         clock: &C,
         subscriber: &shared::Subscriber<Sub>,
     ) -> Poll<Result<(), io::Error>>
@@ -281,7 +270,7 @@ impl Queue {
                         },
                     );
 
-                    self.consume_segments(written_len, segment_alloc);
+                    self.consume_segments(written_len);
 
                     // keep trying to drain the buffer
                     continue;
@@ -314,7 +303,7 @@ impl Queue {
     }
 
     #[inline]
-    fn consume_segments(&mut self, consumed: usize, segment_alloc: &buffer::Allocator) {
+    fn consume_segments(&mut self, consumed: usize) {
         ensure!(consumed > 0);
 
         let mut remaining = consumed;
@@ -322,9 +311,6 @@ impl Queue {
         while let Some(mut segment) = self.segments.pop_front() {
             if let Some(r) = remaining.checked_sub(segment.as_slice().len()) {
                 remaining = r;
-
-                // try to reuse the buffer for future allocations
-                segment_alloc.free(segment.buffer);
 
                 // if we don't have any remaining bytes to pop then we're done
                 ensure!(remaining > 0, break);
@@ -352,7 +338,6 @@ impl Queue {
         cx: &mut Context,
         socket: &S,
         addr: &addr::Addr,
-        segment_alloc: &buffer::Allocator,
         gso: &Gso,
         clock: &C,
         subscriber: &shared::Subscriber<Sub>,
@@ -419,10 +404,7 @@ impl Queue {
             // consume the segments that we transmitted
             let segment_count = segments.len();
             drop(segments);
-            for segment in self.segments.drain(..segment_count) {
-                // try to reuse the buffer for future allocations
-                segment_alloc.free(segment.buffer);
-            }
+            drop(self.segments.drain(..segment_count));
 
             ready!(result)?;
         }
