@@ -51,7 +51,6 @@ where
 {
     shared: ArcShared<Sub>,
     sockets: socket::ArcApplication,
-    send_buffer: msg::send::Message,
     read_mode: ReadMode,
     ack_mode: AckMode,
     timer: Option<Timer>,
@@ -221,12 +220,9 @@ where
         let sockets = &self.sockets;
         let transport_features = sockets.features();
 
-        let mut reader = shared.receiver.application_guard(
-            self.ack_mode,
-            &mut self.send_buffer,
-            shared,
-            sockets,
-        )?;
+        let mut reader = shared
+            .receiver
+            .application_guard(self.ack_mode, shared, sockets)?;
         let reader = &mut *reader;
 
         loop {

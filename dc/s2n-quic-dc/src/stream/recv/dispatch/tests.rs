@@ -3,7 +3,7 @@
 
 use super::*;
 use crate::{
-    socket::recv,
+    socket::pool,
     stream::Actor,
     testing::{ext::*, sim},
 };
@@ -222,31 +222,32 @@ impl Oracle {
 
 #[derive(Clone)]
 struct Packets {
-    packets: recv::pool::Pool,
+    packets: pool::Pool,
     packet_id: u64,
 }
 
 impl Default for Packets {
     fn default() -> Self {
         Self {
-            packets: recv::pool::Pool::new(8, 8),
+            packets: pool::Pool::new(8, 8),
             packet_id: Default::default(),
         }
     }
 }
 
 impl Packets {
-    fn create(&mut self) -> (u64, recv::descriptor::Filled) {
+    fn create(&mut self) -> (u64, pool::descriptor::Filled) {
         let packet_id = self.packet_id;
         self.packet_id += 1;
         let unfilled = self.packets.alloc_or_grow();
         let packet = unfilled
-            .recv_with(|_addr, _cmsg, mut payload| {
+            .fill_with(|_addr, _cmsg, mut payload| {
                 let v = packet_id.to_be_bytes();
                 payload[..v.len()].copy_from_slice(&v);
                 <std::io::Result<_>>::Ok(v.len())
             })
             .unwrap()
+            .into_iter()
             .next()
             .unwrap();
         (packet_id, packet)

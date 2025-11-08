@@ -10,10 +10,11 @@ use crate::{
         stream::{self, decoder, encoder},
     },
     recovery,
+    socket::pool::{descriptor, Pool},
     stream::{
         processing,
         send::{
-            application, buffer,
+            application,
             error::{self, Error},
             filter::Filter,
             transmission::Type as TransmissionType,
@@ -43,7 +44,10 @@ use s2n_quic_core::{
     varint::VarInt,
 };
 use slotmap::SlotMap;
-use std::collections::{BinaryHeap, VecDeque};
+use std::{
+    collections::{BinaryHeap, VecDeque},
+    sync::Arc,
+};
 use tracing::{debug, trace};
 
 pub mod probe;
@@ -52,7 +56,9 @@ pub mod transmission;
 
 type PacketMap<Info> = s2n_quic_core::packet::number::Map<Info>;
 
-pub type Transmission = application::transmission::Event<buffer::Segment>;
+type Segment = Arc<descriptor::Filled>;
+
+pub type Transmission = application::transmission::Event<Segment>;
 
 slotmap::new_key_type! {
     pub struct BufferIndex;
@@ -60,7 +66,7 @@ slotmap::new_key_type! {
 
 #[derive(Clone, Debug)]
 pub enum TransmitIndex {
-    Stream(BufferIndex, buffer::Segment),
+    Stream(BufferIndex, Segment),
     Recovery(BufferIndex),
 }
 
@@ -116,11 +122,10 @@ impl ErrorState {
 pub struct State {
     pub rtt_estimator: RttEstimator,
     pub sent_stream_packets: PacketMap<SentStreamPacket>,
-    pub stream_packet_buffers: SlotMap<BufferIndex, buffer::Segment>,
+    pub stream_packet_buffers: SlotMap<BufferIndex, Segment>,
     pub max_stream_packet_number: VarInt,
     pub sent_recovery_packets: PacketMap<SentRecoveryPacket>,
-    pub recovery_packet_buffers: SlotMap<BufferIndex, Vec<u8>>,
-    pub free_packet_buffers: Vec<Vec<u8>>,
+    pub recovery_packet_buffers: SlotMap<BufferIndex, Segment>,
     pub recovery_packet_number: u64,
     pub last_sent_recovery_packet: Option<Timestamp>,
     pub transmit_queue: VecDeque<TransmitIndex>,
@@ -175,7 +180,6 @@ impl State {
             recovery_packet_buffers: Default::default(),
             recovery_packet_number: 0,
             last_sent_recovery_packet: None,
-            free_packet_buffers: Default::default(),
             transmit_queue: Default::default(),
             control_filter: Default::default(),
             ecn: ecn::Controller::default(),
@@ -256,8 +260,7 @@ impl State {
         packet: &mut packet::control::decoder::Packet,
         random: &mut dyn random::Generator,
         clock: &Clk,
-        transmission_queue: &application::transmission::Queue<buffer::Segment>,
-        segment_alloc: &buffer::Allocator,
+        transmission_queue: &application::transmission::Queue<Segment>,
         publisher: &Pub,
     ) -> Result<(), processing::Error>
     where
@@ -272,7 +275,6 @@ impl State {
             random,
             clock,
             transmission_queue,
-            segment_alloc,
             publisher,
         ) {
             Ok(None) => {}
@@ -295,8 +297,7 @@ impl State {
         packet: &mut packet::control::decoder::Packet,
         random: &mut dyn random::Generator,
         clock: &Clk,
-        transmission_queue: &application::transmission::Queue<buffer::Segment>,
-        segment_alloc: &buffer::Allocator,
+        transmission_queue: &application::transmission::Queue<Segment>,
         publisher: &Pub,
     ) -> Result<Option<processing::Error>, Error>
     where
@@ -366,7 +367,6 @@ impl State {
                             &mut newly_acked,
                             &mut max_acked_stream,
                             &mut max_acked_recovery,
-                            segment_alloc,
                             publisher,
                         )?;
                     } else {
@@ -377,7 +377,6 @@ impl State {
                             &mut newly_acked,
                             &mut max_acked_stream,
                             &mut max_acked_recovery,
-                            segment_alloc,
                             publisher,
                         )?;
                     }
@@ -468,7 +467,6 @@ impl State {
         newly_acked: &mut bool,
         max_acked_stream: &mut Option<VarInt>,
         max_acked_recovery: &mut Option<VarInt>,
-        segment_alloc: &buffer::Allocator,
         publisher: &Pub,
     ) -> Result<(), Error>
     where
@@ -508,10 +506,7 @@ impl State {
                         // free the retransmission segment
                         if let Some(segment) = packet.info.retransmission {
                             if let Some(segment) = self.stream_packet_buffers.remove(segment) {
-                                // push the segment so the application can reuse it
-                                if segment.capacity() >= self.max_sent_segment_size as usize {
-                                    segment_alloc.free(segment);
-                                }
+                                drop(segment)
                             }
                         }
 
@@ -885,7 +880,7 @@ impl State {
     #[inline]
     pub fn load_transmission_queue(
         &mut self,
-        queue: &application::transmission::Queue<buffer::Segment>,
+        queue: &application::transmission::Queue<Segment>,
     ) -> bool {
         let mut did_transmit_stream = false;
 
@@ -986,6 +981,7 @@ impl State {
         stream_id: &stream::Id,
         source_queue_id: Option<VarInt>,
         clock: &Clk,
+        pool: &Pool,
         publisher: &Pub,
     ) -> Result<(), Error>
     where
@@ -999,6 +995,7 @@ impl State {
             stream_id,
             source_queue_id,
             clock,
+            pool,
             publisher,
         ) {
             self.on_error(error, Location::Local, publisher);
@@ -1016,6 +1013,7 @@ impl State {
         stream_id: &stream::Id,
         source_queue_id: Option<VarInt>,
         clock: &Clk,
+        pool: &Pool,
         publisher: &Pub,
     ) -> Result<(), Error>
     where
@@ -1032,7 +1030,14 @@ impl State {
         }
 
         self.try_transmit_retransmissions(control_key, clock, publisher)?;
-        self.try_transmit_probe(control_key, credentials, stream_id, source_queue_id, clock)?;
+        self.try_transmit_probe(
+            control_key,
+            credentials,
+            stream_id,
+            source_queue_id,
+            pool,
+            clock,
+        )?;
 
         Ok(())
     }
@@ -1074,33 +1079,35 @@ impl State {
                     .expect("retransmission should be available");
                 continue;
             };
-            let buffer = segment.make_mut();
+            todo!();
+            // let buffer = segment.make_mut();
 
-            debug_assert!(!buffer.is_empty(), "empty retransmission buffer submitted");
+            // debug_assert!(!buffer.is_empty(), "empty retransmission buffer submitted");
 
             let packet_number =
                 VarInt::new(self.recovery_packet_number).expect("2^62 is a lot of packets");
             self.recovery_packet_number += 1;
 
-            {
-                let buffer = DecoderBufferMut::new(buffer);
-                match decoder::Packet::retransmit(
-                    buffer,
-                    stream::PacketSpace::Recovery,
-                    packet_number,
-                    control_key,
-                ) {
-                    Ok(info) => info,
-                    Err(err) => {
-                        // this shouldn't ever happen
-                        debug_assert!(false, "{err:?}");
-                        return Err(error::Kind::RetransmissionFailure.err());
-                    }
-                }
-            };
+            // {
+            //     let buffer = DecoderBufferMut::new(buffer);
+            //     match decoder::Packet::retransmit(
+            //         buffer,
+            //         stream::PacketSpace::Recovery,
+            //         packet_number,
+            //         control_key,
+            //     ) {
+            //         Ok(info) => info,
+            //         Err(err) => {
+            //             // this shouldn't ever happen
+            //             debug_assert!(false, "{err:?}");
+            //             return Err(error::Kind::RetransmissionFailure.err());
+            //         }
+            //     }
+            // };
 
             let time_sent = clock.get_time();
-            let packet_len = buffer.len() as u16;
+            // let packet_len = buffer.len() as u16;
+            let packet_len = 0;
 
             {
                 let info = self
@@ -1158,6 +1165,7 @@ impl State {
         credentials: &Credentials,
         stream_id: &stream::Id,
         source_queue_id: Option<VarInt>,
+        pool: &Pool,
         clock: &Clk,
     ) -> Result<(), Error>
     where
@@ -1171,7 +1179,10 @@ impl State {
                 VarInt::new(self.recovery_packet_number).expect("2^62 is a lot of packets");
             self.recovery_packet_number += 1;
 
-            let mut buffer = self.free_packet_buffers.pop().unwrap_or_default();
+            // ensure!(let Some(descriptor) = pool.alloc());
+
+            todo!();
+            let mut buffer = vec![];
 
             // resize the buffer to what we need
             {
@@ -1244,7 +1255,8 @@ impl State {
             let ecn = ExplicitCongestionNotification::Ect0;
 
             // enqueue the transmission
-            let buffer_index = self.recovery_packet_buffers.insert(buffer);
+            // let buffer_index = self.recovery_packet_buffers.insert(buffer);
+            let buffer_index = todo!();
             self.transmit_queue
                 .push_back(TransmitIndex::Recovery(buffer_index));
 
@@ -1278,8 +1290,8 @@ impl State {
 
         self.transmit_queue.iter().filter_map(move |index| {
             let buf = match index {
-                TransmitIndex::Stream(_index, segment) => segment.as_slice(),
-                TransmitIndex::Recovery(index) => recovery_packet_buffers.get(*index)?,
+                TransmitIndex::Stream(_index, segment) => segment.payload(),
+                TransmitIndex::Recovery(index) => recovery_packet_buffers.get(*index)?.payload(),
             };
 
             Some((ecn, buf))
@@ -1298,11 +1310,7 @@ impl State {
                 TransmitIndex::Recovery(index) => {
                     // make sure the packet wasn't freed between when we wanted to transmit and
                     // when we actually did
-                    let Some(mut buffer) = self.recovery_packet_buffers.remove(index) else {
-                        continue;
-                    };
-                    buffer.clear();
-                    self.free_packet_buffers.push(buffer);
+                    drop(self.recovery_packet_buffers.remove(index));
                 }
             };
         }
@@ -1342,14 +1350,8 @@ impl State {
         self.unacked_ranges.clear();
 
         self.transmit_queue.clear();
-        for buffer in self.stream_packet_buffers.drain() {
-            // TODO push buffer into free segment queue
-            let _ = buffer;
-        }
-        for (_idx, mut buffer) in self.recovery_packet_buffers.drain() {
-            buffer.clear();
-            self.free_packet_buffers.push(buffer);
-        }
+        self.stream_packet_buffers.clear();
+        self.recovery_packet_buffers.clear();
 
         self.invariants();
     }

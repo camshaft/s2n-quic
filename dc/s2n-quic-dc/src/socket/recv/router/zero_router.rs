@@ -5,7 +5,7 @@ use super::Router;
 use crate::{
     credentials::Credentials,
     packet::{self, stream},
-    socket::recv::descriptor,
+    socket::pool::descriptor,
 };
 use s2n_quic_core::{
     inet::{ExplicitCongestionNotification, SocketAddress},

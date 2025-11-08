@@ -4,7 +4,7 @@
 use crate::{
     packet::Packet,
     path::secret::Map,
-    socket::recv::descriptor,
+    socket::pool::descriptor,
     stream::{
         environment::{Environment, Peer, SetupResult, SocketSet},
         recv::{

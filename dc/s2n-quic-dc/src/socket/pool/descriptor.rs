@@ -1,11 +1,11 @@
 // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::msg::{addr::Addr, cmsg};
+use crate::msg::{self, addr::Addr, cmsg};
 use core::fmt;
 use s2n_quic_core::inet::ExplicitCongestionNotification;
 use std::{
-    io::IoSliceMut,
+    io::{IoSlice, IoSliceMut},
     marker::PhantomData,
     ptr::NonNull,
     sync::{
@@ -56,8 +56,7 @@ impl Descriptor {
 
     #[cfg(debug_assertions)]
     pub(super) fn as_usize(&self) -> usize {
-        // TODO use `.addr()` once MSRV is 1.84
-        self.ptr.as_ptr() as usize
+        self.ptr.addr().get()
     }
 
     #[inline]
@@ -245,7 +244,7 @@ impl Unfilled {
 
     /// Fills the packet with the given callback, if the callback is successful
     #[inline]
-    pub fn recv_with<F, E>(mut self, f: F) -> Result<Segments, (Self, E)>
+    pub fn fill_with<F, E>(mut self, f: F) -> Result<Segments, (Self, E)>
     where
         F: FnOnce(&mut Addr, &mut cmsg::Receiver, IoSliceMut) -> Result<usize, E>,
     {
@@ -277,7 +276,7 @@ impl Unfilled {
             desc.into_filled(len, cmsg.ecn())
         };
         let segments = Segments {
-            descriptor: Some(desc),
+            descriptor: desc,
             segment_len: cmsg.segment_len(),
         };
         Ok(segments)
@@ -450,16 +449,72 @@ impl Drop for Filled {
     }
 }
 
+pub struct Segments {
+    descriptor: Filled,
+    segment_len: u16,
+}
+
+impl Segments {
+    pub fn is_empty(&self) -> bool {
+        self.descriptor.len() == 0
+    }
+
+    pub fn total_payload_len(&self) -> u16 {
+        self.descriptor.len()
+    }
+
+    pub fn send_with<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(&Addr, ExplicitCongestionNotification, &[IoSlice]) -> R,
+    {
+        let addr = self.descriptor.remote_address();
+        let ecn = self.descriptor.ecn();
+        let payload = self.descriptor.payload();
+
+        let segment_len = if self.segment_len == 0 {
+            payload.len()
+        } else {
+            payload.len().min(self.segment_len as _)
+        };
+
+        debug_assert!(payload.len().div_ceil(segment_len) <= msg::segment::MAX_COUNT);
+
+        let mut segments = [IoSlice::new(&[]); msg::segment::MAX_COUNT];
+
+        let mut count = 0;
+        for (segment, ioslice) in payload.chunks(segment_len).zip(segments.iter_mut()) {
+            *ioslice = IoSlice::new(segment);
+            count += 1;
+        }
+
+        let segments = &segments[..count];
+        f(addr, ecn, segments)
+    }
+}
+
+impl IntoIterator for Segments {
+    type Item = Filled;
+    type IntoIter = SegmentsIter;
+
+    #[inline]
+    fn into_iter(self) -> Self::IntoIter {
+        SegmentsIter {
+            descriptor: Some(self.descriptor),
+            segment_len: self.segment_len,
+        }
+    }
+}
+
 /// An iterator over all of the filled segments in a packet
 ///
 /// This is used for when the socket interface allows for receiving multiple packets
 /// in a single syscall, e.g. GRO.
-pub struct Segments {
+pub struct SegmentsIter {
     descriptor: Option<Filled>,
     segment_len: u16,
 }
 
-impl Iterator for Segments {
+impl Iterator for SegmentsIter {
     type Item = Filled;
 
     #[inline]

@@ -2,9 +2,13 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::{Protocol, TransportFeatures};
-use crate::msg::{self, addr::Addr, cmsg};
+use crate::{
+    msg::{self, addr::Addr, cmsg},
+    socket::send,
+    stream::send::state::transmission::Info,
+};
 use core::task::{Context, Poll};
-use s2n_quic_core::inet::ExplicitCongestionNotification;
+use s2n_quic_core::{inet::ExplicitCongestionNotification, time::Timestamp};
 use std::{
     io::{self, IoSlice, IoSliceMut},
     net::SocketAddr,
@@ -12,6 +16,8 @@ use std::{
 };
 
 pub type Flags = libc::c_int;
+
+pub type Transmission = send::wheel::Entry<Info<()>>;
 
 pub trait Socket: 'static + Send + Sync {
     /// Returns the local address for the socket
@@ -58,8 +64,14 @@ pub trait Socket: 'static + Send + Sync {
     ) -> Poll<io::Result<usize>>;
 
     #[inline]
-    fn try_send_buffer(&self, msg: &mut msg::send::Message) -> io::Result<usize> {
-        msg.send_with(|addr, ecn, iov| self.try_send(addr, ecn, iov))
+    fn send_transmission(&self, msg: Transmission, time: Timestamp) {
+        let _ = time;
+        msg.descriptor.send_with(|addr, ecn, iov| {
+            let _ = self.try_send(addr, ecn, iov);
+        });
+        if let Some(completion) = msg.completion.upgrade() {
+            completion.push_back(msg);
+        }
     }
 
     /// Tries to send data on the socket, returning `Err(WouldBlock)` if none could be sent.
@@ -69,15 +81,6 @@ pub trait Socket: 'static + Send + Sync {
         ecn: ExplicitCongestionNotification,
         buffer: &[IoSlice],
     ) -> io::Result<usize>;
-
-    #[inline]
-    fn poll_send_buffer(
-        &self,
-        cx: &mut Context,
-        msg: &mut msg::send::Message,
-    ) -> Poll<io::Result<usize>> {
-        msg.poll_send_with(|addr, ecn, iov| self.poll_send(cx, addr, ecn, iov))
-    }
 
     /// Sends data on the socket
     fn poll_send(

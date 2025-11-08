@@ -5,7 +5,10 @@ use super::udp::{ApplicationSocket, RecvSocket, WorkerSocket};
 use crate::{
     credentials::Credentials,
     event,
-    socket::recv::{pool::Pool as Packets, router::Router, udp},
+    socket::{
+        pool::Pool as Packets,
+        recv::{router::Router, udp},
+    },
     stream::{
         environment::{bach::Environment, udp::Config},
         recv::dispatch::{Allocator as Queues, Control, Stream},

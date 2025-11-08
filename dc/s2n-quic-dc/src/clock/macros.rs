@@ -64,7 +64,11 @@ macro_rules! impl_clock {
                 let target = unsafe { target.as_duration() };
 
                 // floor the delay to milliseconds to reduce timer churn
-                let delay = Duration::from_millis(target.as_millis() as u64);
+                let delay = if target.as_millis() > 1 {
+                    Duration::from_millis(target.as_millis() as u64)
+                } else {
+                    target
+                };
 
                 let target = self.clock.0 + delay;
 

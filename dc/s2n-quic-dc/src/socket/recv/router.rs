@@ -5,7 +5,7 @@ use crate::{
     credentials::{self, Credentials},
     packet::{self, stream},
     path::secret,
-    socket::recv::descriptor,
+    socket::pool::descriptor,
 };
 use s2n_codec::DecoderBufferMut;
 use s2n_quic_core::{

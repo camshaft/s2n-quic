@@ -2,12 +2,12 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
-    allocator::Allocator,
     clock,
     credentials::Credentials,
     crypto::{self, UninitSlice},
     event,
     packet::{control, stream},
+    socket::pool::Pool,
     stream::{
         recv::{
             ack,
@@ -746,18 +746,17 @@ impl State {
     }
 
     #[inline]
-    pub fn on_transmit<K, A, Clk, Pub>(
+    pub fn on_transmit<K, Clk, Pub>(
         &mut self,
         key: &K,
         credentials: &Credentials,
         stream_id: stream::Id,
         source_queue_id: Option<VarInt>,
-        output: &mut A,
+        output: &Pool,
         clock: &Clk,
         publisher: &Pub,
     ) where
         K: crypto::seal::control::Stream,
-        A: Allocator,
         Clk: Clock + ?Sized,
         Pub: event::ConnectionPublisher,
     {
@@ -779,18 +778,17 @@ impl State {
     }
 
     #[inline]
-    fn on_transmit_ack<K, A, Clk, Pub>(
+    fn on_transmit_ack<K, Clk, Pub>(
         &mut self,
         key: &K,
         credentials: &Credentials,
         stream_id: stream::Id,
         source_queue_id: Option<VarInt>,
-        output: &mut A,
+        output: &Pool,
         clock: &Clk,
         publisher: &Pub,
     ) where
         K: crypto::seal::control::Stream,
-        A: Allocator,
         Clk: Clock + ?Sized,
         Pub: event::ConnectionPublisher,
     {
@@ -798,13 +796,14 @@ impl State {
 
         let mtu = self.mtu();
 
-        output.set_ecn(self.ecn());
+        // output.set_ecn(self.ecn());
 
         let packet_number = self.next_pn();
 
         ensure!(let Some(segment) = output.alloc());
 
-        let buffer = output.get_mut(&segment);
+        // let buffer = output.get_mut(&segment);
+        let buffer: &mut Vec<u8> = todo!();
         buffer.resize(mtu as _, 0);
 
         let encoder = EncoderBuffer::new(buffer);
@@ -845,7 +844,6 @@ impl State {
 
         match result {
             0 => {
-                output.free(segment);
                 return;
             }
             packet_len => {
@@ -875,34 +873,35 @@ impl State {
                     None
                 };
 
-                output.push(segment);
+                todo!();
+                // output.push(segment);
 
-                if let Some(buffer) = duplicate {
-                    loop {
-                        let Some(segment) = output.alloc() else {
-                            break;
-                        };
-                        let buf = output.get_mut(&segment);
-                        if intervals > duplicate_threshold {
-                            buf.extend_from_slice(&buffer);
-                            output.push(segment);
+                // if let Some(buffer) = duplicate {
+                //     loop {
+                //         let Some(segment) = output.alloc() else {
+                //             break;
+                //         };
+                //         let buf = output.get_mut(&segment);
+                //         if intervals > duplicate_threshold {
+                //             buf.extend_from_slice(&buffer);
+                //             output.push(segment);
 
-                            // exponentially increase the threshold
-                            duplicate_threshold *= 2;
+                //             // exponentially increase the threshold
+                //             duplicate_threshold *= 2;
 
-                            continue;
-                        } else {
-                            *buf = buffer;
-                            output.push(segment);
-                            break;
-                        }
-                    }
-                }
+                //             continue;
+                //         } else {
+                //             *buf = buffer;
+                //             output.push(segment);
+                //             break;
+                //         }
+                //     }
+                // }
             }
         }
 
         // make sure we sent a packet
-        ensure!(!output.is_empty());
+        // ensure!(!output.is_empty());
 
         publisher.on_stream_control_packet_transmitted(
             event::builder::StreamControlPacketTransmitted {
@@ -920,18 +919,17 @@ impl State {
     }
 
     #[inline]
-    fn on_transmit_error<K, A, Clk, Pub>(
+    fn on_transmit_error<K, Clk, Pub>(
         &mut self,
         control_key: &K,
         credentials: &Credentials,
         stream_id: stream::Id,
         source_queue_id: Option<VarInt>,
-        output: &mut A,
+        output: &Pool,
         _clock: &Clk,
         publisher: &Pub,
     ) where
         K: crypto::seal::control::Stream,
-        A: Allocator,
         Clk: Clock + ?Sized,
         Pub: event::ConnectionPublisher,
     {
@@ -944,13 +942,13 @@ impl State {
 
         let mtu = self.mtu() as usize;
 
-        output.set_ecn(self.ecn());
-
         let packet_number = self.next_pn();
 
-        ensure!(let Some(segment) = output.alloc());
+        ensure!(let Some(mut segment) = output.alloc());
 
-        let buffer = output.get_mut(&segment);
+        // segment.set_ecn(self.ecn());
+
+        let buffer: &mut Vec<u8> = todo!();
         buffer.resize(mtu, 0);
 
         let encoder = EncoderBuffer::new(buffer);
@@ -977,12 +975,11 @@ impl State {
 
         match result {
             0 => {
-                output.free(segment);
                 return;
             }
             packet_len => {
                 buffer.truncate(packet_len);
-                output.push(segment);
+                // output.push(segment);
             }
         }
 
