@@ -10,7 +10,7 @@ use crate::{
             self,
             application::{builder::TokioUdpSocket, Single},
             fd::udp::CachedAddr,
-            SendOnly, Socket as _, Tracing,
+            Socket as _, Tracing, Wheel,
         },
         TransportFeatures,
     },
@@ -22,9 +22,9 @@ use s2n_quic_core::{
 use std::{io, net::UdpSocket, sync::Arc};
 use tokio::io::unix::AsyncFd;
 
-pub(super) type RecvSocket = Arc<UdpSocket>;
-pub(super) type WorkerSocket = Arc<Tracing<SendOnly<CachedAddr<RecvSocket>>>>;
-pub(super) type ApplicationSocket = Arc<Single<Tracing<SendOnly<CachedAddr<RecvSocket>>>>>;
+pub(super) type ArcSocket = Arc<UdpSocket>;
+pub(super) type WorkerSendSocket = Arc<Tracing<Wheel>>;
+pub(super) type ApplicationSendSocket = Arc<Single<Tracing<Wheel>>>;
 type OwnedSocket = AsyncFd<Arc<CachedAddr<UdpSocket>>>;
 
 #[derive(Debug)]
@@ -126,8 +126,8 @@ impl<Sub> Peer<Environment<Sub>> for Pooled
 where
     Sub: event::Subscriber + Clone,
 {
-    type ReadWorkerSocket = WorkerSocket;
-    type WriteWorkerSocket = (WorkerSocket, buffer::Channel<Control>);
+    type ReadWorkerSocket = WorkerSendSocket;
+    type WriteWorkerSocket = (WorkerSendSocket, buffer::Channel<Control>);
 
     #[inline]
     fn features(&self) -> TransportFeatures {

@@ -16,6 +16,8 @@ use std::{
     time::Duration,
 };
 
+pub const DEFAULT_GRANULARITY_US: u64 = 8;
+
 pub type Entry<Info> = queue::Entry<Transmission<Info>>;
 
 pub struct Transmission<Info> {
@@ -25,7 +27,7 @@ pub struct Transmission<Info> {
     pub completion: Weak<Queue<Self>>,
 }
 
-pub struct Wheel<Info, const GRANULARITY_US: u64 = 8>(Arc<State<Info>>);
+pub struct Wheel<Info, const GRANULARITY_US: u64 = DEFAULT_GRANULARITY_US>(Arc<State<Info>>);
 
 impl<Info, const GRANULARITY_US: u64> Clone for Wheel<Info, GRANULARITY_US> {
     fn clone(&self) -> Self {
