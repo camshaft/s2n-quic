@@ -357,7 +357,7 @@ impl Client {
             Some({
                 let mut params = server.params();
                 params.remote_max_data =
-                    s2n_quic_core::varint::VarInt::from_u16(MAX_DATAGRAM_SIZE * 10);
+                    s2n_quic_core::varint::VarInt::from_u32(MAX_DATAGRAM_SIZE as u32 * 10);
                 params
             }),
         );
@@ -370,7 +370,8 @@ impl Client {
 
     fn params(&self) -> ApplicationParams {
         let mut params = dc::testing::TEST_APPLICATION_PARAMS;
-        params.remote_max_data = s2n_quic_core::varint::VarInt::from_u16(MAX_DATAGRAM_SIZE * 10);
+        params.remote_max_data =
+            s2n_quic_core::varint::VarInt::from_u32(MAX_DATAGRAM_SIZE as u32 * 10);
         params.max_datagram_size = self.mtu.unwrap_or(MAX_DATAGRAM_SIZE).into();
         params
     }
