@@ -1,6 +1,11 @@
 // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+/// Implements a clock with standard millisecond-floored timer behavior.
+///
+/// This macro provides the standard clock implementation that floors sleep
+/// durations to milliseconds to reduce timer churn. This is suitable for
+/// most use cases where millisecond precision is sufficient.
 macro_rules! impl_clock {
     () => {
         use super::SleepHandle;
@@ -112,6 +117,32 @@ macro_rules! impl_clock {
     };
 }
 
+/// Implements a clock with microsecond-accurate timer behavior.
+///
+/// This macro provides a clock implementation with microsecond-level precision
+/// for sleep operations. It uses a hybrid approach:
+///
+/// 1. For delays > 1ms: Uses the underlying timer (tokio::time::sleep) to sleep
+///    until 1ms before the target, then switches to a cooperative spin-loop for
+///    the final microsecond-level precision.
+///
+/// 2. For delays ≤ 1ms: Uses a cooperative spin-loop that repeatedly wakes and
+///    yields the task. This allows other tasks to run while maintaining microsecond
+///    precision.
+///
+/// ## Performance Considerations
+///
+/// The spin-loop approach for short delays will increase CPU usage and task wake
+/// frequency. This is a necessary trade-off for applications that require
+/// microsecond-accurate timing, such as the packet pacer in s2n-quic-dc.
+///
+/// ## State Machine
+///
+/// The Sleep future implements a state machine:
+/// - `Initial`: Determine whether to sleep or spin based on remaining time
+/// - `Sleeping`: Sleeping via tokio timer until 1ms before target
+/// - `Spinning`: Cooperative spin-loop checking time and yielding
+/// - `Done`: Target time reached
 macro_rules! impl_microsecond_clock {
     () => {
         use super::SleepHandle;
