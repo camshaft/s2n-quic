@@ -34,6 +34,10 @@ impl LeakyBucket {
     /// * `granularity_us` - Wheel granularity in microseconds (used as minimum leak interval)
     pub fn new(bytes_per_interval: u64, interval: Duration, granularity_us: u64) -> Self {
         let interval_us = interval.as_micros() as f64;
+        // Ensure we have a valid interval to prevent division by zero
+        assert!(interval_us > 0.0, "interval must be greater than zero");
+        assert!(granularity_us > 0, "granularity_us must be greater than zero");
+        
         let bytes_per_us = bytes_per_interval as f64 / interval_us;
         
         Self {
