@@ -251,6 +251,74 @@ impl State {
         send_quantum.try_into().unwrap_or(u8::MAX)
     }
 
+    /// Calculates the pacing interval for a packet based on CCA bandwidth
+    ///
+    /// This method computes how long to wait before sending the next packet
+    /// based on the current bandwidth estimate from the congestion controller.
+    /// The interval is calculated as: `interval = packet_size / bandwidth`
+    ///
+    /// # Arguments
+    /// * `packet_size` - The size of the packet to be sent in bytes
+    ///
+    /// # Returns
+    /// The pacing interval as a `Duration`. Returns a minimum interval of 1 microsecond
+    /// to prevent all packets from getting the same timestamp.
+    #[inline]
+    pub fn calculate_pacing_interval(&self, packet_size: u16) -> Duration {
+        const MIN_PACING_INTERVAL: Duration = Duration::from_micros(1);
+
+        let bandwidth = self.cca.bandwidth();
+        let packet_size_u64 = packet_size as u64;
+        
+        // Calculate interval: packet_size / bandwidth = Duration
+        // The Bandwidth type's Div implementation returns Duration
+        let interval = packet_size_u64 / bandwidth;
+        
+        // Ensure minimum pacing interval to prevent timestamp collisions
+        interval.max(MIN_PACING_INTERVAL)
+    }
+
+    /// Calculates the transmission timestamp for a packet based on CCA pacing
+    ///
+    /// This method computes when a packet should be transmitted by adding the
+    /// pacing interval to the current time. It also handles burst allowance by
+    /// spreading packets over the pacing interval.
+    ///
+    /// # Arguments
+    /// * `now` - The current timestamp
+    /// * `packet_size` - The size of the packet to be sent in bytes
+    /// * `burst_index` - The index of this packet within a burst (0 for first packet)
+    /// * `burst_size` - The total number of packets in the burst (1 if not bursting)
+    ///
+    /// # Returns
+    /// The timestamp when this packet should be transmitted
+    #[inline]
+    pub fn calculate_transmission_time(
+        &self,
+        now: Timestamp,
+        packet_size: u16,
+        burst_index: usize,
+        burst_size: usize,
+    ) -> Timestamp {
+        debug_assert!(burst_size > 0, "burst_size must be at least 1");
+        debug_assert!(burst_index < burst_size, "burst_index must be less than burst_size");
+
+        let interval = self.calculate_pacing_interval(packet_size);
+
+        if burst_index == 0 {
+            // First packet in burst can be sent immediately
+            now
+        } else {
+            // Spread subsequent packets over the pacing interval
+            // packet N gets: now + (interval * N / burst_size)
+            let delay_nanos = (interval.as_nanos() as u64)
+                .saturating_mul(burst_index as u64) / (burst_size as u64);
+            let delay = Duration::from_nanos(delay_nanos);
+            
+            now + delay
+        }
+    }
+
     /// Called by the worker when it receives a control packet from the peer
     #[inline]
     pub fn on_control_packet<C, Clk, Pub>(
@@ -1407,5 +1475,160 @@ impl timer::Provider for State {
         self.pto.timers(query)?;
         self.idle_timer.timers(query)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use s2n_quic_core::time::testing::Clock as TestClock;
+    
+    /// Test helper to create a State instance for testing
+    fn create_test_state() -> State {
+        use s2n_quic_core::{connection, transport};
+        
+        let stream_limits = transport::parameters::InitialStreamLimits {
+            max_data_bidi_local: VarInt::from_u32(1_000_000),
+            max_data_bidi_remote: VarInt::from_u32(1_000_000),
+            max_data_uni: VarInt::ZERO,
+        };
+        
+        let initial_flow_control_limits = transport::parameters::InitialFlowControlLimits {
+            stream_limits,
+            max_data: VarInt::from_u32(1_000_000),
+            max_open_remote_bidirectional_streams: VarInt::ZERO,
+            max_open_remote_unidirectional_streams: VarInt::ZERO,
+        };
+        
+        let limits = connection::Limits::default();
+        let params = ApplicationParams::new(1200, &initial_flow_control_limits, &limits);
+        
+        let stream_id = stream::Id {
+            queue_id: VarInt::from_u32(1),
+            is_reliable: false,
+            is_bidirectional: true,
+        };
+        
+        State::new(stream_id, &params)
+    }
+
+    #[test]
+    fn test_calculate_pacing_interval() {
+        let state = create_test_state();
+        
+        // Test with a typical packet size
+        let packet_size = 1200u16;
+        let interval = state.calculate_pacing_interval(packet_size);
+        
+        // Interval should be at least the minimum (1 microsecond)
+        assert!(interval >= Duration::from_micros(1));
+        
+        // Interval should be reasonable (not infinite)
+        assert!(interval < Duration::from_secs(1));
+    }
+    
+    #[test]
+    fn test_calculate_pacing_interval_minimum() {
+        let state = create_test_state();
+        
+        // Even with zero packet size, should return minimum interval
+        let interval = state.calculate_pacing_interval(0);
+        assert!(interval >= Duration::from_micros(1));
+        
+        // Very small packet should also respect minimum
+        let interval = state.calculate_pacing_interval(1);
+        assert!(interval >= Duration::from_micros(1));
+    }
+
+    #[test]
+    fn test_calculate_transmission_time_single_packet() {
+        let state = create_test_state();
+        let clock = TestClock::default();
+        let now = clock.get_time();
+        let packet_size = 1200u16;
+        
+        // Single packet (burst_size = 1) should be sent immediately
+        let tx_time = state.calculate_transmission_time(now, packet_size, 0, 1);
+        assert_eq!(tx_time, now);
+    }
+
+    #[test]
+    fn test_calculate_transmission_time_burst_first_packet() {
+        let state = create_test_state();
+        let clock = TestClock::default();
+        let now = clock.get_time();
+        let packet_size = 1200u16;
+        
+        // First packet in burst (index 0) should be sent immediately
+        let tx_time = state.calculate_transmission_time(now, packet_size, 0, 10);
+        assert_eq!(tx_time, now);
+    }
+
+    #[test]
+    fn test_calculate_transmission_time_burst_spreading() {
+        let state = create_test_state();
+        let clock = TestClock::default();
+        let now = clock.get_time();
+        let packet_size = 1200u16;
+        let burst_size = 10;
+        
+        // Calculate timestamps for a burst of packets
+        let mut prev_time = now;
+        for burst_index in 0..burst_size {
+            let tx_time = state.calculate_transmission_time(
+                now, 
+                packet_size, 
+                burst_index, 
+                burst_size
+            );
+            
+            // Each packet should be scheduled at or after the previous one
+            assert!(tx_time >= prev_time, 
+                "Packet {} should be scheduled at or after packet {}", 
+                burst_index, 
+                burst_index.saturating_sub(1));
+            
+            prev_time = tx_time;
+        }
+        
+        // Last packet should be delayed from the first
+        let first_time = state.calculate_transmission_time(now, packet_size, 0, burst_size);
+        let last_time = state.calculate_transmission_time(now, packet_size, burst_size - 1, burst_size);
+        assert!(last_time > first_time, 
+            "Last packet in burst should be delayed from first packet");
+    }
+
+    #[test]
+    fn test_calculate_transmission_time_proportional_spreading() {
+        let state = create_test_state();
+        let clock = TestClock::default();
+        let now = clock.get_time();
+        let packet_size = 1200u16;
+        let burst_size = 4;
+        
+        // Calculate timestamps for a burst
+        let t0 = state.calculate_transmission_time(now, packet_size, 0, burst_size);
+        let t1 = state.calculate_transmission_time(now, packet_size, 1, burst_size);
+        let t2 = state.calculate_transmission_time(now, packet_size, 2, burst_size);
+        let t3 = state.calculate_transmission_time(now, packet_size, 3, burst_size);
+        
+        // First packet is immediate
+        assert_eq!(t0, now);
+        
+        // Verify proportional spacing
+        let interval = state.calculate_pacing_interval(packet_size);
+        let expected_delay_1 = Duration::from_nanos(
+            (interval.as_nanos() as u64 * 1) / burst_size as u64
+        );
+        let expected_delay_2 = Duration::from_nanos(
+            (interval.as_nanos() as u64 * 2) / burst_size as u64
+        );
+        let expected_delay_3 = Duration::from_nanos(
+            (interval.as_nanos() as u64 * 3) / burst_size as u64
+        );
+        
+        assert_eq!(t1, now + expected_delay_1);
+        assert_eq!(t2, now + expected_delay_2);
+        assert_eq!(t3, now + expected_delay_3);
     }
 }
