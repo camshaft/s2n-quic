@@ -263,6 +263,17 @@ impl State {
     /// # Returns
     /// The pacing interval as a `Duration`. Returns a minimum interval of 1 microsecond
     /// to prevent all packets from getting the same timestamp.
+    ///
+    /// # Example Usage
+    /// This method is designed to be called when creating wheel entries for packet
+    /// transmission. Once Work Item 3 (Replace Queue with Wheel-Based Transmission)
+    /// is complete, it will be used like:
+    ///
+    /// ```ignore
+    /// let packet_size = 1200;
+    /// let interval = state.calculate_pacing_interval(packet_size);
+    /// // Use interval to schedule the next transmission
+    /// ```
     #[inline]
     pub fn calculate_pacing_interval(&self, packet_size: u16) -> Duration {
         const MIN_PACING_INTERVAL: Duration = Duration::from_micros(1);
