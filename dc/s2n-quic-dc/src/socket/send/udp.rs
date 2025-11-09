@@ -50,6 +50,10 @@ impl<Info, const GRANULARITY_US: u64> WheelState<Info, GRANULARITY_US> {
 /// Index 0 is the highest priority and is processed first.
 /// The function drains each priority level in order, and if blocked by the token
 /// bucket, it restarts from the highest priority level after the bucket refills.
+///
+/// When all wheels are empty for several consecutive iterations, the function will
+/// spin down and park the task. It will be woken up when new entries are inserted
+/// into any wheel.
 pub async fn non_blocking<S: Socket, Clk: Clock, Info, const GRANULARITY_US: u64>(
     socket: S,
     wheels: Vec<Wheel<Info, GRANULARITY_US>>,
@@ -68,8 +72,13 @@ pub async fn non_blocking<S: Socket, Clk: Clock, Info, const GRANULARITY_US: u64
         })
         .collect::<Vec<_>>();
 
+    // Number of consecutive empty iterations before spinning down
+    const SPIN_DOWN_THRESHOLD: usize = 5;
+    let mut empty_iterations = 0;
+
     'outer: loop {
         let mut target_timestamp = None;
+        let mut any_work_done = false;
 
         // Process each wheel in priority order (0 = highest priority)
         for (priority, wheel) in wheels.iter_mut().enumerate() {
@@ -80,6 +89,7 @@ pub async fn non_blocking<S: Socket, Clk: Clock, Info, const GRANULARITY_US: u64
 
                 // Process pending entry first if it exists
                 if let Some((entry, mut remaining_len)) = wheel.pending_entry.take() {
+                    any_work_done = true;
                     // Continue acquiring credits for partially transmitted entry
                     if acquire_tokens(
                         &mut token_bucket,
@@ -102,6 +112,7 @@ pub async fn non_blocking<S: Socket, Clk: Clock, Info, const GRANULARITY_US: u64
 
                 // Process all packets in the queue
                 while let Some(entry) = queue.pop_front() {
+                    any_work_done = true;
                     let mut remaining_len = entry.descriptor.total_payload_len() as u64;
                     if acquire_tokens(
                         &mut token_bucket,
@@ -136,8 +147,47 @@ pub async fn non_blocking<S: Socket, Clk: Clock, Info, const GRANULARITY_US: u64
             }
         }
 
+        // Check if all wheels are empty
+        let all_empty = wheels.iter().all(|w| w.queue.is_empty());
+        
+        if all_empty && !any_work_done {
+            empty_iterations += 1;
+            
+            // If we've had several empty iterations, spin down
+            if empty_iterations >= SPIN_DOWN_THRESHOLD {
+                // Store waker in all wheels so any insertion will wake us up
+                core::future::poll_fn(|cx| {
+                    for wheel in wheels.iter() {
+                        wheel.queue.store_waker(cx.waker().clone());
+                    }
+                    
+                    // Double-check that wheels are still empty after storing waker
+                    // to avoid race condition where insertion happened just before we parked
+                    if wheels.iter().all(|w| w.queue.is_empty()) {
+                        core::task::Poll::Pending
+                    } else {
+                        core::task::Poll::Ready(())
+                    }
+                }).await;
+                
+                // We've been woken up! Advance wheel start times to current time
+                for wheel in wheels.iter() {
+                    wheel.queue.advance_to(&clock);
+                }
+                
+                empty_iterations = 0;
+                continue 'outer;
+            }
+        } else {
+            empty_iterations = 0;
+        }
+
         // All priorities processed, sleep until next highest-priority expiration
-        timer.sleep(target_timestamp.unwrap()).await;
+        // If target_timestamp is None (all wheels were empty), we should have already
+        // handled that in the spin-down logic above or continue the loop
+        if let Some(target) = target_timestamp {
+            timer.sleep(target).await;
+        }
     }
 }
 
@@ -428,6 +478,73 @@ mod tests {
                         sleep.us().sleep().await;
                     }
                 }
+            }
+            .primary()
+            .group("sender")
+            .spawn();
+        });
+    }
+
+    #[test]
+    fn spin_down_and_wake() {
+        sim(|| {
+            async {
+                let socket = UdpSocket::bind("receiver:80").await.unwrap();
+
+                let mut buf = vec![0u8; u16::MAX as usize];
+
+                // Wait for packets to arrive after spin-down and wake
+                for idx in 0..2 {
+                    let (len, addr) = socket.recv_from(&mut buf).await.unwrap();
+                    info!(len, %addr, "recv after wake");
+                    let packet = &buf[..len];
+                    assert_eq!(packet.len(), (idx + 1) * 100);
+                }
+            }
+            .primary()
+            .group("receiver")
+            .spawn();
+
+            async {
+                let (wheel, pool, clock) = new(Duration::from_millis(100));
+
+                let peer_addr = bach::net::lookup_host("receiver:80")
+                    .await
+                    .unwrap()
+                    .next()
+                    .unwrap();
+
+                let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+                let token_bucket = token_bucket(10_000_000, 8.us(), 1);
+
+                // Clone wheel to insert packets later
+                let wheel_clone = wheel.clone();
+                let pool_clone = pool.clone();
+                let clock_clone = clock.clone();
+
+                // Spawn the sender with empty wheel - it should spin down
+                crate::testing::spawn(async move {
+                    non_blocking(socket, vec![wheel], clock, token_bucket).await;
+                });
+
+                // Give enough time for the sender to spin down (>= 5 iterations)
+                // Each iteration sleeps for the wheel horizon
+                info!("waiting for spin down");
+                (Duration::from_millis(100) * 10).sleep().await;
+
+                // Now insert packets - this should wake up the sender
+                info!("inserting packets after spin down");
+                let now = clock_clone.get_time();
+                wheel_clone.insert(
+                    Entry::new(create_transmission(&pool_clone, peer_addr, 100, 0)),
+                    now,
+                );
+                wheel_clone.insert(
+                    Entry::new(create_transmission(&pool_clone, peer_addr, 200, 0)),
+                    now + Duration::from_millis(10),
+                );
+
+                info!("packets inserted, sender should wake up");
             }
             .primary()
             .group("sender")

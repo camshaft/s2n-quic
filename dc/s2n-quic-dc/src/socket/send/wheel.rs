@@ -5,8 +5,8 @@ use crate::{
     socket::pool::descriptor,
     sync::intrusive_queue::{self as queue, Queue},
 };
-use core::fmt;
-use parking_lot::RwLock;
+use core::{fmt, task::Waker};
+use parking_lot::{Mutex, RwLock};
 use s2n_quic_core::time::Timestamp;
 use std::{
     sync::{
@@ -66,6 +66,7 @@ impl<Info, const GRANULARITY_US: u64> Wheel<Info, GRANULARITY_US> {
             len: AtomicUsize::new(0),
             mask,
             entries,
+            waker: Mutex::new(None),
         }))
     }
 
@@ -82,8 +83,16 @@ impl<Info, const GRANULARITY_US: u64> Wheel<Info, GRANULARITY_US> {
 
     pub fn insert(&self, entry: Entry<Info>, timestamp: Timestamp) -> Timestamp {
         let (index, abs_idx) = self.index(timestamp);
-        self.0.len.fetch_add(1, Ordering::Relaxed);
+        let prev_len = self.0.len.fetch_add(1, Ordering::Relaxed);
         self.0.entries[index].push_back(entry);
+        
+        // If we transitioned from empty to non-empty, wake the stored waker
+        if prev_len == 0 {
+            if let Some(waker) = self.0.waker.lock().take() {
+                waker.wake();
+            }
+        }
+        
         unsafe { Timestamp::from_duration(Duration::from_micros(abs_idx * GRANULARITY_US)) }
     }
 
@@ -111,6 +120,25 @@ impl<Info, const GRANULARITY_US: u64> Wheel<Info, GRANULARITY_US> {
         let micros = self.start_idx() * GRANULARITY_US;
         unsafe { Timestamp::from_duration(Duration::from_micros(micros)) }
     }
+    
+    /// Check if the wheel is empty
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+    
+    /// Store a waker to be notified when the wheel becomes non-empty
+    pub fn store_waker(&self, waker: Waker) {
+        *self.0.waker.lock() = Some(waker);
+    }
+    
+    /// Advance the wheel's start time to catch up to the current time
+    /// This should be called after waking up from a spin-down to avoid being too far behind
+    pub fn advance_to<Clk: s2n_quic_core::time::Clock>(&self, clock: &Clk) {
+        let current_time = unsafe { clock.get_time().as_duration().as_micros() as u64 };
+        let new_start_idx = current_time / GRANULARITY_US;
+        let mut lock = self.0.start_idx.write();
+        *lock = new_start_idx;
+    }
 
     fn start_idx(&self) -> u64 {
         *self.0.start_idx.read()
@@ -134,6 +162,8 @@ struct State<Info> {
     mask: u64,
     len: AtomicUsize,
     entries: Box<[Queue<Transmission<Info>>]>,
+    /// Waker to be notified when the wheel transitions from empty to non-empty
+    waker: Mutex<Option<Waker>>,
 }
 
 impl<Info> Wheel<Info> {}
