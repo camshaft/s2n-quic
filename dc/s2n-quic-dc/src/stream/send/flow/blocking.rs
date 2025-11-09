@@ -10,16 +10,25 @@ use crate::stream::{
     TransportFeatures,
 };
 use s2n_quic_core::{ensure, varint::VarInt};
-use std::sync::{Condvar, Mutex};
+use std::sync::{atomic::{AtomicUsize, Ordering}, Condvar, Mutex};
 
 pub struct State {
     state: Mutex<Inner>,
     notify: Condvar,
+    /// Number of transmissions currently in-flight at the socket layer
+    pending_transmissions: AtomicUsize,
+    /// Maximum number of transmissions that can be in-flight at the socket layer
+    max_in_flight_transmissions: usize,
 }
 
 impl State {
     #[inline]
     pub fn new(initial_flow_offset: VarInt) -> Self {
+        Self::with_max_transmissions(initial_flow_offset, 32)
+    }
+
+    #[inline]
+    pub fn with_max_transmissions(initial_flow_offset: VarInt, max_in_flight_transmissions: usize) -> Self {
         Self {
             state: Mutex::new(Inner {
                 stream_offset: VarInt::ZERO,
@@ -27,6 +36,8 @@ impl State {
                 is_finished: false,
             }),
             notify: Condvar::new(),
+            pending_transmissions: AtomicUsize::new(0),
+            max_in_flight_transmissions,
         }
     }
 }
@@ -66,6 +77,21 @@ impl State {
         Ok(())
     }
 
+    /// Increment the count of pending transmissions
+    #[inline]
+    pub fn on_transmit(&self, count: usize) {
+        self.pending_transmissions.fetch_add(count, Ordering::Release);
+    }
+
+    /// Decrement the count of pending transmissions and wake any waiting tasks
+    #[inline]
+    pub fn on_transmit_complete(&self, count: usize) {
+        let prev = self.pending_transmissions.fetch_sub(count, Ordering::Release);
+        debug_assert!(prev >= count, "pending_transmissions underflow");
+        // Wake any tasks waiting for transmission capacity
+        self.notify.notify_all();
+    }
+
     /// Called by the application to acquire flow credits
     #[inline]
     pub fn acquire(
@@ -90,6 +116,16 @@ impl State {
                 current_offset <= flow_offset,
                 "current_offset={current_offset} should be <= flow_offset={flow_offset}"
             );
+
+            // Check if we have capacity for more in-flight transmissions
+            let pending = self.pending_transmissions.load(Ordering::Acquire);
+            if pending >= self.max_in_flight_transmissions {
+                guard = self
+                    .notify
+                    .wait(guard)
+                    .map_err(|_| error::Kind::FatalError.err())?;
+                continue;
+            }
 
             let Some(flow_credits) = flow_offset
                 .as_u64()

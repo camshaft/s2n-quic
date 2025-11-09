@@ -12,7 +12,7 @@ use crate::stream::{
 use atomic_waker::AtomicWaker;
 use core::{
     fmt,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::atomic::{AtomicU64, AtomicUsize, Ordering},
     task::{Context, Poll},
 };
 use s2n_quic_core::{ensure, varint::VarInt};
@@ -30,6 +30,10 @@ pub struct State {
     /// Notifies an application of newly-available flow credits
     poll_waker: AtomicWaker,
     stream_error: OnceLock<Error>,
+    /// Number of transmissions currently in-flight at the socket layer
+    pending_transmissions: AtomicUsize,
+    /// Maximum number of transmissions that can be in-flight at the socket layer
+    max_in_flight_transmissions: usize,
     // TODO add a list for the `acquire` future wakers
 }
 
@@ -38,6 +42,8 @@ impl fmt::Debug for State {
         f.debug_struct("flow::non_blocking::State")
             .field("stream_offset", &self.stream_offset.load(Ordering::Relaxed))
             .field("flow_offset", &self.flow_offset.load(Ordering::Relaxed))
+            .field("pending_transmissions", &self.pending_transmissions.load(Ordering::Relaxed))
+            .field("max_in_flight_transmissions", &self.max_in_flight_transmissions)
             .finish()
     }
 }
@@ -45,11 +51,18 @@ impl fmt::Debug for State {
 impl State {
     #[inline]
     pub fn new(initial_flow_offset: VarInt) -> Self {
+        Self::with_max_transmissions(initial_flow_offset, 32)
+    }
+
+    #[inline]
+    pub fn with_max_transmissions(initial_flow_offset: VarInt, max_in_flight_transmissions: usize) -> Self {
         Self {
             stream_offset: AtomicU64::new(0),
             flow_offset: AtomicU64::new(initial_flow_offset.as_u64()),
             poll_waker: AtomicWaker::new(),
             stream_error: OnceLock::new(),
+            pending_transmissions: AtomicUsize::new(0),
+            max_in_flight_transmissions,
         }
     }
 }
@@ -94,6 +107,21 @@ impl State {
     pub fn set_error(&self, error: Error) {
         let _ = self.stream_error.set(error);
         self.stream_offset.fetch_or(ERROR_MASK, Ordering::Relaxed);
+        self.poll_waker.wake();
+    }
+
+    /// Increment the count of pending transmissions
+    #[inline]
+    pub fn on_transmit(&self, count: usize) {
+        self.pending_transmissions.fetch_add(count, Ordering::Release);
+    }
+
+    /// Decrement the count of pending transmissions and wake any waiting tasks
+    #[inline]
+    pub fn on_transmit_complete(&self, count: usize) {
+        let prev = self.pending_transmissions.fetch_sub(count, Ordering::Release);
+        debug_assert!(prev >= count, "pending_transmissions underflow");
+        // Wake any tasks waiting for transmission capacity
         self.poll_waker.wake();
     }
 
@@ -145,6 +173,20 @@ impl State {
 
                 continue;
             };
+
+            // Check if we have capacity for more in-flight transmissions
+            let pending = self.pending_transmissions.load(Ordering::Acquire);
+            if pending >= self.max_in_flight_transmissions {
+                // if we already stored a waker and still can't transmit then yield the task
+                ensure!(!stored_waker, Poll::Pending);
+                stored_waker = true;
+
+                self.poll_waker.register(cx.waker());
+
+                // retry once before going to sleep in case transmissions completed
+                current_offset = self.acquire_offset(&request)?;
+                continue;
+            }
 
             if !features.is_flow_controlled() {
                 // clamp the request to the flow credits we have
