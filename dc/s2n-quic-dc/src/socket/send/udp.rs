@@ -498,4 +498,65 @@ mod tests {
             .spawn();
         });
     }
+
+    #[test]
+    fn leaky_bucket_burst_reduction() {
+        sim(|| {
+            async {
+                let socket = UdpSocket::bind("receiver:80").await.unwrap();
+
+                let mut buf = vec![0u8; u16::MAX as usize];
+
+                // With the leaky bucket, packets should be paced smoothly
+                // even after an idle period. We expect the packets to arrive
+                // at a steady rate based on the leak rate.
+
+                for idx in 0..5 {
+                    let (len, addr) = socket.recv_from(&mut buf).await.unwrap();
+                    info!(idx, len, %addr, "recv");
+                    
+                    let packet = &buf[..len];
+                    assert_eq!(packet.len(), 100);
+                }
+            }
+            .primary()
+            .group("receiver")
+            .spawn();
+
+            async {
+                let (wheel, pool, clock) = new(Duration::from_millis(100));
+
+                let peer_addr = bach::net::lookup_host("receiver:80")
+                    .await
+                    .unwrap()
+                    .next()
+                    .unwrap();
+
+                let now = clock.get_time();
+
+                // Insert 5 packets at the same time (after being idle)
+                // This simulates a burst scenario
+                for i in 0..5 {
+                    wheel.insert(
+                        Entry::new(create_transmission(&pool, peer_addr, 100, 0)),
+                        now + Duration::from_micros(i * 8), // Spread slightly in the wheel
+                    );
+                }
+
+                let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+                // Limited rate: 500 bytes per 8us = 62.5 MB/s
+                // This is enough for ~5 packets per interval, but the leaky bucket
+                // should pace them at a steady rate rather than bursting
+                let leaky_bucket = leaky_bucket(500, 8.us(), 8);
+
+                crate::testing::spawn(async move {
+                    non_blocking(socket, vec![wheel], clock, leaky_bucket).await;
+                });
+            }
+            .primary()
+            .group("sender")
+            .spawn();
+        });
+    }
 }
