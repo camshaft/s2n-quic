@@ -81,6 +81,14 @@ impl<Info, const GRANULARITY_US: u64> Wheel<Info, GRANULARITY_US> {
         Duration::from_micros(self.0.mask * GRANULARITY_US)
     }
 
+    /// Insert an entry into the wheel at the specified timestamp
+    ///
+    /// If the wheel transitions from empty to non-empty (i.e., this is the first
+    /// entry after being empty), any stored waker will be notified. This allows
+    /// a spin-down sender task to wake up and resume processing.
+    ///
+    /// Returns the actual timestamp the entry was scheduled for (may be clamped
+    /// to the wheel's valid range).
     pub fn insert(&self, entry: Entry<Info>, timestamp: Timestamp) -> Timestamp {
         let (index, abs_idx) = self.index(timestamp);
         let prev_len = self.0.len.fetch_add(1, Ordering::Relaxed);

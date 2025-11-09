@@ -1,6 +1,24 @@
 // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+//! UDP socket sender with priority-based timing wheels and spin-down support
+//!
+//! This module provides a non-blocking UDP sender that uses timing wheels for
+//! packet scheduling with multiple priority levels. The sender implements a
+//! spin-down mechanism to reduce CPU usage when no packets are being sent.
+//!
+//! ## Spin-down Behavior
+//!
+//! When all wheels are empty for several consecutive iterations (threshold: 5),
+//! the sender will:
+//! 1. Store a waker in each wheel
+//! 2. Park the task to avoid busy-waiting
+//! 3. Wake up automatically when any packet is inserted via `Wheel::insert()`
+//! 4. Advance wheel start times to the current clock time to avoid lag
+//!
+//! This allows the sender to be efficient when idle while remaining responsive
+//! to new packet insertions.
+
 use crate::{
     clock::{Clock, Timer},
     intrusive_queue::Queue,
