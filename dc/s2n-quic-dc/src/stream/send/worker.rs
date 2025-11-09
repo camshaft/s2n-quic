@@ -95,6 +95,8 @@ struct Snapshot {
     timeout: Option<Timestamp>,
     bandwidth: Bandwidth,
     error: Option<ErrorState>,
+    // TODO: Add pending_transmissions: usize (work item 5)
+    // This will track how many transmissions are in-flight at the socket layer
 }
 
 impl Snapshot {
@@ -111,6 +113,10 @@ impl Snapshot {
             // more flow credits
             shared.sender.flow.release_max(self.flow_offset);
         }
+
+        // TODO: Process pending_transmissions changes (work item 5)
+        // When transmissions complete (via poll_completions), decrement the counter
+        // and wake any tasks waiting for flow credits if we're below the limit
 
         if initial.send_quantum != self.send_quantum {
             let send_quantum = (self.send_quantum as u64).div_ceil(self.max_datagram_size as u64);
