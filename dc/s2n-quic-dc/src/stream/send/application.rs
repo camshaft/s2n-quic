@@ -6,7 +6,7 @@ use crate::{
     event::{self, ConnectionPublisher},
     msg,
     stream::{
-        pacer, runtime,
+        runtime,
         send::{flow, queue},
         shared::{ArcShared, ShutdownKind},
         socket,
@@ -38,7 +38,6 @@ where
     shared: ArcShared<Sub>,
     sockets: socket::ArcApplication,
     queue: queue::Queue,
-    pacer: pacer::Naive,
     status: Status,
     runtime: runtime::ArcHandle<Sub>,
 }
@@ -308,11 +307,6 @@ where
         cx: &mut Context,
         limit: usize,
     ) -> Poll<Result<usize, io::Error>> {
-        // if we're actually writing to the socket then we need to pace
-        if !self.queue.is_empty() {
-            ready!(self.pacer.poll_pacing(cx, &self.shared.clock));
-        }
-
         let len = ready!(self.queue.poll_flush(
             cx,
             limit,

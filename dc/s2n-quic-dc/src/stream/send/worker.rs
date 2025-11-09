@@ -7,7 +7,6 @@ use crate::{
     msg::{self, addr},
     packet::Packet,
     stream::{
-        pacer,
         recv::buffer::{self, Buffer},
         send::{
             error,
@@ -77,7 +76,6 @@ where
     state: waiting::State,
     timer: Timer,
     application_queue: Queue,
-    pacer: pacer::Naive,
     socket: S,
     handshake: handshake::State,
 }
@@ -183,7 +181,6 @@ where
             state,
             timer,
             application_queue: Default::default(),
-            pacer: Default::default(),
             socket,
             handshake,
         }
@@ -480,9 +477,6 @@ where
         let clock = &self.shared.clock;
 
         while !self.sender.transmit_queue.is_empty() {
-            // pace out retransmissions
-            ready!(self.pacer.poll_pacing(cx, &self.shared.clock));
-
             // construct all of the segments we're going to send in this batch
             let segments = msg::segment::Batch::new(
                 self.sender.transmit_queue_iter(clock).take(max_segments),
