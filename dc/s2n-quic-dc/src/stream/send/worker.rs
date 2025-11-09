@@ -264,6 +264,9 @@ where
         let _ = self.poll_messages(cx);
         let _ = self.poll_socket(cx);
 
+        // Process any completed transmissions to release flow credits
+        let _ = self.poll_completions(cx);
+
         let _ = self.poll_timers(cx);
         let _ = self.poll_transmit(cx);
         self.after_transmit();
@@ -385,6 +388,16 @@ where
     }
 
     #[inline]
+    fn poll_completions(&mut self, _cx: &mut Context) -> Poll<()> {
+        // TODO: Poll the completion queue once Work Item 2 is implemented
+        // For each completed transmission:
+        // - Process the Vec<Info> to update RTT estimates, loss detection, and recovery state
+        // - Decrement pending_transmissions by the number of packets in that transmission
+        // - Wake any tasks waiting for flow credits via self.shared.sender.flow.on_transmit_complete(count)
+        Poll::Ready(())
+    }
+
+    #[inline]
     fn poll_transmit(&mut self, cx: &mut Context) -> Poll<()> {
         loop {
             ready!(self.poll_transmit_flush(cx));
@@ -497,6 +510,10 @@ where
             let segment_count = segments.len();
             drop(segments);
             self.sender.on_transmit_queue(segment_count);
+            
+            // Notify the flow controller that we've sent transmissions
+            // This tracks in-flight transmissions for flow-based backpressure
+            self.shared.sender.flow.on_transmit(segment_count);
         }
 
         Poll::Ready(())
