@@ -10,16 +10,23 @@ use crate::stream::{
     TransportFeatures,
 };
 use s2n_quic_core::{ensure, varint::VarInt};
-use std::sync::{Condvar, Mutex};
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Condvar, Mutex,
+};
 
 pub struct State {
     state: Mutex<Inner>,
     notify: Condvar,
+    /// Maximum number of transmissions that can be in-flight at the socket layer
+    max_in_flight_transmissions: usize,
+    /// Current number of transmissions pending at the socket layer
+    pending_transmissions: AtomicUsize,
 }
 
 impl State {
     #[inline]
-    pub fn new(initial_flow_offset: VarInt) -> Self {
+    pub fn new(initial_flow_offset: VarInt, max_in_flight_transmissions: usize) -> Self {
         Self {
             state: Mutex::new(Inner {
                 stream_offset: VarInt::ZERO,
@@ -27,6 +34,8 @@ impl State {
                 is_finished: false,
             }),
             notify: Condvar::new(),
+            max_in_flight_transmissions,
+            pending_transmissions: AtomicUsize::new(0),
         }
     }
 }
@@ -66,6 +75,34 @@ impl State {
         Ok(())
     }
 
+    /// Called by the background worker to mark a transmission as completed
+    ///
+    /// This decrements the pending transmission counter and wakes waiting tasks
+    #[inline]
+    pub fn on_transmit_complete(&self, count: usize) {
+        let prev = self.pending_transmissions.fetch_sub(count, Ordering::Release);
+        debug_assert!(
+            prev >= count,
+            "cannot complete more transmissions than are pending"
+        );
+        // Wake any tasks waiting for transmission capacity
+        self.notify.notify_all();
+    }
+
+    /// Called when creating a new transmission to check if capacity is available
+    ///
+    /// Returns true if the transmission can be created
+    #[inline]
+    fn can_create_transmission(&self) -> bool {
+        self.pending_transmissions.load(Ordering::Acquire) < self.max_in_flight_transmissions
+    }
+
+    /// Called when a transmission is created to increment the pending count
+    #[inline]
+    pub fn on_transmit_created(&self, count: usize) {
+        self.pending_transmissions.fetch_add(count, Ordering::Release);
+    }
+
     /// Called by the application to acquire flow credits
     #[inline]
     pub fn acquire(
@@ -82,6 +119,15 @@ impl State {
             ensure!(!guard.is_finished, Err(error::Kind::FinalSizeChanged.err()));
 
             // TODO check for an error
+
+            // Check if we have transmission capacity available
+            if !self.can_create_transmission() {
+                guard = self
+                    .notify
+                    .wait(guard)
+                    .map_err(|_| error::Kind::FatalError.err())?;
+                continue;
+            }
 
             let current_offset = guard.stream_offset;
             let flow_offset = guard.flow_offset;
@@ -153,7 +199,8 @@ mod tests {
     fn concurrent_flow() {
         let mut initial_offset = VarInt::from_u8(255);
         let expected_len = VarInt::from_u16(u16::MAX);
-        let state = State::new(initial_offset);
+        let max_in_flight = 32; // Use a higher value for this test
+        let state = State::new(initial_offset, max_in_flight);
         let path_info = path::Info {
             max_datagram_size: 1500,
             send_quantum: 10,

@@ -12,7 +12,7 @@ use crate::stream::{
 use atomic_waker::AtomicWaker;
 use core::{
     fmt,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::atomic::{AtomicU64, AtomicUsize, Ordering},
     task::{Context, Poll},
 };
 use s2n_quic_core::{ensure, varint::VarInt};
@@ -30,6 +30,10 @@ pub struct State {
     /// Notifies an application of newly-available flow credits
     poll_waker: AtomicWaker,
     stream_error: OnceLock<Error>,
+    /// Maximum number of transmissions that can be in-flight at the socket layer
+    max_in_flight_transmissions: usize,
+    /// Current number of transmissions pending at the socket layer
+    pending_transmissions: AtomicUsize,
     // TODO add a list for the `acquire` future wakers
 }
 
@@ -44,12 +48,14 @@ impl fmt::Debug for State {
 
 impl State {
     #[inline]
-    pub fn new(initial_flow_offset: VarInt) -> Self {
+    pub fn new(initial_flow_offset: VarInt, max_in_flight_transmissions: usize) -> Self {
         Self {
             stream_offset: AtomicU64::new(0),
             flow_offset: AtomicU64::new(initial_flow_offset.as_u64()),
             poll_waker: AtomicWaker::new(),
             stream_error: OnceLock::new(),
+            max_in_flight_transmissions,
+            pending_transmissions: AtomicUsize::new(0),
         }
     }
 }
@@ -97,6 +103,34 @@ impl State {
         self.poll_waker.wake();
     }
 
+    /// Called by the background worker to mark a transmission as completed
+    ///
+    /// This decrements the pending transmission counter and wakes waiting tasks
+    #[inline]
+    pub fn on_transmit_complete(&self, count: usize) {
+        let prev = self.pending_transmissions.fetch_sub(count, Ordering::Release);
+        debug_assert!(
+            prev >= count,
+            "cannot complete more transmissions than are pending"
+        );
+        // Wake any tasks waiting for transmission capacity
+        self.poll_waker.wake();
+    }
+
+    /// Called when creating a new transmission to check if capacity is available
+    ///
+    /// Returns true if the transmission can be created
+    #[inline]
+    fn can_create_transmission(&self) -> bool {
+        self.pending_transmissions.load(Ordering::Acquire) < self.max_in_flight_transmissions
+    }
+
+    /// Called when a transmission is created to increment the pending count
+    #[inline]
+    pub fn on_transmit_created(&self, count: usize) {
+        self.pending_transmissions.fetch_add(count, Ordering::Release);
+    }
+
     /// Called by the application to acquire flow credits
     #[inline]
     pub async fn acquire(
@@ -120,6 +154,23 @@ impl State {
         let mut stored_waker = false;
 
         loop {
+            // Check if we have transmission capacity available
+            if !self.can_create_transmission() {
+                // if we already stored a waker and still don't have capacity, yield the task
+                ensure!(!stored_waker, Poll::Pending);
+                stored_waker = true;
+
+                self.poll_waker.register(cx.waker());
+
+                // check again before sleeping
+                if self.can_create_transmission() {
+                    stored_waker = false;
+                    // continue with the flow credit check
+                } else {
+                    continue;
+                }
+            }
+
             let flow_offset = self.flow_offset.load(Ordering::Acquire);
 
             let Some(flow_credits) = flow_offset
@@ -224,7 +275,8 @@ mod tests {
     async fn concurrent_flow() {
         let mut initial_offset = VarInt::from_u8(255);
         let expected_len = VarInt::from_u16(u16::MAX);
-        let state = Arc::new(State::new(initial_offset));
+        let max_in_flight = 32; // Use a higher value for this test
+        let state = Arc::new(State::new(initial_offset, max_in_flight));
         let path_info = path::Info {
             max_datagram_size: 1500,
             send_quantum: 10,
@@ -326,7 +378,8 @@ mod tests {
             .with_type::<(u8, u8, bool)>()
             .cloned()
             .for_each(|(initial_offset, len, is_fin)| {
-                let state = Arc::new(State::new(VarInt::from_u8(initial_offset)));
+                let max_in_flight = 16;
+                let state = Arc::new(State::new(VarInt::from_u8(initial_offset), max_in_flight));
 
                 state.set_error(Error::new(error::Kind::FatalError));
 

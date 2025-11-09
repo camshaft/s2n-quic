@@ -113,6 +113,7 @@ where
             write_worker,
             remote_addr,
             source_queue_id: None,
+            max_in_flight_transmissions: None, // Owned sockets don't use pooled configuration
         };
 
         Ok((socket, recv_buffer))
@@ -143,13 +144,15 @@ where
         let recv_pool = env.recv_pool.as_ref().expect("pool not configured");
         // the client doesn't need to associate credentials since it's already chosen a queue_id
         let credentials = None;
-        let (control, stream, application_socket, worker_socket) = recv_pool.alloc(credentials);
+        let (control, stream, application_socket, worker_socket, max_in_flight_transmissions) =
+            recv_pool.alloc(credentials);
         crate::stream::environment::udp::Pooled {
             peer_addr,
             control,
             stream,
             application_socket,
             worker_socket,
+            max_in_flight_transmissions,
         }
         .setup(env)
     }

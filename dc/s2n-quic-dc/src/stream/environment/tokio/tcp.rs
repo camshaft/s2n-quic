@@ -45,6 +45,7 @@ where
             write_worker: None,
             remote_addr,
             source_queue_id: None,
+            max_in_flight_transmissions: None, // TCP doesn't use this
         };
         Ok((socket, self.recv_buffer))
     }
@@ -82,6 +83,7 @@ where
             write_worker: None,
             remote_addr,
             source_queue_id: None,
+            max_in_flight_transmissions: None, // TCP doesn't use this
         };
         Ok((socket, self.recv_buffer))
     }

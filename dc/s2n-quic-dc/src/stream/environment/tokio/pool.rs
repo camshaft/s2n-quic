@@ -31,6 +31,7 @@ use tracing::Instrument;
 pub(super) struct Pool {
     sockets: Box<[PoolSocket]>,
     local_addr: SocketAddr,
+    config: Config,
 }
 
 struct PoolSocket {
@@ -187,13 +188,14 @@ impl Pool {
         Ok(Self {
             sockets: sockets.into(),
             local_addr,
+            config,
         })
     }
 
     pub fn alloc(
         &self,
         credentials: Option<&Credentials>,
-    ) -> (Control, Stream, ApplicationSendSocket, WorkerSendSocket) {
+    ) -> (Control, Stream, ApplicationSendSocket, WorkerSendSocket, usize) {
         // "Pick 2" worker selection
         let idx = self.pick_worker();
 
@@ -208,7 +210,9 @@ impl Pool {
         let worker_socket = socket.worker.clone();
         let app_socket = socket.application[priority].clone();
 
-        (control, stream, app_socket, worker_socket)
+        let max_in_flight = self.config.max_in_flight_transmissions;
+
+        (control, stream, app_socket, worker_socket, max_in_flight)
     }
 
     /// Implements "pick 2" load balancing: select two random workers and choose the one with lower queue length

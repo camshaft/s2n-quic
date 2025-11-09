@@ -123,6 +123,7 @@ pub struct SocketSet<R, W = R> {
     pub write_worker: Option<W>,
     pub remote_addr: SocketAddress,
     pub source_queue_id: Option<VarInt>,
+    pub max_in_flight_transmissions: Option<usize>,
 }
 
 type SetupResult<ReadWorker, WriteWorker> =

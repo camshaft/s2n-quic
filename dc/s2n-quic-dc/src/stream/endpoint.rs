@@ -219,7 +219,8 @@ where
                 (flow_offset, send_quantum, bandwidth)
             };
 
-        let flow = flow::non_blocking::State::new(flow_offset);
+        let max_in_flight_transmissions = sockets.max_in_flight_transmissions.unwrap_or(16);
+        let flow = flow::non_blocking::State::new(flow_offset, max_in_flight_transmissions);
 
         let path = send::path::Info {
             max_datagram_size: parameters.max_datagram_size(),

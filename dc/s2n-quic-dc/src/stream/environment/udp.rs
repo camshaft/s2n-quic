@@ -42,6 +42,11 @@ pub struct Config {
     pub send_wheel_horizon: Duration,
     pub max_bitrate_bps: u64,
     pub priority_levels: usize,
+    /// Maximum number of transmissions that can be in-flight at the socket layer.
+    /// This provides backpressure to prevent overwhelming the socket queue.
+    /// Smaller values: lower memory, faster congestion reaction, more blocking.
+    /// Larger values: higher throughput on high-BDP links, more memory, slower reaction.
+    pub max_in_flight_transmissions: usize,
 }
 
 impl Config {
@@ -71,6 +76,7 @@ impl Config {
             send_wheel_horizon: Duration::from_millis(100),
             max_bitrate_bps: 5_000_000_000, // 5 Gbps (EC2 per-flow limit)
             priority_levels: 2,             // 0 = control, 1+ = application
+            max_in_flight_transmissions: 16, // Default to 16 for typical internet connections
         }
     }
 
@@ -180,6 +186,7 @@ pub struct Pooled<S: socket::application::Application, W: socket::Socket> {
     pub stream: Stream,
     pub application_socket: Arc<S>,
     pub worker_socket: Arc<W>,
+    pub max_in_flight_transmissions: usize,
 }
 
 impl<E, S, W> Peer<E> for Pooled<S, W>
@@ -245,6 +252,7 @@ where
             write_worker,
             remote_addr,
             source_queue_id: Some(queue_id),
+            max_in_flight_transmissions: Some(self.max_in_flight_transmissions),
         };
 
         let recv_buffer = RecvBuffer::B(buffer::Channel::new(stream));
