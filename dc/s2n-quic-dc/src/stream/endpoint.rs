@@ -328,6 +328,8 @@ where
     if let Some((worker, socket)) = writer.1 {
         let (socket, recv_buffer) = socket.setup();
         let shared = shared.clone();
+        // TODO: Get pool from writer state or environment (work item 12)
+        let pool = todo!("pool should be passed from writer state");
 
         let task = async move {
             let mut writer = send::worker::Worker::new(
@@ -337,6 +339,7 @@ where
                 shared,
                 worker,
                 endpoint_type,
+                pool,
             );
 
             let mut prev_waker: Option<core::task::Waker> = None;

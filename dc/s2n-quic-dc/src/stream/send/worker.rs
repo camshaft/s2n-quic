@@ -6,6 +6,7 @@ use crate::{
     event,
     msg::{self, addr},
     packet::Packet,
+    socket::pool::Pool,
     stream::{
         pacer,
         recv::buffer::{self, Buffer},
@@ -80,6 +81,7 @@ where
     pacer: pacer::Naive,
     socket: S,
     handshake: handshake::State,
+    pool: Arc<Pool>,
 }
 
 #[derive(Debug)]
@@ -159,6 +161,7 @@ where
         shared: Arc<shared::Shared<Sub, C>>,
         mut sender: State,
         endpoint: endpoint::Type,
+        pool: Arc<Pool>,
     ) -> Self {
         let timer = Timer::new(&shared.clock);
         let state = Default::default();
@@ -186,6 +189,7 @@ where
             pacer: Default::default(),
             socket,
             handshake,
+            pool,
         }
     }
 
@@ -268,6 +272,7 @@ where
         let _ = self.poll_socket(cx);
 
         let _ = self.poll_timers(cx);
+        let _ = self.poll_completions(cx);
         let _ = self.poll_transmit(cx);
         self.after_transmit();
     }
@@ -388,6 +393,20 @@ where
     }
 
     #[inline]
+    fn poll_completions(&mut self, cx: &mut Context) -> Poll<()> {
+        let _ = cx;
+        // TODO: Process the stream's completion queue (work item 2)
+        // This will:
+        // 1. Poll the completion queue for finished transmissions
+        // 2. Extract the Vec<Info> from each completed transmission
+        // 3. Update RTT estimates based on transmission timing
+        // 4. Process ACK/loss information
+        // 5. Decrement pending_transmissions counter (work item 5)
+        // 6. Wake any tasks waiting for flow credits
+        Poll::Ready(())
+    }
+
+    #[inline]
     fn poll_transmit(&mut self, cx: &mut Context) -> Poll<()> {
         loop {
             ready!(self.poll_transmit_flush(cx));
@@ -403,29 +422,20 @@ where
                     let publisher = self.shared.publisher();
                     let stream_id = self.shared.stream_id();
                     let source_queue_id = self.shared.local_queue_id();
-                    let pool = todo!();
                     let _ = self.sender.fill_transmit_queue(
                         control_sealer,
                         self.shared.credentials(),
                         &stream_id,
                         source_queue_id,
                         &self.shared.clock,
-                        pool,
+                        &self.pool,
                         &publisher,
                     );
                 }
                 waiting::State::Detached => {
-                    // flush the remaining application queue
-                    let _ = ready!(self.application_queue.poll_flush(
-                        cx,
-                        usize::MAX,
-                        &self.socket,
-                        &addr::Addr::new(self.shared.remote_addr()),
-                        &self.shared.gso,
-                        &self.shared.clock,
-                        &self.shared.subscriber,
-                    ));
-
+                    // Note: Application queue flushing is removed per work item 6.
+                    // Applications now insert directly into the wheel.
+                    
                     // make sure we have the current view from the application
                     self.sender.load_transmission_queue(
                         &self.shared.sender.application_transmission_queue,
@@ -446,14 +456,13 @@ where
                     let publisher = self.shared.publisher();
                     let stream_id = self.shared.stream_id();
                     let source_queue_id = self.shared.local_queue_id();
-                    let pool = todo!();
                     let _ = self.sender.fill_transmit_queue(
                         control_sealer,
                         self.shared.credentials(),
                         &stream_id,
                         source_queue_id,
                         &self.shared.clock,
-                        pool,
+                        &self.pool,
                         &publisher,
                     );
 
@@ -473,6 +482,15 @@ where
     #[inline]
     fn poll_transmit_flush(&mut self, cx: &mut Context) -> Poll<()> {
         ensure!(!self.sender.transmit_queue.is_empty(), Poll::Ready(()));
+
+        // TODO: Replace with wheel entry creation (work item 6)
+        // Instead of calling poll_send on the socket, this should:
+        // 1. Convert transmit_queue items into wheel entries
+        // 2. Calculate pacing timestamp based on CCA bandwidth (work item 8)
+        // 3. Insert entries into the wheel
+        // 4. The socket worker will handle actual transmission
+        //
+        // Current implementation directly sends to socket (temporary):
 
         let mut max_segments = self.shared.gso.max_segments();
         let addr = self.shared.remote_addr();
