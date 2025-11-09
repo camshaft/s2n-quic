@@ -1029,7 +1029,7 @@ impl State {
             self.make_stream_packets_as_pto_probes();
         }
 
-        self.try_transmit_retransmissions(control_key, clock, publisher)?;
+        self.try_transmit_retransmissions(control_key, clock, pool, publisher)?;
         self.try_transmit_probe(
             control_key,
             credentials,
@@ -1047,6 +1047,7 @@ impl State {
         &mut self,
         control_key: &C,
         clock: &Clk,
+        pool: &Pool,
         publisher: &Pub,
     ) -> Result<(), Error>
     where
@@ -1071,7 +1072,7 @@ impl State {
                 );
             }
 
-            let Some(segment) = self.stream_packet_buffers.get_mut(retransmission.segment) else {
+            let Some(segment) = self.stream_packet_buffers.get(retransmission.segment) else {
                 // the segment was acknowledged by another packet so remove it
                 let _ = self
                     .retransmissions
@@ -1079,35 +1080,58 @@ impl State {
                     .expect("retransmission should be available");
                 continue;
             };
-            todo!();
-            // let buffer = segment.make_mut();
 
-            // debug_assert!(!buffer.is_empty(), "empty retransmission buffer submitted");
+            // Allocate a new descriptor from the pool for the retransmission
+            let original_payload = segment.payload();
+            let unfilled = pool.alloc_or_grow();
+            
+            // Fill the descriptor by copying the original segment's data
+            let new_segment = match unfilled.fill_with(|addr, _cmsg, mut iov| {
+                // Copy the address from the original segment
+                addr.set(segment.remote_address().get());
+                
+                // Copy the packet data
+                let len = original_payload.len();
+                iov[..len].copy_from_slice(original_payload);
+                
+                Ok(len)
+            }) {
+                Ok(segments) => {
+                    // Get the single filled descriptor from segments
+                    let mut iter = segments.into_iter();
+                    iter.next().expect("should have exactly one segment")
+                },
+                Err((_, err)) => return Err(err),
+            };
 
+            // Get mutable access to the new buffer to modify the packet number
+            let mut new_segment = new_segment;
+            let buffer = new_segment.payload_mut();
+            
             let packet_number =
                 VarInt::new(self.recovery_packet_number).expect("2^62 is a lot of packets");
             self.recovery_packet_number += 1;
 
-            // {
-            //     let buffer = DecoderBufferMut::new(buffer);
-            //     match decoder::Packet::retransmit(
-            //         buffer,
-            //         stream::PacketSpace::Recovery,
-            //         packet_number,
-            //         control_key,
-            //     ) {
-            //         Ok(info) => info,
-            //         Err(err) => {
-            //             // this shouldn't ever happen
-            //             debug_assert!(false, "{err:?}");
-            //             return Err(error::Kind::RetransmissionFailure.err());
-            //         }
-            //     }
-            // };
+            // Update the packet with the new packet number
+            {
+                let buffer = DecoderBufferMut::new(buffer);
+                match decoder::Packet::retransmit(
+                    buffer,
+                    stream::PacketSpace::Recovery,
+                    packet_number,
+                    control_key,
+                ) {
+                    Ok(_) => {},
+                    Err(err) => {
+                        // this shouldn't ever happen
+                        debug_assert!(false, "{err:?}");
+                        return Err(error::Kind::RetransmissionFailure.err());
+                    }
+                }
+            };
 
             let time_sent = clock.get_time();
-            // let packet_len = buffer.len() as u16;
-            let packet_len = 0;
+            let packet_len = new_segment.len();
 
             {
                 let info = self
@@ -1115,9 +1139,12 @@ impl State {
                     .pop()
                     .expect("retransmission should be available");
 
+                // Wrap the new segment in an Arc for storage
+                let new_segment_arc = Arc::new(new_segment);
+
                 // enqueue the transmission
                 self.transmit_queue
-                    .push_back(TransmitIndex::Stream(info.segment, segment.clone()));
+                    .push_back(TransmitIndex::Stream(info.segment, new_segment_arc));
 
                 let stream_offset = info.stream_offset;
                 let payload_len = info.payload_len;
@@ -1179,25 +1206,10 @@ impl State {
                 VarInt::new(self.recovery_packet_number).expect("2^62 is a lot of packets");
             self.recovery_packet_number += 1;
 
-            // ensure!(let Some(descriptor) = pool.alloc());
-
-            todo!();
-            let mut buffer = vec![];
-
-            // resize the buffer to what we need
-            {
-                let min_len = stream::encoder::MAX_RETRANSMISSION_HEADER_LEN + 128;
-
-                if buffer.capacity() < min_len {
-                    buffer.reserve(min_len - buffer.len());
-                }
-
-                unsafe {
-                    debug_assert!(buffer.capacity() >= min_len);
-                    buffer.set_len(min_len);
-                }
-            }
-
+            // Allocate a descriptor from the pool for the probe packet
+            let unfilled = pool.alloc_or_grow();
+            
+            // Prepare the probe payload metadata
             let offset = self.max_sent_offset;
             let final_offset = if self.state.is_data_sent() {
                 Some(offset)
@@ -1205,7 +1217,7 @@ impl State {
                 None
             };
 
-            let mut payload = probe::Probe {
+            let mut probe_payload = probe::Probe {
                 offset,
                 final_offset,
             };
@@ -1214,7 +1226,6 @@ impl State {
             let control_data = if let Some(error) = self.error.as_ref() {
                 if let Some(frame) = error.as_frame() {
                     control_data_len = VarInt::try_from(frame.encoding_size()).unwrap();
-
                     Some(frame)
                 } else {
                     None
@@ -1223,40 +1234,53 @@ impl State {
                 None
             };
 
-            let encoder = EncoderBuffer::new(&mut buffer);
-            let packet_len = encoder::probe(
-                encoder,
-                source_queue_id,
-                *stream_id,
-                packet_number,
-                self.next_expected_control_packet,
-                VarInt::ZERO,
-                &mut &[][..],
-                control_data_len,
-                &control_data,
-                &mut payload,
-                control_key,
-                credentials,
-            );
+            // Fill the descriptor with the probe packet
+            let probe_segment = match unfilled.fill_with(|addr, _cmsg, mut iov| {
+                // We don't set a specific address for probe packets; it will use the stream's destination
+                // The address will be set by the transmit queue when sending
+                *addr = Default::default();
+                
+                // Encode the probe packet into the descriptor buffer
+                let buffer_slice = &mut iov[..];
+                let encoder = EncoderBuffer::new(buffer_slice);
+                let packet_len = encoder::probe(
+                    encoder,
+                    source_queue_id,
+                    *stream_id,
+                    packet_number,
+                    self.next_expected_control_packet,
+                    VarInt::ZERO,
+                    &mut &[][..],
+                    control_data_len,
+                    &control_data,
+                    &mut probe_payload,
+                    control_key,
+                    credentials,
+                );
+                
+                Ok(packet_len)
+            }) {
+                Ok(segments) => {
+                    // Get the single filled descriptor from segments
+                    let mut iter = segments.into_iter();
+                    iter.next().expect("should have exactly one segment")
+                },
+                Err((_, err)) => return Err(err),
+            };
 
             let payload_len = 0;
             let included_fin = final_offset.is_some();
-            buffer.truncate(packet_len);
-
-            debug_assert!(
-                packet_len < u16::MAX as usize,
-                "cannot write larger packets than 2^16"
-            );
-            let packet_len = packet_len as u16;
+            let packet_len = probe_segment.len();
 
             let time_sent = clock.get_time();
 
             // TODO store this as part of the packet queue
             let ecn = ExplicitCongestionNotification::Ect0;
 
-            // enqueue the transmission
-            // let buffer_index = self.recovery_packet_buffers.insert(buffer);
-            let buffer_index = todo!();
+            // Wrap the probe segment in an Arc and store it in recovery_packet_buffers
+            let probe_segment_arc = Arc::new(probe_segment);
+            let buffer_index = self.recovery_packet_buffers.insert(probe_segment_arc.clone());
+            
             self.transmit_queue
                 .push_back(TransmitIndex::Recovery(buffer_index));
 
