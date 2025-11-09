@@ -149,10 +149,10 @@ pub async fn non_blocking<S: Socket, Clk: Clock, Info, const GRANULARITY_US: u64
 
         // Check if all wheels are empty
         let all_empty = wheels.iter().all(|w| w.queue.is_empty());
-        
+
         if all_empty && !any_work_done {
             empty_iterations += 1;
-            
+
             // If we've had several empty iterations, spin down
             if empty_iterations >= SPIN_DOWN_THRESHOLD {
                 // Store waker in all wheels so any insertion will wake us up
@@ -160,7 +160,7 @@ pub async fn non_blocking<S: Socket, Clk: Clock, Info, const GRANULARITY_US: u64
                     for wheel in wheels.iter() {
                         wheel.queue.store_waker(cx.waker().clone());
                     }
-                    
+
                     // Double-check that wheels are still empty after storing waker
                     // to avoid race condition where insertion happened just before we parked
                     if wheels.iter().all(|w| w.queue.is_empty()) {
@@ -168,23 +168,26 @@ pub async fn non_blocking<S: Socket, Clk: Clock, Info, const GRANULARITY_US: u64
                     } else {
                         core::task::Poll::Ready(())
                     }
-                }).await;
-                
+                })
+                .await;
+
                 // We've been woken up! Advance wheel start times to current time
                 for wheel in wheels.iter() {
                     wheel.queue.advance_to(&clock);
                 }
-                
+
                 empty_iterations = 0;
                 continue 'outer;
             }
+
+            // Not yet at spin-down threshold, just continue the loop
+            // to tick again and re-check
+            continue 'outer;
         } else {
             empty_iterations = 0;
         }
 
         // All priorities processed, sleep until next highest-priority expiration
-        // If target_timestamp is None (all wheels were empty), we should have already
-        // handled that in the spin-down logic above or continue the loop
         if let Some(target) = target_timestamp {
             timer.sleep(target).await;
         }

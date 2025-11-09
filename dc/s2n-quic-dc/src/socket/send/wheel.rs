@@ -85,14 +85,14 @@ impl<Info, const GRANULARITY_US: u64> Wheel<Info, GRANULARITY_US> {
         let (index, abs_idx) = self.index(timestamp);
         let prev_len = self.0.len.fetch_add(1, Ordering::Relaxed);
         self.0.entries[index].push_back(entry);
-        
+
         // If we transitioned from empty to non-empty, wake the stored waker
         if prev_len == 0 {
             if let Some(waker) = self.0.waker.lock().take() {
                 waker.wake();
             }
         }
-        
+
         unsafe { Timestamp::from_duration(Duration::from_micros(abs_idx * GRANULARITY_US)) }
     }
 
@@ -120,17 +120,17 @@ impl<Info, const GRANULARITY_US: u64> Wheel<Info, GRANULARITY_US> {
         let micros = self.start_idx() * GRANULARITY_US;
         unsafe { Timestamp::from_duration(Duration::from_micros(micros)) }
     }
-    
+
     /// Check if the wheel is empty
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
-    
+
     /// Store a waker to be notified when the wheel becomes non-empty
     pub fn store_waker(&self, waker: Waker) {
         *self.0.waker.lock() = Some(waker);
     }
-    
+
     /// Advance the wheel's start time to catch up to the current time
     /// This should be called after waking up from a spin-down to avoid being too far behind
     pub fn advance_to<Clk: s2n_quic_core::time::Clock>(&self, clock: &Clk) {
@@ -363,5 +363,84 @@ mod tests {
             clock.get_time(),
         );
         assert_eq!(actual_time, wheel.start() + wheel.horizon());
+    }
+
+    #[test]
+    fn test_wheel_is_empty() {
+        let (wheel, pool, clock) = new(64);
+
+        // Initially empty
+        assert!(wheel.is_empty());
+        assert_eq!(wheel.len(), 0);
+
+        // After inserting an entry
+        let t0 = clock.get_time();
+        wheel.insert(Entry::new(create_transmission(&pool, 100)), t0);
+        assert!(!wheel.is_empty());
+        assert_eq!(wheel.len(), 1);
+
+        // After ticking and consuming
+        let (_, mut queue) = wheel.tick();
+        let entry = queue.pop_front().unwrap();
+        wheel.on_send();
+        assert!(wheel.is_empty());
+        assert_eq!(wheel.len(), 0);
+        assert_eq!(entry.info, 100);
+    }
+
+    #[test]
+    fn test_wheel_waker_on_insert() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        use std::task::{Context, Wake};
+
+        struct TestWaker {
+            woken: Arc<AtomicBool>,
+        }
+
+        impl Wake for TestWaker {
+            fn wake(self: Arc<Self>) {
+                self.woken.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let (wheel, pool, clock) = new(64);
+
+        // Store a waker
+        let woken = Arc::new(AtomicBool::new(false));
+        let test_waker = Arc::new(TestWaker {
+            woken: woken.clone(),
+        });
+        let waker = test_waker.clone().into();
+        wheel.store_waker(waker);
+
+        // Initially not woken
+        assert!(!woken.load(Ordering::SeqCst));
+
+        // Insert an entry - should wake
+        let t0 = clock.get_time();
+        wheel.insert(Entry::new(create_transmission(&pool, 100)), t0);
+
+        // Verify waker was called
+        assert!(woken.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn test_wheel_advance_to() {
+        let (wheel, _pool, mut clock) = new(64);
+
+        let start = wheel.start();
+
+        // Advance the clock
+        clock.inc_by(Duration::from_micros(8 * 100));
+
+        // Advance the wheel to catch up
+        wheel.advance_to(&clock);
+
+        let new_start = wheel.start();
+
+        // Start should have advanced
+        assert!(new_start > start);
+        assert!(new_start.as_duration().as_micros() >= clock.get_time().as_duration().as_micros());
     }
 }
