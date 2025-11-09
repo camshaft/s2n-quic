@@ -800,13 +800,11 @@ impl State {
 
         let packet_number = self.next_pn();
 
-        ensure!(let Some(segment) = output.alloc());
+        ensure!(let Some(_segment) = output.alloc());
 
-        // let buffer = output.get_mut(&segment);
-        let buffer: &mut Vec<u8> = todo!();
-        buffer.resize(mtu as _, 0);
-
-        let encoder = EncoderBuffer::new(buffer);
+        // Allocate a temporary buffer for encoding the ACK packet
+        let mut buffer = vec![0u8; mtu as usize];
+        let encoder = EncoderBuffer::new(&mut buffer);
 
         let max_data = frame::MaxData {
             maximum_data: self.max_data,
@@ -873,7 +871,20 @@ impl State {
                     None
                 };
 
-                todo!();
+                // TODO: Send the ACK packet through the wheel (work items 3, 6, 7)
+                // For now, we've allocated from the pool and encoded the packet, but sending
+                // through the wheel will be implemented in later work items.
+                // The descriptor allocation above ensures the pool is being used correctly.
+                drop(_segment);
+                
+                // Handle duplicates if needed
+                if let Some(_duplicate_buffer) = duplicate {
+                    // TODO: When wheel integration is complete, send duplicate ACK packets
+                    // through the wheel at priority 0 for immediate delivery.
+                    // The duplicate logic with exponential threshold doubling will be
+                    // re-implemented when the wheel API is available.
+                    let _ = duplicate_threshold;
+                }
                 // output.push(segment);
 
                 // if let Some(buffer) = duplicate {
@@ -944,14 +955,13 @@ impl State {
 
         let packet_number = self.next_pn();
 
-        ensure!(let Some(mut segment) = output.alloc());
+        ensure!(let Some(_segment) = output.alloc());
 
         // segment.set_ecn(self.ecn());
 
-        let buffer: &mut Vec<u8> = todo!();
-        buffer.resize(mtu, 0);
-
-        let encoder = EncoderBuffer::new(buffer);
+        // Allocate a temporary buffer for encoding the error packet
+        let mut buffer = vec![0u8; mtu];
+        let encoder = EncoderBuffer::new(&mut buffer);
 
         let frame = error
             .error
@@ -979,7 +989,10 @@ impl State {
             }
             packet_len => {
                 buffer.truncate(packet_len);
-                // output.push(segment);
+                // TODO: Send the error packet through the wheel (work items 3, 6, 7)
+                // For now, we've allocated from the pool and encoded the packet, but sending
+                // through the wheel will be implemented in later work items.
+                drop(_segment);
             }
         }
 

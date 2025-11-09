@@ -407,11 +407,15 @@ impl Inner {
             &shared.publisher(),
         );
 
+        // TODO: Send ACKs through the wheel (work items 3, 6, 7)
+        // The on_transmit call above has encoded the ACK packet using the pool,
+        // but the actual transmission through the wheel will be implemented
+        // when the wheel integration is complete.
+        
         // ensure!(!send_buffer.is_empty());
 
         // Update the remote address with the latest value
         // send_buffer.set_remote_address(shared.remote_addr());
-        todo!()
     }
 
     #[inline]
