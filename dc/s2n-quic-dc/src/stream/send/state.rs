@@ -10,7 +10,10 @@ use crate::{
         stream::{self, decoder, encoder},
     },
     recovery,
-    socket::pool::{descriptor, Pool},
+    socket::{
+        pool::{descriptor, Pool},
+        send::wheel,
+    },
     stream::{
         processing,
         send::{
@@ -21,6 +24,7 @@ use crate::{
         },
         DEFAULT_IDLE_TIMEOUT,
     },
+    sync::intrusive_queue::Queue as IntrusiveQueue,
 };
 use core::{task::Poll, time::Duration};
 use s2n_codec::{DecoderBufferMut, EncoderBuffer, EncoderValue};
@@ -118,7 +122,6 @@ impl ErrorState {
     }
 }
 
-#[derive(Debug)]
 pub struct State {
     pub rtt_estimator: RttEstimator,
     pub sent_stream_packets: PacketMap<SentStreamPacket>,
@@ -148,6 +151,43 @@ pub struct State {
     pub max_datagram_size: u16,
     pub max_sent_segment_size: u16,
     pub is_reliable: bool,
+    pub completion_queue: Arc<IntrusiveQueue<wheel::Transmission<Vec<transmission::Info<descriptor::Filled>>>>>,
+}
+
+impl core::fmt::Debug for State {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("State")
+            .field("rtt_estimator", &self.rtt_estimator)
+            .field("sent_stream_packets", &self.sent_stream_packets)
+            .field("stream_packet_buffers", &self.stream_packet_buffers)
+            .field("max_stream_packet_number", &self.max_stream_packet_number)
+            .field("sent_recovery_packets", &self.sent_recovery_packets)
+            .field("recovery_packet_buffers", &self.recovery_packet_buffers)
+            .field("recovery_packet_number", &self.recovery_packet_number)
+            .field("last_sent_recovery_packet", &self.last_sent_recovery_packet)
+            .field("transmit_queue", &self.transmit_queue)
+            .field("state", &self.state)
+            .field("control_filter", &self.control_filter)
+            .field("retransmissions", &self.retransmissions)
+            .field("next_expected_control_packet", &self.next_expected_control_packet)
+            .field("cca", &self.cca)
+            .field("ecn", &self.ecn)
+            .field("pto", &self.pto)
+            .field("pto_backoff", &self.pto_backoff)
+            .field("idle_timer", &self.idle_timer)
+            .field("idle_timeout", &self.idle_timeout)
+            .field("error", &self.error)
+            .field("unacked_ranges", &self.unacked_ranges)
+            .field("max_sent_offset", &self.max_sent_offset)
+            .field("max_data", &self.max_data)
+            .field("local_max_data_window", &self.local_max_data_window)
+            .field("peer_activity", &self.peer_activity)
+            .field("max_datagram_size", &self.max_datagram_size)
+            .field("max_sent_segment_size", &self.max_sent_segment_size)
+            .field("is_reliable", &self.is_reliable)
+            .field("completion_queue", &"<completion_queue>")
+            .finish()
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -198,7 +238,14 @@ impl State {
             max_datagram_size,
             max_sent_segment_size: 0,
             is_reliable: stream_id.is_reliable,
+            completion_queue: Arc::new(IntrusiveQueue::new()),
         }
+    }
+
+    /// Returns a weak reference to the completion queue for attaching to transmissions
+    #[inline]
+    pub fn completion_queue_weak(&self) -> std::sync::Weak<IntrusiveQueue<wheel::Transmission<Vec<transmission::Info<descriptor::Filled>>>>> {
+        Arc::downgrade(&self.completion_queue)
     }
 
     /// Initializes the worker as a client

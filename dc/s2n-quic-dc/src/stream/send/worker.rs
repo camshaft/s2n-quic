@@ -268,6 +268,7 @@ where
         let _ = self.poll_socket(cx);
 
         let _ = self.poll_timers(cx);
+        let _ = self.poll_completions(cx);
         let _ = self.poll_transmit(cx);
         self.after_transmit();
     }
@@ -384,6 +385,28 @@ where
         let publisher = shared.publisher();
         self.sender
             .on_time_update(&clock, || shared.last_peer_activity(), &publisher);
+        Poll::Ready(())
+    }
+
+    #[inline]
+    fn poll_completions(&mut self, _cx: &mut Context) -> Poll<()> {
+        // Process completed transmissions from the completion queue
+        while let Some(entry) = self.sender.completion_queue.pop_front() {
+            let transmission = entry.into_inner();
+            
+            // Process each packet in the transmission
+            for info in transmission.info {
+                // TODO: Update RTT estimates based on time_sent
+                // TODO: Mark packets as acknowledged
+                // TODO: Update congestion control
+                // TODO: Release flow credits
+                // TODO: Handle retransmissions if needed
+                
+                // For now, we just drop the info which will free the descriptor
+                let _ = info;
+            }
+        }
+        
         Poll::Ready(())
     }
 
