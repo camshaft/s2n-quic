@@ -5,7 +5,8 @@ use crate::{
     packet::Packet,
     path::secret::Map,
     psk::io::DEFAULT_MTU,
-    socket::{pool::descriptor, send::wheel::DEFAULT_GRANULARITY_US},
+    socket::pool::{self, descriptor},
+    socket::send::wheel::DEFAULT_GRANULARITY_US,
     stream::{
         environment::{Environment, Peer, SetupResult, SocketSet},
         recv::{
@@ -173,13 +174,27 @@ impl Config {
     }
 }
 
-#[derive(Debug)]
 pub struct Pooled<S: socket::application::Application, W: socket::Socket> {
     pub peer_addr: SocketAddress,
     pub control: Control,
     pub stream: Stream,
     pub application_socket: Arc<S>,
     pub worker_socket: Arc<W>,
+    #[allow(dead_code)]
+    pub(crate) pool: Arc<pool::Pool>,
+}
+
+impl<S: socket::application::Application, W: socket::Socket> std::fmt::Debug for Pooled<S, W> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Pooled")
+            .field("peer_addr", &self.peer_addr)
+            .field("control", &self.control)
+            .field("stream", &self.stream)
+            .field("application_socket", &"<socket>")
+            .field("worker_socket", &"<socket>")
+            .field("pool", &"<pool>")
+            .finish()
+    }
 }
 
 impl<E, S, W> Peer<E> for Pooled<S, W>

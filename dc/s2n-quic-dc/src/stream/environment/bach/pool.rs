@@ -40,6 +40,7 @@ struct PoolSocket {
     worker: WorkerSendSocket,
     application: Box<[ApplicationSendSocket]>,
     recv_queue: Mutex<Queues>,
+    descriptor_pool: Arc<Packets>,
 }
 
 impl PoolSocket {
@@ -63,11 +64,14 @@ impl PoolSocket {
             .collect::<Vec<_>>()
             .into_boxed_slice();
 
+        let descriptor_pool = Arc::new(Packets::new(config.max_packet_size, config.packet_count));
+
         Self {
             worker,
             application,
             socket,
             recv_queue,
+            descriptor_pool,
         }
     }
 
@@ -147,6 +151,7 @@ impl Pool {
                 let queues = socket.recv_queue.lock().unwrap();
                 let app_socket = socket.application[0].clone();
                 let worker_socket = socket.worker.clone();
+                let descriptor_pool = socket.descriptor_pool.clone();
 
                 let acceptor = Acceptor::new(
                     env.clone(),
@@ -157,6 +162,7 @@ impl Pool {
                     app_socket,
                     worker_socket,
                     unroutable_packets.clone(),
+                    descriptor_pool,
                 );
 
                 let router = queues
@@ -184,7 +190,7 @@ impl Pool {
     pub fn alloc(
         &self,
         credentials: Option<&Credentials>,
-    ) -> (Control, Stream, ApplicationSendSocket, WorkerSendSocket) {
+    ) -> (Control, Stream, ApplicationSendSocket, WorkerSendSocket, Arc<Packets>) {
         // "Pick 2" worker selection
         let idx = self.pick_worker();
 
@@ -198,8 +204,9 @@ impl Pool {
 
         let worker_socket = socket.worker.clone();
         let app_socket = socket.application[priority].clone();
+        let descriptor_pool = socket.descriptor_pool.clone();
 
-        (control, stream, app_socket, worker_socket)
+        (control, stream, app_socket, worker_socket, descriptor_pool)
     }
 
     /// Implements "pick 2" load balancing: select two random workers and choose the one with lower queue length

@@ -41,6 +41,7 @@ where
     packet: InitialPacket,
     application_socket: Arc<S>,
     worker_socket: Arc<W>,
+    descriptor_pool: Arc<crate::socket::pool::Pool>,
 }
 
 impl<Env, S, W> Acceptor<Env, S, W>
@@ -58,6 +59,7 @@ where
         application_socket: Arc<S>,
         worker_socket: Arc<W>,
         unroutable_packets: mpsc::Sender<descriptor::Filled>,
+        descriptor_pool: Arc<crate::socket::pool::Pool>,
     ) -> Self {
         let dispatch = queues.dispatcher(unroutable_packets);
         let packet = InitialPacket::empty();
@@ -72,6 +74,7 @@ where
             packet,
             application_socket,
             worker_socket,
+            descriptor_pool,
         }
     }
 }
@@ -141,6 +144,7 @@ where
             stream,
             application_socket,
             worker_socket,
+            pool: self.descriptor_pool.clone(),
         };
 
         let mut secret_control = vec![];
