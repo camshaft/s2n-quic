@@ -80,11 +80,11 @@ impl PoolSocket {
             wheels.push((*****application).clone());
         }
 
-        let token_bucket = config.token_bucket();
+        let leaky_bucket = config.leaky_bucket();
 
         let span = tracing::trace_span!("send_socket_worker");
         let task = async move {
-            send::udp::non_blocking(socket, wheels, clock, token_bucket).await;
+            send::udp::non_blocking(socket, wheels, clock, leaky_bucket).await;
         };
 
         if span.is_disabled() {

@@ -22,7 +22,6 @@ use s2n_codec::{DecoderBufferMut, DecoderParameterizedValueMut};
 use s2n_quic_core::{
     inet::{IpAddress, IpV4Address, IpV6Address, SocketAddress, Unspecified},
     recovery::MAX_BURST_PACKETS,
-    time::token_bucket::TokenBucket,
 };
 use std::{sync::Arc, time::Duration};
 
@@ -74,7 +73,7 @@ impl Config {
         }
     }
 
-    pub(crate) fn token_bucket(&self) -> TokenBucket {
+    pub(crate) fn leaky_bucket(&self) -> crate::socket::send::udp::LeakyBucket {
         // Convert bits per second to bytes per interval
         // bytes_per_interval = (bits_per_second * interval_microseconds) / 8_000_000
         let bytes_per_interval = (self.max_bitrate_bps * DEFAULT_GRANULARITY_US) / 8_000_000;
@@ -82,13 +81,12 @@ impl Config {
         let bytes_per_interval =
             bytes_per_interval.max(DEFAULT_MTU as u64 * MAX_BURST_PACKETS as u64);
         let refill_interval = Duration::from_micros(DEFAULT_GRANULARITY_US);
-        let burst = bytes_per_interval; // 1x multiplier
 
-        TokenBucket::builder()
-            .with_max(burst)
-            .with_refill_interval(refill_interval)
-            .with_refill_amount(bytes_per_interval)
-            .build()
+        crate::socket::send::udp::LeakyBucket::new(
+            bytes_per_interval,
+            refill_interval,
+            DEFAULT_GRANULARITY_US,
+        )
     }
 
     pub fn unroutable_packets<S>(

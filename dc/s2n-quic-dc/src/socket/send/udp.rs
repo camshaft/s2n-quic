@@ -7,8 +7,81 @@ use crate::{
     socket::send::wheel::{Entry, Transmission, Wheel},
     stream::socket::Socket,
 };
-use s2n_quic_core::time::{timer::Provider, token_bucket::TokenBucket, Timestamp};
+use s2n_quic_core::time::Timestamp;
 use std::{ops::ControlFlow, time::Duration};
+
+/// A leaky bucket rate limiter that smooths traffic by leaking bytes at a constant rate
+///
+/// Unlike a token bucket, this does not accumulate credits up to a maximum, which helps
+/// reduce bursts. The leak rate is based on the wheel granularity to align with the
+/// timing wheel's tick interval.
+#[derive(Debug)]
+pub struct LeakyBucket {
+    /// Bytes per microsecond leak rate
+    bytes_per_us: f64,
+    /// The last time we leaked bytes
+    last_leak_time: Option<Timestamp>,
+    /// Minimum interval between leaks (based on wheel granularity)
+    leak_interval_us: u64,
+}
+
+impl LeakyBucket {
+    /// Create a new leaky bucket with the specified rate
+    ///
+    /// # Arguments
+    /// * `bytes_per_interval` - Number of bytes to leak per interval
+    /// * `interval` - Time interval for the leak rate
+    /// * `granularity_us` - Wheel granularity in microseconds (used as minimum leak interval)
+    pub fn new(bytes_per_interval: u64, interval: Duration, granularity_us: u64) -> Self {
+        let interval_us = interval.as_micros() as f64;
+        let bytes_per_us = bytes_per_interval as f64 / interval_us;
+        
+        Self {
+            bytes_per_us,
+            last_leak_time: None,
+            leak_interval_us: granularity_us,
+        }
+    }
+
+    /// Try to leak (acquire) the specified number of bytes
+    ///
+    /// Returns the number of bytes that can be leaked based on elapsed time.
+    /// Unlike a token bucket, this does not accumulate credits - it only allows
+    /// bytes based on the time elapsed since the last leak.
+    fn leak(&mut self, requested: u64, now: Timestamp) -> u64 {
+        let elapsed_us = if let Some(last) = self.last_leak_time {
+            // Calculate microseconds elapsed since last leak
+            let elapsed = now.saturating_duration_since(last);
+            elapsed.as_micros() as u64
+        } else {
+            // First leak - use the granularity as the initial interval
+            self.leak_interval_us
+        };
+
+        // Calculate available bytes based on elapsed time
+        let available = (elapsed_us as f64 * self.bytes_per_us) as u64;
+        
+        // Leak up to the requested amount or what's available
+        let leaked = requested.min(available);
+        
+        if leaked > 0 {
+            // Update last leak time
+            self.last_leak_time = Some(now);
+        }
+        
+        leaked
+    }
+
+    /// Get the next time when bytes will be available
+    ///
+    /// Returns when at least 1 byte will be available based on the leak rate
+    fn next_available(&self, now: Timestamp) -> Timestamp {
+        // Calculate time needed for at least 1 byte to be available
+        let micros_for_one_byte = (1.0 / self.bytes_per_us).ceil() as u64;
+        let wait_time = micros_for_one_byte.max(self.leak_interval_us);
+        now + Duration::from_micros(wait_time)
+    }
+}
 
 /// State for each priority level to track partially processed queues and entries
 struct WheelState<Info, const GRANULARITY_US: u64> {
@@ -48,13 +121,13 @@ impl<Info, const GRANULARITY_US: u64> WheelState<Info, GRANULARITY_US> {
 ///
 /// Priority levels are specified by the number of wheels.
 /// Index 0 is the highest priority and is processed first.
-/// The function drains each priority level in order, and if blocked by the token
+/// The function drains each priority level in order, and if blocked by the leaky
 /// bucket, it restarts from the highest priority level after the bucket refills.
 pub async fn non_blocking<S: Socket, Clk: Clock, Info, const GRANULARITY_US: u64>(
     socket: S,
     wheels: Vec<Wheel<Info, GRANULARITY_US>>,
     clock: Clk,
-    mut token_bucket: TokenBucket,
+    mut leaky_bucket: LeakyBucket,
 ) {
     assert!(!wheels.is_empty());
     let mut timer = clock.timer();
@@ -81,8 +154,8 @@ pub async fn non_blocking<S: Socket, Clk: Clock, Info, const GRANULARITY_US: u64
                 // Process pending entry first if it exists
                 if let Some((entry, mut remaining_len)) = wheel.pending_entry.take() {
                     // Continue acquiring credits for partially transmitted entry
-                    if acquire_tokens(
-                        &mut token_bucket,
+                    if acquire_bytes(
+                        &mut leaky_bucket,
                         &clock,
                         &mut timer,
                         &mut remaining_len,
@@ -103,8 +176,8 @@ pub async fn non_blocking<S: Socket, Clk: Clock, Info, const GRANULARITY_US: u64
                 // Process all packets in the queue
                 while let Some(entry) = queue.pop_front() {
                     let mut remaining_len = entry.descriptor.total_payload_len() as u64;
-                    if acquire_tokens(
-                        &mut token_bucket,
+                    if acquire_bytes(
+                        &mut leaky_bucket,
                         &clock,
                         &mut timer,
                         &mut remaining_len,
@@ -141,30 +214,25 @@ pub async fn non_blocking<S: Socket, Clk: Clock, Info, const GRANULARITY_US: u64
     }
 }
 
-async fn acquire_tokens(
-    token_bucket: &mut TokenBucket,
+async fn acquire_bytes(
+    leaky_bucket: &mut LeakyBucket,
     clock: &impl Clock,
     timer: &mut Timer,
     remaining_len: &mut u64,
     priority: usize,
 ) -> ControlFlow<()> {
-    let mut micros = 1;
     loop {
         let now = clock.get_time();
-        let acquired = token_bucket.take(*remaining_len, now);
+        let acquired = leaky_bucket.leak(*remaining_len, now);
         *remaining_len -= acquired;
 
         if *remaining_len == 0 {
             break;
         }
 
-        // Still blocked! Sleep until we acquire more credits
-        let next_expiration = token_bucket.next_expiration().unwrap_or_else(|| {
-            let next_expiration = now + Duration::from_micros(micros);
-            micros *= 2;
-            next_expiration
-        });
-        timer.sleep(next_expiration).await;
+        // Still blocked! Sleep until more bytes are available
+        let next_available = leaky_bucket.next_available(now);
+        timer.sleep(next_available).await;
 
         // only bail if we are operating on lower priority queues
         if priority != 0 {
@@ -217,12 +285,8 @@ mod tests {
         }
     }
 
-    fn token_bucket(bytes_per_interval: u64, interval: Duration, burst: u64) -> TokenBucket {
-        TokenBucket::builder()
-            .with_max(bytes_per_interval * burst)
-            .with_refill_interval(interval)
-            .with_refill_amount(bytes_per_interval)
-            .build()
+    fn leaky_bucket(bytes_per_interval: u64, interval: Duration, granularity_us: u64) -> LeakyBucket {
+        LeakyBucket::new(bytes_per_interval, interval, granularity_us)
     }
 
     fn new(horizon: Duration) -> (Wheel<(u8, u16), 8>, Pool, Clock) {
@@ -272,11 +336,11 @@ mod tests {
 
                 let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
 
-                let token_bucket = token_bucket(10_000_000, 8.us(), 1);
+                let leaky_bucket = leaky_bucket(10_000_000, 8.us(), 8);
 
                 // Spawn the sender
                 crate::testing::spawn(async move {
-                    non_blocking(socket, vec![wheel], clock, token_bucket).await;
+                    non_blocking(socket, vec![wheel], clock, leaky_bucket).await;
                 });
             }
             .primary()
@@ -338,11 +402,11 @@ mod tests {
 
                 let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
 
-                // High bandwidth to avoid token bucket blocking in this test
-                let token_bucket = token_bucket(100_000_000, 8.us(), 1);
+                // High bandwidth to avoid leaky bucket blocking in this test
+                let leaky_bucket = leaky_bucket(100_000_000, 8.us(), 8);
 
                 crate::testing::spawn(async move {
-                    non_blocking(socket, wheels, clock, token_bucket).await;
+                    non_blocking(socket, wheels, clock, leaky_bucket).await;
                 });
             }
             .primary()
@@ -384,15 +448,15 @@ mod tests {
 
                 let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
 
-                // Limited token bucket: enough for ~1 packet per refill
+                // Limited leaky bucket: enough for ~1 packet per refill
                 // This will cause priority 1 to get blocked and allow priority 0 to preempt
-                let token_bucket = token_bucket(150, 8.us(), 1);
+                let leaky_bucket = leaky_bucket(150, 8.us(), 8);
 
                 crate::testing::spawn({
                     let clock = clock.clone();
                     let wheels = wheels.clone();
                     async move {
-                        non_blocking(socket, wheels, clock, token_bucket).await;
+                        non_blocking(socket, wheels, clock, leaky_bucket).await;
                     }
                 });
 
