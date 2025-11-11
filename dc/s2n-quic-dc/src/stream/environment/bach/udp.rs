@@ -42,11 +42,13 @@ where
         let recv_pool = env.recv_pool.as_ref().expect("pool not configured");
         // the client doesn't need to associate credentials since it's already chosen a queue_id
         let credentials = None;
-        let (control, stream, application_socket, worker_socket) = recv_pool.alloc(credentials);
+        let (control, stream, application_socket, worker_socket, transmission_pool) =
+            recv_pool.alloc(credentials);
         crate::stream::environment::udp::Pooled {
             peer_addr,
             control,
             stream,
+            transmission_pool,
             application_socket,
             worker_socket,
         }

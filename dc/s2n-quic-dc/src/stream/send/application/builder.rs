@@ -34,7 +34,6 @@ where
             shared,
             sockets,
             queue: Default::default(),
-            pacer: Default::default(),
             status: Default::default(),
             runtime,
         }))

@@ -35,6 +35,12 @@ impl<T: Clone> Clone for Entry<T> {
     }
 }
 
+impl<T: Default> Default for Entry<T> {
+    fn default() -> Self {
+        Self::new(T::default())
+    }
+}
+
 impl<T> Entry<T> {
     /// Create a new entry with the given value
     pub fn new(value: T) -> Self {

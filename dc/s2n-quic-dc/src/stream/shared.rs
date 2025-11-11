@@ -6,6 +6,7 @@ use crate::{
     credentials::Credentials,
     event::{self, IntoEvent as _},
     packet::stream,
+    socket::pool,
     stream::{
         recv::shared as recv,
         send::{application, shared as send},
@@ -65,15 +66,59 @@ pub enum AcceptState {
 
 pub type ArcShared<Sub> = Arc<Shared<Sub, dyn Clock>>;
 
+pub struct CompletionQueue<T>(UnsafeCell<core::mem::MaybeUninit<T>>);
+
+impl<T: Clone> CompletionQueue<T> {
+    pub fn uninit() -> Self {
+        Self(UnsafeCell::new(core::mem::MaybeUninit::uninit()))
+    }
+
+    #[inline]
+    pub unsafe fn set(&self, value: T) {
+        let weak = unsafe { &mut *self.0.get() };
+        weak.write(value);
+    }
+
+    pub unsafe fn load(&self) -> T {
+        let weak = unsafe { &*self.0.get() };
+        weak.assume_init_ref().clone()
+    }
+}
+
+unsafe impl<T: Send> Send for CompletionQueue<T> {}
+unsafe impl<T: Sync> Sync for CompletionQueue<T> {}
+
 pub struct Shared<Subscriber, Clk>
 where
     Subscriber: event::Subscriber,
-    Clk: ?Sized + Clock,
+    Clk: Clock + ?Sized,
 {
     pub receiver: recv::State,
     pub sender: send::State,
     pub crypto: Crypto,
     pub common: Common<Subscriber, Clk>,
+}
+
+impl<S, Clk> recv::AsShared for Shared<S, Clk>
+where
+    S: event::Subscriber,
+    Clk: Clock + ?Sized,
+{
+    #[inline]
+    fn as_shared(&self) -> &recv::State {
+        &self.receiver
+    }
+}
+
+impl<S, Clk> send::AsShared for Shared<S, Clk>
+where
+    S: event::Subscriber,
+    Clk: Clock + ?Sized,
+{
+    #[inline]
+    fn as_shared(&self) -> &send::State {
+        &self.sender
+    }
 }
 
 impl<Sub, C> Shared<Sub, C>
@@ -126,13 +171,7 @@ where
             Ordering::Relaxed,
         );
     }
-}
 
-impl<Sub, C> Shared<Sub, C>
-where
-    Sub: event::Subscriber,
-    C: ?Sized + Clock,
-{
     #[inline]
     pub fn last_peer_activity(&self) -> Timestamp {
         let timestamp = self.last_peer_activity.load(Ordering::Relaxed);
@@ -186,7 +225,7 @@ where
 impl<Sub, C> ops::Deref for Shared<Sub, C>
 where
     Sub: event::Subscriber,
-    C: ?Sized + Clock,
+    C: Clock + ?Sized,
 {
     type Target = Common<Sub, C>;
 
@@ -199,7 +238,7 @@ where
 pub struct Common<Sub, Clk>
 where
     Sub: event::Subscriber,
-    Clk: ?Sized + Clock,
+    Clk: Clock + ?Sized,
 {
     pub gso: features::Gso,
     pub(super) remote_port: AtomicU16,
@@ -209,6 +248,7 @@ where
     /// The last time we received a packet from the peer
     pub last_peer_activity: AtomicU64,
     pub closed_halves: AtomicU8,
+    pub segment_alloc: pool::Sharded,
     pub subscriber: Subscriber<Sub>,
     pub clock: Clk,
 }
@@ -216,7 +256,7 @@ where
 impl<Sub, Clk> Common<Sub, Clk>
 where
     Sub: event::Subscriber,
-    Clk: ?Sized + Clock,
+    Clk: Clock + ?Sized,
 {
     #[inline]
     pub fn ensure_open(&self) -> std::io::Result<()> {
@@ -298,7 +338,7 @@ where
 impl<Sub, Clk> Drop for Common<Sub, Clk>
 where
     Sub: event::Subscriber,
-    Clk: ?Sized + Clock,
+    Clk: Clock + ?Sized,
 {
     #[inline]
     fn drop(&mut self) {

@@ -4,8 +4,8 @@
 use super::{handle::Transmission, Protocol, Socket, TransportFeatures};
 use crate::{
     msg::{addr::Addr, cmsg},
-    socket::send::{self, wheel::DEFAULT_GRANULARITY_US},
-    stream::send::state::transmission::Info,
+    socket::send::wheel::DEFAULT_GRANULARITY_US,
+    stream::send::state::transmission,
 };
 use core::task::{Context, Poll};
 use s2n_quic_core::{inet::ExplicitCongestionNotification, time::Timestamp};
@@ -17,21 +17,18 @@ use std::{
 
 #[derive(Clone)]
 pub struct Wheel<const GRANULARITY_US: u64 = DEFAULT_GRANULARITY_US> {
-    wheel: send::wheel::Wheel<Info<()>, GRANULARITY_US>,
+    wheel: transmission::Wheel<GRANULARITY_US>,
     local_addr: SocketAddr,
 }
 
 impl<const GRANULARITY_US: u64> Wheel<GRANULARITY_US> {
-    pub fn new(
-        wheel: send::wheel::Wheel<Info<()>, GRANULARITY_US>,
-        local_addr: SocketAddr,
-    ) -> Self {
+    pub fn new(wheel: transmission::Wheel<GRANULARITY_US>, local_addr: SocketAddr) -> Self {
         Self { wheel, local_addr }
     }
 }
 
 impl<const GRANULARITY_US: u64> ops::Deref for Wheel<GRANULARITY_US> {
-    type Target = send::wheel::Wheel<Info<()>, GRANULARITY_US>;
+    type Target = transmission::Wheel<GRANULARITY_US>;
 
     #[inline]
     fn deref(&self) -> &Self::Target {

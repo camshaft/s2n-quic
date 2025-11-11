@@ -5,6 +5,7 @@ use crate::{
     msg::addr::Addr,
     socket::pool::descriptor::{Descriptor, DescriptorInner, FreeList, Unfilled},
 };
+use core::fmt;
 use std::{
     alloc::Layout,
     ptr::NonNull,
@@ -12,12 +13,24 @@ use std::{
 };
 
 pub mod descriptor;
+mod sharded;
+
+pub use sharded::Sharded;
 
 #[derive(Clone)]
 pub struct Pool {
     free: Arc<Free>,
     max_packet_size: u16,
     packet_count: usize,
+}
+
+impl fmt::Debug for Pool {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.debug_struct("Pool")
+            .field("max_packet_size", &self.max_packet_size)
+            .field("packet_count", &self.packet_count)
+            .finish()
+    }
 }
 
 impl Pool {

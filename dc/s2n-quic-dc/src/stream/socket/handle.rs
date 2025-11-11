@@ -4,8 +4,8 @@
 use super::{Protocol, TransportFeatures};
 use crate::{
     msg::{self, addr::Addr, cmsg},
-    socket::send,
-    stream::send::state::transmission::Info,
+    socket::send::completion::Completer as _,
+    stream::send::state::transmission,
 };
 use core::task::{Context, Poll};
 use s2n_quic_core::{inet::ExplicitCongestionNotification, time::Timestamp};
@@ -15,9 +15,9 @@ use std::{
     sync::Arc,
 };
 
-pub type Flags = libc::c_int;
+pub use transmission::Entry as Transmission;
 
-pub type Transmission = send::wheel::Entry<Info<()>>;
+pub type Flags = libc::c_int;
 
 pub trait Socket: 'static + Send + Sync {
     /// Returns the local address for the socket
@@ -66,11 +66,11 @@ pub trait Socket: 'static + Send + Sync {
     #[inline]
     fn send_transmission(&self, msg: Transmission, time: Timestamp) {
         let _ = time;
-        msg.descriptor.send_with(|addr, ecn, iov| {
+        msg.send_with(|addr, ecn, iov| {
             let _ = self.try_send(addr, ecn, iov);
         });
-        if let Some(completion) = msg.completion.upgrade() {
-            completion.push_back(msg);
+        if let Some(completion) = msg.completion.as_ref().and_then(|c| c.upgrade()) {
+            completion.complete(msg);
         }
     }
 
@@ -159,6 +159,11 @@ macro_rules! impl_box {
                 buffer: &[IoSlice],
             ) -> io::Result<usize> {
                 (**self).try_send(addr, ecn, buffer)
+            }
+
+            #[inline(always)]
+            fn send_transmission(&self, msg: Transmission, time: Timestamp) {
+                (**self).send_transmission(msg, time)
             }
 
             #[inline(always)]

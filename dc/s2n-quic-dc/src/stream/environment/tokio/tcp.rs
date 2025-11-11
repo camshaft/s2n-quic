@@ -3,6 +3,7 @@
 
 use crate::{
     event,
+    socket::pool,
     stream::{
         environment::{tokio::Environment, Peer, SetupResult, SocketSet},
         recv::shared::RecvBuffer,
@@ -19,6 +20,7 @@ pub struct Registered {
     pub peer_addr: SocketAddress,
     pub local_port: u16,
     pub recv_buffer: RecvBuffer,
+    pub transmission_pool: pool::Sharded,
 }
 
 impl<Sub> Peer<Environment<Sub>> for Registered
@@ -39,11 +41,13 @@ where
     ) -> SetupResult<Self::ReadWorkerSocket, Self::WriteWorkerSocket> {
         let remote_addr = self.peer_addr;
         let application = Box::new(self.socket);
+        let transmission_pool = self.transmission_pool;
         let socket = SocketSet {
             application,
             read_worker: None,
             write_worker: None,
             remote_addr,
+            transmission_pool,
             source_queue_id: None,
         };
         Ok((socket, self.recv_buffer))
@@ -56,6 +60,7 @@ pub struct Reregistered {
     pub peer_addr: SocketAddress,
     pub local_port: u16,
     pub recv_buffer: RecvBuffer,
+    pub transmission_pool: pool::Sharded,
 }
 
 impl<Sub> Peer<Environment<Sub>> for Reregistered
@@ -76,11 +81,13 @@ where
     ) -> SetupResult<Self::ReadWorkerSocket, Self::WriteWorkerSocket> {
         let remote_addr = self.peer_addr;
         let application = Box::new(self.socket.into_std()?);
+        let transmission_pool = self.transmission_pool;
         let socket = SocketSet {
             application,
             read_worker: None,
             write_worker: None,
             remote_addr,
+            transmission_pool,
             source_queue_id: None,
         };
         Ok((socket, self.recv_buffer))

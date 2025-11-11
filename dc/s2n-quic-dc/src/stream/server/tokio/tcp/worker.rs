@@ -429,11 +429,17 @@ where
                 }
             };
 
+            let transmission_pool = context
+                .env
+                .tcp_transmission_pool()
+                .expect("no transmission queue")
+                .clone();
             let peer = env::tcp::Reregistered {
                 socket,
                 peer_addr: remote_address,
                 local_port: context.local_port,
                 recv_buffer,
+                transmission_pool,
             };
 
             let stream_builder = match endpoint::accept_stream(

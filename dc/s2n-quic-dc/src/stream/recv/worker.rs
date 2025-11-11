@@ -4,8 +4,9 @@
 use crate::{
     clock::Timer,
     event,
-    socket::pool::Pool,
+    packet::stream::PacketSpace,
     stream::{
+        send::state::transmission,
         shared::{AcceptState, ArcShared, ShutdownKind},
         socket::Socket,
         Actor,
@@ -13,7 +14,12 @@ use crate::{
 };
 use core::task::{Context, Poll};
 use s2n_quic_core::{
-    buffer, dc::ApplicationParams, endpoint, ensure, ready, time::clock::Timer as _,
+    buffer,
+    dc::ApplicationParams,
+    endpoint, ensure,
+    inet::{ExplicitCongestionNotification, SocketAddress},
+    ready,
+    time::clock::Timer as _,
 };
 use std::{io, time::Duration};
 use tracing::{debug, trace};
@@ -76,7 +82,9 @@ where
     idle_timer: Timer,
     idle_timeout_duration: Duration,
     backoff: u8,
+    pending_ack: bool,
     socket: S,
+    transmission_buffer: transmission::Builder,
     accept_state: AcceptState,
 }
 
@@ -114,7 +122,9 @@ where
             idle_timer,
             idle_timeout_duration,
             backoff: 0,
+            pending_ack: false,
             socket,
+            transmission_buffer: Default::default(),
             accept_state: AcceptState::Waiting,
         }
     }
@@ -253,10 +263,12 @@ where
 
     #[inline]
     fn is_application_progressing(&mut self) -> bool {
+        let state = self.shared.receiver.application_state();
+
+        self.pending_ack |= state.wants_ack;
+
         // check to see if the application shut down
-        if let super::shared::ApplicationState::Closed { shutdown_kind } =
-            self.shared.receiver.application_state()
-        {
+        if let super::shared::ApplicationStatus::Closed { shutdown_kind } = state.status {
             if matches!(shutdown_kind, ShutdownKind::Pruned) {
                 // if the stream was pruned then we don't need to do anything else
                 let _ = self.state.on_finished();
@@ -320,7 +332,7 @@ where
 
     #[inline]
     fn poll_drain_recv_socket(&mut self, cx: &mut Context) -> Poll<io::Result<()>> {
-        let mut should_transmit = false;
+        let mut should_transmit = self.pending_ack;
         let mut received_packets = 0;
 
         let _res = self.process_packets(cx, &mut received_packets, &mut should_transmit);
@@ -336,13 +348,17 @@ where
 
         // send an ACK if needed
         if let Some(mut recv) = self.shared.receiver.worker_try_lock()? {
-            // use the latest value rather than trying to transmit an old one
-            // if !self.send_buffer.is_empty() {
-            //     let _ = self.send_buffer.drain();
-            // }
+            let mut transmission_queue = TransmissionQueue {
+                buffer: &mut self.transmission_buffer,
+                socket_address: self.shared.remote_addr(),
+                max_segments: self.shared.gso.max_segments(),
+                shared: &self.shared,
+            };
+            recv.fill_transmit_queue(&self.shared, &mut transmission_queue);
 
-            // recv.fill_transmit_queue(&self.shared, &mut self.send_buffer);
-            todo!();
+            if !self.transmission_buffer.is_empty() {
+                self.pending_ack = false;
+            }
 
             if recv.receiver.state().is_data_received() {
                 let _ = self.state.on_data_received();
@@ -414,11 +430,22 @@ where
     }
 
     #[inline]
-    fn poll_flush_socket(&mut self, cx: &mut Context) -> Poll<io::Result<()>> {
-        // while !self.send_buffer.is_empty() {
-        //     ready!(self.socket.poll_send_buffer(cx, &mut self.send_buffer))?;
-        // }
-        todo!();
+    fn poll_flush_socket(&mut self, _cx: &mut Context) -> Poll<io::Result<()>> {
+        let count = self.transmission_buffer.len();
+        ensure!(count > 0, Poll::Ready(Ok(())));
+
+        // Only transmit the last two packets we have pending
+        if count > 2 {
+            self.transmission_buffer.clear_head(count - 2);
+        }
+
+        let now = self.shared.common.clock.get_time();
+
+        for (mut entry, _application_len) in self.transmission_buffer.drain() {
+            // don't subscribe to completion events
+            entry.completion = None;
+            self.socket.send_transmission(entry, now);
+        }
 
         Ok(()).into()
     }
@@ -435,5 +462,76 @@ where
         let target = now + timeout;
 
         self.peek_timer.update(target);
+    }
+}
+
+struct TransmissionQueue<'a, Sub>
+where
+    Sub: event::Subscriber,
+{
+    buffer: &'a mut transmission::Builder,
+    socket_address: SocketAddress,
+    max_segments: usize,
+    shared: &'a ArcShared<Sub>,
+}
+
+impl<Sub> super::shared::TransmitQueue for TransmissionQueue<'_, Sub>
+where
+    Sub: event::Subscriber,
+{
+    fn push_with<F: FnOnce(io::IoSliceMut) -> usize>(&mut self, f: F) -> Option<usize> {
+        let descriptor = self.shared.segment_alloc.alloc_or_grow();
+        let descriptor = descriptor
+            .fill_with(|addr, _cmsg, payload| {
+                let len = f(payload);
+                addr.set(self.socket_address);
+                if len == 0 {
+                    return Err(());
+                }
+                Ok(len)
+            })
+            .ok()?;
+        let mut descriptor = descriptor.take_filled();
+
+        let ecn = ExplicitCongestionNotification::Ect0;
+        let now = self.shared.clock.get_time();
+
+        descriptor.set_ecn(ecn);
+
+        let max_segments = self.max_segments;
+
+        let len: u16 = descriptor.len();
+
+        let info = transmission::Info {
+            packet_len: 0,
+            descriptor: None,
+            stream_offset: Default::default(),
+            payload_len: 0,
+            included_fin: false,
+            time_sent: now,
+            ecn,
+        };
+
+        let meta = transmission::Meta {
+            packet_space: PacketSpace::Recovery,
+            has_more_app_data: false,
+        };
+
+        let transmission_alloc = || {
+            self.shared
+                .sender
+                .alloc_transmission(max_segments, PacketSpace::Recovery)
+        };
+
+        self.buffer.push_segment(
+            (Default::default(), info),
+            meta,
+            0,
+            descriptor,
+            max_segments,
+            transmission_alloc,
+        );
+
+        Some(len as _)
     }
 }

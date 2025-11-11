@@ -16,7 +16,7 @@ use core::{
     task::{Context, Poll},
 };
 use s2n_quic_core::{ensure, varint::VarInt};
-use std::sync::OnceLock;
+use std::sync::{atomic::AtomicU16, OnceLock};
 
 const ERROR_MASK: u64 = 1 << 63;
 const FINISHED_MASK: u64 = 1 << 62;
@@ -25,8 +25,10 @@ const OFFSET_MASK: u64 = !(ERROR_MASK | FINISHED_MASK);
 pub struct State {
     /// Monotonic offset which tracks where the application is currently writing
     stream_offset: AtomicU64,
-    /// Monotonic offset which indicates the maximum offset the application can write to
+    /// Offset which indicates the maximum offset the application can write to
     flow_offset: AtomicU64,
+    /// The number of transmissions that can be outstanding
+    // transmission_credits: AtomicU16,
     /// Notifies an application of newly-available flow credits
     poll_waker: AtomicWaker,
     stream_error: OnceLock<Error>,
@@ -44,10 +46,11 @@ impl fmt::Debug for State {
 
 impl State {
     #[inline]
-    pub fn new(initial_flow_offset: VarInt) -> Self {
+    pub fn new(initial_flow_offset: VarInt, initial_transmission_credits: u16) -> Self {
         Self {
             stream_offset: AtomicU64::new(0),
             flow_offset: AtomicU64::new(initial_flow_offset.as_u64()),
+            // transmission_credits: AtomicU16::new(initial_transmission_credits),
             poll_waker: AtomicWaker::new(),
             stream_error: OnceLock::new(),
         }
@@ -64,28 +67,26 @@ impl State {
     }
 
     /// Called by the background worker to release flow credits
-    ///
-    /// Callers MUST ensure the provided offset is monotonic.
     #[inline]
-    pub fn release(&self, flow_offset: VarInt) {
+    pub fn release(&self, flow_offset: VarInt, transmission_credits: u16) {
         tracing::trace!(release = %flow_offset);
-        self.flow_offset
-            .store(flow_offset.as_u64(), Ordering::Release);
-        self.poll_waker.wake();
-    }
 
-    /// Called by the background worker to release flow credits
-    ///
-    /// This version only releases credits if the value is strictly less than the previous value
-    #[inline]
-    pub fn release_max(&self, flow_offset: VarInt) {
-        tracing::trace!(release = %flow_offset);
+        let mut should_wake = false;
+
         let prev = self
             .flow_offset
-            .fetch_max(flow_offset.as_u64(), Ordering::Release);
+            .swap(flow_offset.as_u64(), Ordering::Release);
 
         // if the flow offset was updated then wake the application waker
-        if prev < flow_offset.as_u64() {
+        should_wake |= prev < flow_offset.as_u64();
+
+        // if transmission_credits > 0 {
+        //     self.transmission_credits
+        //         .fetch_add(transmission_credits, Ordering::Release);
+        //     should_wake = true;
+        // }
+
+        if should_wake {
             self.poll_waker.wake();
         }
     }
@@ -115,9 +116,20 @@ impl State {
         mut request: flow::Request,
         features: &TransportFeatures,
     ) -> Poll<Result<Credits, Error>> {
-        let mut current_offset = self.acquire_offset(&request)?;
-
         let mut stored_waker = false;
+
+        // try to acquire credits for packet transmissions
+        if !features.is_flow_controlled() {
+            // while self.transmission_credits.load(Ordering::Relaxed) == 0 {
+            //     // if we already stored a waker and didn't get more credits then yield the task
+            //     ensure!(!stored_waker, Poll::Pending);
+            //     stored_waker = true;
+
+            //     self.poll_waker.register(cx.waker());
+            // }
+        }
+
+        let mut current_offset = self.acquire_offset(&request)?;
 
         loop {
             let flow_offset = self.flow_offset.load(Ordering::Acquire);
@@ -173,6 +185,12 @@ impl State {
                     // the offset was correctly updated so return our acquired credits
                     let acquired_offset =
                         unsafe { VarInt::new_unchecked(current_offset & OFFSET_MASK) };
+
+                    // if !features.is_flow_controlled() {
+                    //     // After acquiring credits record that we've got a pending transmission
+                    //     self.transmission_credits.fetch_sub(1, Ordering::Acquire);
+                    // }
+
                     let credits = request.response(acquired_offset);
                     return Poll::Ready(Ok(credits));
                 }
@@ -224,7 +242,7 @@ mod tests {
     async fn concurrent_flow() {
         let mut initial_offset = VarInt::from_u8(255);
         let expected_len = VarInt::from_u16(u16::MAX);
-        let state = Arc::new(State::new(initial_offset));
+        let state = Arc::new(State::new(initial_offset, 10));
         let path_info = path::Info {
             max_datagram_size: 1500,
             send_quantum: 10,
@@ -297,7 +315,7 @@ mod tests {
                 tokio::time::sleep(core::time::Duration::from_millis(1)).await;
                 initial_offset = (initial_offset + credits).min(expected_len);
                 credits += 1;
-                state.release(initial_offset);
+                state.release(initial_offset, 1);
             }
         });
 
@@ -326,7 +344,7 @@ mod tests {
             .with_type::<(u8, u8, bool)>()
             .cloned()
             .for_each(|(initial_offset, len, is_fin)| {
-                let state = Arc::new(State::new(VarInt::from_u8(initial_offset)));
+                let state = Arc::new(State::new(VarInt::from_u8(initial_offset), 10));
 
                 state.set_error(Error::new(error::Kind::FatalError));
 

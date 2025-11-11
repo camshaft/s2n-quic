@@ -4,9 +4,9 @@
 use crate::{
     clock,
     event::{self, ConnectionPublisher},
-    msg,
+    packet::stream::PacketSpace,
     stream::{
-        pacer, runtime,
+        runtime,
         send::{flow, queue},
         shared::{ArcShared, ShutdownKind},
         socket,
@@ -24,7 +24,6 @@ use tracing::trace;
 
 mod builder;
 pub mod state;
-pub mod transmission;
 
 use crate::stream::socket::Application;
 pub use builder::Builder;
@@ -38,7 +37,6 @@ where
     shared: ArcShared<Sub>,
     sockets: socket::ArcApplication,
     queue: queue::Queue,
-    pacer: pacer::Naive,
     status: Status,
     runtime: runtime::ArcHandle<Sub>,
 }
@@ -238,30 +236,23 @@ where
 
         trace!(?credits);
 
-        let mut batch = if features.is_reliable() {
-            // the protocol does recovery for us so no need to track the transmissions
-            None
-        } else {
-            // if we are using unreliable sockets then we need to write transmissions to a batch for the
-            // worker to track for recovery
-
-            let batch = self
-                .shared
-                .sender
-                .application_transmission_queue
-                .alloc_batch(msg::segment::MAX_COUNT);
-            Some(batch)
-        };
-
         let stream_id = self.shared.stream_id();
         let local_queue_id = self.shared.local_queue_id();
 
+        if !features.is_flow_controlled() {
+            self.queue.set_bandwidth(self.shared.sender.bandwidth());
+        }
+
         self.queue.push_buffer(
-            buf,
-            &mut batch,
+            &self.shared.remote_addr(),
             max_segments,
-            &self.shared.sender.segment_alloc,
-            |message, buf| {
+            &self.shared.segment_alloc,
+            || {
+                self.shared
+                    .sender
+                    .alloc_transmission(max_segments, PacketSpace::Stream)
+            },
+            |message| {
                 self.shared.crypto.seal_with(
                     |sealer| {
                         // push packets for transmission into our queue
@@ -292,12 +283,6 @@ where
             },
         )?;
 
-        if let Some(batch) = batch {
-            // send the transmission information off to the worker before flushing to the socket so the
-            // worker is prepared to handle ACKs from the peer
-            self.shared.sender.push_to_worker(batch)?;
-        }
-
         // flush the queue of packets to the socket
         self.poll_flush_buffer(cx, usize::MAX)
     }
@@ -308,17 +293,10 @@ where
         cx: &mut Context,
         limit: usize,
     ) -> Poll<Result<usize, io::Error>> {
-        // if we're actually writing to the socket then we need to pace
-        if !self.queue.is_empty() {
-            ready!(self.pacer.poll_pacing(cx, &self.shared.clock));
-        }
-
         let len = ready!(self.queue.poll_flush(
             cx,
             limit,
             self.sockets.write_application(),
-            &msg::addr::Addr::new(self.shared.remote_addr()),
-            &self.shared.gso,
             &self.shared.clock,
             &self.shared.subscriber,
         ))?;
@@ -365,6 +343,10 @@ where
 
         // pass things to the worker if we need to gracefully shut down
         if !self.sockets.features().is_stream() {
+            debug_assert!(
+                queue.is_empty(),
+                "datagram queues should always be empty on shutdown"
+            );
             self.shared
                 .publisher()
                 .on_stream_write_shutdown(event::builder::StreamWriteShutdown {
@@ -378,7 +360,7 @@ where
             } else {
                 ShutdownKind::Normal
             };
-            self.shared.sender.shutdown(queue, shutdown_kind);
+            self.shared.sender.shutdown(shutdown_kind);
             return Ok(());
         }
 
@@ -554,8 +536,6 @@ where
             cx,
             usize::MAX,
             sockets.write_application(),
-            &msg::addr::Addr::new(shared.remote_addr()),
-            &shared.gso,
             &shared.clock,
             &shared.subscriber,
         ));

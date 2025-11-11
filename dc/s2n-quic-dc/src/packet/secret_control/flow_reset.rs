@@ -50,11 +50,6 @@ impl FlowReset {
 
         encoder::finish(encoder, crypto)
     }
-
-    #[cfg(test)]
-    fn validate(&self) -> Option<()> {
-        Some(())
-    }
 }
 
 impl<'a> DecoderValue<'a> for FlowReset {
@@ -73,9 +68,4 @@ impl<'a> DecoderValue<'a> for FlowReset {
         };
         Ok((value, buffer))
     }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
 }

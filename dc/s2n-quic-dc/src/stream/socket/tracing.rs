@@ -1,10 +1,10 @@
 // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use super::{Protocol, Socket, TransportFeatures};
+use super::{handle::Transmission, Protocol, Socket, TransportFeatures};
 use crate::msg::{addr::Addr, cmsg};
 use core::task::{Context, Poll};
-use s2n_quic_core::inet::ExplicitCongestionNotification;
+use s2n_quic_core::{inet::ExplicitCongestionNotification, time::Timestamp};
 use std::{
     io::{self, IoSlice, IoSliceMut},
     net::SocketAddr,
@@ -120,6 +120,11 @@ impl<S: Socket> Socket for Tracing<S> {
         );
 
         result
+    }
+
+    #[inline]
+    fn send_transmission(&self, msg: Transmission, time: Timestamp) {
+        self.0.send_transmission(msg, time);
     }
 
     #[inline(always)]

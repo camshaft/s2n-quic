@@ -2,13 +2,12 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
-    socket::pool::{descriptor, Pool},
+    packet::stream::PacketSpace,
+    socket::send::completion::{Completer, Completion},
     stream::{
         packet_number,
-        send::{
-            application::transmission, error::Error, flow, path, queue::Queue, state::Transmission,
-        },
-        shared::ShutdownKind,
+        send::{flow, path, state::transmission},
+        shared::{CompletionQueue, ShutdownKind},
     },
     task::waker::worker::Waker as WorkerWaker,
 };
@@ -18,7 +17,7 @@ use core::{
 };
 use crossbeam_queue::SegQueue;
 use s2n_quic_core::recovery::bandwidth::Bandwidth;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use tracing::trace;
 
 #[derive(Debug)]
@@ -29,7 +28,7 @@ pub struct Message {
 
 #[derive(Debug)]
 pub enum Event {
-    Shutdown { queue: Queue, kind: ShutdownKind },
+    Shutdown { kind: ShutdownKind },
 }
 
 pub struct State {
@@ -42,8 +41,8 @@ pub struct State {
     ///
     /// We use an unbounded sender since we already rely on flow control to apply backpressure
     worker_queue: SegQueue<Message>,
-    pub application_transmission_queue: transmission::Queue<Arc<descriptor::Filled>>,
-    pub segment_alloc: Pool,
+    pub transmission_queue: transmission::Queue,
+    pub completion_handle: CompletionQueue<Weak<dyn AsShared>>,
 }
 
 impl fmt::Debug for State {
@@ -56,12 +55,35 @@ impl fmt::Debug for State {
     }
 }
 
+pub trait AsShared: 'static + Send + Sync {
+    fn as_shared(&self) -> &State;
+}
+
+impl Completion<transmission::PacketInfo, transmission::Meta> for Weak<dyn AsShared> {
+    type Completer = Arc<dyn AsShared>;
+
+    fn upgrade(&self) -> Option<Self::Completer> {
+        Weak::upgrade(self)
+    }
+}
+
+impl Completer<transmission::PacketInfo, transmission::Meta, Weak<dyn AsShared>>
+    for Arc<dyn AsShared>
+{
+    fn complete(self, transmission: transmission::Entry) {
+        let shared = self.as_shared();
+        shared
+            .transmission_queue
+            .complete_transmission(transmission);
+        shared.worker_waker.wake();
+    }
+}
+
 impl State {
     #[inline]
     pub fn new(
         flow: flow::non_blocking::State,
         path: path::Info,
-        segment_alloc: Pool,
         bandwidth: Option<Bandwidth>,
     ) -> Self {
         let path = path::State::new(path);
@@ -74,8 +96,8 @@ impl State {
             // this will get set once the waker spawns
             worker_waker: Default::default(),
             worker_queue: Default::default(),
-            application_transmission_queue: Default::default(),
-            segment_alloc,
+            transmission_queue: Default::default(),
+            completion_handle: CompletionQueue::uninit(),
         }
     }
 
@@ -94,28 +116,30 @@ impl State {
         self.worker_queue.pop()
     }
 
-    #[inline]
-    pub fn push_to_worker(&self, transmissions: Vec<Transmission>) -> Result<(), Error> {
-        trace!(event = "transmission", len = transmissions.len());
-        self.application_transmission_queue
-            .push_batch(transmissions);
-
-        self.worker_waker.wake();
-
-        Ok(())
-    }
-
     pub fn on_prune(&self) {
-        self.shutdown(Default::default(), ShutdownKind::Pruned);
+        self.shutdown(ShutdownKind::Pruned);
     }
 
     #[inline]
-    pub fn shutdown(&self, queue: Queue, kind: ShutdownKind) {
-        trace!(event = "shutdown", queue = queue.accepted_len(), ?kind);
+    pub fn shutdown(&self, kind: ShutdownKind) {
+        trace!(event = "shutdown", ?kind);
         let message = Message {
-            event: Event::Shutdown { queue, kind },
+            event: Event::Shutdown { kind },
         };
         self.worker_queue.push(message);
         self.worker_waker.wake();
+    }
+
+    pub fn alloc_transmission(
+        &self,
+        batch_size: usize,
+        packet_space: PacketSpace,
+    ) -> transmission::Entry {
+        let completion_queue = || unsafe { self.completion_handle.load() };
+        let mut entry = self
+            .transmission_queue
+            .alloc_entry(batch_size, completion_queue);
+        entry.meta.packet_space = packet_space;
+        entry
     }
 }

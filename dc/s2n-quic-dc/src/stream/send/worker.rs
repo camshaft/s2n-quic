@@ -4,10 +4,8 @@
 use crate::{
     clock::{Clock, Timer},
     event,
-    msg::{self, addr},
-    packet::Packet,
+    packet::{stream::PacketSpace, Packet},
     stream::{
-        pacer,
         recv::buffer::{self, Buffer},
         send::{
             error,
@@ -76,16 +74,14 @@ where
     random: R,
     state: waiting::State,
     timer: Timer,
-    application_queue: Queue,
-    pacer: pacer::Naive,
     socket: S,
     handshake: handshake::State,
+    transmit_queue: Queue,
 }
 
 #[derive(Debug)]
 struct Snapshot {
     flow_offset: VarInt,
-    has_pending_retransmissions: bool,
     send_quantum: usize,
     max_datagram_size: u16,
     ecn: ExplicitCongestionNotification,
@@ -97,18 +93,19 @@ struct Snapshot {
 
 impl Snapshot {
     #[inline]
-    fn apply<Sub, C>(&self, initial: &Self, shared: &shared::Shared<Sub, C>)
-    where
+    fn apply<Sub, C>(
+        &self,
+        initial: &Self,
+        shared: &shared::Shared<Sub, C>,
+        transmission_credits: u16,
+    ) where
         Sub: event::Subscriber,
         C: Clock,
     {
-        if initial.flow_offset < self.flow_offset {
-            shared.sender.flow.release(self.flow_offset);
-        } else if initial.has_pending_retransmissions && !self.has_pending_retransmissions {
-            // we were waiting to clear out our retransmission queue before giving the application
-            // more flow credits
-            shared.sender.flow.release_max(self.flow_offset);
-        }
+        shared
+            .sender
+            .flow
+            .release(self.flow_offset, transmission_credits);
 
         if initial.send_quantum != self.send_quantum {
             let send_quantum = (self.send_quantum as u64).div_ceil(self.max_datagram_size as u64);
@@ -182,10 +179,9 @@ where
             random,
             state,
             timer,
-            application_queue: Default::default(),
-            pacer: Default::default(),
             socket,
             handshake,
+            transmit_queue: Default::default(),
         }
     }
 
@@ -216,7 +212,7 @@ where
 
         self.shared.sender.worker_waker.on_worker_wake();
 
-        self.poll_once(cx);
+        let transmission_credits = self.poll_once(cx);
 
         // check if the application sent us any more messages
         if !self
@@ -244,7 +240,7 @@ where
             !matches!(self.state, waiting::State::Finished)
         });
 
-        current.apply(&initial, &self.shared);
+        current.apply(&initial, &self.shared, transmission_credits);
 
         if let Some(target) = timeout {
             self.timer.update(target);
@@ -263,13 +259,19 @@ where
     }
 
     #[inline]
-    fn poll_once(&mut self, cx: &mut Context) {
+    #[must_use]
+    fn poll_once(&mut self, cx: &mut Context) -> u16 {
+        self.sender
+            .load_completion_queue(&self.shared.sender.transmission_queue);
+
         let _ = self.poll_messages(cx);
         let _ = self.poll_socket(cx);
 
         let _ = self.poll_timers(cx);
         let _ = self.poll_transmit(cx);
         self.after_transmit();
+
+        self.sender.take_transmission_credits()
     }
 
     #[inline]
@@ -278,7 +280,7 @@ where
 
         while let Some(message) = self.shared.sender.pop_worker_message() {
             match message.event {
-                Event::Shutdown { queue, kind } => {
+                Event::Shutdown { kind } => {
                     // if the application is panicking then we notify the peer
                     if let Some(error) = kind.error_code() {
                         let error = error::Kind::ApplicationError {
@@ -290,13 +292,7 @@ where
 
                     // transition to a detached state
                     if self.state.on_application_detach().is_ok() {
-                        debug_assert!(
-                            self.application_queue.is_empty(),
-                            "dropped queue twice for same stream"
-                        );
-
-                        self.application_queue = queue;
-                        continue;
+                        break;
                     }
                 }
             }
@@ -392,44 +388,13 @@ where
         loop {
             ready!(self.poll_transmit_flush(cx));
 
-            let control_sealer = self
-                .shared
-                .crypto
-                .control_sealer()
-                .expect("control crypto should be available");
-
             match self.state {
                 waiting::State::Acking => {
-                    let publisher = self.shared.publisher();
-                    let stream_id = self.shared.stream_id();
-                    let source_queue_id = self.shared.local_queue_id();
-                    let pool = todo!();
-                    let _ = self.sender.fill_transmit_queue(
-                        control_sealer,
-                        self.shared.credentials(),
-                        &stream_id,
-                        source_queue_id,
-                        &self.shared.clock,
-                        pool,
-                        &publisher,
-                    );
+                    self.fill_transmit_queue();
                 }
                 waiting::State::Detached => {
-                    // flush the remaining application queue
-                    let _ = ready!(self.application_queue.poll_flush(
-                        cx,
-                        usize::MAX,
-                        &self.socket,
-                        &addr::Addr::new(self.shared.remote_addr()),
-                        &self.shared.gso,
-                        &self.shared.clock,
-                        &self.shared.subscriber,
-                    ));
-
                     // make sure we have the current view from the application
-                    self.sender.load_transmission_queue(
-                        &self.shared.sender.application_transmission_queue,
-                    );
+                    self.sender.max_sent_offset = self.shared.sender.flow.stream_offset();
 
                     // try to transition to having sent all of the data
                     if self.sender.state.on_send_fin().is_ok() {
@@ -443,19 +408,7 @@ where
                     continue;
                 }
                 waiting::State::ShuttingDown => {
-                    let publisher = self.shared.publisher();
-                    let stream_id = self.shared.stream_id();
-                    let source_queue_id = self.shared.local_queue_id();
-                    let pool = todo!();
-                    let _ = self.sender.fill_transmit_queue(
-                        control_sealer,
-                        self.shared.credentials(),
-                        &stream_id,
-                        source_queue_id,
-                        &self.shared.clock,
-                        pool,
-                        &publisher,
-                    );
+                    self.fill_transmit_queue();
 
                     if self.sender.state.is_terminal() {
                         let _ = self.state.on_finished();
@@ -464,45 +417,65 @@ where
                 waiting::State::Finished => break,
             }
 
-            ensure!(!self.sender.transmit_queue.is_empty(), break);
+            ensure!(!self.transmit_queue.is_empty(), break);
         }
 
         Poll::Ready(())
     }
 
     #[inline]
+    fn fill_transmit_queue(&mut self) {
+        let control_sealer = self
+            .shared
+            .crypto
+            .control_sealer()
+            .expect("control crypto should be available");
+
+        let publisher = self.shared.publisher();
+        let stream_id = self.shared.stream_id();
+        let source_queue_id = self.shared.local_queue_id();
+        let pool = &self.shared.segment_alloc;
+        let remote_address = self.shared.remote_addr();
+        let max_segments = self.shared.gso.max_segments();
+
+        self.transmit_queue.push_buffer(
+            &remote_address,
+            max_segments,
+            pool,
+            || {
+                self.shared
+                    .sender
+                    .alloc_transmission(max_segments, PacketSpace::Recovery)
+            },
+            |packets| {
+                let _ = self.sender.fill_transmit_queue(
+                    control_sealer,
+                    self.shared.credentials(),
+                    &stream_id,
+                    source_queue_id,
+                    &self.shared.clock,
+                    packets,
+                    &publisher,
+                );
+            },
+        );
+    }
+
+    #[inline]
     fn poll_transmit_flush(&mut self, cx: &mut Context) -> Poll<()> {
-        ensure!(!self.sender.transmit_queue.is_empty(), Poll::Ready(()));
+        ensure!(!self.transmit_queue.is_empty(), Poll::Ready(()));
 
-        let mut max_segments = self.shared.gso.max_segments();
-        let addr = self.shared.remote_addr();
-        let addr = addr::Addr::new(addr);
-        let clock = &self.shared.clock;
+        self.transmit_queue
+            .set_bandwidth(self.sender.cca.bandwidth());
 
-        while !self.sender.transmit_queue.is_empty() {
-            // pace out retransmissions
-            ready!(self.pacer.poll_pacing(cx, &self.shared.clock));
-
-            // construct all of the segments we're going to send in this batch
-            let segments = msg::segment::Batch::new(
-                self.sender.transmit_queue_iter(clock).take(max_segments),
-                &self.socket.features(),
-            );
-
-            let ecn = segments.ecn();
-            let res = ready!(self.socket.poll_send(cx, &addr, ecn, &segments));
-
-            if let Err(error) = res {
-                if self.shared.gso.handle_socket_error(&error).is_some() {
-                    // update the max_segments value if it was changed due to the error
-                    max_segments = 1;
-                }
-            }
-
-            // consume the segments that we transmitted
-            let segment_count = segments.len();
-            drop(segments);
-            self.sender.on_transmit_queue(segment_count);
+        while !self.transmit_queue.is_empty() {
+            let _ = ready!(self.transmit_queue.poll_flush(
+                cx,
+                usize::MAX,
+                &self.socket,
+                &self.shared.clock,
+                &self.shared.subscriber,
+            ));
         }
 
         Poll::Ready(())
@@ -511,7 +484,7 @@ where
     #[inline]
     fn after_transmit(&mut self) {
         self.sender
-            .load_transmission_queue(&self.shared.sender.application_transmission_queue);
+            .load_completion_queue(&self.shared.sender.transmission_queue);
 
         self.sender
             .before_sleep(&clock::Cached::new(&self.shared.clock));
@@ -521,7 +494,6 @@ where
     fn snapshot(&self) -> Snapshot {
         Snapshot {
             flow_offset: self.sender.flow_offset(),
-            has_pending_retransmissions: self.sender.transmit_queue.is_empty(),
             send_quantum: self.sender.cca.send_quantum(),
             // TODO get this from the ECN controller
             ecn: ExplicitCongestionNotification::Ect0,
@@ -615,7 +587,7 @@ where
                     &mut packet,
                     self.random,
                     &self.clock,
-                    &self.shared.sender.application_transmission_queue,
+                    &self.shared.sender.transmission_queue,
                     self.publisher,
                 );
 

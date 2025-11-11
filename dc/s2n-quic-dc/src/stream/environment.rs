@@ -5,6 +5,7 @@ use crate::{
     clock,
     either::Either,
     event,
+    socket::pool,
     stream::{recv, runtime, socket, TransportFeatures},
 };
 use core::future::Future;
@@ -121,6 +122,7 @@ pub struct SocketSet<R, W = R> {
     pub application: Box<dyn socket::application::Builder>,
     pub read_worker: Option<R>,
     pub write_worker: Option<W>,
+    pub transmission_pool: pool::Sharded,
     pub remote_addr: SocketAddress,
     pub source_queue_id: Option<VarInt>,
 }

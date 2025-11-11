@@ -8,7 +8,10 @@ use crate::{
     msg,
     packet::stream,
     path::secret,
-    socket::{pool::descriptor, recv::router::Router},
+    socket::{
+        pool::{self, descriptor},
+        recv::router::Router,
+    },
     stream::{
         endpoint,
         environment::{udp, Environment},
@@ -39,6 +42,7 @@ where
     queues: Allocator,
     is_open: bool,
     packet: InitialPacket,
+    transmission_pool: pool::Sharded,
     application_socket: Arc<S>,
     worker_socket: Arc<W>,
 }
@@ -57,6 +61,7 @@ where
         queues: Allocator,
         application_socket: Arc<S>,
         worker_socket: Arc<W>,
+        transmission_pool: pool::Sharded,
         unroutable_packets: mpsc::Sender<descriptor::Filled>,
     ) -> Self {
         let dispatch = queues.dispatcher(unroutable_packets);
@@ -70,6 +75,7 @@ where
             queues,
             is_open: true,
             packet,
+            transmission_pool,
             application_socket,
             worker_socket,
         }
@@ -134,6 +140,7 @@ where
 
         let application_socket = self.application_socket.clone();
         let worker_socket = self.worker_socket.clone();
+        let transmission_pool = self.transmission_pool.clone();
 
         let peer = udp::Pooled {
             peer_addr,
@@ -141,6 +148,7 @@ where
             stream,
             application_socket,
             worker_socket,
+            transmission_pool,
         };
 
         let mut secret_control = vec![];
