@@ -171,6 +171,8 @@ impl Queue {
             transmission_alloc,
         );
 
+        self.accepted_len += application_len as usize;
+
         application_len as usize
     }
 
