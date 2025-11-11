@@ -771,7 +771,7 @@ where
         packet: &'a control::flow_reset::Packet,
         peer: &SocketAddr,
     ) -> Option<&'a control::FlowReset> {
-        let peer_address = SocketAddress::from(*peer);
+        let _peer_address = SocketAddress::from(*peer);
         // let peer_address = peer_address.into_event();
 
         // self.subscriber()

@@ -4,22 +4,29 @@
 use crate::{
     clock::{Clock, Timer},
     intrusive_queue::Queue,
-    socket::send::wheel::{Entry, Transmission, Wheel},
+    socket::send::{
+        completion::{Completer as _, Completion},
+        transmission::{Entry, Transmission},
+        wheel::Wheel,
+    },
     stream::socket::Socket,
 };
 use s2n_quic_core::time::{timer::Provider, token_bucket::TokenBucket, Timestamp};
 use std::{ops::ControlFlow, time::Duration};
 
 /// State for each priority level to track partially processed queues and entries
-struct WheelState<Info, const GRANULARITY_US: u64> {
-    queue: Wheel<Info, GRANULARITY_US>,
-    pending_queue: Option<(Timestamp, Queue<Transmission<Info>>)>,
-    pending_entry: Option<(Entry<Info>, u64)>, // (entry, remaining_len)
+struct WheelState<Info, Meta, Completion, const GRANULARITY_US: u64> {
+    queue: Wheel<Info, Meta, Completion, GRANULARITY_US>,
+    pending_queue: Option<(Timestamp, Queue<Transmission<Info, Meta, Completion>>)>,
+    pending_entry: Option<(Entry<Info, Meta, Completion>, u64)>, // (entry, remaining_len)
 }
 
-impl<Info, const GRANULARITY_US: u64> WheelState<Info, GRANULARITY_US> {
+impl<Info, Meta, C, const GRANULARITY_US: u64> WheelState<Info, Meta, C, GRANULARITY_US>
+where
+    C: Completion<Info, Meta>,
+{
     /// Ticks the wheel to get the next queue
-    fn tick(&mut self) -> (Timestamp, Queue<Transmission<Info>>) {
+    fn tick(&mut self) -> (Timestamp, Queue<Transmission<Info, Meta, C>>) {
         if let Some((timestamp, queue)) = self.pending_queue.take() {
             // Resume processing previously retrieved queue
             (timestamp, queue)
@@ -28,18 +35,23 @@ impl<Info, const GRANULARITY_US: u64> WheelState<Info, GRANULARITY_US> {
         }
     }
 
-    fn transmit<S: Socket, Clk: Clock>(&self, mut entry: Entry<Info>, socket: &S, clock: &Clk) {
+    fn transmit<S: Socket, Clk: Clock>(
+        &self,
+        mut entry: Entry<Info, Meta, C>,
+        socket: &S,
+        clock: &Clk,
+    ) {
         // Successfully acquired all credits, send the packet
         let now = clock.get_time();
-        entry.descriptor.send_with(|addr, ecn, iovec| {
+        entry.send_with(|addr, ecn, iovec| {
             let _ = socket.try_send(addr, ecn, iovec);
         });
 
         self.queue.on_send();
-        entry.transmission = Some(now);
+        entry.transmission_time = Some(now);
 
-        if let Some(completion) = entry.completion.upgrade() {
-            completion.push_back(entry);
+        if let Some(completion) = entry.completion.as_ref().and_then(|c| c.upgrade()) {
+            completion.complete(entry);
         }
     }
 }
@@ -50,12 +62,16 @@ impl<Info, const GRANULARITY_US: u64> WheelState<Info, GRANULARITY_US> {
 /// Index 0 is the highest priority and is processed first.
 /// The function drains each priority level in order, and if blocked by the token
 /// bucket, it restarts from the highest priority level after the bucket refills.
-pub async fn non_blocking<S: Socket, Clk: Clock, Info, const GRANULARITY_US: u64>(
+pub async fn non_blocking<S, Clk, Info, Meta, C, const GRANULARITY_US: u64>(
     socket: S,
-    wheels: Vec<Wheel<Info, GRANULARITY_US>>,
+    wheels: Vec<Wheel<Info, Meta, C, GRANULARITY_US>>,
     clock: Clk,
     mut token_bucket: TokenBucket,
-) {
+) where
+    S: Socket,
+    Clk: Clock,
+    C: Completion<Info, Meta>,
+{
     assert!(!wheels.is_empty());
     let mut timer = clock.timer();
 
@@ -102,7 +118,7 @@ pub async fn non_blocking<S: Socket, Clk: Clock, Info, const GRANULARITY_US: u64
 
                 // Process all packets in the queue
                 while let Some(entry) = queue.pop_front() {
-                    let mut remaining_len = entry.descriptor.total_payload_len() as u64;
+                    let mut remaining_len = entry.total_len as u64;
                     if acquire_tokens(
                         &mut token_bucket,
                         &clock,
@@ -194,26 +210,31 @@ mod tests {
         socket_addr: SocketAddr,
         payload_len: u16,
         priority: u8,
-    ) -> Transmission<(u8, u16)> {
-        Transmission {
-            descriptor: pool
-                .alloc_or_grow()
-                .fill_with(|addr, _cmsg, mut payload| {
-                    addr.set(socket_addr.into());
-                    let len = payload_len as usize;
-                    for chunk in payload[..len].chunks_mut(2) {
-                        if chunk.len() == 2 {
-                            chunk.copy_from_slice(&payload_len.to_be_bytes());
-                        } else {
-                            chunk[0] = 255;
-                        }
+    ) -> Transmission<(), (u8, u16), ()> {
+        let descriptors = pool
+            .alloc_or_grow()
+            .fill_with(|addr, _cmsg, mut payload| {
+                addr.set(socket_addr.into());
+                let len = payload_len as usize;
+                for chunk in payload[..len].chunks_mut(2) {
+                    if chunk.len() == 2 {
+                        chunk.copy_from_slice(&payload_len.to_be_bytes());
+                    } else {
+                        chunk[0] = 255;
                     }
-                    <Result<_, Infallible>>::Ok(len)
-                })
-                .unwrap_or_else(|_| panic!("could not create packet")),
-            transmission: None,
-            info: (priority, payload_len),
-            completion: std::sync::Weak::new(),
+                }
+                <Result<_, Infallible>>::Ok(len)
+            })
+            .unwrap_or_else(|_| panic!("could not create packet"))
+            .into_iter()
+            .map(|desc| (desc, ()))
+            .collect();
+        Transmission {
+            descriptors,
+            total_len: payload_len,
+            transmission_time: None,
+            meta: (priority, payload_len),
+            completion: None,
         }
     }
 
@@ -225,7 +246,7 @@ mod tests {
             .build()
     }
 
-    fn new(horizon: Duration) -> (Wheel<(u8, u16), 8>, Pool, Clock) {
+    fn new(horizon: Duration) -> (Wheel<(), (u8, u16), (), 8>, Pool, Clock) {
         let clock = Clock::default();
         let pool = Pool::new(u16::MAX, 16);
         let wheel = Wheel::new(horizon, &clock);

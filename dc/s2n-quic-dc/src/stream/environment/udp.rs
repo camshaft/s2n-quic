@@ -5,7 +5,10 @@ use crate::{
     packet::Packet,
     path::secret::Map,
     psk::io::DEFAULT_MTU,
-    socket::{pool::descriptor, send::wheel::DEFAULT_GRANULARITY_US},
+    socket::{
+        pool::{self, descriptor},
+        send::wheel::DEFAULT_GRANULARITY_US,
+    },
     stream::{
         environment::{Environment, Peer, SetupResult, SocketSet},
         recv::{
@@ -89,6 +92,21 @@ impl Config {
             .with_refill_interval(refill_interval)
             .with_refill_amount(bytes_per_interval)
             .build()
+    }
+
+    pub(crate) fn rx_packet_pool(&self) -> pool::Pool {
+        pool::Pool::new(self.max_packet_size, self.packet_count)
+    }
+
+    pub(crate) fn tx_packet_pool(&self, thread_count: usize) -> pool::Sharded {
+        let mut pools = Vec::with_capacity(thread_count * 2);
+        for _ in 0..pools.capacity() {
+            pools.push(pool::Pool::new(
+                crate::msg::segment::MAX_UDP_PAYLOAD,
+                self.packet_count,
+            ));
+        }
+        pool::Sharded::new(pools.into())
     }
 
     pub fn unroutable_packets<S>(
@@ -180,6 +198,7 @@ pub struct Pooled<S: socket::application::Application, W: socket::Socket> {
     pub stream: Stream,
     pub application_socket: Arc<S>,
     pub worker_socket: Arc<W>,
+    pub transmission_pool: pool::Sharded,
 }
 
 impl<E, S, W> Peer<E> for Pooled<S, W>
@@ -243,6 +262,7 @@ where
             application,
             read_worker,
             write_worker,
+            transmission_pool: self.transmission_pool,
             remote_addr,
             source_queue_id: Some(queue_id),
         };

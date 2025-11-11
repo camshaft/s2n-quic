@@ -7,6 +7,7 @@ pub mod application;
 #[cfg(any(test, feature = "testing"))]
 mod bach;
 pub mod fd;
+mod gso;
 mod handle;
 mod send_only;
 #[cfg(feature = "tokio")]
@@ -17,6 +18,7 @@ mod wheel;
 pub use self::tracing::Tracing;
 pub use crate::socket::*;
 pub use application::Application;
+pub use gso::Gso;
 pub use handle::{Ext, Flags, Socket};
 pub use send_only::SendOnly;
 pub use wheel::Wheel;

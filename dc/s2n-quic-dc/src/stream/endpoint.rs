@@ -219,7 +219,9 @@ where
                 (flow_offset, send_quantum, bandwidth)
             };
 
-        let flow = flow::non_blocking::State::new(flow_offset);
+        let max_pending_transmissions = 32;
+
+        let flow = flow::non_blocking::State::new(flow_offset, max_pending_transmissions);
 
         let path = send::path::Info {
             max_datagram_size: parameters.max_datagram_size(),
@@ -229,8 +231,7 @@ where
         };
 
         // construct shared writer state
-        let pool = todo!();
-        let state = send::shared::State::new(flow, path, pool, bandwidth);
+        let state = send::shared::State::new(flow, path, bandwidth);
 
         (state, worker)
     };
@@ -263,6 +264,7 @@ where
             .into(),
             last_peer_activity: Default::default(),
             fixed,
+            segment_alloc: sockets.transmission_pool,
             closed_halves: 0u8.into(),
             subscriber: shared::Subscriber {
                 subscriber,
@@ -289,6 +291,12 @@ where
         common,
         crypto,
     });
+
+    // Set a self-referential reference for completion queues
+    let weak = Arc::downgrade(&shared);
+    unsafe {
+        shared.sender.completion_handle.set(weak);
+    }
 
     // spawn the read worker
     if let Some(socket) = sockets.read_worker {

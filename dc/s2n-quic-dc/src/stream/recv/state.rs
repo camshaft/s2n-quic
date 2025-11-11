@@ -7,12 +7,12 @@ use crate::{
     crypto::{self, UninitSlice},
     event,
     packet::{control, stream},
-    socket::pool::Pool,
     stream::{
         recv::{
             ack,
             error::{self, Error},
             packet,
+            shared::TransmitQueue,
         },
         shared::AcceptState,
         TransportFeatures, DEFAULT_IDLE_TIMEOUT,
@@ -746,17 +746,18 @@ impl State {
     }
 
     #[inline]
-    pub fn on_transmit<K, Clk, Pub>(
+    pub fn on_transmit<K, T, Clk, Pub>(
         &mut self,
         key: &K,
         credentials: &Credentials,
         stream_id: stream::Id,
         source_queue_id: Option<VarInt>,
-        output: &Pool,
+        queue: &mut T,
         clock: &Clk,
         publisher: &Pub,
     ) where
         K: crypto::seal::control::Stream,
+        T: TransmitQueue,
         Clk: Clock + ?Sized,
         Pub: event::ConnectionPublisher,
     {
@@ -770,7 +771,7 @@ impl State {
             credentials,
             stream_id,
             source_queue_id,
-            output,
+            queue,
             // avoid querying the clock for every transmitted packet
             &clock::Cached::new(clock),
             publisher,
@@ -778,158 +779,130 @@ impl State {
     }
 
     #[inline]
-    fn on_transmit_ack<K, Clk, Pub>(
+    fn on_transmit_ack<K, T, Clk, Pub>(
         &mut self,
         key: &K,
         credentials: &Credentials,
         stream_id: stream::Id,
         source_queue_id: Option<VarInt>,
-        output: &Pool,
+        queue: &mut T,
         clock: &Clk,
         publisher: &Pub,
     ) where
         K: crypto::seal::control::Stream,
+        T: TransmitQueue,
         Clk: Clock + ?Sized,
         Pub: event::ConnectionPublisher,
     {
         ensure!(self.should_transmit());
 
-        let mtu = self.mtu();
+        // get how many intervals we're tracking - the more there are, the more loss the network
+        // is experiencing
+        let intervals = self.stream_ack.interval_len() + self.recovery_ack.interval_len();
 
-        // output.set_ecn(self.ecn());
+        // The value of `20` is somewhat arbitrary but doing some worst-case math the ACK ranges with
+        // 20 segments would consume about 20-25% of the packet this is a good starting point.
+        // We dont't want to go too much lower otherwise we end up spamming ACKs.
+        let mut duplicate_threshold = 20;
 
-        let packet_number = self.next_pn();
+        let mut should_duplicate = false;
 
-        ensure!(let Some(segment) = output.alloc());
+        // if the number of intervals is large then we should duplicate the ACKs to try and recover
+        should_duplicate |= intervals > duplicate_threshold;
 
-        // let buffer = output.get_mut(&segment);
-        let buffer: &mut Vec<u8> = todo!();
-        buffer.resize(mtu as _, 0);
+        // if we have recovery packets then the network is likely lossy so we duplicate the ACKs to increase the
+        // likelihood that the sender will recover
+        should_duplicate |= !self.recovery_ack.is_empty();
 
-        let encoder = EncoderBuffer::new(buffer);
+        let count = if should_duplicate { 2 } else { 1 };
 
-        let max_data = frame::MaxData {
-            maximum_data: self.max_data,
-        };
-        let max_data_encoding_size: VarInt = max_data.encoding_size().try_into().unwrap();
+        for _ in 0..count {
+            let res = queue.push_with(|mut buffer| {
+                let mtu = self.mtu();
 
-        // compute the recovery ACKs first so we have enough space for those - if we run out, the sender will
-        // convert the stream PNs anyway
-        let (recovery_ack, max_data_encoding_size) =
-            self.recovery_ack
-                .encoding(max_data_encoding_size, None, mtu, clock);
+                // output.set_ecn(self.ecn());
 
-        let (stream_ack, max_data_encoding_size) =
-            self.stream_ack
-                .encoding(max_data_encoding_size, Some(self.ecn_counts), mtu, clock);
+                let packet_number = self.next_pn();
 
-        let encoding_size = max_data_encoding_size;
+                let encoder = EncoderBuffer::new(&mut buffer[..]);
 
-        tracing::trace!(?stream_ack, ?recovery_ack, ?max_data);
-
-        let frame = ((max_data, stream_ack), recovery_ack);
-
-        let result = control::encoder::encode(
-            encoder,
-            source_queue_id,
-            Some(stream_id),
-            packet_number,
-            VarInt::ZERO,
-            &mut &[][..],
-            encoding_size,
-            &frame,
-            key,
-            credentials,
-        );
-
-        match result {
-            0 => {
-                return;
-            }
-            packet_len => {
-                buffer.truncate(packet_len);
-
-                // get how many intervals we're tracking - the more there are, the more loss the network
-                // is experiencing
-                let intervals = self.stream_ack.interval_len() + self.recovery_ack.interval_len();
-
-                // The value of `20` is somewhat arbitrary but doing some worst-case math the ACK ranges with
-                // 20 segments would consume about 20-25% of the packet this is a good starting point.
-                // We dont't want to go too much lower otherwise we end up spamming ACKs.
-                let mut duplicate_threshold = 20;
-
-                let mut should_duplicate = false;
-
-                // if the number of intervals is large then we should duplicate the ACKs to try and recover
-                should_duplicate |= intervals > duplicate_threshold;
-
-                // if we have recovery packets then the network is likely lossy so we duplicate the ACKs to increase the
-                // likelihood that the sender will recover
-                should_duplicate |= !self.recovery_ack.is_empty();
-
-                let duplicate = if should_duplicate {
-                    Some(buffer.clone())
-                } else {
-                    None
+                let max_data = frame::MaxData {
+                    maximum_data: self.max_data,
                 };
+                let max_data_encoding_size: VarInt = max_data.encoding_size().try_into().unwrap();
 
-                todo!();
-                // output.push(segment);
+                // compute the recovery ACKs first so we have enough space for those - if we run out, the sender will
+                // convert the stream PNs anyway
+                let (recovery_ack, max_data_encoding_size) =
+                    self.recovery_ack
+                        .encoding(max_data_encoding_size, None, mtu, clock);
 
-                // if let Some(buffer) = duplicate {
-                //     loop {
-                //         let Some(segment) = output.alloc() else {
-                //             break;
-                //         };
-                //         let buf = output.get_mut(&segment);
-                //         if intervals > duplicate_threshold {
-                //             buf.extend_from_slice(&buffer);
-                //             output.push(segment);
+                let (stream_ack, max_data_encoding_size) = self.stream_ack.encoding(
+                    max_data_encoding_size,
+                    Some(self.ecn_counts),
+                    mtu,
+                    clock,
+                );
 
-                //             // exponentially increase the threshold
-                //             duplicate_threshold *= 2;
+                let encoding_size = max_data_encoding_size;
 
-                //             continue;
-                //         } else {
-                //             *buf = buffer;
-                //             output.push(segment);
-                //             break;
-                //         }
-                //     }
-                // }
+                tracing::trace!(?stream_ack, ?recovery_ack, ?max_data);
+
+                let frame = ((max_data, stream_ack), recovery_ack);
+
+                let packet_len = control::encoder::encode(
+                    encoder,
+                    source_queue_id,
+                    Some(stream_id),
+                    packet_number,
+                    VarInt::ZERO,
+                    &mut &[][..],
+                    encoding_size,
+                    &frame,
+                    key,
+                    credentials,
+                );
+
+                if packet_len == 0 {
+                    return 0;
+                }
+
+                publisher.on_stream_control_packet_transmitted(
+                    event::builder::StreamControlPacketTransmitted {
+                        packet_len,
+                        control_data_len: encoding_size.as_u64() as usize,
+                        packet_number: packet_number.as_u64(),
+                    },
+                );
+
+                // record the max value we've seen for removing old packet numbers
+                self.stream_ack.on_transmit(packet_number);
+                self.recovery_ack.on_transmit(packet_number);
+
+                self.on_packet_sent(packet_number);
+
+                packet_len
+            });
+
+            if res.is_none() {
+                break;
             }
         }
-
-        // make sure we sent a packet
-        // ensure!(!output.is_empty());
-
-        publisher.on_stream_control_packet_transmitted(
-            event::builder::StreamControlPacketTransmitted {
-                packet_len: result,
-                control_data_len: encoding_size.as_u64() as usize,
-                packet_number: packet_number.as_u64(),
-            },
-        );
-
-        // record the max value we've seen for removing old packet numbers
-        self.stream_ack.on_transmit(packet_number);
-        self.recovery_ack.on_transmit(packet_number);
-
-        self.on_packet_sent(packet_number);
     }
 
     #[inline]
-    fn on_transmit_error<K, Clk, Pub>(
+    fn on_transmit_error<K, T, Clk, Pub>(
         &mut self,
         control_key: &K,
         credentials: &Credentials,
         stream_id: stream::Id,
         source_queue_id: Option<VarInt>,
-        output: &Pool,
+        queue: &mut T,
         _clock: &Clk,
         publisher: &Pub,
     ) where
         K: crypto::seal::control::Stream,
+        T: TransmitQueue,
         Clk: Clock + ?Sized,
         Pub: event::ConnectionPublisher,
     {
@@ -940,64 +913,53 @@ impl State {
         // Only transmit errors that we originated
         ensure!(matches!(error.source, Location::Local));
 
-        let mtu = self.mtu() as usize;
+        let _ = queue.push_with(|mut buffer| {
+            let packet_number = self.next_pn();
 
-        let packet_number = self.next_pn();
+            let encoder = EncoderBuffer::new(&mut buffer[..]);
 
-        ensure!(let Some(mut segment) = output.alloc());
+            let frame = error
+                .error
+                .connection_close()
+                .unwrap_or_else(|| s2n_quic_core::transport::Error::NO_ERROR.into());
 
-        // segment.set_ecn(self.ecn());
+            let encoding_size = frame.encoding_size().try_into().unwrap();
 
-        let buffer: &mut Vec<u8> = todo!();
-        buffer.resize(mtu, 0);
+            let result = control::encoder::encode(
+                encoder,
+                source_queue_id,
+                Some(stream_id),
+                packet_number,
+                VarInt::ZERO,
+                &mut &[][..],
+                encoding_size,
+                &frame,
+                control_key,
+                credentials,
+            );
 
-        let encoder = EncoderBuffer::new(buffer);
-
-        let frame = error
-            .error
-            .connection_close()
-            .unwrap_or_else(|| s2n_quic_core::transport::Error::NO_ERROR.into());
-
-        let encoding_size = frame.encoding_size().try_into().unwrap();
-
-        let result = control::encoder::encode(
-            encoder,
-            source_queue_id,
-            Some(stream_id),
-            packet_number,
-            VarInt::ZERO,
-            &mut &[][..],
-            encoding_size,
-            &frame,
-            control_key,
-            credentials,
-        );
-
-        match result {
-            0 => {
-                return;
+            if result == 0 {
+                return 0;
             }
-            packet_len => {
-                buffer.truncate(packet_len);
-                // output.push(segment);
-            }
-        }
 
-        tracing::debug!(connection_close = ?frame);
+            tracing::debug!(connection_close = ?frame);
 
-        publisher.on_stream_control_packet_transmitted(
-            event::builder::StreamControlPacketTransmitted {
-                packet_len: result,
-                control_data_len: encoding_size.as_u64() as usize,
-                packet_number: packet_number.as_u64(),
-            },
-        );
+            publisher.on_stream_control_packet_transmitted(
+                event::builder::StreamControlPacketTransmitted {
+                    packet_len: result,
+                    control_data_len: encoding_size.as_u64() as usize,
+                    packet_number: packet_number.as_u64(),
+                },
+            );
 
-        // clean things up
-        self.stream_ack.clear();
-        self.recovery_ack.clear();
+            // clean things up
+            self.stream_ack.clear();
+            self.recovery_ack.clear();
 
-        self.on_packet_sent(packet_number);
+            self.on_packet_sent(packet_number);
+
+            result
+        });
     }
 
     #[inline]

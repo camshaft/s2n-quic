@@ -7,7 +7,7 @@ use crate::{
     credentials::Credentials,
     event,
     socket::{
-        pool::Pool as Packets,
+        pool::{self, Pool as Packets},
         recv::{router::Router, udp},
         send,
     },
@@ -16,7 +16,7 @@ use crate::{
         environment::{tokio::Environment, udp::Config, Environment as _},
         recv::dispatch::{Allocator as Queues, Control, Stream},
         server::{accept, udp::Acceptor},
-        socket::{application::Single, SendOnly, Tracing},
+        socket::{application::Single, Gso, SendOnly, Tracing},
     },
 };
 use s2n_quic_platform::socket::options::{Options, ReusePort};
@@ -31,6 +31,7 @@ use tracing::Instrument;
 pub(super) struct Pool {
     sockets: Box<[PoolSocket]>,
     local_addr: SocketAddr,
+    transmission_pool: pool::Sharded,
 }
 
 struct PoolSocket {
@@ -47,13 +48,14 @@ impl PoolSocket {
 
         let create_socket = || {
             let wheel = send::wheel::Wheel::new(config.send_wheel_horizon, clock);
-            stream::socket::Wheel::new(wheel, local_addr.into())
+            let socket = stream::socket::Wheel::new(wheel, local_addr.into());
+            Tracing(socket)
         };
 
-        let worker = Arc::new(Tracing(create_socket()));
+        let worker = Arc::new(create_socket());
 
         let application = (0..config.priority_levels)
-            .map(|_| Arc::new(Single(Tracing(create_socket()))))
+            .map(|_| Arc::new(Single(create_socket())))
             .collect::<Vec<_>>()
             .into_boxed_slice();
 
@@ -70,7 +72,7 @@ impl PoolSocket {
         config: &Config,
         env: &Environment<impl event::Subscriber + Clone>,
     ) {
-        let socket = SendOnly(self.socket.clone());
+        let socket = Tracing(Gso(SendOnly(self.socket.clone()), env.gso.clone()));
 
         let mut wheels = vec![(***self.worker).clone()];
 
@@ -130,23 +132,15 @@ impl Pool {
             tx
         };
 
-        let max_packet_size = config.max_packet_size;
-        let packet_count = config.packet_count;
-        let create_packets = || Packets::new(max_packet_size, packet_count);
+        let transmission_pool = config.tx_packet_pool(workers);
 
         macro_rules! spawn {
             ($create_router:expr) => {
                 if config.blocking {
-                    Self::spawn_blocking(env, &config, &sockets, create_packets, $create_router)
+                    Self::spawn_blocking(env, &config, &sockets, $create_router)
                 } else {
                     let _rt = env.reader_rt.enter();
-                    Self::spawn_non_blocking(
-                        env,
-                        &config,
-                        &sockets,
-                        create_packets,
-                        $create_router,
-                    )?;
+                    Self::spawn_non_blocking(env, &config, &sockets, $create_router)?;
                 }
             };
         }
@@ -165,6 +159,7 @@ impl Pool {
                     queues.clone(),
                     app_socket,
                     worker_socket,
+                    transmission_pool.clone(),
                     unroutable_packets.clone(),
                 );
 
@@ -187,13 +182,20 @@ impl Pool {
         Ok(Self {
             sockets: sockets.into(),
             local_addr,
+            transmission_pool,
         })
     }
 
     pub fn alloc(
         &self,
         credentials: Option<&Credentials>,
-    ) -> (Control, Stream, ApplicationSendSocket, WorkerSendSocket) {
+    ) -> (
+        Control,
+        Stream,
+        ApplicationSendSocket,
+        WorkerSendSocket,
+        pool::Sharded,
+    ) {
         // "Pick 2" worker selection
         let idx = self.pick_worker();
 
@@ -207,8 +209,15 @@ impl Pool {
 
         let worker_socket = socket.worker.clone();
         let app_socket = socket.application[priority].clone();
+        let transmission_pool = self.transmission_pool.clone();
 
-        (control, stream, app_socket, worker_socket)
+        (
+            control,
+            stream,
+            app_socket,
+            worker_socket,
+            transmission_pool,
+        )
     }
 
     /// Implements "pick 2" load balancing: select two random workers and choose the one with lower queue length
@@ -243,13 +252,12 @@ impl Pool {
         env: &Environment<impl event::Subscriber + Clone>,
         config: &Config,
         sockets: &[PoolSocket],
-        create_packets: impl Fn() -> Packets,
         create_router: impl Fn(&Packets, &PoolSocket) -> R,
     ) where
         R: 'static + Send + Router,
     {
         for (udp_socket_worker, socket) in sockets.iter().enumerate() {
-            let packets = create_packets();
+            let packets = config.rx_packet_pool();
             let router = create_router(&packets, socket);
             let recv_socket = socket.socket.clone();
             let span = tracing::trace_span!("udp_socket_worker", udp_socket_worker);
@@ -266,14 +274,13 @@ impl Pool {
         env: &Environment<impl event::Subscriber + Clone>,
         config: &Config,
         sockets: &[PoolSocket],
-        create_packets: impl Fn() -> Packets,
         create_router: impl Fn(&Packets, &PoolSocket) -> R,
     ) -> Result<()>
     where
         R: 'static + Send + Router,
     {
         for (udp_socket_worker, socket) in sockets.iter().enumerate() {
-            let packets = create_packets();
+            let packets = config.rx_packet_pool();
             let router = create_router(&packets, socket);
             let recv_socket = AsyncFd::new(socket.socket.clone())?;
             let span = tracing::trace_span!("udp_socket_worker", udp_socket_worker);

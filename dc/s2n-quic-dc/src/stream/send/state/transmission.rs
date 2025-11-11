@@ -1,13 +1,59 @@
 // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::{
+    packet::stream::PacketSpace,
+    socket::{
+        pool::descriptor,
+        send::{self, completion},
+    },
+    stream::send::{shared, transmission::Type},
+};
 use core::ops::Bound;
 use s2n_quic_core::{inet::ExplicitCongestionNotification, time::Timestamp, varint::VarInt};
+use std::sync::Weak;
+
+pub type Completion = Weak<dyn crate::stream::send::shared::AsShared>;
+
+pub type Entry = send::transmission::Entry<PacketInfo, Meta, Completion>;
+
+pub type Transmission = send::transmission::Transmission<PacketInfo, Meta, Completion>;
+
+pub type Builder = send::transmission::Builder<PacketInfo, Meta, Completion>;
+
+pub type Wheel<const GRANULARITY_US: u64> =
+    send::wheel::Wheel<PacketInfo, Meta, Completion, GRANULARITY_US>;
+
+pub type PacketInfo = (VarInt, Info);
+
+pub struct Event {
+    pub packet_number: VarInt,
+    pub info: Info,
+    pub meta: Meta,
+}
+
+pub type Queue = completion::Queue<PacketInfo, Meta, Weak<dyn shared::AsShared>>;
+pub type CompleteTransmission<'a> = completion::CompleteTransmission<'a, PacketInfo, Meta>;
 
 #[derive(Debug)]
-pub struct Info<Retransmission> {
+pub struct Meta {
+    pub packet_space: PacketSpace,
+    pub has_more_app_data: bool,
+}
+
+impl Default for Meta {
+    fn default() -> Self {
+        Self {
+            packet_space: PacketSpace::Stream,
+            has_more_app_data: false,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct Info {
     pub packet_len: u16,
-    pub retransmission: Option<Retransmission>,
+    pub descriptor: Option<descriptor::Filled>,
     pub stream_offset: VarInt,
     pub payload_len: u16,
     pub included_fin: bool,
@@ -15,30 +61,7 @@ pub struct Info<Retransmission> {
     pub ecn: ExplicitCongestionNotification,
 }
 
-impl<Retransmission> Info<Retransmission> {
-    #[inline]
-    pub fn map<R>(self, f: impl FnOnce(Retransmission) -> R) -> Info<R> {
-        let Self {
-            packet_len,
-            retransmission,
-            stream_offset,
-            payload_len,
-            included_fin,
-            time_sent,
-            ecn,
-        } = self;
-        let retransmission = retransmission.map(f);
-        Info {
-            packet_len,
-            retransmission,
-            stream_offset,
-            payload_len,
-            included_fin,
-            time_sent,
-            ecn,
-        }
-    }
-
+impl Info {
     #[inline]
     pub fn cca_len(&self) -> u16 {
         if self.payload_len == 0 {
@@ -46,6 +69,10 @@ impl<Retransmission> Info<Retransmission> {
         } else {
             self.payload_len
         }
+    }
+
+    pub fn is_probe(&self) -> bool {
+        self.payload_len == 0
     }
 
     #[inline]
@@ -72,24 +99,19 @@ impl<Retransmission> Info<Retransmission> {
     }
 }
 
-impl<Retransmission: Copy> Info<Retransmission> {
+impl Info {
     #[inline]
-    pub fn retransmit_copy(
-        &self,
-    ) -> Option<(
-        Retransmission,
-        super::retransmission::Segment<Retransmission>,
-    )> {
-        let segment = self.retransmission?;
+    pub fn try_retransmit(&mut self) -> Option<super::retransmission::Segment> {
+        let descriptor = self.descriptor.take()?;
 
         let retransmission = super::retransmission::Segment {
-            segment,
+            descriptor,
             stream_offset: self.stream_offset,
             payload_len: self.payload_len,
-            ty: super::TransmissionType::Stream,
+            ty: Type::Stream,
             included_fin: self.included_fin,
         };
 
-        Some((segment, retransmission))
+        Some(retransmission)
     }
 }

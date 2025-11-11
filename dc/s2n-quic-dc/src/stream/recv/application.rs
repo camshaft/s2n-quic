@@ -4,7 +4,6 @@
 use crate::{
     clock::Timer,
     event::{self, ConnectionPublisher as _},
-    msg,
     stream::{
         recv, runtime,
         shared::{AcceptState, ArcShared, ShutdownKind},

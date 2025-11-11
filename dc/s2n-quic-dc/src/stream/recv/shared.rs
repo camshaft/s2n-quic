@@ -4,9 +4,9 @@
 use crate::{
     clock,
     either::Either,
-    event, msg,
+    event,
     packet::{stream, Packet},
-    socket::pool::Pool,
+    socket::{pool::Pool, send::transmission},
     stream::{
         recv::{self, buffer::Buffer as _},
         shared::{self, handshake, AcceptState, ArcShared, ShutdownKind},
@@ -32,7 +32,7 @@ use s2n_quic_core::{
     varint::VarInt,
 };
 use std::{
-    io,
+    io::{self, IoSliceMut},
     sync::{
         atomic::{AtomicU64, AtomicU8, Ordering},
         Mutex, MutexGuard,
@@ -51,15 +51,39 @@ pub enum AckMode {
     Worker,
 }
 
-pub enum ApplicationState {
+pub struct ApplicationState {
+    pub status: ApplicationStatus,
+    pub wants_ack: bool,
+}
+
+pub enum ApplicationStatus {
     Open,
     Closed { shutdown_kind: ShutdownKind },
+}
+
+impl ApplicationStatus {
+    fn from_u8(value: u8) -> Self {
+        if value == 0 {
+            return Self::Open;
+        }
+
+        let mut shutdown_kind = ShutdownKind::Normal;
+        for (kind, mask) in ApplicationState::SHUTDOWN_KINDS {
+            if value & mask != 0 {
+                shutdown_kind = *kind;
+                break;
+            }
+        }
+
+        Self::Closed { shutdown_kind }
+    }
 }
 
 impl ApplicationState {
     const IS_CLOSED_MASK: u8 = 1;
     const IS_ERRORED_MASK: u8 = 1 << 1;
     const IS_PRUNED_MASK: u8 = 1 << 2;
+    const WANTS_ACK: u8 = 1 << 3;
 
     const SHUTDOWN_KINDS: &[(ShutdownKind, u8)] = &[
         (ShutdownKind::Errored, Self::IS_ERRORED_MASK),
@@ -69,19 +93,13 @@ impl ApplicationState {
     #[inline]
     fn load(shared: &AtomicU8) -> Self {
         let value = shared.load(Ordering::Acquire);
-        if value == 0 {
-            return Self::Open;
-        }
+        let status = ApplicationStatus::from_u8(value);
+        let wants_ack = value & Self::WANTS_ACK != 0;
+        Self { status, wants_ack }
+    }
 
-        let mut shutdown_kind = ShutdownKind::Normal;
-        for (kind, mask) in Self::SHUTDOWN_KINDS {
-            if value & mask != 0 {
-                shutdown_kind = *kind;
-                break;
-            }
-        }
-
-        Self::Closed { shutdown_kind }
+    fn wants_ack(shared: &AtomicU8) {
+        shared.fetch_or(Self::WANTS_ACK, Ordering::Release);
     }
 
     #[inline]
@@ -102,7 +120,10 @@ impl ApplicationState {
     }
 }
 
-#[derive(Debug)]
+pub trait AsShared: 'static + Send + Sync {
+    fn as_shared(&self) -> &State;
+}
+
 pub struct State {
     inner: Mutex<Inner>,
     application_epoch: AtomicU64,
@@ -283,31 +304,8 @@ where
             false
         );
 
-        match self.ack_mode {
-            AckMode::Application => {
-                // self.inner
-                //     .fill_transmit_queue(self.shared, self.send_buffer);
-
-                // ensure!(!self.send_buffer.is_empty(), false);
-
-                // let did_send = self
-                //     .sockets
-                //     .read_application()
-                //     .try_send_buffer(self.send_buffer)
-                //     .is_ok();
-
-                // // clear out the sender buffer if we didn't already
-                // let _ = self.send_buffer.drain();
-                let did_send: bool = todo!();
-
-                // only wake the worker if we weren't able to transmit the ACK
-                !did_send
-            }
-            AckMode::Worker => {
-                // only wake the worker if the receiver says we should
-                self.inner.receiver.should_transmit()
-            }
-        }
+        // only wake the worker if the receiver says we should
+        self.inner.receiver.should_transmit()
     }
 }
 
@@ -349,7 +347,8 @@ where
         }
 
         if wake_worker_for_ack && !current_state.is_terminal() {
-            // TODO wake the worker
+            ApplicationState::wants_ack(&self.shared.receiver.application_state);
+            self.shared.receiver.worker_waker.wake_forced();
         }
 
         // no need to look at anything if the state didn't change
@@ -360,6 +359,10 @@ where
             self.shared.receiver.shutdown(ShutdownKind::Normal);
         }
     }
+}
+
+pub trait TransmitQueue {
+    fn push_with<F: FnOnce(IoSliceMut) -> usize>(&mut self, f: F) -> Option<usize>;
 }
 
 pub struct Inner {
@@ -387,9 +390,10 @@ impl Inner {
     }
 
     #[inline]
-    pub fn fill_transmit_queue<Sub>(&mut self, shared: &ArcShared<Sub>, pool: &Pool)
+    pub fn fill_transmit_queue<Sub, T>(&mut self, shared: &ArcShared<Sub>, transmit_queue: &mut T)
     where
         Sub: event::Subscriber,
+        T: TransmitQueue,
     {
         let stream_id = shared.stream_id();
         let source_queue_id = shared.local_queue_id();
@@ -402,16 +406,10 @@ impl Inner {
             shared.credentials(),
             stream_id,
             source_queue_id,
-            pool,
+            transmit_queue,
             &shared.clock,
             &shared.publisher(),
         );
-
-        // ensure!(!send_buffer.is_empty());
-
-        // Update the remote address with the latest value
-        // send_buffer.set_remote_address(shared.remote_addr());
-        todo!()
     }
 
     #[inline]

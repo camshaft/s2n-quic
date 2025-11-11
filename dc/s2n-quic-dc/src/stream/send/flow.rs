@@ -3,7 +3,6 @@
 
 use s2n_quic_core::varint::VarInt;
 
-pub mod blocking;
 pub mod non_blocking;
 
 /// Flow credits acquired by an application request

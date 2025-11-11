@@ -49,8 +49,6 @@ pub type Stream = application::Stream<Subscriber>;
 pub use read::Reader;
 pub use write::Writer;
 
-const DEFAULT_POOLED: bool = true;
-
 // limit the number of threads used in testing to reduce costs of harnesses
 const TEST_THREADS: usize = 2;
 
@@ -498,7 +496,6 @@ pub mod client {
         map_capacity: usize,
         mtu: Option<u16>,
         subscriber: event::testing::Subscriber,
-        pooled: bool,
     }
 
     impl Default for Builder {
@@ -507,7 +504,6 @@ pub mod client {
                 map_capacity: 16,
                 mtu: None,
                 subscriber: event::testing::Subscriber::no_snapshot(),
-                pooled: DEFAULT_POOLED,
             }
         }
     }
@@ -533,7 +529,6 @@ pub mod client {
                 map_capacity,
                 mtu,
                 subscriber,
-                pooled,
             } = self;
             let _span = tracing::info_span!("client").entered();
             let map = secret::map::testing::new(map_capacity);
@@ -541,26 +536,24 @@ pub mod client {
             let subscriber = (subscriber, event::tracing::Subscriber::default());
 
             macro_rules! build {
-                ($krate:ident, $pooled:expr, $addr:expr) => {{
+                ($krate:ident, $addr:expr) => {{
                     let options = socket::options::Options::new($addr.parse().unwrap());
 
                     let mut env = $krate::Builder::new(subscriber)
                         .with_threads(TEST_THREADS)
                         .with_socket_options(options);
 
-                    if $pooled {
-                        let pool = udp::Config::new(map.clone());
-                        env = env.with_pool(pool);
-                    }
+                    let pool = udp::Config::new(map.clone());
+                    env = env.with_pool(pool);
 
                     env.build().unwrap()
                 }};
             }
 
             let env = if ::bach::is_active() {
-                Either::B(build!(bach, true, "0.0.0.0:0"))
+                Either::B(build!(bach, "0.0.0.0:0"))
             } else {
-                Either::A(build!(tokio, pooled, "127.0.0.1:0"))
+                Either::A(build!(tokio, "127.0.0.1:0"))
             };
 
             Client { map, env, mtu }
@@ -712,7 +705,6 @@ pub mod server {
         linger: Option<Duration>,
         mtu: Option<u16>,
         subscriber: event::testing::Subscriber,
-        pooled: bool,
         port: u16,
     }
 
@@ -726,7 +718,6 @@ pub mod server {
                 linger: None,
                 mtu: None,
                 subscriber: event::testing::Subscriber::no_snapshot(),
-                pooled: DEFAULT_POOLED,
                 port: 0,
             }
         }
@@ -792,7 +783,6 @@ pub mod server {
                 linger,
                 mtu,
                 subscriber,
-                pooled,
                 port,
             } = self;
 
@@ -807,7 +797,7 @@ pub mod server {
             );
 
             macro_rules! build {
-                ($krate:ident, $pooled:expr) => {{
+                ($krate:ident) => {{
                     let ip: IpAddr = "127.0.0.1".parse().unwrap();
                     let options = crate::socket::Options::new((ip, port).into());
 
@@ -815,12 +805,10 @@ pub mod server {
                         .with_threads(TEST_THREADS)
                         .with_socket_options(options.clone());
 
-                    if $pooled {
-                        let mut pool = udp::Config::new(map.clone());
-                        pool.accept_flavor = flavor;
-                        pool.reuse_port = true;
-                        env = env.with_pool(pool).with_acceptor(sender.clone());
-                    }
+                    let mut pool = udp::Config::new(map.clone());
+                    pool.accept_flavor = flavor;
+                    pool.reuse_port = true;
+                    env = env.with_pool(pool).with_acceptor(sender.clone());
 
                     let env = env.build().unwrap();
                     (env, options)
@@ -833,11 +821,11 @@ pub mod server {
             let local_addr = if ::bach::is_active() {
                 assert_eq!(Protocol::Udp, protocol, "bach only supports UDP currently");
 
-                let (env, _options) = build!(bach, true);
+                let (env, _options) = build!(bach);
 
                 env.pool_addr().unwrap()
             } else {
-                let (env, options) = build!(tokio, pooled);
+                let (env, options) = build!(tokio);
 
                 let local_addr = match protocol {
                     Protocol::Tcp => {
@@ -864,24 +852,9 @@ pub mod server {
 
                         local_addr
                     }
-                    Protocol::Udp if pooled => {
+                    Protocol::Udp => {
                         // acceptor configured in env
                         env.pool_addr().unwrap()
-                    }
-                    Protocol::Udp => {
-                        let socket = options.build_udp().unwrap();
-                        let local_addr = socket.local_addr().unwrap();
-
-                        let socket = ::tokio::io::unix::AsyncFd::new(socket).unwrap();
-
-                        let acceptor = stream_server::tokio::udp::Acceptor::new(
-                            0, socket, &sender, &env, &map, flavor,
-                        );
-                        let acceptor = drop_handle_receiver.wrap(acceptor.run());
-                        let acceptor = acceptor.instrument(tracing::info_span!("udp"));
-                        ::tokio::task::spawn(acceptor);
-
-                        local_addr
                     }
                     Protocol::Other(name) => {
                         todo!("protocol {name:?} not implemented")

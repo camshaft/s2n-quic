@@ -144,12 +144,18 @@ where
         };
 
         let local_port = tcp_stream.local_addr()?.port();
+        let transmission_pool = self
+            .env
+            .tcp_transmission_pool()
+            .expect("no tcp transmission pool")
+            .clone();
         let socket = LazyBoundStream::Tokio(tcp_stream);
         let peer = env::tcp::Reregistered {
             socket,
             peer_addr: remote_address.into(),
             local_port,
             recv_buffer,
+            transmission_pool,
         };
         let stream_builder = match endpoint::accept_stream(
             now,

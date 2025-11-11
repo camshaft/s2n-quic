@@ -337,6 +337,10 @@ impl Filled {
         self.ecn
     }
 
+    pub fn set_ecn(&mut self, ecn: ExplicitCongestionNotification) {
+        self.ecn = ecn;
+    }
+
     /// Returns the length of the payload
     #[inline]
     pub fn len(&self) -> u16 {
@@ -455,12 +459,28 @@ pub struct Segments {
 }
 
 impl Segments {
+    pub fn new(descriptor: Filled, segment_len: u16) -> Self {
+        let segment_len = if segment_len == 0 {
+            descriptor.len()
+        } else {
+            segment_len.min(descriptor.len())
+        };
+        Self {
+            descriptor,
+            segment_len,
+        }
+    }
+
     pub fn is_empty(&self) -> bool {
         self.descriptor.len() == 0
     }
 
     pub fn total_payload_len(&self) -> u16 {
         self.descriptor.len()
+    }
+
+    pub fn take_filled(self) -> Filled {
+        self.descriptor
     }
 
     pub fn send_with<F, R>(&self, f: F) -> R

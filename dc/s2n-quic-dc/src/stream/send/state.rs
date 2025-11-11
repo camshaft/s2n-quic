@@ -7,17 +7,15 @@ use crate::{
     crypto, event,
     packet::{
         self,
-        stream::{self, decoder, encoder},
+        stream::{self, decoder, encoder, PacketSpace},
     },
     recovery,
-    socket::pool::{descriptor, Pool},
     stream::{
         processing,
         send::{
-            application,
+            application::state::Message,
             error::{self, Error},
             filter::Filter,
-            transmission::Type as TransmissionType,
         },
         DEFAULT_IDLE_TIMEOUT,
     },
@@ -43,11 +41,7 @@ use s2n_quic_core::{
     },
     varint::VarInt,
 };
-use slotmap::SlotMap;
-use std::{
-    collections::{BinaryHeap, VecDeque},
-    sync::Arc,
-};
+use std::collections::BinaryHeap;
 use tracing::{debug, trace};
 
 pub mod probe;
@@ -56,29 +50,15 @@ pub mod transmission;
 
 type PacketMap<Info> = s2n_quic_core::packet::number::Map<Info>;
 
-type Segment = Arc<descriptor::Filled>;
-
-pub type Transmission = application::transmission::Event<Segment>;
-
-slotmap::new_key_type! {
-    pub struct BufferIndex;
-}
-
-#[derive(Clone, Debug)]
-pub enum TransmitIndex {
-    Stream(BufferIndex, Segment),
-    Recovery(BufferIndex),
-}
-
 #[derive(Debug)]
 pub struct SentStreamPacket {
-    info: transmission::Info<BufferIndex>,
+    info: transmission::Info,
     cc_info: congestion::PacketInfo,
 }
 
 #[derive(Debug)]
 pub struct SentRecoveryPacket {
-    info: transmission::Info<BufferIndex>,
+    info: transmission::Info,
     cc_info: congestion::PacketInfo,
     max_stream_packet_number: VarInt,
 }
@@ -122,16 +102,12 @@ impl ErrorState {
 pub struct State {
     pub rtt_estimator: RttEstimator,
     pub sent_stream_packets: PacketMap<SentStreamPacket>,
-    pub stream_packet_buffers: SlotMap<BufferIndex, Segment>,
     pub max_stream_packet_number: VarInt,
     pub sent_recovery_packets: PacketMap<SentRecoveryPacket>,
-    pub recovery_packet_buffers: SlotMap<BufferIndex, Segment>,
     pub recovery_packet_number: u64,
     pub last_sent_recovery_packet: Option<Timestamp>,
-    pub transmit_queue: VecDeque<TransmitIndex>,
     pub state: state::Sender,
     pub control_filter: Filter,
-    pub retransmissions: BinaryHeap<retransmission::Segment<BufferIndex>>,
     pub next_expected_control_packet: VarInt,
     pub cca: congestion::Controller,
     pub ecn: ecn::Controller,
@@ -148,6 +124,8 @@ pub struct State {
     pub max_datagram_size: u16,
     pub max_sent_segment_size: u16,
     pub is_reliable: bool,
+    pub retransmissions: BinaryHeap<retransmission::Segment>,
+    pub pending_transmission_credits: u16,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -174,17 +152,13 @@ impl State {
             rtt_estimator: recovery::rtt_estimator(),
             cca,
             sent_stream_packets: Default::default(),
-            stream_packet_buffers: Default::default(),
             max_stream_packet_number: VarInt::ZERO,
             sent_recovery_packets: Default::default(),
-            recovery_packet_buffers: Default::default(),
             recovery_packet_number: 0,
             last_sent_recovery_packet: None,
-            transmit_queue: Default::default(),
             control_filter: Default::default(),
             ecn: ecn::Controller::default(),
             state: Default::default(),
-            retransmissions: Default::default(),
             pto: Pto::default(),
             pto_backoff: INITIAL_PTO_BACKOFF,
             idle_timer: Default::default(),
@@ -198,6 +172,8 @@ impl State {
             max_datagram_size,
             max_sent_segment_size: 0,
             is_reliable: stream_id.is_reliable,
+            retransmissions: Default::default(),
+            pending_transmission_credits: 0,
         }
     }
 
@@ -260,7 +236,7 @@ impl State {
         packet: &mut packet::control::decoder::Packet,
         random: &mut dyn random::Generator,
         clock: &Clk,
-        transmission_queue: &application::transmission::Queue<Segment>,
+        transmission_queue: &transmission::Queue,
         publisher: &Pub,
     ) -> Result<(), processing::Error>
     where
@@ -297,7 +273,7 @@ impl State {
         packet: &mut packet::control::decoder::Packet,
         random: &mut dyn random::Generator,
         clock: &Clk,
-        transmission_queue: &application::transmission::Queue<Segment>,
+        transmission_queue: &transmission::Queue,
         publisher: &Pub,
     ) -> Result<Option<processing::Error>, Error>
     where
@@ -356,7 +332,7 @@ impl State {
                 FrameMut::Ack(ack) => {
                     if !core::mem::replace(&mut loaded_transmit_queue, true) {
                         // make sure we have a current view of the application transmissions
-                        self.load_transmission_queue(transmission_queue);
+                        self.load_completion_queue(transmission_queue);
                     }
 
                     if ack.ecn_counts.is_some() {
@@ -503,13 +479,6 @@ impl State {
                             cca_args = Some((packet.info.time_sent, packet.cc_info));
                         }
 
-                        // free the retransmission segment
-                        if let Some(segment) = packet.info.retransmission {
-                            if let Some(segment) = self.stream_packet_buffers.remove(segment) {
-                                drop(segment)
-                            }
-                        }
-
                         publisher.on_stream_packet_acked(event::builder::StreamPacketAcked {
                             packet_len: packet.info.packet_len as usize,
                             stream_offset: packet.info.stream_offset.as_u64(),
@@ -519,7 +488,7 @@ impl State {
                             lifetime: clock
                                 .get_time()
                                 .saturating_duration_since(packet.info.time_sent),
-                            is_retransmission: packet.info.retransmission.is_some(),
+                            is_retransmission: matches!(PacketSpace::$space, PacketSpace::Recovery),
                         });
 
                         *newly_acked = true;
@@ -546,7 +515,7 @@ impl State {
                         (*max_acked_stream).max(Some(sent_packet.max_stream_packet_number));
 
                     // increase the max stream packet if this was a probe
-                    if sent_packet.info.retransmission.is_none() {
+                    if sent_packet.info.is_probe() {
                         self.max_stream_packet_number = self
                             .max_stream_packet_number
                             .max(sent_packet.max_stream_packet_number + 1);
@@ -600,14 +569,14 @@ impl State {
             return Ok(());
         };
 
-        let mut is_unrecoverable = false;
+        let is_unrecoverable = false;
 
         macro_rules! impl_loss_detection {
             ($sent_packets:ident, $on_packet:expr) => {{
                 let lost_min = PacketNumberSpace::Initial.new_packet_number(VarInt::ZERO);
                 let lost_max = PacketNumberSpace::Initial.new_packet_number(loss_threshold);
                 let range = s2n_quic_core::packet::number::PacketNumberRange::new(lost_min, lost_max);
-                for (num, packet) in self.$sent_packets.remove_range(range) {
+                for (num, mut packet) in self.$sent_packets.remove_range(range) {
                     // TODO create a path and publisher
                     // self.ecn.on_packet_loss(packet.time_sent, packet.ecn, now, path, publisher);
 
@@ -627,18 +596,13 @@ impl State {
                         packet_number: num.as_u64(),
                         time_sent: packet.info.time_sent.into_event(),
                         lifetime: now.saturating_duration_since(packet.info.time_sent),
-                        is_retransmission: packet.info.retransmission.is_some(),
+                        is_retransmission: packet_space.is_recovery(),
                     });
 
                     #[allow(clippy::redundant_closure_call)]
                     ($on_packet)(&packet);
 
-                    if let Some((segment, retransmission)) = packet.info.retransmit_copy() {
-                        // the stream segment was cleaned up so no need to retransmit
-                        if !self.stream_packet_buffers.contains_key(segment) {
-                            continue;
-                        }
-
+                    if let Some(retransmission) = packet.info.try_retransmit() {
                         // update our local packet number to be at least 1 more than the largest lost
                         // packet number
                         let min_recovery_packet_number = num.as_u64() + 1;
@@ -647,8 +611,7 @@ impl State {
 
                         self.retransmissions.push(retransmission);
                     } else {
-                        // we can only recover reliable streams
-                        is_unrecoverable |= packet.info.payload_len > 0 && !self.is_reliable;
+                        // TODO how do we know if the retransmission is in-flight or not?
                     }
                 }
             }}
@@ -680,41 +643,43 @@ impl State {
     /// This ensures that we're not wasting resources by sending empty payloads, especially
     /// when there's outstanding data waiting to be ACK'd.
     fn make_stream_packets_as_pto_probes(&mut self) {
-        // check to see if we have in-flight stream segments
-        ensure!(!self.sent_stream_packets.is_empty());
-        // only reliable streams store segments
-        ensure!(self.is_reliable);
+        // TODO we send_stream_packets doesn't have an `iter_mut` - need to update the packet number map to include that
 
-        let pto = self.pto.transmissions() as usize;
+        // // check to see if we have in-flight stream segments
+        // ensure!(!self.sent_stream_packets.is_empty());
+        // // only reliable streams store segments
+        // ensure!(self.is_reliable);
 
-        // check if we already have retransmissions scheduled
-        let Some(mut remaining) = pto.checked_sub(self.retransmissions.len()) else {
-            return;
-        };
+        // let pto = self.pto.transmissions() as usize;
 
-        // iterate until remaining is 0.
-        //
-        // This nested loop a bit weird but it's intentional - if we have `remaining == 2` but only have a single
-        // in-flight stream segment then we want to transmit that segment `remaining` times.
-        while remaining > 0 {
-            for (num, packet) in self.sent_stream_packets.iter().take(remaining) {
-                let Some((_segment, retransmission)) = packet.info.retransmit_copy() else {
-                    // unreliable streams don't store segments so bail early - this was checked above
-                    return;
-                };
+        // // check if we already have retransmissions scheduled
+        // let Some(mut remaining) = pto.checked_sub(self.retransmissions.len()) else {
+        //     return;
+        // };
 
-                // update our local packet number to be at least 1 more than the largest lost
-                // packet number
-                let min_recovery_packet_number = num.as_u64() + 1;
-                self.recovery_packet_number =
-                    self.recovery_packet_number.max(min_recovery_packet_number);
+        // // iterate until remaining is 0.
+        // //
+        // // This nested loop a bit weird but it's intentional - if we have `remaining == 2` but only have a single
+        // // in-flight stream segment then we want to transmit that segment `remaining` times.
+        // while remaining > 0 {
+        //     for (num, packet) in self.sent_stream_packets.iter_mut().take(remaining) {
+        //         let Some(retransmission) = packet.info.try_retransmit() else {
+        //             // unreliable streams don't store segments so bail early - this was checked above
+        //             return;
+        //         };
 
-                self.retransmissions.push(retransmission);
+        //         // update our local packet number to be at least 1 more than the largest lost
+        //         // packet number
+        //         let min_recovery_packet_number = num.as_u64() + 1;
+        //         self.recovery_packet_number =
+        //             self.recovery_packet_number.max(min_recovery_packet_number);
 
-                // consider this as a PTO
-                remaining -= 1;
-            }
-        }
+        //         self.retransmissions.push(retransmission);
+
+        //         // consider this as a PTO
+        //         remaining -= 1;
+        //     }
+        // }
     }
 
     #[inline]
@@ -761,7 +726,7 @@ impl State {
 
         // force probing when we've sent all of the data but haven't got an ACK for the final
         // offset
-        if self.state.is_data_sent() && self.stream_packet_buffers.is_empty() {
+        if self.state.is_data_sent() && self.sent_stream_packets.is_empty() {
             self.pto.force_transmit();
         }
 
@@ -826,7 +791,7 @@ impl State {
     /// Returns `true` if there are any outstanding stream segments
     #[inline]
     fn has_inflight_packets(&self) -> bool {
-        !self.stream_packet_buffers.is_empty()
+        !self.sent_stream_packets.is_empty()
     }
 
     #[inline]
@@ -878,28 +843,30 @@ impl State {
     /// Called by the worker thread when it becomes aware of the application having transmitted a
     /// segment
     #[inline]
-    pub fn load_transmission_queue(
-        &mut self,
-        queue: &application::transmission::Queue<Segment>,
-    ) -> bool {
+    pub fn load_completion_queue(&mut self, queue: &transmission::Queue) -> bool {
         let mut did_transmit_stream = false;
 
-        for Transmission {
-            packet_number,
-            info,
-            has_more_app_data,
-        } in queue.drain()
-        {
+        queue.drain_completion_queue(|transmission| {
+            let (packet_number, mut info) = transmission.info;
+
+            // Use the actual transmission time rather than when it was submitted to give better RTT estimates
+            info.time_sent = transmission.transmission_time;
+
+            let meta = transmission.meta;
+            let has_more_app_data = meta.has_more_app_data;
             self.max_sent_segment_size = self.max_sent_segment_size.max(info.packet_len);
-            let info = info.map(|buffer| self.stream_packet_buffers.insert(buffer));
-            self.on_transmit_segment(
-                stream::PacketSpace::Stream,
-                packet_number,
-                info,
-                has_more_app_data,
-            );
-            did_transmit_stream = true;
-        }
+
+            // Store the buffer so we can retransmit if lost
+            if !info.is_probe() {
+                info.descriptor = Some(transmission.segment);
+            }
+
+            if meta.packet_space.is_stream() {
+                did_transmit_stream = true;
+            }
+
+            self.on_transmit_segment(meta.packet_space, packet_number, info, has_more_app_data);
+        });
 
         if did_transmit_stream {
             // if we just sent some packets then we can use those as probes
@@ -911,16 +878,22 @@ impl State {
         did_transmit_stream
     }
 
+    pub fn take_transmission_credits(&mut self) -> u16 {
+        core::mem::take(&mut self.pending_transmission_credits)
+    }
+
     #[inline]
     fn on_transmit_segment(
         &mut self,
         packet_space: stream::PacketSpace,
         packet_number: VarInt,
-        info: transmission::Info<BufferIndex>,
+        info: transmission::Info,
         has_more_app_data: bool,
     ) {
         // the BBR implementation requires monotonic time so track that
         let mut cca_time_sent = info.time_sent;
+
+        self.pending_transmission_credits += 1;
 
         match packet_space {
             stream::PacketSpace::Stream => {
@@ -974,19 +947,20 @@ impl State {
     }
 
     #[inline]
-    pub fn fill_transmit_queue<C, Clk, Pub>(
+    pub fn fill_transmit_queue<C, Clk, M, Pub>(
         &mut self,
         control_key: &C,
         credentials: &Credentials,
         stream_id: &stream::Id,
         source_queue_id: Option<VarInt>,
         clock: &Clk,
-        pool: &Pool,
+        packets: &mut M,
         publisher: &Pub,
     ) -> Result<(), Error>
     where
         C: crypto::seal::control::Stream,
         Clk: Clock,
+        M: Message,
         Pub: event::ConnectionPublisher,
     {
         if let Err(error) = self.fill_transmit_queue_impl(
@@ -995,7 +969,7 @@ impl State {
             stream_id,
             source_queue_id,
             clock,
-            pool,
+            packets,
             publisher,
         ) {
             self.on_error(error, Location::Local, publisher);
@@ -1006,19 +980,20 @@ impl State {
     }
 
     #[inline]
-    fn fill_transmit_queue_impl<C, Clk, Pub>(
+    fn fill_transmit_queue_impl<C, Clk, M, Pub>(
         &mut self,
         control_key: &C,
         credentials: &Credentials,
         stream_id: &stream::Id,
         source_queue_id: Option<VarInt>,
         clock: &Clk,
-        pool: &Pool,
+        packets: &mut M,
         publisher: &Pub,
     ) -> Result<(), Error>
     where
         C: crypto::seal::control::Stream,
         Clk: Clock,
+        M: Message,
         Pub: event::ConnectionPublisher,
     {
         // skip a packet number if we're probing
@@ -1029,13 +1004,13 @@ impl State {
             self.make_stream_packets_as_pto_probes();
         }
 
-        self.try_transmit_retransmissions(control_key, clock, publisher)?;
+        self.try_transmit_retransmissions(control_key, clock, packets, publisher)?;
         self.try_transmit_probe(
             control_key,
             credentials,
             stream_id,
             source_queue_id,
-            pool,
+            packets,
             clock,
         )?;
 
@@ -1043,15 +1018,17 @@ impl State {
     }
 
     #[inline]
-    fn try_transmit_retransmissions<C, Clk, Pub>(
+    fn try_transmit_retransmissions<C, Clk, M, Pub>(
         &mut self,
         control_key: &C,
         clock: &Clk,
+        packets: &mut M,
         publisher: &Pub,
     ) -> Result<(), Error>
     where
         C: crypto::seal::control::Stream,
         Clk: Clock,
+        M: Message,
         Pub: event::ConnectionPublisher,
     {
         // We'll only have retransmissions if we're reliable
@@ -1071,58 +1048,47 @@ impl State {
                 );
             }
 
-            let Some(segment) = self.stream_packet_buffers.get_mut(retransmission.segment) else {
-                // the segment was acknowledged by another packet so remove it
-                let _ = self
-                    .retransmissions
-                    .pop()
-                    .expect("retransmission should be available");
-                continue;
-            };
-            todo!();
-            // let buffer = segment.make_mut();
-
-            // debug_assert!(!buffer.is_empty(), "empty retransmission buffer submitted");
+            let mut info = self
+                .retransmissions
+                .pop()
+                .expect("retransmission should be available");
 
             let packet_number =
                 VarInt::new(self.recovery_packet_number).expect("2^62 is a lot of packets");
             self.recovery_packet_number += 1;
 
-            // {
-            //     let buffer = DecoderBufferMut::new(buffer);
-            //     match decoder::Packet::retransmit(
-            //         buffer,
-            //         stream::PacketSpace::Recovery,
-            //         packet_number,
-            //         control_key,
-            //     ) {
-            //         Ok(info) => info,
-            //         Err(err) => {
-            //             // this shouldn't ever happen
-            //             debug_assert!(false, "{err:?}");
-            //             return Err(error::Kind::RetransmissionFailure.err());
-            //         }
-            //     }
-            // };
+            let packet_len = {
+                let buffer = info.descriptor.payload_mut();
+
+                debug_assert!(!buffer.is_empty(), "empty retransmission buffer submitted");
+
+                {
+                    let buffer = DecoderBufferMut::new(buffer);
+                    match decoder::Packet::retransmit(
+                        buffer,
+                        stream::PacketSpace::Recovery,
+                        packet_number,
+                        control_key,
+                    ) {
+                        Ok(info) => info,
+                        Err(err) => {
+                            // this shouldn't ever happen
+                            debug_assert!(false, "{err:?}");
+                            return Err(error::Kind::RetransmissionFailure.err());
+                        }
+                    }
+                }
+
+                buffer.len() as u16
+            };
 
             let time_sent = clock.get_time();
-            // let packet_len = buffer.len() as u16;
-            let packet_len = 0;
 
             {
-                let info = self
-                    .retransmissions
-                    .pop()
-                    .expect("retransmission should be available");
-
-                // enqueue the transmission
-                self.transmit_queue
-                    .push_back(TransmitIndex::Stream(info.segment, segment.clone()));
-
                 let stream_offset = info.stream_offset;
                 let payload_len = info.payload_len;
                 let included_fin = info.included_fin;
-                let retransmission = Some(info.segment);
+                let descriptor = info.descriptor;
 
                 // TODO store this as part of the packet queue
                 let ecn = ExplicitCongestionNotification::Ect0;
@@ -1132,9 +1098,20 @@ impl State {
                     stream_offset,
                     payload_len,
                     included_fin,
-                    retransmission,
+                    descriptor: None,
                     time_sent,
                     ecn,
+                };
+
+                let meta = transmission::Meta {
+                    packet_space: PacketSpace::Recovery,
+                    has_more_app_data: true,
+                };
+
+                let event = transmission::Event {
+                    info,
+                    meta,
+                    packet_number,
                 };
 
                 publisher.on_stream_packet_transmitted(event::builder::StreamPacketTransmitted {
@@ -1146,12 +1123,12 @@ impl State {
                     is_retransmission: true,
                 });
 
-                self.on_transmit_segment(stream::PacketSpace::Recovery, packet_number, info, false);
-
                 // consider this transmission a probe if needed
                 if self.pto.transmissions() > 0 {
                     self.pto.on_transmit_once();
                 }
+
+                packets.push(event, descriptor);
             }
         }
 
@@ -1159,161 +1136,114 @@ impl State {
     }
 
     #[inline]
-    pub fn try_transmit_probe<C, Clk>(
+    pub fn try_transmit_probe<C, M, Clk>(
         &mut self,
         control_key: &C,
         credentials: &Credentials,
         stream_id: &stream::Id,
         source_queue_id: Option<VarInt>,
-        pool: &Pool,
+        packets: &mut M,
         clock: &Clk,
     ) -> Result<(), Error>
     where
         C: crypto::seal::control::Stream,
         Clk: Clock,
+        M: Message,
     {
         while self.pto.transmissions() > 0 {
             // probes are not congestion-controlled
-
-            let packet_number =
-                VarInt::new(self.recovery_packet_number).expect("2^62 is a lot of packets");
-            self.recovery_packet_number += 1;
-
-            // ensure!(let Some(descriptor) = pool.alloc());
-
-            todo!();
-            let mut buffer = vec![];
-
-            // resize the buffer to what we need
-            {
+            let res = packets.push_with(|mut buffer| {
                 let min_len = stream::encoder::MAX_RETRANSMISSION_HEADER_LEN + 128;
+                assert!(buffer.len() >= min_len);
 
-                if buffer.capacity() < min_len {
-                    buffer.reserve(min_len - buffer.len());
-                }
+                let packet_number =
+                    VarInt::new(self.recovery_packet_number).expect("2^62 is a lot of packets");
+                self.recovery_packet_number += 1;
 
-                unsafe {
-                    debug_assert!(buffer.capacity() >= min_len);
-                    buffer.set_len(min_len);
-                }
-            }
-
-            let offset = self.max_sent_offset;
-            let final_offset = if self.state.is_data_sent() {
-                Some(offset)
-            } else {
-                None
-            };
-
-            let mut payload = probe::Probe {
-                offset,
-                final_offset,
-            };
-
-            let mut control_data_len = VarInt::ZERO;
-            let control_data = if let Some(error) = self.error.as_ref() {
-                if let Some(frame) = error.as_frame() {
-                    control_data_len = VarInt::try_from(frame.encoding_size()).unwrap();
-
-                    Some(frame)
+                let offset = self.max_sent_offset;
+                let final_offset = if self.state.is_data_sent() {
+                    Some(offset)
                 } else {
                     None
+                };
+
+                let mut payload = probe::Probe {
+                    offset,
+                    final_offset,
+                };
+
+                let mut control_data_len = VarInt::ZERO;
+                let control_data = if let Some(error) = self.error.as_ref() {
+                    if let Some(frame) = error.as_frame() {
+                        control_data_len = VarInt::try_from(frame.encoding_size()).unwrap();
+
+                        Some(frame)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
+                let encoder = EncoderBuffer::new(&mut buffer);
+                let packet_len = encoder::probe(
+                    encoder,
+                    source_queue_id,
+                    *stream_id,
+                    packet_number,
+                    self.next_expected_control_packet,
+                    VarInt::ZERO,
+                    &mut &[][..],
+                    control_data_len,
+                    &control_data,
+                    &mut payload,
+                    control_key,
+                    credentials,
+                );
+
+                let payload_len = 0;
+                let included_fin = final_offset.is_some();
+
+                debug_assert!(
+                    packet_len < u16::MAX as usize,
+                    "cannot write larger packets than 2^16"
+                );
+                let packet_len = packet_len as u16;
+
+                let time_sent = clock.get_time();
+
+                let ecn = ExplicitCongestionNotification::Ect0;
+
+                let info = transmission::Info {
+                    packet_len,
+                    stream_offset: offset,
+                    payload_len,
+                    included_fin,
+                    descriptor: None,
+                    time_sent,
+                    ecn,
+                };
+
+                let meta = transmission::Meta {
+                    packet_space: PacketSpace::Recovery,
+                    has_more_app_data: false,
+                };
+
+                transmission::Event {
+                    packet_number,
+                    info,
+                    meta,
                 }
-            } else {
-                None
-            };
+            });
 
-            let encoder = EncoderBuffer::new(&mut buffer);
-            let packet_len = encoder::probe(
-                encoder,
-                source_queue_id,
-                *stream_id,
-                packet_number,
-                self.next_expected_control_packet,
-                VarInt::ZERO,
-                &mut &[][..],
-                control_data_len,
-                &control_data,
-                &mut payload,
-                control_key,
-                credentials,
-            );
-
-            let payload_len = 0;
-            let included_fin = final_offset.is_some();
-            buffer.truncate(packet_len);
-
-            debug_assert!(
-                packet_len < u16::MAX as usize,
-                "cannot write larger packets than 2^16"
-            );
-            let packet_len = packet_len as u16;
-
-            let time_sent = clock.get_time();
-
-            // TODO store this as part of the packet queue
-            let ecn = ExplicitCongestionNotification::Ect0;
-
-            // enqueue the transmission
-            // let buffer_index = self.recovery_packet_buffers.insert(buffer);
-            let buffer_index = todo!();
-            self.transmit_queue
-                .push_back(TransmitIndex::Recovery(buffer_index));
-
-            let info = transmission::Info {
-                packet_len,
-                stream_offset: offset,
-                payload_len,
-                included_fin,
-                retransmission: None, // PTO packets are not retransmitted
-                time_sent,
-                ecn,
-            };
-
-            self.on_transmit_segment(stream::PacketSpace::Recovery, packet_number, info, false);
+            if res.is_none() {
+                break;
+            }
 
             self.pto.on_transmit_once();
         }
 
         Ok(())
-    }
-
-    #[inline]
-    pub fn transmit_queue_iter<Clk: Clock>(
-        &mut self,
-        clock: &Clk,
-    ) -> impl Iterator<Item = (ExplicitCongestionNotification, &[u8])> + '_ {
-        let ecn = self
-            .ecn
-            .ecn(s2n_quic_core::transmission::Mode::Normal, clock.get_time());
-        let recovery_packet_buffers = &self.recovery_packet_buffers;
-
-        self.transmit_queue.iter().filter_map(move |index| {
-            let buf = match index {
-                TransmitIndex::Stream(_index, segment) => segment.payload(),
-                TransmitIndex::Recovery(index) => recovery_packet_buffers.get(*index)?.payload(),
-            };
-
-            Some((ecn, buf))
-        })
-    }
-
-    #[inline]
-    pub fn on_transmit_queue(&mut self, count: usize) {
-        for transmission in self.transmit_queue.drain(..count) {
-            match transmission {
-                TransmitIndex::Stream(index, _segment) => {
-                    // make sure the packet wasn't freed between when we wanted to transmit and
-                    // when we actually did
-                    ensure!(self.stream_packet_buffers.get(index).is_some(), continue);
-                }
-                TransmitIndex::Recovery(index) => {
-                    // make sure the packet wasn't freed between when we wanted to transmit and
-                    // when we actually did
-                    drop(self.recovery_packet_buffers.remove(index));
-                }
-            };
-        }
     }
 
     #[inline]
@@ -1348,10 +1278,6 @@ impl State {
         self.idle_timer.cancel();
         self.pto.cancel();
         self.unacked_ranges.clear();
-
-        self.transmit_queue.clear();
-        self.stream_packet_buffers.clear();
-        self.recovery_packet_buffers.clear();
 
         self.invariants();
     }
