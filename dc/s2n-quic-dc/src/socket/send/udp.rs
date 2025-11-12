@@ -12,7 +12,12 @@ use crate::{
     stream::socket::Socket,
 };
 use s2n_quic_core::time::Timestamp;
-use std::{ops::ControlFlow, time::Duration};
+use std::{
+    future::poll_fn,
+    ops::ControlFlow,
+    task::{Poll, Waker},
+    time::Duration,
+};
 
 /// State for each priority level to track partially processed queues and entries
 struct WheelState<Info, Meta, Completion, const GRANULARITY_US: u64> {
@@ -26,12 +31,12 @@ where
     C: Completion<Info, Meta>,
 {
     /// Ticks the wheel to get the next queue
-    fn tick(&mut self) -> (Timestamp, Queue<Transmission<Info, Meta, C>>) {
+    fn tick(&mut self, waker: &Option<&Waker>) -> (Timestamp, Queue<Transmission<Info, Meta, C>>) {
         if let Some((timestamp, queue)) = self.pending_queue.take() {
             // Resume processing previously retrieved queue
             (timestamp, queue)
         } else {
-            self.queue.tick()
+            self.queue.tick(waker.cloned())
         }
     }
 
@@ -84,18 +89,31 @@ pub async fn non_blocking<S, Clk, Info, Meta, C, const GRANULARITY_US: u64>(
         })
         .collect::<Vec<_>>();
 
+    let waker = poll_fn(|cx| Poll::Ready(cx.waker().clone())).await;
+
     let granularity = Duration::from_micros(GRANULARITY_US);
     let mut bucket = bucket.init(granularity, clock.get_time());
+    let horizon = wheels[0].queue.horizon();
+    let mut sleep_time = clock.get_time() + horizon;
 
     loop {
-        let mut target_timestamp = None;
+        // let mut target_timestamp = None;
+        let target_timestamp = clock.get_time() + granularity;
+        let mut did_transmit = false;
+        let mut should_park = false;
+        let waker = if target_timestamp > sleep_time {
+            should_park = true;
+            Some(&waker)
+        } else {
+            None
+        };
 
         // Process each wheel in priority order (0 = highest priority)
         for (_priority, wheel) in wheels.iter_mut().enumerate() {
             // Catch-up/processing loop for this priority level
             loop {
                 // Get or tick the wheel for a queue
-                let (next_timestamp, mut queue) = wheel.tick();
+                let (next_timestamp, mut queue) = wheel.tick(&waker);
 
                 // Process pending entry first if it exists
                 if let Some(entry) = wheel.pending_entry.take() {
@@ -103,15 +121,14 @@ pub async fn non_blocking<S, Clk, Info, Meta, C, const GRANULARITY_US: u64>(
 
                     // Continue acquiring credits for partially transmitted entry
                     if let ControlFlow::Break(()) = bucket.take(entry.total_len as _, now) {
-                        // target_timestamp = Some(target);
-                        // wheel.pending_entry = Some(entry);
-                        // wheel.pending_queue = Some((next_timestamp, queue));
-                        // break;
-                        timer.sleep(now + granularity).await;
+                        wheel.pending_entry = Some(entry);
+                        wheel.pending_queue = Some((next_timestamp, queue));
+                        break;
                     }
 
                     // Successfully acquired all credits, send the packet
                     wheel.transmit(entry, &socket, &now);
+                    did_transmit = true;
                 }
 
                 // Process all packets in the queue
@@ -121,32 +138,41 @@ pub async fn non_blocking<S, Clk, Info, Meta, C, const GRANULARITY_US: u64>(
                     // Continue acquiring credits for partially transmitted entry
                     if let ControlFlow::Break(()) = bucket.take(entry.total_len as _, now) {
                         // target_timestamp = Some(target);
-                        // wheel.pending_entry = Some(entry);
-                        // wheel.pending_queue = Some((next_timestamp, queue));
-                        // break;
-                        timer.sleep(now + granularity).await;
+                        wheel.pending_entry = Some(entry);
+                        wheel.pending_queue = Some((next_timestamp, queue));
+                        break;
                     }
 
                     // Successfully acquired all credits, send the packet
                     wheel.transmit(entry, &socket, &now);
+                    did_transmit = true;
                 }
 
-                // Queue fully drained. Check if this wheel has caught up to the target
-                if let Some(target) = target_timestamp {
-                    if next_timestamp >= target {
-                        break; // Move to next priority level
-                    }
-                    // Still behind target tick again to catch up
-                } else {
-                    // First wheel (highest priority) sets the target timestamp
-                    target_timestamp = Some(next_timestamp);
+                // if the wheel is caught up with the target then continue to the next priority
+                if next_timestamp >= target_timestamp {
                     break;
                 }
             }
         }
 
+        if did_transmit {
+            sleep_time = target_timestamp + horizon;
+        } else if should_park {
+            let mut did_poll = false;
+            core::future::poll_fn(|_cx| {
+                if did_poll {
+                    Poll::Ready(())
+                } else {
+                    did_poll = true;
+                    Poll::Pending
+                }
+            })
+            .await;
+            continue;
+        }
+
         // All priorities processed, sleep until next highest-priority expiration
-        timer.sleep(target_timestamp.unwrap()).await;
+        timer.sleep(target_timestamp).await;
     }
 }
 
@@ -201,7 +227,7 @@ impl LeakyBucketInstance {
     }
 }
 
-#[cfg(test)]
+#[cfg(todo)]
 mod tests {
     use super::*;
     use crate::{

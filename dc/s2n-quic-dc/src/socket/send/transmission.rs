@@ -17,21 +17,6 @@ pub struct Transmission<Info, Meta, Completion> {
     pub completion: Option<Completion>,
 }
 
-impl<Info, Meta, Completion> Default for Transmission<Info, Meta, Completion>
-where
-    Meta: Default,
-{
-    fn default() -> Self {
-        Self {
-            descriptors: Vec::new(),
-            total_len: 0,
-            meta: Default::default(),
-            transmission_time: None,
-            completion: None,
-        }
-    }
-}
-
 impl<Info, Meta, C> Transmission<Info, Meta, C>
 where
     C: Completion<Info, Meta>,
