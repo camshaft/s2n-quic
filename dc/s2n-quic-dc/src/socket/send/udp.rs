@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
-    clock::{Clock, Timer},
+    clock::Clock,
     intrusive_queue::Queue,
     socket::send::{
         completion::{Completer as _, Completion},
@@ -11,14 +11,14 @@ use crate::{
     },
     stream::socket::Socket,
 };
-use s2n_quic_core::time::{timer::Provider, token_bucket::TokenBucket, Timestamp};
+use s2n_quic_core::time::Timestamp;
 use std::{ops::ControlFlow, time::Duration};
 
 /// State for each priority level to track partially processed queues and entries
 struct WheelState<Info, Meta, Completion, const GRANULARITY_US: u64> {
     queue: Wheel<Info, Meta, Completion, GRANULARITY_US>,
     pending_queue: Option<(Timestamp, Queue<Transmission<Info, Meta, Completion>>)>,
-    pending_entry: Option<(Entry<Info, Meta, Completion>, u64)>, // (entry, remaining_len)
+    pending_entry: Option<Entry<Info, Meta, Completion>>,
 }
 
 impl<Info, Meta, C, const GRANULARITY_US: u64> WheelState<Info, Meta, C, GRANULARITY_US>
@@ -35,7 +35,7 @@ where
         }
     }
 
-    fn transmit<S: Socket, Clk: Clock>(
+    fn transmit<S: Socket, Clk: s2n_quic_core::time::Clock>(
         &self,
         mut entry: Entry<Info, Meta, C>,
         socket: &S,
@@ -66,7 +66,7 @@ pub async fn non_blocking<S, Clk, Info, Meta, C, const GRANULARITY_US: u64>(
     socket: S,
     wheels: Vec<Wheel<Info, Meta, C, GRANULARITY_US>>,
     clock: Clk,
-    mut token_bucket: TokenBucket,
+    mut bucket: LeakyBucket,
 ) where
     S: Socket,
     Clk: Clock,
@@ -84,54 +84,42 @@ pub async fn non_blocking<S, Clk, Info, Meta, C, const GRANULARITY_US: u64>(
         })
         .collect::<Vec<_>>();
 
-    'outer: loop {
+    loop {
         let mut target_timestamp = None;
 
         // Process each wheel in priority order (0 = highest priority)
-        for (priority, wheel) in wheels.iter_mut().enumerate() {
+        for (_priority, wheel) in wheels.iter_mut().enumerate() {
             // Catch-up/processing loop for this priority level
             loop {
                 // Get or tick the wheel for a queue
                 let (next_timestamp, mut queue) = wheel.tick();
 
                 // Process pending entry first if it exists
-                if let Some((entry, mut remaining_len)) = wheel.pending_entry.take() {
+                if let Some(entry) = wheel.pending_entry.take() {
+                    let now = clock.get_time();
+
                     // Continue acquiring credits for partially transmitted entry
-                    if acquire_tokens(
-                        &mut token_bucket,
-                        &clock,
-                        &mut timer,
-                        &mut remaining_len,
-                        priority,
-                    )
-                    .await
-                    .is_break()
-                    {
-                        wheel.pending_entry = Some((entry, remaining_len));
+                    if let ControlFlow::Break(target) = bucket.take(entry.total_len as _, now) {
+                        target_timestamp = Some(target);
+                        wheel.pending_entry = Some(entry);
                         wheel.pending_queue = Some((next_timestamp, queue));
-                        continue 'outer;
+                        break;
                     }
 
                     // Successfully acquired all credits, send the packet
-                    wheel.transmit(entry, &socket, &clock);
+                    wheel.transmit(entry, &socket, &now);
                 }
 
                 // Process all packets in the queue
                 while let Some(entry) = queue.pop_front() {
-                    let mut remaining_len = entry.total_len as u64;
-                    if acquire_tokens(
-                        &mut token_bucket,
-                        &clock,
-                        &mut timer,
-                        &mut remaining_len,
-                        priority,
-                    )
-                    .await
-                    .is_break()
-                    {
-                        wheel.pending_entry = Some((entry, remaining_len));
+                    let now = clock.get_time();
+
+                    // Continue acquiring credits for partially transmitted entry
+                    if let ControlFlow::Break(target) = bucket.take(entry.total_len as _, now) {
+                        target_timestamp = Some(target);
+                        wheel.pending_entry = Some(entry);
                         wheel.pending_queue = Some((next_timestamp, queue));
-                        continue 'outer;
+                        break;
                     }
 
                     // Successfully acquired all credits, send the packet
@@ -157,38 +145,40 @@ pub async fn non_blocking<S, Clk, Info, Meta, C, const GRANULARITY_US: u64>(
     }
 }
 
-async fn acquire_tokens(
-    token_bucket: &mut TokenBucket,
-    clock: &impl Clock,
-    timer: &mut Timer,
-    remaining_len: &mut u64,
-    priority: usize,
-) -> ControlFlow<()> {
-    let mut micros = 1;
-    loop {
-        let now = clock.get_time();
-        let acquired = token_bucket.take(*remaining_len, now);
-        *remaining_len -= acquired;
+pub struct LeakyBucket {
+    nanos_per_byte: f64,
+    last_transmission_nanos: u64,
+}
 
-        if *remaining_len == 0 {
-            break;
-        }
-
-        // Still blocked! Sleep until we acquire more credits
-        let next_expiration = token_bucket.next_expiration().unwrap_or_else(|| {
-            let next_expiration = now + Duration::from_micros(micros);
-            micros *= 2;
-            next_expiration
-        });
-        timer.sleep(next_expiration).await;
-
-        // only bail if we are operating on lower priority queues
-        if priority != 0 {
-            return ControlFlow::Break(());
+impl LeakyBucket {
+    pub fn new(gigabits_per_second: f64) -> Self {
+        let nanos_per_byte = 1e9 / (gigabits_per_second * 1e3);
+        Self {
+            nanos_per_byte,
+            last_transmission_nanos: 0,
         }
     }
 
-    ControlFlow::Continue(())
+    fn take(&mut self, bytes: u64, now: Timestamp) -> ControlFlow<Timestamp> {
+        let delay_nanos = bytes as f64 * self.nanos_per_byte;
+        let target_nanos = self.last_transmission_nanos + (delay_nanos as u64).max(1);
+
+        let current_nanos = unsafe { now.as_duration().as_nanos() as u64 };
+
+        if current_nanos < target_nanos {
+            let nanos = target_nanos - current_nanos;
+            let mut target = now + Duration::from_nanos(nanos as u64);
+
+            // Make sure we wait at least a microsecond
+            if target == now {
+                target += Duration::from_micros(1);
+            }
+
+            return ControlFlow::Break(target);
+        }
+
+        ControlFlow::Continue(())
+    }
 }
 
 #[cfg(test)]
@@ -238,14 +228,6 @@ mod tests {
         }
     }
 
-    fn token_bucket(bytes_per_interval: u64, interval: Duration, burst: u64) -> TokenBucket {
-        TokenBucket::builder()
-            .with_max(bytes_per_interval * burst)
-            .with_refill_interval(interval)
-            .with_refill_amount(bytes_per_interval)
-            .build()
-    }
-
     fn new(horizon: Duration) -> (Wheel<(), (u8, u16), (), 8>, Pool, Clock) {
         let clock = Clock::default();
         let pool = Pool::new(u16::MAX, 16);
@@ -293,11 +275,11 @@ mod tests {
 
                 let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
 
-                let token_bucket = token_bucket(10_000_000, 8.us(), 1);
+                let bucket = LeakyBucket::new(1.0);
 
                 // Spawn the sender
                 crate::testing::spawn(async move {
-                    non_blocking(socket, vec![wheel], clock, token_bucket).await;
+                    non_blocking(socket, vec![wheel], clock, bucket).await;
                 });
             }
             .primary()
@@ -360,10 +342,10 @@ mod tests {
                 let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
 
                 // High bandwidth to avoid token bucket blocking in this test
-                let token_bucket = token_bucket(100_000_000, 8.us(), 1);
+                let bucket = LeakyBucket::new(1.0);
 
                 crate::testing::spawn(async move {
-                    non_blocking(socket, wheels, clock, token_bucket).await;
+                    non_blocking(socket, wheels, clock, bucket).await;
                 });
             }
             .primary()
@@ -407,13 +389,13 @@ mod tests {
 
                 // Limited token bucket: enough for ~1 packet per refill
                 // This will cause priority 1 to get blocked and allow priority 0 to preempt
-                let token_bucket = token_bucket(150, 8.us(), 1);
+                let bucket = LeakyBucket::new(1.0);
 
                 crate::testing::spawn({
                     let clock = clock.clone();
                     let wheels = wheels.clone();
                     async move {
-                        non_blocking(socket, wheels, clock, token_bucket).await;
+                        non_blocking(socket, wheels, clock, bucket).await;
                     }
                 });
 

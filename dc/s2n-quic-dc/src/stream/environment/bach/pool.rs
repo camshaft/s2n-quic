@@ -73,7 +73,7 @@ impl PoolSocket {
     }
 
     fn spawn_send_worker(&self, config: &Config, clock: Clock) {
-        let socket = self.socket.clone();
+        let socket = Tracing(self.socket.clone());
 
         let mut wheels = vec![(***self.worker).clone()];
 
@@ -81,7 +81,7 @@ impl PoolSocket {
             wheels.push((*****application).clone());
         }
 
-        let token_bucket = config.token_bucket();
+        let token_bucket = config.bucket();
 
         let span = tracing::trace_span!("send_socket_worker");
         let task = async move {
@@ -128,7 +128,7 @@ impl Pool {
 
         let unroutable_packets = {
             // TODO pace these packets
-            let socket = sockets[0].socket.clone();
+            let socket = Tracing(sockets[0].socket.clone());
             let (tx, task) = config.unroutable_packets(socket);
 
             bach::spawn(task);

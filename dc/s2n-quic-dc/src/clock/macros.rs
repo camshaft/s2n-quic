@@ -61,14 +61,7 @@ macro_rules! impl_clock {
         impl super::Sleep for Sleep {
             #[inline]
             fn update(self: Pin<&mut Self>, target: Timestamp) {
-                let target = unsafe { target.as_duration() };
-
-                // floor the delay to milliseconds to reduce timer churn
-                let delay = if target.as_millis() > 1 {
-                    Duration::from_millis(target.as_millis() as u64)
-                } else {
-                    target
-                };
+                let delay = unsafe { target.as_duration() };
 
                 let target = self.clock.0 + delay;
 
