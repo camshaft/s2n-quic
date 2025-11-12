@@ -66,7 +66,7 @@ pub async fn non_blocking<S, Clk, Info, Meta, C, const GRANULARITY_US: u64>(
     socket: S,
     wheels: Vec<Wheel<Info, Meta, C, GRANULARITY_US>>,
     clock: Clk,
-    mut bucket: LeakyBucket,
+    bucket: LeakyBucket,
 ) where
     S: Socket,
     Clk: Clock,
@@ -84,6 +84,9 @@ pub async fn non_blocking<S, Clk, Info, Meta, C, const GRANULARITY_US: u64>(
         })
         .collect::<Vec<_>>();
 
+    let granularity = Duration::from_micros(GRANULARITY_US);
+    let mut bucket = bucket.init(granularity, clock.get_time());
+
     loop {
         let mut target_timestamp = None;
 
@@ -99,11 +102,12 @@ pub async fn non_blocking<S, Clk, Info, Meta, C, const GRANULARITY_US: u64>(
                     let now = clock.get_time();
 
                     // Continue acquiring credits for partially transmitted entry
-                    if let ControlFlow::Break(target) = bucket.take(entry.total_len as _, now) {
-                        target_timestamp = Some(target);
-                        wheel.pending_entry = Some(entry);
-                        wheel.pending_queue = Some((next_timestamp, queue));
-                        break;
+                    if let ControlFlow::Break(()) = bucket.take(entry.total_len as _, now) {
+                        // target_timestamp = Some(target);
+                        // wheel.pending_entry = Some(entry);
+                        // wheel.pending_queue = Some((next_timestamp, queue));
+                        // break;
+                        timer.sleep(now + granularity).await;
                     }
 
                     // Successfully acquired all credits, send the packet
@@ -115,15 +119,16 @@ pub async fn non_blocking<S, Clk, Info, Meta, C, const GRANULARITY_US: u64>(
                     let now = clock.get_time();
 
                     // Continue acquiring credits for partially transmitted entry
-                    if let ControlFlow::Break(target) = bucket.take(entry.total_len as _, now) {
-                        target_timestamp = Some(target);
-                        wheel.pending_entry = Some(entry);
-                        wheel.pending_queue = Some((next_timestamp, queue));
-                        break;
+                    if let ControlFlow::Break(()) = bucket.take(entry.total_len as _, now) {
+                        // target_timestamp = Some(target);
+                        // wheel.pending_entry = Some(entry);
+                        // wheel.pending_queue = Some((next_timestamp, queue));
+                        // break;
+                        timer.sleep(now + granularity).await;
                     }
 
                     // Successfully acquired all credits, send the packet
-                    wheel.transmit(entry, &socket, &clock);
+                    wheel.transmit(entry, &socket, &now);
                 }
 
                 // Queue fully drained. Check if this wheel has caught up to the target
@@ -146,37 +151,52 @@ pub async fn non_blocking<S, Clk, Info, Meta, C, const GRANULARITY_US: u64>(
 }
 
 pub struct LeakyBucket {
-    nanos_per_byte: f64,
-    last_transmission_nanos: u64,
+    bytes_per_nanos: u64,
 }
 
 impl LeakyBucket {
     pub fn new(gigabits_per_second: f64) -> Self {
-        let nanos_per_byte = 1e9 / (gigabits_per_second * 1e3);
-        Self {
-            nanos_per_byte,
-            last_transmission_nanos: 0,
-        }
+        let bytes_per_nanos = (gigabits_per_second * 1_000_000_000.0 / 8.0) as u64;
+        Self { bytes_per_nanos }
     }
 
-    fn take(&mut self, bytes: u64, now: Timestamp) -> ControlFlow<Timestamp> {
-        let delay_nanos = bytes as f64 * self.nanos_per_byte;
-        let target_nanos = self.last_transmission_nanos + (delay_nanos as u64).max(1);
-
-        let current_nanos = unsafe { now.as_duration().as_nanos() as u64 };
-
-        if current_nanos < target_nanos {
-            let nanos = target_nanos - current_nanos;
-            let mut target = now + Duration::from_nanos(nanos as u64);
-
-            // Make sure we wait at least a microsecond
-            if target == now {
-                target += Duration::from_micros(1);
-            }
-
-            return ControlFlow::Break(target);
+    fn init(&self, granularity: Duration, now: Timestamp) -> LeakyBucketInstance {
+        let bytes_per_nanos = self.bytes_per_nanos;
+        let max_size = bytes_per_nanos * granularity.as_nanos() as u64;
+        let bytes = max_size;
+        let last_refill_nanos = unsafe { now.as_duration().as_nanos() as u64 };
+        LeakyBucketInstance {
+            bytes_per_nanos,
+            last_refill_nanos,
+            max_size,
+            bytes,
         }
+    }
+}
 
+struct LeakyBucketInstance {
+    bytes_per_nanos: u64,
+    last_refill_nanos: u64,
+    max_size: u64,
+    bytes: u64,
+}
+
+impl LeakyBucketInstance {
+    fn refill(&mut self, now: Timestamp) {
+        let now_nanos = unsafe { now.as_duration().as_nanos() as u64 };
+        let diff_nanos = now_nanos.saturating_sub(self.last_refill_nanos);
+        let refill_amount = self.bytes_per_nanos * diff_nanos;
+        let bytes = self.bytes + refill_amount;
+        self.bytes = bytes.min(self.max_size);
+        self.last_refill_nanos = now_nanos;
+    }
+
+    fn take(&mut self, bytes: u64, now: Timestamp) -> ControlFlow<()> {
+        self.refill(now);
+        if self.bytes < bytes {
+            return ControlFlow::Break(());
+        }
+        self.bytes -= bytes;
         ControlFlow::Continue(())
     }
 }
