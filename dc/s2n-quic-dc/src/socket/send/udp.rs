@@ -196,6 +196,7 @@ impl LeakyBucket {
             last_refill_nanos,
             max_size,
             bytes,
+            debt: 0,
         }
     }
 }
@@ -205,13 +206,19 @@ struct LeakyBucketInstance {
     last_refill_nanos: u64,
     max_size: u64,
     bytes: u64,
+    debt: u64,
 }
 
 impl LeakyBucketInstance {
     fn refill(&mut self, now: Timestamp) {
         let now_nanos = unsafe { now.as_duration().as_nanos() as u64 };
         let diff_nanos = now_nanos.saturating_sub(self.last_refill_nanos);
-        let refill_amount = self.bytes_per_nanos * diff_nanos;
+        let mut refill_amount = self.bytes_per_nanos * diff_nanos;
+        if self.debt > 0 {
+            let debt_paid = refill_amount.min(self.debt);
+            refill_amount -= debt_paid;
+            self.debt -= debt_paid;
+        }
         let bytes = self.bytes + refill_amount;
         self.bytes = bytes.min(self.max_size);
         self.last_refill_nanos = now_nanos;
@@ -219,10 +226,18 @@ impl LeakyBucketInstance {
 
     fn take(&mut self, bytes: u64, now: Timestamp) -> ControlFlow<()> {
         self.refill(now);
-        if self.bytes < bytes {
+
+        if self.bytes < bytes && self.debt > 0 {
             return ControlFlow::Break(());
         }
-        self.bytes -= bytes;
+
+        if let Some(bytes) = self.bytes.checked_sub(bytes) {
+            self.bytes = bytes;
+        } else {
+            self.bytes = 0;
+            self.debt = bytes - self.bytes;
+        }
+
         ControlFlow::Continue(())
     }
 }
