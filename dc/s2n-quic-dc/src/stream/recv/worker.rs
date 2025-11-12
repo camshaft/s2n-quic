@@ -82,7 +82,7 @@ where
     idle_timer: Timer,
     idle_timeout_duration: Duration,
     backoff: u8,
-    pending_ack: bool,
+    should_transmit: bool,
     socket: S,
     transmission_buffer: transmission::Builder,
     accept_state: AcceptState,
@@ -122,7 +122,7 @@ where
             idle_timer,
             idle_timeout_duration,
             backoff: 0,
-            pending_ack: false,
+            should_transmit: false,
             socket,
             transmission_buffer: Default::default(),
             accept_state: AcceptState::Waiting,
@@ -154,6 +154,11 @@ where
         if let Poll::Ready(Err(err)) = self.poll_socket(cx) {
             tracing::error!(socket_error = ?err);
             // TODO should we return? if we get a recv error it's most likely fatal
+            return Poll::Ready(());
+        }
+
+        if let Poll::Ready(Err(err)) = self.poll_transmit(cx) {
+            tracing::error!(transmit_error = ?err);
             return Poll::Ready(());
         }
 
@@ -265,7 +270,7 @@ where
     fn is_application_progressing(&mut self) -> bool {
         let state = self.shared.receiver.application_state();
 
-        self.pending_ack |= state.wants_ack;
+        self.should_transmit |= state.wants_ack;
 
         // check to see if the application shut down
         if let super::shared::ApplicationStatus::Closed { shutdown_kind } = state.status {
@@ -332,19 +337,25 @@ where
 
     #[inline]
     fn poll_drain_recv_socket(&mut self, cx: &mut Context) -> Poll<io::Result<()>> {
-        let mut should_transmit = self.pending_ack;
         let mut received_packets = 0;
 
-        let _res = self.process_packets(cx, &mut received_packets, &mut should_transmit);
+        let _res = self.process_packets(cx, &mut received_packets);
 
         ensure!(
-            should_transmit,
+            self.should_transmit,
             if received_packets == 0 {
                 Poll::Pending
             } else {
                 Ok(()).into()
             }
         );
+
+        self.poll_transmit(cx)
+    }
+
+    #[inline]
+    fn poll_transmit(&mut self, cx: &mut Context) -> Poll<io::Result<()>> {
+        ensure!(self.should_transmit, Ok(()).into());
 
         // send an ACK if needed
         if let Some(mut recv) = self.shared.receiver.worker_try_lock()? {
@@ -357,7 +368,7 @@ where
             recv.fill_transmit_queue(&self.shared, &mut transmission_queue);
 
             if !self.transmission_buffer.is_empty() {
-                self.pending_ack = false;
+                self.should_transmit = false;
             }
 
             if recv.receiver.state().is_data_received() {
@@ -379,7 +390,6 @@ where
         &mut self,
         cx: &mut Context,
         received_packets: &mut usize,
-        should_transmit: &mut bool,
     ) -> io::Result<()> {
         // loop until we hit Pending from the socket
         loop {
@@ -388,13 +398,12 @@ where
             let Some(mut recv) = self.shared.receiver.worker_try_lock()? else {
                 // if the application is locking the state then we don't want to transmit, since it
                 // will do that for us
-                *should_transmit = false;
                 break;
             };
 
             // make sure to process any left over packets, if any
             if !recv.payload_is_empty() {
-                *should_transmit |= recv.process_recv_buffer(
+                self.should_transmit |= recv.process_recv_buffer(
                     &mut buffer::writer::storage::Empty,
                     &self.shared,
                     self.socket.features(),
@@ -418,7 +427,7 @@ where
             *received_packets += 1;
 
             // process the packet we just received
-            *should_transmit |= recv.process_recv_buffer(
+            self.should_transmit |= recv.process_recv_buffer(
                 &mut buffer::writer::storage::Empty,
                 &self.shared,
                 self.socket.features(),

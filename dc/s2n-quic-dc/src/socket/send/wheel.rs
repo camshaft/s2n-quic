@@ -16,7 +16,8 @@ use std::{
     time::Duration,
 };
 
-pub const DEFAULT_GRANULARITY_US: u64 = 8;
+// TODO tune this
+pub const DEFAULT_GRANULARITY_US: u64 = 64;
 
 pub struct Wheel<Info, Meta, Completion, const GRANULARITY_US: u64 = DEFAULT_GRANULARITY_US>(
     Arc<State<Info, Meta, Completion>>,
