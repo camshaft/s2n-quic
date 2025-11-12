@@ -80,7 +80,7 @@ impl PoolSocket {
             wheels.push((*****application).clone());
         }
 
-        let token_bucket = config.token_bucket();
+        let token_bucket = config.bucket();
 
         let clock = env.clock();
         let span = tracing::trace_span!("send_socket_worker");
