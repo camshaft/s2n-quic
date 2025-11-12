@@ -124,7 +124,8 @@ impl Pool {
         }
 
         let unroutable_packets = {
-            let socket = sockets[0].worker.clone();
+            // TODO pace these packets
+            let socket = Tracing(SendOnly(sockets[0].socket.clone()));
             let (tx, task) = config.unroutable_packets(socket);
 
             env.reader_rt.spawn(task);

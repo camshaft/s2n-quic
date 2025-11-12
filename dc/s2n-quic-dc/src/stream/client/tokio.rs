@@ -318,6 +318,12 @@ impl Builder {
     }
 
     pub fn with_default_protocol(mut self, protocol: socket::Protocol) -> Self {
+        match protocol {
+            socket::Protocol::Tcp => self.enable_tcp = true,
+            socket::Protocol::Udp => self.enable_udp = true,
+            _ => {}
+        }
+
         self.default_protocol = Some(protocol);
         self
     }

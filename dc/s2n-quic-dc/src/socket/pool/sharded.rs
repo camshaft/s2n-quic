@@ -37,7 +37,7 @@ impl Clone for Sharded {
 impl Sharded {
     pub fn new(pools: Arc<[Pool]>) -> Self {
         assert!(!pools.is_empty());
-        assert!(pools.len().is_power_of_two());
+        assert!(pools.len().is_power_of_two(), "len: {}", pools.len());
         assert!(pools.len() <= u16::MAX as usize);
         let mask = (pools.len() - 1) as u16;
         Self {

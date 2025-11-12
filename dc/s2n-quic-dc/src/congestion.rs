@@ -51,6 +51,14 @@ impl Controller {
         ack_receive_time: Timestamp,
     ) {
         let publisher = &mut NoopPublisher;
+
+        self.controller.on_rtt_update(
+            newest_acked_time_sent,
+            ack_receive_time,
+            rtt_estimator,
+            publisher,
+        );
+
         self.controller.on_ack(
             newest_acked_time_sent,
             bytes_acked,

@@ -281,6 +281,9 @@ where
         while let Some(message) = self.shared.sender.pop_worker_message() {
             match message.event {
                 Event::Shutdown { kind } => {
+                    // Update the state to what was last sent by the application
+                    self.sender.max_sent_offset = self.shared.sender.flow.stream_offset();
+
                     // if the application is panicking then we notify the peer
                     if let Some(error) = kind.error_code() {
                         let error = error::Kind::ApplicationError {

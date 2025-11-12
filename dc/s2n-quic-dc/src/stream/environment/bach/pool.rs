@@ -127,7 +127,8 @@ impl Pool {
         let transmission_pool = config.tx_packet_pool(workers);
 
         let unroutable_packets = {
-            let socket = sockets[0].worker.clone();
+            // TODO pace these packets
+            let socket = sockets[0].socket.clone();
             let (tx, task) = config.unroutable_packets(socket);
 
             bach::spawn(task);

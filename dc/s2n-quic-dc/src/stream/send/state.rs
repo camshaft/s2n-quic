@@ -529,7 +529,8 @@ impl State {
             let ack_delay = ack.ack_delay();
             let rtt_sample = now
                 .saturating_duration_since(time_sent)
-                .saturating_sub(ack_delay);
+                .saturating_sub(ack_delay)
+                .max(Duration::from_micros(1));
 
             self.rtt_estimator.update_rtt(
                 Duration::ZERO,

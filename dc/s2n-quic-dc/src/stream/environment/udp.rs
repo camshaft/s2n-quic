@@ -99,7 +99,8 @@ impl Config {
     }
 
     pub(crate) fn tx_packet_pool(&self, thread_count: usize) -> pool::Sharded {
-        let mut pools = Vec::with_capacity(thread_count * 2);
+        let pool_count = (thread_count * 2).next_power_of_two();
+        let mut pools = Vec::with_capacity(pool_count);
         for _ in 0..pools.capacity() {
             pools.push(pool::Pool::new(
                 crate::msg::segment::MAX_UDP_PAYLOAD,

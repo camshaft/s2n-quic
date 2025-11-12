@@ -6,7 +6,6 @@ use crate::{
     either::Either,
     event,
     packet::{stream, Packet},
-    socket::{pool::Pool, send::transmission},
     stream::{
         recv::{self, buffer::Buffer as _},
         shared::{self, handshake, AcceptState, ArcShared, ShutdownKind},
@@ -51,11 +50,13 @@ pub enum AckMode {
     Worker,
 }
 
+#[derive(Debug)]
 pub struct ApplicationState {
     pub status: ApplicationStatus,
     pub wants_ack: bool,
 }
 
+#[derive(Debug)]
 pub enum ApplicationStatus {
     Open,
     Closed { shutdown_kind: ShutdownKind },
@@ -63,19 +64,15 @@ pub enum ApplicationStatus {
 
 impl ApplicationStatus {
     fn from_u8(value: u8) -> Self {
-        if value == 0 {
-            return Self::Open;
-        }
-
-        let mut shutdown_kind = ShutdownKind::Normal;
         for (kind, mask) in ApplicationState::SHUTDOWN_KINDS {
             if value & mask != 0 {
-                shutdown_kind = *kind;
-                break;
+                return Self::Closed {
+                    shutdown_kind: *kind,
+                };
             }
         }
 
-        Self::Closed { shutdown_kind }
+        Self::Open
     }
 }
 
@@ -86,13 +83,15 @@ impl ApplicationState {
     const WANTS_ACK: u8 = 1 << 3;
 
     const SHUTDOWN_KINDS: &[(ShutdownKind, u8)] = &[
+        (ShutdownKind::Normal, Self::IS_CLOSED_MASK),
         (ShutdownKind::Errored, Self::IS_ERRORED_MASK),
         (ShutdownKind::Pruned, Self::IS_PRUNED_MASK),
     ];
 
     #[inline]
     fn load(shared: &AtomicU8) -> Self {
-        let value = shared.load(Ordering::Acquire);
+        let mask = u8::MAX ^ Self::WANTS_ACK;
+        let value = shared.fetch_and(mask, Ordering::Acquire);
         let status = ApplicationStatus::from_u8(value);
         let wants_ack = value & Self::WANTS_ACK != 0;
         Self { status, wants_ack }
