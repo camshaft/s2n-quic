@@ -6,13 +6,14 @@ use crate::{
     sync::intrusive_queue::Queue,
 };
 use core::fmt;
-use parking_lot::RwLock;
+use parking_lot::Mutex;
 use s2n_quic_core::time::Timestamp;
 use std::{
     sync::{
         atomic::{AtomicUsize, Ordering},
         Arc,
     },
+    task::Waker,
     time::Duration,
 };
 
@@ -61,8 +62,13 @@ impl<Info, Meta, Completion, const GRANULARITY_US: u64>
         let mask = (slots - 1) as u64;
         let start = unsafe { clock.get_time().as_duration().as_micros() as u64 / GRANULARITY_US };
 
+        let sync_state = SyncState {
+            start_idx: start,
+            waker: None,
+        };
+
         Self(Arc::new(State {
-            start_idx: RwLock::new(start),
+            sync_state: Mutex::new(sync_state),
             len: AtomicUsize::new(0),
             mask,
             entries,
@@ -80,24 +86,29 @@ impl<Info, Meta, Completion, const GRANULARITY_US: u64>
         Duration::from_micros(self.0.mask * GRANULARITY_US)
     }
 
-    pub fn insert(&self, entry: Entry<Info, Meta, Completion>, timestamp: Timestamp) -> Timestamp {
-        let (index, abs_idx) = self.index(timestamp);
+    pub fn insert(&self, entry: Entry<Info, Meta, Completion>, time: Timestamp) -> Timestamp {
+        let (index, abs_idx, waker) = self.index(time);
         self.0.len.fetch_add(1, Ordering::Relaxed);
         self.0.entries[index].push_back(entry);
+        if let Some(waker) = waker {
+            waker.wake();
+        }
         unsafe { Timestamp::from_duration(Duration::from_micros(abs_idx * GRANULARITY_US)) }
     }
 
     /// Returns the current transmissions along with the next timestamp to expire
     pub fn tick(
         &self,
+        waker: Option<Waker>,
     ) -> (
         Timestamp,
         crate::intrusive_queue::Queue<Transmission<Info, Meta, Completion>>,
     ) {
-        let mut lock = self.0.start_idx.write();
-        let start = *lock;
+        let mut lock = self.0.sync_state.lock();
+        let start = lock.start_idx;
         let next = start + 1;
-        *lock = next;
+        lock.start_idx = next;
+        lock.waker = waker;
         let index = (start & self.0.mask) as usize;
         let queue = self.0.entries[index].take();
         drop(lock);
@@ -113,35 +124,51 @@ impl<Info, Meta, Completion, const GRANULARITY_US: u64>
     }
 
     pub fn start(&self) -> Timestamp {
-        let micros = self.start_idx() * GRANULARITY_US;
+        let guard = self.0.sync_state.lock();
+        let start = guard.start_idx;
+        drop(guard);
+
+        let micros = start * GRANULARITY_US;
         unsafe { Timestamp::from_duration(Duration::from_micros(micros)) }
     }
 
-    fn start_idx(&self) -> u64 {
-        *self.0.start_idx.read()
-    }
+    fn index(&self, timestamp: Timestamp) -> (usize, u64, Option<Waker>) {
+        let full_idx = unsafe { timestamp.as_duration().as_micros() as u64 / GRANULARITY_US };
 
-    fn index(&self, timestamp: Timestamp) -> (usize, u64) {
-        let min = self.start_idx();
+        let mut guard = self.0.sync_state.lock();
+        let mut min = guard.start_idx;
+        let waker = if let Some(waker) = guard.waker.take() {
+            min = full_idx;
+            guard.start_idx = full_idx;
+            Some(waker)
+        } else {
+            None
+        };
+        drop(guard);
+
         let max = min + self.0.mask;
 
-        let idx = unsafe { timestamp.as_duration().as_micros() as u64 / GRANULARITY_US };
         // bound the timestamp to the current window
-        let idx = idx.clamp(min, max);
+        let idx = full_idx.clamp(min, max);
         // wrap the index around the slots
         let idx = idx & self.0.mask;
-        (idx as usize, min + idx)
+        (idx as usize, min + idx, waker)
     }
 }
 
 struct State<Info, Meta, Completion> {
-    start_idx: RwLock<u64>,
+    sync_state: Mutex<SyncState>,
     mask: u64,
     len: AtomicUsize,
     entries: Box<[Queue<Transmission<Info, Meta, Completion>>]>,
 }
 
-#[cfg(test)]
+struct SyncState {
+    start_idx: u64,
+    waker: Option<Waker>,
+}
+
+#[cfg(todo)]
 mod tests {
     use super::*;
     use crate::socket::pool::Pool;
