@@ -112,6 +112,9 @@ impl<Info, Meta, Completion> Builder<Info, Meta, Completion> {
 
                 can_push &= batch.entry.descriptors.len() < max_segments;
 
+                can_push &= (batch.entry.total_len as usize + descriptor.len() as usize)
+                    <= msg::segment::MAX_UDP_PAYLOAD as usize;
+
                 if let Some((first, _)) = batch.entry.descriptors.first() {
                     // We can push as long as our current message isn't greater than the segment size
                     can_push &= first.len() >= descriptor.len();
