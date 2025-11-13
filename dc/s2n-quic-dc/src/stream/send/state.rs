@@ -60,7 +60,7 @@ pub struct SentStreamPacket {
 pub struct SentRecoveryPacket {
     info: transmission::Info,
     cc_info: congestion::PacketInfo,
-    max_stream_packet_number: VarInt,
+    max_stream_packet_number_lost: VarInt,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -103,6 +103,7 @@ pub struct State {
     pub rtt_estimator: RttEstimator,
     pub sent_stream_packets: PacketMap<SentStreamPacket>,
     pub max_stream_packet_number: VarInt,
+    pub max_stream_packet_number_lost: VarInt,
     pub sent_recovery_packets: PacketMap<SentRecoveryPacket>,
     pub recovery_packet_number: u64,
     pub last_sent_recovery_packet: Option<Timestamp>,
@@ -126,6 +127,8 @@ pub struct State {
     pub max_sent_segment_size: u16,
     pub is_reliable: bool,
     pub retransmissions: BinaryHeap<retransmission::Segment>,
+    #[cfg(debug_assertions)]
+    pub pending_retransmissions: IntervalSet<VarInt>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -155,6 +158,7 @@ impl State {
             cca,
             sent_stream_packets: Default::default(),
             max_stream_packet_number: VarInt::ZERO,
+            max_stream_packet_number_lost: VarInt::ZERO,
             sent_recovery_packets: Default::default(),
             recovery_packet_number: 0,
             last_sent_recovery_packet: None,
@@ -176,6 +180,8 @@ impl State {
             max_sent_segment_size: 0,
             is_reliable: stream_id.is_reliable,
             retransmissions: Default::default(),
+            #[cfg(debug_assertions)]
+            pending_retransmissions: Default::default(),
         }
     }
 
@@ -517,14 +523,7 @@ impl State {
                 |packet_number: VarInt, sent_packet: &SentRecoveryPacket| {
                     *max_acked_recovery = (*max_acked_recovery).max(Some(packet_number));
                     *max_acked_stream =
-                        (*max_acked_stream).max(Some(sent_packet.max_stream_packet_number));
-
-                    // increase the max stream packet if this was a probe
-                    // if sent_packet.info.is_probe() {
-                    //     self.max_stream_packet_number = self
-                    //         .max_stream_packet_number
-                    //         .max(sent_packet.max_stream_packet_number + 1);
-                    // }
+                        (*max_acked_stream).max(Some(sent_packet.max_stream_packet_number_lost));
                 }
             );
         };
@@ -627,9 +626,9 @@ impl State {
             stream::PacketSpace::Stream => impl_loss_detection!(sent_stream_packets, |_| {}),
             stream::PacketSpace::Recovery => {
                 impl_loss_detection!(sent_recovery_packets, |sent_packet: &SentRecoveryPacket| {
-                    // self.max_stream_packet_number = self
-                    //     .max_stream_packet_number
-                    //     .max(sent_packet.max_stream_packet_number + 1);
+                    self.max_stream_packet_number_lost = self
+                        .max_stream_packet_number_lost
+                        .max(sent_packet.max_stream_packet_number_lost + 1);
                 })
             }
         }
@@ -937,13 +936,17 @@ impl State {
 
         if let stream::PacketSpace::Recovery = packet_space {
             let packet_number = PacketNumberSpace::Initial.new_packet_number(packet_number);
-            let max_stream_packet_number = self.max_stream_packet_number;
+            let max_stream_packet_number_lost = self.max_stream_packet_number_lost;
+
+            #[cfg(debug_assertions)]
+            self.pending_retransmissions.remove(info.range());
+
             self.sent_recovery_packets.insert(
                 packet_number,
                 SentRecoveryPacket {
                     info,
                     cc_info,
-                    max_stream_packet_number,
+                    max_stream_packet_number_lost,
                 },
             );
         } else {
@@ -1020,6 +1023,7 @@ impl State {
         // skip a packet number if we're probing
         if self.pto.transmissions() > 0 {
             self.recovery_packet_number += 1;
+            self.max_stream_packet_number_lost += 1;
 
             // Try making some existing stream packets as probes instead of transmitting empty ones
             self.make_stream_packets_as_pto_probes();
@@ -1123,6 +1127,9 @@ impl State {
                     time_sent,
                     ecn,
                 };
+
+                #[cfg(debug_assertions)]
+                self.pending_retransmissions.insert(info.range());
 
                 let meta = transmission::Meta {
                     packet_space: PacketSpace::Recovery,
@@ -1306,39 +1313,47 @@ impl State {
     #[cfg(debug_assertions)]
     #[inline]
     fn invariants(&self) {
-        // if !self.unacked_ranges.is_empty() {
-        //     let mut unacked_ranges = self.unacked_ranges.clone();
-        //     let last = unacked_ranges.inclusive_ranges().next_back().unwrap();
-        //     unacked_ranges.remove(last).unwrap();
+        if !self.unacked_ranges.is_empty() {
+            let mut unacked_ranges = self.unacked_ranges.clone();
+            let last = unacked_ranges.inclusive_ranges().next_back().unwrap();
+            unacked_ranges.remove(last).unwrap();
 
-        //     for (_pn, packet) in self.sent_stream_packets.iter() {
-        //         if packet.info.payload_len == 0 {
-        //             continue;
-        //         }
+            for (_pn, packet) in self.sent_stream_packets.iter() {
+                if packet.info.payload_len == 0 {
+                    continue;
+                }
 
-        //         unacked_ranges.remove(packet.info.range()).unwrap();
-        //     }
+                if packet.info.descriptor.is_some() {
+                    unacked_ranges.remove(packet.info.range()).unwrap();
+                }
+            }
 
-        //     for (_pn, packet) in self.sent_recovery_packets.iter() {
-        //         if packet.info.payload_len == 0 {
-        //             continue;
-        //         }
+            for (_pn, packet) in self.sent_recovery_packets.iter() {
+                if packet.info.payload_len == 0 {
+                    continue;
+                }
 
-        //         unacked_ranges.remove(packet.info.range()).unwrap();
-        //     }
+                if packet.info.descriptor.is_some() {
+                    unacked_ranges.remove(packet.info.range()).unwrap();
+                }
+            }
 
-        //     for v in self.retransmissions.iter() {
-        //         if v.payload_len == 0 {
-        //             continue;
-        //         }
-        //         unacked_ranges.remove(v.range()).unwrap();
-        //     }
+            for v in self.retransmissions.iter() {
+                if v.payload_len == 0 {
+                    continue;
+                }
+                unacked_ranges.remove(v.range()).unwrap();
+            }
 
-        //     assert!(
-        //         unacked_ranges.is_empty(),
-        //         "unacked ranges should be empty: {unacked_ranges:?}\n state\n {self:#?}"
-        //     );
-        // }
+            for range in self.pending_retransmissions.inclusive_ranges() {
+                unacked_ranges.remove(range).unwrap();
+            }
+
+            assert!(
+                unacked_ranges.is_empty(),
+                "unacked ranges should be empty: {unacked_ranges:?}\n state\n {self:#?}"
+            );
+        }
     }
 
     #[cfg(not(debug_assertions))]
