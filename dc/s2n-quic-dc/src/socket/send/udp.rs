@@ -7,7 +7,7 @@ use crate::{
     socket::send::{
         completion::{Completer as _, Completion},
         transmission::{Entry, Transmission},
-        wheel::Wheel,
+        wheel::{WakerState, Wheel},
     },
     stream::socket::Socket,
 };
@@ -15,6 +15,7 @@ use s2n_quic_core::time::Timestamp;
 use std::{
     future::poll_fn,
     ops::ControlFlow,
+    sync::Arc,
     task::{Poll, Waker},
     time::Duration,
 };
@@ -31,9 +32,15 @@ where
     C: Completion<Info, Meta>,
 {
     /// Ticks the wheel to get the next queue
-    fn tick(&mut self, waker: &Option<&Waker>) -> (Timestamp, Queue<Transmission<Info, Meta, C>>) {
+    fn tick(
+        &mut self,
+        waker: &Option<&Arc<WakerState>>,
+    ) -> (Timestamp, Queue<Transmission<Info, Meta, C>>) {
         if let Some((timestamp, queue)) = self.pending_queue.take() {
             // Resume processing previously retrieved queue
+            if let Some(waker) = *waker {
+                self.queue.set_waker(waker.clone());
+            }
             (timestamp, queue)
         } else {
             self.queue.tick(waker.cloned())
@@ -89,7 +96,7 @@ pub async fn non_blocking<S, Clk, Info, Meta, C, const GRANULARITY_US: u64>(
         })
         .collect::<Vec<_>>();
 
-    let waker = poll_fn(|cx| Poll::Ready(cx.waker().clone())).await;
+    let waker = WakerState::new().await;
 
     let granularity = Duration::from_micros(GRANULARITY_US);
     let mut bucket = bucket.init(granularity, clock.get_time());
@@ -99,9 +106,9 @@ pub async fn non_blocking<S, Clk, Info, Meta, C, const GRANULARITY_US: u64>(
     loop {
         // let mut target_timestamp = None;
         let target_timestamp = clock.get_time() + granularity;
-        let mut did_transmit = false;
+        let mut has_pending_transmissions = false;
         let mut should_park = false;
-        let waker = if target_timestamp > sleep_time {
+        let waker_ref = if target_timestamp > sleep_time {
             should_park = true;
             Some(&waker)
         } else {
@@ -109,43 +116,42 @@ pub async fn non_blocking<S, Clk, Info, Meta, C, const GRANULARITY_US: u64>(
         };
 
         // Process each wheel in priority order (0 = highest priority)
-        for (_priority, wheel) in wheels.iter_mut().enumerate() {
+        'batch: for (_priority, wheel) in wheels.iter_mut().enumerate() {
             // Catch-up/processing loop for this priority level
             loop {
                 // Get or tick the wheel for a queue
-                let (next_timestamp, mut queue) = wheel.tick(&waker);
+                let (next_timestamp, mut queue) = wheel.tick(&waker_ref);
 
                 // Process pending entry first if it exists
                 if let Some(entry) = wheel.pending_entry.take() {
                     let now = clock.get_time();
+                    has_pending_transmissions = true;
 
                     // Continue acquiring credits for partially transmitted entry
                     if let ControlFlow::Break(()) = bucket.take(entry.total_len as _, now) {
                         wheel.pending_entry = Some(entry);
                         wheel.pending_queue = Some((next_timestamp, queue));
-                        break;
+                        break 'batch;
                     }
 
                     // Successfully acquired all credits, send the packet
                     wheel.transmit(entry, &socket, &now);
-                    did_transmit = true;
                 }
 
                 // Process all packets in the queue
                 while let Some(entry) = queue.pop_front() {
                     let now = clock.get_time();
+                    has_pending_transmissions = true;
 
                     // Continue acquiring credits for partially transmitted entry
                     if let ControlFlow::Break(()) = bucket.take(entry.total_len as _, now) {
-                        // target_timestamp = Some(target);
                         wheel.pending_entry = Some(entry);
                         wheel.pending_queue = Some((next_timestamp, queue));
-                        break;
+                        break 'batch;
                     }
 
                     // Successfully acquired all credits, send the packet
                     wheel.transmit(entry, &socket, &now);
-                    did_transmit = true;
                 }
 
                 // if the wheel is caught up with the target then continue to the next priority
@@ -155,19 +161,10 @@ pub async fn non_blocking<S, Clk, Info, Meta, C, const GRANULARITY_US: u64>(
             }
         }
 
-        if did_transmit {
+        if has_pending_transmissions {
             sleep_time = target_timestamp + horizon;
         } else if should_park {
-            let mut did_poll = false;
-            core::future::poll_fn(|_cx| {
-                if did_poll {
-                    Poll::Ready(())
-                } else {
-                    did_poll = true;
-                    Poll::Pending
-                }
-            })
-            .await;
+            waker.wait().await;
             continue;
         }
 

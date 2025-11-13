@@ -792,7 +792,14 @@ impl State {
     /// Returns `true` if there are any outstanding stream segments
     #[inline]
     fn has_inflight_packets(&self) -> bool {
-        !self.sent_stream_packets.is_empty()
+        let mut has_packets = false;
+
+        has_packets |= !self.sent_stream_packets.is_empty();
+        has_packets |= !self.sent_recovery_packets.is_empty();
+        has_packets |= !self.retransmissions.is_empty();
+        has_packets |= self.cca.bytes_in_flight() > 0;
+
+        has_packets
     }
 
     #[inline]
