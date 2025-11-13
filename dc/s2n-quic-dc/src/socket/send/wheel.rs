@@ -2,11 +2,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
+    intrusive_queue::Queue,
     socket::send::transmission::{Entry, Transmission},
-    sync::intrusive_queue::Queue,
 };
 use core::fmt;
-use parking_lot::Mutex;
+use parking_lot::{Mutex, MutexGuard};
 use s2n_quic_core::time::Timestamp;
 use std::{
     sync::{
@@ -96,13 +96,13 @@ impl<Info, Meta, Completion, const GRANULARITY_US: u64>
         let sync_state = SyncState {
             start_idx: start,
             waker: None,
+            entries,
         };
 
         Self(Arc::new(State {
             sync_state: Mutex::new(sync_state),
             len: AtomicUsize::new(0),
             mask,
-            entries,
         }))
     }
 
@@ -118,9 +118,11 @@ impl<Info, Meta, Completion, const GRANULARITY_US: u64>
     }
 
     pub fn insert(&self, entry: Entry<Info, Meta, Completion>, time: Timestamp) -> Timestamp {
-        let (index, abs_idx, waker) = self.index(time);
+        let (index, abs_idx, waker, mut lock) = self.index(time);
+        lock.entries[index].push_back(entry);
+        drop(lock);
+
         self.0.len.fetch_add(1, Ordering::Relaxed);
-        self.0.entries[index].push_back(entry);
         if let Some(waker) = waker {
             waker.wake();
         }
@@ -135,17 +137,14 @@ impl<Info, Meta, Completion, const GRANULARITY_US: u64>
     pub fn tick(
         &self,
         waker: Option<Arc<WakerState>>,
-    ) -> (
-        Timestamp,
-        crate::intrusive_queue::Queue<Transmission<Info, Meta, Completion>>,
-    ) {
+    ) -> (Timestamp, Queue<Transmission<Info, Meta, Completion>>) {
         let mut lock = self.0.sync_state.lock();
         let start = lock.start_idx;
         let next = start + 1;
         lock.start_idx = next;
         lock.waker = waker;
         let index = (start & self.0.mask) as usize;
-        let queue = self.0.entries[index].take();
+        let queue = core::mem::take(&mut lock.entries[index]);
         drop(lock);
 
         let now = unsafe { Timestamp::from_duration(Duration::from_micros(next * GRANULARITY_US)) };
@@ -159,27 +158,34 @@ impl<Info, Meta, Completion, const GRANULARITY_US: u64>
     }
 
     pub fn start(&self) -> Timestamp {
-        let guard = self.0.sync_state.lock();
-        let start = guard.start_idx;
-        drop(guard);
+        let lock = self.0.sync_state.lock();
+        let start = lock.start_idx;
+        drop(lock);
 
         let micros = start * GRANULARITY_US;
         unsafe { Timestamp::from_duration(Duration::from_micros(micros)) }
     }
 
-    fn index(&self, timestamp: Timestamp) -> (usize, u64, Option<Arc<WakerState>>) {
+    fn index(
+        &self,
+        timestamp: Timestamp,
+    ) -> (
+        usize,
+        u64,
+        Option<Arc<WakerState>>,
+        MutexGuard<SyncState<Info, Meta, Completion>>,
+    ) {
         let full_idx = unsafe { timestamp.as_duration().as_micros() as u64 / GRANULARITY_US };
 
-        let mut guard = self.0.sync_state.lock();
-        let mut min = guard.start_idx;
-        let waker = if let Some(waker) = guard.waker.take() {
+        let mut lock = self.0.sync_state.lock();
+        let mut min = lock.start_idx;
+        let waker = if let Some(waker) = lock.waker.take() {
             min = full_idx;
-            guard.start_idx = full_idx;
+            lock.start_idx = full_idx;
             Some(waker)
         } else {
             None
         };
-        drop(guard);
 
         let max = min + self.0.mask;
 
@@ -187,20 +193,20 @@ impl<Info, Meta, Completion, const GRANULARITY_US: u64>
         let idx = full_idx.clamp(min, max);
         // wrap the index around the slots
         let idx = idx & self.0.mask;
-        (idx as usize, min + idx, waker)
+        (idx as usize, min + idx, waker, lock)
     }
 }
 
 struct State<Info, Meta, Completion> {
-    sync_state: Mutex<SyncState>,
+    sync_state: Mutex<SyncState<Info, Meta, Completion>>,
     mask: u64,
     len: AtomicUsize,
-    entries: Box<[Queue<Transmission<Info, Meta, Completion>>]>,
 }
 
-struct SyncState {
+struct SyncState<Info, Meta, Completion> {
     start_idx: u64,
     waker: Option<Arc<WakerState>>,
+    entries: Box<[Queue<Transmission<Info, Meta, Completion>>]>,
 }
 
 #[cfg(todo)]
