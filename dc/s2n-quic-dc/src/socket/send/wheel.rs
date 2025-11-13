@@ -10,15 +10,46 @@ use parking_lot::Mutex;
 use s2n_quic_core::time::Timestamp;
 use std::{
     sync::{
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc,
     },
-    task::Waker,
+    task::{Poll, Waker},
     time::Duration,
 };
 
 // TODO tune this
 pub const DEFAULT_GRANULARITY_US: u64 = 64;
+
+pub struct WakerState {
+    waker: Waker,
+    should_wake: AtomicBool,
+}
+
+impl WakerState {
+    pub async fn new() -> Arc<Self> {
+        let waker = core::future::poll_fn(|cx| Poll::Ready(cx.waker().clone())).await;
+        Arc::new(Self {
+            waker,
+            should_wake: AtomicBool::new(false),
+        })
+    }
+
+    fn wake(&self) {
+        self.should_wake.store(true, Ordering::Relaxed);
+        self.waker.wake_by_ref();
+    }
+
+    pub async fn wait(&self) {
+        core::future::poll_fn(|cx| {
+            if self.should_wake.swap(false, Ordering::Relaxed) {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        })
+        .await
+    }
+}
 
 pub struct Wheel<Info, Meta, Completion, const GRANULARITY_US: u64 = DEFAULT_GRANULARITY_US>(
     Arc<State<Info, Meta, Completion>>,
@@ -96,10 +127,14 @@ impl<Info, Meta, Completion, const GRANULARITY_US: u64>
         unsafe { Timestamp::from_duration(Duration::from_micros(abs_idx * GRANULARITY_US)) }
     }
 
+    pub fn set_waker(&mut self, waker: Arc<WakerState>) {
+        self.0.sync_state.lock().waker = Some(waker);
+    }
+
     /// Returns the current transmissions along with the next timestamp to expire
     pub fn tick(
         &self,
-        waker: Option<Waker>,
+        waker: Option<Arc<WakerState>>,
     ) -> (
         Timestamp,
         crate::intrusive_queue::Queue<Transmission<Info, Meta, Completion>>,
@@ -132,7 +167,7 @@ impl<Info, Meta, Completion, const GRANULARITY_US: u64>
         unsafe { Timestamp::from_duration(Duration::from_micros(micros)) }
     }
 
-    fn index(&self, timestamp: Timestamp) -> (usize, u64, Option<Waker>) {
+    fn index(&self, timestamp: Timestamp) -> (usize, u64, Option<Arc<WakerState>>) {
         let full_idx = unsafe { timestamp.as_duration().as_micros() as u64 / GRANULARITY_US };
 
         let mut guard = self.0.sync_state.lock();
@@ -165,7 +200,7 @@ struct State<Info, Meta, Completion> {
 
 struct SyncState {
     start_idx: u64,
-    waker: Option<Waker>,
+    waker: Option<Arc<WakerState>>,
 }
 
 #[cfg(todo)]

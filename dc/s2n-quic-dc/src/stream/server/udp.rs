@@ -28,11 +28,12 @@ use s2n_quic_core::{
 use std::{io, sync::Arc};
 use tracing::debug;
 
-pub struct Acceptor<Env, S, W>
+pub struct Acceptor<Env, S, W, R>
 where
     Env: Environment,
     S: socket::application::Application,
     W: socket::Socket,
+    R: socket::Socket,
 {
     sender: accept::Sender<Env::Subscriber>,
     env: Env,
@@ -45,13 +46,15 @@ where
     transmission_pool: pool::Sharded,
     application_socket: Arc<S>,
     worker_socket: Arc<W>,
+    secret_socket: R,
 }
 
-impl<Env, S, W> Acceptor<Env, S, W>
+impl<Env, S, W, R> Acceptor<Env, S, W, R>
 where
     Env: Environment,
     S: socket::application::Application,
     W: socket::Socket,
+    R: socket::Socket,
 {
     pub fn new(
         env: Env,
@@ -61,6 +64,7 @@ where
         queues: Allocator,
         application_socket: Arc<S>,
         worker_socket: Arc<W>,
+        secret_socket: R,
         transmission_pool: pool::Sharded,
         unroutable_packets: mpsc::Sender<descriptor::Filled>,
     ) -> Self {
@@ -78,16 +82,18 @@ where
             transmission_pool,
             application_socket,
             worker_socket,
+            secret_socket,
         }
     }
 }
 
-impl<Env, S, W> Router for Acceptor<Env, S, W>
+impl<Env, S, W, R> Router for Acceptor<Env, S, W, R>
 where
     Env: Environment,
     Env::Subscriber: Clone,
     S: socket::application::Application,
     W: socket::Socket,
+    R: socket::Socket,
 {
     #[inline]
     fn is_open(&self) -> bool {
@@ -164,7 +170,7 @@ where
                     let addr = msg::addr::Addr::new(peer_addr);
                     let ecn = Default::default();
                     let buffer = &[io::IoSlice::new(&secret_control)];
-                    let _ = self.worker_socket.try_send(&addr, ecn, buffer);
+                    let _ = self.secret_socket.try_send(&addr, ecn, buffer);
                 }
                 return;
             }

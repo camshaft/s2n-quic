@@ -148,6 +148,9 @@ impl Pool {
                 let app_socket = socket.application[0].clone();
                 let worker_socket = socket.worker.clone();
 
+                // TODO pace these packets
+                let secret_socket = Tracing(sockets[0].socket.clone());
+
                 let acceptor = Acceptor::new(
                     env.clone(),
                     sender.clone(),
@@ -156,6 +159,7 @@ impl Pool {
                     queues.clone(),
                     app_socket,
                     worker_socket,
+                    secret_socket,
                     transmission_pool.clone(),
                     unroutable_packets.clone(),
                 );
