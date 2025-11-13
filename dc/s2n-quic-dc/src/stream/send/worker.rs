@@ -93,19 +93,12 @@ struct Snapshot {
 
 impl Snapshot {
     #[inline]
-    fn apply<Sub, C>(
-        &self,
-        initial: &Self,
-        shared: &shared::Shared<Sub, C>,
-        transmission_credits: u16,
-    ) where
+    fn apply<Sub, C>(&self, initial: &Self, shared: &shared::Shared<Sub, C>)
+    where
         Sub: event::Subscriber,
         C: Clock,
     {
-        shared
-            .sender
-            .flow
-            .release(self.flow_offset, transmission_credits);
+        shared.sender.flow.release(self.flow_offset);
 
         if initial.send_quantum != self.send_quantum {
             let send_quantum = (self.send_quantum as u64).div_ceil(self.max_datagram_size as u64);
@@ -212,7 +205,7 @@ where
 
         self.shared.sender.worker_waker.on_worker_wake();
 
-        let transmission_credits = self.poll_once(cx);
+        self.poll_once(cx);
 
         // check if the application sent us any more messages
         if !self
@@ -240,7 +233,7 @@ where
             !matches!(self.state, waiting::State::Finished)
         });
 
-        current.apply(&initial, &self.shared, transmission_credits);
+        current.apply(&initial, &self.shared);
 
         if let Some(target) = timeout {
             self.timer.update(target);
@@ -259,8 +252,7 @@ where
     }
 
     #[inline]
-    #[must_use]
-    fn poll_once(&mut self, cx: &mut Context) -> u16 {
+    fn poll_once(&mut self, cx: &mut Context) {
         self.sender
             .load_completion_queue(&self.shared.sender.transmission_queue);
 
@@ -270,8 +262,6 @@ where
         let _ = self.poll_timers(cx);
         let _ = self.poll_transmit(cx);
         self.after_transmit();
-
-        self.sender.take_transmission_credits()
     }
 
     #[inline]

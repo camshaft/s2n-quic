@@ -16,7 +16,7 @@ use core::{
     task::{Context, Poll},
 };
 use s2n_quic_core::{ensure, varint::VarInt};
-use std::sync::{atomic::AtomicU16, OnceLock};
+use std::sync::OnceLock;
 
 const ERROR_MASK: u64 = 1 << 63;
 const FINISHED_MASK: u64 = 1 << 62;
@@ -27,8 +27,6 @@ pub struct State {
     stream_offset: AtomicU64,
     /// Offset which indicates the maximum offset the application can write to
     flow_offset: AtomicU64,
-    /// The number of transmissions that can be outstanding
-    // transmission_credits: AtomicU16,
     /// Notifies an application of newly-available flow credits
     poll_waker: AtomicWaker,
     stream_error: OnceLock<Error>,
@@ -46,11 +44,10 @@ impl fmt::Debug for State {
 
 impl State {
     #[inline]
-    pub fn new(initial_flow_offset: VarInt, initial_transmission_credits: u16) -> Self {
+    pub fn new(initial_flow_offset: VarInt) -> Self {
         Self {
             stream_offset: AtomicU64::new(0),
             flow_offset: AtomicU64::new(initial_flow_offset.as_u64()),
-            // transmission_credits: AtomicU16::new(initial_transmission_credits),
             poll_waker: AtomicWaker::new(),
             stream_error: OnceLock::new(),
         }
@@ -68,7 +65,7 @@ impl State {
 
     /// Called by the background worker to release flow credits
     #[inline]
-    pub fn release(&self, flow_offset: VarInt, transmission_credits: u16) {
+    pub fn release(&self, flow_offset: VarInt) {
         tracing::trace!(release = %flow_offset);
 
         let mut should_wake = false;
@@ -117,17 +114,6 @@ impl State {
         features: &TransportFeatures,
     ) -> Poll<Result<Credits, Error>> {
         let mut stored_waker = false;
-
-        // try to acquire credits for packet transmissions
-        if !features.is_flow_controlled() {
-            // while self.transmission_credits.load(Ordering::Relaxed) == 0 {
-            //     // if we already stored a waker and didn't get more credits then yield the task
-            //     ensure!(!stored_waker, Poll::Pending);
-            //     stored_waker = true;
-
-            //     self.poll_waker.register(cx.waker());
-            // }
-        }
 
         let mut current_offset = self.acquire_offset(&request)?;
 
@@ -242,7 +228,7 @@ mod tests {
     async fn concurrent_flow() {
         let mut initial_offset = VarInt::from_u8(255);
         let expected_len = VarInt::from_u16(u16::MAX);
-        let state = Arc::new(State::new(initial_offset, 10));
+        let state = Arc::new(State::new(initial_offset));
         let path_info = path::Info {
             max_datagram_size: 1500,
             send_quantum: 10,
@@ -315,7 +301,7 @@ mod tests {
                 tokio::time::sleep(core::time::Duration::from_millis(1)).await;
                 initial_offset = (initial_offset + credits).min(expected_len);
                 credits += 1;
-                state.release(initial_offset, 1);
+                state.release(initial_offset);
             }
         });
 
@@ -344,7 +330,7 @@ mod tests {
             .with_type::<(u8, u8, bool)>()
             .cloned()
             .for_each(|(initial_offset, len, is_fin)| {
-                let state = Arc::new(State::new(VarInt::from_u8(initial_offset), 10));
+                let state = Arc::new(State::new(VarInt::from_u8(initial_offset)));
 
                 state.set_error(Error::new(error::Kind::FatalError));
 
