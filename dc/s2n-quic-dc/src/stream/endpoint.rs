@@ -219,9 +219,7 @@ where
                 (flow_offset, send_quantum, bandwidth)
             };
 
-        let max_pending_transmissions = 32;
-
-        let flow = flow::non_blocking::State::new(flow_offset, max_pending_transmissions);
+        let flow = flow::non_blocking::State::new(flow_offset);
 
         let path = send::path::Info {
             max_datagram_size: parameters.max_datagram_size(),

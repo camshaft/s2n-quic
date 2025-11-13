@@ -119,13 +119,13 @@ pub struct State {
     pub unacked_ranges: IntervalSet<VarInt>,
     pub max_sent_offset: VarInt,
     pub max_data: VarInt,
+    pub max_tx_offset: VarInt,
     pub local_max_data_window: VarInt,
     pub peer_activity: Option<PeerActivity>,
     pub max_datagram_size: u16,
     pub max_sent_segment_size: u16,
     pub is_reliable: bool,
     pub retransmissions: BinaryHeap<retransmission::Segment>,
-    pub pending_transmission_credits: u16,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -147,6 +147,8 @@ impl State {
         let cca = congestion::Controller::new(max_datagram_size);
         let max_sent_offset = VarInt::ZERO;
 
+        let max_tx_offset = VarInt::from_u16(max_datagram_size) * 64;
+
         Self {
             next_expected_control_packet: VarInt::ZERO,
             rtt_estimator: recovery::rtt_estimator(),
@@ -167,13 +169,13 @@ impl State {
             unacked_ranges,
             max_sent_offset,
             max_data: initial_max_data,
+            max_tx_offset,
             local_max_data_window: local_max_data,
             peer_activity: None,
             max_datagram_size,
             max_sent_segment_size: 0,
             is_reliable: stream_id.is_reliable,
             retransmissions: Default::default(),
-            pending_transmission_credits: 0,
         }
     }
 
@@ -218,7 +220,10 @@ impl State {
 
         let remote_offset = self.max_data;
 
-        cca_offset.min(local_offset).min(remote_offset)
+        cca_offset
+            .min(local_offset)
+            .min(remote_offset)
+            .min(self.max_tx_offset)
     }
 
     #[inline]
@@ -887,10 +892,6 @@ impl State {
         did_transmit_stream
     }
 
-    pub fn take_transmission_credits(&mut self) -> u16 {
-        core::mem::take(&mut self.pending_transmission_credits)
-    }
-
     #[inline]
     fn on_transmit_segment(
         &mut self,
@@ -901,8 +902,6 @@ impl State {
     ) {
         // the BBR implementation requires monotonic time so track that
         let mut cca_time_sent = info.time_sent;
-
-        self.pending_transmission_credits += 1;
 
         match packet_space {
             stream::PacketSpace::Stream => {
@@ -958,6 +957,10 @@ impl State {
                 );
             }
             self.max_stream_packet_number = self.max_stream_packet_number.max(packet_number);
+            self.max_tx_offset += VarInt::from_u16(info.payload_len);
+            self.recovery_packet_number = self
+                .recovery_packet_number
+                .max(self.max_stream_packet_number.as_u64() + 1);
             let packet_number = PacketNumberSpace::Initial.new_packet_number(packet_number);
             self.sent_stream_packets
                 .insert(packet_number, SentStreamPacket { info, cc_info });
