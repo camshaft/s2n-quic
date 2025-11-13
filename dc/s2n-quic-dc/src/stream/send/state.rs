@@ -515,11 +515,11 @@ impl State {
                         (*max_acked_stream).max(Some(sent_packet.max_stream_packet_number));
 
                     // increase the max stream packet if this was a probe
-                    if sent_packet.info.is_probe() {
-                        self.max_stream_packet_number = self
-                            .max_stream_packet_number
-                            .max(sent_packet.max_stream_packet_number + 1);
-                    }
+                    // if sent_packet.info.is_probe() {
+                    //     self.max_stream_packet_number = self
+                    //         .max_stream_packet_number
+                    //         .max(sent_packet.max_stream_packet_number + 1);
+                    // }
                 }
             );
         };
@@ -622,9 +622,9 @@ impl State {
             stream::PacketSpace::Stream => impl_loss_detection!(sent_stream_packets, |_| {}),
             stream::PacketSpace::Recovery => {
                 impl_loss_detection!(sent_recovery_packets, |sent_packet: &SentRecoveryPacket| {
-                    self.max_stream_packet_number = self
-                        .max_stream_packet_number
-                        .max(sent_packet.max_stream_packet_number + 1);
+                    // self.max_stream_packet_number = self
+                    //     .max_stream_packet_number
+                    //     .max(sent_packet.max_stream_packet_number + 1);
                 })
             }
         }
@@ -899,9 +899,9 @@ impl State {
 
         match packet_space {
             stream::PacketSpace::Stream => {
-                if let Some(min) = self.last_sent_recovery_packet {
-                    cca_time_sent = info.time_sent.max(min);
-                }
+                // if let Some(min) = self.last_sent_recovery_packet {
+                //     cca_time_sent = info.time_sent.max(min);
+                // }
             }
             stream::PacketSpace::Recovery => {
                 self.last_sent_recovery_packet = Some(info.time_sent);
@@ -941,6 +941,15 @@ impl State {
                 },
             );
         } else {
+            if packet_number == VarInt::ZERO {
+                debug_assert_eq!(packet_number, self.max_stream_packet_number);
+            } else {
+                debug_assert_eq!(
+                    packet_number,
+                    self.max_stream_packet_number + 1,
+                    "application packet numbers should be transmitted in order {info:?}"
+                );
+            }
             self.max_stream_packet_number = self.max_stream_packet_number.max(packet_number);
             let packet_number = PacketNumberSpace::Initial.new_packet_number(packet_number);
             self.sent_stream_packets
