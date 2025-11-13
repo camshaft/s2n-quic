@@ -86,9 +86,9 @@ impl State {
         };
 
         loop {
-            let packet_number = packet_number.next()?;
-
             let res = message.push_with(|mut buffer| {
+                let packet_number = packet_number.next().unwrap();
+
                 let stream_offset = reader.current_offset();
                 let mut reader = reader.track_read();
 
