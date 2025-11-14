@@ -291,7 +291,7 @@ pub struct Builder {
     linger: Option<Duration>,
     send_buffer: Option<usize>,
     recv_buffer: Option<usize>,
-    socket_workers: Option<usize>,
+    socket_workers: udp_pool::Workers,
     enable_tcp: bool,
     enable_udp: bool,
 }
@@ -360,9 +360,17 @@ impl Builder {
         self
     }
 
-    pub fn with_socket_workers(mut self, workers: usize) -> Self {
-        self.socket_workers = Some(workers);
+    pub fn with_socket_workers(mut self, workers: udp_pool::Workers) -> Self {
+        self.socket_workers = workers;
         self
+    }
+
+    pub fn with_socket_worker_count(self, workers: usize) -> Self {
+        self.with_socket_workers(udp_pool::Workers::Environment(Some(workers)))
+    }
+
+    pub fn with_busy_poll(self, busy_poll: crate::busy_poll::Pool) -> Self {
+        self.with_socket_workers(udp_pool::Workers::BusyPoll(busy_poll))
     }
 
     #[inline]
@@ -396,11 +404,7 @@ impl Builder {
 
         if self.enable_udp {
             let mut pool = udp_pool::Config::new(handshake.map().clone());
-
-            if let Some(workers) = self.socket_workers {
-                pool.workers = Some(workers);
-            }
-
+            pool.workers = self.socket_workers;
             env = env.with_pool(pool);
         }
 

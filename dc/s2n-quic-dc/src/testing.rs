@@ -339,3 +339,18 @@ impl Pair {
 pub fn pair_sync() -> (client::Provider, server::Provider) {
     Pair::default().build_sync()
 }
+
+pub fn busy_poll() -> crate::busy_poll::Pool {
+    static POOL: std::sync::OnceLock<crate::busy_poll::Pool> = std::sync::OnceLock::new();
+
+    POOL.get_or_init(|| {
+        let mut handles = vec![];
+        for _ in 0..4 {
+            let (handle, runner) = crate::busy_poll::Handle::new();
+            std::thread::spawn(move || runner.run());
+            handles.push(handle);
+        }
+        handles.into()
+    })
+    .clone()
+}

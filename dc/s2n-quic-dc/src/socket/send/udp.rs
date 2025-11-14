@@ -12,13 +12,7 @@ use crate::{
     stream::socket::Socket,
 };
 use s2n_quic_core::time::Timestamp;
-use std::{
-    future::poll_fn,
-    ops::ControlFlow,
-    sync::Arc,
-    task::{Poll, Waker},
-    time::Duration,
-};
+use std::{ops::ControlFlow, sync::Arc, time::Duration};
 
 /// State for each priority level to track partially processed queues and entries
 struct WheelState<Info, Meta, Completion, const GRANULARITY_US: u64> {
@@ -68,24 +62,43 @@ where
     }
 }
 
+pub trait WakeMode {
+    const BUSY_POLL: bool;
+}
+
+pub struct BusyPoll;
+
+impl WakeMode for BusyPoll {
+    const BUSY_POLL: bool = true;
+}
+
+pub struct WithWaker;
+
+impl WakeMode for WithWaker {
+    const BUSY_POLL: bool = false;
+}
+
 /// Sends packets on a non-blocking socket with priority-based timing wheels
 ///
 /// Priority levels are specified by the number of wheels.
 /// Index 0 is the highest priority and is processed first.
 /// The function drains each priority level in order, and if blocked by the token
 /// bucket, it restarts from the highest priority level after the bucket refills.
-pub async fn non_blocking<S, Clk, Info, Meta, C, const GRANULARITY_US: u64>(
+pub async fn non_blocking<S, Clk, Info, Meta, C, W, const GRANULARITY_US: u64>(
     socket: S,
     wheels: Vec<Wheel<Info, Meta, C, GRANULARITY_US>>,
     clock: Clk,
     bucket: LeakyBucket,
+    wake_mode: W,
 ) where
     S: Socket,
     Clk: Clock,
     C: Completion<Info, Meta>,
+    W: WakeMode,
 {
     assert!(!wheels.is_empty());
     let mut timer = clock.timer();
+    let _ = wake_mode;
 
     let mut wheels = wheels
         .into_iter()
@@ -108,7 +121,7 @@ pub async fn non_blocking<S, Clk, Info, Meta, C, const GRANULARITY_US: u64>(
         let target_timestamp = clock.get_time() + granularity;
         let mut has_pending_transmissions = false;
         let mut should_park = false;
-        let waker_ref = if target_timestamp > sleep_time {
+        let waker_ref = if !W::BUSY_POLL && target_timestamp > sleep_time {
             should_park = true;
             Some(&waker)
         } else {
@@ -163,7 +176,7 @@ pub async fn non_blocking<S, Clk, Info, Meta, C, const GRANULARITY_US: u64>(
 
         if has_pending_transmissions {
             sleep_time = target_timestamp + horizon;
-        } else if should_park {
+        } else if !W::BUSY_POLL && should_park {
             waker.wait().await;
             continue;
         }
