@@ -103,7 +103,7 @@ impl Runner {
         let mut spawns = Vec::with_capacity(16);
 
         loop {
-            const ITERATIONS: usize = if cfg!(debug_assertions) { 1000 } else { 10_000 };
+            const ITERATIONS: usize = if cfg!(debug_assertions) { 10 } else { 10_000 };
 
             for _ in 0..ITERATIONS {
                 tasks.poll(&mut cx);

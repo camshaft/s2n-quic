@@ -13,6 +13,7 @@ mod macros;
 
 #[cfg(any(test, feature = "testing"))]
 pub mod bach;
+pub mod precision;
 #[cfg(feature = "tokio")]
 pub mod tokio;
 pub use time::clock::Cached;
@@ -109,6 +110,12 @@ impl Timer {
         use time::clock::Timer;
         self.update(target);
         core::future::poll_fn(|cx| self.poll_ready(cx)).await
+    }
+}
+
+impl time::Clock for Timer {
+    fn get_time(&self) -> Timestamp {
+        self.sleep.get_time()
     }
 }
 

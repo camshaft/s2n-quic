@@ -5,6 +5,13 @@ use bach::time::{self, sleep_until, Instant};
 
 impl_clock!();
 
+impl crate::clock::precision::Timer for Clock {
+    async fn sleep_until(&mut self, target: super::precision::Timestamp) {
+        let target = self.0 + core::time::Duration::from_nanos(target.nanos);
+        sleep_until(target).await;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::{

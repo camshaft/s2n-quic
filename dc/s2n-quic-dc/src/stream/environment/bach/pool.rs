@@ -79,19 +79,17 @@ impl PoolSocket {
     fn spawn_send_worker(&self, config: &Config, clock: Clock) {
         let socket = Tracing(self.socket.clone());
 
-        let mut wheels = vec![(***self.worker).clone()];
+        let mut wheels = vec![send::wheel::Wheel::clone(&self.worker)];
 
         for application in &self.application {
-            wheels.push((*****application).clone());
+            wheels.push(send::wheel::Wheel::clone(application));
         }
 
         let token_bucket = config.bucket();
 
         let span = tracing::trace_span!("send_socket_worker");
-        let task = async move {
-            send::udp::non_blocking(socket, wheels, clock, token_bucket, send::udp::WithWaker)
-                .await;
-        };
+        let task =
+            send::udp::non_blocking(socket, wheels, clock, token_bucket, send::udp::WithWaker);
 
         if span.is_disabled() {
             bach::spawn(task);
@@ -115,10 +113,15 @@ impl Pool {
 
         let options = env.socket_options.clone();
 
-        config.workers.set_default(workers);
+        config.send_workers.set_default(workers);
+        config.recv_workers.set_default(workers);
 
         assert!(
-            matches!(config.workers, Workers::Environment(_)),
+            matches!(config.send_workers, Workers::Environment(_)),
+            "bach only supports environment socket workers"
+        );
+        assert!(
+            matches!(config.recv_workers, Workers::Environment(_)),
             "bach only supports environment socket workers"
         );
 
@@ -304,10 +307,10 @@ impl Pool {
             None
         };
 
-        let workers = config.workers.len().unwrap_or(1).max(1);
+        let socket_count = config.socket_count();
 
-        for i in 0..workers {
-            let socket = if i == 0 && workers > 1 {
+        for i in 0..socket_count {
+            let socket = if i == 0 && socket_count > 1 {
                 if config.reuse_port {
                     // set reuse port after we bind for the first socket
                     options.reuse_port = ReusePort::AfterBind;

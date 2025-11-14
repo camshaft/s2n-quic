@@ -3,7 +3,7 @@
 
 use super::udp::{ApplicationSendSocket, ArcSocket, WorkerSendSocket};
 use crate::{
-    clock::tokio::Clock,
+    clock::{tokio::Clock, Clock as _},
     credentials::Credentials,
     event,
     socket::{
@@ -45,6 +45,19 @@ struct PoolSocket {
     recv_queue: Mutex<Queues>,
 }
 
+macro_rules! spawn_span {
+    ($span:expr, $task:ident, | $spanned:ident | $spawn:block) => {
+        let span = $span;
+        if span.is_disabled() {
+            let $spanned = $task;
+            $spawn
+        } else {
+            let $spanned = ($task).instrument(span);
+            $spawn
+        }
+    };
+}
+
 impl PoolSocket {
     fn new(socket: UdpSocket, recv_queue: Mutex<Queues>, config: &Config, clock: &Clock) -> Self {
         let socket = Arc::new(socket);
@@ -71,33 +84,55 @@ impl PoolSocket {
         }
     }
 
+    fn create_send_socket_worker(
+        &self,
+        config: &Config,
+        env: &Environment<impl event::Subscriber + Clone>,
+        timer: impl crate::clock::precision::Timer + Send + 'static,
+        wake_mode: impl send::udp::WakeMode + Send + 'static,
+    ) -> impl core::future::Future<Output = ()> + Send + 'static {
+        let socket = Tracing(Gso(SendOnly(self.socket.clone()), env.gso.clone()));
+
+        let mut wheels = vec![send::wheel::Wheel::clone(&self.worker)];
+
+        for application in &self.application {
+            wheels.push(send::wheel::Wheel::clone(application));
+        }
+
+        dbg!(config.priority_levels, wheels.len());
+
+        let token_bucket = config.bucket();
+
+        send::udp::non_blocking(socket, wheels, timer, token_bucket, wake_mode)
+    }
+
     fn spawn_non_blocking_send_worker(
         &self,
         config: &Config,
         env: &Environment<impl event::Subscriber + Clone>,
     ) {
-        let socket = Tracing(Gso(SendOnly(self.socket.clone()), env.gso.clone()));
-
-        let mut wheels = vec![(***self.worker).clone()];
-
-        for application in &self.application {
-            wheels.push((*****application).clone());
-        }
-
-        let token_bucket = config.bucket();
-
-        let clock = env.clock();
+        let timer = env.clock().timer();
+        let wake_mode = send::udp::WithWaker;
+        let task = self.create_send_socket_worker(config, env, timer, wake_mode);
         let span = tracing::trace_span!("send_socket_worker");
-        let task = async move {
-            send::udp::non_blocking(socket, wheels, clock, token_bucket, send::udp::WithWaker)
-                .await;
-        };
-
-        if span.is_disabled() {
+        spawn_span!(span, task, |task| {
             env.writer_rt.spawn(task);
-        } else {
-            env.writer_rt.spawn(task.instrument(span));
-        }
+        });
+    }
+
+    fn spawn_non_blocking_recv_worker(
+        &self,
+        _config: &Config,
+        env: &Environment<impl event::Subscriber + Clone>,
+        alloc: pool::Pool,
+        router: impl Router + Send + 'static,
+    ) {
+        let recv_socket = AsyncFd::new(self.socket.clone()).unwrap();
+        let task = udp::non_blocking(recv_socket, alloc, router);
+        let span = tracing::trace_span!("recv_socket_worker");
+        spawn_span!(span, task, |task| {
+            env.reader_rt.spawn(task);
+        });
     }
 
     fn spawn_busy_poll_send_worker(
@@ -106,28 +141,29 @@ impl PoolSocket {
         env: &Environment<impl event::Subscriber + Clone>,
         handle: &crate::busy_poll::Handle,
     ) {
-        let socket = Tracing(Gso(SendOnly(self.socket.clone()), env.gso.clone()));
-
-        let mut wheels = vec![(***self.worker).clone()];
-
-        for application in &self.application {
-            wheels.push((*****application).clone());
-        }
-
-        let token_bucket = config.bucket();
-
-        let clock = env.clock();
-        let clock = crate::busy_poll::clock::Clock::new(clock);
+        let timer = crate::busy_poll::clock::Timer::new(env.clock());
+        let wake_mode = send::udp::BusyPoll;
+        let task = self.create_send_socket_worker(config, env, timer, wake_mode);
         let span = tracing::trace_span!("send_socket_worker");
-        let task = async move {
-            send::udp::non_blocking(socket, wheels, clock, token_bucket, send::udp::BusyPoll).await;
-        };
-
-        if span.is_disabled() {
+        spawn_span!(span, task, |task| {
             handle.spawn_with_priority(task, config.flow_priority);
-        } else {
-            handle.spawn_with_priority(task.instrument(span), config.flow_priority);
-        }
+        });
+    }
+
+    fn spawn_busy_poll_recv_worker(
+        &self,
+        config: &Config,
+        _env: &Environment<impl event::Subscriber + Clone>,
+        alloc: pool::Pool,
+        router: impl Router + Send + 'static,
+        handle: &crate::busy_poll::Handle,
+    ) {
+        let recv_socket = BusyPoll(self.socket.clone());
+        let task = udp::non_blocking(recv_socket, alloc, router);
+        let span = tracing::trace_span!("recv_socket_worker");
+        spawn_span!(span, task, |task| {
+            handle.spawn_with_priority(task, config.flow_priority);
+        });
     }
 }
 
@@ -145,7 +181,8 @@ impl Pool {
 
         let options = env.socket_options.clone();
 
-        config.workers.set_default(workers);
+        config.send_workers.set_default(workers);
+        config.recv_workers.set_default(workers);
         let sockets = Self::create_workers(&env.clock(), options, &config)?;
 
         let local_addr = sockets[0].socket.local_addr()?;
@@ -169,12 +206,8 @@ impl Pool {
 
         macro_rules! spawn {
             ($create_router:expr) => {
-                if let Workers::BusyPoll(pool) = &config.workers {
-                    Self::spawn_busy_poll(env, pool, &config, &sockets, $create_router)
-                } else {
-                    let _rt = env.reader_rt.enter();
-                    Self::spawn_non_blocking(env, &config, &sockets, $create_router)?;
-                }
+                let _rt = env.reader_rt.enter();
+                Self::spawn_non_blocking(env, &config, &sockets, $create_router)?;
             };
         }
 
@@ -285,39 +318,6 @@ impl Pool {
         self.local_addr
     }
 
-    fn spawn_busy_poll<R>(
-        env: &Environment<impl event::Subscriber + Clone>,
-        pool: &crate::busy_poll::Pool,
-        config: &Config,
-        sockets: &[PoolSocket],
-        create_router: impl Fn(&Packets, &PoolSocket) -> R,
-    ) where
-        R: 'static + Send + Router,
-    {
-        assert_eq!(pool.len(), sockets.len());
-
-        for (udp_socket_worker, socket) in sockets.iter().enumerate() {
-            let packets = config.rx_packet_pool();
-            let router = create_router(&packets, socket);
-            let recv_socket = socket.socket.clone();
-            let recv_socket = BusyPoll(recv_socket);
-            let span = tracing::trace_span!("udp_socket_worker", udp_socket_worker);
-            let task = async move {
-                udp::non_blocking(recv_socket, packets, router).await;
-            };
-            let worker = &pool[udp_socket_worker];
-
-            // spawn the send worker first
-            socket.spawn_busy_poll_send_worker(config, env, worker);
-
-            if span.is_disabled() {
-                worker.spawn_with_priority(task, config.flow_priority);
-            } else {
-                worker.spawn_with_priority(task.instrument(span), config.flow_priority);
-            }
-        }
-    }
-
     fn spawn_non_blocking<R>(
         env: &Environment<impl event::Subscriber + Clone>,
         config: &Config,
@@ -328,19 +328,30 @@ impl Pool {
         R: 'static + Send + Router,
     {
         for (udp_socket_worker, socket) in sockets.iter().enumerate() {
-            let packets = config.rx_packet_pool();
-            let router = create_router(&packets, socket);
-            let recv_socket = AsyncFd::new(socket.socket.clone())?;
-            let span = tracing::trace_span!("udp_socket_worker", udp_socket_worker);
-            let task = async move {
-                udp::non_blocking(recv_socket, packets, router).await;
-            };
-            if span.is_disabled() {
-                tokio::spawn(task);
-            } else {
-                tokio::spawn(task.instrument(span));
+            let alloc = config.rx_packet_pool();
+            let router = create_router(&alloc, socket);
+
+            match &config.send_workers {
+                Workers::BusyPoll(pool) => {
+                    let idx = udp_socket_worker % pool.len();
+                    let handle = &pool[idx];
+                    socket.spawn_busy_poll_send_worker(config, env, handle);
+                }
+                Workers::Environment(_) => {
+                    socket.spawn_non_blocking_send_worker(config, env);
+                }
             }
-            socket.spawn_non_blocking_send_worker(config, env)
+
+            match &config.recv_workers {
+                Workers::BusyPoll(pool) => {
+                    let idx = udp_socket_worker % pool.len();
+                    let handle = &pool[idx];
+                    socket.spawn_busy_poll_recv_worker(config, env, alloc, router, handle);
+                }
+                Workers::Environment(_) => {
+                    socket.spawn_non_blocking_recv_worker(config, env, alloc, router);
+                }
+            }
         }
         Ok(())
     }
@@ -363,10 +374,10 @@ impl Pool {
             None
         };
 
-        let workers = config.workers.len().unwrap_or(1).max(1);
+        let socket_count = config.socket_count();
 
-        for i in 0..workers {
-            let socket = if i == 0 && workers > 1 {
+        for i in 0..socket_count {
+            let socket = if i == 0 && socket_count > 1 {
                 if config.reuse_port {
                     // set reuse port after we bind for the first socket
                     options.reuse_port = ReusePort::AfterBind;

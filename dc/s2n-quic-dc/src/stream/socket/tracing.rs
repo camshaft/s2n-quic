@@ -123,8 +123,12 @@ impl<S: Socket> Socket for Tracing<S> {
     }
 
     #[inline]
-    fn send_transmission(&self, msg: Transmission, time: Timestamp) {
-        self.0.send_transmission(msg, time);
+    fn send_transmission(
+        &self,
+        msg: Transmission,
+        time: Timestamp,
+    ) -> Result<(), (Transmission, Timestamp)> {
+        self.0.send_transmission(msg, time)
     }
 
     #[inline(always)]

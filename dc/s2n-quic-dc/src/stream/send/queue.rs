@@ -337,7 +337,7 @@ impl Queue {
     #[inline]
     fn poll_flush_segments_datagram<S, C, Sub>(
         &mut self,
-        _cx: &mut Context,
+        cx: &mut Context,
         socket: &S,
         clock: &C,
         subscriber: &shared::Subscriber<Sub>,
@@ -347,7 +347,7 @@ impl Queue {
         C: ?Sized + Clock,
         Sub: event::Subscriber,
     {
-        for (batch, application_len) in self.builder.drain() {
+        while let Some((batch, application_len)) = self.builder.pop_front() {
             let now = clock.get_time();
 
             let time = if let Some(next) = self.next_transmission_time {
@@ -357,7 +357,12 @@ impl Queue {
             };
 
             let transmission_len = batch.total_len as u64;
-            socket.send_transmission(batch, time);
+            if let Err((batch, time)) = socket.send_transmission(batch, time) {
+                self.builder.push_front(batch, application_len);
+                // TODO sleep
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
 
             // Compute the next transmission time given the amount of bytes we're transmitting and the bandwidth
             let delay = (transmission_len / self.bandwidth).max(Duration::from_micros(1));

@@ -74,7 +74,8 @@ pub struct Config {
     pub max_packet_size: u16,
     pub packet_count: usize,
     pub accept_flavor: accept::Flavor,
-    pub workers: Workers,
+    pub send_workers: Workers,
+    pub recv_workers: Workers,
     pub map: Map,
     // Send worker configuration
     pub send_wheel_horizon: Duration,
@@ -102,13 +103,15 @@ impl Config {
 
             accept_flavor: accept::Flavor::default(),
 
-            workers: Workers::Environment(None),
+            send_workers: Workers::Environment(None),
+            recv_workers: Workers::Environment(None),
+
             map,
 
             // Send worker defaults
-            send_wheel_horizon: Duration::from_millis(100),
+            send_wheel_horizon: Duration::from_millis(500),
             max_gigabits_per_second: 5.0,
-            priority_levels: 2, // 0 = control, 1+ = application
+            priority_levels: 1,
             flow_priority: None,
         }
     }
@@ -119,6 +122,14 @@ impl Config {
 
     pub(crate) fn rx_packet_pool(&self) -> pool::Pool {
         pool::Pool::new(self.max_packet_size, self.packet_count)
+    }
+
+    pub(crate) fn socket_count(&self) -> usize {
+        self.send_workers
+            .len()
+            .unwrap_or(1)
+            .max(self.recv_workers.len().unwrap_or(1))
+            .max(1)
     }
 
     pub(crate) fn tx_packet_pool(&self, thread_count: usize) -> pool::Sharded {

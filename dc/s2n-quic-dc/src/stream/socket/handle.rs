@@ -64,7 +64,11 @@ pub trait Socket: 'static + Send + Sync {
     ) -> Poll<io::Result<usize>>;
 
     #[inline]
-    fn send_transmission(&self, msg: Transmission, time: Timestamp) {
+    fn send_transmission(
+        &self,
+        msg: Transmission,
+        time: Timestamp,
+    ) -> Result<(), (Transmission, Timestamp)> {
         let _ = time;
         msg.send_with(|addr, ecn, iov| {
             let _ = self.try_send(addr, ecn, iov);
@@ -72,6 +76,7 @@ pub trait Socket: 'static + Send + Sync {
         if let Some(completion) = msg.completion.as_ref().and_then(|c| c.upgrade()) {
             completion.complete(msg);
         }
+        Ok(())
     }
 
     /// Tries to send data on the socket, returning `Err(WouldBlock)` if none could be sent.
@@ -162,7 +167,11 @@ macro_rules! impl_box {
             }
 
             #[inline(always)]
-            fn send_transmission(&self, msg: Transmission, time: Timestamp) {
+            fn send_transmission(
+                &self,
+                msg: Transmission,
+                time: Timestamp,
+            ) -> Result<(), (Transmission, Timestamp)> {
                 (**self).send_transmission(msg, time)
             }
 

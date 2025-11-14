@@ -1,7 +1,8 @@
 // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use tokio::time::{self, sleep_until, Instant};
+use std::time::Instant;
+use tokio::time::{self, sleep_until};
 
 impl_clock!();
 

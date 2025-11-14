@@ -125,7 +125,8 @@ pub struct Builder {
     send_buffer: Option<usize>,
     recv_buffer: Option<usize>,
     reuse_addr: Option<bool>,
-    socket_workers: udp_pool::Workers,
+    send_socket_workers: udp_pool::Workers,
+    recv_socket_workers: udp_pool::Workers,
 }
 
 impl Default for Builder {
@@ -143,7 +144,8 @@ impl Default for Builder {
             send_buffer: None,
             recv_buffer: None,
             reuse_addr: None,
-            socket_workers: Default::default(),
+            send_socket_workers: Default::default(),
+            recv_socket_workers: Default::default(),
         }
     }
 }
@@ -230,17 +232,14 @@ impl Builder {
     common_builder_methods!();
     manager_builder_methods!();
 
-    pub fn with_socket_workers(mut self, workers: udp_pool::Workers) -> Self {
-        self.socket_workers = workers;
+    pub fn with_send_socket_workers(mut self, workers: udp_pool::Workers) -> Self {
+        self.send_socket_workers = workers;
         self
     }
 
-    pub fn with_socket_worker_count(self, workers: usize) -> Self {
-        self.with_socket_workers(udp_pool::Workers::Environment(Some(workers)))
-    }
-
-    pub fn with_busy_poll(self, busy_poll: crate::busy_poll::Pool) -> Self {
-        self.with_socket_workers(udp_pool::Workers::BusyPoll(busy_poll))
+    pub fn with_recv_socket_workers(mut self, workers: udp_pool::Workers) -> Self {
+        self.recv_socket_workers = workers;
+        self
     }
 
     pub fn build<H: Handshake + Clone, S: event::Subscriber + Clone>(
@@ -282,7 +281,8 @@ impl Builder {
 
             pool.reuse_port = concurrency > 1;
             pool.accept_flavor = self.accept_flavor;
-            pool.workers = self.socket_workers;
+            pool.send_workers = self.send_socket_workers;
+            pool.recv_workers = self.recv_socket_workers;
 
             env = env.with_pool(pool);
         }
