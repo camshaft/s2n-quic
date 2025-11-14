@@ -72,6 +72,7 @@ pub fn bind_pair(
     let test_subscriber = NoopSubscriber {};
     let client = ClientTokio::<ClientProvider, NoopSubscriber>::builder()
         .with_default_protocol(protocol)
+        .with_busy_poll(crate::testing::busy_poll())
         .build(client, test_subscriber.clone())
         .unwrap();
 
@@ -79,6 +80,7 @@ pub fn bind_pair(
         .with_address(server_addr)
         .with_protocol(protocol)
         .with_workers(1.try_into().unwrap())
+        .with_busy_poll(crate::testing::busy_poll())
         .build(server, test_subscriber)
         .unwrap();
 
@@ -543,7 +545,12 @@ pub mod client {
                         .with_threads(TEST_THREADS)
                         .with_socket_options(options);
 
-                    let pool = udp::Config::new(map.clone());
+                    let mut pool = udp::Config::new(map.clone());
+
+                    if !::bach::is_active() {
+                        pool.workers = crate::testing::busy_poll().into();
+                    }
+
                     env = env.with_pool(pool);
 
                     env.build().unwrap()
@@ -808,6 +815,11 @@ pub mod server {
                     let mut pool = udp::Config::new(map.clone());
                     pool.accept_flavor = flavor;
                     pool.reuse_port = true;
+
+                    if !::bach::is_active() {
+                        pool.workers = crate::testing::busy_poll().into();
+                    }
+
                     env = env.with_pool(pool).with_acceptor(sender.clone());
 
                     let env = env.build().unwrap();

@@ -13,7 +13,11 @@ use crate::{
     },
     stream::{
         self,
-        environment::{bach::Environment, udp::Config, Environment as _},
+        environment::{
+            bach::Environment,
+            udp::{Config, Workers},
+            Environment as _,
+        },
         recv::dispatch::{Allocator as Queues, Control, Stream},
         server::{accept, udp::Acceptor},
         socket::{application::Single, Tracing},
@@ -85,7 +89,8 @@ impl PoolSocket {
 
         let span = tracing::trace_span!("send_socket_worker");
         let task = async move {
-            send::udp::non_blocking(socket, wheels, clock, token_bucket).await;
+            send::udp::non_blocking(socket, wheels, clock, token_bucket, send::udp::WithWaker)
+                .await;
         };
 
         if span.is_disabled() {
@@ -110,9 +115,12 @@ impl Pool {
 
         let options = env.socket_options.clone();
 
-        if config.workers.is_none() {
-            config.workers = Some(workers);
-        }
+        config.workers.set_default(workers);
+
+        assert!(
+            matches!(config.workers, Workers::Environment(_)),
+            "bach only supports environment socket workers"
+        );
 
         let sockets = Self::create_workers(&env.clock(), options, &config)?;
 
@@ -296,7 +304,7 @@ impl Pool {
             None
         };
 
-        let workers = config.workers.unwrap_or(1).max(1);
+        let workers = config.workers.len().unwrap_or(1).max(1);
 
         for i in 0..workers {
             let socket = if i == 0 && workers > 1 {

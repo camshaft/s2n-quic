@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
+    busy_poll,
     packet::Packet,
     path::secret::Map,
     socket::{
@@ -25,27 +26,66 @@ use s2n_quic_core::inet::{IpAddress, IpV4Address, IpV6Address, SocketAddress, Un
 use std::{sync::Arc, time::Duration};
 
 #[derive(Clone, Debug)]
+pub enum Workers {
+    BusyPoll(busy_poll::Pool),
+    /// Use the environment to spawn workers
+    Environment(Option<usize>),
+}
+
+impl Default for Workers {
+    fn default() -> Self {
+        Self::Environment(None)
+    }
+}
+
+impl Workers {
+    pub fn len(&self) -> Option<usize> {
+        match self {
+            Self::BusyPoll(pool) => Some(pool.len()),
+            Self::Environment(count) => *count,
+        }
+    }
+
+    pub(crate) fn set_default(&mut self, count: usize) {
+        if matches!(self, Self::Environment(None)) {
+            *self = Self::Environment(Some(count));
+        }
+    }
+}
+
+impl From<busy_poll::Pool> for Workers {
+    fn from(value: busy_poll::Pool) -> Self {
+        Self::BusyPoll(value)
+    }
+}
+
+impl From<usize> for Workers {
+    fn from(value: usize) -> Self {
+        Self::Environment(Some(value))
+    }
+}
+
+#[derive(Clone, Debug)]
 #[non_exhaustive]
 pub struct Config {
-    pub blocking: bool,
     pub reuse_port: bool,
     pub stream_recv_queue: Capacity,
     pub control_recv_queue: Capacity,
     pub max_packet_size: u16,
     pub packet_count: usize,
     pub accept_flavor: accept::Flavor,
-    pub workers: Option<usize>,
+    pub workers: Workers,
     pub map: Map,
     // Send worker configuration
     pub send_wheel_horizon: Duration,
     pub max_gigabits_per_second: f64,
     pub priority_levels: usize,
+    pub flow_priority: Option<u8>,
 }
 
 impl Config {
     pub fn new(map: Map) -> Self {
         Self {
-            blocking: false,
             reuse_port: false,
             // TODO tune these defaults
             stream_recv_queue: Capacity {
@@ -62,13 +102,14 @@ impl Config {
 
             accept_flavor: accept::Flavor::default(),
 
-            workers: None,
+            workers: Workers::Environment(None),
             map,
 
             // Send worker defaults
             send_wheel_horizon: Duration::from_millis(100),
             max_gigabits_per_second: 5.0,
             priority_levels: 2, // 0 = control, 1+ = application
+            flow_priority: None,
         }
     }
 
