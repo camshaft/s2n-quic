@@ -40,7 +40,7 @@ impl WakerState {
     }
 
     pub async fn wait(&self) {
-        core::future::poll_fn(|cx| {
+        core::future::poll_fn(|_cx| {
             if self.should_wake.swap(false, Ordering::Relaxed) {
                 Poll::Ready(())
             } else {
@@ -91,7 +91,7 @@ impl<Info, Meta, Completion, const GRANULARITY_US: u64>
             .into_boxed_slice();
 
         let mask = (slots - 1) as u64;
-        let start = unsafe { clock.get_time().as_duration().as_micros() as u64 / GRANULARITY_US };
+        let start = Self::timestamp_to_full_index(clock.get_time());
 
         let sync_state = SyncState {
             start_idx: start,
@@ -117,16 +117,32 @@ impl<Info, Meta, Completion, const GRANULARITY_US: u64>
         Duration::from_micros(self.0.mask * GRANULARITY_US)
     }
 
-    pub fn insert(&self, entry: Entry<Info, Meta, Completion>, time: Timestamp) -> Timestamp {
-        let (index, abs_idx, waker, mut lock) = self.index(time);
-        lock.entries[index].push_back(entry);
+    pub fn insert(
+        &self,
+        mut entry: Entry<Info, Meta, Completion>,
+        time: Timestamp,
+    ) -> Result<(), (Entry<Info, Meta, Completion>, Timestamp)> {
+        let (index, full_idx, waker, mut lock) = match self.index(time) {
+            Ok(v) => v,
+            Err(time) => {
+                return Err((entry, time));
+            }
+        };
+        let transmission_time = Self::full_index_to_timestamp(full_idx);
+        entry.transmission_time = Some(transmission_time);
+        unsafe {
+            debug_assert!(lock.entries.len() > index);
+            lock.entries.get_unchecked_mut(index).push_back(entry);
+        }
         drop(lock);
 
         self.0.len.fetch_add(1, Ordering::Relaxed);
+
         if let Some(waker) = waker {
             waker.wake();
         }
-        unsafe { Timestamp::from_duration(Duration::from_micros(abs_idx * GRANULARITY_US)) }
+
+        Ok(())
     }
 
     pub fn set_waker(&mut self, waker: Arc<WakerState>) {
@@ -144,12 +160,15 @@ impl<Info, Meta, Completion, const GRANULARITY_US: u64>
         lock.start_idx = next;
         lock.waker = waker;
         let index = (start & self.0.mask) as usize;
-        let queue = core::mem::take(&mut lock.entries[index]);
+        let queue = unsafe {
+            debug_assert!(lock.entries.len() > index);
+            core::mem::take(lock.entries.get_unchecked_mut(index))
+        };
         drop(lock);
 
-        let now = unsafe { Timestamp::from_duration(Duration::from_micros(next * GRANULARITY_US)) };
+        let next_tick = Self::full_index_to_timestamp(next);
 
-        (now, queue)
+        (next_tick, queue)
     }
 
     /// Called by the sender after every transmission, which updates the wheel length
@@ -162,24 +181,34 @@ impl<Info, Meta, Completion, const GRANULARITY_US: u64>
         let start = lock.start_idx;
         drop(lock);
 
-        let micros = start * GRANULARITY_US;
-        unsafe { Timestamp::from_duration(Duration::from_micros(micros)) }
+        Self::full_index_to_timestamp(start)
     }
 
     fn index(
         &self,
         timestamp: Timestamp,
-    ) -> (
-        usize,
-        u64,
-        Option<Arc<WakerState>>,
-        MutexGuard<SyncState<Info, Meta, Completion>>,
-    ) {
-        let full_idx = unsafe { timestamp.as_duration().as_micros() as u64 / GRANULARITY_US };
+    ) -> Result<
+        (
+            usize,
+            u64,
+            Option<Arc<WakerState>>,
+            MutexGuard<'_, SyncState<Info, Meta, Completion>>,
+        ),
+        Timestamp,
+    > {
+        let full_idx = Self::timestamp_to_full_index(timestamp);
 
         let mut lock = self.0.sync_state.lock();
         let mut min = lock.start_idx;
+        let max = min + self.0.mask;
+
+        if full_idx > max {
+            let target = Self::full_index_to_timestamp(max);
+            return Err(target);
+        }
+
         let waker = if let Some(waker) = lock.waker.take() {
+            let full_idx = full_idx.max(min);
             min = full_idx;
             lock.start_idx = full_idx;
             Some(waker)
@@ -187,13 +216,34 @@ impl<Info, Meta, Completion, const GRANULARITY_US: u64>
             None
         };
 
-        let max = min + self.0.mask;
+        if cfg!(debug_assertions) {
+            let min = full_idx.min(min);
+            let expected_min = Self::full_index_to_timestamp(min);
+            let expected_max = Self::full_index_to_timestamp(max);
+            assert!(
+                (expected_min..=expected_max).contains(&timestamp),
+                "{} not in {}..={}",
+                timestamp,
+                expected_min,
+                expected_max
+            );
+        }
 
         // bound the timestamp to the current window
-        let idx = full_idx.clamp(min, max);
+        let full_idx = full_idx.max(min);
+
         // wrap the index around the slots
-        let idx = idx & self.0.mask;
-        (idx as usize, min + idx, waker, lock)
+        let idx = full_idx & self.0.mask;
+        let info = (idx as usize, full_idx, waker, lock);
+        Ok(info)
+    }
+
+    fn full_index_to_timestamp(full_idx: u64) -> Timestamp {
+        unsafe { Timestamp::from_duration(Duration::from_micros(full_idx * GRANULARITY_US)) }
+    }
+
+    fn timestamp_to_full_index(timestamp: Timestamp) -> u64 {
+        unsafe { timestamp.as_duration().as_micros() as u64 / GRANULARITY_US }
     }
 }
 
@@ -209,7 +259,7 @@ struct SyncState<Info, Meta, Completion> {
     entries: Box<[Queue<Transmission<Info, Meta, Completion>>]>,
 }
 
-#[cfg(todo)]
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::socket::pool::Pool;
@@ -284,6 +334,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(todo)]
     fn test_wheel_creation() {
         let (wheel, _pool, clock) = new(64);
 
@@ -303,7 +354,7 @@ mod tests {
         wheel.insert(entry, clock.get_time());
 
         // Tick should return this entry
-        let (next_time, mut queue) = wheel.tick();
+        let (next_time, mut queue) = wheel.tick(None);
         clock.inc_by(Duration::from_micros(8));
         assert_eq!(next_time, clock.get_time());
 
@@ -323,7 +374,7 @@ mod tests {
         wheel.insert(Entry::new(create_transmission(&pool, 30)), now);
 
         // Tick should return all entries in FIFO order
-        let (_, mut queue) = wheel.tick();
+        let (_, mut queue) = wheel.tick(None);
 
         assert_eq!(queue.pop_front().unwrap().meta, 10);
         assert_eq!(queue.pop_front().unwrap().meta, 20);
@@ -347,22 +398,23 @@ mod tests {
         wheel.insert(Entry::new(create_transmission(&pool, 300)), t2);
 
         // First tick gets entry 1
-        let (_, mut queue) = wheel.tick();
+        let (_, mut queue) = wheel.tick(None);
         assert_eq!(queue.pop_front().unwrap().meta, 100);
         assert!(queue.is_empty());
 
         // Second tick gets entry 2
-        let (_, mut queue) = wheel.tick();
+        let (_, mut queue) = wheel.tick(None);
         assert_eq!(queue.pop_front().unwrap().meta, 200);
         assert!(queue.is_empty());
 
         // Third tick gets entry 3
-        let (_, mut queue) = wheel.tick();
+        let (_, mut queue) = wheel.tick(None);
         assert_eq!(queue.pop_front().unwrap().meta, 300);
         assert!(queue.is_empty());
     }
 
     #[test]
+    #[cfg(todo)]
     fn test_wheel_index_calculation() {
         let (wheel, _pool, mut clock) = new(64);
 
@@ -382,18 +434,19 @@ mod tests {
 
             // slowly drag behind by missing a tick every 64 iterations
             if expected > 0 {
-                let _ = wheel.tick();
+                let _ = wheel.tick(None);
             }
         }
     }
 
     #[test]
+    #[cfg(todo)]
     fn test_wheel_bounds() {
         let (wheel, pool, mut clock) = new(64);
 
         // advance the wheel
         for _ in 0..64 {
-            let _ = wheel.tick();
+            let _ = wheel.tick(None);
         }
 
         let actual_time = wheel.insert(

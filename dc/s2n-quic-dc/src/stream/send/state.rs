@@ -939,7 +939,7 @@ impl State {
             let max_stream_packet_number_lost = self.max_stream_packet_number_lost;
 
             #[cfg(debug_assertions)]
-            self.pending_retransmissions.remove(info.range());
+            let _ = self.pending_retransmissions.remove(info.range());
 
             self.sent_recovery_packets.insert(
                 packet_number,

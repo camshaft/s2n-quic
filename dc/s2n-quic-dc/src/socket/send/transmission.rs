@@ -154,6 +154,13 @@ impl<Info, Meta, Completion> Builder<Info, Meta, Completion> {
         Some((batch.entry, batch.application_len))
     }
 
+    pub fn push_front(&mut self, entry: Entry<Info, Meta, Completion>, application_len: u16) {
+        self.batches.push_back(Batch {
+            entry,
+            application_len,
+        });
+    }
+
     pub fn drain(&mut self) -> impl Iterator<Item = (Entry<Info, Meta, Completion>, u16)> + '_ {
         self.batches
             .drain(..)

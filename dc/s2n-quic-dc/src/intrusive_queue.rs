@@ -163,6 +163,12 @@ impl<T> Queue<T> {
         self.tail
             .map(|mut tail| &mut unsafe { tail.as_mut() }.value)
     }
+
+    pub fn iter(&self) -> Iter<'_, T> {
+        Iter {
+            next: self.head.as_ref(),
+        }
+    }
 }
 
 impl<T> Default for Queue<T> {
@@ -178,9 +184,25 @@ impl<T> Drop for Queue<T> {
     }
 }
 
+pub struct Iter<'a, T> {
+    next: Option<&'a Entry<T>>,
+}
+
+impl<'a, T> Iterator for Iter<'a, T> {
+    type Item = &'a T;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let current = self.next.take()?;
+        self.next = current.0.next.as_ref();
+        Some(&current.0.value)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bolero::{check, TypeGenerator};
+    use std::collections::VecDeque;
 
     #[test]
     fn test_push_pop() {
@@ -287,5 +309,39 @@ mod tests {
         assert_eq!(*queue.pop_front().unwrap(), 5);
 
         assert!(queue.is_empty());
+    }
+
+    #[derive(Clone, Copy, Debug, TypeGenerator)]
+    enum Operation {
+        Push,
+        Pop,
+    }
+
+    #[test]
+    fn differential_test() {
+        check!().with_type::<Vec<Operation>>().for_each(|ops| {
+            let mut values = 0u64..;
+            let mut oracle = VecDeque::new();
+            let mut subject = Queue::new();
+
+            for op in ops {
+                match op {
+                    Operation::Push => {
+                        let value = values.next().unwrap();
+                        oracle.push_back(value);
+                        subject.push_back(Entry::new(value));
+                    }
+                    Operation::Pop => {
+                        assert_eq!(oracle.pop_front(), subject.pop_front().map(|entry| *entry));
+                    }
+                }
+            }
+
+            while let Some(expected) = oracle.pop_front() {
+                let actual = *subject.pop_front().unwrap();
+                assert_eq!(expected, actual);
+            }
+            assert!(subject.pop_front().is_none());
+        })
     }
 }

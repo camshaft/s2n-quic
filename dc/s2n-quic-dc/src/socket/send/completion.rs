@@ -106,7 +106,7 @@ where
                 {
                     let transmission = &mut *transmission;
                     let descriptors = transmission.descriptors.drain(..);
-                    let transmission_time = transmission.transmission_time.take().unwrap();
+                    let transmission_time = transmission.transmission_time.unwrap();
                     let meta = &transmission.meta;
                     for (segment, info) in descriptors {
                         on_transmission(CompleteTransmission {

@@ -69,9 +69,13 @@ impl<const GRANULARITY_US: u64> Socket for Wheel<GRANULARITY_US> {
     }
 
     #[inline]
-    fn send_transmission(&self, msg: Transmission, time: Timestamp) {
+    fn send_transmission(
+        &self,
+        msg: Transmission,
+        time: Timestamp,
+    ) -> Result<(), (Transmission, Timestamp)> {
         // Insert the transmission into the wheel for timed delivery
-        self.wheel.insert(msg, time);
+        self.wheel.insert(msg, time)
     }
 
     #[inline]

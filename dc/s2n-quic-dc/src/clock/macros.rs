@@ -33,6 +33,14 @@ macro_rules! impl_clock {
             }
         }
 
+        impl crate::clock::precision::Clock for Clock {
+            #[inline]
+            fn now(&self) -> crate::clock::precision::Timestamp {
+                let nanos = self.0.elapsed().as_nanos() as u64;
+                crate::clock::precision::Timestamp { nanos }
+            }
+        }
+
         pin_project!(
             pub struct Sleep {
                 clock: Clock,
@@ -67,7 +75,7 @@ macro_rules! impl_clock {
 
                 // if the clock has changed let the sleep future know
                 trace!(update = ?target);
-                self.project().sleep.reset(target);
+                self.project().sleep.reset(target.into());
             }
         }
 
@@ -91,7 +99,7 @@ macro_rules! impl_clock {
             #[inline]
             fn sleep(&self, amount: Duration) -> (SleepHandle, Timestamp) {
                 let now = Instant::now();
-                let sleep = sleep_until(now + amount);
+                let sleep = sleep_until((now + amount).into());
                 let sleep = Sleep {
                     clock: self.clone(),
                     sleep,

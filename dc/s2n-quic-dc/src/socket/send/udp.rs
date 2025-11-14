@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
-    clock::Clock,
+    clock::precision::{Timer, Timestamp},
     intrusive_queue::Queue,
     socket::send::{
         completion::{Completer as _, Completion},
@@ -11,13 +11,13 @@ use crate::{
     },
     stream::socket::Socket,
 };
-use s2n_quic_core::time::Timestamp;
-use std::{ops::ControlFlow, sync::Arc, time::Duration};
+use std::{future::poll_fn, ops::ControlFlow, sync::Arc, time::Duration};
 
 /// State for each priority level to track partially processed queues and entries
 struct WheelState<Info, Meta, Completion, const GRANULARITY_US: u64> {
     queue: Wheel<Info, Meta, Completion, GRANULARITY_US>,
-    pending_queue: Option<(Timestamp, Queue<Transmission<Info, Meta, Completion>>)>,
+    next_tick: Timestamp,
+    pending_queue: Option<Queue<Transmission<Info, Meta, Completion>>>,
     pending_entry: Option<Entry<Info, Meta, Completion>>,
 }
 
@@ -26,18 +26,25 @@ where
     C: Completion<Info, Meta>,
 {
     /// Ticks the wheel to get the next queue
-    fn tick(
-        &mut self,
-        waker: &Option<&Arc<WakerState>>,
-    ) -> (Timestamp, Queue<Transmission<Info, Meta, C>>) {
-        if let Some((timestamp, queue)) = self.pending_queue.take() {
+    fn tick(&mut self, waker: &Option<&Arc<WakerState>>) -> Queue<Transmission<Info, Meta, C>> {
+        if let Some(queue) = self.pending_queue.take() {
             // Resume processing previously retrieved queue
             if let Some(waker) = *waker {
                 self.queue.set_waker(waker.clone());
             }
-            (timestamp, queue)
+            queue
         } else {
-            self.queue.tick(waker.cloned())
+            let (ts, queue) = self.queue.tick(waker.cloned());
+            if cfg!(debug_assertions) {
+                let min_ts = ts - Duration::from_micros(GRANULARITY_US);
+                let range = min_ts..ts;
+                for entry in queue.iter() {
+                    let target = entry.transmission_time.unwrap();
+                    assert!(range.contains(&target), "{range:?} {target}");
+                }
+            }
+            self.next_tick = ts.into();
+            queue
         }
     }
 
@@ -84,26 +91,28 @@ impl WakeMode for WithWaker {
 /// Index 0 is the highest priority and is processed first.
 /// The function drains each priority level in order, and if blocked by the token
 /// bucket, it restarts from the highest priority level after the bucket refills.
-pub async fn non_blocking<S, Clk, Info, Meta, C, W, const GRANULARITY_US: u64>(
+pub async fn non_blocking<S, T, Info, Meta, C, W, const GRANULARITY_US: u64>(
     socket: S,
     wheels: Vec<Wheel<Info, Meta, C, GRANULARITY_US>>,
-    clock: Clk,
+    mut timer: T,
     bucket: LeakyBucket,
     wake_mode: W,
 ) where
     S: Socket,
-    Clk: Clock,
+    T: Timer,
     C: Completion<Info, Meta>,
     W: WakeMode,
 {
     assert!(!wheels.is_empty());
-    let mut timer = clock.timer();
     let _ = wake_mode;
+
+    let start = timer.now();
 
     let mut wheels = wheels
         .into_iter()
         .map(|wheel| WheelState {
             queue: wheel,
+            next_tick: start,
             pending_queue: None,
             pending_entry: None,
         })
@@ -112,139 +121,224 @@ pub async fn non_blocking<S, Clk, Info, Meta, C, W, const GRANULARITY_US: u64>(
     let waker = WakerState::new().await;
 
     let granularity = Duration::from_micros(GRANULARITY_US);
-    let mut bucket = bucket.init(granularity, clock.get_time());
+    let mut bucket = bucket.init(granularity, timer.now());
     let horizon = wheels[0].queue.horizon();
-    let mut sleep_time = clock.get_time() + horizon;
+    let mut sleep_time = start + horizon;
+    let mut reporter = Reporter::new(start);
 
     loop {
         // let mut target_timestamp = None;
-        let target_timestamp = clock.get_time() + granularity;
+        let start = timer.now();
+        reporter.flush(start);
         let mut has_pending_transmissions = false;
         let mut should_park = false;
-        let waker_ref = if !W::BUSY_POLL && target_timestamp > sleep_time {
+        let waker_ref = if !W::BUSY_POLL && start > sleep_time {
             should_park = true;
             Some(&waker)
         } else {
             None
         };
 
+        let mut next_sleep = None;
+
         // Process each wheel in priority order (0 = highest priority)
-        'batch: for (_priority, wheel) in wheels.iter_mut().enumerate() {
+        'batch: for (priority, wheel) in wheels.iter_mut().enumerate() {
+            let _ = priority;
+
             // Catch-up/processing loop for this priority level
             loop {
-                // Get or tick the wheel for a queue
-                let (next_timestamp, mut queue) = wheel.tick(&waker_ref);
+                let start = timer.now();
+
+                // If we're busy polling then check if we should tick or not
+                if W::BUSY_POLL && wheel.pending_queue.is_none() && wheel.next_tick > start {
+                    break;
+                }
+
+                let mut queue = wheel.tick(&waker_ref);
+
+                if next_sleep.is_none() {
+                    next_sleep = Some(wheel.next_tick);
+                }
 
                 // Process pending entry first if it exists
                 if let Some(entry) = wheel.pending_entry.take() {
-                    let now = clock.get_time();
+                    let now = timer.now();
                     has_pending_transmissions = true;
 
                     // Continue acquiring credits for partially transmitted entry
                     if let ControlFlow::Break(()) = bucket.take(entry.total_len as _, now) {
                         wheel.pending_entry = Some(entry);
-                        wheel.pending_queue = Some((next_timestamp, queue));
+                        wheel.pending_queue = Some(queue);
                         break 'batch;
                     }
 
                     // Successfully acquired all credits, send the packet
+                    reporter.on_send(entry.total_len as _);
                     wheel.transmit(entry, &socket, &now);
                 }
 
                 // Process all packets in the queue
                 while let Some(entry) = queue.pop_front() {
-                    let now = clock.get_time();
+                    let now = timer.now();
                     has_pending_transmissions = true;
 
                     // Continue acquiring credits for partially transmitted entry
                     if let ControlFlow::Break(()) = bucket.take(entry.total_len as _, now) {
                         wheel.pending_entry = Some(entry);
-                        wheel.pending_queue = Some((next_timestamp, queue));
+                        wheel.pending_queue = Some(queue);
                         break 'batch;
                     }
 
                     // Successfully acquired all credits, send the packet
+                    reporter.on_send(entry.total_len as _);
                     wheel.transmit(entry, &socket, &now);
                 }
 
-                // if the wheel is caught up with the target then continue to the next priority
-                if next_timestamp >= target_timestamp {
+                if let Some(next_sleep) = next_sleep {
+                    // if the wheel is caught up with the target then continue to the next priority
+                    if next_sleep <= wheel.next_tick {
+                        break;
+                    }
+                } else {
+                    next_sleep = Some(wheel.next_tick);
                     break;
                 }
             }
         }
 
-        if has_pending_transmissions {
-            sleep_time = target_timestamp + horizon;
-        } else if !W::BUSY_POLL && should_park {
-            waker.wait().await;
-            continue;
+        if W::BUSY_POLL {
+            yield_now().await;
+        } else {
+            if has_pending_transmissions {
+                sleep_time = start + horizon;
+            } else if should_park {
+                waker.wait().await;
+                continue;
+            } else {
+                timer.sleep_until(next_sleep.unwrap()).await;
+            }
         }
+    }
+}
 
-        // All priorities processed, sleep until next highest-priority expiration
-        timer.sleep(target_timestamp).await;
+async fn yield_now() {
+    let mut yielded = false;
+    use std::task::Poll;
+    poll_fn(|cx| {
+        if yielded {
+            Poll::Ready(())
+        } else {
+            yielded = true;
+            cx.waker().wake_by_ref();
+            Poll::Pending
+        }
+    })
+    .await
+}
+
+struct Reporter {
+    last_emit: Timestamp,
+    next_emit: Timestamp,
+    sent: u64,
+}
+
+impl Reporter {
+    pub fn new(start: Timestamp) -> Self {
+        Self {
+            last_emit: start,
+            next_emit: start + Duration::from_secs(1),
+            sent: 0,
+        }
+    }
+
+    fn on_send(&mut self, amount: u64) {
+        self.sent += amount;
+    }
+
+    fn flush(&mut self, now: Timestamp) {
+        if now < self.next_emit {
+            return;
+        }
+        if self.sent > 0 || true {
+            let elapsed_nanos = now.nanos_since(self.last_emit) as f64;
+            let elapsed = elapsed_nanos / 1_000_000_000.0;
+            let mut rate = self.sent as f64 * 8.0 / elapsed;
+            let prefixes = [("G", 1e9), ("M", 1e6), ("K", 1e3)];
+            let mut prefix = "";
+            for (pref, divisor) in prefixes {
+                if rate > divisor {
+                    rate /= divisor;
+                    prefix = pref;
+                    break;
+                }
+            }
+            tracing::info!("{now}: {rate:.2} {prefix}bps");
+        }
+        self.last_emit = now;
+        self.next_emit = now + Duration::from_secs(1);
+        self.sent = 0;
     }
 }
 
 pub struct LeakyBucket {
-    bytes_per_nanos: u64,
+    bytes_per_nanos: f64,
 }
 
 impl LeakyBucket {
     pub fn new(gigabits_per_second: f64) -> Self {
-        let bytes_per_nanos = (gigabits_per_second * 1_000_000_000.0 / 8.0) as u64;
+        let bytes_per_nanos = gigabits_per_second / 8.0;
         Self { bytes_per_nanos }
     }
 
     fn init(&self, granularity: Duration, now: Timestamp) -> LeakyBucketInstance {
         let bytes_per_nanos = self.bytes_per_nanos;
-        let max_size = bytes_per_nanos * granularity.as_nanos() as u64;
+        let max_size = bytes_per_nanos * granularity.as_nanos() as f64;
         let bytes = max_size;
-        let last_refill_nanos = unsafe { now.as_duration().as_nanos() as u64 };
         LeakyBucketInstance {
             bytes_per_nanos,
-            last_refill_nanos,
+            last_refill: now,
             max_size,
             bytes,
-            debt: 0,
+            debt: 0.0,
         }
     }
 }
 
 struct LeakyBucketInstance {
-    bytes_per_nanos: u64,
-    last_refill_nanos: u64,
-    max_size: u64,
-    bytes: u64,
-    debt: u64,
+    bytes_per_nanos: f64,
+    last_refill: Timestamp,
+    max_size: f64,
+    bytes: f64,
+    debt: f64,
 }
 
 impl LeakyBucketInstance {
     fn refill(&mut self, now: Timestamp) {
-        let now_nanos = unsafe { now.as_duration().as_nanos() as u64 };
-        let diff_nanos = now_nanos.saturating_sub(self.last_refill_nanos);
+        let diff_nanos = now.nanos_since(self.last_refill) as f64;
         let mut refill_amount = self.bytes_per_nanos * diff_nanos;
-        if self.debt > 0 {
+        if self.debt > 0.0 {
             let debt_paid = refill_amount.min(self.debt);
             refill_amount -= debt_paid;
             self.debt -= debt_paid;
         }
         let bytes = self.bytes + refill_amount;
         self.bytes = bytes.min(self.max_size);
-        self.last_refill_nanos = now_nanos;
+        self.last_refill = now;
     }
 
     fn take(&mut self, bytes: u64, now: Timestamp) -> ControlFlow<()> {
         self.refill(now);
 
-        if self.bytes < bytes && self.debt > 0 {
+        let bytes = bytes as f64;
+
+        if self.bytes < bytes && self.debt > 0.0 {
             return ControlFlow::Break(());
         }
 
-        if let Some(bytes) = self.bytes.checked_sub(bytes) {
-            self.bytes = bytes;
+        if self.bytes >= bytes {
+            self.bytes = self.bytes - bytes;
         } else {
-            self.bytes = 0;
+            self.bytes = 0.0;
             self.debt = bytes - self.bytes;
         }
 
