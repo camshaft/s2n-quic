@@ -3,6 +3,7 @@
 
 use crate::{
     busy_poll,
+    credentials::Credentials,
     packet::Packet,
     path::secret::Map,
     socket::{
@@ -251,7 +252,11 @@ where
     }
 
     #[inline]
-    fn setup(self, _env: &E) -> SetupResult<Self::ReadWorkerSocket, Self::WriteWorkerSocket> {
+    fn setup(
+        self,
+        _env: &E,
+        _credentials: Option<&Credentials>,
+    ) -> SetupResult<Self::ReadWorkerSocket, Self::WriteWorkerSocket> {
         let mut remote_addr = self.peer_addr;
         let control = self.control;
         let stream = self.stream;

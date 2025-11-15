@@ -89,7 +89,7 @@ where
 
 impl<Env, S, W, R> Router for Acceptor<Env, S, W, R>
 where
-    Env: Environment,
+    Env: Environment + 'static,
     Env::Subscriber: Clone,
     S: socket::application::Application,
     W: socket::Socket,
@@ -241,6 +241,33 @@ where
                 debug!("application accept queue dropped; shutting down");
                 self.is_open = false;
             }
+        }
+    }
+
+    #[inline]
+    fn handle_control_packet(
+        &mut self,
+        _remote_address: SocketAddress,
+        _ecn: ExplicitCongestionNotification,
+        _packet: crate::packet::control::decoder::Packet,
+    ) {
+    }
+
+    #[inline]
+    fn dispatch_control_packet(
+        &mut self,
+        _tag: crate::packet::control::Tag,
+        _id: Option<stream::Id>,
+        credentials: Credentials,
+        segment: descriptor::Filled,
+    ) {
+        // check to see if these credentials are associated with an active stream
+        if let Some(queue_id) = self.dispatch.queue_id_for_key(&credentials) {
+            tracing::trace!(%queue_id, "credential_cache_hit");
+            let _ = self
+                .dispatch
+                .send_control(queue_id, Some(&credentials), segment);
+            return;
         }
     }
 }

@@ -181,7 +181,15 @@ where
 {
     let features = peer.features();
 
-    let (sockets, recv_buffer) = peer.setup(env)?;
+    let (sockets, recv_buffer) = {
+        // Servers need to pass credentials to associate with queue entries
+        let credentials = if endpoint_type.is_server() {
+            Some(&crypto.credentials)
+        } else {
+            None
+        };
+        peer.setup(env, credentials)?
+    };
     let source_queue_id = sockets.source_queue_id;
 
     // construct shared reader state

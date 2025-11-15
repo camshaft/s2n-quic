@@ -3,6 +3,7 @@
 
 use crate::{
     clock,
+    credentials::Credentials,
     either::Either,
     event,
     socket::pool,
@@ -135,7 +136,11 @@ pub trait Peer<E: Environment> {
     type WriteWorkerSocket: WriteWorkerSocket;
 
     fn features(&self) -> TransportFeatures;
-    fn setup(self, env: &E) -> SetupResult<Self::ReadWorkerSocket, Self::WriteWorkerSocket>;
+    fn setup(
+        self,
+        env: &E,
+        credentials: Option<&Credentials>,
+    ) -> SetupResult<Self::ReadWorkerSocket, Self::WriteWorkerSocket>;
 }
 
 pub trait ReadWorkerSocket {

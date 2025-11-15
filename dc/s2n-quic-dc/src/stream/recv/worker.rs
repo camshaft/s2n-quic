@@ -171,6 +171,12 @@ where
             let target = self.shared.last_peer_activity() + self.idle_timeout_duration;
             self.idle_timer.update(target);
             if self.idle_timer.poll_ready(cx).is_ready() {
+                let publisher = self.shared.publisher();
+                self.shared.receiver.notify_error(
+                    super::ErrorKind::IdleTimeout.err(),
+                    endpoint::Location::Local,
+                    &publisher,
+                );
                 return Poll::Ready(());
             }
         }
@@ -276,6 +282,15 @@ where
         if let super::shared::ApplicationStatus::Closed { shutdown_kind } = state.status {
             if matches!(shutdown_kind, ShutdownKind::Pruned) {
                 // if the stream was pruned then we don't need to do anything else
+                let publisher = self.shared.publisher();
+                self.shared.receiver.notify_error(
+                    super::ErrorKind::ApplicationError {
+                        error: ShutdownKind::PRUNED_CODE.into(),
+                    }
+                    .err(),
+                    endpoint::Location::Local,
+                    &publisher,
+                );
                 let _ = self.state.on_finished();
                 self.peek_timer.cancel();
                 self.idle_timer.cancel();
@@ -355,7 +370,9 @@ where
 
     #[inline]
     fn poll_transmit(&mut self, cx: &mut Context) -> Poll<io::Result<()>> {
-        ensure!(self.should_transmit, Ok(()).into());
+        let state = self.shared.receiver.application_state();
+        self.should_transmit |= state.wants_ack;
+        ensure!(self.should_transmit, Poll::Ready(Ok(())));
 
         // send an ACK if needed
         if let Some(mut recv) = self.shared.receiver.worker_try_lock()? {
@@ -378,6 +395,8 @@ where
             if recv.receiver.is_finished() {
                 let _ = self.state.on_finished();
             }
+        } else {
+            cx.waker().wake_by_ref();
         }
 
         ready!(self.poll_flush_socket(cx))?;
