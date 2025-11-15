@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
+    credentials::Credentials,
     event,
     stream::{
         environment::{bach::Environment, Peer, SetupResult},
@@ -37,11 +38,10 @@ where
     fn setup(
         self,
         env: &Environment<Sub>,
+        credentials: Option<&Credentials>,
     ) -> SetupResult<Self::ReadWorkerSocket, Self::WriteWorkerSocket> {
         let peer_addr = self.0;
         let recv_pool = env.recv_pool.as_ref().expect("pool not configured");
-        // the client doesn't need to associate credentials since it's already chosen a queue_id
-        let credentials = None;
         let (control, stream, application_socket, worker_socket, transmission_pool) =
             recv_pool.alloc(credentials);
         crate::stream::environment::udp::Pooled {
@@ -52,6 +52,6 @@ where
             application_socket,
             worker_socket,
         }
-        .setup(env)
+        .setup(env, credentials)
     }
 }

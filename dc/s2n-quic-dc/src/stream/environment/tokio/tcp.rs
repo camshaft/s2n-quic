@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
+    credentials::Credentials,
     event,
     socket::pool,
     stream::{
@@ -38,6 +39,7 @@ where
     fn setup(
         self,
         _env: &Environment<Sub>,
+        _credentials: Option<&Credentials>,
     ) -> SetupResult<Self::ReadWorkerSocket, Self::WriteWorkerSocket> {
         let remote_addr = self.peer_addr;
         let application = Box::new(self.socket);
@@ -78,6 +80,7 @@ where
     fn setup(
         self,
         _env: &Environment<Sub>,
+        _credentials: Option<&Credentials>,
     ) -> SetupResult<Self::ReadWorkerSocket, Self::WriteWorkerSocket> {
         let remote_addr = self.peer_addr;
         let application = Box::new(self.socket.into_std()?);

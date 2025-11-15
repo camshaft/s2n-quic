@@ -478,7 +478,7 @@ mod stress {
                 async move {
                     for request in 0..requests {
                         async {
-                            tracing::info!(?acceptor_addr, payload_size, "creating request");
+                            tracing::debug!(?acceptor_addr, payload_size, "creating request");
                             let (mut response, mut request) = client
                                 .connect(handshake_addr, acceptor_addr, server_name())
                                 .await

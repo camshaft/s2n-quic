@@ -26,7 +26,7 @@ pub use with_map::WithMap;
 pub use zero_router::ZeroRouter;
 
 /// Routes incoming packet segments to the appropriate destination
-pub trait Router {
+pub trait Router: 'static {
     /// Wraps `self` in a router that intercepts secret control messages and forwards
     /// them to the provided [`secret::Map`].
     #[inline]
@@ -155,6 +155,7 @@ pub trait Router {
     ) {
         warn!(
             unhandled_packet = "control",
+            router = core::any::type_name::<Self>(),
             ?tag,
             ?id,
             ?credentials,
@@ -184,6 +185,7 @@ pub trait Router {
     ) {
         warn!(
             unhandled_packet = "stream",
+            router = core::any::type_name::<Self>(),
             ?tag,
             ?id,
             ?credentials,
@@ -212,6 +214,7 @@ pub trait Router {
     ) {
         warn!(
             unhandled_packet = "datagram",
+            router = core::any::type_name::<Self>(),
             ?tag,
             ?credentials,
             remote_address = ?segment.remote_address(),
@@ -240,6 +243,7 @@ pub trait Router {
     ) {
         warn!(
             unhandled_packet = "flow_reset",
+            router = core::any::type_name::<Self>(),
             ?tag,
             queue_id = queue_id.as_u64(),
             ?credentials,
@@ -266,6 +270,7 @@ pub trait Router {
     ) {
         warn!(
             unhandled_packet = "stale_key",
+            router = core::any::type_name::<Self>(),
             ?queue_id,
             ?credentials,
             remote_address = ?segment.remote_address(),
@@ -291,6 +296,7 @@ pub trait Router {
     ) {
         warn!(
             unhandled_packet = "replay_detected",
+            router = core::any::type_name::<Self>(),
             ?queue_id,
             ?credentials,
             remote_address = ?segment.remote_address(),
@@ -315,6 +321,7 @@ pub trait Router {
     ) {
         warn!(
             unhandled_packet = "unknown_path_secret",
+            router = core::any::type_name::<Self>(),
             ?queue_id,
             ?credentials,
             remote_address = ?segment.remote_address(),
@@ -335,6 +342,7 @@ pub trait Router {
         segment: descriptor::Filled,
     ) {
         warn!(
+            router = core::any::type_name::<Self>(),
             ?error,
             ?remote_address,
             packet_len = segment.len(),
