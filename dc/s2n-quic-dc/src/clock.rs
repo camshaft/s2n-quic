@@ -26,12 +26,7 @@ pub type SleepHandle = Pin<Box<dyn Sleep>>;
 pub trait Clock: 'static + Send + Sync + fmt::Debug + time::Clock {
     fn sleep(&self, amount: Duration) -> (SleepHandle, Timestamp);
 
-    fn timer(&self) -> Timer
-    where
-        Self: Sized,
-    {
-        Timer::new(self)
-    }
+    fn timer(&self) -> Timer;
 }
 
 impl<A, B> Clock for Either<A, B>
@@ -43,6 +38,13 @@ where
         match self {
             Either::A(a) => a.sleep(amount),
             Either::B(b) => b.sleep(amount),
+        }
+    }
+
+    fn timer(&self) -> Timer {
+        match self {
+            Either::A(a) => a.timer(),
+            Either::B(b) => b.timer(),
         }
     }
 }

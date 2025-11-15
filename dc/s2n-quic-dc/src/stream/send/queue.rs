@@ -16,7 +16,7 @@ use s2n_quic_core::{
     inet::SocketAddress,
     ready,
     recovery::bandwidth::Bandwidth,
-    time::{Clock, Timestamp},
+    time::{timer, Clock, Timer, Timestamp},
 };
 use std::{
     io::{self, IoSliceMut},
@@ -92,6 +92,7 @@ pub struct Queue {
     bandwidth: Bandwidth,
     /// The next time the queue is allowed to transmit
     next_transmission_time: Option<Timestamp>,
+    transmission_timer: Timer,
 }
 
 impl Default for Queue {
@@ -101,6 +102,7 @@ impl Default for Queue {
             accepted_len: 0,
             bandwidth: Bandwidth::INFINITY,
             next_transmission_time: None,
+            transmission_timer: Default::default(),
         }
     }
 }
@@ -119,6 +121,12 @@ impl Queue {
     #[inline]
     pub fn set_bandwidth(&mut self, bandwidth: Bandwidth) {
         self.bandwidth = bandwidth;
+    }
+
+    pub fn append(&mut self, other: &mut Self) {
+        self.builder.append(&mut other.builder);
+        self.accepted_len += other.accepted_len;
+        self.bandwidth = self.bandwidth.max(other.bandwidth);
     }
 
     #[inline]
@@ -337,7 +345,7 @@ impl Queue {
     #[inline]
     fn poll_flush_segments_datagram<S, C, Sub>(
         &mut self,
-        cx: &mut Context,
+        _cx: &mut Context,
         socket: &S,
         clock: &C,
         subscriber: &shared::Subscriber<Sub>,
@@ -359,8 +367,7 @@ impl Queue {
             let transmission_len = batch.total_len as u64;
             if let Err((batch, time)) = socket.send_transmission(batch, time) {
                 self.builder.push_front(batch, application_len);
-                // TODO sleep
-                cx.waker().wake_by_ref();
+                self.transmission_timer.set(time);
                 return Poll::Pending;
             }
 
@@ -379,5 +386,11 @@ impl Queue {
         }
 
         Ok(()).into()
+    }
+}
+
+impl timer::Provider for Queue {
+    fn timers<Q: timer::Query>(&self, query: &mut Q) -> timer::Result {
+        self.transmission_timer.timers(query)
     }
 }

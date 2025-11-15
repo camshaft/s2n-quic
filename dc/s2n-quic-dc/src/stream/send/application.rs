@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
-    clock,
+    clock::{self, Timer},
     event::{self, ConnectionPublisher},
     packet::stream::PacketSpace,
     stream::{
@@ -18,7 +18,11 @@ use core::{
     sync::atomic::Ordering,
     task::{Context, Poll},
 };
-use s2n_quic_core::{buffer, ensure, ready, task::waker, time::Timestamp};
+use s2n_quic_core::{
+    buffer, ensure, ready,
+    task::waker,
+    time::{clock::Timer as _, timer::Provider, Timestamp},
+};
 use std::{io, net::SocketAddr};
 use tracing::trace;
 
@@ -37,6 +41,7 @@ where
     shared: ArcShared<Sub>,
     sockets: socket::ArcApplication,
     queue: queue::Queue,
+    timer: Timer,
     status: Status,
     runtime: runtime::ArcHandle<Sub>,
 }
@@ -293,15 +298,27 @@ where
         cx: &mut Context,
         limit: usize,
     ) -> Poll<Result<usize, io::Error>> {
-        let len = ready!(self.queue.poll_flush(
-            cx,
-            limit,
-            self.sockets.write_application(),
-            &self.shared.clock,
-            &self.shared.subscriber,
-        ))?;
+        loop {
+            ready!(self.timer.poll_ready(cx));
 
-        Ok(len).into()
+            let res = self.queue.poll_flush(
+                cx,
+                limit,
+                self.sockets.write_application(),
+                &mut self.timer,
+                &self.shared.subscriber,
+            )?;
+
+            match res {
+                Poll::Ready(len) => {
+                    return Ok(len).into();
+                }
+                Poll::Pending => {
+                    self.timer.update(self.queue.next_expiration().unwrap());
+                    continue;
+                }
+            }
+        }
     }
 
     #[inline]
@@ -343,10 +360,6 @@ where
 
         // pass things to the worker if we need to gracefully shut down
         if !self.sockets.features().is_stream() {
-            debug_assert!(
-                queue.is_empty(),
-                "datagram queues should always be empty on shutdown"
-            );
             self.shared
                 .publisher()
                 .on_stream_write_shutdown(event::builder::StreamWriteShutdown {
@@ -360,7 +373,8 @@ where
             } else {
                 ShutdownKind::Normal
             };
-            self.shared.sender.shutdown(shutdown_kind);
+            let queue = core::mem::take(&mut self.queue);
+            self.shared.sender.shutdown(shutdown_kind, queue);
             return Ok(());
         }
 

@@ -9,6 +9,7 @@ use std::{collections::VecDeque, io::IoSlice};
 
 pub type Entry<Info, Meta, Completion> = queue::Entry<Transmission<Info, Meta, Completion>>;
 
+#[derive(Debug)]
 pub struct Transmission<Info, Meta, Completion> {
     pub descriptors: Vec<(descriptor::Filled, Info)>,
     pub total_len: u16,
@@ -95,6 +96,10 @@ impl<Info, Meta, Completion> Builder<Info, Meta, Completion> {
 
     pub fn is_empty(&self) -> bool {
         self.batches.is_empty()
+    }
+
+    pub fn append(&mut self, other: &mut Self) {
+        self.batches.append(&mut other.batches);
     }
 
     pub fn push_segment(

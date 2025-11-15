@@ -1129,7 +1129,7 @@ impl State {
                 };
 
                 #[cfg(debug_assertions)]
-                self.pending_retransmissions.insert(info.range());
+                let _ = self.pending_retransmissions.insert(info.range());
 
                 let meta = transmission::Meta {
                     packet_space: PacketSpace::Recovery,
