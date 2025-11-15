@@ -6,7 +6,7 @@ use crate::{
     socket::send::completion::{Completer, Completion},
     stream::{
         packet_number,
-        send::{flow, path, state::transmission},
+        send::{flow, path, queue::Queue, state::transmission},
         shared::{CompletionQueue, ShutdownKind},
     },
     task::waker::worker::Waker as WorkerWaker,
@@ -28,7 +28,7 @@ pub struct Message {
 
 #[derive(Debug)]
 pub enum Event {
-    Shutdown { kind: ShutdownKind },
+    Shutdown { kind: ShutdownKind, queue: Queue },
 }
 
 pub struct State {
@@ -117,14 +117,14 @@ impl State {
     }
 
     pub fn on_prune(&self) {
-        self.shutdown(ShutdownKind::Pruned);
+        self.shutdown(ShutdownKind::Pruned, Queue::default());
     }
 
     #[inline]
-    pub fn shutdown(&self, kind: ShutdownKind) {
+    pub fn shutdown(&self, kind: ShutdownKind, queue: Queue) {
         trace!(event = "shutdown", ?kind);
         let message = Message {
-            event: Event::Shutdown { kind },
+            event: Event::Shutdown { kind, queue },
         };
         self.worker_queue.push(message);
         self.worker_waker.wake();

@@ -84,6 +84,10 @@ macro_rules! impl_clock {
             fn sleep(&self, amount: Duration) -> (SleepHandle, Timestamp) {
                 self.clock.sleep(amount)
             }
+
+            fn timer(&self) ->super::Timer {
+               super::Timer::new(self)
+            }
         }
 
         impl fmt::Debug for Sleep {
@@ -108,6 +112,10 @@ macro_rules! impl_clock {
                 let target = now.saturating_duration_since(self.0);
                 let target = unsafe { Timestamp::from_duration(target) };
                 (sleep, target)
+            }
+
+            fn timer(&self) ->super::Timer {
+               super::Timer::new(self)
             }
         }
     };

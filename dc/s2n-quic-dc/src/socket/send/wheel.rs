@@ -353,7 +353,7 @@ mod tests {
 
         // Insert an entry at the current time
         let entry = Entry::new(create_transmission(&pool, 100));
-        wheel.insert(entry, clock.get_time());
+        wheel.insert(entry, clock.get_time()).unwrap();
 
         // Tick should return this entry
         let (next_time, mut queue) = wheel.tick(None);
@@ -371,9 +371,15 @@ mod tests {
         let now = clock.get_time();
 
         // Insert multiple entries at the same timestamp
-        wheel.insert(Entry::new(create_transmission(&pool, 10)), now);
-        wheel.insert(Entry::new(create_transmission(&pool, 20)), now);
-        wheel.insert(Entry::new(create_transmission(&pool, 30)), now);
+        wheel
+            .insert(Entry::new(create_transmission(&pool, 10)), now)
+            .unwrap();
+        wheel
+            .insert(Entry::new(create_transmission(&pool, 20)), now)
+            .unwrap();
+        wheel
+            .insert(Entry::new(create_transmission(&pool, 30)), now)
+            .unwrap();
 
         // Tick should return all entries in FIFO order
         let (_, mut queue) = wheel.tick(None);
@@ -395,9 +401,15 @@ mod tests {
         clock.inc_by(Duration::from_micros(8));
         let t2 = clock.get_time();
 
-        wheel.insert(Entry::new(create_transmission(&pool, 100)), t0);
-        wheel.insert(Entry::new(create_transmission(&pool, 200)), t1);
-        wheel.insert(Entry::new(create_transmission(&pool, 300)), t2);
+        wheel
+            .insert(Entry::new(create_transmission(&pool, 100)), t0)
+            .unwrap();
+        wheel
+            .insert(Entry::new(create_transmission(&pool, 200)), t1)
+            .unwrap();
+        wheel
+            .insert(Entry::new(create_transmission(&pool, 300)), t2)
+            .unwrap();
 
         // First tick gets entry 1
         let (_, mut queue) = wheel.tick(None);

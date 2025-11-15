@@ -27,7 +27,7 @@ use s2n_quic_core::{
     recovery::bandwidth::Bandwidth,
     time::{
         clock::{self, Timer as _},
-        timer::Provider as _,
+        timer::{self, Provider as _},
         Timestamp,
     },
     varint::VarInt,
@@ -270,9 +270,11 @@ where
 
         while let Some(message) = self.shared.sender.pop_worker_message() {
             match message.event {
-                Event::Shutdown { kind } => {
+                Event::Shutdown { kind, mut queue } => {
                     // Update the state to what was last sent by the application
                     self.sender.max_sent_offset = self.shared.sender.flow.stream_offset();
+
+                    self.transmit_queue.append(&mut queue);
 
                     // if the application is panicking then we notify the peer
                     if let Some(error) = kind.error_code() {
@@ -429,7 +431,12 @@ where
         let source_queue_id = self.shared.local_queue_id();
         let pool = &self.shared.segment_alloc;
         let remote_address = self.shared.remote_addr();
-        let max_segments = self.shared.gso.max_segments();
+
+        let max_segments = self
+            .shared
+            .gso
+            .max_segments()
+            .min(self.sender.cca.send_quantum());
 
         self.transmit_queue.push_buffer(
             &remote_address,
@@ -492,10 +499,24 @@ where
             ecn: ExplicitCongestionNotification::Ect0,
             max_datagram_size: self.sender.max_datagram_size,
             next_expected_control_packet: self.sender.next_expected_control_packet,
-            timeout: self.sender.next_expiration(),
+            timeout: self.next_expiration(),
             bandwidth: self.sender.cca.bandwidth(),
             error: self.sender.error,
         }
+    }
+}
+
+impl<S, B, R, Sub, C> timer::Provider for Worker<S, B, R, Sub, C>
+where
+    S: Socket,
+    B: Buffer,
+    R: random::Generator,
+    Sub: event::Subscriber,
+    C: Clock,
+{
+    fn timers<Q: timer::Query>(&self, query: &mut Q) -> timer::Result {
+        self.sender.timers(query)?;
+        self.transmit_queue.timers(query)
     }
 }
 
