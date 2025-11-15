@@ -431,6 +431,17 @@ impl State {
         Ok(None)
     }
 
+    pub fn on_application_detach(&mut self, final_offset: VarInt) {
+        self.max_sent_offset = final_offset;
+        let _ = self.unacked_ranges.remove(final_offset..);
+
+        // try to transition to having sent all of the data
+        if self.state.on_send_fin().is_ok() {
+            // arm the PTO now to force it to transmit a final packet
+            self.pto.force_transmit();
+        }
+    }
+
     #[inline]
     fn try_finish(&mut self) {
         // check if we still have pending data
@@ -582,6 +593,7 @@ impl State {
                 let lost_max = PacketNumberSpace::Initial.new_packet_number(loss_threshold);
                 let range = s2n_quic_core::packet::number::PacketNumberRange::new(lost_min, lost_max);
                 for (num, mut packet) in self.$sent_packets.remove_range(range) {
+                    let num_varint = unsafe { VarInt::new_unchecked(num.as_u64()) };
                     // TODO create a path and publisher
                     // self.ecn.on_packet_loss(packet.time_sent, packet.ecn, now, path, publisher);
 
@@ -605,7 +617,7 @@ impl State {
                     });
 
                     #[allow(clippy::redundant_closure_call)]
-                    ($on_packet)(&packet);
+                    ($on_packet)(num_varint, &packet);
 
                     if let Some(retransmission) = packet.info.try_retransmit() {
                         // update our local packet number to be at least 1 more than the largest lost
@@ -623,13 +635,16 @@ impl State {
         }
 
         match packet_space {
-            stream::PacketSpace::Stream => impl_loss_detection!(sent_stream_packets, |_| {}),
+            stream::PacketSpace::Stream => impl_loss_detection!(sent_stream_packets, |_, _| {}),
             stream::PacketSpace::Recovery => {
-                impl_loss_detection!(sent_recovery_packets, |sent_packet: &SentRecoveryPacket| {
-                    self.max_stream_packet_number_lost = self
-                        .max_stream_packet_number_lost
-                        .max(sent_packet.max_stream_packet_number_lost + 1);
-                })
+                impl_loss_detection!(
+                    sent_recovery_packets,
+                    |_packet_number: VarInt, sent_packet: &SentRecoveryPacket| {
+                        self.max_stream_packet_number_lost = self
+                            .max_stream_packet_number_lost
+                            .max(sent_packet.max_stream_packet_number_lost + 1);
+                    }
+                )
             }
         }
 
@@ -731,7 +746,7 @@ impl State {
 
         // force probing when we've sent all of the data but haven't got an ACK for the final
         // offset
-        if self.state.is_data_sent() && self.sent_stream_packets.is_empty() {
+        if self.state.is_data_sent() {
             self.pto.force_transmit();
         }
 
@@ -928,15 +943,14 @@ impl State {
         if info.included_fin {
             // clear out the unacked ranges that we're no longer tracking
             let final_offset = info.end_offset();
-            let _ = self.unacked_ranges.remove(final_offset..);
-
-            // if the transmission included the final offset, then transition to that state
-            let _ = self.state.on_send_fin();
+            self.on_application_detach(final_offset);
         }
 
         if let stream::PacketSpace::Recovery = packet_space {
             let packet_number = PacketNumberSpace::Initial.new_packet_number(packet_number);
-            let max_stream_packet_number_lost = self.max_stream_packet_number_lost;
+            let max_stream_packet_number_lost = self
+                .max_stream_packet_number_lost
+                .max(self.max_stream_packet_number + 1);
 
             #[cfg(debug_assertions)]
             let _ = self.pending_retransmissions.remove(info.range());
@@ -960,10 +974,17 @@ impl State {
                 );
             }
             self.max_stream_packet_number = self.max_stream_packet_number.max(packet_number);
+
+            self.max_stream_packet_number_lost = self
+                .max_stream_packet_number
+                .max(self.max_stream_packet_number_lost)
+                + 1;
+
             self.max_tx_offset += VarInt::from_u16(info.payload_len);
             self.recovery_packet_number = self
                 .recovery_packet_number
                 .max(self.max_stream_packet_number.as_u64() + 1);
+
             let packet_number = PacketNumberSpace::Initial.new_packet_number(packet_number);
             self.sent_stream_packets
                 .insert(packet_number, SentStreamPacket { info, cc_info });

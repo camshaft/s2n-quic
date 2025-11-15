@@ -389,13 +389,8 @@ where
                 }
                 waiting::State::Detached => {
                     // make sure we have the current view from the application
-                    self.sender.max_sent_offset = self.shared.sender.flow.stream_offset();
-
-                    // try to transition to having sent all of the data
-                    if self.sender.state.on_send_fin().is_ok() {
-                        // arm the PTO now to force it to transmit a final packet
-                        self.sender.pto.force_transmit();
-                    }
+                    let final_offset = self.shared.sender.flow.stream_offset();
+                    self.sender.on_application_detach(final_offset);
 
                     // transition to shutting down
                     let _ = self.state.on_shutdown();
