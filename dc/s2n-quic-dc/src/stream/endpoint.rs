@@ -256,6 +256,8 @@ where
             credentials: UnsafeCell::new(crypto.credentials),
         };
 
+        let last_peer_activity = unsafe { now.as_duration().as_micros() as u64 }.into();
+
         shared::Common {
             clock: env.clock().clone(),
             gso: env.gso(),
@@ -268,7 +270,7 @@ where
                 u64::MAX
             }
             .into(),
-            last_peer_activity: Default::default(),
+            last_peer_activity,
             fixed,
             segment_alloc: sockets.transmission_pool,
             closed_halves: 0u8.into(),
