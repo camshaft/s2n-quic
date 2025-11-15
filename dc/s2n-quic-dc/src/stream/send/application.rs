@@ -207,7 +207,6 @@ where
 
         let app = self.shared.application();
         let max_header_len = app.max_header_len();
-        let max_segments = self.shared.gso.max_segments();
 
         // create a flow request from the provided application input
         let initial_len = buf.buffered_len();
@@ -218,6 +217,7 @@ where
         };
 
         let path = self.shared.sender.path.load();
+        let max_segments = self.shared.gso.max_segments().min(path.send_quantum as _);
 
         let features = self.sockets.features();
 

@@ -203,7 +203,9 @@ impl<Info, Meta, Completion, const GRANULARITY_US: u64>
         let max = min + self.0.mask;
 
         if full_idx > max {
-            let target = Self::full_index_to_timestamp(max);
+            // return when the application should resubmit
+            let target = full_idx - self.0.mask + 1;
+            let target = Self::full_index_to_timestamp(target);
             return Err(target);
         }
 
