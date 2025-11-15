@@ -30,7 +30,10 @@ where
     #[inline]
     pub fn build(self, shared: ArcShared<Sub>, sockets: socket::ArcApplication) -> Writer<Sub> {
         let Self { runtime } = self;
-        let timer = shared.clock.timer();
+
+        let mut timer = shared.clock.timer();
+        timer.cancel();
+
         Writer(Box::new(Inner {
             shared,
             sockets,
