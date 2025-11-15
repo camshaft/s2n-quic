@@ -88,7 +88,9 @@ impl Timer {
         /// the future.
         const INITIAL_TIMEOUT: Duration = Duration::from_secs(1);
 
-        Self::new_with_timeout(clock, INITIAL_TIMEOUT)
+        let mut timer = Self::new_with_timeout(clock, INITIAL_TIMEOUT);
+        timer.cancel();
+        timer
     }
 
     #[inline]

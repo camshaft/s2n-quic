@@ -32,7 +32,6 @@ where
         let Self { runtime } = self;
 
         let mut timer = shared.clock.timer();
-        timer.cancel();
 
         Writer(Box::new(Inner {
             shared,
