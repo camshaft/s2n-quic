@@ -863,7 +863,7 @@ impl State {
 
             // TODO figure out why this time travels...
             // Use the actual transmission time rather than when it was submitted to give better RTT estimates
-            // info.time_sent = transmission.transmission_time;
+            info.time_sent = transmission.transmission_time;
 
             let meta = transmission.meta;
             let has_more_app_data = meta.has_more_app_data;

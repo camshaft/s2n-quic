@@ -99,8 +99,6 @@ impl PoolSocket {
             wheels.push(send::wheel::Wheel::clone(application));
         }
 
-        dbg!(config.priority_levels, wheels.len());
-
         let token_bucket = config.bucket();
 
         send::udp::non_blocking(socket, wheels, timer, token_bucket, wake_mode)
