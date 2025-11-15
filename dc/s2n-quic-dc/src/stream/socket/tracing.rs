@@ -123,12 +123,32 @@ impl<S: Socket> Socket for Tracing<S> {
     }
 
     #[inline]
-    fn send_transmission(
+    fn send_transmission(&self, msg: Transmission) {
+        trace!(
+            operation = %"send_transmission",
+            protocol = ?self.protocol(),
+            local_addr = ?self.local_addr(),
+            ?msg,
+        );
+
+        self.0.send_transmission(msg)
+    }
+
+    #[inline]
+    fn send_transmission_at(
         &self,
         msg: Transmission,
         time: Timestamp,
     ) -> Result<(), (Transmission, Timestamp)> {
-        self.0.send_transmission(msg, time)
+        let result = self.0.send_transmission_at(msg, time);
+        trace!(
+            operation = %"send_transmission_at",
+            protocol = ?self.protocol(),
+            local_addr = ?self.local_addr(),
+            ?time,
+            result = ?result,
+        );
+        result
     }
 
     #[inline(always)]

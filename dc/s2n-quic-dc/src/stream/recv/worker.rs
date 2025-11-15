@@ -439,7 +439,7 @@ where
     }
 
     #[inline]
-    fn poll_flush_socket(&mut self, cx: &mut Context) -> Poll<io::Result<()>> {
+    fn poll_flush_socket(&mut self, _cx: &mut Context) -> Poll<io::Result<()>> {
         let count = self.transmission_buffer.len();
         ensure!(count > 0, Poll::Ready(Ok(())));
 
@@ -448,17 +448,10 @@ where
             self.transmission_buffer.clear_head(count - 2);
         }
 
-        let now = self.shared.common.clock.get_time();
-
-        while let Some((mut entry, application_len)) = self.transmission_buffer.pop_front() {
+        for (mut entry, _application_len) in self.transmission_buffer.drain() {
             // don't subscribe to completion events
             entry.completion = None;
-            if let Err((entry, target)) = self.socket.send_transmission(entry, now) {
-                // TODO sleep until target instead
-                cx.waker().wake_by_ref();
-                self.transmission_buffer.push_front(entry, application_len);
-                return Poll::Pending;
-            }
+            self.socket.send_transmission(entry);
         }
 
         Ok(()).into()

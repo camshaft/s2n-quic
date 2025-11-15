@@ -803,7 +803,7 @@ impl State {
         // The value of `20` is somewhat arbitrary but doing some worst-case math the ACK ranges with
         // 20 segments would consume about 20-25% of the packet this is a good starting point.
         // We dont't want to go too much lower otherwise we end up spamming ACKs.
-        let mut duplicate_threshold = 20;
+        let duplicate_threshold = 20;
 
         let mut should_duplicate = false;
 

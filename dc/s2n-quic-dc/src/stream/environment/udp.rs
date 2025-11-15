@@ -109,7 +109,7 @@ impl Config {
             map,
 
             // Send worker defaults
-            send_wheel_horizon: Duration::from_millis(500),
+            send_wheel_horizon: Duration::from_secs(2),
             max_gigabits_per_second: 5.0,
             priority_levels: 1,
             flow_priority: None,

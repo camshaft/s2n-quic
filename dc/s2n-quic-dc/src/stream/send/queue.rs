@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
+    clock::precision,
     event::{self, ConnectionPublisher},
     socket::pool::{self, descriptor},
     stream::{
@@ -16,7 +17,7 @@ use s2n_quic_core::{
     inet::SocketAddress,
     ready,
     recovery::bandwidth::Bandwidth,
-    time::{timer, Clock, Timer, Timestamp},
+    time::{timer, Clock, Timer},
 };
 use std::{
     io::{self, IoSliceMut},
@@ -91,7 +92,7 @@ pub struct Queue {
     /// The current bandwidth of the queue
     bandwidth: Bandwidth,
     /// The next time the queue is allowed to transmit
-    next_transmission_time: Option<Timestamp>,
+    next_transmission_time: Option<precision::Timestamp>,
     transmission_timer: Timer,
 }
 
@@ -359,20 +360,26 @@ impl Queue {
             let now = clock.get_time();
 
             let time = if let Some(next) = self.next_transmission_time {
-                next.max(now)
+                next.max(now.into())
             } else {
-                now
+                now.into()
             };
 
             let transmission_len = batch.total_len as u64;
-            if let Err((batch, time)) = socket.send_transmission(batch, time) {
+
+            // schedule the transmission immediately
+            if let Err((batch, wheel_time)) = socket.send_transmission_at(batch, time.into()) {
+                // If the target time is in the past it means the wheel is overloaded so we need to back off a bit
+                let time = wheel_time.max(time.into());
+
                 self.builder.push_front(batch, application_len);
                 self.transmission_timer.set(time);
+
                 return Poll::Pending;
             }
 
             // Compute the next transmission time given the amount of bytes we're transmitting and the bandwidth
-            let delay = (transmission_len / self.bandwidth).max(Duration::from_micros(1));
+            let delay = transmission_len / self.bandwidth;
             self.next_transmission_time = Some(time + delay);
 
             let provided_len = application_len as usize;
