@@ -632,12 +632,6 @@ impl State {
     }
 
     #[inline]
-    fn ecn(&self) -> ExplicitCongestionNotification {
-        // TODO how do we decide what to send on control messages
-        ExplicitCongestionNotification::Ect0
-    }
-
-    #[inline]
     #[track_caller]
     pub fn on_error<E, Pub>(&mut self, error: E, source: Location, publisher: &Pub)
     where

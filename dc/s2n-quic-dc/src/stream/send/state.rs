@@ -106,7 +106,7 @@ pub struct State {
     pub max_stream_packet_number_lost: VarInt,
     pub sent_recovery_packets: PacketMap<SentRecoveryPacket>,
     pub recovery_packet_number: u64,
-    pub last_sent_recovery_packet: Option<Timestamp>,
+    pub last_sent_packet: Option<Timestamp>,
     pub state: state::Sender,
     pub control_filter: Filter,
     pub next_expected_control_packet: VarInt,
@@ -161,7 +161,7 @@ impl State {
             max_stream_packet_number_lost: VarInt::ZERO,
             sent_recovery_packets: Default::default(),
             recovery_packet_number: 0,
-            last_sent_recovery_packet: None,
+            last_sent_packet: None,
             control_filter: Default::default(),
             ecn: ecn::Controller::default(),
             state: Default::default(),
@@ -878,7 +878,7 @@ impl State {
 
             // TODO figure out why this time travels...
             // Use the actual transmission time rather than when it was submitted to give better RTT estimates
-            info.time_sent = transmission.transmission_time;
+            // info.time_sent = transmission.transmission_time;
 
             let meta = transmission.meta;
             let has_more_app_data = meta.has_more_app_data;
@@ -919,14 +919,17 @@ impl State {
 
         match packet_space {
             stream::PacketSpace::Stream => {
-                // if let Some(min) = self.last_sent_recovery_packet {
-                //     cca_time_sent = info.time_sent.max(min);
-                // }
+                if let Some(min) = self.last_sent_packet {
+                    cca_time_sent = info.time_sent.max(min);
+                }
             }
             stream::PacketSpace::Recovery => {
-                self.last_sent_recovery_packet = Some(info.time_sent);
+                if let Some(min) = self.last_sent_packet {
+                    cca_time_sent = info.time_sent.max(min);
+                }
             }
         }
+        self.last_sent_packet = Some(cca_time_sent);
 
         let cc_info = self.cca.on_packet_sent(
             cca_time_sent,
