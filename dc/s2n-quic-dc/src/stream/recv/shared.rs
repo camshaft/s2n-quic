@@ -40,16 +40,6 @@ use std::{
 
 pub type RecvBuffer = Either<recv::buffer::Local, recv::buffer::Channel>;
 
-/// Who will send ACKs?
-#[derive(Clone, Copy, Debug, Default)]
-pub enum AckMode {
-    /// The application task is sending ACKs
-    #[default]
-    Application,
-    /// The worker task is sending ACKs
-    Worker,
-}
-
 #[derive(Debug)]
 pub struct ApplicationState {
     pub status: ApplicationStatus,
@@ -177,7 +167,6 @@ impl State {
     #[inline]
     pub fn application_guard<'a, Sub>(
         &'a self,
-        ack_mode: AckMode,
         shared: &'a ArcShared<Sub>,
         sockets: &'a dyn socket::Application,
     ) -> io::Result<AppGuard<'a, Sub>>
@@ -198,7 +187,6 @@ impl State {
 
         Ok(AppGuard {
             inner,
-            ack_mode,
             shared,
             sockets,
             initial_state,
@@ -281,7 +269,6 @@ where
     Sub: event::Subscriber,
 {
     inner: ManuallyDrop<MutexGuard<'a, Inner>>,
-    ack_mode: AckMode,
     shared: &'a ArcShared<Sub>,
     sockets: &'a dyn socket::Application,
     initial_state: state::Receiver,

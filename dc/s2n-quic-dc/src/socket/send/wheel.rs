@@ -369,7 +369,7 @@ mod tests {
 
     #[test]
     fn test_wheel_multiple_entries_same_slot() {
-        let (wheel, pool, clock) = new(64);
+        let (wheel, pool, _clock) = new(64);
 
         // Insert multiple entries at the same timestamp
         wheel

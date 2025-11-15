@@ -28,8 +28,6 @@ use std::{io, net::SocketAddr};
 mod builder;
 pub use builder::Builder;
 
-pub use crate::stream::recv::shared::AckMode;
-
 /// Defines what strategy to use when writing to the provided buffer
 #[derive(Clone, Copy, Debug, Default)]
 pub enum ReadMode {
@@ -51,7 +49,6 @@ where
     shared: ArcShared<Sub>,
     sockets: socket::ArcApplication,
     read_mode: ReadMode,
-    ack_mode: AckMode,
     timer: Option<Timer>,
     local_state: LocalState,
     runtime: runtime::ArcHandle<Sub>,
@@ -144,12 +141,6 @@ where
     }
 
     #[inline]
-    pub fn set_ack_mode(&mut self, ack_mode: AckMode) -> &mut Self {
-        self.0.ack_mode = ack_mode;
-        self
-    }
-
-    #[inline]
     pub async fn read_into<S>(&mut self, out_buf: &mut S) -> io::Result<usize>
     where
         S: buffer::writer::Storage,
@@ -219,9 +210,7 @@ where
         let sockets = &self.sockets;
         let transport_features = sockets.features();
 
-        let mut reader = shared
-            .receiver
-            .application_guard(self.ack_mode, shared, sockets)?;
+        let mut reader = shared.receiver.application_guard(shared, sockets)?;
         let reader = &mut *reader;
 
         loop {

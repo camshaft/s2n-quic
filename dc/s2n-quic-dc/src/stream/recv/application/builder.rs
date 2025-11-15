@@ -3,7 +3,7 @@
 
 use crate::{
     clock::Timer,
-    event, msg,
+    event,
     stream::{
         recv::application::{Inner, LocalState, Reader},
         runtime,
@@ -51,7 +51,6 @@ where
         } else {
             ReadMode::UntilFull
         };
-        let ack_mode = Default::default();
         let local_state = match endpoint {
             // reliable transports on the client need to read at least one packet in order to
             // process secret control packets
@@ -66,7 +65,6 @@ where
             shared,
             sockets,
             read_mode,
-            ack_mode,
             timer,
             local_state,
             runtime,

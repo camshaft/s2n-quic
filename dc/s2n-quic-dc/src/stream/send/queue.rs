@@ -19,10 +19,7 @@ use s2n_quic_core::{
     recovery::bandwidth::Bandwidth,
     time::{timer, Clock, Timer},
 };
-use std::{
-    io::{self, IoSliceMut},
-    time::Duration,
-};
+use std::io::{self, IoSliceMut};
 
 pub struct Message<'a, TransmissionAlloc> {
     queue: &'a mut Queue,

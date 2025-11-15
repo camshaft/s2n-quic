@@ -33,7 +33,7 @@ thread_local! {
 pub mod read {
     use crate::stream::recv::application as recv;
 
-    pub use recv::{AckMode, ReadMode};
+    pub use recv::ReadMode;
     pub type Reader = recv::Reader<super::Subscriber>;
 }
 
