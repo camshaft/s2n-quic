@@ -64,18 +64,23 @@ pub trait Socket: 'static + Send + Sync {
     ) -> Poll<io::Result<usize>>;
 
     #[inline]
-    fn send_transmission(
-        &self,
-        msg: Transmission,
-        time: Timestamp,
-    ) -> Result<(), (Transmission, Timestamp)> {
-        let _ = time;
+    fn send_transmission(&self, msg: Transmission) {
         msg.send_with(|addr, ecn, iov| {
             let _ = self.try_send(addr, ecn, iov);
         });
         if let Some(completion) = msg.completion.as_ref().and_then(|c| c.upgrade()) {
             completion.complete(msg);
         }
+    }
+
+    #[inline]
+    fn send_transmission_at(
+        &self,
+        msg: Transmission,
+        time: Timestamp,
+    ) -> Result<(), (Transmission, Timestamp)> {
+        let _ = time;
+        self.send_transmission(msg);
         Ok(())
     }
 
@@ -167,12 +172,17 @@ macro_rules! impl_box {
             }
 
             #[inline(always)]
-            fn send_transmission(
+            fn send_transmission(&self, msg: Transmission) {
+                (**self).send_transmission(msg)
+            }
+
+            #[inline(always)]
+            fn send_transmission_at(
                 &self,
                 msg: Transmission,
                 time: Timestamp,
             ) -> Result<(), (Transmission, Timestamp)> {
-                (**self).send_transmission(msg, time)
+                (**self).send_transmission_at(msg, time)
             }
 
             #[inline(always)]

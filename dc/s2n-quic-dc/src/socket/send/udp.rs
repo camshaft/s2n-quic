@@ -149,16 +149,16 @@ pub async fn non_blocking<S, T, Info, Meta, C, W, const GRANULARITY_US: u64>(
             loop {
                 let start = timer.now();
 
+                if next_sleep.is_none() {
+                    next_sleep = Some(wheel.next_tick);
+                }
+
                 // If we're busy polling then check if we should tick or not
-                if W::BUSY_POLL && wheel.pending_queue.is_none() && wheel.next_tick > start {
+                if wheel.pending_queue.is_none() && wheel.next_tick > start {
                     break;
                 }
 
                 let mut queue = wheel.tick(&waker_ref);
-
-                if next_sleep.is_none() {
-                    next_sleep = Some(wheel.next_tick);
-                }
 
                 // Process pending entry first if it exists
                 if let Some(entry) = wheel.pending_entry.take() {
@@ -166,7 +166,10 @@ pub async fn non_blocking<S, T, Info, Meta, C, W, const GRANULARITY_US: u64>(
                     has_pending_transmissions = true;
 
                     // Continue acquiring credits for partially transmitted entry
-                    if let ControlFlow::Break(()) = bucket.take(entry.total_len as _, now) {
+                    if let ControlFlow::Break(target) = bucket.take(entry.total_len as _, now) {
+                        if !W::BUSY_POLL {
+                            next_sleep = Some(target);
+                        }
                         wheel.pending_entry = Some(entry);
                         wheel.pending_queue = Some(queue);
                         break 'batch;
@@ -183,7 +186,10 @@ pub async fn non_blocking<S, T, Info, Meta, C, W, const GRANULARITY_US: u64>(
                     has_pending_transmissions = true;
 
                     // Continue acquiring credits for partially transmitted entry
-                    if let ControlFlow::Break(()) = bucket.take(entry.total_len as _, now) {
+                    if let ControlFlow::Break(target) = bucket.take(entry.total_len as _, now) {
+                        if !W::BUSY_POLL {
+                            next_sleep = Some(target);
+                        }
                         wheel.pending_entry = Some(entry);
                         wheel.pending_queue = Some(queue);
                         break 'batch;
@@ -213,10 +219,11 @@ pub async fn non_blocking<S, T, Info, Meta, C, W, const GRANULARITY_US: u64>(
                 sleep_time = start + horizon;
             } else if should_park {
                 waker.wait().await;
+                sleep_time = start + horizon;
                 continue;
-            } else {
-                timer.sleep_until(next_sleep.unwrap()).await;
             }
+
+            timer.sleep_until(next_sleep.unwrap()).await;
         }
     }
 }
@@ -259,7 +266,7 @@ impl Reporter {
         if now < self.next_emit {
             return;
         }
-        if self.sent > 0 || true {
+        if self.sent > 0 {
             let elapsed_nanos = now.nanos_since(self.last_emit) as f64;
             let elapsed = elapsed_nanos / 1_000_000_000.0;
             let mut rate = self.sent as f64 * 8.0 / elapsed;
@@ -326,13 +333,17 @@ impl LeakyBucketInstance {
         self.last_refill = now;
     }
 
-    fn take(&mut self, bytes: u64, now: Timestamp) -> ControlFlow<()> {
+    fn take(&mut self, bytes: u64, now: Timestamp) -> ControlFlow<Timestamp> {
         self.refill(now);
 
         let bytes = bytes as f64;
 
         if self.bytes < bytes && self.debt > 0.0 {
-            return ControlFlow::Break(());
+            let remaining = bytes - self.bytes + self.debt;
+            let remaining_nanos = remaining / self.bytes_per_nanos;
+            let mut target = now;
+            target.nanos += remaining_nanos.ceil() as u64;
+            return ControlFlow::Break(target);
         }
 
         if self.bytes >= bytes {

@@ -313,20 +313,12 @@ pub struct Filled {
 
 impl fmt::Debug for Filled {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        let alt = f.alternate();
-
-        let mut s = f.debug_struct("Filled");
-        s.field("id", &self.desc.id())
+        f.debug_struct("Filled")
+            .field("id", &self.desc.id())
             .field("remote_address", &self.remote_address().get())
-            .field("ecn", &self.ecn);
-
-        if alt {
-            s.field("payload", &self.payload());
-        } else {
-            s.field("payload_len", &self.len);
-        }
-
-        s.finish()
+            .field("ecn", &self.ecn)
+            .field("payload_len", &self.len)
+            .finish()
     }
 }
 

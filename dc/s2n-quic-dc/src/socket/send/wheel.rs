@@ -18,7 +18,7 @@ use std::{
 };
 
 // TODO tune this
-pub const DEFAULT_GRANULARITY_US: u64 = 64;
+pub const DEFAULT_GRANULARITY_US: u64 = 128;
 
 pub struct WakerState {
     waker: Waker,
@@ -120,7 +120,7 @@ impl<Info, Meta, Completion, const GRANULARITY_US: u64>
     pub fn insert(
         &self,
         mut entry: Entry<Info, Meta, Completion>,
-        time: Timestamp,
+        time: Option<Timestamp>,
     ) -> Result<(), (Entry<Info, Meta, Completion>, Timestamp)> {
         let (index, full_idx, waker, mut lock) = match self.index(time) {
             Ok(v) => v,
@@ -186,7 +186,7 @@ impl<Info, Meta, Completion, const GRANULARITY_US: u64>
 
     fn index(
         &self,
-        timestamp: Timestamp,
+        timestamp: Option<Timestamp>,
     ) -> Result<
         (
             usize,
@@ -196,10 +196,11 @@ impl<Info, Meta, Completion, const GRANULARITY_US: u64>
         ),
         Timestamp,
     > {
-        let full_idx = Self::timestamp_to_full_index(timestamp);
+        let full_idx = timestamp.map(Self::timestamp_to_full_index);
 
         let mut lock = self.0.sync_state.lock();
         let mut min = lock.start_idx;
+        let full_idx = full_idx.unwrap_or(min);
         let max = min + self.0.mask;
 
         if full_idx > max {
@@ -219,6 +220,7 @@ impl<Info, Meta, Completion, const GRANULARITY_US: u64>
         };
 
         if cfg!(debug_assertions) {
+            let timestamp = timestamp.unwrap_or_else(|| Self::full_index_to_timestamp(full_idx));
             let min = full_idx.min(min);
             let expected_min = Self::full_index_to_timestamp(min);
             let expected_max = Self::full_index_to_timestamp(max);
@@ -353,7 +355,7 @@ mod tests {
 
         // Insert an entry at the current time
         let entry = Entry::new(create_transmission(&pool, 100));
-        wheel.insert(entry, clock.get_time()).unwrap();
+        wheel.insert(entry, None).unwrap();
 
         // Tick should return this entry
         let (next_time, mut queue) = wheel.tick(None);
@@ -368,17 +370,16 @@ mod tests {
     #[test]
     fn test_wheel_multiple_entries_same_slot() {
         let (wheel, pool, clock) = new(64);
-        let now = clock.get_time();
 
         // Insert multiple entries at the same timestamp
         wheel
-            .insert(Entry::new(create_transmission(&pool, 10)), now)
+            .insert(Entry::new(create_transmission(&pool, 10)), None)
             .unwrap();
         wheel
-            .insert(Entry::new(create_transmission(&pool, 20)), now)
+            .insert(Entry::new(create_transmission(&pool, 20)), None)
             .unwrap();
         wheel
-            .insert(Entry::new(create_transmission(&pool, 30)), now)
+            .insert(Entry::new(create_transmission(&pool, 30)), None)
             .unwrap();
 
         // Tick should return all entries in FIFO order
@@ -402,13 +403,13 @@ mod tests {
         let t2 = clock.get_time();
 
         wheel
-            .insert(Entry::new(create_transmission(&pool, 100)), t0)
+            .insert(Entry::new(create_transmission(&pool, 100)), Some(t0))
             .unwrap();
         wheel
-            .insert(Entry::new(create_transmission(&pool, 200)), t1)
+            .insert(Entry::new(create_transmission(&pool, 200)), Some(t1))
             .unwrap();
         wheel
-            .insert(Entry::new(create_transmission(&pool, 300)), t2)
+            .insert(Entry::new(create_transmission(&pool, 300)), Some(t2))
             .unwrap();
 
         // First tick gets entry 1
