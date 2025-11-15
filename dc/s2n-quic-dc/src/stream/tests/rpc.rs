@@ -388,3 +388,121 @@ mod udp {
 
     tests!();
 }
+
+mod stress {
+    use super::*;
+    use crate::testing::*;
+    use s2n_quic_core::stream::testing::Data;
+    use tokio::{task::JoinSet, time::Instant};
+
+    #[tokio::test]
+    async fn echo_test() {
+        stress_test(Protocol::Udp, 1, 1000, 1000).await;
+    }
+
+    #[tokio::test]
+    async fn stress_test_1k() {
+        stress_test(Protocol::Udp, 16, 1000, 1000).await;
+    }
+
+    #[tokio::test]
+    async fn stress_test_100k() {
+        stress_test(Protocol::Udp, 16, 100, 100_000).await;
+    }
+
+    #[tokio::test]
+    async fn stress_test_1m() {
+        stress_test(Protocol::Udp, 16, 100, 1_000_000).await;
+    }
+
+    async fn stress_test(protocol: Protocol, workers: usize, requests: usize, payload_size: usize) {
+        init_tracing();
+
+        let (client, server) = Context::new(protocol).await.split();
+        let handshake_addr = server.handshake_addr().unwrap();
+        let acceptor_addr = server.acceptor_addr().unwrap();
+
+        macro_rules! send {
+            ($side:ident) => {{
+                let start = Instant::now();
+                tracing::info!(side = stringify!($side), "sending");
+                $side
+                    .write_all_from_fin(&mut Data::new(payload_size as _))
+                    .await
+                    .unwrap();
+                tracing::info!(side = stringify!($side), duration = ?start.elapsed(), "sent");
+            }}
+        }
+
+        macro_rules! recv {
+            ($side:ident) => {{
+                let start = Instant::now();
+                tracing::info!(side = stringify!($side), "receiving");
+                let mut expected = Data::new(payload_size as _);
+                while $side.read_into(&mut expected).await.unwrap() != 0 {}
+                tracing::info!(side = stringify!($side), duration = ?start.elapsed(), "received");
+                assert!(expected.is_finished());
+            }}
+        }
+
+        for worker in 0..workers {
+            let server = server.clone();
+            tokio::spawn(
+                async move {
+                    let mut request_id = 0;
+                    while let Ok((stream, remote_addr)) = server.accept().await {
+                        let task = async move {
+                            let (mut request, mut response) = stream.into_split();
+                            recv!(request);
+                            send!(response);
+                        }
+                        .instrument(info_span!(
+                            "request",
+                            request_id,
+                            ?remote_addr
+                        ));
+
+                        request_id += 1;
+
+                        tokio::spawn(task);
+                    }
+                }
+                .instrument(info_span!("server", worker)),
+            );
+        }
+
+        let mut tasks = JoinSet::new();
+        for worker in 0..workers {
+            let client = client.clone();
+            tasks.spawn(
+                async move {
+                    for request in 0..requests {
+                        async {
+                            tracing::info!(?acceptor_addr, payload_size, "creating request");
+                            let (mut response, mut request) = client
+                                .connect(handshake_addr, acceptor_addr, server_name())
+                                .await
+                                .unwrap()
+                                .into_split();
+
+                            send!(request);
+                            recv!(response);
+                        }
+                        .instrument(info_span!("request", request))
+                        .await;
+                    }
+                }
+                .instrument(info_span!("client", worker)),
+            );
+        }
+
+        while let Some(result) = tasks.join_next().await {
+            match result {
+                Ok(_) => result.unwrap(),
+                Err(_) => {
+                    panic!("Task failed");
+                }
+            };
+        }
+    }
+}
