@@ -136,8 +136,7 @@ where
         match handshake {
             handshake::State::ClientQueueIdObserved => {
                 // stop sending our `queue_id` since the server has observed it
-                // TODO
-                // self.local_queue_id.store(u64::MAX, Ordering::Relaxed);
+                self.local_queue_id.store(u64::MAX, Ordering::Relaxed);
 
                 // allow the server to pick a different port on the first response
                 self.remote_port
@@ -153,8 +152,7 @@ where
             }
             handshake::State::ServerQueueIdObserved => {
                 // stop sending our `queue_id` since the client has observed it
-                // TODO
-                // self.local_queue_id.store(u64::MAX, Ordering::Relaxed);
+                self.local_queue_id.store(u64::MAX, Ordering::Relaxed);
 
                 // no need to update the remote_queue_id value since we saw it on the first packet
                 let _ = handshake.on_observation_finished();
