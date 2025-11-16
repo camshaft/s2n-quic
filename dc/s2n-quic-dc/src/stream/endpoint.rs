@@ -258,18 +258,20 @@ where
 
         let last_peer_activity = unsafe { now.as_duration().as_micros() as u64 }.into();
 
+        let local_queue_id = if let Some(id) = source_queue_id {
+            id.as_u64()
+        } else {
+            // use MAX as `None`
+            u64::MAX
+        }
+        .into();
+
         shared::Common {
             clock: env.clock().clone(),
             gso: env.gso(),
             remote_port: remote_addr.port().into(),
             remote_queue_id: stream_id.queue_id.as_u64().into(),
-            local_queue_id: if let Some(id) = source_queue_id {
-                id.as_u64()
-            } else {
-                // use MAX as `None`
-                u64::MAX
-            }
-            .into(),
+            local_queue_id,
             last_peer_activity,
             fixed,
             segment_alloc: sockets.transmission_pool,
