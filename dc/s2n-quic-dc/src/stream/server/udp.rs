@@ -24,6 +24,7 @@ use s2n_quic_core::{
     event::IntoEvent,
     inet::{ExplicitCongestionNotification, SocketAddress},
     time::Clock,
+    varint::VarInt,
 };
 use std::{io, sync::Arc};
 use tracing::debug;
@@ -130,6 +131,9 @@ where
         let peer_addr = segment.remote_address().get();
 
         let (control, stream) = self.queues.alloc_or_grow(Some(&credentials));
+
+        debug_assert_ne!(control.queue_id(), VarInt::ZERO);
+
         // inject the packet into the stream queue
         let _ = stream.push(segment);
 

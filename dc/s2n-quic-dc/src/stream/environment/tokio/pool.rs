@@ -181,7 +181,19 @@ impl Pool {
 
         config.send_workers.set_default(workers);
         config.recv_workers.set_default(workers);
-        let sockets = Self::create_workers(&env.clock(), options, &config)?;
+
+        if acceptor.is_some() && config.socket_count() > 1 {
+            config.reuse_port = true;
+        }
+
+        let create_queue = || {
+            if acceptor.is_some() {
+                Queues::new_non_zero(config.stream_recv_queue, config.control_recv_queue)
+            } else {
+                Queues::new(config.stream_recv_queue, config.control_recv_queue)
+            }
+        };
+        let sockets = Self::create_workers(&env.clock(), options, &config, create_queue)?;
 
         let local_addr = sockets[0].socket.local_addr()?;
         if cfg!(debug_assertions) && config.reuse_port {
@@ -358,15 +370,13 @@ impl Pool {
         clock: &Clock,
         mut options: Options,
         config: &Config,
+        create_queue: impl Fn() -> Queues,
     ) -> Result<Vec<PoolSocket>> {
         let mut sockets = vec![];
 
-        let stream_cap = config.stream_recv_queue;
-        let control_cap = config.control_recv_queue;
-
         let shared_queue = if config.reuse_port {
             // if we are reusing the port, we need to share the queue_ids
-            Some(Queues::new_non_zero(stream_cap, control_cap))
+            Some(create_queue())
         } else {
             // otherwise, each worker can get its own queue to reduce thread contention
             None
@@ -398,7 +408,7 @@ impl Pool {
             let queue = if let Some(shared_queue) = &shared_queue {
                 shared_queue.clone()
             } else {
-                Queues::new(stream_cap, control_cap)
+                create_queue()
             };
 
             let queue = Mutex::new(queue);
