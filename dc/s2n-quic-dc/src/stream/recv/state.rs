@@ -76,8 +76,9 @@ impl State {
         let (initial_max_data, max_data_window) = if features.is_flow_controlled() {
             (VarInt::MAX, VarInt::MAX)
         } else {
-            let initial_max_data = params.remote_max_data;
-            let data_window = params.local_recv_max_data;
+            let initial_max_data = params.local_recv_max_data;
+            // use the send data window for the actual window after the stream has been accepted
+            let data_window = params.local_send_max_data;
             (initial_max_data, data_window)
         };
 
