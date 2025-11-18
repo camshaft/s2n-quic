@@ -57,6 +57,7 @@ pub struct Info {
     pub stream_offset: VarInt,
     pub payload_len: u16,
     pub included_fin: bool,
+    pub is_probe: bool,
     pub time_sent: Timestamp,
     pub ecn: ExplicitCongestionNotification,
 }
@@ -72,7 +73,7 @@ impl Info {
     }
 
     pub fn is_probe(&self) -> bool {
-        self.payload_len == 0
+        self.is_probe
     }
 
     #[inline]

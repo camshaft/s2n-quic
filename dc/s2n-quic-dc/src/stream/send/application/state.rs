@@ -136,6 +136,7 @@ impl State {
                     stream_offset,
                     payload_len,
                     included_fin,
+                    is_probe: false,
                     time_sent,
                     ecn: path.ecn,
                 };

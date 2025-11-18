@@ -59,7 +59,7 @@ bolero-generator = "0.13"
 insta = "1"
 s2n-codec = { path = "../../common/s2n-codec", features = ["testing"] }
 s2n-quic = { path = "../../quic/s2n-quic" }
-s2n-quic-core = { path = "../../quic/s2n-quic-core", features = ["testing"] }
+s2n-quic-core = { path = "../../quic/s2n-quic-core", features = ["state-tracing", "testing"] }
 s2n-quic-platform = { path = "../../quic/s2n-quic-platform", features = ["testing"] }
 tokio = { version = "1", features = ["full"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

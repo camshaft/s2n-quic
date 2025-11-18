@@ -306,6 +306,8 @@ where
                     .recv_buffer
                     .poll_fill(cx, Actor::Worker, &self.socket, &mut publisher));
 
+            debug_assert!(!self.recv_buffer.is_empty());
+
             if let Err(err) = res {
                 // the error is fatal so shut down
                 if !matches!(
@@ -390,7 +392,7 @@ where
                 waiting::State::Detached => {
                     // make sure we have the current view from the application
                     let final_offset = self.shared.sender.flow.stream_offset();
-                    self.sender.on_application_detach(final_offset);
+                    self.sender.on_fin_known(final_offset);
 
                     // transition to shutting down
                     let _ = self.state.on_shutdown();

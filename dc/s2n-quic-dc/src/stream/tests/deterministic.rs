@@ -10,6 +10,7 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     join,
 };
+use tracing::{info_span, Instrument};
 
 #[test]
 fn request_response() {
@@ -120,15 +121,18 @@ fn lost_initial_ack() {
         {
             let mut count = 0;
             bach::net::monitor::on_packet_sent(move |packet| {
-                dbg!(packet.source(), packet.transport.payload().len());
+                let mut command = bach::net::monitor::Command::Pass;
+
                 if packet.source().port() == 443 {
                     count += 1;
-                    if count < 10 {
-                        return bach::net::monitor::Command::Drop;
+                    if count <= 10 {
+                        command = bach::net::monitor::Command::Drop;
                     }
                 }
 
-                bach::net::monitor::Command::Pass
+                tracing::info!(source = ?packet.source(), len = packet.transport.payload().len(), ?command);
+
+                command
             });
         }
 
@@ -146,20 +150,25 @@ fn lost_initial_ack() {
             assert_eq!(response, body);
         }
         .group("client")
+        .instrument(info_span!("client"))
         .primary()
         .spawn();
 
         async move {
             let server = Server::udp().port(443).build();
             while let Ok((mut stream, _addr)) = server.accept().await {
-                spawn(async move {
-                    let mut request = Vec::with_capacity(2000);
-                    let _ = stream.read_to_end(&mut request).await;
-                    let _ = stream.write_all(&request).await;
-                });
+                spawn(
+                    async move {
+                        let mut request = Vec::with_capacity(2000);
+                        let _ = stream.read_to_end(&mut request).await;
+                        let _ = stream.write_all(&request).await;
+                    }
+                    .instrument(info_span!("server:stream")),
+                );
             }
         }
         .group("server")
+        .instrument(info_span!("server"))
         .spawn();
     })
 }
