@@ -335,10 +335,13 @@ where
         if wake_worker_for_ack && !current_state.is_terminal() {
             ApplicationState::wants_ack(&self.shared.receiver.application_state);
             self.shared.receiver.worker_waker.wake_forced();
+            return;
         }
 
         // no need to look at anything if the state didn't change
         ensure!(self.initial_state != current_state);
+        ensure!(self.buffer.is_empty());
+        ensure!(self.reassembler.is_empty());
 
         // shut down the worker if we're in a terminal state
         if current_state.is_terminal() {

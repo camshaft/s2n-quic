@@ -279,7 +279,7 @@ impl Reporter {
                     break;
                 }
             }
-            tracing::info!("{now}: {rate:.2} {prefix}bps");
+            tracing::debug!("{now}: {rate:.2} {prefix}bps");
         }
         self.last_emit = now;
         self.next_emit = now + Duration::from_secs(1);
@@ -336,21 +336,22 @@ impl LeakyBucketInstance {
     fn take(&mut self, bytes: u64, now: Timestamp) -> ControlFlow<Timestamp> {
         self.refill(now);
 
-        let bytes = bytes as f64;
-
-        if self.bytes < bytes && self.debt > 0.0 {
-            let remaining = bytes - self.bytes + self.debt;
+        // check if we need to pay the debt first
+        if bytes > 0 && self.debt > 0.0 {
+            let remaining = self.debt;
             let remaining_nanos = remaining / self.bytes_per_nanos;
             let mut target = now;
             target.nanos += remaining_nanos.ceil() as u64;
             return ControlFlow::Break(target);
         }
 
+        let bytes = bytes as f64;
+
         if self.bytes >= bytes {
             self.bytes = self.bytes - bytes;
         } else {
-            self.bytes = 0.0;
             self.debt = bytes - self.bytes;
+            self.bytes = 0.0;
         }
 
         ControlFlow::Continue(())

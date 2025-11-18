@@ -298,12 +298,16 @@ where
             }
 
             if let Ok(Some(mut recv)) = self.shared.receiver.worker_try_lock() {
-                // check to see if we have anything in the reassembler as well
-                let is_buffer_empty = recv.payload_is_empty() && recv.reassembler.is_empty();
+                let mut should_error = true;
+
+                // check to see if we have anything in the reassembler - if so indicate that we
+                // didn't read the whole thing
+                should_error &= !recv.reassembler.is_reading_complete();
+                should_error &= recv.reassembler.total_received_len() > 0;
 
                 let error = if let Some(code) = shutdown_kind.error_code() {
                     code
-                } else if !is_buffer_empty {
+                } else if should_error {
                     // we still had data in our buffer so notify the sender
                     ErrorCode::Application as u8
                 } else {
@@ -530,10 +534,11 @@ where
 
         let info = transmission::Info {
             packet_len: 0,
-            descriptor: None,
+            descriptor: None.into(),
             stream_offset: Default::default(),
             payload_len: 0,
             included_fin: false,
+            is_probe: false,
             time_sent: now,
             ecn,
         };
