@@ -32,7 +32,7 @@ use s2n_quic_core::{
     interval_set::IntervalSet,
     packet::number::PacketNumberSpace,
     path::{ecn, INITIAL_PTO_BACKOFF},
-    random, ready,
+    random,
     recovery::{Pto, RttEstimator},
     stream::state,
     time::{
@@ -486,7 +486,7 @@ impl State {
             let _ = self.state.on_send_fin();
         }
 
-        tracing::debug!(%final_offset, ?self.unacked_ranges, "fin known");
+        trace!(%final_offset, ?self.unacked_ranges, "fin known");
     }
 
     #[inline]
@@ -740,7 +740,7 @@ impl State {
             debug_assert!(self.pto.is_armed());
         }
 
-        tracing::debug!(
+        trace!(
             unacked_ranges = ?self.unacked_ranges,
             retransmissions = self.retransmissions.len(),
             stream_packets_in_flight = self.sent_stream_packets.iter().count(),
@@ -781,7 +781,7 @@ impl State {
         publisher: &Pub,
     ) where
         Clk: Clock,
-        Ld: FnOnce() -> Timestamp,
+        Ld: Fn() -> Timestamp,
         Pub: event::ConnectionPublisher,
     {
         if self.poll_idle_timer(clock, load_last_activity).is_ready() {
@@ -810,27 +810,26 @@ impl State {
     fn poll_idle_timer<Clk, Ld>(&mut self, clock: &Clk, load_last_activity: Ld) -> Poll<()>
     where
         Clk: Clock,
-        Ld: FnOnce() -> Timestamp,
+        Ld: Fn() -> Timestamp,
     {
         let now = clock.get_time();
 
-        if let Some(expiration) = self.idle_timer.next_expiration() {
-            self.idle_timer.cancel();
-            if expiration.has_elapsed(now) {
-                return Poll::Ready(());
+        for i in 0..2 {
+            if let Some(expiration) = self.idle_timer.next_expiration() {
+                if !expiration.has_elapsed(now) {
+                    return Poll::Pending;
+                }
+                self.idle_timer.cancel();
+                if i > 0 {
+                    break;
+                }
             }
+
+            // if that expired then load the last activity from the peer and update the idle timer with
+            // the value
+            let last_peer_activity = load_last_activity();
+            self.update_idle_timer(&last_peer_activity);
         }
-
-        // check the idle timer first
-        ready!(self.idle_timer.poll_expiration(now));
-
-        // if that expired then load the last activity from the peer and update the idle timer with
-        // the value
-        let last_peer_activity = load_last_activity();
-        self.update_idle_timer(&last_peer_activity);
-
-        // check the idle timer once more before returning
-        ready!(self.idle_timer.poll_expiration(now));
 
         Poll::Ready(())
     }
