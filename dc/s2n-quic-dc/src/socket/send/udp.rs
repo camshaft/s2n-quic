@@ -279,7 +279,7 @@ impl Reporter {
                     break;
                 }
             }
-            tracing::debug!("{now}: {rate:.2} {prefix}bps");
+            tracing::trace!("{now}: {rate:.2} {prefix}bps");
         }
         self.last_emit = now;
         self.next_emit = now + Duration::from_secs(1);
