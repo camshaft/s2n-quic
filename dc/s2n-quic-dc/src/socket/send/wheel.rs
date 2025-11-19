@@ -199,9 +199,9 @@ impl<Info, Meta, Completion, const GRANULARITY_US: u64>
         let full_idx = timestamp.map(Self::timestamp_to_full_index);
 
         let mut lock = self.0.sync_state.lock();
-        let mut min = lock.start_idx;
-        let full_idx = full_idx.unwrap_or(min);
-        let max = min + self.0.mask;
+        let original_min = lock.start_idx;
+        let full_idx = full_idx.unwrap_or(original_min);
+        let max = original_min + self.0.mask;
 
         if full_idx > max {
             // return when the application should resubmit
@@ -210,35 +210,33 @@ impl<Info, Meta, Completion, const GRANULARITY_US: u64>
             return Err(target);
         }
 
-        let waker = if let Some(waker) = lock.waker.take() {
-            let full_idx = full_idx.max(min);
-            min = full_idx;
-            lock.start_idx = full_idx;
-            Some(waker)
+        let (waker, min) = if let Some(waker) = lock.waker.take() {
+            let bounded_idx = full_idx.max(original_min);
+            lock.start_idx = bounded_idx;
+            (Some(waker), bounded_idx)
         } else {
-            None
+            (None, original_min)
         };
 
+        // bound the timestamp to the current window
+        let bounded_idx = full_idx.max(min);
+
         if cfg!(debug_assertions) {
-            let timestamp = timestamp.unwrap_or_else(|| Self::full_index_to_timestamp(full_idx));
-            let min = full_idx.min(min);
-            let expected_min = Self::full_index_to_timestamp(min);
+            let bounded_timestamp = Self::full_index_to_timestamp(bounded_idx);
+            let expected_min = Self::full_index_to_timestamp(original_min);
             let expected_max = Self::full_index_to_timestamp(max);
             assert!(
-                (expected_min..=expected_max).contains(&timestamp),
-                "{} not in {}..={}",
-                timestamp,
+                (expected_min..=expected_max).contains(&bounded_timestamp),
+                "bounded {} not in {}..={}",
+                bounded_timestamp,
                 expected_min,
                 expected_max
             );
         }
 
-        // bound the timestamp to the current window
-        let full_idx = full_idx.max(min);
-
         // wrap the index around the slots
-        let idx = full_idx & self.0.mask;
-        let info = (idx as usize, full_idx, waker, lock);
+        let idx = bounded_idx & self.0.mask;
+        let info = (idx as usize, bounded_idx, waker, lock);
         Ok(info)
     }
 
@@ -338,11 +336,12 @@ mod tests {
     }
 
     #[test]
-    #[cfg(todo)]
     fn test_wheel_creation() {
         let (wheel, _pool, clock) = new(64);
 
-        assert_eq!(wheel.0.entries.len(), 64);
+        let lock = wheel.0.sync_state.lock();
+        assert_eq!(lock.entries.len(), 64);
+        drop(lock);
         assert_eq!(wheel.0.mask, 63);
 
         let start = wheel.start();
@@ -429,13 +428,13 @@ mod tests {
     }
 
     #[test]
-    #[cfg(todo)]
     fn test_wheel_index_calculation() {
         let (wheel, _pool, mut clock) = new(64);
 
         for (iteration, expected) in (0usize..64).cycle().take(512).enumerate() {
             let t = clock.get_time();
-            let idx = wheel.index(t).0;
+            let (idx, _, _, lock) = wheel.index(Some(t)).unwrap();
+            drop(lock);
 
             assert_eq!(
                 idx,
@@ -455,28 +454,237 @@ mod tests {
     }
 
     #[test]
-    #[cfg(todo)]
     fn test_wheel_bounds() {
         let (wheel, pool, mut clock) = new(64);
+        let initial_time = clock.get_time();
 
-        // advance the wheel
-        for _ in 0..64 {
-            let _ = wheel.tick(None);
-        }
-
-        let actual_time = wheel.insert(
+        // Insert at current time should succeed
+        let result = wheel.insert(
             Entry::new(create_transmission(&pool, 100)),
-            clock.get_time(),
+            Some(initial_time),
         );
-        assert_eq!(actual_time, wheel.start());
+        assert!(result.is_ok(), "Expected Ok, got Err");
 
-        // advance the clock outside of the horizon
+        // Tick the wheel forward
+        let _ = wheel.tick(None);
+        clock.inc_by(Duration::from_micros(8));
+
+        // Insert at current time should still succeed
+        let result = wheel.insert(
+            Entry::new(create_transmission(&pool, 150)),
+            Some(clock.get_time()),
+        );
+        assert!(result.is_ok(), "Expected Ok at current time");
+
+        // Advance the clock far beyond the horizon
         clock.inc_by(Duration::from_micros(8 * 1024));
+        let far_future = clock.get_time();
 
-        let actual_time = wheel.insert(
+        let result = wheel.insert(
             Entry::new(create_transmission(&pool, 200)),
-            clock.get_time(),
+            Some(far_future),
         );
-        assert_eq!(actual_time, wheel.start() + wheel.horizon());
+        // Should fail because timestamp is beyond horizon
+        match result {
+            Err((_entry, retry_time)) => {
+                // The retry time should be when the wheel catches up enough to accept this timestamp
+                let current_start = wheel.start();
+                assert!(
+                    retry_time > current_start,
+                    "Retry time {:?} should be > current start {:?}",
+                    retry_time,
+                    current_start
+                );
+            }
+            Ok(_) => panic!("Expected Err for far future timestamp, got Ok"),
+        }
+    }
+
+    #[test]
+    fn test_wheel_waker_advances_start() {
+        let (mut wheel, pool, mut clock) = new(64);
+        
+        // Create a waker
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let waker = rt.block_on(async { WakerState::new().await });
+        
+        // Set the waker
+        wheel.set_waker(waker.clone());
+        
+        let initial_start = wheel.start();
+        
+        // Insert an entry at a future time - this should advance start_idx
+        clock.inc_by(Duration::from_micros(8 * 10));
+        let future_time = clock.get_time();
+        
+        let result = wheel.insert(
+            Entry::new(create_transmission(&pool, 100)),
+            Some(future_time),
+        );
+        assert!(result.is_ok(), "Insert should succeed");
+        
+        // The start should have advanced to at least the future_time
+        let new_start = wheel.start();
+        assert!(
+            new_start >= future_time,
+            "Start {:?} should have advanced to at least {:?}",
+            new_start,
+            future_time
+        );
+        assert!(
+            new_start > initial_start,
+            "Start {:?} should have advanced from {:?}",
+            new_start,
+            initial_start
+        );
+    }
+
+    #[test]
+    fn test_wheel_no_waker_no_advance() {
+        let (wheel, pool, mut clock) = new(64);
+        
+        let initial_start = wheel.start();
+        
+        // Insert an entry at a future time without a waker - should NOT advance start_idx
+        clock.inc_by(Duration::from_micros(8 * 10));
+        let future_time = clock.get_time();
+        
+        let result = wheel.insert(
+            Entry::new(create_transmission(&pool, 100)),
+            Some(future_time),
+        );
+        assert!(result.is_ok(), "Insert should succeed");
+        
+        // The start should NOT have advanced
+        let new_start = wheel.start();
+        assert_eq!(
+            new_start, initial_start,
+            "Start should not advance without waker"
+        );
+    }
+
+    #[test]
+    fn test_wheel_insert_past_timestamp() {
+        let (wheel, pool, mut clock) = new(64);
+        
+        let initial_time = clock.get_time();
+        
+        // Tick forward
+        for _ in 0..10 {
+            let _ = wheel.tick(None);
+            clock.inc_by(Duration::from_micros(8));
+        }
+        
+        // Current start is 10 slots ahead of initial_time
+        let current_start = wheel.start();
+        assert!(
+            initial_time < current_start,
+            "Initial time {:?} should be < current start {:?}",
+            initial_time,
+            current_start
+        );
+        
+        // Insert at past time should still succeed, but be bounded to current slot
+        let result = wheel.insert(
+            Entry::new(create_transmission(&pool, 100)),
+            Some(initial_time),
+        );
+        assert!(result.is_ok(), "Insert at past time should succeed but be bounded");
+        
+        // Entry should be in current slot (immediately available)
+        let (_, mut queue) = wheel.tick(None);
+        assert!(!queue.is_empty(), "Entry should be in current slot");
+        assert_eq!(queue.pop_front().unwrap().meta, 100);
+    }
+
+    #[test]
+    fn test_wheel_wrap_around() {
+        let (wheel, pool, mut clock) = new(64);
+        
+        // Fill multiple slots
+        for i in 0..10 {
+            let result = wheel.insert(
+                Entry::new(create_transmission(&pool, 100 + i)),
+                Some(clock.get_time()),
+            );
+            assert!(result.is_ok(), "Insert {} should succeed", i);
+            clock.inc_by(Duration::from_micros(8));
+        }
+        
+        // Tick through and verify order
+        for i in 0..10 {
+            let (_, mut queue) = wheel.tick(None);
+            let entry = queue.pop_front().expect(&format!("Entry {} should exist", i));
+            assert_eq!(entry.meta, 100 + i, "Entry {} should have correct meta", i);
+            assert!(queue.is_empty(), "Queue should have only one entry");
+        }
+    }
+
+    #[test]
+    fn test_wheel_insert_at_horizon_boundary() {
+        let (wheel, pool, mut clock) = new(64);
+        let initial_start = wheel.start();
+        
+        // Insert at exactly the horizon (max valid timestamp)
+        let horizon = wheel.horizon();
+        clock.inc_by(horizon);
+        let max_time = clock.get_time();
+        
+        let result = wheel.insert(
+            Entry::new(create_transmission(&pool, 100)),
+            Some(max_time),
+        );
+        assert!(result.is_ok(), "Insert at horizon should succeed");
+        
+        // Insert just beyond horizon should fail
+        clock.inc_by(Duration::from_micros(8));
+        let beyond_horizon = clock.get_time();
+        
+        let result = wheel.insert(
+            Entry::new(create_transmission(&pool, 200)),
+            Some(beyond_horizon),
+        );
+        assert!(result.is_err(), "Insert beyond horizon should fail");
+    }
+
+    #[test]
+    fn test_wheel_len_tracking() {
+        let (wheel, pool, _clock) = new(64);
+        
+        assert_eq!(wheel.len(), 0, "Initial len should be 0");
+        
+        // Insert some entries
+        for i in 0..5 {
+            wheel.insert(Entry::new(create_transmission(&pool, 100 + i)), None)
+                .unwrap();
+        }
+        
+        assert_eq!(wheel.len(), 5, "Len should be 5 after inserting 5");
+        
+        // Tick and verify len decreases
+        let (_, mut queue) = wheel.tick(None);
+        while queue.pop_front().is_some() {
+            wheel.on_send();
+        }
+        
+        assert_eq!(wheel.len(), 0, "Len should be 0 after sending all");
+    }
+
+    #[test]
+    fn test_wheel_insert_none_timestamp() {
+        let (wheel, pool, _clock) = new(64);
+        
+        // Insert with None timestamp should use current start
+        let result = wheel.insert(
+            Entry::new(create_transmission(&pool, 100)),
+            None,
+        );
+        assert!(result.is_ok(), "Insert with None timestamp should succeed");
+        
+        // Entry should be in the current slot
+        let (_, mut queue) = wheel.tick(None);
+        assert!(!queue.is_empty(), "Entry should be in current slot");
+        let entry = queue.pop_front().unwrap();
+        assert_eq!(entry.meta, 100);
     }
 }
