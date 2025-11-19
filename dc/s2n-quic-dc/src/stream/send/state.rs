@@ -541,7 +541,7 @@ impl State {
                         self.counters.on_finish(&packet.info);
 
                         if packet.info.included_fin {
-                            let _ = self.fin.on_ack();
+                            self.fin.on_ack();
                         }
 
                         if !packet.info.is_probe() {
@@ -966,8 +966,8 @@ impl State {
             // clear out the unacked ranges that we're no longer tracking
             let final_offset = info.end_offset();
             self.on_fin_known(final_offset);
+            self.fin.on_transmit();
             let _ = self.state.on_send_fin();
-            let _ = self.fin.on_transmit();
         }
 
         if let stream::PacketSpace::Recovery = packet_space {
@@ -1235,11 +1235,7 @@ impl State {
                 self.recovery_packet_number += 1;
 
                 let offset = self.max_data.max_sent_offset();
-                let final_offset = if self.state.is_data_sent() {
-                    Some(offset)
-                } else {
-                    None
-                };
+                let final_offset = self.fin.value();
 
                 let mut payload = probe::Probe {
                     offset,
