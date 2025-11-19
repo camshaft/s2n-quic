@@ -45,6 +45,7 @@ use std::collections::BinaryHeap;
 use tracing::{debug, trace};
 
 pub mod fin;
+pub mod max_data;
 pub mod probe;
 pub mod retransmission;
 pub mod transmission;
@@ -131,9 +132,9 @@ impl InflightCounters {
         }
     }
 
-    pub fn has_inflight_packets(&self, fin_state: &fin::State) -> bool {
+    pub fn has_inflight_packets(&self, fin: &fin::Fin) -> bool {
         let mut requires_pto = self.with_payloads > 0;
-        requires_pto |= !fin_state.is_acked() && self.with_fin > 0;
+        requires_pto |= !fin.is_acked() && self.with_fin > 0;
         requires_pto
     }
 }
@@ -159,15 +160,14 @@ pub struct State {
     pub idle_timeout: Duration,
     pub error: Option<ErrorState>,
     pub unacked_ranges: IntervalSet<VarInt>,
-    pub max_sent_offset: VarInt,
-    pub max_data: VarInt,
+    pub max_data: max_data::MaxData,
     pub max_tx_offset: VarInt,
     pub local_max_data_window: VarInt,
     pub peer_activity: Option<PeerActivity>,
     pub max_datagram_size: u16,
     pub max_sent_segment_size: u16,
     pub is_reliable: bool,
-    pub fin_state: fin::State,
+    pub fin: fin::Fin,
     pub retransmissions: BinaryHeap<retransmission::Segment>,
     #[cfg(debug_assertions)]
     pub pending_retransmissions: IntervalSet<VarInt>,
@@ -190,7 +190,6 @@ impl State {
         unacked_ranges.insert(VarInt::ZERO..=VarInt::MAX).unwrap();
 
         let cca = congestion::Controller::new(max_datagram_size);
-        let max_sent_offset = VarInt::ZERO;
 
         let max_tx_offset = VarInt::from_u16(max_datagram_size) * 64;
 
@@ -214,15 +213,14 @@ impl State {
             idle_timeout: params.max_idle_timeout().unwrap_or(DEFAULT_IDLE_TIMEOUT),
             error: None,
             unacked_ranges,
-            max_sent_offset,
-            max_data: initial_max_data,
+            max_data: max_data::MaxData::new(initial_max_data),
             max_tx_offset,
             local_max_data_window: local_max_data,
             peer_activity: None,
             max_datagram_size,
             max_sent_segment_size: 0,
             is_reliable: stream_id.is_reliable,
-            fin_state: fin::State::default(),
+            fin: Default::default(),
             retransmissions: Default::default(),
             #[cfg(debug_assertions)]
             pending_retransmissions: Default::default(),
@@ -258,7 +256,7 @@ impl State {
                 extra_window = 0;
             }
 
-            self.max_sent_offset + extra_window as usize
+            self.max_data.max_sent_offset() + extra_window as usize
         };
 
         let local_offset = {
@@ -268,7 +266,7 @@ impl State {
             unacked_start.saturating_add(local_max_data_window)
         };
 
-        let remote_offset = self.max_data;
+        let remote_offset = self.max_data.max_data();
 
         cca_offset
             .min(local_offset)
@@ -387,7 +385,7 @@ impl State {
                 FrameMut::Ack(ack) => {
                     if !core::mem::replace(&mut loaded_transmit_queue, true) {
                         // make sure we have a current view of the application transmissions
-                        self.load_completion_queue(transmission_queue);
+                        self.load_completion_queue(transmission_queue, clock);
                     }
 
                     if ack.ecn_counts.is_some() {
@@ -413,17 +411,13 @@ impl State {
                     }
                 }
                 FrameMut::MaxData(frame) => {
-                    if self.max_data < frame.maximum_data {
-                        let diff = frame.maximum_data.saturating_sub(self.max_data);
-
+                    if let Some(diff) = self.max_data.on_max_data_frame(frame.maximum_data) {
                         publisher.on_stream_max_data_received(
                             event::builder::StreamMaxDataReceived {
                                 increase: diff.as_u64(),
                                 new_max_data: frame.maximum_data.as_u64(),
                             },
                         );
-
-                        self.max_data = frame.maximum_data;
                     }
                 }
                 FrameMut::ConnectionClose(close) => {
@@ -476,15 +470,10 @@ impl State {
     }
 
     pub fn on_fin_known(&mut self, final_offset: VarInt) {
-        ensure!(self.fin_state.on_known().is_ok());
-        self.max_sent_offset = final_offset;
+        ensure!(self.fin.on_known(final_offset).is_ok());
         self.unacked_ranges
             .remove(final_offset..=VarInt::MAX)
             .unwrap();
-
-        if self.unacked_ranges.is_empty() {
-            let _ = self.state.on_send_fin();
-        }
 
         trace!(%final_offset, ?self.unacked_ranges, "fin known");
     }
@@ -493,7 +482,7 @@ impl State {
     fn try_finish(&mut self) {
         // check if we still have pending data
         ensure!(self.unacked_ranges.is_empty());
-        ensure!(self.fin_state.is_acked());
+        ensure!(self.fin.is_acked());
 
         // check if we are still ok
         ensure!(self.error.is_none());
@@ -552,7 +541,7 @@ impl State {
                         self.counters.on_finish(&packet.info);
 
                         if packet.info.included_fin {
-                            let _ = self.fin_state.on_fin_ack();
+                            let _ = self.fin.on_ack();
                         }
 
                         if !packet.info.is_probe() {
@@ -749,7 +738,7 @@ impl State {
             idle_timer = ?self.idle_timer.next_expiration(),
             ?self.counters,
             ?self.state,
-            ?self.fin_state,
+            ?self.fin,
         );
 
         self.invariants();
@@ -795,7 +784,7 @@ impl State {
         if self
             .pto
             .on_timeout(
-                self.counters.has_inflight_packets(&self.fin_state),
+                self.counters.has_inflight_packets(&self.fin),
                 clock.get_time(),
             )
             .is_ready()
@@ -855,14 +844,12 @@ impl State {
     #[inline]
     fn should_pto(&self) -> bool {
         // if we have stream packet buffers in flight then arm the PTO
-        let mut should_arm = self.counters.has_inflight_packets(&self.fin_state);
+        let mut should_arm = self.counters.has_inflight_packets(&self.fin);
 
         // if we've sent all of the data/reset and are waiting to clean things up
-        should_arm |= self.state.is_data_sent() && !self.fin_state.is_acked();
+        should_arm |= self.unacked_ranges.is_empty() && !self.fin.is_acked();
 
         should_arm |= self.state.is_reset_sent();
-
-        should_arm |= self.max_sent_offset == self.max_data;
 
         should_arm
     }
@@ -889,7 +876,11 @@ impl State {
     /// Called by the worker thread when it becomes aware of the application having transmitted a
     /// segment
     #[inline]
-    pub fn load_completion_queue(&mut self, queue: &transmission::Queue) -> bool {
+    pub fn load_completion_queue(
+        &mut self,
+        queue: &transmission::Queue,
+        clock: &impl Clock,
+    ) -> bool {
         let mut did_transmit_stream = false;
 
         queue.drain_completion_queue(|transmission| {
@@ -912,7 +903,13 @@ impl State {
                 did_transmit_stream = true;
             }
 
-            self.on_transmit_segment(meta.packet_space, packet_number, info, has_more_app_data);
+            self.on_transmit_segment(
+                meta.packet_space,
+                packet_number,
+                info,
+                has_more_app_data,
+                clock,
+            );
         });
 
         if did_transmit_stream {
@@ -932,6 +929,7 @@ impl State {
         packet_number: VarInt,
         info: transmission::Info,
         has_more_app_data: bool,
+        clock: &impl Clock,
     ) {
         // the BBR implementation requires monotonic time so track that
         let mut cca_time_sent = info.time_sent;
@@ -958,8 +956,8 @@ impl State {
         );
 
         // update the max offset that we've transmitted
-        self.max_sent_offset = self.max_sent_offset.max(info.end_offset());
-
+        self.max_data
+            .on_transmit(info.end_offset(), clock, self.idle_timeout / 2);
         self.counters.on_transmit(&info);
 
         // try to transition to start sending
@@ -969,7 +967,7 @@ impl State {
             let final_offset = info.end_offset();
             self.on_fin_known(final_offset);
             let _ = self.state.on_send_fin();
-            let _ = self.fin_state.on_send_fin();
+            let _ = self.fin.on_transmit();
         }
 
         if let stream::PacketSpace::Recovery = packet_space {
@@ -1236,7 +1234,7 @@ impl State {
                     VarInt::new(self.recovery_packet_number).expect("2^62 is a lot of packets");
                 self.recovery_packet_number += 1;
 
-                let offset = self.max_sent_offset;
+                let offset = self.max_data.max_sent_offset();
                 let final_offset = if self.state.is_data_sent() {
                     Some(offset)
                 } else {

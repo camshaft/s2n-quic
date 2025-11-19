@@ -254,7 +254,7 @@ where
     #[inline]
     fn poll_once(&mut self, cx: &mut Context) {
         self.sender
-            .load_completion_queue(&self.shared.sender.transmission_queue);
+            .load_completion_queue(&self.shared.sender.transmission_queue, &self.shared.clock);
 
         let _ = self.poll_messages(cx);
         let _ = self.poll_socket(cx);
@@ -271,9 +271,6 @@ where
         while let Some(message) = self.shared.sender.pop_worker_message() {
             match message.event {
                 Event::Shutdown { kind, mut queue } => {
-                    // Update the state to what was last sent by the application
-                    self.sender.max_sent_offset = self.shared.sender.flow.stream_offset();
-
                     self.transmit_queue.append(&mut queue);
 
                     // if the application is panicking then we notify the peer
@@ -481,7 +478,7 @@ where
     #[inline]
     fn after_transmit(&mut self) {
         self.sender
-            .load_completion_queue(&self.shared.sender.transmission_queue);
+            .load_completion_queue(&self.shared.sender.transmission_queue, &self.shared.clock);
 
         self.sender
             .before_sleep(&clock::Cached::new(&self.shared.clock));
