@@ -18,6 +18,7 @@ use s2n_quic_core::{
     ready,
     recovery::bandwidth::Bandwidth,
     time::{timer, Clock, Timer},
+    varint::VarInt,
 };
 use std::io::{self, IoSliceMut};
 
@@ -75,6 +76,29 @@ where
     }
 }
 
+#[derive(Debug, Default)]
+struct Checker {
+    #[cfg(debug_assertions)]
+    last_packet_number: Option<VarInt>,
+}
+
+impl Checker {
+    #[inline]
+    fn on_transmission(&mut self, packet_number: VarInt) {
+        let _ = packet_number;
+        #[cfg(debug_assertions)]
+        {
+            if let Some(last_packet_number) = self.last_packet_number {
+                assert!(
+                    packet_number > last_packet_number,
+                    "packet number must be greater than the last packet number"
+                );
+            }
+            self.last_packet_number = Some(packet_number);
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct Queue {
     /// Holds any segments that haven't been flushed to the socket
@@ -91,6 +115,7 @@ pub struct Queue {
     /// The next time the queue is allowed to transmit
     next_transmission_time: Option<precision::Timestamp>,
     transmission_timer: Timer,
+    checker: Checker,
 }
 
 impl Default for Queue {
@@ -101,6 +126,7 @@ impl Default for Queue {
             bandwidth: Bandwidth::INFINITY,
             next_transmission_time: None,
             transmission_timer: Default::default(),
+            checker: Checker::default(),
         }
     }
 }
@@ -167,6 +193,8 @@ impl Queue {
         let application_len = info.payload_len;
 
         descriptor.set_ecn(info.ecn);
+
+        self.checker.on_transmission(packet_number);
 
         self.builder.push_segment(
             (packet_number, info),
@@ -369,6 +397,7 @@ impl Queue {
                 // If the target time is in the past it means the wheel is overloaded so we need to back off a bit
                 let time = wheel_time.max(time.into());
 
+                self.next_transmission_time = Some(time.into());
                 self.builder.push_front(batch, application_len);
                 self.transmission_timer.set(time);
 
