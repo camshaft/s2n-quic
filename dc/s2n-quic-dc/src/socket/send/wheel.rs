@@ -106,6 +106,10 @@ impl<Info, Meta, Completion, const GRANULARITY_US: u64>
         }))
     }
 
+    pub fn is_closed(&self) -> bool {
+        Arc::strong_count(&self.0) == 1
+    }
+
     /// Returns the total number of entries waiting for transmission
     ///
     /// Can be used to determine queue load and potentially rebalance to other queues

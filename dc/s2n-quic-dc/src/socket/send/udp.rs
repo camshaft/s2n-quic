@@ -212,6 +212,10 @@ pub async fn non_blocking<S, T, Info, Meta, C, W, const GRANULARITY_US: u64>(
             }
         }
 
+        if wheels.iter().all(|v| v.queue.is_closed()) {
+            return;
+        }
+
         if W::BUSY_POLL {
             yield_now().await;
         } else {
