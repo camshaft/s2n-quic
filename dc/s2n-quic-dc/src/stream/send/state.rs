@@ -259,12 +259,12 @@ impl State {
             self.max_data.max_sent_offset() + extra_window as usize
         };
 
-        let local_offset = {
-            let unacked_start = self.unacked_ranges.min_value().unwrap_or_default();
-            let local_max_data_window = self.local_max_data_window;
-
-            unacked_start.saturating_add(local_max_data_window)
-        };
+        let local_offset = self
+            .unacked_ranges
+            .min_value()
+            .map_or(VarInt::MAX, |unacked_start| {
+                unacked_start.saturating_add(self.local_max_data_window)
+            });
 
         let remote_offset = self.max_data.max_data();
 
@@ -727,6 +727,10 @@ impl State {
 
         if self.should_pto() {
             debug_assert!(self.pto.is_armed());
+        }
+
+        if self.unacked_ranges.is_empty() && self.fin.is_acked() {
+            debug_assert!(self.state.is_terminal());
         }
 
         trace!(
@@ -1272,7 +1276,7 @@ impl State {
                 );
 
                 let payload_len = 0;
-                let included_fin = final_offset.is_some();
+                let included_fin = Some(offset) == final_offset;
 
                 debug_assert!(
                     packet_len < u16::MAX as usize,
@@ -1410,6 +1414,7 @@ impl timer::Provider for State {
         // if we're in a terminal state then no timers are needed
         ensure!(!self.state.is_terminal(), Ok(()));
         self.pto.timers(query)?;
+        self.max_data.timers(query)?;
         self.idle_timer.timers(query)?;
         Ok(())
     }

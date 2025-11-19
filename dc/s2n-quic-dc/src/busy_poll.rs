@@ -102,6 +102,18 @@ impl Runner {
         let mut tasks = Tasks::new();
         let mut spawns = Vec::with_capacity(16);
 
+        struct AbortOnPanic;
+
+        impl Drop for AbortOnPanic {
+            fn drop(&mut self) {
+                if std::thread::panicking() {
+                    std::process::abort();
+                }
+            }
+        }
+
+        let _guard = AbortOnPanic;
+
         loop {
             const ITERATIONS: usize = if cfg!(debug_assertions) { 10 } else { 10_000 };
 
@@ -166,7 +178,8 @@ impl Tasks {
 
         // clear out the free slots
         while self.slots.last().map_or(false, Option::is_none) {
-            self.slots.pop();
+            let slot = self.slots.pop().unwrap();
+            debug_assert!(slot.is_none());
         }
     }
 
