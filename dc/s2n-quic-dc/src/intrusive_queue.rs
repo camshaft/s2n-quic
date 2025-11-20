@@ -3,6 +3,7 @@
 
 use core::fmt;
 use std::{
+    cell::UnsafeCell,
     ops::{Deref, DerefMut},
     ptr::NonNull,
 };
@@ -10,28 +11,41 @@ use std::{
 /// An entry in the intrusive queue
 ///
 /// Contains the value and links to the previous and next entries.
-pub struct Entry<T>(Box<Inner<T>>);
+pub struct Entry<T>(Box<Cell<T>>);
+
+type Cell<T> = UnsafeCell<Inner<T>>;
+type Link<T> = NonNull<Cell<T>>;
 
 struct Inner<T> {
     value: T,
-    prev: Option<NonNull<Inner<T>>>,
-    next: Option<Entry<T>>,
+    prev: Option<Link<T>>,
+    next: Option<Link<T>>,
 }
 
 unsafe impl<T: Send> Send for Entry<T> {}
 unsafe impl<T: Sync> Sync for Entry<T> {}
 
+impl<T> Inner<T> {
+    #[inline(always)]
+    fn assert_unlinked(&self) {
+        if cfg!(debug_assertions) {
+            debug_assert!(self.prev.is_none());
+            debug_assert!(self.next.is_none());
+        }
+    }
+}
+
 impl<T: fmt::Debug> fmt::Debug for Entry<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0.value.fmt(f)
+        unsafe { &*self.0.get() }.value.fmt(f)
     }
 }
 
 impl<T: Clone> Clone for Entry<T> {
     fn clone(&self) -> Self {
-        debug_assert!(self.0.prev.is_none());
-        debug_assert!(self.0.next.is_none());
-        Self::new(self.0.value.clone())
+        let inner = unsafe { &*self.0.get() };
+        inner.assert_unlinked();
+        Self::new(inner.value.clone())
     }
 }
 
@@ -44,16 +58,27 @@ impl<T: Default> Default for Entry<T> {
 impl<T> Entry<T> {
     /// Create a new entry with the given value
     pub fn new(value: T) -> Self {
-        Self(Box::new(Inner {
+        let inner = Inner {
             value,
             prev: None,
             next: None,
-        }))
+        };
+        Self(Box::new(UnsafeCell::new(inner)))
     }
 
     /// Consume the entry and return the value
     pub fn into_inner(self) -> T {
-        self.0.value
+        let inner = self.0.into_inner();
+        inner.assert_unlinked();
+        inner.value
+    }
+
+    #[inline(always)]
+    fn assert_unlinked(&self) {
+        if cfg!(debug_assertions) {
+            let inner = unsafe { &*self.0.get() };
+            inner.assert_unlinked();
+        }
     }
 }
 
@@ -61,13 +86,13 @@ impl<T> Deref for Entry<T> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
-        &self.0.value
+        &unsafe { &*self.0.get() }.value
     }
 }
 
 impl<T> DerefMut for Entry<T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0.value
+        &mut self.0.get_mut().value
     }
 }
 
@@ -76,8 +101,8 @@ impl<T> DerefMut for Entry<T> {
 /// This is a doubly-linked list where elements are pushed to the back
 /// and popped from the front. The queue owns all entries through Box pointers.
 pub struct Queue<T> {
-    head: Option<Entry<T>>,
-    tail: Option<NonNull<Inner<T>>>,
+    head: Option<Link<T>>,
+    tail: Option<Link<T>>,
 }
 
 unsafe impl<T: Send> Send for Queue<T> {}
@@ -98,22 +123,24 @@ impl<T> Queue<T> {
     }
 
     /// Push an entry to the back of the queue
-    pub fn push_back(&mut self, mut entry: Entry<T>) {
-        debug_assert!(entry.0.prev.is_none());
-        debug_assert!(entry.0.next.is_none());
+    pub fn push_back(&mut self, entry: Entry<T>) {
+        entry.assert_unlinked();
 
-        entry.0.prev = self.tail;
+        // Leak the box to get a raw pointer we can store in the queue
+        let entry_ptr = Box::into_raw(entry.0);
+        let new_tail = unsafe { NonNull::new_unchecked(entry_ptr) };
 
-        let new_tail = NonNull::from(entry.0.as_ref());
+        unsafe {
+            // Set the new entry's prev pointer to the current tail
+            (*(*new_tail.as_ptr()).get()).prev = self.tail;
 
-        // If there's a tail, link it to the new entry
-        if let Some(tail) = self.tail {
-            unsafe {
-                (*tail.as_ptr()).next = Some(entry);
+            // If there's a tail, link it to the new entry
+            if let Some(tail) = self.tail {
+                (*(*tail.as_ptr()).get()).next = Some(new_tail);
+            } else {
+                // Queue was empty, this is the new head
+                self.head = Some(new_tail);
             }
-        } else {
-            // Queue was empty, this is the new head
-            self.head = Some(entry);
         }
 
         self.tail = Some(new_tail);
@@ -123,50 +150,58 @@ impl<T> Queue<T> {
     ///
     /// Returns None if the queue is empty.
     pub fn pop_front(&mut self) -> Option<Entry<T>> {
-        let mut head = self.head.take()?;
+        let head_ptr = self.head.take()?;
 
-        // Take ownership of the next entry
-        self.head = head.0.next.take();
+        unsafe {
+            // Get the next pointer from the head
+            let next = (*(*head_ptr.as_ptr()).get()).next;
+            self.head = next;
 
-        // Update the new head's prev pointer
-        if let Some(ref mut new_head) = self.head {
-            new_head.0.prev = None;
-        } else {
-            // Queue is now empty, clear tail
-            self.tail = None;
+            // Update the new head's prev pointer
+            if let Some(new_head) = self.head {
+                (*(*new_head.as_ptr()).get()).prev = None;
+            } else {
+                // Queue is now empty, clear tail
+                self.tail = None;
+            }
+
+            // Clear the popped entry's pointers
+            (*(*head_ptr.as_ptr()).get()).prev = None;
+            (*(*head_ptr.as_ptr()).get()).next = None;
+
+            // Reconstruct the Entry from the leaked box
+            Some(Entry(Box::from_raw(head_ptr.as_ptr())))
         }
-
-        // Clear the popped entry's pointers
-        head.0.prev = None;
-        head.0.next = None;
-
-        Some(head)
     }
 
     /// Peek at the front entry without removing it
     pub fn peek_front(&self) -> Option<&T> {
-        self.head.as_deref()
+        self.head
+            .map(|head| unsafe { &(*(*head.as_ptr()).get()).value })
     }
 
     /// Peek at the front entry mutably without removing it
     pub fn peek_front_mut(&mut self) -> Option<&mut T> {
-        self.head.as_deref_mut()
+        self.head
+            .map(|head| unsafe { &mut (*(*head.as_ptr()).get()).value })
     }
 
     /// Peek at the back entry without removing it
     pub fn peek_back(&self) -> Option<&T> {
-        self.tail.map(|tail| &unsafe { &*tail.as_ptr() }.value)
+        self.tail
+            .map(|tail| unsafe { &(*(*tail.as_ptr()).get()).value })
     }
 
     /// Peek at the back entry mutably without removing it
     pub fn peek_back_mut(&mut self) -> Option<&mut T> {
         self.tail
-            .map(|mut tail| &mut unsafe { tail.as_mut() }.value)
+            .map(|tail| unsafe { &mut (*(*tail.as_ptr()).get()).value })
     }
 
     pub fn iter(&self) -> Iter<'_, T> {
         Iter {
-            next: self.head.as_ref(),
+            next: self.head,
+            _phantom: std::marker::PhantomData,
         }
     }
 }
@@ -185,7 +220,8 @@ impl<T> Drop for Queue<T> {
 }
 
 pub struct Iter<'a, T> {
-    next: Option<&'a Entry<T>>,
+    next: Option<NonNull<UnsafeCell<Inner<T>>>>,
+    _phantom: std::marker::PhantomData<&'a T>,
 }
 
 impl<'a, T> Iterator for Iter<'a, T> {
@@ -193,8 +229,11 @@ impl<'a, T> Iterator for Iter<'a, T> {
 
     fn next(&mut self) -> Option<Self::Item> {
         let current = self.next.take()?;
-        self.next = current.0.next.as_ref();
-        Some(&current.0.value)
+        unsafe {
+            let inner = &*(*current.as_ptr()).get();
+            self.next = inner.next;
+            Some(&inner.value)
+        }
     }
 }
 
