@@ -4,6 +4,13 @@
 use std::time::Instant;
 use tokio::time::{self, sleep_until};
 
+fn root() -> Instant {
+    use std::sync::OnceLock;
+    static ROOT: OnceLock<Instant> = OnceLock::new();
+
+    *ROOT.get_or_init(Instant::now)
+}
+
 impl_clock!();
 
 #[cfg(test)]

@@ -3,6 +3,13 @@
 
 use bach::time::{self, sleep_until, Instant};
 
+fn root() -> Instant {
+    use std::sync::OnceLock;
+    static ROOT: OnceLock<Instant> = OnceLock::new();
+
+    *ROOT.get_or_init(|| unsafe { core::mem::transmute(core::time::Duration::ZERO) })
+}
+
 impl_clock!();
 
 impl crate::clock::precision::Timer for Clock {
