@@ -212,22 +212,26 @@ pub async fn non_blocking<S, T, Info, Meta, C, W, const GRANULARITY_US: u64>(
             }
         }
 
-        if wheels.iter().all(|v| v.queue.is_closed()) {
-            return;
+        if has_pending_transmissions {
+            sleep_time = start + horizon;
+        } else if start > sleep_time {
+            // check if we need to shut down
+            if wheels.iter().all(|v| v.queue.is_closed()) {
+                return;
+            }
         }
 
         if W::BUSY_POLL {
             yield_now().await;
         } else {
-            if has_pending_transmissions {
-                sleep_time = start + horizon;
-            } else if should_park {
+            if should_park {
                 waker.wait().await;
                 sleep_time = start + horizon;
                 continue;
             }
 
-            timer.sleep_until(next_sleep.unwrap()).await;
+            let next_sleep = next_sleep.unwrap();
+            timer.sleep_until(next_sleep).await;
         }
     }
 }
@@ -362,17 +366,20 @@ impl LeakyBucketInstance {
     }
 }
 
-#[cfg(todo)]
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::{
         clock::bach::Clock,
-        socket::pool::Pool,
+        socket::{
+            pool::Pool,
+            send::completion::{Completer, Queue as CompletionQueue},
+        },
         testing::{ext::*, sim},
     };
     use bach::net::UdpSocket;
     use s2n_quic_core::time::{Clock as _, Duration};
-    use std::{convert::Infallible, net::SocketAddr};
+    use std::{convert::Infallible, net::SocketAddr, sync::Weak};
     use tracing::info;
 
     // Helper to create a test transmission
@@ -381,7 +388,7 @@ mod tests {
         socket_addr: SocketAddr,
         payload_len: u16,
         priority: u8,
-    ) -> Transmission<(), (u8, u16), ()> {
+    ) -> Transmission<u32, (u8, u16), ()> {
         let descriptors = pool
             .alloc_or_grow()
             .fill_with(|addr, _cmsg, mut payload| {
@@ -398,7 +405,7 @@ mod tests {
             })
             .unwrap_or_else(|_| panic!("could not create packet"))
             .into_iter()
-            .map(|desc| (desc, ()))
+            .map(|desc| (desc, 0))
             .collect();
         Transmission {
             descriptors,
@@ -409,7 +416,7 @@ mod tests {
         }
     }
 
-    fn new(horizon: Duration) -> (Wheel<(), (u8, u16), (), 8>, Pool, Clock) {
+    fn new<Comp>(horizon: Duration) -> (Wheel<u32, (u8, u16), Comp, 8>, Pool, Clock) {
         let clock = Clock::default();
         let pool = Pool::new(u16::MAX, 16);
         let wheel = Wheel::new(horizon, &clock);
@@ -445,23 +452,31 @@ mod tests {
 
                 // Insert some packets
                 let now = clock.get_time();
-                wheel.insert(
-                    Entry::new(create_transmission(&pool, peer_addr, 100, 0)),
-                    now,
-                );
-                wheel.insert(
-                    Entry::new(create_transmission(&pool, peer_addr, 200, 0)),
-                    now + Duration::from_millis(10),
-                );
+                wheel
+                    .insert(
+                        Entry::new(create_transmission(&pool, peer_addr, 100, 0)),
+                        Some(now),
+                    )
+                    .unwrap();
+                wheel
+                    .insert(
+                        Entry::new(create_transmission(&pool, peer_addr, 200, 0)),
+                        Some(now + Duration::from_millis(10)),
+                    )
+                    .unwrap();
 
                 let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
 
                 let bucket = LeakyBucket::new(1.0);
 
                 // Spawn the sender
+                let wheels = vec![wheel.clone()];
                 crate::testing::spawn(async move {
-                    non_blocking(socket, vec![wheel], clock, bucket).await;
+                    non_blocking(socket, wheels, clock, bucket, WithWaker).await;
                 });
+
+                1.s().sleep().await;
+                drop(wheel);
             }
             .primary()
             .group("sender")
@@ -509,15 +524,17 @@ mod tests {
                 let packets = [(200, 1), (210, 1), (100, 0), (110, 0)];
 
                 for (payload_len, priority) in packets {
-                    wheels[priority].insert(
-                        Entry::new(create_transmission(
-                            &pool,
-                            peer_addr,
-                            payload_len,
-                            priority as _,
-                        )),
-                        now,
-                    );
+                    wheels[priority]
+                        .insert(
+                            Entry::new(create_transmission(
+                                &pool,
+                                peer_addr,
+                                payload_len,
+                                priority as _,
+                            )),
+                            Some(now),
+                        )
+                        .unwrap();
                 }
 
                 let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -525,9 +542,13 @@ mod tests {
                 // High bandwidth to avoid token bucket blocking in this test
                 let bucket = LeakyBucket::new(1.0);
 
+                let wheels_guard = wheels.clone();
                 crate::testing::spawn(async move {
-                    non_blocking(socket, wheels, clock, bucket).await;
+                    non_blocking(socket, wheels, clock, bucket, WithWaker).await;
                 });
+
+                1.s().sleep().await;
+                drop(wheels_guard);
             }
             .primary()
             .group("sender")
@@ -570,13 +591,13 @@ mod tests {
 
                 // Limited token bucket: enough for ~1 packet per refill
                 // This will cause priority 1 to get blocked and allow priority 0 to preempt
-                let bucket = LeakyBucket::new(1.0);
+                let bucket = LeakyBucket::new(0.0002);
 
                 crate::testing::spawn({
                     let clock = clock.clone();
                     let wheels = wheels.clone();
                     async move {
-                        non_blocking(socket, wheels, clock, bucket).await;
+                        non_blocking(socket, wheels, clock, bucket, WithWaker).await;
                     }
                 });
 
@@ -598,20 +619,208 @@ mod tests {
 
                 for (payload_len, priority, sleep) in packets {
                     info!(payload_len, priority, sleep, "insert");
-                    wheels[priority].insert(
-                        Entry::new(create_transmission(
-                            &pool,
-                            peer_addr,
-                            payload_len,
-                            priority as _,
-                        )),
-                        now,
-                    );
+                    wheels[priority]
+                        .insert(
+                            Entry::new(create_transmission(
+                                &pool,
+                                peer_addr,
+                                payload_len,
+                                priority as _,
+                            )),
+                            Some(now),
+                        )
+                        .unwrap();
                     if sleep > 0 {
                         info!(sleep = ?sleep.us(), "sleep");
                         sleep.us().sleep().await;
                     }
                 }
+
+                1.s().sleep().await;
+                drop(wheels);
+            }
+            .primary()
+            .group("sender")
+            .spawn();
+        });
+    }
+
+    type SharedCompletionQueue = CompletionQueue<u32, (u8, u16), Weak<dyn AsShared>>;
+
+    #[derive(Default)]
+    struct Shared {
+        completion_queue: SharedCompletionQueue,
+    }
+
+    impl core::ops::Deref for Shared {
+        type Target = SharedCompletionQueue;
+
+        fn deref(&self) -> &Self::Target {
+            &self.completion_queue
+        }
+    }
+
+    trait AsShared: 'static + Send + Sync {
+        fn as_shared(&self) -> &Shared;
+    }
+
+    impl AsShared for Shared {
+        fn as_shared(&self) -> &Shared {
+            self
+        }
+    }
+
+    impl Completion<u32, (u8, u16)> for Weak<dyn AsShared> {
+        type Completer = Arc<dyn AsShared>;
+
+        fn upgrade(&self) -> Option<Self::Completer> {
+            Weak::upgrade(self)
+        }
+    }
+
+    impl Completer<u32, (u8, u16), Weak<dyn AsShared>> for Arc<dyn AsShared> {
+        fn complete(self, entry: Entry<u32, (u8, u16), Weak<dyn AsShared>>) {
+            let shared = self.as_shared();
+            shared.completion_queue.complete_transmission(entry);
+        }
+    }
+
+    fn completion_queue() -> Arc<Shared> {
+        Arc::new(Shared::default())
+    }
+
+    #[test]
+    fn concurrent_senders_with_completion_verification() {
+        use bach::rand::*;
+        use std::sync::Arc;
+
+        sim(|| {
+            async {
+                let socket = UdpSocket::bind("receiver:80").await.unwrap();
+                let mut buf = vec![0u8; u16::MAX as usize];
+
+                // Receive all packets - we'll verify order through completion queue
+                loop {
+                    let (len, addr) = socket.recv_from(&mut buf).await.unwrap();
+                    info!(len, %addr, "recv");
+                }
+            }
+            .group("receiver")
+            .spawn();
+
+            let sender_count = 3;
+            let packet_count = 100u32;
+
+            async move {
+                let (wheel, pool, clock) = new(Duration::from_millis(500));
+
+                let peer_addr = bach::net::lookup_host("receiver:80")
+                    .await
+                    .unwrap()
+                    .next()
+                    .unwrap();
+
+                // Create shared completion queue
+                let completion_queue = completion_queue();
+
+                // Spawn multiple concurrent sender tasks
+                for sender_id in 0..sender_count {
+                    let wheel = wheel.clone();
+                    let pool = pool.clone();
+                    let clock = clock.clone();
+                    let peer_addr = peer_addr.clone();
+                    let completion_queue = completion_queue.clone();
+
+                    crate::testing::spawn(async move {
+                        let mut delay = 0.s();
+                        for packet_id in 0..packet_count {
+                            // Random interval between 1-50ms
+                            delay += (1..=50).any().ms();
+
+                            let now = clock.get_time();
+                            let payload_len = 100;
+
+                            // Create transmission with completion tracking
+                            let mut entry = completion_queue.alloc_entry(1, || {
+                                Arc::downgrade(&completion_queue) as Weak<dyn AsShared>
+                            });
+
+                            let descriptors = pool
+                                .alloc_or_grow()
+                                .fill_with(|addr, _cmsg, mut payload| {
+                                    addr.set(peer_addr.into());
+                                    let len = payload_len as usize;
+                                    // Encode packet_id in first 4 bytes
+                                    payload[..4].copy_from_slice(&packet_id.to_be_bytes());
+                                    <Result<_, Infallible>>::Ok(len)
+                                })
+                                .unwrap_or_else(|_| panic!("could not create packet"))
+                                .into_iter()
+                                .map(|desc| (desc, packet_id))
+                                .collect();
+
+                            entry.descriptors = descriptors;
+                            entry.total_len = payload_len;
+                            entry.meta = (sender_id as _, payload_len);
+
+                            let tx_time = now + delay;
+                            while let Err((e, time)) = wheel.insert(entry, Some(tx_time)) {
+                                entry = e;
+                                let duration = (time.max(tx_time))
+                                    .saturating_duration_since(now)
+                                    .max(1.us());
+
+                                tracing::info!(?duration, %tx_time, "sleeping");
+
+                                duration.sleep().await;
+                                delay = 0.s();
+                            }
+
+                            info!(sender_id, packet_id, payload_len, "inserted packet");
+                        }
+                    });
+                }
+
+                // Spawn completion queue reader task
+                {
+                    let completion_queue = completion_queue.clone();
+                    let wheel = wheel.clone();
+
+                    crate::testing::spawn(
+                        async move {
+                            let expected_count = sender_count * packet_count;
+                            let mut count = 0;
+                            let mut senders = vec![0; sender_count as usize];
+
+                            while count < expected_count {
+                                (10..100).any().ms().sleep().await;
+                                info!(count, "draining completion queue");
+
+                                completion_queue.drain_completion_queue(|transmission| {
+                                    let (sender_id, _payload_len) = transmission.meta;
+                                    let packet_id = transmission.info;
+                                    let tx_time = transmission.transmission_time;
+                                    info!(packet_id, ?tx_time, "completed");
+                                    let sender = &mut senders[*sender_id as usize];
+                                    assert_eq!(*sender, packet_id);
+                                    *sender += 1;
+                                    count += 1;
+                                });
+                            }
+
+                            drop(wheel);
+                        }
+                        .primary(),
+                    )
+                }
+
+                // Spawn the sender
+                let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+                let bucket = LeakyBucket::new(1.0);
+
+                crate::testing::spawn(async move {
+                    non_blocking(socket, vec![wheel], clock, bucket, WithWaker).await;
+                });
             }
             .primary()
             .group("sender")

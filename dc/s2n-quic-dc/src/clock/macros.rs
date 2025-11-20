@@ -21,7 +21,7 @@ macro_rules! impl_clock {
         impl Default for Clock {
             #[inline]
             fn default() -> Self {
-                Self(Instant::now())
+                Self(root())
             }
         }
 
