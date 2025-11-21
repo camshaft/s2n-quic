@@ -116,9 +116,13 @@ impl State {
 
                 let has_more_app_data = credits.initial_len > total_payload_len;
 
-                let included_fin = reader
-                    .final_offset()
+                let final_offset = reader.final_offset();
+                let included_final_byte = final_offset
                     .is_some_and(|fin| stream_offset.as_u64() + payload_len as u64 == fin.as_u64());
+
+                let flags = transmission::Flags::empty()
+                    .with_included_final_offset(final_offset.is_some())
+                    .with_included_final_byte(included_final_byte);
 
                 let time_sent = clock.get_time();
                 publisher.on_stream_packet_transmitted(event::builder::StreamPacketTransmitted {
@@ -126,7 +130,7 @@ impl State {
                     payload_len: payload_len as usize,
                     packet_number: packet_number.as_u64(),
                     stream_offset: stream_offset.as_u64(),
-                    is_fin: included_fin,
+                    is_fin: included_final_byte,
                     is_retransmission: false,
                 });
 
@@ -135,8 +139,7 @@ impl State {
                     descriptor: None,
                     stream_offset,
                     payload_len,
-                    included_fin,
-                    is_probe: false,
+                    flags,
                     time_sent,
                     ecn: path.ecn,
                 };
@@ -144,6 +147,7 @@ impl State {
                 let meta = transmission::Meta {
                     has_more_app_data,
                     packet_space: PacketSpace::Stream,
+                    final_offset,
                 };
 
                 transmission::Event {

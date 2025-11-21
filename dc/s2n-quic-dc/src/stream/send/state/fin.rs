@@ -48,8 +48,18 @@ impl Fin {
         }
     }
 
+    pub fn is_queued(&self) -> bool {
+        self.state.is_known()
+    }
+
     pub fn value(&self) -> Option<VarInt> {
         self.value
+    }
+
+    pub fn try_transmit(&mut self) -> Option<VarInt> {
+        let value = self.value()?;
+        let _ = self.state.on_send_fin();
+        Some(value)
     }
 
     pub fn on_transmit(&mut self) {

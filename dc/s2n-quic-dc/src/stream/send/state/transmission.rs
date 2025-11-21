@@ -7,8 +7,9 @@ use crate::{
         pool::descriptor,
         send::{self, completion},
     },
-    stream::send::{shared, transmission::Type},
+    stream::send::shared,
 };
+use bitflags::bitflags;
 use core::ops::Bound;
 use s2n_quic_core::{inet::ExplicitCongestionNotification, time::Timestamp, varint::VarInt};
 use std::sync::Weak;
@@ -39,6 +40,7 @@ pub type CompleteTransmission<'a> = completion::CompleteTransmission<'a, PacketI
 pub struct Meta {
     pub packet_space: PacketSpace,
     pub has_more_app_data: bool,
+    pub final_offset: Option<VarInt>,
 }
 
 impl Default for Meta {
@@ -46,7 +48,56 @@ impl Default for Meta {
         Self {
             packet_space: PacketSpace::Stream,
             has_more_app_data: false,
+            final_offset: None,
         }
+    }
+}
+
+bitflags! {
+    #[derive(Copy, Clone, Debug, Default)]
+    pub struct Flags: u8 {
+        const PROBE = 1 << 0;
+        const INCLUDED_FINAL_OFFSET = 1 << 1;
+        const INCLUDED_FINAL_BYTE = 1 << 2;
+        const INCLUDED_RESET = 1 << 3;
+    }
+}
+
+impl Flags {
+    pub fn is_probe(&self) -> bool {
+        self.contains(Self::PROBE)
+    }
+
+    pub fn with_probe(mut self, enabled: bool) -> Self {
+        self.set(Self::PROBE, enabled);
+        self
+    }
+
+    pub fn included_final_offset(&self) -> bool {
+        self.contains(Self::INCLUDED_FINAL_OFFSET)
+    }
+
+    pub fn with_included_final_offset(mut self, enabled: bool) -> Self {
+        self.set(Self::INCLUDED_FINAL_OFFSET, enabled);
+        self
+    }
+
+    pub fn included_final_byte(&self) -> bool {
+        self.contains(Self::INCLUDED_FINAL_BYTE)
+    }
+
+    pub fn with_included_final_byte(mut self, enabled: bool) -> Self {
+        self.set(Self::INCLUDED_FINAL_BYTE, enabled);
+        self
+    }
+
+    pub fn included_reset(&self) -> bool {
+        self.contains(Self::INCLUDED_RESET)
+    }
+
+    pub fn with_included_reset(mut self, enabled: bool) -> Self {
+        self.set(Self::INCLUDED_RESET, enabled);
+        self
     }
 }
 
@@ -56,8 +107,7 @@ pub struct Info {
     pub descriptor: Option<descriptor::Filled>,
     pub stream_offset: VarInt,
     pub payload_len: u16,
-    pub included_fin: bool,
-    pub is_probe: bool,
+    pub flags: Flags,
     pub time_sent: Timestamp,
     pub ecn: ExplicitCongestionNotification,
 }
@@ -73,7 +123,7 @@ impl Info {
     }
 
     pub fn is_probe(&self) -> bool {
-        self.is_probe
+        self.flags.is_probe()
     }
 
     #[inline]
@@ -85,7 +135,7 @@ impl Info {
     #[inline]
     pub fn tracking_range(&self) -> (Bound<VarInt>, Bound<VarInt>) {
         let start = Bound::Included(self.stream_offset);
-        let end = if self.included_fin {
+        let end = if self.flags.included_final_byte() {
             Bound::Included(VarInt::MAX)
         } else {
             Bound::Excluded(self.end_offset())
@@ -109,8 +159,7 @@ impl Info {
             descriptor,
             stream_offset: self.stream_offset,
             payload_len: self.payload_len,
-            ty: Type::Stream,
-            included_fin: self.included_fin,
+            flags: self.flags,
         };
 
         Some(retransmission)
