@@ -54,14 +54,16 @@ where
         socket: &S,
         clock: &Clk,
     ) {
-        // Successfully acquired all credits, send the packet
+        // Record the transmission time to report accurate transmission
         let now = clock.get_time();
+        entry.transmission_time = Some(now);
+
+        // Successfully acquired all credits, send the packet
         entry.send_with(|addr, ecn, iovec| {
             let _ = socket.try_send(addr, ecn, iovec);
         });
 
         self.queue.on_send();
-        entry.transmission_time = Some(now);
 
         if let Some(completion) = entry.completion.as_ref().and_then(|c| c.upgrade()) {
             completion.complete(entry);

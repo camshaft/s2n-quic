@@ -767,8 +767,7 @@ impl State {
             stream_id,
             source_queue_id,
             queue,
-            // avoid querying the clock for every transmitted packet
-            &clock::Cached::new(clock),
+            clock,
             publisher,
         )
     }

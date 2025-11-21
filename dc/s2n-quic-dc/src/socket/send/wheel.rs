@@ -214,20 +214,18 @@ impl<Info, Meta, Completion, const GRANULARITY_US: u64>
             return Err(target);
         }
 
-        let (waker, min) = if let Some(waker) = lock.waker.take() {
-            let bounded_idx = full_idx.max(original_min);
-            lock.start_idx = bounded_idx;
-            (Some(waker), bounded_idx)
-        } else {
-            (None, original_min)
-        };
+        let bounded_idx = full_idx.max(original_min);
 
-        // bound the timestamp to the current window
-        let bounded_idx = full_idx.max(min);
+        let waker = if let Some(waker) = lock.waker.take() {
+            lock.start_idx = bounded_idx;
+            Some(waker)
+        } else {
+            None
+        };
 
         if cfg!(debug_assertions) {
             let timestamp = Self::full_index_to_timestamp(bounded_idx);
-            let expected_min = Self::full_index_to_timestamp(min);
+            let expected_min = Self::full_index_to_timestamp(original_min);
             let expected_max = Self::full_index_to_timestamp(max);
             assert!(
                 (expected_min..=expected_max).contains(&timestamp),

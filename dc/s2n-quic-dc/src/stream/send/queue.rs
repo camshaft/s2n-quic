@@ -224,13 +224,7 @@ impl Queue {
         C: ?Sized + Clock,
         Sub: event::Subscriber,
     {
-        ready!(self.poll_flush_segments(
-            cx,
-            socket,
-            // cache the timestamps to avoid fetching too many
-            &s2n_quic_core::time::clock::Cached::new(clock),
-            subscriber
-        ))?;
+        ready!(self.poll_flush_segments(cx, socket, clock, subscriber))?;
 
         // Consume accepted credits
         let accepted = limit.min(self.accepted_len);

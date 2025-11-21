@@ -989,6 +989,16 @@ impl State {
             #[cfg(debug_assertions)]
             let _ = self.pending_retransmissions.remove(info.range());
 
+            if cfg!(debug_assertions)
+                && self
+                    .sent_recovery_packets
+                    .get_range()
+                    .max()
+                    .is_some_and(|v| v >= packet_number)
+            {
+                panic!("application packet numbers should be transmitted in order {packet_number:?}: {info:?} - {:?}", self.sent_recovery_packets);
+            }
+
             self.sent_recovery_packets.insert(
                 packet_number,
                 SentRecoveryPacket {

@@ -445,8 +445,7 @@ impl Inner {
     where
         Sub: event::Subscriber,
     {
-        let clock = clock::Cached::new(&shared.clock);
-        let clock = &clock;
+        let clock = &shared.clock;
         let publisher = shared.publisher_with_timestamp(clock.get_time());
 
         // try copying data out of the reassembler into the application buffer
