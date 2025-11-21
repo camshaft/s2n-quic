@@ -1,17 +1,16 @@
 // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::{socket::pool::descriptor, stream::send::transmission::Type};
+use crate::{socket::pool::descriptor, stream::send::state::transmission::Flags};
 use core::cmp::Ordering;
 use s2n_quic_core::varint::VarInt;
 
 #[derive(Debug)]
 pub struct Segment {
     pub descriptor: descriptor::Filled,
-    pub ty: Type,
     pub stream_offset: VarInt,
     pub payload_len: u16,
-    pub included_fin: bool,
+    pub flags: Flags,
 }
 
 impl Segment {
@@ -41,9 +40,8 @@ impl PartialOrd for Segment {
 impl Ord for Segment {
     #[inline]
     fn cmp(&self, rhs: &Self) -> Ordering {
-        self.ty
-            .cmp(&rhs.ty)
-            .then(self.stream_offset.cmp(&rhs.stream_offset))
+        self.stream_offset
+            .cmp(&rhs.stream_offset)
             .then(self.payload_len.cmp(&rhs.payload_len))
             .reverse()
     }

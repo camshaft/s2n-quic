@@ -537,8 +537,7 @@ where
             descriptor: None.into(),
             stream_offset: Default::default(),
             payload_len: 0,
-            included_fin: false,
-            is_probe: false,
+            flags: Default::default(),
             time_sent: now,
             ecn,
         };
@@ -546,6 +545,7 @@ where
         let meta = transmission::Meta {
             packet_space: PacketSpace::Recovery,
             has_more_app_data: false,
+            final_offset: None,
         };
 
         let transmission_alloc = || {

@@ -7,12 +7,7 @@ use crate::{
     packet::{stream::PacketSpace, Packet},
     stream::{
         recv::buffer::{self, Buffer},
-        send::{
-            error,
-            queue::Queue,
-            shared::Event,
-            state::{ErrorState, State},
-        },
+        send::{error, queue::Queue, shared::Event, state::State},
         shared::{self, handshake},
         socket::Socket,
         Actor, TransportFeatures,
@@ -82,13 +77,13 @@ where
 #[derive(Debug)]
 struct Snapshot {
     flow_offset: VarInt,
-    send_quantum: usize,
+    send_quantum: u8,
     max_datagram_size: u16,
     ecn: ExplicitCongestionNotification,
     next_expected_control_packet: VarInt,
     timeout: Option<Timestamp>,
     bandwidth: Bandwidth,
-    error: Option<ErrorState>,
+    error: Option<(error::Error, Location)>,
 }
 
 impl Snapshot {
@@ -120,13 +115,13 @@ impl Snapshot {
             shared.sender.set_bandwidth(self.bandwidth);
         }
 
-        if let Some(error) = self.error {
+        if let Some((error, source)) = self.error {
             if initial.error.is_none() {
-                shared.sender.flow.set_error(error.error);
+                shared.sender.flow.set_error(error);
 
-                if let Some(err) = error.error.for_recv() {
+                if let Some(err) = error.for_recv() {
                     let publisher = shared.publisher();
-                    shared.receiver.notify_error(err, error.source, &publisher);
+                    shared.receiver.notify_error(err, source, &publisher);
                 }
             }
         }
@@ -198,7 +193,7 @@ where
 
         tracing::trace!(
             view = "before",
-            sender_state = ?self.sender.state,
+            sender_state = ?self.sender.state(),
             worker_state = ?self.state,
             snapshot = ?initial,
         );
@@ -223,7 +218,7 @@ where
 
         tracing::trace!(
             view = "after",
-            sender_state = ?self.sender.state,
+            sender_state = ?self.sender.state(),
             worker_state = ?self.state,
             snapshot = ?current,
         );
@@ -244,7 +239,8 @@ where
             Poll::Pending
         } else {
             // If the sender has no timeout then we're finished
-            debug_assert!(self.sender.state.is_terminal(), "{:?}", self.sender.state);
+            let state = self.sender.state();
+            debug_assert!(state.is_terminal(), "{state:?}");
             self.state = waiting::State::Finished;
             self.timer.cancel();
             Poll::Ready(())
@@ -333,7 +329,7 @@ where
             .control_opener()
             .expect("control crypto should be available");
 
-        let had_error = self.sender.error.is_some();
+        let had_error = self.sender.error().is_some();
         let publisher = self.shared.publisher();
 
         {
@@ -356,11 +352,9 @@ where
         }
 
         if !had_error {
-            if let Some(error) = self.sender.error.as_ref() {
-                if let Some(err) = error.error.for_recv() {
-                    self.shared
-                        .receiver
-                        .notify_error(err, error.source, &publisher);
+            if let Some((error, source)) = self.sender.error() {
+                if let Some(err) = error.for_recv() {
+                    self.shared.receiver.notify_error(err, source, &publisher);
                 }
             }
         }
@@ -399,7 +393,7 @@ where
                 waiting::State::ShuttingDown => {
                     self.fill_transmit_queue();
 
-                    if self.sender.state.is_terminal() {
+                    if self.sender.state().is_terminal() {
                         let _ = self.state.on_finished();
                     }
                 }
@@ -430,7 +424,7 @@ where
             .shared
             .gso
             .max_segments()
-            .min(self.sender.cca.send_quantum());
+            .min(self.sender.send_quantum_packets() as _);
 
         self.transmit_queue.push_buffer(
             &remote_address,
@@ -459,8 +453,7 @@ where
     fn poll_transmit_flush(&mut self, cx: &mut Context) -> Poll<()> {
         ensure!(!self.transmit_queue.is_empty(), Poll::Ready(()));
 
-        self.transmit_queue
-            .set_bandwidth(self.sender.cca.bandwidth());
+        self.transmit_queue.set_bandwidth(self.sender.bandwidth());
 
         while !self.transmit_queue.is_empty() {
             let _ = ready!(self.transmit_queue.poll_flush(
@@ -487,14 +480,14 @@ where
     fn snapshot(&self) -> Snapshot {
         Snapshot {
             flow_offset: self.sender.flow_offset(),
-            send_quantum: self.sender.cca.send_quantum(),
+            send_quantum: self.sender.send_quantum_packets(),
             // TODO get this from the ECN controller
             ecn: ExplicitCongestionNotification::Ect0,
-            max_datagram_size: self.sender.max_datagram_size,
-            next_expected_control_packet: self.sender.next_expected_control_packet,
+            max_datagram_size: self.sender.max_datagram_size(),
+            next_expected_control_packet: self.sender.next_expected_control_packet(),
             timeout: self.next_expiration(),
-            bandwidth: self.sender.cca.bandwidth(),
-            error: self.sender.error,
+            bandwidth: self.sender.bandwidth(),
+            error: self.sender.error().map(|(error, source)| (*error, source)),
         }
     }
 }

@@ -211,7 +211,7 @@ where
             if let Some((worker, _socket)) = worker.as_ref() {
                 let flow_offset = worker.flow_offset();
                 let send_quantum = worker.send_quantum_packets();
-                let bandwidth = Some(worker.cca.bandwidth());
+                let bandwidth = Some(worker.bandwidth());
 
                 (flow_offset, send_quantum, bandwidth)
             } else {
