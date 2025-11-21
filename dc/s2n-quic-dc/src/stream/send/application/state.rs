@@ -57,7 +57,7 @@ impl State {
     where
         E: seal::Application,
         I: buffer::reader::Storage<Error = core::convert::Infallible>,
-        Clk: Clock,
+        Clk: Clock + ?Sized,
         M: Message,
         Pub: ConnectionPublisher,
     {

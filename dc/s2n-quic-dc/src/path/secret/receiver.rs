@@ -8,7 +8,7 @@ use std::sync::{
     Mutex,
 };
 
-const WINDOW: usize = 896;
+const WINDOW: usize = 8192;
 
 type Seen = BitArr!(for WINDOW);
 

@@ -160,7 +160,7 @@ impl<Info, Meta, Completion> Builder<Info, Meta, Completion> {
     }
 
     pub fn push_front(&mut self, entry: Entry<Info, Meta, Completion>, application_len: u16) {
-        self.batches.push_back(Batch {
+        self.batches.push_front(Batch {
             entry,
             application_len,
         });

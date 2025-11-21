@@ -26,7 +26,7 @@ use s2n_quic_core::{
     random, ready,
     recovery::bandwidth::Bandwidth,
     time::{
-        clock::{self, Timer as _},
+        clock::Timer as _,
         timer::{self, Provider as _},
         Timestamp,
     },
@@ -326,7 +326,7 @@ where
         ensure!(!self.recv_buffer.is_empty());
 
         let random = &mut self.random;
-        let clock = clock::Cached::new(&self.shared.clock);
+        let clock = &self.shared.clock;
         let opener = self
             .shared
             .crypto
@@ -370,10 +370,10 @@ where
     fn poll_timers(&mut self, cx: &mut Context) -> Poll<()> {
         let _ = cx;
         let shared = &self.shared;
-        let clock = clock::Cached::new(&shared.clock);
+        let clock = &shared.clock;
         let publisher = shared.publisher();
         self.sender
-            .on_time_update(&clock, || shared.last_peer_activity(), &publisher);
+            .on_time_update(clock, || shared.last_peer_activity(), &publisher);
         Poll::Ready(())
     }
 
@@ -480,8 +480,7 @@ where
         self.sender
             .load_completion_queue(&self.shared.sender.transmission_queue, &self.shared.clock);
 
-        self.sender
-            .before_sleep(&clock::Cached::new(&self.shared.clock));
+        self.sender.before_sleep(&self.shared.clock);
     }
 
     #[inline]
@@ -524,7 +523,7 @@ where
     shared: &'a shared::Shared<Sub, C>,
     sender: &'a mut State,
     opener: &'a crate::crypto::awslc::open::control::Stream,
-    clock: clock::Cached<'a, C>,
+    clock: &'a C,
     remote_addr: SocketAddress,
     remote_queue_id: Option<VarInt>,
     random: &'a mut R,
@@ -594,7 +593,7 @@ where
                     ecn,
                     &mut packet,
                     self.random,
-                    &self.clock,
+                    self.clock,
                     &self.shared.sender.transmission_queue,
                     self.publisher,
                 );

@@ -270,7 +270,7 @@ where
                             self.shared.credentials(),
                             &stream_id,
                             local_queue_id,
-                            &clock::Cached::new(&self.shared.clock),
+                            &self.shared.clock,
                             message,
                             &features,
                             &self.shared.publisher(),
