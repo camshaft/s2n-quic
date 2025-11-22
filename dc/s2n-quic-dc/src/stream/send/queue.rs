@@ -20,7 +20,10 @@ use s2n_quic_core::{
     time::{timer, Clock, Timer},
     varint::VarInt,
 };
-use std::io::{self, IoSliceMut};
+use std::{
+    io::{self, IoSliceMut},
+    time::Duration,
+};
 
 pub struct Message<'a, TransmissionAlloc> {
     queue: &'a mut Queue,
@@ -375,32 +378,40 @@ impl Queue {
         C: ?Sized + Clock,
         Sub: event::Subscriber,
     {
+        self.transmission_timer.cancel();
+
         while let Some((batch, application_len)) = self.builder.pop_front() {
             let now = clock.get_time();
 
-            let time = if let Some(next) = self.next_transmission_time {
-                next.max(now.into())
-            } else {
-                now.into()
-            };
-
+            let transmission_time = self.next_transmission_time;
             let transmission_len = batch.total_len as u64;
 
-            // schedule the transmission immediately
-            if let Err((batch, wheel_time)) = socket.send_transmission_at(batch, time.into()) {
-                // If the target time is in the past it means the wheel is overloaded so we need to back off a bit
-                let time = wheel_time.max(time.into());
+            let res = if let Some(transmission_time) = transmission_time {
+                socket.send_transmission_at(batch, transmission_time.into())
+            } else {
+                socket.send_transmission(batch);
+                Ok(())
+            };
 
-                self.next_transmission_time = Some(time.into());
+            // schedule the transmission immediately
+            if let Err((batch, mut wheel_time)) = res {
+                // If the target time is in the past it means the wheel is overloaded so we need to back off a bit
+                if wheel_time.has_elapsed(now) {
+                    wheel_time += Duration::from_millis(2);
+                }
+
+                // Once the transmission timer expires then allow a packet to be inserted at the front
+                self.next_transmission_time = None;
                 self.builder.push_front(batch, application_len);
-                self.transmission_timer.set(time);
+                self.transmission_timer.set(wheel_time);
 
                 return Poll::Pending;
             }
 
             // Compute the next transmission time given the amount of bytes we're transmitting and the bandwidth
             let delay = transmission_len / self.bandwidth;
-            self.next_transmission_time = Some(time + delay);
+            let transmission_time = transmission_time.unwrap_or_else(|| now.into());
+            self.next_transmission_time = Some(transmission_time + delay);
 
             let provided_len = application_len as usize;
             subscriber.publisher(now).on_stream_write_socket_flushed(

@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
-    clock::{self, Timer},
+    clock::Timer,
     event::{self, ConnectionPublisher},
     packet::stream::PacketSpace,
     stream::{
