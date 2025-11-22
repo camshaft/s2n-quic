@@ -255,11 +255,53 @@ impl State {
     }
 
     #[inline]
-    pub fn worker_try_lock(&self) -> io::Result<Option<MutexGuard<'_, Inner>>> {
+    pub fn worker_try_lock(&self) -> io::Result<Option<WorkerGuard<'_>>> {
         match self.inner.try_lock() {
-            Ok(lock) => Ok(Some(lock)),
+            Ok(inner) => Ok(Some(WorkerGuard {
+                inner: ManuallyDrop::new(inner),
+            })),
             Err(std::sync::TryLockError::WouldBlock) => Ok(None),
             Err(_) => Err(io::Error::other("shared recv state has been poisoned")),
+        }
+    }
+}
+
+pub struct WorkerGuard<'a> {
+    inner: ManuallyDrop<MutexGuard<'a, Inner>>,
+}
+
+impl core::ops::Deref for WorkerGuard<'_> {
+    type Target = Inner;
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl core::ops::DerefMut for WorkerGuard<'_> {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.inner
+    }
+}
+
+impl Drop for WorkerGuard<'_> {
+    #[inline]
+    fn drop(&mut self) {
+        let waker = if !self.reassembler.is_empty() {
+            self.application_waker.take()
+        } else {
+            None
+        };
+
+        unsafe {
+            // SAFETY: inner is no longer used
+            ManuallyDrop::drop(&mut self.inner);
+        }
+
+        if let Some(waker) = waker {
+            waker.wake();
         }
     }
 }
@@ -422,12 +464,8 @@ impl Inner {
             &mut subscriber.publisher(clock.get_time()),
         );
 
-        // If we haven't received anything yet, it's possible this stream might be rejected by the sender worker so we need
-        // to store the waker if that happens
-        if matches!(actor, Actor::Application)
-            && matches!(self.handshake, handshake::State::ClientInit)
-            && res.is_pending()
-        {
+        // If we haven't received anything yet store the waker so we can wake up
+        if matches!(actor, Actor::Application) && res.is_pending() {
             self.application_waker = Some(cx.waker().clone());
         }
 

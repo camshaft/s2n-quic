@@ -219,6 +219,7 @@ pub async fn non_blocking<S, T, Info, Meta, C, W, const GRANULARITY_US: u64>(
         } else if start > sleep_time {
             // check if we need to shut down
             if wheels.iter().all(|v| v.queue.is_closed()) {
+                tracing::info!(local_addr = %socket.local_addr().unwrap(), "shutting down UDP sender");
                 return;
             }
         }
@@ -227,9 +228,14 @@ pub async fn non_blocking<S, T, Info, Meta, C, W, const GRANULARITY_US: u64>(
             yield_now().await;
         } else {
             if should_park {
-                waker.wait().await;
-                sleep_time = start + horizon;
-                continue;
+                let is_empty = !wheels.iter().any(|v| v.queue.len() > 0);
+                if is_empty {
+                    tracing::debug!("parking");
+                    waker.wait().await;
+                    tracing::debug!("unparked");
+                    sleep_time = timer.now() + horizon;
+                    continue;
+                }
             }
 
             let next_sleep = next_sleep.unwrap();
