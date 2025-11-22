@@ -211,7 +211,7 @@ impl Pool {
 
     pub fn alloc(
         &self,
-        credentials: Option<&Credentials>,
+        credentials: &Credentials,
     ) -> (
         Control,
         Stream,

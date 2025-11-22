@@ -10,8 +10,30 @@ use std::{
     future::{poll_fn, Future},
     io,
 };
+use tracing::Instrument;
 
 pub async fn from_stream<Sub, Req, Res>(
+    stream: Stream<Sub>,
+    request: Req,
+    response: Res,
+) -> io::Result<Res::Output>
+where
+    Sub: event::Subscriber,
+    Req: Request,
+    Res: Response,
+{
+    #[cfg(debug_assertions)]
+    let span = tracing::warn_span!("rpc", peer_addr = %stream.peer_addr().unwrap(), flow_id = %stream.credentials());
+
+    let future = from_stream_inner(stream, request, response);
+
+    #[cfg(debug_assertions)]
+    let future = future.instrument(span);
+
+    future.await
+}
+
+async fn from_stream_inner<Sub, Req, Res>(
     stream: Stream<Sub>,
     mut request: Req,
     mut response: Res,

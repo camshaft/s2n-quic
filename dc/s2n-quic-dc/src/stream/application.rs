@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
+    credentials::Credentials,
     event::{self, EndpointPublisher as _},
     stream::{
         recv::application::{self as recv, Reader},
@@ -151,6 +152,11 @@ where
     #[inline]
     pub fn protocol(&self) -> socket::Protocol {
         self.read.protocol()
+    }
+
+    #[inline]
+    pub(crate) fn credentials(&self) -> &Credentials {
+        self.read.credentials()
     }
 
     #[inline]

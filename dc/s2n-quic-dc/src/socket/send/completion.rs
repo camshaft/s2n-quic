@@ -71,6 +71,8 @@ where
                 meta: Default::default(),
                 transmission_time: None,
                 completion: None,
+                #[cfg(debug_assertions)]
+                span: tracing::info_span!("transmission"),
             };
             Entry::new(transmission)
         });

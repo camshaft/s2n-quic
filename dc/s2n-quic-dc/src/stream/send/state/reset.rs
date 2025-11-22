@@ -105,6 +105,10 @@ impl Reset {
         }
     }
 
+    pub fn on_ack(&mut self) {
+        let _ = self.state.on_ack();
+    }
+
     pub fn on_error(&mut self, error: Error, source: Location) -> Result<(), ()> {
         ensure!(self.error.is_none(), Err(()));
 

@@ -24,6 +24,16 @@ impl<S: Socket> Deref for Tracing<S> {
     }
 }
 
+macro_rules! local_addr {
+    ($self:expr) => {
+        if let Ok(addr) = $self.local_addr() {
+            addr
+        } else {
+            SocketAddr::from(([0, 0, 0, 0], 0))
+        }
+    };
+}
+
 impl<S: Socket> Socket for Tracing<S> {
     #[inline(always)]
     fn local_addr(&self) -> io::Result<SocketAddr> {
@@ -47,7 +57,7 @@ impl<S: Socket> Socket for Tracing<S> {
         trace!(
             operation = %"poll_peek_len",
             protocol = ?self.protocol(),
-            local_addr = ?self.local_addr(),
+            local_addr = %local_addr!(self),
             result = ?result,
         );
 
@@ -68,8 +78,8 @@ impl<S: Socket> Socket for Tracing<S> {
             Poll::Ready(Ok(_)) => trace!(
                 operation = %"poll_recv",
                 protocol = ?self.protocol(),
-                local_addr = ?self.local_addr(),
-                remote_addr = ?addr,
+                local_addr = %local_addr!(self),
+                peer_addr = %addr.get(),
                 ecn = ?cmsg.ecn(),
                 segments = buffer.len(),
                 segment_len = cmsg.segment_len(),
@@ -82,7 +92,7 @@ impl<S: Socket> Socket for Tracing<S> {
             _ => trace!(
                 operation = %"poll_recv",
                 protocol = ?self.protocol(),
-                local_addr = ?self.local_addr(),
+                local_addr = %local_addr!(self),
                 segments = buffer.len(),
                 buffer_len = {
                     let v: usize = buffer.iter().map(|s| s.len()).sum();
@@ -107,8 +117,8 @@ impl<S: Socket> Socket for Tracing<S> {
         trace!(
             operation = %"try_send",
             protocol = ?self.protocol(),
-            local_addr = ?self.local_addr(),
-            remote_addr = ?addr,
+            local_addr = %local_addr!(self),
+            peer_addr = %addr.get(),
             ?ecn,
             segments = buffer.len(),
             segment_len = buffer.first().map_or(0, |s| s.len()),
@@ -127,7 +137,7 @@ impl<S: Socket> Socket for Tracing<S> {
         trace!(
             operation = %"send_transmission",
             protocol = ?self.protocol(),
-            local_addr = ?self.local_addr(),
+            local_addr = %local_addr!(self),
             ?msg,
         );
 
@@ -144,7 +154,7 @@ impl<S: Socket> Socket for Tracing<S> {
         trace!(
             operation = %"send_transmission_at",
             protocol = ?self.protocol(),
-            local_addr = ?self.local_addr(),
+            local_addr = %local_addr!(self),
             ?time,
             result = ?result,
         );
@@ -164,8 +174,8 @@ impl<S: Socket> Socket for Tracing<S> {
         trace!(
             operation = %"poll_send",
             protocol = ?self.protocol(),
-            local_addr = ?self.local_addr(),
-            remote_addr = ?addr,
+            local_addr = %local_addr!(self),
+            peer_addr = %addr.get(),
             ?ecn,
             segments = buffer.len(),
             segment_len = buffer.first().map_or(0, |s| s.len()),
@@ -186,7 +196,7 @@ impl<S: Socket> Socket for Tracing<S> {
         trace!(
             operation = %"send_finish",
             protocol = ?self.protocol(),
-            local_addr = ?self.local_addr(),
+            local_addr = %local_addr!(self),
             result = ?result,
         );
 

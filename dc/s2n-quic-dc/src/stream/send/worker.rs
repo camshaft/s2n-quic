@@ -180,6 +180,13 @@ where
 
     #[inline]
     pub fn poll(&mut self, cx: &mut Context) -> Poll<()> {
+        #[cfg(debug_assertions)]
+        let _span = {
+            let local_queue_id = self.shared.local_queue_id().map(VarInt::as_u64);
+            let remote_queue_id = self.shared.remote_queue_id().as_u64();
+            tracing::warn_span!("worker::send::poll", local_queue_id, remote_queue_id).entered()
+        };
+
         s2n_quic_core::task::waker::debug_assert_contract(cx, |cx| {
             ready!(self.poll_impl(cx));
             tracing::trace!("write worker shutting down");

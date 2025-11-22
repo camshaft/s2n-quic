@@ -12,7 +12,7 @@ use crate::sync::ring_deque::Capacity;
 use s2n_quic_core::varint::VarInt;
 use std::{alloc::Layout, hash::Hash, marker::PhantomData, ptr::NonNull, sync::Arc};
 
-pub struct Pool<T: 'static + Send, Key: 'static + Send, const PAGE_SIZE: usize> {
+pub struct Pool<T: 'static + Send, Key: 'static + Send + Copy, const PAGE_SIZE: usize> {
     senders: Arc<sender::State<T, Key>>,
     keys: Keys<Key>,
     free: Arc<FreeVec<T, Key>>,
@@ -24,7 +24,7 @@ pub struct Pool<T: 'static + Send, Key: 'static + Send, const PAGE_SIZE: usize> 
     base: VarInt,
 }
 
-impl<T: 'static + Send, Key: 'static + Send, const PAGE_SIZE: usize> Clone
+impl<T: 'static + Send, Key: 'static + Send + Copy, const PAGE_SIZE: usize> Clone
     for Pool<T, Key, PAGE_SIZE>
 {
     #[inline]
@@ -49,7 +49,12 @@ where
 {
     #[inline]
     pub fn new(epoch: VarInt, stream_capacity: Capacity, control_capacity: Capacity) -> Self {
-        let keys = Keys::new(PAGE_SIZE);
+        let keys = if epoch == VarInt::ZERO {
+            // Key maps are not used for clients
+            Keys::new(0)
+        } else {
+            Keys::new(PAGE_SIZE)
+        };
         let senders = sender::State::new(epoch);
         let (free, memory_handle) = FreeVec::new(PAGE_SIZE, keys.clone());
         let mut pool = Pool {
@@ -82,12 +87,12 @@ where
     }
 
     #[inline]
-    pub fn alloc(&self, key: Option<&Key>) -> Option<(Control<T, Key>, Stream<T, Key>)> {
+    pub fn alloc(&self, key: &Key) -> Option<(Control<T, Key>, Stream<T, Key>)> {
         self.free.alloc(key)
     }
 
     #[inline]
-    pub fn alloc_or_grow(&mut self, key: Option<&Key>) -> (Control<T, Key>, Stream<T, Key>) {
+    pub fn alloc_or_grow(&mut self, key: &Key) -> (Control<T, Key>, Stream<T, Key>) {
         loop {
             if let Some(descriptor) = self.alloc(key) {
                 return descriptor;

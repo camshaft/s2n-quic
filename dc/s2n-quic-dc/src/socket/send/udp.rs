@@ -421,6 +421,8 @@ mod tests {
             transmission_time: None,
             meta: (priority, payload_len),
             completion: None,
+            #[cfg(debug_assertions)]
+            span: tracing::info_span!("transmission"),
         }
     }
 

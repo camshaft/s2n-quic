@@ -181,10 +181,10 @@ where
 
     #[inline]
     pub fn stream_id(&self) -> stream::Id {
-        let queue_id = self.remote_queue_id.load(Ordering::Relaxed);
+        let queue_id = self.remote_queue_id();
         // TODO support alternative modes
         stream::Id {
-            queue_id: unsafe { VarInt::new_unchecked(queue_id) },
+            queue_id,
             is_reliable: true,
             is_bidirectional: true,
         }
@@ -194,6 +194,12 @@ where
     pub fn local_queue_id(&self) -> Option<VarInt> {
         let queue_id = self.local_queue_id.load(Ordering::Relaxed);
         VarInt::new(queue_id).ok()
+    }
+
+    #[inline]
+    pub fn remote_queue_id(&self) -> VarInt {
+        let queue_id = self.remote_queue_id.load(Ordering::Relaxed);
+        unsafe { VarInt::new_unchecked(queue_id) }
     }
 
     #[inline]

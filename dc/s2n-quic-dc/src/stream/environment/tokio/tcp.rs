@@ -39,7 +39,7 @@ where
     fn setup(
         self,
         _env: &Environment<Sub>,
-        _credentials: Option<&Credentials>,
+        _credentials: &Credentials,
     ) -> SetupResult<Self::ReadWorkerSocket, Self::WriteWorkerSocket> {
         let remote_addr = self.peer_addr;
         let application = Box::new(self.socket);
@@ -80,7 +80,7 @@ where
     fn setup(
         self,
         _env: &Environment<Sub>,
-        _credentials: Option<&Credentials>,
+        _credentials: &Credentials,
     ) -> SetupResult<Self::ReadWorkerSocket, Self::WriteWorkerSocket> {
         let remote_addr = self.peer_addr;
         let application = Box::new(self.socket.into_std()?);

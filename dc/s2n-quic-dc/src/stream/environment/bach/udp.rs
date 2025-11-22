@@ -38,7 +38,7 @@ where
     fn setup(
         self,
         env: &Environment<Sub>,
-        credentials: Option<&Credentials>,
+        credentials: &Credentials,
     ) -> SetupResult<Self::ReadWorkerSocket, Self::WriteWorkerSocket> {
         let peer_addr = self.0;
         let recv_pool = env.recv_pool.as_ref().expect("pool not configured");

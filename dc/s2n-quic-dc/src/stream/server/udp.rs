@@ -119,6 +119,11 @@ where
         credentials: Credentials,
         segment: descriptor::Filled,
     ) {
+        let peer_addr = segment.remote_address().get();
+
+        #[cfg(debug_assertions)]
+        let _span = tracing::warn_span!("stream", %peer_addr, flow_id = %credentials).entered();
+
         // check to see if these credentials are associated with an active stream
         if let Some(queue_id) = self.dispatch.queue_id_for_key(&credentials) {
             tracing::trace!(%queue_id, "credential_cache_hit");
@@ -128,9 +133,7 @@ where
             return;
         }
 
-        let peer_addr = segment.remote_address().get();
-
-        let (control, stream) = self.queues.alloc_or_grow(Some(&credentials));
+        let (control, stream) = self.queues.alloc_or_grow(&credentials);
 
         debug_assert_ne!(control.queue_id(), VarInt::ZERO);
 

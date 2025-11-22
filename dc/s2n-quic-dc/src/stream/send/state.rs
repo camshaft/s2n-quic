@@ -516,6 +516,10 @@ impl State {
                             self.fin.on_ack();
                         }
 
+                        if packet.info.flags.included_reset() {
+                            self.reset.on_ack();
+                        }
+
                         if !packet.info.is_probe() {
                             *made_progress = true;
                         }
@@ -872,6 +876,14 @@ impl State {
             if meta.packet_space.is_stream() {
                 should_reset_pto = true;
             }
+
+            #[cfg(debug_assertions)]
+            tracing::trace!(
+                ?meta.packet_space,
+                %packet_number,
+                ?info,
+                "transmission_complete"
+            );
 
             self.on_transmit_segment(
                 meta.packet_space,

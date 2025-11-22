@@ -139,7 +139,7 @@ pub trait Peer<E: Environment> {
     fn setup(
         self,
         env: &E,
-        credentials: Option<&Credentials>,
+        credentials: &Credentials,
     ) -> SetupResult<Self::ReadWorkerSocket, Self::WriteWorkerSocket>;
 }
 

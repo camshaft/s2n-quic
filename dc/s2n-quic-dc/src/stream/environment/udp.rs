@@ -255,7 +255,7 @@ where
     fn setup(
         self,
         _env: &E,
-        _credentials: Option<&Credentials>,
+        _credentials: &Credentials,
     ) -> SetupResult<Self::ReadWorkerSocket, Self::WriteWorkerSocket> {
         let mut remote_addr = self.peer_addr;
         let control = self.control;

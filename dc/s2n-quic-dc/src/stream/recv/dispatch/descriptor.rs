@@ -11,6 +11,7 @@ use s2n_quic_core::{ensure, varint::VarInt};
 use std::{
     cell::UnsafeCell,
     marker::PhantomData,
+    mem::MaybeUninit,
     ptr::NonNull,
     sync::{
         atomic::{AtomicUsize, Ordering},
@@ -28,7 +29,7 @@ pub(super) struct Descriptor<T, Key> {
     phantom: PhantomData<DescriptorInner<T, Key>>,
 }
 
-impl<T: 'static, Key: 'static> Descriptor<T, Key> {
+impl<T: 'static, Key: 'static + Copy> Descriptor<T, Key> {
     #[inline]
     pub(super) fn new(ptr: NonNull<DescriptorInner<T, Key>>) -> Self {
         Self {
@@ -71,6 +72,11 @@ impl<T: 'static, Key: 'static> Descriptor<T, Key> {
         self.inner().id
     }
 
+    #[inline]
+    pub unsafe fn key(&self) -> &Key {
+        { &*self.inner().key.get() }.assume_init_ref()
+    }
+
     /// # Safety
     ///
     /// The caller needs to guarantee the [`Descriptor`] is still allocated.
@@ -87,14 +93,6 @@ impl<T: 'static, Key: 'static> Descriptor<T, Key> {
         &self.inner().control
     }
 
-    /// # Safety
-    ///
-    /// * The caller needs to guarantee the [`Descriptor`] is still allocated.
-    /// * The caller needs to have unique access to the [`Descriptor`].
-    pub unsafe fn take_key(&mut self) -> Option<Key> {
-        core::ptr::replace(self.inner().key.get(), None)
-    }
-
     #[inline]
     fn inner(&self) -> &DescriptorInner<T, Key> {
         unsafe { self.ptr.as_ref() }
@@ -104,7 +102,7 @@ impl<T: 'static, Key: 'static> Descriptor<T, Key> {
     ///
     /// * The [`Descriptor`] needs to be marked as free of receivers
     #[inline]
-    pub unsafe fn into_receiver_pair(self, key: Option<Key>) -> (Self, Self) {
+    pub unsafe fn into_receiver_pair(self, key: Key) -> (Self, Self) {
         let inner = self.inner();
 
         // open the queues back up for receiving
@@ -112,7 +110,7 @@ impl<T: 'static, Key: 'static> Descriptor<T, Key> {
 
         // set the key on the descriptor
         // SAFETY: the descriptor is fully owned by the caller
-        let _ = core::ptr::replace(inner.key.get(), key);
+        inner.key.get().write(MaybeUninit::new(key));
 
         probes::on_receiver_open(inner.id);
 
@@ -178,7 +176,7 @@ unsafe impl<T: Sync, Key: Sync> Sync for Descriptor<T, Key> {}
 
 pub(super) struct DescriptorInner<T, Key> {
     id: VarInt,
-    key: UnsafeCell<Option<Key>>,
+    key: UnsafeCell<MaybeUninit<Key>>,
     stream: Queue<T>,
     control: Queue<T>,
     /// A reference back to the free list
@@ -197,7 +195,7 @@ impl<T, Key> DescriptorInner<T, Key> {
         let control = Queue::new(control, Half::Control);
         Self {
             id,
-            key: UnsafeCell::new(None),
+            key: UnsafeCell::new(MaybeUninit::uninit()),
             stream,
             control,
             senders: AtomicUsize::new(0),

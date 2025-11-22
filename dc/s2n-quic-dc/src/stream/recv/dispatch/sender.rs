@@ -8,11 +8,11 @@ use std::{
     sync::{Arc, RwLock},
 };
 
-pub struct State<T: 'static, Key: 'static> {
+pub struct State<T: 'static, Key: 'static + Copy> {
     pub(super) pages: RwLock<SenderPages<T, Key>>,
 }
 
-impl<T: 'static, Key: 'static> State<T, Key>
+impl<T: 'static, Key: 'static + Copy> State<T, Key>
 where
     Key: Eq + Hash,
 {
@@ -24,14 +24,14 @@ where
     }
 }
 
-pub struct Senders<T: 'static, Key: 'static, const PAGE_SIZE: usize> {
+pub struct Senders<T: 'static, Key: 'static + Copy, const PAGE_SIZE: usize> {
     pub(super) state: Arc<State<T, Key>>,
     pub(super) local: Vec<Arc<[Sender<T, Key>]>>,
     pub(super) memory_handle: Arc<free_list::Memory<T, Key>>,
     pub(super) base: VarInt,
 }
 
-impl<T: 'static, Key: 'static, const PAGE_SIZE: usize> Clone for Senders<T, Key, PAGE_SIZE> {
+impl<T: 'static, Key: 'static + Copy, const PAGE_SIZE: usize> Clone for Senders<T, Key, PAGE_SIZE> {
     fn clone(&self) -> Self {
         Self {
             state: self.state.clone(),
@@ -42,7 +42,7 @@ impl<T: 'static, Key: 'static, const PAGE_SIZE: usize> Clone for Senders<T, Key,
     }
 }
 
-impl<T: 'static, Key: 'static, const PAGE_SIZE: usize> Senders<T, Key, PAGE_SIZE> {
+impl<T: 'static, Key: 'static + Copy, const PAGE_SIZE: usize> Senders<T, Key, PAGE_SIZE> {
     #[inline]
     pub fn lookup<F: FnOnce(&Sender<T, Key>, T) -> Result<Option<T>, Error<T>>>(
         &mut self,
@@ -81,12 +81,12 @@ impl<T: 'static, Key: 'static, const PAGE_SIZE: usize> Senders<T, Key, PAGE_SIZE
     }
 }
 
-pub(super) struct SenderPages<T: 'static, Key: 'static> {
+pub(super) struct SenderPages<T: 'static, Key: 'static + Copy> {
     pub(super) pages: Vec<Arc<[Sender<T, Key>]>>,
     pub(super) epoch: VarInt,
 }
 
-impl<T: 'static, Key: 'static> SenderPages<T, Key> {
+impl<T: 'static, Key: 'static + Copy> SenderPages<T, Key> {
     #[inline]
     pub(super) fn new(epoch: VarInt) -> Self {
         Self {

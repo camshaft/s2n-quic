@@ -16,6 +16,8 @@ pub struct Transmission<Info, Meta, Completion> {
     pub meta: Meta,
     pub transmission_time: Option<Timestamp>,
     pub completion: Option<Completion>,
+    #[cfg(debug_assertions)]
+    pub span: tracing::Span,
 }
 
 impl<Info, Meta, C> Transmission<Info, Meta, C>
@@ -26,6 +28,9 @@ where
     where
         F: FnOnce(&Addr, ExplicitCongestionNotification, &[IoSlice]) -> R,
     {
+        #[cfg(debug_assertions)]
+        let _span = self.span.enter();
+
         debug_assert!(!self.descriptors.is_empty());
         debug_assert!(self.descriptors.len() <= msg::segment::MAX_COUNT);
 

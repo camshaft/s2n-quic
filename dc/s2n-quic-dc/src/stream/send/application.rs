@@ -148,6 +148,17 @@ where
     where
         S: buffer::reader::storage::Infallible,
     {
+        #[cfg(debug_assertions)]
+        let _span = {
+            use s2n_quic_core::varint::VarInt;
+            let peer_addr = self.0.shared.remote_addr();
+            let flow_id = self.0.shared.credentials();
+            let local_queue_id = self.0.shared.local_queue_id().map(VarInt::as_u64);
+            let remote_queue_id = self.0.shared.remote_queue_id().as_u64();
+            tracing::warn_span!("poll_write_from", %peer_addr, %flow_id, local_queue_id, remote_queue_id, actor = "application::send")
+                .entered()
+        };
+
         let start_time = self.0.shared.clock.get_time();
         let provided_len = buf.buffered_len();
 
@@ -173,6 +184,20 @@ where
 
     /// Shutdown the stream for writing.
     pub fn shutdown(&mut self) -> io::Result<()> {
+        #[cfg(debug_assertions)]
+        let _span = {
+            let peer_addr = self.0.shared.remote_addr();
+            let flow_id = self.0.shared.credentials();
+            let local_queue_id = self
+                .0
+                .shared
+                .local_queue_id()
+                .map(s2n_quic_core::varint::VarInt::as_u64);
+            let remote_queue_id = self.0.shared.remote_queue_id().as_u64();
+            tracing::warn_span!("shutdown", %peer_addr, %flow_id, local_queue_id, remote_queue_id, actor = "application::send")
+                .entered()
+        };
+
         self.0.shutdown(ShutdownType::Explicit)
     }
 }
