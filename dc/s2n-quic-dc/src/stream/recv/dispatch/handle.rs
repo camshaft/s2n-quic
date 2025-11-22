@@ -145,11 +145,6 @@ impl<T: 'static, Key: 'static> Sender<T, Key> {
     }
 
     #[inline]
-    pub fn key(&self) -> Option<&Key> {
-        unsafe { self.descriptor.key() }
-    }
-
-    #[inline]
     pub fn send_stream(&self, item: T) -> Result<Option<T>, Error<T>> {
         unsafe {
             let prev = self.descriptor.stream_queue().push(item)?;
