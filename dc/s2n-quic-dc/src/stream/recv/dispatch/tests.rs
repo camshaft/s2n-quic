@@ -22,12 +22,19 @@ enum Op {
     DropDispatcher,
 }
 
+fn creds(key_id: u32) -> Credentials {
+    let id = credentials::Id::from([32u8; 16]);
+    let key_id = VarInt::from_u32(key_id);
+    Credentials { id, key_id }
+}
+
 struct Model {
     oracle: Oracle,
     alloc: Option<Allocator>,
     dispatch: Option<Dispatch>,
     #[allow(dead_code)]
     unroutable_packets: mpsc::Receiver<desc::Filled>,
+    key_id: u32,
 }
 
 impl Default for Model {
@@ -54,6 +61,7 @@ impl Model {
             alloc: Some(alloc),
             dispatch: Some(dispatch),
             unroutable_packets,
+            key_id: 0,
         }
     }
 
@@ -87,7 +95,9 @@ impl Model {
         let Some(alloc) = self.alloc.as_mut() else {
             return;
         };
-        let (control, stream) = alloc.alloc_or_grow(None);
+        let key_id = self.key_id;
+        self.key_id += 1;
+        let (control, stream) = alloc.alloc_or_grow(&creds(key_id));
         self.oracle.on_alloc(control, stream);
     }
 
@@ -280,8 +290,8 @@ fn alloc_drop_notify() {
         let control_cap = 1;
         let mut alloc = Allocator::new(stream_cap, control_cap);
 
-        for _ in 0..2 {
-            let (stream, control) = alloc.alloc_or_grow(None);
+        for id in 0..2 {
+            let (stream, control) = alloc.alloc_or_grow(&creds(id));
 
             async move {
                 stream.recv(Actor::Application).await.unwrap_err();
@@ -310,16 +320,13 @@ fn associated_credentials() {
     check!().exhaustive().run(|| {
         let mut alloc = Allocator::new(1, 1);
         let alloc = &mut alloc;
-        let mut key_id = VarInt::ZERO;
+        let mut key_id = 0;
         let key_id = &mut key_id;
 
         let mut alloc_one = move || {
-            let creds = Credentials {
-                id: credentials::Id::default(),
-                key_id: *key_id,
-            };
+            let creds = creds(*key_id);
             *key_id += 1;
-            let (stream, control) = alloc.alloc_or_grow(Some(&creds));
+            let (stream, control) = alloc.alloc_or_grow(&creds);
             let keys = alloc.pool.keys();
 
             move || {
@@ -385,8 +392,11 @@ fn stress_test() {
         });
 
         let alloc = s.spawn(move || {
+            let mut key_id = 0;
             while IS_OPEN.load(Ordering::Relaxed) {
-                let (control, stream) = alloc.alloc_or_grow(None);
+                let creds = creds(key_id);
+                key_id += 1;
+                let (control, stream) = alloc.alloc_or_grow(&creds);
                 stream_send.send(stream).unwrap();
                 control_send.send(control).unwrap();
             }

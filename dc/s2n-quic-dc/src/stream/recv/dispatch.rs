@@ -82,12 +82,12 @@ impl Allocator {
     }
 
     #[inline]
-    pub fn alloc(&self, key: Option<&Credentials>) -> Option<(Control, Stream)> {
+    pub fn alloc(&self, key: &Credentials) -> Option<(Control, Stream)> {
         self.pool.alloc(key)
     }
 
     #[inline]
-    pub fn alloc_or_grow(&mut self, key: Option<&Credentials>) -> (Control, Stream) {
+    pub fn alloc_or_grow(&mut self, key: &Credentials) -> (Control, Stream) {
         self.pool.alloc_or_grow(key)
     }
 }
@@ -107,14 +107,16 @@ impl Dispatch {
     pub fn send_control(
         &mut self,
         queue_id: VarInt,
-        _credentials: Option<&Credentials>,
+        credentials: Option<&Credentials>,
         segment: desc::Filled,
     ) -> Result<(), Error<()>> {
         let payload_len = segment.len();
         let res = self.senders.lookup(queue_id, segment, |sender, segment| {
-            // if credentials.is_some() && sender.key() != credentials {
-            //     return Err(Error::Unallocated(segment));
-            // }
+            if let Some(credentials) = credentials {
+                if sender.key() != credentials {
+                    return Err(Error::Unallocated(segment));
+                }
+            }
 
             sender.send_control(segment)
         });
@@ -145,14 +147,16 @@ impl Dispatch {
     pub fn send_stream(
         &mut self,
         queue_id: VarInt,
-        _credentials: Option<&Credentials>,
+        credentials: Option<&Credentials>,
         segment: desc::Filled,
     ) -> Result<(), Error<()>> {
         let payload_len = segment.len();
         let res = self.senders.lookup(queue_id, segment, |sender, segment| {
-            // if credentials.is_some() && sender.key() != credentials {
-            //     return Err(Error::Unallocated(segment));
-            // }
+            if let Some(credentials) = credentials {
+                if sender.key() != credentials {
+                    return Err(Error::Unallocated(segment));
+                }
+            }
 
             sender.send_stream(segment)
         });

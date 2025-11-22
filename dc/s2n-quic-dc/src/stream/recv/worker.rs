@@ -136,6 +136,14 @@ where
 
     #[inline]
     pub fn poll(&mut self, cx: &mut Context) -> Poll<()> {
+        #[cfg(debug_assertions)]
+        let _span = {
+            use s2n_quic_core::varint::VarInt;
+            let local_queue_id = self.shared.local_queue_id().map(VarInt::as_u64);
+            let remote_queue_id = self.shared.remote_queue_id().as_u64();
+            tracing::warn_span!("worker::recv::poll", local_queue_id, remote_queue_id).entered()
+        };
+
         s2n_quic_core::task::waker::debug_assert_contract(cx, |cx| {
             ready!(self.poll_impl(cx));
             tracing::trace!("read worker shutting down");
@@ -179,6 +187,10 @@ where
                 );
                 return Poll::Ready(());
             }
+        }
+
+        if self.should_transmit {
+            cx.waker().wake_by_ref();
         }
 
         Poll::Pending
@@ -469,6 +481,7 @@ where
         // Only transmit the last two packets we have pending
         if count > 2 {
             self.transmission_buffer.clear_head(count - 2);
+            debug_assert_eq!(self.transmission_buffer.len(), 2);
         }
 
         for (mut entry, _application_len) in self.transmission_buffer.drain() {

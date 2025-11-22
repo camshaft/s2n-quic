@@ -22,7 +22,12 @@ use s2n_quic_core::{
     varint::VarInt,
 };
 use std::{io, sync::Arc};
-use tracing::{debug_span, Instrument as _};
+use tracing::Instrument as _;
+
+#[cfg(not(debug_assertions))]
+use tracing::debug_span as worker_span;
+#[cfg(debug_assertions)]
+use tracing::warn_span as worker_span;
 
 use super::environment::{ReadWorkerSocket as _, WriteWorkerSocket as _};
 
@@ -181,15 +186,7 @@ where
 {
     let features = peer.features();
 
-    let (sockets, recv_buffer) = {
-        // Servers need to pass credentials to associate with queue entries
-        let credentials = if endpoint_type.is_server() {
-            Some(&crypto.credentials)
-        } else {
-            None
-        };
-        peer.setup(env, credentials)?
-    };
+    let (sockets, recv_buffer) = peer.setup(env, &crypto.credentials)?;
     let source_queue_id = sockets.source_queue_id;
 
     // construct shared reader state
@@ -313,6 +310,11 @@ where
         let socket = socket.setup();
         let shared = shared.clone();
 
+        let peer_addr = shared.remote_addr();
+        let flow_id = shared.credentials();
+        let local_queue_id = shared.local_queue_id().map(VarInt::as_u64);
+        let span = worker_span!("worker::read", %peer_addr, %flow_id, local_queue_id, actor = "worker::recv");
+
         let task = async move {
             let mut reader = recv::worker::Worker::new(socket, shared, endpoint_type, &parameters);
 
@@ -333,8 +335,6 @@ where
             .await;
         };
 
-        let span = debug_span!("worker::read");
-
         if span.is_disabled() {
             env.spawn_reader(task);
         } else {
@@ -346,6 +346,11 @@ where
     if let Some((worker, socket)) = writer.1 {
         let (socket, recv_buffer) = socket.setup();
         let shared = shared.clone();
+
+        let peer_addr = shared.remote_addr();
+        let flow_id = shared.credentials();
+        let local_queue_id = shared.local_queue_id().map(VarInt::as_u64);
+        let span = worker_span!("worker::write", %peer_addr, %flow_id, local_queue_id, actor = "worker::send");
 
         let task = async move {
             let mut writer = send::worker::Worker::new(
@@ -373,8 +378,6 @@ where
             })
             .await;
         };
-
-        let span = debug_span!("worker::write");
 
         if span.is_disabled() {
             env.spawn_writer(task);

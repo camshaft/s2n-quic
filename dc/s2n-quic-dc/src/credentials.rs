@@ -45,6 +45,12 @@ impl fmt::Debug for Id {
     }
 }
 
+impl fmt::Display for Id {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        format_args!("{:01x}", u128::from_be_bytes(self.0)).fmt(f)
+    }
+}
+
 impl From<[u8; 16]> for Id {
     #[inline]
     fn from(v: [u8; 16]) -> Self {
@@ -88,6 +94,12 @@ zerocopy_value_codec!(Id);
 pub struct Credentials {
     pub id: Id,
     pub key_id: KeyId,
+}
+
+impl fmt::Display for Credentials {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{}:{}", self.id, self.key_id)
+    }
 }
 
 impl Hash for Credentials {

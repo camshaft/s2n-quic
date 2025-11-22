@@ -156,7 +156,7 @@ impl PoolSocket {
         router: impl Router + Send + 'static,
         handle: &crate::busy_poll::Handle,
     ) {
-        let recv_socket = Tracing(BusyPoll(self.socket.clone()));
+        let recv_socket = BusyPoll(self.socket.clone());
         let task = udp::non_blocking(recv_socket, alloc, router);
         let span = tracing::trace_span!("recv_socket_worker");
         spawn_span!(span, task, |task| {
@@ -268,7 +268,7 @@ impl Pool {
 
     pub fn alloc(
         &self,
-        credentials: Option<&Credentials>,
+        credentials: &Credentials,
     ) -> (
         Control,
         Stream,
