@@ -2,7 +2,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
-    clock,
     credentials::Credentials,
     crypto::{self, UninitSlice},
     event,
