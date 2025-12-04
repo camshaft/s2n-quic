@@ -315,7 +315,10 @@ impl fmt::Debug for Filled {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.debug_struct("Filled")
             .field("id", &self.desc.id())
-            .field("remote_address", &self.remote_address().get())
+            .field(
+                "remote_address",
+                &format_args!("{}", self.remote_address().get()),
+            )
             .field("ecn", &self.ecn)
             .field("payload_len", &self.len)
             .finish()

@@ -6,7 +6,7 @@ use crate::{
     intrusive_queue::Queue,
     socket::send::{
         completion::{Completer as _, Completion},
-        transmission::{Entry, Transmission},
+        transmission::{self, Entry, Transmission},
         wheel::{WakerState, Wheel},
     },
     stream::socket::Socket,
@@ -53,7 +53,9 @@ where
         mut entry: Entry<Info, Meta, C>,
         socket: &S,
         clock: &Clk,
-    ) {
+    ) where
+        Meta: transmission::Meta<Info = Info>,
+    {
         // Record the transmission time to report accurate transmission
         let now = clock.get_time();
         entry.transmission_time = Some(now);
@@ -102,6 +104,7 @@ pub async fn non_blocking<S, T, Info, Meta, C, W, const GRANULARITY_US: u64>(
 ) where
     S: Socket,
     T: Timer,
+    Meta: transmission::Meta<Info = Info>,
     C: Completion<Info, Meta>,
     W: WakeMode,
 {
@@ -381,7 +384,10 @@ mod tests {
         clock::bach::Clock,
         socket::{
             pool::Pool,
-            send::completion::{Completer, Queue as CompletionQueue},
+            send::{
+                completion::{Completer, Queue as CompletionQueue},
+                transmission,
+            },
         },
         testing::{ext::*, sim},
     };
@@ -390,13 +396,31 @@ mod tests {
     use std::{convert::Infallible, net::SocketAddr, sync::Weak};
     use tracing::info;
 
+    #[derive(Clone, Copy, Debug, Default)]
+    struct Meta {
+        priority: u8,
+        payload_len: u16,
+    }
+
+    impl transmission::Meta for Meta {
+        type Info = u32;
+
+        fn span(
+            &self,
+            descriptors: &[(crate::socket::pool::descriptor::Filled, Self::Info)],
+        ) -> impl Drop + 'static {
+            tracing::warn_span!("transmission", ?self.priority, ?self.payload_len, ?descriptors)
+                .entered()
+        }
+    }
+
     // Helper to create a test transmission
     fn create_transmission(
         pool: &Pool,
         socket_addr: SocketAddr,
         payload_len: u16,
         priority: u8,
-    ) -> Transmission<u32, (u8, u16), ()> {
+    ) -> Transmission<u32, Meta, ()> {
         let descriptors = pool
             .alloc_or_grow()
             .fill_with(|addr, _cmsg, mut payload| {
@@ -419,14 +443,15 @@ mod tests {
             descriptors,
             total_len: payload_len,
             transmission_time: None,
-            meta: (priority, payload_len),
+            meta: Meta {
+                priority,
+                payload_len,
+            },
             completion: None,
-            #[cfg(debug_assertions)]
-            span: tracing::info_span!("transmission"),
         }
     }
 
-    fn new<Comp>(horizon: Duration) -> (Wheel<u32, (u8, u16), Comp, 8>, Pool, Clock) {
+    fn new<Comp>(horizon: Duration) -> (Wheel<u32, Meta, Comp, 8>, Pool, Clock) {
         let clock = Clock::default();
         let pool = Pool::new(u16::MAX, 16);
         let wheel = Wheel::new(horizon, &clock);
@@ -655,7 +680,7 @@ mod tests {
         });
     }
 
-    type SharedCompletionQueue = CompletionQueue<u32, (u8, u16), Weak<dyn AsShared>>;
+    type SharedCompletionQueue = CompletionQueue<u32, Meta, Weak<dyn AsShared>>;
 
     #[derive(Default)]
     struct Shared {
@@ -680,7 +705,7 @@ mod tests {
         }
     }
 
-    impl Completion<u32, (u8, u16)> for Weak<dyn AsShared> {
+    impl Completion<u32, Meta> for Weak<dyn AsShared> {
         type Completer = Arc<dyn AsShared>;
 
         fn upgrade(&self) -> Option<Self::Completer> {
@@ -688,8 +713,8 @@ mod tests {
         }
     }
 
-    impl Completer<u32, (u8, u16), Weak<dyn AsShared>> for Arc<dyn AsShared> {
-        fn complete(self, entry: Entry<u32, (u8, u16), Weak<dyn AsShared>>) {
+    impl Completer<u32, Meta, Weak<dyn AsShared>> for Arc<dyn AsShared> {
+        fn complete(self, entry: Entry<u32, Meta, Weak<dyn AsShared>>) {
             let shared = self.as_shared();
             shared.completion_queue.complete_transmission(entry);
         }
@@ -771,7 +796,10 @@ mod tests {
 
                             entry.descriptors = descriptors;
                             entry.total_len = payload_len;
-                            entry.meta = (sender_id as _, payload_len);
+                            entry.meta = Meta {
+                                priority: sender_id as _,
+                                payload_len,
+                            };
 
                             let tx_time = now + delay;
                             while let Err((e, time)) = wheel.insert(entry, Some(tx_time)) {
@@ -807,7 +835,10 @@ mod tests {
                                 info!(count, "draining completion queue");
 
                                 completion_queue.drain_completion_queue(|transmission| {
-                                    let (sender_id, _payload_len) = transmission.meta;
+                                    let Meta {
+                                        priority: sender_id,
+                                        payload_len: _,
+                                    } = transmission.meta;
                                     let packet_id = transmission.info;
                                     let tx_time = transmission.transmission_time;
                                     info!(packet_id, ?tx_time, "completed");

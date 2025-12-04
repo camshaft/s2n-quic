@@ -125,7 +125,7 @@ pub struct SocketSet<R, W = R> {
     pub write_worker: Option<W>,
     pub transmission_pool: pool::Sharded,
     pub remote_addr: SocketAddress,
-    pub source_queue_id: Option<VarInt>,
+    pub local_queue_id: Option<VarInt>,
 }
 
 type SetupResult<ReadWorker, WriteWorker> =

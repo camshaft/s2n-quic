@@ -124,6 +124,8 @@ where
         #[cfg(debug_assertions)]
         let _span = tracing::warn_span!("stream", %peer_addr, flow_id = %credentials).entered();
 
+        tracing::debug!(%peer_addr, flow_id = %credentials, "routing zero queue");
+
         // check to see if these credentials are associated with an active stream
         if let Some(queue_id) = self.dispatch.queue_id_for_key(&credentials) {
             tracing::trace!(%queue_id, "credential_cache_hit");
@@ -172,7 +174,9 @@ where
             &mut secret_control,
         ) {
             Ok(result) => result,
-            Err(_error) => {
+            Err(error) => {
+                tracing::debug!(?error, "failed to derive stream credentials");
+
                 if !secret_control.is_empty() {
                     let addr = msg::addr::Addr::new(peer_addr);
                     let ecn = Default::default();

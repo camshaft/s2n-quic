@@ -91,7 +91,7 @@ impl Config {
             reuse_port: false,
             // TODO tune these defaults
             stream_recv_queue: Capacity {
-                max: 4096,
+                max: u16::MAX as _,
                 initial: 256,
             },
 
@@ -155,7 +155,7 @@ impl Config {
     where
         S: Send + Sync + 'static + crate::stream::socket::Socket,
     {
-        let (tx, rx) = mpsc::new::<descriptor::Filled>(4096);
+        let (tx, rx) = mpsc::new::<descriptor::Filled>(u16::MAX as usize);
         let map = self.map.clone();
         let task = async move {
             let mut out_buffer = [0u8; 1500];
@@ -169,8 +169,9 @@ impl Config {
                 let params = match packet {
                     Packet::Stream(packet) => {
                         let credentials = *packet.credentials();
-                        let stream_id = *packet.stream_id();
-                        Some((credentials, stream_id.queue_id))
+                        packet
+                            .source_queue_id()
+                            .map(|queue_id| (credentials, queue_id))
                     }
                     Packet::Datagram(packet) => {
                         // datagrams are not routable
@@ -179,8 +180,9 @@ impl Config {
                     }
                     Packet::Control(packet) => {
                         let credentials = *packet.credentials();
-                        let stream_id = packet.stream_id();
-                        stream_id.map(|stream_id| (credentials, stream_id.queue_id))
+                        packet
+                            .source_queue_id()
+                            .map(|queue_id| (credentials, queue_id))
                     }
                     Packet::FlowReset(packet) => {
                         // Don't reply to flow reset packets to avoid looping
@@ -261,6 +263,7 @@ where
         let control = self.control;
         let stream = self.stream;
         let queue_id = control.queue_id();
+        debug_assert_eq!(queue_id, stream.queue_id());
 
         let local_addr: SocketAddress = self.worker_socket.local_addr()?.into();
         let application = Box::new(self.application_socket);
@@ -304,7 +307,7 @@ where
             write_worker,
             transmission_pool: self.transmission_pool,
             remote_addr,
-            source_queue_id: Some(queue_id),
+            local_queue_id: Some(queue_id),
         };
 
         let recv_buffer = RecvBuffer::B(buffer::Channel::new(stream));

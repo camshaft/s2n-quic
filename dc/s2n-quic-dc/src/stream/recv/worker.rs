@@ -559,6 +559,7 @@ where
             packet_space: PacketSpace::Recovery,
             has_more_app_data: false,
             final_offset: None,
+            span: Default::default(),
         };
 
         let transmission_alloc = || {

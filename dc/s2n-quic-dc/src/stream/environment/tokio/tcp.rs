@@ -50,7 +50,7 @@ where
             write_worker: None,
             remote_addr,
             transmission_pool,
-            source_queue_id: None,
+            local_queue_id: None,
         };
         Ok((socket, self.recv_buffer))
     }
@@ -91,7 +91,7 @@ where
             write_worker: None,
             remote_addr,
             transmission_pool,
-            source_queue_id: None,
+            local_queue_id: None,
         };
         Ok((socket, self.recv_buffer))
     }

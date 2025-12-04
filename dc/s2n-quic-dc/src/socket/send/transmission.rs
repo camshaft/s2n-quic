@@ -9,6 +9,12 @@ use std::{collections::VecDeque, io::IoSlice};
 
 pub type Entry<Info, Meta, Completion> = queue::Entry<Transmission<Info, Meta, Completion>>;
 
+pub trait Meta {
+    type Info;
+
+    fn span(&self, descriptors: &[(descriptor::Filled, Self::Info)]) -> impl Drop + 'static;
+}
+
 #[derive(Debug)]
 pub struct Transmission<Info, Meta, Completion> {
     pub descriptors: Vec<(descriptor::Filled, Info)>,
@@ -16,20 +22,18 @@ pub struct Transmission<Info, Meta, Completion> {
     pub meta: Meta,
     pub transmission_time: Option<Timestamp>,
     pub completion: Option<Completion>,
-    #[cfg(debug_assertions)]
-    pub span: tracing::Span,
 }
 
-impl<Info, Meta, C> Transmission<Info, Meta, C>
+impl<Info, M, C> Transmission<Info, M, C>
 where
-    C: Completion<Info, Meta>,
+    M: Meta<Info = Info>,
+    C: Completion<Info, M>,
 {
     pub fn send_with<F, R>(&self, f: F) -> R
     where
         F: FnOnce(&Addr, ExplicitCongestionNotification, &[IoSlice]) -> R,
     {
-        #[cfg(debug_assertions)]
-        let _span = self.span.enter();
+        let _span = self.meta.span(&self.descriptors);
 
         debug_assert!(!self.descriptors.is_empty());
         debug_assert!(self.descriptors.len() <= msg::segment::MAX_COUNT);

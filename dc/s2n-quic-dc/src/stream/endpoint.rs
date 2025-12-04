@@ -187,7 +187,8 @@ where
     let features = peer.features();
 
     let (sockets, recv_buffer) = peer.setup(env, &crypto.credentials)?;
-    let source_queue_id = sockets.source_queue_id;
+    let local_queue_id = sockets.local_queue_id;
+    let remote_queue_id = stream_id.queue_id;
 
     // construct shared reader state
     let reader = recv::shared::State::new(
@@ -200,6 +201,8 @@ where
     );
 
     let writer = {
+        let _span = worker_span!("shared::writer", local_queue_id = %local_queue_id.unwrap(), peer_addr = %sockets.remote_addr, flow_id = %crypto.credentials).entered();
+
         let worker = sockets
             .write_worker
             .map(|socket| (send::state::State::new(stream_id, &parameters), socket));
@@ -255,7 +258,7 @@ where
 
         let last_peer_activity = unsafe { now.as_duration().as_micros() as u64 }.into();
 
-        let local_queue_id = if let Some(id) = source_queue_id {
+        let local_queue_id = if let Some(id) = local_queue_id {
             id.as_u64()
         } else {
             // use MAX as `None`
@@ -267,7 +270,7 @@ where
             clock: env.clock().clone(),
             gso: env.gso(),
             remote_port: remote_addr.port().into(),
-            remote_queue_id: stream_id.queue_id.as_u64().into(),
+            remote_queue_id: remote_queue_id.as_u64().into(),
             local_queue_id,
             last_peer_activity,
             fixed,

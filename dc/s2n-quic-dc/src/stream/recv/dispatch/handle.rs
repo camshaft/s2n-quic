@@ -145,7 +145,7 @@ impl<T: 'static, Key: 'static + Copy> Sender<T, Key> {
     }
 
     #[inline]
-    pub fn key(&self) -> &Key {
+    pub fn key(&self) -> Option<Key> {
         unsafe { self.descriptor.key() }
     }
 
