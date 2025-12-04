@@ -124,12 +124,14 @@ where
     Key: 'static + Copy + Send + Sync + Eq + Hash,
 {
     #[inline]
-    fn free(&self, descriptor: Descriptor<T, Key>) -> Option<Box<dyn 'static + Send>> {
+    fn free(&self, mut descriptor: Descriptor<T, Key>) -> Option<Box<dyn 'static + Send>> {
         let key = unsafe {
             // SAFETY: the descriptor is only owned by the free list
-            descriptor.key()
+            descriptor.take_key()
         };
-        self.keys.remove(key);
+        if let Some(key) = key {
+            self.keys.remove(&key);
+        }
 
         let mut inner = self.inner.lock().unwrap();
 

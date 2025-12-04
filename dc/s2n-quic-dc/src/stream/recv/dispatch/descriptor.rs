@@ -11,7 +11,6 @@ use s2n_quic_core::{ensure, varint::VarInt};
 use std::{
     cell::UnsafeCell,
     marker::PhantomData,
-    mem::MaybeUninit,
     ptr::NonNull,
     sync::{
         atomic::{AtomicUsize, Ordering},
@@ -73,8 +72,15 @@ impl<T: 'static, Key: 'static + Copy> Descriptor<T, Key> {
     }
 
     #[inline]
-    pub unsafe fn key(&self) -> &Key {
-        { &*self.inner().key.get() }.assume_init_ref()
+    pub unsafe fn key(&self) -> Option<Key> {
+        {
+            *self.inner().key.get()
+        }
+    }
+
+    #[inline]
+    pub unsafe fn take_key(&mut self) -> Option<Key> {
+        { &mut *self.inner().key.get() }.take()
     }
 
     /// # Safety
@@ -110,7 +116,7 @@ impl<T: 'static, Key: 'static + Copy> Descriptor<T, Key> {
 
         // set the key on the descriptor
         // SAFETY: the descriptor is fully owned by the caller
-        inner.key.get().write(MaybeUninit::new(key));
+        inner.key.get().write(Some(key));
 
         probes::on_receiver_open(inner.id);
 
@@ -176,7 +182,7 @@ unsafe impl<T: Sync, Key: Sync> Sync for Descriptor<T, Key> {}
 
 pub(super) struct DescriptorInner<T, Key> {
     id: VarInt,
-    key: UnsafeCell<MaybeUninit<Key>>,
+    key: UnsafeCell<Option<Key>>,
     stream: Queue<T>,
     control: Queue<T>,
     /// A reference back to the free list
@@ -195,7 +201,7 @@ impl<T, Key> DescriptorInner<T, Key> {
         let control = Queue::new(control, Half::Control);
         Self {
             id,
-            key: UnsafeCell::new(MaybeUninit::uninit()),
+            key: UnsafeCell::new(None),
             stream,
             control,
             senders: AtomicUsize::new(0),

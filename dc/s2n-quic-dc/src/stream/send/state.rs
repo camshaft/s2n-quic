@@ -1172,6 +1172,7 @@ impl State {
                     packet_space: PacketSpace::Recovery,
                     has_more_app_data: true,
                     final_offset: self.fin.value(),
+                    span: Default::default(),
                 };
 
                 let event = transmission::Event {
@@ -1293,6 +1294,7 @@ impl State {
                     packet_space: PacketSpace::Recovery,
                     has_more_app_data: false,
                     final_offset,
+                    span: Default::default(),
                 };
 
                 transmission::Event {

@@ -10,7 +10,7 @@ use crate::{
     stream::send::shared,
 };
 use bitflags::bitflags;
-use core::ops::Bound;
+use core::{fmt, ops::Bound};
 use s2n_quic_core::{inet::ExplicitCongestionNotification, time::Timestamp, varint::VarInt};
 use std::sync::Weak;
 
@@ -36,11 +36,33 @@ pub struct Event {
 pub type Queue = completion::Queue<PacketInfo, Meta, Weak<dyn shared::AsShared>>;
 pub type CompleteTransmission<'a> = completion::CompleteTransmission<'a, PacketInfo, Meta>;
 
+#[derive(Clone)]
+pub struct SenderSpan {
+    #[cfg(debug_assertions)]
+    span: tracing::Span,
+}
+
+impl fmt::Debug for SenderSpan {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SenderSpan").finish()
+    }
+}
+
+impl Default for SenderSpan {
+    fn default() -> Self {
+        Self {
+            #[cfg(debug_assertions)]
+            span: tracing::warn_span!("sender"),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct Meta {
     pub packet_space: PacketSpace,
     pub has_more_app_data: bool,
     pub final_offset: Option<VarInt>,
+    pub span: SenderSpan,
 }
 
 impl Default for Meta {
@@ -49,8 +71,21 @@ impl Default for Meta {
             packet_space: PacketSpace::Stream,
             has_more_app_data: false,
             final_offset: None,
+            span: Default::default(),
         }
     }
+}
+
+impl crate::socket::send::transmission::Meta for Meta {
+    type Info = PacketInfo;
+
+    #[cfg(debug_assertions)]
+    fn span(&self, transmissions: &[(descriptor::Filled, PacketInfo)]) -> impl Drop + 'static {
+        tracing::warn_span!(parent: &self.span.span, "transmission", ?self.packet_space, ?transmissions).entered()
+    }
+
+    #[cfg(not(debug_assertions))]
+    fn span(&self, _transmissions: &[(descriptor::Filled, PacketInfo)]) -> impl Drop + 'static {}
 }
 
 bitflags! {

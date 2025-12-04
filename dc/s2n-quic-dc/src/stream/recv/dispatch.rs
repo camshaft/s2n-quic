@@ -112,10 +112,10 @@ impl Dispatch {
     ) -> Result<(), Error<()>> {
         let payload_len = segment.len();
         let res = self.senders.lookup(queue_id, segment, |sender, segment| {
-            if let Some(credentials) = credentials {
-                if sender.key() != credentials {
-                    return Err(Error::Unallocated(segment));
-                }
+            let key = sender.key();
+            if credentials.is_some() && key.as_ref() != credentials {
+                tracing::debug!(%queue_id, expected = %credentials.unwrap(), actual = ?key, "credential mismatch");
+                return Err(Error::Unallocated(segment));
             }
 
             sender.send_control(segment)
@@ -137,6 +137,8 @@ impl Dispatch {
                 Err(queue::Error::Closed)
             }
             Err(Error::Unallocated(segment)) => {
+                tracing::debug!(remote_addr = %segment.remote_address().get(), "unroutable packet");
+
                 let _ = self.on_unroutable.send_back(segment);
                 Err(queue::Error::Unallocated(()))
             }
@@ -152,10 +154,10 @@ impl Dispatch {
     ) -> Result<(), Error<()>> {
         let payload_len = segment.len();
         let res = self.senders.lookup(queue_id, segment, |sender, segment| {
-            if let Some(credentials) = credentials {
-                if sender.key() != credentials {
-                    return Err(Error::Unallocated(segment));
-                }
+            let key = sender.key();
+            if credentials.is_some() && key.as_ref() != credentials {
+                tracing::debug!(%queue_id, expected = %credentials.unwrap(), actual = ?key, "credential mismatch");
+                return Err(Error::Unallocated(segment));
             }
 
             sender.send_stream(segment)
@@ -177,6 +179,8 @@ impl Dispatch {
                 Err(queue::Error::Closed)
             }
             Err(Error::Unallocated(segment)) => {
+                tracing::debug!(remote_addr = %segment.remote_address().get(), "unroutable packet");
+
                 let _ = self.on_unroutable.send_back(segment);
                 Err(queue::Error::Unallocated(()))
             }
@@ -260,11 +264,16 @@ impl crate::socket::recv::router::Router for Dispatch {
         &mut self,
         _tag: packet::secret_control::flow_reset::Tag,
         queue_id: VarInt,
-        _credentials: Credentials,
+        credentials: Credentials,
         segment: desc::Filled,
     ) {
         let payload_len = segment.len();
         let res = self.senders.lookup(queue_id, segment, |sender, segment| {
+            let key = sender.key();
+            if key != Some(credentials) {
+                return Err(Error::Unallocated(segment));
+            }
+
             // try to send to the stream queue first and fall back to the control queue
             match sender.send_stream(segment) {
                 Ok(v) => Ok(v),

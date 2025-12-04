@@ -148,6 +148,7 @@ impl State {
                     has_more_app_data,
                     packet_space: PacketSpace::Stream,
                     final_offset,
+                    span: Default::default(),
                 };
 
                 transmission::Event {
