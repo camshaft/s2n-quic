@@ -13,6 +13,9 @@ use std::{
 
 pub mod clock;
 
+#[cfg(test)]
+mod tests;
+
 #[derive(Clone)]
 pub struct Pool {
     handles: Arc<[Handle]>,
