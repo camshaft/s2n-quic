@@ -23,7 +23,7 @@ jobs:
   qns_release:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
         with:
           submodules: true
 
@@ -46,7 +46,7 @@ jobs:
           fi
           echo "tags=${TAGS}" >> $GITHUB_OUTPUT
 
-      - uses: aws-actions/configure-aws-credentials@v5.1.0
+      - uses: aws-actions/configure-aws-credentials@v5.1.1
         if: github.event_name == 'push' || github.repository == github.event.pull_request.head.repo.full_name
         with:
           role-to-assume: arn:aws:iam::024603541914:role/GitHubOIDCEcrRole

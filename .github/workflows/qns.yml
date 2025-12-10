@@ -43,11 +43,11 @@ jobs:
     outputs:
       matrix: ${{ steps.implementations.outputs.matrix }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
         with:
           path: s2n-quic
 
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
         with:
           repository: marten-seemann/quic-interop-runner
           ref: ${{ env.INTEROP_RUNNER_REF }}
@@ -83,7 +83,7 @@ jobs:
     env:
       RUSTFLAGS: "-g --cfg s2n_internal_dev --cfg s2n_quic_dump_on_panic --cfg s2n_quic_unstable"
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
         with:
           submodules: true
 
@@ -116,7 +116,7 @@ jobs:
     strategy:
       matrix: ${{ fromJson(needs.env.outputs.matrix) }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
         with:
           path: s2n-quic
 
@@ -148,7 +148,7 @@ jobs:
           docker build . --file Dockerfile --target prebuilt --tag aws/s2n-quic-qns --build-arg tls=s2n-tls
           docker build . --file Dockerfile --target prebuilt --tag aws/s2n-quic-qns-rustls --build-arg tls=rustls
 
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
         with:
           repository: marten-seemann/quic-interop-runner
           ref: ${{ env.INTEROP_RUNNER_REF }}
@@ -224,7 +224,7 @@ jobs:
                 $from
           done
 
-      - uses: aws-actions/configure-aws-credentials@v5.1.0
+      - uses: aws-actions/configure-aws-credentials@v5.1.1
         if: github.event_name == 'push' || github.event_name == 'schedule' || github.repository == github.event.pull_request.head.repo.full_name
         with:
           role-to-assume: arn:aws:iam::024603541914:role/GitHubOIDCRole
@@ -259,7 +259,7 @@ jobs:
     runs-on: ubuntu-22.04
     needs: [interop]
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
 
       - uses: actions/download-artifact@v6
         with:
@@ -322,7 +322,7 @@ jobs:
             results/**/result.json > \
               web/logs/latest/result.json
 
-      - uses: aws-actions/configure-aws-credentials@v5.1.0
+      - uses: aws-actions/configure-aws-credentials@v5.1.1
         if: github.event_name == 'push' || github.event_name == 'schedule' || github.repository == github.event.pull_request.head.repo.full_name
         with:
           role-to-assume: arn:aws:iam::024603541914:role/GitHubOIDCRole
@@ -367,7 +367,7 @@ jobs:
         tls: ["s2n-tls", "rustls"]
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
 
       - uses: actions/download-artifact@v6
         with:
@@ -393,7 +393,7 @@ jobs:
             server: "s2n-quic-null"
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
         with:
           submodules: true
 
@@ -463,7 +463,7 @@ jobs:
     runs-on: ubuntu-22.04
     needs: [perf]
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
 
       # add any additional perf tests here
       - uses: actions/download-artifact@v6
@@ -480,7 +480,7 @@ jobs:
           cd perf-results
           tree -H "." -T "Performance Results" --noreport --charset utf-8 > index.html
 
-      - uses: aws-actions/configure-aws-credentials@v5.1.0
+      - uses: aws-actions/configure-aws-credentials@v5.1.1
         if: github.event_name == 'push' || github.event_name == 'schedule' || github.repository == github.event.pull_request.head.repo.full_name
         with:
           role-to-assume: arn:aws:iam::024603541914:role/GitHubOIDCRole
@@ -517,7 +517,7 @@ jobs:
         attack: ["udp"]
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
 
       - name: Install rust toolchain
         id: toolchain
@@ -576,7 +576,7 @@ jobs:
     if: always() && needs.retry-failures.result == 'skipped'
     needs: [retry-failures, env, s2n-quic-qns, interop, interop-report, h3spec, perf, perf-report, attack]
     steps:
-      - uses: aws-actions/configure-aws-credentials@v5.1.0
+      - uses: aws-actions/configure-aws-credentials@v5.1.1
         if: github.event_name != 'pull_request'
         with:
           role-to-assume: arn:aws:iam::003495580562:role/GitHubOIDCRole
