@@ -724,3 +724,34 @@ The wheel-based model eliminates partial sends because:
 - Blocking on token bucket happens before attempting to send
 
 This simplification removes a significant source of complexity and edge cases. The wheel-based architecture guarantees that either all packets in a transmission are sent or none are sent, eliminating the need to track partial progress. This makes the code more reliable and easier to reason about, while also simplifying error handling and recovery logic.
+
+---
+
+## Status Tracking
+
+See `WORK_ITEM_STATUS.md` for detailed status of each work item, assignments, and progress tracking.
+
+See `TEST_COVERAGE_PLAN.md` for comprehensive test plans for each work item.
+
+See `INVESTIGATION_SUMMARY.md` for high-level overview and implementation plan.
+
+### Quick Status Overview
+
+| # | Work Item | Status |
+|---|-----------|--------|
+| 1 | Pool Integration in Environment Layer | 🔴 Not Started |
+| 2 | Stream Completion Queue Setup | 🔴 Not Started |
+| 3 | Replace Queue with Wheel-Based Transmission | 🔴 Not Started |
+| 4 | Refactor msg/send.rs to Use Descriptor Pool | 🔴 Not Started |
+| 5 | Remove Pacer and Implement Flow-Based Backpressure | 🔴 Not Started |
+| 6 | Update Worker Transmission Logic | 🔴 Not Started |
+| 7 | Update State's Transmission Creation | 🔴 Not Started |
+| 8 | Integrate CCA Pacing with Wheel | 🔴 Not Started |
+| 9 | Configure Transmission Limits | 🔴 Not Started |
+| 10 | Handle Retransmissions with Copying | 🔴 Not Started |
+| 11 | Update Receive Side for Pool-Based ACKs | 🔴 Not Started |
+| 12 | Wire Up Pool Through Stream Creation | 🔴 Not Started |
+| 13 | Update Transmission Info for GSO | 🔴 Not Started |
+| 14 | Remove Partial Send Handling | 🔴 Not Started |
+
+**Status Legend**: 🔴 Not Started | 🟡 In Progress | 🟢 Complete | 🔵 Blocked
