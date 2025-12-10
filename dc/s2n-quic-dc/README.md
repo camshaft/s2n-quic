@@ -7,9 +7,15 @@ This directory contains the s2n-quic-dc crate implementation and documentation.
 ### Technical Specifications
 - **`udp-improvements.md`** - Detailed technical specification of UDP send path improvements
   - 14 work items with implementation details
-  - Architecture diagrams
   - Reasoning for design decisions
   - Status tracking table
+
+- **`DIAGRAMS.md`** - Visual architecture diagrams
+  - Current vs new architecture
+  - Work item dependencies
+  - Implementation timeline
+  - Data flow sequences
+  - Component interactions
 
 ### Project Management
 - **`INVESTIGATION_SUMMARY.md`** - High-level overview and investigation results
@@ -39,16 +45,18 @@ This directory contains the s2n-quic-dc crate implementation and documentation.
 
 ### For Team Leads
 1. Read `INVESTIGATION_SUMMARY.md` for overview
-2. Review `WORK_ITEM_STATUS.md` for current status
-3. Assign work items to team members
-4. Track progress in `WORK_ITEM_STATUS.md`
+2. View `DIAGRAMS.md` for visual architecture
+3. Review `WORK_ITEM_STATUS.md` for current status
+4. Assign work items to team members
+5. Track progress in `WORK_ITEM_STATUS.md`
 
 ### For Developers
 1. Read `INVESTIGATION_SUMMARY.md` for context
-2. Find your assigned work item in `WORK_ITEM_STATUS.md`
-3. Read the detailed specification in `udp-improvements.md`
-4. Review test plans in `TEST_COVERAGE_PLAN.md`
-5. Implement code and tests together
+2. View `DIAGRAMS.md` for visual understanding
+3. Find your assigned work item in `WORK_ITEM_STATUS.md`
+4. Read the detailed specification in `udp-improvements.md`
+5. Review test plans in `TEST_COVERAGE_PLAN.md`
+6. Implement code and tests together
 
 ### For Reviewers
 1. Check `WORK_ITEM_STATUS.md` for item being reviewed
@@ -105,6 +113,7 @@ cargo bench -p s2n-quic-dc-benches
 
 ## Questions?
 
+- Architecture questions: See `DIAGRAMS.md` for visual explanations
 - Technical questions: See `udp-improvements.md` for detailed reasoning
 - Status questions: Check `WORK_ITEM_STATUS.md`
 - Test questions: See `TEST_COVERAGE_PLAN.md`

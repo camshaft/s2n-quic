@@ -6,6 +6,7 @@ This investigation provides a comprehensive analysis of the UDP send path improv
 
 **Key Documents**:
 - **This file**: Overview and navigation
+- `DIAGRAMS.md`: Visual architecture diagrams
 - `udp-improvements.md`: Technical specification of all changes
 - `WORK_ITEM_STATUS.md`: Status tracking and team coordination
 - `TEST_COVERAGE_PLAN.md`: Detailed test plans for each work item
@@ -466,6 +467,7 @@ Use `WORK_ITEM_STATUS.md` to track assignments. Update the "Assigned To" field f
 ## Resources
 
 ### Documentation
+- `DIAGRAMS.md` - Visual architecture and flow diagrams
 - `udp-improvements.md` - Technical specification
 - `WORK_ITEM_STATUS.md` - Status tracking
 - `TEST_COVERAGE_PLAN.md` - Detailed test plans
