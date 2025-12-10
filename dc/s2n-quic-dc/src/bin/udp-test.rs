@@ -7,11 +7,14 @@
 //! It can run as either a server (echoing packets back) or a client (sending bursts).
 
 use clap::{Parser, Subcommand};
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::os::fd::AsRawFd;
 use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
 
+// Socket option constants for busy polling
+// These are defined in Linux's socket.h but may not be in all versions of libc crate
 const SO_BUSY_POLL: libc::c_int = 46;
 const SO_PREFER_BUSY_POLL: libc::c_int = 69;
 
@@ -116,7 +119,12 @@ fn enable_busy_poll(socket: &UdpSocket, busy_poll_us: u32) -> std::io::Result<()
 }
 
 async fn run_server(ip: String, port: u16, busy_poll_us: u32) -> std::io::Result<()> {
-    let addr: SocketAddr = format!("{}:{}", ip, port).parse().unwrap();
+    let addr: SocketAddr = format!("{}:{}", ip, port).parse().map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("Invalid IP or port: {}", e),
+        )
+    })?;
     let socket = UdpSocket::bind(addr).await?;
 
     // Enable busy polling
@@ -173,7 +181,15 @@ async fn run_client(
     payload_size: usize,
     busy_poll_us: u32,
 ) -> std::io::Result<()> {
-    let server_addr: SocketAddr = format!("{}:{}", server_ip, server_port).parse().unwrap();
+    let server_addr: SocketAddr =
+        format!("{}:{}", server_ip, server_port)
+            .parse()
+            .map_err(|e| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("Invalid server IP or port: {}", e),
+                )
+            })?;
     let socket = UdpSocket::bind("0.0.0.0:0").await?;
 
     // Enable busy polling
@@ -203,7 +219,9 @@ async fn run_client(
         let mut burst_sent = 0;
         let mut burst_received = 0;
         let burst_start = Instant::now();
-        let send_start = Instant::now();
+
+        // Track send times for each packet in the burst
+        let mut send_times: HashMap<u64, Instant> = HashMap::new();
 
         // Send burst
         for seq in 0..burst_size {
@@ -212,10 +230,12 @@ async fn run_client(
             // Encode sequence number in first 8 bytes
             payload[..8].copy_from_slice(&(global_seq as u64).to_be_bytes());
 
+            let send_time = Instant::now();
             match socket.send_to(&payload, server_addr).await {
                 Ok(_) => {
                     burst_sent += 1;
                     total_sent += 1;
+                    send_times.insert(global_seq as u64, send_time);
                 }
                 Err(e) => {
                     eprintln!("Error sending packet {}: {}", global_seq, e);
@@ -238,12 +258,16 @@ async fn run_client(
                         burst_received += 1;
                         total_received += 1;
 
-                        // Calculate approximate RTT for this burst
-                        // (from first send to receive time)
-                        let rtt = send_start.elapsed().as_micros() as u64;
-                        total_rtt_us += rtt;
-                        min_rtt_us = min_rtt_us.min(rtt);
-                        max_rtt_us = max_rtt_us.max(rtt);
+                        // Extract sequence number from received packet
+                        let seq = u64::from_be_bytes(recv_buf[..8].try_into().unwrap());
+
+                        // Calculate RTT for this specific packet
+                        if let Some(send_time) = send_times.get(&seq) {
+                            let rtt = send_time.elapsed().as_micros() as u64;
+                            total_rtt_us += rtt;
+                            min_rtt_us = min_rtt_us.min(rtt);
+                            max_rtt_us = max_rtt_us.max(rtt);
+                        }
                     }
                 }
                 Ok(Err(e)) => {
