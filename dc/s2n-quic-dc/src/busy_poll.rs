@@ -190,7 +190,6 @@ impl Tasks {
         for (idx, slot) in self.slots.iter_mut().enumerate() {
             if let Some(task) = slot {
                 if task.task.as_mut().poll(cx).is_ready() {
-                    eprintln!("task {idx} done");
                     *slot = None;
                     self.free.push(idx);
                 }

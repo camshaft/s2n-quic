@@ -12,6 +12,7 @@
 //! 4. The runner stops when all handles are dropped
 
 use super::*;
+use parking_lot::Mutex;
 use std::sync::{
     atomic::{AtomicBool, AtomicU32, Ordering},
     Arc,
