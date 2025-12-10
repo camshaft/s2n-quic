@@ -4,6 +4,8 @@ This directory contains the s2n-quic-dc crate implementation and documentation.
 
 ## Documentation Overview
 
+**Quick Start**: See `QUICK_REFERENCE.md` for a one-page overview!
+
 ### Technical Specifications
 - **`udp-improvements.md`** - Detailed technical specification of UDP send path improvements
   - 14 work items with implementation details
