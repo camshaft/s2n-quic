@@ -1116,7 +1116,6 @@ impl State {
 
             let packet_number =
                 VarInt::new(self.recovery_packet_number).expect("2^62 is a lot of packets");
-            self.recovery_packet_number += 1;
 
             let packet_len = {
                 let buffer = info.descriptor.payload_mut();
@@ -1197,6 +1196,9 @@ impl State {
 
                 packets.push(event, descriptor);
             }
+
+            // Only increment the recovery packet number after successfully pushing the packet
+            self.recovery_packet_number += 1;
         }
 
         Ok(())
@@ -1225,7 +1227,6 @@ impl State {
 
                 let packet_number =
                     VarInt::new(self.recovery_packet_number).expect("2^62 is a lot of packets");
-                self.recovery_packet_number += 1;
 
                 let offset = self.max_data.max_sent_offset();
                 let final_offset = self.fin.try_transmit();
@@ -1307,6 +1308,9 @@ impl State {
             if res.is_none() {
                 break;
             }
+
+            // Only increment the recovery packet number after successfully pushing the packet
+            self.recovery_packet_number += 1;
 
             if self.pto.transmissions() > 0 {
                 self.pto.on_transmit_once();
