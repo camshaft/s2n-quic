@@ -1,78 +1,51 @@
-// Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
-// SPDX-License-Identifier: Apache-2.0
+//! Common stream types and configuration shared between client and server.
 
-use core::time::Duration;
+/// Backpressure configuration for a transfer.
+///
+/// These limits control when the receiver stops issuing PULL_REQUEST messages
+/// to apply backpressure on the sender.
+#[derive(Clone, Debug)]
+pub struct Backpressure {
+    /// Maximum number of messages that can be queued before backpressure is applied.
+    ///
+    /// When this limit is reached, no more PULL_REQUEST messages will be issued
+    /// until messages are consumed by the application.
+    pub max_message_queue_depth: usize,
 
-/// The maximum time a stream will be open without activity from the peer
-pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
-/// The maximum length of a single packet written to a stream
-pub const MAX_DATAGRAM_SIZE: usize = 1 << 15; // 32k
-
-pub use crate::stream::socket::Protocol;
-
-pub mod application;
-pub mod client;
-pub mod crypto;
-pub mod endpoint;
-pub mod environment;
-pub mod pacer;
-pub mod packet_map;
-pub mod packet_number;
-pub mod processing;
-pub mod recv;
-pub mod runtime;
-pub mod send;
-pub mod server;
-pub mod shared;
-pub mod socket;
-
-#[cfg(any(test, feature = "testing"))]
-pub mod testing;
-#[cfg(test)]
-mod tests;
-
-bitflags::bitflags! {
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    pub struct TransportFeatures: u8 {
-        /// The underlying transport guarantees transmission
-        const RELIABLE = 1;
-        /// The underlying transport provides flow control
-        const FLOW_CONTROL = 2;
-        /// The underlying transport provides stream abstractions
-        const STREAM = 3;
-        /// The underlying transport provides connections between peers
-        const CONNECTED = 4;
-    }
+    /// Maximum number of bytes that can be buffered before backpressure is applied.
+    ///
+    /// This limit can be exceeded to complete a partially-buffered message,
+    /// preventing deadlock scenarios.
+    pub max_buffered_bytes: usize,
 }
 
-impl Default for TransportFeatures {
-    #[inline]
+impl Default for Backpressure {
     fn default() -> Self {
-        TransportFeatures::empty()
+        Self {
+            max_message_queue_depth: 16,
+            max_buffered_bytes: 1024 * 1024, // 1 MB
+        }
     }
 }
 
-macro_rules! is_feature {
-    ($is_feature:ident, $NAME:ident) => {
-        #[inline]
-        pub const fn $is_feature(&self) -> bool {
-            self.contains(Self::$NAME)
-        }
-    };
-}
+/// Errors that can occur during stream operations.
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    #[error("peer unreachable")]
+    PeerUnreachable,
 
-impl TransportFeatures {
-    pub const TCP: Self = Self::all();
-    pub const UDP: Self = Self::empty();
+    #[error("dependency failed")]
+    DependencyFailed,
 
-    is_feature!(is_reliable, RELIABLE);
-    is_feature!(is_flow_controlled, FLOW_CONTROL);
-    is_feature!(is_stream, STREAM);
-    is_feature!(is_connected, CONNECTED);
-}
+    #[error("transfer timed out")]
+    TransferTimeout,
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Actor {
-    Application,
-    Worker,
+    #[error("stream open timed out")]
+    OpenTimeout,
+
+    #[error("stream closed without error")]
+    Closed,
+
+    #[error("stream reset with code {0}")]
+    Reset(u32),
 }
