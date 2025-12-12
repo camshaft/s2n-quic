@@ -1,5 +1,5 @@
 use bitflags::bitflags;
-use core::{fmt, ptr::NonNull};
+use core::{ffi::CStr, fmt, ptr::NonNull};
 use ofi_libfabric_sys::bindgen::*;
 
 #[macro_use]
@@ -15,6 +15,44 @@ impl Default for Version {
 }
 
 impl Version {}
+
+pub struct Error(i32);
+
+impl Error {
+    pub fn code(&self) -> i32 {
+        self.0
+    }
+
+    pub fn message(&self) -> Option<&'static str> {
+        let msg = unsafe { fi_strerror(self.0) };
+        if msg.is_null() {
+            return None;
+        }
+        unsafe { CStr::from_ptr(msg).to_str().ok() }
+    }
+}
+
+impl fmt::Debug for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Error")
+            .field("code", &self.code())
+            .field("message", &self.message())
+            .finish()
+    }
+}
+
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let msg = self.message().unwrap_or("unknown error");
+        write!(f, "{msg}")
+    }
+}
+
+impl Error {
+    pub fn from_code(code: i32) -> Self {
+        Self(code)
+    }
+}
 
 bitflags! {
     #[derive(Clone, Copy, Debug)]
@@ -321,10 +359,10 @@ pub mod info {
     pub struct Info {
         #[allow(dead_code)]
         storage: Arc<Inner>,
-        info: InnerInfo,
+        pub(super) info: InnerInfo,
     }
 
-    struct InnerInfo(NonNull<fi_info>);
+    pub(super) struct InnerInfo(pub(super) NonNull<fi_info>);
 
     impl ops::Deref for InnerInfo {
         type Target = fi_info;
@@ -399,6 +437,7 @@ pub mod endpoint {
     #![allow(non_camel_case_types)]
 
     use super::*;
+    use std::sync::{Arc, Mutex};
 
     define_enum!(
         pub enum Type {
@@ -430,6 +469,312 @@ pub mod endpoint {
             Unspecified = FI_PROTO_UNSPEC,
         }
     );
+
+    pub struct Endpoint {
+        inner: Arc<Inner>,
+    }
+
+    struct Inner {
+        fid: NonNull<fid_ep>,
+        completion_queues: Mutex<Vec<completion_queue::CompletionQueue>>,
+        address_vectors: Mutex<Vec<address_vector::AddressVector>>,
+    }
+
+    impl Endpoint {
+        /// Open an endpoint from a domain
+        pub fn open(domain: &domain::Domain, info: &info::Info) -> Result<Self, Error> {
+            let mut ep_ptr: *mut fid_ep = core::ptr::null_mut();
+            let ret = unsafe {
+                fi_endpoint(
+                    domain.as_ptr(),
+                    info.info.0.as_ptr(),
+                    &mut ep_ptr,
+                    core::ptr::null_mut(),
+                )
+            };
+
+            if ret != 0 {
+                return Err(Error::from_code(ret));
+            }
+
+            let fid = NonNull::new(ep_ptr).expect("endpoint pointer was null");
+            let inner = Arc::new(Inner {
+                fid,
+                completion_queues: Default::default(),
+                address_vectors: Default::default(),
+            });
+            Ok(Self { inner })
+        }
+
+        /// Bind a completion queue to the endpoint
+        ///
+        /// Flags should be FI_TRANSMIT, FI_RECV, or both (FI_TRANSMIT | FI_RECV)
+        pub fn bind_cq(
+            &self,
+            cq: &completion_queue::CompletionQueue,
+            flags: u64, // TODO make this a bitflag struct
+        ) -> Result<(), Error> {
+            let ret = unsafe {
+                fi_ep_bind(
+                    self.inner.fid.as_ptr(),
+                    &mut (*cq.as_ptr()).fid as *mut fid,
+                    flags,
+                )
+            };
+
+            if ret != 0 {
+                return Err(Error::from_code(ret));
+            }
+
+            // Store the completion queue so it lives as long as the endpoint does
+            self.inner
+                .completion_queues
+                .lock()
+                .unwrap()
+                .push(cq.clone());
+
+            Ok(())
+        }
+
+        /// Bind an address vector to the endpoint
+        pub fn bind_av(&self, av: &address_vector::AddressVector) -> Result<(), Error> {
+            let ret = unsafe {
+                fi_ep_bind(
+                    self.inner.fid.as_ptr(),
+                    &mut (*av.as_ptr()).fid as *mut fid,
+                    0,
+                )
+            };
+
+            if ret != 0 {
+                return Err(Error::from_code(ret));
+            }
+
+            // Store the address vector so it lives as long as the endpoint does
+            self.inner.address_vectors.lock().unwrap().push(av.clone());
+
+            Ok(())
+        }
+
+        /// Enable the endpoint for data transfers
+        ///
+        /// Must be called after binding completion queue and address vector
+        pub fn enable(&self) -> Result<(), Error> {
+            let ret = unsafe { fi_enable(self.inner.fid.as_ptr()) };
+
+            if ret != 0 {
+                return Err(Error::from_code(ret));
+            }
+
+            Ok(())
+        }
+
+        /// Send a message to a destination endpoint
+        ///
+        /// The data is sent from the registered memory region. The buffer will remain
+        /// valid until the completion is received (the MemoryRegion owns the buffer).
+        ///
+        /// # Parameters
+        /// - `mr`: Registered memory region containing the data to send
+        /// - `len`: Number of bytes to send from the buffer (must be <= mr.len())
+        /// - `dest_addr`: Destination address (from address vector)
+        ///
+        /// # Returns
+        /// Ok(()) if the operation was successfully posted. The actual completion
+        /// will be reported via the bound completion queue.
+        pub fn send(
+            &self,
+            mr: &memory_registration::Send,
+            len: usize,
+            dest_addr: fi_addr_t,
+        ) -> Result<(), Error> {
+            if len > mr.len() {
+                return Err(Error::from_code(-(FI_EINVAL as i32)));
+            }
+
+            let iov = mr.iov();
+
+            let ret = unsafe {
+                fi_sendv(
+                    self.inner.fid.as_ptr(),
+                    iov.as_ptr(),
+                    &mut mr.desc(),
+                    iov.len(),
+                    dest_addr,
+                    // Clone and send the memory region in the completion queue
+                    // so it doesn't get dropped before the transport finishes sending it
+                    mr.clone().into_context(),
+                )
+            };
+
+            if ret != 0 {
+                return Err(Error::from_code(ret as i32));
+            }
+
+            Ok(())
+        }
+
+        /// Post a receive buffer to accept incoming messages
+        ///
+        /// The mutable buffer will be filled with data from the sender. The buffer
+        /// remains valid until the completion is received.
+        ///
+        /// # Parameters
+        /// - `mr`: Mutable registered memory region to receive into
+        /// - `src_addr`: Source address to match, or FI_ADDR_UNSPEC to accept from any sender
+        ///
+        /// # Returns
+        /// Ok(()) if the operation was successfully posted. The actual completion
+        /// will be reported via the bound completion queue, at which point you can
+        /// access the received data from the mutable buffer.
+        pub fn recv(
+            &self,
+            mr: memory_registration::Receive,
+            src_addr: fi_addr_t,
+        ) -> Result<(), Error> {
+            let buffer = mr.buffer();
+
+            let ret = unsafe {
+                fi_recv(
+                    self.inner.fid.as_ptr(),
+                    buffer.as_ptr() as *mut core::ffi::c_void,
+                    buffer.len(),
+                    mr.desc(),
+                    src_addr,
+                    // Transfer ownership of the mutable region to the completion queue
+                    mr.into_context(),
+                )
+            };
+
+            if ret != 0 {
+                return Err(Error::from_code(ret as i32));
+            }
+
+            Ok(())
+        }
+
+        /// Initiate an RMA read operation (pull data from remote peer)
+        ///
+        /// Reads data from a remote peer's registered memory region into your local buffer.
+        /// This is a one-sided operation - the remote peer is not notified.
+        ///
+        /// # Parameters
+        /// - `mr`: Local receive buffer to read data into
+        /// - `len`: Number of bytes to read (must be <= mr.len())
+        /// - `dest_addr`: Remote endpoint address (from address vector)
+        /// - `remote_addr`: Virtual address of remote buffer (if FI_MR_VIRT_ADDR)
+        /// - `remote_key`: Remote memory key (from peer's Send/Receive region)
+        ///
+        /// # Returns
+        /// Ok(()) if the operation was successfully posted. The actual completion
+        /// will be reported via the bound completion queue.
+        pub fn read(
+            &self,
+            mr: memory_registration::Receive,
+            len: usize,
+            dest_addr: fi_addr_t,
+            remote_addr: u64,
+            remote_key: u64,
+        ) -> Result<(), Error> {
+            if len > mr.len() {
+                return Err(Error::from_code(-(FI_EINVAL as i32)));
+            }
+
+            let buffer = mr.buffer();
+
+            let ret = unsafe {
+                fi_read(
+                    self.inner.fid.as_ptr(),
+                    buffer.as_ptr() as *mut core::ffi::c_void,
+                    len,
+                    mr.desc(),
+                    dest_addr,
+                    remote_addr,
+                    remote_key,
+                    // Transfer ownership to completion queue
+                    mr.into_context(),
+                )
+            };
+
+            if ret != 0 {
+                return Err(Error::from_code(ret as i32));
+            }
+
+            Ok(())
+        }
+
+        /// Initiate an RMA write operation (push data to remote peer)
+        ///
+        /// Writes data from your local buffer to a remote peer's registered memory region.
+        /// This is a one-sided operation - the remote peer is not notified unless they
+        /// requested FI_RMA_EVENT.
+        ///
+        /// # Parameters
+        /// - `mr`: Local send buffer containing data to write
+        /// - `len`: Number of bytes to write (must be <= mr.len())
+        /// - `dest_addr`: Remote endpoint address (from address vector)
+        /// - `remote_addr`: Virtual address of remote buffer (if FI_MR_VIRT_ADDR)
+        /// - `remote_key`: Remote memory key (from peer's Send/Receive region)
+        ///
+        /// # Returns
+        /// Ok(()) if the operation was successfully posted. The actual completion
+        /// will be reported via the bound completion queue.
+        pub fn write(
+            &self,
+            mr: &memory_registration::Send,
+            len: usize,
+            dest_addr: fi_addr_t,
+            remote_addr: u64,
+            remote_key: u64,
+        ) -> Result<(), Error> {
+            if len > mr.len() {
+                return Err(Error::from_code(-(FI_EINVAL as i32)));
+            }
+
+            let iov = mr.iov();
+
+            let ret = unsafe {
+                fi_writev(
+                    self.inner.fid.as_ptr(),
+                    iov.as_ptr(),
+                    &mut mr.desc(),
+                    iov.len(),
+                    dest_addr,
+                    remote_addr,
+                    remote_key,
+                    // Clone and send to completion queue
+                    mr.clone().into_context(),
+                )
+            };
+
+            if ret != 0 {
+                return Err(Error::from_code(ret as i32));
+            }
+
+            Ok(())
+        }
+    }
+
+    impl Drop for Inner {
+        fn drop(&mut self) {
+            unsafe {
+                if let Some(close) = (*self.fid.as_ptr())
+                    .fid
+                    .ops
+                    .as_ref()
+                    .and_then(|ops| (*ops).close)
+                {
+                    let _ = close(&mut (*self.fid.as_ptr()).fid as *mut fid);
+                }
+            }
+        }
+    }
+
+    impl fmt::Debug for Endpoint {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("Endpoint").finish_non_exhaustive()
+        }
+    }
 
     pub struct Query<'a>(pub(super) &'a mut fi_ep_attr);
 
@@ -527,6 +872,7 @@ pub mod endpoint {
 pub mod domain {
     use super::*;
     use core::ffi::CStr;
+    use std::sync::Arc;
 
     bitflags! {
         #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -625,16 +971,59 @@ pub mod domain {
         }
     );
 
-    pub struct Domain<'a>(pub(super) &'a fid_domain);
+    pub struct Domain {
+        inner: Arc<Inner>,
+    }
 
-    impl fmt::Debug for Domain<'_> {
-        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            f.debug_struct("fid_domain").finish_non_exhaustive()
+    struct Inner {
+        fid: NonNull<fid_domain>,
+    }
+
+    impl Domain {
+        pub(crate) fn open(fabric: &fabric::Fabric, info: &info::Info) -> Result<Self, Error> {
+            let mut domain_ptr: *mut fid_domain = core::ptr::null_mut();
+            let ret = unsafe {
+                fi_domain(
+                    fabric.as_ptr(),
+                    info.info.0.as_ptr(),
+                    &mut domain_ptr,
+                    core::ptr::null_mut(),
+                )
+            };
+
+            if ret != 0 {
+                return Err(Error::from_code(ret));
+            }
+
+            let fid = NonNull::new(domain_ptr).expect("domain pointer was null");
+            let inner = Arc::new(Inner { fid });
+            Ok(Self { inner })
+        }
+
+        pub(crate) fn as_ptr(&self) -> *mut fid_domain {
+            self.inner.fid.as_ptr()
         }
     }
 
-    impl Domain<'_> {
-        // TODO
+    impl Drop for Inner {
+        fn drop(&mut self) {
+            unsafe {
+                if let Some(close) = (*self.fid.as_ptr())
+                    .fid
+                    .ops
+                    .as_ref()
+                    .and_then(|ops| (*ops).close)
+                {
+                    close(&mut (*self.fid.as_ptr()).fid as *mut fid);
+                }
+            }
+        }
+    }
+
+    impl fmt::Debug for Domain {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("Domain").finish_non_exhaustive()
+        }
     }
 
     pub struct Attributes<'a>(pub(super) &'a fi_domain_attr);
@@ -643,7 +1032,6 @@ pub mod domain {
         fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
             f.debug_struct("fi_domain_attr")
                 .field("name", &self.name())
-                .field("domain", &self.domain())
                 .field("capabilities", &self.capabilities())
                 .field("threading", &self.threading())
                 .field("resource_management", &self.resource_management())
@@ -655,16 +1043,6 @@ pub mod domain {
     }
 
     impl Attributes<'_> {
-        pub fn domain(&self) -> Option<Domain<'_>> {
-            unsafe {
-                let domain = self.0.domain;
-                if domain.is_null() {
-                    return None;
-                }
-                Some(Domain(&*self.0.domain))
-            }
-        }
-
         pub fn name(&self) -> Option<&CStr> {
             if self.0.name.is_null() {
                 return None;
@@ -708,6 +1086,9 @@ pub mod domain {
 
 pub mod memory_registration {
     use super::*;
+    use crate::bytevec::{ByteVec, BytesMut};
+    use core::pin::Pin;
+    use std::sync::Arc;
 
     bitflags! {
         #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -735,6 +1116,763 @@ pub mod memory_registration {
             const VIRT_ADDR = FI_MR_VIRT_ADDR as i32;
         }
     }
+
+    bitflags! {
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        pub struct Access: u64 {
+            /// Memory region can be used as source for send operations
+            const SEND = FI_SEND as u64;
+            /// Memory region can be used for receiving messages
+            const RECV = FI_RECV as u64;
+            /// Memory region can be used as source for RMA read operations
+            const READ = FI_READ as u64;
+            /// Memory region can be used as source for RMA write operations
+            const WRITE = FI_WRITE as u64;
+            /// Memory region can be used as target for remote RMA read operations
+            const REMOTE_READ = FI_REMOTE_READ as u64;
+            /// Memory region can be used as target for remote RMA write operations
+            const REMOTE_WRITE = FI_REMOTE_WRITE as u64;
+        }
+    }
+
+    #[repr(u8)]
+    #[derive(Clone, Copy, Debug)]
+    enum RegionType {
+        Send = 0,
+        Receive = 1,
+    }
+
+    #[repr(C)]
+    struct RegionHeader {
+        type_id: RegionType,
+    }
+
+    /// Send buffer region for send operations and RMA writes
+    ///
+    /// Can be cloned cheaply for retransmissions. Uses Arc for shared ownership.
+    #[derive(Clone)]
+    pub struct Send {
+        inner: Arc<SendInner>,
+    }
+
+    #[repr(C)]
+    struct SendInner {
+        // The header _must_ come first in order for the completion queue to know the type
+        header: RegionHeader,
+        fid: NonNull<fid_mr>,
+        buffer: ByteVec,
+        key: u64,
+        desc: *mut core::ffi::c_void,
+        iov: Pin<Box<[iovec]>>,
+    }
+
+    impl Send {
+        pub fn register(
+            domain: &domain::Domain,
+            buffer: ByteVec,
+            access: Access,
+        ) -> Result<Self, Error> {
+            let iovecs: Vec<iovec> = buffer
+                .chunks()
+                .map(|chunk| iovec {
+                    iov_base: chunk.as_ptr() as *mut core::ffi::c_void,
+                    iov_len: chunk.len(),
+                })
+                .collect();
+            let iov = Pin::new(iovecs.into_boxed_slice());
+
+            let mut mr_ptr: *mut fid_mr = core::ptr::null_mut();
+
+            let ret = unsafe {
+                fi_mr_regv(
+                    domain.as_ptr(),
+                    iov.as_ptr(),
+                    iov.len(),
+                    access.bits(),
+                    0, // offset
+                    0, // requested_key
+                    0, // flags
+                    &mut mr_ptr,
+                    core::ptr::null_mut(),
+                )
+            };
+
+            if ret != 0 {
+                return Err(Error::from_code(ret));
+            }
+
+            let fid = NonNull::new(mr_ptr).expect("memory region pointer was null");
+            let (key, desc) = unsafe {
+                let key = fi_mr_key(mr_ptr);
+                let desc = fi_mr_desc(mr_ptr);
+                (key, desc)
+            };
+
+            let inner = Arc::new(SendInner {
+                header: RegionHeader {
+                    type_id: RegionType::Send,
+                },
+                fid,
+                buffer,
+                key,
+                desc,
+                iov,
+            });
+
+            Ok(Self { inner })
+        }
+
+        /// Get the memory key for this region (used for remote access)
+        pub fn key(&self) -> u64 {
+            self.inner.key
+        }
+
+        /// Get the memory descriptor for this region (used for local operations)
+        pub fn desc(&self) -> *mut core::ffi::c_void {
+            self.inner.desc
+        }
+
+        /// Get a reference to the underlying buffer
+        pub fn buffer(&self) -> &ByteVec {
+            &self.inner.buffer
+        }
+
+        /// Get the total length of the memory region
+        pub fn len(&self) -> usize {
+            self.inner.buffer.len()
+        }
+
+        /// Check if the memory region is empty
+        pub fn is_empty(&self) -> bool {
+            self.inner.buffer.is_empty()
+        }
+
+        /// Get the iovec array for vectored operations
+        pub fn iov(&self) -> &[iovec] {
+            &self.inner.iov
+        }
+
+        /// Convert the MemoryRegion into a context pointer for libfabric operations
+        ///
+        /// This consumes the MemoryRegion and converts it into a raw pointer that can
+        /// be passed as the context parameter to libfabric operations. The MemoryRegion
+        /// will be kept alive until `from_context` is called in the completion handler.
+        pub(crate) fn into_context(self) -> *mut core::ffi::c_void {
+            Arc::into_raw(self.inner) as *mut core::ffi::c_void
+        }
+    }
+
+    impl Drop for SendInner {
+        fn drop(&mut self) {
+            unsafe {
+                if let Some(close) = (*self.fid.as_ptr())
+                    .fid
+                    .ops
+                    .as_ref()
+                    .and_then(|ops| (*ops).close)
+                {
+                    let _ = close(&mut (*self.fid.as_ptr()).fid as *mut fid);
+                }
+            }
+        }
+    }
+
+    impl fmt::Debug for Send {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("Send")
+                .field("key", &self.key())
+                .field("len", &self.len())
+                .field("chunks", &self.buffer().chunks().len())
+                .finish()
+        }
+    }
+
+    /// Receive buffer region for recv and RMA read operations
+    ///
+    /// Cannot be cloned - unique ownership of mutable buffer.
+    pub struct Receive {
+        inner: Box<ReceiveInner>,
+    }
+
+    #[repr(C)]
+    struct ReceiveInner {
+        header: RegionHeader,
+        fid: NonNull<fid_mr>,
+        buffer: BytesMut,
+        key: u64,
+        desc: *mut core::ffi::c_void,
+    }
+
+    impl Receive {
+        pub fn register(
+            domain: &domain::Domain,
+            mut buffer: BytesMut,
+            access: Access,
+        ) -> Result<Self, Error> {
+            use bytes::BufMut;
+
+            let mut mr_ptr: *mut fid_mr = core::ptr::null_mut();
+            let buf = buffer.chunk_mut();
+
+            let ret = unsafe {
+                fi_mr_reg(
+                    domain.as_ptr(),
+                    buf.as_mut_ptr() as *const _,
+                    buf.len(),
+                    access.bits(),
+                    0,
+                    0,
+                    0,
+                    &mut mr_ptr,
+                    core::ptr::null_mut(),
+                )
+            };
+
+            if ret != 0 {
+                return Err(Error::from_code(ret));
+            }
+
+            let fid = NonNull::new(mr_ptr).expect("memory region pointer was null");
+            let (key, desc) = unsafe {
+                let key = fi_mr_key(mr_ptr);
+                let desc = fi_mr_desc(mr_ptr);
+                (key, desc)
+            };
+
+            let inner = Box::new(ReceiveInner {
+                header: RegionHeader {
+                    type_id: RegionType::Receive,
+                },
+                fid,
+                buffer,
+                key,
+                desc,
+            });
+
+            Ok(Self { inner })
+        }
+
+        pub fn key(&self) -> u64 {
+            self.inner.key
+        }
+
+        pub fn desc(&self) -> *mut core::ffi::c_void {
+            self.inner.desc
+        }
+
+        pub fn buffer(&self) -> &BytesMut {
+            &self.inner.buffer
+        }
+
+        pub fn buffer_mut(&mut self) -> &mut BytesMut {
+            &mut self.inner.buffer
+        }
+
+        pub fn len(&self) -> usize {
+            self.inner.buffer.len()
+        }
+
+        pub fn is_empty(&self) -> bool {
+            self.inner.buffer.is_empty()
+        }
+
+        pub(crate) fn into_context(self) -> *mut core::ffi::c_void {
+            Box::into_raw(self.inner) as *mut core::ffi::c_void
+        }
+    }
+
+    impl Drop for ReceiveInner {
+        fn drop(&mut self) {
+            unsafe {
+                if let Some(close) = (*self.fid.as_ptr())
+                    .fid
+                    .ops
+                    .as_ref()
+                    .and_then(|ops| (*ops).close)
+                {
+                    let _ = close(&mut (*self.fid.as_ptr()).fid as *mut fid);
+                }
+            }
+        }
+    }
+
+    impl fmt::Debug for Receive {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("Receive")
+                .field("key", &self.key())
+                .field("len", &self.len())
+                .finish()
+        }
+    }
+
+    /// Type-erased memory region for completion queue reconstruction
+    ///
+    /// Only used when reconstructing from context pointer in completion handler.
+    #[derive(Debug)]
+    pub enum MemoryRegion {
+        Send(Send),
+        Receive(Receive),
+    }
+
+    impl MemoryRegion {
+        /// Reconstruct a MemoryRegion from a context pointer
+        ///
+        /// # Safety
+        /// The context pointer must have been created by `into_context()` from either
+        /// Send or Receive.
+        pub unsafe fn from_context(context: *mut core::ffi::c_void) -> Self {
+            let header = &*(context as *const RegionHeader);
+            match header.type_id {
+                RegionType::Send => {
+                    let inner = Arc::from_raw(context as *const SendInner);
+                    Self::Send(Send { inner })
+                }
+                RegionType::Receive => {
+                    let inner = Box::from_raw(context as *mut ReceiveInner);
+                    Self::Receive(Receive { inner })
+                }
+            }
+        }
+    }
+}
+
+pub mod completion_queue {
+    use super::*;
+    use std::sync::Arc;
+
+    define_enum!(
+        pub enum Format {
+            /// No completion data is provided
+            UNSPEC = fi_cq_format_FI_CQ_FORMAT_UNSPEC,
+            /// Provides only the context data
+            CONTEXT = fi_cq_format_FI_CQ_FORMAT_CONTEXT,
+            /// Provides context and basic completion data
+            MSG = fi_cq_format_FI_CQ_FORMAT_MSG,
+            /// Provides context and detailed completion data
+            DATA = fi_cq_format_FI_CQ_FORMAT_DATA,
+            /// Provides context and tagged message completion data
+            TAGGED = fi_cq_format_FI_CQ_FORMAT_TAGGED,
+        }
+    );
+
+    define_enum!(
+        pub enum WaitObject {
+            NONE = fi_wait_obj_FI_WAIT_NONE,
+            UNSPEC = fi_wait_obj_FI_WAIT_UNSPEC,
+            SET = fi_wait_obj_FI_WAIT_SET,
+            FD = fi_wait_obj_FI_WAIT_FD,
+            MUTEX_COND = fi_wait_obj_FI_WAIT_MUTEX_COND,
+        }
+    );
+
+    #[derive(Clone)]
+    pub struct CompletionQueue {
+        inner: Arc<Inner>,
+    }
+
+    struct Inner {
+        fid: NonNull<fid_cq>,
+    }
+
+    impl CompletionQueue {
+        /// Open a completion queue
+        pub fn open(domain: &domain::Domain, size: usize) -> Result<Self, Error> {
+            Self::open_with_format(domain, size, Format::CONTEXT)
+        }
+
+        /// Open a completion queue with a specific format
+        pub fn open_with_format(
+            domain: &domain::Domain,
+            size: usize,
+            format: Format,
+        ) -> Result<Self, Error> {
+            let mut attr = fi_cq_attr {
+                size,
+                flags: 0,
+                format: format as _,
+                wait_obj: WaitObject::NONE as _,
+                signaling_vector: 0,
+                wait_cond: fi_cq_wait_cond_FI_CQ_COND_NONE as _,
+                wait_set: core::ptr::null_mut(),
+            };
+
+            let mut cq_ptr: *mut fid_cq = core::ptr::null_mut();
+            let ret = unsafe {
+                fi_cq_open(
+                    domain.as_ptr(),
+                    &mut attr,
+                    &mut cq_ptr,
+                    core::ptr::null_mut(),
+                )
+            };
+
+            if ret != 0 {
+                return Err(Error::from_code(ret));
+            }
+
+            let fid = NonNull::new(cq_ptr).expect("completion queue pointer was null");
+            let inner = Arc::new(Inner { fid });
+            Ok(Self { inner })
+        }
+
+        /// Read and process completion entries, automatically freeing MemoryRegions
+        ///
+        /// This reads completions and automatically reconstructs and drops the MemoryRegion
+        /// from each completion context. The callback receives both the completion entry
+        /// and the reconstructed MemoryRegion.
+        ///
+        /// # Parameters
+        /// - `limit`: Maximum number of entries to read (must be <= MAX_LEN)
+        /// - `callback`: Called for each completion with (entry, memory_region)
+        ///
+        /// The MemoryRegion will be dropped after the callback returns.
+        pub fn read<F, const MAX_LEN: usize>(
+            &self,
+            limit: usize,
+            mut callback: F,
+        ) -> Result<usize, Error>
+        where
+            F: FnMut(memory_registration::MemoryRegion),
+        {
+            debug_assert!(limit <= MAX_LEN, "limit exceeds MAX_LEN");
+            let limit = limit.min(MAX_LEN);
+
+            let mut entries: [fi_cq_entry; MAX_LEN] = [unsafe { core::mem::zeroed() }; MAX_LEN];
+            let count = unsafe { self.read_raw(&mut entries[..limit])? };
+
+            for entry in &entries[..count] {
+                if !entry.op_context.is_null() {
+                    let mr = unsafe {
+                        memory_registration::MemoryRegion::from_context(entry.op_context)
+                    };
+                    callback(mr);
+                    // mr is automatically dropped here
+                }
+            }
+
+            Ok(count)
+        }
+
+        /// Read completion entries (non-blocking)
+        ///
+        /// Returns the number of entries read, or an error.
+        /// Returns 0 if no completions are available (FI_EAGAIN).
+        ///
+        /// **Important**: The `op_context` field in each entry contains a MemoryRegion
+        /// pointer. You must call `memory_registration::MemoryRegion::from_context()`
+        /// on each entry to properly free the memory region.
+        pub unsafe fn read_raw(&self, entries: &mut [fi_cq_entry]) -> Result<usize, Error> {
+            let ret = unsafe {
+                fi_cq_read(
+                    self.inner.fid.as_ptr(),
+                    entries.as_mut_ptr() as *mut core::ffi::c_void,
+                    entries.len(),
+                )
+            };
+
+            if ret < 0 {
+                // -FI_EAGAIN means no completions available, return 0
+                if ret == -(FI_EAGAIN as isize) {
+                    return Ok(0);
+                }
+                Err(Error::from_code(ret as i32))
+            } else {
+                Ok(ret as usize)
+            }
+        }
+
+        /// Read completion entries with timeout (blocking)
+        ///
+        /// Blocks until at least one completion is available or timeout expires.
+        /// A timeout of -1 means wait indefinitely.
+        pub fn sread(&self, entries: &mut [fi_cq_entry], timeout_ms: i32) -> Result<usize, Error> {
+            let ret = unsafe {
+                fi_cq_sread(
+                    self.inner.fid.as_ptr(),
+                    entries.as_mut_ptr() as *mut core::ffi::c_void,
+                    entries.len(),
+                    core::ptr::null_mut(),
+                    timeout_ms,
+                )
+            };
+
+            if ret < 0 {
+                Err(Error::from_code(ret as i32))
+            } else {
+                Ok(ret as usize)
+            }
+        }
+
+        /// Read detailed completion data
+        pub fn readfrom(
+            &self,
+            entries: &mut [fi_cq_msg_entry],
+            src_addrs: &mut [fi_addr_t],
+        ) -> Result<usize, Error> {
+            debug_assert_eq!(entries.len(), src_addrs.len());
+
+            let ret = unsafe {
+                fi_cq_readfrom(
+                    self.inner.fid.as_ptr(),
+                    entries.as_mut_ptr() as *mut core::ffi::c_void,
+                    entries.len(),
+                    src_addrs.as_mut_ptr(),
+                )
+            };
+
+            if ret < 0 {
+                if ret == -(FI_EAGAIN as isize) {
+                    return Ok(0);
+                }
+                Err(Error::from_code(ret as i32))
+            } else {
+                Ok(ret as usize)
+            }
+        }
+
+        /// Read error entry from the completion queue
+        ///
+        /// Should be called when a completion operation returns an error to get details.
+        pub fn readerr(&self) -> Result<fi_cq_err_entry, Error> {
+            let mut err_entry = unsafe { core::mem::zeroed::<fi_cq_err_entry>() };
+
+            let ret = unsafe {
+                fi_cq_readerr(
+                    self.inner.fid.as_ptr(),
+                    &mut err_entry,
+                    0, // flags
+                )
+            };
+
+            if ret < 0 {
+                return Err(Error::from_code(ret as i32));
+            }
+
+            Ok(err_entry)
+        }
+
+        pub(crate) fn as_ptr(&self) -> *mut fid_cq {
+            self.inner.fid.as_ptr()
+        }
+    }
+
+    impl Drop for Inner {
+        fn drop(&mut self) {
+            unsafe {
+                if let Some(close) = (*self.fid.as_ptr())
+                    .fid
+                    .ops
+                    .as_ref()
+                    .and_then(|ops| (*ops).close)
+                {
+                    let _ = close(&mut (*self.fid.as_ptr()).fid as *mut fid);
+                }
+            }
+        }
+    }
+
+    impl fmt::Debug for CompletionQueue {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("CompletionQueue").finish_non_exhaustive()
+        }
+    }
+}
+
+pub mod address_vector {
+    use super::*;
+    use std::sync::Arc;
+
+    define_enum!(
+        pub enum Type {
+            /// Address vector uses a map for lookups
+            MAP = fi_av_type_FI_AV_MAP,
+            /// Address vector uses a table for lookups
+            TABLE = fi_av_type_FI_AV_TABLE,
+            Unspecified = fi_av_type_FI_AV_UNSPEC,
+        }
+    );
+
+    #[derive(Clone)]
+    pub struct AddressVector {
+        inner: Arc<Inner>,
+    }
+
+    struct Inner {
+        fid: NonNull<fid_av>,
+    }
+
+    impl AddressVector {
+        /// Open an address vector with default settings (TABLE type)
+        ///
+        /// Uses FI_AV_TABLE as FI_AV_MAP was deprecated in libfabric 2.x
+        pub fn open(domain: &domain::Domain) -> Result<Self, Error> {
+            Self::open_with_attr(domain, Type::TABLE, 64)
+        }
+
+        /// Open an address vector with specific attributes
+        pub fn open_with_attr(
+            domain: &domain::Domain,
+            av_type: Type,
+            count: usize,
+        ) -> Result<Self, Error> {
+            let mut attr = fi_av_attr {
+                type_: av_type as _,
+                rx_ctx_bits: 0,
+                count,
+                ep_per_node: 0,
+                name: core::ptr::null(),
+                map_addr: core::ptr::null_mut(),
+                flags: 0,
+            };
+
+            let mut av_ptr: *mut fid_av = core::ptr::null_mut();
+            let ret = unsafe {
+                fi_av_open(
+                    domain.as_ptr(),
+                    &mut attr,
+                    &mut av_ptr,
+                    core::ptr::null_mut(),
+                )
+            };
+
+            if ret != 0 {
+                return Err(Error::from_code(ret));
+            }
+
+            let fid = NonNull::new(av_ptr).expect("address vector pointer was null");
+            let inner = Arc::new(Inner { fid });
+            Ok(Self { inner })
+        }
+
+        /// Insert a single address into the address vector
+        ///
+        /// Returns the libfabric address handle (fi_addr_t) for this address.
+        pub fn insert(&self, addr: &[u8]) -> Result<fi_addr_t, Error> {
+            let mut fi_addr: fi_addr_t = 0;
+            let ret = unsafe {
+                fi_av_insert(
+                    self.inner.fid.as_ptr(),
+                    addr.as_ptr() as *const core::ffi::c_void,
+                    1,
+                    &mut fi_addr,
+                    0,
+                    core::ptr::null_mut(),
+                )
+            };
+
+            if ret != 1 {
+                return Err(Error::from_code(-(ret as i32)));
+            }
+
+            Ok(fi_addr)
+        }
+
+        /// Insert multiple addresses into the address vector
+        ///
+        /// Returns a Vec of libfabric address handles, one per input address.
+        /// All addresses must be the same size.
+        pub fn insert_multiple(&self, addrs: &[&[u8]]) -> Result<Vec<fi_addr_t>, Error> {
+            if addrs.is_empty() {
+                return Ok(Vec::new());
+            }
+
+            // Flatten addresses into a single buffer
+            let addr_len = addrs[0].len();
+            let mut addr_buf = Vec::with_capacity(addr_len * addrs.len());
+            for addr in addrs {
+                if addr.len() != addr_len {
+                    return Err(Error::from_code(-(FI_EINVAL as i32)));
+                }
+                addr_buf.extend_from_slice(addr);
+            }
+
+            let mut fi_addrs = vec![0_u64; addrs.len()];
+            let ret = unsafe {
+                fi_av_insert(
+                    self.inner.fid.as_ptr(),
+                    addr_buf.as_ptr() as *const core::ffi::c_void,
+                    addrs.len(),
+                    fi_addrs.as_mut_ptr(),
+                    0,
+                    core::ptr::null_mut(),
+                )
+            };
+
+            if ret < 0 {
+                return Err(Error::from_code(ret as i32));
+            }
+
+            if ret as usize != addrs.len() {
+                return Err(Error::from_code(-(FI_EINVAL as i32)));
+            }
+
+            Ok(fi_addrs)
+        }
+
+        /// Remove an address from the address vector
+        pub fn remove(&self, fi_addr: fi_addr_t) -> Result<(), Error> {
+            let ret = unsafe {
+                fi_av_remove(
+                    self.inner.fid.as_ptr(),
+                    &fi_addr as *const fi_addr_t as *mut fi_addr_t,
+                    1,
+                    0,
+                )
+            };
+
+            if ret != 0 {
+                return Err(Error::from_code(ret));
+            }
+
+            Ok(())
+        }
+
+        /// Lookup the address string for a given fi_addr_t
+        ///
+        /// Returns the raw address bytes. The format depends on the provider.
+        pub fn lookup(&self, fi_addr: fi_addr_t, addr_buf: &mut [u8]) -> Result<usize, Error> {
+            let mut addrlen = addr_buf.len();
+            let ret = unsafe {
+                fi_av_lookup(
+                    self.inner.fid.as_ptr(),
+                    fi_addr,
+                    addr_buf.as_mut_ptr() as *mut core::ffi::c_void,
+                    &mut addrlen,
+                )
+            };
+
+            if ret != 0 {
+                return Err(Error::from_code(ret));
+            }
+
+            Ok(addrlen)
+        }
+
+        pub(crate) fn as_ptr(&self) -> *mut fid_av {
+            self.inner.fid.as_ptr()
+        }
+    }
+
+    impl Drop for Inner {
+        fn drop(&mut self) {
+            unsafe {
+                if let Some(close) = (*self.fid.as_ptr())
+                    .fid
+                    .ops
+                    .as_ref()
+                    .and_then(|ops| (*ops).close)
+                {
+                    let _ = close(&mut (*self.fid.as_ptr()).fid as *mut fid);
+                }
+            }
+        }
+    }
+
+    impl fmt::Debug for AddressVector {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("AddressVector").finish_non_exhaustive()
+        }
+    }
 }
 
 pub mod addr {
@@ -755,6 +1893,69 @@ pub mod addr {
             SOCKADDR_IN6 = FI_SOCKADDR_IN6,
         }
     );
+}
+
+pub mod fabric {
+    use super::*;
+    use std::sync::Arc;
+
+    pub struct Fabric {
+        inner: Arc<Inner>,
+    }
+
+    struct Inner {
+        fid: NonNull<fid_fabric>,
+    }
+
+    impl Fabric {
+        pub fn open(info: &info::Info) -> Result<Self, Error> {
+            let mut fabric_ptr: *mut fid_fabric = core::ptr::null_mut();
+            let ret = unsafe {
+                fi_fabric(
+                    info.info.fabric_attr,
+                    &mut fabric_ptr,
+                    core::ptr::null_mut(),
+                )
+            };
+
+            if ret != 0 {
+                return Err(Error::from_code(ret));
+            }
+
+            let fid = NonNull::new(fabric_ptr).expect("fabric pointer was null");
+            let inner = Arc::new(Inner { fid });
+            Ok(Self { inner })
+        }
+
+        pub fn open_domain(&self, info: &info::Info) -> Result<domain::Domain, Error> {
+            domain::Domain::open(self, info)
+        }
+
+        pub(crate) fn as_ptr(&self) -> *mut fid_fabric {
+            self.inner.fid.as_ptr()
+        }
+    }
+
+    impl Drop for Inner {
+        fn drop(&mut self) {
+            unsafe {
+                if let Some(close) = (*self.fid.as_ptr())
+                    .fid
+                    .ops
+                    .as_ref()
+                    .and_then(|ops| (*ops).close)
+                {
+                    close(&mut (*self.fid.as_ptr()).fid as *mut fid as *mut fid);
+                }
+            }
+        }
+    }
+
+    impl fmt::Debug for Fabric {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("Fabric").finish_non_exhaustive()
+        }
+    }
 }
 
 #[cfg(test)]
