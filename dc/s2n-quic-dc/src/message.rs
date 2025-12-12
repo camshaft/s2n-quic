@@ -7,6 +7,8 @@
 use crate::ByteVec;
 use std::{ops::Range, pin::Pin, sync::Arc};
 
+#[cfg(target_os = "linux")]
+mod libfabric;
 mod udp;
 
 /// Unique identifier for a message.

@@ -10,6 +10,9 @@ pub mod server;
 pub mod stream;
 pub mod worker;
 
+#[cfg(target_os = "linux")]
+mod libfabric;
+
 // pub use s2n_quic_core::dc::{Version, SUPPORTED_VERSIONS};
 pub use bytevec::ByteVec;
 
