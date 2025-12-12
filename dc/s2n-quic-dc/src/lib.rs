@@ -23,6 +23,10 @@ pub mod sync;
 pub mod task;
 pub mod uds;
 
+/// dcQUIC v2 implementation with receiver-driven protocol
+#[cfg(todo)]
+pub mod v2;
+
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;
 
