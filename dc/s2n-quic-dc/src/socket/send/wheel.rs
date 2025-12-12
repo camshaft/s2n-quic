@@ -217,7 +217,13 @@ impl<Info, Meta, Completion, const GRANULARITY_US: u64>
         let bounded_idx = full_idx.max(original_min);
 
         let waker = if let Some(waker) = lock.waker.take() {
-            lock.start_idx = bounded_idx;
+            // Only advance start_idx if the wheel is empty
+            // If there are any entries (len > 0), we must tick through them sequentially
+            // to avoid skipping over occupied slots with stale timestamps
+            let is_empty = self.0.len.load(Ordering::Relaxed) == 0;
+            if is_empty {
+                lock.start_idx = bounded_idx;
+            }
             Some(waker)
         } else {
             None

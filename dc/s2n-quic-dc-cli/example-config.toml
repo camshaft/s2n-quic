@@ -1,0 +1,44 @@
+# Example configuration file for s2n-quic-dc-cli
+
+[server]
+# Address the server listens on
+listen_address = "[::1]:4433"
+
+[client]
+# Client-specific configuration (currently empty but reserved for future use)
+
+[tui]
+# How often to refresh the TUI (in milliseconds)
+refresh_rate_ms = 100
+
+# Named workloads that can be run by the client
+# Each workload specifies the parameters for the burst test
+
+[workload.large_burst]
+# Number of streams to open simultaneously
+num_streams = 10000
+# Size of the request payload in bytes
+request_size = 1024
+# Size of the response the server should send in bytes
+response_size = 65536
+# Delay in milliseconds before server sends response
+delay_ms = 100
+
+[workload.small_quick]
+num_streams = 100
+request_size = 512
+response_size = 4096
+delay_ms = 10
+
+[workload.high_latency]
+num_streams = 1000
+request_size = 2048
+response_size = 32768
+delay_ms = 500
+
+[workload.extreme_burst]
+# Test traffic shaping with extreme burst
+num_streams = 50000
+request_size = 512
+response_size = 32768
+delay_ms = 50
