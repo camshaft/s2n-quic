@@ -2,8 +2,7 @@
 //!
 //! A unary RPC sends a single request and receives a single response.
 
-use crate::{causality, message, priority::Priority, stream::Error};
-use s2n_quic_core::buffer::writer;
+use crate::{causality, message, priority::Priority, stream::Error, ByteVec};
 
 /// Builder for configuring a unary RPC request.
 pub struct Builder {
@@ -24,13 +23,13 @@ impl Builder {
     }
 
     /// Sets application metadata for RPC handler dispatch.
-    pub fn metadata(self, metadata: impl Into<bytes::Bytes>) -> Self {
+    pub fn metadata(self, metadata: ByteVec) -> Self {
         let _ = metadata;
         todo!()
     }
 
     /// Sets an optional request header.
-    pub fn header(self, header: impl Into<bytes::Bytes>) -> Self {
+    pub fn header(self, header: ByteVec) -> Self {
         let _ = header;
         todo!()
     }
@@ -91,18 +90,12 @@ pub struct Response {
 
 impl Response {
     /// Returns the optional response header.
-    pub fn header(&self) -> Option<&bytes::Bytes> {
-        todo!()
-    }
-
-    /// Reads the response body into the provided buffer.
-    pub async fn read_into(self, buf: &mut impl writer::Storage) -> Result<(), Error> {
-        let _ = buf;
+    pub fn header(&self) -> Option<&ByteVec> {
         todo!()
     }
 
     /// Consumes the response and returns the body as bytes.
-    pub async fn into_bytes(self) -> Result<bytes::Bytes, Error> {
+    pub async fn recv(self) -> Result<ByteVec, Error> {
         todo!()
     }
 }

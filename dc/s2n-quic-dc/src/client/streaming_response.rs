@@ -2,8 +2,7 @@
 //!
 //! A streaming response RPC sends a single request and receives multiple responses as a stream.
 
-use crate::{causality, message, priority::Priority, stream::Error};
-use s2n_quic_core::buffer::writer;
+use crate::{causality, message, priority::Priority, stream::Error, ByteVec};
 
 /// Builder for configuring a streaming response RPC.
 pub struct Builder {
@@ -24,13 +23,13 @@ impl Builder {
     }
 
     /// Sets application metadata for RPC handler dispatch.
-    pub fn metadata(self, metadata: impl Into<bytes::Bytes>) -> Self {
+    pub fn metadata(self, metadata: ByteVec) -> Self {
         let _ = metadata;
         todo!()
     }
 
     /// Sets an optional request header.
-    pub fn header(self, header: impl Into<bytes::Bytes>) -> Self {
+    pub fn header(self, header: ByteVec) -> Self {
         let _ = header;
         todo!()
     }
@@ -154,13 +153,12 @@ impl Stream {
     }
 
     /// Reads the response body into the provided buffer.
-    pub async fn recv(&mut self, buf: &mut impl writer::Storage) -> Option<Result<(), Error>> {
-        let _ = buf;
+    pub async fn recv(&mut self) -> Option<Result<ByteVec, Error>> {
         todo!()
     }
 
     /// Closes the stream and stops receiving responses.
-    pub fn close(self, error: Option<u32>) -> Result<(), Error> {
+    pub fn close(self, error: Option<ByteVec>) -> Result<(), Error> {
         let _ = error;
         todo!()
     }

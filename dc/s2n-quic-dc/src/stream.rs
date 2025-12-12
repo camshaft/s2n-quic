@@ -1,5 +1,10 @@
 //! Common stream types and configuration shared between client and server.
 
+use crate::ByteVec;
+
+pub mod item;
+pub use item::Item;
+
 /// Backpressure configuration for a transfer.
 ///
 /// These limits control when the receiver stops issuing PULL_REQUEST messages
@@ -46,6 +51,6 @@ pub enum Error {
     #[error("stream closed without error")]
     Closed,
 
-    #[error("stream reset with code {0}")]
-    Reset(u32),
+    #[error("stream reset")]
+    Reset(ByteVec),
 }

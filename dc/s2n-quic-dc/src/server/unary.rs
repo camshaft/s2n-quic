@@ -5,9 +5,9 @@
 use crate::{
     priority::Priority,
     server::{AcceptError, RejectReason},
-    stream::{self, Backpressure},
+    stream::{self, Backpressure, Item},
+    ByteVec,
 };
-use s2n_quic_core::buffer::{reader, writer};
 use std::net::SocketAddr;
 
 /// A request for an incoming unary RPC transfer.
@@ -27,7 +27,7 @@ impl Request {
     /// Returns the application metadata included in the transfer.
     ///
     /// This metadata can be used for handler dispatch and routing decisions.
-    pub fn metadata(&self) -> Option<&[u8]> {
+    pub fn metadata(&self) -> Option<&ByteVec> {
         todo!()
     }
 
@@ -37,7 +37,7 @@ impl Request {
     }
 
     /// Returns the optional request header.
-    pub fn header(&self) -> Option<&bytes::Bytes> {
+    pub fn header(&self) -> Option<&ByteVec> {
         todo!()
     }
 
@@ -71,11 +71,7 @@ pub struct Stream {
 
 impl Stream {
     /// Reads the request payload into the provided buffer.
-    pub async fn read_payload(
-        self,
-        buf: &mut impl writer::Storage,
-    ) -> Result<Response, stream::Error> {
-        let _ = buf;
+    pub async fn recv(self) -> Result<(ByteVec, Response), stream::Error> {
         todo!()
     }
 }
@@ -88,37 +84,25 @@ pub struct Response {
 }
 
 impl Response {
-    /// Sends a response
-    ///
-    /// # Arguments
-    ///
-    /// * `payload` - Response payload data
-    pub async fn send(
-        self,
-        payload: &mut impl reader::storage::Infallible,
-    ) -> Result<(), stream::Error> {
-        let _ = payload;
+    pub async fn send_header(&mut self, header: ByteVec) -> Result<(), stream::Error> {
+        let _ = header;
         todo!()
     }
 
-    /// Sends a response with a header.
-    ///
-    /// # Arguments
-    ///
-    /// * `header` - Response header
-    /// * `payload` - Response payload data
-    pub async fn send_with_header(
-        self,
-        header: &mut impl reader::storage::Infallible,
-        payload: &mut impl reader::storage::Infallible,
-    ) -> Result<(), stream::Error> {
-        let _ = (header, payload);
+    pub fn set_header(&mut self, header: ByteVec) -> Result<(), stream::Error> {
+        let _ = header;
         todo!()
     }
 
-    /// Sends an error response.
-    pub fn send_error(self, code: u32) -> Result<(), stream::Error> {
-        let _ = code;
+    /// Sends the response on the stream.
+    pub async fn send(&mut self, item: Item) -> Result<(), stream::Error> {
+        let _ = item;
+        todo!()
+    }
+
+    /// Closes the response side of the stream normally.
+    pub fn close(self, error: Option<ByteVec>) -> Result<(), stream::Error> {
+        let _ = error;
         todo!()
     }
 }

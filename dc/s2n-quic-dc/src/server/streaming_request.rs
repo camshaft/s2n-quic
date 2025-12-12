@@ -5,9 +5,9 @@
 use crate::{
     priority::Priority,
     server::{AcceptError, RejectReason},
-    stream::{self, Backpressure},
+    stream::{self, Backpressure, Item},
+    ByteVec,
 };
-use s2n_quic_core::buffer::{reader, writer};
 use std::net::SocketAddr;
 
 /// A request for an incoming streaming request RPC transfer.
@@ -20,7 +20,7 @@ impl Request {
         todo!()
     }
 
-    pub fn metadata(&self) -> Option<&[u8]> {
+    pub fn metadata(&self) -> Option<&ByteVec> {
         todo!()
     }
 
@@ -28,7 +28,7 @@ impl Request {
         todo!()
     }
 
-    pub fn header(&self) -> Option<&bytes::Bytes> {
+    pub fn header(&self) -> Option<&ByteVec> {
         todo!()
     }
 
@@ -53,16 +53,12 @@ pub struct Stream {
 }
 
 impl Stream {
-    pub fn header(&self) -> Option<&bytes::Bytes> {
+    pub fn header(&self) -> Option<&ByteVec> {
         todo!()
     }
 
     /// Receives the next request item from the stream.
-    pub async fn recv(
-        &mut self,
-        buf: &mut impl writer::Storage,
-    ) -> Option<Result<(), stream::Error>> {
-        let _ = buf;
+    pub async fn recv(&mut self) -> Option<Result<ByteVec, stream::Error>> {
         todo!()
     }
 
@@ -78,25 +74,25 @@ pub struct Response {
 }
 
 impl Response {
-    pub async fn send(
-        self,
-        payload: &mut impl reader::storage::Infallible,
-    ) -> Result<(), stream::Error> {
-        let _ = payload;
+    pub async fn send_header(&mut self, header: ByteVec) -> Result<(), stream::Error> {
+        let _ = header;
         todo!()
     }
 
-    pub async fn send_with_header(
-        self,
-        header: &mut impl reader::storage::Infallible,
-        payload: &mut impl reader::storage::Infallible,
-    ) -> Result<(), stream::Error> {
-        let _ = (header, payload);
+    pub fn set_header(&mut self, header: ByteVec) -> Result<(), stream::Error> {
+        let _ = header;
         todo!()
     }
 
-    pub fn send_error(self, code: u32) -> Result<(), stream::Error> {
-        let _ = code;
+    /// Sends the response on the stream.
+    pub async fn send(&mut self, item: Item) -> Result<(), stream::Error> {
+        let _ = item;
+        todo!()
+    }
+
+    /// Closes the response side of the stream normally.
+    pub fn close(self, error: Option<ByteVec>) -> Result<(), stream::Error> {
+        let _ = error;
         todo!()
     }
 }

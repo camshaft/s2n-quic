@@ -4,9 +4,8 @@
 //! transfers (e.g., for broadcast scenarios). The buffer lifecycle progresses through
 //! states: allocated → filled → in-use → freed.
 
-use crate::worker;
-use s2n_quic_core::buffer::reader;
-use std::sync::Arc;
+use crate::ByteVec;
+use std::{ops::Range, sync::Arc};
 
 /// Unique identifier for a buffer.
 ///
@@ -32,29 +31,37 @@ struct AllocatorInner {
 }
 
 impl Allocator {
-    /// Allocates a buffer with the specified size.
+    /// Allocates a message from the given data.
     ///
-    /// Returns a handle that can be used to fill the buffer with data and then
-    /// use it for one or more transfers.
+    /// This is a convenience method for the common pattern of allocating a buffer
+    /// and immediately filling it with data.
     ///
     /// # Arguments
     ///
-    /// * `size` - The size of the buffer to allocate in bytes
+    /// * `data` - The data to store in the message
     ///
     /// # Returns
     ///
-    /// An allocation handle that can be configured and filled.
-    pub async fn allocate(&self, size: usize) -> Allocation {
-        let _ = size;
-        todo!()
+    /// A message ready to be used in transfers.
+    pub async fn allocate(&self, data: ByteVec) -> Message {
+        let mut builder = self.builder().await;
+        builder.push_back(data);
+        builder.build()
     }
 
-    /// Sets a preferred worker for NUMA locality.
+    /// Returns a builder for constructing a message with more control.
     ///
-    /// When specified, the allocator will try to allocate memory on the NUMA
-    /// node associated with this worker for better performance.
-    pub fn prefer_worker(self, worker: worker::Id) -> Self {
-        let _ = worker;
+    /// Use this when you need to:
+    /// - Add multiple chunks
+    /// - Mix plaintext and encrypted data
+    /// - Insert data at specific positions
+    ///
+    /// For simple cases, prefer `allocate()` which takes data directly.
+    ///
+    /// # Returns
+    ///
+    /// A builder that can be configured and filled.
+    pub async fn builder(&self) -> Builder {
         todo!()
     }
 }
@@ -63,40 +70,46 @@ impl Allocator {
 ///
 /// This type allows applications to specify preferences for worker/NUMA locality
 /// before the buffer is actually filled with data.
-pub struct Allocation {
+pub struct Builder {
     _todo: (),
 }
 
-impl Allocation {
-    /// Fills the buffer by copying pre-encrypted data.
+impl Builder {
+    pub fn push_front(&mut self, data: ByteVec) {
+        let _ = data;
+    }
+
+    pub fn push_back(&mut self, data: ByteVec) {
+        let _ = data;
+    }
+
+    /// Pushes a pre-encrypted chunk of data into the front of the message.
     ///
-    /// Use this when the application has already encrypted the data and wants
-    /// to copy it into the allocated buffer.
+    /// The provided tag is used to authenticate the payload and bind it to
+    /// the transmission.
+    pub fn push_front_encrypted(&mut self, data: ByteVec, tag: Range<usize>) {
+        let _ = data;
+        let _ = tag;
+    }
+
+    /// Pushes a pre-encrypted chunk of data onto the back of the message.
     ///
-    /// # Arguments
-    ///
-    /// * `data` - The pre-encrypted data to copy
-    /// * `auth_tag_range` - The byte range within the data that should be used
-    ///   for authenticating control messages (typically the GHASH tag)
-    pub fn fill_encrypted(
-        self,
-        data: &mut impl reader::storage::Infallible,
-        auth_tag_range: core::ops::Range<usize>,
-    ) -> Message {
-        let _ = (data, auth_tag_range);
+    /// The provided tag is used to authenticate the payload and bind it to
+    /// the transmission.
+    pub fn push_back_encrypted(&mut self, data: ByteVec, tag: Range<usize>) {
+        let _ = data;
+        let _ = tag;
+    }
+
+    pub fn len(&self) -> usize {
         todo!()
     }
 
-    /// Fills the buffer by encrypting plaintext data.
-    ///
-    /// The transport will encrypt the data using an ephemeral key and return
-    /// a handle that includes both the encrypted buffer and the key.
-    ///
-    /// # Arguments
-    ///
-    /// * `plaintext` - The data to encrypt
-    pub fn fill_plaintext(self, plaintext: &mut impl reader::storage::Infallible) -> Message {
-        let _ = plaintext;
+    pub fn is_empty(&self) -> bool {
+        todo!()
+    }
+
+    pub fn build(self) -> Message {
         todo!()
     }
 }

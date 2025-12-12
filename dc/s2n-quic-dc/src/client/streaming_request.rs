@@ -2,8 +2,12 @@
 //!
 //! A streaming request RPC sends multiple requests and receives a single response.
 
-use crate::{causality, message, priority::Priority, stream::Error};
-use s2n_quic_core::buffer::writer;
+use crate::{
+    causality, message,
+    priority::Priority,
+    stream::{Error, Item},
+    ByteVec,
+};
 
 /// Builder for configuring a streaming request RPC.
 pub struct Builder {
@@ -24,13 +28,13 @@ impl Builder {
     }
 
     /// Sets application metadata for RPC handler dispatch.
-    pub fn metadata(self, metadata: impl Into<bytes::Bytes>) -> Self {
+    pub fn metadata(self, metadata: ByteVec) -> Self {
         let _ = metadata;
         todo!()
     }
 
     /// Sets an optional request header.
-    pub fn header(self, header: impl Into<bytes::Bytes>) -> Self {
+    pub fn header(self, header: ByteVec) -> Self {
         let _ = header;
         todo!()
     }
@@ -91,48 +95,6 @@ impl Request {
     }
 }
 
-/// An item to be sent in a streaming request.
-///
-/// Items can have their own priority and dependencies, allowing fine-grained
-/// control over ordering and scheduling within the stream.
-pub struct Item {
-    #[expect(dead_code)]
-    message: message::Message,
-    priority: Option<Priority>,
-    dependency: Option<causality::Dependency>,
-}
-
-impl Item {
-    /// Creates a new item with the given message.
-    ///
-    /// # Arguments
-    ///
-    /// * `message` - The message payload for this item
-    pub fn new(message: message::Message) -> Self {
-        Self {
-            message,
-            priority: None,
-            dependency: None,
-        }
-    }
-
-    /// Sets the priority for this specific item.
-    ///
-    /// If not set, the item inherits the stream's priority.
-    pub fn priority(mut self, priority: Priority) -> Self {
-        self.priority = Some(priority);
-        self
-    }
-
-    /// Adds a causality dependency for this specific item.
-    ///
-    /// This item will wait for the dependency to be satisfied before being sent.
-    pub fn depends_on(mut self, dependency: causality::Dependency) -> Self {
-        self.dependency = Some(dependency);
-        self
-    }
-}
-
 /// A response from a streaming request RPC.
 pub struct Response {
     _todo: (),
@@ -140,18 +102,12 @@ pub struct Response {
 
 impl Response {
     /// Returns the optional response header.
-    pub fn header(&self) -> Option<&bytes::Bytes> {
-        todo!()
-    }
-
-    /// Reads the response body into the provided buffer.
-    pub async fn read_into(self, buf: &mut impl writer::Storage) -> Result<(), Error> {
-        let _ = buf;
+    pub fn header(&self) -> Option<&ByteVec> {
         todo!()
     }
 
     /// Consumes the response and returns the body as bytes.
-    pub async fn into_bytes(self) -> Result<bytes::Bytes, Error> {
+    pub async fn recv(self) -> Result<ByteVec, Error> {
         todo!()
     }
 }

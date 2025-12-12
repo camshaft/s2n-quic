@@ -5,9 +5,9 @@
 use crate::{
     priority::Priority,
     server::{AcceptError, RejectReason},
-    stream::{self, Backpressure},
+    stream::{self, Backpressure, Item},
+    ByteVec,
 };
-use s2n_quic_core::buffer::{reader, writer};
 use std::net::SocketAddr;
 
 /// A request for an incoming streaming response RPC transfer.
@@ -20,7 +20,7 @@ impl Request {
         todo!()
     }
 
-    pub fn metadata(&self) -> Option<&[u8]> {
+    pub fn metadata(&self) -> Option<&ByteVec> {
         todo!()
     }
 
@@ -28,7 +28,7 @@ impl Request {
         todo!()
     }
 
-    pub fn header(&self) -> Option<&bytes::Bytes> {
+    pub fn header(&self) -> Option<&ByteVec> {
         todo!()
     }
 
@@ -57,16 +57,12 @@ pub struct Stream {
 }
 
 impl Stream {
-    pub fn header(&self) -> Option<&bytes::Bytes> {
+    pub fn header(&self) -> Option<&ByteVec> {
         todo!()
     }
 
     /// Reads the request payload into the provided buffer.
-    pub async fn read_payload(
-        self,
-        buf: &mut impl writer::Storage,
-    ) -> Result<Response, stream::Error> {
-        let _ = buf;
+    pub async fn recv(self) -> Result<(ByteVec, Response), stream::Error> {
         todo!()
     }
 }
@@ -77,33 +73,25 @@ pub struct Response {
 }
 
 impl Response {
+    pub async fn send_header(&mut self, header: ByteVec) -> Result<(), stream::Error> {
+        let _ = header;
+        todo!()
+    }
+
+    pub fn set_header(&mut self, header: ByteVec) -> Result<(), stream::Error> {
+        let _ = header;
+        todo!()
+    }
+
     /// Sends a response item in the stream.
-    pub async fn send(
-        &mut self,
-        payload: &mut impl reader::storage::Infallible,
-    ) -> Result<(), stream::Error> {
-        let _ = payload;
+    pub async fn send(&mut self, item: Item) -> Result<(), stream::Error> {
+        let _ = item;
         todo!()
     }
 
-    /// Sends a response item with a header.
-    pub async fn send_with_header(
-        &mut self,
-        header: &mut impl reader::storage::Infallible,
-        payload: &mut impl reader::storage::Infallible,
-    ) -> Result<(), stream::Error> {
-        let _ = (header, payload);
-        todo!()
-    }
-
-    /// Closes the stream normally.
-    pub fn close(self) -> Result<(), stream::Error> {
-        todo!()
-    }
-
-    /// Closes the stream with an error code.
-    pub fn close_with_error(self, code: u32) -> Result<(), stream::Error> {
-        let _ = code;
+    /// Closes the response side of the stream normally.
+    pub fn close(self, error: Option<ByteVec>) -> Result<(), stream::Error> {
+        let _ = error;
         todo!()
     }
 }
