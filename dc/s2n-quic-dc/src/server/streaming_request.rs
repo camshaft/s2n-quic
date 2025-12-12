@@ -32,11 +32,11 @@ impl Request {
         todo!()
     }
 
-    pub async fn accept(self) -> Result<Stream, AcceptError> {
-        self.accept_with(Backpressure::default()).await
+    pub fn accept(self) -> Result<Stream, AcceptError> {
+        self.accept_with(Backpressure::default())
     }
 
-    pub async fn accept_with(self, config: Backpressure) -> Result<Stream, AcceptError> {
+    pub fn accept_with(self, config: Backpressure) -> Result<Stream, AcceptError> {
         let _ = config;
         todo!()
     }

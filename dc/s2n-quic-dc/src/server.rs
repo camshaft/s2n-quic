@@ -49,8 +49,8 @@ impl Server {
 /// impl Handler for MyHandler {
 ///     fn handle_unary(&self, request: unary::Request) {
 ///         // Application chooses what to do:
+///         let stream = request.accept(Backpressure::default()).unwrap();
 ///         tokio::spawn(async move {
-///             let stream = request.accept(Backpressure::default()).await.unwrap();
 ///             // ... handle the stream
 ///         });
 ///         

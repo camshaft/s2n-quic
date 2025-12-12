@@ -5,15 +5,70 @@
 //! states: allocated → filled → in-use → freed.
 
 use crate::ByteVec;
-use std::{ops::Range, sync::Arc};
+use std::{ops::Range, pin::Pin, sync::Arc};
 
-/// Unique identifier for a buffer.
+mod udp;
+
+/// Unique identifier for a message.
 ///
-/// Buffer IDs are used to reference buffers in protocol messages and enable
-/// efficient lookup in the buffer registry.
+/// Message IDs are used to reference buffers in protocol messages and enable
+/// efficient lookup by the transport.
+///
+/// For UDP, the ID is a slot index.
+/// For libfabric, the ID is the raw pointer to the iov struct for this message.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct BufferId {
-    _todo: (),
+#[repr(transparent)]
+pub struct Id(u64);
+
+impl Id {
+    /// Creates a new Id
+    #[inline]
+    pub(crate) fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    /// Returns the raw value of the ID
+    #[inline]
+    pub(crate) fn as_u64(self) -> u64 {
+        self.0
+    }
+}
+
+/// Key used to authenticate the message
+///
+/// For UDP, this is the generation ID for the slot index.
+/// For libfabric, this is the `fi_mr_key`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[repr(transparent)]
+pub struct Key(u64);
+
+impl Key {
+    /// Creates a new Key
+    #[inline]
+    pub(crate) fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    /// Returns the raw value
+    #[inline]
+    pub(crate) fn as_u64(self) -> u64 {
+        self.0
+    }
+}
+
+/// Trait for transport-specific buffer allocation implementations
+///
+/// Different transports (UDP, libfabric) have different requirements for
+/// buffer management. This trait abstracts those differences.
+trait Backend: 'static + Send + Sync {
+    /// Allocates a new message with the given data
+    fn register(&self, data: Regions) -> Pin<Arc<dyn Handle>>;
+}
+
+trait Handle: 'static + Send + Sync {
+    fn id(&self) -> Id;
+    fn key(&self) -> Key;
+    fn len(&self) -> usize;
 }
 
 /// Handle for allocating buffers.
@@ -22,12 +77,26 @@ pub struct BufferId {
 /// allocation when workers are assigned to specific NUMA nodes.
 #[derive(Clone)]
 pub struct Allocator {
-    #[expect(dead_code)]
-    inner: Arc<AllocatorInner>,
+    backend: Arc<dyn Backend>,
 }
 
-struct AllocatorInner {
-    _todo: (),
+impl Allocator {
+    /// Creates a new UDP-based allocator
+    ///
+    /// Uses slot-based allocation for message identification
+    pub fn new_udp() -> Self {
+        todo!()
+    }
+
+    // TODO: Add when libfabric module is ready
+    // /// Creates a new libfabric-based allocator
+    // ///
+    // /// Uses fi_mr_regv for memory registration and pointer-based identification
+    // pub fn new_libfabric(/* libfabric domain */) -> Self {
+    //     Self {
+    //         backend: Arc::new(LibfabricAllocator::new(/* ... */)),
+    //     }
+    // }
 }
 
 impl Allocator {
@@ -114,6 +183,11 @@ impl Builder {
     }
 }
 
+struct Regions {
+    data: ByteVec,
+    tags: Vec<Range<usize>>,
+}
+
 /// A filled buffer ready for use in transfers.
 ///
 /// This type is cloneable and can be used in multiple transfers. The underlying
@@ -124,8 +198,8 @@ pub struct Message {
 }
 
 impl Message {
-    /// Returns the buffer ID for this message.
-    pub fn id(&self) -> BufferId {
+    /// Returns the ID for this message.
+    pub fn id(&self) -> Id {
         todo!()
     }
 
