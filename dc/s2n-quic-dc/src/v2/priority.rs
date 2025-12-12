@@ -3,7 +3,8 @@
 
 //! Priority levels for transfer scheduling
 //!
-//! The system supports 8 priority levels, from 0 (highest) to 7 (lowest).
+//! The system supports exactly 8 priority levels, numbered 0-7, where
+//! 0 is the highest priority and 7 is the lowest priority.
 //! Higher priority transfers are scheduled before lower priority ones when
 //! bandwidth is constrained.
 
@@ -11,7 +12,10 @@ use core::fmt;
 
 /// Priority level for a transfer
 ///
-/// Priority levels range from 0 (highest) to 7 (lowest).
+/// There are exactly 8 priority levels, numbered 0-7:
+/// - 0 is the highest priority
+/// - 7 is the lowest priority
+///
 /// Higher priority transfers receive preferential scheduling
 /// when bandwidth is limited.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
