@@ -19,10 +19,6 @@ mod libfabric;
 #[path = "libfabric_polyfill.rs"]
 mod libfabric;
 
-// Also create the polyfill module for when it's explicitly imported
-#[cfg(not(feature = "libfabric"))]
-mod libfabric_polyfill;
-
 // pub use s2n_quic_core::dc::{Version, SUPPORTED_VERSIONS};
 pub use bytevec::ByteVec;
 

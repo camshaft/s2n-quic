@@ -417,6 +417,11 @@ pub mod endpoint {
         }
 
         /// Send a message (UDP send)
+        ///
+        /// # Note
+        /// This is a partial implementation. The polyfill provides the basic structure
+        /// but full UDP send logic needs integration with the transport layer's message
+        /// protocol (see V2.md for DATA_CHUNKS message design).
         pub fn send(
             &self,
             mr: &memory_registration::Send,
@@ -428,12 +433,14 @@ pub mod endpoint {
             }
 
             let socket_guard = self.inner.socket.lock().unwrap();
-            if let Some(socket) = socket_guard.as_ref() {
-                // In a real implementation, dest_addr would be resolved via address_vector
-                // For now, this is a simplified stub that returns success
-                // The actual sending would happen here:
-                // socket.send_to(&mr.buffer()[..len], dest_addr)?;
-                let _ = (socket, mr, len, dest_addr);
+            if let Some(_socket) = socket_guard.as_ref() {
+                // TODO: Full implementation would:
+                // 1. Resolve dest_addr via address vector to get SocketAddr
+                // 2. Send buffer data over UDP: socket.send_to(&mr.buffer()[..len], addr)
+                // 3. Post completion to bound completion queue
+                //
+                // For now, return success to satisfy API contract
+                let _ = (mr, len, dest_addr);
                 Ok(())
             } else {
                 Err(Error::from_code(-9)) // EBADF
@@ -441,17 +448,25 @@ pub mod endpoint {
         }
 
         /// Post a receive buffer
+        ///
+        /// # Note
+        /// This is a partial implementation. Full implementation would queue the buffer
+        /// and poll the socket to fill it with incoming data.
         pub fn recv(
             &self,
             _mr: memory_registration::Receive,
             _src_addr: u64,
         ) -> Result<(), Error> {
-            // In UDP polyfill, receives are handled by polling the socket
-            // This operation queues the buffer for completion
+            // TODO: Queue buffer for receives and poll socket
+            // For now, return success to satisfy API contract
             Ok(())
         }
 
         /// RDMA read operation (simulated over UDP)
+        ///
+        /// # Note
+        /// This is a partial implementation. Full implementation would send a
+        /// READ_REQUEST message and wait for READ_RESPONSE (see V2.md protocol).
         pub fn read(
             &self,
             _mr: memory_registration::Receive,
@@ -460,12 +475,15 @@ pub mod endpoint {
             _remote_addr: u64,
             _remote_key: u64,
         ) -> Result<(), Error> {
-            // RDMA read in UDP polyfill: send a READ_REQUEST message
-            // and wait for READ_RESPONSE with the data
+            // TODO: Implement READ_REQUEST/RESPONSE protocol
             Ok(())
         }
 
         /// RDMA write operation (simulated over UDP)
+        ///
+        /// # Note
+        /// This is a partial implementation. Full implementation would send buffer
+        /// contents in a WRITE_DATA message to simulate direct memory write (see V2.md).
         pub fn write(
             &self,
             _mr: &memory_registration::Send,
@@ -474,8 +492,7 @@ pub mod endpoint {
             _remote_addr: u64,
             _remote_key: u64,
         ) -> Result<(), Error> {
-            // RDMA write in UDP polyfill: send a WRITE_DATA message
-            // containing the buffer contents to simulate direct memory write
+            // TODO: Send WRITE_DATA message with buffer contents
             Ok(())
         }
     }
@@ -629,6 +646,20 @@ pub mod memory_registration {
     // Global counter for generating unique memory keys
     static MEMORY_KEY_COUNTER: AtomicU64 = AtomicU64::new(1);
 
+    // Type tag for identifying memory region types
+    #[repr(u8)]
+    #[derive(Clone, Copy, Debug)]
+    enum RegionType {
+        Send = 0,
+        Receive = 1,
+    }
+
+    // Header stored at the beginning of each memory region for type identification
+    #[repr(C)]
+    struct RegionHeader {
+        type_tag: RegionType,
+    }
+
     /// UDP-based memory region for send operations
     ///
     /// In the polyfill, "memory registration" is simulated by:
@@ -642,7 +673,9 @@ pub mod memory_registration {
         inner: Arc<SendInner>,
     }
 
+    #[repr(C)]
     struct SendInner {
+        header: RegionHeader,
         buffer: crate::ByteVec,
         key: u64,
         _access: Access,
@@ -658,6 +691,9 @@ pub mod memory_registration {
             let key = MEMORY_KEY_COUNTER.fetch_add(1, Ordering::Relaxed);
 
             let inner = Arc::new(SendInner {
+                header: RegionHeader {
+                    type_tag: RegionType::Send,
+                },
                 buffer,
                 key,
                 _access: access,
@@ -690,8 +726,12 @@ pub mod memory_registration {
             core::ptr::null_mut()
         }
 
-        /// Get iov array (for compatibility)
-        pub fn iov(&self) -> &[std::mem::MaybeUninit<libc::iovec>] {
+        /// Get iov array (for compatibility - returns empty in polyfill)
+        ///
+        /// The UDP polyfill doesn't use scatter-gather I/O, so this returns an empty slice.
+        /// The real libfabric implementation would return actual iovec structures.
+        #[allow(dead_code)]
+        pub fn iov(&self) -> &[u8] {
             // Return empty slice - UDP polyfill doesn't use scatter-gather
             &[]
         }
@@ -715,7 +755,9 @@ pub mod memory_registration {
         inner: Box<ReceiveInner>,
     }
 
+    #[repr(C)]
     struct ReceiveInner {
+        header: RegionHeader,
         buffer: crate::bytevec::BytesMut,
         key: u64,
         _access: Access,
@@ -730,6 +772,9 @@ pub mod memory_registration {
             let key = MEMORY_KEY_COUNTER.fetch_add(1, Ordering::Relaxed);
 
             let inner = Box::new(ReceiveInner {
+                header: RegionHeader {
+                    type_tag: RegionType::Receive,
+                },
                 buffer,
                 key,
                 _access: access,
@@ -790,12 +835,18 @@ pub mod memory_registration {
         /// The context pointer must have been created by `into_context()` from either
         /// Send or Receive.
         pub unsafe fn from_context(context: *mut core::ffi::c_void) -> Self {
-            // In the polyfill, we need to determine the type
-            // For simplicity, we'll use a tag-based approach
-            // Try to reconstruct as Send first (Arc), then Receive (Box)
-            // This is a simplified implementation
-            let inner = Arc::from_raw(context as *const SendInner);
-            Self::Send(Send { inner })
+            // Read the type tag from the header (first field of both SendInner and ReceiveInner)
+            let header = &*(context as *const RegionHeader);
+            match header.type_tag {
+                RegionType::Send => {
+                    let inner = Arc::from_raw(context as *const SendInner);
+                    Self::Send(Send { inner })
+                }
+                RegionType::Receive => {
+                    let inner = Box::from_raw(context as *mut ReceiveInner);
+                    Self::Receive(Receive { inner })
+                }
+            }
         }
     }
 }

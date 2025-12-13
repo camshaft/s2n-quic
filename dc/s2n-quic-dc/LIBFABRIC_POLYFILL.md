@@ -120,6 +120,24 @@ socket.set_nonblocking(true)?;
 
 Operations return immediately and completions are delivered via the completion queue.
 
+## Implementation Status
+
+The polyfill currently provides:
+
+✅ **Fully Implemented:**
+- Memory registration with synthetic key generation
+- Address vector with handle-to-address mapping
+- Completion queue structure
+- Endpoint lifecycle management
+- UDP socket creation and binding
+- Type-safe memory region reconstruction
+
+⚠️ **Partial Implementation:**
+- Send/recv operations (structure in place, needs protocol integration)
+- RDMA write/read (stubs present, needs DATA_CHUNKS/REQUEST protocol)
+
+The partial implementations provide API compatibility and basic structure. Full functionality requires integration with the transport layer's message protocol described in V2.md (DATA_CHUNKS, READ_REQUEST/RESPONSE, WRITE_DATA messages).
+
 ## Limitations
 
 The polyfill provides functional implementations but with some differences from hardware RDMA:
@@ -129,10 +147,12 @@ The polyfill provides functional implementations but with some differences from 
 3. **Reliability**: UDP requires application-level retransmission for reliability
 4. **Memory**: No true zero-copy - data is copied through userspace buffers
 5. **Bandwidth**: Limited by UDP socket buffer sizes and kernel networking stack
+6. **Protocol integration**: Send/recv operations need full message protocol implementation
 
 These limitations are acceptable for:
 - Development and testing environments
 - Platforms without RDMA hardware
+- API compatibility testing
 - Scenarios where functionality is more important than peak performance
 
 ## Testing
