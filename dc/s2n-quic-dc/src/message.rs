@@ -7,7 +7,8 @@
 use crate::ByteVec;
 use std::{ops::Range, pin::Pin, sync::Arc};
 
-#[cfg(target_os = "linux")]
+// Only include libfabric-specific message handling when the feature is enabled
+#[cfg(feature = "libfabric")]
 mod libfabric;
 mod udp;
 

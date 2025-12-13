@@ -1,0 +1,10 @@
+[package]
+name = "ofi-libfabric-sys-polyfill"
+version = "0.1.0"
+edition = "2021"
+description = "UDP-based polyfill for ofi-libfabric-sys FFI bindings"
+license = "Apache-2.0"
+
+[dependencies]
+libc = "0.2"
+parking_lot = "0.12"
