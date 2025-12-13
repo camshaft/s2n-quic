@@ -10,13 +10,15 @@ pub mod server;
 pub mod stream;
 pub mod worker;
 
-// Use the real libfabric when the feature is enabled
-#[cfg(feature = "libfabric")]
-mod libfabric;
+// Re-export the appropriate libfabric sys crate based on features
+#[cfg(all(feature = "libfabric", not(feature = "libfabric-polyfill")))]
+use ofi_libfabric_sys as libfabric_sys;
 
-// Use the polyfill when libfabric feature is not enabled
-#[cfg(not(feature = "libfabric"))]
-#[path = "libfabric_polyfill.rs"]
+#[cfg(all(not(feature = "libfabric"), feature = "libfabric-polyfill"))]
+use ofi_libfabric_sys_polyfill as libfabric_sys;
+
+// The libfabric module uses the sys crate through the re-export
+#[cfg(any(feature = "libfabric", feature = "libfabric-polyfill"))]
 mod libfabric;
 
 // pub use s2n_quic_core::dc::{Version, SUPPORTED_VERSIONS};

@@ -11,13 +11,15 @@ license = "Apache-2.0"
 exclude = ["corpus.tar.gz"]
 
 [features]
-default = ["tokio"]
+default = ["tokio", "libfabric-polyfill"]
 testing = ["dep:bach", "bolero-generator", "s2n-quic-core/testing", "s2n-quic-platform/testing", "tracing-subscriber"]
 tokio = ["tokio/io-util", "tokio/net", "tokio/rt-multi-thread", "tokio/time"]
 # Enable libfabric support for hardware RDMA (requires libfabric to be installed).
-# When disabled, a UDP-based polyfill provides the same API without hardware dependencies.
+# When disabled, the libfabric-polyfill feature is used by default.
 # See LIBFABRIC_POLYFILL.md for details.
 libfabric = ["dep:ofi-libfabric-sys"]
+# UDP-based polyfill for libfabric (enabled by default, provides sys-level FFI compatibility)
+libfabric-polyfill = ["dep:ofi-libfabric-sys-polyfill"]
 
 [dependencies]
 ahash = "0.8"
@@ -58,6 +60,11 @@ nix = { version = "0.30.1", features = ["socket", "uio", "fs", "time"] }
 
 [dependencies.ofi-libfabric-sys]
 version = "0.1"
+optional = true
+
+[dependencies.ofi-libfabric-sys-polyfill]
+path = "../ofi-libfabric-sys-polyfill"
+package = "ofi-libfabric-sys-polyfill"
 optional = true
 
 [dev-dependencies]

@@ -1,6 +1,6 @@
 use bitflags::bitflags;
 use core::{ffi::CStr, fmt, ptr::NonNull};
-use ofi_libfabric_sys::bindgen::*;
+use crate::libfabric_sys::bindgen::*;
 
 #[macro_use]
 mod macros;
