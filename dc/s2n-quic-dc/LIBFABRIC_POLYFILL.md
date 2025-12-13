@@ -10,7 +10,7 @@ The libfabric polyfill provides a userspace implementation of libfabric operatio
 - The platform doesn't support libfabric (e.g., macOS, Windows)  
 - RDMA hardware is not available (e.g., development machines, cloud instances without EFA)
 
-The polyfill implements libfabric operations over UDP sockets, providing actual functionality rather than just stub implementations.
+The polyfill is implemented at the FFI layer (`ofi-libfabric-sys-polyfill` crate), providing binary-compatible replacements for all libfabric C functions. This allows the high-level Rust bindings in `src/libfabric.rs` to work unchanged with either the real libfabric or the polyfill.
 
 ## Feature Flag
 
@@ -37,6 +37,11 @@ cargo build  # polyfill is used by default when libfabric feature is not enabled
 ```
 
 ## Architecture
+
+The polyfill is implemented in two layers:
+
+1. **FFI Layer** (`dc/ofi-libfabric-sys-polyfill/`) - Provides C-compatible functions matching libfabric's API
+2. **High-Level Bindings** (`dc/s2n-quic-dc/src/libfabric.rs`) - Rust-safe wrappers (works with both real and polyfill)
 
 The polyfill maps libfabric concepts to userspace UDP implementations:
 
@@ -160,14 +165,17 @@ These limitations are acceptable for:
 Build and test with the polyfill:
 
 ```bash
-# Build with polyfill
-cargo build --package s2n-quic-dc --no-default-features
+# Build with polyfill (default)
+cargo build --package s2n-quic-dc
+
+# Build with polyfill explicitly
+cargo build --package s2n-quic-dc --features libfabric-polyfill --no-default-features
 
 # Run tests with polyfill  
-cargo test --package s2n-quic-dc --no-default-features
+cargo test --package s2n-quic-dc
 
 # Build with real libfabric (requires libfabric installed)
-cargo build --package s2n-quic-dc --features libfabric
+cargo build --package s2n-quic-dc --features libfabric --no-default-features
 ```
 
 ## Future Enhancements
@@ -189,5 +197,5 @@ The polyfill maintains API compatibility with the real libfabric module. Code us
 
 - [V2.md](V2.md) - Overall transport architecture and protocol design
 - [libfabric documentation](https://ofiwg.github.io/libfabric/) - Official libfabric docs
-- `src/libfabric.rs` - Real libfabric bindings
-- `src/libfabric_polyfill.rs` - UDP-based polyfill implementation
+- `src/libfabric.rs` - High-level Rust bindings (works with both real and polyfill)
+- `../ofi-libfabric-sys-polyfill/src/lib.rs` - FFI-level UDP polyfill implementation
