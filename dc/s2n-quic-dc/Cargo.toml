@@ -14,7 +14,9 @@ exclude = ["corpus.tar.gz"]
 default = ["tokio"]
 testing = ["dep:bach", "bolero-generator", "s2n-quic-core/testing", "s2n-quic-platform/testing", "tracing-subscriber"]
 tokio = ["tokio/io-util", "tokio/net", "tokio/rt-multi-thread", "tokio/time"]
-# Enable libfabric support for RDMA on Linux (requires libfabric to be installed)
+# Enable libfabric support for hardware RDMA (requires libfabric to be installed).
+# When disabled, a UDP-based polyfill provides the same API without hardware dependencies.
+# See LIBFABRIC_POLYFILL.md for details.
 libfabric = ["dep:ofi-libfabric-sys"]
 
 [dependencies]
