@@ -11,13 +11,15 @@ license = "Apache-2.0"
 exclude = ["corpus.tar.gz"]
 
 [features]
-default = ["tokio", "libfabric-vendored"]
+default = ["tokio", "libfabric-polyfill"]
 testing = ["dep:bach", "bolero-generator", "s2n-quic-core/testing", "s2n-quic-platform/testing", "tracing-subscriber"]
 tokio = ["tokio/io-util", "tokio/net", "tokio/rt-multi-thread", "tokio/time"]
-# Use system libfabric (requires libfabric to be installed)
-libfabric-system = ["dep:ofi-libfabric-sys"]
-# Use vendored libfabric (works on all platforms, enabled by default)
-libfabric-vendored = ["dep:ofi-libfabric-sys", "ofi-libfabric-sys/vendored"]
+# Use system libfabric with custom UDP provider for runtime fallback
+# This is the recommended configuration for Linux deployments
+libfabric = ["dep:ofi-libfabric-sys"]
+# FFI polyfill for platforms where libfabric cannot be installed (macOS, Windows)
+# This provides a complete FFI implementation that mimics libfabric
+libfabric-polyfill = ["dep:ofi-libfabric-sys-polyfill"]
 
 [dependencies]
 ahash = "0.8"
@@ -59,7 +61,10 @@ nix = { version = "0.30.1", features = ["socket", "uio", "fs", "time"] }
 [dependencies.ofi-libfabric-sys]
 version = "0.1"
 optional = true
-default-features = false
+
+[dependencies.ofi-libfabric-sys-polyfill]
+path = "../ofi-libfabric-sys-polyfill"
+optional = true
 
 [dev-dependencies]
 bach = { version = "0.1.0", features = ["net", "net-monitor", "tokio-compat"] }

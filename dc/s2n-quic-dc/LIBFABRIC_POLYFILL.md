@@ -1,53 +1,76 @@
-# Libfabric Polyfill and Runtime Fallback
+# Libfabric Provider Strategy
 
-This document describes the libfabric support strategy in s2n-quic-dc, which includes both compile-time polyfills and runtime fallback.
+This document describes the libfabric support strategy in s2n-quic-dc.
 
 ## Overview
 
-S2n-quic-dc supports three levels of libfabric integration:
+S2n-quic-dc uses libfabric as its abstraction layer, with two main approaches:
 
-1. **Compile-time polyfill** - For platforms that never have libfabric (macOS, Windows, embedded)
-2. **Runtime fallback** - For platforms that might have libfabric, with automatic detection
-3. **Native libfabric** - When available and successfully initialized
+1. **Custom Provider** - UDP-based provider that registers with libfabric (Linux with libfabric installed)
+2. **FFI Polyfill** - Complete FFI implementation for platforms without libfabric (macOS, Windows)
 
-This multi-level approach ensures the system works everywhere while utilizing hardware acceleration when available.
+All code uses the standard libfabric API - the differences are transparent.
 
-## Three Levels of Support
+## Approach 1: Custom Libfabric Provider (Recommended for Linux)
 
-### 1. Compile-Time Polyfill
+When libfabric is available at build time, we register a custom UDP-based provider with libfabric's provider interface.
 
-The `ofi-libfabric-sys-polyfill` crate provides FFI-compatible replacements for all libfabric C functions. This is used when:
-- Building for platforms without libfabric support (macOS, Windows)
-- Compile-time decision to avoid libfabric dependency
+### How It Works
 
-The polyfill implements the libfabric FFI layer, allowing high-level bindings in `src/libfabric.rs` to work unchanged.
+1. System has libfabric library installed
+2. At runtime, libfabric discovers available providers (EFA, verbs, our UDP provider, etc.)
+3. If RDMA hardware available → uses native provider (EFA, verbs)
+4. If no RDMA hardware → falls back to our custom UDP provider
+5. Application code uses libfabric API unchanged in all cases
 
-### 2. Runtime Fallback
+### Key Features
 
-The `transport` module provides a provider abstraction that detects capabilities at runtime:
-- Attempts to initialize libfabric
-- If initialization fails (library not found, no RDMA hardware, permissions), falls back to UDP
-- Transparent to application code
+- Single codebase using libfabric API everywhere
+- Runtime provider selection (no application changes needed)
+- Custom provider implements `fi_provider` interface
+- UDP-based transport when RDMA unavailable
+- Seamless fallback without rebuilding
 
-This is the **recommended approach** for Linux deployments that may or may not have EFA/RDMA.
+### Implementation
 
-### 3. Native Libfabric
+The `libfabric_udp_provider` module implements:
+- Provider registration with libfabric
+- UDP socket management
+- Memory registration (synthetic keys)
+- Send/recv and RDMA-like operations over UDP
+- Completion queues
 
-When libfabric is available and successfully initializes, the system uses hardware RDMA for maximum performance.
+## Approach 2: FFI Polyfill (For Platforms Without Libfabric)
+
+When libfabric cannot be installed (macOS, Windows), the `ofi-libfabric-sys-polyfill` crate provides a complete FFI replacement.
+
+### How It Works
+
+1. Platform doesn't have libfabric (e.g., macOS during development)
+2. FFI polyfill provides all libfabric C functions
+3. High-level bindings work unchanged
+4. UDP-based implementation behind FFI
+
+### Key Features
+
+- Works on any platform
+- Complete libfabric API compatibility
+- No external dependencies
+- Enabled by default for portability
 
 ## Feature Flags
 
 ```toml
 [features]
 default = ["tokio", "libfabric-polyfill"]
-libfabric = ["dep:ofi-libfabric-sys"]           # Real libfabric with runtime fallback
-libfabric-polyfill = ["dep:ofi-libfabric-sys-polyfill"]  # Compile-time polyfill
+libfabric = ["dep:ofi-libfabric-sys"]               # System libfabric + custom UDP provider
+libfabric-polyfill = ["dep:ofi-libfabric-sys-polyfill"]  # FFI polyfill for non-Linux
 ```
 
-### Recommended: Runtime Fallback (Linux)
+### For Linux Production (Recommended)
 
 ```bash
-# Build with libfabric support + automatic UDP fallback
+# Build with system libfabric + custom UDP provider for fallback
 cargo build --features libfabric --no-default-features --features tokio
 
 # At runtime:
