@@ -8,6 +8,7 @@ pub mod message;
 pub mod priority;
 pub mod server;
 pub mod stream;
+pub mod transport;
 pub mod worker;
 
 // Re-export the appropriate libfabric sys crate based on features

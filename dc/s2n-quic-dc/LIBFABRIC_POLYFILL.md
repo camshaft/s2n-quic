@@ -1,49 +1,111 @@
-# Libfabric Polyfill
+# Libfabric Polyfill and Runtime Fallback
 
-This document describes the UDP-based polyfill implementation for libfabric functionality in s2n-quic-dc.
+This document describes the libfabric support strategy in s2n-quic-dc, which includes both compile-time polyfills and runtime fallback.
 
 ## Overview
 
-The libfabric polyfill provides a userspace implementation of libfabric operations that can be used when:
+S2n-quic-dc supports three levels of libfabric integration:
 
-- Libfabric is not installed on the system
-- The platform doesn't support libfabric (e.g., macOS, Windows)  
-- RDMA hardware is not available (e.g., development machines, cloud instances without EFA)
+1. **Compile-time polyfill** - For platforms that never have libfabric (macOS, Windows, embedded)
+2. **Runtime fallback** - For platforms that might have libfabric, with automatic detection
+3. **Native libfabric** - When available and successfully initialized
 
-The polyfill is implemented at the FFI layer (`ofi-libfabric-sys-polyfill` crate), providing binary-compatible replacements for all libfabric C functions. This allows the high-level Rust bindings in `src/libfabric.rs` to work unchanged with either the real libfabric or the polyfill.
+This multi-level approach ensures the system works everywhere while utilizing hardware acceleration when available.
 
-## Feature Flag
+## Three Levels of Support
 
-The libfabric dependency is controlled by the `libfabric` cargo feature:
+### 1. Compile-Time Polyfill
+
+The `ofi-libfabric-sys-polyfill` crate provides FFI-compatible replacements for all libfabric C functions. This is used when:
+- Building for platforms without libfabric support (macOS, Windows)
+- Compile-time decision to avoid libfabric dependency
+
+The polyfill implements the libfabric FFI layer, allowing high-level bindings in `src/libfabric.rs` to work unchanged.
+
+### 2. Runtime Fallback
+
+The `transport` module provides a provider abstraction that detects capabilities at runtime:
+- Attempts to initialize libfabric
+- If initialization fails (library not found, no RDMA hardware, permissions), falls back to UDP
+- Transparent to application code
+
+This is the **recommended approach** for Linux deployments that may or may not have EFA/RDMA.
+
+### 3. Native Libfabric
+
+When libfabric is available and successfully initializes, the system uses hardware RDMA for maximum performance.
+
+## Feature Flags
 
 ```toml
-# Cargo.toml
 [features]
-libfabric = ["dep:ofi-libfabric-sys"]
+default = ["tokio", "libfabric-polyfill"]
+libfabric = ["dep:ofi-libfabric-sys"]           # Real libfabric with runtime fallback
+libfabric-polyfill = ["dep:ofi-libfabric-sys-polyfill"]  # Compile-time polyfill
 ```
 
-### Building with Libfabric (requires libfabric installed)
+### Recommended: Runtime Fallback (Linux)
 
 ```bash
-cargo build --features libfabric
+# Build with libfabric support + automatic UDP fallback
+cargo build --features libfabric --no-default-features --features tokio
+
+# At runtime:
+# - Tries to initialize libfabric
+# - Falls back to UDP if libfabric unavailable
+# - Transparent to application
 ```
 
-### Building with UDP Polyfill (no libfabric required)
+### Compile-Time Polyfill (macOS, Windows, embedded)
 
 ```bash
-cargo build --no-default-features
-# or
-cargo build  # polyfill is used by default when libfabric feature is not enabled
+# Build with UDP-only (no libfabric dependency)
+cargo build  # default includes libfabric-polyfill
+```
+
+### Testing Both Paths
+
+```bash
+# Test with compile-time polyfill
+cargo test --package s2n-quic-dc
+
+# Test with libfabric (if available on your system)
+cargo test --package s2n-quic-dc --features libfabric --no-default-features --features tokio
 ```
 
 ## Architecture
 
-The polyfill is implemented in two layers:
+### Layer 1: FFI Layer (Compile-Time)
 
-1. **FFI Layer** (`dc/ofi-libfabric-sys-polyfill/`) - Provides C-compatible functions matching libfabric's API
-2. **High-Level Bindings** (`dc/s2n-quic-dc/src/libfabric.rs`) - Rust-safe wrappers (works with both real and polyfill)
+**Files:** `dc/ofi-libfabric-sys-polyfill/`
 
-The polyfill maps libfabric concepts to userspace UDP implementations:
+Provides C-compatible functions matching libfabric's API. Used when `libfabric-polyfill` feature is enabled (default).
+
+### Layer 2: High-Level Bindings
+
+**Files:** `dc/s2n-quic-dc/src/libfabric.rs`
+
+Rust-safe wrappers over FFI layer. Works with both real libfabric and polyfill.
+
+### Layer 3: Transport Provider Abstraction (Runtime)
+
+**Files:** `dc/s2n-quic-dc/src/transport.rs`
+
+Runtime provider selection with automatic fallback:
+
+```rust
+pub trait TransportProvider {
+    fn transport_type(&self) -> TransportType;  // Libfabric or Udp
+    fn initialize(&mut self) -> io::Result<()>; // May fail
+    fn send(&self, ...) -> io::Result<usize>;
+    // ... other operations
+}
+
+// Automatically selects best available provider
+let provider = select_provider()?;
+```
+
+The provider abstraction maps transport concepts to implementations:
 
 ### Memory Registration
 
@@ -159,6 +221,36 @@ These limitations are acceptable for:
 - Platforms without RDMA hardware
 - API compatibility testing
 - Scenarios where functionality is more important than peak performance
+
+## When to Use Which Approach
+
+### Use Runtime Fallback When:
+- ✅ Deploying to Linux that **might** have EFA/RDMA
+- ✅ Want maximum performance when available
+- ✅ Need graceful degradation when hardware unavailable
+- ✅ AWS EC2 instances (some have EFA, some don't)
+
+### Use Compile-Time Polyfill When:
+- ✅ Building for macOS or Windows
+- ✅ Embedded or constrained environments
+- ✅ Know for certain no RDMA hardware will be present
+- ✅ Want smallest binary (no libfabric linking)
+
+### Example: AWS Deployment
+
+```rust
+// Initialize transport with automatic fallback
+let provider = s2n_quic_dc::transport::select_provider()?;
+
+match provider {
+    ProviderSelection::Libfabric(_) => {
+        log::info!("Running on EFA-enabled instance");
+    }
+    ProviderSelection::Udp(_) => {
+        log::info!("Running on non-EFA instance, using UDP");
+    }
+}
+```
 
 ## Testing
 
