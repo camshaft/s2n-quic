@@ -114,24 +114,12 @@ impl LibfabricProvider {
         use crate::libfabric::info;
         
         // Attempt to query for available providers
-        let list = match std::panic::catch_unwind(|| {
-            info::Query::new().build()
-        }) {
-            Ok(list) => list,
-            Err(_) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::NotFound,
-                    "libfabric library not found or failed to initialize"
-                ));
-            }
-        };
+        // Note: This may fail if libfabric library is not found at runtime
+        // or if there's no RDMA hardware available
+        let list = info::Query::new().build();
         
         // Check if any providers are available
-        let mut has_provider = false;
-        for _info in list.iter() {
-            has_provider = true;
-            break;
-        }
+        let has_provider = list.iter().next().is_some();
         
         if !has_provider {
             return Err(io::Error::new(

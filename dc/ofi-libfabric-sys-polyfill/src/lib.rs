@@ -21,6 +21,14 @@ pub mod bindgen {
     
     pub type fi_addr_t = u64;
     
+    // ===== Polyfill Configuration =====
+    
+    /// Polyfill version (synthetic, for API compatibility)
+    const POLYFILL_VERSION: u32 = 0x01_00_00_00; // Version 1.0.0
+    
+    /// Provider name for polyfill
+    const PROVIDER_NAME: &[u8] = b"udp-polyfill\0";
+    
     // ===== Constants =====
     
     // Capabilities
@@ -429,7 +437,7 @@ pub mod bindgen {
     /// Get libfabric version (polyfill returns synthetic version)
     #[no_mangle]
     pub extern "C" fn fi_version() -> u32 {
-        0x01_00_00_00 // Version 1.0.0
+        POLYFILL_VERSION
     }
     
     /// Get error string
@@ -505,9 +513,9 @@ pub mod bindgen {
             })),
             fabric_attr: Box::into_raw(Box::new(fi_fabric_attr {
                 name: std::ptr::null_mut(),
-                prov_name: b"udp-polyfill\0".as_ptr() as *mut libc::c_char,
-                prov_version: fi_version(),
-                api_version: fi_version(),
+                prov_name: PROVIDER_NAME.as_ptr() as *mut libc::c_char,
+                prov_version: POLYFILL_VERSION,
+                api_version: POLYFILL_VERSION,
             })),
             nic: std::ptr::null_mut(),
             next: std::ptr::null_mut(),
