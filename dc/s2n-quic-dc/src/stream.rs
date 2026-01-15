@@ -2,9 +2,6 @@
 
 use crate::ByteVec;
 
-pub mod item;
-pub use item::Item;
-
 /// Backpressure configuration for a transfer.
 ///
 /// These limits control when the receiver stops issuing PULL_REQUEST messages

@@ -3,12 +3,12 @@
 //! A unary RPC receives a single request and sends a single response.
 
 use crate::{
-    priority::Priority,
-    server::{AcceptError, RejectReason},
-    stream::{self, Backpressure, Item},
+    endpoint::incoming::handler::{AcceptError, RejectReason},
+    message::Message,
+    peer,
+    stream::{self, Backpressure},
     ByteVec,
 };
-use std::net::SocketAddr;
 
 /// A request for an incoming unary RPC transfer.
 ///
@@ -19,8 +19,8 @@ pub struct Request {
 }
 
 impl Request {
-    /// Returns the remote peer address that initiated this transfer.
-    pub fn remote_addr(&self) -> SocketAddr {
+    /// Returns the remote peer that initiated this transfer.
+    pub fn peer(&self) -> &peer::Handle {
         todo!()
     }
 
@@ -28,16 +28,6 @@ impl Request {
     ///
     /// This metadata can be used for handler dispatch and routing decisions.
     pub fn metadata(&self) -> Option<&ByteVec> {
-        todo!()
-    }
-
-    /// Returns the priority of this transfer.
-    pub fn priority(&self) -> Priority {
-        todo!()
-    }
-
-    /// Returns the optional request header.
-    pub fn header(&self) -> Option<&ByteVec> {
         todo!()
     }
 
@@ -84,18 +74,8 @@ pub struct Response {
 }
 
 impl Response {
-    pub async fn send_header(&mut self, header: ByteVec) -> Result<(), stream::Error> {
-        let _ = header;
-        todo!()
-    }
-
-    pub fn set_header(&mut self, header: ByteVec) -> Result<(), stream::Error> {
-        let _ = header;
-        todo!()
-    }
-
     /// Sends the response on the stream.
-    pub async fn send(&mut self, item: Item) -> Result<(), stream::Error> {
+    pub async fn send(&mut self, item: Message) -> Result<(), stream::Error> {
         let _ = item;
         todo!()
     }

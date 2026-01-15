@@ -1,5 +1,6 @@
 use bitflags::bitflags;
 use core::{ffi::CStr, fmt, ptr::NonNull};
+use libc::iovec;
 use ofi_libfabric_sys::bindgen::*;
 
 #[macro_use]
@@ -298,6 +299,10 @@ pub mod info {
             unsafe { endpoint::Query(&mut *self.hints.as_mut().ep_attr) }
         }
 
+        pub fn domain(&mut self) -> domain::Query<'_> {
+            unsafe { domain::Query(&mut *self.hints.as_mut().domain_attr) }
+        }
+
         pub fn flags(mut self, flags: Flags) -> Self {
             self.flags = flags;
             self
@@ -396,6 +401,8 @@ pub mod info {
                 .field("capabilities", &self.capabilities())
                 .field("mode", &self.mode())
                 .field("addr_format", &self.addr_format())
+                .field("src_addr", &self.src_addr())
+                .field("dest_addr", &self.dest_addr())
                 .field("endpoint", &self.endpoint_attr())
                 .field("domain", &self.domain_attr())
                 .finish_non_exhaustive()
@@ -413,6 +420,31 @@ pub mod info {
 
         pub fn addr_format(&self) -> addr::Format {
             addr::Format::from_bits(self.info.addr_format).unwrap_or(addr::Format::Unspecified)
+        }
+
+        pub fn src_addr(&self) -> Option<&[u8]> {
+            unsafe {
+                let ptr = self.info.src_addr as *const u8;
+                let len = self.info.src_addrlen;
+                if ptr.is_null() {
+                    return None;
+                }
+
+                Some(core::slice::from_raw_parts(ptr, len))
+            }
+        }
+
+        pub fn dest_addr(&self) -> Option<&[u8]> {
+            unsafe {
+                let ptr = self.info.dest_addr as *const u8;
+                let len = self.info.dest_addrlen;
+
+                if ptr.is_null() {
+                    return None;
+                }
+
+                Some(core::slice::from_raw_parts(ptr, len))
+            }
         }
 
         pub fn endpoint_attr(&self) -> endpoint::Attributes<'_> {
@@ -569,6 +601,30 @@ pub mod endpoint {
             Ok(())
         }
 
+        /// Get the local address of this endpoint
+        ///
+        /// Must be called after the endpoint is enabled.
+        /// Returns the raw address bytes suitable for insertion into an address vector.
+        pub fn getname(&self) -> Result<Vec<u8>, Error> {
+            let mut addrlen = 256;
+            let mut addr_buf = vec![0u8; addrlen];
+
+            let ret = unsafe {
+                fi_getname(
+                    &mut (*self.inner.fid.as_ptr()).fid as *mut fid,
+                    addr_buf.as_mut_ptr() as *mut core::ffi::c_void,
+                    &mut addrlen,
+                )
+            };
+
+            if ret != 0 {
+                return Err(Error::from_code(ret));
+            }
+
+            addr_buf.truncate(addrlen);
+            Ok(addr_buf)
+        }
+
         /// Send a message to a destination endpoint
         ///
         /// The data is sent from the registered memory region. The buffer will remain
@@ -584,14 +640,9 @@ pub mod endpoint {
         /// will be reported via the bound completion queue.
         pub fn send(
             &self,
-            mr: &memory_registration::Send,
-            len: usize,
+            mr: memory_registration::Send,
             dest_addr: fi_addr_t,
         ) -> Result<(), Error> {
-            if len > mr.len() {
-                return Err(Error::from_code(-(FI_EINVAL as i32)));
-            }
-
             let iov = mr.iov();
 
             let ret = unsafe {
@@ -603,7 +654,7 @@ pub mod endpoint {
                     dest_addr,
                     // Clone and send the memory region in the completion queue
                     // so it doesn't get dropped before the transport finishes sending it
-                    mr.clone().into_context(),
+                    mr.into_context(),
                 )
             };
 
@@ -621,7 +672,7 @@ pub mod endpoint {
         ///
         /// # Parameters
         /// - `mr`: Mutable registered memory region to receive into
-        /// - `src_addr`: Source address to match, or FI_ADDR_UNSPEC to accept from any sender
+        /// - `src_addr`: Source address to match, or None to accept from any sender
         ///
         /// # Returns
         /// Ok(()) if the operation was successfully posted. The actual completion
@@ -630,7 +681,7 @@ pub mod endpoint {
         pub fn recv(
             &self,
             mr: memory_registration::Receive,
-            src_addr: fi_addr_t,
+            src_addr: Option<fi_addr_t>,
         ) -> Result<(), Error> {
             let buffer = mr.buffer();
 
@@ -638,9 +689,9 @@ pub mod endpoint {
                 fi_recv(
                     self.inner.fid.as_ptr(),
                     buffer.as_ptr() as *mut core::ffi::c_void,
-                    buffer.len(),
+                    buffer.capacity(),
                     mr.desc(),
-                    src_addr,
+                    src_addr.unwrap_or(u64::MAX),
                     // Transfer ownership of the mutable region to the completion queue
                     mr.into_context(),
                 )
@@ -660,7 +711,7 @@ pub mod endpoint {
         ///
         /// # Parameters
         /// - `mr`: Local receive buffer to read data into
-        /// - `len`: Number of bytes to read (must be <= mr.len())
+        /// - `len`: Number of bytes to read (must be <= mr.capacity())
         /// - `dest_addr`: Remote endpoint address (from address vector)
         /// - `remote_addr`: Virtual address of remote buffer (if FI_MR_VIRT_ADDR)
         /// - `remote_key`: Remote memory key (from peer's Send/Receive region)
@@ -676,11 +727,11 @@ pub mod endpoint {
             remote_addr: u64,
             remote_key: u64,
         ) -> Result<(), Error> {
-            if len > mr.len() {
+            let buffer = mr.buffer();
+
+            if len > buffer.capacity() {
                 return Err(Error::from_code(-(FI_EINVAL as i32)));
             }
-
-            let buffer = mr.buffer();
 
             let ret = unsafe {
                 fi_read(
@@ -775,6 +826,9 @@ pub mod endpoint {
             f.debug_struct("Endpoint").finish_non_exhaustive()
         }
     }
+
+    unsafe impl Send for Endpoint {}
+    unsafe impl Sync for Endpoint {}
 
     pub struct Query<'a>(pub(super) &'a mut fi_ep_attr);
 
@@ -970,6 +1024,20 @@ pub mod domain {
             Unspecified = fi_av_type_FI_AV_UNSPEC,
         }
     );
+
+    pub struct Query<'a>(pub(super) &'a mut fi_domain_attr);
+
+    impl<'a> Query<'a> {
+        pub fn memory_registration(self, mode: memory_registration::Mode) -> Self {
+            self.0.mr_mode = mode.bits();
+            self
+        }
+
+        pub fn av_type(self, av_type: AvType) -> Self {
+            self.0.av_type = av_type as _;
+            self
+        }
+    }
 
     pub struct Domain {
         inner: Arc<Inner>,
@@ -1171,6 +1239,7 @@ pub mod memory_registration {
             domain: &domain::Domain,
             buffer: ByteVec,
             access: Access,
+            key: u64,
         ) -> Result<Self, Error> {
             let iovecs: Vec<iovec> = buffer
                 .chunks()
@@ -1189,9 +1258,9 @@ pub mod memory_registration {
                     iov.as_ptr(),
                     iov.len(),
                     access.bits(),
-                    0, // offset
-                    0, // requested_key
-                    0, // flags
+                    0,   // offset
+                    key, // requested_key
+                    0,   // flags
                     &mut mr_ptr,
                     core::ptr::null_mut(),
                 )
@@ -1287,6 +1356,13 @@ pub mod memory_registration {
         }
     }
 
+    // SAFETY: Send is safe to send across threads because:
+    // 1. The fid is managed by Arc and reference counted
+    // 2. The buffer (ByteVec) is already Send
+    // 3. The raw pointers (desc) are only used within libfabric calls
+    unsafe impl std::marker::Send for Send {}
+    unsafe impl Sync for Send {}
+
     /// Receive buffer region for recv and RMA read operations
     ///
     /// Cannot be cloned - unique ownership of mutable buffer.
@@ -1308,6 +1384,7 @@ pub mod memory_registration {
             domain: &domain::Domain,
             mut buffer: BytesMut,
             access: Access,
+            key: u64,
         ) -> Result<Self, Error> {
             use bytes::BufMut;
 
@@ -1321,7 +1398,7 @@ pub mod memory_registration {
                     buf.len(),
                     access.bits(),
                     0,
-                    0,
+                    key,
                     0,
                     &mut mr_ptr,
                     core::ptr::null_mut(),
@@ -1405,6 +1482,13 @@ pub mod memory_registration {
         }
     }
 
+    // SAFETY: Send is safe to send across threads because:
+    // 1. The fid is managed by Box
+    // 2. The buffer (BytesMut) is already Send
+    // 3. The raw pointers (desc) are only used within libfabric calls
+    unsafe impl std::marker::Send for Receive {}
+    unsafe impl Sync for Receive {}
+
     /// Type-erased memory region for completion queue reconstruction
     ///
     /// Only used when reconstructing from context pointer in completion handler.
@@ -1420,7 +1504,10 @@ pub mod memory_registration {
         /// # Safety
         /// The context pointer must have been created by `into_context()` from either
         /// Send or Receive.
-        pub unsafe fn from_context(context: *mut core::ffi::c_void) -> Self {
+        pub unsafe fn from_context(
+            context: *mut core::ffi::c_void,
+            recv_len: Option<usize>,
+        ) -> Self {
             let header = &*(context as *const RegionHeader);
             match header.type_id {
                 RegionType::Send => {
@@ -1428,7 +1515,12 @@ pub mod memory_registration {
                     Self::Send(Send { inner })
                 }
                 RegionType::Receive => {
-                    let inner = Box::from_raw(context as *mut ReceiveInner);
+                    let mut inner = Box::from_raw(context as *mut ReceiveInner);
+                    if let Some(len) = recv_len {
+                        unsafe {
+                            inner.buffer.set_len(len);
+                        }
+                    }
                     Self::Receive(Receive { inner })
                 }
             }
@@ -1439,6 +1531,32 @@ pub mod memory_registration {
 pub mod completion_queue {
     use super::*;
     use std::sync::Arc;
+
+    bitflags! {
+        #[derive(Clone, Copy, Debug)]
+        pub struct CompletionFlags: u64 {
+            /// Receive operation completed
+            const RECV = FI_RECV as u64;
+            /// Send operation completed
+            const SEND = FI_SEND as u64;
+            /// RMA read operation completed
+            const READ = FI_READ as u64;
+            /// RMA write operation completed
+            const WRITE = FI_WRITE as u64;
+            /// Remote read operation completed
+            const REMOTE_READ = FI_REMOTE_READ as u64;
+            /// Remote write operation completed
+            const REMOTE_WRITE = FI_REMOTE_WRITE as u64;
+            /// Remote CQ data available
+            const REMOTE_CQ_DATA = FI_REMOTE_CQ_DATA as u64;
+            /// Multi-receive buffer consumed
+            const MULTI_RECV = FI_MULTI_RECV as u64;
+            /// Tagged message operation
+            const TAGGED = FI_TAGGED as u64;
+            /// Message operation
+            const MSG = FI_MSG as u64;
+        }
+    }
 
     define_enum!(
         pub enum Format {
@@ -1469,6 +1587,9 @@ pub mod completion_queue {
     pub struct CompletionQueue {
         inner: Arc<Inner>,
     }
+
+    unsafe impl Send for CompletionQueue {}
+    unsafe impl Sync for CompletionQueue {}
 
     struct Inner {
         fid: NonNull<fid_cq>,
@@ -1523,7 +1644,7 @@ pub mod completion_queue {
         ///
         /// # Parameters
         /// - `limit`: Maximum number of entries to read (must be <= MAX_LEN)
-        /// - `callback`: Called for each completion with (entry, memory_region)
+        /// - `callback`: Called for each completion with (memory_region)
         ///
         /// The MemoryRegion will be dropped after the callback returns.
         pub fn read<F, const MAX_LEN: usize>(
@@ -1537,13 +1658,17 @@ pub mod completion_queue {
             debug_assert!(limit <= MAX_LEN, "limit exceeds MAX_LEN");
             let limit = limit.min(MAX_LEN);
 
-            let mut entries: [fi_cq_entry; MAX_LEN] = [unsafe { core::mem::zeroed() }; MAX_LEN];
-            let count = unsafe { self.read_raw(&mut entries[..limit])? };
+            let mut entries: [fi_cq_msg_entry; MAX_LEN] = [unsafe { core::mem::zeroed() }; MAX_LEN];
+            let count = unsafe { self.read_msg(&mut entries[..limit])? };
 
             for entry in &entries[..count] {
                 if !entry.op_context.is_null() {
+                    dbg!(entry, CompletionFlags::from_bits_truncate(entry.flags));
                     let mr = unsafe {
-                        memory_registration::MemoryRegion::from_context(entry.op_context)
+                        memory_registration::MemoryRegion::from_context(
+                            entry.op_context,
+                            Some(entry.len),
+                        )
                     };
                     callback(mr);
                     // mr is automatically dropped here
@@ -1551,6 +1676,26 @@ pub mod completion_queue {
             }
 
             Ok(count)
+        }
+
+        /// Read MSG format completion entries (non-blocking)
+        unsafe fn read_msg(&self, entries: &mut [fi_cq_msg_entry]) -> Result<usize, Error> {
+            let ret = unsafe {
+                fi_cq_read(
+                    self.inner.fid.as_ptr(),
+                    entries.as_mut_ptr() as *mut core::ffi::c_void,
+                    entries.len(),
+                )
+            };
+
+            if ret < 0 {
+                if ret == -(FI_EAGAIN as isize) {
+                    return Ok(0);
+                }
+                Err(Error::from_code(ret as i32))
+            } else {
+                Ok(ret as usize)
+            }
         }
 
         /// Read completion entries (non-blocking)
@@ -1697,6 +1842,9 @@ pub mod address_vector {
         inner: Arc<Inner>,
     }
 
+    unsafe impl Send for AddressVector {}
+    unsafe impl Sync for AddressVector {}
+
     struct Inner {
         fid: NonNull<fid_av>,
     }
@@ -1760,8 +1908,8 @@ pub mod address_vector {
                 )
             };
 
-            if ret != 1 {
-                return Err(Error::from_code(-(ret as i32)));
+            if ret < 0 {
+                return Err(Error::from_code(ret as i32));
             }
 
             Ok(fi_addr)
@@ -1961,6 +2109,8 @@ pub mod fabric {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ByteVec;
+    use bytes::BytesMut;
 
     #[test]
     fn basic_info_query() {
@@ -1968,5 +2118,225 @@ mod tests {
         for info in list.iter() {
             println!("{:#?}", info);
         }
+    }
+
+    #[test]
+    fn tcp_rxm_ping_pong() {
+        // Query for TCP endpoint with RXM provider
+        let mut query = info::Query::new()
+            .capabilities(Capabilities::MSG | Capabilities::SEND | Capabilities::RECV);
+
+        query
+            .endpoint()
+            .type_(endpoint::Type::RDM)
+            .protocol(endpoint::Protocol::RXM);
+
+        query
+            .domain()
+            .memory_registration(memory_registration::Mode::PROV_KEY)
+            .av_type(domain::AvType::TABLE);
+
+        let list = query.build();
+
+        // Find a suitable provider
+        let info = list
+            .iter()
+            .find(|info| {
+                info.endpoint_attr().protocol() == endpoint::Protocol::RXM
+                    && info.addr_format() == addr::Format::SOCKADDR_IN
+                    && info.domain_attr().name().is_some_and(|name| name == c"lo")
+            })
+            .expect("No TCP/RXM provider found");
+
+        println!("Using provider: {:#?}", info);
+
+        // Open fabric and domain
+        let fabric = fabric::Fabric::open(&info).expect("Failed to open fabric");
+        let domain = fabric.open_domain(&info).expect("Failed to open domain");
+
+        // Create completion queues for both endpoints (using MSG format to get message length)
+        let cq_size = 128;
+        let sender_cq = completion_queue::CompletionQueue::open_with_format(
+            &domain,
+            cq_size,
+            completion_queue::Format::MSG,
+        )
+        .expect("Failed to open CQ");
+        let receiver_cq = completion_queue::CompletionQueue::open_with_format(
+            &domain,
+            cq_size,
+            completion_queue::Format::MSG,
+        )
+        .expect("Failed to open CQ");
+
+        // Create address vector
+        let av = address_vector::AddressVector::open(&domain).expect("Failed to open AV");
+
+        // Create sender endpoint
+        let sender_ep =
+            endpoint::Endpoint::open(&domain, &info).expect("Failed to create sender endpoint");
+
+        // Bind sender CQ and AV
+        sender_ep
+            .bind_cq(&sender_cq, (FI_TRANSMIT | FI_RECV) as _)
+            .expect("Failed to bind sender CQ");
+        sender_ep.bind_av(&av).expect("Failed to bind sender AV");
+
+        // Create receiver endpoint
+        let receiver_ep =
+            endpoint::Endpoint::open(&domain, &info).expect("Failed to create receiver endpoint");
+
+        // Bind receiver CQ and AV
+        receiver_ep
+            .bind_cq(&receiver_cq, (FI_TRANSMIT | FI_RECV) as _)
+            .expect("Failed to bind receiver CQ");
+        receiver_ep
+            .bind_av(&av)
+            .expect("Failed to bind receiver AV");
+
+        // Enable endpoints
+        sender_ep.enable().expect("Failed to enable sender");
+        receiver_ep.enable().expect("Failed to enable receiver");
+
+        // For RDM endpoints, we need to register addresses in the address vector
+        // Use the src_addr from the provider info to set up localhost communication
+        let receiver_addr = {
+            let src_addr = receiver_ep.getname().unwrap();
+            println!("Registering receiver address: {} bytes", src_addr.len());
+            av.insert(&src_addr)
+                .expect("Failed to insert receiver address into AV")
+        };
+
+        println!("Receiver fi_addr_t: {}", receiver_addr);
+
+        // Prepare test data
+        let send_data = {
+            let mut chunks = ByteVec::new();
+            chunks.push_back("Hello, ".into());
+            chunks.push_back("libfabric".into());
+            chunks.push_back(" ping-pong!".into());
+            chunks
+        };
+        let send_len = send_data.len();
+
+        // Register send memory region
+        let send_mr = memory_registration::Send::register(
+            &domain,
+            send_data.clone(),
+            memory_registration::Access::SEND,
+            123,
+        )
+        .expect("Failed to register send memory");
+
+        println!("Send MR key: {}", send_mr.key());
+
+        // Register receive memory region
+        let recv_data = BytesMut::with_capacity(send_len);
+        let recv_mr = memory_registration::Receive::register(
+            &domain,
+            recv_data,
+            memory_registration::Access::RECV,
+            124,
+        )
+        .expect("Failed to register receive memory");
+
+        println!("Recv MR key: {}", recv_mr.key());
+
+        // Post receive buffer first
+        receiver_ep
+            .recv(recv_mr, None)
+            .expect("Failed to post receive");
+
+        println!("Receive buffer posted, sending message...");
+
+        // Use thread::scope to run sender and receiver concurrently
+        let recv_buffer = std::thread::scope(|s| {
+            // Receiver thread
+            let recv_handle = s.spawn(|| {
+                println!("Receiver thread: waiting for message...");
+                for _ in 0..1000 {
+                    let mut recv_buffer = None;
+                    match receiver_cq.read::<_, 1>(1, |mr| {
+                        println!("Receive completed: {:?}", mr);
+                        if let memory_registration::MemoryRegion::Receive(recv_mr) = mr {
+                            recv_buffer = Some(recv_mr);
+                        }
+                    }) {
+                        Ok(count) if count > 0 => return recv_buffer,
+                        Ok(_) => {} // No completions yet
+                        Err(e) if e.code() == -(FI_EAVAIL as i32) => {
+                            // Error available in CQ, read it
+                            let err_entry = receiver_cq.readerr().expect("Failed to read error");
+                            panic!(
+                                "CQ error: code={}, prov_errno={}",
+                                err_entry.err, err_entry.prov_errno
+                            );
+                        }
+                        Err(e) => panic!("Failed to read receive completion: {:?}", e),
+                    }
+                    std::thread::sleep(std::time::Duration::from_micros(100));
+                }
+                panic!("Receive did not complete");
+            });
+
+            // Sender thread
+            let send_handle = s.spawn(|| {
+                println!("Sender thread: sending message...");
+
+                // Send message with retry on FI_EAGAIN
+                loop {
+                    match sender_ep.send(send_mr.clone(), receiver_addr) {
+                        Ok(()) => break,
+                        Err(e) if e.code() == -(FI_EAGAIN as i32) => {
+                            let _ = unsafe { sender_cq.read_raw(&mut []) };
+                            std::thread::sleep(std::time::Duration::from_micros(100));
+                            continue;
+                        }
+                        Err(e) => panic!("Failed to send message: {:?}", e),
+                    }
+                }
+
+                println!("Message posted, waiting for send completion...");
+
+                // Wait for send completion
+                for _ in 0..1000 {
+                    let count = sender_cq
+                        .read::<_, 1>(1, |mr| {
+                            println!("Send completed: {:?}", mr);
+                        })
+                        .expect("Failed to read send completion");
+
+                    if count > 0 {
+                        return;
+                    }
+                    std::thread::sleep(std::time::Duration::from_micros(100));
+                }
+                panic!("Send did not complete");
+            });
+
+            // Wait for both to complete
+            send_handle.join().unwrap();
+            recv_handle.join().unwrap()
+        });
+
+        println!("Both send and receive completed successfully");
+
+        // Verify received data
+        if let Some(recv_mr) = recv_buffer {
+            let recv_bytes = recv_mr.buffer();
+            let recv_slice = &recv_bytes[..send_len];
+            assert_eq!(
+                recv_slice, b"Hello, libfabric ping-pong!",
+                "Received data does not match sent data"
+            );
+            println!(
+                "Data verified: {:?}",
+                std::str::from_utf8(recv_slice).unwrap()
+            );
+        } else {
+            panic!("No receive buffer found");
+        }
+
+        println!("TCP/RXM ping-pong test completed successfully!");
     }
 }

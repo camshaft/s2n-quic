@@ -4,101 +4,14 @@
 //! transfers (e.g., for broadcast scenarios). The buffer lifecycle progresses through
 //! states: allocated → filled → in-use → freed.
 
-use crate::ByteVec;
-use std::{ops::Range, pin::Pin, sync::Arc};
-
-#[cfg(target_os = "linux")]
-mod libfabric;
-mod udp;
-
-/// Unique identifier for a message.
-///
-/// Message IDs are used to reference buffers in protocol messages and enable
-/// efficient lookup by the transport.
-///
-/// For UDP, the ID is a slot index.
-/// For libfabric, the ID is the raw pointer to the iov struct for this message.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-#[repr(transparent)]
-pub struct Id(u64);
-
-impl Id {
-    /// Creates a new Id
-    #[inline]
-    pub(crate) fn new(value: u64) -> Self {
-        Self(value)
-    }
-
-    /// Returns the raw value of the ID
-    #[inline]
-    pub(crate) fn as_u64(self) -> u64 {
-        self.0
-    }
-}
-
-/// Key used to authenticate the message
-///
-/// For UDP, this is the generation ID for the slot index.
-/// For libfabric, this is the `fi_mr_key`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-#[repr(transparent)]
-pub struct Key(u64);
-
-impl Key {
-    /// Creates a new Key
-    #[inline]
-    pub(crate) fn new(value: u64) -> Self {
-        Self(value)
-    }
-
-    /// Returns the raw value
-    #[inline]
-    pub(crate) fn as_u64(self) -> u64 {
-        self.0
-    }
-}
-
-/// Trait for transport-specific buffer allocation implementations
-///
-/// Different transports (UDP, libfabric) have different requirements for
-/// buffer management. This trait abstracts those differences.
-trait Backend: 'static + Send + Sync {
-    /// Allocates a new message with the given data
-    fn register(&self, data: Regions) -> Pin<Arc<dyn Handle>>;
-}
-
-trait Handle: 'static + Send + Sync {
-    fn id(&self) -> Id;
-    fn key(&self) -> Key;
-    fn len(&self) -> usize;
-}
+use crate::{priority::Priority, ByteVec};
+use smallvec::SmallVec;
+use std::ops::Range;
 
 /// Handle for allocating buffers.
-///
-/// The allocator manages a pool of memory regions and supports NUMA-aware
-/// allocation when workers are assigned to specific NUMA nodes.
 #[derive(Clone)]
 pub struct Allocator {
-    backend: Arc<dyn Backend>,
-}
-
-impl Allocator {
-    /// Creates a new UDP-based allocator
-    ///
-    /// Uses slot-based allocation for message identification
-    pub fn new_udp() -> Self {
-        todo!()
-    }
-
-    // TODO: Add when libfabric module is ready
-    // /// Creates a new libfabric-based allocator
-    // ///
-    // /// Uses fi_mr_regv for memory registration and pointer-based identification
-    // pub fn new_libfabric(/* libfabric domain */) -> Self {
-    //     Self {
-    //         backend: Arc::new(LibfabricAllocator::new(/* ... */)),
-    //     }
-    // }
+    // backend: Arc<dyn Backend>,
 }
 
 impl Allocator {
@@ -114,10 +27,10 @@ impl Allocator {
     /// # Returns
     ///
     /// A message ready to be used in transfers.
-    pub async fn allocate(&self, data: ByteVec) -> Message {
-        let mut builder = self.builder().await;
+    pub async fn allocate(&self, priority: Priority, data: ByteVec) -> Message {
+        let mut builder = self.builder(priority).await;
         builder.push_back(data);
-        builder.build()
+        builder.build().await
     }
 
     /// Returns a builder for constructing a message with more control.
@@ -132,17 +45,15 @@ impl Allocator {
     /// # Returns
     ///
     /// A builder that can be configured and filled.
-    pub async fn builder(&self) -> Builder {
+    pub async fn builder(&self, priority: Priority) -> Builder {
+        let _ = priority;
         todo!()
     }
 }
 
 /// A buffer allocation that can be configured before filling.
-///
-/// This type allows applications to specify preferences for worker/NUMA locality
-/// before the buffer is actually filled with data.
 pub struct Builder {
-    _todo: (),
+    regions: Regions,
 }
 
 impl Builder {
@@ -180,14 +91,14 @@ impl Builder {
         todo!()
     }
 
-    pub fn build(self) -> Message {
+    pub async fn build(self) -> Message {
         todo!()
     }
 }
 
 struct Regions {
     data: ByteVec,
-    tags: Vec<Range<usize>>,
+    tags: SmallVec<[Range<usize>; 1]>,
 }
 
 /// A filled buffer ready for use in transfers.
@@ -200,11 +111,6 @@ pub struct Message {
 }
 
 impl Message {
-    /// Returns the ID for this message.
-    pub fn id(&self) -> Id {
-        todo!()
-    }
-
     /// Returns the size of the message in bytes.
     pub fn len(&self) -> usize {
         todo!()

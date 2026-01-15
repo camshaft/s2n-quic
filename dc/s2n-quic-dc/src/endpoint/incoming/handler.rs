@@ -1,39 +1,11 @@
-//! Server interface for handling incoming transfers.
+//! Interface for handling incoming transfers.
 //!
-//! The server uses a trait-based approach where applications implement the `Handler` trait
+//! The handler uses a trait-based approach where applications implement the `Handler` trait
 //! to receive incoming transfers. The transport calls the handler methods, and the application
 //! decides what to do (spawn a task, drop it, queue it, etc.).
 
-use crate::message;
-use std::{sync::Arc, time::Duration};
-
-pub mod bidirectional;
-pub mod streaming_request;
-pub mod streaming_response;
-pub mod unary;
-
-/// Server handle for managing incoming transfers.
-///
-/// This is the main entry point for server-side operations. It can be cloned
-/// cheaply and shared across threads.
-#[derive(Clone)]
-pub struct Server {
-    #[expect(dead_code)]
-    inner: Arc<Inner>,
-}
-
-struct Inner {
-    _todo: (),
-}
-
-impl Server {
-    /// Returns the buffer allocator for this server.
-    ///
-    /// Applications use the allocator to prepare response payloads.
-    pub fn allocator(&self) -> &message::Allocator {
-        todo!()
-    }
-}
+use super::{bidirectional, streaming_request, streaming_response, unary};
+use std::time::Duration;
 
 /// Handler trait for incoming transfers.
 ///

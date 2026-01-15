@@ -4,12 +4,12 @@
 //! The request and response sides can be used concurrently.
 
 use crate::{
-    priority::Priority,
-    server::{AcceptError, RejectReason},
-    stream::{self, Backpressure, Item},
+    endpoint::incoming::handler::{AcceptError, RejectReason},
+    message::Message,
+    peer,
+    stream::{self, Backpressure},
     ByteVec,
 };
-use std::net::SocketAddr;
 
 /// A request for an incoming bidirectional streaming RPC transfer.
 pub struct Request {
@@ -17,19 +17,12 @@ pub struct Request {
 }
 
 impl Request {
-    pub fn remote_addr(&self) -> SocketAddr {
+    /// Returns the remote peer that initiated this transfer.
+    pub fn peer(&self) -> &peer::Handle {
         todo!()
     }
 
     pub fn metadata(&self) -> Option<&[u8]> {
-        todo!()
-    }
-
-    pub fn priority(&self) -> Priority {
-        todo!()
-    }
-
-    pub fn header(&self) -> Option<&ByteVec> {
         todo!()
     }
 
@@ -59,10 +52,6 @@ pub struct RequestStream {
 }
 
 impl RequestStream {
-    pub fn header(&self) -> Option<&ByteVec> {
-        todo!()
-    }
-
     /// Receives the next request item from the stream.
     pub async fn recv(&mut self) -> Option<Result<ByteVec, stream::Error>> {
         todo!()
@@ -89,18 +78,8 @@ pub struct ResponseSink {
 }
 
 impl ResponseSink {
-    pub async fn send_header(&mut self, header: ByteVec) -> Result<(), stream::Error> {
-        let _ = header;
-        todo!()
-    }
-
-    pub fn set_header(&mut self, header: ByteVec) -> Result<(), stream::Error> {
-        let _ = header;
-        todo!()
-    }
-
     /// Sends a response item in the stream.
-    pub async fn send(&mut self, item: Item) -> Result<(), stream::Error> {
+    pub async fn send(&mut self, item: Message) -> Result<(), stream::Error> {
         let _ = item;
         todo!()
     }

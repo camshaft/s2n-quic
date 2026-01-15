@@ -2,7 +2,7 @@
 //!
 //! A streaming response RPC sends a single request and receives multiple responses as a stream.
 
-use crate::{causality, message, priority::Priority, stream::Error, ByteVec};
+use crate::{message, stream::Error, ByteVec};
 
 /// Builder for configuring a streaming response RPC.
 pub struct Builder {
@@ -10,18 +10,6 @@ pub struct Builder {
 }
 
 impl Builder {
-    /// Sets the priority for this transfer.
-    pub fn priority(self, priority: Priority) -> Self {
-        let _ = priority;
-        todo!()
-    }
-
-    /// Adds a causality dependency.
-    pub fn depends_on(self, dependency: causality::Dependency) -> Self {
-        let _ = dependency;
-        todo!()
-    }
-
     /// Sets application metadata for RPC handler dispatch.
     pub fn metadata(self, metadata: ByteVec) -> Self {
         let _ = metadata;
@@ -31,22 +19,6 @@ impl Builder {
     /// Sets an optional request header.
     pub fn header(self, header: ByteVec) -> Self {
         let _ = header;
-        todo!()
-    }
-
-    /// Indicates that response headers are expected.
-    pub fn expect_response_headers(self, enabled: bool) -> Self {
-        let _ = enabled;
-        todo!()
-    }
-
-    /// Enables causality tracking for this request.
-    ///
-    /// When enabled, the request will be assigned a causality token that can be
-    /// used as a dependency for subsequent requests. This incurs tracking overhead,
-    /// so should only be enabled when dependencies are needed.
-    pub fn causal_token(self, enabled: bool) -> Self {
-        let _ = enabled;
         todo!()
     }
 
@@ -90,11 +62,6 @@ pub struct DirectPlacementRequest {
 }
 
 impl DirectPlacementRequest {
-    /// Returns the causality token for this request.
-    pub fn causal_token(&self) -> Option<causality::Token> {
-        todo!()
-    }
-
     /// Sends the request and returns a handler for receiving chunks.
     ///
     /// The handler will be called by the worker thread for each received chunk,
@@ -128,13 +95,6 @@ pub struct Request {
 }
 
 impl Request {
-    /// Returns the causality token for this request.
-    ///
-    /// This token can be used as a dependency for subsequent requests.
-    pub fn causal_token(&self) -> Option<causality::Token> {
-        todo!()
-    }
-
     /// Sends the request and returns a stream of responses.
     pub async fn send(self) -> Result<Stream, Error> {
         todo!()

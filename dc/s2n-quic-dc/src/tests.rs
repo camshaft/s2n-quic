@@ -1,67 +1,53 @@
-use crate::*;
-use std::net::SocketAddr;
+use crate::{endpoint::Endpoint, priority::Priority, *};
 use tokio::task::JoinSet;
 
 /// Test basic unary RPC flow
 #[tokio::test]
 #[should_panic] // Will panic on todo!() but should compile
 async fn test_unary_rpc() {
-    let client = create_test_client();
+    let endpoint = create_test_endpoint();
     let peer = test_peer_addr();
 
     // Allocate and fill a message
     let message = "Hello, world!";
-    let msg = client.allocator().allocate(message.into()).await;
+    let msg = endpoint
+        .allocator()
+        .allocate(Priority::default(), message.into())
+        .await;
 
     // Build and send unary request
-    let request = client
-        .unary(peer)
-        .priority(priority::Priority::HIGH)
-        .header("request-header".into())
-        .expect_response_header(true)
-        .causal_token(true)
-        .build(msg);
-
-    // Get the causality token
-    let token = request.causal_token();
+    let request = endpoint.unary(peer).build(msg);
 
     // Send and receive response
     let response = request.send().await.unwrap();
 
-    // Check response header
-    assert!(response.header().is_some());
-
     // Read response body
-    let _body = response.recv().await.unwrap();
+    let body = response.recv().await.unwrap();
 
-    println!("Received response with token: {:?}", token);
+    println!("Received response: {body:?}");
 }
 
 /// Test streaming response RPC
 #[tokio::test]
 #[should_panic]
 async fn test_streaming_response() {
-    let client = create_test_client();
+    let endpoint = create_test_endpoint();
     let peer = test_peer_addr();
 
     // Allocate request message
     let message = "request";
-    let request_msg = client.allocator().allocate(message.into()).await;
+    let request_msg = endpoint
+        .allocator()
+        .allocate(Priority::default(), message.into())
+        .await;
 
     // Build and send request
-    let request = client
+    let request = endpoint
         .streaming_response(peer)
-        .priority(priority::Priority::MEDIUM)
         .metadata("handler-info".into())
-        .expect_response_headers(true)
-        .causal_token(true)
         .build(request_msg);
 
-    let token = request.causal_token();
     let mut stream = request.send().await.unwrap();
-
-    // Check header
-    let _header = stream.header();
 
     // Receive multiple responses
     let mut count = 0;
@@ -76,36 +62,28 @@ async fn test_streaming_response() {
     // Close the stream
     stream.close(None).unwrap();
 
-    println!("Received {} responses with token: {:?}", count, token);
+    println!("Received {} responses", count);
 }
 
 /// Test streaming request RPC
 #[tokio::test]
 #[should_panic]
 async fn test_streaming_request() {
-    let client = create_test_client();
+    let endpoint = create_test_endpoint();
     let peer = test_peer_addr();
 
     // Build and open streaming request
-    let mut request = client
-        .streaming_request(peer)
-        .priority(priority::Priority::HIGH)
-        .header("stream-header".into())
-        .expect_response_header(true)
-        .causal_token(true)
-        .build();
-
-    let stream_token = request.causal_token();
+    let mut request = endpoint.streaming_request(peer).build();
 
     // Send multiple items
     for i in 0..5 {
         let msg = format!("item-{i}");
-        let msg = request.allocator().allocate(msg.into()).await;
+        let item = request
+            .allocator()
+            .allocate(Priority::default(), msg.into())
+            .await;
 
-        let item = stream::Item::new(msg).priority(priority::Priority::MEDIUM);
-
-        let item_token = request.send(item).await.unwrap();
-        println!("Sent item {i} with token: {item_token:?}");
+        request.send(item).await.unwrap();
     }
 
     // Finish and get response
@@ -113,35 +91,32 @@ async fn test_streaming_request() {
 
     let _body = response.recv().await.unwrap();
 
-    println!("Streaming request completed with token: {stream_token:?}");
+    println!("Streaming request completed");
 }
 
 /// Test bidirectional streaming with concurrent send/receive
 #[tokio::test]
 #[should_panic]
 async fn test_bidirectional_streaming() {
-    let client = create_test_client();
+    let endpoint = create_test_endpoint();
     let peer = test_peer_addr();
 
     // Build and open bidirectional stream
-    let (mut sender, mut receiver) = client
+    let (mut sender, mut receiver) = endpoint
         .bidirectional(peer)
-        .priority(priority::Priority::VERY_HIGH)
         .metadata("bidi-metadata".into())
-        .expect_response_headers(true)
-        .causal_token(true)
         .build();
-
-    let token = sender.causal_token();
 
     // Spawn task to send requests
     let send_task = tokio::spawn(async move {
         for i in 0..3 {
             let message = format!("request-{i}");
-            let msg = sender.allocator().allocate(message.into()).await;
+            let msg = sender
+                .allocator()
+                .allocate(Priority::default(), message.into())
+                .await;
 
-            let item = stream::Item::new(msg);
-            sender.send(item).await.unwrap();
+            sender.send(msg).await.unwrap();
         }
         sender.close(None).unwrap();
     });
@@ -161,60 +136,16 @@ async fn test_bidirectional_streaming() {
     let response_count = recv_task.await.unwrap();
 
     println!(
-        "Bidirectional stream completed with token: {:?}, received {} responses",
-        token, response_count
+        "Bidirectional stream completed: received {} responses",
+        response_count
     );
-}
-
-/// Test causality dependencies
-#[tokio::test]
-#[should_panic]
-async fn test_causality_dependencies() {
-    let client = create_test_client();
-    let peer = test_peer_addr();
-
-    // First request
-    let msg1 = client.allocator().allocate("first".into()).await;
-
-    let req1 = client
-        .unary(peer)
-        .priority(priority::Priority::HIGH)
-        .causal_token(true)
-        .build(msg1);
-
-    let token1 = req1.causal_token().unwrap();
-
-    // Second request depends on first (wait for response, cascade errors)
-    let msg2 = client.allocator().allocate("second".into()).await;
-
-    let req2 = client
-        .unary(peer)
-        .depends_on(token1.wait_for_response())
-        .causal_token(true)
-        .build(msg2);
-
-    let token2 = req2.causal_token().unwrap();
-
-    // Third request depends on second (wait for request only, don't cascade)
-    let msg3 = client.allocator().allocate("third".into()).await;
-
-    let _req3 = client
-        .unary(peer)
-        .depends_on(token2.wait_for_request_no_cascade())
-        .build(msg3);
-
-    // Send requests - they will be ordered by dependencies
-    let _resp1 = req1.send().await.unwrap();
-    let _resp2 = req2.send().await.unwrap();
-
-    println!("Causality chain completed");
 }
 
 /// Test priority-based scheduling
 #[tokio::test]
 #[should_panic]
 async fn test_priority_scheduling() {
-    let client = create_test_client();
+    let endpoint = create_test_endpoint();
     let peer = test_peer_addr();
 
     // Send requests with different priorities
@@ -227,12 +158,12 @@ async fn test_priority_scheduling() {
 
     let mut tasks = JoinSet::new();
     for (i, prio) in priorities.iter().copied().enumerate() {
-        let msg = client
+        let msg = endpoint
             .allocator()
-            .allocate(format!("msg-{}", i).into())
+            .allocate(Priority::default(), format!("msg-{}", i).into())
             .await;
 
-        let request = client.unary(peer).priority(prio).build(msg);
+        let request = endpoint.unary(peer.clone()).build(msg);
 
         // Spawn to send concurrently
         tasks.spawn(async move {
@@ -264,50 +195,30 @@ async fn test_priority_scheduling() {
     println!("Priority scheduling verified - requests completed in priority order");
 }
 
-/// Test buffer allocation with NUMA preference
-#[tokio::test]
-#[should_panic]
-async fn test_buffer_allocation_numa() {
-    let client = create_test_client();
-
-    // Note: NUMA preference would be set via builder() API when needed for advanced use cases
-    // For now, demonstrate basic allocation
-    let _worker_id = worker_id();
-
-    let msg = client.allocator().allocate("plaintext-data".into()).await;
-
-    assert!(!msg.is_empty());
-
-    println!("Buffer allocated");
-}
-
 /// Test streaming request with item-level priorities and dependencies
 #[tokio::test]
 #[should_panic]
 async fn test_streaming_request_with_item_options() {
-    let client = create_test_client();
+    let endpoint = create_test_endpoint();
     let peer = test_peer_addr();
 
-    let mut request = client
-        .streaming_request(peer)
-        .priority(priority::Priority::MEDIUM)
-        .build();
+    let mut request = endpoint.streaming_request(peer).build();
 
     // First item
-    let msg1 = request.allocator().allocate("item1".into()).await;
+    let msg1 = request
+        .allocator()
+        .allocate(Priority::default(), "item1".into())
+        .await;
 
-    let item1 = stream::Item::new(msg1).priority(priority::Priority::VERY_HIGH);
-
-    let token1 = request.send(item1).await.unwrap();
+    request.send(msg1).await.unwrap();
 
     // Second item depends on first
-    let msg2 = request.allocator().allocate("item2".into()).await;
+    let msg2 = request
+        .allocator()
+        .allocate(Priority::default(), "item2".into())
+        .await;
 
-    let item2 = stream::Item::new(msg2)
-        .priority(priority::Priority::HIGH)
-        .depends_on(token1.wait_for_request());
-
-    let _token2 = request.send(item2).await.unwrap();
+    request.send(msg2).await.unwrap();
 
     let _response = request.finish().await.unwrap();
 
@@ -318,25 +229,21 @@ async fn test_streaming_request_with_item_options() {
 #[tokio::test]
 #[should_panic]
 async fn test_broadcast_pattern() {
-    let client = create_test_client();
-    let peers = vec![
-        "127.0.0.1:8081".parse().unwrap(),
-        "127.0.0.1:8082".parse().unwrap(),
-        "127.0.0.1:8083".parse().unwrap(),
-    ];
+    let endpoint = create_test_endpoint();
+    let peers = vec![test_peer_addr(), test_peer_addr(), test_peer_addr()];
 
     // Allocate and fill a single buffer
     let message = "Broadcast message to all peers";
-    let shared_msg = client.allocator().allocate(message.into()).await;
+    let msg = endpoint
+        .allocator()
+        .allocate(Priority::default(), message.into())
+        .await;
 
     // Clone the message for each peer and send
     let mut tasks = JoinSet::new();
     for peer in peers {
-        let msg = shared_msg.clone(); // Clone the Message - shares the underlying buffer
-        let request = client
-            .unary(peer)
-            .priority(priority::Priority::HIGH)
-            .build(msg);
+        let msg = msg.clone(); // Clone the Message - shares the underlying buffer
+        let request = endpoint.unary(peer).build(msg);
 
         tasks.spawn(async move { request.send().await });
     }
@@ -356,12 +263,15 @@ async fn test_broadcast_pattern() {
 #[tokio::test]
 #[should_panic]
 async fn test_bulk_direct_placement() {
-    let client = create_test_client();
+    let endpoint = create_test_endpoint();
     let peer = test_peer_addr();
 
     // Request cache data for a specific key
     let cache_key = b"my-cache-key";
-    let request_msg = client.allocator().allocate(cache_key.into()).await;
+    let request_msg = endpoint
+        .allocator()
+        .allocate(Priority::default(), cache_key.into())
+        .await;
 
     // Create a chunk handler with pre-allocated buffers
     struct MyCacheHandler {
@@ -370,7 +280,7 @@ async fn test_bulk_direct_placement() {
         buffers: Vec<Vec<u8>>,
     }
 
-    impl client::streaming_response::ChunkHandler for MyCacheHandler {
+    impl endpoint::outgoing::streaming_response::ChunkHandler for MyCacheHandler {
         // TODO: Implement methods for:
         // - Providing buffer regions for RDMA registration
         // - Handling chunk placement notifications
@@ -382,11 +292,9 @@ async fn test_bulk_direct_placement() {
     };
 
     // Build direct placement request
-    let request = client
+    let request = endpoint
         .streaming_response(peer)
-        .priority(priority::Priority::HIGH)
         .metadata("cache-get".into())
-        .causal_token(false) // Don't need causality for cache reads
         .build_direct_placement(request_msg, handler);
 
     // Send and receive with zero-copy placement
@@ -402,12 +310,15 @@ async fn test_bulk_direct_placement() {
 #[tokio::test]
 #[should_panic]
 async fn test_error_handling() {
-    let client = create_test_client();
+    let endpoint = create_test_endpoint();
     let peer = test_peer_addr();
 
-    let msg = client.allocator().allocate("test".into()).await;
+    let msg = endpoint
+        .allocator()
+        .allocate(Priority::default(), "test".into())
+        .await;
 
-    let request = client.unary(peer).build(msg);
+    let request = endpoint.unary(peer).build(msg);
 
     // This will hit todo!() and panic, but demonstrates error handling pattern
     match request.send().await {
@@ -421,14 +332,10 @@ async fn test_error_handling() {
 
 // Helper functions for tests
 
-fn create_test_client() -> client::Client {
-    todo!("Create test client")
+fn create_test_endpoint() -> Endpoint {
+    todo!("Create test endpoint")
 }
 
-fn worker_id() -> worker::Id {
-    todo!("Get worker ID")
-}
-
-fn test_peer_addr() -> SocketAddr {
-    "127.0.0.1:8080".parse().unwrap()
+fn test_peer_addr() -> peer::Handle {
+    todo!("Create test peer handle")
 }
