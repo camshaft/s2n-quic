@@ -176,16 +176,27 @@ where
         }
 
         {
-            let target = self.shared.last_peer_activity() + self.idle_timeout_duration;
+            let now = self.shared.clock.get_time();
+            let last_peer_activity = self.shared.last_peer_activity();
+            let target = last_peer_activity + self.idle_timeout_duration;
             self.idle_timer.update(target);
+            
             if self.idle_timer.poll_ready(cx).is_ready() {
-                let publisher = self.shared.publisher();
-                self.shared.receiver.notify_error(
-                    super::ErrorKind::IdleTimeout.err(),
-                    endpoint::Location::Local,
-                    &publisher,
-                );
-                return Poll::Ready(());
+                // Timer expired - check if we should actually timeout
+                // Don't timeout if we're still actively receiving data (peer may be retransmitting)
+                let is_active = !matches!(self.state, waiting::State::Finished | waiting::State::TimeWait);
+                
+                if !is_active {
+                    // Not active and timer expired - trigger timeout
+                    let publisher = self.shared.publisher();
+                    self.shared.receiver.notify_error(
+                        super::ErrorKind::IdleTimeout.err(),
+                        endpoint::Location::Local,
+                        &publisher,
+                    );
+                    return Poll::Ready(());
+                }
+                // else: active, so don't timeout - timer will be updated on next poll
             }
         }
 

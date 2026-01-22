@@ -718,13 +718,24 @@ impl State {
         // check the idle timer first
         ready!(self.idle_timer.poll_expiration(now));
 
-        // if that expired then load the last activity from the peer and update the idle timer with
-        // the value
+        // if that expired then load the last activity from the peer and check if it's recent enough
         let last_peer_activity = load_last_activity();
-        self.update_idle_timer(&last_peer_activity);
+        
+        // If there's been recent peer activity (within idle_timeout), reset the timer based on current time
+        if now.saturating_duration_since(last_peer_activity) < self.idle_timeout {
+            self.update_idle_timer(clock);
+        }
 
         // check the idle timer once more before returning
         ready!(self.idle_timer.poll_expiration(now));
+
+        // Don't trigger idle timeout if we're still actively receiving
+        // The peer may be retransmitting due to packet loss
+        if matches!(self.state, Receiver::Recv | Receiver::SizeKnown) {
+            // Re-arm the timer and return Pending to avoid timeout
+            self.update_idle_timer(clock);
+            return Poll::Pending;
+        }
 
         Poll::Ready(())
     }

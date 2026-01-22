@@ -798,10 +798,27 @@ impl State {
                 }
             }
 
-            // if that expired then load the last activity from the peer and update the idle timer with
-            // the value
+            // if that expired then load the last activity from the peer and check if it's recent enough
             let last_peer_activity = load_last_activity();
-            self.update_idle_timer(&last_peer_activity);
+            
+            // If there's been recent peer activity (within idle_timeout), reset the timer
+            if now.saturating_duration_since(last_peer_activity) < self.idle_timeout {
+                self.update_idle_timer(clock);
+            }
+        }
+
+        // Don't trigger idle timeout if we have packets in flight
+        // The peer may not have responded yet due to packet loss or delays
+        if self.has_inflight_packets() {
+            // Re-arm the idle timer for future checks since we're not timing out yet
+            self.update_idle_timer(clock);
+            return Poll::Pending;
+        }
+        
+        // Also don't timeout if we're still in Send state (application may be blocked on flow control)
+        if matches!(self.state(), state::Sender::Send) {
+            self.update_idle_timer(clock);
+            return Poll::Pending;
         }
 
         Poll::Ready(())
