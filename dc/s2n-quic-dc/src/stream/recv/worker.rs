@@ -178,20 +178,16 @@ where
         {
             let now = self.shared.clock.get_time();
             let last_peer_activity = self.shared.last_peer_activity();
+            let target = last_peer_activity + self.idle_timeout_duration;
+            self.idle_timer.update(target);
             
-            // Only trigger idle timeout if peer has been idle for the full duration
-            // AND we're not in an active receive state
-            if now.saturating_duration_since(last_peer_activity) >= self.idle_timeout_duration {
-                // Check if we're still actively receiving data
-                // If so, don't timeout - the peer may be retransmitting due to packet loss
+            if self.idle_timer.poll_ready(cx).is_ready() {
+                // Timer expired - check if we should actually timeout
+                // Don't timeout if we're still actively receiving data (peer may be retransmitting)
                 let is_active = !matches!(self.state, waiting::State::Finished | waiting::State::TimeWait);
                 
-                if is_active {
-                    // Update timer for next check
-                    let target = now + self.idle_timeout_duration;
-                    self.idle_timer.update(target);
-                } else {
-                    // Not active and peer is idle - trigger timeout
+                if !is_active {
+                    // Not active and timer expired - trigger timeout
                     let publisher = self.shared.publisher();
                     self.shared.receiver.notify_error(
                         super::ErrorKind::IdleTimeout.err(),
@@ -200,14 +196,8 @@ where
                     );
                     return Poll::Ready(());
                 }
-            } else {
-                // Peer has been active recently, update timer based on peer activity
-                let target = last_peer_activity + self.idle_timeout_duration;
-                self.idle_timer.update(target);
+                // else: active, so don't timeout - timer will be updated on next poll
             }
-            
-            // Poll the timer to check if it's ready
-            let _ = self.idle_timer.poll_ready(cx);
         }
 
         if self.should_transmit {
