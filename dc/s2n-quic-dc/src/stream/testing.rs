@@ -353,7 +353,15 @@ impl Client {
         let local_addr = "127.0.0.1:1337".parse().unwrap();
         self.map.test_insert_pair(
             local_addr,
-            Some(self.params()),
+            Some({
+                let mut params = dc::testing::TEST_APPLICATION_PARAMS;
+                params.remote_max_data =
+                    s2n_quic_core::varint::VarInt::from_u32(MAX_DATAGRAM_SIZE as u32 * 10);
+                params.local_recv_max_data =
+                    s2n_quic_core::varint::VarInt::from_u32(MAX_DATAGRAM_SIZE as u32 * 10);
+                params.max_datagram_size = self.mtu.unwrap_or(MAX_DATAGRAM_SIZE).into();
+                params
+            }),
             &server.map,
             server_addr,
             Some({
@@ -368,14 +376,6 @@ impl Client {
         self.map.get_untracked(server_addr).ok_or_else(|| {
             io::Error::new(io::ErrorKind::AddrNotAvailable, "path secret not available")
         })
-    }
-
-    fn params(&self) -> ApplicationParams {
-        let mut params = dc::testing::TEST_APPLICATION_PARAMS;
-        params.remote_max_data =
-            s2n_quic_core::varint::VarInt::from_u32(MAX_DATAGRAM_SIZE as u32 * 10);
-        params.max_datagram_size = self.mtu.unwrap_or(MAX_DATAGRAM_SIZE).into();
-        params
     }
 
     pub async fn connect_to<S: AsRef<server::Handle>>(&self, server: &S) -> io::Result<Stream> {

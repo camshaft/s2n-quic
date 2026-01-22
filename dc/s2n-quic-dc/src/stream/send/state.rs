@@ -769,6 +769,14 @@ impl State {
             let max_pto_backoff = 1024;
             self.pto_backoff = self.pto_backoff.saturating_mul(2).min(max_pto_backoff);
         }
+
+        if self
+            .max_data
+            .on_timeout(clock, self.idle_timeout)
+            .is_ready()
+        {
+            self.pto.force_transmit();
+        }
     }
 
     #[inline]

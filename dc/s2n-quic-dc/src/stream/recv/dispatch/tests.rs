@@ -318,7 +318,7 @@ fn alloc_drop_notify() {
 #[test]
 fn associated_credentials() {
     check!().exhaustive().run(|| {
-        let mut alloc = Allocator::new(1, 1);
+        let mut alloc = Allocator::new_non_zero(1, 1);
         let alloc = &mut alloc;
         let mut key_id = 0;
         let key_id = &mut key_id;

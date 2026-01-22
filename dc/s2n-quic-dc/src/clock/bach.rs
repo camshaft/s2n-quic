@@ -7,7 +7,11 @@ fn root() -> Instant {
     use std::sync::OnceLock;
     static ROOT: OnceLock<Instant> = OnceLock::new();
 
-    *ROOT.get_or_init(|| unsafe { core::mem::transmute(core::time::Duration::ZERO) })
+    *ROOT.get_or_init(|| unsafe {
+        // SAFETY: bach stores durations
+        // TODO: add a `zero` method in bach
+        core::mem::transmute(core::time::Duration::ZERO)
+    })
 }
 
 impl_clock!();
@@ -36,11 +40,12 @@ mod tests {
                 let clock = Clock::default();
                 let mut timer = Timer::new(&clock);
                 timer.ready().await;
-                let before = Instant::now();
+                let before = clock.get_time();
                 let wait = Duration::from_secs(1);
-                timer.update(clock.get_time() + wait);
+                let target = before + wait;
+                timer.update(target);
                 timer.ready().await;
-                assert_eq!(before + wait, Instant::now());
+                assert_eq!(before + wait, clock.get_time());
             }
             .primary()
             .spawn();
