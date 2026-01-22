@@ -399,10 +399,7 @@ where
                 shared: &self.shared,
             };
             recv.fill_transmit_queue(&self.shared, &mut transmission_queue);
-
-            if !self.transmission_buffer.is_empty() {
-                self.should_transmit = false;
-            }
+            self.should_transmit = false;
 
             if recv.receiver.state().is_data_received() {
                 let _ = self.state.on_data_received();
