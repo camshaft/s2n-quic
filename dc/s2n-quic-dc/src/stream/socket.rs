@@ -7,6 +7,7 @@ pub mod application;
 #[cfg(any(test, feature = "testing"))]
 mod bach;
 mod busy_poll;
+mod events;
 pub mod fd;
 mod gso;
 mod handle;
@@ -16,7 +17,7 @@ mod tokio;
 mod tracing;
 mod wheel;
 
-pub use self::tracing::Tracing;
+pub use self::{events::Events, tracing::Tracing};
 pub use crate::socket::*;
 pub use application::Application;
 pub use busy_poll::BusyPoll;

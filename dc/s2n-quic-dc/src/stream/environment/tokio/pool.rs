@@ -20,7 +20,7 @@ use crate::{
         },
         recv::dispatch::{Allocator as Queues, Control, Stream},
         server::{accept, udp::Acceptor},
-        socket::{application::Single, BusyPoll, Gso, SendOnly, Tracing},
+        socket::{application::Single, BusyPoll, Events, Gso, SendOnly, Tracing},
     },
 };
 use s2n_quic_platform::socket::options::{Options, ReusePort};
@@ -92,6 +92,7 @@ impl PoolSocket {
         wake_mode: impl send::udp::WakeMode + Send + 'static,
     ) -> impl core::future::Future<Output = ()> + Send + 'static {
         let socket = Tracing(Gso(SendOnly(self.socket.clone()), env.gso.clone()));
+        let socket = Events::new(socket, env.subscriber.clone(), env.clock());
 
         let mut wheels = vec![send::wheel::Wheel::clone(&self.worker)];
 
@@ -125,8 +126,9 @@ impl PoolSocket {
         alloc: pool::Pool,
         router: impl Router + Send + 'static,
     ) {
-        let recv_socket = Tracing(AsyncFd::new(self.socket.clone()).unwrap());
-        let task = udp::non_blocking(recv_socket, alloc, router);
+        let socket = Tracing(AsyncFd::new(self.socket.clone()).unwrap());
+        let socket = Events::new(socket, env.subscriber.clone(), env.clock());
+        let task = udp::non_blocking(socket, alloc, router);
         let span = tracing::trace_span!("recv_socket_worker");
         spawn_span!(span, task, |task| {
             env.reader_rt.spawn(task);
@@ -151,13 +153,14 @@ impl PoolSocket {
     fn spawn_busy_poll_recv_worker(
         &self,
         config: &Config,
-        _env: &Environment<impl event::Subscriber + Clone>,
+        env: &Environment<impl event::Subscriber + Clone>,
         alloc: pool::Pool,
         router: impl Router + Send + 'static,
         handle: &crate::busy_poll::Handle,
     ) {
-        let recv_socket = BusyPoll(self.socket.clone());
-        let task = udp::non_blocking(recv_socket, alloc, router);
+        let socket = BusyPoll(self.socket.clone());
+        let socket = Events::new(socket, env.subscriber.clone(), env.clock());
+        let task = udp::non_blocking(socket, alloc, router);
         let span = tracing::trace_span!("recv_socket_worker");
         spawn_span!(span, task, |task| {
             handle.spawn_with_priority(task, config.flow_priority);
