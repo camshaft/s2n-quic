@@ -15,6 +15,44 @@ use std::{
 #[derive(Clone)]
 pub struct Gso<S: Socket>(pub S, pub features::Gso);
 
+impl<S: Socket> Gso<S> {
+    #[inline(always)]
+    fn handle_send_result(
+        &self,
+        result: io::Result<usize>,
+        addr: &Addr,
+        ecn: ExplicitCongestionNotification,
+        buffer: &[IoSlice],
+    ) -> io::Result<usize> {
+        let err = match result {
+            Ok(result) => return Ok(result),
+            Err(err) => err,
+        };
+
+        let mut did_disable = false;
+
+        if err.raw_os_error() == Some(libc::EMSGSIZE) {
+            self.1.disable();
+            did_disable = true;
+        }
+
+        if !did_disable && self.1.handle_socket_error(&err).is_some() {
+            did_disable = true;
+        }
+
+        if did_disable {
+            let mut len = 0;
+            for buffer in buffer {
+                len += buffer.len();
+                let _ = self.0.try_send(addr, ecn, &[*buffer]);
+            }
+            return Ok(len);
+        }
+
+        Err(err)
+    }
+}
+
 impl<S: Socket> Deref for Gso<S> {
     type Target = S;
 
@@ -64,12 +102,7 @@ impl<S: Socket> Socket for Gso<S> {
         buffer: &[IoSlice],
     ) -> io::Result<usize> {
         let result = self.0.try_send(addr, ecn, buffer);
-
-        if let Err(err) = &result {
-            self.1.handle_socket_error(err);
-        }
-
-        result
+        self.handle_send_result(result, addr, ecn, buffer)
     }
 
     #[inline(always)]
@@ -80,13 +113,9 @@ impl<S: Socket> Socket for Gso<S> {
         ecn: ExplicitCongestionNotification,
         buffer: &[IoSlice],
     ) -> Poll<io::Result<usize>> {
-        let result = self.0.poll_send(cx, addr, ecn, buffer);
-
-        if let Poll::Ready(Err(err)) = &result {
-            self.1.handle_socket_error(err);
-        }
-
-        result
+        self.0
+            .poll_send(cx, addr, ecn, buffer)
+            .map(|result| self.handle_send_result(result, addr, ecn, buffer))
     }
 
     #[inline(always)]
