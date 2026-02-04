@@ -18,6 +18,7 @@ use crate::{
             udp::{Config, Workers},
             Environment as _,
         },
+        load_balance::PickTwo,
         recv::dispatch::{Allocator as Queues, Control, Stream},
         server::{accept, udp::Acceptor},
         socket::{application::Single, BusyPoll, Events, Gso, SendOnly, Tracing},
@@ -36,6 +37,7 @@ pub(super) struct Pool {
     sockets: Box<[PoolSocket]>,
     local_addr: SocketAddr,
     transmission_pool: pool::Sharded,
+    load_balancer: PickTwo,
 }
 
 struct PoolSocket {
@@ -225,9 +227,11 @@ impl Pool {
         }
 
         if let Some(sender) = acceptor {
+            // Collect all application sockets from all workers for load balancing
+            let app_sockets: Box<[_]> = sockets.iter().map(|s| s.application[0].clone()).collect();
+
             spawn!(|_packets: &Packets, socket: &PoolSocket| {
                 let queues = socket.recv_queue.lock().unwrap();
-                let app_socket = socket.application[0].clone();
                 let worker_socket = socket.worker.clone();
 
                 // TODO pace these packets
@@ -239,7 +243,7 @@ impl Pool {
                     config.map.clone(),
                     config.accept_flavor,
                     queues.clone(),
-                    app_socket,
+                    app_sockets.clone(),
                     worker_socket,
                     secret_socket,
                     transmission_pool.clone(),
@@ -266,6 +270,7 @@ impl Pool {
             sockets: sockets.into(),
             local_addr,
             transmission_pool,
+            load_balancer: PickTwo::new(),
         })
     }
 
@@ -279,8 +284,11 @@ impl Pool {
         WorkerSendSocket,
         pool::Sharded,
     ) {
-        // "Pick 2" worker selection
-        let idx = self.pick_worker();
+        let idx = self.load_balancer.select(
+            &self.sockets,
+            |socket| Arc::strong_count(&socket.application[0]),
+            |upper_bound| rand::random_range(..upper_bound),
+        );
 
         let socket = &self.sockets[idx];
 
@@ -301,30 +309,6 @@ impl Pool {
             worker_socket,
             transmission_pool,
         )
-    }
-
-    /// Implements "pick 2" load balancing: select two random workers and choose the one with lower queue length
-    fn pick_worker(&self) -> usize {
-        if self.sockets.len() == 1 {
-            return 0;
-        }
-
-        let idx1 = rand::random_range(..self.sockets.len());
-        let mut idx2 = rand::random_range(..self.sockets.len() - 1);
-        // shift the second index up so they're non-overlapping
-        if idx2 >= idx1 {
-            idx2 += 1;
-        }
-
-        // Choose the worker with lower queue length
-        let len1 = self.sockets[idx1].application[0].len();
-        let len2 = self.sockets[idx2].application[0].len();
-
-        if len1 <= len2 {
-            idx1
-        } else {
-            idx2
-        }
     }
 
     pub fn local_addr(&self) -> SocketAddr {

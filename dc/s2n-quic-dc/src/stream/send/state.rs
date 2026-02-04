@@ -114,6 +114,8 @@ impl InflightCounters {
     }
 }
 
+const MAX_TX_OFFSET: VarInt = VarInt::from_u32(64 * 1024);
+
 #[derive(Debug)]
 pub struct State {
     rtt_estimator: RttEstimator,
@@ -165,7 +167,7 @@ impl State {
 
         let cca = congestion::Controller::new(max_datagram_size);
 
-        let max_tx_offset = VarInt::from_u16(max_datagram_size) * 64;
+        let max_tx_offset = MAX_TX_OFFSET;
 
         Self {
             next_expected_control_packet: VarInt::ZERO,
@@ -993,7 +995,7 @@ impl State {
                 .max(self.max_stream_packet_number_lost)
                 + 1;
 
-            self.max_tx_offset += VarInt::from_u16(info.payload_len);
+            self.max_tx_offset = self.max_tx_offset.max(info.end_offset() + MAX_TX_OFFSET);
             self.recovery_packet_number = self
                 .recovery_packet_number
                 .max(self.max_stream_packet_number.as_u64() + 1);

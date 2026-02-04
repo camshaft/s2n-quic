@@ -15,6 +15,7 @@ use crate::{
     stream::{
         endpoint,
         environment::{udp, Environment},
+        load_balance::PickTwo,
         recv::dispatch::{Allocator, Dispatch},
         socket, TransportFeatures,
     },
@@ -45,9 +46,10 @@ where
     is_open: bool,
     packet: InitialPacket,
     transmission_pool: pool::Sharded,
-    application_socket: Arc<S>,
+    application_sockets: Box<[Arc<S>]>,
     worker_socket: Arc<W>,
     secret_socket: R,
+    load_balancer: PickTwo,
 }
 
 impl<Env, S, W, R> Acceptor<Env, S, W, R>
@@ -63,7 +65,7 @@ where
         secrets: secret::Map,
         accept_flavor: accept::Flavor,
         queues: Allocator,
-        application_socket: Arc<S>,
+        application_sockets: Box<[Arc<S>]>,
         worker_socket: Arc<W>,
         secret_socket: R,
         transmission_pool: pool::Sharded,
@@ -81,9 +83,10 @@ where
             is_open: true,
             packet,
             transmission_pool,
-            application_socket,
+            application_sockets,
             worker_socket,
             secret_socket,
+            load_balancer: PickTwo::new(),
         }
     }
 }
@@ -153,7 +156,13 @@ where
             .subscriber()
             .create_connection_context(&meta, &info);
 
-        let application_socket = self.application_socket.clone();
+        // Use "pick 2" load balancing to select an application socket
+        let idx = self.load_balancer.select(
+            &self.application_sockets,
+            |socket| Arc::strong_count(socket),
+            |upper_bound| rand::random_range(..upper_bound),
+        );
+        let application_socket = self.application_sockets[idx].clone();
         let worker_socket = self.worker_socket.clone();
         let transmission_pool = self.transmission_pool.clone();
 
