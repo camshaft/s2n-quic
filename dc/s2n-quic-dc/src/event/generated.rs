@@ -1315,6 +1315,41 @@ pub mod api {
     }
     #[derive(Clone, Debug)]
     #[non_exhaustive]
+    #[doc = " Indicates that a packet was abandoned when the connection closed before it was acknowledged"]
+    pub struct StreamPacketAbandoned {
+        #[doc = " The total size of the packet"]
+        pub packet_len: usize,
+        #[doc = " The size of the application data in the packet"]
+        pub payload_len: usize,
+        #[doc = " The packet number of the abandoned packet"]
+        pub packet_number: u64,
+        #[doc = " The offset in the stream of the first byte in the packet"]
+        pub stream_offset: u64,
+        #[doc = " The time the packet was originally sent"]
+        pub time_sent: Timestamp,
+        #[doc = " The amount of time between when the packet was sent and when it was abandoned"]
+        pub lifetime: core::time::Duration,
+        pub is_retransmission: bool,
+    }
+    #[cfg(any(test, feature = "testing"))]
+    impl crate::event::snapshot::Fmt for StreamPacketAbandoned {
+        fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
+            let mut fmt = fmt.debug_struct("StreamPacketAbandoned");
+            fmt.field("packet_len", &self.packet_len);
+            fmt.field("payload_len", &self.payload_len);
+            fmt.field("packet_number", &self.packet_number);
+            fmt.field("stream_offset", &self.stream_offset);
+            fmt.field("time_sent", &self.time_sent);
+            fmt.field("lifetime", &self.lifetime);
+            fmt.field("is_retransmission", &self.is_retransmission);
+            fmt.finish()
+        }
+    }
+    impl Event for StreamPacketAbandoned {
+        const NAME: &'static str = "stream:packet_abandoned";
+    }
+    #[derive(Clone, Debug)]
+    #[non_exhaustive]
     #[doc = " Indicates that a packet was retransmitted on a stream but was not actually lost"]
     pub struct StreamPacketSpuriouslyRetransmitted {
         #[doc = " The total size of the packet"]
@@ -3153,6 +3188,25 @@ pub mod tracing {
                 is_retransmission,
             } = event;
             tracing :: event ! (target : "stream_packet_acked" , parent : id , tracing :: Level :: DEBUG , { packet_len = tracing :: field :: debug (packet_len) , payload_len = tracing :: field :: debug (payload_len) , packet_number = tracing :: field :: debug (packet_number) , stream_offset = tracing :: field :: debug (stream_offset) , time_sent = tracing :: field :: debug (time_sent) , lifetime = tracing :: field :: debug (lifetime) , is_retransmission = tracing :: field :: debug (is_retransmission) });
+        }
+        #[inline]
+        fn on_stream_packet_abandoned(
+            &self,
+            context: &Self::ConnectionContext,
+            _meta: &api::ConnectionMeta,
+            event: &api::StreamPacketAbandoned,
+        ) {
+            let id = context.id();
+            let api::StreamPacketAbandoned {
+                packet_len,
+                payload_len,
+                packet_number,
+                stream_offset,
+                time_sent,
+                lifetime,
+                is_retransmission,
+            } = event;
+            tracing :: event ! (target : "stream_packet_abandoned" , parent : id , tracing :: Level :: DEBUG , { packet_len = tracing :: field :: debug (packet_len) , payload_len = tracing :: field :: debug (payload_len) , packet_number = tracing :: field :: debug (packet_number) , stream_offset = tracing :: field :: debug (stream_offset) , time_sent = tracing :: field :: debug (time_sent) , lifetime = tracing :: field :: debug (lifetime) , is_retransmission = tracing :: field :: debug (is_retransmission) });
         }
         #[inline]
         fn on_stream_packet_spuriously_retransmitted(
@@ -5061,6 +5115,46 @@ pub mod builder {
         }
     }
     #[derive(Clone, Debug)]
+    #[doc = " Indicates that a packet was abandoned when the connection closed before it was acknowledged"]
+    pub struct StreamPacketAbandoned {
+        #[doc = " The total size of the packet"]
+        pub packet_len: usize,
+        #[doc = " The size of the application data in the packet"]
+        pub payload_len: usize,
+        #[doc = " The packet number of the abandoned packet"]
+        pub packet_number: u64,
+        #[doc = " The offset in the stream of the first byte in the packet"]
+        pub stream_offset: u64,
+        #[doc = " The time the packet was originally sent"]
+        pub time_sent: Timestamp,
+        #[doc = " The amount of time between when the packet was sent and when it was abandoned"]
+        pub lifetime: core::time::Duration,
+        pub is_retransmission: bool,
+    }
+    impl IntoEvent<api::StreamPacketAbandoned> for StreamPacketAbandoned {
+        #[inline]
+        fn into_event(self) -> api::StreamPacketAbandoned {
+            let StreamPacketAbandoned {
+                packet_len,
+                payload_len,
+                packet_number,
+                stream_offset,
+                time_sent,
+                lifetime,
+                is_retransmission,
+            } = self;
+            api::StreamPacketAbandoned {
+                packet_len: packet_len.into_event(),
+                payload_len: payload_len.into_event(),
+                packet_number: packet_number.into_event(),
+                stream_offset: stream_offset.into_event(),
+                time_sent: time_sent.into_event(),
+                lifetime: lifetime.into_event(),
+                is_retransmission: is_retransmission.into_event(),
+            }
+        }
+    }
+    #[derive(Clone, Debug)]
     #[doc = " Indicates that a packet was retransmitted on a stream but was not actually lost"]
     pub struct StreamPacketSpuriouslyRetransmitted {
         #[doc = " The total size of the packet"]
@@ -6752,6 +6846,18 @@ mod traits {
             let _ = meta;
             let _ = event;
         }
+        #[doc = "Called when the `StreamPacketAbandoned` event is triggered"]
+        #[inline]
+        fn on_stream_packet_abandoned(
+            &self,
+            context: &Self::ConnectionContext,
+            meta: &api::ConnectionMeta,
+            event: &api::StreamPacketAbandoned,
+        ) {
+            let _ = context;
+            let _ = meta;
+            let _ = event;
+        }
         #[doc = "Called when the `StreamPacketSpuriouslyRetransmitted` event is triggered"]
         #[inline]
         fn on_stream_packet_spuriously_retransmitted(
@@ -7697,6 +7803,16 @@ mod traits {
             self.as_ref().on_stream_packet_acked(context, meta, event);
         }
         #[inline]
+        fn on_stream_packet_abandoned(
+            &self,
+            context: &Self::ConnectionContext,
+            meta: &api::ConnectionMeta,
+            event: &api::StreamPacketAbandoned,
+        ) {
+            self.as_ref()
+                .on_stream_packet_abandoned(context, meta, event);
+        }
+        #[inline]
         fn on_stream_packet_spuriously_retransmitted(
             &self,
             context: &Self::ConnectionContext,
@@ -8589,6 +8705,16 @@ mod traits {
         ) {
             (self.0).on_stream_packet_acked(&context.0, meta, event);
             (self.1).on_stream_packet_acked(&context.1, meta, event);
+        }
+        #[inline]
+        fn on_stream_packet_abandoned(
+            &self,
+            context: &Self::ConnectionContext,
+            meta: &api::ConnectionMeta,
+            event: &api::StreamPacketAbandoned,
+        ) {
+            (self.0).on_stream_packet_abandoned(&context.0, meta, event);
+            (self.1).on_stream_packet_abandoned(&context.1, meta, event);
         }
         #[inline]
         fn on_stream_packet_spuriously_retransmitted(
@@ -9801,6 +9927,8 @@ mod traits {
         fn on_stream_packet_lost(&self, event: builder::StreamPacketLost);
         #[doc = "Publishes a `StreamPacketAcked` event to the publisher's subscriber"]
         fn on_stream_packet_acked(&self, event: builder::StreamPacketAcked);
+        #[doc = "Publishes a `StreamPacketAbandoned` event to the publisher's subscriber"]
+        fn on_stream_packet_abandoned(&self, event: builder::StreamPacketAbandoned);
         #[doc = "Publishes a `StreamPacketSpuriouslyRetransmitted` event to the publisher's subscriber"]
         fn on_stream_packet_spuriously_retransmitted(
             &self,
@@ -10078,6 +10206,15 @@ mod traits {
             let event = event.into_event();
             self.subscriber
                 .on_stream_packet_acked(self.context, &self.meta, &event);
+            self.subscriber
+                .on_connection_event(self.context, &self.meta, &event);
+            self.subscriber.on_event(&self.meta, &event);
+        }
+        #[inline]
+        fn on_stream_packet_abandoned(&self, event: builder::StreamPacketAbandoned) {
+            let event = event.into_event();
+            self.subscriber
+                .on_stream_packet_abandoned(self.context, &self.meta, &event);
             self.subscriber
                 .on_connection_event(self.context, &self.meta, &event);
             self.subscriber.on_event(&self.meta, &event);
@@ -11148,6 +11285,7 @@ pub mod testing {
         pub stream_packet_received: AtomicU64,
         pub stream_packet_lost: AtomicU64,
         pub stream_packet_acked: AtomicU64,
+        pub stream_packet_abandoned: AtomicU64,
         pub stream_packet_spuriously_retransmitted: AtomicU64,
         pub stream_max_data_received: AtomicU64,
         pub stream_control_packet_transmitted: AtomicU64,
@@ -11275,6 +11413,7 @@ pub mod testing {
                 stream_packet_received: AtomicU64::new(0),
                 stream_packet_lost: AtomicU64::new(0),
                 stream_packet_acked: AtomicU64::new(0),
+                stream_packet_abandoned: AtomicU64::new(0),
                 stream_packet_spuriously_retransmitted: AtomicU64::new(0),
                 stream_max_data_received: AtomicU64::new(0),
                 stream_control_packet_transmitted: AtomicU64::new(0),
@@ -11954,6 +12093,20 @@ pub mod testing {
                 self.output.lock().unwrap().push(out);
             }
         }
+        fn on_stream_packet_abandoned(
+            &self,
+            _context: &Self::ConnectionContext,
+            meta: &api::ConnectionMeta,
+            event: &api::StreamPacketAbandoned,
+        ) {
+            self.stream_packet_abandoned.fetch_add(1, Ordering::Relaxed);
+            if self.location.is_some() {
+                let meta = crate::event::snapshot::Fmt::to_snapshot(meta);
+                let event = crate::event::snapshot::Fmt::to_snapshot(event);
+                let out = format!("{meta:?} {event:?}");
+                self.output.lock().unwrap().push(out);
+            }
+        }
         fn on_stream_packet_spuriously_retransmitted(
             &self,
             _context: &Self::ConnectionContext,
@@ -12594,6 +12747,7 @@ pub mod testing {
         pub stream_packet_received: AtomicU64,
         pub stream_packet_lost: AtomicU64,
         pub stream_packet_acked: AtomicU64,
+        pub stream_packet_abandoned: AtomicU64,
         pub stream_packet_spuriously_retransmitted: AtomicU64,
         pub stream_max_data_received: AtomicU64,
         pub stream_control_packet_transmitted: AtomicU64,
@@ -12711,6 +12865,7 @@ pub mod testing {
                 stream_packet_received: AtomicU64::new(0),
                 stream_packet_lost: AtomicU64::new(0),
                 stream_packet_acked: AtomicU64::new(0),
+                stream_packet_abandoned: AtomicU64::new(0),
                 stream_packet_spuriously_retransmitted: AtomicU64::new(0),
                 stream_max_data_received: AtomicU64::new(0),
                 stream_control_packet_transmitted: AtomicU64::new(0),
@@ -13545,6 +13700,15 @@ pub mod testing {
         }
         fn on_stream_packet_acked(&self, event: builder::StreamPacketAcked) {
             self.stream_packet_acked.fetch_add(1, Ordering::Relaxed);
+            let event = event.into_event();
+            if self.location.is_some() {
+                let event = crate::event::snapshot::Fmt::to_snapshot(&event);
+                let out = format!("{event:?}");
+                self.output.lock().unwrap().push(out);
+            }
+        }
+        fn on_stream_packet_abandoned(&self, event: builder::StreamPacketAbandoned) {
+            self.stream_packet_abandoned.fetch_add(1, Ordering::Relaxed);
             let event = event.into_event();
             if self.location.is_some() {
                 let event = crate::event::snapshot::Fmt::to_snapshot(&event);

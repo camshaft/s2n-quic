@@ -51,6 +51,7 @@ pub struct Context<R: Recorder> {
     stream_packet_received: AtomicU64,
     stream_packet_lost: AtomicU64,
     stream_packet_acked: AtomicU64,
+    stream_packet_abandoned: AtomicU64,
     stream_packet_spuriously_retransmitted: AtomicU64,
     stream_max_data_received: AtomicU64,
     stream_control_packet_transmitted: AtomicU64,
@@ -104,6 +105,7 @@ where
             stream_packet_received: AtomicU64::new(0),
             stream_packet_lost: AtomicU64::new(0),
             stream_packet_acked: AtomicU64::new(0),
+            stream_packet_abandoned: AtomicU64::new(0),
             stream_packet_spuriously_retransmitted: AtomicU64::new(0),
             stream_max_data_received: AtomicU64::new(0),
             stream_control_packet_transmitted: AtomicU64::new(0),
@@ -421,6 +423,19 @@ where
             .on_stream_packet_acked(&context.recorder, meta, event);
     }
     #[inline]
+    fn on_stream_packet_abandoned(
+        &self,
+        context: &Self::ConnectionContext,
+        meta: &api::ConnectionMeta,
+        event: &api::StreamPacketAbandoned,
+    ) {
+        context
+            .stream_packet_abandoned
+            .fetch_add(1, Ordering::Relaxed);
+        self.subscriber
+            .on_stream_packet_abandoned(&context.recorder, meta, event);
+    }
+    #[inline]
     fn on_stream_packet_spuriously_retransmitted(
         &self,
         context: &Self::ConnectionContext,
@@ -611,6 +626,10 @@ impl<R: Recorder> Drop for Context<R> {
         self.recorder.increment_counter(
             "stream_packet_acked",
             self.stream_packet_acked.load(Ordering::Relaxed) as _,
+        );
+        self.recorder.increment_counter(
+            "stream_packet_abandoned",
+            self.stream_packet_abandoned.load(Ordering::Relaxed) as _,
         );
         self.recorder.increment_counter(
             "stream_packet_spuriously_retransmitted",

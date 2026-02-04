@@ -299,7 +299,7 @@ impl State {
             Ok(None) => {}
             Ok(Some(error)) => return Err(error),
             Err(error) => {
-                self.on_error(error, Location::Local, publisher);
+                self.on_error(error, Location::Local, clock, publisher);
             }
         }
 
@@ -422,7 +422,7 @@ impl State {
                     };
 
                     let error = error.err();
-                    self.on_error(error, Location::Remote, publisher);
+                    self.on_error(error, Location::Remote, clock, publisher);
                     return Err(error);
                 }
                 _ => continue,
@@ -754,7 +754,7 @@ impl State {
         Pub: event::ConnectionPublisher,
     {
         if self.poll_idle_timer(clock, load_last_activity).is_ready() {
-            self.on_error(error::Kind::IdleTimeout, Location::Local, publisher);
+            self.on_error(error::Kind::IdleTimeout, Location::Local, clock, publisher);
             return;
         }
 
@@ -1040,7 +1040,7 @@ impl State {
             packets,
             publisher,
         ) {
-            self.on_error(error, Location::Local, publisher);
+            self.on_error(error, Location::Local, clock, publisher);
             return Err(error);
         }
 
@@ -1326,14 +1326,47 @@ impl State {
 
     #[inline]
     #[track_caller]
-    pub fn on_error<E, Pub>(&mut self, error: E, source: Location, publisher: &Pub)
-    where
+    pub fn on_error<E, Clk, Pub>(
+        &mut self,
+        error: E,
+        source: Location,
+        clock: &Clk,
+        publisher: &Pub,
+    ) where
         Error: From<E>,
+        Clk: Clock,
         Pub: event::ConnectionPublisher,
     {
         let error = Error::from(error);
         ensure!(self.reset.on_error(error, source).is_ok());
         publisher.on_stream_sender_errored(event::builder::StreamSenderErrored { error, source });
+
+        // Emit abandon events for all unacknowledged stream packets
+        let now = clock.get_time();
+        for (num, packet) in self.sent_stream_packets.iter() {
+            publisher.on_stream_packet_abandoned(event::builder::StreamPacketAbandoned {
+                packet_len: packet.info.packet_len as usize,
+                stream_offset: packet.info.stream_offset.as_u64(),
+                payload_len: packet.info.payload_len as usize,
+                packet_number: num.as_u64(),
+                time_sent: packet.info.time_sent.into_event(),
+                lifetime: now.saturating_duration_since(packet.info.time_sent),
+                is_retransmission: false,
+            });
+        }
+
+        // Emit abandon events for all unacknowledged recovery packets
+        for (num, packet) in self.sent_recovery_packets.iter() {
+            publisher.on_stream_packet_abandoned(event::builder::StreamPacketAbandoned {
+                packet_len: packet.info.packet_len as usize,
+                stream_offset: packet.info.stream_offset.as_u64(),
+                payload_len: packet.info.payload_len as usize,
+                packet_number: num.as_u64(),
+                time_sent: packet.info.time_sent.into_event(),
+                lifetime: now.saturating_duration_since(packet.info.time_sent),
+                is_retransmission: true,
+            });
+        }
 
         self.retransmissions.clear();
         self.sent_stream_packets.clear();

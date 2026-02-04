@@ -461,6 +461,36 @@ pub struct StreamPacketAcked {
     is_retransmission: bool,
 }
 
+/// Indicates that a packet was abandoned when the connection closed before it was acknowledged
+#[event("stream:packet_abandoned")]
+pub struct StreamPacketAbandoned {
+    /// The total size of the packet
+    #[measure("packet_len", Bytes)]
+    packet_len: usize,
+
+    /// The size of the application data in the packet
+    #[measure("payload_len", Bytes)]
+    #[counter("payload_len.total", Bytes)]
+    #[measure_counter("payload_len.conn", Bytes)]
+    payload_len: usize,
+
+    /// The packet number of the abandoned packet
+    packet_number: u64,
+
+    /// The offset in the stream of the first byte in the packet
+    stream_offset: u64,
+
+    /// The time the packet was originally sent
+    time_sent: Timestamp,
+
+    /// The amount of time between when the packet was sent and when it was abandoned
+    #[measure("lifetime", Duration)]
+    lifetime: core::time::Duration,
+
+    #[bool_counter("retransmission")]
+    is_retransmission: bool,
+}
+
 /// Indicates that a packet was retransmitted on a stream but was not actually lost
 #[event("stream:packet_spuriously_retransmitted")]
 pub struct StreamPacketSpuriouslyRetransmitted {

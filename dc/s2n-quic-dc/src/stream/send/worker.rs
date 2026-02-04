@@ -282,7 +282,12 @@ where
                             error: error.into(),
                         };
                         let publisher = self.shared.publisher();
-                        self.sender.on_error(error, Location::Local, &publisher);
+                        self.sender.on_error(
+                            error,
+                            Location::Local,
+                            &self.shared.clock,
+                            &publisher,
+                        );
                     }
 
                     // transition to a detached state
@@ -568,6 +573,7 @@ where
                         $kind
                     },
                     Location::Local,
+                    self.clock,
                     self.publisher,
                 );
                 self.shared.receiver.notify_error(
