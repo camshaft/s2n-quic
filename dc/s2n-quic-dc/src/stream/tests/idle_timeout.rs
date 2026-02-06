@@ -103,9 +103,12 @@ fn server_no_response() {
 /// The stream should NOT timeout as long as the peer is responding (sending ACKs for DATA_BLOCKED).
 #[test]
 fn flow_control_blocked_sender_idle_timeout() {
+    use std::sync::atomic::Ordering;
+
     sim(|| {
         async move {
             let client = Client::builder().build();
+            let client_subscriber = client.subscriber();
             
             let mut stream = client.connect_sim("server:443").await.unwrap();
 
@@ -117,6 +120,28 @@ fn flow_control_blocked_sender_idle_timeout() {
             
             // Wait longer than the default idle timeout (30s) to see if stream times out
             60.s().sleep().await;
+
+            // Check that we received control packets with MAX_DATA frames from the sender
+            let control_packets_received = client_subscriber
+                .stream_control_packet_received
+                .load(Ordering::Relaxed);
+            let max_data_received = client_subscriber
+                .stream_max_data_received
+                .load(Ordering::Relaxed);
+            
+            tracing::info!(
+                control_packets_received,
+                max_data_received,
+                "Client stats after 60s wait"
+            );
+            
+            // If we're flow control blocked, we should be seeing control packets
+            // being sent by the sender to communicate its blocked state
+            assert!(
+                control_packets_received > 0,
+                "Expected to receive control packets from sender when flow control blocked, got {}",
+                control_packets_received
+            );
 
             // Try to read - if the stream timed out, this should error
             let mut buf = vec![0u8; 100];
@@ -132,8 +157,10 @@ fn flow_control_blocked_sender_idle_timeout() {
 
         async move {
             let server = Server::udp().port(443).build();
+            let server_subscriber = server.subscriber();
 
             while let Ok((mut stream, peer_addr)) = server.accept().await {
+                let server_subscriber = server_subscriber.clone();
                 async move {
                     // Read the request first
                     let mut request = vec![];
@@ -149,6 +176,16 @@ fn flow_control_blocked_sender_idle_timeout() {
                     
                     stream.write_from_fin(&mut data).await
                         .expect("Server write should succeed");
+                    
+                    let control_packets_transmitted = server_subscriber
+                        .stream_control_packet_transmitted
+                        .load(Ordering::Relaxed);
+                    
+                    tracing::info!(
+                        control_packets_transmitted,
+                        "Server transmitted {} control packets",
+                        control_packets_transmitted
+                    );
                     
                     tracing::info!("Server write completed");
                 }
