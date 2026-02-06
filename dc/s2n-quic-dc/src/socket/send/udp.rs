@@ -408,7 +408,7 @@ mod tests {
         fn span(
             &self,
             descriptors: &[(crate::socket::pool::descriptor::Filled, Self::Info)],
-        ) -> impl Drop + 'static {
+        ) -> impl Sized + 'static {
             tracing::warn_span!("transmission", ?self.priority, ?self.payload_len, ?descriptors)
                 .entered()
         }

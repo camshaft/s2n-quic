@@ -12,7 +12,7 @@ pub type Entry<Info, Meta, Completion> = queue::Entry<Transmission<Info, Meta, C
 pub trait Meta {
     type Info;
 
-    fn span(&self, descriptors: &[(descriptor::Filled, Self::Info)]) -> impl Drop + 'static;
+    fn span(&self, descriptors: &[(descriptor::Filled, Self::Info)]) -> impl Sized + 'static;
 }
 
 #[derive(Debug)]

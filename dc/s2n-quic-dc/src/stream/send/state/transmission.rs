@@ -80,12 +80,12 @@ impl crate::socket::send::transmission::Meta for Meta {
     type Info = PacketInfo;
 
     #[cfg(debug_assertions)]
-    fn span(&self, transmissions: &[(descriptor::Filled, PacketInfo)]) -> impl Drop + 'static {
+    fn span(&self, transmissions: &[(descriptor::Filled, PacketInfo)]) -> impl Sized + 'static {
         tracing::warn_span!(parent: &self.span.span, "transmission", ?self.packet_space, ?transmissions).entered()
     }
 
     #[cfg(not(debug_assertions))]
-    fn span(&self, _transmissions: &[(descriptor::Filled, PacketInfo)]) -> impl Drop + 'static {}
+    fn span(&self, _transmissions: &[(descriptor::Filled, PacketInfo)]) -> impl Sized + 'static {}
 }
 
 bitflags! {
