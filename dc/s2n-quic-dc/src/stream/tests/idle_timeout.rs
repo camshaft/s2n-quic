@@ -228,9 +228,10 @@ fn flow_control_max_data_packet_loss() {
             use ::bach::net::monitor::Command;
             
             // Check if this is a control packet
-            let is_control = packet.payload.len() > 0 && {
+            let payload = packet.transport.payload();
+            let is_control = payload.len() > 0 && {
                 // Control packets have tag 0x50-0x5F range
-                let tag = packet.payload[0];
+                let tag = payload[0];
                 (tag & 0xF0) == 0x50
             };
             
