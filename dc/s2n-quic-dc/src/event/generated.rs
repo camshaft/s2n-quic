@@ -1403,6 +1403,24 @@ pub mod api {
     }
     #[derive(Clone, Debug)]
     #[non_exhaustive]
+    #[doc = " Indicates that the stream sent a MAX_DATA frame to grant flow control credits"]
+    pub struct StreamMaxDataTransmitted {
+        #[doc = " The maximum data value being transmitted"]
+        pub max_data: u64,
+    }
+    #[cfg(any(test, feature = "testing"))]
+    impl crate::event::snapshot::Fmt for StreamMaxDataTransmitted {
+        fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
+            let mut fmt = fmt.debug_struct("StreamMaxDataTransmitted");
+            fmt.field("max_data", &self.max_data);
+            fmt.finish()
+        }
+    }
+    impl Event for StreamMaxDataTransmitted {
+        const NAME: &'static str = "stream:max_data_transmitted";
+    }
+    #[derive(Clone, Debug)]
+    #[non_exhaustive]
     pub struct StreamControlPacketTransmitted {
         #[doc = " The total size of the packet"]
         pub packet_len: usize,
@@ -3239,6 +3257,17 @@ pub mod tracing {
                 new_max_data,
             } = event;
             tracing :: event ! (target : "stream_max_data_received" , parent : id , tracing :: Level :: DEBUG , { increase = tracing :: field :: debug (increase) , new_max_data = tracing :: field :: debug (new_max_data) });
+        }
+        #[inline]
+        fn on_stream_max_data_transmitted(
+            &self,
+            context: &Self::ConnectionContext,
+            _meta: &api::ConnectionMeta,
+            event: &api::StreamMaxDataTransmitted,
+        ) {
+            let id = context.id();
+            let api::StreamMaxDataTransmitted { max_data } = event;
+            tracing :: event ! (target : "stream_max_data_transmitted" , parent : id , tracing :: Level :: DEBUG , { max_data = tracing :: field :: debug (max_data) });
         }
         #[inline]
         fn on_stream_control_packet_transmitted(
@@ -5212,6 +5241,21 @@ pub mod builder {
         }
     }
     #[derive(Clone, Debug)]
+    #[doc = " Indicates that the stream sent a MAX_DATA frame to grant flow control credits"]
+    pub struct StreamMaxDataTransmitted {
+        #[doc = " The maximum data value being transmitted"]
+        pub max_data: u64,
+    }
+    impl IntoEvent<api::StreamMaxDataTransmitted> for StreamMaxDataTransmitted {
+        #[inline]
+        fn into_event(self) -> api::StreamMaxDataTransmitted {
+            let StreamMaxDataTransmitted { max_data } = self;
+            api::StreamMaxDataTransmitted {
+                max_data: max_data.into_event(),
+            }
+        }
+    }
+    #[derive(Clone, Debug)]
     pub struct StreamControlPacketTransmitted {
         #[doc = " The total size of the packet"]
         pub packet_len: usize,
@@ -6882,6 +6926,18 @@ mod traits {
             let _ = meta;
             let _ = event;
         }
+        #[doc = "Called when the `StreamMaxDataTransmitted` event is triggered"]
+        #[inline]
+        fn on_stream_max_data_transmitted(
+            &self,
+            context: &Self::ConnectionContext,
+            meta: &api::ConnectionMeta,
+            event: &api::StreamMaxDataTransmitted,
+        ) {
+            let _ = context;
+            let _ = meta;
+            let _ = event;
+        }
         #[doc = "Called when the `StreamControlPacketTransmitted` event is triggered"]
         #[inline]
         fn on_stream_control_packet_transmitted(
@@ -7833,6 +7889,16 @@ mod traits {
                 .on_stream_max_data_received(context, meta, event);
         }
         #[inline]
+        fn on_stream_max_data_transmitted(
+            &self,
+            context: &Self::ConnectionContext,
+            meta: &api::ConnectionMeta,
+            event: &api::StreamMaxDataTransmitted,
+        ) {
+            self.as_ref()
+                .on_stream_max_data_transmitted(context, meta, event);
+        }
+        #[inline]
         fn on_stream_control_packet_transmitted(
             &self,
             context: &Self::ConnectionContext,
@@ -8735,6 +8801,16 @@ mod traits {
         ) {
             (self.0).on_stream_max_data_received(&context.0, meta, event);
             (self.1).on_stream_max_data_received(&context.1, meta, event);
+        }
+        #[inline]
+        fn on_stream_max_data_transmitted(
+            &self,
+            context: &Self::ConnectionContext,
+            meta: &api::ConnectionMeta,
+            event: &api::StreamMaxDataTransmitted,
+        ) {
+            (self.0).on_stream_max_data_transmitted(&context.0, meta, event);
+            (self.1).on_stream_max_data_transmitted(&context.1, meta, event);
         }
         #[inline]
         fn on_stream_control_packet_transmitted(
@@ -9936,6 +10012,8 @@ mod traits {
         );
         #[doc = "Publishes a `StreamMaxDataReceived` event to the publisher's subscriber"]
         fn on_stream_max_data_received(&self, event: builder::StreamMaxDataReceived);
+        #[doc = "Publishes a `StreamMaxDataTransmitted` event to the publisher's subscriber"]
+        fn on_stream_max_data_transmitted(&self, event: builder::StreamMaxDataTransmitted);
         #[doc = "Publishes a `StreamControlPacketTransmitted` event to the publisher's subscriber"]
         fn on_stream_control_packet_transmitted(
             &self,
@@ -10239,6 +10317,15 @@ mod traits {
             let event = event.into_event();
             self.subscriber
                 .on_stream_max_data_received(self.context, &self.meta, &event);
+            self.subscriber
+                .on_connection_event(self.context, &self.meta, &event);
+            self.subscriber.on_event(&self.meta, &event);
+        }
+        #[inline]
+        fn on_stream_max_data_transmitted(&self, event: builder::StreamMaxDataTransmitted) {
+            let event = event.into_event();
+            self.subscriber
+                .on_stream_max_data_transmitted(self.context, &self.meta, &event);
             self.subscriber
                 .on_connection_event(self.context, &self.meta, &event);
             self.subscriber.on_event(&self.meta, &event);
@@ -11288,6 +11375,7 @@ pub mod testing {
         pub stream_packet_abandoned: AtomicU64,
         pub stream_packet_spuriously_retransmitted: AtomicU64,
         pub stream_max_data_received: AtomicU64,
+        pub stream_max_data_transmitted: AtomicU64,
         pub stream_control_packet_transmitted: AtomicU64,
         pub stream_control_packet_received: AtomicU64,
         pub stream_receiver_errored: AtomicU64,
@@ -11416,6 +11504,7 @@ pub mod testing {
                 stream_packet_abandoned: AtomicU64::new(0),
                 stream_packet_spuriously_retransmitted: AtomicU64::new(0),
                 stream_max_data_received: AtomicU64::new(0),
+                stream_max_data_transmitted: AtomicU64::new(0),
                 stream_control_packet_transmitted: AtomicU64::new(0),
                 stream_control_packet_received: AtomicU64::new(0),
                 stream_receiver_errored: AtomicU64::new(0),
@@ -12137,6 +12226,21 @@ pub mod testing {
                 self.output.lock().unwrap().push(out);
             }
         }
+        fn on_stream_max_data_transmitted(
+            &self,
+            _context: &Self::ConnectionContext,
+            meta: &api::ConnectionMeta,
+            event: &api::StreamMaxDataTransmitted,
+        ) {
+            self.stream_max_data_transmitted
+                .fetch_add(1, Ordering::Relaxed);
+            if self.location.is_some() {
+                let meta = crate::event::snapshot::Fmt::to_snapshot(meta);
+                let event = crate::event::snapshot::Fmt::to_snapshot(event);
+                let out = format!("{meta:?} {event:?}");
+                self.output.lock().unwrap().push(out);
+            }
+        }
         fn on_stream_control_packet_transmitted(
             &self,
             _context: &Self::ConnectionContext,
@@ -12750,6 +12854,7 @@ pub mod testing {
         pub stream_packet_abandoned: AtomicU64,
         pub stream_packet_spuriously_retransmitted: AtomicU64,
         pub stream_max_data_received: AtomicU64,
+        pub stream_max_data_transmitted: AtomicU64,
         pub stream_control_packet_transmitted: AtomicU64,
         pub stream_control_packet_received: AtomicU64,
         pub stream_receiver_errored: AtomicU64,
@@ -12868,6 +12973,7 @@ pub mod testing {
                 stream_packet_abandoned: AtomicU64::new(0),
                 stream_packet_spuriously_retransmitted: AtomicU64::new(0),
                 stream_max_data_received: AtomicU64::new(0),
+                stream_max_data_transmitted: AtomicU64::new(0),
                 stream_control_packet_transmitted: AtomicU64::new(0),
                 stream_control_packet_received: AtomicU64::new(0),
                 stream_receiver_errored: AtomicU64::new(0),
@@ -13731,6 +13837,16 @@ pub mod testing {
         }
         fn on_stream_max_data_received(&self, event: builder::StreamMaxDataReceived) {
             self.stream_max_data_received
+                .fetch_add(1, Ordering::Relaxed);
+            let event = event.into_event();
+            if self.location.is_some() {
+                let event = crate::event::snapshot::Fmt::to_snapshot(&event);
+                let out = format!("{event:?}");
+                self.output.lock().unwrap().push(out);
+            }
+        }
+        fn on_stream_max_data_transmitted(&self, event: builder::StreamMaxDataTransmitted) {
+            self.stream_max_data_transmitted
                 .fetch_add(1, Ordering::Relaxed);
             let event = event.into_event();
             if self.location.is_some() {

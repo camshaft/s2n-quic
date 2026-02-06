@@ -860,6 +860,12 @@ impl State {
                     return 0;
                 }
 
+                publisher.on_stream_max_data_transmitted(
+                    event::builder::StreamMaxDataTransmitted {
+                        max_data: self.max_data.as_u64(),
+                    },
+                );
+
                 publisher.on_stream_control_packet_transmitted(
                     event::builder::StreamControlPacketTransmitted {
                         packet_len,

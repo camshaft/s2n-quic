@@ -529,6 +529,13 @@ pub struct StreamMaxDataReceived {
     new_max_data: u64,
 }
 
+/// Indicates that the stream sent a MAX_DATA frame to grant flow control credits
+#[event("stream:max_data_transmitted")]
+pub struct StreamMaxDataTransmitted {
+    /// The maximum data value being transmitted
+    max_data: u64,
+}
+
 #[event("stream:control_packet_transmitted")]
 pub struct StreamControlPacketTransmitted {
     /// The total size of the packet

@@ -129,21 +129,26 @@ fn flow_control_blocked_sender_idle_timeout() {
             let max_data_received = client_subscriber
                 .stream_max_data_received
                 .load(Ordering::Relaxed);
+            let max_data_transmitted = client_subscriber
+                .stream_max_data_transmitted
+                .load(Ordering::Relaxed);
             
             tracing::info!(
                 control_packets_received,
                 max_data_received,
+                max_data_transmitted,
                 "Client stats after 10 minute wait"
             );
             
             // We should be seeing MAX_DATA frames every 15s (half idle timeout)
             // In 10 minutes (600s), that's 600/15 = 40 frames
+            // The receiver (client) transmits MAX_DATA frames, so check max_data_transmitted
             let expected_min_frames = 35; // Allow some margin
             assert!(
-                max_data_received >= expected_min_frames,
-                "Expected at least {} MAX_DATA frames (one every 15s), got {}. This is a BUG!",
+                max_data_transmitted >= expected_min_frames,
+                "Expected at least {} MAX_DATA frames transmitted (one every 15s), got {}. This is a BUG!",
                 expected_min_frames,
-                max_data_received
+                max_data_transmitted
             );
 
             // Read the entire stream and validate correctness
