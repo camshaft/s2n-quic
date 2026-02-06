@@ -722,14 +722,14 @@ impl State {
         // Try up to two times to extend the idle timer based on peer activity.
         // This pattern matches the send side's implementation and gives the peer
         // two chances before timing out.
-        for i in 0..2 {
+        for attempt in 0..2 {
             // check if the idle timer has expired
             if let Some(expiration) = self.idle_timer.next_expiration() {
                 if !expiration.has_elapsed(now) {
                     return Poll::Pending;
                 }
                 self.idle_timer.cancel();
-                if i > 0 {
+                if attempt > 0 {
                     // On the second iteration, if the timer is still expired, give up
                     break;
                 }

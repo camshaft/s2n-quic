@@ -104,8 +104,8 @@ fn sender_active_receiver_blocked() {
             // Send data continuously for longer than the idle timeout
             // This should not timeout because the receiver will send ACKs
             let mut total_sent = 0;
-            for i in 0..60 {
-                let data = vec![i as u8; 1024];
+            for iteration in 0..60 {
+                let data = vec![iteration as u8; 1024];
                 stream.write_all(&data).await.unwrap();
                 total_sent += data.len();
                 1.s().sleep().await;
