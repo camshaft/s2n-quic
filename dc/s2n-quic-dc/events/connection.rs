@@ -529,6 +529,26 @@ pub struct StreamMaxDataReceived {
     new_max_data: u64,
 }
 
+/// Indicates that the stream transmitted a packet with a DATA_BLOCKED frame
+#[event("stream:data_blocked_transmitted")]
+pub struct StreamDataBlockedTransmitted {
+    /// The packet number of the probe packet
+    packet_number: u64,
+
+    /// The offset in the stream where the sender is blocked
+    stream_offset: u64,
+}
+
+/// Indicates that the stream received a packet with a DATA_BLOCKED frame
+#[event("stream:data_blocked_received")]
+pub struct StreamDataBlockedReceived {
+    /// The packet number of the probe packet
+    packet_number: u64,
+
+    /// The offset in the stream where the sender is blocked
+    stream_offset: u64,
+}
+
 #[event("stream:control_packet_transmitted")]
 pub struct StreamControlPacketTransmitted {
     /// The total size of the packet

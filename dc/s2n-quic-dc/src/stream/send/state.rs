@@ -440,7 +440,7 @@ impl State {
             }
         }
 
-        self.on_peer_activity(made_progress);
+        self.on_peer_activity(made_progress || self.max_data.is_blocked());
 
         Ok(None)
     }
@@ -946,8 +946,14 @@ impl State {
         );
 
         // update the max offset that we've transmitted
-        self.max_data
-            .on_transmit(info.end_offset(), clock, self.idle_timeout / 2);
+        if self.max_data.on_transmit(
+            info.end_offset(),
+            clock,
+            self.idle_timeout,
+            self.max_datagram_size,
+        ) {
+            self.pto.force_transmit();
+        }
         self.counters.on_transmit(&info);
 
         if let stream::PacketSpace::Recovery = packet_space {
@@ -1083,6 +1089,7 @@ impl State {
             source_queue_id,
             packets,
             clock,
+            publisher,
         )?;
 
         Ok(())
@@ -1213,7 +1220,7 @@ impl State {
     }
 
     #[inline]
-    pub fn try_transmit_probe<C, M, Clk>(
+    pub fn try_transmit_probe<C, M, Clk, Pub>(
         &mut self,
         control_key: &C,
         credentials: &Credentials,
@@ -1221,11 +1228,13 @@ impl State {
         source_queue_id: Option<VarInt>,
         packets: &mut M,
         clock: &Clk,
+        publisher: &Pub,
     ) -> Result<(), Error>
     where
         C: crypto::seal::control::Stream,
         Clk: Clock,
         M: Message,
+        Pub: event::ConnectionPublisher,
     {
         while self.requires_transmission() {
             // probes are not congestion-controlled
@@ -1252,15 +1261,27 @@ impl State {
                     final_offset,
                 };
 
-                let mut control_data_len = VarInt::ZERO;
-                let control_data = if let Some(frame) = self.reset.try_transmit() {
-                    flags = flags.with_included_reset(true);
-                    control_data_len = VarInt::try_from(frame.encoding_size()).unwrap();
+                // Include DATA_BLOCKED frame when blocked on flow control
+                let data_blocked = self.max_data.try_transmit_data_blocked();
+                let reset_frame = self.reset.try_transmit();
 
-                    Some(frame)
-                } else {
-                    None
-                };
+                let mut control_data_len = VarInt::ZERO;
+                if let Some(ref frame) = data_blocked {
+                    control_data_len += VarInt::try_from(frame.encoding_size()).unwrap();
+                    publisher.on_stream_data_blocked_transmitted(
+                        event::builder::StreamDataBlockedTransmitted {
+                            stream_offset: offset.as_u64(),
+                            packet_number: packet_number.as_u64(),
+                        },
+                    );
+                }
+
+                if let Some(ref frame) = reset_frame {
+                    flags = flags.with_included_reset(true);
+                    control_data_len += VarInt::try_from(frame.encoding_size()).unwrap();
+                }
+
+                let control_data = (data_blocked, reset_frame);
 
                 let encoder = EncoderBuffer::new(&mut buffer);
                 let packet_len = encoder::probe(

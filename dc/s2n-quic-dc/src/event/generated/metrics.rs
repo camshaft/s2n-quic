@@ -54,6 +54,8 @@ pub struct Context<R: Recorder> {
     stream_packet_abandoned: AtomicU64,
     stream_packet_spuriously_retransmitted: AtomicU64,
     stream_max_data_received: AtomicU64,
+    stream_data_blocked_transmitted: AtomicU64,
+    stream_data_blocked_received: AtomicU64,
     stream_control_packet_transmitted: AtomicU64,
     stream_control_packet_received: AtomicU64,
     stream_receiver_errored: AtomicU64,
@@ -108,6 +110,8 @@ where
             stream_packet_abandoned: AtomicU64::new(0),
             stream_packet_spuriously_retransmitted: AtomicU64::new(0),
             stream_max_data_received: AtomicU64::new(0),
+            stream_data_blocked_transmitted: AtomicU64::new(0),
+            stream_data_blocked_received: AtomicU64::new(0),
             stream_control_packet_transmitted: AtomicU64::new(0),
             stream_control_packet_received: AtomicU64::new(0),
             stream_receiver_errored: AtomicU64::new(0),
@@ -462,6 +466,32 @@ where
             .on_stream_max_data_received(&context.recorder, meta, event);
     }
     #[inline]
+    fn on_stream_data_blocked_transmitted(
+        &self,
+        context: &Self::ConnectionContext,
+        meta: &api::ConnectionMeta,
+        event: &api::StreamDataBlockedTransmitted,
+    ) {
+        context
+            .stream_data_blocked_transmitted
+            .fetch_add(1, Ordering::Relaxed);
+        self.subscriber
+            .on_stream_data_blocked_transmitted(&context.recorder, meta, event);
+    }
+    #[inline]
+    fn on_stream_data_blocked_received(
+        &self,
+        context: &Self::ConnectionContext,
+        meta: &api::ConnectionMeta,
+        event: &api::StreamDataBlockedReceived,
+    ) {
+        context
+            .stream_data_blocked_received
+            .fetch_add(1, Ordering::Relaxed);
+        self.subscriber
+            .on_stream_data_blocked_received(&context.recorder, meta, event);
+    }
+    #[inline]
     fn on_stream_control_packet_transmitted(
         &self,
         context: &Self::ConnectionContext,
@@ -639,6 +669,14 @@ impl<R: Recorder> Drop for Context<R> {
         self.recorder.increment_counter(
             "stream_max_data_received",
             self.stream_max_data_received.load(Ordering::Relaxed) as _,
+        );
+        self.recorder.increment_counter(
+            "stream_data_blocked_transmitted",
+            self.stream_data_blocked_transmitted.load(Ordering::Relaxed) as _,
+        );
+        self.recorder.increment_counter(
+            "stream_data_blocked_received",
+            self.stream_data_blocked_received.load(Ordering::Relaxed) as _,
         );
         self.recorder.increment_counter(
             "stream_control_packet_transmitted",

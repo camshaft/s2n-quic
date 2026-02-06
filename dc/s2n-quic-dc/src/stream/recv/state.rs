@@ -506,7 +506,9 @@ impl State {
             Err(error::Kind::Duplicate.err())
         );
 
-        space.on_packet_received(packet.packet_number(), clock.get_time());
+        let packet_number = packet.packet_number();
+
+        space.on_packet_received(packet_number, clock.get_time());
 
         // if we got a new packet then we'll need to transmit an ACK
         // TODO make this smarter to avoid sending too many ACKs
@@ -537,6 +539,14 @@ impl State {
                     .err();
                     self.on_error(error, Location::Remote, publisher);
                     return Err(error);
+                }
+                frame::Frame::DataBlocked(data_blocked) => {
+                    publisher.on_stream_data_blocked_received(
+                        event::builder::StreamDataBlockedReceived {
+                            packet_number: packet_number.as_u64(),
+                            stream_offset: data_blocked.data_limit.as_u64(),
+                        },
+                    );
                 }
                 _ => {
                     // ignore other frames for now

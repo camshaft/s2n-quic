@@ -1403,6 +1403,48 @@ pub mod api {
     }
     #[derive(Clone, Debug)]
     #[non_exhaustive]
+    #[doc = " Indicates that the stream transmitted a packet with a DATA_BLOCKED frame"]
+    pub struct StreamDataBlockedTransmitted {
+        #[doc = " The packet number of the probe packet"]
+        pub packet_number: u64,
+        #[doc = " The offset in the stream where the sender is blocked"]
+        pub stream_offset: u64,
+    }
+    #[cfg(any(test, feature = "testing"))]
+    impl crate::event::snapshot::Fmt for StreamDataBlockedTransmitted {
+        fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
+            let mut fmt = fmt.debug_struct("StreamDataBlockedTransmitted");
+            fmt.field("packet_number", &self.packet_number);
+            fmt.field("stream_offset", &self.stream_offset);
+            fmt.finish()
+        }
+    }
+    impl Event for StreamDataBlockedTransmitted {
+        const NAME: &'static str = "stream:data_blocked_transmitted";
+    }
+    #[derive(Clone, Debug)]
+    #[non_exhaustive]
+    #[doc = " Indicates that the stream received a packet with a DATA_BLOCKED frame"]
+    pub struct StreamDataBlockedReceived {
+        #[doc = " The packet number of the probe packet"]
+        pub packet_number: u64,
+        #[doc = " The offset in the stream where the sender is blocked"]
+        pub stream_offset: u64,
+    }
+    #[cfg(any(test, feature = "testing"))]
+    impl crate::event::snapshot::Fmt for StreamDataBlockedReceived {
+        fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
+            let mut fmt = fmt.debug_struct("StreamDataBlockedReceived");
+            fmt.field("packet_number", &self.packet_number);
+            fmt.field("stream_offset", &self.stream_offset);
+            fmt.finish()
+        }
+    }
+    impl Event for StreamDataBlockedReceived {
+        const NAME: &'static str = "stream:data_blocked_received";
+    }
+    #[derive(Clone, Debug)]
+    #[non_exhaustive]
     pub struct StreamControlPacketTransmitted {
         #[doc = " The total size of the packet"]
         pub packet_len: usize,
@@ -3239,6 +3281,34 @@ pub mod tracing {
                 new_max_data,
             } = event;
             tracing :: event ! (target : "stream_max_data_received" , parent : id , tracing :: Level :: DEBUG , { increase = tracing :: field :: debug (increase) , new_max_data = tracing :: field :: debug (new_max_data) });
+        }
+        #[inline]
+        fn on_stream_data_blocked_transmitted(
+            &self,
+            context: &Self::ConnectionContext,
+            _meta: &api::ConnectionMeta,
+            event: &api::StreamDataBlockedTransmitted,
+        ) {
+            let id = context.id();
+            let api::StreamDataBlockedTransmitted {
+                packet_number,
+                stream_offset,
+            } = event;
+            tracing :: event ! (target : "stream_data_blocked_transmitted" , parent : id , tracing :: Level :: DEBUG , { packet_number = tracing :: field :: debug (packet_number) , stream_offset = tracing :: field :: debug (stream_offset) });
+        }
+        #[inline]
+        fn on_stream_data_blocked_received(
+            &self,
+            context: &Self::ConnectionContext,
+            _meta: &api::ConnectionMeta,
+            event: &api::StreamDataBlockedReceived,
+        ) {
+            let id = context.id();
+            let api::StreamDataBlockedReceived {
+                packet_number,
+                stream_offset,
+            } = event;
+            tracing :: event ! (target : "stream_data_blocked_received" , parent : id , tracing :: Level :: DEBUG , { packet_number = tracing :: field :: debug (packet_number) , stream_offset = tracing :: field :: debug (stream_offset) });
         }
         #[inline]
         fn on_stream_control_packet_transmitted(
@@ -5212,6 +5282,48 @@ pub mod builder {
         }
     }
     #[derive(Clone, Debug)]
+    #[doc = " Indicates that the stream transmitted a packet with a DATA_BLOCKED frame"]
+    pub struct StreamDataBlockedTransmitted {
+        #[doc = " The packet number of the probe packet"]
+        pub packet_number: u64,
+        #[doc = " The offset in the stream where the sender is blocked"]
+        pub stream_offset: u64,
+    }
+    impl IntoEvent<api::StreamDataBlockedTransmitted> for StreamDataBlockedTransmitted {
+        #[inline]
+        fn into_event(self) -> api::StreamDataBlockedTransmitted {
+            let StreamDataBlockedTransmitted {
+                packet_number,
+                stream_offset,
+            } = self;
+            api::StreamDataBlockedTransmitted {
+                packet_number: packet_number.into_event(),
+                stream_offset: stream_offset.into_event(),
+            }
+        }
+    }
+    #[derive(Clone, Debug)]
+    #[doc = " Indicates that the stream received a packet with a DATA_BLOCKED frame"]
+    pub struct StreamDataBlockedReceived {
+        #[doc = " The packet number of the probe packet"]
+        pub packet_number: u64,
+        #[doc = " The offset in the stream where the sender is blocked"]
+        pub stream_offset: u64,
+    }
+    impl IntoEvent<api::StreamDataBlockedReceived> for StreamDataBlockedReceived {
+        #[inline]
+        fn into_event(self) -> api::StreamDataBlockedReceived {
+            let StreamDataBlockedReceived {
+                packet_number,
+                stream_offset,
+            } = self;
+            api::StreamDataBlockedReceived {
+                packet_number: packet_number.into_event(),
+                stream_offset: stream_offset.into_event(),
+            }
+        }
+    }
+    #[derive(Clone, Debug)]
     pub struct StreamControlPacketTransmitted {
         #[doc = " The total size of the packet"]
         pub packet_len: usize,
@@ -6882,6 +6994,30 @@ mod traits {
             let _ = meta;
             let _ = event;
         }
+        #[doc = "Called when the `StreamDataBlockedTransmitted` event is triggered"]
+        #[inline]
+        fn on_stream_data_blocked_transmitted(
+            &self,
+            context: &Self::ConnectionContext,
+            meta: &api::ConnectionMeta,
+            event: &api::StreamDataBlockedTransmitted,
+        ) {
+            let _ = context;
+            let _ = meta;
+            let _ = event;
+        }
+        #[doc = "Called when the `StreamDataBlockedReceived` event is triggered"]
+        #[inline]
+        fn on_stream_data_blocked_received(
+            &self,
+            context: &Self::ConnectionContext,
+            meta: &api::ConnectionMeta,
+            event: &api::StreamDataBlockedReceived,
+        ) {
+            let _ = context;
+            let _ = meta;
+            let _ = event;
+        }
         #[doc = "Called when the `StreamControlPacketTransmitted` event is triggered"]
         #[inline]
         fn on_stream_control_packet_transmitted(
@@ -7833,6 +7969,26 @@ mod traits {
                 .on_stream_max_data_received(context, meta, event);
         }
         #[inline]
+        fn on_stream_data_blocked_transmitted(
+            &self,
+            context: &Self::ConnectionContext,
+            meta: &api::ConnectionMeta,
+            event: &api::StreamDataBlockedTransmitted,
+        ) {
+            self.as_ref()
+                .on_stream_data_blocked_transmitted(context, meta, event);
+        }
+        #[inline]
+        fn on_stream_data_blocked_received(
+            &self,
+            context: &Self::ConnectionContext,
+            meta: &api::ConnectionMeta,
+            event: &api::StreamDataBlockedReceived,
+        ) {
+            self.as_ref()
+                .on_stream_data_blocked_received(context, meta, event);
+        }
+        #[inline]
         fn on_stream_control_packet_transmitted(
             &self,
             context: &Self::ConnectionContext,
@@ -8735,6 +8891,26 @@ mod traits {
         ) {
             (self.0).on_stream_max_data_received(&context.0, meta, event);
             (self.1).on_stream_max_data_received(&context.1, meta, event);
+        }
+        #[inline]
+        fn on_stream_data_blocked_transmitted(
+            &self,
+            context: &Self::ConnectionContext,
+            meta: &api::ConnectionMeta,
+            event: &api::StreamDataBlockedTransmitted,
+        ) {
+            (self.0).on_stream_data_blocked_transmitted(&context.0, meta, event);
+            (self.1).on_stream_data_blocked_transmitted(&context.1, meta, event);
+        }
+        #[inline]
+        fn on_stream_data_blocked_received(
+            &self,
+            context: &Self::ConnectionContext,
+            meta: &api::ConnectionMeta,
+            event: &api::StreamDataBlockedReceived,
+        ) {
+            (self.0).on_stream_data_blocked_received(&context.0, meta, event);
+            (self.1).on_stream_data_blocked_received(&context.1, meta, event);
         }
         #[inline]
         fn on_stream_control_packet_transmitted(
@@ -9936,6 +10112,10 @@ mod traits {
         );
         #[doc = "Publishes a `StreamMaxDataReceived` event to the publisher's subscriber"]
         fn on_stream_max_data_received(&self, event: builder::StreamMaxDataReceived);
+        #[doc = "Publishes a `StreamDataBlockedTransmitted` event to the publisher's subscriber"]
+        fn on_stream_data_blocked_transmitted(&self, event: builder::StreamDataBlockedTransmitted);
+        #[doc = "Publishes a `StreamDataBlockedReceived` event to the publisher's subscriber"]
+        fn on_stream_data_blocked_received(&self, event: builder::StreamDataBlockedReceived);
         #[doc = "Publishes a `StreamControlPacketTransmitted` event to the publisher's subscriber"]
         fn on_stream_control_packet_transmitted(
             &self,
@@ -10239,6 +10419,24 @@ mod traits {
             let event = event.into_event();
             self.subscriber
                 .on_stream_max_data_received(self.context, &self.meta, &event);
+            self.subscriber
+                .on_connection_event(self.context, &self.meta, &event);
+            self.subscriber.on_event(&self.meta, &event);
+        }
+        #[inline]
+        fn on_stream_data_blocked_transmitted(&self, event: builder::StreamDataBlockedTransmitted) {
+            let event = event.into_event();
+            self.subscriber
+                .on_stream_data_blocked_transmitted(self.context, &self.meta, &event);
+            self.subscriber
+                .on_connection_event(self.context, &self.meta, &event);
+            self.subscriber.on_event(&self.meta, &event);
+        }
+        #[inline]
+        fn on_stream_data_blocked_received(&self, event: builder::StreamDataBlockedReceived) {
+            let event = event.into_event();
+            self.subscriber
+                .on_stream_data_blocked_received(self.context, &self.meta, &event);
             self.subscriber
                 .on_connection_event(self.context, &self.meta, &event);
             self.subscriber.on_event(&self.meta, &event);
@@ -11288,6 +11486,8 @@ pub mod testing {
         pub stream_packet_abandoned: AtomicU64,
         pub stream_packet_spuriously_retransmitted: AtomicU64,
         pub stream_max_data_received: AtomicU64,
+        pub stream_data_blocked_transmitted: AtomicU64,
+        pub stream_data_blocked_received: AtomicU64,
         pub stream_control_packet_transmitted: AtomicU64,
         pub stream_control_packet_received: AtomicU64,
         pub stream_receiver_errored: AtomicU64,
@@ -11416,6 +11616,8 @@ pub mod testing {
                 stream_packet_abandoned: AtomicU64::new(0),
                 stream_packet_spuriously_retransmitted: AtomicU64::new(0),
                 stream_max_data_received: AtomicU64::new(0),
+                stream_data_blocked_transmitted: AtomicU64::new(0),
+                stream_data_blocked_received: AtomicU64::new(0),
                 stream_control_packet_transmitted: AtomicU64::new(0),
                 stream_control_packet_received: AtomicU64::new(0),
                 stream_receiver_errored: AtomicU64::new(0),
@@ -12137,6 +12339,36 @@ pub mod testing {
                 self.output.lock().unwrap().push(out);
             }
         }
+        fn on_stream_data_blocked_transmitted(
+            &self,
+            _context: &Self::ConnectionContext,
+            meta: &api::ConnectionMeta,
+            event: &api::StreamDataBlockedTransmitted,
+        ) {
+            self.stream_data_blocked_transmitted
+                .fetch_add(1, Ordering::Relaxed);
+            if self.location.is_some() {
+                let meta = crate::event::snapshot::Fmt::to_snapshot(meta);
+                let event = crate::event::snapshot::Fmt::to_snapshot(event);
+                let out = format!("{meta:?} {event:?}");
+                self.output.lock().unwrap().push(out);
+            }
+        }
+        fn on_stream_data_blocked_received(
+            &self,
+            _context: &Self::ConnectionContext,
+            meta: &api::ConnectionMeta,
+            event: &api::StreamDataBlockedReceived,
+        ) {
+            self.stream_data_blocked_received
+                .fetch_add(1, Ordering::Relaxed);
+            if self.location.is_some() {
+                let meta = crate::event::snapshot::Fmt::to_snapshot(meta);
+                let event = crate::event::snapshot::Fmt::to_snapshot(event);
+                let out = format!("{meta:?} {event:?}");
+                self.output.lock().unwrap().push(out);
+            }
+        }
         fn on_stream_control_packet_transmitted(
             &self,
             _context: &Self::ConnectionContext,
@@ -12750,6 +12982,8 @@ pub mod testing {
         pub stream_packet_abandoned: AtomicU64,
         pub stream_packet_spuriously_retransmitted: AtomicU64,
         pub stream_max_data_received: AtomicU64,
+        pub stream_data_blocked_transmitted: AtomicU64,
+        pub stream_data_blocked_received: AtomicU64,
         pub stream_control_packet_transmitted: AtomicU64,
         pub stream_control_packet_received: AtomicU64,
         pub stream_receiver_errored: AtomicU64,
@@ -12868,6 +13102,8 @@ pub mod testing {
                 stream_packet_abandoned: AtomicU64::new(0),
                 stream_packet_spuriously_retransmitted: AtomicU64::new(0),
                 stream_max_data_received: AtomicU64::new(0),
+                stream_data_blocked_transmitted: AtomicU64::new(0),
+                stream_data_blocked_received: AtomicU64::new(0),
                 stream_control_packet_transmitted: AtomicU64::new(0),
                 stream_control_packet_received: AtomicU64::new(0),
                 stream_receiver_errored: AtomicU64::new(0),
@@ -13731,6 +13967,26 @@ pub mod testing {
         }
         fn on_stream_max_data_received(&self, event: builder::StreamMaxDataReceived) {
             self.stream_max_data_received
+                .fetch_add(1, Ordering::Relaxed);
+            let event = event.into_event();
+            if self.location.is_some() {
+                let event = crate::event::snapshot::Fmt::to_snapshot(&event);
+                let out = format!("{event:?}");
+                self.output.lock().unwrap().push(out);
+            }
+        }
+        fn on_stream_data_blocked_transmitted(&self, event: builder::StreamDataBlockedTransmitted) {
+            self.stream_data_blocked_transmitted
+                .fetch_add(1, Ordering::Relaxed);
+            let event = event.into_event();
+            if self.location.is_some() {
+                let event = crate::event::snapshot::Fmt::to_snapshot(&event);
+                let out = format!("{event:?}");
+                self.output.lock().unwrap().push(out);
+            }
+        }
+        fn on_stream_data_blocked_received(&self, event: builder::StreamDataBlockedReceived) {
+            self.stream_data_blocked_received
                 .fetch_add(1, Ordering::Relaxed);
             let event = event.into_event();
             if self.location.is_some() {

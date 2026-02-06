@@ -31,8 +31,6 @@ pub struct MaxData {
     peer_value: VarInt,
     timer: Timer,
     state: State,
-    /// Indicates if the peer has updated our window since the stream started
-    has_received_update: bool,
 }
 
 impl MaxData {
@@ -42,8 +40,11 @@ impl MaxData {
             peer_value: initial_max_data,
             timer: Timer::default(),
             state: State::default(),
-            has_received_update: false,
         }
+    }
+
+    pub fn is_blocked(&self) -> bool {
+        self.state.is_blocked()
     }
 
     pub fn on_transmit(
@@ -51,13 +52,18 @@ impl MaxData {
         offset: VarInt,
         clock: &impl Clock,
         idle_timeout: Duration,
+        max_datagram_size: u16,
     ) -> bool {
         self.local_value = self.local_value.max(offset);
-        ensure!(self.peer_value == self.local_value, false);
+        ensure!(
+            self.peer_value - self.local_value < VarInt::from_u16(max_datagram_size),
+            false
+        );
         ensure!(self.state.on_blocked().is_ok(), false);
-        debug!("flow blocked");
-        self.timer.set(clock.get_time() + idle_timeout / 2);
-        !self.has_received_update
+        let target = clock.get_time() + idle_timeout / 2;
+        tracing::debug!(offset = ?self.local_value, %target, "data_blocked");
+        self.timer.set(target);
+        true
     }
 
     pub fn max_sent_offset(&self) -> VarInt {
@@ -66,10 +72,6 @@ impl MaxData {
 
     pub fn max_data(&self) -> VarInt {
         self.peer_value
-    }
-
-    pub fn on_control_packet(&mut self) {
-        self.has_received_update = true;
     }
 
     pub fn on_max_data_frame(&mut self, max_data: VarInt) -> Option<VarInt> {
@@ -86,12 +88,28 @@ impl MaxData {
         self.timer.cancel();
     }
 
+    pub fn try_transmit_data_blocked(&self) -> Option<s2n_quic_core::frame::DataBlocked> {
+        if self.state.is_blocked() {
+            Some(s2n_quic_core::frame::DataBlocked {
+                data_limit: self.peer_value,
+            })
+        } else {
+            None
+        }
+    }
+
     pub fn on_timeout(&mut self, clock: &impl Clock, idle_timeout: Duration) -> Poll<()> {
         let now = clock.get_time();
 
+        if self.state.is_unblocked() {
+            self.timer.cancel();
+            return Poll::Pending;
+        }
+
         // make sure we've armed the timer if we're blocked
-        if self.state.is_blocked() && !self.timer.is_armed() {
+        if !self.timer.is_armed() {
             self.timer.set(now + idle_timeout / 2);
+            return Poll::Ready(());
         }
 
         ready!(self.timer.poll_expiration(now));
@@ -112,6 +130,8 @@ mod tests {
     use core::time::Duration;
     use s2n_quic_core::time::{clock::testing as test_clock, timer::Provider};
     use std::task::Poll;
+
+    const MAX_DATAGRAM_SIZE: u16 = 1500;
 
     #[test]
     fn new_initializes_correctly() {
@@ -142,7 +162,12 @@ mod tests {
         let clock = test_clock::Clock::default();
         let idle_timeout = Duration::from_secs(30);
 
-        max_data.on_transmit(VarInt::from_u32(100), &clock, idle_timeout);
+        max_data.on_transmit(
+            VarInt::from_u32(100),
+            &clock,
+            idle_timeout,
+            MAX_DATAGRAM_SIZE,
+        );
         assert_eq!(max_data.max_sent_offset(), VarInt::from_u32(100));
     }
 
@@ -152,8 +177,18 @@ mod tests {
         let clock = test_clock::Clock::default();
         let idle_timeout = Duration::from_secs(30);
 
-        max_data.on_transmit(VarInt::from_u32(100), &clock, idle_timeout);
-        max_data.on_transmit(VarInt::from_u32(50), &clock, idle_timeout);
+        max_data.on_transmit(
+            VarInt::from_u32(100),
+            &clock,
+            idle_timeout,
+            MAX_DATAGRAM_SIZE,
+        );
+        max_data.on_transmit(
+            VarInt::from_u32(50),
+            &clock,
+            idle_timeout,
+            MAX_DATAGRAM_SIZE,
+        );
 
         assert_eq!(max_data.max_sent_offset(), VarInt::from_u32(100));
     }
@@ -165,19 +200,24 @@ mod tests {
         let clock = test_clock::Clock::default();
         let idle_timeout = Duration::from_secs(30);
 
-        max_data.on_transmit(peer_value, &clock, idle_timeout);
+        max_data.on_transmit(peer_value, &clock, idle_timeout, MAX_DATAGRAM_SIZE);
 
         assert!(max_data.state.is_blocked());
     }
 
     #[test]
     fn on_transmit_does_not_block_below_peer_value() {
-        let peer_value = VarInt::from_u32(1000);
+        let peer_value = VarInt::from_u16(MAX_DATAGRAM_SIZE * 2);
         let mut max_data = MaxData::new(peer_value);
         let clock = test_clock::Clock::default();
         let idle_timeout = Duration::from_secs(30);
 
-        max_data.on_transmit(VarInt::from_u32(500), &clock, idle_timeout);
+        max_data.on_transmit(
+            VarInt::from_u32(500),
+            &clock,
+            idle_timeout,
+            MAX_DATAGRAM_SIZE,
+        );
 
         assert!(max_data.state.is_unblocked());
     }
@@ -190,7 +230,7 @@ mod tests {
         let idle_timeout = Duration::from_secs(30);
 
         clock.inc_by(Duration::from_secs(10));
-        max_data.on_transmit(peer_value, &clock, idle_timeout);
+        max_data.on_transmit(peer_value, &clock, idle_timeout, MAX_DATAGRAM_SIZE);
         assert!(max_data.is_armed());
         assert!(max_data.state.is_blocked());
 
@@ -229,7 +269,7 @@ mod tests {
         let clock = test_clock::Clock::default();
         let idle_timeout = Duration::from_secs(30);
 
-        max_data.on_transmit(peer_value, &clock, idle_timeout);
+        max_data.on_transmit(peer_value, &clock, idle_timeout, MAX_DATAGRAM_SIZE);
         assert!(max_data.state.is_blocked());
 
         max_data.on_max_data_frame(VarInt::from_u32(2000));
@@ -244,7 +284,7 @@ mod tests {
         let mut clock = test_clock::Clock::default();
         let idle_timeout = Duration::from_secs(30);
 
-        max_data.on_transmit(peer_value, &clock, idle_timeout);
+        max_data.on_transmit(peer_value, &clock, idle_timeout, MAX_DATAGRAM_SIZE);
         max_data.on_max_data_frame(VarInt::from_u32(2000));
 
         clock.inc_by(idle_timeout);
@@ -267,7 +307,7 @@ mod tests {
         let mut clock = test_clock::Clock::default();
         let idle_timeout = Duration::from_secs(30);
 
-        max_data.on_transmit(peer_value, &clock, idle_timeout);
+        max_data.on_transmit(peer_value, &clock, idle_timeout, MAX_DATAGRAM_SIZE);
         clock.inc_by(Duration::from_secs(10));
 
         assert_eq!(max_data.on_timeout(&clock, idle_timeout), Poll::Pending);
@@ -280,7 +320,7 @@ mod tests {
         let mut clock = test_clock::Clock::default();
         let idle_timeout = Duration::from_secs(30);
 
-        max_data.on_transmit(peer_value, &clock, idle_timeout);
+        max_data.on_transmit(peer_value, &clock, idle_timeout, MAX_DATAGRAM_SIZE);
         clock.inc_by(idle_timeout / 2);
 
         assert_eq!(max_data.on_timeout(&clock, idle_timeout), Poll::Ready(()));
@@ -293,7 +333,7 @@ mod tests {
         let mut clock = test_clock::Clock::default();
         let idle_timeout = Duration::from_secs(30);
 
-        max_data.on_transmit(peer_value, &clock, idle_timeout);
+        max_data.on_transmit(peer_value, &clock, idle_timeout, MAX_DATAGRAM_SIZE);
         clock.inc_by(idle_timeout / 2);
 
         assert_eq!(max_data.on_timeout(&clock, idle_timeout), Poll::Ready(()));
@@ -313,7 +353,7 @@ mod tests {
 
         assert!(max_data.state.is_unblocked());
 
-        max_data.on_transmit(peer_value, &clock, idle_timeout);
+        max_data.on_transmit(peer_value, &clock, idle_timeout, MAX_DATAGRAM_SIZE);
         assert!(max_data.state.is_blocked());
 
         max_data.on_max_data_frame(VarInt::from_u32(2000));
@@ -327,10 +367,10 @@ mod tests {
         let clock = test_clock::Clock::default();
         let idle_timeout = Duration::from_secs(30);
 
-        max_data.on_transmit(peer_value, &clock, idle_timeout);
+        max_data.on_transmit(peer_value, &clock, idle_timeout, MAX_DATAGRAM_SIZE);
         assert!(max_data.state.is_blocked());
 
-        max_data.on_transmit(peer_value, &clock, idle_timeout);
+        max_data.on_transmit(peer_value, &clock, idle_timeout, MAX_DATAGRAM_SIZE);
         assert!(max_data.state.is_blocked());
     }
 
@@ -341,7 +381,7 @@ mod tests {
         let clock = test_clock::Clock::default();
         let idle_timeout = Duration::from_secs(30);
 
-        max_data.on_transmit(peer_value, &clock, idle_timeout);
+        max_data.on_transmit(peer_value, &clock, idle_timeout, MAX_DATAGRAM_SIZE);
         max_data.on_max_data_frame(VarInt::from_u32(2000));
         assert!(max_data.state.is_unblocked());
 
@@ -355,7 +395,12 @@ mod tests {
         let mut clock = test_clock::Clock::default();
         let idle_timeout = Duration::from_secs(30);
 
-        max_data.on_transmit(VarInt::from_u32(1000), &clock, idle_timeout);
+        max_data.on_transmit(
+            VarInt::from_u32(1000),
+            &clock,
+            idle_timeout,
+            MAX_DATAGRAM_SIZE,
+        );
         assert!(max_data.state.is_blocked());
 
         clock.inc_by(Duration::from_secs(5));
@@ -363,7 +408,12 @@ mod tests {
         assert!(max_data.state.is_unblocked());
 
         clock.inc_by(Duration::from_secs(5));
-        max_data.on_transmit(VarInt::from_u32(2000), &clock, idle_timeout);
+        max_data.on_transmit(
+            VarInt::from_u32(2000),
+            &clock,
+            idle_timeout,
+            MAX_DATAGRAM_SIZE,
+        );
         assert!(max_data.state.is_blocked());
 
         clock.inc_by(Duration::from_secs(5));
@@ -373,11 +423,11 @@ mod tests {
 
     #[test]
     fn varint_zero_offset() {
-        let mut max_data = MaxData::new(VarInt::from_u32(1000));
+        let mut max_data = MaxData::new(VarInt::from_u16(MAX_DATAGRAM_SIZE * 2));
         let clock = test_clock::Clock::default();
         let idle_timeout = Duration::from_secs(30);
 
-        max_data.on_transmit(VarInt::ZERO, &clock, idle_timeout);
+        max_data.on_transmit(VarInt::ZERO, &clock, idle_timeout, MAX_DATAGRAM_SIZE);
         assert_eq!(max_data.max_sent_offset(), VarInt::ZERO);
         assert!(max_data.state.is_unblocked());
     }
@@ -398,7 +448,7 @@ mod tests {
         let mut clock = test_clock::Clock::default();
         let idle_timeout = Duration::from_secs(100);
 
-        max_data.on_transmit(peer_value, &clock, idle_timeout);
+        max_data.on_transmit(peer_value, &clock, idle_timeout, MAX_DATAGRAM_SIZE);
 
         clock.inc_by(Duration::from_secs(49));
         assert_eq!(max_data.on_timeout(&clock, idle_timeout), Poll::Pending);
