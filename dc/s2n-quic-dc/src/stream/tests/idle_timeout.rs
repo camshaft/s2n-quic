@@ -122,6 +122,13 @@ fn flow_control_blocked_sender_idle_timeout() {
             // Should see one MAX_DATA frame every 15s (half the 30s idle timeout)
             600.s().sleep().await;
 
+            // Read the entire stream and validate correctness
+            let mut received_data = Data::new(1_000_000);
+            stream.read_into(&mut received_data).await
+                .expect("Stream should not timeout when sender is blocked on flow control");
+            
+            tracing::info!("Read succeeded - stream stayed alive and data is correct!");
+
             // Check that we received control packets with MAX_DATA frames from the sender
             let control_packets_received = client_subscriber
                 .stream_control_packet_received
@@ -150,13 +157,6 @@ fn flow_control_blocked_sender_idle_timeout() {
                 expected_min_frames,
                 max_data_transmitted
             );
-
-            // Read the entire stream and validate correctness
-            let mut received_data = Data::new(1_000_000);
-            stream.read_into(&mut received_data).await
-                .expect("Stream should not timeout when sender is blocked on flow control");
-            
-            tracing::info!("Read succeeded - stream stayed alive and data is correct!");
         }
         .group("client")
         .instrument(info_span!("client"))
@@ -211,7 +211,8 @@ fn flow_control_blocked_sender_idle_timeout() {
 
 /// Test to verify MAX_DATA frames are retransmitted when lost.
 ///
-/// This test uses bach network monitor to drop control packets containing MAX_DATA frames.
+/// This test uses bach network monitor to drop packets containing MAX_DATA frames.
+/// MAX_DATA is sent by the receiver (client) to the sender (server) to grant flow control credits.
 /// If MAX_DATA frames are not reliably retransmitted, the sender will remain blocked
 /// and eventually timeout.
 #[test]
@@ -223,22 +224,35 @@ fn flow_control_max_data_packet_loss() {
     DROP_COUNT.store(0, Ordering::Relaxed);
 
     sim(|| {
-        // Drop every control packet to test MAX_DATA retransmission
+        // Drop packets from client containing MAX_DATA to test retransmission
+        // Client sends MAX_DATA to server (port 443) to grant flow control credits
         ::bach::net::monitor::on_packet_sent(move |packet| {
             use ::bach::net::monitor::Command;
             
-            // Check if this is a control packet
-            let payload = packet.transport.payload();
-            let is_control = payload.len() > 0 && {
-                // Control packets have tag 0x50-0x5F range
-                let tag = payload[0];
-                (tag & 0xF0) == 0x50
-            };
-            
-            if is_control {
-                let count = DROP_COUNT.fetch_add(1, Ordering::Relaxed);
-                tracing::info!(count, "Dropping control packet");
-                return Command::Drop;
+            // Only look at packets FROM client TO server (destination port 443)
+            if packet.destination().port() == 443 {
+                let payload = packet.transport.payload();
+                if payload.len() > 0 {
+                    let tag = payload[0];
+                    
+                    // Check for Control packets (0x50-0x5F) which contain MAX_DATA frames
+                    let is_control = (tag & 0xF0) == 0x50;
+                    
+                    // Also check for Stream packets (0x00-0x3F) with control data flag (0x08)
+                    let is_stream = (tag & 0xC0) == 0;
+                    let has_control_data = (tag & 0x08) != 0;
+                    
+                    // Drop every other packet containing MAX_DATA to simulate packet loss
+                    // while still allowing some through for progress
+                    if is_control || (is_stream && has_control_data) {
+                        let count = DROP_COUNT.fetch_add(1, Ordering::Relaxed);
+                        // Drop every other packet
+                        if count % 2 == 0 {
+                            tracing::info!(count, tag, is_control, has_control_data, "Dropping packet with MAX_DATA");
+                            return Command::Drop;
+                        }
+                    }
+                }
             }
             
             Command::Pass
@@ -259,13 +273,13 @@ fn flow_control_max_data_packet_loss() {
             // Wait 2 minutes - if MAX_DATA isn't retransmitted, stream will timeout
             120.s().sleep().await;
 
-            let max_data_received = client_subscriber
-                .stream_max_data_received
+            let max_data_transmitted = client_subscriber
+                .stream_max_data_transmitted
                 .load(StdOrdering::Relaxed);
             let dropped_packets = DROP_COUNT.load(Ordering::Relaxed);
             
             tracing::info!(
-                max_data_received,
+                max_data_transmitted,
                 dropped_packets,
                 "Stats after 2 minutes with packet loss"
             );
@@ -275,7 +289,7 @@ fn flow_control_max_data_packet_loss() {
             stream.read_into(&mut received_data).await
                 .expect("Stream should not timeout - MAX_DATA frames should be retransmitted when lost");
             
-            tracing::info!("SUCCESS: Stream stayed alive despite control packet loss!");
+            tracing::info!("SUCCESS: Stream stayed alive despite packet loss!");
         }
         .group("client")
         .instrument(info_span!("client"))
@@ -305,9 +319,9 @@ fn flow_control_max_data_packet_loss() {
         .spawn();
     });
     
-    let total_dropped = DROP_COUNT.load(Ordering::Relaxed);
-    tracing::info!(total_dropped, "Total control packets dropped");
+    let total_encountered = DROP_COUNT.load(Ordering::Relaxed);
+    tracing::info!(total_encountered, "Total packets with MAX_DATA encountered");
     
-    // We should have dropped some packets, proving retransmission worked
-    assert!(total_dropped > 0, "Test should have dropped at least one control packet");
+    // We should have encountered some packets containing MAX_DATA
+    assert!(total_encountered > 0, "Test should have seen at least one packet containing MAX_DATA");
 }
