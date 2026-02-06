@@ -26,7 +26,6 @@ use s2n_quic_core::{
     ensure,
     frame::{self, ack::EcnCounts},
     inet::ExplicitCongestionNotification,
-    ready,
     stream::state::Receiver,
     time::{
         timer::{self, Provider as _},
@@ -682,7 +681,12 @@ impl State {
         Pub: event::ConnectionPublisher,
     {
         let now = clock.get_time();
-        if self.poll_idle_timer(clock, load_last_activity).is_ready() {
+        
+        // Load the last activity once and capture it for multiple uses
+        let last_peer_activity = load_last_activity();
+        let load_activity = || last_peer_activity;
+        
+        if self.poll_idle_timer(clock, load_activity).is_ready() {
             self.silent_shutdown();
 
             // only transition to an error state if we didn't receive everything
@@ -711,20 +715,32 @@ impl State {
     fn poll_idle_timer<Clk, Ld>(&mut self, clock: &Clk, load_last_activity: Ld) -> Poll<()>
     where
         Clk: Clock + ?Sized,
-        Ld: FnOnce() -> Timestamp,
+        Ld: Fn() -> Timestamp,
     {
         let now = clock.get_time();
 
-        // check the idle timer first
-        ready!(self.idle_timer.poll_expiration(now));
+        // Try up to two times to extend the idle timer based on peer activity.
+        // This pattern matches the send side's implementation and gives the peer
+        // two chances before timing out.
+        for i in 0..2 {
+            // check if the idle timer has expired
+            if let Some(expiration) = self.idle_timer.next_expiration() {
+                if !expiration.has_elapsed(now) {
+                    return Poll::Pending;
+                }
+                self.idle_timer.cancel();
+                if i > 0 {
+                    // On the second iteration, if the timer is still expired, give up
+                    break;
+                }
+            }
 
-        // if that expired then load the last activity from the peer and update the idle timer with
-        // the value
-        let last_peer_activity = load_last_activity();
-        self.update_idle_timer(&last_peer_activity);
-
-        // check the idle timer once more before returning
-        ready!(self.idle_timer.poll_expiration(now));
+            // Timer expired. Load the last activity from the peer and extend the timer.
+            // This gives the peer credit for recent activity and keeps the stream open
+            // as long as the peer was active within idle_timeout.
+            let last_peer_activity = load_last_activity();
+            self.update_idle_timer(&last_peer_activity);
+        }
 
         Poll::Ready(())
     }
