@@ -5,6 +5,7 @@ use crate::{
     stream::testing::{Client, Server},
     testing::{ext::*, sim},
 };
+use s2n_quic_core::{buffer::reader::Storage, stream::testing::Data};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::{info_span, Instrument};
 
@@ -97,54 +98,32 @@ fn server_no_response() {
 /// This test verifies that when:
 /// 1. The server sends enough data to exceed the receiver's flow control window
 /// 2. The receiver doesn't read from the stream
-/// 3. The sender gets blocked and should send DATA_BLOCKED frames (in theory)
+/// 3. The sender gets blocked and should send DATA_BLOCKED frames
 ///
 /// The stream should NOT timeout as long as the peer is responding (sending ACKs for DATA_BLOCKED).
-///
-/// CURRENT STATUS: This test demonstrates that with UDP streams (which don't have flow control
-/// enabled by default in dc - TransportFeatures::UDP is empty), the data is sent without flow
-/// control enforcement. The test passes because:
-/// - No flow control is applied to UDP streams
-/// - The write completes successfully even with 100KB of data
-/// - The stream stays alive past the idle timeout
-///
-/// To actually reproduce the flow control idle timeout issue, we would need:
-/// 1. Flow control to be enabled for UDP streams, OR
-/// 2. Test with TCP (but bach simulator doesn't support TCP), OR  
-/// 3. A different test harness that supports flow-controlled streams
-///
-/// This test serves as documentation of the current behavior and can be used as a starting
-/// point once flow control is implemented for dc UDP streams.
 #[test]
 fn flow_control_blocked_sender_idle_timeout() {
     sim(|| {
         async move {
             let client = Client::builder().build();
             
-            // Connect to UDP server (note: UDP streams don't have flow control by default)
             let mut stream = client.connect_sim("server:443").await.unwrap();
 
-            // Important: Don't read from the stream at all
-            // If flow control were enabled, this would force the server to hit flow control limits
-            tracing::info!("Client connected, waiting without reading to test flow control block...");
+            // Send a small request to simulate a request+response pattern
+            stream.write_all(b"request").await.unwrap();
+            stream.shutdown().await.unwrap();
+            
+            tracing::info!("Client sent request, now waiting without reading to test flow control block...");
             
             // Wait longer than the default idle timeout (30s) to see if stream times out
             60.s().sleep().await;
 
             // Try to read - if the stream timed out, this should error
             let mut buf = vec![0u8; 100];
-            match stream.read(&mut buf).await {
-                Ok(n) => {
-                    tracing::info!("Read succeeded with {} bytes - stream stayed alive!", n);
-                    // Currently passes because no flow control is enforced on UDP streams
-                }
-                Err(e) => {
-                    tracing::error!("Read failed with error: {:?} - stream timed out!", e);
-                    // Once flow control is implemented, if this error occurs, it indicates
-                    // the bug: stream timing out even though DATA_BLOCKED frames should keep it alive
-                    panic!("Stream timed out due to idle timeout: {:?}", e);
-                }
-            }
+            stream.read(&mut buf).await
+                .expect("Stream should not timeout when sender is blocked on flow control");
+            
+            tracing::info!("Read succeeded - stream stayed alive!");
         }
         .group("client")
         .instrument(info_span!("client"))
@@ -152,29 +131,26 @@ fn flow_control_blocked_sender_idle_timeout() {
         .spawn();
 
         async move {
-            // Use UDP (TCP not supported in bach simulator)
             let server = Server::udp().port(443).build();
 
             while let Ok((mut stream, peer_addr)) = server.accept().await {
                 async move {
-                    tracing::info!("Server accepted connection");
+                    // Read the request first
+                    let mut request = vec![];
+                    stream.read_to_end(&mut request).await.unwrap();
+                    tracing::info!("Server received request, now sending large response");
 
-                    // Send a large amount of data all at once to exceed flow control window
-                    // The default TEST_APPLICATION_PARAMS has remote_max_data of ~14KB
-                    // We send 100KB to ensure we would hit flow control limits (if enforced)
-                    let large_data = vec![0xAB; 100_000];
+                    // Send a large amount of data to exceed flow control window
+                    // Use Data type to avoid allocating everything up front
+                    // Send 1MB to ensure we hit flow control limits
+                    let mut data = Data::new(1_000_000);
                     
-                    tracing::info!("Server attempting to send {} bytes...", large_data.len());
+                    tracing::info!("Server attempting to send {} bytes...", data.buffered_len());
                     
-                    match stream.write_all(&large_data).await {
-                        Ok(_) => {
-                            tracing::info!("Server write_all completed");
-                            stream.shutdown().await.ok();
-                        }
-                        Err(e) => {
-                            tracing::error!("Server write failed: {:?}", e);
-                        }
-                    }
+                    stream.write_from_fin(&mut data).await
+                        .expect("Server write should succeed");
+                    
+                    tracing::info!("Server write completed");
                 }
                 .instrument(info_span!("stream", ?peer_addr))
                 .primary()
