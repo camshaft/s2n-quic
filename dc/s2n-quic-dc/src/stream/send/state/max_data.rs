@@ -8,6 +8,8 @@ use s2n_quic_core::{
 use std::task::Poll;
 use tracing::debug;
 
+const IDLE_RATIO: u32 = 4;
+
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 enum State {
     #[default]
@@ -31,7 +33,7 @@ impl State {
         on_unblocked(Queued | Inflight | Acked => Idle);
         on_ack(Queued | Inflight => Acked);
         on_transmit(Idle | Queued => Inflight);
-        on_timeout(Idle | Inflight => Queued);
+        on_timeout(Queued | Inflight | Acked => Queued);
     }
 }
 
@@ -78,7 +80,7 @@ impl MaxData {
             false
         );
         ensure!(self.state.on_blocked().is_ok(), false);
-        let target = clock.get_time() + idle_timeout / 2;
+        let target = clock.get_time() + idle_timeout / IDLE_RATIO;
         tracing::debug!(offset = ?self.local_value, %target, "data_blocked");
         self.timer.set(target);
         true
@@ -128,22 +130,22 @@ impl MaxData {
     }
 
     pub fn on_timeout(&mut self, clock: &impl Clock, idle_timeout: Duration) -> Poll<()> {
-        let now = clock.get_time();
-
         if self.state.is_unblocked() {
             self.on_unblocked();
             return Poll::Pending;
         }
 
+        let now = clock.get_time();
+
         // make sure we've armed the timer if we're blocked
         if !self.timer.is_armed() {
-            self.timer.set(now + idle_timeout / 2);
+            self.timer.set(now + idle_timeout / IDLE_RATIO);
             let _ = self.state.on_timeout();
             return Poll::Ready(());
         }
 
         ready!(self.timer.poll_expiration(now));
-        self.timer.set(now + idle_timeout / 2);
+        self.timer.set(now + idle_timeout / IDLE_RATIO);
         let _ = self.state.on_timeout();
         Poll::Ready(())
     }

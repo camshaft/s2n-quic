@@ -772,13 +772,7 @@ impl State {
             self.pto_backoff = self.pto_backoff.saturating_mul(2).min(max_pto_backoff);
         }
 
-        if self
-            .max_data
-            .on_timeout(clock, self.idle_timeout)
-            .is_ready()
-        {
-            self.pto.force_transmit();
-        }
+        let _ = self.max_data.on_timeout(clock, self.idle_timeout);
     }
 
     #[inline]
@@ -950,14 +944,12 @@ impl State {
         );
 
         // update the max offset that we've transmitted
-        if self.max_data.on_transmit(
+        self.max_data.on_transmit(
             info.end_offset(),
             clock,
             self.idle_timeout,
             self.max_datagram_size,
-        ) {
-            self.pto.force_transmit();
-        }
+        );
         self.counters.on_transmit(&info);
 
         if let stream::PacketSpace::Recovery = packet_space {
@@ -1022,6 +1014,7 @@ impl State {
         enabled |= self.pto.transmissions() > 0;
         enabled |= self.fin.is_queued();
         enabled |= self.reset.is_queued();
+        enabled |= self.max_data.is_queued();
 
         enabled
     }
@@ -1082,7 +1075,6 @@ impl State {
         if self.pto.transmissions() > 0 {
             self.recovery_packet_number =
                 (self.recovery_packet_number + 1).max(*self.max_stream_packet_number + 1);
-            self.max_stream_packet_number_lost += 1;
         }
 
         self.try_transmit_retransmissions(control_key, clock, packets, publisher)?;
