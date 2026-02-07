@@ -91,7 +91,7 @@ impl Config {
             reuse_port: false,
             // TODO tune these defaults
             stream_recv_queue: Capacity {
-                max: u16::MAX as _,
+                max: 1 << 18,
                 initial: 256,
             },
 
