@@ -827,8 +827,12 @@ impl State {
     }
 
     fn has_inflight_packets(&self) -> bool {
-        self.counters
-            .has_inflight_packets(&self.unacked_ranges, &self.fin, &self.reset)
+        let mut has_inflight =
+            self.counters
+                .has_inflight_packets(&self.unacked_ranges, &self.fin, &self.reset);
+        // If we're blocked on flow control we also need to keep the PTO armed
+        has_inflight |= self.max_data.is_inflight();
+        has_inflight
     }
 
     #[inline]

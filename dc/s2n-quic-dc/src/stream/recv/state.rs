@@ -547,6 +547,10 @@ impl State {
                             stream_offset: data_blocked.data_limit.as_u64(),
                         },
                     );
+                    if data_blocked.data_limit < self.max_data {
+                        // respond to the sender with our current MAX_DATA value
+                        self.needs_transmission("data_blocked_received");
+                    }
                 }
                 _ => {
                     // ignore other frames for now

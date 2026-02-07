@@ -11,17 +11,27 @@ use tracing::debug;
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 enum State {
     #[default]
-    Unblocked,
-    Blocked,
+    Idle,
+    Queued,
+    Inflight,
+    Acked,
 }
 
 impl State {
-    is!(is_unblocked, Unblocked);
-    is!(is_blocked, Blocked);
+    is!(is_idle, Idle);
+    is!(is_queued, Queued);
+    is!(is_inflight, Inflight);
+    is!(is_acked, Acked);
+
+    is!(is_blocked, Queued | Inflight | Acked);
+    is!(is_unblocked, Idle);
 
     event! {
-        on_blocked(Unblocked => Blocked);
-        on_unblocked(Blocked => Unblocked);
+        on_blocked(Idle => Queued);
+        on_unblocked(Queued | Inflight | Acked => Idle);
+        on_ack(Queued | Inflight => Acked);
+        on_transmit(Idle | Queued => Inflight);
+        on_timeout(Idle | Inflight => Queued);
     }
 }
 
@@ -45,6 +55,14 @@ impl MaxData {
 
     pub fn is_blocked(&self) -> bool {
         self.state.is_blocked()
+    }
+
+    pub fn is_queued(&self) -> bool {
+        self.state.is_queued()
+    }
+
+    pub fn is_inflight(&self) -> bool {
+        self.state.is_inflight()
     }
 
     pub fn on_transmit(
@@ -75,7 +93,16 @@ impl MaxData {
     }
 
     pub fn on_max_data_frame(&mut self, max_data: VarInt) -> Option<VarInt> {
-        ensure!(self.peer_value < max_data, None);
+        if self.peer_value > max_data {
+            return None;
+        }
+
+        // The peer ACKd our value so we don't need to arm the PTO
+        if self.peer_value == max_data {
+            let _ = self.state.on_ack();
+            return None;
+        }
+
         let diff = max_data - self.peer_value;
         self.peer_value = max_data;
         self.on_unblocked();
@@ -86,10 +113,12 @@ impl MaxData {
         ensure!(self.state.on_unblocked().is_ok());
         debug!("flow unblocked");
         self.timer.cancel();
+        let _ = self.state.on_unblocked();
     }
 
-    pub fn try_transmit_data_blocked(&self) -> Option<s2n_quic_core::frame::DataBlocked> {
+    pub fn try_transmit_data_blocked(&mut self) -> Option<s2n_quic_core::frame::DataBlocked> {
         if self.state.is_blocked() {
+            let _ = self.state.on_transmit();
             Some(s2n_quic_core::frame::DataBlocked {
                 data_limit: self.peer_value,
             })
@@ -102,18 +131,20 @@ impl MaxData {
         let now = clock.get_time();
 
         if self.state.is_unblocked() {
-            self.timer.cancel();
+            self.on_unblocked();
             return Poll::Pending;
         }
 
         // make sure we've armed the timer if we're blocked
         if !self.timer.is_armed() {
             self.timer.set(now + idle_timeout / 2);
+            let _ = self.state.on_timeout();
             return Poll::Ready(());
         }
 
         ready!(self.timer.poll_expiration(now));
         self.timer.set(now + idle_timeout / 2);
+        let _ = self.state.on_timeout();
         Poll::Ready(())
     }
 }
