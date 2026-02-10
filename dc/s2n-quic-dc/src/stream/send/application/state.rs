@@ -74,6 +74,8 @@ impl State {
         );
         let mut reader = reader.with_read_limit(credits.len);
 
+        let max_header_len = self.max_header_len();
+
         let mut total_payload_len = 0;
         let max_record_size = if features.is_stream() {
             // If the underlying transport is stream based, it will perform its own packetization
@@ -86,10 +88,16 @@ impl State {
         };
 
         loop {
+            let buffer_len = {
+                let estimated_len = reader.buffered_len() + max_header_len;
+                (max_record_size as usize).min(estimated_len)
+            };
+
             let res = message.push_with(|mut buffer| {
                 let packet_number = packet_number.next().unwrap();
 
                 let stream_offset = reader.current_offset();
+                let mut reader = reader.with_read_limit(buffer_len);
                 let mut reader = reader.track_read();
 
                 let encoder = EncoderBuffer::new(&mut buffer[..]);
