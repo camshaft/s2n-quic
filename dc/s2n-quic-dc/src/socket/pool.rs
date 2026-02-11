@@ -48,7 +48,7 @@ impl Pool {
             max_packet_size,
             packet_count,
         };
-        pool.grow();
+        pool.grow(false);
         pool
     }
 
@@ -59,16 +59,15 @@ impl Pool {
 
     #[inline]
     pub fn alloc_or_grow(&self) -> Unfilled {
-        loop {
-            if let Some(descriptor) = self.free.alloc() {
-                return descriptor;
-            }
-            self.grow();
+        if let Some(descriptor) = self.free.alloc() {
+            return descriptor;
         }
+
+        self.grow(true).unwrap()
     }
 
     #[inline(never)] // this should happen rarely
-    fn grow(&self) {
+    fn grow(&self, return_segment: bool) -> Option<Unfilled> {
         let (region, layout) = Region::alloc(self.max_packet_size, self.packet_count);
 
         let ptr = region.ptr;
@@ -101,11 +100,12 @@ impl Pool {
 
                 // push the descriptor into the free list
                 let descriptor = Descriptor::new(NonNull::new_unchecked(descriptor));
+
                 pending.push(descriptor);
             }
         }
 
-        self.free.record_region(region, pending);
+        self.free.record_region(region, pending, return_segment)
     }
 }
 
@@ -231,12 +231,38 @@ impl Free {
     }
 
     #[inline]
-    fn record_region(&self, region: Region, mut descriptors: Vec<Descriptor>) {
+    fn record_region(
+        &self,
+        region: Region,
+        mut descriptors: Vec<Descriptor>,
+        return_segment: bool,
+    ) -> Option<Unfilled> {
         let mut inner = self.0.lock().unwrap();
+
+        if return_segment {
+            if let Some(desc) = inner.descriptors.pop() {
+                #[cfg(debug_assertions)]
+                assert!(inner.active.insert(desc.as_usize()));
+                drop(inner);
+                return Some(Unfilled::from_descriptor(desc));
+            }
+        }
+
         inner.regions.push(region);
+
         let prev = inner.total;
         let next = prev + descriptors.len();
         inner.total = next;
+
+        let segment = if return_segment {
+            let desc = descriptors.pop().unwrap();
+            #[cfg(debug_assertions)]
+            inner.active.insert(desc.as_usize());
+            Some(Unfilled::from_descriptor(desc))
+        } else {
+            None
+        };
+
         inner.descriptors.append(&mut descriptors);
         // Even though the `descriptors` is now empty (`len=0`), it still owns
         // capacity and will need to be freed. Drop the lock before interacting
@@ -244,6 +270,8 @@ impl Free {
         drop(inner);
         drop(descriptors);
         tracing::debug!(prev, next, "growing pool");
+
+        segment
     }
 
     #[inline]

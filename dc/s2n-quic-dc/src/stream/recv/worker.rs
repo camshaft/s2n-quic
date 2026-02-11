@@ -260,7 +260,7 @@ where
                     // on each packet to see if it should intercept and respond with an old control packet
                     // in case the sender didn't see the control packet. This is similar to TCP Reuse/Recycle.
                     let now = self.shared.clock.get_time();
-                    let target = now + Duration::from_millis(500);
+                    let target = now + Duration::from_secs(5);
                     self.peek_timer.update(target);
                 }
                 waiting::State::TimeWait => {

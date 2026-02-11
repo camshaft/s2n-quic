@@ -1,6 +1,8 @@
 // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use crate::{
     socket::{
         pool::descriptor,
@@ -42,6 +44,7 @@ pub struct CompleteTransmission<'a, Info, Meta> {
 pub struct Queue<Info, Meta, Completion> {
     completion: intrusive_queue::Queue<Transmission<Info, Meta, Completion>>,
     free: intrusive_queue::Queue<Transmission<Info, Meta, Completion>>,
+    is_open: AtomicBool,
 }
 
 impl<Info, Meta, Completion> Default for Queue<Info, Meta, Completion> {
@@ -50,6 +53,7 @@ impl<Info, Meta, Completion> Default for Queue<Info, Meta, Completion> {
         Self {
             completion: intrusive_queue::Queue::new(),
             free: intrusive_queue::Queue::new(),
+            is_open: true.into(),
         }
     }
 }
@@ -85,9 +89,15 @@ where
         entry
     }
 
+    pub fn close(&self) {
+        self.is_open.store(false, Ordering::Relaxed);
+    }
+
     #[inline]
     pub fn complete_transmission(&self, entry: Entry<Info, Meta, Completion>) {
-        self.completion.push_back(entry);
+        if self.is_open.load(Ordering::Relaxed) {
+            self.completion.push_back(entry);
+        }
     }
 
     #[inline]

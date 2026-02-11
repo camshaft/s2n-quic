@@ -66,22 +66,25 @@ pub enum AcceptState {
 
 pub type ArcShared<Sub> = Arc<Shared<Sub, dyn Clock>>;
 
-pub struct CompletionQueue<T>(UnsafeCell<core::mem::MaybeUninit<T>>);
+pub struct CompletionQueue<T>(UnsafeCell<Option<T>>);
 
 impl<T: Clone> CompletionQueue<T> {
     pub fn uninit() -> Self {
-        Self(UnsafeCell::new(core::mem::MaybeUninit::uninit()))
+        Self(UnsafeCell::new(None))
     }
 
     #[inline]
     pub unsafe fn set(&self, value: T) {
         let weak = unsafe { &mut *self.0.get() };
-        weak.write(value);
+        *weak = Some(value);
     }
 
     pub unsafe fn load(&self) -> T {
-        let weak = unsafe { &*self.0.get() };
-        weak.assume_init_ref().clone()
+        unsafe {
+            let v = &*self.0.get();
+            s2n_quic_core::assume!(v.is_some());
+            v.clone().unwrap()
+        }
     }
 }
 

@@ -190,6 +190,7 @@ where
         s2n_quic_core::task::waker::debug_assert_contract(cx, |cx| {
             ready!(self.poll_impl(cx));
             tracing::trace!("write worker shutting down");
+            self.shared.sender.transmission_queue.close();
             Poll::Ready(())
         })
     }
