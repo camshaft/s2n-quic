@@ -217,7 +217,7 @@ impl Pool {
             tx
         };
 
-        let transmission_pool = config.tx_packet_pool(workers);
+        let transmission_pool = config.tx_packet_pool();
 
         macro_rules! spawn {
             ($create_router:expr) => {

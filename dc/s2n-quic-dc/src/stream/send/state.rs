@@ -360,6 +360,7 @@ impl State {
         let mut made_progress = false;
         let mut max_acked_stream = None;
         let mut max_acked_recovery = None;
+        let mut max_acked_tx_time = None;
         let mut loaded_transmit_queue = false;
 
         for frame in packet.control_frames_mut() {
@@ -388,6 +389,7 @@ impl State {
                             &mut made_progress,
                             &mut max_acked_stream,
                             &mut max_acked_recovery,
+                            &mut max_acked_tx_time,
                             publisher,
                         )?;
                     } else {
@@ -398,6 +400,7 @@ impl State {
                             &mut made_progress,
                             &mut max_acked_stream,
                             &mut max_acked_recovery,
+                            &mut max_acked_tx_time,
                             publisher,
                         )?;
                     }
@@ -431,12 +434,28 @@ impl State {
             }
         }
 
-        for (space, pn) in [
-            (stream::PacketSpace::Stream, max_acked_stream),
-            (stream::PacketSpace::Recovery, max_acked_recovery),
-        ] {
-            if let Some(pn) = pn {
-                self.detect_lost_packets(random, &recv_time, space, pn, publisher)?;
+        // Perform loss detection across both packet number spaces using the max ACK'd TX time
+        // This ensures we use a consistent loss window based on the most recently acknowledged packet
+        if let Some(max_tx_time) = max_acked_tx_time {
+            // Time threshold: loss_delay = max(kTimeThreshold * max(smoothed_rtt, latest_rtt), kGranularity)
+            let loss_delay = {
+                let rtt = self
+                    .rtt_estimator
+                    .smoothed_rtt()
+                    .max(self.rtt_estimator.latest_rtt());
+                // kTimeThreshold is typically 9/8 per RFC
+                let time_threshold = rtt + rtt / 8;
+                // kGranularity is typically 1ms
+                time_threshold.max(Duration::from_millis(1))
+            };
+
+            let loss_time = max_tx_time.checked_sub(loss_delay);
+
+            for (space, pn) in [
+                (stream::PacketSpace::Stream, max_acked_stream),
+                (stream::PacketSpace::Recovery, max_acked_recovery),
+            ] {
+                self.detect_lost_packets(random, &recv_time, space, pn, loss_time, publisher)?;
             }
         }
 
@@ -475,6 +494,7 @@ impl State {
         made_progress: &mut bool,
         max_acked_stream: &mut Option<VarInt>,
         max_acked_recovery: &mut Option<VarInt>,
+        max_acked_tx_time: &mut Option<Timestamp>,
         publisher: &Pub,
     ) -> Result<(), Error>
     where
@@ -510,6 +530,9 @@ impl State {
                         {
                             cca_args = Some((packet.info.time_sent, packet.cc_info));
                         }
+
+                        // Track the max ACK'd TX time across all packet spaces for loss detection
+                        *max_acked_tx_time = (*max_acked_tx_time).max(Some(packet.info.time_sent));
 
                         self.counters.on_finish(&packet.info);
 
@@ -598,23 +621,44 @@ impl State {
         random: &mut dyn random::Generator,
         clock: &Clk,
         packet_space: stream::PacketSpace,
-        max: VarInt,
+        max_acked_pn: Option<VarInt>,
+        loss_time: Option<Timestamp>,
         publisher: &Pub,
     ) -> Result<(), Error>
     where
         Clk: Clock,
         Pub: event::ConnectionPublisher,
     {
-        let Some(loss_threshold) = max.checked_sub(VarInt::from_u8(2)) else {
-            return Ok(());
-        };
+        // Packet number threshold
+        let pn_threshold = max_acked_pn.and_then(|max_pn| max_pn.checked_sub(VarInt::from_u8(3)));
 
         let is_unrecoverable = false;
 
         macro_rules! impl_loss_detection {
             ($sent_packets:ident, $on_packet:expr) => {{
                 let lost_min = PacketNumberSpace::Initial.new_packet_number(VarInt::ZERO);
-                let lost_max = PacketNumberSpace::Initial.new_packet_number(loss_threshold);
+                let mut lost_max = None;
+
+                for (num, packet) in self.$sent_packets.iter() {
+                    // A packet is considered lost if it meets either condition:
+                    // 1. Time threshold: sent before loss_time
+                    // 2. Packet number threshold: packet number <= max_acked_pn - 3
+                    let lost_by_time = loss_time.map_or(false, |loss_time| packet.info.time_sent <= loss_time);
+                    let lost_by_pn = pn_threshold
+                        .map_or(false, |threshold| num.as_u64() <= threshold.as_u64());
+
+                    if lost_by_time || lost_by_pn {
+                        lost_max = Some(num);
+                        continue;
+                    }
+
+                    break;
+                }
+
+                let Some(lost_max) = lost_max else {
+                    return Ok(());
+                };
+
                 let range = s2n_quic_core::packet::number::PacketNumberRange::new(lost_min, lost_max);
                 for (num, mut packet) in self.$sent_packets.remove_range(range) {
                     let num_varint = unsafe { VarInt::new_unchecked(num.as_u64()) };

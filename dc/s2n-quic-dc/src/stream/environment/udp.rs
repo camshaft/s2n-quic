@@ -72,8 +72,6 @@ pub struct Config {
     pub reuse_port: bool,
     pub stream_recv_queue: Capacity,
     pub control_recv_queue: Capacity,
-    pub max_packet_size: u16,
-    pub packet_count: usize,
     pub accept_flavor: accept::Flavor,
     pub send_workers: Workers,
     pub recv_workers: Workers,
@@ -98,10 +96,6 @@ impl Config {
             // set the control queue depth shallow, since we really only need the most recent ones
             control_recv_queue: Capacity { max: 8, initial: 8 },
 
-            // Allocate 1MB at a time
-            max_packet_size: u16::MAX,
-            packet_count: 16,
-
             accept_flavor: accept::Flavor::default(),
 
             send_workers: Workers::Environment(None),
@@ -122,7 +116,7 @@ impl Config {
     }
 
     pub(crate) fn rx_packet_pool(&self) -> pool::Pool {
-        pool::Pool::new(self.max_packet_size, self.packet_count)
+        pool::Pool::new(u16::MAX, 16)
     }
 
     pub(crate) fn socket_count(&self) -> usize {
@@ -133,16 +127,31 @@ impl Config {
             .max(1)
     }
 
-    pub(crate) fn tx_packet_pool(&self, thread_count: usize) -> pool::Sharded {
-        let pool_count = (thread_count * 2).next_power_of_two();
-        let mut pools = Vec::with_capacity(pool_count);
-        for _ in 0..pools.capacity() {
-            pools.push(pool::Pool::new(
-                crate::msg::segment::MAX_UDP_PAYLOAD,
-                self.packet_count,
-            ));
-        }
-        pool::Sharded::new(pools.into())
+    pub(crate) fn tx_packet_pool(&self) -> pool::Sharded {
+        use std::sync::OnceLock;
+
+        static POOL: OnceLock<pool::Sharded> = OnceLock::new();
+
+        POOL.get_or_init(|| {
+            let thread_count = std::thread::available_parallelism()
+                .map(|c| c.get())
+                .unwrap_or(1);
+            let pool_count = (thread_count * 2).next_power_of_two().min(4);
+            let mut pools = Vec::with_capacity(pool_count);
+
+            let max_packet_size = crate::msg::segment::MAX_UDP_PAYLOAD;
+            let allocation_size = u16::MAX as usize * 16;
+            let packet_count = allocation_size.div_ceil(max_packet_size as usize);
+
+            for _ in 0..pools.capacity() {
+                pools.push(pool::Pool::new(
+                    crate::msg::segment::MAX_UDP_PAYLOAD,
+                    packet_count,
+                ));
+            }
+            pool::Sharded::new(pools.into())
+        })
+        .clone()
     }
 
     pub fn unroutable_packets<S>(

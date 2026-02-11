@@ -162,21 +162,7 @@ impl State {
             out_buf.infallible_copy_into(chunk);
         }
 
-        // Only increase the max data if the application has accepted the stream.
-        if matches!(accept_state, AcceptState::Accepted) {
-            let new_max_data = out_buf
-                .current_offset()
-                .saturating_add(self.max_data_window);
-
-            // record our new max data value
-            if new_max_data > self.max_data {
-                // TODO make this smarter to avoid sending too many MAX_DATA frames
-                self.max_data = new_max_data;
-                self.needs_transmission("new_max_data");
-            }
-        }
-
-        // if we know the final offset then update the sate
+        // if we know the final offset then update the state
         if out_buf.final_offset().is_some() {
             let _ = self.state.on_receive_fin();
         }
@@ -189,6 +175,22 @@ impl State {
         // if we've completely drained the out buffer try transitioning to the final state
         if out_buf.is_consumed() && self.state.on_app_read_all_data().is_ok() {
             self.needs_transmission("app_read_all_data");
+        }
+
+        // Only increase the max data if the application has accepted the stream.
+        if matches!(accept_state, AcceptState::Accepted) {
+            let new_max_data = out_buf
+                .current_offset()
+                .saturating_add(self.max_data_window);
+
+            // record our new max data value
+            if new_max_data > self.max_data {
+                // TODO make this smarter to avoid sending too many MAX_DATA frames
+                self.max_data = new_max_data;
+                if !self.state.is_terminal() {
+                    self.needs_transmission("new_max_data");
+                }
+            }
         }
     }
 
@@ -512,7 +514,7 @@ impl State {
 
         // if we got a new packet then we'll need to transmit an ACK
         // TODO make this smarter to avoid sending too many ACKs
-        self.needs_transmission("new_packet");
+        // self.needs_transmission("new_packet");
 
         // update the idle timer since we received a valid packet
         if matches!(self.state, Receiver::Recv | Receiver::SizeKnown)

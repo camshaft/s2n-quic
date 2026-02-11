@@ -148,7 +148,7 @@ impl Pool {
             }
         }
 
-        let transmission_pool = config.tx_packet_pool(workers);
+        let transmission_pool = config.tx_packet_pool();
 
         let unroutable_packets = {
             // TODO pace these packets
