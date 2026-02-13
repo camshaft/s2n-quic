@@ -29,6 +29,7 @@ pub struct Message {
 #[derive(Debug)]
 pub enum Event {
     Shutdown { kind: ShutdownKind, queue: Queue },
+    KeepAlive { enabled: bool },
 }
 
 pub struct State {
@@ -114,6 +115,13 @@ impl State {
     #[inline]
     pub fn pop_worker_message(&self) -> Option<Message> {
         self.worker_queue.pop()
+    }
+
+    pub fn keep_alive(&self, enabled: bool) {
+        self.worker_queue.push(Message {
+            event: Event::KeepAlive { enabled },
+        });
+        self.worker_waker.wake();
     }
 
     pub fn on_prune(&self) {

@@ -166,6 +166,11 @@ where
     }
 
     #[inline]
+    pub fn keep_alive(&self, enabled: bool) {
+        self.write.keep_alive(enabled);
+    }
+
+    #[inline]
     pub async fn write_from(
         &mut self,
         buf: &mut impl buffer::reader::storage::Infallible,

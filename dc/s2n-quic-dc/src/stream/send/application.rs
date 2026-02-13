@@ -95,6 +95,11 @@ where
     }
 
     #[inline]
+    pub fn keep_alive(&self, enabled: bool) {
+        self.0.shared.sender.keep_alive(enabled);
+    }
+
+    #[inline]
     pub async fn write_from<S>(&mut self, buf: &mut S) -> io::Result<usize>
     where
         S: buffer::reader::storage::Infallible,

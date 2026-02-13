@@ -44,10 +44,11 @@ use s2n_quic_core::{
 use std::collections::BinaryHeap;
 use tracing::trace;
 
-pub mod fin;
-pub mod max_data;
-pub mod probe;
-pub mod reset;
+mod fin;
+mod keep_alive;
+mod max_data;
+mod probe;
+mod reset;
 pub mod retransmission;
 pub mod transmission;
 
@@ -144,6 +145,7 @@ pub struct State {
     max_sent_segment_size: u16,
     is_reliable: bool,
     fin: fin::Fin,
+    keep_alive: keep_alive::KeepAlive,
     retransmissions: BinaryHeap<retransmission::Segment>,
     #[cfg(debug_assertions)]
     pending_retransmissions: IntervalSet<VarInt>,
@@ -197,6 +199,7 @@ impl State {
             is_reliable: stream_id.is_reliable,
             fin: Default::default(),
             retransmissions: Default::default(),
+            keep_alive: Default::default(),
             #[cfg(debug_assertions)]
             pending_retransmissions: Default::default(),
         }
@@ -270,6 +273,14 @@ impl State {
 
     pub fn bandwidth(&self) -> Bandwidth {
         self.cca.bandwidth()
+    }
+
+    pub fn keep_alive(&mut self, enabled: bool, clock: &impl Clock) {
+        let target = self
+            .idle_timer
+            .next_expiration()
+            .unwrap_or_else(|| clock.get_time());
+        self.keep_alive.set(enabled, target, self.idle_timeout);
     }
 
     /// Called by the worker when it receives a control packet from the peer
@@ -817,6 +828,7 @@ impl State {
         }
 
         let _ = self.max_data.on_timeout(clock, self.idle_timeout);
+        let _ = self.keep_alive.on_timeout(clock, self.idle_timeout);
     }
 
     #[inline]
@@ -852,7 +864,10 @@ impl State {
         ensure!(!self.idle_timer.is_armed());
 
         let now = clock.get_time();
-        self.idle_timer.set(now + self.idle_timeout);
+        let target = now + self.idle_timeout;
+        self.idle_timer.set(target);
+        self.keep_alive
+            .on_idle_timer_update(target, self.idle_timeout);
     }
 
     #[inline]
@@ -1059,6 +1074,7 @@ impl State {
         enabled |= self.fin.is_queued();
         enabled |= self.reset.is_queued();
         enabled |= self.max_data.is_queued();
+        enabled |= self.keep_alive.is_queued();
 
         enabled
     }
@@ -1251,6 +1267,7 @@ impl State {
                 if self.pto.transmissions() > 0 {
                     self.pto.on_transmit_once();
                 }
+                self.keep_alive.on_transmit();
 
                 packets.push(event, descriptor);
             }
@@ -1305,9 +1322,13 @@ impl State {
                 let data_blocked = self.max_data.try_transmit_data_blocked();
                 let reset_frame = self.reset.try_transmit();
 
-                let mut control_data_len = VarInt::ZERO;
-                if let Some(ref frame) = data_blocked {
-                    control_data_len += VarInt::try_from(frame.encoding_size()).unwrap();
+                let ping = if self.pto.transmissions() > 0 {
+                    Some(frame::Ping)
+                } else {
+                    None
+                };
+
+                if data_blocked.is_some() {
                     publisher.on_stream_data_blocked_transmitted(
                         event::builder::StreamDataBlockedTransmitted {
                             stream_offset: offset.as_u64(),
@@ -1316,12 +1337,12 @@ impl State {
                     );
                 }
 
-                if let Some(ref frame) = reset_frame {
+                if reset_frame.is_some() {
                     flags = flags.with_included_reset(true);
-                    control_data_len += VarInt::try_from(frame.encoding_size()).unwrap();
                 }
 
-                let control_data = (data_blocked, reset_frame);
+                let control_data = (ping, (data_blocked, reset_frame));
+                let control_data_len = VarInt::try_from(control_data.encoding_size()).unwrap();
 
                 let encoder = EncoderBuffer::new(&mut buffer);
                 let packet_len = encoder::probe(
@@ -1382,6 +1403,7 @@ impl State {
             if self.pto.transmissions() > 0 {
                 self.pto.on_transmit_once();
             }
+            self.keep_alive.on_transmit();
         }
 
         Ok(())
@@ -1496,6 +1518,7 @@ impl timer::Provider for State {
         self.pto.timers(query)?;
         self.max_data.timers(query)?;
         self.idle_timer.timers(query)?;
+        self.keep_alive.timers(query)?;
         Ok(())
     }
 }

@@ -274,6 +274,9 @@ where
 
         while let Some(message) = self.shared.sender.pop_worker_message() {
             match message.event {
+                Event::KeepAlive { enabled } => {
+                    self.sender.keep_alive(enabled, &self.shared.clock);
+                }
                 Event::Shutdown { kind, mut queue } => {
                     self.transmit_queue.append(&mut queue);
 
