@@ -512,15 +512,14 @@ impl State {
 
         space.on_packet_received(packet_number, clock.get_time());
 
-        // if we got a new packet then we'll need to transmit an ACK
-        // TODO make this smarter to avoid sending too many ACKs
-        self.needs_transmission("new_packet");
-
         // update the idle timer since we received a valid packet
         if matches!(self.state, Receiver::Recv | Receiver::SizeKnown)
             || packet.stream_offset() == VarInt::ZERO
         {
             self.update_idle_timer(clock);
+            // if we got a new packet then we'll need to transmit an ACK
+            // TODO make this smarter to avoid sending too many ACKs
+            self.needs_transmission("new_packet");
         }
 
         for frame in packet.control_frames_mut() {
