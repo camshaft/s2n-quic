@@ -402,7 +402,7 @@ fn keep_alive_client_only() {
             // Keep alive should maintain the connection
             180.s().sleep().await;
 
-            // After idle period, send another message to verify stream is still alive
+            // After idle period, send final message and shutdown
             stream.write_all(b"done").await.unwrap();
             stream.shutdown().await.unwrap();
 
@@ -422,8 +422,16 @@ fn keep_alive_client_only() {
             while let Ok((mut stream, peer_addr)) = server.accept().await {
                 async move {
                     // Server does NOT enable keep alive
+                    // Read first chunk
+                    let mut buf = [0u8; 100];
+                    let n = stream.read(&mut buf).await.unwrap();
+                    assert_eq!(&buf[..n], b"request");
+
+                    // Server can now wait for more data
+                    // The client's keep_alive should maintain connection during its 180s idle
                     let mut request = vec![];
                     stream.read_to_end(&mut request).await.unwrap();
+                    assert_eq!(&request, b"done");
 
                     stream.write_from_fin(&mut &b"got it"[..]).await.unwrap();
                 }
