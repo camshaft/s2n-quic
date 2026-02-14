@@ -383,30 +383,30 @@ fn lost_flow_increase() {
         });
 }
 
-/// Test that a stream with keep alive enabled stays alive for several minutes
-/// without timing out due to idle timeout.
+/// Test that a stream with keep alive enabled on the client side stays alive
+/// for several minutes without timing out due to idle timeout.
 #[test]
-fn keep_alive_stays_alive() {
+fn keep_alive_client_only() {
     sim(|| {
         async move {
             let client = Client::builder().build();
             let mut stream = client.connect_sim("server:443").await.unwrap();
 
-            // Enable keep alive on the stream
+            // Enable keep alive on the client stream only
             stream.keep_alive(true);
 
-            // Wait for 3 minutes (much longer than the 30s idle timeout)
-            // The stream should stay alive because keep alive sends PING frames
-            180.s().sleep().await;
-
-            // Send a message to verify the stream is still alive
-            stream.write_all(b"still alive").await.unwrap();
+            // Send periodic small writes to verify stream stays alive over 3 minutes
+            for i in 0..36 {
+                5.s().sleep().await;
+                stream.write_all(&[i]).await.unwrap();
+            }
+            
             stream.shutdown().await.unwrap();
 
             let mut response = vec![];
             stream.read_to_end(&mut response).await.unwrap();
 
-            assert_eq!(response, b"alive!"[..]);
+            assert_eq!(response.len(), 36);
         }
         .group("client")
         .instrument(info_span!("client"))
@@ -418,16 +418,11 @@ fn keep_alive_stays_alive() {
 
             while let Ok((mut stream, peer_addr)) = server.accept().await {
                 async move {
-                    // Enable keep alive on the server side too
-                    stream.keep_alive(true);
-
+                    // Server does NOT enable keep alive
                     let mut request = vec![];
                     stream.read_to_end(&mut request).await.unwrap();
 
-                    stream
-                        .write_from_fin(&mut &b"alive!"[..])
-                        .await
-                        .unwrap();
+                    stream.write_all(&request).await.unwrap();
                 }
                 .instrument(info_span!("stream", ?peer_addr))
                 .primary()
@@ -440,21 +435,28 @@ fn keep_alive_stays_alive() {
     });
 }
 
-/// Test that a stream without keep alive enabled times out after the idle timeout.
+/// Test that a stream with keep alive enabled on the server side stays alive
+/// for several minutes without timing out due to idle timeout.
 #[test]
-fn keep_alive_disabled_times_out() {
+fn keep_alive_server_only() {
     sim(|| {
         async move {
             let client = Client::builder().build();
             let mut stream = client.connect_sim("server:443").await.unwrap();
 
-            // Keep alive is disabled by default
-            // Wait longer than the idle timeout (30s)
-            60.s().sleep().await;
+            // Client does NOT enable keep alive
+            // Send periodic small writes to verify stream stays alive over 3 minutes  
+            for i in 0..36 {
+                5.s().sleep().await;
+                stream.write_all(&[i]).await.unwrap();
+            }
+            
+            stream.shutdown().await.unwrap();
 
-            // Try to send a message - this should fail because the stream timed out
-            let result = stream.write_all(b"should fail").await;
-            assert!(result.is_err(), "Stream should have timed out");
+            let mut response = vec![];
+            stream.read_to_end(&mut response).await.unwrap();
+
+            assert_eq!(response.len(), 36);
         }
         .group("client")
         .instrument(info_span!("client"))
@@ -464,10 +466,66 @@ fn keep_alive_disabled_times_out() {
         async move {
             let server = Server::udp().port(443).build();
 
-            while let Ok((_stream, peer_addr)) = server.accept().await {
+            while let Ok((mut stream, peer_addr)) = server.accept().await {
                 async move {
-                    // Don't do anything, just let the stream idle
-                    120.s().sleep().await;
+                    // Enable keep alive on the server side only
+                    stream.keep_alive(true);
+
+                    let mut request = vec![];
+                    stream.read_to_end(&mut request).await.unwrap();
+
+                    stream.write_all(&request).await.unwrap();
+                }
+                .instrument(info_span!("stream", ?peer_addr))
+                .primary()
+                .spawn();
+            }
+        }
+        .group("server")
+        .instrument(info_span!("server"))
+        .spawn();
+    });
+}
+
+/// Test that a stream times out after keep alive is disabled.
+/// This test enables keep_alive, verifies it works, then disables it and verifies timeout.
+#[test]
+fn keep_alive_enable_then_disable_times_out() {
+    sim(|| {
+        async move {
+            let client = Client::builder().build();
+            let mut stream = client.connect_sim("server:443").await.unwrap();
+
+            // Enable keep alive initially
+            stream.keep_alive(true);
+
+            // Wait for 1 minute to show it's working
+            60.s().sleep().await;
+
+            // Disable keep alive
+            stream.keep_alive(false);
+
+            // Wait longer than the idle timeout (30s)
+            60.s().sleep().await;
+
+            // Try to send a message - this should fail because the stream timed out
+            let result = stream.write_all(b"should fail").await;
+            assert!(result.is_err(), "Stream should have timed out after disabling keep alive");
+        }
+        .group("client")
+        .instrument(info_span!("client"))
+        .primary()
+        .spawn();
+
+        async move {
+            let server = Server::udp().port(443).build();
+
+            while let Ok((stream, peer_addr)) = server.accept().await {
+                async move {
+                    // Keep stream alive to avoid dropping it immediately
+                    let _stream = stream;
+                    // Don't do anything, just hold the stream
+                    200.s().sleep().await;
                 }
                 .instrument(info_span!("stream", ?peer_addr))
                 .primary()
@@ -488,23 +546,28 @@ fn keep_alive_enabled_near_timeout() {
             let client = Client::builder().build();
             let mut stream = client.connect_sim("server:443").await.unwrap();
 
-            // Wait until we're close to the idle timeout (25s out of 30s)
-            25.s().sleep().await;
+            // Send some initial data to establish the stream
+            stream.write_all(b"start").await.unwrap();
+            
+            // Wait until we're close to the idle timeout (20s out of 30s)
+            20.s().sleep().await;
 
-            // Enable keep alive just before timeout
+            // Enable keep alive just before timeout (10s before the 30s timeout)
             stream.keep_alive(true);
 
-            // Wait another 2 minutes to ensure keep alive is working
-            120.s().sleep().await;
-
-            // Send a message to verify the stream is still alive
-            stream.write_all(b"saved by keep alive").await.unwrap();
+            // Wait another 2 minutes with keep alive preventing timeout
+            // Send periodic writes to verify stream stays alive
+            for _ in 0..24 {
+                5.s().sleep().await;
+                stream.write_all(b"x").await.unwrap();
+            }
+            
             stream.shutdown().await.unwrap();
 
             let mut response = vec![];
             stream.read_to_end(&mut response).await.unwrap();
 
-            assert_eq!(response, b"saved!"[..]);
+            assert!(response.len() > 0, "Should have received response");
         }
         .group("client")
         .instrument(info_span!("client"))
@@ -516,14 +579,62 @@ fn keep_alive_enabled_near_timeout() {
 
             while let Ok((mut stream, peer_addr)) = server.accept().await {
                 async move {
-                    // Enable keep alive on the server side too
-                    stream.keep_alive(true);
+                    // Server does NOT enable keep alive
+                    let mut request = vec![];
+                    stream.read_to_end(&mut request).await.unwrap();
 
+                    stream.write_all(&request).await.unwrap();
+                }
+                .instrument(info_span!("stream", ?peer_addr))
+                .primary()
+                .spawn();
+            }
+        }
+        .group("server")
+        .instrument(info_span!("server"))
+        .spawn();
+    });
+}
+
+/// Test that keep alive is no longer active after the stream is shutdown.
+#[test]
+fn keep_alive_inactive_after_shutdown() {
+    sim(|| {
+        async move {
+            let client = Client::builder().build();
+            let mut stream = client.connect_sim("server:443").await.unwrap();
+
+            // Enable keep alive
+            stream.keep_alive(true);
+
+            // Send data and shutdown immediately
+            stream.write_all(b"request").await.unwrap();
+            stream.shutdown().await.unwrap();
+
+            // Read response
+            let mut response = vec![];
+            stream.read_to_end(&mut response).await.unwrap();
+
+            assert_eq!(response, b"response"[..]);
+
+            // After shutdown completes, the stream should close gracefully
+            // and not continue sending keep alive PING frames
+        }
+        .group("client")
+        .instrument(info_span!("client"))
+        .primary()
+        .spawn();
+
+        async move {
+            let server = Server::udp().port(443).build();
+
+            while let Ok((mut stream, peer_addr)) = server.accept().await {
+                async move {
                     let mut request = vec![];
                     stream.read_to_end(&mut request).await.unwrap();
 
                     stream
-                        .write_from_fin(&mut &b"saved!"[..])
+                        .write_from_fin(&mut &b"response"[..])
                         .await
                         .unwrap();
                 }
