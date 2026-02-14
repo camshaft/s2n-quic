@@ -694,6 +694,9 @@ where
 
                         self.any_valid_packets = true;
                         self.remote_addr = *remote_addr;
+                        
+                        // Update peer activity timestamp to reset idle timer
+                        self.shared.on_peer_activity();
 
                         if !matches!(self.handshake, handshake::State::Finished) {
                             // we got a valid stream packet
