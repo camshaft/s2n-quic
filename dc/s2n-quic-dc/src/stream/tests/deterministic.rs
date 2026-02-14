@@ -464,7 +464,7 @@ fn keep_alive_disabled_times_out() {
         async move {
             let server = Server::udp().port(443).build();
 
-            while let Ok((mut _stream, peer_addr)) = server.accept().await {
+            while let Ok((_stream, peer_addr)) = server.accept().await {
                 async move {
                     // Don't do anything, just let the stream idle
                     120.s().sleep().await;
