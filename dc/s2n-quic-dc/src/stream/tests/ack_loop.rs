@@ -9,23 +9,30 @@ use core::sync::atomic::Ordering;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::{info_span, Instrument};
 
-/// Test that demonstrates the ACK transmission loop bug.
+/// Test that investigates ACK transmission behavior with idle timer gating.
 /// 
-/// With needs_transmission("new_packet") uncommented, the receiver sends an ACK
-/// for every packet received. When the client continuously sends data, this causes
-/// the receiver to continuously wake up and transmit ACKs, creating a tight loop.
+/// This test validates whether moving needs_transmission("new_packet") inside the
+/// idle timer update conditional prevents excessive ACK transmissions.
 /// 
-/// This test proves the bug by:
+/// Test behavior:
 /// 1. Client sends continuous stream of small packets (50 writes)
 /// 2. Server receives packets and tracks ACK transmissions via event subscriber
-/// 3. Asserts that ACK count is excessive (demonstrating the loop)
+/// 3. Measures actual ACK count to compare with baseline
 ///
-/// **CURRENT STATUS**: This test FAILS, proving the bug exists.
-/// With the bug: Test shows ~95 ACK packets sent for ~50 data packets (almost 2:1 ratio!)
-/// Expected after fix: ACKs should be batched/throttled to < 10 total ACKs
+/// **FINDING**: Moving the ACK call inside the idle timer check does NOT reduce ACKs!
+/// - Baseline (ACK on every packet, outside if): ~95 ACKs for ~50 data packets
+/// - With idle timer gating (ACK inside if): Still ~95 ACKs for ~50 data packets
+/// 
+/// **ROOT CAUSE**: The idle timer if condition is true for all normal data packets:
+/// - Condition: `state == Recv || state == SizeKnown || packet.stream_offset() == 0`
+/// - During normal reception, state is Recv/SizeKnown, so condition always passes
+/// - Therefore, moving ACK call inside the if doesn't gate anything in practice
+///
+/// **CONCLUSION**: The real bug is not about WHERE the ACK call is placed, but that
+/// needs_transmission() is called on EVERY packet without any batching/throttling.
 #[test]
-#[should_panic(expected = "ACK loop detected")]
-fn ack_loop_reproduction() {
+#[should_panic(expected = "Excessive ACK transmissions")]
+fn ack_transmission_with_idle_timer_gating() {
     sim(|| {
         async move {
             let client = Client::builder().build();
@@ -67,17 +74,20 @@ fn ack_loop_reproduction() {
                     // Check how many ACK control packets were transmitted by the receiver
                     let ack_count = server_subscriber.stream_control_packet_transmitted.load(Ordering::Relaxed);
                     
-                    // With the bug: Every received data packet triggers an ACK transmission
-                    // The client sends ~50 packets, so we'd expect ~50+ ACKs
-                    // Without the bug: ACKs should be batched or sent less frequently
+                    // With ACK call inside idle timer check: ACKs should be reasonable
+                    // Without the fix: Every packet triggers ACK = ~95 ACKs for ~50 packets
+                    // With the fix: ACKs should be batched/throttled = < 20 ACKs
                     
-                    // This assertion will FAIL with the current code, proving the bug exists
-                    // When fixed, ACK count should be much lower (< 10)
+                    tracing::info!(
+                        ack_count,
+                        "ACK control packets transmitted for ~50 data packets"
+                    );
+                    
                     assert!(
-                        ack_count < 10,
-                        "ACK loop detected! Sent {} ACK packets for ~50 data packets. \
-                         Expected < 10 ACKs with proper batching. \
-                         This proves needs_transmission('new_packet') on every packet causes excessive ACKs.",
+                        ack_count < 20,
+                        "Excessive ACK transmissions! Sent {} ACK packets for ~50 data packets. \
+                         Expected < 20 ACKs with idle timer gating. \
+                         (Without fix, this was ~95 ACKs showing 2:1 ratio)",
                         ack_count
                     );
                 }
