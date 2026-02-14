@@ -10,6 +10,7 @@ mod behavior;
 mod cardinality;
 mod deterministic;
 mod idle_timeout;
+mod keep_alive;
 mod key_update;
 mod request_response;
 mod restart;
