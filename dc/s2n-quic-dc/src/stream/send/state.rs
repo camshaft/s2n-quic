@@ -1322,7 +1322,7 @@ impl State {
                 let data_blocked = self.max_data.try_transmit_data_blocked();
                 let reset_frame = self.reset.try_transmit();
 
-                let ping = if self.pto.transmissions() > 0 {
+                let ping = if self.pto.transmissions() > 0 || self.keep_alive.is_queued() {
                     Some(frame::Ping)
                 } else {
                     None
