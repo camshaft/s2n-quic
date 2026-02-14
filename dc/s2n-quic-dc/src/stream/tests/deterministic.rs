@@ -384,7 +384,7 @@ fn lost_flow_increase() {
 }
 
 /// Test that a stream with keep alive enabled on the client side stays alive
-/// for several minutes without timing out due to idle timeout.
+/// while the client is idle doing expensive work (simulated by sleep).
 #[test]
 fn keep_alive_client_only() {
     sim(|| {
@@ -395,18 +395,21 @@ fn keep_alive_client_only() {
             // Enable keep alive on the client stream only
             stream.keep_alive(true);
 
-            // Send periodic small writes to verify stream stays alive over 3 minutes
-            for i in 0..36 {
-                5.s().sleep().await;
-                stream.write_all(&[i]).await.unwrap();
-            }
+            // Send initial request
+            stream.write_all(b"request").await.unwrap();
 
+            // Client is idle for 3 minutes doing expensive work
+            // Keep alive should maintain the connection
+            180.s().sleep().await;
+
+            // After idle period, send another message to verify stream is still alive
+            stream.write_all(b"done").await.unwrap();
             stream.shutdown().await.unwrap();
 
             let mut response = vec![];
             stream.read_to_end(&mut response).await.unwrap();
 
-            assert_eq!(response.len(), 36);
+            assert_eq!(response, b"got it"[..]);
         }
         .group("client")
         .instrument(info_span!("client"))
@@ -422,7 +425,7 @@ fn keep_alive_client_only() {
                     let mut request = vec![];
                     stream.read_to_end(&mut request).await.unwrap();
 
-                    stream.write_all(&request).await.unwrap();
+                    stream.write_from_fin(&mut &b"got it"[..]).await.unwrap();
                 }
                 .instrument(info_span!("stream", ?peer_addr))
                 .primary()
@@ -436,7 +439,7 @@ fn keep_alive_client_only() {
 }
 
 /// Test that a stream with keep alive enabled on the server side stays alive
-/// for several minutes without timing out due to idle timeout.
+/// while the server is idle doing expensive work (simulated by sleep).
 #[test]
 fn keep_alive_server_only() {
     sim(|| {
@@ -445,18 +448,15 @@ fn keep_alive_server_only() {
             let mut stream = client.connect_sim("server:443").await.unwrap();
 
             // Client does NOT enable keep alive
-            // Send periodic small writes to verify stream stays alive over 3 minutes
-            for i in 0..36 {
-                5.s().sleep().await;
-                stream.write_all(&[i]).await.unwrap();
-            }
-
+            // Send request normally
+            stream.write_all(b"request").await.unwrap();
             stream.shutdown().await.unwrap();
 
+            // Wait for server's response
             let mut response = vec![];
             stream.read_to_end(&mut response).await.unwrap();
 
-            assert_eq!(response.len(), 36);
+            assert_eq!(response, b"processed"[..]);
         }
         .group("client")
         .instrument(info_span!("client"))
@@ -474,7 +474,11 @@ fn keep_alive_server_only() {
                     let mut request = vec![];
                     stream.read_to_end(&mut request).await.unwrap();
 
-                    stream.write_all(&request).await.unwrap();
+                    // Server takes a long time to process (3 minutes)
+                    // Keep alive should maintain the connection
+                    180.s().sleep().await;
+
+                    stream.write_from_fin(&mut &b"processed"[..]).await.unwrap();
                 }
                 .instrument(info_span!("stream", ?peer_addr))
                 .primary()
@@ -499,13 +503,16 @@ fn keep_alive_enable_then_disable_times_out() {
             // Enable keep alive initially
             stream.keep_alive(true);
 
-            // Wait for 1 minute to show it's working
+            // Wait for 1 minute while idle to show keep alive is working
             60.s().sleep().await;
+
+            // Write to verify we haven't timed out yet
+            stream.write_all(b"still alive").await.unwrap();
 
             // Disable keep alive
             stream.keep_alive(false);
 
-            // Wait longer than the idle timeout (30s)
+            // Wait longer than the idle timeout (60s > 30s timeout)
             60.s().sleep().await;
 
             // Try to send a message - this should fail because the stream timed out
@@ -520,12 +527,17 @@ fn keep_alive_enable_then_disable_times_out() {
         async move {
             let server = Server::udp().port(443).build();
 
-            while let Ok((stream, peer_addr)) = server.accept().await {
+            while let Ok((mut stream, peer_addr)) = server.accept().await {
                 async move {
-                    // Keep stream alive to avoid dropping it immediately
-                    let _stream = stream;
-                    // Don't do anything, just hold the stream
-                    200.s().sleep().await;
+                    // Server reads the first message
+                    let mut buf = [0u8; 100];
+                    let result = stream.read(&mut buf).await;
+                    assert!(result.is_ok(), "Should read first message");
+
+                    // Server waits, expecting the connection to timeout
+                    // After client disables keep alive, the stream should timeout
+                    let result = stream.read(&mut buf).await;
+                    assert!(result.is_err(), "Stream should timeout on server side");
                 }
                 .instrument(info_span!("stream", ?peer_addr))
                 .primary()
@@ -555,13 +567,11 @@ fn keep_alive_enabled_near_timeout() {
             // Enable keep alive just before timeout (10s before the 30s timeout)
             stream.keep_alive(true);
 
-            // Wait another 2 minutes with keep alive preventing timeout
-            // Send periodic writes to verify stream stays alive
-            for _ in 0..24 {
-                5.s().sleep().await;
-                stream.write_all(b"x").await.unwrap();
-            }
+            // Wait another 2 minutes while idle with keep alive preventing timeout
+            120.s().sleep().await;
 
+            // Send a message to verify stream is still alive
+            stream.write_all(b"still here").await.unwrap();
             stream.shutdown().await.unwrap();
 
             let mut response = vec![];
@@ -597,6 +607,7 @@ fn keep_alive_enabled_near_timeout() {
 }
 
 /// Test that keep alive is no longer active after the stream is shutdown.
+/// This verifies that without keep alive, both client and server timeout.
 #[test]
 fn keep_alive_inactive_after_shutdown() {
     sim(|| {
@@ -617,8 +628,8 @@ fn keep_alive_inactive_after_shutdown() {
 
             assert_eq!(response, b"response"[..]);
 
-            // After shutdown completes, the stream should close gracefully
-            // and not continue sending keep alive PING frames
+            // After shutdown completes, the stream is closed
+            // Keep alive should no longer be sending PING frames
         }
         .group("client")
         .instrument(info_span!("client"))
@@ -637,6 +648,57 @@ fn keep_alive_inactive_after_shutdown() {
                         .write_from_fin(&mut &b"response"[..])
                         .await
                         .unwrap();
+                }
+                .instrument(info_span!("stream", ?peer_addr))
+                .primary()
+                .spawn();
+            }
+        }
+        .group("server")
+        .instrument(info_span!("server"))
+        .spawn();
+    });
+}
+
+/// Test that without keep alive, a stream times out when both sides are idle.
+/// This verifies the negative case - that keep alive is necessary.
+#[test]
+fn keep_alive_required_for_long_idle() {
+    sim(|| {
+        async move {
+            let client = Client::builder().build();
+            let mut stream = client.connect_sim("server:443").await.unwrap();
+
+            // Client does NOT enable keep alive
+            stream.write_all(b"request").await.unwrap();
+
+            // Client is idle for longer than idle timeout
+            60.s().sleep().await;
+
+            // Try to write - should fail due to timeout
+            let result = stream.write_all(b"more data").await;
+            assert!(result.is_err(), "Stream should have timed out without keep alive");
+        }
+        .group("client")
+        .instrument(info_span!("client"))
+        .primary()
+        .spawn();
+
+        async move {
+            let server = Server::udp().port(443).build();
+
+            while let Ok((mut stream, peer_addr)) = server.accept().await {
+                async move {
+                    // Server does NOT enable keep alive
+                    let mut buf = [0u8; 100];
+                    
+                    // Read first message
+                    let result = stream.read(&mut buf).await;
+                    assert!(result.is_ok(), "Should read first message");
+
+                    // Server waits for more data but it times out
+                    let result = stream.read(&mut buf).await;
+                    assert!(result.is_err(), "Stream should timeout on server side");
                 }
                 .instrument(info_span!("stream", ?peer_addr))
                 .primary()
