@@ -514,7 +514,7 @@ impl State {
 
         // if we got a new packet then we'll need to transmit an ACK
         // TODO make this smarter to avoid sending too many ACKs
-        // self.needs_transmission("new_packet");
+        self.needs_transmission("new_packet");
 
         // update the idle timer since we received a valid packet
         if matches!(self.state, Receiver::Recv | Receiver::SizeKnown)
