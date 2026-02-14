@@ -607,7 +607,8 @@ fn keep_alive_enabled_near_timeout() {
 }
 
 /// Test that keep alive is no longer active after the stream is shutdown.
-/// This verifies that without keep alive, both client and server timeout.
+/// This verifies that after client shutdown, keep_alive becomes inactive and
+/// the connection will timeout if the server takes too long.
 #[test]
 fn keep_alive_inactive_after_shutdown() {
     sim(|| {
@@ -622,14 +623,11 @@ fn keep_alive_inactive_after_shutdown() {
             stream.write_all(b"request").await.unwrap();
             stream.shutdown().await.unwrap();
 
-            // Read response
+            // After shutdown, keep alive becomes inactive
+            // Server takes too long to respond, so the connection times out
             let mut response = vec![];
-            stream.read_to_end(&mut response).await.unwrap();
-
-            assert_eq!(response, b"response"[..]);
-
-            // After shutdown completes, the stream is closed
-            // Keep alive should no longer be sending PING frames
+            let result = stream.read_to_end(&mut response).await;
+            assert!(result.is_err(), "Client read should timeout after keep alive became inactive");
         }
         .group("client")
         .instrument(info_span!("client"))
@@ -644,10 +642,13 @@ fn keep_alive_inactive_after_shutdown() {
                     let mut request = vec![];
                     stream.read_to_end(&mut request).await.unwrap();
 
-                    stream
-                        .write_from_fin(&mut &b"response"[..])
-                        .await
-                        .unwrap();
+                    // Server sleeps for longer than idle timeout
+                    // Because client's keep alive is now inactive after shutdown,
+                    // the connection will timeout
+                    60.s().sleep().await;
+
+                    let result = stream.write_from_fin(&mut &b"response"[..]).await;
+                    assert!(result.is_err(), "Server write should fail due to timeout");
                 }
                 .instrument(info_span!("stream", ?peer_addr))
                 .primary()
