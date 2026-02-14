@@ -400,7 +400,7 @@ fn keep_alive_client_only() {
                 5.s().sleep().await;
                 stream.write_all(&[i]).await.unwrap();
             }
-            
+
             stream.shutdown().await.unwrap();
 
             let mut response = vec![];
@@ -445,12 +445,12 @@ fn keep_alive_server_only() {
             let mut stream = client.connect_sim("server:443").await.unwrap();
 
             // Client does NOT enable keep alive
-            // Send periodic small writes to verify stream stays alive over 3 minutes  
+            // Send periodic small writes to verify stream stays alive over 3 minutes
             for i in 0..36 {
                 5.s().sleep().await;
                 stream.write_all(&[i]).await.unwrap();
             }
-            
+
             stream.shutdown().await.unwrap();
 
             let mut response = vec![];
@@ -548,7 +548,7 @@ fn keep_alive_enabled_near_timeout() {
 
             // Send some initial data to establish the stream
             stream.write_all(b"start").await.unwrap();
-            
+
             // Wait until we're close to the idle timeout (20s out of 30s)
             20.s().sleep().await;
 
@@ -561,7 +561,7 @@ fn keep_alive_enabled_near_timeout() {
                 5.s().sleep().await;
                 stream.write_all(b"x").await.unwrap();
             }
-            
+
             stream.shutdown().await.unwrap();
 
             let mut response = vec![];
