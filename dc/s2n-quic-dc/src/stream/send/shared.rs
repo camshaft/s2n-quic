@@ -3,11 +3,10 @@
 
 use crate::{
     packet::stream::PacketSpace,
-    socket::send::completion::{Completer, Completion},
     stream::{
         packet_number,
         send::{flow, path, queue::Queue, state::transmission},
-        shared::{CompletionQueue, ShutdownKind},
+        shared::{CompletionQueue, Half, ShutdownKind},
     },
     task::waker::worker::Waker as WorkerWaker,
 };
@@ -17,7 +16,7 @@ use core::{
 };
 use crossbeam_queue::SegQueue;
 use s2n_quic_core::recovery::bandwidth::Bandwidth;
-use std::sync::{Arc, Weak};
+use std::sync::Weak;
 use tracing::trace;
 
 #[derive(Debug)]
@@ -43,7 +42,7 @@ pub struct State {
     /// We use an unbounded sender since we already rely on flow control to apply backpressure
     worker_queue: SegQueue<Message>,
     pub transmission_queue: transmission::Queue,
-    pub completion_handle: CompletionQueue<Weak<dyn AsShared>>,
+    pub completion_handle: CompletionQueue<Weak<dyn transmission::Notify>>,
 }
 
 impl fmt::Debug for State {
@@ -53,30 +52,6 @@ impl fmt::Debug for State {
             .field("packet_number", &self.packet_number)
             .field("path", &self.path)
             .finish()
-    }
-}
-
-pub trait AsShared: 'static + Send + Sync {
-    fn as_shared(&self) -> &State;
-}
-
-impl Completion<transmission::PacketInfo, transmission::Meta> for Weak<dyn AsShared> {
-    type Completer = Arc<dyn AsShared>;
-
-    fn upgrade(&self) -> Option<Self::Completer> {
-        Weak::upgrade(self)
-    }
-}
-
-impl Completer<transmission::PacketInfo, transmission::Meta, Weak<dyn AsShared>>
-    for Arc<dyn AsShared>
-{
-    fn complete(self, transmission: transmission::Entry) {
-        let shared = self.as_shared();
-        shared
-            .transmission_queue
-            .complete_transmission(transmission);
-        shared.worker_waker.wake();
     }
 }
 
@@ -148,6 +123,7 @@ impl State {
             .transmission_queue
             .alloc_entry(batch_size, completion_queue);
         entry.meta.packet_space = packet_space;
+        entry.meta.half = Half::Write;
         entry
     }
 }

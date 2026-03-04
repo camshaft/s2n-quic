@@ -317,7 +317,8 @@ where
     // Set a self-referential reference for completion queues
     let weak = Arc::downgrade(&shared);
     unsafe {
-        shared.sender.completion_handle.set(weak);
+        shared.sender.completion_handle.set(weak.clone());
+        shared.receiver.completion_handle.set(weak);
     }
 
     // spawn the read worker

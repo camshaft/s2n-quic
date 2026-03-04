@@ -10,6 +10,7 @@ use crate::{
     stream::{
         packet_number,
         send::{error::Error, flow, path, state::transmission},
+        shared::Half,
         tls::S2nTlsConnection,
         TransportFeatures,
     },
@@ -174,6 +175,7 @@ impl State {
                 let meta = transmission::Meta {
                     has_more_app_data,
                     packet_space: PacketSpace::Stream,
+                    half: Half::Write,
                     final_offset,
                     span: Default::default(),
                 };

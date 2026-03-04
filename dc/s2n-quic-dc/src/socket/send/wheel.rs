@@ -340,7 +340,7 @@ mod tests {
             total_len: payload_len,
             transmission_time: None,
             meta: payload_len,
-            completion: None,
+            completion: (),
         }
     }
 

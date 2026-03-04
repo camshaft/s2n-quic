@@ -382,4 +382,3 @@ fn lost_flow_increase() {
             packets.sim();
         });
 }
-

@@ -106,25 +106,24 @@ where
     pub common: Common<Subscriber, Clk>,
 }
 
-impl<S, Clk> recv::AsShared for Shared<S, Clk>
+impl<S, Clk> crate::stream::send::state::transmission::Notify for Shared<S, Clk>
 where
     S: event::Subscriber,
     Clk: Clock + ?Sized,
 {
-    #[inline]
-    fn as_shared(&self) -> &recv::State {
-        &self.receiver
-    }
-}
-
-impl<S, Clk> send::AsShared for Shared<S, Clk>
-where
-    S: event::Subscriber,
-    Clk: Clock + ?Sized,
-{
-    #[inline]
-    fn as_shared(&self) -> &send::State {
-        &self.sender
+    fn complete(&self, entry: crate::stream::send::state::transmission::Entry) {
+        match entry.meta.half {
+            Half::Write => {
+                self.sender.transmission_queue.complete_transmission(entry);
+                self.sender.worker_waker.wake();
+            }
+            Half::Read => {
+                self.receiver
+                    .transmission_queue
+                    .complete_transmission(entry);
+                self.receiver.worker_waker.wake();
+            }
+        }
     }
 }
 

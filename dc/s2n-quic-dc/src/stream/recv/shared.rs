@@ -7,8 +7,8 @@ use crate::{
     packet::{stream, Packet},
     stream::{
         recv::{self, buffer::Buffer as _},
-        send::application::state::PushError,
-        shared::{self, handshake, AcceptState, ArcShared, ShutdownKind},
+        send::{application::state::PushError, state::transmission},
+        shared::{self, handshake, AcceptState, ArcShared, CompletionQueue, ShutdownKind},
         socket::{self, Socket},
         Actor, TransportFeatures,
     },
@@ -124,6 +124,8 @@ pub struct State {
     application_epoch: AtomicU64,
     application_state: AtomicU8,
     pub worker_waker: WorkerWaker,
+    pub transmission_queue: transmission::Queue,
+    pub completion_handle: CompletionQueue<transmission::Completion>,
     is_owned_socket: bool,
 }
 
@@ -156,6 +158,8 @@ impl State {
             application_epoch: AtomicU64::new(0),
             application_state: AtomicU8::new(0),
             worker_waker: Default::default(),
+            transmission_queue: Default::default(),
+            completion_handle: CompletionQueue::uninit(),
             is_owned_socket,
         }
     }
@@ -258,6 +262,20 @@ impl State {
         };
         let _ = ready!(inner.poll_fill_recv_buffer(cx, Actor::Worker, socket, clock, subscriber));
         Poll::Ready(())
+    }
+
+    pub fn alloc_transmission(
+        &self,
+        batch_size: usize,
+        packet_space: crate::packet::stream::PacketSpace,
+    ) -> transmission::Entry {
+        let completion_queue = || unsafe { self.completion_handle.load() };
+        let mut entry = self
+            .transmission_queue
+            .alloc_entry(batch_size, completion_queue);
+        entry.meta.packet_space = packet_space;
+        entry.meta.half = shared::Half::Read;
+        entry
     }
 
     #[inline]

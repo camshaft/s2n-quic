@@ -22,7 +22,7 @@ impl<Info, Meta> Completion<Info, Meta> for () {
     type Completer = ();
 
     fn upgrade(&self) -> Option<Self::Completer> {
-        None
+        Some(())
     }
 }
 
@@ -43,7 +43,6 @@ pub struct CompleteTransmission<'a, Info, Meta> {
 
 pub struct Queue<Info, Meta, Completion> {
     completion: intrusive_queue::Queue<Transmission<Info, Meta, Completion>>,
-    free: intrusive_queue::Queue<Transmission<Info, Meta, Completion>>,
     is_open: AtomicBool,
 }
 
@@ -52,7 +51,6 @@ impl<Info, Meta, Completion> Default for Queue<Info, Meta, Completion> {
     fn default() -> Self {
         Self {
             completion: intrusive_queue::Queue::new(),
-            free: intrusive_queue::Queue::new(),
             is_open: true.into(),
         }
     }
@@ -68,25 +66,14 @@ where
         batch_size: usize,
         completion_queue: impl FnOnce() -> Completion,
     ) -> Entry<Info, Meta, Completion> {
-        let mut entry = self.free.pop_front().unwrap_or_else(|| {
-            let transmission = Transmission {
-                descriptors: Vec::with_capacity(batch_size),
-                total_len: 0,
-                meta: Default::default(),
-                transmission_time: None,
-                completion: None,
-            };
-            Entry::new(transmission)
-        });
-
-        debug_assert!(entry.descriptors.is_empty());
-        entry.descriptors.reserve(batch_size);
-
-        if entry.completion.is_none() {
-            entry.completion = Some(completion_queue());
-        }
-
-        entry
+        let transmission = Transmission {
+            descriptors: Vec::with_capacity(batch_size),
+            total_len: 0,
+            meta: Default::default(),
+            transmission_time: None,
+            completion: completion_queue(),
+        };
+        Entry::new(transmission)
     }
 
     pub fn close(&self) {
@@ -127,9 +114,6 @@ where
                         });
                     }
                 }
-                transmission.total_len = 0;
-                transmission.meta = Default::default();
-                self.free.push_back(transmission);
                 count += 1;
                 did_process_transmission = true;
             }

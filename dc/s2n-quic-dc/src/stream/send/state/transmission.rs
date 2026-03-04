@@ -7,14 +7,32 @@ use crate::{
         pool::descriptor,
         send::{self, completion},
     },
-    stream::send::shared,
+    stream::shared::Half,
 };
 use bitflags::bitflags;
 use core::{fmt, ops::Bound};
 use s2n_quic_core::{inet::ExplicitCongestionNotification, time::Timestamp, varint::VarInt};
 use std::sync::Weak;
 
-pub type Completion = Weak<dyn crate::stream::send::shared::AsShared>;
+pub type Completion = Weak<dyn Notify>;
+
+pub trait Notify: 'static + Send + Sync {
+    fn complete(&self, entry: Entry);
+}
+
+impl completion::Completion<PacketInfo, Meta> for Completion {
+    type Completer = std::sync::Arc<dyn Notify>;
+
+    fn upgrade(&self) -> Option<Self::Completer> {
+        Weak::upgrade(self)
+    }
+}
+
+impl completion::Completer<PacketInfo, Meta, Completion> for std::sync::Arc<dyn Notify> {
+    fn complete(self, entry: Entry) {
+        Notify::complete(&*self, entry);
+    }
+}
 
 pub type Entry = send::transmission::Entry<PacketInfo, Meta, Completion>;
 
@@ -33,7 +51,7 @@ pub struct Event {
     pub meta: Meta,
 }
 
-pub type Queue = completion::Queue<PacketInfo, Meta, Weak<dyn shared::AsShared>>;
+pub type Queue = completion::Queue<PacketInfo, Meta, Weak<dyn Notify>>;
 pub type CompleteTransmission<'a> = completion::CompleteTransmission<'a, PacketInfo, Meta>;
 
 #[derive(Clone)]
@@ -62,6 +80,7 @@ pub struct Meta {
     pub packet_space: PacketSpace,
     pub has_more_app_data: bool,
     pub final_offset: Option<VarInt>,
+    pub half: Half,
     pub span: SenderSpan,
 }
 
@@ -71,7 +90,8 @@ impl Default for Meta {
             packet_space: PacketSpace::Stream,
             has_more_app_data: false,
             final_offset: None,
-            span: Default::default(),
+            half: Half::Write,
+            span: SenderSpan::default(),
         }
     }
 }

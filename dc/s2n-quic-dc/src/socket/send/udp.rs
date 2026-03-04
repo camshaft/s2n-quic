@@ -48,14 +48,28 @@ where
         }
     }
 
+    /// Attempts to transmit an entry on the socket.
+    ///
+    /// Returns `true` if the packet was actually sent, `false` if the completion
+    /// channel could not be upgraded (the sender has gone away) and the packet
+    /// was skipped.
     fn transmit<S: Socket, Clk: s2n_quic_core::time::Clock>(
         &self,
         mut entry: Entry<Info, Meta, C>,
         socket: &S,
         clock: &Clk,
-    ) where
+    ) -> bool
+    where
         Meta: transmission::Meta<Info = Info>,
     {
+        // Try to upgrade the completion channel before sending.
+        // If the upgrade fails, the sender has gone away and there's no point
+        // in sending the packet.
+        let Some(completion) = entry.completion.upgrade() else {
+            self.queue.on_send();
+            return false;
+        };
+
         // Record the transmission time to report accurate transmission
         let now = clock.get_time();
         entry.transmission_time = Some(now);
@@ -67,9 +81,9 @@ where
 
         self.queue.on_send();
 
-        if let Some(completion) = entry.completion.as_ref().and_then(|c| c.upgrade()) {
-            completion.complete(entry);
-        }
+        completion.complete(entry);
+
+        true
     }
 }
 
@@ -181,8 +195,13 @@ pub async fn non_blocking<S, T, Info, Meta, C, W, const GRANULARITY_US: u64>(
                     }
 
                     // Successfully acquired all credits, send the packet
-                    reporter.on_send(entry.total_len as _);
-                    wheel.transmit(entry, &socket, &now);
+                    let total_len = entry.total_len as u64;
+                    if wheel.transmit(entry, &socket, &now) {
+                        reporter.on_send(total_len);
+                    } else {
+                        // The sender went away; restore the bucket credits
+                        bucket.restore(total_len);
+                    }
                 }
 
                 // Process all packets in the queue
@@ -201,8 +220,13 @@ pub async fn non_blocking<S, T, Info, Meta, C, W, const GRANULARITY_US: u64>(
                     }
 
                     // Successfully acquired all credits, send the packet
-                    reporter.on_send(entry.total_len as _);
-                    wheel.transmit(entry, &socket, &now);
+                    let total_len = entry.total_len as u64;
+                    if wheel.transmit(entry, &socket, &now) {
+                        reporter.on_send(total_len);
+                    } else {
+                        // The sender went away; restore the bucket credits
+                        bucket.restore(total_len);
+                    }
                 }
 
                 if let Some(next_sleep) = next_sleep {
@@ -352,6 +376,20 @@ impl LeakyBucketInstance {
         self.last_refill = now;
     }
 
+    /// Restores credits that were previously taken but not actually used
+    /// (e.g., when a transmission was skipped because the sender went away).
+    fn restore(&mut self, bytes: u64) {
+        let bytes = bytes as f64;
+        if self.debt > 0.0 {
+            let debt_restored = bytes.min(self.debt);
+            self.debt -= debt_restored;
+            let remaining = bytes - debt_restored;
+            self.bytes = (self.bytes + remaining).min(self.max_size);
+        } else {
+            self.bytes = (self.bytes + bytes).min(self.max_size);
+        }
+    }
+
     fn take(&mut self, bytes: u64, now: Timestamp) -> ControlFlow<Timestamp> {
         self.refill(now);
 
@@ -448,7 +486,7 @@ mod tests {
                 priority,
                 payload_len,
             },
-            completion: None,
+            completion: (),
         }
     }
 

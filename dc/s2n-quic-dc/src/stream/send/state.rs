@@ -17,6 +17,7 @@ use crate::{
             error::{self, Error},
             filter::Filter,
         },
+        shared::Half,
         DEFAULT_IDLE_TIMEOUT,
     },
 };
@@ -1246,6 +1247,7 @@ impl State {
                     packet_space: PacketSpace::Recovery,
                     has_more_app_data: true,
                     final_offset: self.fin.value(),
+                    half: Half::Write,
                     span: Default::default(),
                 };
 
@@ -1387,6 +1389,7 @@ impl State {
                     packet_space: PacketSpace::Recovery,
                     has_more_app_data: false,
                     final_offset,
+                    half: Half::Write,
                     span: Default::default(),
                 };
 

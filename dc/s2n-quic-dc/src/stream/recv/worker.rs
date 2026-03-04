@@ -26,6 +26,10 @@ use tracing::{debug, trace};
 
 const INITIAL_TIMEOUT: Duration = Duration::from_millis(2);
 
+/// Maximum number of ACK packets that the recv worker can have in flight at any time.
+/// This prevents the receiver from overwhelming the send queue with unbounded ACKs.
+const MAX_INFLIGHT_ACKS: usize = 2;
+
 mod waiting {
     use s2n_quic_core::state::{event, is};
 
@@ -86,6 +90,8 @@ where
     socket: S,
     transmission_buffer: transmission::Builder,
     accept_state: AcceptState,
+    /// Number of ACK packets currently in flight (sent but not yet completed)
+    inflight_acks: usize,
 }
 
 impl<S, Sub> Worker<S, Sub>
@@ -126,6 +132,7 @@ where
             socket,
             transmission_buffer: Default::default(),
             accept_state: AcceptState::Waiting,
+            inflight_acks: 0,
         }
     }
 
@@ -470,8 +477,26 @@ where
         Ok(())
     }
 
+    /// Drains the receiver's completion queue to reclaim inflight ACK credits.
+    #[inline]
+    fn drain_completion_queue(&mut self) {
+        let drained = self
+            .shared
+            .receiver
+            .transmission_queue
+            .drain_completion_queue(|_transmission| {
+                // nothing to do with the completed transmission
+            });
+        self.inflight_acks = self.inflight_acks.saturating_sub(drained);
+    }
+
     #[inline]
     fn poll_flush_socket(&mut self, _cx: &mut Context) -> Poll<io::Result<()>> {
+        // Drain the completion queue to reclaim inflight credits before sending
+        //
+        // We do this even without queued transmissions to ensure notifications are cleaned up
+        self.drain_completion_queue();
+
         let count = self.transmission_buffer.len();
         ensure!(count > 0, Poll::Ready(Ok(())));
 
@@ -481,10 +506,16 @@ where
             debug_assert_eq!(self.transmission_buffer.len(), 2);
         }
 
-        for (mut entry, _application_len) in self.transmission_buffer.drain() {
-            // don't subscribe to completion events
-            entry.completion = None;
+        let capacity = MAX_INFLIGHT_ACKS.saturating_sub(self.inflight_acks);
+
+        if capacity == 0 {
+            return Poll::Ready(Ok(()));
+        }
+
+        let count = capacity.min(count);
+        for (entry, _application_len) in self.transmission_buffer.drain(..count) {
             self.socket.send_transmission(entry);
+            self.inflight_acks += 1;
         }
 
         Ok(()).into()
@@ -560,12 +591,13 @@ where
             packet_space: PacketSpace::Recovery,
             has_more_app_data: false,
             final_offset: None,
+            half: crate::stream::shared::Half::Read,
             span: Default::default(),
         };
 
         let transmission_alloc = || {
             self.shared
-                .sender
+                .receiver
                 .alloc_transmission(max_segments, PacketSpace::Recovery)
         };
 

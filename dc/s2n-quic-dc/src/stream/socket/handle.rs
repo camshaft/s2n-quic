@@ -65,12 +65,17 @@ pub trait Socket: 'static + Send + Sync {
 
     #[inline]
     fn send_transmission(&self, msg: Transmission) {
+        // Try to upgrade the completion channel before sending.
+        // If the upgrade fails, the sender has gone away and there's no point
+        // in sending the packet.
+        let Some(completion) = msg.completion.upgrade() else {
+            return;
+        };
+
         msg.send_with(|addr, ecn, iov| {
             let _ = self.try_send(addr, ecn, iov);
         });
-        if let Some(completion) = msg.completion.as_ref().and_then(|c| c.upgrade()) {
-            completion.complete(msg);
-        }
+        completion.complete(msg);
     }
 
     #[inline]

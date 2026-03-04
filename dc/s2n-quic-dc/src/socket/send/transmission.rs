@@ -5,7 +5,7 @@ use crate::{
 };
 use core::fmt;
 use s2n_quic_core::{inet::ExplicitCongestionNotification, time::Timestamp};
-use std::{collections::VecDeque, io::IoSlice};
+use std::{collections::VecDeque, io::IoSlice, ops::RangeBounds};
 
 pub type Entry<Info, Meta, Completion> = queue::Entry<Transmission<Info, Meta, Completion>>;
 
@@ -21,7 +21,7 @@ pub struct Transmission<Info, Meta, Completion> {
     pub total_len: u16,
     pub meta: Meta,
     pub transmission_time: Option<Timestamp>,
-    pub completion: Option<Completion>,
+    pub completion: Completion,
 }
 
 impl<Info, M, C> Transmission<Info, M, C>
@@ -175,9 +175,12 @@ impl<Info, Meta, Completion> Builder<Info, Meta, Completion> {
         });
     }
 
-    pub fn drain(&mut self) -> impl Iterator<Item = (Entry<Info, Meta, Completion>, u16)> + '_ {
+    pub fn drain(
+        &mut self,
+        range: impl RangeBounds<usize>,
+    ) -> impl Iterator<Item = (Entry<Info, Meta, Completion>, u16)> + '_ {
         self.batches
-            .drain(..)
+            .drain(range)
             .map(|batch| (batch.entry, batch.application_len))
     }
 
