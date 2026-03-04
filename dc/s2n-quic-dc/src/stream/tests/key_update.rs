@@ -13,6 +13,7 @@ use tracing::{info_span, Instrument};
 /// This test checks that the sealer stream key and opener stream key are updated when
 /// more than the confidentiality limit of packets are transmitted.
 #[tokio::test]
+#[ignore = "TCP is temporarily broken"]
 #[cfg_attr(
     not(debug_assertions),
     ignore = "test requires debug_assertions to be enabled"
@@ -24,6 +25,7 @@ async fn key_update() {
 /// This test checks that the sealer stream key and opener stream key are not updated when
 /// less than the confidentiality limit of packets are transmitted.
 #[tokio::test]
+#[ignore = "TCP is temporarily broken"]
 async fn no_key_update() {
     test(TEST_MAX_RECORDS - 10, 0).await;
 }

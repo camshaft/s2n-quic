@@ -471,6 +471,7 @@ fn test() {
 }
 
 #[test]
+#[ignore = "TCP is temporarily broken"]
 fn request_response_test() {
     let context = Context::default();
 

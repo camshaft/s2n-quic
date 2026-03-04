@@ -343,8 +343,9 @@ mod tests {
         let mut clock = test_clock::Clock::default();
         let idle_timeout = Duration::from_secs(30);
 
+        // Timer fires at idle_timeout / IDLE_RATIO = 30/4 = 7.5s
         max_data.on_transmit(peer_value, &clock, idle_timeout, MAX_DATAGRAM_SIZE);
-        clock.inc_by(Duration::from_secs(10));
+        clock.inc_by(Duration::from_secs(5));
 
         assert_eq!(max_data.on_timeout(&clock, idle_timeout), Poll::Pending);
     }
@@ -484,9 +485,10 @@ mod tests {
         let mut clock = test_clock::Clock::default();
         let idle_timeout = Duration::from_secs(100);
 
+        // Timer fires at idle_timeout / IDLE_RATIO = 100/4 = 25s
         max_data.on_transmit(peer_value, &clock, idle_timeout, MAX_DATAGRAM_SIZE);
 
-        clock.inc_by(Duration::from_secs(49));
+        clock.inc_by(Duration::from_secs(24));
         assert_eq!(max_data.on_timeout(&clock, idle_timeout), Poll::Pending);
 
         clock.inc_by(Duration::from_secs(1));

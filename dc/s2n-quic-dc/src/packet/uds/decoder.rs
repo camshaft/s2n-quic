@@ -79,8 +79,7 @@ impl Packet {
             ));
         }
 
-        // let (application_params, buffer) = buffer.decode::<ApplicationParams>()?;
-        let application_params: ApplicationParams = (|| todo!())();
+        let (application_params, buffer) = buffer.decode::<ApplicationParams>()?;
 
         let (encode_time, buffer) = buffer.decode::<u64>()?;
 
