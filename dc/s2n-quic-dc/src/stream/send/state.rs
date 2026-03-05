@@ -433,9 +433,7 @@ impl State {
                             code: close.error_code,
                         }
                     } else {
-                        error::Kind::ApplicationError {
-                            error: close.error_code.into(),
-                        }
+                        error::Kind::from_connection_close(&close)
                     };
 
                     let error = error.err();

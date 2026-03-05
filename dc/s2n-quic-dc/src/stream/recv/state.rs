@@ -518,11 +518,10 @@ impl State {
                             code: close.error_code,
                         }
                     } else {
-                        error::Kind::ApplicationError {
-                            error: close.error_code.into(),
-                        }
-                    }
-                    .err();
+                        error::Kind::from_connection_close(&close)
+                    };
+
+                    let error = error.err();
                     self.on_error(error, Location::Remote, publisher);
                     return Err(error);
                 }
@@ -878,7 +877,7 @@ impl State {
 
             let frame = error
                 .error
-                .connection_close()
+                .as_connection_close()
                 .unwrap_or_else(|| s2n_quic_core::transport::Error::NO_ERROR.into());
 
             let encoding_size = frame.encoding_size().try_into().unwrap();

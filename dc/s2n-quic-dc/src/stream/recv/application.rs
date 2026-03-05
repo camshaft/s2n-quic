@@ -186,6 +186,8 @@ where
             let res = self.0.poll_read_into(cx, &mut out_buf);
 
             if res.is_pending() {
+                // Register the application waker so error notifications wake us
+                self.0.shared.wakers.read_app_waker.register(cx.waker());
                 debug_assert_eq!(
                     out_buf.written_len(),
                     0,

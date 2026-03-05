@@ -236,6 +236,8 @@ where
             return;
         }
 
+        tracing::debug!(%error, ?source, ?actor, "setting stream error");
+
         // Indicate that an error has been encountered
         self.sender.set_error_flag();
         self.receiver.set_error_flag();

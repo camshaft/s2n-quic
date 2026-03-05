@@ -4,7 +4,6 @@ use s2n_quic_core::{
     ensure, frame,
     state::{event, is},
     stream::state::Sender as SenderState,
-    varint::VarInt,
 };
 
 type ConnectionClose = frame::ConnectionClose<'static>;
@@ -56,25 +55,7 @@ impl ErrorState {
             return None;
         }
 
-        match self.error.kind {
-            // Don't send a frame if
-            Kind::IdleTimeout => None,
-            Kind::ApplicationError { error } => Some(frame::ConnectionClose {
-                error_code: VarInt::new(*error).unwrap(),
-                frame_type: None,
-                reason: None,
-            }),
-            Kind::TransportError { code } => Some(frame::ConnectionClose {
-                error_code: code,
-                frame_type: Some(VarInt::from_u16(0)),
-                reason: None,
-            }),
-            _ => Some(frame::ConnectionClose {
-                error_code: VarInt::from_u16(1),
-                frame_type: None,
-                reason: None,
-            }),
-        }
+        self.error.kind.as_connection_close()
     }
 }
 

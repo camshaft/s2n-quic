@@ -96,75 +96,8 @@ impl Error {
 
     /// Returns a `ConnectionClose` frame for this error, if one should be sent.
     #[inline]
-    pub fn connection_close(&self) -> Option<frame::ConnectionClose<'static>> {
-        use s2n_quic_core::transport;
-
-        fn from_code(code: u8) -> Option<frame::ConnectionClose<'static>> {
-            Some(frame::ConnectionClose {
-                error_code: VarInt::from_u8(code),
-                frame_type: None,
-                reason: None,
-            })
-        }
-
-        match self.kind {
-            // Don't send a close for idle timeout
-            Kind::IdleTimeout => None,
-            // We don't have working crypto keys so we can't respond
-            Kind::KeyReplayPrevented
-            | Kind::KeyReplayMaybePrevented { .. }
-            | Kind::UnknownPathSecret => None,
-
-            // Non-fatal recv errors that may be fatal for reliable transports
-            Kind::Decode
-            | Kind::Crypto(_)
-            | Kind::Duplicate
-            | Kind::CredentialMismatch { .. }
-            | Kind::StreamMismatch { .. }
-            | Kind::UnexpectedPacket { .. }
-            | Kind::UnexpectedRetransmission => Some(transport::Error::PROTOCOL_VIOLATION.into()),
-
-            Kind::NormalClose => from_code(Kind::NORMAL_CODE),
-            Kind::ApplicationPanic => from_code(Kind::PANIC_CODE),
-            Kind::AcceptQueueFull => from_code(Kind::ACCEPT_FULL_CODE),
-            Kind::MaxSojournTime => from_code(Kind::MAX_SOJOURN_TIME_CODE),
-            Kind::FlowReset => from_code(Kind::FLOW_RESET_CODE),
-
-            Kind::ApplicationError { error } => Some(frame::ConnectionClose {
-                error_code: VarInt::new(*error).unwrap(),
-                frame_type: None,
-                reason: None,
-            }),
-            Kind::TransportError { code } => Some(frame::ConnectionClose {
-                error_code: code,
-                frame_type: Some(VarInt::from_u16(0)),
-                reason: None,
-            }),
-
-            // Receiver-originated fatal errors
-            Kind::MaxDataExceeded => Some(transport::Error::FLOW_CONTROL_ERROR.into()),
-            Kind::InvalidFin | Kind::TruncatedTransport => {
-                Some(transport::Error::FINAL_SIZE_ERROR.into())
-            }
-            Kind::OutOfOrder { .. } => Some(transport::Error::STREAM_STATE_ERROR.into()),
-            Kind::OutOfRange => Some(transport::Error::STREAM_LIMIT_ERROR.into()),
-
-            // Sender API errors - these don't get connection close frames
-            Kind::PayloadTooLarge
-            | Kind::PacketBufferTooSmall
-            | Kind::StreamFinished
-            | Kind::FinalSizeChanged => None,
-
-            // All other fatal errors get a generic error code
-            Kind::PacketNumberExhaustion
-            | Kind::RetransmissionFailure
-            | Kind::FrameError { .. }
-            | Kind::FatalError => Some(frame::ConnectionClose {
-                error_code: VarInt::from_u16(1),
-                frame_type: None,
-                reason: None,
-            }),
-        }
+    pub fn as_connection_close(&self) -> Option<frame::ConnectionClose<'static>> {
+        self.kind.as_connection_close()
     }
 }
 
@@ -279,6 +212,88 @@ impl Kind {
     #[track_caller]
     pub(crate) fn err(self) -> Error {
         Error::new(self)
+    }
+
+    /// Returns a `ConnectionClose` frame for this error, if one should be sent.
+    #[inline]
+    pub(crate) fn as_connection_close(&self) -> Option<frame::ConnectionClose<'static>> {
+        use s2n_quic_core::transport;
+
+        fn from_code(code: u8) -> Option<frame::ConnectionClose<'static>> {
+            Some(frame::ConnectionClose {
+                error_code: VarInt::from_u8(code),
+                frame_type: None,
+                reason: None,
+            })
+        }
+
+        match self {
+            // Don't send a close for idle timeout
+            Kind::IdleTimeout => None,
+            // We don't have working crypto keys so we can't respond
+            Kind::KeyReplayPrevented
+            | Kind::KeyReplayMaybePrevented { .. }
+            | Kind::UnknownPathSecret => None,
+
+            // Non-fatal recv errors that may be fatal for reliable transports
+            Kind::Decode
+            | Kind::Crypto(_)
+            | Kind::Duplicate
+            | Kind::CredentialMismatch { .. }
+            | Kind::StreamMismatch { .. }
+            | Kind::UnexpectedPacket { .. }
+            | Kind::UnexpectedRetransmission => Some(transport::Error::PROTOCOL_VIOLATION.into()),
+
+            Kind::NormalClose => from_code(Kind::NORMAL_CODE),
+            Kind::ApplicationPanic => from_code(Kind::PANIC_CODE),
+            Kind::AcceptQueueFull => from_code(Kind::ACCEPT_FULL_CODE),
+            Kind::MaxSojournTime => from_code(Kind::MAX_SOJOURN_TIME_CODE),
+            Kind::FlowReset => from_code(Kind::FLOW_RESET_CODE),
+
+            Kind::ApplicationError { error } => Some(frame::ConnectionClose {
+                error_code: VarInt::new(**error).unwrap(),
+                frame_type: None,
+                reason: None,
+            }),
+            Kind::TransportError { code } => Some(frame::ConnectionClose {
+                error_code: *code,
+                frame_type: Some(VarInt::from_u16(0)),
+                reason: None,
+            }),
+
+            // Receiver-originated fatal errors
+            Kind::MaxDataExceeded => Some(transport::Error::FLOW_CONTROL_ERROR.into()),
+            Kind::InvalidFin | Kind::TruncatedTransport => {
+                Some(transport::Error::FINAL_SIZE_ERROR.into())
+            }
+            Kind::OutOfOrder { .. } => Some(transport::Error::STREAM_STATE_ERROR.into()),
+            Kind::OutOfRange => Some(transport::Error::STREAM_LIMIT_ERROR.into()),
+
+            // Sender API errors - these don't get connection close frames
+            Kind::PayloadTooLarge
+            | Kind::PacketBufferTooSmall
+            | Kind::StreamFinished
+            | Kind::FinalSizeChanged => None,
+
+            // All other fatal errors get a generic error code
+            Kind::PacketNumberExhaustion
+            | Kind::RetransmissionFailure
+            | Kind::FrameError { .. }
+            | Kind::FatalError => Some(transport::Error::INTERNAL_ERROR.into()),
+        }
+    }
+
+    pub(crate) fn from_connection_close(close: &frame::ConnectionClose<'_>) -> Self {
+        match close.error_code.as_u64() {
+            code if code == Self::NORMAL_CODE as u64 => Self::NormalClose,
+            code if code == Self::PANIC_CODE as u64 => Self::ApplicationPanic,
+            code if code == Self::ACCEPT_FULL_CODE as u64 => Self::AcceptQueueFull,
+            code if code == Self::MAX_SOJOURN_TIME_CODE as u64 => Self::MaxSojournTime,
+            code if code == Self::FLOW_RESET_CODE as u64 => Self::FlowReset,
+            _ => Self::ApplicationError {
+                error: close.error_code.into(),
+            },
+        }
     }
 }
 
