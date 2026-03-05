@@ -77,12 +77,6 @@ impl State {
         // if the flow offset was updated then wake the application waker
         should_wake |= prev < flow_offset.as_u64();
 
-        // if transmission_credits > 0 {
-        //     self.transmission_credits
-        //         .fetch_add(transmission_credits, Ordering::Release);
-        //     should_wake = true;
-        // }
-
         if should_wake {
             self.poll_waker.wake();
         }

@@ -99,6 +99,23 @@ fn backlog_rejection() {
         .group("server")
         .instrument(info_span!("server"))
         .spawn();
+
+        // NOTE: This is a **simulated time** watchdog, NOT wall-clock time.
+        // The test uses a discrete event simulation where time advances instantly
+        // between events. Wall-clock time (what nextest measures) is completely
+        // independent of simulated time - 60s of sim time should complete in
+        // milliseconds of wall time. If this watchdog fires, it means the
+        // simulation is stuck in an infinite event loop where simulated time
+        // cannot advance.
+        async move {
+            120.s().sleep().await;
+            panic!(
+                "WATCHDOG: simulation did not complete within 120s of simulated time. \
+                 This indicates an infinite event loop preventing time advancement."
+            );
+        }
+        .group("watchdog")
+        .spawn();
     });
 
     let timed_out = timed_out.load(Ordering::Relaxed);

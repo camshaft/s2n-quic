@@ -471,7 +471,7 @@ impl State {
             }
         }
 
-        self.on_peer_activity(made_progress || self.max_data.is_blocked());
+        self.on_peer_activity(made_progress);
 
         Ok(None)
     }
@@ -791,12 +791,13 @@ impl State {
 
         // If the peer is making progress then reset our PTO backoff. Otherwise, we could
         // get caught in a loop.
-        if made_progress {
+        if made_progress || self.max_data.is_blocked() {
             self.reset_pto_timer();
         }
 
         // re-arm the idle timer as long as we're not in terminal state
-        if !self.state().is_terminal() {
+        let state = self.state();
+        if state.is_ready() || state.is_sending() {
             self.idle_timer.cancel();
         }
     }
@@ -864,6 +865,8 @@ impl State {
     #[inline]
     fn update_idle_timer(&mut self, clock: &impl Clock) {
         ensure!(!self.idle_timer.is_armed());
+        let state = self.state();
+        ensure!(state.is_ready() || state.is_sending());
 
         let now = clock.get_time();
         let target = now + self.idle_timeout;

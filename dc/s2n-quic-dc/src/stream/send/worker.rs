@@ -576,7 +576,7 @@ where
                         use error::Kind::*;
                         $kind
                     },
-                    Location::Local,
+                    Location::Remote,
                     self.clock,
                     self.publisher,
                 );
@@ -585,7 +585,7 @@ where
                         use crate::stream::recv::ErrorKind::*;
                         ($kind).into()
                     },
-                    Location::Local,
+                    Location::Remote,
                     self.publisher,
                 );
             }};
