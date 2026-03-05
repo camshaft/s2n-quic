@@ -1,7 +1,7 @@
 // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::{packet, stream::recv};
+use crate::{packet, stream::Error};
 use s2n_codec::DecoderBufferMut;
 use s2n_quic_core::inet::{ExplicitCongestionNotification, SocketAddress};
 
@@ -16,7 +16,7 @@ pub trait Dispatch {
         remote_addr: &SocketAddress,
         ecn: ExplicitCongestionNotification,
         packet: packet::Packet,
-    ) -> Result<(), recv::Error>;
+    ) -> Result<(), Error>;
 
     #[inline]
     fn on_datagram_segment(
@@ -24,7 +24,7 @@ pub trait Dispatch {
         remote_addr: &SocketAddress,
         ecn: ExplicitCongestionNotification,
         segment: &mut [u8],
-    ) -> Result<(), recv::Error> {
+    ) -> Result<(), Error> {
         let tag_len = self.tag_len();
         let segment_len = segment.len();
         let mut decoder = DecoderBufferMut::new(segment);

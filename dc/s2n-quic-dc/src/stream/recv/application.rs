@@ -8,7 +8,7 @@ use crate::{
     stream::{
         recv, runtime,
         shared::{AcceptState, ArcShared, ShutdownKind},
-        socket, Actor,
+        socket, Actor, Error,
     },
 };
 use core::{
@@ -81,7 +81,7 @@ enum LocalState {
     Ready,
     Reading,
     Drained,
-    Errored(recv::Error),
+    Errored(Error),
 }
 
 impl LocalState {
@@ -393,7 +393,9 @@ where
             ShutdownKind::Normal
         };
 
-        self.shared.receiver.shutdown(kind);
+        self.shared
+            .receiver
+            .shutdown(kind, &self.shared.wakers.read_worker_waker);
     }
 
     #[inline(always)]

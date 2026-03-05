@@ -15,6 +15,7 @@ pub mod client;
 pub mod crypto;
 pub mod endpoint;
 pub mod environment;
+pub mod error;
 pub mod load_balance;
 pub mod packet_map;
 pub mod packet_number;
@@ -26,6 +27,8 @@ pub mod server;
 pub mod shared;
 pub mod socket;
 pub(crate) mod tls;
+
+pub use error::Error;
 
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;

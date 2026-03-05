@@ -131,7 +131,7 @@ impl S2nTlsConnection {
         message: &mut M,
         reader: &mut R,
         is_fin: bool,
-    ) -> Result<(), crate::stream::send::Error>
+    ) -> Result<(), crate::stream::error::Error>
     where
         M: super::send::application::state::Message,
         R: s2n_quic_core::buffer::reader::storage::Infallible,
@@ -159,8 +159,8 @@ impl S2nTlsConnection {
                     Poll::Ready(Ok(l)) => consumed += l,
                     Poll::Ready(Err(e)) => {
                         tracing::warn!("s2n_tls::poll_send() = Err({:?})", &e);
-                        return Err(crate::stream::send::Error::new(
-                            crate::stream::send::ErrorKind::FatalError,
+                        return Err(crate::stream::error::Error::new(
+                            crate::stream::error::Kind::FatalError,
                         ));
                     }
                     Poll::Pending => unreachable!(
@@ -175,8 +175,8 @@ impl S2nTlsConnection {
                 Poll::Ready(Ok(_)) => {}
                 Poll::Ready(Err(e)) => {
                     tracing::warn!("s2n_tls::poll_shutdown_send() = Err({:?})", &e);
-                    return Err(crate::stream::send::Error::new(
-                        crate::stream::send::ErrorKind::FatalError,
+                    return Err(crate::stream::error::Error::new(
+                        crate::stream::error::Kind::FatalError,
                     ));
                 }
                 Poll::Pending => unreachable!(
@@ -197,7 +197,7 @@ impl S2nTlsConnection {
             impl s2n_quic_core::buffer::writer::Storage,
             s2n_quic_core::buffer::Reassembler,
         >,
-    ) -> Result<(), super::recv::Error> {
+    ) -> Result<(), crate::stream::error::Error> {
         let mut guard = self.connection.lock().unwrap();
         let (conn, read_state) = &mut *guard;
         let conn = CallbackResetGuard {
@@ -235,30 +235,36 @@ impl S2nTlsConnection {
                 {
                     Ok(r) => r,
                     Err(s2n_quic_core::buffer::Error::OutOfRange) => {
-                        return Err(super::recv::Error::new(
-                            super::recv::ErrorKind::MaxDataExceeded,
+                        return Err(crate::stream::error::Error::new(
+                            crate::stream::error::Kind::MaxDataExceeded,
                         ))
                     }
                     Err(s2n_quic_core::buffer::Error::InvalidFin) => {
-                        return Err(super::recv::Error::new(super::recv::ErrorKind::InvalidFin))
+                        return Err(crate::stream::error::Error::new(
+                            crate::stream::error::Kind::InvalidFin,
+                        ))
                     }
                 };
 
                 match output.read_from(&mut reader) {
                     Ok(()) => {}
                     Err(s2n_quic_core::buffer::Error::OutOfRange) => {
-                        return Err(super::recv::Error::new(
-                            super::recv::ErrorKind::MaxDataExceeded,
+                        return Err(crate::stream::error::Error::new(
+                            crate::stream::error::Kind::MaxDataExceeded,
                         ))
                     }
                     Err(s2n_quic_core::buffer::Error::InvalidFin) => {
-                        return Err(super::recv::Error::new(super::recv::ErrorKind::InvalidFin))
+                        return Err(crate::stream::error::Error::new(
+                            crate::stream::error::Kind::InvalidFin,
+                        ))
                     }
                 }
             }
             Poll::Ready(Err(e)) => {
                 tracing::warn!("s2n_tls::poll_recv() = Err({:?})", &e);
-                return Err(super::recv::Error::new(super::recv::ErrorKind::Decode));
+                return Err(crate::stream::error::Error::new(
+                    crate::stream::error::Kind::Decode,
+                ));
             }
             Poll::Pending => {
                 // Fall through, we expect to hit this case if we've consumed from recv::Buffer but
@@ -631,6 +637,8 @@ where
             },
             s2n_connection: Some(s2n_connection),
             segment_alloc: Pool::new(u16::MAX),
+            stream_error: Default::default(),
+            wakers: Default::default(),
         }
     };
 

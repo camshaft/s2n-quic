@@ -4,7 +4,7 @@
 use crate::{
     either::Either,
     event,
-    stream::{recv, socket::Socket, Actor, TransportFeatures},
+    stream::{socket::Socket, Actor, Error, TransportFeatures},
 };
 use core::task::{Context, Poll};
 use std::io;
@@ -31,11 +31,7 @@ pub trait Buffer {
         S: ?Sized + Socket,
         Pub: event::ConnectionPublisher;
 
-    fn process<R>(
-        &mut self,
-        features: TransportFeatures,
-        router: &mut R,
-    ) -> Result<(), recv::Error>
+    fn process<R>(&mut self, features: TransportFeatures, router: &mut R) -> Result<(), Error>
     where
         R: Dispatch;
 }
@@ -72,7 +68,7 @@ where
     }
 
     #[inline]
-    fn process<R>(&mut self, features: TransportFeatures, router: &mut R) -> Result<(), recv::Error>
+    fn process<R>(&mut self, features: TransportFeatures, router: &mut R) -> Result<(), Error>
     where
         R: Dispatch,
     {

@@ -6,12 +6,9 @@ use crate::{
     event,
     socket::pool::descriptor::Filled,
     stream::{
-        recv::{
-            self,
-            dispatch::{Control, Stream},
-        },
+        recv::dispatch::{Control, Stream},
         socket::Socket,
-        Actor, TransportFeatures,
+        Actor, Error, TransportFeatures,
     },
 };
 use core::task::{Context, Poll};
@@ -109,7 +106,7 @@ macro_rules! impl_buffer {
                 &mut self,
                 features: TransportFeatures,
                 router: &mut R,
-            ) -> Result<(), recv::Error>
+            ) -> Result<(), Error>
             where
                 R: Dispatch,
             {

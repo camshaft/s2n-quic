@@ -197,7 +197,7 @@ impl Config {
                     credentials,
                     wire_version: crate::packet::WireVersion::ZERO,
                     queue_id,
-                    code: crate::stream::shared::ShutdownKind::FLOW_RESET.into(),
+                    code: crate::stream::error::Kind::FLOW_RESET_CODE.into(),
                 };
 
                 let Some(len) = map.sign_flow_reset_packet(&packet, &mut out_buffer) else {

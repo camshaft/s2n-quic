@@ -102,7 +102,7 @@ where
 
     #[inline]
     pub fn keep_alive(&self, enabled: bool) {
-        self.0.shared.sender.keep_alive(enabled);
+        self.0.shared.sender.keep_alive(enabled, &self.0.shared.wakers.write_worker_waker);
     }
 
     #[inline]
@@ -268,7 +268,13 @@ where
         }
 
         // acquire flow credits from the worker
-        let credits = ready!(self.shared.sender.flow.poll_acquire(cx, request, &features))?;
+        let credits = ready!(self.shared.sender.flow.poll_acquire(
+            cx,
+            request,
+            &features,
+            &self.shared.common.wakers.write_app_waker,
+            &self.shared.common.stream_error
+        ))?;
 
         // update the status if this write included the final offset
         if credits.is_fin {
@@ -411,7 +417,7 @@ where
                 ShutdownKind::Normal
             };
             let queue = core::mem::take(&mut self.queue);
-            self.shared.sender.shutdown(shutdown_kind, queue);
+            self.shared.sender.shutdown(shutdown_kind, queue, &self.shared.wakers.write_worker_waker);
             return Ok(());
         }
 

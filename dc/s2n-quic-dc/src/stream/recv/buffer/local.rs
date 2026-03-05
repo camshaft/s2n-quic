@@ -4,7 +4,7 @@
 use super::Dispatch;
 use crate::{
     event, msg,
-    stream::{recv, server::handshake, socket::Socket, Actor, TransportFeatures},
+    stream::{error, server::handshake, socket::Socket, Actor, Error, TransportFeatures},
 };
 use bytes::buf::UninitSlice;
 use core::task::{Context, Poll};
@@ -97,7 +97,7 @@ impl super::Buffer for Local {
     }
 
     #[inline]
-    fn process<R>(&mut self, features: TransportFeatures, router: &mut R) -> Result<(), recv::Error>
+    fn process<R>(&mut self, features: TransportFeatures, router: &mut R) -> Result<(), Error>
     where
         R: Dispatch,
     {
@@ -152,7 +152,7 @@ impl Local {
     }
 
     #[inline]
-    fn dispatch_buffer_stream<R>(&mut self, router: &mut R) -> Result<(), recv::Error>
+    fn dispatch_buffer_stream<R>(&mut self, router: &mut R) -> Result<(), Error>
     where
         R: Dispatch,
     {
@@ -198,13 +198,13 @@ impl Local {
                                 remaining_capacity = msg.remaining_capacity()
                             );
                             msg.clear();
-                            return Err(recv::error::Kind::Decode.into());
+                            return Err(error::Kind::Decode.err());
                         }
 
                         if self.saw_fin {
                             tracing::error!("truncated stream");
                             msg.clear();
-                            return Err(recv::error::Kind::Decode.into());
+                            return Err(error::Kind::Decode.err());
                         }
 
                         tracing::trace!(
@@ -225,7 +225,7 @@ impl Local {
                     // any other decoder errors mean the stream has been corrupted so
                     // it's time to shut down the connection
                     msg.clear();
-                    return Err(recv::error::Kind::Decode.into());
+                    return Err(error::Kind::Decode.err());
                 }
             };
 
@@ -244,7 +244,7 @@ impl Local {
     }
 
     #[inline]
-    fn dispatch_buffer_datagram<R>(&mut self, router: &mut R) -> Result<(), recv::Error>
+    fn dispatch_buffer_datagram<R>(&mut self, router: &mut R) -> Result<(), Error>
     where
         R: Dispatch,
     {

@@ -1,7 +1,7 @@
 // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::stream::{recv, recv::buffer::Dispatch};
+use crate::stream::{error, recv::buffer::Dispatch};
 use std::net::{IpAddr, Ipv4Addr};
 
 // Checks that a stream which saw EOF mid-packet will not expect more data to come in and returns an error.
@@ -26,7 +26,7 @@ fn check_truncation() {
     local.saw_fin = true;
     let err = local.dispatch_buffer_stream(&mut dispatch).unwrap_err();
 
-    assert!(matches!(err.kind(), recv::error::Kind::Decode));
+    assert!(matches!(err.kind(), error::Kind::Decode));
 }
 
 struct NoopDispatch;
@@ -37,7 +37,7 @@ impl Dispatch for NoopDispatch {
         _remote_addr: &s2n_quic_core::inet::SocketAddress,
         _ecn: s2n_quic_core::inet::ExplicitCongestionNotification,
         _packet: crate::packet::Packet,
-    ) -> Result<(), crate::stream::recv::Error> {
+    ) -> Result<(), error::Error> {
         // should never actually parse a packet
         unreachable!()
     }

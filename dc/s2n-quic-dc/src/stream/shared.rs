@@ -8,11 +8,15 @@ use crate::{
     packet::stream,
     socket::pool,
     stream::{
+        error::{Error as StreamError, StoredError},
         recv::shared as recv,
         send::{application, shared as send},
         tls::S2nTlsConnection,
+        Actor,
     },
+    task::waker::worker::Waker as WorkerWaker,
 };
+use atomic_waker::AtomicWaker;
 use core::{
     cell::UnsafeCell,
     ops,
@@ -20,13 +24,14 @@ use core::{
     time::Duration,
 };
 use s2n_quic_core::{
+    endpoint::Location,
     ensure,
     inet::{IpAddress, SocketAddress},
     time::Timestamp,
     varint::VarInt,
 };
 use s2n_quic_platform::features;
-use std::sync::{atomic::AtomicU16, Arc};
+use std::sync::{atomic::AtomicU16, Arc, OnceLock};
 
 pub mod handshake;
 
@@ -42,21 +47,15 @@ pub enum Half {
 pub enum ShutdownKind {
     Normal,
     Errored,
-    Pruned,
-    FlowReset,
 }
 
 impl ShutdownKind {
     pub const ERRORED_CODE: u8 = 0x01;
-    pub const PRUNED_CODE: u8 = 0x02;
-    pub const FLOW_RESET: u8 = 0x03;
 
     pub fn error_code(&self) -> Option<u8> {
         match self {
             ShutdownKind::Normal => None,
             ShutdownKind::Errored => Some(Self::ERRORED_CODE),
-            ShutdownKind::Pruned => Some(Self::PRUNED_CODE),
-            ShutdownKind::FlowReset => Some(Self::FLOW_RESET),
         }
     }
 }
@@ -115,13 +114,13 @@ where
         match entry.meta.half {
             Half::Write => {
                 self.sender.transmission_queue.complete_transmission(entry);
-                self.sender.worker_waker.wake();
+                self.common.wakers.write_worker_waker.wake();
             }
             Half::Read => {
                 self.receiver
                     .transmission_queue
                     .complete_transmission(entry);
-                self.receiver.worker_waker.wake();
+                self.common.wakers.read_worker_waker.wake();
             }
         }
     }
@@ -226,6 +225,34 @@ where
             &*self.common.fixed.credentials.get()
         }
     }
+
+    /// Stores a fatal error in the shared `OnceLock` and notifies all other actors.
+    #[inline]
+    pub fn set_error(&self, error: StreamError, source: Location, actor: Option<(Half, Actor)>) {
+        let stored = StoredError { error, source };
+
+        // First writer wins. If the error was already set, return immediately.
+        if self.common.stream_error.set(stored).is_err() {
+            return;
+        }
+
+        // Indicate that an error has been encountered
+        self.sender.set_error_flag();
+        self.receiver.set_error_flag();
+
+        // Wake all actors except the caller
+        if let Some((half, actor)) = actor {
+            self.common.wakers.wake_all_except(half, actor);
+        } else {
+            self.common.wakers.wake_all();
+        }
+    }
+
+    /// Returns the shared error if one has been set.
+    #[inline]
+    pub fn get_error(&self) -> Option<&StoredError> {
+        self.common.stream_error.get()
+    }
 }
 
 impl<Sub, C> ops::Deref for Shared<Sub, C>
@@ -238,6 +265,41 @@ where
     #[inline]
     fn deref(&self) -> &Self::Target {
         &self.common
+    }
+}
+
+/// Consolidated waker set for all four actors interacting with the stream.
+#[derive(Debug, Default)]
+pub struct WakerSet {
+    pub write_app_waker: AtomicWaker,
+    pub write_worker_waker: WorkerWaker,
+    pub read_app_waker: AtomicWaker,
+    pub read_worker_waker: WorkerWaker,
+}
+
+impl WakerSet {
+    pub fn wake_all(&self) {
+        self.write_app_waker.wake();
+        self.write_worker_waker.wake();
+        self.read_app_waker.wake();
+        self.read_worker_waker.wake();
+    }
+
+    /// Wakes all actors except the one identified by `half` and `actor`.
+    /// This prevents the originator of an error from waking itself.
+    pub fn wake_all_except(&self, half: Half, actor: Actor) {
+        if !matches!((half, actor), (Half::Write, Actor::Application)) {
+            self.write_app_waker.wake();
+        }
+        if !matches!((half, actor), (Half::Write, Actor::Worker)) {
+            self.write_worker_waker.wake();
+        }
+        if !matches!((half, actor), (Half::Read, Actor::Application)) {
+            self.read_app_waker.wake();
+        }
+        if !matches!((half, actor), (Half::Read, Actor::Worker)) {
+            self.read_worker_waker.wake();
+        }
     }
 }
 
@@ -257,6 +319,8 @@ where
     pub segment_alloc: pool::Pool,
     pub subscriber: Subscriber<Sub>,
     pub s2n_connection: Option<S2nTlsConnection>,
+    pub stream_error: OnceLock<StoredError>,
+    pub wakers: WakerSet,
     pub clock: Clk,
 }
 

@@ -6,8 +6,9 @@ use crate::{
     event,
     packet::{stream::PacketSpace, Packet},
     stream::{
+        error,
         recv::buffer::{self, Buffer},
-        send::{error, queue::Queue, shared::Event, state::State},
+        send::{queue::Queue, shared::Event, state::State},
         shared::{self, handshake},
         socket::Socket,
         Actor, TransportFeatures,
@@ -93,7 +94,10 @@ impl Snapshot {
         Sub: event::Subscriber,
         C: Clock,
     {
-        shared.sender.flow.release(self.flow_offset);
+        shared
+            .sender
+            .flow
+            .release(self.flow_offset, &shared.wakers.write_app_waker);
 
         if initial.send_quantum != self.send_quantum {
             let send_quantum = (self.send_quantum as u64).div_ceil(self.max_datagram_size as u64);
@@ -117,12 +121,7 @@ impl Snapshot {
 
         if let Some((error, source)) = self.error {
             if initial.error.is_none() {
-                shared.sender.flow.set_error(error);
-
-                if let Some(err) = error.for_recv() {
-                    let publisher = shared.publisher();
-                    shared.receiver.notify_error(err, source, &publisher);
-                }
+                shared.set_error(error, source, Some((shared::Half::Write, Actor::Worker)));
             }
         }
     }
@@ -175,7 +174,7 @@ where
 
     #[inline]
     pub fn update_waker(&self, cx: &mut Context) {
-        self.shared.sender.worker_waker.update(cx.waker());
+        self.shared.wakers.write_worker_waker.update(cx.waker());
     }
 
     #[inline]
@@ -206,15 +205,15 @@ where
             snapshot = ?initial,
         );
 
-        self.shared.sender.worker_waker.on_worker_wake();
+        self.shared.wakers.write_worker_waker.on_worker_wake();
 
         self.poll_once(cx);
 
         // check if the application sent us any more messages
         if !self
             .shared
-            .sender
-            .worker_waker
+            .wakers
+            .write_worker_waker
             .on_worker_sleep()
             .is_working()
         {
@@ -257,6 +256,16 @@ where
 
     #[inline]
     fn poll_once(&mut self, cx: &mut Context) {
+        // Check the shared error at the top of each poll cycle.
+        // If another actor set the error, transition the sender to its error state.
+        if let Some(stored) = self.shared.get_error() {
+            if self.sender.error().is_none() {
+                let publisher = self.shared.publisher();
+                self.sender
+                    .on_error(stored.error, stored.source, &self.shared.clock, &publisher);
+            }
+        }
+
         self.sender
             .load_completion_queue(&self.shared.sender.transmission_queue, &self.shared.clock);
 
@@ -369,9 +378,8 @@ where
 
         if !had_error {
             if let Some((error, source)) = self.sender.error() {
-                if let Some(err) = error.for_recv() {
-                    self.shared.receiver.notify_error(err, source, &publisher);
-                }
+                self.shared
+                    .set_error(*error, source, Some((shared::Half::Write, Actor::Worker)));
             }
         }
     }
@@ -553,7 +561,7 @@ where
         remote_addr: &SocketAddress,
         ecn: ExplicitCongestionNotification,
         packet: crate::packet::Packet,
-    ) -> Result<(), crate::stream::recv::Error> {
+    ) -> Result<(), crate::stream::error::Error> {
         let credentials = *self.shared.credentials();
 
         macro_rules! secret_control {
@@ -578,14 +586,6 @@ where
                     },
                     Location::Remote,
                     self.clock,
-                    self.publisher,
-                );
-                self.shared.receiver.notify_error(
-                    {
-                        use crate::stream::recv::ErrorKind::*;
-                        ($kind).into()
-                    },
-                    Location::Remote,
                     self.publisher,
                 );
             }};

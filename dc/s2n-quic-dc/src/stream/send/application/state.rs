@@ -9,10 +9,10 @@ use crate::{
     socket::pool::descriptor,
     stream::{
         packet_number,
-        send::{error::Error, flow, path, state::transmission},
+        send::{flow, path, state::transmission},
         shared::Half,
         tls::S2nTlsConnection,
-        TransportFeatures,
+        Error, TransportFeatures,
     },
 };
 use s2n_codec::EncoderBuffer;

@@ -597,8 +597,8 @@ pub struct StreamControlPacketReceived {
 
 #[event("stream:receiver_errored")]
 pub struct StreamReceiverErrored {
-    #[builder(crate::stream::recv::Error)]
-    error: crate::stream::recv::Error,
+    #[builder(crate::stream::Error)]
+    error: crate::stream::Error,
 
     /// The location where the error originated
     source: s2n_quic_core::endpoint::Location,
@@ -606,8 +606,8 @@ pub struct StreamReceiverErrored {
 
 #[event("stream:sender_errored")]
 pub struct StreamSenderErrored {
-    #[builder(crate::stream::send::Error)]
-    error: crate::stream::send::Error,
+    #[builder(crate::stream::Error)]
+    error: crate::stream::Error,
 
     /// The location where the error originated
     source: s2n_quic_core::endpoint::Location,

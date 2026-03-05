@@ -5,6 +5,7 @@ use crate::{
     credentials::{Credentials, Id},
     event::{self, EndpointPublisher as _},
     stream::{
+        error,
         recv::application::{self as recv, Reader},
         send::application::{self as send, Writer},
         shared::ArcShared,
@@ -12,7 +13,7 @@ use crate::{
     },
 };
 use core::{fmt, time::Duration};
-use s2n_quic_core::{buffer, time::Timestamp};
+use s2n_quic_core::{buffer, endpoint::Location, time::Timestamp};
 use std::{io, net::SocketAddr};
 
 pub struct Builder<Sub: event::Subscriber> {
@@ -81,6 +82,7 @@ where
 
     /// Emits an event indicating that the stream was pruned
     #[inline]
+    #[track_caller]
     pub(crate) fn prune(self, reason: event::builder::AcceptorStreamPruneReason) {
         let now = self.shared.clock.get_time();
         let remote_address = self.shared.remote_addr();
@@ -89,6 +91,16 @@ where
         let credential_id = &*creds.id;
         let stream_id = creds.key_id.as_u64();
         let sojourn_time = now.saturating_duration_since(self.queue_time);
+
+        let error = match reason {
+            event::builder::AcceptorStreamPruneReason::MaxSojournTimeExceeded => {
+                error::Kind::MaxSojournTime
+            }
+            event::builder::AcceptorStreamPruneReason::AcceptQueueCapacityExceeded => {
+                error::Kind::AcceptQueueFull
+            }
+        }
+        .err();
 
         self.shared
             .endpoint_publisher(now)
@@ -100,10 +112,8 @@ where
                 reason,
             });
 
-        let publisher = self.shared.publisher_with_timestamp(now);
-
-        self.shared.receiver.on_prune(&publisher);
-        self.shared.sender.on_prune();
+        let source = Location::Local;
+        self.shared.set_error(error, source, None);
     }
 }
 

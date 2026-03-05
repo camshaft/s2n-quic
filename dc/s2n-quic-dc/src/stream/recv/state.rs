@@ -7,11 +7,8 @@ use crate::{
     event,
     packet::{control, stream},
     stream::{
-        recv::{
-            error::{self, Error},
-            packet,
-            shared::TransmitQueue,
-        },
+        error::{self, Error},
+        recv::{packet, shared::TransmitQueue},
         shared::AcceptState,
         TransportFeatures, DEFAULT_IDLE_TIMEOUT,
     },

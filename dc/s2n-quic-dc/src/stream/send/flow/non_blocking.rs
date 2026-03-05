@@ -3,10 +3,8 @@
 
 use super::Credits;
 use crate::stream::{
-    send::{
-        error::{self, Error},
-        flow,
-    },
+    error::{self, Error, StoredError},
+    send::flow,
     TransportFeatures,
 };
 use atomic_waker::AtomicWaker;
@@ -27,10 +25,6 @@ pub struct State {
     stream_offset: AtomicU64,
     /// Offset which indicates the maximum offset the application can write to
     flow_offset: AtomicU64,
-    /// Notifies an application of newly-available flow credits
-    poll_waker: AtomicWaker,
-    stream_error: OnceLock<Error>,
-    // TODO add a list for the `acquire` future wakers
 }
 
 impl fmt::Debug for State {
@@ -48,8 +42,6 @@ impl State {
         Self {
             stream_offset: AtomicU64::new(0),
             flow_offset: AtomicU64::new(initial_flow_offset.as_u64()),
-            poll_waker: AtomicWaker::new(),
-            stream_error: OnceLock::new(),
         }
     }
 }
@@ -63,9 +55,10 @@ impl State {
         unsafe { VarInt::new_unchecked(value) }
     }
 
-    /// Called by the background worker to release flow credits
+    /// Called by the background worker to release flow credits.
+    /// The caller is responsible for waking the application waker if needed.
     #[inline]
-    pub fn release(&self, flow_offset: VarInt) {
+    pub fn release(&self, flow_offset: VarInt, write_app_waker: &AtomicWaker) {
         tracing::trace!(release = %flow_offset);
 
         let mut should_wake = false;
@@ -78,15 +71,21 @@ impl State {
         should_wake |= prev < flow_offset.as_u64();
 
         if should_wake {
-            self.poll_waker.wake();
+            write_app_waker.wake();
         }
     }
 
+    /// Sets just the error bit on the stream offset without storing an error.
+    /// Used by the shared `set_error` path which stores the error in the shared `OnceLock`.
     #[inline]
-    pub fn set_error(&self, error: Error) {
-        let _ = self.stream_error.set(error);
+    pub fn set_error_flag(&self) {
         self.stream_offset.fetch_or(ERROR_MASK, Ordering::Relaxed);
-        self.poll_waker.wake();
+    }
+
+    /// Returns true if the error flag is set.
+    #[inline]
+    pub fn has_error(&self) -> bool {
+        self.stream_offset.load(Ordering::Relaxed) & ERROR_MASK == ERROR_MASK
     }
 
     /// Called by the application to acquire flow credits
@@ -95,8 +94,13 @@ impl State {
         &self,
         request: flow::Request,
         features: &TransportFeatures,
+        write_app_waker: &AtomicWaker,
+        stream_error: &OnceLock<StoredError>,
     ) -> Result<Credits, Error> {
-        core::future::poll_fn(|cx| self.poll_acquire(cx, request, features)).await
+        core::future::poll_fn(|cx| {
+            self.poll_acquire(cx, request, features, write_app_waker, stream_error)
+        })
+        .await
     }
 
     /// Called by the application to acquire flow credits
@@ -106,10 +110,12 @@ impl State {
         cx: &mut Context,
         mut request: flow::Request,
         features: &TransportFeatures,
+        write_app_waker: &AtomicWaker,
+        stream_error: &OnceLock<StoredError>,
     ) -> Poll<Result<Credits, Error>> {
         let mut stored_waker = false;
 
-        let mut current_offset = self.acquire_offset(&request)?;
+        let mut current_offset = self.acquire_offset(&request, stream_error)?;
 
         loop {
             let flow_offset = self.flow_offset.load(Ordering::Acquire);
@@ -130,10 +136,10 @@ impl State {
                 ensure!(!stored_waker, Poll::Pending);
                 stored_waker = true;
 
-                self.poll_waker.register(cx.waker());
+                write_app_waker.register(cx.waker());
 
                 // make one last effort to acquire some flow credits before going to sleep
-                current_offset = self.acquire_offset(&request)?;
+                current_offset = self.acquire_offset(&request, stream_error)?;
 
                 continue;
             };
@@ -166,17 +172,12 @@ impl State {
                     let acquired_offset =
                         unsafe { VarInt::new_unchecked(current_offset & OFFSET_MASK) };
 
-                    // if !features.is_flow_controlled() {
-                    //     // After acquiring credits record that we've got a pending transmission
-                    //     self.transmission_credits.fetch_sub(1, Ordering::Acquire);
-                    // }
-
                     let credits = request.response(acquired_offset);
                     return Poll::Ready(Ok(credits));
                 }
                 Err(updated_offset) => {
                     // the offset was updated from underneath us so try again
-                    current_offset = self.process_offset(updated_offset, &request)?;
+                    current_offset = self.process_offset(updated_offset, &request, stream_error)?;
                     // clear the fact that we stored the waker, since we need to do a full sync
                     // to get the correct state
                     stored_waker = false;
@@ -187,17 +188,33 @@ impl State {
     }
 
     #[inline]
-    fn acquire_offset(&self, request: &flow::Request) -> Result<u64, Error> {
-        self.process_offset(self.stream_offset.load(Ordering::Acquire), request)
+    fn acquire_offset(
+        &self,
+        request: &flow::Request,
+        stream_error: &OnceLock<StoredError>,
+    ) -> Result<u64, Error> {
+        self.process_offset(
+            self.stream_offset.load(Ordering::Acquire),
+            request,
+            stream_error,
+        )
     }
 
     #[inline]
-    fn process_offset(&self, offset: u64, request: &flow::Request) -> Result<u64, Error> {
+    fn process_offset(
+        &self,
+        offset: u64,
+        request: &flow::Request,
+        stream_error: &OnceLock<StoredError>,
+    ) -> Result<u64, Error> {
         if offset & ERROR_MASK == ERROR_MASK {
-            let error = self
-                .stream_error
+            // Read the error from the shared OnceLock
+            let error = stream_error
                 .get()
-                .copied()
+                .map(|stored| {
+                    // Convert the shared StreamError to a send Error
+                    stored.error
+                })
                 .unwrap_or_else(|| error::Kind::FatalError.err());
             return Err(error);
         }
@@ -218,11 +235,27 @@ mod tests {
     use crate::stream::send::path;
     use std::sync::Arc;
 
+    struct TestState {
+        flow: State,
+        waker: AtomicWaker,
+        error: OnceLock<StoredError>,
+    }
+
+    impl TestState {
+        fn new(initial_flow_offset: VarInt) -> Self {
+            Self {
+                flow: State::new(initial_flow_offset),
+                waker: AtomicWaker::new(),
+                error: OnceLock::new(),
+            }
+        }
+    }
+
     #[tokio::test]
     async fn concurrent_flow() {
         let mut initial_offset = VarInt::from_u8(255);
         let expected_len = VarInt::from_u16(u16::MAX);
-        let state = Arc::new(State::new(initial_offset));
+        let state = Arc::new(TestState::new(initial_offset));
         let path_info = path::Info {
             max_datagram_size: 1500,
             send_quantum: 10,
@@ -257,7 +290,11 @@ mod tests {
                     };
                     request.clamp(path_info.max_flow_credits(max_header_len, max_segments));
 
-                    let Ok(credits) = state.acquire(request, &features).await else {
+                    let Ok(credits) = state
+                        .flow
+                        .acquire(request, &features, &state.waker, &state.error)
+                        .await
+                    else {
                         break;
                     };
 
@@ -295,7 +332,7 @@ mod tests {
                 tokio::time::sleep(core::time::Duration::from_millis(1)).await;
                 initial_offset = (initial_offset + credits).min(expected_len);
                 credits += 1;
-                state.release(initial_offset);
+                state.flow.release(initial_offset, &state.waker);
             }
         });
 
@@ -324,9 +361,9 @@ mod tests {
             .with_type::<(u8, u8, bool)>()
             .cloned()
             .for_each(|(initial_offset, len, is_fin)| {
-                let state = Arc::new(State::new(VarInt::from_u8(initial_offset)));
+                let state = Arc::new(TestState::new(VarInt::from_u8(initial_offset)));
 
-                state.set_error(Error::new(error::Kind::FatalError));
+                state.flow.set_error_flag();
 
                 let len = len as _;
                 let request = flow::Request {
@@ -335,7 +372,10 @@ mod tests {
                     is_fin,
                 };
 
-                state.acquire_offset(&request).unwrap_err();
+                state
+                    .flow
+                    .acquire_offset(&request, &state.error)
+                    .unwrap_err();
             })
     }
 }

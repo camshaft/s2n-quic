@@ -1654,7 +1654,7 @@ pub mod api {
     #[derive(Clone, Debug)]
     #[non_exhaustive]
     pub struct StreamReceiverErrored {
-        pub error: crate::stream::recv::Error,
+        pub error: crate::stream::Error,
         #[doc = " The location where the error originated"]
         pub source: s2n_quic_core::endpoint::Location,
     }
@@ -1673,7 +1673,7 @@ pub mod api {
     #[derive(Clone, Debug)]
     #[non_exhaustive]
     pub struct StreamSenderErrored {
-        pub error: crate::stream::send::Error,
+        pub error: crate::stream::Error,
         #[doc = " The location where the error originated"]
         pub source: s2n_quic_core::endpoint::Location,
     }
@@ -5738,7 +5738,7 @@ pub mod builder {
     }
     #[derive(Clone, Debug)]
     pub struct StreamReceiverErrored {
-        pub error: crate::stream::recv::Error,
+        pub error: crate::stream::Error,
         #[doc = " The location where the error originated"]
         pub source: s2n_quic_core::endpoint::Location,
     }
@@ -5754,7 +5754,7 @@ pub mod builder {
     }
     #[derive(Clone, Debug)]
     pub struct StreamSenderErrored {
-        pub error: crate::stream::send::Error,
+        pub error: crate::stream::Error,
         #[doc = " The location where the error originated"]
         pub source: s2n_quic_core::endpoint::Location,
     }

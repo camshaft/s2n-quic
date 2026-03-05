@@ -292,6 +292,8 @@ where
                 context: subscriber_ctx,
             },
             s2n_connection: None,
+            stream_error: Default::default(),
+            wakers: Default::default(),
         }
     };
 

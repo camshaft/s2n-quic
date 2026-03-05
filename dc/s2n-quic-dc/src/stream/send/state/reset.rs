@@ -1,4 +1,4 @@
-use super::{error::Kind, Error};
+use crate::stream::error::{Error, Kind};
 use s2n_quic_core::{
     endpoint::Location,
     ensure, frame,

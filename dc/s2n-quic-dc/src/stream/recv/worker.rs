@@ -6,8 +6,9 @@ use crate::{
     event,
     packet::stream::PacketSpace,
     stream::{
+        error,
         send::{application::state::PushError, state::transmission},
-        shared::{AcceptState, ArcShared, ShutdownKind},
+        shared::{AcceptState, ArcShared, Half},
         socket::Socket,
         Actor,
     },
@@ -138,7 +139,7 @@ where
 
     #[inline]
     pub fn update_waker(&self, cx: &mut Context) {
-        self.shared.receiver.worker_waker.update(cx.waker());
+        self.shared.wakers.read_worker_waker.update(cx.waker());
     }
 
     #[inline]
@@ -186,11 +187,10 @@ where
             let target = self.shared.last_peer_activity() + self.idle_timeout_duration;
             self.idle_timer.update(target);
             if self.idle_timer.poll_ready(cx).is_ready() {
-                let publisher = self.shared.publisher();
-                self.shared.receiver.notify_error(
-                    super::ErrorKind::IdleTimeout.err(),
+                self.shared.set_error(
+                    error::Kind::IdleTimeout.err(),
                     endpoint::Location::Local,
-                    &publisher,
+                    Some((Half::Write, Actor::Worker)),
                 );
                 return Poll::Ready(());
             }
@@ -215,8 +215,10 @@ where
                     ready!(self.shared.receiver.poll_peek_worker(
                         cx,
                         &self.socket,
+                        &self.shared.stream_error,
                         &self.shared.clock,
                         &self.shared.subscriber,
+                        &self.shared.wakers.read_app_waker,
                     ));
 
                     self.arm_peek_timer();
@@ -299,24 +301,12 @@ where
 
         // check to see if the application shut down
         if let super::shared::ApplicationStatus::Closed { shutdown_kind } = state.status {
-            if matches!(shutdown_kind, ShutdownKind::Pruned) {
-                // if the stream was pruned then we don't need to do anything else
-                let publisher = self.shared.publisher();
-                self.shared.receiver.notify_error(
-                    super::ErrorKind::ApplicationError {
-                        error: ShutdownKind::PRUNED_CODE.into(),
-                    }
-                    .err(),
-                    endpoint::Location::Local,
-                    &publisher,
-                );
-                let _ = self.state.on_finished();
-                self.peek_timer.cancel();
-                self.idle_timer.cancel();
-                return true;
-            }
-
-            if let Ok(Some(mut recv)) = self.shared.receiver.worker_try_lock() {
+            if let Ok(Some(mut recv)) = self.shared.receiver.worker_try_lock(
+                &self.shared.wakers.read_app_waker,
+                &self.shared.stream_error,
+                &self.shared.clock,
+                &self.shared.subscriber,
+            ) {
                 let mut should_error = true;
 
                 // check to see if we have anything in the reassembler - if so indicate that we
@@ -398,7 +388,12 @@ where
         ensure!(self.should_transmit, Poll::Ready(Ok(())));
 
         // send an ACK if needed
-        if let Some(mut recv) = self.shared.receiver.worker_try_lock()? {
+        if let Some(mut recv) = self.shared.receiver.worker_try_lock(
+            &self.shared.wakers.read_app_waker,
+            &self.shared.stream_error,
+            &self.shared.clock,
+            &self.shared.subscriber,
+        )? {
             let mut transmission_queue = TransmissionQueue {
                 buffer: &mut self.transmission_buffer,
                 socket_address: self.shared.remote_addr(),
@@ -434,7 +429,13 @@ where
         loop {
             // try_lock the state before reading so we don't consume a packet the application is
             // about to read
-            let Some(mut recv) = self.shared.receiver.worker_try_lock()? else {
+            let Some(mut recv) = self.shared.receiver.worker_try_lock(
+                &self.shared.wakers.read_app_waker,
+                &self.shared.stream_error,
+                &self.shared.clock,
+                &self.shared.subscriber,
+            )?
+            else {
                 // if the application is locking the state then we don't want to transmit, since it
                 // will do that for us
                 break;

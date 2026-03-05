@@ -6,13 +6,14 @@ use crate::{
     event,
     packet::{stream, Packet},
     stream::{
+        error::{self, StoredError},
         recv::{self, buffer::Buffer as _},
         send::{application::state::PushError, state::transmission},
         shared::{self, handshake, AcceptState, ArcShared, CompletionQueue, ShutdownKind},
         socket::{self, Socket},
-        Actor, TransportFeatures,
+        Actor, Error, TransportFeatures,
     },
-    task::waker::worker::Waker as WorkerWaker,
+    task::waker::worker,
 };
 use core::{
     fmt,
@@ -35,7 +36,7 @@ use std::{
     io::{self, IoSliceMut},
     sync::{
         atomic::{AtomicU64, AtomicU8, Ordering},
-        Mutex, MutexGuard,
+        Mutex, MutexGuard, OnceLock,
     },
 };
 
@@ -70,15 +71,11 @@ impl ApplicationStatus {
 impl ApplicationState {
     const IS_CLOSED_MASK: u8 = 1;
     const IS_ERRORED_MASK: u8 = 1 << 1;
-    const IS_PRUNED_MASK: u8 = 1 << 2;
-    const IS_FLOW_RESET_MASK: u8 = 1 << 3;
-    const WANTS_ACK: u8 = 1 << 4;
+    const WANTS_ACK: u8 = 1 << 2;
 
     const SHUTDOWN_KINDS: &[(ShutdownKind, u8)] = &[
         (ShutdownKind::Normal, Self::IS_CLOSED_MASK),
         (ShutdownKind::Errored, Self::IS_ERRORED_MASK),
-        (ShutdownKind::Pruned, Self::IS_PRUNED_MASK),
-        (ShutdownKind::FlowReset, Self::IS_FLOW_RESET_MASK),
     ];
 
     #[inline]
@@ -103,12 +100,6 @@ impl ApplicationState {
             ShutdownKind::Errored => {
                 value |= Self::IS_ERRORED_MASK;
             }
-            ShutdownKind::FlowReset => {
-                value |= Self::IS_FLOW_RESET_MASK;
-            }
-            ShutdownKind::Pruned => {
-                value |= Self::IS_PRUNED_MASK;
-            }
         }
 
         shared.store(value, Ordering::Release);
@@ -123,7 +114,6 @@ pub struct State {
     inner: Mutex<Inner>,
     application_epoch: AtomicU64,
     application_state: AtomicU8,
-    pub worker_waker: WorkerWaker,
     pub transmission_queue: transmission::Queue,
     pub completion_handle: CompletionQueue<transmission::Completion>,
     is_owned_socket: bool,
@@ -150,14 +140,12 @@ impl State {
             reassembler,
             buffer,
             handshake: endpoint.into(),
-            application_waker: None,
         };
         let inner = Mutex::new(inner);
         Self {
             inner,
             application_epoch: AtomicU64::new(0),
             application_state: AtomicU8::new(0),
-            worker_waker: Default::default(),
             transmission_queue: Default::default(),
             completion_handle: CompletionQueue::uninit(),
             is_owned_socket,
@@ -186,10 +174,21 @@ impl State {
         // increment the epoch at which we acquired the guard
         self.application_epoch.fetch_add(1, Ordering::AcqRel);
 
-        let inner = self
+        let mut inner = self
             .inner
             .lock()
             .map_err(|_| io::Error::other("shared recv state has been poisoned"))?;
+
+        // If the shared error is set and the receiver hasn't transitioned yet,
+        // propagate it so the application sees it immediately via check_error().
+        if let Some(stored) = shared.common.stream_error.get() {
+            if inner.receiver.check_error().is_ok() {
+                let publisher = shared.publisher();
+                inner
+                    .receiver
+                    .on_error(stored.error, stored.source, &publisher);
+            }
+        }
 
         let initial_state = inner.receiver.state().clone();
 
@@ -204,39 +203,9 @@ impl State {
     }
 
     #[inline]
-    pub fn shutdown(&self, shutdown_kind: ShutdownKind) {
+    pub fn shutdown(&self, shutdown_kind: ShutdownKind, waker: &worker::Waker) {
         ApplicationState::close(&self.application_state, shutdown_kind);
-        self.worker_waker.wake();
-    }
-
-    pub fn on_prune<Pub>(&self, publisher: &Pub)
-    where
-        Pub: event::ConnectionPublisher,
-    {
-        self.notify_error(
-            recv::error::Kind::ApplicationError {
-                error: ShutdownKind::PRUNED_CODE.into(),
-            }
-            .err(),
-            Location::Local,
-            publisher,
-        );
-    }
-
-    #[inline]
-    pub fn notify_error<Pub>(&self, error: recv::Error, source: Location, publisher: &Pub)
-    where
-        Pub: event::ConnectionPublisher,
-    {
-        let waker = {
-            let mut inner = self.inner.lock().unwrap();
-            inner.receiver.on_error(error, source, publisher);
-            inner.application_waker.take()
-        };
-        self.worker_waker.wake();
-        if let Some(waker) = waker {
-            waker.wake();
-        }
+        waker.wake();
     }
 
     #[inline]
@@ -244,8 +213,10 @@ impl State {
         &self,
         cx: &mut Context,
         socket: &S,
+        stream_error: &OnceLock<StoredError>,
         clock: &C,
         subscriber: &shared::Subscriber<Sub>,
+        read_app_waker: &atomic_waker::AtomicWaker,
     ) -> Poll<()>
     where
         S: ?Sized + Socket,
@@ -256,7 +227,9 @@ impl State {
             let _ = ready!(socket.poll_peek_len(cx));
             return Poll::Ready(());
         }
-        let Ok(Some(mut inner)) = self.worker_try_lock() else {
+        let Ok(Some(mut inner)) =
+            self.worker_try_lock(read_app_waker, stream_error, clock, subscriber)
+        else {
             // have the worker arm its timer
             return Poll::Ready(());
         };
@@ -278,12 +251,43 @@ impl State {
         entry
     }
 
+    /// Sets the error flag on the application state so the read application path detects the error.
+    /// This uses the existing `IS_ERRORED_MASK` - the application checks the shared `OnceLock` for details.
     #[inline]
-    pub fn worker_try_lock(&self) -> io::Result<Option<WorkerGuard<'_>>> {
+    pub fn set_error_flag(&self) {
+        ApplicationState::close(&self.application_state, ShutdownKind::Errored);
+    }
+
+    #[inline]
+    pub fn worker_try_lock<'a, Clk, Sub>(
+        &'a self,
+        read_app_waker: &'a atomic_waker::AtomicWaker,
+        stream_error: &OnceLock<error::StoredError>,
+        clock: &Clk,
+        subscriber: &shared::Subscriber<Sub>,
+    ) -> io::Result<Option<WorkerGuard<'a>>>
+    where
+        Clk: Clock + ?Sized,
+        Sub: event::Subscriber,
+    {
         match self.inner.try_lock() {
-            Ok(inner) => Ok(Some(WorkerGuard {
-                inner: ManuallyDrop::new(inner),
-            })),
+            Ok(mut inner) => {
+                // If the shared error is set and the receiver hasn't transitioned yet,
+                // propagate it into the receiver state so it can transmit a connection close.
+                if let Some(stored) = stream_error.get() {
+                    if inner.receiver.check_error().is_ok() {
+                        // Use a no-op publisher since the error event was already emitted by the originator
+                        let publisher = subscriber.publisher(clock.get_time());
+                        inner
+                            .receiver
+                            .on_error(stored.error, stored.source, &publisher);
+                    }
+                }
+                Ok(Some(WorkerGuard {
+                    inner: ManuallyDrop::new(inner),
+                    read_app_waker,
+                }))
+            }
             Err(std::sync::TryLockError::WouldBlock) => Ok(None),
             Err(_) => Err(io::Error::other("shared recv state has been poisoned")),
         }
@@ -292,6 +296,7 @@ impl State {
 
 pub struct WorkerGuard<'a> {
     inner: ManuallyDrop<MutexGuard<'a, Inner>>,
+    read_app_waker: &'a atomic_waker::AtomicWaker,
 }
 
 impl core::ops::Deref for WorkerGuard<'_> {
@@ -313,19 +318,15 @@ impl core::ops::DerefMut for WorkerGuard<'_> {
 impl Drop for WorkerGuard<'_> {
     #[inline]
     fn drop(&mut self) {
-        let waker = if !self.reassembler.is_empty() {
-            self.application_waker.take()
-        } else {
-            None
-        };
+        let should_wake = !self.reassembler.is_empty();
 
         unsafe {
             // SAFETY: inner is no longer used
             ManuallyDrop::drop(&mut self.inner);
         }
 
-        if let Some(waker) = waker {
-            waker.wake();
+        if should_wake {
+            self.read_app_waker.wake();
         }
     }
 }
@@ -400,7 +401,7 @@ where
 
         if wake_worker_for_ack && !current_state.is_terminal() {
             ApplicationState::wants_ack(&self.shared.receiver.application_state);
-            self.shared.receiver.worker_waker.wake_forced();
+            self.shared.wakers.read_worker_waker.wake_forced();
             return;
         }
 
@@ -411,7 +412,9 @@ where
 
         // shut down the worker if we're in a terminal state
         if current_state.is_terminal() {
-            self.shared.receiver.shutdown(ShutdownKind::Normal);
+            self.shared
+                .receiver
+                .shutdown(ShutdownKind::Normal, &self.shared.wakers.read_worker_waker);
         }
     }
 }
@@ -425,7 +428,6 @@ pub struct Inner {
     pub reassembler: buffer::Reassembler,
     buffer: RecvBuffer,
     handshake: handshake::State,
-    application_waker: Option<core::task::Waker>,
 }
 
 impl fmt::Debug for Inner {
@@ -488,10 +490,8 @@ impl Inner {
             &mut subscriber.publisher(clock.get_time()),
         );
 
-        // If we haven't received anything yet store the waker so we can wake up
-        if matches!(actor, Actor::Application) && res.is_pending() {
-            self.application_waker = Some(cx.waker().clone());
-        }
+        // The application waker is now registered on the WakerSet's read_app_waker AtomicWaker.
+        // Registration happens at the caller level.
 
         res
     }
@@ -688,7 +688,7 @@ where
         remote_addr: &SocketAddress,
         ecn: s2n_quic_core::inet::ExplicitCongestionNotification,
         packet: crate::packet::Packet,
-    ) -> Result<(), recv::Error> {
+    ) -> Result<(), Error> {
         match packet {
             Packet::Stream(mut packet) => {
                 // make sure the packet looks OK before deriving openers from it
@@ -743,7 +743,7 @@ where
                             self.remote_queue_id = source_queue_id;
                         }
 
-                        <Result<_, recv::Error>>::Ok(())
+                        <Result<_, Error>>::Ok(())
                     },
                     self.clock,
                     &self.shared.subscriber,
@@ -758,7 +758,7 @@ where
             Packet::FlowReset(packet) => {
                 if packet.credentials() != self.shared.credentials() {
                     return if IS_STREAM {
-                        Err(recv::error::Kind::CredentialMismatch {
+                        Err(error::Kind::CredentialMismatch {
                             expected: *self.shared.credentials(),
                             actual: *packet.credentials(),
                         }
@@ -778,7 +778,7 @@ where
                     return Ok(());
                 };
 
-                let error = recv::ErrorKind::ApplicationError {
+                let error = error::Kind::ApplicationError {
                     error: packet.code.into(),
                 };
 
@@ -803,7 +803,7 @@ where
                 }
 
                 // streams don't allow for other kinds of packets so close it and bail on processing
-                Err(recv::error::Kind::UnexpectedPacket {
+                Err(error::Kind::UnexpectedPacket {
                     packet: other.kind(),
                 }
                 .into())

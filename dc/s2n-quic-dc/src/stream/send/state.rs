@@ -11,10 +11,10 @@ use crate::{
     },
     recovery,
     stream::{
+        error::{self, Error},
         processing,
         send::{
             application::state::{Message, PushError},
-            error::{self, Error},
             filter::Filter,
         },
         shared::Half,

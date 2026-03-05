@@ -8,7 +8,7 @@ use crate::{
         send::{flow, path, queue::Queue, state::transmission},
         shared::{CompletionQueue, Half, ShutdownKind},
     },
-    task::waker::worker::Waker as WorkerWaker,
+    task::waker::worker,
 };
 use core::{
     fmt,
@@ -35,7 +35,6 @@ pub struct State {
     pub flow: flow::non_blocking::State,
     pub packet_number: packet_number::Counter,
     pub path: path::State,
-    pub worker_waker: WorkerWaker,
     bandwidth: AtomicU64,
     /// A channel sender for pushing transmission information to the worker task
     ///
@@ -69,8 +68,6 @@ impl State {
             packet_number: Default::default(),
             path,
             bandwidth,
-            // this will get set once the waker spawns
-            worker_waker: Default::default(),
             worker_queue: Default::default(),
             transmission_queue: Default::default(),
             completion_handle: CompletionQueue::uninit(),
@@ -92,25 +89,27 @@ impl State {
         self.worker_queue.pop()
     }
 
-    pub fn keep_alive(&self, enabled: bool) {
+    pub fn keep_alive(&self, enabled: bool, waker: &worker::Waker) {
         self.worker_queue.push(Message {
             event: Event::KeepAlive { enabled },
         });
-        self.worker_waker.wake();
-    }
-
-    pub fn on_prune(&self) {
-        self.shutdown(ShutdownKind::Pruned, Queue::default());
+        waker.wake();
     }
 
     #[inline]
-    pub fn shutdown(&self, kind: ShutdownKind, queue: Queue) {
+    pub fn shutdown(&self, kind: ShutdownKind, queue: Queue, waker: &worker::Waker) {
         trace!(event = "shutdown", ?kind);
         let message = Message {
             event: Event::Shutdown { kind, queue },
         };
         self.worker_queue.push(message);
-        self.worker_waker.wake();
+        waker.wake();
+    }
+
+    /// Sets the error flag on the flow state so the write application path detects the error.
+    #[inline]
+    pub fn set_error_flag(&self) {
+        self.flow.set_error_flag();
     }
 
     pub fn alloc_transmission(

@@ -4,7 +4,7 @@
 use crate::{
     crypto, event,
     packet::stream,
-    stream::recv::{state::State as Receiver, Error},
+    stream::{recv::state::State as Receiver, Error},
 };
 use s2n_quic_core::{
     buffer::{reader, writer, Reader},
