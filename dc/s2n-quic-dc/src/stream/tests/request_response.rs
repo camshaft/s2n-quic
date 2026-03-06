@@ -745,6 +745,33 @@ mod udp {
 
     tests!(tokio_test);
     tokio_fuzz_test!();
+
+    /// Regression test for high-cardinality UDP stream workloads with busy polling.
+    ///
+    /// Opening tens of thousands of streams with the busy-poll scheduler was causing
+    /// severe slowdowns and timeout cascades. The root cause was an `eprintln!` call
+    /// fired on every task completion in the busy-poll loop, which serialised all
+    /// completed-task notifications through a single stderr lock and blocked the
+    /// entire event loop long enough for stream idle timers to fire.
+    #[test]
+    fn high_cardinality() {
+        without_tracing(|| {
+            let harness = Harness {
+                requests: vec![Request {
+                    count: 1,
+                    request_size: 64,
+                    response_size: 64,
+                }],
+                client: Client {
+                    count: 10_000,
+                    concurrency: 10,
+                    ..Default::default()
+                },
+                ..harness()
+            };
+            Runtime::new(&harness).run(harness);
+        });
+    }
 }
 
 mod udp_sim {
