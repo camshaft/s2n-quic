@@ -244,10 +244,20 @@ impl DroppedPackets {
         Self { counts }
     }
 
+    fn loss_percent(&self) -> f64 {
+        let mut total = 0;
+        let mut dropped = 0;
+        for range in self.ranges() {
+            total = range.end;
+            dropped += range.end - range.start;
+        }
+        (dropped as f64 / total as f64) * 100.0
+    }
+
     fn sim(self) {
         sim(|| {
             {
-                tracing::info!(packets = ?self, "dropped packets");
+                tracing::info!(packets = ?self, loss = format!("{:.02}%", self.loss_percent()), "dropped packets");
                 let mut enabled = self.enabled_iter().enumerate();
                 bach::net::monitor::on_packet_sent(move |packet| {
                     if packet.source().port() == 443 {
@@ -334,6 +344,38 @@ fn initial_loss() {
         121..124,
         129..130,
         138..141,
+    ])
+    .sim();
+}
+
+#[test]
+fn sporadic_loss() {
+    DroppedPackets::from_iter([
+        10..12,
+        22..27,
+        28..32,
+        40..45,
+        54..61,
+        63..66,
+        75..77,
+        81..84,
+        89..98,
+        108..116,
+        121..127,
+        129..131,
+        136..137,
+        143..152,
+        153..160,
+        163..172,
+        181..183,
+        185..192,
+        199..201,
+        202..212,
+        213..219,
+        227..236,
+        238..248,
+        275..283,
+        284..290,
     ])
     .sim();
 }

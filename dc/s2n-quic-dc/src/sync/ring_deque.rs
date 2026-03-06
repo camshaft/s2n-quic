@@ -216,11 +216,16 @@ impl<T, W: RecvWaker> RingDeque<T, W> {
     pub fn close(&self) -> Result<(), Closed> {
         let mut inner = self.lock()?;
         inner.open = false;
+        // Drain all remaining items so their destructors run while we can still clean up.
+        // This is important for entries that perform cleanup in their `Drop` impl
+        // (e.g., notifying stream workers that the accept queue is closed).
+        let prev = core::mem::take(&mut inner.queue);
         let waker = inner.recv_waker.take();
         drop(inner);
         if let Some(waker) = waker {
             waker.wake();
         }
+        drop(prev);
         Ok(())
     }
 

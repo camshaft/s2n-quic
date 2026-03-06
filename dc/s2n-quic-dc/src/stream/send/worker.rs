@@ -247,7 +247,10 @@ where
         } else {
             // If the sender has no timeout then we're finished
             let state = self.sender.state();
-            debug_assert!(state.is_terminal(), "{state:?}");
+            debug_assert!(
+                state.is_terminal() || state.is_reset_queued() || state.is_reset_sent(),
+                "{state:?}"
+            );
             self.state = waiting::State::Finished;
             self.timer.cancel();
             Poll::Ready(())

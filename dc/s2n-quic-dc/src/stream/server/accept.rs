@@ -44,6 +44,14 @@ impl<Sub: Subscriber> Entry<Sub> {
     pub fn queue_time(&self) -> Timestamp {
         self.0.as_ref().unwrap().queue_time
     }
+
+    /// Returns `true` if the stream already has an error set on its shared state.
+    ///
+    /// This can happen when a client closes the stream while it's still waiting
+    /// in the accept queue.
+    pub fn has_error(&self) -> bool {
+        self.0.as_ref().unwrap().shared.get_error().is_some()
+    }
 }
 
 impl<Sub: Subscriber> From<StreamBuilder<Sub>> for Entry<Sub> {
@@ -79,18 +87,29 @@ pub async fn accept<Sub>(
 where
     Sub: event::Subscriber,
 {
-    let stream = streams.recv_front().await.map_err(|_err| {
-        io::Error::new(
-            io::ErrorKind::NotConnected,
-            "server acceptor runtime is no longer available",
-        )
-    })?;
+    loop {
+        let entry = streams.recv_front().await.map_err(|_err| {
+            io::Error::new(
+                io::ErrorKind::NotConnected,
+                "server acceptor runtime is no longer available",
+            )
+        })?;
 
-    // build the stream inside the application context
-    let (stream, sojourn_time) = stream.accept()?;
-    stats.send(sojourn_time);
+        // Skip entries where the client has already closed/errored the stream
+        // while it was sitting in the accept queue. Dropping the entry will
+        // trigger its prune cleanup.
+        if entry.has_error() {
+            // TODO ideally this would be pushed to a background task so we don't block accepting
+            drop(entry);
+            continue;
+        }
 
-    let remote_addr = stream.peer_addr()?;
+        // build the stream inside the application context
+        let (stream, sojourn_time) = entry.accept()?;
+        stats.send(sojourn_time);
 
-    Ok((stream, remote_addr))
+        let remote_addr = stream.peer_addr()?;
+
+        return Ok((stream, remote_addr));
+    }
 }
