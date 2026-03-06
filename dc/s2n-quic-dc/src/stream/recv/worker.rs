@@ -161,6 +161,12 @@ where
 
     #[inline]
     fn poll_impl(&mut self, cx: &mut Context) -> Poll<()> {
+        // Check the shared error at the top of each poll cycle.
+        // If another actor set the error (e.g., prune), transition to detached so we can transmit an error
+        if self.shared.get_error().is_some() {
+            let _ = self.state.on_application_detach();
+        }
+
         if let Poll::Ready(Err(err)) = self.poll_flush_socket(cx) {
             tracing::error!(socket_error = ?err);
             // TODO should we return? if we get a send error it's most likely fatal
@@ -425,6 +431,9 @@ where
         cx: &mut Context,
         received_packets: &mut usize,
     ) -> io::Result<()> {
+        // Don't process more packets if there's already a shared error
+        ensure!(self.shared.get_error().is_none(), Ok(()));
+
         // loop until we hit Pending from the socket
         loop {
             // try_lock the state before reading so we don't consume a packet the application is
@@ -448,12 +457,12 @@ where
                     &self.shared,
                     self.socket.features(),
                     self.accept_state,
+                    Actor::Worker,
                 );
             }
 
-            let res = recv.poll_fill_recv_buffer(
+            let res = recv.poll_fill_recv_buffer_worker(
                 cx,
-                Actor::Worker,
                 &self.socket,
                 &self.shared.clock,
                 &self.shared.subscriber,
@@ -472,6 +481,7 @@ where
                 &self.shared,
                 self.socket.features(),
                 self.accept_state,
+                Actor::Worker,
             );
         }
 

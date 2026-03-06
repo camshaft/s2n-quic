@@ -435,6 +435,7 @@ struct AcceptorStreamPruned<'a> {
 enum AcceptorStreamPruneReason {
     MaxSojournTimeExceeded,
     AcceptQueueCapacityExceeded,
+    ServerClosed,
 }
 
 /// Emitted when a stream has been dequeued by the application

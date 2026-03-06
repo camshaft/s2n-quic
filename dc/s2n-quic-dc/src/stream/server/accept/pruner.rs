@@ -4,7 +4,7 @@
 use crate::{
     clock::Clock,
     event,
-    stream::{application::Builder as StreamBuilder, environment::Environment, server::stats},
+    stream::{environment::Environment, server::stats},
     sync::mpmc as channel,
 };
 use core::time::Duration;
@@ -47,7 +47,7 @@ impl Pruner {
     pub async fn run<Env>(
         self,
         env: Env,
-        channel: channel::WeakReceiver<StreamBuilder<Env::Subscriber>>,
+        channel: channel::WeakReceiver<super::Entry<Env::Subscriber>>,
         stats: stats::Stats,
     ) where
         Env: Environment,
@@ -84,7 +84,7 @@ impl Pruner {
             loop {
                 // pop off any items that have expired
                 let res = channel.pop_back_if(priority, |stream| {
-                    stream.queue_time.has_elapsed(queue_time_threshold)
+                    stream.queue_time().has_elapsed(queue_time_threshold)
                 });
 
                 match res {

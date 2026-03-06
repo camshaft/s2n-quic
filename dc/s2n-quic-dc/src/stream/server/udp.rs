@@ -249,6 +249,7 @@ where
                 });
         }
 
+        let stream = stream.into();
         let res = match self.accept_flavor {
             accept::Flavor::Fifo => self.sender.send_back(stream),
             accept::Flavor::Lifo => self.sender.send_front(stream),

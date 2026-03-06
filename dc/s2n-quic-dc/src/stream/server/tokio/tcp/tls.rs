@@ -222,6 +222,7 @@ async fn accept_conn<Sub: event::Subscriber + Clone>(
             });
     }
 
+    let stream_builder = stream_builder.into();
     let res = match flavor {
         accept::Flavor::Fifo => sender.send_back(stream_builder),
         accept::Flavor::Lifo => sender.send_front(stream_builder),

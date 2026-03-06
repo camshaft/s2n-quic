@@ -726,6 +726,8 @@ pub mod api {
         MaxSojournTimeExceeded {},
         #[non_exhaustive]
         AcceptQueueCapacityExceeded {},
+        #[non_exhaustive]
+        ServerClosed {},
     }
     impl aggregate::AsVariant for AcceptorStreamPruneReason {
         const VARIANTS: &'static [aggregate::info::Variant] = &[
@@ -739,12 +741,18 @@ pub mod api {
                 id: 1usize,
             }
             .build(),
+            aggregate::info::variant::Builder {
+                name: aggregate::info::Str::new("SERVER_CLOSED\0"),
+                id: 2usize,
+            }
+            .build(),
         ];
         #[inline]
         fn variant_idx(&self) -> usize {
             match self {
                 Self::MaxSojournTimeExceeded { .. } => 0usize,
                 Self::AcceptQueueCapacityExceeded { .. } => 1usize,
+                Self::ServerClosed { .. } => 2usize,
             }
         }
     }
@@ -4838,6 +4846,7 @@ pub mod builder {
     pub enum AcceptorStreamPruneReason {
         MaxSojournTimeExceeded,
         AcceptQueueCapacityExceeded,
+        ServerClosed,
     }
     impl IntoEvent<api::AcceptorStreamPruneReason> for AcceptorStreamPruneReason {
         #[inline]
@@ -4846,6 +4855,7 @@ pub mod builder {
             match self {
                 Self::MaxSojournTimeExceeded => MaxSojournTimeExceeded {},
                 Self::AcceptQueueCapacityExceeded => AcceptQueueCapacityExceeded {},
+                Self::ServerClosed => ServerClosed {},
             }
         }
     }

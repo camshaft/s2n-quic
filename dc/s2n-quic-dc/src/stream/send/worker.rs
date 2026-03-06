@@ -287,6 +287,7 @@ where
                     self.sender.keep_alive(enabled, &self.shared.clock);
                 }
                 Event::Shutdown { kind, mut queue } => {
+                    self.sender.keep_alive(false, &self.shared.clock);
                     self.transmit_queue.append(&mut queue);
 
                     // if the application is panicking then we notify the peer

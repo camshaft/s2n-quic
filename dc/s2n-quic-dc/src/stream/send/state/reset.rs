@@ -1,7 +1,7 @@
 use crate::stream::error::{Error, Kind};
 use s2n_quic_core::{
     endpoint::Location,
-    ensure, frame,
+    frame,
     state::{event, is},
     stream::state::Sender as SenderState,
 };
@@ -90,11 +90,22 @@ impl Reset {
         let _ = self.state.on_ack();
     }
 
+    pub fn on_peer_activity(&mut self) {
+        // TODO if we're waiting an ack then we should re-enqueue another reset. This also needs to be throttled.
+    }
+
     pub fn on_error(&mut self, error: Error, source: Location) -> Result<(), ()> {
-        ensure!(self.error.is_none(), Err(()));
+        if self.error.is_some() {
+            // If the remote peer also sent us an error then we're done
+            if source.is_remote() {
+                let _ = self.state.on_silent_close();
+            }
+            return Err(());
+        }
+
+        self.error = Some(ErrorState { error, source });
 
         let is_idle_timeout = matches!(error.kind(), Kind::IdleTimeout);
-        self.error = Some(ErrorState { error, source });
 
         if source.is_remote() || is_idle_timeout {
             let _ = self.state.on_silent_close();

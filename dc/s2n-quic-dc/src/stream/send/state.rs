@@ -787,6 +787,12 @@ impl State {
             return;
         };
 
+        // If we're in a reset state then let the reset component know there was activity
+        if !self.reset.is_idle() {
+            self.reset.on_peer_activity();
+            return;
+        }
+
         // If the peer is making progress then reset our PTO backoff. Otherwise, we could
         // get caught in a loop.
         if made_progress || self.max_data.is_blocked() {
@@ -863,6 +869,9 @@ impl State {
     #[inline]
     fn update_idle_timer(&mut self, clock: &impl Clock) {
         ensure!(!self.idle_timer.is_armed());
+        // Don't re-arm the idle timer if we're in an error state - the error
+        // timeout was set in on_error and shouldn't be overwritten
+        ensure!(self.error().is_none());
         let state = self.state();
         ensure!(state.is_ready() || state.is_sending());
 
@@ -876,6 +885,7 @@ impl State {
     #[inline]
     fn update_pto_timer(&mut self, clock: &impl Clock) {
         ensure!(!self.pto.is_armed());
+        ensure!(self.reset.is_idle());
 
         if self.has_inflight_packets() {
             self.force_arm_pto_timer(clock);
@@ -883,6 +893,10 @@ impl State {
     }
 
     fn has_inflight_packets(&self) -> bool {
+        if !self.reset.is_idle() {
+            return false;
+        }
+
         let mut has_inflight =
             self.counters
                 .has_inflight_packets(&self.unacked_ranges, &self.fin, &self.reset);
@@ -893,6 +907,8 @@ impl State {
 
     #[inline]
     fn force_arm_pto_timer(&mut self, clock: &impl Clock) {
+        ensure!(self.reset.is_idle());
+
         let mut pto_period = self
             .rtt_estimator
             .pto_period(self.pto_backoff, PacketNumberSpace::Initial);
@@ -1438,6 +1454,11 @@ impl State {
         Pub: event::ConnectionPublisher,
     {
         let error = Error::from(error);
+
+        if matches!(error.kind, error::Kind::IdleTimeout) {
+            self.idle_timer.cancel();
+        }
+
         ensure!(self.reset.on_error(error, source).is_ok());
         publisher.on_stream_sender_errored(event::builder::StreamSenderErrored { error, source });
 
@@ -1473,6 +1494,20 @@ impl State {
         self.sent_recovery_packets.clear();
         self.unacked_ranges.clear();
         self.keep_alive.on_shutdown();
+
+        // Always cancel PTO since we won't be retransmitting
+        self.pto.cancel();
+
+        if source.is_remote() {
+            // Remote errors don't need any further transmission, cancel everything
+            self.idle_timer.cancel();
+        } else {
+            // Local errors need a short timeout to send the reset and wait for an ACK.
+            // Use a shorter timeout (5s) instead of the full idle timeout.
+            let error_timeout = Duration::from_secs(5);
+            self.idle_timer.cancel();
+            self.idle_timer.set(now + error_timeout);
+        }
     }
 
     #[cfg(debug_assertions)]

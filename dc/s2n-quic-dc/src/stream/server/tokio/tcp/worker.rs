@@ -526,6 +526,7 @@ where
                 );
             }
 
+            let stream_builder = stream_builder.into();
             let res = match context.accept_flavor {
                 accept::Flavor::Fifo => self.sender.send_back(stream_builder),
                 accept::Flavor::Lifo => self.sender.send_front(stream_builder),

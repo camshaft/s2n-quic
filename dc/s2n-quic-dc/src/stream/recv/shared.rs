@@ -15,6 +15,7 @@ use crate::{
     },
     task::waker::worker,
 };
+use atomic_waker::AtomicWaker;
 use core::{
     fmt,
     mem::ManuallyDrop,
@@ -187,6 +188,7 @@ impl State {
                 inner
                     .receiver
                     .on_error(stored.error, stored.source, &publisher);
+                return Err(stored.error.into());
             }
         }
 
@@ -233,7 +235,7 @@ impl State {
             // have the worker arm its timer
             return Poll::Ready(());
         };
-        let _ = ready!(inner.poll_fill_recv_buffer(cx, Actor::Worker, socket, clock, subscriber));
+        let _ = ready!(inner.poll_fill_recv_buffer_worker(cx, socket, clock, subscriber));
         Poll::Ready(())
     }
 
@@ -470,10 +472,9 @@ impl Inner {
     }
 
     #[inline]
-    pub fn poll_fill_recv_buffer<S, C, Sub>(
+    pub fn poll_fill_recv_buffer_worker<S, C, Sub>(
         &mut self,
         cx: &mut Context,
-        actor: Actor,
         socket: &S,
         clock: &C,
         subscriber: &shared::Subscriber<Sub>,
@@ -485,13 +486,45 @@ impl Inner {
     {
         let res = self.buffer.poll_fill(
             cx,
-            actor,
+            Actor::Worker,
             socket,
             &mut subscriber.publisher(clock.get_time()),
         );
 
-        // The application waker is now registered on the WakerSet's read_app_waker AtomicWaker.
-        // Registration happens at the caller level.
+        res
+    }
+
+    #[inline]
+    pub fn poll_fill_recv_buffer_app<S, C, Sub>(
+        &mut self,
+        cx: &mut Context,
+        socket: &S,
+        clock: &C,
+        subscriber: &shared::Subscriber<Sub>,
+        waker: &AtomicWaker,
+        error: &OnceLock<StoredError>,
+    ) -> Poll<io::Result<usize>>
+    where
+        S: ?Sized + Socket,
+        C: ?Sized + Clock,
+        Sub: event::Subscriber,
+    {
+        let res = self.buffer.poll_fill(
+            cx,
+            Actor::Application,
+            socket,
+            &mut subscriber.publisher(clock.get_time()),
+        );
+
+        // Register the waker with the shared state so we get notified of potential errors as well
+        if res.is_pending() {
+            waker.register(cx.waker());
+
+            // We need to check the error before going to sleep as it could have been set between registering the waker
+            if let Some(stored) = error.get() {
+                return Poll::Ready(Err(stored.error.into()));
+            }
+        }
 
         res
     }
@@ -503,6 +536,7 @@ impl Inner {
         shared: &ArcShared<Sub>,
         features: TransportFeatures,
         accept_state: AcceptState,
+        actor: Actor,
     ) -> bool
     where
         Sub: event::Subscriber,
@@ -571,6 +605,10 @@ impl Inner {
             // if we processed packets then we may have data to copy out
             self.receiver
                 .on_read_buffer(&mut self.reassembler, out_buf, accept_state, clock);
+        }
+
+        if let Err(err) = self.receiver.check_error() {
+            shared.set_error(err, Location::Remote, Some((shared::Half::Read, actor)));
         }
 
         // we only check for timeouts on unreliable transports
@@ -778,9 +816,7 @@ where
                     return Ok(());
                 };
 
-                let error = error::Kind::ApplicationError {
-                    error: packet.code.into(),
-                };
+                let error = error::Kind::from_application_code(packet.code).err();
 
                 self.receiver
                     .on_error(error, Location::Remote, &self.publisher);

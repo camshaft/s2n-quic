@@ -186,8 +186,6 @@ where
             let res = self.0.poll_read_into(cx, &mut out_buf);
 
             if res.is_pending() {
-                // Register the application waker so error notifications wake us
-                self.0.shared.wakers.read_app_waker.register(cx.waker());
                 debug_assert_eq!(
                     out_buf.written_len(),
                     0,
@@ -239,7 +237,13 @@ where
         loop {
             // try to process any bytes we have in the recv buffer
             // - use the `Accepted` state since this is the application interface
-            reader.process_recv_buffer(out_buf, shared, transport_features, AcceptState::Accepted);
+            reader.process_recv_buffer(
+                out_buf,
+                shared,
+                transport_features,
+                AcceptState::Accepted,
+                Actor::Application,
+            );
 
             // if we still have remaining capacity in the `out_buf` make sure the reassembler is
             // fully drained
@@ -293,12 +297,13 @@ where
                 _ => {}
             }
 
-            let recv = reader.poll_fill_recv_buffer(
+            let recv = reader.poll_fill_recv_buffer_app(
                 cx,
-                Actor::Application,
                 self.sockets.read_application(),
                 &self.shared.clock,
                 &self.shared.subscriber,
+                &self.shared.wakers.read_app_waker,
+                &self.shared.stream_error,
             );
 
             let recv_len =

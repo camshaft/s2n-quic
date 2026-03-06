@@ -99,6 +99,7 @@ where
             event::builder::AcceptorStreamPruneReason::AcceptQueueCapacityExceeded => {
                 error::Kind::AcceptQueueFull
             }
+            event::builder::AcceptorStreamPruneReason::ServerClosed => error::Kind::ServerClosed,
         }
         .err();
 

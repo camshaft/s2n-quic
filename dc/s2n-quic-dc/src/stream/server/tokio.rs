@@ -7,7 +7,6 @@ use crate::{
     event,
     path::secret,
     stream::{
-        application::Builder as StreamBuilder,
         environment::{
             tokio::{self as env, Environment},
             udp as udp_pool, Environment as _,
@@ -268,7 +267,7 @@ impl Builder {
         });
 
         let backlog: usize = self.backlog.map(NonZeroU16::get).unwrap_or(DEFAULT_BACKLOG) as usize;
-        let (stream_sender, stream_receiver) = mpmc::new::<StreamBuilder<S>>(backlog);
+        let (stream_sender, stream_receiver) = mpmc::new(backlog);
 
         let mut env = env::Builder::new(subscriber)
             .with_threads(concurrency)

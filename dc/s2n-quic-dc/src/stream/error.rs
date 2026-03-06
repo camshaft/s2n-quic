@@ -132,6 +132,8 @@ pub enum Kind {
     AcceptQueueFull,
     #[error("the stream was dropped due to high sojourn time")]
     MaxSojournTime,
+    #[error("the server is not accepting streams")]
+    ServerClosed,
     #[error("the flow state was reset and the stream is unrecoverable")]
     FlowReset,
     #[error("the stream was closed without an error")]
@@ -205,8 +207,10 @@ impl Kind {
     pub const ACCEPT_FULL_CODE: u8 = 2;
     /// The stream was dropped due to high sojourn time
     pub const MAX_SOJOURN_TIME_CODE: u8 = 3;
+    /// The server is not accepting streams
+    pub const SERVER_CLOSED_CODE: u8 = 4;
     /// The flow state is gone and the stream is unrecoverable
-    pub const FLOW_RESET_CODE: u8 = 4;
+    pub const FLOW_RESET_CODE: u8 = 5;
 
     #[inline]
     #[track_caller]
@@ -248,6 +252,7 @@ impl Kind {
             Kind::ApplicationPanic => from_code(Kind::PANIC_CODE),
             Kind::AcceptQueueFull => from_code(Kind::ACCEPT_FULL_CODE),
             Kind::MaxSojournTime => from_code(Kind::MAX_SOJOURN_TIME_CODE),
+            Kind::ServerClosed => from_code(Kind::SERVER_CLOSED_CODE),
             Kind::FlowReset => from_code(Kind::FLOW_RESET_CODE),
 
             Kind::ApplicationError { error } => Some(frame::ConnectionClose {
@@ -284,15 +289,17 @@ impl Kind {
     }
 
     pub(crate) fn from_connection_close(close: &frame::ConnectionClose<'_>) -> Self {
-        match close.error_code.as_u64() {
+        Self::from_application_code(close.error_code)
+    }
+
+    pub(crate) fn from_application_code(code: VarInt) -> Self {
+        match code.as_u64() {
             code if code == Self::NORMAL_CODE as u64 => Self::NormalClose,
             code if code == Self::PANIC_CODE as u64 => Self::ApplicationPanic,
             code if code == Self::ACCEPT_FULL_CODE as u64 => Self::AcceptQueueFull,
             code if code == Self::MAX_SOJOURN_TIME_CODE as u64 => Self::MaxSojournTime,
             code if code == Self::FLOW_RESET_CODE as u64 => Self::FlowReset,
-            _ => Self::ApplicationError {
-                error: close.error_code.into(),
-            },
+            _ => Self::ApplicationError { error: code.into() },
         }
     }
 }
@@ -331,6 +338,7 @@ impl From<Kind> for std::io::ErrorKind {
             Kind::ApplicationPanic => ErrorKind::ConnectionAborted,
             Kind::AcceptQueueFull => ErrorKind::ConnectionRefused,
             Kind::MaxSojournTime => ErrorKind::ConnectionRefused,
+            Kind::ServerClosed => ErrorKind::ConnectionRefused,
             Kind::FlowReset => ErrorKind::ConnectionReset,
             Kind::ApplicationError { .. } => ErrorKind::ConnectionReset,
             Kind::TransportError { .. } => ErrorKind::ConnectionAborted,
