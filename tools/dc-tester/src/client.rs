@@ -3,7 +3,7 @@
 
 use crate::config::{ClientConfig, WorkloadConfig};
 use s2n_quic_core::{buffer::Reader as _, stream::testing::Data};
-use s2n_quic_dc::psk;
+use s2n_quic_dc::{psk, stream::socket};
 use std::{
     io,
     net::SocketAddr,
@@ -62,6 +62,8 @@ impl WorkloadStats {
         let sent = self.bytes_sent.swap(0, Ordering::Relaxed);
         let received = self.bytes_received.swap(0, Ordering::Relaxed);
         let errors = self.errors.swap(0, Ordering::Relaxed);
+        let success = completed.saturating_sub(errors);
+        let success_rate = success as f64 / completed.max(1) as f64;
 
         info!(
             workload = %self.workload_name,
@@ -70,6 +72,7 @@ impl WorkloadStats {
             bytes_sent = sent,
             bytes_received = received,
             errors,
+            success_rate = %format_args!("{:.2}%", success_rate * 100.0),
             "Workload stats"
         );
     }
@@ -96,6 +99,9 @@ pub async fn run(
 
     let client: Client =
         s2n_quic_dc::stream::client::tokio::Client::<psk::client::Provider, Subscriber>::builder()
+            .with_default_protocol(socket::Protocol::Udp)
+            .with_send_socket_workers(crate::busy_poll::send_pool().into())
+            .with_recv_socket_workers(crate::busy_poll::recv_pool().into())
             .build(handshake, crate::psk::subscriber())?;
 
     let server_name = crate::psk::server_name();
@@ -180,12 +186,12 @@ async fn run_worker(
         {
             Ok((sent, received)) => (sent, received, false),
             Err(e) => {
-                error!(
-                    workload = %workload.name,
-                    worker_id,
-                    error = %e,
-                    "Request failed"
-                );
+                // error!(
+                //     workload = %workload.name,
+                //     worker_id,
+                //     error = %e,
+                //     "Request failed"
+                // );
                 (0, 0, true)
             }
         };
@@ -231,11 +237,11 @@ async fn execute_request(
     }
 
     if !response.is_finished() {
-        tracing::warn!(
+        return Err(io::Error::other(format!(
             "response was not fully received: expected {} bytes, got {} bytes",
             workload.response_size,
             response.current_offset()
-        );
+        )));
     }
 
     Ok((bytes_sent, workload.response_size))

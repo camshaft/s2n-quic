@@ -59,6 +59,8 @@ impl Stats {
         let received = self.bytes_received.swap(0, Ordering::Relaxed);
         let sent = self.bytes_sent.swap(0, Ordering::Relaxed);
         let errors = self.errors.swap(0, Ordering::Relaxed);
+        let success = completed.saturating_sub(errors);
+        let success_rate = success as f64 / completed.max(1) as f64;
 
         info!(
             requests_processing = processing,
@@ -66,6 +68,8 @@ impl Stats {
             bytes_sent = sent,
             bytes_received = received,
             errors,
+            success,
+            success_rate = %format_args!("{:.2}%", success_rate * 100.0),
             "Server stats"
         );
     }
@@ -82,6 +86,8 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
     let server: Server =
         s2n_quic_dc::stream::server::tokio::Server::<psk::server::Provider, Subscriber>::builder()
             .with_address(config.address)
+            .with_send_socket_workers(crate::busy_poll::send_pool().into())
+            .with_recv_socket_workers(crate::busy_poll::recv_pool().into())
             .build(handshake, crate::psk::subscriber())?;
 
     let acceptor_addr = server.acceptor_addr()?;
@@ -116,7 +122,7 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
             let (bytes_received, bytes_sent, is_error) = match handle_connection(stream).await {
                 Ok((recv, sent)) => (recv, sent, false),
                 Err(e) => {
-                    error!(%peer_addr, error = %e, "Error handling connection");
+                    // error!(%peer_addr, error = %e, "Error handling connection");
                     (0, 0, true)
                 }
             };
