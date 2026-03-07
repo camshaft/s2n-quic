@@ -56,8 +56,6 @@ fn simple() {
     sim(hello_goodbye);
 }
 
-// TODO use this with bach >= 0.0.13
-#[cfg(todo)]
 #[test]
 fn no_loss() {
     use core::sync::atomic::{AtomicUsize, Ordering};
@@ -81,8 +79,6 @@ fn no_loss() {
     assert_eq!(COUNT.load(Ordering::Relaxed), 4);
 }
 
-// TODO use this with bach >= 0.0.13
-#[cfg(todo)]
 #[test]
 fn packet_loss() {
     use core::sync::atomic::{AtomicUsize, Ordering};
@@ -270,9 +266,7 @@ impl Harness {
 #[test]
 fn large_transfer() {
     sim(|| {
-        // TODO use once bach 0.1 is released
-        #[cfg(todo)]
-        bach::net::monitor::on_packet_sent(|packet| {
+        bach::net::monitor::on_packet_sent(|_packet| {
             use bach::net::monitor::Command;
 
             // 25% chance of dropping a packet

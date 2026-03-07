@@ -1,0 +1,24 @@
+# RPC Tester Configuration
+#
+# Usage:
+#   Server: cargo run --bin rpc-tester -- server --config etc/config.example.toml
+#   Client: cargo run --bin rpc-tester -- client --config etc/config.example.toml
+
+[server]
+address = "[::]:4433"
+
+[client]
+# Each workload defines a traffic pattern
+[[client.workloads]]
+name = "small-rpc"
+workers = 50000
+request_size = 1024  # 1 KiB
+response_size = 1024 # 1 KiB
+request_delay_ms = 0 # no delay - continuous
+
+# [[client.workloads]]
+# name = "large-rpc"
+# workers = 4
+# request_size = 1048576  # 1 MiB
+# response_size = 1048576 # 1 MiB
+# request_delay_ms = 0

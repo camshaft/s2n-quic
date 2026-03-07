@@ -1,0 +1,104 @@
+// Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+mod client;
+mod config;
+mod psk;
+mod server;
+
+use clap::{Parser, Subcommand};
+use std::{net::SocketAddr, path::PathBuf};
+
+#[derive(Parser)]
+#[command(name = "dc-tester")]
+#[command(about = "dcQUIC load testing tool")]
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    /// Start the RPC server
+    Server {
+        /// Path to configuration file
+        #[arg(short, long)]
+        config: Option<PathBuf>,
+
+        /// Override the server bind address
+        #[arg(short, long)]
+        address: Option<SocketAddr>,
+    },
+    /// Start the RPC client
+    Client {
+        /// Path to configuration file
+        #[arg(short, long)]
+        config: Option<PathBuf>,
+
+        /// Server acceptor address to connect to (e.g., [::1]:4433)
+        #[arg(short, long)]
+        server_addr: Option<SocketAddr>,
+    },
+}
+
+#[tokio::main(flavor = "multi_thread")]
+async fn main() -> std::io::Result<()> {
+    init_tracing();
+
+    let cli = Cli::parse();
+
+    match cli.command {
+        Commands::Server { config, address } => {
+            let mut config = if let Some(path) = config {
+                config::Config::load(&path)?.server
+            } else {
+                config::ServerConfig::default()
+            };
+
+            if let Some(addr) = address {
+                config.address = addr;
+            }
+
+            server::run(config).await
+        }
+        Commands::Client {
+            config,
+            server_addr,
+        } => {
+            let config = if let Some(path) = config {
+                config::Config::load(&path)?
+            } else {
+                config::Config {
+                    server: config::ServerConfig::default(),
+                    client: config::ClientConfig::default(),
+                }
+            };
+
+            let (acceptor_addr, handshake_addr) = if let Some(addr) = server_addr {
+                let mut handshake = addr;
+                handshake.set_port(addr.port() - 1);
+                (addr, handshake)
+            } else {
+                let server_addr = config.server.address;
+                (server_addr, config.server.handshake_addr())
+            };
+
+            client::run(config.client, acceptor_addr, handshake_addr).await
+        }
+    }
+}
+
+fn init_tracing() {
+    use tracing_subscriber::EnvFilter;
+
+    let filter = EnvFilter::builder()
+        .with_default_directive(tracing::Level::INFO.into())
+        .with_env_var("S2N_LOG")
+        .from_env()
+        .unwrap();
+
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_target(false)
+        .init();
+}
