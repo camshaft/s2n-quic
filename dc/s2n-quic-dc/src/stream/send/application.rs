@@ -102,7 +102,10 @@ where
 
     #[inline]
     pub fn keep_alive(&self, enabled: bool) {
-        self.0.shared.sender.keep_alive(enabled, &self.0.shared.wakers.write_worker_waker);
+        self.0
+            .shared
+            .sender
+            .keep_alive(enabled, &self.0.shared.wakers.write_worker_waker);
     }
 
     #[inline]
@@ -386,17 +389,19 @@ where
             let _ = self.poll_write_from(&mut cx, &mut buffer::reader::storage::Empty, true);
         }
 
+        let fin_sent = matches!(self.status, Status::WroteFin);
         self.status = Status::Shutdown;
         self.shared
             .common
             .closed_halves
             .fetch_add(1, Ordering::Relaxed);
 
-        let queue = core::mem::take(&mut self.queue);
+        let mut queue = core::mem::take(&mut self.queue);
 
         // if we've transmitted everything we need to then finished the writing half
         if matches!(ty, ShutdownType::Explicit) && queue.is_empty() {
             self.sockets.write_application().send_finish()?;
+            queue = core::mem::take(&mut self.queue);
         }
 
         let buffer_len = queue.accepted_len();
@@ -416,8 +421,12 @@ where
             } else {
                 ShutdownKind::Normal
             };
-            let queue = core::mem::take(&mut self.queue);
-            self.shared.sender.shutdown(shutdown_kind, queue, &self.shared.wakers.write_worker_waker);
+            self.shared.sender.shutdown(
+                shutdown_kind,
+                queue,
+                fin_sent,
+                &self.shared.wakers.write_worker_waker,
+            );
             return Ok(());
         }
 

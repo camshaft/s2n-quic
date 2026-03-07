@@ -103,7 +103,8 @@ impl ApplicationState {
             }
         }
 
-        shared.store(value, Ordering::Release);
+        // Use fetch_or to avoid clobbering the WANTS_ACK bit
+        shared.fetch_or(value, Ordering::Release);
     }
 }
 
@@ -401,10 +402,15 @@ where
             ManuallyDrop::drop(&mut self.inner);
         }
 
-        if wake_worker_for_ack && !current_state.is_terminal() {
+        if wake_worker_for_ack {
+            // Signal the worker to send the ACK even when the state is terminal,
+            // so the peer gets delivery confirmation before we shut down.
             ApplicationState::wants_ack(&self.shared.receiver.application_state);
             self.shared.wakers.read_worker_waker.wake_forced();
-            return;
+
+            if !current_state.is_terminal() {
+                return;
+            }
         }
 
         // no need to look at anything if the state didn't change

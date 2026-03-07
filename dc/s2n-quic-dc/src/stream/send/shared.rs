@@ -27,8 +27,15 @@ pub struct Message {
 
 #[derive(Debug)]
 pub enum Event {
-    Shutdown { kind: ShutdownKind, queue: Queue },
-    KeepAlive { enabled: bool },
+    Shutdown {
+        kind: ShutdownKind,
+        queue: Queue,
+        /// Indicates the application already transmitted the fin as part of its stream data
+        fin_sent: bool,
+    },
+    KeepAlive {
+        enabled: bool,
+    },
 }
 
 pub struct State {
@@ -97,10 +104,20 @@ impl State {
     }
 
     #[inline]
-    pub fn shutdown(&self, kind: ShutdownKind, queue: Queue, waker: &worker::Waker) {
-        trace!(event = "shutdown", ?kind);
+    pub fn shutdown(
+        &self,
+        kind: ShutdownKind,
+        queue: Queue,
+        fin_sent: bool,
+        waker: &worker::Waker,
+    ) {
+        trace!(event = "shutdown", ?kind, fin_sent);
         let message = Message {
-            event: Event::Shutdown { kind, queue },
+            event: Event::Shutdown {
+                kind,
+                queue,
+                fin_sent,
+            },
         };
         self.worker_queue.push(message);
         waker.wake();

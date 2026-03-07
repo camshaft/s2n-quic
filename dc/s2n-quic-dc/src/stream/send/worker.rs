@@ -37,15 +37,19 @@ mod waiting {
     pub enum State {
         #[default]
         Acking,
-        Detached,
+        /// The application didn't send the fin; the worker needs to drain and send it
+        DetachedDrain,
+        /// The application already transmitted the fin; just waiting for ACKs
+        DetachedFinSent,
         ShuttingDown,
         Finished,
     }
 
     impl State {
         event! {
-            on_application_detach(Acking => Detached);
-            on_shutdown(Acking | Detached => ShuttingDown);
+            on_application_detach_fin_sent(Acking => DetachedFinSent);
+            on_application_detach_drain(Acking => DetachedDrain);
+            on_shutdown(Acking | DetachedFinSent | DetachedDrain => ShuttingDown);
             on_finished(ShuttingDown => Finished);
         }
     }
@@ -289,7 +293,11 @@ where
                 Event::KeepAlive { enabled } => {
                     self.sender.keep_alive(enabled, &self.shared.clock);
                 }
-                Event::Shutdown { kind, mut queue } => {
+                Event::Shutdown {
+                    kind,
+                    mut queue,
+                    fin_sent,
+                } => {
                     self.sender.keep_alive(false, &self.shared.clock);
                     self.transmit_queue.append(&mut queue);
 
@@ -307,8 +315,14 @@ where
                         );
                     }
 
-                    // transition to a detached state
-                    if self.state.on_application_detach().is_ok() {
+                    // transition to the appropriate detached state based on
+                    // whether the application already transmitted the fin
+                    let transitioned = if fin_sent {
+                        self.state.on_application_detach_fin_sent().is_ok()
+                    } else {
+                        self.state.on_application_detach_drain().is_ok()
+                    };
+                    if transitioned {
                         break;
                     }
                 }
@@ -408,12 +422,22 @@ where
                 waiting::State::Acking => {
                     self.fill_transmit_queue();
                 }
-                waiting::State::Detached => {
-                    // make sure we have the current view from the application
+                waiting::State::DetachedDrain => {
+                    // The application didn't send the fin yet - tell the sender
+                    // so it can transmit a probe with the final offset
                     let final_offset = self.shared.sender.flow.stream_offset();
                     self.sender.on_fin_known(final_offset);
 
                     // transition to shutting down
+                    let _ = self.state.on_shutdown();
+
+                    continue;
+                }
+                waiting::State::DetachedFinSent => {
+                    // The application already transmitted the fin as part of
+                    // its stream data. The completion queue will pick it up
+                    // when the send wheel flushes. Just transition directly
+                    // to shutting down - no need to send a redundant probe.
                     let _ = self.state.on_shutdown();
 
                     continue;

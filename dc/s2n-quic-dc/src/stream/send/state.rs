@@ -1087,13 +1087,24 @@ impl State {
     }
 
     fn requires_transmission(&self) -> bool {
-        let mut enabled = false;
+        let pto = self.pto.transmissions() > 0;
+        let fin = self.fin.is_queued();
+        let reset = self.reset.is_queued();
+        let max_data = self.max_data.is_queued();
+        let keep_alive = self.keep_alive.is_queued();
 
-        enabled |= self.pto.transmissions() > 0;
-        enabled |= self.fin.is_queued();
-        enabled |= self.reset.is_queued();
-        enabled |= self.max_data.is_queued();
-        enabled |= self.keep_alive.is_queued();
+        let enabled = pto | fin | reset | max_data | keep_alive;
+
+        if enabled {
+            trace!(
+                pto,
+                fin,
+                reset,
+                max_data,
+                keep_alive,
+                "requires_transmission"
+            );
+        }
 
         enabled
     }
