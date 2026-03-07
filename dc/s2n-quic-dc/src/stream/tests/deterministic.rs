@@ -50,6 +50,56 @@ fn request_response() {
 }
 
 #[test]
+fn split() {
+    sim(|| {
+        ::bach::net::monitor::on_packet_sent(move |packet| {
+            tracing::info!(?packet, "on_packet_sent");
+            Default::default()
+        });
+
+        async move {
+            let client = Client::builder().build();
+            let stream = client.connect_sim("server:443").await.unwrap();
+
+            let (mut recv, mut send) = stream.into_split();
+
+            let request = b"hello!";
+            send.write_all_from_fin(&mut &request[..]).await.unwrap();
+            drop(send);
+
+            1.s().sleep().await;
+
+            let mut response = vec![];
+            recv.read_to_end(&mut response).await.unwrap();
+
+            assert_eq!(request, &response[..]);
+        }
+        .group("client")
+        .primary()
+        .spawn();
+
+        async move {
+            let server = Server::udp().port(443).build();
+
+            while let Ok((stream, _addr)) = server.accept().await {
+                spawn(async move {
+                    let (mut recv, mut send) = stream.into_split();
+                    let mut request = vec![];
+                    recv.read_to_end(&mut request).await.unwrap();
+                    drop(recv);
+
+                    1.s().sleep().await;
+
+                    send.write_all_from_fin(&mut &request[..]).await.unwrap();
+                });
+            }
+        }
+        .group("server")
+        .spawn();
+    });
+}
+
+#[test]
 fn fail_fast_unknown_path_secret() {
     sim(|| {
         async move {
