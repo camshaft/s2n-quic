@@ -1156,8 +1156,11 @@ impl State {
         let pto = self.pto.transmissions() > 0;
         let fin = self.fin.is_queued();
         let reset = self.reset.is_queued();
-        let max_data = self.max_data.is_queued();
         let keep_alive = self.keep_alive.is_queued();
+
+        // only transmit max_data when we don't have any other packets to send; it acts as a
+        // keep-alive to signal flow-control blockage when the stream would otherwise be idle
+        let max_data = self.max_data.is_queued() && !pto && self.retransmissions.is_empty();
 
         let enabled = pto | fin | reset | max_data | keep_alive;
 
