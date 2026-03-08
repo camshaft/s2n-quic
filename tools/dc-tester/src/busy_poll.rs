@@ -9,7 +9,7 @@
 use s2n_quic_dc::busy_poll;
 use std::sync::OnceLock;
 
-const DEFAULT_WORKERS: usize = if cfg!(debug_assertions) { 1 } else { 5 };
+const DEFAULT_WORKERS: usize = if cfg!(debug_assertions) { 1 } else { 2 };
 
 struct BusyPoll(OnceLock<busy_poll::Pool>);
 

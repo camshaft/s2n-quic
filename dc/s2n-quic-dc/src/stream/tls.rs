@@ -590,11 +590,17 @@ where
         &Default::default(),
     );
 
+    let peer_addr_sa: s2n_quic_core::inet::SocketAddress = peer_addr.into();
     let meta = crate::event::api::ConnectionMeta {
-        id: 0, // TODO use an actual connection ID
+        id: crate::event::next_connection_id(),
         timestamp: env.clock().get_time().into_event(),
     };
-    let info = crate::event::api::ConnectionInfo {};
+    let info = crate::event::api::ConnectionInfo {
+        credential_id: &[1; 16],
+        key_id: 0,
+        remote_address: (&peer_addr_sa).into_event(),
+        is_server: endpoint_type == s2n_quic_core::endpoint::Type::Server,
+    };
 
     let subscriber = env.subscriber().clone();
     let subscriber_ctx = subscriber.create_connection_context(&meta, &info);

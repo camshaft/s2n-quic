@@ -831,11 +831,24 @@ pub mod api {
     }
     #[derive(Clone, Debug)]
     #[non_exhaustive]
-    pub struct ConnectionInfo {}
+    pub struct ConnectionInfo<'a> {
+        #[doc = " The credential ID (path secret identifier) for this stream"]
+        pub credential_id: &'a [u8],
+        #[doc = " The key ID (per-stream counter derived from the path secret)"]
+        pub key_id: u64,
+        #[doc = " The remote peer address"]
+        pub remote_address: SocketAddress<'a>,
+        #[doc = " Whether this is the client or server side of the stream"]
+        pub is_server: bool,
+    }
     #[cfg(any(test, feature = "testing"))]
-    impl crate::event::snapshot::Fmt for ConnectionInfo {
+    impl<'a> crate::event::snapshot::Fmt for ConnectionInfo<'a> {
         fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
             let mut fmt = fmt.debug_struct("ConnectionInfo");
+            fmt.field("credential_id", &"[HIDDEN]");
+            fmt.field("key_id", &self.key_id);
+            fmt.field("remote_address", &self.remote_address);
+            fmt.field("is_server", &self.is_server);
             fmt.finish()
         }
     }
@@ -4909,12 +4922,31 @@ pub mod builder {
         }
     }
     #[derive(Clone, Debug)]
-    pub struct ConnectionInfo {}
-    impl IntoEvent<api::ConnectionInfo> for ConnectionInfo {
+    pub struct ConnectionInfo<'a> {
+        #[doc = " The credential ID (path secret identifier) for this stream"]
+        pub credential_id: &'a [u8],
+        #[doc = " The key ID (per-stream counter derived from the path secret)"]
+        pub key_id: u64,
+        #[doc = " The remote peer address"]
+        pub remote_address: &'a s2n_quic_core::inet::SocketAddress,
+        #[doc = " Whether this is the client or server side of the stream"]
+        pub is_server: bool,
+    }
+    impl<'a> IntoEvent<api::ConnectionInfo<'a>> for ConnectionInfo<'a> {
         #[inline]
-        fn into_event(self) -> api::ConnectionInfo {
-            let ConnectionInfo {} = self;
-            api::ConnectionInfo {}
+        fn into_event(self) -> api::ConnectionInfo<'a> {
+            let ConnectionInfo {
+                credential_id,
+                key_id,
+                remote_address,
+                is_server,
+            } = self;
+            api::ConnectionInfo {
+                credential_id: credential_id.into_event(),
+                key_id: key_id.into_event(),
+                remote_address: remote_address.into_event(),
+                is_server: is_server.into_event(),
+            }
         }
     }
     #[derive(Clone, Debug)]

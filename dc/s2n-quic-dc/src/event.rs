@@ -6,6 +6,15 @@ use s2n_quic_core::event::snapshot;
 
 pub use s2n_quic_core::event::{Event, IntoEvent, Timestamp};
 
+/// Global atomic counter for assigning unique stream IDs within a process.
+static NEXT_CONNECTION_ID: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
+
+/// Returns a unique connection ID for a new stream.
+#[inline]
+pub fn next_connection_id() -> u64 {
+    NEXT_CONNECTION_ID.fetch_add(1, core::sync::atomic::Ordering::Relaxed)
+}
+
 /// Provides metadata related to an event
 pub trait Meta: core::fmt::Debug {
     /// A context from which the event is being emitted
@@ -25,6 +34,8 @@ impl Meta for api::EndpointMeta {
         builder::Subject::Endpoint {}.into_event()
     }
 }
+
+pub mod diagnostic;
 
 mod generated;
 pub use generated::*;

@@ -9,6 +9,7 @@ members = ["."]
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
+mimalloc = { version = "0.1", default-features = false }
 s2n-quic = { path = "../../quic/s2n-quic", features = ["unstable-provider-dc", "unstable-provider-random"] }
 s2n-quic-dc = { path = "../../dc/s2n-quic-dc", features = ["tokio"] }
 s2n-quic-core = { path = "../../quic/s2n-quic-core", features = ["testing"] }

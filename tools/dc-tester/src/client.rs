@@ -7,6 +7,7 @@ use s2n_quic_dc::{psk, stream::socket};
 use std::{
     io,
     net::SocketAddr,
+    path::PathBuf,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
@@ -82,6 +83,7 @@ pub async fn run(
     config: ClientConfig,
     acceptor_addr: SocketAddr,
     handshake_addr: SocketAddr,
+    trace_dir: &PathBuf,
 ) -> io::Result<()> {
     info!(
         workload_count = config.workloads.len(),
@@ -95,14 +97,14 @@ pub async fn run(
         return Ok(());
     }
 
-    let handshake = crate::psk::client()?;
+    let handshake = crate::psk::client(trace_dir)?;
 
     let client: Client =
         s2n_quic_dc::stream::client::tokio::Client::<psk::client::Provider, Subscriber>::builder()
             .with_default_protocol(socket::Protocol::Udp)
             .with_send_socket_workers(crate::busy_poll::send_pool().into())
             .with_recv_socket_workers(crate::busy_poll::recv_pool().into())
-            .build(handshake, crate::psk::subscriber())?;
+            .build(handshake, crate::psk::subscriber(trace_dir))?;
 
     let server_name = crate::psk::server_name();
 

@@ -10,10 +10,17 @@ mod server;
 use clap::{Parser, Subcommand};
 use std::{net::SocketAddr, path::PathBuf};
 
+#[global_allocator]
+static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 #[derive(Parser)]
 #[command(name = "dc-tester")]
 #[command(about = "dcQUIC load testing tool")]
 struct Cli {
+    /// Directory to write diagnostic event traces for errored streams
+    #[arg(long, default_value = "/tmp/dc-traces")]
+    trace_dir: PathBuf,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -60,7 +67,7 @@ async fn main() -> std::io::Result<()> {
                 config.address = addr;
             }
 
-            server::run(config).await
+            server::run(config, &cli.trace_dir).await
         }
         Commands::Client {
             config,
@@ -84,7 +91,7 @@ async fn main() -> std::io::Result<()> {
                 (server_addr, config.server.handshake_addr())
             };
 
-            client::run(config.client, acceptor_addr, handshake_addr).await
+            client::run(config.client, acceptor_addr, handshake_addr, &cli.trace_dir).await
         }
     }
 }

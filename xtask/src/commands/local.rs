@@ -46,6 +46,10 @@ pub struct Local {
     /// Path to dc-tester config file
     #[arg(long)]
     dc_config: Option<PathBuf>,
+
+    /// Directory for diagnostic event traces (one JSON file per errored stream)
+    #[arg(long, default_value = "/tmp/dc-traces")]
+    trace_dir: PathBuf,
 }
 
 impl Local {
@@ -113,7 +117,14 @@ impl Local {
             let (binary, config_path) =
                 node.resolve_paths(sh, &binary_dir.join("dc-tester"), &dc_config);
 
-            let args = vec!["server".to_string(), "--config".to_string(), config_path];
+            let trace_dir = self.trace_dir.display().to_string();
+            let args = vec![
+                "--trace-dir".to_string(),
+                trace_dir,
+                "server".to_string(),
+                "--config".to_string(),
+                config_path,
+            ];
 
             processes.push(ProcessConfig {
                 target: node.clone(),
@@ -144,7 +155,10 @@ impl Local {
             // Round-robin assign clients to servers
             let server_addr = server_addresses[i % server_addresses.len()];
 
+            let trace_dir = self.trace_dir.display().to_string();
             let args = vec![
+                "--trace-dir".to_string(),
+                trace_dir,
                 "client".to_string(),
                 "--config".to_string(),
                 config_path,

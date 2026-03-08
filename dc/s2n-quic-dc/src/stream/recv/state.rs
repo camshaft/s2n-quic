@@ -623,6 +623,16 @@ impl State {
     {
         let error = Error::from(error);
         debug_assert!(error.is_fatal(&self.features));
+
+        // If we've already received or read all data, the error is irrelevant to the
+        // application — don't poison the stream. This prevents late FlowReset packets
+        // (e.g., from server dispatch cleanup after a successful RPC) from turning a
+        // completed stream into a failed one.
+        ensure!(!matches!(
+            self.state,
+            Receiver::DataRecvd | Receiver::DataRead
+        ));
+
         let _ = self.state.on_reset();
         self.transmission.clear();
 

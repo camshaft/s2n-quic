@@ -6,6 +6,7 @@ use s2n_quic_core::stream::testing::Data;
 use s2n_quic_dc::psk;
 use std::{
     io,
+    path::PathBuf,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
@@ -75,20 +76,20 @@ impl Stats {
     }
 }
 
-pub async fn run(config: ServerConfig) -> io::Result<()> {
+pub async fn run(config: ServerConfig, trace_dir: &PathBuf) -> io::Result<()> {
     info!("Starting RPC test server");
 
     // Handshake (QUIC) address uses port - 1 to avoid conflict with the acceptor port
     let mut handshake_bind = config.address;
     handshake_bind.set_port(config.address.port() - 1);
-    let handshake = crate::psk::server(handshake_bind).await?;
+    let handshake = crate::psk::server(handshake_bind, trace_dir).await?;
 
     let server: Server =
         s2n_quic_dc::stream::server::tokio::Server::<psk::server::Provider, Subscriber>::builder()
             .with_address(config.address)
             .with_send_socket_workers(crate::busy_poll::send_pool().into())
             .with_recv_socket_workers(crate::busy_poll::recv_pool().into())
-            .build(handshake, crate::psk::subscriber())?;
+            .build(handshake, crate::psk::subscriber(trace_dir))?;
 
     let acceptor_addr = server.acceptor_addr()?;
     let handshake_addr = server.handshake_addr()?;

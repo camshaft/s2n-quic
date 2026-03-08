@@ -99,10 +99,16 @@ where
 
         let now = self.env.clock().get_time();
         let meta = event::api::ConnectionMeta {
-            id: 0, // TODO use an actual connection ID
+            id: event::next_connection_id(),
             timestamp: now.into_event(),
         };
-        let info = event::api::ConnectionInfo {};
+        let remote_addr_sa: SocketAddress = remote_address.into();
+        let info = event::api::ConnectionInfo {
+            credential_id: &*initial_packet.credentials.id,
+            key_id: initial_packet.credentials.key_id.as_u64(),
+            remote_address: (&remote_addr_sa).into_event(),
+            is_server: true,
+        };
         let subscriber_ctx = self
             .env
             .subscriber()

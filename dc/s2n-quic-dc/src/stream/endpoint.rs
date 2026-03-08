@@ -69,11 +69,17 @@ where
     // sending the first packet until that time.
     let start_time = entry.next_connection_time(now);
 
+    let default_addr = s2n_quic_core::inet::SocketAddress::default();
     let meta = event::api::ConnectionMeta {
-        id: 0, // TODO use an actual connection ID
+        id: event::next_connection_id(),
         timestamp: now.into_event(),
     };
-    let info = event::api::ConnectionInfo {};
+    let info = event::api::ConnectionInfo {
+        credential_id: &*crypto.credentials.id,
+        key_id: crypto.credentials.key_id.as_u64(),
+        remote_address: (&default_addr).into_event(),
+        is_server: false,
+    };
 
     let subscriber = env.subscriber().clone();
     let subscriber_ctx = subscriber.create_connection_context(&meta, &info);

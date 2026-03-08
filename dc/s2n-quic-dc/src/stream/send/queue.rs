@@ -409,7 +409,7 @@ impl Queue {
             if let Err((batch, mut wheel_time)) = res {
                 // If the target time is in the past it means the wheel is overloaded so we need to back off a bit
                 if wheel_time.has_elapsed(now) {
-                    wheel_time += Duration::from_millis(2);
+                    wheel_time = now + Duration::from_millis(1);
                 }
 
                 // Once the transmission timer expires then allow a packet to be inserted at the front

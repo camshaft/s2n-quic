@@ -123,10 +123,15 @@ where
 
             for (socket, remote_address) in fresh.drain() {
                 let meta = event::api::ConnectionMeta {
-                    id: 0, // TODO use an actual connection ID
+                    id: event::next_connection_id(),
                     timestamp: now.into_event(),
                 };
-                let info = event::api::ConnectionInfo {};
+                let info = event::api::ConnectionInfo {
+                    credential_id: &[],
+                    key_id: 0,
+                    remote_address: (&remote_address).into_event(),
+                    is_server: true,
+                };
 
                 let subscriber_ctx = self
                     .env
