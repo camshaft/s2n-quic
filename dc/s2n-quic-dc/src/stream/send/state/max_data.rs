@@ -496,9 +496,10 @@ mod tests {
         assert_eq!(max_data.on_timeout(&clock, idle_timeout), Poll::Ready(()));
     }
 
-    /// When first blocked, the state should skip Queued and go directly to Inflight so that
-    /// transmission interest is not expressed immediately. DATA_BLOCKED is treated as a
-    /// keep-alive: it is only queued once the timer fires (idle_timeout / IDLE_RATIO).
+    /// When first blocked, the state transitions to Inflight (skipping Queued) so that
+    /// transmission interest is not expressed immediately. The state becomes Queued (and
+    /// transmission interest is expressed) only once the timer fires (idle_timeout / IDLE_RATIO).
+    /// DATA_BLOCKED is therefore treated as a keep-alive rather than an eager signal.
     #[test]
     fn no_immediate_transmission_interest_on_first_block() {
         let peer_value = VarInt::from_u32(1000);
