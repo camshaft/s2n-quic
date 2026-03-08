@@ -433,6 +433,31 @@ impl Filled {
     }
 }
 
+impl Filled {
+    /// Creates a deep copy of this filled descriptor by allocating a new buffer
+    /// and copying the payload bytes. This is safe because the copy gets its own
+    /// exclusive memory region.
+    pub fn deep_copy(&self) -> Option<Self> {
+        let Some(unfilled) = Unfilled::new(self.len) else {
+            return None;
+        };
+        let payload = self.payload();
+        let result = unfilled.fill_with(|addr, _cmsg, mut iov| {
+            iov[..payload.len()].copy_from_slice(payload);
+            addr.set(self.remote_address().get());
+            <Result<_, core::convert::Infallible>>::Ok(payload.len())
+        });
+        match result {
+            Ok(segments) => {
+                let mut filled = segments.take_filled();
+                filled.set_ecn(self.ecn);
+                Some(filled)
+            }
+            Err(_) => None,
+        }
+    }
+}
+
 impl Drop for Filled {
     #[inline]
     fn drop(&mut self) {

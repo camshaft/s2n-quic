@@ -83,18 +83,60 @@ fn no_loss() {
 fn packet_loss() {
     use core::sync::atomic::{AtomicUsize, Ordering};
 
+    // Normal (no loss) wire order:
+    //   0: client→server: Stream data "hello!" (pn=0, fin=true)
+    //   1: server→client: Control ACK for client data + MAX_DATA
+    //   2: server→client: Stream data "goodbye!" (pn=0, fin=true)
+    //   3: client→server: Control ACK for server data + MAX_DATA
+    //   Total: 4 packets
+    //
+    // NOTE: The server's ACK (control packet) is sent before the response data
+    // because the recv worker sends ACKs independently from the application.
+
     check!()
         .exhaustive()
         .with_generator(0usize..=4)
         .cloned()
         .for_each(|loss_idx| {
             let max_count = match loss_idx {
-                // the first two are Stream packets
-                0..=1 => 6,
-                // the next ones are Control packets, which cause 1 extra packet, since the
-                // sender also needs to transmit the Stream packet again.
-                2..=3 => 7,
-                // otherwise, it should only take 4
+                // Drop client's initial Stream data (pn=0).
+                // Client PTO fires with 1 retransmit (first PTO = 1 probe).
+                //   0: client→server data (DROPPED)
+                //   1: client→server PTO retransmit (data)
+                //   2: server→client ACK control
+                //   3: server→client response data
+                //   4: client→server ACK control
+                0 => 5,
+                // Drop server's ACK control packet.
+                // Client never learns its data was received. Client PTO fires
+                // with 1 retransmit. Server re-ACKs.
+                //   0: client→server data
+                //   1: server→client ACK control (DROPPED)
+                //   2: server→client response data
+                //   3: client→server ACK control
+                //   4: client→server PTO retransmit (data)
+                //   5: server→client re-ACK control
+                // TODO: server response data should serve as implicit ACK = 5 total
+                1 => 6,
+                // Drop server's response Stream data.
+                // Server PTO fires with 1 retransmit.
+                //   0: client→server data
+                //   1: server→client ACK control
+                //   2: server→client response data (DROPPED)
+                //   3: server→client PTO retransmit (response data)
+                //   4: client→server ACK control
+                2 => 5,
+                // Drop client's ACK control packet.
+                // Server doesn't know client got the response. Server PTO fires
+                // with 1 retransmit.
+                //   0: client→server data
+                //   1: server→client ACK control
+                //   2: server→client response data
+                //   3: client→server ACK control (DROPPED)
+                //   4: server→client PTO retransmit (response data)
+                //   5: client→server re-ACK control
+                3 => 6,
+                // No packet dropped (loss_idx=4 is beyond the 4 packets)
                 _ => 4,
             };
 
@@ -123,7 +165,11 @@ fn packet_loss() {
                 });
             });
 
-            assert_eq!(COUNT.swap(0, Ordering::Relaxed), max_count);
+            assert_eq!(
+                COUNT.swap(0, Ordering::Relaxed),
+                max_count,
+                "actual vs expected"
+            );
         });
 }
 

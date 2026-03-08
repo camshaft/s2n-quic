@@ -219,4 +219,22 @@ impl Info {
 
         Some(retransmission)
     }
+
+    /// Creates a retransmission segment by deep-copying the descriptor, leaving
+    /// the original in place. This is used for proactive retransmission on
+    /// PTO where the packet hasn't been declared lost - we're just eagerly
+    /// retransmitting to avoid an extra round trip.
+    #[inline]
+    pub fn retransmit_copy(&self) -> Option<super::retransmission::Segment> {
+        let descriptor = self.descriptor.as_ref()?.deep_copy()?;
+
+        let retransmission = super::retransmission::Segment {
+            descriptor,
+            stream_offset: self.stream_offset,
+            payload_len: self.payload_len,
+            flags: self.flags,
+        };
+
+        Some(retransmission)
+    }
 }

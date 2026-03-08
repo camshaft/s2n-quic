@@ -444,6 +444,14 @@ impl State {
             }
         }
 
+        // If the ACK processing put us into a terminal state, clean up
+        // any stale retransmissions and cancel the PTO timer so we don't
+        // wastefully send packets for data that's already been acknowledged.
+        if self.state().is_data_received() {
+            self.on_success();
+            return Ok(None);
+        }
+
         // Perform loss detection across both packet number spaces using the max ACK'd TX time
         // This ensures we use a consistent loss window based on the most recently acknowledged packet
         if let Some(max_tx_time) = max_acked_tx_time {
@@ -700,7 +708,13 @@ impl State {
 
                     self.counters.on_finish(&packet.info);
 
-                    // TODO don't retransmit if the range is already ACK'd elsewhere
+                    // don't retransmit if the range is already ACK'd by another packet
+                    // (e.g. a recovery packet carried the same data)
+                    ensure!(
+                        packet.info.payload_len > 0 &&
+                        self.unacked_ranges.contains(&packet.info.stream_offset),
+                        continue
+                    );
 
                     if let Some(retransmission) = packet.info.try_retransmit() {
                         // update our local packet number to be at least 1 more than the largest lost
@@ -829,6 +843,13 @@ impl State {
             .on_timeout(packets_in_flight, clock.get_time())
             .is_ready()
         {
+            // On the first PTO, only send 1 probe instead of 2. This reduces
+            // wasted retransmissions for small streams where a single packet
+            // carries all the data. On subsequent PTOs we keep 2 for resilience.
+            if self.pto_backoff == INITIAL_PTO_BACKOFF && self.pto.transmissions() > 1 {
+                self.pto.on_transmit_once();
+            }
+
             // TODO where does this come from
             let max_pto_backoff = 1024;
             self.pto_backoff = self.pto_backoff.saturating_mul(2).min(max_pto_backoff);
@@ -1086,7 +1107,52 @@ impl State {
         }
     }
 
+    /// Takes the oldest stream packets and tries to make them into PTO packets
+    ///
+    /// This ensures that we're not wasting resources by sending empty payloads, especially
+    /// when there's outstanding data waiting to be ACK'd.
+    fn make_stream_packets_as_pto_probes(&mut self) {
+        // check to see if we have in-flight stream segments
+        ensure!(!self.sent_stream_packets.is_empty());
+        // only reliable streams store segments
+        ensure!(self.is_reliable);
+
+        let pto = self.pto.transmissions() as usize;
+
+        // check if we already have retransmissions scheduled
+        let Some(mut remaining) = pto.checked_sub(self.retransmissions.len()) else {
+            return;
+        };
+
+        // iterate until remaining is 0.
+        //
+        // This nested loop is a bit weird but it's intentional - if we have `remaining == 2`
+        // but only have a single in-flight stream segment then we want to transmit that segment
+        // `remaining` times.
+        while remaining > 0 {
+            for (num, packet) in self.sent_stream_packets.iter().take(remaining) {
+                let Some(retransmission) = packet.info.retransmit_copy() else {
+                    // unreliable streams don't store segments so bail early - this was checked above
+                    return;
+                };
+
+                // update our local packet number to be at least 1 more than the largest lost
+                // packet number
+                let min_recovery_packet_number = num.as_u64() + 1;
+                self.recovery_packet_number =
+                    self.recovery_packet_number.max(min_recovery_packet_number);
+
+                self.retransmissions.push(retransmission);
+
+                // consider this as a PTO
+                remaining -= 1;
+            }
+        }
+    }
+
     fn requires_transmission(&self) -> bool {
+        ensure!(!self.state().is_terminal(), false);
+
         let pto = self.pto.transmissions() > 0;
         let fin = self.fin.is_queued();
         let reset = self.reset.is_queued();
@@ -1165,6 +1231,12 @@ impl State {
         if self.pto.transmissions() > 0 {
             self.recovery_packet_number =
                 (self.recovery_packet_number + 1).max(*self.max_stream_packet_number + 1);
+
+            // On PTO, proactively retransmit in-flight stream packets rather than
+            // sending empty probes. This is especially beneficial for small streams
+            // where the entire payload fits in a single packet - the data arrives
+            // immediately instead of requiring an extra round trip for loss detection.
+            self.make_stream_packets_as_pto_probes();
         }
 
         self.try_transmit_retransmissions(control_key, clock, packets, publisher)?;
@@ -1519,6 +1591,28 @@ impl State {
             self.idle_timer.cancel();
             self.idle_timer.set(now + error_timeout);
         }
+    }
+
+    /// Called when the stream is finished and all data has been ACKed
+    fn on_success(&mut self) {
+        debug_assert!(self.state().is_data_received());
+
+        self.retransmissions.clear();
+
+        // we could have some packets that are outstanding but as long as the unacked ranges are
+        // empty we're good
+        self.sent_stream_packets.clear();
+        self.sent_recovery_packets.clear();
+        self.keep_alive.on_shutdown();
+        self.pto.cancel();
+
+        // Drain any pending PTO transmissions so fill_transmit_queue won't try to send probes
+        while self.pto.transmissions() > 0 {
+            self.pto.on_transmit_once();
+        }
+
+        // TODO why does this cause tests to fail if we uncomment this?
+        // self.idle_timer.cancel();
     }
 
     #[cfg(debug_assertions)]
