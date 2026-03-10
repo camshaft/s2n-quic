@@ -1,10 +1,11 @@
 use crate::{
+    clock::precision,
     msg::{self, addr::Addr},
     socket::{pool::descriptor, send::completion::Completion},
     sync::intrusive_queue as queue,
 };
 use core::fmt;
-use s2n_quic_core::{inet::ExplicitCongestionNotification, time::Timestamp};
+use s2n_quic_core::inet::ExplicitCongestionNotification;
 use std::{collections::VecDeque, io::IoSlice, ops::RangeBounds};
 
 pub type Entry<Info, Meta, Completion> = queue::Entry<Transmission<Info, Meta, Completion>>;
@@ -20,7 +21,7 @@ pub struct Transmission<Info, Meta, Completion> {
     pub descriptors: Vec<(descriptor::Filled, Info)>,
     pub total_len: u16,
     pub meta: Meta,
-    pub transmission_time: Option<Timestamp>,
+    pub transmission_time: Option<precision::Timestamp>,
     pub completion: Completion,
 }
 

@@ -215,6 +215,14 @@ impl<Info, Meta, Completion> Slot<Info, Meta, Completion> {
         self.queue.push_back(entry);
     }
 
+    /// Push an entry to the front of this slot's queue.
+    ///
+    /// Used during cascade (reverse iteration): cascaded entries were enqueued
+    /// before any entries currently in this slot, so they go to the front.
+    fn push_front(&mut self, entry: Entry<Info, Meta, Completion>) {
+        self.queue.push_front(entry);
+    }
+
     fn drain(&mut self) -> Queue<Transmission<Info, Meta, Completion>> {
         core::mem::take(&mut self.queue)
     }
@@ -255,11 +263,22 @@ impl<Info, Meta, Completion> Level<Info, Meta, Completion> {
         self.occupied[word] &= !(1u64 << bit);
     }
 
-    /// Push an entry into a slot and mark it occupied.
+    /// Push an entry into a slot at the back and mark it occupied.
     #[inline]
-    fn push(&mut self, index: usize, entry: Entry<Info, Meta, Completion>) {
+    fn push_back(&mut self, index: usize, entry: Entry<Info, Meta, Completion>) {
         debug_assert!(index < SLOTS_PER_LEVEL);
         unsafe { self.slots.get_unchecked_mut(index) }.push(entry);
+        self.set_occupied(index);
+    }
+
+    /// Push an entry to the front of a slot and mark it occupied.
+    ///
+    /// Used during cascade to preserve FIFO ordering: cascaded entries
+    /// were enqueued before any entries currently in the destination slot.
+    #[inline]
+    fn push_front(&mut self, index: usize, entry: Entry<Info, Meta, Completion>) {
+        debug_assert!(index < SLOTS_PER_LEVEL);
+        unsafe { self.slots.get_unchecked_mut(index) }.push_front(entry);
         self.set_occupied(index);
     }
 
@@ -350,7 +369,7 @@ impl<Info, Meta, Completion, const GRANULARITY_US: u64>
         self.drain_incoming();
 
         // Step 2+3: Advance to `now` and collect due entries
-        let target_tick = Wheel::<Info, Meta, Completion, GRANULARITY_US>::timestamp_to_tick(now);
+        let target_tick = Self::timestamp_to_tick(now);
         let target_tick = target_tick.max(self.current_tick);
 
         let mut result = Queue::new();
@@ -412,7 +431,7 @@ impl<Info, Meta, Completion, const GRANULARITY_US: u64>
 
     /// Returns the timestamp of the current virtual tick.
     pub fn current_time(&self) -> precision::Timestamp {
-        Wheel::<Info, Meta, Completion, GRANULARITY_US>::tick_to_timestamp(self.current_tick)
+        Self::tick_to_timestamp(self.current_tick)
     }
 
     /// Returns the timestamp of the earliest non-empty slot, if any.
@@ -455,11 +474,7 @@ impl<Info, Meta, Completion, const GRANULARITY_US: u64>
                 // to avoid returning a tick AFTER the entry.
                 let base_aligned = (base >> shift) << shift;
                 let earliest_tick = base_aligned + (slot_offset << shift);
-                return Some(
-                    Wheel::<Info, Meta, Completion, GRANULARITY_US>::tick_to_timestamp(
-                        earliest_tick.max(base + 1),
-                    ),
-                );
+                return Some(Self::tick_to_timestamp(earliest_tick.max(base + 1)));
             }
         }
 
@@ -476,40 +491,58 @@ impl<Info, Meta, Completion, const GRANULARITY_US: u64>
         }
     }
 
+    /// Convert a Timestamp to a tick (for reading transmission_time from entries).
+    fn timestamp_to_tick(ts: precision::Timestamp) -> u64 {
+        Wheel::<Info, Meta, Completion, GRANULARITY_US>::timestamp_to_tick(ts)
+    }
+
     /// Convert a core Timestamp to a tick (for reading transmission_time from entries).
-    fn core_timestamp_to_tick(ts: s2n_quic_core::time::Timestamp) -> u64 {
-        let p: precision::Timestamp = ts.into();
-        Wheel::<Info, Meta, Completion, GRANULARITY_US>::timestamp_to_tick(p)
+    fn tick_to_timestamp(tick: u64) -> precision::Timestamp {
+        Wheel::<Info, Meta, Completion, GRANULARITY_US>::tick_to_timestamp(tick)
     }
 
     /// Insert a single entry into the appropriate level/slot.
     fn insert_entry(&mut self, entry: Entry<Info, Meta, Completion>) {
         let target_tick = entry
             .transmission_time
-            .map(Self::core_timestamp_to_tick)
+            .map(Self::timestamp_to_tick)
             .unwrap_or(self.current_tick)
             .max(self.current_tick);
 
         let (level, slot_idx) = Self::compute_level_and_slot(self.current_tick, target_tick);
-        self.levels[level].push(slot_idx, entry);
+
+        self.levels[level].push_back(slot_idx, entry);
     }
 
     /// Cascade entries from level `level` down toward level 0.
+    ///
+    /// Entries in higher levels were enqueued *before* any entries that may
+    /// have been directly inserted into the destination slots (via
+    /// `drain_incoming` at a later `current_tick`). To preserve FIFO order,
+    /// we iterate the cascade queue in **reverse** (`pop_back`) and use
+    /// `push_front` on the destination slot. This is O(n) with zero
+    /// allocation — each `pop_back` and `push_front` is O(1) on the
+    /// doubly-linked intrusive queue.
     fn cascade(&mut self, current_tick: u64, mut level: usize) {
         while level < LEVELS {
             let slot_idx = ((current_tick >> (BITS_PER_LEVEL * level as u32)) & SLOT_MASK) as usize;
 
             let mut entries = self.levels[level].drain(slot_idx);
 
-            while let Some(entry) = entries.pop_front() {
+            // Iterate in reverse: the last entry in the cascade queue was
+            // enqueued last (but still before any direct-inserted entries).
+            // By popping from the back and pushing to the front of the
+            // destination slot, we build up the correct FIFO order:
+            //   [cascaded_first, ..., cascaded_last, direct_first, ..., direct_last]
+            while let Some(entry) = entries.pop_back() {
                 let target_tick = entry
                     .transmission_time
-                    .map(Self::core_timestamp_to_tick)
+                    .map(Self::timestamp_to_tick)
                     .unwrap_or(current_tick)
                     .max(current_tick);
 
                 let (new_level, new_slot) = Self::compute_level_and_slot(current_tick, target_tick);
-                self.levels[new_level].push(new_slot, entry);
+                self.levels[new_level].push_front(new_slot, entry);
             }
 
             // Check if this level also wrapped and needs to cascade upward
@@ -1085,6 +1118,76 @@ mod tests {
                     );
                 }
             });
+    }
+
+    /// Regression test: reproduces the exact cascade reordering bug.
+    ///
+    /// Two packets with the same target tick (same µs) get inserted via
+    /// `drain_incoming` at different `current_tick` values. The first entry
+    /// is inserted when `current_tick` is far from the target (delta > 255),
+    /// so it goes to level 1. Then the ticker advances past a 256-aligned
+    /// cascade boundary (moving `current_tick` closer to the target), and the
+    /// second entry is inserted with delta < 256, going directly to level 0.
+    ///
+    /// When cascade fires, the level-1 entry must be placed BEFORE the
+    /// level-0 entry in the same slot. Without the fix, it was appended
+    /// AFTER, causing packet 188 to appear after packet 189.
+    #[test]
+    fn test_cascade_preserves_fifo_same_tick() {
+        // Use GRANULARITY_US=1 for 1:1 tick-to-µs mapping
+        let pool = Pool::new(u16::MAX);
+        let wheel: Wheel<(), u16, (), 1> = Wheel::new();
+
+        // Start at tick 2_012_940. Target tick = 2_013_199 (delta = 259).
+        let start = precision::Timestamp {
+            nanos: Duration::from_micros(2_012_940).as_nanos() as u64,
+        };
+        let clock = Clock(start);
+        let mut ticker = wheel.ticker(&clock);
+
+        // Target time: both packets share this exact µs tick
+        let target_time = precision::Timestamp {
+            nanos: Duration::from_micros(2_013_199).as_nanos() as u64,
+        };
+
+        // Step 1: Insert packet 0 into the shared queue
+        wheel.insert(create_entry_at(&pool, 0, Some(target_time)));
+
+        // Step 2: tick_to an intermediate time that drains packet 0 into level 1
+        // (delta=259 > 255) but does NOT reach the 256-aligned cascade boundary.
+        // current_tick advances to 2_012_950; no cascade triggered.
+        let intermediate = precision::Timestamp {
+            nanos: Duration::from_micros(2_012_950).as_nanos() as u64,
+        };
+        let queue = ticker.tick_to(intermediate);
+        assert!(queue.is_empty(), "No entries should be due yet");
+
+        // Step 3: Insert packet 1 into the shared queue (same target tick)
+        wheel.insert(create_entry_at(&pool, 1, Some(target_time)));
+
+        // Step 4: tick_to the target time. This call:
+        //   a) drain_incoming: packet 1 → level 0 (delta=2_013_199-2_012_950=249<256)
+        //   b) advance loop reaches 2_013_184 (256-aligned boundary), triggers cascade
+        //   c) cascade moves packet 0 from level 1 → level 0 (same slot as packet 1!)
+        //
+        // BUG (without fix): cascade appends packet 0 AFTER packet 1 → output [1, 0]
+        // FIXED: cascade uses pop_back+push_front → output [0, 1]
+        let mut queue = ticker.tick_to(target_time);
+
+        let first = queue.pop_front().expect("should have first entry");
+        let second = queue.pop_front().expect("should have second entry");
+        assert!(queue.is_empty(), "should have exactly 2 entries");
+
+        assert_eq!(
+            first.meta, 0,
+            "Cascaded entry (packet 0) should come out first, got {}",
+            first.meta
+        );
+        assert_eq!(
+            second.meta, 1,
+            "Direct-inserted entry (packet 1) should come out second, got {}",
+            second.meta
+        );
     }
 
     /// Oracle-based fuzz test for next_expiry: after each tick advance,

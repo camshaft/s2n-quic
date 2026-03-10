@@ -6,7 +6,11 @@ use crate::{
     event::{self, ConnectionPublisher},
     socket::pool::{self, descriptor},
     stream::{
-        send::{application, application::state::PushError, state::transmission},
+        send::{
+            self,
+            application::{self, state::PushError},
+            state::transmission,
+        },
         shared,
         socket::Socket,
     },
@@ -394,16 +398,16 @@ impl Queue {
         let mut next_time = next_time.max(now.into());
 
         // Build a batch queue with transmission times stamped based on bandwidth
-        let mut queue = crate::intrusive_queue::Queue::new();
+        let mut queue = send::state::transmission::EntryQueue::new();
         for (mut batch, application_len) in self.builder.drain(..) {
             let transmission_len = batch.total_len as u64;
 
             // Stamp the transmission time on the entry
-            batch.transmission_time = Some(next_time.into());
+            batch.transmission_time = Some(next_time);
 
             // Compute the next transmission time based on bandwidth
             let delay = transmission_len / self.bandwidth;
-            next_time = (next_time + delay).into();
+            next_time = next_time + delay;
 
             let provided_len = application_len as usize;
             subscriber.publisher(now).on_stream_write_socket_flushed(

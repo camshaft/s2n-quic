@@ -22,6 +22,10 @@ impl<T> Queue<T> {
         self.0.lock().is_empty()
     }
 
+    pub fn len(&self) -> usize {
+        self.0.lock().len()
+    }
+
     /// Push an entry to the back of the queue
     pub fn push_back(&self, entry: Entry<T>) {
         self.0.lock().push_back(entry);

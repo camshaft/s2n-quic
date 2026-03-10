@@ -149,6 +149,26 @@ impl<T> Queue<T> {
         self.len += 1;
     }
 
+    /// Push an entry to the front of the queue
+    pub fn push_front(&mut self, entry: Entry<T>) {
+        entry.assert_unlinked();
+
+        let new_head = NonNull::from(Box::leak(entry.0));
+
+        unsafe {
+            (*new_head.as_ptr()).next = self.head;
+
+            if let Some(head) = self.head {
+                (*head.as_ptr()).prev = Some(new_head);
+            } else {
+                self.tail = Some(new_head);
+            }
+        }
+
+        self.head = Some(new_head);
+        self.len += 1;
+    }
+
     /// Pop an entry from the front of the queue
     ///
     /// Returns None if the queue is empty.
@@ -179,6 +199,31 @@ impl<T> Queue<T> {
         }
     }
 
+    /// Pop an entry from the back of the queue
+    ///
+    /// Returns None if the queue is empty.
+    pub fn pop_back(&mut self) -> Option<Entry<T>> {
+        let tail_ptr = self.tail.take()?;
+
+        unsafe {
+            let prev = (*tail_ptr.as_ptr()).prev;
+            self.tail = prev;
+
+            if let Some(new_tail) = self.tail {
+                (*new_tail.as_ptr()).next = None;
+            } else {
+                self.head = None;
+            }
+
+            (*tail_ptr.as_ptr()).prev = None;
+            (*tail_ptr.as_ptr()).next = None;
+
+            self.len -= 1;
+
+            Some(Entry(Box::from_raw(tail_ptr.as_ptr())))
+        }
+    }
+
     /// Peek at the front entry without removing it
     pub fn peek_front(&self) -> Option<&T> {
         self.head.map(|head| unsafe { &(*head.as_ptr()).value })
@@ -197,6 +242,15 @@ impl<T> Queue<T> {
     /// Peek at the back entry mutably without removing it
     pub fn peek_back_mut(&mut self) -> Option<&mut T> {
         self.tail.map(|tail| unsafe { &mut (*tail.as_ptr()).value })
+    }
+
+    /// Prepend another queue to the front of this queue.
+    ///
+    /// This is O(1) — just a pointer splice. The `other` queue is left empty.
+    /// After this operation, entries from `other` appear before entries from `self`.
+    pub fn prepend(&mut self, other: &mut Queue<T>) {
+        other.append(self);
+        core::mem::swap(self, other);
     }
 
     /// Append another queue to the back of this queue.
@@ -456,11 +510,194 @@ mod tests {
         assert_eq!(*a.peek_back().unwrap(), 2);
     }
 
+    #[test]
+    fn test_push_front_empty() {
+        let mut queue = Queue::new();
+        queue.push_front(Entry::new(1));
+        assert_eq!(queue.len(), 1);
+        assert_eq!(*queue.peek_front().unwrap(), 1);
+        assert_eq!(*queue.peek_back().unwrap(), 1);
+        assert_eq!(*queue.pop_front().unwrap(), 1);
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn test_push_front_ordering() {
+        let mut queue = Queue::new();
+        queue.push_front(Entry::new(3));
+        queue.push_front(Entry::new(2));
+        queue.push_front(Entry::new(1));
+
+        assert_eq!(*queue.pop_front().unwrap(), 1);
+        assert_eq!(*queue.pop_front().unwrap(), 2);
+        assert_eq!(*queue.pop_front().unwrap(), 3);
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn test_push_front_and_push_back_mixed() {
+        let mut queue = Queue::new();
+        queue.push_back(Entry::new(2));
+        queue.push_front(Entry::new(1));
+        queue.push_back(Entry::new(3));
+        queue.push_front(Entry::new(0));
+
+        assert_eq!(*queue.pop_front().unwrap(), 0);
+        assert_eq!(*queue.pop_front().unwrap(), 1);
+        assert_eq!(*queue.pop_front().unwrap(), 2);
+        assert_eq!(*queue.pop_front().unwrap(), 3);
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn test_pop_back_empty() {
+        let mut queue: Queue<u64> = Queue::new();
+        assert!(queue.pop_back().is_none());
+    }
+
+    #[test]
+    fn test_pop_back_single() {
+        let mut queue = Queue::new();
+        queue.push_back(Entry::new(42));
+        assert_eq!(*queue.pop_back().unwrap(), 42);
+        assert!(queue.is_empty());
+        assert!(queue.pop_back().is_none());
+        assert!(queue.pop_front().is_none());
+    }
+
+    #[test]
+    fn test_pop_back_ordering() {
+        let mut queue = Queue::new();
+        queue.push_back(Entry::new(1));
+        queue.push_back(Entry::new(2));
+        queue.push_back(Entry::new(3));
+
+        assert_eq!(*queue.pop_back().unwrap(), 3);
+        assert_eq!(*queue.pop_back().unwrap(), 2);
+        assert_eq!(*queue.pop_back().unwrap(), 1);
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn test_pop_front_and_pop_back_interleaved() {
+        let mut queue = Queue::new();
+        queue.push_back(Entry::new(1));
+        queue.push_back(Entry::new(2));
+        queue.push_back(Entry::new(3));
+        queue.push_back(Entry::new(4));
+
+        assert_eq!(*queue.pop_front().unwrap(), 1);
+        assert_eq!(*queue.pop_back().unwrap(), 4);
+        assert_eq!(*queue.pop_front().unwrap(), 2);
+        assert_eq!(*queue.pop_back().unwrap(), 3);
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn test_prepend_both_non_empty() {
+        let mut a = Queue::new();
+        a.push_back(Entry::new(3));
+        a.push_back(Entry::new(4));
+
+        let mut b = Queue::new();
+        b.push_back(Entry::new(1));
+        b.push_back(Entry::new(2));
+
+        a.prepend(&mut b);
+
+        assert!(b.is_empty());
+        assert_eq!(a.len(), 4);
+        assert_eq!(*a.pop_front().unwrap(), 1);
+        assert_eq!(*a.pop_front().unwrap(), 2);
+        assert_eq!(*a.pop_front().unwrap(), 3);
+        assert_eq!(*a.pop_front().unwrap(), 4);
+        assert!(a.is_empty());
+    }
+
+    #[test]
+    fn test_prepend_to_empty() {
+        let mut a: Queue<u64> = Queue::new();
+        let mut b = Queue::new();
+        b.push_back(Entry::new(1));
+        b.push_back(Entry::new(2));
+
+        a.prepend(&mut b);
+
+        assert!(b.is_empty());
+        assert_eq!(*a.pop_front().unwrap(), 1);
+        assert_eq!(*a.pop_front().unwrap(), 2);
+    }
+
+    #[test]
+    fn test_prepend_empty_other() {
+        let mut a = Queue::new();
+        a.push_back(Entry::new(1));
+
+        let mut b: Queue<u64> = Queue::new();
+        a.prepend(&mut b);
+
+        assert_eq!(a.len(), 1);
+        assert_eq!(*a.pop_front().unwrap(), 1);
+    }
+
+    #[test]
+    fn test_prepend_both_empty() {
+        let mut a: Queue<u64> = Queue::new();
+        let mut b: Queue<u64> = Queue::new();
+        a.prepend(&mut b);
+        assert!(a.is_empty());
+        assert!(b.is_empty());
+    }
+
+    #[test]
+    fn test_prepend_peek() {
+        let mut a = Queue::new();
+        a.push_back(Entry::new(2));
+
+        let mut b = Queue::new();
+        b.push_back(Entry::new(1));
+
+        a.prepend(&mut b);
+
+        assert_eq!(*a.peek_front().unwrap(), 1);
+        assert_eq!(*a.peek_back().unwrap(), 2);
+    }
+
+    #[test]
+    fn test_reverse_iteration_pattern() {
+        // This is the exact pattern used by the wheel's cascade fix:
+        // pop_back from source, push_front into destination
+        let mut source = Queue::new();
+        source.push_back(Entry::new(1));
+        source.push_back(Entry::new(2));
+        source.push_back(Entry::new(3));
+
+        let mut dest = Queue::new();
+        dest.push_back(Entry::new(4));
+        dest.push_back(Entry::new(5));
+
+        // Reverse-iterate source into front of dest
+        while let Some(entry) = source.pop_back() {
+            dest.push_front(entry);
+        }
+
+        assert!(source.is_empty());
+        assert_eq!(*dest.pop_front().unwrap(), 1);
+        assert_eq!(*dest.pop_front().unwrap(), 2);
+        assert_eq!(*dest.pop_front().unwrap(), 3);
+        assert_eq!(*dest.pop_front().unwrap(), 4);
+        assert_eq!(*dest.pop_front().unwrap(), 5);
+        assert!(dest.is_empty());
+    }
+
     #[derive(Clone, Copy, Debug, TypeGenerator)]
     enum Operation {
-        Push,
-        Pop,
+        PushBack,
+        PushFront,
+        PopFront,
+        PopBack,
         Append,
+        Prepend,
     }
 
     #[test]
@@ -470,25 +707,39 @@ mod tests {
             let mut oracle = VecDeque::new();
             let mut subject = Queue::new();
 
-            // secondary queue for append operations
+            // secondary queue for append/prepend operations
             let mut oracle_other = VecDeque::new();
             let mut subject_other = Queue::new();
 
             for op in ops {
                 match op {
-                    Operation::Push => {
+                    Operation::PushBack => {
                         let value = values.next().unwrap();
                         oracle.push_back(value);
                         subject.push_back(Entry::new(value));
                         assert_eq!(oracle.len(), subject.len());
 
-                        // also push to secondary so appends have something to work with
+                        // also push to secondary so appends/prepends have something to work with
                         let value2 = values.next().unwrap();
                         oracle_other.push_back(value2);
                         subject_other.push_back(Entry::new(value2));
                     }
-                    Operation::Pop => {
+                    Operation::PushFront => {
+                        let value = values.next().unwrap();
+                        oracle.push_front(value);
+                        subject.push_front(Entry::new(value));
+                        assert_eq!(oracle.len(), subject.len());
+
+                        let value2 = values.next().unwrap();
+                        oracle_other.push_front(value2);
+                        subject_other.push_front(Entry::new(value2));
+                    }
+                    Operation::PopFront => {
                         assert_eq!(oracle.pop_front(), subject.pop_front().map(|entry| *entry));
+                        assert_eq!(oracle.len(), subject.len());
+                    }
+                    Operation::PopBack => {
+                        assert_eq!(oracle.pop_back(), subject.pop_back().map(|entry| *entry));
                         assert_eq!(oracle.len(), subject.len());
                     }
                     Operation::Append => {
@@ -497,9 +748,22 @@ mod tests {
                         assert!(subject_other.is_empty());
                         assert_eq!(oracle.len(), subject.len());
                     }
+                    Operation::Prepend => {
+                        let mut temp = oracle_other.drain(..).collect::<VecDeque<_>>();
+                        temp.extend(oracle.drain(..));
+                        oracle = temp;
+                        subject.prepend(&mut subject_other);
+                        assert!(subject_other.is_empty());
+                        assert_eq!(oracle.len(), subject.len());
+                    }
                 }
+
+                // Invariant: peek_front/peek_back match oracle
+                assert_eq!(oracle.front().copied(), subject.peek_front().copied());
+                assert_eq!(oracle.back().copied(), subject.peek_back().copied());
             }
 
+            // Drain and verify final contents match
             while let Some(expected) = oracle.pop_front() {
                 let actual = *subject.pop_front().unwrap();
                 assert_eq!(expected, actual);

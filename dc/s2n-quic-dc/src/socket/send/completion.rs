@@ -1,16 +1,15 @@
 // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::sync::atomic::{AtomicBool, Ordering};
-
 use crate::{
+    clock::precision,
     socket::{
         pool::descriptor,
         send::transmission::{Entry, Transmission},
     },
     sync::intrusive_queue,
 };
-use s2n_quic_core::time::Timestamp;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 pub trait Completion<Info, Meta>: Sized {
     type Completer: Completer<Info, Meta, Self>;
@@ -37,7 +36,7 @@ impl<Info, Meta, Completion> Completer<Info, Meta, Completion> for () {
 pub struct CompleteTransmission<'a, Info, Meta> {
     pub info: Info,
     pub segment: descriptor::Filled,
-    pub transmission_time: Timestamp,
+    pub transmission_time: precision::Timestamp,
     pub meta: &'a Meta,
 }
 

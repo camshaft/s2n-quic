@@ -955,15 +955,16 @@ impl State {
 
         queue.drain_completion_queue(|transmission| {
             let (packet_number, mut info) = transmission.info;
+            let transmission_time: Timestamp = transmission.transmission_time.into();
 
             // Use the actual transmission time rather than when it was submitted to give better RTT estimates
             debug_assert!(
-                transmission.transmission_time.has_elapsed(clock.get_time()),
+                transmission_time.has_elapsed(clock.get_time()),
                 "{} >= {}",
                 clock.get_time(),
-                transmission.transmission_time
+                transmission_time
             );
-            info.time_sent = transmission.transmission_time;
+            info.time_sent = transmission_time;
 
             let meta = transmission.meta;
             let has_more_app_data = meta.has_more_app_data;
