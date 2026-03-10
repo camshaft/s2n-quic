@@ -1,58 +1,68 @@
 // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+//! Hierarchical Timing Wheel for packet scheduling.
+//!
+//! Producers push entries into a shared unordered queue. A single reader
+//! owns the hierarchical timing wheel, drains the queue, inserts entries
+//! into the appropriate slot, and advances virtual time to collect due entries.
+//!
+//! The wheel uses 256 slots per level with a configurable base tick (default 1µs).
+//! 4 levels cover 256^4 ticks ≈ 4.29 billion µs ≈ 71.6 minutes at 1µs granularity.
+//!
+//! Each level maintains a 256-bit occupancy bitset ([u64; 4]) for O(1) next-expiry
+//! computation via `trailing_zeros`. Causal ordering is preserved: entries from the
+//! same sender are always dequeued in the order they were submitted, because both the
+//! shared queue and per-slot queues are FIFO.
+
 use crate::{
+    clock::precision,
     intrusive_queue::Queue,
     socket::send::transmission::{Entry, Transmission},
 };
-use core::fmt;
-use parking_lot::{Mutex, MutexGuard};
-use s2n_quic_core::time::Timestamp;
+use core::{fmt, task};
+use parking_lot::Mutex;
+use s2n_quic_core::task::waker::noop;
 use std::{
     sync::{
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicUsize, Ordering},
         Arc,
     },
-    task::{Poll, Waker},
+    task::Waker,
     time::Duration,
 };
 
-// TODO tune this
-pub const DEFAULT_GRANULARITY_US: u64 = 128;
+// ── Configuration ──────────────────────────────────────────────────────────
 
-pub struct WakerState {
-    waker: Waker,
-    should_wake: AtomicBool,
-}
+/// Number of slots per level (must be a power of 2).
+const SLOTS_PER_LEVEL: usize = 256;
 
-impl WakerState {
-    pub async fn new() -> Arc<Self> {
-        let waker = core::future::poll_fn(|cx| Poll::Ready(cx.waker().clone())).await;
-        Arc::new(Self {
-            waker,
-            should_wake: AtomicBool::new(false),
-        })
-    }
+/// Bit-shift per level (log2 of SLOTS_PER_LEVEL).
+const BITS_PER_LEVEL: u32 = 8; // 2^8 = 256
 
-    fn wake(&self) {
-        self.should_wake.store(true, Ordering::Relaxed);
-        self.waker.wake_by_ref();
-    }
+/// Mask for extracting slot index within a level.
+const SLOT_MASK: u64 = (SLOTS_PER_LEVEL - 1) as u64;
 
-    pub async fn wait(&self) {
-        core::future::poll_fn(|_cx| {
-            if self.should_wake.swap(false, Ordering::Relaxed) {
-                Poll::Ready(())
-            } else {
-                Poll::Pending
-            }
-        })
-        .await
-    }
-}
+/// Number of u64 words in the occupancy bitset per level.
+/// 256 bits = 4 × u64.
+const BITSET_WORDS: usize = SLOTS_PER_LEVEL / 64;
 
+/// Number of hierarchical levels.
+/// With 256 slots/level at 1µs base: covers 256^4 µs ≈ 71.6 minutes.
+const LEVELS: usize = 4;
+
+/// Default base tick granularity in microseconds.
+pub const DEFAULT_GRANULARITY_US: u64 = 1;
+
+// ── Wheel (shared handle) ──────────────────────────────────────────────────
+
+/// Shared, cloneable handle for producers to push entries into the wheel.
+///
+/// Producers push entries (with `transmission_time` already set) into an
+/// unordered concurrent queue. The reader-owned [`Ticker`] drains this queue
+/// and inserts entries into the hierarchical timing wheel.
 pub struct Wheel<Info, Meta, Completion, const GRANULARITY_US: u64 = DEFAULT_GRANULARITY_US>(
-    Arc<State<Info, Meta, Completion>>,
+    Arc<Shared<Info, Meta, Completion>>,
 );
 
 impl<Info, Meta, Completion, const GRANULARITY_US: u64> Clone
@@ -69,247 +79,493 @@ impl<Info, Meta, Completion, const GRANULARITY_US: u64> fmt::Debug
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Wheel")
             .field("len", &self.len())
-            .field("start", &self.start())
-            .field("granularity", &Duration::from_micros(GRANULARITY_US))
-            .field("horizon", &self.horizon())
+            .field("granularity_us", &GRANULARITY_US)
             .finish()
     }
+}
+
+/// State protected by a single mutex: the unordered entry queue and the waker.
+struct State<Info, Meta, Completion> {
+    queue: Queue<Transmission<Info, Meta, Completion>>,
+    waker: task::Waker,
+}
+
+/// Shared state between all producers and the single reader.
+struct Shared<Info, Meta, Completion> {
+    state: Mutex<State<Info, Meta, Completion>>,
+    /// Total number of entries queued (for load monitoring).
+    len: AtomicUsize,
 }
 
 impl<Info, Meta, Completion, const GRANULARITY_US: u64>
     Wheel<Info, Meta, Completion, GRANULARITY_US>
 {
-    /// Create a new Wheel with the specified number of slots (must be a power of 2)
-    pub fn new<Clk: s2n_quic_core::time::Clock>(horizon: Duration, clock: &Clk) -> Self {
-        let horizon = (horizon.as_micros() as u64).max(1);
-        let slots = (horizon / GRANULARITY_US) as usize;
-        let slots = slots.next_power_of_two();
-
-        let entries = (0..slots)
-            .map(|_| Queue::new())
-            .collect::<Vec<_>>()
-            .into_boxed_slice();
-
-        let mask = (slots - 1) as u64;
-        let start = Self::timestamp_to_full_index(clock.get_time());
-
-        let sync_state = SyncState {
-            start_idx: start,
-            waker: None,
-            entries,
-        };
-
-        Self(Arc::new(State {
-            sync_state: Mutex::new(sync_state),
+    /// Create a new wheel.
+    pub fn new() -> Self {
+        Self(Arc::new(Shared {
+            state: Mutex::new(State {
+                queue: Queue::new(),
+                waker: noop(),
+            }),
             len: AtomicUsize::new(0),
-            mask,
         }))
     }
+
+    /// Create a [`Ticker`] for this wheel.
+    ///
+    /// The ticker owns the hierarchical timing wheel and is the sole consumer
+    /// of entries from the shared queue.
+    pub fn ticker<Clk: precision::Clock>(
+        &self,
+        clock: &Clk,
+    ) -> Ticker<Info, Meta, Completion, GRANULARITY_US> {
+        let initial_tick = Self::timestamp_to_tick(clock.now());
+        Ticker {
+            wheel: self.clone(),
+            levels: Box::new(core::array::from_fn(|_| Level::new())),
+            current_tick: initial_tick,
+        }
+    }
+
+    // ── Public query methods ───────────────────────────────────────────
 
     pub fn is_closed(&self) -> bool {
         Arc::strong_count(&self.0) == 1
     }
 
-    /// Returns the total number of entries waiting for transmission
-    ///
-    /// Can be used to determine queue load and potentially rebalance to other queues
+    /// Returns the total number of entries waiting for transmission.
     pub fn len(&self) -> usize {
         self.0.len.load(Ordering::Relaxed)
     }
 
-    pub fn horizon(&self) -> Duration {
-        Duration::from_micros(self.0.mask * GRANULARITY_US)
-    }
+    // ── Producer: Insert ───────────────────────────────────────────────
 
-    pub fn insert(
-        &self,
-        mut entry: Entry<Info, Meta, Completion>,
-        time: Option<Timestamp>,
-    ) -> Result<(), (Entry<Info, Meta, Completion>, Timestamp)> {
-        let (index, full_idx, waker, mut lock) = match self.index(time) {
-            Ok(v) => v,
-            Err(time) => {
-                return Err((entry, time));
-            }
+    /// Insert an entry into the wheel.
+    ///
+    /// The entry's `transmission_time` field determines when it will be
+    /// scheduled. If `None`, it will be sent as soon as possible.
+    pub fn insert(&self, entry: Entry<Info, Meta, Completion>) {
+        let waker = {
+            let mut state = self.0.state.lock();
+            self.0.len.fetch_add(1, Ordering::Relaxed);
+            state.queue.push_back(entry);
+            state.waker.clone()
         };
-        let transmission_time = Self::full_index_to_timestamp(full_idx);
-        entry.transmission_time = Some(transmission_time);
-        unsafe {
-            debug_assert!(lock.entries.len() > index);
-            lock.entries.get_unchecked_mut(index).push_back(entry);
-        }
-        drop(lock);
-
-        self.0.len.fetch_add(1, Ordering::Relaxed);
-
-        if let Some(waker) = waker {
-            waker.wake();
-        }
-
-        Ok(())
+        waker.wake();
     }
 
-    pub fn set_waker(&mut self, waker: Arc<WakerState>) {
-        self.0.sync_state.lock().waker = Some(waker);
-    }
-
-    /// Returns the current transmissions along with the next timestamp to expire
-    pub fn tick(
-        &self,
-        waker: Option<Arc<WakerState>>,
-    ) -> (Timestamp, Queue<Transmission<Info, Meta, Completion>>) {
-        let mut lock = self.0.sync_state.lock();
-        let start = lock.start_idx;
-        let next = start + 1;
-        lock.start_idx = next;
-        lock.waker = waker;
-        let index = (start & self.0.mask) as usize;
-        let queue = unsafe {
-            debug_assert!(lock.entries.len() > index);
-            core::mem::take(lock.entries.get_unchecked_mut(index))
+    /// Insert a batch of entries in one lock acquisition.
+    ///
+    /// Each entry's `transmission_time` should already be set.
+    pub fn insert_batch(&self, mut queue: Queue<Transmission<Info, Meta, Completion>>) {
+        let count = queue.len();
+        if count == 0 {
+            return;
+        }
+        let waker = {
+            let mut state = self.0.state.lock();
+            self.0.len.fetch_add(count, Ordering::Relaxed);
+            state.queue.append(&mut queue);
+            state.waker.clone()
         };
-        drop(lock);
-
-        let next_tick = Self::full_index_to_timestamp(next);
-
-        (next_tick, queue)
+        waker.wake();
     }
 
-    /// Called by the sender after every transmission, which updates the wheel length
+    // ── Reader API ───────────────────────────────────────────────────
+
+    pub fn set_waker(&self, waker: Waker) {
+        self.0.state.lock().waker = waker;
+    }
+
+    /// Called by the sender after every transmission to update the queue length.
     pub(crate) fn on_send(&self) {
         self.0.len.fetch_sub(1, Ordering::Relaxed);
     }
 
-    pub fn start(&self) -> Timestamp {
-        let lock = self.0.sync_state.lock();
-        let start = lock.start_idx;
-        drop(lock);
+    // ── Internal: Tick/Timestamp arithmetic ─────────────────────────────
 
-        Self::full_index_to_timestamp(start)
+    fn tick_to_timestamp(tick: u64) -> precision::Timestamp {
+        let time = Duration::from_micros(tick * GRANULARITY_US);
+        precision::Timestamp {
+            nanos: time.as_nanos() as _,
+        }
     }
 
-    fn index(
-        &self,
-        timestamp: Option<Timestamp>,
-    ) -> Result<
-        (
-            usize,
-            u64,
-            Option<Arc<WakerState>>,
-            MutexGuard<'_, SyncState<Info, Meta, Completion>>,
-        ),
-        Timestamp,
-    > {
-        let full_idx = timestamp.map(Self::timestamp_to_full_index);
+    fn timestamp_to_tick(timestamp: precision::Timestamp) -> u64 {
+        let time = Duration::from_nanos(timestamp.nanos);
+        time.as_micros() as u64 / GRANULARITY_US
+    }
+}
 
-        let mut lock = self.0.sync_state.lock();
-        let original_min = lock.start_idx;
-        let full_idx = full_idx.unwrap_or(original_min);
-        let max = original_min + self.0.mask;
+// ── Slot ───────────────────────────────────────────────────────────────────
 
-        if full_idx > max {
-            // return when the application should resubmit
-            let target = full_idx - self.0.mask + 1;
-            let target = Self::full_index_to_timestamp(target);
-            return Err(target);
+/// A single slot in the wheel. Owned exclusively by the Ticker (no sync needed).
+struct Slot<Info, Meta, Completion> {
+    queue: Queue<Transmission<Info, Meta, Completion>>,
+}
+
+impl<Info, Meta, Completion> Slot<Info, Meta, Completion> {
+    fn new() -> Self {
+        Self {
+            queue: Queue::new(),
+        }
+    }
+
+    fn push(&mut self, entry: Entry<Info, Meta, Completion>) {
+        self.queue.push_back(entry);
+    }
+
+    fn drain(&mut self) -> Queue<Transmission<Info, Meta, Completion>> {
+        core::mem::take(&mut self.queue)
+    }
+}
+
+// ── Level ──────────────────────────────────────────────────────────────────
+
+/// One level of the hierarchical wheel, containing SLOTS_PER_LEVEL slots
+/// and a 256-bit occupancy bitset for fast scanning.
+struct Level<Info, Meta, Completion> {
+    slots: Box<[Slot<Info, Meta, Completion>; SLOTS_PER_LEVEL]>,
+    /// Occupancy bitset: bit `i` is set iff `slots[i]` is non-empty.
+    occupied: [u64; BITSET_WORDS],
+}
+
+impl<Info, Meta, Completion> Level<Info, Meta, Completion> {
+    fn new() -> Self {
+        let slots = Box::new(core::array::from_fn(|_| Slot::new()));
+        Self {
+            slots,
+            occupied: [0; BITSET_WORDS],
+        }
+    }
+
+    /// Mark a slot as occupied in the bitset.
+    #[inline]
+    fn set_occupied(&mut self, index: usize) {
+        let word = index / 64;
+        let bit = index % 64;
+        self.occupied[word] |= 1u64 << bit;
+    }
+
+    /// Mark a slot as empty in the bitset.
+    #[inline]
+    fn clear_occupied(&mut self, index: usize) {
+        let word = index / 64;
+        let bit = index % 64;
+        self.occupied[word] &= !(1u64 << bit);
+    }
+
+    /// Push an entry into a slot and mark it occupied.
+    #[inline]
+    fn push(&mut self, index: usize, entry: Entry<Info, Meta, Completion>) {
+        debug_assert!(index < SLOTS_PER_LEVEL);
+        unsafe { self.slots.get_unchecked_mut(index) }.push(entry);
+        self.set_occupied(index);
+    }
+
+    /// Drain a slot and clear it from the bitset.
+    #[inline]
+    fn drain(&mut self, index: usize) -> Queue<Transmission<Info, Meta, Completion>> {
+        debug_assert!(index < SLOTS_PER_LEVEL);
+        let queue = unsafe { self.slots.get_unchecked_mut(index) }.drain();
+        self.clear_occupied(index);
+        queue
+    }
+
+    /// Find the first occupied slot at or after `from_slot` (wrapping within the level).
+    /// Uses the bitset for O(1) per-word scanning via `trailing_zeros`.
+    ///
+    /// Returns the slot index relative to 0, or `None` if no slots are occupied
+    /// after `from_slot` within this level.
+    fn first_occupied_after(&self, from_slot: usize) -> Option<usize> {
+        debug_assert!(from_slot < SLOTS_PER_LEVEL);
+
+        let start_word = from_slot / 64;
+        let start_bit = from_slot % 64;
+
+        // Check the first word, masking off bits before from_slot
+        let masked = self.occupied[start_word] & (!0u64 << start_bit);
+        if masked != 0 {
+            return Some(start_word * 64 + masked.trailing_zeros() as usize);
         }
 
-        let bounded_idx = full_idx.max(original_min);
-
-        let waker = if let Some(waker) = lock.waker.take() {
-            // Only advance start_idx if the wheel is empty
-            // If there are any entries (len > 0), we must tick through them sequentially
-            // to avoid skipping over occupied slots with stale timestamps
-            let is_empty = self.0.len.load(Ordering::Relaxed) == 0;
-            if is_empty {
-                lock.start_idx = bounded_idx;
+        // Check subsequent words
+        for w in (start_word + 1)..BITSET_WORDS {
+            if self.occupied[w] != 0 {
+                return Some(w * 64 + self.occupied[w].trailing_zeros() as usize);
             }
-            Some(waker)
-        } else {
-            None
-        };
-
-        if cfg!(debug_assertions) {
-            let timestamp = Self::full_index_to_timestamp(bounded_idx);
-            let expected_min = Self::full_index_to_timestamp(original_min);
-            let expected_max = Self::full_index_to_timestamp(max);
-            assert!(
-                (expected_min..=expected_max).contains(&timestamp),
-                "bounded {} not in {}..={}",
-                timestamp,
-                expected_min,
-                expected_max
-            );
         }
 
-        // wrap the index around the slots
-        let idx = bounded_idx & self.0.mask;
-        let info = (idx as usize, bounded_idx, waker, lock);
-        Ok(info)
+        None
     }
 
-    fn full_index_to_timestamp(full_idx: u64) -> Timestamp {
-        unsafe { Timestamp::from_duration(Duration::from_micros(full_idx * GRANULARITY_US)) }
-    }
-
-    fn timestamp_to_full_index(timestamp: Timestamp) -> u64 {
-        unsafe { timestamp.as_duration().as_micros() as u64 / GRANULARITY_US }
+    /// Returns true if no slots are occupied.
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        self.occupied.iter().all(|&w| w == 0)
     }
 }
 
-struct State<Info, Meta, Completion> {
-    sync_state: Mutex<SyncState<Info, Meta, Completion>>,
-    mask: u64,
-    len: AtomicUsize,
+// ── Ticker (reader-owned) ──────────────────────────────────────────────────
+
+/// The reader-side of the timing wheel. Not `Clone`, owned by a single consumer.
+///
+/// The `Ticker` owns the hierarchical level/slot structure. It drains the
+/// shared unordered queue, inserts entries into the correct slot, and advances
+/// virtual time to collect due entries.
+pub struct Ticker<Info, Meta, Completion, const GRANULARITY_US: u64 = DEFAULT_GRANULARITY_US> {
+    wheel: Wheel<Info, Meta, Completion, GRANULARITY_US>,
+    levels: Box<[Level<Info, Meta, Completion>; LEVELS]>,
+    current_tick: u64,
 }
 
-struct SyncState<Info, Meta, Completion> {
-    start_idx: u64,
-    waker: Option<Arc<WakerState>>,
-    entries: Box<[Queue<Transmission<Info, Meta, Completion>>]>,
+impl<Info, Meta, Completion, const GRANULARITY_US: u64> fmt::Debug
+    for Ticker<Info, Meta, Completion, GRANULARITY_US>
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Ticker")
+            .field("current_tick", &self.current_tick)
+            .field("granularity_us", &GRANULARITY_US)
+            .field("levels", &LEVELS)
+            .field("slots_per_level", &SLOTS_PER_LEVEL)
+            .finish()
+    }
+}
+
+impl<Info, Meta, Completion, const GRANULARITY_US: u64>
+    Ticker<Info, Meta, Completion, GRANULARITY_US>
+{
+    /// Advance the virtual clock to `now` and return all due entries.
+    ///
+    /// 1. Drains the shared unordered queue and inserts each entry into the
+    ///    appropriate level/slot based on its `transmission_time`.
+    /// 2. Advances virtual time tick-by-tick from the current position to `now`,
+    ///    cascading higher-level slots as needed.
+    /// 3. Collects all entries from expired level-0 slots into a single queue.
+    pub fn tick_to(
+        &mut self,
+        now: precision::Timestamp,
+    ) -> Queue<Transmission<Info, Meta, Completion>> {
+        // Step 1: Drain the shared queue and insert into wheel slots
+        self.drain_incoming();
+
+        // Step 2+3: Advance to `now` and collect due entries
+        let target_tick = Wheel::<Info, Meta, Completion, GRANULARITY_US>::timestamp_to_tick(now);
+        let target_tick = target_tick.max(self.current_tick);
+
+        let mut result = Queue::new();
+
+        while self.current_tick < target_tick {
+            let slot_idx = (self.current_tick & SLOT_MASK) as usize;
+            let mut slot_queue = self.levels[0].drain(slot_idx);
+            result.append(&mut slot_queue);
+
+            self.current_tick += 1;
+
+            // Cascade when level-0 wraps
+            if self.current_tick & SLOT_MASK == 0 {
+                self.cascade(self.current_tick, 1);
+            }
+        }
+
+        // Also drain the current slot (entries at exactly target_tick)
+        let slot_idx = (self.current_tick & SLOT_MASK) as usize;
+        let mut slot_queue = self.levels[0].drain(slot_idx);
+        result.append(&mut slot_queue);
+
+        result
+    }
+
+    /// Delegate to the wheel's `set_waker`.
+    pub fn set_waker(&self, waker: std::task::Waker) {
+        self.wheel.set_waker(waker);
+    }
+
+    /// Returns true if the shared queue has no NEW pending entries
+    /// (i.e., nothing has been pushed since the last drain_incoming).
+    pub fn has_pending(&self) -> bool {
+        !self.wheel.0.state.lock().queue.is_empty()
+    }
+
+    /// Returns the timestamp of the current virtual tick.
+    pub fn current_time(&self) -> precision::Timestamp {
+        Wheel::<Info, Meta, Completion, GRANULARITY_US>::tick_to_timestamp(self.current_tick)
+    }
+
+    /// Returns the timestamp of the earliest non-empty slot, if any.
+    ///
+    /// This scans level-0 first (cheap), then higher levels. Used to determine
+    /// how long the ticker can sleep before the next entry is due.
+    pub fn next_expiry(&self) -> Option<precision::Timestamp> {
+        // Check level-0: find the first occupied slot after the current position
+        let base = self.current_tick;
+        let current_slot = ((base + 1) & SLOT_MASK) as usize;
+        if let Some(slot_idx) = self.levels[0].first_occupied_after(current_slot) {
+            // Compute the tick for this slot
+            let slot_offset = if slot_idx >= current_slot {
+                slot_idx - current_slot
+            } else {
+                SLOTS_PER_LEVEL - current_slot + slot_idx
+            };
+            let tick = base + 1 + slot_offset as u64;
+            return Some(Wheel::<Info, Meta, Completion, GRANULARITY_US>::tick_to_timestamp(tick));
+        }
+
+        // Check higher levels using bitset
+        for level in 1..LEVELS {
+            let shift = BITS_PER_LEVEL * level as u32;
+            let level_cursor = ((base >> shift) + 1) & SLOT_MASK;
+            if let Some(slot_idx) = self.levels[level].first_occupied_after(level_cursor as usize) {
+                let earliest_tick = (slot_idx as u64) << shift;
+                return Some(
+                    Wheel::<Info, Meta, Completion, GRANULARITY_US>::tick_to_timestamp(
+                        earliest_tick.max(base + 1),
+                    ),
+                );
+            }
+        }
+
+        None
+    }
+
+    // ── Internal ───────────────────────────────────────────────────────
+
+    /// Drain the shared unordered queue and insert each entry into the wheel.
+    fn drain_incoming(&mut self) {
+        let mut incoming = core::mem::take(&mut self.wheel.0.state.lock().queue);
+        while let Some(entry) = incoming.pop_front() {
+            self.insert_entry(entry);
+        }
+    }
+
+    /// Convert a core Timestamp to a tick (for reading transmission_time from entries).
+    fn core_timestamp_to_tick(ts: s2n_quic_core::time::Timestamp) -> u64 {
+        let p: precision::Timestamp = ts.into();
+        Wheel::<Info, Meta, Completion, GRANULARITY_US>::timestamp_to_tick(p)
+    }
+
+    /// Insert a single entry into the appropriate level/slot.
+    fn insert_entry(&mut self, entry: Entry<Info, Meta, Completion>) {
+        let target_tick = entry
+            .transmission_time
+            .map(Self::core_timestamp_to_tick)
+            .unwrap_or(self.current_tick)
+            .max(self.current_tick);
+
+        let (level, slot_idx) = Self::compute_level_and_slot(self.current_tick, target_tick);
+        self.levels[level].push(slot_idx, entry);
+    }
+
+    /// Cascade entries from level `level` down toward level 0.
+    fn cascade(&mut self, current_tick: u64, mut level: usize) {
+        while level < LEVELS {
+            let slot_idx = ((current_tick >> (BITS_PER_LEVEL * level as u32)) & SLOT_MASK) as usize;
+
+            let mut entries = self.levels[level].drain(slot_idx);
+
+            while let Some(entry) = entries.pop_front() {
+                let target_tick = entry
+                    .transmission_time
+                    .map(Self::core_timestamp_to_tick)
+                    .unwrap_or(current_tick)
+                    .max(current_tick);
+
+                let (new_level, new_slot) = Self::compute_level_and_slot(current_tick, target_tick);
+                self.levels[new_level].push(new_slot, entry);
+            }
+
+            // Check if this level also wrapped and needs to cascade upward
+            let next_level_tick = current_tick >> (BITS_PER_LEVEL * level as u32);
+            if next_level_tick & SLOT_MASK == 0 {
+                level += 1;
+                continue;
+            }
+
+            break;
+        }
+    }
+
+    /// Compute which level and slot an entry should be placed in.
+    fn compute_level_and_slot(current_tick: u64, target_tick: u64) -> (usize, usize) {
+        let delta = target_tick - current_tick;
+
+        if delta == 0 {
+            let slot = (current_tick & SLOT_MASK) as usize;
+            return (0, slot);
+        }
+
+        // Find the level: which "digit" (base-64) of the delta is non-zero
+        let mut level = 0;
+        let mut shifted = delta;
+        while shifted >= SLOTS_PER_LEVEL as u64 && level + 1 < LEVELS {
+            shifted >>= BITS_PER_LEVEL;
+            level += 1;
+        }
+
+        let slot = ((target_tick >> (BITS_PER_LEVEL * level as u32)) & SLOT_MASK) as usize;
+
+        (level, slot)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::socket::pool::Pool;
-    use s2n_quic_core::time::{self, Clock as _};
     use std::{
         convert::Infallible,
         net::{Ipv4Addr, SocketAddr},
-        time::Duration,
     };
 
-    struct Clock(Timestamp);
+    #[derive(Clone)]
+    struct Clock(precision::Timestamp);
 
-    impl Default for Clock {
-        fn default() -> Self {
-            // `Timestamp` can't represent 0
-            Self::new(Duration::from_micros(1))
+    impl precision::Clock for Clock {
+        type Timer = ClockTimer;
+
+        fn now(&self) -> precision::Timestamp {
+            self.0
+        }
+
+        fn timer(&self) -> ClockTimer {
+            unimplemented!("not needed for unit tests")
         }
     }
 
-    impl time::Clock for Clock {
-        fn get_time(&self) -> Timestamp {
-            self.0
+    struct ClockTimer;
+
+    impl precision::Timer for ClockTimer {
+        fn now(&self) -> precision::Timestamp {
+            unimplemented!()
+        }
+        async fn sleep_until(&mut self, _target: precision::Timestamp) {
+            unimplemented!()
         }
     }
 
     impl Clock {
         fn new(start: Duration) -> Self {
-            Self(unsafe { Timestamp::from_duration(start) })
+            Self(precision::Timestamp {
+                nanos: start.as_nanos() as u64,
+            })
+        }
+
+        fn get_time(&self) -> precision::Timestamp {
+            self.0
         }
 
         fn inc_by(&mut self, duration: Duration) {
-            self.0 += duration;
+            self.0 = self.0 + duration;
         }
     }
 
-    fn new(slots: usize) -> (Wheel<(), u16, (), 8>, Pool, Clock) {
+    fn new(slots: usize) -> (Wheel<(), u16, (), 8>, Ticker<(), u16, (), 8>, Pool, Clock) {
         let horizon = Duration::from_micros(8 * slots as u64);
         let clock = Clock::new(horizon);
         let pool = Pool::new(u16::MAX);
-        (Wheel::new(horizon, &clock), pool, clock)
+        let wheel = Wheel::new();
+        let ticker = wheel.ticker(&clock);
+        (wheel, ticker, pool, clock)
     }
 
     // Helper to create a test transmission
@@ -344,52 +600,48 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_wheel_creation() {
-        let (wheel, _pool, clock) = new(64);
-
-        assert_eq!(wheel.0.sync_state.lock().entries.len(), 64);
-        assert_eq!(wheel.0.mask, 63);
-
-        let start = wheel.start();
-        assert_eq!(start, clock.get_time());
+    fn create_entry_at(
+        pool: &Pool,
+        payload_len: u16,
+        time: Option<precision::Timestamp>,
+    ) -> Entry<(), u16, ()> {
+        let mut entry = Entry::new(create_transmission(pool, payload_len));
+        entry.transmission_time = time.map(Into::into);
+        entry
     }
 
     #[test]
-    fn test_wheel_insert_and_tick() {
-        let (wheel, pool, mut clock) = new(64);
+    fn test_wheel_creation() {
+        let (wheel, _ticker, _pool, _clock) = new(64);
+        assert_eq!(wheel.len(), 0);
+    }
+
+    #[test]
+    fn test_insert_and_tick() {
+        let (wheel, mut ticker, pool, clock) = new(64);
 
         // Insert an entry at the current time
-        let entry = Entry::new(create_transmission(&pool, 100));
-        wheel.insert(entry, None).unwrap();
+        let entry = create_entry_at(&pool, 100, Some(clock.get_time()));
+        wheel.insert(entry);
 
-        // Tick should return this entry
-        let (next_time, mut queue) = wheel.tick(None);
-        clock.inc_by(Duration::from_micros(8));
-        assert_eq!(next_time, clock.get_time());
+        assert_eq!(wheel.len(), 1);
 
+        // Tick to current time should return this entry
+        let mut queue = ticker.tick_to(clock.get_time());
         let entry = queue.pop_front().unwrap();
         assert_eq!(entry.meta, 100);
         assert!(queue.is_empty());
     }
 
     #[test]
-    fn test_wheel_multiple_entries_same_slot() {
-        let (wheel, pool, _clock) = new(64);
+    fn test_multiple_entries_same_slot() {
+        let (wheel, mut ticker, pool, clock) = new(64);
 
-        // Insert multiple entries at the same timestamp
-        wheel
-            .insert(Entry::new(create_transmission(&pool, 10)), None)
-            .unwrap();
-        wheel
-            .insert(Entry::new(create_transmission(&pool, 20)), None)
-            .unwrap();
-        wheel
-            .insert(Entry::new(create_transmission(&pool, 30)), None)
-            .unwrap();
+        wheel.insert(create_entry_at(&pool, 10, Some(clock.get_time())));
+        wheel.insert(create_entry_at(&pool, 20, Some(clock.get_time())));
+        wheel.insert(create_entry_at(&pool, 30, Some(clock.get_time())));
 
-        // Tick should return all entries in FIFO order
-        let (_, mut queue) = wheel.tick(None);
+        let mut queue = ticker.tick_to(clock.get_time());
 
         assert_eq!(queue.pop_front().unwrap().meta, 10);
         assert_eq!(queue.pop_front().unwrap().meta, 20);
@@ -398,350 +650,292 @@ mod tests {
     }
 
     #[test]
-    fn test_wheel_multiple_slots() {
-        let (wheel, pool, mut clock) = new(64);
+    fn test_multiple_slots() {
+        let (wheel, mut ticker, pool, mut clock) = new(64);
 
-        // Insert entries at different times
         let t0 = clock.get_time();
         clock.inc_by(Duration::from_micros(8));
         let t1 = clock.get_time();
         clock.inc_by(Duration::from_micros(8));
         let t2 = clock.get_time();
 
-        wheel
-            .insert(Entry::new(create_transmission(&pool, 100)), Some(t0))
-            .unwrap();
-        wheel
-            .insert(Entry::new(create_transmission(&pool, 200)), Some(t1))
-            .unwrap();
-        wheel
-            .insert(Entry::new(create_transmission(&pool, 300)), Some(t2))
-            .unwrap();
+        wheel.insert(create_entry_at(&pool, 100, Some(t0)));
+        wheel.insert(create_entry_at(&pool, 200, Some(t1)));
+        wheel.insert(create_entry_at(&pool, 300, Some(t2)));
 
-        // First tick gets entry 1
-        let (_, mut queue) = wheel.tick(None);
+        // Tick to t0
+        let mut queue = ticker.tick_to(t0);
         assert_eq!(queue.pop_front().unwrap().meta, 100);
         assert!(queue.is_empty());
 
-        // Second tick gets entry 2
-        let (_, mut queue) = wheel.tick(None);
+        // Tick to t1
+        let mut queue = ticker.tick_to(t1);
         assert_eq!(queue.pop_front().unwrap().meta, 200);
         assert!(queue.is_empty());
 
-        // Third tick gets entry 3
-        let (_, mut queue) = wheel.tick(None);
+        // Tick to t2
+        let mut queue = ticker.tick_to(t2);
         assert_eq!(queue.pop_front().unwrap().meta, 300);
         assert!(queue.is_empty());
     }
 
     #[test]
-    fn test_wheel_index_calculation() {
-        let (wheel, _pool, mut clock) = new(64);
+    fn test_len_tracking() {
+        let (wheel, mut ticker, pool, clock) = new(64);
 
-        for (iteration, expected) in (0usize..64).cycle().take(512).enumerate() {
-            let t = clock.get_time();
-            let (idx, _, _, lock) = wheel.index(Some(t)).unwrap();
-            drop(lock);
+        assert_eq!(wheel.len(), 0);
 
-            assert_eq!(
-                idx,
-                expected,
-                "iteration={iteration} ts={t:?} start={:?} horizon={:?} diff={:?}",
-                wheel.start(),
-                wheel.horizon(),
-                t.saturating_duration_since(wheel.start()),
-            );
-            clock.inc_by(Duration::from_micros(8));
-
-            // slowly drag behind by missing a tick every 64 iterations
-            if expected > 0 {
-                let _ = wheel.tick(None);
-            }
-        }
-    }
-
-    #[test]
-    fn test_wheel_bounds() {
-        let (wheel, pool, mut clock) = new(64);
-        let initial_time = clock.get_time();
-
-        // Insert at current time should succeed
-        let result = wheel.insert(
-            Entry::new(create_transmission(&pool, 100)),
-            Some(initial_time),
-        );
-        assert!(result.is_ok(), "Expected Ok, got Err");
-
-        // Tick the wheel forward
-        let _ = wheel.tick(None);
-        clock.inc_by(Duration::from_micros(8));
-
-        // Insert at current time should still succeed
-        let result = wheel.insert(
-            Entry::new(create_transmission(&pool, 150)),
-            Some(clock.get_time()),
-        );
-        assert!(result.is_ok(), "Expected Ok at current time");
-
-        // Advance the clock far beyond the horizon
-        clock.inc_by(Duration::from_micros(8 * 1024));
-        let far_future = clock.get_time();
-
-        let result = wheel.insert(
-            Entry::new(create_transmission(&pool, 200)),
-            Some(far_future),
-        );
-        // Should fail because timestamp is beyond horizon
-        match result {
-            Err((_entry, retry_time)) => {
-                // The retry time should be when the wheel catches up enough to accept this timestamp
-                let current_start = wheel.start();
-                assert!(
-                    retry_time > current_start,
-                    "Retry time {:?} should be > current start {:?}",
-                    retry_time,
-                    current_start
-                );
-            }
-            Ok(_) => panic!("Expected Err for far future timestamp, got Ok"),
-        }
-    }
-
-    #[test]
-    fn test_wheel_waker_advances_start() {
-        let (mut wheel, pool, mut clock) = new(64);
-
-        // Create a waker
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let waker = rt.block_on(async { WakerState::new().await });
-
-        // Set the waker
-        wheel.set_waker(waker.clone());
-
-        let initial_start = wheel.start();
-
-        // Insert an entry at a future time - this should advance start_idx
-        clock.inc_by(Duration::from_micros(8 * 10));
-        let future_time = clock.get_time();
-
-        let result = wheel.insert(
-            Entry::new(create_transmission(&pool, 100)),
-            Some(future_time),
-        );
-        assert!(result.is_ok(), "Insert should succeed");
-
-        // The start should have advanced to at least the future_time
-        let new_start = wheel.start();
-        assert!(
-            new_start >= future_time,
-            "Start {:?} should have advanced to at least {:?}",
-            new_start,
-            future_time
-        );
-        assert!(
-            new_start > initial_start,
-            "Start {:?} should have advanced from {:?}",
-            new_start,
-            initial_start
-        );
-    }
-
-    #[test]
-    fn test_wheel_no_waker_no_advance() {
-        let (wheel, pool, mut clock) = new(64);
-
-        let initial_start = wheel.start();
-
-        // Insert an entry at a future time without a waker - should NOT advance start_idx
-        clock.inc_by(Duration::from_micros(8 * 10));
-        let future_time = clock.get_time();
-
-        let result = wheel.insert(
-            Entry::new(create_transmission(&pool, 100)),
-            Some(future_time),
-        );
-        assert!(result.is_ok(), "Insert should succeed");
-
-        // The start should NOT have advanced
-        let new_start = wheel.start();
-        assert_eq!(
-            new_start, initial_start,
-            "Start should not advance without waker"
-        );
-    }
-
-    #[test]
-    fn test_wheel_insert_past_timestamp() {
-        let (wheel, pool, mut clock) = new(64);
-
-        let initial_time = clock.get_time();
-
-        // Tick forward
-        for _ in 0..10 {
-            let _ = wheel.tick(None);
-            clock.inc_by(Duration::from_micros(8));
-        }
-
-        // Current start is 10 slots ahead of initial_time
-        let current_start = wheel.start();
-        assert!(
-            initial_time < current_start,
-            "Initial time {:?} should be < current start {:?}",
-            initial_time,
-            current_start
-        );
-
-        // Insert at past time should still succeed, but be bounded to current slot
-        let result = wheel.insert(
-            Entry::new(create_transmission(&pool, 100)),
-            Some(initial_time),
-        );
-        assert!(
-            result.is_ok(),
-            "Insert at past time should succeed but be bounded"
-        );
-
-        // Entry should be in current slot (immediately available)
-        let (_, mut queue) = wheel.tick(None);
-        assert!(!queue.is_empty(), "Entry should be in current slot");
-        assert_eq!(queue.pop_front().unwrap().meta, 100);
-    }
-
-    #[test]
-    fn test_wheel_wrap_around() {
-        let (wheel, pool, mut clock) = new(64);
-
-        // Fill multiple slots
-        for i in 0..10 {
-            let result = wheel.insert(
-                Entry::new(create_transmission(&pool, 100 + i)),
-                Some(clock.get_time()),
-            );
-            assert!(result.is_ok(), "Insert {} should succeed", i);
-            clock.inc_by(Duration::from_micros(8));
-        }
-
-        // Tick through and verify order
-        for i in 0..10 {
-            let (_, mut queue) = wheel.tick(None);
-            let entry = queue
-                .pop_front()
-                .expect(&format!("Entry {} should exist", i));
-            assert_eq!(entry.meta, 100 + i, "Entry {} should have correct meta", i);
-            assert!(queue.is_empty(), "Queue should have only one entry");
-        }
-    }
-
-    #[test]
-    fn test_wheel_insert_at_horizon_boundary() {
-        let (wheel, pool, mut clock) = new(64);
-        let _initial_start = wheel.start();
-
-        // Insert at exactly the horizon (max valid timestamp)
-        let horizon = wheel.horizon();
-        clock.inc_by(horizon);
-        let max_time = clock.get_time();
-
-        let result = wheel.insert(Entry::new(create_transmission(&pool, 100)), Some(max_time));
-        assert!(result.is_ok(), "Insert at horizon should succeed");
-
-        // Insert just beyond horizon should fail
-        clock.inc_by(Duration::from_micros(8));
-        let beyond_horizon = clock.get_time();
-
-        let result = wheel.insert(
-            Entry::new(create_transmission(&pool, 200)),
-            Some(beyond_horizon),
-        );
-        assert!(result.is_err(), "Insert beyond horizon should fail");
-    }
-
-    #[test]
-    fn test_wheel_len_tracking() {
-        let (wheel, pool, _clock) = new(64);
-
-        assert_eq!(wheel.len(), 0, "Initial len should be 0");
-
-        // Insert some entries
         for i in 0..5 {
-            wheel
-                .insert(Entry::new(create_transmission(&pool, 100 + i)), None)
-                .unwrap();
+            wheel.insert(create_entry_at(&pool, 100 + i, Some(clock.get_time())));
         }
 
-        assert_eq!(wheel.len(), 5, "Len should be 5 after inserting 5");
+        assert_eq!(wheel.len(), 5);
 
-        // Tick and verify len decreases
-        let (_, mut queue) = wheel.tick(None);
+        let mut queue = ticker.tick_to(clock.get_time());
         while queue.pop_front().is_some() {
             wheel.on_send();
         }
 
-        assert_eq!(wheel.len(), 0, "Len should be 0 after sending all");
+        assert_eq!(wheel.len(), 0);
     }
 
     #[test]
-    fn test_wheel_insert_none_timestamp() {
-        let (wheel, pool, _clock) = new(64);
+    fn test_insert_none_timestamp() {
+        let (wheel, mut ticker, pool, clock) = new(64);
 
-        // Insert with None timestamp should use current start
-        let result = wheel.insert(Entry::new(create_transmission(&pool, 100)), None);
-        assert!(result.is_ok(), "Insert with None timestamp should succeed");
+        // Insert with None timestamp should be available immediately
+        wheel.insert(create_entry_at(&pool, 100, None));
 
-        // Entry should be in the current slot
-        let (_, mut queue) = wheel.tick(None);
-        assert!(!queue.is_empty(), "Entry should be in current slot");
+        let mut queue = ticker.tick_to(clock.get_time());
+        assert!(!queue.is_empty());
         let entry = queue.pop_front().unwrap();
         assert_eq!(entry.meta, 100);
     }
 
     #[test]
-    fn test_wheel_ordering_with_waker() {
-        // This test validates the fix for the logic bug where variable shadowing
-        // could cause packets to be sent out of order
-        let (mut wheel, pool, mut clock) = new(64);
+    fn test_cascade() {
+        // With GRANULARITY_US=8 and 256 slots/level, we need >256 ticks to trigger cascade.
+        // Insert an entry 300 ticks in the future (beyond level-0's 256-slot range).
+        let (wheel, mut ticker, pool, mut clock) = new(64);
 
-        // Create a waker
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let waker = rt.block_on(async { WakerState::new().await });
-        wheel.set_waker(waker.clone());
+        let start = clock.get_time();
 
-        // Insert entries at different times
-        let t0 = clock.get_time();
-        let result = wheel.insert(Entry::new(create_transmission(&pool, 100)), Some(t0));
-        assert!(result.is_ok(), "First insert should succeed");
+        clock.inc_by(Duration::from_micros(8 * 300));
+        let future_time = clock.get_time();
 
-        clock.inc_by(Duration::from_micros(8 * 5));
-        let t1 = clock.get_time();
+        wheel.insert(create_entry_at(&pool, 999, Some(future_time)));
 
-        // This insert should advance start_idx due to waker
-        wheel.set_waker(waker.clone());
-        let result = wheel.insert(Entry::new(create_transmission(&pool, 200)), Some(t1));
-        assert!(result.is_ok(), "Second insert should succeed");
+        // Tick through 256 ticks to trigger a cascade from level 1 to level 0
+        let mid = start + Duration::from_micros(8 * 256);
+        let queue = ticker.tick_to(mid);
+        assert!(queue.is_empty(), "Should be empty before the target tick");
 
-        // Now insert another entry at t1 - with the bug fix, this should be properly bounded
-        clock.inc_by(Duration::from_micros(8));
-        let t2 = clock.get_time();
-        let result = wheel.insert(Entry::new(create_transmission(&pool, 300)), Some(t2));
-        assert!(result.is_ok(), "Third insert should succeed");
+        // Now tick to the target time — the entry should have been cascaded down
+        let mut queue = ticker.tick_to(future_time);
+        let entry = queue
+            .pop_front()
+            .expect("Entry should have been found after cascade");
+        assert_eq!(entry.meta, 999);
+    }
 
-        // Verify entries come out in the expected order
-        // The first entry was inserted before start advanced, so it should be in the current slot
-        let (_, mut queue) = wheel.tick(None);
-        if let Some(entry) = queue.pop_front() {
-            // Entry 100 or 200 could be here depending on how start advanced
+    #[test]
+    fn test_insert_queue_batch() {
+        let (wheel, mut ticker, pool, clock) = new(64);
+
+        let mut batch = Queue::new();
+        batch.push_back(create_entry_at(&pool, 10, Some(clock.get_time())));
+        batch.push_back(create_entry_at(&pool, 20, Some(clock.get_time())));
+        batch.push_back(create_entry_at(&pool, 30, Some(clock.get_time())));
+
+        wheel.insert_batch(batch);
+
+        assert_eq!(wheel.len(), 3);
+
+        let mut queue = ticker.tick_to(clock.get_time());
+        assert_eq!(queue.pop_front().unwrap().meta, 10);
+        assert_eq!(queue.pop_front().unwrap().meta, 20);
+        assert_eq!(queue.pop_front().unwrap().meta, 30);
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn test_next_expiry() {
+        let (wheel, mut ticker, pool, mut clock) = new(64);
+
+        // Empty wheel has no next expiry
+        ticker.drain_incoming();
+        assert!(ticker.next_expiry().is_none());
+
+        // Insert an entry 10 ticks in the future
+        clock.inc_by(Duration::from_micros(8 * 10));
+        let future_time = clock.get_time();
+        wheel.insert(create_entry_at(&pool, 100, Some(future_time)));
+
+        // Drain and check next_expiry
+        ticker.drain_incoming();
+        let expiry = ticker.next_expiry();
+        assert!(expiry.is_some());
+        assert!(expiry.unwrap() <= future_time);
+    }
+
+    #[test]
+    fn test_extreme_lag_tolerance() {
+        let (wheel, mut ticker, pool, mut clock) = new(64);
+
+        let base = clock.get_time();
+
+        // Insert entries at various future times while NOT ticking
+        for i in 1..=32u16 {
+            clock.inc_by(Duration::from_micros(8));
+            wheel.insert(create_entry_at(&pool, i, Some(clock.get_time())));
+        }
+
+        assert_eq!(wheel.len(), 32);
+
+        // Now tick to the end and collect everything
+        let mut collected = Vec::new();
+        let mut queue = ticker.tick_to(clock.get_time());
+        while let Some(entry) = queue.pop_front() {
+            collected.push(entry.meta);
+        }
+
+        assert_eq!(collected.len(), 32, "All entries should be retrieved");
+
+        for window in collected.windows(2) {
             assert!(
-                entry.meta == 100 || entry.meta == 200,
-                "First tick should have entry 100 or 200"
+                window[0] <= window[1],
+                "Entries should be in order: {} <= {}",
+                window[0],
+                window[1]
             );
         }
+    }
 
-        // Continue ticking to verify order is maintained
-        for _ in 0..10 {
-            let (_, mut queue) = wheel.tick(None);
-            while let Some(_entry) = queue.pop_front() {
-                // Just verify we can drain the queue without panicking
-            }
+    #[test]
+    fn test_concurrent_insert() {
+        use std::thread;
+
+        let (wheel, mut ticker, pool, clock) = new(64);
+        let pool = Arc::new(pool);
+        let time = clock.get_time();
+
+        let mut handles = Vec::new();
+        for t in 0..4 {
+            let wheel = wheel.clone();
+            let pool = pool.clone();
+            handles.push(thread::spawn(move || {
+                for i in 0..100u16 {
+                    let payload = (t * 1000 + i) as u16;
+                    let entry = create_entry_at(&pool, payload, Some(time));
+                    wheel.insert(entry);
+                }
+            }));
         }
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        assert_eq!(wheel.len(), 400);
+
+        let mut queue = ticker.tick_to(time);
+        let mut count = 0;
+        while queue.pop_front().is_some() {
+            count += 1;
+        }
+        assert_eq!(count, 400);
+    }
+
+    #[test]
+    fn test_compute_level_and_slot() {
+        // Level 0: delta 0..255
+        let (level, _slot) = Ticker::<(), (), (), 1>::compute_level_and_slot(0, 0);
+        assert_eq!(level, 0);
+
+        let (level, _slot) = Ticker::<(), (), (), 1>::compute_level_and_slot(0, 255);
+        assert_eq!(level, 0);
+
+        // Level 1: delta 256..65535
+        let (level, _slot) = Ticker::<(), (), (), 1>::compute_level_and_slot(0, 256);
+        assert_eq!(level, 1);
+
+        let (level, _slot) = Ticker::<(), (), (), 1>::compute_level_and_slot(0, 65535);
+        assert_eq!(level, 1);
+
+        // Level 2: delta 65536..16777215
+        let (level, _slot) = Ticker::<(), (), (), 1>::compute_level_and_slot(0, 65536);
+        assert_eq!(level, 2);
+
+        let (level, _slot) = Ticker::<(), (), (), 1>::compute_level_and_slot(0, 16777215);
+        assert_eq!(level, 2);
+
+        // Level 3: delta 16777216..4294967295
+        let (level, _slot) = Ticker::<(), (), (), 1>::compute_level_and_slot(0, 16777216);
+        assert_eq!(level, 3);
+    }
+
+    /// Fuzz test: insert entries at random times, tick to the end, verify:
+    /// 1. All entries are retrieved
+    /// 2. Entries are in causal (non-decreasing tick) order
+    /// 3. Bitset is consistent with slot emptiness
+    #[test]
+    fn fuzz_insert_and_retrieve() {
+        use bolero::check;
+
+        check!().with_type::<Vec<u16>>().for_each(|offsets| {
+            let pool = Pool::new(u16::MAX);
+            let wheel: Wheel<(), u16, (), 1> = Wheel::new();
+            let start = precision::Timestamp { nanos: 1_000_000 };
+            let clock = Clock(start);
+            let mut ticker = wheel.ticker(&clock);
+
+            let mut expected_count = 0usize;
+
+            // Insert entries with varying offsets from start
+            for &raw_offset in offsets.iter() {
+                // Limit offsets to a reasonable range (within level 0+1)
+                let offset_us = (raw_offset as u64) % 60_000;
+                let time = start + Duration::from_micros(offset_us);
+
+                let entry = create_entry_at(&pool, expected_count as u16, Some(time));
+                wheel.insert(entry);
+                expected_count += 1;
+            }
+
+            // Tick far enough to drain everything
+            let end = start + Duration::from_micros(70_000);
+            let mut queue = ticker.tick_to(end);
+
+            let mut count = 0usize;
+            let mut last_time: Option<s2n_quic_core::time::Timestamp> = None;
+            while let Some(entry) = queue.pop_front() {
+                // Verify causal ordering: transmission_time should be non-decreasing
+                if let Some(tx_time) = entry.transmission_time {
+                    if let Some(prev) = last_time {
+                        assert!(
+                            tx_time >= prev,
+                            "Causal ordering violated: {:?} < {:?}",
+                            tx_time,
+                            prev
+                        );
+                    }
+                    last_time = Some(tx_time);
+                }
+                count += 1;
+            }
+
+            assert_eq!(
+                count, expected_count,
+                "Lost entries: expected {expected_count}, got {count}"
+            );
+
+            // Verify all level bitsets are clear after draining
+            for (l, level) in ticker.levels.iter().enumerate() {
+                assert!(
+                    level.is_empty(),
+                    "Level {l} bitset not empty after draining all entries"
+                );
+            }
+        });
     }
 }

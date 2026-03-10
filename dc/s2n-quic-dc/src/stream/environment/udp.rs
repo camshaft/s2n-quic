@@ -8,7 +8,7 @@ use crate::{
     path::secret::Map,
     socket::{
         pool::{self, descriptor},
-        send::udp::LeakyBucket,
+        send::udp::Rate,
     },
     stream::{
         environment::{Environment, Peer, SetupResult, SocketSet},
@@ -24,7 +24,7 @@ use crate::{
 };
 use s2n_codec::{DecoderBufferMut, DecoderParameterizedValueMut};
 use s2n_quic_core::inet::{IpAddress, IpV4Address, IpV6Address, SocketAddress, Unspecified};
-use std::{sync::Arc, time::Duration};
+use std::sync::Arc;
 
 #[derive(Clone, Debug)]
 pub enum Workers {
@@ -77,7 +77,6 @@ pub struct Config {
     pub recv_workers: Workers,
     pub map: Map,
     // Send worker configuration
-    pub send_wheel_horizon: Duration,
     pub max_gigabits_per_second: f64,
     pub priority_levels: usize,
     pub flow_priority: Option<u8>,
@@ -104,15 +103,14 @@ impl Config {
             map,
 
             // Send worker defaults
-            send_wheel_horizon: Duration::from_secs(20),
             max_gigabits_per_second: 5.0,
             priority_levels: 1,
             flow_priority: None,
         }
     }
 
-    pub(crate) fn bucket(&self) -> LeakyBucket {
-        LeakyBucket::new(self.max_gigabits_per_second)
+    pub(crate) fn rate(&self) -> Rate {
+        Rate::new(self.max_gigabits_per_second)
     }
 
     pub(crate) fn rx_packet_pool(&self) -> pool::Pool {

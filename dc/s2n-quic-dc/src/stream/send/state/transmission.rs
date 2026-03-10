@@ -43,6 +43,13 @@ pub type Builder = send::transmission::Builder<PacketInfo, Meta, Completion>;
 pub type Wheel<const GRANULARITY_US: u64> =
     send::wheel::Wheel<PacketInfo, Meta, Completion, GRANULARITY_US>;
 
+pub type Ticker<const GRANULARITY_US: u64> =
+    send::wheel::Ticker<PacketInfo, Meta, Completion, GRANULARITY_US>;
+
+/// An intrusive queue of transmission entries, used for batch submission.
+pub type EntryQueue =
+    crate::intrusive_queue::Queue<send::transmission::Transmission<PacketInfo, Meta, Completion>>;
+
 pub type PacketInfo = (VarInt, Info);
 
 pub struct Event {

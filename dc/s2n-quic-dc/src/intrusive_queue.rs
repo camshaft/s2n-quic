@@ -99,6 +99,7 @@ impl<T> DerefMut for Entry<T> {
 pub struct Queue<T> {
     head: Option<Link<T>>,
     tail: Option<Link<T>>,
+    len: usize,
 }
 
 unsafe impl<T: Send> Send for Queue<T> {}
@@ -110,12 +111,18 @@ impl<T> Queue<T> {
         Self {
             head: None,
             tail: None,
+            len: 0,
         }
     }
 
     /// Returns true if the queue is empty
     pub fn is_empty(&self) -> bool {
         self.head.is_none()
+    }
+
+    /// Returns the number of entries in the queue
+    pub fn len(&self) -> usize {
+        self.len
     }
 
     /// Push an entry to the back of the queue
@@ -139,6 +146,7 @@ impl<T> Queue<T> {
         }
 
         self.tail = Some(new_tail);
+        self.len += 1;
     }
 
     /// Pop an entry from the front of the queue
@@ -163,6 +171,8 @@ impl<T> Queue<T> {
             // Clear the popped entry's pointers
             (*head_ptr.as_ptr()).prev = None;
             (*head_ptr.as_ptr()).next = None;
+
+            self.len -= 1;
 
             // Reconstruct the Entry from the leaked box
             Some(Entry(Box::from_raw(head_ptr.as_ptr())))
@@ -189,9 +199,37 @@ impl<T> Queue<T> {
         self.tail.map(|tail| unsafe { &mut (*tail.as_ptr()).value })
     }
 
+    /// Append another queue to the back of this queue.
+    ///
+    /// This is O(1) — just a pointer splice. The `other` queue is left empty.
+    pub fn append(&mut self, other: &mut Queue<T>) {
+        let Some(other_head) = other.head.take() else {
+            // other is empty
+            return;
+        };
+        let other_tail = other.tail.take().unwrap();
+        let other_len = other.len;
+        other.len = 0;
+
+        if let Some(tail) = self.tail {
+            unsafe {
+                (*tail.as_ptr()).next = Some(other_head);
+                (*other_head.as_ptr()).prev = Some(tail);
+            }
+            self.tail = Some(other_tail);
+        } else {
+            // self is empty
+            self.head = Some(other_head);
+            self.tail = Some(other_tail);
+        }
+
+        self.len += other_len;
+    }
+
     pub fn iter(&self) -> Iter<'_, T> {
         Iter {
             next: self.head,
+            len: self.len,
             _phantom: std::marker::PhantomData,
         }
     }
@@ -212,6 +250,7 @@ impl<T> Drop for Queue<T> {
 
 pub struct Iter<'a, T> {
     next: Option<Link<T>>,
+    len: usize,
     _phantom: std::marker::PhantomData<&'a T>,
 }
 
@@ -223,8 +262,14 @@ impl<'a, T> Iterator for Iter<'a, T> {
         unsafe {
             let inner = &*current.as_ptr();
             self.next = inner.next;
+            self.len -= 1;
             Some(&inner.value)
         }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let len = self.len;
+        (len, Some(len))
     }
 }
 
@@ -341,10 +386,81 @@ mod tests {
         assert!(queue.is_empty());
     }
 
+    #[test]
+    fn test_append_both_non_empty() {
+        let mut a = Queue::new();
+        a.push_back(Entry::new(1));
+        a.push_back(Entry::new(2));
+
+        let mut b = Queue::new();
+        b.push_back(Entry::new(3));
+        b.push_back(Entry::new(4));
+
+        a.append(&mut b);
+
+        assert!(b.is_empty());
+        assert_eq!(*a.pop_front().unwrap(), 1);
+        assert_eq!(*a.pop_front().unwrap(), 2);
+        assert_eq!(*a.pop_front().unwrap(), 3);
+        assert_eq!(*a.pop_front().unwrap(), 4);
+        assert!(a.is_empty());
+    }
+
+    #[test]
+    fn test_append_to_empty() {
+        let mut a = Queue::new();
+        let mut b = Queue::new();
+        b.push_back(Entry::new(10));
+        b.push_back(Entry::new(20));
+
+        a.append(&mut b);
+
+        assert!(b.is_empty());
+        assert_eq!(*a.pop_front().unwrap(), 10);
+        assert_eq!(*a.pop_front().unwrap(), 20);
+        assert!(a.is_empty());
+    }
+
+    #[test]
+    fn test_append_empty_other() {
+        let mut a = Queue::new();
+        a.push_back(Entry::new(1));
+
+        let mut b = Queue::new();
+        a.append(&mut b);
+
+        assert_eq!(*a.pop_front().unwrap(), 1);
+        assert!(a.is_empty());
+    }
+
+    #[test]
+    fn test_append_both_empty() {
+        let mut a: Queue<u64> = Queue::new();
+        let mut b: Queue<u64> = Queue::new();
+        a.append(&mut b);
+        assert!(a.is_empty());
+        assert!(b.is_empty());
+    }
+
+    #[test]
+    fn test_append_peek() {
+        let mut a = Queue::new();
+        a.push_back(Entry::new(1));
+
+        let mut b = Queue::new();
+        b.push_back(Entry::new(2));
+
+        a.append(&mut b);
+
+        assert_eq!(*a.peek_front().unwrap(), 1);
+        assert_eq!(*a.peek_back().unwrap(), 2);
+    }
+
     #[derive(Clone, Copy, Debug, TypeGenerator)]
     enum Operation {
         Push,
         Pop,
+        Append,
     }
 
     #[test]
@@ -354,15 +470,32 @@ mod tests {
             let mut oracle = VecDeque::new();
             let mut subject = Queue::new();
 
+            // secondary queue for append operations
+            let mut oracle_other = VecDeque::new();
+            let mut subject_other = Queue::new();
+
             for op in ops {
                 match op {
                     Operation::Push => {
                         let value = values.next().unwrap();
                         oracle.push_back(value);
                         subject.push_back(Entry::new(value));
+                        assert_eq!(oracle.len(), subject.len());
+
+                        // also push to secondary so appends have something to work with
+                        let value2 = values.next().unwrap();
+                        oracle_other.push_back(value2);
+                        subject_other.push_back(Entry::new(value2));
                     }
                     Operation::Pop => {
                         assert_eq!(oracle.pop_front(), subject.pop_front().map(|entry| *entry));
+                        assert_eq!(oracle.len(), subject.len());
+                    }
+                    Operation::Append => {
+                        oracle.extend(oracle_other.drain(..));
+                        subject.append(&mut subject_other);
+                        assert!(subject_other.is_empty());
+                        assert_eq!(oracle.len(), subject.len());
                     }
                 }
             }

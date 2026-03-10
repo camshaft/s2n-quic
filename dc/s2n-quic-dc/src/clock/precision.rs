@@ -1,10 +1,16 @@
 use std::{fmt, ops, time::Duration};
 
-pub trait Clock: Send + 'static {
+pub trait Clock: Send + Sync + 'static {
+    type Timer: Timer;
+
     fn now(&self) -> Timestamp;
+
+    /// Creates a new timer from this clock.
+    fn timer(&self) -> Self::Timer;
 }
 
-pub trait Timer: Clock {
+pub trait Timer: Send + 'static {
+    fn now(&self) -> Timestamp;
     fn sleep_until(&mut self, target: Timestamp) -> impl core::future::Future<Output = ()> + Send;
 }
 
@@ -85,15 +91,13 @@ impl s2n_quic_core::time::Clock for Timestamp {
     }
 }
 
-impl Clock for crate::clock::Timer {
+impl Timer for crate::clock::Timer {
     fn now(&self) -> Timestamp {
         use s2n_quic_core::time::Clock;
         let nanos = unsafe { self.get_time().as_duration().as_nanos() as u64 };
         Timestamp { nanos }
     }
-}
 
-impl Timer for crate::clock::Timer {
     async fn sleep_until(&mut self, target: Timestamp) {
         let target = std::time::Duration::from_nanos(target.nanos);
         let target = unsafe { s2n_quic_core::time::Timestamp::from_duration(target) };

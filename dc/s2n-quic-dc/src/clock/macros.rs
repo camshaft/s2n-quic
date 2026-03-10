@@ -46,10 +46,17 @@ macro_rules! impl_clock {
         }
 
         impl crate::clock::precision::Clock for Clock {
+            type Timer = super::Timer;
+
             #[inline]
             fn now(&self) -> crate::clock::precision::Timestamp {
                 let nanos = self.0.elapsed_since_start().as_nanos() as u64;
                 crate::clock::precision::Timestamp { nanos }
+            }
+
+            #[inline]
+            fn timer(&self) -> Self::Timer {
+                super::Timer::new(self)
             }
         }
 

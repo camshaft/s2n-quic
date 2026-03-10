@@ -2,910 +2,412 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
-    clock::precision::{Timer, Timestamp},
+    clock::precision::{self, Timer as _, Timestamp},
     intrusive_queue::Queue,
     socket::send::{
+        channel::{self, Flatten, Priority, Reporter},
         completion::{Completer as _, Completion},
         transmission::{self, Entry, Transmission},
-        wheel::{WakerState, Wheel},
+        wheel::{self, Wheel},
     },
     stream::socket::Socket,
 };
-use std::{future::poll_fn, ops::ControlFlow, sync::Arc, time::Duration};
+use std::{
+    future::{poll_fn, Future},
+    task::Poll,
+    time::Duration,
+};
+use tokio::select;
 
-/// State for each priority level to track partially processed queues and entries
-struct WheelState<Info, Meta, Completion, const GRANULARITY_US: u64> {
-    queue: Wheel<Info, Meta, Completion, GRANULARITY_US>,
-    next_tick: Timestamp,
-    pending_queue: Option<Queue<Transmission<Info, Meta, Completion>>>,
-    pending_entry: Option<Entry<Info, Meta, Completion>>,
+// ── Idle Strategy ──────────────────────────────────────────────────────────
+
+/// Controls how the wheel ticker waits for new work between iterations.
+///
+/// Two strategies:
+/// - [`BusyPollIdle`]: Yields once per iteration (for busy-poll runtimes)
+/// - [`WakerIdle`]: Registers a waker and sleeps until next expiry or new insertions
+pub trait Idle: Copy + Send + 'static {
+    /// Called after each tick_to iteration when no entries were due (or after sending).
+    /// Should yield at least once to allow other tasks to run.
+    fn idle<Info, Meta, C, const GRANULARITY_US: u64>(
+        &self,
+        ticker: &wheel::Ticker<Info, Meta, C, GRANULARITY_US>,
+        timer: &mut impl precision::Timer,
+    ) -> impl Future<Output = ()>;
 }
 
-impl<Info, Meta, C, const GRANULARITY_US: u64> WheelState<Info, Meta, C, GRANULARITY_US>
-where
-    C: Completion<Info, Meta>,
-{
-    /// Ticks the wheel to get the next queue
-    fn tick(&mut self, waker: &Option<&Arc<WakerState>>) -> Queue<Transmission<Info, Meta, C>> {
-        if let Some(queue) = self.pending_queue.take() {
-            // Resume processing previously retrieved queue
-            if let Some(waker) = *waker {
-                self.queue.set_waker(waker.clone());
-            }
-            queue
-        } else {
-            let (ts, queue) = self.queue.tick(waker.cloned());
-            if cfg!(debug_assertions) {
-                let min_ts = ts - Duration::from_micros(GRANULARITY_US);
-                let range = min_ts..ts;
-                for entry in queue.iter() {
-                    let target = entry.transmission_time.unwrap();
-                    assert!(range.contains(&target), "{range:?} {target}");
-                }
-            }
-            self.next_tick = ts.into();
-            queue
-        }
-    }
+/// Busy-poll idle: just yield once so other tasks can be polled.
+#[derive(Clone, Copy, Debug)]
+pub struct BusyPollIdle;
 
-    /// Attempts to transmit an entry on the socket.
-    ///
-    /// Returns `true` if the packet was actually sent, `false` if the completion
-    /// channel could not be upgraded (the sender has gone away) and the packet
-    /// was skipped.
-    fn transmit<S: Socket, Clk: s2n_quic_core::time::Clock>(
+impl Idle for BusyPollIdle {
+    async fn idle<Info, Meta, C, const GRANULARITY_US: u64>(
         &self,
-        mut entry: Entry<Info, Meta, C>,
-        socket: &S,
-        clock: &Clk,
-    ) -> bool
-    where
-        Meta: transmission::Meta<Info = Info>,
-    {
-        // Try to upgrade the completion channel before sending.
-        // If the upgrade fails, the sender has gone away and there's no point
-        // in sending the packet.
-        let Some(completion) = entry.completion.upgrade() else {
-            self.queue.on_send();
-            return false;
+        _ticker: &wheel::Ticker<Info, Meta, C, GRANULARITY_US>,
+        _timer: &mut impl precision::Timer,
+    ) {
+        // Yield exactly once to let other tasks run
+        let mut yielded = false;
+        poll_fn(|cx| {
+            // busy poll runtime doesn't use wakers at all
+            let _ = cx;
+
+            if yielded {
+                Poll::Ready(())
+            } else {
+                yielded = true;
+                Poll::Pending
+            }
+        })
+        .await;
+    }
+}
+
+/// Waker-based idle: register waker on the wheel and sleep until next expiry.
+#[derive(Clone, Copy, Debug)]
+pub struct WakerIdle;
+
+impl Idle for WakerIdle {
+    async fn idle<Info, Meta, C, const GRANULARITY_US: u64>(
+        &self,
+        ticker: &wheel::Ticker<Info, Meta, C, GRANULARITY_US>,
+        timer: &mut impl precision::Timer,
+    ) {
+        // Sleep until the next expiry or until woken by new insertions
+        let deadline = ticker.next_expiry();
+
+        let timer_fut = async {
+            if let Some(deadline) = deadline {
+                timer.sleep_until(deadline).await;
+            } else {
+                // if we don't have a deadline it means the wheel is empty and we just need to wait for it
+                core::future::pending::<()>().await;
+            }
         };
 
-        // Record the transmission time to report accurate transmission
-        let now = clock.get_time();
-        entry.transmission_time = Some(now);
+        let queue_updates = poll_fn(|cx| {
+            // the waker was already registered when the task started
+            let _ = cx;
 
-        // Successfully acquired all credits, send the packet
-        entry.send_with(|addr, ecn, iovec| {
-            let _ = socket.try_send(addr, ecn, iovec);
+            if ticker.has_pending() {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
         });
 
-        self.queue.on_send();
+        select! {
+            biased;
 
-        completion.complete(entry);
-
-        true
+            _ = queue_updates => {}
+            _ = timer_fut => {}
+        }
     }
 }
 
-pub trait WakeMode {
-    const BUSY_POLL: bool;
-}
+// ── Wheel Ticker ───────────────────────────────────────────────────────────
 
-pub struct BusyPoll;
-
-impl WakeMode for BusyPoll {
-    const BUSY_POLL: bool = true;
-}
-
-pub struct WithWaker;
-
-impl WakeMode for WithWaker {
-    const BUSY_POLL: bool = false;
-}
-
-/// Sends packets on a non-blocking socket with priority-based timing wheels
+/// Ticks a single timing wheel and pushes ready queues into a channel sender.
 ///
-/// Priority levels are specified by the number of wheels.
-/// Index 0 is the highest priority and is processed first.
-/// The function drains each priority level in order, and if blocked by the token
-/// bucket, it restarts from the highest priority level after the bucket refills.
-pub async fn non_blocking<S, T, Info, Meta, C, W, const GRANULARITY_US: u64>(
-    socket: S,
-    wheels: Vec<Wheel<Info, Meta, C, GRANULARITY_US>>,
-    mut timer: T,
-    bucket: LeakyBucket,
-    wake_mode: W,
+/// Creates a Ticker from the wheel and loops:
+/// 1. Drains the shared queue, inserts into wheel slots, advances to now
+/// 2. Sends due entries through the channel
+/// 3. Sleeps until next expiry or woken by new insertions
+///
+/// Returns when the channel is closed (receiver dropped).
+async fn wheel_ticker<Info, Meta, C, S, I, const GRANULARITY_US: u64>(
+    wheel: Wheel<Info, Meta, C, GRANULARITY_US>,
+    clock: &impl precision::Clock,
+    mut tx: S,
+    idle: I,
 ) where
-    S: Socket,
-    T: Timer,
-    Meta: transmission::Meta<Info = Info>,
-    C: Completion<Info, Meta>,
-    W: WakeMode,
+    S: channel::Sender<Queue<Transmission<Info, Meta, C>>>,
+    I: Idle,
 {
-    assert!(!wheels.is_empty());
-    let _ = wake_mode;
+    let mut ticker = wheel.ticker(clock);
+    poll_fn(|cx| {
+        ticker.set_waker(cx.waker().clone());
+        Poll::Ready(())
+    })
+    .await;
 
-    let start = timer.now();
-
-    let mut wheels = wheels
-        .into_iter()
-        .map(|wheel| WheelState {
-            queue: wheel,
-            next_tick: start,
-            pending_queue: None,
-            pending_entry: None,
-        })
-        .collect::<Vec<_>>();
-
-    let waker = WakerState::new().await;
-
-    let granularity = Duration::from_micros(GRANULARITY_US);
-    let mut bucket = bucket.init(granularity, timer.now());
-    let horizon = wheels[0].queue.horizon();
-    let mut sleep_time = start + horizon;
-    let mut reporter = Reporter::new(start);
+    let mut timer = clock.timer();
 
     loop {
-        // let mut target_timestamp = None;
-        let start = timer.now();
-        reporter.flush(start);
-        let mut has_pending_transmissions = false;
-        let mut should_park = false;
-        let waker_ref = if !W::BUSY_POLL && start > sleep_time {
-            should_park = true;
-            Some(&waker)
-        } else {
-            None
-        };
+        let now: Timestamp = timer.now();
 
-        let mut next_sleep = None;
+        // Advance the wheel to now and collect due entries
+        let queue = ticker.tick_to(now.into());
 
-        // Process each wheel in priority order (0 = highest priority)
-        'batch: for (priority, wheel) in wheels.iter_mut().enumerate() {
-            let _ = priority;
-
-            // Catch-up/processing loop for this priority level
-            loop {
-                let start = timer.now();
-
-                if next_sleep.is_none() {
-                    next_sleep = Some(wheel.next_tick);
-                }
-
-                // If we're busy polling then check if we should tick or not
-                if wheel.pending_queue.is_none() && wheel.next_tick > start {
-                    break;
-                }
-
-                let mut queue = wheel.tick(&waker_ref);
-
-                // Process pending entry first if it exists
-                if let Some(entry) = wheel.pending_entry.take() {
-                    let now = timer.now();
-                    has_pending_transmissions = true;
-
-                    // Continue acquiring credits for partially transmitted entry
-                    if let ControlFlow::Break(target) = bucket.take(entry.total_len as _, now) {
-                        if !W::BUSY_POLL {
-                            next_sleep = Some(target);
-                        }
-                        wheel.pending_entry = Some(entry);
-                        wheel.pending_queue = Some(queue);
-                        break 'batch;
-                    }
-
-                    // Successfully acquired all credits, send the packet
-                    let total_len = entry.total_len as u64;
-                    if wheel.transmit(entry, &socket, &now) {
-                        reporter.on_send(total_len);
-                    } else {
-                        // The sender went away; restore the bucket credits
-                        bucket.restore(total_len);
-                    }
-                }
-
-                // Process all packets in the queue
-                while let Some(entry) = queue.pop_front() {
-                    let now = timer.now();
-                    has_pending_transmissions = true;
-
-                    // Continue acquiring credits for partially transmitted entry
-                    if let ControlFlow::Break(target) = bucket.take(entry.total_len as _, now) {
-                        if !W::BUSY_POLL {
-                            next_sleep = Some(target);
-                        }
-                        wheel.pending_entry = Some(entry);
-                        wheel.pending_queue = Some(queue);
-                        break 'batch;
-                    }
-
-                    // Successfully acquired all credits, send the packet
-                    let total_len = entry.total_len as u64;
-                    if wheel.transmit(entry, &socket, &now) {
-                        reporter.on_send(total_len);
-                    } else {
-                        // The sender went away; restore the bucket credits
-                        bucket.restore(total_len);
-                    }
-                }
-
-                if let Some(next_sleep) = next_sleep {
-                    // if the wheel is caught up with the target then continue to the next priority
-                    if next_sleep <= wheel.next_tick {
-                        break;
-                    }
-                } else {
-                    next_sleep = Some(wheel.next_tick);
-                    break;
-                }
-            }
-        }
-
-        if has_pending_transmissions {
-            sleep_time = start + horizon;
-        } else if start > sleep_time {
-            // check if we need to shut down
-            if wheels.iter().all(|v| v.queue.is_closed()) {
-                tracing::info!(local_addr = %socket.local_addr().unwrap(), "shutting down UDP sender");
+        // Only send non-empty queues to avoid unnecessary wakeups
+        if !queue.is_empty() {
+            if tx.send(queue).await.is_err() {
                 return;
             }
         }
 
-        if W::BUSY_POLL {
-            yield_now().await;
-        } else {
-            if should_park {
-                let is_empty = !wheels.iter().any(|v| v.queue.len() > 0);
-                if is_empty {
-                    tracing::debug!("parking");
-                    waker.wait().await;
-                    tracing::debug!("unparked");
-                    sleep_time = timer.now() + horizon;
-                    continue;
-                }
-            }
-
-            let next_sleep = next_sleep.unwrap();
-            timer.sleep_until(next_sleep).await;
-        }
+        // Yield / sleep using the idle strategy
+        idle.idle(&ticker, &mut timer).await;
     }
 }
 
-async fn yield_now() {
-    let mut yielded = false;
-    use std::task::Poll;
-    poll_fn(|cx| {
-        if yielded {
-            Poll::Ready(())
+// ── Socket Sender ──────────────────────────────────────────────────────────
+
+/// Receives entries from a channel and sends them on a socket.
+///
+/// After sending each packet, computes how long the bytes should take at the
+/// configured rate and sleeps until that time. This naturally paces
+/// transmissions without the complexity of a token bucket with debt tracking.
+///
+/// Returns when the receiver signals that all senders are gone.
+async fn socket_sender<S, Clk, Info, Meta, C, R>(socket: S, clock: &Clk, rate: Rate, mut rx: R)
+where
+    S: Socket,
+    Clk: precision::Clock,
+    Meta: transmission::Meta<Info = Info>,
+    C: Completion<Info, Meta>,
+    R: channel::Receiver<Entry<Info, Meta, C>>,
+{
+    let mut timer = clock.timer();
+    let mut bucket = TokenBucket::new(timer.now(), &rate);
+
+    while let Some(mut entry) = rx.recv().await {
+        // Try to upgrade the completion channel before sending.
+        let total_len = entry.total_len as u64;
+        let Some(completion) = entry.completion.upgrade() else {
+            // The sender went away; skip this entry
+            continue;
+        };
+
+        // Send the packet
+        entry.send_with(|addr, ecn, iovec| {
+            let _ = socket.try_send(addr, ecn, iovec);
+        });
+
+        let now: Timestamp = timer.now();
+
+        // Record the actual transmission time
+        entry.transmission_time = Some(now.into());
+
+        completion.complete(entry);
+
+        // Consume tokens for this packet. The bucket refills based on elapsed
+        // time since the last consume, allowing microbursts up to the burst
+        // capacity. If we've exceeded the rate, sleep until tokens recover.
+        let cost_nanos = rate.nanos_for_bytes(total_len);
+        let sleep_nanos = bucket.consume(now, cost_nanos);
+        if sleep_nanos > 0 {
+            let target = now + Duration::from_nanos(sleep_nanos);
+            timer.sleep_until(target).await;
+        }
+    }
+
+    tracing::info!(local_addr = %socket.local_addr().unwrap(), "shutting down UDP sender");
+}
+
+// ── Public API ─────────────────────────────────────────────────────────────
+
+/// Sends packets on a non-blocking socket with priority-based timing wheels.
+///
+/// Each wheel represents a priority level (index 0 = highest priority).
+/// A ticker task is spawned per wheel that drains due entries into a channel.
+/// A single sender task reads from a priority-merging receiver and transmits
+/// on the socket, applying rate-based pacing.
+pub fn non_blocking<S, Clk, Info, Meta, C, const GRANULARITY_US: u64>(
+    socket: S,
+    wheels: Vec<Wheel<Info, Meta, C, GRANULARITY_US>>,
+    clock: Clk,
+    rate: Rate,
+    idle: impl Idle,
+) -> impl Future<Output = ()> + Send
+where
+    S: Socket,
+    Clk: precision::Clock + Clone,
+    Meta: transmission::Meta<Info = Info>,
+    C: Completion<Info, Meta>,
+{
+    // SAFETY: The future uses Rc-based cell channels internally, which are !Send.
+    // However, the entire future is polled as a single unit — the Rc's are created
+    // inside the async block and never escape it. No Rc crosses a thread boundary.
+    AssertSend(non_blocking_inner(socket, wheels, clock, rate, idle))
+}
+
+async fn non_blocking_inner<S, Clk, Info, Meta, C, const GRANULARITY_US: u64>(
+    socket: S,
+    wheels: Vec<Wheel<Info, Meta, C, GRANULARITY_US>>,
+    clock: Clk,
+    rate: Rate,
+    idle: impl Idle,
+) where
+    S: Socket,
+    Clk: precision::Clock + Clone,
+    Meta: transmission::Meta<Info = Info>,
+    C: Completion<Info, Meta>,
+{
+    assert!(!wheels.is_empty());
+
+    // Create one slot channel per priority level and spawn a ticker per wheel.
+    let mut senders = Vec::with_capacity(wheels.len());
+    let mut receivers = Vec::with_capacity(wheels.len());
+
+    for wheel in &wheels {
+        let (tx, rx) = channel::cell::new();
+        senders.push(tx);
+
+        // Flatten the queue of transmissions into individual entries
+        let rx = Flatten::new(rx);
+
+        let wheel = wheel.clone();
+        // decrement the wheel's len counter when entries are received
+        let rx = channel::Inspect::new(rx, move |_entry: &Entry<Info, Meta, C>| {
+            wheel.on_send();
+        });
+        receivers.push(rx);
+    }
+
+    // Then merge all via Priority, then wrap in Reporter.
+    let receivers = Priority::new(receivers);
+    let receivers = Reporter::new(receivers, clock.clone());
+
+    // Create ticker futures
+    let mut tickers: Vec<_> = wheels
+        .into_iter()
+        .zip(senders)
+        .map(|(wheel, tx)| Some(Box::pin(wheel_ticker(wheel, &clock, tx, idle))))
+        .collect();
+
+    let mut sender = Some(Box::pin(socket_sender(socket, &clock, rate, receivers)));
+
+    core::future::poll_fn(|cx| {
+        let mut any_pending = false;
+        for slot in &mut tickers {
+            if let Some(ticker) = slot {
+                if ticker.as_mut().poll(cx).is_ready() {
+                    *slot = None;
+                } else {
+                    any_pending = true;
+                }
+            }
+        }
+
+        if let Some(s) = &mut sender {
+            if s.as_mut().poll(cx).is_ready() {
+                // If the socket is gone then there's no point in continuing
+                return core::task::Poll::Ready(());
+            } else {
+                any_pending = true;
+            }
+        }
+
+        if any_pending {
+            core::task::Poll::Pending
         } else {
-            yielded = true;
-            cx.waker().wake_by_ref();
-            Poll::Pending
+            core::task::Poll::Ready(())
         }
     })
     .await
 }
 
-struct Reporter {
-    last_emit: Timestamp,
-    next_emit: Timestamp,
-    sent: u64,
+// ── Rate ───────────────────────────────────────────────────────────────────
+
+/// A token-bucket rate limiter for pacing packet transmissions.
+///
+/// Tokens are added at a constant rate (based on the configured throughput).
+/// Each send consumes tokens proportional to the packet size. When the bucket
+/// is empty, the sender sleeps until enough tokens accumulate. The bucket
+/// has a bounded capacity to allow microbursts — if the sender was idle, it
+/// can burst up to `burst_nanos` worth of data at line rate before pacing
+/// kicks in.
+pub struct Rate {
+    /// Nanoseconds per byte at the configured rate.
+    nanos_per_byte: f64,
+    /// Maximum burst allowance in nanoseconds of credit.
+    /// This allows microbursts after idle periods.
+    burst_nanos: u64,
 }
 
-impl Reporter {
-    pub fn new(start: Timestamp) -> Self {
-        Self {
-            last_emit: start,
-            next_emit: start + Duration::from_secs(1),
-            sent: 0,
-        }
-    }
-
-    fn on_send(&mut self, amount: u64) {
-        self.sent += amount;
-    }
-
-    fn flush(&mut self, now: Timestamp) {
-        if now < self.next_emit {
-            return;
-        }
-        if self.sent > 0 {
-            let elapsed_nanos = now.nanos_since(self.last_emit) as f64;
-            let elapsed = elapsed_nanos / 1_000_000_000.0;
-            let mut rate = self.sent as f64 * 8.0 / elapsed;
-            let prefixes = [("G", 1e9), ("M", 1e6), ("K", 1e3)];
-            let mut prefix = "";
-            for (pref, divisor) in prefixes {
-                if rate > divisor {
-                    rate /= divisor;
-                    prefix = pref;
-                    break;
-                }
-            }
-            tracing::trace!("{now}: {rate:.2} {prefix}bps");
-        }
-        self.last_emit = now;
-        self.next_emit = now + Duration::from_secs(1);
-        self.sent = 0;
-    }
-}
-
-pub struct LeakyBucket {
-    bytes_per_nanos: f64,
-}
-
-impl LeakyBucket {
+impl Rate {
     pub fn new(gigabits_per_second: f64) -> Self {
-        let bytes_per_nanos = gigabits_per_second / 8.0;
-        Self { bytes_per_nanos }
+        // nanos/byte = 8 / Gbps
+        let nanos_per_byte = 8.0 / gigabits_per_second;
+
+        // Allow up to 256KB worth of burst (4x GSO batches)
+        let burst_nanos = (4.0 * u16::MAX as f64 * nanos_per_byte) as u64;
+
+        Self {
+            nanos_per_byte,
+            burst_nanos,
+        }
     }
 
-    fn init(&self, granularity: Duration, now: Timestamp) -> LeakyBucketInstance {
-        let bytes_per_nanos = self.bytes_per_nanos;
-        let max_size = bytes_per_nanos * granularity.as_nanos() as f64;
-        let bytes = max_size;
-        LeakyBucketInstance {
-            bytes_per_nanos,
-            last_refill: now,
-            max_size,
-            bytes,
-            debt: 0.0,
-        }
+    /// Returns the number of nanoseconds to sleep after sending `bytes`.
+    fn nanos_for_bytes(&self, bytes: u64) -> u64 {
+        (bytes as f64 * self.nanos_per_byte) as u64
     }
 }
 
-struct LeakyBucketInstance {
-    bytes_per_nanos: f64,
+/// Token bucket state for pacing.
+struct TokenBucket {
+    /// Timestamp when the bucket was last refilled.
     last_refill: Timestamp,
-    max_size: f64,
-    bytes: f64,
-    debt: f64,
+    /// Available tokens in nanoseconds. Can go negative (debt).
+    tokens_nanos: i64,
+    /// Maximum tokens (burst capacity) in nanoseconds.
+    capacity_nanos: i64,
 }
 
-impl LeakyBucketInstance {
-    fn refill(&mut self, now: Timestamp) {
-        let diff_nanos = now.nanos_since(self.last_refill) as f64;
-        let mut refill_amount = self.bytes_per_nanos * diff_nanos;
-        if self.debt > 0.0 {
-            let debt_paid = refill_amount.min(self.debt);
-            refill_amount -= debt_paid;
-            self.debt -= debt_paid;
+impl TokenBucket {
+    fn new(now: Timestamp, rate: &Rate) -> Self {
+        Self {
+            last_refill: now,
+            tokens_nanos: rate.burst_nanos as i64,
+            capacity_nanos: rate.burst_nanos as i64,
         }
-        let bytes = self.bytes + refill_amount;
-        self.bytes = bytes.min(self.max_size);
+    }
+
+    /// Refill tokens based on elapsed time, then consume `cost_nanos`.
+    /// Returns the number of nanos to sleep (0 if tokens are available).
+    fn consume(&mut self, now: Timestamp, cost_nanos: u64) -> u64 {
+        // Refill: add tokens for elapsed time since last refill
+        let elapsed = now.nanos_since(self.last_refill);
         self.last_refill = now;
-    }
+        self.tokens_nanos = (self.tokens_nanos + elapsed as i64).min(self.capacity_nanos);
 
-    /// Restores credits that were previously taken but not actually used
-    /// (e.g., when a transmission was skipped because the sender went away).
-    fn restore(&mut self, bytes: u64) {
-        let bytes = bytes as f64;
-        if self.debt > 0.0 {
-            let debt_restored = bytes.min(self.debt);
-            self.debt -= debt_restored;
-            let remaining = bytes - debt_restored;
-            self.bytes = (self.bytes + remaining).min(self.max_size);
+        // Consume tokens
+        self.tokens_nanos -= cost_nanos as i64;
+
+        // If we went negative, we need to sleep until tokens recover
+        if self.tokens_nanos < 0 {
+            (-self.tokens_nanos) as u64
         } else {
-            self.bytes = (self.bytes + bytes).min(self.max_size);
+            0
         }
-    }
-
-    fn take(&mut self, bytes: u64, now: Timestamp) -> ControlFlow<Timestamp> {
-        self.refill(now);
-
-        // check if we need to pay the debt first
-        if bytes > 0 && self.debt > 0.0 {
-            let remaining = self.debt;
-            let remaining_nanos = remaining / self.bytes_per_nanos;
-            let mut target = now;
-            target.nanos += remaining_nanos.ceil() as u64;
-            return ControlFlow::Break(target);
-        }
-
-        let bytes = bytes as f64;
-
-        if self.bytes >= bytes {
-            self.bytes = self.bytes - bytes;
-        } else {
-            self.debt = bytes - self.bytes;
-            self.bytes = 0.0;
-        }
-
-        ControlFlow::Continue(())
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::{
-        clock::bach::Clock,
-        socket::{
-            pool::Pool,
-            send::{
-                completion::{Completer, Queue as CompletionQueue},
-                transmission,
-            },
-        },
-        testing::{ext::*, sim},
-    };
-    use bach::net::UdpSocket;
-    use s2n_quic_core::time::{Clock as _, Duration};
-    use std::{convert::Infallible, net::SocketAddr, sync::Weak};
-    use tracing::info;
-
-    #[derive(Clone, Copy, Debug, Default)]
-    struct Meta {
-        priority: u8,
-        payload_len: u16,
-    }
-
-    impl transmission::Meta for Meta {
-        type Info = u32;
-
-        fn span(
-            &self,
-            descriptors: &[(crate::socket::pool::descriptor::Filled, Self::Info)],
-        ) -> impl Sized + 'static {
-            tracing::warn_span!("transmission", ?self.priority, ?self.payload_len, ?descriptors)
-                .entered()
-        }
-    }
-
-    // Helper to create a test transmission
-    fn create_transmission(
-        pool: &Pool,
-        socket_addr: SocketAddr,
-        payload_len: u16,
-        priority: u8,
-    ) -> Transmission<u32, Meta, ()> {
-        let descriptors = pool
-            .alloc()
-            .unwrap()
-            .fill_with(|addr, _cmsg, mut payload| {
-                addr.set(socket_addr.into());
-                let len = payload_len as usize;
-                for chunk in payload[..len].chunks_mut(2) {
-                    if chunk.len() == 2 {
-                        chunk.copy_from_slice(&payload_len.to_be_bytes());
-                    } else {
-                        chunk[0] = 255;
-                    }
-                }
-                <Result<_, Infallible>>::Ok(len)
-            })
-            .unwrap_or_else(|_| panic!("could not create packet"))
-            .into_iter()
-            .map(|desc| (desc, 0))
-            .collect();
-        Transmission {
-            descriptors,
-            total_len: payload_len,
-            transmission_time: None,
-            meta: Meta {
-                priority,
-                payload_len,
-            },
-            completion: (),
-        }
-    }
-
-    fn new<Comp>(horizon: Duration) -> (Wheel<u32, Meta, Comp, 8>, Pool, Clock) {
-        let clock = Clock::default();
-        let pool = Pool::new(u16::MAX);
-        let wheel = Wheel::new(horizon, &clock);
-        (wheel, pool, clock)
-    }
-
-    #[test]
-    fn single_priority_basic() {
-        sim(|| {
-            async {
-                let socket = UdpSocket::bind("receiver:80").await.unwrap();
-
-                let mut buf = vec![0u8; u16::MAX as usize];
-                for idx in 0..2 {
-                    let (len, addr) = socket.recv_from(&mut buf).await.unwrap();
-                    info!(len, %addr, "recv");
-                    let packet = &buf[..len];
-                    assert_eq!(packet.len(), (idx + 1) * 100);
-                }
-            }
-            .primary()
-            .group("receiver")
-            .spawn();
-
-            async {
-                let (wheel, pool, clock) = new(Duration::from_millis(100));
-
-                let peer_addr = bach::net::lookup_host("receiver:80")
-                    .await
-                    .unwrap()
-                    .next()
-                    .unwrap();
-
-                // Insert some packets
-                let now = clock.get_time();
-                wheel
-                    .insert(
-                        Entry::new(create_transmission(&pool, peer_addr, 100, 0)),
-                        Some(now),
-                    )
-                    .unwrap();
-                wheel
-                    .insert(
-                        Entry::new(create_transmission(&pool, peer_addr, 200, 0)),
-                        Some(now + Duration::from_millis(10)),
-                    )
-                    .unwrap();
-
-                let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-
-                let bucket = LeakyBucket::new(1.0);
-
-                // Spawn the sender
-                let wheels = vec![wheel.clone()];
-                crate::testing::spawn(async move {
-                    non_blocking(socket, wheels, clock, bucket, WithWaker).await;
-                });
-
-                1.s().sleep().await;
-                drop(wheel);
-            }
-            .primary()
-            .group("sender")
-            .spawn();
-        });
-    }
-
-    #[test]
-    fn multi_priority_ordering() {
-        sim(|| {
-            async {
-                let socket = UdpSocket::bind("receiver:80").await.unwrap();
-
-                let mut buf = vec![0u8; u16::MAX as usize];
-
-                // We should receive packets in priority order
-                // Priority 0 packets first, then priority 1
-                let expected = [100, 110, 200, 210];
-
-                for expected in expected {
-                    let (len, addr) = socket.recv_from(&mut buf).await.unwrap();
-                    info!(len, %addr, "recv");
-                    let packet = &buf[..len];
-                    assert_eq!(packet.len(), expected);
-                }
-            }
-            .primary()
-            .group("receiver")
-            .spawn();
-
-            async {
-                let (wheel0, pool, clock) = new(Duration::from_millis(100));
-                let wheel1 = Wheel::new(wheel0.horizon(), &clock);
-                let wheels = vec![wheel0, wheel1];
-
-                let peer_addr = bach::net::lookup_host("receiver:80")
-                    .await
-                    .unwrap()
-                    .next()
-                    .unwrap();
-
-                let now = clock.get_time();
-
-                // Priority 0 packets (should be sent first despite being inserted after)
-                let packets = [(200, 1), (210, 1), (100, 0), (110, 0)];
-
-                for (payload_len, priority) in packets {
-                    wheels[priority]
-                        .insert(
-                            Entry::new(create_transmission(
-                                &pool,
-                                peer_addr,
-                                payload_len,
-                                priority as _,
-                            )),
-                            Some(now),
-                        )
-                        .unwrap();
-                }
-
-                let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-
-                // High bandwidth to avoid token bucket blocking in this test
-                let bucket = LeakyBucket::new(1.0);
-
-                let wheels_guard = wheels.clone();
-                crate::testing::spawn(async move {
-                    non_blocking(socket, wheels, clock, bucket, WithWaker).await;
-                });
-
-                1.s().sleep().await;
-                drop(wheels_guard);
-            }
-            .primary()
-            .group("sender")
-            .spawn();
-        });
-    }
-
-    #[test]
-    fn token_bucket_preemption() {
-        sim(|| {
-            async {
-                let socket = UdpSocket::bind("receiver:80").await.unwrap();
-
-                let mut buf = vec![0u8; u16::MAX as usize];
-
-                // With limited token bucket, we should see:
-                // 1. Priority 0 packet (100 bytes)
-                // 2. Priority 1 starts but gets blocked
-                // 3. After refill, priority 0 packet (110 bytes) - preempts priority 1
-                // 4. Then priority 1 packets (200, 210 bytes)
-                let expected = [100, 110, 200, 210];
-
-                for expected in expected {
-                    let (len, addr) = socket.recv_from(&mut buf).await.unwrap();
-                    info!(len, %addr, "recv");
-                    let packet = &buf[..len];
-                    assert_eq!(packet.len(), expected);
-                }
-            }
-            .primary()
-            .group("receiver")
-            .spawn();
-
-            async {
-                let (wheel0, pool, clock) = new(Duration::from_millis(100));
-                let wheel1 = Wheel::new(wheel0.horizon(), &clock);
-                let wheels = vec![wheel0, wheel1];
-
-                let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-
-                // Limited token bucket: enough for ~1 packet per refill
-                // This will cause priority 1 to get blocked and allow priority 0 to preempt
-                let bucket = LeakyBucket::new(0.0002);
-
-                crate::testing::spawn({
-                    let clock = clock.clone();
-                    let wheels = wheels.clone();
-                    async move {
-                        non_blocking(socket, wheels, clock, bucket, WithWaker).await;
-                    }
-                });
-
-                let peer_addr = bach::net::lookup_host("receiver:80")
-                    .await
-                    .unwrap()
-                    .next()
-                    .unwrap();
-
-                let now = clock.get_time();
-
-                // Insert all packets at the same time
-                let packets = [
-                    (100, 0, 0), // Priority 0 - sent first
-                    (200, 1, 4), // Priority 1 - starts but gets blocked
-                    (210, 1, 0), // Priority 1 - waiting
-                    (110, 0, 0), // Priority 0 - preempts after refill
-                ];
-
-                for (payload_len, priority, sleep) in packets {
-                    info!(payload_len, priority, sleep, "insert");
-                    wheels[priority]
-                        .insert(
-                            Entry::new(create_transmission(
-                                &pool,
-                                peer_addr,
-                                payload_len,
-                                priority as _,
-                            )),
-                            Some(now),
-                        )
-                        .unwrap();
-                    if sleep > 0 {
-                        info!(sleep = ?sleep.us(), "sleep");
-                        sleep.us().sleep().await;
-                    }
-                }
-
-                1.s().sleep().await;
-                drop(wheels);
-            }
-            .primary()
-            .group("sender")
-            .spawn();
-        });
-    }
-
-    type SharedCompletionQueue = CompletionQueue<u32, Meta, Weak<dyn AsShared>>;
-
-    #[derive(Default)]
-    struct Shared {
-        completion_queue: SharedCompletionQueue,
-    }
-
-    impl core::ops::Deref for Shared {
-        type Target = SharedCompletionQueue;
-
-        fn deref(&self) -> &Self::Target {
-            &self.completion_queue
-        }
-    }
-
-    trait AsShared: 'static + Send + Sync {
-        fn as_shared(&self) -> &Shared;
-    }
-
-    impl AsShared for Shared {
-        fn as_shared(&self) -> &Shared {
-            self
-        }
-    }
-
-    impl Completion<u32, Meta> for Weak<dyn AsShared> {
-        type Completer = Arc<dyn AsShared>;
-
-        fn upgrade(&self) -> Option<Self::Completer> {
-            Weak::upgrade(self)
-        }
-    }
-
-    impl Completer<u32, Meta, Weak<dyn AsShared>> for Arc<dyn AsShared> {
-        fn complete(self, entry: Entry<u32, Meta, Weak<dyn AsShared>>) {
-            let shared = self.as_shared();
-            shared.completion_queue.complete_transmission(entry);
-        }
-    }
-
-    fn completion_queue() -> Arc<Shared> {
-        Arc::new(Shared::default())
-    }
-
-    #[test]
-    fn concurrent_senders_with_completion_verification() {
-        use bach::rand::*;
-        use std::sync::Arc;
-
-        sim(|| {
-            async {
-                let socket = UdpSocket::bind("receiver:80").await.unwrap();
-                let mut buf = vec![0u8; u16::MAX as usize];
-
-                // Receive all packets - we'll verify order through completion queue
-                loop {
-                    let (len, addr) = socket.recv_from(&mut buf).await.unwrap();
-                    info!(len, %addr, "recv");
-                }
-            }
-            .group("receiver")
-            .spawn();
-
-            let sender_count = 3;
-            let packet_count = 100u32;
-
-            async move {
-                let (wheel, pool, clock) = new(Duration::from_millis(500));
-
-                let peer_addr = bach::net::lookup_host("receiver:80")
-                    .await
-                    .unwrap()
-                    .next()
-                    .unwrap();
-
-                // Create shared completion queue
-                let completion_queue = completion_queue();
-
-                // Spawn multiple concurrent sender tasks
-                for sender_id in 0..sender_count {
-                    let wheel = wheel.clone();
-                    let pool = pool.clone();
-                    let clock = clock.clone();
-                    let peer_addr = peer_addr.clone();
-                    let completion_queue = completion_queue.clone();
-
-                    crate::testing::spawn(async move {
-                        let mut delay = 0.s();
-                        for packet_id in 0..packet_count {
-                            // Random interval between 1-50ms
-                            delay += (1..=50).any().ms();
-
-                            let now = clock.get_time();
-                            let payload_len = 100;
-
-                            // Create transmission with completion tracking
-                            let mut entry = completion_queue.alloc_entry(1, || {
-                                Arc::downgrade(&completion_queue) as Weak<dyn AsShared>
-                            });
-
-                            let descriptors = pool
-                                .alloc()
-                                .unwrap()
-                                .fill_with(|addr, _cmsg, mut payload| {
-                                    addr.set(peer_addr.into());
-                                    let len = payload_len as usize;
-                                    // Encode packet_id in first 4 bytes
-                                    payload[..4].copy_from_slice(&packet_id.to_be_bytes());
-                                    <Result<_, Infallible>>::Ok(len)
-                                })
-                                .unwrap_or_else(|_| panic!("could not create packet"))
-                                .into_iter()
-                                .map(|desc| (desc, packet_id))
-                                .collect();
-
-                            entry.descriptors = descriptors;
-                            entry.total_len = payload_len;
-                            entry.meta = Meta {
-                                priority: sender_id as _,
-                                payload_len,
-                            };
-
-                            let tx_time = now + delay;
-                            while let Err((e, time)) = wheel.insert(entry, Some(tx_time)) {
-                                entry = e;
-                                let duration = (time.max(tx_time))
-                                    .saturating_duration_since(now)
-                                    .max(1.us());
-
-                                tracing::info!(?duration, %tx_time, "sleeping");
-
-                                duration.sleep().await;
-                                delay = 0.s();
-                            }
-
-                            info!(sender_id, packet_id, payload_len, "inserted packet");
-                        }
-                    });
-                }
-
-                // Spawn completion queue reader task
-                {
-                    let completion_queue = completion_queue.clone();
-                    let wheel = wheel.clone();
-
-                    crate::testing::spawn(
-                        async move {
-                            let expected_count = sender_count * packet_count;
-                            let mut count = 0;
-                            let mut senders = vec![0; sender_count as usize];
-
-                            while count < expected_count {
-                                (10..100).any().ms().sleep().await;
-                                info!(count, "draining completion queue");
-
-                                completion_queue.drain_completion_queue(|transmission| {
-                                    let Meta {
-                                        priority: sender_id,
-                                        payload_len: _,
-                                    } = transmission.meta;
-                                    let packet_id = transmission.info;
-                                    let tx_time = transmission.transmission_time;
-                                    info!(packet_id, ?tx_time, "completed");
-                                    let sender = &mut senders[*sender_id as usize];
-                                    assert_eq!(*sender, packet_id);
-                                    *sender += 1;
-                                    count += 1;
-                                });
-                            }
-
-                            drop(wheel);
-                        }
-                        .primary(),
-                    )
-                }
-
-                // Spawn the sender
-                let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-                let bucket = LeakyBucket::new(1.0);
-
-                crate::testing::spawn(async move {
-                    non_blocking(socket, vec![wheel], clock, bucket, WithWaker).await;
-                });
-            }
-            .primary()
-            .group("sender")
-            .spawn();
-        });
+// ── Helpers ────────────────────────────────────────────────────────────────
+
+/// Wrapper that asserts a future is `Send` even if the compiler can't prove it.
+///
+/// SAFETY: The caller must ensure the future is only polled from a single thread
+/// and that no !Send data escapes the future.
+struct AssertSend<F>(F);
+
+// SAFETY: The non_blocking_inner future contains Rc-based cell channels which are
+// !Send. However, all Rc's are created within the async block, polled inline via
+// futures_join (never spawned separately), and dropped when the future completes.
+// No Rc ever crosses a thread boundary.
+unsafe impl<F: Future> Send for AssertSend<F> {}
+
+impl<F: Future> Future for AssertSend<F> {
+    type Output = F::Output;
+
+    fn poll(
+        self: core::pin::Pin<&mut Self>,
+        cx: &mut core::task::Context<'_>,
+    ) -> core::task::Poll<Self::Output> {
+        // SAFETY: We're just delegating to the inner future. Pin projection is safe
+        // because AssertSend is a transparent wrapper.
+        unsafe { self.map_unchecked_mut(|s| &mut s.0) }.poll(cx)
     }
 }

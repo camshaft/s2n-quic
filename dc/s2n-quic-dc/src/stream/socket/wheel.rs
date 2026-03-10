@@ -8,7 +8,7 @@ use crate::{
     stream::send::state::transmission,
 };
 use core::task::{Context, Poll};
-use s2n_quic_core::{inet::ExplicitCongestionNotification, time::Timestamp};
+use s2n_quic_core::inet::ExplicitCongestionNotification;
 use std::{
     io::{self, IoSlice, IoSliceMut},
     net::SocketAddr,
@@ -70,16 +70,12 @@ impl<const GRANULARITY_US: u64> Socket for Wheel<GRANULARITY_US> {
 
     #[inline]
     fn send_transmission(&self, msg: Transmission) {
-        let _ = self.wheel.insert(msg, None);
+        self.wheel.insert(msg);
     }
 
     #[inline]
-    fn send_transmission_at(
-        &self,
-        msg: Transmission,
-        time: Timestamp,
-    ) -> Result<(), (Transmission, Timestamp)> {
-        self.wheel.insert(msg, Some(time))
+    fn send_transmission_batch(&self, batch: transmission::EntryQueue) {
+        self.wheel.insert_batch(batch);
     }
 
     #[inline]

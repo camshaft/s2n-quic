@@ -3,7 +3,6 @@
 
 use super::udp::{ApplicationSendSocket, ArcSocket, WorkerSendSocket};
 use crate::{
-    clock::{tokio::Clock, Clock as _},
     credentials::Credentials,
     event,
     socket::{
@@ -61,12 +60,12 @@ macro_rules! spawn_span {
 }
 
 impl PoolSocket {
-    fn new(socket: UdpSocket, recv_queue: Mutex<Queues>, config: &Config, clock: &Clock) -> Self {
+    fn new(socket: UdpSocket, recv_queue: Mutex<Queues>, config: &Config) -> Self {
         let socket = Arc::new(socket);
         let local_addr = socket.local_addr().unwrap();
 
         let create_socket = || {
-            let wheel = send::wheel::Wheel::new(config.send_wheel_horizon, clock);
+            let wheel = send::wheel::Wheel::new();
             let socket = stream::socket::Wheel::new(wheel, local_addr.into());
             Tracing(socket)
         };
@@ -90,8 +89,8 @@ impl PoolSocket {
         &self,
         config: &Config,
         env: &Environment<impl event::Subscriber + Clone>,
-        timer: impl crate::clock::precision::Timer + Send + 'static,
-        wake_mode: impl send::udp::WakeMode + Send + 'static,
+        clock: impl crate::clock::precision::Clock + Clone,
+        idle: impl send::udp::Idle,
     ) -> impl core::future::Future<Output = ()> + Send + 'static {
         let socket = Tracing(Gso(SendOnly(self.socket.clone()), env.gso.clone()));
         let socket = Events::new(socket, env.subscriber.clone(), env.clock());
@@ -102,9 +101,9 @@ impl PoolSocket {
             wheels.push(send::wheel::Wheel::clone(application));
         }
 
-        let token_bucket = config.bucket();
+        let rate = config.rate();
 
-        send::udp::non_blocking(socket, wheels, timer, token_bucket, wake_mode)
+        send::udp::non_blocking(socket, wheels, clock, rate, idle)
     }
 
     fn spawn_non_blocking_send_worker(
@@ -112,9 +111,8 @@ impl PoolSocket {
         config: &Config,
         env: &Environment<impl event::Subscriber + Clone>,
     ) {
-        let timer = env.clock().timer();
-        let wake_mode = send::udp::WithWaker;
-        let task = self.create_send_socket_worker(config, env, timer, wake_mode);
+        let clock = env.clock();
+        let task = self.create_send_socket_worker(config, env, clock, send::udp::WakerIdle);
         let span = tracing::trace_span!("send_socket_worker");
         spawn_span!(span, task, |task| {
             env.writer_rt.spawn(task);
@@ -144,8 +142,7 @@ impl PoolSocket {
         handle: &crate::busy_poll::Handle,
     ) {
         let timer = crate::busy_poll::clock::Timer::new(env.clock());
-        let wake_mode = send::udp::BusyPoll;
-        let task = self.create_send_socket_worker(config, env, timer, wake_mode);
+        let task = self.create_send_socket_worker(config, env, timer, send::udp::BusyPollIdle);
         let span = tracing::trace_span!("send_socket_worker");
         spawn_span!(span, task, |task| {
             handle.spawn_with_priority(task, config.flow_priority);
@@ -198,7 +195,7 @@ impl Pool {
                 Queues::new(config.stream_recv_queue, config.control_recv_queue)
             }
         };
-        let sockets = Self::create_workers(&env.clock(), options, &config, create_queue)?;
+        let sockets = Self::create_workers(options, &config, create_queue)?;
 
         let local_addr = sockets[0].socket.local_addr()?;
         if cfg!(debug_assertions) && config.reuse_port {
@@ -354,7 +351,6 @@ impl Pool {
     }
 
     fn create_workers(
-        clock: &Clock,
         mut options: Options,
         config: &Config,
         create_queue: impl Fn() -> Queues,
@@ -399,7 +395,7 @@ impl Pool {
             };
 
             let queue = Mutex::new(queue);
-            let socket = PoolSocket::new(socket, queue, config, clock);
+            let socket = PoolSocket::new(socket, queue, config);
 
             sockets.push(socket);
         }

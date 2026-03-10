@@ -187,54 +187,9 @@ impl<S: Socket, Sub: event::Subscriber, Clk: Clock> Socket for Events<S, Sub, Cl
     }
 
     #[inline]
-    fn send_transmission_at(
-        &self,
-        msg: Transmission,
-        time: Timestamp,
-    ) -> Result<(), (Transmission, Timestamp)> {
-        let info = msg
-            .descriptors
-            .first()
-            .map(|(desc, _)| (desc.remote_address().get(), desc.len()));
-        let buffer_size = msg.total_len;
-        let segment_count = msg.descriptors.len() as u16;
-
-        let res = self.socket.send_transmission_at(msg, time);
-
-        if let Some((addr, segment_size)) = info {
-            let now = self.clock.get_time();
-            let publisher = self.publisher(Some(now));
-            let delay = time.saturating_duration_since(now);
-
-            match &res {
-                Ok(_) => {
-                    publisher.on_endpoint_udp_transmission_scheduled(
-                        builder::EndpointUdpTransmissionScheduled {
-                            peer_address: addr.into_event(),
-                            buffer_size,
-                            segment_size,
-                            segment_count,
-                            delay,
-                        },
-                    );
-                }
-                Err((_, target)) => {
-                    let backoff = target.saturating_duration_since(now);
-                    publisher.on_endpoint_udp_transmission_rejected(
-                        builder::EndpointUdpTransmissionRejected {
-                            peer_address: addr.into_event(),
-                            buffer_size,
-                            segment_size,
-                            segment_count,
-                            delay,
-                            backoff,
-                        },
-                    );
-                }
-            }
-        }
-
-        res
+    fn send_transmission_batch(&self, batch: crate::stream::send::state::transmission::EntryQueue) {
+        // TODO publish batch scheduling events
+        self.socket.send_transmission_batch(batch);
     }
 
     #[inline(always)]

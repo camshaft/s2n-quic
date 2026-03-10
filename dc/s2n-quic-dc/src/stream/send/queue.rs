@@ -20,10 +20,7 @@ use s2n_quic_core::{
     time::{timer, Clock, Timer},
     varint::VarInt,
 };
-use std::{
-    io::{self, IoSliceMut},
-    time::Duration,
-};
+use std::io::{self, IoSliceMut};
 
 pub struct Message<'a, TransmissionAlloc> {
     queue: &'a mut Queue,
@@ -392,47 +389,38 @@ impl Queue {
     {
         self.transmission_timer.cancel();
 
-        while let Some((batch, application_len)) = self.builder.pop_front() {
-            let now = clock.get_time();
+        let now = clock.get_time();
+        let next_time = self.next_transmission_time.unwrap_or_else(|| now.into());
+        let mut next_time = next_time.max(now.into());
 
-            let transmission_time = self.next_transmission_time;
+        // Build a batch queue with transmission times stamped based on bandwidth
+        let mut queue = crate::intrusive_queue::Queue::new();
+        for (mut batch, application_len) in self.builder.drain(..) {
             let transmission_len = batch.total_len as u64;
 
-            let res = if let Some(transmission_time) = transmission_time {
-                socket.send_transmission_at(batch, transmission_time.into())
-            } else {
-                socket.send_transmission(batch);
-                Ok(())
-            };
+            // Stamp the transmission time on the entry
+            batch.transmission_time = Some(next_time.into());
 
-            // schedule the transmission immediately
-            if let Err((batch, mut wheel_time)) = res {
-                // If the target time is in the past it means the wheel is overloaded so we need to back off a bit
-                if wheel_time.has_elapsed(now) {
-                    wheel_time = now + Duration::from_millis(1);
-                }
-
-                // Once the transmission timer expires then allow a packet to be inserted at the front
-                self.next_transmission_time = None;
-                self.builder.push_front(batch, application_len);
-                self.transmission_timer.set(wheel_time);
-
-                return Poll::Pending;
-            }
-
-            // Compute the next transmission time given the amount of bytes we're transmitting and the bandwidth
+            // Compute the next transmission time based on bandwidth
             let delay = transmission_len / self.bandwidth;
-            let transmission_time = transmission_time.unwrap_or_else(|| now.into());
-            self.next_transmission_time = Some(transmission_time + delay);
+            next_time = (next_time + delay).into();
 
             let provided_len = application_len as usize;
             subscriber.publisher(now).on_stream_write_socket_flushed(
                 event::builder::StreamWriteSocketFlushed {
                     provided_len,
-                    // if the syscall went through, then we wrote the whole thing
                     committed_len: provided_len,
                 },
             );
+
+            queue.push_back(batch);
+        }
+
+        self.next_transmission_time = Some(next_time);
+
+        // Submit the entire batch in one lock acquisition
+        if !queue.is_empty() {
+            socket.send_transmission_batch(queue);
         }
 
         Ok(()).into()

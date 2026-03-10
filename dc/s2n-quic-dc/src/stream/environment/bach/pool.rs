@@ -50,16 +50,11 @@ struct PoolSocket {
 }
 
 impl PoolSocket {
-    fn new(
-        socket: Arc<UdpSocket>,
-        recv_queue: Mutex<Queues>,
-        config: &Config,
-        clock: &Clock,
-    ) -> Self {
+    fn new(socket: Arc<UdpSocket>, recv_queue: Mutex<Queues>, config: &Config) -> Self {
         let local_addr = socket.local_addr().unwrap();
 
         let create_socket = || {
-            let wheel = send::wheel::Wheel::new(config.send_wheel_horizon, clock);
+            let wheel = send::wheel::Wheel::new();
             stream::socket::Wheel::new(wheel, local_addr)
         };
 
@@ -87,11 +82,10 @@ impl PoolSocket {
             wheels.push(send::wheel::Wheel::clone(application));
         }
 
-        let token_bucket = config.bucket();
+        let rate = config.rate();
 
         let span = tracing::trace_span!("send_socket_worker");
-        let task =
-            send::udp::non_blocking(socket, wheels, clock, token_bucket, send::udp::WithWaker);
+        let task = send::udp::non_blocking(socket, wheels, clock, rate, send::udp::WakerIdle);
 
         if span.is_disabled() {
             bach::spawn(task);
@@ -138,7 +132,7 @@ impl Pool {
                 Queues::new(config.stream_recv_queue, config.control_recv_queue)
             }
         };
-        let sockets = Self::create_workers(&env.clock(), options, &config, create_queue)?;
+        let sockets = Self::create_workers(options, &config, create_queue)?;
 
         let local_addr = sockets[0].socket.local_addr()?;
 
@@ -285,7 +279,6 @@ impl Pool {
     }
 
     fn create_workers(
-        clock: &Clock,
         mut options: Options,
         config: &Config,
         create_queue: impl Fn() -> Queues,
@@ -331,7 +324,7 @@ impl Pool {
 
             let socket = Arc::new(socket);
             let queue = Mutex::new(queue);
-            let socket = PoolSocket::new(socket, queue, config, clock);
+            let socket = PoolSocket::new(socket, queue, config);
 
             sockets.push(socket);
         }

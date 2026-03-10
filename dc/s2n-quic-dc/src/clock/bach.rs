@@ -65,6 +65,10 @@ impl super::macros::InstantHandle for Handle {
 }
 
 impl crate::clock::precision::Timer for Clock {
+    fn now(&self) -> super::precision::Timestamp {
+        crate::clock::precision::Clock::now(self)
+    }
+
     async fn sleep_until(&mut self, target: super::precision::Timestamp) {
         let target = self.0.root + Duration::from_nanos(target.nanos);
         sleep_until(target).await;

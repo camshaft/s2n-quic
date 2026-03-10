@@ -4,7 +4,7 @@
 use super::{handle::Transmission, Protocol, Socket, TransportFeatures};
 use crate::msg::{addr::Addr, cmsg};
 use core::task::{Context, Poll};
-use s2n_quic_core::{inet::ExplicitCongestionNotification, time::Timestamp};
+use s2n_quic_core::inet::ExplicitCongestionNotification;
 use std::{
     io::{self, IoSlice, IoSliceMut},
     net::SocketAddr,
@@ -145,20 +145,15 @@ impl<S: Socket> Socket for Tracing<S> {
     }
 
     #[inline]
-    fn send_transmission_at(
-        &self,
-        msg: Transmission,
-        time: Timestamp,
-    ) -> Result<(), (Transmission, Timestamp)> {
-        let result = self.0.send_transmission_at(msg, time);
+    fn send_transmission_batch(&self, batch: crate::stream::send::state::transmission::EntryQueue) {
         trace!(
-            operation = %"send_transmission_at",
+            operation = %"send_transmission_batch",
             protocol = ?self.protocol(),
             local_addr = %local_addr!(self),
-            ?time,
-            result = ?result,
+            count = batch.len(),
         );
-        result
+
+        self.0.send_transmission_batch(batch);
     }
 
     #[inline(always)]

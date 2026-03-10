@@ -75,19 +75,63 @@ impl Handle {
     where
         F: Future<Output = ()> + Send + 'static,
     {
-        let task = Box::pin(task);
         let priority = priority.unwrap_or(128);
-        let task = Task { task, priority };
-        self.state.lock().spawns.push(task);
+        // Wrap the Send future in a Send factory
+        self.state.lock().spawns.push(Spawn::new(move || Task {
+            task: Box::pin(task),
+            priority,
+        }));
+    }
+
+    /// Spawns a non-Send future by passing a Send function that will be called
+    /// on the runner's thread to produce the future.
+    ///
+    /// This allows creating !Send futures (e.g. using `Rc`-based channels)
+    /// that are polled entirely on the busy-poll thread.
+    pub fn spawn_local<F>(&self, f: F)
+    where
+        F: FnOnce() -> Pin<Box<dyn Future<Output = ()> + 'static>> + Send + 'static,
+    {
+        self.spawn_local_with_priority(f, None);
+    }
+
+    /// Like `spawn_local` but with an explicit priority.
+    pub fn spawn_local_with_priority<F>(&self, f: F, priority: Option<u8>)
+    where
+        F: FnOnce() -> Pin<Box<dyn Future<Output = ()> + 'static>> + Send + 'static,
+    {
+        let priority = priority.unwrap_or(128);
+        self.state.lock().spawns.push(Spawn::new(move || Task {
+            task: f(),
+            priority,
+        }));
     }
 }
 
 struct State {
-    spawns: Vec<Task>,
+    spawns: Vec<Spawn>,
 }
 
+/// A `Send` factory that produces a (possibly `!Send`) `Task` on the runner thread.
+struct Spawn {
+    factory: Box<dyn FnOnce() -> Task + Send>,
+}
+
+impl Spawn {
+    fn new(f: impl FnOnce() -> Task + Send + 'static) -> Self {
+        Self {
+            factory: Box::new(f),
+        }
+    }
+
+    fn into_task(self) -> Task {
+        (self.factory)()
+    }
+}
+
+/// A task that lives exclusively on the runner thread. May be `!Send`.
 struct Task {
-    task: Pin<Box<dyn Future<Output = ()> + Send + 'static>>,
+    task: Pin<Box<dyn Future<Output = ()> + 'static>>,
     priority: u8,
 }
 
@@ -134,7 +178,7 @@ impl Runner {
             }
 
             for spawn in spawns.drain(..) {
-                tasks.spawn(spawn);
+                tasks.spawn(spawn.into_task());
             }
 
             tasks.after_spawn();

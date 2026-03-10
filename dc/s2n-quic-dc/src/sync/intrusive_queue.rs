@@ -34,6 +34,11 @@ impl<T> Queue<T> {
         self.0.lock().pop_front()
     }
 
+    /// Append an entire queue in one lock acquisition.
+    pub fn append(&self, other: &mut queue::Queue<T>) {
+        self.0.lock().append(other);
+    }
+
     /// Takes the inner queue from the shared queue
     pub fn take(&self) -> queue::Queue<T> {
         core::mem::take(&mut *self.0.lock())

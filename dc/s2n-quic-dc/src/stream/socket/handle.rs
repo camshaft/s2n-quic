@@ -8,7 +8,7 @@ use crate::{
     stream::send::state::transmission,
 };
 use core::task::{Context, Poll};
-use s2n_quic_core::{inet::ExplicitCongestionNotification, time::Timestamp};
+use s2n_quic_core::inet::ExplicitCongestionNotification;
 use std::{
     io::{self, IoSlice, IoSliceMut},
     net::SocketAddr,
@@ -78,15 +78,14 @@ pub trait Socket: 'static + Send + Sync {
         completion.complete(msg);
     }
 
+    /// Send a batch of transmission entries in one call.
+    ///
+    /// The default implementation falls back to sending each entry individually.
     #[inline]
-    fn send_transmission_at(
-        &self,
-        msg: Transmission,
-        time: Timestamp,
-    ) -> Result<(), (Transmission, Timestamp)> {
-        let _ = time;
-        self.send_transmission(msg);
-        Ok(())
+    fn send_transmission_batch(&self, mut batch: transmission::EntryQueue) {
+        while let Some(entry) = batch.pop_front() {
+            self.send_transmission(entry);
+        }
     }
 
     /// Tries to send data on the socket, returning `Err(WouldBlock)` if none could be sent.
@@ -182,12 +181,8 @@ macro_rules! impl_box {
             }
 
             #[inline(always)]
-            fn send_transmission_at(
-                &self,
-                msg: Transmission,
-                time: Timestamp,
-            ) -> Result<(), (Transmission, Timestamp)> {
-                (**self).send_transmission_at(msg, time)
+            fn send_transmission_batch(&self, batch: transmission::EntryQueue) {
+                (**self).send_transmission_batch(batch)
             }
 
             #[inline(always)]
