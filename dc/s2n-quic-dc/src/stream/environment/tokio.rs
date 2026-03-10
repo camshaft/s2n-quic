@@ -108,10 +108,7 @@ where
         let gso = gso.unwrap_or_else(|| {
             // rather than clamping it to the max burst size, let the CCA be the only
             // component that controls send quantums
-
-            // TODO figure out why GSO isn't working very well
-            features::gso::MaxSegments::try_from(1).unwrap().into()
-            // features::gso::MAX_SEGMENTS.into()
+            features::gso::MAX_SEGMENTS.into()
         });
         let socket_options = socket_options.unwrap_or_default();
 

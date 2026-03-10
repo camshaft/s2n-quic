@@ -179,21 +179,20 @@ where
             continue;
         };
 
+        // Record the actual transmission time before calling UDP send
+        entry.transmission_time = Some(timer.now());
+
         // Send the packet
         entry.send_with(|addr, ecn, iovec| {
             let _ = socket.try_send(addr, ecn, iovec);
         });
-
-        let now: Timestamp = timer.now();
-
-        // Record the actual transmission time
-        entry.transmission_time = Some(now.into());
 
         completion.complete(entry);
 
         // Consume tokens for this packet. The bucket refills based on elapsed
         // time since the last consume, allowing microbursts up to the burst
         // capacity. If we've exceeded the rate, sleep until tokens recover.
+        let now = timer.now();
         let cost_nanos = rate.nanos_for_bytes(total_len);
         let sleep_nanos = bucket.consume(now, cost_nanos);
         if sleep_nanos > 0 {
