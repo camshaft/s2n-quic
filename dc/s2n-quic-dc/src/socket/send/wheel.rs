@@ -1025,21 +1025,20 @@ mod tests {
                 if let Some((&first_future_tick, _)) =
                     oracle.range((start_tick + 1)..).next()
                 {
-                    let expiry = ticker.next_expiry();
-                    if let Some(exp) = expiry {
-                        let exp_tick =
-                            Wheel::timestamp_to_tick(exp);
-                        // Expiry should be <= the oracle's first future tick
-                        // (the wheel may round down to the level boundary)
-                        assert!(
-                            exp_tick <= first_future_tick,
-                            "next_expiry ({exp_tick}) should be <= oracle's first future tick ({first_future_tick})"
-                        );
-                        assert!(
-                            exp_tick > start_tick,
-                            "next_expiry ({exp_tick}) should be > start_tick ({start_tick})"
-                        );
-                    }
+                    let exp = ticker.next_expiry().expect(
+                        "next_expiry should return Some when oracle has future entries",
+                    );
+                    let exp_tick = Wheel::timestamp_to_tick(exp);
+                    // Expiry should be <= the oracle's first future tick
+                    // (the wheel may round down to the level boundary)
+                    assert!(
+                        exp_tick <= first_future_tick,
+                        "next_expiry ({exp_tick}) should be <= oracle's first future tick ({first_future_tick})"
+                    );
+                    assert!(
+                        exp_tick > start_tick,
+                        "next_expiry ({exp_tick}) should be > start_tick ({start_tick})"
+                    );
                 }
 
                 // Now advance to the end and collect, comparing against oracle
@@ -1135,7 +1134,7 @@ mod tests {
                 // 1. Pop entries at current tick and verify count
                 // 2. Compare next_expiry with oracle
                 let mut current = start_tick;
-                let end_tick = start_tick + 15_000;
+                let end_tick = start_tick + MAX_OFFSET;
 
                 while current <= end_tick {
                     let time = Wheel::tick_to_timestamp(current);
@@ -1181,11 +1180,7 @@ mod tests {
                             // This could happen if all remaining entries are at the
                             // current tick (already drained) or beyond the wheel's
                             // scan range. Only fail if oracle_tick > current.
-                            if oracle_tick > current {
-                                panic!(
-                                    "Wheel says no next_expiry but oracle has entries at tick {oracle_tick} (current={current})"
-                                );
-                            }
+                            assert!(oracle_tick > current, "oracle_tick must be > current after removing current");
                         }
                         (None, Some(wheel_tick)) => {
                             // Wheel says there's an expiry but oracle is empty.
@@ -1200,6 +1195,17 @@ mod tests {
                     // but still exercise single-tick and multi-tick advances
                     current += 1;
                 }
+
+                // Verify both oracle and wheel are fully drained
+                assert!(
+                    oracle.is_empty(),
+                    "Oracle still has {} tick(s) with entries after advancing to end",
+                    oracle.len()
+                );
+                assert!(
+                    ticker.next_expiry().is_none(),
+                    "Wheel still has entries after advancing to end"
+                );
             });
     }
 }
