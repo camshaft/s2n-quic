@@ -930,119 +930,10 @@ mod tests {
         );
     }
 
-    /// Regression test: when the target slot at a higher level equals the current
-    /// level slot (a full wrap-around of the circular buffer), next_expiry must
-    /// NOT compute an offset of 0. Since first_occupied_after searches starting
-    /// from current_level_slot + 1, if it returns current_level_slot it means the
-    /// entry has wrapped all the way around (offset = SLOTS_PER_LEVEL, not 0).
-    #[test]
-    fn test_next_expiry_higher_level_wraparound() {
-        // Use GRANULARITY_US=1 for simplicity.
-        // We need: current_level_slot at level 1 == S, and an entry that maps
-        // to the same slot S at level 1 but one full rotation ahead.
-        //
-        // At level 1, shift=8, so current_level_slot = (base >> 8) & 0xFF.
-        // level_cursor = (current_level_slot + 1) & 0xFF.
-        //
-        // For current_level_slot = 255: level_cursor = 0, so first_occupied_after(0)
-        // could return slot 255 if that's the only occupied slot.
-        //
-        // base = 255 * 256 = 65280 → current_level_slot at level 1 = (65280 >> 8) & 255 = 255
-        // level_cursor = (255 + 1) & 255 = 0
-        //
-        // An entry at target_tick = 65280 + 65536 = 130816 would have:
-        // delta = 65536, which would be placed at level 2 by compute_level_and_slot.
-        //
-        // So we need delta < 65536 but target maps to slot 255 at level 1.
-        // target_tick = 65280 + delta, where (target_tick >> 8) & 255 = 255
-        // (65280 + delta) >> 8 = 255 + (delta >> 8) [when delta < 256, the low byte contributes]
-        //
-        // Actually, for delta in [256, 65535], the entry goes into level 1.
-        // (65280 + 256) >> 8 = 65536 >> 8 = 256 → & 255 = 0. Not 255.
-        //
-        // The wrap-around scenario where slot_idx == current_level_slot requires
-        // that first_occupied_after wraps past the end. However, first_occupied_after
-        // does NOT wrap: it only scans from from_slot to 255. So the returned
-        // slot_idx is always >= level_cursor.
-        //
-        // When current_level_slot < 255: level_cursor = current_level_slot + 1,
-        //   so slot_idx >= current_level_slot + 1 > current_level_slot. The `>=`
-        //   and `>` conditions are equivalent.
-        //
-        // When current_level_slot = 255: level_cursor = 0, so slot_idx could be
-        //   0..255. If slot_idx = 255, offset with `>=` would be 0 (wrong).
-        //   But this requires an entry that compute_level_and_slot places at
-        //   level 1 slot 255 when current_level_slot is already 255, which means
-        //   delta must place target at the same slot — implying a full rotation.
-        //   compute_level_and_slot would promote such large deltas to level 2+.
-        //
-        // To verify this empirically, we try to construct the scenario and
-        // check that next_expiry is still correct.
-        let pool = Pool::new(u16::MAX);
-        let wheel: Wheel<(), u16, (), 1> = Wheel::new();
-        // Start at tick 65280 so level-1 current_level_slot = 255
-        let base_tick: u64 = 65280;
-        let start = precision::Timestamp {
-            nanos: Duration::from_micros(base_tick).as_nanos() as u64,
-        };
-        let clock = Clock(start);
-        let mut ticker = wheel.ticker(&clock);
-
-        // Verify current_level_slot at level 1
-        assert_eq!((base_tick >> 8) & 0xFF, 255);
-
-        // Try inserting at various deltas that land in level 1 (delta 256..65535).
-        // Check if any of them map to slot 255.
-        let mut found_slot_255 = false;
-        for delta in [256u64, 512, 1000, 5000, 10000, 32768, 65535] {
-            let target = base_tick + delta;
-            let (level, slot) = Ticker::<(), u16, (), 1>::compute_level_and_slot(base_tick, target);
-            if level == 1 && slot == 255 {
-                found_slot_255 = true;
-
-                let future_time = start + Duration::from_micros(delta);
-                wheel.insert(create_entry_at(&pool, 77, Some(future_time)));
-                ticker.drain_incoming();
-
-                let expiry = ticker
-                    .next_expiry()
-                    .expect("should find the entry in level 1");
-                let expiry_tick = Wheel::<(), u16, (), 1>::timestamp_to_tick(expiry);
-
-                assert!(
-                    expiry_tick > base_tick,
-                    "next_expiry must be in the future; got {expiry_tick}, base={base_tick}"
-                );
-                assert!(
-                    expiry_tick <= target,
-                    "next_expiry should not exceed target; got {expiry_tick}, target={target}"
-                );
-            }
-        }
-
-        // If no delta produced slot 255 at level 1 with this base, that's fine —
-        // it confirms the scenario is structurally impossible. Either way the
-        // test verifies correctness for all deltas we tried.
-        if !found_slot_255 {
-            // The edge case is unreachable for this base; verify with a broader sweep
-            let mut any_match = false;
-            for delta in 256u64..=65535 {
-                let target = base_tick + delta;
-                let (level, slot) =
-                    Ticker::<(), u16, (), 1>::compute_level_and_slot(base_tick, target);
-                if level == 1 && slot == 255 {
-                    any_match = true;
-                    break;
-                }
-            }
-            // If no match exists, the `>=` vs `>` distinction is moot for this level
-            assert!(
-                !any_match,
-                "Found a delta that maps to slot 255 at level 1 — \
-                 the test above should have caught it"
-            );
-        }
-    }
+    // We cap at 20M ticks to keep tick_to() runtime reasonable while
+    // still exercising levels 0 (0–255), 1 (256–65535),
+    // 2 (65536–16M), and 3 (16M+).
+    const MAX_OFFSET: u64 = 20_000_000;
 
     /// Oracle-based fuzz test: compare the wheel against a BTreeMap oracle.
     ///
@@ -1055,16 +946,17 @@ mod tests {
     fn fuzz_oracle_comparison() {
         use bolero::check;
         use std::collections::BTreeMap;
+        type Wheel = super::Wheel<(), u16, (), 1>;
 
         // Input: a list of (start_offset, entry_offsets) pairs.
         // start_offset: where the wheel clock starts (exercises different level alignments)
         // entry_offsets: time offsets for each entry relative to start
         check!()
-            .with_type::<(u16, Vec<u16>)>()
+            .with_type::<(u32, Vec<u32>)>()
             .with_test_time(core::time::Duration::from_secs(10))
             .for_each(|(start_offset, offsets)| {
                 let pool = Pool::new(u16::MAX);
-                let wheel: Wheel<(), u16, (), 1> = Wheel::new();
+                let wheel = Wheel::new();
 
                 // Use a non-trivial start tick to exercise different level slot positions.
                 // Must be non-zero since s2n_quic_core::time::Timestamp cannot represent 0.
@@ -1079,12 +971,11 @@ mod tests {
                 let mut oracle: BTreeMap<u64, Vec<u16>> = BTreeMap::new();
 
                 let start_tick =
-                    Wheel::<(), u16, (), 1>::timestamp_to_tick(start);
+                    Wheel::timestamp_to_tick(start);
 
-                // Insert entries with varying offsets
+                // Insert entries with varying offsets.
                 for (i, &raw_offset) in offsets.iter().enumerate() {
-                    // Offsets span levels 0, 1, and into level 2
-                    let offset_us = (raw_offset as u64) % 60_000;
+                    let offset_us = (raw_offset as u64) % MAX_OFFSET;
                     let target_tick = start_tick + offset_us;
                     let time = start + Duration::from_micros(offset_us);
 
@@ -1114,7 +1005,7 @@ mod tests {
                     let expiry = ticker.next_expiry();
                     if let Some(exp) = expiry {
                         let exp_tick =
-                            Wheel::<(), u16, (), 1>::timestamp_to_tick(exp);
+                            Wheel::timestamp_to_tick(exp);
                         // Expiry should be <= the oracle's first future tick
                         // (the wheel may round down to the level boundary)
                         assert!(
@@ -1128,9 +1019,8 @@ mod tests {
                     }
                 }
 
-                // Now advance tick-by-tick and collect, comparing against oracle
-                let _end_tick = start_tick + 70_000;
-                let end = start + Duration::from_micros(70_000);
+                // Now advance to the end and collect, comparing against oracle
+                let end = start + Duration::from_micros(MAX_OFFSET);
                 let mut queue = ticker.tick_to(end);
 
                 let mut actual: Vec<(u64, u16)> = Vec::new();
@@ -1139,7 +1029,7 @@ mod tests {
                         .transmission_time
                         .map(|ts| {
                             let p: precision::Timestamp = ts.into();
-                            Wheel::<(), u16, (), 1>::timestamp_to_tick(p)
+                            Wheel::timestamp_to_tick(p)
                         })
                         .unwrap_or(start_tick)
                         .max(start_tick);
@@ -1181,13 +1071,14 @@ mod tests {
     fn fuzz_next_expiry_oracle() {
         use bolero::check;
         use std::collections::BTreeMap;
+        type Wheel = super::Wheel<(), u16, (), 1>;
 
         check!()
-            .with_type::<(u8, Vec<u16>)>()
+            .with_type::<(u8, Vec<u32>)>()
             .with_test_time(core::time::Duration::from_secs(10))
             .for_each(|(start_offset, offsets)| {
                 let pool = Pool::new(u16::MAX);
-                let wheel: Wheel<(), u16, (), 1> = Wheel::new();
+                let wheel = Wheel::new();
 
                 // Vary the start position to exercise different level slot alignments.
                 // Must be non-zero since s2n_quic_core::time::Timestamp cannot represent 0.
@@ -1198,14 +1089,14 @@ mod tests {
                 let clock = Clock(start);
                 let mut ticker = wheel.ticker(&clock);
                 let start_tick =
-                    Wheel::<(), u16, (), 1>::timestamp_to_tick(start);
+                    Wheel::timestamp_to_tick(start);
 
                 // Oracle: track which ticks have entries
                 let mut oracle: BTreeMap<u64, usize> = BTreeMap::new();
 
                 // Insert entries
                 for (i, &raw_offset) in offsets.iter().enumerate() {
-                    let offset_us = (raw_offset as u64) % 10_000;
+                    let offset_us = (raw_offset as u64) % MAX_OFFSET;
                     let target_tick = start_tick + offset_us;
                     let time = start + Duration::from_micros(offset_us);
                     let effective_tick = target_tick.max(start_tick);
@@ -1224,7 +1115,7 @@ mod tests {
                 let end_tick = start_tick + 15_000;
 
                 while current <= end_tick {
-                    let time = Wheel::<(), u16, (), 1>::tick_to_timestamp(current);
+                    let time = Wheel::tick_to_timestamp(current);
                     let mut queue = ticker.tick_to(time);
 
                     // Count entries popped at this tick
@@ -1243,7 +1134,7 @@ mod tests {
                     // Compare next_expiry with oracle's next non-empty tick
                     let oracle_next = oracle.keys().next().copied();
                     let wheel_expiry = ticker.next_expiry().map(|ts| {
-                        Wheel::<(), u16, (), 1>::timestamp_to_tick(ts)
+                        Wheel::timestamp_to_tick(ts)
                     });
 
                     match (oracle_next, wheel_expiry) {
