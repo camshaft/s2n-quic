@@ -417,7 +417,11 @@ where
                 let _ = self.state.on_finished();
             }
         } else {
-            cx.waker().wake_by_ref();
+            // The application currently holds the lock. Clear should_transmit to avoid
+            // spinning — when the AppGuard drops, it will check
+            // receiver.should_transmit() and wake us via wants_ack if a transmission
+            // is still needed.
+            self.should_transmit = false;
         }
 
         ready!(self.poll_flush_socket(cx))?;

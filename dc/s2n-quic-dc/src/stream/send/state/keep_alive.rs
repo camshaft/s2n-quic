@@ -135,9 +135,20 @@ impl KeepAlive {
     ///
     /// This method should be called whenever the idle timeout target is updated,
     /// such as when activity occurs on the connection and the idle timer is reset.
+    ///
+    /// The timer is only moved **earlier**, never later. Receiving peer activity
+    /// (e.g., ACKs) resets the local idle timer but does **not** reset the peer's
+    /// idle timer. If we allowed the keep-alive timer to move forward, the peer's
+    /// idle timer could expire before we send the next probe.
     pub fn on_idle_timer_update(&mut self, idle_timeout_target: Timestamp, idle_timeout: Duration) {
         ensure!(self.state.is_armed());
-        ensure!(self.arm_timer(idle_timeout_target, idle_timeout));
+        let timeout = idle_timeout_target - idle_timeout / 4;
+        // Only move the timer earlier, never later. Moving it later risks the
+        // peer's idle timer expiring before we send a keep-alive probe.
+        if let Some(expiration) = self.timer.next_expiration() {
+            ensure!(timeout < expiration);
+        }
+        self.timer.set(timeout);
         let _ = self.state.on_idle_timer_update();
     }
 
@@ -418,7 +429,7 @@ mod tests {
     }
 
     #[test]
-    fn on_idle_timer_update_rearms_when_timeout_changes() {
+    fn on_idle_timer_update_rearms_when_target_is_earlier() {
         let clock = clock();
         let mut keep_alive = KeepAlive::default();
         let (idle_timeout_target, idle_timeout) = test_params(&clock);
@@ -426,13 +437,30 @@ mod tests {
         keep_alive.set(true, idle_timeout_target, idle_timeout);
         let first_expiration = keep_alive.timer.next_expiration();
 
-        // Update with new target
-        let new_target = clock + Duration::from_secs(60);
-        keep_alive.on_idle_timer_update(new_target, idle_timeout);
+        // Update with an earlier target — timer should move earlier
+        let earlier_target = idle_timeout_target - Duration::from_secs(10);
+        keep_alive.on_idle_timer_update(earlier_target, idle_timeout);
 
         let new_expiration = keep_alive.timer.next_expiration();
         assert_ne!(first_expiration, new_expiration);
+        assert!(new_expiration < first_expiration);
         assert!(keep_alive.state.is_cooldown());
+    }
+
+    #[test]
+    fn on_idle_timer_update_ignores_later_target() {
+        let clock = clock();
+        let mut keep_alive = KeepAlive::default();
+        let (idle_timeout_target, idle_timeout) = test_params(&clock);
+
+        keep_alive.set(true, idle_timeout_target, idle_timeout);
+        let first_expiration = keep_alive.timer.next_expiration();
+
+        // Update with a later target — timer should NOT move later
+        let later_target = clock + Duration::from_secs(60);
+        keep_alive.on_idle_timer_update(later_target, idle_timeout);
+
+        assert_eq!(keep_alive.timer.next_expiration(), first_expiration);
     }
 
     #[test]

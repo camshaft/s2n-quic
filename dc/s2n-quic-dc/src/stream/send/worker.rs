@@ -77,6 +77,7 @@ where
     socket: S,
     handshake: handshake::State,
     transmit_queue: Queue,
+    self_wake_count: u8,
 }
 
 #[derive(Debug)]
@@ -173,6 +174,7 @@ where
             socket,
             handshake,
             transmit_queue: Default::default(),
+            self_wake_count: 0,
         }
     }
 
@@ -245,7 +247,15 @@ where
             self.timer.update(target);
             if self.timer.poll_ready(cx).is_ready() {
                 // If the timer fired then we need to schedule the worker again
-                cx.waker().wake_by_ref();
+                if let Some(next) = self.self_wake_count.checked_add(1) {
+                    cx.waker().wake_by_ref();
+                    self.self_wake_count = next;
+                } else {
+                    // Protect the runtime and avoid continuing to self-wake
+                    panic!("too many self-wakes");
+                }
+            } else {
+                self.self_wake_count = 0;
             }
             Poll::Pending
         } else {
