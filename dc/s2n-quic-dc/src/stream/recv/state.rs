@@ -584,6 +584,8 @@ impl State {
         {
             self.transmission
                 .on_largest_delivered_packet(largest_delivered_control_packet);
+            self.max_data
+                .on_largest_delivered_packet(largest_delivered_control_packet);
 
             if let Some(fin_ack_packet_number) = self.fin_ack_packet_number {
                 // if the sender received our ACK to the fin, then we can shut down immediately
@@ -693,6 +695,9 @@ impl State {
 
         // check if the throttled ACK timer has expired
         self.transmission.on_timeout(clock);
+
+        // check if we need to retransmit MAX_DATA
+        self.max_data.on_timeout(clock);
 
         // if the tick timer expired, then copy the current idle timeout target
         if self.tick_timer.poll_expiration(now).is_ready() {
@@ -855,6 +860,9 @@ impl State {
                 break;
             }
         }
+
+        // Arm the retransmit timer for MAX_DATA if we just transitioned to Inflight
+        self.max_data.arm_retransmit_timer(clock);
     }
 
     #[inline]
@@ -941,7 +949,7 @@ impl State {
 
         self.control_packet_number += 1;
         self.transmission.on_transmit(packet_number);
-        self.max_data.on_transmit();
+        self.max_data.on_transmit(packet_number);
     }
 }
 
@@ -951,6 +959,7 @@ impl timer::Provider for State {
         self.idle_timer.timers(query)?;
         self.tick_timer.timers(query)?;
         self.transmission.timers(query)?;
+        self.max_data.timers(query)?;
         Ok(())
     }
 }

@@ -7,33 +7,56 @@
 //! data it is willing to accept. As the application reads data, the window advances
 //! and the new value is queued for transmission.
 //!
+//! When the sender is blocked on flow control (indicated by a DATA_BLOCKED frame),
+//! the receiver retransmits the MAX_DATA frame with exponential backoff until the
+//! sender acknowledges receipt (via `next_expected_control_packet` advancing past
+//! the packet carrying the MAX_DATA).
+//!
 //! ```text
-//!    ┌──────┐  on_new_value   ┌────────┐  on_transmit  ┌──────┐
-//!    │ Idle │ ──────────────> │ Queued │ ────────────> │ Idle │
-//!    └──────┘                 └────────┘               └──────┘
+//!    ┌──────┐  on_new_value   ┌────────┐  on_transmit  ┌──────────┐  on_ack   ┌──────┐
+//!    │ Idle │ ──────────────> │ Queued │ ────────────> │ Inflight │ ───────> │ Idle │
+//!    └──────┘                 └────────┘               └──────────┘          └──────┘
+//!                                  ^                        │
+//!                                  │     on_timeout         │
+//!                                  └────────────────────────┘
 //! ```
 
+use core::time::Duration;
 use s2n_quic_core::{
     ensure, frame,
     state::{event, is},
+    time::{timer, Clock, Timer},
     varint::VarInt,
 };
+
+/// Initial retransmit timeout for MAX_DATA when the sender is flow-blocked.
+///
+/// This is deliberately short since we know the sender is stalled and waiting
+/// for this update. We use exponential backoff to avoid flooding.
+const INITIAL_RETRANSMIT_TIMEOUT: Duration = Duration::from_millis(100);
+
+/// Maximum retransmit timeout to cap exponential backoff.
+const MAX_RETRANSMIT_TIMEOUT: Duration = Duration::from_secs(8);
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 enum State {
     #[default]
     Idle,
     Queued,
+    Inflight,
 }
 
 impl State {
     is!(is_idle, Idle);
     is!(is_queued, Queued);
+    is!(is_inflight, Inflight);
 
     event! {
-        on_queued(Idle => Queued);
+        on_queued(Idle | Inflight => Queued);
         on_blocked_received(Idle => Queued);
-        on_transmit(Queued => Idle);
+        on_transmit(Queued => Inflight);
+        on_ack(Inflight => Idle);
+        on_timeout(Inflight => Queued);
     }
 }
 
@@ -47,6 +70,13 @@ pub struct MaxData {
     window: VarInt,
     /// The state of the max_data transmission
     state: State,
+    /// The control packet number that carried the last MAX_DATA transmission.
+    /// Used to determine when the sender has acknowledged receipt.
+    inflight_pn: Option<VarInt>,
+    /// Timer for retransmitting MAX_DATA when inflight
+    retransmit_timer: Timer,
+    /// Current retransmit timeout (exponential backoff)
+    retransmit_timeout: Duration,
 }
 
 impl MaxData {
@@ -57,6 +87,9 @@ impl MaxData {
             pending_value: initial_max_data,
             window,
             state: State::default(),
+            inflight_pn: None,
+            retransmit_timer: Timer::default(),
+            retransmit_timeout: INITIAL_RETRANSMIT_TIMEOUT,
         }
     }
 
@@ -100,6 +133,9 @@ impl MaxData {
 
         let _ = self.state.on_queued();
 
+        // Reset backoff when we have a genuinely new value to send
+        self.retransmit_timeout = INITIAL_RETRANSMIT_TIMEOUT;
+
         true
     }
 
@@ -109,7 +145,13 @@ impl MaxData {
     #[inline]
     pub fn on_data_blocked(&mut self, peer_limit: VarInt) {
         if peer_limit < self.pending_value {
-            let _ = self.state.on_blocked_received();
+            // The sender is behind — they haven't received our latest MAX_DATA.
+            // If we're inflight, the packet may have been lost, so re-queue.
+            if self.state.is_inflight() {
+                let _ = self.state.on_timeout();
+            } else {
+                let _ = self.state.on_blocked_received();
+            }
         }
     }
 
@@ -123,11 +165,70 @@ impl MaxData {
             .is_some()
     }
 
-    /// Called after the max_data frame has been transmitted
+    /// Called after the max_data frame has been transmitted in a control packet.
+    ///
+    /// The `packet_number` is the control packet number that carried the MAX_DATA,
+    /// used to determine when the sender acknowledges it.
     #[inline]
-    pub fn on_transmit(&mut self) {
-        // TODO record transmit time
+    pub fn on_transmit(&mut self, packet_number: VarInt) {
         self.transmitted_value = self.pending_value;
-        let _ = self.state.on_transmit();
+
+        ensure!(self.state.on_transmit().is_ok());
+
+        self.inflight_pn = Some(packet_number);
+    }
+
+    /// Called when the sender acknowledges receipt of a control packet.
+    ///
+    /// If the acknowledged packet number is >= the packet that carried our
+    /// MAX_DATA, we know the sender has received the update.
+    #[inline]
+    pub fn on_largest_delivered_packet(&mut self, largest_delivered: VarInt) {
+        let Some(inflight_pn) = self.inflight_pn else {
+            return;
+        };
+
+        if largest_delivered >= inflight_pn {
+            // The sender has received the packet containing our MAX_DATA
+            self.inflight_pn = None;
+            self.retransmit_timer.cancel();
+            self.retransmit_timeout = INITIAL_RETRANSMIT_TIMEOUT;
+            let _ = self.state.on_ack();
+        }
+    }
+
+    /// Called on timeout to check if we need to retransmit MAX_DATA.
+    #[inline]
+    pub fn on_timeout<Clk: Clock + ?Sized>(&mut self, clock: &Clk) {
+        ensure!(self.state.is_inflight());
+
+        let now = clock.get_time();
+        if self.retransmit_timer.poll_expiration(now).is_ready() {
+            // Retransmit timer expired — re-queue the MAX_DATA
+            let _ = self.state.on_timeout();
+            self.inflight_pn = None;
+
+            // Exponential backoff
+            self.retransmit_timeout = (self.retransmit_timeout * 2).min(MAX_RETRANSMIT_TIMEOUT);
+        }
+    }
+
+    /// Arms the retransmit timer after transitioning to Inflight.
+    ///
+    /// Called from recv State after on_packet_sent so we have access to a clock.
+    #[inline]
+    pub fn arm_retransmit_timer<Clk: Clock + ?Sized>(&mut self, clock: &Clk) {
+        if self.state.is_inflight() && !self.retransmit_timer.is_armed() {
+            self.retransmit_timer
+                .set(clock.get_time() + self.retransmit_timeout);
+        }
+    }
+}
+
+impl timer::Provider for MaxData {
+    #[inline]
+    fn timers<Q: timer::Query>(&self, query: &mut Q) -> timer::Result {
+        self.retransmit_timer.timers(query)?;
+        Ok(())
     }
 }
