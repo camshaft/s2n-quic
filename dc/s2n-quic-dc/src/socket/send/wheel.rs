@@ -356,13 +356,36 @@ impl<Info, Meta, Completion, const GRANULARITY_US: u64>
         let mut result = Queue::new();
 
         while self.current_tick < target_tick {
-            let slot_idx = (self.current_tick & SLOT_MASK) as usize;
-            let mut slot_queue = self.levels[0].drain(slot_idx);
-            result.append(&mut slot_queue);
+            let current_slot = (self.current_tick & SLOT_MASK) as usize;
 
-            self.current_tick += 1;
+            // Use the bitset to find the next occupied slot in level 0.
+            // Compute its tick; if it's before the next cascade boundary and
+            // target_tick, drain it. Otherwise skip ahead.
+            let next_occupied_tick = self.levels[0]
+                .first_occupied_after(current_slot)
+                .map(|slot| (self.current_tick & !SLOT_MASK) | slot as u64);
 
-            // Cascade when level-0 wraps
+            // The advance limit is the sooner of target_tick or the next
+            // 256-aligned cascade boundary.
+            let next_cascade = (self.current_tick | SLOT_MASK) + 1;
+            let advance_limit = target_tick.min(next_cascade);
+
+            match next_occupied_tick {
+                Some(occ_tick) if occ_tick < advance_limit => {
+                    // Jump to the occupied slot, drain it
+                    let occ_slot = (occ_tick & SLOT_MASK) as usize;
+                    self.current_tick = occ_tick;
+                    let mut slot_queue = self.levels[0].drain(occ_slot);
+                    result.append(&mut slot_queue);
+                    self.current_tick += 1;
+                }
+                _ => {
+                    // Nothing to drain before the advance limit — skip ahead
+                    self.current_tick = advance_limit;
+                }
+            }
+
+            // Cascade when we land on a 256-aligned boundary
             if self.current_tick & SLOT_MASK == 0 {
                 self.cascade(self.current_tick, 1);
             }
