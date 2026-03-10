@@ -416,7 +416,16 @@ impl<Info, Meta, Completion, const GRANULARITY_US: u64>
             let shift = BITS_PER_LEVEL * level as u32;
             let level_cursor = ((base >> shift) + 1) & SLOT_MASK;
             if let Some(slot_idx) = self.levels[level].first_occupied_after(level_cursor as usize) {
-                let earliest_tick = (slot_idx as u64) << shift;
+                // Compute the slot offset relative to the current position in this level.
+                // Slot indices are circular (0–255), so we must interpret them relative
+                // to `current_level_slot` rather than treating them as absolute values.
+                let current_level_slot = (base >> shift) & SLOT_MASK;
+                let slot_offset = if slot_idx as u64 >= current_level_slot {
+                    slot_idx as u64 - current_level_slot
+                } else {
+                    SLOTS_PER_LEVEL as u64 - current_level_slot + slot_idx as u64
+                };
+                let earliest_tick = base + (slot_offset << shift);
                 return Some(
                     Wheel::<Info, Meta, Completion, GRANULARITY_US>::tick_to_timestamp(
                         earliest_tick.max(base + 1),
@@ -782,8 +791,6 @@ mod tests {
     fn test_extreme_lag_tolerance() {
         let (wheel, mut ticker, pool, mut clock) = new(64);
 
-        let base = clock.get_time();
-
         // Insert entries at various future times while NOT ticking
         for i in 1..=32u16 {
             clock.inc_by(Duration::from_micros(8));
@@ -872,6 +879,49 @@ mod tests {
         // Level 3: delta 16777216..4294967295
         let (level, _slot) = Ticker::<(), (), (), 1>::compute_level_and_slot(0, 16777216);
         assert_eq!(level, 3);
+    }
+
+    /// Regression test: next_expiry must return a correct future timestamp
+    /// for entries in higher levels (level 1+). With a non-zero current_tick,
+    /// the buggy code computed `earliest_tick = (slot_idx as u64) << shift`,
+    /// treating the circular slot index as an absolute tick, which produced
+    /// a value in the past that got clamped to `base + 1` — far too early.
+    #[test]
+    fn test_next_expiry_higher_level() {
+        // Use GRANULARITY_US=1 so ticks == microseconds for clarity.
+        // Start at tick 100_000 so that level-1 slot indices are well into the wheel.
+        let pool = Pool::new(u16::MAX);
+        let wheel: Wheel<(), u16, (), 1> = Wheel::new();
+        let start = precision::Timestamp {
+            nanos: Duration::from_micros(100_000).as_nanos() as u64,
+        };
+        let clock = Clock(start);
+        let mut ticker = wheel.ticker(&clock);
+
+        // current_tick is now 100_000.
+        // Insert an entry 300 ticks in the future → target_tick = 100_300.
+        // delta = 300, which is > 256, so it goes into level 1.
+        let future_time = start + Duration::from_micros(300);
+        wheel.insert(create_entry_at(&pool, 42, Some(future_time)));
+        ticker.drain_incoming();
+
+        let expiry = ticker
+            .next_expiry()
+            .expect("should find the entry in level 1");
+        let expiry_tick = Wheel::<(), u16, (), 1>::timestamp_to_tick(expiry);
+
+        // The expiry must be in the future relative to current_tick (100_000)
+        // and must be <= the target tick (100_300).
+        // With the bug, expiry_tick would be clamped to 100_001 (base + 1).
+        assert!(
+            expiry_tick > 100_001,
+            "next_expiry should not collapse to base+1; got tick {expiry_tick} \
+             (expected something close to 100_300, not 100_001)"
+        );
+        assert!(
+            expiry_tick <= 100_300,
+            "next_expiry should not exceed the target tick; got {expiry_tick}"
+        );
     }
 
     /// Fuzz test: insert entries at random times, tick to the end, verify:

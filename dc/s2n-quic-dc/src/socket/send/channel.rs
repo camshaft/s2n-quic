@@ -408,9 +408,9 @@ where
     }
 
     fn on_send(&mut self, len: u16) {
-        // if !cfg!(debug_assertions) {
-        //     return;
-        // }
+        if !cfg!(debug_assertions) {
+            return;
+        }
 
         self.sent += len as u64;
 
