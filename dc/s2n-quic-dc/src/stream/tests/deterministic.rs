@@ -6,9 +6,12 @@ use crate::{
     testing::{ext::*, sim, spawn},
 };
 use bach::time::Instant;
-use std::sync::{
-    atomic::{AtomicU64, Ordering},
-    Arc,
+use std::{
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+    time::Duration,
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -371,6 +374,96 @@ impl DroppedPackets {
             .spawn();
         })
     }
+
+    /// Runs a simulation with the given packet drop pattern and measures throughput.
+    ///
+    /// Returns the elapsed simulated duration for the complete round-trip transfer
+    /// (from the start of the client write to the end of the client read). If the
+    /// transfer does not complete within 30 seconds of simulated time the method
+    /// panics, letting bolero shrink the packet-loss pattern to the minimal case
+    /// that stalls BBRv2.
+    fn sim_with_timing(self) -> Duration {
+        const BODY_LEN: usize = 1 << 18;
+        const TRANSFER_TIMEOUT: Duration = Duration::from_secs(30);
+
+        let elapsed_us = Arc::new(AtomicU64::new(0));
+        let elapsed_capture = elapsed_us.clone();
+
+        sim(|| {
+            {
+                tracing::info!(
+                    packets = ?self,
+                    loss = format!("{:.02}%", self.loss_percent()),
+                    "dropped packets"
+                );
+                let mut enabled = self.enabled_iter().enumerate();
+                bach::net::monitor::on_packet_sent(move |packet| {
+                    if packet.source().port() == 443 {
+                        if let Some((idx, enabled)) = enabled.next() {
+                            if !enabled {
+                                tracing::info!(
+                                    idx,
+                                    len = packet.transport.payload().len(),
+                                    "dropping packet"
+                                );
+                                return bach::net::monitor::Command::Drop;
+                            }
+                        }
+                    }
+                    bach::net::monitor::Command::Pass
+                });
+            }
+
+            {
+                let elapsed_capture = elapsed_capture.clone();
+                async move {
+                    let client = Client::builder().build();
+                    let mut stream = client.connect_sim("server:443").await.unwrap();
+
+                    let body = vec![42u8; BODY_LEN];
+                    let start = Instant::now();
+
+                    crate::testing::timeout(
+                        TRANSFER_TIMEOUT,
+                        async {
+                            stream.write_all(&body).await.unwrap();
+                            stream.shutdown().await.unwrap();
+
+                            let mut response = Vec::with_capacity(BODY_LEN);
+                            stream.read_to_end(&mut response).await.unwrap();
+                            assert_eq!(response, body);
+                        },
+                    )
+                    .await
+                    .expect(
+                        "transfer timed out; BBRv2 may have stalled under this loss pattern",
+                    );
+
+                    let elapsed = start.elapsed();
+                    elapsed_capture.store(elapsed.as_micros() as u64, Ordering::Relaxed);
+                }
+                .group("client")
+                .primary()
+                .spawn();
+            }
+
+            async move {
+                let server = Server::udp().port(443).build();
+
+                while let Ok((mut stream, _addr)) = server.accept().await {
+                    spawn(async move {
+                        let mut request = Vec::with_capacity(BODY_LEN);
+                        let _ = stream.read_to_end(&mut request).await;
+                        let _ = stream.write_all(&request).await;
+                    });
+                }
+            }
+            .group("server")
+            .spawn();
+        });
+
+        Duration::from_micros(elapsed_us.load(Ordering::Relaxed))
+    }
 }
 
 impl core::fmt::Debug for DroppedPackets {
@@ -491,6 +584,70 @@ fn lost_flow_increase() {
         .cloned()
         .for_each(|packets| {
             packets.sim();
+        });
+}
+
+/// Shows the transmission rate of a 256 KiB echo stream under a representative
+/// sporadic loss pattern (~49% loss).
+///
+/// Measures the round-trip elapsed simulated time and derives a throughput
+/// figure, demonstrating that BBRv2 continues to make forward progress even
+/// under heavy packet loss. The exact values are logged to aid debugging; the
+/// test asserts only that the transfer completes within the simulated timeout.
+#[test]
+fn transmission_rate_with_loss() {
+    let packets = DroppedPackets::from_iter([
+        10..12,
+        22..27,
+        28..32,
+        40..45,
+        54..61,
+        63..66,
+        75..77,
+        81..84,
+        89..98,
+        108..116,
+        121..127,
+        129..131,
+        136..137,
+        143..152,
+        153..160,
+        163..172,
+        181..183,
+        185..192,
+        199..201,
+        202..212,
+        213..219,
+        227..236,
+        238..248,
+        275..283,
+        284..290,
+    ]);
+    let loss_percent = packets.loss_percent();
+    let elapsed = packets.sim_with_timing();
+    let throughput_kib_per_sec = (1usize << 18) as f64 / elapsed.as_secs_f64() / 1024.0;
+    eprintln!(
+        "transmission_rate_with_loss: loss={loss_percent:.1}%, elapsed={elapsed:?}, \
+         throughput={throughput_kib_per_sec:.1} KiB/s"
+    );
+}
+
+/// Fuzzes packet-loss patterns to find inputs that stall or severely degrade BBRv2.
+///
+/// For each generated [`DroppedPackets`] value bolero produces, a 256 KiB echo
+/// transfer is run in the deterministic simulator. The transfer must complete
+/// within [`TRANSFER_TIMEOUT`][DroppedPackets::sim_with_timing] of simulated time.
+/// If bolero discovers a pattern that exceeds this bound it will shrink it to the
+/// minimal failing case, pointing directly at the problematic loss sequence.
+#[test]
+fn transmission_rate_fuzz() {
+    bolero::check!()
+        .with_type::<DroppedPackets>()
+        .with_test_time(core::time::Duration::from_secs(30))
+        .with_shrink_time(core::time::Duration::from_secs(10))
+        .cloned()
+        .for_each(|packets| {
+            let _elapsed = packets.sim_with_timing();
         });
 }
 
