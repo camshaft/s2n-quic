@@ -621,6 +621,10 @@ fn bulk_transfer_control_packet_ratio() {
         "expected stream packets to be sent; {counts}"
     );
     assert!(
+        counts.control() > 0,
+        "expected control packets to be sent; {counts}"
+    );
+    assert!(
         ratio <= 0.5,
         "control-to-stream packet ratio is too high: {ratio:.3} (expected <= 0.5); {counts}"
     );

@@ -240,6 +240,7 @@ impl Transmission {
         self.stream_ack.clear();
         self.recovery_ack.clear();
         self.throttle.cancel();
+        self.max_ack_delay.cancel();
         let _ = self.state.on_stream_finished();
     }
 }
