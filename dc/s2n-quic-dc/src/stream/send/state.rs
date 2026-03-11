@@ -924,6 +924,9 @@ impl State {
                 .has_inflight_packets(&self.unacked_ranges, &self.fin, &self.reset);
         // If we're blocked on flow control we also need to keep the PTO armed
         has_inflight |= self.max_data.is_inflight();
+        // The FIN also needs to be tracked — if it was sent but not yet ACKed,
+        // we need PTO to probe for it even if the I/O counter is zero.
+        has_inflight |= !self.fin.is_acked() && self.fin.value().is_some();
         has_inflight
     }
 
