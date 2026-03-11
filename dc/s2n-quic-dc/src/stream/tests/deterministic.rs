@@ -6,6 +6,10 @@ use crate::{
     testing::{ext::*, sim, spawn},
 };
 use bach::time::Instant;
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
+};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     join,
@@ -488,4 +492,136 @@ fn lost_flow_increase() {
         .for_each(|packets| {
             packets.sim();
         });
+}
+
+/// Classifies a raw UDP payload by its first byte (tag byte) into a packet category.
+fn classify_packet(payload: &[u8]) -> &'static str {
+    match payload.first().copied() {
+        Some(0x00..=0x3F) => "stream",
+        Some(0x40..=0x4F) => "datagram",
+        Some(0x50..=0x5F) => "control",
+        Some(0x60..=0x67) => "secret_control",
+        _ => "other",
+    }
+}
+
+/// Tracks packet counts by type across the simulation using atomic counters.
+#[derive(Clone, Default)]
+struct PacketCounts {
+    stream: Arc<AtomicU64>,
+    control: Arc<AtomicU64>,
+    other: Arc<AtomicU64>,
+}
+
+impl PacketCounts {
+    fn record(&self, payload: &[u8]) {
+        match classify_packet(payload) {
+            "stream" => self.stream.fetch_add(1, Ordering::Relaxed),
+            "control" => self.control.fetch_add(1, Ordering::Relaxed),
+            _ => self.other.fetch_add(1, Ordering::Relaxed),
+        };
+    }
+
+    fn stream(&self) -> u64 {
+        self.stream.load(Ordering::Relaxed)
+    }
+
+    fn control(&self) -> u64 {
+        self.control.load(Ordering::Relaxed)
+    }
+
+    fn control_to_stream_ratio(&self) -> f64 {
+        let stream = self.stream() as f64;
+        let control = self.control() as f64;
+        if stream == 0.0 {
+            return 0.0;
+        }
+        control / stream
+    }
+}
+
+impl core::fmt::Display for PacketCounts {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(
+            f,
+            "stream={}, control={}, other={}, control/stream ratio={:.3}",
+            self.stream(),
+            self.control(),
+            self.other.load(Ordering::Relaxed),
+            self.control_to_stream_ratio(),
+        )
+    }
+}
+
+/// Asserts that during a bulk unidirectional transfer, the ratio of control packets
+/// (ACKs) to stream packets stays within a reasonable bound.
+///
+/// In production we observed a ~1.5x control-to-stream ratio, which is far too high.
+/// Ideally the receiver should ACK much less frequently than one ACK per stream packet,
+/// targeting something around 0.5x or lower.
+#[test]
+fn bulk_transfer_control_packet_ratio() {
+    let counts = PacketCounts::default();
+    let monitor_counts = counts.clone();
+
+    sim(|| {
+        {
+            let counts = monitor_counts.clone();
+            bach::net::monitor::on_packet_sent(move |packet| {
+                let payload = packet.transport.payload();
+                if !payload.is_empty() {
+                    counts.record(payload);
+                }
+                bach::net::monitor::Command::Pass
+            });
+        }
+
+        async move {
+            let client = Client::builder().build();
+            let mut stream = client.connect_sim("server:443").await.unwrap();
+
+            // Send a large bulk transfer (1 MiB) to generate enough packets for
+            // meaningful ratio measurement
+            let body = vec![42u8; 1 << 20];
+            stream.write_all(&body).await.unwrap();
+            stream.shutdown().await.unwrap();
+
+            // Wait for all ACKs to flush
+            let mut response = vec![];
+            stream.read_to_end(&mut response).await.unwrap();
+        }
+        .group("client")
+        .primary()
+        .spawn();
+
+        async move {
+            let server = Server::udp().port(443).build();
+
+            while let Ok((mut stream, _addr)) = server.accept().await {
+                spawn(async move {
+                    let mut request = vec![];
+                    stream.read_to_end(&mut request).await.unwrap();
+                    // echo back empty response to let client's read_to_end complete
+                    let _ = stream.shutdown().await;
+                });
+            }
+        }
+        .group("server")
+        .spawn();
+    });
+
+    let ratio = counts.control_to_stream_ratio();
+    eprintln!("bulk_transfer_control_packet_ratio: {counts}");
+
+    // We expect the control-to-stream ratio to stay well below 1.0.
+    // A ratio of 1.5 means the receiver sends 1.5 ACKs per stream packet, which
+    // floods the TX path with control packets. We target <= 0.5 for a healthy ratio.
+    assert!(
+        counts.stream() > 0,
+        "expected stream packets to be sent; {counts}"
+    );
+    assert!(
+        ratio <= 0.5,
+        "control-to-stream packet ratio is too high: {ratio:.3} (expected <= 0.5); {counts}"
+    );
 }

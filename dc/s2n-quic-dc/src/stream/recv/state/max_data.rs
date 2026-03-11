@@ -115,7 +115,16 @@ impl MaxData {
 
     /// Called after reading from the buffer to potentially advance the max_data window.
     ///
-    /// Returns `true` if a new max_data value was queued.
+    /// Updates the pending max_data value but does NOT independently trigger a
+    /// control packet transmission. The updated value will be piggybacked on the
+    /// next ACK control packet. This prevents max_data window advancement from
+    /// inflating the control packet rate during bulk transfers.
+    ///
+    /// If the sender becomes flow-blocked, it will send a DATA_BLOCKED frame,
+    /// which triggers an immediate dedicated max_data transmission via
+    /// [`on_data_blocked`].
+    ///
+    /// Returns `true` if the pending value was updated.
     #[inline]
     pub fn on_read(&mut self, current_offset: VarInt, final_offset: Option<VarInt>) -> bool {
         // TODO instead of fixed windows we should measure how fast the application is reading
@@ -127,13 +136,9 @@ impl MaxData {
         // only increase, never decrease
         ensure!(new_max_data > self.pending_value, false);
 
-        // TODO make this smarter to avoid sending too many MAX_DATA frames
-        // TODO set a timer here or queue immediately if we're approaching the limit
         self.pending_value = new_max_data;
 
-        let _ = self.state.on_queued();
-
-        // Reset backoff when we have a genuinely new value to send
+        // Reset backoff when we have a genuinely new value
         self.retransmit_timeout = INITIAL_RETRANSMIT_TIMEOUT;
 
         true

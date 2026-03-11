@@ -493,14 +493,25 @@ impl State {
 
         space.on_packet_received(packet_number, clock.get_time());
 
+        let packet_space = packet.tag().packet_space();
+
         // update the idle timer since we received a valid packet
         if matches!(self.state, Receiver::Recv | Receiver::SizeKnown)
             || packet.stream_offset() == VarInt::ZERO
         {
             self.update_idle_timer(clock);
 
-            // ACK immediately during active reception for congestion control feedback
-            self.transmission.on_new_packet_active();
+            // Differentiate ACK scheduling based on packet space:
+            // - Recovery packets signal loss and need immediate ACKs
+            // - Stream packets are batched to reduce ACK overhead
+            match packet_space {
+                stream::PacketSpace::Recovery => self.transmission.on_recovery_packet_active(),
+                stream::PacketSpace::Stream => self.transmission.on_new_packet_active(),
+            }
+
+            // Arm the max-ack-delay timer if we have unacknowledged packets but
+            // haven't yet hit the threshold
+            self.transmission.arm_max_ack_delay(clock);
         } else {
             // After receiving all data, rate-limit ACKs to avoid storms while still
             // confirming delivery for the sender's probes
@@ -791,20 +802,19 @@ impl State {
 
         // The value of `20` is somewhat arbitrary but doing some worst-case math the ACK ranges with
         // 20 segments would consume about 20-25% of the packet this is a good starting point.
-        // We dont't want to go too much lower otherwise we end up spamming ACKs.
+        // We don't want to go too much lower otherwise we end up spamming ACKs.
         let duplicate_threshold = 20;
 
-        let mut should_duplicate = false;
-
-        // if the number of intervals is large then we should duplicate the ACKs to try and recover
-        should_duplicate |= intervals > duplicate_threshold;
-
-        // if we have recovery packets then the network is likely lossy so we duplicate the ACKs to increase the
-        // likelihood that the sender will recover
-        should_duplicate |= self.transmission.has_recovery()
-            && matches!(self.state, Receiver::Recv | Receiver::SizeKnown);
-
-        let count = if should_duplicate { 2 } else { 1 };
+        // Only duplicate ACKs when the number of ACK intervals is very large,
+        // indicating severe loss. Recovery packets already trigger immediate ACKs
+        // via `on_recovery_packet_active()`, so we don't need blanket duplication
+        // whenever recovery packets exist — that was doubling the control packet
+        // rate during normal operation.
+        let count = if intervals > duplicate_threshold {
+            2
+        } else {
+            1
+        };
 
         for _ in 0..count {
             let res = queue.push_with(|mut buffer| {

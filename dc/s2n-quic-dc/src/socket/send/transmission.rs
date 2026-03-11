@@ -121,6 +121,11 @@ impl<Info, Meta, Completion> Builder<Info, Meta, Completion> {
         max_segments: usize,
         transmission_alloc: impl Fn() -> Entry<Info, Meta, Completion>,
     ) {
+        // Clamp max_segments to the maximum number of segments allowed per
+        // sendmsg call. Callers may pass a higher value (e.g. from GSO
+        // configuration) that exceeds the iovec/total-payload limits.
+        let max_segments = max_segments.min(msg::segment::MAX_COUNT);
+
         let batch = loop {
             if let Some(batch) = self.batches.back_mut() {
                 let mut can_push = true;
