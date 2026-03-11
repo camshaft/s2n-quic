@@ -54,14 +54,19 @@ const THROTTLE_PERIOD: Duration = Duration::from_secs(1);
 /// active data reception. This amortizes ACK overhead across multiple data
 /// packets. Recovery/retransmission packets always ACK immediately.
 ///
-/// A value of 2 gives a ~0.5 control-to-stream ratio for bulk transfers and
-/// aligns with QUIC's default ACK frequency (RFC 9000 §13.2.1).
-const ACK_PACKET_THRESHOLD: u16 = 2;
+/// A value of 10 amortizes control overhead across more data packets,
+/// which is well-suited for data center environments where throughput is
+/// high and we can rely on the max-ack-delay timer to bound latency.
+const ACK_PACKET_THRESHOLD: u16 = 10;
 
 /// Maximum time to defer an ACK during active reception. If the packet
 /// threshold hasn't been reached within this period, we send an ACK anyway to
 /// avoid stalling congestion control.
-const MAX_ACK_DELAY: Duration = Duration::from_millis(25);
+///
+/// In a data center environment, RTTs are typically sub-millisecond, so a
+/// low value keeps congestion control responsive without adding meaningful
+/// overhead.
+const MAX_ACK_DELAY: Duration = Duration::from_millis(2);
 
 #[derive(Debug, Default)]
 pub struct Transmission {
@@ -127,11 +132,11 @@ impl Transmission {
 
     /// Called when we've received all data (buffered fin).
     ///
-    /// We need to send an ACK to confirm we received everything so the sender
-    /// can finish cleanly.
+    /// We need to send an ACK immediately to confirm we received everything so
+    /// the sender can finish cleanly without having to probe.
     #[inline]
     pub fn on_receive_all_data(&mut self) {
-        let _ = self.state.on_packet_received();
+        self.force_transmission();
     }
 
     /// Called when a local error occurs that needs to be transmitted to the peer.
@@ -139,7 +144,15 @@ impl Transmission {
     /// Queues an immediate transmission so the error gets sent out promptly.
     #[inline]
     pub fn on_error(&mut self) {
+        self.force_transmission();
+    }
+
+    fn force_transmission(&mut self) {
         let _ = self.state.on_packet_received();
+        // Cancel any pending delay timer — we want this ACK out the door now.
+        self.max_ack_delay.cancel();
+        // Reset the counter so the ACK reflects the full set of received packets.
+        self.packets_since_ack = 0;
     }
 
     /// Called when a new packet is received after the stream has received all data.

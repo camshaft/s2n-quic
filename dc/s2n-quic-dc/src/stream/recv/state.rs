@@ -653,8 +653,14 @@ impl State {
         ensure!(self.error.is_none());
         let is_idle_timeout = matches!(error.kind(), error::Kind::IdleTimeout);
         self.error = Some(ErrorState { error, source });
-        publisher
-            .on_stream_receiver_errored(event::builder::StreamReceiverErrored { error, source });
+        if error.kind().is_abandoned() {
+            publisher.on_stream_abandoned(event::builder::StreamAbandoned { error, source });
+        } else {
+            publisher.on_stream_receiver_errored(event::builder::StreamReceiverErrored {
+                error,
+                source,
+            });
+        }
 
         if matches!(source, Location::Local) && !is_idle_timeout {
             self.transmission.on_error();

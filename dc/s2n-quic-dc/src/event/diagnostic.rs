@@ -382,6 +382,18 @@ impl event::Subscriber for Subscriber {
     }
 
     #[inline]
+    fn on_stream_abandoned(
+        &self,
+        context: &Self::ConnectionContext,
+        meta: &api::ConnectionMeta,
+        event: &api::StreamAbandoned,
+    ) {
+        // Record the event for completeness but do NOT mark as error —
+        // abandoned streams are an expected application-level operation.
+        record_event(context, meta, "StreamAbandoned", event);
+    }
+
+    #[inline]
     fn on_stream_decrypt_packet(
         &self,
         context: &Self::ConnectionContext,

@@ -158,6 +158,34 @@ async fn addr_after_full_shutdown_test() {
     }
 }
 
+/// Q: What happens when the client drops the read half but continues to write?
+///
+/// A: The write half of the stream continues to function as normal.
+///    Dropping the read side is a "stop_sending" — it only closes the receive
+///    direction, not the send direction.
+#[tokio::test]
+async fn drop_read_half_write_continues_test() {
+    let context = Context::new().await;
+    let (stream, mut server) = context.pair().await;
+
+    let (read, mut write) = stream.into_split();
+
+    // Drop the read half — triggers stop_sending on the receive side.
+    // The write half should remain fully operational.
+    drop(read);
+
+    tokio::time::sleep(Duration::from_millis(1)).await;
+
+    // Client can still write after dropping the read half
+    write.write_all(b"hello from client!").await.unwrap();
+    AsyncWriteExt::shutdown(&mut write).await.unwrap();
+
+    // Server can still read the data the client sent
+    let mut buffer = vec![];
+    server.read_to_end(&mut buffer).await.unwrap();
+    assert_eq!(&buffer, b"hello from client!");
+}
+
 /// Q: What happens when the client shuts down the stream but continues to read?
 ///
 /// A: The open half of the stream continues to function as normal

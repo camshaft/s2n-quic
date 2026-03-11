@@ -212,6 +212,14 @@ impl Kind {
     /// The flow state is gone and the stream is unrecoverable
     pub const FLOW_RESET_CODE: u8 = 5;
 
+    /// Returns `true` if this error represents the stream being abandoned
+    /// (e.g. via stop_sending or a clean application close) rather than a
+    /// transport-level failure.
+    #[inline]
+    pub fn is_abandoned(&self) -> bool {
+        matches!(self, Kind::NormalClose)
+    }
+
     #[inline]
     #[track_caller]
     pub(crate) fn err(self) -> Error {
