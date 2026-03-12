@@ -25,7 +25,7 @@ use parking_lot::Mutex;
 use s2n_quic_core::task::waker::noop;
 use std::{
     sync::{
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc,
     },
     task::Waker,
@@ -95,6 +95,23 @@ struct Shared<Info, Meta, Completion> {
     state: Mutex<State<Info, Meta, Completion>>,
     /// Total number of entries queued (for load monitoring).
     len: AtomicUsize,
+    /// Set to `true` by producers whenever they push at least one entry into
+    /// the shared queue; cleared to `false` by [`Ticker::drain_incoming`] after
+    /// it empties the queue.
+    ///
+    /// The [`Ticker`] checks this flag atomically *before* acquiring the lock,
+    /// so it can skip the lock entirely when no new entries have been pushed
+    /// since the last drain.  Both the `store(true)` (in `insert` /
+    /// `insert_batch`) and the `store(false)` (in `drain_incoming`) happen
+    /// while the mutex is held, so the flag is always consistent with the
+    /// queue contents.
+    ///
+    /// Memory ordering: `Relaxed` is sufficient.  The mutex unlock/lock pair
+    /// provides the necessary acquire-release semantics for the queue contents.
+    /// The pre-lock load in `drain_incoming` is an optimistic hint: a `false`
+    /// value (stale read) is safe because the producer's subsequent
+    /// `waker.wake()` will re-wake the ticker to retry.
+    pending: AtomicBool,
 }
 
 impl<Info, Meta, Completion, const GRANULARITY_US: u64>
@@ -108,6 +125,7 @@ impl<Info, Meta, Completion, const GRANULARITY_US: u64>
                 waker: noop(),
             }),
             len: AtomicUsize::new(0),
+            pending: AtomicBool::new(false),
         }))
     }
 
@@ -148,10 +166,20 @@ impl<Info, Meta, Completion, const GRANULARITY_US: u64>
         let waker = {
             let mut state = self.0.state.lock();
             self.0.len.fetch_add(1, Ordering::Relaxed);
+            // Only wake if we are the first to set the flag since the last
+            // drain — a concurrent producer that set it before us already
+            // woke the ticker, so a second wake is redundant.
+            let already_pending = self.0.pending.swap(true, Ordering::Relaxed);
             state.queue.push_back(entry);
-            state.waker.clone()
+            if !already_pending {
+                Some(state.waker.clone())
+            } else {
+                None
+            }
         };
-        waker.wake();
+        if let Some(waker) = waker {
+            waker.wake();
+        }
     }
 
     /// Insert a batch of entries in one lock acquisition.
@@ -165,10 +193,17 @@ impl<Info, Meta, Completion, const GRANULARITY_US: u64>
         let waker = {
             let mut state = self.0.state.lock();
             self.0.len.fetch_add(count, Ordering::Relaxed);
+            let already_pending = self.0.pending.swap(true, Ordering::Relaxed);
             state.queue.append(&mut queue);
-            state.waker.clone()
+            if !already_pending {
+                Some(state.waker.clone())
+            } else {
+                None
+            }
         };
-        waker.wake();
+        if let Some(waker) = waker {
+            waker.wake();
+        }
     }
 
     // ── Reader API ───────────────────────────────────────────────────
@@ -423,10 +458,13 @@ impl<Info, Meta, Completion, const GRANULARITY_US: u64>
         self.wheel.set_waker(waker);
     }
 
-    /// Returns true if the shared queue has no NEW pending entries
-    /// (i.e., nothing has been pushed since the last drain_incoming).
+    /// Returns true if the shared queue has new pending entries
+    /// (i.e., entries pushed since the last drain_incoming).
+    ///
+    /// This check is lock-free: it reads the `pending` flag that
+    /// the producers set under the lock.
     pub fn has_pending(&self) -> bool {
-        !self.wheel.0.state.lock().queue.is_empty()
+        self.wheel.0.pending.load(Ordering::Relaxed)
     }
 
     /// Returns the timestamp of the current virtual tick.
@@ -484,8 +522,24 @@ impl<Info, Meta, Completion, const GRANULARITY_US: u64>
     // ── Internal ───────────────────────────────────────────────────────
 
     /// Drain the shared unordered queue and insert each entry into the wheel.
+    ///
+    /// Fast path: if the `pending` flag is false (no new entries since the
+    /// last drain), we skip acquiring the lock entirely.  This avoids expensive
+    /// mutex contention during busy-poll loops where `tick_to` is called at
+    /// high frequency but producers are quiet.
     fn drain_incoming(&mut self) {
-        let mut incoming = core::mem::take(&mut self.wheel.0.state.lock().queue);
+        // Fast path: nothing to drain — skip the lock.
+        if !self.wheel.0.pending.load(Ordering::Relaxed) {
+            return;
+        }
+        let mut incoming = {
+            let mut state = self.wheel.0.state.lock();
+            // Clear the flag while holding the lock so it stays consistent
+            // with the queue: any producer that sets it afterward will also
+            // push to the queue before we can observe it on the next call.
+            self.wheel.0.pending.store(false, Ordering::Relaxed);
+            core::mem::take(&mut state.queue)
+        };
         while let Some(entry) = incoming.pop_front() {
             self.insert_entry(entry);
         }
@@ -557,21 +611,24 @@ impl<Info, Meta, Completion, const GRANULARITY_US: u64>
     }
 
     /// Compute which level and slot an entry should be placed in.
+    ///
+    /// Uses `leading_zeros()` to determine the level in O(1) (one CPU
+    /// instruction on all major ISAs) rather than a shift-loop.
+    ///
+    /// Mapping: delta 0–255 → level 0, 256–65535 → level 1,
+    /// 65536–16_777_215 → level 2, 16_777_216+ → level 3.
     fn compute_level_and_slot(current_tick: u64, target_tick: u64) -> (usize, usize) {
         let delta = target_tick - current_tick;
 
-        if delta == 0 {
-            let slot = (current_tick & SLOT_MASK) as usize;
-            return (0, slot);
-        }
-
-        // Find the level: which "digit" (base-64) of the delta is non-zero
-        let mut level = 0;
-        let mut shifted = delta;
-        while shifted >= SLOTS_PER_LEVEL as u64 && level + 1 < LEVELS {
-            shifted >>= BITS_PER_LEVEL;
-            level += 1;
-        }
+        // Number of significant bits in delta:
+        //   delta=0    → bits=0
+        //   delta=1    → bits=1  (1 significant bit)
+        //   delta=255  → bits=8
+        //   delta=256  → bits=9
+        // Level = floor((bits - 1) / BITS_PER_LEVEL), capped at LEVELS-1.
+        // saturating_sub handles delta=0 (bits=0) without a special case.
+        let bits = u64::BITS - delta.leading_zeros();
+        let level = ((bits.saturating_sub(1) / BITS_PER_LEVEL) as usize).min(LEVELS - 1);
 
         let slot = ((target_tick >> (BITS_PER_LEVEL * level as u32)) & SLOT_MASK) as usize;
 

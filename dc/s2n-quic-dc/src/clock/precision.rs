@@ -34,6 +34,20 @@ impl fmt::Display for Timestamp {
 }
 
 impl Timestamp {
+    /// Create a `Timestamp` from a raw nanosecond value.
+    ///
+    /// The nanoseconds are measured from the same epoch used internally
+    /// (the system monotonic clock epoch).  Callers should use a non-zero
+    /// value because `s2n_quic_core::time::Timestamp` cannot represent 0.
+    ///
+    /// # Panics
+    ///
+    /// Panics in debug builds if `nanos` is zero.
+    pub fn from_nanos(nanos: u64) -> Self {
+        debug_assert!(nanos > 0, "Timestamp nanos must be non-zero");
+        Self { nanos }
+    }
+
     pub fn duration_since(&self, other: Timestamp) -> std::time::Duration {
         let nanos = self.nanos.saturating_sub(other.nanos);
         std::time::Duration::from_nanos(nanos)
