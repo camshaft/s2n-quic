@@ -11,6 +11,6 @@ pub mod streams;
 pub fn benchmarks(c: &mut Criterion) {
     crypto::benchmarks(c);
     datagram::benchmarks(c);
-    send_wheel::benches(c);
+    send_wheel::benchmarks(c);
     streams::benchmarks(c);
 }

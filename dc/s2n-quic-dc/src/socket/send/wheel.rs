@@ -108,8 +108,8 @@ struct Shared<Info, Meta, Completion> {
     ///
     /// Memory ordering: `Relaxed` is sufficient.  The mutex unlock/lock pair
     /// provides the necessary acquire-release semantics for the queue contents.
-    /// The pre-lock load in `drain_incoming` is an optimistic hint: a false
-    /// `false` (stale read) is safe because the producer's subsequent
+    /// The pre-lock load in `drain_incoming` is an optimistic hint: a `false`
+    /// value (stale read) is safe because the producer's subsequent
     /// `waker.wake()` will re-wake the ticker to retry.
     pending: AtomicBool,
 }
@@ -166,11 +166,20 @@ impl<Info, Meta, Completion, const GRANULARITY_US: u64>
         let waker = {
             let mut state = self.0.state.lock();
             self.0.len.fetch_add(1, Ordering::Relaxed);
-            self.0.pending.store(true, Ordering::Relaxed);
+            // Only wake if we are the first to set the flag since the last
+            // drain — a concurrent producer that set it before us already
+            // woke the ticker, so a second wake is redundant.
+            let already_pending = self.0.pending.swap(true, Ordering::Relaxed);
             state.queue.push_back(entry);
-            state.waker.clone()
+            if !already_pending {
+                Some(state.waker.clone())
+            } else {
+                None
+            }
         };
-        waker.wake();
+        if let Some(waker) = waker {
+            waker.wake();
+        }
     }
 
     /// Insert a batch of entries in one lock acquisition.
@@ -184,11 +193,17 @@ impl<Info, Meta, Completion, const GRANULARITY_US: u64>
         let waker = {
             let mut state = self.0.state.lock();
             self.0.len.fetch_add(count, Ordering::Relaxed);
-            self.0.pending.store(true, Ordering::Relaxed);
+            let already_pending = self.0.pending.swap(true, Ordering::Relaxed);
             state.queue.append(&mut queue);
-            state.waker.clone()
+            if !already_pending {
+                Some(state.waker.clone())
+            } else {
+                None
+            }
         };
-        waker.wake();
+        if let Some(waker) = waker {
+            waker.wake();
+        }
     }
 
     // ── Reader API ───────────────────────────────────────────────────

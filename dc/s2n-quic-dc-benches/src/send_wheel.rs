@@ -101,7 +101,7 @@ fn make_wheel(
 
 // ── Benchmarks ────────────────────────────────────────────────────────────────
 
-pub fn benches(c: &mut Criterion) {
+pub fn benchmarks(c: &mut Criterion) {
     let pool = Pool::new(u16::MAX);
 
     // ── tick_to: empty (no new entries in shared queue) ───────────────────
