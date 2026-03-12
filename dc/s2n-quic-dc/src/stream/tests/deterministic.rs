@@ -6,6 +6,7 @@ use crate::{
     testing::{ext::*, sim, spawn},
 };
 use bach::time::Instant;
+use bytes::Bytes;
 use std::{
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -396,12 +397,153 @@ impl DroppedPackets {
             .spawn();
         });
 
-        let elapsed = end_time.lock().unwrap().unwrap().elapsed_since_start();
-        elapsed
+
+    /// Runs the same packet-drop pattern against a plain s2n-quic (non-DC) connection
+    /// inside the same `sim()` environment, using [`bach::net::monitor`] to apply the
+    /// drop sequence.
+    ///
+    /// The drop pattern is applied to packets transmitted from the server (port 443),
+    /// matching the semantics of [`Self::sim`].  Both simulations therefore see
+    /// identical loss conditions, making their elapsed times directly comparable.
+    fn sim_quic(self, body_len: usize) -> Duration {
+        use s2n_quic::{
+            client::Connect,
+            provider::{io::bach_net::Io as BachIo, tls::default as tls},
+            Client, Server,
+        };
+        use s2n_quic_core::crypto::tls::testing::certificates;
+
+        const TRANSFER_TIMEOUT: Duration = Duration::from_secs(30);
+        const SERVER_PORT: u16 = 443;
+
+        let end_time: Arc<Mutex<Option<Instant>>> = Arc::new(Mutex::new(None));
+        let end_time_inner = end_time.clone();
+
+        sim(|| {
+            {
+                tracing::info!(packets = ?self, loss = format!("{:.02}%", self.loss_percent()), "dropped packets (quic)");
+                let mut enabled = self.enabled_iter().enumerate();
+                bach::net::monitor::on_packet_sent(move |packet| {
+                    if packet.source().port() == SERVER_PORT {
+                        if let Some((idx, enabled)) = enabled.next() {
+                            if !enabled {
+                                tracing::info!(
+                                    idx,
+                                    len = packet.transport.payload().len(),
+                                    "dropping quic packet"
+                                );
+                                return bach::net::monitor::Command::Drop;
+                            }
+                        }
+                    }
+                    bach::net::monitor::Command::Pass
+                });
+            }
+
+            {
+                let end_time = end_time_inner.clone();
+                async move {
+                    // Wait until the server group has registered its virtual IP so that DNS
+                    // resolution of "server" succeeds.
+                    let server_addr = loop {
+                        match bach::net::lookup_host(("server", SERVER_PORT)).await {
+                            Ok(mut addrs) => {
+                                if let Some(addr) = addrs.next() {
+                                    break addr;
+                                }
+                            }
+                            Err(_) => {}
+                        }
+                        bach::time::sleep(Duration::from_millis(1)).await;
+                    };
+
+                    let client_tls = tls::Client::builder()
+                        .with_certificate(certificates::CERT_PEM)
+                        .unwrap()
+                        .build()
+                        .unwrap();
+
+                    let client = Client::builder()
+                        .with_io(BachIo::new("0.0.0.0:0".parse().unwrap()))
+                        .unwrap()
+                        .with_tls(client_tls)
+                        .unwrap()
+                        .start()
+                        .unwrap();
+
+                    let connect = Connect::new(server_addr).with_server_name("localhost");
+                    let mut conn = client.connect(connect).await.unwrap();
+                    let mut stream = conn.open_bidirectional_stream().await.unwrap();
+
+                    let body = Bytes::from(vec![42u8; body_len]);
+
+                    crate::testing::timeout(
+                        TRANSFER_TIMEOUT,
+                        async {
+                            stream.send(body.clone()).await.unwrap();
+                            stream.finish().unwrap();
+
+                            let mut received = 0usize;
+                            while let Some(chunk) = stream.receive().await.unwrap() {
+                                received += chunk.len();
+                            }
+                            assert_eq!(received, body_len);
+                        },
+                    )
+                    .await
+                    .expect("quic transfer timed out");
+
+                    *end_time.lock().unwrap() = Some(Instant::now());
+                }
+                .group("client")
+                .primary()
+                .spawn();
+            }
+
+            async move {
+                let server_tls = tls::Server::builder()
+                    .with_certificate(certificates::CERT_PEM, certificates::KEY_PEM)
+                    .unwrap()
+                    .build()
+                    .unwrap();
+
+                let server_addr: std::net::SocketAddr =
+                    ([0u8, 0, 0, 0], SERVER_PORT).into();
+                let mut server = Server::builder()
+                    .with_io(BachIo::new(server_addr))
+                    .unwrap()
+                    .with_tls(server_tls)
+                    .unwrap()
+                    .start()
+                    .unwrap();
+
+                while let Some(mut conn) = server.accept().await {
+                    spawn(async move {
+                        while let Ok(Some(mut stream)) =
+                            conn.accept_bidirectional_stream().await
+                        {
+                            spawn(async move {
+                                // Accumulate the full request then echo it back.
+                                let mut buf = Vec::with_capacity(body_len);
+                                while let Some(chunk) = stream.receive().await.unwrap() {
+                                    buf.extend_from_slice(&chunk);
+                                }
+                                stream.send(buf.into()).await.unwrap();
+                                let _ = stream.finish();
+                            });
+                        }
+                    });
+                }
+            }
+            .group("server")
+            .spawn();
+        });
+
+        end_time.lock().unwrap().unwrap().elapsed_since_start()
     }
 }
 
-impl core::fmt::Debug for DroppedPackets {
+
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_set().entries(self.ranges()).finish()
     }
@@ -542,7 +684,8 @@ fn transmission_rate_fuzz() {
         .cloned()
         .for_each(|packets| {
             let loss = packets.loss_percent();
-            let elapsed = packets.sim(1 << 18);
+            let elapsed_dc = packets.clone().sim(1 << 18);
+            let elapsed_quic = packets.sim_quic(1 << 18);
 
             // Duration bound that scales quadratically with loss rate:
             //   0% loss  → 1 s max
@@ -551,8 +694,12 @@ fn transmission_rate_fuzz() {
             let max_secs = 1.0_f64 + (loss / 100.0).powi(2) * 29.0;
             let max_allowed = Duration::from_secs_f64(max_secs);
             assert!(
-                elapsed <= max_allowed,
-                "transfer took too long for {loss:.1}% loss: {elapsed:?} (max allowed: {max_allowed:?})"
+                elapsed_dc <= max_allowed,
+                "dc transfer took too long for {loss:.1}% loss: {elapsed_dc:?} (max allowed: {max_allowed:?})"
+            );
+            assert!(
+                elapsed_quic <= max_allowed,
+                "quic transfer took too long for {loss:.1}% loss: {elapsed_quic:?} (max allowed: {max_allowed:?})"
             );
         });
 }
@@ -564,6 +711,72 @@ fn transmission_rate_fuzz() {
 #[test]
 fn no_loss() {
     let elapsed = DroppedPackets { counts: vec![] }.sim(1 << 18);
+    insta::assert_snapshot!(format!("{elapsed:?}"));
+}
+
+/// Baseline no-loss transfer using plain s2n-quic inside the same bach `sim()` environment.
+#[test]
+fn no_loss_quic() {
+    let elapsed = DroppedPackets { counts: vec![] }.sim_quic(1 << 18);
+    insta::assert_snapshot!(format!("{elapsed:?}"));
+}
+
+/// Compares initial-loss transfer time: plain s2n-quic vs DC-QUIC under the same packet drops.
+#[test]
+fn initial_loss_quic() {
+    let elapsed = DroppedPackets::from_iter([
+        1..10,
+        10..20,
+        20..29,
+        29..34,
+        38..45,
+        52..54,
+        61..66,
+        67..71,
+        78..86,
+        91..97,
+        97..100,
+        100..102,
+        113..117,
+        121..124,
+        129..130,
+        138..141,
+    ])
+    .sim_quic(1 << 18);
+    insta::assert_snapshot!(format!("{elapsed:?}"));
+}
+
+/// Compares sporadic-loss transfer time: plain s2n-quic vs DC-QUIC under the same packet drops.
+#[test]
+fn sporadic_loss_quic() {
+    let elapsed = DroppedPackets::from_iter([
+        10..12,
+        22..27,
+        28..32,
+        40..45,
+        54..61,
+        63..66,
+        75..77,
+        81..84,
+        89..98,
+        108..116,
+        121..127,
+        129..131,
+        136..137,
+        143..152,
+        153..160,
+        163..172,
+        181..183,
+        185..192,
+        199..201,
+        202..212,
+        213..219,
+        227..236,
+        238..248,
+        275..283,
+        284..290,
+    ])
+    .sim_quic(1 << 18);
     insta::assert_snapshot!(format!("{elapsed:?}"));
 }
 /// Classifies a raw UDP payload by its first byte (tag byte) into a packet category.
