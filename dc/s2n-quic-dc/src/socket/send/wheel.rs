@@ -25,7 +25,7 @@ use parking_lot::Mutex;
 use s2n_quic_core::task::waker::noop;
 use std::{
     sync::{
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc,
     },
     task::Waker,
@@ -95,22 +95,23 @@ struct Shared<Info, Meta, Completion> {
     state: Mutex<State<Info, Meta, Completion>>,
     /// Total number of entries queued (for load monitoring).
     len: AtomicUsize,
-    /// Number of entries in the shared input queue (updated under the lock).
+    /// Set to `true` by producers whenever they push at least one entry into
+    /// the shared queue; cleared to `false` by [`Ticker::drain_incoming`] after
+    /// it empties the queue.
     ///
-    /// The [`Ticker`] checks this atomically *before* acquiring the lock in
-    /// [`Ticker::drain_incoming`], so it can skip the lock entirely when no
-    /// new entries have been pushed since the last drain.  The value is always
-    /// consistent with the queue contents because both the increment (in
-    /// [`Wheel::insert`] / [`Wheel::insert_batch`]) and the reset (in
-    /// [`Ticker::drain_incoming`]) happen while the mutex is held.
+    /// The [`Ticker`] checks this flag atomically *before* acquiring the lock,
+    /// so it can skip the lock entirely when no new entries have been pushed
+    /// since the last drain.  Both the `store(true)` (in `insert` /
+    /// `insert_batch`) and the `store(false)` (in `drain_incoming`) happen
+    /// while the mutex is held, so the flag is always consistent with the
+    /// queue contents.
     ///
-    /// Memory ordering: `Relaxed` is sufficient everywhere.  The mutex
-    /// unlock/lock pair provides the necessary acquire-release semantics for
-    /// the queue contents themselves.  The pre-lock load in `drain_incoming`
-    /// is only a hint: a false zero (stale read) is safe because the producer
-    /// always calls `waker.wake()` after releasing the lock, which will cause
-    /// the ticker to re-poll and drain on its next iteration.
-    pending: AtomicUsize,
+    /// Memory ordering: `Relaxed` is sufficient.  The mutex unlock/lock pair
+    /// provides the necessary acquire-release semantics for the queue contents.
+    /// The pre-lock load in `drain_incoming` is an optimistic hint: a false
+    /// `false` (stale read) is safe because the producer's subsequent
+    /// `waker.wake()` will re-wake the ticker to retry.
+    pending: AtomicBool,
 }
 
 impl<Info, Meta, Completion, const GRANULARITY_US: u64>
@@ -124,7 +125,7 @@ impl<Info, Meta, Completion, const GRANULARITY_US: u64>
                 waker: noop(),
             }),
             len: AtomicUsize::new(0),
-            pending: AtomicUsize::new(0),
+            pending: AtomicBool::new(false),
         }))
     }
 
@@ -165,7 +166,7 @@ impl<Info, Meta, Completion, const GRANULARITY_US: u64>
         let waker = {
             let mut state = self.0.state.lock();
             self.0.len.fetch_add(1, Ordering::Relaxed);
-            self.0.pending.fetch_add(1, Ordering::Relaxed);
+            self.0.pending.store(true, Ordering::Relaxed);
             state.queue.push_back(entry);
             state.waker.clone()
         };
@@ -183,7 +184,7 @@ impl<Info, Meta, Completion, const GRANULARITY_US: u64>
         let waker = {
             let mut state = self.0.state.lock();
             self.0.len.fetch_add(count, Ordering::Relaxed);
-            self.0.pending.fetch_add(count, Ordering::Relaxed);
+            self.0.pending.store(true, Ordering::Relaxed);
             state.queue.append(&mut queue);
             state.waker.clone()
         };
@@ -445,10 +446,10 @@ impl<Info, Meta, Completion, const GRANULARITY_US: u64>
     /// Returns true if the shared queue has new pending entries
     /// (i.e., entries pushed since the last drain_incoming).
     ///
-    /// This check is lock-free: it reads the `pending` atomic counter that
-    /// the producers maintain under the lock.
+    /// This check is lock-free: it reads the `pending` flag that
+    /// the producers set under the lock.
     pub fn has_pending(&self) -> bool {
-        self.wheel.0.pending.load(Ordering::Relaxed) > 0
+        self.wheel.0.pending.load(Ordering::Relaxed)
     }
 
     /// Returns the timestamp of the current virtual tick.
@@ -507,21 +508,21 @@ impl<Info, Meta, Completion, const GRANULARITY_US: u64>
 
     /// Drain the shared unordered queue and insert each entry into the wheel.
     ///
-    /// Fast path: if the `pending` counter is zero (no new entries since the
+    /// Fast path: if the `pending` flag is false (no new entries since the
     /// last drain), we skip acquiring the lock entirely.  This avoids expensive
     /// mutex contention during busy-poll loops where `tick_to` is called at
     /// high frequency but producers are quiet.
     fn drain_incoming(&mut self) {
         // Fast path: nothing to drain — skip the lock.
-        if self.wheel.0.pending.load(Ordering::Relaxed) == 0 {
+        if !self.wheel.0.pending.load(Ordering::Relaxed) {
             return;
         }
         let mut incoming = {
             let mut state = self.wheel.0.state.lock();
-            // Reset under the same lock so the counter stays consistent with
-            // the queue: any producer that increments `pending` afterward will
-            // also push to the queue before we can observe it.
-            self.wheel.0.pending.store(0, Ordering::Relaxed);
+            // Clear the flag while holding the lock so it stays consistent
+            // with the queue: any producer that sets it afterward will also
+            // push to the queue before we can observe it on the next call.
+            self.wheel.0.pending.store(false, Ordering::Relaxed);
             core::mem::take(&mut state.queue)
         };
         while let Some(entry) = incoming.pop_front() {
