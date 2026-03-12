@@ -397,6 +397,9 @@ impl DroppedPackets {
             .spawn();
         });
 
+        let elapsed = { *end_time.lock().unwrap() };
+        elapsed.unwrap().elapsed_since_start()
+    }
 
     /// Runs the same packet-drop pattern against a plain s2n-quic (non-DC) connection
     /// inside the same `sim()` environment, using [`bach::net::monitor`] to apply the
@@ -539,11 +542,12 @@ impl DroppedPackets {
             .spawn();
         });
 
-        end_time.lock().unwrap().unwrap().elapsed_since_start()
+        let elapsed = { *end_time.lock().unwrap() };
+        elapsed.unwrap().elapsed_since_start()
     }
 }
 
-
+impl core::fmt::Debug for DroppedPackets {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_set().entries(self.ranges()).finish()
     }
