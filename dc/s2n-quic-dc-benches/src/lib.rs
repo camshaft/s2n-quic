@@ -5,10 +5,12 @@ use criterion::Criterion;
 
 pub mod crypto;
 pub mod datagram;
+pub mod send_wheel;
 pub mod streams;
 
 pub fn benchmarks(c: &mut Criterion) {
     crypto::benchmarks(c);
     datagram::benchmarks(c);
+    send_wheel::benches(c);
     streams::benchmarks(c);
 }
