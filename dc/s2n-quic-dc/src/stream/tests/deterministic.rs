@@ -311,7 +311,17 @@ impl DroppedPackets {
         (dropped as f64 / total as f64) * 100.0
     }
 
-    fn sim(self) {
+    /// Runs a simulation with the given packet drop pattern.
+    ///
+    /// Returns the total elapsed simulated time from t=0 to transfer completion.
+    /// The transfer is bounded by a 30-second simulated timeout; if it exceeds
+    /// that, the method panics so bolero can shrink to the minimal failing case.
+    fn sim(self, body_len: usize) -> Duration {
+        const TRANSFER_TIMEOUT: Duration = Duration::from_secs(30);
+
+        let end_time: Arc<Mutex<Option<Instant>>> = Arc::new(Mutex::new(None));
+        let end_time_inner = end_time.clone();
+
         sim(|| {
             {
                 tracing::info!(packets = ?self, loss = format!("{:.02}%", self.loss_percent()), "dropped packets");
@@ -340,91 +350,13 @@ impl DroppedPackets {
                 });
             }
 
-            async move {
-                let client = Client::builder().build();
-                let mut stream = client.connect_sim("server:443").await.unwrap();
-
-                let body = vec![42; 1 << 18];
-
-                stream.write_all(&mut &body[..]).await.unwrap();
-                stream.shutdown().await.unwrap();
-
-                let mut response = Vec::with_capacity(2000);
-                stream.read_to_end(&mut response).await.unwrap();
-                assert_eq!(response, body);
-            }
-            .group("client")
-            .primary()
-            .spawn();
-
-            async move {
-                let server = Server::udp().port(443).build();
-
-                2.s().sleep().await;
-
-                while let Ok((mut stream, _addr)) = server.accept().await {
-                    spawn(async move {
-                        let mut request = Vec::with_capacity(1 << 18);
-                        let _ = stream.read_to_end(&mut request).await;
-                        let _ = stream.write_all(&request).await;
-                    });
-                }
-            }
-            .group("server")
-            .spawn();
-        })
-    }
-
-    /// Runs a simulation with the given packet drop pattern and measures the total
-    /// elapsed simulated time from t=0 to transfer completion.
-    ///
-    /// Uses the same timing approach as the `rpc.rs` tests: an `Instant::now()` is
-    /// captured inside the async task at the moment the round-trip completes, and
-    /// `elapsed_since_start()` is called after `sim()` returns to get the simulated
-    /// wall-clock duration from the start of the simulation.
-    ///
-    /// If the transfer does not complete within 30 simulated seconds the method
-    /// panics, letting bolero shrink the packet-loss pattern to the minimal case
-    /// that stalls BBRv2.
-    fn sim_with_timing(self) -> Duration {
-        const BODY_LEN: usize = 1 << 18;
-        const TRANSFER_TIMEOUT: Duration = Duration::from_secs(30);
-
-        let end_time: Arc<Mutex<Option<Instant>>> = Arc::new(Mutex::new(None));
-        let end_time_inner = end_time.clone();
-
-        sim(|| {
-            {
-                tracing::info!(
-                    packets = ?self,
-                    loss = format!("{:.02}%", self.loss_percent()),
-                    "dropped packets"
-                );
-                let mut enabled = self.enabled_iter().enumerate();
-                bach::net::monitor::on_packet_sent(move |packet| {
-                    if packet.source().port() == 443 {
-                        if let Some((idx, enabled)) = enabled.next() {
-                            if !enabled {
-                                tracing::info!(
-                                    idx,
-                                    len = packet.transport.payload().len(),
-                                    "dropping packet"
-                                );
-                                return bach::net::monitor::Command::Drop;
-                            }
-                        }
-                    }
-                    bach::net::monitor::Command::Pass
-                });
-            }
-
             {
                 let end_time = end_time_inner.clone();
                 async move {
                     let client = Client::builder().build();
                     let mut stream = client.connect_sim("server:443").await.unwrap();
 
-                    let body = vec![42u8; BODY_LEN];
+                    let body = vec![42u8; body_len];
 
                     crate::testing::timeout(
                         TRANSFER_TIMEOUT,
@@ -432,15 +364,13 @@ impl DroppedPackets {
                             stream.write_all(&body).await.unwrap();
                             stream.shutdown().await.unwrap();
 
-                            let mut response = Vec::with_capacity(BODY_LEN);
+                            let mut response = Vec::with_capacity(body_len);
                             stream.read_to_end(&mut response).await.unwrap();
                             assert_eq!(response, body);
                         },
                     )
                     .await
-                    .expect(
-                        "transfer timed out; BBRv2 may have stalled under this loss pattern",
-                    );
+                    .expect("transfer timed out");
 
                     // Capture the simulated time at completion so we can report
                     // elapsed_since_start() after sim() exits.
@@ -456,7 +386,7 @@ impl DroppedPackets {
 
                 while let Ok((mut stream, _addr)) = server.accept().await {
                     spawn(async move {
-                        let mut request = Vec::with_capacity(BODY_LEN);
+                        let mut request = Vec::with_capacity(body_len);
                         let _ = stream.read_to_end(&mut request).await;
                         let _ = stream.write_all(&request).await;
                     });
@@ -479,7 +409,7 @@ impl core::fmt::Debug for DroppedPackets {
 
 #[test]
 fn initial_loss() {
-    DroppedPackets::from_iter([
+    let elapsed = DroppedPackets::from_iter([
         1..10,
         10..20,
         20..29,
@@ -497,12 +427,13 @@ fn initial_loss() {
         129..130,
         138..141,
     ])
-    .sim();
+    .sim(1 << 18);
+    insta::assert_snapshot!(format!("{elapsed:?}"));
 }
 
 #[test]
 fn sporadic_loss() {
-    DroppedPackets::from_iter([
+    let elapsed = DroppedPackets::from_iter([
         10..12,
         22..27,
         28..32,
@@ -529,7 +460,8 @@ fn sporadic_loss() {
         275..283,
         284..290,
     ])
-    .sim();
+    .sim(1 << 18);
+    insta::assert_snapshot!(format!("{elapsed:?}"));
 }
 
 #[test]
@@ -588,17 +520,19 @@ fn lost_flow_increase() {
         .with_shrink_time(core::time::Duration::from_secs(10))
         .cloned()
         .for_each(|packets| {
-            packets.sim();
+            let _ = packets.sim(1 << 18);
         });
 }
 
-/// Fuzzes all packet-loss patterns to find inputs that stall or severely degrade BBRv2.
+/// Fuzzes all packet-loss patterns and asserts that the transfer duration scales
+/// proportionally with the loss rate.
 ///
 /// For each generated [`DroppedPackets`] value bolero produces, a 256 KiB echo
-/// transfer is run in the deterministic simulator. The transfer must complete
-/// within the 30-second simulated timeout inside [`DroppedPackets::sim_with_timing`].
-/// If bolero discovers a pattern that exceeds that bound it will shrink it to the
-/// minimal failing case, pointing directly at the problematic loss sequence.
+/// transfer is run in the deterministic simulator. The elapsed time is then
+/// compared against a bound derived from the loss percentage: at 0% loss the cap
+/// is ~1 s; at 100% loss it scales up to the 30 s hard timeout. This means bolero
+/// will shrink any pattern where the end-to-end time grows orders of magnitude
+/// beyond what the loss rate would predict.
 #[test]
 fn transmission_rate_fuzz() {
     bolero::check!()
@@ -607,89 +541,31 @@ fn transmission_rate_fuzz() {
         .with_shrink_time(core::time::Duration::from_secs(10))
         .cloned()
         .for_each(|packets| {
-            let _elapsed = packets.sim_with_timing();
+            let loss = packets.loss_percent();
+            let elapsed = packets.sim(1 << 18);
+
+            // Duration bound that scales quadratically with loss rate:
+            //   0% loss  → 1 s max
+            //   50% loss → ~8 s max
+            //   100% loss → 30 s max (also enforced by the transfer timeout)
+            let max_secs = 1.0_f64 + (loss / 100.0).powi(2) * 29.0;
+            let max_allowed = Duration::from_secs_f64(max_secs);
+            assert!(
+                elapsed <= max_allowed,
+                "transfer took too long for {loss:.1}% loss: {elapsed:?} (max allowed: {max_allowed:?})"
+            );
         });
 }
 
 /// Measures total simulated time for a clean 256 KiB round-trip echo with no packet loss.
 ///
 /// This is the baseline scenario. The snapshot locks in the expected transfer
-/// duration so that any regression (e.g., caused by changing ACK thresholds or
-/// BBRv2 pacing parameters) is immediately visible as a snapshot diff.
+/// duration so that any regression is immediately visible as a snapshot diff.
 #[test]
-fn no_loss_timing() {
-    let elapsed = DroppedPackets { counts: vec![] }.sim_with_timing();
+fn no_loss() {
+    let elapsed = DroppedPackets { counts: vec![] }.sim(1 << 18);
     insta::assert_snapshot!(format!("{elapsed:?}"));
 }
-
-/// Measures total simulated time for a 256 KiB round-trip echo under heavy initial loss.
-///
-/// Uses the same loss pattern as the [`initial_loss`] test. The snapshot locks in
-/// the expected recovery time so changes to retransmission or BBRv2 startup
-/// behaviour are surfaced as a snapshot diff.
-#[test]
-fn initial_loss_timing() {
-    let elapsed = DroppedPackets::from_iter([
-        1..10,
-        10..20,
-        20..29,
-        29..34,
-        38..45,
-        52..54,
-        61..66,
-        67..71,
-        78..86,
-        91..97,
-        97..100,
-        100..102,
-        113..117,
-        121..124,
-        129..130,
-        138..141,
-    ])
-    .sim_with_timing();
-    insta::assert_snapshot!(format!("{elapsed:?}"));
-}
-
-/// Measures total simulated time for a 256 KiB round-trip echo under sporadic loss.
-///
-/// Uses the same loss pattern as the [`sporadic_loss`] test (~49% loss rate).
-/// The snapshot locks in the expected transfer duration; if ACK thresholds,
-/// BBRv2 pacing, or retransmission heuristics are changed the diff will show
-/// exactly how the end-to-end time is affected.
-#[test]
-fn sporadic_loss_timing() {
-    let elapsed = DroppedPackets::from_iter([
-        10..12,
-        22..27,
-        28..32,
-        40..45,
-        54..61,
-        63..66,
-        75..77,
-        81..84,
-        89..98,
-        108..116,
-        121..127,
-        129..131,
-        136..137,
-        143..152,
-        153..160,
-        163..172,
-        181..183,
-        185..192,
-        199..201,
-        202..212,
-        213..219,
-        227..236,
-        238..248,
-        275..283,
-        284..290,
-    ])
-    .sim_with_timing();
-    insta::assert_snapshot!(format!("{elapsed:?}"));
-}
-
 /// Classifies a raw UDP payload by its first byte (tag byte) into a packet category.
 fn classify_packet(payload: &[u8]) -> &'static str {
     match payload.first().copied() {
