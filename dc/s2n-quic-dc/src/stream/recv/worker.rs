@@ -604,7 +604,6 @@ where
 
         let meta = transmission::Meta {
             packet_space: PacketSpace::Recovery,
-            has_more_app_data: false,
             final_offset: None,
             half: crate::stream::shared::Half::Read,
             span: Default::default(),

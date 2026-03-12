@@ -85,7 +85,6 @@ impl Default for SenderSpan {
 #[derive(Debug)]
 pub struct Meta {
     pub packet_space: PacketSpace,
-    pub has_more_app_data: bool,
     pub final_offset: Option<VarInt>,
     pub half: Half,
     pub span: SenderSpan,
@@ -95,7 +94,6 @@ impl Default for Meta {
     fn default() -> Self {
         Self {
             packet_space: PacketSpace::Stream,
-            has_more_app_data: false,
             final_offset: None,
             half: Half::Write,
             span: SenderSpan::default(),

@@ -142,8 +142,6 @@ impl State {
                 let payload_len = reader.consumed_len() as u16;
                 total_payload_len += payload_len as usize;
 
-                let has_more_app_data = credits.initial_len > total_payload_len;
-
                 let final_offset = reader.final_offset();
                 let included_final_byte = final_offset
                     .is_some_and(|fin| stream_offset.as_u64() + payload_len as u64 == fin.as_u64());
@@ -173,7 +171,6 @@ impl State {
                 };
 
                 let meta = transmission::Meta {
-                    has_more_app_data,
                     packet_space: PacketSpace::Stream,
                     half: Half::Write,
                     final_offset,

@@ -283,8 +283,11 @@ where
             }
         }
 
-        self.sender
-            .load_completion_queue(&self.shared.sender.transmission_queue, &self.shared.clock);
+        self.sender.load_completion_queue(
+            &self.shared.sender.transmission_queue,
+            &self.shared.clock,
+            self.shared.sender.flow.stream_offset(),
+        );
 
         let _ = self.poll_messages(cx);
         let _ = self.poll_socket(cx);
@@ -532,8 +535,11 @@ where
 
     #[inline]
     fn after_transmit(&mut self) {
-        self.sender
-            .load_completion_queue(&self.shared.sender.transmission_queue, &self.shared.clock);
+        self.sender.load_completion_queue(
+            &self.shared.sender.transmission_queue,
+            &self.shared.clock,
+            self.shared.sender.flow.stream_offset(),
+        );
 
         self.sender.before_sleep(&self.shared.clock);
     }
@@ -636,6 +642,7 @@ where
 
                 let remote_queue_id = packet.source_queue_id();
 
+                let app_stream_offset = || self.shared.sender.flow.stream_offset();
                 let res = self.sender.on_control_packet(
                     self.opener,
                     ecn,
@@ -643,6 +650,7 @@ where
                     self.random,
                     self.clock,
                     &self.shared.sender.transmission_queue,
+                    &app_stream_offset,
                     self.publisher,
                 );
 

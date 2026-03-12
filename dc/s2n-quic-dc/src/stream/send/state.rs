@@ -287,7 +287,7 @@ impl State {
 
     /// Called by the worker when it receives a control packet from the peer
     #[inline]
-    pub fn on_control_packet<C, Clk, Pub>(
+    pub fn on_control_packet<C, Clk, Aso, Pub>(
         &mut self,
         control_key: &C,
         ecn: ExplicitCongestionNotification,
@@ -295,11 +295,13 @@ impl State {
         random: &mut dyn random::Generator,
         clock: &Clk,
         transmission_queue: &transmission::Queue,
+        app_stream_offset: &Aso,
         publisher: &Pub,
     ) -> Result<(), processing::Error>
     where
         C: crypto::open::control::Stream,
         Clk: Clock,
+        Aso: Fn() -> VarInt,
         Pub: event::ConnectionPublisher,
     {
         match self.on_control_packet_impl(
@@ -309,6 +311,7 @@ impl State {
             random,
             clock,
             transmission_queue,
+            app_stream_offset,
             publisher,
         ) {
             Ok(None) => {}
@@ -324,7 +327,7 @@ impl State {
     }
 
     #[inline(always)]
-    fn on_control_packet_impl<C, Clk, Pub>(
+    fn on_control_packet_impl<C, Clk, Aso, Pub>(
         &mut self,
         control_key: &C,
         _ecn: ExplicitCongestionNotification,
@@ -332,11 +335,13 @@ impl State {
         random: &mut dyn random::Generator,
         clock: &Clk,
         transmission_queue: &transmission::Queue,
+        app_stream_offset: &Aso,
         publisher: &Pub,
     ) -> Result<Option<processing::Error>, Error>
     where
         C: crypto::open::control::Stream,
         Clk: Clock,
+        Aso: Fn() -> VarInt,
         Pub: event::ConnectionPublisher,
     {
         // only process the packet after we know it's authentic
@@ -390,8 +395,11 @@ impl State {
                 }
                 FrameMut::Ack(ack) => {
                     if !core::mem::replace(&mut loaded_transmit_queue, true) {
+                        // Lazily load the app stream offset to give the application
+                        // maximum time to advance it before we check.
+                        let offset = app_stream_offset();
                         // make sure we have a current view of the application transmissions
-                        self.load_completion_queue(transmission_queue, clock);
+                        self.load_completion_queue(transmission_queue, clock, offset);
                     }
 
                     if ack.ecn_counts.is_some() {
@@ -954,7 +962,12 @@ impl State {
     /// Called by the worker thread when it becomes aware of the application having transmitted a
     /// segment
     #[inline]
-    pub fn load_completion_queue(&mut self, queue: &transmission::Queue, clock: &impl Clock) {
+    pub fn load_completion_queue(
+        &mut self,
+        queue: &transmission::Queue,
+        clock: &impl Clock,
+        app_stream_offset: VarInt,
+    ) {
         let mut should_reset_pto = false;
 
         queue.drain_completion_queue(|transmission| {
@@ -971,7 +984,19 @@ impl State {
             info.time_sent = transmission_time;
 
             let meta = transmission.meta;
-            let has_more_app_data = meta.has_more_app_data;
+
+            // Determine whether the application has more data beyond this packet.
+            //
+            // We check several signals:
+            // 1. Probes are never app-limited — they're sent because we're blocked
+            //    on ACKs (CWND/flow-control limited), not because the app is idle.
+            // 2. The app's stream_offset is ahead of this packet's end → more data
+            //    is queued in the pipeline between the app and the worker.
+            // 3. We know the final offset (from a large write with FIN) and this
+            //    packet hasn't reached it → there's definitely more data to send.
+            let has_more_app_data = info.flags.is_probe()
+                || app_stream_offset > info.end_offset()
+                || meta.final_offset.is_some_and(|fin| info.end_offset() < fin);
             self.max_sent_segment_size = self.max_sent_segment_size.max(info.packet_len);
 
             // Check if we need to update the fin state
@@ -1350,7 +1375,6 @@ impl State {
 
                 let meta = transmission::Meta {
                     packet_space: PacketSpace::Recovery,
-                    has_more_app_data: true,
                     final_offset: self.fin.value(),
                     half: Half::Write,
                     span: Default::default(),
@@ -1492,7 +1516,6 @@ impl State {
 
                 let meta = transmission::Meta {
                     packet_space: PacketSpace::Recovery,
-                    has_more_app_data: false,
                     final_offset,
                     half: Half::Write,
                     span: Default::default(),
