@@ -9,13 +9,15 @@ use crate::{
     },
     testing::{ext::*, server_name, sim, without_tracing},
 };
+use bach::time::Instant;
 use bolero::{check, TypeGenerator};
 use bytes::BytesMut;
 use s2n_quic_core::stream::testing::Data;
+use std::{sync::Mutex, time::Duration};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::{info_span, Instrument};
 
-fn hello_goodbye() {
+fn hello_goodbye(end_time: &'static Mutex<Option<Instant>>) {
     async move {
         let client = Client::builder().build();
         let response = rpc::InMemoryResponse::from(BytesMut::default());
@@ -23,6 +25,8 @@ fn hello_goodbye() {
             .rpc_sim("server:443", &b"hello!"[..], response)
             .await
             .unwrap();
+
+        *end_time.lock().unwrap() = Some(Instant::now());
 
         assert_eq!(response, b"goodbye!"[..]);
     }
@@ -52,18 +56,14 @@ fn hello_goodbye() {
 }
 
 #[test]
-fn simple() {
-    sim(hello_goodbye);
-}
-
-#[test]
 fn no_loss() {
     use core::sync::atomic::{AtomicUsize, Ordering};
 
     static COUNT: AtomicUsize = AtomicUsize::new(0);
+    static END_TIME: Mutex<Option<Instant>> = Mutex::new(None);
 
     sim(|| {
-        hello_goodbye();
+        hello_goodbye(&END_TIME);
 
         ::bach::net::monitor::on_packet_sent(move |packet| {
             let count = COUNT.fetch_add(1, Ordering::Relaxed) + 1;
@@ -77,6 +77,10 @@ fn no_loss() {
     });
 
     assert_eq!(COUNT.load(Ordering::Relaxed), 4);
+    assert_eq!(
+        END_TIME.lock().unwrap().unwrap().elapsed_since_start(),
+        Duration::from_millis(1)
+    );
 }
 
 #[test]
@@ -98,7 +102,7 @@ fn packet_loss() {
         .with_generator(0usize..=4)
         .cloned()
         .for_each(|loss_idx| {
-            let max_count = match loss_idx {
+            let (max_count, expected_end_duration) = match loss_idx {
                 // Drop client's initial Stream data (pn=0).
                 // Client PTO fires with 1 retransmit (first PTO = 1 probe).
                 //   0: client→server data (DROPPED)
@@ -106,7 +110,7 @@ fn packet_loss() {
                 //   2: server→client ACK control
                 //   3: server→client response data
                 //   4: client→server ACK control
-                0 => 5,
+                0 => (5, 7.ms() + 1.us()),
                 // Drop server's ACK control packet.
                 // Client never learns its data was received. Client PTO fires
                 // with 1 retransmit. Server re-ACKs.
@@ -117,7 +121,7 @@ fn packet_loss() {
                 //   4: client→server PTO retransmit (data)
                 //   5: server→client re-ACK control
                 // TODO: server response data should serve as implicit ACK = 5 total
-                1 => 6,
+                1 => (6, 1.ms()),
                 // Drop server's response Stream data.
                 // Server PTO fires with 1 retransmit.
                 //   0: client→server data
@@ -125,7 +129,7 @@ fn packet_loss() {
                 //   2: server→client response data (DROPPED)
                 //   3: server→client PTO retransmit (response data)
                 //   4: client→server ACK control
-                2 => 5,
+                2 => (5, 7.ms()),
                 // Drop client's ACK control packet.
                 // Server doesn't know client got the response. Server PTO fires
                 // with 1 retransmit.
@@ -135,18 +139,20 @@ fn packet_loss() {
                 //   3: client→server ACK control (DROPPED)
                 //   4: server→client PTO retransmit (response data)
                 //   5: client→server re-ACK control
-                3 => 6,
+                3 => (6, 1.ms()),
                 // No packet dropped (loss_idx=4 is beyond the 4 packets)
-                _ => 4,
+                _ => (4, 1.ms()),
             };
 
             static COUNT: AtomicUsize = AtomicUsize::new(0);
+            static END_TIME: Mutex<Option<Instant>> = Mutex::new(None);
 
             // reset the count back to 0
             COUNT.store(0, Ordering::Relaxed);
+            *END_TIME.lock().unwrap() = None;
 
             sim(|| {
-                hello_goodbye();
+                hello_goodbye(&END_TIME);
 
                 ::bach::net::monitor::on_packet_sent(move |packet| {
                     let idx = COUNT.fetch_add(1, Ordering::Relaxed);
@@ -170,6 +176,8 @@ fn packet_loss() {
                 max_count,
                 "actual vs expected"
             );
+            let elapsed = END_TIME.lock().unwrap().unwrap().elapsed_since_start();
+            assert_eq!(elapsed, expected_end_duration);
         });
 }
 

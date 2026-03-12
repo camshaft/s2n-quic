@@ -613,6 +613,17 @@ pub struct StreamSenderErrored {
     source: s2n_quic_core::endpoint::Location,
 }
 
+/// Indicates that the stream was abandoned by the application (e.g. via stop_sending)
+/// rather than experiencing a transport-level error.
+#[event("stream:abandoned")]
+pub struct StreamAbandoned {
+    #[builder(crate::stream::Error)]
+    error: crate::stream::Error,
+
+    /// The location where the abandonment originated
+    source: s2n_quic_core::endpoint::Location,
+}
+
 // NOTE - This event MUST come last, since connection-level aggregation depends on it
 #[event("connection:closed")]
 // #[checkpoint("latency")]

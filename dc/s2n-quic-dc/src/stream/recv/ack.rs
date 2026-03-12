@@ -61,10 +61,6 @@ impl Space {
         self.packets.interval_len()
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.packets.is_empty()
-    }
-
     pub fn ack_delay(&self, now: Timestamp) -> VarInt {
         let delay = self
             .max_received_packet_time

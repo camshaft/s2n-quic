@@ -116,7 +116,8 @@ impl InflightCounters {
     }
 }
 
-const MAX_TX_OFFSET: VarInt = VarInt::from_u32(64 * 1024);
+/// Allow up to 4 GSO segments in flight
+const MAX_TX_OFFSET: VarInt = VarInt::from_u32(4 * u16::MAX as u32);
 
 #[derive(Debug)]
 pub struct State {
@@ -923,6 +924,9 @@ impl State {
                 .has_inflight_packets(&self.unacked_ranges, &self.fin, &self.reset);
         // If we're blocked on flow control we also need to keep the PTO armed
         has_inflight |= self.max_data.is_inflight();
+        // The FIN also needs to be tracked — if it was sent but not yet ACKed,
+        // we need PTO to probe for it even if the I/O counter is zero.
+        has_inflight |= !self.fin.is_acked() && self.fin.value().is_some();
         has_inflight
     }
 
@@ -1544,7 +1548,12 @@ impl State {
         }
 
         ensure!(self.reset.on_error(error, source).is_ok());
-        publisher.on_stream_sender_errored(event::builder::StreamSenderErrored { error, source });
+        if error.kind().is_abandoned() {
+            publisher.on_stream_abandoned(event::builder::StreamAbandoned { error, source });
+        } else {
+            publisher
+                .on_stream_sender_errored(event::builder::StreamSenderErrored { error, source });
+        }
 
         // Emit abandon events for all unacknowledged stream packets
         let now = clock.get_time();
@@ -1587,8 +1596,8 @@ impl State {
             self.idle_timer.cancel();
         } else {
             // Local errors need a short timeout to send the reset and wait for an ACK.
-            // Use a shorter timeout (5s) instead of the full idle timeout.
-            let error_timeout = Duration::from_secs(5);
+            // Use a shorter timeout (1s) instead of the full idle timeout.
+            let error_timeout = Duration::from_secs(1);
             self.idle_timer.cancel();
             self.idle_timer.set(now + error_timeout);
         }

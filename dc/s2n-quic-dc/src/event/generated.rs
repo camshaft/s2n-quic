@@ -1712,6 +1712,27 @@ pub mod api {
     }
     #[derive(Clone, Debug)]
     #[non_exhaustive]
+    #[doc = " Indicates that the stream was abandoned by the application (e.g. via stop_sending)"]
+    #[doc = " rather than experiencing a transport-level error."]
+    pub struct StreamAbandoned {
+        pub error: crate::stream::Error,
+        #[doc = " The location where the abandonment originated"]
+        pub source: s2n_quic_core::endpoint::Location,
+    }
+    #[cfg(any(test, feature = "testing"))]
+    impl crate::event::snapshot::Fmt for StreamAbandoned {
+        fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
+            let mut fmt = fmt.debug_struct("StreamAbandoned");
+            fmt.field("error", &self.error);
+            fmt.field("source", &self.source);
+            fmt.finish()
+        }
+    }
+    impl Event for StreamAbandoned {
+        const NAME: &'static str = "stream:abandoned";
+    }
+    #[derive(Clone, Debug)]
+    #[non_exhaustive]
     pub struct ConnectionClosed {}
     #[cfg(any(test, feature = "testing"))]
     impl crate::event::snapshot::Fmt for ConnectionClosed {
@@ -3624,6 +3645,17 @@ pub mod tracing {
             let id = context.id();
             let api::StreamSenderErrored { error, source } = event;
             tracing :: event ! (target : "stream_sender_errored" , parent : id , tracing :: Level :: DEBUG , { error = tracing :: field :: debug (error) , source = tracing :: field :: debug (source) });
+        }
+        #[inline]
+        fn on_stream_abandoned(
+            &self,
+            context: &Self::ConnectionContext,
+            _meta: &api::ConnectionMeta,
+            event: &api::StreamAbandoned,
+        ) {
+            let id = context.id();
+            let api::StreamAbandoned { error, source } = event;
+            tracing :: event ! (target : "stream_abandoned" , parent : id , tracing :: Level :: DEBUG , { error = tracing :: field :: debug (error) , source = tracing :: field :: debug (source) });
         }
         #[inline]
         fn on_connection_closed(
@@ -5811,6 +5843,24 @@ pub mod builder {
         }
     }
     #[derive(Clone, Debug)]
+    #[doc = " Indicates that the stream was abandoned by the application (e.g. via stop_sending)"]
+    #[doc = " rather than experiencing a transport-level error."]
+    pub struct StreamAbandoned {
+        pub error: crate::stream::Error,
+        #[doc = " The location where the abandonment originated"]
+        pub source: s2n_quic_core::endpoint::Location,
+    }
+    impl IntoEvent<api::StreamAbandoned> for StreamAbandoned {
+        #[inline]
+        fn into_event(self) -> api::StreamAbandoned {
+            let StreamAbandoned { error, source } = self;
+            api::StreamAbandoned {
+                error: error.into_event(),
+                source: source.into_event(),
+            }
+        }
+    }
+    #[derive(Clone, Debug)]
     pub struct ConnectionClosed {}
     impl IntoEvent<api::ConnectionClosed> for ConnectionClosed {
         #[inline]
@@ -7526,6 +7576,18 @@ mod traits {
             let _ = meta;
             let _ = event;
         }
+        #[doc = "Called when the `StreamAbandoned` event is triggered"]
+        #[inline]
+        fn on_stream_abandoned(
+            &self,
+            context: &Self::ConnectionContext,
+            meta: &api::ConnectionMeta,
+            event: &api::StreamAbandoned,
+        ) {
+            let _ = context;
+            let _ = meta;
+            let _ = event;
+        }
         #[doc = "Called when the `ConnectionClosed` event is triggered"]
         #[inline]
         fn on_connection_closed(
@@ -8524,6 +8586,15 @@ mod traits {
             self.as_ref().on_stream_sender_errored(context, meta, event);
         }
         #[inline]
+        fn on_stream_abandoned(
+            &self,
+            context: &Self::ConnectionContext,
+            meta: &api::ConnectionMeta,
+            event: &api::StreamAbandoned,
+        ) {
+            self.as_ref().on_stream_abandoned(context, meta, event);
+        }
+        #[inline]
         fn on_connection_closed(
             &self,
             context: &Self::ConnectionContext,
@@ -9482,6 +9553,16 @@ mod traits {
         ) {
             (self.0).on_stream_sender_errored(&context.0, meta, event);
             (self.1).on_stream_sender_errored(&context.1, meta, event);
+        }
+        #[inline]
+        fn on_stream_abandoned(
+            &self,
+            context: &Self::ConnectionContext,
+            meta: &api::ConnectionMeta,
+            event: &api::StreamAbandoned,
+        ) {
+            (self.0).on_stream_abandoned(&context.0, meta, event);
+            (self.1).on_stream_abandoned(&context.1, meta, event);
         }
         #[inline]
         fn on_connection_closed(
@@ -10708,6 +10789,8 @@ mod traits {
         fn on_stream_receiver_errored(&self, event: builder::StreamReceiverErrored);
         #[doc = "Publishes a `StreamSenderErrored` event to the publisher's subscriber"]
         fn on_stream_sender_errored(&self, event: builder::StreamSenderErrored);
+        #[doc = "Publishes a `StreamAbandoned` event to the publisher's subscriber"]
+        fn on_stream_abandoned(&self, event: builder::StreamAbandoned);
         #[doc = "Publishes a `ConnectionClosed` event to the publisher's subscriber"]
         fn on_connection_closed(&self, event: builder::ConnectionClosed);
         #[doc = r" Returns the QUIC version negotiated for the current connection, if any"]
@@ -11057,6 +11140,15 @@ mod traits {
             let event = event.into_event();
             self.subscriber
                 .on_stream_sender_errored(self.context, &self.meta, &event);
+            self.subscriber
+                .on_connection_event(self.context, &self.meta, &event);
+            self.subscriber.on_event(&self.meta, &event);
+        }
+        #[inline]
+        fn on_stream_abandoned(&self, event: builder::StreamAbandoned) {
+            let event = event.into_event();
+            self.subscriber
+                .on_stream_abandoned(self.context, &self.meta, &event);
             self.subscriber
                 .on_connection_event(self.context, &self.meta, &event);
             self.subscriber.on_event(&self.meta, &event);
@@ -12131,6 +12223,7 @@ pub mod testing {
         pub stream_control_packet_received: AtomicU64,
         pub stream_receiver_errored: AtomicU64,
         pub stream_sender_errored: AtomicU64,
+        pub stream_abandoned: AtomicU64,
         pub connection_closed: AtomicU64,
         pub endpoint_initialized: AtomicU64,
         pub dc_connection_timeout: AtomicU64,
@@ -12265,6 +12358,7 @@ pub mod testing {
                 stream_control_packet_received: AtomicU64::new(0),
                 stream_receiver_errored: AtomicU64::new(0),
                 stream_sender_errored: AtomicU64::new(0),
+                stream_abandoned: AtomicU64::new(0),
                 connection_closed: AtomicU64::new(0),
                 endpoint_initialized: AtomicU64::new(0),
                 dc_connection_timeout: AtomicU64::new(0),
@@ -13107,6 +13201,20 @@ pub mod testing {
                 self.output.lock().unwrap().push(out);
             }
         }
+        fn on_stream_abandoned(
+            &self,
+            _context: &Self::ConnectionContext,
+            meta: &api::ConnectionMeta,
+            event: &api::StreamAbandoned,
+        ) {
+            self.stream_abandoned.fetch_add(1, Ordering::Relaxed);
+            if self.location.is_some() {
+                let meta = crate::event::snapshot::Fmt::to_snapshot(meta);
+                let event = crate::event::snapshot::Fmt::to_snapshot(event);
+                let out = format!("{meta:?} {event:?}");
+                self.output.lock().unwrap().push(out);
+            }
+        }
         fn on_connection_closed(
             &self,
             _context: &Self::ConnectionContext,
@@ -13682,6 +13790,7 @@ pub mod testing {
         pub stream_control_packet_received: AtomicU64,
         pub stream_receiver_errored: AtomicU64,
         pub stream_sender_errored: AtomicU64,
+        pub stream_abandoned: AtomicU64,
         pub connection_closed: AtomicU64,
         pub endpoint_initialized: AtomicU64,
         pub dc_connection_timeout: AtomicU64,
@@ -13806,6 +13915,7 @@ pub mod testing {
                 stream_control_packet_received: AtomicU64::new(0),
                 stream_receiver_errored: AtomicU64::new(0),
                 stream_sender_errored: AtomicU64::new(0),
+                stream_abandoned: AtomicU64::new(0),
                 connection_closed: AtomicU64::new(0),
                 endpoint_initialized: AtomicU64::new(0),
                 dc_connection_timeout: AtomicU64::new(0),
@@ -14765,6 +14875,15 @@ pub mod testing {
         }
         fn on_stream_sender_errored(&self, event: builder::StreamSenderErrored) {
             self.stream_sender_errored.fetch_add(1, Ordering::Relaxed);
+            let event = event.into_event();
+            if self.location.is_some() {
+                let event = crate::event::snapshot::Fmt::to_snapshot(&event);
+                let out = format!("{event:?}");
+                self.output.lock().unwrap().push(out);
+            }
+        }
+        fn on_stream_abandoned(&self, event: builder::StreamAbandoned) {
+            self.stream_abandoned.fetch_add(1, Ordering::Relaxed);
             let event = event.into_event();
             if self.location.is_some() {
                 let event = crate::event::snapshot::Fmt::to_snapshot(&event);
