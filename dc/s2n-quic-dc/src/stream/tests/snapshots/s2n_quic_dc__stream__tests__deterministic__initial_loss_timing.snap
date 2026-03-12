@@ -1,0 +1,6 @@
+---
+source: dc/s2n-quic-dc/src/stream/tests/deterministic.rs
+assertion_line: 651
+expression: "format!(\"{elapsed:?}\")"
+---
+2.665076s
