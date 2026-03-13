@@ -1,163 +1,142 @@
 # s2n-quic-dc Architecture
 
-`s2n-quic-dc` is a datagram-based transport for data center networks. It reuses the QUIC
-handshake to derive strongly authenticated, long-lived shared secrets between peers, then uses
-those secrets to protect individual short-lived streams without requiring any per-stream
+`s2n-quic-dc` is a transport for data center networks. It reuses the QUIC handshake to
+derive strongly authenticated, long-lived shared secrets between peers, then uses those
+secrets to protect individual short-lived streams without requiring any per-stream
 cryptographic negotiation or centralized state.
-
-## Crate Layout
-
-```
-src/
-  credentials.rs        -- Credential ID and key-ID types
-  crypto/               -- Encrypt/decrypt traits and AWS-LC implementation
-  packet/               -- Wire formats (stream, control, secret_control)
-  path/
-    secret/             -- Shared-secret scheduling, sender/receiver state, secret map
-  psk/                  -- QUIC PSK handshake wrappers (client / server)
-  stream/
-    application.rs      -- Public Builder/Stream/Reader/Writer types
-    endpoint.rs         -- open_stream() entry point
-    server/             -- Accept-side plumbing (handshake map, acceptor, manager)
-    send/               -- Outbound state machine, queue, and worker
-    recv/               -- Inbound dispatch, buffer, state machine, and worker
-    shared/             -- State shared between the send and receive halves
-  sync/                 -- Lock-free primitives (ring_deque, mpsc, mpmc)
-  task/                 -- Waker helpers
-  event/                -- Telemetry subscriber traits
-  socket/               -- UDP socket abstraction and descriptor pool
-  control.rs            -- Control-channel setup
-```
 
 ---
 
 ## 1. Handshake and Credential Establishment
 
-### The core idea
+The handshake runs once per peer pair using a standard TLS 1.3 QUIC connection. Both
+sides export a shared secret from the TLS session using the TLS Exporter (RFC 5705,
+label `"EXPERIMENTAL EXPORTER s2n-quic-dc"`), then store that secret in a local map.
+Every stream opened to that peer thereafter derives its encryption material directly from
+the cached secret — no additional handshake is required.
 
-The handshake runs **once per peer pair** using a standard TLS 1.3 QUIC connection. Both
-sides export a shared secret from the TLS session using the TLS Exporter (RFC 5705), then
-store that secret in a local map. Every stream opened to that peer thereafter derives its
-encryption material directly from the cached secret — no additional handshake is required.
-
-### What gets exported
-
-After the QUIC handshake completes, `HandshakingPath` (see
-[`path/secret/map/handshake.rs`](src/path/secret/map/handshake.rs)) calls
-`s2n_quic::provider::dc::Path::on_dc_handshake_complete`, which uses `TLS_EXPORTER_LABEL =
-"EXPERIMENTAL EXPORTER s2n-quic-dc"` to derive a shared `schedule::Secret`.
-
-This secret, together with a `credentials::Id` (a 16-byte random identifier), forms a
-`path/secret/map/entry::Entry` that is stored in the `path::secret::Map`
-([`path/secret/map.rs`](src/path/secret/map.rs)).
+`HandshakingPath` ([`path/secret/map/handshake.rs`](src/path/secret/map/handshake.rs))
+implements the `dc::Path` trait from `s2n_quic_core`. After the QUIC handshake completes,
+it exports the shared `schedule::Secret` and stores it in a `path/secret/map/entry::Entry`
+inside the `path::secret::Map` ([`path/secret/map.rs`](src/path/secret/map.rs)).
 
 ### Per-stream key derivation
 
 Every stream packet carries a `Credentials` value
-([`credentials.rs`](src/credentials.rs)) consisting of:
+([`credentials.rs`](src/credentials.rs)) consisting of a 16-byte `Id` that identifies the
+shared map entry and a monotonically incrementing `KeyId`. The actual AEAD key for a given
+`KeyId` is derived on the fly from the base `schedule::Secret`
+([`path/secret/schedule.rs`](src/path/secret/schedule.rs)) — no keys are pre-generated and
+none are stored beyond the base secret.
 
-- `Id` — 16-byte identifier for the shared entry in the map
-- `KeyId` — a monotonically incrementing varint
+The sender claims the next `KeyId` by atomically incrementing a single counter in
+`path/secret/sender::State` ([`path/secret/sender.rs`](src/path/secret/sender.rs)). No
+locks are taken when opening a new stream; there is nothing to coordinate with other
+streams to the same peer. This is the primary reason that the scheme scales: a single
+`AtomicU64` does all the work that a per-stream key negotiation would otherwise require.
 
-The sender side (`path/secret/sender::State`,
-[`path/secret/sender.rs`](src/path/secret/sender.rs)) atomically claims the next `KeyId`
-and hands it to the stream. The crypto layer derives the actual AEAD key for that `KeyId`
-on the fly from the base `schedule::Secret`
-([`path/secret/schedule.rs`](src/path/secret/schedule.rs)).
+The receiver maintains a sliding bitmap window (65,535 bits) in
+`path/secret/receiver::State` ([`path/secret/receiver.rs`](src/path/secret/receiver.rs))
+to detect replayed `KeyId` values. The window is protected by a narrow `Mutex` only during
+bit-level updates; reading the maximum-seen key ID is purely atomic.
 
-The receiver side (`path/secret/receiver::State`,
-[`path/secret/receiver.rs`](src/path/secret/receiver.rs)) tracks the maximum `KeyId` seen
-and maintains a sliding bitmap window (65,535 bits) to detect replayed packets.
-
-### Why this avoids excess state and synchronization
-
-- **One entry per peer**, not per stream. Streams are ephemeral; the map entry lives as long
-  as the peer relationship does, bounded by a configurable capacity.
-- **Atomic key-ID claiming**. The sender increments a single `AtomicU64`; no locks are
-  needed to allocate a key for a new stream.
-- **Lazy key derivation**. AEAD keys are derived from the base secret and the `KeyId` only
-  when a packet is actually being sealed or opened; no keys are pre-generated.
-- **Lock-free replay detection**. The bitmap window is guarded by a narrow `Mutex` only for
-  bit-level updates; reads of `max_seen_key_id` are atomic.
-- **Periodic re-handshake**. The cleaner task
-  ([`path/secret/map/cleaner.rs`](src/path/secret/map/cleaner.rs)) evicts old entries and
-  triggers re-handshakes to rotate the base secret.
+Because the map entry is shared by every stream to the same peer, the scheme has one fixed
+cost per peer relationship rather than one per stream. The entry's lifetime is managed by a
+periodic cleaner task ([`path/secret/map/cleaner.rs`](src/path/secret/map/cleaner.rs)) that
+evicts stale entries and triggers re-handshakes to rotate the base secret when necessary.
 
 ### Out-of-band credential signals
 
-If a receiver encounters a packet it cannot decode — because the credential ID is unknown,
-the key is stale, or a replay is detected — it sends a small authenticated
-`packet::secret_control` datagram
-([`packet/secret_control.rs`](src/packet/secret_control.rs)) back to the sender. These
-signals (`UnknownPathSecret`, `StaleKey`, `ReplayDetected`, `FlowReset`) allow the two
-sides to resynchronize without a full re-handshake in most cases.
+When a receiver cannot authenticate a packet — because the credential ID is unknown,
+the `KeyId` is outside the current replay window, or a replay is positively detected — it
+sends a small, authenticated `packet::secret_control` datagram back to the sender
+([`packet/secret_control.rs`](src/packet/secret_control.rs)).
+
+There are four signal types:
+
+- `UnknownPathSecret` — the receiver does not recognise the credential ID; the sender
+  should trigger a fresh handshake before retrying.
+- `StaleKey` — the `KeyId` is so far behind the receiver's window that it cannot determine
+  whether the packet was replayed; the sender should move to a newer key.
+- `ReplayDetected` — the receiver has definitively seen this `KeyId` before; the packet is
+  dropped and the sender is notified so it can take corrective action.
+- `FlowReset` — used to reset the state of a stream when one side detects an inconsistency
+  or hard error. Carries a `queue_id` so it can be routed to the right stream.
+
+These signals allow the two sides to resynchronize quickly without a full re-handshake in
+most cases.
 
 ---
 
 ## 2. Stream Lifecycle
 
-### Overview
-
-A stream is a single bidirectional, reliable, ordered byte channel. Each stream is
-associated with one `Credentials` value (and hence one peer entry) and runs on a UDP socket.
-The word *stream* here refers to the application-level abstraction; the underlying transport
-uses unreliable UDP datagrams plus a reliability layer inside `s2n-quic-dc`.
+A stream is a bidirectional, reliable, ordered byte channel. Each stream is associated with
+one `Credentials` value (and hence one peer map entry). The underlying transport can be UDP
+or TCP: the socket abstraction ([`stream/socket.rs`](src/stream/socket.rs)) reports its
+capabilities via `TransportFeatures`, and the implementation fills in whatever reliability
+and ordering guarantees the application layer requires that the socket does not already
+provide. On UDP that means the dc layer handles ACKs, retransmission, and flow control. On
+TCP those are provided by the kernel and the dc layer skips them.
 
 ### Queue-ID observation protocol
 
-Before either side can deliver data reliably, each needs to know which queue slot the other
-has allocated for inbound packets. This is tracked by a small state machine in
-[`stream/shared/handshake.rs`](src/stream/shared/handshake.rs):
+Every stream endpoint has a local *queue ID* that it publishes in the `source_queue_id`
+field of outgoing packets. The peer uses this value to direct future packets to the right
+per-stream receive queue. Before each side has observed the other's queue ID, packets
+include this field so the peer can learn it. The state machine that tracks this exchange
+lives in [`stream/shared/handshake.rs`](src/stream/shared/handshake.rs):
 
 | State | Meaning |
 |---|---|
 | `ClientInit` | Client has chosen its own `queue_id`; server's is not yet known |
 | `ClientQueueIdObserved` | Client has seen at least one packet from the server and learned its `queue_id` |
 | `ServerInit` | Server has seen the client's first packet and chosen its own `queue_id` |
-| `ServerQueueIdObserved` | Server has seen evidence the client received its `queue_id` |
-| `Finished` | Both sides have confirmed each other's `queue_id`; steady state |
+| `ServerQueueIdObserved` | Server has received evidence that the client has seen its `queue_id` |
+| `Finished` | Both sides are fully aware of each other's `queue_id`; steady state |
 
-Early packets include a `source_queue_id` field so the peer can update its routing table.
-Once both sides have observed the other's queue ID the field is omitted to save space.
+The `source_queue_id` field is always included in packets — even in the `Finished` state —
+because omitting it breaks the `FlowReset` flow that needs the field for routing.
 
 ### Client: opening a stream
 
-1. **Credential lookup** — `endpoint::open_stream`
-   ([`stream/endpoint.rs`](src/stream/endpoint.rs)) looks up the peer in the
-   `path::secret::Map`. If no entry exists, a new QUIC handshake is triggered first.
-2. **Rate limiting** — `entry.next_connection_time()` enforces a per-peer connection rate
-   limit using a single atomic compare-and-swap; no global lock is taken.
-3. **Builder construction** — A `stream::application::Builder`
-   ([`stream/application.rs`](src/stream/application.rs)) is assembled. It holds:
-   - a `send::application::Builder` (outbound half)
-   - a `recv::application::Builder` (inbound half)
-   - an `ArcShared` containing credentials, clocks, sockets, and wakers
-4. **Worker spawning** — Calling `Builder::build()` spawns a send worker and a receive
-   worker as async tasks on the environment's runtime
-   ([`stream/environment.rs`](src/stream/environment.rs)).
-5. **Stream returned** — A `Stream` is returned to the caller, providing an async `Reader`
-   and `Writer`.
+Opening a stream begins in `endpoint::open_stream`
+([`stream/endpoint.rs`](src/stream/endpoint.rs)), which looks up the peer in the
+`path::secret::Map`. If no entry exists, a QUIC handshake is triggered first and the caller
+waits for it to complete. Once credentials are available, a per-peer rate limit is enforced
+with a single atomic compare-and-swap on `entry.next_connection_time()`; no global lock is
+taken.
 
-The first outgoing packet uses `queue_id = 0` as a sentinel, telling the server to assign
-a real queue ID. Subsequent packets use the queue ID learned from the server's first reply.
+The function then assembles a `stream::application::Builder`
+([`stream/application.rs`](src/stream/application.rs)) that pairs a send-side and
+receive-side builder with an `ArcShared` value containing the credentials, clock, sockets,
+and wakers that the two halves share. Calling `Builder::build()` spawns a send worker and a
+receive worker as async tasks on the environment's runtime
+([`stream/environment.rs`](src/stream/environment.rs)) and returns a `Stream` to the
+caller.
+
+The client's first outgoing packet uses `queue_id = 0` in the destination field, which
+tells the server-side acceptor that this is a new stream. The protocol allows several
+packets to be sent before the client observes the server's chosen `queue_id`; until then
+the client continues using `0` as the destination while advertising its own `queue_id` in
+the `source_queue_id` field.
 
 ### Server: accepting a stream
 
-1. **Socket receive loop** — A per-socket task reads UDP datagrams continuously.
-2. **Decrypt and route** — The recv dispatch layer
-   ([`stream/recv/dispatch.rs`](src/stream/recv/dispatch.rs)) decrypts each packet using
-   the credential from the packet header and routes it to the appropriate per-stream channel
-   by `queue_id`.
-3. **New stream detection** — If a packet arrives with `queue_id = 0` (the sentinel for a
-   new stream), the server handshake map
-   ([`stream/server/handshake.rs`](src/stream/server/handshake.rs)) allocates a fresh
-   dispatch channel and enqueues the stream into the acceptor.
-4. **Acceptor** — The `stream::server::accept::Acceptor`
-   ([`stream/server/accept.rs`](src/stream/server/accept.rs)) dequeues streams and applies
-   back-pressure (maximum sojourn time, queue capacity). Stale or errored streams are pruned
-   before being handed to the application.
-5. **Application `accept()`** — The application calls `server.accept()` to receive a
-   `Stream` (same `Reader`/`Writer` type as the client side).
+The server runs a receive loop on a shared acceptor socket. On UDP, the acceptor
+([`stream/server/udp.rs`](src/stream/server/udp.rs)) reads raw packets and first checks
+whether the credentials in the packet header are already associated with an active stream. If
+so, the packet is forwarded directly to that stream's receive queue by queue ID. If the
+credentials are new, the acceptor allocates a fresh pair of dispatch channels
+([`stream/recv/dispatch.rs`](src/stream/recv/dispatch.rs)), injects the packet, and calls
+`endpoint::open_stream` to open the server side of the stream. On TCP, incoming connections
+are accepted at the TLS/QUIC level and each connection corresponds to one stream.
+
+In both cases the resulting `stream::application::Builder` is enqueued in the accept queue.
+The `stream::server::accept::Acceptor`
+([`stream/server/accept.rs`](src/stream/server/accept.rs)) dequeues builders, applies
+back-pressure via a configurable maximum sojourn time and queue capacity, and prunes stale
+or already-errored streams before the application calls `server.accept()` and receives the
+same `Stream` type used by the client.
 
 ---
 
@@ -165,117 +144,110 @@ a real queue ID. Subsequent packets use the queue ID learned from the server's f
 
 ### Send path (application → network)
 
-```
-Application
-  │  writes bytes into Writer (async)
-  ▼
-send::application::State          (stream/send/application/)
-  │  segments data, applies flow-control window,
-  │  stores in a lock-free send queue
-  ▼
-send::worker::Worker              (stream/send/worker.rs)
-  │  polls the queue, builds packet headers, calls crypto seal
-  │  (path/secret/schedule → crypto/awslc)
-  │  hands sealed packets to the socket
-  ▼
-socket::Socket                    (stream/socket.rs)
-  │  writes UDP datagrams; uses GSO/sendmmsg where available
-  ▼
-Network
-```
+The application calls `Writer::write` (or the `AsyncWrite` adapter), which calls into
+`send::application::Writer` ([`stream/send/application.rs`](src/stream/send/application.rs)).
+The writer first acquires flow credits by polling `send::flow`
+([`stream/send/flow.rs`](src/stream/send/flow.rs)), which gates transmission on the
+receiver's advertised window. When credits are granted, the writer seals each packet
+in-place using the AEAD key derived for the current `KeyId`, then pushes the sealed
+descriptor into a per-stream `Queue` ([`stream/send/queue.rs`](src/stream/send/queue.rs)).
 
-**Key contracts:**
-
-- The `Writer` interacts with `send::application::State` through a shared, lock-free queue
-  ([`stream/send/queue.rs`](src/stream/send/queue.rs)) and an `AtomicWaker` so that the
-  writer future and the send worker wake each other without a mutex.
-- The send worker tracks outstanding packet numbers and handles retransmissions via the
-  transmission state machine ([`stream/send/state.rs`](src/stream/send/state.rs)).
-- Flow control credits are managed in `send::flow`
-  ([`stream/send/flow.rs`](src/stream/send/flow.rs)); the worker only transmits while
-  credits are available and parks itself otherwise.
-- Keep-alive PINGs are generated by the send worker when the stream is idle and the
-  `keep_alive` option is enabled ([`stream/send/state/keep_alive.rs`](src/stream/send/state/keep_alive.rs)).
+The `Queue` is backed by a hierarchical timing wheel
+([`stream/send/state/transmission.rs`](src/stream/send/state/transmission.rs)) that
+schedules each segment for transmission at a specific time, enabling pacing. A socket worker
+drains the wheel and writes the segments to the network via the `socket::Socket` abstraction
+([`stream/socket.rs`](src/stream/socket.rs)), which uses GSO/sendmmsg on Linux when
+available. After each segment is physically sent, the wheel posts a completion entry back
+through a lock-free completion queue. The send worker
+([`stream/send/worker.rs`](src/stream/send/worker.rs)) drains this completion queue via
+`State::load_completion_queue`, recording the actual transmission time for RTT estimation
+and tracking which packets need to be acknowledged or retransmitted. Keep-alive PING frames
+are generated by the send worker when the stream is idle and the `keep_alive` option is
+enabled ([`stream/send/state/keep_alive.rs`](src/stream/send/state/keep_alive.rs)).
 
 ### Receive path (network → application)
 
-```
-Network
-  │  UDP datagrams arrive at socket
-  ▼
-recv::dispatch::Dispatch          (stream/recv/dispatch.rs)
-  │  authenticates + decrypts each packet
-  │  (path/secret/receiver — replay check, then crypto open)
-  │  routes to the per-stream channel by queue_id
-  ▼
-recv::worker::Worker              (stream/recv/worker.rs)
-  │  reassembles out-of-order packets via recv::buffer::Buffer
-  │  (stream/recv/buffer.rs)
-  │  delivers in-order data to the application
-  │  tracks receive state machine (stream/recv/state.rs)
-  │  sends ACK control packets back to the sender
-  ▼
-recv::application::Reader         (stream/recv/application.rs)
-  │  application reads bytes (async)
-  ▼
-Application
-```
+On the receive side the design distinguishes between the *happy path*, where the application
+is reading fast enough to keep up with the socket, and the *fallback path*, where the
+receive worker takes over.
 
-**Key contracts:**
+In the happy path the application task calls `Reader::read`
+([`stream/recv/application.rs`](src/stream/recv/application.rs)). This reads raw bytes
+directly from the socket into a receive buffer, then drives the packet parser and AEAD
+opener inline via `PacketDispatch::on_packet` in
+[`stream/recv/shared.rs`](src/stream/recv/shared.rs). Decrypted, validated packet payloads
+are fed into the reassembly buffer and delivered to the caller in stream order. Because the
+application does the work directly, no inter-thread handoff is needed in steady state.
 
-- The `Dispatch` and each stream's receive worker communicate via a bounded channel from the
-  lock-free `sync::mpsc` ([`sync/mpsc.rs`](src/sync/mpsc.rs)) / `sync::ring_deque`
-  ([`sync/ring_deque.rs`](src/sync/ring_deque.rs)) family. Back-pressure is inherent: if
-  the per-stream channel is full, new packets for that stream are dropped and the sender's
-  congestion control reacts.
-- The receive worker sends ACK packets through the same `socket::Socket` abstraction used
-  by the send worker; ACKs are plain `packet::control` datagrams
-  ([`packet/control.rs`](src/packet/control.rs)) authenticated with HMAC.
-- The receive state machine ([`stream/recv/state.rs`](src/stream/recv/state.rs)) drives an
-  idle timer; ACKs are only generated when that timer fires or new data arrives, preventing
-  ACK storms.
+When the application is not reading quickly enough, the receive worker
+([`stream/recv/worker.rs`](src/stream/recv/worker.rs)) detects the lag by observing whether
+the application's read epoch is advancing. If not, the worker acquires the shared receiver
+lock and drains the socket on behalf of the application, decrypting and reassembling packets
+so they are ready when the application eventually calls `read`. The worker is also solely
+responsible for sending ACK control packets back to the sender, regardless of which path
+processed the data.
+
+The endpoint-level dispatch ([`stream/recv/dispatch.rs`](src/stream/recv/dispatch.rs)) is a
+shared component that sits upstream of all per-stream receive queues. It is intentionally
+kept as thin as possible: it reads tag bytes and queue IDs from the raw datagram, looks up
+the per-stream channel, and forwards the encrypted buffer without touching the payload. Any
+decryption or authentication happens later, either in the application thread or in the per-
+stream worker. If no channel is registered for a given queue ID the packet is forwarded to
+an unroutable queue for handling by the acceptor or the secret-control layer.
 
 ### Control packets
 
-Two categories of out-of-band packets exist alongside stream data:
+Two categories of small, authenticated packets travel alongside stream data:
 
-| Category | Packet types | Purpose |
-|---|---|---|
-| **Stream control** | `packet::control` | ACKs, flow-credit updates from receiver to sender |
-| **Secret control** | `packet::secret_control` | `UnknownPathSecret`, `StaleKey`, `ReplayDetected`, `FlowReset` — credential resynchronization signals |
+`packet::control` ([`packet/control.rs`](src/packet/control.rs)) carries ACKs and flow
+credit updates from the receiver to the sender. These are authenticated with HMAC, small
+enough to always fit in a single datagram, and sent by the receive worker after processing
+each epoch of data packets.
 
-Both categories are authenticated (HMAC or AEAD) and are small enough to fit in a single
-datagram. They travel on the same UDP socket as data packets and are demultiplexed by their
-tag byte before any per-stream routing.
+`packet::secret_control` ([`packet/secret_control.rs`](src/packet/secret_control.rs))
+carries the four credential-resynchronization signals described in section 1. These are
+authenticated with AEAD using the map entry's control key and are handled by
+`path::secret::Map` before any per-stream routing occurs.
+
+Both packet types share the same UDP socket as stream data and are demultiplexed by their
+leading tag byte.
 
 ---
 
 ## Component Interaction Summary
 
+```text
+┌────────────────────────────────────────────────────────────┐
+│                        Application                         │
+│   Writer (send/application.rs)    Reader (recv/application.rs)
+└──────────────┬──────────────────────────────┬─────────────┘
+               │ flow credits + sealed packets │ decrypted bytes
+               │                               │
+    ┌──────────▼──────────┐       ┌────────────▼────────────┐
+    │    send::Worker     │       │      recv::Worker        │
+    │  (send/worker.rs)   │       │   (recv/worker.rs)       │
+    │                     │       │                          │
+    │ drains completion   │       │ fallback: drains socket  │
+    │ queue; tracks ACKs  │       │ when app reads slowly;   │
+    │ and retransmission  │       │ always sends ACKs        │
+    └──────────┬──────────┘       └────────────▲────────────┘
+               │ sealed segments               │ encrypted descriptors
+               │                               │
+    ┌──────────▼───────────────────────────────┴────────────┐
+    │                   socket::Socket                       │
+    │            (stream/socket.rs — UDP or TCP)             │
+    │  send: timing wheel → socket worker → completion queue │
+    │  recv: dispatch (recv/dispatch.rs) routes by queue_id  │
+    └──────────┬────────────────────────────────────────────┘
+               │                               │
+            Network ──────────────────────► Network
 ```
-┌──────────────────────────────────────┐
-│            Application               │
-│  Writer ──────────────── Reader      │
-└──────┬───────────────────────┬───────┘
-       │                       │
-┌──────▼──────┐         ┌──────▼──────┐
-│ send worker │         │ recv worker │
-│  (per stream)│        │  (per stream)│
-└──────┬──────┘         └──────▲──────┘
-       │  packet::stream        │ packet::stream
-       │  (sealed)              │ (opened)
-┌──────▼────────────────────────┴──────┐
-│          socket::Socket              │
-│       (UDP, GSO, sendmmsg)           │
-└──────┬────────────────────────▲──────┘
-       │  datagrams             │ datagrams
-       │          Network       │
-       └────────────────────────┘
 
-Credential / key material flows through:
-  path::secret::Map  →  credentials::Credentials  →  packet headers
-  (one map entry per peer, shared by all streams to that peer)
+Credential and key material flow through:
+
+```text
+path::secret::Map  ──►  credentials::Credentials  ──►  every packet header
 ```
 
-The design keeps the data plane lock-free and the credential plane nearly so. Streams are
-created and destroyed rapidly; the per-peer map entry is the only long-lived state.
+One map entry exists per peer and is shared by every stream to that peer. Streams
+themselves are ephemeral; the map entry is the only long-lived per-peer state.
