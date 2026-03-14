@@ -42,7 +42,7 @@ fn secret_map() -> Map {
     let capacity = 50_000;
     let clock = Clock::default();
     let subscriber = s2n_quic_dc::event::tracing::Subscriber::default();
-    Map::new(signer, capacity, clock, subscriber)
+    Map::new(signer, capacity, false, clock, subscriber)
 }
 
 pub fn server_name() -> s2n_quic::server::Name {
@@ -130,7 +130,6 @@ impl Client {
                 secret_map(),
                 tls_client(),
                 s2n_quic::provider::event::tracing::Subscriber::default(),
-                |_, _| {},
                 server_name(),
             )
             .map_err(|e| anyhow::anyhow!("Failed to start PSK client: {}", e))?;
