@@ -49,6 +49,7 @@ mod fin;
 mod keep_alive;
 mod max_data;
 mod probe;
+mod progress;
 mod reset;
 pub mod retransmission;
 pub mod transmission;
@@ -149,6 +150,11 @@ pub struct State {
     fin: fin::Fin,
     keep_alive: keep_alive::KeepAlive,
     retransmissions: BinaryHeap<retransmission::Segment>,
+    /// Tracks the minimum unacked offset to detect lack of forward progress.
+    /// If this value doesn't advance within `idle_timeout`, the stream is
+    /// considered stuck and will be terminated. This acts as a safety net
+    /// against retransmission amplification loops.
+    progress: progress::Progress,
     #[cfg(debug_assertions)]
     pending_retransmissions: IntervalSet<VarInt>,
 }
@@ -202,6 +208,7 @@ impl State {
             fin: Default::default(),
             retransmissions: Default::default(),
             keep_alive: Default::default(),
+            progress: Default::default(),
             #[cfg(debug_assertions)]
             pending_retransmissions: Default::default(),
         }
@@ -260,11 +267,9 @@ impl State {
     }
 
     fn local_offset(&self) -> VarInt {
-        self.unacked_ranges
-            .min_value()
-            .map_or(VarInt::MAX, |unacked_start| {
-                unacked_start.saturating_add(self.local_max_data_window)
-            })
+        self.max_data
+            .max_sent_offset()
+            .saturating_add(self.local_max_data_window)
     }
 
     #[inline]
@@ -486,6 +491,10 @@ impl State {
             }
         }
 
+        // Notify the forward progress tracker when the minimum unacked offset advances
+        if let Some(min_unacked) = self.unacked_ranges.min_value() {
+            self.progress.on_progress(min_unacked);
+        }
         self.on_peer_activity(made_progress);
 
         Ok(None)
@@ -781,6 +790,17 @@ impl State {
         self.update_idle_timer(clock);
         self.update_pto_timer(clock);
 
+        // Update the forward progress watchdog timer
+        let has_inflight_payload =
+            self.counters.with_payload > 0 && !self.unacked_ranges.is_empty();
+        let is_flow_blocked = self.max_data.is_blocked();
+        self.progress.update(
+            clock,
+            self.idle_timeout,
+            has_inflight_payload,
+            is_flow_blocked,
+        );
+
         if self.has_inflight_packets() {
             debug_assert!(self.pto.is_armed());
         }
@@ -866,6 +886,11 @@ impl State {
 
         let _ = self.max_data.on_timeout(clock, self.idle_timeout);
         let _ = self.keep_alive.on_timeout(clock, self.idle_timeout);
+
+        // Check if the forward progress watchdog has expired
+        if self.progress.on_timeout(clock.get_time()) {
+            self.on_error(error::Kind::StreamStuck, Location::Local, clock, publisher);
+        }
     }
 
     #[inline]
@@ -957,6 +982,15 @@ impl State {
     fn reset_pto_timer(&mut self) {
         self.pto_backoff = INITIAL_PTO_BACKOFF;
         self.pto.cancel();
+        // Drain any pending PTO transmissions so we don't generate spurious
+        // retransmission probes after the backoff has been reset. Without this,
+        // a previously-fired PTO leaves `transmissions > 0` even after cancel(),
+        // causing `fill_transmit_queue_impl` to deep-copy in-flight packets as
+        // PTO probes — duplicating data that loss detection has already queued
+        // for retransmission and creating an amplification loop.
+        while self.pto.transmissions() > 0 {
+            self.pto.on_transmit_once();
+        }
     }
 
     /// Called by the worker thread when it becomes aware of the application having transmitted a
@@ -1633,14 +1667,7 @@ impl State {
             });
         }
 
-        self.retransmissions.clear();
-        self.sent_stream_packets.clear();
-        self.sent_recovery_packets.clear();
-        self.unacked_ranges.clear();
-        self.keep_alive.on_shutdown();
-
-        // Always cancel PTO since we won't be retransmitting
-        self.pto.cancel();
+        self.clear_inflight_state();
 
         if source.is_remote() {
             // Remote errors don't need any further transmission, cancel everything
@@ -1658,22 +1685,40 @@ impl State {
     fn on_success(&mut self) {
         debug_assert!(self.state().is_data_received());
 
-        self.retransmissions.clear();
-
-        // we could have some packets that are outstanding but as long as the unacked ranges are
-        // empty we're good
-        self.sent_stream_packets.clear();
-        self.sent_recovery_packets.clear();
-        self.keep_alive.on_shutdown();
-        self.pto.cancel();
-
-        // Drain any pending PTO transmissions so fill_transmit_queue won't try to send probes
-        while self.pto.transmissions() > 0 {
-            self.pto.on_transmit_once();
-        }
+        self.clear_inflight_state();
 
         // TODO why does this cause tests to fail if we uncomment this?
         // self.idle_timer.cancel();
+    }
+
+    /// Clears all in-flight packet state, retransmission queues, counters,
+    /// the PTO timer, and the progress watchdog.
+    ///
+    /// This is the shared cleanup between `on_error` and `on_success`. It
+    /// ensures that stale counters don't trick `has_inflight_packets` into
+    /// returning true, that leftover PTO transmissions don't cause
+    /// `fill_transmit_queue` to bump `recovery_packet_number` or generate
+    /// spurious probes, and that debug-only `pending_retransmissions` stay
+    /// in sync with the cleared packet maps.
+    fn clear_inflight_state(&mut self) {
+        self.retransmissions.clear();
+        self.sent_stream_packets.clear();
+        self.sent_recovery_packets.clear();
+        self.unacked_ranges.clear();
+        self.counters = Default::default();
+        self.keep_alive.on_shutdown();
+        self.progress.cancel();
+
+        #[cfg(debug_assertions)]
+        self.pending_retransmissions.clear();
+
+        // Cancel the PTO timer and drain any pending transmissions so
+        // fill_transmit_queue won't try to send probes or bump
+        // recovery_packet_number for a stream that is shutting down.
+        self.pto.cancel();
+        while self.pto.transmissions() > 0 {
+            self.pto.on_transmit_once();
+        }
     }
 
     #[cfg(debug_assertions)]
@@ -1736,6 +1781,7 @@ impl timer::Provider for State {
         self.max_data.timers(query)?;
         self.idle_timer.timers(query)?;
         self.keep_alive.timers(query)?;
+        self.progress.timers(query)?;
         Ok(())
     }
 }

@@ -148,6 +148,8 @@ pub enum Kind {
     PacketNumberExhaustion,
     #[error("retransmission not possible")]
     RetransmissionFailure,
+    #[error("the stream got stuck - THIS IS A BUG")]
+    StreamStuck,
     #[error("an invalid frame was received: {decoder}")]
     FrameError { decoder: s2n_codec::DecoderError },
     #[error("the stream experienced an unrecoverable error")]
@@ -291,6 +293,7 @@ impl Kind {
             // All other fatal errors get a generic error code
             Kind::PacketNumberExhaustion
             | Kind::RetransmissionFailure
+            | Kind::StreamStuck
             | Kind::FrameError { .. }
             | Kind::FatalError => Some(transport::Error::INTERNAL_ERROR.into()),
         }
@@ -336,6 +339,7 @@ impl From<Kind> for std::io::ErrorKind {
             Kind::PacketBufferTooSmall => ErrorKind::InvalidInput,
             Kind::PacketNumberExhaustion => ErrorKind::BrokenPipe,
             Kind::RetransmissionFailure => ErrorKind::BrokenPipe,
+            Kind::StreamStuck => ErrorKind::BrokenPipe,
             Kind::StreamFinished => ErrorKind::UnexpectedEof,
             Kind::FinalSizeChanged => ErrorKind::InvalidInput,
             Kind::IdleTimeout => ErrorKind::TimedOut,

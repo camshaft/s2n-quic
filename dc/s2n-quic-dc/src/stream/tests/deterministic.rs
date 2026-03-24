@@ -656,7 +656,7 @@ fn retransmission_loop_under_loss() {
         // This creates the conditions for the retransmission feedback loop.
         {
             let mut count = 0u64;
-            bach::net::monitor::on_packet_sent(move |packet| {
+            bach::net::monitor::on_packet_sent(move |_packet| {
                 count += 1;
                 // Drop every 3rd packet in both directions
                 if count % 3 == 0 {
