@@ -623,6 +623,106 @@ impl core::fmt::Display for PacketCounts {
     }
 }
 
+/// Reproduces a scenario where streams get stuck in a perpetual retransmission
+/// loop under sustained bidirectional packet loss.
+///
+/// The root cause: `make_stream_packets_as_pto_probes` only checked
+/// `sent_stream_packets` when generating PTO probes.  Once all original stream
+/// packets were ACKed — but some recovery packets carrying still-unacked data
+/// remained in flight — PTO could only produce empty, payload-less probes.  The
+/// recovery packets that got lost could not be re-retransmitted through the
+/// normal loss-detection path (because their descriptors hadn't arrived from the
+/// completion queue yet at the time of the loss event), and PTO couldn't help
+/// because it never looked at `sent_recovery_packets`.  This caused the sender
+/// to loop endlessly sending empty probes while the receiver waited for data
+/// that would never arrive.
+///
+/// The fix extends `make_stream_packets_as_pto_probes` to fall back to
+/// `sent_recovery_packets` when no stream packets are available, so PTO can
+/// produce data-carrying probes from in-flight recovery packets.
+#[test]
+fn retransmission_loop_under_loss() {
+    let end_time: Arc<Mutex<Option<Instant>>> = Arc::new(Mutex::new(None));
+    let end_time_inner = end_time.clone();
+
+    sim(|| {
+        // Apply sustained ~33% BIDIRECTIONAL packet loss.
+        // Unlike the DroppedPackets infrastructure which only drops server→client
+        // packets (ACKs), this drops packets in BOTH directions. This is critical
+        // because:
+        // - Client→server loss means the receiver gets gaps → triggers retransmissions
+        // - Server→client loss means ACKs get lost → sender can't confirm delivery
+        // - Recovery packets (retransmissions) ALSO get lost
+        // This creates the conditions for the retransmission feedback loop.
+        {
+            let mut count = 0u64;
+            bach::net::monitor::on_packet_sent(move |packet| {
+                count += 1;
+                // Drop every 3rd packet in both directions
+                if count % 3 == 0 {
+                    bach::net::monitor::Command::Drop
+                } else {
+                    bach::net::monitor::Command::Pass
+                }
+            });
+        }
+
+        {
+            let end_time = end_time_inner.clone();
+            async move {
+                let client = Client::builder().build();
+                let mut stream = client.connect_sim("server:443").await.unwrap();
+
+                let body = vec![42u8; 1 << 18]; // 256 KiB
+
+                let result = crate::testing::timeout(Duration::from_secs(300), async {
+                    stream.write_all(&body).await.unwrap();
+                    stream.shutdown().await.unwrap();
+
+                    let mut response = Vec::with_capacity(body.len());
+                    stream.read_to_end(&mut response).await.unwrap();
+                    assert_eq!(response, body);
+                })
+                .await;
+
+                *end_time.lock().unwrap() = Some(Instant::now());
+                result.expect(
+                    "transfer timed out under 33% bidirectional loss — \
+                     likely stuck in retransmission loop",
+                );
+            }
+            .group("client")
+            .primary()
+            .spawn();
+        }
+
+        async move {
+            let server = Server::udp().port(443).build();
+
+            while let Ok((mut stream, _addr)) = server.accept().await {
+                spawn(async move {
+                    let mut request = Vec::with_capacity(1 << 18);
+                    let _ = stream.read_to_end(&mut request).await;
+                    let _ = stream.write_all(&request).await;
+                });
+            }
+        }
+        .group("server")
+        .spawn();
+    });
+
+    let elapsed = end_time.lock().unwrap().unwrap().elapsed_since_start();
+
+    // With ~33% bidirectional loss and 256 KiB data, the transfer should still
+    // complete well within 30s. Without the fix, it times out.
+    let max_allowed = Duration::from_secs(15);
+    assert!(
+        elapsed <= max_allowed,
+        "transfer took too long with ~33% bidirectional loss: {elapsed:?} \
+         (max allowed: {max_allowed:?}); this suggests a retransmission feedback loop"
+    );
+}
+
 /// Asserts that during a bulk unidirectional transfer, the ratio of control packets
 /// (ACKs) to stream packets stays within a reasonable bound.
 ///

@@ -1142,10 +1142,10 @@ impl State {
     /// This ensures that we're not wasting resources by sending empty payloads, especially
     /// when there's outstanding data waiting to be ACK'd.
     fn make_stream_packets_as_pto_probes(&mut self) {
-        // check to see if we have in-flight stream segments
-        ensure!(!self.sent_stream_packets.is_empty());
         // only reliable streams store segments
         ensure!(self.is_reliable);
+        // check to see if we have in-flight segments in either packet space
+        ensure!(!self.sent_stream_packets.is_empty() || !self.sent_recovery_packets.is_empty());
 
         let pto = self.pto.transmissions() as usize;
 
@@ -1157,25 +1157,52 @@ impl State {
         // iterate until remaining is 0.
         //
         // This nested loop is a bit weird but it's intentional - if we have `remaining == 2`
-        // but only have a single in-flight stream segment then we want to transmit that segment
+        // but only have a single in-flight segment then we want to transmit that segment
         // `remaining` times.
+        //
+        // We try stream packets first, then fall back to recovery packets. This
+        // ensures that when all original stream packets have been ACKed but
+        // recovery packets carrying unacked data are still in flight, we can
+        // still produce PTO probes with actual payload rather than empty probes.
         while remaining > 0 {
+            let mut made_progress = false;
+
+            // First try stream packets
             for (num, packet) in self.sent_stream_packets.iter().take(remaining) {
                 let Some(retransmission) = packet.info.retransmit_copy() else {
-                    // unreliable streams don't store segments so bail early - this was checked above
-                    return;
+                    break;
                 };
 
-                // update our local packet number to be at least 1 more than the largest lost
-                // packet number
                 let min_recovery_packet_number = num.as_u64() + 1;
                 self.recovery_packet_number =
                     self.recovery_packet_number.max(min_recovery_packet_number);
 
                 self.retransmissions.push(retransmission);
-
-                // consider this as a PTO
                 remaining -= 1;
+                made_progress = true;
+            }
+
+            if remaining == 0 {
+                break;
+            }
+
+            // Then try recovery packets that have stored descriptors
+            for (num, packet) in self.sent_recovery_packets.iter().take(remaining) {
+                let Some(retransmission) = packet.info.retransmit_copy() else {
+                    continue;
+                };
+
+                let min_recovery_packet_number = num.as_u64() + 1;
+                self.recovery_packet_number =
+                    self.recovery_packet_number.max(min_recovery_packet_number);
+
+                self.retransmissions.push(retransmission);
+                remaining -= 1;
+                made_progress = true;
+            }
+
+            if !made_progress {
+                break;
             }
         }
     }
@@ -1365,6 +1392,7 @@ impl State {
                     stream_offset,
                     payload_len,
                     flags,
+                    // The descriptor gets stored later from the completion queue
                     descriptor: None,
                     time_sent,
                     ecn,
