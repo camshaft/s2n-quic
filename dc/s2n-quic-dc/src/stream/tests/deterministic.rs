@@ -324,7 +324,7 @@ impl DroppedPackets {
 
         sim(|| {
             {
-                tracing::info!(packets = ?self, loss = format!("{:.02}%", self.loss_percent()), "dropped packets");
+                tracing::info!(packets = ?self, loss = format!("{:.02}%", self.loss_percent()), "starting test");
                 let mut enabled = self.enabled_iter().enumerate();
                 bach::net::monitor::on_packet_sent(move |packet| {
                     if packet.source().port() == 443 {
@@ -358,17 +358,14 @@ impl DroppedPackets {
 
                     let body = vec![42u8; body_len];
 
-                    crate::testing::timeout(
-                        TRANSFER_TIMEOUT,
-                        async {
-                            stream.write_all(&body).await.unwrap();
-                            stream.shutdown().await.unwrap();
+                    crate::testing::timeout(TRANSFER_TIMEOUT, async {
+                        stream.write_all(&body).await.unwrap();
+                        stream.shutdown().await.unwrap();
 
-                            let mut response = Vec::with_capacity(body_len);
-                            stream.read_to_end(&mut response).await.unwrap();
-                            assert_eq!(response, body);
-                        },
-                    )
+                        let mut response = Vec::with_capacity(body_len);
+                        stream.read_to_end(&mut response).await.unwrap();
+                        assert_eq!(response, body);
+                    })
                     .await
                     .expect("transfer timed out");
 
@@ -517,7 +514,7 @@ fn lost_flow_increase() {
     bolero::check!()
         .with_type::<DroppedPackets>()
         .with_test_time(core::time::Duration::from_secs(30))
-        .with_shrink_time(core::time::Duration::from_secs(10))
+        .with_shrink_time(core::time::Duration::from_secs(0))
         .cloned()
         .for_each(|packets| {
             let _ = packets.sim(1 << 18);
@@ -549,6 +546,7 @@ fn transmission_rate_fuzz() {
             //   50% loss → ~8 s max
             //   100% loss → 30 s max (also enforced by the transfer timeout)
             let max_secs = 1.0_f64 + (loss / 100.0).powi(2) * 29.0;
+            let max_secs = max_secs.min(30.0);
             let max_allowed = Duration::from_secs_f64(max_secs);
             assert!(
                 elapsed <= max_allowed,
