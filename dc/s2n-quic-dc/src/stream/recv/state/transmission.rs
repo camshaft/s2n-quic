@@ -44,11 +44,20 @@ impl State {
     }
 }
 
-/// Rate limit period for ACKs after the stream has received all data.
+/// Initial backoff period for ACKs after the stream has received all data.
 ///
 /// Once we're past `Recv`/`SizeKnown`, the sender is mostly probing to confirm
-/// delivery. We throttle ACKs to avoid storms while still making progress.
-const THROTTLE_PERIOD: Duration = Duration::from_secs(1);
+/// delivery. We use exponential backoff starting small to give fast initial
+/// feedback (allowing the sender to close quickly) while preventing ACK storms
+/// when many duplicate packets arrive.
+const INITIAL_THROTTLE_PERIOD: Duration = Duration::from_micros(250);
+
+/// Maximum backoff period for draining-state ACKs.
+///
+/// Caps the exponential backoff so the sender always gets feedback within a
+/// bounded time. This must be shorter than the sender's idle timeout to prevent
+/// the sender from giving up.
+const MAX_THROTTLE_PERIOD: Duration = Duration::from_millis(500);
 
 /// Number of stream-space packets to accumulate before sending an ACK during
 /// active data reception. This amortizes ACK overhead across multiple data
@@ -79,6 +88,9 @@ pub struct Transmission {
     /// Timer for rate-limiting ACKs once the stream has received all data.
     /// When armed, we defer new-packet ACKs until it fires.
     throttle: Timer,
+    /// Current throttle backoff period for draining-state ACKs.
+    /// Doubles after each ACK transmission, capped at [`MAX_THROTTLE_PERIOD`].
+    throttle_period: Duration,
     /// Timer that caps how long we defer ACKs during active reception.
     max_ack_delay: Timer,
 }
@@ -157,20 +169,29 @@ impl Transmission {
 
     /// Called when a new packet is received after the stream has received all data.
     ///
-    /// The sender is likely probing to confirm delivery, so we rate-limit ACKs
-    /// to avoid storms. If no throttle timer is active, we queue immediately
-    /// and start the timer. Otherwise we defer until the timer fires.
+    /// Uses exponential backoff: the first packet triggers an immediate ACK,
+    /// subsequent packets are deferred with increasing delay. This gives the
+    /// sender fast initial feedback while avoiding ACK storms.
     #[inline]
     pub fn on_new_packet_draining<Clk: Clock + ?Sized>(&mut self, clock: &Clk) {
-        // Mark that we need to send a packet after the throttle timeout
+        // If the throttle timer is active, defer until it fires
         if self.throttle.is_armed() {
             let _ = self.state.on_packet_received_throttled();
             return;
         }
 
-        // record that we have pending data to ACK
+        // Queue an immediate ACK and arm the throttle with the current backoff
         ensure!(self.state.on_packet_received().is_ok());
-        self.throttle.set(clock.get_time() + THROTTLE_PERIOD);
+
+        let period = if self.throttle_period.is_zero() {
+            INITIAL_THROTTLE_PERIOD
+        } else {
+            self.throttle_period
+        };
+        self.throttle.set(clock.get_time() + period);
+
+        // Advance the backoff for next time, capped at the maximum
+        self.throttle_period = (period * 2).min(MAX_THROTTLE_PERIOD);
     }
 
     /// Called on timeout to check if the throttle timer or max-ack-delay timer

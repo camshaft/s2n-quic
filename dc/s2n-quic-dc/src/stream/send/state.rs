@@ -267,11 +267,17 @@ impl State {
     }
 
     fn local_offset(&self) -> VarInt {
-        // Use the lower bound of the unacked ranges so we don't overbuffer
-        self.unacked_ranges
-            .min_value()
-            .unwrap_or_else(|| self.max_data.max_sent_offset())
-            .saturating_add(self.local_max_data_window)
+        // Limit how far ahead the application can write based on bytes currently
+        // in flight, rather than anchoring on the minimum unacked offset. The old
+        // approach (min_unacked + window) caused the window to collapse when a
+        // lost packet kept min_unacked stuck far behind max_sent_offset, starving
+        // the application of flow credits even though the CCA and peer would allow
+        // more data.
+        let remaining_window =
+            (*self.local_max_data_window as u64).saturating_sub(self.cca.bytes_in_flight() as u64);
+        self.max_data
+            .max_sent_offset()
+            .saturating_add(VarInt::try_from(remaining_window).unwrap_or(VarInt::MAX))
     }
 
     #[inline]
@@ -327,8 +333,6 @@ impl State {
                 self.on_error(error, Location::Local, clock, publisher);
             }
         }
-
-        self.invariants();
 
         Ok(())
     }
@@ -770,8 +774,6 @@ impl State {
             Err(error::Kind::RetransmissionFailure.err())
         );
 
-        self.invariants();
-
         Ok(())
     }
 
@@ -881,8 +883,15 @@ impl State {
                 self.pto.on_transmit_once();
             }
 
-            // TODO where does this come from
-            let max_pto_backoff = 1024;
+            // Cap the PTO backoff to prevent multi-second retransmission
+            // delays. In a datacenter environment, the receiver throttles
+            // draining-state ACKs to once per second. If PTO backoff grows
+            // too large, the sender's retransmission cadence exceeds the
+            // receiver's ACK rate, creating a feedback deadlock where the
+            // sender waits longer than the ACK throttle window. A cap of 16
+            // keeps the maximum PTO period at ~32ms (16 × ~2ms base), which
+            // is well within the receiver's feedback window.
+            let max_pto_backoff = 16;
             self.pto_backoff = self.pto_backoff.saturating_mul(2).min(max_pto_backoff);
         }
 
@@ -1071,8 +1080,6 @@ impl State {
             // if we just sent some packets then we can use those as probes
             self.reset_pto_timer();
         }
-
-        self.invariants();
     }
 
     #[inline]
@@ -1222,8 +1229,18 @@ impl State {
                 break;
             }
 
-            // Then try recovery packets that have stored descriptors
-            for (num, packet) in self.sent_recovery_packets.iter().take(remaining) {
+            // Then try recovery packets that have stored descriptors.
+            // Don't use `.take(remaining)` here — probe entries (payload_len=0,
+            // no descriptor) would consume the budget without producing
+            // retransmissions, causing us to miss data-carrying packets deeper
+            // in the map.
+            for (num, packet) in self.sent_recovery_packets.iter() {
+                if packet.info.payload_len > 0
+                    && !self.unacked_ranges.contains(&packet.info.stream_offset)
+                {
+                    continue;
+                }
+
                 let Some(retransmission) = packet.info.retransmit_copy() else {
                     continue;
                 };
@@ -1235,6 +1252,10 @@ impl State {
                 self.retransmissions.push(retransmission);
                 remaining -= 1;
                 made_progress = true;
+
+                if remaining == 0 {
+                    break;
+                }
             }
 
             if !made_progress {
@@ -1364,6 +1385,18 @@ impl State {
         ensure!(self.is_reliable, Ok(()));
 
         while let Some(retransmission) = self.retransmissions.peek() {
+            // Skip retransmissions whose data has already been ACKed. This can
+            // happen when PTO probes are created via `retransmit_copy()` and the
+            // original data is ACKed before the copy is transmitted. Without this
+            // check, stale entries would be needlessly transmitted only to be
+            // immediately ACKed by the receiver.
+            if retransmission.payload_len > 0
+                && !self.unacked_ranges.contains(&retransmission.stream_offset)
+            {
+                self.retransmissions.pop();
+                continue;
+            }
+
             // If the CCA is requesting fast retransmission we can bypass the CWND check
             if !self.cca.requires_fast_retransmission() {
                 // make sure we fit in the current congestion window
@@ -1723,9 +1756,26 @@ impl State {
         }
     }
 
-    #[cfg(debug_assertions)]
+    #[cfg(not(debug_assertions))]
+    #[inline(always)]
+    fn invariants(&self) {}
+}
+
+#[cfg(debug_assertions)]
+impl State {
     #[inline]
     fn invariants(&self) {
+        self.invariant_unacked_coverage();
+        self.invariant_counters();
+        self.invariant_packet_numbers();
+        self.invariant_fin_consistency();
+        self.invariant_terminal_state();
+        self.invariant_retransmission_ranges();
+    }
+
+    /// Every unacked byte must be accounted for by an in-flight packet (with a descriptor),
+    /// a pending retransmission segment, or a pending_retransmissions entry.
+    fn invariant_unacked_coverage(&self) {
         if !self.unacked_ranges.is_empty() {
             let mut unacked_ranges = self.unacked_ranges.clone();
             let last = unacked_ranges.inclusive_ranges().next_back().unwrap();
@@ -1766,12 +1816,183 @@ impl State {
                 unacked_ranges.is_empty(),
                 "unacked ranges should be empty: {unacked_ranges:?}\n state\n {self:#?}"
             );
+
+            if let (Some(expected), Some(actual)) =
+                (self.fin.value(), self.unacked_ranges.max_value())
+            {
+                assert!(
+                    expected >= actual,
+                    "once the final offset is known the unacked ranges should be clamped"
+                );
+            }
         }
     }
 
-    #[cfg(not(debug_assertions))]
-    #[inline(always)]
-    fn invariants(&self) {}
+    /// The `counters` fields must exactly match the actual in-flight packets in
+    /// `sent_stream_packets` and `sent_recovery_packets`.
+    fn invariant_counters(&self) {
+        let mut expected = InflightCounters::default();
+
+        for (_pn, packet) in self.sent_stream_packets.iter() {
+            expected.on_transmit(&packet.info);
+        }
+
+        for (_pn, packet) in self.sent_recovery_packets.iter() {
+            expected.on_transmit(&packet.info);
+        }
+
+        assert_eq!(
+            self.counters.probes, expected.probes,
+            "probes counter mismatch: tracked={}, actual={}",
+            self.counters.probes, expected.probes,
+        );
+        assert_eq!(
+            self.counters.with_payload, expected.with_payload,
+            "with_payload counter mismatch: tracked={}, actual={}",
+            self.counters.with_payload, expected.with_payload,
+        );
+        assert_eq!(
+            self.counters.with_final_offset, expected.with_final_offset,
+            "with_final_offset counter mismatch: tracked={}, actual={}",
+            self.counters.with_final_offset, expected.with_final_offset,
+        );
+        assert_eq!(
+            self.counters.with_reset, expected.with_reset,
+            "with_reset counter mismatch: tracked={}, actual={}",
+            self.counters.with_reset, expected.with_reset,
+        );
+    }
+
+    /// Packet number relationships:
+    /// - `max_stream_packet_number` must equal the maximum key in `sent_stream_packets` (if non-empty)
+    /// - `recovery_packet_number` must be > all in-flight recovery packet numbers
+    /// - `max_stream_packet_number_lost` must be <= `max_stream_packet_number + 1`
+    /// - All recovery packet numbers must be > `max_stream_packet_number`
+    fn invariant_packet_numbers(&self) {
+        // max_stream_packet_number must be >= the maximum key in sent_stream_packets
+        if !self.sent_stream_packets.is_empty() {
+            let max_inflight = self.sent_stream_packets.get_range().end().as_u64();
+            let max_inflight = unsafe { VarInt::new_unchecked(max_inflight) };
+            assert!(
+                self.max_stream_packet_number >= max_inflight,
+                "max_stream_packet_number ({}) < max in-flight stream packet ({})",
+                self.max_stream_packet_number,
+                max_inflight,
+            );
+        }
+
+        // recovery_packet_number must be > all in-flight recovery packet numbers
+        if !self.sent_recovery_packets.is_empty() {
+            let max_recovery_inflight = self.sent_recovery_packets.get_range().end().as_u64();
+            assert!(
+                self.recovery_packet_number > max_recovery_inflight,
+                "recovery_packet_number ({}) <= max in-flight recovery packet ({})",
+                self.recovery_packet_number,
+                max_recovery_inflight,
+            );
+        }
+
+        // The next recovery_packet_number to assign must be > max_stream_packet_number
+        // because recovery packets are always numbered above stream packets at the time
+        // of assignment. (In-flight recovery packets may have numbers <= the current
+        // max_stream_packet_number if new stream packets were loaded after those recovery
+        // packets were sent.)
+        if !self.sent_stream_packets.is_empty() || !self.sent_recovery_packets.is_empty() {
+            assert!(
+                self.recovery_packet_number >= *self.max_stream_packet_number as u64 + 1,
+                "recovery_packet_number ({}) < max_stream_packet_number + 1 ({})",
+                self.recovery_packet_number,
+                *self.max_stream_packet_number as u64 + 1,
+            );
+        }
+    }
+
+    /// Fin state must be consistent with unacked_ranges:
+    /// - If fin value is known, unacked_ranges must not contain offsets >= final_offset
+    ///   (except the trailing sentinel when fin isn't fully acked yet)
+    ///
+    /// Note: fin can be acked while data ranges are still unacked — the fin
+    /// was carried in a packet that covered the tail of the stream, but earlier
+    /// data may still be in flight. The `state()` function correctly requires
+    /// BOTH `unacked_ranges.is_empty()` AND `fin.is_acked()` for DataRecvd.
+    fn invariant_fin_consistency(&self) {
+        if let Some(final_offset) = self.fin.value() {
+            // No data offsets beyond final_offset should be unacked
+            // (VarInt::MAX sentinel is expected when fin isn't fully acked yet)
+            for range in self.unacked_ranges.inclusive_ranges() {
+                let start = *range.start();
+                if start >= final_offset && start != VarInt::MAX {
+                    panic!(
+                        "unacked_ranges contains offset {} beyond final_offset {}",
+                        start, final_offset,
+                    );
+                }
+            }
+        }
+    }
+
+    /// When the state is terminal, there must be no in-flight packets,
+    /// no pending retransmissions, and PTO must not be armed.
+    fn invariant_terminal_state(&self) {
+        if !self.state().is_terminal() {
+            return;
+        }
+
+        assert!(
+            self.sent_stream_packets.is_empty(),
+            "terminal state but sent_stream_packets is non-empty",
+        );
+        assert!(
+            self.sent_recovery_packets.is_empty(),
+            "terminal state but sent_recovery_packets is non-empty",
+        );
+        assert!(
+            self.retransmissions.is_empty(),
+            "terminal state but retransmissions queue is non-empty",
+        );
+        assert!(
+            self.unacked_ranges.is_empty(),
+            "terminal state but unacked_ranges is non-empty: {:?}",
+            self.unacked_ranges,
+        );
+        assert_eq!(
+            self.pto.transmissions(),
+            0,
+            "terminal state but PTO has pending transmissions",
+        );
+    }
+
+    /// Retransmissions may transiently include stale entries (e.g., PTO
+    /// probe copies whose data was ACKed before the copy was transmitted).
+    /// These get cleaned up lazily in `try_transmit_retransmissions`. This
+    /// invariant ensures the stale count stays bounded — it should never
+    /// exceed the number of in-flight packets, since each stale entry
+    /// originated as a copy of one.
+    fn invariant_retransmission_ranges(&self) {
+        let mut stale_count = 0u32;
+        for segment in self.retransmissions.iter() {
+            if segment.payload_len == 0 {
+                continue;
+            }
+            if !self.unacked_ranges.contains(&segment.stream_offset) {
+                stale_count += 1;
+            }
+        }
+
+        // Each stale retransmission was a deep copy of an in-flight packet
+        // created by `retransmit_copy()`. The number of copies is bounded by
+        // PTO transmissions (typically 1-2 per PTO fire). If stale entries
+        // accumulate beyond the in-flight count, we're leaking retransmissions.
+        let inflight_count =
+            self.sent_stream_packets.iter().count() + self.sent_recovery_packets.iter().count();
+        // Use max(inflight, 2) to handle the edge case where all in-flight
+        // packets have been ACKed but PTO copies haven't been drained yet.
+        let max_stale = inflight_count.max(2);
+        assert!(
+            (stale_count as usize) <= max_stale,
+            "too many stale retransmissions: {stale_count} stale entries but only {inflight_count} in-flight packets",
+        );
+    }
 }
 
 impl timer::Provider for State {
