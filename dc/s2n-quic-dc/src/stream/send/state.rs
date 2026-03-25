@@ -267,8 +267,10 @@ impl State {
     }
 
     fn local_offset(&self) -> VarInt {
-        self.max_data
-            .max_sent_offset()
+        // Use the lower bound of the unacked ranges so we don't overbuffer
+        self.unacked_ranges
+            .min_value()
+            .unwrap_or_else(|| self.max_data.max_sent_offset())
             .saturating_add(self.local_max_data_window)
     }
 
