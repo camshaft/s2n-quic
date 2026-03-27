@@ -19,6 +19,9 @@ pub trait Provider: 'static {
 #[cfg(any(test, feature = "unstable-provider-io-testing"))]
 pub mod testing;
 
+#[cfg(any(test, feature = "unstable-provider-io-testing"))]
+pub mod bach_net;
+
 #[cfg(feature = "unstable-provider-io-turmoil")]
 pub mod turmoil;
 
