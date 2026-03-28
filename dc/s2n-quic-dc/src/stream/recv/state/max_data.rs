@@ -151,6 +151,12 @@ impl MaxData {
     pub fn on_data_blocked(&mut self, peer_limit: VarInt) {
         if peer_limit < self.pending_value {
             // The sender is behind — they haven't received our latest MAX_DATA.
+            // Reset backoff since the sender is actively telling us they are blocked
+            // and need the update urgently.
+            self.retransmit_timeout = INITIAL_RETRANSMIT_TIMEOUT;
+            // Cancel any armed timer so the new shorter timeout takes effect on
+            // the next arm_retransmit_timer call.
+            self.retransmit_timer.cancel();
             // If we're inflight, the packet may have been lost, so re-queue.
             if self.state.is_inflight() {
                 let _ = self.state.on_timeout();
@@ -176,7 +182,16 @@ impl MaxData {
     /// used to determine when the sender acknowledges it.
     #[inline]
     pub fn on_transmit(&mut self, packet_number: VarInt) {
+        // Only track if we are transmitting a new (higher) value so that a lost
+        // piggybacked MAX_DATA update is retransmitted even when the state was Idle.
+        ensure!(self.pending_value > self.transmitted_value);
+
         self.transmitted_value = self.pending_value;
+
+        // Transition to Queued first if we are Idle so on_transmit (Queued→Inflight) succeeds.
+        if self.state.is_idle() {
+            let _ = self.state.on_queued();
+        }
 
         ensure!(self.state.on_transmit().is_ok());
 
