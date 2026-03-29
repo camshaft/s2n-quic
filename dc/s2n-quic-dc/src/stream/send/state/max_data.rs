@@ -32,10 +32,11 @@ impl State {
     is!(is_unblocked, Idle);
 
     event! {
-        on_blocked(Idle => Queued);
+        // skip Queued on initial block; transmission interest is expressed once the timer fires
+        on_blocked(Idle => Inflight);
         on_unblocked(Queued | Inflight | Acked => Idle);
         on_ack(Queued | Inflight => Acked);
-        on_transmit(Idle | Queued => Inflight);
+        on_transmit(Queued => Inflight);
         on_timeout(Queued | Inflight | Acked => Queued);
     }
 }
@@ -493,5 +494,51 @@ mod tests {
 
         clock.inc_by(Duration::from_secs(1));
         assert_eq!(max_data.on_timeout(&clock, idle_timeout), Poll::Ready(()));
+    }
+
+    /// When first blocked, the state transitions to Inflight (skipping Queued) so that
+    /// transmission interest is not expressed immediately. The state becomes Queued (and
+    /// transmission interest is expressed) only once the timer fires (idle_timeout / IDLE_RATIO).
+    /// DATA_BLOCKED is therefore treated as a keep-alive rather than an eager signal.
+    #[test]
+    fn no_immediate_transmission_interest_on_first_block() {
+        let peer_value = VarInt::from_u32(1000);
+        let mut max_data = MaxData::new(peer_value);
+        let mut clock = test_clock::Clock::default();
+        let idle_timeout = Duration::from_secs(30);
+
+        max_data.on_transmit(peer_value, &clock, idle_timeout, MAX_DATAGRAM_SIZE);
+
+        // blocked, but NOT yet queued – no immediate transmission interest
+        assert!(max_data.state.is_blocked());
+        assert!(!max_data.is_queued());
+        assert!(max_data.is_armed());
+
+        // still not queued before the timer fires
+        clock.inc_by(Duration::from_secs(5));
+        assert_eq!(max_data.on_timeout(&clock, idle_timeout), Poll::Pending);
+        assert!(!max_data.is_queued());
+
+        // after the timer fires, state transitions to Queued → transmission interest
+        clock.inc_by(idle_timeout / IDLE_RATIO);
+        assert_eq!(max_data.on_timeout(&clock, idle_timeout), Poll::Ready(()));
+        assert!(max_data.is_queued());
+    }
+
+    /// Even while in the Inflight "waiting for timer" state, DATA_BLOCKED is still
+    /// piggybacked onto any probe that fires for another reason (PTO, keep-alive, etc.).
+    #[test]
+    fn data_blocked_piggybacked_while_waiting_for_timer() {
+        let peer_value = VarInt::from_u32(1000);
+        let mut max_data = MaxData::new(peer_value);
+        let clock = test_clock::Clock::default();
+        let idle_timeout = Duration::from_secs(30);
+
+        max_data.on_transmit(peer_value, &clock, idle_timeout, MAX_DATAGRAM_SIZE);
+
+        // is_blocked() is true even before the timer fires, so DATA_BLOCKED can be piggybacked
+        assert!(max_data.state.is_blocked());
+        let frame = max_data.try_transmit_data_blocked();
+        assert!(frame.is_some());
     }
 }
