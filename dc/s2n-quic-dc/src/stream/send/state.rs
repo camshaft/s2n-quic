@@ -128,7 +128,6 @@ pub struct State {
     max_stream_packet_number_lost: VarInt,
     sent_recovery_packets: PacketMap<SentRecoveryPacket>,
     recovery_packet_number: u64,
-    last_sent_packet: Option<Timestamp>,
     control_filter: Filter,
     next_expected_control_packet: VarInt,
     cca: congestion::Controller,
@@ -188,7 +187,6 @@ impl State {
             max_stream_packet_number_lost: VarInt::ZERO,
             sent_recovery_packets: Default::default(),
             recovery_packet_number: 0,
-            last_sent_packet: None,
             control_filter: Default::default(),
             ecn: ecn::Controller::default(),
             pto: Pto::default(),
@@ -623,6 +621,13 @@ impl State {
                 sent_recovery_packets,
                 |packet_number: VarInt, sent_packet: &SentRecoveryPacket| {
                     *max_acked_recovery = (*max_acked_recovery).max(Some(packet_number));
+                    // When a recovery packet is ACKed, the data it carried has
+                    // been delivered. Use the stored max_stream_packet_number_lost
+                    // to raise max_acked_stream — this is the stream PN up to
+                    // which packets were considered lost when the recovery was
+                    // created. This lets the PN threshold correctly detect
+                    // stream-space loss without using the recovery PN directly
+                    // (which would be far too high).
                     *max_acked_stream =
                         (*max_acked_stream).max(Some(sent_packet.max_stream_packet_number_lost));
                 }
@@ -1091,25 +1096,9 @@ impl State {
         has_more_app_data: bool,
         clock: &impl Clock,
     ) {
-        // the BBR implementation requires monotonic time so track that
-        let mut cca_time_sent = info.time_sent;
-
-        match packet_space {
-            stream::PacketSpace::Stream => {
-                if let Some(min) = self.last_sent_packet {
-                    cca_time_sent = info.time_sent.max(min);
-                }
-            }
-            stream::PacketSpace::Recovery => {
-                if let Some(min) = self.last_sent_packet {
-                    cca_time_sent = info.time_sent.max(min);
-                }
-            }
-        }
-        self.last_sent_packet = Some(cca_time_sent);
-
+        // create tracking state for the CCA
         let cc_info = self.cca.on_packet_sent(
-            cca_time_sent,
+            info.time_sent,
             info.cca_len(),
             has_more_app_data,
             &self.rtt_estimator,
@@ -1166,8 +1155,7 @@ impl State {
 
             self.max_stream_packet_number_lost = self
                 .max_stream_packet_number
-                .max(self.max_stream_packet_number_lost)
-                + 1;
+                .max(self.max_stream_packet_number_lost);
 
             self.max_tx_offset = self.max_tx_offset.max(info.end_offset() + MAX_TX_OFFSET);
             self.recovery_packet_number = self

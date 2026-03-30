@@ -237,15 +237,18 @@ impl Transmission {
     where
         Clk: Clock + ?Sized,
     {
-        // compute the recovery ACKs first so we have enough space for those - if we run out,
-        // the sender will convert the stream PNs anyway
-        let (recovery_ack, encoding_size) =
-            self.recovery_ack
-                .encoding(max_data_encoding_size, None, mtu, clock);
-
+        // Encode stream ACKs first to guarantee they get space. The sender's
+        // loss detection depends on stream ACKs to advance the PN threshold
+        // and clear packets from sent_stream_packets. If recovery ACKs consume
+        // the entire MTU budget, stream ACKs get starved, causing the sender to
+        // spuriously declare stream packets as lost — triggering more recovery
+        // packets and creating a feedback loop.
         let (stream_ack, encoding_size) =
             self.stream_ack
-                .encoding(encoding_size, Some(self.ecn_counts), mtu, clock);
+                .encoding(max_data_encoding_size, Some(self.ecn_counts), mtu, clock);
+
+        let (recovery_ack, encoding_size) =
+            self.recovery_ack.encoding(encoding_size, None, mtu, clock);
 
         (stream_ack, recovery_ack, encoding_size)
     }
