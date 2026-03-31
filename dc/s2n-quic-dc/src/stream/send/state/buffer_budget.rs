@@ -54,9 +54,10 @@ impl BufferBudget {
     /// * `max_window` – the upper bound on the local send window (from transport parameters).
     /// * `max_datagram_size` – used to compute the minimum window floor.
     pub fn new(max_window: VarInt, max_datagram_size: u16) -> Self {
-        let min_window = MIN_WINDOW_SEGMENTS * max_datagram_size as u64;
+        let max_window = max_window.as_u64();
+        let min_window = (MIN_WINDOW_SEGMENTS * max_datagram_size as u64).min(max_window);
         Self {
-            max_window: *max_window as u64,
+            max_window,
             min_window,
         }
     }

@@ -126,10 +126,18 @@ impl MaxData {
     ///
     /// Returns `true` if the pending value was updated.
     #[inline]
-    pub fn on_read(&mut self, current_offset: VarInt, final_offset: Option<VarInt>) -> bool {
-        // TODO instead of fixed windows we should measure how fast the application is reading
-        // from the stream and dynamically scale it up if there's more demand.
-        let new_max_data = current_offset.saturating_add(self.window);
+    pub fn on_read(
+        &mut self,
+        current_offset: VarInt,
+        final_offset: Option<VarInt>,
+        dynamic_window: Option<u64>,
+    ) -> bool {
+        // Use the dynamic window from RecvBudget if available, otherwise fall
+        // back to the fixed window configured at construction time.
+        let window = dynamic_window
+            .map(|w| VarInt::try_from(w).unwrap_or(VarInt::MAX))
+            .unwrap_or(self.window);
+        let new_max_data = current_offset.saturating_add(window);
 
         let new_max_data = final_offset.unwrap_or(VarInt::MAX).min(new_max_data);
 

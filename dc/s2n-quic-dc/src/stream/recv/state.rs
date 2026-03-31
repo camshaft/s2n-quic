@@ -31,6 +31,7 @@ use s2n_quic_core::{
 };
 
 mod max_data;
+mod recv_budget;
 mod transmission;
 
 #[derive(Clone, Copy, Debug)]
@@ -50,6 +51,7 @@ pub struct State {
     tick_timer: Timer,
     is_reliable: bool,
     max_data: max_data::MaxData,
+    recv_budget: recv_budget::RecvBudget,
     error: Option<ErrorState>,
     fin_ack_packet_number: Option<VarInt>,
     features: TransportFeatures,
@@ -93,6 +95,7 @@ impl State {
             idle_timeout,
             tick_timer,
             max_data: max_data::MaxData::new(initial_max_data, max_data_window),
+            recv_budget: recv_budget::RecvBudget::new(max_data_window, params.max_datagram_size()),
             error: None,
             fin_ack_packet_number: None,
             features,
@@ -172,8 +175,14 @@ impl State {
 
         // Only increase the max data if the application has accepted the stream.
         if matches!(accept_state, AcceptState::Accepted) {
+            // Track application consumption for drain rate estimation
+            let current = out_buf.current_offset();
+            self.recv_budget
+                .on_consume(*current as u64, _clock.get_time());
+
+            let dynamic_window = Some(self.recv_budget.window());
             self.max_data
-                .on_read(out_buf.current_offset(), out_buf.final_offset());
+                .on_read(current, out_buf.final_offset(), dynamic_window);
         }
     }
 
@@ -559,8 +568,14 @@ impl State {
             // enough gap?
         }
 
+        // Notify recv_budget that we received a data packet with payload
+        // (used for active-transfer filtering in RTT estimation)
+        if !packet.payload().is_empty() {
+            self.recv_budget.on_data_received(clock.get_time());
+        }
+
         // clean up any ACK state that we can
-        self.on_next_expected_control_packet(packet.next_expected_control_packet());
+        self.on_next_expected_control_packet(packet.next_expected_control_packet(), clock);
 
         Ok(())
     }
@@ -589,7 +604,11 @@ impl State {
     }
 
     #[inline]
-    fn on_next_expected_control_packet(&mut self, next_expected_control_packet: VarInt) {
+    fn on_next_expected_control_packet<Clk: Clock + ?Sized>(
+        &mut self,
+        next_expected_control_packet: VarInt,
+        clock: &Clk,
+    ) {
         if let Some(largest_delivered_control_packet) =
             next_expected_control_packet.checked_sub(VarInt::from_u8(1))
         {
@@ -597,6 +616,10 @@ impl State {
                 .on_largest_delivered_packet(largest_delivered_control_packet);
             self.max_data
                 .on_largest_delivered_packet(largest_delivered_control_packet);
+
+            // Sample feedback-loop RTT from the control packet echo
+            self.recv_budget
+                .on_control_ack(largest_delivered_control_packet, clock.get_time());
 
             if let Some(fin_ack_packet_number) = self.fin_ack_packet_number {
                 // if the sender received our ACK to the fin, then we can shut down immediately
@@ -867,7 +890,7 @@ impl State {
                     },
                 );
 
-                self.on_packet_sent(packet_number);
+                self.on_packet_sent(packet_number, clock);
 
                 packet_len
             });
@@ -889,7 +912,7 @@ impl State {
         stream_id: stream::Id,
         source_queue_id: Option<VarInt>,
         queue: &mut T,
-        _clock: &Clk,
+        clock: &Clk,
         publisher: &Pub,
     ) where
         K: crypto::seal::control::Stream,
@@ -943,7 +966,7 @@ impl State {
                 },
             );
 
-            self.on_packet_sent(packet_number);
+            self.on_packet_sent(packet_number, clock);
 
             result
         });
@@ -955,13 +978,17 @@ impl State {
     }
 
     #[inline]
-    fn on_packet_sent(&mut self, packet_number: VarInt) {
+    fn on_packet_sent<Clk: Clock + ?Sized>(&mut self, packet_number: VarInt, clock: &Clk) {
         // record the fin_ack packet number so we can shutdown more quickly
         if !matches!(self.state, Receiver::Recv | Receiver::SizeKnown)
             && self.fin_ack_packet_number.is_none()
         {
             self.fin_ack_packet_number = Some(packet_number);
         }
+
+        // Record send timestamp for feedback-loop RTT estimation
+        self.recv_budget
+            .on_control_sent(packet_number, clock.get_time());
 
         self.control_packet_number += 1;
         self.transmission.on_transmit(packet_number);
