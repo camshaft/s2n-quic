@@ -45,6 +45,7 @@ use s2n_quic_core::{
 use std::collections::BinaryHeap;
 use tracing::trace;
 
+mod buffer_budget;
 mod fin;
 mod keep_alive;
 mod max_data;
@@ -141,7 +142,7 @@ pub struct State {
     unacked_ranges: IntervalSet<VarInt>,
     max_data: max_data::MaxData,
     max_tx_offset: VarInt,
-    local_max_data_window: VarInt,
+    buffer_budget: buffer_budget::BufferBudget,
     peer_activity: Option<PeerActivity>,
     max_datagram_size: u16,
     max_sent_segment_size: u16,
@@ -198,7 +199,7 @@ impl State {
             unacked_ranges,
             max_data: max_data::MaxData::new(initial_max_data),
             max_tx_offset,
-            local_max_data_window: local_max_data,
+            buffer_budget: buffer_budget::BufferBudget::new(local_max_data, max_datagram_size),
             peer_activity: None,
             max_datagram_size,
             max_sent_segment_size: 0,
@@ -265,14 +266,16 @@ impl State {
     }
 
     fn local_offset(&self) -> VarInt {
-        // Limit how far ahead the application can write based on bytes currently
-        // in flight, rather than anchoring on the minimum unacked offset. The old
-        // approach (min_unacked + window) caused the window to collapse when a
-        // lost packet kept min_unacked stuck far behind max_sent_offset, starving
-        // the application of flow credits even though the CCA and peer would allow
-        // more data.
-        let remaining_window =
-            (*self.local_max_data_window as u64).saturating_sub(self.cca.bytes_in_flight() as u64);
+        // Use the dynamic BDP-based window instead of a fixed-size buffer.
+        // This computes how much buffer we actually need to sustain the current
+        // pacing rate (pacing rate × RTT), clamped to a configured max.
+        // When many streams share a packet sender that caps the aggregate rate,
+        // each stream's observed bandwidth drops and its buffer shrinks
+        // proportionally — coordinating memory usage without explicit signaling.
+        let window = self
+            .buffer_budget
+            .window(self.cca.bandwidth(), &self.rtt_estimator);
+        let remaining_window = window.saturating_sub(self.cca.bytes_in_flight() as u64);
         self.max_data
             .max_sent_offset()
             .saturating_add(VarInt::try_from(remaining_window).unwrap_or(VarInt::MAX))
