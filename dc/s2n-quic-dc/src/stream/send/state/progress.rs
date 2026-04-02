@@ -74,7 +74,8 @@ impl Progress {
         ensure!(!self.timer.is_armed());
 
         // Arm the timer with the idle timeout as the deadline
-        let target = clock.get_time() + idle_timeout;
+        // Make the timeout longer than the idle timer to avoid conflating the two errors
+        let target = clock.get_time() + idle_timeout * 2;
         self.timer.set(target);
     }
 
