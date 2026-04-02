@@ -25,12 +25,9 @@ use s2n_quic_core::{
 /// Multiplier applied to the BDP (pacing_rate × smoothed_rtt) when computing
 /// the dynamic local send buffer window.
 ///
-/// We use a multiplier of 1 because the bandwidth signal fed into this
-/// calculation is the CCA's *pacing rate*, which already includes BBR's gain
-/// factors (2× during STARTUP, 1.25× during PROBE_BW_UP, 1× in steady state).
-/// That built-in gain provides natural headroom during probing phases — exactly
-/// when we need extra buffer — so no additional multiplier is required.
-const BDP_MULTIPLIER: u64 = 1;
+/// We use a multiplier of 2 to avoid timing issues where the buffer underflows
+/// and doesn't have enough to saturate the 5 Gbps capacity.
+const BDP_MULTIPLIER: u64 = 2;
 
 /// Minimum number of max-datagram-size segments the window will allow.
 ///

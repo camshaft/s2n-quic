@@ -144,7 +144,7 @@ impl State {
         out_buf: &mut B,
         chunk: &mut C,
         accept_state: AcceptState,
-        _clock: &Clk,
+        clock: &Clk,
     ) where
         B: buffer::Duplex<Error = core::convert::Infallible>,
         C: buffer::writer::Storage,
@@ -178,7 +178,7 @@ impl State {
             // Track application consumption for drain rate estimation
             let current = out_buf.current_offset();
             self.recv_budget
-                .on_consume(*current as u64, _clock.get_time());
+                .on_consume(*current as u64, clock.get_time());
 
             let dynamic_window = Some(self.recv_budget.window());
             self.max_data
