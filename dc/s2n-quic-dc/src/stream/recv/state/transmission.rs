@@ -271,13 +271,25 @@ impl Transmission {
             .on_largest_delivered_packet(largest_delivered_control_packet);
     }
 
-    /// Clear all ACK state
+    /// Clear ACK ranges and timers but keep the state machine alive.
+    ///
+    /// Used when we need to send an error control packet (connection-close)
+    /// after transitioning to an error state. The ACK ranges are no longer
+    /// needed, but the transmission state machine must remain operational so
+    /// `on_error()` can queue the connection-close for transmission.
     #[inline]
-    pub fn clear(&mut self) {
+    pub fn clear_acks(&mut self) {
         self.stream_ack.clear();
         self.recovery_ack.clear();
         self.throttle.cancel();
         self.max_ack_delay.cancel();
+        self.packets_since_ack = 0;
+    }
+
+    /// Clear all ACK state and transition to the terminal `Finished` state.
+    #[inline]
+    pub fn clear(&mut self) {
+        self.clear_acks();
         let _ = self.state.on_stream_finished();
     }
 }

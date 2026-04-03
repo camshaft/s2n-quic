@@ -28,7 +28,7 @@ use s2n_quic_core::{time::Timestamp, varint::VarInt};
 
 /// Multiplier applied to drain_rate × min_rtt.
 ///
-/// A value of 4 provides one RTT of headroom beyond what's strictly needed,
+/// A value of 4 provides enough headroom beyond what's strictly needed,
 /// absorbing jitter in both the drain rate and the RTT measurement.
 const WINDOW_MULTIPLIER: u64 = 4;
 

@@ -670,7 +670,6 @@ impl State {
         ));
 
         let _ = self.state.on_reset();
-        self.transmission.clear();
 
         // make sure we haven't already set the error from something else
         ensure!(self.error.is_none());
@@ -685,9 +684,26 @@ impl State {
             });
         }
 
-        if matches!(source, Location::Local) && !is_idle_timeout {
+        if matches!(source, Location::Local)
+            && !is_idle_timeout
+            && matches!(error.kind(), error::Kind::ApplicationError { .. })
+        {
+            // The application abandoned the stream (stop_sending). Clear ACK
+            // state but keep the transmission state machine alive so the queued
+            // connection-close can be transmitted to the peer, notifying the
+            // sender to stop.
+            self.transmission.clear_acks();
+            self.transmission.on_error();
+        } else if matches!(source, Location::Local) && !is_idle_timeout {
+            // Other local errors (credential mismatch, truncated transport, etc.)
+            // are handled by separate error notification mechanisms (e.g.,
+            // FlowReset secret control packets). Fully clear the transmission
+            // state so the receiver shuts down without attempting to send a
+            // connection-close.
+            self.transmission.clear();
             self.transmission.on_error();
         } else {
+            self.transmission.clear();
             let _ = self.state.on_app_read_reset();
             self.silent_shutdown();
         }

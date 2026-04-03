@@ -333,6 +333,10 @@ where
                 let publisher = self.shared.publisher();
                 recv.receiver.stop_sending(error.into(), &publisher);
 
+                // The receiver has queued a connection-close control packet; make
+                // sure `poll_transmit` actually sends it.
+                self.should_transmit |= recv.receiver.should_transmit();
+
                 if recv.receiver.is_finished() {
                     let _ = self.state.on_finished();
                 }

@@ -120,7 +120,11 @@ fn fail_fast_unknown_path_secret() {
                 let stream = client.connect_sim("server:443").await.unwrap();
 
                 if idx == 0 {
-                    // the first stream is throw away to get the server to drop its state
+                    // the first stream is thrown away to get the server to drop its
+                    // state. We must send at least one packet so the server actually
+                    // accepts the stream and calls drop_state().
+                    let mut stream = stream;
+                    stream.write_all(b"hello").await.unwrap();
                     drop(stream);
                     1.ms().sleep().await;
                 } else {
@@ -721,6 +725,242 @@ fn retransmission_loop_under_loss() {
         "transfer took too long with ~33% bidirectional loss: {elapsed:?} \
          (max allowed: {max_allowed:?}); this suggests a retransmission feedback loop"
     );
+}
+
+/// Validates that dropping the receiver after reading a small header promptly stops
+/// the sender from transmitting more data.
+///
+/// This simulates a production pattern where a client races reads against multiple
+/// replicas: it reads a small header from each response, picks one winner, and drops
+/// the rest. Dropped streams must stop the sender promptly to avoid wasting bandwidth.
+///
+/// The test measures the total stream-packet bytes sent over the wire from the server
+/// after the client drops its reader. The sender should observe the cancellation
+/// (via the receiver's connection-close control packet) within a small number of RTTs
+/// and stop transmitting.
+#[test]
+fn recv_cancel_stops_sender() {
+    /// Total bytes the server attempts to write — intentionally large so we can
+    /// detect if the sender keeps going after cancellation.
+    const TOTAL_PAYLOAD: usize = 1 << 20; // 1 MiB
+
+    /// Number of header bytes the client reads before dropping.
+    const HEADER_LEN: usize = 64;
+
+    let stream_bytes_from_server = Arc::new(AtomicU64::new(0));
+    let monitor_bytes = stream_bytes_from_server.clone();
+
+    sim(|| {
+        {
+            let bytes = monitor_bytes.clone();
+            bach::net::monitor::on_packet_sent(move |packet| {
+                // Only count stream packets from the server (port 443)
+                if packet.source().port() == 443 {
+                    let payload = packet.transport.payload();
+                    if !payload.is_empty() && classify_packet(payload) == "stream" {
+                        bytes.fetch_add(payload.len() as u64, Ordering::Relaxed);
+                    }
+                }
+                bach::net::monitor::Command::Pass
+            });
+        }
+
+        async move {
+            let client = Client::builder().build();
+            let stream = client.connect_sim("server:443").await.unwrap();
+
+            let (mut reader, writer) = stream.into_split();
+            // Drop write half — we only care about the read direction
+            drop(writer);
+
+            // Read just the header
+            let mut header = vec![0u8; HEADER_LEN];
+            let mut total_read = 0;
+            while total_read < HEADER_LEN {
+                match reader.read(&mut header[total_read..]).await {
+                    Ok(0) => break,
+                    Ok(n) => total_read += n,
+                    Err(_) => break,
+                }
+            }
+
+            assert!(
+                total_read > 0,
+                "client should have read at least some header bytes"
+            );
+
+            // Drop the reader — this triggers stop_sending / connection-close back
+            // to the sender, which should stop it from transmitting more data.
+            drop(reader);
+
+            // Give the simulation time for the cancellation to propagate and the
+            // sender to observe it. A few seconds of simulated time is generous.
+            5.s().sleep().await;
+        }
+        .group("client")
+        .primary()
+        .spawn();
+
+        async move {
+            let server = Server::udp().port(443).build();
+
+            while let Ok((mut stream, _addr)) = server.accept().await {
+                spawn(async move {
+                    let body = vec![0xABu8; TOTAL_PAYLOAD];
+                    // The sender will write until it gets an error from the cancelled receiver
+                    let _ = stream.write_all(&body).await;
+                });
+            }
+        }
+        .group("server")
+        .spawn();
+    });
+
+    let total_wire_bytes = stream_bytes_from_server.load(Ordering::Relaxed);
+
+    eprintln!(
+        "recv_cancel_stops_sender: server sent {total_wire_bytes} stream bytes on the wire \
+         (payload was {TOTAL_PAYLOAD} bytes, client read {HEADER_LEN} header bytes)"
+    );
+
+    // The sender should have stopped well before transmitting the entire payload.
+    // With a 1ms RTT, the cancellation should propagate within a few RTTs. We allow
+    // a generous budget but it must be far less than the full payload.
+    //
+    // Use a snapshot so any regression in cancellation responsiveness is immediately
+    // visible as a diff.
+    insta::assert_snapshot!(format!(
+        "server_stream_bytes={total_wire_bytes}, payload={TOTAL_PAYLOAD}, header={HEADER_LEN}"
+    ));
+}
+
+/// Same as `recv_cancel_stops_sender` but races 3 concurrent streams — one is kept
+/// alive while the other two are cancelled after reading a header. Validates that
+/// cancelled senders stop promptly while the winner continues normally.
+#[test]
+fn racing_receivers_cancel() {
+    const TOTAL_PAYLOAD: usize = 1 << 20; // 1 MiB
+    const HEADER_LEN: usize = 128;
+
+    // Track stream bytes per server port. Servers use ports 443, 444, 445.
+    let bytes_per_port: [Arc<AtomicU64>; 3] = [
+        Arc::new(AtomicU64::new(0)),
+        Arc::new(AtomicU64::new(0)),
+        Arc::new(AtomicU64::new(0)),
+    ];
+    let monitor_bytes = bytes_per_port.clone();
+
+    sim(|| {
+        {
+            let bytes = monitor_bytes.clone();
+            bach::net::monitor::on_packet_sent(move |packet| {
+                let port = packet.source().port();
+                let idx = match port {
+                    443 => Some(0),
+                    444 => Some(1),
+                    445 => Some(2),
+                    _ => None,
+                };
+                if let Some(idx) = idx {
+                    let payload = packet.transport.payload();
+                    if !payload.is_empty() && classify_packet(payload) == "stream" {
+                        bytes[idx].fetch_add(payload.len() as u64, Ordering::Relaxed);
+                    }
+                }
+                bach::net::monitor::Command::Pass
+            });
+        }
+
+        async move {
+            let client = Client::builder().build();
+
+            let mut readers = Vec::new();
+            let mut writers = Vec::new();
+
+            for port in [443u16, 444, 445] {
+                let addr = format!("server:{port}");
+                let stream = client.connect_sim(&addr).await.unwrap();
+                let (reader, writer) = stream.into_split();
+                readers.push(reader);
+                writers.push(writer);
+            }
+
+            // Drop all write halves
+            drop(writers);
+
+            // Read a header from each stream
+            for reader in &mut readers {
+                let mut header = vec![0u8; HEADER_LEN];
+                let mut total_read = 0;
+                while total_read < HEADER_LEN {
+                    match reader.read(&mut header[total_read..]).await {
+                        Ok(0) => break,
+                        Ok(n) => total_read += n,
+                        Err(_) => break,
+                    }
+                }
+                assert!(total_read > 0, "should read at least some header bytes");
+            }
+
+            // "Pick" the first reader (winner), drop the other two (losers)
+            let mut winner = readers.remove(0);
+            for loser in readers {
+                drop(loser);
+            }
+
+            // Let cancellation propagate
+            2.s().sleep().await;
+
+            // The winner should still be able to read the remaining payload
+            // (we already consumed HEADER_LEN bytes above)
+            let mut response = vec![];
+            winner.read_to_end(&mut response).await.unwrap();
+            assert_eq!(response.len() + HEADER_LEN, TOTAL_PAYLOAD);
+            drop(winner);
+
+            // Let everything settle
+            2.s().sleep().await;
+        }
+        .group("client")
+        .primary()
+        .spawn();
+
+        for port in [443u16, 444, 445] {
+            async move {
+                let server = Server::udp().port(port).build();
+
+                while let Ok((mut stream, _addr)) = server.accept().await {
+                    spawn(async move {
+                        let body = vec![0xCDu8; TOTAL_PAYLOAD];
+                        let _ = stream.write_all(&body).await;
+                        let _ = stream.shutdown().await;
+                    });
+                }
+            }
+            .group("server")
+            .spawn();
+        }
+    });
+
+    let winner_bytes = bytes_per_port[0].load(Ordering::Relaxed);
+    let loser1_bytes = bytes_per_port[1].load(Ordering::Relaxed);
+    let loser2_bytes = bytes_per_port[2].load(Ordering::Relaxed);
+
+    eprintln!(
+        "racing_receivers_cancel: winner={winner_bytes}, loser1={loser1_bytes}, \
+         loser2={loser2_bytes} stream bytes (payload={TOTAL_PAYLOAD})"
+    );
+
+    // The winner must have sent the full payload (plus overhead)
+    assert!(
+        winner_bytes >= TOTAL_PAYLOAD as u64,
+        "winner should have sent at least the full payload: {winner_bytes} < {TOTAL_PAYLOAD}"
+    );
+
+    insta::assert_snapshot!(format!(
+        "winner_bytes={winner_bytes}, loser1_bytes={loser1_bytes}, loser2_bytes={loser2_bytes}, \
+         payload={TOTAL_PAYLOAD}, header={HEADER_LEN}"
+    ));
 }
 
 /// Asserts that during a bulk unidirectional transfer, the ratio of control packets
