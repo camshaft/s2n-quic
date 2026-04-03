@@ -308,6 +308,12 @@ jobs:
         if: ${{ matrix.target != 'native' }}
         run: cargo install cross --git https://github.com/cross-rs/cross
 
+      - name: Install cargo-nextest
+        if: ${{ matrix.target == 'native' }}
+        uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
+
       - uses: camshaft/rust-cache@v1
         with:
           key: ${{ matrix.target }}
@@ -326,9 +332,15 @@ jobs:
         run: |
           ${{ matrix.target != 'native' && 'cross' || 'cargo' }} build --tests --workspace ${{ matrix.exclude }} ${{ matrix.target != 'native' && format('--target {0}', matrix.target) || '' }} ${{ matrix.args }}
 
-      - name: Run cargo/cross test
+      - name: Run cross test
+        if: ${{ matrix.target != 'native' }}
         run: |
-          ${{ matrix.target != 'native' && 'cross' || 'cargo' }} test --workspace ${{ matrix.exclude }} ${{ matrix.target != 'native' && format('--target {0}', matrix.target) || '' }} ${{ matrix.args }}
+          cross test --workspace ${{ matrix.exclude }} --target ${{ matrix.target }} ${{ matrix.args }}
+
+      - name: Run cargo nextest
+        if: ${{ matrix.target == 'native' }}
+        run: |
+          cargo nextest run --no-fail-fast --workspace ${{ matrix.exclude }} ${{ matrix.args }}
 
   asan:
     runs-on: ubuntu-latest
@@ -344,6 +356,11 @@ jobs:
           rustup override set ${{ env.RUST_NIGHTLY_TOOLCHAIN }}
 
       - uses: camshaft/rust-cache@v1
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
 
       # asan expects a binary at /usr/bin/llvm-symbolizer but GHA runners include
       # multiple versioned binaries, like /usr/bin/llvm-symbolizer-13. This step
@@ -363,7 +380,8 @@ jobs:
           # determine if we should reenable this in the future.
           ASAN_OPTIONS: detect_leaks=false
         run: |
-          cargo test \
+          cargo nextest run \
+            --no-fail-fast \
             -Zbuild-std \
             --target x86_64-unknown-linux-gnu \
             --workspace
@@ -383,13 +401,18 @@ jobs:
 
       - uses: camshaft/rust-cache@v1
 
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
+
       - name: Run test (rustls)
         run: |
-          cargo test --no-default-features --features "provider-tls-fips provider-tls-rustls"
+          cargo nextest run --no-fail-fast --no-default-features --features "provider-tls-fips provider-tls-rustls"
 
       - name: Run test (s2n-tls)
         run: |
-          cargo test --no-default-features --features "provider-tls-fips provider-tls-s2n"
+          cargo nextest run --no-fail-fast --no-default-features --features "provider-tls-fips provider-tls-s2n"
 
   miri:
     runs-on:
@@ -698,6 +721,11 @@ jobs:
 
       - uses: camshaft/rust-cache@v1
 
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
+
       - name: format
         working-directory: ./tools/s2n-events
         run: cargo fmt -- --check
@@ -713,7 +741,7 @@ jobs:
 
       - name: test
         working-directory: ./tools/s2n-events
-        run: cargo test
+        run: cargo nextest run
 
   # ensures the event codegen is up to date
   generate-events:
