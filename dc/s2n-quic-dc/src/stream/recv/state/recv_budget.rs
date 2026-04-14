@@ -299,11 +299,11 @@ mod tests {
     fn basic_window_calculation() {
         let mut b = budget(10_000_000);
         // drain rate = 100 MB/s, min_rtt = 10ms
-        // window = 100_000_000 * 0.010 * 2 = 2_000_000
+        // window = 100_000_000 * 0.010 * 4 = 4_000_000
         b.drain.rate = 100_000_000;
         b.rtt.min_rtt = Some(Duration::from_millis(10));
 
-        assert_eq!(b.window(), 2_000_000);
+        assert_eq!(b.window(), 4_000_000);
     }
 
     #[test]
@@ -548,9 +548,9 @@ mod tests {
         // Now provide BDP measurements that produce a smaller window
         b.drain.rate = 1_000_000; // 1 MB/s
         b.rtt.min_rtt = Some(Duration::from_millis(5));
-        // BDP window = 1_000_000 * 0.005 * 2 = 10_000
+        // BDP window = 1_000_000 * 0.005 * 4 = 20_000
         let bdp_window = b.window();
-        assert_eq!(bdp_window, 10_000);
+        assert_eq!(bdp_window, 20_000);
         // BDP is much smaller than slow-start — this is the whole point
         assert!(bdp_window < ss_window);
     }

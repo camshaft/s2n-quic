@@ -133,15 +133,15 @@ mod tests {
 
     #[test]
     fn basic_bdp_calculation() {
-        // 100 MB/s pacing rate, 10ms RTT → BDP = 1 MB, window = 1 MB (multiplier=1)
+        // 100 MB/s pacing rate, 10ms RTT → BDP = 1 MB, window = 2 MB (multiplier=2)
         let b = budget(10_000_000);
         let rtt = rtt_estimator(Duration::from_millis(10));
         let bw = Bandwidth::new(100_000_000, Duration::from_secs(1));
 
         let w = b.window(bw, &rtt);
         // BDP = 100_000_000 * 0.010 = 1_000_000
-        // window = 1_000_000 * 1 = 1_000_000
-        assert_eq!(w, 1_000_000);
+        // window = 1_000_000 * 2 = 2_000_000
+        assert_eq!(w, 2_000_000);
     }
 
     #[test]
@@ -170,15 +170,15 @@ mod tests {
     fn shared_sender_reduces_window() {
         // Scenario: 100 streams sharing a 1 Gbps sender
         // Each stream gets ~10 Mbps = 1.25 MB/s pacing rate
-        // With 5ms RTT → BDP per stream = 6250, window = 6250
+        // With 5ms RTT → BDP per stream = 6250, window = 12500
         let b = budget(10_000_000);
         let rtt = rtt_estimator(Duration::from_millis(5));
         let per_stream_bw = Bandwidth::new(1_250_000, Duration::from_secs(1));
 
         let w = b.window(per_stream_bw, &rtt);
         // BDP = 1_250_000 * 0.005 = 6250
-        // window = 6250 * 1 = 6250
-        assert_eq!(w, 6_250);
+        // window = 6250 * 2 = 12500
+        assert_eq!(w, 12_500);
         // Much less than the 10 MB max — exactly what we want!
     }
 

@@ -409,8 +409,17 @@ where
 
         if !had_error {
             if let Some((error, source)) = self.sender.error() {
-                self.shared
-                    .set_error(*error, source, Some((shared::Half::Write, Actor::Worker)));
+                // A NormalClose (error_code=0) from the remote peer is a half-close:
+                // they closed their receive direction, asking us to stop sending.
+                // This should only affect the send side, NOT the receive side.
+                // Don't set the shared error which would poison the entire stream.
+                let is_half_close = matches!(error.kind(), error::Kind::NormalClose)
+                    && matches!(source, Location::Remote);
+
+                if !is_half_close {
+                    self.shared
+                        .set_error(*error, source, Some((shared::Half::Write, Actor::Worker)));
+                }
             }
         }
     }

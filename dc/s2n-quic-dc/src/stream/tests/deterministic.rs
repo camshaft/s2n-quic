@@ -1235,7 +1235,7 @@ fn stream_stuck_on_sender_panic() {
     eprintln!("stream_stuck_on_sender_panic: elapsed={elapsed:?}, stuck={was_stuck}");
 
     // The client should detect the server's failure and terminate cleanly.
-    let max_allowed = Duration::from_secs(45);
+    let max_allowed = Duration::from_secs(10);
     assert!(
         !was_stuck && elapsed <= max_allowed,
         "stream got stuck after sender panic: elapsed={elapsed:?}, was_stuck={was_stuck}; \
