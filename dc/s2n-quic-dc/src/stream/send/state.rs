@@ -884,6 +884,11 @@ impl State {
             .on_timeout(packets_in_flight, clock.get_time())
             .is_ready()
         {
+            // Re-queue the reset for retransmission if we're waiting for an
+            // ACK to a CONNECTION_CLOSE. PTO exponential backoff throttles
+            // the retransmission rate.
+            self.reset.on_pto_timeout();
+
             // On the first PTO, only send 1 probe instead of 2. This reduces
             // wasted retransmissions for small streams where a single packet
             // carries all the data. On subsequent PTOs we keep 2 for resilience.
@@ -959,7 +964,6 @@ impl State {
     #[inline]
     fn update_pto_timer(&mut self, clock: &impl Clock) {
         ensure!(!self.pto.is_armed());
-        ensure!(self.reset.is_idle());
 
         if self.has_inflight_packets() {
             self.force_arm_pto_timer(clock);
@@ -967,6 +971,12 @@ impl State {
     }
 
     fn has_inflight_packets(&self) -> bool {
+        // If we're in a reset state that's waiting for an ACK, we have
+        // inflight packets (the CONNECTION_CLOSE) that need PTO.
+        if self.reset.waiting_ack() {
+            return true;
+        }
+
         if !self.reset.is_idle() {
             return false;
         }
@@ -984,8 +994,6 @@ impl State {
 
     #[inline]
     fn force_arm_pto_timer(&mut self, clock: &impl Clock) {
-        ensure!(self.reset.is_idle());
-
         let mut pto_period = self
             .rtt_estimator
             .pto_period(self.pto_backoff, PacketNumberSpace::Initial);
@@ -1653,6 +1661,11 @@ impl State {
         Pub: event::ConnectionPublisher,
     {
         let error = Error::from(error);
+
+        // If the sender has already successfully finished (all data ACKed),
+        // ignore late errors. A FlowReset arriving after DataRecvd shouldn't
+        // poison a completed transfer.
+        ensure!(!self.state().is_data_received());
 
         if matches!(error.kind, error::Kind::IdleTimeout) {
             self.idle_timer.cancel();

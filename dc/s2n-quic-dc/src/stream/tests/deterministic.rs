@@ -963,6 +963,287 @@ fn racing_receivers_cancel() {
     ));
 }
 
+/// Reproduces a scenario where a stream gets stuck (StreamStuck error) because
+/// the receiver's application panics mid-transfer.
+///
+/// **The stuck scenario in production:**
+///
+/// 1. Client sends a large request to the server.
+/// 2. Server application panics while processing the stream.
+/// 3. Server's Reader and Writer drop abruptly (no FIN, no graceful shutdown):
+///    - Writer drops with `is_panicking: true` → FIN is skipped
+///    - `ShutdownKind::Errored` sends an `ApplicationError` CONNECTION_CLOSE
+///    - Recv worker enters **draining state**, throttling ACKs
+/// 4. The draining recv worker still periodically ACKs the client's stream data,
+///    which counts as **peer activity** and keeps the client's **idle timer** alive.
+/// 5. However, if the CONNECTION_CLOSE packet is lost (due to packet loss), the
+///    client sender never learns the server errored out.
+/// 6. The client's sender keeps retransmitting data. The draining ACKs keep the
+///    idle timer refreshed, but the `min_unacked` offset may not advance if the
+///    draining-state ACKs don't carry new acknowledgments for the lowest offsets.
+/// 7. After `idle_timeout * 2` (60s), the progress watchdog fires **StreamStuck**.
+///
+/// This test models the scenario: the server reads a partial request then abruptly
+/// drops the stream (simulating a panic), while selective packet loss ensures the
+/// error notification doesn't reach the client reliably. The client should detect
+/// the failure and terminate cleanly rather than getting stuck.
+#[test]
+fn stream_stuck_on_receiver_panic() {
+    const BODY_LEN: usize = 1 << 18; // 256 KiB
+                                     // The progress watchdog fires at idle_timeout * 2 = 60s. Use a timeout
+                                     // that's long enough to observe it.
+    const TRANSFER_TIMEOUT: Duration = Duration::from_secs(90);
+
+    let end_time: Arc<Mutex<Option<Instant>>> = Arc::new(Mutex::new(None));
+    let end_time_inner = end_time.clone();
+
+    let stuck_detected = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stuck_flag = stuck_detected.clone();
+
+    sim(|| {
+        // Drop only the first few control packets from the server. These
+        // carry the CONNECTION_CLOSE (error notification). Later control
+        // packets are draining-state ACKs which keep flowing to the client.
+        //
+        // This creates the exact production scenario:
+        // - CONNECTION_CLOSE is lost → client sender doesn't know the server errored
+        // - Draining ACKs keep arriving → peer activity keeps idle timer alive
+        // - But if draining ACKs don't advance min_unacked (e.g., server only
+        //   received partial data before panic), the progress watchdog fires
+        {
+            let mut server_control_count = 0u64;
+            bach::net::monitor::on_packet_sent(move |packet| {
+                let payload = packet.transport.payload();
+                let is_from_server = packet.source().port() == 443;
+
+                if is_from_server && !payload.is_empty() {
+                    if classify_packet(payload) == "control" {
+                        server_control_count += 1;
+                        // Drop first 2 control packets — these carry the
+                        // CONNECTION_CLOSE. Let later draining ACKs through.
+                        if server_control_count <= 2 {
+                            return bach::net::monitor::Command::Drop;
+                        }
+                    }
+                }
+
+                bach::net::monitor::Command::Pass
+            });
+        }
+
+        {
+            let end_time = end_time_inner.clone();
+            let stuck_flag = stuck_flag.clone();
+            async move {
+                let client = Client::builder().build();
+                let mut stream = client.connect_sim("server:443").await.unwrap();
+
+                let body = vec![42u8; BODY_LEN];
+
+                let result = crate::testing::timeout(TRANSFER_TIMEOUT, async {
+                    // The write and shutdown may or may not succeed depending on
+                    // timing — the server may drop before we finish writing.
+                    let _ = stream.write_all(&body).await;
+                    let _ = stream.shutdown().await;
+
+                    let mut response = Vec::with_capacity(BODY_LEN);
+                    // This will error because the server panicked and dropped
+                    // the stream. The important thing is that it errors within
+                    // a reasonable time rather than hanging forever.
+                    let _ = stream.read_to_end(&mut response).await;
+                })
+                .await;
+
+                *end_time.lock().unwrap() = Some(Instant::now());
+
+                if result.is_err() {
+                    // Transfer timed out — likely hit StreamStuck
+                    stuck_flag.store(true, Ordering::Relaxed);
+                }
+            }
+            .group("client")
+            .primary()
+            .spawn();
+        }
+
+        async move {
+            let server = Server::udp().port(443).build();
+
+            while let Ok((stream, _addr)) = server.accept().await {
+                spawn(async move {
+                    let (mut recv, send) = stream.into_split();
+
+                    // Read only a small portion of the request, then "panic" by
+                    // dropping both halves abruptly without shutdown.
+                    let mut partial = vec![0u8; 1024];
+                    let _ = recv.read(&mut partial).await;
+
+                    // Simulate panic: drop both halves without calling shutdown
+                    // or writing a FIN. This triggers ShutdownKind::Errored on
+                    // both the recv and send workers.
+                    drop(send);
+                    drop(recv);
+                });
+            }
+        }
+        .group("server")
+        .spawn();
+    });
+
+    let elapsed = end_time
+        .lock()
+        .unwrap()
+        .map(|t| t.elapsed_since_start())
+        .unwrap_or(Duration::from_secs(0));
+
+    let was_stuck = stuck_detected.load(Ordering::Relaxed);
+
+    eprintln!("stream_stuck_on_receiver_panic: elapsed={elapsed:?}, stuck={was_stuck}");
+
+    // When the server panics and drops the stream, it sends a CONNECTION_CLOSE.
+    // If those first packets are lost, the server's send worker currently exits
+    // immediately via on_error → clear_inflight_state → Finished, without
+    // retransmitting the CONNECTION_CLOSE. The client then hangs until IdleTimeout
+    // at 30s — far too long.
+    //
+    // The server should retransmit the CONNECTION_CLOSE a few times before giving
+    // up, so the client learns about the failure within a few RTTs (< 1s).
+    let max_allowed = Duration::from_secs(1);
+    assert!(
+        !was_stuck && elapsed <= max_allowed,
+        "stream took too long to detect receiver panic: elapsed={elapsed:?}, \
+         was_stuck={was_stuck}; the server's CONNECTION_CLOSE was likely lost \
+         and not retransmitted, causing the client to wait for IdleTimeout"
+    );
+}
+
+/// Same as `stream_stuck_on_receiver_panic` but with the panic happening on the
+/// sender side (server panics while writing the response). This tests the
+/// complementary scenario where the sender panics and the receiver gets stuck.
+#[test]
+fn stream_stuck_on_sender_panic() {
+    const BODY_LEN: usize = 1 << 18; // 256 KiB
+    const TRANSFER_TIMEOUT: Duration = Duration::from_secs(90);
+
+    let end_time: Arc<Mutex<Option<Instant>>> = Arc::new(Mutex::new(None));
+    let end_time_inner = end_time.clone();
+
+    let stuck_detected = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stuck_flag = stuck_detected.clone();
+
+    sim(|| {
+        // Drop control packets from the server in a pattern that loses the
+        // initial CONNECTION_CLOSE but allows later retransmissions through.
+        {
+            let mut server_control_count = 0u64;
+            let mut total_count = 0u64;
+            bach::net::monitor::on_packet_sent(move |packet| {
+                total_count += 1;
+                let payload = packet.transport.payload();
+                let is_from_server = packet.source().port() == 443;
+
+                if is_from_server && !payload.is_empty() {
+                    if classify_packet(payload) == "control" {
+                        server_control_count += 1;
+                        // Drop first 8 control packets — this includes the
+                        // CONNECTION_CLOSE and early retransmissions.
+                        if server_control_count <= 8 {
+                            return bach::net::monitor::Command::Drop;
+                        }
+                    }
+                }
+
+                // Light uniform loss
+                if total_count % 13 == 0 {
+                    return bach::net::monitor::Command::Drop;
+                }
+
+                bach::net::monitor::Command::Pass
+            });
+        }
+
+        {
+            let end_time = end_time_inner.clone();
+            let stuck_flag = stuck_flag.clone();
+            async move {
+                let client = Client::builder().build();
+                let stream = client.connect_sim("server:443").await.unwrap();
+                let (mut recv, mut send) = stream.into_split();
+
+                let body = vec![42u8; BODY_LEN];
+
+                let result = crate::testing::timeout(TRANSFER_TIMEOUT, async {
+                    // Send the request
+                    send.write_all(&body).await.unwrap();
+                    send.shutdown().unwrap();
+                    drop(send);
+
+                    // Try to read the response — server will panic mid-write
+                    let mut response = vec![];
+                    let _ = recv.read_to_end(&mut response).await;
+                })
+                .await;
+
+                *end_time.lock().unwrap() = Some(Instant::now());
+
+                match result {
+                    Ok(()) => {}
+                    Err(_) => {
+                        stuck_flag.store(true, Ordering::Relaxed);
+                    }
+                }
+            }
+            .group("client")
+            .primary()
+            .spawn();
+        }
+
+        async move {
+            let server = Server::udp().port(443).build();
+
+            while let Ok((stream, _addr)) = server.accept().await {
+                spawn(async move {
+                    let (mut recv, mut send) = stream.into_split();
+
+                    // Read the full request
+                    let mut request = vec![];
+                    let _ = recv.read_to_end(&mut request).await;
+                    drop(recv);
+
+                    // Start writing the response, then "panic" partway through
+                    let response = vec![0xABu8; BODY_LEN];
+                    let half = BODY_LEN / 2;
+                    let _ = send.write_all(&response[..half]).await;
+
+                    // Simulate panic: drop the writer without shutdown/FIN
+                    drop(send);
+                });
+            }
+        }
+        .group("server")
+        .spawn();
+    });
+
+    let elapsed = end_time
+        .lock()
+        .unwrap()
+        .map(|t| t.elapsed_since_start())
+        .unwrap_or(Duration::from_secs(0));
+
+    let was_stuck = stuck_detected.load(Ordering::Relaxed);
+
+    eprintln!("stream_stuck_on_sender_panic: elapsed={elapsed:?}, stuck={was_stuck}");
+
+    // The client should detect the server's failure and terminate cleanly.
+    let max_allowed = Duration::from_secs(45);
+    assert!(
+        !was_stuck && elapsed <= max_allowed,
+        "stream got stuck after sender panic: elapsed={elapsed:?}, was_stuck={was_stuck}; \
+         the client was likely kept alive by draining-state activity while \
+         the error notification was lost"
+    );
+}
+
 /// Asserts that during a bulk unidirectional transfer, the ratio of control packets
 /// (ACKs) to stream packets stays within a reasonable bound.
 ///

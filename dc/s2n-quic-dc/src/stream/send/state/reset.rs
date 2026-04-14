@@ -12,22 +12,37 @@ type ConnectionClose = frame::ConnectionClose<'static>;
 enum State {
     #[default]
     Idle,
+    /// Reset has been queued but not yet transmitted.
     Queued,
+    /// Reset was sent for the first time. Peer activity can immediately
+    /// re-queue for retransmission since the peer clearly missed it.
     Sent,
+    Throttling,
+    ThrottlingQueued,
     Finished,
 }
 
 impl State {
     is!(is_idle, Idle);
-    is!(is_queued, Queued);
+    is!(is_queued, Queued | ThrottlingQueued);
     is!(is_sent, Sent);
+    is!(is_throttling, Throttling);
     is!(is_finished, Finished);
+    is!(
+        is_waiting_ack,
+        Queued | Sent | Throttling | ThrottlingQueued
+    );
 
     event! {
         on_reset(Idle => Queued);
-        on_sent(Queued => Sent);
-        on_ack(Sent => Finished);
-        on_silent_close(Idle => Finished);
+        // Maintain if we're throttling or not
+        on_sent(Queued => Sent, ThrottlingQueued => Throttling);
+        on_ack(Sent | Queued | Throttling | ThrottlingQueued => Finished);
+        // Reset to the non-throttled state
+        on_pto_timeout(Sent | Throttling => Queued);
+        // Trigger an immediate throttled queued
+        on_peer_activity(Sent => ThrottlingQueued);
+        on_silent_close(Idle | Queued | Sent | Throttling | ThrottlingQueued => Finished);
     }
 }
 
@@ -36,7 +51,7 @@ impl From<&State> for SenderState {
         match value {
             State::Idle => SenderState::Send,
             State::Queued => SenderState::ResetQueued,
-            State::Sent => SenderState::ResetSent,
+            State::Sent | State::Throttling | State::ThrottlingQueued => SenderState::ResetSent,
             State::Finished => SenderState::ResetRecvd,
         }
     }
@@ -75,7 +90,7 @@ impl Reset {
     }
 
     pub fn waiting_ack(&self) -> bool {
-        self.state.is_queued() || self.state.is_sent()
+        self.state.is_waiting_ack()
     }
 
     pub fn state(&self) -> Option<SenderState> {
@@ -90,8 +105,20 @@ impl Reset {
         let _ = self.state.on_ack();
     }
 
+    /// Re-enqueue the reset for retransmission on PTO timeout.
+    ///
+    /// PTO provides exponential backoff throttling. This can re-queue from
+    /// either `Sent` or `Retransmitting` states.
+    pub fn on_pto_timeout(&mut self) {
+        let _ = self.state.on_pto_timeout();
+    }
+
+    /// Called when the peer sends us a packet while we're waiting for an ACK
+    /// to our CONNECTION_CLOSE. On the first occurrence (state == `Sent`),
+    /// immediately re-queue so we retransmit quickly. After that, we're in
+    /// `Retransmitting` and PTO handles further retransmissions.
     pub fn on_peer_activity(&mut self) {
-        // TODO if we're waiting an ack then we should re-enqueue another reset. This also needs to be throttled.
+        let _ = self.state.on_peer_activity();
     }
 
     pub fn on_error(&mut self, error: Error, source: Location) -> Result<(), ()> {
@@ -123,8 +150,8 @@ impl Reset {
     }
 
     pub fn try_transmit(&mut self) -> Option<ConnectionClose> {
-        let _ = self.state.on_sent();
         let frame = self.error.as_ref()?.as_frame()?;
+        let _ = self.state.on_sent();
         Some(frame)
     }
 }

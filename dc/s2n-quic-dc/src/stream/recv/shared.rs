@@ -183,8 +183,11 @@ impl State {
 
         // If the shared error is set and the receiver hasn't transitioned yet,
         // propagate it so the application sees it immediately via check_error().
-        if let Some(stored) = shared.common.stream_error.get() {
-            if inner.receiver.check_error().is_ok() {
+        // Skip if the receiver has already successfully finished (DataRecvd/DataRead)
+        // — the application already got all its data and shouldn't see late errors
+        // like FlowResets that arrive after completion.
+        if inner.receiver.check_error().is_ok() && !inner.receiver.state().is_terminal() {
+            if let Some(stored) = shared.common.stream_error.get() {
                 let publisher = shared.publisher();
                 inner
                     .receiver

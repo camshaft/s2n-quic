@@ -141,10 +141,11 @@ where
         tag: packet::secret_control::flow_reset::Tag,
         queue_id: s2n_quic_core::varint::VarInt,
         credentials: Credentials,
+        trigger: packet::secret_control::flow_reset::Trigger,
         segment: descriptor::Filled,
     ) {
         self.non_zero
-            .dispatch_flow_reset_packet(tag, queue_id, credentials, segment);
+            .dispatch_flow_reset_packet(tag, queue_id, credentials, trigger, segment);
     }
 
     #[inline]

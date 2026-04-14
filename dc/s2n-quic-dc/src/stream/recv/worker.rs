@@ -439,9 +439,6 @@ where
         cx: &mut Context,
         received_packets: &mut usize,
     ) -> io::Result<()> {
-        // Don't process more packets if there's already a shared error
-        ensure!(self.shared.get_error().is_none(), Ok(()));
-
         // loop until we hit Pending from the socket
         loop {
             // try_lock the state before reading so we don't consume a packet the application is

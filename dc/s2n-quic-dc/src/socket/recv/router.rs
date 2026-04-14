@@ -114,13 +114,20 @@ pub trait Router: 'static {
                         let tag = packet.tag();
                         let queue_id = packet.queue_id();
                         let credentials = *packet.credentials();
+                        let trigger = packet.trigger();
 
                         #[cfg(debug_assertions)]
                         let _span = tracing::info_span!("recv::flow_reset", peer_addr = %remote_address, flow_id = %credentials).entered();
 
-                        tracing::trace!(?tag, ?queue_id, %credentials, "parsed_flow_reset_packet");
+                        tracing::trace!(?tag, ?queue_id, %credentials, ?trigger, "parsed_flow_reset_packet");
                         self.handle_flow_reset_packet(remote_address, ecn, packet);
-                        self.dispatch_flow_reset_packet(tag, queue_id, credentials, segment);
+                        self.dispatch_flow_reset_packet(
+                            tag,
+                            queue_id,
+                            credentials,
+                            trigger,
+                            segment,
+                        );
                     }
                     packet::Packet::StaleKey(packet) => {
                         tracing::trace!(?packet, "parsed_stale_key_packet");
@@ -256,6 +263,7 @@ pub trait Router: 'static {
         tag: packet::secret_control::flow_reset::Tag,
         queue_id: VarInt,
         credentials: Credentials,
+        trigger: packet::secret_control::flow_reset::Trigger,
         segment: descriptor::Filled,
     ) {
         warn!(
@@ -264,6 +272,7 @@ pub trait Router: 'static {
             ?tag,
             queue_id = queue_id.as_u64(),
             %credentials,
+            ?trigger,
             remote_address = %segment.remote_address(),
             packet_len = segment.len()
         );

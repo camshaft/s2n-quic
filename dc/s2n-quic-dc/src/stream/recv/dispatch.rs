@@ -265,6 +265,7 @@ impl crate::socket::recv::router::Router for Dispatch {
         _tag: packet::secret_control::flow_reset::Tag,
         queue_id: VarInt,
         credentials: Credentials,
+        trigger: packet::secret_control::flow_reset::Trigger,
         segment: desc::Filled,
     ) {
         let payload_len = segment.len();
@@ -274,11 +275,12 @@ impl crate::socket::recv::router::Router for Dispatch {
                 return Err(Error::Unallocated(segment));
             }
 
-            // try to send to the stream queue first and fall back to the control queue
-            match sender.send_stream(segment) {
-                Ok(v) => Ok(v),
-                Err(Error::Closed) => Err(Error::Closed),
-                Err(Error::Unallocated(segment)) => sender.send_control(segment),
+            // Route FlowReset to the correct queue based on what triggered it:
+            // - Stream trigger → send worker needs it → control queue
+            // - Control trigger → recv worker needs it → stream queue
+            match trigger {
+                packet::secret_control::flow_reset::Trigger::Stream => sender.send_control(segment),
+                packet::secret_control::flow_reset::Trigger::Control => sender.send_stream(segment),
             }
         });
 
@@ -289,7 +291,8 @@ impl crate::socket::recv::router::Router for Dispatch {
                     %queue_id,
                     payload_len,
                     overflow = prev.is_some(),
-                    "send_stream"
+                    ?trigger,
+                    "dispatch_flow_reset"
                 );
             }
             Err(Error::Closed) => {

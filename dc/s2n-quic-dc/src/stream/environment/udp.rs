@@ -4,7 +4,7 @@
 use crate::{
     busy_poll,
     credentials::Credentials,
-    packet::Packet,
+    packet::{secret_control::flow_reset, Packet},
     path::secret::Map,
     socket::{
         pool::{self, descriptor},
@@ -144,18 +144,23 @@ impl Config {
         let task = async move {
             let mut out_buffer = [0u8; 1500];
 
+            tracing::debug!("unroutable_packets task started");
+
             while let Ok(mut descriptor) = rx.recv_front().await {
+                tracing::debug!(remote_addr = %descriptor.remote_address().get(), "unroutable_packets: processing descriptor");
                 let peer = descriptor.remote_address().get().into();
                 let buffer = DecoderBufferMut::new(descriptor.payload_mut());
                 let Ok((packet, _)) = Packet::decode_parameterized_mut(16, buffer) else {
+                    tracing::debug!("unroutable_packets: failed to decode packet");
                     continue;
                 };
+
                 let params = match packet {
                     Packet::Stream(packet) => {
                         let credentials = *packet.credentials();
                         packet
                             .source_queue_id()
-                            .map(|queue_id| (credentials, queue_id))
+                            .map(|queue_id| (credentials, queue_id, flow_reset::Trigger::Stream))
                     }
                     Packet::Datagram(packet) => {
                         // datagrams are not routable
@@ -166,7 +171,7 @@ impl Config {
                         let credentials = *packet.credentials();
                         packet
                             .source_queue_id()
-                            .map(|queue_id| (credentials, queue_id))
+                            .map(|queue_id| (credentials, queue_id, flow_reset::Trigger::Control))
                     }
                     Packet::FlowReset(packet) => {
                         // Don't reply to flow reset packets to avoid looping
@@ -187,18 +192,23 @@ impl Config {
                     }
                 };
 
-                let Some((credentials, queue_id)) = params else {
+                let Some((credentials, queue_id, trigger)) = params else {
+                    tracing::debug!("unroutable_packets: no source_queue_id, skipping");
                     continue;
                 };
+
+                tracing::debug!(%credentials, %queue_id, "unroutable_packets: sending FlowReset");
 
                 let packet = crate::packet::secret_control::FlowReset {
                     credentials,
                     wire_version: crate::packet::WireVersion::ZERO,
                     queue_id,
                     code: crate::stream::error::Kind::FLOW_RESET_CODE.into(),
+                    trigger,
                 };
 
                 let Some(len) = map.sign_flow_reset_packet(&packet, &mut out_buffer) else {
+                    tracing::debug!("unroutable_packets: sign_flow_reset_packet returned None");
                     continue;
                 };
 
@@ -206,7 +216,8 @@ impl Config {
                 let ecn = Default::default();
                 let buffer = &out_buffer[..len];
                 let buffer = &[std::io::IoSlice::new(buffer)];
-                let _ = socket.try_send(remote_addr, ecn, buffer);
+                let result = socket.try_send(remote_addr, ecn, buffer);
+                tracing::debug!(%remote_addr, len, ?result, "unroutable_packets: try_send FlowReset");
             }
         };
         (tx, task)
