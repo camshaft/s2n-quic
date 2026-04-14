@@ -8,7 +8,7 @@ use crate::{
     packet::stream,
     socket::pool,
     stream::{
-        error::{Error as StreamError, StoredError},
+        error::{Error as StreamError, StoredError, self},
         recv::shared as recv,
         send::{application, shared as send},
         tls::S2nTlsConnection,
@@ -229,6 +229,13 @@ where
     /// Stores a fatal error in the shared `OnceLock` and notifies all other actors.
     #[inline]
     pub fn set_error(&self, error: StreamError, source: Location, actor: Option<(Half, Actor)>) {
+        // NormalClose (error_code=0) is a half-close signal, not a fatal error.
+        // It means one direction is closing gracefully and should not poison the
+        // entire bidirectional stream. Don't set the shared error for NormalClose.
+        if matches!(error.kind(), error::Kind::NormalClose) {
+            return;
+        }
+
         let stored = StoredError { error, source };
 
         // First writer wins. If the error was already set, return immediately.
