@@ -1029,9 +1029,19 @@ impl State {
         clock: &impl Clock,
         app_stream_offset: VarInt,
     ) {
+        let is_terminal = self.state().is_terminal();
+
         let mut should_reset_pto = false;
 
         queue.drain_completion_queue(|transmission| {
+            if is_terminal {
+                // If we're in a terminal state, don't process completions.
+                // Completions may arrive after clear_inflight_state() has been called (e.g., from on_error()),
+                // and processing them would insert packets into empty maps while counters remain at zero,
+                // causing invariant violations.
+                return;
+            }
+
             let (packet_number, mut info) = transmission.info;
             let transmission_time: Timestamp = transmission.transmission_time.into();
 

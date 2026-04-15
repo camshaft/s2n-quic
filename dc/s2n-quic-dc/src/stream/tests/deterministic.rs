@@ -1320,3 +1320,105 @@ fn bulk_transfer_control_packet_ratio() {
         "control-to-stream packet ratio is too high: {ratio:.3} (expected <= 0.5); {counts}"
     );
 }
+
+/// Regression test for InflightCounters bug under control packet starvation.
+///
+/// This test reproduces a counter tracking bug that occurred when:
+/// - Stream enters terminal state via error → `clear_inflight_state()` clears counters/maps
+/// - Transmission completions arrive after clearing
+/// - `load_completion_queue()` processes them, inserting packets into empty maps
+/// - Result: maps contain packets but counters are zero → invariant violation
+///
+/// The bug was fixed by adding a terminal state check in `load_completion_queue()`
+/// (send/state.rs:1026) to prevent processing completions after the stream has ended.
+///
+/// Test scenario: 95% control packet loss + 40% stream packet loss creates conditions
+/// where the stream errors out while many transmission completions are still pending.
+#[test]
+fn inflight_counters_control_packet_starvation() {
+    const BODY_LEN: usize = 1 << 18; // 256 KiB
+    const TRANSFER_TIMEOUT: Duration = Duration::from_secs(400);
+
+    let packet_counts = PacketCounts::default();
+    let monitor_counts = packet_counts.clone();
+
+    sim(|| {
+        // Selective loss: mostly drop control packets, allow most stream packets
+        {
+            let counts = monitor_counts.clone();
+            let mut stream_count = 0u64;
+            let mut control_count = 0u64;
+            bach::net::monitor::on_packet_sent(move |packet| {
+                let payload = packet.transport.payload();
+
+                if !payload.is_empty() {
+                    counts.record(payload);
+
+                    let packet_type = classify_packet(payload);
+
+                    match packet_type {
+                        "control" => {
+                            control_count += 1;
+                            // Drop 95% of control packets
+                            if control_count % 20 != 1 {
+                                return bach::net::monitor::Command::Drop;
+                            }
+                        }
+                        "stream" => {
+                            stream_count += 1;
+                            // Drop 40% of stream packets
+                            if stream_count % 5 == 0 || stream_count % 5 == 1 {
+                                return bach::net::monitor::Command::Drop;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+
+                bach::net::monitor::Command::Pass
+            });
+        }
+
+        async move {
+            let client = Client::builder().build();
+            let mut stream = client.connect_sim("server:443").await.unwrap();
+
+            let body = vec![42u8; BODY_LEN];
+
+            let result = crate::testing::timeout(TRANSFER_TIMEOUT, async {
+                stream.write_all(&body).await.unwrap();
+                stream.shutdown().await.unwrap();
+
+                let mut response = vec![];
+                stream.read_to_end(&mut response).await.unwrap();
+                assert_eq!(response, body);
+            })
+            .await;
+
+            result.expect("transfer should complete despite control packet starvation");
+        }
+        .group("client")
+        .primary()
+        .spawn();
+
+        async move {
+            let server = Server::udp().port(443).build();
+
+            while let Ok((mut stream, _addr)) = server.accept().await {
+                spawn(async move {
+                    let mut request = vec![];
+                    stream.read_to_end(&mut request).await.unwrap();
+                    stream.write_all(&request).await.unwrap();
+                });
+            }
+        }
+        .group("server")
+        .spawn();
+    });
+
+    let ratio = packet_counts.control_to_stream_ratio();
+    eprintln!(
+        "inflight_counters_control_packet_starvation: {}, ratio={:.3}",
+        packet_counts, ratio
+    );
+}
