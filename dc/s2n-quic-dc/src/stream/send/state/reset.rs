@@ -122,17 +122,22 @@ impl Reset {
     }
 
     pub fn on_error(&mut self, error: Error, source: Location) -> Result<(), ()> {
+        let is_idle_timeout = matches!(error.kind(), Kind::IdleTimeout);
+
         if self.error.is_some() {
             // If the remote peer also sent us an error then we're done
             if source.is_remote() {
                 let _ = self.state.on_silent_close();
             }
+            // Special case: IdleTimeout should always trigger cleanup even when error exists
+            if is_idle_timeout {
+                let _ = self.state.on_silent_close();
+                return Ok(());
+            }
             return Err(());
         }
 
         self.error = Some(ErrorState { error, source });
-
-        let is_idle_timeout = matches!(error.kind(), Kind::IdleTimeout);
 
         if source.is_remote() || is_idle_timeout {
             let _ = self.state.on_silent_close();
