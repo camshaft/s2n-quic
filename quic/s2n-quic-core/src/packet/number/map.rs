@@ -97,6 +97,7 @@ impl<V> Map<V> {
             self.end = packet_number;
             self.values[0] = Some(value);
             self.index = 0;
+            self.invariants();
             return;
         }
 
@@ -123,6 +124,7 @@ impl<V> Map<V> {
 
         self.values[index] = Some(value);
         self.end = packet_number;
+        self.invariants();
     }
 
     /// Inserts the given `value` into the map or updates the existing entry
@@ -137,6 +139,7 @@ impl<V> Map<V> {
             self.end = packet_number;
             self.values[0] = Some(value);
             self.index = 0;
+            self.invariants();
             return;
         }
 
@@ -169,6 +172,7 @@ impl<V> Map<V> {
         }
 
         self.end = self.end.max(packet_number);
+        self.invariants();
     }
 
     /// Returns a reference to the `V` associated with the given `packet_number`
@@ -190,7 +194,8 @@ impl<V> Map<V> {
             //              [_, _, _, 3]
             // remove(3) => [_, _, _, _]
             (true, true) => {
-                self.clear();
+                // We've consumed the entry above so no need to iterate over the values
+                self.logical_clear();
             }
             // the packet was removed from the front
             //              [0, 1, _, 3, 4]
@@ -216,6 +221,7 @@ impl<V> Map<V> {
             }
         }
 
+        self.invariants();
         Some(info)
     }
 
@@ -252,7 +258,67 @@ impl<V> Map<V> {
     /// Clears all of the packet information in the sent
     #[inline]
     pub fn clear(&mut self) {
+        if self.is_empty() {
+            return;
+        }
+
+        // Clear only the occupied slots by iterating from start to end
+        for pn in PacketNumberRange::new(self.start, self.end) {
+            if let Some(index) = self.pn_index(pn) {
+                self.values[index] = None;
+            }
+        }
+
+        self.logical_clear();
+        self.invariants();
+    }
+
+    /// Logically clears the map but doesn't free any of the value entries.
+    ///
+    /// Only use this if you can guarantee the memory will eventually be removed by
+    /// other means, e.g. lazily by a consuming iterator.
+    fn logical_clear(&mut self) {
+        // Set the index to the sentinel value to mark the map as empty
         self.index = self.values.len();
+    }
+
+    #[cfg(not(test))]
+    #[inline(always)]
+    fn invariants(&self) {}
+
+    #[cfg(test)]
+    fn invariants(&self) {
+        // INVARIANT: if is_empty() returns true, all value slots must be None
+        if self.is_empty() {
+            for (idx, slot) in self.values.iter().enumerate() {
+                assert!(
+                    slot.is_none(),
+                    "map is_empty() but slot {} has a value; index={}, len={}",
+                    idx,
+                    self.index,
+                    self.values.len()
+                );
+            }
+        }
+
+        // INVARIANT: index must be within bounds or equal to len (empty marker)
+        assert!(
+            self.index <= self.values.len(),
+            "index out of bounds: index={}, len={}",
+            self.index,
+            self.values.len()
+        );
+
+        // INVARIANT: if not empty, the slot at index must be Some
+        if !self.is_empty() {
+            assert!(
+                self.values[self.index].is_some(),
+                "map not empty but index slot is None; index={}, start={:?}, end={:?}",
+                self.index,
+                self.start,
+                self.end
+            );
+        }
     }
 
     #[inline]
@@ -362,8 +428,12 @@ macro_rules! impl_iter {
                 let start = packets.start;
                 let end = packets.end;
                 let index = packets.index;
-                let len = packets.values.len();
+                let capacity = packets.values.len();
+                let is_empty = packets.is_empty();
 
+                // Split the ring buffer at the index. The slice after the index (head)
+                // contains the start of the logical range, and the slice before (tail)
+                // contains the end, due to the ring wrapping.
                 let (tail, head) = packets.values.$split(index);
                 let iter = head.into_iter().chain(tail);
 
@@ -374,8 +444,8 @@ macro_rules! impl_iter {
                     remaining: 0,
                 };
 
-                // make sure we have at least one packet
-                if len == 0 {
+                // if the map is logically empty, return early
+                if is_empty {
                     return iter;
                 }
 
@@ -384,7 +454,7 @@ macro_rules! impl_iter {
                 // we always have at least 1 items since the range is inclusive
                 iter.remaining += 1;
 
-                debug_assert!(iter.remaining <= len);
+                debug_assert!(iter.remaining <= capacity);
 
                 iter
             }
@@ -458,10 +528,9 @@ impl<'a, V> RemoveIter<'a, V> {
             (Less, Equal) | (Less, Greater) | (Equal, Greater) | (Equal, Equal) => {
                 // deleting all entries
 
-                // clear the sent packets
-                //
-                // NOTE: this doesn't actually delete anything in the buffer
-                iter.packets.clear();
+                // Mark all of the packets as cleared but let the iterator be consumed/dropped
+                // to actually clear out all of the entries.
+                iter.packets.logical_clear();
 
                 // no need to update index as it's already set to the lower bound
             }
@@ -669,6 +738,8 @@ mod tests {
         Remove(VarInt),
         // Removes a range of packet numbers
         RemoveRange(VarInt, VarInt),
+        // Clears the map
+        Clear,
     }
 
     fn model(ops: &[Operation]) {
@@ -726,6 +797,12 @@ mod tests {
                 self.check_consistency();
             }
 
+            pub fn clear(&mut self) {
+                self.subject.clear();
+                self.oracle.clear();
+                self.check_consistency();
+            }
+
             fn check_consistency(&self) {
                 let mut subject = self.subject.iter();
                 let mut oracle = self.oracle.iter();
@@ -740,6 +817,19 @@ mod tests {
                         }
                     }
                 }
+
+                // Check for memory leaks: count actual Some values in storage
+                let actual_stored_count =
+                    self.subject.values.iter().filter(|v| v.is_some()).count();
+                let expected_count = self.oracle.len();
+                assert_eq!(
+                    actual_stored_count,
+                    expected_count,
+                    "Memory leak detected: {} values stored but only {} in oracle (leaked {} values)",
+                    actual_stored_count,
+                    expected_count,
+                    actual_stored_count.saturating_sub(expected_count)
+                );
             }
         }
 
@@ -771,6 +861,9 @@ mod tests {
 
                     model.remove_range(range);
                 }
+                Operation::Clear => {
+                    model.clear();
+                }
             }
         }
     }
@@ -797,5 +890,49 @@ mod tests {
             assert!(map.get(pn).is_some());
             assert!(!map.is_empty());
         });
+    }
+
+    /// Regression test for bug where clear() didn't actually clear values,
+    /// leaving the map in an inconsistent state where is_empty() == true
+    /// but value slots still contained Some(...).
+    ///
+    /// This caused iterator/invariant checks to fail because they assumed
+    /// is_empty() == true meant all slots were None.
+    #[test]
+    fn clear_actually_clears_values() {
+        let space = PacketNumberSpace::ApplicationData;
+        let mut map = Map::default();
+
+        // Insert some values
+        for i in 0u8..5u8 {
+            let pn = space.new_packet_number(i.into());
+            map.insert(pn, i);
+        }
+
+        assert!(!map.is_empty());
+        assert_eq!(map.iter().count(), 5);
+
+        // Clear the map
+        map.clear();
+
+        // The map should be empty
+        assert!(map.is_empty());
+        assert_eq!(map.iter().count(), 0);
+
+        // CRITICAL: All value slots should be None when is_empty() == true
+        // This is the invariant that was violated before the fix
+        for (idx, slot) in map.values.iter().enumerate() {
+            assert!(
+                slot.is_none(),
+                "After clear(), slot {} should be None but contains a value",
+                idx
+            );
+        }
+
+        // The map should be usable after clear
+        let pn = space.new_packet_number(100u8.into());
+        map.insert(pn, 100);
+        assert!(!map.is_empty());
+        assert_eq!(map.get(pn), Some(&100));
     }
 }
