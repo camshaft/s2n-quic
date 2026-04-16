@@ -940,6 +940,12 @@ impl State {
             // the value
             let last_peer_activity = load_last_activity();
             self.update_idle_timer(&last_peer_activity);
+
+            // If timer still isn't armed after update attempt, it means we're in a state
+            // where the timer shouldn't run (e.g., error state, terminal state)
+            if self.idle_timer.next_expiration().is_none() {
+                return Poll::Pending;
+            }
         }
 
         Poll::Ready(())
