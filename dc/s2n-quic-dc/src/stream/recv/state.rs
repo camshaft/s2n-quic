@@ -132,7 +132,7 @@ impl State {
         // if we've already received everything then no need to notify the peer to stop
         ensure!(matches!(self.state, Receiver::Recv | Receiver::SizeKnown));
         self.on_error(
-            error::Kind::ApplicationError { error },
+            error::Kind::from_application_code(error.into()),
             Location::Local,
             publisher,
         );
@@ -686,10 +686,11 @@ impl State {
 
         if matches!(source, Location::Local)
             && !is_idle_timeout
-            && matches!(error.kind(), error::Kind::ApplicationError { .. })
+            && error.kind().as_connection_close().is_some()
         {
-            // The application abandoned the stream (stop_sending). Clear ACK
-            // state but keep the transmission state machine alive so the queued
+            // The application abandoned the stream (stop_sending) or experienced
+            // an application-level error (panic, accept queue full, etc.). Clear
+            // ACK state but keep the transmission state machine alive so the queued
             // connection-close can be transmitted to the peer, notifying the
             // sender to stop.
             self.transmission.clear_acks();
