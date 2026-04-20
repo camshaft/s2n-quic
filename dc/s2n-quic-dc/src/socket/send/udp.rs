@@ -14,6 +14,7 @@ use crate::{
 };
 use std::{
     future::{poll_fn, Future},
+    pin::pin,
     task::Poll,
     time::Duration,
 };
@@ -132,16 +133,38 @@ async fn wheel_ticker<Info, Meta, C, S, I, const GRANULARITY_US: u64>(
     .await;
 
     let mut timer = clock.timer();
+    let mut pending_queue = Queue::new();
 
     loop {
         let now: Timestamp = timer.now();
 
         // Advance the wheel to now and collect due entries
-        let queue = ticker.tick_to(now.into());
+        let mut queue = ticker.tick_to(now.into());
+
+        // Append to pending queue from previous iteration
+        pending_queue.append(&mut queue);
 
         // Only send non-empty queues to avoid unnecessary wakeups
-        if !queue.is_empty() {
-            if tx.send(queue).await.is_err() {
+        if !pending_queue.is_empty() {
+            let to_send = core::mem::take(&mut pending_queue);
+            let mut send_fut = pin!(tx.send(to_send));
+
+            // Poll the send future, ticking the wheel while blocked
+            let result = poll_fn(|cx| {
+                match send_fut.as_mut().poll(cx) {
+                    Poll::Ready(result) => Poll::Ready(result),
+                    Poll::Pending => {
+                        // While send is blocked, tick the wheel and accumulate
+                        let now: Timestamp = timer.now();
+                        let mut new_queue = ticker.tick_to(now.into());
+                        pending_queue.append(&mut new_queue);
+                        Poll::Pending
+                    }
+                }
+            })
+            .await;
+
+            if result.is_err() {
                 return;
             }
         }
