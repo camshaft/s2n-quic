@@ -34,8 +34,9 @@ impl<C: precision::Clock + Send + Sync + Clone> precision::Timer for Timer<C> {
     }
 
     async fn sleep_until(&mut self, target: Timestamp) {
+        let mut yielded = false;
         poll_fn(|_cx| {
-            if self.clock.now().nanos >= target.nanos {
+            if core::mem::replace(&mut yielded, true) && self.clock.now().nanos >= target.nanos {
                 Poll::Ready(())
             } else {
                 Poll::Pending

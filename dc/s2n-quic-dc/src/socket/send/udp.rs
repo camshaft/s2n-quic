@@ -167,10 +167,10 @@ async fn wheel_ticker<Info, Meta, C, S, I, const GRANULARITY_US: u64>(
             if result.is_err() {
                 return;
             }
+        } else {
+            // Yield / sleep using the idle strategy
+            idle.idle(&ticker, &mut timer).await;
         }
-
-        // Yield / sleep using the idle strategy
-        idle.idle(&ticker, &mut timer).await;
     }
 }
 
@@ -193,8 +193,31 @@ where
 {
     let mut timer = clock.timer();
     let mut bucket = TokenBucket::new(timer.now(), &rate);
+    let mut packets_per_poll = 0u32;
 
-    while let Some(mut entry) = rx.recv().await {
+    loop {
+        packets_per_poll += 1;
+
+        let mut recv_fut = pin!(rx.recv());
+        let Some(mut entry) = poll_fn(|cx| {
+            if packets_per_poll > 10 {
+                cx.waker().wake_by_ref();
+                packets_per_poll = 0;
+                return Poll::Pending;
+            }
+
+            let result = recv_fut.as_mut().poll(cx);
+            if result.is_pending() {
+                // If recv returned Pending, we yielded. Reset counters.
+                packets_per_poll = 0;
+            }
+            result
+        })
+        .await
+        else {
+            break;
+        };
+
         // Try to upgrade the completion channel before sending.
         let total_len = entry.total_len as u64;
         let Some(completion) = entry.completion.upgrade() else {
@@ -218,9 +241,13 @@ where
         let now = timer.now();
         let cost_nanos = rate.nanos_for_bytes(total_len);
         let sleep_nanos = bucket.consume(now, cost_nanos);
+
         if sleep_nanos > 0 {
             let target = now + Duration::from_nanos(sleep_nanos);
             timer.sleep_until(target).await;
+
+            // Reset counters after yielding
+            packets_per_poll = 0;
         }
     }
 
@@ -353,8 +380,9 @@ impl Rate {
         // nanos/byte = 8 / Gbps
         let nanos_per_byte = 8.0 / gigabits_per_second;
 
-        // Allow up to 256KB worth of burst (4x GSO batches)
-        let burst_nanos = (4.0 * u16::MAX as f64 * nanos_per_byte) as u64;
+        // Allow up to 64KB worth of burst (1x GSO batch)
+        // Reduced from 256KB to avoid overwhelming NIC TX ring
+        let burst_nanos = (u16::MAX as f64 * nanos_per_byte) as u64;
 
         Self {
             nanos_per_byte,

@@ -159,10 +159,17 @@ impl Runner {
         let _guard = AbortOnPanic;
 
         loop {
-            const ITERATIONS: usize = if cfg!(debug_assertions) { 10 } else { 10_000 };
+            const ITERATIONS: usize = if cfg!(debug_assertions) { 10 } else { 100 };
 
             for _ in 0..ITERATIONS {
                 tasks.poll(&mut cx);
+            }
+
+            // Yield to allow other threads (especially SCHED_OTHER threads like Tokio runtime)
+            // to make progress when running with RT scheduling
+            #[cfg(target_os = "linux")]
+            unsafe {
+                libc::sched_yield();
             }
 
             if let Some(state) = state.upgrade() {

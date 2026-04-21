@@ -63,6 +63,8 @@ pub fn blocking<S: AsRawFd, R: Router>(socket: S, alloc: pool::Pool, mut router:
 pub async fn non_blocking<S: Socket, R: Router>(socket: S, alloc: pool::Pool, mut router: R) {
     let mut pending = None;
     core::future::poll_fn(move |cx| {
+        let mut count = 0;
+
         while router.is_open() {
             let unfilled = pending.take().or_else(|| alloc.alloc());
 
@@ -88,6 +90,13 @@ pub async fn non_blocking<S: Socket, R: Router>(socket: S, alloc: pool::Pool, mu
                     }
 
                     // poll the socket again
+                    count += 1;
+
+                    if count > 10 {
+                        cx.waker().wake_by_ref();
+                        return Poll::Pending;
+                    }
+
                     continue;
                 }
                 Err((desc, err)) => {
