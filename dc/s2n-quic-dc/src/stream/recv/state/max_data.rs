@@ -154,10 +154,12 @@ impl MaxData {
 
     /// Called when we receive a DATA_BLOCKED frame from the peer.
     ///
-    /// If our max_data is higher than what the peer sees, we queue a retransmission.
+    /// If our max_data is higher than or equal to what the peer sees, we queue a retransmission.
+    /// The equal case handles when the sender is blocked exactly at the advertised limit
+    /// and on_read has advanced pending_value but no packet has been sent yet.
     #[inline]
     pub fn on_data_blocked(&mut self, peer_limit: VarInt) {
-        if peer_limit < self.pending_value {
+        if peer_limit <= self.pending_value {
             // The sender is behind — they haven't received our latest MAX_DATA.
             // If we're inflight, the packet may have been lost, so re-queue.
             if self.state.is_inflight() {
