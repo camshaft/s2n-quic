@@ -115,14 +115,9 @@ impl MaxData {
 
     /// Called after reading from the buffer to potentially advance the max_data window.
     ///
-    /// Updates the pending max_data value but does NOT independently trigger a
-    /// control packet transmission. The updated value will be piggybacked on the
-    /// next ACK control packet. This prevents max_data window advancement from
-    /// inflating the control packet rate during bulk transfers.
-    ///
-    /// If the sender becomes flow-blocked, it will send a DATA_BLOCKED frame,
-    /// which triggers an immediate dedicated max_data transmission via
-    /// [`on_data_blocked`].
+    /// Updates the pending max_data value. If we have a new value and nothing is currently
+    /// queued or inflight, transitions to Queued state so the new limit will be sent.
+    /// This ensures the sender receives updated flow control credits promptly.
     ///
     /// Returns `true` if the pending value was updated.
     #[inline]
@@ -149,17 +144,22 @@ impl MaxData {
         // Reset backoff when we have a genuinely new value
         self.retransmit_timeout = INITIAL_RETRANSMIT_TIMEOUT;
 
+        // If we have a new value that hasn't been transmitted yet and we're idle,
+        // queue it for transmission. This prevents deadlock when the sender is
+        // flow-blocked and on_read advances the window.
+        if self.pending_value > self.transmitted_value && self.state.is_idle() {
+            let _ = self.state.on_queued();
+        }
+
         true
     }
 
     /// Called when we receive a DATA_BLOCKED frame from the peer.
     ///
-    /// If our max_data is higher than or equal to what the peer sees, we queue a retransmission.
-    /// The equal case handles when the sender is blocked exactly at the advertised limit
-    /// and on_read has advanced pending_value but no packet has been sent yet.
+    /// If our max_data is higher than what the peer sees, we queue a retransmission.
     #[inline]
     pub fn on_data_blocked(&mut self, peer_limit: VarInt) {
-        if peer_limit <= self.pending_value {
+        if peer_limit < self.pending_value {
             // The sender is behind — they haven't received our latest MAX_DATA.
             // If we're inflight, the packet may have been lost, so re-queue.
             if self.state.is_inflight() {
