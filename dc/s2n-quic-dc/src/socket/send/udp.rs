@@ -139,7 +139,7 @@ async fn wheel_ticker<Info, Meta, C, S, I, const GRANULARITY_US: u64>(
         let now: Timestamp = timer.now();
 
         // Advance the wheel to now and collect due entries
-        let mut queue = ticker.tick_to(now.into());
+        let mut queue = ticker.tick_to(now);
 
         // Append to pending queue from previous iteration
         pending_queue.append(&mut queue);
@@ -156,7 +156,7 @@ async fn wheel_ticker<Info, Meta, C, S, I, const GRANULARITY_US: u64>(
                     Poll::Pending => {
                         // While send is blocked, tick the wheel and accumulate
                         let now: Timestamp = timer.now();
-                        let mut new_queue = ticker.tick_to(now.into());
+                        let mut new_queue = ticker.tick_to(now);
                         pending_queue.append(&mut new_queue);
                         Poll::Pending
                     }

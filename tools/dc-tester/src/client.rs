@@ -15,7 +15,7 @@ use std::{
     time::Duration,
 };
 use tokio::io::AsyncWriteExt;
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 
 type Subscriber = crate::psk::Subscriber;
 type Client = s2n_quic_dc::stream::client::tokio::Client<psk::client::Provider, Subscriber>;
@@ -187,7 +187,7 @@ async fn run_worker(
         .await
         {
             Ok((sent, received)) => (sent, received, false),
-            Err(e) => {
+            Err(_e) => {
                 // error!(
                 //     workload = %workload.name,
                 //     worker_id,

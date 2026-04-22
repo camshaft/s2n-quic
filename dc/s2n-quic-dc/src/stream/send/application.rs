@@ -351,7 +351,7 @@ where
                 cx,
                 limit,
                 self.sockets.write_application(),
-                &mut self.timer,
+                &self.timer,
                 &self.shared.subscriber,
             )?;
 

@@ -66,7 +66,7 @@ impl PoolSocket {
 
         let create_socket = || {
             let wheel = send::wheel::Wheel::new();
-            let socket = stream::socket::Wheel::new(wheel, local_addr.into());
+            let socket = stream::socket::Wheel::new(wheel, local_addr);
             Tracing(socket)
         };
 

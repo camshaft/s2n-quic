@@ -677,7 +677,7 @@ mod tests {
         time: Option<precision::Timestamp>,
     ) -> Entry<(), u16, ()> {
         let mut entry = Entry::new(create_transmission(pool, payload_len));
-        entry.transmission_time = time.map(Into::into);
+        entry.transmission_time = time;
         entry
     }
 
@@ -894,7 +894,7 @@ mod tests {
             let pool = pool.clone();
             handles.push(thread::spawn(move || {
                 for i in 0..100u16 {
-                    let payload = (t * 1000 + i) as u16;
+                    let payload = t * 1000 + i;
                     let entry = create_entry_at(&pool, payload, Some(time));
                     wheel.insert(entry);
                 }
@@ -1083,7 +1083,7 @@ mod tests {
                     let tick = entry
                         .transmission_time
                         .map(|ts| {
-                            let p: precision::Timestamp = ts.into();
+                            let p: precision::Timestamp = ts;
                             Wheel::timestamp_to_tick(p)
                         })
                         .unwrap_or(start_tick)

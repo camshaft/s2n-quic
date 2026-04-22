@@ -58,13 +58,13 @@ where
         let res = udp::peek(&self.0);
 
         match res {
-            Ok(len) => return Ok(len).into(),
+            Ok(len) => Ok(len).into(),
             Err(ref e)
                 if [io::ErrorKind::WouldBlock, io::ErrorKind::Interrupted].contains(&e.kind()) =>
             {
-                return Poll::Pending;
+                Poll::Pending
             }
-            Err(err) => return Err(err).into(),
+            Err(err) => Err(err).into(),
         }
     }
 
@@ -153,13 +153,13 @@ where
         let res = udp::send(&self.0, addr, ecn, buffer, Default::default());
 
         match res {
-            Ok(len) => return Ok(len).into(),
+            Ok(len) => Ok(len).into(),
             Err(ref e)
                 if [io::ErrorKind::WouldBlock, io::ErrorKind::Interrupted].contains(&e.kind()) =>
             {
-                return Poll::Pending;
+                Poll::Pending
             }
-            Err(err) => return Err(err).into(),
+            Err(err) => Err(err).into(),
         }
     }
 

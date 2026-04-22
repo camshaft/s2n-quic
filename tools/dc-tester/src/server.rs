@@ -14,7 +14,7 @@ use std::{
     time::Duration,
 };
 use tokio::io::AsyncReadExt;
-use tracing::{error, info};
+use tracing::info;
 
 type Subscriber = crate::psk::Subscriber;
 type Server = s2n_quic_dc::stream::server::tokio::Server<psk::server::Provider, Subscriber>;
@@ -115,14 +115,14 @@ pub async fn run(config: ServerConfig, trace_dir: &PathBuf) -> io::Result<()> {
     }
 
     loop {
-        let (stream, peer_addr) = server.accept().await?;
+        let (stream, _peer_addr) = server.accept().await?;
 
         let stats = stats.clone();
         tokio::spawn(async move {
             stats.start_request();
             let (bytes_received, bytes_sent, is_error) = match handle_connection(stream).await {
                 Ok((recv, sent)) => (recv, sent, false),
-                Err(e) => {
+                Err(_e) => {
                     // error!(%peer_addr, error = %e, "Error handling connection");
                     (0, 0, true)
                 }

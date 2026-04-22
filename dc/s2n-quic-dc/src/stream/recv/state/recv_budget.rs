@@ -96,7 +96,7 @@ impl RecvBudget {
     pub fn new(max_window: VarInt, max_datagram_size: u16) -> Self {
         let min_window = MIN_WINDOW_SEGMENTS * max_datagram_size as u64;
         Self {
-            max_window: *max_window as u64,
+            max_window: *max_window,
             min_window,
             rtt: FeedbackRtt::default(),
             drain: DrainRate::default(),
@@ -164,7 +164,7 @@ impl RecvBudget {
         }
 
         // window = drain_rate × min_rtt × MULTIPLIER
-        let rtt_secs_numer = min_rtt.as_nanos() as u128;
+        let rtt_secs_numer = min_rtt.as_nanos();
         let window = (rate as u128)
             .saturating_mul(rtt_secs_numer)
             .saturating_mul(WINDOW_MULTIPLIER as u128)
@@ -217,7 +217,7 @@ impl FeedbackRtt {
         }
 
         // Update min_rtt.
-        if self.min_rtt.map_or(true, |prev| rtt_sample < prev) {
+        if self.min_rtt.is_none_or(|prev| rtt_sample < prev) {
             self.min_rtt = Some(rtt_sample);
             self.min_rtt_stamp = Some(now);
         }

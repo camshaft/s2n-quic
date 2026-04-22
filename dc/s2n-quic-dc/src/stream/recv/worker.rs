@@ -595,7 +595,7 @@ where
 
         let info = transmission::Info {
             packet_len: 0,
-            descriptor: None.into(),
+            descriptor: None,
             stream_offset: Default::default(),
             payload_len: 0,
             flags: Default::default(),
