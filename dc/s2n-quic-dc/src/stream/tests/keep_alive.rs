@@ -213,7 +213,7 @@ fn keep_alive_enabled_near_timeout() {
             let mut response = vec![];
             stream.read_to_end(&mut response).await.unwrap();
 
-            assert!(response.len() > 0, "Should have received response");
+            assert!(!response.is_empty(), "Should have received response");
         }
         .group("client")
         .instrument(info_span!("client"))

@@ -228,7 +228,7 @@ impl Tasks {
         });
 
         // clear out the free slots
-        while self.slots.last().map_or(false, Option::is_none) {
+        while self.slots.last().is_some_and(Option::is_none) {
             let slot = self.slots.pop().unwrap();
             debug_assert!(slot.is_none());
         }

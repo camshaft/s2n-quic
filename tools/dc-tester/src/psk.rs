@@ -64,7 +64,7 @@ pub async fn server(
 ) -> io::Result<psk::server::Provider> {
     let map = map(trace_dir);
     let tls = tls_server()?;
-    let subscriber = s2n_quic::provider::event::default::Subscriber::default();
+    let subscriber = s2n_quic::provider::event::default::Subscriber;
 
     psk::server::Provider::builder()
         .start(handshake_addr, tls, subscriber, map)
@@ -75,7 +75,7 @@ pub async fn server(
 pub fn client(trace_dir: &PathBuf) -> io::Result<psk::client::Provider> {
     let map = map(trace_dir);
     let tls = tls_client()?;
-    let subscriber = s2n_quic::provider::event::default::Subscriber::default();
+    let subscriber = s2n_quic::provider::event::default::Subscriber;
 
     psk::client::Provider::builder()
         .start(

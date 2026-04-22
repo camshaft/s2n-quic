@@ -1919,10 +1919,10 @@ impl State {
         // packets were sent.)
         if !self.sent_stream_packets.is_empty() || !self.sent_recovery_packets.is_empty() {
             assert!(
-                self.recovery_packet_number >= *self.max_stream_packet_number as u64 + 1,
+                self.recovery_packet_number > *self.max_stream_packet_number,
                 "recovery_packet_number ({}) < max_stream_packet_number + 1 ({})",
                 self.recovery_packet_number,
-                *self.max_stream_packet_number as u64 + 1,
+                *self.max_stream_packet_number + 1,
             );
         }
     }

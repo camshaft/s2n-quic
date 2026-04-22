@@ -208,7 +208,7 @@ fn lost_initial_ack() {
 
             let body = vec![42; 1000];
 
-            stream.write_all(&mut &body[..]).await.unwrap();
+            stream.write_all(&body[..]).await.unwrap();
             stream.shutdown().await.unwrap();
 
             let mut response = Vec::with_capacity(2000);
@@ -663,7 +663,7 @@ fn retransmission_loop_under_loss() {
             bach::net::monitor::on_packet_sent(move |_packet| {
                 count += 1;
                 // Drop every 3rd packet in both directions
-                if count % 3 == 0 {
+                if count.is_multiple_of(3) {
                     bach::net::monitor::Command::Drop
                 } else {
                     bach::net::monitor::Command::Pass
@@ -774,7 +774,7 @@ fn recv_cancel_stops_sender() {
             drop(writer);
 
             // Read just the header
-            let mut header = vec![0u8; HEADER_LEN];
+            let mut header = [0u8; HEADER_LEN];
             let mut total_read = 0;
             while total_read < HEADER_LEN {
                 match reader.read(&mut header[total_read..]).await {
@@ -890,7 +890,7 @@ fn racing_receivers_cancel() {
 
             // Read a header from each stream
             for reader in &mut readers {
-                let mut header = vec![0u8; HEADER_LEN];
+                let mut header = [0u8; HEADER_LEN];
                 let mut total_read = 0;
                 while total_read < HEADER_LEN {
                     match reader.read(&mut header[total_read..]).await {
@@ -1016,8 +1016,8 @@ fn stream_stuck_on_receiver_panic() {
                 let payload = packet.transport.payload();
                 let is_from_server = packet.source().port() == 443;
 
-                if is_from_server && !payload.is_empty() {
-                    if classify_packet(payload) == "control" {
+                if is_from_server && !payload.is_empty()
+                    && classify_packet(payload) == "control" {
                         server_control_count += 1;
                         // Drop first 2 control packets — these carry the
                         // CONNECTION_CLOSE. Let later draining ACKs through.
@@ -1025,7 +1025,6 @@ fn stream_stuck_on_receiver_panic() {
                             return bach::net::monitor::Command::Drop;
                         }
                     }
-                }
 
                 bach::net::monitor::Command::Pass
             });
@@ -1142,8 +1141,8 @@ fn stream_stuck_on_sender_panic() {
                 let payload = packet.transport.payload();
                 let is_from_server = packet.source().port() == 443;
 
-                if is_from_server && !payload.is_empty() {
-                    if classify_packet(payload) == "control" {
+                if is_from_server && !payload.is_empty()
+                    && classify_packet(payload) == "control" {
                         server_control_count += 1;
                         // Drop first 8 control packets — this includes the
                         // CONNECTION_CLOSE and early retransmissions.
@@ -1151,10 +1150,9 @@ fn stream_stuck_on_sender_panic() {
                             return bach::net::monitor::Command::Drop;
                         }
                     }
-                }
 
                 // Light uniform loss
-                if total_count % 13 == 0 {
+                if total_count.is_multiple_of(13) {
                     return bach::net::monitor::Command::Drop;
                 }
 
@@ -1367,7 +1365,7 @@ fn inflight_counters_control_packet_starvation() {
                         "stream" => {
                             stream_count += 1;
                             // Drop 40% of stream packets
-                            if stream_count % 5 == 0 || stream_count % 5 == 1 {
+                            if stream_count.is_multiple_of(5) || stream_count % 5 == 1 {
                                 return bach::net::monitor::Command::Drop;
                             }
                         }

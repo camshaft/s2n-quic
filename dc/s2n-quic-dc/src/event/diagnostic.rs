@@ -523,25 +523,25 @@ fn write_trace(context: &ConnectionContext) -> std::io::Result<()> {
     let mut buf = String::with_capacity(4096);
 
     buf.push_str("{\n");
-    let _ = write!(buf, "  \"connection_id\": {},\n", context.connection_id);
-    let _ = write!(buf, "  \"credential_id\": \"{}\",\n", context.credential_id);
-    let _ = write!(buf, "  \"key_id\": {},\n", context.key_id);
-    let _ = write!(
+    let _ = writeln!(buf, "  \"connection_id\": {},", context.connection_id);
+    let _ = writeln!(buf, "  \"credential_id\": \"{}\",", context.credential_id);
+    let _ = writeln!(buf, "  \"key_id\": {},", context.key_id);
+    let _ = writeln!(
         buf,
-        "  \"remote_address\": \"{}\",\n",
+        "  \"remote_address\": \"{}\",",
         context.remote_address
     );
-    let _ = write!(buf, "  \"role\": \"{role}\",\n");
-    let _ = write!(buf, "  \"event_count\": {},\n", events.len());
+    let _ = writeln!(buf, "  \"role\": \"{role}\",");
+    let _ = writeln!(buf, "  \"event_count\": {},", events.len());
     buf.push_str("  \"events\": [\n");
 
     for (i, record) in events.iter().enumerate() {
         let comma = if i + 1 < events.len() { "," } else { "" };
         // Escape the debug string for JSON
         let escaped = escape_json(&record.detail);
-        let _ = write!(
+        let _ = writeln!(
             buf,
-            "    {{\"seq\": {}, \"event\": \"{}\", \"detail\": \"{escaped}\"}}{comma}\n",
+            "    {{\"seq\": {}, \"event\": \"{}\", \"detail\": \"{escaped}\"}}{comma}",
             record.seq, record.name,
         );
     }

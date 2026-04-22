@@ -178,7 +178,7 @@ impl State {
             // Track application consumption for drain rate estimation
             let current = out_buf.current_offset();
             self.recv_budget
-                .on_consume(*current as u64, clock.get_time());
+                .on_consume(*current, clock.get_time());
 
             let dynamic_window = Some(self.recv_budget.window());
             self.max_data

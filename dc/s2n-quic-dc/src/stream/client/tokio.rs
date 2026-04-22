@@ -460,8 +460,7 @@ where
 
     // TODO potentially branch on not using the recv pool if we're under a certain concurrency?
     if !env.has_recv_pool() {
-        return Err(io::Error::new(
-            io::ErrorKind::Other,
+        return Err(io::Error::other(
             "UDP protocol requires configuring the recv pool",
         ));
     }

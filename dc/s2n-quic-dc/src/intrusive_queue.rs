@@ -749,7 +749,7 @@ mod tests {
                         assert_eq!(oracle.len(), subject.len());
                     }
                     Operation::Prepend => {
-                        let mut temp = oracle_other.drain(..).collect::<VecDeque<_>>();
+                        let mut temp = std::mem::take(&mut oracle_other);
                         temp.extend(oracle.drain(..));
                         oracle = temp;
                         subject.prepend(&mut subject_other);

@@ -299,7 +299,6 @@ where
             let _ = self
                 .dispatch
                 .send_control(queue_id, Some(&credentials), segment);
-            return;
         }
     }
 }
