@@ -252,6 +252,12 @@ impl Struct {
                         fn #function(&#receiver self, event: builder::#ident);
                     ));
 
+                    let anomalous_endpoint_call = if attrs.anomalous {
+                        quote!(self.subscriber.on_anomalous_event(&self.meta, &event);)
+                    } else {
+                        quote!()
+                    };
+
                     output.endpoint_publisher_subscriber.extend(quote!(
                         #[inline]
                         #allow_deprecated
@@ -259,6 +265,7 @@ impl Struct {
                             let event = event.into_event();
                             self.subscriber.#function(&self.meta, &event);
                             self.subscriber.on_event(&self.meta, &event);
+                            #anomalous_endpoint_call
                         }
                     ));
 
@@ -364,6 +371,12 @@ impl Struct {
                         fn #function(&#receiver self, event: builder::#ident);
                     ));
 
+                    let anomalous_connection_call = if attrs.anomalous {
+                        quote!(self.subscriber.on_anomalous_event(&self.meta, &event);)
+                    } else {
+                        quote!()
+                    };
+
                     output.connection_publisher_subscriber.extend(quote!(
                         #[inline]
                         #allow_deprecated
@@ -372,6 +385,7 @@ impl Struct {
                             self.subscriber.#function(self.context, &self.meta, &event);
                             self.subscriber.on_connection_event(self.context, &self.meta, &event);
                             self.subscriber.on_event(&self.meta, &event);
+                            #anomalous_connection_call
                         }
                     ));
 
@@ -542,6 +556,7 @@ pub struct ContainerAttrs {
     pub builder_derive_attrs: TokenStream,
     pub checkpoint: Vec<Checkpoint>,
     pub measure_counter: Vec<Metric>,
+    pub anomalous: bool,
     pub extra: TokenStream,
 }
 
@@ -562,6 +577,7 @@ impl ContainerAttrs {
             builder_derive_attrs: quote!(),
             checkpoint: vec![],
             measure_counter: vec![],
+            anomalous: false,
             extra: quote!(),
         };
 
@@ -591,6 +607,8 @@ impl ContainerAttrs {
                 v.checkpoint.push(attr.parse_args().unwrap());
             } else if path.is_ident("measure_counter") {
                 v.measure_counter.push(attr.parse_args().unwrap());
+            } else if path.is_ident("anomalous") {
+                v.anomalous = true;
             } else {
                 attr.to_tokens(&mut v.extra)
             }

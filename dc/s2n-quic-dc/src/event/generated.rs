@@ -8022,6 +8022,12 @@ mod traits {
             let _ = meta;
             let _ = event;
         }
+        #[doc = r" Called for each anomalous event that relates to the endpoint and all connections"]
+        #[inline]
+        fn on_anomalous_event<M: Meta, E: Event>(&self, meta: &M, event: &E) {
+            let _ = meta;
+            let _ = event;
+        }
         #[doc = r" Called for each event that relates to a connection"]
         #[inline]
         fn on_connection_event<E: Event>(
@@ -8958,6 +8964,10 @@ mod traits {
         #[inline]
         fn on_event<M: Meta, E: Event>(&self, meta: &M, event: &E) {
             self.as_ref().on_event(meta, event);
+        }
+        #[inline]
+        fn on_anomalous_event<M: Meta, E: Event>(&self, meta: &M, event: &E) {
+            self.as_ref().on_anomalous_event(meta, event);
         }
         #[inline]
         fn on_connection_event<E: Event>(
@@ -9954,6 +9964,11 @@ mod traits {
             self.1.on_event(meta, event);
         }
         #[inline]
+        fn on_anomalous_event<M: Meta, E: Event>(&self, meta: &M, event: &E) {
+            self.0.on_anomalous_event(meta, event);
+            self.1.on_anomalous_event(meta, event);
+        }
+        #[inline]
         fn on_connection_event<E: Event>(
             &self,
             context: &Self::ConnectionContext,
@@ -10290,6 +10305,7 @@ mod traits {
             let event = event.into_event();
             self.subscriber.on_acceptor_tcp_io_error(&self.meta, &event);
             self.subscriber.on_event(&self.meta, &event);
+            self.subscriber.on_anomalous_event(&self.meta, &event);
         }
         #[inline]
         fn on_acceptor_tcp_socket_sent(&self, event: builder::AcceptorTcpSocketSent) {
@@ -10344,6 +10360,7 @@ mod traits {
             let event = event.into_event();
             self.subscriber.on_acceptor_udp_io_error(&self.meta, &event);
             self.subscriber.on_event(&self.meta, &event);
+            self.subscriber.on_anomalous_event(&self.meta, &event);
         }
         #[inline]
         fn on_acceptor_stream_pruned(&self, event: builder::AcceptorStreamPruned) {

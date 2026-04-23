@@ -231,6 +231,7 @@ struct AcceptorTcpStreamEnqueued<'a> {
 /// Emitted when the TCP acceptor encounters an IO error
 #[event("acceptor:tcp:io_error")]
 #[subject(endpoint)]
+#[anomalous]
 struct AcceptorTcpIoError<'a> {
     /// The error encountered
     #[builder(&'a std::io::Error)]
@@ -402,6 +403,7 @@ struct AcceptorUdpStreamEnqueued<'a> {
 /// Emitted when the UDP acceptor encounters an IO error
 #[event("acceptor:udp:io_error")]
 #[subject(endpoint)]
+#[anomalous]
 struct AcceptorUdpIoError<'a> {
     /// The error encountered
     #[builder(&'a std::io::Error)]

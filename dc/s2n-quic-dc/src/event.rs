@@ -73,3 +73,78 @@ pub mod disabled {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use core::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
+
+    struct AnomalyCounter {
+        count: Arc<AtomicU64>,
+    }
+
+    impl Subscriber for AnomalyCounter {
+        type ConnectionContext = ();
+
+        fn create_connection_context(
+            &self,
+            _meta: &api::ConnectionMeta,
+            _info: &api::ConnectionInfo,
+        ) -> Self::ConnectionContext {
+        }
+
+        fn on_anomalous_event<M: Meta, E: Event>(&self, _meta: &M, _event: &E) {
+            self.count.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn test_timestamp() -> Timestamp {
+        unsafe {
+            s2n_quic_core::time::Timestamp::from_duration(core::time::Duration::from_secs(1))
+        }
+        .into_event()
+    }
+
+    #[test]
+    fn anomalous_event_fires_for_acceptor_udp_io_error() {
+        let count = Arc::new(AtomicU64::new(0));
+        let subscriber = AnomalyCounter {
+            count: count.clone(),
+        };
+
+        let meta = builder::EndpointMeta {
+            timestamp: test_timestamp(),
+        };
+        let publisher = EndpointPublisherSubscriber::new(meta, None, &subscriber);
+
+        // Publish an anomalous event (AcceptorUdpIoError is tagged #[anomalous])
+        let error = std::io::Error::new(std::io::ErrorKind::AddrNotAvailable, "udp error");
+        publisher.on_acceptor_udp_io_error(builder::AcceptorUdpIoError { error: &error });
+
+        assert_eq!(count.load(Ordering::Relaxed), 1, "on_anomalous_event should fire for AcceptorUdpIoError");
+    }
+
+    #[test]
+    fn anomalous_event_does_not_fire_for_normal_events() {
+        let count = Arc::new(AtomicU64::new(0));
+        let subscriber = AnomalyCounter {
+            count: count.clone(),
+        };
+
+        let meta = builder::EndpointMeta {
+            timestamp: test_timestamp(),
+        };
+        let publisher = EndpointPublisherSubscriber::new(meta, None, &subscriber);
+
+        // Publish a non-anomalous event (AcceptorTcpStarted is NOT tagged #[anomalous])
+        let addr = s2n_quic_core::inet::SocketAddress::default();
+        publisher.on_acceptor_tcp_started(builder::AcceptorTcpStarted {
+            id: 0,
+            local_address: &addr,
+            backlog: 128,
+        });
+
+        assert_eq!(count.load(Ordering::Relaxed), 0, "on_anomalous_event should NOT fire for non-anomalous events");
+    }
+}

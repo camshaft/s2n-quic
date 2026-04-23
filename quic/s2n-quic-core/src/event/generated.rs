@@ -3240,7 +3240,7 @@ pub mod api {
         }
     }
     macro_rules! impl_conn_id {
-        ($name:ident) => {
+        ($ name : ident) => {
             impl<'a> IntoEvent<builder::ConnectionId<'a>> for &'a crate::connection::id::$name {
                 #[inline]
                 fn into_event(self) -> builder::ConnectionId<'a> {
@@ -7057,7 +7057,8 @@ pub mod supervisor {
 pub use traits::*;
 mod traits {
     use super::*;
-    use crate::{event::Meta, query};
+    use crate::event::Meta;
+    use crate::query;
     use core::fmt;
     #[doc = r" Allows for events to be subscribed to"]
     pub trait Subscriber: 'static + Send {
@@ -7884,6 +7885,12 @@ mod traits {
             let _ = meta;
             let _ = event;
         }
+        #[doc = r" Called for each anomalous event that relates to the endpoint and all connections"]
+        #[inline]
+        fn on_anomalous_event<M: Meta, E: Event>(&mut self, meta: &M, event: &E) {
+            let _ = meta;
+            let _ = event;
+        }
         #[doc = r" Called for each event that relates to a connection"]
         #[inline]
         fn on_connection_event<E: Event>(
@@ -8599,6 +8606,11 @@ mod traits {
         fn on_event<M: Meta, E: Event>(&mut self, meta: &M, event: &E) {
             self.0.on_event(meta, event);
             self.1.on_event(meta, event);
+        }
+        #[inline]
+        fn on_anomalous_event<M: Meta, E: Event>(&mut self, meta: &M, event: &E) {
+            self.0.on_anomalous_event(meta, event);
+            self.1.on_anomalous_event(meta, event);
         }
         #[inline]
         fn on_connection_event<E: Event>(
