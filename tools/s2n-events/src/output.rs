@@ -150,6 +150,11 @@ impl ToTokens for Output {
             }
 
             #[inline]
+            fn on_anomalous_event<M: Meta, E: Event>(&#mode self, meta: &M, event: &E) {
+                self.as_ref().on_anomalous_event(meta, event);
+            }
+
+            #[inline]
             fn on_connection_event<E: Event>(
                 &#mode self,
                 context: &#mode Self::ConnectionContext,
@@ -285,6 +290,13 @@ impl ToTokens for Output {
                         let _ = event;
                     }
 
+                    /// Called for each anomalous event that relates to the endpoint and all connections
+                    #[inline]
+                    fn on_anomalous_event<M: Meta, E: Event>(&#mode self, meta: &M, event: &E) {
+                        let _ = meta;
+                        let _ = event;
+                    }
+
                     /// Called for each event that relates to a connection
                     #[inline]
                     fn on_connection_event<E: Event>(
@@ -335,6 +347,12 @@ impl ToTokens for Output {
                     fn on_event<M: Meta, E: Event>(&#mode self, meta: &M, event: &E) {
                         self.0.on_event(meta, event);
                         self.1.on_event(meta, event);
+                    }
+
+                    #[inline]
+                    fn on_anomalous_event<M: Meta, E: Event>(&#mode self, meta: &M, event: &E) {
+                        self.0.on_anomalous_event(meta, event);
+                        self.1.on_anomalous_event(meta, event);
                     }
 
                     #[inline]
