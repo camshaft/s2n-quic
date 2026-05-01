@@ -539,6 +539,12 @@ where
     // Update activity timestamp
     peer_state.update_activity(clock, idle_timeout);
 
+    // Record the ECN marking from this control packet so the ACK frames we
+    // send back include accurate ECN counts covering both datagram and control
+    // packet types that share the same ack_space.
+    let ecn = packet.storage().ecn();
+    peer_state.ecn_counts.increment(ecn);
+
     // Record the packet for ACK
     peer_state
         .ack_space
@@ -634,12 +640,14 @@ impl PeerState {
     where
         Clk: s2n_quic_core::time::Clock + ?Sized,
     {
-        // Generate ACK frame from the ACK space, including ECN counts so the sender
-        // can validate ECN support and detect congestion via the ACK frame.
+        // Generate ACK frame from the ACK space.  Only include ECN counts when
+        // at least one ECN-marked packet has been seen; this avoids forcing the
+        // wider ACK-with-ECN frame encoding (which drops more ACK ranges to fit
+        // the MTU) when the counts would all be zero anyway.
         let mtu = 1400u16;
         let (ack_frame, encoding_size) = self
             .ack_space
-            .encoding(VarInt::ZERO, Some(self.ecn_counts), mtu, clock);
+            .encoding(VarInt::ZERO, self.ecn_counts.as_option(), mtu, clock);
 
         let ack_frame = ack_frame?;
 
