@@ -1895,6 +1895,17 @@ where
         for (packet_size, mut datagram_entry) in
             segment_sizes.into_iter().zip(batch.datagrams.drain())
         {
+            // Control packets (e.g. ACKs) are not congestion controlled: they must
+            // arrive in a timely manner regardless of the congestion window, and they
+            // don't carry application data that needs reliable delivery tracking.
+            if let crate::packet::datagram::partial::PacketType::Control { .. } =
+                &mut datagram_entry.packet_type
+            {
+                // Drop the entry without registering it in the CCA or packet number map.
+                packet_number += VarInt::from_u8(1);
+                continue;
+            }
+
             // Notify CCA about the sent packet
             let cc_info =
                 ctx.cca
@@ -1907,14 +1918,6 @@ where
                 sent_bytes: packet_size,
             };
             datagram_entry.transmission_info = Some(transmission_info);
-
-            // For control packets, clear the payload to save memory
-            // Control packets (like ACKs) are ephemeral and don't need retransmission
-            if let crate::packet::datagram::partial::PacketType::Control { control_data } =
-                &mut datagram_entry.packet_type
-            {
-                control_data.clear();
-            }
 
             // Convert packet number to PacketNumber type and register in map
             let pn = s2n_quic_core::packet::number::PacketNumberSpace::Initial
