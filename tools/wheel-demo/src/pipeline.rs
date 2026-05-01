@@ -118,22 +118,21 @@ impl CounterRegistry {
 
 // ── Testing Helpers ────────────────────────────────────────────────────────
 
-/// Fast consistent hash for routing packets by credentials
+/// Fast consistent hash for routing received datagrams to a worker.
 ///
-/// Combines credentials.id (good entropy) with key_id using a mixing function
+/// Prefers the `source_sender_id` embedded in the packet's routing info —
+/// that value is set by the sender to its own stable worker identity and does
+/// not change across key rotations.  When routing info is absent we fall back
+/// to `credentials.id`, which is also stable across rotations (unlike
+/// `credentials.key_id`, which increments on every key rotation and must
+/// **not** be used here).
 #[inline]
-fn hash_credentials(credentials: &Credentials) -> u64 {
-    // Start with credentials.id which has good entropy
-    let mut hash = credentials.id.to_hash();
-
-    // Mix in key_id using a simple but effective mixing function
-    // This ensures different paths from the same peer distribute across workers
-    let key_id = credentials.key_id.as_u64();
-    hash ^= key_id.wrapping_mul(0x9e3779b97f4a7c15); // Golden ratio
-    hash = hash.rotate_left(32) ^ key_id;
-    hash = hash.wrapping_mul(0x517cc1b727220a95);
-
-    hash
+fn routing_hash(routing_info: RoutingInfo, credentials: &Credentials) -> u64 {
+    if let Some(sender_id) = routing_info.source_sender_id() {
+        sender_id.as_u64()
+    } else {
+        credentials.id.to_hash()
+    }
 }
 
 /// Create a deterministic test path secret map for demo purposes.
@@ -650,8 +649,13 @@ impl PeerState {
 
 /// Per-worker peer state cache
 struct PeerStateCache {
-    /// Map from credentials to peer state
-    peers: std::collections::HashMap<Credentials, PeerState>,
+    /// Map from stable credentials ID to peer state.
+    ///
+    /// Keyed on `credentials::Id` (stable across key rotations) rather than the full
+    /// `Credentials` struct (which includes `key_id`).  This ensures that a key rotation
+    /// on the sender side updates the existing peer state rather than creating a new one
+    /// or losing ACK history.
+    peers: std::collections::HashMap<credentials::Id, PeerState>,
     /// Idle timeout for peer states
     idle_timeout: Duration,
 }
@@ -675,8 +679,23 @@ impl PeerStateCache {
         Clk: s2n_quic_core::time::Clock + ?Sized,
     {
         // Use entry API for single hash lookup
-        Some(match self.peers.entry(*credentials) {
-            hash_map::Entry::Occupied(entry) => entry.into_mut(),
+        let idle_timeout = self.idle_timeout;
+        Some(match self.peers.entry(credentials.id) {
+            hash_map::Entry::Occupied(mut entry) => {
+                // If the sender has rotated to a new key, refresh the opener so we can
+                // continue to decrypt packets encrypted under the new key_id.
+                if entry.get().current_key_id != credentials.key_id {
+                    let (new_opener, _) = path_secret_map.opener_for_credentials(
+                        credentials,
+                        None,
+                        control_out,
+                    )?;
+                    let state = entry.get_mut();
+                    state.opener = new_opener;
+                    state.current_key_id = credentials.key_id;
+                }
+                entry.into_mut()
+            }
             hash_map::Entry::Vacant(entry) => {
                 // Slow path: derive opener from map
                 let (opener, path_entry) = path_secret_map.opener_for_credentials(
@@ -690,7 +709,7 @@ impl PeerStateCache {
                     opener,
                     credentials.key_id,
                     clock,
-                    self.idle_timeout,
+                    idle_timeout,
                 ))
             }
         })
@@ -1538,7 +1557,7 @@ where
 
                             // Get peer state and generate ACK
                             let mut peer_cache_ref = shared_peer_cache.borrow_mut();
-                            let Some(peer_state) = peer_cache_ref.peers.get_mut(&credentials)
+                            let Some(peer_state) = peer_cache_ref.peers.get_mut(&credentials.id)
                             else {
                                 return Err("missing credentials for peer");
                             };
@@ -1628,10 +1647,11 @@ where
                             move |packet: Entry<
                                 packet::datagram::decoder::Packet<descriptor::Filled>,
                             >| {
-                                // Route based on credentials hash for consistent routing
-                                // This ensures all packets for the same path go to the same ACK worker
-                                let credentials = packet.credentials();
-                                let hash = hash_credentials(credentials);
+                                // Route by source_sender_id so the same sender always lands on the
+                                // same worker, even after a key rotation changes the credentials
+                                // key_id.
+                                let hash =
+                                    routing_hash(packet.routing_info(), packet.credentials());
                                 let worker_id = (hash & mask) as usize;
                                 let _ = datagram_receiver_tx[worker_id].send_entry(packet);
                             },
@@ -1646,10 +1666,11 @@ where
                             move |packet: Entry<
                                 packet::datagram::decoder::Packet<descriptor::Filled>,
                             >| {
-                                // Route based on credentials hash for consistent routing
-                                // This ensures all packets for the same path go to the same ACK worker
-                                let credentials = packet.credentials();
-                                let hash = hash_credentials(credentials);
+                                // Route by source_sender_id so the same sender always lands on the
+                                // same worker, even after a key rotation changes the credentials
+                                // key_id.
+                                let hash =
+                                    routing_hash(packet.routing_info(), packet.credentials());
                                 let worker_id = (hash % num_workers as u64) as usize;
                                 let _ = datagram_receiver_tx[worker_id].send_entry(packet);
                             },

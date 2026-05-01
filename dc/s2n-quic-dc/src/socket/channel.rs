@@ -1569,9 +1569,11 @@ pub struct PathContext<Sealer> {
     pub next_packet_number: VarInt,
     /// Number of packets encrypted with the current sealer.
     ///
-    /// Incremented on every encrypt call and reset to 0 whenever the sealer is rotated.
-    /// This is the authoritative signal for deciding when to rotate — it reflects actual
-    /// encrypt usage rather than the monotonically-growing `next_packet_number`.
+    /// This counter is maintained by the surrounding pipeline code: it should be
+    /// incremented for each encrypt operation that uses the current sealer and reset to 0
+    /// when the sealer is rotated.  When kept up to date, it can be used to decide when
+    /// to rotate based on actual encrypt usage rather than the monotonically-growing
+    /// `next_packet_number`.
     pub encrypted_count: u64,
     /// Congestion controller for this path
     pub cca: crate::congestion::Controller,
