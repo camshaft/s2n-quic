@@ -813,11 +813,6 @@ struct SocketPathContexts {
             >,
         >,
     >,
-    /// Per-path count of packets encrypted with the current sealer, keyed by credentials ID.
-    /// This counter is incremented at encode time and reset to 0 on each key rotation, so it
-    /// always reflects usage of the *current* key rather than the monotonically-growing packet
-    /// number sequence.
-    encrypted_counts: RefCell<std::collections::HashMap<credentials::Id, u64>>,
     max_datagram_size: u16,
 }
 
@@ -825,31 +820,19 @@ impl SocketPathContexts {
     fn new(max_datagram_size: u16) -> Self {
         Self {
             contexts: RefCell::new(std::collections::HashMap::new()),
-            encrypted_counts: RefCell::new(std::collections::HashMap::new()),
             max_datagram_size,
         }
     }
 
-    /// Record that `count` additional packets were encrypted for the path identified by `id`.
-    ///
-    /// This must be called after every batch is encoded so that [`get_or_insert`] can trigger
-    /// rotation when the current key's utilization reaches [`ROTATION_THRESHOLD`].
-    fn on_encrypted(&self, id: credentials::Id, count: u64) {
-        *self
-            .encrypted_counts
-            .borrow_mut()
-            .entry(id)
-            .or_insert(0) += count;
-    }
-
     /// Get or create a path context for the given path entry.
     ///
-    /// On each call for an existing path, the per-key encryption counter is checked against
-    /// [`ROTATION_THRESHOLD`].  When the limit is reached the sealer and credentials are replaced
-    /// with a fresh key derived from the same path secret entry and the counter is reset to 0.
-    /// The packet-number counter is intentionally **not** reset on rotation so that the
-    /// `packet_number_map` (which tracks in-flight packets awaiting ACKs) remains consistent;
-    /// old entries continue to be ACKed or loss-detected against their original packet numbers.
+    /// On each call for an existing path, the per-key `encrypted_count` field on the context is
+    /// checked against [`ROTATION_THRESHOLD`].  When the limit is reached the sealer and
+    /// credentials are replaced with a fresh key derived from the same path secret entry and the
+    /// counter is reset to 0.  The packet-number counter is intentionally **not** reset on
+    /// rotation so that the `packet_number_map` (which tracks in-flight packets awaiting ACKs)
+    /// remains consistent; old entries continue to be ACKed or loss-detected against their
+    /// original packet numbers.
     fn get_or_insert(
         &self,
         entry: &Arc<PathSecretEntry>,
@@ -862,13 +845,7 @@ impl SocketPathContexts {
             let context = context.clone();
 
             // Check whether the current key has hit its utilization limit.
-            let encrypted = self
-                .encrypted_counts
-                .borrow()
-                .get(&credentials_id)
-                .copied()
-                .unwrap_or(0);
-            if encrypted >= ROTATION_THRESHOLD {
+            if context.borrow().encrypted_count >= ROTATION_THRESHOLD {
                 // TODO: schedule rotation via an intrusive list rather than performing it inline
                 // here, so that the pipeline is not stalled while the new key is derived.
                 let (new_sealer, new_credentials) = entry.reusable_sealer();
@@ -878,9 +855,7 @@ impl SocketPathContexts {
                 ctx.credentials = new_credentials;
                 // Reset the per-key encryption counter so we do not rotate again until the
                 // new key also reaches the threshold.
-                self.encrypted_counts
-                    .borrow_mut()
-                    .insert(credentials_id, 0);
+                ctx.encrypted_count = 0;
                 tracing::info!(
                     new_key_id,
                     credentials_id = ?credentials_id,
@@ -909,6 +884,7 @@ impl SocketPathContexts {
             sealer,
             credentials,
             next_packet_number: VarInt::ZERO,
+            encrypted_count: 0,
             cca,
             rtt_estimator,
             packet_number_map,
@@ -1301,9 +1277,6 @@ where
                         let rx = FlattenQueue::new(batch_rx);
                         let rx = channel::Timing::new(rx, "flatten");
 
-                        // Keep a second handle to socket_contexts so the Inspect step
-                        // below can call on_encrypted after the encoder runs.
-                        let contexts_for_count = socket_contexts.clone();
                         let resolver = SimplePathContextResolver::new(socket_contexts);
                         let rx = channel::PathResolver::new(rx, resolver, error_tx);
                         let rx = channel::Timing::new(rx, "path_resolver");
@@ -1313,16 +1286,15 @@ where
                         let rx = channel::Timing::new(rx, "encoder");
 
                         // Count the number of packets that were just encrypted and record it in
-                        // the per-path counter.  This is the authoritative signal used by
-                        // get_or_insert to decide when to rotate the sealer.
+                        // the per-key counter on the path context.  This is the authoritative
+                        // signal used by get_or_insert to decide when to rotate the sealer.
                         let rx = channel::Inspect::new(
                             rx,
-                            move |path_batch: &channel::PathBatch<
+                            |path_batch: &channel::PathBatch<
                                 s2n_quic_dc::crypto::awslc::seal::Application,
                             >| {
                                 let count = path_batch.batch.datagrams.len() as u64;
-                                let id = path_batch.context.borrow().credentials.id;
-                                contexts_for_count.on_encrypted(id, count);
+                                path_batch.context.borrow_mut().encrypted_count += count;
                             },
                         );
 

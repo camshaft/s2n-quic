@@ -1567,6 +1567,12 @@ pub struct PathContext<Sealer> {
     pub credentials: crate::credentials::Credentials,
     /// Next packet number to assign (per-path counter)
     pub next_packet_number: VarInt,
+    /// Number of packets encrypted with the current sealer.
+    ///
+    /// Incremented on every encrypt call and reset to 0 whenever the sealer is rotated.
+    /// This is the authoritative signal for deciding when to rotate — it reflects actual
+    /// encrypt usage rather than the monotonically-growing `next_packet_number`.
+    pub encrypted_count: u64,
     /// Congestion controller for this path
     pub cca: crate::congestion::Controller,
     /// RTT estimator for this path
