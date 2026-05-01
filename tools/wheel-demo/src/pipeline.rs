@@ -786,6 +786,18 @@ where
     info!(%local_addr, "Socket sender shutting down");
 }
 
+/// Key rotation threshold: maximum packets encrypted before rotating to a new sealer.
+///
+/// Mirrors the utilization limits used by `s2n_quic_dc::path::secret::key::seal::Application`.
+/// In debug builds we rotate very frequently (every 4096 packets) to exercise the rotation path.
+/// In release builds we rotate at `(2^23 - 2^16)` packets — that is, `2^16` packets before the
+/// AEAD_AES_128/256_GCM confidentiality limit of `2^23` encrypted packets (RFC 9001 §B.1).
+const ROTATION_THRESHOLD: u64 = if cfg!(debug_assertions) {
+    s2n_quic_dc::path::secret::seal::TEST_MAX_RECORDS
+} else {
+    (1 << 23) - (1 << 16)
+};
+
 /// Per-socket path context storage
 ///
 /// Each send socket maintains its own packet number space, CCA state, and RTT estimator.
@@ -812,7 +824,13 @@ impl SocketPathContexts {
         }
     }
 
-    /// Get or create a path context for the given path entry
+    /// Get or create a path context for the given path entry.
+    ///
+    /// If an existing context's packet counter has reached [`ROTATION_THRESHOLD`], the sealer and
+    /// credentials are replaced with a fresh key derived from the same path secret entry.  The
+    /// packet-number counter is intentionally **not** reset on rotation so that the
+    /// `packet_number_map` (which tracks in-flight packets awaiting ACKs) remains consistent;
+    /// old entries continue to be ACKed or loss-detected against their original packet numbers.
     fn get_or_insert(
         &self,
         entry: &Arc<PathSecretEntry>,
@@ -822,7 +840,26 @@ impl SocketPathContexts {
 
         let mut contexts = self.contexts.borrow_mut();
         if let Some(context) = contexts.get(&credentials_id) {
-            return context.clone();
+            let context = context.clone();
+
+            // Schedule key rotation when the sealer approaches its utilization limit.
+            let needs_rotation =
+                context.borrow().next_packet_number.as_u64() >= ROTATION_THRESHOLD;
+            if needs_rotation {
+                let (new_sealer, new_credentials) = entry.reusable_sealer();
+                let new_key_id = new_credentials.key_id.as_u64();
+                let mut ctx = context.borrow_mut();
+                ctx.sealer = new_sealer;
+                ctx.credentials = new_credentials;
+                tracing::info!(
+                    new_key_id,
+                    credentials_id = ?credentials_id,
+                    next_packet_number = ctx.next_packet_number.as_u64(),
+                    "Key rotation: sealer and credentials updated"
+                );
+            }
+
+            return context;
         }
 
         // Create new context - call reusable_sealer() only once
