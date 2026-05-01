@@ -16,6 +16,7 @@ use s2n_quic_core::{
     packet::number::{PacketNumberRange, PacketNumberSpace},
     varint::VarInt,
 };
+use s2n_quic_core::frame::ack::EcnCounts;
 use s2n_quic_dc::{
     busy_poll::clock::Timer as BusyPollClock,
     clock::{precision::Clock as _, tokio::Clock as TokioClock},
@@ -473,7 +474,10 @@ where
     // Update activity timestamp
     peer_state.update_activity(clock, idle_timeout);
 
-    // Record the packet for ACK
+    // Record the packet for ACK and track its ECN marking so we can report
+    // the cumulative ECN counts back to the sender in the next ACK frame.
+    let ecn = packet.storage().ecn();
+    peer_state.ecn_counts.increment(ecn);
     peer_state
         .ack_space
         .on_packet_received(packet_number, clock.get_time());
@@ -556,6 +560,9 @@ struct PeerState {
     current_key_id: VarInt,
     /// ACK space for tracking received packets (spans all key_ids for this peer)
     ack_space: s2n_quic_dc::stream::recv::ack::Space,
+    /// Accumulated ECN counts for received packets, reported back to the sender
+    /// in each ACK frame so the sender can validate ECN support and detect congestion.
+    ecn_counts: EcnCounts,
     /// Timer for idle timeout
     idle_timer: s2n_quic_core::time::Timer,
     /// Last activity timestamp
@@ -591,6 +598,7 @@ impl PeerState {
             opener,
             current_key_id: key_id,
             ack_space: Default::default(),
+            ecn_counts: Default::default(),
             idle_timer,
             last_activity: now,
             transmission_state: AckTransmissionState::Idle,
@@ -626,9 +634,12 @@ impl PeerState {
     where
         Clk: s2n_quic_core::time::Clock + ?Sized,
     {
-        // Generate ACK frame from the ACK space
+        // Generate ACK frame from the ACK space, including ECN counts so the sender
+        // can validate ECN support and detect congestion via the ACK frame.
         let mtu = 1400u16;
-        let (ack_frame, encoding_size) = self.ack_space.encoding(VarInt::ZERO, None, mtu, clock);
+        let (ack_frame, encoding_size) = self
+            .ack_space
+            .encoding(VarInt::ZERO, Some(self.ecn_counts), mtu, clock);
 
         let ack_frame = ack_frame?;
 
