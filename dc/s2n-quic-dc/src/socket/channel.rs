@@ -525,10 +525,11 @@ where
 
 /// Wraps a receiver with rate-based pacing using a token bucket.
 ///
-/// Items are pulled from the inner receiver, but pacing is applied via
-/// `on_consumed` — only when the consumer confirms an item was processed
-/// are tokens consumed and a timer is armed. Subsequent `poll_recv` calls
-/// will poll the timer until it fires.
+/// Byte costs are accumulated across all `on_consumed` calls and charged
+/// together at the start of the next `poll_recv`.  Arming the timer is
+/// therefore deferred until we actually have debt, so a burst of small
+/// `on_consumed` calls (e.g. from `FlattenSegments`) results in a single
+/// timer rather than one per packet.
 ///
 /// This allows cancelled/skipped items to avoid rate limiting.
 pub struct Paced<R, Clk, T>
@@ -539,7 +540,10 @@ where
     timer: Clk::Timer,
     rate: crate::socket::rate::Rate,
     bucket: crate::socket::rate::TokenBucket,
-    buffered: Option<T>,
+    /// Accumulated nanosecond cost from `on_consumed` calls, charged on the
+    /// next `poll_recv`.
+    pending_cost: u64,
+    _phantom: core::marker::PhantomData<T>,
 }
 
 impl<R, Clk, T> Paced<R, Clk, T>
@@ -557,7 +561,8 @@ where
             timer,
             rate,
             bucket,
-            buffered: None,
+            pending_cost: 0,
+            _phantom: core::marker::PhantomData,
         }
     }
 }
@@ -570,50 +575,35 @@ where
     fn poll_recv(&mut self, cx: &mut task::Context<'_>) -> Poll<Option<T>> {
         use crate::clock::precision::Timer;
 
-        // If we have a buffered item from a previous poll, check timer first
-        if self.buffered.is_some() {
-            ready!(self.timer.poll_ready(cx));
-            // Timer is ready, return the buffered item
-            return Poll::Ready(self.buffered.take());
-        }
-
-        // Try to get next item from inner receiver
-        let item = ready!(self.inner.poll_recv(cx));
-
-        // If we got an item, check if timer is ready
-        if item.is_some() {
-            match self.timer.poll_ready(cx) {
-                Poll::Ready(()) => {
-                    // Timer ready, can return the item
-                    Poll::Ready(item)
-                }
-                Poll::Pending => {
-                    // Timer not ready, buffer the item and return Pending
-                    self.buffered = item;
-                    Poll::Pending
-                }
+        // Charge all cost accumulated since the last item was returned.
+        // Doing this here (rather than in on_consumed) means multiple
+        // on_consumed calls from a single batch are folded into one bucket
+        // query and one timer update.
+        if self.pending_cost > 0 {
+            let cost = core::mem::take(&mut self.pending_cost);
+            let now = self.timer.now();
+            let sleep_nanos = self.bucket.consume(now, cost);
+            if sleep_nanos > 0 {
+                let target = now + std::time::Duration::from_nanos(sleep_nanos);
+                self.timer.update(target);
             }
-        } else {
-            // No item (channel closed), return None
-            Poll::Ready(None)
         }
+
+        // Wait out any debt before delivering the next item.
+        if self.timer.is_armed() {
+            ready!(self.timer.poll_ready(cx));
+        }
+
+        self.inner.poll_recv(cx)
     }
 
     fn on_consumed(&mut self, bytes: u64) {
-        use crate::clock::precision::Timer;
-
-        // Notify inner receiver first
+        // Notify inner receiver first.
         self.inner.on_consumed(bytes);
 
-        // Then apply rate limiting
-        let now = self.timer.now();
-        let cost_nanos = self.rate.nanos_for_bytes(bytes);
-        let sleep_nanos = self.bucket.consume(now, cost_nanos);
-
-        if sleep_nanos > 0 {
-            let target = now + std::time::Duration::from_nanos(sleep_nanos);
-            self.timer.update(target);
-        }
+        // Accumulate cost; it will be charged on the next poll_recv so that
+        // all on_consumed calls within the same batch are batched together.
+        self.pending_cost += self.rate.nanos_for_bytes(bytes);
     }
 }
 

@@ -1621,9 +1621,9 @@ where
                     let socket_rx = InspectErr::new(socket_rx, |err| {
                         tracing::warn!(socket_id, %err, "Socket recv error");
                     });
+                    let socket_rx = Paced::new(socket_rx, clock.clone(), overall_send_rate);
                     let segments_rx = FlattenSegments::new(socket_rx);
                     let segments_rx = Reporter::new(segments_rx, clock.clone(), false);
-                    let segments_rx = Paced::new(segments_rx, clock.clone(), overall_send_rate);
 
                     let router = ChannelRouter {
                         datagram_tx,
