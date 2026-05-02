@@ -1623,6 +1623,7 @@ where
                     });
                     let segments_rx = FlattenSegments::new(socket_rx);
                     let segments_rx = Reporter::new(segments_rx, clock.clone(), false);
+                    let segments_rx = Paced::new(segments_rx, clock.clone(), overall_send_rate);
 
                     let router = ChannelRouter {
                         datagram_tx,
