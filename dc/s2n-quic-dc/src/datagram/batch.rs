@@ -10,7 +10,7 @@ use crate::{
     socket::pool::descriptor,
 };
 use s2n_quic_core::varint::VarInt;
-use std::net::SocketAddr;
+use std::{net::SocketAddr, time::Duration};
 
 /// Placeholder type for batches without an attached context (Send)
 ///
@@ -47,6 +47,8 @@ pub struct Batch<Ctx = NoContext> {
     pub datagrams: Queue<PartialDatagram>,
     /// Transmission time (1us intervals per sender)
     pub transmission_time: Option<precision::Timestamp>,
+    /// Relative transmission delay resolved by the wheel against its current base time
+    pub transmission_delay: Option<Duration>,
     /// Metadata for socket workers
     pub meta: Meta,
     /// Storage field for fully-encoded packets with GSO segment size
@@ -62,6 +64,7 @@ impl Batch<NoContext> {
         Self {
             datagrams: Queue::new(),
             transmission_time,
+            transmission_delay: None,
             meta: Meta {
                 total_bytes: 0,
                 peer_addr,
@@ -115,6 +118,13 @@ impl<Ctx> Batch<Ctx> {
     #[inline]
     pub fn len(&self) -> usize {
         self.datagrams.len()
+    }
+
+    /// Sets a relative transmission delay that will be resolved by the wheel.
+    #[inline]
+    pub fn set_transmission_delay(&mut self, delay: Duration) {
+        self.transmission_time = None;
+        self.transmission_delay = Some(delay);
     }
 }
 
@@ -376,8 +386,18 @@ impl<Ctx> SingleTimer for Batch<Ctx> {
     }
 
     #[inline]
+    fn resolve_target_time(&mut self, base: precision::Timestamp) -> Option<precision::Timestamp> {
+        if let Some(delay) = self.transmission_delay.take() {
+            self.transmission_time = Some(base + delay);
+        }
+
+        self.transmission_time
+    }
+
+    #[inline]
     fn set_target_time(&mut self, time: precision::Timestamp) {
         self.transmission_time = Some(time);
+        self.transmission_delay = None;
     }
 }
 
@@ -467,6 +487,19 @@ mod tests {
         batch.set_target_time(time);
         assert_eq!(batch.target_time(), Some(time));
     }
+
+    #[test]
+    fn batch_relative_schedule() {
+        let mut batch = Batch::new(None, "127.0.0.1:8080".parse().unwrap());
+        let base = precision::Timestamp { nanos: 1_000 };
+        let delay = Duration::from_micros(1);
+
+        batch.set_transmission_delay(delay);
+
+        assert_eq!(batch.resolve_target_time(base), Some(base + delay));
+        assert_eq!(batch.transmission_delay, None);
+        assert_eq!(batch.target_time(), Some(base + delay));
+    }
 }
 
 // ── Context Attachment ──────────────────────────────────────────────────────
@@ -492,6 +525,10 @@ const _: () = {
         assert!(
             offset_of!(Batch<NoContext>, transmission_time)
                 == offset_of!(Batch<RcType>, transmission_time)
+        );
+        assert!(
+            offset_of!(Batch<NoContext>, transmission_delay)
+                == offset_of!(Batch<RcType>, transmission_delay)
         );
         assert!(offset_of!(Batch<NoContext>, meta) == offset_of!(Batch<RcType>, meta));
         assert!(offset_of!(Batch<NoContext>, encoded) == offset_of!(Batch<RcType>, encoded));

@@ -81,6 +81,15 @@ pub trait WheelAdapter: Adapter {
     /// The pointer must be valid and point to an initialized Value.
     unsafe fn target_time(value: *const Self::Value) -> Option<precision::Timestamp>;
 
+    /// Resolves the target time for this link against the provided base time.
+    ///
+    /// # Safety
+    /// The pointer must be valid and point to an initialized Value.
+    unsafe fn resolve_target_time(
+        value: *mut Self::Value,
+        base: precision::Timestamp,
+    ) -> Option<precision::Timestamp>;
+
     /// Sets the actual execution time (called when the entry is yielded from the wheel).
     ///
     /// # Safety
@@ -96,6 +105,12 @@ pub trait SingleTimer {
     /// Returns the target time, or `None` for immediate execution.
     fn target_time(&self) -> Option<precision::Timestamp>;
 
+    /// Resolves the target time against the provided base time.
+    #[inline]
+    fn resolve_target_time(&mut self, _base: precision::Timestamp) -> Option<precision::Timestamp> {
+        self.target_time()
+    }
+
     /// Sets the target time (called when the entry is yielded from the wheel).
     fn set_target_time(&mut self, time: precision::Timestamp);
 }
@@ -104,6 +119,13 @@ pub trait SingleTimer {
 impl<T: SingleTimer> WheelAdapter for crate::intrusive_queue::EntryAdapter<T> {
     unsafe fn target_time(value: *const Self::Value) -> Option<precision::Timestamp> {
         (*Self::target(value as *mut Self::Value)).target_time()
+    }
+
+    unsafe fn resolve_target_time(
+        value: *mut Self::Value,
+        base: precision::Timestamp,
+    ) -> Option<precision::Timestamp> {
+        (*Self::target(value)).resolve_target_time(base)
     }
 
     unsafe fn set_target_time(value: *mut Self::Value, time: precision::Timestamp) {
@@ -178,15 +200,25 @@ where
     // ── Internal: Wheel operations ──────────────────────────────────────
 
     /// Insert a single entry into the appropriate level/slot.
-    fn insert_entry(&mut self, ptr: A::Pointer) {
-        let target_tick = unsafe {
+    fn stamp_entry(ptr: &A::Pointer, time: precision::Timestamp) {
+        unsafe {
             // SAFETY: The pointer is valid since it came from the adapter.
-            let value_ptr = A::as_ptr(&ptr);
-            A::target_time(value_ptr)
+            A::set_target_time(A::as_ptr(ptr), time);
         }
-        .map(Self::timestamp_to_tick)
-        .unwrap_or(self.current_tick)
-        .max(self.current_tick);
+    }
+
+    fn stamp_list(list: &mut List<A>, time: precision::Timestamp) {
+        for value in list.iter_mut() {
+            unsafe {
+                // SAFETY: The mutable reference points to a valid value in the list.
+                A::set_target_time(value as *mut _, time);
+            }
+        }
+    }
+
+    /// Insert a single entry into the appropriate level/slot.
+    fn insert_entry(&mut self, ptr: A::Pointer, target_time: precision::Timestamp) {
+        let target_tick = Self::timestamp_to_tick(target_time).max(self.current_tick);
 
         let (level, slot_idx) = Self::compute_level_and_slot(self.current_tick, target_tick);
 
@@ -226,6 +258,7 @@ where
                     let occ_slot = (occ_tick & SLOT_MASK) as usize;
                     self.current_tick = occ_tick;
                     let mut slot_queue = self.levels[0].drain(occ_slot);
+                    Self::stamp_list(&mut slot_queue, Self::tick_to_timestamp(occ_tick));
                     self.len -= slot_queue.len();
                     result.append(&mut slot_queue);
                     self.current_tick += 1;
@@ -245,6 +278,7 @@ where
         // Also drain the current slot (entries at exactly target_tick)
         let slot_idx = (self.current_tick & SLOT_MASK) as usize;
         let mut slot_queue = self.levels[0].drain(slot_idx);
+        Self::stamp_list(&mut slot_queue, Self::tick_to_timestamp(self.current_tick));
         self.len -= slot_queue.len();
         result.append(&mut slot_queue);
 
@@ -360,22 +394,25 @@ where
     R: channel::Receiver<List<A>>,
 {
     fn poll_recv(&mut self, cx: &mut task::Context<'_>) -> Poll<Option<List<A>>> {
+        let now = self.timer.now();
+
         // 1. Try to drain one batch from inner receiver into the wheel
         match self.inner.poll_recv(cx) {
             Poll::Ready(Some(batch)) => {
                 // Sort entries: immediate execution goes to pending, scheduled goes to wheel
                 for ptr in batch {
-                    let has_target_time = unsafe {
+                    let resolved_target_time = unsafe {
                         // SAFETY: The pointer is valid since it came from the adapter.
                         let value_ptr = A::as_ptr(&ptr);
-                        A::target_time(value_ptr).is_some()
+                        A::resolve_target_time(value_ptr, now)
                     };
 
-                    if !has_target_time {
-                        // No timestamp = immediate execution, skip wheel insertion
-                        self.pending_list.push_back(ptr);
+                    if let Some(target_time) = resolved_target_time {
+                        self.insert_entry(ptr, target_time);
                     } else {
-                        self.insert_entry(ptr);
+                        // No timestamp = immediate execution, skip wheel insertion
+                        Self::stamp_entry(&ptr, now);
+                        self.pending_list.push_back(ptr);
                     }
                 }
                 // Self-wake to process more batches or tick
@@ -383,8 +420,11 @@ where
             }
             Poll::Ready(None) => {
                 // Inner is closed - drain remaining entries and close
+                let now = self.timer.now();
                 let mut final_list = core::mem::take(&mut self.pending_list);
                 let mut remaining = self.drain_remaining();
+                Self::stamp_list(&mut final_list, now);
+                Self::stamp_list(&mut remaining, now);
                 final_list.append(&mut remaining);
 
                 return Poll::Ready(if final_list.is_empty() {
@@ -399,7 +439,6 @@ where
         }
 
         // 2. Tick to current time and collect due entries
-        let now = self.timer.now();
         let mut list = self.tick_to(now);
         self.pending_list.append(&mut list);
 

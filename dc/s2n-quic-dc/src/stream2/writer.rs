@@ -55,8 +55,11 @@ use std::{
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
+    time::Duration,
 };
 use tracing::{debug, trace};
+
+const TRANSMISSION_PACING_INTERVAL: Duration = Duration::from_micros(1);
 
 /// Writer for stream2: handles fragmentation and flow control
 ///
@@ -295,6 +298,18 @@ impl Writer {
 }
 
 impl Inner {
+    #[inline]
+    fn push_paced_batch(
+        batches: &mut List<crate::intrusive_queue::EntryAdapter<Batch>>,
+        builder: crate::datagram::batch::Builder,
+        transmission_delay: &mut Duration,
+    ) {
+        let mut batch = builder.finish();
+        batch.set_transmission_delay(*transmission_delay);
+        batches.push_back(batch.into());
+        *transmission_delay += TRANSMISSION_PACING_INTERVAL;
+    }
+
     fn poll_write_from<S>(
         &mut self,
         cx: &mut Context,
@@ -819,6 +834,7 @@ impl Inner {
         // Track batches and segments per batch
         let mut batches = List::new();
         let mut current_builder = crate::datagram::batch::Builder::new(None, data_addr);
+        let mut transmission_delay = Duration::ZERO;
 
         // Special case: if is_fin and buffer is empty, send empty FIN packet
         let mut need_fin_packet = is_fin && buf.buffer_is_empty();
@@ -879,7 +895,11 @@ impl Inner {
             if current_builder.len() >= max_segments {
                 // Batch is full, finish it and start a new one
                 if !current_builder.is_empty() {
-                    batches.push_back(current_builder.finish().into());
+                    Self::push_paced_batch(
+                        &mut batches,
+                        current_builder,
+                        &mut transmission_delay,
+                    );
                 }
                 current_builder = crate::datagram::batch::Builder::new(None, data_addr);
             }
@@ -888,7 +908,11 @@ impl Inner {
                 Ok(()) => {}
                 Err(datagram_entry) => {
                     // Batch builder is full, finish it and start a new one
-                    batches.push_back(current_builder.finish().into());
+                    Self::push_paced_batch(
+                        &mut batches,
+                        current_builder,
+                        &mut transmission_delay,
+                    );
                     current_builder = crate::datagram::batch::Builder::new(None, data_addr);
 
                     // Try again with new builder
@@ -917,7 +941,7 @@ impl Inner {
 
         // Push final batch if not empty
         if !current_builder.is_empty() {
-            batches.push_back(current_builder.finish().into());
+            Self::push_paced_batch(&mut batches, current_builder, &mut transmission_delay);
         }
 
         // Submit all batches
@@ -994,5 +1018,42 @@ impl tokio::io::AsyncWrite for Writer {
 
     fn is_write_vectored(&self) -> bool {
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn push_paced_batch_assigns_relative_delays() {
+        let peer_addr = "127.0.0.1:8080".parse().unwrap();
+        let mut batches = List::new();
+        let mut transmission_delay = Duration::ZERO;
+
+        Inner::push_paced_batch(
+            &mut batches,
+            crate::datagram::batch::Builder::new(None, peer_addr),
+            &mut transmission_delay,
+        );
+        Inner::push_paced_batch(
+            &mut batches,
+            crate::datagram::batch::Builder::new(None, peer_addr),
+            &mut transmission_delay,
+        );
+
+        let mut iter = batches.iter();
+        let first = iter.next().unwrap();
+        let second = iter.next().unwrap();
+
+        assert_eq!(first.transmission_delay, Some(Duration::ZERO));
+        assert_eq!(
+            second.transmission_delay,
+            Some(TRANSMISSION_PACING_INTERVAL)
+        );
+        assert_eq!(
+            transmission_delay,
+            TRANSMISSION_PACING_INTERVAL + TRANSMISSION_PACING_INTERVAL
+        );
     }
 }

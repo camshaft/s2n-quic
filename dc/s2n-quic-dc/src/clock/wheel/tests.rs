@@ -101,6 +101,7 @@ impl Clock {
 struct TestEntry {
     meta: u16,
     transmission_time: Option<precision::Timestamp>,
+    transmission_delay: Option<Duration>,
 }
 
 impl SingleTimer for TestEntry {
@@ -108,8 +109,17 @@ impl SingleTimer for TestEntry {
         self.transmission_time
     }
 
+    fn resolve_target_time(&mut self, base: precision::Timestamp) -> Option<precision::Timestamp> {
+        if let Some(delay) = self.transmission_delay.take() {
+            self.transmission_time = Some(base + delay);
+        }
+
+        self.transmission_time
+    }
+
     fn set_target_time(&mut self, time: precision::Timestamp) {
         self.transmission_time = Some(time);
+        self.transmission_delay = None;
     }
 }
 
@@ -163,6 +173,7 @@ fn test_immediate_transmission() {
         TestEntry {
             meta: 42,
             transmission_time: None,
+            transmission_delay: None,
         }
         .into(),
     );
@@ -193,6 +204,7 @@ fn test_len_tracking() {
             TestEntry {
                 meta: 100 + i,
                 transmission_time: Some(future_time),
+                transmission_delay: None,
             }
             .into(),
         );
@@ -232,6 +244,7 @@ fn test_cascade() {
         TestEntry {
             meta: 999,
             transmission_time: Some(future_time),
+            transmission_delay: None,
         }
         .into(),
     );
@@ -269,6 +282,7 @@ fn test_ordering() {
             TestEntry {
                 meta: i,
                 transmission_time: Some(clock.get_time() + Duration::from_micros(i as u64)),
+                transmission_delay: None,
             }
             .into(),
         );
@@ -366,12 +380,13 @@ fn fuzz_oracle_comparison() {
 
                 let meta = i as u16;
                 batch.push_back(
-                    TestEntry {
-                        meta,
-                        transmission_time: Some(time),
-                    }
-                    .into(),
-                );
+                        TestEntry {
+                            meta,
+                            transmission_time: Some(time),
+                            transmission_delay: None,
+                        }
+                        .into(),
+                    );
                 oracle.entry(effective_tick).or_default().push(meta);
             }
 
@@ -451,4 +466,39 @@ fn fuzz_oracle_comparison() {
                 "Wheel len should be 0 after draining all entries"
             );
         });
+}
+
+#[test]
+fn test_relative_transmission_resolution() {
+    let clock = Clock::new(Duration::from_micros(1_000));
+    let channel = TestChannel::new();
+    let mut wheel: Wheel<EntryAdapter<TestEntry>, ClockTimer, _, 1> =
+        Wheel::new(&channel, clock.timer());
+
+    let mut batch = Queue::new();
+    batch.push_back(
+        TestEntry {
+            meta: 7,
+            transmission_time: None,
+            transmission_delay: Some(Duration::from_micros(5)),
+        }
+        .into(),
+    );
+    channel.send_batch(batch);
+
+    let result = poll_once(core::future::poll_fn(|cx| wheel.poll_recv(cx)));
+    assert!(result.is_none(), "relative entry should remain scheduled");
+
+    wheel.timer.now = clock.get_time() + Duration::from_micros(5);
+    let mut queue = poll_once(core::future::poll_fn(|cx| wheel.poll_recv(cx)))
+        .unwrap()
+        .unwrap();
+
+    let entry = queue.pop_front().unwrap();
+    assert_eq!(entry.meta, 7);
+    assert_eq!(
+        entry.transmission_time,
+        Some(clock.get_time() + Duration::from_micros(5))
+    );
+    assert_eq!(entry.transmission_delay, None);
 }
