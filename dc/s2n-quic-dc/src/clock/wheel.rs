@@ -203,17 +203,17 @@ where
     fn stamp_entry(ptr: &A::Pointer, time: precision::Timestamp) {
         unsafe {
             // SAFETY: The pointer is valid since it came from the adapter.
-            A::set_target_time(A::as_ptr(ptr), time);
+            A::set_target_time(A::as_ptr(ptr) as *mut _, time);
         }
     }
 
     fn stamp_list(list: &mut List<A>, time: precision::Timestamp) {
-        for value in list.iter_mut() {
-            unsafe {
-                // SAFETY: The mutable reference points to a valid value in the list.
-                A::set_target_time(value as *mut _, time);
-            }
+        let mut stamped = List::new();
+        while let Some(ptr) = list.pop_front() {
+            Self::stamp_entry(&ptr, time);
+            stamped.push_back(ptr);
         }
+        list.append(&mut stamped);
     }
 
     /// Insert a single entry into the appropriate level/slot.
@@ -403,7 +403,7 @@ where
                 for ptr in batch {
                     let resolved_target_time = unsafe {
                         // SAFETY: The pointer is valid since it came from the adapter.
-                        let value_ptr = A::as_ptr(&ptr);
+                        let value_ptr = A::as_ptr(&ptr) as *mut _;
                         A::resolve_target_time(value_ptr, now)
                     };
 

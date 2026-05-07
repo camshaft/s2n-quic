@@ -1759,6 +1759,13 @@ impl<S> crate::clock::wheel::WheelAdapter for PtoAdapter<S> {
         (*value).borrow().pto.target_time
     }
 
+    unsafe fn resolve_target_time(
+        value: *mut Self::Value,
+        _base: crate::clock::precision::Timestamp,
+    ) -> Option<crate::clock::precision::Timestamp> {
+        Self::target_time(value)
+    }
+
     unsafe fn set_target_time(value: *mut Self::Value, time: crate::clock::precision::Timestamp) {
         (*value).borrow_mut().pto.target_time = Some(time);
     }
