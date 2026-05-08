@@ -4,7 +4,6 @@
 use super::{
     descriptor::Descriptor,
     handle::{Control, Stream},
-    pool::Region,
     probes,
 };
 use s2n_quic_core::varint::VarInt;
@@ -37,10 +36,8 @@ impl<S: 'static, C: 'static, Key: 'static> FreeVec<S, C, Key> {
     #[inline]
     pub fn new(initial_cap: usize) -> (Arc<Self>, Arc<Memory<S, C, Key>>) {
         let descriptors = VecDeque::with_capacity(initial_cap);
-        let regions = Vec::with_capacity(1);
         let inner = FreeInner {
             descriptors,
-            regions,
             total: 0,
             open: true,
             #[cfg(debug_assertions)]
@@ -73,22 +70,14 @@ impl<S: 'static, C: 'static, Key: 'static> FreeVec<S, C, Key> {
 
         drop(inner);
 
-        unsafe {
-            // SAFETY: the descriptor is only owned by the free list
-            descriptor.init_key(key);
-            let (control, stream) = descriptor.into_receiver_pair(remote_queue_id);
-            Ok((Control::new(control), Stream::new(stream)))
-        }
+        descriptor.init_key(key);
+        let (control, stream) = descriptor.into_receiver_pair(remote_queue_id);
+        Ok((Control::new(control), Stream::new(stream)))
     }
 
     #[inline]
-    pub fn record_region(
-        &self,
-        region: Region<S, C, Key>,
-        descriptors: Vec<Descriptor<S, C, Key>>,
-    ) {
+    pub fn record_region(&self, descriptors: Vec<Descriptor<S, C, Key>>) {
         let mut inner = self.inner.lock().unwrap();
-        inner.regions.push(region);
         let prev = inner.total;
         let next = prev + descriptors.len();
         inner.total = next;
@@ -153,7 +142,6 @@ where
 
 struct FreeInner<S: 'static, C: 'static, Key: 'static> {
     descriptors: VecDeque<Descriptor<S, C, Key>>,
-    regions: Vec<Region<S, C, Key>>,
     total: usize,
     open: bool,
     #[cfg(debug_assertions)]
@@ -176,7 +164,6 @@ impl<S: 'static, C: 'static, Key: 'static> FreeInner<S, C, Key> {
             self,
             FreeInner {
                 descriptors: VecDeque::new(),
-                regions: Vec::new(),
                 total: 0,
                 open: false,
                 #[cfg(debug_assertions)]
@@ -189,20 +176,11 @@ impl<S: 'static, C: 'static, Key: 'static> FreeInner<S, C, Key> {
 impl<S: 'static, C: 'static, Key: 'static> Drop for FreeInner<S, C, Key> {
     #[inline]
     fn drop(&mut self) {
-        if self.descriptors.is_empty() {
-            return;
-        }
+        if !self.descriptors.is_empty() {
+            #[cfg(debug_assertions)]
+            assert!(self.active.is_empty());
 
-        #[cfg(debug_assertions)]
-        assert!(self.active.is_empty());
-
-        probes::on_drained(self.total);
-
-        for descriptor in self.descriptors.drain(..) {
-            unsafe {
-                // SAFETY: the free list is closed and there are no outstanding descriptors
-                descriptor.drop_in_place();
-            }
+            probes::on_drained(self.total);
         }
     }
 }
