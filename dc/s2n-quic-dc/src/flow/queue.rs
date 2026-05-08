@@ -16,6 +16,8 @@ mod inner;
 mod pool;
 mod probes;
 mod sender;
+#[cfg(test)]
+mod tests;
 
 // Re-export the Key trait
 pub use descriptor::Key;
