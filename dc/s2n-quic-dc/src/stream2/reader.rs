@@ -312,17 +312,11 @@ impl Reader {
     where
         S: buffer::writer::Storage,
     {
-        let contract_state = core::cell::Cell::new(ReadIntoWakerContract::default());
-        waker::debug_assert_contract_with_context(
-            cx,
-            |cx| {
-                let mut state = contract_state.get();
-                let outcome = self.0.poll_read_into(cx, buf, &mut state);
-                contract_state.set(state);
-                outcome
-            },
-            || Some(contract_state.get()),
-        )
+        waker::debug_assert_contract_with_context(cx, |cx| {
+            let mut contract_state = ReadIntoWakerContract::default();
+            let outcome = self.0.poll_read_into(cx, buf, &mut contract_state);
+            (outcome, Some(contract_state))
+        })
     }
 }
 
