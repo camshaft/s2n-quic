@@ -147,9 +147,11 @@ impl<S: 'static, C: 'static, Key: 'static> Sender<S, C, Key> {
     where
         F: FnOnce(&Key) -> R,
     {
-        let value = queue.with_key(|| self.descriptor.with_key(f))?;
-        debug_assert!(value.is_some(), "descriptor key missing for allocated queue");
-        value.ok_or(())
+        queue.with_key(|| {
+            self.descriptor
+                .with_key(f)
+                .expect("descriptor key missing for allocated queue")
+        })
     }
 
     #[inline]
@@ -172,11 +174,7 @@ impl<S: 'static, C: 'static, Key: 'static> Sender<S, C, Key> {
                     false
                 }
             },
-            || {
-                let valid = self.descriptor.with_key(validate);
-                debug_assert!(valid.is_some(), "descriptor key missing for stream send");
-                valid.unwrap_or(false)
-            },
+            || self.descriptor.with_key(validate).expect("descriptor key missing for stream send"),
         )?;
         probes::on_send(self.descriptor.queue_id(), Half::Stream, false);
         Ok(())
@@ -203,9 +201,9 @@ impl<S: 'static, C: 'static, Key: 'static> Sender<S, C, Key> {
                 }
             },
             || {
-                let valid = self.descriptor.with_key(validate);
-                debug_assert!(valid.is_some(), "descriptor key missing for control send");
-                valid.unwrap_or(false)
+                self.descriptor
+                    .with_key(validate)
+                    .expect("descriptor key missing for control send")
             },
         )?;
         probes::on_send(self.descriptor.queue_id(), Half::Control, false);

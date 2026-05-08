@@ -176,10 +176,9 @@ impl<S: 'static, C: 'static, Key: 'static> Descriptor<S, C, Key> {
 
         // Drop the key before freeing the descriptor
         let mut key = self.inner.key.lock().unwrap();
-        let key = key
+        let _key = key
             .take()
             .expect("descriptor key was not initialized");
-        drop(key);
 
         let storage = self.inner.free_list.free(self.clone());
         drop(storage);
