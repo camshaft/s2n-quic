@@ -22,7 +22,7 @@ use crate::{
     intrusive_queue::{Entry, Queue},
     packet::{
         self,
-        datagram::{partial::PartialDatagram, QueuePair, ResetTarget, RoutingInfo},
+        datagram::{partial::{PacketType, PartialDatagram}, QueuePair, ResetTarget, RoutingInfo},
     },
     path::{self, secret::map::Entry as PathSecretEntry},
     random,
@@ -2255,6 +2255,56 @@ struct RecvSocketInfo<S> {
     socket: S,
 }
 
+const BATCH_PRIORITY_LEVELS: usize = 5;
+
+#[derive(Clone, Copy)]
+enum BatchPriority {
+    Ack = 0,
+    FlowRetryReset = 1,
+    FlowControl = 2,
+    FlowData = 3,
+    FlowInit = 4,
+}
+
+impl BatchPriority {
+    #[inline]
+    fn as_index(self) -> usize {
+        self as usize
+    }
+}
+
+#[inline]
+fn classify_datagram_priority(datagram: &PartialDatagram) -> BatchPriority {
+    match &datagram.packet_type {
+        PacketType::Control { .. } => BatchPriority::Ack,
+        PacketType::Datagram { routing_info, .. } => match routing_info {
+            RoutingInfo::FlowValidateRequest { .. }
+            | RoutingInfo::FlowInitValidate { .. }
+            | RoutingInfo::FlowReset { .. } => BatchPriority::FlowRetryReset,
+            RoutingInfo::FlowControl { .. } => BatchPriority::FlowControl,
+            RoutingInfo::FlowData { .. } | RoutingInfo::None => BatchPriority::FlowData,
+            RoutingInfo::FlowInit { .. } => BatchPriority::FlowInit,
+        },
+    }
+}
+
+#[inline]
+fn classify_batch_priority(batch: &Batch) -> BatchPriority {
+    let mut priority = BatchPriority::FlowInit;
+
+    for datagram in batch.datagrams.iter() {
+        let datagram_priority = classify_datagram_priority(datagram);
+        if datagram_priority.as_index() < priority.as_index() {
+            priority = datagram_priority;
+            if matches!(priority, BatchPriority::Ack) {
+                break;
+            }
+        }
+    }
+
+    priority
+}
+
 struct Worker<SendSocket, RecvSocket> {
     id: usize,
     send_sockets: Vec<SendSocketInfo<SendSocket>>,
@@ -2374,10 +2424,6 @@ where
     // Create channel for wheel input from generators
     let (wheel_input_tx, wheel_input_rx) = intrusive_queue::sync::new();
 
-    // Create the timing wheel that wraps the input receiver
-    let wheel_timer = clock.timer();
-    let wheel: Wheel<_, _, _, 1> = Wheel::new(wheel_input_rx, wheel_timer);
-
     // Create error channel for failed batches
     let (error_tx, error_rx) = intrusive_queue::sync::new();
 
@@ -2451,19 +2497,41 @@ where
     spawner.spawn_local(0, {
         let clock = clock.clone();
         let socket_senders = flat_socket_senders.clone();
+        let wheel_input_rx = wheel_input_rx;
         move |mut spawner| {
             info!("Starting wheel worker on worker 0");
 
-            // Task 1: Pump wheel output into a channel for distribution
-            let (wheel_output_tx, wheel_output_rx) = intrusive_queue::unsync::new();
+            let mut priority_wheel_txs = Vec::with_capacity(BATCH_PRIORITY_LEVELS);
+            let mut priority_output_rxs = Vec::with_capacity(BATCH_PRIORITY_LEVELS);
+
+            for _ in 0..BATCH_PRIORITY_LEVELS {
+                let (priority_input_tx, priority_input_rx) = intrusive_queue::unsync::new();
+                let (priority_output_tx, priority_output_rx) = intrusive_queue::unsync::new();
+                let wheel_timer = clock.timer();
+                let wheel: Wheel<_, _, _, 1> =
+                    Wheel::new(priority_input_rx.into_list_receiver(), wheel_timer);
+
+                priority_wheel_txs.push(priority_input_tx);
+                priority_output_rxs.push(FlattenQueue::new(priority_output_rx.into_list_receiver()));
+
+                spawner.spawn(async move {
+                    channel::pump(wheel, priority_output_tx.into_list_sender()).await;
+                });
+            }
 
             spawner.spawn(async move {
-                channel::pump(wheel, wheel_output_tx.into_list_sender()).await;
-                info!("Wheel pump task shutting down");
+                let rx = FlattenQueue::new(wheel_input_rx);
+                let rx = channel::Map::new(rx, move |entry: Entry<Batch>| {
+                    let priority = classify_batch_priority(&entry);
+                    let _ = priority_wheel_txs[priority.as_index()].send(entry);
+                });
+
+                rx.drain().await;
+                info!("Priority wheel router task shutting down");
             });
 
             // Task 2: Overall bandwidth limiter + sticky routing + round robin distributor
-            let rx = FlattenQueue::new(wheel_output_rx.into_list_receiver());
+            let rx = channel::Priority::new(priority_output_rxs);
             let rx = Paced::new(rx, clock.clone(), overall_send_rate);
 
             // Intercept sticky batches (sender_id != MAX) and route them directly
