@@ -139,6 +139,24 @@ impl<S: 'static, C: 'static, Key: 'static> Sender<S, C, Key> {
     }
 
     #[inline]
+    fn with_allocated_key<T, F, R>(
+        &self,
+        queue: &super::inner::Queue<T>,
+        f: F,
+    ) -> Result<R, ()>
+    where
+        F: FnOnce(&Key) -> R,
+    {
+        let value = queue.with_key(|| self.descriptor.with_key(f))?;
+        if let Some(value) = value {
+            Ok(value)
+        } else {
+            debug_assert!(false, "descriptor key missing for allocated queue");
+            Err(())
+        }
+    }
+
+    #[inline]
     pub fn send_stream<F>(
         &self,
         entry: intrusive_queue::Entry<S>,
@@ -158,7 +176,15 @@ impl<S: 'static, C: 'static, Key: 'static> Sender<S, C, Key> {
                     false
                 }
             },
-            || self.descriptor.with_key(validate).unwrap_or(false),
+            || {
+                let valid = self.descriptor.with_key(validate);
+                if let Some(valid) = valid {
+                    valid
+                } else {
+                    debug_assert!(false, "descriptor key missing for stream send");
+                    false
+                }
+            },
         )?;
         probes::on_send(self.descriptor.queue_id(), Half::Stream, false);
         Ok(())
@@ -184,7 +210,15 @@ impl<S: 'static, C: 'static, Key: 'static> Sender<S, C, Key> {
                     false
                 }
             },
-            || self.descriptor.with_key(validate).unwrap_or(false),
+            || {
+                let valid = self.descriptor.with_key(validate);
+                if let Some(valid) = valid {
+                    valid
+                } else {
+                    debug_assert!(false, "descriptor key missing for control send");
+                    false
+                }
+            },
         )?;
         probes::on_send(self.descriptor.queue_id(), Half::Control, false);
         Ok(())
@@ -202,7 +236,7 @@ impl<S: 'static, C: 'static, Key: 'static> Sender<S, C, Key> {
         F: FnOnce(&Key) -> R,
     {
         let stream_queue = self.descriptor.stream_queue();
-        stream_queue.with_key(|| self.descriptor.with_key(f)).and_then(|v| v.ok_or(()))
+        self.with_allocated_key(stream_queue, f)
     }
 
     /// Invokes the provided closure with a reference to the queue's key if the control queue is allocated.
@@ -217,7 +251,7 @@ impl<S: 'static, C: 'static, Key: 'static> Sender<S, C, Key> {
         F: FnOnce(&Key) -> R,
     {
         let control_queue = self.descriptor.control_queue();
-        control_queue.with_key(|| self.descriptor.with_key(f)).and_then(|v| v.ok_or(()))
+        self.with_allocated_key(control_queue, f)
     }
 }
 
