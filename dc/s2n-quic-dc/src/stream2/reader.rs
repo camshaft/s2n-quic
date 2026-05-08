@@ -283,7 +283,14 @@ impl Reader {
         core::future::poll_fn(|cx| self.poll_validate(cx)).await
     }
 
-    /// Poll-based validate
+    /// Poll-based validate variant of [`Self::validate`].
+    ///
+    /// Polls stream validation progress using `cx` and returns:
+    /// - `Poll::Pending` while waiting for `FlowValidated`
+    /// - `Poll::Ready(Ok(()))` once validation completes or if already validated
+    /// - `Poll::Ready(Err(_))` on reset/channel errors
+    ///
+    /// Prefer [`Self::validate`] unless integrating with a manual polling loop.
     pub fn poll_validate(&mut self, cx: &mut Context) -> Poll<io::Result<()>> {
         waker::debug_assert_contract_with_context(cx, |cx| {
             let mut contract_state = ReadIntoWakerContract::default();
