@@ -121,6 +121,11 @@ where
             // update our local copy
             self.epoch = senders.epoch;
 
+            // Another pool instance already published a growth page; drop this
+            // speculative page and retry alloc against the shared free list.
+            drop(pending_desc);
+            drop(pending_senders);
+
             // return back to the alloc method, which may have a free descriptor now
             return;
         }

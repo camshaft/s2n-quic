@@ -108,7 +108,7 @@ impl<S: 'static, C: 'static, Key: 'static> Descriptor<S, C, Key> {
     #[inline]
     pub fn init_key(&self, key: Key) {
         let mut current = self.inner.key.lock().unwrap();
-        debug_assert!(current.is_none(), "descriptor key already initialized");
+        assert!(current.is_none(), "descriptor key already initialized");
         *current = Some(key);
     }
 
@@ -176,8 +176,9 @@ impl<S: 'static, C: 'static, Key: 'static> Descriptor<S, C, Key> {
 
         // Drop the key before freeing the descriptor
         let mut key = self.inner.key.lock().unwrap();
-        let key = key.take();
-        debug_assert!(key.is_some(), "descriptor key was not initialized");
+        let key = key
+            .take()
+            .expect("descriptor key was not initialized");
         drop(key);
 
         let storage = self.inner.free_list.free(self.clone());
