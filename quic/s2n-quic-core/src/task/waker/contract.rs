@@ -3,6 +3,7 @@
 
 use alloc::{sync::Arc, task::Wake};
 use core::{
+    fmt,
     sync::atomic::{AtomicBool, Ordering},
     task::{Context, Poll, Waker},
 };
@@ -54,7 +55,7 @@ impl Contract {
     /// Checks the state of the waker based on the provided `outcome`
     #[inline]
     #[track_caller]
-    pub fn check_outcome<T>(self, outcome: &Poll<T>) {
+    pub fn check_outcome<T, C: fmt::Debug>(self, outcome: &Poll<T>, context: Option<&C>) {
         if outcome.is_ready() {
             return;
         }
@@ -65,10 +66,17 @@ impl Contract {
 
         let is_ok = is_cloned || wake_called;
 
-        assert!(
-            is_ok,
-            "strong_count = {strong_count}; is_cloned = {is_cloned}; wake_called = {wake_called}"
-        );
+        if let Some(context) = context {
+            assert!(
+                is_ok,
+                "strong_count = {strong_count}; is_cloned = {is_cloned}; wake_called = {wake_called}; contract_context = {context:?}"
+            );
+        } else {
+            assert!(
+                is_ok,
+                "strong_count = {strong_count}; is_cloned = {is_cloned}; wake_called = {wake_called}"
+            );
+        }
     }
 }
 
@@ -77,10 +85,30 @@ impl Contract {
 #[inline(always)]
 #[track_caller]
 pub fn assert_contract<F: FnOnce(&mut Context) -> Poll<R>, R>(cx: &mut Context, f: F) -> Poll<R> {
+    assert_contract_with_context::<F, R, (), _>(cx, f, || None)
+}
+
+/// Checks that if a function returns [`Poll::Pending`], then the function called [`Waker::clone`],
+/// [`Waker::wake`], or [`Waker::wake_by_ref`] on the [`Context`]'s [`Waker`].
+///
+/// Includes optional `context` in panic output when the contract is violated.
+#[inline(always)]
+#[track_caller]
+pub fn assert_contract_with_context<
+    F: FnOnce(&mut Context) -> Poll<R>,
+    R,
+    C: fmt::Debug,
+    Ctx: FnOnce() -> Option<C>,
+>(
+    cx: &mut Context,
+    f: F,
+    context: Ctx,
+) -> Poll<R> {
     let contract = Contract::new(cx);
     let mut cx = contract.context();
     let outcome = f(&mut cx);
-    contract.check_outcome(&outcome);
+    let context = context();
+    contract.check_outcome(&outcome, context.as_ref());
     outcome
 }
 
@@ -94,8 +122,29 @@ pub fn debug_assert_contract<F: FnOnce(&mut Context) -> Poll<R>, R>(
     cx: &mut Context,
     f: F,
 ) -> Poll<R> {
+    debug_assert_contract_with_context::<F, R, (), _>(cx, f, || None)
+}
+
+/// Checks that if a function returns [`Poll::Pending`], then the function called [`Waker::clone`],
+/// [`Waker::wake`], or [`Waker::wake_by_ref`] on the [`Context`]'s [`Waker`].
+///
+/// Includes optional `context` in panic output when the contract is violated.
+///
+/// This is only enabled with `debug_assertions`.
+#[inline(always)]
+#[track_caller]
+pub fn debug_assert_contract_with_context<
+    F: FnOnce(&mut Context) -> Poll<R>,
+    R,
+    C: fmt::Debug,
+    Ctx: FnOnce() -> Option<C>,
+>(
+    cx: &mut Context,
+    f: F,
+    context: Ctx,
+) -> Poll<R> {
     #[cfg(debug_assertions)]
-    return assert_contract(cx, f);
+    return assert_contract_with_context(cx, f, context);
 
     #[cfg(not(debug_assertions))]
     return f(cx);

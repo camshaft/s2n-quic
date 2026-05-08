@@ -170,6 +170,25 @@ impl Status {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct ReadIntoWakerContract {
+    checked_pending_validation: bool,
+    checked_reset: bool,
+    checked_complete: bool,
+    polled_stream_rx: bool,
+    stream_rx_ready: bool,
+    stream_rx_pending: bool,
+    stream_rx_closed: bool,
+    stream_rx_data: bool,
+    stream_rx_flow_validated: bool,
+    stream_rx_reset: bool,
+    attempted_copy_into_buf: bool,
+    copied_data: bool,
+    maybe_send_max_data_ok: bool,
+    returned_ready: bool,
+    returned_pending: bool,
+}
+
 impl Reader {
     /// Create a new Reader for a client connection
     pub(crate) fn new_client(
@@ -293,7 +312,12 @@ impl Reader {
     where
         S: buffer::writer::Storage,
     {
-        waker::debug_assert_contract(cx, |cx| self.0.poll_read_into(cx, buf))
+        let mut contract = ReadIntoWakerContract::default();
+        waker::debug_assert_contract_with_context(
+            cx,
+            |cx| self.0.poll_read_into(cx, buf, &mut contract),
+            || Some(contract),
+        )
     }
 }
 
@@ -304,7 +328,8 @@ impl Inner {
         }
 
         // Poll for FlowValidated (or Reset/error)
-        match self.poll_stream_rx(cx)? {
+        let mut contract = ReadIntoWakerContract::default();
+        match self.poll_stream_rx(cx, &mut contract)? {
             Poll::Ready(()) => {
                 if self.status.is_pending_validation() {
                     Poll::Pending
@@ -316,12 +341,19 @@ impl Inner {
         }
     }
 
-    fn poll_read_into<S>(&mut self, cx: &mut Context, buf: &mut S) -> Poll<io::Result<usize>>
+    fn poll_read_into<S>(
+        &mut self,
+        cx: &mut Context,
+        buf: &mut S,
+        contract: &mut ReadIntoWakerContract,
+    ) -> Poll<io::Result<usize>>
     where
         S: buffer::writer::Storage,
     {
         // Must validate before reading
+        contract.checked_pending_validation = true;
         if self.status.is_pending_validation() {
+            contract.returned_ready = true;
             return Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "stream not yet validated - call validate() first",
@@ -329,43 +361,55 @@ impl Inner {
         }
 
         // Check if we're in a terminal state
+        contract.checked_reset = true;
         if self.status.is_reset() {
             if let Some(error_code) = self.reset_error_code {
                 let reset_error: ResetError = error_code.into();
+                contract.returned_ready = true;
                 return Poll::Ready(Err(io::Error::new(
                     io::ErrorKind::ConnectionReset,
                     reset_error,
                 )));
             }
+            contract.returned_ready = true;
             return Poll::Ready(Err(io::ErrorKind::ConnectionReset.into()));
         }
 
+        contract.checked_complete = true;
         if self.status.is_complete() {
+            contract.returned_ready = true;
             return Poll::Ready(Ok(0));
         }
 
         // Process incoming messages to fill the reassembler
-        let _ = self.poll_stream_rx(cx)?;
+        contract.polled_stream_rx = true;
+        let _ = self.poll_stream_rx(cx, contract)?;
 
         // Copy from reassembler into destination buffer
         let bytes_read = if buf.remaining_capacity() > 0 {
+            contract.attempted_copy_into_buf = true;
             let mut tracker = buf.track_write();
             self.reassembler.infallible_copy_into(&mut tracker);
+            contract.copied_data = tracker.written_len() > 0;
             tracker.written_len()
         } else {
             0
         };
 
         self.maybe_send_max_data()?;
+        contract.maybe_send_max_data_ok = true;
 
         if self.reassembler.is_reading_complete() {
             self.status.on_complete().ok();
+            contract.returned_ready = true;
             return Poll::Ready(Ok(bytes_read));
         }
 
         if bytes_read > 0 {
+            contract.returned_ready = true;
             Poll::Ready(Ok(bytes_read))
         } else {
+            contract.returned_pending = true;
             Poll::Pending
         }
     }
@@ -375,9 +419,14 @@ impl Inner {
     /// NOTE: `poll_swap` both drains the queue and registers the waker in one call,
     /// so there's no need to loop. If the queue is empty, the waker is registered
     /// and we return Pending.
-    fn poll_stream_rx(&mut self, cx: &mut Context) -> Poll<io::Result<()>> {
+    fn poll_stream_rx(
+        &mut self,
+        cx: &mut Context,
+        contract: &mut ReadIntoWakerContract,
+    ) -> Poll<io::Result<()>> {
         match self.stream_rx.poll_swap(cx) {
             Poll::Ready(Ok(queue)) => {
+                contract.stream_rx_ready = true;
                 // Process all messages in the queue
                 for msg in queue {
                     match msg.into_inner() {
@@ -386,6 +435,7 @@ impl Inner {
                             mut payload,
                             fin,
                         } => {
+                            contract.stream_rx_data = true;
                             trace!(
                                 stream_id = self.stream_id.as_u64(),
                                 offset = offset.as_u64(),
@@ -444,6 +494,7 @@ impl Inner {
                             }
                         }
                         StreamMsg::FlowValidated => {
+                            contract.stream_rx_flow_validated = true;
                             if self.status.on_validated().is_ok() {
                                 debug!(stream_id = self.stream_id.as_u64(), "Flow validated");
                             } else {
@@ -454,6 +505,7 @@ impl Inner {
                             }
                         }
                         StreamMsg::Reset { error_code } => {
+                            contract.stream_rx_reset = true;
                             debug!(
                                 stream_id = self.stream_id.as_u64(),
                                 error_code = error_code.as_u64(),
@@ -472,11 +524,17 @@ impl Inner {
 
                 Poll::Ready(Ok(()))
             }
-            Poll::Ready(Err(_)) => Poll::Ready(Err(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "stream channel closed",
-            ))),
-            Poll::Pending => Poll::Pending,
+            Poll::Ready(Err(_)) => {
+                contract.stream_rx_closed = true;
+                Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "stream channel closed",
+                )))
+            }
+            Poll::Pending => {
+                contract.stream_rx_pending = true;
+                Poll::Pending
+            }
         }
     }
 
