@@ -2451,43 +2451,37 @@ where
         move |mut spawner| {
             info!("Starting wheel worker on worker 0");
 
-            let mut priority_wheel_txs = Vec::with_capacity(BatchPriority::LEVELS);
+            let mut priority_output_txs = Vec::with_capacity(BatchPriority::LEVELS);
             let mut priority_output_rxs = Vec::with_capacity(BatchPriority::LEVELS);
 
             for _ in 0..BatchPriority::LEVELS {
-                let (priority_input_tx, priority_input_rx) = intrusive_queue::unsync::new();
                 let (priority_output_tx, priority_output_rx) = intrusive_queue::unsync::new();
-                let wheel_timer = clock.timer();
-                let wheel: Wheel<_, _, _, 1> =
-                    Wheel::new(priority_input_rx.into_list_receiver(), wheel_timer);
-
-                priority_wheel_txs.push(priority_input_tx);
+                priority_output_txs.push(priority_output_tx);
                 priority_output_rxs
                     .push(FlattenQueue::new(priority_output_rx.into_list_receiver()));
-
-                spawner.spawn(async move {
-                    channel::pump(wheel, priority_output_tx.into_list_sender()).await;
-                });
             }
 
+            let wheel_timer = clock.timer();
+            let wheel: Wheel<_, _, _, 1> = Wheel::new(wheel_input_rx, wheel_timer);
             spawner.spawn(async move {
-                let rx = FlattenQueue::new(wheel_input_rx);
+                let rx = FlattenQueue::new(wheel);
                 let rx = channel::Map::new(rx, move |entry: Entry<Batch>| {
-                    // Route each batch into a dedicated per-priority wheel. The downstream
-                    // `channel::Priority` receiver polls these outputs in priority order.
+                    // Route each wheel output batch into a dedicated priority lane. The
+                    // downstream `channel::Priority` receiver polls these outputs in order.
                     let priority_idx = entry.meta.priority.as_index();
                     // SAFETY: batch priority is an enum with values in 0..BatchPriority::LEVELS.
-                    let sender = unsafe { priority_wheel_txs.get_unchecked_mut(priority_idx) };
-                    if sender.send(entry).is_err() {
+                    let priority_sender =
+                        unsafe { priority_output_txs.get_unchecked_mut(priority_idx) };
+                    if priority_sender.send(entry).is_err() {
                         tracing::warn!(
                             priority = priority_idx,
-                            "Priority wheel input is closed; dropping batch"
+                            "Priority output lane is closed; dropping batch"
                         );
                     }
                 });
 
                 rx.drain().await;
-                info!("Priority wheel router task shutting down");
+                info!("Wheel priority router task shutting down");
             });
 
             // Task 2: Overall bandwidth limiter + sticky routing + round robin distributor
