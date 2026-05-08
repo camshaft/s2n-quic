@@ -312,16 +312,16 @@ impl Reader {
     where
         S: buffer::writer::Storage,
     {
-        let contract = core::cell::Cell::new(ReadIntoWakerContract::default());
+        let contract_state = core::cell::Cell::new(ReadIntoWakerContract::default());
         waker::debug_assert_contract_with_context(
             cx,
             |cx| {
-                let mut state = contract.get();
+                let mut state = contract_state.get();
                 let outcome = self.0.poll_read_into(cx, buf, &mut state);
-                contract.set(state);
+                contract_state.set(state);
                 outcome
             },
-            || Some(contract.get()),
+            || Some(contract_state.get()),
         )
     }
 }
@@ -333,8 +333,8 @@ impl Inner {
         }
 
         // Poll for FlowValidated (or Reset/error)
-        let mut contract = ReadIntoWakerContract::default();
-        match self.poll_stream_rx(cx, &mut contract)? {
+        let mut contract_state = ReadIntoWakerContract::default();
+        match self.poll_stream_rx(cx, &mut contract_state)? {
             Poll::Ready(()) => {
                 if self.status.is_pending_validation() {
                     Poll::Pending

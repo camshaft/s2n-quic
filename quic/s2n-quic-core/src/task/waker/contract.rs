@@ -65,18 +65,13 @@ impl Contract {
         let wake_called = self.state.wake_called.load(Ordering::Acquire);
 
         let is_ok = is_cloned || wake_called;
-
-        if let Some(context) = context {
-            assert!(
-                is_ok,
-                "strong_count = {strong_count}; is_cloned = {is_cloned}; wake_called = {wake_called}; contract_context = {context:?}"
-            );
-        } else {
-            assert!(
-                is_ok,
-                "strong_count = {strong_count}; is_cloned = {is_cloned}; wake_called = {wake_called}"
-            );
-        }
+        let context = context
+            .map(|context| alloc::format!("; contract_context = {context:?}"))
+            .unwrap_or_default();
+        assert!(
+            is_ok,
+            "strong_count = {strong_count}; is_cloned = {is_cloned}; wake_called = {wake_called}{context}"
+        );
     }
 }
 
