@@ -57,7 +57,7 @@ struct Config {
 
 #[inline]
 fn next_u64(state: &mut u64) -> u64 {
-    // xorshift64*: fast deterministic PRNG for reproducible stress scheduling.
+    // xorshift64*: fast deterministic pseudo-random number generator (PRNG) for reproducible stress scheduling.
     let mut x = *state;
     x ^= x >> 12;
     x ^= x << 25;
@@ -302,7 +302,7 @@ fn run_oracle_stress(config: Config) {
 
 #[test]
 // Run with `cargo test -p s2n-quic-dc flow::queue::tests::stress_alloc_grow_and_route_multi_threaded -- --exact --ignored`
-#[ignore = "contention stress; currently used to reproduce allocator routing hangs"]
+#[ignore = "contention stress; long-running oracle routing verification"]
 fn stress_alloc_grow_and_route_multi_threaded() {
     run_oracle_stress(Config {
         threads: 4,
