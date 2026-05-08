@@ -31,6 +31,7 @@ fn stress_alloc_grow_and_route_multi_threaded() {
     const THREADS: usize = 8;
     const ITERS_PER_THREAD: usize = 1_500;
     const WORKER_ID_SHIFT: usize = 24;
+    const YIELD_INTERVAL: usize = 64;
 
     let allocator = Allocator::<usize, usize, TestKey>::new();
     let dispatcher = allocator.dispatcher();
@@ -99,7 +100,7 @@ fn stress_alloc_grow_and_route_multi_threaded() {
                         drop(stream);
                     }
 
-                    if iter % 64 == 0 {
+                    if iter % YIELD_INTERVAL == 0 {
                         thread::yield_now();
                     }
                 }
