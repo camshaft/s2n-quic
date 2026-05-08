@@ -17,15 +17,12 @@ use crate::{
     clock::{precision::Clock as _, tokio::Clock as TokioClock, wheel::Wheel},
     congestion,
     credentials::{self, Credentials},
-    datagram::batch::Batch,
+    datagram::batch::{Batch, Priority as BatchPriority},
     flow::{self, queue},
     intrusive_queue::{Entry, Queue},
     packet::{
         self,
-        datagram::{
-            partial::{PacketType, PartialDatagram},
-            QueuePair, ResetTarget, RoutingInfo,
-        },
+        datagram::{partial::PartialDatagram, QueuePair, ResetTarget, RoutingInfo},
     },
     path::{self, secret::map::Entry as PathSecretEntry},
     random,
@@ -2258,56 +2255,6 @@ struct RecvSocketInfo<S> {
     socket: S,
 }
 
-const BATCH_PRIORITY_LEVELS: usize = 5;
-
-#[derive(Clone, Copy)]
-enum BatchPriority {
-    Ack = 0,
-    FlowRetryReset = 1,
-    FlowControl = 2,
-    FlowData = 3,
-    FlowInit = 4,
-}
-
-impl BatchPriority {
-    #[inline]
-    fn as_index(self) -> usize {
-        self as usize
-    }
-}
-
-#[inline]
-fn classify_datagram_priority(datagram: &PartialDatagram) -> BatchPriority {
-    match &datagram.packet_type {
-        PacketType::Control { .. } => BatchPriority::Ack,
-        PacketType::Datagram { routing_info, .. } => match routing_info {
-            RoutingInfo::FlowValidateRequest { .. }
-            | RoutingInfo::FlowInitValidate { .. }
-            | RoutingInfo::FlowReset { .. } => BatchPriority::FlowRetryReset,
-            RoutingInfo::FlowControl { .. } => BatchPriority::FlowControl,
-            RoutingInfo::FlowData { .. } | RoutingInfo::None => BatchPriority::FlowData,
-            RoutingInfo::FlowInit { .. } => BatchPriority::FlowInit,
-        },
-    }
-}
-
-#[inline]
-fn classify_batch_priority(batch: &Batch) -> BatchPriority {
-    let mut priority = BatchPriority::FlowInit;
-
-    for datagram in batch.datagrams.iter() {
-        let datagram_priority = classify_datagram_priority(datagram);
-        if datagram_priority.as_index() < priority.as_index() {
-            priority = datagram_priority;
-            if matches!(priority, BatchPriority::Ack) {
-                break;
-            }
-        }
-    }
-
-    priority
-}
-
 struct Worker<SendSocket, RecvSocket> {
     id: usize,
     send_sockets: Vec<SendSocketInfo<SendSocket>>,
@@ -2504,10 +2451,10 @@ where
         move |mut spawner| {
             info!("Starting wheel worker on worker 0");
 
-            let mut priority_wheel_txs = Vec::with_capacity(BATCH_PRIORITY_LEVELS);
-            let mut priority_output_rxs = Vec::with_capacity(BATCH_PRIORITY_LEVELS);
+            let mut priority_wheel_txs = Vec::with_capacity(BatchPriority::LEVELS);
+            let mut priority_output_rxs = Vec::with_capacity(BatchPriority::LEVELS);
 
-            for _ in 0..BATCH_PRIORITY_LEVELS {
+            for _ in 0..BatchPriority::LEVELS {
                 let (priority_input_tx, priority_input_rx) = intrusive_queue::unsync::new();
                 let (priority_output_tx, priority_output_rx) = intrusive_queue::unsync::new();
                 let wheel_timer = clock.timer();
@@ -2528,10 +2475,12 @@ where
                 let rx = channel::Map::new(rx, move |entry: Entry<Batch>| {
                     // Route each batch into a dedicated per-priority wheel. The downstream
                     // `channel::Priority` receiver polls these outputs in priority order.
-                    let priority = classify_batch_priority(&entry);
-                    if priority_wheel_txs[priority.as_index()].send(entry).is_err() {
+                    let priority_idx = entry.meta.priority.as_index();
+                    // SAFETY: batch priority is an enum with values in 0..BatchPriority::LEVELS.
+                    let sender = unsafe { priority_wheel_txs.get_unchecked_mut(priority_idx) };
+                    if sender.send(entry).is_err() {
                         tracing::warn!(
-                            priority = priority.as_index(),
+                            priority = priority_idx,
                             "Priority wheel input is closed; dropping batch"
                         );
                     }
