@@ -108,7 +108,10 @@ impl<S: 'static, C: 'static, Key: 'static> Descriptor<S, C, Key> {
     #[inline]
     pub fn init_key(&self, key: Key) {
         let mut current = self.inner.key.lock().unwrap();
-        assert!(current.is_none(), "descriptor key already initialized");
+        assert!(
+            current.is_none(),
+            "internal error: attempted to initialize descriptor key twice (this should never happen)"
+        );
         *current = Some(key);
     }
 

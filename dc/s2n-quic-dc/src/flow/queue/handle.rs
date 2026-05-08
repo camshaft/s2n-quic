@@ -150,7 +150,9 @@ impl<S: 'static, C: 'static, Key: 'static> Sender<S, C, Key> {
         queue.with_key(|| {
             self.descriptor
                 .with_key(f)
-                .expect("descriptor key missing for allocated queue")
+                .expect(
+                    "internal error: descriptor key uninitialized for allocated queue (this should never happen)",
+                )
         })
     }
 
@@ -174,7 +176,11 @@ impl<S: 'static, C: 'static, Key: 'static> Sender<S, C, Key> {
                     false
                 }
             },
-            || self.descriptor.with_key(validate).expect("descriptor key missing for stream send"),
+            || {
+                self.descriptor.with_key(validate).expect(
+                    "internal error: descriptor key uninitialized during stream send (this should never happen)",
+                )
+            },
         )?;
         probes::on_send(self.descriptor.queue_id(), Half::Stream, false);
         Ok(())
@@ -203,7 +209,9 @@ impl<S: 'static, C: 'static, Key: 'static> Sender<S, C, Key> {
             || {
                 self.descriptor
                     .with_key(validate)
-                    .expect("descriptor key missing for control send")
+                    .expect(
+                        "internal error: descriptor key uninitialized during control send (this should never happen)",
+                    )
             },
         )?;
         probes::on_send(self.descriptor.queue_id(), Half::Control, false);
