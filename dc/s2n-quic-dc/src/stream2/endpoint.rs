@@ -3148,114 +3148,172 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rand::{rngs::StdRng, Rng, SeedableRng};
 
-    /// Verify that the routing hash function distributes 1000 random
-    /// (credential_id, sender_id) pairs evenly across worker buckets.
+    /// Verify that `hash_id_and_sender` distributes traffic evenly across worker
+    /// buckets, and that no individual credential causes its sender_ids to "laser
+    /// in" on a single receiver.
     ///
-    /// sender_ids are drawn from 0..=63 (the realistic range).
-    /// credential_ids are random 16-byte values with high entropy.
+    /// In practice each peer sees packets from *every* sender_id under a given set
+    /// of credentials, so the realistic input pattern is "many random
+    /// credential_ids × all 64 sender_ids", not "many random pairs".  We exercise
+    /// that pattern and check both:
     ///
-    /// For each router variant we assert that every bucket falls within
-    /// a 3× range of the ideal average, i.e. no bucket receives fewer
-    /// than `expected / 3` or more than `expected * 3` assignments.
+    /// * **Global distribution** — across all credentials × all sender_ids, every
+    ///   bucket should land within ±20 % of the ideal average.
+    /// * **Per-credential spread** — for any single credential the 64 sender_ids
+    ///   must land in a healthy number of distinct buckets and no single bucket
+    ///   may absorb a disproportionate share.  This is what protects throughput:
+    ///   if one credential's traffic concentrated on one worker we'd bottleneck.
+    ///
+    /// We use `StdRng` (ChaCha12, a CSPRNG) instead of a weak PRNG so that the
+    /// RNG's own quality cannot mask weaknesses in the hash function under test.
+    /// We also iterate over multiple seeds — judging hash quality from a single
+    /// seed would be unsound.
     #[test]
     fn routing_hash_distribution() {
-        // Deterministic seed so the test is reproducible.
-        let mut rng_state: u64 = 0xdeadbeef_cafebabe;
+        const N_CREDS: usize = 1000;
+        const SENDER_COUNT: u64 = 64; // realistic operational range: 0..=63
+        const SEEDS: u64 = 10;
 
-        // Simple xorshift64 PRNG — good enough for generating test entropy.
-        let mut next_u64 = move || -> u64 {
-            rng_state ^= rng_state << 13;
-            rng_state ^= rng_state >> 7;
-            rng_state ^= rng_state << 17;
-            rng_state
-        };
+        // Property of the routing scheme being tested.
+        struct RouterCase {
+            name: &'static str,
+            buckets: usize,
+            // Maximum allowed per-credential single-bucket count.
+            max_per_cred_bucket: usize,
+            // Minimum required distinct buckets hit by a single credential.
+            min_per_cred_unique: usize,
+            // Returns the bucket index for a hash.
+            route: fn(u64, usize) -> usize,
+        }
 
-        const PAIRS: usize = 1000;
-        const MAX_SENDER_ID: u64 = 63;
+        fn route_pow2(h: u64, n: usize) -> usize {
+            (h & (n as u64 - 1)) as usize
+        }
+        fn route_mod(h: u64, n: usize) -> usize {
+            (h % n as u64) as usize
+        }
 
-        // Generate the test pairs up front.
-        let pairs: Vec<(credentials::Id, VarInt)> = (0..PAIRS)
-            .map(|_| {
-                let mut id_bytes = [0u8; 16];
-                let lo = next_u64().to_ne_bytes();
-                let hi = next_u64().to_ne_bytes();
-                id_bytes[..8].copy_from_slice(&lo);
-                id_bytes[8..].copy_from_slice(&hi);
-                let id = credentials::Id::from(id_bytes);
-                let sender_id =
-                    unsafe { VarInt::new_unchecked(next_u64() % (MAX_SENDER_ID + 1)) };
-                (id, sender_id)
-            })
-            .collect();
+        // Bounds below were derived empirically by running this test with
+        // 50 different seeds and adding margin.  The current hash exhibits a
+        // deterministic per-credential pattern for power-of-two routing (every
+        // credential hits the same *number* of distinct buckets with the same
+        // worst-case count, just permuted), which is actually tighter than a
+        // truly random hash would give — see the analysis comment above.
+        let cases = [
+            RouterCase {
+                name: "PowerOfTwoRoute(64)",
+                buckets: 64,
+                max_per_cred_bucket: 3,
+                min_per_cred_unique: 44,
+                route: route_pow2,
+            },
+            RouterCase {
+                name: "PowerOfTwoRoute(16)",
+                buckets: 16,
+                max_per_cred_bucket: 5,
+                min_per_cred_unique: 16,
+                route: route_pow2,
+            },
+            RouterCase {
+                name: "PowerOfTwoRoute(4)",
+                buckets: 4,
+                max_per_cred_bucket: 17,
+                min_per_cred_unique: 4,
+                route: route_pow2,
+            },
+            // Modulo routing has random per-credential behaviour, so the bounds
+            // are looser to leave headroom for natural Poisson variance.
+            RouterCase {
+                name: "ModuloRoute(60)",
+                buckets: 60,
+                max_per_cred_bucket: 12,
+                min_per_cred_unique: 25,
+                route: route_mod,
+            },
+            RouterCase {
+                name: "ModuloRoute(3)",
+                buckets: 3,
+                max_per_cred_bucket: 50,
+                min_per_cred_unique: 3,
+                route: route_mod,
+            },
+        ];
 
-        // Helper: bucket all pairs with the given router, return per-bucket counts.
-        let bucket = |router: &dyn RouteStrategy| -> Vec<usize> {
-            let mut counts = vec![0usize; router.count()];
-            for (id, sender_id) in &pairs {
-                let hash = hash_id_and_sender(id, *sender_id);
-                counts[router.route(hash)] += 1;
-            }
-            counts
-        };
+        for seed in 0..SEEDS {
+            // ChaCha12 CSPRNG — independent of and orthogonal to the hash function.
+            let mut rng = StdRng::seed_from_u64(seed);
 
-        // Helper: assert that every bucket stays within a 3× range of the ideal average
-        // (between one-third and three times the expected count).  This is deliberately
-        // generous — with only 1 000 samples a ±4 standard-deviation event is unlikely
-        // but possible—so the threshold is set to catch genuinely broken distributions
-        // (e.g. a single bucket absorbing all traffic) while tolerating the natural
-        // Poisson variance expected from a good hash function.
-        let assert_even = |label: &str, counts: &[usize]| {
-            let total: usize = counts.iter().sum();
-            let expected = total / counts.len();
-            let lo = expected / 3;
-            let hi = expected * 3;
-            for (i, &c) in counts.iter().enumerate() {
+            let credential_ids: Vec<credentials::Id> = (0..N_CREDS)
+                .map(|_| {
+                    let mut bytes = [0u8; 16];
+                    rng.fill_bytes(&mut bytes);
+                    credentials::Id::from(bytes)
+                })
+                .collect();
+
+            for case in &cases {
+                let mut global = vec![0usize; case.buckets];
+
+                // Per-credential statistics.
+                let mut worst_max_count = 0usize;
+                let mut worst_min_unique = case.buckets + 1;
+
+                for id in &credential_ids {
+                    let mut local = vec![0usize; case.buckets];
+                    for s in 0..SENDER_COUNT {
+                        // SAFETY: SENDER_COUNT (64) is well below VarInt::MAX.
+                        let sender = unsafe { VarInt::new_unchecked(s) };
+                        let h = hash_id_and_sender(id, sender);
+                        let b = (case.route)(h, case.buckets);
+                        local[b] += 1;
+                        global[b] += 1;
+                    }
+
+                    let max = *local.iter().max().unwrap();
+                    let unique = local.iter().filter(|&&c| c > 0).count();
+                    worst_max_count = worst_max_count.max(max);
+                    worst_min_unique = worst_min_unique.min(unique);
+                }
+
+                // ── Global distribution: every bucket within ±20 % of mean ──
+                let total: usize = global.iter().sum();
+                let expected = total / case.buckets;
+                let lo = expected * 80 / 100;
+                let hi = expected * 120 / 100;
+                let gmin = *global.iter().min().unwrap();
+                let gmax = *global.iter().max().unwrap();
                 assert!(
-                    c >= lo && c <= hi,
-                    "{label}: bucket {i} has {c} entries (expected ~{expected}, \
-                     acceptable range {lo}..={hi}); full distribution: {counts:?}"
+                    gmin >= lo && gmax <= hi,
+                    "{} seed={seed}: global skew — expected {expected}, \
+                     got min={gmin} ({}%), max={gmax} ({}%); \
+                     allowed range {lo}..={hi}; full distribution: {global:?}",
+                    case.name,
+                    gmin * 100 / expected.max(1),
+                    gmax * 100 / expected.max(1),
+                );
+
+                // ── Per-credential: never laser onto a single receiver ──
+                assert!(
+                    worst_max_count <= case.max_per_cred_bucket,
+                    "{} seed={seed}: some credential put {worst_max_count} of \
+                     its {SENDER_COUNT} sender_ids into a single bucket \
+                     (limit {})",
+                    case.name,
+                    case.max_per_cred_bucket,
+                );
+
+                // ── Per-credential: hit a healthy number of buckets ──
+                assert!(
+                    worst_min_unique >= case.min_per_cred_unique,
+                    "{} seed={seed}: some credential's {SENDER_COUNT} sender_ids \
+                     hit only {worst_min_unique} distinct buckets \
+                     (minimum {})",
+                    case.name,
+                    case.min_per_cred_unique,
                 );
             }
-        };
-
-        // --- PowerOfTwoRoute with 64 buckets ---
-        struct PowerOfTwoRouter(PowerOfTwoRoute);
-        trait RouteStrategy {
-            fn count(&self) -> usize;
-            fn route(&self, hash: u64) -> usize;
         }
-        impl RouteStrategy for PowerOfTwoRouter {
-            fn count(&self) -> usize {
-                (self.0.mask + 1) as usize
-            }
-            fn route(&self, hash: u64) -> usize {
-                self.0.route(hash)
-            }
-        }
-
-        struct ModRouter(ModuloRoute);
-        impl RouteStrategy for ModRouter {
-            fn count(&self) -> usize {
-                self.0.divisor as usize
-            }
-            fn route(&self, hash: u64) -> usize {
-                self.0.route(hash)
-            }
-        }
-
-        let pow2_router = PowerOfTwoRouter(PowerOfTwoRoute::new(64));
-        let counts = bucket(&pow2_router);
-        assert_even("PowerOfTwoRoute(64)", &counts);
-
-        // --- ModuloRoute with 60 buckets (non-power-of-two) ---
-        let mod_router = ModRouter(ModuloRoute::new(60));
-        let counts = bucket(&mod_router);
-        assert_even("ModuloRoute(60)", &counts);
-
-        // --- ModuloRoute with 3 buckets (stress-test small counts) ---
-        let mod_router3 = ModRouter(ModuloRoute::new(3));
-        let counts = bucket(&mod_router3);
-        assert_even("ModuloRoute(3)", &counts);
     }
 }
