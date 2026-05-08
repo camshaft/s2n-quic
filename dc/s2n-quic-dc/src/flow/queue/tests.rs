@@ -58,7 +58,7 @@ fn stress_alloc_grow_and_route_multi_threaded() {
 
                     let stream_value = (worker_id << 24) | iter;
                     let control_value = stream_value ^ usize::MAX;
-                    let remote_queue_id = VarInt::from_u32((iter as u32) + 1);
+                    let remote_queue_id = VarInt::new((iter as u64) + 1).unwrap();
 
                     dispatch
                         .send_stream(
