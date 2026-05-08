@@ -301,7 +301,7 @@ fn run_oracle_stress(config: Config) {
 }
 
 #[test]
-// Run with `cargo test -p s2n-quic-dc flow::queue::tests::stress_alloc_grow_and_route_multi_threaded -- --ignored`
+// Run with `cargo test -p s2n-quic-dc -- flow::queue::tests::stress_alloc_grow_and_route_multi_threaded --ignored`
 #[ignore = "contention stress; long-running oracle routing verification"]
 fn stress_alloc_grow_and_route_multi_threaded() {
     run_oracle_stress(Config {
@@ -316,7 +316,7 @@ fn stress_alloc_grow_and_route_multi_threaded() {
 }
 
 #[test]
-// Run with `cargo test -p s2n-quic-dc flow::queue::tests::stress_alloc_grow_and_route_multi_threaded_contention -- --ignored`
+// Run with `cargo test -p s2n-quic-dc -- flow::queue::tests::stress_alloc_grow_and_route_multi_threaded_contention --ignored`
 #[ignore = "expensive stress test with high contention and retained queue sets"]
 fn stress_alloc_grow_and_route_multi_threaded_contention() {
     run_oracle_stress(Config {
@@ -331,7 +331,7 @@ fn stress_alloc_grow_and_route_multi_threaded_contention() {
 }
 
 #[test]
-// Run with `cargo test -p s2n-quic-dc flow::queue::tests::stress_alloc_grow_and_route_multi_threaded_huge -- --ignored`
+// Run with `cargo test -p s2n-quic-dc -- flow::queue::tests::stress_alloc_grow_and_route_multi_threaded_huge --ignored`
 #[ignore = "expensive stress test for very large retained queue sets"]
 fn stress_alloc_grow_and_route_multi_threaded_huge() {
     run_oracle_stress(Config {
