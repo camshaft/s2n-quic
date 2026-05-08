@@ -91,7 +91,7 @@ use crate::{
     },
 };
 use core::{
-    cell::RefCell,
+    cell::UnsafeCell,
     fmt,
     task::{self, Poll},
 };
@@ -1722,19 +1722,19 @@ impl Pto {
     }
 }
 
-/// Adapter for using `Rc<RefCell<PathContext<S>>>` in the PTO timing wheel
+/// Adapter for using `Rc<UnsafeCell<PathContext<S>>>` in the PTO timing wheel
 ///
 /// This adapter allows the wheel to work directly with Rc pointers, avoiding
 /// any additional allocations. The links are stored in `PathContext.pto.links`.
 pub struct PtoAdapter<S>(core::marker::PhantomData<S>);
 
 impl<S> crate::intrusive_queue::Adapter for PtoAdapter<S> {
-    type Value = std::cell::RefCell<PathContext<S>>;
-    type Target = std::cell::RefCell<PathContext<S>>;
-    type Pointer = std::rc::Rc<std::cell::RefCell<PathContext<S>>>;
+    type Value = std::cell::UnsafeCell<PathContext<S>>;
+    type Target = std::cell::UnsafeCell<PathContext<S>>;
+    type Pointer = std::rc::Rc<std::cell::UnsafeCell<PathContext<S>>>;
 
     unsafe fn links(value: *mut Self::Value) -> *mut crate::intrusive_queue::Links {
-        core::ptr::addr_of_mut!((*value).borrow_mut().pto.links)
+        core::ptr::addr_of_mut!((*(*value).get()).pto.links)
     }
 
     unsafe fn target(value: *mut Self::Value) -> *mut Self::Target {
@@ -1756,11 +1756,11 @@ impl<S> crate::intrusive_queue::Adapter for PtoAdapter<S> {
 
 impl<S> crate::clock::wheel::WheelAdapter for PtoAdapter<S> {
     unsafe fn target_time(value: *const Self::Value) -> Option<crate::clock::precision::Timestamp> {
-        (*value).borrow().pto.target_time
+        (*(*value).get()).pto.target_time
     }
 
     unsafe fn set_target_time(value: *mut Self::Value, time: crate::clock::precision::Timestamp) {
-        (*value).borrow_mut().pto.target_time = Some(time);
+        (*(*value).get()).pto.target_time = Some(time);
     }
 }
 
@@ -1804,7 +1804,7 @@ pub trait PathContextResolver {
     fn resolve(
         &self,
         entry: &Arc<crate::path::secret::map::Entry>,
-    ) -> Option<Rc<RefCell<PathContext<Self::Sealer>>>>;
+    ) -> Option<Rc<UnsafeCell<PathContext<Self::Sealer>>>>;
 }
 
 // ── Path Resolution ────────────────────────────────────────────────────────
@@ -1832,7 +1832,7 @@ impl<R, Resolver, ErrorSender> PathResolver<R, Resolver, ErrorSender> {
 impl<R, Resolver, ErrorSender>
     Receiver<
         crate::intrusive_queue::Entry<
-            crate::datagram::batch::Batch<Rc<RefCell<PathContext<Resolver::Sealer>>>>,
+            crate::datagram::batch::Batch<Rc<UnsafeCell<PathContext<Resolver::Sealer>>>>,
         >,
     > for PathResolver<R, Resolver, ErrorSender>
 where
@@ -1846,7 +1846,7 @@ where
     ) -> Poll<
         Option<
             crate::intrusive_queue::Entry<
-                crate::datagram::batch::Batch<Rc<RefCell<PathContext<Resolver::Sealer>>>>,
+                crate::datagram::batch::Batch<Rc<UnsafeCell<PathContext<Resolver::Sealer>>>>,
             >,
         >,
     > {
@@ -1875,7 +1875,9 @@ where
         };
 
         // Increment pending_batches counter
-        context.borrow_mut().pending_batches += 1;
+        unsafe {
+            (*context.get()).pending_batches += 1;
+        }
 
         // Attach the context to the batch, making it !Send
         let batch = batch.with_context(context);
@@ -1921,13 +1923,13 @@ impl<R> Encoder<R> {
 impl<R, Sealer>
     Receiver<
         crate::intrusive_queue::Entry<
-            crate::datagram::batch::Batch<Rc<RefCell<PathContext<Sealer>>>>,
+            crate::datagram::batch::Batch<Rc<UnsafeCell<PathContext<Sealer>>>>,
         >,
     > for Encoder<R>
 where
     R: Receiver<
         crate::intrusive_queue::Entry<
-            crate::datagram::batch::Batch<Rc<RefCell<PathContext<Sealer>>>>,
+            crate::datagram::batch::Batch<Rc<UnsafeCell<PathContext<Sealer>>>>,
         >,
     >,
     Sealer: crate::crypto::seal::Application,
@@ -1938,7 +1940,7 @@ where
     ) -> Poll<
         Option<
             crate::intrusive_queue::Entry<
-                crate::datagram::batch::Batch<Rc<RefCell<PathContext<Sealer>>>>,
+                crate::datagram::batch::Batch<Rc<UnsafeCell<PathContext<Sealer>>>>,
             >,
         >,
     > {
@@ -1987,13 +1989,13 @@ impl<R, Clk, Sealer> PacketRegistrar<R, Clk, Sealer> {
 impl<R, Clk, Sealer>
     Receiver<
         crate::intrusive_queue::Entry<
-            crate::datagram::batch::Batch<Rc<RefCell<PathContext<Sealer>>>>,
+            crate::datagram::batch::Batch<Rc<UnsafeCell<PathContext<Sealer>>>>,
         >,
     > for PacketRegistrar<R, Clk, Sealer>
 where
     R: Receiver<
         crate::intrusive_queue::Entry<
-            crate::datagram::batch::Batch<Rc<RefCell<PathContext<Sealer>>>>,
+            crate::datagram::batch::Batch<Rc<UnsafeCell<PathContext<Sealer>>>>,
         >,
     >,
     Clk: crate::clock::precision::Clock,
@@ -2005,7 +2007,7 @@ where
     ) -> Poll<
         Option<
             crate::intrusive_queue::Entry<
-                crate::datagram::batch::Batch<Rc<RefCell<PathContext<Sealer>>>>,
+                crate::datagram::batch::Batch<Rc<UnsafeCell<PathContext<Sealer>>>>,
             >,
         >,
     > {
@@ -2033,7 +2035,7 @@ where
         let context = &batch.context;
 
         // Check if there's more app data based on pending batch count
-        let has_more_app_data = context.borrow().pending_batches > 1;
+        let has_more_app_data = unsafe { (*context.get()).pending_batches > 1 };
 
         // Get starting packet number from batch metadata
         let Some(starting_pn) = batch.meta.starting_packet_number else {
@@ -2050,10 +2052,9 @@ where
         };
         let segment_sizes = segments.sizes();
 
-        {
-            // Borrow context to register packets (disjoint from batch.datagrams)
-            let mut ctx = context.borrow_mut();
-            let ctx = &mut *ctx;
+        unsafe {
+            // SAFETY: path contexts are worker-local and not re-entrant.
+            let ctx = &mut *context.get();
             let mut packet_number = starting_pn;
 
             // Iterate over segment sizes and datagrams together
@@ -2141,11 +2142,11 @@ impl<R, Sealer, PtoTx> Receiver<crate::intrusive_queue::Entry<crate::datagram::b
 where
     R: Receiver<
         crate::intrusive_queue::Entry<
-            crate::datagram::batch::Batch<Rc<RefCell<PathContext<Sealer>>>>,
+            crate::datagram::batch::Batch<Rc<UnsafeCell<PathContext<Sealer>>>>,
         >,
     >,
     Sealer: crate::crypto::seal::Application,
-    PtoTx: UnboundedSender<std::rc::Rc<std::cell::RefCell<PathContext<Sealer>>>>,
+    PtoTx: UnboundedSender<std::rc::Rc<std::cell::UnsafeCell<PathContext<Sealer>>>>,
 {
     fn poll_recv(
         &mut self,
@@ -2162,12 +2163,13 @@ where
         // Only insert if:
         // 1. PTO needs update (packets were sent), AND
         // 2. Context is not already linked in the wheel
-        {
-            let ctx = context.borrow();
-            if ctx.pto.needs_update && !ctx.pto.links.is_linked() {
-                drop(ctx);
-                let _ = self.pto_wheel_tx.send(context.clone());
-            }
+        let should_insert = unsafe {
+            let ctx = &*context.get();
+            ctx.pto.needs_update && !ctx.pto.links.is_linked()
+        };
+
+        if should_insert {
+            let _ = self.pto_wheel_tx.send(context.clone());
         }
 
         Poll::Ready(Some(batch))

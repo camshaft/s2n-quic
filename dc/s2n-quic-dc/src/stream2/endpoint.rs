@@ -50,7 +50,7 @@ use s2n_quic_core::{
 };
 use s2n_quic_platform::features;
 use std::{
-    cell::RefCell,
+    cell::{RefCell, UnsafeCell},
     collections::{hash_map, HashMap},
     io,
     net::SocketAddr,
@@ -482,7 +482,7 @@ fn generate_pto_probe(
 }
 
 type RcPathContext =
-    Rc<RefCell<socket::channel::PathContext<crate::crypto::awslc::seal::Application>>>;
+    Rc<UnsafeCell<socket::channel::PathContext<crate::crypto::awslc::seal::Application>>>;
 
 /// Process a PTO wheel timeout for a path context
 ///
@@ -498,42 +498,48 @@ where
     Clk: crate::clock::precision::Clock + ?Sized,
     S: UnboundedSender<RcPathContext>,
 {
-    let mut context_ref = context_rc.borrow_mut();
-    let context = &mut *context_ref;
-    let has_inflight = socket::channel::Pto::has_inflight_packets(&context.packet_number_map);
+    let (probe_batch, has_inflight) = unsafe {
+        // SAFETY: path contexts are worker-local and non-reentrant.
+        let context = &mut *context_rc.get();
+        let has_inflight = socket::channel::Pto::has_inflight_packets(&context.packet_number_map);
 
-    // Check if we should actually send a probe
-    let should_send_probe = context.pto.on_timeout(has_inflight);
+        // Check if we should actually send a probe
+        let should_send_probe = context.pto.on_timeout(has_inflight);
 
-    // Extract data address for probe generation if needed
-    // Control packets (including PTO probes) go to the data port, not handshake port
-    let data_addr = context.path_secret_entry.data_addr();
+        // Extract data address for probe generation if needed
+        // Control packets (including PTO probes) go to the data port, not handshake port
+        let data_addr = context.path_secret_entry.data_addr();
 
-    let probe_batch = if should_send_probe {
-        tracing::debug!(
-            worker_id,
-            credentials_id = ?context.credentials.id,
-            backoff = context.pto.backoff,
-            inflight = context.packet_number_map.iter().count(),
-            "PTO timeout - sending probe"
-        );
+        let probe_batch = if should_send_probe {
+            tracing::debug!(
+                worker_id,
+                credentials_id = ?context.credentials.id,
+                backoff = context.pto.backoff,
+                inflight = context.packet_number_map.iter().count(),
+                "PTO timeout - sending probe"
+            );
 
-        // Generate probe datagram (immutable borrow of context)
-        let probe_datagram = generate_pto_probe(&*context);
+            // Generate probe datagram (immutable borrow of context)
+            let probe_datagram = generate_pto_probe(&*context);
 
-        // Create a batch for the probe
-        let mut batch = Batch::new(None, data_addr);
-        batch.push(probe_datagram.into());
+            // Create a batch for the probe
+            let mut batch = Batch::new(None, data_addr);
+            batch.push(probe_datagram.into());
 
-        Some(Entry::new(batch))
-    } else {
-        None
+            Some(Entry::new(batch))
+        } else {
+            None
+        };
+
+        // Reinsert if still has inflight packets (needs rescheduling)
+        if has_inflight {
+            context.pto.update_target(clock, &context.rtt_estimator);
+        }
+
+        (probe_batch, has_inflight)
     };
 
-    // Reinsert if still has inflight packets (needs rescheduling)
     if has_inflight {
-        context.pto.update_target(clock, &context.rtt_estimator);
-        drop(context_ref); // Release borrow before sending
         let _ = pto_wheel_tx.send(context_rc);
     }
 
@@ -2063,7 +2069,7 @@ struct SocketPathContexts {
     contexts: RefCell<
         std::collections::HashMap<
             credentials::Id,
-            Rc<RefCell<socket::channel::PathContext<crate::crypto::awslc::seal::Application>>>,
+            Rc<UnsafeCell<socket::channel::PathContext<crate::crypto::awslc::seal::Application>>>,
         >,
     >,
 }
@@ -2079,7 +2085,7 @@ impl SocketPathContexts {
     fn get_or_insert(
         &self,
         entry: &Arc<PathSecretEntry>,
-    ) -> Rc<RefCell<socket::channel::PathContext<crate::crypto::awslc::seal::Application>>> {
+    ) -> Rc<UnsafeCell<socket::channel::PathContext<crate::crypto::awslc::seal::Application>>> {
         let credentials_id = *entry.id();
 
         let mut contexts = self.contexts.borrow_mut();
@@ -2112,7 +2118,7 @@ impl SocketPathContexts {
             pending_batches: 0,
         };
 
-        let context = Rc::new(RefCell::new(context));
+        let context = Rc::new(UnsafeCell::new(context));
         contexts.insert(credentials_id, context.clone());
         context
     }
@@ -2137,7 +2143,7 @@ impl socket::channel::PathContextResolver for SimplePathContextResolver {
     fn resolve(
         &self,
         entry: &Arc<PathSecretEntry>,
-    ) -> Option<Rc<RefCell<socket::channel::PathContext<Self::Sealer>>>> {
+    ) -> Option<Rc<UnsafeCell<socket::channel::PathContext<Self::Sealer>>>> {
         Some(self.socket_contexts.get_or_insert(entry))
     }
 }
@@ -2922,11 +2928,11 @@ where
                                 return;
                             };
 
-                            let mut context = context_rc.borrow_mut();
+                            let context = unsafe { &mut *context_rc.get() };
                             process_control_frames(
                                 worker_id,
                                 &mut packet,
-                                &mut context,
+                                context,
                                 &mut acked_tx,
                                 &mut lost_tx,
                                 &clock,

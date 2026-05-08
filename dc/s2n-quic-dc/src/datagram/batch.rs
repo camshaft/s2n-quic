@@ -76,7 +76,7 @@ impl Priority {
 ///    - Encodes into GSO segments in storage buffer
 /// 5. **Send step**: Transmits encoded bytes from storage
 ///
-/// The `Ctx` parameter is NoContext by default (Send), or Rc<RefCell<PathContext>>
+/// The `Ctx` parameter is NoContext by default (Send), or Rc<UnsafeCell<PathContext>>
 /// when attached to a worker-local path context (!Send).
 #[repr(C)]
 pub struct Batch<Ctx = NoContext> {
@@ -167,7 +167,7 @@ impl<Ctx> Batch<Ctx> {
     }
 }
 
-impl<Sealer> Batch<std::rc::Rc<std::cell::RefCell<crate::socket::channel::PathContext<Sealer>>>>
+impl<Sealer> Batch<std::rc::Rc<std::cell::UnsafeCell<crate::socket::channel::PathContext<Sealer>>>>
 where
     Sealer: crate::crypto::seal::Application,
 {
@@ -188,9 +188,8 @@ where
             source_sender_id
         );
 
-        // Borrow context for the entire encoding operation
-        let mut ctx = self.context.borrow_mut();
-        let ctx = &mut *ctx;
+        // SAFETY: socket path contexts are worker-local and non-reentrant.
+        let ctx = unsafe { &mut *self.context.get() };
 
         // Get references to sealer and credentials
         let sealer = &ctx.sealer;
@@ -561,7 +560,7 @@ const _: () = {
     use core::mem::{align_of, offset_of, size_of};
 
     // Use a concrete type for Rc since we can't use generics in const
-    type RcType = std::rc::Rc<std::cell::RefCell<()>>;
+    type RcType = std::rc::Rc<std::cell::UnsafeCell<()>>;
 
     const fn assert_layout_compatible() {
         // NoContext must have the same size and alignment as Rc<T>
