@@ -3263,8 +3263,7 @@ mod tests {
                 for id in &credential_ids {
                     let mut local = vec![0usize; case.buckets];
                     for s in 0..SENDER_COUNT {
-                        // SAFETY: SENDER_COUNT (64) is well below VarInt::MAX.
-                        let sender = unsafe { VarInt::new_unchecked(s) };
+                        let sender = VarInt::new(s).unwrap();
                         let h = hash_id_and_sender(id, sender);
                         let b = (case.route)(h, case.buckets);
                         local[b] += 1;
