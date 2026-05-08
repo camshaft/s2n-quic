@@ -280,7 +280,16 @@ impl Reader {
     /// For pending streams, this polls for the FlowValidated message from the pipeline.
     /// The application should wrap this in its own timeout.
     pub async fn validate(&mut self) -> io::Result<()> {
-        core::future::poll_fn(|cx| self.0.poll_validate(cx)).await
+        core::future::poll_fn(|cx| self.poll_validate(cx)).await
+    }
+
+    /// Poll-based validate
+    pub fn poll_validate(&mut self, cx: &mut Context) -> Poll<io::Result<()>> {
+        waker::debug_assert_contract_with_context(cx, |cx| {
+            let mut contract_state = ReadIntoWakerContract::default();
+            let outcome = self.0.poll_validate(cx, &mut contract_state);
+            (outcome, Some(contract_state))
+        })
     }
 
     /// Send a FlowReset to the peer for both halves and transition to terminal state.
@@ -321,22 +330,32 @@ impl Reader {
 }
 
 impl Inner {
-    fn poll_validate(&mut self, cx: &mut Context) -> Poll<io::Result<()>> {
+    fn poll_validate(
+        &mut self,
+        cx: &mut Context,
+        contract: &mut ReadIntoWakerContract,
+    ) -> Poll<io::Result<()>> {
         if !self.status.is_pending_validation() {
+            contract.returned_ready = true;
             return Poll::Ready(Ok(()));
         }
 
         // Poll for FlowValidated (or Reset/error)
-        let mut contract_state = ReadIntoWakerContract::default();
-        match self.poll_stream_rx(cx, &mut contract_state)? {
+        contract.polled_stream_rx = true;
+        match self.poll_stream_rx(cx, contract)? {
             Poll::Ready(()) => {
                 if self.status.is_pending_validation() {
+                    contract.returned_pending = true;
                     Poll::Pending
                 } else {
+                    contract.returned_ready = true;
                     Poll::Ready(Ok(()))
                 }
             }
-            Poll::Pending => Poll::Pending,
+            Poll::Pending => {
+                contract.returned_pending = true;
+                Poll::Pending
+            }
         }
     }
 
