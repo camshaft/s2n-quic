@@ -119,6 +119,45 @@ impl<T> Queue<T> {
         }
     }
 
+    /// Asserts invariants that must hold immediately before a descriptor is re-allocated
+    /// or immediately after both receiver halves have been returned to the free list.
+    ///
+    /// Two modes:
+    /// - `check_is_open = false` (free-time): the sender side may already be gone, so
+    ///   `IS_OPEN` is allowed to be false.  Checks: `HAS_RECEIVER = false` and queue empty.
+    /// - `check_is_open = true` (alloc-time): the sender side must still be alive for the
+    ///   descriptor to be re-issued.  Adds: `IS_OPEN = true`.
+    #[inline]
+    pub fn assert_clean_for_reuse(&self, check_is_open: bool) {
+        #[cfg(debug_assertions)]
+        {
+            let inner = self.inner.lock().unwrap();
+            debug_assert!(
+                !inner.flags.contains(Flags::HAS_RECEIVER),
+                "queue half {:?} still has a live receiver on reuse; flags={:?}",
+                self.half,
+                inner.flags,
+            );
+            debug_assert!(
+                inner.queue.is_empty(),
+                "queue half {:?} has undelivered entries on reuse; flags={:?}",
+                self.half,
+                inner.flags,
+            );
+            if check_is_open {
+                debug_assert!(
+                    inner.flags.contains(Flags::IS_OPEN),
+                    "queue half {:?} is permanently closed at alloc time (sender side gone); \
+                     flags={:?}",
+                    self.half,
+                    inner.flags,
+                );
+            }
+        }
+        #[cfg(not(debug_assertions))]
+        let _ = check_is_open;
+    }
+
     /// Push an entry into the queue.
     ///
     /// `observe` is called inside the lock when `HAS_OBSERVED` is not yet set. If it
@@ -308,6 +347,19 @@ impl<T> Queue<T> {
         // take the queue items out of the lock to avoid mutex poisoning.
         // note that most of the time this should be empty, which would be a no-op
         let queue = core::mem::take(&mut closing.queue);
+
+        // Verify that the flags are in the expected cleared state before releasing the lock.
+        debug_assert!(
+            !closing.flags.contains(Flags::HAS_RECEIVER),
+            "HAS_RECEIVER must be cleared after close_receiver_inner; flags={:?}",
+            closing.flags,
+        );
+        debug_assert!(
+            !closing.flags.contains(Flags::HAS_OBSERVED),
+            "HAS_OBSERVED must be cleared after close_receiver_inner; flags={:?}",
+            closing.flags,
+        );
+
         drop(closing);
 
         // Don't wake the waker - receiver is closing

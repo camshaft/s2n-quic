@@ -131,6 +131,16 @@ where
 {
     #[inline]
     fn free(&self, descriptor: Descriptor<S, C, Key>) -> Option<Box<dyn 'static + Send>> {
+        // Both queue halves must have been fully closed and drained before the descriptor
+        // can safely re-enter the free list. Catch any invariant violation before the
+        // descriptor is recycled and the bug is obscured.  IS_OPEN may legitimately be
+        // false here if all Dispatch instances have been dropped (shutdown), so we do
+        // not check it at free time.
+        unsafe {
+            descriptor.stream_queue().assert_clean_for_reuse(false);
+            descriptor.control_queue().assert_clean_for_reuse(false);
+        }
+
         let mut inner = self.inner.lock().unwrap();
 
         #[cfg(debug_assertions)]

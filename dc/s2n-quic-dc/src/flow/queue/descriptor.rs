@@ -159,6 +159,14 @@ impl<S: 'static, C: 'static, Key: 'static> Descriptor<S, C, Key> {
     pub unsafe fn into_receiver_pair(self, remote_queue_id: Option<VarInt>) -> (Self, Self) {
         let inner = self.inner();
 
+        // Both queue halves must be in a clean, receiverless, empty state before
+        // we re-open them.  IS_OPEN must also be true here because this descriptor
+        // is being re-issued while at least one Dispatch (and its Senders) is alive.
+        // If this fires, a receiver was not properly dropped before returning the
+        // descriptor to the free list, or the sender side was torn down prematurely.
+        inner.stream.assert_clean_for_reuse(true);
+        inner.control.assert_clean_for_reuse(true);
+
         let has_remote_queue_id = remote_queue_id.is_some();
         if let Some(id) = remote_queue_id {
             inner.remote_queue_id.store(id.as_u64(), Ordering::Relaxed);
