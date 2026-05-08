@@ -22,7 +22,10 @@ use crate::{
     intrusive_queue::{Entry, Queue},
     packet::{
         self,
-        datagram::{partial::{PacketType, PartialDatagram}, QueuePair, ResetTarget, RoutingInfo},
+        datagram::{
+            partial::{PacketType, PartialDatagram},
+            QueuePair, ResetTarget, RoutingInfo,
+        },
     },
     path::{self, secret::map::Entry as PathSecretEntry},
     random,
@@ -2512,7 +2515,8 @@ where
                     Wheel::new(priority_input_rx.into_list_receiver(), wheel_timer);
 
                 priority_wheel_txs.push(priority_input_tx);
-                priority_output_rxs.push(FlattenQueue::new(priority_output_rx.into_list_receiver()));
+                priority_output_rxs
+                    .push(FlattenQueue::new(priority_output_rx.into_list_receiver()));
 
                 spawner.spawn(async move {
                     channel::pump(wheel, priority_output_tx.into_list_sender()).await;
