@@ -95,6 +95,15 @@ where
 
     #[inline(never)] // this should happen rarely
     fn grow(&mut self) {
+        // The epoch must always be a multiple of PAGE_SIZE so descriptor IDs are
+        // laid out contiguously within each page.
+        debug_assert_eq!(
+            self.epoch.as_u64() % PAGE_SIZE as u64,
+            0,
+            "epoch must be a multiple of PAGE_SIZE before grow; epoch={:?} PAGE_SIZE={PAGE_SIZE}",
+            self.epoch,
+        );
+
         let (region, layout) = Region::alloc(PAGE_SIZE);
 
         let ptr = region.ptr;
@@ -115,8 +124,16 @@ where
                 // last reference to get dropped.
                 let free_list = self.free.clone();
 
+                let id = self.epoch + idx;
+                // The descriptor's ID must sit in the correct slot within its page.
+                debug_assert_eq!(
+                    id.as_u64() % PAGE_SIZE as u64,
+                    idx as u64,
+                    "descriptor ID {id:?} must have offset {idx} within its page"
+                );
+
                 // initialize the descriptor with the channels
-                descriptor.write(DescriptorInner::new(self.epoch + idx, free_list));
+                descriptor.write(DescriptorInner::new(id, free_list));
 
                 let descriptor = NonNull::new_unchecked(descriptor);
                 let descriptor = Descriptor::new(descriptor);
@@ -133,6 +150,15 @@ where
         let pending_senders: Arc<[_]> = pending_senders.into();
 
         let mut senders = self.senders.pages.write().unwrap();
+
+        // The number of pages in state must equal epoch / PAGE_SIZE before we add ours.
+        debug_assert_eq!(
+            senders.pages.len() as u64,
+            senders.epoch.as_u64() / PAGE_SIZE as u64,
+            "senders page count must equal epoch/PAGE_SIZE; pages={} epoch={:?} PAGE_SIZE={PAGE_SIZE}",
+            senders.pages.len(),
+            senders.epoch,
+        );
 
         // check if another pool instance already updated the senders list
         if senders.epoch != self.epoch {
@@ -154,6 +180,9 @@ where
         let target_epoch = self.epoch + PAGE_SIZE;
         senders.epoch = target_epoch;
         self.epoch = target_epoch;
+
+        // After advancing: pages.len() must now equal new_epoch / PAGE_SIZE
+        // (will be true once we push below, checked at next grow).
 
         // update the sender list with the newly allocated channels
         senders.pages.push(pending_senders);

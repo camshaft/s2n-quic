@@ -723,11 +723,78 @@ fn stress_cross_thread_routing_oracle() {
     );
 }
 
+/// Verifies that dropping all Dispatch clones before the handles are dropped does
+/// not fire any assertion.  After senders close (`IS_OPEN = false`), the receiver
+/// handles must still drain cleanly and return their descriptors to the free list.
+///
+/// Also verifies the `Closed` signal contract: after the sender side is gone and the
+/// queue is empty, `try_recv()` returns `Err(Closed)` (not `Ok(None)`).
+#[test]
+fn dispatch_drops_before_handles() {
+    crate::testing::init_tracing();
+
+    let allocator = TestAllocator::new();
+    let mut dispatch = allocator.dispatcher();
+    let next_key = AtomicU64::new(0);
+    let mut active_ids = Vec::new();
+    let mut active = BTreeMap::<VarInt, ActiveQueue>::new();
+
+    // Allocate a bunch of queues, send a message into each one.
+    for _ in 0..32 {
+        alloc_queue(&mut dispatch, &next_key, &mut active_ids, &mut active);
+    }
+    for (queue_id, queue) in active.iter_mut() {
+        let seq = queue.send_seq;
+        queue.send_seq += 1;
+        dispatch
+            .send_stream(
+                *queue_id,
+                None,
+                &queue.key_id,
+                intrusive_queue::Entry::new(Message {
+                    queue_id: *queue_id,
+                    key_id: queue.key_id,
+                    seq,
+                }),
+            )
+            .expect("send to active queue must succeed before dispatch drop");
+    }
+
+    // Drop the dispatch (and the allocator).  This triggers sender close on every
+    // descriptor, setting IS_OPEN = false.  Messages already in the queue must
+    // still be readable.
+    drop(dispatch);
+    drop(allocator);
+
+    for (queue_id, queue) in active.iter_mut() {
+        // The pre-close message must still be delivered.
+        let entry = queue.stream.try_recv().unwrap().unwrap().into_inner();
+        assert_eq!(
+            entry.queue_id, *queue_id,
+            "message must arrive at the correct queue even after dispatch drop"
+        );
+
+        // Once the queue is empty and the sender is closed, `try_recv` must return
+        // `Err(Closed)` — NOT `Ok(None)` — to signal end-of-stream to the receiver.
+        assert!(
+            queue.stream.try_recv().is_err(),
+            "closed + empty stream queue must signal Err(Closed)"
+        );
+    }
+    // Drop all handles — exercises the assert_clean_for_reuse(check_is_open=false) path.
+    active.clear();
+    active_ids.clear();
+}
+
+
 // ── Ignored (long-running) variants — run with --profile release-debug ───────
 //
 // cargo test -p s2n-quic-dc --profile release-debug -- <test_name> --ignored --exact
 
-/// Aggressive single-owner multi-sender stress.
+/// Aggressive single-owner multi-sender stress with near-zero retention.
+///
+/// With `min_retained_queues = 0` every descriptor can be recycled every iteration,
+/// maximising key-rotation and descriptor-reuse races.
 ///
 /// `cargo test -p s2n-quic-dc --profile release-debug -- flow::queue::tests::stress_heavy_alloc_churn --ignored --exact`
 #[test]
@@ -737,12 +804,12 @@ fn stress_heavy_alloc_churn() {
         threads: 8,
         iters_per_thread: 10_000,
         target_active_queues: 8_192,
-        // Very aggressive churn: nearly all queues recycled every iteration.
+        // Zero retention: every queue can be recycled every iteration.
         // This maximises descriptor reuse under concurrent senders.
-        min_retained_queues: 256,
+        min_retained_queues: 0,
         alloc_burst: 512,
         route_batch: 512,
-        free_batch: 2_048,
+        free_batch: 8_192,
     });
 }
 
