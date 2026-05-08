@@ -32,9 +32,17 @@ impl Key for crate::credentials::Credentials {
     }
 }
 
-#[derive(Clone)]
 pub(super) struct Descriptor<S, C, Key> {
     inner: Arc<DescriptorInner<S, C, Key>>,
+}
+
+impl<S, C, Key> Clone for Descriptor<S, C, Key> {
+    #[inline]
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+        }
+    }
 }
 
 impl<S: 'static, C: 'static, Key: 'static> Descriptor<S, C, Key> {
