@@ -3190,7 +3190,7 @@ mod tests {
             .collect();
 
         // Helper: bucket all pairs with the given router, return per-bucket counts.
-        let bucket = |router: &dyn SenderRoute_| -> Vec<usize> {
+        let bucket = |router: &dyn RouteStrategy| -> Vec<usize> {
             let mut counts = vec![0usize; router.count()];
             for (id, sender_id) in &pairs {
                 let hash = hash_id_and_sender(id, *sender_id);
@@ -3202,7 +3202,7 @@ mod tests {
         // Helper: assert that every bucket stays within a 3× range of the ideal average
         // (between one-third and three times the expected count).  This is deliberately
         // generous — with only 1 000 samples a ±4 standard-deviation event is unlikely
-        // but possible — so the threshold is set to catch genuinely broken distributions
+        // but possible—so the threshold is set to catch genuinely broken distributions
         // (e.g. a single bucket absorbing all traffic) while tolerating the natural
         // Poisson variance expected from a good hash function.
         let assert_even = |label: &str, counts: &[usize]| {
@@ -3220,12 +3220,12 @@ mod tests {
         };
 
         // --- PowerOfTwoRoute with 64 buckets ---
-        struct PowerRouter(PowerOfTwoRoute);
-        trait SenderRoute_ {
+        struct PowerOfTwoRouter(PowerOfTwoRoute);
+        trait RouteStrategy {
             fn count(&self) -> usize;
             fn route(&self, hash: u64) -> usize;
         }
-        impl SenderRoute_ for PowerRouter {
+        impl RouteStrategy for PowerOfTwoRouter {
             fn count(&self) -> usize {
                 (self.0.mask + 1) as usize
             }
@@ -3235,7 +3235,7 @@ mod tests {
         }
 
         struct ModRouter(ModuloRoute);
-        impl SenderRoute_ for ModRouter {
+        impl RouteStrategy for ModRouter {
             fn count(&self) -> usize {
                 self.0.divisor as usize
             }
@@ -3244,7 +3244,7 @@ mod tests {
             }
         }
 
-        let pow2_router = PowerRouter(PowerOfTwoRoute::new(64));
+        let pow2_router = PowerOfTwoRouter(PowerOfTwoRoute::new(64));
         let counts = bucket(&pow2_router);
         assert_even("PowerOfTwoRoute(64)", &counts);
 
