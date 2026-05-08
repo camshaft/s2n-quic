@@ -57,7 +57,7 @@ struct Config {
 
 #[inline]
 fn next_u64(state: &mut u64) -> u64 {
-    // xorshift64*
+    // xorshift64*: fast deterministic PRNG for reproducible stress scheduling.
     let mut x = *state;
     x ^= x >> 12;
     x ^= x << 25;
