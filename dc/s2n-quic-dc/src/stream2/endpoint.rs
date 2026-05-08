@@ -2526,8 +2526,15 @@ where
             spawner.spawn(async move {
                 let rx = FlattenQueue::new(wheel_input_rx);
                 let rx = channel::Map::new(rx, move |entry: Entry<Batch>| {
+                    // Route each batch into a dedicated per-priority wheel. The downstream
+                    // `channel::Priority` receiver polls these outputs in priority order.
                     let priority = classify_batch_priority(&entry);
-                    let _ = priority_wheel_txs[priority.as_index()].send(entry);
+                    if priority_wheel_txs[priority.as_index()].send(entry).is_err() {
+                        tracing::warn!(
+                            priority = priority.as_index(),
+                            "Priority wheel input is closed; dropping batch"
+                        );
+                    }
                 });
 
                 rx.drain().await;
