@@ -3144,3 +3144,118 @@ where
         data_port: source_control_port,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Verify that the routing hash function distributes 1000 random
+    /// (credential_id, sender_id) pairs evenly across worker buckets.
+    ///
+    /// sender_ids are drawn from 0..=63 (the realistic range).
+    /// credential_ids are random 16-byte values with high entropy.
+    ///
+    /// For each router variant we assert that every bucket falls within
+    /// a 3× range of the ideal average, i.e. no bucket receives fewer
+    /// than `expected / 3` or more than `expected * 3` assignments.
+    #[test]
+    fn routing_hash_distribution() {
+        // Deterministic seed so the test is reproducible.
+        let mut rng_state: u64 = 0xdeadbeef_cafebabe;
+
+        // Simple xorshift64 PRNG — good enough for generating test entropy.
+        let mut next_u64 = move || -> u64 {
+            rng_state ^= rng_state << 13;
+            rng_state ^= rng_state >> 7;
+            rng_state ^= rng_state << 17;
+            rng_state
+        };
+
+        const PAIRS: usize = 1000;
+        const MAX_SENDER_ID: u64 = 63;
+
+        // Generate the test pairs up front.
+        let pairs: Vec<(credentials::Id, VarInt)> = (0..PAIRS)
+            .map(|_| {
+                let mut id_bytes = [0u8; 16];
+                let lo = next_u64().to_ne_bytes();
+                let hi = next_u64().to_ne_bytes();
+                id_bytes[..8].copy_from_slice(&lo);
+                id_bytes[8..].copy_from_slice(&hi);
+                let id = credentials::Id::from(id_bytes);
+                let sender_id =
+                    unsafe { VarInt::new_unchecked(next_u64() % (MAX_SENDER_ID + 1)) };
+                (id, sender_id)
+            })
+            .collect();
+
+        // Helper: bucket all pairs with the given router, return per-bucket counts.
+        let bucket = |router: &dyn SenderRoute_| -> Vec<usize> {
+            let mut counts = vec![0usize; router.count()];
+            for (id, sender_id) in &pairs {
+                let hash = hash_id_and_sender(id, *sender_id);
+                counts[router.route(hash)] += 1;
+            }
+            counts
+        };
+
+        // Helper: assert that every bucket stays within a 3× range of the ideal average
+        // (between one-third and three times the expected count).  This is deliberately
+        // generous — with only 1 000 samples a ±4 standard-deviation event is unlikely
+        // but possible — so the threshold is set to catch genuinely broken distributions
+        // (e.g. a single bucket absorbing all traffic) while tolerating the natural
+        // Poisson variance expected from a good hash function.
+        let assert_even = |label: &str, counts: &[usize]| {
+            let total: usize = counts.iter().sum();
+            let expected = total / counts.len();
+            let lo = expected / 3;
+            let hi = expected * 3;
+            for (i, &c) in counts.iter().enumerate() {
+                assert!(
+                    c >= lo && c <= hi,
+                    "{label}: bucket {i} has {c} entries (expected ~{expected}, \
+                     acceptable range {lo}..={hi}); full distribution: {counts:?}"
+                );
+            }
+        };
+
+        // --- PowerOfTwoRoute with 64 buckets ---
+        struct PowerRouter(PowerOfTwoRoute);
+        trait SenderRoute_ {
+            fn count(&self) -> usize;
+            fn route(&self, hash: u64) -> usize;
+        }
+        impl SenderRoute_ for PowerRouter {
+            fn count(&self) -> usize {
+                (self.0.mask + 1) as usize
+            }
+            fn route(&self, hash: u64) -> usize {
+                self.0.route(hash)
+            }
+        }
+
+        struct ModRouter(ModuloRoute);
+        impl SenderRoute_ for ModRouter {
+            fn count(&self) -> usize {
+                self.0.divisor as usize
+            }
+            fn route(&self, hash: u64) -> usize {
+                self.0.route(hash)
+            }
+        }
+
+        let pow2_router = PowerRouter(PowerOfTwoRoute::new(64));
+        let counts = bucket(&pow2_router);
+        assert_even("PowerOfTwoRoute(64)", &counts);
+
+        // --- ModuloRoute with 60 buckets (non-power-of-two) ---
+        let mod_router = ModRouter(ModuloRoute::new(60));
+        let counts = bucket(&mod_router);
+        assert_even("ModuloRoute(60)", &counts);
+
+        // --- ModuloRoute with 3 buckets (stress-test small counts) ---
+        let mod_router3 = ModRouter(ModuloRoute::new(3));
+        let counts = bucket(&mod_router3);
+        assert_even("ModuloRoute(3)", &counts);
+    }
+}
