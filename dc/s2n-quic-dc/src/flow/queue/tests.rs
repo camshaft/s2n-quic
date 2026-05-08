@@ -30,6 +30,7 @@ fn stress_alloc_grow_and_route_multi_threaded() {
 
     const THREADS: usize = 8;
     const ITERS_PER_THREAD: usize = 1_500;
+    const WORKER_ID_SHIFT: usize = 24;
 
     let allocator = Allocator::<usize, usize, TestKey>::new();
     let dispatcher = allocator.dispatcher();
@@ -56,7 +57,7 @@ fn stress_alloc_grow_and_route_multi_threaded() {
                     assert_eq!(stream.remote_queue_id(), None);
                     assert_eq!(control.remote_queue_id(), None);
 
-                    let stream_value = (worker_id << 24) | iter;
+                    let stream_value = (worker_id << WORKER_ID_SHIFT) | iter;
                     let control_value = stream_value ^ usize::MAX;
                     let remote_queue_id = VarInt::new((iter as u64) + 1).unwrap();
 
