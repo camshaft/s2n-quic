@@ -315,7 +315,7 @@ fn stress_alloc_grow_and_route_multi_threaded() {
 }
 
 #[test]
-#[ignore = "expensive stress test with high contention and retained queue set"]
+#[ignore = "expensive stress test with high contention and retained queue sets"]
 fn stress_alloc_grow_and_route_multi_threaded_contention() {
     run_oracle_stress(Config {
         threads: 8,
