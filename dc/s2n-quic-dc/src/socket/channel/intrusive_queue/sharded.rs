@@ -358,7 +358,7 @@ impl<A: intrusive_queue::Adapter> Receiver<A> {
         let bit = bits.trailing_zeros() as usize;
         self.local_occupancy[word] &= !(1 << bit);
         let shard = word * u64::BITS as usize + bit;
-        self.next_shard = (shard + 1) & self.shared.shard_mask;
+        self.next_shard = (shard + 1) % self.shared.shards.len();
         Some(shard)
     }
 
@@ -524,6 +524,8 @@ mod tests {
     fn next_occupied_wraps_once() {
         let (_tx, mut rx) = new::<u32>(128);
 
+        // Start in word 1 so the scan first finds a later shard in that word, then wraps back to
+        // word 0.
         rx.next_shard = 65;
         rx.local_occupancy[1] = 1 << 6; // shard 70
         rx.local_occupancy[0] = 1 << 2; // shard 2
@@ -542,6 +544,7 @@ mod tests {
         assert_eq!(rx.local_occupancy[0], 1);
 
         assert_eq!(rx.valid_word_mask(0), 0xff);
+        // Bit 9 is outside the 8-shard range and should be ignored by the valid-word mask.
         rx.local_occupancy[0] = (1 << 9) | (1 << 7);
         assert_eq!(rx.next_occupied(), Some(7));
         assert_eq!(rx.next_occupied(), None);
