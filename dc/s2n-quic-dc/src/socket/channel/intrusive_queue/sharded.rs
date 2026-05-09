@@ -298,6 +298,9 @@ impl<A: intrusive_queue::Adapter> Receiver<A> {
                 "occupancy bit set for an empty shard"
             );
 
+            // In release builds, preserve the receive contract by returning the list even if a
+            // stale occupancy bit points at an empty shard. The debug assertion above catches that
+            // state during testing.
             let list = core::mem::take(&mut queue.queue);
             return TryRecv::Ready(list);
         }

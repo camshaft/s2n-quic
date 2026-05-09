@@ -32,7 +32,7 @@ pub mod loom {
             loop {
                 match future.as_mut().poll(&mut cx) {
                     Poll::Ready(output) => return output,
-                    Poll::Pending => std::thread::yield_now(),
+                    Poll::Pending => std::thread::park_timeout(std::time::Duration::from_millis(1)),
                 }
             }
         }
