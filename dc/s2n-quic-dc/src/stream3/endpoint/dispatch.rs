@@ -285,15 +285,16 @@ fn handle_flow_init(
 ) {
     let create_queue = |handle| {
         let (queue_control, queue_stream) = queue_dispatcher.alloc_or_grow(handle, Some(peer_queue_id));
-        let queue_id = queue_control.queue_id();
-        (queue_id, (queue_control, queue_stream))
+        (queue_control.queue_id(), (queue_control, queue_stream))
     };
 
     let mut initial_payload = Some(buf);
     let mut create_stream = |queue_control: msg::queue::Control,
                              queue_stream: msg::queue::Stream,
                              pending_validation: bool| {
-        let payload = initial_payload.take().expect("flow init payload already consumed");
+        let payload = initial_payload
+            .take()
+            .expect("internal error: flow init payload consumed more than once");
         if is_fin || !payload.is_empty() {
             queue_stream.push(
                 msg::Stream::Data {
