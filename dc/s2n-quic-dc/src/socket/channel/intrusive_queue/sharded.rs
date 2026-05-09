@@ -5,7 +5,7 @@
 //!
 //! The sender has no backpressure - it can always push lists to one of the shards. The receiver
 //! drains one shard at a time, returning the entire list. Receivers are expected to register their
-//! waker before exposing senders.
+//! waker immediately after channel creation and before cloning or exposing senders.
 
 use crate::intrusive_queue;
 use core::{
@@ -34,8 +34,10 @@ struct Shared<A: intrusive_queue::Adapter> {
 }
 
 // SAFETY: `recv_waker` is initialized to a noop waker and only mutated by the receiver before
-// senders are exposed. Senders only read it to wake the receiver. Shard queues are protected by
-// their mutexes, and `A::Pointer: Send` ensures queue contents can safely cross threads.
+// senders are exposed. Senders only read it to wake the receiver. This makes shared references safe.
+// The type is also safe to send between threads because all fields are `Send` under `A::Pointer:
+// Send`; shard queues are mutex-protected, and `UnsafeCell<Waker>` is `Send` because `Waker` is
+// `Send`.
 unsafe impl<A: intrusive_queue::Adapter> Sync for Shared<A> where A::Pointer: Send {}
 unsafe impl<A: intrusive_queue::Adapter> Send for Shared<A> where A::Pointer: Send {}
 
@@ -88,6 +90,10 @@ pub fn new<T>(
     new_with_adapter::<intrusive_queue::EntryAdapter<T>>(shard_count)
 }
 
+/// Creates a sharded intrusive queue channel.
+///
+/// Call [`Receiver::register`] immediately after creation and before cloning or exposing the
+/// returned sender to another thread.
 pub fn new_with_adapter<A: intrusive_queue::Adapter>(
     shard_count: usize,
 ) -> (Sender<A>, Receiver<A>) {
@@ -251,27 +257,25 @@ impl<A: intrusive_queue::Adapter> Receiver<A> {
     }
 
     #[inline(always)]
-    fn has_local_occupancy(&self) -> bool {
-        self.local_occupancy.iter().any(|word| *word != 0)
-    }
+    fn ensure_local_occupancy(&mut self) -> bool {
+        if self.local_occupancy.iter().any(|word| *word != 0) {
+            return true;
+        }
 
-    #[inline(always)]
-    fn refresh_occupancy(&mut self) -> bool {
-        let mut has_occupancy = false;
         for (local, shared) in self
             .local_occupancy
             .iter_mut()
             .zip(self.shared.occupancy.iter())
         {
             *local |= shared.swap(0, Ordering::AcqRel);
-            has_occupancy |= *local != 0;
         }
-        has_occupancy
+
+        self.local_occupancy.iter().any(|word| *word != 0)
     }
 
     #[inline(always)]
     fn try_recv(&mut self) -> TryRecv<A> {
-        if !self.has_local_occupancy() && !self.refresh_occupancy() {
+        if !self.ensure_local_occupancy() {
             return TryRecv::Empty;
         }
 
@@ -297,7 +301,7 @@ impl<A: intrusive_queue::Adapter> Receiver<A> {
             return TryRecv::Ready(list);
         }
 
-        if self.has_local_occupancy() {
+        if self.ensure_local_occupancy() {
             TryRecv::Yield
         } else {
             TryRecv::Empty
