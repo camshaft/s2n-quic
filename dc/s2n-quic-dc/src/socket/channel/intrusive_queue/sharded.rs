@@ -74,6 +74,7 @@ pub fn new_with_adapter<A: intrusive_queue::Adapter>(
         .map(|_| Mutex::new(intrusive_queue::List::new()))
         .collect::<Vec<_>>()
         .into_boxed_slice();
+    // Use an odd stride so each sender walks every shard in the power-of-two ring.
     let sender_stride = ((shard_count / 2).saturating_sub(1)) | 1;
     let shared = Arc::new(Shared {
         is_open: AtomicBool::new(true),
@@ -224,6 +225,7 @@ impl<A: intrusive_queue::Adapter> Drop for Receiver<A> {
 
 impl<A: intrusive_queue::Adapter> Receiver<A> {
     pub fn register(&self, waker: &Waker) {
+        // This channel is intended for receivers that register once before exposing senders.
         let _ = self.shared.recv_waker.set(waker.clone());
     }
 
@@ -241,12 +243,18 @@ impl<A: intrusive_queue::Adapter> Receiver<A> {
 
             let mut queue = self.shared.shards[shard].lock();
             if queue.is_empty() {
+                // Clear while holding the shard lock so a sender cannot enqueue before the bit
+                // is cleared.
                 self.shared.occupancy[word].fetch_and(!bit, Ordering::AcqRel);
+                drop(queue);
                 continue;
             }
 
             let list = core::mem::take(&mut *queue);
+            // Clear while holding the shard lock so any following sender observes an empty queue
+            // and sets the bit again after enqueueing.
             self.shared.occupancy[word].fetch_and(!bit, Ordering::AcqRel);
+            drop(queue);
             self.next_shard = (shard + 1) & self.shared.shard_mask;
             return Some(list);
         }
