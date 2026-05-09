@@ -389,6 +389,8 @@ impl<A: intrusive_queue::Adapter> super::super::Receiver<intrusive_queue::List<A
     #[inline(always)]
     fn poll_recv(
         &mut self,
+        // The receiver waker is registered explicitly before senders are exposed; the channel
+        // trait still requires a context parameter here.
         _cx: &mut core::task::Context<'_>,
     ) -> Poll<Option<intrusive_queue::List<A>>> {
         if let TryRecv::Ready(list) = self.try_recv() {
