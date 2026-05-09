@@ -291,11 +291,12 @@ impl<A: intrusive_queue::Adapter> Receiver<A> {
 
     #[inline(always)]
     fn try_recv(&mut self) -> TryRecv<A> {
-        while let Some(shard) = self.next_occupied() {
+        if let Some(shard) = self.next_occupied() {
             let mut queue = lock(&self.shared.shards[shard]);
-            if queue.queue.is_empty() {
-                continue;
-            }
+            debug_assert!(
+                !queue.queue.is_empty(),
+                "occupancy bit set for an empty shard"
+            );
 
             let list = core::mem::take(&mut queue.queue);
             return TryRecv::Ready(list);
@@ -333,7 +334,7 @@ impl<A: intrusive_queue::Adapter> Receiver<A> {
             }
         }
 
-        self.next_shard = start_shard;
+        self.next_shard = 0;
         None
     }
 
@@ -537,6 +538,7 @@ mod tests {
         assert_eq!(rx.next_occupied(), Some(70));
         assert_eq!(rx.next_occupied(), Some(2));
         assert_eq!(rx.next_occupied(), None);
+        assert_eq!(rx.next_shard, 0);
     }
 
     #[test]
@@ -555,6 +557,17 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "occupancy bit set for an empty shard")]
+    fn stale_occupancy_bit_panics() {
+        let (_tx, mut rx) = new::<u32>(1);
+        let mut cx = noop_cx();
+
+        rx.local_occupancy[0] = 1;
+
+        let _ = rx.poll_recv(&mut cx);
+    }
+
+    #[test]
     fn receiver_drop_closes_sender() {
         let (mut tx, mut rx) = new::<u32>(2);
         register(&mut rx);
@@ -568,10 +581,43 @@ mod tests {
         use crate::testing::loom;
 
         loom::model(|| {
-            let (mut tx0, mut rx) = new::<u32>(2);
-            let waker = s2n_quic_core::task::waker::noop();
-            // Register before cloning/exposing senders so sender wakeups only read the waker.
-            rx.register(&waker);
+            let (mut tx0, rx) = new::<u32>(2);
+            let registered = loom::sync::Arc::new(loom::sync::atomic::AtomicBool::new(false));
+            let registered_rx = registered.clone();
+
+            let receiver = loom::thread::spawn(move || {
+                loom::future::block_on(async move {
+                    let mut rx = rx;
+                    let mut registered = false;
+                    let mut received = vec![];
+
+                    loop {
+                        let item = core::future::poll_fn(|cx| {
+                            if !registered {
+                                rx.register(cx.waker());
+                                registered_rx.store(true, Ordering::Release);
+                                registered = true;
+                            }
+
+                            rx.poll_recv(cx)
+                        })
+                        .await;
+
+                        match item {
+                            Some(list) => received.extend(values(&list)),
+                            None => break,
+                        }
+                    }
+
+                    received.sort_unstable();
+                    assert_eq!(received, vec![1, 2]);
+                });
+            });
+
+            while !registered.load(Ordering::Acquire) {
+                loom::hint::spin_loop();
+            }
+
             let mut tx1 = tx0.clone();
 
             let a = loom::thread::spawn(move || tx0.send(list([1])).unwrap());
@@ -579,14 +625,7 @@ mod tests {
 
             a.join().unwrap();
             b.join().unwrap();
-
-            let mut cx = noop_cx();
-            let mut received = vec![];
-            while let Poll::Ready(Some(list)) = rx.poll_recv(&mut cx) {
-                received.extend(values(&list));
-            }
-            received.sort_unstable();
-            assert_eq!(received, vec![1, 2]);
+            receiver.join().unwrap();
         });
     }
 }

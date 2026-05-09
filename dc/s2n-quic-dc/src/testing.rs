@@ -16,7 +16,31 @@ use s2n_quic::provider::tls::default as s2n_quic_tls_prov;
 
 #[cfg(all(test, not(loom)))]
 pub mod loom {
-    pub use std::thread;
+    pub use std::{sync, thread};
+
+    pub mod future {
+        use core::{
+            future::Future,
+            task::{Context, Poll},
+        };
+
+        pub fn block_on<F: Future>(future: F) -> F::Output {
+            let mut future = std::pin::pin!(future);
+            let waker = s2n_quic_core::task::waker::noop();
+            let mut cx = Context::from_waker(&waker);
+
+            loop {
+                match future.as_mut().poll(&mut cx) {
+                    Poll::Ready(output) => return output,
+                    Poll::Pending => std::thread::yield_now(),
+                }
+            }
+        }
+    }
+
+    pub mod hint {
+        pub use core::hint::spin_loop;
+    }
 
     pub fn model<F: 'static + FnOnce() -> R, R>(f: F) -> R {
         f()
