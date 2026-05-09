@@ -319,6 +319,7 @@ impl<A: intrusive_queue::Adapter> Receiver<A> {
         }
 
         for offset in 1..word_count {
+            // Manually wrap instead of using modulo in this hot path.
             let word = start_word + offset;
             let word = if word >= word_count {
                 word - word_count
@@ -359,6 +360,7 @@ impl<A: intrusive_queue::Adapter> Receiver<A> {
             return None;
         }
 
+        debug_assert_ne!(bits, 0);
         let bit = bits.trailing_zeros() as usize;
         self.local_occupancy[word] &= !(1 << bit);
         let shard = word * u64::BITS as usize + bit;
