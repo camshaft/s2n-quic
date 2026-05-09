@@ -74,7 +74,8 @@ pub fn new_with_adapter<A: intrusive_queue::Adapter>(
         .map(|_| Mutex::new(intrusive_queue::List::new()))
         .collect::<Vec<_>>()
         .into_boxed_slice();
-    // Use an odd stride so each sender walks every shard in the power-of-two ring.
+    // Use an odd stride so it is coprime with the power-of-two shard count and each sender walks
+    // every shard in the ring.
     let sender_stride = ((shard_count / 2).saturating_sub(1)) | 1;
     let shared = Arc::new(Shared {
         is_open: AtomicBool::new(true),
@@ -226,6 +227,7 @@ impl<A: intrusive_queue::Adapter> Drop for Receiver<A> {
 impl<A: intrusive_queue::Adapter> Receiver<A> {
     pub fn register(&self, waker: &Waker) {
         // This channel is intended for receivers that register once before exposing senders.
+        // Subsequent registrations are ignored.
         let _ = self.shared.recv_waker.set(waker.clone());
     }
 
@@ -269,7 +271,9 @@ impl<A: intrusive_queue::Adapter> super::super::Receiver<intrusive_queue::List<A
         &mut self,
         cx: &mut core::task::Context<'_>,
     ) -> Poll<Option<intrusive_queue::List<A>>> {
-        self.register(cx.waker());
+        if self.shared.recv_waker.get().is_none() {
+            self.register(cx.waker());
+        }
 
         if let Some(list) = self.try_recv() {
             return Poll::Ready(Some(list));
