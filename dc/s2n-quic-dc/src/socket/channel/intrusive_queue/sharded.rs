@@ -291,6 +291,8 @@ impl<A: intrusive_queue::Adapter> Receiver<A> {
 
     #[inline(always)]
     fn try_recv(&mut self) -> TryRecv<A> {
+        // Only consume one occupied bit per receive attempt. A set bit pointing at an empty shard
+        // is considered stale/buggy state, so don't keep scanning for another shard here.
         if let Some(shard) = self.next_occupied() {
             let mut queue = lock(&self.shared.shards[shard]);
             debug_assert!(

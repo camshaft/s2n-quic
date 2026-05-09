@@ -32,6 +32,8 @@ pub mod loom {
             loop {
                 match future.as_mut().poll(&mut cx) {
                     Poll::Ready(output) => return output,
+                    // This fallback executor is only used by non-loom unit tests. Parking briefly
+                    // avoids a tight spin without adding another test-only executor dependency.
                     Poll::Pending => std::thread::park_timeout(std::time::Duration::from_millis(1)),
                 }
             }
