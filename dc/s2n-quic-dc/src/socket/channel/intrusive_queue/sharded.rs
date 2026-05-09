@@ -306,7 +306,6 @@ impl<A: intrusive_queue::Adapter> Receiver<A> {
 
     #[inline(always)]
     fn next_occupied(&mut self) -> Option<usize> {
-        let shard_count = self.shared.shards.len();
         let word_count = self.local_occupancy.len();
         let start_shard = self.next_shard;
         let start_word = start_shard / u64::BITS as usize;
@@ -333,7 +332,7 @@ impl<A: intrusive_queue::Adapter> Receiver<A> {
             }
         }
 
-        self.next_shard = start_shard % shard_count;
+        self.next_shard = start_shard;
         None
     }
 
@@ -544,7 +543,7 @@ mod tests {
         assert_eq!(rx.local_occupancy[0], 1);
 
         assert_eq!(rx.valid_word_mask(0), 0xff);
-        // Bit 9 is outside the 8-shard range and should be ignored by the valid-word mask.
+        // Bit 9 is outside the 8-shard range and should be ignored by the valid word mask.
         rx.local_occupancy[0] = (1 << 9) | (1 << 7);
         assert_eq!(rx.next_occupied(), Some(7));
         assert_eq!(rx.next_occupied(), None);
