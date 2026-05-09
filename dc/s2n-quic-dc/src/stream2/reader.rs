@@ -688,7 +688,7 @@ mod tests {
     use crate::stream2::endpoint::{reset_error, ControlMsg};
     use bytes::BytesMut;
     use s2n_quic_core::varint::VarInt;
-    use std::{task::Waker, vec::Vec};
+    use std::task::Waker;
 
     #[test]
     fn delivers_buffered_data_before_reset_error() {
@@ -718,7 +718,7 @@ mod tests {
         let mut reader = Reader::new_client(wheel_tx, path_secret_entry, stream_id, stream_rx);
         let mut cx = Context::from_waker(Waker::noop());
 
-        let mut first = Vec::new();
+        let mut first: Vec<u8> = Vec::new();
         let read = match reader.poll_read_into(&mut cx, &mut first) {
             Poll::Ready(Ok(len)) => len,
             other => panic!("expected first read to succeed, got {other:?}"),
@@ -726,7 +726,7 @@ mod tests {
         assert_eq!(read, 5);
         assert_eq!(first, b"hello");
 
-        let mut second = Vec::new();
+        let mut second: Vec<u8> = Vec::new();
         let err = match reader.poll_read_into(&mut cx, &mut second) {
             Poll::Ready(Err(err)) => err,
             other => panic!("expected second read to return reset error, got {other:?}"),
