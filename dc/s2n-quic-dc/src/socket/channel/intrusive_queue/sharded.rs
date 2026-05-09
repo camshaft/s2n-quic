@@ -35,7 +35,7 @@ struct Shared<A: intrusive_queue::Adapter> {
 
 // SAFETY: `recv_waker` is initialized to a noop waker and only mutated by the receiver before
 // senders are exposed. Senders only read it to wake the receiver. Shard queues are protected by
-// their mutexes and only require sendable pointers to cross threads.
+// their mutexes, and `A::Pointer: Send` ensures queue contents can safely cross threads.
 unsafe impl<A: intrusive_queue::Adapter> Sync for Shared<A> where A::Pointer: Send {}
 unsafe impl<A: intrusive_queue::Adapter> Send for Shared<A> where A::Pointer: Send {}
 
@@ -242,9 +242,11 @@ impl<A: intrusive_queue::Adapter> Drop for Receiver<A> {
 impl<A: intrusive_queue::Adapter> Receiver<A> {
     /// Registers the receiver waker.
     ///
-    /// This channel expects the receiver to register before exposing senders.
+    /// This channel expects the receiver to register immediately after channel creation, before any
+    /// sender is cloned or exposed to another thread.
     pub fn register(&mut self, waker: &Waker) {
-        // SAFETY: registration is performed by the receiver before senders are exposed.
+        // SAFETY: callers must complete registration before cloning or exposing senders. After
+        // that point, senders may concurrently read the waker.
         unsafe { *self.shared.recv_waker.get() = waker.clone() };
     }
 
