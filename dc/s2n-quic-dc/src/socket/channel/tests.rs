@@ -332,7 +332,7 @@ fn flatten_drains_queue_then_fetches_next() {
 }
 
 #[test]
-#[should_panic(expected = "shard count must be a non-zero power of two")]
+#[should_panic(expected = "shard count must be a power of two")]
 fn sharded_rejects_non_power_of_two_shards() {
     let _ = super::intrusive_queue::sharded::new::<u32>(3);
 }

@@ -62,7 +62,7 @@ pub fn new_with_adapter<A: intrusive_queue::Adapter>(
 ) -> (Sender<A>, Receiver<A>) {
     assert!(
         shard_count.is_power_of_two(),
-        "shard count must be a non-zero power of two"
+        "shard count must be a power of two"
     );
 
     let occupancy_len = shard_count.div_ceil(u64::BITS as usize);
