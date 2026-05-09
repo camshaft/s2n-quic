@@ -37,6 +37,7 @@ impl<A: intrusive_queue::Adapter> Shared<A> {
 
     #[inline(always)]
     fn bit(shard: usize) -> (usize, u64) {
+        // Map a shard index to its occupancy word and bit in the bitmap.
         let word = shard / u64::BITS as usize;
         let bit = 1 << (shard % u64::BITS as usize);
         (word, bit)
@@ -76,8 +77,8 @@ pub fn new_with_adapter<A: intrusive_queue::Adapter>(
         .map(|_| Mutex::new(intrusive_queue::List::new()))
         .collect::<Vec<_>>()
         .into_boxed_slice();
-    // Use an odd stride so it is coprime with the power-of-two shard count and each sender walks
-    // every shard in the ring.
+    // Use a value near half the shard count, then force it odd. Odd values are coprime with
+    // power-of-two shard counts, so each sender walks every shard before repeating.
     let sender_stride = ((shard_count / 2).saturating_sub(1)) | 1;
     let shared = Arc::new(Shared {
         is_open: AtomicBool::new(true),
@@ -278,6 +279,10 @@ impl<A: intrusive_queue::Adapter> super::super::Receiver<intrusive_queue::List<A
         }
 
         if self.shared.sender_count.load(Ordering::Acquire) == 0 {
+            if let Some(list) = self.try_recv() {
+                return Poll::Ready(Some(list));
+            }
+
             return Poll::Ready(None);
         }
 
