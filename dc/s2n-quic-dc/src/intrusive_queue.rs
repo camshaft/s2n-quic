@@ -174,12 +174,14 @@ impl<T> DerefMut for Entry<T> {
     }
 }
 
+#[cfg(not(loom))]
 impl<T: crate::socket::channel::ByteCost> crate::socket::channel::ByteCost for Entry<T> {
     fn byte_cost(&self) -> u64 {
         (**self).byte_cost()
     }
 }
 
+#[cfg(not(loom))]
 impl<T: crate::socket::channel::Sendable> crate::socket::channel::Sendable for Entry<T> {
     fn send<S: crate::socket::send::Socket>(&mut self, socket: &S) -> std::io::Result<()> {
         (**self).send(socket)

@@ -37,9 +37,7 @@ pin-project-lite = "0.2"
 rand = "0.10"
 rustc-hash = "2"
 s2n-codec = { version = "=0.76.0", path = "../../common/s2n-codec", default-features = false }
-s2n-quic = { version = "=1.76.0", path = "../../quic/s2n-quic", features = ["unstable-provider-dc", "unstable-provider-random"] }
 s2n-quic-core = { version = "=0.76.0", path = "../../quic/s2n-quic-core", default-features = false }
-s2n-quic-platform = { version = "=0.76.0", path = "../../quic/s2n-quic-platform" }
 s2n-tls = "0.3"
 slotmap = "1"
 hashbrown = "0.16"
@@ -61,14 +59,23 @@ bolero = "0.13"
 bolero-generator = "0.13"
 insta = "1"
 s2n-codec = { path = "../../common/s2n-codec", features = ["testing"] }
-s2n-quic = { path = "../../quic/s2n-quic" }
 s2n-quic-core = { path = "../../quic/s2n-quic-core", features = ["state-tracing", "testing"] }
-s2n-quic-platform = { path = "../../quic/s2n-quic-platform", features = ["testing"] }
 tokio = { version = "1", features = ["full", "test-util"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [target.'cfg(loom)'.dev-dependencies]
 loom = { version = "0.7", features = ["checkpoint", "futures"] }
+
+[target.'cfg(loom)'.dependencies]
+event-listener-strategy = { version = "0.5", features = ["loom"] }
+
+[target.'cfg(not(loom))'.dependencies]
+s2n-quic = { version = "=1.76.0", path = "../../quic/s2n-quic", features = ["unstable-provider-dc", "unstable-provider-random"] }
+s2n-quic-platform = { version = "=0.76.0", path = "../../quic/s2n-quic-platform" }
+
+[target.'cfg(not(loom))'.dev-dependencies]
+s2n-quic = { path = "../../quic/s2n-quic" }
+s2n-quic-platform = { path = "../../quic/s2n-quic-platform", features = ["testing"] }
 
 [lints.rust.unexpected_cfgs]
 level = "warn"

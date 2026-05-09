@@ -585,41 +585,28 @@ mod tests {
     fn loom_concurrent_send_recv() {
         use crate::testing::loom;
 
-        loom::model(|| {
-            const UNREGISTERED: usize = 0;
-            const REGISTERING: usize = 1;
-            const REGISTERED: usize = 2;
-
+        fn scenario() {
             let (mut tx0, rx) = new::<u32>(2);
             let registered =
-                loom::sync::Arc::new(loom::sync::atomic::AtomicUsize::new(UNREGISTERED));
-            let registered_flag = registered.clone();
+                loom::sync::Arc::new((loom::sync::Mutex::new(false), loom::sync::Condvar::new()));
+            let registered_rx = registered.clone();
 
             let receiver = loom::thread::spawn(move || {
                 loom::future::block_on(async move {
                     let mut rx = rx;
                     let mut received = vec![];
 
-                    loop {
-                        let item = core::future::poll_fn(|cx| {
-                            if registered_flag
-                                .compare_exchange(
-                                    UNREGISTERED,
-                                    REGISTERING,
-                                    Ordering::AcqRel,
-                                    Ordering::Acquire,
-                                )
-                                .is_ok()
-                            {
-                                rx.register(cx.waker());
-                                // Publish receiver waker registration before the main thread
-                                // exposes senders to concurrent sender threads.
-                                registered_flag.store(REGISTERED, Ordering::Release);
-                            }
+                    core::future::poll_fn(|cx| {
+                        rx.register(cx.waker());
+                        let (registered, cvar) = &*registered_rx;
+                        *registered.lock().unwrap() = true;
+                        cvar.notify_one();
+                        Poll::Ready(())
+                    })
+                    .await;
 
-                            rx.poll_recv(cx)
-                        })
-                        .await;
+                    loop {
+                        let item = core::future::poll_fn(|cx| rx.poll_recv(cx)).await;
 
                         match item {
                             Some(list) => received.extend(values(&list)),
@@ -632,9 +619,10 @@ mod tests {
                 });
             });
 
-            while registered.load(Ordering::Acquire) != REGISTERED {
-                loom::hint::spin_loop();
-                loom::thread::yield_now();
+            let (registered, cvar) = &*registered;
+            let mut is_registered = registered.lock().unwrap();
+            while !*is_registered {
+                is_registered = cvar.wait(is_registered).unwrap();
             }
 
             let mut tx1 = tx0.clone();
@@ -645,6 +633,16 @@ mod tests {
             a.join().unwrap();
             b.join().unwrap();
             receiver.join().unwrap();
-        });
+        }
+
+        #[cfg(loom)]
+        {
+            let mut model = loom::model::Builder::new();
+            model.preemption_bound = Some(2);
+            model.check(scenario);
+        }
+
+        #[cfg(not(loom))]
+        loom::model(scenario);
     }
 }
