@@ -286,21 +286,6 @@ impl Inner {
     where
         S: buffer::writer::Storage,
     {
-        if self.status.is_reset() {
-            if let Some(error_code) = self.reset_error_code {
-                let reset_error: ResetError = error_code.into();
-                return Poll::Ready(Err(io::Error::new(
-                    io::ErrorKind::ConnectionReset,
-                    reset_error,
-                )));
-            }
-            return Poll::Ready(Err(io::ErrorKind::ConnectionReset.into()));
-        }
-
-        if self.status.is_complete() {
-            return Poll::Ready(Ok(0));
-        }
-
         let _ = self.poll_stream_rx(cx)?;
 
         if self.status.is_pending_validation() {
