@@ -345,8 +345,9 @@ impl<A: intrusive_queue::Adapter> Receiver<A> {
 
         let mut bits = self.local_occupancy[word] & mask;
         if bits == 0 {
-            // The swap only needs Acquire ordering: senders publish queue writes before the
-            // Release occupancy bit, and the receiver does not publish data when clearing it.
+            // The swap only needs Acquire ordering: senders publish queue writes with Release
+            // ordering before setting the occupancy bit, and the receiver does not publish data
+            // when clearing it.
             self.local_occupancy[word] |= self.shared.occupancy[word].swap(0, Ordering::Acquire);
             bits = self.local_occupancy[word] & mask;
         }
@@ -529,6 +530,20 @@ mod tests {
 
         assert_eq!(rx.next_occupied(), Some(70));
         assert_eq!(rx.next_occupied(), Some(2));
+        assert_eq!(rx.next_occupied(), None);
+    }
+
+    #[test]
+    fn next_occupied_respects_masks() {
+        let (_tx, mut rx) = new::<u32>(8);
+
+        rx.local_occupancy[0] = 1;
+        assert_eq!(rx.next_occupied_in_word(0, 0), None);
+        assert_eq!(rx.local_occupancy[0], 1);
+
+        assert_eq!(rx.valid_word_mask(0), 0xff);
+        rx.local_occupancy[0] = (1 << 9) | (1 << 7);
+        assert_eq!(rx.next_occupied(), Some(7));
         assert_eq!(rx.next_occupied(), None);
     }
 
