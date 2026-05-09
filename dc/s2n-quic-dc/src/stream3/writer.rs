@@ -83,13 +83,12 @@ use crate::{
         datagram::{partial::MAX_FLOW_DATA_HEADER_OVERHEAD, QueuePair, ResetTarget},
     },
     path::secret::map::Entry as PathSecretEntry,
-    socket::channel,
     stream3::{
         endpoint::{
             msg,
             reset_error::{self, ResetError},
         },
-        frame::{self, Frame, Header, DEFAULT_TTL},
+        frame::{self, Frame, Header, SubmissionSender, DEFAULT_TTL},
     },
 };
 use s2n_quic_core::{
@@ -110,8 +109,7 @@ pub struct Writer(Box<Inner>);
 
 struct Inner {
     /// Channel to submit frames to the wheel
-    frame_tx:
-        channel::intrusive_queue::sharded::Sender<crate::intrusive_queue::EntryAdapter<Frame>>,
+    frame_tx: SubmissionSender,
     /// Receiver for completion notifications from the pipeline
     completion_rx: frame::CompletionReceiver,
     /// Control-side channel for receiving MAX_DATA frames
@@ -171,8 +169,7 @@ impl Status {
 
 impl Writer {
     pub(crate) fn new_client(
-        frame_tx:
-            channel::intrusive_queue::sharded::Sender<crate::intrusive_queue::EntryAdapter<Frame>>,
+        frame_tx: SubmissionSender,
         path_secret_entry: Arc<PathSecretEntry>,
         stream_id: VarInt,
         acceptor_id: VarInt,
@@ -203,8 +200,7 @@ impl Writer {
     }
 
     pub(crate) fn new_server(
-        frame_tx:
-            channel::intrusive_queue::sharded::Sender<crate::intrusive_queue::EntryAdapter<Frame>>,
+        frame_tx: SubmissionSender,
         path_secret_entry: Arc<PathSecretEntry>,
         stream_id: VarInt,
         control_rx: msg::queue::Control,

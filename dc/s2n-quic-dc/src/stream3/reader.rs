@@ -96,7 +96,7 @@ use crate::{
             msg,
             reset_error::{self, ResetError},
         },
-        frame::{self, Frame, Header, DEFAULT_TTL},
+        frame::{self, Frame, Header, SubmissionSender, DEFAULT_TTL},
     },
 };
 use s2n_codec::EncoderValue;
@@ -124,9 +124,7 @@ pub struct Reader(Box<Inner>);
 
 struct Inner {
     /// Channel to submit frames to the wheel
-    frame_tx: crate::socket::channel::intrusive_queue::sharded::Sender<
-        crate::intrusive_queue::EntryAdapter<Frame>,
-    >,
+    frame_tx: SubmissionSender,
     /// Stream-side channel for receiving data from the pipeline
     stream_rx: msg::queue::Stream,
     /// Path secret entry providing MTU and crypto material
@@ -174,9 +172,7 @@ impl Status {
 
 impl Reader {
     pub(crate) fn new_client(
-        frame_tx: crate::socket::channel::intrusive_queue::sharded::Sender<
-            crate::intrusive_queue::EntryAdapter<Frame>,
-        >,
+        frame_tx: SubmissionSender,
         path_secret_entry: Arc<PathSecretEntry>,
         stream_id: VarInt,
         stream_rx: msg::queue::Stream,
@@ -199,9 +195,7 @@ impl Reader {
     }
 
     pub(crate) fn new_server(
-        frame_tx: crate::socket::channel::intrusive_queue::sharded::Sender<
-            crate::intrusive_queue::EntryAdapter<Frame>,
-        >,
+        frame_tx: SubmissionSender,
         path_secret_entry: Arc<PathSecretEntry>,
         stream_id: VarInt,
         stream_rx: msg::queue::Stream,
@@ -223,9 +217,7 @@ impl Reader {
     }
 
     pub(crate) fn new_server_pending(
-        frame_tx: crate::socket::channel::intrusive_queue::sharded::Sender<
-            crate::intrusive_queue::EntryAdapter<Frame>,
-        >,
+        frame_tx: SubmissionSender,
         path_secret_entry: Arc<PathSecretEntry>,
         stream_id: VarInt,
         stream_rx: msg::queue::Stream,
