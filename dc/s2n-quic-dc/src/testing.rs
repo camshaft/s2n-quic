@@ -14,6 +14,18 @@ pub use bach::{ext, rand};
 
 use s2n_quic::provider::tls::default as s2n_quic_tls_prov;
 
+#[cfg(all(test, not(loom)))]
+pub mod loom {
+    pub use std::*;
+
+    pub fn model<F: 'static + FnOnce() -> R, R>(f: F) -> R {
+        f()
+    }
+}
+
+#[cfg(all(test, loom))]
+pub use loom;
+
 pub static SNI: OnceLock<Name> = OnceLock::new();
 
 #[doc(hidden)]

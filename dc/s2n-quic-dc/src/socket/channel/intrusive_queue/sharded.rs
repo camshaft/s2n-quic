@@ -10,13 +10,34 @@
 use crate::intrusive_queue;
 use core::{
     cell::UnsafeCell,
-    sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     task::{Poll, Waker},
 };
-use parking_lot::Mutex;
-use std::sync::Arc;
+use sync::{lock, Arc, AtomicBool, AtomicU64, AtomicUsize, Mutex, Ordering};
 
-const MAX_SHARDS_PER_POLL: usize = 16;
+#[cfg(all(loom, test))]
+mod sync {
+    pub use loom::sync::{
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+        Arc, Mutex, MutexGuard,
+    };
+
+    #[inline(always)]
+    pub fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+        mutex.lock().unwrap()
+    }
+}
+
+#[cfg(not(all(loom, test)))]
+mod sync {
+    pub use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+    pub use parking_lot::{Mutex, MutexGuard};
+    pub use std::sync::Arc;
+
+    #[inline(always)]
+    pub fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+        mutex.lock()
+    }
+}
 
 struct Shard<A: intrusive_queue::Adapter> {
     is_open: bool,
@@ -192,7 +213,7 @@ impl<A: intrusive_queue::Adapter> Sender<A> {
         }
 
         let shard = self.next_shard();
-        let mut queue = self.shared.shards[shard].lock();
+        let mut queue = lock(&self.shared.shards[shard]);
 
         if !queue.is_open {
             return Err(list);
@@ -248,7 +269,7 @@ pub struct Receiver<A: intrusive_queue::Adapter> {
 impl<A: intrusive_queue::Adapter> Drop for Receiver<A> {
     fn drop(&mut self) {
         for shard in self.shared.shards.iter() {
-            shard.lock().is_open = false;
+            lock(shard).is_open = false;
         }
     }
 }
@@ -269,42 +290,9 @@ impl<A: intrusive_queue::Adapter> Receiver<A> {
     }
 
     #[inline(always)]
-    fn ensure_local_occupancy(&mut self) -> bool {
-        if self.local_occupancy.iter().any(|word| *word != 0) {
-            return true;
-        }
-
-        for (local, shared) in self
-            .local_occupancy
-            .iter_mut()
-            .zip(self.shared.occupancy.iter())
-        {
-            *local |= shared.swap(0, Ordering::AcqRel);
-        }
-
-        self.local_occupancy.iter().any(|word| *word != 0)
-    }
-
-    #[inline(always)]
     fn try_recv(&mut self) -> TryRecv<A> {
-        if !self.ensure_local_occupancy() {
-            return TryRecv::Empty;
-        }
-
-        let shard_count = self.shared.shards.len();
-        let iterations = shard_count.min(MAX_SHARDS_PER_POLL);
-
-        for _ in 0..iterations {
-            let shard = self.next_shard;
-            self.next_shard = (shard + 1) & self.shared.shard_mask;
-            let (word, bit) = Shared::<A>::occupancy_word_and_bit(shard);
-
-            if self.local_occupancy[word] & bit == 0 {
-                continue;
-            }
-            self.local_occupancy[word] &= !bit;
-
-            let mut queue = self.shared.shards[shard].lock();
+        while let Some(shard) = self.next_occupied() {
+            let mut queue = lock(&self.shared.shards[shard]);
             if queue.queue.is_empty() {
                 continue;
             }
@@ -313,10 +301,78 @@ impl<A: intrusive_queue::Adapter> Receiver<A> {
             return TryRecv::Ready(list);
         }
 
-        if self.ensure_local_occupancy() {
-            TryRecv::Yield
+        TryRecv::Empty
+    }
+
+    #[inline(always)]
+    fn next_occupied(&mut self) -> Option<usize> {
+        let shard_count = self.shared.shards.len();
+        let word_count = self.local_occupancy.len();
+        let start_shard = self.next_shard;
+        let start_word = start_shard / u64::BITS as usize;
+        let start_bit = start_shard % u64::BITS as usize;
+
+        if let Some(shard) = self.next_occupied_in_word(
+            start_word,
+            self.valid_word_mask(start_word) & (!0 << start_bit),
+        ) {
+            return Some(shard);
+        }
+
+        for offset in 1..word_count {
+            let word = (start_word + offset) % word_count;
+            if let Some(shard) = self.next_occupied_in_word(word, self.valid_word_mask(word)) {
+                return Some(shard);
+            }
+        }
+
+        if start_bit > 0 {
+            let mask = self.valid_word_mask(start_word) & ((1 << start_bit) - 1);
+            if let Some(shard) = self.next_occupied_in_word(start_word, mask) {
+                return Some(shard);
+            }
+        }
+
+        self.next_shard = start_shard & (shard_count - 1);
+        None
+    }
+
+    #[inline(always)]
+    fn next_occupied_in_word(&mut self, word: usize, mask: u64) -> Option<usize> {
+        if mask == 0 {
+            return None;
+        }
+
+        let mut bits = self.local_occupancy[word] & mask;
+        if bits == 0 {
+            // The swap only needs Acquire ordering: senders publish queue writes before the
+            // Release occupancy bit, and the receiver does not publish data when clearing it.
+            self.local_occupancy[word] |= self.shared.occupancy[word].swap(0, Ordering::Acquire);
+            bits = self.local_occupancy[word] & mask;
+        }
+        if bits == 0 {
+            return None;
+        }
+
+        let bit = bits.trailing_zeros() as usize;
+        self.local_occupancy[word] &= !(1 << bit);
+        let shard = word * u64::BITS as usize + bit;
+        self.next_shard = (shard + 1) & self.shared.shard_mask;
+        Some(shard)
+    }
+
+    #[inline(always)]
+    fn valid_word_mask(&self, word: usize) -> u64 {
+        let word_count = self.local_occupancy.len();
+        if word + 1 != word_count {
+            return !0;
+        }
+
+        let valid_bits = self.shared.shards.len() - (word * u64::BITS as usize);
+        if valid_bits == u64::BITS as usize {
+            !0
         } else {
-            TryRecv::Empty
+            (1 << valid_bits) - 1
         }
     }
 }
@@ -325,15 +381,10 @@ impl<A: intrusive_queue::Adapter> super::super::Receiver<intrusive_queue::List<A
     #[inline(always)]
     fn poll_recv(
         &mut self,
-        cx: &mut core::task::Context<'_>,
+        _cx: &mut core::task::Context<'_>,
     ) -> Poll<Option<intrusive_queue::List<A>>> {
-        match self.try_recv() {
-            TryRecv::Ready(list) => return Poll::Ready(Some(list)),
-            TryRecv::Yield => {
-                cx.waker().wake_by_ref();
-                return Poll::Pending;
-            }
-            TryRecv::Empty => {}
+        if let TryRecv::Ready(list) = self.try_recv() {
+            return Poll::Ready(Some(list));
         }
 
         if self.shared.sender_count.load(Ordering::Acquire) == 0 {
@@ -354,7 +405,6 @@ impl<A: intrusive_queue::Adapter> super::super::Receiver<intrusive_queue::List<A
 enum TryRecv<A: intrusive_queue::Adapter> {
     Ready(intrusive_queue::List<A>),
     Empty,
-    Yield,
 }
 
 #[cfg(test)]
@@ -470,16 +520,16 @@ mod tests {
     }
 
     #[test]
-    fn receiver_yields_after_bounded_scan() {
-        let (_tx, mut rx) = new::<u32>(MAX_SHARDS_PER_POLL * 2);
-        let mut cx = noop_cx();
+    fn next_occupied_wraps_once() {
+        let (_tx, mut rx) = new::<u32>(128);
 
-        // Simulate a stale receiver-local occupancy snapshot for more shards than one poll is
-        // allowed to scan, without having to enqueue into every shard.
-        rx.local_occupancy[0] = !0;
+        rx.next_shard = 65;
+        rx.local_occupancy[1] = 1 << 6; // shard 70
+        rx.local_occupancy[0] = 1 << 2; // shard 2
 
-        assert!(matches!(rx.poll_recv(&mut cx), Poll::Pending));
-        assert_ne!(rx.local_occupancy[0], 0);
+        assert_eq!(rx.next_occupied(), Some(70));
+        assert_eq!(rx.next_occupied(), Some(2));
+        assert_eq!(rx.next_occupied(), None);
     }
 
     #[test]
@@ -493,6 +543,8 @@ mod tests {
 
     #[test]
     fn loom_concurrent_send_recv() {
+        use crate::testing::loom;
+
         loom::model(|| {
             let (mut tx0, mut rx) = new::<u32>(2);
             let waker = s2n_quic_core::task::waker::noop();

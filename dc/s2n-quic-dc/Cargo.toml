@@ -60,7 +60,6 @@ s2n-tls-tokio = "0.3"
 bolero = "0.13"
 bolero-generator = "0.13"
 insta = "1"
-loom = { version = "0.7", features = ["checkpoint", "futures"] }
 s2n-codec = { path = "../../common/s2n-codec", features = ["testing"] }
 s2n-quic = { path = "../../quic/s2n-quic" }
 s2n-quic-core = { path = "../../quic/s2n-quic-core", features = ["state-tracing", "testing"] }
@@ -68,6 +67,9 @@ s2n-quic-platform = { path = "../../quic/s2n-quic-platform", features = ["testin
 tokio = { version = "1", features = ["full", "test-util"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
+[target.'cfg(loom)'.dev-dependencies]
+loom = { version = "0.7", features = ["checkpoint", "futures"] }
+
 [lints.rust.unexpected_cfgs]
 level = "warn"
-check-cfg = ['cfg(future)', 'cfg(fuzzing)', 'cfg(kani)', 'cfg(todo)']
+check-cfg = ['cfg(future)', 'cfg(fuzzing)', 'cfg(kani)', 'cfg(loom)', 'cfg(todo)']
