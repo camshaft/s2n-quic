@@ -360,7 +360,6 @@ impl<A: intrusive_queue::Adapter> Receiver<A> {
             return None;
         }
 
-        debug_assert_ne!(bits, 0);
         let bit = bits.trailing_zeros() as usize;
         self.local_occupancy[word] &= !(1 << bit);
         let shard = word * u64::BITS as usize + bit;
@@ -375,7 +374,9 @@ impl<A: intrusive_queue::Adapter> Receiver<A> {
             return !0;
         }
 
-        let valid_bits = self.shared.shards.len() - (word * u64::BITS as usize);
+        let first_shard = word * u64::BITS as usize;
+        debug_assert!(first_shard < self.shared.shards.len());
+        let valid_bits = self.shared.shards.len() - first_shard;
         if valid_bits == u64::BITS as usize {
             !0
         } else {
