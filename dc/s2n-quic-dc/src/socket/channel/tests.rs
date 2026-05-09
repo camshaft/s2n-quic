@@ -334,12 +334,12 @@ fn flatten_drains_queue_then_fetches_next() {
 #[test]
 #[should_panic(expected = "shard count must be a non-zero power of two")]
 fn sharded_rejects_non_power_of_two_shards() {
-    let _ = intrusive_queue::sharded::new::<u32>(3);
+    let _ = super::intrusive_queue::sharded::new::<u32>(3);
 }
 
 #[test]
 fn sharded_drains_entire_shard() {
-    let (mut tx, mut rx) = intrusive_queue::sharded::new::<u32>(1);
+    let (mut tx, mut rx) = super::intrusive_queue::sharded::new::<u32>(1);
     let mut cx = noop_cx();
 
     assert!(matches!(rx.poll_recv(&mut cx), Poll::Pending));
@@ -358,7 +358,7 @@ fn sharded_drains_entire_shard() {
 
 #[test]
 fn sharded_sender_creation_selects_initial_shard() {
-    let (mut tx0, mut rx) = intrusive_queue::sharded::new::<u32>(4);
+    let (mut tx0, mut rx) = super::intrusive_queue::sharded::new::<u32>(4);
     let mut tx1 = tx0.clone();
     let mut tx2 = tx0.clone();
     let mut tx3 = tx0.clone();
@@ -385,7 +385,7 @@ fn sharded_sender_creation_selects_initial_shard() {
 
 #[test]
 fn sharded_sender_drop_closes_receiver() {
-    let (tx, mut rx) = intrusive_queue::sharded::new::<u32>(2);
+    let (tx, mut rx) = super::intrusive_queue::sharded::new::<u32>(2);
     let mut cx = noop_cx();
 
     assert!(matches!(rx.poll_recv(&mut cx), Poll::Pending));

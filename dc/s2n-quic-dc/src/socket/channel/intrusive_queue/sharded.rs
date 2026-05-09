@@ -57,7 +57,9 @@ pub fn new<T>(
     new_with_adapter::<intrusive_queue::EntryAdapter<T>>(shard_count)
 }
 
-pub fn new_with_adapter<A: intrusive_queue::Adapter>(shard_count: usize) -> (Sender<A>, Receiver<A>) {
+pub fn new_with_adapter<A: intrusive_queue::Adapter>(
+    shard_count: usize,
+) -> (Sender<A>, Receiver<A>) {
     assert!(
         shard_count.is_power_of_two(),
         "shard count must be a non-zero power of two"
@@ -203,34 +205,6 @@ impl<A: intrusive_queue::Adapter> super::super::Sender<A::Pointer> for Sender<A>
             Ok(()) => Poll::Ready(Ok(())),
             Err(value) => {
                 slot.write(value);
-                Poll::Ready(Err(()))
-            }
-        }
-    }
-}
-
-impl<A: intrusive_queue::Adapter> super::super::UnboundedSender<intrusive_queue::List<A>>
-    for Sender<A>
-{
-    #[inline(always)]
-    fn send(&mut self, list: intrusive_queue::List<A>) -> Result<(), intrusive_queue::List<A>> {
-        self.send_batch(list)
-    }
-}
-
-impl<A: intrusive_queue::Adapter> super::super::Sender<intrusive_queue::List<A>> for Sender<A> {
-    #[inline(always)]
-    fn poll_send(
-        &mut self,
-        _cx: &mut core::task::Context<'_>,
-        value: &mut core::mem::MaybeUninit<intrusive_queue::List<A>>,
-    ) -> Poll<Result<(), ()>> {
-        let list = unsafe { value.assume_init_read() };
-
-        match self.send_batch(list) {
-            Ok(()) => Poll::Ready(Ok(())),
-            Err(list) => {
-                value.write(list);
                 Poll::Ready(Err(()))
             }
         }
