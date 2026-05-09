@@ -328,24 +328,16 @@ impl Inner {
             )));
         }
 
-        // Check if we're in a terminal state
-        if self.status.is_reset() {
-            if let Some(error_code) = self.reset_error_code {
-                let reset_error: ResetError = error_code.into();
-                return Poll::Ready(Err(io::Error::new(
-                    io::ErrorKind::ConnectionReset,
-                    reset_error,
-                )));
-            }
-            return Poll::Ready(Err(io::ErrorKind::ConnectionReset.into()));
-        }
-
         if self.status.is_complete() {
             return Poll::Ready(Ok(0));
         }
 
-        // Process incoming messages to fill the reassembler
-        let _ = self.poll_stream_rx(cx)?;
+        // Process incoming messages to fill the reassembler unless we've already been reset.
+        let stream_rx_result = if self.status.is_reset() {
+            Poll::Ready(Ok(()))
+        } else {
+            self.poll_stream_rx(cx)
+        };
 
         // Copy from reassembler into destination buffer
         let bytes_read = if buf.remaining_capacity() > 0 {
@@ -356,7 +348,9 @@ impl Inner {
             0
         };
 
-        self.maybe_send_max_data()?;
+        if !self.status.is_reset() {
+            self.maybe_send_max_data()?;
+        }
 
         if self.reassembler.is_reading_complete() {
             debug!(
@@ -370,9 +364,17 @@ impl Inner {
         }
 
         if bytes_read > 0 {
-            Poll::Ready(Ok(bytes_read))
-        } else {
-            Poll::Pending
+            return Poll::Ready(Ok(bytes_read));
+        }
+
+        if self.status.is_reset() {
+            return Poll::Ready(Err(self.reset_error()));
+        }
+
+        match stream_rx_result {
+            Poll::Ready(Ok(())) => Poll::Pending,
+            Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
+            Poll::Pending => Poll::Pending,
         }
     }
 
@@ -530,6 +532,16 @@ impl Inner {
         Ok(())
     }
 
+    #[inline]
+    fn reset_error(&self) -> io::Error {
+        if let Some(error_code) = self.reset_error_code {
+            let reset_error: ResetError = error_code.into();
+            io::Error::new(io::ErrorKind::ConnectionReset, reset_error)
+        } else {
+            io::ErrorKind::ConnectionReset.into()
+        }
+    }
+
     /// Send a MAX_DATA frame to the peer
     fn send_max_data(&mut self, maximum_data: VarInt) -> io::Result<()> {
         use s2n_codec::EncoderValue;
@@ -667,6 +679,59 @@ impl Drop for Reader {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::stream2::endpoint::{reset_error, ControlMsg};
+    use bytes::BytesMut;
+    use s2n_quic_core::varint::VarInt;
+    use std::{task::Waker, vec::Vec};
+
+    #[test]
+    fn delivers_buffered_data_before_reset_error() {
+        let stream_id = VarInt::from_u8(1);
+        let path_secret_entry = PathSecretEntry::fake("127.0.0.1:4433".parse().unwrap(), None);
+        let handle = flow::Handle::client(stream_id, path_secret_entry.clone());
+
+        let mut allocator = flow::queue::Allocator::<StreamMsg, ControlMsg, flow::Handle>::new();
+        let (_control_rx, stream_rx) = allocator.alloc_or_grow(handle, None);
+
+        stream_rx.push(
+            StreamMsg::Data {
+                offset: VarInt::ZERO,
+                fin: false,
+                payload: BytesMut::from(&b"hello"[..]),
+            }
+            .into(),
+        );
+        stream_rx.push(
+            StreamMsg::Reset {
+                error_code: reset_error::ABNORMAL_TERMINATION,
+            }
+            .into(),
+        );
+
+        let (wheel_tx, _wheel_rx) = channel::intrusive_queue::sync::new();
+        let mut reader = Reader::new_client(wheel_tx, path_secret_entry, stream_id, stream_rx);
+        let mut cx = Context::from_waker(Waker::noop());
+
+        let mut first = Vec::new();
+        let read = match reader.poll_read_into(&mut cx, &mut first) {
+            Poll::Ready(Ok(len)) => len,
+            other => panic!("expected first read to succeed, got {other:?}"),
+        };
+        assert_eq!(read, 5);
+        assert_eq!(first, b"hello");
+
+        let mut second = Vec::new();
+        let err = match reader.poll_read_into(&mut cx, &mut second) {
+            Poll::Ready(Err(err)) => err,
+            other => panic!("expected second read to return reset error, got {other:?}"),
+        };
+        assert_eq!(err.kind(), io::ErrorKind::ConnectionReset);
     }
 }
 
