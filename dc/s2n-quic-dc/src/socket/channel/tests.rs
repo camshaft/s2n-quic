@@ -331,6 +331,68 @@ fn flatten_drains_queue_then_fetches_next() {
     });
 }
 
+#[test]
+#[should_panic(expected = "shard count must be a non-zero power of two")]
+fn sharded_rejects_non_power_of_two_shards() {
+    let _ = intrusive_queue::sharded::new::<u32>(3);
+}
+
+#[test]
+fn sharded_drains_entire_shard() {
+    let (mut tx, mut rx) = intrusive_queue::sharded::new::<u32>(1);
+    let mut cx = noop_cx();
+
+    assert!(matches!(rx.poll_recv(&mut cx), Poll::Pending));
+
+    UnboundedSender::send(&mut tx, intrusive_queue::Entry::new(1)).unwrap();
+    UnboundedSender::send(&mut tx, intrusive_queue::Entry::new(2)).unwrap();
+    UnboundedSender::send(&mut tx, intrusive_queue::Entry::new(3)).unwrap();
+
+    let Poll::Ready(Some(list)) = rx.poll_recv(&mut cx) else {
+        panic!("expected drained list");
+    };
+    assert_eq!(list.iter().copied().collect::<Vec<_>>(), vec![1, 2, 3]);
+
+    assert!(matches!(rx.poll_recv(&mut cx), Poll::Pending));
+}
+
+#[test]
+fn sharded_sender_creation_selects_initial_shard() {
+    let (mut tx0, mut rx) = intrusive_queue::sharded::new::<u32>(4);
+    let mut tx1 = tx0.clone();
+    let mut tx2 = tx0.clone();
+    let mut tx3 = tx0.clone();
+    let mut cx = noop_cx();
+
+    assert!(matches!(rx.poll_recv(&mut cx), Poll::Pending));
+
+    UnboundedSender::send(&mut tx3, intrusive_queue::Entry::new(3)).unwrap();
+    UnboundedSender::send(&mut tx2, intrusive_queue::Entry::new(2)).unwrap();
+    UnboundedSender::send(&mut tx1, intrusive_queue::Entry::new(1)).unwrap();
+    UnboundedSender::send(&mut tx0, intrusive_queue::Entry::new(0)).unwrap();
+
+    let mut values = vec![];
+    for _ in 0..4 {
+        let Poll::Ready(Some(list)) = rx.poll_recv(&mut cx) else {
+            panic!("expected drained list");
+        };
+        assert_eq!(list.len(), 1);
+        values.push(*list.front().unwrap());
+    }
+
+    assert_eq!(values, vec![0, 1, 2, 3]);
+}
+
+#[test]
+fn sharded_sender_drop_closes_receiver() {
+    let (tx, mut rx) = intrusive_queue::sharded::new::<u32>(2);
+    let mut cx = noop_cx();
+
+    assert!(matches!(rx.poll_recv(&mut cx), Poll::Pending));
+    drop(tx);
+    assert!(matches!(rx.poll_recv(&mut cx), Poll::Ready(None)));
+}
+
 // ── YieldAfter tests ────────────────────────────────────────────────
 
 struct AssertSend<F>(F);
