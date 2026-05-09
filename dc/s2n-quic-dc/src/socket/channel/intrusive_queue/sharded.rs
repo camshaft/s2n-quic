@@ -45,6 +45,18 @@ impl<A: intrusive_queue::Adapter> Shared<A> {
     }
 
     #[inline(always)]
+    fn set_occupied(&self, shard: usize) {
+        let (word, bit) = Self::bit(shard);
+        self.occupancy[word].fetch_or(bit, Ordering::Release);
+    }
+
+    #[inline(always)]
+    fn clear_occupied(&self, shard: usize) {
+        let (word, bit) = Self::bit(shard);
+        self.occupancy[word].fetch_and(!bit, Ordering::AcqRel);
+    }
+
+    #[inline(always)]
     fn wake_receiver(&self) {
         if let Some(waker) = self.recv_waker.get() {
             waker.wake_by_ref();
@@ -90,7 +102,7 @@ pub fn new_with_adapter<A: intrusive_queue::Adapter>(
     let shared = Arc::new(Shared {
         is_open: AtomicBool::new(true),
         sender_count: AtomicUsize::new(1),
-        next_sender_shard: AtomicUsize::new(sender_stride),
+        next_sender_shard: AtomicUsize::new(0),
         sender_stride,
         shard_mask: shard_count - 1,
         occupancy,
@@ -99,7 +111,7 @@ pub fn new_with_adapter<A: intrusive_queue::Adapter>(
     });
 
     let sender = Sender {
-        next_shard: 0,
+        next_shard: shared.allocate_sender_shard(),
         shared: shared.clone(),
     };
     let receiver = Receiver {
@@ -153,8 +165,7 @@ impl<A: intrusive_queue::Adapter> Sender<A> {
         drop(queue);
 
         if was_empty {
-            let (word, bit) = Shared::<A>::bit(shard);
-            self.shared.occupancy[word].fetch_or(bit, Ordering::Release);
+            self.shared.set_occupied(shard);
             self.shared.wake_receiver();
         }
 
@@ -180,8 +191,7 @@ impl<A: intrusive_queue::Adapter> Sender<A> {
         drop(queue);
 
         if was_empty {
-            let (word, bit) = Shared::<A>::bit(shard);
-            self.shared.occupancy[word].fetch_or(bit, Ordering::Release);
+            self.shared.set_occupied(shard);
             self.shared.wake_receiver();
         }
 
@@ -255,7 +265,7 @@ impl<A: intrusive_queue::Adapter> Receiver<A> {
             if queue.is_empty() {
                 // Clear while holding the shard lock so a sender cannot enqueue before the bit
                 // is cleared.
-                self.shared.occupancy[word].fetch_and(!bit, Ordering::AcqRel);
+                self.shared.clear_occupied(shard);
                 drop(queue);
                 continue;
             }
@@ -263,7 +273,7 @@ impl<A: intrusive_queue::Adapter> Receiver<A> {
             let list = core::mem::take(&mut *queue);
             // Clear while holding the shard lock so any following sender observes an empty queue
             // and sets the bit again after enqueueing.
-            self.shared.occupancy[word].fetch_and(!bit, Ordering::AcqRel);
+            self.shared.clear_occupied(shard);
             drop(queue);
             self.next_shard = (shard + 1) & self.shared.shard_mask;
             return Some(list);
