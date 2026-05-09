@@ -593,15 +593,15 @@ mod tests {
             let receiver = loom::thread::spawn(move || {
                 loom::future::block_on(async move {
                     let mut rx = rx;
-                    let mut registered = false;
                     let mut received = vec![];
 
                     loop {
                         let item = core::future::poll_fn(|cx| {
-                            if !registered {
+                            if !registered_flag.load(Ordering::Acquire) {
                                 rx.register(cx.waker());
+                                // Publish receiver waker registration before the main thread
+                                // exposes senders to concurrent sender threads.
                                 registered_flag.store(true, Ordering::Release);
-                                registered = true;
                             }
 
                             rx.poll_recv(cx)
