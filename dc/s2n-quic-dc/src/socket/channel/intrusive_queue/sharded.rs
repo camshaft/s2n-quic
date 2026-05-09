@@ -37,7 +37,7 @@ impl<A: intrusive_queue::Adapter> Shared<A> {
     }
 
     #[inline(always)]
-    fn bit(shard: usize) -> (usize, u64) {
+    fn occupancy_word_and_bit(shard: usize) -> (usize, u64) {
         // Map a shard index to its occupancy word and bit in the bitmap.
         let word = shard / u64::BITS as usize;
         let bit = 1 << (shard % u64::BITS as usize);
@@ -46,13 +46,13 @@ impl<A: intrusive_queue::Adapter> Shared<A> {
 
     #[inline(always)]
     fn set_occupied(&self, shard: usize) {
-        let (word, bit) = Self::bit(shard);
+        let (word, bit) = Self::occupancy_word_and_bit(shard);
         self.occupancy[word].fetch_or(bit, Ordering::Release);
     }
 
     #[inline(always)]
     fn clear_occupied(&self, shard: usize) {
-        let (word, bit) = Self::bit(shard);
+        let (word, bit) = Self::occupancy_word_and_bit(shard);
         self.occupancy[word].fetch_and(!bit, Ordering::AcqRel);
     }
 
@@ -218,6 +218,7 @@ impl<A: intrusive_queue::Adapter> super::super::Sender<A::Pointer> for Sender<A>
             return Poll::Ready(Err(()));
         }
 
+        // SAFETY: the Sender trait requires callers to provide an initialized slot.
         let value = unsafe { slot.assume_init_read() };
         match <Self as super::super::UnboundedSender<A::Pointer>>::send(self, value) {
             Ok(()) => Poll::Ready(Ok(())),
@@ -255,7 +256,7 @@ impl<A: intrusive_queue::Adapter> Receiver<A> {
 
         for offset in 0..shard_count {
             let shard = (self.next_shard + offset) & self.shared.shard_mask;
-            let (word, bit) = Shared::<A>::bit(shard);
+            let (word, bit) = Shared::<A>::occupancy_word_and_bit(shard);
 
             if self.shared.occupancy[word].load(Ordering::Acquire) & bit == 0 {
                 continue;
@@ -290,6 +291,7 @@ impl<A: intrusive_queue::Adapter> super::super::Receiver<intrusive_queue::List<A
         cx: &mut core::task::Context<'_>,
     ) -> Poll<Option<intrusive_queue::List<A>>> {
         if self.shared.recv_waker.get().is_none() {
+            // A concurrent first registration is harmless: OnceLock accepts only one waker.
             self.register(cx.waker());
         }
 
