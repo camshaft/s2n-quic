@@ -60,6 +60,7 @@ s2n-tls-tokio = "0.3"
 bolero = "0.13"
 bolero-generator = "0.13"
 insta = "1"
+loom = { version = "0.7", features = ["checkpoint", "futures"] }
 s2n-codec = { path = "../../common/s2n-codec", features = ["testing"] }
 s2n-quic = { path = "../../quic/s2n-quic" }
 s2n-quic-core = { path = "../../quic/s2n-quic-core", features = ["state-tracing", "testing"] }
