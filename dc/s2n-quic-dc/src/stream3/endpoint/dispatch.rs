@@ -294,7 +294,7 @@ fn handle_flow_init(
                              pending_validation: bool| {
         let payload = initial_payload
             .take()
-            .expect("internal error: flow init payload consumed more than once");
+            .expect("internal error: create_stream called more than once for a single FlowInit");
         if is_fin || !payload.is_empty() {
             queue_stream.push(
                 msg::Stream::Data {
