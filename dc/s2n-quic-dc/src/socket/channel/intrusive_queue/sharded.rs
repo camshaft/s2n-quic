@@ -5,6 +5,7 @@
 //!
 //! The sender has no backpressure - it can always push entries to one of the
 //! shards. The receiver drains one shard at a time, returning the entire list.
+//! Receivers are expected to register their waker once before exposing senders.
 
 use crate::intrusive_queue;
 use core::{
@@ -51,6 +52,14 @@ impl<A: intrusive_queue::Adapter> Shared<A> {
     }
 }
 
+#[inline(always)]
+fn sender_stride(shard_count: usize) -> usize {
+    // Start near half the shard count to spread consecutive senders apart, then force the result
+    // to be odd. Odd values are coprime with power-of-two shard counts, so each sender walks every
+    // shard before repeating.
+    ((shard_count / 2).saturating_sub(1)) | 1
+}
+
 pub fn new<T>(
     shard_count: usize,
 ) -> (
@@ -77,9 +86,7 @@ pub fn new_with_adapter<A: intrusive_queue::Adapter>(
         .map(|_| Mutex::new(intrusive_queue::List::new()))
         .collect::<Vec<_>>()
         .into_boxed_slice();
-    // Use a value near half the shard count, then force it odd. Odd values are coprime with
-    // power-of-two shard counts, so each sender walks every shard before repeating.
-    let sender_stride = ((shard_count / 2).saturating_sub(1)) | 1;
+    let sender_stride = sender_stride(shard_count);
     let shared = Arc::new(Shared {
         is_open: AtomicBool::new(true),
         sender_count: AtomicUsize::new(1),
@@ -224,9 +231,11 @@ impl<A: intrusive_queue::Adapter> Drop for Receiver<A> {
 }
 
 impl<A: intrusive_queue::Adapter> Receiver<A> {
+    /// Registers the receiver waker.
+    ///
+    /// This channel expects the receiver to register once before exposing senders. Subsequent
+    /// registrations are ignored.
     pub fn register(&self, waker: &Waker) {
-        // This channel is intended for receivers that register once before exposing senders.
-        // Subsequent registrations are ignored.
         let _ = self.shared.recv_waker.set(waker.clone());
     }
 
