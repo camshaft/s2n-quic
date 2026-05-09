@@ -609,7 +609,7 @@ mod tests {
                                     UNREGISTERED,
                                     REGISTERING,
                                     Ordering::AcqRel,
-                                    Ordering::Relaxed,
+                                    Ordering::Acquire,
                                 )
                                 .is_ok()
                             {
@@ -635,6 +635,7 @@ mod tests {
             });
 
             while registered.load(Ordering::Acquire) != REGISTERED {
+                loom::hint::spin_loop();
                 loom::thread::yield_now();
             }
 
