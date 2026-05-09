@@ -291,8 +291,10 @@ impl<A: intrusive_queue::Adapter> Receiver<A> {
 
     #[inline(always)]
     fn try_recv(&mut self) -> TryRecv<A> {
-        // Only consume one occupied bit per receive attempt. A set bit pointing at an empty shard
-        // is considered stale/buggy state, so don't keep scanning for another shard here.
+        // Only consume one occupied bit per receive attempt. A set bit should only point at an
+        // empty shard if occupancy bookkeeping is stale, e.g. the receiver already drained the
+        // shard without clearing every local/shared bit for it, so don't keep scanning for another
+        // shard here.
         if let Some(shard) = self.next_occupied() {
             let mut queue = lock(&self.shared.shards[shard]);
             debug_assert!(
@@ -300,9 +302,9 @@ impl<A: intrusive_queue::Adapter> Receiver<A> {
                 "occupancy bit set for an empty shard"
             );
 
-            // In release builds, preserve the receive contract by returning the list even if a
-            // stale occupancy bit points at an empty shard. The debug assertion above catches that
-            // state during testing.
+            // In release builds, preserve the receive contract by returning a valid list, even if
+            // it is empty, instead of continuing to scan for a non-empty shard. The debug assertion
+            // above catches stale occupancy during testing.
             let list = core::mem::take(&mut queue.queue);
             return TryRecv::Ready(list);
         }
