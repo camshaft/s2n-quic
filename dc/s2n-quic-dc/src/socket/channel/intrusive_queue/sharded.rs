@@ -29,6 +29,7 @@ struct Shared<A: intrusive_queue::Adapter> {
     sender_stride: usize,
     shard_mask: usize,
     occupancy: Box<[AtomicU64]>,
+    // Initialized to a noop waker and updated by the receiver before senders are exposed.
     recv_waker: UnsafeCell<Waker>,
     shards: Box<[Mutex<Shard<A>>]>,
 }
@@ -107,10 +108,7 @@ pub fn new_with_adapter<A: intrusive_queue::Adapter>(
         .map(|_| AtomicU64::new(0))
         .collect::<Vec<_>>()
         .into_boxed_slice();
-    let local_occupancy = (0..occupancy_len)
-        .map(|_| 0)
-        .collect::<Vec<_>>()
-        .into_boxed_slice();
+    let local_occupancy = vec![0; occupancy_len].into_boxed_slice();
     let shards = (0..shard_count)
         .map(|_| {
             Mutex::new(Shard {
@@ -356,8 +354,8 @@ mod tests {
 
     fn noop_cx() -> core::task::Context<'static> {
         let waker = s2n_quic_core::task::waker::noop();
-        let waker = Box::leak(Box::new(waker));
-        core::task::Context::from_waker(waker)
+        let waker_ref = Box::leak(Box::new(waker));
+        core::task::Context::from_waker(waker_ref)
     }
 
     fn list(values: impl IntoIterator<Item = u32>) -> Queue<u32> {
@@ -473,6 +471,7 @@ mod tests {
         loom::model(|| {
             let (mut tx0, mut rx) = new::<u32>(2);
             let waker = s2n_quic_core::task::waker::noop();
+            // Register before cloning/exposing senders so sender wakeups only read the waker.
             rx.register(&waker);
             let mut tx1 = tx0.clone();
 
