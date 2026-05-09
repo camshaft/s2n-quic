@@ -319,7 +319,12 @@ impl<A: intrusive_queue::Adapter> Receiver<A> {
         }
 
         for offset in 1..word_count {
-            let word = (start_word + offset) % word_count;
+            let word = start_word + offset;
+            let word = if word >= word_count {
+                word - word_count
+            } else {
+                word
+            };
             if let Some(shard) = self.next_occupied_in_word(word, self.valid_word_mask(word)) {
                 return Some(shard);
             }
@@ -357,7 +362,7 @@ impl<A: intrusive_queue::Adapter> Receiver<A> {
         let bit = bits.trailing_zeros() as usize;
         self.local_occupancy[word] &= !(1 << bit);
         let shard = word * u64::BITS as usize + bit;
-        self.next_shard = (shard + 1) % self.shared.shards.len();
+        self.next_shard = (shard + 1) & self.shared.shard_mask;
         Some(shard)
     }
 
