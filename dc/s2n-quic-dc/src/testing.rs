@@ -1,23 +1,17 @@
 // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-#[cfg(not(loom))]
 use crate::{
     event,
     path::secret::{stateless_reset::Signer, Map},
     psk::{client, server},
 };
-#[cfg(not(loom))]
 use s2n_quic::{provider::tls::Provider, server::Name};
-#[cfg(not(loom))]
 use s2n_quic_core::{crypto::tls::testing::certificates, time::StdClock};
-#[cfg(not(loom))]
 use std::{sync::OnceLock, time::Duration};
 
-#[cfg(not(loom))]
 pub use bach::{ext, rand};
 
-#[cfg(not(loom))]
 use s2n_quic::provider::tls::default as s2n_quic_tls_prov;
 
 #[cfg(all(test, not(loom)))]
@@ -69,16 +63,13 @@ pub mod loom {
 #[cfg(all(test, loom))]
 pub use loom;
 
-#[cfg(not(loom))]
 pub static SNI: OnceLock<Name> = OnceLock::new();
 
 #[doc(hidden)]
-#[cfg(not(loom))]
 pub fn server_name() -> Name {
     SNI.get_or_init(|| "localhost".into()).clone()
 }
 
-#[cfg(not(loom))]
 pub mod task {
     pub use bach::task::*;
     pub use tokio::task::yield_now;
@@ -108,10 +99,8 @@ pub mod task {
     }
 }
 
-#[cfg(not(loom))]
 pub use task::spawn;
 
-#[cfg(not(loom))]
 pub async fn sleep(duration: Duration) {
     if bach::is_active() {
         bach::time::sleep(duration).await;
@@ -120,7 +109,6 @@ pub async fn sleep(duration: Duration) {
     }
 }
 
-#[cfg(not(loom))]
 pub async fn timeout<F>(duration: Duration, f: F) -> Result<F::Output, bach::time::error::Elapsed>
 where
     F: core::future::Future,
@@ -132,20 +120,13 @@ where
     }
 }
 
-#[cfg(not(loom))]
 pub fn assert_debug<T: core::fmt::Debug>(_v: &T) {}
-#[cfg(not(loom))]
 pub fn assert_send<T: Send>(_v: &T) {}
-#[cfg(not(loom))]
 pub fn assert_sync<T: Sync>(_v: &T) {}
-#[cfg(not(loom))]
 pub fn assert_static<T: 'static>(_v: &T) {}
-#[cfg(not(loom))]
 pub fn assert_async_read<T: tokio::io::AsyncRead>(_v: &T) {}
-#[cfg(not(loom))]
 pub fn assert_async_write<T: tokio::io::AsyncWrite>(_v: &T) {}
 
-#[cfg(not(loom))]
 pub fn init_tracing() {
     if cfg!(any(miri, fuzzing)) {
         return;
@@ -186,7 +167,6 @@ pub fn init_tracing() {
     });
 }
 
-#[cfg(not(loom))]
 pub fn without_tracing<F: FnOnce() -> T, T>(f: F) -> T {
     // make sure the global subscriber is initialized before setting a local one
     init_tracing();
@@ -202,11 +182,9 @@ pub fn without_tracing<F: FnOnce() -> T, T>(f: F) -> T {
 }
 
 #[derive(Default)]
-#[cfg(not(loom))]
 struct Uptime(tracing_subscriber::fmt::time::SystemTime);
 
 // Generate the timestamp from the testing IO provider rather than wall clock.
-#[cfg(not(loom))]
 impl tracing_subscriber::fmt::time::FormatTime for Uptime {
     fn format_time(&self, w: &mut tracing_subscriber::fmt::format::Writer<'_>) -> std::fmt::Result {
         if bach::is_active() {
@@ -224,7 +202,6 @@ impl tracing_subscriber::fmt::time::FormatTime for Uptime {
 }
 
 /// Runs a function in a deterministic, discrete event simulation environment
-#[cfg(not(loom))]
 pub fn sim(f: impl FnOnce()) {
     init_tracing();
 
@@ -236,12 +213,10 @@ pub fn sim(f: impl FnOnce()) {
 }
 
 #[derive(Clone, Default)]
-#[cfg(not(loom))]
 pub struct NoopSubscriber;
 
 // Need to implement both s2n-quic-dc::event::Subscriber and s2n-quic-core::event::Subscriber
 // to fulfill the trait bounds for both client::Provider and server::Provider
-#[cfg(not(loom))]
 impl crate::event::Subscriber for NoopSubscriber {
     type ConnectionContext = ();
 
@@ -253,7 +228,6 @@ impl crate::event::Subscriber for NoopSubscriber {
     }
 }
 
-#[cfg(not(loom))]
 impl s2n_quic_core::event::Subscriber for NoopSubscriber {
     type ConnectionContext = ();
 
@@ -266,10 +240,8 @@ impl s2n_quic_core::event::Subscriber for NoopSubscriber {
 }
 
 #[derive(Default, Clone)]
-#[cfg(not(loom))]
 pub struct TestTlsProvider {}
 
-#[cfg(not(loom))]
 impl Provider for TestTlsProvider {
     type Server = s2n_quic_tls_prov::Server;
     type Client = s2n_quic_tls_prov::Client;
@@ -293,13 +265,11 @@ impl Provider for TestTlsProvider {
 }
 
 #[derive(Clone, Debug, Default)]
-#[cfg(not(loom))]
 pub struct Pair {
     pub client_mtu: Option<u16>,
     pub server_mtu: Option<u16>,
 }
 
-#[cfg(not(loom))]
 impl Pair {
     fn server(&self) -> server::Builder<impl s2n_quic_core::event::Subscriber> {
         let mut server = server::Provider::builder();
@@ -415,27 +385,22 @@ impl Pair {
     }
 }
 
-#[cfg(not(loom))]
 pub fn pair_sync() -> (client::Provider, server::Provider) {
     Pair::default().build_sync()
 }
 
-#[cfg(not(loom))]
 pub fn send_busy_poll() -> crate::busy_poll::Pool {
     static POOL: BusyPool = BusyPool::new();
     POOL.get()
 }
 
-#[cfg(not(loom))]
 pub fn recv_busy_poll() -> crate::busy_poll::Pool {
     static POOL: BusyPool = BusyPool::new();
     POOL.get()
 }
 
-#[cfg(not(loom))]
 struct BusyPool(std::sync::OnceLock<crate::busy_poll::Pool>);
 
-#[cfg(not(loom))]
 impl BusyPool {
     const fn new() -> Self {
         Self(std::sync::OnceLock::new())

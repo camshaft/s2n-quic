@@ -585,7 +585,7 @@ mod tests {
     fn loom_concurrent_send_recv() {
         use crate::testing::loom;
 
-        fn scenario() {
+        loom::model(|| {
             let (mut tx0, rx) = new::<u32>(2);
             let registered =
                 loom::sync::Arc::new((loom::sync::Mutex::new(false), loom::sync::Condvar::new()));
@@ -633,16 +633,6 @@ mod tests {
             a.join().unwrap();
             b.join().unwrap();
             receiver.join().unwrap();
-        }
-
-        #[cfg(loom)]
-        {
-            let mut model = loom::model::Builder::new();
-            model.preemption_bound = Some(2);
-            model.check(scenario);
-        }
-
-        #[cfg(not(loom))]
-        loom::model(scenario);
+        });
     }
 }
