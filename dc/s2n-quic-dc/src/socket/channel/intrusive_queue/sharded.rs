@@ -28,6 +28,8 @@ struct Shared<A: intrusive_queue::Adapter> {
 impl<A: intrusive_queue::Adapter> Shared<A> {
     #[inline(always)]
     fn allocate_sender_shard(&self) -> usize {
+        // Sender start positions intentionally wrap around the shard mask once there are more
+        // senders than shards.
         self.next_sender_shard
             .fetch_add(self.sender_stride, Ordering::Relaxed)
             & self.shard_mask
@@ -144,10 +146,8 @@ impl<A: intrusive_queue::Adapter> Sender<A> {
 
         if was_empty {
             let (word, bit) = Shared::<A>::bit(shard);
-            let old = self.shared.occupancy[word].fetch_or(bit, Ordering::Release);
-            if old & bit == 0 {
-                self.shared.wake_receiver();
-            }
+            self.shared.occupancy[word].fetch_or(bit, Ordering::Release);
+            self.shared.wake_receiver();
         }
 
         Ok(())
@@ -173,10 +173,8 @@ impl<A: intrusive_queue::Adapter> Sender<A> {
 
         if was_empty {
             let (word, bit) = Shared::<A>::bit(shard);
-            let old = self.shared.occupancy[word].fetch_or(bit, Ordering::Release);
-            if old & bit == 0 {
-                self.shared.wake_receiver();
-            }
+            self.shared.occupancy[word].fetch_or(bit, Ordering::Release);
+            self.shared.wake_receiver();
         }
 
         Ok(())
