@@ -588,8 +588,13 @@ mod tests {
         use crate::testing::loom;
 
         loom::model(|| {
+            const UNREGISTERED: usize = 0;
+            const REGISTERING: usize = 1;
+            const REGISTERED: usize = 2;
+
             let (mut tx0, rx) = new::<u32>(2);
-            let registered = loom::sync::Arc::new(loom::sync::atomic::AtomicUsize::new(0));
+            let registered =
+                loom::sync::Arc::new(loom::sync::atomic::AtomicUsize::new(UNREGISTERED));
             let registered_flag = registered.clone();
 
             let receiver = loom::thread::spawn(move || {
@@ -600,13 +605,18 @@ mod tests {
                     loop {
                         let item = core::future::poll_fn(|cx| {
                             if registered_flag
-                                .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+                                .compare_exchange(
+                                    UNREGISTERED,
+                                    REGISTERING,
+                                    Ordering::AcqRel,
+                                    Ordering::Relaxed,
+                                )
                                 .is_ok()
                             {
                                 rx.register(cx.waker());
                                 // Publish receiver waker registration before the main thread
                                 // exposes senders to concurrent sender threads.
-                                registered_flag.store(2, Ordering::Release);
+                                registered_flag.store(REGISTERED, Ordering::Release);
                             }
 
                             rx.poll_recv(cx)
@@ -624,7 +634,7 @@ mod tests {
                 });
             });
 
-            while registered.load(Ordering::Acquire) != 2 {
+            while registered.load(Ordering::Acquire) != REGISTERED {
                 loom::thread::yield_now();
             }
 
