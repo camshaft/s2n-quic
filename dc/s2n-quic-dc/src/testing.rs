@@ -16,7 +16,7 @@ use s2n_quic::provider::tls::default as s2n_quic_tls_prov;
 
 #[cfg(all(test, not(loom)))]
 pub mod loom {
-    pub use std::*;
+    pub use std::thread;
 
     pub fn model<F: 'static + FnOnce() -> R, R>(f: F) -> R {
         f()

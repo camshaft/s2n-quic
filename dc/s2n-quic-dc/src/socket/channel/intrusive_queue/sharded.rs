@@ -333,7 +333,7 @@ impl<A: intrusive_queue::Adapter> Receiver<A> {
             }
         }
 
-        self.next_shard = start_shard & (shard_count - 1);
+        self.next_shard = start_shard % shard_count;
         None
     }
 
