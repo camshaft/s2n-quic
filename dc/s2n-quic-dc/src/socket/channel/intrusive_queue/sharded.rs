@@ -10,7 +10,7 @@
 use crate::intrusive_queue;
 use core::{
     cell::UnsafeCell,
-    sync::atomic::{AtomicU64, AtomicUsize, Ordering},
+    sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     task::{Poll, Waker},
 };
 use parking_lot::Mutex;
@@ -29,6 +29,7 @@ struct Shared<A: intrusive_queue::Adapter> {
     sender_stride: usize,
     shard_mask: usize,
     occupancy: Box<[AtomicU64]>,
+    waker_registered: AtomicBool,
     // Initialized to a noop waker and updated by the receiver before senders are exposed.
     recv_waker: UnsafeCell<Waker>,
     shards: Box<[Mutex<Shard<A>>]>,
@@ -126,6 +127,7 @@ pub fn new_with_adapter<A: intrusive_queue::Adapter>(
         sender_stride,
         shard_mask: shard_count - 1,
         occupancy,
+        waker_registered: AtomicBool::new(false),
         recv_waker: UnsafeCell::new(s2n_quic_core::task::waker::noop()),
         shards,
     });
@@ -180,6 +182,11 @@ impl<A: intrusive_queue::Adapter> Sender<A> {
         &mut self,
         mut list: intrusive_queue::List<A>,
     ) -> Result<(), intrusive_queue::List<A>> {
+        debug_assert!(
+            self.shared.waker_registered.load(Ordering::Acquire),
+            "receiver waker must be registered before exposing senders"
+        );
+
         if list.is_empty() {
             return Ok(());
         }
@@ -255,11 +262,10 @@ impl<A: intrusive_queue::Adapter> Receiver<A> {
         // SAFETY: callers must complete registration before cloning or exposing senders. After
         // that point, senders may concurrently read the waker.
         unsafe {
-            let slot = self.shared.recv_waker.get();
-            let old_waker = core::ptr::read(slot);
-            core::ptr::write(slot, waker.clone());
+            let old_waker = core::mem::replace(&mut *self.shared.recv_waker.get(), waker.clone());
             drop(old_waker);
         }
+        self.shared.waker_registered.store(true, Ordering::Release);
     }
 
     #[inline(always)]
@@ -366,6 +372,11 @@ mod tests {
         core::task::Context::from_waker(waker_ref)
     }
 
+    fn register<A: intrusive_queue::Adapter>(rx: &mut Receiver<A>) {
+        let waker = s2n_quic_core::task::waker::noop();
+        rx.register(&waker);
+    }
+
     fn list(values: impl IntoIterator<Item = u32>) -> Queue<u32> {
         let mut list = Queue::new();
         for value in values {
@@ -388,6 +399,7 @@ mod tests {
     fn drains_entire_shard() {
         let (mut tx, mut rx) = new::<u32>(1);
         let mut cx = noop_cx();
+        register(&mut rx);
 
         assert!(matches!(rx.poll_recv(&mut cx), Poll::Pending));
 
@@ -404,6 +416,7 @@ mod tests {
     #[test]
     fn sender_creation_selects_initial_shard() {
         let (mut tx0, mut rx) = new::<u32>(4);
+        register(&mut rx);
         let mut tx1 = tx0.clone();
         let mut tx2 = tx0.clone();
         let mut tx3 = tx0.clone();
@@ -432,6 +445,7 @@ mod tests {
     fn sender_round_robins_locally_by_one() {
         let (mut tx, mut rx) = new::<u32>(4);
         let mut cx = noop_cx();
+        register(&mut rx);
 
         for value in 0..4 {
             tx.send(list([value])).unwrap();
@@ -470,7 +484,8 @@ mod tests {
 
     #[test]
     fn receiver_drop_closes_sender() {
-        let (mut tx, rx) = new::<u32>(2);
+        let (mut tx, mut rx) = new::<u32>(2);
+        register(&mut rx);
         drop(rx);
 
         assert_eq!(tx.send(list([1])).unwrap_err().len(), 1);
