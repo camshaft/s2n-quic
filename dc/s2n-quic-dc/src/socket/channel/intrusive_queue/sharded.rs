@@ -169,6 +169,8 @@ impl<A: intrusive_queue::Adapter> Sender<A> {
     #[inline(always)]
     fn next_shard(&mut self) -> usize {
         let shard = self.next_shard;
+        // The creation-time stride spreads senders out; each sender then walks adjacent shards to
+        // avoid repeatedly colliding with other senders using the same stride.
         self.next_shard = (shard + 1) & self.shared.shard_mask;
         shard
     }
@@ -452,6 +454,8 @@ mod tests {
         let (_tx, mut rx) = new::<u32>(MAX_SHARDS_PER_POLL * 2);
         let mut cx = noop_cx();
 
+        // Simulate a stale receiver-local occupancy snapshot for more shards than one poll is
+        // allowed to scan, without having to enqueue into every shard.
         rx.local_occupancy[0] = !0;
 
         assert!(matches!(rx.poll_recv(&mut cx), Poll::Pending));
