@@ -35,10 +35,13 @@ use std::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
     },
-    task::{Context, RawWaker, RawWakerVTable, Waker},
+    task::{Context, Waker},
     thread,
     time::{Duration, Instant},
 };
+
+#[global_allocator]
+static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 // ── CLI ───────────────────────────────────────────────────────────────────────
 
@@ -183,35 +186,10 @@ fn usage_and_exit(message: &str) -> ! {
     std::process::exit(if message.is_empty() { 0 } else { 2 });
 }
 
-// ── Thread-unpark waker ───────────────────────────────────────────────────────
+// ── No-op waker ──────────────────────────────────────────────────────────────
 
-static THREAD_WAKER_VTABLE: RawWakerVTable =
-    RawWakerVTable::new(clone_waker, wake, wake_by_ref, drop_waker);
-
-/// Build a `Waker` that unparks `thread` when woken.
-fn thread_unpark_waker(thread: thread::Thread) -> Waker {
-    let ptr = Box::into_raw(Box::new(thread)) as *const ();
-    unsafe { Waker::from_raw(RawWaker::new(ptr, &THREAD_WAKER_VTABLE)) }
-}
-
-unsafe fn clone_waker(ptr: *const ()) -> RawWaker {
-    let t = &*(ptr as *const thread::Thread);
-    let cloned = Box::new(t.clone());
-    RawWaker::new(Box::into_raw(cloned) as *const (), &THREAD_WAKER_VTABLE)
-}
-
-unsafe fn wake(ptr: *const ()) {
-    let t = Box::from_raw(ptr as *mut thread::Thread);
-    t.unpark();
-}
-
-unsafe fn wake_by_ref(ptr: *const ()) {
-    let t = &*(ptr as *const thread::Thread);
-    t.unpark();
-}
-
-unsafe fn drop_waker(ptr: *const ()) {
-    drop(Box::from_raw(ptr as *mut thread::Thread));
+fn noop_waker() -> Waker {
+    Waker::noop().clone()
 }
 
 // ── Channel abstraction ───────────────────────────────────────────────────────
@@ -252,17 +230,18 @@ fn main() {
         ChannelKind::Sharded => {
             let shards = config.shard_count();
             let (tx, rx) = sharded::new::<u64>(shards);
-            let waker = thread_unpark_waker(thread::current());
+            let waker = noop_waker();
 
             // Sharded receivers require registration before senders are cloned
-            // or exposed to other threads.
+            // or exposed to other threads. The benchmark busy polls the receiver,
+            // so use a no-op waker to mirror production behavior.
             rx.register(&waker);
 
             run(config, Some(shards), profile, tx, rx, waker);
         }
         ChannelKind::Sync => {
             let (tx, rx) = sync::new::<u64>();
-            let waker = thread_unpark_waker(thread::current());
+            let waker = noop_waker();
             run(config, None, profile, tx, rx, waker);
         }
     }
@@ -337,13 +316,7 @@ where
                 received.fetch_add(list.len() as u64, Ordering::Relaxed);
             }
             std::task::Poll::Ready(None) => break,
-            std::task::Poll::Pending => {
-                let remaining = deadline.saturating_duration_since(Instant::now());
-                if remaining.is_zero() {
-                    break;
-                }
-                thread::park_timeout(remaining);
-            }
+            std::task::Poll::Pending => std::hint::spin_loop(),
         }
     }
 
