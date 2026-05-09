@@ -291,10 +291,8 @@ impl<A: intrusive_queue::Adapter> Receiver<A> {
 
     #[inline(always)]
     fn try_recv(&mut self) -> TryRecv<A> {
-        // Only consume one occupied bit per receive attempt. A set bit should only point at an
-        // empty shard if occupancy bookkeeping is stale, e.g. the receiver already drained the
-        // shard without clearing every local/shared bit for it, so don't keep scanning for another
-        // shard here.
+        // Only consume one occupied bit per receive attempt so stale occupancy bookkeeping stays
+        // visible to debug builds instead of being hidden by looking for another ready shard.
         if let Some(shard) = self.next_occupied() {
             let mut queue = lock(&self.shared.shards[shard]);
             debug_assert!(
