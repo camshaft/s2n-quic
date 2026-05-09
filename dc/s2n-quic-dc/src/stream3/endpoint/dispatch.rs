@@ -283,6 +283,8 @@ fn handle_flow_init(
     counters: &counters::Dispatch,
     response_frames: &mut Queue<Frame>,
 ) {
+    const NO_STICKY_SENDER_ID: VarInt = VarInt::MAX;
+
     let create_queue = |handle| {
         let (queue_control, queue_stream) = queue_dispatcher.alloc_or_grow(handle, Some(peer_queue_id));
         (queue_control.queue_id(), (queue_control, queue_stream))
@@ -292,9 +294,13 @@ fn handle_flow_init(
     let mut create_stream = |queue_control: msg::queue::Control,
                              queue_stream: msg::queue::Stream,
                              pending_validation: bool| {
-        let payload = initial_payload
-            .take()
-            .expect("internal error: create_stream called more than once for a single FlowInit");
+        let payload = initial_payload.take().unwrap_or_else(|| {
+            panic!(
+                "internal error: create_stream called more than once for FlowInit (attempt_id={}, stream_id={})",
+                attempt_id.as_u64(),
+                stream_id.as_u64()
+            )
+        });
         if is_fin || !payload.is_empty() {
             queue_stream.push(
                 msg::Stream::Data {
@@ -325,7 +331,7 @@ fn handle_flow_init(
                 reset_target: ResetTarget::Both,
                 error_code,
             },
-            source_sender_id: VarInt::MAX,
+            source_sender_id: NO_STICKY_SENDER_ID,
             payload: ByteVec::new(),
             path_secret_entry: peer.path_entry.clone(),
             completion: None,
@@ -348,7 +354,7 @@ fn handle_flow_init(
                 attempt_id,
                 stream_id,
             },
-            source_sender_id: VarInt::MAX,
+            source_sender_id: NO_STICKY_SENDER_ID,
             payload: ByteVec::new(),
             path_secret_entry: peer.path_entry.clone(),
             completion: None,
