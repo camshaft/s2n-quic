@@ -23,18 +23,29 @@ pub mod loom {
             future::Future,
             task::{Context, Poll},
         };
+        use std::sync::Arc;
 
         pub fn block_on<F: Future>(future: F) -> F::Output {
+            struct ThreadWaker(std::thread::Thread);
+
+            impl std::task::Wake for ThreadWaker {
+                fn wake(self: Arc<Self>) {
+                    self.0.unpark();
+                }
+
+                fn wake_by_ref(self: &Arc<Self>) {
+                    self.0.unpark();
+                }
+            }
+
             let mut future = std::pin::pin!(future);
-            let waker = s2n_quic_core::task::waker::noop();
+            let waker = std::task::Waker::from(Arc::new(ThreadWaker(std::thread::current())));
             let mut cx = Context::from_waker(&waker);
 
             loop {
                 match future.as_mut().poll(&mut cx) {
                     Poll::Ready(output) => return output,
-                    // This fallback executor is only used by non-loom unit tests. Parking briefly
-                    // avoids a tight spin without adding another test-only executor dependency.
-                    Poll::Pending => std::thread::park_timeout(std::time::Duration::from_millis(1)),
+                    Poll::Pending => std::thread::park(),
                 }
             }
         }

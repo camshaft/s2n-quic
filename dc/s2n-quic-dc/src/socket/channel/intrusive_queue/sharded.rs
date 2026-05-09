@@ -588,7 +588,7 @@ mod tests {
         loom::model(|| {
             let (mut tx0, rx) = new::<u32>(2);
             let registered = loom::sync::Arc::new(loom::sync::atomic::AtomicBool::new(false));
-            let registered_rx = registered.clone();
+            let registered_flag = registered.clone();
 
             let receiver = loom::thread::spawn(move || {
                 loom::future::block_on(async move {
@@ -600,7 +600,7 @@ mod tests {
                         let item = core::future::poll_fn(|cx| {
                             if !registered {
                                 rx.register(cx.waker());
-                                registered_rx.store(true, Ordering::Release);
+                                registered_flag.store(true, Ordering::Release);
                                 registered = true;
                             }
 
