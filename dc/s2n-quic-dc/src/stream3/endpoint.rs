@@ -25,7 +25,7 @@ use std::sync::atomic::AtomicU64;
 
 pub struct Endpoint {
     /// Frame submission channel (writers submit Queue<Frame> here)
-    pub frame_tx: intrusive_queue::sync::Sender<Frame>,
+    pub frame_tx: intrusive_queue::sharded::Sender<crate::intrusive_queue::EntryAdapter<Frame>>,
     /// Path secret map (shared with PSK providers)
     pub path_secret_map: crate::path::secret::Map,
     /// Queue allocator for flow queues

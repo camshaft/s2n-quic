@@ -57,7 +57,9 @@ pub(crate) fn process<Clk>(
     recv_cache: &mut recv::Cache,
     path_secret_map: &PathSecretMap,
     acceptor_registry: &acceptor::Registry<Stream>,
-    frame_tx: &crate::socket::channel::intrusive_queue::sync::Sender<Frame>,
+    frame_tx: &crate::socket::channel::intrusive_queue::sharded::Sender<
+        crate::intrusive_queue::EntryAdapter<Frame>,
+    >,
     response_tx: &mut impl channel::UnboundedSender<Queue<Frame>>,
     queue_dispatcher: &mut msg::queue::Dispatcher,
     clock: &Clk,
@@ -275,7 +277,9 @@ fn handle_flow_init(
     is_fin: bool,
     buf: BytesMut,
     acceptor_registry: &acceptor::Registry<Stream>,
-    frame_tx: &crate::socket::channel::intrusive_queue::sync::Sender<Frame>,
+    frame_tx: &crate::socket::channel::intrusive_queue::sharded::Sender<
+        crate::intrusive_queue::EntryAdapter<Frame>,
+    >,
     queue_dispatcher: &mut msg::queue::Dispatcher,
     counters: &counters::Dispatch,
     response_frames: &mut Queue<Frame>,
