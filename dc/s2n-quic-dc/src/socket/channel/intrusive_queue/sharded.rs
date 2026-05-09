@@ -307,6 +307,7 @@ impl<A: intrusive_queue::Adapter> Receiver<A> {
     #[inline(always)]
     fn next_occupied(&mut self) -> Option<usize> {
         let word_count = self.local_occupancy.len();
+        debug_assert!(word_count.is_power_of_two());
         let start_shard = self.next_shard;
         let start_word = start_shard / u64::BITS as usize;
         let start_bit = start_shard % u64::BITS as usize;
@@ -319,13 +320,7 @@ impl<A: intrusive_queue::Adapter> Receiver<A> {
         }
 
         for offset in 1..word_count {
-            // Manually wrap instead of using modulo in this hot path.
-            let word = start_word + offset;
-            let word = if word >= word_count {
-                word - word_count
-            } else {
-                word
-            };
+            let word = (start_word + offset) & (word_count - 1);
             if let Some(shard) = self.next_occupied_in_word(word, self.valid_word_mask(word)) {
                 return Some(shard);
             }
