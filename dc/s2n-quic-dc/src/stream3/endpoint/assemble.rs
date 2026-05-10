@@ -95,9 +95,6 @@ where
             // Drain cancelled frames before collecting transmittable ones
             let mut cancelled_queue = Queue::new();
             let mut packet_frames = Queue::new();
-            // Use the next packet number for size estimation, but only consume it after a packet
-            // is successfully assembled.
-            let packet_number = context.next_packet_number;
 
             while let Some(frame) = context.pending.pop_front() {
                 if !frame.should_transmit() {
@@ -109,7 +106,7 @@ where
 
                 let estimated_len = estimate_segment_len(
                     source_sender_id,
-                    packet_number,
+                    context.next_packet_number,
                     context.flow_attempt_id_counter,
                     &packet_frames,
                     header_buf,
@@ -139,6 +136,7 @@ where
             }
 
             // Assign packet number
+            let packet_number = context.next_packet_number;
             context.next_packet_number += 1;
 
             // Zero padding between segments for GSO alignment
@@ -719,6 +717,7 @@ mod tests {
     fn assemble_fuzz_respects_gso_invariants() {
         let mtu = 256;
         const MAX_TEST_FRAMES: usize = segment::MAX_COUNT * 2;
+        const TEST_CRYPTO_TAG_LEN: usize = 16;
 
         check!()
             .with_type::<Vec<FrameSpec>>()
@@ -746,7 +745,7 @@ mod tests {
                         context.flow_attempt_id_counter,
                         &single,
                         &mut header_buf,
-                        16,
+                        TEST_CRYPTO_TAG_LEN,
                     ) <= mtu as usize
                     {
                         context.push_frame(
