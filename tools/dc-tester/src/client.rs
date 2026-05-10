@@ -106,23 +106,27 @@ async fn execute_request(
 ) -> io::Result<(u64, u64)> {
     // Connect to the server — handshake address is used to obtain/cache path secrets,
     // data address is derived from the path secret entry
-    let mut stream = client.connect(server_addr, VarInt::ZERO).await?;
+    let stream = client.connect(server_addr, VarInt::ZERO).await?;
+    let (mut reader, mut writer) = stream.into_split();
 
     // Write the 8-byte response size header
-    stream.write_u64(workload.response_size).await?;
+    writer.write_u64(workload.response_size).await?;
 
     // Write request body using Data
     let mut request = Data::new(workload.request_size);
     while !request.is_finished() {
-        stream.write_from_fin(&mut request).await?;
+        writer.write_from_fin(&mut request).await?;
     }
 
     let bytes_sent = 8 + workload.request_size;
 
+    // Drop the writer to signal half-close before reading the response
+    drop(writer);
+
     // Read and validate response using Data
     let mut response = Data::new(workload.response_size);
     loop {
-        let n = stream.read_into(&mut response).await?;
+        let n = reader.read_into(&mut response).await?;
         if n == 0 {
             break;
         }

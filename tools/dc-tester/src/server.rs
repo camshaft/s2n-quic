@@ -51,29 +51,34 @@ pub async fn run(endpoint: Arc<Endpoint>, address: SocketAddr) -> io::Result<()>
     }
 }
 
-async fn handle_connection(mut stream: s2n_quic_dc::stream2::Stream) -> io::Result<(u64, u64)> {
-    tokio::time::timeout(Duration::from_secs(1), stream.validate())
+async fn handle_connection(stream: s2n_quic_dc::stream2::Stream) -> io::Result<(u64, u64)> {
+    let (mut reader, mut writer) = stream.into_split();
+
+    tokio::time::timeout(Duration::from_secs(1), reader.validate())
         .await
         .unwrap_or_else(|_| Err(io::ErrorKind::TimedOut.into()))?;
 
     // Read the 8-byte response size header
-    let response_size = stream.read_u64().await?;
+    let response_size = reader.read_u64().await?;
     let mut total_received = 8u64;
 
     // Read and validate the rest of the request body using Data
     let mut receiver = Data::new(u64::MAX);
     loop {
-        let n = stream.read_into(&mut receiver).await?;
+        let n = reader.read_into(&mut receiver).await?;
         if n == 0 {
             break;
         }
         total_received += n as u64;
     }
 
+    // Drop the reader half after we're done reading
+    drop(reader);
+
     // Generate and send response data using Data
     let mut response = Data::new(response_size);
     while !response.is_finished() {
-        stream.write_from_fin(&mut response).await?;
+        writer.write_from_fin(&mut response).await?;
     }
 
     Ok((total_received, response_size))
