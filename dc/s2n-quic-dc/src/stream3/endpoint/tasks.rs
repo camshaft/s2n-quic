@@ -55,7 +55,7 @@ fn frame_entry_byte_cost(frame: &Frame) -> u64 {
             Err(_) => {
                 debug_assert!(
                     payload_len > VarInt::MAX.as_u64(),
-                    "frame payload length exceeds VarInt::MAX and will use max varint encoding: {}",
+                    "unexpected VarInt conversion failure for payload length: {}",
                     payload_len
                 );
                 VarInt::MAX.encoding_size() as u64
@@ -200,20 +200,20 @@ where
             }
 
             match self.inner.poll_recv(cx) {
-                Poll::Ready(Some(frame)) => {
-                    if !Arc::ptr_eq(batch.path_secret_entry(), frame.path_secret_entry()) {
-                        self.buffered = Some(frame);
+                Poll::Ready(Some(frame_entry)) => {
+                    if !Arc::ptr_eq(batch.path_secret_entry(), frame_entry.path_secret_entry()) {
+                        self.buffered = Some(frame_entry);
                         break;
                     }
 
-                    let frame_cost = frame_entry_byte_cost(&frame);
+                    let frame_cost = frame_entry_byte_cost(&frame_entry);
                     let next_cost = batch.byte_cost().saturating_add(frame_cost);
                     if next_cost > target_bytes {
-                        self.buffered = Some(frame);
+                        self.buffered = Some(frame_entry);
                         break;
                     }
 
-                    batch.push_with_cost(frame, frame_cost);
+                    batch.push_with_cost(frame_entry, frame_cost);
                 }
                 Poll::Ready(None) | Poll::Pending => break,
             }
