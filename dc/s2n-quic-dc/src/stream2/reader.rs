@@ -113,6 +113,8 @@ use std::{
 };
 use tracing::{debug, trace};
 
+const MAX_FLOW_CONTROL_CREDIT: VarInt = VarInt::MAX;
+
 /// Reader for stream2: handles reassembly and flow control
 ///
 /// Boxed to avoid excessive stack usage when passing around in applications
@@ -626,7 +628,7 @@ impl Inner {
 
     /// In until-end mode, advertise maximal receive credit so the peer can complete transmission.
     fn maybe_send_unbounded_max_data(&mut self) -> io::Result<()> {
-        if self.remote_max_data == VarInt::MAX {
+        if self.remote_max_data == MAX_FLOW_CONTROL_CREDIT {
             return Ok(());
         }
 
@@ -635,8 +637,8 @@ impl Inner {
             return Ok(());
         }
 
-        self.send_max_data(VarInt::MAX)?;
-        self.remote_max_data = VarInt::MAX;
+        self.send_max_data(MAX_FLOW_CONTROL_CREDIT)?;
+        self.remote_max_data = MAX_FLOW_CONTROL_CREDIT;
         Ok(())
     }
 
