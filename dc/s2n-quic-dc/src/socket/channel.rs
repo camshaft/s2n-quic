@@ -2351,12 +2351,12 @@ impl<T> BatchLen for std::collections::VecDeque<T> {
 
 /// Wraps a sender and records enqueue metrics for every successful send.
 ///
-/// Associates a [`crate::counter::QueueGauge`] with the sender.  Each time
+/// Associates a [`crate::counter::QueueGauge`] with the sender. Each time
 /// a value is successfully enqueued the gauge is incremented by the item
 /// count reported by [`BatchLen::batch_len`], so both single-item and batch
 /// sends produce accurate queue-depth readings.
 ///
-/// Works with both [`UnboundedSender`] and [`Sender`] trait objects.
+/// Works with any type implementing [`UnboundedSender`] or [`Sender`].
 pub struct GaugedSender<S, T> {
     inner: S,
     gauge: crate::counter::QueueGauge,
