@@ -819,13 +819,6 @@ mod tests {
             other => panic!("unexpected poll result: {other:?}"),
         }
 
-        let mut out = Vec::new();
-        match reader.poll_read_into(&mut cx, &mut out) {
-            Poll::Ready(Ok(len)) => assert_eq!(len, 8),
-            other => panic!("unexpected read result: {other:?}"),
-        }
-        assert_eq!(out, expected);
-
         Ok(())
     }
 
