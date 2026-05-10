@@ -60,12 +60,6 @@
 //
 // Performance:
 //
-// * The Interposer fast path only applies when the reassembler has no readable head data.
-//   If buffered head data exists, poll_read_into drains that data first and only later polls
-//   stream_rx again. We should measure whether it's worth trying to resume interposition in
-//   the same read once the buffered head is drained, or whether the extra bookkeeping would
-//   outweigh the copy savings.
-//
 // * poll_read_into calls poll_stream_rx and then tries to copy out. If poll_stream_rx
 //   returns Pending and the reassembler already has buffered data, we still try to copy
 //   (which is fine). But if poll_stream_rx returns an error, we return the error immediately
