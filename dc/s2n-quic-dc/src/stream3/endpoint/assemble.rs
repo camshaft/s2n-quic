@@ -382,15 +382,7 @@ fn push_frame_metadata(
 ) {
     let entry_size = frame_metadata_len(header, payload_len);
     let start = header_buf.len();
-    header_buf.reserve(entry_size);
-
-    // SAFETY: this keeps the per-frame packing loop from zero-initializing each metadata append.
-    // `reserve` guarantees the additional capacity, the newly-extended region is not observed
-    // through any other reference before the write, and the runtime `assert_eq!` below verifies
-    // the encoder filled exactly `entry_size` bytes before the buffer is used again.
-    unsafe {
-        header_buf.set_len(start + entry_size);
-    }
+    header_buf.resize(start + entry_size, 0);
 
     let mut enc = EncoderBuffer::new(&mut header_buf[start..]);
     enc.encode(header);
@@ -402,7 +394,7 @@ fn push_frame_metadata(
         debug_assert_payload_length_invariant(payload_len);
     }
 
-    assert_eq!(enc.len(), entry_size, "frame metadata encoder length mismatch");
+    debug_assert_eq!(enc.len(), entry_size, "frame metadata encoder length mismatch");
 }
 
 /// Produce a Header with attempt_id stamped for FlowInit frames.
