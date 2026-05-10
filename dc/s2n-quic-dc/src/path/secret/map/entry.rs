@@ -33,8 +33,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-const NANOS_PER_SECOND: u128 = 1_000_000_000;
-
 #[cfg(test)]
 mod tests;
 
@@ -139,7 +137,7 @@ impl Entry {
             parameters,
             Duration::ZERO,
             application_data,
-            1,
+            0,
         )
     }
 
@@ -252,9 +250,13 @@ impl Entry {
         self.peer_data_port.store(port, Ordering::Relaxed);
     }
 
-    fn sender_index(&self, sender_idx: usize) -> usize {
-        debug_assert!(!self.next_transmission_by_sender.is_empty());
-        sender_idx % self.next_transmission_by_sender.len()
+    fn sender_index(&self, sender_idx: usize) -> Option<usize> {
+        let len = self.next_transmission_by_sender.len();
+        if len == 0 {
+            None
+        } else {
+            Some(sender_idx % len)
+        }
     }
 
     fn sender_schedule_micros(ts: Timestamp) -> u64 {
@@ -264,22 +266,18 @@ impl Entry {
     }
 
     fn init_sender_schedule(socket_sender_count: usize) -> Box<[AtomicU64]> {
-        let count = socket_sender_count.max(1);
-        (0..count)
+        (0..socket_sender_count)
             .map(|_| AtomicU64::new(0))
             .collect::<Vec<_>>()
             .into_boxed_slice()
     }
 
     fn transmission_delay(queued_bytes: usize, bandwidth: Bandwidth) -> Duration {
-        let bytes_per_second = bandwidth.as_bytes_per_second();
-        if queued_bytes == 0 || bytes_per_second == 0 || bytes_per_second == u64::MAX {
+        if queued_bytes == 0 {
             return Duration::ZERO;
         }
 
-        let nanos = (queued_bytes as u128).saturating_mul(NANOS_PER_SECOND) / bytes_per_second as u128;
-        let nanos = nanos.min(u64::MAX as u128) as u64;
-        Duration::from_nanos(nanos)
+        bandwidth * queued_bytes
     }
 
     #[inline]
@@ -289,7 +287,10 @@ impl Entry {
 
     #[inline]
     pub fn sender_next_transmission_micros(&self, sender_idx: usize) -> u64 {
-        self.next_transmission_by_sender[self.sender_index(sender_idx)].load(Ordering::Acquire)
+        let Some(sender_idx) = self.sender_index(sender_idx) else {
+            return 0;
+        };
+        self.next_transmission_by_sender[sender_idx].load(Ordering::Acquire)
     }
 
     pub fn update_sender_next_transmission_time(
@@ -299,7 +300,9 @@ impl Entry {
         queued_bytes: usize,
         bandwidth: Bandwidth,
     ) -> Timestamp {
-        let sender_idx = self.sender_index(sender_idx);
+        let Some(sender_idx) = self.sender_index(sender_idx) else {
+            return now;
+        };
         let delay = Self::transmission_delay(queued_bytes, bandwidth);
         let next = now + delay;
         let next_micros = Self::sender_schedule_micros(next);
@@ -312,12 +315,12 @@ impl Entry {
         random_fn: impl Fn(usize) -> usize,
     ) -> usize {
         let len = self.next_transmission_by_sender.len();
-        if len == 1 {
+        if len <= 1 {
             return 0;
         }
 
-        let idx1 = random_fn(len).min(len - 1);
-        let mut idx2 = random_fn(len - 1).min(len - 2);
+        let idx1 = random_fn(len) % len;
+        let mut idx2 = random_fn(len - 1) % (len - 1);
         if idx2 >= idx1 {
             idx2 += 1;
         }

@@ -70,6 +70,13 @@ fn bandwidth_mul_duration() {
 }
 
 #[test]
+fn bandwidth_mul_usize_duration() {
+    let bandwidth = Bandwidth::new(10_000, Duration::from_secs(1));
+    let result = bandwidth * 2_000usize;
+    assert_eq!(result, Duration::from_millis(200));
+}
+
+#[test]
 fn bandwidth_mul_duration_too_long() {
     let bandwidth = Bandwidth::new(1, Duration::from_nanos(1));
 

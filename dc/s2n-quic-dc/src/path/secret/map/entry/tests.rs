@@ -40,8 +40,8 @@ fn entry_size() {
     if should_check {
         assert_eq!(
             Entry::fake((std::net::Ipv4Addr::LOCALHOST, 0).into(), None).size(),
-            // Includes per-entry sender scheduling storage metadata (Box<[AtomicU64]> + one slot).
-            331
+            // Includes per-entry sender scheduling storage metadata (Box<[AtomicU64]>).
+            323
         );
     }
 }
@@ -50,6 +50,14 @@ fn entry_size() {
 fn allocates_sender_schedule_slots() {
     let entry = test_entry_with_senders(4);
     assert_eq!(entry.socket_sender_count(), 4);
+}
+
+#[test]
+fn empty_sender_schedule_is_supported() {
+    let entry = test_entry_with_senders(0);
+    assert_eq!(entry.socket_sender_count(), 0);
+    assert_eq!(entry.sender_next_transmission_micros(0), 0);
+    assert_eq!(entry.pick_sender_by_next_transmission(|_| 0), 0);
 }
 
 #[test]

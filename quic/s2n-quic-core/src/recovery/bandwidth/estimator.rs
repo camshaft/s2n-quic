@@ -174,6 +174,14 @@ impl core::ops::Mul<Duration> for Bandwidth {
     }
 }
 
+impl core::ops::Mul<usize> for Bandwidth {
+    type Output = Duration;
+
+    fn mul(self, rhs: usize) -> Self::Output {
+        (rhs as u64) / self
+    }
+}
+
 /// Divides a count of bytes represented as a u64 by the given `Bandwidth`
 ///
 /// Since `Bandwidth` is a rate of bytes over a time period, this division

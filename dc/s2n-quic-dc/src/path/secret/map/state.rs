@@ -518,7 +518,7 @@ where
         let mut state = Self {
             // This is around 500MB with current entry size.
             max_capacity: capacity,
-            socket_sender_count: AtomicUsize::new(1),
+            socket_sender_count: AtomicUsize::new(0),
             should_evict_on_unknown_path_secret,
             rehandshake_period,
             peers: Default::default(),
@@ -702,12 +702,11 @@ where
     }
 
     fn socket_sender_count(&self) -> usize {
-        self.socket_sender_count.load(Ordering::Acquire).max(1)
+        self.socket_sender_count.load(Ordering::Acquire)
     }
 
     fn set_socket_sender_count(&self, count: usize) {
-        self.socket_sender_count
-            .store(count.max(1), Ordering::Release);
+        self.socket_sender_count.store(count, Ordering::Release);
     }
 
     fn should_evict_on_unknown_path_secret(&self) -> bool {
