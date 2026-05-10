@@ -1053,8 +1053,10 @@ mod sim_tests {
     }
 
     fn noop_cx() -> core::task::Context<'static> {
-        let waker = Box::leak(Box::new(waker::noop()));
-        core::task::Context::from_waker(waker)
+        use std::sync::LazyLock;
+        static NOOP_WAKER: LazyLock<core::task::Waker> =
+            LazyLock::new(|| waker::noop());
+        core::task::Context::from_waker(&NOOP_WAKER)
     }
 
     // ── Harness methods ───────────────────────────────────────────────────────
@@ -1308,7 +1310,14 @@ mod sim_tests {
                         // never crosses thread boundaries.  We wrap the non-Send
                         // future so bach::spawn can accept it.
                         struct SendWrapper<F>(F);
+                        // SAFETY: bach's sim runs all tasks on a single thread, so
+                        // SendWrapper<F> is never actually sent across threads even
+                        // though it claims to implement Send/Sync.  This is the
+                        // standard pattern for wrapping !Send types in single-threaded
+                        // async executors.
                         unsafe impl<F> Send for SendWrapper<F> {}
+                        // SAFETY: same reasoning as the Send impl above — bach's sim
+                        // never shares the wrapper across threads concurrently.
                         unsafe impl<F> Sync for SendWrapper<F> {}
                         impl<F: core::future::Future> core::future::Future for SendWrapper<F> {
                             type Output = F::Output;
@@ -1316,7 +1325,13 @@ mod sim_tests {
                                 self: core::pin::Pin<&mut Self>,
                                 cx: &mut core::task::Context<'_>,
                             ) -> core::task::Poll<Self::Output> {
-                                // SAFETY: we never move the inner future after pinning.
+                                // SAFETY: `SendWrapper` is a `#[repr(transparent)]`-like
+                                // single-field wrapper.  We obtain a pinned `&mut F` by
+                                // first calling `get_unchecked_mut` to reach the inner
+                                // field, then immediately re-pinning it.  The outer pin
+                                // guarantee ensures the `SendWrapper` is not moved, and
+                                // since the inner `F` is at offset 0 within the wrapper,
+                                // it is also not moved.
                                 unsafe {
                                     core::pin::Pin::new_unchecked(
                                         &mut self.get_unchecked_mut().0,
