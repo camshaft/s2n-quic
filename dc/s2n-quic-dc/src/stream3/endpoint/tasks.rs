@@ -203,7 +203,7 @@ where
 
             match self.inner.poll_recv(cx) {
                 Poll::Ready(Some(frame)) => {
-                    if !Arc::ptr_eq(&batch.path_secret_entry, frame.path_secret_entry()) {
+                    if !Arc::ptr_eq(batch.path_secret_entry(), frame.path_secret_entry()) {
                         self.buffered = Some(frame);
                         break;
                     }
