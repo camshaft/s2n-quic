@@ -2402,7 +2402,9 @@ where
         cx: &mut task::Context<'_>,
         value: &mut core::mem::MaybeUninit<T>,
     ) -> Poll<Result<(), ()>> {
-        // The Sender contract guarantees `value` is initialized before poll_send.
+        // SAFETY: The `Sender` trait contract requires callers to pass an initialized
+        // `MaybeUninit<T>` to `poll_send`.  We read it here only to compute the batch
+        // size before forwarding to the inner sender, which consumes/moves the value.
         let count = unsafe { value.assume_init_ref() }.batch_len();
         match self.inner.poll_send(cx, value) {
             Poll::Ready(Ok(())) => {

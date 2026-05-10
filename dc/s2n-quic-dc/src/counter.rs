@@ -244,6 +244,10 @@ impl QueueGauge {
         self.depth.sub(1);
     }
 
+    /// Decrements the queue depth by `count` items and records them as drained.
+    ///
+    /// Use this instead of calling [`dequeue`] in a loop when receiving a batch
+    /// of items at once, so the depth and drain counters stay accurate.
     #[inline]
     pub fn dequeue_n(&self, count: u64) {
         self.drain.add(count);
