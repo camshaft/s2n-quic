@@ -49,6 +49,16 @@ pub(crate) struct Context {
     pub pto: Pto,
     /// Frames waiting to be assembled into packets
     pub pending: Queue<Frame>,
+    /// Total payload bytes across all frames in `pending`.
+    ///
+    /// Maintained by `push_frame`, `pop_pending`, and `push_front_pending` so callers
+    /// never need to traverse the queue.
+    pub pending_bytes: usize,
+    /// Index of this socket in the path secret entry's `next_transmission_by_sender` array.
+    ///
+    /// Used by `publish_next_transmission_time` to write the correct slot so the
+    /// load-balancer pick-two logic has up-to-date per-socket load information.
+    pub sender_idx: usize,
     /// Intrusive links and target time for the transmission pacing wheel
     pub tx_wheel: WheelLinks,
     /// Intrusive links and target time for the PTO (probe timeout) wheel
@@ -58,7 +68,11 @@ pub(crate) struct Context {
 }
 
 impl Context {
-    pub fn new(entry: &Arc<PathSecretEntry>, inflight_gauge: QueueGauge) -> Self {
+    pub fn new(
+        entry: &Arc<PathSecretEntry>,
+        inflight_gauge: QueueGauge,
+        sender_idx: usize,
+    ) -> Self {
         let (sealer, credentials) = entry.reusable_sealer();
         let cca = congestion::Controller::new(entry.max_datagram_size());
         let rtt_estimator = RttEstimator::new(Duration::from_millis(2));
@@ -75,15 +89,52 @@ impl Context {
             inflight,
             pto: Pto::default(),
             pending: Queue::new(),
+            pending_bytes: 0,
+            sender_idx,
             tx_wheel: WheelLinks::new(),
             pto_wheel: WheelLinks::new(),
             idle_wheel: WheelLinks::new(),
         }
     }
 
+    /// Push a frame onto the pending queue, tracking its payload size.
     #[inline]
     pub fn push_frame(&mut self, frame: intrusive_queue::Entry<Frame>) {
+        self.pending_bytes += frame.payload_len();
         self.pending.push_back(frame);
+    }
+
+    /// Pop the next frame from the pending queue, updating the byte counter.
+    #[inline]
+    pub fn pop_pending(&mut self) -> Option<intrusive_queue::Entry<Frame>> {
+        let frame = self.pending.pop_front()?;
+        self.pending_bytes = self.pending_bytes.saturating_sub(frame.payload_len());
+        Some(frame)
+    }
+
+    /// Push a frame back to the front of the pending queue (e.g. when it doesn't fit in
+    /// the current segment), updating the byte counter.
+    #[inline]
+    pub fn push_front_pending(&mut self, frame: intrusive_queue::Entry<Frame>) {
+        self.pending_bytes += frame.payload_len();
+        self.pending.push_front(frame);
+    }
+
+    /// Publish the estimated next transmission time to the path secret entry.
+    ///
+    /// Derives the estimate from the current pending payload size and the CCA bandwidth
+    /// sample, then stores it in the path-secret entry so the load-balancer
+    /// (`pick_sender_by_next_transmission`) can compare per-socket load.
+    ///
+    /// Call this whenever the pending queue or CCA state changes.
+    #[inline]
+    pub fn publish_next_transmission_time(&self, now: s2n_quic_core::time::Timestamp) {
+        self.path_secret_entry.update_sender_next_transmission_time(
+            self.sender_idx,
+            now,
+            self.pending_bytes,
+            self.cca.bandwidth(),
+        );
     }
 
     #[inline]
@@ -254,13 +305,15 @@ impl Pto {
 pub(crate) struct Cache {
     contexts: HashMap<credentials::Id, Rc<RefCell<Context>>>,
     inflight_gauge: QueueGauge,
+    sender_idx: usize,
 }
 
 impl Cache {
-    pub fn new(inflight_gauge: QueueGauge) -> Self {
+    pub fn new(inflight_gauge: QueueGauge, sender_idx: usize) -> Self {
         Self {
             contexts: HashMap::new(),
             inflight_gauge,
+            sender_idx,
         }
     }
 
@@ -273,6 +326,7 @@ impl Cache {
                 Rc::new(RefCell::new(Context::new(
                     entry,
                     self.inflight_gauge.clone(),
+                    self.sender_idx,
                 )))
             })
             .clone()
@@ -359,7 +413,7 @@ mod tests {
         let entry = PathSecretEntry::fake("127.0.0.1:8080".parse().unwrap(), None);
         let registry = crate::counter::Registry::new();
         let gauge = registry.register_queue_gauge("test.inflight");
-        Rc::new(RefCell::new(Context::new(&entry, gauge)))
+        Rc::new(RefCell::new(Context::new(&entry, gauge, 0)))
     }
 
     // ── Tests ─────────────────────────────────────────────────────────────
@@ -592,5 +646,118 @@ mod tests {
         assert_eq!(result.len(), 1);
         let popped = result.pop_front().unwrap();
         assert!(Rc::ptr_eq(&popped, &ctx3));
+    }
+
+    // ── pending_bytes tracking tests ──────────────────────────────────────
+
+    fn make_frame(payload_len: usize) -> intrusive_queue::Entry<Frame> {
+        use crate::{
+            byte_vec::ByteVec,
+            packet::datagram::QueuePair,
+            path::secret::map::Entry as PathSecretEntry,
+            stream3::frame::{Frame, Header, TransmissionStatus, DEFAULT_TTL},
+        };
+        use bytes::Bytes;
+
+        let entry = PathSecretEntry::fake("127.0.0.1:8080".parse().unwrap(), None);
+        let mut payload = ByteVec::new();
+        if payload_len > 0 {
+            payload.push_back(Bytes::from(vec![0u8; payload_len]));
+        }
+        Frame {
+            header: Header::FlowData {
+                queue_pair: QueuePair {
+                    source_queue_id: VarInt::ZERO,
+                    dest_queue_id: VarInt::ZERO,
+                },
+                stream_id: VarInt::ZERO,
+                offset: VarInt::ZERO,
+                is_fin: false,
+            },
+            source_sender_id: VarInt::MAX,
+            payload,
+            path_secret_entry: entry,
+            completion: None,
+            status: TransmissionStatus::default(),
+            ttl: DEFAULT_TTL,
+            transmission_time: None,
+        }
+        .into()
+    }
+
+    #[test]
+    fn pending_bytes_tracks_push_and_pop() {
+        let ctx = make_context();
+        let mut ctx = ctx.borrow_mut();
+
+        assert_eq!(ctx.pending_bytes, 0);
+
+        ctx.push_frame(make_frame(100));
+        assert_eq!(ctx.pending_bytes, 100);
+
+        ctx.push_frame(make_frame(200));
+        assert_eq!(ctx.pending_bytes, 300);
+
+        let frame = ctx.pop_pending().unwrap();
+        assert_eq!(frame.payload_len(), 100);
+        assert_eq!(ctx.pending_bytes, 200);
+
+        let frame = ctx.pop_pending().unwrap();
+        assert_eq!(frame.payload_len(), 200);
+        assert_eq!(ctx.pending_bytes, 0);
+
+        assert!(ctx.pop_pending().is_none());
+        assert_eq!(ctx.pending_bytes, 0);
+    }
+
+    #[test]
+    fn pending_bytes_tracks_push_front() {
+        let ctx = make_context();
+        let mut ctx = ctx.borrow_mut();
+
+        ctx.push_frame(make_frame(100));
+        assert_eq!(ctx.pending_bytes, 100);
+
+        // Pop then push back (simulates "doesn't fit" path in assemble)
+        let frame = ctx.pop_pending().unwrap();
+        assert_eq!(ctx.pending_bytes, 0);
+
+        ctx.push_front_pending(frame);
+        assert_eq!(ctx.pending_bytes, 100);
+    }
+
+    #[test]
+    fn publish_next_transmission_time_stores_to_path_entry() {
+        use crate::path::secret::map::Entry as PathSecretEntry;
+
+        // Create an entry with one sender slot so the atomic array is populated.
+        let entry = PathSecretEntry::fake_with_socket_senders(
+            "127.0.0.1:8080".parse().unwrap(),
+            None,
+            1,
+        );
+
+        let registry = crate::counter::Registry::new();
+        let gauge = registry.register_queue_gauge("test.inflight");
+        let mut ctx = Context::new(&entry, gauge, 0);
+
+        // Initial value should be zero.
+        assert_eq!(entry.sender_next_transmission_micros(0), 0);
+
+        // Push some payload bytes so pending_bytes > 0.
+        ctx.push_frame(make_frame(1000));
+
+        // Build a timestamp from a known duration.
+        let now = unsafe {
+            s2n_quic_core::time::Timestamp::from_duration(Duration::from_micros(5_000))
+        };
+        ctx.publish_next_transmission_time(now);
+
+        // With non-zero pending bytes the published time should be >= now (5000µs).
+        let published = entry.sender_next_transmission_micros(0);
+        assert!(
+            published >= 5_000,
+            "published micros {published} should be >= now (5000µs)"
+        );
     }
 }
