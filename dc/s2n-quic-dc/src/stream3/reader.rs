@@ -264,12 +264,17 @@ impl Reader {
         let mut copied_len = 0usize;
 
         while copied_len < len {
+            if !target.has_remaining_capacity() {
+                break;
+            }
             let step_len = core::future::poll_fn(|cx| {
                 self.poll_wait_for_buffered_len(cx, target, len.saturating_sub(copied_len))
             })
             .await?;
 
-            copied_len = copied_len.saturating_add(step_len);
+            copied_len = copied_len
+                .checked_add(step_len)
+                .ok_or_else(|| io::Error::other("buffer length overflow"))?;
 
             if step_len == 0 || self.0.reassembler.is_writing_complete() {
                 break;
@@ -331,14 +336,16 @@ impl Inner {
             return Poll::Ready(Ok(0));
         }
 
+        if !target.has_remaining_capacity() {
+            return Poll::Ready(Ok(0));
+        }
+
         self.open_flow_control_for_buffered_len(len)?;
 
         let mut tracker = target.track_write();
         let _ = self.poll_stream_rx(cx, &mut tracker)?;
 
-        if tracker.has_remaining_capacity() {
-            self.reassembler.infallible_copy_into(&mut tracker);
-        }
+        self.reassembler.infallible_copy_into(&mut tracker);
 
         let bytes_copied = tracker.written_len();
         self.maybe_send_max_data()?;
