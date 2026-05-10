@@ -115,6 +115,40 @@ pub trait UnboundedSender<T> {
     fn send(&mut self, value: T) -> Result<(), T>;
 }
 
+// ── EntryBoxSender ─────────────────────────────────────────────────────────
+
+/// Adapts an `UnboundedSender<Entry<T>>` into an `UnboundedSender<T>` by boxing
+/// values into [`crate::intrusive_queue::Entry`] on each send.
+///
+/// This is the canonical way to bridge between a "plain value" sender interface and a
+/// channel that requires intrusive-queue entries without duplicating boxing logic at
+/// every call site.
+pub struct EntryBoxSender<T, S> {
+    inner: S,
+    _phantom: PhantomData<T>,
+}
+
+impl<T, S> EntryBoxSender<T, S> {
+    pub fn new(inner: S) -> Self {
+        Self {
+            inner,
+            _phantom: PhantomData,
+        }
+    }
+}
+
+impl<T, S> UnboundedSender<T> for EntryBoxSender<T, S>
+where
+    S: UnboundedSender<crate::intrusive_queue::Entry<T>>,
+{
+    #[inline]
+    fn send(&mut self, value: T) -> Result<(), T> {
+        self.inner
+            .send(crate::intrusive_queue::Entry::new(value))
+            .map_err(|e| e.into_inner())
+    }
+}
+
 /// A channel sender.
 pub trait Sender<T> {
     /// Poll to send a value on the channel.

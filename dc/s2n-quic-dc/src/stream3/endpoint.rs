@@ -86,7 +86,7 @@ struct SendTaskParts<Socket> {
 }
 
 /// All the ingredients needed to spawn a recv-socket + dispatch task pair on a worker.
-struct RecvTaskParts<Socket, Clk> {
+struct RecvTaskParts<Socket, Clk, AckSnd> {
     // ── recv task ──────────────────────────────────────────────────────
     socket: Socket,
     recv_pool: crate::socket::pool::Pool,
@@ -103,7 +103,7 @@ struct RecvTaskParts<Socket, Clk> {
     path_secret_map: crate::path::secret::Map,
     acceptor_registry: acceptor::Registry<Stream>,
     frame_tx: SubmissionSender,
-    ack_sender: routing::AckSender,
+    ack_sender: AckSnd,
     queue_dispatcher: msg::queue::Dispatcher,
     counters: counters::Dispatch,
     clock: Clk,
@@ -116,7 +116,7 @@ struct RecvTaskParts<Socket, Clk> {
 /// After building a `Worker` for each thread, call [`Worker::spawn`] on each to hand off all
 /// its tasks to the spawner. This design makes it easy to reassign sockets or tasks across
 /// workers without restructuring the spawn logic.
-struct Worker<SendSocket, RecvSocket, Clk, G> {
+struct Worker<SendSocket, RecvSocket, Clk, G, AckSnd> {
     /// This worker's index in the spawner.
     id: usize,
     /// Frame-dispatch task, assigned to exactly one worker (typically worker 0).
@@ -124,10 +124,10 @@ struct Worker<SendSocket, RecvSocket, Clk, G> {
     /// Send socket tasks assigned to this worker.
     send_tasks: Vec<SendTaskParts<SendSocket>>,
     /// Recv + dispatch task pairs assigned to this worker.
-    recv_tasks: Vec<RecvTaskParts<RecvSocket, Clk>>,
+    recv_tasks: Vec<RecvTaskParts<RecvSocket, Clk, AckSnd>>,
 }
 
-impl<SendSocket, RecvSocket, Clk, G> Worker<SendSocket, RecvSocket, Clk, G>
+impl<SendSocket, RecvSocket, Clk, G, AckSnd> Worker<SendSocket, RecvSocket, Clk, G, AckSnd>
 where
     SendSocket: crate::socket::send::Socket + Send + 'static,
     RecvSocket: crate::socket::recv::Socket + Send + 'static,
@@ -136,6 +136,7 @@ where
         + Send
         + 'static,
     G: crate::random::Generator,
+    AckSnd: crate::socket::channel::UnboundedSender<msg::Sender> + Send + 'static,
 {
     fn new(id: usize) -> Self {
         Self {
@@ -200,6 +201,7 @@ where
                     rt.recv_pool,
                     rt.packet_tx,
                     rt.decode_error_counter,
+                    tasks::DEFAULT_RECV_BUDGET,
                 ));
                 local.spawn(tasks::packet_dispatch_task(
                     rt.packet_rx,
@@ -212,6 +214,7 @@ where
                     rt.queue_dispatcher,
                     rt.counters,
                     rt.clock,
+                    tasks::DEFAULT_DISPATCH_BUDGET,
                 ));
             }
         });
@@ -339,7 +342,17 @@ where
 
     // Build workers -------------------------------------------------------------
     // Pre-allocate one Worker per spawner thread.
-    let mut workers: Vec<Worker<SendSocket, RecvSocket, C, G>> = {
+    //
+    // `AckSnd` = `AckSender<EntryBoxSender<msg::Sender, intrusive_queue::sync::Sender<msg::Sender>>>`:
+    // each `socket_ack_tx` is an `UnboundedSender<Entry<msg::Sender>>`; `EntryBoxSender` converts
+    // it to `UnboundedSender<msg::Sender>` so `AckSender` only needs to route by sender id.
+    type AckSnd = routing::AckSender<
+        crate::socket::channel::EntryBoxSender<
+            msg::Sender,
+            crate::socket::channel::intrusive_queue::sync::Sender<msg::Sender>,
+        >,
+    >;
+    let mut workers: Vec<Worker<SendSocket, RecvSocket, C, G, AckSnd>> = {
         let mut v = Vec::with_capacity(num_workers);
         v.extend((0..num_workers).map(|id| Worker::new(id)));
         v
@@ -387,7 +400,13 @@ where
             path_secret_map: path_secret_map.clone(),
             acceptor_registry: acceptor_registry.clone(),
             frame_tx: frame_tx.clone(),
-            ack_sender: routing::AckSender::new(socket_ack_txs.clone()),
+            ack_sender: routing::AckSender::new(
+                socket_ack_txs
+                    .iter()
+                    .cloned()
+                    .map(crate::socket::channel::EntryBoxSender::new)
+                    .collect(),
+            ),
             queue_dispatcher: queue_dispatcher.clone(),
             counters: counters.clone(),
             clock: clock.clone(),

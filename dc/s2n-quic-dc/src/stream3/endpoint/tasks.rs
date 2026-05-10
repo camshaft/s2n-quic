@@ -13,6 +13,14 @@ use core::{
 };
 use std::sync::Arc;
 
+/// Default per-poll budget for [`socket_recv_task`]: process up to this many segments before
+/// yielding to the executor. Tune via the `budget` parameter if workloads differ.
+pub const DEFAULT_RECV_BUDGET: usize = 32;
+
+/// Default per-poll budget for [`packet_dispatch_task`]: process up to this many packets before
+/// yielding to the executor. Tune via the `budget` parameter if workloads differ.
+pub const DEFAULT_DISPATCH_BUDGET: usize = 32;
+
 /// Routing key accessor for stream3 send-side load-balancing tasks.
 pub trait PathSecretMapEntry {
     fn path_secret_entry(&self) -> &Arc<PathSecretEntry>;
@@ -355,19 +363,21 @@ pub async fn socket_send_task<Socket, BatchRx, AckRx>(
 /// `packet_tx` is generic so callers can substitute a local unsync sender when the dispatch
 /// task is co-located on the same worker.
 ///
-/// Drives a [`SocketReceiver`] → [`InspectErr`] → [`FlattenSegments`] → [`ChannelRouter`] chain.
+/// Drives a [`SocketReceiver`] → [`InspectErr`] → [`FlattenSegments`] → [`RouterAdapter`] chain,
+/// drained with a per-poll `budget` so the executor can interleave other tasks.
 /// Each segment is decoded; datagram packets are forwarded via `packet_tx` to the dispatch task,
 /// and decode errors are tallied via `decode_error_counter`.
 ///
 /// [`SocketReceiver`]: crate::socket::channel::SocketReceiver
 /// [`InspectErr`]: crate::socket::channel::InspectErr
 /// [`FlattenSegments`]: crate::socket::channel::FlattenSegments
-/// [`ChannelRouter`]: crate::stream3::endpoint::worker::ChannelRouter
+/// [`RouterAdapter`]: crate::socket::channel::RouterAdapter
 pub async fn socket_recv_task<Socket, Tx>(
     socket: Socket,
     pool: crate::socket::pool::Pool,
     tx: Tx,
     decode_error_counter: crate::counter::Counter,
+    budget: usize,
 ) where
     Socket: crate::socket::recv::Socket,
     Tx: crate::socket::channel::UnboundedSender<
@@ -376,33 +386,22 @@ pub async fn socket_recv_task<Socket, Tx>(
         >,
     >,
 {
-    use crate::{
-        socket::{
-            channel::{FlattenSegments, InspectErr, Receiver as _, SocketReceiver},
-            recv::router::Router as _,
-        },
-        stream3::endpoint::worker::ChannelRouter,
+    use crate::socket::channel::{
+        FlattenSegments, InspectErr, ReceiverExt as _, RouterAdapter, SocketReceiver,
     };
+    use crate::stream3::endpoint::worker::ChannelRouter;
 
     let rx = SocketReceiver::new(socket, pool);
     // SocketReceiver yields io::Result<Segments>; InspectErr logs errors and unwraps to Segments.
     let rx = InspectErr::new(rx, |err| {
         tracing::warn!(%err, "socket recv error");
     });
-    let mut rx = FlattenSegments::new(rx);
-    let mut router = ChannelRouter {
+    let rx = FlattenSegments::new(rx);
+    let router = ChannelRouter {
         tx,
         decode_error_counter,
     };
-
-    loop {
-        let Some(segment) = rx.recv().await else {
-            break;
-        };
-        let bytes = segment.len() as u64;
-        router.on_segment(segment);
-        rx.on_consumed(bytes);
-    }
+    RouterAdapter::new(rx, router).drain_budgeted(Some(budget)).await;
 }
 
 /// Per-worker packet dispatch loop: decrypts, deduplicates, and dispatches received packets.
@@ -410,29 +409,27 @@ pub async fn socket_recv_task<Socket, Tx>(
 /// `packet_rx` and `ack_sender` are generic so callers can substitute local unsync receivers
 /// or a custom ACK fan-out when tasks are co-located on the same worker.
 ///
-/// Owns a [`recv::Cache`] for per-sender crypto state. For each packet, calls
-/// [`dispatch::process`] which:
-/// * Authenticates and decrypts the payload,
-/// * Deduplicates by packet number,
-/// * Updates ACK state and ECN counts,
-/// * Dispatches each decoded frame to its type handler (flow queues, ACK channels, acceptors).
+/// Uses a [`Map`] combinator over `packet_rx` that calls [`dispatch::process`] for each packet,
+/// then drains up to `budget` items per poll so the executor can interleave other tasks.
 ///
 /// Dispatch errors are silently dropped — they represent invalid/duplicate/unauthenticated
 /// packets which should not terminate the worker.
 ///
+/// [`Map`]: crate::socket::channel::Map
 /// [`recv::Cache`]: crate::stream3::endpoint::recv::Cache
 /// [`dispatch::process`]: crate::stream3::endpoint::dispatch::process
 pub async fn packet_dispatch_task<PacketRx, AckTx, Clk>(
-    mut packet_rx: PacketRx,
+    packet_rx: PacketRx,
     worker_id: usize,
     idle_timeout: core::time::Duration,
     path_secret_map: crate::path::secret::Map,
     acceptor_registry: crate::acceptor::Registry<crate::stream3::Stream>,
     frame_tx: crate::stream3::frame::SubmissionSender,
-    mut ack_sender: AckTx,
-    mut queue_dispatcher: crate::stream3::endpoint::msg::queue::Dispatcher,
+    ack_sender: AckTx,
+    queue_dispatcher: crate::stream3::endpoint::msg::queue::Dispatcher,
     counters: crate::stream3::endpoint::counters::Dispatch,
     clock: Clk,
+    budget: usize,
 ) where
     PacketRx: Receiver<
         crate::intrusive_queue::Entry<
@@ -442,17 +439,16 @@ pub async fn packet_dispatch_task<PacketRx, AckTx, Clk>(
     AckTx: crate::socket::channel::UnboundedSender<crate::stream3::endpoint::msg::Sender>,
     Clk: s2n_quic_core::time::Clock + crate::clock::precision::Clock,
 {
+    use crate::socket::channel::{Map, ReceiverExt as _};
     use crate::stream3::endpoint::{dispatch, recv};
 
     let mut recv_cache = recv::Cache::new(idle_timeout, worker_id);
     // Response frames (ACKs sent back to peers) re-enter via the same submission channel.
     let mut response_tx = frame_tx.clone();
+    let mut ack_sender = ack_sender;
+    let mut queue_dispatcher = queue_dispatcher;
 
-    loop {
-        let Some(packet) = packet_rx.recv().await else {
-            break;
-        };
-
+    let rx = Map::new(packet_rx, move |packet| {
         let _ = dispatch::process(
             packet,
             &mut recv_cache,
@@ -465,9 +461,9 @@ pub async fn packet_dispatch_task<PacketRx, AckTx, Clk>(
             &clock,
             &counters,
         );
-    }
+    });
+    rx.drain_budgeted(Some(budget)).await;
 }
-
 
 #[cfg(test)]
 mod tests {

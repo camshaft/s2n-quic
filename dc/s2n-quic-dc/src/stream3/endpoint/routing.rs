@@ -99,21 +99,26 @@ impl SenderRoute for ModuloRoute {
 /// Routes `msg::Sender` messages to the correct per-socket ACK channel.
 ///
 /// The `local_sender_id` embedded in `msg::Sender::Ack` identifies which send socket's
-/// context should process this acknowledgement. `AckSender` wraps one
-/// `sync::Sender<msg::Sender>` per socket and dispatches based on that ID.
-pub(crate) struct AckSender {
-    inner: Vec<crate::socket::channel::intrusive_queue::sync::Sender<super::msg::Sender>>,
+/// context should process this acknowledgement. `AckSender<T>` wraps one sender of type `T`
+/// per socket and dispatches based on that ID.
+///
+/// `T` is generic over the sender type so callers can wrap or transform it freely (e.g., wrap
+/// an `intrusive_queue::sync::Sender<Entry<msg::Sender>>` in
+/// [`EntryBoxSender`][crate::socket::channel::EntryBoxSender] to get a plain `UnboundedSender<msg::Sender>`).
+pub(crate) struct AckSender<T> {
+    inner: Vec<T>,
 }
 
-impl AckSender {
-    pub fn new(
-        senders: Vec<crate::socket::channel::intrusive_queue::sync::Sender<super::msg::Sender>>,
-    ) -> Self {
+impl<T> AckSender<T> {
+    pub fn new(senders: Vec<T>) -> Self {
         Self { inner: senders }
     }
 }
 
-impl crate::socket::channel::UnboundedSender<super::msg::Sender> for AckSender {
+impl<T> crate::socket::channel::UnboundedSender<super::msg::Sender> for AckSender<T>
+where
+    T: crate::socket::channel::UnboundedSender<super::msg::Sender>,
+{
     fn send(
         &mut self,
         msg: super::msg::Sender,
@@ -122,9 +127,7 @@ impl crate::socket::channel::UnboundedSender<super::msg::Sender> for AckSender {
             super::msg::Sender::Ack { local_sender_id, .. } => {
                 let idx = local_sender_id.as_u64() as usize;
                 match self.inner.get_mut(idx) {
-                    Some(tx) => tx
-                        .send(crate::intrusive_queue::Entry::new(msg))
-                        .map_err(|e| e.into_inner()),
+                    Some(tx) => tx.send(msg),
                     None => Err(msg),
                 }
             }
