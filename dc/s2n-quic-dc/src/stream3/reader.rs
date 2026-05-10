@@ -619,7 +619,7 @@ mod tests {
     fn write_data_reader_bypasses_reassembler_for_in_order_data() {
         let mut reassembler = Reassembler::new();
         let mut reader = Data::new(8);
-        let mut app_buf = Vec::new();
+        let mut app_buf: Vec<u8> = Vec::new();
 
         write_data_reader(&mut reassembler, &mut reader, Some(&mut app_buf)).unwrap();
 
@@ -634,7 +634,7 @@ mod tests {
     fn write_data_reader_keeps_out_of_order_data_in_reassembler() {
         let mut reassembler = Reassembler::new();
         let mut reader = Data::new(8);
-        let mut app_buf = Vec::new();
+        let mut app_buf: Vec<u8> = Vec::new();
 
         reader.seek_forward(4);
         write_data_reader(&mut reassembler, &mut reader, Some(&mut app_buf)).unwrap();
@@ -650,7 +650,7 @@ mod tests {
     fn write_data_reader_does_not_interpose_when_reassembler_has_head_data() {
         let mut reassembler = Reassembler::new();
         let mut reader = Data::new(8);
-        let mut app_buf = Vec::new();
+        let mut app_buf: Vec<u8> = Vec::new();
 
         reassembler.write_at(0u32.into(), &Data::send_one_at(0, 4)).unwrap();
         reader.seek_forward(4);
