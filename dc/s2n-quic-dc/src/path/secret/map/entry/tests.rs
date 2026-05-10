@@ -73,4 +73,7 @@ fn picks_sender_with_lower_next_transmission() {
 
     let picked = entry.pick_sender_by_next_transmission(|upper_bound| upper_bound - 1);
     assert_eq!(picked, 1);
+
+    let picked = entry.pick_sender_by_next_transmission(|_| 0);
+    assert_eq!(picked, 1);
 }
