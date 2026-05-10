@@ -720,11 +720,9 @@ impl Inner {
             payload_budget = next;
         }
 
-        #[cfg(debug_assertions)]
         unreachable!(
             "payload budget did not converge: header={header:?} available={available} budget={payload_budget}"
         );
-        payload_budget
     }
 
     fn send_data<S>(&mut self, buf: &mut S, is_fin: bool) -> io::Result<usize>
@@ -1255,5 +1253,36 @@ mod tests {
         assert_eq!(bytes_read + header.metadata_len(bytes_read), inner.packet_size as usize);
         assert_eq!(buf, b"lo");
         assert!(!is_fin);
+    }
+
+    #[test]
+    fn flow_data_fin_does_not_change_metadata_length() {
+        let (inner, _) = new_test_inner();
+        let queue_pair = QueuePair {
+            source_queue_id: inner.control_rx.queue_id(),
+            dest_queue_id: inner.control_rx.remote_queue_id().unwrap(),
+        };
+
+        for offset in [VarInt::ZERO, VarInt::from_u8(63), VarInt::from_u8(64), VarInt::MAX] {
+            for payload_len in [0, 1, 63, 64, 4096] {
+                let without_fin = Header::FlowData {
+                    queue_pair,
+                    stream_id: inner.stream_id,
+                    offset,
+                    is_fin: false,
+                };
+                let with_fin = Header::FlowData {
+                    queue_pair,
+                    stream_id: inner.stream_id,
+                    offset,
+                    is_fin: true,
+                };
+
+                assert_eq!(
+                    without_fin.metadata_len(payload_len),
+                    with_fin.metadata_len(payload_len)
+                );
+            }
+        }
     }
 }
