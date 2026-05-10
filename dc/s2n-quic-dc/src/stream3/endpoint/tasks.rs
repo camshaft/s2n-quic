@@ -35,24 +35,7 @@ impl PathSecretMapEntry for crate::stream3::frame::Frame {
 
 /// Routes items to socket senders by using pick-two path scheduling from the path secret map
 /// entry associated with each item.
-pub async fn pick_two<T, R, S>(rx: R, senders: Vec<S>)
-where
-    T: ByteCost + PathSecretMapEntry,
-    R: Receiver<T>,
-    S: Sender<T>,
-{
-    pick_two_with_random(rx, senders, |upper_bound| {
-        debug_assert!(upper_bound > 0);
-        if upper_bound == 0 {
-            0
-        } else {
-            rand::random_range(..upper_bound)
-        }
-    })
-    .await
-}
-
-pub async fn pick_two_with_random<T, R, S, Rand>(mut rx: R, mut senders: Vec<S>, random: Rand)
+pub async fn pick_two<T, R, S, Rand>(mut rx: R, mut senders: Vec<S>, random: Rand)
 where
     T: ByteCost + PathSecretMapEntry,
     R: Receiver<T>,
@@ -100,34 +83,30 @@ where
             let picked = value
                 .path_secret_entry()
                 .pick_sender_by_next_transmission(random);
-            picked % senders.len()
+            debug_assert!(
+                picked < senders.len(),
+                "picked sender index out of bounds: picked={} senders={}",
+                picked,
+                senders.len()
+            );
+            if picked >= senders.len() {
+                return Poll::Ready(false);
+            }
+            picked
         };
 
         match senders[chosen_idx].poll_send(cx, slot) {
             Poll::Ready(Ok(())) => return Poll::Ready(true),
-            Poll::Ready(Err(())) => {
-                senders.swap_remove(chosen_idx);
-                if senders.is_empty() {
-                    return Poll::Ready(false);
-                }
-            }
+            Poll::Ready(Err(())) => return Poll::Ready(false),
             Poll::Pending => {
                 let len = senders.len();
-                let mut retry = false;
                 for offset in 1..len {
                     let idx = (chosen_idx + offset) % len;
                     match senders[idx].poll_send(cx, slot) {
                         Poll::Ready(Ok(())) => return Poll::Ready(true),
-                        Poll::Ready(Err(())) => {
-                            senders.swap_remove(idx);
-                            retry = true;
-                            break;
-                        }
+                        Poll::Ready(Err(())) => return Poll::Ready(false),
                         Poll::Pending => {}
                     }
-                }
-                if retry {
-                    continue;
                 }
                 return Poll::Pending;
             }
