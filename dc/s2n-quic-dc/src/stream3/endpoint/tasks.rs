@@ -43,15 +43,24 @@ impl PathSecretMapEntry for crate::stream3::frame::Frame {
 /// fields that are added later by workers (credentials, packet number, routing, tag, etc).
 const MAX_FRAME_BATCH_PACKET_OVERHEAD: u64 =
     crate::packet::datagram::partial::MAX_FLOW_DATA_HEADER_OVERHEAD as u64;
+const BATCH_FRAMES_POLL_BUDGET: usize = 10;
 
 #[inline]
 fn frame_entry_byte_cost(frame: &Frame) -> u64 {
     let payload_len = frame.payload_len() as u64;
     let header_len = frame.header.encoding_size() as u64;
     let payload_len_varint = if frame.header.has_payload_length() {
-        VarInt::new(payload_len)
-            .unwrap_or(VarInt::MAX)
-            .encoding_size() as u64
+        match VarInt::new(payload_len) {
+            Ok(payload_len) => payload_len.encoding_size() as u64,
+            Err(_) => {
+                debug_assert!(
+                    false,
+                    "frame payload length exceeds VarInt::MAX: {}",
+                    payload_len
+                );
+                VarInt::MAX.encoding_size() as u64
+            }
+        }
     } else {
         0
     };
@@ -183,7 +192,7 @@ where
         let mut batch = FrameBatch::new(first);
 
         // Keep poll work bounded and return the current batch so the executor can make progress.
-        for _ in 0..10 {
+        for _ in 0..BATCH_FRAMES_POLL_BUDGET {
             if batch.byte_cost() >= target_bytes {
                 break;
             }
