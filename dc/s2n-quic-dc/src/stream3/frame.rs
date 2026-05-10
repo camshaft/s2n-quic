@@ -73,6 +73,7 @@ pub enum FailureReason {
 /// Describes what kind of frame this is and the per-frame routing fields. The
 /// source_sender_id is NOT here — it lives on the Frame struct and gets stamped
 /// into the packet header at encryption time by the peer context.
+#[cfg_attr(test, derive(bolero_generator::TypeGenerator))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Header {
     /// Initialize a new flow with the server
@@ -151,16 +152,18 @@ impl Header {
         }
     }
 
-    /// Returns true if this header variant carries a payload in the encrypted region.
+    /// Returns true if this header variant carries a per-frame payload length.
     #[inline]
     pub fn has_payload(&self) -> bool {
         match self {
-            Self::FlowInit { .. } | Self::FlowData { .. } => true,
-            Self::FlowControl { .. }
-            | Self::FlowReset { .. }
+            Self::FlowInit { .. }
+            | Self::FlowData { .. }
+            | Self::FlowControl { .. }
+            | Self::Control { .. } => true,
+            Self::FlowReset { .. }
             | Self::FlowInitValidate { .. }
             | Self::FlowValidateRequest { .. }
-            | Self::Control { .. } => false,
+            => false,
         }
     }
 }

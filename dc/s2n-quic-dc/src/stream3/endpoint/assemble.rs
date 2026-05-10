@@ -12,7 +12,7 @@ use crate::{
     crypto::seal,
     intrusive_queue::Queue,
     msg::segment,
-    packet::{self, datagram::RoutingInfo},
+    packet::{datagram::RoutingInfo, WireVersion},
     socket::pool,
     stream3::{
         endpoint::{inflight, send::Context},
@@ -20,7 +20,8 @@ use crate::{
     },
 };
 use s2n_codec::{Encoder, EncoderBuffer, EncoderValue};
-use s2n_quic_core::{buffer, time::Clock, varint::VarInt};
+use s2n_quic_core::{buffer, varint::VarInt};
+use s2n_quic_platform::features::Gso;
 
 /// Attempt to assemble pending frames into a full GSO datagram of encrypted packets.
 ///
@@ -38,12 +39,13 @@ pub(crate) fn assemble<Clk>(
     clock: &Clk,
     source_sender_id: VarInt,
     source_control_port: u16,
+    gso: &Gso,
     pool: &pool::Pool,
     header_buf: &mut Vec<u8>,
     cancelled: &mut impl crate::socket::channel::UnboundedSender<Queue<Frame>>,
 ) -> Option<pool::descriptor::Segments>
 where
-    Clk: precision::Clock + Clock + ?Sized,
+    Clk: precision::Clock + ?Sized,
 {
     let available_window = context
         .cca
@@ -56,7 +58,8 @@ where
 
     let mtu = context.path_secret_entry.max_datagram_size();
     let now = clock.now();
-    let time_sent = clock.get_time();
+    let time_sent = now.into();
+    let max_segments = gso.max_segments().min(segment::MAX_COUNT);
 
     let unfilled = pool.alloc()?;
 
@@ -70,7 +73,7 @@ where
         let mut watermark: usize = 0;
 
         loop {
-            if segments_written as usize >= segment::MAX_COUNT {
+            if segments_written as usize >= max_segments {
                 break;
             }
 
@@ -95,6 +98,7 @@ where
             // Drain cancelled frames before collecting transmittable ones
             let mut cancelled_queue = Queue::new();
             let mut packet_frames = Queue::new();
+            let mut metadata = MetadataEstimate::new(context.flow_attempt_id_counter);
 
             while let Some(frame) = context.pending.pop_front() {
                 if !frame.should_transmit() {
@@ -102,24 +106,21 @@ where
                     continue;
                 }
 
-                packet_frames.push_back(frame);
-
-                let estimated_len = estimate_segment_len(
+                let next_metadata = metadata.with_frame(&frame);
+                let estimated_len = next_metadata.estimate_packet_len(
                     source_sender_id,
                     context.next_packet_number,
-                    context.flow_attempt_id_counter,
-                    &packet_frames,
-                    header_buf,
+                    &context.credentials,
                     seal::Application::tag_len(&context.sealer),
                 );
 
                 if estimated_len > max_segment_len {
-                    let frame = packet_frames
-                        .pop_back()
-                        .expect("packet_frames is not empty after push_back");
                     context.pending.push_front(frame);
                     break;
                 }
+
+                metadata = next_metadata;
+                packet_frames.push_back(frame);
 
                 if estimated_len == max_segment_len {
                     break;
@@ -221,34 +222,76 @@ where
     ))
 }
 
-fn estimate_segment_len(
-    source_sender_id: VarInt,
-    packet_number: VarInt,
-    initial_flow_attempt_id: VarInt,
-    frames: &Queue<Frame>,
-    header_buf: &mut Vec<u8>,
-    crypto_tag_len: usize,
-) -> usize {
-    let mut flow_attempt_id = initial_flow_attempt_id;
-    let total_payload_len = encode_frame_metadata(frames, &mut flow_attempt_id, header_buf);
-    let header_len = VarInt::new(header_buf.len() as u64).expect("header length fits in VarInt");
-    let payload_len =
-        VarInt::new(total_payload_len as u64).expect("payload length fits in VarInt");
+#[derive(Clone, Copy, Debug)]
+struct MetadataEstimate {
+    header_len: usize,
+    payload_len: usize,
+    flow_attempt_id: VarInt,
+}
 
-    datagram::encoder::estimate_len(
-        packet_number,
-        RoutingInfo::SenderId { source_sender_id },
-        header_len,
-        payload_len,
-        crypto_tag_len,
-    )
+impl MetadataEstimate {
+    #[inline]
+    fn new(flow_attempt_id: VarInt) -> Self {
+        Self {
+            header_len: 0,
+            payload_len: 0,
+            flow_attempt_id,
+        }
+    }
+
+    #[inline]
+    fn with_frame(self, frame: &Frame) -> Self {
+        self.with_frame_parts(&frame.header, frame.payload_len())
+    }
+
+    #[inline]
+    fn with_frame_parts(
+        mut self,
+        header: &crate::stream3::frame::Header,
+        payload_len: usize,
+    ) -> Self {
+        let header = stamp_attempt_id(header, &mut self.flow_attempt_id);
+        self.header_len += frame_metadata_len(&header, payload_len);
+        self.payload_len += payload_len;
+        self
+    }
+
+    #[inline]
+    fn estimate_packet_len(
+        &self,
+        source_sender_id: VarInt,
+        packet_number: VarInt,
+        credentials: &crate::credentials::Credentials,
+        crypto_tag_len: usize,
+    ) -> usize {
+        let header_len =
+            VarInt::new(self.header_len as u64).expect("header length fits in VarInt");
+        let payload_len =
+            VarInt::new(self.payload_len as u64).expect("payload length fits in VarInt");
+        let routing_info = RoutingInfo::SenderId { source_sender_id };
+
+        crate::packet::datagram::Tag::default().encoding_size()
+            + credentials.encoding_size()
+            + WireVersion::ZERO.encoding_size()
+            + core::mem::size_of::<u16>()
+            + packet_number.encoding_size()
+            + routing_info.encoding_size()
+            + payload_len.encoding_size()
+            + if self.header_len > 0 {
+                header_len.encoding_size() + self.header_len
+            } else {
+                0
+            }
+            + self.payload_len
+            + crypto_tag_len
+    }
 }
 
 /// Encode a single segment containing one or more frames.
 ///
 /// Wire layout:
 ///   [packet-level header: tag, credentials, wire_version, source_control_port, pn, SenderId routing]
-///   [header_len varint][frame metadata: Header + payload_len per frame...]
+///   [header_len varint][frame metadata: Header + optional payload_len per frame...]
 ///   [payload_len varint][frame payloads concatenated...]
 ///   [auth tag: 16 bytes]
 ///
@@ -302,19 +345,52 @@ fn encode_frame_metadata(
 
     for frame in frames.iter() {
         let header = stamp_attempt_id(&frame.header, flow_attempt_id);
-        let payload_len = VarInt::try_from(frame.payload_len() as u64).unwrap_or(VarInt::ZERO);
-        let entry_size = header.encoding_size() + payload_len.encoding_size();
-        let start = header_buf.len();
-        header_buf.resize(start + entry_size, 0);
-        let mut enc = EncoderBuffer::new(&mut header_buf[start..]);
-        enc.encode(&header);
-        enc.encode(&payload_len);
-        debug_assert_eq!(enc.len(), entry_size);
+        push_frame_metadata(header_buf, &header, frame.payload_len());
 
         total_payload_len += frame.payload_len();
     }
 
     total_payload_len
+}
+
+#[inline]
+fn frame_metadata_len(header: &crate::stream3::frame::Header, payload_len: usize) -> usize {
+    if header.has_payload() {
+        let payload_len = VarInt::try_from(payload_len as u64).unwrap_or(VarInt::ZERO);
+        header.encoding_size() + payload_len.encoding_size()
+    } else {
+        debug_assert_eq!(payload_len, 0);
+        header.encoding_size()
+    }
+}
+
+#[inline]
+fn push_frame_metadata(
+    header_buf: &mut Vec<u8>,
+    header: &crate::stream3::frame::Header,
+    payload_len: usize,
+) {
+    let entry_size = frame_metadata_len(header, payload_len);
+    let start = header_buf.len();
+    header_buf.reserve(entry_size);
+
+    // SAFETY: `reserve` ensures the requested capacity is available and the encoder writes exactly
+    // `entry_size` bytes into the newly-exposed slice before it is observed.
+    unsafe {
+        header_buf.set_len(start + entry_size);
+    }
+
+    let mut enc = EncoderBuffer::new(&mut header_buf[start..]);
+    enc.encode(header);
+
+    if header.has_payload() {
+        let payload_len = VarInt::try_from(payload_len as u64).unwrap_or(VarInt::ZERO);
+        enc.encode(&payload_len);
+    } else {
+        debug_assert_eq!(payload_len, 0);
+    }
+
+    debug_assert_eq!(enc.len(), entry_size);
 }
 
 /// Produce a Header with attempt_id stamped for FlowInit frames.
@@ -406,34 +482,82 @@ mod tests {
     use super::*;
     use crate::{
         byte_vec::ByteVec,
+        clock::testing::Clock,
         counter::Registry,
-        packet::datagram::{QueuePair, ResetTarget},
+        packet::datagram::ResetTarget,
         path::secret::map::Entry as PathSecretEntry,
         stream3::frame::{Frame, Header, TransmissionStatus, DEFAULT_TTL},
     };
-    use bolero::{check, TypeGenerator};
+    use bolero::check;
     use bytes::Bytes;
     use core::time::Duration;
+    use s2n_quic_platform::features::gso::MaxSegments;
     use std::sync::Arc;
 
-    #[derive(Clone, Copy)]
-    struct FixedClock(precision::Timestamp);
+    const MAX_TEST_FRAMES: usize = segment::MAX_COUNT * 2;
+    const MAX_TEST_PAYLOAD_LEN: usize = 8_500;
+    const MIN_TEST_MTU: u16 = 1_200;
+    const MAX_TEST_MTU: u16 = 8_950;
+    const TEST_CRYPTO_TAG_LEN: usize = 16;
 
-    impl precision::Clock for FixedClock {
-        type Timer = crate::clock::Timer;
+    #[derive(Clone, Debug)]
+    struct FrameInput {
+        header: Header,
+        payload: Vec<u8>,
+    }
 
-        fn now(&self) -> precision::Timestamp {
-            self.0
-        }
+    impl bolero_generator::TypeGenerator for FrameInput {
+        fn generate<D>(driver: &mut D) -> Option<Self>
+        where
+            D: bolero_generator::Driver,
+        {
+            use bolero_generator::{TypeGenerator as _, ValueGenerator as _};
 
-        fn timer(&self) -> Self::Timer {
-            unreachable!("FixedClock is a test fixture and does not support timer construction")
+            let header = Header::generate(driver)?;
+            let payload_len = (0..=MAX_TEST_PAYLOAD_LEN).generate(driver)?;
+            let mut payload = Vec::with_capacity(payload_len);
+            for _ in 0..payload_len {
+                payload.push(<u8 as bolero_generator::TypeGenerator>::generate(driver)?);
+            }
+
+            Some(Self { header, payload })
         }
     }
 
-    impl s2n_quic_core::time::Clock for FixedClock {
-        fn get_time(&self) -> s2n_quic_core::time::Timestamp {
-            self.0.into()
+    #[derive(Clone, Debug)]
+    struct HarnessInput {
+        mtu: u16,
+        max_segments: usize,
+        source_sender_id: VarInt,
+        source_control_port: u16,
+        frames: Vec<FrameInput>,
+    }
+
+    impl bolero_generator::TypeGenerator for HarnessInput {
+        fn generate<D>(driver: &mut D) -> Option<Self>
+        where
+            D: bolero_generator::Driver,
+        {
+            use bolero_generator::{TypeGenerator as _, ValueGenerator as _};
+
+            let mtu = (MIN_TEST_MTU..=MAX_TEST_MTU).generate(driver)?;
+            let max_segments = (1..=segment::MAX_COUNT).generate(driver)?;
+            let source_sender_id = VarInt::generate(driver)?;
+            let source_control_port =
+                <u16 as bolero_generator::TypeGenerator>::generate(driver)?;
+
+            let mut frames = Vec::with_capacity(MAX_TEST_FRAMES);
+            for _ in 0..MAX_TEST_FRAMES {
+                frames.push(FrameInput::generate(driver)?);
+            }
+
+            Some(Self {
+                mtu,
+                max_segments,
+                source_sender_id,
+                source_control_port,
+                frames,
+            })
         }
     }
 
@@ -446,166 +570,6 @@ mod tests {
         }
     }
 
-    #[derive(Clone, Debug, TypeGenerator)]
-    enum HeaderSpec {
-        FlowInit {
-            source_queue_id: u8,
-            dest_acceptor_id: u8,
-            fresh_attempt_id: bool,
-            stream_id: u8,
-            is_fin: bool,
-        },
-        FlowData {
-            source_queue_id: u8,
-            dest_queue_id: u8,
-            stream_id: u8,
-            offset: u16,
-            is_fin: bool,
-        },
-        FlowControl {
-            source_queue_id: u8,
-            dest_queue_id: u8,
-            stream_id: u8,
-        },
-        FlowReset {
-            dest_queue_id: u8,
-            stream_id: u8,
-            reset_target: ResetTargetSpec,
-            error_code: u8,
-        },
-        FlowInitValidate {
-            source_queue_id: u8,
-            dest_queue_id: u8,
-            attempt_id: u8,
-            stream_id: u8,
-        },
-        FlowValidateRequest {
-            dest_sender_id: u8,
-            source_queue_id: u8,
-            dest_queue_id: u8,
-            attempt_id: u8,
-            stream_id: u8,
-        },
-        Control {
-            dest_sender_id: u8,
-        },
-    }
-
-    #[derive(Clone, Copy, Debug, TypeGenerator)]
-    enum ResetTargetSpec {
-        Both,
-        Stream,
-        Control,
-    }
-
-    #[derive(Clone, Debug, TypeGenerator)]
-    struct FrameSpec {
-        header: HeaderSpec,
-        payload: Vec<u8>,
-    }
-
-    impl ResetTargetSpec {
-        fn into_reset_target(self) -> ResetTarget {
-            match self {
-                Self::Both => ResetTarget::Both,
-                Self::Stream => ResetTarget::Stream,
-                Self::Control => ResetTarget::Control,
-            }
-        }
-    }
-
-    impl HeaderSpec {
-        fn into_header(self) -> Header {
-            match self {
-                Self::FlowInit {
-                    source_queue_id,
-                    dest_acceptor_id,
-                    fresh_attempt_id,
-                    stream_id,
-                    is_fin,
-                } => Header::FlowInit {
-                    source_queue_id: VarInt::from_u8(source_queue_id),
-                    dest_acceptor_id: VarInt::from_u8(dest_acceptor_id),
-                    attempt_id: if fresh_attempt_id {
-                        VarInt::MAX
-                    } else {
-                        VarInt::from_u8(source_queue_id)
-                    },
-                    stream_id: VarInt::from_u8(stream_id),
-                    is_fin,
-                },
-                Self::FlowData {
-                    source_queue_id,
-                    dest_queue_id,
-                    stream_id,
-                    offset,
-                    is_fin,
-                } => Header::FlowData {
-                    queue_pair: QueuePair {
-                        source_queue_id: VarInt::from_u8(source_queue_id),
-                        dest_queue_id: VarInt::from_u8(dest_queue_id),
-                    },
-                    stream_id: VarInt::from_u8(stream_id),
-                    offset: VarInt::from_u16(offset),
-                    is_fin,
-                },
-                Self::FlowControl {
-                    source_queue_id,
-                    dest_queue_id,
-                    stream_id,
-                } => Header::FlowControl {
-                    queue_pair: QueuePair {
-                        source_queue_id: VarInt::from_u8(source_queue_id),
-                        dest_queue_id: VarInt::from_u8(dest_queue_id),
-                    },
-                    stream_id: VarInt::from_u8(stream_id),
-                },
-                Self::FlowReset {
-                    dest_queue_id,
-                    stream_id,
-                    reset_target,
-                    error_code,
-                } => Header::FlowReset {
-                    dest_queue_id: VarInt::from_u8(dest_queue_id),
-                    stream_id: VarInt::from_u8(stream_id),
-                    reset_target: reset_target.into_reset_target(),
-                    error_code: VarInt::from_u8(error_code),
-                },
-                Self::FlowInitValidate {
-                    source_queue_id,
-                    dest_queue_id,
-                    attempt_id,
-                    stream_id,
-                } => Header::FlowInitValidate {
-                    queue_pair: QueuePair {
-                        source_queue_id: VarInt::from_u8(source_queue_id),
-                        dest_queue_id: VarInt::from_u8(dest_queue_id),
-                    },
-                    attempt_id: VarInt::from_u8(attempt_id),
-                    stream_id: VarInt::from_u8(stream_id),
-                },
-                Self::FlowValidateRequest {
-                    dest_sender_id,
-                    source_queue_id,
-                    dest_queue_id,
-                    attempt_id,
-                    stream_id,
-                } => Header::FlowValidateRequest {
-                    dest_sender_id: VarInt::from_u8(dest_sender_id),
-                    queue_pair: QueuePair {
-                        source_queue_id: VarInt::from_u8(source_queue_id),
-                        dest_queue_id: VarInt::from_u8(dest_queue_id),
-                    },
-                    attempt_id: VarInt::from_u8(attempt_id),
-                    stream_id: VarInt::from_u8(stream_id),
-                },
-                Self::Control { dest_sender_id } => Header::Control {
-                    dest_sender_id: VarInt::from_u8(dest_sender_id),
-                },
-            }
-        }
-    }
-
     fn make_context(mtu: u16) -> (Context, Arc<PathSecretEntry>) {
         let entry = PathSecretEntry::fake("127.0.0.1:8080".parse().unwrap(), None);
         entry.update_max_datagram_size(mtu);
@@ -614,23 +578,46 @@ mod tests {
         (Context::new(&entry, gauge), entry)
     }
 
-    fn to_frame(
-        spec: FrameSpec,
-        entry: &Arc<PathSecretEntry>,
-        mtu: u16,
-    ) -> crate::intrusive_queue::Entry<Frame> {
-        const MAX_TEST_PAYLOAD_DIVISOR: usize = 4;
+    fn make_gso(max_segments: usize) -> Gso {
+        MaxSegments::try_from(max_segments).unwrap().into()
+    }
 
-        let payload = spec
-            .payload
-            .into_iter()
-            .take((mtu as usize / MAX_TEST_PAYLOAD_DIVISOR).max(1))
-            .collect::<Vec<_>>();
+    fn payload_len(frame: &FrameInput) -> usize {
+        if frame.header.has_payload() {
+            frame.payload.len()
+        } else {
+            0
+        }
+    }
+
+    fn is_frame_encodable(
+        frame: &FrameInput,
+        source_sender_id: VarInt,
+        credentials: &crate::credentials::Credentials,
+        mtu: u16,
+    ) -> bool {
+        MetadataEstimate::new(VarInt::ZERO)
+            .with_frame_parts(&frame.header, payload_len(frame))
+            .estimate_packet_len(
+                source_sender_id,
+                VarInt::ZERO,
+                credentials,
+                TEST_CRYPTO_TAG_LEN,
+            )
+            <= mtu as usize
+    }
+
+    fn to_frame(frame: &FrameInput, entry: &Arc<PathSecretEntry>) -> crate::intrusive_queue::Entry<Frame> {
+        let payload = if frame.header.has_payload() {
+            frame.payload.as_slice()
+        } else {
+            &[]
+        };
 
         Frame {
-            header: spec.header.into_header(),
+            header: frame.header,
             source_sender_id: VarInt::MAX,
-            payload: payload_vec(&payload),
+            payload: payload_vec(payload),
             path_secret_entry: entry.clone(),
             completion: None,
             status: TransmissionStatus::default(),
@@ -648,10 +635,98 @@ mod tests {
         payload
     }
 
-    fn assert_gso_invariants(segments: &pool::descriptor::Segments, mtu: u16) {
+    #[derive(Debug, PartialEq, Eq)]
+    struct Oracle {
+        packet_sizes: Vec<u16>,
+        remaining_frames: usize,
+    }
+
+    fn oracle(
+        frames: &[FrameInput],
+        source_sender_id: VarInt,
+        credentials: &crate::credentials::Credentials,
+        mtu: u16,
+        max_segments: usize,
+    ) -> Oracle {
+        let mut packet_sizes = Vec::new();
+        let mut segment_size = 0u16;
+        let mut offset = 0usize;
+        let mut packet_number = VarInt::ZERO;
+        let mut flow_attempt_id = VarInt::ZERO;
+        let mut next_idx = 0usize;
+
+        while next_idx < frames.len() && packet_sizes.len() < max_segments {
+            let remaining_total =
+                segment::MAX_TOTAL as usize - offset.min(segment::MAX_TOTAL as usize);
+            let max_segment_len = if segment_size == 0 {
+                remaining_total.min(mtu as usize)
+            } else {
+                remaining_total.min(segment_size as usize)
+            };
+
+            if max_segment_len == 0 {
+                break;
+            }
+
+            let start_idx = next_idx;
+            let mut metadata = MetadataEstimate::new(flow_attempt_id);
+
+            while let Some(frame) = frames.get(next_idx) {
+                let next_metadata = metadata.with_frame_parts(&frame.header, payload_len(frame));
+                let estimated_len = next_metadata.estimate_packet_len(
+                    source_sender_id,
+                    packet_number,
+                    credentials,
+                    TEST_CRYPTO_TAG_LEN,
+                );
+
+                if estimated_len > max_segment_len {
+                    break;
+                }
+
+                metadata = next_metadata;
+                next_idx += 1;
+
+                if estimated_len == max_segment_len {
+                    break;
+                }
+            }
+
+            if next_idx == start_idx {
+                break;
+            }
+
+            let packet_len = metadata.estimate_packet_len(
+                source_sender_id,
+                packet_number,
+                credentials,
+                TEST_CRYPTO_TAG_LEN,
+            ) as u16;
+            packet_sizes.push(packet_len);
+
+            if segment_size == 0 {
+                segment_size = packet_len;
+            }
+
+            offset += segment_size as usize;
+            flow_attempt_id = metadata.flow_attempt_id;
+            packet_number += 1;
+
+            if packet_len < segment_size {
+                break;
+            }
+        }
+
+        Oracle {
+            packet_sizes,
+            remaining_frames: frames.len().saturating_sub(next_idx),
+        }
+    }
+
+    fn assert_gso_invariants(segments: &pool::descriptor::Segments, mtu: u16, max_segments: usize) {
         let sizes = segments.sizes().collect::<Vec<_>>();
         assert!(!sizes.is_empty());
-        assert!(sizes.len() <= segment::MAX_COUNT);
+        assert!(sizes.len() <= max_segments);
         assert!(segments.total_payload_len() <= segment::MAX_TOTAL);
 
         let segment_len = sizes[0];
@@ -672,7 +747,8 @@ mod tests {
     fn assemble_accounts_for_header_overhead() {
         let mtu = 256;
         let (mut context, entry) = make_context(mtu);
-        let clock = FixedClock(precision::Timestamp { nanos: 1_000 });
+        let clock = Clock::new(Duration::from_micros(1));
+        let gso = make_gso(1);
         let pool = pool::Pool::new(u16::MAX);
         let mut header_buf = Vec::new();
         let mut cancelled = CancelledSender(Vec::new());
@@ -703,77 +779,74 @@ mod tests {
             &clock,
             VarInt::from_u8(1),
             443,
+            &gso,
             &pool,
             &mut header_buf,
             &mut cancelled,
         )
         .expect("frames should assemble");
 
-        assert_gso_invariants(&segments, mtu);
+        assert_gso_invariants(&segments, mtu, gso.max_segments().min(segment::MAX_COUNT));
         assert!(context.has_pending(), "header-heavy frames should spill into another batch");
     }
 
     #[test]
     fn assemble_fuzz_respects_gso_invariants() {
-        let mtu = 256;
-        const MAX_TEST_FRAMES: usize = segment::MAX_COUNT * 2;
-        const TEST_CRYPTO_TAG_LEN: usize = 16;
-
         check!()
-            .with_type::<Vec<FrameSpec>>()
+            .with_type::<HarnessInput>()
             .with_test_time(Duration::from_secs(10))
-            .for_each(|specs| {
-                let specs = specs
+            .for_each(|input| {
+                let (mut context, entry) = make_context(input.mtu);
+                let frames = input
+                    .frames
                     .iter()
-                    .take(MAX_TEST_FRAMES)
+                    .filter(|frame| {
+                        is_frame_encodable(
+                            frame,
+                            input.source_sender_id,
+                            &context.credentials,
+                            input.mtu,
+                        )
+                    })
                     .cloned()
                     .collect::<Vec<_>>();
-                let (mut context, entry) = make_context(mtu);
-                let clock = FixedClock(precision::Timestamp { nanos: 1_000 });
+                if frames.is_empty() {
+                    return;
+                }
+
+                let max_segments = input.max_segments.min(segment::MAX_COUNT);
+                let oracle = oracle(
+                    &frames,
+                    input.source_sender_id,
+                    &context.credentials,
+                    input.mtu,
+                    max_segments,
+                );
+                let clock = Clock::new(Duration::from_micros(1));
+                let gso = make_gso(max_segments);
                 let pool = pool::Pool::new(u16::MAX);
                 let mut header_buf = Vec::new();
                 let mut cancelled = CancelledSender(Vec::new());
 
-                for spec in specs {
-                    let frame = to_frame(spec, &entry, mtu);
-                    let mut single = Queue::new();
-                    single.push_back(frame);
-
-                    if estimate_segment_len(
-                        VarInt::from_u8(1),
-                        VarInt::ZERO,
-                        context.flow_attempt_id_counter,
-                        &single,
-                        &mut header_buf,
-                        TEST_CRYPTO_TAG_LEN,
-                    ) <= mtu as usize
-                    {
-                        context.push_frame(
-                            single
-                                .pop_front()
-                                .expect("single-frame queue should contain one frame"),
-                        );
-                    }
+                for frame in &frames {
+                    context.push_frame(to_frame(frame, &entry));
                 }
 
-                let mut batches = 0usize;
-                while context.has_pending() {
-                    let segments = assemble(
-                        &mut context,
-                        &clock,
-                        VarInt::from_u8(1),
-                        443,
-                        &pool,
-                        &mut header_buf,
-                        &mut cancelled,
-                    )
-                    .expect("assemble should make progress for bounded test inputs");
+                let segments = assemble(
+                    &mut context,
+                    &clock,
+                    input.source_sender_id,
+                    input.source_control_port,
+                    &gso,
+                    &pool,
+                    &mut header_buf,
+                    &mut cancelled,
+                )
+                .expect("assemble should make progress for bounded test inputs");
 
-                    assert_gso_invariants(&segments, mtu);
-                    context.cca = crate::congestion::Controller::new(mtu);
-                    batches += 1;
-                    assert!(batches <= MAX_TEST_FRAMES);
-                }
+                assert_gso_invariants(&segments, input.mtu, max_segments);
+                assert_eq!(segments.sizes().collect::<Vec<_>>(), oracle.packet_sizes);
+                assert_eq!(context.pending.len(), oracle.remaining_frames);
             });
     }
 }
