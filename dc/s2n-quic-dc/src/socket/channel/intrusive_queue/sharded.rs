@@ -371,12 +371,8 @@ impl<A: intrusive_queue::Adapter> super::super::Receiver<intrusive_queue::List<A
         &mut self,
         cx: &mut core::task::Context<'_>,
     ) -> Poll<Option<intrusive_queue::List<A>>> {
-        if let TryRecv::Ready(list) = self.try_recv() {
-            return Poll::Ready(Some(list));
-        }
-
-        // Register the waker before the final check for new items, so we cannot miss a
-        // concurrent send between the failed try_recv above and checking sender_count.
+        // Register the waker before checking for items so we cannot miss a concurrent send
+        // between the occupancy check and returning Poll::Pending.
         self.shared.recv_waker.register(cx.waker());
 
         if let TryRecv::Ready(list) = self.try_recv() {

@@ -408,15 +408,31 @@ pub async fn socket_send_task<Socket, BatchRx, AckRx>(
     // For now, drain and discard all incoming batches and ACKs so that the endpoint can run
     // without panicking, and so that channels don't back up. This is intentionally a no-op
     // stub until the send path is implemented.
-    use crate::socket::channel::ReceiverExt as _;
     use core::future;
+    use core::task::Poll;
 
-    future::poll_fn(|cx| {
-        // Drain batch channel
-        while let core::task::Poll::Ready(Some(_)) = batch_rx.poll_recv(cx) {}
-        // Drain ACK channel
-        while let core::task::Poll::Ready(Some(_)) = ack_rx.poll_recv(cx) {}
-        core::task::Poll::Pending
+    // Drain both channels with a per-poll budget so the stub does not starve other tasks.
+    future::poll_fn(move |cx| {
+        let mut done = 0;
+        for _ in 0..DEFAULT_DISPATCH_BUDGET {
+            match batch_rx.poll_recv(cx) {
+                Poll::Ready(Some(_)) => done += 1,
+                Poll::Ready(None) => return Poll::Ready(()),
+                Poll::Pending => break,
+            }
+        }
+        for _ in 0..DEFAULT_DISPATCH_BUDGET {
+            match ack_rx.poll_recv(cx) {
+                Poll::Ready(Some(_)) => done += 1,
+                Poll::Ready(None) => return Poll::Ready(()),
+                Poll::Pending => break,
+            }
+        }
+        // If we consumed items this round, yield so other tasks can run.
+        if done > 0 {
+            cx.waker().wake_by_ref();
+        }
+        Poll::Pending
     })
     .await
 }
