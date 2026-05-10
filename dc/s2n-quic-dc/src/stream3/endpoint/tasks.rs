@@ -55,7 +55,7 @@ fn frame_entry_byte_cost(frame: &Frame) -> u64 {
             Err(_) => {
                 debug_assert!(
                     payload_len > VarInt::MAX.as_u64(),
-                    "frame payload length exceeds VarInt::MAX: {}",
+                    "frame payload length exceeds VarInt::MAX and will use max varint encoding: {}",
                     payload_len
                 );
                 VarInt::MAX.encoding_size() as u64
@@ -96,10 +96,8 @@ impl FrameBatch {
     }
 
     #[inline]
-    fn push(&mut self, frame: Entry<Frame>) {
-        self.byte_cost = self
-            .byte_cost
-            .saturating_add(frame_entry_byte_cost(&frame));
+    fn push_with_cost(&mut self, frame: Entry<Frame>, frame_cost: u64) {
+        self.byte_cost = self.byte_cost.saturating_add(frame_cost);
         self.queue.push_back(frame);
     }
 
@@ -208,15 +206,14 @@ where
                         break;
                     }
 
-                    let next_cost = batch
-                        .byte_cost()
-                        .saturating_add(frame_entry_byte_cost(&frame));
+                    let frame_cost = frame_entry_byte_cost(&frame);
+                    let next_cost = batch.byte_cost().saturating_add(frame_cost);
                     if next_cost > target_bytes {
                         self.buffered = Some(frame);
                         break;
                     }
 
-                    batch.push(frame);
+                    batch.push_with_cost(frame, frame_cost);
                 }
                 Poll::Ready(None) | Poll::Pending => break,
             }
