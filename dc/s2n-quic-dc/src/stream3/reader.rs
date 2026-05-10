@@ -273,7 +273,7 @@ impl Inner {
             return Poll::Ready(Ok(()));
         }
 
-        match self.poll_stream_rx(cx)? {
+        match self.poll_stream_rx::<buffer::writer::storage::Empty>(cx, None)? {
             Poll::Ready(()) => {
                 if self.status.is_pending_validation() {
                     Poll::Pending
@@ -558,7 +558,7 @@ where
     S: buffer::writer::Storage + ?Sized,
     R: buffer::reader::Reader + ?Sized,
 {
-    if let Some(app_buf) = app_buf.filter(|app_buf| reassembler.buffer_is_empty()) {
+    if let Some(app_buf) = app_buf.filter(|_| reassembler.is_empty()) {
         let mut interposer = Interposer::new(app_buf, reassembler);
         interposer.read_from(reader)
     } else {
