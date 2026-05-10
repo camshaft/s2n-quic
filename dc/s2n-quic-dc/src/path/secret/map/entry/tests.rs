@@ -40,6 +40,7 @@ fn entry_size() {
     if should_check {
         assert_eq!(
             Entry::fake((std::net::Ipv4Addr::LOCALHOST, 0).into(), None).size(),
+            // Includes per-entry sender scheduling storage metadata (Box<[AtomicU64]> + one slot).
             331
         );
     }
