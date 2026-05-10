@@ -290,16 +290,20 @@ where
 /// Reads batches of frames from the sharded submission channel, groups consecutive frames for
 /// the same path-secret entry, and routes each batch to a send socket via pick-two scheduling.
 ///
+/// `socket_senders` is generic so callers can wrap or transform senders (e.g., add pacing,
+/// metrics, or local unsync senders when the target is on the same worker).
+///
 /// # Waker registration
 ///
 /// The sharded receiver requires explicit waker registration before it can wake the task.
 /// This function registers the waker on entry (before blocking) so the channel can wake us
 /// when new frames arrive.
-pub async fn frame_dispatch<Rand>(
+pub async fn frame_dispatch<S, Rand>(
     frame_rx: crate::stream3::frame::SubmissionReceiver,
-    socket_senders: Vec<crate::socket::channel::cell::sync::Sender<FrameBatch>>,
+    socket_senders: Vec<S>,
     random: Rand,
 ) where
+    S: Sender<FrameBatch>,
     Rand: Fn(usize) -> usize,
 {
     // Register the receiver's waker before first poll so senders can wake us up.
@@ -318,6 +322,9 @@ pub async fn frame_dispatch<Rand>(
 
 /// Per-socket send worker: receives frame batches, assembles packets, sends via socket.
 ///
+/// `batch_rx` and `ack_rx` are generic so callers can wrap them with pacing, metrics, or
+/// local unsync receivers when the sender is on the same worker.
+///
 /// Maintains a per-peer [`send::Context`] cache. For each incoming [`FrameBatch`] the frames are
 /// pushed onto the matching context's pending queue, [`assemble`] is called to encrypt and pack
 /// them into GSO segments, and the segments are sent through `socket`. Concurrently, incoming
@@ -327,41 +334,45 @@ pub async fn frame_dispatch<Rand>(
 /// [`send::Context`]: crate::stream3::endpoint::send::Context
 /// [`assemble`]: crate::stream3::endpoint::assemble::assemble
 /// [`ack::process_ack`]: crate::stream3::endpoint::ack::process_ack
-pub async fn socket_send_task<Socket>(
+pub async fn socket_send_task<Socket, BatchRx, AckRx>(
     _socket: Socket,
-    _batch_rx: crate::socket::channel::cell::sync::Receiver<FrameBatch>,
-    _ack_rx: crate::socket::channel::intrusive_queue::sync::Receiver<
-        crate::stream3::endpoint::msg::Sender,
-    >,
+    _batch_rx: BatchRx,
+    _ack_rx: AckRx,
     _sender_idx: usize,
     _source_control_port: u16,
     _gso: s2n_quic_platform::features::Gso,
     _pool: crate::socket::pool::Pool,
 ) where
     Socket: crate::socket::send::Socket,
+    BatchRx: Receiver<FrameBatch>,
+    AckRx: Receiver<crate::intrusive_queue::Entry<crate::stream3::endpoint::msg::Sender>>,
 {
     todo!("socket_send_task: assemble frames and send via socket — see stream3 send-path TODO")
 }
 
 /// Per-socket receive worker: reads raw UDP segments and routes decoded packets to dispatch.
 ///
-/// Drives a [`SocketReceiver`] → [`FlattenSegments`] → [`RouterAdapter`] chain. Each segment is
-/// handed to [`ChannelRouter`] which decodes the outer packet header, dispatches datagram packets
-/// to `packet_tx`, and records decode errors.
+/// `packet_tx` is generic so callers can substitute a local unsync sender when the dispatch
+/// task is co-located on the same worker.
+///
+/// Drives a [`SocketReceiver`] → [`FlattenSegments`] → [`ChannelRouter`] chain. Each segment is
+/// decoded and datagram packets are forwarded via `packet_tx` to the dispatch task.
 ///
 /// [`SocketReceiver`]: crate::socket::channel::SocketReceiver
 /// [`FlattenSegments`]: crate::socket::channel::FlattenSegments
-/// [`RouterAdapter`]: crate::socket::channel::RouterAdapter
 /// [`ChannelRouter`]: crate::stream3::endpoint::worker::ChannelRouter
-pub async fn socket_recv_task<Socket>(
+pub async fn socket_recv_task<Socket, Tx>(
     socket: Socket,
     pool: crate::socket::pool::Pool,
-    tx: crate::socket::channel::intrusive_queue::sync::Sender<
-        crate::packet::datagram::decoder::Packet<crate::socket::pool::descriptor::Filled>,
-    >,
+    tx: Tx,
     decode_error_counter: crate::counter::Counter,
 ) where
     Socket: crate::socket::recv::Socket,
+    Tx: crate::socket::channel::UnboundedSender<
+        crate::intrusive_queue::Entry<
+            crate::packet::datagram::decoder::Packet<crate::socket::pool::descriptor::Filled>,
+        >,
+    >,
 {
     use crate::{
         socket::{
@@ -394,6 +405,9 @@ pub async fn socket_recv_task<Socket>(
 
 /// Per-worker packet dispatch loop: decrypts, deduplicates, and dispatches received packets.
 ///
+/// `packet_rx` and `ack_sender` are generic so callers can substitute local unsync receivers
+/// or a custom ACK fan-out when tasks are co-located on the same worker.
+///
 /// Owns a [`recv::Cache`] for per-sender crypto state. For each packet, calls
 /// [`dispatch::process`] which:
 /// * Authenticates and decrypts the payload,
@@ -406,41 +420,34 @@ pub async fn socket_recv_task<Socket>(
 ///
 /// [`recv::Cache`]: crate::stream3::endpoint::recv::Cache
 /// [`dispatch::process`]: crate::stream3::endpoint::dispatch::process
-pub async fn packet_dispatch_task<Clk>(
-    mut packet_rx: crate::socket::channel::intrusive_queue::sync::Receiver<
-        crate::packet::datagram::decoder::Packet<crate::socket::pool::descriptor::Filled>,
-    >,
+pub async fn packet_dispatch_task<PacketRx, AckTx, Clk>(
+    mut packet_rx: PacketRx,
     worker_id: usize,
     idle_timeout: core::time::Duration,
     path_secret_map: crate::path::secret::Map,
     acceptor_registry: crate::acceptor::Registry<crate::stream3::Stream>,
     frame_tx: crate::stream3::frame::SubmissionSender,
-    mut ack_sender: crate::stream3::endpoint::routing::AckSender,
+    mut ack_sender: AckTx,
     mut queue_dispatcher: crate::stream3::endpoint::msg::queue::Dispatcher,
     counters: crate::stream3::endpoint::counters::Dispatch,
     clock: Clk,
 ) where
+    PacketRx: Receiver<
+        crate::intrusive_queue::Entry<
+            crate::packet::datagram::decoder::Packet<crate::socket::pool::descriptor::Filled>,
+        >,
+    >,
+    AckTx: crate::socket::channel::UnboundedSender<crate::stream3::endpoint::msg::Sender>,
     Clk: s2n_quic_core::time::Clock + crate::clock::precision::Clock,
 {
-    use crate::{
-        socket::channel::Receiver as ChannelReceiver,
-        stream3::endpoint::{dispatch, recv},
-    };
-
-    type PacketEntry = crate::intrusive_queue::Entry<
-        crate::packet::datagram::decoder::Packet<crate::socket::pool::descriptor::Filled>,
-    >;
+    use crate::stream3::endpoint::{dispatch, recv};
 
     let mut recv_cache = recv::Cache::new(idle_timeout, worker_id);
     // Response frames (ACKs sent back to peers) re-enter via the same submission channel.
     let mut response_tx = frame_tx.clone();
 
     loop {
-        let packet = core::future::poll_fn(|cx| {
-            <_ as ChannelReceiver<PacketEntry>>::poll_recv(&mut packet_rx, cx)
-        })
-        .await;
-        let Some(packet) = packet else {
+        let Some(packet) = packet_rx.recv().await else {
             break;
         };
 
@@ -458,6 +465,7 @@ pub async fn packet_dispatch_task<Clk>(
         );
     }
 }
+
 
 #[cfg(test)]
 mod tests {
