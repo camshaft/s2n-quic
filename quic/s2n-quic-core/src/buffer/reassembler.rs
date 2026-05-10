@@ -17,6 +17,8 @@ mod duplex;
 mod probe;
 mod reader;
 mod request;
+pub mod segments;
+pub mod slot_storage;
 mod slot;
 mod writer;
 
@@ -25,6 +27,9 @@ mod tests;
 
 use request::Request;
 use slot::Slot;
+
+pub use segments::Segments;
+pub use slot_storage::SlotStorage;
 
 /// The default buffer size for slots that the [`Reassembler`] uses.
 ///

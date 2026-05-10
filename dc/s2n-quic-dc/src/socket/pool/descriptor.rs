@@ -495,6 +495,39 @@ impl s2n_quic_core::buffer::reader::Storage for Filled {
     }
 }
 
+impl s2n_quic_core::buffer::SlotStorage for Filled {
+    #[inline]
+    fn len(&self) -> usize {
+        self.len() as usize
+    }
+
+    #[inline]
+    fn is_empty(&self) -> bool {
+        self.is_empty()
+    }
+
+    #[inline]
+    fn as_slice(&self) -> &[u8] {
+        self.payload()
+    }
+
+    #[inline]
+    fn advance(&mut self, len: usize) {
+        self.advance(len as u16);
+    }
+
+    #[inline]
+    fn truncate(&mut self, len: usize) {
+        self.truncate(len as u16);
+    }
+
+    #[inline]
+    fn split_off_prefix(&mut self, at: usize) -> Self {
+        self.split_to(at as u16)
+    }
+}
+
+
 impl Filled {
     /// Creates a deep copy of this filled descriptor by allocating a new buffer
     /// and copying the payload bytes. This is safe because the copy gets its own

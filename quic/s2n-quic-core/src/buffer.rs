@@ -13,4 +13,6 @@ pub use duplex::Duplex;
 pub use error::Error;
 pub use reader::Reader;
 pub use reassembler::Reassembler;
+pub use reassembler::Segments;
+pub use reassembler::SlotStorage;
 pub use writer::Writer;
