@@ -641,9 +641,12 @@ mod tests {
 
         assert!(app_buf.is_empty());
         assert_eq!(reassembler.consumed_len(), 0);
-        assert_eq!(reassembler.total_received_len(), 4);
+        assert_eq!(reassembler.total_received_len(), 0);
         assert!(reassembler.is_empty());
         assert!(!reassembler.is_reading_complete());
+
+        reassembler.write_at(0u32.into(), &Data::send_one_at(0, 4)).unwrap();
+        assert_eq!(reassembler.len(), 8);
     }
 
     #[test]
