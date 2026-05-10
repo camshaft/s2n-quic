@@ -720,9 +720,14 @@ impl Inner {
             payload_budget = next;
         }
 
-        unreachable!(
-            "payload budget did not converge: header={header:?} available={available} budget={payload_budget} iterations={MAX_PAYLOAD_BUDGET_ITERATIONS}"
+        debug!(
+            ?header,
+            available,
+            payload_budget,
+            iterations = MAX_PAYLOAD_BUDGET_ITERATIONS,
+            "payload budget did not converge; using conservative fallback"
         );
+        available.saturating_sub(header.metadata_len(available))
     }
 
     fn send_data<S>(&mut self, buf: &mut S, is_fin: bool) -> io::Result<usize>
