@@ -282,25 +282,26 @@ impl Inner {
     where
         S: buffer::writer::Storage,
     {
+        if self.status.is_complete() {
+            return Poll::Ready(Ok(0));
+        }
+
         let mut tracker = buf.track_write();
-        let _ = self.poll_stream_rx(cx, &mut tracker)?;
+        let stream_result = if self.status.is_reset() {
+            Poll::Ready(Ok(()))
+        } else {
+            self.poll_stream_rx(cx, &mut tracker)
+        };
 
         if self.status.is_pending_validation() {
+            if let Poll::Ready(Err(err)) = stream_result {
+                return Poll::Ready(Err(err));
+            }
+
             return Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "stream not yet validated - call validate() first",
             )));
-        }
-
-        if self.status.is_reset() {
-            if let Some(error_code) = self.reset_error_code {
-                let reset_error: ResetError = error_code.into();
-                return Poll::Ready(Err(io::Error::new(
-                    io::ErrorKind::ConnectionReset,
-                    reset_error,
-                )));
-            }
-            return Poll::Ready(Err(io::ErrorKind::ConnectionReset.into()));
         }
 
         if tracker.has_remaining_capacity() {
@@ -309,7 +310,15 @@ impl Inner {
 
         let bytes_read = tracker.written_len();
 
-        self.maybe_send_max_data()?;
+        if let Poll::Ready(Err(err)) = stream_result {
+            if err.kind() != io::ErrorKind::ConnectionReset || bytes_read == 0 {
+                return Poll::Ready(Err(err));
+            }
+        }
+
+        if !self.status.is_terminal() {
+            self.maybe_send_max_data()?;
+        }
 
         if self.reassembler.is_reading_complete() {
             debug!(
@@ -324,6 +333,8 @@ impl Inner {
 
         if bytes_read > 0 {
             Poll::Ready(Ok(bytes_read))
+        } else if self.status.is_reset() {
+            Poll::Ready(Err(self.connection_reset_error()))
         } else {
             Poll::Pending
         }
@@ -420,6 +431,15 @@ impl Inner {
         let _ = self.send_reset_frame(error_code, ResetTarget::Both);
         let reset_error: ResetError = error_code.into();
         Poll::Ready(Err(io::Error::new(io::ErrorKind::InvalidData, reset_error)))
+    }
+
+    fn connection_reset_error(&self) -> io::Error {
+        if let Some(error_code) = self.reset_error_code {
+            let reset_error: ResetError = error_code.into();
+            io::Error::new(io::ErrorKind::ConnectionReset, reset_error)
+        } else {
+            io::ErrorKind::ConnectionReset.into()
+        }
     }
 
     fn maybe_send_max_data(&mut self) -> io::Result<()> {
@@ -611,7 +631,7 @@ mod tests {
     };
     use core::{convert::Infallible, task::Poll};
     use s2n_quic_core::{
-        buffer::Reassembler,
+        buffer::{writer::Storage as _, Reassembler},
         endpoint,
         stream::testing::Data,
         task::waker,
@@ -724,5 +744,58 @@ mod tests {
         assert!(reader.0.status.is_complete());
 
         Ok(())
+    }
+
+    #[test]
+    fn poll_read_into_drains_buffered_data_before_returning_reset() {
+        let expected = Data::send_one_at(0, 8);
+        let mut reader = test_reader(msg::Stream::Data {
+            offset: VarInt::from_u8(4),
+            fin: false,
+            payload: filled_payload(&expected[4..]),
+        });
+        let waker = waker::noop();
+        let mut cx = core::task::Context::from_waker(&waker);
+        let mut out = Vec::new();
+
+        assert!(matches!(reader.poll_read_into(&mut cx, &mut out), Poll::Pending));
+        assert!(out.is_empty());
+
+        reader.0.stream_rx.push(
+            msg::Stream::Data {
+                offset: VarInt::ZERO,
+                fin: false,
+                payload: filled_payload(&expected[..4]),
+            }
+            .into(),
+        );
+        reader
+            .0
+            .stream_rx
+            .push(msg::Stream::Reset { error_code: VarInt::from_u8(7) }.into());
+
+        {
+            let mut limited = out.with_write_limit(4);
+            match reader.poll_read_into(&mut cx, &mut limited) {
+                Poll::Ready(Ok(len)) => assert_eq!(len, 4),
+                other => panic!("unexpected post-reset poll result: {other:?}"),
+            }
+        }
+        assert_eq!(out, expected[..4]);
+        assert!(reader.0.status.is_reset());
+
+        {
+            let mut limited = out.with_write_limit(4);
+            match reader.poll_read_into(&mut cx, &mut limited) {
+                Poll::Ready(Ok(len)) => assert_eq!(len, 4),
+                other => panic!("unexpected buffered reset poll result: {other:?}"),
+            }
+        }
+        assert_eq!(out, expected);
+
+        match reader.poll_read_into(&mut cx, &mut out) {
+            Poll::Ready(Err(err)) => assert_eq!(err.kind(), io::ErrorKind::ConnectionReset),
+            other => panic!("unexpected terminal poll result: {other:?}"),
+        }
     }
 }
