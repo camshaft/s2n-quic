@@ -109,6 +109,7 @@ where
                 let next_metadata = metadata.with_frame(&frame);
                 let estimated_len = next_metadata.estimate_packet_len(
                     source_sender_id,
+                    source_control_port,
                     context.next_packet_number,
                     &context.credentials,
                     seal::Application::tag_len(&context.sealer),
@@ -260,6 +261,7 @@ impl MetadataEstimate {
     fn estimate_packet_len(
         &self,
         source_sender_id: VarInt,
+        source_control_port: u16,
         packet_number: VarInt,
         credentials: &crate::credentials::Credentials,
         crypto_tag_len: usize,
@@ -273,7 +275,7 @@ impl MetadataEstimate {
         crate::packet::datagram::Tag::default().encoding_size()
             + credentials.encoding_size()
             + WireVersion::ZERO.encoding_size()
-            + core::mem::size_of::<u16>() // source_control_port
+            + source_control_port.encoding_size()
             + packet_number.encoding_size()
             + routing_info.encoding_size()
             + payload_len.encoding_size()
@@ -391,7 +393,7 @@ fn push_frame_metadata(
         debug_assert_eq!(payload_len, 0);
     }
 
-    debug_assert_eq!(enc.len(), entry_size);
+    assert_eq!(enc.len(), entry_size, "frame metadata encoder length mismatch");
 }
 
 /// Produce a Header with attempt_id stamped for FlowInit frames.
@@ -594,6 +596,7 @@ mod tests {
     fn is_frame_encodable(
         frame: &FrameInput,
         source_sender_id: VarInt,
+        source_control_port: u16,
         credentials: &crate::credentials::Credentials,
         mtu: u16,
     ) -> bool {
@@ -601,6 +604,7 @@ mod tests {
             .with_frame_parts(&frame.header, payload_len(frame))
             .estimate_packet_len(
                 source_sender_id,
+                source_control_port,
                 VarInt::ZERO,
                 credentials,
                 TEST_CRYPTO_TAG_LEN,
@@ -645,6 +649,7 @@ mod tests {
     fn oracle(
         frames: &[FrameInput],
         source_sender_id: VarInt,
+        source_control_port: u16,
         credentials: &crate::credentials::Credentials,
         mtu: u16,
         max_segments: usize,
@@ -676,6 +681,7 @@ mod tests {
                 let next_metadata = metadata.with_frame_parts(&frame.header, payload_len(frame));
                 let estimated_len = next_metadata.estimate_packet_len(
                     source_sender_id,
+                    source_control_port,
                     packet_number,
                     credentials,
                     TEST_CRYPTO_TAG_LEN,
@@ -699,6 +705,7 @@ mod tests {
 
             let packet_len = metadata.estimate_packet_len(
                 source_sender_id,
+                source_control_port,
                 packet_number,
                 credentials,
                 TEST_CRYPTO_TAG_LEN,
@@ -805,6 +812,7 @@ mod tests {
                         is_frame_encodable(
                             frame,
                             input.source_sender_id,
+                            input.source_control_port,
                             &context.credentials,
                             input.mtu,
                         )
@@ -819,6 +827,7 @@ mod tests {
                 let oracle = oracle(
                     &frames,
                     input.source_sender_id,
+                    input.source_control_port,
                     &context.credentials,
                     input.mtu,
                     max_segments,
