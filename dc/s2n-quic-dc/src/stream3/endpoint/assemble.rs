@@ -384,10 +384,10 @@ fn push_frame_metadata(
     let start = header_buf.len();
     header_buf.reserve(entry_size);
 
-    // SAFETY: this avoids zero-initializing the appended metadata bytes on every frame.
+    // SAFETY: this keeps the per-frame packing loop from zero-initializing each metadata append.
     // `reserve` guarantees the additional capacity, the newly-extended region is not observed
-    // through any other reference before the write, and the post-condition assertion below
-    // verifies the encoder filled exactly `entry_size` bytes.
+    // through any other reference before the write, and the runtime `assert_eq!` below verifies
+    // the encoder filled exactly `entry_size` bytes before the buffer is used again.
     unsafe {
         header_buf.set_len(start + entry_size);
     }
