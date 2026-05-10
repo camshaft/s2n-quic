@@ -33,6 +33,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+const NANOS_PER_SECOND: u128 = 1_000_000_000;
+
 #[cfg(test)]
 mod tests;
 
@@ -274,7 +276,7 @@ impl Entry {
             return Duration::ZERO;
         }
 
-        let nanos = (queued_bytes as u128).saturating_mul(1_000_000_000) / bytes_per_second as u128;
+        let nanos = (queued_bytes as u128).saturating_mul(NANOS_PER_SECOND) / bytes_per_second as u128;
         let nanos = nanos.min(u64::MAX as u128) as u64;
         Duration::from_nanos(nanos)
     }
@@ -313,8 +315,8 @@ impl Entry {
             return 0;
         }
 
-        let idx1 = random_fn(len) % len;
-        let mut idx2 = random_fn(len - 1) % (len - 1);
+        let idx1 = random_fn(len).min(len - 1);
+        let mut idx2 = random_fn(len - 1).min(len - 2);
         if idx2 >= idx1 {
             idx2 += 1;
         }
