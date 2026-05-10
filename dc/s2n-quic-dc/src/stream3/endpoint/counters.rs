@@ -60,11 +60,11 @@ pub(crate) struct Dispatch {
     pub flow_accepted: Counter,
     pub flow_pending: Counter,
 
-    pub rx_process_peer_lookup: Counter,
-    pub rx_process_decryption: Counter,
-    pub rx_process_duplicate: Counter,
-    pub rx_process_missing_sender_id: Counter,
-    pub rx_process_unsupported_routing: Counter,
+    pub rx_process_err_peer_lookup: Counter,
+    pub rx_process_err_decryption: Counter,
+    pub rx_process_err_duplicate: Counter,
+    pub rx_process_err_missing_sender_id: Counter,
+    pub rx_process_err_unsupported_routing: Counter,
 }
 
 impl Dispatch {
@@ -122,12 +122,13 @@ impl Dispatch {
             flow_accepted: counters.register("flow.accepted"),
             flow_pending: counters.register("flow.pending"),
 
-            rx_process_peer_lookup: counters.register("!rx.process.peer_lookup"),
-            rx_process_decryption: counters.register("!rx.process.decrypt"),
-            rx_process_duplicate: counters.register("!rx.process.duplicate"),
-            rx_process_missing_sender_id: counters.register("!rx.process.missing_sender_id"),
-            rx_process_unsupported_routing: counters
-                .register("!rx.process.unsupported_routing"),
+            rx_process_err_peer_lookup: counters.register("!rx.process.err.peer_lookup"),
+            rx_process_err_decryption: counters.register("!rx.process.err.decrypt"),
+            rx_process_err_duplicate: counters.register("!rx.process.err.duplicate"),
+            rx_process_err_missing_sender_id: counters
+                .register("!rx.process.err.missing_sender_id"),
+            rx_process_err_unsupported_routing: counters
+                .register("!rx.process.err.unsupported_routing"),
         }
     }
 

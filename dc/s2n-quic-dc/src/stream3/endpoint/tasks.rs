@@ -554,33 +554,52 @@ pub async fn packet_dispatch_task<PacketRx, AckTx, Clk>(
 
     // Response frames (ACKs sent back to peers) re-enter via the same submission channel.
     // TODO: route responses through a dedicated channel + RetransmissionBatcher (see above).
-    let mut response_tx = frame_tx.clone();
-    let mut ack_sender = ack_sender;
-    let mut queue_dispatcher = queue_dispatcher;
-    let process_counters = counters;
-    let error_counters = process_counters.clone();
+    let rx = Map::new(packet_rx, {
+        let mut response_tx = frame_tx.clone();
+        let mut ack_sender = ack_sender;
+        let mut queue_dispatcher = queue_dispatcher;
+        let recv_cache = recv_cache;
+        let path_secret_map = path_secret_map;
+        let acceptor_registry = acceptor_registry;
+        let frame_tx = frame_tx;
+        let clock = clock;
+        let counters = counters.clone();
 
-    let rx = Map::new(packet_rx, move |packet| {
-        process_counters.rx_data_pkt.add(1);
-        dispatch::process(
-            packet,
-            &mut recv_cache.borrow_mut(),
-            &path_secret_map,
-            &acceptor_registry,
-            &frame_tx,
-            &mut response_tx,
-            &mut ack_sender,
-            &mut queue_dispatcher,
-            &clock,
-            &process_counters,
-        )
+        move |packet| {
+            counters.rx_data_pkt.add(1);
+            dispatch::process(
+                packet,
+                &mut recv_cache.borrow_mut(),
+                &path_secret_map,
+                &acceptor_registry,
+                &frame_tx,
+                &mut response_tx,
+                &mut ack_sender,
+                &mut queue_dispatcher,
+                &clock,
+                &counters,
+            )
+        }
     });
-    let rx = InspectErr::new(rx, move |err| match err {
+    let rx = InspectErr::new(rx, {
+        let counters = counters;
+        move |err| on_packet_dispatch_error(&counters, err)
+    });
+    rx.drain_budgeted(Some(budget)).await;
+}
+
+fn on_packet_dispatch_error(
+    counters: &crate::stream3::endpoint::counters::Dispatch,
+    err: crate::stream3::endpoint::dispatch::Error,
+) {
+    use crate::stream3::endpoint::dispatch;
+
+    match err {
         dispatch::Error::PeerStateLookup {
             credentials,
             control_out,
         } => {
-            error_counters.rx_process_peer_lookup.add(1);
+            counters.rx_process_err_peer_lookup.add(1);
             tracing::warn!(
                 ?credentials,
                 control_out_len = control_out.len(),
@@ -591,7 +610,7 @@ pub async fn packet_dispatch_task<PacketRx, AckTx, Clk>(
             credentials,
             packet_number,
         } => {
-            error_counters.rx_process_decryption.add(1);
+            counters.rx_process_err_decryption.add(1);
             tracing::debug!(
                 ?credentials,
                 pn = packet_number.as_u64(),
@@ -602,7 +621,7 @@ pub async fn packet_dispatch_task<PacketRx, AckTx, Clk>(
             credentials,
             packet_number,
         } => {
-            error_counters.rx_process_duplicate.add(1);
+            counters.rx_process_err_duplicate.add(1);
             tracing::trace!(
                 ?credentials,
                 pn = packet_number.as_u64(),
@@ -610,15 +629,14 @@ pub async fn packet_dispatch_task<PacketRx, AckTx, Clk>(
             );
         }
         dispatch::Error::MissingSenderId => {
-            error_counters.rx_process_missing_sender_id.add(1);
-            tracing::warn!("packet missing source_sender_id in routing info");
+            counters.rx_process_err_missing_sender_id.add(1);
+            tracing::warn!("packet missing routing info; expected SenderId");
         }
         dispatch::Error::UnsupportedRoutingInfo { routing_info } => {
-            error_counters.rx_process_unsupported_routing.add(1);
+            counters.rx_process_err_unsupported_routing.add(1);
             tracing::warn!(?routing_info, "unsupported datagram routing info");
         }
-    });
-    rx.drain_budgeted(Some(budget)).await;
+    }
 }
 
 #[cfg(test)]
