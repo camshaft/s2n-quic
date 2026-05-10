@@ -89,6 +89,9 @@ use std::{
 };
 use tracing::{debug, trace};
 
+// `payload_budget_for` can only cross a handful of varint-size thresholds before stabilizing.
+const MAX_PAYLOAD_BUDGET_ITERATIONS: usize = 8;
+
 pub struct Writer(Box<Inner>);
 
 struct Inner {
@@ -707,7 +710,7 @@ impl Inner {
         let available = self.packet_size as usize;
         let mut payload_budget = available;
 
-        for _ in 0..8 {
+        for _ in 0..MAX_PAYLOAD_BUDGET_ITERATIONS {
             // The payload budget feeds back into `metadata_len` through the varint-encoded
             // payload-length field, so recompute until the fixed point stabilizes.
             let next = available.saturating_sub(header.metadata_len(payload_budget));
@@ -717,7 +720,10 @@ impl Inner {
             payload_budget = next;
         }
 
-        debug_assert!(false, "payload budget did not converge");
+        debug_assert!(
+            false,
+            "payload budget did not converge: header={header:?} available={available} budget={payload_budget}"
+        );
         payload_budget
     }
 
