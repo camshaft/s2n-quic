@@ -101,10 +101,15 @@ impl Meta {
 
     /// Returns the length of the outer packet header (everything before the application header).
     ///
-    /// This is derived directly from the already-validated `header` and `application_header`
-    /// ranges, so it can never underflow once the packet has been successfully decoded.
+    /// The `application_header` range is always decoded from *within* the `header` buffer
+    /// (see `Meta::decode`), so `application_header.len() <= header.len()` is a structural
+    /// invariant of every successfully decoded packet.
     #[inline]
     pub fn outer_header_len(&self) -> usize {
+        debug_assert!(
+            self.application_header.len() <= self.header.len(),
+            "application_header must be a sub-range of header"
+        );
         self.header.len() - self.application_header.len()
     }
 
