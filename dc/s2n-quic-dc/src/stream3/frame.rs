@@ -153,6 +153,10 @@ impl Header {
     }
 
     /// Returns true if this header variant carries a per-frame payload length entry.
+    ///
+    /// This indicates whether the application header includes an explicit payload length for the
+    /// frame, not whether the frame must contain non-empty payload bytes. Control and flow-control
+    /// frames can legitimately encode a zero-length payload while still carrying the length field.
     #[inline]
     pub fn has_payload_length(&self) -> bool {
         match self {

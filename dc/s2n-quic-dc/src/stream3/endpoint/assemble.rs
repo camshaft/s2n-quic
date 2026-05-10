@@ -361,12 +361,17 @@ fn frame_metadata_len(header: &crate::stream3::frame::Header, payload_len: usize
         let payload_len = VarInt::try_from(payload_len as u64).unwrap_or(VarInt::ZERO);
         header.encoding_size() + payload_len.encoding_size()
     } else {
-        debug_assert_eq!(
-            payload_len, 0,
-            "frames without payload_length must have zero payload"
-        );
+        debug_assert_payload_length_invariant(payload_len);
         header.encoding_size()
     }
+}
+
+#[inline]
+fn debug_assert_payload_length_invariant(payload_len: usize) {
+    debug_assert_eq!(
+        payload_len, 0,
+        "frames without payload_length must have zero payload"
+    );
 }
 
 #[inline]
@@ -380,8 +385,9 @@ fn push_frame_metadata(
     header_buf.reserve(entry_size);
 
     // SAFETY: this avoids zero-initializing the appended metadata bytes on every frame.
-    // `reserve` guarantees the additional capacity, the encoder fills exactly `entry_size` bytes,
-    // and the newly-extended region is not observed through any other reference before the write.
+    // `reserve` guarantees the additional capacity, the newly-extended region is not observed
+    // through any other reference before the write, and the post-condition assertion below
+    // verifies the encoder filled exactly `entry_size` bytes.
     unsafe {
         header_buf.set_len(start + entry_size);
     }
@@ -393,10 +399,7 @@ fn push_frame_metadata(
         let payload_len = VarInt::try_from(payload_len as u64).unwrap_or(VarInt::ZERO);
         enc.encode(&payload_len);
     } else {
-        debug_assert_eq!(
-            payload_len, 0,
-            "frames without payload_length must have zero payload"
-        );
+        debug_assert_payload_length_invariant(payload_len);
     }
 
     assert_eq!(enc.len(), entry_size, "frame metadata encoder length mismatch");
