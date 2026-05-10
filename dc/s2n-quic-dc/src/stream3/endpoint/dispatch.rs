@@ -363,7 +363,7 @@ fn dispatch_decoded_frame(
         }
         Header::Control { dest_sender_id } => {
             let message = msg::Sender::Ack {
-                sender_id: dest_sender_id,
+                local_sender_id: dest_sender_id,
                 payload,
             };
             if sender_tx.send(message).is_err() {
@@ -1024,7 +1024,7 @@ fn handle_flow_control(
             tracing::debug!(
                 stream_id = stream_id.as_u64(),
                 queue_id = local_queue_id.as_u64(),
-                "FlowControl for half-closed stream - sending reset"
+                "FlowControl for half-closed control queue - sending reset"
             );
             push_reset_frame_with_target(
                 response_frames,

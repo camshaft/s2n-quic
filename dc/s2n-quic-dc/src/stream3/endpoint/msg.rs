@@ -23,7 +23,7 @@ pub enum Control {
 
 pub enum Sender {
     Ack {
-        sender_id: VarInt,
+        local_sender_id: VarInt,
         payload: descriptor::Filled,
     },
 }
