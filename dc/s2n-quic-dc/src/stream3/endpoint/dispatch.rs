@@ -105,6 +105,12 @@ where
     let outer_header_len = header_total_len - app_header_len;
     let ecn = packet.storage().ecn();
 
+    // All of these lengths come from the decoded packet, whose storage is a u16-bounded
+    // `descriptor::Filled`.  They must fit in u16 for the subsequent advance/truncate calls.
+    debug_assert!(outer_header_len <= u16::MAX as usize, "outer_header_len overflows u16");
+    debug_assert!(app_header_len <= u16::MAX as usize, "app_header_len overflows u16");
+    debug_assert!(payload_len <= u16::MAX as usize, "payload_len overflows u16");
+
     // Decrypt the payload in place (AAD = outer packet header, already cleartext).
     packet
         .decrypt_in_place(&peer.opener)
@@ -289,8 +295,22 @@ where
                 match result {
                     Ok((header, frame_payload_len)) => {
                         counters.on_received_frame(&header);
+                        // Validate that the claimed payload length fits within the
+                        // remaining descriptor storage before casting to u16.
+                        if frame_payload_len > payload_storage.len() as usize {
+                            tracing::warn!(
+                                %credentials,
+                                packet_number = packet_number.as_u64(),
+                                frame_payload_len,
+                                remaining = payload_storage.len(),
+                                "frame payload length exceeds remaining packet payload"
+                            );
+                            break;
+                        }
                         // Split the frame's payload out of the shared descriptor.
                         // This is O(1): it increments the ref-count and adjusts offsets.
+                        // The cast is safe because we verified frame_payload_len <= u16::MAX
+                        // above (payload_storage.len() is u16-bounded).
                         let frame_payload = payload_storage.split_to(frame_payload_len as u16);
                         dispatch_decoded_frame(
                             header,
