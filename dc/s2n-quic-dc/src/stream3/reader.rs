@@ -251,6 +251,23 @@ impl Reader {
         core::future::poll_fn(|cx| self.poll_read_into(cx, buf)).await
     }
 
+    /// Wait until at least `len` bytes are buffered and readable.
+    ///
+    /// This proactively opens remote flow control to permit buffering up to `len` bytes beyond
+    /// the current consumed offset. The returned value is the currently buffered readable bytes,
+    /// which may be less than `len` if the stream reaches FIN before that amount is available.
+    pub async fn wait_for_buffered_len(&mut self, len: usize) -> io::Result<usize> {
+        core::future::poll_fn(|cx| self.poll_wait_for_buffered_len(cx, len)).await
+    }
+
+    pub fn poll_wait_for_buffered_len(
+        &mut self,
+        cx: &mut Context,
+        len: usize,
+    ) -> Poll<io::Result<usize>> {
+        waker::debug_assert_contract(cx, |cx| self.0.poll_wait_for_buffered_len(cx, len))
+    }
+
     pub fn poll_read_into<S>(&mut self, cx: &mut Context, buf: &mut S) -> Poll<io::Result<usize>>
     where
         S: buffer::writer::Storage,
@@ -260,6 +277,45 @@ impl Reader {
 }
 
 impl Inner {
+    fn poll_wait_for_buffered_len(
+        &mut self,
+        cx: &mut Context,
+        len: usize,
+    ) -> Poll<io::Result<usize>> {
+        if self.status.is_pending_validation() {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "stream not yet validated - call validate() first",
+            )));
+        }
+
+        if self.status.is_reset() {
+            if let Some(error_code) = self.reset_error_code {
+                let reset_error: ResetError = error_code.into();
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::ConnectionReset,
+                    reset_error,
+                )));
+            }
+            return Poll::Ready(Err(io::ErrorKind::ConnectionReset.into()));
+        }
+
+        self.open_flow_control_for_buffered_len(len)?;
+
+        if self.reassembler.len() >= len || self.reassembler.is_writing_complete() {
+            return Poll::Ready(Ok(self.reassembler.len()));
+        }
+
+        let mut app_buf = buffer::writer::storage::Empty;
+        let _ = self.poll_stream_rx(cx, &mut app_buf)?;
+
+        if self.reassembler.len() >= len || self.reassembler.is_writing_complete() {
+            Poll::Ready(Ok(self.reassembler.len()))
+        } else {
+            Poll::Pending
+        }
+    }
+
     fn poll_validate(&mut self, cx: &mut Context) -> Poll<io::Result<()>> {
         if !self.status.is_pending_validation() {
             return Poll::Ready(Ok(()));
@@ -450,6 +506,27 @@ impl Inner {
                 "maybe_send_max_data: below threshold, not sending"
             );
         }
+
+        Ok(())
+    }
+
+    fn open_flow_control_for_buffered_len(&mut self, len: usize) -> io::Result<()> {
+        let len = u64::try_from(len)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "buffer length overflow"))?;
+        let consumed = self.reassembler.consumed_len();
+        let desired_max_data = consumed
+            .checked_add(len)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "max_data overflow"))?;
+
+        if self.remote_max_data.as_u64() >= desired_max_data {
+            return Ok(());
+        }
+
+        let desired_max_data = VarInt::new(desired_max_data)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "max_data overflow"))?;
+
+        self.send_max_data_frame(desired_max_data)?;
+        self.remote_max_data = desired_max_data;
 
         Ok(())
     }
@@ -722,6 +799,51 @@ mod tests {
         }
         assert_eq!(out, expected);
         assert!(reader.0.status.is_complete());
+
+        Ok(())
+    }
+
+    #[test]
+    fn wait_for_buffered_len_returns_target_when_available() -> io::Result<()> {
+        let expected = Data::send_one_at(0, 8);
+        let mut reader = test_reader(msg::Stream::Data {
+            offset: VarInt::ZERO,
+            fin: true,
+            payload: filled_payload(&expected),
+        });
+        let waker = waker::noop();
+        let mut cx = core::task::Context::from_waker(&waker);
+
+        match reader.poll_wait_for_buffered_len(&mut cx, 8) {
+            Poll::Ready(Ok(len)) => assert_eq!(len, 8),
+            other => panic!("unexpected poll result: {other:?}"),
+        }
+
+        let mut out = Vec::new();
+        match reader.poll_read_into(&mut cx, &mut out) {
+            Poll::Ready(Ok(len)) => assert_eq!(len, 8),
+            other => panic!("unexpected read result: {other:?}"),
+        }
+        assert_eq!(out, expected);
+
+        Ok(())
+    }
+
+    #[test]
+    fn wait_for_buffered_len_returns_actual_when_stream_ends_early() -> io::Result<()> {
+        let expected = Data::send_one_at(0, 8);
+        let mut reader = test_reader(msg::Stream::Data {
+            offset: VarInt::ZERO,
+            fin: true,
+            payload: filled_payload(&expected),
+        });
+        let waker = waker::noop();
+        let mut cx = core::task::Context::from_waker(&waker);
+
+        match reader.poll_wait_for_buffered_len(&mut cx, 16) {
+            Poll::Ready(Ok(len)) => assert_eq!(len, 8),
+            other => panic!("unexpected poll result: {other:?}"),
+        }
 
         Ok(())
     }

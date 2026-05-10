@@ -54,6 +54,11 @@ impl Stream {
     }
 
     #[inline]
+    pub async fn wait_for_buffered_len(&mut self, len: usize) -> io::Result<usize> {
+        self.read.wait_for_buffered_len(len).await
+    }
+
+    #[inline]
     pub async fn write_from<S>(&mut self, buf: &mut S) -> io::Result<usize>
     where
         S: buffer::reader::storage::Infallible,
