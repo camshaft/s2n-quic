@@ -306,6 +306,30 @@ where
 /// The sharded receiver requires explicit waker registration before it can wake the task.
 /// This function registers the waker on entry (before blocking) so the channel can wake us
 /// when new frames arrive.
+///
+/// # TODO: missing stream2 pipeline stages
+///
+/// The following stages present in stream2's dispatch pipeline are not yet implemented:
+///
+/// - **Priority queues**: stream2 distributes batches across `BatchPriority::LEVELS` priority
+///   lanes (Urgent, High, Normal, …) based on `batch.meta.priority`, then polls them in order
+///   via `channel::Priority`. This prevents low-priority retransmissions from starving
+///   fresh user data.
+///
+/// - **Timing wheel / PTO**: stream2 runs a `Wheel<_, _, _, 1>` (µs granularity) that fires
+///   deferred batches at their scheduled transmission time. PTO probes and delayed ACKs are
+///   injected into the wheel and emerge from it just-in-time. A separate PTO wheel task
+///   generates probe batches when the wheel fires a timed-out inflight entry.
+///
+/// - **Overall bandwidth pacer**: stream2 wraps the priority output with
+///   `Paced::new(rx, clock, overall_send_rate)` to cap total egress across all sockets.
+///
+/// - **Sticky routing**: batches with `meta.sender_id != VarInt::MAX` are intercepted by a
+///   `FilterMap` and sent directly to the owning socket (retransmissions must go back to the
+///   same socket that registered the packet). Non-sticky batches proceed to pick-two / round-robin.
+///
+/// - **Queue metrics**: stream2 wraps each queue stage in `GaugedQueue` to track depth with
+///   labelled counters (`q.wheel`, `q.priority.{i}`, …).
 pub async fn frame_dispatch<S, Rand>(
     frame_rx: crate::stream3::frame::SubmissionReceiver,
     socket_senders: Vec<S>,
@@ -342,6 +366,40 @@ pub async fn frame_dispatch<S, Rand>(
 /// [`send::Context`]: crate::stream3::endpoint::send::Context
 /// [`assemble`]: crate::stream3::endpoint::assemble::assemble
 /// [`ack::process_ack`]: crate::stream3::endpoint::ack::process_ack
+///
+/// # TODO: missing stream2 pipeline stages
+///
+/// The following stages present in stream2's send pipeline are not yet implemented:
+///
+/// - **Worker-shared socket contexts** (`Rc<SocketPathContexts>`): stream2 creates a
+///   per-socket `SocketPathContexts` (an `Rc`) that is registered in a worker-level
+///   `sender_contexts: Rc<RefCell<HashMap<usize, Rc<SocketPathContexts>>>>`. This lets the
+///   ACK processing task (phase 2) look up the context for any socket on the same worker.
+///
+/// - **PathResolver**: resolves each `FrameBatch` to a per-peer send context by credentials.
+///   Emits errors (unknown peer, missing path secret) to a dedicated error channel so they do
+///   not block the hot path.
+///
+/// - **Encoder** (`channel::Encoder`): encrypts frame queues into wire-format datagrams:
+///   fills in credentials, GSO-aware packet boundaries, routing info (`source_sender_id`,
+///   `source_control_port`), and AEAD authentication tag. Produces `PartialDatagram` items.
+///
+/// - **PacketRegistrar** (`channel::PacketRegistrar`): registers each encrypted packet in the
+///   inflight map (packet-number → context), marking it eligible for loss recovery and PTO.
+///   Stamps the transmission timestamp used for RTT estimation.
+///
+/// - **Per-socket pacer** (`Paced`): enforces a per-socket send-rate cap after
+///   `PacketRegistrar` and before the actual socket write, preventing burst sending.
+///
+/// - **Acked/lost packet channels**: stream2 has unsync channels (`acked_tx`, `lost_tx`) from
+///   the ACK processing task back to this task, driving CCA (`on_ack`, `on_loss`) updates,
+///   retransmission batching, and completion notifications to waiters.
+///
+/// - **PTO wheel injection**: when CCA schedules a probe timeout, the context's PTO deadline
+///   is registered with a per-worker `Wheel`; when the wheel fires, a probe batch is generated
+///   and pumped back into the frame submission channel.
+///
+/// - **Metrics**: `tx` packet counter, `tx:bytes` byte counter, per-socket queue depth gauge.
 pub async fn socket_send_task<Socket, BatchRx, AckRx>(
     _socket: Socket,
     _batch_rx: BatchRx,
@@ -372,6 +430,15 @@ pub async fn socket_send_task<Socket, BatchRx, AckRx>(
 /// [`InspectErr`]: crate::socket::channel::InspectErr
 /// [`FlattenSegments`]: crate::socket::channel::FlattenSegments
 /// [`RouterAdapter`]: crate::socket::channel::RouterAdapter
+///
+/// # TODO: missing stream2 pipeline stages
+///
+/// - **Receive metrics**: stream2 counts received packets (`socket.rx`) and bytes
+///   (`socket.rx:bytes`) via `channel::Inspect` before the router. Add equivalent counters once
+///   the counter infrastructure is wired up.
+///
+/// - **Recv-side pacing** (experimental): stream2 has a commented-out `Paced` stage on the
+///   recv side to cap ingest rate. Revisit if recv processing becomes a bottleneck.
 pub async fn socket_recv_task<Socket, Tx>(
     socket: Socket,
     pool: crate::socket::pool::Pool,
@@ -409,6 +476,10 @@ pub async fn socket_recv_task<Socket, Tx>(
 /// `packet_rx` and `ack_sender` are generic so callers can substitute local unsync receivers
 /// or a custom ACK fan-out when tasks are co-located on the same worker.
 ///
+/// Accepts a worker-shared `recv_cache` as `Rc<RefCell<recv::Cache>>` created once in
+/// [`Worker::spawn`]. This matches stream2's `Rc<RefCell<SenderStateCache>>` pattern: all tasks
+/// that run on the same worker thread share the same cache so they can coordinate without locks.
+///
 /// Uses a [`Map`] combinator over `packet_rx` that calls [`dispatch::process`] for each packet,
 /// then drains up to `budget` items per poll so the executor can interleave other tasks.
 ///
@@ -418,10 +489,28 @@ pub async fn socket_recv_task<Socket, Tx>(
 /// [`Map`]: crate::socket::channel::Map
 /// [`recv::Cache`]: crate::stream3::endpoint::recv::Cache
 /// [`dispatch::process`]: crate::stream3::endpoint::dispatch::process
+///
+/// # TODO: missing stream2 pipeline stages
+///
+/// - **Response channel** (`response_tx`): stream2 has a dedicated unsync channel for ACKs and
+///   flow-control responses generated by `process_datagram`. These are batched by
+///   `RetransmissionBatcher` and pumped into the timing wheel. Currently in stream3, response
+///   frames re-enter `frame_tx` directly; a separate response channel with its own batcher would
+///   allow finer-grained scheduling.
+///
+/// - **Error classification**: stream2 logs distinct error types with structured fields —
+///   `PeerStateLookup` (warn), `Decryption` (debug), `Duplicate` (trace),
+///   `MissingSenderId` (warn). The current impl silently drops all errors; each variant should
+///   be logged and counted separately.
+///
+/// - **Dispatch counters** (`rx.data_pkt`, process-level counters): stream2 increments per-packet
+///   and per-frame counters. The dispatch sub-counters are not yet wired up in stream3.
+///
+/// - **Queue depth metric** (`q.datagram`): stream2 wraps the input queue in `GaugedQueue`.
+///   Add once the counter infrastructure is available per-worker.
 pub async fn packet_dispatch_task<PacketRx, AckTx, Clk>(
     packet_rx: PacketRx,
-    worker_id: usize,
-    idle_timeout: core::time::Duration,
+    recv_cache: std::rc::Rc<std::cell::RefCell<crate::stream3::endpoint::recv::Cache>>,
     path_secret_map: crate::path::secret::Map,
     acceptor_registry: crate::acceptor::Registry<crate::stream3::Stream>,
     frame_tx: crate::stream3::frame::SubmissionSender,
@@ -440,10 +529,10 @@ pub async fn packet_dispatch_task<PacketRx, AckTx, Clk>(
     Clk: s2n_quic_core::time::Clock + crate::clock::precision::Clock,
 {
     use crate::socket::channel::{Map, ReceiverExt as _};
-    use crate::stream3::endpoint::{dispatch, recv};
+    use crate::stream3::endpoint::dispatch;
 
-    let mut recv_cache = recv::Cache::new(idle_timeout, worker_id);
     // Response frames (ACKs sent back to peers) re-enter via the same submission channel.
+    // TODO: route responses through a dedicated channel + RetransmissionBatcher (see above).
     let mut response_tx = frame_tx.clone();
     let mut ack_sender = ack_sender;
     let mut queue_dispatcher = queue_dispatcher;
@@ -451,7 +540,7 @@ pub async fn packet_dispatch_task<PacketRx, AckTx, Clk>(
     let rx = Map::new(packet_rx, move |packet| {
         let _ = dispatch::process(
             packet,
-            &mut recv_cache,
+            &mut recv_cache.borrow_mut(),
             &path_secret_map,
             &acceptor_registry,
             &frame_tx,

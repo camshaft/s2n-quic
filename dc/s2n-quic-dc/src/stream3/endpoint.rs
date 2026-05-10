@@ -98,8 +98,6 @@ struct RecvTaskParts<Socket, Clk, AckSnd> {
     packet_rx: crate::socket::channel::intrusive_queue::sync::Receiver<
         crate::packet::datagram::decoder::Packet<crate::socket::pool::descriptor::Filled>,
     >,
-    worker_id: usize,
-    idle_timeout: core::time::Duration,
     path_secret_map: crate::path::secret::Map,
     acceptor_registry: acceptor::Registry<Stream>,
     frame_tx: SubmissionSender,
@@ -116,9 +114,15 @@ struct RecvTaskParts<Socket, Clk, AckSnd> {
 /// After building a `Worker` for each thread, call [`Worker::spawn`] on each to hand off all
 /// its tasks to the spawner. This design makes it easy to reassign sockets or tasks across
 /// workers without restructuring the spawn logic.
+///
+/// `idle_timeout` is stored here (not in `RecvTaskParts`) because it belongs to the worker as
+/// a whole: the single `recv::Cache` is created once inside `spawn_local` as an
+/// `Rc<RefCell<recv::Cache>>` and shared across all tasks that run on this worker thread.
 struct Worker<SendSocket, RecvSocket, Clk, G, AckSnd> {
     /// This worker's index in the spawner.
     id: usize,
+    /// Peer idle timeout — controls when `recv::Cache` entries expire.
+    idle_timeout: core::time::Duration,
     /// Frame-dispatch task, assigned to exactly one worker (typically worker 0).
     frame_dispatch: Option<FrameDispatchParts<G>>,
     /// Send socket tasks assigned to this worker.
@@ -138,9 +142,10 @@ where
     G: crate::random::Generator,
     AckSnd: crate::socket::channel::UnboundedSender<msg::Sender> + Send + 'static,
 {
-    fn new(id: usize) -> Self {
+    fn new(id: usize, idle_timeout: core::time::Duration) -> Self {
         Self {
             id,
+            idle_timeout,
             frame_dispatch: None,
             send_tasks: Vec::new(),
             recv_tasks: Vec::new(),
@@ -152,11 +157,16 @@ where
     /// The random generator (`G`) is captured as `Send` in the outer closure and then wrapped
     /// in a [`std::cell::RefCell`] inside `spawn_local`, where it is entirely worker-local.
     /// No `Mutex` is needed.
+    ///
+    /// A single [`recv::Cache`] is created once per worker (as `Rc<RefCell<recv::Cache>>`) and
+    /// shared across all dispatch tasks. This matches stream2's `shared_sender_cache` pattern,
+    /// where the cache is accessed by multiple tasks on the same worker thread via `Rc`.
     fn spawn<S: crate::stream2::Spawner>(self, spawner: &S) {
         use crate::stream2::spawner::LocalSpawner as _;
 
         let Self {
             id,
+            idle_timeout,
             frame_dispatch,
             send_tasks,
             recv_tasks,
@@ -172,13 +182,10 @@ where
                     let mut bytes = [0u8; 8];
                     random.borrow_mut().public_random_fill(&mut bytes);
                     let raw = usize::from_le_bytes(bytes);
-                    // Prefer a cheap bitwise mask when the socket count is a power of two;
-                    // fall back to division-based mod otherwise.
-                    if n.is_power_of_two() {
-                        raw & (n - 1)
-                    } else {
-                        raw % n.max(1)
-                    }
+                    // Sender counts are always powers of two, so we can use a cheap
+                    // bitwise mask rather than a more expensive modulo operation.
+                    debug_assert!(n.is_power_of_two(), "sender count must be a power of two");
+                    raw & (n - 1)
                 };
                 local.spawn(tasks::frame_dispatch(fd.frame_rx, fd.batch_txs, random_fn));
             }
@@ -195,6 +202,12 @@ where
                 ));
             }
 
+            // One recv::Cache per worker, shared across all dispatch tasks on this worker
+            // (matches stream2's Rc<RefCell<SenderStateCache>> pattern).
+            let recv_cache = std::rc::Rc::new(std::cell::RefCell::new(
+                crate::stream3::endpoint::recv::Cache::new(idle_timeout, id),
+            ));
+
             for rt in recv_tasks {
                 local.spawn(tasks::socket_recv_task(
                     rt.socket,
@@ -205,8 +218,7 @@ where
                 ));
                 local.spawn(tasks::packet_dispatch_task(
                     rt.packet_rx,
-                    rt.worker_id,
-                    rt.idle_timeout,
+                    recv_cache.clone(),
                     rt.path_secret_map,
                     rt.acceptor_registry,
                     rt.frame_tx,
@@ -354,7 +366,7 @@ where
     >;
     let mut workers: Vec<Worker<SendSocket, RecvSocket, C, G, AckSnd>> = {
         let mut v = Vec::with_capacity(num_workers);
-        v.extend((0..num_workers).map(|id| Worker::new(id)));
+        v.extend((0..num_workers).map(|id| Worker::new(id, idle_timeout)));
         v
     };
 
@@ -395,8 +407,6 @@ where
             packet_tx,
             decode_error_counter: decode_error_counter.clone(),
             packet_rx,
-            worker_id,
-            idle_timeout,
             path_secret_map: path_secret_map.clone(),
             acceptor_registry: acceptor_registry.clone(),
             frame_tx: frame_tx.clone(),
