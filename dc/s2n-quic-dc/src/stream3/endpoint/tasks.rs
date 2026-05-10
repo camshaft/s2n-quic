@@ -557,8 +557,8 @@ pub async fn packet_dispatch_task<PacketRx, AckTx, Clk>(
     let mut response_tx = frame_tx.clone();
     let mut ack_sender = ack_sender;
     let mut queue_dispatcher = queue_dispatcher;
-    let process_counters = counters.clone();
-    let error_counters = counters.clone();
+    let process_counters = counters;
+    let error_counters = process_counters.clone();
 
     let rx = Map::new(packet_rx, move |packet| {
         process_counters.rx_data_pkt.add(1);
@@ -581,8 +581,11 @@ pub async fn packet_dispatch_task<PacketRx, AckTx, Clk>(
             control_out,
         } => {
             error_counters.rx_process_peer_lookup.add(1);
-            let _ = control_out;
-            tracing::warn!(?credentials, "failed to get or create peer state");
+            tracing::warn!(
+                ?credentials,
+                control_out_len = control_out.len(),
+                "failed to get or create peer state"
+            );
         }
         dispatch::Error::Decryption {
             credentials,
