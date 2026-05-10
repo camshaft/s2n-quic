@@ -709,10 +709,8 @@ impl Inner {
     fn payload_budget_for(&self, header: &Header) -> usize {
         let available = self.packet_size as usize;
         let mut payload_budget = available;
-        let mut iterations = 0;
 
         for _ in 0..MAX_PAYLOAD_BUDGET_ITERATIONS {
-            iterations += 1;
             // The payload budget feeds back into `metadata_len` through the varint-encoded
             // payload-length field, so recompute until the fixed point stabilizes.
             let next = available.saturating_sub(header.metadata_len(payload_budget));
@@ -723,7 +721,7 @@ impl Inner {
         }
 
         unreachable!(
-            "payload budget did not converge: header={header:?} available={available} budget={payload_budget} iterations={iterations}"
+            "payload budget did not converge: header={header:?} available={available} budget={payload_budget} iterations={MAX_PAYLOAD_BUDGET_ITERATIONS}"
         );
     }
 
