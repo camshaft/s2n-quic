@@ -31,6 +31,89 @@ use s2n_quic_core::{
 };
 use std::{cell::RefCell, collections::HashMap, rc::Rc, sync::Arc};
 
+/// Pending frame queue with an integrated wire-cost counter.
+///
+/// This struct ensures that `byte_cost` always mirrors the true accumulated
+/// [`ByteCost`] of every frame in the queue. All mutations (push/pop) go through
+/// this type, so callers cannot accidentally desync the counter.
+pub(crate) struct PendingFrames {
+    queue: Queue<Frame>,
+    /// Accumulated wire cost of all frames currently in the queue.
+    ///
+    /// Wire cost = payload bytes + header metadata bytes (type tag + routing
+    /// varints + optional payload-length varint) for every frame.
+    byte_cost: usize,
+}
+
+impl PendingFrames {
+    #[inline]
+    pub fn new() -> Self {
+        Self {
+            queue: Queue::new(),
+            byte_cost: 0,
+        }
+    }
+
+    /// Push a frame onto the back of the queue, updating the cost counter.
+    #[inline]
+    pub fn push_back(&mut self, frame: intrusive_queue::Entry<Frame>) {
+        self.byte_cost += frame.byte_cost() as usize;
+        self.queue.push_back(frame);
+    }
+
+    /// Push a frame onto the front of the queue, updating the cost counter.
+    ///
+    /// Only call this with a frame that was just removed via [`pop_front`] — for
+    /// example when a frame does not fit in the current segment and must be
+    /// returned for the next assembly round. Calling this with a frame that was
+    /// *not* previously popped will double-count its wire cost.
+    #[inline]
+    pub fn push_front(&mut self, frame: intrusive_queue::Entry<Frame>) {
+        self.byte_cost += frame.byte_cost() as usize;
+        self.queue.push_front(frame);
+    }
+
+    /// Remove the next frame from the front of the queue, updating the cost counter.
+    #[inline]
+    pub fn pop_front(&mut self) -> Option<intrusive_queue::Entry<Frame>> {
+        let frame = self.queue.pop_front()?;
+        let cost = frame.byte_cost() as usize;
+        debug_assert!(
+            self.byte_cost >= cost,
+            "byte_cost underflow: counter={} frame_cost={}",
+            self.byte_cost,
+            cost
+        );
+        self.byte_cost = self.byte_cost.saturating_sub(cost);
+        Some(frame)
+    }
+
+    /// Returns `true` if the queue contains no frames.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.queue.is_empty()
+    }
+
+    /// Returns the number of frames in the queue.
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.queue.len()
+    }
+
+    /// Returns the accumulated wire cost of all frames currently in the queue.
+    #[inline]
+    pub fn byte_cost(&self) -> usize {
+        self.byte_cost
+    }
+
+    /// Returns a shared reference to the inner queue for read-only operations
+    /// (e.g. iteration during segment encoding).
+    #[inline]
+    pub fn as_queue(&self) -> &Queue<Frame> {
+        &self.queue
+    }
+}
+
 /// Per-peer send state, one per (credentials_id, send_socket) pair.
 ///
 /// Holds crypto material, congestion control, inflight tracking, and the pending frame
@@ -48,13 +131,8 @@ pub(crate) struct Context {
     pub rtt_estimator: RttEstimator,
     pub inflight: inflight::Map,
     pub pto: Pto,
-    /// Frames waiting to be assembled into packets
-    pub pending: Queue<Frame>,
-    /// Total payload bytes across all frames in `pending`.
-    ///
-    /// Maintained by `push_frame`, `pop_pending`, and `push_front_pending` so callers
-    /// never need to traverse the queue.
-    pub pending_bytes: usize,
+    /// Frames waiting to be assembled into packets, with integrated wire-cost tracking.
+    pub pending: PendingFrames,
     /// Index of this socket in the path secret entry's `next_transmission_by_sender` array.
     ///
     /// Used by `publish_next_transmission_time` to write the correct slot so the
@@ -89,8 +167,7 @@ impl Context {
             rtt_estimator,
             inflight,
             pto: Pto::default(),
-            pending: Queue::new(),
-            pending_bytes: 0,
+            pending: PendingFrames::new(),
             sender_idx,
             tx_wheel: WheelLinks::new(),
             pto_wheel: WheelLinks::new(),
@@ -98,48 +175,29 @@ impl Context {
         }
     }
 
-    /// Push a frame onto the pending queue, tracking its wire cost.
-    ///
-    /// Wire cost includes both payload bytes and header encoding bytes (type tag,
-    /// routing fields, and optional payload-length varint), so `pending_bytes`
-    /// reflects how much data this context is holding for the load balancer.
+    /// Push a frame onto the pending queue.
     #[inline]
     pub fn push_frame(&mut self, frame: intrusive_queue::Entry<Frame>) {
-        self.pending_bytes += frame.byte_cost() as usize;
         self.pending.push_back(frame);
     }
 
-    /// Pop the next frame from the pending queue, updating the byte counter.
+    /// Pop the next frame from the pending queue.
     #[inline]
     pub fn pop_pending(&mut self) -> Option<intrusive_queue::Entry<Frame>> {
-        let frame = self.pending.pop_front()?;
-        let cost = frame.byte_cost() as usize;
-        debug_assert!(
-            self.pending_bytes >= cost,
-            "pending_bytes underflow: counter={} frame_cost={}",
-            self.pending_bytes,
-            cost
-        );
-        self.pending_bytes = self.pending_bytes.saturating_sub(cost);
-        Some(frame)
+        self.pending.pop_front()
     }
 
-    /// Push a frame back to the front of the pending queue, updating the byte counter.
+    /// Push a frame back to the front of the pending queue.
     ///
-    /// This should only be called with a frame that was just removed from this queue via
-    /// [`pop_pending`] — for example when a frame does not fit in the current segment and
-    /// must be returned so the next assembly round can try again. Calling this with a
-    /// frame that was *not* previously popped will double-count its wire cost in
-    /// `pending_bytes`.
+    /// Only call this with a frame just removed via [`pop_pending`].
     #[inline]
     pub fn push_front_pending(&mut self, frame: intrusive_queue::Entry<Frame>) {
-        self.pending_bytes += frame.byte_cost() as usize;
         self.pending.push_front(frame);
     }
 
     /// Publish the estimated next transmission time to the path secret entry.
     ///
-    /// Derives the estimate from the current pending payload size and the CCA bandwidth
+    /// Derives the estimate from the current pending wire cost and the CCA bandwidth
     /// sample, then stores it in the path-secret entry so the load-balancer
     /// (`pick_sender_by_next_transmission`) can compare per-socket load.
     ///
@@ -149,7 +207,7 @@ impl Context {
         self.path_secret_entry.update_sender_next_transmission_time(
             self.sender_idx,
             now,
-            self.pending_bytes,
+            self.pending.byte_cost(),
             self.cca.bandwidth(),
         );
     }
@@ -709,28 +767,28 @@ mod tests {
         let ctx = make_context();
         let mut ctx = ctx.borrow_mut();
 
-        assert_eq!(ctx.pending_bytes, 0);
+        assert_eq!(ctx.pending.byte_cost(), 0);
 
         let frame1 = make_frame(100);
         let cost1 = frame1.byte_cost() as usize;
         ctx.push_frame(frame1);
-        assert_eq!(ctx.pending_bytes, cost1);
+        assert_eq!(ctx.pending.byte_cost(), cost1);
 
         let frame2 = make_frame(200);
         let cost2 = frame2.byte_cost() as usize;
         ctx.push_frame(frame2);
-        assert_eq!(ctx.pending_bytes, cost1 + cost2);
+        assert_eq!(ctx.pending.byte_cost(), cost1 + cost2);
 
         let frame = ctx.pop_pending().unwrap();
         assert_eq!(frame.payload_len(), 100);
-        assert_eq!(ctx.pending_bytes, cost2);
+        assert_eq!(ctx.pending.byte_cost(), cost2);
 
         let frame = ctx.pop_pending().unwrap();
         assert_eq!(frame.payload_len(), 200);
-        assert_eq!(ctx.pending_bytes, 0);
+        assert_eq!(ctx.pending.byte_cost(), 0);
 
         assert!(ctx.pop_pending().is_none());
-        assert_eq!(ctx.pending_bytes, 0);
+        assert_eq!(ctx.pending.byte_cost(), 0);
     }
 
     #[test]
@@ -743,14 +801,14 @@ mod tests {
         let frame = make_frame(100);
         let cost = frame.byte_cost() as usize;
         ctx.push_frame(frame);
-        assert_eq!(ctx.pending_bytes, cost);
+        assert_eq!(ctx.pending.byte_cost(), cost);
 
         // Pop then push back (simulates "doesn't fit" path in assemble)
         let frame = ctx.pop_pending().unwrap();
-        assert_eq!(ctx.pending_bytes, 0);
+        assert_eq!(ctx.pending.byte_cost(), 0);
 
         ctx.push_front_pending(frame);
-        assert_eq!(ctx.pending_bytes, cost);
+        assert_eq!(ctx.pending.byte_cost(), cost);
     }
 
     #[test]
@@ -775,6 +833,8 @@ mod tests {
         ctx.push_frame(make_frame(1000));
 
         // Build a timestamp from a known duration.
+        // SAFETY: the duration is positive (5 000 µs) and well within the range of
+        // representable Timestamp values (u64 microseconds from process start).
         let now = unsafe {
             s2n_quic_core::time::Timestamp::from_duration(Duration::from_micros(5_000))
         };

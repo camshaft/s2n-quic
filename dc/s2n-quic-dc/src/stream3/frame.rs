@@ -174,14 +174,20 @@ impl Header {
     /// Returns the number of bytes this header occupies in the application header region,
     /// including the optional payload-length varint when [`has_payload_length`] is true.
     ///
-    /// This mirrors the `frame_metadata_len` helper in `assemble.rs` and is exposed here so
-    /// that `Frame::byte_cost` can account for header overhead without a cross-module dependency.
+    /// This is the single canonical implementation of the frame-metadata size calculation.
+    /// `assemble::frame_metadata_len` delegates here so both callers operate on the same
+    /// assumptions. Debug builds assert that header variants without a payload-length field
+    /// always receive an empty payload.
     #[inline]
     pub fn metadata_len(&self, payload_len: usize) -> usize {
         if self.has_payload_length() {
-            let payload_len = VarInt::try_from(payload_len as u64).unwrap_or(VarInt::ZERO);
-            self.encoding_size() + payload_len.encoding_size()
+            let payload_len_varint = VarInt::try_from(payload_len as u64).unwrap_or(VarInt::ZERO);
+            self.encoding_size() + payload_len_varint.encoding_size()
         } else {
+            debug_assert_eq!(
+                payload_len, 0,
+                "frames without payload_length must have zero payload"
+            );
             self.encoding_size()
         }
     }

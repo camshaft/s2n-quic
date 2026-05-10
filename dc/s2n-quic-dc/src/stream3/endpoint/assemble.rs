@@ -363,13 +363,7 @@ fn encode_frame_metadata(
 
 #[inline]
 fn frame_metadata_len(header: &crate::stream3::frame::Header, payload_len: usize) -> usize {
-    if header.has_payload_length() {
-        let payload_len = VarInt::try_from(payload_len as u64).unwrap_or(VarInt::ZERO);
-        header.encoding_size() + payload_len.encoding_size()
-    } else {
-        debug_assert_payload_length_invariant(payload_len);
-        header.encoding_size()
-    }
+    header.metadata_len(payload_len)
 }
 
 #[inline]
@@ -942,7 +936,7 @@ mod tests {
             &context.sealer,
             &context.credentials,
             &mut context.flow_attempt_id_counter,
-            &context.pending,
+            context.pending.as_queue(),
             &mut header_buf,
         );
         assert!(encoded_len > 0, "must encode at least something");
