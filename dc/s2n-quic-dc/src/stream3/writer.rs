@@ -708,6 +708,8 @@ impl Inner {
         let mut payload_budget = available;
 
         loop {
+            // The payload budget feeds back into `metadata_len` through the varint-encoded
+            // payload-length field, so recompute until the fixed point stabilizes.
             let next = available.saturating_sub(header.metadata_len(payload_budget));
             if next == payload_budget {
                 return payload_budget;
@@ -754,7 +756,9 @@ impl Inner {
                 queue_pair,
                 stream_id: self.stream_id,
                 offset: self.next_offset,
-                is_fin,
+                // FIN changes the tag value but not its encoded size, so size the chunk as if
+                // it were a non-FIN frame and decide whether to set FIN after copying.
+                is_fin: false,
             };
 
             let chunk_len = if need_fin_packet {
