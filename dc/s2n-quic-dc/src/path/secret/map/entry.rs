@@ -268,6 +268,17 @@ impl Entry {
             .into_boxed_slice()
     }
 
+    fn transmission_delay(queued_bytes: usize, bandwidth: Bandwidth) -> Duration {
+        let bytes_per_second = bandwidth.as_bytes_per_second();
+        if queued_bytes == 0 || bytes_per_second == 0 || bytes_per_second == u64::MAX {
+            return Duration::ZERO;
+        }
+
+        let nanos = (queued_bytes as u128).saturating_mul(1_000_000_000) / bytes_per_second as u128;
+        let nanos = nanos.min(u64::MAX as u128) as u64;
+        Duration::from_nanos(nanos)
+    }
+
     #[inline]
     pub fn socket_sender_count(&self) -> usize {
         self.next_transmission_by_sender.len()
@@ -286,7 +297,7 @@ impl Entry {
         bandwidth: Bandwidth,
     ) -> Timestamp {
         let sender_idx = self.sender_index(sender_idx);
-        let delay: Duration = (queued_bytes as u64) / bandwidth;
+        let delay = Self::transmission_delay(queued_bytes, bandwidth);
         let next = now + delay;
         let next_micros = Self::sender_schedule_micros(next);
         self.next_transmission_by_sender[sender_idx].store(next_micros, Ordering::Release);
@@ -302,15 +313,8 @@ impl Entry {
             return 0;
         }
 
-        let mut idx1 = random_fn(len);
-        if idx1 >= len {
-            idx1 %= len;
-        }
-
-        let mut idx2 = random_fn(len - 1);
-        if idx2 >= len - 1 {
-            idx2 %= len - 1;
-        }
+        let idx1 = random_fn(len) % len;
+        let mut idx2 = random_fn(len - 1) % (len - 1);
         if idx2 >= idx1 {
             idx2 += 1;
         }
