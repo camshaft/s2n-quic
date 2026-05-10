@@ -581,7 +581,7 @@ mod tests {
     }
 
     #[test]
-    fn batch_frames_respects_datagram_byte_budget() {
+    fn batch_frames_enforces_datagram_byte_budget() {
         let path = test_path_secret_entry();
         path.update_max_datagram_size(220);
 
@@ -600,6 +600,14 @@ mod tests {
             panic!("expected first batch");
         };
         assert_eq!(first.len(), 1);
+        assert!(first.byte_cost() <= 220);
+        let frame_cost = frame_entry_byte_cost(
+            first
+                .queue()
+                .peek_front()
+                .expect("batch must contain the first frame"),
+        );
+        assert!(first.byte_cost().saturating_add(frame_cost) > 220);
 
         let second = with_noop_context(|cx| batcher.poll_recv(cx));
         let Poll::Ready(Some(second)) = second else {
