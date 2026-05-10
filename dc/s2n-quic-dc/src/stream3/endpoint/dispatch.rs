@@ -1016,7 +1016,7 @@ fn handle_flow_control(
             tracing::debug!(
                 stream_id = stream_id.as_u64(),
                 queue_id = local_queue_id.as_u64(),
-                "FlowControl for half-closed control - sending reset"
+                "FlowControl for half-closed stream - sending reset"
             );
             push_reset_frame_with_target(
                 response_frames,
