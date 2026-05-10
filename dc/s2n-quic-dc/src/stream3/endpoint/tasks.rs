@@ -11,8 +11,6 @@ use core::{
     future::poll_fn,
     task::{self, Poll},
 };
-use s2n_codec::EncoderValue;
-use s2n_quic_core::varint::VarInt;
 use std::sync::Arc;
 
 /// Routing key accessor for stream3 send-side load-balancing tasks.
@@ -45,31 +43,6 @@ const MAX_FRAME_BATCH_PACKET_OVERHEAD: u64 =
     crate::packet::datagram::partial::MAX_FLOW_DATA_HEADER_OVERHEAD as u64;
 const BATCH_FRAMES_POLL_BUDGET: usize = 10;
 
-#[inline]
-fn frame_entry_byte_cost(frame: &Frame) -> u64 {
-    let payload_len = frame.payload_len() as u64;
-    let header_len = frame.header.encoding_size() as u64;
-    let payload_len_varint = if frame.header.has_payload_length() {
-        match VarInt::new(payload_len) {
-            Ok(payload_len) => payload_len.encoding_size() as u64,
-            Err(_) => {
-                debug_assert!(
-                    payload_len > VarInt::MAX.as_u64(),
-                    "unexpected VarInt conversion failure for payload length: {}",
-                    payload_len
-                );
-                VarInt::MAX.encoding_size() as u64
-            }
-        }
-    } else {
-        0
-    };
-
-    payload_len
-        .saturating_add(header_len)
-        .saturating_add(payload_len_varint)
-}
-
 /// A queue of frames grouped for a single path-secret entry.
 ///
 /// This wrapper keeps the queue byte-cost estimate and path-secret entry so it can be routed
@@ -84,7 +57,7 @@ impl FrameBatch {
     #[inline]
     fn new(first: Entry<Frame>) -> Self {
         let path_secret_entry = first.path_secret_entry.clone();
-        let byte_cost = MAX_FRAME_BATCH_PACKET_OVERHEAD.saturating_add(frame_entry_byte_cost(&first));
+        let byte_cost = MAX_FRAME_BATCH_PACKET_OVERHEAD.saturating_add(first.byte_cost());
         let mut queue = Queue::new();
         queue.push_back(first);
 
@@ -206,7 +179,7 @@ where
                         break;
                     }
 
-                    let frame_cost = frame_entry_byte_cost(&frame_entry);
+                    let frame_cost = frame_entry.byte_cost();
                     let next_cost = batch.byte_cost().saturating_add(frame_cost);
                     if next_cost > target_bytes {
                         self.buffered = Some(frame_entry);
@@ -598,12 +571,11 @@ mod tests {
         };
         assert_eq!(first.len(), 1);
         assert!(first.byte_cost() <= 220);
-        let frame_cost = frame_entry_byte_cost(
-            first
-                .queue()
-                .peek_front()
-                .expect("batch must contain the first frame"),
-        );
+        let frame_cost = first
+            .queue()
+            .peek_front()
+            .expect("batch must contain the first frame")
+            .byte_cost();
         assert!(first.byte_cost().saturating_add(frame_cost) > 220);
 
         let second = with_noop_context(|cx| batcher.poll_recv(cx));
