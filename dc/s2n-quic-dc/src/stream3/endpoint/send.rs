@@ -21,6 +21,7 @@ use crate::{
     credentials::{self, Credentials},
     intrusive_queue::{self, Queue},
     path::secret::map::Entry as PathSecretEntry,
+    socket::channel::ByteCost,
     stream3::{endpoint::inflight, frame::Frame},
 };
 use core::time::Duration;
@@ -97,10 +98,14 @@ impl Context {
         }
     }
 
-    /// Push a frame onto the pending queue, tracking its payload size.
+    /// Push a frame onto the pending queue, tracking its wire cost.
+    ///
+    /// Wire cost includes both payload bytes and header encoding bytes (type tag,
+    /// routing fields, and optional payload-length varint), so `pending_bytes`
+    /// reflects how much data this context is holding for the load balancer.
     #[inline]
     pub fn push_frame(&mut self, frame: intrusive_queue::Entry<Frame>) {
-        self.pending_bytes += frame.payload_len();
+        self.pending_bytes += frame.byte_cost() as usize;
         self.pending.push_back(frame);
     }
 
@@ -108,14 +113,14 @@ impl Context {
     #[inline]
     pub fn pop_pending(&mut self) -> Option<intrusive_queue::Entry<Frame>> {
         let frame = self.pending.pop_front()?;
-        let len = frame.payload_len();
+        let cost = frame.byte_cost() as usize;
         debug_assert!(
-            self.pending_bytes >= len,
-            "pending_bytes underflow: counter={} frame_payload={}",
+            self.pending_bytes >= cost,
+            "pending_bytes underflow: counter={} frame_cost={}",
             self.pending_bytes,
-            len
+            cost
         );
-        self.pending_bytes = self.pending_bytes.saturating_sub(len);
+        self.pending_bytes = self.pending_bytes.saturating_sub(cost);
         Some(frame)
     }
 
@@ -124,11 +129,11 @@ impl Context {
     /// This should only be called with a frame that was just removed from this queue via
     /// [`pop_pending`] — for example when a frame does not fit in the current segment and
     /// must be returned so the next assembly round can try again. Calling this with a
-    /// frame that was *not* previously popped will double-count its payload bytes in
+    /// frame that was *not* previously popped will double-count its wire cost in
     /// `pending_bytes`.
     #[inline]
     pub fn push_front_pending(&mut self, frame: intrusive_queue::Entry<Frame>) {
-        self.pending_bytes += frame.payload_len();
+        self.pending_bytes += frame.byte_cost() as usize;
         self.pending.push_front(frame);
     }
 
@@ -699,20 +704,26 @@ mod tests {
 
     #[test]
     fn pending_bytes_tracks_push_and_pop() {
+        use crate::socket::channel::ByteCost as _;
+
         let ctx = make_context();
         let mut ctx = ctx.borrow_mut();
 
         assert_eq!(ctx.pending_bytes, 0);
 
-        ctx.push_frame(make_frame(100));
-        assert_eq!(ctx.pending_bytes, 100);
+        let frame1 = make_frame(100);
+        let cost1 = frame1.byte_cost() as usize;
+        ctx.push_frame(frame1);
+        assert_eq!(ctx.pending_bytes, cost1);
 
-        ctx.push_frame(make_frame(200));
-        assert_eq!(ctx.pending_bytes, 300);
+        let frame2 = make_frame(200);
+        let cost2 = frame2.byte_cost() as usize;
+        ctx.push_frame(frame2);
+        assert_eq!(ctx.pending_bytes, cost1 + cost2);
 
         let frame = ctx.pop_pending().unwrap();
         assert_eq!(frame.payload_len(), 100);
-        assert_eq!(ctx.pending_bytes, 200);
+        assert_eq!(ctx.pending_bytes, cost2);
 
         let frame = ctx.pop_pending().unwrap();
         assert_eq!(frame.payload_len(), 200);
@@ -724,18 +735,22 @@ mod tests {
 
     #[test]
     fn pending_bytes_tracks_push_front() {
+        use crate::socket::channel::ByteCost as _;
+
         let ctx = make_context();
         let mut ctx = ctx.borrow_mut();
 
-        ctx.push_frame(make_frame(100));
-        assert_eq!(ctx.pending_bytes, 100);
+        let frame = make_frame(100);
+        let cost = frame.byte_cost() as usize;
+        ctx.push_frame(frame);
+        assert_eq!(ctx.pending_bytes, cost);
 
         // Pop then push back (simulates "doesn't fit" path in assemble)
         let frame = ctx.pop_pending().unwrap();
         assert_eq!(ctx.pending_bytes, 0);
 
         ctx.push_front_pending(frame);
-        assert_eq!(ctx.pending_bytes, 100);
+        assert_eq!(ctx.pending_bytes, cost);
     }
 
     #[test]
