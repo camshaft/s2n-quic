@@ -278,8 +278,7 @@ impl Entry {
         }
 
         let queued_bytes = u64::try_from(queued_bytes).unwrap_or(u64::MAX);
-        let delay: Duration = queued_bytes / bandwidth;
-        delay
+        <u64 as core::ops::Div<Bandwidth>>::div(queued_bytes, bandwidth)
     }
 
     #[inline]
