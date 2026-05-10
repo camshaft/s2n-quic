@@ -41,7 +41,15 @@ where
     R: Receiver<T>,
     S: Sender<T>,
 {
-    pick_two_with_random(rx, senders, |upper_bound| rand::random_range(..upper_bound)).await
+    pick_two_with_random(rx, senders, |upper_bound| {
+        debug_assert!(upper_bound > 0);
+        if upper_bound == 0 {
+            0
+        } else {
+            rand::random_range(..upper_bound)
+        }
+    })
+    .await
 }
 
 pub async fn pick_two_with_random<T, R, S, Rand>(mut rx: R, mut senders: Vec<S>, random: Rand)
@@ -86,6 +94,8 @@ where
         }
 
         let chosen_idx = {
+            // SAFETY: `slot` is initialized with `MaybeUninit::new(entry)` and remains
+            // initialized until it is consumed by a successful `poll_send`.
             let value = unsafe { &*slot.as_ptr() };
             let picked = value
                 .path_secret_entry()

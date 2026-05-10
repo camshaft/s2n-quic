@@ -19,7 +19,7 @@ pub(crate) mod worker;
 
 use crate::{
     acceptor,
-    stream3::{frame::{Frame, SubmissionSender}, Stream},
+    stream3::{frame::SubmissionSender, Stream},
 };
 use std::sync::atomic::AtomicU64;
 
