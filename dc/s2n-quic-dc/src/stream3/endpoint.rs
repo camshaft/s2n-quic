@@ -339,8 +339,11 @@ where
 
     // Build workers -------------------------------------------------------------
     // Pre-allocate one Worker per spawner thread.
-    let mut workers: Vec<Worker<SendSocket, RecvSocket, C, G>> =
-        (0..num_workers).map(|id| Worker::new(id)).collect();
+    let mut workers: Vec<Worker<SendSocket, RecvSocket, C, G>> = {
+        let mut v = Vec::with_capacity(num_workers);
+        v.extend((0..num_workers).map(|id| Worker::new(id)));
+        v
+    };
 
     // Worker 0 runs frame-dispatch.
     workers[0].frame_dispatch = Some(FrameDispatchParts {

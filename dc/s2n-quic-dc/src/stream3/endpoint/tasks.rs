@@ -355,10 +355,12 @@ pub async fn socket_send_task<Socket, BatchRx, AckRx>(
 /// `packet_tx` is generic so callers can substitute a local unsync sender when the dispatch
 /// task is co-located on the same worker.
 ///
-/// Drives a [`SocketReceiver`] → [`FlattenSegments`] → [`ChannelRouter`] chain. Each segment is
-/// decoded and datagram packets are forwarded via `packet_tx` to the dispatch task.
+/// Drives a [`SocketReceiver`] → [`InspectErr`] → [`FlattenSegments`] → [`ChannelRouter`] chain.
+/// Each segment is decoded; datagram packets are forwarded via `packet_tx` to the dispatch task,
+/// and decode errors are tallied via `decode_error_counter`.
 ///
 /// [`SocketReceiver`]: crate::socket::channel::SocketReceiver
+/// [`InspectErr`]: crate::socket::channel::InspectErr
 /// [`FlattenSegments`]: crate::socket::channel::FlattenSegments
 /// [`ChannelRouter`]: crate::stream3::endpoint::worker::ChannelRouter
 pub async fn socket_recv_task<Socket, Tx>(
