@@ -672,6 +672,8 @@ impl Inner {
         let header = Header::FlowInit {
             source_queue_id: self.control_rx.queue_id(),
             dest_acceptor_id: self.acceptor_id,
+            // The transport replaces this sentinel with the real attempt_id later, so size
+            // early-data packets against the worst-case varint length up front.
             attempt_id: VarInt::MAX,
             stream_id: self.stream_id,
             is_fin,
@@ -766,8 +768,8 @@ impl Inner {
                 queue_pair,
                 stream_id: self.stream_id,
                 offset,
-                // FIN and non-FIN FlowData frames have equal metadata length; use the
-                // terminal variant as a conservative placeholder for the budget check.
+                // FIN and non-FIN FlowData frames have equal metadata length, so either
+                // variant produces the same payload budget.
                 is_fin: true,
             };
 
