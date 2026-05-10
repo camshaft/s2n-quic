@@ -626,7 +626,7 @@ mod tests {
         assert_eq!(app_buf, Data::send_one_at(0, 8));
         assert_eq!(reassembler.consumed_len(), 8);
         assert_eq!(reassembler.final_size(), Some(8));
-        assert!(reassembler.buffer_is_empty());
+        assert!(reassembler.is_empty());
         assert!(reassembler.is_reading_complete());
     }
 
@@ -640,9 +640,9 @@ mod tests {
         write_data_reader(&mut reassembler, &mut reader, Some(&mut app_buf)).unwrap();
 
         assert!(app_buf.is_empty());
-        assert_eq!(reassembler.current_offset().as_u64(), 0);
+        assert_eq!(reassembler.consumed_len(), 0);
         assert_eq!(reassembler.total_received_len(), 4);
-        assert!(reassembler.buffer_is_empty());
+        assert!(reassembler.is_empty());
         assert!(!reassembler.is_reading_complete());
     }
 
@@ -660,6 +660,6 @@ mod tests {
         assert!(app_buf.is_empty());
         assert_eq!(reassembler.len(), 8);
         assert_eq!(reassembler.total_received_len(), 8);
-        assert!(!reassembler.buffer_is_empty());
+        assert!(!reassembler.is_empty());
     }
 }
