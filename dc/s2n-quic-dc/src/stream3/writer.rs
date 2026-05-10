@@ -42,13 +42,6 @@
 //   transmission_time. We also need to remember the last transmission time so we don't go
 //   backward if we do another burst.
 //
-// * MTU estimation is overly conservative. MAX_FLOW_DATA_HEADER_OVERHEAD assumes worst-case
-//   VarInt sizes for all fields (8 bytes each), but many fields have known values at frame
-//   construction time (stream_id, queue_ids, offset). We should compute the actual header
-//   size using the known varint-encoded lengths for fields we know, and only use worst-case
-//   for fields the transport fills later (source_sender_id, packet_number). This could
-//   reclaim 20-30 bytes per frame for typical streams.
-//
 // Observability:
 //
 // * No mechanism to report FIN acknowledgment to the application. After sending FIN, the
@@ -673,8 +666,15 @@ impl Inner {
             return Err(offset_overflow_error());
         }
 
-        let mtu = self.packet_size as usize;
-        let chunk_len = mtu
+        let header = Header::FlowInit {
+            source_queue_id: self.control_rx.queue_id(),
+            dest_acceptor_id: self.acceptor_id,
+            attempt_id: VarInt::MAX,
+            stream_id: self.stream_id,
+            is_fin,
+        };
+        let chunk_len = self
+            .payload_budget_for(&header)
             .min(buf.buffered_len())
             .min(self.remaining_offset_capacity());
 
@@ -703,11 +703,23 @@ impl Inner {
         local_available.min(remote_available)
     }
 
+    fn payload_budget_for(&self, header: &Header) -> usize {
+        let available = self.packet_size as usize;
+        let mut payload_budget = available;
+
+        loop {
+            let next = available.saturating_sub(header.metadata_len(payload_budget));
+            if next == payload_budget {
+                return payload_budget;
+            }
+            payload_budget = next;
+        }
+    }
+
     fn send_data<S>(&mut self, buf: &mut S, is_fin: bool) -> io::Result<usize>
     where
         S: buffer::reader::storage::Infallible,
     {
-        let mtu = self.packet_size as usize;
         let mut written = 0;
 
         let mut need_fin_packet = is_fin && buf.buffer_is_empty();
@@ -730,13 +742,33 @@ impl Inner {
                 break;
             }
 
+            let queue_pair = QueuePair {
+                source_queue_id: self.control_rx.queue_id(),
+                dest_queue_id: self
+                    .control_rx
+                    .remote_queue_id()
+                    .expect("remote_queue_id must be set when Open"),
+            };
+
+            let header = Header::FlowData {
+                queue_pair,
+                stream_id: self.stream_id,
+                offset: self.next_offset,
+                is_fin,
+            };
+
             let chunk_len = if need_fin_packet {
                 0
             } else {
-                mtu.min(buf.buffered_len())
+                self.payload_budget_for(&header)
+                    .min(buf.buffered_len())
                     .min(available as usize)
                     .min(remaining_offset_capacity)
             };
+
+            if chunk_len == 0 && !need_fin_packet {
+                break;
+            }
 
             let mut payload = ByteVec::new();
             if chunk_len > 0 {
@@ -748,14 +780,6 @@ impl Inner {
             let offset = self.next_offset;
             let is_last_chunk = buf.buffer_is_empty();
             let include_fin = is_fin && is_last_chunk;
-
-            let queue_pair = QueuePair {
-                source_queue_id: self.control_rx.queue_id(),
-                dest_queue_id: self
-                    .control_rx
-                    .remote_queue_id()
-                    .expect("remote_queue_id must be set when Open"),
-            };
 
             let frame = Frame {
                 source_sender_id: VarInt::MAX,
@@ -1143,5 +1167,69 @@ mod tests {
 
         let mut cx = noop_cx();
         assert!(matches!(frame_rx.poll_recv(&mut cx), Poll::Pending));
+    }
+
+    #[test]
+    fn payload_budget_tracks_flow_data_metadata() {
+        let (mut inner, _) = new_test_inner();
+        inner.packet_size = 64;
+
+        let header = Header::FlowData {
+            queue_pair: QueuePair {
+                source_queue_id: inner.control_rx.queue_id(),
+                dest_queue_id: inner.control_rx.remote_queue_id().unwrap(),
+            },
+            stream_id: inner.stream_id,
+            offset: VarInt::ZERO,
+            is_fin: false,
+        };
+
+        let budget = inner.payload_budget_for(&header);
+        assert_eq!(budget + header.metadata_len(budget), inner.packet_size as usize);
+        assert!(budget < inner.packet_size as usize);
+        assert!(budget + 1 + header.metadata_len(budget + 1) > inner.packet_size as usize);
+    }
+
+    #[test]
+    fn payload_budget_shrinks_when_offset_varint_grows() {
+        let (mut inner, _) = new_test_inner();
+        inner.packet_size = 64;
+
+        let header_at_63 = Header::FlowData {
+            queue_pair: QueuePair {
+                source_queue_id: inner.control_rx.queue_id(),
+                dest_queue_id: inner.control_rx.remote_queue_id().unwrap(),
+            },
+            stream_id: inner.stream_id,
+            offset: VarInt::from_u8(63),
+            is_fin: false,
+        };
+        let header_at_64 = Header::FlowData {
+            offset: VarInt::from_u8(64),
+            ..header_at_63
+        };
+
+        assert!(inner.payload_budget_for(&header_at_64) < inner.payload_budget_for(&header_at_63));
+    }
+
+    #[test]
+    fn prepare_early_data_respects_flow_init_metadata_budget() {
+        let (mut inner, _) = new_test_inner();
+        inner.packet_size = 16;
+
+        let mut buf = &b"hello"[..];
+        let (payload, bytes_read, is_fin) = inner.prepare_early_data(&mut buf, false).unwrap();
+        let header = Header::FlowInit {
+            source_queue_id: inner.control_rx.queue_id(),
+            dest_acceptor_id: inner.acceptor_id,
+            attempt_id: VarInt::MAX,
+            stream_id: inner.stream_id,
+            is_fin,
+        };
+
+        assert_eq!(bytes_read, payload.len());
+        assert_eq!(bytes_read + header.metadata_len(bytes_read), inner.packet_size as usize);
+        assert_eq!(buf, b"lo");
+        assert!(!is_fin);
     }
 }
