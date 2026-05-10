@@ -152,9 +152,9 @@ impl Header {
         }
     }
 
-    /// Returns true if this header variant carries a per-frame payload length.
+    /// Returns true if this header variant carries a per-frame payload length entry.
     #[inline]
-    pub fn has_payload(&self) -> bool {
+    pub fn has_payload_length(&self) -> bool {
         match self {
             Self::FlowInit { .. }
             | Self::FlowData { .. }

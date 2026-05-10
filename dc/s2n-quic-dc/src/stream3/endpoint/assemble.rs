@@ -273,7 +273,7 @@ impl MetadataEstimate {
         crate::packet::datagram::Tag::default().encoding_size()
             + credentials.encoding_size()
             + WireVersion::ZERO.encoding_size()
-            + core::mem::size_of::<u16>()
+            + core::mem::size_of::<u16>() // source_control_port
             + packet_number.encoding_size()
             + routing_info.encoding_size()
             + payload_len.encoding_size()
@@ -355,7 +355,7 @@ fn encode_frame_metadata(
 
 #[inline]
 fn frame_metadata_len(header: &crate::stream3::frame::Header, payload_len: usize) -> usize {
-    if header.has_payload() {
+    if header.has_payload_length() {
         let payload_len = VarInt::try_from(payload_len as u64).unwrap_or(VarInt::ZERO);
         header.encoding_size() + payload_len.encoding_size()
     } else {
@@ -374,8 +374,9 @@ fn push_frame_metadata(
     let start = header_buf.len();
     header_buf.reserve(entry_size);
 
-    // SAFETY: `reserve` ensures the requested capacity is available and the encoder writes exactly
-    // `entry_size` bytes into the newly-exposed slice before it is observed.
+    // SAFETY: this avoids zero-initializing the appended metadata bytes on every frame. `reserve`
+    // ensures capacity is available and the encoder writes exactly `entry_size` bytes before the
+    // slice is observed.
     unsafe {
         header_buf.set_len(start + entry_size);
     }
@@ -383,7 +384,7 @@ fn push_frame_metadata(
     let mut enc = EncoderBuffer::new(&mut header_buf[start..]);
     enc.encode(header);
 
-    if header.has_payload() {
+    if header.has_payload_length() {
         let payload_len = VarInt::try_from(payload_len as u64).unwrap_or(VarInt::ZERO);
         enc.encode(&payload_len);
     } else {
@@ -583,7 +584,7 @@ mod tests {
     }
 
     fn payload_len(frame: &FrameInput) -> usize {
-        if frame.header.has_payload() {
+        if frame.header.has_payload_length() {
             frame.payload.len()
         } else {
             0
@@ -608,7 +609,7 @@ mod tests {
     }
 
     fn to_frame(frame: &FrameInput, entry: &Arc<PathSecretEntry>) -> crate::intrusive_queue::Entry<Frame> {
-        let payload = if frame.header.has_payload() {
+        let payload = if frame.header.has_payload_length() {
             frame.payload.as_slice()
         } else {
             &[]
