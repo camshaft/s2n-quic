@@ -427,7 +427,7 @@ mod tests {
         }
 
         fn timer(&self) -> Self::Timer {
-            unreachable!("tests do not construct timers from FixedClock")
+            unreachable!("FixedClock is a test fixture and does not support timer construction")
         }
     }
 
