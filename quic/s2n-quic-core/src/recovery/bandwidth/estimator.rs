@@ -174,19 +174,6 @@ impl core::ops::Mul<Duration> for Bandwidth {
     }
 }
 
-impl core::ops::Mul<usize> for Bandwidth {
-    type Output = Duration;
-
-    fn mul(self, rhs: usize) -> Self::Output {
-        #[allow(clippy::suspicious_arithmetic_impl)]
-        Duration::from_nanos(
-            self.nanos_per_kibibyte
-                .saturating_mul(rhs as u64)
-                >> KIBIBYTE_SHIFT,
-        )
-    }
-}
-
 /// Divides a count of bytes represented as a u64 by the given `Bandwidth`
 ///
 /// Since `Bandwidth` is a rate of bytes over a time period, this division

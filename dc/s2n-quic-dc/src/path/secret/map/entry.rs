@@ -277,7 +277,8 @@ impl Entry {
             return Duration::ZERO;
         }
 
-        bandwidth * queued_bytes
+        let queued_bytes = queued_bytes.min(u64::MAX as usize) as u64;
+        queued_bytes / bandwidth
     }
 
     #[inline]
