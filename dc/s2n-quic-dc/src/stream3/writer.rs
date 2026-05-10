@@ -707,7 +707,7 @@ impl Inner {
         let available = self.packet_size as usize;
         let mut payload_budget = available;
 
-        loop {
+        for _ in 0..8 {
             // The payload budget feeds back into `metadata_len` through the varint-encoded
             // payload-length field, so recompute until the fixed point stabilizes.
             let next = available.saturating_sub(header.metadata_len(payload_budget));
@@ -716,6 +716,9 @@ impl Inner {
             }
             payload_budget = next;
         }
+
+        debug_assert!(false, "payload budget did not converge");
+        payload_budget
     }
 
     fn send_data<S>(&mut self, buf: &mut S, is_fin: bool) -> io::Result<usize>
@@ -756,10 +759,19 @@ impl Inner {
                 queue_pair,
                 stream_id: self.stream_id,
                 offset: self.next_offset,
-                // FIN changes the tag value but not its encoded size, so size the chunk as if
-                // it were a non-FIN frame and decide whether to set FIN after copying.
                 is_fin: false,
             };
+            debug_assert_eq!(
+                header.metadata_len(0),
+                Header::FlowData {
+                    queue_pair,
+                    stream_id: self.stream_id,
+                    offset: self.next_offset,
+                    is_fin: true,
+                }
+                .metadata_len(0),
+                "FlowData FIN must not change metadata length",
+            );
 
             let chunk_len = if need_fin_packet {
                 0
