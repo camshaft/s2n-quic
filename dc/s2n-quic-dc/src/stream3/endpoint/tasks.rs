@@ -44,12 +44,12 @@ where
     pick_two_with_random(rx, senders, |upper_bound| rand::random_range(..upper_bound)).await
 }
 
-pub async fn pick_two_with_random<T, R, S, Rand>(mut rx: R, mut senders: Vec<S>, mut random: Rand)
+pub async fn pick_two_with_random<T, R, S, Rand>(mut rx: R, mut senders: Vec<S>, random: Rand)
 where
     T: ByteCost + PathSecretMapEntry,
     R: Receiver<T>,
     S: Sender<T>,
-    Rand: FnMut(usize) -> usize,
+    Rand: Fn(usize) -> usize,
 {
     loop {
         let Some(entry) = rx.recv().await else {
@@ -59,7 +59,7 @@ where
         let bytes = entry.byte_cost();
         let mut slot = core::mem::MaybeUninit::new(entry);
 
-        let sent = poll_fn(|cx| try_send_pick_two(cx, &mut slot, &mut senders, &mut random)).await;
+        let sent = poll_fn(|cx| try_send_pick_two(cx, &mut slot, &mut senders, &random)).await;
 
         if !sent {
             break;
@@ -73,12 +73,12 @@ fn try_send_pick_two<T, S, Rand>(
     cx: &mut task::Context<'_>,
     slot: &mut core::mem::MaybeUninit<T>,
     senders: &mut Vec<S>,
-    random: &mut Rand,
+    random: &Rand,
 ) -> Poll<bool>
 where
     T: PathSecretMapEntry,
     S: Sender<T>,
-    Rand: FnMut(usize) -> usize,
+    Rand: Fn(usize) -> usize,
 {
     loop {
         if senders.is_empty() {
@@ -89,7 +89,7 @@ where
             let value = unsafe { &*slot.as_ptr() };
             let picked = value
                 .path_secret_entry()
-                .pick_sender_by_next_transmission(&mut *random);
+                .pick_sender_by_next_transmission(random);
             picked % senders.len()
         };
 
