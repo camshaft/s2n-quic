@@ -15,75 +15,76 @@
 //! [auth tag]
 //! ```
 //!
-//! After the outer packet has been decrypted in place, the decrypted buffer holds:
-//!   `[application_header bytes][frame payload bytes]`
+//! After the outer packet has been decrypted in place, the application header holds
+//! per-frame metadata (Header type tag + optional payload length VarInt), while the
+//! payload descriptor holds the concatenated, decrypted frame payloads.
 //!
-//! This module decodes the application header (frame metadata region) and pairs each
-//! frame header with its corresponding slice of the payload bytes.
+//! This module provides [`decode_frames`], a lazy iterator that parses the application
+//! header and yields `(Header, payload_len)` pairs without any heap allocation.  The
+//! caller is responsible for slicing the corresponding payload bytes from the decrypted
+//! payload region (e.g. via [`descriptor::Filled::split_to`]).
 
 use crate::stream3::frame::Header;
-use s2n_codec::{decoder_invariant, DecoderBuffer, DecoderError};
+use s2n_codec::{DecoderBuffer, DecoderError};
 use s2n_quic_core::varint::VarInt;
 
-/// A frame extracted from the application header / payload regions of a decoded packet.
-#[derive(Debug)]
-pub(crate) struct DecodedFrame<'a> {
-    pub header: Header,
-    /// Slice into the decrypted payload corresponding to this frame's data.
-    ///
-    /// The slice is zero-length for frame types where `has_payload_length()` is false
-    /// (FlowReset, FlowInitValidate, FlowValidateRequest).
-    pub payload: &'a [u8],
+/// A lazy iterator over the per-frame metadata in a stream3 application header.
+///
+/// Each call to [`Iterator::next`] decodes the next frame's [`Header`] and
+/// payload length from the application header bytes, yielding
+/// `Ok((header, payload_len))` on success or `Err(DecoderError)` on malformed input.
+///
+/// The caller is responsible for consuming exactly `payload_len` bytes from the
+/// corresponding payload region (e.g. via [`descriptor::Filled::split_to`]) for
+/// each yielded frame.
+///
+/// Obtain an instance via [`decode_frames`].
+pub(crate) struct FrameIter<'a> {
+    metadata: DecoderBuffer<'a>,
 }
 
-/// Decode all frames from the application header and payload regions.
-///
-/// `application_header` contains the per-frame metadata (header type + optional payload_len).
-/// `payload` contains the concatenated, already-decrypted frame payloads.
-///
-/// Returns the decoded frames on success. Returns a `DecoderError` if the metadata or
-/// payload bytes are malformed or inconsistent (e.g., lengths exceed the available data).
-pub(crate) fn decode_frames<'a>(
-    application_header: &[u8],
-    payload: &'a [u8],
-) -> Result<Vec<DecodedFrame<'a>>, DecoderError> {
-    let mut metadata = DecoderBuffer::new(application_header);
-    let mut frames = Vec::new();
-    let mut payload_offset = 0usize;
+impl<'a> Iterator for FrameIter<'a> {
+    type Item = Result<(Header, usize), DecoderError>;
 
-    while !metadata.is_empty() {
-        let (header, rest) = metadata.decode::<Header>()?;
-        metadata = rest;
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.metadata.is_empty() {
+            return None;
+        }
 
-        let payload_len = if header.has_payload_length() {
-            let (len, rest) = metadata.decode::<VarInt>()?;
-            metadata = rest;
-            len.as_u64() as usize
-        } else {
-            0
-        };
+        let result = (|| {
+            let (header, rest) = self.metadata.decode::<Header>()?;
+            self.metadata = rest;
 
-        let next_offset = payload_offset + payload_len;
-        decoder_invariant!(
-            next_offset <= payload.len(),
-            "frame payload length exceeds available payload bytes"
-        );
+            let payload_len = if header.has_payload_length() {
+                let (len, rest) = self.metadata.decode::<VarInt>()?;
+                self.metadata = rest;
+                len.as_u64() as usize
+            } else {
+                0
+            };
 
-        let frame_payload = &payload[payload_offset..next_offset];
-        payload_offset = next_offset;
+            Ok((header, payload_len))
+        })();
 
-        frames.push(DecodedFrame {
-            header,
-            payload: frame_payload,
-        });
+        Some(result)
     }
+}
 
-    decoder_invariant!(
-        payload_offset == payload.len(),
-        "payload bytes not fully consumed by frame metadata"
-    );
-
-    Ok(frames)
+/// Returns a lazy iterator over the per-frame metadata in the application header.
+///
+/// `application_header` contains the per-frame metadata (header type tag + optional
+/// payload_len VarInt) as encoded by the stream3 assembler.
+///
+/// Each item from the iterator is `Ok((header, payload_len))`. The caller must
+/// consume exactly `payload_len` bytes from the decrypted payload region for each
+/// yielded frame, and verify that all payload bytes have been consumed after the
+/// iterator is exhausted.
+///
+/// No heap allocation is performed.
+pub(crate) fn decode_frames(application_header: &[u8]) -> FrameIter<'_> {
+    FrameIter {
+        metadata: DecoderBuffer::new(application_header),
+    }
 }
 
 #[cfg(test)]
@@ -135,6 +136,25 @@ mod tests {
         (app_header, payload)
     }
 
+    /// Collect decode_frames iterator results into (header, payload slice) pairs,
+    /// pairing each metadata entry with the corresponding bytes from `payload`.
+    fn collect_frames<'p>(
+        app_header: &[u8],
+        payload: &'p [u8],
+    ) -> Result<Vec<(Header, &'p [u8])>, DecoderError> {
+        let mut offset = 0usize;
+        let mut result = Vec::new();
+        for item in decode_frames(app_header) {
+            let (header, payload_len) = item?;
+            let end = offset + payload_len;
+            assert!(end <= payload.len(), "payload underflow in test");
+            result.push((header, &payload[offset..end]));
+            offset = end;
+        }
+        assert_eq!(offset, payload.len(), "leftover payload bytes in test");
+        Ok(result)
+    }
+
     #[test]
     fn round_trip_single_flow_data() {
         let header = Header::FlowData {
@@ -152,10 +172,10 @@ mod tests {
             payload: data.to_vec(),
         }];
         let (app_header, payload) = encode_frames(&specs);
-        let frames = decode_frames(&app_header, &payload).unwrap();
+        let frames = collect_frames(&app_header, &payload).unwrap();
         assert_eq!(frames.len(), 1);
-        assert_eq!(frames[0].header, header);
-        assert_eq!(frames[0].payload, data);
+        assert_eq!(frames[0].0, header);
+        assert_eq!(frames[0].1, data);
     }
 
     #[test]
@@ -197,20 +217,20 @@ mod tests {
         ];
 
         let (app_header, payload) = encode_frames(&specs);
-        let frames = decode_frames(&app_header, &payload).unwrap();
+        let frames = collect_frames(&app_header, &payload).unwrap();
 
         assert_eq!(frames.len(), 3);
-        assert_eq!(frames[0].header, specs[0].header);
-        assert_eq!(frames[0].payload, b"stream10");
-        assert_eq!(frames[1].header, specs[1].header);
-        assert_eq!(frames[1].payload, b"");
-        assert_eq!(frames[2].header, specs[2].header);
-        assert_eq!(frames[2].payload, b"fin data");
+        assert_eq!(frames[0].0, specs[0].header);
+        assert_eq!(frames[0].1, b"stream10");
+        assert_eq!(frames[1].0, specs[1].header);
+        assert_eq!(frames[1].1, b"");
+        assert_eq!(frames[2].0, specs[2].header);
+        assert_eq!(frames[2].1, b"fin data");
     }
 
     #[test]
-    fn empty_application_header_empty_payload() {
-        let frames = decode_frames(&[], &[]).unwrap();
+    fn empty_application_header() {
+        let frames: Vec<_> = decode_frames(&[]).collect();
         assert!(frames.is_empty());
     }
 
@@ -225,30 +245,15 @@ mod tests {
             offset: VarInt::ZERO,
             is_fin: false,
         };
-        // Claim 100-byte payload but supply only 5
+        // Encode a header claiming a 100-byte payload
         let mut app_header = Vec::new();
         push_frame_metadata(&mut app_header, &header, 100);
-        let payload = b"short".to_vec();
-        let result = decode_frames(&app_header, &payload);
-        assert!(result.is_err(), "expected error for payload underflow");
-    }
-
-    #[test]
-    fn leftover_payload_bytes_returns_error() {
-        let header = Header::FlowData {
-            queue_pair: QueuePair {
-                source_queue_id: VarInt::ZERO,
-                dest_queue_id: VarInt::ZERO,
-            },
-            stream_id: VarInt::ZERO,
-            offset: VarInt::ZERO,
-            is_fin: false,
-        };
-        // Claim 5-byte payload but supply 10
-        let mut app_header = Vec::new();
-        push_frame_metadata(&mut app_header, &header, 5);
-        let payload = b"0123456789".to_vec();
-        let result = decode_frames(&app_header, &payload);
-        assert!(result.is_err(), "expected error for leftover payload bytes");
+        // The iterator itself decodes header + length; payload consumption is the caller's job.
+        let result: Result<Vec<_>, _> = decode_frames(&app_header).collect();
+        // The metadata is well-formed, so the iterator succeeds; the caller detects underflow.
+        assert!(result.is_ok(), "metadata decode should succeed");
+        let frames = result.unwrap();
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].1, 100); // payload_len reported by iterator
     }
 }

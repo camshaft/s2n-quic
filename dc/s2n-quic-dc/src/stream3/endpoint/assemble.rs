@@ -960,30 +960,38 @@ mod tests {
             .decrypt_in_place(&opener)
             .expect("decryption must succeed with matching key pair");
 
-        // Decode the frame metadata
-        let frames = decode::decode_frames(packet.application_header(), packet.payload())
-            .expect("frame metadata must decode");
+        // Decode the frame metadata; pair each (header, payload_len) with the
+        // corresponding payload bytes from the decrypted payload region.
+        let app_header = packet.application_header();
+        let payload_bytes = packet.payload();
+        let decoded_frames: Vec<_> = {
+            let mut offset = 0usize;
+            let mut result = Vec::new();
+            for item in decode::decode_frames(app_header) {
+                let (header, payload_len) = item.expect("frame metadata must decode");
+                result.push((header, &payload_bytes[offset..offset + payload_len]));
+                offset += payload_len;
+            }
+            assert_eq!(offset, payload_bytes.len(), "all payload bytes must be consumed");
+            result
+        };
 
         assert_eq!(
-            frames.len(),
+            decoded_frames.len(),
             input_frames.len(),
             "decoded frame count must match"
         );
 
-        for (i, (decoded, original)) in frames.iter().zip(input_frames.iter()).enumerate() {
-            assert_eq!(
-                decoded.header, original.header,
-                "frame[{i}] header mismatch"
-            );
+        for (i, ((header, payload), original)) in
+            decoded_frames.iter().zip(input_frames.iter()).enumerate()
+        {
+            assert_eq!(*header, original.header, "frame[{i}] header mismatch");
             let expected_payload = if original.header.has_payload_length() {
                 &original.payload[..]
             } else {
                 &[][..]
             };
-            assert_eq!(
-                decoded.payload, expected_payload,
-                "frame[{i}] payload mismatch"
-            );
+            assert_eq!(*payload, expected_payload, "frame[{i}] payload mismatch");
         }
     }
 
@@ -1087,9 +1095,19 @@ mod tests {
                     .expect("decrypt must succeed with matched key pair");
 
                 // Decode the frame metadata region
-                let decoded =
-                    decode::decode_frames(packet.application_header(), packet.payload())
-                        .expect("frame metadata must decode after decryption");
+                let app_header = packet.application_header();
+                let payload_bytes = packet.payload();
+                let decoded: Vec<_> = {
+                    let mut offset = 0usize;
+                    let mut result = Vec::new();
+                    for item in decode::decode_frames(app_header) {
+                        let (header, payload_len) = item.expect("frame metadata must decode after decryption");
+                        result.push((header, &payload_bytes[offset..offset + payload_len]));
+                        offset += payload_len;
+                    }
+                    assert_eq!(offset, payload_bytes.len(), "all payload bytes must be consumed");
+                    result
+                };
 
                 // Verify frames match
                 assert_eq!(
@@ -1098,14 +1116,14 @@ mod tests {
                     "decoded frame count must match"
                 );
 
-                for (i, (dec, orig)) in decoded.iter().zip(packet_inputs.iter()).enumerate() {
-                    assert_eq!(dec.header, orig.header, "frame[{i}] header mismatch");
+                for (i, ((header, payload), orig)) in decoded.iter().zip(packet_inputs.iter()).enumerate() {
+                    assert_eq!(*header, orig.header, "frame[{i}] header mismatch");
                     let exp_payload = if orig.header.has_payload_length() {
                         &orig.payload[..]
                     } else {
                         &[][..]
                     };
-                    assert_eq!(dec.payload, exp_payload, "frame[{i}] payload mismatch");
+                    assert_eq!(*payload, exp_payload, "frame[{i}] payload mismatch");
                 }
             });
     }

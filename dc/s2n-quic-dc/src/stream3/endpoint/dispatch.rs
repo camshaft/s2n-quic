@@ -30,7 +30,6 @@ use crate::{
         Reader, Stream, Writer,
     },
 };
-use bytes::BytesMut;
 use s2n_quic_core::varint::VarInt;
 
 const UNSET_SOURCE_SENDER_ID: VarInt = VarInt::MAX;
@@ -57,7 +56,7 @@ pub(crate) enum Error {
 /// dispatches each frame in the packet to its type-specific handler. Response frames
 /// (ACKs, FlowValidateRequest, FlowReset) are emitted to `response_tx`.
 pub(crate) fn process<Clk>(
-    packet: Entry<packet::datagram::decoder::Packet<descriptor::Filled>>,
+    mut packet: Entry<packet::datagram::decoder::Packet<descriptor::Filled>>,
     recv_cache: &mut recv::Cache,
     path_secret_map: &PathSecretMap,
     acceptor_registry: &acceptor::Registry<Stream>,
@@ -94,21 +93,25 @@ where
         });
     };
 
-    // Decrypt
-    let len = packet.decrypt_into_len();
-    let mut buf = BytesMut::with_capacity(len);
+    // Collect information about the packet layout before decryption and before
+    // consuming the packet with into_parts().
+    let tag_len = crate::crypto::open::Application::tag_len(&peer.opener);
+    let payload_len = packet.payload().len();
+    let app_header_len = packet.application_header().len();
+    let storage_len = packet.storage().len() as usize;
+    // Total header length = everything before the payload (outer header + app header)
+    let header_total_len = storage_len - payload_len - tag_len;
+    // Outer packet header length (everything before the application header)
+    let outer_header_len = header_total_len - app_header_len;
+    let ecn = packet.storage().ecn();
 
-    let written = packet
-        .decrypt_into(&peer.opener, bytes::BufMut::chunk_mut(&mut buf))
+    // Decrypt the payload in place (AAD = outer packet header, already cleartext).
+    packet
+        .decrypt_in_place(&peer.opener)
         .map_err(|_| Error::Decryption {
             credentials,
             packet_number,
         })?;
-
-    unsafe {
-        debug_assert_eq!(written, len);
-        buf.set_len(len);
-    }
 
     // Packet number deduplication
     if peer
@@ -125,17 +128,29 @@ where
 
     // Update activity and ACK tracking
     peer.update_activity(clock, idle_timeout);
-    let ecn = packet.storage().ecn();
     peer.ecn_counts.increment(ecn);
     peer.ack_space
         .on_packet_received(packet_number, clock.get_time());
     peer.ack_state = AckState::Scheduled;
 
-    // Dispatch based on routing info
+    // Extract the descriptor and navigate to the relevant payload regions.
     //
-    // TODO: When the multi-frame packet format lands, this becomes an iteration over
-    // decoded frame headers in the metadata region. For now, one routing_info per packet.
-    let routing_info = packet.routing_info();
+    // Storage layout after decryption:
+    //   [outer packet header (outer_header_len bytes)]
+    //   [application header (app_header_len bytes)]   ← cleartext frame metadata for SenderId
+    //   [decrypted frame payloads (payload_len bytes)]
+    //   [auth tag (tag_len bytes)]
+    //
+    // We split the storage into:
+    //   `app_header_desc`  – the application header region (empty for single-frame packets)
+    //   `payload_storage`  – the decrypted frame payloads, with auth tag removed
+    let (_, mut storage) = packet.into_inner().into_parts();
+    storage.advance(outer_header_len as u16);
+    let app_header_desc = storage.split_to(app_header_len as u16);
+    // storage now points to [payload][auth_tag]; strip the auth tag.
+    storage.truncate(payload_len as u16);
+    let mut payload_storage = storage;
+
     let mut response_frames = Queue::new();
 
     match routing_info {
@@ -160,7 +175,7 @@ where
                 attempt_id,
                 stream_id,
                 is_fin,
-                buf,
+                payload_storage,
                 acceptor_registry,
                 frame_tx,
                 queue_dispatcher,
@@ -219,7 +234,7 @@ where
                 stream_id,
                 offset,
                 is_fin,
-                buf,
+                payload_storage,
                 queue_dispatcher,
                 counters,
                 &mut response_frames,
@@ -235,7 +250,7 @@ where
                 &credentials,
                 queue_pair,
                 stream_id,
-                buf,
+                payload_storage,
                 queue_dispatcher,
                 counters,
                 &mut response_frames,
@@ -260,25 +275,27 @@ where
             );
         }
         RoutingInfo::SenderId { source_sender_id } => {
-            // Multi-frame packet: the application header holds per-frame metadata
-            // (Header + optional payload_len). The decrypted buf contains
-            // [application_header][concatenated frame payloads].
-            let app_header_len = packet.application_header().len();
-            let frame_metadata = &buf[..app_header_len];
-            let frame_payloads = &buf[app_header_len..];
+            // Multi-frame packet: `app_header_desc` contains the per-frame metadata
+            // (Header type tag + optional payload_len VarInt) and `payload_storage`
+            // contains the concatenated, decrypted frame payloads.
+            //
+            // We borrow the application header bytes from `app_header_desc`.  Splitting
+            // `payload_storage` does not conflict with this borrow because the two
+            // descriptors are independent (they share the same underlying allocation but
+            // have separate offset/len bookkeeping).
+            let app_header_slice: &[u8] = app_header_desc.payload();
 
-            match decode::decode_frames(frame_metadata, frame_payloads) {
-                Ok(decoded) => {
-                    for decoded_frame in decoded {
-                        counters.on_received_frame(&decoded_frame.header);
-                        // Copy the payload into its own allocation so each stream's
-                        // data has an independent lifetime (avoids tying all streams
-                        // together via a shared BytesMut allocation).
-                        let payload = BytesMut::from(decoded_frame.payload);
+            for result in decode::decode_frames(app_header_slice) {
+                match result {
+                    Ok((header, frame_payload_len)) => {
+                        counters.on_received_frame(&header);
+                        // Split the frame's payload out of the shared descriptor.
+                        // This is O(1): it increments the ref-count and adjusts offsets.
+                        let frame_payload = payload_storage.split_to(frame_payload_len as u16);
                         dispatch_decoded_frame(
-                            decoded_frame.header,
+                            header,
                             source_sender_id,
-                            payload,
+                            frame_payload,
                             peer,
                             &credentials,
                             acceptor_registry,
@@ -288,15 +305,25 @@ where
                             &mut response_frames,
                         );
                     }
+                    Err(err) => {
+                        tracing::warn!(
+                            %credentials,
+                            packet_number = packet_number.as_u64(),
+                            ?err,
+                            "failed to decode multi-frame packet metadata"
+                        );
+                        break;
+                    }
                 }
-                Err(err) => {
-                    tracing::warn!(
-                        %credentials,
-                        packet_number = packet_number.as_u64(),
-                        ?err,
-                        "failed to decode multi-frame packet metadata"
-                    );
-                }
+            }
+
+            if !payload_storage.is_empty() {
+                tracing::warn!(
+                    %credentials,
+                    packet_number = packet_number.as_u64(),
+                    remaining = payload_storage.len(),
+                    "multi-frame packet has unconsumed payload bytes"
+                );
             }
         }
     }
@@ -316,7 +343,7 @@ where
 fn dispatch_decoded_frame(
     header: Header,
     source_sender_id: VarInt,
-    payload: BytesMut,
+    payload: descriptor::Filled,
     peer: &mut recv::Context,
     credentials: &Credentials,
     acceptor_registry: &acceptor::Registry<Stream>,
@@ -448,7 +475,7 @@ fn handle_flow_init(
     attempt_id: VarInt,
     stream_id: VarInt,
     is_fin: bool,
-    buf: BytesMut,
+    buf: descriptor::Filled,
     acceptor_registry: &acceptor::Registry<Stream>,
     frame_tx: &SubmissionSender,
     queue_dispatcher: &mut msg::queue::Dispatcher,
@@ -460,27 +487,29 @@ fn handle_flow_init(
         (queue_control.queue_id(), (queue_control, queue_stream))
     };
 
-    let mut initial_payload = Some(buf);
+    let mut initial_payload: Option<descriptor::Filled> = Some(buf);
     let mut create_stream = |queue_control: msg::queue::Control,
                              queue_stream: msg::queue::Stream,
                              pending_validation: bool| {
-        let payload = initial_payload.take().unwrap_or_else(|| {
+        let payload = initial_payload.take();
+        if payload.is_none() {
             tracing::error!(
                 attempt_id = attempt_id.as_u64(),
                 stream_id = stream_id.as_u64(),
                 "create_stream called more than once for FlowInit"
             );
-            BytesMut::new()
-        });
-        if is_fin || !payload.is_empty() {
-            queue_stream.push(
-                msg::Stream::Data {
-                    offset: VarInt::ZERO,
-                    fin: is_fin,
-                    payload,
-                }
-                .into(),
-            );
+        }
+        if let Some(p) = payload {
+            if is_fin || !p.is_empty() {
+                queue_stream.push(
+                    msg::Stream::Data {
+                        offset: VarInt::ZERO,
+                        fin: is_fin,
+                        payload: p,
+                    }
+                    .into(),
+                );
+            }
         }
 
         let local_queue_id = queue_control.queue_id();
@@ -888,7 +917,7 @@ fn handle_flow_data(
     stream_id: VarInt,
     offset: VarInt,
     is_fin: bool,
-    buf: BytesMut,
+    buf: descriptor::Filled,
     queue_dispatcher: &mut msg::queue::Dispatcher,
     counters: &counters::Dispatch,
     response_frames: &mut Queue<Frame>,
@@ -969,7 +998,7 @@ fn handle_flow_control(
     credentials: &Credentials,
     queue_pair: QueuePair,
     stream_id: VarInt,
-    buf: BytesMut,
+    buf: descriptor::Filled,
     queue_dispatcher: &mut msg::queue::Dispatcher,
     counters: &counters::Dispatch,
     response_frames: &mut Queue<Frame>,
