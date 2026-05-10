@@ -125,7 +125,9 @@ pub trait UnboundedSender<T> {
 /// every call site.
 pub struct EntryBoxSender<T, S> {
     inner: S,
-    _phantom: PhantomData<T>,
+    // `fn() -> T` phantom avoids propagating Send/Sync from T onto the struct — the struct
+    // does not own any T values, so auto-trait derivation should come from S alone.
+    _phantom: PhantomData<fn() -> T>,
 }
 
 impl<T, S> EntryBoxSender<T, S> {
