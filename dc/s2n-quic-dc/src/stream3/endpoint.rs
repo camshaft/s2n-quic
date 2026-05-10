@@ -246,7 +246,7 @@ where
             ));
             local.spawn(tasks::packet_dispatch_task(
                 packet_rx,
-                recv_idx,
+                worker_id,
                 idle_timeout,
                 path_secret_map,
                 acceptor_registry,

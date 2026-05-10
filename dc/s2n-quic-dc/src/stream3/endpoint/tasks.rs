@@ -303,9 +303,9 @@ pub async fn frame_dispatch<Rand>(
     Rand: Fn(usize) -> usize,
 {
     // Register the receiver's waker before first poll so senders can wake us up.
-    let mut opt = Some(frame_rx);
+    let mut pending_rx = Some(frame_rx);
     let frame_rx = core::future::poll_fn(|cx| {
-        let rx = opt.take().unwrap();
+        let rx = pending_rx.take().unwrap();
         rx.register(cx.waker());
         Poll::Ready(rx)
     })
