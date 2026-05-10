@@ -83,8 +83,7 @@ where
             }
 
             let max_segment_len = {
-                let remaining_total =
-                    segment::MAX_TOTAL as usize - offset.min(segment::MAX_TOTAL as usize);
+                let remaining_total = segment::MAX_TOTAL as usize - offset.min(segment::MAX_TOTAL as usize);
                 if segment_size == 0 {
                     remaining_total.min(mtu as usize)
                 } else {
@@ -273,7 +272,8 @@ impl MetadataEstimate {
         credentials: &crate::credentials::Credentials,
         crypto_tag_len: usize,
     ) -> usize {
-        let header_len = VarInt::new(self.header_len as u64).expect("header length fits in VarInt");
+        let header_len =
+            VarInt::new(self.header_len as u64).expect("header length fits in VarInt");
         let payload_len =
             VarInt::new(self.payload_len as u64).expect("payload length fits in VarInt");
         let routing_info = RoutingInfo::SenderId { source_sender_id };
@@ -394,11 +394,7 @@ fn push_frame_metadata(
         debug_assert_payload_length_invariant(payload_len);
     }
 
-    debug_assert_eq!(
-        enc.len(),
-        entry_size,
-        "frame metadata encoder length mismatch"
-    );
+    debug_assert_eq!(enc.len(), entry_size, "frame metadata encoder length mismatch");
 }
 
 /// Produce a Header with attempt_id stamped for FlowInit frames.
@@ -551,7 +547,8 @@ mod tests {
             let mtu = (MIN_TEST_MTU..=MAX_TEST_MTU).generate(driver)?;
             let max_segments = (1..=segment::MAX_COUNT).generate(driver)?;
             let source_sender_id = VarInt::generate(driver)?;
-            let source_control_port = <u16 as bolero_generator::TypeGenerator>::generate(driver)?;
+            let source_control_port =
+                <u16 as bolero_generator::TypeGenerator>::generate(driver)?;
 
             let mut frames = Vec::with_capacity(MAX_TEST_FRAMES);
             for _ in 0..MAX_TEST_FRAMES {
@@ -616,10 +613,7 @@ mod tests {
             <= mtu as usize
     }
 
-    fn to_frame(
-        frame: &FrameInput,
-        entry: &Arc<PathSecretEntry>,
-    ) -> crate::intrusive_queue::Entry<Frame> {
+    fn to_frame(frame: &FrameInput, entry: &Arc<PathSecretEntry>) -> crate::intrusive_queue::Entry<Frame> {
         let payload = if frame.header.has_payload_length() {
             frame.payload.as_slice()
         } else {
@@ -802,10 +796,7 @@ mod tests {
         .expect("frames should assemble");
 
         assert_gso_invariants(&segments, mtu, gso.max_segments().min(segment::MAX_COUNT));
-        assert!(
-            context.has_pending(),
-            "header-heavy frames should spill into another batch"
-        );
+        assert!(context.has_pending(), "header-heavy frames should spill into another batch");
     }
 
     #[test]
@@ -939,7 +930,7 @@ mod tests {
         let tag_len = crate::crypto::seal::Application::tag_len(&context.sealer);
         let encoded_len = encode_segment(
             &mut buf,
-            443,                // source_control_port
+            443, // source_control_port
             VarInt::from_u8(7), // source_sender_id
             context.next_packet_number,
             &context.sealer,
@@ -981,11 +972,7 @@ mod tests {
                 result.push((header, &payload_bytes[offset..offset + payload_len]));
                 offset += payload_len;
             }
-            assert_eq!(
-                offset,
-                payload_bytes.len(),
-                "all payload bytes must be consumed"
-            );
+            assert_eq!(offset, payload_bytes.len(), "all payload bytes must be consumed");
             result
         };
 
@@ -1114,16 +1101,11 @@ mod tests {
                     let mut offset = 0usize;
                     let mut result = Vec::new();
                     for item in decode::decode_frames(app_header) {
-                        let (header, payload_len) =
-                            item.expect("frame metadata must decode after decryption");
+                        let (header, payload_len) = item.expect("frame metadata must decode after decryption");
                         result.push((header, &payload_bytes[offset..offset + payload_len]));
                         offset += payload_len;
                     }
-                    assert_eq!(
-                        offset,
-                        payload_bytes.len(),
-                        "all payload bytes must be consumed"
-                    );
+                    assert_eq!(offset, payload_bytes.len(), "all payload bytes must be consumed");
                     result
                 };
 
@@ -1134,9 +1116,7 @@ mod tests {
                     "decoded frame count must match"
                 );
 
-                for (i, ((header, payload), orig)) in
-                    decoded.iter().zip(packet_inputs.iter()).enumerate()
-                {
+                for (i, ((header, payload), orig)) in decoded.iter().zip(packet_inputs.iter()).enumerate() {
                     assert_eq!(*header, orig.header, "frame[{i}] header mismatch");
                     let exp_payload = if orig.header.has_payload_length() {
                         &orig.payload[..]
