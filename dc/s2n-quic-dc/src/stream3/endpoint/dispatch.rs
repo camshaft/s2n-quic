@@ -65,6 +65,7 @@ pub(crate) fn process<Clk>(
     acceptor_registry: &acceptor::Registry<Stream>,
     frame_tx: &SubmissionSender,
     response_tx: &mut impl channel::UnboundedSender<Queue<Frame>>,
+    sender_tx: &mut impl channel::UnboundedSender<msg::Sender>,
     queue_dispatcher: &mut msg::queue::Dispatcher,
     clock: &Clk,
     counters: &counters::Dispatch,
@@ -203,6 +204,7 @@ where
                     acceptor_registry,
                     frame_tx,
                     queue_dispatcher,
+                    sender_tx,
                     counters,
                     &mut response_frames,
                 );
@@ -249,6 +251,7 @@ fn dispatch_decoded_frame(
     acceptor_registry: &acceptor::Registry<Stream>,
     frame_tx: &SubmissionSender,
     queue_dispatcher: &mut msg::queue::Dispatcher,
+    sender_tx: &mut impl channel::UnboundedSender<msg::Sender>,
     counters: &counters::Dispatch,
     response_frames: &mut Queue<Frame>,
 ) {
@@ -359,13 +362,18 @@ fn dispatch_decoded_frame(
             );
         }
         Header::Control { dest_sender_id } => {
-            tracing::warn!(
-                %credentials,
-                source_sender_id = source_sender_id.as_u64(),
-                dest_sender_id = dest_sender_id.as_u64(),
-                payload_len = payload.len(),
-                "rejecting Control frame in multi-frame packet; ACK routing is unsupported"
-            );
+            let message = msg::Sender::Ack {
+                sender_id: dest_sender_id,
+                payload,
+            };
+            if sender_tx.send(message).is_err() {
+                tracing::warn!(
+                    %credentials,
+                    source_sender_id = source_sender_id.as_u64(),
+                    dest_sender_id = dest_sender_id.as_u64(),
+                    "dropping ACK sender message; sender queue is closed"
+                );
+            }
         }
     }
 }
