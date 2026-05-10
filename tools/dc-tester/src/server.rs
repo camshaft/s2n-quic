@@ -58,28 +58,34 @@ async fn handle_connection(stream: s2n_quic_dc::stream2::Stream) -> io::Result<(
         .await
         .unwrap_or_else(|_| Err(io::ErrorKind::TimedOut.into()))?;
 
-    // Read the 8-byte response size header
+    // Read the 8-byte response size header (required by the send half to know how many bytes to write)
     let response_size = reader.read_u64().await?;
-    let mut total_received = 8u64;
 
-    // Read and validate the rest of the request body using Data
-    let mut receiver = Data::new(u64::MAX);
-    loop {
-        let n = reader.read_into(&mut receiver).await?;
-        if n == 0 {
-            break;
+    // Read the remaining request body and write the response concurrently so both
+    // halves are exercised at the same time, covering more half-close code paths.
+    let recv = async move {
+        let mut total_received = 8u64;
+        let mut receiver = Data::new(u64::MAX);
+        loop {
+            let n = reader.read_into(&mut receiver).await?;
+            if n == 0 {
+                break;
+            }
+            total_received += n as u64;
         }
-        total_received += n as u64;
-    }
+        // reader drops here, signaling half-close (FIN) on the read side
+        io::Result::Ok(total_received)
+    };
 
-    // Drop the reader half after we're done reading
-    drop(reader);
+    let send = async move {
+        // Generate and send response data; dropping the writer afterwards signals half-close (FIN)
+        let mut response = Data::new(response_size);
+        while !response.is_finished() {
+            writer.write_from_fin(&mut response).await?;
+        }
+        io::Result::Ok(response_size)
+    };
 
-    // Generate and send response data using Data
-    let mut response = Data::new(response_size);
-    while !response.is_finished() {
-        writer.write_from_fin(&mut response).await?;
-    }
-
-    Ok((total_received, response_size))
+    let (total_received, bytes_sent) = tokio::try_join!(recv, send)?;
+    Ok((total_received, bytes_sent))
 }
