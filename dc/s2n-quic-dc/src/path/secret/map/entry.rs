@@ -259,7 +259,8 @@ impl Entry {
 
     fn sender_schedule_micros(ts: Timestamp) -> u64 {
         // SAFETY: `Timestamp` values in this crate are monotonic and treated as non-negative.
-        unsafe { ts.as_duration().as_micros() as u64 }
+        let micros = unsafe { ts.as_duration().as_micros() };
+        micros.min(u64::MAX as u128) as u64
     }
 
     fn init_sender_schedule(socket_sender_count: usize) -> Box<[AtomicU64]> {
