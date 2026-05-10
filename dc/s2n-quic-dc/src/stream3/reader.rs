@@ -103,8 +103,10 @@ use s2n_codec::EncoderValue;
 use s2n_quic_core::{
     buffer::{
         self,
+        duplex::Interposer,
         reader::{storage::Infallible as _, Incremental},
         reassembler::Reassembler,
+        writer::Writer as _,
     },
     frame::MaxData,
     ready,
@@ -287,7 +289,7 @@ impl Inner {
     where
         S: buffer::writer::Storage,
     {
-        let _ = self.poll_stream_rx(cx)?;
+        let _ = self.poll_stream_rx(cx, Some(buf))?;
 
         if self.status.is_pending_validation() {
             return Poll::Ready(Err(io::Error::new(
@@ -339,7 +341,10 @@ impl Inner {
         }
     }
 
-    fn poll_stream_rx(&mut self, cx: &mut Context) -> Poll<io::Result<()>> {
+    fn poll_stream_rx<S>(&mut self, cx: &mut Context, mut app_buf: Option<&mut S>) -> Poll<io::Result<()>>
+    where
+        S: buffer::writer::Storage + ?Sized,
+    {
         match self.stream_rx.poll_swap(cx) {
             Poll::Ready(Ok(queue)) => {
                 for msg in queue {
@@ -370,7 +375,10 @@ impl Inner {
                                 }
                             };
 
-                            if let Err(err) = self.reassembler.write_reader(&mut reader) {
+                            let app_buf = app_buf.as_mut().map(|buf| &mut **buf);
+                            if let Err(err) =
+                                write_data_reader(&mut self.reassembler, &mut reader, app_buf)
+                            {
                                 debug!(
                                     stream_id = self.stream_id.as_u64(),
                                     ?err,
@@ -540,6 +548,24 @@ impl Inner {
     }
 }
 
+#[inline]
+fn write_data_reader<S, R>(
+    reassembler: &mut Reassembler,
+    reader: &mut R,
+    app_buf: Option<&mut S>,
+) -> Result<(), buffer::Error<R::Error>>
+where
+    S: buffer::writer::Storage + ?Sized,
+    R: buffer::reader::Reader + ?Sized,
+{
+    if let Some(app_buf) = app_buf.filter(|app_buf| reassembler.buffer_is_empty()) {
+        let mut interposer = Interposer::new(app_buf, reassembler);
+        interposer.read_from(reader)
+    } else {
+        reassembler.write_reader(reader)
+    }
+}
+
 impl Drop for Reader {
     fn drop(&mut self) {
         debug!(
@@ -581,5 +607,59 @@ impl tokio::io::AsyncRead for Reader {
         let mut buf = buffer::writer::storage::BufMut::new(buf);
         ready!(self.poll_read_into(cx, &mut buf))?;
         Poll::Ready(Ok(()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::write_data_reader;
+    use s2n_quic_core::{buffer::Reassembler, stream::testing::Data};
+
+    #[test]
+    fn write_data_reader_bypasses_reassembler_for_in_order_data() {
+        let mut reassembler = Reassembler::new();
+        let mut reader = Data::new(8);
+        let mut app_buf = Vec::new();
+
+        write_data_reader(&mut reassembler, &mut reader, Some(&mut app_buf)).unwrap();
+
+        assert_eq!(app_buf, Data::send_one_at(0, 8));
+        assert_eq!(reassembler.consumed_len(), 8);
+        assert_eq!(reassembler.final_size(), Some(8));
+        assert!(reassembler.buffer_is_empty());
+        assert!(reassembler.is_reading_complete());
+    }
+
+    #[test]
+    fn write_data_reader_keeps_out_of_order_data_in_reassembler() {
+        let mut reassembler = Reassembler::new();
+        let mut reader = Data::new(8);
+        let mut app_buf = Vec::new();
+
+        reader.seek_forward(4);
+        write_data_reader(&mut reassembler, &mut reader, Some(&mut app_buf)).unwrap();
+
+        assert!(app_buf.is_empty());
+        assert_eq!(reassembler.current_offset().as_u64(), 0);
+        assert_eq!(reassembler.total_received_len(), 4);
+        assert!(reassembler.buffer_is_empty());
+        assert!(!reassembler.is_reading_complete());
+    }
+
+    #[test]
+    fn write_data_reader_does_not_interpose_when_reassembler_has_head_data() {
+        let mut reassembler = Reassembler::new();
+        let mut reader = Data::new(8);
+        let mut app_buf = Vec::new();
+
+        reassembler.write_at(0u32.into(), &Data::send_one_at(0, 4)).unwrap();
+        reader.seek_forward(4);
+
+        write_data_reader(&mut reassembler, &mut reader, Some(&mut app_buf)).unwrap();
+
+        assert!(app_buf.is_empty());
+        assert_eq!(reassembler.len(), 8);
+        assert_eq!(reassembler.total_received_len(), 8);
+        assert!(!reassembler.buffer_is_empty());
     }
 }
