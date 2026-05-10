@@ -435,6 +435,8 @@ impl Inner {
         self.maybe_send_unbounded_max_data()?;
 
         // Process incoming messages and keep buffering until all stream bytes are present.
+        // We intentionally ignore the returned Poll state here and gate readiness on
+        // `is_writing_complete()` below so we only release data after full payload receipt.
         let _ = self.poll_stream_rx(cx)?;
 
         if !self.reassembler.is_writing_complete() {
