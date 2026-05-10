@@ -4,8 +4,7 @@
 use crate::{
     clock::precision,
     credentials::{self, Credentials},
-    flow,
-    intrusive_queue,
+    flow, intrusive_queue,
     packet::{self, datagram::partial::PartialDatagram},
     path::{self, secret::map::Entry as PathSecretEntry},
 };

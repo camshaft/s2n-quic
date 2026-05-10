@@ -35,8 +35,9 @@ pub type CompletionSender = datagram_completion::Sender<Frame>;
 pub type CompletionReceiver = datagram_completion::Receiver<Frame>;
 
 /// Submission channel sender typed on Frame.
-pub type SubmissionSender =
-    crate::socket::channel::intrusive_queue::sharded::Sender<crate::intrusive_queue::EntryAdapter<Frame>>;
+pub type SubmissionSender = crate::socket::channel::intrusive_queue::sharded::Sender<
+    crate::intrusive_queue::EntryAdapter<Frame>,
+>;
 
 /// Create a new completion channel for Frames.
 pub fn completion_channel() -> CompletionReceiver {
@@ -166,8 +167,7 @@ impl Header {
             | Self::Control { .. } => true,
             Self::FlowReset { .. }
             | Self::FlowInitValidate { .. }
-            | Self::FlowValidateRequest { .. }
-            => false,
+            | Self::FlowValidateRequest { .. } => false,
         }
     }
 
@@ -353,7 +353,13 @@ impl<'a> s2n_codec::DecoderValue<'a> for Header {
             Self::FLOW_CONTROL_TYPE => {
                 let (queue_pair, buffer) = buffer.decode()?;
                 let (stream_id, buffer) = buffer.decode()?;
-                Ok((Self::FlowControl { queue_pair, stream_id }, buffer))
+                Ok((
+                    Self::FlowControl {
+                        queue_pair,
+                        stream_id,
+                    },
+                    buffer,
+                ))
             }
             Self::FLOW_RESET_BOTH_TYPE
             | Self::FLOW_RESET_STREAM_TYPE

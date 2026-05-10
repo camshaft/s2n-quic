@@ -505,7 +505,11 @@ mod tests {
     fn pick_two_drops_unsent_entry_on_shutdown() {
         let drop_counter = Arc::new(AtomicUsize::new(0));
         let rx = TestReceiver {
-            values: [new_test_item(test_path_secret_entry(), drop_counter.clone())].into(),
+            values: [new_test_item(
+                test_path_secret_entry(),
+                drop_counter.clone(),
+            )]
+            .into(),
             consumed: 0,
         };
         let senders = vec![TestSender {

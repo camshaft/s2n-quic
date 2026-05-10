@@ -17,12 +17,7 @@ use crate::{
     stream::TransportFeatures,
 };
 use s2n_codec::EncoderBuffer;
-use s2n_quic_core::{
-    dc,
-    recovery::bandwidth::Bandwidth,
-    time::Timestamp,
-    varint::VarInt,
-};
+use s2n_quic_core::{dc, recovery::bandwidth::Bandwidth, time::Timestamp, varint::VarInt};
 use std::{
     any::Any,
     net::SocketAddr,
@@ -342,10 +337,7 @@ impl Entry {
         next
     }
 
-    pub fn pick_sender_by_next_transmission(
-        &self,
-        random_fn: impl Fn(usize) -> usize,
-    ) -> usize {
+    pub fn pick_sender_by_next_transmission(&self, random_fn: impl Fn(usize) -> usize) -> usize {
         let len = self.next_transmission_by_sender.len();
         if len == 0 {
             // No sender sockets are configured yet; callers treat 0 as the default route index.

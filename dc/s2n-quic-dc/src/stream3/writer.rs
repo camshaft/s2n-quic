@@ -653,7 +653,11 @@ impl Inner {
         Ok((bytes_read, actual_fin))
     }
 
-    fn prepare_early_data<S>(&mut self, buf: &mut S, is_fin: bool) -> io::Result<(ByteVec, usize, bool)>
+    fn prepare_early_data<S>(
+        &mut self,
+        buf: &mut S,
+        is_fin: bool,
+    ) -> io::Result<(ByteVec, usize, bool)>
     where
         S: buffer::reader::storage::Infallible,
     {
@@ -670,7 +674,9 @@ impl Inner {
         }
 
         let mtu = self.packet_size as usize;
-        let chunk_len = mtu.min(buf.buffered_len()).min(self.remaining_offset_capacity());
+        let chunk_len = mtu
+            .min(buf.buffered_len())
+            .min(self.remaining_offset_capacity());
 
         let mut payload = ByteVec::new();
         {
@@ -1093,19 +1099,27 @@ mod tests {
     }
 
     #[test]
-    fn send_data_returns_error_before_consuming_on_offset_overflow() {
+    fn send_data_caps_payload_at_varint_max() {
         let (mut inner, mut frame_rx) = new_test_inner();
-        inner.next_offset = VarInt::MAX;
+        inner.next_offset = VarInt::MAX - VarInt::from_u8(1);
+        inner.remote_max_data = VarInt::MAX;
 
-        let mut buf = &b"x"[..];
-        let err = inner.send_data(&mut buf, false).unwrap_err();
+        let mut buf = &b"xy"[..];
+        let written = inner.send_data(&mut buf, false).unwrap();
 
-        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
-        assert_eq!(buf, b"x");
-        assert_eq!(inner.inflight_bytes, 0);
+        assert_eq!(written, 1);
+        assert_eq!(buf, b"y");
+        assert_eq!(inner.inflight_bytes, 1);
         assert_eq!(inner.next_offset, VarInt::MAX);
 
         let mut cx = noop_cx();
-        assert!(matches!(frame_rx.poll_recv(&mut cx), Poll::Pending));
+        let sent = match frame_rx.poll_recv(&mut cx) {
+            Poll::Ready(Some(sent)) => sent,
+            other => panic!("expected data frame, got {other:?}"),
+        };
+
+        let sent = sent.iter().collect::<Vec<_>>();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].payload.len(), 1);
     }
 }
