@@ -283,6 +283,182 @@ where
     }
 }
 
+// ── Pipeline Task Functions ────────────────────────────────────────────────
+
+/// Routes frame submissions to socket workers using pick-two load balancing.
+///
+/// Reads batches of frames from the sharded submission channel, groups consecutive frames for
+/// the same path-secret entry, and routes each batch to a send socket via pick-two scheduling.
+///
+/// # Waker registration
+///
+/// The sharded receiver requires explicit waker registration before it can wake the task.
+/// This function registers the waker on entry (before blocking) so the channel can wake us
+/// when new frames arrive.
+pub async fn frame_dispatch<Rand>(
+    frame_rx: crate::stream3::frame::SubmissionReceiver,
+    socket_senders: Vec<crate::socket::channel::cell::sync::Sender<FrameBatch>>,
+    random: Rand,
+) where
+    Rand: Fn(usize) -> usize,
+{
+    // Register the receiver's waker before first poll so senders can wake us up.
+    let mut opt = Some(frame_rx);
+    let frame_rx = core::future::poll_fn(|cx| {
+        let rx = opt.take().unwrap();
+        rx.register(cx.waker());
+        Poll::Ready(rx)
+    })
+    .await;
+
+    let rx = crate::socket::channel::FlattenList::new(frame_rx);
+    let rx = BatchFramesByPathSecret::new(rx);
+    pick_two(rx, socket_senders, random).await;
+}
+
+/// Per-socket send worker: receives frame batches, assembles packets, sends via socket.
+///
+/// Maintains a per-peer [`send::Context`] cache. For each incoming [`FrameBatch`] the frames are
+/// pushed onto the matching context's pending queue, [`assemble`] is called to encrypt and pack
+/// them into GSO segments, and the segments are sent through `socket`. Concurrently, incoming
+/// [`msg::Sender::Ack`] messages are decoded and fed into [`ack::process_ack`] to update CCA and
+/// loss-recovery state.
+///
+/// [`send::Context`]: crate::stream3::endpoint::send::Context
+/// [`assemble`]: crate::stream3::endpoint::assemble::assemble
+/// [`ack::process_ack`]: crate::stream3::endpoint::ack::process_ack
+pub async fn socket_send_task<Socket>(
+    _socket: Socket,
+    _batch_rx: crate::socket::channel::cell::sync::Receiver<FrameBatch>,
+    _ack_rx: crate::socket::channel::intrusive_queue::sync::Receiver<
+        crate::stream3::endpoint::msg::Sender,
+    >,
+    _sender_idx: usize,
+    _source_control_port: u16,
+    _gso: s2n_quic_platform::features::Gso,
+    _pool: crate::socket::pool::Pool,
+) where
+    Socket: crate::socket::send::Socket,
+{
+    todo!("socket_send_task: assemble frames and send via socket — see stream3 send-path TODO")
+}
+
+/// Per-socket receive worker: reads raw UDP segments and routes decoded packets to dispatch.
+///
+/// Drives a [`SocketReceiver`] → [`FlattenSegments`] → [`RouterAdapter`] chain. Each segment is
+/// handed to [`ChannelRouter`] which decodes the outer packet header, dispatches datagram packets
+/// to `packet_tx`, and records decode errors.
+///
+/// [`SocketReceiver`]: crate::socket::channel::SocketReceiver
+/// [`FlattenSegments`]: crate::socket::channel::FlattenSegments
+/// [`RouterAdapter`]: crate::socket::channel::RouterAdapter
+/// [`ChannelRouter`]: crate::stream3::endpoint::worker::ChannelRouter
+pub async fn socket_recv_task<Socket>(
+    socket: Socket,
+    pool: crate::socket::pool::Pool,
+    tx: crate::socket::channel::intrusive_queue::sync::Sender<
+        crate::packet::datagram::decoder::Packet<crate::socket::pool::descriptor::Filled>,
+    >,
+    decode_error_counter: crate::counter::Counter,
+) where
+    Socket: crate::socket::recv::Socket,
+{
+    use crate::{
+        socket::{
+            channel::{FlattenSegments, InspectErr, Receiver as _, SocketReceiver},
+            recv::router::Router as _,
+        },
+        stream3::endpoint::worker::ChannelRouter,
+    };
+
+    let rx = SocketReceiver::new(socket, pool);
+    // SocketReceiver yields io::Result<Segments>; InspectErr logs errors and unwraps to Segments.
+    let rx = InspectErr::new(rx, |err| {
+        tracing::warn!(%err, "socket recv error");
+    });
+    let mut rx = FlattenSegments::new(rx);
+    let mut router = ChannelRouter {
+        tx,
+        decode_error_counter,
+    };
+
+    loop {
+        let Some(segment) = rx.recv().await else {
+            break;
+        };
+        let bytes = segment.len() as u64;
+        router.on_segment(segment);
+        rx.on_consumed(bytes);
+    }
+}
+
+/// Per-worker packet dispatch loop: decrypts, deduplicates, and dispatches received packets.
+///
+/// Owns a [`recv::Cache`] for per-sender crypto state. For each packet, calls
+/// [`dispatch::process`] which:
+/// * Authenticates and decrypts the payload,
+/// * Deduplicates by packet number,
+/// * Updates ACK state and ECN counts,
+/// * Dispatches each decoded frame to its type handler (flow queues, ACK channels, acceptors).
+///
+/// Dispatch errors are silently dropped — they represent invalid/duplicate/unauthenticated
+/// packets which should not terminate the worker.
+///
+/// [`recv::Cache`]: crate::stream3::endpoint::recv::Cache
+/// [`dispatch::process`]: crate::stream3::endpoint::dispatch::process
+pub async fn packet_dispatch_task<Clk>(
+    mut packet_rx: crate::socket::channel::intrusive_queue::sync::Receiver<
+        crate::packet::datagram::decoder::Packet<crate::socket::pool::descriptor::Filled>,
+    >,
+    worker_id: usize,
+    idle_timeout: core::time::Duration,
+    path_secret_map: crate::path::secret::Map,
+    acceptor_registry: crate::acceptor::Registry<crate::stream3::Stream>,
+    frame_tx: crate::stream3::frame::SubmissionSender,
+    mut ack_sender: crate::stream3::endpoint::routing::AckSender,
+    mut queue_dispatcher: crate::stream3::endpoint::msg::queue::Dispatcher,
+    counters: crate::stream3::endpoint::counters::Dispatch,
+    clock: Clk,
+) where
+    Clk: s2n_quic_core::time::Clock + crate::clock::precision::Clock,
+{
+    use crate::{
+        socket::channel::Receiver as ChannelReceiver,
+        stream3::endpoint::{dispatch, recv},
+    };
+
+    type PacketEntry = crate::intrusive_queue::Entry<
+        crate::packet::datagram::decoder::Packet<crate::socket::pool::descriptor::Filled>,
+    >;
+
+    let mut recv_cache = recv::Cache::new(idle_timeout, worker_id);
+    // Response frames (ACKs sent back to peers) re-enter via the same submission channel.
+    let mut response_tx = frame_tx.clone();
+
+    loop {
+        let packet = core::future::poll_fn(|cx| {
+            <_ as ChannelReceiver<PacketEntry>>::poll_recv(&mut packet_rx, cx)
+        })
+        .await;
+        let Some(packet) = packet else {
+            break;
+        };
+
+        let _ = dispatch::process(
+            packet,
+            &mut recv_cache,
+            &path_secret_map,
+            &acceptor_registry,
+            &frame_tx,
+            &mut response_tx,
+            &mut ack_sender,
+            &mut queue_dispatcher,
+            &clock,
+            &counters,
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

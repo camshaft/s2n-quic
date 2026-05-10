@@ -93,3 +93,41 @@ impl SenderRoute for ModuloRoute {
         (hash % self.divisor) as usize
     }
 }
+
+// ── ACK Routing ───────────────────────────────────────────────────────────
+
+/// Routes `msg::Sender` messages to the correct per-socket ACK channel.
+///
+/// The `local_sender_id` embedded in `msg::Sender::Ack` identifies which send socket's
+/// context should process this acknowledgement. `AckSender` wraps one
+/// `sync::Sender<msg::Sender>` per socket and dispatches based on that ID.
+pub(crate) struct AckSender {
+    inner: Vec<crate::socket::channel::intrusive_queue::sync::Sender<super::msg::Sender>>,
+}
+
+impl AckSender {
+    pub fn new(
+        senders: Vec<crate::socket::channel::intrusive_queue::sync::Sender<super::msg::Sender>>,
+    ) -> Self {
+        Self { inner: senders }
+    }
+}
+
+impl crate::socket::channel::UnboundedSender<super::msg::Sender> for AckSender {
+    fn send(
+        &mut self,
+        msg: super::msg::Sender,
+    ) -> Result<(), super::msg::Sender> {
+        match &msg {
+            super::msg::Sender::Ack { local_sender_id, .. } => {
+                let idx = local_sender_id.as_u64() as usize;
+                match self.inner.get_mut(idx) {
+                    Some(tx) => tx
+                        .send(crate::intrusive_queue::Entry::new(msg))
+                        .map_err(|e| e.into_inner()),
+                    None => Err(msg),
+                }
+            }
+        }
+    }
+}
