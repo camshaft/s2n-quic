@@ -95,6 +95,8 @@ where
             // Drain cancelled frames before collecting transmittable ones
             let mut cancelled_queue = Queue::new();
             let mut packet_frames = Queue::new();
+            // Use the next packet number for size estimation, but only consume it after a packet
+            // is successfully assembled.
             let packet_number = context.next_packet_number;
 
             while let Some(frame) = context.pending.pop_front() {
@@ -224,12 +226,12 @@ where
 fn estimate_segment_len(
     source_sender_id: VarInt,
     packet_number: VarInt,
-    flow_attempt_id: VarInt,
+    initial_flow_attempt_id: VarInt,
     frames: &Queue<Frame>,
     header_buf: &mut Vec<u8>,
     crypto_tag_len: usize,
 ) -> usize {
-    let mut flow_attempt_id = flow_attempt_id;
+    let mut flow_attempt_id = initial_flow_attempt_id;
     let total_payload_len = encode_frame_metadata(frames, &mut flow_attempt_id, header_buf);
     let header_len = VarInt::new(header_buf.len() as u64).expect("header length fits in VarInt");
     let payload_len =
@@ -619,10 +621,12 @@ mod tests {
         entry: &Arc<PathSecretEntry>,
         mtu: u16,
     ) -> crate::intrusive_queue::Entry<Frame> {
+        const MAX_TEST_PAYLOAD_DIVISOR: usize = 4;
+
         let payload = spec
             .payload
             .into_iter()
-            .take((mtu as usize / 4).max(1))
+            .take((mtu as usize / MAX_TEST_PAYLOAD_DIVISOR).max(1))
             .collect::<Vec<_>>();
 
         Frame {
