@@ -213,6 +213,12 @@ mod tests {
         }
     }
 
+    fn with_test_context<R>(f: impl FnOnce(&mut task::Context<'_>) -> R) -> R {
+        let waker = s2n_quic_core::task::waker::noop();
+        let mut cx = task::Context::from_waker(&waker);
+        f(&mut cx)
+    }
+
     #[test]
     fn selected_sender_is_polled_before_alternates() {
         let mut slot = MaybeUninit::new(new_test_item(
@@ -229,10 +235,7 @@ mod tests {
                 calls: 0,
             },
         ];
-        let waker = s2n_quic_core::task::waker::noop();
-        let mut cx = task::Context::from_waker(&waker);
-
-        let result = try_send_pick_two(&mut cx, &mut slot, &mut senders, &|_| 0);
+        let result = with_test_context(|cx| try_send_pick_two(cx, &mut slot, &mut senders, &|_| 0));
         assert_eq!(result, Poll::Ready(true));
         assert_eq!(senders[0].calls, 1);
         assert_eq!(senders[1].calls, 0);
@@ -254,10 +257,7 @@ mod tests {
                 calls: 0,
             },
         ];
-        let waker = s2n_quic_core::task::waker::noop();
-        let mut cx = task::Context::from_waker(&waker);
-
-        let result = try_send_pick_two(&mut cx, &mut slot, &mut senders, &|_| 0);
+        let result = with_test_context(|cx| try_send_pick_two(cx, &mut slot, &mut senders, &|_| 0));
         assert_eq!(result, Poll::Ready(true));
         assert_eq!(senders[0].calls, 1);
         assert_eq!(senders[1].calls, 1);
@@ -279,10 +279,7 @@ mod tests {
                 calls: 0,
             },
         ];
-        let waker = s2n_quic_core::task::waker::noop();
-        let mut cx = task::Context::from_waker(&waker);
-
-        let result = try_send_pick_two(&mut cx, &mut slot, &mut senders, &|_| 0);
+        let result = with_test_context(|cx| try_send_pick_two(cx, &mut slot, &mut senders, &|_| 0));
         assert_eq!(result, Poll::Ready(false));
         assert_eq!(senders[0].calls, 1);
         assert_eq!(senders[1].calls, 0);
@@ -303,10 +300,8 @@ mod tests {
             calls: 0,
         }];
         let mut fut = core::pin::pin!(pick_two(rx, senders, |_| 0));
-        let waker = s2n_quic_core::task::waker::noop();
-        let mut cx = task::Context::from_waker(&waker);
-
-        assert_eq!(fut.as_mut().poll(&mut cx), Poll::Ready(()));
+        let result = with_test_context(|cx| fut.as_mut().poll(cx));
+        assert_eq!(result, Poll::Ready(()));
         assert_eq!(drop_counter.load(Ordering::Relaxed), 1);
     }
 }
