@@ -286,7 +286,7 @@ impl Entry {
         bandwidth: Bandwidth,
     ) -> Timestamp {
         let sender_idx = self.sender_index(sender_idx);
-        let delay = (queued_bytes as u64) / bandwidth;
+        let delay: Duration = (queued_bytes as u64) / bandwidth;
         let next = now + delay;
         let next_micros = Self::sender_schedule_micros(next);
         self.next_transmission_by_sender[sender_idx].store(next_micros, Ordering::Release);
@@ -302,8 +302,8 @@ impl Entry {
             return 0;
         }
 
-        let idx1 = random_fn(len) % len;
-        let mut idx2 = random_fn(len - 1) % (len - 1);
+        let idx1 = random_fn(len).min(len - 1);
+        let mut idx2 = random_fn(len - 1).min(len - 2);
         if idx2 >= idx1 {
             idx2 += 1;
         }
