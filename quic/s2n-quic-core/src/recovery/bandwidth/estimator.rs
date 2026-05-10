@@ -178,7 +178,12 @@ impl core::ops::Mul<usize> for Bandwidth {
     type Output = Duration;
 
     fn mul(self, rhs: usize) -> Self::Output {
-        (rhs as u64) / self
+        #[allow(clippy::suspicious_arithmetic_impl)]
+        Duration::from_nanos(
+            self.nanos_per_kibibyte
+                .saturating_mul(rhs as u64)
+                >> KIBIBYTE_SHIFT,
+        )
     }
 }
 
