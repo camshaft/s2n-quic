@@ -315,15 +315,25 @@ impl Entry {
         random_fn: impl Fn(usize) -> usize,
     ) -> usize {
         let len = self.next_transmission_by_sender.len();
-        if len <= 1 {
+        if len == 0 {
+            // No sender sockets are configured yet; callers treat 0 as the default route index.
+            return 0;
+        }
+
+        if len == 1 {
             return 0;
         }
 
         let idx1 = random_fn(len) % len;
-        let mut idx2 = random_fn(len - 1) % (len - 1);
-        if idx2 >= idx1 {
-            idx2 += 1;
-        }
+        let idx2 = if len == 2 {
+            idx1 ^ 1
+        } else {
+            let mut idx2 = random_fn(len - 1) % (len - 1);
+            if idx2 >= idx1 {
+                idx2 += 1;
+            }
+            idx2
+        };
 
         let time1 = self.next_transmission_by_sender[idx1].load(Ordering::Acquire);
         let time2 = self.next_transmission_by_sender[idx2].load(Ordering::Acquire);
