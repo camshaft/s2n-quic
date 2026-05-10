@@ -674,9 +674,13 @@ impl Inner {
         }
 
         let mtu = self.packet_size as usize;
+        let local_available = self
+            .max_inflight_bytes
+            .saturating_sub(self.inflight_bytes) as usize;
         let chunk_len = mtu
             .min(buf.buffered_len())
-            .min(self.remaining_offset_capacity());
+            .min(self.remaining_offset_capacity())
+            .min(local_available);
 
         let mut payload = ByteVec::new();
         {
@@ -850,6 +854,511 @@ impl Drop for Writer {
 
 fn offset_overflow_error() -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, "stream offset overflow")
+}
+
+/// Bach/bolero simulation tests for the stream3 writer.
+///
+/// These tests generate random sequences of writer operations (Write, Shutdown) interleaved
+/// with random pipeline responses (Ack, Fail, MaxData, Reset, Hold) and assert that no
+/// writer invariants are violated:
+///
+/// - `inflight_bytes` never exceeds `max_inflight_bytes`
+/// - frame offsets are monotonically non-overlapping
+/// - `offset + payload_len` never exceeds `remote_max_data` at the time of sending
+/// - FIN is sent at most once
+/// - no new FlowData frames are sent after the peer has issued a Reset
+///
+/// The `bach_writer_sim` test additionally runs each scenario inside a deterministic bach
+/// time simulation with real async scheduling.
+#[cfg(test)]
+mod sim_tests {
+    use super::*;
+    use crate::{
+        flow,
+        intrusive_queue::{Entry, Queue},
+        socket::{
+            channel::{self, Receiver as _},
+            pool::descriptor::Unfilled,
+        },
+        stream3::frame,
+    };
+    use bolero::TypeGenerator;
+    use s2n_codec::{Encoder, EncoderBuffer, EncoderValue as _};
+    use s2n_quic_core::{task::waker, varint::VarInt};
+    use std::task::Poll;
+
+    // ── Operations ────────────────────────────────────────────────────────────
+
+    /// Operations that the writer side applies.
+    #[derive(Clone, Debug, TypeGenerator)]
+    enum WriterOp {
+        /// Write N bytes of application data.
+        Write(#[generator(0u16..=1024)] u16),
+        /// Graceful shutdown (send FIN and stop).
+        Shutdown,
+    }
+
+    /// Operations that the simulated pipeline applies.
+    #[derive(Clone, Debug, TypeGenerator)]
+    enum PipelineOp {
+        /// Acknowledge all pending (and held) frames.
+        AckAll,
+        /// Fail all pending (and held) frames with the given reason.
+        FailAll(FailureKind),
+        /// Send a MAX_DATA update to the writer's control channel.
+        MaxData(#[generator(0u64..=65536)] u64),
+        /// Peer sends a Reset to the writer.
+        Reset(#[generator(0u8..=10)] u8),
+        /// Accumulate frames without returning completions (slow pipeline).
+        Hold,
+    }
+
+    /// Which failure reason the pipeline uses when failing frames.
+    #[derive(Clone, Copy, Debug, TypeGenerator)]
+    enum FailureKind {
+        PeerDead,
+        TransmissionError,
+        UnknownPathSecret,
+        Cancelled,
+    }
+
+    impl FailureKind {
+        fn into_status(self) -> frame::TransmissionStatus {
+            frame::TransmissionStatus::Failed(match self {
+                Self::PeerDead => frame::FailureReason::PeerDead,
+                Self::TransmissionError => frame::FailureReason::TransmissionError,
+                Self::UnknownPathSecret => frame::FailureReason::UnknownPathSecret,
+                Self::Cancelled => frame::FailureReason::Cancelled,
+            })
+        }
+    }
+
+    // ── Scenario ──────────────────────────────────────────────────────────────
+
+    /// The full scenario that the fuzzer generates for one test iteration.
+    #[derive(Clone, Debug, TypeGenerator)]
+    struct Scenario {
+        /// Initial remote MAX_DATA window.
+        ///
+        /// `0` means client-mode (no writes until `MaxData` establishes flow).
+        /// Non-zero means server-mode (flow already established).
+        #[generator(0u32..=8192)]
+        initial_remote_max_data: u32,
+        /// Local in-flight budget (max bytes we allow in flight at once).
+        #[generator(64u64..=8192)]
+        max_inflight_bytes: u64,
+        /// Interleaved writer and pipeline operations.
+        ops: Vec<(WriterOp, PipelineOp)>,
+    }
+
+    // ── Harness ───────────────────────────────────────────────────────────────
+
+    type FrameRx = channel::intrusive_queue::sharded::Receiver<
+        crate::intrusive_queue::EntryAdapter<Frame>,
+    >;
+
+    struct Harness {
+        inner: Inner,
+        frame_rx: FrameRx,
+        /// Completion sender for returning frames back to the writer.
+        completion_sender: frame::CompletionSender,
+        /// Frames held by the pipeline without completing them.
+        held_frames: Vec<Entry<Frame>>,
+        /// Keep the allocator alive so its internal senders (which hold `IS_OPEN`) are
+        /// not dropped and do not close the writer's control channel prematurely.
+        _allocator: msg::queue::Allocator,
+        /// Keep the stream receiver alive alongside the control receiver so the
+        /// descriptor is not freed before the test is done.
+        _stream_rx: msg::queue::Stream,
+        // ── Invariant state ──
+        /// Highest byte offset sent so far (exclusive end of last frame).
+        next_expected_offset: u64,
+        /// Whether we have already seen a FIN frame.
+        fin_seen: bool,
+        /// Whether the pipeline has already sent a Reset to the writer.
+        reset_sent: bool,
+    }
+
+    fn make_harness(scenario: &Scenario) -> Harness {
+        let (frame_tx, frame_rx) = channel::intrusive_queue::sharded::new::<Frame>(1);
+        let waker_ref = waker::noop();
+        frame_rx.register(&waker_ref);
+
+        let path_secret_entry =
+            PathSecretEntry::fake("127.0.0.1:8080".parse().unwrap(), None);
+        let stream_id = VarInt::from_u8(42);
+        let handle = flow::Handle::client(stream_id, path_secret_entry.clone());
+        let mut allocator = msg::queue::Allocator::new();
+        let (control_rx, stream_rx) =
+            allocator.alloc_or_grow(handle, Some(VarInt::from_u8(7)));
+
+        let completion_rx = frame::completion_channel();
+        let completion_sender = completion_rx.sender();
+
+        let initial_max_data =
+            VarInt::try_from(scenario.initial_remote_max_data as u64).unwrap_or(VarInt::MAX);
+        // Server mode has flow already established; client mode starts in Init.
+        let (status, remote_max_data) = if scenario.initial_remote_max_data > 0 {
+            (Status::Open, initial_max_data)
+        } else {
+            (Status::Init, VarInt::ZERO)
+        };
+
+        let inner = Inner {
+            frame_tx,
+            completion_rx,
+            control_rx,
+            path_secret_entry,
+            packet_size: 512,
+            stream_id,
+            acceptor_id: VarInt::ZERO,
+            next_offset: VarInt::ZERO,
+            inflight_bytes: 0,
+            max_inflight_bytes: scenario.max_inflight_bytes,
+            remote_max_data,
+            status,
+            reset_error_code: None,
+        };
+
+        Harness {
+            inner,
+            frame_rx,
+            completion_sender,
+            held_frames: Vec::new(),
+            _allocator: allocator,
+            _stream_rx: stream_rx,
+            next_expected_offset: 0,
+            fin_seen: false,
+            reset_sent: false,
+        }
+    }
+
+    // ── Helpers ───────────────────────────────────────────────────────────────
+
+    /// Encode a QUIC MAX_DATA frame (type 0x10 + varint) into a fresh `descriptor::Filled`.
+    fn encode_max_data(value: u64) -> Option<crate::socket::pool::descriptor::Filled> {
+        let max_data = VarInt::try_from(value).ok()?;
+        // 1 byte type tag + variable-length integer
+        let size = 1 + max_data.encoding_size();
+        let unfilled = Unfilled::new(size as u16)?;
+        unfilled
+            .fill_with(|_addr, _cmsg, mut iov| {
+                let mut enc = EncoderBuffer::new(&mut iov[..size]);
+                enc.encode(&0x10u8); // MAX_DATA frame type tag
+                enc.encode(&max_data);
+                Ok::<_, core::convert::Infallible>(size)
+            })
+            .ok()
+            .map(|segs| segs.take_filled())
+    }
+
+    fn noop_cx() -> core::task::Context<'static> {
+        let waker = Box::leak(Box::new(waker::noop()));
+        core::task::Context::from_waker(waker)
+    }
+
+    // ── Harness methods ───────────────────────────────────────────────────────
+
+    impl Harness {
+        /// Non-blocking drain of all currently available frames from `frame_rx`.
+        fn drain_frames(&mut self) -> Vec<Entry<Frame>> {
+            let waker_ref = waker::noop();
+            let mut cx = core::task::Context::from_waker(&waker_ref);
+            let mut frames = Vec::new();
+            loop {
+                match self.frame_rx.poll_recv(&mut cx) {
+                    Poll::Ready(Some(list)) => frames.extend(list),
+                    _ => break,
+                }
+            }
+            frames
+        }
+
+        /// Verify per-frame invariants.
+        ///
+        /// Called for every frame that arrives in `frame_rx` before the pipeline
+        /// acts on it.  By this point the writer has already sent the frame, so
+        /// `inner.remote_max_data` reflects the value that was in place at the
+        /// time the frame was built (it can only grow afterwards).
+        fn check_frame_invariants(&mut self, frame: &Frame) {
+            if let Header::FlowData {
+                offset, is_fin, ..
+            } = frame.header
+            {
+                let payload_len = frame.payload_len() as u64;
+                let end = offset.as_u64() + payload_len;
+
+                // No new data frames after the peer sent a Reset.
+                assert!(
+                    !self.reset_sent,
+                    "FlowData frame received after pipeline sent Reset: offset={} len={}",
+                    offset.as_u64(),
+                    payload_len,
+                );
+
+                // Offsets must be monotonically non-decreasing.
+                assert!(
+                    offset.as_u64() >= self.next_expected_offset,
+                    "non-monotonic offset: frame starts at {} but expected >= {}",
+                    offset.as_u64(),
+                    self.next_expected_offset,
+                );
+
+                // The frame must not exceed the remote MAX_DATA window.
+                assert!(
+                    end <= self.inner.remote_max_data.as_u64(),
+                    "frame [{}..{}) exceeds remote_max_data {}",
+                    offset.as_u64(),
+                    end,
+                    self.inner.remote_max_data.as_u64(),
+                );
+
+                // Advance the expected offset tracker.
+                if end > self.next_expected_offset {
+                    self.next_expected_offset = end;
+                }
+
+                // FIN must appear at most once.
+                if is_fin {
+                    assert!(!self.fin_seen, "FIN was sent more than once");
+                    self.fin_seen = true;
+                }
+            }
+        }
+
+        /// Check the per-step state invariants on the writer.
+        fn check_state_invariants(&self) {
+            assert!(
+                self.inner.inflight_bytes <= self.inner.max_inflight_bytes,
+                "inflight_bytes {} exceeds max_inflight_bytes {}",
+                self.inner.inflight_bytes,
+                self.inner.max_inflight_bytes,
+            );
+        }
+
+        /// Return completions for all frames with Acknowledged status.
+        fn ack_frames(&self, frames: Vec<Entry<Frame>>) {
+            if frames.is_empty() {
+                return;
+            }
+            let mut queue = Queue::new();
+            for mut entry in frames {
+                entry.status = frame::TransmissionStatus::Acknowledged;
+                queue.push_back(entry);
+            }
+            self.completion_sender.send_batch(queue).ok();
+        }
+
+        /// Return completions for all frames with the given failure status.
+        fn fail_frames(&self, frames: Vec<Entry<Frame>>, kind: FailureKind) {
+            if frames.is_empty() {
+                return;
+            }
+            let mut queue = Queue::new();
+            for mut entry in frames {
+                entry.status = kind.into_status();
+                queue.push_back(entry);
+            }
+            self.completion_sender.send_batch(queue).ok();
+        }
+
+        /// Push a MAX_DATA update into the writer's control channel.
+        fn push_max_data(&self, value: u64) {
+            if let Some(payload) = encode_max_data(value) {
+                self.inner
+                    .control_rx
+                    .push(Entry::new(msg::Control::Frames { payload }));
+            }
+        }
+
+        /// Push a peer-initiated Reset into the writer's control channel.
+        fn push_reset(&self, code: u8) {
+            let error_code = VarInt::try_from(code as u64).unwrap_or(VarInt::ZERO);
+            self.inner
+                .control_rx
+                .push(Entry::new(msg::Control::Reset { error_code }));
+        }
+
+        /// Drain frames from `frame_rx`, check their invariants, then apply the
+        /// pipeline op to them.
+        fn apply_pipeline_op(&mut self, op: &PipelineOp) {
+            let new_frames = self.drain_frames();
+            for f in &new_frames {
+                self.check_frame_invariants(f);
+            }
+
+            match op {
+                PipelineOp::AckAll => {
+                    let mut all = self.held_frames.drain(..).collect::<Vec<_>>();
+                    all.extend(new_frames);
+                    self.ack_frames(all);
+                }
+                PipelineOp::FailAll(kind) => {
+                    let mut all = self.held_frames.drain(..).collect::<Vec<_>>();
+                    all.extend(new_frames);
+                    self.fail_frames(all, *kind);
+                }
+                PipelineOp::MaxData(v) => {
+                    self.push_max_data(*v);
+                    // Hold the new frames without completing them.
+                    self.held_frames.extend(new_frames);
+                }
+                PipelineOp::Reset(code) => {
+                    self.reset_sent = true;
+                    self.push_reset(*code);
+                    // Drop all pending frames — no completions sent.
+                    drop(new_frames);
+                    self.held_frames.clear();
+                }
+                PipelineOp::Hold => {
+                    self.held_frames.extend(new_frames);
+                }
+            }
+        }
+
+        /// Apply one writer op.  Returns `true` when the writer has shut down.
+        fn apply_writer_op(
+            &mut self,
+            op: &WriterOp,
+            cx: &mut core::task::Context,
+        ) -> bool {
+            match op {
+                WriterOp::Write(n) => {
+                    let data = vec![0u8; *n as usize];
+                    let mut buf: &[u8] = &data;
+                    let _ = self.inner.poll_write_from(cx, &mut buf, false);
+                    false
+                }
+                WriterOp::Shutdown => {
+                    let _ = self.inner.shutdown();
+                    true
+                }
+            }
+        }
+
+        /// Let the writer process any completions and control messages that the
+        /// pipeline has queued since the last step.
+        fn drain_writer_inbox(&mut self, cx: &mut core::task::Context) {
+            // poll_completions and poll_remote_budget are called inside
+            // poll_write_from, but we call them directly here so the writer
+            // can react even when it is not actively writing.
+            let _ = self.inner.poll_completions(cx);
+            let _ = self.inner.poll_remote_budget(cx);
+        }
+    }
+
+    // ── Core runner ───────────────────────────────────────────────────────────
+
+    fn run_scenario(scenario: &Scenario) {
+        let mut harness = make_harness(scenario);
+        let mut cx = noop_cx();
+
+        for (writer_op, pipeline_op) in &scenario.ops {
+            // 1. Apply the writer op (may send frames or return Pending).
+            let done = harness.apply_writer_op(writer_op, &mut cx);
+            harness.check_state_invariants();
+
+            // 2. Apply the pipeline op (drain frames, check invariants, react).
+            harness.apply_pipeline_op(pipeline_op);
+
+            // 3. Let the writer pick up the pipeline's responses.
+            harness.drain_writer_inbox(&mut cx);
+            harness.check_state_invariants();
+
+            if done {
+                break;
+            }
+        }
+
+        // After all ops: drain and check any remaining frames.
+        let remaining = harness.drain_frames();
+        for f in &remaining {
+            harness.check_frame_invariants(&f);
+        }
+        harness.check_state_invariants();
+    }
+
+    // ── Tests ─────────────────────────────────────────────────────────────────
+
+    /// Property-based test: run random scenarios without time simulation.
+    #[test]
+    fn bolero_writer_sim() {
+        crate::testing::without_tracing(|| {
+            bolero::check!()
+                .with_type::<Scenario>()
+                .with_test_time(core::time::Duration::from_secs(30))
+                .for_each(|scenario| run_scenario(scenario));
+        });
+    }
+
+    /// Same property-based test inside a bach deterministic time simulation.
+    ///
+    /// Each iteration runs in its own `sim()` environment, which exercises
+    /// real async scheduling and virtual time (e.g. tokio::task::yield_now).
+    #[test]
+    fn bach_writer_sim() {
+        crate::testing::without_tracing(|| {
+            bolero::check!()
+                .with_type::<Scenario>()
+                .with_test_time(core::time::Duration::from_secs(30))
+                .for_each(|scenario| {
+                    let scenario = scenario.clone();
+                    crate::testing::sim(|| {
+                        // SAFETY: bach's sim executor is single-threaded; the future
+                        // never crosses thread boundaries.  We wrap the non-Send
+                        // future so bach::spawn can accept it.
+                        struct SendWrapper<F>(F);
+                        unsafe impl<F> Send for SendWrapper<F> {}
+                        unsafe impl<F> Sync for SendWrapper<F> {}
+                        impl<F: core::future::Future> core::future::Future for SendWrapper<F> {
+                            type Output = F::Output;
+                            fn poll(
+                                self: core::pin::Pin<&mut Self>,
+                                cx: &mut core::task::Context<'_>,
+                            ) -> core::task::Poll<Self::Output> {
+                                // SAFETY: we never move the inner future after pinning.
+                                unsafe {
+                                    core::pin::Pin::new_unchecked(
+                                        &mut self.get_unchecked_mut().0,
+                                    )
+                                    .poll(cx)
+                                }
+                            }
+                        }
+
+                        async fn run(scenario: Scenario) {
+                            let mut harness = make_harness(&scenario);
+                            let mut cx = noop_cx();
+
+                            for (writer_op, pipeline_op) in &scenario.ops {
+                                let done = harness.apply_writer_op(writer_op, &mut cx);
+                                harness.check_state_invariants();
+
+                                // Yield so bach's scheduler can run other work.
+                                tokio::task::yield_now().await;
+
+                                harness.apply_pipeline_op(pipeline_op);
+                                harness.drain_writer_inbox(&mut cx);
+                                harness.check_state_invariants();
+
+                                if done {
+                                    break;
+                                }
+                            }
+
+                            let remaining = harness.drain_frames();
+                            for f in &remaining {
+                                harness.check_frame_invariants(&f);
+                            }
+                            harness.check_state_invariants();
+                        }
+
+                        use bach::ext::{PrimaryExt as _, SpawnExt as _};
+                        SendWrapper(run(scenario)).primary().spawn();
+                    });
+                });
+        });
+    }
 }
 
 #[cfg(feature = "tokio")]
