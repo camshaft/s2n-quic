@@ -60,14 +60,11 @@
 //
 // Performance:
 //
-// * Use buffer::duplex::Interposer to bypass the reassembler on the hot path. When a
-//   datagram arrives at the head offset and the application buffer has remaining capacity,
-//   the Interposer writes directly into the application buffer and calls skip() on the
-//   reassembler to advance its cursor. This avoids a copy through the reassembler for the
-//   common in-order case. The existing stream implementation does this in recv/shared.rs.
-//   To integrate: poll_stream_rx needs access to the application buffer, and the write path
-//   should use `Interposer::new(app_buf, &mut self.reassembler)` as the Writer target for
-//   write_reader. Out-of-order data still goes into the reassembler as usual.
+// * The Interposer fast path only applies when the reassembler has no readable head data.
+//   If buffered head data exists, poll_read_into drains that data first and only later polls
+//   stream_rx again. We should measure whether it's worth trying to resume interposition in
+//   the same read once the buffered head is drained, or whether the extra bookkeeping would
+//   outweigh the copy savings.
 //
 // * poll_read_into calls poll_stream_rx and then tries to copy out. If poll_stream_rx
 //   returns Pending and the reassembler already has buffered data, we still try to copy
@@ -274,7 +271,8 @@ impl Inner {
             return Poll::Ready(Ok(()));
         }
 
-        match self.poll_stream_rx::<buffer::writer::storage::Empty>(cx, None)? {
+        let mut app_buf = buffer::writer::storage::Empty;
+        match self.poll_stream_rx(cx, &mut app_buf)? {
             Poll::Ready(()) => {
                 if self.status.is_pending_validation() {
                     Poll::Pending
@@ -291,12 +289,7 @@ impl Inner {
         S: buffer::writer::Storage,
     {
         let mut tracker = buf.track_write();
-        let direct_write_buf = if self.status.is_pending_validation() {
-            None
-        } else {
-            Some(&mut tracker)
-        };
-        let _ = self.poll_stream_rx(cx, direct_write_buf)?;
+        let _ = self.poll_stream_rx(cx, &mut tracker)?;
 
         if self.status.is_pending_validation() {
             return Poll::Ready(Err(io::Error::new(
@@ -342,10 +335,12 @@ impl Inner {
         }
     }
 
-    fn poll_stream_rx<S>(&mut self, cx: &mut Context, mut app_buf: Option<&mut S>) -> Poll<io::Result<()>>
+    fn poll_stream_rx<S>(&mut self, cx: &mut Context, app_buf: &mut S) -> Poll<io::Result<()>>
     where
         S: buffer::writer::Storage + ?Sized,
     {
+        let interpose = !self.status.is_pending_validation();
+
         match self.stream_rx.poll_swap(cx) {
             Poll::Ready(Ok(queue)) => {
                 for msg in queue {
@@ -376,9 +371,8 @@ impl Inner {
                                 }
                             };
 
-                            let app_buf = app_buf.as_mut().map(|buf| &mut **buf);
                             if let Err(err) =
-                                write_data_reader(&mut self.reassembler, &mut reader, app_buf)
+                                write_data_reader(&mut self.reassembler, &mut reader, app_buf, interpose)
                             {
                                 debug!(
                                     stream_id = self.stream_id.as_u64(),
@@ -553,13 +547,14 @@ impl Inner {
 fn write_data_reader<S, R>(
     reassembler: &mut Reassembler,
     reader: &mut R,
-    app_buf: Option<&mut S>,
+    app_buf: &mut S,
+    interpose: bool,
 ) -> Result<(), buffer::Error<R::Error>>
 where
     S: buffer::writer::Storage + ?Sized,
     R: buffer::reader::Reader + ?Sized,
 {
-    if let Some(app_buf) = app_buf.filter(|_| reassembler.is_empty()) {
+    if interpose && reassembler.is_empty() {
         let mut interposer = Interposer::new(app_buf, reassembler);
         interposer.read_from(reader)
     } else {
@@ -670,7 +665,7 @@ mod tests {
         let mut reader = Data::new(8);
         let mut app_buf: Vec<u8> = Vec::new();
 
-        write_data_reader(&mut reassembler, &mut reader, Some(&mut app_buf)).unwrap();
+        write_data_reader(&mut reassembler, &mut reader, &mut app_buf, true).unwrap();
 
         assert_eq!(app_buf, Data::send_one_at(0, 8));
         assert_eq!(reassembler.consumed_len(), 8);
@@ -686,7 +681,7 @@ mod tests {
         let mut app_buf: Vec<u8> = Vec::new();
 
         reader.seek_forward(4);
-        write_data_reader(&mut reassembler, &mut reader, Some(&mut app_buf)).unwrap();
+        write_data_reader(&mut reassembler, &mut reader, &mut app_buf, true).unwrap();
 
         assert!(app_buf.is_empty());
         assert_eq!(reassembler.consumed_len(), 0);
@@ -707,7 +702,7 @@ mod tests {
         reassembler.write_at(0u32.into(), &Data::send_one_at(0, 4)).unwrap();
         reader.seek_forward(4);
 
-        write_data_reader(&mut reassembler, &mut reader, Some(&mut app_buf)).unwrap();
+        write_data_reader(&mut reassembler, &mut reader, &mut app_buf, true).unwrap();
 
         assert!(app_buf.is_empty());
         assert_eq!(reassembler.len(), 8);
