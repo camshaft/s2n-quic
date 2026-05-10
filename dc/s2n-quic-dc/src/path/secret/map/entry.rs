@@ -278,7 +278,8 @@ impl Entry {
         }
 
         let queued_bytes = queued_bytes.min(u64::MAX as usize) as u64;
-        queued_bytes / bandwidth
+        let delay: Duration = queued_bytes / bandwidth;
+        delay
     }
 
     #[inline]
