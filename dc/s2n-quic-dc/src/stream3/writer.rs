@@ -720,8 +720,8 @@ impl Inner {
             payload_budget = next;
         }
 
-        debug_assert!(
-            false,
+        #[cfg(debug_assertions)]
+        unreachable!(
             "payload budget did not converge: header={header:?} available={available} budget={payload_budget}"
         );
         payload_budget
@@ -749,9 +749,6 @@ impl Inner {
             }
 
             let available = self.min_send_budget();
-            if !need_fin_packet && available == 0 {
-                break;
-            }
 
             let queue_pair = QueuePair {
                 source_queue_id: self.control_rx.queue_id(),
