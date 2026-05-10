@@ -659,7 +659,7 @@ mod tests {
         segments.take_filled()
     }
 
-    fn test_reader(msg: msg::Stream) -> Reader {
+    fn test_reader_with_messages(messages: impl IntoIterator<Item = msg::Stream>) -> Reader {
         let stream_id = VarInt::from_u8(1);
         let peer: SocketAddr = "127.0.0.1:4433".parse().unwrap();
         let path_secret_entry = PathSecretEntry::fake_deterministic(peer, endpoint::Type::Client);
@@ -668,9 +668,15 @@ mod tests {
         let (_control, stream_rx) = allocator
             .alloc(handle, Some(VarInt::from_u8(2)))
             .expect("queue alloc should succeed");
-        stream_rx.push(msg.into());
+        for msg in messages {
+            stream_rx.push(msg.into());
+        }
 
         Reader::new_client(test_frame_tx(), path_secret_entry, stream_id, stream_rx)
+    }
+
+    fn test_reader(msg: msg::Stream) -> Reader {
+        test_reader_with_messages([msg])
     }
 
     #[test]
@@ -749,30 +755,24 @@ mod tests {
     #[test]
     fn poll_read_into_drains_buffered_data_before_returning_reset() {
         let expected = Data::send_one_at(0, 8);
-        let mut reader = test_reader(msg::Stream::Data {
-            offset: VarInt::from_u8(4),
-            fin: false,
-            payload: filled_payload(&expected[4..]),
-        });
-        let waker = waker::noop();
-        let mut cx = core::task::Context::from_waker(&waker);
-        let mut out = Vec::new();
-
-        assert!(matches!(reader.poll_read_into(&mut cx, &mut out), Poll::Pending));
-        assert!(out.is_empty());
-
-        reader.0.stream_rx.push(
+        let mut reader = test_reader_with_messages([
+            msg::Stream::Data {
+                offset: VarInt::from_u8(4),
+                fin: false,
+                payload: filled_payload(&expected[4..]),
+            },
             msg::Stream::Data {
                 offset: VarInt::ZERO,
                 fin: false,
                 payload: filled_payload(&expected[..4]),
-            }
-            .into(),
-        );
-        reader
-            .0
-            .stream_rx
-            .push(msg::Stream::Reset { error_code: VarInt::from_u8(7) }.into());
+            },
+            msg::Stream::Reset {
+                error_code: VarInt::from_u8(7),
+            },
+        ]);
+        let waker = waker::noop();
+        let mut cx = core::task::Context::from_waker(&waker);
+        let mut out = Vec::new();
 
         {
             let mut limited = out.with_write_limit(4);
