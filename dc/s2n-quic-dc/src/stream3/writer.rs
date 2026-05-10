@@ -761,11 +761,14 @@ impl Inner {
                     .expect("remote_queue_id must be set when Open"),
             };
 
+            let offset = self.next_offset;
             let header = Header::FlowData {
                 queue_pair,
                 stream_id: self.stream_id,
-                offset: self.next_offset,
-                is_fin: false,
+                offset,
+                // FIN and non-FIN FlowData frames have equal metadata length; use the
+                // terminal variant as a conservative placeholder for the budget check.
+                is_fin: true,
             };
 
             let chunk_len = if need_fin_packet {
@@ -788,7 +791,6 @@ impl Inner {
             }
 
             let payload_len = payload.len();
-            let offset = self.next_offset;
             let is_last_chunk = buf.buffer_is_empty();
             let include_fin = is_fin && is_last_chunk;
 
