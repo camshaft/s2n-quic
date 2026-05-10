@@ -291,12 +291,12 @@ impl Inner {
         S: buffer::writer::Storage,
     {
         let mut tracker = buf.track_write();
-        let app_buf = if self.status.is_pending_validation() {
+        let direct_write_buf = if self.status.is_pending_validation() {
             None
         } else {
             Some(&mut tracker)
         };
-        let _ = self.poll_stream_rx(cx, app_buf)?;
+        let _ = self.poll_stream_rx(cx, direct_write_buf)?;
 
         if self.status.is_pending_validation() {
             return Poll::Ready(Err(io::Error::new(
@@ -314,10 +314,6 @@ impl Inner {
                 )));
             }
             return Poll::Ready(Err(io::ErrorKind::ConnectionReset.into()));
-        }
-
-        if self.status.is_complete() {
-            return Poll::Ready(Ok(tracker.written_len()));
         }
 
         if tracker.has_remaining_capacity() {
