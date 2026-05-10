@@ -302,8 +302,15 @@ impl Entry {
             return 0;
         }
 
-        let idx1 = random_fn(len).min(len - 1);
-        let mut idx2 = random_fn(len - 1).min(len - 2);
+        let mut idx1 = random_fn(len);
+        if idx1 >= len {
+            idx1 %= len;
+        }
+
+        let mut idx2 = random_fn(len - 1);
+        if idx2 >= len - 1 {
+            idx2 %= len - 1;
+        }
         if idx2 >= idx1 {
             idx2 += 1;
         }

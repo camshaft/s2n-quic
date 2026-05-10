@@ -54,6 +54,7 @@ fn allocates_sender_schedule_slots() {
 #[test]
 fn picks_sender_with_lower_next_transmission() {
     let entry = test_entry_with_senders(2);
+    // SAFETY: this uses a non-negative test duration, which satisfies Timestamp invariants.
     let now = unsafe { Timestamp::from_duration(Duration::from_micros(10)) };
 
     entry.update_sender_next_transmission_time(
