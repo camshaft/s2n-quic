@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
+    datagram::batch::Priority,
     intrusive_queue::{Entry, Queue},
     path::secret::map::Entry as PathSecretEntry,
     socket::channel::{ByteCost, Receiver, Sender},
@@ -53,18 +54,30 @@ const BATCH_FRAMES_POLL_BUDGET: usize = 10;
 
 /// A queue of frames grouped for a single path-secret entry.
 ///
-/// This wrapper keeps the queue byte-cost estimate and path-secret entry so it can be routed
-/// through `pick_two`.
+/// This wrapper keeps the queue byte-cost estimate, path-secret entry, and the transmission
+/// priority (derived from the first frame) so it can be routed through the priority queues
+/// and `pick_two`.
 pub struct FrameBatch {
     queue: Queue<Frame>,
     path_secret_entry: Arc<PathSecretEntry>,
     byte_cost: u64,
+    /// Transmission priority derived from the first frame in the batch.
+    ///
+    /// Batches for the same path-secret entry that arrive consecutively share the same
+    /// priority since frames with the same purpose (data, ACK, flow control, …) are
+    /// typically submitted together by a single writer.
+    priority: Priority,
 }
 
 impl FrameBatch {
     #[inline]
     fn new(first: Entry<Frame>) -> Self {
         let path_secret_entry = first.path_secret_entry.clone();
+        // `Frame::priority()` delegates to `Header::priority()` which matches exhaustively
+        // over all `Header` variants.  Every variant maps to a `Priority` constant, so
+        // the returned value is always a valid `Priority` and its `as_index()` is always
+        // in `0..Priority::LEVELS`.
+        let priority = first.priority();
         let byte_cost = MAX_FRAME_BATCH_PACKET_OVERHEAD.saturating_add(first.byte_cost());
         let mut queue = Queue::new();
         queue.push_back(first);
@@ -73,6 +86,7 @@ impl FrameBatch {
             queue,
             path_secret_entry,
             byte_cost,
+            priority,
         }
     }
 
@@ -98,6 +112,12 @@ impl FrameBatch {
     #[inline]
     pub fn queue(&self) -> &Queue<Frame> {
         &self.queue
+    }
+
+    /// Returns the transmission priority of this batch.
+    #[inline]
+    pub fn priority(&self) -> Priority {
+        self.priority
     }
 
     /// Consumes the batch and returns the underlying frame queue.
@@ -293,54 +313,116 @@ where
 
 // ── Pipeline Task Functions ────────────────────────────────────────────────
 
-/// Routes frame submissions to socket workers using pick-two load balancing.
+/// Routes frame submissions to socket workers using priority queues, pacing, and pick-two
+/// load balancing.
 ///
-/// Reads batches of frames from the sharded submission channel, groups consecutive frames for
-/// the same path-secret entry, and routes each batch to a send socket via pick-two scheduling.
+/// Creates two cooperating tasks on `spawner`'s worker:
 ///
-/// `socket_senders` is generic so callers can wrap or transform senders (e.g., add pacing,
-/// metrics, or local unsync senders when the target is on the same worker).
+/// - **Priority router** (Task 1): reads frame batches from the sharded submission channel,
+///   groups consecutive frames for the same path-secret entry via [`BatchFramesByPathSecret`],
+///   and routes each batch to one of [`Priority::LEVELS`] single-slot priority lane channels
+///   based on the batch's packet type. Higher-priority batches (ACKs, flow control) land in
+///   lower-indexed lanes and are drained first.
 ///
-/// # Waker registration
+/// - **Distributor** (Task 2): drains the priority lanes in urgency order (via
+///   [`channel::Priority`]), applies overall bandwidth pacing ([`channel::Paced`]), and routes
+///   each batch to a send socket via pick-two scheduling.
 ///
-/// The sharded receiver requires explicit waker registration before it can wake the task.
-/// This function registers the waker on entry (before blocking) so the channel can wake us
-/// when new frames arrive.
+/// No timing wheel is used: the sharded submission channel already interleaves frames from
+/// concurrent writers, so ordering is handled upstream.
 ///
-/// # TODO: missing stream2 pipeline stages
+/// # Priority lane channels
 ///
-/// The following stages present in stream2's dispatch pipeline are not yet implemented:
+/// Priority lanes are [`cell::unsync`] single-slot channels (one per
+/// [`Priority::LEVELS`]). Both tasks run on the same worker so no cross-thread
+/// synchronisation is needed. The single-slot design provides natural back-pressure:
+/// Task 1 blocks on a full lane while Task 2 drains it.
 ///
-/// - **Priority queues**: stream2 distributes batches across `BatchPriority::LEVELS` priority
-///   lanes (Urgent, High, Normal, …) based on `batch.meta.priority`, then polls them in order
-///   via `channel::Priority`. This prevents low-priority retransmissions from starving
-///   fresh user data.
+/// # Sticky routing and queue metrics
 ///
-/// - **Timing wheel / PTO**: stream2 runs a `Wheel<_, _, _, 1>` (µs granularity) that fires
-///   deferred batches at their scheduled transmission time. PTO probes and delayed ACKs are
-///   injected into the wheel and emerge from it just-in-time. A separate PTO wheel task
-///   generates probe batches when the wheel fires a timed-out inflight entry.
+/// Sticky routing (retransmissions to the same socket) and per-queue depth gauges are not
+/// yet implemented. See stream2's dispatch pipeline for the reference implementation.
 ///
-/// - **Overall bandwidth pacer**: stream2 wraps the priority output with
-///   `Paced::new(rx, clock, overall_send_rate)` to cap total egress across all sockets.
-///
-/// - **Sticky routing**: batches with `meta.sender_id != VarInt::MAX` are intercepted by a
-///   `FilterMap` and sent directly to the owning socket (retransmissions must go back to the
-///   same socket that registered the packet). Non-sticky batches proceed to pick-two / round-robin.
-///
-/// - **Queue metrics**: stream2 wraps each queue stage in `GaugedQueue` to track depth with
-///   labelled counters (`q.wheel`, `q.priority.{i}`, …).
-pub async fn frame_dispatch<S, Rand>(
+/// [`channel::Priority`]: crate::socket::channel::Priority
+/// [`channel::Paced`]: crate::socket::channel::Paced
+/// [`cell::unsync`]: crate::socket::channel::cell::unsync
+/// [`Priority::LEVELS`]: crate::datagram::batch::Priority::LEVELS
+pub fn frame_dispatch<S, Rand, Clk>(
+    spawner: &mut impl crate::stream2::spawner::LocalSpawner,
     frame_rx: crate::stream3::frame::SubmissionReceiver,
     socket_senders: Vec<S>,
     random: Rand,
+    clock: Clk,
+    overall_send_rate: crate::socket::rate::Rate,
 ) where
-    S: Sender<FrameBatch>,
-    Rand: Fn(usize) -> usize,
+    S: Sender<FrameBatch> + 'static,
+    Rand: Fn(usize) -> usize + 'static,
+    Clk: crate::clock::precision::Clock + 'static,
 {
-    let rx = crate::socket::channel::FlattenList::new(frame_rx);
-    let rx = BatchFramesByPathSecret::new(rx);
-    pick_two(rx, socket_senders, random).await;
+    use crate::socket::channel::{cell, FlattenList, Paced, Priority as PriorityRx};
+
+    // Create one single-slot unsync channel per priority level.
+    // Both tasks run on the same worker, so Rc-based (!Send) channels are correct here.
+    let mut priority_txs: Vec<cell::unsync::Sender<FrameBatch>> =
+        Vec::with_capacity(Priority::LEVELS);
+    let mut priority_rxs: Vec<cell::unsync::Receiver<FrameBatch>> =
+        Vec::with_capacity(Priority::LEVELS);
+    for _ in 0..Priority::LEVELS {
+        let (tx, rx) = cell::unsync::new::<FrameBatch>();
+        priority_txs.push(tx);
+        priority_rxs.push(rx);
+    }
+
+    // Task 1: read batches from the submission channel and route into priority lanes.
+    //
+    // Applies back-pressure when a priority lane's single slot is full: the task
+    // suspends until the distributor (Task 2) drains that slot.
+    spawner.spawn(async move {
+        use core::mem::MaybeUninit;
+
+        let rx = FlattenList::new(frame_rx);
+        let mut batcher = BatchFramesByPathSecret::new(rx);
+
+        loop {
+            // poll_fn drives the batcher forward without needing ReceiverExt in scope.
+            let Some(batch) = poll_fn(|cx| batcher.poll_recv(cx)).await else {
+                break;
+            };
+
+            let priority_idx = batch.priority().as_index();
+            // `Priority::as_index()` is guaranteed to return a value in 0..Priority::LEVELS
+            // because `Priority` is a `repr(u8)` enum whose variants are assigned sequential
+            // constants starting at 0 (Ack=0, FlowRetryReset=1, …, FlowInit=4).
+            // The channel Vec is constructed with exactly `Priority::LEVELS` entries.
+            debug_assert!(
+                priority_idx < priority_txs.len(),
+                "priority index out of bounds: idx={priority_idx} levels={}",
+                priority_txs.len(),
+            );
+            let mut slot = MaybeUninit::new(batch);
+
+            // Wait until the slot for this priority level is free.
+            match poll_fn(|cx| priority_txs[priority_idx].poll_send(cx, &mut slot)).await {
+                Ok(()) => {}
+                Err(()) => {
+                    // Distributor (Task 2) is gone; drop the batch and stop.
+                    // SAFETY: `cell::unsync::Sender::poll_send` only reads from `slot`
+                    // (via `assume_init_read`) when returning `Ok`.  On `Err` (receiver
+                    // dropped) and on `Pending` (slot full) the slot is left untouched, so
+                    // the value is still initialised and we must drop it manually here.
+                    unsafe { slot.assume_init_drop() };
+                    break;
+                }
+            }
+        }
+    });
+
+    // Task 2: drain priority lanes in urgency order, apply pacing, route to sockets.
+    spawner.spawn(async move {
+        let rx = PriorityRx::new(priority_rxs);
+        let rx = Paced::new(rx, clock, overall_send_rate);
+        pick_two(rx, socket_senders, random).await;
+    });
 }
 
 /// Per-socket send worker: receives frame batches, assembles packets, sends via socket.
