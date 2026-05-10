@@ -34,10 +34,6 @@
 // * VarInt overflow in next_offset: adding payload_len to next_offset could overflow VarInt
 //   (max 2^62-1) on extremely large streams. Should return an error instead of panicking.
 //
-// * poll_completions processes failures with "last one wins" semantics — if a queue has
-//   both Acknowledged and Failed completions, only the last failure is reported. First
-//   failure should take precedence since it represents the earliest delivery problem.
-//
 // Flow control:
 //
 // * Auto-tune max_inflight_bytes based on completion queue delivery rate. Currently using a
