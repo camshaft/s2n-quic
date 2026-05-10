@@ -118,7 +118,8 @@ async fn execute_request(
         // Write the 8-byte response size header
         writer.write_u64(response_size).await?;
 
-        // Write request body; dropping the writer afterwards signals half-close (FIN)
+        // write_from_fin transmits FIN on the final chunk; writer drop calls shutdown()
+        // as a fallback if FIN hasn't been sent yet (e.g. empty body)
         let mut request = Data::new(request_size);
         while !request.is_finished() {
             writer.write_from_fin(&mut request).await?;

@@ -73,12 +73,13 @@ async fn handle_connection(stream: s2n_quic_dc::stream2::Stream) -> io::Result<(
             }
             total_received += n as u64;
         }
-        // reader drops here, signaling half-close (FIN) on the read side
+        // reader drops here; if the request wasn't fully drained, drop sends STOP_SENDING
         io::Result::Ok(total_received)
     };
 
     let send = async move {
-        // Generate and send response data; dropping the writer afterwards signals half-close (FIN)
+        // write_from_fin transmits FIN on the final chunk; writer drop calls shutdown()
+        // as a fallback if FIN hasn't been sent yet (e.g. empty response)
         let mut response = Data::new(response_size);
         while !response.is_finished() {
             writer.write_from_fin(&mut response).await?;
