@@ -527,7 +527,6 @@ impl s2n_quic_core::buffer::SlotStorage for Filled {
     }
 }
 
-
 impl Filled {
     /// Creates a deep copy of this filled descriptor by allocating a new buffer
     /// and copying the payload bytes. This is safe because the copy gets its own
