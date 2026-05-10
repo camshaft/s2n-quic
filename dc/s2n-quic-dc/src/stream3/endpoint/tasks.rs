@@ -549,7 +549,7 @@ pub async fn packet_dispatch_task<PacketRx, AckTx, Clk>(
     AckTx: crate::socket::channel::UnboundedSender<crate::stream3::endpoint::msg::Sender>,
     Clk: s2n_quic_core::time::Clock + crate::clock::precision::Clock,
 {
-    use crate::socket::channel::{Map, ReceiverExt as _};
+    use crate::socket::channel::{InspectErr, Map, ReceiverExt as _};
     use crate::stream3::endpoint::dispatch;
 
     // Response frames (ACKs sent back to peers) re-enter via the same submission channel.
@@ -557,9 +557,12 @@ pub async fn packet_dispatch_task<PacketRx, AckTx, Clk>(
     let mut response_tx = frame_tx.clone();
     let mut ack_sender = ack_sender;
     let mut queue_dispatcher = queue_dispatcher;
+    let process_counters = counters.clone();
+    let error_counters = counters.clone();
 
     let rx = Map::new(packet_rx, move |packet| {
-        let _ = dispatch::process(
+        process_counters.rx_data_pkt.add(1);
+        dispatch::process(
             packet,
             &mut recv_cache.borrow_mut(),
             &path_secret_map,
@@ -569,8 +572,48 @@ pub async fn packet_dispatch_task<PacketRx, AckTx, Clk>(
             &mut ack_sender,
             &mut queue_dispatcher,
             &clock,
-            &counters,
-        );
+            &process_counters,
+        )
+    });
+    let rx = InspectErr::new(rx, move |err| match err {
+        dispatch::Error::PeerStateLookup {
+            credentials,
+            control_out,
+        } => {
+            error_counters.rx_process_peer_lookup.add(1);
+            let _ = control_out;
+            tracing::warn!(?credentials, "failed to get or create peer state");
+        }
+        dispatch::Error::Decryption {
+            credentials,
+            packet_number,
+        } => {
+            error_counters.rx_process_decryption.add(1);
+            tracing::debug!(
+                ?credentials,
+                pn = packet_number.as_u64(),
+                "failed to decrypt packet - authentication failed"
+            );
+        }
+        dispatch::Error::Duplicate {
+            credentials,
+            packet_number,
+        } => {
+            error_counters.rx_process_duplicate.add(1);
+            tracing::trace!(
+                ?credentials,
+                pn = packet_number.as_u64(),
+                "duplicate packet filtered"
+            );
+        }
+        dispatch::Error::MissingSenderId => {
+            error_counters.rx_process_missing_sender_id.add(1);
+            tracing::warn!("packet missing source_sender_id in routing info");
+        }
+        dispatch::Error::UnsupportedRoutingInfo { routing_info } => {
+            error_counters.rx_process_unsupported_routing.add(1);
+            tracing::warn!(?routing_info, "unsupported datagram routing info");
+        }
     });
     rx.drain_budgeted(Some(budget)).await;
 }
