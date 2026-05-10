@@ -22,7 +22,7 @@ use crate::{
     socket::{channel, pool::descriptor},
     stream3::{
         endpoint::{
-            counters, msg,
+            counters, decode, msg,
             recv::{self, AckState, AttemptDedupError},
             reset_error,
         },
@@ -259,9 +259,45 @@ where
                 counters,
             );
         }
-        RoutingInfo::SenderId { .. } => {
-            // TODO: multi-frame packet dispatch — iterate frame headers in the
-            // application header region and dispatch each frame individually.
+        RoutingInfo::SenderId { source_sender_id } => {
+            // Multi-frame packet: the application header holds per-frame metadata
+            // (Header + optional payload_len). The decrypted buf contains
+            // [application_header][concatenated frame payloads].
+            let app_header_len = packet.application_header().len();
+            let frame_metadata = &buf[..app_header_len];
+            let frame_payloads = &buf[app_header_len..];
+
+            match decode::decode_frames(frame_metadata, frame_payloads) {
+                Ok(decoded) => {
+                    for decoded_frame in decoded {
+                        counters.on_received_frame(&decoded_frame.header);
+                        // Copy the payload into its own allocation so each stream's
+                        // data has an independent lifetime (avoids tying all streams
+                        // together via a shared BytesMut allocation).
+                        let payload = BytesMut::from(decoded_frame.payload);
+                        dispatch_decoded_frame(
+                            decoded_frame.header,
+                            source_sender_id,
+                            payload,
+                            peer,
+                            &credentials,
+                            acceptor_registry,
+                            frame_tx,
+                            queue_dispatcher,
+                            counters,
+                            &mut response_frames,
+                        );
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        %credentials,
+                        packet_number = packet_number.as_u64(),
+                        ?err,
+                        "failed to decode multi-frame packet metadata"
+                    );
+                }
+            }
         }
     }
 
@@ -269,7 +305,139 @@ where
     Ok(())
 }
 
-// ── FlowInit ──────────────────────────────────────────────────────────────
+// ── Multi-frame dispatch ───────────────────────────────────────────────────
+
+/// Dispatch a single frame decoded from a multi-frame `SenderId` packet.
+///
+/// This routes each decoded frame to the same handler as its single-frame
+/// `RoutingInfo` counterpart, using the packet-level `source_sender_id` for
+/// frame types that require it (e.g., FlowInit).
+#[allow(clippy::too_many_arguments)]
+fn dispatch_decoded_frame(
+    header: Header,
+    source_sender_id: VarInt,
+    payload: BytesMut,
+    peer: &mut recv::Context,
+    credentials: &Credentials,
+    acceptor_registry: &acceptor::Registry<Stream>,
+    frame_tx: &SubmissionSender,
+    queue_dispatcher: &mut msg::queue::Dispatcher,
+    counters: &counters::Dispatch,
+    response_frames: &mut Queue<Frame>,
+) {
+    match header {
+        Header::FlowInit {
+            source_queue_id,
+            dest_acceptor_id,
+            attempt_id,
+            stream_id,
+            is_fin,
+        } => {
+            handle_flow_init(
+                peer,
+                credentials,
+                source_sender_id,
+                source_queue_id,
+                dest_acceptor_id,
+                attempt_id,
+                stream_id,
+                is_fin,
+                payload,
+                acceptor_registry,
+                frame_tx,
+                queue_dispatcher,
+                counters,
+                response_frames,
+            );
+        }
+        Header::FlowValidateRequest {
+            dest_sender_id,
+            queue_pair,
+            attempt_id,
+            stream_id,
+        } => {
+            handle_flow_validate_request(
+                &peer.path_entry,
+                credentials,
+                dest_sender_id,
+                queue_pair,
+                attempt_id,
+                stream_id,
+                queue_dispatcher,
+                counters,
+                response_frames,
+            );
+        }
+        Header::FlowInitValidate {
+            queue_pair,
+            attempt_id,
+            stream_id,
+        } => {
+            handle_flow_init_validate(
+                credentials,
+                queue_pair,
+                attempt_id,
+                stream_id,
+                queue_dispatcher,
+                counters,
+                response_frames,
+            );
+        }
+        Header::FlowData {
+            queue_pair,
+            stream_id,
+            offset,
+            is_fin,
+        } => {
+            handle_flow_data(
+                credentials,
+                queue_pair,
+                stream_id,
+                offset,
+                is_fin,
+                payload,
+                queue_dispatcher,
+                counters,
+                response_frames,
+            );
+        }
+        Header::FlowControl { queue_pair, stream_id } => {
+            handle_flow_control(
+                credentials,
+                queue_pair,
+                stream_id,
+                payload,
+                queue_dispatcher,
+                counters,
+                response_frames,
+            );
+        }
+        Header::FlowReset {
+            dest_queue_id,
+            stream_id,
+            reset_target,
+            error_code,
+        } => {
+            handle_flow_reset(
+                credentials,
+                dest_queue_id,
+                stream_id,
+                reset_target,
+                error_code,
+                queue_dispatcher,
+                counters,
+            );
+        }
+        Header::Control { .. } => {
+            // ACK frames carried in multi-frame packets.
+            // TODO: route ACK control frames to the appropriate sender context.
+            tracing::trace!(
+                stream_id = ?credentials.id,
+                "Control frame in multi-frame packet (unhandled)"
+            );
+        }
+    }
+}
 
 fn handle_flow_init(
     peer: &mut recv::Context,
