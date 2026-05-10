@@ -14,6 +14,7 @@ pub(crate) mod reset_error;
 pub(crate) mod routing;
 pub(crate) mod send;
 pub(crate) mod socket;
+pub(crate) mod tasks;
 pub(crate) mod worker;
 
 use crate::{
