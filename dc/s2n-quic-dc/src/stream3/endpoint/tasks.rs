@@ -202,7 +202,10 @@ mod tests {
         PathSecretEntry::fake("127.0.0.1:4433".parse().unwrap(), None)
     }
 
-    fn item(path_secret_entry: Arc<PathSecretEntry>, drop_counter: Arc<AtomicUsize>) -> TestItem {
+    fn new_test_item(
+        path_secret_entry: Arc<PathSecretEntry>,
+        drop_counter: Arc<AtomicUsize>,
+    ) -> TestItem {
         TestItem {
             path_secret_entry,
             byte_cost: 123,
@@ -212,7 +215,7 @@ mod tests {
 
     #[test]
     fn selected_sender_is_polled_before_alternates() {
-        let mut slot = MaybeUninit::new(item(
+        let mut slot = MaybeUninit::new(new_test_item(
             test_path_secret_entry(),
             Arc::new(AtomicUsize::new(0)),
         ));
@@ -237,7 +240,7 @@ mod tests {
 
     #[test]
     fn falls_back_to_alternate_sender_when_selected_sender_is_pending() {
-        let mut slot = MaybeUninit::new(item(
+        let mut slot = MaybeUninit::new(new_test_item(
             test_path_secret_entry(),
             Arc::new(AtomicUsize::new(0)),
         ));
@@ -262,7 +265,7 @@ mod tests {
 
     #[test]
     fn shuts_down_on_sender_error() {
-        let mut slot = MaybeUninit::new(item(
+        let mut slot = MaybeUninit::new(new_test_item(
             test_path_secret_entry(),
             Arc::new(AtomicUsize::new(0)),
         ));
@@ -292,7 +295,7 @@ mod tests {
     fn pick_two_drops_unsent_entry_on_shutdown() {
         let drop_counter = Arc::new(AtomicUsize::new(0));
         let rx = TestReceiver {
-            values: [item(test_path_secret_entry(), drop_counter.clone())].into(),
+            values: [new_test_item(test_path_secret_entry(), drop_counter.clone())].into(),
             consumed: 0,
         };
         let senders = vec![TestSender {
