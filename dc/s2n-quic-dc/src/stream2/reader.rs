@@ -370,7 +370,7 @@ impl Inner {
         }
 
         // Process incoming messages to fill the reassembler
-        let _poll_state = self.poll_stream_rx(cx)?;
+        let _ = self.poll_stream_rx(cx)?;
 
         // Copy from reassembler into destination buffer
         let bytes_read = if buf.remaining_capacity() > 0 {
