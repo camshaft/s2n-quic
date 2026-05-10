@@ -1205,8 +1205,13 @@ mod tests {
             is_fin: false,
         };
         let header_at_64 = Header::FlowData {
+            queue_pair: QueuePair {
+                source_queue_id: inner.control_rx.queue_id(),
+                dest_queue_id: inner.control_rx.remote_queue_id().unwrap(),
+            },
+            stream_id: inner.stream_id,
             offset: VarInt::from_u8(64),
-            ..header_at_63
+            is_fin: false,
         };
 
         assert!(inner.payload_budget_for(&header_at_64) < inner.payload_budget_for(&header_at_63));
