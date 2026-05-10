@@ -229,7 +229,8 @@ fn estimate_segment_len(
     header_buf: &mut Vec<u8>,
     crypto_tag_len: usize,
 ) -> usize {
-    let total_payload_len = encode_frame_metadata(frames, flow_attempt_id, header_buf);
+    let mut flow_attempt_id = flow_attempt_id;
+    let total_payload_len = encode_frame_metadata(frames, &mut flow_attempt_id, header_buf);
     let header_len = VarInt::new(header_buf.len() as u64).expect("header length fits in VarInt");
     let payload_len =
         VarInt::new(total_payload_len as u64).expect("payload length fits in VarInt");
@@ -267,8 +268,7 @@ fn encode_segment<S: seal::Application>(
     let routing_info = RoutingInfo::SenderId { source_sender_id };
 
     // Build the application header: per-frame metadata entries
-    let total_payload_len = encode_frame_metadata(frames, *flow_attempt_id, header_buf);
-    *flow_attempt_id = advance_flow_attempt_id(*flow_attempt_id, frames);
+    let total_payload_len = encode_frame_metadata(frames, flow_attempt_id, header_buf);
 
     let header_len = VarInt::try_from(header_buf.len() as u64).unwrap_or(VarInt::ZERO);
     let payload_len_varint = VarInt::try_from(total_payload_len as u64).unwrap_or(VarInt::ZERO);
@@ -294,14 +294,14 @@ fn encode_segment<S: seal::Application>(
 
 fn encode_frame_metadata(
     frames: &Queue<Frame>,
-    mut flow_attempt_id: VarInt,
+    flow_attempt_id: &mut VarInt,
     header_buf: &mut Vec<u8>,
 ) -> usize {
     header_buf.clear();
     let mut total_payload_len = 0usize;
 
     for frame in frames.iter() {
-        let header = stamp_attempt_id(&frame.header, &mut flow_attempt_id);
+        let header = stamp_attempt_id(&frame.header, flow_attempt_id);
         let payload_len = VarInt::try_from(frame.payload_len() as u64).unwrap_or(VarInt::ZERO);
         let entry_size = header.encoding_size() + payload_len.encoding_size();
         let start = header_buf.len();
@@ -315,14 +315,6 @@ fn encode_frame_metadata(
     }
 
     total_payload_len
-}
-
-fn advance_flow_attempt_id(mut flow_attempt_id: VarInt, frames: &Queue<Frame>) -> VarInt {
-    for frame in frames.iter() {
-        let _ = stamp_attempt_id(&frame.header, &mut flow_attempt_id);
-    }
-
-    flow_attempt_id
 }
 
 /// Produce a Header with attempt_id stamped for FlowInit frames.
@@ -722,12 +714,17 @@ mod tests {
     #[test]
     fn assemble_fuzz_respects_gso_invariants() {
         let mtu = 256;
+        const MAX_TEST_FRAMES: usize = segment::MAX_COUNT * 2;
 
         check!()
             .with_type::<Vec<FrameSpec>>()
             .with_test_time(Duration::from_secs(10))
             .for_each(|specs| {
-                let specs = specs.iter().take(segment::MAX_COUNT * 2).cloned().collect::<Vec<_>>();
+                let specs = specs
+                    .iter()
+                    .take(MAX_TEST_FRAMES)
+                    .cloned()
+                    .collect::<Vec<_>>();
                 let (mut context, entry) = make_context(mtu);
                 let clock = FixedClock(precision::Timestamp { nanos: 1_000 });
                 let pool = pool::Pool::new(u16::MAX);
@@ -772,7 +769,7 @@ mod tests {
                     assert_gso_invariants(&segments, mtu);
                     context.cca = crate::congestion::Controller::new(mtu);
                     batches += 1;
-                    assert!(batches <= segment::MAX_COUNT * 2);
+                    assert!(batches <= MAX_TEST_FRAMES);
                 }
             });
     }
