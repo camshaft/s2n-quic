@@ -717,15 +717,19 @@ impl Inner {
                 break;
             }
 
+            let remaining_offset_capacity = self.remaining_offset_capacity();
+            if !need_fin_packet && remaining_offset_capacity == 0 {
+                if written == 0 {
+                    return Err(offset_overflow_error());
+                }
+                break;
+            }
+
             let available = self.min_send_budget();
             if !need_fin_packet && available == 0 {
                 break;
             }
 
-            let remaining_offset_capacity = self.remaining_offset_capacity();
-            if !need_fin_packet && remaining_offset_capacity == 0 {
-                return Err(offset_overflow_error());
-            }
             let chunk_len = if need_fin_packet {
                 0
             } else {
@@ -1121,5 +1125,23 @@ mod tests {
         let sent = sent.iter().collect::<Vec<_>>();
         assert_eq!(sent.len(), 1);
         assert_eq!(sent[0].payload.len(), 1);
+    }
+
+    #[test]
+    fn send_data_returns_error_before_consuming_when_offset_is_max() {
+        let (mut inner, mut frame_rx) = new_test_inner();
+        inner.next_offset = VarInt::MAX;
+        inner.remote_max_data = VarInt::MAX;
+
+        let mut buf = &b"x"[..];
+        let err = inner.send_data(&mut buf, false).unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(buf, b"x");
+        assert_eq!(inner.next_offset, VarInt::MAX);
+        assert_eq!(inner.inflight_bytes, 0);
+
+        let mut cx = noop_cx();
+        assert!(matches!(frame_rx.poll_recv(&mut cx), Poll::Pending));
     }
 }
