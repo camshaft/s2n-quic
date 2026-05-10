@@ -54,6 +54,14 @@ impl Stream {
     }
 
     #[inline]
+    pub async fn read_into_until_end<S>(&mut self, buf: &mut S) -> io::Result<usize>
+    where
+        S: buffer::writer::Storage,
+    {
+        self.read.read_into_until_end(buf).await
+    }
+
+    #[inline]
     pub async fn write_from<S>(&mut self, buf: &mut S) -> io::Result<usize>
     where
         S: buffer::reader::storage::Infallible,

@@ -295,6 +295,29 @@ impl Reader {
     {
         waker::debug_assert_contract(cx, |cx| self.0.poll_read_into(cx, buf))
     }
+
+    /// Read data into a buffer only after the full stream payload has been received.
+    ///
+    /// This mode buffers all incoming data in the reassembler until FIN + all bytes are present.
+    /// While waiting, the reader advertises maximal receive credit to avoid sender stalls.
+    pub async fn read_into_until_end<S>(&mut self, buf: &mut S) -> io::Result<usize>
+    where
+        S: buffer::writer::Storage,
+    {
+        core::future::poll_fn(|cx| self.poll_read_into_until_end(cx, buf)).await
+    }
+
+    /// Poll-based read in until-end mode.
+    pub fn poll_read_into_until_end<S>(
+        &mut self,
+        cx: &mut Context,
+        buf: &mut S,
+    ) -> Poll<io::Result<usize>>
+    where
+        S: buffer::writer::Storage,
+    {
+        waker::debug_assert_contract(cx, |cx| self.0.poll_read_into_until_end(cx, buf))
+    }
 }
 
 impl Inner {
@@ -357,6 +380,75 @@ impl Inner {
         };
 
         self.maybe_send_max_data()?;
+
+        if self.reassembler.is_reading_complete() {
+            debug!(
+                stream_id = self.stream_id.as_u64(),
+                final_size = ?self.reassembler.final_size(),
+                consumed_len = self.reassembler.consumed_len(),
+                "Reader complete - all data consumed"
+            );
+            self.status.on_complete().ok();
+            return Poll::Ready(Ok(bytes_read));
+        }
+
+        if bytes_read > 0 {
+            Poll::Ready(Ok(bytes_read))
+        } else {
+            Poll::Pending
+        }
+    }
+
+    fn poll_read_into_until_end<S>(
+        &mut self,
+        cx: &mut Context,
+        buf: &mut S,
+    ) -> Poll<io::Result<usize>>
+    where
+        S: buffer::writer::Storage,
+    {
+        // Must validate before reading
+        if self.status.is_pending_validation() {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "stream not yet validated - call validate() first",
+            )));
+        }
+
+        // Check if we're in a terminal state
+        if self.status.is_reset() {
+            if let Some(error_code) = self.reset_error_code {
+                let reset_error: ResetError = error_code.into();
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::ConnectionReset,
+                    reset_error,
+                )));
+            }
+            return Poll::Ready(Err(io::ErrorKind::ConnectionReset.into()));
+        }
+
+        if self.status.is_complete() {
+            return Poll::Ready(Ok(0));
+        }
+
+        // In until-end mode, grant maximal credit so the peer can finish sending.
+        self.maybe_send_unbounded_max_data()?;
+
+        // Process incoming messages and keep buffering until all stream bytes are present.
+        let _ = self.poll_stream_rx(cx)?;
+
+        if !self.reassembler.is_writing_complete() {
+            return Poll::Pending;
+        }
+
+        // Copy from reassembler into destination buffer once full payload is buffered.
+        let bytes_read = if buf.remaining_capacity() > 0 {
+            let mut tracker = buf.track_write();
+            self.reassembler.infallible_copy_into(&mut tracker);
+            tracker.written_len()
+        } else {
+            0
+        };
 
         if self.reassembler.is_reading_complete() {
             debug!(
@@ -527,6 +619,22 @@ impl Inner {
             );
         }
 
+        Ok(())
+    }
+
+    /// In until-end mode, advertise maximal receive credit so the peer can complete transmission.
+    fn maybe_send_unbounded_max_data(&mut self) -> io::Result<()> {
+        if self.remote_max_data == VarInt::MAX {
+            return Ok(());
+        }
+
+        // Can't send MAX_DATA before we know the peer's queue ID.
+        if self.stream_rx.remote_queue_id().is_none() {
+            return Ok(());
+        }
+
+        self.send_max_data(VarInt::MAX)?;
+        self.remote_max_data = VarInt::MAX;
         Ok(())
     }
 
