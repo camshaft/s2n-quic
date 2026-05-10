@@ -181,7 +181,7 @@ where
                 let random_fn = move |n: usize| {
                     let mut bytes = [0u8; 8];
                     random.borrow_mut().public_random_fill(&mut bytes);
-                    let raw = usize::from_le_bytes(bytes);
+                    let raw = u64::from_le_bytes(bytes) as usize;
                     // Sender counts are always powers of two, so we can use a cheap
                     // bitwise mask rather than a more expensive modulo operation.
                     debug_assert!(n.is_power_of_two(), "sender count must be a power of two");

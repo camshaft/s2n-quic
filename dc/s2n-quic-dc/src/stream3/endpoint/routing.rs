@@ -125,7 +125,12 @@ where
     ) -> Result<(), super::msg::Sender> {
         match &msg {
             super::msg::Sender::Ack { local_sender_id, .. } => {
-                let idx = local_sender_id.as_u64() as usize;
+                let idx = match usize::try_from(local_sender_id.as_u64()) {
+                    Ok(idx) => idx,
+                    // A sender ID that doesn't fit in usize cannot be a valid socket index on this
+                    // platform; treat it as an unroutable ACK and drop it.
+                    Err(_) => return Err(msg),
+                };
                 match self.inner.get_mut(idx) {
                     Some(tx) => tx.send(msg),
                     None => Err(msg),

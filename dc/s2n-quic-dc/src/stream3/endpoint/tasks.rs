@@ -338,15 +338,6 @@ pub async fn frame_dispatch<S, Rand>(
     S: Sender<FrameBatch>,
     Rand: Fn(usize) -> usize,
 {
-    // Register the receiver's waker before first poll so senders can wake us up.
-    let mut pending_rx = Some(frame_rx);
-    let frame_rx = core::future::poll_fn(|cx| {
-        let rx = pending_rx.take().unwrap();
-        rx.register(cx.waker());
-        Poll::Ready(rx)
-    })
-    .await;
-
     let rx = crate::socket::channel::FlattenList::new(frame_rx);
     let rx = BatchFramesByPathSecret::new(rx);
     pick_two(rx, socket_senders, random).await;
@@ -402,8 +393,8 @@ pub async fn frame_dispatch<S, Rand>(
 /// - **Metrics**: `tx` packet counter, `tx:bytes` byte counter, per-socket queue depth gauge.
 pub async fn socket_send_task<Socket, BatchRx, AckRx>(
     _socket: Socket,
-    _batch_rx: BatchRx,
-    _ack_rx: AckRx,
+    mut batch_rx: BatchRx,
+    mut ack_rx: AckRx,
     _sender_idx: usize,
     _source_control_port: u16,
     _gso: s2n_quic_platform::features::Gso,
@@ -413,7 +404,21 @@ pub async fn socket_send_task<Socket, BatchRx, AckRx>(
     BatchRx: Receiver<FrameBatch>,
     AckRx: Receiver<crate::intrusive_queue::Entry<crate::stream3::endpoint::msg::Sender>>,
 {
-    todo!("socket_send_task: assemble frames and send via socket — see stream3 send-path TODO")
+    // TODO: implement the full send pipeline (see doc comment above for all stages).
+    // For now, drain and discard all incoming batches and ACKs so that the endpoint can run
+    // without panicking, and so that channels don't back up. This is intentionally a no-op
+    // stub until the send path is implemented.
+    use crate::socket::channel::ReceiverExt as _;
+    use core::future;
+
+    future::poll_fn(|cx| {
+        // Drain batch channel
+        while let core::task::Poll::Ready(Some(_)) = batch_rx.poll_recv(cx) {}
+        // Drain ACK channel
+        while let core::task::Poll::Ready(Some(_)) = ack_rx.poll_recv(cx) {}
+        core::task::Poll::Pending
+    })
+    .await
 }
 
 /// Per-socket receive worker: reads raw UDP segments and routes decoded packets to dispatch.
