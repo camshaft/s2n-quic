@@ -54,8 +54,11 @@ impl Stream {
     }
 
     #[inline]
-    pub async fn wait_for_buffered_len(&mut self, len: usize) -> io::Result<usize> {
-        self.read.wait_for_buffered_len(len).await
+    pub async fn wait_for_buffered_len<S>(&mut self, target: &mut S, len: usize) -> io::Result<usize>
+    where
+        S: buffer::writer::Storage,
+    {
+        self.read.wait_for_buffered_len(target, len).await
     }
 
     #[inline]

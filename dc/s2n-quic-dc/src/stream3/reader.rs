@@ -251,21 +251,44 @@ impl Reader {
         core::future::poll_fn(|cx| self.poll_read_into(cx, buf)).await
     }
 
-    /// Wait until at least `len` bytes are buffered and readable.
+    /// Wait until at least `len` bytes have been copied into `target`.
     ///
     /// This proactively opens remote flow control to permit buffering up to `len` bytes beyond
-    /// the current consumed offset. The returned value is the currently buffered readable bytes,
-    /// which may be less than `len` if the stream reaches FIN before that amount is available.
-    pub async fn wait_for_buffered_len(&mut self, len: usize) -> io::Result<usize> {
-        core::future::poll_fn(|cx| self.poll_wait_for_buffered_len(cx, len)).await
+    /// the current consumed offset while allowing direct interposed writes into `target`.
+    /// The returned value is the amount actually copied, which may be less than `len` if the
+    /// stream reaches FIN before that amount is available.
+    pub async fn wait_for_buffered_len<S>(&mut self, target: &mut S, len: usize) -> io::Result<usize>
+    where
+        S: buffer::writer::Storage,
+    {
+        let mut copied_len = 0usize;
+
+        while copied_len < len {
+            let step_len = core::future::poll_fn(|cx| {
+                self.poll_wait_for_buffered_len(cx, target, len.saturating_sub(copied_len))
+            })
+            .await?;
+
+            copied_len = copied_len.saturating_add(step_len);
+
+            if step_len == 0 || self.0.reassembler.is_writing_complete() {
+                break;
+            }
+        }
+
+        Ok(copied_len)
     }
 
-    pub fn poll_wait_for_buffered_len(
+    pub fn poll_wait_for_buffered_len<S>(
         &mut self,
         cx: &mut Context,
+        target: &mut S,
         len: usize,
-    ) -> Poll<io::Result<usize>> {
-        waker::debug_assert_contract(cx, |cx| self.0.poll_wait_for_buffered_len(cx, len))
+    ) -> Poll<io::Result<usize>>
+    where
+        S: buffer::writer::Storage,
+    {
+        waker::debug_assert_contract(cx, |cx| self.0.poll_wait_for_buffered_len(cx, target, len))
     }
 
     pub fn poll_read_into<S>(&mut self, cx: &mut Context, buf: &mut S) -> Poll<io::Result<usize>>
@@ -277,11 +300,15 @@ impl Reader {
 }
 
 impl Inner {
-    fn poll_wait_for_buffered_len(
+    fn poll_wait_for_buffered_len<S>(
         &mut self,
         cx: &mut Context,
+        target: &mut S,
         len: usize,
-    ) -> Poll<io::Result<usize>> {
+    ) -> Poll<io::Result<usize>>
+    where
+        S: buffer::writer::Storage,
+    {
         if self.status.is_pending_validation() {
             return Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -300,17 +327,24 @@ impl Inner {
             return Poll::Ready(Err(io::ErrorKind::ConnectionReset.into()));
         }
 
-        self.open_flow_control_for_buffered_len(len)?;
-
-        if self.reassembler.len() >= len || self.reassembler.is_writing_complete() {
-            return Poll::Ready(Ok(self.reassembler.len()));
+        if len == 0 {
+            return Poll::Ready(Ok(0));
         }
 
-        let mut app_buf = buffer::writer::storage::Empty;
-        let _ = self.poll_stream_rx(cx, &mut app_buf)?;
+        self.open_flow_control_for_buffered_len(len)?;
 
-        if self.reassembler.len() >= len || self.reassembler.is_writing_complete() {
-            Poll::Ready(Ok(self.reassembler.len()))
+        let mut tracker = target.track_write();
+        let _ = self.poll_stream_rx(cx, &mut tracker)?;
+
+        if tracker.has_remaining_capacity() {
+            self.reassembler.infallible_copy_into(&mut tracker);
+        }
+
+        let bytes_copied = tracker.written_len();
+        self.maybe_send_max_data()?;
+
+        if bytes_copied > 0 || self.reassembler.is_writing_complete() {
+            Poll::Ready(Ok(bytes_copied))
         } else {
             Poll::Pending
         }
@@ -813,11 +847,13 @@ mod tests {
         });
         let waker = waker::noop();
         let mut cx = core::task::Context::from_waker(&waker);
+        let mut out = Vec::new();
 
-        match reader.poll_wait_for_buffered_len(&mut cx, 8) {
+        match reader.poll_wait_for_buffered_len(&mut cx, &mut out, 8) {
             Poll::Ready(Ok(len)) => assert_eq!(len, 8),
             other => panic!("unexpected poll result: {other:?}"),
         }
+        assert_eq!(out, expected);
 
         Ok(())
     }
@@ -832,11 +868,13 @@ mod tests {
         });
         let waker = waker::noop();
         let mut cx = core::task::Context::from_waker(&waker);
+        let mut out = Vec::new();
 
-        match reader.poll_wait_for_buffered_len(&mut cx, 16) {
+        match reader.poll_wait_for_buffered_len(&mut cx, &mut out, 16) {
             Poll::Ready(Ok(len)) => assert_eq!(len, 8),
             other => panic!("unexpected poll result: {other:?}"),
         }
+        assert_eq!(out, expected);
 
         Ok(())
     }
