@@ -53,7 +53,8 @@ where
         let sent = poll_fn(|cx| try_send_pick_two(cx, &mut slot, &mut senders, &random)).await;
 
         if !sent {
-            // SAFETY: `slot` is initialized with `entry` and only consumed by successful send.
+            // SAFETY: `slot` is initialized above with `MaybeUninit::new(entry)` and only
+            // consumed by successful send.
             unsafe { slot.assume_init_drop() };
             break;
         }
@@ -201,7 +202,7 @@ mod tests {
     fn test_path_secret_entry() -> Arc<PathSecretEntry> {
         let peer = "127.0.0.1:4433"
             .parse()
-            .expect("hardcoded loopback peer address should parse");
+            .expect("failed to parse hardcoded loopback address 127.0.0.1:4433");
         PathSecretEntry::fake(peer, None)
     }
 
