@@ -558,11 +558,6 @@ pub async fn packet_dispatch_task<PacketRx, AckTx, Clk>(
         let mut response_tx = frame_tx.clone();
         let mut ack_sender = ack_sender;
         let mut queue_dispatcher = queue_dispatcher;
-        let recv_cache = recv_cache;
-        let path_secret_map = path_secret_map;
-        let acceptor_registry = acceptor_registry;
-        let frame_tx = frame_tx;
-        let clock = clock;
         let counters = counters.clone();
 
         move |packet| {
