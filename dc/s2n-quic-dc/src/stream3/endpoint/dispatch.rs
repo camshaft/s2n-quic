@@ -817,7 +817,7 @@ fn handle_flow_init_validate(
                         attempt_id = attempt_id.as_u64(),
                         stream_id = stream_id.as_u64(),
                         queue_id = local_queue_id.as_u64(),
-                        "FlowInitValidate failed to send FlowValidated - sending FlowReset"
+                        "FlowInitValidate failed to send FlowValidated - sending reset"
                     );
                     push_reset_frame(
                         response_frames,
@@ -836,7 +836,7 @@ fn handle_flow_init_validate(
                 attempt_id = attempt_id.as_u64(),
                 stream_id = stream_id.as_u64(),
                 queue_id = local_queue_id.as_u64(),
-                "FlowInitValidate validation failed - sending FlowReset"
+                "FlowInitValidate validation failed - sending reset"
             );
             push_reset_frame(
                 response_frames,
