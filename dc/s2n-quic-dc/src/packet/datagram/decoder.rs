@@ -99,6 +99,15 @@ impl Meta {
         self.packet_number.as_u64()
     }
 
+    /// Returns the length of the outer packet header (everything before the application header).
+    ///
+    /// This is derived directly from the already-validated `header` and `application_header`
+    /// ranges, so it can never underflow once the packet has been successfully decoded.
+    #[inline]
+    pub fn outer_header_len(&self) -> usize {
+        self.header.len() - self.application_header.len()
+    }
+
     /// Combine this metadata with storage to create a Packet
     #[inline]
     pub fn with_storage<S: storage::Bytes>(self, storage: S) -> Result<Packet<S>, (Self, S)> {

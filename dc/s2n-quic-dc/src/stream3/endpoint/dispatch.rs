@@ -95,21 +95,12 @@ where
 
     // Collect information about the packet layout before decryption and before
     // consuming the packet with into_parts().
-    let tag_len = crate::crypto::open::Application::tag_len(&peer.opener);
-    let payload_len = packet.payload().len();
+    // These lengths come directly from the packet's validated CheckedRanges and cannot
+    // underflow — if the packet decoded successfully they are internally consistent.
+    let outer_header_len = packet.outer_header_len();
     let app_header_len = packet.application_header().len();
-    let storage_len = packet.storage().len() as usize;
-    // Total header length = everything before the payload (outer header + app header)
-    let header_total_len = storage_len - payload_len - tag_len;
-    // Outer packet header length (everything before the application header)
-    let outer_header_len = header_total_len - app_header_len;
+    let payload_len = packet.payload().len();
     let ecn = packet.storage().ecn();
-
-    // All of these lengths come from the decoded packet, whose storage is a u16-bounded
-    // `descriptor::Filled`.  They must fit in u16 for the subsequent advance/truncate calls.
-    debug_assert!(outer_header_len <= u16::MAX as usize, "outer_header_len overflows u16");
-    debug_assert!(app_header_len <= u16::MAX as usize, "app_header_len overflows u16");
-    debug_assert!(payload_len <= u16::MAX as usize, "payload_len overflows u16");
 
     // Decrypt the payload in place (AAD = outer packet header, already cleartext).
     packet

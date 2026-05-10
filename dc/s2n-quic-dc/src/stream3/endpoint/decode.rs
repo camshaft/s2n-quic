@@ -235,7 +235,7 @@ mod tests {
     }
 
     #[test]
-    fn payload_length_mismatch_returns_error() {
+    fn iterator_yields_claimed_payload_len() {
         let header = Header::FlowData {
             queue_pair: QueuePair {
                 source_queue_id: VarInt::ZERO,
@@ -245,15 +245,15 @@ mod tests {
             offset: VarInt::ZERO,
             is_fin: false,
         };
-        // Encode a header claiming a 100-byte payload
+        // Encode a header claiming a 100-byte payload.
+        // The iterator decodes only the metadata; payload consumption is the caller's job.
         let mut app_header = Vec::new();
         push_frame_metadata(&mut app_header, &header, 100);
-        // The iterator itself decodes header + length; payload consumption is the caller's job.
-        let result: Result<Vec<_>, _> = decode_frames(&app_header).collect();
-        // The metadata is well-formed, so the iterator succeeds; the caller detects underflow.
-        assert!(result.is_ok(), "metadata decode should succeed");
-        let frames = result.unwrap();
+        let frames: Vec<_> = decode_frames(&app_header)
+            .collect::<Result<_, _>>()
+            .expect("well-formed metadata must decode");
         assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].0, header);
         assert_eq!(frames[0].1, 100); // payload_len reported by iterator
     }
 }
