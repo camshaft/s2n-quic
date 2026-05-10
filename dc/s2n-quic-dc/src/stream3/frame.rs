@@ -362,7 +362,6 @@ impl<'a> s2n_codec::DecoderValue<'a> for Header {
             }
             _ => {
                 decoder_invariant!(false, "unknown frame header type");
-                #[allow(unreachable_code)]
                 Err(s2n_codec::DecoderError::InvariantViolation(
                     "unknown frame header type",
                 ))
