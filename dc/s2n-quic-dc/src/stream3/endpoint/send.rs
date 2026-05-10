@@ -108,12 +108,24 @@ impl Context {
     #[inline]
     pub fn pop_pending(&mut self) -> Option<intrusive_queue::Entry<Frame>> {
         let frame = self.pending.pop_front()?;
-        self.pending_bytes = self.pending_bytes.saturating_sub(frame.payload_len());
+        let len = frame.payload_len();
+        debug_assert!(
+            self.pending_bytes >= len,
+            "pending_bytes underflow: counter={} frame_payload={}",
+            self.pending_bytes,
+            len
+        );
+        self.pending_bytes = self.pending_bytes.saturating_sub(len);
         Some(frame)
     }
 
-    /// Push a frame back to the front of the pending queue (e.g. when it doesn't fit in
-    /// the current segment), updating the byte counter.
+    /// Push a frame back to the front of the pending queue, updating the byte counter.
+    ///
+    /// This should only be called with a frame that was just removed from this queue via
+    /// [`pop_pending`] — for example when a frame does not fit in the current segment and
+    /// must be returned so the next assembly round can try again. Calling this with a
+    /// frame that was *not* previously popped will double-count its payload bytes in
+    /// `pending_bytes`.
     #[inline]
     pub fn push_front_pending(&mut self, frame: intrusive_queue::Entry<Frame>) {
         self.pending_bytes += frame.payload_len();
