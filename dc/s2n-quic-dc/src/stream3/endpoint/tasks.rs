@@ -54,7 +54,7 @@ fn frame_entry_byte_cost(frame: &Frame) -> u64 {
             Ok(payload_len) => payload_len.encoding_size() as u64,
             Err(_) => {
                 debug_assert!(
-                    false,
+                    payload_len > VarInt::MAX.as_u64(),
                     "frame payload length exceeds VarInt::MAX: {}",
                     payload_len
                 );
@@ -103,21 +103,25 @@ impl FrameBatch {
         self.queue.push_back(frame);
     }
 
+    /// Returns the number of frames currently buffered in this batch.
     #[inline]
     pub fn len(&self) -> usize {
         self.queue.len()
     }
 
+    /// Returns true when this batch contains no frames.
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.queue.is_empty()
     }
 
+    /// Borrows the underlying intrusive queue of frames.
     #[inline]
     pub fn queue(&self) -> &Queue<Frame> {
         &self.queue
     }
 
+    /// Consumes the batch and returns the underlying frame queue.
     #[inline]
     pub fn into_queue(self) -> Queue<Frame> {
         self.queue
