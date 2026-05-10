@@ -277,7 +277,7 @@ impl Entry {
             return Duration::ZERO;
         }
 
-        let queued_bytes = queued_bytes.min(u64::MAX as usize) as u64;
+        let queued_bytes = u64::try_from(queued_bytes).unwrap_or(u64::MAX);
         let delay: Duration = queued_bytes / bandwidth;
         delay
     }
