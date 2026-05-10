@@ -106,6 +106,7 @@ use s2n_quic_core::{
         duplex::Interposer,
         reader::{storage::Infallible as _, Incremental},
         reassembler::Reassembler,
+        writer::Storage as _,
         writer::Writer as _,
     },
     frame::MaxData,
@@ -289,7 +290,13 @@ impl Inner {
     where
         S: buffer::writer::Storage,
     {
-        let _ = self.poll_stream_rx(cx, Some(buf))?;
+        let mut tracker = buf.track_write();
+        let app_buf = if self.status.is_pending_validation() {
+            None
+        } else {
+            Some(&mut tracker)
+        };
+        let _ = self.poll_stream_rx(cx, app_buf)?;
 
         if self.status.is_pending_validation() {
             return Poll::Ready(Err(io::Error::new(
@@ -310,16 +317,14 @@ impl Inner {
         }
 
         if self.status.is_complete() {
-            return Poll::Ready(Ok(0));
+            return Poll::Ready(Ok(tracker.written_len()));
         }
 
-        let bytes_read = if buf.remaining_capacity() > 0 {
-            let mut tracker = buf.track_write();
+        if tracker.has_remaining_capacity() {
             self.reassembler.infallible_copy_into(&mut tracker);
-            tracker.written_len()
-        } else {
-            0
-        };
+        }
+
+        let bytes_read = tracker.written_len();
 
         self.maybe_send_max_data()?;
 
@@ -612,8 +617,56 @@ impl tokio::io::AsyncRead for Reader {
 
 #[cfg(test)]
 mod tests {
-    use super::write_data_reader;
-    use s2n_quic_core::{buffer::Reassembler, stream::testing::Data};
+    use super::{msg, write_data_reader, Reader};
+    use crate::{
+        flow,
+        path::secret::map::Entry as PathSecretEntry,
+        socket::pool::{self, descriptor},
+        stream3::frame::{Frame, SubmissionSender},
+    };
+    use core::{convert::Infallible, task::Poll};
+    use s2n_quic_core::{
+        buffer::Reassembler,
+        endpoint,
+        stream::testing::Data,
+        task::waker,
+        varint::VarInt,
+    };
+    use std::{io, net::SocketAddr};
+
+    fn test_frame_tx() -> SubmissionSender {
+        let (frame_tx, frame_rx) =
+            crate::socket::channel::intrusive_queue::sharded::new::<Frame>(1);
+        let waker = waker::noop();
+        frame_rx.register(&waker);
+        frame_tx
+    }
+
+    fn filled_payload(data: &[u8]) -> descriptor::Filled {
+        let pool = pool::Pool::new(data.len().try_into().unwrap());
+        let unfilled = pool.alloc().unwrap();
+        let segments = unfilled
+            .fill_with(|_addr, _cmsg, mut payload| {
+                payload[..data.len()].copy_from_slice(data);
+                Result::<_, Infallible>::Ok(data.len())
+            })
+            .unwrap();
+        segments.take_filled()
+    }
+
+    fn test_reader(msg: msg::Stream) -> Reader {
+        let stream_id = VarInt::from_u8(1);
+        let peer: SocketAddr = "127.0.0.1:4433".parse().unwrap();
+        let path_secret_entry = PathSecretEntry::fake_deterministic(peer, endpoint::Type::Client);
+        let handle = flow::Handle::client(stream_id, path_secret_entry.clone());
+        let allocator = msg::queue::Allocator::new();
+        let (_control, stream_rx) = allocator
+            .alloc(handle, Some(VarInt::from_u8(2)))
+            .expect("queue alloc should succeed");
+        stream_rx.push(msg.into());
+
+        Reader::new_client(test_frame_tx(), path_secret_entry, stream_id, stream_rx)
+    }
 
     #[test]
     fn write_data_reader_bypasses_reassembler_for_in_order_data() {
@@ -664,5 +717,27 @@ mod tests {
         assert_eq!(reassembler.len(), 8);
         assert_eq!(reassembler.total_received_len(), 8);
         assert!(!reassembler.is_empty());
+    }
+
+    #[test]
+    fn poll_read_into_counts_direct_interposer_writes() -> io::Result<()> {
+        let expected = Data::send_one_at(0, 8);
+        let mut reader = test_reader(msg::Stream::Data {
+            offset: VarInt::ZERO,
+            fin: true,
+            payload: filled_payload(&expected),
+        });
+        let waker = waker::noop();
+        let mut cx = core::task::Context::from_waker(&waker);
+        let mut out = Vec::new();
+
+        match reader.poll_read_into(&mut cx, &mut out) {
+            Poll::Ready(Ok(len)) => assert_eq!(len, 8),
+            other => panic!("unexpected first poll result: {other:?}"),
+        }
+        assert_eq!(out, expected);
+        assert!(reader.0.status.is_complete());
+
+        Ok(())
     }
 }
