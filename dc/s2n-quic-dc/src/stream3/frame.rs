@@ -17,6 +17,7 @@ use crate::{
     byte_vec::ByteVec,
     clock::precision,
     datagram::batch::Priority,
+    intrusive_queue::{Entry, Queue},
     packet::datagram::{QueuePair, ResetTarget},
     path::secret::map::Entry as PathSecretEntry,
     socket::channel::{intrusive_queue::datagram_completion, ByteCost},
@@ -34,13 +35,87 @@ pub type CompletionSender = datagram_completion::Sender<Frame>;
 /// Completion channel receiver typed on Frame.
 pub type CompletionReceiver = datagram_completion::Receiver<Frame>;
 
+/// Shard-local storage for the frame submission channel.
+///
+/// Each [`Priority`] level gets its own intrusive queue.  Senders pre-sort frames into the
+/// correct priority bucket at submission time; the receiver performs a single [`poll_swap`] to
+/// atomically obtain all per-priority queues at O(Priority::LEVELS) cost — no per-frame
+/// iteration needed to categorize received frames.
+///
+/// [`poll_swap`]: crate::socket::channel::intrusive_queue::sharded::Receiver::poll_swap
+pub struct PriorityStorage {
+    pub queues: [Queue<Frame>; Priority::LEVELS],
+}
+
+impl Default for PriorityStorage {
+    fn default() -> Self {
+        Self {
+            queues: std::array::from_fn(|_| Queue::new()),
+        }
+    }
+}
+
+impl crate::socket::channel::intrusive_queue::sharded::Storage<
+    crate::intrusive_queue::EntryAdapter<Frame>,
+> for PriorityStorage
+{
+    type Input = Self;
+
+    #[inline(always)]
+    fn is_empty(&self) -> bool {
+        self.queues.iter().all(Queue::is_empty)
+    }
+
+    #[inline(always)]
+    fn input_is_empty(input: &Self) -> bool {
+        input.is_empty()
+    }
+
+    #[inline(always)]
+    fn append(&mut self, other: &mut Self) {
+        for (dst, src) in self.queues.iter_mut().zip(other.queues.iter_mut()) {
+            dst.append(src);
+        }
+    }
+}
+
+impl PriorityStorage {
+    /// Inserts `frame` into the priority bucket matching its [`Frame::priority`].
+    #[inline]
+    pub fn push(&mut self, frame: Entry<Frame>) {
+        let idx = frame.priority().as_index();
+        // SAFETY: Priority::as_index() is in 0..Priority::LEVELS and queues has exactly
+        // Priority::LEVELS entries.
+        unsafe { self.queues.get_unchecked_mut(idx) }.push_back(frame);
+    }
+
+    /// Iterates over all frames across all priority buckets, highest priority first.
+    pub fn iter(&self) -> impl Iterator<Item = &Frame> {
+        self.queues.iter().flat_map(|q| q.iter())
+    }
+}
+
+impl core::fmt::Debug for PriorityStorage {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let mut list = f.debug_list();
+        for frame in self.iter() {
+            list.entry(frame);
+        }
+        list.finish()
+    }
+}
+
 /// Submission channel sender typed on Frame.
-pub type SubmissionSender =
-    crate::socket::channel::intrusive_queue::sharded::Sender<crate::intrusive_queue::EntryAdapter<Frame>>;
+pub type SubmissionSender = crate::socket::channel::intrusive_queue::sharded::Sender<
+    crate::intrusive_queue::EntryAdapter<Frame>,
+    PriorityStorage,
+>;
 
 /// Submission channel receiver typed on Frame.
-pub type SubmissionReceiver =
-    crate::socket::channel::intrusive_queue::sharded::Receiver<crate::intrusive_queue::EntryAdapter<Frame>>;
+pub type SubmissionReceiver = crate::socket::channel::intrusive_queue::sharded::Receiver<
+    crate::intrusive_queue::EntryAdapter<Frame>,
+    PriorityStorage,
+>;
 
 /// Creates a new frame submission channel.
 ///
@@ -48,7 +123,36 @@ pub type SubmissionReceiver =
 /// at the cost of receiver bookkeeping. A good default is the number of workers rounded up to the
 /// next power of two, multiplied by a small constant (e.g. 4).
 pub fn submission_channel(shard_count: usize) -> (SubmissionSender, SubmissionReceiver) {
-    crate::socket::channel::intrusive_queue::sharded::new::<Frame>(shard_count)
+    crate::socket::channel::intrusive_queue::sharded::new_with_storage::<Frame, PriorityStorage>(
+        shard_count,
+    )
+}
+
+/// Implements [`channel::Receiver<PriorityStorage>`] for [`SubmissionReceiver`] by wrapping
+/// [`poll_swap`] so the receiver can be composed with [`Map`] and [`drain_budgeted`].
+///
+/// Each `poll_recv` call swaps one shard's pre-sorted storage into a fresh default
+/// `PriorityStorage`, returning O(1) work at the channel level regardless of queue depth.
+///
+/// [`poll_swap`]: crate::socket::channel::intrusive_queue::sharded::Receiver::poll_swap
+/// [`Map`]: crate::socket::channel::Map
+/// [`drain_budgeted`]: crate::socket::channel::ReceiverExt::drain_budgeted
+impl crate::socket::channel::Receiver<PriorityStorage> for SubmissionReceiver {
+    #[inline]
+    fn poll_recv(
+        &mut self,
+        cx: &mut core::task::Context<'_>,
+    ) -> core::task::Poll<Option<PriorityStorage>> {
+        let mut batch = PriorityStorage::default();
+        match self.poll_swap(cx, &mut batch) {
+            core::task::Poll::Ready(Some(())) => core::task::Poll::Ready(Some(batch)),
+            core::task::Poll::Ready(None) => core::task::Poll::Ready(None),
+            core::task::Poll::Pending => core::task::Poll::Pending,
+        }
+    }
+
+    #[inline]
+    fn on_consumed(&mut self, _bytes: u64) {}
 }
 
 /// Create a new completion channel for Frames.

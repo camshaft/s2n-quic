@@ -79,7 +79,7 @@ use crate::{
             msg,
             reset_error::{self, ResetError},
         },
-        frame::{self, Frame, Header, SubmissionSender, DEFAULT_TTL},
+        frame::{self, Frame, Header, PriorityStorage, SubmissionSender, DEFAULT_TTL},
     },
 };
 use s2n_quic_core::{
@@ -814,10 +814,10 @@ impl Inner {
     }
 
     fn send_frame(&mut self, frame: Frame) -> io::Result<()> {
-        let mut batch = Queue::new();
-        batch.push_back(frame.into());
+        let mut storage = PriorityStorage::default();
+        storage.push(frame.into());
         self.frame_tx
-            .send_batch(batch)
+            .send_batch(storage)
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "frame channel closed"))
     }
 }
@@ -898,11 +898,9 @@ mod tests {
 
     fn new_test_inner() -> (
         Inner,
-        channel::intrusive_queue::sharded::Receiver<crate::intrusive_queue::EntryAdapter<Frame>>,
+        crate::stream3::frame::SubmissionReceiver,
     ) {
-        let (frame_tx, frame_rx) = channel::intrusive_queue::sharded::new::<Frame>(1);
-        let waker = s2n_quic_core::task::waker::noop();
-        frame_rx.register(&waker);
+        let (frame_tx, frame_rx) = crate::stream3::frame::submission_channel(1);
 
         let path_secret_entry = PathSecretEntry::fake("127.0.0.1:8080".parse().unwrap(), None);
         let stream_id = VarInt::from_u8(42);
