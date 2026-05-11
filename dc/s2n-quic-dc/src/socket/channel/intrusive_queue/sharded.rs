@@ -60,6 +60,8 @@ impl<A: intrusive_queue::Adapter> Storage<A> for intrusive_queue::List<A> {
 struct Shard<A: intrusive_queue::Adapter, Q: Storage<A>> {
     is_open: bool,
     queue: Q,
+    // Use `fn() -> A` so auto-trait derivation comes from the storage type rather than this
+    // zero-sized marker.
     _marker: PhantomData<fn() -> A>,
 }
 
