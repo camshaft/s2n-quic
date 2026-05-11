@@ -60,7 +60,7 @@ impl<A: intrusive_queue::Adapter> Storage<A> for intrusive_queue::List<A> {
 struct Shard<A: intrusive_queue::Adapter, Q: Storage<A>> {
     is_open: bool,
     queue: Q,
-    _adapter: PhantomData<fn() -> A>,
+    _marker: PhantomData<fn() -> A>,
 }
 
 struct Shared<A: intrusive_queue::Adapter, Q: Storage<A>> {
@@ -167,7 +167,9 @@ where
             Mutex::new(Shard {
                 is_open: true,
                 queue: Q::default(),
-                _adapter: PhantomData,
+                // Keep the adapter type parameter on the shard even though the adapter itself is
+                // only expressed through the storage type.
+                _marker: PhantomData,
             })
         })
         .collect::<Vec<_>>()
@@ -476,6 +478,8 @@ mod tests {
     }
 
     impl Storage<intrusive_queue::EntryAdapter<u32>> for SplitQueue {
+        // Split into two categories so the test can verify that custom shard-local storage keeps
+        // separate append targets inside a shard.
         fn is_empty(&self) -> bool {
             self.even.is_empty() && self.odd.is_empty()
         }
