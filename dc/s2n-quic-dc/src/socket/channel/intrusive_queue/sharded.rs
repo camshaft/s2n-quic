@@ -39,7 +39,7 @@ mod sync {
 }
 
 /// Shard-local storage used by the channel to accumulate sender input under the shard lock.
-pub trait Storage<A: intrusive_queue::Adapter> {
+pub trait Storage<A: intrusive_queue::Adapter>: Default {
     type Input;
 
     fn is_empty(&self) -> bool;
@@ -136,45 +136,31 @@ pub fn new<T: 'static>(
     new_with_adapter::<intrusive_queue::EntryAdapter<T>>(shard_count)
 }
 
-/// Creates a sharded intrusive queue channel backed by a custom shard-local storage type.
-///
-/// `next_storage` must return an empty storage value each time it is called. The receiver swaps
-/// that empty value into the shard before returning the previously populated storage to the caller.
-/// If this contract is violated, the receiver panics when it drains the shard because replacing a
-/// shard with non-empty storage would corrupt the channel state.
 pub fn new_with_storage<T: 'static, Q>(
     shard_count: usize,
-    next_storage: impl Fn() -> Q + Send + Sync + 'static,
 ) -> (
     Sender<intrusive_queue::EntryAdapter<T>, Q>,
     Receiver<intrusive_queue::EntryAdapter<T>, Q>,
 )
 where
-    Q: Storage<intrusive_queue::EntryAdapter<T>> + 'static,
+    Q: Storage<intrusive_queue::EntryAdapter<T>>,
 {
-    new_with_adapter_and_storage::<intrusive_queue::EntryAdapter<T>, Q>(shard_count, next_storage)
+    new_with_adapter_and_storage::<intrusive_queue::EntryAdapter<T>, Q>(shard_count)
 }
 
 /// Creates a sharded intrusive queue channel.
 pub fn new_with_adapter<A: intrusive_queue::Adapter + 'static>(
     shard_count: usize,
 ) -> (Sender<A>, Receiver<A>) {
-    new_with_adapter_and_storage::<A, intrusive_queue::List<A>>(shard_count, intrusive_queue::List::new)
+    new_with_adapter_and_storage::<A, intrusive_queue::List<A>>(shard_count)
 }
 
-/// Creates a sharded intrusive queue channel backed by a custom shard-local storage type.
-///
-/// `next_storage` must return an empty storage value each time it is called. The receiver swaps
-/// that empty value into the shard before returning the previously populated storage to the caller.
-/// If this contract is violated, the receiver panics when it drains the shard because replacing a
-/// shard with non-empty storage would corrupt the channel state.
 pub fn new_with_adapter_and_storage<A, Q>(
     shard_count: usize,
-    next_storage: impl Fn() -> Q + Send + Sync + 'static,
 ) -> (Sender<A, Q>, Receiver<A, Q>)
 where
     A: intrusive_queue::Adapter + 'static,
-    Q: Storage<A> + 'static,
+    Q: Storage<A>,
 {
     assert!(
         shard_count.is_power_of_two(),
@@ -191,7 +177,7 @@ where
         .map(|_| {
             Mutex::new(Shard {
                 is_open: true,
-                queue: next_storage(),
+                queue: Q::default(),
                 // Keep the adapter/storage relationship on each shard even though the adapter is
                 // only represented indirectly through the storage type.
                 _marker: PhantomData,
@@ -217,7 +203,6 @@ where
     let receiver = Receiver {
         next_shard: 0,
         local_occupancy,
-        next_storage: Box::new(next_storage),
         shared,
     };
 
@@ -319,7 +304,6 @@ pub struct Receiver<
 > {
     next_shard: usize,
     local_occupancy: Box<[u64]>,
-    next_storage: Box<dyn Fn() -> Q + Send + Sync>,
     shared: Arc<Shared<A, Q>>,
 }
 
@@ -343,7 +327,7 @@ impl<A: intrusive_queue::Adapter, Q: Storage<A>> Receiver<A, Q> {
     }
 
     #[inline(always)]
-    fn try_recv(&mut self) -> TryRecv<Q> {
+    fn try_swap(&mut self, batch: &mut Q) -> TrySwap {
         // Only consume one occupied bit per receive attempt so stale occupancy bookkeeping stays
         // visible to debug builds instead of being hidden by looking for another ready shard.
         if let Some(shard) = self.next_occupied() {
@@ -353,16 +337,45 @@ impl<A: intrusive_queue::Adapter, Q: Storage<A>> Receiver<A, Q> {
                 "occupancy bit set for an empty shard"
             );
 
-            let mut batch = (self.next_storage)();
             assert!(
                 batch.is_empty(),
-                "next_storage() must return empty storage"
+                "poll_swap requires the caller to provide empty storage"
             );
-            core::mem::swap(&mut batch, &mut queue.queue);
-            return TryRecv::Ready(batch);
+            core::mem::swap(batch, &mut queue.queue);
+            return TrySwap::Ready;
         }
 
-        TryRecv::Empty
+        TrySwap::Empty
+    }
+
+    /// Swaps the next ready shard into `batch`.
+    ///
+    /// `batch` must be empty before calling this method. On `Ready(Some(()))`, `batch` contains
+    /// the drained shard contents and the receiver has taken ownership of the empty storage value
+    /// that was previously in `batch`.
+    #[inline(always)]
+    pub fn poll_swap(
+        &mut self,
+        cx: &mut core::task::Context<'_>,
+        batch: &mut Q,
+    ) -> Poll<Option<()>> {
+        // Register the waker before checking for items so we cannot miss a concurrent send
+        // between the occupancy check and returning Poll::Pending.
+        self.shared.recv_waker.register(cx.waker());
+
+        if let TrySwap::Ready = self.try_swap(batch) {
+            return Poll::Ready(Some(()));
+        }
+
+        if self.shared.sender_count.load(Ordering::Acquire) == 0 {
+            if let TrySwap::Ready = self.try_swap(batch) {
+                return Poll::Ready(Some(()));
+            }
+
+            return Poll::Ready(None);
+        }
+
+        Poll::Pending
     }
 
     #[inline(always)]
@@ -441,34 +454,29 @@ impl<A: intrusive_queue::Adapter, Q: Storage<A>> Receiver<A, Q> {
     }
 }
 
-impl<A: intrusive_queue::Adapter, Q: Storage<A>> super::super::Receiver<Q> for Receiver<A, Q> {
+impl<A: intrusive_queue::Adapter> super::super::Receiver<intrusive_queue::List<A>>
+    for Receiver<A, intrusive_queue::List<A>>
+{
     #[inline(always)]
-    fn poll_recv(&mut self, cx: &mut core::task::Context<'_>) -> Poll<Option<Q>> {
-        // Register the waker before checking for items so we cannot miss a concurrent send
-        // between the occupancy check and returning Poll::Pending.
-        self.shared.recv_waker.register(cx.waker());
+    fn poll_recv(
+        &mut self,
+        cx: &mut core::task::Context<'_>,
+    ) -> Poll<Option<intrusive_queue::List<A>>> {
+        let mut batch = intrusive_queue::List::new();
 
-        if let TryRecv::Ready(batch) = self.try_recv() {
-            return Poll::Ready(Some(batch));
+        match self.poll_swap(cx, &mut batch) {
+            Poll::Ready(Some(())) => Poll::Ready(Some(batch)),
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Pending => Poll::Pending,
         }
-
-        if self.shared.sender_count.load(Ordering::Acquire) == 0 {
-            if let TryRecv::Ready(batch) = self.try_recv() {
-                return Poll::Ready(Some(batch));
-            }
-
-            return Poll::Ready(None);
-        }
-
-        Poll::Pending
     }
 
     #[inline(always)]
     fn on_consumed(&mut self, _bytes: u64) {}
 }
 
-enum TryRecv<Q> {
-    Ready(Q),
+enum TrySwap {
+    Ready,
     Empty,
 }
 
@@ -654,17 +662,15 @@ mod tests {
 
     #[test]
     fn custom_storage_appends_per_category() {
-        let next_slot = Arc::new(AtomicUsize::new(0));
-        let slot_ids = next_slot.clone();
-        let (mut tx, mut rx) = new_with_storage::<u32, SplitQueue>(1, move || {
-            SplitQueue::new(slot_ids.fetch_add(1, Ordering::Relaxed))
-        });
+        let (mut tx, mut rx) = new_with_storage::<u32, SplitQueue>(1);
         let mut cx = noop_cx();
         register(&mut rx);
 
         tx.send(split_queue([1, 2])).unwrap();
 
-        let Poll::Ready(Some(batch)) = rx.poll_recv(&mut cx) else {
+        let mut batch = SplitQueue::new(0);
+
+        let Poll::Ready(Some(())) = rx.poll_swap(&mut cx, &mut batch) else {
             panic!("expected drained split queue");
         };
 
@@ -674,26 +680,41 @@ mod tests {
 
         tx.send(split_queue([5, 6])).unwrap();
 
-        let Poll::Ready(Some(batch)) = rx.poll_recv(&mut cx) else {
+        batch = SplitQueue::new(1);
+
+        let Poll::Ready(Some(())) = rx.poll_swap(&mut cx, &mut batch) else {
+            panic!("expected drained split queue");
+        };
+
+        assert_eq!(batch.slot_id, 0);
+        assert_eq!(values(&batch.even), vec![6]);
+        assert_eq!(values(&batch.odd), vec![5]);
+
+        tx.send(split_queue([7, 8])).unwrap();
+
+        batch = SplitQueue::new(2);
+
+        let Poll::Ready(Some(())) = rx.poll_swap(&mut cx, &mut batch) else {
             panic!("expected drained split queue");
         };
 
         assert_eq!(batch.slot_id, 1);
-        assert_eq!(values(&batch.even), vec![6]);
-        assert_eq!(values(&batch.odd), vec![5]);
+        assert_eq!(values(&batch.even), vec![8]);
+        assert_eq!(values(&batch.odd), vec![7]);
     }
 
     #[test]
     fn custom_storage_accepts_distinct_input_type() {
-        let (mut tx, mut rx) =
-            new_with_storage::<u32, VecInputSplitQueue>(1, VecInputSplitQueue::default);
+        let (mut tx, mut rx) = new_with_storage::<u32, VecInputSplitQueue>(1);
         let mut cx = noop_cx();
         register(&mut rx);
 
         tx.send(vec![Entry::new(1), Entry::new(2), Entry::new(3)])
             .unwrap();
 
-        let Poll::Ready(Some(batch)) = rx.poll_recv(&mut cx) else {
+        let mut batch = VecInputSplitQueue::default();
+
+        let Poll::Ready(Some(())) = rx.poll_swap(&mut cx, &mut batch) else {
             panic!("expected drained vec split queue");
         };
 
