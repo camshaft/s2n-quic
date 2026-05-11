@@ -114,6 +114,13 @@ where
             packet_number,
         })?;
     if written != decrypt_len {
+        tracing::warn!(
+            %credentials,
+            packet_number = packet_number.as_u64(),
+            expected_len = decrypt_len,
+            actual_len = written,
+            "decrypt_into wrote an unexpected number of bytes"
+        );
         return Err(Error::Decryption {
             credentials,
             packet_number,
