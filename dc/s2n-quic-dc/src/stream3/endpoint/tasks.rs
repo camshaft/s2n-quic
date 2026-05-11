@@ -394,11 +394,8 @@ pub fn frame_dispatch<S, Rand, Clk>(
         let rx = Map::new(frame_rx, move |mut storage: crate::stream3::frame::PriorityStorage| {
             for (i, queue) in storage.queues.iter_mut().enumerate() {
                 if !queue.is_empty() {
-                    // SAFETY: `i` is in `0..Priority::LEVELS` and `priority_list_txs`
-                    // has exactly `Priority::LEVELS` entries.
-                    let sender = unsafe { priority_list_txs.get_unchecked_mut(i) };
                     let _ = crate::socket::channel::UnboundedSender::send(
-                        sender,
+                        &mut priority_list_txs[i],
                         core::mem::take(queue),
                     );
                 }

@@ -84,9 +84,7 @@ impl PriorityStorage {
     #[inline]
     pub fn push(&mut self, frame: Entry<Frame>) {
         let idx = frame.priority().as_index();
-        // SAFETY: Priority::as_index() is in 0..Priority::LEVELS and queues has exactly
-        // Priority::LEVELS entries.
-        unsafe { self.queues.get_unchecked_mut(idx) }.push_back(frame);
+        self.queues[idx].push_back(frame);
     }
 
     /// Iterates over all frames across all priority buckets, highest priority first.
