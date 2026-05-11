@@ -60,8 +60,8 @@ impl<A: intrusive_queue::Adapter> Storage<A> for intrusive_queue::List<A> {
 struct Shard<A: intrusive_queue::Adapter, Q: Storage<A>> {
     is_open: bool,
     queue: Q,
-    // Use `fn() -> A` so auto-trait derivation comes from the storage type rather than this
-    // zero-sized marker.
+    // `A` is only expressed through `Q: Storage<A>`, so keep an explicit marker on the shard to
+    // preserve that type relationship while still letting auto-trait derivation come from `Q`.
     _marker: PhantomData<fn() -> A>,
 }
 
@@ -169,8 +169,8 @@ where
             Mutex::new(Shard {
                 is_open: true,
                 queue: Q::default(),
-                // Keep the adapter type parameter on the shard even though the adapter itself is
-                // only expressed through the storage type.
+                // Keep the adapter/storage relationship on each shard even though the adapter is
+                // only represented indirectly through the storage type.
                 _marker: PhantomData,
             })
         })
