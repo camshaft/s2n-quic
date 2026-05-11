@@ -129,7 +129,7 @@ where
     unsafe {
         // SAFETY: decrypt_into initialized exactly `written` bytes in `decrypted` and we
         // returned early unless `written == decrypt_len`.
-        decrypted.set_len(written);
+        decrypted.set_len(decrypt_len);
     }
 
     // Packet number deduplication
