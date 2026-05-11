@@ -352,7 +352,7 @@ impl<A: intrusive_queue::Adapter, Q: Storage<A>> Receiver<A, Q> {
             let mut batch = (self.next_storage)();
             debug_assert!(
                 batch.is_empty(),
-                "receiver replacement storage must start empty"
+                "next_storage() must return empty storage"
             );
             core::mem::swap(&mut batch, &mut queue.queue);
             return TryRecv::Ready(batch);
@@ -550,6 +550,34 @@ mod tests {
         queue
     }
 
+    #[derive(Debug, Default)]
+    struct VecSplitQueue {
+        even: Queue<u32>,
+        odd: Queue<u32>,
+    }
+
+    impl Storage<intrusive_queue::EntryAdapter<u32>> for VecSplitQueue {
+        type Input = Vec<Entry<u32>>;
+
+        fn is_empty(&self) -> bool {
+            self.even.is_empty() && self.odd.is_empty()
+        }
+
+        fn input_is_empty(input: &Self::Input) -> bool {
+            input.is_empty()
+        }
+
+        fn append(&mut self, other: &mut Self::Input) {
+            for entry in other.drain(..) {
+                if *entry % 2 == 0 {
+                    self.even.push_back(entry);
+                } else {
+                    self.odd.push_back(entry);
+                }
+            }
+        }
+    }
+
     #[test]
     #[should_panic(expected = "shard count must be a power of two")]
     fn rejects_non_power_of_two_shards() {
@@ -649,6 +677,23 @@ mod tests {
         assert_eq!(batch.slot_id, 1);
         assert_eq!(values(&batch.even), vec![6]);
         assert_eq!(values(&batch.odd), vec![5]);
+    }
+
+    #[test]
+    fn custom_storage_accepts_distinct_input_type() {
+        let (mut tx, mut rx) = new_with_storage::<u32, VecSplitQueue>(1, VecSplitQueue::default);
+        let mut cx = noop_cx();
+        register(&mut rx);
+
+        tx.send(vec![Entry::new(1), Entry::new(2), Entry::new(3)])
+            .unwrap();
+
+        let Poll::Ready(Some(batch)) = rx.poll_recv(&mut cx) else {
+            panic!("expected drained vec split queue");
+        };
+
+        assert_eq!(values(&batch.even), vec![2]);
+        assert_eq!(values(&batch.odd), vec![1, 3]);
     }
 
     #[test]
