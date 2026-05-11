@@ -30,7 +30,7 @@ use crate::{
         Reader, Stream, Writer,
     },
 };
-use bytes::{BufMut as _, BytesMut};
+use bytes::BytesMut;
 use s2n_quic_core::varint::VarInt;
 
 const UNSET_SOURCE_SENDER_ID: VarInt = VarInt::MAX;
@@ -60,7 +60,7 @@ pub(crate) enum Error {
 /// dispatches each frame in the packet to its type-specific handler. Response frames
 /// (ACKs, FlowValidateRequest, FlowReset) are emitted to `response_tx`.
 pub(crate) fn process<Clk>(
-    mut packet: Entry<packet::datagram::decoder::Packet<descriptor::Filled>>,
+    packet: Entry<packet::datagram::decoder::Packet<descriptor::Filled>>,
     recv_cache: &mut recv::Cache,
     path_secret_map: &PathSecretMap,
     acceptor_registry: &acceptor::Registry<Stream>,
@@ -101,11 +101,11 @@ where
     };
 
     // Collect information about the packet layout before decryption.
-    let app_header_len = packet.application_header().len();
+    let app_header_slice: &[u8] = packet.application_header();
     let decrypt_len = packet.decrypt_into_len();
     let ecn = packet.storage().ecn();
 
-    // Decrypt into a BytesMut buffer containing [application_header][payload].
+    // Decrypt payload bytes into a BytesMut buffer.
     let mut decrypted = BytesMut::with_capacity(decrypt_len);
     let written = packet
         .decrypt_into(&peer.opener, bytes::BufMut::chunk_mut(&mut decrypted))
@@ -153,17 +153,13 @@ where
         .on_packet_received(packet_number, clock.get_time());
     peer.ack_state = AckState::Scheduled;
 
-    // Split [application_header][payload] into separate buffers.
-    let app_header = decrypted.split_to(app_header_len);
     let mut payload_storage = decrypted;
 
     let mut response_frames = Queue::new();
 
-    // Multi-frame packet: `app_header_desc` contains the per-frame metadata
+    // Multi-frame packet: `app_header_slice` contains the per-frame metadata
     // (Header type tag + optional payload_len VarInt) and `payload_storage`
     // contains the concatenated, decrypted frame payloads.
-    //
-    let app_header_slice: &[u8] = &app_header;
 
     for result in decode::decode_frames(app_header_slice) {
         match result {
