@@ -303,11 +303,12 @@ where
 ///
 /// Creates two cooperating tasks on `spawner`'s worker:
 ///
-/// - **Priority router** (Task 1): receives pre-sorted [`PriorityStorage`] swap items from
-///   the sharded submission channel — one per occupied shard — using a [`Map`] combinator
-///   and [`drain_budgeted`].  For each item it appends each priority queue directly to the
-///   corresponding per-priority unsync [`ListSender`] in O([`Priority::LEVELS`]) work,
-///   regardless of how many frames the shard contained.
+/// - **Priority router** (Task 1): on each poll it calls [`poll_swap`] once to atomically
+///   receive the next ready shard's [`PriorityStorage`] (a Box pointer swap — O(1)).  It
+///   then appends each non-empty priority queue to the corresponding per-priority unsync
+///   [`ListSender`] in O([`Priority::LEVELS`]) work.  After processing one shard it yields
+///   to the executor (one shard per poll).  A pre-allocated `staging` Box is reused across
+///   swaps — no heap allocation on the hot path.
 ///
 /// - **Batcher + Distributor** (Task 2): each per-priority unsync receiver is independently
 ///   wrapped in [`BatchFramesByPathSecret`] to coalesce frames for the same peer into
@@ -326,18 +327,19 @@ where
 ///
 /// # Fixed-cost routing
 ///
-/// Senders pre-sort frames into [`PriorityStorage`] priority buckets at submission time.
-/// Task 1's [`Map`] closure does O([`Priority::LEVELS`]) list-append operations per shard
-/// swap, independent of the number of frames in that shard.  There is no per-frame
-/// iteration in the routing hot path.
+/// Senders submit [`PriorityInput`] values (stack-allocated), which are merged into the
+/// shard's Box-backed [`PriorityStorage`] at submission time (O([`Priority::LEVELS`])
+/// appends). Task 1 pointer-swaps the Box in O(1) and then distributes the queues to the
+/// per-priority unsync lanes in one O([`Priority::LEVELS`]) pass.
 ///
 /// # Pipeline overview
 ///
 /// ```text
 /// Task 1 (priority router):
-///   SubmissionReceiver (yields PriorityStorage via poll_swap)
-///     → Map(storage → append each priority queue to per-priority ListSender)
-///     → drain_budgeted
+///   SubmissionReceiver
+///     → poll_swap (O(1) pointer swap of PriorityStorage Box)
+///     → drain staging into per-priority ListSenders (O(Priority::LEVELS))
+///     → yield (one shard per poll)
 ///
 /// Task 2 (batcher + distributor):
 ///   [per-priority unsync rx[i] → BatchFramesByPathSecret]
@@ -351,16 +353,16 @@ where
 /// Sticky routing (retransmissions to the same socket) and per-queue depth gauges are not
 /// yet implemented. See stream2's dispatch pipeline for the reference implementation.
 ///
-/// [`Map`]: crate::socket::channel::Map
+/// [`poll_swap`]: crate::socket::channel::intrusive_queue::sharded::Receiver::poll_swap
 /// [`ListSender`]: crate::socket::channel::intrusive_queue::unsync::ListSender
-/// [`drain_budgeted`]: crate::socket::channel::ReceiverExt::drain_budgeted
 /// [`channel::Priority`]: crate::socket::channel::Priority
 /// [`channel::Paced`]: crate::socket::channel::Paced
 /// [`Priority::LEVELS`]: crate::datagram::batch::Priority::LEVELS
 /// [`PriorityStorage`]: crate::stream3::frame::PriorityStorage
+/// [`PriorityInput`]: crate::stream3::frame::PriorityInput
 pub fn frame_dispatch<S, Rand, Clk>(
     spawner: &mut impl crate::stream2::spawner::LocalSpawner,
-    frame_rx: crate::stream3::frame::SubmissionReceiver,
+    mut frame_rx: crate::stream3::frame::SubmissionReceiver,
     socket_senders: Vec<S>,
     random: Rand,
     clock: Clk,
@@ -370,7 +372,7 @@ pub fn frame_dispatch<S, Rand, Clk>(
     Rand: Fn(usize) -> usize + 'static,
     Clk: crate::clock::precision::Clock + 'static,
 {
-    use crate::socket::channel::{intrusive_queue, Map, Paced, Priority as PriorityRx, ReceiverExt as _};
+    use crate::socket::channel::{intrusive_queue, Paced, Priority as PriorityRx};
 
     // Create one unbounded unsync channel per priority level.
     // Task 1 sends whole `Queue<Frame>` lists via `ListSender`; Task 2 pops individual
@@ -386,22 +388,32 @@ pub fn frame_dispatch<S, Rand, Clk>(
 
     // Task 1: fixed-cost priority routing.
     //
-    // Each item from `frame_rx` is a `PriorityStorage` — the pre-sorted contents of one
-    // shard, with frames already distributed into per-priority queues by senders.  The Map
-    // closure appends each non-empty priority queue to the matching unsync ListSender in
-    // O(Priority::LEVELS) work, regardless of the number of frames in the shard.
+    // A persistent `staging` PriorityStorage (pre-allocated once) avoids heap allocation on
+    // the hot path.  Each poll calls `poll_swap` once to pointer-swap the next ready shard's
+    // Box into `staging`, then appends each non-empty priority queue to the matching
+    // per-priority ListSender.  After processing one shard the task yields to the executor
+    // (one shard per poll, matching the behaviour of `drain()`).
     spawner.spawn({
-        let rx = Map::new(frame_rx, move |mut storage: crate::stream3::frame::PriorityStorage| {
-            for (i, queue) in storage.queues.iter_mut().enumerate() {
-                if !queue.is_empty() {
-                    let _ = crate::socket::channel::UnboundedSender::send(
-                        &mut priority_list_txs[i],
-                        core::mem::take(queue),
-                    );
+        let mut staging = crate::stream3::frame::PriorityStorage::default();
+        poll_fn(move |cx| {
+            match frame_rx.poll_swap(cx, &mut staging) {
+                task::Poll::Ready(None) => task::Poll::Ready(()),
+                task::Poll::Pending => task::Poll::Pending,
+                task::Poll::Ready(Some(())) => {
+                    for (i, queue) in staging.queues.iter_mut().enumerate() {
+                        if !queue.is_empty() {
+                            let _ = crate::socket::channel::UnboundedSender::send(
+                                &mut priority_list_txs[i],
+                                core::mem::take(queue),
+                            );
+                        }
+                    }
+                    // Yield after processing one shard to give other tasks a turn.
+                    cx.waker().wake_by_ref();
+                    task::Poll::Pending
                 }
             }
-        });
-        rx.drain_budgeted(Some(DEFAULT_DISPATCH_BUDGET))
+        })
     });
 
     // Task 2: batch each priority lane independently, merge in urgency order,

@@ -35,22 +35,73 @@ pub type CompletionSender = datagram_completion::Sender<Frame>;
 /// Completion channel receiver typed on Frame.
 pub type CompletionReceiver = datagram_completion::Receiver<Frame>;
 
-/// Shard-local storage for the frame submission channel.
+/// Stack-allocated sender input for the frame submission channel.
 ///
-/// Each [`Priority`] level gets its own intrusive queue.  Senders pre-sort frames into the
-/// correct priority bucket at submission time; the receiver performs a single [`poll_swap`] to
-/// atomically obtain all per-priority queues at O(Priority::LEVELS) cost — no per-frame
-/// iteration needed to categorize received frames.
+/// Callers (readers, writers, dispatch) create a `PriorityInput` on the stack, insert frames
+/// via [`push`], and submit it with [`SubmissionSender::send_batch`]. No heap allocation is
+/// needed on the submission path.
+///
+/// Inside the sharded channel, each shard accumulates multiple `PriorityInput` values
+/// by appending them into its [`PriorityStorage`] (Box-backed). The receiver then
+/// pointer-swaps the Box in O(1) to obtain the shard's accumulated queues.
+///
+/// [`push`]: PriorityInput::push
+/// [`SubmissionSender::send_batch`]: crate::socket::channel::intrusive_queue::sharded::Sender::send_batch
+pub struct PriorityInput {
+    pub queues: [Queue<Frame>; Priority::LEVELS],
+}
+
+impl Default for PriorityInput {
+    fn default() -> Self {
+        Self {
+            queues: std::array::from_fn(|_| Queue::new()),
+        }
+    }
+}
+
+impl PriorityInput {
+    /// Inserts `frame` into the priority bucket matching its [`Frame::priority`].
+    #[inline]
+    pub fn push(&mut self, frame: Entry<Frame>) {
+        let idx = frame.priority().as_index();
+        self.queues[idx].push_back(frame);
+    }
+
+    /// Iterates over all frames across all priority buckets, highest priority first.
+    pub fn iter(&self) -> impl Iterator<Item = &Frame> {
+        self.queues.iter().flat_map(|q| q.iter())
+    }
+}
+
+impl core::fmt::Debug for PriorityInput {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let mut list = f.debug_list();
+        for frame in self.iter() {
+            list.entry(frame);
+        }
+        list.finish()
+    }
+}
+
+/// Box-backed shard-local storage for the frame submission channel.
+///
+/// Each shard holds one `PriorityStorage`, which is a heap-allocated array of
+/// [`Priority::LEVELS`] intrusive queues.  Because only the Box pointer is swapped during
+/// [`poll_swap`] — not the entire queue array — the swap is O(1) regardless of how many
+/// frames are buffered or how many priority levels exist.
+///
+/// Senders submit [`PriorityInput`] values (stack-allocated); the shard's `append` method
+/// merges those stack queues into this Box in O([`Priority::LEVELS`]) list-append operations.
 ///
 /// [`poll_swap`]: crate::socket::channel::intrusive_queue::sharded::Receiver::poll_swap
 pub struct PriorityStorage {
-    pub queues: [Queue<Frame>; Priority::LEVELS],
+    pub queues: Box<[Queue<Frame>; Priority::LEVELS]>,
 }
 
 impl Default for PriorityStorage {
     fn default() -> Self {
         Self {
-            queues: std::array::from_fn(|_| Queue::new()),
+            queues: Box::new(std::array::from_fn(|_| Queue::new())),
         }
     }
 }
@@ -59,7 +110,7 @@ impl crate::socket::channel::intrusive_queue::sharded::Storage<
     crate::intrusive_queue::EntryAdapter<Frame>,
 > for PriorityStorage
 {
-    type Input = Self;
+    type Input = PriorityInput;
 
     #[inline(always)]
     fn is_empty(&self) -> bool {
@@ -67,12 +118,12 @@ impl crate::socket::channel::intrusive_queue::sharded::Storage<
     }
 
     #[inline(always)]
-    fn input_is_empty(input: &Self) -> bool {
-        input.is_empty()
+    fn input_is_empty(input: &PriorityInput) -> bool {
+        input.queues.iter().all(Queue::is_empty)
     }
 
     #[inline(always)]
-    fn append(&mut self, other: &mut Self) {
+    fn append(&mut self, other: &mut PriorityInput) {
         for (dst, src) in self.queues.iter_mut().zip(other.queues.iter_mut()) {
             dst.append(src);
         }
@@ -80,13 +131,6 @@ impl crate::socket::channel::intrusive_queue::sharded::Storage<
 }
 
 impl PriorityStorage {
-    /// Inserts `frame` into the priority bucket matching its [`Frame::priority`].
-    #[inline]
-    pub fn push(&mut self, frame: Entry<Frame>) {
-        let idx = frame.priority().as_index();
-        self.queues[idx].push_back(frame);
-    }
-
     /// Iterates over all frames across all priority buckets, highest priority first.
     pub fn iter(&self) -> impl Iterator<Item = &Frame> {
         self.queues.iter().flat_map(|q| q.iter())
@@ -124,33 +168,6 @@ pub fn submission_channel(shard_count: usize) -> (SubmissionSender, SubmissionRe
     crate::socket::channel::intrusive_queue::sharded::new_with_storage::<Frame, PriorityStorage>(
         shard_count,
     )
-}
-
-/// Implements [`channel::Receiver<PriorityStorage>`] for [`SubmissionReceiver`] by wrapping
-/// [`poll_swap`] so the receiver can be composed with [`Map`] and [`drain_budgeted`].
-///
-/// Each `poll_recv` call swaps one shard's pre-sorted storage into a fresh default
-/// `PriorityStorage`, returning O(1) work at the channel level regardless of queue depth.
-///
-/// [`poll_swap`]: crate::socket::channel::intrusive_queue::sharded::Receiver::poll_swap
-/// [`Map`]: crate::socket::channel::Map
-/// [`drain_budgeted`]: crate::socket::channel::ReceiverExt::drain_budgeted
-impl crate::socket::channel::Receiver<PriorityStorage> for SubmissionReceiver {
-    #[inline]
-    fn poll_recv(
-        &mut self,
-        cx: &mut core::task::Context<'_>,
-    ) -> core::task::Poll<Option<PriorityStorage>> {
-        let mut batch = PriorityStorage::default();
-        match self.poll_swap(cx, &mut batch) {
-            core::task::Poll::Ready(Some(())) => core::task::Poll::Ready(Some(batch)),
-            core::task::Poll::Ready(None) => core::task::Poll::Ready(None),
-            core::task::Poll::Pending => core::task::Poll::Pending,
-        }
-    }
-
-    #[inline]
-    fn on_consumed(&mut self, _bytes: u64) {}
 }
 
 /// Create a new completion channel for Frames.

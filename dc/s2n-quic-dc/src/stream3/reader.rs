@@ -87,7 +87,7 @@ use crate::{
             msg,
             reset_error::{self, ResetError},
         },
-        frame::{self, Frame, Header, PriorityStorage, SubmissionSender, DEFAULT_TTL},
+        frame::{self, Frame, Header, PriorityInput, SubmissionSender, DEFAULT_TTL},
     },
 };
 use s2n_codec::EncoderValue;
@@ -529,10 +529,10 @@ impl Inner {
     }
 
     fn send_frame(&mut self, frame: Frame) -> io::Result<()> {
-        let mut storage = PriorityStorage::default();
-        storage.push(frame.into());
+        let mut input = PriorityInput::default();
+        input.push(frame.into());
         self.frame_tx
-            .send_batch(storage)
+            .send_batch(input)
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "frame channel closed"))
     }
 }
