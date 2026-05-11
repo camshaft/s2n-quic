@@ -127,7 +127,7 @@ fn sender_stride(shard_count: usize) -> usize {
     ((shard_count / 2).saturating_sub(1)) | 1
 }
 
-pub fn new<T: 'static>(
+pub fn new<T>(
     shard_count: usize,
 ) -> (
     Sender<intrusive_queue::EntryAdapter<T>>,
@@ -136,7 +136,7 @@ pub fn new<T: 'static>(
     new_with_adapter::<intrusive_queue::EntryAdapter<T>>(shard_count)
 }
 
-pub fn new_with_storage<T: 'static, Q>(
+pub fn new_with_storage<T, Q>(
     shard_count: usize,
 ) -> (
     Sender<intrusive_queue::EntryAdapter<T>, Q>,
@@ -149,7 +149,7 @@ where
 }
 
 /// Creates a sharded intrusive queue channel.
-pub fn new_with_adapter<A: intrusive_queue::Adapter + 'static>(
+pub fn new_with_adapter<A: intrusive_queue::Adapter>(
     shard_count: usize,
 ) -> (Sender<A>, Receiver<A>) {
     new_with_adapter_and_storage::<A, intrusive_queue::List<A>>(shard_count)
@@ -159,7 +159,7 @@ pub fn new_with_adapter_and_storage<A, Q>(
     shard_count: usize,
 ) -> (Sender<A, Q>, Receiver<A, Q>)
 where
-    A: intrusive_queue::Adapter + 'static,
+    A: intrusive_queue::Adapter,
     Q: Storage<A>,
 {
     assert!(
@@ -257,7 +257,7 @@ impl<A: intrusive_queue::Adapter, Q: Storage<A>> Sender<A, Q> {
             return Err(batch);
         }
 
-        let was_empty = queue.queue.is_empty();
+        let was_empty = <Q as Storage<A>>::is_empty(&queue.queue);
         queue.queue.append(&mut batch);
         drop(queue);
 
@@ -333,12 +333,12 @@ impl<A: intrusive_queue::Adapter, Q: Storage<A>> Receiver<A, Q> {
         if let Some(shard) = self.next_occupied() {
             let mut queue = lock(&self.shared.shards[shard]);
             debug_assert!(
-                !queue.queue.is_empty(),
+                !<Q as Storage<A>>::is_empty(&queue.queue),
                 "occupancy bit set for an empty shard"
             );
 
             assert!(
-                batch.is_empty(),
+                <Q as Storage<A>>::is_empty(batch),
                 "poll_swap requires the caller to provide empty storage"
             );
             core::mem::swap(batch, &mut queue.queue);
