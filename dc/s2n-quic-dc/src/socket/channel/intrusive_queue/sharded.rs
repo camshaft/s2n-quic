@@ -350,7 +350,7 @@ impl<A: intrusive_queue::Adapter, Q: Storage<A>> Receiver<A, Q> {
             );
 
             let mut batch = (self.next_storage)();
-            debug_assert!(
+            assert!(
                 batch.is_empty(),
                 "next_storage() must return empty storage"
             );
@@ -551,12 +551,12 @@ mod tests {
     }
 
     #[derive(Debug, Default)]
-    struct VecSplitQueue {
+    struct VecInputSplitQueue {
         even: Queue<u32>,
         odd: Queue<u32>,
     }
 
-    impl Storage<intrusive_queue::EntryAdapter<u32>> for VecSplitQueue {
+    impl Storage<intrusive_queue::EntryAdapter<u32>> for VecInputSplitQueue {
         type Input = Vec<Entry<u32>>;
 
         fn is_empty(&self) -> bool {
@@ -681,7 +681,8 @@ mod tests {
 
     #[test]
     fn custom_storage_accepts_distinct_input_type() {
-        let (mut tx, mut rx) = new_with_storage::<u32, VecSplitQueue>(1, VecSplitQueue::default);
+        let (mut tx, mut rx) =
+            new_with_storage::<u32, VecInputSplitQueue>(1, VecInputSplitQueue::default);
         let mut cx = noop_cx();
         register(&mut rx);
 
