@@ -350,7 +350,7 @@ impl<A: intrusive_queue::Adapter, Q: Storage<A>, F: FnMut() -> Q> Receiver<A, Q,
             );
 
             let mut batch = (self.next_storage)();
-            assert!(
+            debug_assert!(
                 batch.is_empty(),
                 "receiver replacement storage must start empty"
             );
@@ -506,6 +506,7 @@ mod tests {
 
     #[derive(Debug, Default)]
     struct SplitQueue {
+        // Records which receiver-provided replacement slot is currently backing the shard.
         slot_id: usize,
         even: Queue<u32>,
         odd: Queue<u32>,
