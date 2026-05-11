@@ -140,6 +140,8 @@ pub fn new<T: 'static>(
 ///
 /// `next_storage` must return an empty storage value each time it is called. The receiver swaps
 /// that empty value into the shard before returning the previously populated storage to the caller.
+/// If this contract is violated, the receiver panics when it drains the shard because replacing a
+/// shard with non-empty storage would corrupt the channel state.
 pub fn new_with_storage<T: 'static, Q>(
     shard_count: usize,
     next_storage: impl Fn() -> Q + Send + Sync + 'static,
@@ -164,6 +166,8 @@ pub fn new_with_adapter<A: intrusive_queue::Adapter + 'static>(
 ///
 /// `next_storage` must return an empty storage value each time it is called. The receiver swaps
 /// that empty value into the shard before returning the previously populated storage to the caller.
+/// If this contract is violated, the receiver panics when it drains the shard because replacing a
+/// shard with non-empty storage would corrupt the channel state.
 pub fn new_with_adapter_and_storage<A, Q>(
     shard_count: usize,
     next_storage: impl Fn() -> Q + Send + Sync + 'static,
