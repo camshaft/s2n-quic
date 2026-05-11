@@ -113,11 +113,16 @@ where
             credentials,
             packet_number,
         })?;
+    if written != decrypt_len {
+        return Err(Error::Decryption {
+            credentials,
+            packet_number,
+        });
+    }
     unsafe {
-        // SAFETY: decrypt_into writes exactly `written` initialized bytes into `decrypted`'s
-        // uninitialized chunk; `written` is asserted to equal the requested `decrypt_len`.
-        debug_assert_eq!(written, decrypt_len);
-        decrypted.set_len(decrypt_len);
+        // SAFETY: decrypt_into initialized exactly `written` bytes in `decrypted` and we
+        // returned early unless `written == decrypt_len`.
+        decrypted.set_len(written);
     }
 
     // Packet number deduplication
