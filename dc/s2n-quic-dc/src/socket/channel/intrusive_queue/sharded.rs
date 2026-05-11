@@ -127,7 +127,7 @@ fn sender_stride(shard_count: usize) -> usize {
     ((shard_count / 2).saturating_sub(1)) | 1
 }
 
-pub fn new<T>(
+pub fn new<T: 'static>(
     shard_count: usize,
 ) -> (
     Sender<intrusive_queue::EntryAdapter<T>>,
@@ -137,39 +137,40 @@ pub fn new<T>(
 }
 
 /// Creates a sharded intrusive queue channel backed by a custom shard-local storage type.
-pub fn new_with_storage<T, Q, F>(
+///
+/// `next_storage` must return an empty storage value each time it is called. The receiver swaps
+/// that empty value into the shard before returning the previously populated storage to the caller.
+pub fn new_with_storage<T: 'static, Q>(
     shard_count: usize,
-    next_storage: F,
+    next_storage: impl Fn() -> Q + Send + Sync + 'static,
 ) -> (
     Sender<intrusive_queue::EntryAdapter<T>, Q>,
-    Receiver<intrusive_queue::EntryAdapter<T>, Q, F>,
+    Receiver<intrusive_queue::EntryAdapter<T>, Q>,
 )
 where
-    Q: Storage<intrusive_queue::EntryAdapter<T>>,
-    F: FnMut() -> Q,
+    Q: Storage<intrusive_queue::EntryAdapter<T>> + 'static,
 {
-    new_with_adapter_and_storage::<intrusive_queue::EntryAdapter<T>, Q, F>(shard_count, next_storage)
+    new_with_adapter_and_storage::<intrusive_queue::EntryAdapter<T>, Q>(shard_count, next_storage)
 }
 
 /// Creates a sharded intrusive queue channel.
-pub fn new_with_adapter<A: intrusive_queue::Adapter>(
+pub fn new_with_adapter<A: intrusive_queue::Adapter + 'static>(
     shard_count: usize,
 ) -> (Sender<A>, Receiver<A>) {
-    new_with_adapter_and_storage::<A, intrusive_queue::List<A>, _>(
-        shard_count,
-        intrusive_queue::List::new,
-    )
+    new_with_adapter_and_storage::<A, intrusive_queue::List<A>>(shard_count, intrusive_queue::List::new)
 }
 
 /// Creates a sharded intrusive queue channel backed by a custom shard-local storage type.
-pub fn new_with_adapter_and_storage<A, Q, F>(
+///
+/// `next_storage` must return an empty storage value each time it is called. The receiver swaps
+/// that empty value into the shard before returning the previously populated storage to the caller.
+pub fn new_with_adapter_and_storage<A, Q>(
     shard_count: usize,
-    mut next_storage: F,
-) -> (Sender<A, Q>, Receiver<A, Q, F>)
+    next_storage: impl Fn() -> Q + Send + Sync + 'static,
+) -> (Sender<A, Q>, Receiver<A, Q>)
 where
-    A: intrusive_queue::Adapter,
-    Q: Storage<A>,
-    F: FnMut() -> Q,
+    A: intrusive_queue::Adapter + 'static,
+    Q: Storage<A> + 'static,
 {
     assert!(
         shard_count.is_power_of_two(),
@@ -212,7 +213,7 @@ where
     let receiver = Receiver {
         next_shard: 0,
         local_occupancy,
-        next_storage,
+        next_storage: Box::new(next_storage),
         shared,
     };
 
@@ -311,15 +312,14 @@ impl<A: intrusive_queue::Adapter, Q: Storage<A>> super::super::Sender<Q::Input> 
 pub struct Receiver<
     A: intrusive_queue::Adapter,
     Q: Storage<A> = intrusive_queue::List<A>,
-    F: FnMut() -> Q = fn() -> Q,
 > {
     next_shard: usize,
     local_occupancy: Box<[u64]>,
-    next_storage: F,
+    next_storage: Box<dyn Fn() -> Q + Send + Sync>,
     shared: Arc<Shared<A, Q>>,
 }
 
-impl<A: intrusive_queue::Adapter, Q: Storage<A>, F: FnMut() -> Q> Drop for Receiver<A, Q, F> {
+impl<A: intrusive_queue::Adapter, Q: Storage<A>> Drop for Receiver<A, Q> {
     fn drop(&mut self) {
         for shard in self.shared.shards.iter() {
             lock(shard).is_open = false;
@@ -327,7 +327,7 @@ impl<A: intrusive_queue::Adapter, Q: Storage<A>, F: FnMut() -> Q> Drop for Recei
     }
 }
 
-impl<A: intrusive_queue::Adapter, Q: Storage<A>, F: FnMut() -> Q> Receiver<A, Q, F> {
+impl<A: intrusive_queue::Adapter, Q: Storage<A>> Receiver<A, Q> {
     /// Registers the receiver waker.
     ///
     /// Uses [`AtomicWaker`] internally, so this may be called at any time — including after senders
@@ -437,9 +437,7 @@ impl<A: intrusive_queue::Adapter, Q: Storage<A>, F: FnMut() -> Q> Receiver<A, Q,
     }
 }
 
-impl<A: intrusive_queue::Adapter, Q: Storage<A>, F: FnMut() -> Q> super::super::Receiver<Q>
-    for Receiver<A, Q, F>
-{
+impl<A: intrusive_queue::Adapter, Q: Storage<A>> super::super::Receiver<Q> for Receiver<A, Q> {
     #[inline(always)]
     fn poll_recv(&mut self, cx: &mut core::task::Context<'_>) -> Poll<Option<Q>> {
         // Register the waker before checking for items so we cannot miss a concurrent send
@@ -485,9 +483,7 @@ mod tests {
         core::task::Context::from_waker(waker_ref)
     }
 
-    fn register<A: intrusive_queue::Adapter, Q: Storage<A>, F: FnMut() -> Q>(
-        rx: &mut Receiver<A, Q, F>,
-    ) {
+    fn register<A: intrusive_queue::Adapter, Q: Storage<A>>(rx: &mut Receiver<A, Q>) {
         let waker = s2n_quic_core::task::waker::noop();
         rx.register(&waker);
     }
@@ -628,7 +624,7 @@ mod tests {
     fn custom_storage_appends_per_category() {
         let next_slot = Arc::new(AtomicUsize::new(0));
         let slot_ids = next_slot.clone();
-        let (mut tx, mut rx) = new_with_storage::<u32, SplitQueue, _>(1, move || {
+        let (mut tx, mut rx) = new_with_storage::<u32, SplitQueue>(1, move || {
             SplitQueue::new(slot_ids.fetch_add(1, Ordering::Relaxed))
         });
         let mut cx = noop_cx();
