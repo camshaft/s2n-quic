@@ -127,8 +127,9 @@ where
         });
     }
     unsafe {
-        // SAFETY: decrypt_into initialized exactly `written` bytes in `decrypted` and we
-        // returned early unless `written == decrypt_len`.
+        // SAFETY: `decrypted` was allocated with `with_capacity(decrypt_len)` and `chunk_mut`
+        // exposed exactly that uninitialized region to decrypt_into, which initialized
+        // `decrypt_len` bytes. We returned early unless `written == decrypt_len`.
         decrypted.set_len(decrypt_len);
     }
 

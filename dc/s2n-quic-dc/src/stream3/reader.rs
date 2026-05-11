@@ -604,11 +604,11 @@ impl tokio::io::AsyncRead for Reader {
 mod tests {
     use super::{msg, write_data_reader, Reader};
     use crate::{
-        byte_vec::BytesMut,
         flow,
         path::secret::map::Entry as PathSecretEntry,
         stream3::frame::{Frame, SubmissionSender},
     };
+    use bytes::BytesMut;
     use core::task::Poll;
     use s2n_quic_core::{
         buffer::Reassembler,
