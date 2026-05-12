@@ -3,38 +3,63 @@
 
 //! Helpers for building stream3 endpoint instances inside Bach simulations.
 //!
-//! [`setup_sim_endpoint`] creates a fully wired pipeline backed by `bach::net::UdpSocket`
-//! sockets, using the Bach clock and a single combined worker so everything runs on the
-//! same Bach thread. Handshakes are skipped: call [`connect`] to automatically inject
-//! matching fake path-secret entries into the two endpoint maps on demand.
+//! The two main high-level entry points are [`SimServer`] and [`SimClient`]:
+//!
+//! ```ignore
+//! // Server group
+//! let server = SimServer::new();
+//! let acceptor = server.register_acceptor_channel(VarInt::from_u8(1), 8).unwrap();
+//! while let Ok(stream) = acceptor.recv_front().await { /* … */ }
+//!
+//! // Client group
+//! let client = SimClient::new();
+//! let stream = client.connect("server:4433", VarInt::from_u8(1)).await.unwrap();
+//! ```
+//!
+//! Both types lazily create exactly one [`Endpoint`] per Bach group (simulated machine).
+//! [`SimServer`] binds its recv/send sockets to the well-known port [`SERVER_PORT`] so
+//! the client can resolve the peer address purely by group name (via `bach::net::lookup_host`).
+//!
+//! For lower-level access, [`setup_sim_endpoint`], [`connect`], and
+//! [`insert_fake_path_pair`] are also available.
 
 use super::{Budgets, Config, Endpoint, WorkerLayout, setup_endpoint};
 use crate::{
     acceptor,
     clock::bach::Clock,
+    flow,
     path::secret::Map as PathSecretMap,
     socket::{pool::Pool, rate::Rate},
-    stream3::Stream,
+    stream3::{Reader, Stream, Writer},
+    sync::mpmc,
 };
 use core::net::SocketAddr;
+use s2n_quic_core::varint::VarInt;
 use std::{
     cell::RefCell,
     collections::HashMap,
-    sync::Arc,
+    io,
+    sync::{atomic::Ordering, Arc},
 };
 
-// ── Thread-local endpoint registry ───────────────────────────────────────────
+// ── Thread-local endpoint registries ─────────────────────────────────────────
 //
-// When `setup_sim_endpoint` creates an endpoint it registers its path-secret map
-// in this thread-local map, keyed by the endpoint's data socket address.
-// [`connect`] looks the peer up here so callers don't have to thread the maps
-// through their tests manually.
+// Bach runs all tasks on a single OS thread, so `thread_local!` state is safe
+// for inter-task communication within a simulation run.
 //
-// Bach runs all tasks on a single OS thread, so a `thread_local!` is safe for
-// inter-task communication.
+// SIM_MAP_REGISTRY: stores each endpoint's PathSecretMap keyed by data_addr.
+//   `connect()` uses this to auto-insert fake path secrets without the caller
+//   having to thread maps through test code.
+//
+// SIM_ENDPOINT_BY_GROUP: stores one Arc<Endpoint> per Bach group (keyed by
+//   group.id()).  SimServer::new() / SimClient::new() create the endpoint
+//   lazily on first call so users don't have to call setup_sim_endpoint().
 
 thread_local! {
     static SIM_MAP_REGISTRY: RefCell<HashMap<SocketAddr, PathSecretMap>> =
+        RefCell::new(HashMap::new());
+
+    static SIM_ENDPOINT_BY_GROUP: RefCell<HashMap<u64, Arc<Endpoint>>> =
         RefCell::new(HashMap::new());
 }
 
@@ -42,6 +67,35 @@ fn register_endpoint_map(data_addr: SocketAddr, map: PathSecretMap) {
     SIM_MAP_REGISTRY.with(|r| {
         r.borrow_mut().insert(data_addr, map);
     });
+}
+
+/// Well-known port that [`SimServer`] binds to.
+///
+/// Clients resolve the peer address via `"<group-name>:SERVER_PORT"` using
+/// [`bach::net::lookup_host`], so no explicit address-exchange channel is needed.
+pub const SERVER_PORT: u16 = 4433;
+
+/// Returns the shared [`Endpoint`] for the current Bach group, creating it lazily.
+///
+/// `bind_addr` is used only on the first call for a given group; subsequent calls
+/// return the cached endpoint regardless of `bind_addr`.
+fn get_or_create_group_endpoint(bind_addr: SocketAddr) -> Arc<Endpoint> {
+    let group_id = bach::group::current().id();
+    SIM_ENDPOINT_BY_GROUP.with(|r| {
+        let mut map = r.borrow_mut();
+        if let Some(ep) = map.get(&group_id) {
+            return ep.clone();
+        }
+        let path_secret_map = crate::path::secret::map::testing::new(50_000);
+        let acceptor_registry = acceptor::Registry::new();
+        let config = SimEndpointConfig {
+            bind_addr,
+            ..SimEndpointConfig::default()
+        };
+        let ep = Arc::new(setup_sim_endpoint(config, path_secret_map, acceptor_registry));
+        map.insert(group_id, ep.clone());
+        ep
+    })
 }
 
 // ── Bach random generator ─────────────────────────────────────────────────────
@@ -157,7 +211,14 @@ pub fn setup_sim_endpoint(
 
     // Bind send sockets using the synchronous constructor so this function can
     // be called before the Bach runtime drains async tasks.
-    let bind_opts = {
+    // Send sockets always use an ephemeral port — only the recv socket needs
+    // the configured (potentially well-known) address.
+    let send_bind_opts = {
+        let mut o = bach::net::socket::Options::default();
+        o.local_addr = SocketAddr::new(bind_addr.ip(), 0);
+        o
+    };
+    let recv_bind_opts = {
         let mut o = bach::net::socket::Options::default();
         o.local_addr = bind_addr;
         o
@@ -166,14 +227,14 @@ pub fn setup_sim_endpoint(
     let send_sockets: Vec<Arc<bach::net::UdpSocket>> = (0..num_send_sockets)
         .map(|_| {
             let sock =
-                bach::net::UdpSocket::new(&bind_opts).expect("failed to bind send socket");
+                bach::net::UdpSocket::new(&send_bind_opts).expect("failed to bind send socket");
             Arc::new(sock)
         })
         .collect();
 
     // Bind a single recv socket.
     let recv_socket =
-        bach::net::UdpSocket::new(&bind_opts).expect("failed to bind recv socket");
+        bach::net::UdpSocket::new(&recv_bind_opts).expect("failed to bind recv socket");
     let recv_sockets = vec![recv_socket];
 
     let send_pool = Pool::new(mtu);
@@ -286,4 +347,200 @@ pub fn insert_fake_path_pair(
     peer_addr: SocketAddr,
 ) -> crate::credentials::Id {
     local_map.test_insert_pair(local_addr, None, peer_map, peer_addr, None)
+}
+
+// ── SimChannelAcceptor ────────────────────────────────────────────────────────
+
+/// Internal channel-backed acceptor used by [`SimServer::register_acceptor_channel`].
+struct SimChannelAcceptor {
+    tx: mpmc::Sender<Stream>,
+    /// Keeps the acceptor registered while at least one receiver is alive.
+    handle: std::sync::Mutex<Option<acceptor::Handle>>,
+}
+
+impl acceptor::Acceptor<Stream> for SimChannelAcceptor {
+    fn handle_request(&self, stream: Stream) {
+        self.push(stream);
+    }
+
+    fn handle_pending(&self, stream: Stream) -> acceptor::PendingAction {
+        self.push(stream);
+        acceptor::PendingAction::AcceptedWithRetry
+    }
+}
+
+impl SimChannelAcceptor {
+    fn push(&self, stream: Stream) {
+        use crate::stream3::endpoint::reset_error::ResetError;
+        match self.tx.send_back(stream) {
+            Ok(Some(mut evicted)) => evicted.reset(ResetError::ServerBusy),
+            Ok(None) => {}
+            Err(_) => {
+                // All receivers dropped — unregister the acceptor.
+                drop(self.handle.lock().unwrap().take());
+            }
+        }
+    }
+}
+
+// ── SimServer ─────────────────────────────────────────────────────────────────
+
+/// High-level sim server that lazily creates one [`Endpoint`] per Bach group.
+///
+/// The underlying endpoint is bound to [`SERVER_PORT`] so clients can resolve
+/// the peer address using only the group name:
+/// ```ignore
+/// let stream = client.connect("server:4433", acceptor_id).await.unwrap();
+/// ```
+///
+/// Acceptors are registered via [`SimServer::register_acceptor_channel`], which
+/// returns an [`mpmc::Receiver<Stream>`] that yields accepted streams.
+pub struct SimServer {
+    endpoint: Arc<Endpoint>,
+}
+
+impl SimServer {
+    /// Returns the sim server for the current Bach group, creating it if needed.
+    ///
+    /// Binds sockets to `0.0.0.0:`[`SERVER_PORT`].  Call this inside the group
+    /// task (after `.group("name").spawn()`) so the socket is associated with the
+    /// correct simulated machine.
+    pub fn new() -> Self {
+        let bind_addr: SocketAddr = format!("0.0.0.0:{SERVER_PORT}").parse().unwrap();
+        let endpoint = get_or_create_group_endpoint(bind_addr);
+        Self { endpoint }
+    }
+
+    /// Returns the bound data address of the underlying endpoint.
+    pub fn data_addr(&self) -> SocketAddr {
+        self.endpoint.data_addr
+    }
+
+    /// Register a channel-based acceptor for incoming streams.
+    ///
+    /// Returns an [`mpmc::Receiver<Stream>`] that yields accepted [`Stream`]s.
+    /// The acceptor is automatically unregistered when all receivers are dropped.
+    /// `capacity` is the maximum number of accepted streams buffered in the channel.
+    pub fn register_acceptor_channel(
+        &self,
+        acceptor_id: VarInt,
+        capacity: usize,
+    ) -> io::Result<mpmc::Receiver<Stream>> {
+        let (tx, rx) = mpmc::new(capacity);
+        let acceptor = Arc::new(SimChannelAcceptor {
+            tx,
+            handle: std::sync::Mutex::new(None),
+        });
+        let handle = self
+            .endpoint
+            .acceptor_registry
+            .register(acceptor_id, acceptor.clone())
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::AddrInUse, "acceptor ID already registered")
+            })?;
+        *acceptor.handle.lock().unwrap() = Some(handle);
+        Ok(rx)
+    }
+}
+
+impl Default for SimServer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ── SimClient ─────────────────────────────────────────────────────────────────
+
+/// High-level sim client that lazily creates one [`Endpoint`] per Bach group.
+///
+/// Call [`SimClient::connect`] to resolve the peer by group name, auto-insert
+/// fake path-secrets, and get back a ready-to-use bidirectional [`Stream`]:
+///
+/// ```ignore
+/// let mut client = SimClient::new();
+/// let mut stream = client.connect("server:4433", VarInt::from_u8(1)).await?;
+/// ```
+pub struct SimClient {
+    endpoint: Arc<Endpoint>,
+    /// Cloned allocator so `connect` can call `alloc_or_grow(&mut self)` without
+    /// holding a mutable reference to the Arc-wrapped endpoint.
+    queue_allocator: super::msg::queue::Allocator,
+}
+
+impl SimClient {
+    /// Returns the sim client for the current Bach group, creating it if needed.
+    ///
+    /// Binds sockets to an ephemeral port (`0.0.0.0:0`).  Call this inside the
+    /// group task so the socket is associated with the correct simulated machine.
+    pub fn new() -> Self {
+        let bind_addr: SocketAddr = "0.0.0.0:0".parse().unwrap();
+        let endpoint = get_or_create_group_endpoint(bind_addr);
+        let queue_allocator = endpoint.queue_allocator.clone();
+        Self {
+            endpoint,
+            queue_allocator,
+        }
+    }
+
+    /// Returns the bound data address of the underlying endpoint.
+    pub fn data_addr(&self) -> SocketAddr {
+        self.endpoint.data_addr
+    }
+
+    /// Connect to a peer, returning a bidirectional [`Stream`].
+    ///
+    /// Resolves `peer` via [`bach::net::lookup_host`] (so `"server:4433"` works),
+    /// auto-inserts fake path-secret entries into both endpoint maps if not already
+    /// present, then allocates queues and constructs the `Stream`.
+    ///
+    /// The returned stream is ready to use: call [`Stream::write_all_from_fin`] /
+    /// [`Stream::read_into`] (or the tokio `AsyncRead`/`AsyncWrite` impls) to
+    /// exchange data with the server.
+    pub async fn connect<A>(&mut self, peer: A, acceptor_id: VarInt) -> io::Result<Stream>
+    where
+        A: bach::net::ToSocketAddrs,
+    {
+        // Yield so the server group has had a chance to bind its socket.
+        bach::task::yield_now().await;
+
+        // Resolve hostname → SocketAddr (e.g. "server:4433" → <server-ip>:4433).
+        let peer_addr = bach::net::lookup_host(peer)
+            .await
+            .map_err(|e| io::Error::new(io::ErrorKind::AddrNotAvailable, e))?
+            .next()
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::AddrNotAvailable, "no address found for peer")
+            })?;
+
+        // Auto-insert path secrets (idempotent: re-uses existing entry if present).
+        let path_secret_entry = connect(&self.endpoint, peer_addr);
+
+        // Allocate a fresh stream ID and flow queues.
+        let stream_id =
+            VarInt::new(self.endpoint.next_stream_id.fetch_add(1, Ordering::Relaxed))
+                .expect("stream_id overflow");
+
+        let handle = flow::Handle::client(stream_id, path_secret_entry.clone());
+        let (queue_control, queue_stream) =
+            self.queue_allocator.alloc_or_grow(handle, None);
+
+        // Build Reader + Writer and wrap them in a Stream.
+        let frame_tx = self.endpoint.frame_tx.clone();
+        let writer = Writer::new_client(
+            frame_tx.clone(),
+            path_secret_entry.clone(),
+            stream_id,
+            acceptor_id,
+            queue_control,
+        );
+        let reader = Reader::new_client(frame_tx, path_secret_entry, stream_id, queue_stream);
+
+        Ok(Stream::new(reader, writer))
+    }
+}
+
+impl Default for SimClient {
+    fn default() -> Self {
+        Self::new()
+    }
 }
