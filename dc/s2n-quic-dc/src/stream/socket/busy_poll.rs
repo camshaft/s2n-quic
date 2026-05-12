@@ -3,9 +3,11 @@
 
 use super::{
     fd::{udp, Flags},
-    poll_recv_batch_one, RecvMessage,
+    RecvMessage,
     Protocol, Socket, TransportFeatures,
 };
+#[cfg(not(target_os = "linux"))]
+use super::handle::poll_recv_batch_one;
 use crate::msg::{addr::Addr, cmsg};
 use core::task::{Context, Poll};
 use s2n_quic_core::{ensure, inet::ExplicitCongestionNotification};
@@ -110,10 +112,10 @@ where
     #[inline]
     fn poll_recv_batch(
         &self,
-        cx: &mut Context,
+        _cx: &mut Context,
         messages: &mut [RecvMessage<'_>],
     ) -> Poll<io::Result<usize>> {
-        #[cfg(s2n_quic_platform_socket_mmsg)]
+        #[cfg(target_os = "linux")]
         {
             loop {
                 let flags = Flags::default();
@@ -129,9 +131,9 @@ where
             }
         }
 
-        #[cfg(not(s2n_quic_platform_socket_mmsg))]
+        #[cfg(not(target_os = "linux"))]
         {
-            poll_recv_batch_one(self, cx, messages)
+            poll_recv_batch_one(self, _cx, messages)
         }
     }
 

@@ -440,19 +440,22 @@ fn flatten_empty_queue_skipped() {
 fn socket_receiver_buffers_batched_results() {
     use crate::stream::socket::RecvMessage;
     use std::{
-        cell::{Cell, RefCell},
         collections::VecDeque,
         io,
         net::{Ipv4Addr, SocketAddr},
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc, Mutex,
+        },
     };
 
     #[derive(Default)]
     struct State {
-        polls: Cell<usize>,
-        batches: RefCell<VecDeque<Vec<(SocketAddr, Vec<u8>)>>>,
+        polls: AtomicUsize,
+        batches: Mutex<VecDeque<Vec<(SocketAddr, Vec<u8>)>>>,
     }
 
-    struct TestBatchSocket(std::rc::Rc<State>);
+    struct TestBatchSocket(Arc<State>);
 
     impl crate::socket::recv::Socket for TestBatchSocket {
         fn poll_recv(
@@ -470,8 +473,8 @@ fn socket_receiver_buffers_batched_results() {
             _cx: &mut core::task::Context<'_>,
             messages: &mut [RecvMessage<'_>],
         ) -> Poll<io::Result<usize>> {
-            self.0.polls.set(self.0.polls.get() + 1);
-            let Some(batch) = self.0.batches.borrow_mut().pop_front() else {
+            self.0.polls.fetch_add(1, Ordering::Relaxed);
+            let Some(batch) = self.0.batches.lock().unwrap().pop_front() else {
                 return Poll::Pending;
             };
 
@@ -489,8 +492,8 @@ fn socket_receiver_buffers_batched_results() {
         }
     }
 
-    let state = std::rc::Rc::new(State::default());
-    state.batches.borrow_mut().push_back(vec![
+    let state = Arc::new(State::default());
+    state.batches.lock().unwrap().push_back(vec![
         (SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 1111), vec![1, 2, 3]),
         (SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 2222), vec![4, 5]),
     ]);
@@ -504,7 +507,7 @@ fn socket_receiver_buffers_batched_results() {
         Poll::Ready(Some(Ok(segments))) => segments.take_filled(),
         other => panic!("unexpected first poll result: {other:?}"),
     };
-    assert_eq!(state.polls.get(), 1);
+    assert_eq!(state.polls.load(Ordering::Relaxed), 1);
     assert_eq!(first.remote_address().get().port(), 1111);
     assert_eq!(first.payload(), &[1, 2, 3]);
 
@@ -512,12 +515,12 @@ fn socket_receiver_buffers_batched_results() {
         Poll::Ready(Some(Ok(segments))) => segments.take_filled(),
         other => panic!("unexpected second poll result: {other:?}"),
     };
-    assert_eq!(state.polls.get(), 1);
+    assert_eq!(state.polls.load(Ordering::Relaxed), 1);
     assert_eq!(second.remote_address().get().port(), 2222);
     assert_eq!(second.payload(), &[4, 5]);
 
     assert!(matches!(rx.poll_recv(&mut cx), Poll::Pending));
-    assert_eq!(state.polls.get(), 2);
+    assert_eq!(state.polls.load(Ordering::Relaxed), 2);
 }
 
 // ── Paced tests ────────────────────────────────────────────────────

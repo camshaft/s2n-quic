@@ -1491,8 +1491,6 @@ where
         &mut self,
         cx: &mut task::Context<'_>,
     ) -> Poll<Option<io::Result<descriptor::Segments>>> {
-        use std::io;
-
         if let Some(segments) = self.ready.pop_front() {
             if !self.ready.is_empty() {
                 cx.waker().wake_by_ref();
@@ -1521,10 +1519,11 @@ where
 
         let mut messages = Vec::with_capacity(self.pending.len());
         for (unfilled, cmsg) in self.pending.iter_mut().zip(self.cmsgs.iter_mut()) {
+            let (addr, payload) = unfilled.recv_parts_mut();
             messages.push(crate::stream::socket::RecvMessage::new(
-                unfilled.remote_address_mut(),
+                addr,
                 cmsg,
-                unfilled.payload_mut(),
+                payload,
             ));
         }
 

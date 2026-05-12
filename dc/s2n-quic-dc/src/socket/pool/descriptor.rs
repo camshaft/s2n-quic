@@ -267,6 +267,19 @@ impl Unfilled {
     }
 
     #[inline]
+    pub fn recv_parts_mut(&mut self) -> (&mut Addr, &mut [u8]) {
+        let desc = self.desc.as_ref().expect("invalid state");
+        let capacity = desc.inner().capacity as usize;
+        unsafe {
+            let base = desc.ptr.as_ptr().cast::<u8>();
+            let addr = &mut *base.add(desc.inner().addr_offset()).cast::<Addr>();
+            let payload =
+                core::slice::from_raw_parts_mut(base.add(desc.inner().payload_offset()), capacity);
+            (addr, payload)
+        }
+    }
+
+    #[inline]
     pub fn fill(mut self, len: usize, cmsg: cmsg::Receiver) -> Segments {
         let desc = self.desc.take().expect("invalid state");
         let capacity = desc.inner().capacity as usize;
@@ -288,10 +301,11 @@ impl Unfilled {
     where
         F: FnOnce(&mut Addr, &mut cmsg::Receiver, IoSliceMut) -> Result<usize, E>,
     {
-        let iov = IoSliceMut::new(self.payload_mut());
+        let (addr, payload) = self.recv_parts_mut();
+        let iov = IoSliceMut::new(payload);
         let mut cmsg = cmsg::Receiver::default();
 
-        let len = match f(self.remote_address_mut(), &mut cmsg, iov) {
+        let len = match f(addr, &mut cmsg, iov) {
             Ok(len) => {
                 debug_assert!(len <= self.capacity());
                 len

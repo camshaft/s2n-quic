@@ -93,7 +93,7 @@ where
     })
 }
 
-#[cfg(s2n_quic_platform_socket_mmsg)]
+#[cfg(target_os = "linux")]
 #[inline]
 pub fn recv_mmsg<T>(fd: &T, messages: &mut [RecvMessage<'_>], flags: Flags) -> io::Result<usize>
 where
