@@ -14,6 +14,7 @@ use crate::{
     socket::{
         channel::{intrusive_queue::unsync, ByteCost, Receiver, UnboundedSender},
         pool::descriptor,
+        rate::{Rate, TokenBucket},
     },
     stream3::{endpoint::send, frame::Frame},
 };
@@ -252,6 +253,94 @@ where
         }
 
         Poll::Ready(Some(batch))
+    }
+
+    #[inline]
+    fn on_consumed(&mut self, bytes: u64) {
+        self.inner.on_consumed(bytes);
+    }
+}
+
+// ── FrameDispatchPacer ────────────────────────────────────────────────────
+
+/// Pacing combinator for the stream3 frame-dispatch pipeline.
+///
+/// This is an experimental alternative to [`crate::socket::channel::Paced`] for Task 2 of
+/// [`super::tasks::frame_dispatch`].  Unlike `Paced`, which relies on `on_consumed` to arm
+/// its timer (a callback that `drain_budgeted` never invokes), `FrameDispatchPacer` arms the
+/// timer directly inside `poll_recv` — immediately after pulling an item from the inner
+/// receiver.
+///
+/// The assumed cost is always [`u16::MAX`] bytes, regardless of the actual `byte_cost()` of
+/// the item.  This deliberate over-estimate introduces a small inter-batch delay that gives
+/// more frames a chance to accumulate in the priority lanes before the next batch is
+/// dispatched, improving batching without noticeably degrading throughput.
+pub struct FrameDispatchPacer<R, Clk, T>
+where
+    Clk: precision::Clock,
+{
+    inner: R,
+    timer: Clk::Timer,
+    rate: Rate,
+    bucket: TokenBucket,
+    buffered: Option<T>,
+}
+
+impl<R, Clk, T> FrameDispatchPacer<R, Clk, T>
+where
+    Clk: precision::Clock,
+{
+    pub fn new(inner: R, clock: Clk, rate: Rate) -> Self {
+        use crate::clock::precision::Timer as _;
+
+        let timer = clock.timer();
+        let now = timer.now();
+        let bucket = TokenBucket::new(now, &rate);
+        Self {
+            inner,
+            timer,
+            rate,
+            bucket,
+            buffered: None,
+        }
+    }
+}
+
+impl<T, R, Clk> Receiver<T> for FrameDispatchPacer<R, Clk, T>
+where
+    R: Receiver<T>,
+    Clk: precision::Clock,
+{
+    fn poll_recv(&mut self, cx: &mut core::task::Context<'_>) -> core::task::Poll<Option<T>> {
+        use crate::clock::precision::Timer as _;
+        use core::task::Poll;
+
+        // If we have a buffered item from a previous poll, wait for the pacing timer.
+        if self.buffered.is_some() {
+            ready!(self.timer.poll_ready(cx));
+            return Poll::Ready(self.buffered.take());
+        }
+
+        // Pull next item from the inner receiver.
+        let item = ready!(self.inner.poll_recv(cx));
+
+        let Some(item) = item else {
+            return Poll::Ready(None);
+        };
+
+        // Arm the timer as if this item consumed a full u16::MAX-byte packet.
+        let now = self.timer.now();
+        let cost_nanos = self.rate.nanos_for_bytes(u16::MAX as u64);
+        let sleep_nanos = self.bucket.consume(now, cost_nanos);
+
+        if sleep_nanos > 0 {
+            let target = now + std::time::Duration::from_nanos(sleep_nanos);
+            self.timer.update(target);
+            self.buffered = Some(item);
+            return Poll::Pending;
+        }
+
+        Poll::Ready(Some(item))
     }
 
     #[inline]

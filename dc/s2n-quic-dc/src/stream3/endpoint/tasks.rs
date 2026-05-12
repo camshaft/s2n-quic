@@ -21,7 +21,7 @@ use crate::{
             self,
             combinator::{
                 Assembler, BatchFramesByPathSecret, CompletionDispatcher, FrameBatch,
-                PathSecretMapEntry, PickTwo,
+                FrameDispatchPacer, PathSecretMapEntry, PickTwo,
             },
             dispatch, msg, send, Budgets,
         },
@@ -58,7 +58,8 @@ pub const DEFAULT_DISPATCH_BUDGET: usize = 32;
 ///   wrapped in [`BatchFramesByPathSecret`] to coalesce frames for the same peer into
 ///   datagram-sized batches. The resulting per-priority [`Receiver<FrameBatch>`] streams are
 ///   merged in urgency order by [`channel::Priority`], overall bandwidth is throttled by
-///   [`channel::Paced`], and each batch is routed to a send socket via [`pick_two`].
+///   [`combinator::FrameDispatchPacer`] (which paces as if each batch is `u16::MAX` bytes to
+///   improve batching), and each batch is routed to a send socket via [`pick_two`].
 ///
 /// # Why prioritize before batching
 ///
@@ -88,7 +89,7 @@ pub const DEFAULT_DISPATCH_BUDGET: usize = 32;
 /// Task 2 (batcher + distributor):
 ///   [per-priority unsync rx[i] → BatchFramesByPathSecret]
 ///     → Priority (urgency-ordered merge)
-///     → Paced (overall bandwidth cap)
+///     → FrameDispatchPacer (inter-batch delay assuming u16::MAX-byte packets)
 ///     → pick_two (send-socket routing)
 /// ```
 ///
@@ -100,7 +101,7 @@ pub const DEFAULT_DISPATCH_BUDGET: usize = 32;
 /// [`poll_swap`]: crate::socket::channel::intrusive_queue::sharded::Receiver::poll_swap
 /// [`ListSender`]: crate::socket::channel::intrusive_queue::unsync::ListSender
 /// [`channel::Priority`]: crate::socket::channel::Priority
-/// [`channel::Paced`]: crate::socket::channel::Paced
+/// [`combinator::FrameDispatchPacer`]: crate::stream3::endpoint::combinator::FrameDispatchPacer
 /// [`Priority::LEVELS`]: crate::datagram::batch::Priority::LEVELS
 /// [`PriorityStorage`]: crate::stream3::frame::PriorityStorage
 /// [`PriorityInput`]: crate::stream3::frame::PriorityInput
@@ -147,7 +148,7 @@ pub fn frame_dispatch<S, Rand, Clk>(
     // Task 2: batch → Entry → priority merge → pace → pick-two to workers.
     spawner.spawn(async move {
         let rx = PriorityRx::new(priority_batch_rxs);
-        let rx = Paced::new(rx, clock, overall_send_rate);
+        let rx = FrameDispatchPacer::new(rx, clock, overall_send_rate);
         let rx = PickTwo::new(rx, worker_senders, random);
         rx.drain_budgeted(Some(budgets.frame_dispatch)).await;
     });
