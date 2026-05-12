@@ -206,7 +206,7 @@ impl<S: crate::socket::recv::Socket> crate::socket::recv::Socket for MeteredRecv
         let result = self.inner.poll_recv_batch(cx, messages);
         if let core::task::Poll::Ready(Ok(received)) = &result {
             let bytes = messages.iter().take(*received).map(|message| message.len as u64).sum();
-            self.rx_counter.add(1);
+            self.rx_counter.add(*received as u64);
             self.rx_bytes_counter.add(bytes);
         }
         result
