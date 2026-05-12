@@ -94,54 +94,94 @@ where
 }
 
 #[cfg(target_os = "linux")]
+struct RecvMmsgScratch {
+    cmsg_storage: Vec<cmsg::Storage<{ cmsg::DECODER_LEN }>>,
+    iovecs: Vec<libc::iovec>,
+    msgvec: Vec<libc::mmsghdr>,
+}
+
+#[cfg(target_os = "linux")]
+impl RecvMmsgScratch {
+    #[inline]
+    fn new() -> Self {
+        Self {
+            cmsg_storage: Vec::new(),
+            iovecs: Vec::new(),
+            msgvec: Vec::new(),
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
 #[inline]
 pub fn recv_mmsg<T>(fd: &T, messages: &mut [RecvMessage<'_>], flags: Flags) -> io::Result<usize>
 where
     T: AsRawFd,
 {
-    use libc::mmsghdr;
-
     let count = messages.len().min(1024);
     if count == 0 {
         return Ok(0);
     }
 
-    let mut cmsg_storage = Vec::with_capacity(count);
-    let mut iovecs = Vec::with_capacity(count);
-    let mut msgvec = Vec::with_capacity(count);
-
-    for message in messages.iter_mut().take(count) {
-        message.len = 0;
-
-        cmsg_storage.push(cmsg::Storage::<{ cmsg::DECODER_LEN }>::default());
-        iovecs.push(IoSliceMut::new(message.payload));
-
-        let mut msg = unsafe { core::mem::zeroed::<mmsghdr>() };
-        message.addr.recv_with_msg(&mut msg.msg_hdr);
-        msg.msg_hdr.msg_control = cmsg_storage.last_mut().unwrap().as_mut_ptr() as *mut _;
-        msg.msg_hdr.msg_controllen = cmsg_storage.last().unwrap().len() as _;
-        msg.msg_hdr.msg_iov = iovecs.last_mut().unwrap() as *mut IoSliceMut as *mut _;
-        msg.msg_hdr.msg_iovlen = 1;
-        msgvec.push(msg);
+    thread_local! {
+        static SCRATCH: std::cell::RefCell<RecvMmsgScratch> =
+            std::cell::RefCell::new(RecvMmsgScratch::new());
     }
 
-    let len = libc_call(|| unsafe {
-        libc::recvmmsg(
-            fd.as_raw_fd(),
-            msgvec.as_mut_ptr(),
-            count as _,
-            flags as _,
-            core::ptr::null_mut(),
-        ) as _
-    })?;
+    SCRATCH.with(|scratch| {
+        let mut scratch = scratch.borrow_mut();
+        scratch
+            .cmsg_storage
+            .resize_with(count, cmsg::Storage::<{ cmsg::DECODER_LEN }>::default);
+        scratch.iovecs.resize(
+            count,
+            libc::iovec {
+                iov_base: core::ptr::null_mut(),
+                iov_len: 0,
+            },
+        );
+        scratch
+            .msgvec
+            .resize_with(count, || unsafe { core::mem::zeroed::<libc::mmsghdr>() });
 
-    for (message, msg) in messages.iter_mut().zip(msgvec.iter()).take(len) {
-        message.addr.update_with_msg(&msg.msg_hdr);
-        message.cmsg.with_msg(&msg.msg_hdr);
-        message.len = msg.msg_len as usize;
-    }
+        for (idx, message) in messages.iter_mut().take(count).enumerate() {
+            message.len = 0;
+            scratch.cmsg_storage[idx] = cmsg::Storage::<{ cmsg::DECODER_LEN }>::default();
+            scratch.iovecs[idx] = libc::iovec {
+                iov_base: message.payload.as_mut_ptr() as *mut _,
+                iov_len: message.payload.len(),
+            };
+            let msg_control = scratch.cmsg_storage[idx].as_mut_ptr() as *mut _;
+            let msg_controllen = scratch.cmsg_storage[idx].len() as _;
+            let msg_iov = &mut scratch.iovecs[idx] as *mut _;
 
-    Ok(len)
+            let msg = &mut scratch.msgvec[idx];
+            *msg = unsafe { core::mem::zeroed() };
+            message.addr.recv_with_msg(&mut msg.msg_hdr);
+            msg.msg_hdr.msg_control = msg_control;
+            msg.msg_hdr.msg_controllen = msg_controllen;
+            msg.msg_hdr.msg_iov = msg_iov;
+            msg.msg_hdr.msg_iovlen = 1;
+        }
+
+        let len = libc_call(|| unsafe {
+            libc::recvmmsg(
+                fd.as_raw_fd(),
+                scratch.msgvec.as_mut_ptr(),
+                count as _,
+                flags as _,
+                core::ptr::null_mut(),
+            ) as _
+        })?;
+
+        for (message, msg) in messages.iter_mut().zip(scratch.msgvec.iter()).take(len) {
+            message.addr.update_with_msg(&msg.msg_hdr);
+            message.cmsg.with_msg(&msg.msg_hdr);
+            message.len = msg.msg_len as usize;
+        }
+
+        Ok(len)
+    })
 }
 
 /// Constructs a msghdr for receiving

@@ -1557,6 +1557,9 @@ where
             }
             Poll::Ready(Some(Ok(segments)))
         } else {
+            // If the kernel delivered only zero-length datagrams, we recycled those descriptors
+            // back into `pending` without emitting a packet. Self-wake so we can retry the hot
+            // path without waiting for an external wakeup.
             if received > 0 {
                 cx.waker().wake_by_ref();
             }
