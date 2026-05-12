@@ -21,6 +21,12 @@ pub mod socket;
 pub(crate) mod tasks;
 pub(crate) mod worker;
 
+#[cfg(any(test, feature = "testing"))]
+pub mod testing;
+
+#[cfg(test)]
+mod tests;
+
 use crate::{
     acceptor, packet,
     socket::{channel::intrusive_queue::sync as sync_queue, pool::descriptor},
@@ -47,6 +53,8 @@ pub struct Endpoint {
     pub next_stream_id: AtomicU64,
     /// The port that recv sockets are bound to
     pub data_port: u16,
+    /// Full socket address the recv socket is listening on
+    pub data_addr: std::net::SocketAddr,
 }
 
 // ── Pipeline Setup ────────────────────────────────────────────────────────
@@ -275,11 +283,11 @@ where
     );
 
     // The port our recv sockets listen on — embedded in outbound packets so peers can ACK back.
-    let source_control_port = recv_sockets
+    let source_control_addr = recv_sockets
         .first()
         .and_then(|s| s.local_addr().ok())
-        .map(|a| a.port())
-        .unwrap_or(0);
+        .unwrap_or_else(|| "0.0.0.0:0".parse().unwrap());
+    let source_control_port = source_control_addr.port();
 
     // Frame submission channel: all writers share one sharded sender; one dispatch task drains it.
     let (frame_tx, frame_rx) = frame::submission_channel(submission_shards);
@@ -449,6 +457,7 @@ where
         counters: counter_registry,
         next_stream_id: AtomicU64::new(0),
         data_port: source_control_port,
+        data_addr: source_control_addr,
     }
 }
 
