@@ -44,9 +44,18 @@ impl<A: intrusive_queue::Adapter> Shared<A> {
     ///
     /// # Safety
     ///
-    /// Must be called on the same thread that created and accesses `Shared`.
+    /// The caller must have exclusive access to `Shared`: `Shared` is wrapped
+    /// in `Rc` (non-`Send`), so all access must be on the same thread.
+    /// Calling this while the receiver's `poll_recv` is concurrently reading
+    /// `self.waker` via `&mut self` would be unsound.  Because `Rc` prevents
+    /// sharing across threads and Rust's borrow checker ensures `&mut Receiver`
+    /// and `&mut Sender` are not held simultaneously in safe code, this
+    /// invariant is upheld automatically.
     #[inline(always)]
     unsafe fn wake_receiver(&self) {
+        // SAFETY: guaranteed to be on the same thread as the receiver because
+        // `Shared` is wrapped in `Rc`.  The `&mut self` of `send` and
+        // `poll_recv` ensures the waker slot is accessed by at most one caller.
         if let Some(waker) = (*self.waker.get()).take() {
             waker.wake();
         }

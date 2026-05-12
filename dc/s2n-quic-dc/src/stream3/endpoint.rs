@@ -283,10 +283,12 @@ where
     );
 
     // The port our recv sockets listen on — embedded in outbound packets so peers can ACK back.
+    const UNSPECIFIED_ADDR: std::net::SocketAddr =
+        std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0);
     let source_control_addr = recv_sockets
         .first()
         .and_then(|s| s.local_addr().ok())
-        .unwrap_or_else(|| "0.0.0.0:0".parse().unwrap());
+        .unwrap_or(UNSPECIFIED_ADDR);
     let source_control_port = source_control_addr.port();
 
     // Frame submission channel: all writers share one sharded sender; one dispatch task drains it.

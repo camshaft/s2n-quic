@@ -166,8 +166,10 @@ pub fn setup_sim_endpoint(
 /// Both maps receive reciprocal entries with the same shared secret. Returns the
 /// common credential ID.
 ///
-/// Also sets the socket sender count on both maps to `num_senders` (must match the
-/// `num_send_sockets` value used in [`SimEndpointConfig`]).
+/// The socket sender count used for the new entries is read from each map; call
+/// [`setup_sim_endpoint`] (which calls [`Map::set_socket_sender_count`]) before
+/// this function so the entries are allocated with the correct number of sender
+/// slots.
 pub fn insert_fake_path_pair(
     local_map: &PathSecretMap,
     local_addr: SocketAddr,
