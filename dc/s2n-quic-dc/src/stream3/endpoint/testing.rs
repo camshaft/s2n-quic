@@ -71,8 +71,12 @@ fn register_endpoint_map(data_addr: SocketAddr, map: PathSecretMap) {
 
 /// Well-known port that [`SimServer`] binds to.
 ///
-/// Clients resolve the peer address via `"<group-name>:SERVER_PORT"` using
-/// [`bach::net::lookup_host`], so no explicit address-exchange channel is needed.
+/// 4433 is the QUIC/IETF QUIC standard port and is conventionally used for DC
+/// (datagram-capable) connections.  Using a well-known port means clients can
+/// resolve the peer address by group name alone, without an out-of-band channel:
+/// ```ignore
+/// client.connect("server:4433", acceptor_id).await
+/// ```
 pub const SERVER_PORT: u16 = 4433;
 
 /// Returns the shared [`Endpoint`] for the current Bach group, creating it lazily.
@@ -162,7 +166,7 @@ pub struct SimEndpointConfig {
 impl Default for SimEndpointConfig {
     fn default() -> Self {
         Self {
-            bind_addr: "0.0.0.0:0".parse().unwrap(),
+            bind_addr: SocketAddr::new(std::net::Ipv4Addr::UNSPECIFIED.into(), 0),
             num_send_sockets: 1,
             submission_shards: 1,
             overall_send_rate: Rate::new(25.0),
@@ -373,7 +377,11 @@ impl SimChannelAcceptor {
     fn push(&self, stream: Stream) {
         use crate::stream3::endpoint::reset_error::ResetError;
         match self.tx.send_back(stream) {
-            Ok(Some(mut evicted)) => evicted.reset(ResetError::ServerBusy),
+            Ok(Some(mut evicted)) => {
+                // Channel is full: reset the oldest accepted stream rather than
+                // dropping it silently.  ServerBusy is the closest error code.
+                evicted.reset(ResetError::ServerBusy)
+            }
             Ok(None) => {}
             Err(_) => {
                 // All receivers dropped — unregister the acceptor.
@@ -406,7 +414,7 @@ impl SimServer {
     /// task (after `.group("name").spawn()`) so the socket is associated with the
     /// correct simulated machine.
     pub fn new() -> Self {
-        let bind_addr: SocketAddr = format!("0.0.0.0:{SERVER_PORT}").parse().unwrap();
+        let bind_addr = SocketAddr::new(std::net::Ipv4Addr::UNSPECIFIED.into(), SERVER_PORT);
         let endpoint = get_or_create_group_endpoint(bind_addr);
         Self { endpoint }
     }
@@ -473,7 +481,7 @@ impl SimClient {
     /// Binds sockets to an ephemeral port (`0.0.0.0:0`).  Call this inside the
     /// group task so the socket is associated with the correct simulated machine.
     pub fn new() -> Self {
-        let bind_addr: SocketAddr = "0.0.0.0:0".parse().unwrap();
+        let bind_addr = SocketAddr::new(std::net::Ipv4Addr::UNSPECIFIED.into(), 0);
         let endpoint = get_or_create_group_endpoint(bind_addr);
         let queue_allocator = endpoint.queue_allocator.clone();
         Self {
