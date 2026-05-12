@@ -238,47 +238,70 @@ impl Unfilled {
         Some(Self { desc: Some(desc) })
     }
 
+    #[inline]
+    pub fn capacity(&self) -> usize {
+        self.desc
+            .as_ref()
+            .expect("invalid state")
+            .inner()
+            .capacity as usize
+    }
+
+    #[inline]
+    pub fn payload_mut(&mut self) -> &mut [u8] {
+        let desc = self.desc.as_ref().expect("invalid state");
+        let capacity = desc.inner().capacity as usize;
+        unsafe {
+            let base = desc.ptr.as_ptr().cast::<u8>();
+            core::slice::from_raw_parts_mut(base.add(desc.inner().payload_offset()), capacity)
+        }
+    }
+
+    #[inline]
+    pub fn remote_address_mut(&mut self) -> &mut Addr {
+        let desc = self.desc.as_ref().expect("invalid state");
+        unsafe {
+            let base = desc.ptr.as_ptr().cast::<u8>();
+            &mut *base.add(desc.inner().addr_offset()).cast::<Addr>()
+        }
+    }
+
+    #[inline]
+    pub fn fill(mut self, len: usize, cmsg: cmsg::Receiver) -> Segments {
+        let desc = self.desc.take().expect("invalid state");
+        let capacity = desc.inner().capacity as usize;
+        let len = len.min(capacity) as u16;
+
+        let desc = unsafe {
+            // SAFETY: the descriptor is exclusively owned here and `len` is clamped to capacity
+            desc.into_filled(len, cmsg.ecn())
+        };
+        Segments {
+            descriptor: desc,
+            segment_len: cmsg.segment_len(),
+        }
+    }
+
     /// Fills the packet with the given callback, if the callback is successful
     #[inline]
     pub fn fill_with<F, E>(mut self, f: F) -> Result<Segments, (Self, E)>
     where
         F: FnOnce(&mut Addr, &mut cmsg::Receiver, IoSliceMut) -> Result<usize, E>,
     {
-        let desc = self.desc.take().expect("invalid state");
-        let capacity = desc.inner().capacity as usize;
-        let addr = unsafe {
-            let base = desc.ptr.as_ptr().cast::<u8>();
-            &mut *base.add(desc.inner().addr_offset()).cast::<Addr>()
-        };
-        let data = unsafe {
-            // SAFETY: the payload region was allocated with at least `capacity` bytes
-            let base = desc.ptr.as_ptr().cast::<u8>();
-            core::slice::from_raw_parts_mut(base.add(desc.inner().payload_offset()), capacity)
-        };
-        let iov = IoSliceMut::new(data);
+        let iov = IoSliceMut::new(self.payload_mut());
         let mut cmsg = cmsg::Receiver::default();
 
-        let len = match f(addr, &mut cmsg, iov) {
+        let len = match f(self.remote_address_mut(), &mut cmsg, iov) {
             Ok(len) => {
-                debug_assert!(len <= capacity);
-                len.min(capacity) as u16
+                debug_assert!(len <= self.capacity());
+                len
             }
             Err(err) => {
-                let unfilled = Self { desc: Some(desc) };
-                return Err((unfilled, err));
+                return Err((self, err));
             }
         };
 
-        let desc = unsafe {
-            // SAFETY: the descriptor is exclusively owned here and the returned len does not exceed
-            //         the allowed capacity
-            desc.into_filled(len, cmsg.ecn())
-        };
-        let segments = Segments {
-            descriptor: desc,
-            segment_len: cmsg.segment_len(),
-        };
-        Ok(segments)
+        Ok(self.fill(len, cmsg))
     }
 }
 

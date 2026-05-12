@@ -198,6 +198,21 @@ impl<S: crate::socket::recv::Socket> crate::socket::recv::Socket for MeteredRecv
     }
 
     #[inline]
+    fn poll_recv_batch(
+        &self,
+        cx: &mut core::task::Context,
+        messages: &mut [crate::stream::socket::RecvMessage<'_>],
+    ) -> core::task::Poll<io::Result<usize>> {
+        let result = self.inner.poll_recv_batch(cx, messages);
+        if let core::task::Poll::Ready(Ok(received)) = &result {
+            let bytes = messages.iter().take(*received).map(|message| message.len as u64).sum();
+            self.rx_counter.add(1);
+            self.rx_bytes_counter.add(bytes);
+        }
+        result
+    }
+
+    #[inline]
     fn local_addr(&self) -> io::Result<SocketAddr> {
         self.inner.local_addr()
     }

@@ -22,7 +22,7 @@ pub use crate::socket::*;
 pub use application::Application;
 pub use busy_poll::BusyPoll;
 pub use gso::Gso;
-pub use handle::{Ext, Flags, Socket};
+pub use handle::{Ext, Flags, RecvMessage, Socket};
 pub use send_only::SendOnly;
 pub use wheel::Wheel;
 

@@ -19,6 +19,50 @@ pub use transmission::Entry as Transmission;
 
 pub type Flags = libc::c_int;
 
+pub struct RecvMessage<'a> {
+    pub addr: &'a mut Addr,
+    pub cmsg: &'a mut cmsg::Receiver,
+    pub payload: &'a mut [u8],
+    pub len: usize,
+}
+
+impl<'a> RecvMessage<'a> {
+    #[inline]
+    pub fn new(
+        addr: &'a mut Addr,
+        cmsg: &'a mut cmsg::Receiver,
+        payload: &'a mut [u8],
+    ) -> Self {
+        Self {
+            addr,
+            cmsg,
+            payload,
+            len: 0,
+        }
+    }
+}
+
+#[inline]
+pub fn poll_recv_batch_one<S: Socket + ?Sized>(
+    socket: &S,
+    cx: &mut Context,
+    messages: &mut [RecvMessage<'_>],
+) -> Poll<io::Result<usize>> {
+    let Some(message) = messages.first_mut() else {
+        return Poll::Ready(Ok(0));
+    };
+
+    let mut iov = [IoSliceMut::new(message.payload)];
+    match socket.poll_recv(cx, message.addr, message.cmsg, &mut iov) {
+        Poll::Ready(Ok(len)) => {
+            message.len = len;
+            Poll::Ready(Ok(1))
+        }
+        Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
+        Poll::Pending => Poll::Pending,
+    }
+}
+
 pub trait Socket: 'static + Send + Sync {
     /// Returns the local address for the socket
     fn local_addr(&self) -> io::Result<SocketAddr>;
@@ -62,6 +106,15 @@ pub trait Socket: 'static + Send + Sync {
         cmsg: &mut cmsg::Receiver,
         buffer: &mut [IoSliceMut],
     ) -> Poll<io::Result<usize>>;
+
+    #[inline]
+    fn poll_recv_batch(
+        &self,
+        cx: &mut Context,
+        messages: &mut [RecvMessage<'_>],
+    ) -> Poll<io::Result<usize>> {
+        poll_recv_batch_one(self, cx, messages)
+    }
 
     #[inline]
     fn send_transmission(&self, msg: Transmission) {
@@ -163,6 +216,15 @@ macro_rules! impl_box {
                 buffer: &mut [IoSliceMut],
             ) -> Poll<io::Result<usize>> {
                 (**self).poll_recv(cx, addr, cmsg, buffer)
+            }
+
+            #[inline(always)]
+            fn poll_recv_batch(
+                &self,
+                cx: &mut Context,
+                messages: &mut [RecvMessage<'_>],
+            ) -> Poll<io::Result<usize>> {
+                (**self).poll_recv_batch(cx, messages)
             }
 
             #[inline(always)]

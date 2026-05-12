@@ -53,6 +53,10 @@ pub struct EndpointConfig {
     /// Number of shards for the frame submission channel (must be power of two)
     #[serde(default = "EndpointConfig::default_submission_shards")]
     pub submission_shards: usize,
+
+    /// Maximum number of datagrams to submit in each recv batch syscall
+    #[serde(default = "EndpointConfig::default_recv_mmsg_entries")]
+    pub recv_mmsg_entries: usize,
 }
 
 impl EndpointConfig {
@@ -74,6 +78,10 @@ impl EndpointConfig {
 
     fn default_submission_shards() -> usize {
         128
+    }
+
+    fn default_recv_mmsg_entries() -> usize {
+        16
     }
 }
 
@@ -110,6 +118,7 @@ impl Default for EndpointConfig {
             bandwidth: Self::default_bandwidth(),
             per_socket_bandwidth: Self::default_per_socket_bandwidth(),
             submission_shards: Self::default_submission_shards(),
+            recv_mmsg_entries: Self::default_recv_mmsg_entries(),
         }
     }
 }

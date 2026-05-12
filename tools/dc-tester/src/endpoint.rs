@@ -81,6 +81,7 @@ pub fn create(
         overall_send_rate: Rate::new(config.bandwidth),
         per_socket_send_rate: Rate::new(config.per_socket_bandwidth),
         budgets: endpoint::Budgets::default(),
+        recv_mmsg_entries: config.recv_mmsg_entries,
         submission_shards: config.submission_shards,
     };
 

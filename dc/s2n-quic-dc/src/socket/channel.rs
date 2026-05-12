@@ -1454,15 +1454,31 @@ where
 pub struct SocketReceiver<S> {
     socket: S,
     alloc: crate::socket::pool::Pool,
-    pending: Option<descriptor::Unfilled>,
+    batch_size: usize,
+    pending: std::collections::VecDeque<descriptor::Unfilled>,
+    cmsgs: std::collections::VecDeque<crate::msg::cmsg::Receiver>,
+    ready: std::collections::VecDeque<descriptor::Segments>,
+    lengths: Vec<usize>,
 }
 
 impl<S> SocketReceiver<S> {
     pub fn new(socket: S, alloc: crate::socket::pool::Pool) -> Self {
+        Self::new_with_batch_size(socket, alloc, 1)
+    }
+
+    pub fn new_with_batch_size(
+        socket: S,
+        alloc: crate::socket::pool::Pool,
+        batch_size: usize,
+    ) -> Self {
         Self {
             socket,
             alloc,
-            pending: None,
+            batch_size: batch_size.max(1).min(1024),
+            pending: Default::default(),
+            cmsgs: Default::default(),
+            ready: Default::default(),
+            lengths: Vec::new(),
         }
     }
 }
@@ -1477,39 +1493,75 @@ where
     ) -> Poll<Option<io::Result<descriptor::Segments>>> {
         use std::io;
 
-        let unfilled = self.pending.take().or_else(|| self.alloc.alloc());
+        if let Some(segments) = self.ready.pop_front() {
+            if !self.ready.is_empty() {
+                cx.waker().wake_by_ref();
+            }
+            return Poll::Ready(Some(Ok(segments)));
+        }
 
-        let Some(unfilled) = unfilled else {
+        while self.pending.len() < self.batch_size {
+            let Some(unfilled) = self.alloc.alloc() else {
+                break;
+            };
+            self.pending.push_back(unfilled);
+            self.cmsgs.push_back(Default::default());
+        }
+
+        if self.pending.is_empty() {
             // Allocator exhausted
             tracing::warn!("packet allocator exhausted on recv path");
             cx.waker().wake_by_ref();
             return Poll::Pending;
+        }
+
+        for cmsg in &mut self.cmsgs {
+            *cmsg = Default::default();
+        }
+
+        let mut messages = Vec::with_capacity(self.pending.len());
+        for (unfilled, cmsg) in self.pending.iter_mut().zip(self.cmsgs.iter_mut()) {
+            messages.push(crate::stream::socket::RecvMessage::new(
+                unfilled.remote_address_mut(),
+                cmsg,
+                unfilled.payload_mut(),
+            ));
+        }
+
+        let received = match self.socket.poll_recv_batch(cx, &mut messages) {
+            Poll::Pending => return Poll::Pending,
+            Poll::Ready(Err(err)) => return Poll::Ready(Some(Err(err))),
+            Poll::Ready(Ok(received)) => received,
         };
 
-        let res = unfilled.fill_with(|addr, cmsg, buffer| {
-            match self.socket.poll_recv(cx, addr, cmsg, &mut [buffer]) {
-                Poll::Pending => Err(io::ErrorKind::WouldBlock.into()),
-                Poll::Ready(Ok(len)) => Ok(len),
-                Poll::Ready(Err(err)) => Err(err),
+        self.lengths.clear();
+        self.lengths
+            .extend(messages.iter().take(received).map(|message| message.len));
+        drop(messages);
+
+        for len in self.lengths.drain(..) {
+            let unfilled = self.pending.pop_front().expect("missing pending descriptor");
+            let cmsg = self.cmsgs.pop_front().expect("missing pending cmsg");
+
+            if len == 0 {
+                self.pending.push_back(unfilled);
+                self.cmsgs.push_back(Default::default());
+                continue;
             }
-        });
 
-        match res {
-            Ok(segments) => Poll::Ready(Some(Ok(segments))),
-            Err((desc, err)) => {
-                // Put the unfilled segment back for retry
-                self.pending = Some(desc);
+            self.ready.push_back(unfilled.fill(len, cmsg));
+        }
 
-                let kind = err.kind();
-
-                // If we got blocked, yield the future
-                if kind == io::ErrorKind::WouldBlock {
-                    return Poll::Pending;
-                }
-
-                // Return the error to the caller
-                Poll::Ready(Some(Err(err)))
+        if let Some(segments) = self.ready.pop_front() {
+            if !self.ready.is_empty() {
+                cx.waker().wake_by_ref();
             }
+            Poll::Ready(Some(Ok(segments)))
+        } else {
+            if received > 0 {
+                cx.waker().wake_by_ref();
+            }
+            Poll::Pending
         }
     }
 

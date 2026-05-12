@@ -436,6 +436,90 @@ fn flatten_empty_queue_skipped() {
     });
 }
 
+#[test]
+fn socket_receiver_buffers_batched_results() {
+    use crate::stream::socket::RecvMessage;
+    use std::{
+        cell::{Cell, RefCell},
+        collections::VecDeque,
+        io,
+        net::{Ipv4Addr, SocketAddr},
+    };
+
+    #[derive(Default)]
+    struct State {
+        polls: Cell<usize>,
+        batches: RefCell<VecDeque<Vec<(SocketAddr, Vec<u8>)>>>,
+    }
+
+    struct TestBatchSocket(std::rc::Rc<State>);
+
+    impl crate::socket::recv::Socket for TestBatchSocket {
+        fn poll_recv(
+            &self,
+            _cx: &mut core::task::Context<'_>,
+            _addr: &mut crate::msg::addr::Addr,
+            _cmsg: &mut crate::msg::cmsg::Receiver,
+            _buffer: &mut [std::io::IoSliceMut<'_>],
+        ) -> Poll<io::Result<usize>> {
+            unreachable!("batched path should be used");
+        }
+
+        fn poll_recv_batch(
+            &self,
+            _cx: &mut core::task::Context<'_>,
+            messages: &mut [RecvMessage<'_>],
+        ) -> Poll<io::Result<usize>> {
+            self.0.polls.set(self.0.polls.get() + 1);
+            let Some(batch) = self.0.batches.borrow_mut().pop_front() else {
+                return Poll::Pending;
+            };
+
+            for (message, (addr, payload)) in messages.iter_mut().zip(batch.iter()) {
+                message.addr.set((*addr).into());
+                message.payload[..payload.len()].copy_from_slice(payload);
+                message.len = payload.len();
+            }
+
+            Poll::Ready(Ok(batch.len().min(messages.len())))
+        }
+
+        fn local_addr(&self) -> io::Result<SocketAddr> {
+            Ok(SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 4444))
+        }
+    }
+
+    let state = std::rc::Rc::new(State::default());
+    state.batches.borrow_mut().push_back(vec![
+        (SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 1111), vec![1, 2, 3]),
+        (SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 2222), vec![4, 5]),
+    ]);
+    let socket = TestBatchSocket(state.clone());
+
+    let pool = crate::socket::pool::Pool::new(1500);
+    let mut rx = SocketReceiver::new_with_batch_size(socket, pool, 4);
+    let mut cx = noop_cx();
+
+    let first = match rx.poll_recv(&mut cx) {
+        Poll::Ready(Some(Ok(segments))) => segments.take_filled(),
+        other => panic!("unexpected first poll result: {other:?}"),
+    };
+    assert_eq!(state.polls.get(), 1);
+    assert_eq!(first.remote_address().get().port(), 1111);
+    assert_eq!(first.payload(), &[1, 2, 3]);
+
+    let second = match rx.poll_recv(&mut cx) {
+        Poll::Ready(Some(Ok(segments))) => segments.take_filled(),
+        other => panic!("unexpected second poll result: {other:?}"),
+    };
+    assert_eq!(state.polls.get(), 1);
+    assert_eq!(second.remote_address().get().port(), 2222);
+    assert_eq!(second.payload(), &[4, 5]);
+
+    assert!(matches!(rx.poll_recv(&mut cx), Poll::Pending));
+    assert_eq!(state.polls.get(), 2);
+}
+
 // ── Paced tests ────────────────────────────────────────────────────
 
 #[test]

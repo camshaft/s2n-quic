@@ -158,6 +158,11 @@ pub struct Config<S, C> {
     pub per_socket_send_rate: crate::socket::rate::Rate,
     /// Per-poll budgets for each pipeline task.
     pub budgets: Budgets,
+    /// Maximum number of datagrams to submit in each recv batch syscall.
+    ///
+    /// Values above 1024 are capped to the kernel limit. On platforms without
+    /// `recvmmsg`, the receiver falls back to a single datagram per poll.
+    pub recv_mmsg_entries: usize,
     /// Number of shards for the frame submission channel.
     pub submission_shards: usize,
 }
@@ -247,6 +252,7 @@ where
         overall_send_rate,
         per_socket_send_rate,
         budgets,
+        recv_mmsg_entries,
         submission_shards,
     } = config;
 
@@ -432,6 +438,7 @@ where
         workers[worker_id].recv_socket = Some(RecvSocketParts {
             socket,
             recv_pool: recv_pool.clone(),
+            recv_mmsg_entries,
             router,
         });
     }
@@ -494,6 +501,7 @@ type PacketReceiver = sync_queue::Receiver<packet::datagram::decoder::Packet<des
 struct RecvSocketParts<Socket, Route> {
     socket: Socket,
     recv_pool: crate::socket::pool::Pool,
+    recv_mmsg_entries: usize,
     router: worker::FanOutRouter<PacketSender, Route>,
 }
 
@@ -625,6 +633,7 @@ where
                 local.spawn(tasks::socket_recv_task(
                     rs.socket,
                     rs.recv_pool,
+                    rs.recv_mmsg_entries,
                     rs.router,
                     budgets,
                 ));

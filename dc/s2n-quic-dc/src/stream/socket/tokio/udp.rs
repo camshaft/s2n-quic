@@ -3,6 +3,7 @@
 
 use super::{
     fd::{udp, Flags},
+    poll_recv_batch_one, RecvMessage,
     Protocol, Socket, TransportFeatures,
 };
 use crate::msg::{addr::Addr, cmsg};
@@ -95,6 +96,40 @@ where
                     continue;
                 }
             }
+        }
+    }
+
+    #[inline]
+    fn poll_recv_batch(
+        &self,
+        cx: &mut Context,
+        messages: &mut [RecvMessage<'_>],
+    ) -> Poll<io::Result<usize>> {
+        #[cfg(s2n_quic_platform_socket_mmsg)]
+        {
+            loop {
+                let mut socket = ready!(self.poll_read_ready(cx))?;
+                let flags = Flags::default();
+
+                let res = socket.try_io(|fd| udp::recv_mmsg(fd, messages, flags));
+
+                match res {
+                    Ok(Ok(len)) => return Ok(len).into(),
+                    Ok(Err(ref e)) if e.kind() == io::ErrorKind::Interrupted => {
+                        continue;
+                    }
+                    Ok(Err(err)) => return Err(err).into(),
+                    Err(err) => {
+                        let _: TryIoError = err;
+                        continue;
+                    }
+                }
+            }
+        }
+
+        #[cfg(not(s2n_quic_platform_socket_mmsg))]
+        {
+            poll_recv_batch_one(self, cx, messages)
         }
     }
 

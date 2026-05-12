@@ -483,13 +483,14 @@ async fn wheel_drain<A, T, F>(
 pub async fn socket_recv_task<Socket, R>(
     socket: Socket,
     pool: crate::socket::pool::Pool,
+    recv_mmsg_entries: usize,
     router: R,
     budgets: Budgets,
 ) where
     Socket: crate::socket::recv::Socket,
     R: crate::socket::recv::router::Router,
 {
-    let rx = SocketReceiver::new(socket, pool);
+    let rx = SocketReceiver::new_with_batch_size(socket, pool, recv_mmsg_entries);
     let rx = InspectErr::new(rx, |err| {
         tracing::warn!(%err, "socket recv error");
     });
