@@ -51,8 +51,6 @@ pub struct Endpoint {
     pub counters: crate::counter::Registry,
     /// Endpoint-wide stream ID counter
     pub next_stream_id: AtomicU64,
-    /// The port that recv sockets are bound to
-    pub data_port: u16,
     /// Full socket address the recv socket is listening on
     pub data_addr: std::net::SocketAddr,
 }
@@ -458,7 +456,6 @@ where
         acceptor_registry,
         counters: counter_registry,
         next_stream_id: AtomicU64::new(0),
-        data_port: source_control_port,
         data_addr: source_control_addr,
     }
 }
