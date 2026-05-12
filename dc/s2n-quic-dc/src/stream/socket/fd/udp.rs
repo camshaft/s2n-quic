@@ -173,6 +173,7 @@ where
                 core::ptr::null_mut(),
             ) as _
         })?;
+        let len = len.min(count);
 
         for (message, msg) in messages.iter_mut().zip(scratch.msgvec.iter()).take(len) {
             message.addr.update_with_msg(&msg.msg_hdr);

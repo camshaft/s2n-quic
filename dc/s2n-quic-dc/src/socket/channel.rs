@@ -1455,8 +1455,8 @@ pub struct SocketReceiver<S> {
     socket: S,
     alloc: crate::socket::pool::Pool,
     batch_size: usize,
-    pending: std::collections::VecDeque<descriptor::Unfilled>,
-    cmsgs: std::collections::VecDeque<crate::msg::cmsg::Receiver>,
+    pending:
+        std::collections::VecDeque<(descriptor::Unfilled, crate::msg::cmsg::Receiver)>,
     ready: std::collections::VecDeque<descriptor::Segments>,
     lengths: Vec<usize>,
 }
@@ -1476,7 +1476,6 @@ impl<S> SocketReceiver<S> {
             alloc,
             batch_size: batch_size.max(1).min(1024),
             pending: Default::default(),
-            cmsgs: Default::default(),
             ready: Default::default(),
             lengths: Vec::new(),
         }
@@ -1502,8 +1501,7 @@ where
             let Some(unfilled) = self.alloc.alloc() else {
                 break;
             };
-            self.pending.push_back(unfilled);
-            self.cmsgs.push_back(Default::default());
+            self.pending.push_back((unfilled, Default::default()));
         }
 
         if self.pending.is_empty() {
@@ -1513,12 +1511,12 @@ where
             return Poll::Pending;
         }
 
-        for cmsg in &mut self.cmsgs {
+        for (_, cmsg) in &mut self.pending {
             *cmsg = Default::default();
         }
 
         let mut messages = Vec::with_capacity(self.pending.len());
-        for (unfilled, cmsg) in self.pending.iter_mut().zip(self.cmsgs.iter_mut()) {
+        for (unfilled, cmsg) in self.pending.iter_mut() {
             let (addr, payload) = unfilled.recv_parts_mut();
             messages.push(crate::stream::socket::RecvMessage::new(
                 addr,
@@ -1539,12 +1537,10 @@ where
         drop(messages);
 
         for len in self.lengths.drain(..) {
-            let unfilled = self.pending.pop_front().expect("missing pending descriptor");
-            let cmsg = self.cmsgs.pop_front().expect("missing pending cmsg");
+            let (unfilled, cmsg) = self.pending.pop_front().expect("missing pending descriptor");
 
             if len == 0 {
-                self.pending.push_back(unfilled);
-                self.cmsgs.push_back(Default::default());
+                self.pending.push_back((unfilled, cmsg));
                 continue;
             }
 
