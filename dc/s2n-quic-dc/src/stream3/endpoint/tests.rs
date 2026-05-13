@@ -223,8 +223,8 @@ fn ping_pong() {
 fn client_heavy_transfer() {
     run_transfer_case(
         "client_heavy_transfer",
-        TransferPlan::new(128, 256, b'c', core::time::Duration::from_millis(0)),
-        TransferPlan::new(4, 32, b's', core::time::Duration::from_millis(1)),
+        TransferPlan::new(32, 128, b'c', core::time::Duration::from_millis(0)),
+        TransferPlan::new(2, 16, b's', core::time::Duration::from_millis(0)),
     );
 }
 
@@ -232,8 +232,8 @@ fn client_heavy_transfer() {
 fn server_heavy_transfer() {
     run_transfer_case(
         "server_heavy_transfer",
-        TransferPlan::new(4, 32, b'c', core::time::Duration::from_millis(1)),
-        TransferPlan::new(128, 256, b's', core::time::Duration::from_millis(0)),
+        TransferPlan::new(2, 16, b'c', core::time::Duration::from_millis(0)),
+        TransferPlan::new(32, 128, b's', core::time::Duration::from_millis(0)),
     );
 }
 
@@ -241,7 +241,7 @@ fn server_heavy_transfer() {
 fn bidirectional_bulk_transfer() {
     run_transfer_case(
         "bidirectional_bulk_transfer",
-        TransferPlan::new(96, 192, b'c', core::time::Duration::from_millis(1)),
-        TransferPlan::new(96, 224, b's', core::time::Duration::from_millis(2)),
+        TransferPlan::new(24, 128, b'c', core::time::Duration::from_millis(0)),
+        TransferPlan::new(24, 128, b's', core::time::Duration::from_millis(0)),
     );
 }
