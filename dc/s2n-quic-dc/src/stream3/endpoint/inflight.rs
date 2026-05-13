@@ -149,10 +149,10 @@ impl Map {
     /// non-empty, all-ack-eliciting frames. A packet with only ACK frames and no
     /// `probed_to` could trigger an ACK loop.
     ///
-    /// This method is O(N × F) where N is the number of inflight packets and F is the
-    /// number of frames per packet. It is only compiled in test builds.
-    #[cfg(test)]
+    /// The O(N × F) loop over all frames is only compiled in test builds. Cheaper
+    /// per-entry checks can be added outside the `#[cfg(test)]` guard in the future.
     pub fn invariants(&self) {
+        #[cfg(test)]
         for (_, packet) in self.inner.iter() {
             if packet.probed_to.is_none() {
                 assert!(

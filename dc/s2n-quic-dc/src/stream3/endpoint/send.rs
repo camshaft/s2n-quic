@@ -513,7 +513,6 @@ impl Context {
                 );
             }
         }
-        #[cfg(test)]
         self.inflight.invariants();
     }
 }
