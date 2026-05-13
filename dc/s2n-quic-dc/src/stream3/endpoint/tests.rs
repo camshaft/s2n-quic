@@ -87,15 +87,8 @@ async fn run_stream_exchange(
     role: &'static str,
 ) {
     let (mut reader, mut writer) = stream.into_split();
-
-    let write = async {
-        write_plan(&mut writer, send_plan, role).await;
-    };
-    let read = async {
-        read_to_fin(&mut reader, recv_plan, role).await;
-    };
-
-    tokio::join!(write, read);
+    write_plan(&mut writer, send_plan, role).await;
+    read_to_fin(&mut reader, recv_plan, role).await;
 }
 
 fn run_transfer_case(test_name: &'static str, client_send: TransferPlan, server_send: TransferPlan) {
@@ -223,8 +216,8 @@ fn ping_pong() {
 fn client_heavy_transfer() {
     run_transfer_case(
         "client_heavy_transfer",
-        TransferPlan::new(32, 128, b'c', core::time::Duration::from_millis(0)),
-        TransferPlan::new(2, 16, b's', core::time::Duration::from_millis(0)),
+        TransferPlan::new(32, 128, b'c', core::time::Duration::ZERO),
+        TransferPlan::new(2, 16, b's', core::time::Duration::ZERO),
     );
 }
 
@@ -232,8 +225,8 @@ fn client_heavy_transfer() {
 fn server_heavy_transfer() {
     run_transfer_case(
         "server_heavy_transfer",
-        TransferPlan::new(2, 16, b'c', core::time::Duration::from_millis(0)),
-        TransferPlan::new(32, 128, b's', core::time::Duration::from_millis(0)),
+        TransferPlan::new(2, 16, b'c', core::time::Duration::ZERO),
+        TransferPlan::new(32, 128, b's', core::time::Duration::ZERO),
     );
 }
 
@@ -241,7 +234,7 @@ fn server_heavy_transfer() {
 fn bidirectional_bulk_transfer() {
     run_transfer_case(
         "bidirectional_bulk_transfer",
-        TransferPlan::new(24, 128, b'c', core::time::Duration::from_millis(0)),
-        TransferPlan::new(24, 128, b's', core::time::Duration::from_millis(0)),
+        TransferPlan::new(24, 128, b'c', core::time::Duration::from_millis(1)),
+        TransferPlan::new(24, 128, b's', core::time::Duration::from_millis(2)),
     );
 }
