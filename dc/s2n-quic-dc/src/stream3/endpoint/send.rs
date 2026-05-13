@@ -157,17 +157,37 @@ impl WheelInterest {
 ///
 /// The assembler checks this on every assembly round:
 /// - `Idle`: no probe pending; perform normal immediate + pending drain.
-/// - `Requested`: a probe must be sent. If `pending` data exists it already serves
-///   as an ack-eliciting packet, so the assembler just clears the flag and proceeds.
-///   Otherwise the assembler retransmits the frames from the oldest non-shell inflight
-///   entry under a new packet number, linking the two via `inflight::Packet::probed_to`.
-#[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
+/// - `Requested`: a probe must be sent. If `pending` data is present **and**
+///   the congestion window allows it, that data serves as the ack-eliciting packet.
+///   Otherwise the assembler retransmits the frames from the oldest non-shell
+///   inflight entry under a new packet number (which bypasses CWND per RFC 9002
+///   §6.2.4), linking the two via `inflight::Packet::probed_to`.
+#[derive(Default, Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ProbeState {
     /// No probe pending.
     #[default]
     Idle,
     /// A probe has been requested by the PTO handler.
     Requested,
+}
+
+impl ProbeState {
+    s2n_quic_core::state::is!(
+        /// Returns `true` when a probe is pending.
+        is_requested, Requested
+    );
+
+    s2n_quic_core::state::event! {
+        /// Transition `Idle → Requested` when a PTO fires.
+        request(Idle => Requested);
+        /// Transition `Requested → Idle` once the assembler encodes the probe.
+        clear(Requested => Idle);
+    }
+
+    #[cfg(test)]
+    pub fn dot_test() {
+        insta::assert_snapshot!(Self::dot());
+    }
 }
 
 /// Per-peer send state, one per (credentials_id, send_socket) pair.
@@ -201,8 +221,8 @@ pub(crate) struct Context {
     /// Used by `publish_next_transmission_time` to write the correct slot so the
     /// load-balancer pick-two logic has up-to-date per-socket load information.
     pub sender_idx: usize,
-    /// PTO probe state: set to `Requested` by the PTO handler; cleared by the assembler
-    /// after the probe segment is encoded.
+    /// PTO probe state: set to `Requested` by the PTO handler via `on_pto_timeout`;
+    /// cleared by the assembler after the probe segment is encoded.
     pub probe_state: ProbeState,
     /// Intrusive links and target time for the transmission pacing wheel
     pub tx_wheel: WheelLinks,
@@ -338,7 +358,7 @@ impl Context {
             false
         };
 
-        let pto = if !self.is_pto_scheduled() {
+        let pto = if !self.is_pto_scheduled() && self.inflight.has_inflight() {
             self.pto.update_target(clock, &self.rtt_estimator);
             if let Some(target) = self.pto.target_time {
                 self.pto_wheel.target_time = Some(target);
@@ -449,6 +469,19 @@ impl Context {
     #[inline]
     pub fn is_idle_scheduled(&self) -> bool {
         self.idle_wheel.links.is_linked()
+    }
+
+    /// Called when the PTO wheel fires for this context.
+    ///
+    /// Delegates to `Pto::on_timeout` and, if a real probe should be sent,
+    /// transitions the probe state from `Idle` to `Requested`. The caller
+    /// only needs to follow up with `wheel_interest` to reschedule wheels.
+    pub fn on_pto_timeout(&mut self) {
+        if self.pto.on_timeout() {
+            // Ignoring the Result: it is only Err on no-op (already Requested),
+            // which is harmless if the assembler hasn't consumed the previous probe yet.
+            let _ = self.probe_state.request();
+        }
     }
 }
 

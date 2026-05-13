@@ -22,12 +22,12 @@ use crate::{
         pool::{self, descriptor::Segments},
     },
     stream3::{
-        endpoint::{
-            inflight,
-            send::{Context, ProbeState},
+            endpoint::{
+                inflight,
+                send::Context,
+            },
+            frame::{self, Frame},
         },
-        frame::{self, Frame},
-    },
 };
 use s2n_codec::{Encoder, EncoderBuffer, EncoderValue};
 use s2n_quic_core::{
@@ -117,14 +117,22 @@ where
 
             // Phase 0: PTO probe assembly.
             //
-            // If a probe was requested and there are no pending data frames to serve as
-            // an ack-eliciting packet naturally, retransmit the oldest non-shell inflight
-            // entry under a new PN. The new PN is preceded by a skipped PN so the peer's
-            // ACK creates a gap that triggers PN-threshold loss detection on old packets.
-            if context.probe_state == ProbeState::Requested {
-                context.probe_state = ProbeState::Idle;
+            // If a probe was requested and pending data cannot serve as the probe
+            // (either because none exists, or because the congestion window prevents
+            // sending it — RFC 9002 §6.2.4 requires probes to bypass CWND),
+            // retransmit the oldest non-shell inflight entry under a new PN.
+            // The new PN is preceded by a skipped PN so the peer's ACK creates a
+            // gap that triggers PN-threshold loss detection on old packets.
+            if context.probe_state.is_requested() {
+                // Only let pending data serve as the probe when it can actually be
+                // sent. If CWND-limited, we must fall through to the inflight
+                // retransmit path so the probe still gets out.
+                let pending_serves_as_probe =
+                    context.has_pending_data() && context.can_send_pending_frames();
 
-                if !context.has_pending_data() {
+                if !pending_serves_as_probe {
+                    let _ = context.probe_state.clear();
+
                     if let Some((old_pn, probe_frames)) =
                         context.inflight.take_oldest_for_probe()
                     {
@@ -168,9 +176,12 @@ where
                         }
                     }
                     // If no non-shell inflight entry exists the probe is a no-op.
+                } else {
+                    // Pending data is sendable — it will serve as the probe naturally
+                    // when Phase 2 drains it. Clear the request so we don't re-enter
+                    // this branch on the same assembly round.
+                    let _ = context.probe_state.clear();
                 }
-                // If pending data exists it is itself ack-eliciting and serves as the
-                // probe — fall through to Phase 2 to drain it normally.
             }
 
             // Phase 1: drain immediate (ACK) frames unconditionally.

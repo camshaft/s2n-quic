@@ -21,7 +21,7 @@ use crate::{
 use core::time::Duration;
 use s2n_quic_core::{
     frame::{self as quic_frame, ack::AckRanges},
-    packet::number::{PacketNumberRange, PacketNumberSpace},
+    packet::number::{PacketNumber, PacketNumberRange, PacketNumberSpace},
     varint::VarInt,
 };
 
@@ -57,12 +57,21 @@ pub(crate) fn process_ack<Clk, Rand>(
         let pmax = PacketNumberSpace::Initial.new_packet_number(*range.end());
         let range = PacketNumberRange::new(pmin, pmax);
 
-        // Collect removed entries into a temporary Vec so that the mutable borrow
-        // on `context.inflight` is released before we call `take_chain_tail_frames`
-        // (which also needs `&mut context.inflight`).
-        let removed: Vec<_> = context.inflight.remove_range(range).collect();
+        // Phase 1: remove ACKed entries from the inflight map.
+        //
+        // Shell entries (probed_to.is_some()) have empty `frames`; the live frames
+        // reside at the tail of the probe chain at a higher PN. We defer chain
+        // following until after the iterator is dropped (so the borrow on
+        // `context.inflight` is released) and use a small fixed-size stack array
+        // to record which chain heads to follow — no heap allocation.
+        //
+        // The maximum number of shells in a single ACK range is bounded by the PTO
+        // backoff cap (16×, ~4 doublings), so 8 slots is more than sufficient.
+        const MAX_DEFERRED: usize = 8;
+        let mut deferred: [Option<PacketNumber>; MAX_DEFERRED] = [None; MAX_DEFERRED];
+        let mut deferred_count = 0usize;
 
-        for (num, mut packet) in removed {
+        for (num, mut packet) in context.inflight.remove_range(range) {
             if let Some(tx_info) = packet.transmission_info.take() {
                 let time_sent = tx_info.time_sent;
                 max_acked_tx_time = max_acked_tx_time.max(Some(time_sent));
@@ -86,19 +95,33 @@ pub(crate) fn process_ack<Clk, Rand>(
                 "packet ACKed"
             );
 
-            // If this entry is a shell (its frames were moved to a probe), follow the
-            // probed_to chain to the tail and complete the frames found there.
-            // The tail entry stays in the inflight map (empty shell) until it is
-            // independently ACKed or swept by loss detection.
-            let frames = if let Some(probe_pn) = packet.probed_to {
-                context.inflight.take_chain_tail_frames(probe_pn).1
+            if let Some(probe_pn) = packet.probed_to {
+                // Shell: the live frames are at the tail of the probe chain.
+                // Defer completion to Phase 2 (after the iterator is dropped).
+                // If we somehow exceed MAX_DEFERRED, the frames at the tail will
+                // remain in the inflight map and be completed when the probe entry
+                // itself is ACKed or swept by loss detection.
+                if deferred_count < MAX_DEFERRED {
+                    deferred[deferred_count] = Some(probe_pn);
+                    deferred_count += 1;
+                }
             } else {
-                packet.frames
-            };
+                for mut entry in packet.frames {
+                    entry.status = TransmissionStatus::Acknowledged;
+                    let _ = completed.send(entry);
+                }
+            }
+        }
+        // remove_range iterator is dropped here; borrow on `context.inflight` released.
 
-            for mut entry in frames {
-                entry.status = TransmissionStatus::Acknowledged;
-                let _ = completed.send(entry);
+        // Phase 2: follow deferred probe chains and complete the tail frames.
+        for i in 0..deferred_count {
+            if let Some(probe_pn) = deferred[i] {
+                let (_, tail_frames) = context.inflight.take_chain_tail_frames(probe_pn);
+                for mut entry in tail_frames {
+                    entry.status = TransmissionStatus::Acknowledged;
+                    let _ = completed.send(entry);
+                }
             }
         }
     }

@@ -419,12 +419,9 @@ pub fn send_worker<Socket, Clk, WakerSink>(
             move |context: Rc<RefCell<send::Context>>| {
                 let wheel_interest = {
                     let mut ctx = context.borrow_mut();
-                    if ctx.pto.on_timeout() {
-                        // PTO fired: request a probe. The assembler will either send
-                        // pending data (which is already ack-eliciting) or retransmit
-                        // the oldest inflight entry under a fresh packet number.
-                        ctx.probe_state = send::ProbeState::Requested;
-                    }
+                    // Context encapsulates both the PTO countdown and the probe-state
+                    // transition — the caller just observes the resulting wheel interest.
+                    ctx.on_pto_timeout();
                     ctx.wheel_interest(&clock)
                 };
                 if wheel_interest.transmission {
