@@ -295,14 +295,12 @@ impl Context {
         Clk: precision::Clock + ?Sized,
     {
         let transmission = if
-        // Check we have queued packets
-        self.has_pending()
-            // Make sure we're not already linked
-            && !self.is_tx_scheduled()
-            // Check if the congestion controller is allowing a send.
-            // TODO (PTO task 4): remove `|| true` once CWND is enforced only for
-            // `pending` frames; `immediate` frames always bypass the window.
-            && (self.cca.requires_fast_retransmission() || !self.cca.is_congestion_limited() || true)
+        // Check we have queued packets and we're not already linked
+        !self.is_tx_scheduled()
+            && (self.has_immediate()
+                || (self.has_pending_data()
+                    && (self.cca.requires_fast_retransmission()
+                        || !self.cca.is_congestion_limited())))
         {
             let target = self
                 .cca
@@ -396,6 +394,16 @@ impl Context {
     #[inline]
     pub fn has_pending(&self) -> bool {
         !self.immediate.is_empty() || !self.pending.is_empty()
+    }
+
+    #[inline]
+    pub fn has_immediate(&self) -> bool {
+        !self.immediate.is_empty()
+    }
+
+    #[inline]
+    pub fn has_pending_data(&self) -> bool {
+        !self.pending.is_empty()
     }
 
     #[inline]
