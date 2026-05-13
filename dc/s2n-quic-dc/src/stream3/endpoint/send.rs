@@ -495,12 +495,13 @@ impl Context {
 
     /// Verify structural invariants of the context.
     ///
-    /// Runs assertions guarded by `cfg!(test)` — in non-test builds this compiles away
-    /// to nothing. Call this after any mutation that could violate these invariants:
+    /// Runs assertions guarded by `cfg!(debug_assertions)` — in release builds this
+    /// compiles away to nothing. Call this after any mutation that could violate these
+    /// invariants:
     /// - PTO target should be `None` when there is no inflight data (no need to probe).
     #[inline]
     pub fn invariants(&self) {
-        if cfg!(test) {
+        if cfg!(debug_assertions) {
             if !self.inflight.has_inflight() {
                 assert!(
                     self.pto.target_time.is_none(),

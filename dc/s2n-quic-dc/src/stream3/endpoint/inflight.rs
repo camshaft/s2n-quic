@@ -34,7 +34,19 @@ pub(crate) struct Packet {
     /// packet is declared lost, each frame is individually evaluated for retransmission.
     /// When this packet is a "shell" (probed to a newer PN), the list will be empty
     /// because the frames have been moved to the probe entry.
+    ///
+    /// ACK frames (immediate/control frames) are always at the **beginning** of the
+    /// queue, followed by non-ACK (data) frames. `ack_frame_count` records how many
+    /// leading frames are ACK frames.
     pub frames: Queue<Frame>,
+    /// Number of leading ACK (control/immediate) frames in `frames`.
+    ///
+    /// ACK frames are stale by definition and must not be retransmitted as part of a
+    /// PTO probe. [`take_oldest_for_probe`] uses this count to skip them efficiently
+    /// without scanning the whole queue.
+    ///
+    /// [`take_oldest_for_probe`]: Self::take_oldest_for_probe
+    pub ack_frame_count: usize,
     /// Transmission metadata shared by all frames in this packet (CCA info, send time,
     /// wire byte count). Taken on first ACK or loss so that RTT/CCA updates are applied
     /// exactly once.
@@ -56,9 +68,32 @@ pub(crate) struct Packet {
 }
 
 impl Packet {
-    pub fn new(frames: Queue<Frame>, info: TransmissionInfo) -> Self {
+    pub fn new(frames: Queue<Frame>, info: TransmissionInfo, ack_frame_count: usize) -> Self {
+        // ACK frames must come before non-ACK frames so that take_oldest_for_probe
+        // can efficiently skip them using ack_frame_count.
+        #[cfg(debug_assertions)]
+        {
+            let mut seen_non_ack = false;
+            for frame in frames.iter() {
+                if frame.is_immediate() {
+                    debug_assert!(
+                        !seen_non_ack,
+                        "ACK frame appears after non-ACK frame — ACK frames must be at the front"
+                    );
+                } else {
+                    seen_non_ack = true;
+                }
+            }
+            // Verify the stored count matches the actual number of leading ACK frames.
+            let actual = frames.iter().take_while(|f| f.is_immediate()).count();
+            debug_assert_eq!(
+                actual, ack_frame_count,
+                "ack_frame_count ({ack_frame_count}) does not match leading ACK frame count ({actual})"
+            );
+        }
         Self {
             frames,
+            ack_frame_count,
             transmission_info: Some(info),
             probed_to: None,
         }
@@ -107,46 +142,37 @@ impl Map {
         self.inner.get_mut(pn)
     }
 
-    /// Find the oldest inflight packet number whose `frames` list is non-empty (not a shell).
+    /// Find the oldest inflight packet number that has data (non-ACK) frames available for probing.
     ///
-    /// Returns `None` if all inflight entries are shells or if the map is empty.
+    /// Returns `None` if all inflight entries are shells or contain only ACK frames or if the
+    /// map is empty.
     pub fn oldest_non_shell_pn(&self) -> Option<PacketNumber> {
         self.inner
             .iter()
-            .find(|(_, p)| !p.frames.is_empty())
+            .find(|(_, p)| p.frames.len() > p.ack_frame_count)
             .map(|(pn, _)| pn)
     }
 
     /// Take the frames from the oldest non-shell inflight entry for a PTO probe.
     ///
-    /// The entry remains in the map with an empty `frames` list and its
-    /// `TransmissionInfo` intact. The caller must then either call
-    /// [`set_probed_to`] to finalise the shell pointer, or call
-    /// [`restore_probe_frames`] if the probe segment could not be encoded.
+    /// ACK (control/immediate) frames are stripped before returning — they are stale
+    /// and must not be retransmitted. The entry remains in the map with an empty
+    /// `frames` list and its `TransmissionInfo` intact. The caller must then call
+    /// [`set_probed_to`] to finalise the shell pointer.
     ///
     /// [`set_probed_to`]: Self::set_probed_to
-    /// [`restore_probe_frames`]: Self::restore_probe_frames
     pub fn take_oldest_for_probe(&mut self) -> Option<(PacketNumber, Queue<Frame>)> {
         let old_pn = self.oldest_non_shell_pn()?;
         let packet = self.inner.get_mut(old_pn)?;
+
+        // Fast path: pop the known leading ACK frames using the stored count.
+        for _ in 0..packet.ack_frame_count {
+            let _stale = packet.frames.pop_front();
+        }
+        packet.ack_frame_count = 0;
+
         let frames = core::mem::take(&mut packet.frames);
         Some((old_pn, frames))
-    }
-
-    /// Restore frames to an entry after a failed probe attempt.
-    ///
-    /// Called when [`take_oldest_for_probe`] was invoked but the probe segment
-    /// could not be encoded (e.g. the segment buffer is already full).
-    ///
-    /// [`take_oldest_for_probe`]: Self::take_oldest_for_probe
-    pub fn restore_probe_frames(&mut self, pn: PacketNumber, frames: Queue<Frame>) {
-        if let Some(packet) = self.inner.get_mut(pn) {
-            debug_assert!(
-                packet.frames.is_empty(),
-                "restoring frames to non-empty packet — was take_oldest_for_probe called?"
-            );
-            packet.frames = frames;
-        }
     }
 
     /// Set the `probed_to` forward pointer on an existing inflight entry.
