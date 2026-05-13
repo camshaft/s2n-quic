@@ -22,13 +22,18 @@ use crate::{
         pool::{self, descriptor::Segments},
     },
     stream3::{
-        endpoint::{inflight, send::Context},
+        endpoint::{
+            inflight,
+            send::{Context, ProbeState},
+        },
         frame::{self, Frame},
     },
 };
 use s2n_codec::{Encoder, EncoderBuffer, EncoderValue};
 use s2n_quic_core::{
-    buffer, inet::ExplicitCongestionNotification, packet::number::PacketNumberSpace, varint::VarInt,
+    buffer, inet::ExplicitCongestionNotification,
+    packet::number::{PacketNumber, PacketNumberSpace},
+    varint::VarInt,
 };
 use s2n_quic_platform::features::Gso;
 
@@ -105,6 +110,66 @@ where
             let mut packet_frames = Queue::new();
             let mut metadata = MetadataEstimate::new(context.flow_attempt_id_counter);
             let mut is_ack_eliciting = false;
+            // If a probe is encoded in this segment, this records which old inflight
+            // entry was turned into a shell so we can link it to the new PN after
+            // the segment is registered in the inflight map.
+            let mut probe_from_pn: Option<PacketNumber> = None;
+
+            // Phase 0: PTO probe assembly.
+            //
+            // If a probe was requested and there are no pending data frames to serve as
+            // an ack-eliciting packet naturally, retransmit the oldest non-shell inflight
+            // entry under a new PN. The new PN is preceded by a skipped PN so the peer's
+            // ACK creates a gap that triggers PN-threshold loss detection on old packets.
+            if context.probe_state == ProbeState::Requested {
+                context.probe_state = ProbeState::Idle;
+
+                if !context.has_pending_data() {
+                    if let Some((old_pn, probe_frames)) =
+                        context.inflight.take_oldest_for_probe()
+                    {
+                        // Estimate whether all probe frames fit within this segment.
+                        let mut fits = true;
+                        let mut probe_metadata = metadata;
+                        for frame in probe_frames.iter() {
+                            let next = probe_metadata.with_frame(frame);
+                            let est_len = next.estimate_packet_len(
+                                source_sender_id,
+                                source_control_port,
+                                context.next_packet_number,
+                                &context.credentials,
+                                seal::Application::tag_len(&context.sealer),
+                            );
+                            if est_len > max_segment_len {
+                                fits = false;
+                                break;
+                            }
+                            probe_metadata = next;
+                        }
+
+                        if fits {
+                            // Skip a PN so the probe creates a detectable gap for
+                            // PN-threshold loss detection on the old PN.
+                            context.next_packet_number += 1;
+                            probe_from_pn = Some(old_pn);
+                            metadata = probe_metadata;
+                            for frame in probe_frames {
+                                // Probe frames are always ack-eliciting (non-Control).
+                                is_ack_eliciting = true;
+                                packet_frames.push_back(frame);
+                            }
+                        } else {
+                            // Probe doesn't fit this segment (unusual: the frames came
+                            // from a packet encoded at this same MTU). Restore the entry
+                            // and let the next PTO firing retry.
+                            context.inflight.restore_probe_frames(old_pn, probe_frames);
+                        }
+                    }
+                    // If no non-shell inflight entry exists the probe is a no-op.
+                }
+                // If pending data exists it is itself ack-eliciting and serves as the
+                // probe — fall through to Phase 2 to drain it normally.
+            }
 
             // Phase 1: drain immediate (ACK) frames unconditionally.
             while let Some(frame) = context.pop_immediate() {
@@ -229,6 +294,11 @@ where
                 context
                     .inflight
                     .insert(pn, inflight::Packet::new(packet_frames, tx_info));
+
+                // If this segment was a probe, link the old shell entry to the new PN.
+                if let Some(old_pn) = probe_from_pn {
+                    context.inflight.set_probed_to(old_pn, pn);
+                }
             }
 
             segments_written += 1;

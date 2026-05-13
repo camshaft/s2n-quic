@@ -57,7 +57,12 @@ pub(crate) fn process_ack<Clk, Rand>(
         let pmax = PacketNumberSpace::Initial.new_packet_number(*range.end());
         let range = PacketNumberRange::new(pmin, pmax);
 
-        for (num, mut packet) in context.inflight.remove_range(range) {
+        // Collect removed entries into a temporary Vec so that the mutable borrow
+        // on `context.inflight` is released before we call `take_chain_tail_frames`
+        // (which also needs `&mut context.inflight`).
+        let removed: Vec<_> = context.inflight.remove_range(range).collect();
+
+        for (num, mut packet) in removed {
             if let Some(tx_info) = packet.transmission_info.take() {
                 let time_sent = tx_info.time_sent;
                 max_acked_tx_time = max_acked_tx_time.max(Some(time_sent));
@@ -81,7 +86,17 @@ pub(crate) fn process_ack<Clk, Rand>(
                 "packet ACKed"
             );
 
-            for mut entry in packet.frames {
+            // If this entry is a shell (its frames were moved to a probe), follow the
+            // probed_to chain to the tail and complete the frames found there.
+            // The tail entry stays in the inflight map (empty shell) until it is
+            // independently ACKed or swept by loss detection.
+            let frames = if let Some(probe_pn) = packet.probed_to {
+                context.inflight.take_chain_tail_frames(probe_pn).1
+            } else {
+                packet.frames
+            };
+
+            for mut entry in frames {
                 entry.status = TransmissionStatus::Acknowledged;
                 let _ = completed.send(entry);
             }

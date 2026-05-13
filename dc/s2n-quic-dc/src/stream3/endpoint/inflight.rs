@@ -101,6 +101,87 @@ impl Map {
     pub fn has_inflight(&self) -> bool {
         self.inner.iter().next().is_some()
     }
+
+    /// Return a mutable reference to the packet at `pn`, if present.
+    pub fn get_mut(&mut self, pn: PacketNumber) -> Option<&mut Packet> {
+        self.inner.get_mut(pn)
+    }
+
+    /// Find the oldest inflight packet number whose `frames` list is non-empty (not a shell).
+    ///
+    /// Returns `None` if all inflight entries are shells or if the map is empty.
+    pub fn oldest_non_shell_pn(&self) -> Option<PacketNumber> {
+        self.inner
+            .iter()
+            .find(|(_, p)| !p.frames.is_empty())
+            .map(|(pn, _)| pn)
+    }
+
+    /// Take the frames from the oldest non-shell inflight entry for a PTO probe.
+    ///
+    /// The entry remains in the map with an empty `frames` list and its
+    /// `TransmissionInfo` intact. The caller must then either call
+    /// [`set_probed_to`] to finalise the shell pointer, or call
+    /// [`restore_probe_frames`] if the probe segment could not be encoded.
+    ///
+    /// [`set_probed_to`]: Self::set_probed_to
+    /// [`restore_probe_frames`]: Self::restore_probe_frames
+    pub fn take_oldest_for_probe(&mut self) -> Option<(PacketNumber, Queue<Frame>)> {
+        let old_pn = self.oldest_non_shell_pn()?;
+        let packet = self.inner.get_mut(old_pn)?;
+        let frames = core::mem::take(&mut packet.frames);
+        Some((old_pn, frames))
+    }
+
+    /// Restore frames to an entry after a failed probe attempt.
+    ///
+    /// Called when [`take_oldest_for_probe`] was invoked but the probe segment
+    /// could not be encoded (e.g. the segment buffer is already full).
+    ///
+    /// [`take_oldest_for_probe`]: Self::take_oldest_for_probe
+    pub fn restore_probe_frames(&mut self, pn: PacketNumber, frames: Queue<Frame>) {
+        if let Some(packet) = self.inner.get_mut(pn) {
+            debug_assert!(
+                packet.frames.is_empty(),
+                "restoring frames to non-empty packet — was take_oldest_for_probe called?"
+            );
+            packet.frames = frames;
+        }
+    }
+
+    /// Set the `probed_to` forward pointer on an existing inflight entry.
+    ///
+    /// Called after a probe segment is successfully encoded: the `old_pn` entry
+    /// becomes a shell pointing to `new_pn` (the probe's packet number).
+    pub fn set_probed_to(&mut self, old_pn: PacketNumber, new_pn: PacketNumber) {
+        if let Some(packet) = self.inner.get_mut(old_pn) {
+            packet.probed_to = Some(new_pn);
+        }
+    }
+
+    /// Follow the `probed_to` chain starting at `pn` and take the frames from the tail.
+    ///
+    /// Used in ACK processing when a shell is ACKed: the frames to complete live at
+    /// the tail of the probe chain. The tail entry's `frames` are emptied but the
+    /// entry itself remains in the map with its `TransmissionInfo` intact for later
+    /// loss detection or ACK completion.
+    ///
+    /// Returns `(tail_pn, frames)`.
+    pub fn take_chain_tail_frames(&mut self, mut pn: PacketNumber) -> (PacketNumber, Queue<Frame>) {
+        // Walk the chain to the tail (first entry with no probed_to link).
+        loop {
+            match self.inner.get(pn).and_then(|p| p.probed_to) {
+                Some(next_pn) => pn = next_pn,
+                None => break,
+            }
+        }
+        let frames = self
+            .inner
+            .get_mut(pn)
+            .map(|p| core::mem::take(&mut p.frames))
+            .unwrap_or_default();
+        (pn, frames)
+    }
 }
 
 pub(crate) struct RemoveRange<'a, I> {
