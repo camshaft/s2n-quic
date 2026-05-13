@@ -107,15 +107,13 @@ impl Contract {
         let is_ok = is_cloned || wake_called;
         if !is_ok {
             if let Some(context) = context() {
-                assert!(
-                    is_ok,
+                panic!(
                     "clone_count = {clone_count}; drop_count = {drop_count}; \
                      wake_count = {wake_count}; wake_by_ref_count = {wake_by_ref_count}; \
                      live_clones = {live_clones}; contract_context = {context:?}"
                 );
             } else {
-                assert!(
-                    is_ok,
+                panic!(
                     "clone_count = {clone_count}; drop_count = {drop_count}; \
                      wake_count = {wake_count}; wake_by_ref_count = {wake_by_ref_count}; \
                      live_clones = {live_clones}"
