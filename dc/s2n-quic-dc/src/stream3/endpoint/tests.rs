@@ -95,7 +95,7 @@ async fn run_stream_exchange(
         read_to_fin(&mut reader, recv_plan, role).await;
     };
 
-    futures::join!(write, read);
+    tokio::join!(write, read);
 }
 
 fn run_transfer_case(test_name: &'static str, client_send: TransferPlan, server_send: TransferPlan) {
