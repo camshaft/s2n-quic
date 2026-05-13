@@ -170,7 +170,7 @@ pub(crate) enum ProbeState {
     Requested,
 }
 
-
+/// Per-peer send state, one per (credentials_id, send_socket) pair.
 ///
 /// Holds crypto material, congestion control, inflight tracking, and the pending frame
 /// queues. Frames are pushed in by the Dispatcher, then `assemble()` is called when the

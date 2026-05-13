@@ -140,6 +140,8 @@ where
                                 &context.credentials,
                                 seal::Application::tag_len(&context.sealer),
                             );
+                            // Strict greater-than: a packet that exactly fills
+                            // max_segment_len still fits (consistent with Phase 1/2).
                             if est_len > max_segment_len {
                                 fits = false;
                                 break;
