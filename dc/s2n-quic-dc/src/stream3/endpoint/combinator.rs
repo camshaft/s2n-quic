@@ -182,8 +182,7 @@ impl ByteCost for FrameBatch {
 impl PathSecretMapEntry for FrameBatch {
     #[inline]
     fn path_secret_entry(&self) -> &Arc<PathSecretEntry> {
-        let front = self.immediate.front().or_else(|| self.pending.front());
-        let Some(front) = front else {
+        let Some(front) = self.immediate.front().or_else(|| self.pending.front()) else {
             unsafe {
                 s2n_quic_core::assume!(false, "FrameBatch should always be non-empty");
             }
