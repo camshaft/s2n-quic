@@ -478,8 +478,9 @@ impl Context {
     /// only needs to follow up with `wheel_interest` to reschedule wheels.
     pub fn on_pto_timeout(&mut self) {
         if self.pto.on_timeout() {
-            // Ignoring the Result: it is only Err on no-op (already Requested),
-            // which is harmless if the assembler hasn't consumed the previous probe yet.
+            // The only failure case is `NoOp` — the state is already `Requested`
+            // because a previous probe hasn't been consumed by the assembler yet.
+            // That's harmless: the assembler will send the probe on its next run.
             let _ = self.probe_state.request();
         }
     }
