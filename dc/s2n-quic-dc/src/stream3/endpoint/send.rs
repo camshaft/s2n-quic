@@ -512,8 +512,9 @@ impl Context {
                     "PTO is armed but there is no inflight data to probe"
                 );
             }
-            self.inflight.invariants();
         }
+        #[cfg(test)]
+        self.inflight.invariants();
     }
 }
 

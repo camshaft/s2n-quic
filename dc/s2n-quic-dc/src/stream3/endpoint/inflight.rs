@@ -150,8 +150,8 @@ impl Map {
     /// `probed_to` could trigger an ACK loop.
     ///
     /// This method is O(N × F) where N is the number of inflight packets and F is the
-    /// number of frames per packet. It is intended to be called under
-    /// `cfg!(debug_assertions)` only.
+    /// number of frames per packet. It is only compiled in test builds.
+    #[cfg(test)]
     pub fn invariants(&self) {
         for (_, packet) in self.inner.iter() {
             if packet.probed_to.is_none() {
@@ -175,6 +175,11 @@ impl Map {
     /// becomes a shell pointing to `new_pn` (the probe's packet number).
     pub fn set_probed_to(&mut self, old_pn: PacketNumber, new_pn: PacketNumber) {
         if let Some(packet) = self.inner.get_mut(old_pn) {
+            debug_assert!(
+                packet.frames.is_empty(),
+                "set_probed_to: old entry still has frames; \
+                 take_oldest_for_probe should have taken them before calling set_probed_to"
+            );
             packet.probed_to = Some(new_pn);
         }
     }
@@ -200,6 +205,10 @@ impl Map {
             .get_mut(pn)
             .map(|p| core::mem::take(&mut p.frames))
             .unwrap_or_default();
+        debug_assert!(
+            !frames.is_empty(),
+            "take_chain_tail_frames: probe chain tail has no frames"
+        );
         (pn, frames)
     }
 }

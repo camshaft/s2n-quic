@@ -312,7 +312,16 @@ where
                 // Strip ACK (control/immediate) frames before inflight insertion — they
                 // are stale on any retransmit and must not be re-sent as probes.
                 for _ in 0..ack_frame_count {
-                    packet_frames.pop_front();
+                    let frame = packet_frames
+                        .pop_front()
+                        .expect("ack_frame_count exceeds packet_frames length");
+                    debug_assert!(
+                        frame.is_immediate(),
+                        "expected ACK/control frame during stripping, got a data frame"
+                    );
+                    // TODO: once a dedicated ACK completion queue exists, notify it here so
+                    // the receiver can send another ACK if desired.
+                    drop(frame);
                 }
 
                 // Register in inflight map
