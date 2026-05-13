@@ -213,16 +213,16 @@ impl
 
     #[inline(always)]
     fn append_to(mut self, storage: &mut PriorityStorage) {
-        let Some(first) = self.front() else {
+        let len = self.len();
+        if len == 0 {
             return;
-        };
-        let idx = first.priority().as_index();
-        debug_assert!(
-            self.iter().all(|f| f.priority().as_index() == idx),
-            "all frames in a Queue<Frame> input must share the same priority"
-        );
-        storage.0.len += self.len();
-        storage.0.queues[idx].append(&mut self);
+        }
+
+        storage.0.len += len;
+        while let Some(frame) = self.pop_front() {
+            let idx = frame.priority().as_index();
+            storage.0.queues[idx].push_back(frame);
+        }
     }
 }
 
