@@ -231,6 +231,12 @@ impl
         if len == 0 {
             return;
         }
+        debug_assert!(
+            self.queue
+                .iter()
+                .all(|frame| frame.priority() == self.priority),
+            "HomogeneousBatch priority did not match all queued frames"
+        );
         let idx = self.priority.as_index();
         storage.0.queues[idx].append(&mut self.queue);
         storage.0.len += len;
