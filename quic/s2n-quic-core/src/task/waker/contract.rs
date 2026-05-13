@@ -128,7 +128,7 @@ impl Contract {
 #[inline(always)]
 #[track_caller]
 pub fn assert_contract<F: FnOnce(&mut Context) -> Poll<R>, R>(cx: &mut Context, f: F) -> Poll<R> {
-    assert_contract_with_context::<_, _, _, ()>(cx, f, || None)
+    assert_contract_with_context(cx, f, || Option::<()>::None)
 }
 
 /// Checks that if a function returns [`Poll::Pending`], then the function called [`Waker::clone`],
@@ -164,7 +164,7 @@ pub fn debug_assert_contract<F: FnOnce(&mut Context) -> Poll<R>, R>(
     cx: &mut Context,
     f: F,
 ) -> Poll<R> {
-    debug_assert_contract_with_context::<_, _, _, ()>(cx, f, || None)
+    debug_assert_contract_with_context(cx, f, || Option::<()>::None)
 }
 
 /// Checks that if a function returns [`Poll::Pending`], then the function called [`Waker::clone`],
