@@ -30,6 +30,7 @@ pub(crate) struct TransmissionInfo {
 pub(crate) struct Packet {
     pub frames: Queue<Frame>,
     pub transmission_info: Option<TransmissionInfo>,
+    pub probed_to: Option<PacketNumber>,
 }
 
 impl Packet {
@@ -37,6 +38,7 @@ impl Packet {
         Self {
             frames,
             transmission_info: Some(info),
+            probed_to: None,
         }
     }
 }
