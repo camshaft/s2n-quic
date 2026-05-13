@@ -148,6 +148,10 @@ impl Map {
     /// Each stored packet must either have a `probed_to` link (shell) **or** contain
     /// non-empty, all-ack-eliciting frames. A packet with only ACK frames and no
     /// `probed_to` could trigger an ACK loop.
+    ///
+    /// This method is O(N × F) where N is the number of inflight packets and F is the
+    /// number of frames per packet. It is intended to be called under
+    /// `cfg!(debug_assertions)` only.
     pub fn invariants(&self) {
         for (_, packet) in self.inner.iter() {
             if packet.probed_to.is_none() {
