@@ -108,6 +108,27 @@ impl PendingFrames {
     pub fn byte_cost(&self) -> usize {
         self.byte_cost
     }
+
+    /// Append all frames from a batch in O(1).
+    ///
+    /// The batch's pre-computed `byte_cost` (which includes per-packet overhead) is
+    /// transferred to this queue's counter, preserving the load-balancer estimate.
+    #[inline]
+    pub fn append_batch(&mut self, batch: super::combinator::FrameBatch) {
+        let count = batch.len() as u64;
+        self.byte_cost += batch.byte_cost() as usize;
+        let mut queue = batch.into_queue();
+        self.gauge.enqueue(count);
+        self.queue.append(&mut queue);
+    }
+}
+
+/// Returns `true` if a frame should be queued in `immediate` (bypasses CWND).
+///
+/// Currently only `Control`-header frames (outbound ACK packets) are immediate.
+#[inline]
+fn is_immediate_frame(frame: &Frame) -> bool {
+    matches!(frame.header, crate::stream3::frame::Header::Control { .. })
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -217,17 +238,45 @@ impl Context {
     /// Frames with a `Control` header (ACK frames) are routed to the `immediate` queue and
     /// bypass CWND enforcement. All other frames go to the `pending` queue and are subject
     /// to the congestion window.
+    ///
+    /// In the common case batches are priority-homogeneous (assembled from a single priority
+    /// lane), so a single O(1) `append_batch` is used. Only mixed-priority batches fall back
+    /// to per-frame routing.
     pub fn push_batch<Clk: precision::Clock + ?Sized>(
         &mut self,
         batch: super::combinator::FrameBatch,
         clock: &Clk,
     ) -> WheelInterest {
-        let mut queue = batch.into_queue();
-        while let Some(frame) = queue.pop_front() {
-            if matches!(frame.header, crate::stream3::frame::Header::Control { .. }) {
-                self.immediate.push_back(frame);
+        // Peek at the first frame to determine which queue the whole batch belongs to.
+        // Batches are assembled from per-priority lanes, so in practice every frame in a
+        // batch shares the same header class. The peek is O(1); the append is O(1).
+        let all_immediate = batch
+            .queue()
+            .front()
+            .map_or(false, |f| is_immediate_frame(f));
+
+        if all_immediate {
+            self.immediate.append_batch(batch);
+        } else {
+            // Check whether any Control frames snuck into a non-immediate batch. This
+            // shouldn't happen with homogeneous priority lanes, but handle it defensively.
+            let has_control = batch
+                .queue()
+                .iter()
+                .any(|f| is_immediate_frame(f));
+
+            if has_control {
+                // Mixed batch: route frame-by-frame.
+                let mut queue = batch.into_queue();
+                while let Some(frame) = queue.pop_front() {
+                    if is_immediate_frame(&frame) {
+                        self.immediate.push_back(frame);
+                    } else {
+                        self.pending.push_back(frame);
+                    }
+                }
             } else {
-                self.pending.push_back(frame);
+                self.pending.append_batch(batch);
             }
         }
         self.wheel_interest(clock)
@@ -356,7 +405,7 @@ impl Context {
     /// Only call this with a frame just removed via [`pop_immediate`] or [`pop_pending`].
     #[inline]
     pub fn push_front_frame(&mut self, frame: intrusive_queue::Entry<Frame>) {
-        if matches!(frame.header, crate::stream3::frame::Header::Control { .. }) {
+        if is_immediate_frame(&frame) {
             self.immediate.push_front(frame);
         } else {
             self.pending.push_front(frame);
