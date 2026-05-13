@@ -115,84 +115,71 @@ where
             // the segment is registered in the inflight map.
             let mut probe_from_pn: Option<PacketNumber> = None;
 
-            // probe_bypass_cwnd: set when pending data will serve as the probe so that
-            // Phase 2 can bypass CWND per RFC 9002 §6.2.4 even if it would otherwise
-            // be blocked by congestion control.
-            let mut probe_bypass_cwnd = false;
-
             // Phase 0: PTO probe assembly.
             //
-            // If a probe was requested, prefer pending data as the ack-eliciting packet
-            // (bypassing CWND per RFC 9002 §6.2.4). Only fall back to retransmitting the
-            // oldest inflight entry when no pending data is available.
-            //
-            // The new PN is preceded by a skipped PN so the peer's ACK creates a gap
-            // that triggers PN-threshold loss detection on old packets.
+            // If a probe was requested, prefer pending data (Phase 2 will bypass CWND).
+            // Otherwise retransmit frames from the oldest non-shell inflight entry under
+            // a new PN. A skipped PN creates a gap the peer can use for PN-threshold loss
+            // detection on the original packet (RFC 9002 §6.2.4).
             if context.probe_state.is_requested() {
-                if context.has_pending_data() {
-                    // Pending data bypasses CWND for the probe — set flag so Phase 2 sends
-                    // it regardless of the congestion window.
-                    let _ = context.probe_state.clear();
-                    probe_bypass_cwnd = true;
-                } else if let Some((old_pn, probe_frames)) =
-                    context.inflight.take_oldest_for_probe()
-                {
-                    let _ = context.probe_state.clear();
+                if !context.has_pending_data() {
+                    // No pending data — retransmit from the oldest inflight entry.
+                    if let Some((old_pn, mut probe_frames)) =
+                        context.inflight.take_oldest_for_probe()
+                    {
+                        // Compute the post-skip packet number without committing it to
+                        // context yet — we only assign it if at least one frame fits.
+                        let next_packet_number = context.next_packet_number + 1;
 
-                    // Skip a PN BEFORE estimation so the size estimate uses the correct
-                    // (post-skip) packet number, which affects the varint-encoded header.
-                    context.next_packet_number += 1;
+                        let mut probe_metadata = metadata;
 
-                    let mut probe_metadata = metadata;
-                    let mut probe_queue = Queue::new();
-                    let mut restore_queue = Queue::new();
-                    let mut still_fitting = true;
-
-                    for frame in probe_frames {
-                        if still_fitting {
+                        while let Some(frame) = probe_frames.pop_front() {
                             let next = probe_metadata.with_frame(&frame);
                             let est_len = next.estimate_packet_len(
                                 source_sender_id,
                                 source_control_port,
-                                context.next_packet_number,
+                                next_packet_number,
                                 &context.credentials,
                                 seal::Application::tag_len(&context.sealer),
                             );
                             if est_len <= max_segment_len {
                                 probe_metadata = next;
-                                probe_queue.push_back(frame);
+                                is_ack_eliciting = true;
+                                packet_frames.push_back(frame);
                             } else {
-                                // First frame that doesn't fit — switch to restore mode.
-                                still_fitting = false;
-                                restore_queue.push_back(frame);
+                                // A frame didn't fit.  If this is the very first frame it is
+                                // a header-estimate bug — MTUs don't change so it must fit.
+                                assert!(
+                                    !packet_frames.is_empty(),
+                                    "first probe frame does not fit — header estimate is wrong"
+                                );
+                                // Remaining frames go back into probe_frames for restoration.
+                                probe_frames.push_front(frame);
+                                break;
                             }
-                        } else {
-                            restore_queue.push_back(frame);
                         }
-                    }
 
-                    if !probe_queue.is_empty() {
-                        metadata = probe_metadata;
-                        for frame in probe_queue {
-                            is_ack_eliciting = true;
-                            packet_frames.push_back(frame);
-                        }
-                        if restore_queue.is_empty() {
-                            // All frames fit: link old_pn as a shell pointing to new_pn.
-                            probe_from_pn = Some(old_pn);
+                        if !packet_frames.is_empty() {
+                            // Commit the PN skip now that we know at least one frame was taken.
+                            context.next_packet_number = next_packet_number;
+                            metadata = probe_metadata;
+                            if probe_frames.is_empty() {
+                                // All frames fit: link old_pn as a shell pointing to new_pn.
+                                probe_from_pn = Some(old_pn);
+                            } else {
+                                // Partial fit: restore the remaining frames.
+                                context.inflight.restore_probe_frames(old_pn, probe_frames);
+                            }
+                            // probe_state cleared below, after encoding, via on_transmit()
                         } else {
-                            // Partial fit: restore the frames that didn't fit so the next
-                            // PTO can retransmit them. Don't set probe_from_pn — old_pn
-                            // keeps its remaining frames and is not linked as a shell.
-                            context.inflight.restore_probe_frames(old_pn, restore_queue);
+                            // Nothing fit — restore everything; probe state stays Requested.
+                            context.inflight.restore_probe_frames(old_pn, probe_frames);
                         }
-                    } else {
-                        // Nothing fit at all: undo the PN skip and restore all frames.
-                        context.next_packet_number -= 1;
-                        context.inflight.restore_probe_frames(old_pn, restore_queue);
                     }
+                    // If no non-shell inflight entry exists the probe is a no-op for now.
                 }
-                // If no non-shell inflight entry exists the probe is a no-op.
+                // If has_pending_data(), Phase 2 will bypass CWND and serve as the probe;
+                // probe_state.on_transmit() is called below after encoding.
             }
 
             // Phase 1: drain immediate (ACK) frames unconditionally.
@@ -226,9 +213,10 @@ where
             }
 
             // Phase 2: drain pending (data) frames.
-            // Probes bypass CWND (RFC 9002 §6.2.4); otherwise only drain when CWND allows.
-            let can_send_pending =
-                context.has_pending_data() && (probe_bypass_cwnd || context.can_send_pending_frames());
+            // When a probe is requested and pending data is available, bypass CWND per
+            // RFC 9002 §6.2.4. Otherwise only drain when the congestion window allows.
+            let can_send_pending = context.has_pending_data()
+                && (context.probe_state.is_requested() || context.can_send_pending_frames());
 
             if can_send_pending {
                 while let Some(frame) = context.pop_pending() {
@@ -325,6 +313,12 @@ where
                 if let Some(old_pn) = probe_from_pn {
                     context.inflight.set_probed_to(old_pn, pn);
                 }
+
+                // Notify probe state that an ack-eliciting packet was transmitted.
+                // This clears `Requested → Idle`; if already Idle (e.g. second segment
+                // in this assembly round) the NoOp result is silently ignored.
+                let _ = context.probe_state.on_transmit();
+                context.invariants();
             }
 
             segments_written += 1;

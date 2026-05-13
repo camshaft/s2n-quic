@@ -159,11 +159,11 @@ impl WheelInterest {
 ///
 /// The assembler checks this on every assembly round:
 /// - `Idle`: no probe pending; perform normal immediate + pending drain.
-/// - `Requested`: a probe must be sent. If `pending` data is present **and**
-///   the congestion window allows it, that data serves as the ack-eliciting packet.
-///   Otherwise the assembler retransmits the frames from the oldest non-shell
-///   inflight entry under a new packet number (which bypasses CWND per RFC 9002
-///   §6.2.4), linking the two via `inflight::Packet::probed_to`.
+/// - `Requested`: a probe must be sent. If `pending` data is present it serves as the
+///   ack-eliciting packet (CWND is bypassed per RFC 9002 §6.2.4). Otherwise the assembler
+///   retransmits frames from the oldest non-shell inflight entry under a new packet number,
+///   linking the two via `inflight::Packet::probed_to`. After an ack-eliciting packet is
+///   successfully encoded, the assembler calls `on_transmit()` to transition back to `Idle`.
 #[derive(Default, Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ProbeState {
     /// No probe pending.
@@ -182,8 +182,8 @@ impl ProbeState {
     s2n_quic_core::state::event! {
         /// Transition `Idle → Requested` when a PTO fires.
         request(Idle => Requested);
-        /// Transition `Requested → Idle` once the assembler encodes the probe.
-        clear(Requested => Idle);
+        /// Transition `Requested → Idle` after the assembler transmits an ack-eliciting probe.
+        on_transmit(Requested => Idle);
     }
 
     #[cfg(test)]
@@ -491,6 +491,23 @@ impl Context {
             let _ = self.probe_state.request();
         }
         self.wheel_interest(clock)
+    }
+
+    /// Verify structural invariants of the context.
+    ///
+    /// Runs assertions guarded by `cfg!(test)` — in non-test builds this compiles away
+    /// to nothing. Call this after any mutation that could violate these invariants:
+    /// - PTO target should be `None` when there is no inflight data (no need to probe).
+    #[inline]
+    pub fn invariants(&self) {
+        if cfg!(test) {
+            if !self.inflight.has_inflight() {
+                assert!(
+                    self.pto.target_time.is_none(),
+                    "PTO is armed but there is no inflight data to probe"
+                );
+            }
+        }
     }
 }
 
