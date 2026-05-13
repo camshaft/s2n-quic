@@ -221,9 +221,6 @@ pub(crate) struct Context {
     /// Used by `publish_next_transmission_time` to write the correct slot so the
     /// load-balancer pick-two logic has up-to-date per-socket load information.
     pub sender_idx: usize,
-    /// PTO probe state: set to `Requested` by the PTO handler via `on_pto_timeout`;
-    /// cleared by the assembler after the probe segment is encoded.
-    pub probe_state: ProbeState,
     /// Intrusive links and target time for the transmission pacing wheel
     pub tx_wheel: WheelLinks,
     /// Intrusive links and target time for the PTO (probe timeout) wheel
@@ -264,7 +261,6 @@ impl Context {
                 }
             }),
             sender_idx,
-            probe_state: ProbeState::Idle,
             tx_wheel: WheelLinks::new(),
             pto_wheel: WheelLinks::new(),
             idle_wheel: WheelLinks::new(),
@@ -345,12 +341,12 @@ impl Context {
         // Check we have queued packets and we're not already linked
         !self.is_tx_scheduled()
             && (self.has_immediate()
-                || self.probe_state.is_requested()
+                || self.pto.probe_state.is_requested()
                 || (self.has_pending_data() && self.can_send_pending_frames()))
         {
             // Probes bypass pacing: if one is pending schedule immediately so the
             // assembler can encode it without waiting for the CCA departure time.
-            let target = if self.probe_state.is_requested() {
+            let target = if self.pto.probe_state.is_requested() {
                 None
             } else {
                 self.cca
@@ -425,6 +421,12 @@ impl Context {
         self.queues[frame.priority().as_index()].push_front(frame);
     }
 
+    /// Push a frame to the back of whichever priority queue it belongs to.
+    #[inline]
+    pub fn push_back_frame(&mut self, frame: intrusive_queue::Entry<Frame>) {
+        self.queues[frame.priority().as_index()].push_back(frame);
+    }
+
     /// Publish the estimated next transmission time to the path secret entry.
     ///
     /// Derives the estimate from the current pending wire cost and the CCA bandwidth
@@ -488,7 +490,7 @@ impl Context {
             // The only failure case is `NoOp` — the state is already `Requested`
             // because a previous probe hasn't been consumed by the assembler yet.
             // That's harmless: the assembler will send the probe on its next run.
-            let _ = self.probe_state.request();
+            let _ = self.pto.probe_state.request();
         }
         self.wheel_interest(clock)
     }
@@ -499,6 +501,8 @@ impl Context {
     /// compiles away to nothing. Call this after any mutation that could violate these
     /// invariants:
     /// - PTO target should be `None` when there is no inflight data (no need to probe).
+    /// - Every inflight packet must either have a `probed_to` link (shell) or contain
+    ///   non-empty, all-ack-eliciting frames (no stale ACK frames stored).
     #[inline]
     pub fn invariants(&self) {
         if cfg!(debug_assertions) {
@@ -508,6 +512,7 @@ impl Context {
                     "PTO is armed but there is no inflight data to probe"
                 );
             }
+            self.inflight.invariants();
         }
     }
 }
@@ -623,6 +628,9 @@ pub(crate) struct Pto {
     pub arm_base: Option<precision::Timestamp>,
     pub last_sent_time: Option<precision::Timestamp>,
     pub needs_update: bool,
+    /// PTO probe state: set to `Requested` by the PTO handler via `on_pto_timeout`;
+    /// cleared by the assembler after the probe segment is encoded.
+    pub probe_state: ProbeState,
 }
 
 impl Default for Pto {
@@ -634,6 +642,7 @@ impl Default for Pto {
             arm_base: None,
             last_sent_time: None,
             needs_update: false,
+            probe_state: ProbeState::Idle,
         }
     }
 }
