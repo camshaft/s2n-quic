@@ -86,9 +86,30 @@ async fn run_stream_exchange(
     recv_plan: TransferPlan,
     role: &'static str,
 ) {
+    use core::{future::Future, task::Poll};
+
     let (mut reader, mut writer) = stream.into_split();
-    write_plan(&mut writer, send_plan, role).await;
-    read_to_fin(&mut reader, recv_plan, role).await;
+
+    let mut write_fut = core::pin::pin!(write_plan(&mut writer, send_plan, role));
+    let mut read_fut = core::pin::pin!(read_to_fin(&mut reader, recv_plan, role));
+    let mut write_done = false;
+    let mut read_done = false;
+
+    core::future::poll_fn(|cx| {
+        if !write_done && Future::poll(write_fut.as_mut(), cx).is_ready() {
+            write_done = true;
+        }
+        if !read_done && Future::poll(read_fut.as_mut(), cx).is_ready() {
+            read_done = true;
+        }
+
+        if write_done && read_done {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
+    })
+    .await;
 }
 
 fn run_transfer_case(test_name: &'static str, client_send: TransferPlan, server_send: TransferPlan) {
