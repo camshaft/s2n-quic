@@ -4,7 +4,7 @@
 use crate::{
     clock::precision,
     datagram::batch::Priority,
-    intrusive_queue::{Entry, Queue},
+    intrusive_queue::Entry,
     socket::{
         channel::{
             intrusive_queue::{self, unsync},
@@ -24,7 +24,7 @@ use crate::{
             },
             dispatch, msg, send, Budgets,
         },
-        frame::{Frame, PriorityStorage, SubmissionReceiver},
+        frame::{Frame, PriorityInput, PriorityStorage, SubmissionReceiver},
     },
 };
 use core::{future::poll_fn, task::Poll};
@@ -157,7 +157,7 @@ pub fn frame_dispatch<S, Clk>(
         let rx = crate::counter::GaugedReceiver::new(rx, q_frames);
         let rx = BatchFramesByPathSecret::new(rx, &clock, overall_send_rate);
         let rx = Map::new(rx, Entry::new);
-        // let rx = FrameDispatchPacer::new(rx, clock, overall_send_rate);
+        let rx = Paced::new(rx, clock, overall_send_rate);
         let rx = PickTwo::new(rx, worker_senders, rng);
         rx.drain_budgeted(Some(budgets.frame_dispatch)).await;
     });
@@ -341,7 +341,7 @@ pub fn send_worker<Socket, Clk, WakerSink>(
                     return;
                 };
 
-                let mut lost_queue: Queue<Frame> = Queue::new();
+                let mut lost_queue = PriorityInput::default();
 
                 let wheel_interest = {
                     let mut ctx = ctx_rc.borrow_mut();
