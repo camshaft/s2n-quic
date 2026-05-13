@@ -123,6 +123,7 @@ impl PendingFrames {
     }
 }
 
+#[must_use = "WheelInterest must be dispatched; ignoring it silently skips wheel scheduling"]
 #[derive(Clone, Copy, Debug)]
 pub struct WheelInterest {
     pub transmission: bool,
@@ -339,12 +340,12 @@ impl Context {
         // Check we have queued packets and we're not already linked
         !self.is_tx_scheduled()
             && (self.has_immediate()
-                || self.probe_state == ProbeState::Requested
+                || self.probe_state.is_requested()
                 || (self.has_pending_data() && self.can_send_pending_frames()))
         {
             // Probes bypass pacing: if one is pending schedule immediately so the
             // assembler can encode it without waiting for the CCA departure time.
-            let target = if self.probe_state == ProbeState::Requested {
+            let target = if self.probe_state.is_requested() {
                 None
             } else {
                 self.cca
@@ -473,16 +474,17 @@ impl Context {
 
     /// Called when the PTO wheel fires for this context.
     ///
-    /// Delegates to `Pto::on_timeout` and, if a real probe should be sent,
-    /// transitions the probe state from `Idle` to `Requested`. The caller
-    /// only needs to follow up with `wheel_interest` to reschedule wheels.
-    pub fn on_pto_timeout(&mut self) {
+    /// Transitions the probe state from `Idle` to `Requested` if a real probe
+    /// should be sent, then computes and returns the updated `WheelInterest` for
+    /// rescheduling. The caller only needs to dispatch the returned interest.
+    pub fn on_pto_timeout<Clk: precision::Clock + ?Sized>(&mut self, clock: &Clk) -> WheelInterest {
         if self.pto.on_timeout() {
             // The only failure case is `NoOp` — the state is already `Requested`
             // because a previous probe hasn't been consumed by the assembler yet.
             // That's harmless: the assembler will send the probe on its next run.
             let _ = self.probe_state.request();
         }
+        self.wheel_interest(clock)
     }
 }
 

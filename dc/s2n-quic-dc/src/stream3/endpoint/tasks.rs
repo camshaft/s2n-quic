@@ -419,10 +419,7 @@ pub fn send_worker<Socket, Clk, WakerSink>(
             move |context: Rc<RefCell<send::Context>>| {
                 let wheel_interest = {
                     let mut ctx = context.borrow_mut();
-                    // Context encapsulates both the PTO countdown and the probe-state
-                    // transition — the caller just observes the resulting wheel interest.
-                    ctx.on_pto_timeout();
-                    ctx.wheel_interest(&clock)
+                    ctx.on_pto_timeout(&clock)
                 };
                 if wheel_interest.transmission {
                     q_tx_wheel.enqueue(1);

@@ -18,6 +18,7 @@ use crate::{
         frame::{self, Frame, TransmissionStatus},
     },
 };
+use arrayvec::ArrayVec;
 use core::time::Duration;
 use s2n_quic_core::{
     frame::{self as quic_frame, ack::AckRanges},
@@ -62,14 +63,13 @@ pub(crate) fn process_ack<Clk, Rand>(
         // Shell entries (probed_to.is_some()) have empty `frames`; the live frames
         // reside at the tail of the probe chain at a higher PN. We defer chain
         // following until after the iterator is dropped (so the borrow on
-        // `context.inflight` is released) and use a small fixed-size stack array
-        // to record which chain heads to follow — no heap allocation.
+        // `context.inflight` is released) and use a small fixed-size ArrayVec
+        // (no heap allocation, no zeroed-memory initialisation) to record which
+        // chain heads to follow.
         //
         // The maximum number of shells in a single ACK range is bounded by the PTO
         // backoff cap (16×, ~4 doublings), so 8 slots is more than sufficient.
-        const MAX_DEFERRED: usize = 8;
-        let mut deferred: [Option<PacketNumber>; MAX_DEFERRED] = [None; MAX_DEFERRED];
-        let mut deferred_count = 0usize;
+        let mut deferred: ArrayVec<PacketNumber, 8> = ArrayVec::new();
 
         for (num, mut packet) in context.inflight.remove_range(range) {
             if let Some(tx_info) = packet.transmission_info.take() {
@@ -98,13 +98,10 @@ pub(crate) fn process_ack<Clk, Rand>(
             if let Some(probe_pn) = packet.probed_to {
                 // Shell: the live frames are at the tail of the probe chain.
                 // Defer completion to Phase 2 (after the iterator is dropped).
-                // If we somehow exceed MAX_DEFERRED, the frames at the tail will
-                // remain in the inflight map and be completed when the probe entry
-                // itself is ACKed or swept by loss detection.
-                if deferred_count < MAX_DEFERRED {
-                    deferred[deferred_count] = Some(probe_pn);
-                    deferred_count += 1;
-                }
+                // If we somehow exceed capacity, the tail frames will remain in
+                // the inflight map and be completed when the probe entry itself
+                // is ACKed or swept by loss detection.
+                let _ = deferred.try_push(probe_pn);
             } else {
                 for mut entry in packet.frames {
                     entry.status = TransmissionStatus::Acknowledged;
@@ -115,13 +112,11 @@ pub(crate) fn process_ack<Clk, Rand>(
         // remove_range iterator is dropped here; borrow on `context.inflight` released.
 
         // Phase 2: follow deferred probe chains and complete the tail frames.
-        for i in 0..deferred_count {
-            if let Some(probe_pn) = deferred[i] {
-                let (_, tail_frames) = context.inflight.take_chain_tail_frames(probe_pn);
-                for mut entry in tail_frames {
-                    entry.status = TransmissionStatus::Acknowledged;
-                    let _ = completed.send(entry);
-                }
+        for probe_pn in &deferred {
+            let (_, tail_frames) = context.inflight.take_chain_tail_frames(*probe_pn);
+            for mut entry in tail_frames {
+                entry.status = TransmissionStatus::Acknowledged;
+                let _ = completed.send(entry);
             }
         }
     }
