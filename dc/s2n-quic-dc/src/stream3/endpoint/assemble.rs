@@ -164,6 +164,9 @@ where
                     if let Some((old_pn, mut probe_frames)) =
                         context.inflight.take_oldest_for_probe()
                     {
+                        // oldest_non_shell_pn only returns entries with data frames
+                        // (frames.len() > ack_frame_count), so after ACK-frame stripping
+                        // the returned queue is always non-empty.
                         debug_assert!(
                             !probe_frames.is_empty(),
                             "take_oldest_for_probe returned empty data frames"

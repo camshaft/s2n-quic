@@ -165,6 +165,15 @@ impl Map {
         let old_pn = self.oldest_non_shell_pn()?;
         let packet = self.inner.get_mut(old_pn)?;
 
+        // oldest_non_shell_pn guarantees frames.len() > ack_frame_count, so the loop
+        // terminates safely. The debug_assert enforces this for development builds.
+        debug_assert!(
+            packet.frames.len() >= packet.ack_frame_count,
+            "ack_frame_count ({}) exceeds frames.len() ({})",
+            packet.ack_frame_count,
+            packet.frames.len()
+        );
+
         // Fast path: pop the known leading ACK frames using the stored count.
         for _ in 0..packet.ack_frame_count {
             let _stale = packet.frames.pop_front();
