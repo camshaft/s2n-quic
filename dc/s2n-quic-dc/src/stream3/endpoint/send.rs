@@ -298,9 +298,7 @@ impl Context {
         // Check we have queued packets and we're not already linked
         !self.is_tx_scheduled()
             && (self.has_immediate()
-                || (self.has_pending_data()
-                    && (self.cca.requires_fast_retransmission()
-                        || !self.cca.is_congestion_limited())))
+                || (self.has_pending_data() && self.can_send_pending_frames()))
         {
             let target = self
                 .cca
@@ -404,6 +402,11 @@ impl Context {
     #[inline]
     pub fn has_pending_data(&self) -> bool {
         !self.pending.is_empty()
+    }
+
+    #[inline]
+    pub fn can_send_pending_frames(&self) -> bool {
+        self.cca.requires_fast_retransmission() || !self.cca.is_congestion_limited()
     }
 
     #[inline]

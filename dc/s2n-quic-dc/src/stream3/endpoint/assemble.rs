@@ -137,8 +137,7 @@ where
             }
 
             // Phase 2: drain pending (data) frames only when CWND permits.
-            let can_send_pending =
-                context.cca.requires_fast_retransmission() || !context.cca.is_congestion_limited();
+            let can_send_pending = context.can_send_pending_frames();
 
             if can_send_pending {
                 while let Some(frame) = context.pop_pending() {
