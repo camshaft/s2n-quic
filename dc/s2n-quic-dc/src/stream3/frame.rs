@@ -200,31 +200,7 @@ impl
     }
 }
 
-impl
-    crate::socket::channel::intrusive_queue::sharded::Input<
-        crate::intrusive_queue::EntryAdapter<Frame>,
-        PriorityStorage,
-    > for Queue<Frame>
-{
-    #[inline(always)]
-    fn is_empty(&self) -> bool {
-        Queue::is_empty(self)
-    }
 
-    #[inline(always)]
-    fn append_to(mut self, storage: &mut PriorityStorage) {
-        let len = self.len();
-        if len == 0 {
-            return;
-        }
-
-        storage.0.len += len;
-        while let Some(frame) = self.pop_front() {
-            let idx = frame.priority().as_index();
-            storage.0.queues[idx].push_back(frame);
-        }
-    }
-}
 
 impl PriorityStorage {
     /// Iterates over all frames across all priority buckets, highest priority first.

@@ -79,7 +79,7 @@ use crate::{
             msg,
             reset_error::{self, ResetError},
         },
-        frame::{self, Frame, Header, SubmissionSender, DEFAULT_TTL},
+        frame::{self, Frame, Header, PriorityInput, SubmissionSender, DEFAULT_TTL},
     },
 };
 use s2n_quic_core::{
@@ -757,7 +757,7 @@ impl Inner {
         let mut written = 0;
 
         let mut need_fin_packet = is_fin && buf.buffer_is_empty();
-        let mut frames = Queue::new();
+        let mut frames = PriorityInput::default();
 
         loop {
             if !need_fin_packet && buf.buffer_is_empty() {
@@ -820,7 +820,7 @@ impl Inner {
                 transmission_time: None,
             };
 
-            frames.push_back(frame.into());
+            frames.push(frame.into());
 
             self.advance_offset(payload_len)?;
             written += payload_len;
@@ -868,7 +868,7 @@ impl Inner {
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "frame channel closed"))
     }
 
-    fn send_batch(&mut self, frame: Queue<Frame>) -> io::Result<()> {
+    fn send_batch(&mut self, frame: PriorityInput) -> io::Result<()> {
         self.frame_tx
             .send_batch(frame)
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "frame channel closed"))

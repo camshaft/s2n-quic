@@ -66,8 +66,10 @@ const MAX_FRAME_BATCH_PACKET_OVERHEAD: u64 =
 /// queues with two O(1) list-append operations.
 ///
 /// Because individual frames are routed into per-priority unsync lanes *before*
-/// [`BatchFramesByPathSecret`] coalesces them, all frames in a `FrameBatch` that comes out
-/// of a given lane share the same priority class.
+/// [`BatchFramesByPathSecret`] coalesces them, frames in a `FrameBatch` that comes out
+/// of a given lane share the same priority class. (Frames submitted as a batch via the
+/// retransmission path may have mixed priorities, but are pre-sorted into per-priority
+/// buckets at submission time by [`PriorityInput`], so this invariant is maintained.)
 pub struct FrameBatch {
     /// ACK (Control-header) frames: bypass CWND, drained unconditionally by assembler.
     immediate: Queue<Frame>,
