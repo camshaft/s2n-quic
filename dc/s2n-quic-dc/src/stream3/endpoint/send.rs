@@ -366,9 +366,9 @@ impl Context {
     /// Only call this with a frame just removed via [`pop_pending`].
     #[inline]
     pub fn push_front_pending(&mut self, frame: intrusive_queue::Entry<Frame>) {
-        let idx = frame.priority().as_index();
-        debug_assert!(idx > 0, "immediate frame passed to push_front_pending");
-        self.pending[idx - 1].push_front(frame);
+        debug_assert!(!frame.is_immediate(), "immediate frame passed to push_front_pending");
+        // Delegate to push_front_frame which has the correct branching for all levels.
+        self.push_front_frame(frame);
     }
 
     /// Push a frame back to the front of whichever queue it belongs to.
@@ -378,11 +378,9 @@ impl Context {
     /// removed via [`pop_immediate`] or [`pop_pending`].
     #[inline]
     pub fn push_front_frame(&mut self, frame: intrusive_queue::Entry<Frame>) {
-        let idx = frame.priority().as_index();
-        if idx == 0 {
-            self.immediate.push_front(frame);
-        } else {
-            self.pending[idx - 1].push_front(frame);
+        match frame.priority().as_index() {
+            0 => self.immediate.push_front(frame),
+            n => self.pending[n - 1].push_front(frame),
         }
     }
 
