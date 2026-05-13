@@ -146,10 +146,10 @@ where
                     let mut probe_metadata = metadata;
                     let mut probe_queue = Queue::new();
                     let mut restore_queue = Queue::new();
-                    let mut fitting = true;
+                    let mut still_fitting = true;
 
                     for frame in probe_frames {
-                        if fitting {
+                        if still_fitting {
                             let next = probe_metadata.with_frame(&frame);
                             let est_len = next.estimate_packet_len(
                                 source_sender_id,
@@ -163,7 +163,7 @@ where
                                 probe_queue.push_back(frame);
                             } else {
                                 // First frame that doesn't fit — switch to restore mode.
-                                fitting = false;
+                                still_fitting = false;
                                 restore_queue.push_back(frame);
                             }
                         } else {
