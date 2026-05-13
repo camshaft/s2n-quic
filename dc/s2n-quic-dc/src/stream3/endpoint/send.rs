@@ -60,6 +60,14 @@ impl PendingFrames {
         }
     }
 
+    /// Push a frame onto the back of the queue, updating the cost counter.
+    #[inline]
+    pub fn push_back(&mut self, frame: intrusive_queue::Entry<Frame>) {
+        self.byte_cost += frame.byte_cost() as usize;
+        self.gauge.enqueue(1);
+        self.queue.push_back(frame);
+    }
+
     /// Push a frame onto the front of the queue, updating the cost counter.
     ///
     /// Only call this with a frame that was just removed via [`pop_front`] — for
@@ -100,16 +108,6 @@ impl PendingFrames {
     pub fn byte_cost(&self) -> usize {
         self.byte_cost
     }
-
-    /// Append all frames from a batch in O(1).
-    #[inline]
-    pub fn append_batch(&mut self, batch: super::combinator::FrameBatch) {
-        let count = batch.len() as u64;
-        self.byte_cost += batch.byte_cost() as usize;
-        let mut queue = batch.into_queue();
-        self.gauge.enqueue(count);
-        self.queue.append(&mut queue);
-    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -145,8 +143,12 @@ impl WheelInterest {
 /// Per-peer send state, one per (credentials_id, send_socket) pair.
 ///
 /// Holds crypto material, congestion control, inflight tracking, and the pending frame
-/// queue. Frames are pushed in by the Dispatcher, then `assemble()` is called when the
+/// queues. Frames are pushed in by the Dispatcher, then `assemble()` is called when the
 /// local wheel fires to pack them into encrypted packets.
+///
+/// Frames are held in two queues based on whether they bypass CWND:
+/// - `immediate`: ACK frames (`Control` header) — drained unconditionally by the assembler.
+/// - `pending`: all other frames (data, resets, flow control) — subject to CWND gating.
 pub(crate) struct Context {
     pub path_secret_entry: Arc<PathSecretEntry>,
     pub sealer: crate::crypto::awslc::seal::Application,
@@ -159,7 +161,10 @@ pub(crate) struct Context {
     pub rtt_estimator: RttEstimator,
     pub inflight: inflight::Map,
     pub pto: Pto,
-    /// Frames waiting to be assembled into packets, with integrated wire-cost tracking.
+    /// ACK frames (Control header) that bypass CWND enforcement. Drained unconditionally
+    /// by the assembler before data frames.
+    pub immediate: PendingFrames,
+    /// Data frames subject to CWND. Drained only when the congestion window allows.
     pub pending: PendingFrames,
     /// Index of this socket in the path secret entry's `next_transmission_by_sender` array.
     ///
@@ -178,6 +183,7 @@ impl Context {
     pub fn new(
         entry: &Arc<PathSecretEntry>,
         inflight_gauge: QueueGauge,
+        immediate_gauge: QueueGauge,
         pending_gauge: QueueGauge,
         sender_idx: usize,
     ) -> Self {
@@ -196,6 +202,7 @@ impl Context {
             rtt_estimator,
             inflight,
             pto: Pto::default(),
+            immediate: PendingFrames::new(immediate_gauge),
             pending: PendingFrames::new(pending_gauge),
             sender_idx,
             tx_wheel: WheelLinks::new(),
@@ -206,12 +213,23 @@ impl Context {
 
     /// Append all frames from a batch and return wheel interest indicating which wheels
     /// need this context inserted.
+    ///
+    /// Frames with a `Control` header (ACK frames) are routed to the `immediate` queue and
+    /// bypass CWND enforcement. All other frames go to the `pending` queue and are subject
+    /// to the congestion window.
     pub fn push_batch<Clk: precision::Clock + ?Sized>(
         &mut self,
         batch: super::combinator::FrameBatch,
         clock: &Clk,
     ) -> WheelInterest {
-        self.pending.append_batch(batch);
+        let mut queue = batch.into_queue();
+        while let Some(frame) = queue.pop_front() {
+            if matches!(frame.header, crate::stream3::frame::Header::Control { .. }) {
+                self.immediate.push_back(frame);
+            } else {
+                self.pending.push_back(frame);
+            }
+        }
         self.wheel_interest(clock)
     }
 
@@ -269,9 +287,10 @@ impl Context {
         self.has_pending()
             // Make sure we're not already linked
             && !self.is_tx_scheduled()
-            // Check if the congestion controller is allowing a send
+            // Check if the congestion controller is allowing a send.
+            // TODO (PTO task 4): remove `|| true` once CWND is enforced only for
+            // `pending` frames; `immediate` frames always bypass the window.
             && (self.cca.requires_fast_retransmission() || !self.cca.is_congestion_limited() || true)
-        // TODO we need to see if we have ACKs scheculed and still let those go through
         {
             let target = self
                 .cca
@@ -303,6 +322,20 @@ impl Context {
         }
     }
 
+    /// Pop the next immediate (ACK) frame from the immediate queue.
+    #[inline]
+    pub fn pop_immediate(&mut self) -> Option<intrusive_queue::Entry<Frame>> {
+        self.immediate.pop_front()
+    }
+
+    /// Push a frame back to the front of the immediate queue.
+    ///
+    /// Only call this with a frame just removed via [`pop_immediate`].
+    #[inline]
+    pub fn push_front_immediate(&mut self, frame: intrusive_queue::Entry<Frame>) {
+        self.immediate.push_front(frame);
+    }
+
     /// Pop the next frame from the pending queue.
     #[inline]
     pub fn pop_pending(&mut self) -> Option<intrusive_queue::Entry<Frame>> {
@@ -317,6 +350,19 @@ impl Context {
         self.pending.push_front(frame);
     }
 
+    /// Push a frame back to the front of whichever queue it belongs to.
+    ///
+    /// Routes `Control`-header frames to `immediate` and all other frames to `pending`.
+    /// Only call this with a frame just removed via [`pop_immediate`] or [`pop_pending`].
+    #[inline]
+    pub fn push_front_frame(&mut self, frame: intrusive_queue::Entry<Frame>) {
+        if matches!(frame.header, crate::stream3::frame::Header::Control { .. }) {
+            self.immediate.push_front(frame);
+        } else {
+            self.pending.push_front(frame);
+        }
+    }
+
     /// Publish the estimated next transmission time to the path secret entry.
     ///
     /// Derives the estimate from the current pending wire cost and the CCA bandwidth
@@ -329,14 +375,14 @@ impl Context {
         self.path_secret_entry.update_sender_next_transmission_time(
             self.sender_idx,
             now,
-            self.pending.byte_cost(),
+            self.immediate.byte_cost() + self.pending.byte_cost(),
             self.cca.bandwidth(),
         );
     }
 
     #[inline]
     pub fn has_pending(&self) -> bool {
-        !self.pending.is_empty()
+        !self.immediate.is_empty() || !self.pending.is_empty()
     }
 
     #[inline]
@@ -502,6 +548,7 @@ impl Pto {
 pub(crate) struct Cache {
     contexts: FxHashMap<credentials::Id, Rc<RefCell<Context>>>,
     inflight_gauge: QueueGauge,
+    immediate_gauge: QueueGauge,
     pending_gauge: QueueGauge,
     sender_idx: usize,
 }
@@ -511,6 +558,7 @@ impl Cache {
         Self {
             contexts: FxHashMap::default(),
             inflight_gauge: counter_registry.register_queue_gauge("send.inflight"),
+            immediate_gauge: counter_registry.register_queue_gauge("send.immediate"),
             pending_gauge: counter_registry.register_queue_gauge("send.pending"),
             sender_idx,
         }
@@ -525,6 +573,7 @@ impl Cache {
                 Rc::new(RefCell::new(Context::new(
                     entry,
                     self.inflight_gauge.clone(),
+                    self.immediate_gauge.clone(),
                     self.pending_gauge.clone(),
                     self.sender_idx,
                 )))
