@@ -199,8 +199,43 @@ impl
         storage.0.len += 1;
     }
 }
+/// A batch of frames that all share the same priority level.
+///
+/// Unlike [`PriorityInput`], which fans frames into per-priority buckets at push time,
+/// `HomogeneousBatch` wraps a single [`Queue<Frame>`] whose frames are all known to have
+/// the same priority.  The `append_to` implementation performs a single O(1) list-append
+/// into the correct priority bucket, avoiding an unnecessary O([`Priority::LEVELS`])
+/// iteration.
+///
+/// Use this when the caller knows the priority of every frame at construction time —
+/// for example, the stream writer which always produces [`Priority::FlowData`] frames.
+pub struct HomogeneousBatch {
+    pub queue: Queue<Frame>,
+    pub priority: Priority,
+}
 
+impl
+    crate::socket::channel::intrusive_queue::sharded::Input<
+        crate::intrusive_queue::EntryAdapter<Frame>,
+        PriorityStorage,
+    > for HomogeneousBatch
+{
+    #[inline(always)]
+    fn is_empty(&self) -> bool {
+        self.queue.is_empty()
+    }
 
+    #[inline(always)]
+    fn append_to(mut self, storage: &mut PriorityStorage) {
+        let len = self.queue.len();
+        if len == 0 {
+            return;
+        }
+        let idx = self.priority.as_index();
+        storage.0.queues[idx].append(&mut self.queue);
+        storage.0.len += len;
+    }
+}
 
 impl PriorityStorage {
     /// Iterates over all frames across all priority buckets, highest priority first.
