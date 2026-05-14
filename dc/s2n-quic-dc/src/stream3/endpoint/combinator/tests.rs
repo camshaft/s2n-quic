@@ -431,6 +431,8 @@ fn batch_frames_adopts_sticky_from_later_frame() {
 
 #[test]
 fn ack_processor_drops_message_with_out_of_range_sender_idx() {
+    const OUT_OF_RANGE_SENDER_ID: u64 = 42; // total_sender_ids is 1, so any value > 0 is invalid.
+
     let registry = crate::counter::Registry::default();
     let send_caches = vec![Rc::new(RefCell::new(send::Cache::new(&registry, 0)))];
     let sender_idx_to_local = vec![0];
@@ -442,7 +444,7 @@ fn ack_processor_drops_message_with_out_of_range_sender_idx() {
 
     let ack_rx = TestReceiver {
         values: VecDeque::from([Entry::new(msg::Sender::ReceivedAck {
-            local_sender_id: VarInt::from_u8(42),
+            local_sender_id: VarInt::new(OUT_OF_RANGE_SENDER_ID).expect("valid varint"),
             path_secret_entry,
             payload: BytesMut::new(),
         })]),
