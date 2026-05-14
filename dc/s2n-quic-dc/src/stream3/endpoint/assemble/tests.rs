@@ -280,11 +280,12 @@ fn assemble_accounts_for_header_overhead() {
     for _ in 0..128 {
         context.push_back_frame(
             Frame {
-                header: Header::FlowReset {
-                    dest_queue_id: VarInt::from_u8(1),
+                header: Header::FlowControl {
+                    queue_pair: crate::packet::datagram::QueuePair {
+                        source_queue_id: VarInt::from_u8(1),
+                        dest_queue_id: VarInt::from_u8(1),
+                    },
                     stream_id: VarInt::from_u8(1),
-                    reset_target: ResetTarget::Both,
-                    error_code: VarInt::from_u8(1),
                 },
                 source_sender_id: VarInt::MAX,
                 payload: ByteVec::new(),
@@ -334,6 +335,7 @@ fn assemble_fuzz_respects_gso_invariants() {
                 .iter()
                 .filter(|frame| {
                     !matches!(frame.header, Header::Ack { .. })
+                        && frame.header.priority().as_index() > 0
                         &&
                     is_frame_encodable(
                         frame,
@@ -349,8 +351,7 @@ fn assemble_fuzz_respects_gso_invariants() {
                 return;
             }
 
-            // Sort by priority to match the assembler's drain order: immediate
-            // (Ack) first, then pending queues from lowest index to highest.
+            // Sort by priority to match the assembler's pending-queue drain order.
             frames.sort_by_key(|f| f.header.priority().as_index());
 
             let max_segments = input.max_segments.min(segment::MAX_COUNT);
