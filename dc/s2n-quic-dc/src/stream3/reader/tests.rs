@@ -3,7 +3,7 @@
 
 //! Tests for the stream3 Reader.
 //!
-//! ## Organisation
+//! ## Organization
 //!
 //! * **Synchronous unit tests** – exercise `write_data_reader` and
 //!   `poll_read_into` directly with noop wakers; no async runtime needed.
@@ -188,12 +188,23 @@ fn write_data_reader_keeps_out_of_order_data_in_reassembler() {
     reader.seek_forward(4);
     write_data_reader(&mut reassembler, &mut reader, &mut app_buf, true).unwrap();
 
+    // Nothing was delivered to the application yet — the tail (offset 4-7) is
+    // buffered in the reassembler, but there is a gap at 0-3.  `is_empty()` and
+    // `total_received_len()` both report zero because they only count bytes
+    // contiguous from the current read position (offset 0).  `final_size()` is
+    // set, confirming the tail and FIN were recorded internally.
     assert!(app_buf.is_empty());
     assert_eq!(reassembler.consumed_len(), 0);
     assert_eq!(reassembler.total_received_len(), 0);
     assert!(reassembler.is_empty());
     assert!(!reassembler.is_reading_complete());
+    assert_eq!(
+        reassembler.final_size(),
+        Some(8),
+        "FIN should be recorded even though the head is missing"
+    );
 
+    // Once the missing head is written, all 8 bytes become available.
     reassembler
         .write_at(0u32.into(), &Data::send_one_at(0, 4))
         .unwrap();
@@ -213,6 +224,10 @@ fn write_data_reader_does_not_interpose_when_reassembler_has_head_data() {
 
     write_data_reader(&mut reassembler, &mut reader, &mut app_buf, true).unwrap();
 
+    // The interposer bypass is skipped because the reassembler already holds
+    // data at the head (offset 0-3).  Both head and tail (reader, offset 4-7)
+    // are stored in the reassembler; all 8 bytes are contiguous so they are
+    // immediately accessible without a gap.
     assert!(app_buf.is_empty());
     assert_eq!(reassembler.len(), 8);
     assert_eq!(reassembler.total_received_len(), 8);
