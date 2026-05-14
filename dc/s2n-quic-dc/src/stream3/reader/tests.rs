@@ -585,9 +585,9 @@ fn max_data_sent_after_consuming() {
             let read = reader.read_into(&mut buf).await.expect("read failed");
             assert_eq!(read, payload_len);
             assert_eq!(buf.len(), payload_len);
-            // Keep the task alive briefly so the endpoint-side assertion consumes
-            // this batch before Reader is dropped at task completion.
-            crate::testing::sleep(Duration::from_millis(1)).await;
+            // Keep the task alive long enough for the endpoint-side assertion to
+            // consume this batch before Reader is dropped at task completion.
+            crate::testing::sleep(Duration::from_secs(1)).await;
         }
         .primary()
         .spawn();
@@ -694,7 +694,9 @@ fn client_fin_observed_before_gap_fill_does_not_send_max_data() {
 
         async move {
             pusher.push_data(2, b"llo", true);
-            crate::testing::sleep(Duration::from_millis(1)).await;
+            // Sleep long enough to ensure the out-of-order FIN segment is
+            // processed before the head segment is injected.
+            crate::testing::sleep(Duration::from_secs(1)).await;
             pusher.push_data(0, b"he", false);
             let frames = pusher.recv_frames_timeout(Duration::from_secs(1)).await;
             assert!(
