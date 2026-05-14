@@ -616,10 +616,11 @@ impl Inner {
     }
 
     fn maybe_send_max_data(&mut self) -> io::Result<()> {
+        if self.fin_observed && !self.send_flow_update_after_fin {
+            return Ok(());
+        }
+
         if let Some(final_size) = self.reassembler.final_size() {
-            if self.fin_observed && !self.send_flow_update_after_fin {
-                return Ok(());
-            }
             if self.remote_max_data.as_u64() >= final_size {
                 return Ok(());
             }

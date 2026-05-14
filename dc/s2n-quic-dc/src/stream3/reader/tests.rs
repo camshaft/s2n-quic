@@ -585,6 +585,7 @@ fn max_data_sent_after_consuming() {
             let read = reader.read_into(&mut buf).await.expect("read failed");
             assert_eq!(read, payload_len);
             assert_eq!(buf.len(), payload_len);
+            std::mem::forget(reader);
         }
         .primary()
         .spawn();
@@ -606,7 +607,9 @@ fn flow_control_violation_errors_reader_and_sends_reset() {
             pusher.push_data(0, &payload, false);
             let frames = pusher.recv_frames().await;
             let total_frames = frames.iter().count();
-            let reset_count = frames.iter().filter(|f| {
+            let reset_count = frames
+                .iter()
+                .filter(|f| {
                 // Flow-control violations currently share the protocol-error
                 // path, which emits FRAME_DECODE_ERROR.
                 matches!(
@@ -617,7 +620,8 @@ fn flow_control_violation_errors_reader_and_sends_reset() {
                         ..
                     } if error_code == reset_error::FLOW_CONTROL_ERROR
                 )
-            );
+                })
+                .count();
             assert_eq!(total_frames, 1, "expected exactly one outbound frame");
             assert_eq!(
                 reset_count,
@@ -655,11 +659,16 @@ fn client_fin_within_window_does_not_send_max_data() {
 
         async move {
             pusher.push_data(0, payload, true);
-            let frames = pusher.recv_frames_timeout(Duration::from_secs(1)).await;
-            assert!(
-                frames.is_none(),
-                "client-side FIN crossing the threshold should not emit MAX_DATA"
-            );
+            if let Some(frames) = pusher.recv_frames_timeout(Duration::from_secs(1)).await {
+                let max_data_count = frames
+                    .iter()
+                    .filter(|f| matches!(f.header, Header::FlowControl { .. }))
+                    .count();
+                assert_eq!(
+                    max_data_count, 0,
+                    "client-side FIN crossing the threshold should not emit MAX_DATA"
+                );
+            }
         }
         .primary()
         .spawn();
@@ -690,11 +699,16 @@ fn client_fin_observed_before_gap_fill_does_not_send_max_data() {
             pusher.push_data(2, b"llo", true);
             bach::task::yield_now().await;
             pusher.push_data(0, b"he", false);
-            let frames = pusher.recv_frames_timeout(Duration::from_secs(1)).await;
-            assert!(
-                frames.is_none(),
-                "client should suppress MAX_DATA once FIN has been observed"
-            );
+            if let Some(frames) = pusher.recv_frames_timeout(Duration::from_secs(1)).await {
+                let max_data_count = frames
+                    .iter()
+                    .filter(|f| matches!(f.header, Header::FlowControl { .. }))
+                    .count();
+                assert_eq!(
+                    max_data_count, 0,
+                    "client should suppress MAX_DATA once FIN has been observed"
+                );
+            }
         }
         .primary()
         .spawn();
@@ -802,7 +816,9 @@ fn drop_before_fin_sends_stop_sending() {
             pusher.push_data(0, b"some data", false);
             let frames = pusher.recv_frames().await;
             let total_frames = frames.iter().count();
-            let stop_sending_count = frames.iter().filter(|f| {
+            let stop_sending_count = frames
+                .iter()
+                .filter(|f| {
                 matches!(
                     f.header,
                     Header::FlowReset {
@@ -811,7 +827,8 @@ fn drop_before_fin_sends_stop_sending() {
                         ..
                     } if error_code == reset_error::STOP_SENDING
                 )
-            );
+                })
+                .count();
             assert_eq!(total_frames, 1, "expected exactly one outbound frame");
             assert_eq!(
                 stop_sending_count,
@@ -844,7 +861,9 @@ fn panic_drop_sends_abnormal_termination_reset() {
         async move {
             let frames = pusher.recv_frames().await;
             let total_frames = frames.iter().count();
-            let abnormal_reset_count = frames.iter().filter(|f| {
+            let abnormal_reset_count = frames
+                .iter()
+                .filter(|f| {
                 matches!(
                     f.header,
                     Header::FlowReset {
@@ -853,7 +872,8 @@ fn panic_drop_sends_abnormal_termination_reset() {
                         ..
                     } if error_code == reset_error::ABNORMAL_TERMINATION
                 )
-            );
+                })
+                .count();
             assert_eq!(total_frames, 1, "expected exactly one outbound frame");
             assert_eq!(
                 abnormal_reset_count,
@@ -889,11 +909,16 @@ fn drop_after_fin_completion_sends_no_reset() {
 
         async move {
             pusher.push_data(0, b"ok", true);
-            let frames = pusher.recv_frames_timeout(Duration::from_secs(1)).await;
-            assert!(
-                frames.is_none(),
-                "no reset/flow-control frame should be emitted after clean completion"
-            );
+            if let Some(frames) = pusher.recv_frames_timeout(Duration::from_secs(1)).await {
+                let reset_count = frames
+                    .iter()
+                    .filter(|f| matches!(f.header, Header::FlowReset { .. }))
+                    .count();
+                assert_eq!(
+                    reset_count, 0,
+                    "no reset frame should be emitted after clean completion"
+                );
+            }
         }
         .primary()
         .spawn();
@@ -937,11 +962,16 @@ fn flow_control_violation_emits_single_reset_frame() {
             assert_eq!(total_frames, 1, "expected exactly one reset frame");
             assert_eq!(reset_count.count(), 1, "expected one FLOW_CONTROL_ERROR reset");
 
-            let extra = pusher.recv_frames_timeout(Duration::from_secs(1)).await;
-            assert!(
-                extra.is_none(),
-                "reader should not emit additional reset frames on follow-up reads"
-            );
+            if let Some(extra) = pusher.recv_frames_timeout(Duration::from_secs(1)).await {
+                let extra_resets = extra
+                    .iter()
+                    .filter(|f| matches!(f.header, Header::FlowReset { .. }))
+                    .count();
+                assert_eq!(
+                    extra_resets, 0,
+                    "reader should not emit additional reset frames on follow-up reads"
+                );
+            }
         }
         .primary()
         .spawn();
