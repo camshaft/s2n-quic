@@ -246,7 +246,7 @@ where
 
     let mut enqueue_pending_ack = false;
     if is_ack_eliciting {
-        peer.ack_state.on_ack_eliciting();
+        let _ = peer.ack_state.on_ack_eliciting();
 
         debug_assert!(
             !peer.ack_burst.is_linked() || peer.ack_state.is_scheduled(),

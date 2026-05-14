@@ -43,22 +43,23 @@ impl AckState {
     s2n_quic_core::state::is!(is_flushed, Flushed);
     s2n_quic_core::state::is!(is_flushed_stale, FlushedStale);
 
-    /// An ack-eliciting packet was received.
-    pub fn on_ack_eliciting(&mut self) {
-        match self {
-            Self::Idle => *self = Self::Scheduled,
-            Self::Flushed => *self = Self::FlushedStale,
-            Self::Scheduled | Self::FlushedStale => {}
-        }
-    }
-
     s2n_quic_core::state::event! {
+        /// An ack-eliciting packet was received.
+        on_ack_eliciting(
+            Idle | Scheduled => Scheduled,
+            Flushed | FlushedStale => FlushedStale,
+        );
         /// The ACK submission was sent to the send worker.
         on_flush(Scheduled => Flushed);
-        /// Completion returned and no new packets arrived — back to idle.
-        on_completion_idle(Flushed => Idle);
-        /// Completion returned but new packets arrived — re-schedule.
-        on_completion_stale(FlushedStale => Scheduled);
+        /// ACK flush completion returned.
+        ///
+        /// If no new packets arrived while in flight, transition back to idle.
+        /// If packets arrived (FlushedStale), transition to scheduled so the
+        /// completion path can re-encode and resubmit.
+        on_flush_complete(
+            Flushed => Idle,
+            FlushedStale => Scheduled,
+        );
         /// Scheduled but nothing to encode — reset to idle.
         on_empty(Scheduled => Idle);
     }
@@ -328,14 +329,8 @@ impl Context {
             self.ack_state.is_flushed() || self.ack_state.is_flushed_stale(),
             "ack completion should only be observed for Flushed/FlushedStale states"
         );
-
-        if self.ack_state.is_flushed_stale() {
-            let _ = self.ack_state.on_completion_stale();
-            return self.encode_and_flush(recv_worker_id);
-        }
-
-        let _ = self.ack_state.on_completion_idle();
-        None
+        let _ = self.ack_state.on_flush_complete();
+        self.encode_and_flush(recv_worker_id)
     }
 }
 
