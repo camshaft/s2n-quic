@@ -760,10 +760,18 @@ impl<R, Clk, Rand, C> AckProcessor<R, Clk, Rand, C> {
 
     fn resolve_cache(&mut self, sender_idx: usize) -> Option<&mut Rc<RefCell<send::Cache>>> {
         if sender_idx >= self.total_sender_ids {
+            self.counters.on_invalid_sender_idx();
             return None;
         }
-        let local_id = self.sender_idx_to_local.get(sender_idx).copied()?;
-        self.send_caches.get_mut(local_id)
+        let Some(local_id) = self.sender_idx_to_local.get(sender_idx).copied() else {
+            self.counters.on_invalid_sender_idx();
+            return None;
+        };
+        let Some(cache) = self.send_caches.get_mut(local_id) else {
+            self.counters.on_invalid_sender_idx();
+            return None;
+        };
+        Some(cache)
     }
 
     fn dispatch_wheel_interest(
