@@ -266,14 +266,21 @@ impl Reader {
     /// # Buffer requirements
     ///
     /// `S` must be a buffer that can always accept more bytes — for example
-    /// [`bytes::BytesMut`] or [`Vec<u8>`], which grow on demand.  If `buf` runs
-    /// out of capacity before EOF is reached, `read_into` returns
-    /// `Poll::Pending` without making progress and this loop will stall.
+    /// [`bytes::BytesMut`] or [`Vec<u8>`], which grow on demand. If `buf` has no
+    /// remaining capacity (empty at call time or later filled for fixed-size
+    /// storage), this method returns `InvalidInput` instead of stalling.
     pub async fn read_to_end<S>(&mut self, buf: &mut S) -> io::Result<()>
     where
         S: buffer::writer::Storage,
     {
         loop {
+            if !buf.track_write().has_remaining_capacity() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "buffer has no remaining capacity",
+                ));
+            }
+
             if self.read_into(buf).await? == 0 {
                 return Ok(());
             }
@@ -440,6 +447,31 @@ impl Inner {
                             mut payload,
                             fin,
                         } => {
+                            let Some(end_offset) = offset.as_u64().checked_add(payload.len() as u64)
+                            else {
+                                debug!(
+                                    stream_id = self.stream_id.as_u64(),
+                                    offset = offset.as_u64(),
+                                    payload_len = payload.len(),
+                                    "Incoming data offset overflowed"
+                                );
+                                return self.protocol_error();
+                            };
+
+                            if self.remote_max_data != VarInt::ZERO
+                                && end_offset > self.remote_max_data.as_u64()
+                            {
+                                debug!(
+                                    stream_id = self.stream_id.as_u64(),
+                                    offset = offset.as_u64(),
+                                    payload_len = payload.len(),
+                                    end_offset,
+                                    remote_max_data = self.remote_max_data.as_u64(),
+                                    "Peer exceeded advertised receive window"
+                                );
+                                return self.protocol_error();
+                            }
+
                             trace!(
                                 stream_id = self.stream_id.as_u64(),
                                 offset = offset.as_u64(),

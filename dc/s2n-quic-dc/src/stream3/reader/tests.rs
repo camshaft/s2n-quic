@@ -23,10 +23,11 @@
 //!   The two sides talk over the real flow-queue / frame-submission channels,
 //!   without any actual UDP sockets or cryptography.
 
-use super::{msg, write_data_reader, Reader};
+use super::{msg, reset_error, write_data_reader, Reader};
 use crate::{
     flow,
     intrusive_queue,
+    packet::datagram::ResetTarget,
     path::secret::map::Entry as PathSecretEntry,
     stream3::frame::{self, Frame, Header, PriorityStorage, SubmissionReceiver},
 };
@@ -517,14 +518,14 @@ fn max_data_sent_after_consuming() {
 
         let (mut reader, mut pusher) = make_pair();
         let window_size = reader.0.window_size;
-        // A payload just over window_size ensures we cross the > window/2
-        // threshold in a single read.
-        let payload = vec![0xabu8; window_size as usize + 1];
+        // Cross the > window/2 threshold in a single read without exceeding the
+        // advertised receive window.
+        let payload = vec![0xabu8; (window_size / 2 + 1) as usize];
         let payload_len = payload.len();
 
         // Endpoint task: push data, then wait for the MAX_DATA frame.
         async move {
-            pusher.push_data(0, &payload, true);
+            pusher.push_data(0, &payload, false);
             let frames = pusher.recv_frames().await;
             let has_max_data = frames
                 .iter()
@@ -534,11 +535,100 @@ fn max_data_sent_after_consuming() {
         .primary()
         .spawn();
 
-        // App task: read until EOF.
+        // App task: read once.
         async move {
             let mut buf = BytesMut::with_capacity(payload_len + 16);
-            reader.read_to_end(&mut buf).await.expect("read failed");
+            let read = reader.read_into(&mut buf).await.expect("read failed");
+            assert_eq!(read, payload_len);
             assert_eq!(buf.len(), payload_len);
+        }
+        .primary()
+        .spawn();
+    });
+}
+
+/// If the peer sends beyond the client's advertised receive window, the Reader
+/// errors and emits a FlowReset.
+#[test]
+fn flow_control_violation_errors_reader_and_sends_reset() {
+    crate::testing::sim(|| {
+        use crate::testing::ext::*;
+
+        let (mut reader, mut pusher) = make_pair();
+        let payload = vec![0u8; reader.0.window_size as usize + 1];
+        let payload_len = payload.len();
+
+        async move {
+            pusher.push_data(0, &payload, false);
+            let frames = pusher.recv_frames().await;
+            let has_protocol_reset = frames.iter().any(|f| {
+                matches!(
+                    f.header,
+                    Header::FlowReset {
+                        reset_target: ResetTarget::Both,
+                        error_code,
+                        ..
+                    } if error_code == reset_error::FRAME_DECODE_ERROR
+                )
+            });
+            assert!(
+                has_protocol_reset,
+                "expected FlowReset(Both, FRAME_DECODE_ERROR) on flow-control violation"
+            );
+        }
+        .primary()
+        .spawn();
+
+        async move {
+            let mut buf = BytesMut::with_capacity(payload_len + 16);
+            let err = reader
+                .read_into(&mut buf)
+                .await
+                .expect_err("expected InvalidData on flow-control violation");
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        }
+        .primary()
+        .spawn();
+    });
+}
+
+/// Client-side FIN within the advertised window should not require sending
+/// MAX_DATA after the final byte is consumed.
+#[test]
+fn client_fin_within_window_does_not_send_max_data() {
+    crate::testing::sim(|| {
+        use crate::testing::ext::*;
+
+        let (mut reader, pusher) = make_pair();
+        let payload = b"hello";
+
+        // Break frame_tx by dropping the original frame receiver. If the Reader
+        // tries to send MAX_DATA on FIN, reads would fail with BrokenPipe.
+        let Pusher {
+            dispatcher,
+            queue_id,
+            request,
+            frame_rx: _closed,
+            frame_storage,
+        } = pusher;
+        let mut pusher = Pusher {
+            dispatcher,
+            queue_id,
+            request,
+            frame_rx: frame::submission_channel(1).1,
+            frame_storage,
+        };
+
+        async move {
+            pusher.push_data(0, payload, true);
+        }
+        .primary()
+        .spawn();
+
+        async move {
+            let mut buf = BytesMut::with_capacity(32);
+            reader.read_to_end(&mut buf).await.expect("read failed");
+            assert_eq!(&buf[..], payload);
         }
         .primary()
         .spawn();
@@ -615,10 +705,20 @@ fn drop_before_fin_sends_stop_sending() {
         async move {
             pusher.push_data(0, b"some data", false);
             let frames = pusher.recv_frames().await;
-            let has_flow_reset = frames
-                .iter()
-                .any(|f| matches!(f.header, Header::FlowReset { .. }));
-            assert!(has_flow_reset, "expected a FlowReset (STOP_SENDING) on drop");
+            let has_stop_sending = frames.iter().any(|f| {
+                matches!(
+                    f.header,
+                    Header::FlowReset {
+                        reset_target: ResetTarget::Stream,
+                        error_code,
+                        ..
+                    } if error_code == reset_error::STOP_SENDING
+                )
+            });
+            assert!(
+                has_stop_sending,
+                "expected FlowReset(Stream, STOP_SENDING) on drop"
+            );
         }
         .primary()
         .spawn();
@@ -628,6 +728,103 @@ fn drop_before_fin_sends_stop_sending() {
             let mut buf = BytesMut::with_capacity(64);
             let _ = reader.read_into(&mut buf).await;
             drop(reader); // no FIN received → Drop sends STOP_SENDING
+        }
+        .primary()
+        .spawn();
+    });
+}
+
+/// Dropping the Reader during panic sends ABNORMAL_TERMINATION to both sides.
+#[test]
+fn panic_drop_sends_abnormal_termination_reset() {
+    crate::testing::sim(|| {
+        use crate::testing::ext::*;
+
+        let (reader, mut pusher) = make_pair();
+
+        async move {
+            let frames = pusher.recv_frames().await;
+            let has_abnormal_reset = frames.iter().any(|f| {
+                matches!(
+                    f.header,
+                    Header::FlowReset {
+                        reset_target: ResetTarget::Both,
+                        error_code,
+                        ..
+                    } if error_code == reset_error::ABNORMAL_TERMINATION
+                )
+            });
+            assert!(
+                has_abnormal_reset,
+                "expected FlowReset(Both, ABNORMAL_TERMINATION) when dropping during panic"
+            );
+        }
+        .primary()
+        .spawn();
+
+        async move {
+            let panic_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _reader = reader;
+                panic!("intentional test panic while dropping reader");
+            }));
+            assert!(panic_result.is_err());
+        }
+        .primary()
+        .spawn();
+    });
+}
+
+/// `read_to_end` should fail fast if the application-provided buffer has no
+/// remaining capacity at call time.
+#[test]
+fn read_to_end_empty_buffer_returns_invalid_input() {
+    crate::testing::sim(|| {
+        use crate::testing::ext::*;
+
+        let (mut reader, mut pusher) = make_pair();
+
+        async move {
+            pusher.push_data(0, b"hello", true);
+        }
+        .primary()
+        .spawn();
+
+        async move {
+            let mut backing = BytesMut::with_capacity(16);
+            let mut limited = backing.with_write_limit(0);
+            let err = reader
+                .read_to_end(&mut limited)
+                .await
+                .expect_err("expected InvalidInput for zero-capacity buffer");
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        }
+        .primary()
+        .spawn();
+    });
+}
+
+/// `read_to_end` should fail fast once a fixed-size/non-growable buffer is full.
+#[test]
+fn read_to_end_full_buffer_returns_invalid_input() {
+    crate::testing::sim(|| {
+        use crate::testing::ext::*;
+
+        let (mut reader, mut pusher) = make_pair();
+
+        async move {
+            pusher.push_data(0, b"hello", true);
+        }
+        .primary()
+        .spawn();
+
+        async move {
+            let mut backing = BytesMut::with_capacity(16);
+            let mut limited = backing.with_write_limit(1);
+            let err = reader
+                .read_to_end(&mut limited)
+                .await
+                .expect_err("expected InvalidInput once fixed-size buffer is full");
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
         }
         .primary()
         .spawn();
@@ -664,11 +861,12 @@ fn broken_frame_channel_is_handled_gracefully() {
             frame_storage,
         };
 
-        // Endpoint task: push enough data to trigger a MAX_DATA send.
-        let payload = vec![0u8; window_size as usize + 1];
+        // Endpoint task: push enough data to trigger a MAX_DATA send without
+        // exceeding the advertised receive window.
+        let payload = vec![0u8; (window_size / 2 + 1) as usize];
         let payload_len = payload.len();
         async move {
-            pusher.push_data(0, &payload, true);
+            pusher.push_data(0, &payload, false);
         }
         .primary()
         .spawn();
