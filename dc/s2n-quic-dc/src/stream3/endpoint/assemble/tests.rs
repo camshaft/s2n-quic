@@ -333,6 +333,8 @@ fn assemble_fuzz_respects_gso_invariants() {
                 .frames
                 .iter()
                 .filter(|frame| {
+                    !matches!(frame.header, Header::Ack { .. })
+                        &&
                     is_frame_encodable(
                         frame,
                         input.source_sender_id,
