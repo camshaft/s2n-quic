@@ -161,7 +161,6 @@ impl crate::clock::wheel::WheelAdapter for IdleWheelAdapter {
     }
 }
 
-
 ///
 /// Uses a sliding window to efficiently deduplicate FlowInit packets within
 /// a bounded memory footprint. This is the fast path for recent attempt_ids.

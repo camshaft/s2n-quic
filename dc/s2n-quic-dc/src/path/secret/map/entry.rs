@@ -394,9 +394,8 @@ impl Entry {
     /// this entry. Uses a monotonic fetch_max so the value only advances forward.
     #[inline]
     pub fn update_last_peer_activity(&self, ts: s2n_quic_core::time::Timestamp) {
-        // SAFETY: Timestamp values in this crate are treated as non-negative durations
-        // from a fixed epoch.
-        let nanos = unsafe { ts.as_duration().as_nanos() as u64 };
+        // SAFETY: Timestamp values in this crate are monotonic and treated as non-negative.
+        let nanos = unsafe { ts.as_duration().as_nanos() }.min(u64::MAX as u128) as u64;
         self.last_peer_activity.fetch_max(nanos, Ordering::Relaxed);
     }
 

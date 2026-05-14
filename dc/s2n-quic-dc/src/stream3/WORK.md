@@ -26,9 +26,11 @@ Currently (once we fix the "no ACKs" bug) we'll send one ACK per received packet
 
 When the PTO wheel fires for a context, we need to generate a probe packet (retransmit one frame or send a PING-equivalent) to elicit an ACK from the peer.
 
-### Idle context reclamation (tasks.rs:401)
+### Idle context reclamation
 
-When the idle wheel fires, we should clean up the `send::Context` (remove from cache, release CCA state, notify completion channels of remaining inflight frames as failed).
+Implemented. Both send and recv dispatch workers have idle-wheel drain tasks that check
+`PathSecretEntry::last_peer_activity_nanos()` on expiry. If the peer was active within
+`idle_timeout`, the wheel is rearmed; otherwise the context is removed from the local cache.
 
 ### Response frame routing (tasks.rs:562)
 
