@@ -213,18 +213,20 @@ fn client_second_write_blocks_until_max_data() {
             assert!(matches!(sent[0].header, Header::FlowInit { is_fin: false, .. }));
             assert_eq!(sent[0].payload, &b"hello"[..]);
 
-            // Yield once so the app task can issue its second write and observe
-            // pending behavior while Writer is in `Status::FlowInitSent` (before
-            // any remote MAX_DATA credit is injected).
+            // Give the app task a scheduling opportunity to attempt a second
+            // write while Writer is still in `Status::FlowInitSent` (before any
+            // remote MAX_DATA credit is injected).
             bach::task::yield_now().await;
             pusher.push_max_data(VarInt::from_u16(4096));
 
             let next = pusher.recv_frames().await;
             let sent_next = next.iter().collect::<Vec<_>>();
-            let has_expected_data = sent_next.iter().any(|f| {
-                matches!(f.header, Header::FlowData { is_fin: false, .. }) && f.payload == &b"!"[..]
-            });
-            assert!(has_expected_data, "expected non-fin FlowData payload after MAX_DATA");
+            assert_eq!(sent_next.len(), 1);
+            assert!(matches!(
+                sent_next[0].header,
+                Header::FlowData { is_fin: true, .. }
+            ));
+            assert_eq!(sent_next[0].payload, &b"!"[..]);
         }
         .primary()
         .spawn();
@@ -246,7 +248,10 @@ fn client_second_write_blocks_until_max_data() {
                 "expected second write to block before MAX_DATA"
             );
 
-            let written = writer.write_from(&mut second).await.expect("second write");
+            let written = writer
+                .write_from_fin(&mut second)
+                .await
+                .expect("second write");
             assert_eq!(written, 1);
         }
         .primary()
