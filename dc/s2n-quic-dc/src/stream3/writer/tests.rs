@@ -113,8 +113,10 @@ impl Pusher {
         });
     }
 
-    // Receives one submitted burst. Tests that expect multiple submission
-    // cycles should call this helper again.
+    /// Receives one submitted burst.
+    ///
+    /// Tests that expect multiple submission cycles should call this helper
+    /// again.
     async fn recv_frames(&mut self) -> intrusive_queue::Queue<Frame> {
         core::future::poll_fn(|cx| self.frame_rx.poll_swap(cx, &mut self.frame_storage)).await;
         let mut combined_frames = intrusive_queue::Queue::default();
@@ -160,13 +162,14 @@ where
     // to keep this helper safe when tests run in parallel.
     static PANIC_HOOK_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    let _guard = PANIC_HOOK_LOCK
+    let guard = PANIC_HOOK_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let previous_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(|_| {}));
     let result = std::panic::catch_unwind(f);
     std::panic::set_hook(previous_hook);
+    drop(guard);
     result
 }
 
