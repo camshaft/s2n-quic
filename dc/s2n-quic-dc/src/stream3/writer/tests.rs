@@ -40,7 +40,15 @@ fn make_pair_with_type(ep_type: endpoint::Type) -> (Writer, Pusher) {
 
     let allocator = msg::queue::Allocator::new();
     let dispatcher = allocator.dispatcher();
-    let handle = flow::Handle::client(stream_id, path_secret_entry.clone());
+    let handle = match ep_type {
+        endpoint::Type::Client => flow::Handle::client(stream_id, path_secret_entry.clone()),
+        endpoint::Type::Server => {
+            let tracker = flow::Tracker::new(*path_secret_entry.id());
+            tracker
+                .try_register(stream_id, |handle| (VarInt::ZERO, handle))
+                .expect("server handle registration should succeed")
+        }
+    };
     let (control_rx, _stream_rx) = dispatcher
         .alloc(handle, Some(remote_queue_id))
         .expect("queue alloc should succeed");
@@ -81,8 +89,7 @@ struct Pusher {
 
 impl Pusher {
     fn push_control(&mut self, message: msg::Control) {
-        let _ = self
-            .dispatcher
+        self.dispatcher
             .send_control(
                 self.queue_id,
                 None,
@@ -102,6 +109,8 @@ impl Pusher {
         });
     }
 
+    // Receives one submitted burst. Tests that expect multiple submission
+    // cycles should call this helper again.
     async fn recv_frames(&mut self) -> intrusive_queue::Queue<Frame> {
         core::future::poll_fn(|cx| self.frame_rx.poll_swap(cx, &mut self.frame_storage)).await;
         let mut combined_frames = intrusive_queue::Queue::default();
@@ -137,6 +146,22 @@ impl Pusher {
                 .expect("completion send should succeed in tests");
         }
     }
+}
+
+fn catch_unwind_silent<F, T>(f: F) -> std::thread::Result<T>
+where
+    F: FnOnce() -> T + std::panic::UnwindSafe,
+{
+    static PANIC_HOOK_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    let _guard = PANIC_HOOK_LOCK
+        .lock()
+        .expect("panic hook lock should not be poisoned");
+    let previous_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let result = std::panic::catch_unwind(f);
+    std::panic::set_hook(previous_hook);
+    result
 }
 
 // ─── Bach async tests ─────────────────────────────────────────────────────────
@@ -369,9 +394,8 @@ fn panic_drop_sends_abnormal_termination_reset() {
         .spawn();
 
         async move {
-            let panic_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let moved_writer = writer;
-                let _ = &moved_writer;
+            let panic_result = catch_unwind_silent(std::panic::AssertUnwindSafe(move || {
+                let _writer = writer;
                 panic!("intentional test panic while dropping writer");
             }));
             assert!(panic_result.is_err());
