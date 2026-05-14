@@ -89,14 +89,18 @@ struct Pusher {
 
 impl Pusher {
     fn push_control(&mut self, message: msg::Control) {
-        self.dispatcher
+        if self
+            .dispatcher
             .send_control(
                 self.queue_id,
                 None,
                 &self.request,
                 intrusive_queue::Entry::new(message),
             )
-            .unwrap_or_else(|_| panic!("send_control should succeed in tests"));
+            .is_err()
+        {
+            panic!("send_control should succeed in tests");
+        }
     }
 
     fn push_reset(&mut self, error_code: VarInt) {
@@ -158,7 +162,7 @@ where
 
     let _guard = PANIC_HOOK_LOCK
         .lock()
-        .expect("panic hook lock should not be poisoned");
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let previous_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(|_| {}));
     let result = std::panic::catch_unwind(f);
