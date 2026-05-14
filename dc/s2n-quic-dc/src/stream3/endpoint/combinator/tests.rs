@@ -454,7 +454,7 @@ fn ack_processor_drops_message_with_out_of_range_sender_idx() {
         send_caches,
         sender_idx_to_local,
         1,
-        test_clock(),
+        crate::clock::bach::Clock::default(),
         crate::xorshift::Rng::new(),
         frame_tx,
         crate::stream3::frame::PriorityInput::default(),
