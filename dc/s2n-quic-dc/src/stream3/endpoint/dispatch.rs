@@ -243,11 +243,14 @@ where
     counters.rx_frames_per_packet.record_value(frame_count);
 
     if is_ack_eliciting {
+        let was_flushed = peer.ack_state.is_flushed();
         let _ = peer.ack_state.on_ack_eliciting();
 
-        if let Some(submission) = peer.update_ack_state(recv_worker_id) {
-            let msg = msg::Sender::PendingAck(submission);
-            let _ = sender_tx.send(Entry::new(msg));
+        if !was_flushed {
+            if let Some(submission) = peer.update_ack_state(recv_worker_id) {
+                let msg = msg::Sender::PendingAck(submission);
+                let _ = sender_tx.send(Entry::new(msg));
+            }
         }
     }
 
@@ -392,6 +395,18 @@ fn dispatch_decoded_frame(
             );
         }
         Header::Ack { dest_sender_id, .. } => {
+            let sender_count = peer.path_entry.socket_sender_count() as u64;
+            if dest_sender_id.as_u64() >= sender_count {
+                tracing::warn!(
+                    %credentials,
+                    source_sender_id = source_sender_id.as_u64(),
+                    dest_sender_id = dest_sender_id.as_u64(),
+                    sender_count,
+                    "dropping ACK frame with invalid destination sender id"
+                );
+                return;
+            }
+
             let message = msg::Sender::ReceivedAck {
                 local_sender_id: dest_sender_id,
                 path_secret_entry: peer.path_entry.clone(),

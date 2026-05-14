@@ -41,7 +41,7 @@ impl AckState {
 
     s2n_quic_core::state::event! {
         /// An ack-eliciting packet was received.
-        on_ack_eliciting(Idle => Scheduled);
+        on_ack_eliciting(Idle|Flushed => Scheduled);
         /// The ACK submission was sent to the send worker.
         on_flush(Scheduled => Flushed);
         /// Completion returned and no new packets arrived — back to idle.
@@ -50,6 +50,18 @@ impl AckState {
         on_completion_stale(Flushed => Scheduled);
         /// Scheduled but nothing to encode — reset to idle.
         on_empty(Scheduled => Idle);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AckState;
+
+    #[test]
+    fn ack_eliciting_packet_marks_flushed_ack_as_stale() {
+        let mut state = AckState::Flushed;
+        let _ = state.on_ack_eliciting();
+        assert!(state.is_scheduled());
     }
 }
 

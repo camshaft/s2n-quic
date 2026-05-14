@@ -668,8 +668,14 @@ where
         let frame = match self.inner.poll_recv(cx) {
             Poll::Ready(Some(frame)) => frame,
             Poll::Ready(None) => {
-                let waker = self.flush();
-                return Poll::Ready(Some(waker));
+                // Upstream is closed: flush any buffered batch and then terminate.
+                // We must return `None` here so `drain_budgeted` can stop polling.
+                let flushed_waker = self.flush();
+                if flushed_waker.is_some() {
+                    tracing::trace!("flushed pending completion batch while closing");
+                }
+                // Intentionally drop `flushed_waker` here: `AutoWake` wakes-on-drop.
+                return Poll::Ready(None);
             }
             Poll::Pending => {
                 let waker = self.flush();
@@ -758,29 +764,9 @@ impl<R, Clk, Rand, C> AckProcessor<R, Clk, Rand, C> {
         }
     }
 
-    fn resolve_cache(&mut self, sender_idx: usize) -> &mut Rc<RefCell<send::Cache>> {
-        let send_cache_count = self.send_caches.len();
-        let Some(local_id) = self.sender_idx_to_local.get(sender_idx).copied() else {
-            unsafe {
-                s2n_quic_core::assume!(
-                    false,
-                    "sender id {} is out of range of {}",
-                    sender_idx,
-                    self.total_sender_ids
-                )
-            }
-        };
-        let Some(cache) = self.send_caches.get_mut(local_id) else {
-            unsafe {
-                s2n_quic_core::assume!(
-                    false,
-                    "local id {} is out of range of {}",
-                    local_id,
-                    send_cache_count
-                )
-            }
-        };
-        cache
+    fn resolve_cache(&mut self, sender_idx: usize) -> Option<&mut Rc<RefCell<send::Cache>>> {
+        let local_id = self.sender_idx_to_local.get(sender_idx).copied()?;
+        self.send_caches.get_mut(local_id)
     }
 
     fn dispatch_wheel_interest(
@@ -813,7 +799,15 @@ where
         };
 
         let sender_idx = entry.sender_idx();
-        let cache = self.resolve_cache(sender_idx);
+        let Some(cache) = self.resolve_cache(sender_idx) else {
+            tracing::warn!(
+                sender_idx,
+                total_sender_ids = self.total_sender_ids,
+                caches = self.send_caches.len(),
+                "dropping sender message with invalid sender index"
+            );
+            return Poll::Ready(Some(()));
+        };
 
         match &mut *entry {
             msg::Sender::ReceivedAck {

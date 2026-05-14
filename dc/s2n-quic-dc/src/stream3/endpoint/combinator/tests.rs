@@ -428,3 +428,33 @@ fn batch_frames_adopts_sticky_from_later_frame() {
     assert_eq!(batch.len(), 3);
     assert_eq!(batch.sender_id(), Some(3));
 }
+
+// ── CompletionDispatcher tests ──────────────────────────────────────────────
+
+#[test]
+fn completion_dispatcher_returns_none_when_closed_and_empty() {
+    let rx = TestReceiver::<Entry<Frame>> {
+        values: VecDeque::new(),
+        consumed: 0,
+    };
+    let mut dispatcher = CompletionDispatcher::new(rx);
+
+    let poll = with_noop_context(|cx| dispatcher.poll_recv(cx));
+    assert!(matches!(poll, Poll::Ready(None)));
+}
+
+#[test]
+fn completion_dispatcher_closes_after_draining_input() {
+    let path = test_path_secret_entry();
+    let rx = TestReceiver {
+        values: VecDeque::from([new_test_frame(path, 0)]),
+        consumed: 0,
+    };
+    let mut dispatcher = CompletionDispatcher::new(rx);
+
+    let first = with_noop_context(|cx| dispatcher.poll_recv(cx));
+    assert!(matches!(first, Poll::Ready(Some(_))));
+
+    let second = with_noop_context(|cx| dispatcher.poll_recv(cx));
+    assert!(matches!(second, Poll::Ready(None)));
+}
