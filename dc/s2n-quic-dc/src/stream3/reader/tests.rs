@@ -585,6 +585,8 @@ fn max_data_sent_after_consuming() {
             let read = reader.read_into(&mut buf).await.expect("read failed");
             assert_eq!(read, payload_len);
             assert_eq!(buf.len(), payload_len);
+            // Keep the reader alive for the rest of the sim so Drop does not
+            // emit STOP_SENDING and contaminate the endpoint-side frame batch.
             std::mem::forget(reader);
         }
         .primary()
