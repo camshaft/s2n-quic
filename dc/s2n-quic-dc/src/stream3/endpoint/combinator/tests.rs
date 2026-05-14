@@ -320,13 +320,10 @@ fn frame_batch_tracks_byte_costs_per_priority() {
         path,
         0,
         Header::FlowReset {
-            queue_pair: crate::packet::datagram::QueuePair {
-                source_queue_id: VarInt::from_u8(0),
-                dest_queue_id: VarInt::from_u8(1),
-            },
+            dest_queue_id: VarInt::from_u8(1),
             stream_id: VarInt::from_u8(0),
-            final_offset: VarInt::from_u8(9),
-            application_error_code: VarInt::from_u8(7),
+            reset_target: crate::packet::datagram::ResetTarget::Both,
+            error_code: VarInt::from_u8(7),
         },
     );
     let reset_cost = reset.byte_cost();
@@ -338,7 +335,10 @@ fn frame_batch_tracks_byte_costs_per_priority() {
     );
 
     let (queues, costs) = batch.into_queues();
-    assert_eq!(costs[Priority::FlowControl.as_index()], MAX_FRAME_BATCH_PACKET_OVERHEAD + first_cost);
+    assert_eq!(
+        costs[Priority::FlowControl.as_index()],
+        MAX_FRAME_BATCH_PACKET_OVERHEAD + first_cost
+    );
     assert_eq!(costs[Priority::FlowData.as_index()], data_cost);
     assert_eq!(costs[Priority::FlowReset.as_index()], reset_cost);
     assert_eq!(queues[Priority::FlowControl.as_index()].len(), 1);

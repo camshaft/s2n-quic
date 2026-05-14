@@ -256,7 +256,10 @@ fn pto_needs_update_suppresses_probe() {
         "needs_update path should not fire a probe"
     );
     assert!(!pto.needs_update, "needs_update cleared after timeout");
-    assert!(pto.arm_base.is_none(), "arm_base reset in needs_update path");
+    assert!(
+        pto.arm_base.is_none(),
+        "arm_base reset in needs_update path"
+    );
 }
 
 #[test]
@@ -283,10 +286,7 @@ fn pto_on_ack_resets_backoff() {
     assert_eq!(pto.backoff, 4);
 
     pto.on_ack_received(true);
-    assert_eq!(
-        pto.backoff, INITIAL_PTO_BACKOFF,
-        "ACK should reset backoff"
-    );
+    assert_eq!(pto.backoff, INITIAL_PTO_BACKOFF, "ACK should reset backoff");
     assert_eq!(pto.firings_remaining, 0, "ACK should reset countdown");
     assert!(pto.arm_base.is_none(), "ACK should reset arm_base");
 }
@@ -415,7 +415,8 @@ fn pto_backoff_sequence_matches_expected_probe_count() {
     for (i, &should_probe) in expected.iter().enumerate() {
         let result = pto.on_timeout();
         assert_eq!(
-            result, should_probe,
+            result,
+            should_probe,
             "timeout #{}: expected probe={should_probe} but got {result}",
             i + 1
         );
