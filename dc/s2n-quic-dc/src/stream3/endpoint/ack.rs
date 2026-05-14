@@ -474,7 +474,7 @@ mod tests {
             &mut completed,
             &mut lost,
             &mut cancelled,
-            &now, // precision::Timestamp implements s2n_quic_core::time::Clock
+            &now, // s2n_quic_core::time::Timestamp implements s2n_quic_core::time::Clock
             &mut rng,
         );
 
@@ -489,13 +489,14 @@ mod tests {
         );
 
         // No probe entries should be left with un-drained frames.
+        // Probes were inserted at PNs NUM_SHELLS..2*NUM_SHELLS-1.
         for i in 0..NUM_SHELLS {
-            let probe_pn = make_pn(100 + i);
+            let probe_pn = make_pn(NUM_SHELLS + i);
             if let Some(packet) = ctx.inflight.get_mut(probe_pn) {
                 assert!(
                     packet.frames.is_empty(),
                     "probe entry at PN {} has un-drained frames — chain completion was skipped",
-                    100 + i
+                    NUM_SHELLS + i
                 );
             }
         }
