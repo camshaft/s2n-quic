@@ -616,7 +616,8 @@ impl Inner {
     }
 
     fn maybe_send_max_data(&mut self) -> io::Result<()> {
-        if self.fin_observed && !self.send_flow_update_after_fin {
+        let fin_observed = self.fin_observed || self.reassembler.final_size().is_some();
+        if fin_observed && !self.send_flow_update_after_fin {
             return Ok(());
         }
 

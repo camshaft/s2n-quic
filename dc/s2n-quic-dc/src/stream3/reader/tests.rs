@@ -169,13 +169,18 @@ impl Pusher {
 
     /// Asynchronously waits for frames up to `duration`.
     ///
-    /// Returns `Some(queue)` when `recv_frames` completes before timeout (the
-    /// queue may still be empty). Returns `None` only when the timeout expires.
+    /// Returns `Some(queue)` when at least one frame is received before timeout.
+    /// Returns `None` on timeout or when only an empty wake/close is observed.
     async fn recv_frames_timeout(
         &mut self,
         duration: Duration,
     ) -> Option<intrusive_queue::Queue<Frame>> {
-        crate::testing::timeout(duration, self.recv_frames()).await.ok()
+        let queue = crate::testing::timeout(duration, self.recv_frames()).await.ok()?;
+        if queue.is_empty() {
+            None
+        } else {
+            Some(queue)
+        }
     }
 }
 
@@ -564,15 +569,10 @@ fn max_data_sent_after_consuming() {
         async move {
             pusher.push_data(0, &payload, false);
             let frames = pusher.recv_frames().await;
-            let total_frames = frames.iter().count();
-            let max_data_values: Vec<_> = frames
-                .iter()
-                .filter_map(|f| decode_max_data_from_flow_control(f))
-                .collect();
-            assert_eq!(total_frames, 1, "expected exactly one outbound frame");
+            assert_eq!(frames.len(), 1, "expected exactly one outbound frame");
             assert_eq!(
-                max_data_values.as_slice(),
-                &[expected_max_data],
+                frames.front().and_then(decode_max_data_from_flow_control),
+                Some(expected_max_data),
                 "expected exactly one MAX_DATA frame with the computed limit"
             );
         }
@@ -585,9 +585,7 @@ fn max_data_sent_after_consuming() {
             let read = reader.read_into(&mut buf).await.expect("read failed");
             assert_eq!(read, payload_len);
             assert_eq!(buf.len(), payload_len);
-            // Keep the reader alive for the rest of the sim so Drop does not
-            // emit STOP_SENDING and contaminate the endpoint-side frame batch.
-            std::mem::forget(reader);
+            crate::testing::sleep(Duration::from_millis(1)).await;
         }
         .primary()
         .spawn();
@@ -661,16 +659,11 @@ fn client_fin_within_window_does_not_send_max_data() {
 
         async move {
             pusher.push_data(0, payload, true);
-            if let Some(frames) = pusher.recv_frames_timeout(Duration::from_secs(1)).await {
-                let max_data_count = frames
-                    .iter()
-                    .filter(|f| matches!(f.header, Header::FlowControl { .. }))
-                    .count();
-                assert_eq!(
-                    max_data_count, 0,
-                    "client-side FIN crossing the threshold should not emit MAX_DATA"
-                );
-            }
+            let frames = pusher.recv_frames_timeout(Duration::from_secs(1)).await;
+            assert!(
+                frames.is_none(),
+                "client-side FIN crossing the threshold should not emit outbound frames"
+            );
         }
         .primary()
         .spawn();
@@ -699,18 +692,13 @@ fn client_fin_observed_before_gap_fill_does_not_send_max_data() {
 
         async move {
             pusher.push_data(2, b"llo", true);
-            bach::task::yield_now().await;
+            crate::testing::sleep(Duration::from_millis(1)).await;
             pusher.push_data(0, b"he", false);
-            if let Some(frames) = pusher.recv_frames_timeout(Duration::from_secs(1)).await {
-                let max_data_count = frames
-                    .iter()
-                    .filter(|f| matches!(f.header, Header::FlowControl { .. }))
-                    .count();
-                assert_eq!(
-                    max_data_count, 0,
-                    "client should suppress MAX_DATA once FIN has been observed"
-                );
-            }
+            let frames = pusher.recv_frames_timeout(Duration::from_secs(1)).await;
+            assert!(
+                frames.is_none(),
+                "client should suppress all outbound frames once FIN has been observed"
+            );
         }
         .primary()
         .spawn();
@@ -774,15 +762,10 @@ fn server_validates_then_reads() {
                 .recv_frames_timeout(Duration::from_secs(1))
                 .await
                 .expect("expected server flow update after validating/reading");
-            let total_frames = frames.iter().count();
-            let max_data_values: Vec<_> = frames
-                .iter()
-                .filter_map(|f| decode_max_data_from_flow_control(f))
-                .collect();
-            assert_eq!(total_frames, 1, "expected exactly one outbound frame");
+            assert_eq!(frames.len(), 1, "expected exactly one outbound frame");
             assert_eq!(
-                max_data_values.as_slice(),
-                &[expected_max_data],
+                frames.front().and_then(decode_max_data_from_flow_control),
+                Some(expected_max_data),
                 "expected exactly one MAX_DATA frame with the computed limit"
             );
         }
@@ -911,16 +894,8 @@ fn drop_after_fin_completion_sends_no_reset() {
 
         async move {
             pusher.push_data(0, b"ok", true);
-            if let Some(frames) = pusher.recv_frames_timeout(Duration::from_secs(1)).await {
-                let reset_count = frames
-                    .iter()
-                    .filter(|f| matches!(f.header, Header::FlowReset { .. }))
-                    .count();
-                assert_eq!(
-                    reset_count, 0,
-                    "no reset frame should be emitted after clean completion"
-                );
-            }
+            let frames = pusher.recv_frames_timeout(Duration::from_secs(1)).await;
+            assert!(frames.is_none(), "no frame should be emitted after clean completion");
         }
         .primary()
         .spawn();
@@ -964,16 +939,11 @@ fn flow_control_violation_emits_single_reset_frame() {
             assert_eq!(total_frames, 1, "expected exactly one reset frame");
             assert_eq!(reset_count.count(), 1, "expected one FLOW_CONTROL_ERROR reset");
 
-            if let Some(extra) = pusher.recv_frames_timeout(Duration::from_secs(1)).await {
-                let extra_resets = extra
-                    .iter()
-                    .filter(|f| matches!(f.header, Header::FlowReset { .. }))
-                    .count();
-                assert_eq!(
-                    extra_resets, 0,
-                    "reader should not emit additional reset frames on follow-up reads"
-                );
-            }
+            let extra = pusher.recv_frames_timeout(Duration::from_secs(1)).await;
+            assert!(
+                extra.is_none(),
+                "reader should not emit additional frames on follow-up reads"
+            );
         }
         .primary()
         .spawn();
