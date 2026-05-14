@@ -585,6 +585,8 @@ fn max_data_sent_after_consuming() {
             let read = reader.read_into(&mut buf).await.expect("read failed");
             assert_eq!(read, payload_len);
             assert_eq!(buf.len(), payload_len);
+            // Keep the task alive briefly so the endpoint-side assertion consumes
+            // this batch before Reader is dropped at task completion.
             crate::testing::sleep(Duration::from_millis(1)).await;
         }
         .primary()
