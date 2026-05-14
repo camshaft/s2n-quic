@@ -493,10 +493,14 @@ impl Inner {
                 .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "max_data overflow"))?;
 
             // Frame submission is best-effort: if the channel is closed (e.g.
-            // the endpoint task has already exited) we skip the credit update
-            // rather than failing the read.  The peer may stall waiting for
-            // more credits, but the already-buffered data has been delivered
-            // successfully.  (The Drop impl follows the same "ignore" policy.)
+            // the endpoint task has already exited after delivering the final
+            // frame batch) we skip updating remote_max_data rather than failing
+            // the read.  The already-buffered data is still delivered to the
+            // caller.  Flow control will not advance for future reads on this
+            // stream, but that is harmless once all data has been received
+            // (is_writing_complete is true in that case, so this branch is only
+            // reached on the final read before is_reading_complete triggers).
+            // The Drop impl follows the same "ignore frame errors" policy.
             if self.send_max_data_frame(new_max_data).is_ok() {
                 self.remote_max_data = new_max_data;
             }

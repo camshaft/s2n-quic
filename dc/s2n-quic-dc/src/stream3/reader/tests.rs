@@ -5,8 +5,9 @@
 //!
 //! ## Organization
 //!
-//! * **Synchronous unit tests** – exercise `write_data_reader` directly with no
-//!   I/O or tasks needed; these test an internal helper function in isolation.
+//! * **Synchronous unit tests** – exercise `write_data_reader` directly without
+//!   an async runtime or task scheduler; these test an internal helper function
+//!   in isolation.
 //!
 //! * **Bach async tests** – each test runs inside `crate::testing::sim` and uses
 //!   **two separate primary tasks** to model how a real application and endpoint
@@ -229,7 +230,7 @@ fn write_data_reader_does_not_interpose_when_reassembler_has_head_data() {
 //   • endpoint task – owns Pusher; sends stream messages and asserts on frames.
 //   • app task      – owns Reader; calls read_into and asserts on received data.
 //
-// Both tasks are marked `.primary()` so the bach sim runs until *both* complete,
+// Both tasks are marked `.primary()` so the Bach sim runs until *both* complete,
 // providing backpressure-free cooperative scheduling between the two sides.
 
 /// Basic in-order read: endpoint sends data + FIN, application reads until EOF.
