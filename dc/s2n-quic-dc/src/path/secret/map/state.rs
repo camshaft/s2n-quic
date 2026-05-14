@@ -28,7 +28,7 @@ use std::{
     },
     time::Duration,
 };
-use tokio::task::JoinHandle;
+use tokio::{sync::broadcast, task::JoinHandle};
 
 #[cfg(test)]
 mod tests;
@@ -446,6 +446,11 @@ where
             >,
         >,
     >,
+
+    /// Broadcast channel used to notify all stream3 workers that a path secret entry has been
+    /// invalidated.  When an authenticated `UnknownPathSecret` is received the local credential
+    /// ID is sent here; each worker subscribes and evicts matching state from its local caches.
+    pub(super) invalidation_tx: broadcast::Sender<Id>,
 }
 
 // FIXME: Avoid the whole socket.
@@ -515,6 +520,10 @@ where
         // FIXME: Allow configuring the rehandshake_period.
         let rehandshake_period = Duration::from_secs(3600 * 24);
 
+        // Create the invalidation broadcast channel.  The initial receiver is dropped
+        // immediately; workers subscribe later via `subscribe_invalidations()`.
+        let (invalidation_tx, _initial_rx) = broadcast::channel(1024);
+
         let mut state = Self {
             // This is around 500MB with current entry size.
             max_capacity: capacity,
@@ -536,6 +545,7 @@ where
             subscriber,
             request_handshake: RwLock::new(None),
             mk_application_data: RwLock::new(None),
+            invalidation_tx,
         };
 
         // Growing to double our maximum inserted entries should ensure that we never grow again, see:
@@ -1015,6 +1025,12 @@ where
         // See comment on requested_handshakes for details.
         self.request_handshake(*entry.peer(), HandshakeReason::Remote);
 
+        // Mark the entry as invalid so that workers stop transmitting and processing
+        // packets on this path secret.  Broadcast the local credential ID so that each
+        // worker can evict the associated state from its local caches.
+        entry.mark_invalid();
+        let _ = self.invalidation_tx.send(local_id);
+
         if self.should_evict_on_unknown_path_secret() {
             self.evict(&entry);
         }
@@ -1282,6 +1298,10 @@ where
             .on_dc_connection_timeout(event::builder::DcConnectionTimeout {
                 peer_address: SocketAddress::from(*peer_address).into_event(),
             });
+    }
+
+    fn subscribe_invalidations(&self) -> broadcast::Receiver<Id> {
+        self.invalidation_tx.subscribe()
     }
 }
 

@@ -185,6 +185,7 @@ pub fn send_worker<Socket, Clk, WakerSink, AckComp>(
     frame_tx: crate::stream3::frame::SubmissionSender,
     ack_completions_tx: AckComp,
     mut waker_sink: WakerSink,
+    invalidation_rx: tokio::sync::broadcast::Receiver<crate::credentials::Id>,
     budgets: Budgets,
     counter_registry: crate::counter::Registry,
 ) where
@@ -225,6 +226,9 @@ pub fn send_worker<Socket, Clk, WakerSink, AckComp>(
     let (completed_tx, completed_rx) = unsync::new::<Frame>();
     let (cancelled_tx, cancelled_rx) = unsync::new::<Frame>();
 
+    // Spawn invalidation task to proactively evict stale send contexts.
+    spawner.spawn(send_invalidation_task(invalidation_rx, send_caches.clone()));
+
     // Task 1: context resolver — drain batch_rx, resolve to context, push frames.
     spawner.spawn({
         let mut send_caches = send_caches.clone();
@@ -262,10 +266,13 @@ pub fn send_worker<Socket, Clk, WakerSink, AckComp>(
                 }
             };
 
-            let sender = {
+            let Some(sender) = ({
                 let mut cache = cache.borrow_mut();
                 let cache = &mut *cache;
                 cache.get_or_insert(batch.path_secret_entry())
+            }) else {
+                tracing::debug!("dropping batch for invalidated path secret entry");
+                return;
             };
 
             let wheel_interest = {
@@ -544,6 +551,7 @@ pub async fn packet_dispatch_task<PacketRx, AckSender, AckBurstSender, WakerSink
 {
     // Response frames (ACKs sent back to peers) re-enter via the same submission channel.
     // TODO: route responses through a dedicated channel + RetransmissionBatcher (see above).
+    let path_secret_map_for_error = path_secret_map.clone();
     let rx = Map::new(packet_rx, {
         let mut response_tx = frame_tx.clone();
         let mut queue_dispatcher = queue_dispatcher;
@@ -570,7 +578,7 @@ pub async fn packet_dispatch_task<PacketRx, AckSender, AckBurstSender, WakerSink
     });
     let rx = InspectErr::new(rx, {
         let counters = counters;
-        move |err| on_packet_dispatch_error(&counters, err)
+        move |err| on_packet_dispatch_error(&counters, &path_secret_map_for_error, err)
     });
     rx.drain_budgeted(Some(budgets.packet_dispatch)).await;
 }
@@ -649,18 +657,26 @@ pub async fn ack_burst_task<AckBurstRx, AckTx>(
 }
 
 
-fn on_packet_dispatch_error(counters: &endpoint::counters::Dispatch, err: dispatch::Error) {
+fn on_packet_dispatch_error(
+    counters: &endpoint::counters::Dispatch,
+    path_secret_map: &crate::path::secret::Map,
+    err: dispatch::Error,
+) {
     match err {
         dispatch::Error::PeerStateLookup {
             credentials,
-            control_out,
+            mut control_out,
+            peer_addr,
         } => {
             counters.rx_process_err_peer_lookup.add(1);
-            tracing::warn!(
-                ?credentials,
-                control_out_len = control_out.len(),
-                "failed to get or create peer state"
-            );
+            if !control_out.is_empty() {
+                path_secret_map.send_control_packet(&peer_addr, &mut control_out);
+            } else {
+                tracing::warn!(
+                    ?credentials,
+                    "failed to get or create peer state"
+                );
+            }
         }
         dispatch::Error::Decryption {
             credentials,
@@ -691,6 +707,64 @@ fn on_packet_dispatch_error(counters: &endpoint::counters::Dispatch, err: dispat
         dispatch::Error::UnsupportedRoutingInfo { routing_info } => {
             counters.rx_process_err_unsupported_routing.add(1);
             tracing::warn!(?routing_info, "unsupported datagram routing info");
+        }
+    }
+}
+
+/// Drains an invalidation broadcast receiver, evicting matching entries from the recv cache.
+///
+/// Receives credential IDs broadcast when an `UnknownPathSecret` control packet is authenticated,
+/// and removes all cached receiver contexts for that credential from `recv_cache`.  When the
+/// channel lags (sender was too fast), all cached state is cleared conservatively.
+pub async fn recv_invalidation_task(
+    mut rx: tokio::sync::broadcast::Receiver<crate::credentials::Id>,
+    recv_cache: Rc<RefCell<endpoint::recv::Cache>>,
+) {
+    loop {
+        match rx.recv().await {
+            Ok(id) => {
+                tracing::debug!(?id, "recv_invalidation_task: evicting recv cache entries");
+                recv_cache.borrow_mut().evict_by_id(id);
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                tracing::warn!(
+                    n,
+                    "recv_invalidation_task: lagged; clearing all recv cache entries"
+                );
+                recv_cache.borrow_mut().senders.clear();
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+        }
+    }
+}
+
+/// Drains an invalidation broadcast receiver, evicting matching entries from the send caches.
+///
+/// Receives credential IDs broadcast when an `UnknownPathSecret` control packet is authenticated,
+/// and removes matching send contexts across all per-socket caches.  When the channel lags, all
+/// cached contexts are cleared conservatively.
+pub async fn send_invalidation_task(
+    mut rx: tokio::sync::broadcast::Receiver<crate::credentials::Id>,
+    send_caches: Vec<Rc<RefCell<send::Cache>>>,
+) {
+    loop {
+        match rx.recv().await {
+            Ok(id) => {
+                tracing::debug!(?id, "send_invalidation_task: evicting send cache entries");
+                for cache in &send_caches {
+                    cache.borrow_mut().evict_by_id(id);
+                }
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                tracing::warn!(
+                    n,
+                    "send_invalidation_task: lagged; clearing all send cache entries"
+                );
+                for cache in &send_caches {
+                    cache.borrow_mut().clear();
+                }
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
         }
     }
 }

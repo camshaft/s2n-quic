@@ -279,6 +279,15 @@ impl Map {
         self.store.on_dc_connection_timeout(peer_address);
     }
 
+    /// Subscribe to the path-secret invalidation broadcast channel.
+    ///
+    /// Returns a receiver that fires whenever an authenticated `UnknownPathSecret` packet
+    /// is processed, carrying the local credential ID that has been marked invalid.
+    /// Callers (typically stream3 workers) should evict matching cached state on receipt.
+    pub fn subscribe_invalidations(&self) -> tokio::sync::broadcast::Receiver<crate::credentials::Id> {
+        self.store.subscribe_invalidations()
+    }
+
     pub fn handle_control_packet(&self, packet: &control::Packet, peer: &SocketAddr) {
         match packet {
             control::Packet::StaleKey(packet) => {
@@ -299,6 +308,10 @@ impl Map {
         out: &mut [u8],
     ) -> Option<usize> {
         self.store.sign_flow_reset_packet(packet, out)
+    }
+
+    pub fn send_control_packet(&self, dst: &std::net::SocketAddr, buffer: &mut [u8]) {
+        self.store.send_control_packet(dst, buffer);
     }
 
     pub fn handle_flow_reset_packet<'a>(

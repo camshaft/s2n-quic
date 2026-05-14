@@ -22,7 +22,7 @@ use std::{
     any::Any,
     net::SocketAddr,
     sync::{
-        atomic::{AtomicU16, AtomicU32, AtomicU64, AtomicU8, Ordering},
+        atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, AtomicU8, Ordering},
         Arc,
     },
     time::{Duration, Instant},
@@ -63,6 +63,10 @@ pub struct Entry {
     peer_data_port: AtomicU16,
     /// Next scheduled transmission timestamp per socket sender, encoded as microseconds.
     next_transmission_by_sender: Box<[AtomicU64]>,
+    /// Set to `true` when an `UnknownPathSecret` control packet is authenticated for this
+    /// entry, indicating the peer no longer recognises our credentials.  Workers check this
+    /// flag before transmitting or processing further packets on the associated path.
+    is_invalid: AtomicBool,
 }
 
 impl SizeOf for Entry {
@@ -80,6 +84,7 @@ impl SizeOf for Entry {
             next_connection,
             peer_data_port,
             next_transmission_by_sender,
+            is_invalid,
         } = self;
         creation_time.size()
             + peer.size()
@@ -94,6 +99,7 @@ impl SizeOf for Entry {
             + peer_data_port.size()
             + std::mem::size_of::<Box<[AtomicU64]>>()
             + next_transmission_by_sender.len() * std::mem::size_of::<AtomicU64>()
+            + is_invalid.size()
     }
 }
 
@@ -112,6 +118,7 @@ impl SizeOf for ApplicationData {
 impl SizeOf for AtomicU8 {}
 impl SizeOf for AtomicU16 {}
 impl SizeOf for AtomicU32 {}
+impl SizeOf for AtomicBool {}
 
 impl Entry {
     pub fn new(
@@ -165,6 +172,7 @@ impl Entry {
             next_connection: AtomicU64::new(0),
             peer_data_port: AtomicU16::new(0),
             next_transmission_by_sender: Self::init_sender_schedule(socket_sender_count),
+            is_invalid: AtomicBool::new(false),
         }
     }
 
@@ -408,6 +416,22 @@ impl Entry {
 
     pub fn retired_at(&self) -> Option<u64> {
         self.retired.retired_at()
+    }
+
+    /// Marks this entry as invalid.
+    ///
+    /// Once marked, workers will refuse to transmit or process any further packets
+    /// associated with this path secret.  The flag is set when an authenticated
+    /// `UnknownPathSecret` control packet is received from the peer, indicating that
+    /// the peer no longer recognises the credentials we have been sending.
+    pub fn mark_invalid(&self) {
+        self.is_invalid.store(true, Ordering::Release);
+    }
+
+    /// Returns `true` if this entry has been marked invalid.
+    #[inline]
+    pub fn is_invalid(&self) -> bool {
+        self.is_invalid.load(Ordering::Acquire)
     }
 
     /// Atomically claims the next connection slot for rate limiting.

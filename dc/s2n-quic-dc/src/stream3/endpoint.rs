@@ -419,6 +419,7 @@ where
             frame_tx: frame_tx.clone(),
             ack_completions_tx: ack_completions_tx.clone(),
             waker_sink,
+            invalidation_rx: path_secret_map.subscribe_invalidations(),
         });
     }
 
@@ -455,6 +456,7 @@ where
             clock: clock.clone(),
             route: ack_route,
             waker_sink,
+            invalidation_rx: path_secret_map.subscribe_invalidations(),
         });
     }
 
@@ -513,6 +515,8 @@ struct SendWorkerParts {
     frame_tx: SubmissionSender,
     ack_completions_tx: routing::AckCompletionSender<sync_queue::Sender<msg::Sender>>,
     waker_sink: waker::Sink,
+    /// Receives invalidated credential IDs so the worker can evict its send caches.
+    invalidation_rx: tokio::sync::broadcast::Receiver<crate::credentials::Id>,
 }
 
 /// Per-socket ingredients for the socket send task.
@@ -551,6 +555,8 @@ struct RecvDispatchParts<Clk, AckSnd, Route> {
     clock: Clk,
     route: Route,
     waker_sink: waker::Sink,
+    /// Receives invalidated credential IDs so the worker can evict its recv cache.
+    invalidation_rx: tokio::sync::broadcast::Receiver<crate::credentials::Id>,
 }
 
 // ── Worker ────────────────────────────────────────────────────────────────
@@ -661,6 +667,7 @@ where
                     sw.frame_tx,
                     sw.ack_completions_tx,
                     sw.waker_sink,
+                    sw.invalidation_rx,
                     budgets,
                     counter_registry.clone(),
                 );
@@ -688,6 +695,10 @@ where
                     crate::socket::channel::intrusive_queue::unsync::new_with_adapter::<
                         crate::stream3::endpoint::recv::AckBurstAdapter,
                     >();
+                local.spawn(tasks::recv_invalidation_task(
+                    rd.invalidation_rx,
+                    recv_cache.clone(),
+                ));
                 local.spawn(tasks::packet_dispatch_task(
                     packet_rx,
                     recv_cache.clone(),

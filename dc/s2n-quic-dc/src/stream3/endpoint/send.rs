@@ -790,24 +790,49 @@ impl Cache {
         }
     }
 
-    pub fn get_or_insert(&mut self, entry: &Arc<PathSecretEntry>) -> Rc<RefCell<Context>> {
+    pub fn get_or_insert(&mut self, entry: &Arc<PathSecretEntry>) -> Option<Rc<RefCell<Context>>> {
         let id = *entry.id();
 
-        self.contexts
-            .entry(id)
-            .or_insert_with(|| {
-                Rc::new(RefCell::new(Context::new(
-                    entry,
-                    self.inflight_gauge.clone(),
-                    self.ack_gauge.clone(),
-                    self.pending_gauge.clone(),
-                    self.sender_idx,
-                )))
-            })
-            .clone()
+        // Refuse to create or use a context for an invalidated path secret entry.
+        if entry.is_invalid() {
+            tracing::debug!(?id, "skipping invalidated path secret entry");
+            self.contexts.remove(&id);
+            return None;
+        }
+
+        Some(
+            self.contexts
+                .entry(id)
+                .or_insert_with(|| {
+                    Rc::new(RefCell::new(Context::new(
+                        entry,
+                        self.inflight_gauge.clone(),
+                        self.ack_gauge.clone(),
+                        self.pending_gauge.clone(),
+                        self.sender_idx,
+                    )))
+                })
+                .clone(),
+        )
     }
 
     pub fn get(&self, id: &credentials::Id) -> Option<Rc<RefCell<Context>>> {
         self.contexts.get(id).cloned()
+    }
+
+    /// Evict the cached send context for the given credential ID.
+    ///
+    /// Called by the invalidation task when a broadcast message indicates that the path
+    /// secret identified by `id` has been marked invalid.
+    pub fn evict_by_id(&mut self, id: credentials::Id) {
+        self.contexts.remove(&id);
+    }
+
+    /// Evict all cached send contexts.
+    ///
+    /// Called by the invalidation task when the broadcast channel lags and we cannot
+    /// determine which specific entries were invalidated.
+    pub fn clear(&mut self) {
+        self.contexts.clear();
     }
 }

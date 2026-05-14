@@ -40,6 +40,11 @@ pub(crate) enum Error {
     PeerStateLookup {
         credentials: Credentials,
         control_out: Vec<u8>,
+        /// The remote address the packet was received from.
+        ///
+        /// If `control_out` is non-empty this address should be used to transmit the
+        /// resulting `UnknownPathSecret` control packet back to the peer.
+        peer_addr: std::net::SocketAddr,
     },
     Decryption {
         credentials: Credentials,
@@ -83,6 +88,7 @@ where
     let packet_number = packet.packet_number();
     let routing_info = packet.routing_info();
     let idle_timeout = recv_cache.idle_timeout;
+    let peer_addr: std::net::SocketAddr = packet.storage().remote_address().get().into();
 
     let source_sender_id = match routing_info {
         RoutingInfo::SenderId { source_sender_id } => source_sender_id,
@@ -107,6 +113,7 @@ where
                 return Err(Error::PeerStateLookup {
                     credentials,
                     control_out,
+                    peer_addr,
                 });
             }
         }

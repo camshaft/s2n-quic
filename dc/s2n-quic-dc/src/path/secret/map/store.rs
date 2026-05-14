@@ -169,4 +169,12 @@ pub trait Store: 'static + Send + Sync {
     fn reset_all_senders(&self);
 
     fn on_dc_connection_timeout(&self, peer_address: &SocketAddr);
+
+    /// Subscribe to the path-secret invalidation broadcast channel.
+    ///
+    /// The sender fires whenever an authenticated `UnknownPathSecret` control packet is
+    /// received, passing the local credential [`Id`] that has been marked invalid.
+    /// Each worker should subscribe once and evict matching state from its local caches
+    /// when a message is received.
+    fn subscribe_invalidations(&self) -> tokio::sync::broadcast::Receiver<Id>;
 }

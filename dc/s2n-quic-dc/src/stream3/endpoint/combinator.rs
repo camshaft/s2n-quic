@@ -848,9 +848,12 @@ where
                 self.dispatch_wheel_interest(ctx_rc, wheel_interest);
             }
             msg::Sender::PendingAck(_) => {
-                let ctx_rc = {
+                let Some(ctx_rc) = ({
                     let mut cache = cache.borrow_mut();
                     cache.get_or_insert(entry.path_secret_entry())
+                }) else {
+                    tracing::debug!("dropping pending ACK for invalidated path secret entry");
+                    return Poll::Ready(Some(()));
                 };
 
                 let wheel_interest = {

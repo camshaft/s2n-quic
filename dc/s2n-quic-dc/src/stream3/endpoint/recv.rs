@@ -384,11 +384,30 @@ impl Cache {
         };
 
         Some(match self.senders.entry(key) {
-            hash_map::Entry::Occupied(entry) => (entry.get().clone(), true),
+            hash_map::Entry::Occupied(entry) => {
+                let ctx = entry.get().clone();
+                // If the underlying path secret has been invalidated, evict the cached
+                // state immediately and treat this as a cache miss that cannot be fulfilled.
+                if ctx.borrow().path_entry.is_invalid() {
+                    entry.remove();
+                    return None;
+                }
+                (ctx, true)
+            }
             hash_map::Entry::Vacant(entry) => {
                 tracing::debug!(%credentials, %remote_sender_id, worker_id = self.worker_id, "opener_for_credentials");
+                // TODO: dedup derived openers — if two recv workers observe the same
+                // (credentials.id, remote_sender_id) pair before either has cached a context
+                // (e.g. due to concurrent worker-level routing changes) they each call
+                // `opener_for_credentials` independently, deriving separate opener objects
+                // from the same key material.  This is correct but wasteful.  A future
+                // implementation could share a single opener per credential ID across workers.
                 let (opener, path_entry) =
                     path_secret_map.opener_for_credentials(credentials, None, control_out)?;
+
+                if path_entry.is_invalid() {
+                    return None;
+                }
 
                 let dest_sender_id = route.sender_id_for_ack(&credentials.id, remote_sender_id);
 
@@ -407,11 +426,11 @@ impl Cache {
         })
     }
 
-    #[expect(dead_code)] // TODO implement expiration
-    pub fn cleanup_expired<Clk>(&mut self, clock: &Clk)
-    where
-        Clk: s2n_quic_core::time::Clock + ?Sized,
-    {
-        self.senders.retain(|_, state| !state.borrow_mut().is_expired(clock));
+    /// Evict all cached receiver contexts whose credential ID matches `id`.
+    ///
+    /// Called by the invalidation task when a broadcast message arrives indicating
+    /// that a path secret entry has been marked invalid.
+    pub fn evict_by_id(&mut self, id: credentials::Id) {
+        self.senders.retain(|key, _| key.id != id);
     }
 }
