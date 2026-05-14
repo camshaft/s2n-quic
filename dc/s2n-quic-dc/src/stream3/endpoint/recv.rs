@@ -41,7 +41,7 @@ impl AckState {
 
     s2n_quic_core::state::event! {
         /// An ack-eliciting packet was received.
-        on_ack_eliciting(Idle => Scheduled);
+        on_ack_eliciting(Idle|Flushed => Scheduled);
         /// The ACK submission was sent to the send worker.
         on_flush(Scheduled => Flushed);
         /// Completion returned and no new packets arrived — back to idle.
@@ -50,6 +50,41 @@ impl AckState {
         on_completion_stale(Flushed => Scheduled);
         /// Scheduled but nothing to encode — reset to idle.
         on_empty(Scheduled => Idle);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AckState;
+
+    #[test]
+    fn ack_eliciting_while_flushed_marks_state_stale() {
+        let mut state = AckState::Idle;
+        let _ = state.on_ack_eliciting();
+        let _ = state.on_flush();
+        assert!(state.is_flushed());
+
+        // New ack-eliciting packet arrives while an ACK is in flight.
+        // The recv path ignores transition errors, so this must succeed and
+        // move to Scheduled to guarantee re-submission on completion.
+        let _ = state.on_ack_eliciting();
+        assert!(state.is_scheduled());
+    }
+
+    #[test]
+    fn stale_state_can_be_reflushed_by_completion_path() {
+        let mut state = AckState::Idle;
+        let _ = state.on_ack_eliciting();
+        let _ = state.on_flush();
+        assert!(state.is_flushed());
+
+        // Simulate arrival of new packets during in-flight ACK lifetime.
+        let _ = state.on_ack_eliciting();
+        assert!(state.is_scheduled());
+
+        // Completion task re-submits when stale by transitioning Scheduled -> Flushed.
+        assert!(state.on_flush().is_ok());
+        assert!(state.is_flushed());
     }
 }
 
