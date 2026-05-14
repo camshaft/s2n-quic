@@ -97,9 +97,8 @@ impl Pusher {
     }
 
     fn push_max_data(&mut self, maximum_data: VarInt) {
-        let payload = Bytes::from(MaxData { maximum_data }.encode_to_vec());
         self.push_control(msg::Control::Frames {
-            payload: payload.into(),
+            payload: Bytes::from(MaxData { maximum_data }.encode_to_vec()).into(),
         });
     }
 
@@ -237,14 +236,14 @@ fn client_second_write_blocks_until_max_data() {
             assert_eq!(written, 5);
 
             let mut second = Bytes::from_static(b"!");
-            let blocked_without_max_data =
+            let write_blocked =
                 core::future::poll_fn(|cx| match writer.poll_write_from(cx, &mut second, false) {
                     Poll::Pending => Poll::Ready(true),
                     Poll::Ready(_) => Poll::Ready(false),
                 })
                 .await;
             assert!(
-                blocked_without_max_data,
+                write_blocked,
                 "expected second write to block before MAX_DATA"
             );
 
