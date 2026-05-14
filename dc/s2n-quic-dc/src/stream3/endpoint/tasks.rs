@@ -606,7 +606,10 @@ pub async fn ack_completion_task<AckTx>(
                 },
                 submission.recv_worker_id,
             ),
-            _ => return,
+            _ => {
+                debug_assert!(false, "ack completion task received non-PendingAck message");
+                return;
+            }
         };
 
         let ctx_rc = {
@@ -618,15 +621,10 @@ pub async fn ack_completion_task<AckTx>(
         };
         let mut ctx = ctx_rc.borrow_mut();
 
-        if ctx.ack_state.is_scheduled() {
-            let Some(submission) = ctx.encode_and_flush(recv_worker_id) else {
-                return;
-            };
+        if let Some(submission) = ctx.on_ack_completion(recv_worker_id) {
             let mut pending_ack_entry = entry;
             *pending_ack_entry = msg::Sender::PendingAck(submission);
             let _ = ack_sender.send(pending_ack_entry);
-        } else {
-            let _ = ctx.ack_state.on_completion_idle();
         }
     });
     rx.drain_budgeted(Some(budgets.ack_completion)).await;

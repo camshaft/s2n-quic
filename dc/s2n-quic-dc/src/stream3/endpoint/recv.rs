@@ -21,7 +21,8 @@ use std::{cell::RefCell, collections::hash_map, rc::Rc, sync::Arc};
 /// Idle → Scheduled (ack-eliciting packet received)
 /// Scheduled → Flushed (submission sent to send worker)
 /// Flushed → Idle (completion returned, no new data)
-/// Flushed → Scheduled (completion returned, new data arrived while in flight)
+/// Flushed → FlushedStale (ack-eliciting packet received while completion is in flight)
+/// FlushedStale → Scheduled (completion returned, needs re-flush)
 /// ```
 #[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AckState {
@@ -33,21 +34,31 @@ pub(crate) enum AckState {
     /// ACK submission is in the send pipeline. New packets update the shared state
     /// but don't produce another submission until the completion returns.
     Flushed,
+    /// ACK completion is in flight and new ack-eliciting data arrived.
+    FlushedStale,
 }
 
 impl AckState {
     s2n_quic_core::state::is!(is_scheduled, Scheduled);
     s2n_quic_core::state::is!(is_flushed, Flushed);
+    s2n_quic_core::state::is!(is_flushed_stale, FlushedStale);
+
+    /// An ack-eliciting packet was received.
+    pub fn on_ack_eliciting(&mut self) {
+        match self {
+            Self::Idle => *self = Self::Scheduled,
+            Self::Flushed => *self = Self::FlushedStale,
+            Self::Scheduled | Self::FlushedStale => {}
+        }
+    }
 
     s2n_quic_core::state::event! {
-        /// An ack-eliciting packet was received.
-        on_ack_eliciting(Idle => Scheduled);
         /// The ACK submission was sent to the send worker.
         on_flush(Scheduled => Flushed);
         /// Completion returned and no new packets arrived — back to idle.
         on_completion_idle(Flushed => Idle);
         /// Completion returned but new packets arrived — re-schedule.
-        on_completion_stale(Flushed => Scheduled);
+        on_completion_stale(FlushedStale => Scheduled);
         /// Scheduled but nothing to encode — reset to idle.
         on_empty(Scheduled => Idle);
     }
@@ -310,6 +321,17 @@ impl Context {
             remote_sender_id: self.remote_sender_id,
             recv_worker_id,
         })
+    }
+
+    pub fn on_ack_completion(&mut self, recv_worker_id: usize) -> Option<ack_state::Submission> {
+        let _ = self.ack_state.on_completion_stale();
+
+        if let Some(submission) = self.encode_and_flush(recv_worker_id) {
+            return Some(submission);
+        }
+
+        let _ = self.ack_state.on_completion_idle();
+        None
     }
 }
 
