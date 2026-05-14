@@ -84,6 +84,7 @@ fn make_pair_with_type(ep_type: endpoint::Type) -> (Reader, Pusher) {
         queue_id,
         request,
         frame_rx,
+        frame_storage: PriorityStorage::default(),
     };
 
     (reader, pusher)
@@ -101,6 +102,9 @@ struct Pusher {
     request: flow::Request,
     /// Outbound frames submitted by the Reader (MAX_DATA, STOP_SENDING, …).
     frame_rx: SubmissionReceiver,
+    /// Reusable priority-storage buffer; avoids re-allocating the fixed-size
+    /// array on every `recv_frames` call.
+    frame_storage: PriorityStorage,
 }
 
 impl Pusher {
@@ -138,17 +142,15 @@ impl Pusher {
     /// Asynchronously wait for frames submitted by the Reader.
     ///
     /// Suspends until at least one frame (or a channel-close) is received,
-    /// then returns all frames collected in that batch.
-    async fn recv_frames(&mut self) -> Vec<Frame> {
-        let mut storage = PriorityStorage::default();
-        core::future::poll_fn(|cx| self.frame_rx.poll_swap(cx, &mut storage)).await;
-        let mut frames = Vec::new();
-        for (_priority, queue) in storage.drain() {
-            for entry in queue {
-                frames.push(entry.into_inner());
-            }
+    /// then returns all frames collected in that batch as a flat intrusive
+    /// queue.  The `PriorityStorage` allocation is reused across calls.
+    async fn recv_frames(&mut self) -> intrusive_queue::Queue<Frame> {
+        core::future::poll_fn(|cx| self.frame_rx.poll_swap(cx, &mut self.frame_storage)).await;
+        let mut result = intrusive_queue::Queue::default();
+        for (_priority, mut queue) in self.frame_storage.drain() {
+            result.append(&mut queue);
         }
-        frames
+        result
     }
 }
 
@@ -251,12 +253,7 @@ fn basic_read() {
         // App task: read until EOF.
         async move {
             let mut buf = BytesMut::with_capacity(32);
-            loop {
-                let n = reader.read_into(&mut buf).await.expect("read failed");
-                if n == 0 {
-                    break;
-                }
-            }
+            reader.read_to_end(&mut buf).await.expect("read failed");
             assert_eq!(&buf[..], b"hello world");
             assert!(reader.0.status.is_complete());
         }
@@ -317,12 +314,7 @@ fn out_of_order_reassembly() {
         // App task: read until EOF.
         async move {
             let mut buf = BytesMut::with_capacity(32);
-            loop {
-                let n = reader.read_into(&mut buf).await.expect("read failed");
-                if n == 0 {
-                    break;
-                }
-            }
+            reader.read_to_end(&mut buf).await.expect("read failed");
             assert_eq!(&buf[..], b"helloworld");
         }
         .primary()
@@ -388,7 +380,20 @@ fn reset_after_partial_data() {
                     }
                 }
             }
+            // The "partial" data was delivered by the interposer before the
+            // Reset message was processed in the same queue batch.  TCP has
+            // the same semantics: data already in the receive buffer when a
+            // RST arrives may have been copied to user-space.
+            assert_eq!(&buf[..], b"partial");
             assert!(reader.0.status.is_reset());
+            assert!(reader.0.reassembler.is_empty());
+            // Subsequent reads after a reset must return ConnectionReset,
+            // not BrokenPipe or some other error.
+            let err2 = reader
+                .read_into(&mut buf)
+                .await
+                .expect_err("expected ConnectionReset on re-read");
+            assert_eq!(err2.kind(), std::io::ErrorKind::ConnectionReset);
         }
         .primary()
         .spawn();
@@ -427,12 +432,7 @@ fn max_data_sent_after_consuming() {
         // App task: read until EOF.
         async move {
             let mut buf = BytesMut::with_capacity(payload_len + 16);
-            loop {
-                let n = reader.read_into(&mut buf).await.expect("read failed");
-                if n == 0 {
-                    break;
-                }
-            }
+            reader.read_to_end(&mut buf).await.expect("read failed");
             assert_eq!(buf.len(), payload_len);
         }
         .primary()
@@ -486,12 +486,7 @@ fn server_validates_then_reads() {
         async move {
             reader.validate().await.expect("validate failed");
             let mut buf = BytesMut::with_capacity(16);
-            loop {
-                let n = reader.read_into(&mut buf).await.expect("read failed");
-                if n == 0 {
-                    break;
-                }
-            }
+            reader.read_to_end(&mut buf).await.expect("read failed");
             assert_eq!(&buf[..], b"hello");
         }
         .primary()
@@ -535,10 +530,8 @@ fn drop_before_fin_sends_stop_sending() {
 }
 
 /// When the frame channel receiver is dropped (simulating a dead endpoint) the
-/// Reader handles the failure gracefully and does not panic.
-///
-/// Uses `make_pair()` but drops the `frame_rx` immediately so that any frames
-/// the Reader tries to send are silently discarded.
+/// Reader surfaces a `BrokenPipe` error when it tries to send flow-control
+/// frames (e.g. `MAX_DATA`).  The Reader must not panic.
 #[test]
 fn broken_frame_channel_is_handled_gracefully() {
     crate::testing::sim(|| {
@@ -547,12 +540,15 @@ fn broken_frame_channel_is_handled_gracefully() {
         let (mut reader, pusher) = make_pair();
         let window_size = reader.0.window_size;
 
-        // Destructure pusher to drop the frame_rx (breaks reader's frame_tx).
+        // Destructure pusher to drop the original frame_rx (breaks reader's
+        // frame_tx).  A fresh disconnected receiver takes its place so the
+        // Pusher struct remains valid for pushing stream messages.
         let Pusher {
             dispatcher,
             queue_id,
             request,
             frame_rx: _closed,
+            frame_storage,
         } = pusher;
         let mut pusher = Pusher {
             dispatcher,
@@ -560,6 +556,7 @@ fn broken_frame_channel_is_handled_gracefully() {
             request,
             // Dummy disconnected receiver — not used for assertions in this test.
             frame_rx: frame::submission_channel(1).1,
+            frame_storage,
         };
 
         // Endpoint task: push enough data to trigger a MAX_DATA send.
@@ -571,11 +568,14 @@ fn broken_frame_channel_is_handled_gracefully() {
         .primary()
         .spawn();
 
-        // App task: read should succeed (frames are silently dropped) or fail
-        // with BrokenPipe.  Either way the Reader must not panic.
+        // App task: MAX_DATA cannot be sent (frame channel closed) → BrokenPipe.
         async move {
             let mut buf = BytesMut::with_capacity(payload_len + 16);
-            let _ = reader.read_into(&mut buf).await;
+            let err = reader
+                .read_into(&mut buf)
+                .await
+                .expect_err("expected BrokenPipe when frame channel is closed");
+            assert_eq!(err.kind(), std::io::ErrorKind::BrokenPipe);
         }
         .primary()
         .spawn();

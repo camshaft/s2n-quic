@@ -258,6 +258,21 @@ impl Reader {
         core::future::poll_fn(|cx| self.poll_read_into(cx, buf)).await
     }
 
+    /// Reads all remaining stream data into `buf`.
+    ///
+    /// Loops over [`read_into`][Self::read_into] until it returns `Ok(0)` (EOF),
+    /// propagating any error immediately.
+    pub async fn read_to_end<S>(&mut self, buf: &mut S) -> io::Result<()>
+    where
+        S: buffer::writer::Storage,
+    {
+        loop {
+            if self.read_into(buf).await? == 0 {
+                return Ok(());
+            }
+        }
+    }
+
     pub fn poll_read_into<S>(&mut self, cx: &mut Context, buf: &mut S) -> Poll<io::Result<usize>>
     where
         S: buffer::writer::Storage,
@@ -314,6 +329,21 @@ impl Inner {
             return Poll::Ready(Ok(0));
         }
 
+        // If the stream was previously reset, return the stored error on every
+        // subsequent call without re-polling the (potentially closed) stream
+        // channel.  This makes the error sticky and avoids returning BrokenPipe
+        // instead of ConnectionReset on re-read.
+        if self.status.is_reset() {
+            if let Some(error_code) = self.reset_error_code {
+                let reset_error: ResetError = error_code.into();
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::ConnectionReset,
+                    reset_error,
+                )));
+            }
+            return Poll::Ready(Err(io::ErrorKind::ConnectionReset.into()));
+        }
+
         let mut tracker = buf.track_write();
 
         // Poll for new stream messages.  If the channel reports a hard error
@@ -352,7 +382,14 @@ impl Inner {
 
         let bytes_read = tracker.written_len();
 
-        self.maybe_send_max_data()?;
+        // Only update flow-control while the channel is healthy.  When
+        // `deferred_err` is set the sender's channel has already closed, which
+        // means no more data is coming and there is nothing to send MAX_DATA to.
+        // Attempting to send in that state would produce an error that discards
+        // the data we just buffered, which is wrong.
+        if deferred_err.is_none() {
+            self.maybe_send_max_data()?;
+        }
 
         if self.reassembler.is_reading_complete() {
             debug!(
@@ -492,18 +529,11 @@ impl Inner {
             let new_max_data = VarInt::new(new_max_data)
                 .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "max_data overflow"))?;
 
-            // Frame submission is best-effort: if the channel is closed (e.g.
-            // the endpoint task has already exited after delivering the final
-            // frame batch) we skip updating remote_max_data rather than failing
-            // the read.  The already-buffered data is still delivered to the
-            // caller.  Flow control will not advance for future reads on this
-            // stream, but that is harmless once all data has been received
-            // (is_writing_complete is true in that case, so this branch is only
-            // reached on the final read before is_reading_complete triggers).
-            // The Drop impl follows the same "ignore frame errors" policy.
-            if self.send_max_data_frame(new_max_data).is_ok() {
-                self.remote_max_data = new_max_data;
-            }
+            // Frame send errors are propagated: if we cannot communicate flow
+            // control credits the peer may stall, so it is better to surface
+            // the failure immediately.
+            self.send_max_data_frame(new_max_data)?;
+            self.remote_max_data = new_max_data;
         } else {
             trace!(
                 stream_id = self.stream_id.as_u64(),
