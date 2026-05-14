@@ -23,7 +23,7 @@
 //!   The two sides talk over the real flow-queue / frame-submission channels,
 //!   without any actual UDP sockets or cryptography.
 
-use super::{msg, reset_error, write_data_reader, Reader};
+use super::{msg, reset_error, write_data_reader, ReadToEnd, Reader};
 use crate::{
     flow,
     intrusive_queue,
@@ -38,7 +38,7 @@ use s2n_quic_core::{
     stream::testing::Data,
     varint::VarInt,
 };
-use std::net::SocketAddr;
+use std::{net::SocketAddr, time::Duration};
 
 // ─── Test helpers ─────────────────────────────────────────────────────────────
 
@@ -165,6 +165,17 @@ impl Pusher {
         }
         result
     }
+
+    /// Asynchronously waits for frames up to `duration`.
+    ///
+    /// Returns `Some(queue)` when `recv_frames` completes before timeout (the
+    /// queue may still be empty). Returns `None` only when the timeout expires.
+    async fn recv_frames_timeout(
+        &mut self,
+        duration: Duration,
+    ) -> Option<intrusive_queue::Queue<Frame>> {
+        crate::testing::timeout(duration, self.recv_frames()).await.ok()
+    }
 }
 
 // ─── write_data_reader unit tests (no I/O, no tasks) ──────────────────────────
@@ -266,7 +277,8 @@ fn basic_read() {
         // App task: read until EOF.
         async move {
             let mut buf = BytesMut::with_capacity(32);
-            reader.read_to_end(&mut buf).await.expect("read failed");
+            let outcome = reader.read_to_end(&mut buf).await.expect("read failed");
+            assert_eq!(outcome, ReadToEnd::Complete);
             assert_eq!(&buf[..], b"hello world");
             assert!(reader.0.status.is_complete());
         }
@@ -327,7 +339,8 @@ fn out_of_order_reassembly() {
         // App task: read until EOF.
         async move {
             let mut buf = BytesMut::with_capacity(32);
-            reader.read_to_end(&mut buf).await.expect("read failed");
+            let outcome = reader.read_to_end(&mut buf).await.expect("read failed");
+            assert_eq!(outcome, ReadToEnd::Complete);
             assert_eq!(&buf[..], b"helloworld");
         }
         .primary()
@@ -570,12 +583,12 @@ fn flow_control_violation_errors_reader_and_sends_reset() {
                         reset_target: ResetTarget::Both,
                         error_code,
                         ..
-                    } if error_code == reset_error::FRAME_DECODE_ERROR
+                    } if error_code == reset_error::FLOW_CONTROL_ERROR
                 )
             });
             assert!(
                 has_protocol_reset,
-                "expected FlowReset(Both, FRAME_DECODE_ERROR) on flow-control violation"
+                "expected FlowReset(Both, FLOW_CONTROL_ERROR) on flow-control violation"
             );
         }
         .primary()
@@ -601,37 +614,28 @@ fn client_fin_within_window_does_not_send_max_data() {
     crate::testing::sim(|| {
         use crate::testing::ext::*;
 
-        let (mut reader, pusher) = make_pair();
+        let (mut reader, mut pusher) = make_pair();
         let payload = b"hello";
-
-        // Break frame_tx by dropping the original frame receiver. If the Reader
-        // tries to send MAX_DATA on FIN, reads would fail with BrokenPipe.
-        let Pusher {
-            dispatcher,
-            queue_id,
-            request,
-            // Intentionally dropped to simulate a broken frame channel.
-            frame_rx: _frame_rx,
-            frame_storage,
-        } = pusher;
-        let disconnected_frame_rx = frame::submission_channel(1).1;
-        let mut pusher = Pusher {
-            dispatcher,
-            queue_id,
-            request,
-            frame_rx: disconnected_frame_rx,
-            frame_storage,
-        };
 
         async move {
             pusher.push_data(0, payload, true);
+            if let Some(frames) = pusher.recv_frames_timeout(Duration::from_secs(1)).await {
+                let has_max_data = frames
+                    .iter()
+                    .any(|f| matches!(f.header, Header::FlowControl { .. }));
+                assert!(
+                    !has_max_data,
+                    "client-side FIN should not trigger a flow update frame"
+                );
+            }
         }
         .primary()
         .spawn();
 
         async move {
             let mut buf = BytesMut::with_capacity(32);
-            reader.read_to_end(&mut buf).await.expect("read failed");
+            let outcome = reader.read_to_end(&mut buf).await.expect("read failed");
+            assert_eq!(outcome, ReadToEnd::Complete);
             assert_eq!(&buf[..], payload);
         }
         .primary()
@@ -677,7 +681,19 @@ fn server_validates_then_reads() {
 
         async move {
             pusher.push_flow_validated();
+            // Encourage task interleaving so validation/read processing can run
+            // before we assert on emitted flow-control frames.
+            bach::task::yield_now().await;
             pusher.push_data(0, b"hello", true);
+            bach::task::yield_now().await;
+            let frames = pusher
+                .recv_frames_timeout(Duration::from_secs(1))
+                .await
+                .expect("expected server flow update after validating/reading");
+            let has_max_data = frames
+                .iter()
+                .any(|f| matches!(f.header, Header::FlowControl { .. }));
+            assert!(has_max_data, "expected server to send flow update");
         }
         .primary()
         .spawn();
@@ -685,7 +701,8 @@ fn server_validates_then_reads() {
         async move {
             reader.validate().await.expect("validate failed");
             let mut buf = BytesMut::with_capacity(16);
-            reader.read_to_end(&mut buf).await.expect("read failed");
+            let outcome = reader.read_to_end(&mut buf).await.expect("read failed");
+            assert_eq!(outcome, ReadToEnd::Complete);
             assert_eq!(&buf[..], b"hello");
         }
         .primary()
@@ -781,10 +798,10 @@ fn panic_drop_sends_abnormal_termination_reset() {
     });
 }
 
-/// `read_to_end` should fail fast if the application-provided buffer has no
-/// remaining capacity at call time.
+/// `read_to_end` should report `BufferFull` if the application-provided buffer
+/// has no remaining capacity at call time.
 #[test]
-fn read_to_end_empty_buffer_returns_invalid_input() {
+fn read_to_end_empty_buffer_returns_buffer_full() {
     crate::testing::sim(|| {
         use crate::testing::ext::*;
 
@@ -799,20 +816,22 @@ fn read_to_end_empty_buffer_returns_invalid_input() {
         async move {
             let mut backing = BytesMut::with_capacity(16);
             let mut limited = backing.with_write_limit(0);
-            let err = reader
+            let outcome = reader
                 .read_to_end(&mut limited)
                 .await
-                .expect_err("expected InvalidInput for zero-capacity buffer");
-            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+                .expect("expected BufferFull for zero-capacity buffer");
+            assert_eq!(outcome, ReadToEnd::BufferFull);
+            assert!(backing.is_empty());
         }
         .primary()
         .spawn();
     });
 }
 
-/// `read_to_end` should fail fast once a fixed-size/non-growable buffer is full.
+/// `read_to_end` should return `BufferFull` once a fixed-size/non-growable
+/// buffer is full, while preserving bytes that were already copied.
 #[test]
-fn read_to_end_full_buffer_returns_invalid_input() {
+fn read_to_end_full_buffer_returns_buffer_full() {
     crate::testing::sim(|| {
         use crate::testing::ext::*;
 
@@ -826,12 +845,15 @@ fn read_to_end_full_buffer_returns_invalid_input() {
 
         async move {
             let mut backing = BytesMut::with_capacity(16);
-            let mut limited = backing.with_write_limit(1);
-            let err = reader
-                .read_to_end(&mut limited)
-                .await
-                .expect_err("expected InvalidInput once fixed-size buffer is full");
-            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+            let outcome = {
+                let mut limited = backing.with_write_limit(1);
+                reader
+                    .read_to_end(&mut limited)
+                    .await
+                    .expect("expected BufferFull once fixed-size buffer is full")
+            };
+            assert_eq!(outcome, ReadToEnd::BufferFull);
+            assert_eq!(&backing[..], b"h");
         }
         .primary()
         .spawn();

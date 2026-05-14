@@ -117,6 +117,25 @@ pub struct Reader(Box<Inner>);
 
 use super::coop::{self, Coop, HasCoop};
 
+/// Outcome of [`Reader::read_to_end`].
+///
+/// `Complete` means EOF was reached. `BufferFull` means the provided storage ran
+/// out of remaining capacity before EOF and `read_to_end` should be called again
+/// with more capacity to continue draining the stream.
+#[must_use = "ReadToEnd indicates whether EOF was reached or another call is needed with more buffer capacity"]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReadToEnd {
+    Complete,
+    BufferFull,
+}
+
+impl ReadToEnd {
+    #[inline]
+    pub fn is_complete(self) -> bool {
+        matches!(self, Self::Complete)
+    }
+}
+
 struct Inner {
     /// Channel to submit frames to the wheel
     frame_tx: SubmissionSender,
@@ -132,6 +151,15 @@ struct Inner {
     remote_max_data: VarInt,
     /// Window size for flow control
     window_size: u64,
+    /// Whether this endpoint should emit a flow update after FIN is consumed.
+    /// Server-side readers set this to true so FIN consumption can act as an
+    /// acceptance signal to the peer. Client-side readers set it to false since
+    /// post-FIN credit updates are unnecessary once the peer is done sending.
+    send_flow_update_after_fin: bool,
+    /// Tracks whether a FIN has been observed on the receive side.
+    /// When `fin_observed` is true and `send_flow_update_after_fin` is false,
+    /// flow updates are suppressed.
+    fin_observed: bool,
     /// Current status of the reader
     status: Status,
     /// Reset error code if the stream was reset by the peer
@@ -186,6 +214,8 @@ impl Reader {
             reassembler: Reassembler::new(),
             remote_max_data,
             window_size,
+            send_flow_update_after_fin: false,
+            fin_observed: false,
             status: Status::Open,
             reset_error_code: None,
             coop: Coop::default(),
@@ -209,6 +239,8 @@ impl Reader {
             reassembler: Reassembler::new(),
             remote_max_data: VarInt::ZERO,
             window_size,
+            send_flow_update_after_fin: true,
+            fin_observed: false,
             status: Status::Open,
             reset_error_code: None,
             coop: Coop::default(),
@@ -232,6 +264,8 @@ impl Reader {
             reassembler: Reassembler::new(),
             remote_max_data: VarInt::ZERO,
             window_size,
+            send_flow_update_after_fin: true,
+            fin_observed: false,
             status: Status::PendingValidation,
             reset_error_code: None,
             coop: Coop::default(),
@@ -268,21 +302,19 @@ impl Reader {
     /// `S` must be a buffer that can always accept more bytes — for example
     /// [`bytes::BytesMut`] or [`Vec<u8>`], which grow on demand. If `buf` has no
     /// remaining capacity (empty at call time or later filled for fixed-size
-    /// storage), this method returns `InvalidInput` instead of stalling.
-    pub async fn read_to_end<S>(&mut self, buf: &mut S) -> io::Result<()>
+    /// storage), this method returns [`ReadToEnd::BufferFull`] so the caller can
+    /// provide additional capacity and call again.
+    pub async fn read_to_end<S>(&mut self, buf: &mut S) -> io::Result<ReadToEnd>
     where
         S: buffer::writer::Storage,
     {
         loop {
             if !buf.track_write().has_remaining_capacity() {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "buffer has no remaining capacity",
-                ));
+                return Ok(ReadToEnd::BufferFull);
             }
 
             if self.read_into(buf).await? == 0 {
-                return Ok(());
+                return Ok(ReadToEnd::Complete);
             }
         }
     }
@@ -447,6 +479,9 @@ impl Inner {
                             mut payload,
                             fin,
                         } => {
+                            if fin {
+                                self.fin_observed = true;
+                            }
                             let Some(payload_end_offset) =
                                 offset.as_u64().checked_add(payload.len() as u64)
                             else {
@@ -477,7 +512,7 @@ impl Inner {
                                     remote_max_data = self.remote_max_data.as_u64(),
                                     "Peer exceeded advertised receive window"
                                 );
-                                return self.protocol_error();
+                                return self.flow_control_error();
                             }
 
                             trace!(
@@ -570,8 +605,21 @@ impl Inner {
         Poll::Ready(Err(io::Error::new(io::ErrorKind::InvalidData, reset_error)))
     }
 
+    fn flow_control_error(&mut self) -> Poll<io::Result<()>> {
+        let error_code = reset_error::FLOW_CONTROL_ERROR;
+        self.reset_error_code = Some(error_code);
+        self.status.on_reset().ok();
+        self.reassembler.reset();
+        let _ = self.send_reset_frame(error_code, ResetTarget::Both);
+        let reset_error: ResetError = error_code.into();
+        Poll::Ready(Err(io::Error::new(io::ErrorKind::InvalidData, reset_error)))
+    }
+
     fn maybe_send_max_data(&mut self) -> io::Result<()> {
         if let Some(final_size) = self.reassembler.final_size() {
+            if self.fin_observed && !self.send_flow_update_after_fin {
+                return Ok(());
+            }
             if self.remote_max_data.as_u64() >= final_size {
                 return Ok(());
             }
