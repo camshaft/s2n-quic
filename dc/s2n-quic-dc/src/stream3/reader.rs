@@ -334,14 +334,11 @@ impl Inner {
         // channel.  This makes the error sticky and avoids returning BrokenPipe
         // instead of ConnectionReset on re-read.
         if self.status.is_reset() {
-            if let Some(error_code) = self.reset_error_code {
-                let reset_error: ResetError = error_code.into();
-                return Poll::Ready(Err(io::Error::new(
-                    io::ErrorKind::ConnectionReset,
-                    reset_error,
-                )));
-            }
-            return Poll::Ready(Err(io::ErrorKind::ConnectionReset.into()));
+            let error = self.reset_error_code.map_or_else(
+                || io::Error::from(io::ErrorKind::ConnectionReset),
+                |code| io::Error::new(io::ErrorKind::ConnectionReset, ResetError::from(code)),
+            );
+            return Poll::Ready(Err(error));
         }
 
         let mut tracker = buf.track_write();

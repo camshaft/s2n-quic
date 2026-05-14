@@ -144,6 +144,13 @@ impl Pusher {
     /// Suspends until at least one frame (or a channel-close) is received,
     /// then returns all frames collected in that batch as a flat intrusive
     /// queue.  The `PriorityStorage` allocation is reused across calls.
+    ///
+    /// # Iterating the result
+    ///
+    /// Use [`Queue::iter`][`intrusive_queue::Queue::iter`] to borrow frames
+    /// without consuming them, or iterate by value to take ownership of each
+    /// `Entry<Frame>`.  Entries deref to `Frame` so you can access fields
+    /// (e.g. `entry.header`) without calling `into_inner`.
     async fn recv_frames(&mut self) -> intrusive_queue::Queue<Frame> {
         core::future::poll_fn(|cx| self.frame_rx.poll_swap(cx, &mut self.frame_storage)).await;
         let mut result = intrusive_queue::Queue::default();
