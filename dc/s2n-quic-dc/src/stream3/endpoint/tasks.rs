@@ -636,7 +636,7 @@ pub async fn ack_burst_task<AckBurstRx, AckTx>(
     ack_burst_rx: AckBurstRx,
     mut ack_sender: AckTx,
     recv_worker_id: usize,
-    budgets: Budgets,
+    budget: usize,
 ) where
     AckBurstRx: Receiver<Rc<RefCell<endpoint::recv::Context>>>,
     AckTx: UnboundedSender<Entry<msg::Sender>>,
@@ -647,7 +647,7 @@ pub async fn ack_burst_task<AckBurstRx, AckTx>(
             let _ = ack_sender.send(Entry::new(msg::Sender::PendingAck(submission)));
         }
     });
-    rx.drain_budgeted(Some(budgets.packet_dispatch)).await;
+    rx.drain_budgeted(Some(budget)).await;
 }
 
 

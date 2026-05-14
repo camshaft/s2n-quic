@@ -95,6 +95,8 @@ pub struct Budgets {
     pub socket_recv: usize,
     /// Budget for the per-worker packet dispatch task.
     pub packet_dispatch: usize,
+    /// Budget for the per-worker ACK burst drain task.
+    pub ack_burst: usize,
     /// Budget for the waker drain task (wakers fired per poll).
     pub waker_drain: usize,
     /// Budget for the ACK completion drain task (entries returned from assembler per poll).
@@ -116,6 +118,7 @@ impl Default for Budgets {
             completion_cancelled: tasks::DEFAULT_DISPATCH_BUDGET,
             socket_recv: tasks::DEFAULT_RECV_BUDGET,
             packet_dispatch: usize::MAX,
+            ack_burst: tasks::DEFAULT_DISPATCH_BUDGET,
             waker_drain: 512,
             ack_completion: tasks::DEFAULT_DISPATCH_BUDGET,
         }
@@ -703,7 +706,7 @@ where
                     crate::socket::channel::FlattenList::new(ack_burst_rx.into_list_receiver()),
                     rd.ack_sender.clone(),
                     recv_dispatch_idx,
-                    budgets,
+                    budgets.ack_burst,
                 ));
                 local.spawn(tasks::ack_completion_task(
                     rd.ack_completion_rx,
