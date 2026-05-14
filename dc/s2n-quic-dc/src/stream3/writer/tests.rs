@@ -213,6 +213,8 @@ fn client_second_write_blocks_until_max_data() {
             assert!(matches!(sent[0].header, Header::FlowInit { is_fin: false, .. }));
             assert_eq!(sent[0].payload, &b"hello"[..]);
 
+            // Yield once so the app task can issue its second write and observe
+            // FlowInitSent blocking before we grant remote credit.
             bach::task::yield_now().await;
             pusher.push_max_data(VarInt::from_u16(4096));
 
