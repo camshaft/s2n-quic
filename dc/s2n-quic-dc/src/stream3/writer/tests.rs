@@ -154,25 +154,6 @@ impl Pusher {
     }
 }
 
-fn catch_unwind_silent<F, T>(f: F) -> std::thread::Result<T>
-where
-    F: FnOnce() -> T + std::panic::UnwindSafe,
-{
-    // Panic hooks are process-global, so lock around hook replacement/restoration
-    // to keep this helper safe when tests run in parallel.
-    static PANIC_HOOK_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    let guard = PANIC_HOOK_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let previous_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(|_| {}));
-    let result = std::panic::catch_unwind(f);
-    std::panic::set_hook(previous_hook);
-    drop(guard);
-    result
-}
-
 // ─── Bach async tests ─────────────────────────────────────────────────────────
 
 #[test]
@@ -403,7 +384,7 @@ fn panic_drop_sends_abnormal_termination_reset() {
         .spawn();
 
         async move {
-            let panic_result = catch_unwind_silent(std::panic::AssertUnwindSafe(move || {
+            let panic_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
                 let _writer = writer;
                 panic!("intentional test panic while dropping writer");
             }));
