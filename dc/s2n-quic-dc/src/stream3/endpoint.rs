@@ -95,7 +95,8 @@ pub struct Budgets {
     pub socket_recv: usize,
     /// Budget for the per-worker packet dispatch task.
     pub packet_dispatch: usize,
-    /// Budget for the per-worker ACK burst drain task.
+    /// Budget for the per-worker ACK burst drain task (`ack_burst_task`), i.e.
+    /// how many pending recv contexts are encoded/sent per poll.
     pub ack_burst: usize,
     /// Budget for the waker drain task (wakers fired per poll).
     pub waker_drain: usize,

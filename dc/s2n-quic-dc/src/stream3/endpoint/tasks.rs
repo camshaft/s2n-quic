@@ -518,14 +518,14 @@ pub async fn socket_recv_task<Socket, R>(
 ///
 /// - **Queue depth metric** (`q.datagram`): stream2 wraps the input queue in `GaugedQueue`.
 ///   Add once the counter infrastructure is available per-worker.
-pub async fn packet_dispatch_task<PacketRx, AckTx, AckBurstTx, WakerSink, Clk, Route>(
+pub async fn packet_dispatch_task<PacketRx, AckSender, AckBurstSender, WakerSink, Clk, Route>(
     packet_rx: PacketRx,
     recv_cache: Rc<RefCell<endpoint::recv::Cache>>,
-    mut ack_burst_tx: AckBurstTx,
+    mut ack_burst_tx: AckBurstSender,
     path_secret_map: crate::path::secret::Map,
     acceptor_registry: crate::acceptor::Registry<crate::stream3::Stream>,
     frame_tx: crate::stream3::frame::SubmissionSender,
-    mut ack_sender: AckTx,
+    mut ack_sender: AckSender,
     queue_dispatcher: msg::queue::Dispatcher,
     counters: Arc<endpoint::counters::Dispatch>,
     clock: Clk,
@@ -536,8 +536,8 @@ pub async fn packet_dispatch_task<PacketRx, AckTx, AckBurstTx, WakerSink, Clk, R
     PacketRx: Receiver<
         crate::intrusive_queue::Entry<crate::packet::datagram::decoder::Packet<descriptor::Filled>>,
     >,
-    AckTx: UnboundedSender<Entry<msg::Sender>>,
-    AckBurstTx: UnboundedSender<Rc<RefCell<endpoint::recv::Context>>>,
+    AckSender: UnboundedSender<Entry<msg::Sender>>,
+    AckBurstSender: UnboundedSender<Rc<RefCell<endpoint::recv::Context>>>,
     WakerSink: UnboundedSender<crate::flow::queue::AutoWake>,
     Clk: s2n_quic_core::time::Clock + precision::Clock,
     Route: endpoint::routing::SenderRoute,
