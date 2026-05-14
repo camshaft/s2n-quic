@@ -182,15 +182,49 @@ where
                 }
             }
 
-            // Phase 2: PTO probe assembly.
+            // Phase 2: drain immediate (priority-0) frames.
+            // These bypass CWND and are always eligible when present.
+            while let Some(frame) = context.pop_immediate() {
+                if !frame.should_transmit() {
+                    let _ = cancelled.send(frame);
+                    continue;
+                }
+
+                let next_metadata = metadata.with_frame(&frame);
+                let estimated_len = next_metadata.estimate_packet_len(
+                    source_sender_id,
+                    source_control_port,
+                    context.next_packet_number,
+                    &context.credentials,
+                    seal::Application::tag_len(&context.sealer),
+                );
+
+                if estimated_len > max_segment_len {
+                    context.push_front_frame(frame);
+                    break;
+                }
+
+                is_ack_eliciting |= frame.header.is_ack_eliciting();
+                metadata = next_metadata;
+                packet_frames.push_back(frame);
+
+                if estimated_len == max_segment_len {
+                    break;
+                }
+            }
+
+            // Phase 3: PTO probe assembly.
             //
             // Only entered when a probe is requested and there is no pending data to serve
-            // as the probe. If pending data is present, Phase 3 will bypass CWND and act
+            // as the probe. If pending data is present, Phase 4 will bypass CWND and act
             // as the probe (RFC 9002 §6.2.4), so no retransmit is needed here.
             //
             // Skipping 4 PNs creates a gap large enough that the peer will immediately
             // ACK the probe (RFC 9000 §13.2.1 / RFC 9002 §6.2.4).
-            if context.pto.probe_state.is_requested() && !context.has_pending_data() {
+            if context.pto.probe_state.is_requested()
+                && !is_ack_eliciting
+                && !context.has_pending_data()
+            {
                 // No pending data — retransmit from the oldest inflight entry.
                 if let Some((old_pn, mut probe_frames)) = context.inflight.take_oldest_for_probe() {
                     // oldest_non_shell_pn only returns entries with non-empty frames.
@@ -253,7 +287,7 @@ where
                 }
             }
 
-            // Phase 3: drain pending (data) frames.
+            // Phase 4: drain pending (data) frames.
             // When a probe is requested and pending data is available, bypass CWND per
             // RFC 9002 §6.2.4. Otherwise only drain when the congestion window allows.
             let can_send_pending = context.has_pending_data()

@@ -405,6 +405,7 @@ impl Context {
         // Check we have queued packets and we're not already linked
         !self.is_tx_scheduled()
             && (self.has_pending_acks()
+                || self.has_pending_immediate()
                 || self.pto.probe_state.is_requested()
                 || (self.has_pending_data() && self.can_send_pending_frames()))
         {
@@ -451,6 +452,12 @@ impl Context {
             }
         }
         None
+    }
+
+    /// Pop the next immediate frame (priority index 0), bypassing CWND.
+    #[inline]
+    pub fn pop_immediate(&mut self) -> Option<intrusive_queue::Entry<Frame>> {
+        self.queues[0].pop_front()
     }
 
     /// Push a frame back to the front of whichever priority queue it belongs to.
@@ -504,6 +511,11 @@ impl Context {
     #[inline]
     pub fn has_pending_data(&self) -> bool {
         self.queues[1..].iter().any(|q| !q.is_empty())
+    }
+
+    #[inline]
+    pub fn has_pending_immediate(&self) -> bool {
+        !self.queues[0].is_empty()
     }
 
     #[inline]
