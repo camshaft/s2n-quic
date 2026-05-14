@@ -63,6 +63,13 @@ pub struct Entry {
     peer_data_port: AtomicU16,
     /// Next scheduled transmission timestamp per socket sender, encoded as microseconds.
     next_transmission_by_sender: Box<[AtomicU64]>,
+    /// Timestamp of the last successfully authenticated received packet, in nanoseconds.
+    ///
+    /// Updated via `fetch_max` (monotonically advancing) by the recv dispatch task whenever a
+    /// packet is decrypted, deduplicated, and dispatched. Both the send-side and recv-side idle
+    /// wheels read this value to decide whether to evict a peer's local state or rearm for
+    /// another idle period.
+    last_peer_activity: AtomicU64,
 }
 
 impl SizeOf for Entry {
@@ -80,6 +87,7 @@ impl SizeOf for Entry {
             next_connection,
             peer_data_port,
             next_transmission_by_sender,
+            last_peer_activity,
         } = self;
         creation_time.size()
             + peer.size()
@@ -94,6 +102,7 @@ impl SizeOf for Entry {
             + peer_data_port.size()
             + std::mem::size_of::<Box<[AtomicU64]>>()
             + next_transmission_by_sender.len() * std::mem::size_of::<AtomicU64>()
+            + last_peer_activity.size()
     }
 }
 
@@ -165,6 +174,7 @@ impl Entry {
             next_connection: AtomicU64::new(0),
             peer_data_port: AtomicU16::new(0),
             next_transmission_by_sender: Self::init_sender_schedule(socket_sender_count),
+            last_peer_activity: AtomicU64::new(0),
         }
     }
 
@@ -376,6 +386,26 @@ impl Entry {
             .map_or(Duration::from_secs(60), |v| {
                 Duration::from_millis(v.get() as u64)
             })
+    }
+
+    /// Update the last peer activity timestamp.
+    ///
+    /// Called whenever a packet is successfully authenticated (decrypted and deduplicated) for
+    /// this entry. Uses a monotonic fetch_max so the value only advances forward.
+    #[inline]
+    pub fn update_last_peer_activity(&self, ts: s2n_quic_core::time::Timestamp) {
+        // SAFETY: Timestamp values in this crate are treated as non-negative durations
+        // from a fixed epoch.
+        let nanos = unsafe { ts.as_duration().as_nanos() as u64 };
+        self.last_peer_activity.fetch_max(nanos, Ordering::Relaxed);
+    }
+
+    /// Return the nanosecond timestamp of the last authenticated received packet.
+    ///
+    /// Returns 0 if no packet has been received yet for this entry.
+    #[inline]
+    pub fn last_peer_activity_nanos(&self) -> u64 {
+        self.last_peer_activity.load(Ordering::Relaxed)
     }
 
     pub fn id(&self) -> &credentials::Id {

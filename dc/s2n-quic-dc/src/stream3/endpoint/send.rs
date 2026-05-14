@@ -438,7 +438,15 @@ impl Context {
         WheelInterest {
             transmission,
             pto,
-            idle_timeout: false,
+            idle_timeout: if !self.is_idle_scheduled() {
+                // Arm the idle wheel: fire after idle_timeout so we can evict this context if
+                // the peer has gone silent for that long.
+                let now = clock.now();
+                self.idle_wheel.target_time = Some(now + self.path_secret_entry.idle_timeout());
+                true
+            } else {
+                false
+            },
         }
     }
 
@@ -522,7 +530,6 @@ impl Context {
     }
 
     #[inline]
-    #[expect(dead_code)] // TODO implement expiration
     pub fn is_idle_scheduled(&self) -> bool {
         self.idle_wheel.links.is_linked()
     }
@@ -542,6 +549,38 @@ impl Context {
         self.wheel_interest(clock)
     }
 
+    /// Called when the idle wheel fires for this context.
+    ///
+    /// Checks whether the peer was recently active by reading the shared `last_peer_activity`
+    /// counter on the path-secret entry.
+    ///
+    /// - Returns `Some(WheelInterest)` to rearm: the caller should dispatch the returned
+    ///   interest, which will re-insert this context into the idle wheel.
+    /// - Returns `None` to evict: the caller should remove this context from the send cache.
+    pub fn on_idle_timeout<Clk: precision::Clock + ?Sized>(
+        &mut self,
+        clock: &Clk,
+    ) -> Option<WheelInterest> {
+        let now = clock.now();
+        let now_nanos = now.nanos;
+        let timeout = self.path_secret_entry.idle_timeout();
+        let timeout_nanos = timeout.as_nanos().min(u64::MAX as u128) as u64;
+        let cutoff = now_nanos.saturating_sub(timeout_nanos);
+
+        let last_activity = self.path_secret_entry.last_peer_activity_nanos();
+        if last_activity >= cutoff {
+            // Peer has been active — rearm the idle wheel for another period.
+            self.idle_wheel.target_time = Some(now + timeout);
+            Some(WheelInterest {
+                transmission: false,
+                pto: false,
+                idle_timeout: true,
+            })
+        } else {
+            // Truly idle — signal eviction.
+            None
+        }
+    }
     /// Verify structural invariants of the context.
     ///
     /// Runs assertions guarded by `cfg!(debug_assertions)` — in release builds this
@@ -809,5 +848,10 @@ impl Cache {
 
     pub fn get(&self, id: &credentials::Id) -> Option<Rc<RefCell<Context>>> {
         self.contexts.get(id).cloned()
+    }
+
+    /// Remove the send context for the given credentials ID from the cache.
+    pub fn remove(&mut self, id: &credentials::Id) {
+        self.contexts.remove(id);
     }
 }

@@ -99,6 +99,8 @@ pub struct Budgets {
     pub waker_drain: usize,
     /// Budget for the ACK completion drain task (entries returned from assembler per poll).
     pub ack_completion: usize,
+    /// Budget for the recv idle wheel drain task (contexts checked per poll).
+    pub recv_idle_wheel: usize,
 }
 
 impl Default for Budgets {
@@ -118,6 +120,7 @@ impl Default for Budgets {
             packet_dispatch: usize::MAX,
             waker_drain: 512,
             ack_completion: tasks::DEFAULT_DISPATCH_BUDGET,
+            recv_idle_wheel: tasks::DEFAULT_DISPATCH_BUDGET,
         }
     }
 }
@@ -680,6 +683,10 @@ where
                 let recv_cache = std::rc::Rc::new(std::cell::RefCell::new(
                     crate::stream3::endpoint::recv::Cache::new(idle_timeout, recv_dispatch_idx),
                 ));
+                let (recv_idle_wheel_tx, recv_idle_wheel_rx) =
+                    crate::socket::channel::intrusive_queue::unsync::new_with_adapter::<
+                        crate::stream3::endpoint::recv::IdleWheelAdapter,
+                    >();
                 local.spawn(tasks::packet_dispatch_task(
                     packet_rx,
                     recv_cache.clone(),
@@ -689,9 +696,17 @@ where
                     rd.ack_sender.clone(),
                     rd.queue_dispatcher,
                     rd.counters,
-                    rd.clock,
+                    rd.clock.clone(),
                     rd.route,
                     rd.waker_sink,
+                    recv_idle_wheel_tx.clone(),
+                    budgets,
+                ));
+                local.spawn(tasks::recv_idle_wheel_task(
+                    recv_idle_wheel_rx,
+                    recv_idle_wheel_tx,
+                    recv_cache.clone(),
+                    rd.clock,
                     budgets,
                 ));
                 local.spawn(tasks::ack_completion_task(

@@ -379,13 +379,40 @@ pub fn send_worker<Socket, Clk, WakerSink, AckComp>(
         budgets.pto_wheel,
     ));
 
-    // Task 7: Idle wheel drain — reclaims resources for idle connections.
+    // Task 7: Idle wheel drain — reclaims send context resources for idle connections.
     spawner.spawn(wheel_drain(
         idle_wheel_rx,
         clock.timer(),
-        |context: Rc<RefCell<send::Context>>| {
-            // TODO reclaim idle context resources
-            let _ = context;
+        {
+            let send_caches = send_caches.clone();
+            let sender_idx_to_local = sender_idx_to_local.clone();
+            let clock = clock.clone();
+            let mut tx_wheel_tx = tx_wheel_tx.clone();
+            let mut pto_wheel_tx = pto_wheel_tx.clone();
+            let mut idle_wheel_tx = idle_wheel_tx.clone();
+            move |context: Rc<RefCell<send::Context>>| {
+                let result = context.borrow_mut().on_idle_timeout(&clock);
+                match result {
+                    Some(wheel_interest) => {
+                        // Peer was active — rearm for another idle period.
+                        wheel_interest.dispatch(
+                            context,
+                            &mut tx_wheel_tx,
+                            &mut pto_wheel_tx,
+                            &mut idle_wheel_tx,
+                        );
+                    }
+                    None => {
+                        // Truly idle — remove from the send cache.
+                        let id = *context.borrow().path_secret_entry.id();
+                        let local_id = sender_idx_to_local[context.borrow().sender_idx];
+                        if let Some(cache) = send_caches.get(local_id) {
+                            cache.borrow_mut().remove(&id);
+                        }
+                        tracing::debug!(?id, "idle timeout: evicting send context");
+                    }
+                }
+            }
         },
         budgets.idle_wheel,
     ));
@@ -530,6 +557,7 @@ pub async fn packet_dispatch_task<PacketRx, AckTx, WakerSink, Clk, Route>(
     clock: Clk,
     route: Route,
     mut waker_sink: WakerSink,
+    mut idle_wheel_tx: unsync::Sender<endpoint::recv::IdleWheelAdapter>,
     budgets: Budgets,
 ) where
     PacketRx: Receiver<
@@ -563,6 +591,7 @@ pub async fn packet_dispatch_task<PacketRx, AckTx, WakerSink, Clk, Route>(
                 &counters,
                 &route,
                 &mut waker_sink,
+                &mut idle_wheel_tx,
             )
         }
     });
@@ -605,10 +634,14 @@ pub async fn ack_completion_task<AckTx>(
             remote_sender_id: submission.remote_sender_id,
         };
 
-        let mut cache = recv_cache.borrow_mut();
-        let Some(ctx) = cache.senders.get_mut(&key) else {
+        // Clone the Rc first (with minimal borrow scope) so we can borrow_mut the Context
+        // independently of the cache borrow.
+        let ctx_rc = recv_cache.borrow().senders.get(&key).cloned();
+        let Some(ctx_rc) = ctx_rc else {
             return;
         };
+        let mut ctx_guard = ctx_rc.borrow_mut();
+        let ctx: &mut endpoint::recv::Context = &mut *ctx_guard;
 
         if ctx.ack_state.is_scheduled() {
             // New packets arrived while in flight — re-submit.
@@ -631,6 +664,57 @@ pub async fn ack_completion_task<AckTx>(
         }
     });
     rx.drain_budgeted(Some(budgets.ack_completion)).await;
+}
+
+/// Per-worker recv idle wheel drain: evicts recv contexts that have been idle too long.
+///
+/// Each time the idle wheel fires for a context, checks whether the peer was recently active
+/// via the shared `last_peer_activity` counter on the path-secret entry:
+///
+/// - If active within the idle timeout: rearms the idle wheel for another period by
+///   re-inserting the context into the same wheel channel via `idle_wheel_tx`.
+/// - If idle: removes the context from the recv cache and logs a debug message.
+pub async fn recv_idle_wheel_task<Clk>(
+    idle_wheel_rx: unsync::Receiver<endpoint::recv::IdleWheelAdapter>,
+    idle_wheel_tx: unsync::Sender<endpoint::recv::IdleWheelAdapter>,
+    recv_cache: Rc<RefCell<endpoint::recv::Cache>>,
+    clock: Clk,
+    budgets: Budgets,
+) where
+    Clk: precision::Clock,
+{
+    wheel_drain(
+        idle_wheel_rx,
+        clock.timer(),
+        {
+            let mut idle_wheel_tx = idle_wheel_tx;
+            move |context: Rc<RefCell<endpoint::recv::Context>>| {
+                let idle_timeout = recv_cache.borrow().idle_timeout;
+                let now_nanos = clock.now().nanos;
+                let rearm = context.borrow_mut().on_idle_timeout(now_nanos, idle_timeout);
+                if rearm {
+                    // Peer was active — rearm for another idle period.
+                    let target = clock.now() + idle_timeout;
+                    context.borrow_mut().idle_wheel.target_time = Some(target);
+                    let _ = UnboundedSender::send(&mut idle_wheel_tx, context);
+                } else {
+                    // Truly idle — remove from cache.
+                    let (id, remote_sender_id) = {
+                        let ctx = context.borrow();
+                        (*ctx.path_entry.id(), ctx.remote_sender_id)
+                    };
+                    let key = endpoint::recv::Key {
+                        id,
+                        remote_sender_id,
+                    };
+                    recv_cache.borrow_mut().remove(&key);
+                    tracing::debug!(?id, %remote_sender_id, "idle timeout: evicting recv context");
+                }
+            }
+        },
+        budgets.recv_idle_wheel,
+    )
+    .await;
 }
 
 fn on_packet_dispatch_error(counters: &endpoint::counters::Dispatch, err: dispatch::Error) {

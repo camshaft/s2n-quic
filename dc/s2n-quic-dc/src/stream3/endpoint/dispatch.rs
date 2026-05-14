@@ -10,6 +10,7 @@
 use crate::{
     acceptor,
     byte_vec::ByteVec,
+    clock::precision,
     credentials::Credentials,
     flow,
     flow::queue::AutoWake,
@@ -19,7 +20,10 @@ use crate::{
         datagram::{QueuePair, ResetTarget, RoutingInfo},
     },
     path::secret::{map::Entry as PathSecretEntry, Map as PathSecretMap},
-    socket::{channel, pool::descriptor},
+    socket::{
+        channel::{self, intrusive_queue::unsync},
+        pool::descriptor,
+    },
     stream3::{
         endpoint::{
             counters, decode, msg,
@@ -59,6 +63,9 @@ pub(crate) enum Error {
 /// Authenticates (decrypt), deduplicates by packet number, updates ACK state, then
 /// dispatches each frame in the packet to its type-specific handler. Response frames
 /// (ACKs, FlowValidateRequest, FlowReset) are emitted to `response_tx`.
+///
+/// `idle_wheel_tx` receives newly-created recv contexts so the idle wheel drain task
+/// can evict them after prolonged silence.
 pub(crate) fn process<Clk, Route>(
     packet: Entry<packet::datagram::decoder::Packet<descriptor::Filled>>,
     recv_cache: &mut recv::Cache,
@@ -72,6 +79,7 @@ pub(crate) fn process<Clk, Route>(
     counters: &counters::Dispatch,
     route: &Route,
     waker_sink: &mut impl channel::UnboundedSender<AutoWake>,
+    idle_wheel_tx: &mut unsync::Sender<recv::IdleWheelAdapter>,
 ) -> Result<(), Error>
 where
     Clk: s2n_quic_core::time::Clock + ?Sized,
@@ -91,7 +99,7 @@ where
 
     // Get or create peer receive state
     let mut control_out = Vec::new();
-    let (peer, cache_hit) = {
+    let (peer_rc, cache_hit) = {
         let _guard = counters.rx_peer_lookup_time.start();
         match recv_cache.get_or_insert(
             &credentials,
@@ -114,7 +122,14 @@ where
         counters.rx_peer_cache_hit.add(1);
     } else {
         counters.rx_peer_cache_miss.add(1);
+        // New context: arm the idle wheel so it will be evicted after prolonged silence.
+        let idle_target = precision::Timestamp::from(clock.get_time()) + idle_timeout;
+        peer_rc.borrow_mut().idle_wheel.target_time = Some(idle_target);
+        let _ = channel::UnboundedSender::send(idle_wheel_tx, peer_rc.clone());
     }
+
+    let mut peer_guard = peer_rc.borrow_mut();
+    let peer: &mut recv::Context = &mut *peer_guard;
 
     // Collect information about the packet layout before decryption.
     let app_header_slice: &[u8] = packet.application_header();

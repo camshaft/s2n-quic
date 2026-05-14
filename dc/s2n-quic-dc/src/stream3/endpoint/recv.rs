@@ -108,7 +108,60 @@ impl crate::clock::wheel::WheelAdapter for AckWheelAdapter {
     }
 }
 
-/// Attempt deduplication window for tracking seen attempt_ids.
+/// Intrusive links + target time for idle timeout wheel membership.
+pub(crate) struct IdleWheelLinks {
+    pub links: intrusive_queue::Links,
+    pub target_time: Option<precision::Timestamp>,
+}
+
+impl IdleWheelLinks {
+    pub const fn new() -> Self {
+        Self {
+            links: intrusive_queue::Links::new(),
+            target_time: None,
+        }
+    }
+}
+
+pub(crate) struct IdleWheelAdapter;
+
+impl crate::intrusive_queue::Adapter for IdleWheelAdapter {
+    type Value = RefCell<Context>;
+    type Target = RefCell<Context>;
+    type Pointer = Rc<RefCell<Context>>;
+
+    unsafe fn links(value: *mut Self::Value) -> *mut intrusive_queue::Links {
+        core::ptr::addr_of_mut!((*(*value).as_ptr()).idle_wheel.links)
+    }
+
+    unsafe fn target(value: *mut Self::Value) -> *mut Self::Target {
+        value
+    }
+
+    fn as_ptr(ptr: &Self::Pointer) -> *const Self::Value {
+        Rc::as_ptr(ptr)
+    }
+
+    fn into_raw(ptr: Self::Pointer) -> *mut Self::Value {
+        Rc::into_raw(ptr) as *mut Self::Value
+    }
+
+    unsafe fn from_raw(ptr: *mut Self::Value) -> Self::Pointer {
+        Rc::from_raw(ptr)
+    }
+}
+
+impl crate::clock::wheel::WheelAdapter for IdleWheelAdapter {
+    unsafe fn target_time(value: *const Self::Value) -> Option<precision::Timestamp> {
+        (*value).borrow().idle_wheel.target_time
+    }
+
+    unsafe fn set_target_time(value: *mut Self::Value, time: precision::Timestamp) {
+        (*value).borrow_mut().idle_wheel.target_time = Some(time);
+    }
+}
+
+
 ///
 /// Uses a sliding window to efficiently deduplicate FlowInit packets within
 /// a bounded memory footprint. This is the fast path for recent attempt_ids.
@@ -188,6 +241,8 @@ pub(crate) struct Context {
     pub flows: flow::Tracker,
     /// Intrusive links for ACK batching wheel
     pub ack_wheel: AckWheelLinks,
+    /// Intrusive links for idle timeout wheel
+    pub idle_wheel: IdleWheelLinks,
 }
 
 impl Context {
@@ -226,6 +281,7 @@ impl Context {
             attempt_dedup: AttemptDedup::new(),
             flows,
             ack_wheel: AckWheelLinks::new(),
+            idle_wheel: IdleWheelLinks::new(),
         }
     }
 
@@ -236,6 +292,9 @@ impl Context {
         let now = clock.get_time();
         self.last_activity = now;
         self.idle_timer.set(now + idle_timeout);
+        // Advance the shared activity counter so the send-side idle wheel can also
+        // detect peer liveness without receiving its own ACKs.
+        self.path_entry.update_last_peer_activity(now);
     }
 
     pub fn is_expired<Clk>(&mut self, clock: &Clk) -> bool
@@ -243,6 +302,26 @@ impl Context {
         Clk: s2n_quic_core::time::Clock + ?Sized,
     {
         self.idle_timer.poll_expiration(clock.get_time()).is_ready()
+    }
+
+    /// Returns `true` if this context is already linked into the idle timeout wheel.
+    #[inline]
+    pub fn is_idle_scheduled(&self) -> bool {
+        self.idle_wheel.links.is_linked()
+    }
+
+    /// Called when the idle wheel fires for this context.
+    ///
+    /// Returns `true` to rearm (peer was active within the timeout window), or
+    /// `false` to evict (peer has been silent for longer than `idle_timeout`).
+    ///
+    /// `now_nanos` should be the current `precision::Timestamp::nanos` value — the same
+    /// epoch used by [`PathSecretEntry::update_last_peer_activity`].
+    pub fn on_idle_timeout(&mut self, now_nanos: u64, idle_timeout: Duration) -> bool {
+        let timeout_nanos = idle_timeout.as_nanos().min(u64::MAX as u128) as u64;
+        let cutoff = now_nanos.saturating_sub(timeout_nanos);
+        let last_activity = self.path_entry.last_peer_activity_nanos();
+        last_activity >= cutoff
     }
 
     /// Update the shared ACK state and produce a submission for the direct ACK path.
@@ -303,7 +382,7 @@ impl core::hash::Hash for Key {
 
 /// Per-worker sender state cache.
 pub(crate) struct Cache {
-    pub senders: FxHashMap<Key, Context>,
+    pub senders: FxHashMap<Key, Rc<RefCell<Context>>>,
     pub idle_timeout: Duration,
     pub worker_id: usize,
 }
@@ -317,6 +396,10 @@ impl Cache {
         }
     }
 
+    /// Look up or create a recv context for the given peer.
+    ///
+    /// Returns `(context, is_cache_hit)`. When `is_cache_hit` is `false` (new entry),
+    /// the caller is responsible for arming the idle wheel for the returned context.
     #[inline]
     pub fn get_or_insert<Clk, Route>(
         &mut self,
@@ -326,7 +409,7 @@ impl Cache {
         clock: &Clk,
         control_out: &mut Vec<u8>,
         route: &Route,
-    ) -> Option<(&mut Context, bool)>
+    ) -> Option<(Rc<RefCell<Context>>, bool)>
     where
         Clk: s2n_quic_core::time::Clock + ?Sized,
         Route: super::routing::SenderRoute,
@@ -337,7 +420,7 @@ impl Cache {
         };
 
         Some(match self.senders.entry(key) {
-            hash_map::Entry::Occupied(entry) => (entry.into_mut(), true),
+            hash_map::Entry::Occupied(entry) => (entry.get().clone(), true),
             hash_map::Entry::Vacant(entry) => {
                 tracing::debug!(%credentials, %remote_sender_id, worker_id = self.worker_id, "opener_for_credentials");
                 let (opener, path_entry) =
@@ -345,7 +428,7 @@ impl Cache {
 
                 let dest_sender_id = route.sender_id_for_ack(&credentials.id, remote_sender_id);
 
-                let ctx = entry.insert(Context::new(
+                let ctx = Rc::new(RefCell::new(Context::new(
                     path_entry,
                     remote_sender_id,
                     dest_sender_id,
@@ -353,17 +436,15 @@ impl Cache {
                     credentials.key_id,
                     clock,
                     self.idle_timeout,
-                ));
-                (ctx, false)
+                )));
+                let inserted = entry.insert(ctx).clone();
+                (inserted, false)
             }
         })
     }
 
-    #[expect(dead_code)] // TODO implement expiration
-    pub fn cleanup_expired<Clk>(&mut self, clock: &Clk)
-    where
-        Clk: s2n_quic_core::time::Clock + ?Sized,
-    {
-        self.senders.retain(|_, state| !state.is_expired(clock));
+    /// Remove the recv context for the given key from the cache.
+    pub fn remove(&mut self, key: &Key) {
+        self.senders.remove(key);
     }
 }
