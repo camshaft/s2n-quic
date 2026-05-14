@@ -562,6 +562,8 @@ fn flow_control_violation_errors_reader_and_sends_reset() {
             pusher.push_data(0, &payload, false);
             let frames = pusher.recv_frames().await;
             let has_protocol_reset = frames.iter().any(|f| {
+                // Flow-control violations currently share the protocol-error
+                // path, which emits FRAME_DECODE_ERROR.
                 matches!(
                     f.header,
                     Header::FlowReset {
@@ -608,14 +610,16 @@ fn client_fin_within_window_does_not_send_max_data() {
             dispatcher,
             queue_id,
             request,
-            frame_rx: _closed,
+            // Intentionally dropped to simulate a broken frame channel.
+            frame_rx: _frame_rx,
             frame_storage,
         } = pusher;
+        let disconnected_frame_rx = frame::submission_channel(1).1;
         let mut pusher = Pusher {
             dispatcher,
             queue_id,
             request,
-            frame_rx: frame::submission_channel(1).1,
+            frame_rx: disconnected_frame_rx,
             frame_storage,
         };
 
@@ -764,7 +768,10 @@ fn panic_drop_sends_abnormal_termination_reset() {
 
         async move {
             let panic_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let _reader = reader;
+                // Move ownership into the panic scope so Drop runs while the
+                // thread is panicking and emits ABNORMAL_TERMINATION.
+                let moved_reader = reader;
+                let _ = &moved_reader;
                 panic!("intentional test panic while dropping reader");
             }));
             assert!(panic_result.is_err());

@@ -447,7 +447,8 @@ impl Inner {
                             mut payload,
                             fin,
                         } => {
-                            let Some(end_offset) = offset.as_u64().checked_add(payload.len() as u64)
+                            let Some(payload_end_offset) =
+                                offset.as_u64().checked_add(payload.len() as u64)
                             else {
                                 debug!(
                                     stream_id = self.stream_id.as_u64(),
@@ -458,14 +459,21 @@ impl Inner {
                                 return self.protocol_error();
                             };
 
+                            // Server bootstrap special-case:
+                            // `remote_max_data == 0` is used for server-side
+                            // streams before initial validation/credit release.
+                            // In that state the first bytes are accepted without
+                            // hard receive-window enforcement; once credits are
+                            // advertised (`remote_max_data > 0`) the check below
+                            // is enforced for all subsequent packets.
                             if self.remote_max_data != VarInt::ZERO
-                                && end_offset > self.remote_max_data.as_u64()
+                                && payload_end_offset > self.remote_max_data.as_u64()
                             {
                                 debug!(
                                     stream_id = self.stream_id.as_u64(),
                                     offset = offset.as_u64(),
                                     payload_len = payload.len(),
-                                    end_offset,
+                                    payload_end_offset,
                                     remote_max_data = self.remote_max_data.as_u64(),
                                     "Peer exceeded advertised receive window"
                                 );
