@@ -412,6 +412,99 @@ fn reset_after_partial_data() {
     });
 }
 
+/// Reset before data in the same queue batch: reset wins and late data is not
+/// delivered to the application.
+#[test]
+fn reset_before_data_in_same_batch_discards_data() {
+    crate::testing::sim(|| {
+        use crate::testing::ext::*;
+
+        let (mut reader, mut pusher) = make_pair();
+
+        async move {
+            // Push reset first, then data in the same queue batch.
+            pusher.push_reset(VarInt::from_u8(7));
+            pusher.push_data(0, b"late", true);
+        }
+        .primary()
+        .spawn();
+
+        async move {
+            let mut buf = BytesMut::with_capacity(16);
+            let err = reader
+                .read_into(&mut buf)
+                .await
+                .expect_err("expected ConnectionReset");
+            assert_eq!(err.kind(), std::io::ErrorKind::ConnectionReset);
+            assert!(buf.is_empty(), "data after reset should not be delivered");
+            assert!(reader.0.reassembler.is_empty());
+
+            let err2 = reader
+                .read_into(&mut buf)
+                .await
+                .expect_err("expected sticky ConnectionReset");
+            assert_eq!(err2.kind(), std::io::ErrorKind::ConnectionReset);
+        }
+        .primary()
+        .spawn();
+    });
+}
+
+/// If the application reads one byte at a time (yielding between reads), data
+/// buffered before a reset is drained before surfacing ConnectionReset.
+#[test]
+fn reset_after_partial_data_byte_at_a_time_drains_before_error() {
+    crate::testing::sim(|| {
+        use crate::testing::ext::*;
+
+        let (mut reader, mut pusher) = make_pair();
+        let expected = b"partial";
+
+        async move {
+            pusher.push_data(0, expected, false);
+            pusher.push_reset(VarInt::from_u8(9));
+        }
+        .primary()
+        .spawn();
+
+        async move {
+            let mut buf = BytesMut::with_capacity(64);
+            loop {
+                // Model an app that reads in tiny chunks and yields.
+                bach::task::yield_now().await;
+
+                let result = {
+                    let mut limited = buf.with_write_limit(1);
+                    reader.read_into(&mut limited).await
+                };
+
+                match result {
+                    Ok(0) => panic!("unexpected clean EOF, expected reset"),
+                    Ok(n) => assert_eq!(n, 1, "expected one-byte reads"),
+                    Err(e) => {
+                        assert_eq!(e.kind(), std::io::ErrorKind::ConnectionReset);
+                        break;
+                    }
+                }
+            }
+
+            assert_eq!(&buf[..], expected);
+            assert!(reader.0.reassembler.is_empty());
+
+            let err2 = {
+                let mut limited = buf.with_write_limit(1);
+                reader
+                    .read_into(&mut limited)
+                    .await
+                    .expect_err("expected sticky ConnectionReset")
+            };
+            assert_eq!(err2.kind(), std::io::ErrorKind::ConnectionReset);
+        }
+        .primary()
+        .spawn();
+    });
+}
+
 /// The Reader must emit a `MAX_DATA` (FlowControl) frame after the application
 /// consumes enough bytes to cross the replenishment threshold (> window / 2).
 ///
