@@ -544,7 +544,7 @@ pub async fn packet_dispatch_task<PacketRx, AckTx, WakerSink, Clk, Route>(
     let mut response_tx = frame_tx.clone();
     let mut queue_dispatcher = queue_dispatcher;
     let recv_worker_id = recv_cache.borrow().worker_id;
-    let budget = budgets.packet_dispatch;
+    let budget = budgets.packet_dispatch.max(1);
 
     poll_fn(move |cx| {
         for _ in 0..budget {
