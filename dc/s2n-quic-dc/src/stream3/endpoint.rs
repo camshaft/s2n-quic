@@ -387,7 +387,7 @@ where
     for (idx, drain) in waker_drains.into_iter().enumerate() {
         let worker_id = layout.waker_drain[idx % layout.waker_drain.len()];
         let prev = workers[worker_id].waker_drain.replace(drain);
-        debug_assert!(
+        assert!(
             prev.is_none(),
             "worker {worker_id} assigned multiple waker drain tasks"
         );
