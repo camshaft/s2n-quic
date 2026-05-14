@@ -99,11 +99,11 @@ impl Pusher {
 
     async fn recv_frames(&mut self) -> intrusive_queue::Queue<Frame> {
         core::future::poll_fn(|cx| self.frame_rx.poll_swap(cx, &mut self.frame_storage)).await;
-        let mut result = intrusive_queue::Queue::default();
+        let mut combined_frames = intrusive_queue::Queue::default();
         for (_priority, mut queue) in self.frame_storage.drain() {
-            result.append(&mut queue);
+            combined_frames.append(&mut queue);
         }
-        result
+        combined_frames
     }
 
     async fn recv_frames_timeout(
@@ -203,11 +203,15 @@ fn completed_frame(
 }
 
 fn send_completions(inner: &Inner, completions: impl IntoIterator<Item = Frame>) {
-    let mut queue = intrusive_queue::Queue::new();
+    let mut completion_queue = intrusive_queue::Queue::new();
     for completion in completions {
-        queue.push_back(completion.into());
+        completion_queue.push_back(completion.into());
     }
-    inner.completion_rx.sender().send_batch(queue).unwrap();
+    inner
+        .completion_rx
+        .sender()
+        .send_batch(completion_queue)
+        .unwrap();
 }
 
 fn noop_cx() -> core::task::Context<'static> {
