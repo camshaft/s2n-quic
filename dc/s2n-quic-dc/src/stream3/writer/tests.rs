@@ -152,6 +152,8 @@ fn catch_unwind_silent<F, T>(f: F) -> std::thread::Result<T>
 where
     F: FnOnce() -> T + std::panic::UnwindSafe,
 {
+    // Panic hooks are process-global, so lock around hook replacement/restoration
+    // to keep this helper safe when tests run in parallel.
     static PANIC_HOOK_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     let _guard = PANIC_HOOK_LOCK
