@@ -324,10 +324,14 @@ impl Context {
     }
 
     pub fn on_ack_completion(&mut self, recv_worker_id: usize) -> Option<ack_state::Submission> {
-        let _ = self.ack_state.on_completion_stale();
+        debug_assert!(
+            self.ack_state.is_flushed() || self.ack_state.is_flushed_stale(),
+            "ack completion should only be observed for Flushed/FlushedStale states"
+        );
 
-        if let Some(submission) = self.encode_and_flush(recv_worker_id) {
-            return Some(submission);
+        if self.ack_state.is_flushed_stale() {
+            let _ = self.ack_state.on_completion_stale();
+            return self.encode_and_flush(recv_worker_id);
         }
 
         let _ = self.ack_state.on_completion_idle();
