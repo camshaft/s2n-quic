@@ -31,7 +31,12 @@ use crate::{
     stream3::frame::{self, Frame, Header, PriorityStorage, SubmissionReceiver},
 };
 use bytes::BytesMut;
-use s2n_quic_core::{buffer::Reassembler, endpoint, stream::testing::Data, varint::VarInt};
+use s2n_quic_core::{
+    buffer::{writer::Storage as _, Reassembler},
+    endpoint,
+    stream::testing::Data,
+    varint::VarInt,
+};
 use std::net::SocketAddr;
 
 // ─── Test helpers ─────────────────────────────────────────────────────────────

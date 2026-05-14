@@ -262,6 +262,13 @@ impl Reader {
     ///
     /// Loops over [`read_into`][Self::read_into] until it returns `Ok(0)` (EOF),
     /// propagating any error immediately.
+    ///
+    /// # Buffer requirements
+    ///
+    /// `S` must be a buffer that can always accept more bytes — for example
+    /// [`bytes::BytesMut`] or [`Vec<u8>`], which grow on demand.  If `buf` runs
+    /// out of capacity before EOF is reached, `read_into` returns
+    /// `Poll::Pending` without making progress and this loop will stall.
     pub async fn read_to_end<S>(&mut self, buf: &mut S) -> io::Result<()>
     where
         S: buffer::writer::Storage,
@@ -329,11 +336,12 @@ impl Inner {
             return Poll::Ready(Ok(0));
         }
 
-        // If the stream was previously reset, return the stored error on every
-        // subsequent call without re-polling the (potentially closed) stream
-        // channel.  This makes the error sticky and avoids returning BrokenPipe
-        // instead of ConnectionReset on re-read.
-        if self.status.is_reset() {
+        // If the stream was previously reset, drain any buffered data first
+        // (matching TCP semantics: data in the receive buffer before a RST is
+        // still readable).  Once the reassembler is empty every subsequent
+        // call returns the sticky error.
+        if self.status.is_reset() && self.reassembler.is_empty() {
+            self.reassembler.reset(); // free cursor metadata
             let error = self.reset_error_code.map_or_else(
                 || io::Error::from(io::ErrorKind::ConnectionReset),
                 |code| io::Error::new(io::ErrorKind::ConnectionReset, ResetError::from(code)),
@@ -343,16 +351,32 @@ impl Inner {
 
         let mut tracker = buf.track_write();
 
-        // Poll for new stream messages.  If the channel reports a hard error
-        // (e.g. BrokenPipe because the sender was dropped) but the reassembler
-        // already holds all of the stream's data (writing_complete), we can
-        // still deliver that data and complete normally; only surface the error
-        // once there is nothing left to consume.
-        let stream_result = self.poll_stream_rx(cx, &mut tracker);
-        let deferred_err = match stream_result {
-            Poll::Ready(Ok(())) => None,
-            Poll::Ready(Err(e)) if self.reassembler.is_writing_complete() => Some(e),
-            other => return other.map_ok(|()| 0usize),
+        // If already in reset state, skip the channel poll — no new messages
+        // will arrive.  Drain the reassembler and surface the error when empty.
+        // Otherwise poll for new stream messages.  Defer any channel error
+        // (BrokenPipe or ConnectionReset) while the reassembler still has data,
+        // delivering all buffered bytes to the application first.
+        let deferred_err = if self.status.is_reset() {
+            let e = self.reset_error_code.map_or_else(
+                || io::Error::from(io::ErrorKind::ConnectionReset),
+                |code| io::Error::new(io::ErrorKind::ConnectionReset, ResetError::from(code)),
+            );
+            Some(e)
+        } else {
+            let stream_result = self.poll_stream_rx(cx, &mut tracker);
+            match stream_result {
+                Poll::Ready(Ok(())) => None,
+                // Defer the error while the reassembler still has data to give
+                // to the application (either all writes complete, or a reset
+                // arrived but data was already buffered).
+                Poll::Ready(Err(e))
+                    if self.reassembler.is_writing_complete()
+                        || !self.reassembler.is_empty() =>
+                {
+                    Some(e)
+                }
+                other => return other.map_ok(|()| 0usize),
+            }
         };
 
         if self.status.is_pending_validation() {
@@ -360,17 +384,6 @@ impl Inner {
                 io::ErrorKind::InvalidInput,
                 "stream not yet validated - call validate() first",
             )));
-        }
-
-        if self.status.is_reset() {
-            if let Some(error_code) = self.reset_error_code {
-                let reset_error: ResetError = error_code.into();
-                return Poll::Ready(Err(io::Error::new(
-                    io::ErrorKind::ConnectionReset,
-                    reset_error,
-                )));
-            }
-            return Poll::Ready(Err(io::ErrorKind::ConnectionReset.into()));
         }
 
         if tracker.has_remaining_capacity() {
@@ -480,7 +493,14 @@ impl Inner {
                             );
                             self.reset_error_code = Some(error_code);
                             self.status.on_reset().ok();
-                            self.reassembler.reset();
+                            // Only clear the reassembler immediately when it is
+                            // already empty.  If data was buffered before the
+                            // reset arrived, leave it intact so poll_read_into_inner
+                            // can drain it to the application first (TCP semantics:
+                            // data in the receive buffer before a RST is readable).
+                            if self.reassembler.is_empty() {
+                                self.reassembler.reset();
+                            }
                             let reset_error: ResetError = error_code.into();
                             return Poll::Ready(Err(io::Error::new(
                                 io::ErrorKind::ConnectionReset,
