@@ -194,6 +194,10 @@ impl Map {
     /// Returns `(tail_pn, frames)`. The frames queue may be empty if the tail entry
     /// was already ACKed and removed in the same ACK range (both shell and probe PN
     /// acknowledged simultaneously).
+    ///
+    /// **Note**: This method leaves ghost entries in the map (empty frames, no `probed_to`).
+    /// Prefer [`drain_chain_from`] for production ACK processing, which also removes all
+    /// visited entries to prevent spurious PTO and loss detection.
     pub fn take_chain_tail_frames(&mut self, mut pn: PacketNumber) -> (PacketNumber, Queue<Frame>) {
         // Walk the chain to the tail (first entry with no probed_to link).
         loop {
@@ -208,6 +212,50 @@ impl Map {
             .map(|p| core::mem::take(&mut p.frames))
             .unwrap_or_default();
         (pn, frames)
+    }
+
+    /// Walk the probe chain from `start_pn` to the tail, removing every entry visited
+    /// (including `start_pn` and all intermediates), and return:
+    ///
+    /// - The frames from the tail entry (these are the live ack-eliciting frames to complete).
+    /// - All [`TransmissionInfo`]s collected from removed entries, in chain order, so the
+    ///   caller can pass them to the CCA to keep bytes-in-flight accounting accurate.
+    ///
+    /// If `start_pn` is not in the map (the tail was already ACKed and removed by Phase 1
+    /// in the same ACK range), this returns empty frames and no `TransmissionInfo`.
+    ///
+    /// This is the correct replacement for [`take_chain_tail_frames`] in production ACK
+    /// processing: it avoids ghost entries that would otherwise keep the PTO wheel armed
+    /// and eventually trigger spurious `on_packet_lost` calls.
+    pub fn drain_chain_from(
+        &mut self,
+        mut pn: PacketNumber,
+    ) -> (Queue<Frame>, Vec<TransmissionInfo>) {
+        let mut tx_infos = Vec::new();
+        loop {
+            // Peek at probed_to before the mutable removal so we know where to walk next.
+            let next_pn = self.inner.get(pn).and_then(|p| p.probed_to);
+
+            // Remove the current entry from the map, collecting its frames and tx_info.
+            let mut frames = Queue::default();
+            for (_, mut packet) in self.remove_range(PacketNumberRange::new(pn, pn)) {
+                frames = core::mem::take(&mut packet.frames);
+                if let Some(info) = packet.transmission_info.take() {
+                    tx_infos.push(info);
+                }
+            }
+
+            match next_pn {
+                Some(next) => {
+                    // Intermediate node (shell): frames should be empty, advance.
+                    pn = next;
+                }
+                None => {
+                    // Tail node: its frames are the ones to complete.
+                    return (frames, tx_infos);
+                }
+            }
+        }
     }
 }
 
@@ -522,6 +570,154 @@ mod tests {
         map.set_probed_to(pn1, pn2); // now pn1 is a valid shell (probed_to is Some)
         // Should not panic: pn1 has probed_to, pn2 has non-empty frames
         map.invariants();
+    }
+
+    // ── Bug regression: ghost probe entry after shell ACK ─────────────────────
+
+    /// Regression test for the "ghost probe entry" bug.
+    ///
+    /// **Bug (fixed)**: The original `take_chain_tail_frames` took frames from the
+    /// probe entry but did **not** remove the entry from the inflight map.  The entry
+    /// remained as a "ghost": empty `frames` queue and no `probed_to` link but still
+    /// with a valid `transmission_info`.  The ghost entry:
+    ///
+    /// 1. Kept `has_inflight()` returning `true` despite no un-acknowledged work
+    ///    remaining — the PTO wheel therefore stayed armed and fired spurious probes.
+    /// 2. Violated the inflight invariant (non-shell entry with empty frames).
+    /// 3. Once further packets were sent and acknowledged at a sufficiently high PN,
+    ///    the ghost fell inside the PN-threshold loss window and `on_packet_lost`
+    ///    was called spuriously, reducing the congestion window unnecessarily.
+    ///
+    /// **Fix**: Replace `take_chain_tail_frames` with `drain_chain_from` in ACK Phase 2.
+    /// `drain_chain_from` removes every entry in the chain from the inflight map, so no
+    /// ghost entries are left behind.
+    #[test]
+    fn ack_shell_leaves_ghost_probe_entry() {
+        let mut map = Map::new(make_gauge());
+        let pn_shell = make_pn(0);
+        let pn_probe = make_pn(8); // mirrors the +4 PN skip used by the assembler
+        let now = unsafe {
+            s2n_quic_core::time::Timestamp::from_duration(Duration::from_millis(100))
+        };
+
+        // Insert original packet.
+        map.insert(pn_shell, make_packet(fake_entry()));
+
+        // Simulate PTO probe assembly: take frames from shell, re-insert at probe
+        // PN, and link shell → probe.
+        let (_taken_pn, probe_frames) = map.take_oldest_for_probe().expect("has entry");
+        let mut cca = crate::congestion::Controller::new(1500);
+        let rtt = RttEstimator::new(Duration::from_millis(2));
+        let cc_info = cca.on_packet_sent(now, 100, false, &rtt);
+        map.insert(
+            pn_probe,
+            Packet::new(
+                probe_frames,
+                TransmissionInfo {
+                    cc_info,
+                    time_sent: now,
+                    sent_bytes: 100,
+                },
+            ),
+        );
+        map.set_probed_to(pn_shell, pn_probe);
+
+        // Simulate ACK processing Phase 1: ACK range covers the shell only.
+        let acked: Vec<_> = map
+            .remove_range(PacketNumberRange::new(pn_shell, pn_shell))
+            .collect();
+        assert_eq!(acked.len(), 1, "shell must be removed from inflight");
+        // Retrieve the probed_to pointer that Phase 1 pushes into `deferred`.
+        let probe_follow_pn = acked[0]
+            .1
+            .probed_to
+            .expect("shell must carry probed_to link");
+        assert_eq!(probe_follow_pn, pn_probe);
+
+        // Simulate ACK processing Phase 2 using the FIXED drain_chain_from.
+        let (drained_frames, _tx_infos) = map.drain_chain_from(probe_follow_pn);
+        assert!(
+            !drained_frames.is_empty(),
+            "chain tail must yield the live frames"
+        );
+
+        // All data carried by the probe chain is now acknowledged.  The inflight
+        // map must be empty — `drain_chain_from` removes the probe entry so no
+        // ghost remains to keep the PTO wheel armed or trigger spurious loss detection.
+        assert!(
+            !map.has_inflight(),
+            "inflight map must be empty after drain_chain_from; \
+             ghost probe entry would keep PTO wheel armed and trigger spurious \
+             on_packet_lost calls"
+        );
+    }
+
+    /// No spurious loss detection after using drain_chain_from.
+    ///
+    /// With the old buggy `take_chain_tail_frames`, the probe entry (pn_probe=8)
+    /// would remain in the map as a ghost after the shell is ACKed.  Any subsequent
+    /// ACK with `max_acked_pn >= 11` would put pn_probe inside the PN-threshold loss
+    /// range (max_acked - 3 = 8), causing `on_packet_lost` to fire for data that was
+    /// already acknowledged — an unnecessary CWND reduction.
+    ///
+    /// This test verifies that using `drain_chain_from` (the fix) removes the probe
+    /// entry so loss detection never sees it.
+    #[test]
+    fn ghost_probe_entry_eligible_for_spurious_loss_detection() {
+        let mut map = Map::new(make_gauge());
+        let pn_shell = make_pn(0);
+        let pn_probe = make_pn(8);
+        let now = unsafe {
+            s2n_quic_core::time::Timestamp::from_duration(Duration::from_millis(100))
+        };
+
+        map.insert(pn_shell, make_packet(fake_entry()));
+        let (_taken, probe_frames) = map.take_oldest_for_probe().unwrap();
+        let mut cca = crate::congestion::Controller::new(1500);
+        let rtt = RttEstimator::new(Duration::from_millis(2));
+        let cc_info = cca.on_packet_sent(now, 100, false, &rtt);
+        map.insert(
+            pn_probe,
+            Packet::new(
+                probe_frames,
+                TransmissionInfo {
+                    cc_info,
+                    time_sent: now,
+                    sent_bytes: 100,
+                },
+            ),
+        );
+        map.set_probed_to(pn_shell, pn_probe);
+
+        // ACK the shell; use the FIXED drain_chain_from for Phase 2.
+        let acked: Vec<_> = map
+            .remove_range(PacketNumberRange::new(pn_shell, pn_shell))
+            .collect();
+        let follow_pn = acked[0].1.probed_to.unwrap();
+        let _ = map.drain_chain_from(follow_pn);
+
+        // Insert a fresh packet at PN 12.  With the fix, the probe entry at PN 8
+        // is gone.  Loss detection for max_acked=12 (range [0,9]) must find nothing.
+        let fresh_pn = make_pn(12);
+        map.insert(fresh_pn, make_packet(fake_entry()));
+
+        // Simulate PN-threshold loss detection for max_acked = 12.
+        // Loss range = PNs <= 12 - 3 = 9.
+        let loss_range = PacketNumberRange::new(make_pn(0), make_pn(9));
+        let losses: Vec<_> = map.remove_range(loss_range).collect();
+
+        // With the fix (drain_chain_from), the probe at pn=8 was already removed.
+        // Loss detection must not find it — no spurious on_packet_lost call.
+        let probe_pn_u64 = pn_probe.as_u64();
+        let ghost_declared_lost = losses
+            .iter()
+            .any(|(pn, _)| pn.as_u64() == probe_pn_u64);
+        assert!(
+            !ghost_declared_lost,
+            "probe entry at pn={probe_pn_u64} should have been removed by drain_chain_from; \
+             finding it in the loss range indicates a regression — data already acknowledged \
+             would trigger a spurious on_packet_lost and unnecessary CWND reduction"
+        );
     }
 }
 

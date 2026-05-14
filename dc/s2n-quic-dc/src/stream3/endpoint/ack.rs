@@ -20,7 +20,6 @@ use crate::{
         frame::{self, Frame, TransmissionStatus},
     },
 };
-use arrayvec::ArrayVec;
 use core::time::Duration;
 use s2n_quic_core::{
     frame::{
@@ -69,13 +68,8 @@ pub(crate) fn process_ack<Clk, Rand>(
         // Shell entries (probed_to.is_some()) have empty `frames`; the live frames
         // reside at the tail of the probe chain at a higher PN. We defer chain
         // following until after the iterator is dropped (so the borrow on
-        // `context.inflight` is released) and use a small fixed-size ArrayVec
-        // (no heap allocation, no zeroed-memory initialisation) to record which
-        // chain heads to follow.
-        //
-        // The maximum number of shells in a single ACK range is bounded by the PTO
-        // backoff cap (16×, ~4 doublings), so 8 slots is more than sufficient.
-        let mut deferred: ArrayVec<PacketNumber, 8> = ArrayVec::new();
+        // `context.inflight` is released).
+        let mut deferred: Vec<PacketNumber> = Vec::new();
 
         for (num, mut packet) in context.inflight.remove_range(range) {
             if let Some(tx_info) = packet.transmission_info.take() {
@@ -104,10 +98,7 @@ pub(crate) fn process_ack<Clk, Rand>(
             if let Some(probe_pn) = packet.probed_to {
                 // Shell: the live frames are at the tail of the probe chain.
                 // Defer completion to Phase 2 (after the iterator is dropped).
-                // If we somehow exceed capacity, the tail frames will remain in
-                // the inflight map and be completed when the probe entry itself
-                // is ACKed or swept by loss detection.
-                let _ = deferred.try_push(probe_pn);
+                deferred.push(probe_pn);
             } else {
                 for mut entry in packet.frames {
                     entry.status = TransmissionStatus::Acknowledged;
@@ -117,12 +108,32 @@ pub(crate) fn process_ack<Clk, Rand>(
         }
         // remove_range iterator is dropped here; borrow on `context.inflight` released.
 
-        // Phase 2: follow deferred probe chains and complete the tail frames.
-        for probe_pn in &deferred {
-            let (_, tail_frames) = context.inflight.take_chain_tail_frames(*probe_pn);
+        // Phase 2: drain deferred probe chains.
+        //
+        // `drain_chain_from` walks from the deferred PN to the tail, removes every
+        // entry visited (preventing ghost entries that would otherwise keep the PTO
+        // wheel armed and trigger spurious loss detection), and returns the tail's
+        // live frames together with the TransmissionInfos of all removed entries so
+        // that bytes-in-flight accounting stays accurate.
+        for probe_pn in deferred {
+            let (tail_frames, chain_tx_infos) = context.inflight.drain_chain_from(probe_pn);
             for mut entry in tail_frames {
                 entry.status = TransmissionStatus::Acknowledged;
                 let _ = completed.send(entry);
+            }
+            // Account for the implicitly-acknowledged probe entries in CCA.
+            for tx_info in chain_tx_infos {
+                let time_sent = tx_info.time_sent;
+                max_acked_tx_time = max_acked_tx_time.max(Some(time_sent));
+                bytes_acked += tx_info.sent_bytes as usize;
+                if cca_args
+                    .as_ref()
+                    .map_or(true, |(prev_time, _): &(_, congestion::PacketInfo)| {
+                        *prev_time < time_sent
+                    })
+                {
+                    cca_args = Some((time_sent, tx_info.cc_info));
+                }
             }
         }
     }
@@ -269,5 +280,224 @@ fn detect_loss<Rand>(
             rtt = ?context.rtt_estimator.smoothed_rtt(),
             "Loss detection triggered"
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        byte_vec::ByteVec,
+        counter::Registry,
+        intrusive_queue::Queue,
+        packet::datagram::QueuePair,
+        path::secret::map::Entry as PathSecretEntry,
+        stream3::{
+            endpoint::{
+                counters,
+                inflight::{Packet, TransmissionInfo},
+                send,
+            },
+            frame::{Frame, Header, TransmissionStatus, DEFAULT_TTL},
+        },
+        xorshift::Rng,
+    };
+    use bytes::Bytes;
+    use core::time::Duration;
+    use s2n_quic_core::{
+        ack,
+        packet::number::PacketNumberSpace,
+        recovery::RttEstimator,
+        varint::VarInt,
+    };
+    use std::sync::Arc;
+
+    fn make_pn(n: u64) -> PacketNumber {
+        PacketNumberSpace::Initial.new_packet_number(VarInt::new(n).unwrap())
+    }
+
+    fn make_frame() -> crate::intrusive_queue::Entry<Frame> {
+        let entry = PathSecretEntry::fake("127.0.0.1:9999".parse().unwrap(), None);
+        let mut payload = ByteVec::new();
+        payload.push_back(Bytes::from_static(b"x"));
+        Frame {
+            header: Header::FlowData {
+                queue_pair: QueuePair {
+                    source_queue_id: VarInt::from_u8(1),
+                    dest_queue_id: VarInt::from_u8(2),
+                },
+                stream_id: VarInt::from_u8(1),
+                offset: VarInt::ZERO,
+                is_fin: false,
+            },
+            source_sender_id: VarInt::MAX,
+            payload,
+            path_secret_entry: entry,
+            completion: None,
+            status: TransmissionStatus::default(),
+            ttl: DEFAULT_TTL,
+            transmission_time: None,
+        }
+        .into()
+    }
+
+    fn make_send_context(registry: &Registry) -> send::Context {
+        let entry = PathSecretEntry::fake("127.0.0.1:9999".parse().unwrap(), None);
+        let inflight_gauge = registry.register_queue_gauge("test.inflight");
+        let ack_gauge = registry.register_queue_gauge("test.ack");
+        let pending_gauge = registry.register_queue_gauge("test.pending");
+        send::Context::new(&entry, inflight_gauge, ack_gauge, pending_gauge, 0)
+    }
+
+    /// Regression test for the deferred-chain overflow bug.
+    ///
+    /// `process_ack` uses an `ArrayVec<PacketNumber, 8>` (called `deferred`) to buffer
+    /// the `probed_to` targets of shell entries found in each ACK range iteration.
+    /// Phase 2 then follows each deferred entry to complete the live frames at the chain
+    /// tail.
+    ///
+    /// **Bug**: `deferred.try_push` silently discards any entry beyond the 8th when the
+    /// array is full.  If a single contiguous ACK range covers 9 or more shell entries,
+    /// the 9th (and beyond) probe chains are never followed.  The frames at those chain
+    /// tails are stuck in the inflight map:
+    ///
+    /// - The writer's completion callback is never invoked for those frames.
+    /// - The stuck entries linger until loss detection eventually removes them, at which
+    ///   point they trigger spurious `on_packet_lost` calls (unnecessary CWND reduction)
+    ///   and the frames may be retransmitted even though the data was acknowledged.
+    ///
+    /// The comment in the source code states that 8 slots is "more than sufficient"
+    /// because the PTO backoff cap bounds the *depth* of a single probe chain.  This is
+    /// incorrect: the PTO backoff cap limits how many times *one* original packet can be
+    /// probed, not how many distinct shell entries can appear in a single ACK range.  A
+    /// burst of 9+ original packets that each received one PTO probe before a large ACK
+    /// arrives is a realistic production scenario (e.g. after a brief network outage).
+    #[test]
+    fn process_ack_completes_all_nine_shells_in_one_range() {
+        const NUM_SHELLS: u64 = 9; // one more than the ArrayVec<_, 8> capacity
+
+        let registry = Registry::default();
+        let counters = counters::Send::new(&registry);
+        let mut rng = Rng::new();
+        let mut ctx = make_send_context(&registry);
+
+        // Fixed timestamp for all CCA bookkeeping.
+        let now: s2n_quic_core::time::Timestamp =
+            unsafe { s2n_quic_core::time::Timestamp::from_duration(Duration::from_millis(100)) };
+        let rtt = RttEstimator::new(Duration::from_millis(2));
+
+        // The inflight map requires strictly monotonically increasing packet numbers.
+        // Strategy: insert ALL original packets first (PNs 0..NUM_SHELLS-1), then
+        // probe each in order (PNs NUM_SHELLS..2*NUM_SHELLS-1).  This guarantees the
+        // PN sequence is always increasing when we insert.
+        //
+        //   PNs 0..NUM_SHELLS-1   : original (will become shells)
+        //   PNs NUM_SHELLS..2*NUM_SHELLS-1 : probes
+        //
+        // All shells have consecutive PNs 0..NUM_SHELLS-1, so a single contiguous ACK
+        // range [0, NUM_SHELLS-1] causes a single iteration of the
+        // `for range in ack.ack_ranges()` loop — where `deferred` lives — and the
+        // 9th try_push silently overflows.
+        //
+        // Use ctx.cca for all on_packet_sent calls so the CCA state stays consistent
+        // with what process_ack's on_packet_ack will see.
+
+        // Step 1: insert all original packets.
+        for i in 0..NUM_SHELLS {
+            let shell_pn = make_pn(i);
+            let mut frames = Queue::new();
+            frames.push_back(make_frame());
+            let cc_info = ctx.cca.on_packet_sent(now, 100, false, &rtt);
+            ctx.inflight.insert(
+                shell_pn,
+                Packet::new(
+                    frames,
+                    TransmissionInfo {
+                        cc_info,
+                        time_sent: now,
+                        sent_bytes: 100,
+                    },
+                ),
+            );
+        }
+
+        // Step 2: simulate PTO for each original packet in order.
+        // take_oldest_for_probe always returns the smallest PN with non-empty frames,
+        // which is exactly make_pn(i) during each iteration.
+        for i in 0..NUM_SHELLS {
+            let shell_pn = make_pn(i);
+            let probe_pn = make_pn(NUM_SHELLS + i); // always > max existing PN
+
+            let (taken_pn, probe_frames) = ctx.inflight.take_oldest_for_probe().unwrap();
+            assert_eq!(taken_pn, shell_pn, "must take PN {i}");
+
+            let cc_probe = ctx.cca.on_packet_sent(now, 100, false, &rtt);
+            ctx.inflight.insert(
+                probe_pn,
+                Packet::new(
+                    probe_frames,
+                    TransmissionInfo {
+                        cc_info: cc_probe,
+                        time_sent: now,
+                        sent_bytes: 100,
+                    },
+                ),
+            );
+            ctx.inflight.set_probed_to(shell_pn, probe_pn);
+        }
+
+        // Build a single contiguous ACK range covering all NUM_SHELLS shell PNs.
+        // Using one range ensures every shell falls inside the same `deferred`
+        // ArrayVec instance and the overflow is triggered.
+        let mut ack_ranges = ack::Ranges::new(usize::MAX);
+        ack_ranges
+            .insert_packet_number_range(PacketNumberRange::new(
+                make_pn(0),
+                make_pn(NUM_SHELLS - 1),
+            ))
+            .expect("range fits");
+        let ack_frame = quic_frame::Ack {
+            ack_delay: VarInt::ZERO,
+            ack_ranges: &ack_ranges,
+            ecn_counts: None,
+        };
+
+        // Sink for completed, lost, and cancelled frames.
+        let mut completed: Queue<Frame> = Queue::new();
+        let mut lost: Queue<Frame> = Queue::new();
+        let mut cancelled: Queue<Frame> = Queue::new();
+
+        process_ack(
+            &ack_frame,
+            &mut ctx,
+            &counters,
+            &mut completed,
+            &mut lost,
+            &mut cancelled,
+            &now, // precision::Timestamp implements s2n_quic_core::time::Clock
+            &mut rng,
+        );
+
+        // Each probe had exactly one data frame, so we expect NUM_SHELLS completions.
+        let completed_count = completed.len();
+        assert_eq!(
+            completed_count,
+            NUM_SHELLS as usize,
+            "all {NUM_SHELLS} chain tails must be completed after one ACK range \
+             covering all {NUM_SHELLS} shells; only {completed_count} were — \
+             deferred ArrayVec<PacketNumber, 8> silently dropped entry #9 (overflow)"
+        );
+
+        // No probe entries should be left with un-drained frames.
+        for i in 0..NUM_SHELLS {
+            let probe_pn = make_pn(100 + i);
+            if let Some(packet) = ctx.inflight.get_mut(probe_pn) {
+                assert!(
+                    packet.frames.is_empty(),
+                    "probe entry at PN {} has un-drained frames — chain completion was skipped",
+                    100 + i
+                );
+            }
+        }
     }
 }
