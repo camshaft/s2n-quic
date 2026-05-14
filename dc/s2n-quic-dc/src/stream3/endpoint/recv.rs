@@ -108,6 +108,34 @@ impl crate::clock::wheel::WheelAdapter for AckWheelAdapter {
     }
 }
 
+pub(crate) struct AckBurstAdapter;
+
+impl crate::intrusive_queue::Adapter for AckBurstAdapter {
+    type Value = RefCell<Context>;
+    type Target = RefCell<Context>;
+    type Pointer = Rc<RefCell<Context>>;
+
+    unsafe fn links(value: *mut Self::Value) -> *mut intrusive_queue::Links {
+        core::ptr::addr_of_mut!((*(*value).as_ptr()).ack_burst)
+    }
+
+    unsafe fn target(value: *mut Self::Value) -> *mut Self::Target {
+        value
+    }
+
+    fn as_ptr(ptr: &Self::Pointer) -> *const Self::Value {
+        Rc::as_ptr(ptr)
+    }
+
+    fn into_raw(ptr: Self::Pointer) -> *mut Self::Value {
+        Rc::into_raw(ptr) as *mut Self::Value
+    }
+
+    unsafe fn from_raw(ptr: *mut Self::Value) -> Self::Pointer {
+        Rc::from_raw(ptr)
+    }
+}
+
 /// Attempt deduplication window for tracking seen attempt_ids.
 ///
 /// Uses a sliding window to efficiently deduplicate FlowInit packets within
@@ -171,9 +199,6 @@ pub(crate) struct Context {
     pub dedup_filter: crate::stream::recv::ack::StreamFilter,
     /// Lightweight ACK range tracker for the direct ACK path.
     pub ack_ranges: ack_ranges::AckRanges,
-    /// Writer handle to the shared ACK state. Updated when ranges change;
-    /// the send worker reads the latest snapshot at assembly time.
-    pub ack_writer: ack_state::Writer,
     /// Which local sender_id outgoing ACKs for this peer route through.
     pub dest_sender_id: VarInt,
     /// Accumulated ECN counts for received packets, reported back to the sender
@@ -188,6 +213,8 @@ pub(crate) struct Context {
     pub flows: flow::Tracker,
     /// Intrusive links for ACK batching wheel
     pub ack_wheel: AckWheelLinks,
+    /// Intrusive links for recv-worker pending-ACK burst queue membership.
+    pub ack_burst: intrusive_queue::Links,
 }
 
 impl Context {
@@ -208,7 +235,6 @@ impl Context {
         idle_timer.set(now + idle_timeout);
 
         let flows = flow::Tracker::new(*path_entry.id());
-        let (ack_writer, _ack_reader) = ack_state::channel();
 
         Self {
             path_entry,
@@ -217,7 +243,6 @@ impl Context {
             current_key_id: key_id,
             dedup_filter: Default::default(),
             ack_ranges: Default::default(),
-            ack_writer,
             dest_sender_id,
             ecn_counts: Default::default(),
             idle_timer,
@@ -226,6 +251,7 @@ impl Context {
             attempt_dedup: AttemptDedup::new(),
             flows,
             ack_wheel: AckWheelLinks::new(),
+            ack_burst: intrusive_queue::Links::new(),
         }
     }
 
@@ -245,7 +271,7 @@ impl Context {
         self.idle_timer.poll_expiration(clock.get_time()).is_ready()
     }
 
-    /// Update the shared ACK state and produce a submission for the direct ACK path.
+    /// Encode the current ACK state and produce a direct submission for the send worker.
     ///
     /// Only produces a submission when ack_state is Scheduled (new packets arrived
     /// since the last submission). Transitions to Flushed after submitting to enforce
@@ -253,7 +279,7 @@ impl Context {
     /// whether ack_state went back to Scheduled (new packets arrived) and re-submits.
     ///
     /// Returns `None` if there are no ranges or an ACK is already in flight.
-    pub fn update_ack_state(&mut self, recv_worker_id: usize) -> Option<ack_state::Submission> {
+    pub fn encode_and_flush(&mut self, recv_worker_id: usize) -> Option<ack_state::Submission> {
         if !self.ack_state.is_scheduled() {
             return None;
         }
@@ -273,12 +299,12 @@ impl Context {
             return None;
         };
 
-        self.ack_writer
-            .update(body, largest_recv_time.into(), has_ecn);
         let _ = self.ack_state.on_flush();
 
         Some(ack_state::Submission {
-            reader: self.ack_writer.reader(),
+            body,
+            largest_recv_time: largest_recv_time.into(),
+            has_ecn,
             path_secret_entry: self.path_entry.clone(),
             local_sender_id: self.dest_sender_id,
             remote_sender_id: self.remote_sender_id,
@@ -303,7 +329,7 @@ impl core::hash::Hash for Key {
 
 /// Per-worker sender state cache.
 pub(crate) struct Cache {
-    pub senders: FxHashMap<Key, Context>,
+    pub senders: FxHashMap<Key, Rc<RefCell<Context>>>,
     pub idle_timeout: Duration,
     pub worker_id: usize,
 }
@@ -326,7 +352,7 @@ impl Cache {
         clock: &Clk,
         control_out: &mut Vec<u8>,
         route: &Route,
-    ) -> Option<(&mut Context, bool)>
+    ) -> Option<(Rc<RefCell<Context>>, bool)>
     where
         Clk: s2n_quic_core::time::Clock + ?Sized,
         Route: super::routing::SenderRoute,
@@ -337,7 +363,7 @@ impl Cache {
         };
 
         Some(match self.senders.entry(key) {
-            hash_map::Entry::Occupied(entry) => (entry.into_mut(), true),
+            hash_map::Entry::Occupied(entry) => (entry.get().clone(), true),
             hash_map::Entry::Vacant(entry) => {
                 tracing::debug!(%credentials, %remote_sender_id, worker_id = self.worker_id, "opener_for_credentials");
                 let (opener, path_entry) =
@@ -345,7 +371,7 @@ impl Cache {
 
                 let dest_sender_id = route.sender_id_for_ack(&credentials.id, remote_sender_id);
 
-                let ctx = entry.insert(Context::new(
+                let ctx = Rc::new(RefCell::new(Context::new(
                     path_entry,
                     remote_sender_id,
                     dest_sender_id,
@@ -353,7 +379,8 @@ impl Cache {
                     credentials.key_id,
                     clock,
                     self.idle_timeout,
-                ));
+                )));
+                entry.insert(ctx.clone());
                 (ctx, false)
             }
         })
@@ -364,6 +391,6 @@ impl Cache {
     where
         Clk: s2n_quic_core::time::Clock + ?Sized,
     {
-        self.senders.retain(|_, state| !state.is_expired(clock));
+        self.senders.retain(|_, state| !state.borrow_mut().is_expired(clock));
     }
 }

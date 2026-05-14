@@ -28,7 +28,7 @@ use crate::{
     },
 };
 use core::{future::poll_fn, task::Poll};
-use s2n_quic_core::{assume, varint::VarInt};
+use s2n_quic_core::{assume, ready, varint::VarInt};
 use std::{cell::RefCell, rc::Rc, sync::Arc};
 
 /// Default per-poll budget for [`socket_recv_task`]: process up to this many segments before
@@ -519,12 +519,13 @@ pub async fn socket_recv_task<Socket, R>(
 /// - **Queue depth metric** (`q.datagram`): stream2 wraps the input queue in `GaugedQueue`.
 ///   Add once the counter infrastructure is available per-worker.
 pub async fn packet_dispatch_task<PacketRx, AckTx, WakerSink, Clk, Route>(
-    packet_rx: PacketRx,
+    mut packet_rx: PacketRx,
     recv_cache: Rc<RefCell<endpoint::recv::Cache>>,
+    pending_acks: Rc<RefCell<crate::intrusive_queue::List<endpoint::recv::AckBurstAdapter>>>,
     path_secret_map: crate::path::secret::Map,
     acceptor_registry: crate::acceptor::Registry<crate::stream3::Stream>,
     frame_tx: crate::stream3::frame::SubmissionSender,
-    ack_sender: AckTx,
+    mut ack_sender: AckTx,
     queue_dispatcher: msg::queue::Dispatcher,
     counters: Arc<endpoint::counters::Dispatch>,
     clock: Clk,
@@ -540,19 +541,27 @@ pub async fn packet_dispatch_task<PacketRx, AckTx, WakerSink, Clk, Route>(
     Clk: s2n_quic_core::time::Clock + precision::Clock,
     Route: endpoint::routing::SenderRoute,
 {
-    // Response frames (ACKs sent back to peers) re-enter via the same submission channel.
-    // TODO: route responses through a dedicated channel + RetransmissionBatcher (see above).
-    let rx = Map::new(packet_rx, {
-        let mut response_tx = frame_tx.clone();
-        let mut ack_sender = ack_sender;
-        let mut queue_dispatcher = queue_dispatcher;
-        let counters = counters.clone();
+    let mut response_tx = frame_tx.clone();
+    let mut queue_dispatcher = queue_dispatcher;
+    let recv_worker_id = recv_cache.borrow().worker_id;
+    let budget = budgets.packet_dispatch;
 
-        move |packet| {
+    poll_fn(move |cx| {
+        for _ in 0..budget {
+            let Some(packet) = ready!(packet_rx.poll_recv(cx)) else {
+                flush_pending_acks(
+                    &mut pending_acks.borrow_mut(),
+                    &mut ack_sender,
+                    recv_worker_id,
+                );
+                return Poll::Ready(());
+            };
+
             counters.rx_data_pkt.add(1);
-            dispatch::process(
+            let result = dispatch::process(
                 packet,
                 &mut recv_cache.borrow_mut(),
+                &mut pending_acks.borrow_mut(),
                 &path_secret_map,
                 &acceptor_registry,
                 &frame_tx,
@@ -563,14 +572,21 @@ pub async fn packet_dispatch_task<PacketRx, AckTx, WakerSink, Clk, Route>(
                 &counters,
                 &route,
                 &mut waker_sink,
-            )
+            );
+            if let Err(err) = result {
+                on_packet_dispatch_error(&counters, err);
+            }
         }
-    });
-    let rx = InspectErr::new(rx, {
-        let counters = counters;
-        move |err| on_packet_dispatch_error(&counters, err)
-    });
-    rx.drain_budgeted(Some(budgets.packet_dispatch)).await;
+
+        flush_pending_acks(
+            &mut pending_acks.borrow_mut(),
+            &mut ack_sender,
+            recv_worker_id,
+        );
+        cx.waker().wake_by_ref();
+        Poll::Pending
+    })
+    .await;
 }
 
 /// Drains offloaded wakers from dispatch workers, invoking each one.
@@ -587,14 +603,12 @@ pub async fn waker_drain_task(drain: endpoint::waker::Drain, budgets: Budgets) {
 /// For each returned entry, looks up the recv context and checks if new packets arrived
 /// while the ACK was in flight. If stale (ack_state went back to Scheduled), re-submits
 /// a fresh PendingAck. Otherwise transitions Flushed → Idle.
-pub async fn ack_completion_task<AckTx>(
+pub async fn ack_completion_task(
     completion_rx: impl Receiver<Entry<msg::Sender>>,
     recv_cache: Rc<RefCell<endpoint::recv::Cache>>,
-    mut ack_sender: AckTx,
+    pending_acks: Rc<RefCell<crate::intrusive_queue::List<endpoint::recv::AckBurstAdapter>>>,
     budgets: Budgets,
-) where
-    AckTx: UnboundedSender<Entry<msg::Sender>>,
-{
+) {
     let rx = Map::new(completion_rx, move |entry: Entry<msg::Sender>| {
         let msg::Sender::PendingAck(ref submission) = *entry else {
             return;
@@ -605,32 +619,39 @@ pub async fn ack_completion_task<AckTx>(
             remote_sender_id: submission.remote_sender_id,
         };
 
-        let mut cache = recv_cache.borrow_mut();
-        let Some(ctx) = cache.senders.get_mut(&key) else {
-            return;
+        let ctx_rc = {
+            let cache = recv_cache.borrow();
+            let Some(ctx) = cache.senders.get(&key) else {
+                return;
+            };
+            ctx.clone()
         };
+        let mut ctx = ctx_rc.borrow_mut();
 
         if ctx.ack_state.is_scheduled() {
-            // New packets arrived while in flight — re-submit.
-            let mtu = ctx.path_entry.max_datagram_size() as usize;
-            let max_body_len = mtu.saturating_sub(endpoint::recv::ack_ranges::PACKET_OVERHEAD);
-            let _ = ctx.ack_state.on_flush();
-            ctx.ack_writer.update(
-                ctx.ack_ranges
-                    .encode_body(ctx.ecn_counts.as_option(), max_body_len)
-                    .unwrap_or_default(),
-                ctx.ack_ranges
-                    .largest_recv_time()
-                    .map(Into::into)
-                    .unwrap_or(crate::clock::precision::Timestamp { nanos: 0 }),
-                ctx.ecn_counts.as_option().is_some(),
-            );
-            let _ = ack_sender.send(entry);
+            if !ctx.ack_burst.is_linked() {
+                pending_acks.borrow_mut().push_back(ctx_rc.clone());
+            }
         } else {
             let _ = ctx.ack_state.on_completion_idle();
         }
     });
     rx.drain_budgeted(Some(budgets.ack_completion)).await;
+}
+
+fn flush_pending_acks<AckTx>(
+    pending: &mut crate::intrusive_queue::List<endpoint::recv::AckBurstAdapter>,
+    ack_sender: &mut AckTx,
+    recv_worker_id: usize,
+) where
+    AckTx: UnboundedSender<Entry<msg::Sender>>,
+{
+    while let Some(ctx_rc) = pending.pop_front() {
+        let mut ctx = ctx_rc.borrow_mut();
+        if let Some(submission) = ctx.encode_and_flush(recv_worker_id) {
+            let _ = ack_sender.send(Entry::new(msg::Sender::PendingAck(submission)));
+        }
+    }
 }
 
 fn on_packet_dispatch_error(counters: &endpoint::counters::Dispatch, err: dispatch::Error) {
