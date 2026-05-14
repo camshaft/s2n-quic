@@ -32,6 +32,7 @@ use crate::{
 };
 use bytes::BytesMut;
 use s2n_quic_core::varint::VarInt;
+use std::{cell::RefCell, rc::Rc};
 
 const UNSET_SOURCE_SENDER_ID: VarInt = VarInt::MAX;
 
@@ -62,7 +63,7 @@ pub(crate) enum Error {
 pub(crate) fn process<Clk, Route>(
     packet: Entry<packet::datagram::decoder::Packet<descriptor::Filled>>,
     recv_cache: &mut recv::Cache,
-    pending_acks: &mut crate::intrusive_queue::List<recv::AckBurstAdapter>,
+    ack_burst_tx: &mut impl channel::UnboundedSender<Rc<RefCell<recv::Context>>>,
     path_secret_map: &PathSecretMap,
     acceptor_registry: &acceptor::Registry<Stream>,
     frame_tx: &SubmissionSender,
@@ -258,7 +259,7 @@ where
     drop(peer);
 
     if enqueue_pending_ack {
-        pending_acks.push_back(peer_rc);
+        let _ = ack_burst_tx.send(peer_rc);
     }
 
     let _ = response_tx.send(response_frames);

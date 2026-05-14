@@ -680,15 +680,14 @@ where
                 let recv_cache = std::rc::Rc::new(std::cell::RefCell::new(
                     crate::stream3::endpoint::recv::Cache::new(idle_timeout, recv_dispatch_idx),
                 ));
-                let pending_acks = std::rc::Rc::new(std::cell::RefCell::new(
-                    crate::intrusive_queue::List::<
+                let (ack_burst_tx, ack_burst_rx) =
+                    crate::socket::channel::intrusive_queue::unsync::new_with_adapter::<
                         crate::stream3::endpoint::recv::AckBurstAdapter,
-                    >::new(),
-                ));
+                    >();
                 local.spawn(tasks::packet_dispatch_task(
                     packet_rx,
                     recv_cache.clone(),
-                    pending_acks.clone(),
+                    ack_burst_tx,
                     rd.path_secret_map,
                     rd.acceptor_registry,
                     rd.frame_tx,
@@ -700,10 +699,16 @@ where
                     rd.waker_sink,
                     budgets,
                 ));
+                local.spawn(tasks::ack_burst_task(
+                    crate::socket::channel::FlattenList::new(ack_burst_rx.into_list_receiver()),
+                    rd.ack_sender.clone(),
+                    recv_dispatch_idx,
+                    budgets,
+                ));
                 local.spawn(tasks::ack_completion_task(
                     rd.ack_completion_rx,
                     recv_cache,
-                    pending_acks,
+                    rd.ack_sender,
                     budgets,
                 ));
             }
