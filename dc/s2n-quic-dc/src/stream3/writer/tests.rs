@@ -19,7 +19,7 @@ use crate::{
 use bytes::Bytes;
 use s2n_codec::EncoderValue;
 use s2n_quic_core::{endpoint, frame::MaxData, varint::VarInt};
-use std::{net::SocketAddr, time::Duration};
+use std::{net::SocketAddr, task::Poll, time::Duration};
 
 // ─── Test helpers ─────────────────────────────────────────────────────────────
 
@@ -213,6 +213,7 @@ fn client_second_write_blocks_until_max_data() {
             assert!(matches!(sent[0].header, Header::FlowInit { is_fin: false, .. }));
             assert_eq!(sent[0].payload, &b"hello"[..]);
 
+            bach::task::yield_now().await;
             pusher.push_max_data(VarInt::from_u16(4096));
 
             let next = pusher.recv_frames().await;
@@ -231,6 +232,17 @@ fn client_second_write_blocks_until_max_data() {
             assert_eq!(written, 5);
 
             let mut second = Bytes::from_static(b"!");
+            let blocked_without_max_data =
+                core::future::poll_fn(|cx| match writer.poll_write_from(cx, &mut second, false) {
+                    Poll::Pending => Poll::Ready(true),
+                    Poll::Ready(_) => Poll::Ready(false),
+                })
+                .await;
+            assert!(
+                blocked_without_max_data,
+                "expected second write to block before MAX_DATA"
+            );
+
             let written = writer.write_from(&mut second).await.expect("second write");
             assert_eq!(written, 1);
         }
