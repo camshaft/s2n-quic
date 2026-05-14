@@ -165,9 +165,8 @@ fn client_write_all_from_fin_sends_flow_init_with_early_data_and_fin() {
 
         async move {
             let frames = pusher.recv_frames().await;
-            let mut sent = frames.iter();
-            let frame = sent.next().expect("expected one FlowInit frame");
-            assert!(sent.next().is_none(), "expected exactly one frame");
+            let frame = frames.iter().next().expect("expected one FlowInit frame");
+            assert!(frames.iter().nth(1).is_none(), "expected exactly one frame");
             assert!(matches!(frame.header, Header::FlowInit { is_fin: true, .. }));
             assert_eq!(frame.payload, &b"hello"[..]);
         }
@@ -224,9 +223,8 @@ fn client_second_write_blocks_until_max_data() {
         async move {
             let frames = pusher.recv_frames().await;
             {
-                let mut sent = frames.iter();
-                let frame = sent.next().expect("expected one FlowInit frame");
-                assert!(sent.next().is_none(), "expected exactly one frame");
+                let frame = frames.iter().next().expect("expected one FlowInit frame");
+                assert!(frames.iter().nth(1).is_none(), "expected exactly one frame");
                 assert!(matches!(frame.header, Header::FlowInit { is_fin: false, .. }));
                 assert_eq!(frame.payload, &b"hello"[..]);
             }
@@ -239,9 +237,8 @@ fn client_second_write_blocks_until_max_data() {
 
             let next = pusher.recv_frames().await;
             {
-                let mut sent_next = next.iter();
-                let frame = sent_next.next().expect("expected one FlowData frame");
-                assert!(sent_next.next().is_none(), "expected exactly one frame");
+                let frame = next.iter().next().expect("expected one FlowData frame");
+                assert!(next.iter().nth(1).is_none(), "expected exactly one frame");
                 assert!(matches!(
                     frame.header,
                     Header::FlowData { is_fin: true, .. }
@@ -289,8 +286,10 @@ fn server_first_write_emits_flow_data_not_flow_init() {
 
         async move {
             let frames = pusher.recv_frames().await;
-            let mut sent = frames.iter();
-            assert!(sent.next().is_some(), "expected at least one FlowData frame");
+            assert!(
+                frames.iter().next().is_some(),
+                "expected at least one FlowData frame"
+            );
 
             let mut expected_offset = 0u64;
             let mut payload = Vec::new();
@@ -342,8 +341,10 @@ fn server_flow_control_budget_caps_transmitted_bytes() {
         async move {
             let frames = pusher.recv_frames().await;
             {
-                let mut sent = frames.iter();
-                assert!(sent.next().is_some(), "expected at least one FlowData frame");
+                assert!(
+                    frames.iter().next().is_some(),
+                    "expected at least one FlowData frame"
+                );
 
                 let mut expected_offset = 0u64;
                 let mut payload = Vec::new();
@@ -408,9 +409,11 @@ fn client_preserves_max_data_on_out_of_order_lower_update() {
         async move {
             let init = pusher.recv_frames().await;
             {
-                let mut sent_init = init.iter();
-                let init_frame = sent_init.next().expect("expected FlowInit frame");
-                assert!(sent_init.next().is_none(), "expected exactly one FlowInit frame");
+                let init_frame = init.iter().next().expect("expected FlowInit frame");
+                assert!(
+                    init.iter().nth(1).is_none(),
+                    "expected exactly one FlowInit frame"
+                );
                 assert!(matches!(
                     init_frame.header,
                     Header::FlowInit { is_fin: false, .. }
@@ -483,9 +486,8 @@ fn server_write_from_fin_blocks_while_budget_exhausted_then_sends_single_fin_fra
         async move {
             let first = pusher.recv_frames().await;
             {
-                let mut sent_first = first.iter();
-                let first_frame = sent_first.next().expect("expected one first frame");
-                assert!(sent_first.next().is_none(), "expected exactly one frame");
+                let first_frame = first.iter().next().expect("expected one first frame");
+                assert!(first.iter().nth(1).is_none(), "expected exactly one frame");
                 assert!(matches!(
                     first_frame.header,
                     Header::FlowData {
@@ -507,9 +509,8 @@ fn server_write_from_fin_blocks_while_budget_exhausted_then_sends_single_fin_fra
 
             let second = pusher.recv_frames().await;
             {
-                let mut sent_second = second.iter();
-                let second_frame = sent_second.next().expect("expected one second frame");
-                assert!(sent_second.next().is_none(), "expected exactly one frame");
+                let second_frame = second.iter().next().expect("expected one second frame");
+                assert!(second.iter().nth(1).is_none(), "expected exactly one frame");
                 assert!(matches!(
                     second_frame.header,
                     Header::FlowData {
@@ -562,8 +563,7 @@ fn client_fin_write_then_drop_emits_no_extra_packet() {
         async move {
             let first = pusher.recv_frames().await;
             {
-                let mut sent = first.iter();
-                assert!(sent.next().is_some(), "expected at least one frame");
+                assert!(first.iter().next().is_some(), "expected at least one frame");
                 let mut payload = Vec::new();
                 let mut fin_count = 0usize;
                 for frame in first.iter() {
@@ -616,8 +616,7 @@ fn server_fin_write_then_drop_emits_no_extra_packet() {
         async move {
             let first = pusher.recv_frames().await;
             {
-                let mut sent = first.iter();
-                assert!(sent.next().is_some(), "expected at least one frame");
+                assert!(first.iter().next().is_some(), "expected at least one frame");
                 let mut payload = Vec::new();
                 let mut fin_count = 0usize;
                 let mut expected_offset = 0u64;
@@ -726,9 +725,11 @@ fn drop_open_writer_sends_fin_packet() {
 
         async move {
             let frames = pusher.recv_frames().await;
-            let mut sent = frames.iter();
-            let frame = sent.next().expect("expected one FIN frame");
-            assert!(sent.next().is_none(), "expected exactly one FIN frame on drop");
+            let frame = frames.iter().next().expect("expected one FIN frame");
+            assert!(
+                frames.iter().nth(1).is_none(),
+                "expected exactly one FIN frame on drop"
+            );
             assert!(matches!(
                 frame.header,
                 Header::FlowData {
