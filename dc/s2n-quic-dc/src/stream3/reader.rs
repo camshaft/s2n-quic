@@ -248,6 +248,7 @@ impl Reader {
         }
         let _ = self.0.send_reset_frame(error_code, ResetTarget::Both);
         self.0.status.on_reset().ok();
+        self.0.reassembler.reset();
     }
 
     pub async fn read_into<S>(&mut self, buf: &mut S) -> io::Result<usize>
@@ -314,7 +315,18 @@ impl Inner {
         }
 
         let mut tracker = buf.track_write();
-        let _ = self.poll_stream_rx(cx, &mut tracker)?;
+
+        // Poll for new stream messages.  If the channel reports a hard error
+        // (e.g. BrokenPipe because the sender was dropped) but the reassembler
+        // already holds all of the stream's data (writing_complete), we can
+        // still deliver that data and complete normally; only surface the error
+        // once there is nothing left to consume.
+        let stream_result = self.poll_stream_rx(cx, &mut tracker);
+        let deferred_err = match stream_result {
+            Poll::Ready(Ok(())) => None,
+            Poll::Ready(Err(e)) if self.reassembler.is_writing_complete() => Some(e),
+            other => return other.map_ok(|()| 0usize),
+        };
 
         if self.status.is_pending_validation() {
             return Poll::Ready(Err(io::Error::new(
@@ -354,10 +366,16 @@ impl Inner {
         }
 
         if bytes_read > 0 {
-            Poll::Ready(Ok(bytes_read))
-        } else {
-            Poll::Pending
+            return Poll::Ready(Ok(bytes_read));
         }
+
+        // No data was consumed.  If the channel had a deferred error, surface
+        // it now that the reassembler is exhausted.
+        if let Some(e) = deferred_err {
+            return Poll::Ready(Err(e));
+        }
+
+        Poll::Pending
     }
 
     fn poll_stream_rx<S>(&mut self, cx: &mut Context, app_buf: &mut S) -> Poll<io::Result<()>>
@@ -428,6 +446,7 @@ impl Inner {
                             );
                             self.reset_error_code = Some(error_code);
                             self.status.on_reset().ok();
+                            self.reassembler.reset();
                             let reset_error: ResetError = error_code.into();
                             return Poll::Ready(Err(io::Error::new(
                                 io::ErrorKind::ConnectionReset,
@@ -451,6 +470,7 @@ impl Inner {
         let error_code = reset_error::FRAME_DECODE_ERROR;
         self.reset_error_code = Some(error_code);
         self.status.on_reset().ok();
+        self.reassembler.reset();
         let _ = self.send_reset_frame(error_code, ResetTarget::Both);
         let reset_error: ResetError = error_code.into();
         Poll::Ready(Err(io::Error::new(io::ErrorKind::InvalidData, reset_error)))
@@ -472,8 +492,14 @@ impl Inner {
             let new_max_data = VarInt::new(new_max_data)
                 .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "max_data overflow"))?;
 
-            self.send_max_data_frame(new_max_data)?;
-            self.remote_max_data = new_max_data;
+            // Frame submission is best-effort: if the channel is closed (e.g.
+            // the endpoint task has already exited) we skip the credit update
+            // rather than failing the read.  The peer may stall waiting for
+            // more credits, but the already-buffered data has been delivered
+            // successfully.  (The Drop impl follows the same "ignore" policy.)
+            if self.send_max_data_frame(new_max_data).is_ok() {
+                self.remote_max_data = new_max_data;
+            }
         } else {
             trace!(
                 stream_id = self.stream_id.as_u64(),
