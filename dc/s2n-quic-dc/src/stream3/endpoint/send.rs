@@ -34,7 +34,8 @@ use s2n_quic_core::{
     frame::ack::EcnCounts,
     packet::{number::PacketNumberSpace, KeyPhase},
     path::INITIAL_PTO_BACKOFF,
-    recovery::RttEstimator, varint::VarInt,
+    recovery::RttEstimator,
+    varint::VarInt,
 };
 use std::{cell::RefCell, rc::Rc, sync::Arc};
 
