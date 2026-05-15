@@ -296,13 +296,14 @@ impl crate::crypto::open::Application for PacketOpener {
     #[inline]
     fn decrypt(
         &self,
-        _key_phase: KeyPhase,
+        received_key_phase: KeyPhase,
         packet_number: u64,
         header: &[u8],
         payload_in: &[u8],
         tag: &[u8],
         payload_out: &mut crate::crypto::UninitSlice,
     ) -> crate::crypto::open::Result {
+        let _ = received_key_phase;
         // stream3 currently maintains one opener per sender/key_id; until multi-key
         // rotation is implemented, tolerate both phase bits by decrypting with phase 0.
         crate::crypto::open::Application::decrypt(
@@ -319,11 +320,12 @@ impl crate::crypto::open::Application for PacketOpener {
     #[inline]
     fn decrypt_in_place(
         &self,
-        _key_phase: KeyPhase,
+        received_key_phase: KeyPhase,
         packet_number: u64,
         header: &[u8],
         payload_and_tag: &mut [u8],
     ) -> crate::crypto::open::Result {
+        let _ = received_key_phase;
         // stream3 currently maintains one opener per sender/key_id; until multi-key
         // rotation is implemented, tolerate both phase bits by decrypting with phase 0.
         crate::crypto::open::Application::decrypt_in_place(

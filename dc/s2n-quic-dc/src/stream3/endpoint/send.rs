@@ -302,12 +302,17 @@ pub(crate) struct PacketSealer {
 impl PacketSealer {
     #[inline]
     fn new(inner: crate::crypto::awslc::seal::Application, key_id: VarInt) -> Self {
-        let key_phase = if key_id.as_u64() & 1 == 0 {
-            KeyPhase::Zero
-        } else {
-            KeyPhase::One
-        };
+        let key_phase = key_phase_for_key_id(key_id);
         Self { inner, key_phase }
+    }
+}
+
+#[inline]
+pub(crate) fn key_phase_for_key_id(key_id: VarInt) -> KeyPhase {
+    if key_id.as_u64() & 1 == 0 {
+        KeyPhase::Zero
+    } else {
+        KeyPhase::One
     }
 }
 
