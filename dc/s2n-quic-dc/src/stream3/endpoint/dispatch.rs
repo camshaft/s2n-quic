@@ -218,14 +218,7 @@ where
                 });
             }
             Err(err) => {
-                debug_assert!(
-                    false,
-                    "unexpected dedup error after successful decrypt: {err:?}"
-                );
-                return Err(Error::Decryption {
-                    credentials,
-                    packet_number,
-                });
+                unreachable!("unexpected dedup error after successful decrypt: {err:?}");
             }
         }
     }

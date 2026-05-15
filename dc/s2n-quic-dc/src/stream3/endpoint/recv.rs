@@ -250,7 +250,11 @@ pub(crate) struct Context {
     // after rotation will fail to decrypt. Need to maintain a small cache of recent
     // openers (e.g., HashMap<VarInt, Opener>) to handle in-flight packets during rotation.
     pub opener: crate::crypto::awslc::open::Application,
-    /// The key_id this opener corresponds to
+    /// The key_id this opener corresponds to.
+    ///
+    /// This lets the recv path decide whether an incoming packet can reuse the cached
+    /// opener directly or needs a provisional decrypt + replay validation before the
+    /// context is updated to a newly accepted key.
     pub current_key_id: VarInt,
     /// Sliding window for packet number deduplication.
     pub dedup_filter: crate::stream::recv::ack::StreamFilter,
