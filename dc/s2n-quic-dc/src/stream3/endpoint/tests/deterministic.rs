@@ -25,7 +25,11 @@ use bytes::{Bytes, BytesMut};
 use core::ops::Range;
 use s2n_quic_core::varint::VarInt;
 use std::{
-    sync::{Arc, Mutex},
+    collections::HashSet,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex,
+    },
     time::Duration,
 };
 
@@ -374,5 +378,274 @@ fn transmission_rate_fuzz() {
                 "transfer took too long for {loss:.1}% loss: {elapsed:?} \
                  (max allowed: {max_allowed:?})"
             );
+        });
+}
+
+// ── Init Protocol Deduplication ───────────────────────────────────────────────
+
+/// Describes per-packet network manipulation to apply to FlowInit packets
+/// directed at the server.
+///
+/// The two action lists are applied in lock-step per original (non-duplicate)
+/// FlowInit: `delays[i]` is the extra delay in units of 5 ms for the i-th
+/// FlowInit, and `duplicates[i]` says whether that packet should also be
+/// delivered as a network-level copy.  The copy is scheduled at absolute base
+/// latency (no inherited delay), so it arrives *before* any delayed original,
+/// creating a reordering scenario.
+///
+/// The lists may have different lengths; shorter lists simply stop applying
+/// their effect once exhausted (defaulting to no delay / no duplication).
+#[derive(Clone, bolero::TypeGenerator)]
+struct PacketActions {
+    /// Per-packet extra delay, in units of 5 ms (range 0..=50 → 0..=250 ms).
+    #[generator(produce::<Vec<u8>>().with().values(0..=50))]
+    delays: Vec<u8>,
+    /// Per-packet duplication flag.
+    duplicates: Vec<bool>,
+}
+
+impl core::fmt::Debug for PacketActions {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("PacketActions")
+            .field("n_delays", &self.delays.len())
+            .field(
+                "max_delay_ms",
+                &(self.delays.iter().copied().max().unwrap_or(0) as u64 * 5),
+            )
+            .field("n_duplicates", &self.duplicates.len())
+            .field(
+                "n_duplicated",
+                &self.duplicates.iter().filter(|&&b| b).count(),
+            )
+            .finish()
+    }
+}
+
+/// Installs two Bach network monitors that apply per-packet delay and
+/// duplication to FlowInit packets directed **to** the server.
+///
+/// * **Monitor 1 – delay**: for each original FlowInit going to the server,
+///   applies an extra delay of `delays[i] * 5 ms`.
+/// * **Monitor 2 – duplicate**: for each original FlowInit, optionally injects
+///   a network-level copy.  The copy uses an absolute offset so it is scheduled
+///   at base network latency, independently of the original's extra delay — it
+///   therefore arrives *before* the delayed original, exercising the server's
+///   deduplication logic under reordering.
+///
+/// Duplicate packets (tagged `packet.is_duplicate == true`) are passed through
+/// unchanged by both monitors to prevent cascading expansion.
+///
+/// This function must be called inside a `sim(|| { … })` closure so that the
+/// monitors are registered in the current Bach network environment.
+fn install_init_monitors(actions: &PacketActions) {
+    use bach::net::monitor;
+
+    // Monitor 1: per-packet extra delay on original FlowInit packets.
+    let delays = actions.delays.clone();
+    let delay_idx = Arc::new(AtomicUsize::new(0));
+    monitor::on_packet_sent(move |packet| {
+        if !packet.is_duplicate && packet.destination().port() == SERVER_PORT {
+            let i = delay_idx.fetch_add(1, Ordering::Relaxed);
+            if let Some(&d) = delays.get(i) {
+                if d > 0 {
+                    return monitor::delay(Duration::from_millis(d as u64 * 5)).into();
+                }
+            }
+        }
+        Default::default()
+    });
+
+    // Monitor 2: per-packet duplication of original FlowInit packets.
+    //
+    // `duplicate(1).absolute()` schedules the copy at base network latency
+    // (no inherited delay from monitor 1), so it consistently arrives ahead
+    // of a delayed original.
+    let duplicates = actions.duplicates.clone();
+    let dup_idx = Arc::new(AtomicUsize::new(0));
+    monitor::on_packet_sent(move |packet| {
+        if !packet.is_duplicate && packet.destination().port() == SERVER_PORT {
+            let i = dup_idx.fetch_add(1, Ordering::Relaxed);
+            if let Some(&should_dup) = duplicates.get(i) {
+                if should_dup {
+                    return monitor::duplicate(1).absolute().into();
+                }
+            }
+        }
+        Default::default()
+    });
+}
+
+/// Core helper for the init-protocol uniqueness tests.
+///
+/// Opens `n` concurrent client streams (using a single [`Client`], so they
+/// receive consecutive stream IDs `0..n`), installs the given network
+/// manipulation via [`install_init_monitors`], and then verifies two invariants:
+///
+/// 1. **No duplicate acceptance**: the server's acceptor receives each stream
+///    ID at most once.  If any ID appears twice the assertion fires immediately,
+///    indicating a bug in the init-protocol deduplication logic.
+///
+/// 2. **No missing streams**: the server eventually accepts all `n` streams.
+///    Combined with (1) this means the server sees each ID *exactly* once.
+///
+/// The server task is the Bach primary task; the simulation ends when the
+/// server has counted `n` accepted streams.  The client task is non-primary
+/// and keeps the simulated network alive until the server finishes.
+///
+/// `connect` failures on the client side are fatal (the test panics), since
+/// the client should always be able to initiate a stream regardless of network
+/// conditions.
+fn sim_init_uniqueness(actions: &PacketActions, n: usize) {
+    // Generous timeout: even with the maximum 250 ms per-packet delay the
+    // entire population of FlowInit packets arrives within ~300 ms of sim
+    // time, well inside the 5-second window.
+    const ACCEPT_TIMEOUT: Duration = Duration::from_secs(5);
+
+    let acceptor_id = VarInt::from_u8(1);
+
+    let seen_ids: Arc<Mutex<HashSet<u64>>> = Arc::new(Mutex::new(HashSet::new()));
+    let seen_ids_sv = seen_ids.clone();
+
+    tracing::info!(?actions, n, "starting init_uniqueness sim");
+
+    sim(|| {
+        install_init_monitors(actions);
+
+        // ── Server (primary) ─────────────────────────────────────────────────
+        // Accept exactly `n` streams, asserting no stream ID appears twice.
+        {
+            async move {
+                let server = Server::new();
+                // Buffer capacity is n*2 so the channel never blocks the
+                // dispatch worker even if streams arrive faster than the
+                // server loop drains them.
+                let acceptor = server
+                    .register_acceptor_channel(acceptor_id, n * 2)
+                    .expect("acceptor registration failed");
+
+                for _ in 0..n {
+                    let stream =
+                        crate::testing::timeout(ACCEPT_TIMEOUT, acceptor.recv_front())
+                            .await
+                            .expect("server timed out waiting for a stream")
+                            .expect("acceptor channel closed unexpectedly");
+
+                    let id = stream.stream_id().as_u64();
+                    let first_time = seen_ids_sv.lock().unwrap().insert(id);
+                    assert!(
+                        first_time,
+                        "stream_id {id} was delivered to the server acceptor twice — \
+                         init-protocol deduplication is broken"
+                    );
+
+                    // Release the stream promptly so the protocol can reclaim
+                    // resources; we do not need to read any data here.
+                    spawn(async move { drop(stream); });
+                }
+            }
+            .group("server")
+            .primary()
+            .spawn();
+        }
+
+        // ── Client (non-primary) ─────────────────────────────────────────────
+        // Open `n` streams and immediately drop each one (which enqueues a FIN
+        // via Writer::drop).  Keeps the simulated network alive until the
+        // server's primary task finishes.
+        {
+            async move {
+                let mut client = Client::new();
+                for _ in 0..n {
+                    let _stream = client
+                        .connect("server:0", acceptor_id)
+                        .await
+                        .expect("client connect() failed — this should never happen");
+                    // Dropping _stream here triggers Writer::drop → FIN.
+                }
+                // Stay alive so packets in flight can reach the server.
+                bach::time::sleep(Duration::from_secs(60)).await;
+            }
+            .group("client")
+            .spawn();
+        }
+    });
+
+    // Post-sim assertion: every stream ID in 0..n was accepted exactly once.
+    // (The no-duplicate invariant was already checked inline above; this
+    // catches the complementary "missing stream" case.)
+    let seen = seen_ids.lock().unwrap();
+    assert_eq!(
+        seen.len(),
+        n,
+        "expected {n} unique stream IDs but server saw {} — \
+         some streams were either missing or duplicated",
+        seen.len()
+    );
+}
+
+// ── Deterministic uniqueness tests ───────────────────────────────────────────
+
+/// Baseline: 1 000 concurrent streams with no network manipulation.
+///
+/// Verifies the server sees all 1 000 stream IDs exactly once when packets are
+/// delivered in order without duplication.
+#[test]
+fn init_uniqueness_baseline() {
+    const N: usize = 1_000;
+    let actions = PacketActions {
+        delays: vec![],
+        duplicates: vec![],
+    };
+    sim_init_uniqueness(&actions, N);
+}
+
+/// All FlowInit packets duplicated, no extra delay.
+///
+/// Every stream's FlowInit arrives at the server twice at approximately the
+/// same network latency.  The init-protocol deduplication must discard the
+/// second copy so the server acceptor sees each stream ID only once.
+#[test]
+fn init_uniqueness_all_duplicated() {
+    const N: usize = 1_000;
+    let actions = PacketActions {
+        delays: vec![0; N],
+        duplicates: vec![true; N],
+    };
+    sim_init_uniqueness(&actions, N);
+}
+
+/// Reordered FlowInit packets with selective duplication.
+///
+/// Odd-indexed packets are delayed by 250 ms, causing them to arrive after
+/// even-indexed packets (which have no extra delay).  Every third packet is
+/// also duplicated.  The combination exercises the init protocol under both
+/// out-of-order delivery and duplicate arrival.
+#[test]
+fn init_uniqueness_reordered_and_duplicated() {
+    const N: usize = 1_000;
+    let actions = PacketActions {
+        delays: (0..N).map(|i| if i % 2 == 1 { 50 } else { 0 }).collect(),
+        duplicates: (0..N).map(|i| i % 3 == 0).collect(),
+    };
+    sim_init_uniqueness(&actions, N);
+}
+
+// ── Fuzz test ─────────────────────────────────────────────────────────────────
+
+/// Fuzzes the init-protocol uniqueness invariant with randomized per-packet
+/// delay and duplication patterns.
+///
+/// For each generated [`PacketActions`] value, 100 concurrent streams are
+/// opened and the test asserts that the server acceptor receives each stream
+/// ID exactly once (no duplicates, none missing).
+#[test]
+fn init_uniqueness_fuzz() {
+    bolero::check!()
+        .with_type::<PacketActions>()
+        .with_test_time(core::time::Duration::from_secs(30))
+        .with_shrink_time(core::time::Duration::from_secs(10))
+        .cloned()
+        .for_each(|actions| {
+            sim_init_uniqueness(&actions, 100);
         });
 }

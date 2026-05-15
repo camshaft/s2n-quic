@@ -274,6 +274,11 @@ impl Reader {
         core::future::poll_fn(|cx| self.0.poll_validate(cx)).await
     }
 
+    /// Returns the stream identifier for this reader.
+    pub fn stream_id(&self) -> VarInt {
+        self.0.stream_id
+    }
+
     pub(crate) fn send_reset(&mut self, error_code: VarInt) {
         if self.0.status.is_terminal() {
             return;
