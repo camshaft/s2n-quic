@@ -1321,10 +1321,7 @@ fn format_bits_per_second(bytes: u64) -> (f64, &'static str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{
-        atomic::{AtomicUsize, Ordering},
-        Arc,
-    };
+    use std::sync::Arc;
 
     struct MockSink {
         id: &'static str,
@@ -1627,8 +1624,7 @@ mod tests {
     }
 
     #[test]
-    fn report_once_only_takes_once_per_interval_for_multiple_sinks() {
-        let take_count = Arc::new(AtomicUsize::new(0));
+    fn single_metric_take_fans_out_to_multiple_sinks() {
         let registry = s2n_quic_dc_metrics::Registry::new();
         let counter = registry.register_counter("rx.data".into(), None);
         counter.increment(1);
@@ -1653,12 +1649,10 @@ mod tests {
         ];
 
         if let Some(line) = registry.try_take_current_metrics_line_sparse(false) {
-            take_count.fetch_add(1, Ordering::Relaxed);
             let payload = ReportingPayload::from_line(&line);
             dispatch_payload_to_sinks(&mut sinks, &payload, None);
         }
 
-        assert_eq!(take_count.load(Ordering::Relaxed), 1);
         assert_eq!(seen.lock().unwrap().len(), 3);
     }
 }
