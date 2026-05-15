@@ -979,10 +979,7 @@ impl Inner {
     fn send_frame(&mut self, frame: Frame) -> io::Result<()> {
         self.frame_tx
             .send_batch(Entry::new(frame))
-            .map_err(|entry| {
-                drop(entry);
-                io::Error::new(io::ErrorKind::BrokenPipe, "frame channel closed")
-            })
+            .map_err(|_entry| io::Error::new(io::ErrorKind::BrokenPipe, "frame channel closed"))
     }
 
     fn send_batch(&mut self, queue: Queue<Frame>) -> io::Result<()> {
@@ -991,10 +988,7 @@ impl Inner {
                 queue,
                 priority: Priority::FlowData,
             })
-            .map_err(|batch| {
-                drop(batch);
-                io::Error::new(io::ErrorKind::BrokenPipe, "frame channel closed")
-            })
+            .map_err(|_batch| io::Error::new(io::ErrorKind::BrokenPipe, "frame channel closed"))
     }
 
     fn try_reserve_local_flow(

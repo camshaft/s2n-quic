@@ -276,13 +276,14 @@ impl Controller {
     }
 
     #[inline]
-    pub fn move_inflight_to_queued(&self, _priority: StreamPriority, bytes: u64) {
+    pub fn move_inflight_to_queued(&self, priority: StreamPriority, bytes: u64) {
         if bytes == 0 {
             return;
         }
 
         Self::sub_counter(&self.inflight_bytes, bytes);
         self.queued_bytes.fetch_add(bytes, Ordering::AcqRel);
+        self.wake_waiters(priority);
     }
 
     #[inline]
