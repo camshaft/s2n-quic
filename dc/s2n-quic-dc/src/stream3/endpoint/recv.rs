@@ -254,7 +254,9 @@ pub(crate) struct Context {
     ///
     /// This lets the recv path decide whether an incoming packet can reuse the cached
     /// opener directly or needs a provisional decrypt + replay validation before the
-    /// context is updated to a newly accepted key.
+    /// context is updated to a newly accepted key. During key rotation, packets whose
+    /// `credentials.key_id` differs from this value must go through the provisional path
+    /// before the worker-local context is updated in place.
     pub current_key_id: VarInt,
     /// Sliding window for packet number deduplication.
     pub dedup_filter: crate::stream::recv::ack::StreamFilter,
@@ -428,8 +430,10 @@ impl Cache {
     /// Returns an existing worker-local peer context for the `(credentials.id, remote_sender_id)`
     /// tuple, if one has already been installed for the current recv worker.
     ///
-    /// This does not derive or validate keys. Callers that miss in this cache must complete any
-    /// provisional decrypt + replay validation before publishing state with [`Self::insert`].
+    /// This does not derive or validate keys. Callers that miss in this cache, or that find a
+    /// context whose `current_key_id` differs from the incoming `credentials.key_id`, must
+    /// complete provisional decrypt + replay validation before publishing state with
+    /// [`Self::insert`].
     #[inline]
     pub fn get(
         &self,

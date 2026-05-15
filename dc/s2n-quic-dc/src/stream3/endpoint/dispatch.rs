@@ -217,7 +217,9 @@ where
                 });
             }
             Err(err) => {
-                unreachable!("unexpected dedup error after successful decrypt: {err:?}");
+                unreachable!(
+                    "check_dedup_for_credentials should only return replay errors after successful decrypt, got: {err:?}"
+                );
             }
         }
     }
