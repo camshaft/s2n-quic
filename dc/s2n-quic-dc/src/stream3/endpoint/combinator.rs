@@ -726,6 +726,11 @@ where
                 continue;
             }
 
+            if self.batch.is_empty() {
+                self.batch.push_back(Entry::from(frame));
+                continue;
+            }
+
             let incoming_id = frame
                 .completion
                 .as_ref()
@@ -733,11 +738,6 @@ where
                 .expect("invariant violation: frame.completion is None after should_notify returned true");
 
             if self.current_queue_id() == Some(incoming_id) {
-                self.batch.push_back(Entry::from(frame));
-                continue;
-            }
-
-            if self.batch.is_empty() {
                 self.batch.push_back(Entry::from(frame));
                 continue;
             }
