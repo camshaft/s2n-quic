@@ -74,6 +74,10 @@ pub(crate) struct Dispatch {
 
     pub rx_peer_cache_hit: Counter,
     pub rx_peer_cache_miss: Counter,
+    pub rx_peer_provisional_install: Counter,
+    pub rx_peer_provisional_decrypt_fail: Counter,
+    pub rx_peer_replay_definitely_detected: Counter,
+    pub rx_peer_replay_potentially_detected: Counter,
     pub rx_peer_lookup_time: Timer,
     pub rx_decrypt_time: Timer,
     pub rx_dispatch_time: Timer,
@@ -163,6 +167,13 @@ impl Dispatch {
 
             rx_peer_cache_hit: counters.register("rx.peer_cache.hit"),
             rx_peer_cache_miss: counters.register("rx.peer_cache.miss"),
+            rx_peer_provisional_install: counters.register("rx.peer.provisional_install"),
+            rx_peer_provisional_decrypt_fail: counters
+                .register("!rx.peer.provisional_decrypt_fail"),
+            rx_peer_replay_definitely_detected: counters
+                .register("!rx.peer.replay_definitely_detected"),
+            rx_peer_replay_potentially_detected: counters
+                .register("!rx.peer.replay_potentially_detected"),
             rx_peer_lookup_time: counters.register_timer("rx.peer_lookup_time"),
             rx_decrypt_time: counters.register_timer("rx.decrypt_time"),
             rx_dispatch_time: counters.register_timer("rx.dispatch_time"),

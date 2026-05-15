@@ -7,7 +7,7 @@ use crate::{
     clock::precision,
     credentials::{self, Credentials},
     flow, intrusive_queue,
-    path::{self, secret::map::Entry as PathSecretEntry},
+    path::secret::map::Entry as PathSecretEntry,
     stream3::endpoint::ack::state as ack_state,
 };
 use core::time::Duration;
@@ -251,7 +251,6 @@ pub(crate) struct Context {
     // openers (e.g., HashMap<VarInt, Opener>) to handle in-flight packets during rotation.
     pub opener: crate::crypto::awslc::open::Application,
     /// The key_id this opener corresponds to
-    #[expect(dead_code)] // TODO implement key rotation
     pub current_key_id: VarInt,
     /// Sliding window for packet number deduplication.
     pub dedup_filter: crate::stream::recv::ack::StreamFilter,
@@ -320,6 +319,18 @@ impl Context {
         let now = clock.get_time();
         self.last_activity = now;
         self.idle_timer.set(now + idle_timeout);
+    }
+
+    #[inline]
+    pub fn update_opener(
+        &mut self,
+        path_entry: Arc<PathSecretEntry>,
+        opener: crate::crypto::awslc::open::Application,
+        key_id: VarInt,
+    ) {
+        self.path_entry = path_entry;
+        self.opener = opener;
+        self.current_key_id = key_id;
     }
 
     pub fn is_expired<Clk>(&mut self, clock: &Clk) -> bool
@@ -411,15 +422,29 @@ impl Cache {
     }
 
     #[inline]
-    pub fn get_or_insert<Clk, Route>(
+    pub fn get(
+        &self,
+        credentials: &Credentials,
+        remote_sender_id: VarInt,
+    ) -> Option<Rc<RefCell<Context>>> {
+        let key = Key {
+            id: credentials.id,
+            remote_sender_id,
+        };
+
+        self.senders.get(&key).cloned()
+    }
+
+    #[inline]
+    pub fn insert<Clk, Route>(
         &mut self,
         credentials: &Credentials,
         remote_sender_id: VarInt,
-        path_secret_map: &path::secret::map::Map,
+        path_entry: Arc<PathSecretEntry>,
+        opener: crate::crypto::awslc::open::Application,
         clock: &Clk,
-        control_out: &mut Vec<u8>,
         route: &Route,
-    ) -> Option<(Rc<RefCell<Context>>, bool)>
+    ) -> Rc<RefCell<Context>>
     where
         Clk: s2n_quic_core::time::Clock + ?Sized,
         Route: super::routing::SenderRoute,
@@ -429,15 +454,15 @@ impl Cache {
             remote_sender_id,
         };
 
-        Some(match self.senders.entry(key) {
-            hash_map::Entry::Occupied(entry) => (entry.get().clone(), true),
+        match self.senders.entry(key) {
+            hash_map::Entry::Occupied(entry) => {
+                let ctx = entry.get().clone();
+                ctx.borrow_mut()
+                    .update_opener(path_entry, opener, credentials.key_id);
+                ctx
+            }
             hash_map::Entry::Vacant(entry) => {
-                tracing::debug!(%credentials, %remote_sender_id, worker_id = self.worker_id, "opener_for_credentials");
-                let (opener, path_entry) =
-                    path_secret_map.opener_for_credentials(credentials, None, control_out)?;
-
                 let dest_sender_id = route.sender_id_for_ack(&credentials.id, remote_sender_id);
-
                 let ctx = Rc::new(RefCell::new(Context::new(
                     path_entry,
                     remote_sender_id,
@@ -448,9 +473,9 @@ impl Cache {
                     self.idle_timeout,
                 )));
                 entry.insert(ctx.clone());
-                (ctx, false)
+                ctx
             }
-        })
+        }
     }
 
     #[expect(dead_code)] // TODO implement expiration

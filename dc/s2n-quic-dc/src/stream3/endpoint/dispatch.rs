@@ -36,6 +36,7 @@ use std::{cell::RefCell, rc::Rc};
 
 const UNSET_SOURCE_SENDER_ID: VarInt = VarInt::MAX;
 
+#[derive(Debug)]
 pub(crate) enum Error {
     PeerStateLookup {
         credentials: Credentials,
@@ -44,6 +45,15 @@ pub(crate) enum Error {
     Decryption {
         credentials: Credentials,
         packet_number: VarInt,
+    },
+    ReplayDefinitelyDetected {
+        credentials: Credentials,
+        packet_number: VarInt,
+    },
+    ReplayPotentiallyDetected {
+        credentials: Credentials,
+        packet_number: VarInt,
+        gap: Option<u64>,
     },
     Duplicate {
         credentials: Credentials,
@@ -90,49 +100,76 @@ where
         _ => return Err(Error::UnsupportedRoutingInfo { routing_info }),
     };
 
-    // Get or create peer receive state
+    // Look up worker-local peer state, but only publish new keys after decrypt + replay
+    // validation succeed.
     let mut control_out = Vec::new();
-    let (peer_rc, cache_hit) = {
+    let existing_peer_rc = {
         let _guard = counters.rx_peer_lookup_time.start();
-        match recv_cache.get_or_insert(
-            &credentials,
-            source_sender_id,
-            path_secret_map,
-            clock,
-            &mut control_out,
-            route,
-        ) {
-            Some(v) => v,
-            None => {
-                return Err(Error::PeerStateLookup {
-                    credentials,
-                    control_out,
-                });
-            }
-        }
+        recv_cache.get(&credentials, source_sender_id)
     };
+    let cache_hit = existing_peer_rc
+        .as_ref()
+        .map(|peer_rc| peer_rc.borrow().current_key_id == credentials.key_id)
+        .unwrap_or(false);
     if cache_hit {
         counters.rx_peer_cache_hit.add(1);
     } else {
         counters.rx_peer_cache_miss.add(1);
     }
-    let mut peer = peer_rc.borrow_mut();
 
     // Collect information about the packet layout before decryption.
     let app_header_slice: &[u8] = packet.application_header();
     let decrypt_len = packet.decrypt_into_len();
     let ecn = packet.storage().ecn();
 
+    let mut peer_rc = existing_peer_rc;
+    let mut provisional = None;
+    if !cache_hit {
+        tracing::debug!(
+            %credentials,
+            %source_sender_id,
+            worker_id = recv_cache.worker_id,
+            "opener_for_credentials"
+        );
+        let (opener, path_entry) =
+            match path_secret_map.opener_for_credentials(&credentials, None, &mut control_out) {
+                Some(v) => v,
+                None => {
+                    return Err(Error::PeerStateLookup {
+                        credentials,
+                        control_out,
+                    });
+                }
+            };
+        provisional = Some((opener, path_entry));
+    }
+
     // Decrypt payload bytes into a BytesMut buffer.
     let mut decrypted = BytesMut::with_capacity(decrypt_len);
     let written = {
         let _guard = counters.rx_decrypt_time.start();
-        packet
-            .decrypt_into(&peer.opener, bytes::BufMut::chunk_mut(&mut decrypted))
-            .map_err(|_| Error::Decryption {
-                credentials,
-                packet_number,
-            })?
+        let payload = bytes::BufMut::chunk_mut(&mut decrypted);
+        let result = if let Some((opener, _)) = provisional.as_ref() {
+            packet.decrypt_into(opener, payload)
+        } else {
+            let peer = peer_rc
+                .as_ref()
+                .expect("cache hit must have an existing peer context");
+            let peer = peer.borrow();
+            packet.decrypt_into(&peer.opener, payload)
+        };
+        match result {
+            Ok(written) => written,
+            Err(_) => {
+                if provisional.is_some() {
+                    counters.rx_peer_provisional_decrypt_fail.add(1);
+                }
+                return Err(Error::Decryption {
+                    credentials,
+                    packet_number,
+                });
+            }
+        }
     };
     if written != decrypt_len {
         tracing::warn!(
@@ -153,6 +190,48 @@ where
         // `decrypt_len` bytes. We returned early unless `written == decrypt_len`.
         decrypted.set_len(decrypt_len);
     }
+
+    if let Some((opener, path_entry)) = provisional {
+        match path_secret_map.check_dedup_for_credentials(&path_entry, &credentials, None) {
+            Ok(()) => {
+                peer_rc = Some(recv_cache.insert(
+                    &credentials,
+                    source_sender_id,
+                    path_entry,
+                    opener,
+                    clock,
+                    route,
+                ));
+                counters.rx_peer_provisional_install.add(1);
+            }
+            Err(crate::crypto::open::Error::ReplayDefinitelyDetected) => {
+                return Err(Error::ReplayDefinitelyDetected {
+                    credentials,
+                    packet_number,
+                });
+            }
+            Err(crate::crypto::open::Error::ReplayPotentiallyDetected { gap }) => {
+                return Err(Error::ReplayPotentiallyDetected {
+                    credentials,
+                    packet_number,
+                    gap,
+                });
+            }
+            Err(err) => {
+                debug_assert!(
+                    false,
+                    "unexpected dedup error after successful decrypt: {err:?}"
+                );
+                return Err(Error::Decryption {
+                    credentials,
+                    packet_number,
+                });
+            }
+        }
+    }
+
+    let peer_rc = peer_rc.expect("peer context must exist after successful decrypt");
+    let mut peer = peer_rc.borrow_mut();
 
     // Packet number deduplication
     if peer.dedup_filter.on_packet_number(packet_number).is_err() {
@@ -1234,5 +1313,248 @@ fn handle_flow_reset(
                 "FlowReset(Control) dispatched"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        acceptor, counter,
+        intrusive_queue::Entry,
+        packet::{self, datagram::RoutingInfo},
+        path::secret::map::testing,
+        socket::{channel::UnboundedSender, pool::descriptor},
+        stream3::{endpoint::routing::SenderRoute, frame},
+    };
+    use s2n_codec::{DecoderBufferMut, DecoderParameterizedValueMut, Encoder, EncoderBuffer};
+    use s2n_quic_core::time::StdClock;
+    use std::{convert::Infallible, net::SocketAddr, sync::Arc};
+
+    struct CollectSender<T> {
+        items: Vec<T>,
+    }
+
+    impl<T> Default for CollectSender<T> {
+        fn default() -> Self {
+            Self { items: Vec::new() }
+        }
+    }
+
+    impl<T> UnboundedSender<T> for CollectSender<T> {
+        fn send(&mut self, value: T) -> Result<(), T> {
+            self.items.push(value);
+            Ok(())
+        }
+    }
+
+    fn build_ack_packet(
+        sender_entry: &Arc<PathSecretEntry>,
+        seal_key_id: VarInt,
+        credentials_key_id: VarInt,
+        packet_number: u64,
+    ) -> Entry<packet::datagram::decoder::Packet<descriptor::Filled>> {
+        let sealer = sender_entry.secret().application_sealer(seal_key_id);
+        let credentials = Credentials {
+            id: sender_entry.secret().peer_id(),
+            key_id: credentials_key_id,
+        };
+        let header = Header::Ack {
+            dest_sender_id: VarInt::ZERO,
+            ack_delay: VarInt::ZERO,
+            has_ecn: false,
+        };
+
+        let mut frame_header = [0u8; 64];
+        let mut encoder = EncoderBuffer::new(&mut frame_header[..]);
+        encoder.encode(&header);
+        encoder.encode(&VarInt::ZERO);
+        let frame_header_len = encoder.len();
+
+        let mut packet_buf = [0u8; 256];
+        let header_len = VarInt::try_from(frame_header_len as u64).unwrap();
+        let mut header_reader = &frame_header[..frame_header_len];
+        let mut payload_reader = &b""[..];
+        let len = packet::datagram::encoder::encode(
+            EncoderBuffer::new(&mut packet_buf),
+            0,
+            RoutingInfo::SenderId {
+                source_sender_id: VarInt::ZERO,
+            },
+            Some(VarInt::new(packet_number).unwrap()),
+            header_len,
+            &mut header_reader,
+            VarInt::ZERO,
+            &mut payload_reader,
+            &sealer,
+            &credentials,
+        );
+
+        let segments = descriptor::Unfilled::new(packet_buf.len() as u16)
+            .unwrap()
+            .fill_with(|_addr, _cmsg, mut iov| -> Result<usize, Infallible> {
+                iov[..len].copy_from_slice(&packet_buf[..len]);
+                Ok(len)
+            })
+            .unwrap();
+        let meta = {
+            let decoder = DecoderBufferMut::new(&mut packet_buf[..len]);
+            let (packet, _) = packet::Packet::decode_parameterized_mut(16, decoder).unwrap();
+            match packet {
+                packet::Packet::Datagram(packet) => *packet.meta(),
+                other => panic!("expected datagram packet, got {other:?}"),
+            }
+        };
+
+        let filled = segments.take_filled();
+
+        Entry::new(meta.with_storage(filled).unwrap())
+    }
+
+    fn setup_maps() -> (
+        PathSecretMap,
+        Arc<PathSecretEntry>,
+        Arc<counters::Dispatch>,
+        recv::Cache,
+        msg::queue::Dispatcher,
+        frame::SubmissionSender,
+    ) {
+        let receiver_map = testing::new(16);
+        let sender_map = testing::new(16);
+        receiver_map.set_socket_sender_count(1);
+        sender_map.set_socket_sender_count(1);
+
+        let receiver_addr: SocketAddr = "127.0.0.1:4000".parse().unwrap();
+        let sender_addr: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+        receiver_map.test_insert_pair(receiver_addr, None, &sender_map, sender_addr, None);
+
+        let sender_entry = sender_map
+            .get_raw(receiver_addr)
+            .expect("sender path-secret entry");
+
+        let counter_registry = counter::Registry::new();
+        let counters = counters::Dispatch::new(&counter_registry);
+        let recv_cache = recv::Cache::new(core::time::Duration::from_secs(30), 0);
+        let queue_dispatcher = msg::queue::Allocator::new().dispatcher();
+        let (frame_tx, _frame_rx) = frame::submission_channel(1);
+
+        (
+            receiver_map,
+            sender_entry,
+            counters,
+            recv_cache,
+            queue_dispatcher,
+            frame_tx,
+        )
+    }
+
+    #[test]
+    fn guessed_key_id_does_not_publish_recv_state() {
+        let (
+            path_secret_map,
+            sender_entry,
+            counters,
+            mut recv_cache,
+            mut queue_dispatcher,
+            frame_tx,
+        ) = setup_maps();
+        let packet = build_ack_packet(&sender_entry, VarInt::ZERO, VarInt::new(7).unwrap(), 1);
+        let clock = StdClock::default();
+        let route = routing::PowerOfTwoRoute::new(1);
+        let acceptor_registry = acceptor::Registry::new();
+        let mut ack_burst_tx = CollectSender::default();
+        let mut response_tx = CollectSender::default();
+        let mut sender_tx = CollectSender::default();
+        let mut waker_sink = CollectSender::default();
+
+        let err = process(
+            packet,
+            &mut recv_cache,
+            &mut ack_burst_tx,
+            &path_secret_map,
+            &acceptor_registry,
+            &frame_tx,
+            &mut response_tx,
+            &mut sender_tx,
+            &mut queue_dispatcher,
+            &clock,
+            &counters,
+            &route,
+            &mut waker_sink,
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, Error::Decryption { .. }));
+        assert!(recv_cache.senders.is_empty());
+        assert!(sender_tx.items.is_empty());
+    }
+
+    #[test]
+    fn replayed_key_is_rejected_before_installing_recv_state() {
+        let (
+            path_secret_map,
+            sender_entry,
+            counters,
+            mut recv_cache,
+            mut queue_dispatcher,
+            frame_tx,
+        ) = setup_maps();
+        let first_packet = build_ack_packet(&sender_entry, VarInt::ZERO, VarInt::ZERO, 1);
+        let replay_packet = build_ack_packet(&sender_entry, VarInt::ZERO, VarInt::ZERO, 2);
+        let clock = StdClock::default();
+        let route = routing::PowerOfTwoRoute::new(1);
+        let acceptor_registry = acceptor::Registry::new();
+
+        let mut ack_burst_tx = CollectSender::default();
+        let mut response_tx = CollectSender::default();
+        let mut sender_tx = CollectSender::default();
+        let mut waker_sink = CollectSender::default();
+
+        process(
+            first_packet,
+            &mut recv_cache,
+            &mut ack_burst_tx,
+            &path_secret_map,
+            &acceptor_registry,
+            &frame_tx,
+            &mut response_tx,
+            &mut sender_tx,
+            &mut queue_dispatcher,
+            &clock,
+            &counters,
+            &route,
+            &mut waker_sink,
+        )
+        .unwrap();
+        assert_eq!(recv_cache.senders.len(), 1);
+        assert_eq!(sender_tx.items.len(), 1);
+
+        let mut fresh_recv_cache = recv::Cache::new(core::time::Duration::from_secs(30), 0);
+        let mut fresh_queue_dispatcher = msg::queue::Allocator::new().dispatcher();
+        let mut fresh_ack_burst_tx = CollectSender::default();
+        let mut fresh_response_tx = CollectSender::default();
+        let mut fresh_sender_tx = CollectSender::default();
+        let mut fresh_waker_sink = CollectSender::default();
+
+        let err = process(
+            replay_packet,
+            &mut fresh_recv_cache,
+            &mut fresh_ack_burst_tx,
+            &path_secret_map,
+            &acceptor_registry,
+            &frame_tx,
+            &mut fresh_response_tx,
+            &mut fresh_sender_tx,
+            &mut fresh_queue_dispatcher,
+            &clock,
+            &counters,
+            &route,
+            &mut fresh_waker_sink,
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, Error::ReplayDefinitelyDetected { .. }));
+        assert!(fresh_recv_cache.senders.is_empty());
+        assert!(fresh_sender_tx.items.is_empty());
     }
 }

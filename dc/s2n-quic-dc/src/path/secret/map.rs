@@ -214,6 +214,16 @@ impl Map {
         Some((opener, entry))
     }
 
+    #[inline]
+    pub fn check_dedup_for_credentials(
+        &self,
+        entry: &Arc<Entry>,
+        credentials: &Credentials,
+        queue_id: Option<VarInt>,
+    ) -> crate::crypto::open::Result {
+        self.store.check_dedup(entry, credentials.key_id, queue_id)
+    }
+
     pub fn open_once(
         &self,
         credentials: &Credentials,

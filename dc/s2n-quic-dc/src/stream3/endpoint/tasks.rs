@@ -676,6 +676,30 @@ fn on_packet_dispatch_error(counters: &endpoint::counters::Dispatch, err: dispat
                 "failed to decrypt packet - authentication failed"
             );
         }
+        dispatch::Error::ReplayDefinitelyDetected {
+            credentials,
+            packet_number,
+        } => {
+            counters.rx_peer_replay_definitely_detected.add(1);
+            tracing::debug!(
+                ?credentials,
+                pn = packet_number.as_u64(),
+                "replayed key rejected for packet"
+            );
+        }
+        dispatch::Error::ReplayPotentiallyDetected {
+            credentials,
+            packet_number,
+            gap,
+        } => {
+            counters.rx_peer_replay_potentially_detected.add(1);
+            tracing::debug!(
+                ?credentials,
+                pn = packet_number.as_u64(),
+                ?gap,
+                "potentially replayed key rejected for packet"
+            );
+        }
         dispatch::Error::Duplicate {
             credentials,
             packet_number,
