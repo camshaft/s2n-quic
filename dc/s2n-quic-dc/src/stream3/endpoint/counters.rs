@@ -3,6 +3,7 @@
 
 use crate::{
     counter::{Counter, Registry, Summary, Timer, Unit},
+    flow::queue::ValidationError,
     packet::datagram::ResetTarget,
     stream3::frame::Header,
 };
@@ -12,7 +13,6 @@ use std::sync::Arc;
 /// Counters for the datagram receive/dispatch pipeline.
 pub(crate) struct Dispatch {
     pub rx_data_pkt: Counter,
-    pub rx_none: Counter,
     pub rx_init: Counter,
     pub rx_validate: Counter,
     pub rx_init_validate: Counter,
@@ -39,13 +39,17 @@ pub(crate) struct Dispatch {
     pub rx_data_ok: Counter,
     pub rx_data_unallocated: Counter,
     pub rx_data_half_closed: Counter,
-    pub rx_data_fully_closed: Counter,
+    pub rx_data_credential_mismatch: Counter,
+    pub rx_data_stream_id_mismatch: Counter,
+    pub rx_data_tombstone: Counter,
     pub rx_data_perm_closed: Counter,
 
     pub rx_flow_control_ok: Counter,
     pub rx_flow_control_unallocated: Counter,
     pub rx_flow_control_half_closed: Counter,
-    pub rx_flow_control_fully_closed: Counter,
+    pub rx_flow_control_credential_mismatch: Counter,
+    pub rx_flow_control_stream_id_mismatch: Counter,
+    pub rx_flow_control_tombstone: Counter,
     pub rx_flow_control_perm_closed: Counter,
 
     pub rx_reset_both: Counter,
@@ -89,7 +93,6 @@ impl Dispatch {
     pub fn new(counters: &Registry) -> Arc<Self> {
         Arc::new(Self {
             rx_data_pkt: counters.register("rx.data_pkt"),
-            rx_none: counters.register("!rx.none"),
             rx_init: counters.register("rx.init"),
             rx_validate: counters.register("rx.validate"),
             rx_init_validate: counters.register("rx.init_validate"),
@@ -116,15 +119,24 @@ impl Dispatch {
                 .register("!rx.init_validate.dispatch_failed"),
 
             rx_data_ok: counters.register("rx.data.ok"),
-            rx_data_unallocated: counters.register("!rx.data.unallocated"),
-            rx_data_half_closed: counters.register("!rx.data.half_closed"),
-            rx_data_fully_closed: counters.register("!rx.data.fully_closed"),
+            rx_data_unallocated: counters.register_nominal("!rx.data", "unallocated"),
+            rx_data_half_closed: counters.register_nominal("!rx.data", "half_closed"),
+            rx_data_credential_mismatch: counters
+                .register_nominal("!rx.data", "credential_mismatch"),
+            rx_data_stream_id_mismatch: counters.register_nominal("!rx.data", "stream_id_mismatch"),
+            rx_data_tombstone: counters.register_nominal("rx.data", "tombstone"),
             rx_data_perm_closed: counters.register("rx.data.perm_closed"),
 
             rx_flow_control_ok: counters.register("rx.flow_control.ok"),
-            rx_flow_control_unallocated: counters.register("!rx.flow_control.unallocated"),
-            rx_flow_control_half_closed: counters.register("!rx.flow_control.half_closed"),
-            rx_flow_control_fully_closed: counters.register("!rx.flow_control.fully_closed"),
+            rx_flow_control_unallocated: counters
+                .register_nominal("!rx.flow_control", "unallocated"),
+            rx_flow_control_half_closed: counters
+                .register_nominal("!rx.flow_control", "half_closed"),
+            rx_flow_control_credential_mismatch: counters
+                .register_nominal("!rx.flow_control", "credential_mismatch"),
+            rx_flow_control_stream_id_mismatch: counters
+                .register_nominal("!rx.flow_control", "stream_id_mismatch"),
+            rx_flow_control_tombstone: counters.register_nominal("rx.flow_control", "tombstone"),
             rx_flow_control_perm_closed: counters.register("rx.flow_control.perm_closed"),
 
             rx_reset_both: counters.register("rx.reset.both"),
@@ -165,6 +177,24 @@ impl Dispatch {
             rx_ecn_ce: counters.register_nominal("rx.ecn", "ce"),
             rx_ecn_not_ect: counters.register_nominal("rx.ecn", "not_ect"),
         })
+    }
+
+    #[inline]
+    pub fn on_data_validation_failed(&self, reason: ValidationError) {
+        match reason {
+            ValidationError::CredentialMismatch => self.rx_data_credential_mismatch.add(1),
+            ValidationError::StreamIdMismatch => self.rx_data_stream_id_mismatch.add(1),
+            ValidationError::Tombstone => self.rx_data_tombstone.add(1),
+        }
+    }
+
+    #[inline]
+    pub fn on_flow_control_validation_failed(&self, reason: ValidationError) {
+        match reason {
+            ValidationError::CredentialMismatch => self.rx_flow_control_credential_mismatch.add(1),
+            ValidationError::StreamIdMismatch => self.rx_flow_control_stream_id_mismatch.add(1),
+            ValidationError::Tombstone => self.rx_flow_control_tombstone.add(1),
+        }
     }
 
     #[inline]
@@ -212,6 +242,8 @@ impl Dispatch {
 pub(crate) struct Send {
     pub lost: Counter,
     pub invalid_sender_idx: Counter,
+    pub tx_ack_received: Counter,
+    pub tx_ack_no_ctx: Counter,
     pub tx_rtt: Timer,
     pub tx_ecn_ect0: Counter,
     pub tx_ecn_ect1: Counter,
@@ -223,6 +255,8 @@ impl Send {
         Arc::new(Self {
             lost: counters.register("!send.lost"),
             invalid_sender_idx: counters.register("!send.invalid_sender_idx"),
+            tx_ack_received: counters.register("tx.ack_received"),
+            tx_ack_no_ctx: counters.register("!tx.ack_no_ctx"),
             tx_rtt: counters.register_timer("tx.rtt"),
             tx_ecn_ect0: counters.register_nominal("tx.ecn", "ect0"),
             tx_ecn_ect1: counters.register_nominal("tx.ecn", "ect1"),
@@ -238,6 +272,16 @@ impl Send {
     #[inline]
     pub fn on_invalid_sender_idx(&self) {
         self.invalid_sender_idx.add(1);
+    }
+
+    #[inline]
+    pub fn on_received_ack(&self) {
+        self.tx_ack_received.add(1);
+    }
+
+    #[inline]
+    pub fn on_received_ack_no_ctx(&self) {
+        self.tx_ack_no_ctx.add(1);
     }
 
     #[inline]

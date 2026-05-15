@@ -21,7 +21,8 @@ use std::{cell::RefCell, collections::hash_map, rc::Rc, sync::Arc};
 /// Idle → Scheduled (ack-eliciting packet received)
 /// Scheduled → Flushed (submission sent to send worker)
 /// Flushed → Idle (completion returned, no new data)
-/// Flushed → Scheduled (completion returned, new data arrived while in flight)
+/// Flushed → FlushedStale (ack-eliciting packet received while completion is in flight)
+/// FlushedStale → Scheduled (completion returned, needs re-flush)
 /// ```
 #[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AckState {
@@ -33,21 +34,32 @@ pub(crate) enum AckState {
     /// ACK submission is in the send pipeline. New packets update the shared state
     /// but don't produce another submission until the completion returns.
     Flushed,
+    /// ACK completion is in flight and new ack-eliciting data arrived.
+    FlushedStale,
 }
 
 impl AckState {
     s2n_quic_core::state::is!(is_scheduled, Scheduled);
     s2n_quic_core::state::is!(is_flushed, Flushed);
+    s2n_quic_core::state::is!(is_flushed_stale, FlushedStale);
 
     s2n_quic_core::state::event! {
         /// An ack-eliciting packet was received.
-        on_ack_eliciting(Idle => Scheduled);
+        on_ack_eliciting(
+            Idle | Scheduled => Scheduled,
+            Flushed | FlushedStale => FlushedStale,
+        );
         /// The ACK submission was sent to the send worker.
         on_flush(Scheduled => Flushed);
-        /// Completion returned and no new packets arrived — back to idle.
-        on_completion_idle(Flushed => Idle);
-        /// Completion returned but new packets arrived — re-schedule.
-        on_completion_stale(Flushed => Scheduled);
+        /// ACK flush completion returned.
+        ///
+        /// If no new packets arrived while in flight, transition back to idle.
+        /// If packets arrived (FlushedStale), transition to scheduled so the
+        /// completion path can re-encode and resubmit.
+        on_flush_complete(
+            Flushed => Idle,
+            FlushedStale => Scheduled,
+        );
         /// Scheduled but nothing to encode — reset to idle.
         on_empty(Scheduled => Idle);
     }
@@ -161,40 +173,115 @@ impl crate::clock::wheel::WheelAdapter for IdleWheelAdapter {
     }
 }
 
+pub(crate) struct AckBurstAdapter;
+
+impl crate::intrusive_queue::Adapter for AckBurstAdapter {
+    type Value = RefCell<Context>;
+    type Target = RefCell<Context>;
+    type Pointer = Rc<RefCell<Context>>;
+
+    unsafe fn links(value: *mut Self::Value) -> *mut intrusive_queue::Links {
+        core::ptr::addr_of_mut!((*(*value).as_ptr()).ack_burst)
+    }
+
+    unsafe fn target(value: *mut Self::Value) -> *mut Self::Target {
+        value
+    }
+
+    fn as_ptr(ptr: &Self::Pointer) -> *const Self::Value {
+        Rc::as_ptr(ptr)
+    }
+
+    fn into_raw(ptr: Self::Pointer) -> *mut Self::Value {
+        Rc::into_raw(ptr) as *mut Self::Value
+    }
+
+    unsafe fn from_raw(ptr: *mut Self::Value) -> Self::Pointer {
+        Rc::from_raw(ptr)
+    }
+}
+
+/// Attempt deduplication using a circular bitmap.
 ///
-/// Uses a sliding window to efficiently deduplicate FlowInit packets within
-/// a bounded memory footprint. This is the fast path for recent attempt_ids.
+/// Tracks up to `CAPACITY` recent attempt_ids without shifting memory. The bitmap
+/// is indexed relative to `right_edge` using modular arithmetic.
 pub(crate) struct AttemptDedup {
-    /// Sliding window for recent attempt_ids (same as packet number dedup)
-    window: s2n_quic_core::packet::number::SlidingWindow,
+    bitmap: [u64; Self::WORDS],
+    right_edge: Option<u64>,
 }
 
 impl AttemptDedup {
+    const WORDS: usize = 32;
+    const CAPACITY: u64 = (Self::WORDS as u64) * 64;
+
     pub fn new() -> Self {
         Self {
-            window: Default::default(),
+            bitmap: [0; Self::WORDS],
+            right_edge: None,
         }
     }
 
-    /// Check if an attempt_id has been seen before in the recent window.
-    ///
-    /// Returns:
-    /// - Ok(()) if attempt_id is new and within window
-    /// - Err(Duplicate) if already seen in window
-    /// - Err(TooOld) if outside window (check DashMap or retry)
     pub fn check_attempt_id(&mut self, attempt_id: VarInt) -> Result<(), AttemptDedupError> {
-        use s2n_quic_core::packet::number::{PacketNumberSpace, SlidingWindowError};
+        let id = attempt_id.as_u64();
 
-        let packet_number = PacketNumberSpace::Initial.new_packet_number(attempt_id);
-        match self.window.insert(packet_number) {
-            Ok(()) => Ok(()),
-            Err(SlidingWindowError::TooOld) => Err(AttemptDedupError::TooOld),
-            Err(SlidingWindowError::Duplicate) => Err(AttemptDedupError::Duplicate),
+        let Some(edge) = self.right_edge else {
+            self.right_edge = Some(id);
+            return Ok(());
+        };
+
+        if id == edge {
+            return Err(AttemptDedupError::Duplicate);
         }
+
+        if id > edge {
+            let advance = id - edge;
+            self.clear_range(edge + 1, advance);
+            // The old right_edge moves into the bitmap (if still in window)
+            if advance < Self::CAPACITY {
+                let (word, mask) = Self::index(edge);
+                self.bitmap[word] |= mask;
+            }
+            self.right_edge = Some(id);
+            return Ok(());
+        }
+
+        // id < edge
+        let offset = edge - id;
+        if offset >= Self::CAPACITY {
+            return Err(AttemptDedupError::TooOld);
+        }
+
+        let (word, mask) = Self::index(id);
+        if self.bitmap[word] & mask != 0 {
+            return Err(AttemptDedupError::Duplicate);
+        }
+
+        self.bitmap[word] |= mask;
+        Ok(())
+    }
+
+    /// Clear `count` bit positions starting at `from`.
+    fn clear_range(&mut self, from: u64, count: u64) {
+        if count >= Self::CAPACITY {
+            self.bitmap = [0; Self::WORDS];
+            return;
+        }
+        for i in 0..count {
+            let (word, mask) = Self::index(from + i);
+            self.bitmap[word] &= !mask;
+        }
+    }
+
+    #[inline]
+    fn index(id: u64) -> (usize, u64) {
+        let bit = (id % Self::CAPACITY) as usize;
+        let word = bit / 64;
+        let mask = 1u64 << (bit % 64);
+        (word, mask)
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) enum AttemptDedupError {
     /// Attempt ID already seen (duplicate)
     Duplicate,
@@ -223,9 +310,6 @@ pub(crate) struct Context {
     pub dedup_filter: crate::stream::recv::ack::StreamFilter,
     /// Lightweight ACK range tracker for the direct ACK path.
     pub ack_ranges: ack_ranges::AckRanges,
-    /// Writer handle to the shared ACK state. Updated when ranges change;
-    /// the send worker reads the latest snapshot at assembly time.
-    pub ack_writer: ack_state::Writer,
     /// Which local sender_id outgoing ACKs for this peer route through.
     pub dest_sender_id: VarInt,
     /// Accumulated ECN counts for received packets, reported back to the sender
@@ -242,6 +326,8 @@ pub(crate) struct Context {
     pub ack_wheel: AckWheelLinks,
     /// Intrusive links for idle timeout wheel
     pub idle_wheel: IdleWheelLinks,
+    /// Intrusive links for recv-worker pending-ACK burst queue membership.
+    pub ack_burst: intrusive_queue::Links,
 }
 
 impl Context {
@@ -262,7 +348,6 @@ impl Context {
         idle_timer.set(now + idle_timeout);
 
         let flows = flow::Tracker::new(*path_entry.id());
-        let (ack_writer, _ack_reader) = ack_state::channel();
 
         Self {
             path_entry,
@@ -271,7 +356,6 @@ impl Context {
             current_key_id: key_id,
             dedup_filter: Default::default(),
             ack_ranges: Default::default(),
-            ack_writer,
             dest_sender_id,
             ecn_counts: Default::default(),
             idle_timer,
@@ -281,6 +365,7 @@ impl Context {
             flows,
             ack_wheel: AckWheelLinks::new(),
             idle_wheel: IdleWheelLinks::new(),
+            ack_burst: intrusive_queue::Links::new(),
         }
     }
 
@@ -323,7 +408,7 @@ impl Context {
         last_activity >= cutoff
     }
 
-    /// Update the shared ACK state and produce a submission for the direct ACK path.
+    /// Encode the current ACK state and produce a direct submission for the send worker.
     ///
     /// Only produces a submission when ack_state is Scheduled (new packets arrived
     /// since the last submission). Transitions to Flushed after submitting to enforce
@@ -331,7 +416,7 @@ impl Context {
     /// whether ack_state went back to Scheduled (new packets arrived) and re-submits.
     ///
     /// Returns `None` if there are no ranges or an ACK is already in flight.
-    pub fn update_ack_state(&mut self, recv_worker_id: usize) -> Option<ack_state::Submission> {
+    pub fn encode_and_flush(&mut self, recv_worker_id: usize) -> Option<ack_state::Submission> {
         if !self.ack_state.is_scheduled() {
             return None;
         }
@@ -351,17 +436,26 @@ impl Context {
             return None;
         };
 
-        self.ack_writer
-            .update(body, largest_recv_time.into(), has_ecn);
         let _ = self.ack_state.on_flush();
 
         Some(ack_state::Submission {
-            reader: self.ack_writer.reader(),
+            body,
+            largest_recv_time: largest_recv_time.into(),
+            has_ecn,
             path_secret_entry: self.path_entry.clone(),
             local_sender_id: self.dest_sender_id,
             remote_sender_id: self.remote_sender_id,
             recv_worker_id,
         })
+    }
+
+    pub fn on_ack_completion(&mut self, recv_worker_id: usize) -> Option<ack_state::Submission> {
+        debug_assert!(
+            self.ack_state.is_flushed() || self.ack_state.is_flushed_stale(),
+            "ack completion should only be observed for Flushed/FlushedStale states"
+        );
+        let _ = self.ack_state.on_flush_complete();
+        self.encode_and_flush(recv_worker_id)
     }
 }
 
@@ -436,8 +530,8 @@ impl Cache {
                     clock,
                     self.idle_timeout,
                 )));
-                let inserted = entry.insert(ctx).clone();
-                (inserted, false)
+                entry.insert(ctx.clone());
+                (ctx, false)
             }
         })
     }
@@ -445,5 +539,183 @@ impl Cache {
     /// Remove the recv context for the given key from the cache.
     pub fn remove(&mut self, key: &Key) {
         self.senders.remove(key);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bolero::check;
+    use std::collections::VecDeque;
+
+    fn v(n: u64) -> VarInt {
+        VarInt::new(n).unwrap()
+    }
+
+    /// Oracle implementation using a VecDeque with the same capacity semantics.
+    struct Oracle {
+        seen: VecDeque<u64>,
+        right_edge: Option<u64>,
+    }
+
+    impl Oracle {
+        fn new() -> Self {
+            Self {
+                seen: VecDeque::new(),
+                right_edge: None,
+            }
+        }
+
+        fn check(&mut self, id: u64) -> Result<(), AttemptDedupError> {
+            let Some(edge) = self.right_edge else {
+                self.right_edge = Some(id);
+                self.seen.push_back(id);
+                return Ok(());
+            };
+
+            if id > edge {
+                self.right_edge = Some(id);
+            }
+
+            // Evict entries that are now too old
+            let new_edge = self.right_edge.unwrap();
+            while let Some(&oldest) = self.seen.front() {
+                if new_edge - oldest >= AttemptDedup::CAPACITY {
+                    self.seen.pop_front();
+                } else {
+                    break;
+                }
+            }
+
+            if new_edge - id >= AttemptDedup::CAPACITY {
+                return Err(AttemptDedupError::TooOld);
+            }
+
+            if self.seen.contains(&id) {
+                return Err(AttemptDedupError::Duplicate);
+            }
+
+            self.seen.push_back(id);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn first_insert_succeeds() {
+        let mut dedup = AttemptDedup::new();
+        assert!(dedup.check_attempt_id(v(0)).is_ok());
+    }
+
+    #[test]
+    fn duplicate_right_edge() {
+        let mut dedup = AttemptDedup::new();
+        assert!(dedup.check_attempt_id(v(5)).is_ok());
+        assert_eq!(
+            dedup.check_attempt_id(v(5)).unwrap_err(),
+            AttemptDedupError::Duplicate
+        );
+    }
+
+    #[test]
+    fn duplicate_within_window() {
+        let mut dedup = AttemptDedup::new();
+        assert!(dedup.check_attempt_id(v(10)).is_ok());
+        assert!(dedup.check_attempt_id(v(8)).is_ok());
+        assert_eq!(
+            dedup.check_attempt_id(v(8)).unwrap_err(),
+            AttemptDedupError::Duplicate
+        );
+    }
+
+    #[test]
+    fn too_old() {
+        let mut dedup = AttemptDedup::new();
+        assert!(dedup
+            .check_attempt_id(v(AttemptDedup::CAPACITY + 10))
+            .is_ok());
+        assert_eq!(
+            dedup.check_attempt_id(v(0)).unwrap_err(),
+            AttemptDedupError::TooOld
+        );
+    }
+
+    #[test]
+    fn advance_clears_old_bits() {
+        let mut dedup = AttemptDedup::new();
+        assert!(dedup.check_attempt_id(v(5)).is_ok());
+        assert!(dedup.check_attempt_id(v(3)).is_ok());
+
+        assert!(dedup
+            .check_attempt_id(v(5 + AttemptDedup::CAPACITY + 1))
+            .is_ok());
+
+        assert_eq!(
+            dedup.check_attempt_id(v(3)).unwrap_err(),
+            AttemptDedupError::TooOld
+        );
+        assert_eq!(
+            dedup.check_attempt_id(v(5)).unwrap_err(),
+            AttemptDedupError::TooOld
+        );
+    }
+
+    #[test]
+    fn advance_clears_reused_positions() {
+        let mut dedup = AttemptDedup::new();
+        assert!(dedup.check_attempt_id(v(0)).is_ok());
+        assert!(dedup.check_attempt_id(v(1)).is_ok());
+
+        let wrap = AttemptDedup::CAPACITY;
+        assert!(dedup.check_attempt_id(v(1 + wrap)).is_ok());
+        assert!(dedup.check_attempt_id(v(wrap)).is_ok());
+    }
+
+    #[test]
+    fn sequential_inserts() {
+        let mut dedup = AttemptDedup::new();
+        for i in 0..AttemptDedup::CAPACITY * 3 {
+            assert!(dedup.check_attempt_id(v(i)).is_ok(), "failed at {i}");
+        }
+    }
+
+    #[test]
+    fn out_of_order_within_window() {
+        let mut dedup = AttemptDedup::new();
+        assert!(dedup.check_attempt_id(v(100)).is_ok());
+        assert!(dedup.check_attempt_id(v(50)).is_ok());
+        assert!(dedup.check_attempt_id(v(75)).is_ok());
+        assert!(dedup.check_attempt_id(v(99)).is_ok());
+
+        assert_eq!(
+            dedup.check_attempt_id(v(50)).unwrap_err(),
+            AttemptDedupError::Duplicate
+        );
+        assert_eq!(
+            dedup.check_attempt_id(v(100)).unwrap_err(),
+            AttemptDedupError::Duplicate
+        );
+    }
+
+    #[test]
+    fn fuzz_matches_oracle() {
+        check!().with_type::<Vec<u16>>().for_each(|ops| {
+            let mut dedup = AttemptDedup::new();
+            let mut oracle = Oracle::new();
+
+            for &id in ops.iter() {
+                let id = id as u64;
+                let actual = dedup.check_attempt_id(v(id));
+                let expected = oracle.check(id);
+
+                assert_eq!(
+                    actual.is_ok(),
+                    expected.is_ok(),
+                    "mismatch at id={id}: actual={actual:?} expected={expected:?}"
+                );
+                if let (Err(a), Err(e)) = (&actual, &expected) {
+                    assert_eq!(a, e, "error kind mismatch at id={id}");
+                }
+            }
+        });
     }
 }

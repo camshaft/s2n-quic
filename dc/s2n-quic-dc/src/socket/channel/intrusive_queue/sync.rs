@@ -227,15 +227,26 @@ impl<T> super::super::Receiver<intrusive_queue::Entry<T>> for Receiver<T> {
     fn poll_recv(
         &mut self,
         cx: &mut core::task::Context<'_>,
+        budget: &mut super::super::Budget,
     ) -> Poll<Option<intrusive_queue::Entry<T>>> {
+        if budget.is_exhausted() {
+            budget.set_needs_wake();
+            return Poll::Pending;
+        }
+
         let mut guard = self.shared.inner.lock();
 
         if let Some(entry) = guard.queue.pop_front() {
+            budget.consume();
             return Poll::Ready(Some(entry));
         }
 
         // Check if all senders are gone (strong_count <= 1 means only receiver left)
         if Arc::strong_count(&self.shared) <= 1 {
+            tracing::error!(
+                strong_count = Arc::strong_count(&self.shared),
+                "sync channel closed: all senders dropped"
+            );
             return Poll::Ready(None);
         }
 
@@ -251,17 +262,28 @@ impl<T> super::super::Receiver<intrusive_queue::Queue<T>> for Receiver<T> {
     fn poll_recv(
         &mut self,
         cx: &mut core::task::Context<'_>,
+        budget: &mut super::super::Budget,
     ) -> Poll<Option<intrusive_queue::Queue<T>>> {
+        if budget.is_exhausted() {
+            budget.set_needs_wake();
+            return Poll::Pending;
+        }
+
         let mut guard = self.shared.inner.lock();
 
         if !guard.queue.is_empty() {
             // Drain all available entries into a batch
             let batch = core::mem::take(&mut guard.queue);
+            budget.consume();
             return Poll::Ready(Some(batch));
         }
 
         // Check if all senders are gone (strong_count <= 1 means only receiver left)
         if Arc::strong_count(&self.shared) <= 1 {
+            tracing::error!(
+                strong_count = Arc::strong_count(&self.shared),
+                "sync channel closed: all senders dropped"
+            );
             return Poll::Ready(None);
         }
 

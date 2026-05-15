@@ -36,7 +36,7 @@ use s2n_quic_core::{
 };
 use std::{cell::RefCell, rc::Rc, sync::Arc};
 
-#[cfg(todo)]
+#[cfg(test)]
 mod tests;
 
 /// Pending frame queue with an integrated wire-cost counter.
@@ -453,7 +453,7 @@ impl Context {
     /// Pop the next pending frame, draining from highest priority first.
     #[inline]
     pub fn pop_pending(&mut self) -> Option<intrusive_queue::Entry<Frame>> {
-        for queue in &mut self.queues[1..] {
+        for queue in &mut self.queues {
             if let Some(frame) = queue.pop_front() {
                 return Some(frame);
             }
@@ -511,7 +511,7 @@ impl Context {
 
     #[inline]
     pub fn has_pending_data(&self) -> bool {
-        self.queues[1..].iter().any(|q| !q.is_empty())
+        self.queues.iter().any(|q| !q.is_empty())
     }
 
     #[inline]

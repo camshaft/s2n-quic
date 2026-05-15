@@ -78,7 +78,7 @@ struct TestReceiver<T> {
 }
 
 impl<T> Receiver<T> for TestReceiver<T> {
-    fn poll_recv(&mut self, _cx: &mut task::Context<'_>) -> Poll<Option<T>> {
+    fn poll_recv(&mut self, _cx: &mut task::Context<'_>, _budget: &mut Budget) -> Poll<Option<T>> {
         Poll::Ready(self.values.pop_front())
     }
 
@@ -108,6 +108,28 @@ fn new_test_item(
 
 fn new_test_frame(path_secret_entry: Arc<PathSecretEntry>, payload_len: usize) -> Entry<Frame> {
     new_test_frame_with_sender_id(path_secret_entry, payload_len, VarInt::MAX)
+}
+
+fn new_test_frame_with_header(
+    path_secret_entry: Arc<PathSecretEntry>,
+    payload_len: usize,
+    header: Header,
+) -> Entry<Frame> {
+    let mut payload = ByteVec::new();
+    if payload_len > 0 {
+        payload.push_back(Bytes::from(vec![0u8; payload_len]));
+    }
+
+    Entry::new(Frame {
+        header,
+        source_sender_id: VarInt::MAX,
+        payload,
+        path_secret_entry,
+        completion: None,
+        status: TransmissionStatus::Pending,
+        ttl: DEFAULT_TTL,
+        transmission_time: None,
+    })
 }
 
 fn new_test_frame_with_sender_id(
@@ -272,6 +294,59 @@ fn sticky_sender_error_returns_value() {
 // ── BatchFramesByPathSecret tests ─────────────────────────────────────────
 
 #[test]
+fn frame_batch_tracks_byte_costs_per_priority() {
+    let path = test_path_secret_entry();
+    let first = new_test_frame(path.clone(), 16);
+    let first_cost = first.byte_cost();
+    let mut batch = FrameBatch::new(first);
+
+    let data = new_test_frame_with_header(
+        path.clone(),
+        24,
+        Header::FlowData {
+            queue_pair: crate::packet::datagram::QueuePair {
+                source_queue_id: VarInt::from_u8(0),
+                dest_queue_id: VarInt::from_u8(1),
+            },
+            stream_id: VarInt::from_u8(0),
+            offset: VarInt::ZERO,
+            is_fin: false,
+        },
+    );
+    let data_cost = data.byte_cost();
+    batch.push_with_cost(data, data_cost);
+
+    let reset = new_test_frame_with_header(
+        path,
+        0,
+        Header::FlowReset {
+            dest_queue_id: VarInt::from_u8(1),
+            stream_id: VarInt::from_u8(0),
+            reset_target: crate::packet::datagram::ResetTarget::Both,
+            error_code: VarInt::from_u8(7),
+        },
+    );
+    let reset_cost = reset.byte_cost();
+    batch.push_with_cost(reset, reset_cost);
+
+    assert_eq!(
+        batch.byte_cost(),
+        MAX_FRAME_BATCH_PACKET_OVERHEAD + first_cost + data_cost + reset_cost
+    );
+
+    let (queues, costs) = batch.into_queues();
+    assert_eq!(
+        costs[Priority::FlowControl.as_index()],
+        MAX_FRAME_BATCH_PACKET_OVERHEAD + first_cost
+    );
+    assert_eq!(costs[Priority::FlowData.as_index()], data_cost);
+    assert_eq!(costs[Priority::FlowReset.as_index()], reset_cost);
+    assert_eq!(queues[Priority::FlowControl.as_index()].len(), 1);
+    assert_eq!(queues[Priority::FlowData.as_index()].len(), 1);
+    assert_eq!(queues[Priority::FlowReset.as_index()].len(), 1);
+}
+
+#[test]
 fn batch_frames_groups_by_same_path_secret() {
     let path_a = test_path_secret_entry();
     let path_b = test_path_secret_entry();
@@ -288,14 +363,14 @@ fn batch_frames_groups_by_same_path_secret() {
     };
     let mut batcher = BatchFramesByPathSecret::new(rx, &test_clock(), Rate::new(10.0));
 
-    let first = with_noop_context(|cx| batcher.poll_recv(cx));
+    let first = with_noop_context(|cx| batcher.poll_recv(cx, &mut Budget::new(usize::MAX)));
     let Poll::Ready(Some(first)) = first else {
         panic!("expected first batch");
     };
     assert_eq!(first.len(), 2);
     assert!(Arc::ptr_eq(first.path_secret_entry(), &path_a));
 
-    let second = with_noop_context(|cx| batcher.poll_recv(cx));
+    let second = with_noop_context(|cx| batcher.poll_recv(cx, &mut Budget::new(usize::MAX)));
     let Poll::Ready(Some(second)) = second else {
         panic!("expected second batch");
     };
@@ -321,7 +396,7 @@ fn batch_frames_enforces_datagram_byte_budget() {
 
     let target_bytes = u16::MAX as u64 - 3000;
 
-    let first = with_noop_context(|cx| batcher.poll_recv(cx));
+    let first = with_noop_context(|cx| batcher.poll_recv(cx, &mut Budget::new(usize::MAX)));
     let Poll::Ready(Some(first)) = first else {
         panic!("expected first batch");
     };
@@ -329,13 +404,13 @@ fn batch_frames_enforces_datagram_byte_budget() {
     assert_eq!(first.len(), 1);
     assert!(first.byte_cost() <= target_bytes);
 
-    let second = with_noop_context(|cx| batcher.poll_recv(cx));
+    let second = with_noop_context(|cx| batcher.poll_recv(cx, &mut Budget::new(usize::MAX)));
     let Poll::Ready(Some(second)) = second else {
         panic!("expected second batch");
     };
     assert_eq!(second.len(), 1);
 
-    let third = with_noop_context(|cx| batcher.poll_recv(cx));
+    let third = with_noop_context(|cx| batcher.poll_recv(cx, &mut Budget::new(usize::MAX)));
     let Poll::Ready(Some(third)) = third else {
         panic!("expected third batch");
     };
@@ -369,7 +444,7 @@ fn batch_frames_tracks_sticky_sender_from_first_frame() {
     };
     let mut batcher = BatchFramesByPathSecret::new(rx, &test_clock(), Rate::new(10.0));
 
-    let first = with_noop_context(|cx| batcher.poll_recv(cx));
+    let first = with_noop_context(|cx| batcher.poll_recv(cx, &mut Budget::new(usize::MAX)));
     let Poll::Ready(Some(batch)) = first else {
         panic!("expected batch");
     };
@@ -391,14 +466,14 @@ fn batch_frames_breaks_on_conflicting_sticky_senders() {
     };
     let mut batcher = BatchFramesByPathSecret::new(rx, &test_clock(), Rate::new(10.0));
 
-    let first = with_noop_context(|cx| batcher.poll_recv(cx));
+    let first = with_noop_context(|cx| batcher.poll_recv(cx, &mut Budget::new(usize::MAX)));
     let Poll::Ready(Some(batch1)) = first else {
         panic!("expected first batch");
     };
     assert_eq!(batch1.len(), 1);
     assert_eq!(batch1.sender_id(), Some(1));
 
-    let second = with_noop_context(|cx| batcher.poll_recv(cx));
+    let second = with_noop_context(|cx| batcher.poll_recv(cx, &mut Budget::new(usize::MAX)));
     let Poll::Ready(Some(batch2)) = second else {
         panic!("expected second batch");
     };
@@ -421,7 +496,7 @@ fn batch_frames_adopts_sticky_from_later_frame() {
     };
     let mut batcher = BatchFramesByPathSecret::new(rx, &test_clock(), Rate::new(10.0));
 
-    let first = with_noop_context(|cx| batcher.poll_recv(cx));
+    let first = with_noop_context(|cx| batcher.poll_recv(cx, &mut Budget::new(usize::MAX)));
     let Poll::Ready(Some(batch)) = first else {
         panic!("expected batch");
     };
@@ -468,9 +543,9 @@ fn ack_processor_drops_message_with_out_of_range_sender_idx() {
         registry.register_queue_gauge("q.tx_wheel"),
     );
 
-    let first = with_noop_context(|cx| processor.poll_recv(cx));
+    let first = with_noop_context(|cx| processor.poll_recv(cx, &mut Budget::new(usize::MAX)));
     assert_eq!(first, Poll::Ready(Some(())));
 
-    let second = with_noop_context(|cx| processor.poll_recv(cx));
+    let second = with_noop_context(|cx| processor.poll_recv(cx, &mut Budget::new(usize::MAX)));
     assert_eq!(second, Poll::Ready(None));
 }
