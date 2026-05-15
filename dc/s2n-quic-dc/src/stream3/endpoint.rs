@@ -314,6 +314,7 @@ where
     let local_flow = local_flow::Controller::new(
         local_flow::Controller::DEFAULT_MAX_QUEUED_BYTES,
         local_flow::Controller::DEFAULT_MAX_INFLIGHT_BYTES,
+        local_flow::Controller::DEFAULT_MAX_BURST_BYTES,
     );
 
     // Shared flow-queue allocator and dispatch counters -------------------------

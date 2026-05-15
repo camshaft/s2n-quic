@@ -131,10 +131,10 @@ struct Inner {
     status: Status,
     /// Endpoint-wide local flow control shared across writers
     local_flow: Arc<local_flow::Controller>,
+    /// Per-writer local flow entry tracked by the controller
+    flow: Arc<local_flow::Flow>,
     /// Application-assigned priority for endpoint-local credit arbitration
     stream_priority: StreamPriority,
-    /// Stable waiter identifier used for fair credit wakeups
-    waiter_id: u64,
     /// Reset error code if the stream was reset by the peer
     reset_error_code: Option<VarInt>,
     /// Cooperative yield budget
@@ -187,7 +187,8 @@ impl Writer {
         let packet_size = mtu.saturating_sub(MAX_FLOW_DATA_HEADER_OVERHEAD);
         let max_inflight_bytes = parameters.local_send_max_data.as_u64();
         let remote_max_data = VarInt::ZERO;
-        let waiter_id = local_flow.allocate_waiter_id();
+        let stream_priority = StreamPriority::default();
+        let flow = local_flow.allocate_flow(stream_priority);
 
         Self(Box::new(Inner {
             frame_tx,
@@ -203,8 +204,8 @@ impl Writer {
             remote_max_data,
             status: Status::Init,
             local_flow,
-            stream_priority: StreamPriority::default(),
-            waiter_id,
+            flow,
+            stream_priority,
             reset_error_code: None,
             coop: Coop::default(),
         }))
@@ -223,7 +224,8 @@ impl Writer {
         let packet_size = mtu.saturating_sub(MAX_FLOW_DATA_HEADER_OVERHEAD);
         let max_inflight_bytes = parameters.local_send_max_data.as_u64();
         let initial_remote_max_data = parameters.remote_max_data;
-        let waiter_id = local_flow.allocate_waiter_id();
+        let stream_priority = StreamPriority::default();
+        let flow = local_flow.allocate_flow(stream_priority);
 
         Self(Box::new(Inner {
             frame_tx,
@@ -239,8 +241,8 @@ impl Writer {
             remote_max_data: initial_remote_max_data,
             status: Status::Open,
             local_flow,
-            stream_priority: StreamPriority::default(),
-            waiter_id,
+            flow,
+            stream_priority,
             reset_error_code: None,
             coop: Coop::default(),
         }))
@@ -342,8 +344,7 @@ impl Inner {
             return;
         }
 
-        self.local_flow
-            .clear_waiter(self.waiter_id, self.stream_priority);
+        self.local_flow.update_priority(&self.flow, priority);
         self.stream_priority = priority;
     }
 
@@ -389,21 +390,17 @@ impl Inner {
             return Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()));
         }
 
-        self.local_flow
-            .clear_waiter(self.waiter_id, self.stream_priority);
         self.poll_completions(cx)?;
         let _ = self.poll_remote_budget(cx)?;
 
         if self.status.is_init() {
-            let outcome = self.send_flow_init_with_early_data(buf, is_fin)?;
+            let outcome = self.send_flow_init_with_early_data(cx, buf, is_fin)?;
 
             if outcome.written > 0 || outcome.is_fin {
                 return Poll::Ready(Ok(outcome.written));
             }
 
-            if let Some(requested) = outcome.local_flow_blocked {
-                self.local_flow
-                    .register_waiter(self.waiter_id, self.stream_priority, requested, cx.waker());
+            if outcome.local_flow_blocked.is_some() {
                 return Poll::Pending;
             }
 
@@ -423,14 +420,10 @@ impl Inner {
             return Poll::Pending;
         }
 
-        let outcome = self.send_data(buf, is_fin)?;
+        let outcome = self.send_data(cx, buf, is_fin)?;
 
-        if outcome.written == 0 {
-            if let Some(requested) = outcome.local_flow_blocked {
-                self.local_flow
-                    .register_waiter(self.waiter_id, self.stream_priority, requested, cx.waker());
-                return Poll::Pending;
-            }
+        if outcome.written == 0 && outcome.local_flow_blocked.is_some() {
+            return Poll::Pending;
         }
 
         Poll::Ready(Ok(outcome.written))
@@ -496,7 +489,13 @@ impl Inner {
 
     fn send_fin_packet(&mut self) -> io::Result<()> {
         if self.status.is_init() {
-            self.send_flow_init_with_early_data(&mut buffer::reader::storage::Empty, true)?;
+            let noop = s2n_quic_core::task::waker::noop();
+            let mut cx = Context::from_waker(&noop);
+            self.send_flow_init_with_early_data(
+                &mut cx,
+                &mut buffer::reader::storage::Empty,
+                true,
+            )?;
         } else if self.status.is_open() {
             let queue_pair = QueuePair {
                 source_queue_id: self.control_rx.queue_id(),
@@ -710,6 +709,7 @@ impl Inner {
 
     fn send_flow_init_with_early_data<S>(
         &mut self,
+        cx: &mut Context,
         buf: &mut S,
         is_fin: bool,
     ) -> io::Result<FlowInitOutcome>
@@ -722,7 +722,7 @@ impl Inner {
             actual_fin,
             local_flow,
             blocked_request,
-        } = self.prepare_early_data(buf, is_fin)?;
+        } = self.prepare_early_data(cx, buf, is_fin)?;
 
         if let Some(blocked_request) = blocked_request {
             return Ok(FlowInitOutcome {
@@ -774,6 +774,7 @@ impl Inner {
 
     fn prepare_early_data<S>(
         &mut self,
+        cx: &mut Context,
         buf: &mut S,
         is_fin: bool,
     ) -> io::Result<EarlyData>
@@ -808,7 +809,7 @@ impl Inner {
         let desired = mtu
             .min(buf.buffered_len())
             .min(self.remaining_offset_capacity());
-        let Some((chunk_len, local_flow)) = self.try_reserve_local_flow(desired) else {
+        let Some((chunk_len, local_flow)) = self.try_reserve_local_flow(cx, desired, true) else {
             return Ok(EarlyData {
                 payload: ByteVec::new(),
                 bytes_read: 0,
@@ -849,7 +850,7 @@ impl Inner {
         local_available.min(remote_available)
     }
 
-    fn send_data<S>(&mut self, buf: &mut S, is_fin: bool) -> io::Result<SendOutcome>
+    fn send_data<S>(&mut self, cx: &mut Context, buf: &mut S, is_fin: bool) -> io::Result<SendOutcome>
     where
         S: buffer::reader::storage::Infallible,
     {
@@ -888,10 +889,14 @@ impl Inner {
 
             let (chunk_len, local_flow) = if desired_len == 0 {
                 (0, None)
-            } else if let Some((chunk_len, local_flow)) = self.try_reserve_local_flow(desired_len) {
+            } else if let Some((chunk_len, local_flow)) =
+                self.try_reserve_local_flow(cx, desired_len, written == 0)
+            {
                 (chunk_len, local_flow)
             } else {
-                local_flow_blocked = Some(desired_len as u64);
+                if written == 0 {
+                    local_flow_blocked = Some(desired_len as u64);
+                }
                 break;
             };
 
@@ -993,15 +998,22 @@ impl Inner {
 
     fn try_reserve_local_flow(
         &self,
+        cx: &mut Context,
         requested: usize,
+        request_if_empty: bool,
     ) -> Option<(usize, Option<local_flow::Credit>)> {
         if requested == 0 {
             return Some((0, None));
         }
 
-        let granted =
+        let mut granted = self.flow.take_issued(requested as u64);
+        if granted == 0 && request_if_empty {
+            self.flow.register_waker(cx.waker());
             self.local_flow
-                .try_acquire(self.waiter_id, self.stream_priority, requested as u64);
+                .request(&self.flow, self.stream_priority, requested as u64);
+            granted = self.flow.take_issued(requested as u64);
+        }
+
         if granted == 0 {
             return None;
         }
@@ -1029,9 +1041,7 @@ impl Drop for Writer {
             "Writer dropping"
         );
 
-        self.0
-            .local_flow
-            .clear_waiter(self.0.waiter_id, self.0.stream_priority);
+        self.0.local_flow.clear_waiter(&self.0.flow);
         if std::thread::panicking() {
             self.0.completion_rx.cancel();
 

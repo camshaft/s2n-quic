@@ -63,7 +63,7 @@ fn make_pair_with_type(ep_type: endpoint::Type) -> (Writer, Pusher) {
     };
 
     let (frame_tx, frame_rx) = frame::submission_channel(1);
-    let local_flow = local_flow::Controller::new(u64::MAX, u64::MAX);
+    let local_flow = local_flow::Controller::new(u64::MAX, u64::MAX, u64::MAX);
 
     let writer = match ep_type {
         endpoint::Type::Client => Writer::new_client(
