@@ -36,11 +36,16 @@ impl StreamPriority {
 
     #[inline]
     fn from_u8(value: u8) -> Self {
+        debug_assert!(
+            (value as usize) < Self::LEVELS,
+            "invalid stream priority value: {value}"
+        );
         if value == Self::High as u8 {
             Self::High
         } else if value == Self::Normal as u8 {
             Self::Normal
         } else {
+            debug_assert_eq!(value, Self::Low as u8);
             Self::Low
         }
     }
@@ -265,6 +270,9 @@ impl Drop for Flow {
 
         if let Some(controller) = self.controller.upgrade() {
             controller.release_queued(self.priority(), outstanding);
+        } else {
+            // The endpoint/controller has already been dropped, so no remaining writers can
+            // observe or reuse the endpoint-local budget anymore.
         }
     }
 }
