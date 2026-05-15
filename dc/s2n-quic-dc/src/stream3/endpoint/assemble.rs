@@ -415,6 +415,8 @@ fn assemble_probe(
                 continue;
             }
 
+            frame.local_flow_on_transmit();
+
             let next = probe_metadata.with_frame(&frame);
             let est_len = next.estimate_packet_len(
                 source_sender_id,

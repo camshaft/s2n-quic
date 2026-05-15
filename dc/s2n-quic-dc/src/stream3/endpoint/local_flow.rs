@@ -376,9 +376,8 @@ mod tests {
         }
 
         unsafe fn wake_by_ref(data: *const ()) {
-            let counter = Arc::<AtomicUsize>::from_raw(data.cast());
+            let counter = std::mem::ManuallyDrop::new(Arc::<AtomicUsize>::from_raw(data.cast()));
             counter.fetch_add(1, Ordering::Relaxed);
-            let _ = Arc::into_raw(counter);
         }
 
         unsafe fn drop(data: *const ()) {
