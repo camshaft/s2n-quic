@@ -202,22 +202,25 @@ fn parse_scalar_value(value: &str) -> Option<(&str, Option<&str>)> {
         return None;
     }
 
+    let is_number = |candidate: &str| candidate.parse::<f64>().is_ok();
+
     if let Some((number, suffix)) = value.split_once(' ') {
-        number
-            .parse::<f64>()
-            .ok()
-            .map(|_| (number, Some(suffix.trim()).filter(|v| !v.is_empty())))
+        if is_number(number) {
+            Some((number, Some(suffix.trim()).filter(|v| !v.is_empty())))
+        } else {
+            None
+        }
     } else {
-        value.parse::<f64>().ok().map(|_| (value, None))
+        is_number(value).then_some((value, None))
     }
 }
 
-fn to_milliseconds(value: u64, unit: &str) -> f64 {
+fn to_milliseconds(value: u64, unit: &str) -> Option<f64> {
     match unit {
-        "us" => value as f64 / 1_000.0,
-        "ms" => value as f64,
-        "s" => value as f64 * 1_000.0,
-        _ => value as f64,
+        "us" => Some(value as f64 / 1_000.0),
+        "ms" => Some(value as f64),
+        "s" => Some(value as f64 * 1_000.0),
+        _ => None,
     }
 }
 
@@ -246,10 +249,14 @@ fn encode_statsd_lines(samples: &[RawMetricSample<'_>], prefix: Option<&str>) ->
             let (count, p50, p99, max) = compute_histogram_percentiles(&buckets);
             lines.push(format!("{metric}.count:{count}|c"));
 
-            if matches!(unit, "us" | "ms" | "s") {
-                lines.push(format!("{metric}.p50:{:.3}|ms", to_milliseconds(p50, unit)));
-                lines.push(format!("{metric}.p99:{:.3}|ms", to_milliseconds(p99, unit)));
-                lines.push(format!("{metric}.max:{:.3}|ms", to_milliseconds(max, unit)));
+            if let (Some(p50), Some(p99), Some(max)) = (
+                to_milliseconds(p50, unit),
+                to_milliseconds(p99, unit),
+                to_milliseconds(max, unit),
+            ) {
+                lines.push(format!("{metric}.p50:{p50:.3}|ms"));
+                lines.push(format!("{metric}.p99:{p99:.3}|ms"));
+                lines.push(format!("{metric}.max:{max:.3}|ms"));
             } else {
                 lines.push(format!("{metric}.p50:{p50}|g"));
                 lines.push(format!("{metric}.p99:{p99}|g"));
@@ -287,6 +294,8 @@ fn encode_statsd_lines(samples: &[RawMetricSample<'_>], prefix: Option<&str>) ->
 }
 
 fn chunk_statsd_lines(lines: &[String], max_payload_size: usize) -> (Vec<Vec<u8>>, usize) {
+    // Zero is an invalid payload size and cannot hold even a single byte, so all lines are
+    // reported as dropped in this case.
     if max_payload_size == 0 {
         return (Vec::new(), lines.len());
     }
