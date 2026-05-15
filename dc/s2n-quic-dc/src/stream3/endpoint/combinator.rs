@@ -731,13 +731,16 @@ where
                 continue;
             }
 
-            let incoming_id = frame
-                .completion
-                .as_ref()
-                .map(|c| c.queue_id())
-                .expect("invariant violation: frame.completion is None after should_notify returned true");
+            let is_same_queue = self.current_queue_id()
+                == Some(
+                    frame
+                        .completion
+                        .as_ref()
+                        .map(|c| c.queue_id())
+                        .expect("invariant violation: frame.completion is None after should_notify returned true"),
+                );
 
-            if self.current_queue_id() == Some(incoming_id) {
+            if is_same_queue {
                 self.batch.push_back(Entry::from(frame));
                 continue;
             }
