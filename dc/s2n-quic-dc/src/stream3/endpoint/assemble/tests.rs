@@ -112,7 +112,7 @@ fn is_frame_encodable(
     credentials: &crate::credentials::Credentials,
     mtu: u16,
 ) -> bool {
-    MetadataEstimate::new(VarInt::ZERO)
+    MetadataEstimate::new()
         .with_frame_parts(&frame.header, payload_len(frame))
         .estimate_packet_len(
             source_sender_id,
@@ -173,7 +173,6 @@ fn oracle(
     let mut segment_size = 0u16;
     let mut offset = 0usize;
     let mut packet_number = VarInt::ZERO;
-    let mut flow_attempt_id = VarInt::ZERO;
     let mut next_idx = 0usize;
 
     while next_idx < frames.len() && packet_sizes.len() < max_segments {
@@ -189,7 +188,7 @@ fn oracle(
         }
 
         let start_idx = next_idx;
-        let mut metadata = MetadataEstimate::new(flow_attempt_id);
+        let mut metadata = MetadataEstimate::new();
 
         while let Some(frame) = frames.get(next_idx) {
             let next_metadata = metadata.with_frame_parts(&frame.header, payload_len(frame));
@@ -231,7 +230,6 @@ fn oracle(
         }
 
         offset += segment_size as usize;
-        flow_attempt_id = metadata.flow_attempt_id;
         packet_number += 1;
 
         if packet_len < segment_size {
@@ -334,14 +332,13 @@ fn assemble_fuzz_respects_gso_invariants() {
                 .iter()
                 .filter(|frame| {
                     !matches!(frame.header, Header::Ack { .. })
-                        &&
-                    is_frame_encodable(
-                        frame,
-                        input.source_sender_id,
-                        input.source_control_port,
-                        &context.credentials,
-                        input.mtu,
-                    )
+                        && is_frame_encodable(
+                            frame,
+                            input.source_sender_id,
+                            input.source_control_port,
+                            &context.credentials,
+                            input.mtu,
+                        )
                 })
                 .cloned()
                 .collect::<Vec<_>>();
@@ -473,7 +470,7 @@ fn encode_decode_round_trip() {
         &context.sealer,
         &context.credentials,
         &mut flow_attempt_id,
-        &packet_frames,
+        &mut packet_frames,
         &mut header_buf,
     );
     assert!(encoded_len > 0, "must encode at least something");
@@ -566,7 +563,7 @@ fn encode_decode_fuzz_round_trip() {
 
             // Simulate the assembler: pick frames that fit together in one packet.
             let mut packet_inputs: Vec<&FrameInput> = Vec::new();
-            let mut meta = MetadataEstimate::new(VarInt::ZERO);
+            let mut meta = MetadataEstimate::new();
             for frame in &input.frames {
                 if !is_frame_encodable(
                     frame,
@@ -617,7 +614,7 @@ fn encode_decode_fuzz_round_trip() {
                 &context.sealer,
                 &context.credentials,
                 &mut flow_attempt_id,
-                &packet_frames,
+                &mut packet_frames,
                 &mut header_buf,
             );
 

@@ -1,87 +1,21 @@
 // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Single-entry channels for connecting wheel ticker tasks to a socket sender.
+//! Channel traits and combinators for the receiver pipeline.
 //!
-//! # Implementation Guidelines
+//! # Budget-Based Yielding
 //!
-//! ## Avoid Unbounded Loops in `poll_*` Methods
+//! Every `poll_recv` call takes a `&mut Budget`. The budget tracks how many items
+//! the pipeline may process in one poll cycle. Combinators MUST NOT call
+//! `cx.waker().wake_by_ref()` — only the top-level `drain_budgeted` does that.
 //!
-//! **CRITICAL**: Never use unbounded `loop` or `while` constructs inside `poll_recv`,
-//! `poll_send`, or any `poll_*` method. Loops can cause task starvation by monopolizing
-//! the executor and preventing other tasks from making progress.
+//! When budget is exhausted:
+//! - Leaf receivers return `Poll::Pending` after calling `budget.set_needs_wake()`
+//! - Flatten-style adapters stop yielding buffered items
+//! - Filter/batch adapters stop pulling from inner
 //!
-//! ### Why This Matters
-//!
-//! When a `poll_*` method contains a loop that keeps returning `Ready`, it can:
-//! - Starve other tasks on the same executor worker
-//! - Cause pipeline stalls where one component loops while another waits
-//! - Make the system unresponsive under load
-//! - Create difficult-to-diagnose performance issues
-//!
-//! ### The Self-Wake Pattern
-//!
-//! Instead of looping, use the **self-wake pattern**: return `Pending` and wake yourself
-//! to be polled again. This gives the executor a chance to poll other tasks.
-//!
-//! ```rust,ignore
-//! // ❌ BAD: Unbounded loop
-//! fn poll_recv(&mut self, cx: &mut Context) -> Poll<Option<T>> {
-//!     loop {
-//!         if let Some(item) = self.buffer.pop() {
-//!             return Poll::Ready(Some(item));
-//!         }
-//!         match self.inner.poll_recv(cx) {
-//!             Poll::Ready(Some(batch)) => {
-//!                 self.buffer = batch;
-//!                 continue; // ❌ Loops without yielding
-//!             }
-//!             Poll::Pending => return Poll::Pending,
-//!             Poll::Ready(None) => return Poll::Ready(None),
-//!         }
-//!     }
-//! }
-//!
-//! // ✅ GOOD: Self-wake instead of loop
-//! fn poll_recv(&mut self, cx: &mut Context) -> Poll<Option<T>> {
-//!     if let Some(item) = self.buffer.pop() {
-//!         cx.waker().wake_by_ref(); // Wake to process more items
-//!         return Poll::Ready(Some(item));
-//!     }
-//!     match self.inner.poll_recv(cx) {
-//!         Poll::Ready(Some(batch)) => {
-//!             self.buffer = batch;
-//!             cx.waker().wake_by_ref(); // Wake to process batch
-//!             Poll::Pending // ✅ Yield to executor
-//!         }
-//!         Poll::Pending => Poll::Pending,
-//!         Poll::Ready(None) => Poll::Ready(None),
-//!     }
-//! }
-//! ```
-//!
-//! ### Exception: Bounded Loops
-//!
-//! Small, **provably bounded** loops are acceptable when the bound is small (e.g., < 10
-//! iterations) and based on a fixed-size collection:
-//!
-//! ```rust,ignore
-//! // ✅ OK: Bounded by fixed array size
-//! for (idx, rx) in self.receivers.iter_mut().enumerate() {
-//!     if let Poll::Ready(Some(value)) = rx.poll_recv(cx) {
-//!         return Poll::Ready(Some(value));
-//!     }
-//! }
-//! ```
-//!
-//! ### Debugging Loop-Related Issues
-//!
-//! If you see:
-//! - Tasks not making progress despite being woken
-//! - Some pipeline stages receiving data while others don't
-//! - Continuous polling without yielding
-//!
-//! Check for unbounded loops in `poll_*` methods and replace them with self-waking.
+//! The `drain_budgeted` future resets budget each poll, loops until Pending, then
+//! checks `budget.take_needs_wake()` to issue a single self-wake if more work exists.
 
 use crate::{
     packet::datagram::partial::{FailureReason, TransmissionInfo, TransmissionStatus},
@@ -92,7 +26,6 @@ use crate::{
 };
 use core::{
     cell::RefCell,
-    fmt,
     task::{self, Poll},
 };
 use s2n_quic_core::{assume, ready, varint::VarInt};
@@ -103,6 +36,77 @@ pub mod intrusive_queue;
 
 #[cfg(test)]
 mod tests;
+
+// ── Budget ────────────────────────────────────────────────────────────────
+
+/// Tracks remaining work budget for a single poll cycle.
+///
+/// Threaded through the receiver pipeline from the top-level drain. Replaces
+/// per-combinator self-wakes with a centralized "needs_wake" signal.
+pub struct Budget {
+    capacity: usize,
+    remaining: usize,
+    generation: usize,
+    needs_wake: bool,
+}
+
+impl Budget {
+    #[inline]
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            remaining: capacity,
+            generation: 0,
+            needs_wake: false,
+        }
+    }
+
+    /// Consume one unit of budget. Returns `true` if budget was available.
+    #[inline]
+    pub fn consume(&mut self) -> bool {
+        if self.remaining > 0 {
+            self.remaining -= 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    #[inline]
+    pub fn is_exhausted(&self) -> bool {
+        self.remaining == 0
+    }
+
+    /// Signal that there is more work available. The top-level drain will
+    /// issue a self-wake when it sees this flag.
+    #[inline]
+    pub fn set_needs_wake(&mut self) {
+        self.needs_wake = true;
+    }
+
+    #[inline]
+    pub fn take_needs_wake(&mut self) -> bool {
+        core::mem::replace(&mut self.needs_wake, false)
+    }
+
+    /// Reset budget for the next poll cycle. Increments generation.
+    #[inline]
+    pub fn reset(&mut self) {
+        self.remaining = self.capacity;
+        self.needs_wake = false;
+        self.generation = self.generation.wrapping_add(1);
+    }
+
+    #[inline]
+    pub fn consumed(&self) -> usize {
+        self.capacity - self.remaining
+    }
+
+    #[inline]
+    pub fn generation(&self) -> usize {
+        self.generation
+    }
+}
 
 /// A channel sender without backpressure.
 ///
@@ -175,46 +179,27 @@ pub trait Sender<T> {
         cx: &mut task::Context<'_>,
         value: &mut core::mem::MaybeUninit<T>,
     ) -> Poll<Result<(), ()>>;
-
-    /// Sends the value on the channel. Returns `Err` if the channel is closed.
-    async fn send(&mut self, value: T) -> Result<(), T> {
-        let mut slot = core::mem::MaybeUninit::new(value);
-        let mut taken = false;
-        core::future::poll_fn(move |cx| {
-            if taken {
-                // Value was already taken, just return Ready
-                return Poll::Ready(Ok(()));
-            }
-
-            match self.poll_send(cx, &mut slot) {
-                Poll::Ready(Ok(())) => {
-                    taken = true;
-                    Poll::Ready(Ok(()))
-                }
-                Poll::Ready(Err(())) => {
-                    taken = true;
-                    // Channel closed, extract the value
-                    Poll::Ready(Err(unsafe { slot.assume_init_read() }))
-                }
-                Poll::Pending => Poll::Pending,
-            }
-        })
-        .await
-    }
 }
 
 /// An async-capable channel receiver.
 pub trait Receiver<T> {
-    /// Poll for the next value. Registers the waker if nothing is available.
+    /// Poll for the next value with budget tracking.
     ///
     /// Returns `Ready(Some(value))` when a value is available,
-    /// `Pending` when empty but not closed,
+    /// `Pending` when empty (or budget exhausted) but not closed,
     /// `Ready(None)` when the channel is closed.
-    fn poll_recv(&mut self, cx: &mut task::Context<'_>) -> Poll<Option<T>>;
+    ///
+    /// Implementations MUST NOT call `cx.waker().wake_by_ref()`. When budget
+    /// is exhausted and more work is available, call `budget.set_needs_wake()`
+    /// and return `Pending`. The top-level drain handles the single self-wake.
+    fn poll_recv(&mut self, cx: &mut task::Context<'_>, budget: &mut Budget) -> Poll<Option<T>>;
 
     /// Receives the next value. Returns `None` when the channel is closed.
-    fn recv(&mut self) -> impl core::future::Future<Output = Option<T>> + '_ {
-        core::future::poll_fn(|cx| self.poll_recv(cx))
+    fn recv<'a>(
+        &'a mut self,
+        budget: &'a mut Budget,
+    ) -> impl core::future::Future<Output = Option<T>> + 'a {
+        core::future::poll_fn(move |cx| self.poll_recv(cx, budget))
     }
 
     /// Notify the receiver that the last item received was consumed.
@@ -246,29 +231,74 @@ pub trait ReceiverExt<T>: Receiver<T> + Sized {
         self.drain_budgeted(None)
     }
 
-    /// Drain the receiver, processing up to `budget` items per poll before yielding.
+    /// Drain the receiver, processing up to `capacity` items per poll before yielding.
     /// `None` means process one item per poll.
-    fn drain_budgeted(mut self, budget: Option<usize>) -> impl core::future::Future<Output = ()>
+    fn drain_budgeted(mut self, capacity: Option<usize>) -> impl core::future::Future<Output = ()>
     where
         Self: Receiver<()>,
     {
-        let budget = budget.unwrap_or(1);
+        let cap = capacity.unwrap_or(1);
+        let mut budget = Budget::new(cap);
         core::future::poll_fn(move |cx| {
-            for _ in 0..budget {
-                match self.poll_recv(cx) {
-                    Poll::Pending => return Poll::Pending,
+            budget.reset();
+            loop {
+                match self.poll_recv(cx, &mut budget) {
+                    Poll::Pending => break,
                     Poll::Ready(None) => return Poll::Ready(()),
-                    Poll::Ready(Some(())) => {}
+                    Poll::Ready(Some(())) => {
+                        if budget.is_exhausted() {
+                            budget.set_needs_wake();
+                            break;
+                        }
+                        continue;
+                    }
                 }
             }
-            cx.waker().wake_by_ref();
+            if budget.take_needs_wake() {
+                cx.waker().wake_by_ref();
+            }
             Poll::Pending
         })
     }
 
-    /// Wraps the receiver with a debug adapter that logs received values.
-    fn dbg(self, label: &'static str) -> Dbg<T, Self> {
-        Dbg::new(self, label)
+    /// Like [`drain_budgeted`](Self::drain_budgeted), but records per-poll metrics:
+    /// items consumed (budget summary) and wall-clock duration (timer).
+    fn drain_budgeted_metered(
+        mut self,
+        capacity: Option<usize>,
+        budget_summary: crate::counter::Summary,
+        time_summary: crate::counter::Timer,
+    ) -> impl core::future::Future<Output = ()>
+    where
+        Self: Receiver<()>,
+    {
+        let cap = capacity.unwrap_or(1);
+        let mut budget = Budget::new(cap);
+        core::future::poll_fn(move |cx| {
+            budget.reset();
+            let _guard = time_summary.start();
+            loop {
+                match self.poll_recv(cx, &mut budget) {
+                    Poll::Pending => break,
+                    Poll::Ready(None) => {
+                        budget_summary.record_value(budget.consumed() as u64);
+                        return Poll::Ready(());
+                    }
+                    Poll::Ready(Some(())) => {
+                        if budget.is_exhausted() {
+                            budget.set_needs_wake();
+                            break;
+                        }
+                        continue;
+                    }
+                }
+            }
+            budget_summary.record_value(budget.consumed() as u64);
+            if budget.take_needs_wake() {
+                cx.waker().wake_by_ref();
+            }
+            Poll::Pending
+        })
     }
 }
 
@@ -286,6 +316,8 @@ impl<T, R> ReceiverExt<T> for R where R: Receiver<T> {}
 pub struct Priority<R> {
     receivers: Vec<R>,
     last_recv_idx: Option<usize>,
+    current_idx: usize,
+    last_generation: usize,
 }
 
 impl<R> Priority<R> {
@@ -293,25 +325,38 @@ impl<R> Priority<R> {
         Self {
             receivers,
             last_recv_idx: None,
+            current_idx: 0,
+            last_generation: usize::MAX,
         }
     }
 }
 
 impl<T, R: Receiver<T>> Receiver<T> for Priority<R> {
-    fn poll_recv(&mut self, cx: &mut task::Context<'_>) -> Poll<Option<T>> {
+    fn poll_recv(&mut self, cx: &mut task::Context<'_>, budget: &mut Budget) -> Poll<Option<T>> {
+        let len = self.receivers.len();
+        if len == 0 {
+            return Poll::Ready(None);
+        }
+
+        // Reset to highest priority at the start of each new generation
+        if budget.generation() != self.last_generation {
+            self.current_idx = 0;
+            self.last_generation = budget.generation();
+        }
+
         let mut all_closed = true;
-        for (idx, rx) in self.receivers.iter_mut().enumerate() {
-            match rx.poll_recv(cx) {
+        for i in 0..len {
+            let idx = (self.current_idx + i) % len;
+            match self.receivers[idx].poll_recv(cx, budget) {
                 Poll::Ready(Some(value)) => {
                     self.last_recv_idx = Some(idx);
+                    self.current_idx = (idx + 1) % len;
                     return Poll::Ready(Some(value));
                 }
                 Poll::Pending => {
                     all_closed = false;
                 }
-                Poll::Ready(None) => {
-                    // This channel is closed, continue to lower priority
-                }
+                Poll::Ready(None) => {}
             }
         }
         if all_closed {
@@ -362,29 +407,37 @@ where
     C: IntoIterator<IntoIter = I, Item = Item>,
     R: Receiver<C>,
 {
-    fn poll_recv(&mut self, cx: &mut task::Context<'_>) -> Poll<Option<Item>> {
-        // Drain any buffered entries first
-        if let Some(iter) = &mut self.iter {
-            if let Some(item) = iter.next() {
-                // Self-wake to drain more entries
-                cx.waker().wake_by_ref();
-                return Poll::Ready(Some(item));
+    fn poll_recv(&mut self, cx: &mut task::Context<'_>, budget: &mut Budget) -> Poll<Option<Item>> {
+        loop {
+            // Drain any buffered entries first
+            if let Some(iter) = &mut self.iter {
+                if budget.is_exhausted() {
+                    budget.set_needs_wake();
+                    return Poll::Pending;
+                }
+                if let Some(item) = iter.next() {
+                    // Subsequent items from buffer consume budget
+                    budget.consume();
+                    return Poll::Ready(Some(item));
+                }
+                // Iterator exhausted
+                self.iter = None;
             }
-        }
 
-        // Iterator exhausted, clear it and try to pull the next container
-        self.iter = None;
-
-        // Try to pull the next container from the inner receiver
-        match self.inner.poll_recv(cx) {
-            Poll::Ready(Some(container)) => {
-                self.iter = Some(container.into_iter());
-                // Self-wake to process the new iterator
-                cx.waker().wake_by_ref();
-                Poll::Pending
+            // Pull next container from inner (inner consumes budget for the acquisition)
+            match self.inner.poll_recv(cx, budget) {
+                Poll::Ready(Some(container)) => {
+                    let mut iter = container.into_iter();
+                    // First item is free — budget was consumed by inner
+                    if let Some(item) = iter.next() {
+                        self.iter = Some(iter);
+                        return Poll::Ready(Some(item));
+                    }
+                    // Empty container, loop back
+                }
+                Poll::Ready(None) => return Poll::Ready(None),
+                Poll::Pending => return Poll::Pending,
             }
-            Poll::Ready(None) => Poll::Ready(None),
-            Poll::Pending => Poll::Pending,
         }
     }
 
@@ -418,22 +471,30 @@ where
     fn poll_recv(
         &mut self,
         cx: &mut task::Context<'_>,
+        budget: &mut Budget,
     ) -> Poll<Option<crate::intrusive_queue::Entry<T>>> {
         loop {
-            // Drain any buffered entries first
-            if let Some(entry) = self.queue.pop_front() {
-                return Poll::Ready(Some(entry));
+            // Drain any buffered entries — subsequent items consume budget
+            if !self.queue.is_empty() {
+                if budget.is_exhausted() {
+                    budget.set_needs_wake();
+                    return Poll::Pending;
+                }
+                if let Some(entry) = self.queue.pop_front() {
+                    budget.consume();
+                    return Poll::Ready(Some(entry));
+                }
             }
 
-            // Try to pull the next queue from the inner receiver
-            match self.inner.poll_recv(cx) {
+            // Pull next queue from inner (inner consumes budget for the swap)
+            match self.inner.poll_recv(cx, budget) {
                 Poll::Ready(Some(queue)) => {
-                    if queue.is_empty() {
-                        // Self-wake to process the new queue
-                        cx.waker().wake_by_ref();
-                        return Poll::Pending;
-                    }
                     self.queue = queue;
+                    // First item is free — budget was consumed by inner
+                    if let Some(entry) = self.queue.pop_front() {
+                        return Poll::Ready(Some(entry));
+                    }
+                    // Empty queue, loop back
                 }
                 Poll::Ready(None) => return Poll::Ready(None),
                 Poll::Pending => return Poll::Pending,
@@ -473,24 +534,37 @@ where
     A: crate::intrusive_queue::Adapter,
     R: Receiver<crate::intrusive_queue::List<A>>,
 {
-    fn poll_recv(&mut self, cx: &mut task::Context<'_>) -> Poll<Option<A::Pointer>> {
-        // Drain any buffered entries first
-        if let Some(entry) = self.list.pop_front() {
-            // Self-wake to drain more entries
-            cx.waker().wake_by_ref();
-            return Poll::Ready(Some(entry));
-        }
-
-        // Try to pull the next list from the inner receiver
-        match self.inner.poll_recv(cx) {
-            Poll::Ready(Some(list)) => {
-                self.list = list;
-                // Self-wake to process the new list
-                cx.waker().wake_by_ref();
-                Poll::Pending
+    fn poll_recv(
+        &mut self,
+        cx: &mut task::Context<'_>,
+        budget: &mut Budget,
+    ) -> Poll<Option<A::Pointer>> {
+        loop {
+            // Drain buffered entries — subsequent items consume budget
+            if !self.list.is_empty() {
+                if budget.is_exhausted() {
+                    budget.set_needs_wake();
+                    return Poll::Pending;
+                }
+                if let Some(entry) = self.list.pop_front() {
+                    budget.consume();
+                    return Poll::Ready(Some(entry));
+                }
             }
-            Poll::Ready(None) => Poll::Ready(None),
-            Poll::Pending => Poll::Pending,
+
+            // Pull next list from inner (inner consumes budget for the swap)
+            match self.inner.poll_recv(cx, budget) {
+                Poll::Ready(Some(list)) => {
+                    self.list = list;
+                    // First item is free — budget was consumed by inner
+                    if let Some(entry) = self.list.pop_front() {
+                        return Poll::Ready(Some(entry));
+                    }
+                    // Empty list, loop back
+                }
+                Poll::Ready(None) => return Poll::Ready(None),
+                Poll::Pending => return Poll::Pending,
+            }
         }
     }
 
@@ -524,8 +598,8 @@ where
     R: Receiver<T>,
     F: Fn(&T),
 {
-    fn poll_recv(&mut self, cx: &mut task::Context<'_>) -> Poll<Option<T>> {
-        match self.inner.poll_recv(cx) {
+    fn poll_recv(&mut self, cx: &mut task::Context<'_>, budget: &mut Budget) -> Poll<Option<T>> {
+        match self.inner.poll_recv(cx, budget) {
             Poll::Ready(Some(value)) => {
                 (self.inspect)(&value);
                 Poll::Ready(Some(value))
@@ -567,8 +641,8 @@ where
     R: Receiver<T>,
     F: FnMut(T) -> U,
 {
-    fn poll_recv(&mut self, cx: &mut task::Context<'_>) -> Poll<Option<U>> {
-        match self.inner.poll_recv(cx) {
+    fn poll_recv(&mut self, cx: &mut task::Context<'_>, budget: &mut Budget) -> Poll<Option<U>> {
+        match self.inner.poll_recv(cx, budget) {
             Poll::Ready(Some(value)) => {
                 let mapped = (self.map)(value);
                 Poll::Ready(Some(mapped))
@@ -614,25 +688,23 @@ where
     R: Receiver<T>,
     F: FnMut(T) -> Option<U>,
 {
-    fn poll_recv(&mut self, cx: &mut task::Context<'_>) -> Poll<Option<U>> {
-        // Try up to 10 items before yielding (bounded loop)
-        for _ in 0..10 {
-            match self.inner.poll_recv(cx) {
+    fn poll_recv(&mut self, cx: &mut task::Context<'_>, budget: &mut Budget) -> Poll<Option<U>> {
+        loop {
+            match self.inner.poll_recv(cx, budget) {
                 Poll::Ready(Some(value)) => {
                     if let Some(mapped) = (self.filter_map)(value) {
                         return Poll::Ready(Some(mapped));
                     }
-                    // Filtered out, continue to next item
+                    if budget.is_exhausted() {
+                        budget.set_needs_wake();
+                        return Poll::Pending;
+                    }
                     continue;
                 }
                 Poll::Ready(None) => return Poll::Ready(None),
                 Poll::Pending => return Poll::Pending,
             }
         }
-
-        // Hit iteration limit, wake up to continue
-        cx.waker().wake_by_ref();
-        Poll::Pending
     }
 
     fn on_consumed(&mut self, bytes: u64) {
@@ -686,7 +758,7 @@ where
     R: Receiver<T>,
     Clk: crate::clock::precision::Clock,
 {
-    fn poll_recv(&mut self, cx: &mut task::Context<'_>) -> Poll<Option<T>> {
+    fn poll_recv(&mut self, cx: &mut task::Context<'_>, budget: &mut Budget) -> Poll<Option<T>> {
         use crate::clock::precision::Timer;
 
         // If we have a buffered item from a previous poll, check timer first
@@ -697,7 +769,7 @@ where
         }
 
         // Try to get next item from inner receiver
-        let item = ready!(self.inner.poll_recv(cx));
+        let item = ready!(self.inner.poll_recv(cx, budget));
 
         // If we got an item, check if timer is ready
         if item.is_some() {
@@ -736,58 +808,6 @@ where
     }
 }
 
-// ── YieldAfter adapter ─────────────────────────────────────────────────────
-
-/// Wraps a receiver and forces a yield after a threshold of consecutive Ready returns.
-///
-/// This prevents a busy receiver from starving other tasks by ensuring the
-/// executor gets a chance to poll other futures periodically.
-pub struct YieldAfter<R> {
-    inner: R,
-    ready_count: u32,
-    threshold: u32,
-}
-
-impl<R> YieldAfter<R> {
-    pub fn new(inner: R, threshold: u32) -> Self {
-        Self {
-            inner,
-            ready_count: 0,
-            threshold,
-        }
-    }
-}
-
-impl<T, R> Receiver<T> for YieldAfter<R>
-where
-    R: Receiver<T>,
-{
-    fn poll_recv(&mut self, cx: &mut task::Context<'_>) -> Poll<Option<T>> {
-        // If we've hit the threshold, force a yield
-        if self.ready_count >= self.threshold {
-            self.ready_count = 0;
-            cx.waker().wake_by_ref();
-            return Poll::Pending;
-        }
-
-        match self.inner.poll_recv(cx) {
-            Poll::Ready(value) => {
-                self.ready_count += 1;
-                Poll::Ready(value)
-            }
-            Poll::Pending => {
-                // Reset count on Pending since we yielded
-                self.ready_count = 0;
-                Poll::Pending
-            }
-        }
-    }
-
-    fn on_consumed(&mut self, bytes: u64) {
-        self.inner.on_consumed(bytes);
-    }
-}
-
 // ── Pump ───────────────────────────────────────────────────────────────────
 
 /// Continuously pumps values from a receiver to a sender.
@@ -806,9 +826,9 @@ where
     pump_budgeted(rx, tx, None).await;
 }
 
-/// Transfers items from a receiver to a sender, yielding after `budget` items
+/// Transfers items from a receiver to a sender, yielding after `capacity` items
 /// are transferred in a single poll. `None` means transfer one item per poll.
-pub async fn pump_budgeted<T, R, S>(rx: R, tx: S, budget: Option<usize>)
+pub async fn pump_budgeted<T, R, S>(rx: R, tx: S, capacity: Option<usize>)
 where
     R: Receiver<T>,
     S: Sender<T>,
@@ -817,7 +837,7 @@ where
         rx,
         tx,
         value: None,
-        budget: budget.unwrap_or(1),
+        budget: Budget::new(capacity.unwrap_or(1)),
     }
     .await;
 
@@ -825,7 +845,7 @@ where
         rx: R,
         tx: S,
         value: Option<core::mem::MaybeUninit<T>>,
-        budget: usize,
+        budget: Budget,
     }
 
     impl<T, R, S> Future for BudgetedPump<T, R, S>
@@ -840,19 +860,18 @@ where
             cx: &mut std::task::Context<'_>,
         ) -> Poll<Self::Output> {
             let this = unsafe { self.get_unchecked_mut() };
+            this.budget.reset();
 
-            for _ in 0..this.budget {
+            loop {
                 if this.value.is_none() {
-                    match this.rx.poll_recv(cx) {
+                    match this.rx.poll_recv(cx, &mut this.budget) {
                         Poll::Ready(Some(value)) => {
                             this.value = Some(MaybeUninit::new(value));
                         }
                         Poll::Ready(None) => {
                             return Poll::Ready(());
                         }
-                        Poll::Pending => {
-                            return Poll::Pending;
-                        }
+                        Poll::Pending => break,
                     }
                 }
 
@@ -860,16 +879,20 @@ where
                     match this.tx.poll_send(cx, v) {
                         Poll::Ready(Ok(())) => {
                             this.value = None;
+                            if this.budget.is_exhausted() {
+                                this.budget.set_needs_wake();
+                                break;
+                            }
                         }
                         Poll::Ready(Err(())) => return Poll::Ready(()),
-                        Poll::Pending => {
-                            return Poll::Pending;
-                        }
+                        Poll::Pending => break,
                     }
                 }
             }
 
-            cx.waker().wake_by_ref();
+            if this.budget.take_needs_wake() {
+                cx.waker().wake_by_ref();
+            }
             Poll::Pending
         }
     }
@@ -890,10 +913,11 @@ where
     use core::future::poll_fn;
 
     let mut next_idx = 0;
+    let mut budget = Budget::new(usize::MAX);
 
     loop {
         // Receive next item
-        let Some(entry) = rx.recv().await else {
+        let Some(entry) = rx.recv(&mut budget).await else {
             break;
         };
 
@@ -979,9 +1003,10 @@ where
     fn poll_recv(
         &mut self,
         cx: &mut task::Context<'_>,
+        budget: &mut Budget,
     ) -> Poll<Option<Result<transmission::Entry<Info, Meta, C>, transmission::Entry<Info, Meta, C>>>>
     {
-        let Some(entry) = ready!(self.inner.poll_recv(cx)) else {
+        let Some(entry) = ready!(self.inner.poll_recv(cx, budget)) else {
             return Poll::Ready(None);
         };
 
@@ -1021,8 +1046,12 @@ where
     S: crate::socket::send::Socket,
     T: Sendable,
 {
-    fn poll_recv(&mut self, cx: &mut task::Context<'_>) -> Poll<Option<Result<T, (io::Error, T)>>> {
-        let Some(mut item) = ready!(self.inner.poll_recv(cx)) else {
+    fn poll_recv(
+        &mut self,
+        cx: &mut task::Context<'_>,
+        budget: &mut Budget,
+    ) -> Poll<Option<Result<T, (io::Error, T)>>> {
+        let Some(mut item) = ready!(self.inner.poll_recv(cx, budget)) else {
             return Poll::Ready(None);
         };
 
@@ -1070,18 +1099,22 @@ where
     R: Receiver<Result<T, E>>,
     F: FnMut(E),
 {
-    fn poll_recv(&mut self, cx: &mut task::Context<'_>) -> Poll<Option<T>> {
-        let Some(result) = ready!(self.inner.poll_recv(cx)) else {
-            return Poll::Ready(None);
-        };
+    fn poll_recv(&mut self, cx: &mut task::Context<'_>, budget: &mut Budget) -> Poll<Option<T>> {
+        loop {
+            let Some(result) = ready!(self.inner.poll_recv(cx, budget)) else {
+                return Poll::Ready(None);
+            };
 
-        match result {
-            Ok(value) => Poll::Ready(Some(value)),
-            Err(err) => {
-                (self.on_error)(err);
-                // Drop error, self-wake to get next
-                cx.waker().wake_by_ref();
-                Poll::Pending
+            match result {
+                Ok(value) => return Poll::Ready(Some(value)),
+                Err(err) => {
+                    (self.on_error)(err);
+                    if budget.is_exhausted() {
+                        budget.set_needs_wake();
+                        return Poll::Pending;
+                    }
+                    continue;
+                }
             }
         }
     }
@@ -1114,17 +1147,21 @@ impl<R, T, E> Receiver<T> for UnwrapOk<R, T, E>
 where
     R: Receiver<Result<T, E>>,
 {
-    fn poll_recv(&mut self, cx: &mut task::Context<'_>) -> Poll<Option<T>> {
-        let Some(result) = ready!(self.inner.poll_recv(cx)) else {
-            return Poll::Ready(None);
-        };
+    fn poll_recv(&mut self, cx: &mut task::Context<'_>, budget: &mut Budget) -> Poll<Option<T>> {
+        loop {
+            let Some(result) = ready!(self.inner.poll_recv(cx, budget)) else {
+                return Poll::Ready(None);
+            };
 
-        match result {
-            Ok(value) => Poll::Ready(Some(value)),
-            Err(_) => {
-                // Drop error, self-wake to get next
-                cx.waker().wake_by_ref();
-                Poll::Pending
+            match result {
+                Ok(value) => return Poll::Ready(Some(value)),
+                Err(_) => {
+                    if budget.is_exhausted() {
+                        budget.set_needs_wake();
+                        return Poll::Pending;
+                    }
+                    continue;
+                }
             }
         }
     }
@@ -1163,8 +1200,9 @@ where
     fn poll_recv(
         &mut self,
         cx: &mut task::Context<'_>,
+        budget: &mut Budget,
     ) -> Poll<Option<Result<(), transmission::Entry<Info, Meta, C>>>> {
-        let Some(entry) = ready!(self.inner.poll_recv(cx)) else {
+        let Some(entry) = ready!(self.inner.poll_recv(cx, budget)) else {
             return Poll::Ready(None);
         };
 
@@ -1261,9 +1299,9 @@ impl<R> Receiver<()> for CompletionBatcher<R>
 where
     R: Receiver<crate::intrusive_queue::Entry<crate::packet::datagram::partial::PartialDatagram>>,
 {
-    fn poll_recv(&mut self, cx: &mut task::Context<'_>) -> Poll<Option<()>> {
-        for _ in 0..10 {
-            match self.inner.poll_recv(cx) {
+    fn poll_recv(&mut self, cx: &mut task::Context<'_>, budget: &mut Budget) -> Poll<Option<()>> {
+        loop {
+            match self.inner.poll_recv(cx, budget) {
                 Poll::Ready(Some(mut entry)) => {
                     let bytes = Self::entry_bytes(&entry);
 
@@ -1275,48 +1313,33 @@ where
                         (Some(current), Some(new)) if current.queue_id() == new.queue_id() => {
                             self.current_batch_bytes += bytes;
                             self.current_batch.push_back(entry);
-                            // Don't change the sender, since it matches the previous one
                         }
                         // Different sender or first entry - flush and start new batch
                         (_, Some(new_sender)) => {
-                            // Flush the old batch if there is one
                             self.flush_batch();
-
-                            // Start new batch with this sender
                             self.current_sender = Some(new_sender);
                             self.current_batch_bytes = bytes;
                             self.current_batch.push_back(entry);
                         }
                         // No completion sender - just drop it
                         (_, None) => {
-                            // If we have a batch in progress, flush it first
                             self.flush_batch();
-                            // Drop this entry (no completion notification needed)
-                            // But still report the bytes consumed
                             self.inner.on_consumed(bytes);
                         }
                     }
 
-                    // Continue processing - don't return yet
                     continue;
                 }
                 Poll::Ready(None) => {
-                    // Input stream ended - flush any remaining batch
                     self.flush_batch();
                     return Poll::Ready(None);
                 }
                 Poll::Pending => {
-                    // No more entries available right now
-                    // Flush the current batch if we have one
                     self.flush_batch();
                     return Poll::Pending;
                 }
             }
         }
-
-        self.flush_batch();
-        cx.waker().wake_by_ref();
-        Poll::Pending
     }
 
     fn on_consumed(&mut self, bytes: u64) {
@@ -1367,10 +1390,10 @@ where
     fn poll_recv(
         &mut self,
         cx: &mut task::Context<'_>,
+        budget: &mut Budget,
     ) -> Poll<Option<crate::intrusive_queue::Entry<crate::datagram::batch::Batch>>> {
-        // Process up to 10 lost packets per poll
-        for _ in 0..10 {
-            match self.inner.poll_recv(cx) {
+        loop {
+            match self.inner.poll_recv(cx, budget) {
                 Poll::Ready(Some(entry)) => {
                     // Get the peer address from the datagram
                     let peer_addr = entry.remote_address();
@@ -1428,15 +1451,6 @@ where
                 }
             }
         }
-
-        // Processed max iterations - flush current batch and wake up for more
-        if let Some(batch) = self.flush_batch() {
-            cx.waker().wake_by_ref();
-            return Poll::Ready(Some(batch));
-        }
-
-        cx.waker().wake_by_ref();
-        Poll::Pending
     }
 
     fn on_consumed(&mut self, bytes: u64) {
@@ -1474,6 +1488,7 @@ where
     fn poll_recv(
         &mut self,
         cx: &mut task::Context<'_>,
+        budget: &mut Budget,
     ) -> Poll<Option<io::Result<descriptor::Segments>>> {
         use std::io;
 
@@ -1482,7 +1497,7 @@ where
         let Some(unfilled) = unfilled else {
             // Allocator exhausted
             tracing::warn!("packet allocator exhausted on recv path");
-            cx.waker().wake_by_ref();
+            budget.set_needs_wake();
             return Poll::Pending;
         };
 
@@ -1543,23 +1558,36 @@ impl<R> Receiver<descriptor::Filled> for FlattenSegments<R>
 where
     R: Receiver<descriptor::Segments>,
 {
-    fn poll_recv(&mut self, cx: &mut task::Context<'_>) -> Poll<Option<descriptor::Filled>> {
-        // Drain any buffered segments first
-        if let Some(segment) = self.iter.next() {
-            // Self-wake to drain more segments
-            cx.waker().wake_by_ref();
-            return Poll::Ready(Some(segment));
-        }
-
-        // Try to pull the next Segments from the inner receiver
-        match ready!(self.inner.poll_recv(cx)) {
-            Some(segments) => {
-                self.iter = segments.into_iter();
-                // Self-wake to process the new segments
-                cx.waker().wake_by_ref();
-                Poll::Pending
+    fn poll_recv(
+        &mut self,
+        cx: &mut task::Context<'_>,
+        budget: &mut Budget,
+    ) -> Poll<Option<descriptor::Filled>> {
+        loop {
+            // Drain any buffered segments first
+            if let Some(segment) = self.iter.next() {
+                if budget.is_exhausted() {
+                    budget.set_needs_wake();
+                    return Poll::Pending;
+                }
+                // Subsequent items from buffer consume budget
+                budget.consume();
+                return Poll::Ready(Some(segment));
             }
-            None => Poll::Ready(None),
+
+            // Pull next Segments from inner (inner consumes budget for the acquisition)
+            match self.inner.poll_recv(cx, budget) {
+                Poll::Ready(Some(segments)) => {
+                    self.iter = segments.into_iter();
+                    // First item is free — budget was consumed by inner
+                    if let Some(segment) = self.iter.next() {
+                        return Poll::Ready(Some(segment));
+                    }
+                    // Empty segments, loop back
+                }
+                Poll::Ready(None) => return Poll::Ready(None),
+                Poll::Pending => return Poll::Pending,
+            }
         }
     }
 
@@ -1590,14 +1618,14 @@ where
     R: Receiver<descriptor::Filled>,
     Router: crate::socket::recv::router::Router,
 {
-    fn poll_recv(&mut self, cx: &mut task::Context<'_>) -> Poll<Option<()>> {
+    fn poll_recv(&mut self, cx: &mut task::Context<'_>, budget: &mut Budget) -> Poll<Option<()>> {
         // Check if router is still open
         if !self.router.is_open() {
             return Poll::Ready(None);
         }
 
         // Get next segment
-        let segment = ready!(self.inner.poll_recv(cx));
+        let segment = ready!(self.inner.poll_recv(cx, budget));
 
         match segment {
             Some(segment) => {
@@ -1681,8 +1709,8 @@ where
     R: Receiver<T>,
     Clk: crate::clock::precision::Clock,
 {
-    fn poll_recv(&mut self, cx: &mut task::Context<'_>) -> Poll<Option<T>> {
-        self.inner.poll_recv(cx)
+    fn poll_recv(&mut self, cx: &mut task::Context<'_>, budget: &mut Budget) -> Poll<Option<T>> {
+        self.inner.poll_recv(cx, budget)
     }
 
     fn on_consumed(&mut self, bytes: u64) {
@@ -1728,75 +1756,10 @@ impl Default for Pto {
 }
 
 impl Pto {
-    /// Returns true if we have inflight packets that need PTO protection
-    pub fn has_inflight_packets(
-        packet_map: &s2n_quic_core::packet::number::Map<
-            crate::intrusive_queue::Entry<crate::packet::datagram::partial::PartialDatagram>,
-        >,
-    ) -> bool {
-        !packet_map.is_empty()
-    }
-
     /// Called when a new ack-eliciting packet is sent
     pub fn on_packet_sent(&mut self, now: crate::clock::precision::Timestamp) {
-        // Track the last send time for PTO calculation
         self.last_sent_time = Some(now);
-        // Mark that we need to update the PTO timer (new tail packet)
         self.needs_update = true;
-    }
-
-    /// Called when we receive an ACK
-    pub fn on_ack_received(&mut self, has_remaining_inflight: bool) {
-        // Reset backoff on forward progress
-        self.backoff = s2n_quic_core::path::INITIAL_PTO_BACKOFF;
-
-        if has_remaining_inflight {
-            // We still have packets in flight, mark for update
-            self.needs_update = true;
-        } else {
-            // No more packets in flight, cancel PTO
-            self.target_time = None;
-            self.needs_update = false;
-        }
-    }
-
-    /// Called when the PTO timer fires. Returns true if we should send a probe.
-    ///
-    /// The caller must recompute target_time via update_target() before reinserting.
-    pub fn on_timeout(&mut self, has_inflight: bool) -> bool {
-        // Clear the target time - caller will recompute before reinserting
-        self.target_time = None;
-
-        // If we need an update, just reschedule without sending probe
-        if self.needs_update {
-            self.needs_update = false;
-            return false;
-        }
-
-        // This is an actual PTO timeout - send probe and increase backoff
-        self.backoff = self.backoff.saturating_mul(2).min(16); // Cap at 16
-        true
-    }
-
-    /// Calculate and set the target time for the next PTO
-    ///
-    /// Call this right before inserting into the wheel.
-    /// Uses last_sent_time as the base, falling back to clock.now() if no packets sent yet.
-    pub fn update_target<Clk: crate::clock::precision::Clock + ?Sized>(
-        &mut self,
-        clock: &Clk,
-        rtt_estimator: &s2n_quic_core::recovery::RttEstimator,
-    ) {
-        use s2n_quic_core::packet::number::PacketNumberSpace;
-        let mut pto_period = rtt_estimator.pto_period(self.backoff, PacketNumberSpace::Initial);
-
-        // Minimum 2ms to avoid premature triggers due to timestamp rounding
-        pto_period = pto_period.max(core::time::Duration::from_millis(2));
-
-        // Base the timeout on when the last packet was sent
-        // Only read clock if we don't have a last_sent_time
-        let base_time = self.last_sent_time.unwrap_or_else(|| clock.now());
-        self.target_time = Some(base_time + pto_period);
     }
 }
 
@@ -1923,6 +1886,7 @@ where
     fn poll_recv(
         &mut self,
         cx: &mut task::Context<'_>,
+        budget: &mut Budget,
     ) -> Poll<
         Option<
             crate::intrusive_queue::Entry<
@@ -1930,37 +1894,37 @@ where
             >,
         >,
     > {
-        let Some(mut batch) = ready!(self.inner.poll_recv(cx)) else {
-            return Poll::Ready(None);
-        };
+        loop {
+            let Some(mut batch) = ready!(self.inner.poll_recv(cx, budget)) else {
+                return Poll::Ready(None);
+            };
 
-        let Some(front) = batch.datagrams.front() else {
-            // Empty batch - just skip it
-            debug_assert!(false, "empty batch submitted");
-            cx.waker().wake_by_ref();
-            return Poll::Pending;
-        };
+            let Some(front) = batch.datagrams.front() else {
+                // Empty batch - just skip it
+                debug_assert!(false, "empty batch submitted");
+                continue;
+            };
 
-        // Resolve path context
-        let Some(context) = self.resolver.resolve(&front.path_secret_entry) else {
-            // Reset all of the batch datagrams as failed
-            for dgram in batch.datagrams.iter_mut() {
-                dgram.status = TransmissionStatus::Failed(FailureReason::UnknownPathSecret);
-            }
+            // Resolve path context
+            let Some(context) = self.resolver.resolve(&front.path_secret_entry) else {
+                // Reset all of the batch datagrams as failed
+                for dgram in batch.datagrams.iter_mut() {
+                    dgram.status = TransmissionStatus::Failed(FailureReason::UnknownPathSecret);
+                }
 
-            let _ = self.error_sender.send(batch);
+                let _ = self.error_sender.send(batch);
 
-            cx.waker().wake_by_ref();
-            return Poll::Pending;
-        };
+                continue;
+            };
 
-        // Increment pending_batches counter
-        context.borrow_mut().pending_batches += 1;
+            // Increment pending_batches counter
+            context.borrow_mut().pending_batches += 1;
 
-        // Attach the context to the batch, making it !Send
-        let batch = batch.with_context(context);
+            // Attach the context to the batch, making it !Send
+            let batch = batch.with_context(context);
 
-        Poll::Ready(Some(batch))
+            return Poll::Ready(Some(batch));
+        }
     }
 
     fn on_consumed(&mut self, bytes: u64) {
@@ -2015,6 +1979,7 @@ where
     fn poll_recv(
         &mut self,
         cx: &mut task::Context<'_>,
+        budget: &mut Budget,
     ) -> Poll<
         Option<
             crate::intrusive_queue::Entry<
@@ -2022,12 +1987,12 @@ where
             >,
         >,
     > {
-        let Some(mut batch) = ready!(self.inner.poll_recv(cx)) else {
+        let Some(mut batch) = ready!(self.inner.poll_recv(cx, budget)) else {
             return Poll::Ready(None);
         };
 
         let Some(unfilled) = self.pool.alloc() else {
-            cx.waker().wake_by_ref();
+            budget.set_needs_wake();
             return Poll::Pending;
         };
 
@@ -2082,6 +2047,7 @@ where
     fn poll_recv(
         &mut self,
         cx: &mut task::Context<'_>,
+        budget: &mut Budget,
     ) -> Poll<
         Option<
             crate::intrusive_queue::Entry<
@@ -2089,7 +2055,7 @@ where
             >,
         >,
     > {
-        let Some(mut batch_entry) = ready!(self.inner.poll_recv(cx)) else {
+        let Some(mut batch_entry) = ready!(self.inner.poll_recv(cx, budget)) else {
             return Poll::Ready(None);
         };
 
@@ -2231,8 +2197,9 @@ where
     fn poll_recv(
         &mut self,
         cx: &mut task::Context<'_>,
+        budget: &mut Budget,
     ) -> Poll<Option<crate::intrusive_queue::Entry<crate::datagram::batch::Batch>>> {
-        let Some(batch_with_context) = ready!(self.inner.poll_recv(cx)) else {
+        let Some(batch_with_context) = ready!(self.inner.poll_recv(cx, budget)) else {
             return Poll::Ready(None);
         };
 
@@ -2255,100 +2222,6 @@ where
     }
 
     fn on_consumed(&mut self, bytes: u64) {
-        self.inner.on_consumed(bytes);
-    }
-}
-
-// ── Timing adapter ─────────────────────────────────────────────────────────
-
-/// Wraps a receiver and measures time spent in poll_recv
-pub struct Timing<T, R> {
-    inner: R,
-    label: &'static str,
-    _phantom: PhantomData<T>,
-}
-
-impl<T, R> Timing<T, R> {
-    pub fn new(inner: R, label: &'static str) -> Self {
-        Self {
-            inner,
-            label,
-            _phantom: PhantomData,
-        }
-    }
-}
-
-impl<T, R> Receiver<T> for Timing<T, R>
-where
-    R: Receiver<T>,
-{
-    fn poll_recv(&mut self, cx: &mut task::Context<'_>) -> Poll<Option<T>> {
-        // let start = std::time::Instant::now();
-        let result = self.inner.poll_recv(cx);
-        // let elapsed = start.elapsed();
-
-        // if elapsed.as_millis() > 1 {
-        // tracing::warn!(label = self.label, ?elapsed, "slow poll_recv detected");
-        // }
-
-        result
-    }
-
-    fn on_consumed(&mut self, bytes: u64) {
-        self.inner.on_consumed(bytes);
-    }
-}
-
-// ── Dbg adapter ────────────────────────────────────────────────────────────
-
-/// Wraps a receiver and logs debug information about received values.
-///
-/// Prints the type name and label when values are received, useful for
-/// debugging channel pipelines.
-pub struct Dbg<T, R> {
-    inner: R,
-    label: &'static str,
-    _phantom: PhantomData<T>,
-}
-
-impl<T, R> Dbg<T, R> {
-    pub fn new(inner: R, label: &'static str) -> Self {
-        Self {
-            inner,
-            label,
-            _phantom: PhantomData,
-        }
-    }
-}
-
-impl<T, R> Receiver<T> for Dbg<T, R>
-where
-    R: Receiver<T>,
-    T: fmt::Debug,
-{
-    fn poll_recv(&mut self, cx: &mut task::Context<'_>) -> Poll<Option<T>> {
-        match self.inner.poll_recv(cx) {
-            Poll::Ready(Some(value)) => {
-                tracing::trace!(
-                    label = self.label,
-                    // value = ?value,
-                    "recv Ready(Some)",
-                );
-                Poll::Ready(Some(value))
-            }
-            Poll::Ready(None) => {
-                tracing::trace!(label = self.label, "recv Ready(None)",);
-                Poll::Ready(None)
-            }
-            Poll::Pending => {
-                tracing::trace!(label = self.label, "recv Pending",);
-                Poll::Pending
-            }
-        }
-    }
-
-    fn on_consumed(&mut self, bytes: u64) {
-        tracing::trace!(label = self.label, bytes, "on_consumed",);
         self.inner.on_consumed(bytes);
     }
 }
@@ -2409,6 +2282,16 @@ pub struct GaugedSender<S, T> {
     inner: S,
     gauge: crate::counter::QueueGauge,
     _phantom: PhantomData<T>,
+}
+
+impl<S: Clone, T> Clone for GaugedSender<S, T> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            gauge: self.gauge.clone(),
+            _phantom: PhantomData,
+        }
+    }
 }
 
 impl<S, T> GaugedSender<S, T> {
@@ -2497,8 +2380,8 @@ where
     R: Receiver<T>,
 {
     #[inline]
-    fn poll_recv(&mut self, cx: &mut task::Context<'_>) -> Poll<Option<T>> {
-        match self.inner.poll_recv(cx) {
+    fn poll_recv(&mut self, cx: &mut task::Context<'_>, budget: &mut Budget) -> Poll<Option<T>> {
+        match self.inner.poll_recv(cx, budget) {
             Poll::Ready(Some(value)) => {
                 self.gauge.dequeue_n(value.batch_len());
                 Poll::Ready(Some(value))

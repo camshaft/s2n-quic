@@ -255,12 +255,11 @@ where
     if is_ack_eliciting {
         let _ = peer.ack_state.on_ack_eliciting();
 
-        debug_assert!(
-            !peer.ack_burst.is_linked() || peer.ack_state.is_scheduled(),
-            "ack_burst link should only be active while ack_state is Scheduled"
-        );
-
-        if !peer.ack_burst.is_linked() {
+        // Only enqueue into the burst queue when the state is Scheduled.
+        // When FlushedStale, the ack_completion_task handles re-encoding after
+        // the in-flight ACK completes — enqueueing here would leave a stale link
+        // that outlives the Scheduled state.
+        if !peer.ack_burst.is_linked() && peer.ack_state.is_scheduled() {
             enqueue_pending_ack = true;
         }
     }
@@ -865,7 +864,7 @@ fn handle_flow_validate_request(
                     dest_queue_id: queue_pair.source_queue_id,
                     stream_id,
                     reset_target: ResetTarget::Both,
-                    error_code: reset_error::STALE_STATE,
+                    error_code: reset_error::FLOW_VALIDATION_FAILED,
                 },
                 source_sender_id: UNSET_SOURCE_SENDER_ID,
                 payload: ByteVec::new(),
@@ -934,7 +933,7 @@ fn handle_flow_init_validate(
                         path_secret_entry,
                         queue_pair.source_queue_id,
                         stream_id,
-                        reset_error::STALE_STATE,
+                        reset_error::FLOW_VALIDATION_FAILED,
                     );
                 }
             }
@@ -953,7 +952,7 @@ fn handle_flow_init_validate(
                 path_secret_entry,
                 queue_pair.source_queue_id,
                 stream_id,
-                reset_error::STALE_STATE,
+                reset_error::FLOW_VALIDATION_FAILED,
             );
         }
     }
@@ -1020,42 +1019,42 @@ fn handle_flow_data(
                 path_secret_entry,
                 queue_pair.source_queue_id,
                 stream_id,
-                reset_error::STALE_STATE,
+                reset_error::QUEUE_UNALLOCATED,
             );
         }
         Err(flow::queue::Error::HalfClosed(_)) => {
             counters.rx_data_half_closed.add(1);
-            tracing::debug!(
+            tracing::trace!(
                 stream_id = stream_id.as_u64(),
                 queue_id = local_queue_id.as_u64(),
-                "FlowData for half-closed stream - sending reset"
-            );
-            push_reset_frame_with_target(
-                response_frames,
-                counters,
-                path_secret_entry,
-                queue_pair.source_queue_id,
-                stream_id,
-                ResetTarget::Stream,
-                reset_error::STALE_STATE,
+                "FlowData for half-closed stream - dropping"
             );
         }
-        Err(flow::queue::Error::FullyClosed(_)) => {
-            counters.rx_data_fully_closed.add(1);
-            tracing::debug!(
-                stream_id = stream_id.as_u64(),
-                queue_id = local_queue_id.as_u64(),
-                "FlowData for fully closed queue - sending reset"
-            );
-            push_reset_frame_with_target(
-                response_frames,
-                counters,
-                path_secret_entry,
-                queue_pair.source_queue_id,
-                stream_id,
-                ResetTarget::Both,
-                reset_error::STALE_STATE,
-            );
+        Err(flow::queue::Error::ValidationFailed(_, reason)) => {
+            counters.on_data_validation_failed(reason);
+            if let Some(error_code) = reason.as_reset_code() {
+                tracing::debug!(
+                    stream_id = stream_id.as_u64(),
+                    queue_id = local_queue_id.as_u64(),
+                    ?reason,
+                    "FlowData validation failed - sending reset"
+                );
+                push_reset_frame_with_target(
+                    response_frames,
+                    counters,
+                    path_secret_entry,
+                    queue_pair.source_queue_id,
+                    stream_id,
+                    ResetTarget::Both,
+                    error_code,
+                );
+            } else {
+                tracing::trace!(
+                    stream_id = stream_id.as_u64(),
+                    queue_id = local_queue_id.as_u64(),
+                    "FlowData for previous occupant - dropping"
+                );
+            }
         }
         Err(flow::queue::Error::PermanentlyClosed) => {
             counters.rx_data_perm_closed.add(1);
@@ -1121,42 +1120,42 @@ fn handle_flow_control(
                 queue_pair.source_queue_id,
                 stream_id,
                 ResetTarget::Both,
-                reset_error::STALE_STATE,
+                reset_error::QUEUE_UNALLOCATED,
             );
         }
         Err(flow::queue::Error::HalfClosed(_)) => {
             counters.rx_flow_control_half_closed.add(1);
-            tracing::debug!(
+            tracing::trace!(
                 stream_id = stream_id.as_u64(),
                 queue_id = local_queue_id.as_u64(),
-                "FlowControl for half-closed control queue - sending reset"
-            );
-            push_reset_frame_with_target(
-                response_frames,
-                counters,
-                path_secret_entry,
-                queue_pair.source_queue_id,
-                stream_id,
-                ResetTarget::Control,
-                reset_error::STALE_STATE,
+                "FlowControl for half-closed control queue - dropping"
             );
         }
-        Err(flow::queue::Error::FullyClosed(_)) => {
-            counters.rx_flow_control_fully_closed.add(1);
-            tracing::debug!(
-                stream_id = stream_id.as_u64(),
-                queue_id = local_queue_id.as_u64(),
-                "FlowControl for fully closed queue - sending reset"
-            );
-            push_reset_frame_with_target(
-                response_frames,
-                counters,
-                path_secret_entry,
-                queue_pair.source_queue_id,
-                stream_id,
-                ResetTarget::Both,
-                reset_error::STALE_STATE,
-            );
+        Err(flow::queue::Error::ValidationFailed(_, reason)) => {
+            counters.on_flow_control_validation_failed(reason);
+            if let Some(error_code) = reason.as_reset_code() {
+                tracing::debug!(
+                    stream_id = stream_id.as_u64(),
+                    queue_id = local_queue_id.as_u64(),
+                    ?reason,
+                    "FlowControl validation failed - sending reset"
+                );
+                push_reset_frame_with_target(
+                    response_frames,
+                    counters,
+                    path_secret_entry,
+                    queue_pair.source_queue_id,
+                    stream_id,
+                    ResetTarget::Both,
+                    error_code,
+                );
+            } else {
+                tracing::trace!(
+                    stream_id = stream_id.as_u64(),
+                    queue_id = local_queue_id.as_u64(),
+                    "FlowControl for previous occupant - dropping"
+                );
+            }
         }
         Err(flow::queue::Error::PermanentlyClosed) => {
             counters.rx_flow_control_perm_closed.add(1);
