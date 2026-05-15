@@ -711,10 +711,13 @@ where
             return Poll::Ready(Some(Default::default()));
         }
 
-        let incoming_id = frame.completion.as_ref().map(|c| c.queue_id());
-        debug_assert!(incoming_id.is_some());
+        let incoming_id = frame
+            .completion
+            .as_ref()
+            .map(|c| c.queue_id())
+            .expect("should_notify returned true without completion sender");
 
-        if self.current_queue_id() == incoming_id {
+        if self.current_queue_id() == Some(incoming_id) {
             self.batch.push_back(Entry::from(frame));
             Poll::Ready(Some(Default::default()))
         } else {
