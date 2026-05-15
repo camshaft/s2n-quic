@@ -642,8 +642,8 @@ fn init_uniqueness_reordered_and_duplicated() {
 fn init_uniqueness_fuzz() {
     bolero::check!()
         .with_type::<PacketActions>()
-        .with_test_time(core::time::Duration::from_secs(30))
-        .with_shrink_time(core::time::Duration::from_secs(10))
+        .with_test_time(Duration::from_secs(30))
+        .with_shrink_time(Duration::from_secs(10))
         .cloned()
         .for_each(|actions| {
             sim_init_uniqueness(&actions, 100);
