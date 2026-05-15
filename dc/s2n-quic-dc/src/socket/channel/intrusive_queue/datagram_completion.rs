@@ -400,5 +400,9 @@ mod tests {
         let rx = new_with_mode::<()>(SubscriptionMode::FailuresOnly);
         let tx = rx.sender();
         assert_eq!(tx.subscription_mode(), SubscriptionMode::FailuresOnly);
+
+        let rx = new::<()>();
+        let tx = rx.sender();
+        assert_eq!(tx.subscription_mode(), SubscriptionMode::All);
     }
 }
