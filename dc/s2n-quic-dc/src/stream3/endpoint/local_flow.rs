@@ -37,8 +37,8 @@ impl StreamPriority {
     #[inline]
     fn from_u8(value: u8) -> Self {
         match value {
-            0 => Self::High,
-            1 => Self::Normal,
+            value if value == Self::High as u8 => Self::High,
+            value if value == Self::Normal as u8 => Self::Normal,
             _ => Self::Low,
         }
     }
@@ -232,7 +232,7 @@ impl Flow {
     }
 
     #[inline]
-    fn mark_enqueued(&self, _priority: StreamPriority) -> bool {
+    fn mark_enqueued(&self) -> bool {
         if self
             .queued
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -319,7 +319,10 @@ impl Controller {
     pub const DEFAULT_MAX_BURST_BYTES: u64 = 64 * 1024;
 
     pub fn new(max_queued_bytes: u64, max_inflight_bytes: u64, max_burst_bytes: u64) -> Arc<Self> {
-        assert!(max_burst_bytes > 0, "max burst bytes must be non-zero");
+        assert!(
+            max_burst_bytes > 0,
+            "max_burst_bytes must be non-zero, got: {max_burst_bytes}"
+        );
         Arc::new(Self {
             queued_bytes: AtomicU64::new(0),
             inflight_bytes: AtomicU64::new(0),
@@ -424,7 +427,7 @@ impl Controller {
     }
 
     fn enqueue(&self, flow: Arc<Flow>, priority: StreamPriority) {
-        if !flow.mark_enqueued(priority) {
+        if !flow.mark_enqueued() {
             return;
         }
 
