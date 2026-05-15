@@ -3,7 +3,7 @@
 
 use crate::stream3::{endpoint::reset_error::ResetError, Reader, Writer};
 use s2n_quic_core::buffer;
-use std::io;
+use std::{io, net::SocketAddr};
 
 /// A bidirectional stream composed of a Reader and Writer
 pub struct Stream {
@@ -51,6 +51,11 @@ impl Stream {
     #[inline]
     pub fn into_split(self) -> (Reader, Writer) {
         (self.read, self.write)
+    }
+
+    #[inline]
+    pub fn peer_addr(&self) -> SocketAddr {
+        self.read.peer_addr()
     }
 
     #[inline]

@@ -107,6 +107,7 @@ use s2n_quic_core::{
 };
 use std::{
     io,
+    net::SocketAddr,
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
@@ -225,6 +226,7 @@ impl Reader {
         path_secret_entry: Arc<PathSecretEntry>,
         stream_id: VarInt,
         stream_rx: msg::queue::Stream,
+        peer_fin_received: bool,
     ) -> Self {
         let parameters = path_secret_entry.parameters();
         let window_size = parameters.local_recv_max_data.as_u64();
@@ -238,7 +240,7 @@ impl Reader {
             reassembler: Reassembler::new(),
             remote_max_data: VarInt::ZERO,
             window_size,
-            send_flow_update_after_fin: true,
+            send_flow_update_after_fin: !peer_fin_received,
             status: Status::Open,
             reset_error_code: None,
             coop: Coop::default(),
@@ -250,6 +252,7 @@ impl Reader {
         path_secret_entry: Arc<PathSecretEntry>,
         stream_id: VarInt,
         stream_rx: msg::queue::Stream,
+        peer_fin_received: bool,
     ) -> Self {
         let parameters = path_secret_entry.parameters();
         let window_size = parameters.local_recv_max_data.as_u64();
@@ -263,7 +266,7 @@ impl Reader {
             reassembler: Reassembler::new(),
             remote_max_data: VarInt::ZERO,
             window_size,
-            send_flow_update_after_fin: true,
+            send_flow_update_after_fin: !peer_fin_received,
             status: Status::PendingValidation,
             reset_error_code: None,
             coop: Coop::default(),
@@ -275,8 +278,14 @@ impl Reader {
     }
 
     /// Returns the stream identifier for this reader.
+    #[inline]
     pub fn stream_id(&self) -> u64 {
         self.0.stream_id.as_u64()
+    }
+
+    #[inline]
+    pub fn peer_addr(&self) -> SocketAddr {
+        *self.0.path_secret_entry.peer()
     }
 
     pub(crate) fn send_reset(&mut self, error_code: VarInt) {

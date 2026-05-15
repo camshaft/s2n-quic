@@ -18,10 +18,9 @@ pub struct Builder<
     #[allow(dead_code)]
     pub(crate) event_subscriber: Event,
     pub(crate) data_window: u64,
-    pub(crate) initial_data_window: Option<u64>,
     pub(crate) mtu: u16,
     pub(crate) max_idle_timeout: Duration,
-    pub(crate) data_port: Option<u16>,
+    pub(crate) data_addrs: Vec<SocketAddr>,
     pub(crate) pto_jitter_percentage: u8,
     #[cfg(any(test, feature = "testing"))]
     pub(crate) endpoint_limits: Option<TestEndpointLimiter>,
@@ -48,10 +47,9 @@ impl Default for Builder<s2n_quic::provider::event::default::Subscriber> {
         Self {
             event_subscriber: Default::default(),
             data_window: DEFAULT_MAX_DATA,
-            initial_data_window: None,
             mtu: DEFAULT_MTU,
             max_idle_timeout: DEFAULT_IDLE_TIMEOUT,
-            data_port: None,
+            data_addrs: Vec::new(),
             pto_jitter_percentage: DEFAULT_PTO_JITTER_PERCENTAGE,
             #[cfg(any(test, feature = "testing"))]
             endpoint_limits: None,
@@ -68,10 +66,9 @@ impl<Event: s2n_quic::provider::event::Subscriber> Builder<Event> {
         Builder {
             event_subscriber,
             data_window: self.data_window,
-            initial_data_window: self.initial_data_window,
             mtu: self.mtu,
             max_idle_timeout: self.max_idle_timeout,
-            data_port: self.data_port,
+            data_addrs: self.data_addrs,
             pto_jitter_percentage: self.pto_jitter_percentage,
             #[cfg(any(test, feature = "testing"))]
             endpoint_limits: self.endpoint_limits,
@@ -96,15 +93,6 @@ impl<Event: s2n_quic::provider::event::Subscriber> Builder<Event> {
         self
     }
 
-    /// Sets the initial amount of data that the peer is allowed to send before the application
-    /// accepts the stream
-    ///
-    /// This defaults to 10x the MTU if not set.
-    pub fn with_initial_data_window(mut self, initial_data_window: u64) -> Self {
-        self.initial_data_window = Some(initial_data_window);
-        self
-    }
-
     /// Sets the largest maximum transmission unit (MTU) that will be used for transmission
     pub fn with_mtu(mut self, mtu: u16) -> Self {
         self.mtu = mtu;
@@ -120,9 +108,9 @@ impl<Event: s2n_quic::provider::event::Subscriber> Builder<Event> {
         self
     }
 
-    /// Sets the local data port to advertise to the peer via post-handshake port exchange.
-    pub fn with_data_port(mut self, port: u16) -> Self {
-        self.data_port = Some(port);
+    /// Sets the local data addresses to advertise to the peer.
+    pub fn with_data_addrs(mut self, addrs: Vec<SocketAddr>) -> Self {
+        self.data_addrs = addrs;
         self
     }
 
