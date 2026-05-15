@@ -199,6 +199,9 @@ impl Flow {
     }
 
     #[inline]
+    /// Atomically consumes up to `limit` bytes of previously issued credits.
+    ///
+    /// Returns the actual number of bytes removed from this flow's issued balance.
     pub fn take_issued(&self, limit: u64) -> u64 {
         let mut current = self.issued.load(Ordering::Acquire);
         loop {
@@ -220,6 +223,7 @@ impl Flow {
     }
 
     #[inline]
+    /// Stores the current task waker so the controller can resume the writer once credits arrive.
     pub fn register_waker(&self, waker: &Waker) {
         let slot = &mut *self.waker.lock();
         if slot.as_ref().map_or(true, |current| !current.will_wake(waker)) {
@@ -233,6 +237,9 @@ impl Flow {
     }
 
     #[inline]
+    /// Clears any pending request and drops the stored application waker.
+    ///
+    /// Writers call this when they no longer need queued credits, such as on drop.
     pub fn clear_wait(&self) {
         self.clear_requested();
         *self.waker.lock() = None;
@@ -337,6 +344,10 @@ impl Controller {
     pub const DEFAULT_MAX_INFLIGHT_BYTES: u64 = 8 * 1024 * 1024;
     pub const DEFAULT_MAX_BURST_BYTES: u64 = 64 * 1024;
 
+    /// Creates a controller with endpoint-wide queued/inflight limits and a per-issuance burst cap.
+    ///
+    /// `max_burst_bytes` limits how many queued bytes a single flow can receive in one issuance so
+    /// that other waiting flows have a chance to run before the same writer acquires more credits.
     pub fn new(max_queued_bytes: u64, max_inflight_bytes: u64, max_burst_bytes: u64) -> Arc<Self> {
         assert!(
             max_queued_bytes > 0,
@@ -381,6 +392,10 @@ impl Controller {
         self.inflight_bytes.load(Ordering::Acquire)
     }
 
+    /// Requests endpoint-local credits for `flow`.
+    ///
+    /// The controller records the desired byte count, queues the flow in its priority lane if
+    /// needed, and attempts to issue a capped burst immediately if endpoint capacity is available.
     pub fn request(&self, flow: &Arc<Flow>, priority: StreamPriority, requested: u64) {
         if requested == 0 {
             return;
@@ -397,10 +412,17 @@ impl Controller {
         self.issue_waiters();
     }
 
+    /// Clears any pending wait state for `flow`.
+    ///
+    /// This is used when a writer is dropped or otherwise no longer needs queued credits.
     pub fn clear_waiter(&self, flow: &Arc<Flow>) {
         flow.clear_wait();
     }
 
+    /// Updates the flow's priority for future credit issuance.
+    ///
+    /// Already-queued flows keep their current queue position until popped, at which point the
+    /// controller requeues them onto the new priority lane before issuing credits.
     pub fn update_priority(&self, flow: &Arc<Flow>, priority: StreamPriority) {
         let previous = flow.priority();
         if previous == priority {
