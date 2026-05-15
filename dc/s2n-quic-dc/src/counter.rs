@@ -303,11 +303,10 @@ where
         }
         if let Some(line) = inner.try_take_current_metrics_line_sparse(false) {
             // eprintln!("[raw] {line}");
-            let line = Some(line)
-                .filter(|v| !v.is_empty())
-                .map(|v| ParsedMetricsLine::parse(&v))
-                .filter(|metrics| !metrics.is_empty())
-                .map(|metrics| metrics.format_pretty());
+            let line = Some(line).filter(|v| !v.is_empty()).and_then(|v| {
+                let metrics = ParsedMetricsLine::parse(&v);
+                (!metrics.is_empty()).then(|| metrics.format_pretty())
+            });
 
             if let Some(formatted) = line {
                 if label.is_empty() {
@@ -459,17 +458,17 @@ where
 // ── Metrics line formatting ─────────────────────────────────────────────────
 
 #[derive(Debug, Default, PartialEq, Eq)]
-struct ParsedMetricsLine {
-    entries: Vec<MetricEntry>,
+struct ParsedMetricsLine<'a> {
+    entries: Vec<MetricEntry<'a>>,
 }
 
-impl ParsedMetricsLine {
-    fn parse(line: &str) -> Self {
+impl<'a> ParsedMetricsLine<'a> {
+    fn parse(line: &'a str) -> Self {
         use std::collections::{BTreeMap, BTreeSet, HashSet};
 
-        let mut metrics: BTreeMap<&str, &str> = BTreeMap::new();
-        let mut nominals: BTreeMap<&str, Vec<NominalVariant>> = BTreeMap::new();
-        let mut variant_histograms: BTreeMap<&str, Vec<HistogramVariant>> = BTreeMap::new();
+        let mut metrics: BTreeMap<&'a str, &'a str> = BTreeMap::new();
+        let mut nominals: BTreeMap<&'a str, Vec<NominalVariant<'a>>> = BTreeMap::new();
+        let mut variant_histograms: BTreeMap<&'a str, Vec<HistogramVariant<'a>>> = BTreeMap::new();
 
         for part in line.split(',') {
             let Some((key, value)) = part.split_once('=') else {
@@ -479,8 +478,8 @@ impl ParsedMetricsLine {
             if let Some((val, rest)) = value.split_once(' ') {
                 if val.bytes().all(|b| b.is_ascii_digit()) {
                     nominals.entry(key).or_default().push(NominalVariant {
-                        label: rest.to_string(),
-                        value: val.to_string(),
+                        label: rest,
+                        value: val,
                     });
                     continue;
                 }
@@ -514,7 +513,7 @@ impl ParsedMetricsLine {
         }
 
         let mut entries = Vec::new();
-        let mut consumed: HashSet<String> = HashSet::new();
+        let mut consumed: HashSet<&'a str> = HashSet::new();
 
         for (&key, &value) in &metrics {
             if consumed.contains(key) {
@@ -530,18 +529,24 @@ impl ParsedMetricsLine {
                 let enq_key = format!("{base}.enq");
                 let drain_key = format!("{base}.drain");
                 let depth_key = format!("{base}.depth");
-                consumed.insert(enq_key.clone());
-                consumed.insert(drain_key.clone());
-                consumed.insert(depth_key.clone());
+                if let Some((&enq_key, _)) = metrics.get_key_value(enq_key.as_str()) {
+                    consumed.insert(enq_key);
+                }
+                if let Some((&drain_key, _)) = metrics.get_key_value(drain_key.as_str()) {
+                    consumed.insert(drain_key);
+                }
+                if let Some((&depth_key, _)) = metrics.get_key_value(depth_key.as_str()) {
+                    consumed.insert(depth_key);
+                }
 
                 entries.push(MetricEntry::QueueGauge(QueueGaugeMetric {
-                    name: base.to_string(),
-                    enq: metrics.get(enq_key.as_str()).unwrap_or(&"0").to_string(),
-                    drain: metrics.get(drain_key.as_str()).unwrap_or(&"0").to_string(),
+                    name: base,
+                    enq: metrics.get(enq_key.as_str()).copied().unwrap_or("0"),
+                    drain: metrics.get(drain_key.as_str()).copied().unwrap_or("0"),
                     depth: metrics
                         .get(depth_key.as_str())
-                        .filter(|depth| **depth != "0")
-                        .map(|depth| (*depth).to_string()),
+                        .copied()
+                        .filter(|depth| *depth != "0"),
                 }));
                 continue;
             }
@@ -553,18 +558,22 @@ impl ParsedMetricsLine {
             if let Some(base) = hit_miss_base.filter(|base| hit_miss_bases.contains(base)) {
                 let hit_key = format!("{base}.hit");
                 let miss_key = format!("{base}.miss");
-                consumed.insert(hit_key.clone());
-                consumed.insert(miss_key.clone());
+                if let Some((&hit_key, _)) = metrics.get_key_value(hit_key.as_str()) {
+                    consumed.insert(hit_key);
+                }
+                if let Some((&miss_key, _)) = metrics.get_key_value(miss_key.as_str()) {
+                    consumed.insert(miss_key);
+                }
 
                 entries.push(MetricEntry::HitMiss(HitMissMetric {
-                    name: base.to_string(),
-                    hit: metrics.get(hit_key.as_str()).unwrap_or(&"0").to_string(),
-                    miss: metrics.get(miss_key.as_str()).unwrap_or(&"0").to_string(),
+                    name: base,
+                    hit: metrics.get(hit_key.as_str()).copied().unwrap_or("0"),
+                    miss: metrics.get(miss_key.as_str()).copied().unwrap_or("0"),
                 }));
                 continue;
             }
 
-            consumed.insert(key.to_string());
+            consumed.insert(key);
 
             if let Some(name) = key.strip_suffix(":bytes") {
                 if let Ok(bytes) = value.parse::<u64>() {
@@ -572,10 +581,7 @@ impl ParsedMetricsLine {
                         continue;
                     }
 
-                    entries.push(MetricEntry::Throughput(ThroughputMetric {
-                        name: name.to_string(),
-                        bytes,
-                    }));
+                    entries.push(MetricEntry::Throughput(ThroughputMetric { name, bytes }));
                 }
 
                 continue;
@@ -583,28 +589,25 @@ impl ParsedMetricsLine {
 
             if value.contains('*') {
                 entries.push(MetricEntry::Histogram(HistogramMetric {
-                    name: key.to_string(),
+                    name: key,
                     histogram: Histogram::parse(value),
                 }));
                 continue;
             }
 
-            entries.push(MetricEntry::Scalar(ScalarMetric {
-                name: key.to_string(),
-                value: value.to_string(),
-            }));
+            entries.push(MetricEntry::Scalar(ScalarMetric { name: key, value }));
         }
 
         for (key, variants) in nominals {
             entries.push(MetricEntry::Nominal(NominalMetric {
-                name: key.to_string(),
+                name: key,
                 variants,
             }));
         }
 
         for (key, variants) in variant_histograms {
             entries.push(MetricEntry::VariantHistograms(VariantHistogramMetric {
-                name: key.to_string(),
+                name: key,
                 variants,
             }));
         }
@@ -628,17 +631,17 @@ impl ParsedMetricsLine {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-enum MetricEntry {
-    QueueGauge(QueueGaugeMetric),
-    HitMiss(HitMissMetric),
-    Throughput(ThroughputMetric),
-    Histogram(HistogramMetric),
-    Scalar(ScalarMetric),
-    Nominal(NominalMetric),
-    VariantHistograms(VariantHistogramMetric),
+enum MetricEntry<'a> {
+    QueueGauge(QueueGaugeMetric<'a>),
+    HitMiss(HitMissMetric<'a>),
+    Throughput(ThroughputMetric<'a>),
+    Histogram(HistogramMetric<'a>),
+    Scalar(ScalarMetric<'a>),
+    Nominal(NominalMetric<'a>),
+    VariantHistograms(VariantHistogramMetric<'a>),
 }
 
-impl MetricEntry {
+impl MetricEntry<'_> {
     fn write_to(&self, output: &mut String) {
         use std::fmt::Write;
 
@@ -696,72 +699,68 @@ impl MetricEntry {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-struct QueueGaugeMetric {
-    name: String,
-    enq: String,
-    drain: String,
-    depth: Option<String>,
+struct QueueGaugeMetric<'a> {
+    name: &'a str,
+    enq: &'a str,
+    drain: &'a str,
+    depth: Option<&'a str>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
-struct HitMissMetric {
-    name: String,
-    hit: String,
-    miss: String,
+struct HitMissMetric<'a> {
+    name: &'a str,
+    hit: &'a str,
+    miss: &'a str,
 }
 
 #[derive(Debug, PartialEq, Eq)]
-struct ThroughputMetric {
-    name: String,
+struct ThroughputMetric<'a> {
+    name: &'a str,
     bytes: u64,
 }
 
 #[derive(Debug, PartialEq, Eq)]
-struct HistogramMetric {
-    name: String,
-    histogram: Histogram,
+struct HistogramMetric<'a> {
+    name: &'a str,
+    histogram: Histogram<'a>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
-struct ScalarMetric {
-    name: String,
-    value: String,
+struct ScalarMetric<'a> {
+    name: &'a str,
+    value: &'a str,
 }
 
 #[derive(Debug, PartialEq, Eq)]
-struct NominalMetric {
-    name: String,
-    variants: Vec<NominalVariant>,
+struct NominalMetric<'a> {
+    name: &'a str,
+    variants: Vec<NominalVariant<'a>>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
-struct NominalVariant {
-    label: String,
-    value: String,
+struct NominalVariant<'a> {
+    label: &'a str,
+    value: &'a str,
 }
 
 #[derive(Debug, PartialEq, Eq)]
-struct VariantHistogramMetric {
-    name: String,
-    variants: Vec<HistogramVariant>,
+struct VariantHistogramMetric<'a> {
+    name: &'a str,
+    variants: Vec<HistogramVariant<'a>>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
-struct HistogramVariant {
-    label: String,
-    histogram: Histogram,
+struct HistogramVariant<'a> {
+    label: &'a str,
+    histogram: Histogram<'a>,
 }
 
-impl HistogramVariant {
-    fn parse(value: &str) -> Self {
+impl<'a> HistogramVariant<'a> {
+    fn parse(value: &'a str) -> Self {
         let (data, unit, variant) = parse_histogram_suffix(value);
 
         Self {
-            label: if variant.is_empty() {
-                "?".to_string()
-            } else {
-                variant.to_string()
-            },
+            label: if variant.is_empty() { "?" } else { variant },
             histogram: Histogram::parse_parts(data, unit),
         }
     }
@@ -772,21 +771,21 @@ impl HistogramVariant {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-struct Histogram {
+struct Histogram<'a> {
     buckets: Vec<HistogramBucket>,
-    unit: String,
+    unit: &'a str,
 }
 
-impl Histogram {
-    fn parse(value: &str) -> Self {
+impl<'a> Histogram<'a> {
+    fn parse(value: &'a str) -> Self {
         let (data, unit, _variant) = parse_histogram_suffix(value);
         Self::parse_parts(data, unit)
     }
 
-    fn parse_parts(data: &str, unit: &str) -> Self {
+    fn parse_parts(data: &'a str, unit: &'a str) -> Self {
         Self {
             buckets: parse_histogram_buckets(data),
-            unit: unit.to_string(),
+            unit,
         }
     }
 
@@ -980,21 +979,21 @@ mod tests {
             ParsedMetricsLine {
                 entries: vec![
                     MetricEntry::QueueGauge(QueueGaugeMetric {
-                        name: "q.packet".into(),
-                        enq: "46180".into(),
-                        drain: "45662".into(),
-                        depth: Some("875".into()),
+                        name: "q.packet",
+                        enq: "46180",
+                        drain: "45662",
+                        depth: Some("875"),
                     }),
                     MetricEntry::Nominal(NominalMetric {
-                        name: "rx.ecn".into(),
+                        name: "rx.ecn",
                         variants: vec![
                             NominalVariant {
-                                label: "ect0".into(),
-                                value: "500".into(),
+                                label: "ect0",
+                                value: "500",
                             },
                             NominalVariant {
-                                label: "ect1".into(),
-                                value: "3".into(),
+                                label: "ect1",
+                                value: "3",
                             },
                         ],
                     }),
@@ -1013,10 +1012,10 @@ mod tests {
             parsed,
             ParsedMetricsLine {
                 entries: vec![MetricEntry::VariantHistograms(VariantHistogramMetric {
-                    name: "task.time".into(),
+                    name: "task.time",
                     variants: vec![
                         HistogramVariant {
-                            label: "packet_dispatch.0".into(),
+                            label: "packet_dispatch.0",
                             histogram: Histogram {
                                 buckets: vec![
                                     HistogramBucket { value: 5, count: 2 },
@@ -1025,14 +1024,14 @@ mod tests {
                                         count: 1
                                     },
                                 ],
-                                unit: "us".into(),
+                                unit: "us",
                             },
                         },
                         HistogramVariant {
-                            label: "packet_dispatch.1".into(),
+                            label: "packet_dispatch.1",
                             histogram: Histogram {
                                 buckets: vec![HistogramBucket { value: 7, count: 3 }],
-                                unit: "us".into(),
+                                unit: "us",
                             },
                         },
                     ],
