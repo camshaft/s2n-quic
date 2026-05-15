@@ -31,7 +31,9 @@ use crate::{
 use core::time::Duration;
 use rustc_hash::FxHashMap;
 use s2n_quic_core::{
-    frame::ack::EcnCounts, packet::number::PacketNumberSpace, path::INITIAL_PTO_BACKOFF,
+    frame::ack::EcnCounts,
+    packet::{number::PacketNumberSpace, KeyPhase},
+    path::INITIAL_PTO_BACKOFF,
     recovery::RttEstimator, varint::VarInt,
 };
 use std::{cell::RefCell, rc::Rc, sync::Arc};
@@ -260,7 +262,7 @@ impl ProbeState {
 /// ACKs are handled separately via `pending_acks` (direct path, bypasses CWND).
 pub(crate) struct Context {
     pub path_secret_entry: Arc<PathSecretEntry>,
-    pub sealer: crate::crypto::awslc::seal::Application,
+    pub sealer: PacketSealer,
     pub credentials: Credentials,
     /// Next packet number to assign
     pub next_packet_number: VarInt,
@@ -290,6 +292,53 @@ pub(crate) struct Context {
     pub peer_ecn_counts: EcnCounts,
 }
 
+#[derive(Debug)]
+pub(crate) struct PacketSealer {
+    inner: crate::crypto::awslc::seal::Application,
+    key_phase: KeyPhase,
+}
+
+impl PacketSealer {
+    #[inline]
+    fn new(inner: crate::crypto::awslc::seal::Application, key_id: VarInt) -> Self {
+        let key_phase = if key_id.as_u64() & 1 == 0 {
+            KeyPhase::Zero
+        } else {
+            KeyPhase::One
+        };
+        Self { inner, key_phase }
+    }
+}
+
+impl crate::crypto::seal::Application for PacketSealer {
+    #[inline]
+    fn key_phase(&self) -> KeyPhase {
+        self.key_phase
+    }
+
+    #[inline]
+    fn tag_len(&self) -> usize {
+        crate::crypto::seal::Application::tag_len(&self.inner)
+    }
+
+    #[inline]
+    fn encrypt(
+        &self,
+        packet_number: u64,
+        header: &[u8],
+        extra_payload: Option<&[u8]>,
+        payload_and_tag: &mut [u8],
+    ) {
+        crate::crypto::seal::Application::encrypt(
+            &self.inner,
+            packet_number,
+            header,
+            extra_payload,
+            payload_and_tag,
+        )
+    }
+}
+
 impl Context {
     pub fn new(
         entry: &Arc<PathSecretEntry>,
@@ -299,6 +348,7 @@ impl Context {
         sender_idx: usize,
     ) -> Self {
         let (sealer, credentials) = entry.reusable_sealer();
+        let sealer = PacketSealer::new(sealer, credentials.key_id);
         let cca = congestion::Controller::new(entry.max_datagram_size());
         let rtt_estimator = RttEstimator::new(Duration::from_millis(2));
         let inflight = inflight::Map::new(inflight_gauge);

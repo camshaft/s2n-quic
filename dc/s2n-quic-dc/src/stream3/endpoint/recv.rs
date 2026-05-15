@@ -12,7 +12,7 @@ use crate::{
 };
 use core::time::Duration;
 use rustc_hash::FxHashMap;
-use s2n_quic_core::{frame::ack::EcnCounts, varint::VarInt};
+use s2n_quic_core::{frame::ack::EcnCounts, packet::KeyPhase, varint::VarInt};
 use std::{cell::RefCell, collections::hash_map, rc::Rc, sync::Arc};
 
 /// ACK transmission state machine.
@@ -249,7 +249,7 @@ pub(crate) struct Context {
     // Currently we only track the latest key, which means packets with old key_ids
     // after rotation will fail to decrypt. Need to maintain a small cache of recent
     // openers (e.g., HashMap<VarInt, Opener>) to handle in-flight packets during rotation.
-    pub opener: crate::crypto::awslc::open::Application,
+    pub opener: PacketOpener,
     /// The key_id this opener corresponds to
     #[expect(dead_code)] // TODO implement key rotation
     pub current_key_id: VarInt,
@@ -275,12 +275,69 @@ pub(crate) struct Context {
     pub ack_burst: intrusive_queue::Links,
 }
 
+#[derive(Debug)]
+pub(crate) struct PacketOpener {
+    inner: crate::crypto::awslc::open::Application,
+}
+
+impl PacketOpener {
+    #[inline]
+    fn new(inner: crate::crypto::awslc::open::Application) -> Self {
+        Self { inner }
+    }
+}
+
+impl crate::crypto::open::Application for PacketOpener {
+    #[inline]
+    fn tag_len(&self) -> usize {
+        crate::crypto::open::Application::tag_len(&self.inner)
+    }
+
+    #[inline]
+    fn decrypt(
+        &self,
+        _key_phase: KeyPhase,
+        packet_number: u64,
+        header: &[u8],
+        payload_in: &[u8],
+        tag: &[u8],
+        payload_out: &mut crate::crypto::UninitSlice,
+    ) -> crate::crypto::open::Result {
+        crate::crypto::open::Application::decrypt(
+            &self.inner,
+            KeyPhase::Zero,
+            packet_number,
+            header,
+            payload_in,
+            tag,
+            payload_out,
+        )
+    }
+
+    #[inline]
+    fn decrypt_in_place(
+        &self,
+        _key_phase: KeyPhase,
+        packet_number: u64,
+        header: &[u8],
+        payload_and_tag: &mut [u8],
+    ) -> crate::crypto::open::Result {
+        crate::crypto::open::Application::decrypt_in_place(
+            &self.inner,
+            KeyPhase::Zero,
+            packet_number,
+            header,
+            payload_and_tag,
+        )
+    }
+}
+
 impl Context {
     pub fn new<Clk>(
         path_entry: Arc<PathSecretEntry>,
         remote_sender_id: VarInt,
         dest_sender_id: VarInt,
-        opener: crate::crypto::awslc::open::Application,
+        opener: PacketOpener,
         key_id: VarInt,
         clock: &Clk,
         idle_timeout: Duration,
@@ -435,6 +492,7 @@ impl Cache {
                 tracing::debug!(%credentials, %remote_sender_id, worker_id = self.worker_id, "opener_for_credentials");
                 let (opener, path_entry) =
                     path_secret_map.opener_for_credentials(credentials, None, control_out)?;
+                let opener = PacketOpener::new(opener);
 
                 let dest_sender_id = route.sender_id_for_ack(&credentials.id, remote_sender_id);
 

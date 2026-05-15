@@ -479,6 +479,12 @@ fn encode_decode_round_trip() {
     let decode_buf = s2n_codec::DecoderBufferMut::new(&mut buf[..encoded_len]);
     let (mut packet, _) = crate::packet::datagram::decoder::Packet::decode(decode_buf, (), tag_len)
         .expect("packet must decode cleanly");
+    let expected_key_phase = if key_id.as_u64() & 1 == 0 {
+        s2n_quic_core::packet::KeyPhase::Zero
+    } else {
+        s2n_quic_core::packet::KeyPhase::One
+    };
+    assert_eq!(packet.tag().key_phase(), expected_key_phase);
 
     assert!(
         matches!(
