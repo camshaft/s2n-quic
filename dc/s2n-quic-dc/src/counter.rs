@@ -876,7 +876,7 @@ impl<'a> ParsedMetricsLine<'a> {
 
             if let Some((val, rest)) = value.split_once(' ') {
                 if val.bytes().all(|b| b.is_ascii_digit()) {
-                    if is_scalar_unit_only(rest) {
+                    if is_valid_scalar_unit(rest) {
                         metrics.insert(key, value);
                         continue;
                     }
@@ -1284,7 +1284,7 @@ fn is_histogram_unit_only(rest: &str) -> bool {
     matches!(rest, "us" | "ms" | "s" | "B" | "KB" | "MB" | "GB")
 }
 
-fn is_scalar_unit_only(rest: &str) -> bool {
+fn is_valid_scalar_unit(rest: &str) -> bool {
     matches!(rest, "us" | "ms" | "s" | "B" | "KB" | "MB" | "GB" | "%")
 }
 
@@ -1301,12 +1301,18 @@ fn compute_histogram_percentiles(buckets: &[HistogramBucket]) -> (u64, u64, u64,
     (total_count, p50, p99, max)
 }
 
+/// Returns `(total_count, max_value)` for histogram buckets.
+///
+/// For empty buckets, both values are `0`.
 fn histogram_count_and_max(buckets: &[HistogramBucket]) -> (u64, u64) {
     let count = buckets.iter().map(|bucket| bucket.count).sum();
     let max = buckets.last().map_or(0, |bucket| bucket.value);
     (count, max)
 }
 
+/// Returns the value at the requested percentile for histogram buckets.
+///
+/// `percentile` is expected in the range `0..=100`. Empty buckets return `0`.
 fn histogram_value_at_percentile(buckets: &[HistogramBucket], percentile: u32) -> u64 {
     let total_count: u64 = buckets.iter().map(|bucket| bucket.count).sum();
     if total_count == 0 {
