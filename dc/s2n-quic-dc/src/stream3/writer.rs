@@ -77,6 +77,7 @@ use crate::{
     path::secret::map::Entry as PathSecretEntry,
     stream3::{
         endpoint::{
+            local_flow::{self},
             msg,
             reset_error::{self, ResetError},
         },
@@ -98,6 +99,8 @@ use std::{
 use tracing::{debug, trace};
 
 use super::coop::{self, Coop, HasCoop};
+
+pub use super::endpoint::local_flow::StreamPriority;
 
 pub struct Writer(Box<Inner>);
 
@@ -126,6 +129,12 @@ struct Inner {
     remote_max_data: VarInt,
     /// Current status of the writer
     status: Status,
+    /// Endpoint-wide local flow control shared across writers
+    local_flow: Arc<local_flow::Controller>,
+    /// Application-assigned priority for endpoint-local credit arbitration
+    stream_priority: StreamPriority,
+    /// Stable waiter identifier used for fair credit wakeups
+    waiter_id: u64,
     /// Reset error code if the stream was reset by the peer
     reset_error_code: Option<VarInt>,
     /// Cooperative yield budget
@@ -166,6 +175,7 @@ impl Status {
 impl Writer {
     pub(crate) fn new_client(
         frame_tx: SubmissionSender,
+        local_flow: Arc<local_flow::Controller>,
         path_secret_entry: Arc<PathSecretEntry>,
         stream_id: VarInt,
         acceptor_id: VarInt,
@@ -177,6 +187,7 @@ impl Writer {
         let packet_size = mtu.saturating_sub(MAX_FLOW_DATA_HEADER_OVERHEAD);
         let max_inflight_bytes = parameters.local_send_max_data.as_u64();
         let remote_max_data = VarInt::ZERO;
+        let waiter_id = local_flow.allocate_waiter_id();
 
         Self(Box::new(Inner {
             frame_tx,
@@ -191,6 +202,9 @@ impl Writer {
             max_inflight_bytes,
             remote_max_data,
             status: Status::Init,
+            local_flow,
+            stream_priority: StreamPriority::default(),
+            waiter_id,
             reset_error_code: None,
             coop: Coop::default(),
         }))
@@ -198,6 +212,7 @@ impl Writer {
 
     pub(crate) fn new_server(
         frame_tx: SubmissionSender,
+        local_flow: Arc<local_flow::Controller>,
         path_secret_entry: Arc<PathSecretEntry>,
         stream_id: VarInt,
         control_rx: msg::queue::Control,
@@ -208,6 +223,7 @@ impl Writer {
         let packet_size = mtu.saturating_sub(MAX_FLOW_DATA_HEADER_OVERHEAD);
         let max_inflight_bytes = parameters.local_send_max_data.as_u64();
         let initial_remote_max_data = parameters.remote_max_data;
+        let waiter_id = local_flow.allocate_waiter_id();
 
         Self(Box::new(Inner {
             frame_tx,
@@ -222,6 +238,9 @@ impl Writer {
             max_inflight_bytes,
             remote_max_data: initial_remote_max_data,
             status: Status::Open,
+            local_flow,
+            stream_priority: StreamPriority::default(),
+            waiter_id,
             reset_error_code: None,
             coop: Coop::default(),
         }))
@@ -298,6 +317,11 @@ impl Writer {
         self.0.shutdown()
     }
 
+    #[inline]
+    pub fn set_priority(&mut self, priority: StreamPriority) {
+        self.0.set_priority(priority);
+    }
+
     pub(crate) fn force_shutdown(&mut self) {
         self.0.completion_rx.cancel();
         self.0.status.on_shutdown().ok();
@@ -312,6 +336,17 @@ impl HasCoop for Inner {
 }
 
 impl Inner {
+    #[inline]
+    fn set_priority(&mut self, priority: StreamPriority) {
+        if self.stream_priority == priority {
+            return;
+        }
+
+        self.local_flow
+            .clear_waiter(self.waiter_id, self.stream_priority);
+        self.stream_priority = priority;
+    }
+
     #[inline]
     fn poll_write_from<S>(
         &mut self,
@@ -354,14 +389,22 @@ impl Inner {
             return Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()));
         }
 
+        self.local_flow
+            .clear_waiter(self.waiter_id, self.stream_priority);
         self.poll_completions(cx)?;
         let _ = self.poll_remote_budget(cx)?;
 
         if self.status.is_init() {
-            let (written, is_fin) = self.send_flow_init_with_early_data(buf, is_fin)?;
+            let outcome = self.send_flow_init_with_early_data(buf, is_fin)?;
 
-            if written > 0 || is_fin {
-                return Poll::Ready(Ok(written));
+            if outcome.written > 0 || outcome.is_fin {
+                return Poll::Ready(Ok(outcome.written));
+            }
+
+            if let Some(requested) = outcome.local_flow_blocked {
+                self.local_flow
+                    .register_waiter(self.waiter_id, self.stream_priority, requested, cx.waker());
+                return Poll::Pending;
             }
 
             return Poll::Pending;
@@ -380,9 +423,17 @@ impl Inner {
             return Poll::Pending;
         }
 
-        let written = self.send_data(buf, is_fin)?;
+        let outcome = self.send_data(buf, is_fin)?;
 
-        Poll::Ready(Ok(written))
+        if outcome.written == 0 {
+            if let Some(requested) = outcome.local_flow_blocked {
+                self.local_flow
+                    .register_waiter(self.waiter_id, self.stream_priority, requested, cx.waker());
+                return Poll::Pending;
+            }
+        }
+
+        Poll::Ready(Ok(outcome.written))
     }
 
     fn shutdown(&mut self) -> io::Result<()> {
@@ -423,6 +474,7 @@ impl Inner {
                 error_code,
             },
             payload: ByteVec::new(),
+            local_flow: None,
             path_secret_entry: self.path_secret_entry.clone(),
             completion: None,
             status: frame::TransmissionStatus::default(),
@@ -463,6 +515,7 @@ impl Inner {
                     is_fin: true,
                 },
                 payload: ByteVec::new(),
+                local_flow: None,
                 path_secret_entry: self.path_secret_entry.clone(),
                 completion: Some(self.completion_rx.sender()),
                 status: frame::TransmissionStatus::default(),
@@ -659,11 +712,25 @@ impl Inner {
         &mut self,
         buf: &mut S,
         is_fin: bool,
-    ) -> io::Result<(usize, bool)>
+    ) -> io::Result<FlowInitOutcome>
     where
         S: buffer::reader::storage::Infallible,
     {
-        let (payload, bytes_read, actual_fin) = self.prepare_early_data(buf, is_fin)?;
+        let EarlyData {
+            payload,
+            bytes_read,
+            actual_fin,
+            local_flow,
+            blocked_request,
+        } = self.prepare_early_data(buf, is_fin)?;
+
+        if let Some(blocked_request) = blocked_request {
+            return Ok(FlowInitOutcome {
+                written: 0,
+                is_fin: false,
+                local_flow_blocked: Some(blocked_request),
+            });
+        }
 
         let frame = Frame {
             source_sender_id: VarInt::MAX,
@@ -675,6 +742,7 @@ impl Inner {
                 is_fin: actual_fin,
             },
             payload,
+            local_flow,
             path_secret_entry: self.path_secret_entry.clone(),
             completion: Some(self.completion_rx.sender()),
             status: frame::TransmissionStatus::default(),
@@ -697,23 +765,39 @@ impl Inner {
             "Sent FlowInit with early data"
         );
 
-        Ok((bytes_read, actual_fin))
+        Ok(FlowInitOutcome {
+            written: bytes_read,
+            is_fin: actual_fin,
+            local_flow_blocked: None,
+        })
     }
 
     fn prepare_early_data<S>(
         &mut self,
         buf: &mut S,
         is_fin: bool,
-    ) -> io::Result<(ByteVec, usize, bool)>
+    ) -> io::Result<EarlyData>
     where
         S: buffer::reader::storage::Infallible,
     {
         if is_fin && buf.buffer_is_empty() {
-            return Ok((ByteVec::new(), 0, true));
+            return Ok(EarlyData {
+                payload: ByteVec::new(),
+                bytes_read: 0,
+                actual_fin: true,
+                local_flow: None,
+                blocked_request: None,
+            });
         }
 
         if buf.buffer_is_empty() {
-            return Ok((ByteVec::new(), 0, false));
+            return Ok(EarlyData {
+                payload: ByteVec::new(),
+                bytes_read: 0,
+                actual_fin: false,
+                local_flow: None,
+                blocked_request: None,
+            });
         }
 
         if self.remaining_offset_capacity() == 0 {
@@ -721,9 +805,18 @@ impl Inner {
         }
 
         let mtu = self.packet_size as usize;
-        let chunk_len = mtu
+        let desired = mtu
             .min(buf.buffered_len())
             .min(self.remaining_offset_capacity());
+        let Some((chunk_len, local_flow)) = self.try_reserve_local_flow(desired) else {
+            return Ok(EarlyData {
+                payload: ByteVec::new(),
+                bytes_read: 0,
+                actual_fin: false,
+                local_flow: None,
+                blocked_request: Some(desired as u64),
+            });
+        };
 
         let mut payload = ByteVec::new();
         {
@@ -737,7 +830,13 @@ impl Inner {
 
         let actual_is_fin = is_fin && buf.buffer_is_empty();
 
-        Ok((payload, bytes_read, actual_is_fin))
+        Ok(EarlyData {
+            payload,
+            bytes_read,
+            actual_fin: actual_is_fin,
+            local_flow,
+            blocked_request: None,
+        })
     }
 
     fn min_send_budget(&self) -> u64 {
@@ -750,12 +849,13 @@ impl Inner {
         local_available.min(remote_available)
     }
 
-    fn send_data<S>(&mut self, buf: &mut S, is_fin: bool) -> io::Result<usize>
+    fn send_data<S>(&mut self, buf: &mut S, is_fin: bool) -> io::Result<SendOutcome>
     where
         S: buffer::reader::storage::Infallible,
     {
         let mtu = self.packet_size as usize;
         let mut written = 0;
+        let mut local_flow_blocked = None;
 
         let mut need_fin_packet = is_fin && buf.buffer_is_empty();
         let mut frames = Queue::new();
@@ -778,12 +878,21 @@ impl Inner {
                 break;
             }
 
-            let chunk_len = if need_fin_packet {
+            let desired_len = if need_fin_packet {
                 0
             } else {
                 mtu.min(buf.buffered_len())
                     .min(available as usize)
                     .min(remaining_offset_capacity)
+            };
+
+            let (chunk_len, local_flow) = if desired_len == 0 {
+                (0, None)
+            } else if let Some((chunk_len, local_flow)) = self.try_reserve_local_flow(desired_len) {
+                (chunk_len, local_flow)
+            } else {
+                local_flow_blocked = Some(desired_len as u64);
+                break;
             };
 
             let mut payload = ByteVec::new();
@@ -814,6 +923,7 @@ impl Inner {
                     is_fin: include_fin,
                 },
                 payload,
+                local_flow,
                 path_secret_entry: self.path_secret_entry.clone(),
                 completion: Some(self.completion_rx.sender()),
                 status: frame::TransmissionStatus::default(),
@@ -843,7 +953,10 @@ impl Inner {
 
         self.send_batch(frames)?;
 
-        Ok(written)
+        Ok(SendOutcome {
+            written,
+            local_flow_blocked,
+        })
     }
 
     fn remaining_offset_capacity(&self) -> usize {
@@ -866,7 +979,10 @@ impl Inner {
     fn send_frame(&mut self, frame: Frame) -> io::Result<()> {
         self.frame_tx
             .send_batch(Entry::new(frame))
-            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "frame channel closed"))
+            .map_err(|entry| {
+                drop(entry);
+                io::Error::new(io::ErrorKind::BrokenPipe, "frame channel closed")
+            })
     }
 
     fn send_batch(&mut self, queue: Queue<Frame>) -> io::Result<()> {
@@ -875,7 +991,36 @@ impl Inner {
                 queue,
                 priority: Priority::FlowData,
             })
-            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "frame channel closed"))
+            .map_err(|batch| {
+                drop(batch);
+                io::Error::new(io::ErrorKind::BrokenPipe, "frame channel closed")
+            })
+    }
+
+    fn try_reserve_local_flow(
+        &self,
+        requested: usize,
+    ) -> Option<(usize, Option<local_flow::Credit>)> {
+        if requested == 0 {
+            return Some((0, None));
+        }
+
+        let granted =
+            self.local_flow
+                .try_acquire(self.waiter_id, self.stream_priority, requested as u64);
+        if granted == 0 {
+            return None;
+        }
+
+        let granted = granted as usize;
+        Some((
+            granted,
+            Some(local_flow::Credit::new(
+                self.local_flow.clone(),
+                self.stream_priority,
+                granted as u64,
+            )),
+        ))
     }
 }
 
@@ -890,6 +1035,9 @@ impl Drop for Writer {
             "Writer dropping"
         );
 
+        self.0
+            .local_flow
+            .clear_waiter(self.0.waiter_id, self.0.stream_priority);
         if std::thread::panicking() {
             self.0.completion_rx.cancel();
 
@@ -903,6 +1051,25 @@ impl Drop for Writer {
             let _ = self.shutdown();
         }
     }
+}
+
+struct EarlyData {
+    payload: ByteVec,
+    bytes_read: usize,
+    actual_fin: bool,
+    local_flow: Option<local_flow::Credit>,
+    blocked_request: Option<u64>,
+}
+
+struct FlowInitOutcome {
+    written: usize,
+    is_fin: bool,
+    local_flow_blocked: Option<u64>,
+}
+
+struct SendOutcome {
+    written: usize,
+    local_flow_blocked: Option<u64>,
 }
 
 fn offset_overflow_error() -> io::Error {

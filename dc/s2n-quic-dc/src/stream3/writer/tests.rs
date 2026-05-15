@@ -14,7 +14,10 @@ use crate::{
     flow, intrusive_queue,
     packet::datagram::ResetTarget,
     path::secret::map::Entry as PathSecretEntry,
-    stream3::frame::{self, Frame, Header, PriorityStorage, SubmissionReceiver},
+    stream3::{
+        endpoint::local_flow,
+        frame::{self, Frame, Header, PriorityStorage, SubmissionReceiver},
+    },
 };
 use bytes::Bytes;
 use s2n_codec::EncoderValue;
@@ -60,17 +63,19 @@ fn make_pair_with_type(ep_type: endpoint::Type) -> (Writer, Pusher) {
     };
 
     let (frame_tx, frame_rx) = frame::submission_channel(1);
+    let local_flow = local_flow::Controller::new(u64::MAX, u64::MAX);
 
     let writer = match ep_type {
         endpoint::Type::Client => Writer::new_client(
             frame_tx,
+            local_flow.clone(),
             path_secret_entry,
             stream_id,
             acceptor_id,
             control_rx,
         ),
         endpoint::Type::Server => {
-            Writer::new_server(frame_tx, path_secret_entry, stream_id, control_rx)
+            Writer::new_server(frame_tx, local_flow, path_secret_entry, stream_id, control_rx)
         }
     };
 

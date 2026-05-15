@@ -21,6 +21,7 @@ use crate::{
     packet::datagram::{QueuePair, ResetTarget},
     path::secret::map::Entry as PathSecretEntry,
     socket::channel::{intrusive_queue::datagram_completion, ByteCost, UnboundedSender},
+    stream3::endpoint::local_flow,
 };
 use s2n_codec::{decoder_invariant, Encoder, EncoderValue};
 use s2n_quic_core::varint::VarInt;
@@ -694,6 +695,8 @@ pub struct Frame {
     /// Payload data (stream bytes for FlowData, control frame bytes for FlowControl,
     /// ACK frames for Control, empty for resets)
     pub payload: ByteVec,
+    /// Endpoint-local flow-control reservation for application payload queued by a Writer.
+    pub local_flow: Option<local_flow::Credit>,
     /// Path secret entry identifying the destination peer.
     ///
     /// Used by the wheel to group frames by peer (Arc pointer comparison) and by the
@@ -736,6 +739,27 @@ impl Frame {
     #[inline]
     pub fn payload_len(&self) -> usize {
         self.payload.len()
+    }
+
+    #[inline]
+    pub fn local_flow_on_transmit(&mut self) {
+        if let Some(local_flow) = &mut self.local_flow {
+            local_flow.on_transmit();
+        }
+    }
+
+    #[inline]
+    pub fn local_flow_on_requeue(&mut self) {
+        if let Some(local_flow) = &mut self.local_flow {
+            local_flow.on_requeue();
+        }
+    }
+
+    #[inline]
+    pub fn local_flow_on_complete(&mut self) {
+        if let Some(local_flow) = &mut self.local_flow {
+            local_flow.release();
+        }
     }
 
     /// Returns true if this frame should still be transmitted.
@@ -797,6 +821,7 @@ mod tests {
             },
             source_sender_id: VarInt::MAX,
             payload,
+            local_flow: None,
             path_secret_entry: entry,
             completion: None,
             status: TransmissionStatus::default(),
@@ -825,6 +850,7 @@ mod tests {
             },
             source_sender_id: VarInt::MAX,
             payload: ByteVec::new(),
+            local_flow: None,
             path_secret_entry: entry,
             completion: None,
             status: TransmissionStatus::default(),
@@ -849,6 +875,7 @@ mod tests {
             },
             source_sender_id: VarInt::MAX,
             payload: ByteVec::new(),
+            local_flow: None,
             path_secret_entry: entry,
             completion: None,
             status: TransmissionStatus::default(),
@@ -876,6 +903,7 @@ mod tests {
             },
             source_sender_id: VarInt::from_u8(7),
             payload: ByteVec::new(),
+            local_flow: None,
             path_secret_entry: entry,
             completion: None,
             status: TransmissionStatus::default(),

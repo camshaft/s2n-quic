@@ -110,6 +110,7 @@ pub(crate) fn process_ack<Clk, Rand>(
                 let _ = deferred.try_push(probe_pn);
             } else {
                 for mut entry in packet.frames {
+                    entry.local_flow_on_complete();
                     entry.status = TransmissionStatus::Acknowledged;
                     let _ = completed.send(entry);
                 }
@@ -121,6 +122,7 @@ pub(crate) fn process_ack<Clk, Rand>(
         for probe_pn in &deferred {
             let (_, tail_frames) = context.inflight.take_chain_tail_frames(*probe_pn);
             for mut entry in tail_frames {
+                entry.local_flow_on_complete();
                 entry.status = TransmissionStatus::Acknowledged;
                 let _ = completed.send(entry);
             }
@@ -241,6 +243,7 @@ fn detect_loss<Rand>(
 
         for mut entry in packet.frames {
             if !entry.should_transmit() {
+                entry.local_flow_on_complete();
                 entry.status = TransmissionStatus::Failed(frame::FailureReason::Cancelled);
                 let _ = cancelled.send(entry);
                 cancelled_count += 1;
@@ -248,12 +251,14 @@ fn detect_loss<Rand>(
             }
 
             if entry.ttl == 0 {
+                entry.local_flow_on_complete();
                 entry.status = TransmissionStatus::Failed(frame::FailureReason::TransmissionError);
                 let _ = completed.send(entry);
                 lost_count += 1;
                 continue;
             }
 
+            entry.local_flow_on_requeue();
             entry.ttl -= 1;
             let _ = lost.send(entry);
             lost_count += 1;

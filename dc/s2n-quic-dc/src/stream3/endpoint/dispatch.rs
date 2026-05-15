@@ -32,7 +32,7 @@ use crate::{
 };
 use bytes::BytesMut;
 use s2n_quic_core::varint::VarInt;
-use std::{cell::RefCell, rc::Rc};
+use std::{cell::RefCell, rc::Rc, sync::Arc};
 
 const UNSET_SOURCE_SENDER_ID: VarInt = VarInt::MAX;
 
@@ -67,6 +67,7 @@ pub(crate) fn process<Clk, Route>(
     path_secret_map: &PathSecretMap,
     acceptor_registry: &acceptor::Registry<Stream>,
     frame_tx: &SubmissionSender,
+    local_flow: &Arc<super::local_flow::Controller>,
     response_tx: &mut impl channel::UnboundedSender<PriorityInput>,
     sender_tx: &mut impl channel::UnboundedSender<Entry<msg::Sender>>,
     queue_dispatcher: &mut msg::queue::Dispatcher,
@@ -212,10 +213,11 @@ where
                     frame_payload,
                     &mut peer,
                     &credentials,
-                    acceptor_registry,
-                    frame_tx,
-                    queue_dispatcher,
-                    sender_tx,
+                acceptor_registry,
+                frame_tx,
+                local_flow,
+                queue_dispatcher,
+                sender_tx,
                     counters,
                     &mut response_frames,
                     waker_sink,
@@ -282,6 +284,7 @@ fn dispatch_decoded_frame(
     credentials: &Credentials,
     acceptor_registry: &acceptor::Registry<Stream>,
     frame_tx: &SubmissionSender,
+    local_flow: &Arc<super::local_flow::Controller>,
     queue_dispatcher: &mut msg::queue::Dispatcher,
     sender_tx: &mut impl channel::UnboundedSender<Entry<msg::Sender>>,
     counters: &counters::Dispatch,
@@ -308,6 +311,7 @@ fn dispatch_decoded_frame(
                 payload,
                 acceptor_registry,
                 frame_tx,
+                local_flow,
                 queue_dispatcher,
                 counters,
                 response_frames,
@@ -432,6 +436,7 @@ fn handle_flow_init(
     buf: BytesMut,
     acceptor_registry: &acceptor::Registry<Stream>,
     frame_tx: &SubmissionSender,
+    local_flow: &Arc<super::local_flow::Controller>,
     queue_dispatcher: &mut msg::queue::Dispatcher,
     counters: &counters::Dispatch,
     response_frames: &mut PriorityInput,
@@ -471,6 +476,7 @@ fn handle_flow_init(
         let local_queue_id = queue_control.queue_id();
         let writer = Writer::new_server(
             frame_tx.clone(),
+            local_flow.clone(),
             peer.path_entry.clone(),
             stream_id,
             queue_control,
@@ -758,6 +764,7 @@ fn push_reset_frame_with_target(
         },
         source_sender_id: UNSET_SOURCE_SENDER_ID,
         payload: ByteVec::new(),
+        local_flow: None,
         path_secret_entry: path_secret_entry.clone(),
         completion: None,
         status: Default::default(),
@@ -790,6 +797,7 @@ fn push_validate_request_frame(
         },
         source_sender_id: UNSET_SOURCE_SENDER_ID,
         payload: ByteVec::new(),
+        local_flow: None,
         path_secret_entry: path_secret_entry.clone(),
         completion: None,
         status: Default::default(),
@@ -836,6 +844,7 @@ fn handle_flow_validate_request(
                 },
                 source_sender_id: UNSET_SOURCE_SENDER_ID,
                 payload: ByteVec::new(),
+                local_flow: None,
                 path_secret_entry: path_secret_entry.clone(),
                 completion: None,
                 status: Default::default(),
@@ -861,6 +870,7 @@ fn handle_flow_validate_request(
                 },
                 source_sender_id: UNSET_SOURCE_SENDER_ID,
                 payload: ByteVec::new(),
+                local_flow: None,
                 path_secret_entry: path_secret_entry.clone(),
                 completion: None,
                 status: Default::default(),

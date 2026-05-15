@@ -81,6 +81,7 @@ impl Client {
 
         let writer = Writer::new_client(
             self.endpoint.frame_tx.clone(),
+            self.endpoint.local_flow.clone(),
             path_secret_entry.clone(),
             stream_id,
             acceptor_id,

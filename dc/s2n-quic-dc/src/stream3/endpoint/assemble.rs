@@ -154,6 +154,7 @@ where
                     header,
                     source_sender_id: submission.local_sender_id,
                     payload: submission.body.clone().into(),
+                    local_flow: None,
                     path_secret_entry: submission.path_secret_entry.clone(),
                     completion: None,
                     status: Default::default(),
@@ -208,11 +209,14 @@ where
                 && (context.pto.probe_state.is_requested() || context.can_send_pending_frames());
 
             if can_send_pending {
-                while let Some(frame) = context.pop_pending() {
+                while let Some(mut frame) = context.pop_pending() {
                     if !frame.should_transmit() {
+                        frame.local_flow_on_complete();
                         let _ = cancelled.send(frame);
                         continue;
                     }
+
+                    frame.local_flow_on_transmit();
 
                     let next_metadata = metadata.with_frame(&frame);
                     let estimated_len = next_metadata.estimate_packet_len(
@@ -404,8 +408,9 @@ fn assemble_probe(
         let mut probe_metadata = *metadata;
         let mut has_frame = false;
 
-        while let Some(frame) = probe_frames.pop_front() {
+        while let Some(mut frame) = probe_frames.pop_front() {
             if !frame.should_transmit() {
+                frame.local_flow_on_complete();
                 let _ = cancelled.send(frame);
                 continue;
             }

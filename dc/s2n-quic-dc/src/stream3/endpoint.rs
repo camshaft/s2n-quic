@@ -13,6 +13,7 @@ pub(crate) mod counters;
 pub(crate) mod decode;
 pub(crate) mod dispatch;
 pub(crate) mod inflight;
+pub(crate) mod local_flow;
 pub(crate) mod msg;
 pub(crate) mod recv;
 pub(crate) mod reset_error;
@@ -52,6 +53,8 @@ type AckMsgReceiver = sync_queue::Receiver<msg::Sender>;
 pub struct Endpoint {
     /// Frame submission channel (writers submit frame inputs here)
     pub frame_tx: SubmissionSender,
+    /// Endpoint-wide local flow control shared by all stream3 writers
+    pub local_flow: Arc<local_flow::Controller>,
     /// Path secret map (shared with PSK providers)
     pub path_secret_map: crate::path::secret::Map,
     /// Queue allocator for flow queues
@@ -308,6 +311,10 @@ where
 
     // Frame submission channel: all writers share one sharded sender; one dispatch task drains it.
     let (frame_tx, frame_rx) = frame::submission_channel(submission_shards);
+    let local_flow = local_flow::Controller::new(
+        local_flow::Controller::DEFAULT_MAX_QUEUED_BYTES,
+        local_flow::Controller::DEFAULT_MAX_INFLIGHT_BYTES,
+    );
 
     // Shared flow-queue allocator and dispatch counters -------------------------
     let queue_allocator = msg::queue::Allocator::new();
@@ -395,9 +402,13 @@ where
     // ── Waker offload ─────────────────────────────────────────────────────────
     // One slot per producer (recv_dispatch + send workers), partitioned across waker_drain workers.
     let num_recv_dispatch = layout.recv_dispatch.len();
-    let num_waker_slots = num_recv_dispatch + num_send_workers;
+    let num_waker_slots = num_recv_dispatch + num_send_workers + 1;
     let num_waker_drains = layout.waker_drain.len().max(1);
     let (mut waker_sinks, waker_drains) = waker::new(num_waker_slots, num_waker_drains);
+    let local_flow_waker_sink = waker_sinks
+        .pop()
+        .expect("local flow control waker sink must exist");
+    local_flow.set_waker_sink(local_flow_waker_sink);
     let send_waker_sinks = waker_sinks.split_off(num_recv_dispatch);
 
     for (idx, drain) in waker_drains.into_iter().enumerate() {
@@ -471,6 +482,7 @@ where
             path_secret_map: path_secret_map.clone(),
             acceptor_registry: acceptor_registry.clone(),
             frame_tx: frame_tx.clone(),
+            local_flow: local_flow.clone(),
             ack_sender: ack_sender.clone(),
             ack_completion_rx,
             recv_dispatch_idx: idx,
@@ -505,6 +517,7 @@ where
 
     Endpoint {
         frame_tx,
+        local_flow,
         path_secret_map,
         queue_allocator,
         acceptor_registry,
@@ -575,6 +588,7 @@ struct RecvDispatchParts<Clk, AckSnd, Route> {
     path_secret_map: crate::path::secret::Map,
     acceptor_registry: acceptor::Registry<Stream>,
     frame_tx: SubmissionSender,
+    local_flow: Arc<local_flow::Controller>,
     ack_sender: AckSnd,
     ack_completion_rx: sync_queue::Receiver<msg::Sender>,
     /// Index into the AckCompletionSender's staging array (0..num_recv_dispatch).
@@ -721,6 +735,7 @@ where
                     rd.path_secret_map,
                     rd.acceptor_registry,
                     rd.frame_tx,
+                    rd.local_flow,
                     rd.ack_sender.clone(),
                     rd.queue_dispatcher,
                     rd.counters,

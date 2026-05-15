@@ -1,7 +1,7 @@
 // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::stream3::{endpoint::reset_error::ResetError, Reader, Writer};
+use crate::stream3::{endpoint::reset_error::ResetError, Reader, StreamPriority, Writer};
 use s2n_quic_core::buffer;
 use std::io;
 
@@ -88,6 +88,11 @@ impl Stream {
     #[inline]
     pub fn shutdown(&mut self) -> io::Result<()> {
         self.write.shutdown()
+    }
+
+    #[inline]
+    pub fn set_priority(&mut self, priority: StreamPriority) {
+        self.write.set_priority(priority);
     }
 }
 

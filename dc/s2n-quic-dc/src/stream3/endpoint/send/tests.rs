@@ -53,6 +53,7 @@ fn make_frame(payload_len: usize) -> crate::intrusive_queue::Entry<Frame> {
         },
         source_sender_id: s2n_quic_core::varint::VarInt::MAX,
         payload,
+        local_flow: None,
         path_secret_entry: make_path_secret_entry(),
         completion: None,
         status: TransmissionStatus::Pending,

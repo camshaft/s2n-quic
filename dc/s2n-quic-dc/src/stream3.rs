@@ -24,4 +24,4 @@ pub use client::Client;
 pub use reader::Reader;
 pub use server::Server;
 pub use stream::Stream;
-pub use writer::Writer;
+pub use writer::{StreamPriority, Writer};

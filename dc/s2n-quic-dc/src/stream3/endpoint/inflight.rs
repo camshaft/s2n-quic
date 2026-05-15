@@ -260,6 +260,7 @@ mod tests {
             },
             source_sender_id: VarInt::MAX,
             payload,
+            local_flow: None,
             path_secret_entry: entry,
             completion: None,
             status: TransmissionStatus::default(),
