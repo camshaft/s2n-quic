@@ -4,10 +4,10 @@
 use core::time::Duration;
 use std::{
     collections::HashMap,
-    io,
-    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket},
+    net::SocketAddr,
     sync::{
         atomic::{AtomicI64, Ordering},
+        mpsc::{SyncSender, TrySendError},
         Arc, Mutex,
     },
 };
@@ -29,6 +29,7 @@ impl core::fmt::Display for NonZeroDisplay {
 }
 
 const DEFAULT_STATSD_UDP_MAX_PAYLOAD: usize = 1200;
+const STATSD_HISTOGRAM_PERCENTILES: [u32; 4] = [50, 90, 95, 99];
 
 #[derive(Clone, Debug)]
 pub struct ReporterConfig {
@@ -58,16 +59,24 @@ pub enum ReporterSink {
 #[derive(Clone, Debug)]
 pub struct StatsdUdpConfig {
     pub addr: SocketAddr,
+    pub tx: SyncSender<StatsdUdpPayloadBatch>,
     pub max_payload_size: usize,
 }
 
 impl StatsdUdpConfig {
-    pub fn new(addr: SocketAddr) -> Self {
+    pub fn new(addr: SocketAddr, tx: SyncSender<StatsdUdpPayloadBatch>) -> Self {
         Self {
             addr,
+            tx,
             max_payload_size: DEFAULT_STATSD_UDP_MAX_PAYLOAD,
         }
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StatsdUdpPayloadBatch {
+    pub addr: SocketAddr,
+    pub payloads: Vec<Vec<u8>>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -115,20 +124,12 @@ impl ReporterOutputSink for TracingSink {
 }
 
 struct StatsdUdpSink {
-    socket: UdpSocket,
     config: StatsdUdpConfig,
 }
 
 impl StatsdUdpSink {
-    fn new(config: StatsdUdpConfig) -> io::Result<Self> {
-        let bind_addr = if config.addr.is_ipv4() {
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
-        } else {
-            SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0)
-        };
-        let socket = UdpSocket::bind(bind_addr)?;
-        socket.set_nonblocking(true)?;
-        Ok(Self { socket, config })
+    fn new(config: StatsdUdpConfig) -> Self {
+        Self { config }
     }
 }
 
@@ -148,23 +149,18 @@ impl ReporterOutputSink for StatsdUdpSink {
             );
         }
 
-        let mut blocked = 0usize;
-        for payload in payloads {
-            match self.socket.send_to(&payload, self.config.addr) {
-                Ok(_) => {}
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                    blocked += 1;
-                }
-                Err(error) => return Err(format!("failed to send statsd payload: {error}")),
+        let batch = StatsdUdpPayloadBatch {
+            addr: self.config.addr,
+            payloads,
+        };
+        match self.config.tx.try_send(batch) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => {
+                tracing::warn!(addr = %self.config.addr, "statsd payload queue full; dropping batch");
             }
-        }
-
-        if blocked > 0 {
-            tracing::warn!(
-                blocked,
-                addr = %self.config.addr,
-                "statsd socket would block; dropped payload batch"
-            );
+            Err(TrySendError::Disconnected(_)) => {
+                return Err("statsd payload queue disconnected".into());
+            }
         }
 
         Ok(())
@@ -202,6 +198,15 @@ fn sanitize_metric_name(input: &str) -> String {
         output.push(normalized);
     }
     output
+}
+
+fn parse_byte_value(value: &str) -> Option<u64> {
+    let (number, unit) = value.split_once(' ')?;
+    if unit.trim() == "B" {
+        number.parse().ok()
+    } else {
+        None
+    }
 }
 
 fn with_metric_prefix(name: &str, prefix: Option<&str>) -> String {
@@ -242,6 +247,18 @@ fn parse_scalar_value(value: &str) -> Option<(&str, Option<&str>)> {
     }
 }
 
+fn scalar_metric_base_name(key: &str, suffix: Option<&str>) -> String {
+    if let Some(name) = key.strip_suffix(":bytes") {
+        return format!("{name}.bytes");
+    }
+
+    if matches!(suffix, Some("B")) {
+        return format!("{key}.bytes");
+    }
+
+    key.to_string()
+}
+
 fn convert_to_milliseconds(value: u64, unit: &str) -> Option<f64> {
     match unit {
         "us" => Some(value as f64 / 1_000.0),
@@ -254,9 +271,10 @@ fn convert_to_milliseconds(value: u64, unit: &str) -> Option<f64> {
 /// Encodes raw metric samples into StatsD lines.
 ///
 /// Scalars are emitted as counters (`|c`) except `.depth` metrics, which are emitted as gauges
-/// (`|g`). Histogram-like values (`value` containing `*`) are emitted as `.count` plus
-/// percentile (`.p50`, `.p99`, `.max`) metrics; time units (`us`, `ms`, `s`) are normalized to
-/// StatsD timer units (`|ms`), while non-time units are emitted as gauges.
+/// (`|g`) plus timer-formatted distribution samples (`|ms`) for percentile/burst analysis.
+/// Histogram-like values (`value` containing `*`) are emitted as `.count` plus percentile
+/// (`.p50`, `.p90`, `.p95`, `.p99`, `.max`) metrics; time units (`us`, `ms`, `s`) are normalized
+/// to StatsD timer units (`|ms`), while non-time units are emitted as gauges.
 fn encode_statsd_lines(samples: &[RawMetricSample<'_>], prefix: Option<&str>) -> Vec<String> {
     let mut lines = Vec::new();
 
@@ -268,31 +286,32 @@ fn encode_statsd_lines(samples: &[RawMetricSample<'_>], prefix: Option<&str>) ->
                 continue;
             }
 
-            let base_name = sample
-                .key
-                .strip_suffix(":bytes")
-                .map(|k| format!("{k}.bytes"))
-                .unwrap_or_else(|| sample.key.to_string());
+            let base_name = if unit == "B" {
+                format!("{}.bytes", sample.key)
+            } else {
+                scalar_metric_base_name(sample.key, None)
+            };
             let mut metric = with_metric_prefix(&base_name, prefix);
             if !variant.is_empty() {
                 metric.push('.');
                 metric.push_str(&sanitize_metric_name(variant));
             }
 
-            let (count, p50, p99, max) = compute_histogram_percentiles(&buckets);
+            let (count, _p50, _p99, max) = compute_histogram_percentiles(&buckets);
             lines.push(format!("{metric}.count:{count}|c"));
 
-            if let (Some(p50), Some(p99), Some(max)) = (
-                convert_to_milliseconds(p50, unit),
-                convert_to_milliseconds(p99, unit),
-                convert_to_milliseconds(max, unit),
-            ) {
-                lines.push(format!("{metric}.p50:{p50:.3}|ms"));
-                lines.push(format!("{metric}.p99:{p99:.3}|ms"));
+            for percentile in STATSD_HISTOGRAM_PERCENTILES {
+                let value = histogram_value_at_percentile(&buckets, percentile);
+                if let Some(value) = convert_to_milliseconds(value, unit) {
+                    lines.push(format!("{metric}.p{percentile}:{value:.3}|ms"));
+                } else {
+                    lines.push(format!("{metric}.p{percentile}:{value}|g"));
+                }
+            }
+
+            if let Some(max) = convert_to_milliseconds(max, unit) {
                 lines.push(format!("{metric}.max:{max:.3}|ms"));
             } else {
-                lines.push(format!("{metric}.p50:{p50}|g"));
-                lines.push(format!("{metric}.p99:{p99}|g"));
                 lines.push(format!("{metric}.max:{max}|g"));
             }
 
@@ -303,24 +322,20 @@ fn encode_statsd_lines(samples: &[RawMetricSample<'_>], prefix: Option<&str>) ->
             continue;
         };
 
-        let base_name = sample
-            .key
-            .strip_suffix(":bytes")
-            .map(|k| format!("{k}.bytes"))
-            .unwrap_or_else(|| sample.key.to_string());
+        let base_name = scalar_metric_base_name(sample.key, suffix);
         let mut metric = with_metric_prefix(&base_name, prefix);
 
-        if let Some(suffix) = suffix {
+        if let Some(suffix) = suffix.filter(|suffix| *suffix != "B") {
             metric.push('.');
             metric.push_str(&sanitize_metric_name(suffix));
         }
 
-        let metric_type = if sample.key.ends_with(".depth") {
-            "g"
+        if sample.key.ends_with(".depth") {
+            lines.push(format!("{metric}:{number}|g"));
+            lines.push(format!("{metric}.distribution:{number}|ms"));
         } else {
-            "c"
-        };
-        lines.push(format!("{metric}:{number}|{metric_type}"));
+            lines.push(format!("{metric}:{number}|c"));
+        }
     }
 
     lines
@@ -377,14 +392,7 @@ fn build_sinks(config: &[ReporterSink]) -> Vec<Box<dyn ReporterOutputSink>> {
     for sink in config {
         match sink {
             ReporterSink::Tracing => sinks.push(Box::new(TracingSink)),
-            ReporterSink::StatsdUdp(config) => match StatsdUdpSink::new(config.clone()) {
-                Ok(sink) => sinks.push(Box::new(sink)),
-                Err(error) => tracing::warn!(
-                    ?error,
-                    addr = %config.addr,
-                    "failed to initialize statsd sink"
-                ),
-            },
+            ReporterSink::StatsdUdp(config) => sinks.push(Box::new(StatsdUdpSink::new(config.clone()))),
         }
     }
 
@@ -868,6 +876,10 @@ impl<'a> ParsedMetricsLine<'a> {
 
             if let Some((val, rest)) = value.split_once(' ') {
                 if val.bytes().all(|b| b.is_ascii_digit()) {
+                    if is_scalar_unit_only(rest) {
+                        metrics.insert(key, value);
+                        continue;
+                    }
                     nominals.entry(key).or_default().push(NominalVariant {
                         label: rest,
                         value: val,
@@ -967,7 +979,8 @@ impl<'a> ParsedMetricsLine<'a> {
             consumed.insert(key);
 
             if let Some(name) = key.strip_suffix(":bytes") {
-                if let Ok(bytes) = value.parse::<u64>() {
+                let bytes = value.parse::<u64>().ok().or_else(|| parse_byte_value(value));
+                if let Some(bytes) = bytes {
                     if bytes == 0 {
                         continue;
                     }
@@ -975,6 +988,15 @@ impl<'a> ParsedMetricsLine<'a> {
                     entries.push(MetricEntry::Throughput(ThroughputMetric { name, bytes }));
                 }
 
+                continue;
+            }
+
+            if let Some(bytes) = parse_byte_value(value) {
+                if bytes == 0 {
+                    continue;
+                }
+
+                entries.push(MetricEntry::Throughput(ThroughputMetric { name: key, bytes }));
                 continue;
             }
 
@@ -1262,6 +1284,10 @@ fn is_histogram_unit_only(rest: &str) -> bool {
     matches!(rest, "us" | "ms" | "s" | "B" | "KB" | "MB" | "GB")
 }
 
+fn is_scalar_unit_only(rest: &str) -> bool {
+    matches!(rest, "us" | "ms" | "s" | "B" | "%")
+}
+
 fn compute_histogram_percentiles(buckets: &[HistogramBucket]) -> (u64, u64, u64, u64) {
     let total_count = buckets.iter().map(|bucket| bucket.count).sum();
     if total_count == 0 {
@@ -1288,6 +1314,25 @@ fn compute_histogram_percentiles(buckets: &[HistogramBucket]) -> (u64, u64, u64,
     }
 
     (total_count, p50, p99, max)
+}
+
+fn histogram_value_at_percentile(buckets: &[HistogramBucket], percentile: u32) -> u64 {
+    let total_count: u64 = buckets.iter().map(|bucket| bucket.count).sum();
+    if total_count == 0 {
+        return 0;
+    }
+
+    let target = ((total_count as f64) * (percentile as f64 / 100.0)).ceil() as u64;
+    let mut cumulative = 0u64;
+
+    for bucket in buckets {
+        cumulative += bucket.count;
+        if cumulative >= target {
+            return bucket.value;
+        }
+    }
+
+    buckets.last().map_or(0, |bucket| bucket.value)
 }
 
 fn parse_histogram_buckets(data: &str) -> Vec<HistogramBucket> {
@@ -1479,6 +1524,13 @@ mod tests {
     }
 
     #[test]
+    fn format_bytes_unit_as_bps() {
+        let line = "socket.rx=273390965 B";
+        let result = ParsedMetricsLine::parse(line).format_pretty();
+        assert_eq!(result, "socket.rx=2.19Gbps");
+    }
+
+    #[test]
     fn format_plain_counter() {
         let line = "rx.data=255470";
         let result = ParsedMetricsLine::parse(line).format_pretty();
@@ -1628,11 +1680,52 @@ mod tests {
 
         assert!(lines.contains(&"svc.rx.data:255470|c".to_string()));
         assert!(lines.contains(&"svc.q.packet.depth:875|g".to_string()));
+        assert!(lines.contains(&"svc.q.packet.depth.distribution:875|ms".to_string()));
         assert!(lines.contains(&"svc.rx.ecn.ect0:500|c".to_string()));
         assert!(lines.contains(&"svc.task.time.packet_dispatch.0.count:3|c".to_string()));
         assert!(lines.contains(&"svc.task.time.packet_dispatch.0.p50:0.005|ms".to_string()));
+        assert!(lines.contains(&"svc.task.time.packet_dispatch.0.p90:0.010|ms".to_string()));
+        assert!(lines.contains(&"svc.task.time.packet_dispatch.0.p95:0.010|ms".to_string()));
         assert!(lines.contains(&"svc.task.time.packet_dispatch.0.p99:0.010|ms".to_string()));
         assert!(lines.contains(&"svc.task.time.packet_dispatch.0.max:0.010|ms".to_string()));
+    }
+
+    #[test]
+    fn statsd_encoding_supports_byte_units_without_bytes_suffix() {
+        let payload = ReportingPayload::from_line("socket.rx=273390965 B,socket.tx:bytes=272721617");
+        let lines = encode_statsd_lines(&payload.raw_samples, Some("svc"));
+
+        assert!(lines.contains(&"svc.socket.rx.bytes:273390965|c".to_string()));
+        assert!(lines.contains(&"svc.socket.tx.bytes:272721617|c".to_string()));
+    }
+
+    #[test]
+    fn statsd_sink_submits_payloads_as_single_batch() {
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let config = StatsdUdpConfig::new("127.0.0.1:8125".parse().unwrap(), tx);
+        let mut sink = StatsdUdpSink::new(config);
+        let payload =
+            ReportingPayload::from_line("rx.data=1,q.packet.depth=2,task.time=5*2+10*1 us dispatch");
+
+        sink.emit(&payload, Some("svc")).unwrap();
+        let batch = rx.try_recv().unwrap();
+        assert_eq!(batch.addr, "127.0.0.1:8125".parse().unwrap());
+        assert!(!batch.payloads.is_empty());
+    }
+
+    #[test]
+    fn statsd_sink_drops_batch_when_queue_full() {
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let config = StatsdUdpConfig::new("127.0.0.1:8125".parse().unwrap(), tx);
+        let mut sink = StatsdUdpSink::new(config);
+        let payload = ReportingPayload::from_line("rx.data=1");
+
+        sink.emit(&payload, None).unwrap();
+        sink.emit(&payload, None).unwrap();
+
+        // only the first batch is retained in the bounded queue
+        assert!(rx.try_recv().is_ok());
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]
