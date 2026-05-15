@@ -87,6 +87,29 @@ impl<T> Receiver<T> for TestReceiver<T> {
     }
 }
 
+struct BudgetAwareTestReceiver<T> {
+    values: VecDeque<T>,
+}
+
+impl<T> Receiver<T> for BudgetAwareTestReceiver<T> {
+    fn poll_recv(&mut self, _cx: &mut task::Context<'_>, budget: &mut Budget) -> Poll<Option<T>> {
+        if budget.is_exhausted() {
+            budget.set_needs_wake();
+            return Poll::Pending;
+        }
+
+        match self.values.pop_front() {
+            Some(value) => {
+                budget.consume();
+                Poll::Ready(Some(value))
+            }
+            None => Poll::Ready(None),
+        }
+    }
+
+    fn on_consumed(&mut self, _bytes: u64) {}
+}
+
 fn test_path_secret_entry() -> Arc<PathSecretEntry> {
     let peer = "127.0.0.1:4433"
         .parse()
@@ -162,13 +185,12 @@ fn new_test_frame_with_sender_id(
 
 fn drive_completion_dispatcher(
     dispatcher: &mut CompletionDispatcher<TestReceiver<Entry<Frame>>>,
-) {
+    budget_capacity: usize,
+) -> Poll<Option<crate::flow::queue::AutoWake>> {
     with_noop_context(|cx| {
-        let mut budget = Budget::new(usize::MAX);
-        let _ = dispatcher.poll_recv(cx, &mut budget);
-        let mut budget = Budget::new(usize::MAX);
-        let _ = dispatcher.poll_recv(cx, &mut budget);
-    });
+        let mut budget = Budget::new(budget_capacity);
+        dispatcher.poll_recv(cx, &mut budget)
+    })
 }
 
 fn with_noop_context<R>(f: impl FnOnce(&mut task::Context<'_>) -> R) -> R {
@@ -316,7 +338,7 @@ fn completion_dispatcher_filters_non_failures_for_failure_only_subscriptions() {
         consumed: 0,
     };
     let mut dispatcher = CompletionDispatcher::new(rx);
-    drive_completion_dispatcher(&mut dispatcher);
+    let _ = drive_completion_dispatcher(&mut dispatcher, usize::MAX);
 
     with_noop_context(|cx| {
         let result = completion_rx.poll_swap(cx);
@@ -341,7 +363,7 @@ fn completion_dispatcher_notifies_failures_for_failure_only_subscriptions() {
         consumed: 0,
     };
     let mut dispatcher = CompletionDispatcher::new(rx);
-    drive_completion_dispatcher(&mut dispatcher);
+    let _ = drive_completion_dispatcher(&mut dispatcher, usize::MAX);
 
     with_noop_context(|cx| match completion_rx.poll_swap(cx) {
         Poll::Ready(Some(queue)) => {
@@ -352,6 +374,62 @@ fn completion_dispatcher_notifies_failures_for_failure_only_subscriptions() {
             ));
         }
         other => panic!("expected failed completion notification, got {other:?}"),
+    });
+}
+
+#[test]
+fn completion_dispatcher_polls_past_filtered_frames_in_same_poll() {
+    let path_secret_entry = test_path_secret_entry();
+    let mut completion_rx = frame::failure_completion_channel();
+    let sender = completion_rx.sender();
+
+    let mut acknowledged = new_test_frame(path_secret_entry.clone(), 1).into_inner();
+    acknowledged.status = TransmissionStatus::Acknowledged;
+    acknowledged.completion = Some(sender.clone());
+
+    let mut failed = new_test_frame(path_secret_entry, 1).into_inner();
+    failed.status = TransmissionStatus::Failed(frame::FailureReason::TransmissionError);
+    failed.completion = Some(sender);
+
+    let rx = TestReceiver {
+        values: [Entry::new(acknowledged), Entry::new(failed)].into(),
+        consumed: 0,
+    };
+    let mut dispatcher = CompletionDispatcher::new(rx);
+
+    let _ = drive_completion_dispatcher(&mut dispatcher, usize::MAX);
+
+    with_noop_context(|cx| match completion_rx.poll_swap(cx) {
+        Poll::Ready(Some(queue)) => {
+            assert_eq!(queue.len(), 1);
+            assert!(matches!(
+                queue.front().unwrap().status,
+                TransmissionStatus::Failed(frame::FailureReason::TransmissionError)
+            ));
+        }
+        other => panic!("expected failed completion notification, got {other:?}"),
+    });
+}
+
+#[test]
+fn completion_dispatcher_returns_pending_when_budget_exhausted_while_filtering() {
+    let path_secret_entry = test_path_secret_entry();
+    let completion_rx = frame::failure_completion_channel();
+
+    let mut frame = new_test_frame(path_secret_entry, 1).into_inner();
+    frame.status = TransmissionStatus::Acknowledged;
+    frame.completion = Some(completion_rx.sender());
+
+    let rx = BudgetAwareTestReceiver {
+        values: [Entry::new(frame)].into(),
+    };
+    let mut dispatcher = CompletionDispatcher::new(rx);
+
+    with_noop_context(|cx| {
+        let mut budget = Budget::new(1);
+        let result = dispatcher.poll_recv(cx, &mut budget);
+        assert!(matches!(result, Poll::Pending));
+        assert!(budget.take_needs_wake());
     });
 }
 
