@@ -25,12 +25,36 @@ const SHOULD_TRANSMIT: u8 = 0b01;
 const RECEIVER_ALIVE: u8 = 0b10;
 const INITIAL_STATE: u8 = SHOULD_TRANSMIT | RECEIVER_ALIVE;
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SubscriptionMode {
+    #[default]
+    All,
+    FailuresOnly,
+}
+
+#[derive(Clone, Copy)]
+enum NotifyFilter<T> {
+    All,
+    FailuresOnly(fn(&T) -> bool),
+}
+
+impl<T> NotifyFilter<T> {
+    #[inline]
+    fn includes(&self, value: &T) -> bool {
+        match self {
+            Self::All => true,
+            Self::FailuresOnly(is_failure) => is_failure(value),
+        }
+    }
+}
+
 struct Inner<T> {
     queue: intrusive_queue::Queue<T>,
     recv_waker: Option<core::task::Waker>,
 }
 
 struct Shared<T> {
+    mode: NotifyFilter<T>,
     /// Bitpacked flags:
     /// - bit 0: should_transmit
     /// - bit 1: receiver_alive
@@ -39,7 +63,17 @@ struct Shared<T> {
 }
 
 pub fn new<T>() -> Receiver<T> {
+    new_with_mode(SubscriptionMode::All, |_| false)
+}
+
+pub fn new_with_mode<T>(mode: SubscriptionMode, is_failure: fn(&T) -> bool) -> Receiver<T> {
+    let mode = match mode {
+        SubscriptionMode::All => NotifyFilter::All,
+        SubscriptionMode::FailuresOnly => NotifyFilter::FailuresOnly(is_failure),
+    };
+
     let shared = Arc::new(Shared {
+        mode,
         flags: AtomicU8::new(INITIAL_STATE),
         inner: Mutex::new(Inner {
             queue: intrusive_queue::Queue::new(),
@@ -115,6 +149,10 @@ impl<T> Sender<T> {
         &self,
         entry: intrusive_queue::Entry<T>,
     ) -> Result<AutoWake, intrusive_queue::Entry<T>> {
+        if !self.shared.mode.includes(&entry) {
+            return Ok(AutoWake::default());
+        }
+
         let flags = self.shared.flags.load(Ordering::Acquire);
 
         // If receiver is gone, silently drop the completion
@@ -136,6 +174,23 @@ impl<T> Sender<T> {
     ) -> Result<AutoWake, intrusive_queue::Queue<T>> {
         if batch.is_empty() {
             return Ok(AutoWake::default());
+        }
+
+        match self.shared.mode {
+            NotifyFilter::All => {}
+            NotifyFilter::FailuresOnly(is_failure) => {
+                let mut failures = intrusive_queue::Queue::new();
+                while let Some(entry) = batch.pop_front() {
+                    if is_failure(&entry) {
+                        failures.push_back(entry);
+                    }
+                }
+                batch = failures;
+
+                if batch.is_empty() {
+                    return Ok(AutoWake::default());
+                }
+            }
         }
 
         let flags = self.shared.flags.load(Ordering::Acquire);
@@ -375,5 +430,35 @@ mod tests {
 
         // Sender drop doesn't cancel transmissions
         assert!(tx2.should_transmit());
+    }
+
+    #[test]
+    fn failures_only_filters_non_failures() {
+        #[derive(Debug)]
+        struct Status {
+            failed: bool,
+        }
+
+        let mut rx = new_with_mode(SubscriptionMode::FailuresOnly, |status: &Status| status.failed);
+        let tx = rx.sender();
+
+        let mut queue = intrusive_queue::Queue::new();
+        queue.push_back(intrusive_queue::Entry::new(Status { failed: false }));
+        queue.push_back(intrusive_queue::Entry::new(Status { failed: true }));
+
+        tx.send_batch(queue).expect("send should succeed");
+
+        let mut cx = core::task::Context::from_waker(futures::task::noop_waker_ref());
+        let mut budget = super::super::Budget::new(usize::MAX);
+        let received = match <Receiver<Status> as super::super::Receiver<
+            intrusive_queue::Queue<Status>,
+        >>::poll_recv(&mut rx, &mut cx, &mut budget)
+        {
+            Poll::Ready(Some(queue)) => queue,
+            other => panic!("expected ready queue, got {other:?}"),
+        };
+
+        assert_eq!(received.len(), 1);
+        assert!(received.front().unwrap().failed);
     }
 }
