@@ -319,12 +319,13 @@ impl Controller {
     pub const DEFAULT_MAX_BURST_BYTES: u64 = 64 * 1024;
 
     pub fn new(max_queued_bytes: u64, max_inflight_bytes: u64, max_burst_bytes: u64) -> Arc<Self> {
+        assert!(max_burst_bytes > 0, "max burst bytes must be non-zero");
         Arc::new(Self {
             queued_bytes: AtomicU64::new(0),
             inflight_bytes: AtomicU64::new(0),
             max_queued_bytes,
             max_inflight_bytes,
-            max_burst_bytes: max_burst_bytes.max(1),
+            max_burst_bytes,
             waiters: core::array::from_fn(|_| Mutex::new(List::new())),
             wake_sink: Mutex::new(None),
         })
