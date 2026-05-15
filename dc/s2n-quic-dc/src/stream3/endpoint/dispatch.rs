@@ -36,7 +36,6 @@ use std::{cell::RefCell, rc::Rc};
 
 const UNSET_SOURCE_SENDER_ID: VarInt = VarInt::MAX;
 
-#[derive(Debug)]
 pub(crate) enum Error {
     PeerStateLookup {
         credentials: Credentials,
@@ -1503,7 +1502,7 @@ mod tests {
         let mut sender_tx = CollectSender::default();
         let mut waker_sink = CollectSender::default();
 
-        process(
+        let result = process(
             first_packet,
             &mut recv_cache,
             &mut ack_burst_tx,
@@ -1517,8 +1516,8 @@ mod tests {
             &counters,
             &route,
             &mut waker_sink,
-        )
-        .unwrap();
+        );
+        assert!(result.is_ok());
         assert_eq!(recv_cache.senders.len(), 1);
         assert_eq!(sender_tx.items.len(), 1);
 

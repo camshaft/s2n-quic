@@ -425,6 +425,11 @@ impl Cache {
         }
     }
 
+    /// Returns an existing worker-local peer context for the `(credentials.id, remote_sender_id)`
+    /// tuple, if one has already been installed for the current recv worker.
+    ///
+    /// This does not derive or validate keys. Callers that miss in this cache must complete any
+    /// provisional decrypt + replay validation before publishing state with [`Self::insert`].
     #[inline]
     pub fn get(
         &self,
@@ -439,6 +444,11 @@ impl Cache {
         self.senders.get(&key).cloned()
     }
 
+    /// Inserts a newly accepted opener for the `(credentials.id, remote_sender_id)` tuple or
+    /// updates the existing worker-local context in place when the peer advances to a new key.
+    ///
+    /// `path_entry` and `opener` must already have passed decrypt and replay validation for
+    /// `credentials.key_id`. The recv cache only publishes the context after those checks succeed.
     #[inline]
     pub fn insert<Clk, Route>(
         &mut self,
