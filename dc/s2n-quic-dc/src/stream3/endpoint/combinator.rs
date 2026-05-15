@@ -748,11 +748,6 @@ where
             if waker.is_some() {
                 return Poll::Ready(Some(waker));
             }
-
-            if budget.is_exhausted() {
-                budget.set_needs_wake();
-                return Poll::Pending;
-            }
         }
     }
 
