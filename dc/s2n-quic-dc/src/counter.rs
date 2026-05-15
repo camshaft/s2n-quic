@@ -158,6 +158,10 @@ impl ReporterOutputSink for StatsdUdpSink {
     }
 }
 
+/// Parses a raw metrics line into machine-exportable samples.
+///
+/// The expected input format is a comma-separated list of `key=value` pairs as emitted by the
+/// metrics registry. Malformed segments (missing `=`) are ignored.
 fn parse_raw_metric_samples(line: &str) -> Vec<RawMetricSample<'_>> {
     line.split(',')
         .filter_map(|part| {
@@ -170,6 +174,10 @@ fn parse_raw_metric_samples(line: &str) -> Vec<RawMetricSample<'_>> {
         .collect()
 }
 
+/// Sanitizes metric names for StatsD formatting.
+///
+/// Allowed characters (`[a-zA-Z0-9_.-]`) are preserved, `:` is normalized to `.`, and all other
+/// characters are replaced with `_`.
 fn sanitize_metric_name(input: &str) -> String {
     let mut output = String::with_capacity(input.len());
     for c in input.chars() {
@@ -196,26 +204,32 @@ fn with_metric_prefix(name: &str, prefix: Option<&str>) -> String {
     }
 }
 
+/// Parses a scalar metric value and returns `(numeric_value, optional_suffix)` when valid.
+///
+/// Examples:
+/// - `"123"` -> `Some(("123", None))`
+/// - `"123 ect0"` -> `Some(("123", Some("ect0")))`
+/// - `"abc"` -> `None`
 fn parse_scalar_value(value: &str) -> Option<(&str, Option<&str>)> {
     let value = value.trim();
     if value.is_empty() {
         return None;
     }
 
-    let is_number = |candidate: &str| candidate.parse::<f64>().is_ok();
-
     if let Some((number, suffix)) = value.split_once(' ') {
-        if is_number(number) {
+        if number.parse::<f64>().is_ok() {
             Some((number, Some(suffix.trim()).filter(|v| !v.is_empty())))
         } else {
             None
         }
+    } else if value.parse::<f64>().is_ok() {
+        Some((value, None))
     } else {
-        is_number(value).then_some((value, None))
+        None
     }
 }
 
-fn to_milliseconds(value: u64, unit: &str) -> Option<f64> {
+fn normalize_to_milliseconds(value: u64, unit: &str) -> Option<f64> {
     match unit {
         "us" => Some(value as f64 / 1_000.0),
         "ms" => Some(value as f64),
@@ -224,6 +238,12 @@ fn to_milliseconds(value: u64, unit: &str) -> Option<f64> {
     }
 }
 
+/// Encodes raw metric samples into StatsD lines.
+///
+/// Scalars are emitted as counters (`|c`) except `.depth` metrics, which are emitted as gauges
+/// (`|g`). Histogram-like values (`value` containing `*`) are emitted as `.count` plus
+/// percentile (`.p50`, `.p99`, `.max`) metrics; time units (`us`, `ms`, `s`) are normalized to
+/// StatsD timer units (`|ms`), while non-time units are emitted as gauges.
 fn encode_statsd_lines(samples: &[RawMetricSample<'_>], prefix: Option<&str>) -> Vec<String> {
     let mut lines = Vec::new();
 
@@ -250,9 +270,9 @@ fn encode_statsd_lines(samples: &[RawMetricSample<'_>], prefix: Option<&str>) ->
             lines.push(format!("{metric}.count:{count}|c"));
 
             if let (Some(p50), Some(p99), Some(max)) = (
-                to_milliseconds(p50, unit),
-                to_milliseconds(p99, unit),
-                to_milliseconds(max, unit),
+                normalize_to_milliseconds(p50, unit),
+                normalize_to_milliseconds(p99, unit),
+                normalize_to_milliseconds(max, unit),
             ) {
                 lines.push(format!("{metric}.p50:{p50:.3}|ms"));
                 lines.push(format!("{metric}.p99:{p99:.3}|ms"));
@@ -293,6 +313,10 @@ fn encode_statsd_lines(samples: &[RawMetricSample<'_>], prefix: Option<&str>) ->
     lines
 }
 
+/// Batches StatsD lines into newline-delimited UDP payloads up to `max_payload_size`.
+///
+/// Returns `(payloads, dropped_oversized_lines)`. When `max_payload_size == 0`, no payloads are
+/// emitted and all lines are counted as dropped.
 fn chunk_statsd_lines(lines: &[String], max_payload_size: usize) -> (Vec<Vec<u8>>, usize) {
     // Zero is an invalid payload size and cannot hold even a single byte, so all lines are
     // reported as dropped in this case.
