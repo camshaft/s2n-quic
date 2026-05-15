@@ -715,7 +715,7 @@ where
             .completion
             .as_ref()
             .map(|c| c.queue_id())
-            .expect("invariant violation: should_notify returned true but completion sender is None");
+            .expect("invariant violation: frame.completion is None after should_notify returned true");
 
         if self.current_queue_id() == Some(incoming_id) {
             self.batch.push_back(Entry::from(frame));

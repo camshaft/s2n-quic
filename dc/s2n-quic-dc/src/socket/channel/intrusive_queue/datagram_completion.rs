@@ -396,7 +396,7 @@ mod tests {
     }
 
     #[test]
-    fn sender_exposes_subscription_mode() {
+    fn sender_subscription_mode() {
         let rx = new_with_mode::<()>(SubscriptionMode::FailuresOnly);
         let tx = rx.sender();
         assert_eq!(tx.subscription_mode(), SubscriptionMode::FailuresOnly);
