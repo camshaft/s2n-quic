@@ -1285,7 +1285,7 @@ fn is_histogram_unit_only(rest: &str) -> bool {
 }
 
 fn is_scalar_unit_only(rest: &str) -> bool {
-    matches!(rest, "us" | "ms" | "s" | "B" | "%")
+    matches!(rest, "us" | "ms" | "s" | "B" | "KB" | "MB" | "GB" | "%")
 }
 
 fn compute_histogram_percentiles(buckets: &[HistogramBucket]) -> (u64, u64, u64, u64) {
@@ -1294,24 +1294,9 @@ fn compute_histogram_percentiles(buckets: &[HistogramBucket]) -> (u64, u64, u64,
         return (0, 0, 0, 0);
     }
 
-    let p50_target = ((total_count as f64) * 0.5).ceil() as u64;
-    let p99_target = ((total_count as f64) * 0.99).ceil() as u64;
-
-    let mut cumulative: u64 = 0;
-    let mut p50: u64 = 0;
-    let mut p99: u64 = 0;
-    let mut max: u64 = 0;
-
-    for bucket in buckets {
-        cumulative += bucket.count;
-        if p50 == 0 && cumulative >= p50_target {
-            p50 = bucket.value;
-        }
-        if p99 == 0 && cumulative >= p99_target {
-            p99 = bucket.value;
-        }
-        max = bucket.value;
-    }
+    let p50 = histogram_value_at_percentile(buckets, 50);
+    let p99 = histogram_value_at_percentile(buckets, 99);
+    let max = buckets.last().map_or(0, |bucket| bucket.value);
 
     (total_count, p50, p99, max)
 }
