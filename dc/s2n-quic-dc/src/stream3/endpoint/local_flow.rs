@@ -265,48 +265,48 @@ impl Controller {
     }
 
     #[inline]
-    pub fn move_queued_to_inflight(&self, priority: StreamPriority, bytes: u64) {
+    pub fn move_queued_to_inflight(&self, _priority: StreamPriority, bytes: u64) {
         if bytes == 0 {
             return;
         }
 
         Self::sub_counter(&self.queued_bytes, bytes);
         self.inflight_bytes.fetch_add(bytes, Ordering::AcqRel);
-        self.wake_waiters(priority);
+        self.wake_waiters();
     }
 
     #[inline]
-    pub fn move_inflight_to_queued(&self, priority: StreamPriority, bytes: u64) {
+    pub fn move_inflight_to_queued(&self, _priority: StreamPriority, bytes: u64) {
         if bytes == 0 {
             return;
         }
 
         Self::sub_counter(&self.inflight_bytes, bytes);
         self.queued_bytes.fetch_add(bytes, Ordering::AcqRel);
-        self.wake_waiters(priority);
+        self.wake_waiters();
     }
 
     #[inline]
-    pub fn release_queued(&self, priority: StreamPriority, bytes: u64) {
+    pub fn release_queued(&self, _priority: StreamPriority, bytes: u64) {
         if bytes == 0 {
             return;
         }
 
         Self::sub_counter(&self.queued_bytes, bytes);
-        self.wake_waiters(priority);
+        self.wake_waiters();
     }
 
     #[inline]
-    pub fn release_inflight(&self, priority: StreamPriority, bytes: u64) {
+    pub fn release_inflight(&self, _priority: StreamPriority, bytes: u64) {
         if bytes == 0 {
             return;
         }
 
         Self::sub_counter(&self.inflight_bytes, bytes);
-        self.wake_waiters(priority);
+        self.wake_waiters();
     }
 
-    fn wake_waiters(&self, released_priority: StreamPriority) {
+    fn wake_waiters(&self) {
         let inflight = self.inflight_bytes.load(Ordering::Acquire);
         if inflight >= self.max_inflight_bytes {
             return;
@@ -329,9 +329,6 @@ impl Controller {
                 let waiter = queue.pop_front().expect("front waiter must exist");
                 self.active_waiter[priority.as_index()].store(waiter.id, Ordering::Release);
                 self.dispatch_waker(waiter.waker);
-                break;
-            }
-            if priority.as_index() >= released_priority.as_index() {
                 break;
             }
         }
