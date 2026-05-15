@@ -37,8 +37,8 @@ impl StreamPriority {
     #[inline]
     fn from_u8(value: u8) -> Self {
         match value {
-            value if value == Self::High as u8 => Self::High,
-            value if value == Self::Normal as u8 => Self::Normal,
+            v if v == Self::High as u8 => Self::High,
+            v if v == Self::Normal as u8 => Self::Normal,
             _ => Self::Low,
         }
     }
@@ -114,6 +114,11 @@ impl Drop for Credit {
     }
 }
 
+/// Per-writer local-flow state shared between the application task and the endpoint controller.
+///
+/// Writers park their waker here when they need more endpoint-local credits. The controller
+/// stores the flow in a priority intrusive queue, issues a capped burst into `issued`, and then
+/// forwards the stored waker via `AutoWake` so the application can resume and consume credits.
 pub struct Flow {
     controller: Weak<Controller>,
     priority: AtomicU8,
@@ -262,6 +267,10 @@ impl Drop for Flow {
     }
 }
 
+/// Adapter that stores [`Arc<Flow>`] values in the controller's intrusive priority queues.
+///
+/// This lets each writer keep one stable flow allocation while the controller links and unlinks
+/// it across wait queues without additional boxing or per-wait allocations.
 #[derive(Clone, Copy, Debug)]
 struct FlowAdapter;
 
@@ -319,6 +328,14 @@ impl Controller {
     pub const DEFAULT_MAX_BURST_BYTES: u64 = 64 * 1024;
 
     pub fn new(max_queued_bytes: u64, max_inflight_bytes: u64, max_burst_bytes: u64) -> Arc<Self> {
+        assert!(
+            max_queued_bytes > 0,
+            "max_queued_bytes must be non-zero, got: {max_queued_bytes}"
+        );
+        assert!(
+            max_inflight_bytes > 0,
+            "max_inflight_bytes must be non-zero, got: {max_inflight_bytes}"
+        );
         assert!(
             max_burst_bytes > 0,
             "max_burst_bytes must be non-zero, got: {max_burst_bytes}"
