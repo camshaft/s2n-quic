@@ -653,6 +653,22 @@ where
             .map(|c| c.queue_id())
     }
 
+    #[inline]
+    fn should_notify(frame: &Frame) -> bool {
+        use crate::socket::channel::intrusive_queue::datagram_completion::SubscriptionMode;
+
+        let Some(sender) = frame.completion.as_ref() else {
+            return false;
+        };
+
+        match sender.subscription_mode() {
+            SubscriptionMode::All => true,
+            SubscriptionMode::FailuresOnly => {
+                matches!(frame.status, frame::TransmissionStatus::Failed(_))
+            }
+        }
+    }
+
     fn flush(&mut self) -> crate::flow::queue::AutoWake {
         if self.batch.is_empty() {
             return Default::default();
@@ -691,11 +707,12 @@ where
             }
         };
 
-        let incoming_id = frame.completion.as_ref().map(|c| c.queue_id());
-
-        let Some(_) = incoming_id else {
+        if !Self::should_notify(&frame) {
             return Poll::Ready(Some(Default::default()));
-        };
+        }
+
+        let incoming_id = frame.completion.as_ref().map(|c| c.queue_id());
+        debug_assert!(incoming_id.is_some());
 
         if self.current_queue_id() == incoming_id {
             self.batch.push_back(Entry::from(frame));

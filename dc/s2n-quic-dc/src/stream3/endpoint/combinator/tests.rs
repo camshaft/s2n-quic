@@ -160,6 +160,17 @@ fn new_test_frame_with_sender_id(
     })
 }
 
+fn drive_completion_dispatcher(
+    dispatcher: &mut CompletionDispatcher<TestReceiver<Entry<Frame>>>,
+) {
+    with_noop_context(|cx| {
+        let mut budget = Budget::new(usize::MAX);
+        let _ = dispatcher.poll_recv(cx, &mut budget);
+        let mut budget = Budget::new(usize::MAX);
+        let _ = dispatcher.poll_recv(cx, &mut budget);
+    });
+}
+
 fn with_noop_context<R>(f: impl FnOnce(&mut task::Context<'_>) -> R) -> R {
     let waker = s2n_quic_core::task::waker::noop();
     let mut cx = task::Context::from_waker(&waker);
@@ -289,6 +300,59 @@ fn sticky_sender_error_returns_value() {
 
     drop(result);
     assert_eq!(drop_counter.load(Ordering::Relaxed), 1);
+}
+
+#[test]
+fn completion_dispatcher_filters_non_failures_for_failure_only_subscriptions() {
+    let path_secret_entry = test_path_secret_entry();
+    let mut completion_rx = frame::failure_completion_channel();
+
+    let mut frame = new_test_frame(path_secret_entry, 1).into_inner();
+    frame.status = TransmissionStatus::Acknowledged;
+    frame.completion = Some(completion_rx.sender());
+
+    let rx = TestReceiver {
+        values: [Entry::new(frame)].into(),
+        consumed: 0,
+    };
+    let mut dispatcher = CompletionDispatcher::new(rx);
+    drive_completion_dispatcher(&mut dispatcher);
+
+    with_noop_context(|cx| {
+        let result = completion_rx.poll_swap(cx);
+        assert!(
+            matches!(result, Poll::Pending),
+            "acknowledged frame should be filtered before notification"
+        );
+    });
+}
+
+#[test]
+fn completion_dispatcher_notifies_failures_for_failure_only_subscriptions() {
+    let path_secret_entry = test_path_secret_entry();
+    let mut completion_rx = frame::failure_completion_channel();
+
+    let mut frame = new_test_frame(path_secret_entry, 1).into_inner();
+    frame.status = TransmissionStatus::Failed(frame::FailureReason::TransmissionError);
+    frame.completion = Some(completion_rx.sender());
+
+    let rx = TestReceiver {
+        values: [Entry::new(frame)].into(),
+        consumed: 0,
+    };
+    let mut dispatcher = CompletionDispatcher::new(rx);
+    drive_completion_dispatcher(&mut dispatcher);
+
+    with_noop_context(|cx| match completion_rx.poll_swap(cx) {
+        Poll::Ready(Some(queue)) => {
+            assert_eq!(queue.len(), 1);
+            assert!(matches!(
+                queue.front().unwrap().status,
+                TransmissionStatus::Failed(frame::FailureReason::TransmissionError)
+            ));
+        }
+        other => panic!("expected failed completion notification, got {other:?}"),
+    });
 }
 
 // ── BatchFramesByPathSecret tests ─────────────────────────────────────────
