@@ -297,7 +297,7 @@ fn encode_statsd_lines(samples: &[RawMetricSample<'_>], prefix: Option<&str>) ->
                 metric.push_str(&sanitize_metric_name(variant));
             }
 
-            let (count, _p50, _p99, max) = compute_histogram_percentiles(&buckets);
+            let (count, max) = histogram_count_and_max(&buckets);
             lines.push(format!("{metric}.count:{count}|c"));
 
             for percentile in STATSD_HISTOGRAM_PERCENTILES {
@@ -1314,6 +1314,12 @@ fn compute_histogram_percentiles(buckets: &[HistogramBucket]) -> (u64, u64, u64,
     }
 
     (total_count, p50, p99, max)
+}
+
+fn histogram_count_and_max(buckets: &[HistogramBucket]) -> (u64, u64) {
+    let count = buckets.iter().map(|bucket| bucket.count).sum();
+    let max = buckets.last().map_or(0, |bucket| bucket.value);
+    (count, max)
 }
 
 fn histogram_value_at_percentile(buckets: &[HistogramBucket], percentile: u32) -> u64 {
