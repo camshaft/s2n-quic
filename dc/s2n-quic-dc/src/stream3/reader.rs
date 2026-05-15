@@ -661,7 +661,16 @@ impl Inner {
 
                 for completed in queue.iter() {
                     if let frame::TransmissionStatus::Failed(reason) = completed.status {
-                        failure.get_or_insert(reason);
+                        if let Some(existing) = failure {
+                            debug!(
+                                stream_id = self.stream_id.as_u64(),
+                                first = ?existing,
+                                additional = ?reason,
+                                "observed additional transmission failure"
+                            );
+                        } else {
+                            failure = Some(reason);
+                        }
                     }
                 }
 
