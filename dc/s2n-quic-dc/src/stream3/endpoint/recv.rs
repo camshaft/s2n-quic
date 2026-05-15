@@ -303,6 +303,8 @@ impl crate::crypto::open::Application for PacketOpener {
         tag: &[u8],
         payload_out: &mut crate::crypto::UninitSlice,
     ) -> crate::crypto::open::Result {
+        // stream3 currently maintains one opener per sender/key_id; until multi-key
+        // rotation is implemented, tolerate both phase bits by decrypting with phase 0.
         crate::crypto::open::Application::decrypt(
             &self.inner,
             KeyPhase::Zero,
@@ -322,6 +324,8 @@ impl crate::crypto::open::Application for PacketOpener {
         header: &[u8],
         payload_and_tag: &mut [u8],
     ) -> crate::crypto::open::Result {
+        // stream3 currently maintains one opener per sender/key_id; until multi-key
+        // rotation is implemented, tolerate both phase bits by decrypting with phase 0.
         crate::crypto::open::Application::decrypt_in_place(
             &self.inner,
             KeyPhase::Zero,
