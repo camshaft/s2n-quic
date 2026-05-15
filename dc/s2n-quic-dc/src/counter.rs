@@ -148,10 +148,23 @@ impl ReporterOutputSink for StatsdUdpSink {
             );
         }
 
+        let mut blocked = 0usize;
         for payload in payloads {
-            self.socket
-                .send_to(&payload, self.config.addr)
-                .map_err(|error| format!("failed to send statsd payload: {error}"))?;
+            match self.socket.send_to(&payload, self.config.addr) {
+                Ok(_) => {}
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    blocked += 1;
+                }
+                Err(error) => return Err(format!("failed to send statsd payload: {error}")),
+            }
+        }
+
+        if blocked > 0 {
+            tracing::warn!(
+                blocked,
+                addr = %self.config.addr,
+                "statsd socket would block; dropped payload batch"
+            );
         }
 
         Ok(())
