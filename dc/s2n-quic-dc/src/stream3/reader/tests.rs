@@ -184,7 +184,7 @@ impl Pusher {
         }
     }
 
-    fn complete_all(
+    fn complete_with_status(
         &mut self,
         mut frames: intrusive_queue::Queue<Frame>,
         status: frame::TransmissionStatus,
@@ -629,7 +629,7 @@ fn max_data_transmission_failure_surfaces_error() {
             pusher.push_data(0, &payload, false);
 
             let frames = pusher.recv_frames().await;
-            pusher.complete_all(
+            pusher.complete_with_status(
                 frames,
                 frame::TransmissionStatus::Failed(frame::FailureReason::TransmissionError),
             );

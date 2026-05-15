@@ -63,7 +63,7 @@ struct Shared<T> {
 }
 
 pub fn new<T>() -> Receiver<T> {
-    new_with_mode(SubscriptionMode::All, |_| false)
+    new_with_mode(SubscriptionMode::All, never_failure::<T>)
 }
 
 pub fn new_with_mode<T>(mode: SubscriptionMode, is_failure: fn(&T) -> bool) -> Receiver<T> {
@@ -83,6 +83,11 @@ pub fn new_with_mode<T>(mode: SubscriptionMode, is_failure: fn(&T) -> bool) -> R
     Receiver {
         shared: ManuallyDrop::new(shared),
     }
+}
+
+#[inline]
+fn never_failure<T>(_: &T) -> bool {
+    false
 }
 
 pub struct Sender<T> {
