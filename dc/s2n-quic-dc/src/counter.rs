@@ -229,7 +229,7 @@ fn parse_scalar_value(value: &str) -> Option<(&str, Option<&str>)> {
     }
 }
 
-fn normalize_to_milliseconds(value: u64, unit: &str) -> Option<f64> {
+fn convert_to_milliseconds(value: u64, unit: &str) -> Option<f64> {
     match unit {
         "us" => Some(value as f64 / 1_000.0),
         "ms" => Some(value as f64),
@@ -270,9 +270,9 @@ fn encode_statsd_lines(samples: &[RawMetricSample<'_>], prefix: Option<&str>) ->
             lines.push(format!("{metric}.count:{count}|c"));
 
             if let (Some(p50), Some(p99), Some(max)) = (
-                normalize_to_milliseconds(p50, unit),
-                normalize_to_milliseconds(p99, unit),
-                normalize_to_milliseconds(max, unit),
+                convert_to_milliseconds(p50, unit),
+                convert_to_milliseconds(p99, unit),
+                convert_to_milliseconds(max, unit),
             ) {
                 lines.push(format!("{metric}.p50:{p50:.3}|ms"));
                 lines.push(format!("{metric}.p99:{p99:.3}|ms"));
@@ -1600,7 +1600,7 @@ mod tests {
 
         dispatch_payload_to_sinks(&mut sinks, &payload, None);
         assert_eq!(
-            seen.lock().unwrap().as_slice(),
+            seen.lock().expect("MockSink mutex poisoned").as_slice(),
             &[
                 "first:1:rx.data=1".to_string(),
                 "second:1:rx.data=1".to_string()
