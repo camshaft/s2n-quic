@@ -7,10 +7,10 @@ use std::{
     net::SocketAddr,
     sync::{
         atomic::{AtomicI64, Ordering},
-        mpsc::{SyncSender, TrySendError},
         Arc, Mutex,
     },
 };
+use tokio::sync::mpsc;
 
 pub use s2n_quic_dc_metrics::{Summary, Unit};
 use std::time::Instant;
@@ -59,16 +59,64 @@ pub enum ReporterSink {
 #[derive(Clone, Debug)]
 pub struct StatsdUdpConfig {
     pub addr: SocketAddr,
-    pub tx: SyncSender<StatsdUdpPayloadBatch>,
+    pub tx: mpsc::Sender<StatsdUdpPayloadBatch>,
     pub max_payload_size: usize,
 }
 
 impl StatsdUdpConfig {
-    pub fn new(addr: SocketAddr, tx: SyncSender<StatsdUdpPayloadBatch>) -> Self {
+    pub fn new(addr: SocketAddr, tx: mpsc::Sender<StatsdUdpPayloadBatch>) -> Self {
         Self {
             addr,
             tx,
             max_payload_size: DEFAULT_STATSD_UDP_MAX_PAYLOAD,
+        }
+    }
+
+    /// Creates a `StatsdUdpConfig` and spawns a background task that sends batches over UDP.
+    ///
+    /// The task owns a single socket connected to `addr` and paces payloads using the provided
+    /// `Rate` to avoid overwhelming the local listener.
+    pub fn spawn(
+        socket: std::net::UdpSocket,
+        addr: SocketAddr,
+        queue_depth: usize,
+        rate: crate::socket::rate::Rate,
+    ) -> Self {
+        let (tx, rx) = mpsc::channel(queue_depth);
+        let config = Self::new(addr, tx);
+
+        tokio::spawn(statsd_udp_sender(socket, rx, rate));
+
+        config
+    }
+}
+
+async fn statsd_udp_sender(
+    socket: std::net::UdpSocket,
+    mut rx: mpsc::Receiver<StatsdUdpPayloadBatch>,
+    rate: crate::socket::rate::Rate,
+) {
+    socket.set_nonblocking(true).ok();
+    let socket = match tokio::net::UdpSocket::from_std(socket) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to convert statsd UDP socket to async");
+            return;
+        }
+    };
+
+    while let Some(batch) = rx.recv().await {
+        for payload in &batch.payloads {
+            let target_nanos = rate.nanos_for_bytes(payload.len() as u64);
+            let before = Instant::now();
+            if let Err(e) = socket.send_to(payload, batch.addr).await {
+                tracing::warn!(addr = %batch.addr, error = %e, "statsd UDP send failed");
+                break;
+            }
+            let elapsed = before.elapsed();
+            if let Some(remaining) = Duration::from_nanos(target_nanos).checked_sub(elapsed) {
+                tokio::time::sleep(remaining).await;
+            }
         }
     }
 }
@@ -155,10 +203,10 @@ impl ReporterOutputSink for StatsdUdpSink {
         };
         match self.config.tx.try_send(batch) {
             Ok(()) => {}
-            Err(TrySendError::Full(_)) => {
+            Err(mpsc::error::TrySendError::Full(_)) => {
                 tracing::warn!(addr = %self.config.addr, "statsd payload queue full; dropping batch");
             }
-            Err(TrySendError::Disconnected(_)) => {
+            Err(mpsc::error::TrySendError::Closed(_)) => {
                 return Err("statsd payload queue disconnected".into());
             }
         }
@@ -297,8 +345,14 @@ fn encode_statsd_lines(samples: &[RawMetricSample<'_>], prefix: Option<&str>) ->
                 metric.push_str(&sanitize_metric_name(variant));
             }
 
-            let (count, max) = histogram_count_and_max(&buckets);
+            let (count, min, max) = histogram_count_min_max(&buckets);
             lines.push(format!("{metric}.count:{count}|c"));
+
+            if let Some(min) = convert_to_milliseconds(min, unit) {
+                lines.push(format!("{metric}.min:{min:.3}|ms"));
+            } else {
+                lines.push(format!("{metric}.min:{min}|g"));
+            }
 
             for percentile in STATSD_HISTOGRAM_PERCENTILES {
                 let value = histogram_value_at_percentile(&buckets, percentile);
@@ -449,13 +503,13 @@ pub struct Gauge(Arc<AtomicI64>);
 
 impl Gauge {
     #[inline]
-    pub fn add(&self, v: i64) {
-        self.0.fetch_add(v, Ordering::Relaxed);
+    pub fn add(&self, v: i64) -> i64 {
+        self.0.fetch_add(v, Ordering::Relaxed) + v
     }
 
     #[inline]
-    pub fn sub(&self, v: i64) {
-        self.0.fetch_sub(v, Ordering::Relaxed);
+    pub fn sub(&self, v: i64) -> i64 {
+        self.0.fetch_sub(v, Ordering::Relaxed) - v
     }
 
     #[inline]
@@ -501,19 +555,22 @@ impl Drop for TimerGuard<'_> {
 }
 
 // ── QueueGauge ──────────────────────────────────────────────────────────────
+// TODO: add per-item sojourn time tracking (enqueue→dequeue latency as a histogram)
 
 #[derive(Clone)]
 pub struct QueueGauge {
     pub throughput: Counter,
     pub drain: Counter,
     pub depth: Gauge,
+    pub depth_distribution: Summary,
 }
 
 impl QueueGauge {
     #[inline]
     pub fn enqueue(&self, count: u64) {
         self.throughput.add(count);
-        self.depth.add(count as i64);
+        let depth = self.depth.add(count as i64).max(0) as u64;
+        self.depth_distribution.record_value(depth);
     }
 
     #[inline]
@@ -549,6 +606,13 @@ impl Registry {
         Counter(self.inner.register_counter(label.to_string(), None))
     }
 
+    pub fn register_bytes(&self, label: impl core::fmt::Display) -> Counter {
+        Counter(
+            self.inner
+                .register_counter(label.to_string(), Some("B".into())),
+        )
+    }
+
     pub fn register_nominal(
         &self,
         label: impl core::fmt::Display,
@@ -575,11 +639,15 @@ impl Registry {
             .register_list_callback(format!("{label}.depth"), None, Unit::Count, move || {
                 NonZeroDisplay(depth_clone.load(Ordering::Relaxed))
             });
+        let depth_distribution = self
+            .inner
+            .register_summary(format!("{label}.depth_dist"), None, Unit::Count);
 
         let gauge = QueueGauge {
             throughput,
             drain,
             depth: Gauge(depth),
+            depth_distribution,
         };
         gauges.insert(label, gauge.clone());
         gauge
@@ -609,15 +677,21 @@ impl Registry {
         );
         let depth = Arc::new(AtomicI64::new(0));
         let depth_clone = depth.clone();
-        self.inner
-            .register_list_callback(format!("{label}.depth"), var, Unit::Count, move || {
-                NonZeroDisplay(depth_clone.load(Ordering::Relaxed))
-            });
+        self.inner.register_list_callback(
+            format!("{label}.depth"),
+            var.clone(),
+            Unit::Count,
+            move || NonZeroDisplay(depth_clone.load(Ordering::Relaxed)),
+        );
+        let depth_distribution =
+            self.inner
+                .register_summary(format!("{label}.depth_dist"), var, Unit::Count);
 
         let gauge = QueueGauge {
             throughput,
             drain,
             depth: Gauge(depth),
+            depth_distribution,
         };
         gauges.insert(key, gauge.clone());
         gauge
@@ -1203,7 +1277,7 @@ impl<'a> Histogram<'a> {
     }
 
     fn summarize(&self) -> (u64, u64, u64, u64) {
-        compute_histogram_percentiles(&self.buckets)
+        compute_histogram_summary(&self.buckets)
     }
 
     fn write_summary(&self, key: &str, output: &mut String) {
@@ -1285,10 +1359,10 @@ fn is_histogram_unit_only(rest: &str) -> bool {
 }
 
 fn is_valid_scalar_unit(rest: &str) -> bool {
-    matches!(rest, "us" | "ms" | "s" | "B" | "KB" | "MB" | "GB" | "%")
+    is_histogram_unit_only(rest) || rest == "%"
 }
 
-fn compute_histogram_percentiles(buckets: &[HistogramBucket]) -> (u64, u64, u64, u64) {
+fn compute_histogram_summary(buckets: &[HistogramBucket]) -> (u64, u64, u64, u64) {
     let total_count = buckets.iter().map(|bucket| bucket.count).sum();
     if total_count == 0 {
         return (0, 0, 0, 0);
@@ -1301,13 +1375,14 @@ fn compute_histogram_percentiles(buckets: &[HistogramBucket]) -> (u64, u64, u64,
     (total_count, p50, p99, max)
 }
 
-/// Returns `(total_count, max_value)` for histogram buckets.
+/// Returns `(total_count, min_value, max_value)` for histogram buckets.
 ///
-/// For empty buckets, both values are `0`.
-fn histogram_count_and_max(buckets: &[HistogramBucket]) -> (u64, u64) {
+/// For empty buckets, all values are `0`.
+fn histogram_count_min_max(buckets: &[HistogramBucket]) -> (u64, u64, u64) {
     let count = buckets.iter().map(|bucket| bucket.count).sum();
+    let min = buckets.first().map_or(0, |bucket| bucket.value);
     let max = buckets.last().map_or(0, |bucket| bucket.value);
-    (count, max)
+    (count, min, max)
 }
 
 /// Returns the value at the requested percentile for histogram buckets.
@@ -1680,6 +1755,7 @@ mod tests {
         assert!(lines.contains(&"svc.q.packet.depth.distribution:875|ms".to_string()));
         assert!(lines.contains(&"svc.rx.ecn.ect0:500|c".to_string()));
         assert!(lines.contains(&"svc.task.time.packet_dispatch.0.count:3|c".to_string()));
+        assert!(lines.contains(&"svc.task.time.packet_dispatch.0.min:0.005|ms".to_string()));
         assert!(lines.contains(&"svc.task.time.packet_dispatch.0.p50:0.005|ms".to_string()));
         assert!(lines.contains(&"svc.task.time.packet_dispatch.0.p90:0.010|ms".to_string()));
         assert!(lines.contains(&"svc.task.time.packet_dispatch.0.p95:0.010|ms".to_string()));
@@ -1698,7 +1774,7 @@ mod tests {
 
     #[test]
     fn statsd_sink_submits_payloads_as_single_batch() {
-        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let (tx, mut rx) = mpsc::channel(1);
         let config = StatsdUdpConfig::new("127.0.0.1:8125".parse().unwrap(), tx);
         let mut sink = StatsdUdpSink::new(config);
         let payload =
@@ -1712,7 +1788,7 @@ mod tests {
 
     #[test]
     fn statsd_sink_drops_batch_when_queue_full() {
-        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let (tx, mut rx) = mpsc::channel(1);
         let config = StatsdUdpConfig::new("127.0.0.1:8125".parse().unwrap(), tx);
         let mut sink = StatsdUdpSink::new(config);
         let payload = ReportingPayload::from_line("rx.data=1");
