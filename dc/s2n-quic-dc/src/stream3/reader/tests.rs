@@ -623,6 +623,7 @@ fn max_data_transmission_failure_surfaces_error() {
         let (mut reader, mut pusher) = make_pair();
         let window_size = reader.0.window_size;
         let payload = vec![0u8; (window_size / 2 + 1) as usize];
+        let payload_len = payload.len();
 
         async move {
             pusher.push_data(0, &payload, false);
@@ -637,10 +638,10 @@ fn max_data_transmission_failure_surfaces_error() {
         .spawn();
 
         async move {
-            let mut buf = BytesMut::with_capacity(payload.len() + 16);
+            let mut buf = BytesMut::with_capacity(payload_len + 16);
 
             let read = reader.read_into(&mut buf).await.expect("first read should succeed");
-            assert_eq!(read, payload.len());
+            assert_eq!(read, payload_len);
 
             bach::task::yield_now().await;
 

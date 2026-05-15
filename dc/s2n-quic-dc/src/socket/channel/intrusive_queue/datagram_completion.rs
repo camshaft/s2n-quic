@@ -389,6 +389,7 @@ impl<T> super::super::Receiver<intrusive_queue::Queue<T>> for Receiver<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::socket::channel::Budget;
 
     #[test]
     fn initial_state() {
@@ -448,9 +449,9 @@ mod tests {
 
         tx.send_batch(queue).expect("send should succeed");
 
-        let mut cx = core::task::Context::from_waker(futures::task::noop_waker_ref());
-        let mut budget = super::super::Budget::new(usize::MAX);
-        let received = match <Receiver<Status> as super::super::Receiver<
+        let mut cx = core::task::Context::from_waker(std::task::Waker::noop());
+        let mut budget = Budget::new(usize::MAX);
+        let received = match <Receiver<Status> as crate::socket::channel::Receiver<
             intrusive_queue::Queue<Status>,
         >>::poll_recv(&mut rx, &mut cx, &mut budget)
         {
