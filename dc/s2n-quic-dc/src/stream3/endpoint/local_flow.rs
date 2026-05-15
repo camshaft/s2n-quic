@@ -17,8 +17,6 @@ use std::{
     task::Waker,
 };
 
-const UNQUEUED_PRIORITY: u8 = u8::MAX;
-
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum StreamPriority {
     High = 0,
@@ -122,7 +120,6 @@ pub struct Flow {
     requested: AtomicU64,
     issued: AtomicU64,
     queued: AtomicBool,
-    queued_priority: AtomicU8,
     waker: Mutex<Option<Waker>>,
     links: Links,
 }
@@ -149,7 +146,6 @@ impl Flow {
             requested: AtomicU64::new(0),
             issued: AtomicU64::new(0),
             queued: AtomicBool::new(false),
-            queued_priority: AtomicU8::new(UNQUEUED_PRIORITY),
             waker: Mutex::new(None),
             links: Links::new(),
         })
@@ -236,7 +232,7 @@ impl Flow {
     }
 
     #[inline]
-    fn mark_enqueued(&self, priority: StreamPriority) -> bool {
+    fn mark_enqueued(&self, _priority: StreamPriority) -> bool {
         if self
             .queued
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -244,22 +240,12 @@ impl Flow {
         {
             return false;
         }
-
-        self.queued_priority
-            .store(priority as u8, Ordering::Release);
         true
     }
 
     #[inline]
     fn mark_dequeued(&self) {
         self.queued.store(false, Ordering::Release);
-        self.queued_priority.store(UNQUEUED_PRIORITY, Ordering::Release);
-    }
-
-    #[inline]
-    fn queued_priority(&self) -> Option<StreamPriority> {
-        let priority = self.queued_priority.load(Ordering::Acquire);
-        (priority != UNQUEUED_PRIORITY).then(|| StreamPriority::from_u8(priority))
     }
 }
 
@@ -382,10 +368,6 @@ impl Controller {
 
     pub fn clear_waiter(&self, flow: &Arc<Flow>) {
         flow.clear_wait();
-        if let Some(priority) = flow.queued_priority() {
-            self.remove_from_queue(priority, flow);
-            flow.mark_dequeued();
-        }
     }
 
     pub fn update_priority(&self, flow: &Arc<Flow>, priority: StreamPriority) {
@@ -395,15 +377,6 @@ impl Controller {
         }
 
         flow.set_priority(priority);
-
-        if let Some(queued_priority) = flow.queued_priority() {
-            if queued_priority != priority {
-                self.remove_from_queue(queued_priority, flow);
-                flow.mark_dequeued();
-                self.enqueue(flow.clone(), priority);
-            }
-        }
-
         self.issue_waiters();
     }
 
@@ -487,11 +460,6 @@ impl Controller {
                 }
 
                 let granted = available.min(self.max_burst_bytes).min(requested);
-                if granted == 0 {
-                    self.enqueue(flow, desired_priority);
-                    break 'outer;
-                }
-
                 self.queued_bytes.fetch_add(granted, Ordering::AcqRel);
                 flow.clear_requested();
                 flow.issue(granted);
@@ -514,20 +482,6 @@ impl Controller {
         self.max_queued_bytes
             .saturating_sub(queued)
             .min(self.max_inflight_bytes.saturating_sub(inflight))
-    }
-
-    fn remove_from_queue(&self, priority: StreamPriority, target: &Arc<Flow>) {
-        let queue = &mut *self.waiters[priority.as_index()].lock();
-        let len = queue.len();
-        for _ in 0..len {
-            let Some(flow) = queue.pop_front() else {
-                break;
-            };
-            if Arc::ptr_eq(&flow, target) {
-                return;
-            }
-            queue.push_back(flow);
-        }
     }
 
     fn dispatch_wakes(&self, wakes: VecDeque<AutoWake>) {
