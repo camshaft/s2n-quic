@@ -171,11 +171,11 @@ impl Writer {
         acceptor_id: VarInt,
         control_rx: msg::queue::Control,
     ) -> Self {
-        let completion_rx = frame::failure_completion_channel();
+        let completion_rx = frame::completion_channel();
         let parameters = path_secret_entry.parameters();
         let mtu = parameters.max_datagram_size();
         let packet_size = mtu.saturating_sub(MAX_FLOW_DATA_HEADER_OVERHEAD);
-        let max_inflight_bytes = u64::MAX;
+        let max_inflight_bytes = parameters.local_send_max_data.as_u64();
         let remote_max_data = VarInt::ZERO;
 
         Self(Box::new(Inner {
@@ -202,11 +202,11 @@ impl Writer {
         stream_id: VarInt,
         control_rx: msg::queue::Control,
     ) -> Self {
-        let completion_rx = frame::failure_completion_channel();
+        let completion_rx = frame::completion_channel();
         let parameters = path_secret_entry.parameters();
         let mtu = parameters.max_datagram_size();
         let packet_size = mtu.saturating_sub(MAX_FLOW_DATA_HEADER_OVERHEAD);
-        let max_inflight_bytes = u64::MAX;
+        let max_inflight_bytes = parameters.local_send_max_data.as_u64();
         let initial_remote_max_data = parameters.remote_max_data;
 
         Self(Box::new(Inner {
