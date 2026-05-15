@@ -115,6 +115,7 @@ pub struct Controller {
     max_inflight_bytes: u64,
     next_waiter_id: AtomicU64,
     waiters: [Mutex<VecDeque<Waiter>>; StreamPriority::LEVELS],
+    active_waiter: [AtomicU64; StreamPriority::LEVELS],
     wake_sink: Mutex<Option<waker::Sink>>,
 }
 
@@ -141,6 +142,7 @@ impl Controller {
             max_inflight_bytes,
             next_waiter_id: AtomicU64::new(1),
             waiters: core::array::from_fn(|_| Mutex::new(VecDeque::new())),
+            active_waiter: core::array::from_fn(|_| AtomicU64::new(0)),
             wake_sink: Mutex::new(None),
         })
     }
@@ -167,9 +169,13 @@ impl Controller {
 
     #[inline]
     pub fn clear_waiter(&self, waiter_id: u64, priority: StreamPriority) {
-        let queue = &mut *self.waiters[priority.as_index()].lock();
+        let priority_idx = priority.as_index();
+        let queue = &mut *self.waiters[priority_idx].lock();
         if let Some(pos) = queue.iter().position(|waiter| waiter.id == waiter_id) {
             queue.remove(pos);
+        }
+        if self.active_waiter[priority_idx].load(Ordering::Acquire) == waiter_id {
+            self.active_waiter[priority_idx].store(0, Ordering::Release);
         }
     }
 
@@ -211,9 +217,18 @@ impl Controller {
             if !self.waiters[higher.as_index()].lock().is_empty() {
                 return 0;
             }
+            let active = self.active_waiter[higher.as_index()].load(Ordering::Acquire);
+            if active != 0 {
+                return 0;
+            }
         }
 
-        {
+        let active = self.active_waiter[priority_idx].load(Ordering::Acquire);
+        if active != 0 && active != waiter_id {
+            return 0;
+        }
+
+        if active != waiter_id {
             let queue = self.waiters[priority_idx].lock();
             if let Some(front) = queue.front() {
                 if front.id != waiter_id {
@@ -242,6 +257,7 @@ impl Controller {
                 .compare_exchange(queued, next, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
             {
+                self.active_waiter[priority_idx].store(0, Ordering::Release);
                 self.clear_waiter(waiter_id, priority);
                 return granted;
             }
@@ -254,7 +270,7 @@ impl Controller {
             return;
         }
 
-        self.queued_bytes.fetch_sub(bytes, Ordering::AcqRel);
+        Self::sub_counter(&self.queued_bytes, bytes);
         self.inflight_bytes.fetch_add(bytes, Ordering::AcqRel);
         self.wake_waiters(priority);
     }
@@ -265,7 +281,7 @@ impl Controller {
             return;
         }
 
-        self.inflight_bytes.fetch_sub(bytes, Ordering::AcqRel);
+        Self::sub_counter(&self.inflight_bytes, bytes);
         self.queued_bytes.fetch_add(bytes, Ordering::AcqRel);
     }
 
@@ -275,7 +291,7 @@ impl Controller {
             return;
         }
 
-        self.queued_bytes.fetch_sub(bytes, Ordering::AcqRel);
+        Self::sub_counter(&self.queued_bytes, bytes);
         self.wake_waiters(priority);
     }
 
@@ -285,7 +301,7 @@ impl Controller {
             return;
         }
 
-        self.inflight_bytes.fetch_sub(bytes, Ordering::AcqRel);
+        Self::sub_counter(&self.inflight_bytes, bytes);
         self.wake_waiters(priority);
     }
 
@@ -295,44 +311,43 @@ impl Controller {
             return;
         }
 
-        let mut available = self
+        let available = self
             .max_queued_bytes
             .saturating_sub(self.queued_bytes.load(Ordering::Acquire));
         if available == 0 {
             return;
         }
 
-        let mut to_wake = Vec::new();
         for priority in StreamPriority::ALL {
             let queue = &mut *self.waiters[priority.as_index()].lock();
-            while let Some(waiter) = queue.front() {
-                if waiter.requested > available {
-                    break;
-                }
-
+            let should_wake = queue
+                .front()
+                .map(|waiter| waiter.requested <= available)
+                .unwrap_or(false);
+            if should_wake {
                 let waiter = queue.pop_front().expect("front waiter must exist");
-                available = available.saturating_sub(waiter.requested);
-                to_wake.push(waiter.waker);
+                self.active_waiter[priority.as_index()].store(waiter.id, Ordering::Release);
+                self.dispatch_waker(waiter.waker);
+                break;
             }
-
-            if priority.as_index() <= released_priority.as_index() && !to_wake.is_empty() {
+            if priority.as_index() >= released_priority.as_index() {
                 break;
             }
         }
+    }
 
-        if to_wake.is_empty() {
-            return;
-        }
-
+    fn dispatch_waker(&self, waker: Waker) {
         if let Some(mut sink) = self.wake_sink.lock().clone() {
-            for waker in to_wake {
-                let _ = sink.send(waker);
-            }
+            let _ = sink.send(waker);
         } else {
-            for waker in to_wake {
-                waker.wake();
-            }
+            waker.wake();
         }
+    }
+
+    fn sub_counter(counter: &AtomicU64, bytes: u64) {
+        let _ = counter.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            Some(current.saturating_sub(bytes))
+        });
     }
 }
 
