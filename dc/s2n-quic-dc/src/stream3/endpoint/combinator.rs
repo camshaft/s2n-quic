@@ -708,7 +708,8 @@ where
         };
 
         if !Self::should_notify(&frame) {
-            return Poll::Ready(Some(Default::default()));
+            let waker = self.flush();
+            return Poll::Ready(Some(waker));
         }
 
         let incoming_id = frame
