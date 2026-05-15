@@ -218,13 +218,14 @@ where
             }
             Err(err) => {
                 unreachable!(
-                    "check_dedup_for_credentials should only return replay errors after successful decrypt, got: {err:?}"
+                    "check_dedup_for_credentials should only return replay errors after provisional decrypt succeeds, got: {err:?}"
                 );
             }
         }
     }
 
-    let peer_rc = peer_rc.expect("peer context must exist after successful decrypt");
+    let peer_rc =
+        peer_rc.expect("peer context must exist after successful decrypt and replay validation");
     let mut peer = peer_rc.borrow_mut();
 
     // Packet number deduplication
