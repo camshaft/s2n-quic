@@ -383,18 +383,14 @@ fn transmission_rate_fuzz() {
 
 // ── Init Protocol Deduplication ───────────────────────────────────────────────
 
-/// Describes per-packet network manipulation to apply to FlowInit packets
-/// directed at the server.
+/// Describes per-packet network manipulation to apply to packets in the
+/// simulation.
 ///
-/// The two action lists are applied in lock-step per original (non-duplicate)
-/// FlowInit: `delays[i]` is the extra delay in units of 5 ms for the i-th
-/// FlowInit, and `duplicates[i]` says whether that packet should also be
-/// delivered as a network-level copy.  The copy is scheduled at absolute base
-/// latency (no inherited delay), so it arrives *before* any delayed original,
-/// creating a reordering scenario.
-///
-/// The lists may have different lengths; shorter lists simply stop applying
-/// their effect once exhausted (defaulting to no delay / no duplication).
+/// The two command lists are zipped into per-packet `(delay, duplicate)` pairs
+/// and cycled over every packet so that even a short bolero-generated list
+/// covers the entire simulation.  The `delay` value is in units of 5 ms
+/// (range 0..=50 → 0..=250 ms); `duplicate` requests an extra network-level
+/// copy delivered at absolute base latency.
 #[derive(Clone, bolero::TypeGenerator)]
 struct PacketActions {
     /// Per-packet extra delay, in units of 5 ms (range 0..=50 → 0..=250 ms).
@@ -422,54 +418,63 @@ impl core::fmt::Debug for PacketActions {
 }
 
 /// Installs two Bach network monitors that apply per-packet delay and
-/// duplication to FlowInit packets directed **to** the server.
+/// duplication to every packet in the simulation.
 ///
-/// * **Monitor 1 – delay**: for each original FlowInit going to the server,
-///   applies an extra delay of `delays[i] * 5 ms`.
-/// * **Monitor 2 – duplicate**: for each original FlowInit, optionally injects
-///   a network-level copy.  The copy uses an absolute offset so it is scheduled
-///   at base network latency, independently of the original's extra delay — it
-///   therefore arrives *before* the delayed original, exercising the server's
-///   deduplication logic under reordering.
+/// The `delays` and `duplicates` lists from `actions` are zipped into a single
+/// `Vec<(u8, bool)>` and shared between two monitors via a single index
+/// counter.  Both monitors read the **same** index for each packet (monitor 1
+/// peeks without advancing; monitor 2 advances after reading), so the delay
+/// and duplicate commands are always applied in lock-step.  The list is cycled
+/// with `i % len` so that every packet receives a command even when the
+/// generated list is shorter than the total number of packets.
 ///
-/// Duplicate packets (tagged `packet.is_duplicate == true`) are passed through
-/// unchanged by both monitors to prevent cascading expansion.
+/// Duplicate packets (`packet.is_duplicate == true`) are passed through
+/// unchanged by the duplicate monitor to prevent cascading expansion.
 ///
-/// This function must be called inside a `sim(|| { … })` closure so that the
-/// monitors are registered in the current Bach network environment.
+/// This function must be called inside a `sim(|| { … })` closure.
 fn install_init_monitors(actions: &PacketActions) {
     use bach::net::monitor;
 
-    // Monitor 1: per-packet extra delay on original FlowInit packets.
-    let delays = actions.delays.clone();
-    let delay_idx = Arc::new(AtomicUsize::new(0));
-    monitor::on_packet_sent(move |packet| {
-        if !packet.is_duplicate && packet.destination().port() == SERVER_PORT {
-            let i = delay_idx.fetch_add(1, Ordering::Relaxed);
-            if let Some(&d) = delays.get(i) {
-                if d > 0 {
-                    return monitor::delay(Duration::from_millis(d as u64 * 5)).into();
-                }
-            }
+    let n = actions.delays.len().max(actions.duplicates.len());
+    if n == 0 {
+        return;
+    }
+
+    // Zip the two lists into a single per-packet command vec.
+    let commands: Arc<Vec<(u8, bool)>> = Arc::new(
+        (0..n)
+            .map(|i| {
+                let d = actions.delays.get(i).copied().unwrap_or(0);
+                let b = actions.duplicates.get(i).copied().unwrap_or(false);
+                (d, b)
+            })
+            .collect(),
+    );
+
+    // A single counter shared between both monitors so they always operate on
+    // the same index for the same packet.
+    let idx = Arc::new(AtomicUsize::new(0));
+
+    // Monitor 1: delay — peeks at the current index without advancing.
+    let commands_m1 = commands.clone();
+    let idx_m1 = idx.clone();
+    monitor::on_packet_sent(move |_packet| {
+        let i = idx_m1.load(Ordering::Relaxed);
+        let (delay, _) = commands_m1[i % commands_m1.len()];
+        if delay > 0 {
+            return monitor::delay(Duration::from_millis(delay as u64 * 5)).into();
         }
         Default::default()
     });
 
-    // Monitor 2: per-packet duplication of original FlowInit packets.
-    //
-    // `duplicate(1).absolute()` schedules the copy at base network latency
-    // (no inherited delay from monitor 1), so it consistently arrives ahead
-    // of a delayed original.
-    let duplicates = actions.duplicates.clone();
-    let dup_idx = Arc::new(AtomicUsize::new(0));
+    // Monitor 2: duplicate — reads the current index and then advances it.
+    // Only original (non-duplicate) packets are duplicated to prevent
+    // cascading expansion.
     monitor::on_packet_sent(move |packet| {
-        if !packet.is_duplicate && packet.destination().port() == SERVER_PORT {
-            let i = dup_idx.fetch_add(1, Ordering::Relaxed);
-            if let Some(&should_dup) = duplicates.get(i) {
-                if should_dup {
-                    return monitor::duplicate(1).absolute().into();
-                }
-            }
+        let i = idx.fetch_add(1, Ordering::Relaxed);
+        let (_, should_dup) = commands[i % commands.len()];
+        if should_dup && !packet.is_duplicate {
+            return monitor::duplicate(1).absolute().into();
         }
         Default::default()
     });
@@ -530,7 +535,7 @@ fn sim_init_uniqueness(actions: &PacketActions, n: usize) {
                             .expect("server timed out waiting for a stream")
                             .expect("acceptor channel closed unexpectedly");
 
-                    let id = stream.stream_id().as_u64();
+                    let id = stream.stream_id();
                     let first_time = seen_ids_sv.lock().unwrap().insert(id);
                     assert!(
                         first_time,

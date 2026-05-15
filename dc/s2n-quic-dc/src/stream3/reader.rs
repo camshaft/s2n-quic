@@ -275,8 +275,8 @@ impl Reader {
     }
 
     /// Returns the stream identifier for this reader.
-    pub fn stream_id(&self) -> VarInt {
-        self.0.stream_id
+    pub fn stream_id(&self) -> u64 {
+        self.0.stream_id.as_u64()
     }
 
     pub(crate) fn send_reset(&mut self, error_code: VarInt) {

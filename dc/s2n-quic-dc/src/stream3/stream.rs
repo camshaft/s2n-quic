@@ -29,7 +29,7 @@ impl Stream {
     ///
     /// This is the same ID that the client assigned when opening the stream,
     /// and is echoed by the server side once the stream is accepted.
-    pub fn stream_id(&self) -> s2n_quic_core::varint::VarInt {
+    pub fn stream_id(&self) -> u64 {
         self.read.stream_id()
     }
 
