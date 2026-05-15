@@ -36,10 +36,12 @@ impl StreamPriority {
 
     #[inline]
     fn from_u8(value: u8) -> Self {
-        match value {
-            v if v == Self::High as u8 => Self::High,
-            v if v == Self::Normal as u8 => Self::Normal,
-            _ => Self::Low,
+        if value == Self::High as u8 {
+            Self::High
+        } else if value == Self::Normal as u8 {
+            Self::Normal
+        } else {
+            Self::Low
         }
     }
 }
@@ -459,7 +461,7 @@ impl Controller {
 
         let mut wakes = VecDeque::new();
 
-        'outer: while available > 0 {
+        'issue_loop: while available > 0 {
             let mut progressed = false;
 
             for queued_priority in StreamPriority::ALL {
@@ -486,7 +488,7 @@ impl Controller {
                 flow.issue(granted);
                 available = available.saturating_sub(granted);
                 wakes.push_back(flow.take_waker());
-                continue 'outer;
+                continue 'issue_loop;
             }
 
             if !progressed {
