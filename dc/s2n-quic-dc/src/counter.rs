@@ -1358,12 +1358,11 @@ fn format_bits_per_second(bytes: u64) -> (f64, &'static str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
 
     struct MockSink {
         id: &'static str,
         fail: bool,
-        calls: Arc<Mutex<Vec<String>>>,
+        calls: std::sync::Arc<Mutex<Vec<String>>>,
     }
 
     impl ReporterOutputSink for MockSink {
@@ -1566,7 +1565,7 @@ mod tests {
         let counter = registry.register_counter("rx.data".into(), None);
         counter.increment(7);
 
-        let seen = Arc::new(Mutex::new(Vec::new()));
+        let seen = std::sync::Arc::new(Mutex::new(Vec::new()));
         let mut sinks: Vec<Box<dyn ReporterOutputSink>> = vec![
             Box::new(MockSink {
                 id: "a",
@@ -1597,7 +1596,7 @@ mod tests {
     #[test]
     fn dispatch_continues_after_sink_error_in_order() {
         let payload = ReportingPayload::from_line("rx.data=1");
-        let seen = Arc::new(Mutex::new(Vec::new()));
+        let seen = std::sync::Arc::new(Mutex::new(Vec::new()));
         let mut sinks: Vec<Box<dyn ReporterOutputSink>> = vec![
             Box::new(MockSink {
                 id: "first",
@@ -1613,7 +1612,7 @@ mod tests {
 
         dispatch_payload_to_sinks(&mut sinks, &payload, None);
         assert_eq!(
-            seen.lock().expect("MockSink mutex poisoned").as_slice(),
+            seen.lock().unwrap().as_slice(),
             &[
                 "first:1:rx.data=1".to_string(),
                 "second:1:rx.data=1".to_string()
@@ -1666,7 +1665,7 @@ mod tests {
         let counter = registry.register_counter("rx.data".into(), None);
         counter.increment(1);
 
-        let seen = Arc::new(Mutex::new(Vec::new()));
+        let seen = std::sync::Arc::new(Mutex::new(Vec::new()));
         let mut sinks: Vec<Box<dyn ReporterOutputSink>> = vec![
             Box::new(MockSink {
                 id: "1",
