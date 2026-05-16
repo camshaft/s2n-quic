@@ -553,10 +553,10 @@ fn sim_init_uniqueness(actions: &PacketActions, n: usize) {
                     let seen_ids_sv = seen_ids_sv.clone();
                     let validated_count = validated_count_inner.clone();
                     async move {
-                        let mut stream = stream;
-                        if stream.validate().await.is_err() {
-                            return;
-                        }
+                        let mut stream = match stream.validate().await {
+                            Ok(stream) => stream,
+                            Err(_) => return,
+                        };
 
                         let id = stream.stream_id();
                         let first_time = seen_ids_sv.lock().unwrap().insert(id);
