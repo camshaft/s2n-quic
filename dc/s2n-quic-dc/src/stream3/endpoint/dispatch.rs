@@ -1331,7 +1331,7 @@ fn handle_flow_reset(
 /// We look up the stream_id in the per-peer `flows` tracker to find the local queue_id,
 /// then dispatch a Reset to both stream and control queues. If the stream_id is not
 /// found (FlowInit not yet registered or already closed), we mark the attempt_id as
-/// finalised in the dedup window so that any later FlowInit with this attempt_id is
+/// finalized in the dedup window so that any later FlowInit with this attempt_id is
 /// silently rejected — the server will never create a stream that the client has
 /// already aborted. We never send a reset back in response.
 fn handle_flow_init_reset(
@@ -1346,15 +1346,31 @@ fn handle_flow_init_reset(
 ) {
     let Some(local_queue_id) = peer.flows.lookup(stream_id) else {
         // Stream not found: mark attempt_id as seen so a later FlowInit with
-        // the same attempt_id is rejected.  Ignore errors — Duplicate means
-        // already marked (safe), TooOld means outside the dedup window (no-op).
-        let _ = peer.attempt_dedup.check_attempt_id(attempt_id);
+        // the same attempt_id is rejected.
+        match peer.attempt_dedup.check_attempt_id(attempt_id) {
+            Ok(()) => {
+                tracing::debug!(
+                    attempt_id = attempt_id.as_u64(),
+                    stream_id = stream_id.as_u64(),
+                    "FlowInitReset for unknown stream_id - attempt_id marked as seen"
+                );
+            }
+            Err(AttemptDedupError::Duplicate) => {
+                tracing::debug!(
+                    attempt_id = attempt_id.as_u64(),
+                    stream_id = stream_id.as_u64(),
+                    "FlowInitReset for unknown stream_id - attempt_id already marked (duplicate reset)"
+                );
+            }
+            Err(AttemptDedupError::TooOld) => {
+                tracing::debug!(
+                    attempt_id = attempt_id.as_u64(),
+                    stream_id = stream_id.as_u64(),
+                    "FlowInitReset for unknown stream_id - attempt_id outside dedup window"
+                );
+            }
+        }
         counters.rx_init_reset_unknown.add(1);
-        tracing::debug!(
-            attempt_id = attempt_id.as_u64(),
-            stream_id = stream_id.as_u64(),
-            "FlowInitReset for unknown stream_id - marking attempt_id as seen"
-        );
         return;
     };
 
