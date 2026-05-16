@@ -137,14 +137,11 @@ use tracing::{debug, trace};
 /// # Example
 ///
 /// ```ignore
-/// use s2n_quic_core::stream::testing::Data;
 /// use s2n_quic_dc::stream::Writer;
 ///
-/// async fn send_response(mut writer: Writer, len: u64) -> std::io::Result<()> {
-///     let mut body = Data::new(len);
-///     while !body.is_finished() {
-///         writer.write_from_fin(&mut body).await?;
-///     }
+/// async fn send_response(mut writer: Writer) -> std::io::Result<()> {
+///     let mut body: &[u8] = b"hello from s2n-quic-dc";
+///     writer.write_all_from_fin(&mut body).await?;
 ///     Ok(())
 /// }
 /// ```

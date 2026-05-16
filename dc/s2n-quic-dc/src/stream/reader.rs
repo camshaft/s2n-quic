@@ -379,14 +379,13 @@ impl Reader {
     /// - `Ok(0)` is EOF, not "no bytes available right now".
     /// - Use a loop if you need to fill a buffer or drain the whole stream.
     ///
-    /// # Example
-    ///
-    /// ```ignore
+/// # Example
+///
+/// ```ignore
 /// async fn read_frame(reader: &mut s2n_quic_dc::stream::Reader) -> std::io::Result<Vec<u8>> {
-///     let mut frame = vec![0; 4096];
+///     let mut frame = [0; 4096];
 ///     let n = reader.read_into(&mut frame[..]).await?;
-///     frame.truncate(n);
-///     Ok(frame)
+///     Ok(frame[..n].to_vec())
 /// }
 /// ```
     pub async fn read_into<S>(&mut self, buf: &mut S) -> io::Result<usize>
