@@ -72,9 +72,9 @@ pub struct Entry {
     ///
     ///   score = max(now, earliest_departure_time)
     ///         + congestion_penalty           (one smoothed RTT when cwnd-limited)
-    ///         + queued_bytes / pacing_rate   (estimated queue-drain time)
+    ///         + queued_bytes / bandwidth     (estimated queue-drain time)
     ///
-    /// This means the score units are still nanoseconds but the semantic is *load*, not
+    /// This means the score units are still nanoseconds but the semantics are *load*, not
     /// *wall-clock time*.  Comparisons between two scores for the same peer at the same
     /// instant are always valid; absolute values have no external meaning.
     sender_load_scores: Box<[AtomicU64]>,
