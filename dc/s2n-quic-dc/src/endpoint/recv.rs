@@ -213,6 +213,13 @@ pub(crate) struct Context {
     /// Map from stream_id to allocated queue_id for this sender.
     /// Shared with queue handles so they can remove entries when closed.
     pub flows: flow::Tracker,
+    /// Buffered FIN notifications received before the corresponding FlowInit.
+    ///
+    /// Maps `stream_id → offset`: when a FlowInitFin is received for a stream that
+    /// has not yet been registered (FlowInit not yet seen), we stash the offset here.
+    /// When the matching FlowInit arrives and registers the stream, we immediately
+    /// apply the buffered FIN so the reader sees EOF at the correct byte offset.
+    pub pending_fins: FxHashMap<VarInt, VarInt>,
     /// Intrusive links for recv-worker pending-ACK burst queue membership.
     pub ack_burst: intrusive::Links,
 }
@@ -246,6 +253,8 @@ impl Context {
             ack_state: AckState::Idle,
             attempt_dedup: AttemptDedup::new(),
             flows,
+            ack_burst: intrusive::Links::new(),
+            pending_fins: FxHashMap::default(),
             ack_burst: intrusive::Links::new(),
         }
     }

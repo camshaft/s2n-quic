@@ -29,16 +29,6 @@
 
 // TODOs:
 //
-// Correctness:
-//
-// * [FIXED] FlowInitSent reset gap: `send_reset_frame()` now falls back to
-//   `send_flow_init_reset_frame()` when the server's queue ID is unknown, allowing
-//   the server to look up the stream via stream_id and dispatch the reset to the queues.
-//
-// * [FIXED] FlowInitSent FIN gap: `send_fin_packet()` now handles FlowInitSent by
-//   sending a FlowInitFin frame with the current write offset. The server looks up
-//   the stream via stream_id and dispatches a FIN data chunk to the stream queue.
-//
 // Flow control:
 //
 // * Auto-tune max_inflight_bytes based on completion queue delivery rate. Currently using a
@@ -577,9 +567,28 @@ impl Inner {
             return Ok(());
         }
 
+        // The completion channel records which sender socket transmitted the FlowInit.
+        // We must route FlowInitReset through the same socket so it reaches the same
+        // server-side recv::Context (which is keyed by sender ID).
+        let Some(sender_idx) = self.completion_rx.init_sender_idx() else {
+            // FlowInit is still queued and has not been transmitted by any sender socket.
+            // Cancel it so the server never sees this stream — no FlowInitReset needed.
+            debug!(
+                stream_id = self.stream_id.as_u64(),
+                "FlowInit not yet transmitted - cancelling pending FlowInit instead of sending FlowInitReset"
+            );
+            self.completion_rx.cancel();
+            return Ok(());
+        };
+
+        // Include the actual attempt_id so the server can mark it as seen in its dedup
+        // window, preventing a late-arriving FlowInit duplicate from creating a new stream.
+        let attempt_id = self.completion_rx.init_attempt_id().unwrap_or(VarInt::MAX);
+
         let frame = Frame {
-            source_sender_id: VarInt::MAX,
+            source_sender_id: VarInt::new(sender_idx as u64).unwrap_or(VarInt::MAX),
             header: Header::FlowInitReset {
+                attempt_id,
                 stream_id: self.stream_id,
                 error_code,
             },
@@ -595,6 +604,8 @@ impl Inner {
 
         debug!(
             stream_id = self.stream_id.as_u64(),
+            sender_idx,
+            attempt_id = attempt_id.as_u64(),
             error_code = error_code.as_u64(),
             "Sent FlowInitReset"
         );
@@ -612,8 +623,23 @@ impl Inner {
             return Ok(());
         }
 
+        // The completion channel records which sender socket transmitted the FlowInit.
+        // We must route FlowInitFin through the same socket so it reaches the same
+        // server-side recv::Context (keyed by sender ID).
+        let Some(sender_idx) = self.completion_rx.init_sender_idx() else {
+            // FlowInit is still queued and has not been transmitted by any sender socket.
+            // Cancel it so the server never sees this stream — no FlowInitFin needed.
+            debug!(
+                stream_id = self.stream_id.as_u64(),
+                "FlowInit not yet transmitted - cancelling pending FlowInit instead of sending FlowInitFin"
+            );
+            self.completion_rx.cancel();
+            self.status.on_send_fin().unwrap();
+            return Ok(());
+        };
+
         let frame = Frame {
-            source_sender_id: VarInt::MAX,
+            source_sender_id: VarInt::new(sender_idx as u64).unwrap_or(VarInt::MAX),
             header: Header::FlowInitFin {
                 stream_id: self.stream_id,
                 offset: self.next_offset,
@@ -630,6 +656,7 @@ impl Inner {
 
         debug!(
             stream_id = self.stream_id.as_u64(),
+            sender_idx,
             offset = self.next_offset.as_u64(),
             "Sent FlowInitFin"
         );
