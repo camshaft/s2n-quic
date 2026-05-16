@@ -1,0 +1,54 @@
+{
+  "nodes": [
+    {
+      "id": "socket_recv",
+      "label": "Socket Recv",
+      "kind": "task",
+      "x": 80,
+      "y": 80,
+      "selectors": [
+        { "metric_prefix": "task.time", "metric_type": "histogram", "variant": "socket_recv" }
+      ]
+    },
+    {
+      "id": "packet_dispatch_queue",
+      "label": "Packet Dispatch Queue",
+      "kind": "queue",
+      "x": 360,
+      "y": 120,
+      "selectors": [
+        { "metric_prefix": "q.packet_dispatch", "metric_type": "queue" }
+      ]
+    },
+    {
+      "id": "packet_dispatch",
+      "label": "Packet Dispatch",
+      "kind": "task",
+      "x": 660,
+      "y": 80,
+      "selectors": [
+        { "metric_prefix": "task.time", "metric_type": "histogram", "variant": "packet_dispatch" }
+      ]
+    }
+  ],
+  "edges": [
+    {
+      "id": "recv_to_queue",
+      "from": "socket_recv",
+      "to": "packet_dispatch_queue",
+      "label": "enqueue",
+      "selectors": [
+        { "metric_prefix": "q.packet_dispatch", "metric_type": "queue" }
+      ]
+    },
+    {
+      "id": "queue_to_task",
+      "from": "packet_dispatch_queue",
+      "to": "packet_dispatch",
+      "label": "drain",
+      "selectors": [
+        { "metric_prefix": "q.packet_dispatch", "metric_type": "queue" }
+      ]
+    }
+  ]
+}
