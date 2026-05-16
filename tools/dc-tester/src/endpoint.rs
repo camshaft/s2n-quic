@@ -5,8 +5,9 @@ use crate::config::EndpointConfig;
 use s2n_quic_dc::{
     busy_poll,
     path::secret::{self, stateless_reset::Signer},
+    runtime,
     socket::rate::Rate,
-    stream3::endpoint::{self, socket},
+    stream::endpoint::{self, socket},
 };
 use std::{io, net::SocketAddr, sync::Arc};
 use tracing::info;
@@ -14,11 +15,13 @@ use tracing::info;
 pub fn create(
     config: &EndpointConfig,
     bind_addr: SocketAddr,
-    spawner: &busy_poll::Pool,
+    pool: &busy_poll::Pool,
 ) -> io::Result<Arc<endpoint::Endpoint>> {
+    let runtime = runtime::busy_poll::Handle::new(pool.clone());
+
     // Create the path secret map (shared by endpoint, client PSK, server PSK)
     let signer = Signer::new(b"dc-tester");
-    let clock = s2n_quic_dc::clock::tokio::Clock::default();
+    let clock = s2n_quic_dc::time::tokio::Clock::default();
     let subscriber = s2n_quic_dc::event::tracing::Subscriber::default();
     let map = secret::Map::new(signer, 50_000, true, clock, subscriber);
 
@@ -55,14 +58,11 @@ pub fn create(
     let layout = config.layout();
     info!(?layout, "starting endpoint");
 
-    let bp_clock =
-        s2n_quic_dc::busy_poll::clock::Timer::new(s2n_quic_dc::clock::tokio::Clock::default());
     let send_pool = s2n_quic_dc::socket::pool::Pool::new(u16::MAX);
     let recv_pool = s2n_quic_dc::socket::pool::Pool::new(u16::MAX);
     let acceptor_registry = s2n_quic_dc::acceptor::Registry::new();
 
     let endpoint_config = endpoint::Config {
-        spawner: spawner.clone(),
         layout,
         send_pool,
         recv_pool,
@@ -70,14 +70,13 @@ pub fn create(
         gso,
         acceptor_registry,
         idle_timeout: core::time::Duration::from_secs(30),
-        clock: bp_clock,
         overall_send_rate: Rate::new(config.bandwidth),
         per_socket_send_rate: Rate::new(config.per_socket_bandwidth),
         budgets: endpoint::Budgets::default(),
         submission_shards: config.submission_shards,
     };
 
-    let inner = endpoint::setup_endpoint(endpoint_config, send_sockets, recv_sockets);
+    let inner = endpoint::setup_endpoint(runtime, endpoint_config, send_sockets, recv_sockets);
 
     Ok(Arc::new(inner))
 }
