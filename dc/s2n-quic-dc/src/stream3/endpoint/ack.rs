@@ -151,7 +151,7 @@ pub(crate) fn process_ack<Clk, Rand>(
             now,
         );
 
-        context.publish_next_transmission_time(now);
+        context.publish_sender_load_score(now);
     }
 
     // Process ECN feedback from the peer
