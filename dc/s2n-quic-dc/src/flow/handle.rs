@@ -4,7 +4,7 @@
 //! Flow handle with validation support
 
 use crate::credentials;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use s2n_quic_core::varint::VarInt;
 use std::{
     collections::{hash_map, VecDeque},
@@ -131,6 +131,22 @@ impl crate::flow::queue::Key for Handle {
     }
 }
 
+/// Sentinel value returned by `Tracker::try_register` when the stream_id is
+/// recognised as a recently-completed flow.  Using `VarInt::MAX` is safe because
+/// real queue IDs are assigned by a monotonically-incrementing counter starting
+/// from 0 and can never reach this value in practice.
+pub const COMPLETED_SENTINEL: VarInt = VarInt::MAX;
+
+/// Maximum number of recently-completed stream_ids retained by the Tracker.
+///
+/// Any TooOld FlowInit retransmission can only arrive if its attempt_id fell
+/// outside the AttemptDedup window (capacity = 2048).  In the worst case the
+/// right_edge can advance by at most (total streams) since the stream was
+/// completed.  We keep 4× the dedup window as a generous safety margin for
+/// typical workloads; for the 10 000-stream fuzz scenario this covers all
+/// possible TooOld completions.
+const COMPLETED_RING_CAPACITY: usize = 8192;
+
 /// Tracker for managing flow lifecycle on a single dispatch worker thread.
 ///
 /// The map is thread-local (Rc + RefCell). Cross-thread Handle drops are
@@ -141,6 +157,13 @@ pub struct Tracker {
     drop_channel: Arc<DropChannel>,
     drain_buf: std::rc::Rc<std::cell::RefCell<VecDeque<VarInt>>>,
     credentials: credentials::Id,
+    /// Ring buffer of recently-completed stream_ids (capped at
+    /// [`COMPLETED_RING_CAPACITY`]).  Used by `try_register` to detect TooOld
+    /// FlowInit retransmissions for streams that already finished, preventing
+    /// them from being dispatched to the acceptor as spurious new streams.
+    completed_ring: std::rc::Rc<std::cell::RefCell<VecDeque<VarInt>>>,
+    /// Hash-set mirror of `completed_ring` for O(1) membership tests.
+    completed_set: std::rc::Rc<std::cell::RefCell<FxHashSet<VarInt>>>,
 }
 
 impl core::fmt::Debug for Tracker {
@@ -159,6 +182,8 @@ impl Tracker {
             drop_channel: Arc::new(DropChannel::new()),
             drain_buf: Default::default(),
             credentials,
+            completed_ring: Default::default(),
+            completed_set: Default::default(),
         }
     }
 
@@ -171,8 +196,19 @@ impl Tracker {
             return;
         }
         let mut map = self.map.borrow_mut();
+        let mut ring = self.completed_ring.borrow_mut();
+        let mut set = self.completed_set.borrow_mut();
         for stream_id in buf.drain(..) {
             map.remove(&stream_id);
+            // Record as recently completed so that TooOld retransmissions of
+            // this stream_id are recognised and discarded in try_register.
+            if ring.len() >= COMPLETED_RING_CAPACITY {
+                if let Some(evicted) = ring.pop_front() {
+                    set.remove(&evicted);
+                }
+            }
+            ring.push_back(stream_id);
+            set.insert(stream_id);
         }
     }
 
@@ -183,6 +219,17 @@ impl Tracker {
         create_queue: impl FnOnce(Handle) -> (VarInt, Q),
     ) -> Result<Q, VarInt> {
         self.drain_drops();
+
+        // Reject retransmissions for recently-completed streams before checking
+        // the active map.  These arrive on the TooOld path when a PTO probe
+        // for a long-gone stream makes it past the attempt-dedup window.
+        if self.completed_set.borrow().contains(&stream_id) {
+            tracing::trace!(
+                stream_id = stream_id.as_u64(),
+                "TooOld FlowInit for recently-completed stream — stale retransmission"
+            );
+            return Err(COMPLETED_SENTINEL);
+        }
 
         match self.map.borrow_mut().entry(stream_id) {
             hash_map::Entry::Occupied(entry) => {

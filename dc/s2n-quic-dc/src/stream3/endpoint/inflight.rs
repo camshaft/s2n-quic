@@ -56,6 +56,13 @@ pub(crate) struct Packet {
     /// Loss detection on a shell calls `on_packet_lost` for CCA but does not follow the
     /// chain — the probe is still in flight and may succeed independently.
     pub probed_to: Option<PacketNumber>,
+    /// True when this entry's frames were already completed because a shell pointing to
+    /// this entry was ACKed earlier (via `take_chain_tail_frames`).  The entry remains in
+    /// the inflight map so that its `transmission_info` can still feed CCA/RTT updates
+    /// when the probe packet is eventually ACKed or declared lost.  `frames` will be
+    /// empty in this state, which is distinct from an un-probed live entry; the invariant
+    /// check skips the "non-empty frames" assertion for completed-tail entries.
+    pub frames_completed: bool,
 }
 
 impl Packet {
@@ -73,6 +80,7 @@ impl Packet {
             frames,
             transmission_info: Some(info),
             probed_to: None,
+            frames_completed: false,
         }
     }
 }
@@ -157,7 +165,7 @@ impl Map {
     pub fn invariants(&self) {
         #[cfg(test)]
         for (_, packet) in self.inner.iter() {
-            if packet.probed_to.is_none() {
+            if packet.probed_to.is_none() && !packet.frames_completed {
                 assert!(
                     !packet.frames.is_empty(),
                     "inflight packet has no probed_to link and no frames — potential ACK loop"
@@ -218,7 +226,14 @@ impl Map {
         let frames = self
             .inner
             .get_mut(pn)
-            .map(|p| core::mem::take(&mut p.frames))
+            .map(|p| {
+                // Mark as frames_completed so the invariant check does not flag this
+                // entry as a "zombie" (probed_to=None, frames empty).  The entry must
+                // remain in the map so its TransmissionInfo is available when the probe
+                // packet is ACKed or declared lost (for CCA/RTT updates).
+                p.frames_completed = true;
+                core::mem::take(&mut p.frames)
+            })
             .unwrap_or_default();
         (pn, frames)
     }

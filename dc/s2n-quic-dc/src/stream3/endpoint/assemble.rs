@@ -612,9 +612,13 @@ fn push_frame_metadata(header_buf: &mut Vec<u8>, header: &frame::Header, payload
 
 /// Stamp attempt_id in place for FlowInit frames.
 ///
-/// If the frame's attempt_id is the sentinel `VarInt::MAX`, allocates from the counter
-/// and writes it back into the header. On PTO retransmission the header already holds
-/// the assigned value, so no new allocation occurs.
+/// Safety-net assignment for FlowInit attempt_ids.
+///
+/// Under normal operation every FlowInit frame has its attempt_id assigned in
+/// `send::Context::push_batch` — once, the moment the frame is associated with a
+/// concrete send worker — so by the time we reach the encoder the field is already
+/// set and this function is a no-op.  The check is kept here as a fallback for frames
+/// that bypass `push_batch` (e.g. in unit tests that call `encode_segment` directly).
 fn stamp_attempt_id(header: &mut frame::Header, flow_attempt_id: &mut VarInt) {
     if let frame::Header::FlowInit { attempt_id, .. } = header {
         if *attempt_id == VarInt::MAX {

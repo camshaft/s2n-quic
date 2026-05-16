@@ -717,13 +717,22 @@ fn handle_flow_init(
                     }
                 }
                 Err(local_queue_id) => {
-                    counters.rx_init_retx.add(1);
-                    tracing::trace!(
-                        attempt_id = attempt_id.as_u64(),
-                        stream_id = stream_id.as_u64(),
-                        queue_id = local_queue_id.as_u64(),
-                        "FlowInit retransmission of existing flow - dropping"
-                    );
+                    if local_queue_id == flow::COMPLETED_SENTINEL {
+                        counters.rx_init_retx.add(1);
+                        tracing::trace!(
+                            attempt_id = attempt_id.as_u64(),
+                            stream_id = stream_id.as_u64(),
+                            "TooOld FlowInit retransmission of completed flow — dropping"
+                        );
+                    } else {
+                        counters.rx_init_retx.add(1);
+                        tracing::trace!(
+                            attempt_id = attempt_id.as_u64(),
+                            stream_id = stream_id.as_u64(),
+                            queue_id = local_queue_id.as_u64(),
+                            "FlowInit retransmission of existing flow - dropping"
+                        );
+                    }
                 }
             }
         }

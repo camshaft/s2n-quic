@@ -353,17 +353,35 @@ impl Context {
     /// need this context inserted.
     ///
     /// Each priority level is appended in O(1) via an intrusive list splice.
+    ///
+    /// FlowInit frames whose `attempt_id` is still the unset sentinel (`VarInt::MAX`) are
+    /// stamped with this context's `flow_attempt_id_counter` here — exactly once, at the
+    /// moment the frame is associated with a concrete send worker.  Retransmissions already
+    /// carry the counter value assigned on their first pass and are left unchanged.
     pub fn push_batch<Clk: precision::Clock + ?Sized>(
         &mut self,
         batch: super::combinator::FrameBatch,
         clock: &Clk,
     ) -> WheelInterest {
         let (queues, byte_costs) = batch.into_queues();
-        for (queue, (slot, cost)) in queues
+        for (mut queue, (slot, cost)) in queues
             .into_iter()
             .zip(self.queues.iter_mut().zip(byte_costs))
         {
             if !queue.is_empty() {
+                // Stamp attempt_id for any new FlowInit frames entering this worker for the
+                // first time.  Using VarInt::MAX as the "unassigned" sentinel mirrors the
+                // Writer and avoids an extra field on Frame.
+                for frame in queue.iter_mut() {
+                    if let crate::stream3::frame::Header::FlowInit { attempt_id, .. } =
+                        &mut frame.header
+                    {
+                        if *attempt_id == s2n_quic_core::varint::VarInt::MAX {
+                            *attempt_id = self.flow_attempt_id_counter;
+                            self.flow_attempt_id_counter += 1;
+                        }
+                    }
+                }
                 slot.append_queue(queue, cost);
             }
         }
