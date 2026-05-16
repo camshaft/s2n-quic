@@ -3,7 +3,7 @@
 
 //! Unit tests for send-side queue accounting and PTO / `ProbeState` logic.
 
-use super::{PendingFrames, ProbeState, Pto, INITIAL_PTO_BACKOFF};
+use super::{Context, PendingFrames, ProbeState, Pto, INITIAL_PTO_BACKOFF};
 use crate::{
     byte_vec::ByteVec,
     clock::testing::Clock,
@@ -11,7 +11,10 @@ use crate::{
     packet::datagram::QueuePair,
     path::secret::map::Entry as PathSecretEntry,
     socket::channel::ByteCost,
-    stream3::frame::{Frame, Header, TransmissionStatus, DEFAULT_TTL},
+    stream3::{
+        endpoint::combinator::FrameBatch,
+        frame::{Frame, Header, TransmissionStatus, DEFAULT_TTL},
+    },
 };
 use bytes::Bytes;
 use core::time::Duration;
@@ -421,4 +424,160 @@ fn pto_backoff_sequence_matches_expected_probe_count() {
             i + 1
         );
     }
+}
+
+// ── publish_sender_load_score tests ──────────────────────────────────────────
+
+/// Build a `Context` backed by an entry that has `sender_count` pre-allocated sender slots.
+///
+/// `peer_data_addrs` is populated so that `Context::new` can resolve the destination address.
+fn make_context_with_sender_slots(
+    sender_count: usize,
+    registry: &Registry,
+) -> (Context, Arc<PathSecretEntry>) {
+    let peer: std::net::SocketAddr = "127.0.0.1:9999".parse().unwrap();
+    let entry = PathSecretEntry::fake_with_socket_senders(peer, None, sender_count);
+    entry.set_peer_data_addrs(&[peer]);
+    let ctx = Context::new(
+        &entry,
+        registry.register_queue_gauge("test.inflight"),
+        registry.register_queue_gauge("test.ack"),
+        registry.register_queue_gauge("test.pending"),
+        0,
+    )
+    .expect("Context::new should succeed with peer_data_addrs populated");
+    (ctx, entry)
+}
+
+/// `push_batch` must call `publish_sender_load_score` so that pick-two sees an up-to-date
+/// backlog immediately after frames are enqueued — not only after the next send or ACK.
+#[test]
+fn push_batch_immediately_refreshes_sender_load_score() {
+    let registry = Registry::default();
+    let (mut ctx, entry) = make_context_with_sender_slots(1, &registry);
+    let clock = make_clock(1000);
+
+    let score_before = entry.sender_load_score(0);
+    assert_eq!(score_before, 0, "initial load score should be 0");
+
+    let frame = make_frame(512);
+    let batch = FrameBatch::single(frame);
+    let _ = ctx.push_batch(batch, &clock);
+
+    let score_after = entry.sender_load_score(0);
+    assert!(
+        score_after > score_before,
+        "push_batch should refresh the sender load score immediately; score stayed at {score_before}"
+    );
+}
+
+/// A sender whose CCA is cwnd-limited (bytes_in_flight ≥ cwnd) should receive a congestion
+/// penalty of one smoothed RTT, making it look more loaded than an uncongested sender with
+/// the same queued bytes and the same wall-clock time.
+#[test]
+fn cwnd_limited_adds_rtt_penalty_to_load_score() {
+    let registry = Registry::default();
+    let (mut ctx_congested, entry_congested) = make_context_with_sender_slots(1, &registry);
+    let (ctx_idle, entry_idle) = make_context_with_sender_slots(1, &registry);
+
+    let clock = make_clock(1000);
+    let now: s2n_quic_core::time::Timestamp = clock.get_time().into();
+
+    // Fill up ctx_congested's inflight past cwnd to trigger is_congestion_limited().
+    // Send two packets that each exceed half the current cwnd.
+    let rtt_clone = ctx_congested.rtt_estimator.clone();
+    let cwnd = ctx_congested.cca.congestion_window();
+    let pkt_size = ((cwnd / 2).saturating_add(1)).clamp(1, u16::MAX as u32) as u16;
+    let _ = ctx_congested.cca.on_packet_sent(now, pkt_size, true, &rtt_clone);
+    let _ = ctx_congested.cca.on_packet_sent(now, pkt_size, true, &rtt_clone);
+
+    assert!(
+        ctx_congested.cca.is_congestion_limited(),
+        "ctx_congested should be cwnd-limited after filling inflight beyond cwnd={cwnd}"
+    );
+
+    // Publish with identical 'now' and zero queued bytes so the only difference is the penalty.
+    ctx_congested.publish_sender_load_score(now);
+    ctx_idle.publish_sender_load_score(now);
+
+    let score_congested = entry_congested.sender_load_score(0);
+    let score_idle = entry_idle.sender_load_score(0);
+
+    assert!(
+        score_congested > score_idle,
+        "cwnd-limited sender (score={score_congested}) should have a higher load score \
+         than an uncongested sender (score={score_idle})"
+    );
+
+    // The gap should be at least half a smoothed RTT.
+    let srtt_ns = ctx_congested.rtt_estimator.smoothed_rtt().as_nanos() as u64;
+    let delta = score_congested - score_idle;
+    assert!(
+        delta >= srtt_ns / 2,
+        "congestion penalty delta ({delta}) should be ≥ half of smoothed_rtt ({srtt_ns})"
+    );
+}
+
+/// When BBR's pacing gate is active (`earliest_departure_time` > `now`), the load score should
+/// use EDT as its base rather than `now`, so pacing-gated senders appear more loaded than idle
+/// senders at the same wall-clock time.
+///
+/// BBR pacing works in bursts: it sets EDT=now on the first send of a new burst (initialising
+/// the departure time) and advances EDT by `send_quantum / pacing_rate` on each subsequent
+/// burst.  Two back-to-back sends therefore leave EDT strictly in the future.
+#[test]
+fn edt_floor_raises_score_when_pacing_gated() {
+    let registry = Registry::default();
+    let (mut ctx_paced, entry_paced) = make_context_with_sender_slots(1, &registry);
+    let (ctx_idle, entry_idle) = make_context_with_sender_slots(1, &registry);
+
+    let clock = make_clock(1000);
+    let t0: s2n_quic_core::time::Timestamp = clock.get_time().into();
+
+    // Two back-to-back sends of a full quantum push EDT strictly into the future:
+    //   send #1 – BBR initialises next_packet_departure_time = t0 + INITIAL_INTERVAL (= t0)
+    //   send #2 – BBR advances EDT = max(EDT, t0) + interval = t0 + interval > t0
+    let rtt_clone = ctx_paced.rtt_estimator.clone();
+    let quantum = ctx_paced.cca.send_quantum().min(u16::MAX as usize) as u16;
+    let _ = ctx_paced.cca.on_packet_sent(t0, quantum, true, &rtt_clone);
+    let _ = ctx_paced.cca.on_packet_sent(t0, quantum, true, &rtt_clone);
+
+    let edt = ctx_paced
+        .cca
+        .earliest_departure_time()
+        .expect("BBR should set earliest_departure_time after two on_packet_sent calls");
+    assert!(
+        edt > t0,
+        "EDT should be strictly after t0; two sends should have advanced the pacing window"
+    );
+
+    // Choose `now` that is after t0 but still strictly before EDT so the floor kicks in.
+    // 1 ns is enough because the pacing interval (send_quantum / pacing_rate) is
+    // on the order of tens to hundreds of microseconds.
+    let now_before_edt = t0 + Duration::from_nanos(1);
+    assert!(
+        now_before_edt < edt,
+        "test setup: now_before_edt must be < edt for the floor to apply"
+    );
+
+    // Publish scores from both contexts at the same instant.
+    ctx_paced.publish_sender_load_score(now_before_edt);
+    ctx_idle.publish_sender_load_score(now_before_edt);
+
+    let score_paced = entry_paced.sender_load_score(0);
+    let score_idle = entry_idle.sender_load_score(0);
+
+    // The pacing-gated sender must not look cheaper than the idle sender.
+    assert!(
+        score_paced >= score_idle,
+        "pacing-gated sender (score={score_paced}) should appear at least as loaded as \
+         the idle sender (score={score_idle})"
+    );
+
+    // The paced score must be rooted at EDT, so it must be ≥ EDT expressed in nanoseconds.
+    let edt_ns = unsafe { edt.as_duration().as_nanos() as u64 };
+    assert!(
+        score_paced >= edt_ns,
+        "paced score ({score_paced}) should be ≥ EDT nanoseconds ({edt_ns})"
+    );
 }

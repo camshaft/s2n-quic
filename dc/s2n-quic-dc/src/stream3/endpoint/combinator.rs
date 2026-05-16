@@ -141,6 +141,15 @@ impl FrameBatch {
     }
 }
 
+#[cfg(test)]
+impl FrameBatch {
+    /// Wrap a single frame in a `FrameBatch`, for use in unit tests that need to
+    /// call `send::Context::push_batch` without going through the full combinator pipeline.
+    pub fn single(frame: Entry<Frame>) -> Self {
+        Self::new(frame)
+    }
+}
+
 impl ByteCost for FrameBatch {
     #[inline]
     fn byte_cost(&self) -> u64 {
