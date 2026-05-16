@@ -112,6 +112,46 @@ use std::{
 };
 use tracing::{debug, trace};
 
+/// The receive half of an `s2n-quic-dc` stream.
+///
+/// `Reader` presents an ordered byte stream even though the transport delivers
+/// datagrams out of order. Incoming payloads are reassembled internally and are
+/// only exposed to the application once the next contiguous bytes are ready.
+///
+/// # Expectations and guarantees
+///
+/// - Reads are in-order. Gaps stay hidden until missing data arrives.
+/// - `read_into` returning `Ok(0)` means EOF: the peer's FIN has been fully
+///   received and all preceding bytes have been consumed.
+/// - If the peer resets the stream after some bytes were already buffered,
+///   those buffered bytes are still readable before the reset becomes visible.
+/// - When the `tokio` feature is enabled, `Reader` also implements
+///   [`tokio::io::AsyncRead`].
+///
+/// # Footguns
+///
+/// - Server-side readers can start in a pending-validation state. Calling
+///   `read_into` before [`validate`](Self::validate) succeeds returns
+///   `InvalidInput`.
+/// - Dropping a reader before the peer finishes sending is treated as
+///   cancellation and sends `STOP_SENDING` to the peer.
+/// - [`peer_addr`](Self::peer_addr) is the handshake address associated with
+///   the path secret, not a promise about the exact data path currently in use.
+///
+/// # Example
+///
+/// ```ignore
+/// use s2n_quic_dc::stream::Reader;
+///
+/// async fn drain(mut reader: Reader) -> std::io::Result<Vec<u8>> {
+///     reader.validate().await?;
+///
+///     let mut body = Vec::new();
+///     while reader.read_to_end(&mut body).await?.is_complete() == false {}
+///
+///     Ok(body)
+/// }
+/// ```
 pub struct Reader(Box<Inner>);
 
 use super::coop::{self, Coop, HasCoop};
@@ -129,6 +169,7 @@ pub enum ReadToEnd {
 }
 
 impl ReadToEnd {
+    /// Returns `true` when [`Reader::read_to_end`] reached EOF.
     #[inline]
     pub fn is_complete(self) -> bool {
         matches!(self, Self::Complete)
@@ -271,16 +312,36 @@ impl Reader {
         }))
     }
 
+    /// Waits for the reader to become valid for application use.
+    ///
+    /// Client-side readers are already validated, so this is usually a no-op.
+    /// Server-side readers may need to wait until the transport confirms that
+    /// the incoming flow is acceptable.
+    ///
+    /// # Guarantees
+    ///
+    /// - Once this returns `Ok(())`, subsequent reads will no longer fail with
+    ///   "stream not yet validated".
+    /// - Calling it multiple times is harmless.
+    ///
+    /// # Footguns
+    ///
+    /// This method has no built-in timeout. If validation is part of a request
+    /// deadline, wrap it in your own timeout.
     pub async fn validate(&mut self) -> io::Result<()> {
         core::future::poll_fn(|cx| self.0.poll_validate(cx)).await
     }
 
-    /// Returns the stream identifier for this reader.
+    /// Returns the stream identifier assigned when the flow was created.
     #[inline]
     pub fn stream_id(&self) -> u64 {
         self.0.stream_id.as_u64()
     }
 
+    /// Returns the peer's handshake address for this stream.
+    ///
+    /// This is useful for logging and correlation. It is not a guarantee that
+    /// every data packet currently uses that exact socket address.
     #[inline]
     pub fn peer_addr(&self) -> SocketAddr {
         *self.0.path_secret_entry.peer()
@@ -295,6 +356,39 @@ impl Reader {
         self.0.reassembler.reset();
     }
 
+    /// Reads the next contiguous bytes into `buf`.
+    ///
+    /// The returned byte count may be smaller than `buf`'s remaining capacity.
+    /// A return value of `0` means EOF.
+    ///
+    /// # Semantics
+    ///
+    /// This call waits until one of the following happens:
+    ///
+    /// - contiguous stream data becomes available,
+    /// - the peer's FIN is fully consumed and EOF can be reported,
+    /// - a terminal error is ready to surface.
+    ///
+    /// Out-of-order packets may be received before this completes, but they stay
+    /// buffered until the missing prefix arrives.
+    ///
+    /// # Footguns
+    ///
+    /// - On pending server-side streams, call [`validate`](Self::validate)
+    ///   first.
+    /// - `Ok(0)` is EOF, not "no bytes available right now".
+    /// - Use a loop if you need to fill a buffer or drain the whole stream.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// async fn read_frame(reader: &mut s2n_quic_dc::stream::Reader) -> std::io::Result<Vec<u8>> {
+    ///     let mut frame = vec![0; 4096];
+    ///     let n = reader.read_into(&mut &mut frame[..]).await?;
+    ///     frame.truncate(n);
+    ///     Ok(frame)
+    /// }
+    /// ```
     pub async fn read_into<S>(&mut self, buf: &mut S) -> io::Result<usize>
     where
         S: buffer::writer::Storage,
@@ -314,6 +408,23 @@ impl Reader {
     /// remaining capacity (empty at call time or later filled for fixed-size
     /// storage), this method returns [`ReadToEnd::BufferFull`] so the caller can
     /// provide additional capacity and call again.
+    ///
+    /// # Footguns
+    ///
+    /// `BufferFull` does not mean EOF. It only means the stream still has data
+    /// left and the destination buffer needs more capacity.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// async fn collect_all(
+    ///     reader: &mut s2n_quic_dc::stream::Reader,
+    /// ) -> std::io::Result<Vec<u8>> {
+    ///     let mut out = Vec::new();
+    ///     while !reader.read_to_end(&mut out).await?.is_complete() {}
+    ///     Ok(out)
+    /// }
+    /// ```
     pub async fn read_to_end<S>(&mut self, buf: &mut S) -> io::Result<ReadToEnd>
     where
         S: buffer::writer::Storage,
@@ -329,6 +440,10 @@ impl Reader {
         }
     }
 
+    /// Poll-based form of [`read_into`](Self::read_into).
+    ///
+    /// This follows the usual `Future::poll` contract: on `Pending`, the reader
+    /// arranges for `cx.waker()` to be notified when progress may be possible.
     pub fn poll_read_into<S>(&mut self, cx: &mut Context, buf: &mut S) -> Poll<io::Result<usize>>
     where
         S: buffer::writer::Storage,

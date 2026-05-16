@@ -109,6 +109,45 @@ use std::{
 };
 use tracing::{debug, trace};
 
+/// The send half of an `s2n-quic-dc` stream.
+///
+/// `Writer` accepts an ordered byte stream from the application, fragments it
+/// into transport frames, and enforces both local inflight limits and the
+/// peer's advertised `MAX_DATA` credit.
+///
+/// # Expectations and guarantees
+///
+/// - Writes preserve byte order.
+/// - Successful writes only mean data was queued to the transport pipeline, not
+///   that the peer has already received or acknowledged it.
+/// - When the `tokio` feature is enabled, `Writer` implements
+///   [`tokio::io::AsyncWrite`].
+/// - After FIN is sent, further writes fail with `BrokenPipe`.
+///
+/// # Footguns
+///
+/// - [`write_from`](Self::write_from) and [`write_from_fin`](Self::write_from_fin)
+///   may consume only part of the source buffer. Use the `write_all_*` helpers
+///   if partial progress is inconvenient.
+/// - [`shutdown`](Self::shutdown) queues FIN but does not wait for it to be
+///   acknowledged.
+/// - Dropping a writer outside of a panic performs a best-effort shutdown. In a
+///   panic, the writer instead sends an abnormal reset and cancels queued work.
+///
+/// # Example
+///
+/// ```ignore
+/// use s2n_quic_core::stream::testing::Data;
+/// use s2n_quic_dc::stream::Writer;
+///
+/// async fn send_response(mut writer: Writer, len: u64) -> std::io::Result<()> {
+///     let mut body = Data::new(len);
+///     while !body.is_finished() {
+///         writer.write_from_fin(&mut body).await?;
+///     }
+///     Ok(())
+/// }
+/// ```
 pub struct Writer(Box<Inner>);
 
 struct Inner {
@@ -237,10 +276,24 @@ impl Writer {
         }))
     }
 
-    /// Writes the provided buffer to the stream
+    /// Writes bytes from `buf` into the stream.
     ///
-    /// Note that the stream may not write all of the provided data. If the application wants to flush
-    /// the entire buffer, prefer [`Self::write_all_from`] instead.
+    /// The writer may accept only part of the source buffer before returning.
+    /// If the caller needs to drain the entire buffer, prefer
+    /// [`write_all_from`](Self::write_all_from).
+    ///
+    /// # Semantics
+    ///
+    /// Progress can be limited by:
+    ///
+    /// - the peer's current `MAX_DATA` credit,
+    /// - the local inflight-byte budget,
+    /// - the current packet size.
+    ///
+    /// # Footguns
+    ///
+    /// A successful return does not mean the bytes were acknowledged. It only
+    /// means they were handed off to the transport pipeline.
     pub async fn write_from<S>(&mut self, buf: &mut S) -> io::Result<usize>
     where
         S: buffer::reader::storage::Infallible,
@@ -250,7 +303,12 @@ impl Writer {
 
     /// Write all data from a buffer
     ///
-    /// This method blocks until all of the data is written or the stream returns an error.
+    /// This method loops until `buf` is empty or the stream returns an error.
+    ///
+    /// # Guarantee
+    ///
+    /// On success, every byte that was present in `buf` when the call started
+    /// has been queued to the transport.
     pub async fn write_all_from<S>(&mut self, buf: &mut S) -> io::Result<usize>
     where
         S: buffer::reader::storage::Infallible,
@@ -264,11 +322,20 @@ impl Writer {
         }
     }
 
-    /// Write data from a buffer and send FIN
+    /// Writes bytes from `buf` and marks the stream finished once `buf` is empty.
     ///
-    /// Note that the stream may not write all of the provided data. This method signals to the transport
-    /// that the provided length is the final amount to send. If the application wants to flush
-    /// the entire buffer, prefer [`Self::write_all_from_fin`] instead.
+    /// If this call only consumes part of `buf`, FIN is not sent yet. FIN is
+    /// attached to the last chunk, which is the first successful call where the
+    /// provided buffer becomes empty.
+    ///
+    /// If the caller wants one call that keeps going until both the payload and
+    /// FIN are queued, prefer [`write_all_from_fin`](Self::write_all_from_fin).
+    ///
+    /// # Footguns
+    ///
+    /// Keep passing the same logical payload until the source buffer is empty.
+    /// Starting over with a new buffer after a partial return changes the final
+    /// stream contents.
     pub async fn write_from_fin<S>(&mut self, buf: &mut S) -> io::Result<usize>
     where
         S: buffer::reader::storage::Infallible,
@@ -278,7 +345,20 @@ impl Writer {
 
     /// Write all data from a buffer and send FIN
     ///
-    /// This method blocks until all of the data is written or the stream returns an error.
+    /// This method loops until the entire buffer has been queued and the final
+    /// chunk has been marked with FIN.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// async fn send_bytes(
+    ///     writer: &mut s2n_quic_dc::stream::Writer,
+    ///     mut bytes: &[u8],
+    /// ) -> std::io::Result<()> {
+    ///     writer.write_all_from_fin(&mut bytes).await?;
+    ///     Ok(())
+    /// }
+    /// ```
     pub async fn write_all_from_fin<S>(&mut self, buf: &mut S) -> io::Result<usize>
     where
         S: buffer::reader::storage::Infallible,
@@ -292,11 +372,19 @@ impl Writer {
         }
     }
 
+    /// Returns the peer's handshake address for this stream.
+    ///
+    /// This is primarily useful for diagnostics and request correlation.
     #[inline]
     pub fn peer_addr(&self) -> SocketAddr {
         *self.0.path_secret_entry.peer()
     }
 
+    /// Poll-based form of [`write_from`](Self::write_from) and
+    /// [`write_from_fin`](Self::write_from_fin).
+    ///
+    /// Pass `is_fin = true` when the remaining bytes in `buf` represent the end
+    /// of the stream.
     pub fn poll_write_from<S>(
         &mut self,
         cx: &mut Context,
@@ -309,6 +397,19 @@ impl Writer {
         self.0.poll_write_from(cx, buf, is_fin)
     }
 
+    /// Queues an empty FIN if the stream is still open.
+    ///
+    /// This is the explicit half-close operation for the write side.
+    ///
+    /// # Guarantees
+    ///
+    /// - It is idempotent.
+    /// - On success, the writer will not accept more application bytes.
+    ///
+    /// # Footguns
+    ///
+    /// Success only means FIN was queued locally. It does not mean the peer has
+    /// observed it yet.
     pub fn shutdown(&mut self) -> io::Result<()> {
         self.0.shutdown()
     }
