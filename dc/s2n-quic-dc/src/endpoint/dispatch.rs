@@ -413,6 +413,17 @@ fn dispatch_decoded_frame(
                 waker_sink,
             );
         }
+        Header::FlowInitFin { stream_id, offset } => {
+            handle_flow_init_fin(
+                peer,
+                credentials,
+                stream_id,
+                offset,
+                queue_dispatcher,
+                counters,
+                waker_sink,
+            );
+        }
         Header::Ack {
             dest_sender_id,
             ack_delay: ack_delay_micros,
@@ -1311,5 +1322,61 @@ fn handle_flow_init_reset(
         queue_id = local_queue_id.as_u64(),
         error_code = error_code.as_u64(),
         "FlowInitReset dispatched"
+    );
+}
+
+// ── FlowInitFin ───────────────────────────────────────────────────────────
+
+/// Handle a FlowInitFin frame: graceful FIN from a client that doesn't yet know
+/// the server's queue ID.
+///
+/// The client is in `FlowInitSent` state — it transmitted a FlowInit (with early
+/// data, `is_fin=false`) but has not yet received MAX_DATA. Rather than leaving the
+/// server reader blocked indefinitely, the client sends FlowInitFin with the total
+/// byte offset it has written so the server can deliver a proper EOF to the reader.
+///
+/// We look up the stream_id in the per-peer `flows` tracker, then dispatch a
+/// zero-payload FIN data chunk at `offset` to the stream queue. If the stream_id is
+/// not found (no FlowInit was registered, or the flow was already closed), we silently
+/// drop the frame. We never send a reset back in response.
+fn handle_flow_init_fin(
+    peer: &mut recv::Context,
+    credentials: &Credentials,
+    stream_id: VarInt,
+    offset: VarInt,
+    queue_dispatcher: &mut msg::queue::Dispatcher,
+    counters: &counters::Dispatch,
+    waker_sink: &mut impl channel::UnboundedSender<AutoWake>,
+) {
+    let Some(local_queue_id) = peer.flows.lookup(stream_id) else {
+        counters.rx_init_fin_unknown.add(1);
+        tracing::debug!(
+            stream_id = stream_id.as_u64(),
+            "FlowInitFin for unknown stream_id - dropping"
+        );
+        return;
+    };
+
+    let request = flow::Request {
+        credential_id: credentials.id,
+        stream_id,
+    };
+
+    counters.rx_init_fin.add(1);
+    let stream_entry = msg::Stream::Data {
+        offset,
+        fin: true,
+        payload: BytesMut::new(),
+    }
+    .into();
+    if let Ok(waker) = queue_dispatcher.send_stream(local_queue_id, None, &request, stream_entry) {
+        let _ = waker_sink.send(waker);
+    }
+
+    tracing::debug!(
+        stream_id = stream_id.as_u64(),
+        queue_id = local_queue_id.as_u64(),
+        offset = offset.as_u64(),
+        "FlowInitFin dispatched"
     );
 }

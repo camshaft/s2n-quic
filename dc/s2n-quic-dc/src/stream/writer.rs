@@ -35,12 +35,9 @@
 //   `send_flow_init_reset_frame()` when the server's queue ID is unknown, allowing
 //   the server to look up the stream via stream_id and dispatch the reset to the queues.
 //
-// * FlowInitSent FIN gap: when the writer is dropped/shut down GRACEFULLY while in
-//   FlowInitSent (before MAX_DATA arrives), no FIN reaches the peer. `send_fin_packet()`
-//   only handles Init and Open. A FIN retransmission (re-sending FlowInit with is_fin:
-//   true) is dropped by the server's attempt dedup (same attempt_id). A proper fix
-//   requires server-side changes to handle is_fin on a duplicate FlowInit.
-//   Applications should avoid graceful shutdown in FlowInitSent state.
+// * [FIXED] FlowInitSent FIN gap: `send_fin_packet()` now handles FlowInitSent by
+//   sending a FlowInitFin frame with the current write offset. The server looks up
+//   the stream via stream_id and dispatches a FIN data chunk to the stream queue.
 //
 // Flow control:
 //
@@ -491,6 +488,12 @@ impl Inner {
         }
 
         if self.status.is_flow_init_sent() {
+            if is_fin && buf.buffer_is_empty() {
+                // Buffer is empty and the caller wants to close the write side.
+                // Send FlowInitFin so the server can deliver EOF before MAX_DATA arrives.
+                self.send_fin_packet()?;
+                return Poll::Ready(Ok(0));
+            }
             trace!(
                 stream_id = self.stream_id.as_u64(),
                 "Writer blocked in FlowInitSent - waiting for remote MAX_DATA"
@@ -599,9 +602,51 @@ impl Inner {
         Ok(())
     }
 
+    fn send_flow_init_fin_frame(&mut self) -> io::Result<()> {
+        // Only meaningful when the server already received our FlowInit.
+        if !self.status.is_flow_init_sent() {
+            debug!(
+                stream_id = self.stream_id.as_u64(),
+                "Not sending FlowInitFin - FlowInit was never sent"
+            );
+            return Ok(());
+        }
+
+        let frame = Frame {
+            source_sender_id: VarInt::MAX,
+            header: Header::FlowInitFin {
+                stream_id: self.stream_id,
+                offset: self.next_offset,
+            },
+            payload: ByteVec::new(),
+            path_secret_entry: self.path_secret_entry.clone(),
+            completion: Some(self.completion_rx.sender()),
+            status: frame::TransmissionStatus::default(),
+            ttl: DEFAULT_TTL,
+            transmission_time: None,
+        };
+
+        self.send_frame(frame)?;
+
+        debug!(
+            stream_id = self.stream_id.as_u64(),
+            offset = self.next_offset.as_u64(),
+            "Sent FlowInitFin"
+        );
+
+        self.status.on_send_fin().unwrap();
+
+        Ok(())
+    }
+
     fn send_fin_packet(&mut self) -> io::Result<()> {
         if self.status.is_init() {
             self.send_flow_init_with_early_data(&mut buffer::reader::storage::Empty, true)?;
+        } else if self.status.is_flow_init_sent() {
+            // FlowInit was sent but MAX_DATA (server queue ID) not yet received.
+            // Use FlowInitFin so the server can look up the stream via stream_id and
+            // deliver EOF to the reader at the correct offset.
+            self.send_flow_init_fin_frame()?;
         } else if self.status.is_open() {
             let queue_pair = QueuePair {
                 source_queue_id: self.control_rx.queue_id(),
@@ -632,9 +677,6 @@ impl Inner {
             debug!(stream_id = self.stream_id.as_u64(), "Sent FIN");
             self.status.on_send_fin().unwrap();
         }
-        // FlowInitSent: FIN cannot be delivered (server drops duplicate FlowInit by dedup).
-        // The FlowInitReset path handles error/reset cases; graceful FIN in this state
-        // requires the application to wait for MAX_DATA before shutting down.
 
         Ok(())
     }
