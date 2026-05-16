@@ -391,6 +391,17 @@ pub enum Header {
         stream_id: VarInt,
         error_code: VarInt,
     },
+    /// Graceful FIN before flow establishment (client doesn't know server's queue ID yet).
+    ///
+    /// Sent when the client has written early data in a FlowInit (is_fin=false) and then
+    /// wants to signal the end of the write side before MAX_DATA arrives. The server
+    /// looks up the stream_id → queue_id mapping and dispatches a FIN at `offset` to the
+    /// stream queue.  `offset` is the total number of payload bytes already sent in the
+    /// FlowInit so the reader can close the stream correctly.
+    FlowInitFin {
+        stream_id: VarInt,
+        offset: VarInt,
+    },
     /// Client response to a FlowValidateRequest
     FlowInitValidate {
         queue_pair: QueuePair,
@@ -429,6 +440,7 @@ impl Header {
     const FLOW_RESET_STREAM_TYPE: u8 = 9;
     const FLOW_RESET_CONTROL_TYPE: u8 = 10;
     const FLOW_INIT_RESET_TYPE: u8 = 11;
+    const FLOW_INIT_FIN_TYPE: u8 = 12;
     const ACK_TYPE: u8 = 14;
     const ACK_ECN_TYPE: u8 = 15;
     const ACK_ELICITING_TYPE: u8 = 16;
@@ -447,6 +459,7 @@ impl Header {
             Self::FlowData { .. } => Priority::FlowData,
             Self::FlowControl { .. } => Priority::FlowControl,
             Self::FlowReset { .. } | Self::FlowInitReset { .. } => Priority::FlowReset,
+            Self::FlowInitFin { .. } => Priority::FlowControl,
             Self::FlowInitValidate { .. } | Self::FlowValidateRequest { .. } => Priority::FlowRetry,
             // Ack frames are assembled directly from pending_acks, never queued by priority.
             Self::Ack { .. } => Priority::FlowControl,
@@ -482,6 +495,7 @@ impl Header {
             | Self::Ack { .. } => true,
             Self::FlowReset { .. }
             | Self::FlowInitReset { .. }
+            | Self::FlowInitFin { .. }
             | Self::FlowInitValidate { .. }
             | Self::FlowValidateRequest { .. } => false,
         }
@@ -599,6 +613,11 @@ impl EncoderValue for Header {
                 encoder.encode(&Self::FLOW_INIT_RESET_TYPE);
                 encoder.encode(stream_id);
                 encoder.encode(error_code);
+            }
+            Self::FlowInitFin { stream_id, offset } => {
+                encoder.encode(&Self::FLOW_INIT_FIN_TYPE);
+                encoder.encode(stream_id);
+                encoder.encode(offset);
             }
             Self::Ack {
                 dest_sender_id,
@@ -723,6 +742,11 @@ impl<'a> s2n_codec::DecoderValue<'a> for Header {
                 let (stream_id, buffer) = buffer.decode()?;
                 let (error_code, buffer) = buffer.decode()?;
                 Ok((Self::FlowInitReset { stream_id, error_code }, buffer))
+            }
+            Self::FLOW_INIT_FIN_TYPE => {
+                let (stream_id, buffer) = buffer.decode()?;
+                let (offset, buffer) = buffer.decode()?;
+                Ok((Self::FlowInitFin { stream_id, offset }, buffer))
             }
             Self::ACK_TYPE
             | Self::ACK_ECN_TYPE
