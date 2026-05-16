@@ -276,7 +276,7 @@ impl Writer {
         }))
     }
 
-    /// Writes bytes from `buf` into the stream.
+    /// Writes bytes from the source buffer into the stream.
     ///
     /// The writer may accept only part of the source buffer before returning.
     /// If the caller needs to drain the entire buffer, prefer
@@ -322,7 +322,8 @@ impl Writer {
         }
     }
 
-    /// Writes bytes from `buf` and marks the stream finished once `buf` is empty.
+    /// Writes bytes from the source buffer and marks the stream finished once
+    /// that buffer is empty.
     ///
     /// If this call only consumes part of `buf`, FIN is not sent yet. FIN is
     /// attached to the last chunk, which is the first successful call where the

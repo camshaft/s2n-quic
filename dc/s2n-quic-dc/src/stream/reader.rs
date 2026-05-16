@@ -147,7 +147,7 @@ use tracing::{debug, trace};
 ///     reader.validate().await?;
 ///
 ///     let mut body = Vec::new();
-///     while reader.read_to_end(&mut body).await?.is_complete() == false {}
+///     while !reader.read_to_end(&mut body).await?.is_complete() {}
 ///
 ///     Ok(body)
 /// }
@@ -356,7 +356,7 @@ impl Reader {
         self.0.reassembler.reset();
     }
 
-    /// Reads the next contiguous bytes into `buf`.
+    /// Reads the next contiguous bytes into the destination buffer.
     ///
     /// The returned byte count may be smaller than `buf`'s remaining capacity.
     /// A return value of `0` means EOF.
