@@ -451,23 +451,35 @@ fn make_context_with_sender_slots(
 
 /// `push_batch` must call `publish_sender_load_score` so that pick-two sees an up-to-date
 /// backlog immediately after frames are enqueued — not only after the next send or ACK.
+///
+/// The test verifies that the score includes the enqueued frame's drain delay, not merely
+/// that a timestamp was written.  It does so by comparing against an empty-queue baseline
+/// published at the same instant: if the drain delay were missing, the two scores would
+/// be equal.
 #[test]
 fn push_batch_immediately_refreshes_sender_load_score() {
     let registry = Registry::default();
     let (mut ctx, entry) = make_context_with_sender_slots(1, &registry);
     let clock = make_clock(1000);
+    let now: s2n_quic_core::time::Timestamp = clock.get_time().into();
 
-    let score_before = entry.sender_load_score(0);
-    assert_eq!(score_before, 0, "initial load score should be 0");
+    // Establish a baseline: score with no queued frames at this instant.
+    ctx.publish_sender_load_score(now);
+    let score_empty_queue = entry.sender_load_score(0);
 
+    // Enqueue a frame with a non-trivial payload.
     let frame = make_frame(512);
     let batch = FrameBatch::single(frame);
     let _ = ctx.push_batch(batch, &clock);
 
-    let score_after = entry.sender_load_score(0);
+    // push_batch must have refreshed the score and the new score must be strictly
+    // higher than the empty-queue baseline — the difference is the drain delay for
+    // the enqueued bytes.
+    let score_with_frame = entry.sender_load_score(0);
     assert!(
-        score_after > score_before,
-        "push_batch should refresh the sender load score immediately; score stayed at {score_before}"
+        score_with_frame > score_empty_queue,
+        "push_batch should include the enqueued frame's drain delay in the score; \
+         empty_queue={score_empty_queue}, with_frame={score_with_frame}"
     );
 }
 
@@ -509,12 +521,14 @@ fn cwnd_limited_adds_rtt_penalty_to_load_score() {
          than an uncongested sender (score={score_idle})"
     );
 
-    // The gap should be at least half a smoothed RTT.
+    // The gap must be at least one full smoothed RTT (the congestion penalty is exactly
+    // one smoothed RTT).  Timestamps are microsecond-granular so allow up to 1 µs of
+    // rounding error in the stored score.
     let srtt_ns = ctx_congested.rtt_estimator.smoothed_rtt().as_nanos() as u64;
     let delta = score_congested - score_idle;
     assert!(
-        delta >= srtt_ns / 2,
-        "congestion penalty delta ({delta}) should be ≥ half of smoothed_rtt ({srtt_ns})"
+        delta + 1000 >= srtt_ns,
+        "congestion penalty delta ({delta} ns) should be ≈ one full smoothed_rtt ({srtt_ns} ns)"
     );
 }
 
@@ -552,9 +566,9 @@ fn edt_floor_raises_score_when_pacing_gated() {
     );
 
     // Choose `now` that is after t0 but still strictly before EDT so the floor kicks in.
-    // 1 ns is enough because the pacing interval (send_quantum / pacing_rate) is
-    // on the order of tens to hundreds of microseconds.
-    let now_before_edt = t0 + Duration::from_nanos(1);
+    // Use 1 µs — the minimum Timestamp increment — rather than 1 ns (which would be
+    // rounded back to t0 due to Timestamp's microsecond granularity).
+    let now_before_edt = t0 + Duration::from_micros(1);
     assert!(
         now_before_edt < edt,
         "test setup: now_before_edt must be < edt for the floor to apply"
