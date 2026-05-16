@@ -216,6 +216,7 @@ impl DroppedPackets {
 
                     while let Some(stream) = acceptor.recv().await {
                         async move {
+                            let stream = stream.validate().await.expect("server validate");
                             let (mut reader, mut writer) = stream.into_split();
 
                             let mut request = BytesMut::with_capacity(body_len);
