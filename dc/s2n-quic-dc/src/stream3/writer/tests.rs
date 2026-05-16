@@ -952,7 +952,7 @@ fn client_peer_dead_during_flow_init_sent_no_reset() {
 /// the drop calls shutdown() → send_fin_packet() → send_flow_init_fin_frame(),
 /// which sends FlowInitFin to let the server deliver EOF to the reader.
 #[test]
-fn client_drop_in_flow_init_sent_cannot_send_fin() {
+fn client_drop_in_flow_init_sent_sends_flow_init_fin() {
     crate::testing::sim(|| {
         use crate::testing::ext::*;
 
@@ -998,11 +998,10 @@ fn client_drop_in_flow_init_sent_cannot_send_fin() {
     });
 }
 
-/// PeerDead completion failure during FlowInitSent: send_reset_frame now falls
-/// back to send_flow_init_reset_frame(), but PeerDead does not invoke that path
-/// (the error surfaces as TimedOut without emitting a reset frame).
+/// PeerDead completion failure during FlowInitSent: no FlowInitReset because the
+/// peer is unreachable (it makes no difference whether we send it or not).
 #[test]
-fn client_reset_during_flow_init_sent_is_silent() {
+fn client_peer_dead_during_flow_init_sent_no_reset_silent() {
     crate::testing::sim(|| {
         use crate::testing::ext::*;
 
