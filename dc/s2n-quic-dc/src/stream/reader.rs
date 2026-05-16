@@ -202,6 +202,10 @@ struct Inner {
     status: Status,
     /// Reset error code if the stream was reset by the peer
     reset_error_code: Option<VarInt>,
+    /// Tracks whether EOF has already been surfaced once in debug builds so we
+    /// can catch applications spinning on repeated `Ok(0)` reads.
+    #[cfg(debug_assertions)]
+    eof_reported: bool,
     /// Cooperative yield budget
     coop: Coop,
 }
@@ -256,6 +260,8 @@ impl Reader {
             send_flow_update_after_fin: false,
             status: Status::Open,
             reset_error_code: None,
+            #[cfg(debug_assertions)]
+            eof_reported: false,
             coop: Coop::default(),
         }))
     }
@@ -282,6 +288,8 @@ impl Reader {
             send_flow_update_after_fin: !peer_fin_received,
             status: Status::Open,
             reset_error_code: None,
+            #[cfg(debug_assertions)]
+            eof_reported: false,
             coop: Coop::default(),
         }))
     }
@@ -308,6 +316,8 @@ impl Reader {
             send_flow_update_after_fin: !peer_fin_received,
             status: Status::PendingValidation,
             reset_error_code: None,
+            #[cfg(debug_assertions)]
+            eof_reported: false,
             coop: Coop::default(),
         }))
     }
@@ -463,6 +473,26 @@ impl HasCoop for Inner {
 
 impl Inner {
     #[inline]
+    fn ready_eof(&mut self) -> Poll<io::Result<usize>> {
+        self.on_eof_returned();
+        Poll::Ready(Ok(0))
+    }
+
+    #[cfg(debug_assertions)]
+    #[inline]
+    fn on_eof_returned(&mut self) {
+        debug_assert!(
+            !self.eof_reported,
+            "Reader returned EOF more than once; applications must stop reading after Ok(0)"
+        );
+        self.eof_reported = true;
+    }
+
+    #[cfg(not(debug_assertions))]
+    #[inline]
+    fn on_eof_returned(&mut self) {}
+
+    #[inline]
     fn poll_validate(&mut self, cx: &mut Context) -> Poll<io::Result<()>> {
         self.poll_completions(cx)?;
 
@@ -503,7 +533,7 @@ impl Inner {
         // Once the stream is fully consumed, signal EOF without touching the
         // (potentially already-closed) stream channel.
         if self.status.is_complete() {
-            return Poll::Ready(Ok(0));
+            return self.ready_eof();
         }
 
         // If the stream was previously reset, drain any buffered data first
@@ -582,6 +612,9 @@ impl Inner {
                 "Reader complete - all data consumed"
             );
             self.status.on_complete().ok();
+            if bytes_read == 0 {
+                return self.ready_eof();
+            }
             return Poll::Ready(Ok(bytes_read));
         }
 
