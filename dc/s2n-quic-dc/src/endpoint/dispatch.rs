@@ -1362,7 +1362,6 @@ fn handle_flow_init_fin(
         stream_id,
     };
 
-    counters.rx_init_fin.add(1);
     let stream_entry = msg::Stream::Data {
         offset,
         fin: true,
