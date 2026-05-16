@@ -382,13 +382,13 @@ impl Reader {
     /// # Example
     ///
     /// ```ignore
-    /// async fn read_frame(reader: &mut s2n_quic_dc::stream::Reader) -> std::io::Result<Vec<u8>> {
-    ///     let mut frame = vec![0; 4096];
-    ///     let n = reader.read_into(&mut &mut frame[..]).await?;
-    ///     frame.truncate(n);
-    ///     Ok(frame)
-    /// }
-    /// ```
+/// async fn read_frame(reader: &mut s2n_quic_dc::stream::Reader) -> std::io::Result<Vec<u8>> {
+///     let mut frame = vec![0; 4096];
+///     let n = reader.read_into(&mut frame[..]).await?;
+///     frame.truncate(n);
+///     Ok(frame)
+/// }
+/// ```
     pub async fn read_into<S>(&mut self, buf: &mut S) -> io::Result<usize>
     where
         S: buffer::writer::Storage,
