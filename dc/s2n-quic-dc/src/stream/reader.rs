@@ -338,10 +338,11 @@ impl Reader {
         self.0.stream_id.as_u64()
     }
 
-    /// Returns the peer's handshake address for this stream.
+    /// Returns the peer endpoint address used to identify this stream.
     ///
-    /// This is useful for logging and correlation. It is not a guarantee that
-    /// every data packet currently uses that exact socket address.
+    /// This is the address the client provided to `connect`, so it is the
+    /// stable endpoint identity for the peer even if data is exchanged across
+    /// multiple data paths.
     #[inline]
     pub fn peer_addr(&self) -> SocketAddr {
         *self.0.path_secret_entry.peer()
@@ -379,15 +380,17 @@ impl Reader {
     /// - `Ok(0)` is EOF, not "no bytes available right now".
     /// - Use a loop if you need to fill a buffer or drain the whole stream.
     ///
-/// # Example
-///
-/// ```ignore
-/// async fn read_frame(reader: &mut s2n_quic_dc::stream::Reader) -> std::io::Result<Vec<u8>> {
-///     let mut frame = [0; 4096];
-///     let n = reader.read_into(&mut frame[..]).await?;
-///     Ok(frame[..n].to_vec())
-/// }
-/// ```
+    /// # Example
+    ///
+    /// ```ignore
+    /// async fn read_frame(
+    ///     reader: &mut s2n_quic_dc::stream::Reader,
+    /// ) -> std::io::Result<Vec<u8>> {
+    ///     let mut frame = [0; 4096];
+    ///     let n = reader.read_into(&mut frame[..]).await?;
+    ///     Ok(frame[..n].to_vec())
+    /// }
+    /// ```
     pub async fn read_into<S>(&mut self, buf: &mut S) -> io::Result<usize>
     where
         S: buffer::writer::Storage,

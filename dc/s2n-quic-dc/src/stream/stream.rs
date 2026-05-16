@@ -108,7 +108,11 @@ impl Stream {
         (self.read, self.write)
     }
 
-    /// Returns the peer's handshake address for this stream.
+    /// Returns the peer endpoint address used to identify this stream.
+    ///
+    /// This is the address the client provided to `connect`, so it remains the
+    /// stable peer identity even if data is exchanged across multiple data
+    /// paths.
     #[inline]
     pub fn peer_addr(&self) -> SocketAddr {
         self.read.peer_addr()

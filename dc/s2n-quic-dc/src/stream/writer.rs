@@ -122,7 +122,8 @@ use tracing::{debug, trace};
 ///   that the peer has already received or acknowledged it.
 /// - When the `tokio` feature is enabled, `Writer` implements
 ///   [`tokio::io::AsyncWrite`].
-/// - After FIN is sent, further writes fail with `BrokenPipe`.
+/// - After FIN is sent, further writes are rejected. Today that surfaces as
+///   `BrokenPipe`.
 ///
 /// # Footguns
 ///
@@ -370,9 +371,10 @@ impl Writer {
         }
     }
 
-    /// Returns the peer's handshake address for this stream.
+    /// Returns the peer endpoint address used to identify this stream.
     ///
-    /// This is primarily useful for diagnostics and request correlation.
+    /// This is the address the client provided to `connect`, so it remains the
+    /// stable peer identity even if data is sent across multiple data paths.
     #[inline]
     pub fn peer_addr(&self) -> SocketAddr {
         *self.0.path_secret_entry.peer()
