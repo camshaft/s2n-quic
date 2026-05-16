@@ -371,10 +371,10 @@ impl Writer {
         }
     }
 
-    /// Returns the peer endpoint address used to identify this stream.
+    /// Returns the handshake peer address used to identify this stream.
     ///
-    /// This is the address the client provided to `connect`, so it remains the
-    /// stable peer identity even if data is sent across multiple data paths.
+    /// This remains the stable peer identity even if data is sent across
+    /// multiple data paths.
     #[inline]
     pub fn peer_addr(&self) -> SocketAddr {
         *self.0.path_secret_entry.peer()
@@ -397,7 +397,7 @@ impl Writer {
         self.0.poll_write_from(cx, buf, is_fin)
     }
 
-    /// Queues an empty FIN if the stream is still open.
+    /// Locally half-closes the write side of the stream.
     ///
     /// This is the explicit half-close operation for the write side.
     ///
@@ -408,8 +408,12 @@ impl Writer {
     ///
     /// # Footguns
     ///
-    /// Success only means FIN was queued locally. It does not mean the peer has
-    /// observed it yet.
+    /// - Success does not guarantee a FIN frame was emitted immediately. In
+    ///   particular, if shutdown happens while the writer is still waiting for
+    ///   flow establishment (`FlowInitSent`), the local shutdown succeeds but
+    ///   no FIN can be sent yet because the peer queue ID is still unknown.
+    /// - Even when a FIN frame is emitted, success only means it was queued
+    ///   locally. It does not mean the peer has observed it yet.
     pub fn shutdown(&mut self) -> io::Result<()> {
         self.0.shutdown()
     }

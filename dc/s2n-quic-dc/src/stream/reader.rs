@@ -351,11 +351,10 @@ impl Reader {
         self.0.stream_id.as_u64()
     }
 
-    /// Returns the peer endpoint address used to identify this stream.
+    /// Returns the handshake peer address used to identify this stream.
     ///
-    /// This is the address the client provided to `connect`, so it is the
-    /// stable endpoint identity for the peer even if data is exchanged across
-    /// multiple data paths.
+    /// This is the stable endpoint identity for the peer, even if data is
+    /// exchanged across multiple data paths.
     #[inline]
     pub fn peer_addr(&self) -> SocketAddr {
         *self.0.path_secret_entry.peer()
@@ -430,6 +429,13 @@ impl Reader {
     ///
     /// `BufferFull` does not mean EOF. It only means the stream still has data
     /// left and the destination buffer needs more capacity.
+    ///
+    /// Zero-copy, vectored destinations such as [`crate::byte_vec::ByteVec`]
+    /// preserve the received chunking, which often means many small MTU-sized
+    /// [`bytes::Bytes`] values. That can be a good fit for short-lived or
+    /// scatter/gather processing, but if the buffered value will stay resident
+    /// in memory for a while it is usually better to copy it into a more
+    /// compact layout once enough bytes have accumulated.
     ///
     /// # Example
     ///

@@ -60,10 +60,14 @@ impl Stream {
         Self { read, write }
     }
 
-    /// Resets both halves of the stream, sending a single `FlowReset` to the peer.
+    /// Resets both halves of the stream and tries to notify the peer with a
+    /// `FlowReset`.
     ///
-    /// This transitions both the Reader and Writer to their terminal states so their
-    /// Drop impls are no-ops. Only one FlowReset packet is sent (from the Reader side).
+    /// This transitions both the Reader and Writer to their terminal states so
+    /// their Drop impls are no-ops. Reset notification is attempted from the
+    /// Reader side; if the read half is already terminal or the flow is not yet
+    /// fully established, this may become a local-only reset with no
+    /// `FlowReset` emitted.
     ///
     /// Use this when the entire stream should fail immediately and any queued or
     /// future I/O should stop.
@@ -108,11 +112,10 @@ impl Stream {
         (self.read, self.write)
     }
 
-    /// Returns the peer endpoint address used to identify this stream.
+    /// Returns the handshake peer address used to identify this stream.
     ///
-    /// This is the address the client provided to `connect`, so it remains the
-    /// stable peer identity even if data is exchanged across multiple data
-    /// paths.
+    /// This remains the stable peer identity even if data is exchanged across
+    /// multiple data paths.
     #[inline]
     pub fn peer_addr(&self) -> SocketAddr {
         self.read.peer_addr()
