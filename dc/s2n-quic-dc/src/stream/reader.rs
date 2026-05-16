@@ -133,6 +133,9 @@ use tracing::{debug, trace};
 /// - Server-side readers can start in a pending-validation state. Calling
 ///   `read_into` before [`validate`](Self::validate) succeeds returns
 ///   `InvalidInput`.
+/// - In debug builds, repeatedly calling `read_into` after it already returned
+///   `Ok(0)` triggers a debug assertion so applications notice accidental
+///   post-EOF spin loops.
 /// - Dropping a reader before the peer finishes sending is treated as
 ///   cancellation and sends `STOP_SENDING` to the peer.
 /// - [`peer_addr`](Self::peer_addr) is the handshake address associated with
@@ -202,10 +205,10 @@ struct Inner {
     status: Status,
     /// Reset error code if the stream was reset by the peer
     reset_error_code: Option<VarInt>,
-    /// Tracks whether EOF has already been surfaced once in debug builds so we
-    /// can catch applications spinning on repeated `Ok(0)` reads.
+    /// Tracks how many times EOF has been surfaced in debug builds so we can
+    /// catch applications spinning on repeated `Ok(0)` reads.
     #[cfg(debug_assertions)]
-    eof_reported: bool,
+    eof_counter: u8,
     /// Cooperative yield budget
     coop: Coop,
 }
@@ -261,7 +264,7 @@ impl Reader {
             status: Status::Open,
             reset_error_code: None,
             #[cfg(debug_assertions)]
-            eof_reported: false,
+            eof_counter: 0,
             coop: Coop::default(),
         }))
     }
@@ -289,7 +292,7 @@ impl Reader {
             status: Status::Open,
             reset_error_code: None,
             #[cfg(debug_assertions)]
-            eof_reported: false,
+            eof_counter: 0,
             coop: Coop::default(),
         }))
     }
@@ -317,7 +320,7 @@ impl Reader {
             status: Status::PendingValidation,
             reset_error_code: None,
             #[cfg(debug_assertions)]
-            eof_reported: false,
+            eof_counter: 0,
             coop: Coop::default(),
         }))
     }
@@ -388,6 +391,8 @@ impl Reader {
     /// - On pending server-side streams, call [`validate`](Self::validate)
     ///   first.
     /// - `Ok(0)` is EOF, not "no bytes available right now".
+    /// - In debug builds, repeatedly calling `read_into` after the first
+    ///   `Ok(0)` triggers a debug assertion to catch EOF polling loops.
     /// - Use a loop if you need to fill a buffer or drain the whole stream.
     ///
     /// # Example
@@ -481,11 +486,13 @@ impl Inner {
     #[cfg(debug_assertions)]
     #[inline]
     fn on_eof_returned(&mut self) {
+        self.eof_counter = self.eof_counter.saturating_add(1);
         debug_assert!(
-            !self.eof_reported,
-            "Reader returned EOF more than once; applications must stop reading after Ok(0)"
+            self.eof_counter <= 1,
+            "Reader returned EOF {} times on stream {}. `read_into` returning Ok(0) means the peer's FIN was fully consumed and no more data will arrive. Stop calling `read_into` after the first Ok(0); repeated post-EOF reads usually mean the application treated EOF as \"try again later\".",
+            self.eof_counter,
+            self.stream_id.as_u64(),
         );
-        self.eof_reported = true;
     }
 
     #[cfg(not(debug_assertions))]
