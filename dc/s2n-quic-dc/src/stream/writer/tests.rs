@@ -754,37 +754,175 @@ fn panic_drop_sends_abnormal_termination_reset() {
     });
 }
 
-// ─── Flow init protocol gap tests ───────────────────────────────────────────
+// ─── FlowInitReset tests ─────────────────────────────────────────────────────
 //
-// PROTOCOL GAP: FlowInitSent → peer notification failure
+// The tests below document the behavior of the FlowInitReset message, which is
+// sent when the client needs to reset a stream in FlowInitSent state (before
+// MAX_DATA arrives and the server queue ID becomes known).
 //
-// When a client writer is abandoned during FlowInitSent (before the peer's
-// MAX_DATA response arrives), neither FIN nor FlowReset can reach the peer:
-//
-//   - `send_fin_packet()` is a no-op in FlowInitSent (only handles Init and Open).
-//   - `send_reset_frame()` requires `remote_queue_id` which is only set once
-//     the peer's MAX_DATA arrives (flow establishment).
-//
-// The consequence is that the peer (which already accepted the FlowInit, created
-// a reader, and possibly buffered early data) will hang indefinitely waiting for
-// more data or a FIN that never arrives. There is no stream-level idle timeout
-// on the reader side.
-//
-// Potential fix: `send_fin_packet()` should handle FlowInitSent by re-sending
-// the FlowInit frame with `is_fin: true`. The FlowInit header routes via
-// `dest_acceptor_id` (not `remote_queue_id`), so it can always be sent. The
-// peer's dedup logic would see the same stream_id and treat the FIN-bearing
-// retransmission as a final-size update on the already-accepted flow.
-//
-// The three tests below (client_drop_in_flow_init_sent_cannot_send_fin,
-// client_shutdown_during_flow_init_sent, client_panic_drop_during_flow_init_sent)
-// all document this gap. They will need updating when a fix lands.
+// The remaining FIN gap (graceful shutdown in FlowInitSent) is not addressed
+// here — applications should wait for MAX_DATA before gracefully shutting down.
 
-/// Dropping a client writer while in FlowInitSent (before MAX_DATA arrives)
-/// cannot send FIN or Reset because remote_queue_id is unknown. The peer that
-/// accepted the FlowInit gets no notification and will hang waiting for data.
-///
-/// See "PROTOCOL GAP" comment block above for full analysis.
+/// Panic drop while in FlowInitSent: FlowInitReset is sent so the server can
+/// look up the stream via stream_id and terminate both queues.
+#[test]
+fn client_panic_drop_during_flow_init_sent_sends_flow_init_reset() {
+    crate::testing::sim(|| {
+        use crate::testing::ext::*;
+
+        let (mut writer, mut pusher) = PairBuilder::client_no_remote_queue_id().build();
+
+        async move {
+            // FlowInit arrives first
+            let frames = pusher.recv_frames().await;
+            assert_eq!(frames.len(), 1);
+            assert!(matches!(
+                frames.front().unwrap().header,
+                Header::FlowInit { is_fin: false, .. }
+            ));
+
+            // FlowInitReset follows on panic
+            let reset = pusher
+                .recv_frames_timeout(Duration::from_secs(1))
+                .await
+                .expect("expected FlowInitReset after panic drop");
+            assert_eq!(reset.len(), 1);
+            assert!(
+                matches!(
+                    reset.front().unwrap().header,
+                    Header::FlowInitReset {
+                        error_code,
+                        ..
+                    } if error_code == reset_error::ABNORMAL_TERMINATION
+                ),
+                "expected FlowInitReset(ABNORMAL_TERMINATION) on panic in FlowInitSent"
+            );
+        }
+        .primary()
+        .spawn();
+
+        async move {
+            let mut payload = Bytes::from_static(b"hello");
+            let written = writer.write_from(&mut payload).await.expect("first write");
+            assert_eq!(written, 5);
+            assert!(writer.0.status.is_flow_init_sent());
+
+            let panic_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                let _writer = writer;
+                panic!("intentional test panic during FlowInitSent");
+            }));
+            assert!(panic_result.is_err());
+        }
+        .primary()
+        .spawn();
+    });
+}
+
+/// TransmissionError during FlowInitSent: FlowInitReset is sent so the server
+/// can look up the stream by stream_id and terminate the queues.
+#[test]
+fn client_transmission_error_during_flow_init_sent_sends_flow_init_reset() {
+    crate::testing::sim(|| {
+        use crate::testing::ext::*;
+
+        let (mut writer, mut pusher) = PairBuilder::client_no_remote_queue_id().build();
+
+        async move {
+            let frames = pusher.recv_frames().await;
+            assert_eq!(frames.len(), 1);
+            pusher.complete_all(
+                frames,
+                frame::TransmissionStatus::Failed(frame::FailureReason::TransmissionError),
+            );
+
+            // FlowInitReset should be emitted
+            let reset = pusher
+                .recv_frames_timeout(Duration::from_secs(1))
+                .await
+                .expect("expected FlowInitReset after TransmissionError in FlowInitSent");
+            assert_eq!(reset.len(), 1);
+            assert!(
+                matches!(
+                    reset.front().unwrap().header,
+                    Header::FlowInitReset {
+                        error_code,
+                        ..
+                    } if error_code == reset_error::RETRANSMISSIONS_EXHAUSTED
+                ),
+                "expected FlowInitReset(RETRANSMISSIONS_EXHAUSTED)"
+            );
+        }
+        .primary()
+        .spawn();
+
+        async move {
+            let mut payload = Bytes::from_static(b"hello");
+            let written = writer.write_from(&mut payload).await.expect("first write");
+            assert_eq!(written, 5);
+
+            bach::task::yield_now().await;
+
+            let mut retry = Bytes::from_static(b"!");
+            let err = writer
+                .write_from(&mut retry)
+                .await
+                .expect_err("expected BrokenPipe");
+            assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
+            assert!(writer.0.status.is_shutdown());
+        }
+        .primary()
+        .spawn();
+    });
+}
+
+/// PeerDead completion failure during FlowInitSent: no FlowInitReset because the
+/// peer is unreachable (it makes no difference whether we send it or not).
+#[test]
+fn client_peer_dead_during_flow_init_sent_no_reset() {
+    crate::testing::sim(|| {
+        use crate::testing::ext::*;
+
+        let (mut writer, mut pusher) = PairBuilder::client_no_remote_queue_id().build();
+
+        async move {
+            let frames = pusher.recv_frames().await;
+            assert_eq!(frames.len(), 1);
+            pusher.complete_all(
+                frames,
+                frame::TransmissionStatus::Failed(frame::FailureReason::PeerDead),
+            );
+
+            // PeerDead: no FlowInitReset (peer can't receive it)
+            let extra = pusher.recv_frames_timeout(Duration::from_secs(1)).await;
+            assert!(extra.is_none(), "no FlowInitReset for PeerDead");
+        }
+        .primary()
+        .spawn();
+
+        async move {
+            let mut payload = Bytes::from_static(b"hello");
+            let written = writer.write_from(&mut payload).await.expect("first write");
+            assert_eq!(written, 5);
+
+            bach::task::yield_now().await;
+
+            let mut retry = Bytes::from_static(b"!");
+            let err = writer
+                .write_from(&mut retry)
+                .await
+                .expect_err("expected TimedOut");
+            assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+            assert!(writer.0.status.is_shutdown());
+        }
+        .primary()
+        .spawn();
+    });
+}
+
+/// Dropping a client writer while in FlowInitSent (before MAX_DATA arrives):
+/// the drop calls shutdown() → send_fin_packet(), which is a no-op in FlowInitSent
+/// (cannot deliver FIN because the server drops duplicate FlowInit by dedup).
+/// The server reader will hang — this is a remaining FIN gap.
 #[test]
 fn client_drop_in_flow_init_sent_cannot_send_fin() {
     sim(|| {
@@ -821,10 +959,9 @@ fn client_drop_in_flow_init_sent_cannot_send_fin() {
     });
 }
 
-/// PeerDead completion failure during FlowInitSent: send_reset_frame silently
-/// no-ops because remote_queue_id is unknown. The error is surfaced to the
-/// application but the peer is never explicitly notified (acceptable since the
-/// peer is dead anyway).
+/// PeerDead completion failure during FlowInitSent: send_reset_frame now falls
+/// back to send_flow_init_reset_frame(), but PeerDead does not invoke that path
+/// (the error surfaces as TimedOut without emitting a reset frame).
 #[test]
 fn client_reset_during_flow_init_sent_is_silent() {
     sim(|| {
@@ -868,9 +1005,9 @@ fn client_reset_during_flow_init_sent_is_silent() {
     });
 }
 
-/// TransmissionError during FlowInitSent: the code attempts send_reset_frame
-/// with RETRANSMISSIONS_EXHAUSTED but it silently fails. Unlike PeerDead, the
-/// peer might still be alive here — documenting the silent failure.
+/// TransmissionError during FlowInitSent (legacy test, superseded by
+/// client_transmission_error_during_flow_init_sent_sends_flow_init_reset).
+/// This test verifies the application-facing error behavior remains correct.
 #[test]
 fn client_transmission_error_during_flow_init_sent() {
     sim(|| {
@@ -884,9 +1021,11 @@ fn client_transmission_error_during_flow_init_sent() {
                 frame::TransmissionStatus::Failed(frame::FailureReason::TransmissionError),
             );
 
-            // No FlowReset emitted despite TransmissionError (remote_queue_id unknown)
-            let extra = pusher.recv_frames_timeout(Duration::from_secs(1)).await;
-            assert!(extra.is_none(), "no FlowReset possible during FlowInitSent");
+            // FlowInitReset is emitted; consume it so the test doesn't leave stale frames.
+            let _reset = pusher
+                .recv_frames_timeout(Duration::from_secs(1))
+                .await
+                .expect("expected FlowInitReset");
         }
         .primary()
         .spawn();
@@ -951,10 +1090,9 @@ fn client_control_channel_closed_during_flow_init_sent() {
     });
 }
 
-/// Explicit shutdown() while in FlowInitSent: send_fin_packet does nothing
-/// (FlowInitSent is neither Init nor Open), so no FIN reaches the peer.
-///
-/// See "PROTOCOL GAP" comment block above for full analysis.
+/// Explicit shutdown() while in FlowInitSent: send_fin_packet is a no-op because
+/// the server would drop a duplicate FlowInit by dedup. The FIN gap remains for
+/// graceful shutdown in this state — applications should wait for MAX_DATA.
 #[test]
 fn client_shutdown_during_flow_init_sent() {
     sim(|| {
@@ -1266,11 +1404,10 @@ fn server_shutdown_idempotent() {
     });
 }
 
-/// Panic drop during FlowInitSent: completion_rx.cancel() prevents further
-/// transmission of the FlowInit but no FlowReset can reach the peer (no
-/// remote_queue_id). Documents the silent failure on panic in this state.
-///
-/// See "PROTOCOL GAP" comment block above for full analysis.
+/// Panic drop during FlowInitSent (legacy test, superseded by
+/// client_panic_drop_during_flow_init_sent_sends_flow_init_reset).
+/// This verifies that FlowInitReset can be sent even when panicking, and that
+/// the frame observable from the test matches expectations.
 #[test]
 fn client_panic_drop_during_flow_init_sent() {
     sim(|| {
@@ -1285,11 +1422,21 @@ fn client_panic_drop_during_flow_init_sent() {
                 Header::FlowInit { is_fin: false, .. }
             ));
 
-            // No FlowReset emitted on panic (remote_queue_id unknown)
-            let extra = pusher.recv_frames_timeout(Duration::from_secs(1)).await;
+            // FlowInitReset arrives after panic
+            let reset = pusher
+                .recv_frames_timeout(Duration::from_secs(1))
+                .await
+                .expect("expected FlowInitReset on panic in FlowInitSent");
+            assert_eq!(reset.len(), 1);
             assert!(
-                extra.is_none(),
-                "panic during FlowInitSent cannot send FlowReset — peer unnotified"
+                matches!(
+                    reset.front().unwrap().header,
+                    Header::FlowInitReset {
+                        error_code,
+                        ..
+                    } if error_code == reset_error::ABNORMAL_TERMINATION
+                ),
+                "expected FlowInitReset(ABNORMAL_TERMINATION)"
             );
         }
         .primary()

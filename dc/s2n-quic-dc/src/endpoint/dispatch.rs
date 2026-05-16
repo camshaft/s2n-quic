@@ -399,6 +399,20 @@ fn dispatch_decoded_frame(
                 waker_sink,
             );
         }
+        Header::FlowInitReset {
+            stream_id,
+            error_code,
+        } => {
+            handle_flow_init_reset(
+                peer,
+                credentials,
+                stream_id,
+                error_code,
+                queue_dispatcher,
+                counters,
+                waker_sink,
+            );
+        }
         Header::Ack {
             dest_sender_id,
             ack_delay: ack_delay_micros,
@@ -1243,4 +1257,59 @@ fn handle_flow_reset(
             );
         }
     }
+}
+
+// ── FlowInitReset ─────────────────────────────────────────────────────────
+
+/// Handle a FlowInitReset frame from a client that doesn't yet know the server's queue ID.
+///
+/// The client is in `FlowInitSent` state — it transmitted a FlowInit but has not yet
+/// received MAX_DATA (and thus doesn't know the server's queue ID). Rather than
+/// silently dropping the reset, it sends a FlowInitReset containing only the stream_id.
+///
+/// We look up the stream_id in the per-peer `flows` tracker to find the local queue_id,
+/// then dispatch a Reset to both stream and control queues. If the stream_id is not
+/// found (no FlowInit was registered, or the flow was already closed), we silently drop
+/// the frame. We never send a reset back in response.
+fn handle_flow_init_reset(
+    peer: &mut recv::Context,
+    credentials: &Credentials,
+    stream_id: VarInt,
+    error_code: VarInt,
+    queue_dispatcher: &mut msg::queue::Dispatcher,
+    counters: &counters::Dispatch,
+    waker_sink: &mut impl channel::UnboundedSender<AutoWake>,
+) {
+    let Some(local_queue_id) = peer.flows.lookup(stream_id) else {
+        counters.rx_init_reset_unknown.add(1);
+        tracing::debug!(
+            stream_id = stream_id.as_u64(),
+            "FlowInitReset for unknown stream_id - dropping"
+        );
+        return;
+    };
+
+    let request = flow::Request {
+        credential_id: credentials.id,
+        stream_id,
+    };
+
+    let stream_entry = msg::Stream::Reset { error_code }.into();
+    let control_entry = msg::Control::Reset { error_code }.into();
+    let (waker_a, waker_b) = queue_dispatcher.send_both(
+        local_queue_id,
+        None,
+        &request,
+        stream_entry,
+        control_entry,
+    );
+    let _ = waker_sink.send(waker_a);
+    let _ = waker_sink.send(waker_b);
+
+    tracing::debug!(
+        stream_id = stream_id.as_u64(),
+        queue_id = local_queue_id.as_u64(),
+        error_code = error_code.as_u64(),
+        "FlowInitReset dispatched"
+    );
 }
