@@ -397,7 +397,7 @@ fn in_order_read_reports_byte_count_and_completes() {
 /// accidentally spin on clean completion forever.
 #[cfg(debug_assertions)]
 #[test]
-#[should_panic(expected = "Reader returned EOF 2 times on stream 1")]
+#[should_panic(expected = "Reader returned EOF again on stream 1")]
 fn repeated_post_eof_reads_panic_in_debug() {
     sim(|| {
         let (mut reader, mut pusher) = make_pair();

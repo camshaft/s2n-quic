@@ -205,8 +205,8 @@ struct Inner {
     status: Status,
     /// Reset error code if the stream was reset by the peer
     reset_error_code: Option<VarInt>,
-    /// Tracks how many times EOF has been surfaced in debug builds so we can
-    /// catch applications spinning on repeated `Ok(0)` reads.
+    /// Counts total EOF returns in debug builds so a second `Ok(0)` can trip a
+    /// debug assertion and catch post-EOF spin loops.
     #[cfg(debug_assertions)]
     eof_counter: u8,
     /// Cooperative yield budget
@@ -488,10 +488,10 @@ impl Inner {
     fn on_eof_returned(&mut self) {
         self.eof_counter = self.eof_counter.saturating_add(1);
         debug_assert!(
-            self.eof_counter <= 1,
-            "Reader returned EOF {} times on stream {}. `read_into` returning Ok(0) means the peer's FIN was fully consumed and no more data will arrive. Stop calling `read_into` after the first Ok(0); repeated post-EOF reads usually mean the application treated EOF as \"try again later\".",
-            self.eof_counter,
+            self.eof_counter == 1,
+            "Reader returned EOF again on stream {} (EOF count: {}). `read_into` returning Ok(0) means the peer's FIN was fully consumed and no more data will arrive. Stop calling `read_into` after the first Ok(0); repeated post-EOF reads usually mean the application treated EOF as \"try again later\" and is now spinning after the stream has completed.",
             self.stream_id.as_u64(),
+            self.eof_counter,
         );
     }
 
