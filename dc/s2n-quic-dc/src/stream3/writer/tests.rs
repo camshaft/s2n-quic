@@ -230,10 +230,22 @@ impl Pusher {
     ///
     /// Tests that expect multiple submission cycles should call this helper
     /// again.
+    ///
+    /// Simulates the assembler by stamping `sender_idx = 0` on any FlowInit
+    /// frame completions, mirroring what the real assembler does when it picks
+    /// up the frame for transmission.
     async fn recv_frames(&mut self) -> intrusive_queue::Queue<Frame> {
         core::future::poll_fn(|cx| self.frame_rx.poll_swap(cx, &mut self.frame_storage)).await;
         let mut combined_frames = intrusive_queue::Queue::default();
         for (_priority, mut queue) in self.frame_storage.drain() {
+            // Stamp init_sender_idx on FlowInit completions to simulate the assembler.
+            for frame in queue.iter() {
+                if matches!(frame.header, Header::FlowInit { .. }) {
+                    if let Some(completion) = &frame.completion {
+                        completion.set_init_sender_idx(0);
+                    }
+                }
+            }
             combined_frames.append(&mut queue);
         }
         combined_frames
