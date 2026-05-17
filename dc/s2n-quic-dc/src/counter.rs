@@ -695,6 +695,7 @@ struct TaskRegistrationMetadata {
     name: String,
     description: String,
     function: String,
+    budget: Option<usize>,
 }
 
 impl Task {
@@ -718,12 +719,13 @@ impl Task {
         .collect()
     }
 
-    pub fn with_registration_metadata_ref<T>(&self, f: impl FnOnce(&str, &str, &str) -> T) -> T {
+    pub fn with_registration_metadata_ref<T>(&self, f: impl FnOnce(&str, &str, &str, Option<usize>) -> T) -> T {
         let registration = self.registration.lock().unwrap();
         f(
             registration.name.as_str(),
             registration.description.as_str(),
             registration.function.as_str(),
+            registration.budget,
         )
     }
 
@@ -738,8 +740,10 @@ impl Task {
             .with_registration_function(function);
         
         // Auto-register in topology
-        let registration = task.with_registration_metadata_ref(|name, description, function| {
-            TaskRegistration::new(name, description, function).with_metric(&task)
+        let registration = task.with_registration_metadata_ref(|name, description, function, budget| {
+            TaskRegistration::new(name, description, function)
+                .with_budget(budget)
+                .with_metric(&task)
         });
         task.registry.register_task_topology(registration);
         
@@ -768,6 +772,20 @@ impl Task {
             registration.function = function.to_string();
         }
         self
+    }
+
+    /// Set the budget for this task.
+    /// 
+    /// This should be called when spawning the task to record the budget in the topology.
+    /// Panics in debug builds if the budget has already been set (task already spawned).
+    pub fn set_budget(&self, budget: Option<usize>) {
+        let mut registration = self.registration.lock().unwrap();
+        debug_assert!(
+            registration.budget.is_none(),
+            "Task budget already set - task '{}' has already been spawned",
+            registration.name
+        );
+        registration.budget = budget;
     }
 }
 

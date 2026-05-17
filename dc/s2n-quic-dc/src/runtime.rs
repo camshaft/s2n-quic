@@ -15,7 +15,6 @@
 
 use crate::counter;
 use crate::time::precision;
-use counter::TaskRegistration;
 use s2n_quic_core::time;
 use std::future::Future;
 
@@ -66,17 +65,11 @@ pub trait Spawner {
         self.spawn(future);
     }
 
-    /// Register metadata describing a task spawned on this worker.
-    ///
-    /// This is used by runtime introspection tools (e.g., inspector runtime).
-    #[inline]
-    fn register_task(&mut self, _task: TaskRegistration) {}
-
     /// Convenience helper for pipeline tasks with budget and task counters.
     ///
-    /// Registers the task with the spawner (for runtime introspection), then spawns
-    /// the task with its name. Task topology registration happens automatically when
-    /// the task counter is created with `with_registration_metadata`.
+    /// Sets the budget on the task counter, then spawns the task with its name.
+    /// Task topology registration happens automatically when the task counter is
+    /// created with `with_registration_metadata`.
     #[inline]
     fn spawn_receiver_task<F>(
         &mut self,
@@ -87,13 +80,8 @@ pub trait Spawner {
         F: Future<Output = ()> + 'static,
         Self: Sized,
     {
-        let task = task_counter.with_registration_metadata_ref(|name, description, function| {
-            TaskRegistration::new(name, description, function)
-                .with_budget(budget)
-                .with_metric(&task_counter)
-        });
-        let task_name = task.name.clone();
-        self.register_task(task);
+        task_counter.set_budget(budget);
+        let task_name = task_counter.with_registration_metadata_ref(|name, _, _, _| name.to_string());
         self.spawn_named(&task_name, future);
     }
 }
