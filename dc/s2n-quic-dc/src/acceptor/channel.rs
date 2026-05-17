@@ -585,14 +585,14 @@ mod tests {
     /// ensures no single receiver handles all the work.
     #[test]
     fn three_receivers_distribute_load() {
-        let count1 = Arc::new(AtomicUsize::new(0));
-        let count2 = Arc::new(AtomicUsize::new(0));
-        let count3 = Arc::new(AtomicUsize::new(0));
+        let rx1_count = Arc::new(AtomicUsize::new(0));
+        let rx2_count = Arc::new(AtomicUsize::new(0));
+        let rx3_count = Arc::new(AtomicUsize::new(0));
 
         {
-            let count1 = count1.clone();
-            let count2 = count2.clone();
-            let count3 = count3.clone();
+            let rx1_count = rx1_count.clone();
+            let rx2_count = rx2_count.clone();
+            let rx3_count = rx3_count.clone();
 
             sim(move || {
                 let (mut sender, rx1) = new::<u32>(100.into());
@@ -600,9 +600,9 @@ mod tests {
                 let rx3 = rx1.clone();
 
                 for (mut rx, count) in [
-                    (rx1, count1),
-                    (rx2, count2),
-                    (rx3, count3),
+                    (rx1, rx1_count),
+                    (rx2, rx2_count),
+                    (rx3, rx3_count),
                 ] {
                     async move {
                         while rx.recv().await.is_some() {
@@ -626,19 +626,23 @@ mod tests {
             });
         }
 
-        let c1 = count1.load(Ordering::Relaxed);
-        let c2 = count2.load(Ordering::Relaxed);
-        let c3 = count3.load(Ordering::Relaxed);
+        let c1 = rx1_count.load(Ordering::Relaxed);
+        let c2 = rx2_count.load(Ordering::Relaxed);
+        let c3 = rx3_count.load(Ordering::Relaxed);
 
-        assert_eq!(c1 + c2 + c3, 60, "all 60 items should be received exactly once");
+        assert_eq!(
+            c1 + c2 + c3,
+            60,
+            "all 60 items should be received exactly once (distribution: rx1={c1}, rx2={c2}, rx3={c3})"
+        );
         // Pick-two load balancing must spread the work: no receiver should be idle
-        assert!(c1 > 0, "receiver 1 should receive some items");
-        assert!(c2 > 0, "receiver 2 should receive some items");
-        assert!(c3 > 0, "receiver 3 should receive some items");
+        assert!(c1 > 0, "receiver 1 should receive some items (distribution: rx1={c1}, rx2={c2}, rx3={c3})");
+        assert!(c2 > 0, "receiver 2 should receive some items (distribution: rx1={c1}, rx2={c2}, rx3={c3})");
+        assert!(c3 > 0, "receiver 3 should receive some items (distribution: rx1={c1}, rx2={c2}, rx3={c3})");
         // And no single receiver should be overwhelmed
-        assert!(c1 < 50, "receiver 1 should not handle most of the load");
-        assert!(c2 < 50, "receiver 2 should not handle most of the load");
-        assert!(c3 < 50, "receiver 3 should not handle most of the load");
+        assert!(c1 < 50, "receiver 1 should not handle most of the load (distribution: rx1={c1}, rx2={c2}, rx3={c3})");
+        assert!(c2 < 50, "receiver 2 should not handle most of the load (distribution: rx1={c1}, rx2={c2}, rx3={c3})");
+        assert!(c3 < 50, "receiver 3 should not handle most of the load (distribution: rx1={c1}, rx2={c2}, rx3={c3})");
     }
 
     /// After one of two registered receivers is dropped its slot is removed.
