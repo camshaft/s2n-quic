@@ -569,7 +569,8 @@ impl Drop for TimerGuard<'_> {
 ///
 /// - `drained`: number of items processed in a single poll
 /// - `time`: wall-clock duration spent inside a poll
-/// - `next_poll_latency`: elapsed time between consecutive poll starts
+/// - `next_poll_latency`: elapsed time from the end of one poll to the start
+///   of the next poll
 #[derive(Clone)]
 pub struct Task {
     pub drained: Summary,
