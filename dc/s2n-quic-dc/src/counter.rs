@@ -77,6 +77,27 @@ macro_rules! metric_trace {
 }
 
 macro_rules! metric_trace_with_metadata {
+    ($metric_id:expr, $metadata:expr, $op:literal) => {{
+        #[cfg(any(test, feature = "metric-tracing"))]
+        {
+            let (_metric_id, metric_label, metric_variant) =
+                metric_trace_fields($metric_id, $metadata);
+            if let Some(metric_variant) = metric_variant {
+                tracing::trace!(
+                    target: "s2n_quic_dc::metric",
+                    metric_label = %metric_label,
+                    metric_variant = %metric_variant,
+                    $op
+                );
+            } else {
+                tracing::trace!(
+                    target: "s2n_quic_dc::metric",
+                    metric_label = %metric_label,
+                    $op
+                );
+            }
+        }
+    }};
     ($metric_id:expr, $metadata:expr, $op:literal, $($arg:tt)*) => {{
         #[cfg(any(test, feature = "metric-tracing"))]
         {
@@ -703,13 +724,7 @@ impl Timer {
     pub fn start_at(&self, start: Instant) -> TimerGuard<'_> {
         with_metric_span!("timer.start_at", {
             if in_bach_sim() {
-                let _bach_start = bach::time::Instant::now();
-                metric_trace_with_metadata!(
-                    self.metric_id,
-                    &self.metadata,
-                    "timer.start_at",
-                    bach_start = ?_bach_start
-                );
+                metric_trace_with_metadata!(self.metric_id, &self.metadata, "timer.start_at");
             } else {
                 metric_trace_with_metadata!(
                     self.metric_id,
@@ -744,13 +759,7 @@ impl Timer {
     pub fn record(&self, duration: Duration) {
         with_metric_span!("timer.record", {
             if in_bach_sim() {
-                let _bach_now = bach::time::Instant::now();
-                metric_trace_with_metadata!(
-                    self.metric_id,
-                    &self.metadata,
-                    "timer.record",
-                    bach_now = ?_bach_now
-                );
+                metric_trace_with_metadata!(self.metric_id, &self.metadata, "timer.record");
             } else {
                 metric_trace_with_metadata!(
                     self.metric_id,
