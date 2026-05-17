@@ -199,7 +199,11 @@ where
 
     #[inline]
     fn append_due_entries(due_tick: u64, mut entries: List<A>, out: &mut List<A>) {
-        #[cfg(debug_assertions)]
+        if !cfg!(debug_assertions) {
+            out.append(&mut entries);
+            return;
+        }
+
         while let Some(ptr) = entries.pop_front() {
             unsafe {
                 // SAFETY: The pointer is valid since it came from the adapter.
@@ -216,9 +220,6 @@ where
             }
             out.push_back(ptr);
         }
-
-        #[cfg(not(debug_assertions))]
-        out.append(&mut entries);
     }
 
     /// Advance the virtual clock to `target_tick` and return all due entries.
