@@ -312,24 +312,27 @@ impl Context {
             .ack_ranges
             .encode_body(self.ecn_counts.as_option(), max_body_len)
         else {
+            let transition = self.ack_state.on_empty();
             debug_assert!(
-                self.ack_state.on_empty().is_ok(),
+                transition.is_ok(),
                 "on_empty transition failed from Scheduled"
             );
             self.invariants();
             return None;
         };
         let Some(largest_recv_time) = self.ack_ranges.largest_recv_time() else {
+            let transition = self.ack_state.on_empty();
             debug_assert!(
-                self.ack_state.on_empty().is_ok(),
+                transition.is_ok(),
                 "on_empty transition failed from Scheduled"
             );
             self.invariants();
             return None;
         };
 
+        let transition = self.ack_state.on_flush();
         debug_assert!(
-            self.ack_state.on_flush().is_ok(),
+            transition.is_ok(),
             "on_flush transition failed from Scheduled"
         );
         self.invariants();
@@ -354,8 +357,9 @@ impl Context {
             self.invariants();
             return None;
         }
+        let transition = self.ack_state.on_flush_complete();
         debug_assert!(
-            self.ack_state.on_flush_complete().is_ok(),
+            transition.is_ok(),
             "on_flush_complete transition failed from Flushed/FlushedStale"
         );
         let submission = self.encode_and_flush(recv_worker_id);
