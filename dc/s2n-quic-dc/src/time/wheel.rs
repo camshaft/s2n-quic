@@ -208,6 +208,8 @@ where
                     let target_tick = Self::timestamp_to_tick(target_time);
                     debug_assert!(
                         target_tick <= due_tick,
+                        // `None` is allowed while queued (disarm-in-place), but moving
+                        // the target into the future while linked breaks wheel slot invariants.
                         "wheel entry target_time changed while queued: target_tick ({target_tick}) > due_tick ({due_tick})"
                     );
                 }
