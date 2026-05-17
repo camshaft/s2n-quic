@@ -696,26 +696,26 @@ impl Registry {
             return existing.clone();
         }
 
-        let var = Some(variant.clone());
+        let variant_option = Some(variant.clone());
         let throughput = Counter(
             self.inner
-                .register_counter(format!("{label}.enq"), var.clone()),
+                .register_counter(format!("{label}.enq"), variant_option.clone()),
         );
         let drain = Counter(
             self.inner
-                .register_counter(format!("{label}.drain"), var.clone()),
+                .register_counter(format!("{label}.drain"), variant_option.clone()),
         );
         let depth = Arc::new(AtomicI64::new(0));
         let depth_clone = depth.clone();
         self.inner.register_list_callback(
             format!("{label}.depth"),
-            var.clone(),
+            variant_option.clone(),
             Unit::Count,
             move || NonZeroDisplay(depth_clone.load(Ordering::Relaxed)),
         );
         let depth_distribution =
             self.inner
-                .register_summary(format!("{label}.depth_dist"), var, Unit::Count);
+                .register_summary(format!("{label}.depth_dist"), variant_option, Unit::Count);
 
         let gauge = QueueGauge {
             label,

@@ -977,7 +977,7 @@ mod tests {
                 .with_metric(MetricRegistration::new(
                     "q.producer_to_consumer.depth",
                     MetricKind::Gauge,
-                    "Queue depth",
+                    "Current queue depth",
                 )),
             );
             local.register_channel_sender(
