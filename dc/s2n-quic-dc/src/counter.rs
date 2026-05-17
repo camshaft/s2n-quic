@@ -640,7 +640,6 @@ impl Timer {
             metric_trace!(metric_id = self.metric_id, start = ?start, "timer.start_at");
             TimerGuard {
                 summary: &self.summary,
-                #[cfg(any(test, feature = "metric-tracing"))]
                 metric_id: self.metric_id,
                 start,
                 recorded: false,
@@ -702,7 +701,7 @@ impl SummaryMetric {
 
 pub struct TimerGuard<'a> {
     summary: &'a Summary,
-    #[cfg(any(test, feature = "metric-tracing"))]
+    #[allow(dead_code)]
     metric_id: MetricId,
     start: Instant,
     recorded: bool,
