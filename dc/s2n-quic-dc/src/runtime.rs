@@ -477,6 +477,7 @@ pub mod inspector {
 
     impl s2n_quic_core::time::Clock for Clock {
         fn get_time(&self) -> s2n_quic_core::time::Timestamp {
+            // SAFETY: Duration::ZERO is always a valid non-negative timestamp origin.
             unsafe { s2n_quic_core::time::Timestamp::from_duration(core::time::Duration::ZERO) }
         }
     }

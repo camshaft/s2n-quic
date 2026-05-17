@@ -36,7 +36,7 @@ fn topology_snapshot_uses_dc_tester_layout() {
             _segment_size: u16,
             _ecn: s2n_quic_core::inet::ExplicitCongestionNotification,
         ) -> std::io::Result<usize> {
-            panic!("send_msg should not be called by topology snapshot test");
+            panic!("send_msg should not be called during topology snapshot");
         }
 
         fn local_addr(&self) -> std::io::Result<std::net::SocketAddr> {
@@ -57,7 +57,7 @@ fn topology_snapshot_uses_dc_tester_layout() {
             _cmsg: &mut crate::msg::cmsg::Receiver,
             _buffer: &mut [std::io::IoSliceMut],
         ) -> core::task::Poll<std::io::Result<usize>> {
-            panic!("poll_recv should not be called by topology snapshot test");
+            panic!("poll_recv should not be called during topology snapshot");
         }
 
         fn local_addr(&self) -> std::io::Result<std::net::SocketAddr> {
