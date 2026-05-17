@@ -757,9 +757,18 @@ where
             }
 
             if let Some(sw) = send_worker {
-                let batch_rx =
-                    crate::counter::GaugedQueueReceiver::new(sw.batch_rx, sw.batch_gauge);
-                let ack_rx = crate::counter::GaugedQueueReceiver::new(sw.ack_rx, sw.ack_gauge);
+                let batch_rx = crate::counter::GaugedQueueReceiver::new(
+                    sw.batch_rx,
+                    sw.batch_gauge
+                        .receiver("task.context_resolver")
+                        .with_function("endpoint::Worker::spawn"),
+                );
+                let ack_rx = crate::counter::GaugedQueueReceiver::new(
+                    sw.ack_rx,
+                    sw.ack_gauge
+                        .receiver("task.ack_processor")
+                        .with_function("endpoint::Worker::spawn"),
+                );
                 tasks::send_worker(
                     &mut local,
                     sw.idx,
@@ -797,8 +806,12 @@ where
             }
 
             if let Some(rd) = recv_dispatch {
-                let packet_rx =
-                    crate::counter::GaugedQueueReceiver::new(rd.packet_rx, rd.packet_gauge);
+                let packet_rx = crate::counter::GaugedQueueReceiver::new(
+                    rd.packet_rx,
+                    rd.packet_gauge
+                        .receiver("task.packet_dispatch")
+                        .with_function("endpoint::Worker::spawn"),
+                );
                 let recv_dispatch_idx = rd.recv_dispatch_idx;
                 let recv_cache = std::rc::Rc::new(std::cell::RefCell::new(
                     crate::stream::endpoint::recv::Cache::new(recv_dispatch_idx),
@@ -955,8 +968,12 @@ where
                     "ACK completion task drains completion entries",
                     "endpoint::Worker::spawn",
                 );
-                let ack_completion_rx =
-                    crate::counter::GaugedReceiver::new(rd.ack_completion_rx, ack_completion_gauge);
+                let ack_completion_rx = crate::counter::GaugedReceiver::new(
+                    rd.ack_completion_rx,
+                    ack_completion_gauge
+                        .receiver("task.ack_completion")
+                        .with_function("endpoint::Worker::spawn"),
+                );
                 let rx = tasks::ack_completion(
                     ack_completion_rx,
                     recv_cache.clone(),

@@ -164,22 +164,16 @@ pub fn frame_dispatch<S, Clk>(
 
     {
         // Task 2: batch → Entry → priority merge → pace → pick-two to workers.
-        for i in 0..Priority::LEVELS {
-            let receiver = q_router_to_batcher[i]
-                .receiver("task.frame_dispatch")
-                .with_description("Frame dispatch drains per-lane queues")
-                .with_function("endpoint::tasks::frame_dispatch");
-            spawner.register_queue_receiver(&receiver);
-        }
-
         let priority_batch_rxs = priority_batch_rxs
             .into_iter()
             .zip(q_router_to_batcher)
             .map(|(rx, gauge)| {
-                crate::counter::GaugedQueueReceiver::new(
-                    rx.into_list_receiver(),
-                    gauge.receiver("task.frame_dispatch"),
-                )
+                let receiver = gauge
+                    .receiver("task.frame_dispatch")
+                    .with_description("Frame dispatch drains per-lane queues")
+                    .with_function("endpoint::tasks::frame_dispatch");
+                spawner.register_queue_receiver(&receiver);
+                crate::counter::GaugedQueueReceiver::new(rx.into_list_receiver(), receiver)
             })
             .collect();
         let rx = PriorityRx::new(priority_batch_rxs);
@@ -287,8 +281,6 @@ pub fn send_worker<Socket, Clk, WakerSink, AckComp>(
     let q_ack_to_completion =
         counter_registry.register_queue_gauge_nominal("q.ack_to_completion", &variant);
     let (completed_tx, completed_rx) = unsync::new::<Frame>();
-    let invalidation_completed_tx =
-        crate::counter::GaugedSender::new(completed_tx.clone(), q_ack_to_completion.clone());
     let q_ack_to_cancelled =
         counter_registry.register_queue_gauge_nominal("q.ack_to_cancelled", &variant);
     let (cancelled_tx, cancelled_rx) = unsync::new::<Frame>();
@@ -311,6 +303,13 @@ pub fn send_worker<Socket, Clk, WakerSink, AckComp>(
         format!("ch.ack_to_completion.{variant}"),
         "Completed frame channel from ack/invalidation tasks to completion dispatcher",
         "endpoint::tasks::send_worker",
+    );
+    let invalidation_completed_tx = crate::counter::GaugedSender::new(
+        completed_tx.clone(),
+        q_ack_to_completion
+            .sender("task.invalidation")
+            .with_description("Invalidation task emits failed frames as completions")
+            .with_function("endpoint::tasks::send_worker"),
     );
     let q_ack_to_cancelled = q_ack_to_cancelled.with_registration_metadata(
         format!("ch.ack_to_cancelled.{variant}"),
@@ -487,14 +486,6 @@ pub fn send_worker<Socket, Clk, WakerSink, AckComp>(
             .with_description("Tx wheel drains scheduled contexts")
             .with_function("endpoint::tasks::send_worker");
         spawner.register_queue_receiver(&tx_wheel_receiver);
-        for sender_idx in send_sockets.iter().map(|socket| socket.sender_idx) {
-            let wheel_to_assembler_sender = q_wheel_to_assembler[sender_idx_to_local[sender_idx]]
-                .sender("task.tx_wheel")
-                .with_description("Tx wheel routes expired contexts to socket assembler")
-                .with_function("endpoint::tasks::send_worker");
-            spawner.register_queue_sender(&wheel_to_assembler_sender);
-        }
-
         let task_counter = counter_registry
             .register_nominal_task("task.tx_wheel", format!("send.{worker_id}"))
             .with_registration_metadata(
@@ -512,7 +503,14 @@ pub fn send_worker<Socket, Clk, WakerSink, AckComp>(
                     .into_iter()
                     .zip(q_wheel_to_assembler.iter().cloned())
                     .map(|(tx, gauge)| {
-                        crate::counter::GaugedSender::new(tx, gauge.sender("task.tx_wheel"))
+                        let sender = gauge
+                            .sender("task.tx_wheel")
+                            .with_description(
+                                "Tx wheel routes expired contexts to socket assembler",
+                            )
+                            .with_function("endpoint::tasks::send_worker");
+                        spawner.register_queue_sender(&sender);
+                        crate::counter::GaugedSender::new(tx, sender)
                     })
                     .collect();
                 move |context: Rc<RefCell<send::Context>>| {
@@ -643,15 +641,26 @@ pub fn send_worker<Socket, Clk, WakerSink, AckComp>(
         spawner.register_queue_receiver(&assembler_receiver);
 
         let clock = st.clock.clone();
-        let tx_wheel_tx =
-            crate::counter::GaugedSender::new(tx_wheel_tx.clone(), q_resolver_to_tx_wheel.clone());
+        let tx_wheel_tx = crate::counter::GaugedSender::new(
+            tx_wheel_tx.clone(),
+            q_resolver_to_tx_wheel
+                .sender(&task_name)
+                .with_description("Assembler schedules immediate transmit wheel work")
+                .with_function("endpoint::tasks::send_worker"),
+        );
         let pto_wheel_tx = crate::counter::GaugedSender::new(
             pto_wheel_tx.clone(),
-            q_resolver_to_pto_wheel.clone(),
+            q_resolver_to_pto_wheel
+                .sender(&task_name)
+                .with_description("Assembler schedules PTO wheel work")
+                .with_function("endpoint::tasks::send_worker"),
         );
         let idle_wheel_tx = crate::counter::GaugedSender::new(
             idle_wheel_tx.clone(),
-            q_resolver_to_idle_wheel.clone(),
+            q_resolver_to_idle_wheel
+                .sender(&task_name)
+                .with_description("Assembler updates idle wheel scheduling")
+                .with_function("endpoint::tasks::send_worker"),
         );
         let cancelled_tx = cancelled_tx.clone().into_list_sender();
         let ack_completions_tx = ack_completions_tx.clone();
@@ -841,7 +850,12 @@ async fn wheel_drain<A, T, F, const GRANULARITY_US: u64>(
     let wheel: crate::time::wheel::Wheel<A, T, _, GRANULARITY_US> =
         crate::time::wheel::Wheel::new(rx.into_list_receiver(), timer);
     let rx = FlattenList::new(wheel);
-    let rx = crate::counter::GaugedReceiver::new(rx, input_gauge);
+    let rx = crate::counter::GaugedReceiver::new(
+        rx,
+        input_gauge
+            .receiver("task.wheel_drain")
+            .with_function("endpoint::tasks::wheel_drain"),
+    );
     let rx = Map::new(rx, |item| on_expire(item));
     rx.drain_budgeted_metered(Some(budget), task_counter).await;
 }
@@ -867,7 +881,13 @@ pub async fn send_idle_wheel_drain<Clk>(
         timer,
         input_gauge.clone(),
         {
-            let mut idle_wheel_tx = crate::counter::GaugedSender::new(idle_wheel_tx, input_gauge);
+            let mut idle_wheel_tx = crate::counter::GaugedSender::new(
+                idle_wheel_tx,
+                input_gauge
+                    .sender("task.send_idle_wheel_drain")
+                    .with_description("Idle wheel re-enqueues active send contexts")
+                    .with_function("endpoint::tasks::send_idle_wheel_drain"),
+            );
             move |context: Rc<RefCell<send::Context>>| {
                 let now = clock.now();
                 let ctx = context.borrow();
@@ -914,7 +934,13 @@ pub async fn recv_idle_wheel_drain<Clk>(
         timer,
         input_gauge.clone(),
         {
-            let mut idle_wheel_tx = crate::counter::GaugedSender::new(idle_wheel_tx, input_gauge);
+            let mut idle_wheel_tx = crate::counter::GaugedSender::new(
+                idle_wheel_tx,
+                input_gauge
+                    .sender("task.recv_idle_wheel_drain")
+                    .with_description("Idle wheel re-enqueues active recv contexts")
+                    .with_function("endpoint::tasks::recv_idle_wheel_drain"),
+            );
             move |context: Rc<RefCell<endpoint::recv::Context>>| {
                 let now = clock.now();
                 let ctx = context.borrow();
