@@ -328,6 +328,7 @@ fn run_sim_with_snapshot(f: impl FnOnce()) {
         .unwrap()
         .add_directive("s2n_quic_dc=debug".parse().unwrap())
         .add_directive("s2n_quic_dc::endpoint::recv=info".parse().unwrap())
+        .add_directive("s2n_quic_dc::metric=trace".parse().unwrap())
         .add_directive("s2n_quic_dc::counter=warn".parse().unwrap());
     let subscriber = tracing_subscriber::fmt()
         .with_env_filter(env_filter)
