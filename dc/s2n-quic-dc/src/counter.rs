@@ -1513,6 +1513,53 @@ impl Topology {
         out.push_str("}\n");
         out
     }
+
+    /// Validate that the topology is coherent.
+    ///
+    /// Checks that every channel has at least one sender and one receiver.
+    /// Returns a list of validation errors if any are found.
+    pub fn validate(&self) -> Vec<String> {
+        let mut errors = Vec::new();
+        let mut channel_senders = std::collections::HashMap::new();
+        let mut channel_receivers = std::collections::HashMap::new();
+
+        // Count senders and receivers for each channel
+        for binding in &self.bindings {
+            match binding.direction {
+                ChannelDirection::Sends => {
+                    *channel_senders
+                        .entry(binding.channel_name.clone())
+                        .or_insert(0) += 1;
+                }
+                ChannelDirection::Receives => {
+                    *channel_receivers
+                        .entry(binding.channel_name.clone())
+                        .or_insert(0) += 1;
+                }
+            }
+        }
+
+        // Check that every channel has at least one sender and one receiver
+        for channel in &self.channels {
+            let sender_count = channel_senders.get(&channel.name).copied().unwrap_or(0);
+            let receiver_count = channel_receivers.get(&channel.name).copied().unwrap_or(0);
+
+            if sender_count == 0 {
+                errors.push(format!(
+                    "Channel '{}' has no senders",
+                    channel.name
+                ));
+            }
+            if receiver_count == 0 {
+                errors.push(format!(
+                    "Channel '{}' has no receivers",
+                    channel.name
+                ));
+            }
+        }
+
+        errors
+    }
 }
 
 fn escape_dot(input: &str) -> String {
@@ -2448,5 +2495,31 @@ mod tests {
         }
 
         assert_eq!(seen.lock().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn topology_validation() {
+        let registry = Registry::new();
+        
+        // Create a queue with both sender and receiver
+        let q1 = registry.register_queue_gauge("q.test1");
+        let _sender1 = q1.sender("task.sender");
+        let _receiver1 = q1.receiver("task.receiver");
+        
+        // Create a queue with only a sender (missing receiver)
+        let q2 = registry.register_queue_gauge("q.test2");
+        let _sender2 = q2.sender("task.sender");
+        
+        // Create a queue with only a receiver (missing sender)
+        let q3 = registry.register_queue_gauge("q.test3");
+        let _receiver3 = q3.receiver("task.receiver");
+        
+        let topology = registry.topology();
+        let errors = topology.validate();
+        
+        // Should have 2 errors: q.test2 missing receiver, q.test3 missing sender
+        assert_eq!(errors.len(), 2);
+        assert!(errors.iter().any(|e| e.contains("q.test2") && e.contains("no receivers")));
+        assert!(errors.iter().any(|e| e.contains("q.test3") && e.contains("no senders")));
     }
 }
