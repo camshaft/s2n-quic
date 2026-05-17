@@ -13,7 +13,7 @@ use crate::{
         msg, send, Budgets,
     },
     intrusive::{Entry, Queue},
-    runtime::{ChannelRegistration, Spawner, TaskRegistration},
+    runtime::{ChannelRegistration, MetricKind, MetricRegistration, Spawner, TaskRegistration},
     socket::{
         channel::{
             intrusive::{self, unsync},
@@ -128,10 +128,24 @@ pub fn frame_dispatch<S, Clk>(
                 format!("ch.router_to_batcher.p{i}"),
                 "Per-priority unsync queue from priority router to frame dispatch",
                 "endpoint::tasks::frame_dispatch",
-                "task.priority_router",
-                "task.frame_dispatch",
             )
-            .with_metric(format!("q.router_to_batcher.variant=p{i}")),
+            .with_metric(MetricRegistration::new(
+                format!("q.router_to_batcher.variant=p{i}"),
+                MetricKind::Gauge,
+                "Queue depth for router→batcher lane",
+            )),
+        );
+        spawner.register_channel_sender(
+            "task.priority_router",
+            format!("ch.router_to_batcher.p{i}"),
+            "Priority router emits per-lane frame queues",
+            "endpoint::tasks::frame_dispatch",
+        );
+        spawner.register_channel_receiver(
+            "task.frame_dispatch",
+            format!("ch.router_to_batcher.p{i}"),
+            "Frame dispatch drains per-lane queues",
+            "endpoint::tasks::frame_dispatch",
         );
     }
 
@@ -148,10 +162,7 @@ pub fn frame_dispatch<S, Clk>(
             "task.priority_router",
             "Routes submissions into per-priority queues",
             "endpoint::tasks::frame_dispatch",
-        )
-        .with_metric("task.priority_router.drained")
-        .with_metric("task.priority_router.time")
-        .with_metric("task.priority_router.next_poll_latency"),
+        ),
         rx,
         Some(budgets.submission_router),
         task_counter,
@@ -174,10 +185,7 @@ pub fn frame_dispatch<S, Clk>(
             "task.frame_dispatch",
             "Batches, paces, and routes frame batches to worker send sockets",
             "endpoint::tasks::frame_dispatch",
-        )
-        .with_metric("task.frame_dispatch.drained")
-        .with_metric("task.frame_dispatch.time")
-        .with_metric("task.frame_dispatch.next_poll_latency"),
+        ),
         rx,
         Some(budgets.frame_dispatch),
         task_counter,
@@ -279,50 +287,162 @@ pub fn send_worker<Socket, Clk, WakerSink, AckComp>(
             format!("ch.resolver_to_tx_wheel.{variant}"),
             "Send context scheduling channel feeding the tx wheel",
             "endpoint::tasks::send_worker",
-            "task.context_resolver",
-            "task.tx_wheel",
         )
-        .with_metric(format!("q.resolver_to_tx_wheel.variant={variant}")),
+        .with_metric(MetricRegistration::new(
+            format!("q.resolver_to_tx_wheel.variant={variant}"),
+            MetricKind::Gauge,
+            "Queue depth from resolver/ack paths into tx wheel",
+        )),
+    );
+    spawner.register_channel_sender(
+        "task.context_resolver",
+        format!("ch.resolver_to_tx_wheel.{variant}"),
+        "Context resolver schedules transmission work",
+        "endpoint::tasks::send_worker",
+    );
+    spawner.register_channel_sender(
+        "task.ack_processor",
+        format!("ch.resolver_to_tx_wheel.{variant}"),
+        "ACK processor re-schedules transmission work",
+        "endpoint::tasks::send_worker",
+    );
+    spawner.register_channel_sender(
+        "task.pto_wheel",
+        format!("ch.resolver_to_tx_wheel.{variant}"),
+        "PTO wheel requests probe transmissions",
+        "endpoint::tasks::send_worker",
+    );
+    spawner.register_channel_receiver(
+        "task.tx_wheel",
+        format!("ch.resolver_to_tx_wheel.{variant}"),
+        "Tx wheel drains scheduled contexts",
+        "endpoint::tasks::send_worker",
     );
     spawner.register_channel(
         ChannelRegistration::new(
             format!("ch.resolver_to_pto_wheel.{variant}"),
             "Send context scheduling channel feeding the pto wheel",
             "endpoint::tasks::send_worker",
-            "task.ack_processor",
-            "task.pto_wheel",
         )
-        .with_metric(format!("q.resolver_to_pto_wheel.variant={variant}")),
+        .with_metric(MetricRegistration::new(
+            format!("q.resolver_to_pto_wheel.variant={variant}"),
+            MetricKind::Gauge,
+            "Queue depth from resolver/ack paths into pto wheel",
+        )),
+    );
+    spawner.register_channel_sender(
+        "task.context_resolver",
+        format!("ch.resolver_to_pto_wheel.{variant}"),
+        "Context resolver schedules PTO checks",
+        "endpoint::tasks::send_worker",
+    );
+    spawner.register_channel_sender(
+        "task.ack_processor",
+        format!("ch.resolver_to_pto_wheel.{variant}"),
+        "ACK processor updates PTO scheduling",
+        "endpoint::tasks::send_worker",
+    );
+    spawner.register_channel_sender(
+        "task.pto_wheel",
+        format!("ch.resolver_to_pto_wheel.{variant}"),
+        "PTO wheel re-schedules contexts",
+        "endpoint::tasks::send_worker",
+    );
+    spawner.register_channel_receiver(
+        "task.pto_wheel",
+        format!("ch.resolver_to_pto_wheel.{variant}"),
+        "PTO wheel drains scheduled contexts",
+        "endpoint::tasks::send_worker",
     );
     spawner.register_channel(
         ChannelRegistration::new(
             format!("ch.resolver_to_idle_wheel.{variant}"),
             "Send context scheduling channel feeding the idle wheel",
             "endpoint::tasks::send_worker",
-            "task.context_resolver",
-            "task.idle_wheel",
         )
-        .with_metric(format!("q.resolver_to_idle_wheel.variant={variant}")),
+        .with_metric(MetricRegistration::new(
+            format!("q.resolver_to_idle_wheel.variant={variant}"),
+            MetricKind::Gauge,
+            "Queue depth from resolver/ack paths into idle wheel",
+        )),
+    );
+    spawner.register_channel_sender(
+        "task.context_resolver",
+        format!("ch.resolver_to_idle_wheel.{variant}"),
+        "Context resolver tracks idle expiry",
+        "endpoint::tasks::send_worker",
+    );
+    spawner.register_channel_sender(
+        "task.ack_processor",
+        format!("ch.resolver_to_idle_wheel.{variant}"),
+        "ACK processor updates idle scheduling",
+        "endpoint::tasks::send_worker",
+    );
+    spawner.register_channel_sender(
+        "task.pto_wheel",
+        format!("ch.resolver_to_idle_wheel.{variant}"),
+        "PTO wheel updates idle scheduling",
+        "endpoint::tasks::send_worker",
+    );
+    spawner.register_channel_receiver(
+        "task.idle_wheel",
+        format!("ch.resolver_to_idle_wheel.{variant}"),
+        "Idle wheel drains scheduled contexts",
+        "endpoint::tasks::send_worker",
     );
     spawner.register_channel(
         ChannelRegistration::new(
             format!("ch.ack_to_completion.{variant}"),
             "Completed frame channel from ack/invalidation tasks to completion dispatcher",
             "endpoint::tasks::send_worker",
-            "task.ack_processor",
-            "task.completion",
         )
-        .with_metric(format!("q.ack_to_completion.variant={variant}")),
+        .with_metric(MetricRegistration::new(
+            format!("q.ack_to_completion.variant={variant}"),
+            MetricKind::Gauge,
+            "Queue depth from ack/invalidation to completion dispatcher",
+        )),
+    );
+    spawner.register_channel_sender(
+        "task.ack_processor",
+        format!("ch.ack_to_completion.{variant}"),
+        "ACK processor emits completed frames",
+        "endpoint::tasks::send_worker",
+    );
+    spawner.register_channel_sender(
+        "task.invalidation",
+        format!("ch.ack_to_completion.{variant}"),
+        "Invalidation task emits failed frames as completions",
+        "endpoint::tasks::send_worker",
+    );
+    spawner.register_channel_receiver(
+        "task.completion",
+        format!("ch.ack_to_completion.{variant}"),
+        "Completion task drains completed frames",
+        "endpoint::tasks::send_worker",
     );
     spawner.register_channel(
         ChannelRegistration::new(
             format!("ch.ack_to_cancelled.{variant}"),
             "Cancelled frame channel drained by cancelled task",
             "endpoint::tasks::send_worker",
-            "task.ack_processor",
-            "task.cancelled",
         )
-        .with_metric(format!("q.ack_to_cancelled.variant={variant}")),
+        .with_metric(MetricRegistration::new(
+            format!("q.ack_to_cancelled.variant={variant}"),
+            MetricKind::Gauge,
+            "Queue depth from ack processor to cancelled-frame drain",
+        )),
+    );
+    spawner.register_channel_sender(
+        "task.ack_processor",
+        format!("ch.ack_to_cancelled.{variant}"),
+        "ACK processor emits cancelled frames",
+        "endpoint::tasks::send_worker",
+    );
+    spawner.register_channel_receiver(
+        "task.cancelled",
+        format!("ch.ack_to_cancelled.{variant}"),
+        "Cancelled task drains cancelled frames",
+        "endpoint::tasks::send_worker",
     );
 
     // Task 1: context resolver — drain batch_rx, resolve to context, push frames.
@@ -342,10 +462,7 @@ pub fn send_worker<Socket, Clk, WakerSink, AckComp>(
             "task.context_resolver",
             "Resolves frame batches to send contexts and schedules wheels",
             "endpoint::tasks::send_worker",
-        )
-        .with_metric("task.context_resolver.drained")
-        .with_metric("task.context_resolver.time")
-        .with_metric("task.context_resolver.next_poll_latency"),
+        ),
         rx,
         Some(budgets.context_resolver),
         task_counter,
@@ -383,10 +500,7 @@ pub fn send_worker<Socket, Clk, WakerSink, AckComp>(
             "task.ack_processor",
             "Processes ACK feedback and re-schedules contexts across wheels",
             "endpoint::tasks::send_worker",
-        )
-        .with_metric("task.ack_processor.drained")
-        .with_metric("task.ack_processor.time")
-        .with_metric("task.ack_processor.next_poll_latency"),
+        ),
         rx,
         Some(budgets.ack_processor),
         task_counter,
@@ -401,10 +515,7 @@ pub fn send_worker<Socket, Clk, WakerSink, AckComp>(
             "task.completion",
             "Dispatches completion notifications back to writer wakers",
             "endpoint::tasks::send_worker",
-        )
-        .with_metric("task.completion.drained")
-        .with_metric("task.completion.time")
-        .with_metric("task.completion.next_poll_latency"),
+        ),
         rx,
         Some(budgets.completion_acked),
         task_counter,
@@ -419,10 +530,7 @@ pub fn send_worker<Socket, Clk, WakerSink, AckComp>(
             "task.cancelled",
             "Drains cancelled frames that no longer have an owner",
             "endpoint::tasks::send_worker",
-        )
-        .with_metric("task.cancelled.drained")
-        .with_metric("task.cancelled.time")
-        .with_metric("task.cancelled.next_poll_latency"),
+        ),
         rx,
         Some(budgets.completion_cancelled),
         task_counter,
@@ -455,9 +563,7 @@ pub fn send_worker<Socket, Clk, WakerSink, AckComp>(
             "endpoint::tasks::send_worker",
         )
         .with_budget(Some(budgets.tx_wheel))
-        .with_metric("task.tx_wheel.drained")
-        .with_metric("task.tx_wheel.time")
-        .with_metric("task.tx_wheel.next_poll_latency"),
+        .with_standard_task_metrics(),
         tx_wheel_task,
     );
 
@@ -495,10 +601,7 @@ pub fn send_worker<Socket, Clk, WakerSink, AckComp>(
             "task.pto_wheel",
             "Handles probe-timeout expirations and wheel re-scheduling",
             "endpoint::tasks::send_worker",
-        )
-        .with_metric("task.pto_wheel.drained")
-        .with_metric("task.pto_wheel.time")
-        .with_metric("task.pto_wheel.next_poll_latency"),
+        ),
         rx,
         Some(budgets.pto_wheel),
         task_counter,
@@ -525,9 +628,7 @@ pub fn send_worker<Socket, Clk, WakerSink, AckComp>(
             "endpoint::tasks::send_worker",
         )
         .with_budget(Some(budgets.idle_wheel))
-        .with_metric("task.idle_wheel.drained")
-        .with_metric("task.idle_wheel.time")
-        .with_metric("task.idle_wheel.next_poll_latency"),
+        .with_standard_task_metrics(),
         idle_wheel_task,
     );
 
@@ -545,10 +646,24 @@ pub fn send_worker<Socket, Clk, WakerSink, AckComp>(
                 format!("ch.wheel_to_assembler.send.{sender_idx}"),
                 "Per-socket queue from tx wheel to assembler+socket sender task",
                 "endpoint::tasks::send_worker",
-                "task.tx_wheel",
-                "task.assembler",
             )
-            .with_metric(format!("q.wheel_to_assembler.variant=send.{sender_idx}")),
+            .with_metric(MetricRegistration::new(
+                format!("q.wheel_to_assembler.variant=send.{sender_idx}"),
+                MetricKind::Gauge,
+                "Queue depth from tx wheel to assembler",
+            )),
+        );
+        spawner.register_channel_sender(
+            "task.tx_wheel",
+            format!("ch.wheel_to_assembler.send.{sender_idx}"),
+            "Tx wheel routes expired contexts to socket assembler",
+            "endpoint::tasks::send_worker",
+        );
+        spawner.register_channel_receiver(
+            "task.assembler",
+            format!("ch.wheel_to_assembler.send.{sender_idx}"),
+            "Assembler drains contexts assigned to this socket",
+            "endpoint::tasks::send_worker",
         );
 
         let clock = st.clock.clone();
@@ -592,10 +707,7 @@ pub fn send_worker<Socket, Clk, WakerSink, AckComp>(
                 "task.assembler",
                 "Assembles and sends packets for one socket sender id",
                 "endpoint::tasks::send_worker",
-            )
-            .with_metric("task.assembler.drained")
-            .with_metric("task.assembler.time")
-            .with_metric("task.assembler.next_poll_latency"),
+            ),
             rx,
             Some(budgets.assembler),
             task_counter,
@@ -613,10 +725,7 @@ pub fn send_worker<Socket, Clk, WakerSink, AckComp>(
                 "task.invalidation",
                 "Purges revoked path secrets from send cache and emits completions",
                 "endpoint::tasks::send_worker",
-            )
-            .with_metric("task.invalidation.drained")
-            .with_metric("task.invalidation.time")
-            .with_metric("task.invalidation.next_poll_latency"),
+            ),
             rx,
             Some(budgets.invalidation),
             task_counter,

@@ -15,8 +15,46 @@
 
 use crate::time::precision;
 use crate::{counter, socket::channel};
+use core::fmt;
 use s2n_quic_core::time;
 use std::future::Future;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MetricKind {
+    Counter,
+    Gauge,
+    Summary,
+    Timer,
+}
+
+impl fmt::Display for MetricKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Counter => f.write_str("counter"),
+            Self::Gauge => f.write_str("gauge"),
+            Self::Summary => f.write_str("summary"),
+            Self::Timer => f.write_str("timer"),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct MetricRegistration {
+    pub name: String,
+    pub kind: MetricKind,
+    pub description: String,
+}
+
+impl MetricRegistration {
+    #[inline]
+    pub fn new(name: impl fmt::Display, kind: MetricKind, description: impl fmt::Display) -> Self {
+        Self {
+            name: name.to_string(),
+            kind,
+            description: description.to_string(),
+        }
+    }
+}
 
 /// Describes a spawned pipeline task for runtime-level introspection.
 #[derive(Clone, Debug)]
@@ -25,20 +63,20 @@ pub struct TaskRegistration {
     pub description: String,
     pub function: String,
     pub budget: Option<usize>,
-    pub metrics: Vec<String>,
+    pub metrics: Vec<MetricRegistration>,
 }
 
 impl TaskRegistration {
     #[inline]
     pub fn new(
-        name: impl Into<String>,
-        description: impl Into<String>,
-        function: impl Into<String>,
+        name: impl fmt::Display,
+        description: impl fmt::Display,
+        function: impl fmt::Display,
     ) -> Self {
         Self {
-            name: name.into(),
-            description: description.into(),
-            function: function.into(),
+            name: name.to_string(),
+            description: description.to_string(),
+            function: function.to_string(),
             budget: None,
             metrics: Vec::new(),
         }
@@ -51,46 +89,112 @@ impl TaskRegistration {
     }
 
     #[inline]
-    pub fn with_metric(mut self, metric: impl Into<String>) -> Self {
-        self.metrics.push(metric.into());
+    pub fn with_metric(mut self, metric: MetricRegistration) -> Self {
+        self.upsert_metric(metric);
         self
+    }
+
+    #[inline]
+    pub fn with_standard_task_metrics(mut self) -> Self {
+        self.upsert_metric(MetricRegistration::new(
+            format!("{}.drained", self.name),
+            MetricKind::Summary,
+            "Number of items processed per poll for this task",
+        ));
+        self.upsert_metric(MetricRegistration::new(
+            format!("{}.time", self.name),
+            MetricKind::Timer,
+            "Wall-clock duration spent inside each task poll",
+        ));
+        self.upsert_metric(MetricRegistration::new(
+            format!("{}.next_poll_latency", self.name),
+            MetricKind::Timer,
+            "Wall-clock latency between consecutive task polls",
+        ));
+        self
+    }
+
+    #[inline]
+    fn upsert_metric(&mut self, metric: MetricRegistration) {
+        if let Some(current) = self.metrics.iter_mut().find(|m| m.name == metric.name) {
+            *current = metric;
+        } else {
+            self.metrics.push(metric);
+        }
     }
 }
 
-/// Describes a channel/queue edge between tasks for runtime-level introspection.
+/// Describes a channel/queue entity in the runtime pipeline.
 #[derive(Clone, Debug)]
 pub struct ChannelRegistration {
     pub name: String,
     pub description: String,
     pub function: String,
-    pub from_task: String,
-    pub to_task: String,
-    pub metrics: Vec<String>,
+    pub metrics: Vec<MetricRegistration>,
 }
 
 impl ChannelRegistration {
     #[inline]
     pub fn new(
-        name: impl Into<String>,
-        description: impl Into<String>,
-        function: impl Into<String>,
-        from_task: impl Into<String>,
-        to_task: impl Into<String>,
+        name: impl fmt::Display,
+        description: impl fmt::Display,
+        function: impl fmt::Display,
     ) -> Self {
         Self {
-            name: name.into(),
-            description: description.into(),
-            function: function.into(),
-            from_task: from_task.into(),
-            to_task: to_task.into(),
+            name: name.to_string(),
+            description: description.to_string(),
+            function: function.to_string(),
             metrics: Vec::new(),
         }
     }
 
     #[inline]
-    pub fn with_metric(mut self, metric: impl Into<String>) -> Self {
-        self.metrics.push(metric.into());
+    pub fn with_metric(mut self, metric: MetricRegistration) -> Self {
+        self.metrics.push(metric);
         self
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ChannelDirection {
+    Sends,
+    Receives,
+}
+
+impl fmt::Display for ChannelDirection {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Sends => f.write_str("sends"),
+            Self::Receives => f.write_str("receives"),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct ChannelBinding {
+    pub task_name: String,
+    pub channel_name: String,
+    pub direction: ChannelDirection,
+    pub description: String,
+    pub function: String,
+}
+
+impl ChannelBinding {
+    #[inline]
+    pub fn new(
+        task_name: impl fmt::Display,
+        channel_name: impl fmt::Display,
+        direction: ChannelDirection,
+        description: impl fmt::Display,
+        function: impl fmt::Display,
+    ) -> Self {
+        Self {
+            task_name: task_name.to_string(),
+            channel_name: channel_name.to_string(),
+            direction,
+            description: description.to_string(),
+            function: function.to_string(),
+        }
     }
 }
 
@@ -137,6 +241,46 @@ pub trait Spawner {
     #[inline]
     fn register_channel(&mut self, _channel: ChannelRegistration) {}
 
+    /// Register a relationship between a task and a channel entity.
+    #[inline]
+    fn register_channel_binding(&mut self, _binding: ChannelBinding) {}
+
+    /// Register that a task sends on a channel.
+    #[inline]
+    fn register_channel_sender(
+        &mut self,
+        task_name: impl fmt::Display,
+        channel_name: impl fmt::Display,
+        description: impl fmt::Display,
+        function: impl fmt::Display,
+    ) {
+        self.register_channel_binding(ChannelBinding::new(
+            task_name,
+            channel_name,
+            ChannelDirection::Sends,
+            description,
+            function,
+        ));
+    }
+
+    /// Register that a task receives from a channel.
+    #[inline]
+    fn register_channel_receiver(
+        &mut self,
+        task_name: impl fmt::Display,
+        channel_name: impl fmt::Display,
+        description: impl fmt::Display,
+        function: impl fmt::Display,
+    ) {
+        self.register_channel_binding(ChannelBinding::new(
+            task_name,
+            channel_name,
+            ChannelDirection::Receives,
+            description,
+            function,
+        ));
+    }
+
     /// Spawn a !Send future and register metadata for the task.
     #[inline]
     fn spawn_named<F>(&mut self, task: TaskRegistration, future: F)
@@ -160,7 +304,7 @@ pub trait Spawner {
         Self: Sized,
     {
         use crate::socket::channel::ReceiverExt as _;
-        let task = task.with_budget(budget);
+        let task = task.with_budget(budget).with_standard_task_metrics();
         self.spawn_named(task, receiver.drain_budgeted_metered(budget, task_counter));
     }
 }
@@ -401,7 +545,9 @@ pub mod tokio {
 
 /// Wrapper runtime that records per-worker task/channel registrations and can emit DOT graphs.
 pub mod inspector {
-    use super::{ChannelRegistration, Runtime, Spawner, TaskRegistration};
+    use super::{
+        ChannelBinding, ChannelDirection, ChannelRegistration, Runtime, Spawner, TaskRegistration,
+    };
     use std::{
         collections::BTreeMap,
         sync::{Arc, Mutex},
@@ -417,6 +563,7 @@ pub mod inspector {
     struct State {
         tasks: Vec<RegisteredTask>,
         channels: Vec<RegisteredChannel>,
+        channel_bindings: Vec<RegisteredChannelBinding>,
     }
 
     #[derive(Clone)]
@@ -429,6 +576,12 @@ pub mod inspector {
     struct RegisteredChannel {
         worker_id: usize,
         channel: ChannelRegistration,
+    }
+
+    #[derive(Clone)]
+    struct RegisteredChannelBinding {
+        worker_id: usize,
+        binding: ChannelBinding,
     }
 
     impl<R: Runtime> Handle<R> {
@@ -452,6 +605,7 @@ pub mod inspector {
             }
 
             let mut task_node_ids = std::collections::HashMap::new();
+            let mut channel_node_ids = std::collections::HashMap::new();
             for worker_id in 0..self.inner.worker_count() {
                 out.push_str(&format!("  subgraph cluster_worker_{worker_id} {{\n"));
                 out.push_str(&format!("    label=\"worker {worker_id}\";\n"));
@@ -463,11 +617,7 @@ pub mod inspector {
                             .budget
                             .map(|v| v.to_string())
                             .unwrap_or_else(|| "none".to_string());
-                        let metrics = if task.metrics.is_empty() {
-                            "none".to_string()
-                        } else {
-                            task.metrics.join(", ")
-                        };
+                        let metrics = metric_summary(&task.metrics);
                         let label = format!(
                             "{}\\nfn: {}\\nbudget: {}\\nmetrics: {}\\n{}",
                             task.name, task.function, budget, metrics, task.description
@@ -478,30 +628,54 @@ pub mod inspector {
                         ));
                     }
                 }
+                for (idx, channel) in state
+                    .channels
+                    .iter()
+                    .filter(|channel| channel.worker_id == worker_id)
+                    .enumerate()
+                {
+                    let node_id = format!("w{worker_id}_c{idx}");
+                    channel_node_ids
+                        .insert((worker_id, channel.channel.name.clone()), node_id.clone());
+                    let metrics = metric_summary(&channel.channel.metrics);
+                    let label = format!(
+                        "{}\\nfn: {}\\nmetrics: {}\\n{}",
+                        channel.channel.name,
+                        channel.channel.function,
+                        metrics,
+                        channel.channel.description
+                    );
+                    out.push_str(&format!(
+                        "    {node_id} [shape=ellipse,label=\"{}\"];\n",
+                        escape_dot(&label)
+                    ));
+                }
                 out.push_str("  }\n");
             }
 
-            for channel in &state.channels {
-                let worker_id = channel.worker_id;
-                let Some(from) = task_node_ids.get(&(worker_id, channel.channel.from_task.clone()))
+            for binding in &state.channel_bindings {
+                let worker_id = binding.worker_id;
+                let Some(task_node) =
+                    task_node_ids.get(&(worker_id, binding.binding.task_name.clone()))
                 else {
                     continue;
                 };
-                let Some(to) = task_node_ids.get(&(worker_id, channel.channel.to_task.clone()))
+                let Some(channel_node) =
+                    channel_node_ids.get(&(worker_id, binding.binding.channel_name.clone()))
                 else {
                     continue;
                 };
-                let metrics = if channel.channel.metrics.is_empty() {
-                    "none".to_string()
+
+                let (from, to) = if binding.binding.direction == ChannelDirection::Sends {
+                    (task_node, channel_node)
                 } else {
-                    channel.channel.metrics.join(", ")
+                    (channel_node, task_node)
                 };
                 let label = format!(
-                    "{}\\nfn: {}\\nmetrics: {}\\n{}",
-                    channel.channel.name,
-                    channel.channel.function,
-                    metrics,
-                    channel.channel.description
+                    "{}\\nfn: {}\\n{}",
+                    binding.binding.direction,
+                    binding.binding.function,
+                    binding.binding.description
                 );
                 out.push_str(&format!(
                     "  {from} -> {to} [label=\"{}\"];\n",
@@ -512,10 +686,41 @@ pub mod inspector {
             out.push_str("}\n");
             out
         }
+
+        pub fn channel_bindings(&self) -> Vec<String> {
+            let state = self.state.lock().expect("inspector lock poisoned");
+            let mut bindings: Vec<_> = state
+                .channel_bindings
+                .iter()
+                .map(|entry| {
+                    format!(
+                        "worker {}: task '{}' {} on channel '{}'",
+                        entry.worker_id,
+                        entry.binding.task_name,
+                        entry.binding.direction,
+                        entry.binding.channel_name
+                    )
+                })
+                .collect();
+            bindings.sort();
+            bindings
+        }
     }
 
     fn escape_dot(input: &str) -> String {
         input.replace('\\', "\\\\").replace('"', "\\\"")
+    }
+
+    fn metric_summary(metrics: &[super::MetricRegistration]) -> String {
+        if metrics.is_empty() {
+            "none".to_string()
+        } else {
+            metrics
+                .iter()
+                .map(|metric| format!("{} [{}]: {}", metric.name, metric.kind, metric.description))
+                .collect::<Vec<_>>()
+                .join("\\n")
+        }
     }
 
     impl<R: Runtime> Runtime for Handle<R> {
@@ -582,6 +787,18 @@ pub mod inspector {
                 });
             self.inner.register_channel(channel);
         }
+
+        fn register_channel_binding(&mut self, binding: ChannelBinding) {
+            self.state
+                .lock()
+                .expect("inspector lock poisoned")
+                .channel_bindings
+                .push(RegisteredChannelBinding {
+                    worker_id: self.worker_id,
+                    binding: binding.clone(),
+                });
+            self.inner.register_channel_binding(binding);
+        }
     }
 }
 
@@ -603,29 +820,26 @@ mod tests {
 
     #[test]
     fn inspector_runtime_emits_dot_with_worker_task_and_channel_metadata() {
-        let rt = inspector::Handle::new(tokio::Handle::new(2));
-        let (tx, rx_done) = std::sync::mpsc::channel();
+        let rt = inspector::Handle::new(bach::Handle::new(2));
 
-        rt.spawn_local(1, move |mut local| {
-            local.spawn_named(
+        rt.spawn_local(1, |mut local| {
+            local.register_task(
                 TaskRegistration::new(
                     "task.producer",
                     "Produces work for downstream pipeline stages",
                     "tests::producer",
                 )
                 .with_budget(Some(32))
-                .with_metric("task.producer.drained"),
-                async {},
+                .with_standard_task_metrics(),
             );
 
-            local.spawn_named(
+            local.register_task(
                 TaskRegistration::new(
                     "task.consumer",
                     "Consumes work from producer",
                     "tests::consumer",
                 )
-                .with_metric("task.consumer.drained"),
-                async {},
+                .with_standard_task_metrics(),
             );
 
             local.register_channel(
@@ -633,22 +847,28 @@ mod tests {
                     "ch.producer_to_consumer",
                     "Unsync queue carrying producer items",
                     "tests::channel",
-                    "task.producer",
-                    "task.consumer",
                 )
-                .with_metric("q.producer_to_consumer.depth"),
+                .with_metric(MetricRegistration::new(
+                    "q.producer_to_consumer.depth",
+                    MetricKind::Gauge,
+                    "Queue depth",
+                )),
             );
-            tx.send(()).expect("test sync channel should be open");
+            local.register_channel_sender(
+                "task.producer",
+                "ch.producer_to_consumer",
+                "Producer enqueues messages",
+                "tests::producer",
+            );
+            local.register_channel_receiver(
+                "task.consumer",
+                "ch.producer_to_consumer",
+                "Consumer dequeues messages",
+                "tests::consumer",
+            );
         });
-        rx_done
-            .recv_timeout(std::time::Duration::from_secs(1))
-            .expect("worker should run registration closure");
 
-        let dot = rt.to_dot();
-        assert!(dot.contains("cluster_worker_1"));
-        assert!(dot.contains("task.producer"));
-        assert!(dot.contains("task.consumer"));
-        assert!(dot.contains("ch.producer_to_consumer"));
-        assert!(dot.contains("budget: 32"));
+        insta::assert_snapshot!(rt.to_dot());
+        insta::assert_snapshot!(rt.channel_bindings().join("\n"));
     }
 }
