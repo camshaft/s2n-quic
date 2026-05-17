@@ -664,7 +664,7 @@ fn ack_rtt_tracker_clear_removes_pending() {
 }
 
 /// When only one ack-eliciting ACK-only packet has been sent (stable == latest),
-/// ACKing it should return that packet's time_sent and clear the tracker.
+/// ACKing it should return that packet's time_sent and set sampled=true.
 #[test]
 fn ack_rtt_tracker_single_send_acked() {
     let mut tracker = AckRttTracker::default();
@@ -672,9 +672,16 @@ fn ack_rtt_tracker_single_send_acked() {
     tracker.on_sent(make_varint(5), sent_time);
 
     // ACK range [3, 7] covers PN 5.
-    let result = tracker.check_range(make_varint(3), make_varint(7), make_varint(7));
+    let result = tracker.check_range(make_varint(3), make_varint(7));
     assert_eq!(result, Some(sent_time), "should return time_sent when PN covered");
-    assert!(!tracker.is_pending(), "tracker cleared after match");
+    // sampled=true → is_pending()=true (cooldown prevents re-probe)
+    assert!(
+        tracker.is_pending(),
+        "tracker is still pending (sampled=true) to prevent ACK loop"
+    );
+    // clear() resets sampled so a new probe can be started after data flows
+    tracker.clear();
+    assert!(!tracker.is_pending(), "tracker cleared after clear()");
 }
 
 /// Latest (fresher) sample should be preferred when both stable and latest are set
@@ -684,19 +691,22 @@ fn ack_rtt_tracker_latest_preferred_over_stable() {
     let mut tracker = AckRttTracker::default();
     let t1 = make_ts(100);
     let t5 = make_ts(105);
-    // First send establishes stable; second send updates latest.
+    // First send (ack-eliciting) establishes stable; second send updates latest.
     tracker.on_sent(make_varint(1), t1);
     tracker.on_sent(make_varint(5), t5);
 
     // ACK covers PN 5 (latest) but not PN 1 (stable).
-    let result = tracker.check_range(make_varint(5), make_varint(5), make_varint(5));
+    let result = tracker.check_range(make_varint(5), make_varint(5));
     assert_eq!(result, Some(t5), "latest time_sent should be returned");
-    assert!(!tracker.is_pending(), "both slots cleared when latest is ACKed");
+    // sampled=true → is_pending()=true (cooldown)
+    assert!(
+        tracker.is_pending(),
+        "sampled=true after consuming latest — re-probe suppressed"
+    );
 }
 
-/// When latest is lost but stable is ACKed, the stable's time_sent is returned
-/// and stable is advanced to whatever latest holds (None in this case, since
-/// latest was lost before stable could be updated).
+/// When latest is lost but stable is ACKed, stable's time_sent is returned and
+/// stable is advanced to latest. Loss of latest is handled in on_ack_done.
 #[test]
 fn ack_rtt_tracker_stable_fallback_when_latest_lost() {
     let mut tracker = AckRttTracker::default();
@@ -705,35 +715,33 @@ fn ack_rtt_tracker_stable_fallback_when_latest_lost() {
     tracker.on_sent(make_varint(1), t1); // stable = (1, t1)
     tracker.on_sent(make_varint(5), t5); // latest = (5, t5)
 
-    // ACK covers PN 1 (stable) but not PN 5 (latest). Largest = 6 > 5 so latest is lost.
-    // stable check: 1 in [1,1] → return t1, advance stable = latest.take() (None because
-    // we check stable after having already taken latest in the loss branch? Actually the
-    // latest loss runs AFTER the stable check, so let's verify the order matters here.)
-    //
-    // The stable check happens before loss detection, so at the point of the stable match:
-    //   - self.latest is still Some(5, t5)
-    //   - stable ACKed → self.stable = self.latest.take() → stable becomes Some(5, t5)
-    // Then we return t1 WITHOUT running loss detection (early return).
-    // So after this call: stable = Some(5, t5), latest = None.
-    let result = tracker.check_range(make_varint(1), make_varint(1), make_varint(6));
+    // ACK covers PN 1 (stable) but not PN 5 (latest).
+    // check_range: stable ACKed → advance stable = latest.take() = (5,t5), sampled=true.
+    let result = tracker.check_range(make_varint(1), make_varint(1));
     assert_eq!(result, Some(t1), "stable fallback time_sent returned");
-    // stable was advanced to latest=(5,t5), so is_pending() is true
+    // stable advanced to (5,t5), sampled=true → is_pending()=true
+    assert!(tracker.is_pending(), "still pending (sampled + advanced stable)");
+
+    // After all ranges: on_ack_done(6) declares pn=5 lost (6 > 5).
+    tracker.on_ack_done(make_varint(6));
+    // stable cleared (was 5, lost); sampled still true → is_pending()=true
     assert!(
         tracker.is_pending(),
-        "stable advanced to latest — still pending for a fresher sample"
+        "sampled=true keeps pending even after stable is lost"
     );
 }
 
-/// When only stable is set and the peer ACKs it, both slots should be clear.
+/// When only stable is set and the peer ACKs it, sampled is set.
 #[test]
 fn ack_rtt_tracker_single_send_stable_acked() {
     let mut tracker = AckRttTracker::default();
     let sent_time = make_ts(200);
     tracker.on_sent(make_varint(10), sent_time);
 
-    let result = tracker.check_range(make_varint(10), make_varint(10), make_varint(10));
+    let result = tracker.check_range(make_varint(10), make_varint(10));
     assert_eq!(result, Some(sent_time));
-    assert!(!tracker.is_pending());
+    // sampled=true → is_pending()=true
+    assert!(tracker.is_pending(), "sampled=true after consuming sample");
 }
 
 #[test]
@@ -742,28 +750,31 @@ fn ack_rtt_tracker_check_range_no_match_does_not_clear_when_larger_not_acked() {
     tracker.on_sent(make_varint(10), make_ts(100));
 
     // ACK range [1, 5] does not cover PN 10; largest_acknowledged=5 < 10.
-    let result = tracker.check_range(make_varint(1), make_varint(5), make_varint(5));
+    let result = tracker.check_range(make_varint(1), make_varint(5));
     assert!(result.is_none(), "no match expected");
+    tracker.on_ack_done(make_varint(5));
     assert!(
         tracker.is_pending(),
         "tracker should remain pending when largest_acked < stable_pn"
     );
 }
 
-/// Both stable and latest are declared lost when the peer acknowledges a PN
-/// strictly larger than both without covering either.
+/// Both stable and latest are declared lost via on_ack_done when the peer
+/// acknowledges a PN strictly larger than both without covering either.
 #[test]
 fn ack_rtt_tracker_both_cleared_when_both_lost() {
     let mut tracker = AckRttTracker::default();
     tracker.on_sent(make_varint(3), make_ts(100)); // stable = (3,_)
     tracker.on_sent(make_varint(7), make_ts(105)); // latest = (7,_)
 
-    // ACK range [10, 15], largest=15 > 7 > 3 → both lost.
-    let result = tracker.check_range(make_varint(10), make_varint(15), make_varint(15));
+    // ACK range [10, 15] — neither pn=3 nor pn=7 is covered.
+    let result = tracker.check_range(make_varint(10), make_varint(15));
     assert!(result.is_none(), "no RTT sample from lost packets");
+    // largest=15 > 7 > 3 → on_ack_done declares both lost.
+    tracker.on_ack_done(make_varint(15));
     assert!(
         !tracker.is_pending(),
-        "both slots cleared by loss detection"
+        "both slots cleared by loss detection; sampled NOT set (packets were lost)"
     );
 }
 
@@ -771,6 +782,98 @@ fn ack_rtt_tracker_both_cleared_when_both_lost() {
 fn ack_rtt_tracker_returns_none_when_not_pending() {
     let mut tracker = AckRttTracker::default();
     // No pending sample → check_range is a no-op returning None.
-    let result = tracker.check_range(make_varint(0), make_varint(100), make_varint(100));
+    let result = tracker.check_range(make_varint(0), make_varint(100));
     assert!(result.is_none());
+}
+
+/// After a sample is consumed (sampled=true), the tracker remains pending until
+/// clear() is called. This prevents an ACK loop: the assembler won't make further
+/// ACK-only packets ack-eliciting until new data flows through the inflight map.
+#[test]
+fn ack_rtt_tracker_sampled_prevents_reprobe_until_clear() {
+    let mut tracker = AckRttTracker::default();
+    tracker.on_sent(make_varint(1), make_ts(100));
+
+    // Consume the sample.
+    let _ = tracker.check_range(make_varint(1), make_varint(1));
+    assert!(
+        tracker.is_pending(),
+        "sampled=true → is_pending()=true → assembler will not re-probe"
+    );
+
+    // clear() represents data entering the inflight map, which resets the tracker.
+    tracker.clear();
+    assert!(
+        !tracker.is_pending(),
+        "after clear(), tracker is ready to probe again"
+    );
+}
+
+/// on_non_eliciting_sent updates `latest` while a probe is in-flight, giving
+/// a fresher sample if the peer's ACK range covers the new PN.
+#[test]
+fn ack_rtt_tracker_on_non_eliciting_sent_updates_latest() {
+    let mut tracker = AckRttTracker::default();
+    let t1 = make_ts(100);
+    let t2 = make_ts(110);
+    tracker.on_sent(make_varint(1), t1); // ack-eliciting: stable=(1,t1), latest=(1,t1)
+
+    // Non-ack-eliciting send while probe is in-flight.
+    tracker.on_non_eliciting_sent(make_varint(2), t2); // latest=(2,t2), stable unchanged
+
+    // Peer's ACK range covers PN 2 (the non-eliciting send).
+    let result = tracker.check_range(make_varint(2), make_varint(2));
+    assert_eq!(result, Some(t2), "fresher sample from non-eliciting send");
+}
+
+/// on_non_eliciting_sent is a no-op when no probe is in-flight.
+#[test]
+fn ack_rtt_tracker_on_non_eliciting_sent_noop_when_no_probe() {
+    let mut tracker = AckRttTracker::default();
+    // No probe in-flight (stable=None).
+    tracker.on_non_eliciting_sent(make_varint(5), make_ts(100));
+    assert!(!tracker.is_pending(), "no-op when stable=None");
+}
+
+/// Loss detection in on_ack_done does NOT set sampled — the probe was lost so
+/// we should be free to probe again without waiting for clear().
+#[test]
+fn ack_rtt_tracker_loss_does_not_set_sampled() {
+    let mut tracker = AckRttTracker::default();
+    tracker.on_sent(make_varint(3), make_ts(100)); // stable=(3,_), latest=(3,_)
+
+    // Peer ACKs [10,15] — pn=3 not covered; largest=15 > 3 → declared lost.
+    let result = tracker.check_range(make_varint(10), make_varint(15));
+    assert!(result.is_none());
+    tracker.on_ack_done(make_varint(15));
+    assert!(
+        !tracker.is_pending(),
+        "after loss, not pending — re-probe is allowed"
+    );
+}
+
+/// on_ack_done correctly handles the case where ranges are delivered
+/// largest-first: if a small range covers the tracked PN, check_range consumes
+/// it, and on_ack_done does not spuriously clear a valid state.
+#[test]
+fn ack_rtt_tracker_multi_range_ack_largest_first() {
+    let mut tracker = AckRttTracker::default();
+    let sent_time = make_ts(100);
+    tracker.on_sent(make_varint(3), sent_time); // stable=(3,_)
+
+    // Simulate ACK frame with two ranges delivered largest-first:
+    //   range [10,15] — does not cover pn=3
+    //   range [1,5]   — covers pn=3
+    // With the old per-range loss heuristic, the first range would declare pn=3
+    // lost (largest=15 > 3, not in [10,15]). The new approach defers loss to
+    // on_ack_done, so the second range correctly returns the sample.
+    let r1 = tracker.check_range(make_varint(10), make_varint(15)); // no match
+    assert!(r1.is_none());
+
+    let r2 = tracker.check_range(make_varint(1), make_varint(5)); // covers pn=3
+    assert_eq!(r2, Some(sent_time), "second range should still yield sample");
+
+    tracker.on_ack_done(make_varint(15));
+    // sampled=true after consuming in r2
+    assert!(tracker.is_pending(), "sampled=true after successful probe");
 }

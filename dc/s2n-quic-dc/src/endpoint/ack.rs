@@ -68,11 +68,7 @@ pub(crate) fn process_ack<Clk, Rand>(
 
         // Check whether this range covers the outstanding ack-eliciting ACK-only
         // packet (if any) and collect the RTT sample.
-        if let Some(time_sent) =
-            context
-                .rtt_tracker
-                .check_range(start, end, max_acked_pn)
-        {
+        if let Some(time_sent) = context.rtt_tracker.check_range(start, end) {
             ack_only_rtt_sample = Some(time_sent);
         }
 
@@ -145,6 +141,12 @@ pub(crate) fn process_ack<Clk, Rand>(
             }
         }
     }
+
+    // Finalize loss detection for the ACK-only RTT tracker. This must be called
+    // after all ranges have been processed so that the loss heuristic does not
+    // fire on the first (largest) range and discard a slot that would have been
+    // covered by a later (smaller) range in the same ACK frame.
+    context.rtt_tracker.on_ack_done(max_acked_pn);
 
     // Update RTT estimator and CCA.
     //
