@@ -3,15 +3,15 @@
 
 use core::time::Duration;
 use s2n_quic_dc_metrics::format::{
-    ParsedMetricsLine, histogram_count_min_max, histogram_value_at_percentile,
-    parse_histogram_buckets, parse_histogram_suffix,
+    histogram_count_min_max, histogram_value_at_percentile, parse_histogram_buckets,
+    parse_histogram_suffix, ParsedMetricsLine,
 };
 use std::{
     collections::HashMap,
     net::SocketAddr,
     sync::{
-        Arc, Mutex,
         atomic::{AtomicI64, Ordering},
+        Arc, Mutex,
     },
     time::Instant,
 };
@@ -580,6 +580,17 @@ pub struct Task {
     pub next_poll_latency: Timer,
 }
 
+impl Task {
+    pub const DRAINED_DESCRIPTION: &'static str =
+        "Number of items processed per poll for this task";
+    pub const DRAINED_UNIT: &'static str = "count";
+    pub const TIME_DESCRIPTION: &'static str = "Wall-clock duration spent inside each task poll";
+    pub const TIME_UNIT: &'static str = "microsecond";
+    pub const NEXT_POLL_LATENCY_DESCRIPTION: &'static str =
+        "Wall-clock latency between consecutive task polls";
+    pub const NEXT_POLL_LATENCY_UNIT: &'static str = "microsecond";
+}
+
 // ── QueueGauge ──────────────────────────────────────────────────────────────
 // TODO: add per-item sojourn time tracking (enqueue→dequeue latency as a histogram)
 
@@ -591,6 +602,18 @@ pub struct QueueGauge {
     pub drain: Counter,
     pub depth: Gauge,
     pub depth_distribution: Summary,
+}
+
+impl QueueGauge {
+    pub const ENQUEUED_DESCRIPTION: &'static str = "Total queue enqueue events";
+    pub const ENQUEUED_UNIT: &'static str = "count";
+    pub const DEQUEUED_DESCRIPTION: &'static str = "Total queue dequeue events";
+    pub const DEQUEUED_UNIT: &'static str = "count";
+    pub const DEPTH_DESCRIPTION: &'static str = "Current queue depth";
+    pub const DEPTH_UNIT: &'static str = "count";
+    pub const DEPTH_DISTRIBUTION_DESCRIPTION: &'static str =
+        "Distribution of observed queue depth values";
+    pub const DEPTH_DISTRIBUTION_UNIT: &'static str = "count";
 }
 
 impl QueueGauge {

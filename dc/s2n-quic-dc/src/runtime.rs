@@ -76,26 +76,32 @@ pub trait Metric {
     fn registrations(&self) -> Vec<MetricRegistration>;
 }
 
+impl Metric for MetricRegistration {
+    fn registrations(&self) -> Vec<MetricRegistration> {
+        vec![self.clone()]
+    }
+}
+
 impl Metric for counter::Task {
     fn registrations(&self) -> Vec<MetricRegistration> {
         let mut drained = MetricRegistration::new(
             format!("{}.drained", self.label),
             MetricKind::Summary,
-            "Number of items processed per poll for this task",
+            counter::Task::DRAINED_DESCRIPTION,
         )
-        .with_unit("count");
+        .with_unit(counter::Task::DRAINED_UNIT);
         let mut time = MetricRegistration::new(
             format!("{}.time", self.label),
             MetricKind::Timer,
-            "Wall-clock duration spent inside each task poll",
+            counter::Task::TIME_DESCRIPTION,
         )
-        .with_unit("microsecond");
+        .with_unit(counter::Task::TIME_UNIT);
         let mut next_poll_latency = MetricRegistration::new(
             format!("{}.next_poll_latency", self.label),
             MetricKind::Timer,
-            "Wall-clock latency between consecutive task polls",
+            counter::Task::NEXT_POLL_LATENCY_DESCRIPTION,
         )
-        .with_unit("microsecond");
+        .with_unit(counter::Task::NEXT_POLL_LATENCY_UNIT);
         if let Some(variant) = &self.variant {
             drained = drained.with_variant(variant);
             time = time.with_variant(variant);
@@ -110,27 +116,27 @@ impl Metric for counter::QueueGauge {
         let mut enqueued = MetricRegistration::new(
             format!("{}.enq", self.label),
             MetricKind::Counter,
-            "Total queue enqueue events",
+            counter::QueueGauge::ENQUEUED_DESCRIPTION,
         )
-        .with_unit("count");
+        .with_unit(counter::QueueGauge::ENQUEUED_UNIT);
         let mut dequeued = MetricRegistration::new(
             format!("{}.drain", self.label),
             MetricKind::Counter,
-            "Total queue dequeue events",
+            counter::QueueGauge::DEQUEUED_DESCRIPTION,
         )
-        .with_unit("count");
+        .with_unit(counter::QueueGauge::DEQUEUED_UNIT);
         let mut depth = MetricRegistration::new(
             format!("{}.depth", self.label),
             MetricKind::Gauge,
-            "Current queue depth",
+            counter::QueueGauge::DEPTH_DESCRIPTION,
         )
-        .with_unit("count");
+        .with_unit(counter::QueueGauge::DEPTH_UNIT);
         let mut depth_distribution = MetricRegistration::new(
             format!("{}.depth_dist", self.label),
             MetricKind::Summary,
-            "Distribution of observed queue depth values",
+            counter::QueueGauge::DEPTH_DISTRIBUTION_DESCRIPTION,
         )
-        .with_unit("count");
+        .with_unit(counter::QueueGauge::DEPTH_DISTRIBUTION_UNIT);
         if let Some(variant) = &self.variant {
             enqueued = enqueued.with_variant(variant);
             dequeued = dequeued.with_variant(variant);
@@ -174,42 +180,7 @@ impl TaskRegistration {
     }
 
     #[inline]
-    pub fn with_metric(mut self, metric: MetricRegistration) -> Self {
-        self.upsert_metric(metric);
-        self
-    }
-
-    #[inline]
-    pub fn with_standard_task_metrics(mut self) -> Self {
-        self.upsert_metric(
-            MetricRegistration::new(
-                format!("{}.drained", self.name),
-                MetricKind::Summary,
-                "Number of items processed per poll for this task",
-            )
-            .with_unit("count"),
-        );
-        self.upsert_metric(
-            MetricRegistration::new(
-                format!("{}.time", self.name),
-                MetricKind::Timer,
-                "Wall-clock duration spent inside each task poll",
-            )
-            .with_unit("microsecond"),
-        );
-        self.upsert_metric(
-            MetricRegistration::new(
-                format!("{}.next_poll_latency", self.name),
-                MetricKind::Timer,
-                "Wall-clock latency between consecutive task polls",
-            )
-            .with_unit("microsecond"),
-        );
-        self
-    }
-
-    #[inline]
-    pub fn with_metric_handle(mut self, metric: &impl Metric) -> Self {
+    pub fn with_metric(mut self, metric: &impl Metric) -> Self {
         for metric in metric.registrations() {
             self.upsert_metric(metric);
         }
@@ -255,13 +226,7 @@ impl ChannelRegistration {
     }
 
     #[inline]
-    pub fn with_metric(mut self, metric: MetricRegistration) -> Self {
-        self.metrics.push(metric);
-        self
-    }
-
-    #[inline]
-    pub fn with_metric_handle(mut self, metric: &impl Metric) -> Self {
+    pub fn with_metric(mut self, metric: &impl Metric) -> Self {
         self.metrics.extend(metric.registrations());
         self
     }
@@ -416,7 +381,7 @@ pub trait Spawner {
         Self: Sized,
     {
         use crate::socket::channel::ReceiverExt as _;
-        let task = task.with_budget(budget).with_metric_handle(&task_counter);
+        let task = task.with_budget(budget).with_metric(&task_counter);
         self.spawn_named(task, receiver.drain_budgeted_metered(budget, task_counter));
     }
 }
@@ -947,8 +912,11 @@ mod tests {
     #[test]
     fn inspector_runtime_emits_dot_with_worker_task_and_channel_metadata() {
         let rt = inspector::Handle::new(bach::Handle::new(2));
+        let counter_registry = crate::counter::Registry::new();
+        let counter_registry_for_worker = counter_registry.clone();
 
-        rt.spawn_local(1, |mut local| {
+        rt.spawn_local(1, move |mut local| {
+            let producer_counter = counter_registry_for_worker.register_task("task.producer");
             local.register_task(
                 TaskRegistration::new(
                     "task.producer",
@@ -956,16 +924,17 @@ mod tests {
                     "tests::producer",
                 )
                 .with_budget(Some(32))
-                .with_standard_task_metrics(),
+                .with_metric(&producer_counter),
             );
 
+            let consumer_counter = counter_registry_for_worker.register_task("task.consumer");
             local.register_task(
                 TaskRegistration::new(
                     "task.consumer",
                     "Consumes work from producer",
                     "tests::consumer",
                 )
-                .with_standard_task_metrics(),
+                .with_metric(&consumer_counter),
             );
 
             local.register_channel(
@@ -974,11 +943,9 @@ mod tests {
                     "Unsync queue carrying producer items",
                     "tests::channel",
                 )
-                .with_metric(MetricRegistration::new(
-                    "q.producer_to_consumer.depth",
-                    MetricKind::Gauge,
-                    "Current queue depth",
-                )),
+                .with_metric(
+                    &counter_registry_for_worker.register_queue_gauge("q.producer_to_consumer"),
+                ),
             );
             local.register_channel_sender(
                 "task.producer",

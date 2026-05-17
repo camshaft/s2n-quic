@@ -9,7 +9,7 @@ use crate::{
     intrusive::Entry,
     packet,
     socket::{
-        channel::{UnboundedSender, intrusive::sync as sync_queue},
+        channel::{intrusive::sync as sync_queue, UnboundedSender},
         pool::descriptor,
     },
     stream::PendingValidation,
@@ -17,7 +17,7 @@ use crate::{
 };
 use core::time::Duration;
 use s2n_quic_core::time;
-use std::sync::{Arc, atomic::AtomicU64};
+use std::sync::{atomic::AtomicU64, Arc};
 
 pub(crate) mod ack;
 pub(crate) mod assemble;
@@ -838,7 +838,7 @@ where
                         "Recv-context idle wheel queue from packet dispatch to idle drain",
                         "endpoint::Worker::spawn",
                     )
-                    .with_metric_handle(&q_recv_idle_wheel),
+                    .with_metric(&q_recv_idle_wheel),
                 );
                 local.register_channel_sender(
                     "task.packet_dispatch",
@@ -868,7 +868,7 @@ where
                             "endpoint::Worker::spawn",
                         )
                         .with_budget(Some(budgets.idle_wheel))
-                        .with_standard_task_metrics(),
+                        .with_metric(&task_counter),
                         tasks::recv_idle_wheel_drain(
                             recv_idle_wheel_rx,
                             recv_idle_wheel_tx.clone(),
@@ -939,7 +939,7 @@ where
                         "ACK completion queue from assembler tasks back to recv dispatch worker",
                         "endpoint::Worker::spawn",
                     )
-                    .with_metric_handle(&ack_completion_gauge),
+                    .with_metric(&ack_completion_gauge),
                 );
                 local.register_channel_sender(
                     "task.assembler",
