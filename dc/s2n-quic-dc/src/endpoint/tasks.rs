@@ -129,7 +129,7 @@ pub fn frame_dispatch<S, Clk>(
             )
     });
     for i in 0..Priority::LEVELS {
-        spawner.register_queue_channel(&q_router_to_batcher[i]);
+        spawner.register_queue_channel(&q_router_to_batcher[i], &counter_registry);
     }
 
     {
@@ -139,7 +139,7 @@ pub fn frame_dispatch<S, Clk>(
                 .sender("task.priority_router")
                 .with_description("Priority router emits per-lane frame queues")
                 .with_function("endpoint::tasks::frame_dispatch");
-            spawner.register_queue_sender(&sender);
+            spawner.register_queue_sender(&sender, &counter_registry);
         }
 
         let rx = FrameReceiver {
@@ -159,6 +159,7 @@ pub fn frame_dispatch<S, Clk>(
             rx.drain_budgeted_metered(Some(budgets.submission_router), task_counter.clone()),
             Some(budgets.submission_router),
             task_counter,
+            &counter_registry,
         );
     }
 
@@ -172,7 +173,7 @@ pub fn frame_dispatch<S, Clk>(
                     .receiver("task.frame_dispatch")
                     .with_description("Frame dispatch drains per-lane queues")
                     .with_function("endpoint::tasks::frame_dispatch");
-                spawner.register_queue_receiver(&receiver);
+                spawner.register_queue_receiver(&receiver, &counter_registry);
                 crate::counter::GaugedQueueReceiver::new(rx.into_list_receiver(), receiver)
             })
             .collect();
@@ -192,6 +193,7 @@ pub fn frame_dispatch<S, Clk>(
             rx.drain_budgeted_metered(Some(budgets.frame_dispatch), task_counter.clone()),
             Some(budgets.frame_dispatch),
             task_counter,
+            &counter_registry,
         );
     }
 }
@@ -316,11 +318,11 @@ pub fn send_worker<Socket, Clk, WakerSink, AckComp>(
         "Cancelled frame channel drained by cancelled task",
         "endpoint::tasks::send_worker",
     );
-    spawner.register_queue_channel(&q_resolver_to_tx_wheel);
-    spawner.register_queue_channel(&q_resolver_to_pto_wheel);
-    spawner.register_queue_channel(&q_resolver_to_idle_wheel);
-    spawner.register_queue_channel(&q_ack_to_completion);
-    spawner.register_queue_channel(&q_ack_to_cancelled);
+    spawner.register_queue_channel(&q_resolver_to_tx_wheel, &counter_registry);
+    spawner.register_queue_channel(&q_resolver_to_pto_wheel, &counter_registry);
+    spawner.register_queue_channel(&q_resolver_to_idle_wheel, &counter_registry);
+    spawner.register_queue_channel(&q_ack_to_completion, &counter_registry);
+    spawner.register_queue_channel(&q_ack_to_cancelled, &counter_registry);
 
     {
         // Task 1: context resolver — drain batch_rx, resolve to context, push frames.
@@ -336,9 +338,9 @@ pub fn send_worker<Socket, Clk, WakerSink, AckComp>(
             .sender("task.context_resolver")
             .with_description("Context resolver tracks idle expiry")
             .with_function("endpoint::tasks::send_worker");
-        spawner.register_queue_sender(&tx_wheel_sender);
-        spawner.register_queue_sender(&pto_wheel_sender);
-        spawner.register_queue_sender(&idle_wheel_sender);
+        spawner.register_queue_sender(&tx_wheel_sender, &counter_registry);
+        spawner.register_queue_sender(&pto_wheel_sender, &counter_registry);
+        spawner.register_queue_sender(&idle_wheel_sender, &counter_registry);
 
         let rx = context_resolver(
             batch_rx,
@@ -361,6 +363,7 @@ pub fn send_worker<Socket, Clk, WakerSink, AckComp>(
             rx.drain_budgeted_metered(Some(budgets.context_resolver), task_counter.clone()),
             Some(budgets.context_resolver),
             task_counter,
+            &counter_registry,
         );
     }
 
@@ -386,11 +389,11 @@ pub fn send_worker<Socket, Clk, WakerSink, AckComp>(
             .sender("task.ack_processor")
             .with_description("ACK processor emits cancelled frames")
             .with_function("endpoint::tasks::send_worker");
-        spawner.register_queue_sender(&tx_wheel_sender);
-        spawner.register_queue_sender(&pto_wheel_sender);
-        spawner.register_queue_sender(&idle_wheel_sender);
-        spawner.register_queue_sender(&completion_sender);
-        spawner.register_queue_sender(&cancelled_sender);
+        spawner.register_queue_sender(&tx_wheel_sender, &counter_registry);
+        spawner.register_queue_sender(&pto_wheel_sender, &counter_registry);
+        spawner.register_queue_sender(&idle_wheel_sender, &counter_registry);
+        spawner.register_queue_sender(&completion_sender, &counter_registry);
+        spawner.register_queue_sender(&cancelled_sender, &counter_registry);
 
         let send_caches_for_ack = send_caches.clone();
         let sender_idx_to_local_for_ack = sender_idx_to_local.clone();
@@ -428,6 +431,7 @@ pub fn send_worker<Socket, Clk, WakerSink, AckComp>(
             rx.drain_budgeted_metered(Some(budgets.ack_processor), task_counter.clone()),
             Some(budgets.ack_processor),
             task_counter,
+            &counter_registry,
         );
     }
 
@@ -437,7 +441,7 @@ pub fn send_worker<Socket, Clk, WakerSink, AckComp>(
             .receiver("task.completion")
             .with_description("Completion task drains completed frames")
             .with_function("endpoint::tasks::send_worker");
-        spawner.register_queue_receiver(&completion_receiver);
+        spawner.register_queue_receiver(&completion_receiver, &counter_registry);
 
         let rx = crate::counter::GaugedReceiver::new(completed_rx, completion_receiver);
         let rx = completion_dispatcher(rx, waker_sink);
@@ -452,6 +456,7 @@ pub fn send_worker<Socket, Clk, WakerSink, AckComp>(
             rx.drain_budgeted_metered(Some(budgets.completion_acked), task_counter.clone()),
             Some(budgets.completion_acked),
             task_counter,
+            &counter_registry,
         );
     }
 
@@ -461,7 +466,7 @@ pub fn send_worker<Socket, Clk, WakerSink, AckComp>(
             .receiver("task.cancelled")
             .with_description("Cancelled task drains cancelled frames")
             .with_function("endpoint::tasks::send_worker");
-        spawner.register_queue_receiver(&cancelled_receiver);
+        spawner.register_queue_receiver(&cancelled_receiver, &counter_registry);
 
         let rx = crate::counter::GaugedReceiver::new(cancelled_rx, cancelled_receiver);
         let rx = cancelled_drain(rx);
@@ -476,6 +481,7 @@ pub fn send_worker<Socket, Clk, WakerSink, AckComp>(
             rx.drain_budgeted_metered(Some(budgets.completion_cancelled), task_counter.clone()),
             Some(budgets.completion_cancelled),
             task_counter,
+            &counter_registry,
         );
     }
 
@@ -485,7 +491,7 @@ pub fn send_worker<Socket, Clk, WakerSink, AckComp>(
             .receiver("task.tx_wheel")
             .with_description("Tx wheel drains scheduled contexts")
             .with_function("endpoint::tasks::send_worker");
-        spawner.register_queue_receiver(&tx_wheel_receiver);
+        spawner.register_queue_receiver(&tx_wheel_receiver, &counter_registry);
         let task_counter = counter_registry
             .register_nominal_task("task.tx_wheel", format!("send.{worker_id}"))
             .with_registration_metadata(
@@ -509,7 +515,7 @@ pub fn send_worker<Socket, Clk, WakerSink, AckComp>(
                                 "Tx wheel routes expired contexts to socket assembler",
                             )
                             .with_function("endpoint::tasks::send_worker");
-                        spawner.register_queue_sender(&sender);
+                        spawner.register_queue_sender(&sender, &counter_registry);
                         crate::counter::GaugedSender::new(tx, sender)
                     })
                     .collect();
@@ -521,7 +527,7 @@ pub fn send_worker<Socket, Clk, WakerSink, AckComp>(
             budgets.tx_wheel,
             task_counter.clone(),
         );
-        spawner.spawn_receiver_task(tx_wheel_task, Some(budgets.tx_wheel), task_counter);
+        spawner.spawn_receiver_task(tx_wheel_task, Some(budgets.tx_wheel), task_counter, &counter_registry);
     }
 
     {
@@ -542,10 +548,10 @@ pub fn send_worker<Socket, Clk, WakerSink, AckComp>(
             .sender("task.pto_wheel")
             .with_description("PTO wheel updates idle scheduling")
             .with_function("endpoint::tasks::send_worker");
-        spawner.register_queue_receiver(&pto_wheel_receiver);
-        spawner.register_queue_sender(&tx_wheel_sender);
-        spawner.register_queue_sender(&pto_wheel_sender);
-        spawner.register_queue_sender(&idle_wheel_sender);
+        spawner.register_queue_receiver(&pto_wheel_receiver, &counter_registry);
+        spawner.register_queue_sender(&tx_wheel_sender, &counter_registry);
+        spawner.register_queue_sender(&pto_wheel_sender, &counter_registry);
+        spawner.register_queue_sender(&idle_wheel_sender, &counter_registry);
 
         let wheel: crate::time::wheel::Wheel<_, _, _> =
             crate::time::wheel::Wheel::new(pto_wheel_rx.into_list_receiver(), clock.timer());
@@ -584,6 +590,7 @@ pub fn send_worker<Socket, Clk, WakerSink, AckComp>(
             rx.drain_budgeted_metered(Some(budgets.pto_wheel), task_counter.clone()),
             Some(budgets.pto_wheel),
             task_counter,
+            &counter_registry,
         );
     }
 
@@ -593,7 +600,7 @@ pub fn send_worker<Socket, Clk, WakerSink, AckComp>(
             .receiver("task.idle_wheel")
             .with_description("Idle wheel drains scheduled contexts")
             .with_function("endpoint::tasks::send_worker");
-        spawner.register_queue_receiver(&idle_wheel_receiver);
+        spawner.register_queue_receiver(&idle_wheel_receiver, &counter_registry);
 
         let task_counter = counter_registry
             .register_nominal_task("task.idle_wheel", format!("send.{worker_id}"))
@@ -615,7 +622,7 @@ pub fn send_worker<Socket, Clk, WakerSink, AckComp>(
             budgets.idle_wheel,
             task_counter.clone(),
         );
-        spawner.spawn_receiver_task(idle_wheel_task, Some(budgets.idle_wheel), task_counter);
+        spawner.spawn_receiver_task(idle_wheel_task, Some(budgets.idle_wheel), task_counter, &counter_registry);
     }
 
     // Per-socket assembler + send tasks.
@@ -633,12 +640,12 @@ pub fn send_worker<Socket, Clk, WakerSink, AckComp>(
             "Per-socket queue from tx wheel to assembler+socket sender task",
             "endpoint::tasks::send_worker",
         );
-        spawner.register_queue_channel(&gauge);
+        spawner.register_queue_channel(&gauge, &counter_registry);
         let assembler_receiver = gauge
             .receiver(&task_name)
             .with_description("Assembler drains contexts assigned to this socket")
             .with_function("endpoint::tasks::send_worker");
-        spawner.register_queue_receiver(&assembler_receiver);
+        spawner.register_queue_receiver(&assembler_receiver, &counter_registry);
 
         let clock = st.clock.clone();
         let tx_wheel_tx = crate::counter::GaugedSender::new(
@@ -697,6 +704,7 @@ pub fn send_worker<Socket, Clk, WakerSink, AckComp>(
             rx.drain_budgeted_metered(Some(budgets.assembler), task_counter.clone()),
             Some(budgets.assembler),
             task_counter,
+            &counter_registry,
         );
     }
 
@@ -707,7 +715,7 @@ pub fn send_worker<Socket, Clk, WakerSink, AckComp>(
             .sender("task.invalidation")
             .with_description("Invalidation task emits failed frames as completions")
             .with_function("endpoint::tasks::send_worker");
-        spawner.register_queue_sender(&invalidation_sender);
+        spawner.register_queue_sender(&invalidation_sender, &counter_registry);
 
         let rx = send_invalidation(invalidation_rx, send_caches, invalidation_completed_tx);
         let variant = format!("send.{worker_id}");
@@ -722,6 +730,7 @@ pub fn send_worker<Socket, Clk, WakerSink, AckComp>(
             rx.drain_budgeted_metered(Some(budgets.invalidation), task_counter.clone()),
             Some(budgets.invalidation),
             task_counter,
+            &counter_registry,
         );
     }
 }

@@ -175,11 +175,24 @@ impl<'a> Spawner<'a> {
     where
         F: Future<Output = ()> + 'static,
     {
+        self.spawn_with_priority_and_name(future, priority, None);
+    }
+
+    #[track_caller]
+    pub fn spawn_with_priority_and_name<F>(
+        &mut self,
+        future: F,
+        priority: Option<u8>,
+        name: Option<String>,
+    ) where
+        F: Future<Output = ()> + 'static,
+    {
         let priority = priority.unwrap_or(128);
         let task = Task {
             task: Box::pin(future),
             priority,
             location: Location::caller(),
+            name,
         };
 
         self.tasks.spawn(task);
@@ -213,6 +226,8 @@ struct Task {
     priority: u8,
     #[allow(dead_code)]
     location: &'static Location<'static>,
+    #[allow(dead_code)]
+    name: Option<String>,
 }
 
 #[must_use]

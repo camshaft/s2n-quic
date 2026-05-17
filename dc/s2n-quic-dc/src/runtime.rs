@@ -321,6 +321,18 @@ pub trait Spawner {
     where
         F: Future<Output = ()> + 'static;
 
+    /// Spawn a named !Send future on the current worker.
+    ///
+    /// This allows runtimes to attach a debug name to the spawned task.
+    /// Default implementation ignores the name and calls spawn().
+    #[inline]
+    fn spawn_named<F>(&mut self, _name: &str, future: F)
+    where
+        F: Future<Output = ()> + 'static,
+    {
+        self.spawn(future);
+    }
+
     /// Register metadata describing a task spawned on this worker.
     #[inline]
     fn register_task(&mut self, _task: TaskRegistration) {}
@@ -330,10 +342,11 @@ pub trait Spawner {
     fn register_channel(&mut self, _channel: ChannelRegistration) {}
 
     #[inline]
-    fn register_queue_channel(&mut self, channel: &counter::QueueGauge) {
+    fn register_queue_channel(&mut self, channel: &counter::QueueGauge, registry: &counter::Registry) {
         let registration = channel.with_registration_metadata_ref(|name, description, function| {
             ChannelRegistration::new(name, description, function).with_metric(channel)
         });
+        registry.register_channel_topology(registration.clone());
         self.register_channel(registration);
     }
 
@@ -360,14 +373,17 @@ pub trait Spawner {
     }
 
     #[inline]
-    fn register_queue_sender(&mut self, sender: &counter::QueueSender) {
+    fn register_queue_sender(&mut self, sender: &counter::QueueSender, registry: &counter::Registry) {
         let channel_name = sender.channel_metadata(|name, _, _| name.to_string());
-        self.register_channel_sender(
+        let binding = ChannelBinding::new(
             sender.task_name(),
             channel_name,
+            ChannelDirection::Sends,
             sender.description(),
             sender.function(),
         );
+        registry.register_binding_topology(binding.clone());
+        self.register_channel_binding(binding);
     }
 
     /// Register that a task receives from a channel.
@@ -389,14 +405,17 @@ pub trait Spawner {
     }
 
     #[inline]
-    fn register_queue_receiver(&mut self, receiver: &counter::QueueReceiver) {
+    fn register_queue_receiver(&mut self, receiver: &counter::QueueReceiver, registry: &counter::Registry) {
         let channel_name = receiver.channel_metadata(|name, _, _| name.to_string());
-        self.register_channel_receiver(
+        let binding = ChannelBinding::new(
             receiver.task_name(),
             channel_name,
+            ChannelDirection::Receives,
             receiver.description(),
             receiver.function(),
         );
+        registry.register_binding_topology(binding.clone());
+        self.register_channel_binding(binding);
     }
 
     /// Convenience helper for pipeline tasks with budget and task counters.
@@ -406,6 +425,7 @@ pub trait Spawner {
         future: F,
         budget: Option<usize>,
         task_counter: counter::Task,
+        registry: &counter::Registry,
     ) where
         F: Future<Output = ()> + 'static,
         Self: Sized,
@@ -415,8 +435,10 @@ pub trait Spawner {
                 .with_budget(budget)
                 .with_metric(&task_counter)
         });
+        let task_name = task.name.clone();
+        registry.register_task_topology(task.clone());
         self.register_task(task);
-        self.spawn(future);
+        self.spawn_named(&task_name, future);
     }
 }
 
@@ -471,6 +493,13 @@ pub mod busy_poll {
             F: Future<Output = ()> + 'static,
         {
             crate::busy_poll::Spawner::spawn(self, future);
+        }
+
+        fn spawn_named<F>(&mut self, name: &str, future: F)
+        where
+            F: Future<Output = ()> + 'static,
+        {
+            self.spawn_with_priority_and_name(future, None, Some(name.to_string()));
         }
     }
 }
@@ -536,6 +565,16 @@ pub mod bach {
             F: Future<Output = ()> + 'static,
         {
             ::bach::spawn(SendWrapper(future));
+        }
+
+        fn spawn_named<F>(&mut self, name: &str, future: F)
+        where
+            F: Future<Output = ()> + 'static,
+        {
+            // Bach doesn't currently support named spawns, but we could add it.
+            // For now, just spawn normally.
+            let _ = name;
+            self.spawn(future);
         }
     }
 
@@ -626,6 +665,16 @@ pub mod tokio {
             F: Future<Output = ()> + 'static,
         {
             tokio::task::spawn_local(future);
+        }
+
+        fn spawn_named<F>(&mut self, name: &str, future: F)
+        where
+            F: Future<Output = ()> + 'static,
+        {
+            // Tokio spawn_local doesn't support names directly.
+            // We could log the name or use it for debugging.
+            let _ = name;
+            self.spawn(future);
         }
     }
 

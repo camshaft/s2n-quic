@@ -1124,6 +1124,18 @@ pub struct Registry {
     queue_metadata: Arc<Mutex<HashMap<String, QueueRegistrationMetadata>>>,
     queue_endpoint_metadata: Arc<Mutex<HashMap<MetricId, QueueEndpointMetadata>>>,
     metric_metadata: Arc<Mutex<HashMap<MetricId, MetricMetadata>>>,
+    topology: Arc<Mutex<Topology>>,
+}
+
+/// Runtime topology tracked by the counter registry.
+///
+/// This includes all tasks, channels/queues, and their bindings (sender/receiver relationships).
+/// The registry owns this information and can expose it for runtime introspection (e.g., DOT graphs).
+#[derive(Clone, Default, Debug)]
+pub struct Topology {
+    tasks: Vec<crate::runtime::TaskRegistration>,
+    channels: Vec<crate::runtime::ChannelRegistration>,
+    bindings: Vec<crate::runtime::ChannelBinding>,
 }
 
 impl Registry {
@@ -1137,7 +1149,30 @@ impl Registry {
             queue_metadata: Arc::new(Mutex::new(HashMap::new())),
             queue_endpoint_metadata: Arc::new(Mutex::new(HashMap::new())),
             metric_metadata: Arc::new(Mutex::new(HashMap::new())),
+            topology: Arc::new(Mutex::new(Topology::default())),
         }
+    }
+
+    /// Returns a snapshot of the runtime topology tracked by this registry.
+    ///
+    /// This includes all registered tasks, channels, and their bindings.
+    pub fn topology(&self) -> Topology {
+        self.topology.lock().unwrap().clone()
+    }
+
+    /// Register a task in the topology.
+    pub(crate) fn register_task_topology(&self, task: crate::runtime::TaskRegistration) {
+        self.topology.lock().unwrap().tasks.push(task);
+    }
+
+    /// Register a channel/queue in the topology.
+    pub(crate) fn register_channel_topology(&self, channel: crate::runtime::ChannelRegistration) {
+        self.topology.lock().unwrap().channels.push(channel);
+    }
+
+    /// Register a channel binding (sender/receiver relationship) in the topology.
+    pub(crate) fn register_binding_topology(&self, binding: crate::runtime::ChannelBinding) {
+        self.topology.lock().unwrap().bindings.push(binding);
     }
 
     fn register_metric_metadata(
