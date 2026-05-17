@@ -53,7 +53,7 @@ struct Shared<T> {
     /// The `attempt_id` assigned to the FlowInit frame when it was first transmitted.
     /// Stamped alongside `init_sender_idx` by the assembler.  The writer includes this
     /// value in subsequent FlowInitReset frames so the server can mark the attempt as
-    /// finalised in its dedup window and reject any late-arriving FlowInit duplicate.
+    /// finalized in its dedup window and reject any late-arriving FlowInit duplicate.
     /// `UNSET_SENDER_IDX` means the FlowInit has not yet been transmitted.
     init_attempt_id: AtomicU64,
     inner: Mutex<Inner<T>>,
@@ -169,7 +169,7 @@ impl<T> Sender<T> {
     /// Record the `attempt_id` assigned to the FlowInit frame by the assembler.
     ///
     /// Stamped alongside [`set_init_sender_idx`].  The writer includes this value in
-    /// FlowInitReset frames so the server can mark the attempt as finalised in its
+    /// FlowInitReset frames so the server can mark the attempt as finalized in its
     /// dedup window.
     #[inline]
     pub fn set_init_attempt_id(&self, id: VarInt) {

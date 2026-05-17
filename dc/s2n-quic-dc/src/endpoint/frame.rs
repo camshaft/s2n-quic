@@ -387,7 +387,7 @@ pub enum Header {
     /// stream_id → queue_id map and dispatches the reset to the appropriate queues.
     ///
     /// `attempt_id` is the same value stamped into the FlowInit frame.  The server uses
-    /// it to mark the attempt as finalised so that any later FlowInit duplicate with the
+    /// it to mark the attempt as finalized so that any later FlowInit duplicate with the
     /// same `attempt_id` is silently dropped (preventing the server from accepting a
     /// stream that the client has already aborted).
     FlowInitReset {
