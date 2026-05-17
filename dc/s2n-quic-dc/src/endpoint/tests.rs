@@ -13,6 +13,156 @@ use crate::stream::endpoint::testing::sim::{Client, Server, SERVER_PORT};
 use bytes::{Bytes, BytesMut};
 use s2n_quic_core::varint::VarInt;
 
+#[test]
+fn topology_snapshot_uses_dc_tester_layout() {
+    use crate::{
+        acceptor,
+        path::secret::map::testing,
+        runtime,
+        socket::{pool::Pool, rate::Rate},
+        stream::endpoint::{self, socket, WorkerLayout},
+    };
+
+    #[derive(Clone)]
+    struct DummyClock;
+
+    #[derive(Clone)]
+    struct DummyTimer {
+        armed: bool,
+    }
+
+    impl s2n_quic_core::time::Clock for DummyClock {
+        fn get_time(&self) -> s2n_quic_core::time::Timestamp {
+            unsafe { s2n_quic_core::time::Timestamp::from_duration(core::time::Duration::ZERO) }
+        }
+    }
+
+    impl crate::time::precision::Clock for DummyClock {
+        type Timer = DummyTimer;
+
+        fn now(&self) -> crate::time::precision::Timestamp {
+            crate::time::precision::Timestamp { nanos: 0 }
+        }
+
+        fn timer(&self) -> Self::Timer {
+            DummyTimer { armed: false }
+        }
+    }
+
+    impl crate::time::precision::Timer for DummyTimer {
+        fn now(&self) -> crate::time::precision::Timestamp {
+            crate::time::precision::Timestamp { nanos: 0 }
+        }
+
+        async fn sleep_until(&mut self, _target: crate::time::precision::Timestamp) {}
+
+        fn poll_ready(
+            &mut self,
+            _cx: &mut core::task::Context,
+        ) -> core::task::Poll<()> {
+            core::task::Poll::Pending
+        }
+
+        fn update(&mut self, _target: crate::time::precision::Timestamp) {
+            self.armed = true;
+        }
+
+        fn cancel(&mut self) {
+            self.armed = false;
+        }
+
+        fn is_armed(&self) -> bool {
+            self.armed
+        }
+    }
+
+    #[derive(Clone)]
+    struct TestRuntime {
+        worker_count: usize,
+        clock: DummyClock,
+    }
+
+    struct Local {
+        worker_id: usize,
+    }
+
+    impl runtime::Spawner for Local {
+        fn spawn<F>(&mut self, _future: F)
+        where
+            F: std::future::Future<Output = ()> + 'static,
+        {
+        }
+
+        fn worker_id(&self) -> usize {
+            self.worker_id
+        }
+    }
+
+    impl runtime::Runtime for TestRuntime {
+        type Clock = DummyClock;
+        type Spawner<'a> = Local;
+
+        fn worker_count(&self) -> usize {
+            self.worker_count
+        }
+
+        fn clock(&self) -> Self::Clock {
+            self.clock.clone()
+        }
+
+        fn spawn_local<F>(&self, worker_id: usize, f: F)
+        where
+            F: FnOnce(Self::Spawner<'_>) + Send + 'static,
+        {
+            f(Local { worker_id });
+        }
+    }
+
+    let mut ids = 1..;
+    let layout = WorkerLayout {
+        frame_dispatch: 0,
+        send: (&mut ids).take(4).collect(),
+        recv_io: (&mut ids).take(4).collect(),
+        recv_dispatch: (&mut ids).take(5).collect(),
+        waker_drain: (&mut ids).take(1).collect(),
+        background: ids.next().expect("background worker id should exist"),
+    };
+
+    let runtime = TestRuntime {
+        worker_count: layout.background + 1,
+        clock: DummyClock,
+    };
+    let bind_addr = std::net::SocketAddr::new(std::net::Ipv4Addr::UNSPECIFIED.into(), 0);
+    let gso = endpoint::Gso::default();
+    let send_sockets = socket::SendConfig::new(64, bind_addr, gso.clone())
+        .busy_poll()
+        .expect("send sockets should be created");
+    let recv_sockets = socket::RecvConfig::new(4, bind_addr)
+        .busy_poll()
+        .expect("recv sockets should be created");
+
+    let endpoint = endpoint::setup_endpoint(
+        runtime,
+        endpoint::Config {
+            layout,
+            send_pool: Pool::new(u16::MAX),
+            recv_pool: Pool::new(u16::MAX),
+            path_secret_map: testing::new(50_000),
+            gso,
+            acceptor_registry: acceptor::Registry::new(),
+            overall_send_rate: Rate::new(25.0),
+            per_socket_send_rate: Rate::new(5.0),
+            budgets: endpoint::Budgets::default(),
+            submission_shards: 128,
+        },
+        send_sockets,
+        recv_sockets,
+    );
+
+    let topology = endpoint.counters.topology();
+    insta::assert_snapshot!(topology.to_dot());
+}
+
 /// Ping-pong end-to-end test: the client sends "ping" and the server echoes
 /// "pong" back over a real simulated UDP network path.
 ///
