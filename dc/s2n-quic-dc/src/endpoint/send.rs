@@ -706,13 +706,15 @@ impl Context {
     pub fn invariants(&self) {
         if cfg!(debug_assertions) {
             let has_pending_data = self.queues.iter().any(|q| !q.is_empty());
+            let has_pending_data_predicate = self.has_pending_data();
+            let has_pending_predicate = self.has_pending();
             assert_eq!(
-                self.has_pending_data(),
+                has_pending_data_predicate,
                 has_pending_data,
                 "has_pending_data predicate drifted from queue contents"
             );
             assert_eq!(
-                self.has_pending(),
+                has_pending_predicate,
                 has_pending_data,
                 "has_pending predicate drifted from queue contents"
             );
