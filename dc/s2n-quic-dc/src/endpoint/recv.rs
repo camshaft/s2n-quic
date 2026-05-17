@@ -301,7 +301,6 @@ impl Context {
     ///
     /// Returns `None` if there are no ranges or an ACK is already in flight.
     pub fn encode_and_flush(&mut self, recv_worker_id: usize) -> Option<ack_state::Submission> {
-        self.invariants();
         if !self.ack_state.is_scheduled() {
             return None;
         }

@@ -243,9 +243,12 @@ where
 
     let mut enqueue_pending_ack = false;
     if is_ack_eliciting {
-        if peer.ack_state.on_ack_eliciting().is_err() {
-            counters.rx_ack_state_impossible.add(1);
-            debug_assert!(false, "on_ack_eliciting transition failed");
+        match peer.ack_state.on_ack_eliciting() {
+            Ok(()) | Err(s2n_quic_core::state::Error::NoOp { .. }) => {}
+            Err(s2n_quic_core::state::Error::InvalidTransition { .. }) => {
+                counters.rx_ack_state_impossible.add(1);
+                debug_assert!(false, "on_ack_eliciting transition failed");
+            }
         }
 
         // Only enqueue into the burst queue when the state is Scheduled.
