@@ -1115,6 +1115,269 @@ impl QueueReceiver {
     }
 }
 
+// ── Metric Registration Structures ──────────────────────────────────────────
+
+#[derive(Clone, Debug)]
+pub struct MetricRegistration {
+    pub label: String,
+    pub variant: Option<String>,
+    pub kind: MetricKind,
+    pub unit: Option<&'static str>,
+    pub description: String,
+}
+
+impl MetricRegistration {
+    #[inline]
+    pub fn new(
+        name: impl core::fmt::Display,
+        kind: MetricKind,
+        description: impl core::fmt::Display,
+    ) -> Self {
+        Self {
+            label: name.to_string(),
+            variant: None,
+            kind,
+            unit: None,
+            description: description.to_string(),
+        }
+    }
+
+    #[inline]
+    pub fn with_variant(mut self, variant: impl core::fmt::Display) -> Self {
+        self.variant = Some(variant.to_string());
+        self
+    }
+
+    #[inline]
+    pub fn with_unit(mut self, unit: &'static str) -> Self {
+        self.unit = Some(unit);
+        self
+    }
+}
+
+pub trait Metric {
+    fn registrations(&self) -> Vec<MetricRegistration>;
+}
+
+impl Metric for MetricRegistration {
+    fn registrations(&self) -> Vec<MetricRegistration> {
+        vec![self.clone()]
+    }
+}
+
+impl Metric for Task {
+    fn registrations(&self) -> Vec<MetricRegistration> {
+        self.metrics()
+            .into_iter()
+            .map(|metric| {
+                let mut registration =
+                    MetricRegistration::new(metric.label, metric.kind, metric.description);
+                if let Some(variant) = metric.variant {
+                    registration = registration.with_variant(variant);
+                }
+                if let Some(unit) = metric.unit {
+                    registration = registration.with_unit(unit);
+                }
+                registration
+            })
+            .collect()
+    }
+}
+
+impl Metric for QueueGauge {
+    fn registrations(&self) -> Vec<MetricRegistration> {
+        self.metrics()
+            .into_iter()
+            .map(|metric| {
+                let mut registration =
+                    MetricRegistration::new(metric.label, metric.kind, metric.description);
+                if let Some(variant) = metric.variant {
+                    registration = registration.with_variant(variant);
+                }
+                if let Some(unit) = metric.unit {
+                    registration = registration.with_unit(unit);
+                }
+                registration
+            })
+            .collect()
+    }
+}
+
+impl Metric for QueueSender {
+    fn registrations(&self) -> Vec<MetricRegistration> {
+        self.metric
+            .metric_metadata()
+            .into_iter()
+            .map(|metadata| MetricRegistration {
+                label: metadata.label,
+                variant: metadata.variant,
+                kind: metadata.kind,
+                unit: metadata.unit,
+                description: metadata.description,
+            })
+            .collect()
+    }
+}
+
+impl Metric for QueueReceiver {
+    fn registrations(&self) -> Vec<MetricRegistration> {
+        self.metric
+            .metric_metadata()
+            .into_iter()
+            .map(|metadata| MetricRegistration {
+                label: metadata.label,
+                variant: metadata.variant,
+                kind: metadata.kind,
+                unit: metadata.unit,
+                description: metadata.description,
+            })
+            .collect()
+    }
+}
+
+/// Describes a spawned pipeline task for runtime-level introspection.
+#[derive(Clone, Debug)]
+pub struct TaskRegistration {
+    pub name: String,
+    pub description: String,
+    pub function: String,
+    pub budget: Option<usize>,
+    pub metrics: Vec<MetricRegistration>,
+}
+
+impl TaskRegistration {
+    #[inline]
+    pub fn new(
+        name: impl core::fmt::Display,
+        description: impl core::fmt::Display,
+        function: impl core::fmt::Display,
+    ) -> Self {
+        Self {
+            name: name.to_string(),
+            description: description.to_string(),
+            function: function.to_string(),
+            budget: None,
+            metrics: Vec::new(),
+        }
+    }
+
+    #[inline]
+    pub fn with_budget(mut self, budget: Option<usize>) -> Self {
+        self.budget = budget;
+        self
+    }
+
+    #[inline]
+    pub fn with_metric(mut self, metric: &impl Metric) -> Self {
+        for metric in metric.registrations() {
+            self.upsert_metric(metric);
+        }
+        self
+    }
+
+    #[inline]
+    fn upsert_metric(&mut self, metric: MetricRegistration) {
+        if let Some(current) = self
+            .metrics
+            .iter_mut()
+            .find(|m| m.label == metric.label && m.variant == metric.variant)
+        {
+            *current = metric;
+        } else {
+            self.metrics.push(metric);
+        }
+    }
+}
+
+/// Describes a channel/queue entity in the runtime pipeline.
+#[derive(Clone, Debug)]
+pub struct ChannelRegistration {
+    pub name: String,
+    pub description: String,
+    pub function: String,
+    pub metrics: Vec<MetricRegistration>,
+}
+
+impl ChannelRegistration {
+    #[inline]
+    pub fn new(
+        name: impl core::fmt::Display,
+        description: impl core::fmt::Display,
+        function: impl core::fmt::Display,
+    ) -> Self {
+        Self {
+            name: name.to_string(),
+            description: description.to_string(),
+            function: function.to_string(),
+            metrics: Vec::new(),
+        }
+    }
+
+    #[inline]
+    pub fn with_metric(mut self, metric: &impl Metric) -> Self {
+        for metric in metric.registrations() {
+            self.upsert_metric(metric);
+        }
+        self
+    }
+
+    #[inline]
+    fn upsert_metric(&mut self, metric: MetricRegistration) {
+        if let Some(current) = self
+            .metrics
+            .iter_mut()
+            .find(|m| m.label == metric.label && m.variant == metric.variant)
+        {
+            *current = metric;
+        } else {
+            self.metrics.push(metric);
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ChannelDirection {
+    Sends,
+    Receives,
+}
+
+impl core::fmt::Display for ChannelDirection {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Sends => f.write_str("sends"),
+            Self::Receives => f.write_str("receives"),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct ChannelBinding {
+    pub task_name: String,
+    pub channel_name: String,
+    pub direction: ChannelDirection,
+    pub description: String,
+    pub function: String,
+}
+
+impl ChannelBinding {
+    #[inline]
+    pub fn new(
+        task_name: impl core::fmt::Display,
+        channel_name: impl core::fmt::Display,
+        direction: ChannelDirection,
+        description: impl core::fmt::Display,
+        function: impl core::fmt::Display,
+    ) -> Self {
+        Self {
+            task_name: task_name.to_string(),
+            channel_name: channel_name.to_string(),
+            direction,
+            description: description.to_string(),
+            function: function.to_string(),
+        }
+    }
+}
+
 // ── Registry ────────────────────────────────────────────────────────────────
 
 #[derive(Clone, Default)]
@@ -1133,9 +1396,9 @@ pub struct Registry {
 /// The registry owns this information and can expose it for runtime introspection (e.g., DOT graphs).
 #[derive(Clone, Default, Debug)]
 pub struct Topology {
-    tasks: Vec<crate::runtime::TaskRegistration>,
-    channels: Vec<crate::runtime::ChannelRegistration>,
-    bindings: Vec<crate::runtime::ChannelBinding>,
+    tasks: Vec<TaskRegistration>,
+    channels: Vec<ChannelRegistration>,
+    bindings: Vec<ChannelBinding>,
 }
 
 impl Registry {
@@ -1161,18 +1424,52 @@ impl Registry {
     }
 
     /// Register a task in the topology.
-    pub(crate) fn register_task_topology(&self, task: crate::runtime::TaskRegistration) {
+    pub(crate) fn register_task_topology(&self, task: TaskRegistration) {
         self.topology.lock().unwrap().tasks.push(task);
     }
 
     /// Register a channel/queue in the topology.
-    pub(crate) fn register_channel_topology(&self, channel: crate::runtime::ChannelRegistration) {
+    pub(crate) fn register_channel_topology(&self, channel: ChannelRegistration) {
         self.topology.lock().unwrap().channels.push(channel);
     }
 
     /// Register a channel binding (sender/receiver relationship) in the topology.
-    pub(crate) fn register_binding_topology(&self, binding: crate::runtime::ChannelBinding) {
+    pub(crate) fn register_binding_topology(&self, binding: ChannelBinding) {
         self.topology.lock().unwrap().bindings.push(binding);
+    }
+
+    /// Register a queue/channel in the topology.
+    pub fn register_queue_channel(&self, channel: &QueueGauge) {
+        let registration = channel.with_registration_metadata_ref(|name, description, function| {
+            ChannelRegistration::new(name, description, function).with_metric(channel)
+        });
+        self.register_channel_topology(registration);
+    }
+
+    /// Register a queue sender in the topology.
+    pub fn register_queue_sender(&self, sender: &QueueSender) {
+        let channel_name = sender.channel_metadata(|name, _, _| name.to_string());
+        let binding = ChannelBinding::new(
+            sender.task_name(),
+            channel_name,
+            ChannelDirection::Sends,
+            sender.description(),
+            sender.function(),
+        );
+        self.register_binding_topology(binding);
+    }
+
+    /// Register a queue receiver in the topology.
+    pub fn register_queue_receiver(&self, receiver: &QueueReceiver) {
+        let channel_name = receiver.channel_metadata(|name, _, _| name.to_string());
+        let binding = ChannelBinding::new(
+            receiver.task_name(),
+            channel_name,
+            ChannelDirection::Receives,
+            receiver.description(),
+            receiver.function(),
+        );
+        self.register_binding_topology(binding);
     }
 
     fn register_metric_metadata(
