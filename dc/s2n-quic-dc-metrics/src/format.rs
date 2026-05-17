@@ -133,13 +133,13 @@ impl<'a> IntoIterator for &'a ParsedMetricsLine<'a> {
 
 #[derive(Debug)]
 pub struct ParsedMetricsLineIter<'a> {
-    entries: std::vec::IntoIter<MetricEntry<'a>>,
+    entry_iter: std::vec::IntoIter<MetricEntry<'a>>,
 }
 
 impl<'a> ParsedMetricsLineIter<'a> {
     fn new(line: &'a str) -> Self {
         Self {
-            entries: parse_entries(line).into_iter(),
+            entry_iter: parse_entries(line).into_iter(),
         }
     }
 }
@@ -148,7 +148,7 @@ impl<'a> Iterator for ParsedMetricsLineIter<'a> {
     type Item = MetricEntry<'a>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.entries.next()
+        self.entry_iter.next()
     }
 }
 
@@ -583,11 +583,11 @@ pub struct HistogramBucket {
 /// is a recognized unit suffix only (e.g. "us", "B"), as opposed to containing a
 /// variant name.
 fn is_histogram_unit_only(rest: &str) -> bool {
-    matches!(rest, "us" | "ms" | "s" | "B" | "KB" | "MB" | "GB" | "%")
+    HISTOGRAM_UNITS.contains(&rest)
 }
 
 fn is_valid_scalar_unit(rest: &str) -> bool {
-    is_histogram_unit_only(rest) || rest == "%"
+    SCALAR_UNITS.contains(&rest)
 }
 
 fn parse_byte_value(value: &str) -> Option<u64> {
@@ -665,7 +665,7 @@ fn parse_histogram_buckets_with_unit(data: &str, unit: &str) -> Vec<HistogramBuc
 
 fn parse_histogram_bucket_value(value: &str, unit: &str) -> Option<u64> {
     if unit == "%" {
-        let scaled = (value.parse::<f64>().ok()? * 1000.0).round();
+        let scaled = (value.parse::<f64>().ok()? * PERCENT_TO_MILLI_PERCENT).round();
         if !scaled.is_finite() || scaled < 0.0 || scaled > u64::MAX as f64 {
             return None;
         }
@@ -711,8 +711,12 @@ pub fn format_duration_us(us: u64) -> String {
 }
 
 fn format_percent(milli_percent: u64) -> String {
-    format!("{:.3}%", milli_percent as f64 / 1000.0)
+    format!("{:.3}%", milli_percent as f64 / PERCENT_TO_MILLI_PERCENT)
 }
+
+const HISTOGRAM_UNITS: &[&str] = &["us", "ms", "s", "B", "KB", "MB", "GB", "%"];
+const SCALAR_UNITS: &[&str] = &["us", "ms", "s", "B", "KB", "MB", "GB", "%"];
+const PERCENT_TO_MILLI_PERCENT: f64 = 1000.0;
 
 pub fn format_bits_per_second(bytes: u64) -> (f64, &'static str) {
     let mut rate = bytes as f64 * 8.0;
