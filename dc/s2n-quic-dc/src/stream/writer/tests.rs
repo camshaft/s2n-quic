@@ -800,7 +800,7 @@ fn client_panic_drop_during_flow_init_sent_sends_flow_init_reset() {
                     Header::FlowInitReset {
                         error_code,
                         ..
-                    } if error_code == reset_error::ABNORMAL_TERMINATION
+                    } if error_code == error::ABNORMAL_TERMINATION
                 ),
                 "expected FlowInitReset(ABNORMAL_TERMINATION) on panic in FlowInitSent"
             );
@@ -857,7 +857,7 @@ fn client_transmission_error_during_flow_init_sent_sends_flow_init_reset() {
                     Header::FlowInitReset {
                         error_code,
                         ..
-                    } if error_code == reset_error::RETRANSMISSIONS_EXHAUSTED
+                    } if error_code == error::RETRANSMISSIONS_EXHAUSTED
                 ),
                 "expected FlowInitReset(RETRANSMISSIONS_EXHAUSTED)"
             );
@@ -1460,7 +1460,7 @@ fn client_panic_drop_during_flow_init_sent() {
                     Header::FlowInitReset {
                         error_code,
                         ..
-                    } if error_code == reset_error::ABNORMAL_TERMINATION
+                    } if error_code == error::ABNORMAL_TERMINATION
                 ),
                 "expected FlowInitReset(ABNORMAL_TERMINATION)"
             );

@@ -253,7 +253,6 @@ impl Context {
             ack_state: AckState::Idle,
             attempt_dedup: AttemptDedup::new(),
             flows,
-            ack_burst: intrusive::Links::new(),
             pending_fins: FxHashMap::default(),
             ack_burst: intrusive::Links::new(),
         }
