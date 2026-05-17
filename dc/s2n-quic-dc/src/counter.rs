@@ -516,9 +516,14 @@ pub struct Timer(Summary);
 impl Timer {
     #[inline]
     pub fn start(&self) -> TimerGuard {
+        self.start_at(Instant::now())
+    }
+
+    #[inline]
+    pub fn start_at(&self, start: Instant) -> TimerGuard {
         TimerGuard {
             summary: &self.0,
-            start: Instant::now(),
+            start,
         }
     }
 
@@ -538,6 +543,15 @@ impl Drop for TimerGuard<'_> {
     fn drop(&mut self) {
         self.summary.record_duration(self.start.elapsed());
     }
+}
+
+// ── Task ────────────────────────────────────────────────────────────────────
+
+#[derive(Clone)]
+pub struct Task {
+    pub drained: Summary,
+    pub time: Timer,
+    pub next_poll_latency: Timer,
 }
 
 // ── QueueGauge ──────────────────────────────────────────────────────────────
@@ -714,6 +728,15 @@ impl Registry {
         )
     }
 
+    pub fn register_task(&self, label: impl core::fmt::Display) -> Task {
+        let label = label.to_string();
+        Task {
+            drained: self.register_summary(format!("{label}.drained"), Unit::Count),
+            time: self.register_timer(format!("{label}.time")),
+            next_poll_latency: self.register_timer(format!("{label}.next_poll_latency")),
+        }
+    }
+
     pub fn register_nominal_timer(
         &self,
         label: impl core::fmt::Display,
@@ -724,6 +747,25 @@ impl Registry {
             Some(variant.to_string()),
             Unit::Microsecond,
         ))
+    }
+
+    pub fn register_nominal_task(
+        &self,
+        label: impl core::fmt::Display,
+        variant: impl core::fmt::Display,
+    ) -> Task {
+        let label = label.to_string();
+        let variant = variant.to_string();
+        Task {
+            drained: self.register_nominal_summary(
+                format!("{label}.drained"),
+                &variant,
+                Unit::Count,
+            ),
+            time: self.register_nominal_timer(format!("{label}.time"), &variant),
+            next_poll_latency: self
+                .register_nominal_timer(format!("{label}.next_poll_latency"), &variant),
+        }
     }
 
     pub fn spawn_reporter(&self, interval: Duration) {
