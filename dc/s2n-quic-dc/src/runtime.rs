@@ -604,10 +604,10 @@ pub mod inspector {
     }
 
     fn socket_addr(base_port: u16, idx: usize) -> SocketAddr {
-        let offset = u16::try_from(idx).expect("socket index should fit in u16");
+        let offset = u16::try_from(idx).expect("socket index exceeds u16::MAX (65535)");
         let port = base_port
             .checked_add(offset)
-            .expect("socket port should fit in u16");
+            .expect("port calculation overflows u16::MAX (base_port + index exceeds 65535)");
         SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port)
     }
 }
