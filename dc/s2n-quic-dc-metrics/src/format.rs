@@ -16,14 +16,30 @@ impl<'a> ParsedMetricsLine<'a> {
     /// Returns an iterator of grouped metric entries.
     ///
     /// Note: this reparses the input line and rebuilds grouped entries each time it is called.
-    pub fn iter(&self) -> ParsedMetricsLineIter<'a> {
+    pub fn compound_iter(&self) -> ParsedMetricsLineIter<'a> {
         ParsedMetricsLineIter::new(self.line)
+    }
+
+    /// Returns an iterator of grouped metric entries.
+    ///
+    /// Note: this reparses the input line and rebuilds grouped entries each time it is called.
+    /// Each item is a parse result, allowing callers to observe parse errors directly.
+    pub fn iter(&self) -> ParsedMetricsLineIter<'a> {
+        self.compound_iter()
+    }
+
+    /// Returns an iterator of primitive metric entries before grouping/combinator logic is applied.
+    ///
+    /// Note: this reparses the input line each time it is called.
+    /// Each item is a parse result, allowing callers to observe parse errors directly.
+    pub fn primitive_iter(&self) -> PrimitiveMetricIter<'a> {
+        parse_primitive_metrics(self.line)
     }
 
     pub fn format_pretty(&self) -> String {
         let mut output = String::new();
 
-        for entry in self.iter() {
+        for entry in self.compound_iter().flatten() {
             entry.write_to(&mut output);
         }
 
@@ -31,7 +47,7 @@ impl<'a> ParsedMetricsLine<'a> {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.iter().next().is_none()
+        self.compound_iter().flatten().next().is_none()
     }
 
     pub fn to_json_rows(&self) -> Vec<serde_json::Value> {
@@ -39,7 +55,7 @@ impl<'a> ParsedMetricsLine<'a> {
 
         let mut rows = Vec::new();
 
-        for entry in self.iter() {
+        for entry in self.compound_iter().flatten() {
             match entry {
                 MetricEntry::QueueGauge(m) => {
                     rows.push(json!({
@@ -117,38 +133,55 @@ impl<'a> ParsedMetricsLine<'a> {
 }
 
 impl<'a> IntoIterator for ParsedMetricsLine<'a> {
-    type Item = MetricEntry<'a>;
+    type Item = Result<MetricEntry<'a>, MetricParseError<'a>>;
     type IntoIter = ParsedMetricsLineIter<'a>;
 
     fn into_iter(self) -> Self::IntoIter {
-        ParsedMetricsLineIter::new(self.line)
+        self.compound_iter()
     }
 }
 
 impl<'line, 'parsed> IntoIterator for &'parsed ParsedMetricsLine<'line> {
-    type Item = MetricEntry<'line>;
+    type Item = Result<MetricEntry<'line>, MetricParseError<'line>>;
     type IntoIter = ParsedMetricsLineIter<'line>;
 
     fn into_iter(self) -> Self::IntoIter {
-        self.iter()
+        self.compound_iter()
     }
 }
 
 #[derive(Debug)]
 pub struct ParsedMetricsLineIter<'a> {
-    entry_iter: std::vec::IntoIter<MetricEntry<'a>>,
+    entry_iter: std::vec::IntoIter<Result<MetricEntry<'a>, MetricParseError<'a>>>,
 }
 
 impl<'a> ParsedMetricsLineIter<'a> {
     fn new(line: &'a str) -> Self {
+        let mut primitive_entries = Vec::new();
+        let mut errors = Vec::new();
+
+        for entry in parse_primitive_metrics(line) {
+            match entry {
+                Ok(entry) => primitive_entries.push(entry),
+                Err(error) => errors.push(error),
+            }
+        }
+
+        let combined = combine_metrics(primitive_entries);
+        let mut entry_iter =
+            Vec::with_capacity(combined.entries.len() + combined.errors.len() + errors.len());
+        entry_iter.extend(combined.entries.into_iter().map(Ok));
+        entry_iter.extend(combined.errors.into_iter().map(Err));
+        entry_iter.extend(errors.into_iter().map(Err));
+
         Self {
-            entry_iter: combine_metrics(parse_primitive_metrics(line)).into_iter(),
+            entry_iter: entry_iter.into_iter(),
         }
     }
 }
 
 impl<'a> Iterator for ParsedMetricsLineIter<'a> {
-    type Item = MetricEntry<'a>;
+    type Item = Result<MetricEntry<'a>, MetricParseError<'a>>;
 
     fn next(&mut self) -> Option<Self::Item> {
         self.entry_iter.next()
@@ -156,7 +189,7 @@ impl<'a> Iterator for ParsedMetricsLineIter<'a> {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-enum PrimitiveMetricEntry<'a> {
+pub enum PrimitiveMetricEntry<'a> {
     Scalar {
         key: &'a str,
         value: &'a str,
@@ -172,38 +205,53 @@ enum PrimitiveMetricEntry<'a> {
     },
 }
 
-struct PrimitiveMetricIter<'a> {
+#[derive(Debug, PartialEq, Eq)]
+pub enum MetricParseError<'a> {
+    InvalidMetricFragment { fragment: &'a str },
+    InvalidThroughputValue { key: &'a str, value: &'a str },
+    InvalidHistogramValue { key: &'a str, value: &'a str },
+    InvalidVariantHistogramValue { key: &'a str, value: &'a str },
+}
+
+pub struct PrimitiveMetricIter<'a> {
     parts: std::str::Split<'a, char>,
 }
 
 impl<'a> Iterator for PrimitiveMetricIter<'a> {
-    type Item = PrimitiveMetricEntry<'a>;
+    type Item = Result<PrimitiveMetricEntry<'a>, MetricParseError<'a>>;
 
     fn next(&mut self) -> Option<Self::Item> {
         for part in self.parts.by_ref() {
-            let Some((key, value)) = part.split_once('=') else {
+            let part = part.trim();
+            if part.is_empty() {
                 continue;
+            }
+
+            let Some((key, value)) = part.split_once('=') else {
+                return Some(Err(MetricParseError::InvalidMetricFragment {
+                    fragment: part,
+                }));
             };
 
             if let Some((val, rest)) = value.split_once(' ') {
                 if val.bytes().all(|b| b.is_ascii_digit()) {
                     if is_valid_scalar_unit(rest) {
-                        return Some(PrimitiveMetricEntry::Scalar { key, value });
+                        return Some(Ok(PrimitiveMetricEntry::Scalar { key, value }));
                     }
 
-                    return Some(PrimitiveMetricEntry::NominalVariant {
+                    return Some(Ok(PrimitiveMetricEntry::NominalVariant {
                         key,
                         value: val,
                         label: rest,
-                    });
+                    }));
                 }
 
                 if val.contains('*') && !is_histogram_unit_only(rest) {
-                    return Some(PrimitiveMetricEntry::HistogramVariant { key, value });
+                    return Some(Ok(PrimitiveMetricEntry::HistogramVariant { key, value }));
                 }
             }
 
-            return Some(PrimitiveMetricEntry::Scalar { key, value });
+            return Some(Ok(PrimitiveMetricEntry::Scalar { key, value }));
         }
 
         None
@@ -216,14 +264,20 @@ fn parse_primitive_metrics<'a>(line: &'a str) -> PrimitiveMetricIter<'a> {
     }
 }
 
+struct CombinedMetrics<'a> {
+    entries: Vec<MetricEntry<'a>>,
+    errors: Vec<MetricParseError<'a>>,
+}
+
 fn combine_metrics<'a>(
     primitive_entries: impl IntoIterator<Item = PrimitiveMetricEntry<'a>>,
-) -> Vec<MetricEntry<'a>> {
+) -> CombinedMetrics<'a> {
     use std::collections::{BTreeMap, BTreeSet, HashSet};
 
     let mut metrics: BTreeMap<&'a str, &'a str> = BTreeMap::new();
     let mut nominals: BTreeMap<&'a str, Vec<NominalVariant<'a>>> = BTreeMap::new();
     let mut variant_histograms: BTreeMap<&'a str, Vec<HistogramVariant<'a>>> = BTreeMap::new();
+    let mut errors = Vec::new();
 
     for primitive_entry in primitive_entries {
         match primitive_entry {
@@ -237,10 +291,12 @@ fn combine_metrics<'a>(
                     .push(NominalVariant { label, value });
             }
             PrimitiveMetricEntry::HistogramVariant { key, value } => {
-                variant_histograms
-                    .entry(key)
-                    .or_default()
-                    .push(HistogramVariant::parse(value));
+                let histogram = HistogramVariant::parse(value);
+                if histogram.histogram.buckets.is_empty() {
+                    errors.push(MetricParseError::InvalidVariantHistogramValue { key, value });
+                } else {
+                    variant_histograms.entry(key).or_default().push(histogram);
+                }
             }
         }
     }
@@ -335,6 +391,8 @@ fn combine_metrics<'a>(
                 }
 
                 entries.push(MetricEntry::Throughput(ThroughputMetric { name, bytes }));
+            } else {
+                errors.push(MetricParseError::InvalidThroughputValue { key, value });
             }
 
             continue;
@@ -353,10 +411,15 @@ fn combine_metrics<'a>(
         }
 
         if value.contains('*') {
-            entries.push(MetricEntry::Histogram(HistogramMetric {
-                name: key,
-                histogram: Histogram::parse(value),
-            }));
+            let histogram = Histogram::parse(value);
+            if histogram.buckets.is_empty() {
+                errors.push(MetricParseError::InvalidHistogramValue { key, value });
+            } else {
+                entries.push(MetricEntry::Histogram(HistogramMetric {
+                    name: key,
+                    histogram,
+                }));
+            }
             continue;
         }
 
@@ -377,7 +440,7 @@ fn combine_metrics<'a>(
         }));
     }
 
-    entries
+    CombinedMetrics { entries, errors }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -799,7 +862,17 @@ mod tests {
     use crate::{Registry, Unit};
 
     fn parsed_entries(line: &str) -> Vec<MetricEntry<'_>> {
-        ParsedMetricsLine::parse(line).into_iter().collect()
+        ParsedMetricsLine::parse(line)
+            .compound_iter()
+            .map(|entry| entry.expect("expected parseable metric"))
+            .collect()
+    }
+
+    fn parse_errors(line: &str) -> Vec<MetricParseError<'_>> {
+        ParsedMetricsLine::parse(line)
+            .compound_iter()
+            .filter_map(Result::err)
+            .collect()
     }
 
     #[test]
@@ -873,7 +946,10 @@ mod tests {
     #[test]
     fn parse_is_iterator_based() {
         let parsed = ParsedMetricsLine::parse("a=1,b=2");
-        let entries: Vec<_> = parsed.iter().collect();
+        let entries: Vec<_> = parsed
+            .iter()
+            .map(|entry| entry.expect("expected parseable metric"))
+            .collect();
         assert_eq!(
             entries,
             vec![
@@ -887,6 +963,44 @@ mod tests {
                 }),
             ]
         );
+    }
+
+    #[test]
+    fn primitive_iterator_exposes_raw_entries() {
+        let parsed = ParsedMetricsLine::parse("q.packet.enq=10,rx.ecn=7 ect0");
+        let entries: Vec<_> = parsed
+            .primitive_iter()
+            .map(|entry| entry.expect("expected parseable primitive metric"))
+            .collect();
+
+        assert_eq!(
+            entries,
+            vec![
+                PrimitiveMetricEntry::Scalar {
+                    key: "q.packet.enq",
+                    value: "10",
+                },
+                PrimitiveMetricEntry::NominalVariant {
+                    key: "rx.ecn",
+                    value: "7",
+                    label: "ect0",
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn parser_emits_errors_for_invalid_input() {
+        let errors = parse_errors("bad,socket.tx:bytes=oops,latency=bad*value us");
+        assert!(errors
+            .iter()
+            .any(|error| matches!(error, MetricParseError::InvalidMetricFragment { fragment } if *fragment == "bad")));
+        assert!(errors.iter().any(
+            |error| matches!(error, MetricParseError::InvalidThroughputValue { key, value } if *key == "socket.tx:bytes" && *value == "oops")
+        ));
+        assert!(errors.iter().any(
+            |error| matches!(error, MetricParseError::InvalidHistogramValue { key, value } if *key == "latency" && *value == "bad*value us")
+        ));
     }
 
     #[test]
@@ -1086,10 +1200,12 @@ mod tests {
             let line = String::from_utf8_lossy(input);
             let parsed = ParsedMetricsLine::parse(&line);
             let _ = parsed.iter().count();
+            let _ = parsed.primitive_iter().count();
             let pretty = parsed.format_pretty();
             let _ = parsed.to_json_rows();
             let reparsed = ParsedMetricsLine::parse(&pretty);
             let _ = reparsed.iter().count();
+            let _ = reparsed.primitive_iter().count();
             let _ = reparsed.to_json_rows();
         });
     }
