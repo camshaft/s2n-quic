@@ -3,6 +3,7 @@
 
 mod ack_burst;
 mod ack_completion;
+mod completion;
 mod context_resolver;
 mod frame_dispatch;
 mod helpers;
