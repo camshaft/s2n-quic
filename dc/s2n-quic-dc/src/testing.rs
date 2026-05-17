@@ -8,7 +8,10 @@ use crate::{
 };
 use s2n_quic::{provider::tls::Provider, server::Name};
 use s2n_quic_core::{crypto::tls::testing::certificates, time::StdClock};
-use std::{sync::OnceLock, time::Duration};
+use std::{cell::Cell, sync::OnceLock, time::Duration};
+
+#[cfg(test)]
+use std::sync::{Arc, Mutex};
 
 pub use bach::{ext, rand};
 
@@ -64,6 +67,25 @@ pub mod loom {
 pub use loom;
 
 pub static SNI: OnceLock<Name> = OnceLock::new();
+
+thread_local! {
+    static TRACING_DISABLED_DEPTH: Cell<usize> = const { Cell::new(0) };
+}
+
+struct TracingDisabledGuard;
+
+impl TracingDisabledGuard {
+    fn enter() -> Self {
+        TRACING_DISABLED_DEPTH.with(|depth| depth.set(depth.get() + 1));
+        Self
+    }
+}
+
+impl Drop for TracingDisabledGuard {
+    fn drop(&mut self) {
+        TRACING_DISABLED_DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
+    }
+}
 
 #[doc(hidden)]
 pub fn server_name() -> Name {
@@ -128,6 +150,7 @@ pub fn without_tracing<F: FnOnce() -> T, T>(f: F) -> T {
         return f();
     }
 
+    let _guard = TracingDisabledGuard::enter();
     tracing::subscriber::with_default(tracing::subscriber::NoSubscriber::new(), f)
 }
 
@@ -152,14 +175,103 @@ impl tracing_subscriber::fmt::time::FormatTime for Uptime {
 }
 
 /// Runs a function in a deterministic, discrete event simulation environment
+#[track_caller]
 pub fn sim(f: impl FnOnce()) {
     init_tracing();
 
+    #[cfg(test)]
+    {
+        if cfg!(feature = "metric-tracing") && !is_tracing_disabled() {
+            return run_sim_with_snapshot(f);
+        }
+    }
+
+    run_sim(f);
+}
+
+fn run_sim(f: impl FnOnce()) {
     // 1ms RTT
     let net_delay = Duration::from_micros(500);
     let queues = bach::environment::net::queue::Fixed::default().with_net_latency(net_delay);
     let mut rt = bach::environment::default::Runtime::new().with_net_queues(Some(Box::new(queues)));
     rt.run(f);
+}
+
+fn is_tracing_disabled() -> bool {
+    TRACING_DISABLED_DEPTH.with(|depth| depth.get() > 0)
+}
+
+#[cfg(test)]
+#[track_caller]
+fn run_sim_with_snapshot(f: impl FnOnce()) {
+    use tracing_subscriber::fmt::format::FmtSpan;
+
+    let location = std::panic::Location::caller();
+    let writer = SnapshotWriter::default();
+    let format = tracing_subscriber::fmt::format()
+        .with_timer(Uptime::default())
+        .compact();
+    let subscriber = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::builder()
+                .with_default_directive(tracing::Level::TRACE.into())
+                .with_env_var("S2N_LOG")
+                .from_env()
+                .unwrap(),
+        )
+        .with_span_events(FmtSpan::NEW | FmtSpan::CLOSE)
+        .event_format(format)
+        .with_ansi(false)
+        .with_writer(writer.clone())
+        .finish();
+
+    tracing::subscriber::with_default(subscriber, || run_sim(f));
+
+    let suffix = format!(
+        "sim_{}_{}",
+        location.file().replace(['/', '\\', '.'], "_"),
+        location.line()
+    );
+    let logs = writer.take_string();
+    insta::with_settings!({snapshot_suffix => suffix}, {
+        insta::assert_snapshot!(logs);
+    });
+}
+
+#[cfg(test)]
+#[derive(Clone, Default)]
+struct SnapshotWriter(Arc<Mutex<Vec<u8>>>);
+
+#[cfg(test)]
+impl SnapshotWriter {
+    fn take_string(&self) -> String {
+        let bytes = self.0.lock().unwrap().clone();
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+}
+
+#[cfg(test)]
+struct SnapshotWriteGuard(Arc<Mutex<Vec<u8>>>);
+
+#[cfg(test)]
+impl std::io::Write for SnapshotWriteGuard {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for SnapshotWriter {
+    type Writer = SnapshotWriteGuard;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        SnapshotWriteGuard(self.0.clone())
+    }
 }
 
 #[derive(Clone, Default)]

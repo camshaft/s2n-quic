@@ -67,6 +67,32 @@ impl core::fmt::Display for NonZeroDisplay {
 const DEFAULT_STATSD_UDP_MAX_PAYLOAD: usize = 1200;
 const STATSD_HISTOGRAM_PERCENTILES: [u32; 4] = [50, 90, 95, 99];
 
+macro_rules! metric_trace {
+    ($($arg:tt)*) => {{
+        #[cfg(any(test, feature = "metric-tracing"))]
+        {
+            tracing::trace!(target: "s2n_quic_dc::metric", $($arg)*);
+        }
+    }};
+}
+
+macro_rules! with_metric_span {
+    ($name:literal, $body:expr) => {{
+        #[cfg(any(test, feature = "metric-tracing"))]
+        {
+            let _span =
+                tracing::trace_span!(target: "s2n_quic_dc::metric", "metric_call", op = $name)
+                    .entered();
+            $body
+        }
+
+        #[cfg(not(any(test, feature = "metric-tracing")))]
+        {
+            $body
+        }
+    }};
+}
+
 #[derive(Clone, Debug)]
 pub enum SparseMode {
     Never,
@@ -507,7 +533,10 @@ pub struct Counter {
 impl Counter {
     #[inline]
     pub fn add(&self, v: u64) {
-        self.inner.increment(v);
+        with_metric_span!("counter.add", {
+            metric_trace!(metric_id = self.metric_id, value = v, "counter.add");
+            self.inner.increment(v);
+        });
     }
 
     #[inline]
@@ -543,17 +572,29 @@ pub struct Gauge {
 impl Gauge {
     #[inline]
     pub fn add(&self, v: i64) -> i64 {
-        self.inner.fetch_add(v, Ordering::Relaxed) + v
+        with_metric_span!("gauge.add", {
+            let value = self.inner.fetch_add(v, Ordering::Relaxed) + v;
+            metric_trace!(metric_id = self.metric_id, delta = v, value, "gauge.add");
+            value
+        })
     }
 
     #[inline]
     pub fn sub(&self, v: i64) -> i64 {
-        self.inner.fetch_sub(v, Ordering::Relaxed) - v
+        with_metric_span!("gauge.sub", {
+            let value = self.inner.fetch_sub(v, Ordering::Relaxed) - v;
+            metric_trace!(metric_id = self.metric_id, delta = v, value, "gauge.sub");
+            value
+        })
     }
 
     #[inline]
     pub fn get(&self) -> i64 {
-        self.inner.load(Ordering::Relaxed)
+        with_metric_span!("gauge.get", {
+            let value = self.inner.load(Ordering::Relaxed);
+            metric_trace!(metric_id = self.metric_id, value, "gauge.get");
+            value
+        })
     }
 
     #[inline]
@@ -595,16 +636,23 @@ impl Timer {
     /// timestamp (for example, per-poll execution time and inter-poll latency).
     #[inline]
     pub fn start_at(&self, start: Instant) -> TimerGuard<'_> {
-        TimerGuard {
-            summary: &self.summary,
-            start,
-            recorded: false,
-        }
+        with_metric_span!("timer.start_at", {
+            metric_trace!(metric_id = self.metric_id, start = ?start, "timer.start_at");
+            TimerGuard {
+                summary: &self.summary,
+                metric_id: self.metric_id,
+                start,
+                recorded: false,
+            }
+        })
     }
 
     #[inline]
     pub fn record(&self, duration: Duration) {
-        self.summary.record_duration(duration);
+        with_metric_span!("timer.record", {
+            metric_trace!(metric_id = self.metric_id, duration = ?duration, "timer.record");
+            self.summary.record_duration(duration);
+        });
     }
 
     #[inline]
@@ -631,7 +679,10 @@ pub struct SummaryMetric {
 impl SummaryMetric {
     #[inline]
     pub fn record_value(&self, value: u64) {
-        self.summary.record_value(value);
+        with_metric_span!("summary.record_value", {
+            metric_trace!(metric_id = self.metric_id, value, "summary.record_value");
+            self.summary.record_value(value);
+        });
     }
 
     #[inline]
@@ -650,6 +701,7 @@ impl SummaryMetric {
 
 pub struct TimerGuard<'a> {
     summary: &'a Summary,
+    metric_id: MetricId,
     start: Instant,
     recorded: bool,
 }
@@ -657,10 +709,20 @@ pub struct TimerGuard<'a> {
 impl TimerGuard<'_> {
     #[inline]
     pub fn record(mut self) -> Instant {
-        let now = Instant::now();
-        self.summary.record_duration(now.duration_since(self.start));
-        self.recorded = true;
-        now
+        with_metric_span!("timer_guard.record", {
+            let now = Instant::now();
+            let duration = now.duration_since(self.start);
+            metric_trace!(
+                metric_id = self.metric_id,
+                start = ?self.start,
+                now = ?now,
+                duration = ?duration,
+                "timer_guard.record"
+            );
+            self.summary.record_duration(duration);
+            self.recorded = true;
+            now
+        })
     }
 }
 
@@ -668,7 +730,16 @@ impl Drop for TimerGuard<'_> {
     #[inline]
     fn drop(&mut self) {
         if !self.recorded {
-            self.summary.record_duration(self.start.elapsed());
+            with_metric_span!("timer_guard.drop", {
+                let duration = self.start.elapsed();
+                metric_trace!(
+                    metric_id = self.metric_id,
+                    start = ?self.start,
+                    duration = ?duration,
+                    "timer_guard.drop"
+                );
+                self.summary.record_duration(duration);
+            });
         }
     }
 }
@@ -969,21 +1040,30 @@ impl QueueGauge {
 impl QueueGauge {
     #[inline]
     pub fn enqueue(&self, count: u64) {
-        self.throughput.add(count);
-        let depth = self.depth.add(count as i64).max(0) as u64;
-        self.depth_distribution.record_value(depth);
+        with_metric_span!("queue.enqueue", {
+            self.throughput.add(count);
+            let depth = self.depth.add(count as i64).max(0) as u64;
+            metric_trace!(count, depth, "queue.enqueue");
+            self.depth_distribution.record_value(depth);
+        });
     }
 
     #[inline]
     pub fn dequeue(&self) {
-        self.drain.add(1);
-        self.depth.sub(1);
+        with_metric_span!("queue.dequeue", {
+            self.drain.add(1);
+            let depth = self.depth.sub(1).max(0) as u64;
+            metric_trace!(depth, "queue.dequeue");
+        });
     }
 
     #[inline]
     pub fn dequeue_n(&self, count: u64) {
-        self.drain.add(count);
-        self.depth.sub(count as i64);
+        with_metric_span!("queue.dequeue_n", {
+            self.drain.add(count);
+            let depth = self.depth.sub(count as i64).max(0) as u64;
+            metric_trace!(count, depth, "queue.dequeue_n");
+        });
     }
 }
 
