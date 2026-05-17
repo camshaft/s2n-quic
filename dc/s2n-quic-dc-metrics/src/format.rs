@@ -20,10 +20,7 @@ impl<'a> ParsedMetricsLine<'a> {
         ParsedMetricsLineIter::new(self.line)
     }
 
-    /// Returns an iterator of grouped metric entries.
-    ///
-    /// Note: this reparses the input line and rebuilds grouped entries each time it is called.
-    /// Each item is a parse result, allowing callers to observe parse errors directly.
+    /// Alias for [`Self::compound_iter`].
     pub fn iter(&self) -> ParsedMetricsLineIter<'a> {
         self.compound_iter()
     }
@@ -990,14 +987,24 @@ mod tests {
     }
 
     #[test]
-    fn parser_emits_errors_for_invalid_input() {
-        let errors = parse_errors("bad,socket.tx:bytes=oops,latency=bad*value us");
+    fn parser_emits_fragment_error() {
+        let errors = parse_errors("bad");
         assert!(errors
             .iter()
             .any(|error| matches!(error, MetricParseError::InvalidMetricFragment { fragment } if *fragment == "bad")));
+    }
+
+    #[test]
+    fn parser_emits_throughput_error() {
+        let errors = parse_errors("socket.tx:bytes=oops");
         assert!(errors.iter().any(
             |error| matches!(error, MetricParseError::InvalidThroughputValue { key, value } if *key == "socket.tx:bytes" && *value == "oops")
         ));
+    }
+
+    #[test]
+    fn parser_emits_histogram_error() {
+        let errors = parse_errors("latency=bad*value us");
         assert!(errors.iter().any(
             |error| matches!(error, MetricParseError::InvalidHistogramValue { key, value } if *key == "latency" && *value == "bad*value us")
         ));
