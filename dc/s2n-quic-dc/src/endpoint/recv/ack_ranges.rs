@@ -40,6 +40,11 @@ impl Default for AckRanges {
 }
 
 impl AckRanges {
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.packets.is_empty()
+    }
+
     /// Record a received packet number and its arrival time.
     pub fn on_packet_received(&mut self, packet_number: VarInt, now: Timestamp) {
         let pn = PacketNumberSpace::Initial.new_packet_number(packet_number);

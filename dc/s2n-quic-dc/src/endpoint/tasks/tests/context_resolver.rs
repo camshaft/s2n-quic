@@ -9,7 +9,7 @@
 //! wheels based on WheelInterest. These tests verify the lookup, push, and dispatch
 //! behavior.
 
-use super::helpers::{test_batch, test_entry, TestReceiverExt as _};
+use super::helpers::{test_batch, test_entry, CollectingSender, TestReceiver, TestReceiverExt as _};
 use crate::{
     endpoint::{combinator::FrameBatch, send, tasks},
     socket::channel::{intrusive::unsync, ReceiverExt as _, UnboundedSender as _},
@@ -123,6 +123,51 @@ fn input_close_shuts_down() {
         async move {
             let result = tx_wheel_rx.recv().await;
             assert!(result.is_none(), "expected TX wheel channel to close");
+        }
+        .primary()
+        .spawn();
+    });
+}
+
+#[test]
+fn wheel_router_routes_all_interest_combinations() {
+    sim(|| {
+        let registry = crate::counter::Registry::default();
+        let (ctx, _) = {
+            let entry = test_entry();
+            let ctx = send::Context::new(
+                &entry,
+                registry.register_queue_gauge("test.inflight"),
+                registry.register_queue_gauge("test.ack"),
+                registry.register_queue_gauge("test.pending"),
+                0,
+                &Clock::default(),
+            )
+            .unwrap();
+            (Rc::new(RefCell::new(ctx)), entry)
+        };
+
+        let interests = [
+            send::WheelInterest { transmission: false, pto: false, idle_timeout: false },
+            send::WheelInterest { transmission: true, pto: false, idle_timeout: false },
+            send::WheelInterest { transmission: false, pto: true, idle_timeout: false },
+            send::WheelInterest { transmission: false, pto: false, idle_timeout: true },
+            send::WheelInterest { transmission: true, pto: true, idle_timeout: false },
+            send::WheelInterest { transmission: true, pto: false, idle_timeout: true },
+            send::WheelInterest { transmission: false, pto: true, idle_timeout: true },
+            send::WheelInterest { transmission: true, pto: true, idle_timeout: true },
+        ];
+        let input = TestReceiver::new(interests.into_iter().map(|i| (ctx.clone(), i)));
+        let (tx_sender, tx_items) = CollectingSender::new();
+        let (pto_sender, pto_items) = CollectingSender::new();
+        let (idle_sender, idle_items) = CollectingSender::new();
+        let mut router = send::WheelRouter::new(input, tx_sender, pto_sender, idle_sender);
+
+        async move {
+            while router.recv().await.is_some() {}
+            assert_eq!(tx_items.borrow().len(), 4);
+            assert_eq!(pto_items.borrow().len(), 4);
+            assert_eq!(idle_items.borrow().len(), 4);
         }
         .primary()
         .spawn();
