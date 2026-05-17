@@ -20,50 +20,8 @@ fn topology_snapshot_uses_dc_tester_layout() {
         path::secret::map::testing,
         runtime,
         socket::{pool::Pool, rate::Rate},
-        stream::endpoint::{self, WorkerLayout},
+        stream::endpoint::{self, Config, WorkerLayout},
     };
-
-    #[derive(Clone, Copy)]
-    struct PanicSendSocket {
-        addr: std::net::SocketAddr,
-    }
-
-    impl crate::socket::send::Socket for PanicSendSocket {
-        fn send_msg(
-            &self,
-            _addr: &crate::msg::addr::Addr,
-            _payload: &[std::io::IoSlice],
-            _segment_size: u16,
-            _ecn: s2n_quic_core::inet::ExplicitCongestionNotification,
-        ) -> std::io::Result<usize> {
-            panic!("send_msg should not be called during topology snapshot");
-        }
-
-        fn local_addr(&self) -> std::io::Result<std::net::SocketAddr> {
-            Ok(self.addr)
-        }
-    }
-
-    #[derive(Clone, Copy)]
-    struct PanicRecvSocket {
-        addr: std::net::SocketAddr,
-    }
-
-    impl crate::socket::recv::Socket for PanicRecvSocket {
-        fn poll_recv(
-            &self,
-            _cx: &mut core::task::Context,
-            _addr: &mut crate::msg::addr::Addr,
-            _cmsg: &mut crate::msg::cmsg::Receiver,
-            _buffer: &mut [std::io::IoSliceMut],
-        ) -> core::task::Poll<std::io::Result<usize>> {
-            panic!("poll_recv should not be called during topology snapshot");
-        }
-
-        fn local_addr(&self) -> std::io::Result<std::net::SocketAddr> {
-            Ok(self.addr)
-        }
-    }
 
     let mut ids = 1..;
     let layout = WorkerLayout {
@@ -75,44 +33,23 @@ fn topology_snapshot_uses_dc_tester_layout() {
         background: ids.next().expect("background worker id should exist"),
     };
 
-    let runtime = runtime::inspector::Handle::new(layout.background + 1);
-    let gso = endpoint::Gso::default();
-    let send_sockets = (0..64)
-        .map(|idx| PanicSendSocket {
-            addr: std::net::SocketAddr::new(
-                std::net::Ipv4Addr::LOCALHOST.into(),
-                10_000 + idx as u16,
-            ),
-        })
-        .collect();
-    let recv_sockets = (0..4)
-        .map(|idx| PanicRecvSocket {
-            addr: std::net::SocketAddr::new(
-                std::net::Ipv4Addr::LOCALHOST.into(),
-                20_000 + idx as u16,
-            ),
-        })
-        .collect();
-
-    let endpoint = endpoint::setup_endpoint(
-        runtime,
-        endpoint::Config {
+    let topology = runtime::inspector::endpoint_topology(
+        Config {
             layout,
             send_pool: Pool::new(u16::MAX),
             recv_pool: Pool::new(u16::MAX),
             path_secret_map: testing::new(50_000),
-            gso,
+            gso: endpoint::Gso::default(),
             acceptor_registry: acceptor::Registry::new(),
             overall_send_rate: Rate::new(25.0),
             per_socket_send_rate: Rate::new(5.0),
             budgets: endpoint::Budgets::default(),
             submission_shards: 128,
         },
-        send_sockets,
-        recv_sockets,
+        64,
+        4,
     );
 
-    let topology = endpoint.counters.topology();
     insta::assert_snapshot!(topology.to_snapshot());
 }
 

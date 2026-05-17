@@ -378,8 +378,10 @@ pub mod tokio {
 /// Use the counter::Registry::topology() function to get the graph of the pipeline
 /// after using the inspector runtime.
 pub mod inspector {
+    use crate::endpoint::{self, Config, WorkerLayout};
     use crate::time::precision;
     use std::future::Future;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
@@ -408,6 +410,16 @@ pub mod inspector {
         futures: Arc<AtomicUsize>,
     }
 
+    #[derive(Clone, Copy)]
+    struct PanicSendSocket {
+        addr: SocketAddr,
+    }
+
+    #[derive(Clone, Copy)]
+    struct PanicRecvSocket {
+        addr: SocketAddr,
+    }
+
     impl Handle {
         pub fn new(worker_count: usize) -> Self {
             Self {
@@ -430,6 +442,32 @@ pub mod inspector {
         pub fn future_count(&self) -> usize {
             self.futures.load(Ordering::Relaxed)
         }
+    }
+
+    /// Builds an endpoint with panic-only sockets and returns the resulting topology.
+    ///
+    /// This is intended for topology introspection without creating real sockets or executing
+    /// runtime tasks.
+    pub fn endpoint_topology(
+        config: Config,
+        send_socket_count: usize,
+        recv_socket_count: usize,
+    ) -> crate::counter::Topology {
+        let worker_count = required_worker_count(&config.layout);
+        let runtime = Handle::new(worker_count);
+        let send_sockets = (0..send_socket_count)
+            .map(|idx| PanicSendSocket {
+                addr: socket_addr(10_000, idx),
+            })
+            .collect();
+        let recv_sockets = (0..recv_socket_count)
+            .map(|idx| PanicRecvSocket {
+                addr: socket_addr(20_000, idx),
+            })
+            .collect();
+        endpoint::setup_endpoint(runtime, config, send_sockets, recv_sockets)
+            .counters
+            .topology()
     }
 
     impl Default for Handle {
@@ -516,6 +554,61 @@ pub mod inspector {
         fn is_armed(&self) -> bool {
             self.armed
         }
+    }
+
+    impl crate::socket::send::Socket for PanicSendSocket {
+        fn send_msg(
+            &self,
+            _addr: &crate::msg::addr::Addr,
+            _payload: &[std::io::IoSlice],
+            _segment_size: u16,
+            _ecn: s2n_quic_core::inet::ExplicitCongestionNotification,
+        ) -> std::io::Result<usize> {
+            panic!("send_msg should not be called during topology snapshot");
+        }
+
+        fn local_addr(&self) -> std::io::Result<SocketAddr> {
+            Ok(self.addr)
+        }
+    }
+
+    impl crate::socket::recv::Socket for PanicRecvSocket {
+        fn poll_recv(
+            &self,
+            _cx: &mut core::task::Context,
+            _addr: &mut crate::msg::addr::Addr,
+            _cmsg: &mut crate::msg::cmsg::Receiver,
+            _buffer: &mut [std::io::IoSliceMut],
+        ) -> core::task::Poll<std::io::Result<usize>> {
+            panic!("poll_recv should not be called during topology snapshot");
+        }
+
+        fn local_addr(&self) -> std::io::Result<SocketAddr> {
+            Ok(self.addr)
+        }
+    }
+
+    fn required_worker_count(layout: &WorkerLayout) -> usize {
+        let max = layout
+            .send
+            .iter()
+            .chain(layout.recv_io.iter())
+            .chain(layout.recv_dispatch.iter())
+            .chain(layout.waker_drain.iter())
+            .chain(core::iter::once(&layout.frame_dispatch))
+            .chain(core::iter::once(&layout.background))
+            .copied()
+            .max()
+            .expect("worker layout should not be empty");
+        max + 1
+    }
+
+    fn socket_addr(base_port: u16, idx: usize) -> SocketAddr {
+        let offset = u16::try_from(idx).expect("socket index should fit in u16");
+        let port = base_port
+            .checked_add(offset)
+            .expect("socket port should fit in u16");
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port)
     }
 }
 
