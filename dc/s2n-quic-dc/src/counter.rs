@@ -915,8 +915,9 @@ impl QueueGauge {
 
 impl QueueSender {
     pub fn with_description(mut self, description: impl core::fmt::Display) -> Self {
-        self.description = description.to_string();
-        self.metric = self.metric.with_description(&self.description);
+        let description = description.to_string();
+        self.metric = self.metric.with_description(&description);
+        self.description = description;
         self
     }
 
@@ -954,8 +955,9 @@ impl QueueSender {
 
 impl QueueReceiver {
     pub fn with_description(mut self, description: impl core::fmt::Display) -> Self {
-        self.description = description.to_string();
-        self.metric = self.metric.with_description(&self.description);
+        let description = description.to_string();
+        self.metric = self.metric.with_description(&description);
+        self.description = description;
         self
     }
 
