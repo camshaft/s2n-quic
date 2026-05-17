@@ -121,6 +121,13 @@ where
             // the segment is registered in the inflight map.
             let mut probe_from_pn: Option<PacketNumber> = None;
 
+            // When there is no data in the inflight map and no RTT sample is already
+            // pending, mark the next ACK-only packet as ack-eliciting so the peer
+            // sends us an ACK we can use to update the RTT estimator. This keeps the
+            // RTT estimate fresh in read-heavy scenarios where we only send ACKs.
+            let rtt_sample_needed =
+                !context.inflight.has_inflight() && !context.rtt_tracker.is_pending();
+
             // Phase 1: drain direct ACK submissions (from pending_acks queue).
             // Each entry carries an already-encoded ACK body from recv worker; stamp
             // wire-time ack_delay here. These bypass CWND like Phase 1 frames.
@@ -138,7 +145,8 @@ where
                     dest_sender_id: submission.remote_sender_id,
                     ack_delay,
                     has_ecn: submission.has_ecn,
-                    is_ack_eliciting: context.pto.probe_state.is_requested(),
+                    is_ack_eliciting: context.pto.probe_state.is_requested()
+                        || rtt_sample_needed,
                 };
                 let payload_len = submission.body.len();
 
@@ -326,6 +334,11 @@ where
                 // An ACK-only packet that was ack-eliciting (PING-style ACK) satisfies the
                 // PTO but has nothing to retransmit.
                 if !packet_frames.is_empty() {
+                    // Data frames are going into the inflight map and will produce RTT
+                    // samples via normal ACK processing. The separate ACK-only RTT tracker
+                    // is no longer needed.
+                    context.rtt_tracker.clear();
+
                     let has_more_app_data = context.has_pending();
                     let cc_info = context.cca.on_packet_sent(
                         time_sent,
@@ -348,6 +361,11 @@ where
                     if let Some(old_pn) = probe_from_pn {
                         context.inflight.set_probed_to(old_pn, pn);
                     }
+                } else if rtt_sample_needed {
+                    // ACK-only ack-eliciting packet (PING-style) sent to obtain an RTT
+                    // sample. Record the PN and send time so the ACK processor can match
+                    // the peer's response and update the RTT estimator.
+                    context.rtt_tracker.on_sent(packet_number, time_sent);
                 }
                 context.invariants();
             }

@@ -29,8 +29,13 @@ use crate::{
 use core::time::Duration;
 use rustc_hash::FxHashMap;
 use s2n_quic_core::{
-    frame::ack::EcnCounts, packet::number::PacketNumberSpace, path::INITIAL_PTO_BACKOFF, random,
-    recovery::RttEstimator, varint::VarInt,
+    frame::ack::EcnCounts,
+    packet::number::PacketNumberSpace,
+    path::INITIAL_PTO_BACKOFF,
+    random,
+    recovery::RttEstimator,
+    time::Timestamp,
+    varint::VarInt,
 };
 use s2n_quic_platform::features::Gso;
 use std::{cell::RefCell, rc::Rc, sync::Arc};
@@ -176,6 +181,89 @@ impl PendingAcks {
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.queue.is_empty()
+    }
+}
+
+/// Tracks RTT sampling for ACK-only (read-heavy) sends.
+///
+/// When there is no data in the inflight map, RTT samples cannot be obtained from
+/// normal ACK processing because no ack-eliciting packets are outstanding. This
+/// tracker enables the assembler to occasionally make an ACK-only packet
+/// ack-eliciting (acting like a PING), records when it was sent, and then updates
+/// the RTT estimator when the peer acknowledges that packet.
+///
+/// At most one sample is outstanding at a time. A new sample is requested only
+/// when the inflight map is empty *and* no sample is already pending. This
+/// prevents the sender from flooding the peer with ack-eliciting ACK-only packets
+/// while still keeping the RTT estimate fresh during sustained read-heavy periods.
+///
+/// The tracker is also cleared whenever a data-carrying packet is inserted into
+/// the inflight map, because those packets will produce RTT samples on their own.
+#[derive(Debug, Default)]
+pub(crate) struct AckRttTracker {
+    /// The packet number and send time of the outstanding ack-eliciting ACK-only
+    /// packet. `None` when no sample is pending.
+    pending: Option<(VarInt, Timestamp)>,
+}
+
+impl AckRttTracker {
+    /// Returns `true` when an ack-eliciting ACK-only packet is outstanding and
+    /// we have not yet received the corresponding RTT sample.
+    #[inline]
+    pub fn is_pending(&self) -> bool {
+        self.pending.is_some()
+    }
+
+    /// Called just before an ack-eliciting ACK-only packet is sent.
+    ///
+    /// Records `(packet_number, time_sent)` so `check_range` can match the
+    /// incoming ACK and compute an RTT sample.
+    #[inline]
+    pub fn on_sent(&mut self, packet_number: VarInt, time_sent: Timestamp) {
+        self.pending = Some((packet_number, time_sent));
+    }
+
+    /// Clear the pending sample.
+    ///
+    /// Called when a data-carrying packet is inserted into the inflight map.
+    /// In that case the tracker is no longer needed because RTT samples will
+    /// arrive via the normal inflight ACK path.
+    #[inline]
+    pub fn clear(&mut self) {
+        self.pending = None;
+    }
+
+    /// Check whether a single ACK range covers the pending PN.
+    ///
+    /// `start` and `end` are the inclusive VarInt bounds of the acknowledged
+    /// range, and `largest_acknowledged` is the overall largest PN in the ACK
+    /// frame (used for loss detection).
+    ///
+    /// Returns `Some(time_sent)` when the pending PN is covered, allowing the
+    /// caller to compute and record an RTT sample. In that case the tracker is
+    /// cleared. If the pending PN is strictly less than `largest_acknowledged`
+    /// but not covered by `[start, end]`, the ack-eliciting ACK packet was
+    /// probably dropped; the tracker is also cleared so a fresh sample can be
+    /// requested on the next ACK-only send.
+    #[inline]
+    pub fn check_range(
+        &mut self,
+        start: VarInt,
+        end: VarInt,
+        largest_acknowledged: VarInt,
+    ) -> Option<Timestamp> {
+        let (pn, time_sent) = self.pending?;
+        if pn >= start && pn <= end {
+            self.pending = None;
+            return Some(time_sent);
+        }
+        // Loss heuristic: if the peer has acknowledged a PN strictly beyond
+        // ours but our PN is not in this range, the ack-eliciting ACK-only
+        // packet was likely dropped. Clear so we can request a new sample.
+        if largest_acknowledged > pn {
+            self.pending = None;
+        }
+        None
     }
 }
 
@@ -350,6 +438,13 @@ pub(crate) struct Context {
     /// Last-seen ECN counts from peer ACK frames; used to compute deltas for the CCA.
     pub peer_ecn_counts: EcnCounts,
     pub created_at: precision::Timestamp,
+    /// RTT sampler for ACK-only (read-heavy) sends.
+    ///
+    /// When `inflight` is empty we have no ack-eliciting packets in flight and
+    /// can no longer get RTT samples through the normal ACK path. This tracker
+    /// periodically makes an ACK-only packet ack-eliciting so that the peer
+    /// responds and we can measure the round-trip time.
+    pub rtt_tracker: AckRttTracker,
 }
 
 #[derive(Debug)]
@@ -409,6 +504,7 @@ impl Context {
             idle_wheel: WheelLinks::new(),
             peer_ecn_counts: EcnCounts::default(),
             created_at: clock.now(),
+            rtt_tracker: AckRttTracker::default(),
         })
     }
 

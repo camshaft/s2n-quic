@@ -617,3 +617,107 @@ fn edt_floor_raises_score_when_pacing_gated() {
         "paced score ({score_paced}) should be ≥ EDT nanoseconds ({edt_ns})"
     );
 }
+
+// ── AckRttTracker tests ───────────────────────────────────────────────────────
+
+use super::AckRttTracker;
+use s2n_quic_core::varint::VarInt;
+
+fn make_ts(millis: u64) -> s2n_quic_core::time::Timestamp {
+    unsafe {
+        s2n_quic_core::time::Timestamp::from_duration(Duration::from_millis(millis))
+    }
+}
+
+fn make_varint(n: u64) -> VarInt {
+    VarInt::new(n).unwrap()
+}
+
+#[test]
+fn ack_rtt_tracker_initially_not_pending() {
+    let tracker = AckRttTracker::default();
+    assert!(
+        !tracker.is_pending(),
+        "fresh AckRttTracker should have no pending sample"
+    );
+}
+
+#[test]
+fn ack_rtt_tracker_pending_after_on_sent() {
+    let mut tracker = AckRttTracker::default();
+    tracker.on_sent(make_varint(5), make_ts(100));
+    assert!(
+        tracker.is_pending(),
+        "tracker should be pending after on_sent"
+    );
+}
+
+#[test]
+fn ack_rtt_tracker_clear_removes_pending() {
+    let mut tracker = AckRttTracker::default();
+    tracker.on_sent(make_varint(5), make_ts(100));
+    tracker.clear();
+    assert!(
+        !tracker.is_pending(),
+        "tracker should not be pending after clear"
+    );
+}
+
+#[test]
+fn ack_rtt_tracker_check_range_returns_time_sent_when_covered() {
+    let mut tracker = AckRttTracker::default();
+    let sent_time = make_ts(100);
+    tracker.on_sent(make_varint(5), sent_time);
+
+    // ACK range [3, 7] covers PN 5.
+    let result = tracker.check_range(make_varint(3), make_varint(7), make_varint(7));
+    assert_eq!(result, Some(sent_time), "check_range should return time_sent when PN is covered");
+    assert!(!tracker.is_pending(), "tracker cleared after match");
+}
+
+#[test]
+fn ack_rtt_tracker_check_range_exact_match() {
+    let mut tracker = AckRttTracker::default();
+    let sent_time = make_ts(200);
+    tracker.on_sent(make_varint(10), sent_time);
+
+    let result = tracker.check_range(make_varint(10), make_varint(10), make_varint(10));
+    assert_eq!(result, Some(sent_time));
+    assert!(!tracker.is_pending());
+}
+
+#[test]
+fn ack_rtt_tracker_check_range_no_match_does_not_clear_when_larger_not_acked() {
+    let mut tracker = AckRttTracker::default();
+    tracker.on_sent(make_varint(10), make_ts(100));
+
+    // ACK range [1, 5] does not cover PN 10; largest_acknowledged=5 < 10.
+    let result = tracker.check_range(make_varint(1), make_varint(5), make_varint(5));
+    assert!(result.is_none(), "no match expected");
+    assert!(
+        tracker.is_pending(),
+        "tracker should remain pending when largest_acked < pending_pn"
+    );
+}
+
+#[test]
+fn ack_rtt_tracker_check_range_loss_detection_clears_when_larger_acked() {
+    let mut tracker = AckRttTracker::default();
+    tracker.on_sent(make_varint(5), make_ts(100));
+
+    // ACK range [8, 12] does not include PN 5; largest_acknowledged=12 > 5 → loss.
+    let result = tracker.check_range(make_varint(8), make_varint(12), make_varint(12));
+    assert!(result.is_none(), "no RTT sample from a lost packet");
+    assert!(
+        !tracker.is_pending(),
+        "tracker cleared by loss detection when largest_acked > pending_pn"
+    );
+}
+
+#[test]
+fn ack_rtt_tracker_returns_none_when_not_pending() {
+    let mut tracker = AckRttTracker::default();
+    // No pending sample → check_range is a no-op returning None.
+    let result = tracker.check_range(make_varint(0), make_varint(100), make_varint(100));
+    assert!(result.is_none());
+}
