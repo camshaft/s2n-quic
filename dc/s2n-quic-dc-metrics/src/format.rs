@@ -852,7 +852,7 @@ mod tests {
                                 HistogramBucket { value: 5, count: 2 },
                                 HistogramBucket {
                                     value: 10,
-                                    count: 1
+                                    count: 1,
                                 },
                             ],
                             unit: "us",
