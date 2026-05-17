@@ -877,3 +877,103 @@ fn ack_rtt_tracker_multi_range_ack_largest_first() {
     // sampled=true after consuming in r2
     assert!(tracker.is_pending(), "sampled=true after successful probe");
 }
+
+// ── Assembler-path scenarios ──────────────────────────────────────────────────
+//
+// The following tests simulate the exact sequence of AckRttTracker API calls
+// that the assembler makes in specific scenarios, verifying that the tracker
+// produces correct RTT samples in each case.
+
+/// PTO fires while an RTT probe is already in-flight.
+///
+/// Scenario (mirrors the assembler's fixed code path):
+///   - `on_sent` was called for the first ack-eliciting probe (stable + latest set).
+///   - A subsequent ACK-only send is triggered by PTO while `make_ack_eliciting=false`
+///     (sampled not yet set, stable is still in-flight).
+///   - The assembler calls `on_non_eliciting_sent` to advance `latest` to the PTO PN.
+///   - When the peer ACKs the PTO PN, `check_range` returns the fresher timestamp.
+///
+/// Before the fix the assembler entered the `if is_ack_eliciting` code path and
+/// called neither `on_sent` nor `on_non_eliciting_sent`, leaving `latest` stale.
+#[test]
+fn ack_rtt_tracker_pto_during_inflight_probe_updates_latest() {
+    let mut tracker = AckRttTracker::default();
+    let t_probe = make_ts(100);
+    let t_pto = make_ts(250);
+
+    // First ack-eliciting probe (make_ack_eliciting=true).
+    tracker.on_sent(make_varint(1), t_probe);
+    assert!(tracker.is_pending(), "probe in-flight");
+
+    // PTO fires; assembler sends ACK-only ack-eliciting packet with PN 5.
+    // make_ack_eliciting=false here, so on_non_eliciting_sent is called.
+    tracker.on_non_eliciting_sent(make_varint(5), t_pto);
+
+    // Peer ACKs PN 5 (the PTO PN) — latest was advanced, so we get t_pto.
+    let result = tracker.check_range(make_varint(5), make_varint(5));
+    assert_eq!(
+        result,
+        Some(t_pto),
+        "PTO PN acknowledged: should return the fresher t_pto timestamp"
+    );
+}
+
+/// PTO fires while `sampled=true` (no probe in-flight).
+///
+/// After an RTT sample is consumed, `sampled=true` keeps `is_pending()=true`
+/// to prevent ACK loops.  If PTO fires during this cooldown, the assembler
+/// calls `on_non_eliciting_sent` — but since `stable=None`, it is a no-op.
+/// The sampled state is preserved and no spurious new cycle is started.
+#[test]
+fn ack_rtt_tracker_pto_after_sample_consumed_is_noop() {
+    let mut tracker = AckRttTracker::default();
+    let t_probe = make_ts(100);
+    let t_pto = make_ts(300);
+
+    // Probe sent and acknowledged — sample consumed, sampled=true.
+    tracker.on_sent(make_varint(1), t_probe);
+    let _ = tracker.check_range(make_varint(1), make_varint(1));
+    tracker.on_ack_done(make_varint(10));
+    assert!(tracker.is_pending(), "sampled=true prevents re-probe");
+
+    // PTO fires; assembler calls on_non_eliciting_sent.
+    // stable=None so this should be a no-op.
+    tracker.on_non_eliciting_sent(make_varint(5), t_pto);
+
+    // Tracker should still be pending (sampled=true) and not track PN 5.
+    assert!(tracker.is_pending(), "still sampled=true after PTO no-op");
+    let result = tracker.check_range(make_varint(5), make_varint(5));
+    assert!(
+        result.is_none(),
+        "PN 5 should not be tracked when stable=None"
+    );
+}
+
+/// `make_ack_eliciting=true` AND PTO requested simultaneously.
+///
+/// The assembler sets `is_ack_eliciting` due to both `make_ack_eliciting` and
+/// PTO.  The tracker should receive `on_sent` (not `on_non_eliciting_sent`)
+/// because this is our own RTT probe.  After the fix, the `on_sent` call lives
+/// inside the `if is_ack_eliciting` block and is reached in this case.
+#[test]
+fn ack_rtt_tracker_make_ack_eliciting_true_records_probe() {
+    let mut tracker = AckRttTracker::default();
+    let t_send = make_ts(100);
+
+    // Assembler: make_ack_eliciting=true → calls on_sent.
+    tracker.on_sent(make_varint(7), t_send);
+    assert!(tracker.is_pending(), "probe recorded after on_sent");
+
+    // Peer acknowledges PN 7.
+    let result = tracker.check_range(make_varint(7), make_varint(7));
+    assert_eq!(
+        result,
+        Some(t_send),
+        "RTT sample should be returned when probe PN is acknowledged"
+    );
+    tracker.on_ack_done(make_varint(7));
+    assert!(
+        tracker.is_pending(),
+        "sampled=true keeps is_pending after consumption"
+    );
+}

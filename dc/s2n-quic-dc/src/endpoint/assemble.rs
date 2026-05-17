@@ -121,12 +121,12 @@ where
             // the segment is registered in the inflight map.
             let mut probe_from_pn: Option<PacketNumber> = None;
 
-            // When there is no data in the inflight map, make this ACK-only
-            // packet ack-eliciting so the peer sends us an ACK we can use to
-            // update the RTT estimator. We call rtt_tracker.on_sent on every
-            // such send: on_sent updates `latest` each time while keeping
-            // `stable` fixed at the oldest unacknowledged PN, so the tracker
-            // always has a fallback sample even if the most recent send is lost.
+            // When there is no data in the inflight map, we want to obtain an RTT
+            // sample by making one ACK-only packet ack-eliciting (PING-style probe).
+            // `make_ack_eliciting` is true only for the first probe in a cycle;
+            // once a probe is in-flight (`is_pending()=true`) subsequent ACK-only
+            // sends are non-ack-eliciting but still update `latest` via
+            // `on_non_eliciting_sent` so we have the freshest PN when the ACK arrives.
             let rtt_sample_needed = !context.inflight.has_inflight();
             // Only make the ACK packet ack-eliciting when no probe is already
             // outstanding. This prevents an ACK loop: once the peer responds to
@@ -368,18 +368,29 @@ where
                         context.inflight.set_probed_to(old_pn, pn);
                     }
                 } else if rtt_sample_needed {
+                    // ACK-only ack-eliciting packet (our own RTT probe or PTO-triggered).
+                    // The tracker update must live here — inside the `if is_ack_eliciting`
+                    // block — because `is_ack_eliciting=true` prevents the outer
+                    // `else if rtt_sample_needed` branch from ever being reached.
                     if make_ack_eliciting {
-                        // ACK-only ack-eliciting packet (PING-style) sent to obtain an RTT
-                        // sample. Record the PN and send time so the ACK processor can match
-                        // the peer's response and update the RTT estimator.
+                        // This is our own ack-eliciting probe; start a new tracking cycle.
                         context.rtt_tracker.on_sent(packet_number, time_sent);
                     } else {
-                        // Not ack-eliciting (probe already in-flight), but keep `latest`
-                        // pointing at the most recently sent PN. If the peer's next ACK
-                        // covers this PN as part of a range, we return the fresher sample.
+                        // PTO made the packet ack-eliciting while our own probe was not
+                        // requested (sampled=true or stable already in-flight). Update
+                        // `latest` so if the peer's ACK covers this PN we get a fresh sample.
                         context.rtt_tracker.on_non_eliciting_sent(packet_number, time_sent);
                     }
                 }
+                context.invariants();
+            } else if rtt_sample_needed {
+                // `is_ack_eliciting=false` here. By construction, `is_ack_eliciting=false`
+                // implies `make_ack_eliciting=false` (a true `make_ack_eliciting` would have
+                // set the ACK header ack-eliciting, making `is_ack_eliciting=true`).
+                // Keep `latest` fresh while the in-flight probe waits for an ACK.
+                context.rtt_tracker.on_non_eliciting_sent(packet_number, time_sent);
+                context.invariants();
+            } else {
                 context.invariants();
             }
 
