@@ -130,10 +130,6 @@ use tracing::{debug, trace};
 ///
 /// # Footguns
 ///
-/// - Server-side readers can start in a pending-validation state. Validation is
-///   enforced by [`crate::stream::PendingValidation`] before applications get a
-///   [`crate::stream::Stream`], but internal users should still avoid reads
-///   while pending.
 /// - In debug builds, repeatedly calling `read_into` after it already returned
 ///   `Ok(0)` triggers a debug assertion so applications notice accidental
 ///   post-EOF spin loops.
@@ -391,8 +387,6 @@ impl Reader {
     ///
     /// # Footguns
     ///
-    /// - On pending server-side streams, validation must complete before
-    ///   calling `read_into`.
     /// - `Ok(0)` is EOF, not "no bytes available right now".
     /// - In debug builds, repeatedly calling `read_into` after the first
     ///   `Ok(0)` triggers a debug assertion to catch EOF polling loops.
