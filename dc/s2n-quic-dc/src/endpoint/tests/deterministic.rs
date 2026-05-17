@@ -705,8 +705,8 @@ fn init_uniqueness_reordered_and_duplicated() {
 fn ack_only_probe_does_not_create_ack_loop() {
     // Small body: we care about post-transfer behaviour, not throughput.
     const BODY_LEN: usize = 1024;
-    // 5 simulated seconds at 1 ms RTT = 5 000 RTTs.  An unbounded ACK loop
-    // would produce at least two packets per RTT → ≥ 10 000 extra packets.
+    // 5 simulated seconds at 1 ms RTT = 5,000 RTTs.  An unbounded ACK loop
+    // would produce at least two packets per RTT → ≥ 10,000 extra packets.
     const OBSERVE_WINDOW: Duration = Duration::from_secs(5);
     // Allow a generous margin for the legitimate ACK flush that follows the
     // transfer (completing the last round of in-flight ACKs) plus a single
@@ -721,7 +721,7 @@ fn ack_only_probe_does_not_create_ack_loop() {
         let packets_after = packets_after.clone();
 
         sim(|| {
-            // Count every packet sent after the primary task signals "done".
+            // Count packets sent after the transfer completes.
             {
                 let done = transfer_done.clone();
                 let count = packets_after.clone();

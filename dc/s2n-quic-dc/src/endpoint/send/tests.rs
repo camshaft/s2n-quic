@@ -706,7 +706,7 @@ fn ack_rtt_tracker_latest_preferred_over_stable() {
 }
 
 /// When latest is lost but stable is ACKed, stable's time_sent is returned and
-/// stable is advanced to latest. Loss of latest is handled in on_ack_done.
+/// stable is advanced to the value from latest. Loss of latest is handled in on_ack_done.
 #[test]
 fn ack_rtt_tracker_stable_fallback_when_latest_lost() {
     let mut tracker = AckRttTracker::default();
@@ -719,7 +719,7 @@ fn ack_rtt_tracker_stable_fallback_when_latest_lost() {
     // check_range: stable ACKed → advance stable = latest.take() = (5,t5), sampled=true.
     let result = tracker.check_range(make_varint(1), make_varint(1));
     assert_eq!(result, Some(t1), "stable fallback time_sent returned");
-    // stable advanced to (5,t5), sampled=true → is_pending()=true
+    // stable advanced to (5,t5) (the value latest held), sampled=true → is_pending()=true
     assert!(tracker.is_pending(), "still pending (sampled + advanced stable)");
 
     // After all ranges: on_ack_done(6) declares pn=5 lost (6 > 5).
@@ -852,9 +852,8 @@ fn ack_rtt_tracker_loss_does_not_set_sampled() {
     );
 }
 
-/// on_ack_done correctly handles the case where ranges are delivered
-/// largest-first: if a small range covers the tracked PN, check_range consumes
-/// it, and on_ack_done does not spuriously clear a valid state.
+/// `on_ack_done` is called after all ranges, so a tracked PN in a smaller range
+/// is not spuriously declared lost when a larger range is processed first.
 #[test]
 fn ack_rtt_tracker_multi_range_ack_largest_first() {
     let mut tracker = AckRttTracker::default();
@@ -864,9 +863,10 @@ fn ack_rtt_tracker_multi_range_ack_largest_first() {
     // Simulate ACK frame with two ranges delivered largest-first:
     //   range [10,15] — does not cover pn=3
     //   range [1,5]   — covers pn=3
-    // With the old per-range loss heuristic, the first range would declare pn=3
-    // lost (largest=15 > 3, not in [10,15]). The new approach defers loss to
-    // on_ack_done, so the second range correctly returns the sample.
+    // check_range does not perform loss detection, so the first range does not
+    // clear the tracker. The second range finds pn=3 and returns the sample.
+    // on_ack_done sees largest=15 > 3, but stable has already been consumed so
+    // it has nothing left to clear.
     let r1 = tracker.check_range(make_varint(10), make_varint(15)); // no match
     assert!(r1.is_none());
 
