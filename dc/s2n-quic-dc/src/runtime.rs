@@ -23,7 +23,7 @@ use std::future::Future;
 /// Each runtime implementation bundles both spawning capability and the clock
 /// appropriate for that execution model (e.g. busy-poll timers that don't use wakers,
 /// tokio timers backed by the tokio runtime, bach simulated time).
-pub trait Runtime: Clone + Send + 'static {
+pub trait Runtime: Clone + 'static {
     /// The clock type associated with this runtime.
     type Clock: time::Clock + precision::Clock + Clone + Send + 'static;
 
@@ -380,10 +380,10 @@ pub mod tokio {
 pub mod inspector {
     use crate::endpoint::{self, Config, WorkerLayout};
     use crate::time::precision;
+    use core::pin::Pin;
     use std::future::Future;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     /// Inspector runtime for topology introspection.
     ///
@@ -392,7 +392,7 @@ pub mod inspector {
     pub struct Handle {
         worker_count: usize,
         clock: Clock,
-        futures: Arc<AtomicUsize>,
+        futures: Arc<Mutex<Vec<Pin<Box<dyn Future<Output = ()> + 'static>>>>>,
     }
 
     /// Simple clock for inspector runtime.
@@ -407,7 +407,7 @@ pub mod inspector {
 
     pub struct Local {
         worker_id: usize,
-        futures: Arc<AtomicUsize>,
+        futures: Arc<Mutex<Vec<Pin<Box<dyn Future<Output = ()> + 'static>>>>>,
     }
 
     #[derive(Clone, Copy)]
@@ -425,7 +425,7 @@ pub mod inspector {
             Self {
                 worker_count: worker_count.max(1),
                 clock: Clock,
-                futures: Arc::new(AtomicUsize::new(0)),
+                futures: Arc::new(Mutex::new(Vec::new())),
             }
         }
 
@@ -434,13 +434,18 @@ pub mod inspector {
         where
             F: Future<Output = ()> + 'static,
         {
-            self.futures.fetch_add(1, Ordering::Relaxed);
-            drop(future);
+            self.futures
+                .lock()
+                .expect("inspector future lock poisoned")
+                .push(Box::pin(future));
         }
 
         /// Get the number of futures currently held.
         pub fn future_count(&self) -> usize {
-            self.futures.load(Ordering::Relaxed)
+            self.futures
+                .lock()
+                .expect("inspector future lock poisoned")
+                .len()
         }
     }
 
@@ -481,8 +486,10 @@ pub mod inspector {
         where
             F: Future<Output = ()> + 'static,
         {
-            self.futures.fetch_add(1, Ordering::Relaxed);
-            drop(future);
+            self.futures
+                .lock()
+                .expect("inspector future lock poisoned")
+                .push(Box::pin(future));
         }
 
         fn worker_id(&self) -> usize {
@@ -615,6 +622,14 @@ pub mod inspector {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use core::{
+        pin::Pin,
+        task::{Context, Poll},
+    };
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
 
     #[test]
     fn tokio_runtime_worker_count() {
@@ -639,5 +654,39 @@ mod tests {
         inspector.spawn(async {});
 
         assert_eq!(inspector.future_count(), 3);
+    }
+
+    #[test]
+    fn inspector_spawn_does_not_drop_future() {
+        let inspector = inspector::Handle::new(1);
+        let drop_count = Arc::new(AtomicUsize::new(0));
+        inspector.spawn(DropOnDropFuture::new(drop_count.clone()));
+
+        assert_eq!(inspector.future_count(), 1);
+        assert_eq!(drop_count.load(Ordering::Relaxed), 0);
+    }
+
+    struct DropOnDropFuture {
+        drop_count: Arc<AtomicUsize>,
+    }
+
+    impl DropOnDropFuture {
+        fn new(drop_count: Arc<AtomicUsize>) -> Self {
+            Self { drop_count }
+        }
+    }
+
+    impl Future for DropOnDropFuture {
+        type Output = ();
+
+        fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+            Poll::Pending
+        }
+    }
+
+    impl Drop for DropOnDropFuture {
+        fn drop(&mut self) {
+            self.drop_count.fetch_add(1, Ordering::Relaxed);
+        }
     }
 }
