@@ -645,20 +645,32 @@ mod tests {
         assert!(c3 < 50, "receiver 3 should not handle most of the load (distribution: rx1={c1}, rx2={c2}, rx3={c3})");
     }
 
-    /// After one of two registered receivers is dropped its slot is removed.
+    /// After one of two *registered* receivers is dropped its slot is removed.
     /// All subsequent sends go to the surviving receiver.
+    ///
+    /// Registration is lazy: a receiver only participates in load balancing
+    /// after it has polled at least once.  This test:
+    ///   1. Registers `rx2` via `try_recv` (which calls `ensure_registered`).
+    ///   2. Drops `rx2`, removing its slot from the shared list.
+    ///   3. Sends 10 items — they must all arrive on `rx1`.
     #[test]
     fn dropped_receiver_stops_receiving() {
         sim(|| {
             let (mut sender, mut rx1) = new::<u32>(100.into());
-            let rx2 = rx1.clone();
+            let mut rx2 = rx1.clone();
+
+            // Register rx2 by calling try_recv (returns None on empty queue),
+            // then immediately drop it so its slot is removed.
+            async move {
+                let _ = rx2.try_recv(); // registers the slot, returns None
+                // rx2 is dropped here — slot is unregistered
+            }
+            .spawn();
 
             async move {
-                // Register rx2 then immediately drop it
+                // Wait for the rx2 task to complete and unregister before sending.
                 1.ms().sleep().await;
-                drop(rx2);
 
-                // Everything must arrive on rx1
                 for i in 0u32..10 {
                     send_wake(&mut sender, i).unwrap();
                 }
