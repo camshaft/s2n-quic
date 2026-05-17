@@ -19,6 +19,7 @@ use tokio::sync::mpsc;
 
 pub use s2n_quic_dc_metrics::{Summary, Unit};
 
+/// Stable identifier for metric metadata tracked in [`Registry`].
 pub type MetricId = u64;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
