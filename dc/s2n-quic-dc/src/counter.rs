@@ -717,12 +717,12 @@ impl Task {
         .collect()
     }
 
-    pub fn registration_metadata(&self) -> (String, String, String) {
+    pub fn with_registration_metadata_ref<T>(&self, f: impl FnOnce(&str, &str, &str) -> T) -> T {
         let registration = self.registration.lock().unwrap();
-        (
-            registration.name.clone(),
-            registration.description.clone(),
-            registration.function.clone(),
+        f(
+            registration.name.as_str(),
+            registration.description.as_str(),
+            registration.function.as_str(),
         )
     }
 
@@ -732,11 +732,12 @@ impl Task {
         description: impl core::fmt::Display,
         function: impl core::fmt::Display,
     ) -> Self {
-        let mut registration = self.registration.lock().unwrap();
-        registration.name = name.to_string();
-        registration.description = description.to_string();
-        registration.function = function.to_string();
-        drop(registration);
+        {
+            let mut registration = self.registration.lock().unwrap();
+            registration.name = name.to_string();
+            registration.description = description.to_string();
+            registration.function = function.to_string();
+        }
         self
     }
 }

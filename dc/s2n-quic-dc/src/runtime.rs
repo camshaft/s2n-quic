@@ -342,12 +342,12 @@ pub trait Spawner {
         F: Future<Output = ()> + 'static,
         Self: Sized,
     {
-        let (name, description, function) = task_counter.registration_metadata();
-        self.register_task(
+        let task = task_counter.with_registration_metadata_ref(|name, description, function| {
             TaskRegistration::new(name, description, function)
                 .with_budget(budget)
-                .with_metric(&task_counter),
-        );
+                .with_metric(&task_counter)
+        });
+        self.register_task(task);
         self.spawn(future);
     }
 }
