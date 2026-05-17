@@ -114,10 +114,10 @@ pub fn frame_dispatch<S, Clk>(
     Clk: precision::Clock + 'static,
 {
     let mut priority_batch_rxs = Vec::with_capacity(Priority::LEVELS);
-    let priority_list_txs: [_; Priority::LEVELS] = core::array::from_fn(|_| {
+    let priority_txs_raw: [_; Priority::LEVELS] = core::array::from_fn(|_| {
         let (tx, rx) = intrusive::unsync::new::<Frame>();
         priority_batch_rxs.push(rx);
-        tx.into_list_sender()
+        tx
     });
     let q_router_to_batcher: [_; Priority::LEVELS] = core::array::from_fn(|i| {
         counter_registry
@@ -131,12 +131,13 @@ pub fn frame_dispatch<S, Clk>(
 
     {
         // Task 1: fixed-cost priority routing.
-        for i in 0..Priority::LEVELS {
-            let _sender = q_router_to_batcher[i]
+        let priority_list_txs: [_; Priority::LEVELS] = core::array::from_fn(|i| {
+            let sender = q_router_to_batcher[i]
                 .sender("task.priority_router")
                 .with_description("Priority router emits per-lane frame queues")
                 .with_function("endpoint::tasks::frame_dispatch");
-        }
+            crate::counter::GaugedSender::new(priority_txs_raw[i].clone().into_list_sender(), sender)
+        });
 
         let rx = FrameReceiver {
             frame_rx,
@@ -461,10 +462,6 @@ pub fn send_worker<Socket, Clk, WakerSink, AckComp>(
 
     {
         // Task 5: TX wheel drain — routes expired contexts to per-socket assembler channels.
-        let _tx_wheel_receiver = q_resolver_to_tx_wheel
-            .receiver("task.tx_wheel")
-            .with_description("Tx wheel drains scheduled contexts")
-            .with_function("endpoint::tasks::send_worker");
         let task_counter = counter_registry
             .register_nominal_task("task.tx_wheel", format!("send.{worker_id}"))
             .with_registration_metadata(
@@ -563,11 +560,6 @@ pub fn send_worker<Socket, Clk, WakerSink, AckComp>(
 
     {
         // Task 7: Idle wheel drain — reclaims resources for idle connections.
-        let _idle_wheel_receiver = q_resolver_to_idle_wheel
-            .receiver("task.idle_wheel")
-            .with_description("Idle wheel drains scheduled contexts")
-            .with_function("endpoint::tasks::send_worker");
-
         let task_counter = counter_registry
             .register_nominal_task("task.idle_wheel", format!("send.{worker_id}"))
             .with_registration_metadata(
@@ -674,11 +666,6 @@ pub fn send_worker<Socket, Clk, WakerSink, AckComp>(
     // Task: invalidation drain — purge send caches on path secret revocation.
     // Routes to completed_tx (not cancelled) so CompletionDispatcher wakes streams.
     {
-        let _invalidation_sender = q_ack_to_completion
-            .sender("task.invalidation")
-            .with_description("Invalidation task emits failed frames as completions")
-            .with_function("endpoint::tasks::send_worker");
-
         let rx = send_invalidation(invalidation_rx, send_caches, invalidation_completed_tx);
         let variant = format!("send.{worker_id}");
         let task_counter = counter_registry

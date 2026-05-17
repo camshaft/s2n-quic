@@ -15,14 +15,9 @@
 
 use crate::counter;
 use crate::time::precision;
+use counter::TaskRegistration;
 use s2n_quic_core::time;
 use std::future::Future;
-
-// Re-export topology types from counter module
-pub use counter::{
-    ChannelBinding, ChannelDirection, ChannelRegistration, Metric, MetricRegistration,
-    TaskRegistration,
-};
 
 /// Abstraction over a task runtime and its associated clock.
 ///
@@ -364,57 +359,43 @@ pub mod tokio {
 /// Wrapper runtime that holds spawned futures to keep them alive.
 ///
 /// This is a simple container that prevents futures from being dropped.
-/// For topology introspection, use the counter::Registry::topology() method instead.
+/// Use the counter::Registry::topology() function to get the graph of the pipeline
+/// after using the inspector runtime.
 pub mod inspector {
-    use super::{Runtime, Spawner, TaskRegistration};
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::{Arc, Mutex};
 
+    /// Inspector that holds futures to prevent them from being dropped.
     #[derive(Clone)]
-    pub struct Handle<R: Runtime> {
-        inner: R,
+    pub struct Handle {
+        futures: Arc<Mutex<Vec<Pin<Box<dyn Future<Output = ()> + Send>>>>>,
     }
 
-    impl<R: Runtime> Handle<R> {
-        pub fn new(inner: R) -> Self {
-            Self { inner }
-        }
-    }
-
-    impl<R: Runtime> Runtime for Handle<R> {
-        type Clock = R::Clock;
-        type Spawner<'a> = Local<R::Spawner<'a>>;
-
-        fn worker_count(&self) -> usize {
-            self.inner.worker_count()
+    impl Handle {
+        pub fn new() -> Self {
+            Self {
+                futures: Arc::new(Mutex::new(Vec::new())),
+            }
         }
 
-        fn clock(&self) -> Self::Clock {
-            self.inner.clock()
-        }
-
-        fn spawn_local<F>(&self, worker_id: usize, f: F)
+        /// Spawn a future and hold it to prevent it from being dropped.
+        pub fn spawn<F>(&self, future: F)
         where
-            F: FnOnce(Self::Spawner<'_>) + Send + 'static,
+            F: Future<Output = ()> + Send + 'static,
         {
-            self.inner.spawn_local(worker_id, move |spawner| {
-                f(Local { inner: spawner });
-            });
+            self.futures.lock().unwrap().push(Box::pin(future));
+        }
+
+        /// Get the number of futures currently held.
+        pub fn future_count(&self) -> usize {
+            self.futures.lock().unwrap().len()
         }
     }
 
-    pub struct Local<S> {
-        inner: S,
-    }
-
-    impl<S: Spawner> Spawner for Local<S> {
-        fn spawn<F>(&mut self, future: F)
-        where
-            F: std::future::Future<Output = ()> + 'static,
-        {
-            self.inner.spawn(future);
-        }
-
-        fn register_task(&mut self, task: TaskRegistration) {
-            self.inner.register_task(task);
+    impl Default for Handle {
+        fn default() -> Self {
+            Self::new()
         }
     }
 }
@@ -436,23 +417,15 @@ mod tests {
     }
 
     #[test]
-    fn inspector_runtime_simple_wrapper() {
-        let rt = inspector::Handle::new(bach::Handle::new(2));
-        assert_eq!(rt.worker_count(), 2);
+    fn inspector_holds_futures() {
+        let inspector = inspector::Handle::new();
+        assert_eq!(inspector.future_count(), 0);
         
-        // Inspector is now just a simple wrapper
-        // Topology introspection comes from counter::Registry::topology()
-        let counter_registry = crate::counter::Registry::new();
-        let _task = counter_registry
-            .register_task("task.test")
-            .with_registration_metadata(
-                "task.test",
-                "Test task",
-                "tests::test",
-            );
+        // Spawn some futures
+        inspector.spawn(async {});
+        inspector.spawn(async {});
+        inspector.spawn(async {});
         
-        let topology = counter_registry.topology();
-        assert_eq!(topology.tasks.len(), 1);
-        assert_eq!(topology.tasks[0].name, "task.test");
+        assert_eq!(inspector.future_count(), 3);
     }
 }

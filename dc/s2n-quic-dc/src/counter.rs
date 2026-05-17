@@ -1436,6 +1436,119 @@ pub struct Topology {
     pub bindings: Vec<ChannelBinding>,
 }
 
+impl Topology {
+    /// Generate a DOT graph representation of the topology.
+    pub fn to_dot(&self) -> String {
+        let mut out = String::from("digraph pipeline {\n  rankdir=LR;\n");
+
+        let mut task_node_ids = std::collections::HashMap::new();
+        let mut channel_node_ids = std::collections::HashMap::new();
+
+        // Render tasks
+        for (idx, task) in self.tasks.iter().enumerate() {
+            let node_id = format!("t{idx}");
+            task_node_ids.insert(task.name.clone(), node_id.clone());
+            let budget = task
+                .budget
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "none".to_string());
+            let metrics = metric_summary(&task.metrics);
+            let label = format!(
+                "{}\\nfn: {}\\nbudget: {}\\nmetrics: {}\\n{}",
+                task.name, task.function, budget, metrics, task.description
+            );
+            out.push_str(&format!(
+                "  {node_id} [shape=box,label=\"{}\"];\n",
+                escape_dot(&label)
+            ));
+        }
+
+        // Render channels
+        for (idx, channel) in self.channels.iter().enumerate() {
+            let node_id = format!("c{idx}");
+            channel_node_ids.insert(channel.name.clone(), node_id.clone());
+            let metrics = metric_summary(&channel.metrics);
+            let label = format!(
+                "{}\\nfn: {}\\nmetrics: {}\\n{}",
+                channel.name, channel.function, metrics, channel.description
+            );
+            out.push_str(&format!(
+                "  {node_id} [shape=ellipse,label=\"{}\"];\n",
+                escape_dot(&label)
+            ));
+        }
+
+        // Render bindings
+        for binding in &self.bindings {
+            let Some(task_node) = task_node_ids.get(&binding.task_name) else {
+                out.push_str(&format!(
+                    "  // unresolved binding: missing task '{}'\n",
+                    binding.task_name
+                ));
+                continue;
+            };
+            let Some(channel_node) = channel_node_ids.get(&binding.channel_name) else {
+                out.push_str(&format!(
+                    "  // unresolved binding: missing channel '{}'\n",
+                    binding.channel_name
+                ));
+                continue;
+            };
+
+            let (from, to) = if binding.direction == ChannelDirection::Sends {
+                (task_node, channel_node)
+            } else {
+                (channel_node, task_node)
+            };
+            let label = format!(
+                "{}\\nfn: {}\\n{}",
+                binding.direction, binding.function, binding.description
+            );
+            out.push_str(&format!(
+                "  {from} -> {to} [label=\"{}\"];\n",
+                escape_dot(&label)
+            ));
+        }
+
+        out.push_str("}\n");
+        out
+    }
+}
+
+fn escape_dot(input: &str) -> String {
+    input
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+}
+
+fn metric_summary(metrics: &[MetricRegistration]) -> String {
+    if metrics.is_empty() {
+        "none".to_string()
+    } else {
+        metrics
+            .iter()
+            .map(|metric| {
+                let variant = metric
+                    .variant
+                    .as_ref()
+                    .map(|variant| format!(" variant={variant}"))
+                    .unwrap_or_default();
+                let unit = metric
+                    .unit
+                    .map(|unit| format!(" unit={unit}"))
+                    .unwrap_or_default();
+                format!(
+                    "{} [{}{}{}]: {}",
+                    metric.label, metric.kind, variant, unit, metric.description
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\\n")
+    }
+}
+
 impl Registry {
     const COUNT_UNIT: &'static str = "count";
     const MICROSECOND_UNIT: &'static str = "microsecond";
