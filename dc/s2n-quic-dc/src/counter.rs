@@ -696,6 +696,7 @@ struct TaskRegistrationMetadata {
     description: String,
     function: String,
     budget: Option<usize>,
+    worker_id: Option<usize>,
 }
 
 impl Task {
@@ -735,19 +736,9 @@ impl Task {
         description: impl core::fmt::Display,
         function: impl core::fmt::Display,
     ) -> Self {
-        let task = self.with_registration_name(name)
+        self.with_registration_name(name)
             .with_registration_description(description)
-            .with_registration_function(function);
-        
-        // Auto-register in topology
-        let registration = task.with_registration_metadata_ref(|name, description, function, budget| {
-            TaskRegistration::new(name, description, function)
-                .with_budget(budget)
-                .with_metric(&task)
-        });
-        task.registry.register_task_topology(registration);
-        
-        task
+            .with_registration_function(function)
     }
 
     pub fn with_registration_name(self, name: impl core::fmt::Display) -> Self {
@@ -774,18 +765,33 @@ impl Task {
         self
     }
 
-    /// Set the budget for this task.
+    /// Called when the task is spawned to record spawn-time information in the topology.
     /// 
-    /// This should be called when spawning the task to record the budget in the topology.
-    /// Panics in debug builds if the budget has already been set (task already spawned).
-    pub fn set_budget(&self, budget: Option<usize>) {
+    /// This captures the budget and worker ID, then registers the task in the topology.
+    /// Panics in debug builds if the task has already been spawned.
+    pub fn on_spawn(&self, budget: Option<usize>, worker_id: usize) {
         let mut registration = self.registration.lock().unwrap();
         debug_assert!(
-            registration.budget.is_none(),
-            "Task budget already set - task '{}' has already been spawned",
-            registration.name
+            registration.worker_id.is_none(),
+            "Task '{}' has already been spawned on worker {:?}",
+            registration.name,
+            registration.worker_id
         );
         registration.budget = budget;
+        registration.worker_id = Some(worker_id);
+        
+        // Register in topology now that spawn information is finalized
+        let task_registration = TaskRegistration::new(
+            &registration.name,
+            &registration.description,
+            &registration.function,
+        )
+        .with_budget(budget)
+        .with_worker_id(Some(worker_id))
+        .with_metric(self);
+        
+        drop(registration);
+        self.registry.register_task_topology(task_registration);
     }
 }
 
@@ -858,9 +864,17 @@ impl QueueGauge {
         description: impl core::fmt::Display,
         function: impl core::fmt::Display,
     ) -> Self {
-        self.with_registration_name(name)
+        let queue = self.with_registration_name(name)
             .with_registration_description(description)
-            .with_registration_function(function)
+            .with_registration_function(function);
+        
+        // Update topology with new metadata
+        let registration = queue.with_registration_metadata_ref(|name, description, function| {
+            ChannelRegistration::new(name, description, function).with_metric(&queue)
+        });
+        queue.registry.upsert_channel_topology(registration);
+        
+        queue
     }
 
     pub fn with_registration_name(self, name: impl core::fmt::Display) -> Self {
@@ -1043,6 +1057,18 @@ impl QueueGauge {
 impl QueueSender {
     pub fn with_description(mut self, description: impl core::fmt::Display) -> Self {
         self.metric = self.metric.with_description(description);
+        
+        // Update binding in topology
+        let channel_name = self.channel_metadata(|name, _, _| name.to_string());
+        let binding = ChannelBinding::new(
+            self.task_name(),
+            channel_name,
+            ChannelDirection::Sends,
+            self.description(),
+            self.function(),
+        );
+        self.queue.registry.upsert_binding_topology(binding);
+        
         self
     }
 
@@ -1057,6 +1083,18 @@ impl QueueSender {
         {
             metadata.function = function.to_string();
         }
+        
+        // Update binding in topology
+        let channel_name = self.channel_metadata(|name, _, _| name.to_string());
+        let binding = ChannelBinding::new(
+            self.task_name(),
+            channel_name,
+            ChannelDirection::Sends,
+            self.description(),
+            self.function(),
+        );
+        self.queue.registry.upsert_binding_topology(binding);
+        
         self
     }
 
@@ -1107,6 +1145,18 @@ impl QueueSender {
 impl QueueReceiver {
     pub fn with_description(mut self, description: impl core::fmt::Display) -> Self {
         self.metric = self.metric.with_description(description);
+        
+        // Update binding in topology
+        let channel_name = self.channel_metadata(|name, _, _| name.to_string());
+        let binding = ChannelBinding::new(
+            self.task_name(),
+            channel_name,
+            ChannelDirection::Receives,
+            self.description(),
+            self.function(),
+        );
+        self.queue.registry.upsert_binding_topology(binding);
+        
         self
     }
 
@@ -1121,6 +1171,18 @@ impl QueueReceiver {
         {
             metadata.function = function.to_string();
         }
+        
+        // Update binding in topology
+        let channel_name = self.channel_metadata(|name, _, _| name.to_string());
+        let binding = ChannelBinding::new(
+            self.task_name(),
+            channel_name,
+            ChannelDirection::Receives,
+            self.description(),
+            self.function(),
+        );
+        self.queue.registry.upsert_binding_topology(binding);
+        
         self
     }
 
@@ -1295,6 +1357,7 @@ pub struct TaskRegistration {
     pub description: String,
     pub function: String,
     pub budget: Option<usize>,
+    pub worker_id: Option<usize>,
     pub metrics: Vec<MetricRegistration>,
 }
 
@@ -1310,6 +1373,7 @@ impl TaskRegistration {
             description: description.to_string(),
             function: function.to_string(),
             budget: None,
+            worker_id: None,
             metrics: Vec::new(),
         }
     }
@@ -1317,6 +1381,12 @@ impl TaskRegistration {
     #[inline]
     pub fn with_budget(mut self, budget: Option<usize>) -> Self {
         self.budget = budget;
+        self
+    }
+
+    #[inline]
+    pub fn with_worker_id(mut self, worker_id: Option<usize>) -> Self {
+        self.worker_id = worker_id;
         self
     }
 
@@ -1646,9 +1716,34 @@ impl Registry {
         self.topology.lock().unwrap().channels.push(channel);
     }
 
+    /// Update or insert a channel/queue in the topology by name.
+    pub(crate) fn upsert_channel_topology(&self, channel: ChannelRegistration) {
+        let mut topology = self.topology.lock().unwrap();
+        if let Some(existing) = topology.channels.iter_mut().find(|c| c.name == channel.name) {
+            *existing = channel;
+        } else {
+            topology.channels.push(channel);
+        }
+    }
+
     /// Register a channel binding (sender/receiver relationship) in the topology.
     pub(crate) fn register_binding_topology(&self, binding: ChannelBinding) {
         self.topology.lock().unwrap().bindings.push(binding);
+    }
+
+    /// Update or insert a channel binding in the topology.
+    /// Matches on task_name, channel_name, and direction.
+    pub(crate) fn upsert_binding_topology(&self, binding: ChannelBinding) {
+        let mut topology = self.topology.lock().unwrap();
+        if let Some(existing) = topology.bindings.iter_mut().find(|b| {
+            b.task_name == binding.task_name
+                && b.channel_name == binding.channel_name
+                && b.direction == binding.direction
+        }) {
+            *existing = binding;
+        } else {
+            topology.bindings.push(binding);
+        }
     }
 
     /// Register a queue/channel in the topology.

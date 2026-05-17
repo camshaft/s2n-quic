@@ -65,11 +65,15 @@ pub trait Spawner {
         self.spawn(future);
     }
 
+    /// Returns the worker ID for this spawner.
+    ///
+    /// This is used for runtime introspection and topology tracking.
+    fn worker_id(&self) -> usize;
+
     /// Convenience helper for pipeline tasks with budget and task counters.
     ///
-    /// Sets the budget on the task counter, then spawns the task with its name.
-    /// Task topology registration happens automatically when the task counter is
-    /// created with `with_registration_metadata`.
+    /// Calls on_spawn with the budget and worker ID (which registers the task in topology),
+    /// then spawns the task with its name.
     #[inline]
     fn spawn_receiver_task<F>(
         &mut self,
@@ -80,7 +84,8 @@ pub trait Spawner {
         F: Future<Output = ()> + 'static,
         Self: Sized,
     {
-        task_counter.set_budget(budget);
+        let worker_id = self.worker_id();
+        task_counter.on_spawn(budget, worker_id);
         let task_name = task_counter.with_registration_metadata_ref(|name, _, _, _| name.to_string());
         self.spawn_named(&task_name, future);
     }
@@ -145,6 +150,10 @@ pub mod busy_poll {
         {
             self.spawn_with_priority_and_name(future, None, Some(name.to_string()));
         }
+
+        fn worker_id(&self) -> usize {
+            self.worker_id
+        }
     }
 }
 
@@ -175,7 +184,15 @@ pub mod bach {
     }
 
     /// Bach local spawner
-    pub struct Local;
+    pub struct Local {
+        worker_id: usize,
+    }
+
+    impl Local {
+        pub fn new(worker_id: usize) -> Self {
+            Self { worker_id }
+        }
+    }
 
     /// Wrapper to make !Send futures Send for bach's API
     struct SendWrapper<F>(F);
@@ -217,6 +234,10 @@ pub mod bach {
         {
             ::bach::task::spawn_named(SendWrapper(future), name);
         }
+
+        fn worker_id(&self) -> usize {
+            self.worker_id
+        }
     }
 
     impl Runtime for Handle {
@@ -231,11 +252,11 @@ pub mod bach {
             self.clock.clone()
         }
 
-        fn spawn_local<F>(&self, _worker_id: usize, f: F)
+        fn spawn_local<F>(&self, worker_id: usize, f: F)
         where
             F: FnOnce(Self::Spawner<'_>) + Send + 'static,
         {
-            let local = Local;
+            let local = Local { worker_id };
             f(local);
         }
     }
@@ -267,7 +288,7 @@ pub mod tokio {
         /// Create a new tokio runtime with the specified number of workers.
         pub fn new(worker_count: usize) -> Self {
             let workers: Vec<_> = (0..worker_count)
-                .map(|_| {
+                .map(|worker_id| {
                     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<WorkItem>();
 
                     std::thread::spawn(move || {
@@ -280,7 +301,7 @@ pub mod tokio {
 
                         local.block_on(&rt, async move {
                             while let Some(work) = rx.recv().await {
-                                let spawner = Local;
+                                let spawner = Local { worker_id };
                                 work(spawner);
                             }
                         });
@@ -298,7 +319,9 @@ pub mod tokio {
     }
 
     /// Tokio local spawner that uses spawn_local within a LocalSet.
-    pub struct Local;
+    pub struct Local {
+        worker_id: usize,
+    }
 
     impl Spawner for Local {
         fn spawn<F>(&mut self, future: F)
@@ -316,6 +339,10 @@ pub mod tokio {
             // We could log the name or use it for debugging.
             let _ = name;
             self.spawn(future);
+        }
+
+        fn worker_id(&self) -> usize {
+            self.worker_id
         }
     }
 

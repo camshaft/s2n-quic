@@ -107,10 +107,11 @@ impl ops::Deref for Pool {
 pub struct Handle {
     state: Arc<Mutex<State>>,
     heartbeat: Arc<Heartbeat>,
+    worker_id: usize,
 }
 
 impl Handle {
-    pub fn new() -> (Self, Runner) {
+    pub fn new(worker_id: usize) -> (Self, Runner) {
         let state = Arc::new(Mutex::new(State {
             spawns: Vec::with_capacity(16),
         }));
@@ -118,10 +119,12 @@ impl Handle {
         let handle = Self {
             state: state.clone(),
             heartbeat: heartbeat.clone(),
+            worker_id,
         };
         let runner = Runner {
             state: Arc::downgrade(&state),
             heartbeat,
+            worker_id,
         };
         (handle, runner)
     }
@@ -159,6 +162,7 @@ impl Handle {
 
 pub struct Spawner<'a> {
     tasks: &'a mut Tasks,
+    pub(crate) worker_id: usize,
 }
 
 impl<'a> Spawner<'a> {
@@ -215,8 +219,8 @@ impl Spawn {
         }
     }
 
-    fn into_tasks(self, tasks: &mut Tasks) {
-        (self.factory)(Spawner { tasks })
+    fn into_tasks(self, tasks: &mut Tasks, worker_id: usize) {
+        (self.factory)(Spawner { tasks, worker_id })
     }
 }
 
@@ -234,12 +238,14 @@ struct Task {
 pub struct Runner {
     state: Weak<Mutex<State>>,
     heartbeat: Arc<Heartbeat>,
+    worker_id: usize,
 }
 
 impl Runner {
     pub fn run(self) {
         let state = self.state;
         let heartbeat = self.heartbeat;
+        let worker_id = self.worker_id;
         let waker = s2n_quic_core::task::waker::noop();
         let mut cx = Context::from_waker(&waker);
         let mut tasks = Tasks::new();
@@ -288,7 +294,7 @@ impl Runner {
             }
 
             for spawn in spawns.drain(..) {
-                spawn.into_tasks(&mut tasks);
+                spawn.into_tasks(&mut tasks, worker_id);
             }
 
             tasks.after_spawn();
