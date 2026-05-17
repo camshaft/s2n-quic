@@ -67,60 +67,31 @@ impl core::fmt::Display for NonZeroDisplay {
 const DEFAULT_STATSD_UDP_MAX_PAYLOAD: usize = 1200;
 const STATSD_HISTOGRAM_PERCENTILES: [u32; 4] = [50, 90, 95, 99];
 
-macro_rules! metric_trace {
-    ($($arg:tt)*) => {{
-        #[cfg(any(test, feature = "metric-tracing"))]
-        {
-            tracing::trace!(target: "s2n_quic_dc::metric", $($arg)*);
+/// Emits a compact metric trace event.
+///
+/// Format: `{prefix}#{label}={value}` or `{prefix}#{label}[{variant}]={value}`.
+/// The `target` is set to `"s2n_quic_dc::metric"` so the snapshot subscriber's
+/// env-filter directive (`s2n_quic_dc::metric=trace`) can enable it, while the
+/// snapshot formatter suppresses the target string itself with `with_target(false)`.
+#[cfg(any(test, feature = "metric-tracing"))]
+macro_rules! metric_emit {
+    ($prefix:literal, $label:expr, $variant:expr, $value:expr) => {
+        match $variant.as_deref() {
+            Some(v) => tracing::trace!(
+                target: "s2n_quic_dc::metric",
+                concat!($prefix, "#{}[{}]={}"),
+                $label,
+                v,
+                $value
+            ),
+            None => tracing::trace!(
+                target: "s2n_quic_dc::metric",
+                concat!($prefix, "#{}={}"),
+                $label,
+                $value
+            ),
         }
-    }};
-}
-
-macro_rules! metric_trace_with_metadata {
-    ($metric_id:expr, $metadata:expr, $op:literal) => {{
-        #[cfg(any(test, feature = "metric-tracing"))]
-        {
-            let (_metric_id, metric_label, metric_variant) =
-                metric_trace_fields($metric_id, $metadata);
-            if let Some(variant) = metric_variant {
-                tracing::trace!(
-                    target: "s2n_quic_dc::metric",
-                    label = %metric_label,
-                    variant = %variant,
-                    $op
-                );
-            } else {
-                tracing::trace!(
-                    target: "s2n_quic_dc::metric",
-                    label = %metric_label,
-                    $op
-                );
-            }
-        }
-    }};
-    ($metric_id:expr, $metadata:expr, $op:literal, $($arg:tt)*) => {{
-        #[cfg(any(test, feature = "metric-tracing"))]
-        {
-            let (_metric_id, metric_label, metric_variant) =
-                metric_trace_fields($metric_id, $metadata);
-            if let Some(variant) = metric_variant {
-                tracing::trace!(
-                    target: "s2n_quic_dc::metric",
-                    label = %metric_label,
-                    variant = %variant,
-                    $($arg)*,
-                    $op
-                );
-            } else {
-                tracing::trace!(
-                    target: "s2n_quic_dc::metric",
-                    label = %metric_label,
-                    $($arg)*,
-                    $op
-                );
-            }
-        }
-    }};
+    };
 }
 
 #[cfg(any(test, feature = "metric-tracing"))]
@@ -128,15 +99,15 @@ macro_rules! metric_trace_with_metadata {
 fn metric_trace_fields(
     metric_id: MetricId,
     metadata: &Arc<Mutex<HashMap<MetricId, MetricMetadata>>>,
-) -> (MetricId, String, Option<String>) {
+) -> (String, Option<String>) {
     let metadata = metadata.lock().unwrap().get(&metric_id).cloned();
-    let (metric_label, metric_variant) = match metadata {
+    match metadata {
         Some(metadata) => (metadata.label, metadata.variant),
         None => ("unknown".to_string(), None),
-    };
-    (metric_id, metric_label, metric_variant)
+    }
 }
 
+#[cfg(any(test, feature = "metric-tracing"))]
 #[inline]
 fn in_bach_sim() -> bool {
     #[cfg(any(test, feature = "testing"))]
@@ -148,23 +119,6 @@ fn in_bach_sim() -> bool {
     {
         false
     }
-}
-
-macro_rules! with_metric_span {
-    ($name:literal, $body:expr) => {{
-        #[cfg(any(test, feature = "metric-tracing"))]
-        {
-            let _span =
-                tracing::trace_span!(target: "s2n_quic_dc::metric", "metric_call", op = $name)
-                    .entered();
-            $body
-        }
-
-        #[cfg(not(any(test, feature = "metric-tracing")))]
-        {
-            $body
-        }
-    }};
 }
 
 #[derive(Clone, Debug)]
@@ -607,10 +561,12 @@ pub struct Counter {
 impl Counter {
     #[inline]
     pub fn add(&self, v: u64) {
-        with_metric_span!("counter.add", {
-            metric_trace_with_metadata!(self.metric_id, &self.metadata, "counter.add", value = v);
-            self.inner.increment(v);
-        });
+        #[cfg(any(test, feature = "metric-tracing"))]
+        {
+            let (label, variant) = metric_trace_fields(self.metric_id, &self.metadata);
+            metric_emit!("c", label, variant, v);
+        }
+        self.inner.increment(v);
     }
 
     #[inline]
@@ -646,41 +602,29 @@ pub struct Gauge {
 impl Gauge {
     #[inline]
     pub fn add(&self, v: i64) -> i64 {
-        with_metric_span!("gauge.add", {
-            let value = self.inner.fetch_add(v, Ordering::Relaxed) + v;
-            metric_trace_with_metadata!(
-                self.metric_id,
-                &self.metadata,
-                "gauge.add",
-                delta = v,
-                value
-            );
-            value
-        })
+        let value = self.inner.fetch_add(v, Ordering::Relaxed) + v;
+        #[cfg(any(test, feature = "metric-tracing"))]
+        {
+            let (label, variant) = metric_trace_fields(self.metric_id, &self.metadata);
+            metric_emit!("g", label, variant, value);
+        }
+        value
     }
 
     #[inline]
     pub fn sub(&self, v: i64) -> i64 {
-        with_metric_span!("gauge.sub", {
-            let value = self.inner.fetch_sub(v, Ordering::Relaxed) - v;
-            metric_trace_with_metadata!(
-                self.metric_id,
-                &self.metadata,
-                "gauge.sub",
-                delta = v,
-                value
-            );
-            value
-        })
+        let value = self.inner.fetch_sub(v, Ordering::Relaxed) - v;
+        #[cfg(any(test, feature = "metric-tracing"))]
+        {
+            let (label, variant) = metric_trace_fields(self.metric_id, &self.metadata);
+            metric_emit!("g", label, variant, value);
+        }
+        value
     }
 
     #[inline]
     pub fn get(&self) -> i64 {
-        with_metric_span!("gauge.get", {
-            let value = self.inner.load(Ordering::Relaxed);
-            metric_trace_with_metadata!(self.metric_id, &self.metadata, "gauge.get", value);
-            value
-        })
+        self.inner.load(Ordering::Relaxed)
     }
 
     #[inline]
@@ -722,54 +666,27 @@ impl Timer {
     /// timestamp (for example, per-poll execution time and inter-poll latency).
     #[inline]
     pub fn start_at(&self, start: Instant) -> TimerGuard<'_> {
-        with_metric_span!("timer.start_at", {
-            if in_bach_sim() {
-                metric_trace_with_metadata!(self.metric_id, &self.metadata, "timer.start_at");
-            } else {
-                metric_trace_with_metadata!(
-                    self.metric_id,
-                    &self.metadata,
-                    "timer.start_at",
-                    start = ?start
-                );
-            }
-            #[cfg(any(test, feature = "metric-tracing"))]
-            let (metric_id, metric_label, metric_variant) =
-                metric_trace_fields(self.metric_id, &self.metadata);
-            #[cfg(not(any(test, feature = "metric-tracing")))]
-            let (metric_id, metric_label, metric_variant) = (self.metric_id, String::new(), None);
-            TimerGuard {
-                summary: &self.summary,
-                metric_id,
-                metric_label,
-                metric_variant,
-                start,
-                #[cfg(any(test, feature = "testing"))]
-                bach_start: if in_bach_sim() {
-                    Some(bach::time::Instant::now())
-                } else {
-                    None
-                },
-                recorded: false,
-            }
-        })
+        #[cfg(any(test, feature = "metric-tracing"))]
+        let (metric_label, metric_variant) = metric_trace_fields(self.metric_id, &self.metadata);
+        #[cfg(not(any(test, feature = "metric-tracing")))]
+        let (metric_label, metric_variant) = (String::new(), None);
+        TimerGuard {
+            summary: &self.summary,
+            metric_label,
+            metric_variant,
+            start,
+            recorded: false,
+        }
     }
 
     #[inline]
     pub fn record(&self, duration: Duration) {
-        with_metric_span!("timer.record", {
-            if in_bach_sim() {
-                metric_trace_with_metadata!(self.metric_id, &self.metadata, "timer.record");
-            } else {
-                metric_trace_with_metadata!(
-                    self.metric_id,
-                    &self.metadata,
-                    "timer.record",
-                    duration = ?duration
-                );
-            }
-            self.summary.record_duration(duration);
-        });
+        #[cfg(any(test, feature = "metric-tracing"))]
+        if !in_bach_sim() {
+            let (label, variant) = metric_trace_fields(self.metric_id, &self.metadata);
+            metric_emit!("t", label, variant, duration.as_micros());
+        }
+        self.summary.record_duration(duration);
     }
 
     #[inline]
@@ -796,15 +713,12 @@ pub struct SummaryMetric {
 impl SummaryMetric {
     #[inline]
     pub fn record_value(&self, value: u64) {
-        with_metric_span!("summary.record_value", {
-            metric_trace_with_metadata!(
-                self.metric_id,
-                &self.metadata,
-                "summary.record_value",
-                value
-            );
-            self.summary.record_value(value);
-        });
+        #[cfg(any(test, feature = "metric-tracing"))]
+        {
+            let (label, variant) = metric_trace_fields(self.metric_id, &self.metadata);
+            metric_emit!("m", label, variant, value);
+        }
+        self.summary.record_value(value);
     }
 
     #[inline]
@@ -824,80 +738,25 @@ impl SummaryMetric {
 pub struct TimerGuard<'a> {
     summary: &'a Summary,
     #[allow(dead_code)]
-    metric_id: MetricId,
-    #[allow(dead_code)]
     metric_label: String,
     #[allow(dead_code)]
     metric_variant: Option<String>,
     start: Instant,
-    #[cfg(any(test, feature = "testing"))]
-    bach_start: Option<bach::time::Instant>,
     recorded: bool,
 }
 
 impl TimerGuard<'_> {
     #[inline]
     pub fn record(mut self) -> Instant {
-        with_metric_span!("timer_guard.record", {
-            let now = Instant::now();
-            let duration = now.duration_since(self.start);
-            #[cfg(any(test, feature = "testing"))]
-            if let Some(bach_start) = self.bach_start {
-                let bach_now = bach::time::Instant::now();
-                let _ = bach_now.saturating_duration_since(bach_start);
-                if let Some(_v) = &self.metric_variant {
-                    metric_trace!(
-                        label = %self.metric_label,
-                        variant = %_v,
-                        "timer_guard.record"
-                    );
-                } else {
-                    metric_trace!(label = %self.metric_label, "timer_guard.record");
-                }
-            } else {
-                if let Some(_v) = &self.metric_variant {
-                    metric_trace!(
-                        label = %self.metric_label,
-                        variant = %_v,
-                        start = ?self.start,
-                        now = ?now,
-                        duration = ?duration,
-                        "timer_guard.record"
-                    );
-                } else {
-                    metric_trace!(
-                        label = %self.metric_label,
-                        start = ?self.start,
-                        now = ?now,
-                        duration = ?duration,
-                        "timer_guard.record"
-                    );
-                }
-            }
-
-            #[cfg(not(any(test, feature = "testing")))]
-            if let Some(_v) = &self.metric_variant {
-                metric_trace!(
-                    label = %self.metric_label,
-                    variant = %_v,
-                    start = ?self.start,
-                    now = ?now,
-                    duration = ?duration,
-                    "timer_guard.record"
-                );
-            } else {
-                metric_trace!(
-                    label = %self.metric_label,
-                    start = ?self.start,
-                    now = ?now,
-                    duration = ?duration,
-                    "timer_guard.record"
-                );
-            }
-            self.summary.record_duration(duration);
-            self.recorded = true;
-            now
-        })
+        let now = Instant::now();
+        let duration = now.duration_since(self.start);
+        #[cfg(any(test, feature = "metric-tracing"))]
+        if !in_bach_sim() {
+            metric_emit!("t", self.metric_label, self.metric_variant, duration.as_micros());
+        }
+        self.summary.record_duration(duration);
+        self.recorded = true;
+        now
     }
 }
 
@@ -905,59 +764,12 @@ impl Drop for TimerGuard<'_> {
     #[inline]
     fn drop(&mut self) {
         if !self.recorded {
-            with_metric_span!("timer_guard.drop", {
-                let duration = self.start.elapsed();
-                #[cfg(any(test, feature = "testing"))]
-                if let Some(bach_start) = self.bach_start {
-                    let bach_now = bach::time::Instant::now();
-                    let _ = bach_now.saturating_duration_since(bach_start);
-                    if let Some(_v) = &self.metric_variant {
-                        metric_trace!(
-                            label = %self.metric_label,
-                            variant = %_v,
-                            "timer_guard.drop"
-                        );
-                    } else {
-                        metric_trace!(label = %self.metric_label, "timer_guard.drop");
-                    }
-                } else {
-                    if let Some(_v) = &self.metric_variant {
-                        metric_trace!(
-                            label = %self.metric_label,
-                            variant = %_v,
-                            start = ?self.start,
-                            duration = ?duration,
-                            "timer_guard.drop"
-                        );
-                    } else {
-                        metric_trace!(
-                            label = %self.metric_label,
-                            start = ?self.start,
-                            duration = ?duration,
-                            "timer_guard.drop"
-                        );
-                    }
-                }
-
-                #[cfg(not(any(test, feature = "testing")))]
-                if let Some(_v) = &self.metric_variant {
-                    metric_trace!(
-                        label = %self.metric_label,
-                        variant = %_v,
-                        start = ?self.start,
-                        duration = ?duration,
-                        "timer_guard.drop"
-                    );
-                } else {
-                    metric_trace!(
-                        label = %self.metric_label,
-                        start = ?self.start,
-                        duration = ?duration,
-                        "timer_guard.drop"
-                    );
-                }
-                self.summary.record_duration(duration);
-            });
+            let duration = self.start.elapsed();
+            #[cfg(any(test, feature = "metric-tracing"))]
+            if !in_bach_sim() {
+                metric_emit!("t", self.metric_label, self.metric_variant, duration.as_micros());
+            }
+            self.summary.record_duration(duration);
         }
     }
 }
@@ -1258,30 +1070,21 @@ impl QueueGauge {
 impl QueueGauge {
     #[inline]
     pub fn enqueue(&self, count: u64) {
-        with_metric_span!("queue.enqueue", {
-            self.throughput.add(count);
-            let depth = self.depth.add(count as i64).max(0) as u64;
-            metric_trace!(count, depth, "queue.enqueue");
-            self.depth_distribution.record_value(depth);
-        });
+        self.throughput.add(count);
+        let depth = self.depth.add(count as i64).max(0) as u64;
+        self.depth_distribution.record_value(depth);
     }
 
     #[inline]
     pub fn dequeue(&self) {
-        with_metric_span!("queue.dequeue", {
-            self.drain.add(1);
-            let _depth = self.depth.sub(1).max(0) as u64;
-            metric_trace!(depth = _depth, "queue.dequeue");
-        });
+        self.drain.add(1);
+        let _ = self.depth.sub(1).max(0) as u64;
     }
 
     #[inline]
     pub fn dequeue_n(&self, count: u64) {
-        with_metric_span!("queue.dequeue_n", {
-            self.drain.add(count);
-            let _depth = self.depth.sub(count as i64).max(0) as u64;
-            metric_trace!(count, depth = _depth, "queue.dequeue_n");
-        });
+        self.drain.add(count);
+        let _ = self.depth.sub(count as i64).max(0) as u64;
     }
 }
 

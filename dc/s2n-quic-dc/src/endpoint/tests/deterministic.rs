@@ -133,7 +133,8 @@ impl DroppedPackets {
         let end_time: Arc<Mutex<Option<Instant>>> = Arc::new(Mutex::new(None));
         let end_time_inner = end_time.clone();
 
-        without_tracing(|| sim(|| {
+        let _guard = without_tracing();
+        sim(|| {
             {
                 tracing::info!(
                     packets = ?self,
@@ -240,7 +241,7 @@ impl DroppedPackets {
                 .group("server")
                 .spawn();
             }
-        }));
+        });
 
         let elapsed = end_time.lock().unwrap().unwrap().elapsed_since_start();
         elapsed
@@ -347,9 +348,8 @@ fn bulk_transfer_with_loss() {
         .with_shrink_time(core::time::Duration::from_secs(0))
         .cloned()
         .for_each(|packets| {
-            without_tracing(|| {
-                let _ = packets.sim(1 << 18);
-            });
+            let _guard = without_tracing();
+            let _ = packets.sim(1 << 18);
         });
 }
 
@@ -369,7 +369,8 @@ fn transmission_rate_fuzz() {
         .cloned()
         .for_each(|packets| {
             let loss = packets.loss_percent();
-            let elapsed = without_tracing(|| packets.sim(1 << 18));
+            let _guard = without_tracing();
+            let elapsed = packets.sim(1 << 18);
 
             // Duration bound that scales quadratically with loss rate:
             //   0% loss  → 1 s max
@@ -519,9 +520,8 @@ fn sim_init_uniqueness(actions: &PacketActions, n: usize) {
     tracing::info!("════════════════════════════════════════════════════════════════════");
     tracing::info!(?actions, n, "starting init_uniqueness sim");
 
-    without_tracing(|| sim(|| {
-
-        // ── Server (primary) ─────────────────────────────────────────────────
+    let _guard = without_tracing();
+    sim(|| {
         // Accept streams until `n` unique stream IDs have been validated.
         // Duplicates (which fail validation) are silently discarded.
         {
@@ -619,7 +619,7 @@ fn sim_init_uniqueness(actions: &PacketActions, n: usize) {
             .group("client")
             .spawn();
         }
-    }));
+    });
 
     // Post-sim assertion: every stream ID in 0..n was accepted exactly once.
     // (The no-duplicate invariant was already checked inline above; this
@@ -662,7 +662,8 @@ fn init_uniqueness_all_duplicated() {
         delays: vec![0; N],
         duplicates: vec![true; N],
     };
-    without_tracing(|| sim_init_uniqueness(&actions, N));
+    let _guard = without_tracing();
+    sim_init_uniqueness(&actions, N);
 }
 
 /// Reordered FlowInit packets with selective duplication.

@@ -2,10 +2,8 @@
 source: dc/s2n-quic-dc/src/testing.rs
 expression: logs
 ---
-0:00:00.000000000 TRACE metric_call:metric_call: s2n_quic_dc::metric: counter.add label=send.pending.enq value=1 op="queue.enqueue" op="counter.add"
-0:00:00.000000000 TRACE metric_call:metric_call: s2n_quic_dc::metric: gauge.add label=send.pending.depth delta=1 value=1 op="queue.enqueue" op="gauge.add"
-0:00:00.000000000 TRACE metric_call: s2n_quic_dc::metric: queue.enqueue count=1 depth=1 op="queue.enqueue"
-0:00:00.000000000 TRACE metric_call:metric_call: s2n_quic_dc::metric: summary.record_value label=send.pending.depth_dist value=1 op="queue.enqueue" op="summary.record_value"
-0:00:00.000000000 TRACE metric_call:metric_call: s2n_quic_dc::metric: counter.add label=send.pending.drain value=1 op="queue.dequeue" op="counter.add"
-0:00:00.000000000 TRACE metric_call:metric_call: s2n_quic_dc::metric: gauge.sub label=send.pending.depth delta=1 value=0 op="queue.dequeue" op="gauge.sub"
-0:00:00.000000000 TRACE metric_call: s2n_quic_dc::metric: queue.dequeue depth=0 op="queue.dequeue"
+0:00:00.000000000 TRACE c#send.pending.enq=1
+0:00:00.000000000 TRACE g#send.pending.depth=1
+0:00:00.000000000 TRACE m#send.pending.depth_dist=1
+0:00:00.000000000 TRACE c#send.pending.drain=1
+0:00:00.000000000 TRACE g#send.pending.depth=0

@@ -96,6 +96,19 @@ impl Drop for TracingDisabledGuard {
     }
 }
 
+/// Guard that disables tracing for its lifetime.
+///
+/// Obtain one with [`without_tracing`].  While the guard is live:
+/// - [`snapshots_enabled`] returns `false`, so `sim` will not snapshot.
+/// - A [`tracing::subscriber::NoSubscriber`] is installed on the current
+///   thread so metric events are not recorded.
+///
+/// Dropping the guard restores the previous state.
+pub struct WithoutTracingGuard {
+    _depth: Option<TracingDisabledGuard>,
+    _dispatch: Option<tracing::subscriber::DefaultGuard>,
+}
+
 pub(crate) fn snapshots_enabled() -> bool {
     SNAPSHOT_MODE_DEPTH.load(Ordering::Relaxed) > 0
 }
@@ -170,19 +183,33 @@ pub fn init_tracing() {
     });
 }
 
-pub fn without_tracing<F: FnOnce() -> T, T>(f: F) -> T {
-    // make sure the global subscriber is initialized before setting a local one
+/// Returns a guard that disables tracing for its lifetime.
+///
+/// ```rust,ignore
+/// let _guard = testing::without_tracing();
+/// // ... tracing-free work ...
+/// // guard drops here, tracing restored
+/// ```
+pub fn without_tracing() -> WithoutTracingGuard {
+    // make sure the global subscriber is initialized before swapping in NoSubscriber
     init_tracing();
 
     static FORCED: OnceLock<bool> = OnceLock::new();
 
     // add the option to get logs with `S2N_LOG_FORCED=1`
     if *FORCED.get_or_init(|| std::env::var("S2N_LOG_FORCED").is_ok()) {
-        return f();
+        return WithoutTracingGuard {
+            _depth: None,
+            _dispatch: None,
+        };
     }
 
-    let _guard = TracingDisabledGuard::enter();
-    tracing::subscriber::with_default(tracing::subscriber::NoSubscriber::new(), f)
+    WithoutTracingGuard {
+        _depth: Some(TracingDisabledGuard::enter()),
+        _dispatch: Some(tracing::subscriber::set_default(
+            tracing::subscriber::NoSubscriber::new(),
+        )),
+    }
 }
 
 #[derive(Default)]
@@ -246,6 +273,7 @@ fn run_sim_with_snapshot(f: impl FnOnce()) {
     let writer = SnapshotWriter::default();
     let format = tracing_subscriber::fmt::format()
         .with_timer(Uptime::default())
+        .with_target(false)
         .compact();
     let env_filter = tracing_subscriber::EnvFilter::builder()
         .with_default_directive(tracing::Level::WARN.into())

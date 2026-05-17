@@ -23,7 +23,8 @@ use s2n_quic_core::varint::VarInt;
 /// entries into both maps.
 #[test]
 fn ping_pong() {
-    crate::testing::without_tracing(|| crate::testing::sim(|| {
+    let _guard = crate::testing::without_tracing();
+    crate::testing::sim(|| {
         use crate::testing::ext::*;
 
         let acceptor_id = VarInt::from_u8(1);
@@ -103,7 +104,7 @@ fn ping_pong() {
         .group("client")
         .primary()
         .spawn();
-    }));
+    });
 }
 
 /// Verifies that PTO retransmission recovers from lost server responses.
@@ -113,7 +114,8 @@ fn ping_pong() {
 /// missing ACK and retransmit, allowing the exchange to complete.
 #[test]
 fn server_response_loss_triggers_pto() {
-    crate::testing::without_tracing(|| crate::testing::sim(|| {
+    let _guard = crate::testing::without_tracing();
+    crate::testing::sim(|| {
         use crate::testing::ext::*;
 
         let acceptor_id = VarInt::from_u8(1);
@@ -202,7 +204,7 @@ fn server_response_loss_triggers_pto() {
         .group("client")
         .primary()
         .spawn();
-    }));
+    });
 }
 
 /// Verifies that the client's initial packet loss is recovered by PTO.
@@ -211,7 +213,8 @@ fn server_response_loss_triggers_pto() {
 /// client should PTO-retransmit and the server should still see "ping".
 #[test]
 fn client_request_loss_triggers_pto() {
-    crate::testing::without_tracing(|| crate::testing::sim(|| {
+    let _guard = crate::testing::without_tracing();
+    crate::testing::sim(|| {
         use crate::testing::ext::*;
 
         let acceptor_id = VarInt::from_u8(1);
@@ -297,7 +300,7 @@ fn client_request_loss_triggers_pto() {
         .group("client")
         .primary()
         .spawn();
-    }));
+    });
 }
 
 /// Verifies that multiple sequential streams work correctly.
@@ -306,7 +309,8 @@ fn client_request_loss_triggers_pto() {
 /// This tests the acceptor channel, multi-stream dispatch, and queue pair routing.
 #[test]
 fn multiple_sequential_streams() {
-    crate::testing::without_tracing(|| crate::testing::sim(|| {
+    let _guard = crate::testing::without_tracing();
+    crate::testing::sim(|| {
         use crate::testing::ext::*;
 
         let acceptor_id = VarInt::from_u8(1);
@@ -377,7 +381,7 @@ fn multiple_sequential_streams() {
         .group("client")
         .primary()
         .spawn();
-    }));
+    });
 }
 
 /// Verifies that a larger payload (multiple frames) transfers correctly.
@@ -386,7 +390,8 @@ fn multiple_sequential_streams() {
 /// frame fragmentation in the Writer and reassembly in the Reader.
 #[test]
 fn large_payload_transfer() {
-    crate::testing::without_tracing(|| crate::testing::sim(|| {
+    let _guard = crate::testing::without_tracing();
+    crate::testing::sim(|| {
         use crate::testing::ext::*;
 
         let acceptor_id = VarInt::from_u8(1);
@@ -458,7 +463,7 @@ fn large_payload_transfer() {
         .group("client")
         .primary()
         .spawn();
-    }));
+    });
 }
 
 /// Verifies that multiple consecutive packet drops are recovered by PTO.
@@ -467,7 +472,8 @@ fn large_payload_transfer() {
 /// should recover on the third attempt.
 #[test]
 fn multiple_packet_loss_recovered_by_pto() {
-    crate::testing::without_tracing(|| crate::testing::sim(|| {
+    let _guard = crate::testing::without_tracing();
+    crate::testing::sim(|| {
         use crate::testing::ext::*;
 
         let acceptor_id = VarInt::from_u8(1);
@@ -552,7 +558,7 @@ fn multiple_packet_loss_recovered_by_pto() {
         .group("client")
         .primary()
         .spawn();
-    }));
+    });
 }
 
 /// Verifies that ACKs are sent back and the sender's inflight map is drained.
@@ -562,7 +568,8 @@ fn multiple_packet_loss_recovered_by_pto() {
 /// hanging (which would indicate stuck inflight tracking).
 #[test]
 fn ack_drains_inflight() {
-    crate::testing::without_tracing(|| crate::testing::sim(|| {
+    let _guard = crate::testing::without_tracing();
+    crate::testing::sim(|| {
         use crate::testing::ext::*;
 
         let acceptor_id = VarInt::from_u8(1);
@@ -629,7 +636,7 @@ fn ack_drains_inflight() {
         .group("client")
         .primary()
         .spawn();
-    }));
+    });
 }
 
 /// Verifies that a bidirectional data exchange works when both sides send simultaneously.
@@ -638,7 +645,8 @@ fn ack_drains_inflight() {
 /// for the client's message first.
 #[test]
 fn bidirectional_simultaneous_send() {
-    crate::testing::without_tracing(|| crate::testing::sim(|| {
+    let _guard = crate::testing::without_tracing();
+    crate::testing::sim(|| {
         use crate::testing::ext::*;
 
         let acceptor_id = VarInt::from_u8(1);
@@ -711,5 +719,5 @@ fn bidirectional_simultaneous_send() {
         .group("client")
         .primary()
         .spawn();
-    }));
+    });
 }
