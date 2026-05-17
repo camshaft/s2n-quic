@@ -519,6 +519,10 @@ impl Timer {
         self.start_at(Instant::now())
     }
 
+    /// Starts a timer from a caller-provided `Instant`.
+    ///
+    /// Use this when multiple task metrics should share the exact same poll-start
+    /// timestamp (for example, per-poll execution time and inter-poll latency).
     #[inline]
     pub fn start_at(&self, start: Instant) -> TimerGuard {
         TimerGuard {
@@ -547,6 +551,11 @@ impl Drop for TimerGuard<'_> {
 
 // ── Task ────────────────────────────────────────────────────────────────────
 
+/// Metric bundle for a drain-budgeted task poll loop.
+///
+/// - `drained`: number of items processed in a single poll
+/// - `time`: wall-clock duration spent inside a poll
+/// - `next_poll_latency`: elapsed time between consecutive poll starts
 #[derive(Clone)]
 pub struct Task {
     pub drained: Summary,
