@@ -349,19 +349,18 @@ where
         .unzip();
 
     // Invalidation channels: recv IO → background (raw segments) and background → all workers
-    let (invalidation_raw_tx, invalidation_raw_rx) =
-        intrusive::sync::new::<descriptor::Filled>();
+    let (invalidation_raw_tx, invalidation_raw_rx) = intrusive::sync::new::<descriptor::Filled>();
     let num_invalidation_targets = num_send_workers + layout.recv_dispatch.len();
-    let (invalidation_broadcast_txs, invalidation_worker_rxs): (Vec<_>, Vec<_>) =
-        (0..num_invalidation_targets)
-            .map(|i| {
-                let (tx, rx) = intrusive::sync::new::<crate::credentials::Id>();
-                let gauge = counter_registry
-                    .register_queue_gauge_nominal("q.invalidation", format_args!("worker.{i}"));
-                let tx = crate::socket::channel::GaugedSender::new(tx, gauge);
-                (tx, rx)
-            })
-            .unzip();
+    let (invalidation_broadcast_txs, invalidation_worker_rxs): (Vec<_>, Vec<_>) = (0
+        ..num_invalidation_targets)
+        .map(|i| {
+            let (tx, rx) = intrusive::sync::new::<crate::credentials::Id>();
+            let gauge = counter_registry
+                .register_queue_gauge_nominal("q.invalidation", format_args!("worker.{i}"));
+            let tx = crate::socket::channel::GaugedSender::new(tx, gauge);
+            (tx, rx)
+        })
+        .unzip();
     let mut invalidation_worker_rxs = invalidation_worker_rxs.into_iter();
 
     let mut sender_id_to_worker: Vec<usize> = Vec::with_capacity(num_send);
@@ -689,7 +688,8 @@ struct Worker<SendSocket, RecvSocket, Clk, AckSnd, Route, Inv> {
     background: Option<BackgroundParts>,
 }
 
-impl<SendSocket, RecvSocket, Clk, AckSnd, Route, Inv> Worker<SendSocket, RecvSocket, Clk, AckSnd, Route, Inv>
+impl<SendSocket, RecvSocket, Clk, AckSnd, Route, Inv>
+    Worker<SendSocket, RecvSocket, Clk, AckSnd, Route, Inv>
 where
     SendSocket: crate::socket::send::Socket + Send + 'static,
     RecvSocket: crate::socket::recv::Socket + Send + 'static,
@@ -819,8 +819,8 @@ where
 
                 // Recv idle wheel — expires inactive recv contexts.
                 let variant = format!("recv.{recv_dispatch_idx}");
-                let q_recv_idle_wheel = counter_registry
-                    .register_queue_gauge_nominal("q.recv_idle_wheel", &variant);
+                let q_recv_idle_wheel =
+                    counter_registry.register_queue_gauge_nominal("q.recv_idle_wheel", &variant);
                 let (recv_idle_wheel_tx, recv_idle_wheel_rx) =
                     crate::socket::channel::intrusive::unsync::new_with_adapter::<
                         crate::stream::endpoint::recv::IdleWheelAdapter,
@@ -842,8 +842,8 @@ where
                     let idle_rescheduled = counter_registry.register("idle.recv.rescheduled");
                     let idle_lifetime =
                         counter_registry.register_nominal_timer("idle.recv.lifetime", &variant);
-                    let task_counter = counter_registry
-                        .register_nominal_task("task.recv_idle_wheel", &variant);
+                    let task_counter =
+                        counter_registry.register_nominal_task("task.recv_idle_wheel", &variant);
                     local.spawn_named(
                         TaskRegistration::new(
                             "task.recv_idle_wheel",
@@ -855,17 +855,18 @@ where
                         .with_metric("task.recv_idle_wheel.time")
                         .with_metric("task.recv_idle_wheel.next_poll_latency"),
                         tasks::recv_idle_wheel_drain(
-                        recv_idle_wheel_rx,
-                        recv_idle_wheel_tx.clone(),
-                        clock,
-                        q_recv_idle_wheel,
-                        recv_cache,
-                        idle_expired,
-                        idle_rescheduled,
-                        idle_lifetime,
-                        budgets.idle_wheel,
-                        task_counter,
-                    ));
+                            recv_idle_wheel_rx,
+                            recv_idle_wheel_tx.clone(),
+                            clock,
+                            q_recv_idle_wheel,
+                            recv_cache,
+                            idle_expired,
+                            idle_rescheduled,
+                            idle_lifetime,
+                            budgets.idle_wheel,
+                            task_counter,
+                        ),
+                    );
                 }
 
                 let rx = tasks::packet_dispatch(
@@ -931,11 +932,14 @@ where
                         "task.assembler",
                         "task.ack_completion",
                     )
-                    .with_metric(format!("q.assembler_to_dispatch.variant=recv.{recv_dispatch_idx}")),
+                    .with_metric(format!(
+                        "q.assembler_to_dispatch.variant=recv.{recv_dispatch_idx}"
+                    )),
                 );
                 let ack_completion_rx =
                     crate::counter::GaugedReceiver::new(rd.ack_completion_rx, ack_completion_gauge);
-                let rx = tasks::ack_completion(ack_completion_rx, recv_cache.clone(), rd.ack_sender);
+                let rx =
+                    tasks::ack_completion(ack_completion_rx, recv_cache.clone(), rd.ack_sender);
                 let task_counter =
                     counter_registry.register_nominal_task("task.ack_completion", &variant);
                 local.spawn_receiver_task(
@@ -991,13 +995,10 @@ where
             }
 
             if let Some(bg) = background {
-                let rx = tasks::invalidation_validator(
-                    bg.raw_rx,
-                    bg.path_secret_map,
-                    bg.broadcast_txs,
-                );
-                let task_counter =
-                    counter_registry.register_nominal_task("task.invalidation_validator", "background");
+                let rx =
+                    tasks::invalidation_validator(bg.raw_rx, bg.path_secret_map, bg.broadcast_txs);
+                let task_counter = counter_registry
+                    .register_nominal_task("task.invalidation_validator", "background");
                 local.spawn_receiver_task(
                     TaskRegistration::new(
                         "task.invalidation_validator",

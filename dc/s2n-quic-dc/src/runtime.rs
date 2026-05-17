@@ -13,8 +13,8 @@
 //!
 //! This abstraction needs to support both this pattern and simpler runtimes like tokio.
 
-use crate::{counter, socket::channel};
 use crate::time::precision;
+use crate::{counter, socket::channel};
 use s2n_quic_core::time;
 use std::future::Future;
 
@@ -483,10 +483,12 @@ pub mod inspector {
 
             for channel in &state.channels {
                 let worker_id = channel.worker_id;
-                let Some(from) = task_node_ids.get(&(worker_id, channel.channel.from_task.clone())) else {
+                let Some(from) = task_node_ids.get(&(worker_id, channel.channel.from_task.clone()))
+                else {
                     continue;
                 };
-                let Some(to) = task_node_ids.get(&(worker_id, channel.channel.to_task.clone())) else {
+                let Some(to) = task_node_ids.get(&(worker_id, channel.channel.to_task.clone()))
+                else {
                     continue;
                 };
                 let metrics = if channel.channel.metrics.is_empty() {
@@ -601,9 +603,10 @@ mod tests {
 
     #[test]
     fn inspector_runtime_emits_dot_with_worker_task_and_channel_metadata() {
-        let rt = inspector::Handle::new(bach::Handle::new(2));
+        let rt = inspector::Handle::new(tokio::Handle::new(2));
+        let (tx, rx_done) = std::sync::mpsc::channel();
 
-        rt.spawn_local(1, |mut local| {
+        rt.spawn_local(1, move |mut local| {
             local.spawn_named(
                 TaskRegistration::new(
                     "task.producer",
@@ -635,7 +638,11 @@ mod tests {
                 )
                 .with_metric("q.producer_to_consumer.depth"),
             );
+            tx.send(()).expect("test sync channel should be open");
         });
+        rx_done
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("worker should run registration closure");
 
         let dot = rt.to_dot();
         assert!(dot.contains("cluster_worker_1"));

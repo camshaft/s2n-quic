@@ -356,7 +356,8 @@ pub fn send_worker<Socket, Clk, WakerSink, AckComp>(
     let sender_idx_to_local_for_ack = sender_idx_to_local.clone();
     let send_counters = endpoint::counters::Send::new(&counter_registry);
     let completed_tx = crate::counter::GaugedSender::new(completed_tx, q_ack_to_completion.clone());
-    let cancelled_tx = crate::counter::GaugedSender::new(cancelled_tx.clone(), q_ack_to_cancelled.clone());
+    let cancelled_tx_for_ack =
+        crate::counter::GaugedSender::new(cancelled_tx.clone(), q_ack_to_cancelled.clone());
     let rx = AckProcessor::new(
         ack_rx,
         send_caches_for_ack,
@@ -366,7 +367,7 @@ pub fn send_worker<Socket, Clk, WakerSink, AckComp>(
         random,
         frame_tx,
         completed_tx,
-        cancelled_tx,
+        cancelled_tx_for_ack,
         send_counters,
     );
     let rx = Flatten::new(rx);
@@ -553,8 +554,10 @@ pub fn send_worker<Socket, Clk, WakerSink, AckComp>(
         let clock = st.clock.clone();
         let tx_wheel_tx =
             crate::counter::GaugedSender::new(tx_wheel_tx.clone(), q_resolver_to_tx_wheel.clone());
-        let pto_wheel_tx =
-            crate::counter::GaugedSender::new(pto_wheel_tx.clone(), q_resolver_to_pto_wheel.clone());
+        let pto_wheel_tx = crate::counter::GaugedSender::new(
+            pto_wheel_tx.clone(),
+            q_resolver_to_pto_wheel.clone(),
+        );
         let idle_wheel_tx = crate::counter::GaugedSender::new(
             idle_wheel_tx.clone(),
             q_resolver_to_idle_wheel.clone(),
@@ -771,8 +774,7 @@ pub async fn send_idle_wheel_drain<Clk>(
         timer,
         input_gauge.clone(),
         {
-            let mut idle_wheel_tx =
-                crate::counter::GaugedSender::new(idle_wheel_tx, input_gauge);
+            let mut idle_wheel_tx = crate::counter::GaugedSender::new(idle_wheel_tx, input_gauge);
             move |context: Rc<RefCell<send::Context>>| {
                 let now = clock.now();
                 let ctx = context.borrow();
@@ -819,8 +821,7 @@ pub async fn recv_idle_wheel_drain<Clk>(
         timer,
         input_gauge.clone(),
         {
-            let mut idle_wheel_tx =
-                crate::counter::GaugedSender::new(idle_wheel_tx, input_gauge);
+            let mut idle_wheel_tx = crate::counter::GaugedSender::new(idle_wheel_tx, input_gauge);
             move |context: Rc<RefCell<endpoint::recv::Context>>| {
                 let now = clock.now();
                 let ctx = context.borrow();
@@ -889,7 +890,15 @@ where
 /// invalid/duplicate/unauthenticated packets which should not terminate the worker.
 ///
 /// [`dispatch::process`]: crate::endpoint::dispatch::process
-pub fn packet_dispatch<PacketRx, AckSender, AckBurstSender, IdleWheelSender, WakerSink, Clk, Route>(
+pub fn packet_dispatch<
+    PacketRx,
+    AckSender,
+    AckBurstSender,
+    IdleWheelSender,
+    WakerSink,
+    Clk,
+    Route,
+>(
     packet_rx: PacketRx,
     recv_cache: Rc<RefCell<endpoint::recv::Cache>>,
     mut ack_burst_tx: AckBurstSender,
@@ -1135,14 +1144,19 @@ pub fn send_invalidation<R>(
 where
     R: Receiver<Entry<crate::credentials::Id>>,
 {
-    Map::new(invalidation_rx, move |entry: Entry<crate::credentials::Id>| {
-        let id = *entry;
-        for cache in &send_caches {
-            cache
-                .borrow_mut()
-                .invalidate(&id, frame::FailureReason::UnknownPathSecret, &mut cancelled_tx);
-        }
-    })
+    Map::new(
+        invalidation_rx,
+        move |entry: Entry<crate::credentials::Id>| {
+            let id = *entry;
+            for cache in &send_caches {
+                cache.borrow_mut().invalidate(
+                    &id,
+                    frame::FailureReason::UnknownPathSecret,
+                    &mut cancelled_tx,
+                );
+            }
+        },
+    )
 }
 
 pub fn recv_invalidation<R>(
@@ -1152,10 +1166,13 @@ pub fn recv_invalidation<R>(
 where
     R: Receiver<Entry<crate::credentials::Id>>,
 {
-    Map::new(invalidation_rx, move |entry: Entry<crate::credentials::Id>| {
-        let id = *entry;
-        recv_cache.borrow_mut().invalidate_by_id(&id);
-    })
+    Map::new(
+        invalidation_rx,
+        move |entry: Entry<crate::credentials::Id>| {
+            let id = *entry;
+            recv_cache.borrow_mut().invalidate_by_id(&id);
+        },
+    )
 }
 
 pub fn invalidation_validator<R, Tx>(
