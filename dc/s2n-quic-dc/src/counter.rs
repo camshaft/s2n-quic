@@ -94,6 +94,7 @@ macro_rules! metric_emit {
     };
 }
 
+/// Returns the `(label, variant)` for a metric from the shared metadata map.
 #[cfg(any(test, feature = "metric-tracing"))]
 #[inline]
 fn metric_trace_fields(
@@ -107,6 +108,9 @@ fn metric_trace_fields(
     }
 }
 
+/// Returns `true` when the current thread is running inside a bach discrete-event
+/// simulation.  In that context wall-clock [`Instant`] values are synthetic and
+/// non-deterministic timer durations should not be emitted to snapshots.
 #[cfg(any(test, feature = "metric-tracing"))]
 #[inline]
 fn in_bach_sim() -> bool {
