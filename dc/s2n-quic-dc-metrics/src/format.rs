@@ -3,7 +3,7 @@
 
 // ── Metrics line formatting ─────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ParsedMetricsLine<'a> {
     line: &'a str,
 }
@@ -13,6 +13,9 @@ impl<'a> ParsedMetricsLine<'a> {
         Self { line }
     }
 
+    /// Returns an iterator of grouped metric entries.
+    ///
+    /// Note: this reparses the input line and rebuilds grouped entries each time it is called.
     pub fn iter(&self) -> ParsedMetricsLineIter<'a> {
         ParsedMetricsLineIter::new(self.line)
     }
@@ -122,9 +125,9 @@ impl<'a> IntoIterator for ParsedMetricsLine<'a> {
     }
 }
 
-impl<'a> IntoIterator for &'a ParsedMetricsLine<'a> {
-    type Item = MetricEntry<'a>;
-    type IntoIter = ParsedMetricsLineIter<'a>;
+impl<'line, 'parsed> IntoIterator for &'parsed ParsedMetricsLine<'line> {
+    type Item = MetricEntry<'line>;
+    type IntoIter = ParsedMetricsLineIter<'line>;
 
     fn into_iter(self) -> Self::IntoIter {
         self.iter()
@@ -139,7 +142,7 @@ pub struct ParsedMetricsLineIter<'a> {
 impl<'a> ParsedMetricsLineIter<'a> {
     fn new(line: &'a str) -> Self {
         Self {
-            entry_iter: parse_entries(line).into_iter(),
+            entry_iter: combine_metrics(parse_primitive_metrics(line)).into_iter(),
         }
     }
 }
@@ -152,41 +155,94 @@ impl<'a> Iterator for ParsedMetricsLineIter<'a> {
     }
 }
 
-fn parse_entries<'a>(line: &'a str) -> Vec<MetricEntry<'a>> {
+#[derive(Debug, PartialEq, Eq)]
+enum PrimitiveMetricEntry<'a> {
+    Scalar {
+        key: &'a str,
+        value: &'a str,
+    },
+    NominalVariant {
+        key: &'a str,
+        value: &'a str,
+        label: &'a str,
+    },
+    HistogramVariant {
+        key: &'a str,
+        value: &'a str,
+    },
+}
+
+struct PrimitiveMetricIter<'a> {
+    parts: std::str::Split<'a, char>,
+}
+
+impl<'a> Iterator for PrimitiveMetricIter<'a> {
+    type Item = PrimitiveMetricEntry<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        for part in self.parts.by_ref() {
+            let Some((key, value)) = part.split_once('=') else {
+                continue;
+            };
+
+            if let Some((val, rest)) = value.split_once(' ') {
+                if val.bytes().all(|b| b.is_ascii_digit()) {
+                    if is_valid_scalar_unit(rest) {
+                        return Some(PrimitiveMetricEntry::Scalar { key, value });
+                    }
+
+                    return Some(PrimitiveMetricEntry::NominalVariant {
+                        key,
+                        value: val,
+                        label: rest,
+                    });
+                }
+
+                if val.contains('*') && !is_histogram_unit_only(rest) {
+                    return Some(PrimitiveMetricEntry::HistogramVariant { key, value });
+                }
+            }
+
+            return Some(PrimitiveMetricEntry::Scalar { key, value });
+        }
+
+        None
+    }
+}
+
+fn parse_primitive_metrics<'a>(line: &'a str) -> PrimitiveMetricIter<'a> {
+    PrimitiveMetricIter {
+        parts: line.split(','),
+    }
+}
+
+fn combine_metrics<'a>(
+    primitive_entries: impl IntoIterator<Item = PrimitiveMetricEntry<'a>>,
+) -> Vec<MetricEntry<'a>> {
     use std::collections::{BTreeMap, BTreeSet, HashSet};
 
     let mut metrics: BTreeMap<&'a str, &'a str> = BTreeMap::new();
     let mut nominals: BTreeMap<&'a str, Vec<NominalVariant<'a>>> = BTreeMap::new();
     let mut variant_histograms: BTreeMap<&'a str, Vec<HistogramVariant<'a>>> = BTreeMap::new();
 
-    for part in line.split(',') {
-        let Some((key, value)) = part.split_once('=') else {
-            continue;
-        };
-
-        if let Some((val, rest)) = value.split_once(' ') {
-            if val.bytes().all(|b| b.is_ascii_digit()) {
-                if is_valid_scalar_unit(rest) {
-                    metrics.insert(key, value);
-                    continue;
-                }
-                nominals.entry(key).or_default().push(NominalVariant {
-                    label: rest,
-                    value: val,
-                });
-                continue;
+    for primitive_entry in primitive_entries {
+        match primitive_entry {
+            PrimitiveMetricEntry::Scalar { key, value } => {
+                metrics.insert(key, value);
             }
-
-            if val.contains('*') && !is_histogram_unit_only(rest) {
+            PrimitiveMetricEntry::NominalVariant { key, value, label } => {
+                nominals
+                    .entry(key)
+                    .or_default()
+                    .push(NominalVariant { label, value });
+            }
+            PrimitiveMetricEntry::HistogramVariant { key, value } => {
                 variant_histograms
                     .entry(key)
                     .or_default()
                     .push(HistogramVariant::parse(value));
-                continue;
             }
         }
-
-        metrics.insert(key, value);
     }
 
     let mut queue_bases = BTreeSet::new();
@@ -289,7 +345,10 @@ fn parse_entries<'a>(line: &'a str) -> Vec<MetricEntry<'a>> {
                 continue;
             }
 
-            entries.push(MetricEntry::Throughput(ThroughputMetric { name: key, bytes }));
+            entries.push(MetricEntry::Throughput(ThroughputMetric {
+                name: key,
+                bytes,
+            }));
             continue;
         }
 
@@ -791,7 +850,10 @@ mod tests {
                         histogram: Histogram {
                             buckets: vec![
                                 HistogramBucket { value: 5, count: 2 },
-                                HistogramBucket { value: 10, count: 1 },
+                                HistogramBucket {
+                                    value: 10,
+                                    count: 1
+                                },
                             ],
                             unit: "us",
                         },
@@ -969,8 +1031,11 @@ mod tests {
         let nominal = registry.register_counter("agg.counter".into(), Some("Task|worker.0".into()));
         nominal.increment(11);
 
-        let variant =
-            registry.register_summary("agg.summary".into(), Some("Task|worker.0".into()), Unit::Count);
+        let variant = registry.register_summary(
+            "agg.summary".into(),
+            Some("Task|worker.0".into()),
+            Unit::Count,
+        );
         variant.record_value(4);
         variant.record_value(8);
 
@@ -983,9 +1048,9 @@ mod tests {
         let line = registry.take_current_metrics_line();
         let entries = parsed_entries(&line);
 
-        assert!(entries
-            .iter()
-            .any(|entry| matches!(entry, MetricEntry::Scalar(m) if m.name == "scalar" && m.value == "7")));
+        assert!(entries.iter().any(
+            |entry| matches!(entry, MetricEntry::Scalar(m) if m.name == "scalar" && m.value == "7")
+        ));
         assert!(entries
             .iter()
             .any(|entry| matches!(entry, MetricEntry::QueueGauge(m) if m.name == "queue.depth" && m.enq == "9" && m.drain == "4" && m.depth == Some("5"))));
@@ -1001,9 +1066,9 @@ mod tests {
         assert!(entries
             .iter()
             .any(|entry| matches!(entry, MetricEntry::Histogram(m) if m.name == "loss" && m.histogram.unit == "%")));
-        assert!(entries.iter().any(
-            |entry| matches!(entry, MetricEntry::Histogram(m) if m.name == "success")
-        ));
+        assert!(entries
+            .iter()
+            .any(|entry| matches!(entry, MetricEntry::Histogram(m) if m.name == "success")));
         assert!(entries
             .iter()
             .any(|entry| matches!(entry, MetricEntry::Nominal(m) if m.name == "agg.counter" && m.variants.len() == 1 && m.variants[0].label == "Task|worker.0")));
