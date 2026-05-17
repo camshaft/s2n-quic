@@ -197,6 +197,28 @@ where
         self.len += 1;
     }
 
+    #[inline]
+    fn append_due_entries(due_tick: u64, mut entries: List<A>, out: &mut List<A>) {
+        #[cfg(debug_assertions)]
+        while let Some(ptr) = entries.pop_front() {
+            unsafe {
+                // SAFETY: The pointer is valid since it came from the adapter.
+                let value_ptr = A::as_ptr(&ptr);
+                if let Some(target_time) = A::target_time(value_ptr) {
+                    let target_tick = Self::timestamp_to_tick(target_time);
+                    debug_assert!(
+                        target_tick <= due_tick,
+                        "wheel entry target_time changed while queued: target_tick ({target_tick}) > due_tick ({due_tick})"
+                    );
+                }
+            }
+            out.push_back(ptr);
+        }
+
+        #[cfg(not(debug_assertions))]
+        out.append(&mut entries);
+    }
+
     /// Advance the virtual clock to `target_tick` and return all due entries.
     fn tick_to(&mut self, now: precision::Timestamp) -> List<A> {
         let target_tick = Self::timestamp_to_tick(now);
@@ -228,9 +250,9 @@ where
                     // Jump to the occupied slot, drain it
                     let occ_slot = (occ_tick & SLOT_MASK) as usize;
                     self.current_tick = occ_tick;
-                    let mut slot_queue = self.levels[0].drain(occ_slot);
+                    let slot_queue = self.levels[0].drain(occ_slot);
                     self.len -= slot_queue.len();
-                    result.append(&mut slot_queue);
+                    Self::append_due_entries(self.current_tick, slot_queue, &mut result);
                     self.current_tick += 1;
                 }
                 _ => {
@@ -247,9 +269,9 @@ where
 
         // Also drain the current slot (entries at exactly target_tick)
         let slot_idx = (self.current_tick & SLOT_MASK) as usize;
-        let mut slot_queue = self.levels[0].drain(slot_idx);
+        let slot_queue = self.levels[0].drain(slot_idx);
         self.len -= slot_queue.len();
-        result.append(&mut slot_queue);
+        Self::append_due_entries(self.current_tick, slot_queue, &mut result);
 
         result
     }
