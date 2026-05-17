@@ -23,7 +23,6 @@ use s2n_quic_core::varint::VarInt;
 /// entries into both maps.
 #[test]
 fn ping_pong() {
-    let _guard = crate::testing::without_tracing();
     crate::testing::sim(|| {
         use crate::testing::ext::*;
 
@@ -114,7 +113,6 @@ fn ping_pong() {
 /// missing ACK and retransmit, allowing the exchange to complete.
 #[test]
 fn server_response_loss_triggers_pto() {
-    let _guard = crate::testing::without_tracing();
     crate::testing::sim(|| {
         use crate::testing::ext::*;
 
@@ -213,7 +211,6 @@ fn server_response_loss_triggers_pto() {
 /// client should PTO-retransmit and the server should still see "ping".
 #[test]
 fn client_request_loss_triggers_pto() {
-    let _guard = crate::testing::without_tracing();
     crate::testing::sim(|| {
         use crate::testing::ext::*;
 
@@ -309,7 +306,6 @@ fn client_request_loss_triggers_pto() {
 /// This tests the acceptor channel, multi-stream dispatch, and queue pair routing.
 #[test]
 fn multiple_sequential_streams() {
-    let _guard = crate::testing::without_tracing();
     crate::testing::sim(|| {
         use crate::testing::ext::*;
 
@@ -390,7 +386,6 @@ fn multiple_sequential_streams() {
 /// frame fragmentation in the Writer and reassembly in the Reader.
 #[test]
 fn large_payload_transfer() {
-    let _guard = crate::testing::without_tracing();
     crate::testing::sim(|| {
         use crate::testing::ext::*;
 
@@ -472,7 +467,6 @@ fn large_payload_transfer() {
 /// should recover on the third attempt.
 #[test]
 fn multiple_packet_loss_recovered_by_pto() {
-    let _guard = crate::testing::without_tracing();
     crate::testing::sim(|| {
         use crate::testing::ext::*;
 
@@ -568,7 +562,6 @@ fn multiple_packet_loss_recovered_by_pto() {
 /// hanging (which would indicate stuck inflight tracking).
 #[test]
 fn ack_drains_inflight() {
-    let _guard = crate::testing::without_tracing();
     crate::testing::sim(|| {
         use crate::testing::ext::*;
 
@@ -645,7 +638,6 @@ fn ack_drains_inflight() {
 /// for the client's message first.
 #[test]
 fn bidirectional_simultaneous_send() {
-    let _guard = crate::testing::without_tracing();
     crate::testing::sim(|| {
         use crate::testing::ext::*;
 

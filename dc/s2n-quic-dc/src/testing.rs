@@ -77,6 +77,7 @@ pub static SNI: OnceLock<Name> = OnceLock::new();
 
 thread_local! {
     static TRACING_DISABLED_DEPTH: Cell<usize> = const { Cell::new(0) };
+    static SNAPSHOT_DISABLED_DEPTH: Cell<usize> = const { Cell::new(0) };
 }
 
 static SNAPSHOT_MODE_DEPTH: AtomicUsize = AtomicUsize::new(0);
@@ -96,10 +97,25 @@ impl Drop for TracingDisabledGuard {
     }
 }
 
+struct SnapshotDisabledGuard;
+
+impl SnapshotDisabledGuard {
+    fn enter() -> Self {
+        SNAPSHOT_DISABLED_DEPTH.with(|depth| depth.set(depth.get() + 1));
+        Self
+    }
+}
+
+impl Drop for SnapshotDisabledGuard {
+    fn drop(&mut self) {
+        SNAPSHOT_DISABLED_DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
+    }
+}
+
 /// Guard that disables tracing for its lifetime.
 ///
 /// Obtain one with [`without_tracing`].  While the guard is live:
-/// - [`snapshots_enabled`] returns `false`, so `sim` will not snapshot.
+/// - `sim` will not produce snapshot output.
 /// - A [`tracing::subscriber::NoSubscriber`] is installed on the current
 ///   thread so metric events are not recorded.
 ///
@@ -107,6 +123,15 @@ impl Drop for TracingDisabledGuard {
 pub struct WithoutTracingGuard {
     _depth: Option<TracingDisabledGuard>,
     _dispatch: Option<tracing::subscriber::DefaultGuard>,
+}
+
+/// Guard that suppresses sim snapshot output for its lifetime.
+///
+/// Obtain one with [`without_snapshots`].  Tracing remains active;
+/// only the insta snapshot capture is skipped.  Dropping the guard restores
+/// the previous state.
+pub struct WithoutSnapshotsGuard {
+    _depth: SnapshotDisabledGuard,
 }
 
 pub(crate) fn snapshots_enabled() -> bool {
@@ -212,6 +237,22 @@ pub fn without_tracing() -> WithoutTracingGuard {
     }
 }
 
+/// Returns a guard that suppresses sim snapshot output for its lifetime.
+///
+/// Tracing events continue to be emitted to the normal test subscriber;
+/// only the insta snapshot capture is skipped so the output of `sim` is not
+/// compared against stored snapshots.
+///
+/// ```rust,ignore
+/// let _guard = testing::without_snapshots();
+/// testing::sim(|| { ... }); // runs, but no snapshot is taken
+/// ```
+pub fn without_snapshots() -> WithoutSnapshotsGuard {
+    WithoutSnapshotsGuard {
+        _depth: SnapshotDisabledGuard::enter(),
+    }
+}
+
 #[derive(Default)]
 struct Uptime(tracing_subscriber::fmt::time::SystemTime);
 
@@ -233,7 +274,7 @@ pub fn sim(f: impl FnOnce()) {
 
     #[cfg(test)]
     {
-        if !is_tracing_disabled() && !is_bolero_fuzzing() {
+        if !is_tracing_disabled() && !is_snapshots_disabled() && !is_bolero_fuzzing() {
             return run_sim_with_snapshot(f);
         }
     }
@@ -252,6 +293,11 @@ fn run_sim(f: impl FnOnce()) {
 #[cfg(test)]
 fn is_tracing_disabled() -> bool {
     TRACING_DISABLED_DEPTH.with(|depth| depth.get() > 0)
+}
+
+#[cfg(test)]
+fn is_snapshots_disabled() -> bool {
+    SNAPSHOT_DISABLED_DEPTH.with(|depth| depth.get() > 0)
 }
 
 #[cfg(test)]

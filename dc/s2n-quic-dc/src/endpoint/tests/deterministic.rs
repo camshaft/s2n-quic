@@ -342,13 +342,13 @@ fn sporadic_loss() {
 /// completes — the exact duration is not checked here, only liveness.
 #[test]
 fn bulk_transfer_with_loss() {
+    let _guard = without_tracing();
     bolero::check!()
         .with_type::<DroppedPackets>()
         .with_test_time(core::time::Duration::from_secs(30))
         .with_shrink_time(core::time::Duration::from_secs(0))
         .cloned()
         .for_each(|packets| {
-            let _guard = without_tracing();
             let _ = packets.sim(1 << 18);
         });
 }
@@ -362,6 +362,7 @@ fn bulk_transfer_with_loss() {
 /// end-to-end time grows orders of magnitude beyond what the loss rate predicts.
 #[test]
 fn transmission_rate_fuzz() {
+    let _guard = without_tracing();
     bolero::check!()
         .with_type::<DroppedPackets>()
         .with_test_time(core::time::Duration::from_secs(30))
@@ -369,7 +370,6 @@ fn transmission_rate_fuzz() {
         .cloned()
         .for_each(|packets| {
             let loss = packets.loss_percent();
-            let _guard = without_tracing();
             let elapsed = packets.sim(1 << 18);
 
             // Duration bound that scales quadratically with loss rate:
