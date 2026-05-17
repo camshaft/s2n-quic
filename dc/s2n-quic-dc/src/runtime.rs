@@ -13,43 +13,28 @@
 //!
 //! This abstraction needs to support both this pattern and simpler runtimes like tokio.
 
+use crate::counter;
 use crate::time::precision;
-use crate::{counter, socket::channel};
 use core::fmt;
 use s2n_quic_core::time;
 use std::future::Future;
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum MetricKind {
-    Counter,
-    Gauge,
-    Summary,
-    Timer,
-}
-
-impl fmt::Display for MetricKind {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Counter => f.write_str("counter"),
-            Self::Gauge => f.write_str("gauge"),
-            Self::Summary => f.write_str("summary"),
-            Self::Timer => f.write_str("timer"),
-        }
-    }
-}
 
 #[derive(Clone, Debug)]
 pub struct MetricRegistration {
     pub label: String,
     pub variant: Option<String>,
-    pub kind: MetricKind,
+    pub kind: counter::MetricKind,
     pub unit: Option<&'static str>,
     pub description: String,
 }
 
 impl MetricRegistration {
     #[inline]
-    pub fn new(name: impl fmt::Display, kind: MetricKind, description: impl fmt::Display) -> Self {
+    pub fn new(
+        name: impl fmt::Display,
+        kind: counter::MetricKind,
+        description: impl fmt::Display,
+    ) -> Self {
         Self {
             label: name.to_string(),
             variant: None,
@@ -87,16 +72,8 @@ impl Metric for counter::Task {
         self.metrics()
             .into_iter()
             .map(|metric| {
-                let mut registration = MetricRegistration::new(
-                    metric.label,
-                    match metric.kind {
-                        counter::MetricKind::Counter => MetricKind::Counter,
-                        counter::MetricKind::Gauge => MetricKind::Gauge,
-                        counter::MetricKind::Summary => MetricKind::Summary,
-                        counter::MetricKind::Timer => MetricKind::Timer,
-                    },
-                    metric.description,
-                );
+                let mut registration =
+                    MetricRegistration::new(metric.label, metric.kind, metric.description);
                 if let Some(variant) = metric.variant {
                     registration = registration.with_variant(variant);
                 }
@@ -114,16 +91,8 @@ impl Metric for counter::QueueGauge {
         self.metrics()
             .into_iter()
             .map(|metric| {
-                let mut registration = MetricRegistration::new(
-                    metric.label,
-                    match metric.kind {
-                        counter::MetricKind::Counter => MetricKind::Counter,
-                        counter::MetricKind::Gauge => MetricKind::Gauge,
-                        counter::MetricKind::Summary => MetricKind::Summary,
-                        counter::MetricKind::Timer => MetricKind::Timer,
-                    },
-                    metric.description,
-                );
+                let mut registration =
+                    MetricRegistration::new(metric.label, metric.kind, metric.description);
                 if let Some(variant) = metric.variant {
                     registration = registration.with_variant(variant);
                 }
@@ -362,47 +331,24 @@ pub trait Spawner {
         ));
     }
 
-    /// Register task metadata and spawn a future by delegating to [`Spawner::spawn`].
+    /// Convenience helper for pipeline tasks with budget and task counters.
     #[inline]
-    fn spawn_named<F>(&mut self, task: TaskRegistration, future: F)
-    where
-        F: Future<Output = ()> + 'static,
-    {
-        self.register_task(task);
-        self.spawn(future);
-    }
-
-    /// Convenience helper for pipeline receiver tasks with budget and task counters.
-    #[inline]
-    fn spawn_receiver_task<R>(
+    fn spawn_receiver_task<F>(
         &mut self,
-        task: TaskRegistration,
-        receiver: R,
+        future: F,
         budget: Option<usize>,
         task_counter: counter::Task,
     ) where
-        R: channel::Receiver<()> + 'static,
-        Self: Sized,
-    {
-        use crate::socket::channel::ReceiverExt as _;
-        let task = task.with_budget(budget).with_metric(&task_counter);
-        self.spawn_named(task, receiver.drain_budgeted_metered(budget, task_counter));
-    }
-
-    /// Convenience helper that derives task registration metadata from the task counter handle.
-    #[inline]
-    fn spawn_counter_task<R>(&mut self, receiver: R, budget: Option<usize>, task_counter: counter::Task)
-    where
-        R: channel::Receiver<()> + 'static,
+        F: Future<Output = ()> + 'static,
         Self: Sized,
     {
         let (name, description, function) = task_counter.registration_metadata();
-        self.spawn_receiver_task(
-            TaskRegistration::new(name, description, function),
-            receiver,
-            budget,
-            task_counter,
+        self.register_task(
+            TaskRegistration::new(name, description, function)
+                .with_budget(budget)
+                .with_metric(&task_counter),
         );
+        self.spawn(future);
     }
 }
 

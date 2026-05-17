@@ -30,6 +30,17 @@ pub enum MetricKind {
     Timer,
 }
 
+impl core::fmt::Display for MetricKind {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Counter => f.write_str("counter"),
+            Self::Gauge => f.write_str("gauge"),
+            Self::Summary => f.write_str("summary"),
+            Self::Timer => f.write_str("timer"),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct MetricMetadata {
     pub id: MetricId,
@@ -487,12 +498,29 @@ fn report_once(
 // ── Counter ─────────────────────────────────────────────────────────────────
 
 #[derive(Clone)]
-pub struct Counter(s2n_quic_dc_metrics::Counter);
+pub struct Counter {
+    inner: s2n_quic_dc_metrics::Counter,
+    metric_id: MetricId,
+    metadata: Arc<Mutex<HashMap<MetricId, MetricMetadata>>>,
+}
 
 impl Counter {
     #[inline]
     pub fn add(&self, v: u64) {
-        self.0.increment(v);
+        self.inner.increment(v);
+    }
+
+    #[inline]
+    pub fn metric_metadata(&self) -> Option<MetricMetadata> {
+        self.metadata.lock().unwrap().get(&self.metric_id).cloned()
+    }
+
+    #[inline]
+    pub fn with_description(self, description: impl core::fmt::Display) -> Self {
+        if let Some(metadata) = self.metadata.lock().unwrap().get_mut(&self.metric_id) {
+            metadata.description = description.to_string();
+        }
+        self
     }
 }
 
@@ -506,22 +534,39 @@ impl core::ops::AddAssign<u64> for Counter {
 // ── Gauge ───────────────────────────────────────────────────────────────────
 
 #[derive(Clone)]
-pub struct Gauge(Arc<AtomicI64>);
+pub struct Gauge {
+    inner: Arc<AtomicI64>,
+    metric_id: MetricId,
+    metadata: Arc<Mutex<HashMap<MetricId, MetricMetadata>>>,
+}
 
 impl Gauge {
     #[inline]
     pub fn add(&self, v: i64) -> i64 {
-        self.0.fetch_add(v, Ordering::Relaxed) + v
+        self.inner.fetch_add(v, Ordering::Relaxed) + v
     }
 
     #[inline]
     pub fn sub(&self, v: i64) -> i64 {
-        self.0.fetch_sub(v, Ordering::Relaxed) - v
+        self.inner.fetch_sub(v, Ordering::Relaxed) - v
     }
 
     #[inline]
     pub fn get(&self) -> i64 {
-        self.0.load(Ordering::Relaxed)
+        self.inner.load(Ordering::Relaxed)
+    }
+
+    #[inline]
+    pub fn metric_metadata(&self) -> Option<MetricMetadata> {
+        self.metadata.lock().unwrap().get(&self.metric_id).cloned()
+    }
+
+    #[inline]
+    pub fn with_description(self, description: impl core::fmt::Display) -> Self {
+        if let Some(metadata) = self.metadata.lock().unwrap().get_mut(&self.metric_id) {
+            metadata.description = description.to_string();
+        }
+        self
     }
 }
 
@@ -532,7 +577,11 @@ impl Gauge {
 /// Call `timer.start()` to begin timing; the returned guard records
 /// the elapsed duration into the underlying `Summary` on drop.
 #[derive(Clone)]
-pub struct Timer(Summary);
+pub struct Timer {
+    summary: Summary,
+    metric_id: MetricId,
+    metadata: Arc<Mutex<HashMap<MetricId, MetricMetadata>>>,
+}
 
 impl Timer {
     #[inline]
@@ -547,7 +596,7 @@ impl Timer {
     #[inline]
     pub fn start_at(&self, start: Instant) -> TimerGuard<'_> {
         TimerGuard {
-            summary: &self.0,
+            summary: &self.summary,
             start,
             recorded: false,
         }
@@ -555,7 +604,47 @@ impl Timer {
 
     #[inline]
     pub fn record(&self, duration: Duration) {
-        self.0.record_duration(duration);
+        self.summary.record_duration(duration);
+    }
+
+    #[inline]
+    pub fn metric_metadata(&self) -> Option<MetricMetadata> {
+        self.metadata.lock().unwrap().get(&self.metric_id).cloned()
+    }
+
+    #[inline]
+    pub fn with_description(self, description: impl core::fmt::Display) -> Self {
+        if let Some(metadata) = self.metadata.lock().unwrap().get_mut(&self.metric_id) {
+            metadata.description = description.to_string();
+        }
+        self
+    }
+}
+
+#[derive(Clone)]
+pub struct SummaryMetric {
+    summary: Summary,
+    metric_id: MetricId,
+    metadata: Arc<Mutex<HashMap<MetricId, MetricMetadata>>>,
+}
+
+impl SummaryMetric {
+    #[inline]
+    pub fn record_value(&self, value: u64) {
+        self.summary.record_value(value);
+    }
+
+    #[inline]
+    pub fn metric_metadata(&self) -> Option<MetricMetadata> {
+        self.metadata.lock().unwrap().get(&self.metric_id).cloned()
+    }
+
+    #[inline]
+    pub fn with_description(self, description: impl core::fmt::Display) -> Self {
+        if let Some(metadata) = self.metadata.lock().unwrap().get_mut(&self.metric_id) {
+            metadata.description = description.to_string();
+        }
+        self
     }
 }
 
@@ -594,18 +683,17 @@ impl Drop for TimerGuard<'_> {
 ///   of the next poll
 #[derive(Clone)]
 pub struct Task {
-    pub(crate) label: String,
-    pub(crate) variant: Option<String>,
-    pub(crate) name: String,
-    pub(crate) description: String,
-    pub(crate) function: String,
-    metadata: Arc<Mutex<HashMap<MetricId, MetricMetadata>>>,
-    drained_id: MetricId,
-    time_id: MetricId,
-    next_poll_latency_id: MetricId,
-    pub drained: Summary,
+    registration: Arc<Mutex<TaskRegistrationMetadata>>,
+    pub drained: SummaryMetric,
     pub time: Timer,
     pub next_poll_latency: Timer,
+}
+
+#[derive(Clone, Default)]
+struct TaskRegistrationMetadata {
+    name: String,
+    description: String,
+    function: String,
 }
 
 impl Task {
@@ -619,26 +707,36 @@ impl Task {
     pub const NEXT_POLL_LATENCY_UNIT: &'static str = "microsecond";
 
     pub fn metrics(&self) -> Vec<MetricMetadata> {
-        let metadata = self.metadata.lock().unwrap();
-        [self.drained_id, self.time_id, self.next_poll_latency_id]
-            .into_iter()
-            .filter_map(|id| metadata.get(&id).cloned())
-            .collect()
+        [
+            self.drained.metric_metadata(),
+            self.time.metric_metadata(),
+            self.next_poll_latency.metric_metadata(),
+        ]
+        .into_iter()
+        .flatten()
+        .collect()
     }
 
-    pub fn registration_metadata(&self) -> (&str, &str, &str) {
-        (&self.name, &self.description, &self.function)
+    pub fn registration_metadata(&self) -> (String, String, String) {
+        let registration = self.registration.lock().unwrap();
+        (
+            registration.name.clone(),
+            registration.description.clone(),
+            registration.function.clone(),
+        )
     }
 
-    fn with_registration_metadata(
-        mut self,
+    pub fn with_registration_metadata(
+        self,
         name: impl core::fmt::Display,
         description: impl core::fmt::Display,
         function: impl core::fmt::Display,
     ) -> Self {
-        self.name = name.to_string();
-        self.description = description.to_string();
-        self.function = function.to_string();
+        let mut registration = self.registration.lock().unwrap();
+        registration.name = name.to_string();
+        registration.description = description.to_string();
+        registration.function = function.to_string();
+        drop(registration);
         self
     }
 }
@@ -648,17 +746,10 @@ impl Task {
 
 #[derive(Clone)]
 pub struct QueueGauge {
-    pub(crate) label: String,
-    pub(crate) variant: Option<String>,
-    metadata: Arc<Mutex<HashMap<MetricId, MetricMetadata>>>,
-    enqueued_id: MetricId,
-    dequeued_id: MetricId,
-    depth_id: MetricId,
-    depth_distribution_id: MetricId,
     pub throughput: Counter,
     pub drain: Counter,
     pub depth: Gauge,
-    pub depth_distribution: Summary,
+    pub depth_distribution: SummaryMetric,
 }
 
 impl QueueGauge {
@@ -673,15 +764,14 @@ impl QueueGauge {
     pub const DEPTH_DISTRIBUTION_UNIT: &'static str = "count";
 
     pub fn metrics(&self) -> Vec<MetricMetadata> {
-        let metadata = self.metadata.lock().unwrap();
         [
-            self.enqueued_id,
-            self.dequeued_id,
-            self.depth_id,
-            self.depth_distribution_id,
+            self.throughput.metric_metadata(),
+            self.drain.metric_metadata(),
+            self.depth.metric_metadata(),
+            self.depth_distribution.metric_metadata(),
         ]
         .into_iter()
-        .filter_map(|id| metadata.get(&id).cloned())
+        .flatten()
         .collect()
     }
 }
@@ -753,14 +843,51 @@ impl Registry {
         id
     }
 
+    fn counter_handle(&self, inner: s2n_quic_dc_metrics::Counter, metric_id: MetricId) -> Counter {
+        Counter {
+            inner,
+            metric_id,
+            metadata: self.metric_metadata.clone(),
+        }
+    }
+
+    fn gauge_handle(&self, inner: Arc<AtomicI64>, metric_id: MetricId) -> Gauge {
+        Gauge {
+            inner,
+            metric_id,
+            metadata: self.metric_metadata.clone(),
+        }
+    }
+
+    fn timer_handle(&self, summary: Summary, metric_id: MetricId) -> Timer {
+        Timer {
+            summary,
+            metric_id,
+            metadata: self.metric_metadata.clone(),
+        }
+    }
+
+    fn summary_handle(&self, summary: Summary, metric_id: MetricId) -> SummaryMetric {
+        SummaryMetric {
+            summary,
+            metric_id,
+            metadata: self.metric_metadata.clone(),
+        }
+    }
+
     pub fn register(&self, label: impl core::fmt::Display) -> Counter {
-        Counter(self.inner.register_counter(label.to_string(), None))
+        let label = label.to_string();
+        let metric_id = self.register_metric_metadata(&label, None, MetricKind::Counter, None, "");
+        self.counter_handle(self.inner.register_counter(label, None), metric_id)
     }
 
     pub fn register_bytes(&self, label: impl core::fmt::Display) -> Counter {
-        Counter(
-            self.inner
-                .register_counter(label.to_string(), Some("B".into())),
+        let label = label.to_string();
+        let metric_id =
+            self.register_metric_metadata(&label, None, MetricKind::Counter, Some("B"), "");
+        self.counter_handle(
+            self.inner.register_counter(label, Some("B".into())),
+            metric_id,
         )
     }
 
@@ -769,10 +896,11 @@ impl Registry {
         label: impl core::fmt::Display,
         variant: impl core::fmt::Display,
     ) -> Counter {
-        Counter(
-            self.inner
-                .register_counter(label.to_string(), Some(variant.to_string())),
-        )
+        let label = label.to_string();
+        let variant = variant.to_string();
+        let metric_id =
+            self.register_metric_metadata(&label, Some(&variant), MetricKind::Counter, None, "");
+        self.counter_handle(self.inner.register_counter(label, Some(variant)), metric_id)
     }
 
     pub fn register_queue_gauge(&self, label: impl core::fmt::Display) -> QueueGauge {
@@ -782,7 +910,6 @@ impl Registry {
             return existing.clone();
         }
 
-        let throughput = Counter(self.inner.register_counter(format!("{label}.enq"), None));
         let enqueued_id = self.register_metric_metadata(
             format!("{label}.enq"),
             None,
@@ -790,7 +917,10 @@ impl Registry {
             Some(Self::COUNT_UNIT),
             QueueGauge::ENQUEUED_DESCRIPTION,
         );
-        let drain = Counter(self.inner.register_counter(format!("{label}.drain"), None));
+        let throughput = self.counter_handle(
+            self.inner.register_counter(format!("{label}.enq"), None),
+            enqueued_id,
+        );
         let dequeued_id = self.register_metric_metadata(
             format!("{label}.drain"),
             None,
@@ -798,8 +928,12 @@ impl Registry {
             Some(Self::COUNT_UNIT),
             QueueGauge::DEQUEUED_DESCRIPTION,
         );
-        let depth = Arc::new(AtomicI64::new(0));
-        let depth_clone = depth.clone();
+        let drain = self.counter_handle(
+            self.inner.register_counter(format!("{label}.drain"), None),
+            dequeued_id,
+        );
+        let depth_inner = Arc::new(AtomicI64::new(0));
+        let depth_clone = depth_inner.clone();
         self.inner
             .register_list_callback(format!("{label}.depth"), None, Unit::Count, move || {
                 NonZeroDisplay(depth_clone.load(Ordering::Relaxed))
@@ -811,7 +945,7 @@ impl Registry {
             Some(Self::COUNT_UNIT),
             QueueGauge::DEPTH_DESCRIPTION,
         );
-        let depth_distribution =
+        let depth_distribution_inner =
             self.inner
                 .register_summary(format!("{label}.depth_dist"), None, Unit::Count);
         let depth_distribution_id = self.register_metric_metadata(
@@ -823,17 +957,11 @@ impl Registry {
         );
 
         let gauge = QueueGauge {
-            label: label.clone(),
-            variant: None,
-            metadata: self.metric_metadata.clone(),
-            enqueued_id,
-            dequeued_id,
-            depth_id,
-            depth_distribution_id,
             throughput,
             drain,
-            depth: Gauge(depth),
-            depth_distribution,
+            depth: self.gauge_handle(depth_inner, depth_id),
+            depth_distribution: self
+                .summary_handle(depth_distribution_inner, depth_distribution_id),
         };
         gauges.insert(label, gauge.clone());
         gauge
@@ -853,10 +981,6 @@ impl Registry {
         }
 
         let variant_option = Some(variant.clone());
-        let throughput = Counter(
-            self.inner
-                .register_counter(format!("{label}.enq"), variant_option.clone()),
-        );
         let enqueued_id = self.register_metric_metadata(
             format!("{label}.enq"),
             Some(&variant),
@@ -864,9 +988,10 @@ impl Registry {
             Some(Self::COUNT_UNIT),
             QueueGauge::ENQUEUED_DESCRIPTION,
         );
-        let drain = Counter(
+        let throughput = self.counter_handle(
             self.inner
-                .register_counter(format!("{label}.drain"), variant_option.clone()),
+                .register_counter(format!("{label}.enq"), variant_option.clone()),
+            enqueued_id,
         );
         let dequeued_id = self.register_metric_metadata(
             format!("{label}.drain"),
@@ -875,8 +1000,13 @@ impl Registry {
             Some(Self::COUNT_UNIT),
             QueueGauge::DEQUEUED_DESCRIPTION,
         );
-        let depth = Arc::new(AtomicI64::new(0));
-        let depth_clone = depth.clone();
+        let drain = self.counter_handle(
+            self.inner
+                .register_counter(format!("{label}.drain"), variant_option.clone()),
+            dequeued_id,
+        );
+        let depth_inner = Arc::new(AtomicI64::new(0));
+        let depth_clone = depth_inner.clone();
         self.inner.register_list_callback(
             format!("{label}.depth"),
             variant_option.clone(),
@@ -890,7 +1020,7 @@ impl Registry {
             Some(Self::COUNT_UNIT),
             QueueGauge::DEPTH_DESCRIPTION,
         );
-        let depth_distribution =
+        let depth_distribution_inner =
             self.inner
                 .register_summary(format!("{label}.depth_dist"), variant_option, Unit::Count);
         let depth_distribution_id = self.register_metric_metadata(
@@ -902,30 +1032,26 @@ impl Registry {
         );
 
         let gauge = QueueGauge {
-            label,
-            variant: Some(variant),
-            metadata: self.metric_metadata.clone(),
-            enqueued_id,
-            dequeued_id,
-            depth_id,
-            depth_distribution_id,
             throughput,
             drain,
-            depth: Gauge(depth),
-            depth_distribution,
+            depth: self.gauge_handle(depth_inner, depth_id),
+            depth_distribution: self
+                .summary_handle(depth_distribution_inner, depth_distribution_id),
         };
         gauges.insert(key, gauge.clone());
         gauge
     }
 
     pub fn register_gauge(&self, label: impl core::fmt::Display) -> Gauge {
+        let label = label.to_string();
+        let metric_id = self.register_metric_metadata(&label, None, MetricKind::Gauge, None, "");
         let inner = Arc::new(AtomicI64::new(0));
         let inner_clone = inner.clone();
         self.inner
-            .register_list_callback(label.to_string(), None, Unit::Count, move || {
+            .register_list_callback(label, None, Unit::Count, move || {
                 NonZeroDisplay(inner_clone.load(Ordering::Relaxed))
             });
-        Gauge(inner)
+        self.gauge_handle(inner, metric_id)
     }
 
     pub fn register_summary(&self, label: impl core::fmt::Display, unit: Unit) -> Summary {
@@ -943,9 +1069,17 @@ impl Registry {
     }
 
     pub fn register_timer(&self, label: impl core::fmt::Display) -> Timer {
-        Timer(
-            self.inner
-                .register_summary(label.to_string(), None, Unit::Microsecond),
+        let label = label.to_string();
+        let metric_id = self.register_metric_metadata(
+            &label,
+            None,
+            MetricKind::Timer,
+            Some(Self::MICROSECOND_UNIT),
+            "",
+        );
+        self.timer_handle(
+            self.inner.register_summary(label, None, Unit::Microsecond),
+            metric_id,
         )
     }
 
@@ -976,30 +1110,25 @@ impl Registry {
             Task::NEXT_POLL_LATENCY_DESCRIPTION,
         );
         Task {
-            label: label.clone(),
-            variant: None,
-            name: label.clone(),
-            description: String::new(),
-            function: String::new(),
-            metadata: self.metric_metadata.clone(),
-            drained_id,
-            time_id,
-            next_poll_latency_id,
-            drained: self.register_summary(drained_label, Unit::Count),
-            time: self.register_timer(time_label),
-            next_poll_latency: self.register_timer(next_poll_latency_label),
+            registration: Arc::new(Mutex::new(TaskRegistrationMetadata {
+                name: label.clone(),
+                ..Default::default()
+            })),
+            drained: self.summary_handle(
+                self.register_summary(drained_label, Unit::Count),
+                drained_id,
+            ),
+            time: self.timer_handle(
+                self.inner
+                    .register_summary(time_label, None, Unit::Microsecond),
+                time_id,
+            ),
+            next_poll_latency: self.timer_handle(
+                self.inner
+                    .register_summary(next_poll_latency_label, None, Unit::Microsecond),
+                next_poll_latency_id,
+            ),
         }
-    }
-
-    pub fn register_task_with_details(
-        &self,
-        label: impl core::fmt::Display,
-        description: impl core::fmt::Display,
-        function: impl core::fmt::Display,
-    ) -> Task {
-        let label = label.to_string();
-        self.register_task(&label)
-            .with_registration_metadata(label, description, function)
     }
 
     pub fn register_nominal_timer(
@@ -1007,11 +1136,20 @@ impl Registry {
         label: impl core::fmt::Display,
         variant: impl core::fmt::Display,
     ) -> Timer {
-        Timer(self.inner.register_summary(
-            label.to_string(),
-            Some(variant.to_string()),
-            Unit::Microsecond,
-        ))
+        let label = label.to_string();
+        let variant = variant.to_string();
+        let metric_id = self.register_metric_metadata(
+            &label,
+            Some(&variant),
+            MetricKind::Timer,
+            Some(Self::MICROSECOND_UNIT),
+            "",
+        );
+        self.timer_handle(
+            self.inner
+                .register_summary(label, Some(variant), Unit::Microsecond),
+            metric_id,
+        )
     }
 
     pub fn register_nominal_task(
@@ -1046,36 +1184,28 @@ impl Registry {
             Task::NEXT_POLL_LATENCY_DESCRIPTION,
         );
         Task {
-            label: label.clone(),
-            variant: Some(variant.clone()),
-            name: format!("{label}.{variant}"),
-            description: String::new(),
-            function: String::new(),
-            metadata: self.metric_metadata.clone(),
-            drained_id,
-            time_id,
-            next_poll_latency_id,
-            drained: self.register_nominal_summary(
-                drained_label,
-                &variant,
-                Unit::Count,
+            registration: Arc::new(Mutex::new(TaskRegistrationMetadata {
+                name: format!("{label}.{variant}"),
+                ..Default::default()
+            })),
+            drained: self.summary_handle(
+                self.register_nominal_summary(drained_label, &variant, Unit::Count),
+                drained_id,
             ),
-            time: self.register_nominal_timer(time_label, &variant),
-            next_poll_latency: self.register_nominal_timer(next_poll_latency_label, &variant),
+            time: self.timer_handle(
+                self.inner
+                    .register_summary(time_label, Some(variant.clone()), Unit::Microsecond),
+                time_id,
+            ),
+            next_poll_latency: self.timer_handle(
+                self.inner.register_summary(
+                    next_poll_latency_label,
+                    Some(variant),
+                    Unit::Microsecond,
+                ),
+                next_poll_latency_id,
+            ),
         }
-    }
-
-    pub fn register_nominal_task_with_details(
-        &self,
-        label: impl core::fmt::Display,
-        variant: impl core::fmt::Display,
-        description: impl core::fmt::Display,
-        function: impl core::fmt::Display,
-    ) -> Task {
-        let label = label.to_string();
-        let variant = variant.to_string();
-        self.register_nominal_task(&label, &variant)
-            .with_registration_metadata(format!("{label}.{variant}"), description, function)
     }
 
     pub fn spawn_reporter(&self, interval: Duration) {

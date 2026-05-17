@@ -724,7 +724,8 @@ where
 
     #[inline]
     fn spawn<R: crate::runtime::Runtime>(self, runtime: &R) {
-        use crate::runtime::{ChannelRegistration, Spawner as _, TaskRegistration};
+        use crate::runtime::{ChannelRegistration, Spawner as _};
+        use crate::socket::channel::ReceiverExt as _;
 
         let Self {
             id,
@@ -781,15 +782,15 @@ where
                 let recv_idx = rs.idx;
                 let variant = format!("recv.{recv_idx}");
                 let rx = tasks::socket_recv(rs.socket, rs.recv_pool, rs.router);
-                let task_counter =
-                    counter_registry.register_nominal_task("task.socket_recv", &variant);
-                local.spawn_receiver_task(
-                    TaskRegistration::new(
+                let task_counter = counter_registry
+                    .register_nominal_task("task.socket_recv", &variant)
+                    .with_registration_metadata(
                         "task.socket_recv",
                         "Reads UDP datagrams and routes packets into dispatch queues",
                         "endpoint::Worker::spawn",
-                    ),
-                    rx,
+                    );
+                local.spawn_receiver_task(
+                    rx.drain_budgeted_metered(Some(budgets.socket_recv), task_counter.clone()),
                     Some(budgets.socket_recv),
                     task_counter,
                 );
@@ -859,16 +860,14 @@ where
                     let idle_rescheduled = counter_registry.register("idle.recv.rescheduled");
                     let idle_lifetime =
                         counter_registry.register_nominal_timer("idle.recv.lifetime", &variant);
-                    let task_counter =
-                        counter_registry.register_nominal_task("task.recv_idle_wheel", &variant);
-                    local.spawn_named(
-                        TaskRegistration::new(
+                    let task_counter = counter_registry
+                        .register_nominal_task("task.recv_idle_wheel", &variant)
+                        .with_registration_metadata(
                             "task.recv_idle_wheel",
                             "Expires or re-schedules idle recv contexts",
                             "endpoint::Worker::spawn",
-                        )
-                        .with_budget(Some(budgets.idle_wheel))
-                        .with_metric(&task_counter),
+                        );
+                    local.spawn_receiver_task(
                         tasks::recv_idle_wheel_drain(
                             recv_idle_wheel_rx,
                             recv_idle_wheel_tx.clone(),
@@ -879,8 +878,10 @@ where
                             idle_rescheduled,
                             idle_lifetime,
                             budgets.idle_wheel,
-                            task_counter,
+                            task_counter.clone(),
                         ),
+                        Some(budgets.idle_wheel),
+                        task_counter,
                     );
                 }
 
@@ -900,15 +901,15 @@ where
                     rd.waker_sink,
                 );
                 let variant = format!("recv.{recv_dispatch_idx}");
-                let task_counter =
-                    counter_registry.register_nominal_task("task.packet_dispatch", &variant);
-                local.spawn_receiver_task(
-                    TaskRegistration::new(
+                let task_counter = counter_registry
+                    .register_nominal_task("task.packet_dispatch", &variant)
+                    .with_registration_metadata(
                         "task.packet_dispatch",
                         "Decrypts, validates, and routes inbound packets",
                         "endpoint::Worker::spawn",
-                    ),
-                    rx,
+                    );
+                local.spawn_receiver_task(
+                    rx.drain_budgeted_metered(Some(budgets.packet_dispatch), task_counter.clone()),
                     Some(budgets.packet_dispatch),
                     task_counter,
                 );
@@ -918,15 +919,15 @@ where
                     recv_dispatch_idx,
                     rd.counters.clone(),
                 );
-                let task_counter =
-                    counter_registry.register_nominal_task("task.ack_burst", &variant);
-                local.spawn_receiver_task(
-                    TaskRegistration::new(
+                let task_counter = counter_registry
+                    .register_nominal_task("task.ack_burst", &variant)
+                    .with_registration_metadata(
                         "task.ack_burst",
                         "Encodes and submits ACK bursts from recv contexts",
                         "endpoint::Worker::spawn",
-                    ),
-                    rx,
+                    );
+                local.spawn_receiver_task(
+                    rx.drain_budgeted_metered(Some(budgets.ack_burst), task_counter.clone()),
                     Some(budgets.ack_burst),
                     task_counter,
                 );
@@ -962,29 +963,29 @@ where
                     rd.ack_sender,
                     rd.counters.clone(),
                 );
-                let task_counter =
-                    counter_registry.register_nominal_task("task.ack_completion", &variant);
-                local.spawn_receiver_task(
-                    TaskRegistration::new(
+                let task_counter = counter_registry
+                    .register_nominal_task("task.ack_completion", &variant)
+                    .with_registration_metadata(
                         "task.ack_completion",
                         "Finalizes ACK send completions and retries stale acknowledgements",
                         "endpoint::Worker::spawn",
-                    ),
-                    rx,
+                    );
+                local.spawn_receiver_task(
+                    rx.drain_budgeted_metered(Some(budgets.ack_completion), task_counter.clone()),
                     Some(budgets.ack_completion),
                     task_counter,
                 );
 
                 let rx = tasks::recv_invalidation(rd.invalidation_rx, recv_cache);
-                let task_counter =
-                    counter_registry.register_nominal_task("task.invalidation", &variant);
-                local.spawn_receiver_task(
-                    TaskRegistration::new(
+                let task_counter = counter_registry
+                    .register_nominal_task("task.invalidation", &variant)
+                    .with_registration_metadata(
                         "task.invalidation",
                         "Purges invalidated recv contexts",
                         "endpoint::Worker::spawn",
-                    ),
-                    rx,
+                    );
+                local.spawn_receiver_task(
+                    rx.drain_budgeted_metered(Some(budgets.invalidation), task_counter.clone()),
                     Some(budgets.invalidation),
                     task_counter,
                 );
@@ -993,15 +994,15 @@ where
             if let Some(drain) = waker_drain {
                 let variant = format!("waker.{id}");
                 let rx = tasks::waker_drain(drain);
-                let task_counter =
-                    counter_registry.register_nominal_task("task.waker_drain", &variant);
-                local.spawn_receiver_task(
-                    TaskRegistration::new(
+                let task_counter = counter_registry
+                    .register_nominal_task("task.waker_drain", &variant)
+                    .with_registration_metadata(
                         "task.waker_drain",
                         "Invokes deferred wakers enqueued by dispatch workers",
                         "endpoint::Worker::spawn",
-                    ),
-                    rx,
+                    );
+                local.spawn_receiver_task(
+                    rx.drain_budgeted_metered(Some(budgets.waker_drain), task_counter.clone()),
                     Some(budgets.waker_drain),
                     task_counter,
                 );
@@ -1011,14 +1012,14 @@ where
                 let rx =
                     tasks::invalidation_validator(bg.raw_rx, bg.path_secret_map, bg.broadcast_txs);
                 let task_counter = counter_registry
-                    .register_nominal_task("task.invalidation_validator", "background");
-                local.spawn_receiver_task(
-                    TaskRegistration::new(
+                    .register_nominal_task("task.invalidation_validator", "background")
+                    .with_registration_metadata(
                         "task.invalidation_validator",
                         "Validates invalidation datagrams and fan-outs revocation events",
                         "endpoint::Worker::spawn",
-                    ),
-                    rx,
+                    );
+                local.spawn_receiver_task(
+                    rx.drain_budgeted_metered(None, task_counter.clone()),
                     None,
                     task_counter,
                 );

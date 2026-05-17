@@ -13,7 +13,7 @@ use crate::{
         msg, send, Budgets,
     },
     intrusive::{Entry, Queue},
-    runtime::{ChannelRegistration, Spawner, TaskRegistration},
+    runtime::{ChannelRegistration, Spawner},
     socket::{
         channel::{
             intrusive::{self, unsync},
@@ -150,14 +150,15 @@ pub fn frame_dispatch<S, Clk>(
             priority_list_txs,
             q_router_to_batcher: q_router_to_batcher.clone(),
         };
-        let task_counter = counter_registry.register_task("task.priority_router");
-        spawner.spawn_receiver_task(
-            TaskRegistration::new(
+        let task_counter = counter_registry
+            .register_task("task.priority_router")
+            .with_registration_metadata(
                 "task.priority_router",
                 "Routes submissions into per-priority queues",
                 "endpoint::tasks::frame_dispatch",
-            ),
-            rx,
+            );
+        spawner.spawn_receiver_task(
+            rx.drain_budgeted_metered(Some(budgets.submission_router), task_counter.clone()),
             Some(budgets.submission_router),
             task_counter,
         );
@@ -186,14 +187,15 @@ pub fn frame_dispatch<S, Clk>(
         let rx = Map::new(rx, Entry::new);
         let rx = Paced::new(rx, clock, overall_send_rate);
         let rx = PickTwo::new(rx, worker_senders, rng, &counter_registry);
-        let task_counter = counter_registry.register_task("task.frame_dispatch");
-        spawner.spawn_receiver_task(
-            TaskRegistration::new(
+        let task_counter = counter_registry
+            .register_task("task.frame_dispatch")
+            .with_registration_metadata(
                 "task.frame_dispatch",
                 "Batches, paces, and routes frame batches to worker send sockets",
                 "endpoint::tasks::frame_dispatch",
-            ),
-            rx,
+            );
+        spawner.spawn_receiver_task(
+            rx.drain_budgeted_metered(Some(budgets.frame_dispatch), task_counter.clone()),
             Some(budgets.frame_dispatch),
             task_counter,
         );
@@ -368,15 +370,15 @@ pub fn send_worker<Socket, Clk, WakerSink, AckComp>(
                 q_resolver_to_idle_wheel.clone(),
             ),
         );
-        let task_counter =
-            counter_registry.register_nominal_task("task.context_resolver", &variant);
-        spawner.spawn_receiver_task(
-            TaskRegistration::new(
+        let task_counter = counter_registry
+            .register_nominal_task("task.context_resolver", &variant)
+            .with_registration_metadata(
                 "task.context_resolver",
                 "Resolves frame batches to send contexts and schedules wheels",
                 "endpoint::tasks::send_worker",
-            ),
-            rx,
+            );
+        spawner.spawn_receiver_task(
+            rx.drain_budgeted_metered(Some(budgets.context_resolver), task_counter.clone()),
             Some(budgets.context_resolver),
             task_counter,
         );
@@ -447,14 +449,15 @@ pub fn send_worker<Socket, Clk, WakerSink, AckComp>(
                 q_resolver_to_idle_wheel.clone(),
             ),
         );
-        let task_counter = counter_registry.register_nominal_task("task.ack_processor", &variant);
-        spawner.spawn_receiver_task(
-            TaskRegistration::new(
+        let task_counter = counter_registry
+            .register_nominal_task("task.ack_processor", &variant)
+            .with_registration_metadata(
                 "task.ack_processor",
                 "Processes ACK feedback and re-schedules contexts across wheels",
                 "endpoint::tasks::send_worker",
-            ),
-            rx,
+            );
+        spawner.spawn_receiver_task(
+            rx.drain_budgeted_metered(Some(budgets.ack_processor), task_counter.clone()),
             Some(budgets.ack_processor),
             task_counter,
         );
@@ -471,14 +474,15 @@ pub fn send_worker<Socket, Clk, WakerSink, AckComp>(
 
         let rx = crate::counter::GaugedReceiver::new(completed_rx, q_ack_to_completion);
         let rx = completion_dispatcher(rx, waker_sink);
-        let task_counter = counter_registry.register_nominal_task("task.completion", &variant);
-        spawner.spawn_receiver_task(
-            TaskRegistration::new(
+        let task_counter = counter_registry
+            .register_nominal_task("task.completion", &variant)
+            .with_registration_metadata(
                 "task.completion",
                 "Dispatches completion notifications back to writer wakers",
                 "endpoint::tasks::send_worker",
-            ),
-            rx,
+            );
+        spawner.spawn_receiver_task(
+            rx.drain_budgeted_metered(Some(budgets.completion_acked), task_counter.clone()),
             Some(budgets.completion_acked),
             task_counter,
         );
@@ -495,14 +499,15 @@ pub fn send_worker<Socket, Clk, WakerSink, AckComp>(
 
         let rx = crate::counter::GaugedReceiver::new(cancelled_rx, q_ack_to_cancelled.clone());
         let rx = cancelled_drain(rx);
-        let task_counter = counter_registry.register_nominal_task("task.cancelled", &variant);
-        spawner.spawn_receiver_task(
-            TaskRegistration::new(
+        let task_counter = counter_registry
+            .register_nominal_task("task.cancelled", &variant)
+            .with_registration_metadata(
                 "task.cancelled",
                 "Drains cancelled frames that no longer have an owner",
                 "endpoint::tasks::send_worker",
-            ),
-            rx,
+            );
+        spawner.spawn_receiver_task(
+            rx.drain_budgeted_metered(Some(budgets.completion_cancelled), task_counter.clone()),
             Some(budgets.completion_cancelled),
             task_counter,
         );
@@ -525,8 +530,13 @@ pub fn send_worker<Socket, Clk, WakerSink, AckComp>(
             );
         }
 
-        let task_counter =
-            counter_registry.register_nominal_task("task.tx_wheel", format!("send.{worker_id}"));
+        let task_counter = counter_registry
+            .register_nominal_task("task.tx_wheel", format!("send.{worker_id}"))
+            .with_registration_metadata(
+                "task.tx_wheel",
+                "Drains tx timing wheel and routes expired contexts to assemblers",
+                "endpoint::tasks::send_worker",
+            );
         let tx_wheel_task = wheel_drain::<_, _, _, { crate::time::wheel::MICROSECOND_GRANULARITY }>(
             tx_wheel_rx,
             clock.timer(),
@@ -546,16 +556,7 @@ pub fn send_worker<Socket, Clk, WakerSink, AckComp>(
             budgets.tx_wheel,
             task_counter.clone(),
         );
-        spawner.spawn_named(
-            TaskRegistration::new(
-                "task.tx_wheel",
-                "Drains tx timing wheel and routes expired contexts to assemblers",
-                "endpoint::tasks::send_worker",
-            )
-            .with_budget(Some(budgets.tx_wheel))
-            .with_metric(&task_counter),
-            tx_wheel_task,
-        );
+        spawner.spawn_receiver_task(tx_wheel_task, Some(budgets.tx_wheel), task_counter);
     }
 
     {
@@ -617,15 +618,15 @@ pub fn send_worker<Socket, Clk, WakerSink, AckComp>(
                 q_resolver_to_idle_wheel.clone(),
             ),
         );
-        let task_counter =
-            counter_registry.register_nominal_task("task.pto_wheel", format!("send.{worker_id}"));
-        spawner.spawn_receiver_task(
-            TaskRegistration::new(
+        let task_counter = counter_registry
+            .register_nominal_task("task.pto_wheel", format!("send.{worker_id}"))
+            .with_registration_metadata(
                 "task.pto_wheel",
                 "Handles probe-timeout expirations and wheel re-scheduling",
                 "endpoint::tasks::send_worker",
-            ),
-            rx,
+            );
+        spawner.spawn_receiver_task(
+            rx.drain_budgeted_metered(Some(budgets.pto_wheel), task_counter.clone()),
             Some(budgets.pto_wheel),
             task_counter,
         );
@@ -640,8 +641,13 @@ pub fn send_worker<Socket, Clk, WakerSink, AckComp>(
             "endpoint::tasks::send_worker",
         );
 
-        let task_counter =
-            counter_registry.register_nominal_task("task.idle_wheel", format!("send.{worker_id}"));
+        let task_counter = counter_registry
+            .register_nominal_task("task.idle_wheel", format!("send.{worker_id}"))
+            .with_registration_metadata(
+                "task.idle_wheel",
+                "Expires or re-schedules idle send contexts",
+                "endpoint::tasks::send_worker",
+            );
         let idle_wheel_task = send_idle_wheel_drain(
             idle_wheel_rx,
             idle_wheel_tx.clone(),
@@ -655,16 +661,7 @@ pub fn send_worker<Socket, Clk, WakerSink, AckComp>(
             budgets.idle_wheel,
             task_counter.clone(),
         );
-        spawner.spawn_named(
-            TaskRegistration::new(
-                "task.idle_wheel",
-                "Expires or re-schedules idle send contexts",
-                "endpoint::tasks::send_worker",
-            )
-            .with_budget(Some(budgets.idle_wheel))
-            .with_metric(&task_counter),
-            idle_wheel_task,
-        );
+        spawner.spawn_receiver_task(idle_wheel_task, Some(budgets.idle_wheel), task_counter);
     }
 
     // Per-socket assembler + send tasks.
@@ -727,14 +724,15 @@ pub fn send_worker<Socket, Clk, WakerSink, AckComp>(
         });
         let rx = Map::new(rx, |_segments| {});
         let variant = format!("send.{sender_idx}");
-        let task_counter = counter_registry.register_nominal_task("task.assembler", &variant);
-        spawner.spawn_receiver_task(
-            TaskRegistration::new(
+        let task_counter = counter_registry
+            .register_nominal_task("task.assembler", &variant)
+            .with_registration_metadata(
                 &task_name,
                 "Assembles and sends packets for one socket sender id",
                 "endpoint::tasks::send_worker",
-            ),
-            rx,
+            );
+        spawner.spawn_receiver_task(
+            rx.drain_budgeted_metered(Some(budgets.assembler), task_counter.clone()),
             Some(budgets.assembler),
             task_counter,
         );
@@ -752,14 +750,15 @@ pub fn send_worker<Socket, Clk, WakerSink, AckComp>(
 
         let rx = send_invalidation(invalidation_rx, send_caches, invalidation_completed_tx);
         let variant = format!("send.{worker_id}");
-        let task_counter = counter_registry.register_nominal_task("task.invalidation", &variant);
-        spawner.spawn_receiver_task(
-            TaskRegistration::new(
+        let task_counter = counter_registry
+            .register_nominal_task("task.invalidation", &variant)
+            .with_registration_metadata(
                 "task.invalidation",
                 "Purges revoked path secrets from send cache and emits completions",
                 "endpoint::tasks::send_worker",
-            ),
-            rx,
+            );
+        spawner.spawn_receiver_task(
+            rx.drain_budgeted_metered(Some(budgets.invalidation), task_counter.clone()),
             Some(budgets.invalidation),
             task_counter,
         );
