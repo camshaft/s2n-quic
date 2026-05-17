@@ -683,6 +683,7 @@ impl Drop for TimerGuard<'_> {
 ///   of the next poll
 #[derive(Clone)]
 pub struct Task {
+    registry: Registry,
     registration: Arc<Mutex<TaskRegistrationMetadata>>,
     pub drained: SummaryMetric,
     pub time: Timer,
@@ -732,9 +733,17 @@ impl Task {
         description: impl core::fmt::Display,
         function: impl core::fmt::Display,
     ) -> Self {
-        self.with_registration_name(name)
+        let task = self.with_registration_name(name)
             .with_registration_description(description)
-            .with_registration_function(function)
+            .with_registration_function(function);
+        
+        // Auto-register in topology
+        let registration = task.with_registration_metadata_ref(|name, description, function| {
+            TaskRegistration::new(name, description, function).with_metric(&task)
+        });
+        task.registry.register_task_topology(registration);
+        
+        task
     }
 
     pub fn with_registration_name(self, name: impl core::fmt::Display) -> Self {
@@ -935,10 +944,23 @@ impl QueueGauge {
                     ..Default::default()
                 },
             );
-        QueueSender {
+        let sender = QueueSender {
             queue: self.clone(),
             metric,
-        }
+        };
+        
+        // Auto-register in topology
+        let channel_name = sender.channel_metadata(|name, _, _| name.to_string());
+        let binding = ChannelBinding::new(
+            sender.task_name(),
+            channel_name,
+            ChannelDirection::Sends,
+            sender.description(),
+            sender.function(),
+        );
+        self.registry.register_binding_topology(binding);
+        
+        sender
     }
 
     pub fn receiver(&self, task_name: impl core::fmt::Display) -> QueueReceiver {
@@ -959,10 +981,23 @@ impl QueueGauge {
                     ..Default::default()
                 },
             );
-        QueueReceiver {
+        let receiver = QueueReceiver {
             queue: self.clone(),
             metric,
-        }
+        };
+        
+        // Auto-register in topology
+        let channel_name = receiver.channel_metadata(|name, _, _| name.to_string());
+        let binding = ChannelBinding::new(
+            receiver.task_name(),
+            channel_name,
+            ChannelDirection::Receives,
+            receiver.description(),
+            receiver.function(),
+        );
+        self.registry.register_binding_topology(binding);
+        
+        receiver
     }
 }
 
@@ -1396,9 +1431,9 @@ pub struct Registry {
 /// The registry owns this information and can expose it for runtime introspection (e.g., DOT graphs).
 #[derive(Clone, Default, Debug)]
 pub struct Topology {
-    tasks: Vec<TaskRegistration>,
-    channels: Vec<ChannelRegistration>,
-    bindings: Vec<ChannelBinding>,
+    pub tasks: Vec<TaskRegistration>,
+    pub channels: Vec<ChannelRegistration>,
+    pub bindings: Vec<ChannelBinding>,
 }
 
 impl Registry {
@@ -1629,6 +1664,13 @@ impl Registry {
                 ..Default::default()
             },
         );
+        
+        // Auto-register in topology
+        let registration = gauge.with_registration_metadata_ref(|name, description, function| {
+            ChannelRegistration::new(name, description, function).with_metric(&gauge)
+        });
+        self.register_channel_topology(registration);
+        
         gauges.insert(label, gauge.clone());
         gauge
     }
@@ -1715,6 +1757,13 @@ impl Registry {
                 ..Default::default()
             },
         );
+        
+        // Auto-register in topology
+        let registration = gauge.with_registration_metadata_ref(|name, description, function| {
+            ChannelRegistration::new(name, description, function).with_metric(&gauge)
+        });
+        self.register_channel_topology(registration);
+        
         gauges.insert(key, gauge.clone());
         gauge
     }
@@ -1787,6 +1836,7 @@ impl Registry {
             Task::NEXT_POLL_LATENCY_DESCRIPTION,
         );
         Task {
+            registry: self.clone(),
             registration: Arc::new(Mutex::new(TaskRegistrationMetadata {
                 name: label.clone(),
                 ..Default::default()
@@ -1861,6 +1911,7 @@ impl Registry {
             Task::NEXT_POLL_LATENCY_DESCRIPTION,
         );
         Task {
+            registry: self.clone(),
             registration: Arc::new(Mutex::new(TaskRegistrationMetadata {
                 name: format!("{label}.{variant}"),
                 ..Default::default()

@@ -79,15 +79,15 @@ pub trait Spawner {
 
     /// Convenience helper for pipeline tasks with budget and task counters.
     ///
-    /// Registers the task with both the registry (for topology) and the spawner
-    /// (for runtime introspection), then spawns the task with its name.
+    /// Registers the task with the spawner (for runtime introspection), then spawns
+    /// the task with its name. Task topology registration happens automatically when
+    /// the task counter is created with `with_registration_metadata`.
     #[inline]
     fn spawn_receiver_task<F>(
         &mut self,
         future: F,
         budget: Option<usize>,
         task_counter: counter::Task,
-        registry: &counter::Registry,
     ) where
         F: Future<Output = ()> + 'static,
         Self: Sized,
@@ -98,7 +98,6 @@ pub trait Spawner {
                 .with_metric(&task_counter)
         });
         let task_name = task.name.clone();
-        registry.register_task_topology(task.clone());
         self.register_task(task);
         self.spawn_named(&task_name, future);
     }
@@ -233,10 +232,7 @@ pub mod bach {
         where
             F: Future<Output = ()> + 'static,
         {
-            // Bach doesn't currently support named spawns, but we could add it.
-            // For now, just spawn normally.
-            let _ = name;
-            self.spawn(future);
+            ::bach::task::spawn_named(SendWrapper(future), name);
         }
     }
 
@@ -365,221 +361,21 @@ pub mod tokio {
     }
 }
 
-/// Wrapper runtime that records per-worker task/channel registrations and can emit DOT graphs.
+/// Wrapper runtime that holds spawned futures to keep them alive.
+///
+/// This is a simple container that prevents futures from being dropped.
+/// For topology introspection, use the counter::Registry::topology() method instead.
 pub mod inspector {
-    use super::{
-        ChannelBinding, ChannelDirection, ChannelRegistration, Runtime, Spawner, TaskRegistration,
-    };
-    use std::{
-        collections::BTreeMap,
-        sync::{Arc, Mutex},
-    };
+    use super::{Runtime, Spawner, TaskRegistration};
 
     #[derive(Clone)]
     pub struct Handle<R: Runtime> {
         inner: R,
-        state: Arc<Mutex<State>>,
-    }
-
-    #[derive(Default)]
-    struct State {
-        tasks: Vec<RegisteredTask>,
-        channels: Vec<RegisteredChannel>,
-        channel_bindings: Vec<RegisteredChannelBinding>,
-    }
-
-    #[derive(Clone)]
-    struct RegisteredTask {
-        worker_id: usize,
-        task: TaskRegistration,
-    }
-
-    #[derive(Clone)]
-    struct RegisteredChannel {
-        worker_id: usize,
-        channel: ChannelRegistration,
-    }
-
-    #[derive(Clone)]
-    struct RegisteredChannelBinding {
-        worker_id: usize,
-        binding: ChannelBinding,
     }
 
     impl<R: Runtime> Handle<R> {
         pub fn new(inner: R) -> Self {
-            Self {
-                inner,
-                state: Arc::new(Mutex::new(State::default())),
-            }
-        }
-
-        pub fn to_dot(&self) -> String {
-            let state = self.state.lock().expect("inspector lock poisoned");
-            let mut out = String::from("digraph pipeline {\n  rankdir=LR;\n  compound=true;\n");
-
-            let mut by_worker: BTreeMap<usize, Vec<_>> = BTreeMap::new();
-            for task in &state.tasks {
-                by_worker
-                    .entry(task.worker_id)
-                    .or_default()
-                    .push(task.task.clone());
-            }
-
-            let mut task_node_ids = std::collections::HashMap::new();
-            let mut channel_node_ids = std::collections::HashMap::new();
-            for worker_id in 0..self.inner.worker_count() {
-                out.push_str(&format!("  subgraph cluster_worker_{worker_id} {{\n"));
-                out.push_str(&format!("    label=\"worker {worker_id}\";\n"));
-                if let Some(tasks) = by_worker.get(&worker_id) {
-                    for (idx, task) in tasks.iter().enumerate() {
-                        let node_id = format!("w{worker_id}_t{idx}");
-                        task_node_ids.insert((worker_id, task.name.clone()), node_id.clone());
-                        let budget = task
-                            .budget
-                            .map(|v| v.to_string())
-                            .unwrap_or_else(|| "none".to_string());
-                        let metrics = metric_summary(&task.metrics);
-                        let label = format!(
-                            "{}\\nfn: {}\\nbudget: {}\\nmetrics: {}\\n{}",
-                            task.name, task.function, budget, metrics, task.description
-                        );
-                        out.push_str(&format!(
-                            "    {node_id} [shape=box,label=\"{}\"];\n",
-                            escape_dot(&label)
-                        ));
-                    }
-                }
-                for (idx, channel) in state
-                    .channels
-                    .iter()
-                    .filter(|channel| channel.worker_id == worker_id)
-                    .enumerate()
-                {
-                    let node_id = format!("w{worker_id}_c{idx}");
-                    channel_node_ids
-                        .insert((worker_id, channel.channel.name.clone()), node_id.clone());
-                    let metrics = metric_summary(&channel.channel.metrics);
-                    let label = format!(
-                        "{}\\nfn: {}\\nmetrics: {}\\n{}",
-                        channel.channel.name,
-                        channel.channel.function,
-                        metrics,
-                        channel.channel.description
-                    );
-                    out.push_str(&format!(
-                        "    {node_id} [shape=ellipse,label=\"{}\"];\n",
-                        escape_dot(&label)
-                    ));
-                }
-                out.push_str("  }\n");
-            }
-
-            for binding in &state.channel_bindings {
-                let worker_id = binding.worker_id;
-                let Some(task_node) =
-                    task_node_ids.get(&(worker_id, binding.binding.task_name.clone()))
-                else {
-                    out.push_str(&format!(
-                        "  // unresolved binding on worker {worker_id}: missing task '{}'\n",
-                        binding.binding.task_name
-                    ));
-                    continue;
-                };
-                let Some(channel_node) =
-                    channel_node_ids.get(&(worker_id, binding.binding.channel_name.clone()))
-                else {
-                    out.push_str(&format!(
-                        "  // unresolved binding on worker {worker_id}: missing channel '{}'\n",
-                        binding.binding.channel_name
-                    ));
-                    continue;
-                };
-
-                let (from, to) = if binding.binding.direction == ChannelDirection::Sends {
-                    (task_node, channel_node)
-                } else {
-                    (channel_node, task_node)
-                };
-                let label = format!(
-                    "{}\\nfn: {}\\n{}",
-                    binding.binding.direction,
-                    binding.binding.function,
-                    binding.binding.description
-                );
-                out.push_str(&format!(
-                    "  {from} -> {to} [label=\"{}\"];\n",
-                    escape_dot(&label)
-                ));
-            }
-
-            out.push_str("}\n");
-            out
-        }
-
-        pub fn channel_bindings(&self) -> Vec<String> {
-            let state = self.state.lock().expect("inspector lock poisoned");
-            let mut bindings: Vec<_> = state.channel_bindings.iter().collect();
-            bindings.sort_by(|a, b| {
-                (
-                    a.worker_id,
-                    &a.binding.task_name,
-                    a.binding.direction as u8,
-                    &a.binding.channel_name,
-                )
-                    .cmp(&(
-                        b.worker_id,
-                        &b.binding.task_name,
-                        b.binding.direction as u8,
-                        &b.binding.channel_name,
-                    ))
-            });
-            bindings
-                .into_iter()
-                .map(|entry| {
-                    format!(
-                        "worker {}: task '{}' {} on channel '{}'",
-                        entry.worker_id,
-                        entry.binding.task_name,
-                        entry.binding.direction,
-                        entry.binding.channel_name
-                    )
-                })
-                .collect()
-        }
-    }
-
-    fn escape_dot(input: &str) -> String {
-        input
-            .replace('\\', "\\\\")
-            .replace('"', "\\\"")
-            .replace('\n', "\\n")
-            .replace('\r', "\\r")
-    }
-
-    fn metric_summary(metrics: &[super::MetricRegistration]) -> String {
-        if metrics.is_empty() {
-            "none".to_string()
-        } else {
-            metrics
-                .iter()
-                .map(|metric| {
-                    let variant = metric
-                        .variant
-                        .as_ref()
-                        .map(|variant| format!(" variant={variant}"))
-                        .unwrap_or_default();
-                    let unit = metric
-                        .unit
-                        .map(|unit| format!(" unit={unit}"))
-                        .unwrap_or_default();
-                    format!(
-                        "{} [{}{}{}]: {}",
-                        metric.label, metric.kind, variant, unit, metric.description
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join("\\n")
+            Self { inner }
         }
     }
 
@@ -599,21 +395,14 @@ pub mod inspector {
         where
             F: FnOnce(Self::Spawner<'_>) + Send + 'static,
         {
-            let state = self.state.clone();
             self.inner.spawn_local(worker_id, move |spawner| {
-                f(Local {
-                    inner: spawner,
-                    worker_id,
-                    state,
-                });
+                f(Local { inner: spawner });
             });
         }
     }
 
     pub struct Local<S> {
         inner: S,
-        worker_id: usize,
-        state: Arc<Mutex<State>>,
     }
 
     impl<S: Spawner> Spawner for Local<S> {
@@ -625,17 +414,6 @@ pub mod inspector {
         }
 
         fn register_task(&mut self, task: TaskRegistration) {
-            let mut state = self.state.lock().expect("inspector lock poisoned");
-            if let Some(existing) = state.tasks.iter_mut().find(|existing| {
-                existing.worker_id == self.worker_id && existing.task.name == task.name
-            }) {
-                existing.task = task.clone();
-            } else {
-                state.tasks.push(RegisteredTask {
-                    worker_id: self.worker_id,
-                    task: task.clone(),
-                });
-            }
             self.inner.register_task(task);
         }
     }
@@ -658,36 +436,23 @@ mod tests {
     }
 
     #[test]
-    fn inspector_runtime_emits_dot_with_worker_task_and_channel_metadata() {
+    fn inspector_runtime_simple_wrapper() {
         let rt = inspector::Handle::new(bach::Handle::new(2));
+        assert_eq!(rt.worker_count(), 2);
+        
+        // Inspector is now just a simple wrapper
+        // Topology introspection comes from counter::Registry::topology()
         let counter_registry = crate::counter::Registry::new();
-        let counter_registry_for_worker = counter_registry.clone();
-
-        rt.spawn_local(1, move |mut local| {
-            let producer_counter = counter_registry_for_worker.register_task("task.producer");
-            local.register_task(
-                TaskRegistration::new(
-                    "task.producer",
-                    "Produces work for downstream pipeline stages",
-                    "tests::producer",
-                )
-                .with_budget(Some(32))
-                .with_metric(&producer_counter),
+        let _task = counter_registry
+            .register_task("task.test")
+            .with_registration_metadata(
+                "task.test",
+                "Test task",
+                "tests::test",
             );
-
-            let consumer_counter = counter_registry_for_worker.register_task("task.consumer");
-            local.register_task(
-                TaskRegistration::new(
-                    "task.consumer",
-                    "Consumes work from producer",
-                    "tests::consumer",
-                )
-                .with_metric(&consumer_counter),
-            );
-        });
-
-        insta::assert_snapshot!(rt.to_dot());
-        // Note: Channel binding introspection now goes through counter::Registry topology
-        // instead of spawner. This test now only verifies task registration.
+        
+        let topology = counter_registry.topology();
+        assert_eq!(topology.tasks.len(), 1);
+        assert_eq!(topology.tasks[0].name, "task.test");
     }
 }

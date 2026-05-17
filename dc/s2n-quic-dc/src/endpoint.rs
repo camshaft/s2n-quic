@@ -802,7 +802,6 @@ where
                     rx.drain_budgeted_metered(Some(budgets.socket_recv), task_counter.clone()),
                     Some(budgets.socket_recv),
                     task_counter,
-                    &counter_registry,
                 );
             }
 
@@ -859,7 +858,6 @@ where
                         ),
                         Some(budgets.idle_wheel),
                         task_counter,
-                        &counter_registry,
                     );
                 }
 
@@ -890,7 +888,6 @@ where
                     rx.drain_budgeted_metered(Some(budgets.packet_dispatch), task_counter.clone()),
                     Some(budgets.packet_dispatch),
                     task_counter,
-                    &counter_registry,
                 );
                 let rx = tasks::ack_burst(
                     crate::socket::channel::FlattenList::new(ack_burst_rx.into_list_receiver()),
@@ -909,7 +906,6 @@ where
                     rx.drain_budgeted_metered(Some(budgets.ack_burst), task_counter.clone()),
                     Some(budgets.ack_burst),
                     task_counter,
-                    &counter_registry,
                 );
                 let ack_completion_gauge = counter_registry.register_queue_gauge_nominal(
                     "q.dispatch",
@@ -938,7 +934,6 @@ where
                     rx.drain_budgeted_metered(Some(budgets.ack_completion), task_counter.clone()),
                     Some(budgets.ack_completion),
                     task_counter,
-                    &counter_registry,
                 );
 
                 let rx = tasks::recv_invalidation(rd.invalidation_rx, recv_cache);
@@ -953,7 +948,6 @@ where
                     rx.drain_budgeted_metered(Some(budgets.invalidation), task_counter.clone()),
                     Some(budgets.invalidation),
                     task_counter,
-                    &counter_registry,
                 );
             }
 
@@ -971,7 +965,6 @@ where
                     rx.drain_budgeted_metered(Some(budgets.waker_drain), task_counter.clone()),
                     Some(budgets.waker_drain),
                     task_counter,
-                    &counter_registry,
                 );
             }
 
@@ -989,7 +982,6 @@ where
                     rx.drain_budgeted_metered(None, task_counter.clone()),
                     None,
                     task_counter,
-                    &counter_registry,
                 );
             }
         });
