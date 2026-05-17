@@ -241,8 +241,6 @@ fn is_bolero_fuzzing() -> bool {
 #[cfg(test)]
 #[track_caller]
 fn run_sim_with_snapshot(f: impl FnOnce()) {
-    use tracing_subscriber::fmt::format::FmtSpan;
-
     let location = std::panic::Location::caller();
     let writer = SnapshotWriter::default();
     let format = tracing_subscriber::fmt::format()
@@ -256,7 +254,6 @@ fn run_sim_with_snapshot(f: impl FnOnce()) {
         .add_directive("s2n_quic_dc::metric=trace".parse().unwrap());
     let subscriber = tracing_subscriber::fmt()
         .with_env_filter(env_filter)
-        .with_span_events(FmtSpan::NEW)
         .event_format(format)
         .with_ansi(false)
         .with_writer(writer.clone())
@@ -266,13 +263,9 @@ fn run_sim_with_snapshot(f: impl FnOnce()) {
     tracing::subscriber::with_default(subscriber, || run_sim(f));
 
     let suffix = format!(
-        "sim_{}_{}_{}",
+        "sim_{}_{}",
         location.file().replace(['/', '\\', '.'], "_"),
-        location.line(),
-        std::thread::current()
-            .name()
-            .unwrap_or("unknown")
-            .replace(['/', '\\', '.', ':'], "_")
+        location.line()
     );
     let logs = writer.take_string();
     insta::with_settings!({snapshot_suffix => suffix}, {

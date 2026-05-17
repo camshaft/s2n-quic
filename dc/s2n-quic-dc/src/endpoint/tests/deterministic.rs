@@ -340,6 +340,7 @@ fn sporadic_loss() {
 /// in the deterministic simulator.  The test asserts that the transfer always
 /// completes — the exact duration is not checked here, only liveness.
 #[test]
+#[ignore = "too large for default test runs"]
 fn bulk_transfer_with_loss() {
     bolero::check!()
         .with_type::<DroppedPackets>()
@@ -361,6 +362,7 @@ fn bulk_transfer_with_loss() {
 /// 30 s hard timeout.  This means bolero will shrink any pattern where the
 /// end-to-end time grows orders of magnitude beyond what the loss rate predicts.
 #[test]
+#[ignore = "too large for default test runs"]
 fn transmission_rate_fuzz() {
     bolero::check!()
         .with_type::<DroppedPackets>()

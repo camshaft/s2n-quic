@@ -80,16 +80,24 @@ macro_rules! metric_trace_with_metadata {
     ($metric_id:expr, $metadata:expr, $op:literal, $($arg:tt)*) => {{
         #[cfg(any(test, feature = "metric-tracing"))]
         {
-            let (metric_id, metric_label, metric_variant) =
+            let (_metric_id, metric_label, metric_variant) =
                 metric_trace_fields($metric_id, $metadata);
-            tracing::trace!(
-                target: "s2n_quic_dc::metric",
-                metric_id,
-                metric_label = %metric_label,
-                metric_variant = ?metric_variant,
-                $($arg)*,
-                $op
-            );
+            if let Some(metric_variant) = metric_variant {
+                tracing::trace!(
+                    target: "s2n_quic_dc::metric",
+                    metric_label = %metric_label,
+                    metric_variant = %metric_variant,
+                    $($arg)*,
+                    $op
+                );
+            } else {
+                tracing::trace!(
+                    target: "s2n_quic_dc::metric",
+                    metric_label = %metric_label,
+                    $($arg)*,
+                    $op
+                );
+            }
         }
     }};
 }
@@ -827,38 +835,56 @@ impl TimerGuard<'_> {
             #[cfg(any(test, feature = "testing"))]
             if let Some(bach_start) = self.bach_start {
                 let bach_now = bach::time::Instant::now();
-                let _bach_duration = bach_now.saturating_duration_since(bach_start);
+                let _ = bach_now.saturating_duration_since(bach_start);
+                if let Some(_metric_variant) = &self.metric_variant {
+                    metric_trace!(
+                        metric_label = %self.metric_label,
+                        metric_variant = %_metric_variant,
+                        "timer_guard.record"
+                    );
+                } else {
+                    metric_trace!(metric_label = %self.metric_label, "timer_guard.record");
+                }
+            } else {
+                if let Some(_metric_variant) = &self.metric_variant {
+                    metric_trace!(
+                        metric_label = %self.metric_label,
+                        metric_variant = %_metric_variant,
+                        start = ?self.start,
+                        now = ?now,
+                        duration = ?duration,
+                        "timer_guard.record"
+                    );
+                } else {
+                    metric_trace!(
+                        metric_label = %self.metric_label,
+                        start = ?self.start,
+                        now = ?now,
+                        duration = ?duration,
+                        "timer_guard.record"
+                    );
+                }
+            }
+
+            #[cfg(not(any(test, feature = "testing")))]
+            if let Some(metric_variant) = &self.metric_variant {
                 metric_trace!(
-                    metric_id = self.metric_id,
                     metric_label = %self.metric_label,
-                    metric_variant = ?self.metric_variant,
-                    bach_start = ?bach_start,
-                    bach_now = ?bach_now,
-                    bach_duration = ?_bach_duration,
+                    metric_variant = %metric_variant,
+                    start = ?self.start,
+                    now = ?now,
+                    duration = ?duration,
                     "timer_guard.record"
                 );
             } else {
                 metric_trace!(
-                    metric_id = self.metric_id,
                     metric_label = %self.metric_label,
-                    metric_variant = ?self.metric_variant,
                     start = ?self.start,
                     now = ?now,
                     duration = ?duration,
                     "timer_guard.record"
                 );
             }
-
-            #[cfg(not(any(test, feature = "testing")))]
-            metric_trace!(
-                metric_id = self.metric_id,
-                metric_label = %self.metric_label,
-                metric_variant = ?self.metric_variant,
-                start = ?self.start,
-                now = ?now,
-                duration = ?duration,
-                "timer_guard.record"
-            );
             self.summary.record_duration(duration);
             self.recorded = true;
             now
@@ -875,36 +901,52 @@ impl Drop for TimerGuard<'_> {
                 #[cfg(any(test, feature = "testing"))]
                 if let Some(bach_start) = self.bach_start {
                     let bach_now = bach::time::Instant::now();
-                    let _bach_duration = bach_now.saturating_duration_since(bach_start);
+                    let _ = bach_now.saturating_duration_since(bach_start);
+                    if let Some(_metric_variant) = &self.metric_variant {
+                        metric_trace!(
+                            metric_label = %self.metric_label,
+                            metric_variant = %_metric_variant,
+                            "timer_guard.drop"
+                        );
+                    } else {
+                        metric_trace!(metric_label = %self.metric_label, "timer_guard.drop");
+                    }
+                } else {
+                    if let Some(_metric_variant) = &self.metric_variant {
+                        metric_trace!(
+                            metric_label = %self.metric_label,
+                            metric_variant = %_metric_variant,
+                            start = ?self.start,
+                            duration = ?duration,
+                            "timer_guard.drop"
+                        );
+                    } else {
+                        metric_trace!(
+                            metric_label = %self.metric_label,
+                            start = ?self.start,
+                            duration = ?duration,
+                            "timer_guard.drop"
+                        );
+                    }
+                }
+
+                #[cfg(not(any(test, feature = "testing")))]
+                if let Some(metric_variant) = &self.metric_variant {
                     metric_trace!(
-                        metric_id = self.metric_id,
                         metric_label = %self.metric_label,
-                        metric_variant = ?self.metric_variant,
-                        bach_start = ?bach_start,
-                        bach_now = ?bach_now,
-                        bach_duration = ?_bach_duration,
+                        metric_variant = %metric_variant,
+                        start = ?self.start,
+                        duration = ?duration,
                         "timer_guard.drop"
                     );
                 } else {
                     metric_trace!(
-                        metric_id = self.metric_id,
                         metric_label = %self.metric_label,
-                        metric_variant = ?self.metric_variant,
                         start = ?self.start,
                         duration = ?duration,
                         "timer_guard.drop"
                     );
                 }
-
-                #[cfg(not(any(test, feature = "testing")))]
-                metric_trace!(
-                    metric_id = self.metric_id,
-                    metric_label = %self.metric_label,
-                    metric_variant = ?self.metric_variant,
-                    start = ?self.start,
-                    duration = ?duration,
-                    "timer_guard.drop"
-                );
                 self.summary.record_duration(duration);
             });
         }
