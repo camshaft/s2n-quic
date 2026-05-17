@@ -192,13 +192,7 @@ struct Uptime(tracing_subscriber::fmt::time::SystemTime);
 impl tracing_subscriber::fmt::time::FormatTime for Uptime {
     fn format_time(&self, w: &mut tracing_subscriber::fmt::format::Writer<'_>) -> std::fmt::Result {
         if bach::is_active() {
-            let thread = std::thread::current();
-            let name = thread.name().unwrap_or("");
-            if ["main", ""].contains(&name) {
-                write!(w, "{}", bach::time::Instant::now())
-            } else {
-                write!(w, "{} [{name}]", bach::time::Instant::now())
-            }
+            write!(w, "{}", bach::time::Instant::now())
         } else {
             self.0.format_time(w)
         }
@@ -241,7 +235,14 @@ fn is_bolero_fuzzing() -> bool {
 #[cfg(test)]
 #[track_caller]
 fn run_sim_with_snapshot(f: impl FnOnce()) {
-    let location = std::panic::Location::caller();
+    // Derive a stable snapshot suffix from the test thread name (e.g.
+    // "endpoint::tasks::tests::context_resolver::same_peer_reuses_context")
+    // rather than from the caller file/line, which changes as code moves.
+    let suffix = std::thread::current()
+        .name()
+        .unwrap_or("unknown")
+        .replace([':', '/', '\\', '.', ' '], "_");
+
     let writer = SnapshotWriter::default();
     let format = tracing_subscriber::fmt::format()
         .with_timer(Uptime::default())
@@ -262,12 +263,8 @@ fn run_sim_with_snapshot(f: impl FnOnce()) {
     let _snapshot_mode_guard = SnapshotModeGuard::enter();
     tracing::subscriber::with_default(subscriber, || run_sim(f));
 
-    let suffix = format!(
-        "sim_{}_{}",
-        location.file().replace(['/', '\\', '.'], "_"),
-        location.line()
-    );
     let logs = writer.take_string();
+
     insta::with_settings!({snapshot_suffix => suffix}, {
         insta::assert_snapshot!(logs);
     });

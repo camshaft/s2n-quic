@@ -133,7 +133,7 @@ impl DroppedPackets {
         let end_time: Arc<Mutex<Option<Instant>>> = Arc::new(Mutex::new(None));
         let end_time_inner = end_time.clone();
 
-        sim(|| {
+        without_tracing(|| sim(|| {
             {
                 tracing::info!(
                     packets = ?self,
@@ -240,7 +240,7 @@ impl DroppedPackets {
                 .group("server")
                 .spawn();
             }
-        });
+        }));
 
         let elapsed = end_time.lock().unwrap().unwrap().elapsed_since_start();
         elapsed
@@ -340,7 +340,6 @@ fn sporadic_loss() {
 /// in the deterministic simulator.  The test asserts that the transfer always
 /// completes — the exact duration is not checked here, only liveness.
 #[test]
-#[ignore = "too large for default test runs"]
 fn bulk_transfer_with_loss() {
     bolero::check!()
         .with_type::<DroppedPackets>()
@@ -362,7 +361,6 @@ fn bulk_transfer_with_loss() {
 /// 30 s hard timeout.  This means bolero will shrink any pattern where the
 /// end-to-end time grows orders of magnitude beyond what the loss rate predicts.
 #[test]
-#[ignore = "too large for default test runs"]
 fn transmission_rate_fuzz() {
     bolero::check!()
         .with_type::<DroppedPackets>()
@@ -521,8 +519,7 @@ fn sim_init_uniqueness(actions: &PacketActions, n: usize) {
     tracing::info!("════════════════════════════════════════════════════════════════════");
     tracing::info!(?actions, n, "starting init_uniqueness sim");
 
-    sim(|| {
-        install_init_monitors(actions);
+    without_tracing(|| sim(|| {
 
         // ── Server (primary) ─────────────────────────────────────────────────
         // Accept streams until `n` unique stream IDs have been validated.
@@ -622,7 +619,7 @@ fn sim_init_uniqueness(actions: &PacketActions, n: usize) {
             .group("client")
             .spawn();
         }
-    });
+    }));
 
     // Post-sim assertion: every stream ID in 0..n was accepted exactly once.
     // (The no-duplicate invariant was already checked inline above; this

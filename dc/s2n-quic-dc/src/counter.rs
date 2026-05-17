@@ -82,17 +82,17 @@ macro_rules! metric_trace_with_metadata {
         {
             let (_metric_id, metric_label, metric_variant) =
                 metric_trace_fields($metric_id, $metadata);
-            if let Some(metric_variant) = metric_variant {
+            if let Some(variant) = metric_variant {
                 tracing::trace!(
                     target: "s2n_quic_dc::metric",
-                    metric_label = %metric_label,
-                    metric_variant = %metric_variant,
+                    label = %metric_label,
+                    variant = %variant,
                     $op
                 );
             } else {
                 tracing::trace!(
                     target: "s2n_quic_dc::metric",
-                    metric_label = %metric_label,
+                    label = %metric_label,
                     $op
                 );
             }
@@ -103,18 +103,18 @@ macro_rules! metric_trace_with_metadata {
         {
             let (_metric_id, metric_label, metric_variant) =
                 metric_trace_fields($metric_id, $metadata);
-            if let Some(metric_variant) = metric_variant {
+            if let Some(variant) = metric_variant {
                 tracing::trace!(
                     target: "s2n_quic_dc::metric",
-                    metric_label = %metric_label,
-                    metric_variant = %metric_variant,
+                    label = %metric_label,
+                    variant = %variant,
                     $($arg)*,
                     $op
                 );
             } else {
                 tracing::trace!(
                     target: "s2n_quic_dc::metric",
-                    metric_label = %metric_label,
+                    label = %metric_label,
                     $($arg)*,
                     $op
                 );
@@ -845,20 +845,20 @@ impl TimerGuard<'_> {
             if let Some(bach_start) = self.bach_start {
                 let bach_now = bach::time::Instant::now();
                 let _ = bach_now.saturating_duration_since(bach_start);
-                if let Some(_metric_variant) = &self.metric_variant {
+                if let Some(_v) = &self.metric_variant {
                     metric_trace!(
-                        metric_label = %self.metric_label,
-                        metric_variant = %_metric_variant,
+                        label = %self.metric_label,
+                        variant = %_v,
                         "timer_guard.record"
                     );
                 } else {
-                    metric_trace!(metric_label = %self.metric_label, "timer_guard.record");
+                    metric_trace!(label = %self.metric_label, "timer_guard.record");
                 }
             } else {
-                if let Some(_metric_variant) = &self.metric_variant {
+                if let Some(_v) = &self.metric_variant {
                     metric_trace!(
-                        metric_label = %self.metric_label,
-                        metric_variant = %_metric_variant,
+                        label = %self.metric_label,
+                        variant = %_v,
                         start = ?self.start,
                         now = ?now,
                         duration = ?duration,
@@ -866,7 +866,7 @@ impl TimerGuard<'_> {
                     );
                 } else {
                     metric_trace!(
-                        metric_label = %self.metric_label,
+                        label = %self.metric_label,
                         start = ?self.start,
                         now = ?now,
                         duration = ?duration,
@@ -876,10 +876,10 @@ impl TimerGuard<'_> {
             }
 
             #[cfg(not(any(test, feature = "testing")))]
-            if let Some(metric_variant) = &self.metric_variant {
+            if let Some(_v) = &self.metric_variant {
                 metric_trace!(
-                    metric_label = %self.metric_label,
-                    metric_variant = %metric_variant,
+                    label = %self.metric_label,
+                    variant = %_v,
                     start = ?self.start,
                     now = ?now,
                     duration = ?duration,
@@ -887,7 +887,7 @@ impl TimerGuard<'_> {
                 );
             } else {
                 metric_trace!(
-                    metric_label = %self.metric_label,
+                    label = %self.metric_label,
                     start = ?self.start,
                     now = ?now,
                     duration = ?duration,
@@ -911,27 +911,27 @@ impl Drop for TimerGuard<'_> {
                 if let Some(bach_start) = self.bach_start {
                     let bach_now = bach::time::Instant::now();
                     let _ = bach_now.saturating_duration_since(bach_start);
-                    if let Some(_metric_variant) = &self.metric_variant {
+                    if let Some(_v) = &self.metric_variant {
                         metric_trace!(
-                            metric_label = %self.metric_label,
-                            metric_variant = %_metric_variant,
+                            label = %self.metric_label,
+                            variant = %_v,
                             "timer_guard.drop"
                         );
                     } else {
-                        metric_trace!(metric_label = %self.metric_label, "timer_guard.drop");
+                        metric_trace!(label = %self.metric_label, "timer_guard.drop");
                     }
                 } else {
-                    if let Some(_metric_variant) = &self.metric_variant {
+                    if let Some(_v) = &self.metric_variant {
                         metric_trace!(
-                            metric_label = %self.metric_label,
-                            metric_variant = %_metric_variant,
+                            label = %self.metric_label,
+                            variant = %_v,
                             start = ?self.start,
                             duration = ?duration,
                             "timer_guard.drop"
                         );
                     } else {
                         metric_trace!(
-                            metric_label = %self.metric_label,
+                            label = %self.metric_label,
                             start = ?self.start,
                             duration = ?duration,
                             "timer_guard.drop"
@@ -940,17 +940,17 @@ impl Drop for TimerGuard<'_> {
                 }
 
                 #[cfg(not(any(test, feature = "testing")))]
-                if let Some(metric_variant) = &self.metric_variant {
+                if let Some(_v) = &self.metric_variant {
                     metric_trace!(
-                        metric_label = %self.metric_label,
-                        metric_variant = %metric_variant,
+                        label = %self.metric_label,
+                        variant = %_v,
                         start = ?self.start,
                         duration = ?duration,
                         "timer_guard.drop"
                     );
                 } else {
                     metric_trace!(
-                        metric_label = %self.metric_label,
+                        label = %self.metric_label,
                         start = ?self.start,
                         duration = ?duration,
                         "timer_guard.drop"
