@@ -268,10 +268,10 @@ pub trait ReceiverExt<T>: Receiver<T> + Sized {
         core::future::poll_fn(move |cx| {
             budget.reset();
             let poll_start = Instant::now();
-            if let Some(prev_poll_end) = prev_poll_end {
+            if let Some(prev_end) = prev_poll_end {
                 task_counter
                     .next_poll_latency
-                    .record(poll_start.duration_since(prev_poll_end));
+                    .record(poll_start.duration_since(prev_end));
             }
             let guard = task_counter.time.start_at(poll_start);
             let mut output = Poll::Pending;
