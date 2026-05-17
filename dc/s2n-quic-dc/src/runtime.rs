@@ -40,8 +40,10 @@ impl fmt::Display for MetricKind {
 
 #[derive(Clone, Debug)]
 pub struct MetricRegistration {
-    pub name: String,
+    pub label: String,
+    pub variant: Option<String>,
     pub kind: MetricKind,
+    pub unit: Option<&'static str>,
     pub description: String,
 }
 
@@ -49,10 +51,93 @@ impl MetricRegistration {
     #[inline]
     pub fn new(name: impl fmt::Display, kind: MetricKind, description: impl fmt::Display) -> Self {
         Self {
-            name: name.to_string(),
+            label: name.to_string(),
+            variant: None,
             kind,
+            unit: None,
             description: description.to_string(),
         }
+    }
+
+    #[inline]
+    pub fn with_variant(mut self, variant: impl fmt::Display) -> Self {
+        self.variant = Some(variant.to_string());
+        self
+    }
+
+    #[inline]
+    pub fn with_unit(mut self, unit: &'static str) -> Self {
+        self.unit = Some(unit);
+        self
+    }
+}
+
+pub trait Metric {
+    fn registrations(&self) -> Vec<MetricRegistration>;
+}
+
+impl Metric for counter::Task {
+    fn registrations(&self) -> Vec<MetricRegistration> {
+        let mut drained = MetricRegistration::new(
+            format!("{}.drained", self.label),
+            MetricKind::Summary,
+            "Number of items processed per poll for this task",
+        )
+        .with_unit("count");
+        let mut time = MetricRegistration::new(
+            format!("{}.time", self.label),
+            MetricKind::Timer,
+            "Wall-clock duration spent inside each task poll",
+        )
+        .with_unit("microsecond");
+        let mut next_poll_latency = MetricRegistration::new(
+            format!("{}.next_poll_latency", self.label),
+            MetricKind::Timer,
+            "Wall-clock latency between consecutive task polls",
+        )
+        .with_unit("microsecond");
+        if let Some(variant) = &self.variant {
+            drained = drained.with_variant(variant);
+            time = time.with_variant(variant);
+            next_poll_latency = next_poll_latency.with_variant(variant);
+        }
+        vec![drained, time, next_poll_latency]
+    }
+}
+
+impl Metric for counter::QueueGauge {
+    fn registrations(&self) -> Vec<MetricRegistration> {
+        let mut enqueued = MetricRegistration::new(
+            format!("{}.enq", self.label),
+            MetricKind::Counter,
+            "Total queue enqueue events",
+        )
+        .with_unit("count");
+        let mut dequeued = MetricRegistration::new(
+            format!("{}.drain", self.label),
+            MetricKind::Counter,
+            "Total queue dequeue events",
+        )
+        .with_unit("count");
+        let mut depth = MetricRegistration::new(
+            format!("{}.depth", self.label),
+            MetricKind::Gauge,
+            "Current queue depth",
+        )
+        .with_unit("count");
+        let mut depth_distribution = MetricRegistration::new(
+            format!("{}.depth_dist", self.label),
+            MetricKind::Summary,
+            "Distribution of observed queue depth values",
+        )
+        .with_unit("count");
+        if let Some(variant) = &self.variant {
+            enqueued = enqueued.with_variant(variant);
+            dequeued = dequeued.with_variant(variant);
+            depth = depth.with_variant(variant);
+            depth_distribution = depth_distribution.with_variant(variant);
+        }
+        vec![enqueued, dequeued, depth, depth_distribution]
     }
 }
 
@@ -96,27 +181,48 @@ impl TaskRegistration {
 
     #[inline]
     pub fn with_standard_task_metrics(mut self) -> Self {
-        self.upsert_metric(MetricRegistration::new(
-            format!("{}.drained", self.name),
-            MetricKind::Summary,
-            "Number of items processed per poll for this task",
-        ));
-        self.upsert_metric(MetricRegistration::new(
-            format!("{}.time", self.name),
-            MetricKind::Timer,
-            "Wall-clock duration spent inside each task poll",
-        ));
-        self.upsert_metric(MetricRegistration::new(
-            format!("{}.next_poll_latency", self.name),
-            MetricKind::Timer,
-            "Wall-clock latency between consecutive task polls",
-        ));
+        self.upsert_metric(
+            MetricRegistration::new(
+                format!("{}.drained", self.name),
+                MetricKind::Summary,
+                "Number of items processed per poll for this task",
+            )
+            .with_unit("count"),
+        );
+        self.upsert_metric(
+            MetricRegistration::new(
+                format!("{}.time", self.name),
+                MetricKind::Timer,
+                "Wall-clock duration spent inside each task poll",
+            )
+            .with_unit("microsecond"),
+        );
+        self.upsert_metric(
+            MetricRegistration::new(
+                format!("{}.next_poll_latency", self.name),
+                MetricKind::Timer,
+                "Wall-clock latency between consecutive task polls",
+            )
+            .with_unit("microsecond"),
+        );
+        self
+    }
+
+    #[inline]
+    pub fn with_metric_handle(mut self, metric: &impl Metric) -> Self {
+        for metric in metric.registrations() {
+            self.upsert_metric(metric);
+        }
         self
     }
 
     #[inline]
     fn upsert_metric(&mut self, metric: MetricRegistration) {
-        if let Some(current) = self.metrics.iter_mut().find(|m| m.name == metric.name) {
+        if let Some(current) = self
+            .metrics
+            .iter_mut()
+            .find(|m| m.label == metric.label && m.variant == metric.variant)
+        {
             *current = metric;
         } else {
             self.metrics.push(metric);
@@ -151,6 +257,12 @@ impl ChannelRegistration {
     #[inline]
     pub fn with_metric(mut self, metric: MetricRegistration) -> Self {
         self.metrics.push(metric);
+        self
+    }
+
+    #[inline]
+    pub fn with_metric_handle(mut self, metric: &impl Metric) -> Self {
+        self.metrics.extend(metric.registrations());
         self
     }
 }
@@ -304,7 +416,7 @@ pub trait Spawner {
         Self: Sized,
     {
         use crate::socket::channel::ReceiverExt as _;
-        let task = task.with_budget(budget).with_standard_task_metrics();
+        let task = task.with_budget(budget).with_metric_handle(&task_counter);
         self.spawn_named(task, receiver.drain_budgeted_metered(budget, task_counter));
     }
 }
@@ -717,7 +829,21 @@ pub mod inspector {
         } else {
             metrics
                 .iter()
-                .map(|metric| format!("{} [{}]: {}", metric.name, metric.kind, metric.description))
+                .map(|metric| {
+                    let variant = metric
+                        .variant
+                        .as_ref()
+                        .map(|variant| format!(" variant={variant}"))
+                        .unwrap_or_default();
+                    let unit = metric
+                        .unit
+                        .map(|unit| format!(" unit={unit}"))
+                        .unwrap_or_default();
+                    format!(
+                        "{} [{}{}{}]: {}",
+                        metric.label, metric.kind, variant, unit, metric.description
+                    )
+                })
                 .collect::<Vec<_>>()
                 .join("\\n")
         }

@@ -3,23 +3,23 @@
 
 use crate::{
     endpoint::{
-        self,
+        self, Budgets,
         combinator::{
             AckProcessor, Assembler, AssemblerCounters, BatchFramesByPathSecret,
             CompletionDispatcher, FrameBatch, PathSecretMapEntry, PickTwo,
         },
         dispatch,
         frame::{self, Frame, Priority, PriorityStorage, SubmissionReceiver},
-        msg, send, Budgets,
+        msg, send,
     },
     intrusive::{Entry, Queue},
-    runtime::{ChannelRegistration, MetricKind, MetricRegistration, Spawner, TaskRegistration},
+    runtime::{ChannelRegistration, Spawner, TaskRegistration},
     socket::{
         channel::{
-            intrusive::{self, unsync},
             Budget, Flatten, FlattenList, FlattenSegments, InspectErr, Map, Paced,
             Priority as PriorityRx, Receiver, ReceiverExt as _, RouterAdapter, SocketReceiver,
             SocketSender, UnboundedSender,
+            intrusive::{self, unsync},
         },
         pool::descriptor,
         rate::Rate,
@@ -129,11 +129,7 @@ pub fn frame_dispatch<S, Clk>(
                 "Per-priority unsync queue from priority router to frame dispatch",
                 "endpoint::tasks::frame_dispatch",
             )
-            .with_metric(MetricRegistration::new(
-                format!("q.router_to_batcher.variant=p{i}"),
-                MetricKind::Gauge,
-                "Queue depth for router→batcher lane",
-            )),
+            .with_metric_handle(&q_router_to_batcher[i]),
         );
         spawner.register_channel_sender(
             "task.priority_router",
@@ -288,11 +284,7 @@ pub fn send_worker<Socket, Clk, WakerSink, AckComp>(
             "Send context scheduling channel feeding the tx wheel",
             "endpoint::tasks::send_worker",
         )
-        .with_metric(MetricRegistration::new(
-            format!("q.resolver_to_tx_wheel.variant={variant}"),
-            MetricKind::Gauge,
-            "Queue depth from resolver/ack paths into tx wheel",
-        )),
+        .with_metric_handle(&q_resolver_to_tx_wheel),
     );
     spawner.register_channel_sender(
         "task.context_resolver",
@@ -324,11 +316,7 @@ pub fn send_worker<Socket, Clk, WakerSink, AckComp>(
             "Send context scheduling channel feeding the pto wheel",
             "endpoint::tasks::send_worker",
         )
-        .with_metric(MetricRegistration::new(
-            format!("q.resolver_to_pto_wheel.variant={variant}"),
-            MetricKind::Gauge,
-            "Queue depth from resolver/ack paths into pto wheel",
-        )),
+        .with_metric_handle(&q_resolver_to_pto_wheel),
     );
     spawner.register_channel_sender(
         "task.context_resolver",
@@ -360,11 +348,7 @@ pub fn send_worker<Socket, Clk, WakerSink, AckComp>(
             "Send context scheduling channel feeding the idle wheel",
             "endpoint::tasks::send_worker",
         )
-        .with_metric(MetricRegistration::new(
-            format!("q.resolver_to_idle_wheel.variant={variant}"),
-            MetricKind::Gauge,
-            "Queue depth from resolver/ack paths into idle wheel",
-        )),
+        .with_metric_handle(&q_resolver_to_idle_wheel),
     );
     spawner.register_channel_sender(
         "task.context_resolver",
@@ -396,11 +380,7 @@ pub fn send_worker<Socket, Clk, WakerSink, AckComp>(
             "Completed frame channel from ack/invalidation tasks to completion dispatcher",
             "endpoint::tasks::send_worker",
         )
-        .with_metric(MetricRegistration::new(
-            format!("q.ack_to_completion.variant={variant}"),
-            MetricKind::Gauge,
-            "Queue depth from ack/invalidation to completion dispatcher",
-        )),
+        .with_metric_handle(&q_ack_to_completion),
     );
     spawner.register_channel_sender(
         "task.ack_processor",
@@ -426,11 +406,7 @@ pub fn send_worker<Socket, Clk, WakerSink, AckComp>(
             "Cancelled frame channel drained by cancelled task",
             "endpoint::tasks::send_worker",
         )
-        .with_metric(MetricRegistration::new(
-            format!("q.ack_to_cancelled.variant={variant}"),
-            MetricKind::Gauge,
-            "Queue depth from ack processor to cancelled-frame drain",
-        )),
+        .with_metric_handle(&q_ack_to_cancelled),
     );
     spawner.register_channel_sender(
         "task.ack_processor",
@@ -647,11 +623,7 @@ pub fn send_worker<Socket, Clk, WakerSink, AckComp>(
                 "Per-socket queue from tx wheel to assembler+socket sender task",
                 "endpoint::tasks::send_worker",
             )
-            .with_metric(MetricRegistration::new(
-                format!("q.wheel_to_assembler.variant=send.{sender_idx}"),
-                MetricKind::Gauge,
-                "Queue depth from tx wheel to assembler",
-            )),
+            .with_metric_handle(&gauge),
         );
         spawner.register_channel_sender(
             "task.tx_wheel",

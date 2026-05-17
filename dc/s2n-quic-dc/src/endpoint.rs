@@ -9,7 +9,7 @@ use crate::{
     intrusive::Entry,
     packet,
     socket::{
-        channel::{intrusive::sync as sync_queue, UnboundedSender},
+        channel::{UnboundedSender, intrusive::sync as sync_queue},
         pool::descriptor,
     },
     stream::PendingValidation,
@@ -17,7 +17,7 @@ use crate::{
 };
 use core::time::Duration;
 use s2n_quic_core::time;
-use std::sync::{atomic::AtomicU64, Arc};
+use std::sync::{Arc, atomic::AtomicU64};
 
 pub(crate) mod ack;
 pub(crate) mod assemble;
@@ -724,9 +724,7 @@ where
 
     #[inline]
     fn spawn<R: crate::runtime::Runtime>(self, runtime: &R) {
-        use crate::runtime::{
-            ChannelRegistration, MetricKind, MetricRegistration, Spawner as _, TaskRegistration,
-        };
+        use crate::runtime::{ChannelRegistration, Spawner as _, TaskRegistration};
 
         let Self {
             id,
@@ -840,11 +838,7 @@ where
                         "Recv-context idle wheel queue from packet dispatch to idle drain",
                         "endpoint::Worker::spawn",
                     )
-                    .with_metric(MetricRegistration::new(
-                        format!("q.recv_idle_wheel.variant={variant}"),
-                        MetricKind::Gauge,
-                        "Queue depth from packet dispatch into recv idle wheel",
-                    )),
+                    .with_metric_handle(&q_recv_idle_wheel),
                 );
                 local.register_channel_sender(
                     "task.packet_dispatch",
@@ -945,11 +939,7 @@ where
                         "ACK completion queue from assembler tasks back to recv dispatch worker",
                         "endpoint::Worker::spawn",
                     )
-                    .with_metric(MetricRegistration::new(
-                        format!("q.assembler_to_dispatch.variant=recv.{recv_dispatch_idx}"),
-                        MetricKind::Gauge,
-                        "Queue depth for assembler-to-dispatch ACK completions",
-                    )),
+                    .with_metric_handle(&ack_completion_gauge),
                 );
                 local.register_channel_sender(
                     "task.assembler",

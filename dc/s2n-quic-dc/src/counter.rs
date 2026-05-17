@@ -3,15 +3,15 @@
 
 use core::time::Duration;
 use s2n_quic_dc_metrics::format::{
-    histogram_count_min_max, histogram_value_at_percentile, parse_histogram_buckets,
-    parse_histogram_suffix, ParsedMetricsLine,
+    ParsedMetricsLine, histogram_count_min_max, histogram_value_at_percentile,
+    parse_histogram_buckets, parse_histogram_suffix,
 };
 use std::{
     collections::HashMap,
     net::SocketAddr,
     sync::{
-        atomic::{AtomicI64, Ordering},
         Arc, Mutex,
+        atomic::{AtomicI64, Ordering},
     },
     time::Instant,
 };
@@ -573,6 +573,8 @@ impl Drop for TimerGuard<'_> {
 ///   of the next poll
 #[derive(Clone)]
 pub struct Task {
+    pub(crate) label: String,
+    pub(crate) variant: Option<String>,
     pub drained: Summary,
     pub time: Timer,
     pub next_poll_latency: Timer,
@@ -583,6 +585,8 @@ pub struct Task {
 
 #[derive(Clone)]
 pub struct QueueGauge {
+    pub(crate) label: String,
+    pub(crate) variant: Option<String>,
     pub throughput: Counter,
     pub drain: Counter,
     pub depth: Gauge,
@@ -668,6 +672,8 @@ impl Registry {
                 .register_summary(format!("{label}.depth_dist"), None, Unit::Count);
 
         let gauge = QueueGauge {
+            label: label.clone(),
+            variant: None,
             throughput,
             drain,
             depth: Gauge(depth),
@@ -690,7 +696,7 @@ impl Registry {
             return existing.clone();
         }
 
-        let var = Some(variant);
+        let var = Some(variant.clone());
         let throughput = Counter(
             self.inner
                 .register_counter(format!("{label}.enq"), var.clone()),
@@ -712,6 +718,8 @@ impl Registry {
                 .register_summary(format!("{label}.depth_dist"), var, Unit::Count);
 
         let gauge = QueueGauge {
+            label,
+            variant: Some(variant),
             throughput,
             drain,
             depth: Gauge(depth),
@@ -755,6 +763,8 @@ impl Registry {
     pub fn register_task(&self, label: impl core::fmt::Display) -> Task {
         let label = label.to_string();
         Task {
+            label: label.clone(),
+            variant: None,
             drained: self.register_summary(format!("{label}.drained"), Unit::Count),
             time: self.register_timer(format!("{label}.time")),
             next_poll_latency: self.register_timer(format!("{label}.next_poll_latency")),
@@ -781,6 +791,8 @@ impl Registry {
         let label = label.to_string();
         let variant = variant.to_string();
         Task {
+            label: label.clone(),
+            variant: Some(variant.clone()),
             drained: self.register_nominal_summary(
                 format!("{label}.drained"),
                 &variant,
