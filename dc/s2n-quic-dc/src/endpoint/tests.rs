@@ -20,101 +20,48 @@ fn topology_snapshot_uses_dc_tester_layout() {
         path::secret::map::testing,
         runtime,
         socket::{pool::Pool, rate::Rate},
-        stream::endpoint::{self, socket, WorkerLayout},
+        stream::endpoint::{self, WorkerLayout},
     };
 
-    #[derive(Clone)]
-    struct DummyClock;
-
-    #[derive(Clone)]
-    struct DummyTimer {
-        armed: bool,
+    #[derive(Clone, Copy)]
+    struct PanicSendSocket {
+        addr: std::net::SocketAddr,
     }
 
-    impl s2n_quic_core::time::Clock for DummyClock {
-        fn get_time(&self) -> s2n_quic_core::time::Timestamp {
-            unsafe { s2n_quic_core::time::Timestamp::from_duration(core::time::Duration::ZERO) }
-        }
-    }
-
-    impl crate::time::precision::Clock for DummyClock {
-        type Timer = DummyTimer;
-
-        fn now(&self) -> crate::time::precision::Timestamp {
-            crate::time::precision::Timestamp { nanos: 0 }
+    impl crate::socket::send::Socket for PanicSendSocket {
+        fn send_msg(
+            &self,
+            _addr: &crate::msg::addr::Addr,
+            _payload: &[std::io::IoSlice],
+            _segment_size: u16,
+            _ecn: s2n_quic_core::inet::ExplicitCongestionNotification,
+        ) -> std::io::Result<usize> {
+            panic!("send_msg should not be called by topology snapshot test");
         }
 
-        fn timer(&self) -> Self::Timer {
-            DummyTimer { armed: false }
+        fn local_addr(&self) -> std::io::Result<std::net::SocketAddr> {
+            Ok(self.addr)
         }
     }
 
-    impl crate::time::precision::Timer for DummyTimer {
-        fn now(&self) -> crate::time::precision::Timestamp {
-            crate::time::precision::Timestamp { nanos: 0 }
-        }
+    #[derive(Clone, Copy)]
+    struct PanicRecvSocket {
+        addr: std::net::SocketAddr,
+    }
 
-        async fn sleep_until(&mut self, _target: crate::time::precision::Timestamp) {}
-
-        fn poll_ready(
-            &mut self,
+    impl crate::socket::recv::Socket for PanicRecvSocket {
+        fn poll_recv(
+            &self,
             _cx: &mut core::task::Context,
-        ) -> core::task::Poll<()> {
-            core::task::Poll::Pending
+            _addr: &mut crate::msg::addr::Addr,
+            _cmsg: &mut crate::msg::cmsg::Receiver,
+            _buffer: &mut [std::io::IoSliceMut],
+        ) -> core::task::Poll<std::io::Result<usize>> {
+            panic!("poll_recv should not be called by topology snapshot test");
         }
 
-        fn update(&mut self, _target: crate::time::precision::Timestamp) {
-            self.armed = true;
-        }
-
-        fn cancel(&mut self) {
-            self.armed = false;
-        }
-
-        fn is_armed(&self) -> bool {
-            self.armed
-        }
-    }
-
-    #[derive(Clone)]
-    struct TestRuntime {
-        worker_count: usize,
-        clock: DummyClock,
-    }
-
-    struct Local {
-        worker_id: usize,
-    }
-
-    impl runtime::Spawner for Local {
-        fn spawn<F>(&mut self, _future: F)
-        where
-            F: std::future::Future<Output = ()> + 'static,
-        {
-        }
-
-        fn worker_id(&self) -> usize {
-            self.worker_id
-        }
-    }
-
-    impl runtime::Runtime for TestRuntime {
-        type Clock = DummyClock;
-        type Spawner<'a> = Local;
-
-        fn worker_count(&self) -> usize {
-            self.worker_count
-        }
-
-        fn clock(&self) -> Self::Clock {
-            self.clock.clone()
-        }
-
-        fn spawn_local<F>(&self, worker_id: usize, f: F)
-        where
-            F: FnOnce(Self::Spawner<'_>) + Send + 'static,
-        {
-            f(Local { worker_id });
+        fn local_addr(&self) -> std::io::Result<std::net::SocketAddr> {
+            Ok(self.addr)
         }
     }
 
@@ -128,18 +75,24 @@ fn topology_snapshot_uses_dc_tester_layout() {
         background: ids.next().expect("background worker id should exist"),
     };
 
-    let runtime = TestRuntime {
-        worker_count: layout.background + 1,
-        clock: DummyClock,
-    };
-    let bind_addr = std::net::SocketAddr::new(std::net::Ipv4Addr::UNSPECIFIED.into(), 0);
+    let runtime = runtime::inspector::Handle::new(layout.background + 1);
     let gso = endpoint::Gso::default();
-    let send_sockets = socket::SendConfig::new(64, bind_addr, gso.clone())
-        .busy_poll()
-        .expect("send sockets should be created");
-    let recv_sockets = socket::RecvConfig::new(4, bind_addr)
-        .busy_poll()
-        .expect("recv sockets should be created");
+    let send_sockets = (0..64)
+        .map(|idx| PanicSendSocket {
+            addr: std::net::SocketAddr::new(
+                std::net::Ipv4Addr::LOCALHOST.into(),
+                10_000 + idx as u16,
+            ),
+        })
+        .collect();
+    let recv_sockets = (0..4)
+        .map(|idx| PanicRecvSocket {
+            addr: std::net::SocketAddr::new(
+                std::net::Ipv4Addr::LOCALHOST.into(),
+                20_000 + idx as u16,
+            ),
+        })
+        .collect();
 
     let endpoint = endpoint::setup_endpoint(
         runtime,
@@ -160,7 +113,7 @@ fn topology_snapshot_uses_dc_tester_layout() {
     );
 
     let topology = endpoint.counters.topology();
-    insta::assert_snapshot!(topology.to_dot());
+    insta::assert_snapshot!(topology.to_snapshot());
 }
 
 /// Ping-pong end-to-end test: the client sends "ping" and the server echoes

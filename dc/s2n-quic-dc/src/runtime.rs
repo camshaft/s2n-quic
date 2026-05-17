@@ -86,7 +86,8 @@ pub trait Spawner {
     {
         let worker_id = self.worker_id();
         task_counter.on_spawn(budget, worker_id);
-        let task_name = task_counter.with_registration_metadata_ref(|name, _, _, _| name.to_string());
+        let task_name =
+            task_counter.with_registration_metadata_ref(|name, _, _, _| name.to_string());
         self.spawn_named(&task_name, future);
     }
 }
@@ -377,40 +378,142 @@ pub mod tokio {
 /// Use the counter::Registry::topology() function to get the graph of the pipeline
 /// after using the inspector runtime.
 pub mod inspector {
+    use crate::time::precision;
     use std::future::Future;
-    use std::pin::Pin;
-    use std::sync::{Arc, Mutex};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
 
-    /// Inspector that holds futures to prevent them from being dropped.
+    /// Inspector runtime for topology introspection.
+    ///
+    /// Spawned tasks are recorded without being executed.
     #[derive(Clone)]
     pub struct Handle {
-        futures: Arc<Mutex<Vec<Pin<Box<dyn Future<Output = ()> + Send>>>>>,
+        worker_count: usize,
+        clock: Clock,
+        futures: Arc<AtomicUsize>,
+    }
+
+    /// Simple clock for inspector runtime.
+    #[derive(Clone, Debug, Default)]
+    pub struct Clock;
+
+    /// Simple timer for inspector runtime.
+    #[derive(Clone, Debug, Default)]
+    pub struct Timer {
+        armed: bool,
+    }
+
+    pub struct Local {
+        worker_id: usize,
+        futures: Arc<AtomicUsize>,
     }
 
     impl Handle {
-        pub fn new() -> Self {
+        pub fn new(worker_count: usize) -> Self {
             Self {
-                futures: Arc::new(Mutex::new(Vec::new())),
+                worker_count: worker_count.max(1),
+                clock: Clock,
+                futures: Arc::new(AtomicUsize::new(0)),
             }
         }
 
         /// Spawn a future and hold it to prevent it from being dropped.
         pub fn spawn<F>(&self, future: F)
         where
-            F: Future<Output = ()> + Send + 'static,
+            F: Future<Output = ()> + 'static,
         {
-            self.futures.lock().unwrap().push(Box::pin(future));
+            self.futures.fetch_add(1, Ordering::Relaxed);
+            drop(future);
         }
 
         /// Get the number of futures currently held.
         pub fn future_count(&self) -> usize {
-            self.futures.lock().unwrap().len()
+            self.futures.load(Ordering::Relaxed)
         }
     }
 
     impl Default for Handle {
         fn default() -> Self {
-            Self::new()
+            Self::new(1)
+        }
+    }
+
+    impl super::Spawner for Local {
+        fn spawn<F>(&mut self, future: F)
+        where
+            F: Future<Output = ()> + 'static,
+        {
+            self.futures.fetch_add(1, Ordering::Relaxed);
+            drop(future);
+        }
+
+        fn worker_id(&self) -> usize {
+            self.worker_id
+        }
+    }
+
+    impl super::Runtime for Handle {
+        type Clock = Clock;
+        type Spawner<'a> = Local;
+
+        fn worker_count(&self) -> usize {
+            self.worker_count
+        }
+
+        fn clock(&self) -> Self::Clock {
+            self.clock.clone()
+        }
+
+        fn spawn_local<F>(&self, worker_id: usize, f: F)
+        where
+            F: FnOnce(Self::Spawner<'_>) + Send + 'static,
+        {
+            f(Local {
+                worker_id,
+                futures: self.futures.clone(),
+            });
+        }
+    }
+
+    impl s2n_quic_core::time::Clock for Clock {
+        fn get_time(&self) -> s2n_quic_core::time::Timestamp {
+            unsafe { s2n_quic_core::time::Timestamp::from_duration(core::time::Duration::ZERO) }
+        }
+    }
+
+    impl precision::Clock for Clock {
+        type Timer = Timer;
+
+        fn now(&self) -> precision::Timestamp {
+            precision::Timestamp { nanos: 0 }
+        }
+
+        fn timer(&self) -> Self::Timer {
+            Timer { armed: false }
+        }
+    }
+
+    impl precision::Timer for Timer {
+        fn now(&self) -> precision::Timestamp {
+            precision::Timestamp { nanos: 0 }
+        }
+
+        async fn sleep_until(&mut self, _target: precision::Timestamp) {}
+
+        fn poll_ready(&mut self, _cx: &mut core::task::Context) -> core::task::Poll<()> {
+            core::task::Poll::Pending
+        }
+
+        fn update(&mut self, _target: precision::Timestamp) {
+            self.armed = true;
+        }
+
+        fn cancel(&mut self) {
+            self.armed = false;
+        }
+
+        fn is_armed(&self) -> bool {
+            self.armed
         }
     }
 }
@@ -433,14 +536,14 @@ mod tests {
 
     #[test]
     fn inspector_holds_futures() {
-        let inspector = inspector::Handle::new();
+        let inspector = inspector::Handle::new(1);
         assert_eq!(inspector.future_count(), 0);
-        
+
         // Spawn some futures
         inspector.spawn(async {});
         inspector.spawn(async {});
         inspector.spawn(async {});
-        
+
         assert_eq!(inspector.future_count(), 3);
     }
 }
