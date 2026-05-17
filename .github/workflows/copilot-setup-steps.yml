@@ -12,6 +12,8 @@ on:
 jobs:
   copilot-setup-steps:
     runs-on: ubuntu-latest
+    env:
+      CARGO_INSTA_VERSION: "1.47.2"
     permissions:
       contents: read
     steps:
@@ -23,8 +25,8 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cargo/bin/cargo-insta
-          key: ${{ runner.os }}-cargo-insta-v1
+          key: ${{ runner.os }}-cargo-insta-${{ env.CARGO_INSTA_VERSION }}
 
       - name: Install cargo-insta
         if: steps.cache-cargo-insta.outputs.cache-hit != 'true'
-        run: cargo install cargo-insta --locked
+        run: cargo install cargo-insta --locked --version "$CARGO_INSTA_VERSION"
