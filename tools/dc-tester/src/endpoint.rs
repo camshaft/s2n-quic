@@ -83,7 +83,8 @@ pub fn create(
         recv_sockets,
     );
     if print_pipeline_dot {
-        eprintln!("{}", inspector.to_dot());
+        println!("{}", inspector.to_dot());
+        eprintln!("pipeline channel bindings:");
         for binding in inspector.channel_bindings() {
             eprintln!("{binding}");
         }

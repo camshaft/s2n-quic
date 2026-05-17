@@ -1,7 +1,7 @@
 // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use super::helpers::{test_entry, CollectingSender, RecvContextBuilder, TestReceiverExt};
+use super::helpers::{test_entry, RecvContextBuilder, TestReceiverExt};
 use crate::{
     credentials,
     endpoint::{
@@ -9,6 +9,7 @@ use crate::{
         recv, send, tasks,
     },
     intrusive::Entry,
+    socket::channel::intrusive::unsync,
     testing::{ext::*, sim},
     time::{bach::Clock, precision},
 };
@@ -100,13 +101,14 @@ fn send_invalidation_purges_cache_and_emits_failed_frames() {
         }
 
         let id = *pse.id();
-        let (cancelled_tx, collected) = CollectingSender::<Entry<Frame>>::new();
+        let (cancelled_tx, mut collected_rx) = unsync::new::<Frame>();
 
         let invalidation_rx = super::helpers::TestReceiver::new(vec![Entry::from(id)]);
         let mut rx = tasks::send_invalidation(invalidation_rx, send_caches.clone(), cancelled_tx);
 
         async move {
             rx.recv().await;
+            drop(rx);
 
             assert_eq!(
                 send_caches[0].borrow().context_count(),
@@ -114,11 +116,17 @@ fn send_invalidation_purges_cache_and_emits_failed_frames() {
                 "cache should be empty after invalidation"
             );
 
-            let frames = collected.borrow();
-            assert_eq!(frames.len(), 1, "one frame should have been emitted");
+            let frame = collected_rx
+                .recv()
+                .await
+                .expect("one frame should have been emitted");
             assert_eq!(
-                frames[0].status,
+                frame.status,
                 frame::TransmissionStatus::Failed(frame::FailureReason::UnknownPathSecret),
+            );
+            assert!(
+                collected_rx.recv().await.is_none(),
+                "only one failed frame should be emitted"
             );
         }
         .primary()
@@ -132,20 +140,24 @@ fn send_invalidation_noop_for_unknown_id() {
         let SendSetup { send_caches, .. } = setup_send();
 
         let fake_id = credentials::Id::from([0xAA; 16]);
-        let (cancelled_tx, collected) = CollectingSender::<Entry<Frame>>::new();
+        let (cancelled_tx, mut collected_rx) = unsync::new::<Frame>();
 
         let invalidation_rx = super::helpers::TestReceiver::new(vec![Entry::from(fake_id)]);
         let mut rx = tasks::send_invalidation(invalidation_rx, send_caches.clone(), cancelled_tx);
 
         async move {
             rx.recv().await;
+            drop(rx);
 
             assert_eq!(
                 send_caches[0].borrow().context_count(),
                 1,
                 "unrelated context should remain"
             );
-            assert!(collected.borrow().is_empty(), "no frames should be emitted");
+            assert!(
+                collected_rx.recv().await.is_none(),
+                "no frames should be emitted"
+            );
         }
         .primary()
         .spawn();
@@ -194,6 +206,75 @@ fn recv_invalidation_preserves_unrelated_entries() {
                 2,
                 "unrelated entries should be preserved"
             );
+        }
+        .primary()
+        .spawn();
+    });
+}
+
+#[test]
+fn ack_completion_after_recv_invalidation_does_not_resurrect_context() {
+    sim(|| {
+        let (recv_cache, id) = setup_recv();
+
+        let submission = {
+            let ctx = recv_cache.borrow().senders.values().next().unwrap().clone();
+            let c = ctx.borrow();
+            crate::endpoint::ack::state::Submission {
+                body: bytes::Bytes::from_static(&[1]),
+                largest_recv_time: precision::Clock::now(&Clock::default()),
+                has_ecn: false,
+                path_secret_entry: c.path_entry.clone(),
+                local_sender_id: c.dest_sender_id,
+                remote_sender_id: c.remote_sender_id,
+                recv_worker_id: 0,
+            }
+        };
+
+        let invalidation_rx = super::helpers::TestReceiver::new(vec![Entry::from(id)]);
+        let mut invalidation = tasks::recv_invalidation(invalidation_rx, recv_cache.clone());
+
+        let completion_rx = super::helpers::TestReceiver::new(vec![Entry::new(
+            crate::endpoint::msg::Sender::PendingAck(submission),
+        )]);
+        let (sender, mut collected) = unsync::new::<crate::endpoint::msg::Sender>();
+        let counters =
+            crate::endpoint::counters::Dispatch::new(&crate::counter::Registry::default());
+        let mut completion = tasks::ack_completion(completion_rx, recv_cache.clone(), sender, counters);
+
+        async move {
+            invalidation.recv().await;
+            completion.recv().await;
+            drop(completion);
+            assert!(recv_cache.borrow().senders.is_empty());
+            assert!(collected.recv().await.is_none());
+        }
+        .primary()
+        .spawn();
+    });
+}
+
+#[test]
+fn ack_burst_after_recv_invalidation_emits_nothing() {
+    sim(|| {
+        let (recv_cache, id) = setup_recv();
+        let ctx = recv_cache.borrow().senders.values().next().unwrap().clone();
+
+        let invalidation_rx = super::helpers::TestReceiver::new(vec![Entry::from(id)]);
+        let mut invalidation = tasks::recv_invalidation(invalidation_rx, recv_cache.clone());
+
+        let ack_burst_rx = super::helpers::TestReceiver::new(vec![ctx]);
+        let (sender, mut collected) = unsync::new::<crate::endpoint::msg::Sender>();
+        let counters =
+            crate::endpoint::counters::Dispatch::new(&crate::counter::Registry::default());
+        let mut ack_burst = tasks::ack_burst(ack_burst_rx, sender, 0, counters);
+
+        async move {
+            invalidation.recv().await;
+            ack_burst.recv().await;
+            drop(ack_burst);
+            assert!(recv_cache.borrow().senders.is_empty());
+            assert!(collected.recv().await.is_none());
         }
         .primary()
         .spawn();

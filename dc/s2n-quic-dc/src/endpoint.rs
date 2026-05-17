@@ -894,7 +894,7 @@ where
                     rd.frame_tx,
                     rd.ack_sender.clone(),
                     rd.queue_dispatcher,
-                    rd.counters,
+                    rd.counters.clone(),
                     rd.clock,
                     rd.route,
                     rd.waker_sink,
@@ -916,6 +916,7 @@ where
                     crate::socket::channel::FlattenList::new(ack_burst_rx.into_list_receiver()),
                     rd.ack_sender.clone(),
                     recv_dispatch_idx,
+                    rd.counters.clone(),
                 );
                 let task_counter =
                     counter_registry.register_nominal_task("task.ack_burst", &variant);
@@ -955,8 +956,12 @@ where
                 );
                 let ack_completion_rx =
                     crate::counter::GaugedReceiver::new(rd.ack_completion_rx, ack_completion_gauge);
-                let rx =
-                    tasks::ack_completion(ack_completion_rx, recv_cache.clone(), rd.ack_sender);
+                let rx = tasks::ack_completion(
+                    ack_completion_rx,
+                    recv_cache.clone(),
+                    rd.ack_sender,
+                    rd.counters.clone(),
+                );
                 let task_counter =
                     counter_registry.register_nominal_task("task.ack_completion", &variant);
                 local.spawn_receiver_task(

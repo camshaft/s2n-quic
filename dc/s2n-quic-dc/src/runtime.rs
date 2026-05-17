@@ -84,66 +84,55 @@ impl Metric for MetricRegistration {
 
 impl Metric for counter::Task {
     fn registrations(&self) -> Vec<MetricRegistration> {
-        let mut drained = MetricRegistration::new(
-            format!("{}.drained", self.label),
-            MetricKind::Summary,
-            counter::Task::DRAINED_DESCRIPTION,
-        )
-        .with_unit(counter::Task::DRAINED_UNIT);
-        let mut time = MetricRegistration::new(
-            format!("{}.time", self.label),
-            MetricKind::Timer,
-            counter::Task::TIME_DESCRIPTION,
-        )
-        .with_unit(counter::Task::TIME_UNIT);
-        let mut next_poll_latency = MetricRegistration::new(
-            format!("{}.next_poll_latency", self.label),
-            MetricKind::Timer,
-            counter::Task::NEXT_POLL_LATENCY_DESCRIPTION,
-        )
-        .with_unit(counter::Task::NEXT_POLL_LATENCY_UNIT);
-        if let Some(variant) = &self.variant {
-            drained = drained.with_variant(variant);
-            time = time.with_variant(variant);
-            next_poll_latency = next_poll_latency.with_variant(variant);
-        }
-        vec![drained, time, next_poll_latency]
+        self.metrics()
+            .into_iter()
+            .map(|metric| {
+                let mut registration = MetricRegistration::new(
+                    metric.label,
+                    match metric.kind {
+                        counter::MetricKind::Counter => MetricKind::Counter,
+                        counter::MetricKind::Gauge => MetricKind::Gauge,
+                        counter::MetricKind::Summary => MetricKind::Summary,
+                        counter::MetricKind::Timer => MetricKind::Timer,
+                    },
+                    metric.description,
+                );
+                if let Some(variant) = metric.variant {
+                    registration = registration.with_variant(variant);
+                }
+                if let Some(unit) = metric.unit {
+                    registration = registration.with_unit(unit);
+                }
+                registration
+            })
+            .collect()
     }
 }
 
 impl Metric for counter::QueueGauge {
     fn registrations(&self) -> Vec<MetricRegistration> {
-        let mut enqueued = MetricRegistration::new(
-            format!("{}.enq", self.label),
-            MetricKind::Counter,
-            counter::QueueGauge::ENQUEUED_DESCRIPTION,
-        )
-        .with_unit(counter::QueueGauge::ENQUEUED_UNIT);
-        let mut dequeued = MetricRegistration::new(
-            format!("{}.drain", self.label),
-            MetricKind::Counter,
-            counter::QueueGauge::DEQUEUED_DESCRIPTION,
-        )
-        .with_unit(counter::QueueGauge::DEQUEUED_UNIT);
-        let mut depth = MetricRegistration::new(
-            format!("{}.depth", self.label),
-            MetricKind::Gauge,
-            counter::QueueGauge::DEPTH_DESCRIPTION,
-        )
-        .with_unit(counter::QueueGauge::DEPTH_UNIT);
-        let mut depth_distribution = MetricRegistration::new(
-            format!("{}.depth_dist", self.label),
-            MetricKind::Summary,
-            counter::QueueGauge::DEPTH_DISTRIBUTION_DESCRIPTION,
-        )
-        .with_unit(counter::QueueGauge::DEPTH_DISTRIBUTION_UNIT);
-        if let Some(variant) = &self.variant {
-            enqueued = enqueued.with_variant(variant);
-            dequeued = dequeued.with_variant(variant);
-            depth = depth.with_variant(variant);
-            depth_distribution = depth_distribution.with_variant(variant);
-        }
-        vec![enqueued, dequeued, depth, depth_distribution]
+        self.metrics()
+            .into_iter()
+            .map(|metric| {
+                let mut registration = MetricRegistration::new(
+                    metric.label,
+                    match metric.kind {
+                        counter::MetricKind::Counter => MetricKind::Counter,
+                        counter::MetricKind::Gauge => MetricKind::Gauge,
+                        counter::MetricKind::Summary => MetricKind::Summary,
+                        counter::MetricKind::Timer => MetricKind::Timer,
+                    },
+                    metric.description,
+                );
+                if let Some(variant) = metric.variant {
+                    registration = registration.with_variant(variant);
+                }
+                if let Some(unit) = metric.unit {
+                    registration = registration.with_unit(unit);
+                }
+                registration
+            })
+            .collect()
     }
 }
 
@@ -227,8 +216,23 @@ impl ChannelRegistration {
 
     #[inline]
     pub fn with_metric(mut self, metric: &impl Metric) -> Self {
-        self.metrics.extend(metric.registrations());
+        for metric in metric.registrations() {
+            self.upsert_metric(metric);
+        }
         self
+    }
+
+    #[inline]
+    fn upsert_metric(&mut self, metric: MetricRegistration) {
+        if let Some(current) = self
+            .metrics
+            .iter_mut()
+            .find(|m| m.label == metric.label && m.variant == metric.variant)
+        {
+            *current = metric;
+        } else {
+            self.metrics.push(metric);
+        }
     }
 }
 
@@ -358,7 +362,7 @@ pub trait Spawner {
         ));
     }
 
-    /// Spawn a !Send future and register metadata for the task.
+    /// Register task metadata and spawn a future by delegating to [`Spawner::spawn`].
     #[inline]
     fn spawn_named<F>(&mut self, task: TaskRegistration, future: F)
     where
@@ -383,6 +387,22 @@ pub trait Spawner {
         use crate::socket::channel::ReceiverExt as _;
         let task = task.with_budget(budget).with_metric(&task_counter);
         self.spawn_named(task, receiver.drain_budgeted_metered(budget, task_counter));
+    }
+
+    /// Convenience helper that derives task registration metadata from the task counter handle.
+    #[inline]
+    fn spawn_counter_task<R>(&mut self, receiver: R, budget: Option<usize>, task_counter: counter::Task)
+    where
+        R: channel::Receiver<()> + 'static,
+        Self: Sized,
+    {
+        let (name, description, function) = task_counter.registration_metadata();
+        self.spawn_receiver_task(
+            TaskRegistration::new(name, description, function),
+            receiver,
+            budget,
+            task_counter,
+        );
     }
 }
 
@@ -735,11 +755,19 @@ pub mod inspector {
                 let Some(task_node) =
                     task_node_ids.get(&(worker_id, binding.binding.task_name.clone()))
                 else {
+                    out.push_str(&format!(
+                        "  // unresolved binding on worker {worker_id}: missing task '{}'\n",
+                        binding.binding.task_name
+                    ));
                     continue;
                 };
                 let Some(channel_node) =
                     channel_node_ids.get(&(worker_id, binding.binding.channel_name.clone()))
                 else {
+                    out.push_str(&format!(
+                        "  // unresolved binding on worker {worker_id}: missing channel '{}'\n",
+                        binding.binding.channel_name
+                    ));
                     continue;
                 };
 
@@ -766,9 +794,23 @@ pub mod inspector {
 
         pub fn channel_bindings(&self) -> Vec<String> {
             let state = self.state.lock().expect("inspector lock poisoned");
-            let mut bindings: Vec<_> = state
-                .channel_bindings
-                .iter()
+            let mut bindings: Vec<_> = state.channel_bindings.iter().collect();
+            bindings.sort_by(|a, b| {
+                (
+                    a.worker_id,
+                    &a.binding.task_name,
+                    a.binding.direction as u8,
+                    &a.binding.channel_name,
+                )
+                    .cmp(&(
+                        b.worker_id,
+                        &b.binding.task_name,
+                        b.binding.direction as u8,
+                        &b.binding.channel_name,
+                    ))
+            });
+            bindings
+                .into_iter()
                 .map(|entry| {
                     format!(
                         "worker {}: task '{}' {} on channel '{}'",
@@ -778,14 +820,16 @@ pub mod inspector {
                         entry.binding.channel_name
                     )
                 })
-                .collect();
-            bindings.sort();
-            bindings
+                .collect()
         }
     }
 
     fn escape_dot(input: &str) -> String {
-        input.replace('\\', "\\\\").replace('"', "\\\"")
+        input
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('\n', "\\n")
+            .replace('\r', "\\r")
     }
 
     fn metric_summary(metrics: &[super::MetricRegistration]) -> String {
@@ -856,26 +900,32 @@ pub mod inspector {
         }
 
         fn register_task(&mut self, task: TaskRegistration) {
-            self.state
-                .lock()
-                .expect("inspector lock poisoned")
-                .tasks
-                .push(RegisteredTask {
+            let mut state = self.state.lock().expect("inspector lock poisoned");
+            if let Some(existing) = state.tasks.iter_mut().find(|existing| {
+                existing.worker_id == self.worker_id && existing.task.name == task.name
+            }) {
+                existing.task = task.clone();
+            } else {
+                state.tasks.push(RegisteredTask {
                     worker_id: self.worker_id,
                     task: task.clone(),
                 });
+            }
             self.inner.register_task(task);
         }
 
         fn register_channel(&mut self, channel: ChannelRegistration) {
-            self.state
-                .lock()
-                .expect("inspector lock poisoned")
-                .channels
-                .push(RegisteredChannel {
+            let mut state = self.state.lock().expect("inspector lock poisoned");
+            if let Some(existing) = state.channels.iter_mut().find(|existing| {
+                existing.worker_id == self.worker_id && existing.channel.name == channel.name
+            }) {
+                existing.channel = channel.clone();
+            } else {
+                state.channels.push(RegisteredChannel {
                     worker_id: self.worker_id,
                     channel: channel.clone(),
                 });
+            }
             self.inner.register_channel(channel);
         }
 
