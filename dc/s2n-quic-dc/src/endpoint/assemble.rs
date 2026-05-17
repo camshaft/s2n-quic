@@ -121,12 +121,13 @@ where
             // the segment is registered in the inflight map.
             let mut probe_from_pn: Option<PacketNumber> = None;
 
-            // When there is no data in the inflight map and no RTT sample is already
-            // pending, mark the next ACK-only packet as ack-eliciting so the peer
-            // sends us an ACK we can use to update the RTT estimator. This keeps the
-            // RTT estimate fresh in read-heavy scenarios where we only send ACKs.
-            let rtt_sample_needed =
-                !context.inflight.has_inflight() && !context.rtt_tracker.is_pending();
+            // When there is no data in the inflight map, make this ACK-only
+            // packet ack-eliciting so the peer sends us an ACK we can use to
+            // update the RTT estimator. We call rtt_tracker.on_sent on every
+            // such send: on_sent updates `latest` each time while keeping
+            // `stable` fixed at the oldest unacknowledged PN, so the tracker
+            // always has a fallback sample even if the most recent send is lost.
+            let rtt_sample_needed = !context.inflight.has_inflight();
 
             // Phase 1: drain direct ACK submissions (from pending_acks queue).
             // Each entry carries an already-encoded ACK body from recv worker; stamp

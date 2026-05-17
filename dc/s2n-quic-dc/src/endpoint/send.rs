@@ -188,63 +188,85 @@ impl PendingAcks {
 ///
 /// When there is no data in the inflight map, RTT samples cannot be obtained from
 /// normal ACK processing because no ack-eliciting packets are outstanding. This
-/// tracker enables the assembler to occasionally make an ACK-only packet
-/// ack-eliciting (acting like a PING), records when it was sent, and then updates
-/// the RTT estimator when the peer acknowledges that packet.
+/// tracker enables the assembler to make every ACK-only packet ack-eliciting (acting
+/// like a PING), records send times, and then updates the RTT estimator when the
+/// peer acknowledges one of those packets.
 ///
-/// At most one sample is outstanding at a time. A new sample is requested only
-/// when the inflight map is empty *and* no sample is already pending. This
-/// prevents the sender from flooding the peer with ack-eliciting ACK-only packets
-/// while still keeping the RTT estimate fresh during sustained read-heavy periods.
+/// Two slots mirror the design in `s2n_quic_core::ack::transmission::Set`:
+///
+/// - **`stable`** — the *oldest* ack-eliciting ACK-only transmission that has not yet
+///   been acknowledged. Set once and held fixed until the peer ACKs it or loss is
+///   declared. Acts as a reliable fallback RTT sample if newer sends are dropped.
+///
+/// - **`latest`** — the *most recent* ack-eliciting ACK-only transmission. Updated on
+///   every send so the RTT sample is as fresh as possible.
+///
+/// On each assembly round `on_sent` is called with the current packet number.
+/// `latest` is always updated; `stable` is set only when it is `None`. This
+/// ensures that even if multiple packets are in flight at once (due to pipelining
+/// or delayed ACKs) we always have a stable baseline packet to fall back on.
 ///
 /// The tracker is also cleared whenever a data-carrying packet is inserted into
 /// the inflight map, because those packets will produce RTT samples on their own.
 #[derive(Debug, Default)]
 pub(crate) struct AckRttTracker {
-    /// The packet number and send time of the outstanding ack-eliciting ACK-only
-    /// packet. `None` when no sample is pending.
-    pending: Option<(VarInt, Timestamp)>,
+    /// Oldest pending ack-eliciting ACK-only transmission.
+    /// Set once; not replaced until acknowledged or declared lost.
+    stable: Option<(VarInt, Timestamp)>,
+    /// Most recently sent ack-eliciting ACK-only transmission.
+    /// Updated on every ack-eliciting ACK-only send.
+    latest: Option<(VarInt, Timestamp)>,
 }
 
 impl AckRttTracker {
-    /// Returns `true` when an ack-eliciting ACK-only packet is outstanding and
-    /// we have not yet received the corresponding RTT sample.
+    /// Returns `true` when at least one ack-eliciting ACK-only packet is
+    /// outstanding (i.e., `stable` has been set but not yet consumed).
     #[inline]
     pub fn is_pending(&self) -> bool {
-        self.pending.is_some()
+        self.stable.is_some()
     }
 
     /// Called just before an ack-eliciting ACK-only packet is sent.
     ///
-    /// Records `(packet_number, time_sent)` so `check_range` can match the
-    /// incoming ACK and compute an RTT sample.
+    /// Always updates `latest`. Sets `stable` only when it is `None`, so `stable`
+    /// always refers to the oldest unacknowledged ack-eliciting transmission.
     #[inline]
     pub fn on_sent(&mut self, packet_number: VarInt, time_sent: Timestamp) {
-        self.pending = Some((packet_number, time_sent));
+        self.latest = Some((packet_number, time_sent));
+        if self.stable.is_none() {
+            self.stable = Some((packet_number, time_sent));
+        }
     }
 
-    /// Clear the pending sample.
+    /// Clear both slots.
     ///
     /// Called when a data-carrying packet is inserted into the inflight map.
     /// In that case the tracker is no longer needed because RTT samples will
     /// arrive via the normal inflight ACK path.
     #[inline]
     pub fn clear(&mut self) {
-        self.pending = None;
+        self.stable = None;
+        self.latest = None;
     }
 
-    /// Check whether a single ACK range covers the pending PN.
+    /// Check whether a single ACK range covers either the `latest` or `stable` PN.
     ///
-    /// `start` and `end` are the inclusive VarInt bounds of the acknowledged
-    /// range, and `largest_acknowledged` is the overall largest PN in the ACK
-    /// frame (used for loss detection).
+    /// `start` and `end` are the inclusive VarInt bounds of the acknowledged range,
+    /// and `largest_acknowledged` is the overall largest PN in the ACK frame (used
+    /// for loss detection).
     ///
-    /// Returns `Some(time_sent)` when the pending PN is covered, allowing the
-    /// caller to compute and record an RTT sample. In that case the tracker is
-    /// cleared. If the pending PN is strictly less than `largest_acknowledged`
-    /// but not covered by `[start, end]`, the ack-eliciting ACK packet was
-    /// probably dropped; the tracker is also cleared so a fresh sample can be
-    /// requested on the next ACK-only send.
+    /// **When `latest` is covered:** returns its `time_sent`, clears both slots.
+    /// This gives the freshest possible RTT sample.
+    ///
+    /// **When `stable` is covered (but `latest` is not):** returns `stable`'s
+    /// `time_sent`, advances `stable ← latest` (promoting `latest` to the stable
+    /// position for future fallback). This handles the case where the most recent
+    /// send was dropped but an older one was acknowledged.
+    ///
+    /// **Loss detection:** if `largest_acknowledged` is strictly greater than a
+    /// slot's PN and that slot is not in the current range, the slot is considered
+    /// lost. `latest` is cleared; if `stable` is declared lost, it is advanced to
+    /// `latest` (which may also be `None` if both are lost).
     #[inline]
     pub fn check_range(
         &mut self,
@@ -252,17 +274,40 @@ impl AckRttTracker {
         end: VarInt,
         largest_acknowledged: VarInt,
     ) -> Option<Timestamp> {
-        let (pn, time_sent) = self.pending?;
-        if pn >= start && pn <= end {
-            self.pending = None;
-            return Some(time_sent);
+        // Check latest first — fresher sample is preferable.
+        if let Some((pn, time_sent)) = self.latest {
+            if pn >= start && pn <= end {
+                // Latest ACKed → clear both and return the fresh sample.
+                self.stable = None;
+                self.latest = None;
+                return Some(time_sent);
+            }
         }
-        // Loss heuristic: if the peer has acknowledged a PN strictly beyond
-        // ours but our PN is not in this range, the ack-eliciting ACK-only
-        // packet was likely dropped. Clear so we can request a new sample.
-        if largest_acknowledged > pn {
-            self.pending = None;
+
+        // Fall back to stable.
+        if let Some((pn, time_sent)) = self.stable {
+            if pn >= start && pn <= end {
+                // Stable ACKed → advance stable to latest so the next ACK
+                // can produce a fresher sample; clear latest.
+                self.stable = self.latest.take();
+                return Some(time_sent);
+            }
         }
+
+        // Loss detection: declare slots lost when the peer has acknowledged
+        // a PN strictly beyond them but they are not in this range.
+        if let Some((pn, _)) = self.latest {
+            if largest_acknowledged > pn {
+                self.latest = None;
+            }
+        }
+        if let Some((pn, _)) = self.stable {
+            if largest_acknowledged > pn {
+                // Advance stable to whatever latest holds (may be None).
+                self.stable = self.latest.take();
+            }
+        }
+
         None
     }
 }
