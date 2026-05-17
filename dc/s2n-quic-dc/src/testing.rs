@@ -197,6 +197,7 @@ fn run_sim(f: impl FnOnce()) {
     rt.run(f);
 }
 
+#[cfg(test)]
 fn is_tracing_disabled() -> bool {
     TRACING_DISABLED_DEPTH.with(|depth| depth.get() > 0)
 }

@@ -640,6 +640,7 @@ impl Timer {
             metric_trace!(metric_id = self.metric_id, start = ?start, "timer.start_at");
             TimerGuard {
                 summary: &self.summary,
+                #[cfg(any(test, feature = "metric-tracing"))]
                 metric_id: self.metric_id,
                 start,
                 recorded: false,
@@ -701,6 +702,7 @@ impl SummaryMetric {
 
 pub struct TimerGuard<'a> {
     summary: &'a Summary,
+    #[cfg(any(test, feature = "metric-tracing"))]
     metric_id: MetricId,
     start: Instant,
     recorded: bool,
@@ -1052,8 +1054,8 @@ impl QueueGauge {
     pub fn dequeue(&self) {
         with_metric_span!("queue.dequeue", {
             self.drain.add(1);
-            let depth = self.depth.sub(1).max(0) as u64;
-            metric_trace!(depth, "queue.dequeue");
+            let _depth = self.depth.sub(1).max(0) as u64;
+            metric_trace!(depth = _depth, "queue.dequeue");
         });
     }
 
@@ -1061,8 +1063,8 @@ impl QueueGauge {
     pub fn dequeue_n(&self, count: u64) {
         with_metric_span!("queue.dequeue_n", {
             self.drain.add(count);
-            let depth = self.depth.sub(count as i64).max(0) as u64;
-            metric_trace!(count, depth, "queue.dequeue_n");
+            let _depth = self.depth.sub(count as i64).max(0) as u64;
+            metric_trace!(count, depth = _depth, "queue.dequeue_n");
         });
     }
 }
