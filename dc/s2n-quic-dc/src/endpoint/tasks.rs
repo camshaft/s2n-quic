@@ -13,7 +13,7 @@ use crate::{
         msg, send, Budgets,
     },
     intrusive::{Entry, Queue},
-    runtime::{ChannelRegistration, Spawner},
+    runtime::Spawner,
     socket::{
         channel::{
             intrusive::{self, unsync},
@@ -120,28 +120,26 @@ pub fn frame_dispatch<S, Clk>(
         tx.into_list_sender()
     });
     let q_router_to_batcher: [_; Priority::LEVELS] = core::array::from_fn(|i| {
-        counter_registry.register_queue_gauge_nominal("q.router_to_batcher", format_args!("p{i}"))
-    });
-    for i in 0..Priority::LEVELS {
-        spawner.register_channel(
-            ChannelRegistration::new(
+        counter_registry
+            .register_queue_gauge_nominal("q.router_to_batcher", format_args!("p{i}"))
+            .with_registration_metadata(
                 format!("ch.router_to_batcher.p{i}"),
                 "Per-priority unsync queue from priority router to frame dispatch",
                 "endpoint::tasks::frame_dispatch",
             )
-            .with_metric(&q_router_to_batcher[i]),
-        );
+    });
+    for i in 0..Priority::LEVELS {
+        spawner.register_queue_channel(&q_router_to_batcher[i]);
     }
 
     {
         // Task 1: fixed-cost priority routing.
         for i in 0..Priority::LEVELS {
-            spawner.register_channel_sender(
-                "task.priority_router",
-                format!("ch.router_to_batcher.p{i}"),
-                "Priority router emits per-lane frame queues",
-                "endpoint::tasks::frame_dispatch",
-            );
+            let sender = q_router_to_batcher[i]
+                .sender("task.priority_router")
+                .with_description("Priority router emits per-lane frame queues")
+                .with_function("endpoint::tasks::frame_dispatch");
+            spawner.register_queue_sender(&sender);
         }
 
         let rx = FrameReceiver {
@@ -167,19 +165,21 @@ pub fn frame_dispatch<S, Clk>(
     {
         // Task 2: batch → Entry → priority merge → pace → pick-two to workers.
         for i in 0..Priority::LEVELS {
-            spawner.register_channel_receiver(
-                "task.frame_dispatch",
-                format!("ch.router_to_batcher.p{i}"),
-                "Frame dispatch drains per-lane queues",
-                "endpoint::tasks::frame_dispatch",
-            );
+            let receiver = q_router_to_batcher[i]
+                .receiver("task.frame_dispatch")
+                .with_description("Frame dispatch drains per-lane queues")
+                .with_function("endpoint::tasks::frame_dispatch");
+            spawner.register_queue_receiver(&receiver);
         }
 
         let priority_batch_rxs = priority_batch_rxs
             .into_iter()
             .zip(q_router_to_batcher)
             .map(|(rx, gauge)| {
-                crate::counter::GaugedQueueReceiver::new(rx.into_list_receiver(), gauge)
+                crate::counter::GaugedQueueReceiver::new(
+                    rx.into_list_receiver(),
+                    gauge.receiver("task.frame_dispatch"),
+                )
             })
             .collect();
         let rx = PriorityRx::new(priority_batch_rxs);
@@ -292,67 +292,54 @@ pub fn send_worker<Socket, Clk, WakerSink, AckComp>(
     let q_ack_to_cancelled =
         counter_registry.register_queue_gauge_nominal("q.ack_to_cancelled", &variant);
     let (cancelled_tx, cancelled_rx) = unsync::new::<Frame>();
-    spawner.register_channel(
-        ChannelRegistration::new(
-            format!("ch.resolver_to_tx_wheel.{variant}"),
-            "Send context scheduling channel feeding the tx wheel",
-            "endpoint::tasks::send_worker",
-        )
-        .with_metric(&q_resolver_to_tx_wheel),
+    let q_resolver_to_tx_wheel = q_resolver_to_tx_wheel.with_registration_metadata(
+        format!("ch.resolver_to_tx_wheel.{variant}"),
+        "Send context scheduling channel feeding the tx wheel",
+        "endpoint::tasks::send_worker",
     );
-    spawner.register_channel(
-        ChannelRegistration::new(
-            format!("ch.resolver_to_pto_wheel.{variant}"),
-            "Send context scheduling channel feeding the pto wheel",
-            "endpoint::tasks::send_worker",
-        )
-        .with_metric(&q_resolver_to_pto_wheel),
+    let q_resolver_to_pto_wheel = q_resolver_to_pto_wheel.with_registration_metadata(
+        format!("ch.resolver_to_pto_wheel.{variant}"),
+        "Send context scheduling channel feeding the pto wheel",
+        "endpoint::tasks::send_worker",
     );
-    spawner.register_channel(
-        ChannelRegistration::new(
-            format!("ch.resolver_to_idle_wheel.{variant}"),
-            "Send context scheduling channel feeding the idle wheel",
-            "endpoint::tasks::send_worker",
-        )
-        .with_metric(&q_resolver_to_idle_wheel),
+    let q_resolver_to_idle_wheel = q_resolver_to_idle_wheel.with_registration_metadata(
+        format!("ch.resolver_to_idle_wheel.{variant}"),
+        "Send context scheduling channel feeding the idle wheel",
+        "endpoint::tasks::send_worker",
     );
-    spawner.register_channel(
-        ChannelRegistration::new(
-            format!("ch.ack_to_completion.{variant}"),
-            "Completed frame channel from ack/invalidation tasks to completion dispatcher",
-            "endpoint::tasks::send_worker",
-        )
-        .with_metric(&q_ack_to_completion),
+    let q_ack_to_completion = q_ack_to_completion.with_registration_metadata(
+        format!("ch.ack_to_completion.{variant}"),
+        "Completed frame channel from ack/invalidation tasks to completion dispatcher",
+        "endpoint::tasks::send_worker",
     );
-    spawner.register_channel(
-        ChannelRegistration::new(
-            format!("ch.ack_to_cancelled.{variant}"),
-            "Cancelled frame channel drained by cancelled task",
-            "endpoint::tasks::send_worker",
-        )
-        .with_metric(&q_ack_to_cancelled),
+    let q_ack_to_cancelled = q_ack_to_cancelled.with_registration_metadata(
+        format!("ch.ack_to_cancelled.{variant}"),
+        "Cancelled frame channel drained by cancelled task",
+        "endpoint::tasks::send_worker",
     );
+    spawner.register_queue_channel(&q_resolver_to_tx_wheel);
+    spawner.register_queue_channel(&q_resolver_to_pto_wheel);
+    spawner.register_queue_channel(&q_resolver_to_idle_wheel);
+    spawner.register_queue_channel(&q_ack_to_completion);
+    spawner.register_queue_channel(&q_ack_to_cancelled);
 
     {
         // Task 1: context resolver — drain batch_rx, resolve to context, push frames.
-        spawner.register_channel_sender(
-            "task.context_resolver",
-            format!("ch.resolver_to_tx_wheel.{variant}"),
-            "Context resolver schedules transmission work",
-            "endpoint::tasks::send_worker",
-        );
-        spawner.register_channel_sender(
-            "task.context_resolver",
-            format!("ch.resolver_to_pto_wheel.{variant}"),
-            "Context resolver schedules PTO checks",
-            "endpoint::tasks::send_worker",
-        );
-        spawner.register_channel_sender(
-            "task.context_resolver",
-            format!("ch.resolver_to_idle_wheel.{variant}"),
-            "Context resolver tracks idle expiry",
-            "endpoint::tasks::send_worker",
-        );
+        let tx_wheel_sender = q_resolver_to_tx_wheel
+            .sender("task.context_resolver")
+            .with_description("Context resolver schedules transmission work")
+            .with_function("endpoint::tasks::send_worker");
+        let pto_wheel_sender = q_resolver_to_pto_wheel
+            .sender("task.context_resolver")
+            .with_description("Context resolver schedules PTO checks")
+            .with_function("endpoint::tasks::send_worker");
+        let idle_wheel_sender = q_resolver_to_idle_wheel
+            .sender("task.context_resolver")
+            .with_description("Context resolver tracks idle expiry")
+            .with_function("endpoint::tasks::send_worker");
+        spawner.register_queue_sender(&tx_wheel_sender);
+        spawner.register_queue_sender(&pto_wheel_sender);
+        spawner.register_queue_sender(&idle_wheel_sender);
 
         let rx = context_resolver(
             batch_rx,
@@ -360,15 +347,9 @@ pub fn send_worker<Socket, Clk, WakerSink, AckComp>(
             sender_idx_to_local.clone(),
             total_sender_ids,
             clock.clone(),
-            crate::counter::GaugedSender::new(tx_wheel_tx.clone(), q_resolver_to_tx_wheel.clone()),
-            crate::counter::GaugedSender::new(
-                pto_wheel_tx.clone(),
-                q_resolver_to_pto_wheel.clone(),
-            ),
-            crate::counter::GaugedSender::new(
-                idle_wheel_tx.clone(),
-                q_resolver_to_idle_wheel.clone(),
-            ),
+            crate::counter::GaugedSender::new(tx_wheel_tx.clone(), tx_wheel_sender),
+            crate::counter::GaugedSender::new(pto_wheel_tx.clone(), pto_wheel_sender),
+            crate::counter::GaugedSender::new(idle_wheel_tx.clone(), idle_wheel_sender),
         );
         let task_counter = counter_registry
             .register_nominal_task("task.context_resolver", &variant)
@@ -386,44 +367,38 @@ pub fn send_worker<Socket, Clk, WakerSink, AckComp>(
 
     {
         // Task 2: ACK processor — decode, update CCA/RTT, detect loss, reschedule.
-        spawner.register_channel_sender(
-            "task.ack_processor",
-            format!("ch.resolver_to_tx_wheel.{variant}"),
-            "ACK processor re-schedules transmission work",
-            "endpoint::tasks::send_worker",
-        );
-        spawner.register_channel_sender(
-            "task.ack_processor",
-            format!("ch.resolver_to_pto_wheel.{variant}"),
-            "ACK processor updates PTO scheduling",
-            "endpoint::tasks::send_worker",
-        );
-        spawner.register_channel_sender(
-            "task.ack_processor",
-            format!("ch.resolver_to_idle_wheel.{variant}"),
-            "ACK processor updates idle scheduling",
-            "endpoint::tasks::send_worker",
-        );
-        spawner.register_channel_sender(
-            "task.ack_processor",
-            format!("ch.ack_to_completion.{variant}"),
-            "ACK processor emits completed frames",
-            "endpoint::tasks::send_worker",
-        );
-        spawner.register_channel_sender(
-            "task.ack_processor",
-            format!("ch.ack_to_cancelled.{variant}"),
-            "ACK processor emits cancelled frames",
-            "endpoint::tasks::send_worker",
-        );
+        let tx_wheel_sender = q_resolver_to_tx_wheel
+            .sender("task.ack_processor")
+            .with_description("ACK processor re-schedules transmission work")
+            .with_function("endpoint::tasks::send_worker");
+        let pto_wheel_sender = q_resolver_to_pto_wheel
+            .sender("task.ack_processor")
+            .with_description("ACK processor updates PTO scheduling")
+            .with_function("endpoint::tasks::send_worker");
+        let idle_wheel_sender = q_resolver_to_idle_wheel
+            .sender("task.ack_processor")
+            .with_description("ACK processor updates idle scheduling")
+            .with_function("endpoint::tasks::send_worker");
+        let completion_sender = q_ack_to_completion
+            .sender("task.ack_processor")
+            .with_description("ACK processor emits completed frames")
+            .with_function("endpoint::tasks::send_worker");
+        let cancelled_sender = q_ack_to_cancelled
+            .sender("task.ack_processor")
+            .with_description("ACK processor emits cancelled frames")
+            .with_function("endpoint::tasks::send_worker");
+        spawner.register_queue_sender(&tx_wheel_sender);
+        spawner.register_queue_sender(&pto_wheel_sender);
+        spawner.register_queue_sender(&idle_wheel_sender);
+        spawner.register_queue_sender(&completion_sender);
+        spawner.register_queue_sender(&cancelled_sender);
 
         let send_caches_for_ack = send_caches.clone();
         let sender_idx_to_local_for_ack = sender_idx_to_local.clone();
         let send_counters = endpoint::counters::Send::new(&counter_registry);
-        let completed_tx =
-            crate::counter::GaugedSender::new(completed_tx, q_ack_to_completion.clone());
+        let completed_tx = crate::counter::GaugedSender::new(completed_tx, completion_sender);
         let cancelled_tx_for_ack =
-            crate::counter::GaugedSender::new(cancelled_tx.clone(), q_ack_to_cancelled.clone());
+            crate::counter::GaugedSender::new(cancelled_tx.clone(), cancelled_sender);
         let rx = AckProcessor::new(
             ack_rx,
             send_caches_for_ack,
@@ -439,15 +414,9 @@ pub fn send_worker<Socket, Clk, WakerSink, AckComp>(
         let rx = Flatten::new(rx);
         let rx = send::WheelRouter::new(
             rx,
-            crate::counter::GaugedSender::new(tx_wheel_tx.clone(), q_resolver_to_tx_wheel.clone()),
-            crate::counter::GaugedSender::new(
-                pto_wheel_tx.clone(),
-                q_resolver_to_pto_wheel.clone(),
-            ),
-            crate::counter::GaugedSender::new(
-                idle_wheel_tx.clone(),
-                q_resolver_to_idle_wheel.clone(),
-            ),
+            crate::counter::GaugedSender::new(tx_wheel_tx.clone(), tx_wheel_sender),
+            crate::counter::GaugedSender::new(pto_wheel_tx.clone(), pto_wheel_sender),
+            crate::counter::GaugedSender::new(idle_wheel_tx.clone(), idle_wheel_sender),
         );
         let task_counter = counter_registry
             .register_nominal_task("task.ack_processor", &variant)
@@ -465,14 +434,13 @@ pub fn send_worker<Socket, Clk, WakerSink, AckComp>(
 
     {
         // Task 3: Completion dispatcher — batches completed frames by channel, one lock per batch.
-        spawner.register_channel_receiver(
-            "task.completion",
-            format!("ch.ack_to_completion.{variant}"),
-            "Completion task drains completed frames",
-            "endpoint::tasks::send_worker",
-        );
+        let completion_receiver = q_ack_to_completion
+            .receiver("task.completion")
+            .with_description("Completion task drains completed frames")
+            .with_function("endpoint::tasks::send_worker");
+        spawner.register_queue_receiver(&completion_receiver);
 
-        let rx = crate::counter::GaugedReceiver::new(completed_rx, q_ack_to_completion);
+        let rx = crate::counter::GaugedReceiver::new(completed_rx, completion_receiver);
         let rx = completion_dispatcher(rx, waker_sink);
         let task_counter = counter_registry
             .register_nominal_task("task.completion", &variant)
@@ -490,14 +458,13 @@ pub fn send_worker<Socket, Clk, WakerSink, AckComp>(
 
     {
         // Task 4: Cancelled frame drain — drops frames whose writer is already gone.
-        spawner.register_channel_receiver(
-            "task.cancelled",
-            format!("ch.ack_to_cancelled.{variant}"),
-            "Cancelled task drains cancelled frames",
-            "endpoint::tasks::send_worker",
-        );
+        let cancelled_receiver = q_ack_to_cancelled
+            .receiver("task.cancelled")
+            .with_description("Cancelled task drains cancelled frames")
+            .with_function("endpoint::tasks::send_worker");
+        spawner.register_queue_receiver(&cancelled_receiver);
 
-        let rx = crate::counter::GaugedReceiver::new(cancelled_rx, q_ack_to_cancelled.clone());
+        let rx = crate::counter::GaugedReceiver::new(cancelled_rx, cancelled_receiver);
         let rx = cancelled_drain(rx);
         let task_counter = counter_registry
             .register_nominal_task("task.cancelled", &variant)
@@ -515,19 +482,17 @@ pub fn send_worker<Socket, Clk, WakerSink, AckComp>(
 
     {
         // Task 5: TX wheel drain — routes expired contexts to per-socket assembler channels.
-        spawner.register_channel_receiver(
-            "task.tx_wheel",
-            format!("ch.resolver_to_tx_wheel.{variant}"),
-            "Tx wheel drains scheduled contexts",
-            "endpoint::tasks::send_worker",
-        );
+        let tx_wheel_receiver = q_resolver_to_tx_wheel
+            .receiver("task.tx_wheel")
+            .with_description("Tx wheel drains scheduled contexts")
+            .with_function("endpoint::tasks::send_worker");
+        spawner.register_queue_receiver(&tx_wheel_receiver);
         for sender_idx in send_sockets.iter().map(|socket| socket.sender_idx) {
-            spawner.register_channel_sender(
-                "task.tx_wheel",
-                format!("ch.wheel_to_assembler.send.{sender_idx}"),
-                "Tx wheel routes expired contexts to socket assembler",
-                "endpoint::tasks::send_worker",
-            );
+            let wheel_to_assembler_sender = q_wheel_to_assembler[sender_idx_to_local[sender_idx]]
+                .sender("task.tx_wheel")
+                .with_description("Tx wheel routes expired contexts to socket assembler")
+                .with_function("endpoint::tasks::send_worker");
+            spawner.register_queue_sender(&wheel_to_assembler_sender);
         }
 
         let task_counter = counter_registry
@@ -546,7 +511,9 @@ pub fn send_worker<Socket, Clk, WakerSink, AckComp>(
                 let mut socket_context_txs: Vec<_> = socket_context_txs
                     .into_iter()
                     .zip(q_wheel_to_assembler.iter().cloned())
-                    .map(|(tx, gauge)| crate::counter::GaugedSender::new(tx, gauge))
+                    .map(|(tx, gauge)| {
+                        crate::counter::GaugedSender::new(tx, gauge.sender("task.tx_wheel"))
+                    })
                     .collect();
                 move |context: Rc<RefCell<send::Context>>| {
                     let local_id = sender_idx_to_local[context.borrow().sender_idx];
@@ -561,35 +528,31 @@ pub fn send_worker<Socket, Clk, WakerSink, AckComp>(
 
     {
         // Task 6: PTO wheel drain — fires probes for tail loss recovery.
-        spawner.register_channel_receiver(
-            "task.pto_wheel",
-            format!("ch.resolver_to_pto_wheel.{variant}"),
-            "PTO wheel drains scheduled contexts",
-            "endpoint::tasks::send_worker",
-        );
-        spawner.register_channel_sender(
-            "task.pto_wheel",
-            format!("ch.resolver_to_tx_wheel.{variant}"),
-            "PTO wheel requests probe transmissions",
-            "endpoint::tasks::send_worker",
-        );
-        spawner.register_channel_sender(
-            "task.pto_wheel",
-            format!("ch.resolver_to_pto_wheel.{variant}"),
-            "PTO wheel re-enqueues contexts after timeout processing",
-            "endpoint::tasks::send_worker",
-        );
-        spawner.register_channel_sender(
-            "task.pto_wheel",
-            format!("ch.resolver_to_idle_wheel.{variant}"),
-            "PTO wheel updates idle scheduling",
-            "endpoint::tasks::send_worker",
-        );
+        let pto_wheel_receiver = q_resolver_to_pto_wheel
+            .receiver("task.pto_wheel")
+            .with_description("PTO wheel drains scheduled contexts")
+            .with_function("endpoint::tasks::send_worker");
+        let tx_wheel_sender = q_resolver_to_tx_wheel
+            .sender("task.pto_wheel")
+            .with_description("PTO wheel requests probe transmissions")
+            .with_function("endpoint::tasks::send_worker");
+        let pto_wheel_sender = q_resolver_to_pto_wheel
+            .sender("task.pto_wheel")
+            .with_description("PTO wheel re-enqueues contexts after timeout processing")
+            .with_function("endpoint::tasks::send_worker");
+        let idle_wheel_sender = q_resolver_to_idle_wheel
+            .sender("task.pto_wheel")
+            .with_description("PTO wheel updates idle scheduling")
+            .with_function("endpoint::tasks::send_worker");
+        spawner.register_queue_receiver(&pto_wheel_receiver);
+        spawner.register_queue_sender(&tx_wheel_sender);
+        spawner.register_queue_sender(&pto_wheel_sender);
+        spawner.register_queue_sender(&idle_wheel_sender);
 
         let wheel: crate::time::wheel::Wheel<_, _, _> =
             crate::time::wheel::Wheel::new(pto_wheel_rx.into_list_receiver(), clock.timer());
         let rx = FlattenList::new(wheel);
-        let rx = crate::counter::GaugedReceiver::new(rx, q_resolver_to_pto_wheel.clone());
+        let rx = crate::counter::GaugedReceiver::new(rx, pto_wheel_receiver);
         let clock_for_pto = clock.clone();
         let tx_pto_check = counter_registry.register("tx.pto_check");
         let tx_pto_requested = counter_registry.register("tx.pto_requested");
@@ -608,15 +571,9 @@ pub fn send_worker<Socket, Clk, WakerSink, AckComp>(
         });
         let rx = send::WheelRouter::new(
             rx,
-            crate::counter::GaugedSender::new(tx_wheel_tx.clone(), q_resolver_to_tx_wheel.clone()),
-            crate::counter::GaugedSender::new(
-                pto_wheel_tx.clone(),
-                q_resolver_to_pto_wheel.clone(),
-            ),
-            crate::counter::GaugedSender::new(
-                idle_wheel_tx.clone(),
-                q_resolver_to_idle_wheel.clone(),
-            ),
+            crate::counter::GaugedSender::new(tx_wheel_tx.clone(), tx_wheel_sender),
+            crate::counter::GaugedSender::new(pto_wheel_tx.clone(), pto_wheel_sender),
+            crate::counter::GaugedSender::new(idle_wheel_tx.clone(), idle_wheel_sender),
         );
         let task_counter = counter_registry
             .register_nominal_task("task.pto_wheel", format!("send.{worker_id}"))
@@ -634,12 +591,11 @@ pub fn send_worker<Socket, Clk, WakerSink, AckComp>(
 
     {
         // Task 7: Idle wheel drain — reclaims resources for idle connections.
-        spawner.register_channel_receiver(
-            "task.idle_wheel",
-            format!("ch.resolver_to_idle_wheel.{variant}"),
-            "Idle wheel drains scheduled contexts",
-            "endpoint::tasks::send_worker",
-        );
+        let idle_wheel_receiver = q_resolver_to_idle_wheel
+            .receiver("task.idle_wheel")
+            .with_description("Idle wheel drains scheduled contexts")
+            .with_function("endpoint::tasks::send_worker");
+        spawner.register_queue_receiver(&idle_wheel_receiver);
 
         let task_counter = counter_registry
             .register_nominal_task("task.idle_wheel", format!("send.{worker_id}"))
@@ -674,20 +630,17 @@ pub fn send_worker<Socket, Clk, WakerSink, AckComp>(
         let source_sender_id = VarInt::new(st.sender_idx as u64).unwrap();
         let sender_idx = st.sender_idx;
         let task_name = format!("task.assembler.send.{sender_idx}");
-        spawner.register_channel(
-            ChannelRegistration::new(
-                format!("ch.wheel_to_assembler.send.{sender_idx}"),
-                "Per-socket queue from tx wheel to assembler+socket sender task",
-                "endpoint::tasks::send_worker",
-            )
-            .with_metric(&gauge),
-        );
-        spawner.register_channel_receiver(
-            &task_name,
+        let gauge = gauge.with_registration_metadata(
             format!("ch.wheel_to_assembler.send.{sender_idx}"),
-            "Assembler drains contexts assigned to this socket",
+            "Per-socket queue from tx wheel to assembler+socket sender task",
             "endpoint::tasks::send_worker",
         );
+        spawner.register_queue_channel(&gauge);
+        let assembler_receiver = gauge
+            .receiver(&task_name)
+            .with_description("Assembler drains contexts assigned to this socket")
+            .with_function("endpoint::tasks::send_worker");
+        spawner.register_queue_receiver(&assembler_receiver);
 
         let clock = st.clock.clone();
         let tx_wheel_tx =
@@ -703,7 +656,7 @@ pub fn send_worker<Socket, Clk, WakerSink, AckComp>(
         let cancelled_tx = cancelled_tx.clone().into_list_sender();
         let ack_completions_tx = ack_completions_tx.clone();
         let asm_counters = asm_counters.clone();
-        let context_rx = crate::counter::GaugedReceiver::new(context_rx, gauge);
+        let context_rx = crate::counter::GaugedReceiver::new(context_rx, assembler_receiver);
         let rx = Assembler::new(
             context_rx,
             clock.clone(),
@@ -741,12 +694,11 @@ pub fn send_worker<Socket, Clk, WakerSink, AckComp>(
     // Task: invalidation drain — purge send caches on path secret revocation.
     // Routes to completed_tx (not cancelled) so CompletionDispatcher wakes streams.
     {
-        spawner.register_channel_sender(
-            "task.invalidation",
-            format!("ch.ack_to_completion.{variant}"),
-            "Invalidation task emits failed frames as completions",
-            "endpoint::tasks::send_worker",
-        );
+        let invalidation_sender = q_ack_to_completion
+            .sender("task.invalidation")
+            .with_description("Invalidation task emits failed frames as completions")
+            .with_function("endpoint::tasks::send_worker");
+        spawner.register_queue_sender(&invalidation_sender);
 
         let rx = send_invalidation(invalidation_rx, send_caches, invalidation_completed_tx);
         let variant = format!("send.{worker_id}");

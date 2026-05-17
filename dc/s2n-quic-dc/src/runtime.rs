@@ -105,6 +105,44 @@ impl Metric for counter::QueueGauge {
     }
 }
 
+impl Metric for counter::QueueSender {
+    fn registrations(&self) -> Vec<MetricRegistration> {
+        self.metrics()
+            .into_iter()
+            .map(|metric| {
+                let mut registration =
+                    MetricRegistration::new(metric.label, metric.kind, metric.description);
+                if let Some(variant) = metric.variant {
+                    registration = registration.with_variant(variant);
+                }
+                if let Some(unit) = metric.unit {
+                    registration = registration.with_unit(unit);
+                }
+                registration
+            })
+            .collect()
+    }
+}
+
+impl Metric for counter::QueueReceiver {
+    fn registrations(&self) -> Vec<MetricRegistration> {
+        self.metrics()
+            .into_iter()
+            .map(|metric| {
+                let mut registration =
+                    MetricRegistration::new(metric.label, metric.kind, metric.description);
+                if let Some(variant) = metric.variant {
+                    registration = registration.with_variant(variant);
+                }
+                if let Some(unit) = metric.unit {
+                    registration = registration.with_unit(unit);
+                }
+                registration
+            })
+            .collect()
+    }
+}
+
 /// Describes a spawned pipeline task for runtime-level introspection.
 #[derive(Clone, Debug)]
 pub struct TaskRegistration {
@@ -291,6 +329,14 @@ pub trait Spawner {
     #[inline]
     fn register_channel(&mut self, _channel: ChannelRegistration) {}
 
+    #[inline]
+    fn register_queue_channel(&mut self, channel: &counter::QueueGauge) {
+        let registration = channel.with_registration_metadata_ref(|name, description, function| {
+            ChannelRegistration::new(name, description, function).with_metric(channel)
+        });
+        self.register_channel(registration);
+    }
+
     /// Register a relationship between a task and a channel entity.
     #[inline]
     fn register_channel_binding(&mut self, _binding: ChannelBinding) {}
@@ -313,6 +359,17 @@ pub trait Spawner {
         ));
     }
 
+    #[inline]
+    fn register_queue_sender(&mut self, sender: &counter::QueueSender) {
+        let channel_name = sender.channel_metadata(|name, _, _| name.to_string());
+        self.register_channel_sender(
+            sender.task_name(),
+            channel_name,
+            sender.description(),
+            sender.function(),
+        );
+    }
+
     /// Register that a task receives from a channel.
     #[inline]
     fn register_channel_receiver(
@@ -329,6 +386,17 @@ pub trait Spawner {
             description,
             function,
         ));
+    }
+
+    #[inline]
+    fn register_queue_receiver(&mut self, receiver: &counter::QueueReceiver) {
+        let channel_name = receiver.channel_metadata(|name, _, _| name.to_string());
+        self.register_channel_receiver(
+            receiver.task_name(),
+            channel_name,
+            receiver.description(),
+            receiver.function(),
+        );
     }
 
     /// Convenience helper for pipeline tasks with budget and task counters.

@@ -747,10 +747,41 @@ impl Task {
 
 #[derive(Clone)]
 pub struct QueueGauge {
+    inner: s2n_quic_dc_metrics::Registry,
+    label: String,
+    variant: Option<String>,
+    registration: Arc<Mutex<QueueRegistrationMetadata>>,
+    metadata: Arc<Mutex<HashMap<MetricId, MetricMetadata>>>,
+    next_metric_id: Arc<AtomicU64>,
     pub throughput: Counter,
     pub drain: Counter,
     pub depth: Gauge,
     pub depth_distribution: SummaryMetric,
+}
+
+#[derive(Clone, Default)]
+struct QueueRegistrationMetadata {
+    name: String,
+    description: String,
+    function: String,
+}
+
+#[derive(Clone)]
+pub struct QueueSender {
+    queue: QueueGauge,
+    task_name: String,
+    metric: Counter,
+    description: String,
+    function: String,
+}
+
+#[derive(Clone)]
+pub struct QueueReceiver {
+    queue: QueueGauge,
+    task_name: String,
+    metric: Counter,
+    description: String,
+    function: String,
 }
 
 impl QueueGauge {
@@ -775,6 +806,90 @@ impl QueueGauge {
         .flatten()
         .collect()
     }
+
+    pub fn with_registration_metadata(
+        self,
+        name: impl core::fmt::Display,
+        description: impl core::fmt::Display,
+        function: impl core::fmt::Display,
+    ) -> Self {
+        {
+            let mut registration = self.registration.lock().unwrap();
+            registration.name = name.to_string();
+            registration.description = description.to_string();
+            registration.function = function.to_string();
+        }
+        self
+    }
+
+    pub fn with_registration_metadata_ref<T>(&self, f: impl FnOnce(&str, &str, &str) -> T) -> T {
+        let registration = self.registration.lock().unwrap();
+        f(
+            registration.name.as_str(),
+            registration.description.as_str(),
+            registration.function.as_str(),
+        )
+    }
+
+    fn register_endpoint_counter(
+        &self,
+        suffix: &str,
+        task_name: &str,
+        description: impl core::fmt::Display,
+    ) -> Counter {
+        let label = format!("{}.{}", self.label, suffix);
+        let variant = match &self.variant {
+            Some(variant) => Some(format!("{variant}.{task_name}")),
+            None => Some(task_name.to_string()),
+        };
+        let metric_id = self.next_metric_id.fetch_add(1, Ordering::Relaxed);
+        self.metadata.lock().unwrap().insert(
+            metric_id,
+            MetricMetadata {
+                id: metric_id,
+                label: label.clone(),
+                variant: variant.clone(),
+                kind: MetricKind::Counter,
+                unit: Some("count"),
+                description: description.to_string(),
+            },
+        );
+        Counter {
+            inner: self.inner.register_counter(label, variant),
+            metric_id,
+            metadata: self.metadata.clone(),
+        }
+    }
+
+    pub fn sender(&self, task_name: impl core::fmt::Display) -> QueueSender {
+        let task_name = task_name.to_string();
+        QueueSender {
+            queue: self.clone(),
+            task_name: task_name.clone(),
+            metric: self.register_endpoint_counter(
+                "sender",
+                &task_name,
+                format_args!("Queue sends performed by {task_name}"),
+            ),
+            description: format!("Queue sends performed by {task_name}"),
+            function: String::new(),
+        }
+    }
+
+    pub fn receiver(&self, task_name: impl core::fmt::Display) -> QueueReceiver {
+        let task_name = task_name.to_string();
+        QueueReceiver {
+            queue: self.clone(),
+            task_name: task_name.clone(),
+            metric: self.register_endpoint_counter(
+                "receiver",
+                &task_name,
+                format_args!("Queue receives performed by {task_name}"),
+            ),
+            description: format!("Queue receives performed by {task_name}"),
+            function: String::new(),
+        }
+    }
 }
 
 impl QueueGauge {
@@ -795,6 +910,96 @@ impl QueueGauge {
     pub fn dequeue_n(&self, count: u64) {
         self.drain.add(count);
         self.depth.sub(count as i64);
+    }
+}
+
+impl QueueSender {
+    pub fn with_description(mut self, description: impl core::fmt::Display) -> Self {
+        self.description = description.to_string();
+        self.metric = self.metric.with_description(&self.description);
+        self
+    }
+
+    pub fn with_function(mut self, function: impl core::fmt::Display) -> Self {
+        self.function = function.to_string();
+        self
+    }
+
+    pub fn task_name(&self) -> &str {
+        &self.task_name
+    }
+
+    pub fn channel_metadata<T>(&self, f: impl FnOnce(&str, &str, &str) -> T) -> T {
+        self.queue.with_registration_metadata_ref(f)
+    }
+
+    pub fn metrics(&self) -> Vec<MetricMetadata> {
+        self.metric.metric_metadata().into_iter().collect()
+    }
+
+    pub fn description(&self) -> &str {
+        &self.description
+    }
+
+    pub fn function(&self) -> &str {
+        &self.function
+    }
+
+    #[inline]
+    fn on_send(&self, count: u64) {
+        self.metric.add(count);
+        self.queue.enqueue(count);
+    }
+}
+
+impl QueueReceiver {
+    pub fn with_description(mut self, description: impl core::fmt::Display) -> Self {
+        self.description = description.to_string();
+        self.metric = self.metric.with_description(&self.description);
+        self
+    }
+
+    pub fn with_function(mut self, function: impl core::fmt::Display) -> Self {
+        self.function = function.to_string();
+        self
+    }
+
+    pub fn task_name(&self) -> &str {
+        &self.task_name
+    }
+
+    pub fn channel_metadata<T>(&self, f: impl FnOnce(&str, &str, &str) -> T) -> T {
+        self.queue.with_registration_metadata_ref(f)
+    }
+
+    pub fn metrics(&self) -> Vec<MetricMetadata> {
+        self.metric.metric_metadata().into_iter().collect()
+    }
+
+    pub fn description(&self) -> &str {
+        &self.description
+    }
+
+    pub fn function(&self) -> &str {
+        &self.function
+    }
+
+    #[inline]
+    fn on_receive(&self, count: u64) {
+        self.metric.add(count);
+        self.queue.dequeue_n(count);
+    }
+}
+
+impl From<QueueGauge> for QueueSender {
+    fn from(queue: QueueGauge) -> Self {
+        queue.sender("unknown")
+    }
+}
+
+impl From<QueueGauge> for QueueReceiver {
+    fn from(queue: QueueGauge) -> Self {
+        queue.receiver("unknown")
     }
 }
 
@@ -958,6 +1163,15 @@ impl Registry {
         );
 
         let gauge = QueueGauge {
+            inner: self.inner.clone(),
+            label: label.clone(),
+            variant: None,
+            registration: Arc::new(Mutex::new(QueueRegistrationMetadata {
+                name: label.clone(),
+                ..Default::default()
+            })),
+            metadata: self.metric_metadata.clone(),
+            next_metric_id: self.next_metric_id.clone(),
             throughput,
             drain,
             depth: self.gauge_handle(depth_inner, depth_id),
@@ -1033,6 +1247,15 @@ impl Registry {
         );
 
         let gauge = QueueGauge {
+            inner: self.inner.clone(),
+            label: label.clone(),
+            variant: Some(variant.clone()),
+            registration: Arc::new(Mutex::new(QueueRegistrationMetadata {
+                name: format!("{label}.{variant}"),
+                ..Default::default()
+            })),
+            metadata: self.metric_metadata.clone(),
+            next_metric_id: self.next_metric_id.clone(),
             throughput,
             drain,
             depth: self.gauge_handle(depth_inner, depth_id),
@@ -1275,15 +1498,15 @@ async fn report_loop<F, Fut>(
 pub struct GaugedQueueReceiver<T, R> {
     inner: R,
     queue: crate::intrusive::Queue<T>,
-    gauge: QueueGauge,
+    gauge: QueueReceiver,
 }
 
 impl<T, R> GaugedQueueReceiver<T, R> {
-    pub fn new(inner: R, gauge: QueueGauge) -> Self {
+    pub fn new(inner: R, gauge: impl Into<QueueReceiver>) -> Self {
         Self {
             inner,
             queue: Default::default(),
-            gauge,
+            gauge: gauge.into(),
         }
     }
 }
@@ -1307,7 +1530,7 @@ where
             }
 
             if let Some(entry) = self.queue.pop_front() {
-                self.gauge.dequeue();
+                self.gauge.on_receive(1);
                 budget.consume();
                 return core::task::Poll::Ready(Some(entry));
             }
@@ -1335,12 +1558,15 @@ where
 
 pub struct GaugedSender<S> {
     inner: S,
-    gauge: QueueGauge,
+    gauge: QueueSender,
 }
 
 impl<S> GaugedSender<S> {
-    pub fn new(inner: S, gauge: QueueGauge) -> Self {
-        Self { inner, gauge }
+    pub fn new(inner: S, gauge: impl Into<QueueSender>) -> Self {
+        Self {
+            inner,
+            gauge: gauge.into(),
+        }
     }
 }
 
@@ -1360,7 +1586,7 @@ where
     fn send(&mut self, value: T) -> Result<(), T> {
         match self.inner.send(value) {
             Ok(()) => {
-                self.gauge.enqueue(1);
+                self.gauge.on_send(1);
                 Ok(())
             }
             Err(v) => Err(v),
@@ -1372,12 +1598,15 @@ where
 
 pub struct GaugedReceiver<R> {
     inner: R,
-    gauge: QueueGauge,
+    gauge: QueueReceiver,
 }
 
 impl<R> GaugedReceiver<R> {
-    pub fn new(inner: R, gauge: QueueGauge) -> Self {
-        Self { inner, gauge }
+    pub fn new(inner: R, gauge: impl Into<QueueReceiver>) -> Self {
+        Self {
+            inner,
+            gauge: gauge.into(),
+        }
     }
 }
 
@@ -1392,7 +1621,7 @@ where
     ) -> core::task::Poll<Option<T>> {
         match self.inner.poll_recv(cx, budget) {
             core::task::Poll::Ready(Some(v)) => {
-                self.gauge.dequeue();
+                self.gauge.on_receive(1);
                 core::task::Poll::Ready(Some(v))
             }
             other => other,
