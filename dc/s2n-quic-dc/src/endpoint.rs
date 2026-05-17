@@ -724,7 +724,7 @@ where
 
     #[inline]
     fn spawn<R: crate::runtime::Runtime>(self, runtime: &R) {
-        use crate::runtime::{ChannelRegistration, Spawner as _};
+        use crate::runtime::Spawner as _;
         use crate::socket::channel::ReceiverExt as _;
 
         let Self {

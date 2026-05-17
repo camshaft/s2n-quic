@@ -15,7 +15,6 @@
 
 use crate::counter;
 use crate::time::precision;
-use core::fmt;
 use s2n_quic_core::time;
 use std::future::Future;
 
@@ -685,32 +684,10 @@ mod tests {
                 )
                 .with_metric(&consumer_counter),
             );
-
-            local.register_channel(
-                ChannelRegistration::new(
-                    "ch.producer_to_consumer",
-                    "Unsync queue carrying producer items",
-                    "tests::channel",
-                )
-                .with_metric(
-                    &counter_registry_for_worker.register_queue_gauge("q.producer_to_consumer"),
-                ),
-            );
-            local.register_channel_sender(
-                "task.producer",
-                "ch.producer_to_consumer",
-                "Producer enqueues messages",
-                "tests::producer",
-            );
-            local.register_channel_receiver(
-                "task.consumer",
-                "ch.producer_to_consumer",
-                "Consumer dequeues messages",
-                "tests::consumer",
-            );
         });
 
         insta::assert_snapshot!(rt.to_dot());
-        insta::assert_snapshot!(rt.channel_bindings().join("\n"));
+        // Note: Channel binding introspection now goes through counter::Registry topology
+        // instead of spawner. This test now only verifies task registration.
     }
 }
