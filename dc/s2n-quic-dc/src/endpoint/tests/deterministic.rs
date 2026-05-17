@@ -17,18 +17,18 @@
 //! throughput is immediately visible.
 
 use crate::{
-    stream::endpoint::testing::sim::{Client, Server, SERVER_PORT},
-    testing::{ext::*, sim},
+    stream::endpoint::testing::sim::{Client, SERVER_PORT, Server},
+    testing::{ext::*, sim, without_tracing},
 };
-use bach::time::{timeout, Instant};
+use bach::time::{Instant, timeout};
 use bytes::{Bytes, BytesMut};
 use core::ops::Range;
 use s2n_quic_core::varint::VarInt;
 use std::{
     collections::HashSet,
     sync::{
-        atomic::{AtomicUsize, Ordering},
         Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -347,7 +347,9 @@ fn bulk_transfer_with_loss() {
         .with_shrink_time(core::time::Duration::from_secs(0))
         .cloned()
         .for_each(|packets| {
-            let _ = packets.sim(1 << 18);
+            without_tracing(|| {
+                let _ = packets.sim(1 << 18);
+            });
         });
 }
 
@@ -367,7 +369,7 @@ fn transmission_rate_fuzz() {
         .cloned()
         .for_each(|packets| {
             let loss = packets.loss_percent();
-            let elapsed = packets.sim(1 << 18);
+            let elapsed = without_tracing(|| packets.sim(1 << 18));
 
             // Duration bound that scales quadratically with loss rate:
             //   0% loss  → 1 s max
@@ -661,7 +663,7 @@ fn init_uniqueness_all_duplicated() {
         delays: vec![0; N],
         duplicates: vec![true; N],
     };
-    sim_init_uniqueness(&actions, N);
+    without_tracing(|| sim_init_uniqueness(&actions, N));
 }
 
 /// Reordered FlowInit packets with selective duplication.

@@ -3,12 +3,19 @@
 
 use crate::{
     event,
-    path::secret::{stateless_reset::Signer, Map},
+    path::secret::{Map, stateless_reset::Signer},
     psk::{client, server},
 };
 use s2n_quic::{provider::tls::Provider, server::Name};
 use s2n_quic_core::{crypto::tls::testing::certificates, time::StdClock};
-use std::{cell::Cell, sync::OnceLock, time::Duration};
+use std::{
+    cell::Cell,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        OnceLock,
+    },
+    time::Duration,
+};
 
 #[cfg(test)]
 use std::sync::{Arc, Mutex};
@@ -72,6 +79,8 @@ thread_local! {
     static TRACING_DISABLED_DEPTH: Cell<usize> = const { Cell::new(0) };
 }
 
+static SNAPSHOT_MODE_DEPTH: AtomicUsize = AtomicUsize::new(0);
+
 struct TracingDisabledGuard;
 
 impl TracingDisabledGuard {
@@ -84,6 +93,28 @@ impl TracingDisabledGuard {
 impl Drop for TracingDisabledGuard {
     fn drop(&mut self) {
         TRACING_DISABLED_DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
+    }
+}
+
+pub(crate) fn snapshots_enabled() -> bool {
+    SNAPSHOT_MODE_DEPTH.load(Ordering::Relaxed) > 0
+}
+
+#[cfg(test)]
+struct SnapshotModeGuard;
+
+#[cfg(test)]
+impl SnapshotModeGuard {
+    fn enter() -> Self {
+        SNAPSHOT_MODE_DEPTH.fetch_add(1, Ordering::Relaxed);
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for SnapshotModeGuard {
+    fn drop(&mut self) {
+        SNAPSHOT_MODE_DEPTH.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -181,7 +212,7 @@ pub fn sim(f: impl FnOnce()) {
 
     #[cfg(test)]
     {
-        if cfg!(feature = "metric-tracing") && !is_tracing_disabled() {
+        if !is_tracing_disabled() && !is_bolero_fuzzing() {
             return run_sim_with_snapshot(f);
         }
     }
@@ -203,6 +234,11 @@ fn is_tracing_disabled() -> bool {
 }
 
 #[cfg(test)]
+fn is_bolero_fuzzing() -> bool {
+    std::env::var_os("BOLERO_RANDOM_SEED").is_some()
+}
+
+#[cfg(test)]
 #[track_caller]
 fn run_sim_with_snapshot(f: impl FnOnce()) {
     use tracing_subscriber::fmt::format::FmtSpan;
@@ -212,26 +248,31 @@ fn run_sim_with_snapshot(f: impl FnOnce()) {
     let format = tracing_subscriber::fmt::format()
         .with_timer(Uptime::default())
         .compact();
+    let env_filter = tracing_subscriber::EnvFilter::builder()
+        .with_default_directive(tracing::Level::WARN.into())
+        .with_env_var("S2N_LOG")
+        .from_env()
+        .unwrap()
+        .add_directive("s2n_quic_dc::metric=trace".parse().unwrap());
     let subscriber = tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::builder()
-                .with_default_directive(tracing::Level::TRACE.into())
-                .with_env_var("S2N_LOG")
-                .from_env()
-                .unwrap(),
-        )
-        .with_span_events(FmtSpan::NEW | FmtSpan::CLOSE)
+        .with_env_filter(env_filter)
+        .with_span_events(FmtSpan::NEW)
         .event_format(format)
         .with_ansi(false)
         .with_writer(writer.clone())
         .finish();
 
+    let _snapshot_mode_guard = SnapshotModeGuard::enter();
     tracing::subscriber::with_default(subscriber, || run_sim(f));
 
     let suffix = format!(
-        "sim_{}_{}",
+        "sim_{}_{}_{}",
         location.file().replace(['/', '\\', '.'], "_"),
-        location.line()
+        location.line(),
+        std::thread::current()
+            .name()
+            .unwrap_or("unknown")
+            .replace(['/', '\\', '.', ':'], "_")
     );
     let logs = writer.take_string();
     insta::with_settings!({snapshot_suffix => suffix}, {

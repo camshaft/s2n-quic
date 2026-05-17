@@ -1,0 +1,20 @@
+---
+source: dc/s2n-quic-dc/src/testing.rs
+expression: logs
+---
+0:00:00.000000000 [endpoint::tasks::tests::context_resolver::same_peer_reuses_context] TRACE metric_call: s2n_quic_dc::metric: new op="queue.enqueue"
+0:00:00.000000000 [endpoint::tasks::tests::context_resolver::same_peer_reuses_context] TRACE metric_call:metric_call: s2n_quic_dc::metric: new op="queue.enqueue" op="counter.add"
+0:00:00.000000000 [endpoint::tasks::tests::context_resolver::same_peer_reuses_context] TRACE metric_call:metric_call: s2n_quic_dc::metric: counter.add metric_id=9 metric_label=send.pending.enq metric_variant=None value=1 op="queue.enqueue" op="counter.add"
+0:00:00.000000000 [endpoint::tasks::tests::context_resolver::same_peer_reuses_context] TRACE metric_call:metric_call: s2n_quic_dc::metric: new op="queue.enqueue" op="gauge.add"
+0:00:00.000000000 [endpoint::tasks::tests::context_resolver::same_peer_reuses_context] TRACE metric_call:metric_call: s2n_quic_dc::metric: gauge.add metric_id=11 metric_label=send.pending.depth metric_variant=None delta=1 value=1 op="queue.enqueue" op="gauge.add"
+0:00:00.000000000 [endpoint::tasks::tests::context_resolver::same_peer_reuses_context] TRACE metric_call: s2n_quic_dc::metric: queue.enqueue count=1 depth=1 op="queue.enqueue"
+0:00:00.000000000 [endpoint::tasks::tests::context_resolver::same_peer_reuses_context] TRACE metric_call:metric_call: s2n_quic_dc::metric: new op="queue.enqueue" op="summary.record_value"
+0:00:00.000000000 [endpoint::tasks::tests::context_resolver::same_peer_reuses_context] TRACE metric_call:metric_call: s2n_quic_dc::metric: summary.record_value metric_id=12 metric_label=send.pending.depth_dist metric_variant=None value=1 op="queue.enqueue" op="summary.record_value"
+0:00:00.000000000 [endpoint::tasks::tests::context_resolver::same_peer_reuses_context] TRACE metric_call: s2n_quic_dc::metric: new op="queue.enqueue"
+0:00:00.000000000 [endpoint::tasks::tests::context_resolver::same_peer_reuses_context] TRACE metric_call:metric_call: s2n_quic_dc::metric: new op="queue.enqueue" op="counter.add"
+0:00:00.000000000 [endpoint::tasks::tests::context_resolver::same_peer_reuses_context] TRACE metric_call:metric_call: s2n_quic_dc::metric: counter.add metric_id=9 metric_label=send.pending.enq metric_variant=None value=1 op="queue.enqueue" op="counter.add"
+0:00:00.000000000 [endpoint::tasks::tests::context_resolver::same_peer_reuses_context] TRACE metric_call:metric_call: s2n_quic_dc::metric: new op="queue.enqueue" op="gauge.add"
+0:00:00.000000000 [endpoint::tasks::tests::context_resolver::same_peer_reuses_context] TRACE metric_call:metric_call: s2n_quic_dc::metric: gauge.add metric_id=11 metric_label=send.pending.depth metric_variant=None delta=1 value=2 op="queue.enqueue" op="gauge.add"
+0:00:00.000000000 [endpoint::tasks::tests::context_resolver::same_peer_reuses_context] TRACE metric_call: s2n_quic_dc::metric: queue.enqueue count=1 depth=2 op="queue.enqueue"
+0:00:00.000000000 [endpoint::tasks::tests::context_resolver::same_peer_reuses_context] TRACE metric_call:metric_call: s2n_quic_dc::metric: new op="queue.enqueue" op="summary.record_value"
+0:00:00.000000000 [endpoint::tasks::tests::context_resolver::same_peer_reuses_context] TRACE metric_call:metric_call: s2n_quic_dc::metric: summary.record_value metric_id=12 metric_label=send.pending.depth_dist metric_variant=None value=2 op="queue.enqueue" op="summary.record_value"
