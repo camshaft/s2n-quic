@@ -528,6 +528,7 @@ impl Timer {
         TimerGuard {
             summary: &self.0,
             start,
+            recorded: false,
         }
     }
 
@@ -540,12 +541,25 @@ impl Timer {
 pub struct TimerGuard<'a> {
     summary: &'a Summary,
     start: Instant,
+    recorded: bool,
+}
+
+impl TimerGuard<'_> {
+    #[inline]
+    pub fn record(mut self) -> Instant {
+        let now = Instant::now();
+        self.summary.record_duration(now.duration_since(self.start));
+        self.recorded = true;
+        now
+    }
 }
 
 impl Drop for TimerGuard<'_> {
     #[inline]
     fn drop(&mut self) {
-        self.summary.record_duration(self.start.elapsed());
+        if !self.recorded {
+            self.summary.record_duration(self.start.elapsed());
+        }
     }
 }
 

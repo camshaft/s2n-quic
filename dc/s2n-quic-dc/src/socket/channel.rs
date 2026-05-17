@@ -264,22 +264,24 @@ pub trait ReceiverExt<T>: Receiver<T> + Sized {
     {
         let cap = capacity.unwrap_or(1);
         let mut budget = Budget::new(cap);
-        let mut prev_poll_start = None::<Instant>;
+        let mut prev_poll_end = None::<Instant>;
         core::future::poll_fn(move |cx| {
             budget.reset();
             let poll_start = Instant::now();
-            if let Some(prev_poll_start) = prev_poll_start.replace(poll_start) {
+            if let Some(prev_poll_end) = prev_poll_end {
                 task_counter
                     .next_poll_latency
-                    .record(poll_start.duration_since(prev_poll_start));
+                    .record(poll_start.duration_since(prev_poll_end));
             }
-            let _guard = task_counter.time.start_at(poll_start);
+            let guard = task_counter.time.start_at(poll_start);
+            let mut output = Poll::Pending;
             loop {
                 match self.poll_recv(cx, &mut budget) {
                     Poll::Pending => break,
                     Poll::Ready(None) => {
                         task_counter.drained.record_value(budget.consumed() as u64);
-                        return Poll::Ready(());
+                        output = Poll::Ready(());
+                        break;
                     }
                     Poll::Ready(Some(())) => {
                         if budget.is_exhausted() {
@@ -290,11 +292,14 @@ pub trait ReceiverExt<T>: Receiver<T> + Sized {
                     }
                 }
             }
-            task_counter.drained.record_value(budget.consumed() as u64);
-            if budget.take_needs_wake() {
-                cx.waker().wake_by_ref();
+            if output.is_pending() {
+                task_counter.drained.record_value(budget.consumed() as u64);
+                if budget.take_needs_wake() {
+                    cx.waker().wake_by_ref();
+                }
             }
-            Poll::Pending
+            prev_poll_end = Some(guard.record());
+            output
         })
     }
 }
