@@ -18,5 +18,13 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v5
 
+      - name: Cache cargo-insta binary
+        id: cache-cargo-insta
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cargo-insta
+          key: ${{ runner.os }}-cargo-insta-v1
+
       - name: Install cargo-insta
+        if: steps.cache-cargo-insta.outputs.cache-hit != 'true'
         run: cargo install cargo-insta --locked
