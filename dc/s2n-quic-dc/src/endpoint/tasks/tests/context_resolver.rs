@@ -9,7 +9,7 @@
 //! wheels based on WheelInterest. These tests verify the lookup, push, and dispatch
 //! behavior.
 
-use super::helpers::{test_batch, test_entry, CollectingSender, TestReceiver, TestReceiverExt as _};
+use super::helpers::{test_batch, test_entry, TestReceiver, TestReceiverExt as _};
 use crate::{
     endpoint::{combinator::FrameBatch, send, tasks},
     socket::channel::{intrusive::unsync, ReceiverExt as _, UnboundedSender as _},
@@ -133,7 +133,7 @@ fn input_close_shuts_down() {
 fn wheel_router_routes_all_interest_combinations() {
     sim(|| {
         let registry = crate::counter::Registry::default();
-        let (ctx, _) = {
+        let make_context = || {
             let entry = test_entry();
             let ctx = send::Context::new(
                 &entry,
@@ -144,7 +144,7 @@ fn wheel_router_routes_all_interest_combinations() {
                 &Clock::default(),
             )
             .unwrap();
-            (Rc::new(RefCell::new(ctx)), entry)
+            Rc::new(RefCell::new(ctx))
         };
 
         let interests = [
@@ -157,17 +157,30 @@ fn wheel_router_routes_all_interest_combinations() {
             send::WheelInterest { transmission: false, pto: true, idle_timeout: true },
             send::WheelInterest { transmission: true, pto: true, idle_timeout: true },
         ];
-        let input = TestReceiver::new(interests.into_iter().map(|i| (ctx.clone(), i)));
-        let (tx_sender, tx_items) = CollectingSender::new();
-        let (pto_sender, pto_items) = CollectingSender::new();
-        let (idle_sender, idle_items) = CollectingSender::new();
+        let input = TestReceiver::new(interests.into_iter().map(|i| (make_context(), i)));
+        let (tx_sender, mut tx_items) = unsync::new_with_adapter::<send::TxWheelAdapter>();
+        let (pto_sender, mut pto_items) = unsync::new_with_adapter::<send::PtoWheelAdapter>();
+        let (idle_sender, mut idle_items) = unsync::new_with_adapter::<send::IdleWheelAdapter>();
         let mut router = send::WheelRouter::new(input, tx_sender, pto_sender, idle_sender);
 
         async move {
             while router.recv().await.is_some() {}
-            assert_eq!(tx_items.borrow().len(), 4);
-            assert_eq!(pto_items.borrow().len(), 4);
-            assert_eq!(idle_items.borrow().len(), 4);
+            drop(router);
+            let mut tx = 0usize;
+            while tx_items.recv().await.is_some() {
+                tx += 1;
+            }
+            let mut pto = 0usize;
+            while pto_items.recv().await.is_some() {
+                pto += 1;
+            }
+            let mut idle = 0usize;
+            while idle_items.recv().await.is_some() {
+                idle += 1;
+            }
+            assert_eq!(tx, 4);
+            assert_eq!(pto, 4);
+            assert_eq!(idle, 4);
         }
         .primary()
         .spawn();

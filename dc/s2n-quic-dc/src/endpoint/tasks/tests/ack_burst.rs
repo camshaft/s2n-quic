@@ -156,13 +156,18 @@ fn flushed_context_does_not_double_submit() {
 fn duplicate_context_entry_produces_single_submission() {
     sim(|| {
         let ctx = scheduled_context();
-        let harness = setup([ctx.clone(), ctx]);
+        let Harness { mut output_rx } = setup([ctx.clone(), ctx]);
 
         async move {
-            1.ms().sleep().await;
-            let items = harness.collected.borrow();
-            assert_eq!(items.len(), 1, "duplicate context should not double-submit");
-            assert!(matches!(&*items[0], msg::Sender::PendingAck(_)));
+            let first = output_rx
+                .recv()
+                .await
+                .expect("duplicate context should still emit first submission");
+            assert!(matches!(&*first, msg::Sender::PendingAck(_)));
+            assert!(
+                output_rx.recv().await.is_none(),
+                "duplicate context should not double-submit"
+            );
         }
         .primary()
         .spawn();

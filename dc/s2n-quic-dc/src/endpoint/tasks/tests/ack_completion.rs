@@ -169,12 +169,14 @@ fn completion_from_idle_state_is_ignored() {
             recv_worker_id: 0,
         };
         let cache = cache_with_context(ctx, &submission);
-        let entry = Entry::new(msg::Sender::PendingAck(submission));
-        let harness = setup(cache, [entry]);
+        let entry = crate::intrusive::Entry::new(msg::Sender::PendingAck(submission));
+        let Harness { mut output_rx } = setup(cache, [entry]);
 
         async move {
-            1.ms().sleep().await;
-            assert!(harness.collected.borrow().is_empty());
+            assert!(
+                output_rx.recv().await.is_none(),
+                "completion from idle should not produce a resubmission"
+            );
         }
         .primary()
         .spawn();
@@ -195,15 +197,18 @@ fn stale_resubmit_then_next_completion_settles() {
         }
 
         let cache = cache_with_context(ctx.clone(), &submission);
-        let first = Entry::new(msg::Sender::PendingAck(submission));
-        let harness = setup(cache, [first]);
+        let first = crate::intrusive::Entry::new(msg::Sender::PendingAck(submission));
+        let Harness { mut output_rx } = setup(cache, [first]);
 
         async move {
-            1.ms().sleep().await;
-            let mut items = harness.collected.borrow_mut();
-            assert_eq!(items.len(), 1, "stale completion should re-submit exactly once");
-            let resubmitted = items.pop().unwrap();
-            drop(items);
+            let resubmitted = output_rx
+                .recv()
+                .await
+                .expect("stale completion should re-submit exactly once");
+            assert!(
+                output_rx.recv().await.is_none(),
+                "stale completion should produce only one re-submission"
+            );
 
             // Drive a second completion for the re-submitted ACK.
             let cache = Rc::new(RefCell::new(recv::Cache::new(0)));
@@ -215,10 +220,9 @@ fn stale_resubmit_then_next_completion_settles() {
                 }
             };
             cache.borrow_mut().senders.insert(key, ctx.clone());
-            let harness2 = setup(cache, [resubmitted]);
-            1.ms().sleep().await;
+            let Harness { mut output_rx } = setup(cache, [resubmitted]);
             assert!(
-                harness2.collected.borrow().is_empty(),
+                output_rx.recv().await.is_none(),
                 "second completion should not re-submit again without new data"
             );
             assert_eq!(ctx.borrow().ack_state, recv::AckState::Idle);

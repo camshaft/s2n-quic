@@ -237,7 +237,7 @@ fn ack_completion_after_recv_invalidation_does_not_resurrect_context() {
         let completion_rx = super::helpers::TestReceiver::new(vec![Entry::new(
             crate::endpoint::msg::Sender::PendingAck(submission),
         )]);
-        let (sender, collected) = CollectingSender::new();
+        let (sender, mut collected) = unsync::new::<crate::endpoint::msg::Sender>();
         let counters =
             crate::endpoint::counters::Dispatch::new(&crate::counter::Registry::default());
         let mut completion = tasks::ack_completion(completion_rx, recv_cache.clone(), sender, counters);
@@ -245,8 +245,9 @@ fn ack_completion_after_recv_invalidation_does_not_resurrect_context() {
         async move {
             invalidation.recv().await;
             completion.recv().await;
+            drop(completion);
             assert!(recv_cache.borrow().senders.is_empty());
-            assert!(collected.borrow().is_empty());
+            assert!(collected.recv().await.is_none());
         }
         .primary()
         .spawn();
@@ -263,7 +264,7 @@ fn ack_burst_after_recv_invalidation_emits_nothing() {
         let mut invalidation = tasks::recv_invalidation(invalidation_rx, recv_cache.clone());
 
         let ack_burst_rx = super::helpers::TestReceiver::new(vec![ctx]);
-        let (sender, collected) = CollectingSender::new();
+        let (sender, mut collected) = unsync::new::<crate::endpoint::msg::Sender>();
         let counters =
             crate::endpoint::counters::Dispatch::new(&crate::counter::Registry::default());
         let mut ack_burst = tasks::ack_burst(ack_burst_rx, sender, 0, counters);
@@ -271,8 +272,9 @@ fn ack_burst_after_recv_invalidation_emits_nothing() {
         async move {
             invalidation.recv().await;
             ack_burst.recv().await;
+            drop(ack_burst);
             assert!(recv_cache.borrow().senders.is_empty());
-            assert!(collected.borrow().is_empty());
+            assert!(collected.recv().await.is_none());
         }
         .primary()
         .spawn();
