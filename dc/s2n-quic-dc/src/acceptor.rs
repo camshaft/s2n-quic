@@ -185,7 +185,7 @@ impl<T: Send + 'static> Registry<T> {
     ///
     /// Returns Err if the acceptor doesn't exist.
     pub fn dispatch(&self, acceptor_id: VarInt, request: T) -> Result<AutoWake, DispatchError> {
-        let Some(acceptor) = self.acceptors.get(&acceptor_id) else {
+        let Some(acceptor) = self.lookup(acceptor_id) else {
             return Err(DispatchError::AcceptorNotFound);
         };
 
@@ -200,16 +200,18 @@ impl<T: Send + 'static> Registry<T> {
         acceptor_id: VarInt,
         request: T,
     ) -> Result<Dispatch, DispatchError> {
-        let Some(acceptor) = self.acceptors.get(&acceptor_id) else {
+        let Some(acceptor) = self.lookup(acceptor_id) else {
             return Err(DispatchError::AcceptorNotFound);
         };
 
         Ok(acceptor.handle_pending(request))
     }
 
-    /// Returns whether an acceptor is currently registered for `acceptor_id`.
-    pub fn contains(&self, acceptor_id: VarInt) -> bool {
-        self.acceptors.contains_key(&acceptor_id)
+    /// Looks up an acceptor by ID.
+    pub fn lookup(&self, acceptor_id: VarInt) -> Option<Arc<dyn Acceptor<T>>> {
+        self.acceptors
+            .get(&acceptor_id)
+            .map(|acceptor| acceptor.value().clone())
     }
 }
 

@@ -903,7 +903,10 @@ fn unregistered_acceptor_id_does_not_reach_registered_acceptor() {
             assert!(written > 0, "client write should send at least one byte");
 
             let mut buf = BytesMut::with_capacity(1);
-            let err = timeout(Duration::from_secs(1), stream.read_into(&mut buf))
+            let err = timeout(
+                Duration::from_secs(1), // simulated wall-clock timeout (bach time)
+                stream.read_into(&mut buf),
+            )
                 .await
                 .expect("client read should fail within timeout")
                 .expect_err("read should fail for unregistered acceptor id");
