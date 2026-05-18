@@ -35,6 +35,10 @@ interface RemoteViewerConfig {
   mermaidUrl?: string;
 }
 
+function isAdapterType(value: unknown): value is AdapterConfig["type"] {
+  return value === "none" || value === "prometheus" || value === "cloudwatch";
+}
+
 function buildAdapter(config: {
   type: string;
   prometheusUrl?: string;
@@ -184,14 +188,9 @@ export default function App() {
 
       if (cfg.adapterConfig && typeof cfg.adapterConfig === "object") {
         const adapter = cfg.adapterConfig as Record<string, unknown>;
-        if (
-          adapter.type === "none" ||
-          adapter.type === "prometheus" ||
-          adapter.type === "cloudwatch"
-        ) {
-          const type = adapter.type as AdapterConfig["type"];
+        if (isAdapterType(adapter.type)) {
           next.adapterConfig = {
-            type,
+            type: adapter.type,
             prometheusUrl:
               typeof adapter.prometheusUrl === "string"
                 ? adapter.prometheusUrl
@@ -283,7 +282,10 @@ export default function App() {
           useTopologyStore.setState({ perKindMode: cfg.perKindMode });
         }
 
-        const explicitMermaidUrl = cleanUrlInput(overrideMermaidUrl ?? "");
+        const stateMermaidUrl = useTopologyStore.getState().mermaidUrl;
+        const explicitMermaidUrl = cleanUrlInput(
+          overrideMermaidUrl ?? stateMermaidUrl,
+        );
         const configMermaidUrl = cleanUrlInput(cfg.mermaidUrl ?? "");
 
         if (explicitMermaidUrl) {
