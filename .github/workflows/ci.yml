@@ -254,12 +254,15 @@ jobs:
           - os: ubuntu-latest
             rust: stable
             target: native
+            cache_target: x86_64-unknown-linux-gnu
           - os: ubuntu-latest
             rust: stable
             target: aarch64-unknown-linux-gnu
+            cache_target: aarch64-unknown-linux-gnu
           - os: macos-latest
             rust: stable
             target: native
+            cache_target: aarch64-apple-darwin
     steps:
       - uses: ilammy/setup-nasm@v1
       - uses: actions/checkout@v6
@@ -272,11 +275,14 @@ jobs:
         run: |
           rustup toolchain install ${{ matrix.rust }}
           rustup override set ${{ matrix.rust }}
-          ${{ matrix.target != 'native' && format('rustup target add {0}', matrix.target) || 'echo native target selected' }}
+
+      - name: Install target
+        if: ${{ matrix.target != 'native' }}
+        run: rustup target add ${{ matrix.target }}
 
       - uses: camshaft/rust-cache@v1
         with:
-          key: dc-core-tests-${{ matrix.os }}-${{ matrix.target }}
+          key: dc-core-tests-${{ matrix.os }}-${{ matrix.cache_target }}
 
       - uses: camshaft/install@v1
         with:
