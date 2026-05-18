@@ -182,7 +182,6 @@ impl<T> crate::socket::channel::UnboundedSender<T> for Discard {
     }
 }
 
-
 /// Creates a PathSecretEntry for `addr`. Both the path-secret addr and the
 /// peer-data addr are set to the given address, making the entry suitable for
 /// building a [`send::Context`] that will transmit to that address.
@@ -195,7 +194,6 @@ pub fn test_entry_at(addr: std::net::SocketAddr) -> Arc<PathSecretEntry> {
     pse.set_peer_data_addrs(&[addr]);
     pse
 }
-
 
 pub fn test_entry() -> Arc<PathSecretEntry> {
     let addr: SocketAddr = "127.0.0.1:4433".parse().unwrap();
