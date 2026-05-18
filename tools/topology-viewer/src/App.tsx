@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, useCallback } from "react";
+import { useEffect, useRef, useState, useCallback, useMemo } from "react";
 import { useTopologyStore } from "./store";
 import { ControlBar } from "./components/ControlBar";
 import { SettingsPanel } from "./components/SettingsPanel";
@@ -57,9 +57,29 @@ export default function App() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
+  // Memoize the adapter so it only rebuilds when the relevant config fields
+  // change — not on every keystroke in unrelated inputs.
+  const adapter = useMemo<DataSourceAdapter | null>(
+    () =>
+      buildAdapter({
+        type: adapterConfig.type,
+        prometheusUrl: adapterConfig.prometheusUrl,
+        prometheusPrefix: adapterConfig.prometheusPrefix,
+        cloudwatchProxyUrl: adapterConfig.cloudwatchProxyUrl,
+        cloudwatchNamespace: adapterConfig.cloudwatchNamespace,
+      }),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [
+      adapterConfig.type,
+      adapterConfig.prometheusUrl,
+      adapterConfig.prometheusPrefix,
+      adapterConfig.cloudwatchProxyUrl,
+      adapterConfig.cloudwatchNamespace,
+    ],
+  );
+
   const fetchAll = useCallback(async () => {
     if (!graph || graph.nodes.length === 0) return;
-    const adapter = buildAdapter(adapterConfig);
     if (!adapter) return;
 
     const now = new Date();
@@ -87,7 +107,7 @@ export default function App() {
           }
         }),
     );
-  }, [graph, adapterConfig, timeRangeMinutes, setMetricData, setQueryStatus]);
+  }, [graph, adapter, timeRangeMinutes, setMetricData, setQueryStatus]);
 
   // Auto-refresh loop
   useEffect(() => {
