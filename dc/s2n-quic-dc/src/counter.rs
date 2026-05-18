@@ -1735,48 +1735,59 @@ impl Topology {
 
     /// Generate a Mermaid flowchart representation of the topology.
     pub fn to_mermaid(&self) -> String {
-        let mut out = String::from("flowchart LR\n");
+        let mut out = String::from(
+            "flowchart LR\n  classDef task_header fill:#eef2ff,stroke:#4f46e5,stroke-width:2px,font-weight:bold;\n  classDef task_property fill:#f8fafc,stroke:#94a3b8,stroke-width:1px;\n",
+        );
 
         use std::collections::BTreeMap;
         let mut task_node_ids = std::collections::HashMap::new();
         let mut channel_node_ids = std::collections::HashMap::new();
-        let mut worker_task_nodes = BTreeMap::<usize, Vec<String>>::new();
-        let mut unassigned_task_nodes = Vec::new();
+        let mut worker_task_blocks = BTreeMap::<usize, Vec<String>>::new();
+        let mut unassigned_task_blocks = Vec::new();
 
         // Render tasks
         for (idx, task) in self.tasks.iter().enumerate() {
-            let node_id = format!("t{idx}");
+            let node_id = format!("t{idx}_name");
             task_node_ids.insert(task.name.clone(), node_id.clone());
             let budget = task
                 .budget
                 .map(|v| v.to_string())
                 .unwrap_or_else(|| "none".to_string());
             let metrics = metric_summary(&task.metrics);
-            let label = format!(
-                "{}\nfn: {}\nbudget: {}\nmetrics: {}\n{}",
-                task.name, task.function, budget, metrics, task.description
+            let fn_node_id = format!("t{idx}_fn");
+            let budget_node_id = format!("t{idx}_budget");
+            let metrics_node_id = format!("t{idx}_metrics");
+            let desc_node_id = format!("t{idx}_desc");
+            let task_block = format!(
+                "subgraph task_{idx}[\"{}\"]\n  direction TB\n  {node_id}[\"name: {}\"]\n  {fn_node_id}[\"fn: {}\"]\n  {budget_node_id}[\"budget: {}\"]\n  {metrics_node_id}[\"metrics: {}\"]\n  {desc_node_id}[\"desc: {}\"]\n  {node_id} --- {fn_node_id}\n  {fn_node_id} --- {budget_node_id}\n  {budget_node_id} --- {metrics_node_id}\n  {metrics_node_id} --- {desc_node_id}\nend\nclass {node_id} task_header;\nclass {fn_node_id},{budget_node_id},{metrics_node_id},{desc_node_id} task_property;\n",
+                escape_mermaid(&task.name),
+                escape_mermaid(&task.name),
+                escape_mermaid(&task.function),
+                escape_mermaid(&budget),
+                escape_mermaid(&metrics),
+                escape_mermaid(&task.description),
             );
-            let node_line = format!("{node_id}[\"{}\"]\n", escape_mermaid(&label));
 
             if let Some(worker_id) = task.worker_id {
-                worker_task_nodes.entry(worker_id).or_default().push(node_line);
+                worker_task_blocks
+                    .entry(worker_id)
+                    .or_default()
+                    .push(task_block);
             } else {
-                unassigned_task_nodes.push(node_line);
+                unassigned_task_blocks.push(task_block);
             }
         }
 
-        for (worker_id, task_nodes) in worker_task_nodes {
+        for (worker_id, task_blocks) in worker_task_blocks {
             out.push_str(&format!("  subgraph worker_{worker_id}[worker {worker_id}]\n"));
-            for node in task_nodes {
-                out.push_str("    ");
-                out.push_str(&node);
+            for block in task_blocks {
+                push_indented(&mut out, "    ", &block);
             }
             out.push_str("  end\n");
         }
 
-        for node in unassigned_task_nodes {
-            out.push_str("  ");
-            out.push_str(&node);
+        for block in unassigned_task_blocks {
+            push_indented(&mut out, "  ", &block);
         }
 
         // Render channels
@@ -1992,6 +2003,14 @@ fn escape_mermaid(input: &str) -> String {
         .replace('"', "\\\"")
         .replace('\n', "<br/>")
         .replace('\r', "")
+}
+
+fn push_indented(out: &mut String, indent: &str, block: &str) {
+    for line in block.lines() {
+        out.push_str(indent);
+        out.push_str(line);
+        out.push('\n');
+    }
 }
 
 fn snapshot_text(input: &str) -> String {
@@ -3059,8 +3078,30 @@ mod tests {
                 TaskRegistration::new("task.worker.2", "desc", "fn").with_worker_id(Some(2)),
                 TaskRegistration::new("task.unassigned", "desc", "fn"),
             ],
-            channels: vec![],
-            bindings: vec![],
+            channels: vec![ChannelRegistration::new("queue.main", "queue desc", "queue_fn")],
+            bindings: vec![
+                ChannelBinding::new(
+                    "task.worker.1",
+                    "queue.main",
+                    ChannelDirection::Sends,
+                    "write path",
+                    "worker_send",
+                ),
+                ChannelBinding::new(
+                    "task.worker.2",
+                    "queue.main",
+                    ChannelDirection::Receives,
+                    "read path",
+                    "worker_recv",
+                ),
+                ChannelBinding::new(
+                    "task.unassigned",
+                    "queue.main",
+                    ChannelDirection::Receives,
+                    "monitor path",
+                    "monitor_recv",
+                ),
+            ],
         };
 
         insta::assert_snapshot!(topology.to_mermaid());

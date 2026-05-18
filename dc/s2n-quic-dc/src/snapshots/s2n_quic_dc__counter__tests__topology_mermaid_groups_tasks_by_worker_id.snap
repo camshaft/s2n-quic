@@ -3,10 +3,55 @@ source: dc/s2n-quic-dc/src/counter.rs
 expression: topology.to_mermaid()
 ---
 flowchart LR
+  classDef task_header fill:#eef2ff,stroke:#4f46e5,stroke-width:2px,font-weight:bold;
+  classDef task_property fill:#f8fafc,stroke:#94a3b8,stroke-width:1px;
   subgraph worker_1[worker 1]
-    t0["task.worker.1<br/>fn: fn<br/>budget: none<br/>metrics: none<br/>desc"]
+    subgraph task_0["task.worker.1"]
+      direction TB
+      t0_name["name: task.worker.1"]
+      t0_fn["fn: fn"]
+      t0_budget["budget: none"]
+      t0_metrics["metrics: none"]
+      t0_desc["desc: desc"]
+      t0_name --- t0_fn
+      t0_fn --- t0_budget
+      t0_budget --- t0_metrics
+      t0_metrics --- t0_desc
+    end
+    class t0_name task_header;
+    class t0_fn,t0_budget,t0_metrics,t0_desc task_property;
   end
   subgraph worker_2[worker 2]
-    t1["task.worker.2<br/>fn: fn<br/>budget: none<br/>metrics: none<br/>desc"]
+    subgraph task_1["task.worker.2"]
+      direction TB
+      t1_name["name: task.worker.2"]
+      t1_fn["fn: fn"]
+      t1_budget["budget: none"]
+      t1_metrics["metrics: none"]
+      t1_desc["desc: desc"]
+      t1_name --- t1_fn
+      t1_fn --- t1_budget
+      t1_budget --- t1_metrics
+      t1_metrics --- t1_desc
+    end
+    class t1_name task_header;
+    class t1_fn,t1_budget,t1_metrics,t1_desc task_property;
   end
-  t2["task.unassigned<br/>fn: fn<br/>budget: none<br/>metrics: none<br/>desc"]
+  subgraph task_2["task.unassigned"]
+    direction TB
+    t2_name["name: task.unassigned"]
+    t2_fn["fn: fn"]
+    t2_budget["budget: none"]
+    t2_metrics["metrics: none"]
+    t2_desc["desc: desc"]
+    t2_name --- t2_fn
+    t2_fn --- t2_budget
+    t2_budget --- t2_metrics
+    t2_metrics --- t2_desc
+  end
+  class t2_name task_header;
+  class t2_fn,t2_budget,t2_metrics,t2_desc task_property;
+  c0(("queue.main<br/>fn: queue_fn<br/>metrics: none<br/>queue desc"))
+  t0_name -->|sends<br/>fn: worker_send<br/>write path| c0
+  c0 -->|receives<br/>fn: worker_recv<br/>read path| t1_name
+  c0 -->|receives<br/>fn: monitor_recv<br/>monitor path| t2_name
