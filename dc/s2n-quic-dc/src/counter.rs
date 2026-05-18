@@ -1757,11 +1757,11 @@ impl<'a, F: MermaidMetricFormatter> core::fmt::Display for Mermaid<'a, F> {
         }
 
         for (worker_id, task_nodes) in worker_task_nodes {
-            write!(f, "  subgraph worker_{worker_id}[worker {worker_id}]\n")?;
+            writeln!(f, "  subgraph worker_{worker_id}[worker {worker_id}]")?;
             for node in &task_nodes {
                 write_indented(f, "    ", node)?;
             }
-            write!(f, "  end\n")?;
+            writeln!(f, "  end")?;
         }
 
         for node in &unassigned_task_nodes {
@@ -1780,11 +1780,8 @@ impl<'a, F: MermaidMetricFormatter> core::fmt::Display for Mermaid<'a, F> {
             }
             props.push(format!("desc: {}", channel.description));
             let label = format_mermaid_card(&channel.name, props);
-            write!(
-                f,
-                "  {node_id}[\"{}\"]\n  class {node_id} channel_node;\n",
-                label
-            )?;
+            writeln!(f, "  {node_id}[\"{}\"]", label)?;
+            writeln!(f, "  class {node_id} channel_node;")?;
             if !comments.is_empty() {
                 write_indented(f, "  ", &comments)?;
             }
@@ -1793,17 +1790,17 @@ impl<'a, F: MermaidMetricFormatter> core::fmt::Display for Mermaid<'a, F> {
         // Render bindings
         for binding in &topology.bindings {
             let Some(task_node) = task_node_ids.get(&binding.task_name) else {
-                write!(
+                writeln!(
                     f,
-                    "  %% unresolved binding: missing task '{}'\n",
+                    "  %% unresolved binding: missing task '{}'",
                     binding.task_name
                 )?;
                 continue;
             };
             let Some(channel_node) = channel_node_ids.get(&binding.channel_name) else {
-                write!(
+                writeln!(
                     f,
-                    "  %% unresolved binding: missing channel '{}'\n",
+                    "  %% unresolved binding: missing channel '{}'",
                     binding.channel_name
                 )?;
                 continue;
@@ -1819,7 +1816,7 @@ impl<'a, F: MermaidMetricFormatter> core::fmt::Display for Mermaid<'a, F> {
                 binding.direction, binding.function, binding.description
             );
             let edge_label = escape_mermaid(&label).replace('|', "&#124;");
-            write!(f, "  {from} -->|{}| {to}\n", edge_label)?;
+            writeln!(f, "  {from} -->|{}| {to}", edge_label)?;
         }
 
         Ok(())
@@ -2118,14 +2115,13 @@ fn format_mermaid_card(header: &str, properties: impl IntoIterator<Item = String
     escape_mermaid(&label)
 }
 
-
 fn write_indented(
     f: &mut core::fmt::Formatter<'_>,
     indent: &str,
     block: &str,
 ) -> core::fmt::Result {
     for line in block.lines() {
-        write!(f, "{indent}{line}\n")?;
+        writeln!(f, "{indent}{line}")?;
     }
     Ok(())
 }
