@@ -893,17 +893,28 @@ fn unregistered_acceptor_id_does_not_reach_registered_acceptor() {
 
         async move {
             let mut client = Client::new();
-            let stream = client
+            let mut stream = client
                 .connect("server:0", missing_acceptor_id)
                 .await
                 .expect("connect failed");
 
-            let (_reader, mut writer) = stream.into_split();
             let mut payload = Bytes::from_static(b"ping");
-            writer
-                .write_all_from_fin(&mut payload)
+            let written = stream.write_from(&mut payload).await.expect("client write");
+            assert!(written > 0, "client write should send at least one byte");
+
+            let mut buf = BytesMut::with_capacity(1);
+            let err = timeout(Duration::from_secs(1), stream.read_into(&mut buf))
                 .await
-                .expect("client write");
+                .expect("client read should fail within timeout")
+                .expect_err("read should fail for unregistered acceptor id");
+            assert_eq!(err.kind(), std::io::ErrorKind::ConnectionReset);
+
+            let reset_error = err
+                .get_ref()
+                .and_then(|cause| cause.downcast_ref::<crate::endpoint::error::Error>())
+                .copied()
+                .expect("reset should include endpoint error code");
+            assert_eq!(reset_error, crate::endpoint::error::Error::AcceptorNotFound);
         }
         .group("client")
         .primary()

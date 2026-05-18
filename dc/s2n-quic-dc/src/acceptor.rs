@@ -206,6 +206,11 @@ impl<T: Send + 'static> Registry<T> {
 
         Ok(acceptor.handle_pending(request))
     }
+
+    /// Returns whether an acceptor is currently registered for `acceptor_id`.
+    pub fn contains(&self, acceptor_id: VarInt) -> bool {
+        self.acceptors.contains_key(&acceptor_id)
+    }
 }
 
 impl<T> Default for Registry<T>

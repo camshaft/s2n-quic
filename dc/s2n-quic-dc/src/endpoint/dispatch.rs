@@ -517,6 +517,24 @@ fn handle_flow_init(
             };
             match register_result {
                 Ok((queue_control, queue_stream)) => {
+                    if !acceptor_registry.contains(acceptor_id) {
+                        tracing::debug!(
+                            attempt_id = attempt_id.as_u64(),
+                            stream_id = stream_id.as_u64(),
+                            acceptor_id = acceptor_id.as_u64(),
+                            "FlowInit rejected - acceptor not found"
+                        );
+                        push_reset_frame(
+                            response_frames,
+                            counters,
+                            &peer.path_entry,
+                            peer_queue_id,
+                            stream_id,
+                            error::ACCEPTOR_NOT_FOUND,
+                        );
+                        return;
+                    }
+
                     let (local_queue_id, stream) = {
                         let _guard = counters.rx_init_create_stream_time.start();
                         create_stream(queue_control, queue_stream, false)
@@ -608,6 +626,25 @@ fn handle_flow_init(
             };
             match register_result {
                 Ok((queue_control, queue_stream)) => {
+                    if !acceptor_registry.contains(acceptor_id) {
+                        counters.rx_init_no_acceptor.add(1);
+                        tracing::debug!(
+                            attempt_id = attempt_id.as_u64(),
+                            stream_id = stream_id.as_u64(),
+                            acceptor_id = acceptor_id.as_u64(),
+                            "FlowInit rejected - acceptor not found"
+                        );
+                        push_reset_frame(
+                            response_frames,
+                            counters,
+                            &peer.path_entry,
+                            peer_queue_id,
+                            stream_id,
+                            error::ACCEPTOR_NOT_FOUND,
+                        );
+                        return;
+                    }
+
                     let (local_queue_id, stream) = {
                         let _guard = counters.rx_init_create_stream_time.start();
                         create_stream(queue_control, queue_stream, true)
