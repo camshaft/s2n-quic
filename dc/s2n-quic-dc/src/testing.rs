@@ -3,7 +3,7 @@
 
 use crate::{
     event,
-    path::secret::{Map, stateless_reset::Signer},
+    path::secret::{stateless_reset::Signer, Map},
     psk::{client, server},
 };
 use s2n_quic::{provider::tls::Provider, server::Name};

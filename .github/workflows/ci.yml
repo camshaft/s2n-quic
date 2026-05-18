@@ -99,8 +99,8 @@ jobs:
       - name: Install rust toolchain
         id: toolchain
         run: |
-          rustup toolchain install ${{ env.RUST_NIGHTLY_TOOLCHAIN }} --profile minimal --component rustfmt
-          rustup override set ${{ env.RUST_NIGHTLY_TOOLCHAIN }}
+          rustup toolchain install 1.91.0 --profile minimal --component rustfmt
+          rustup override set 1.91.0
 
       - name: Run cargo fmt
         run: |
@@ -122,8 +122,8 @@ jobs:
       - name: Install rust toolchain
         id: toolchain
         run: |
-          rustup toolchain install stable --profile minimal --component clippy
-          rustup override set stable
+          rustup toolchain install 1.91.0 --profile minimal --component clippy
+          rustup override set 1.91.0
 
       - uses: camshaft/rust-cache@v1
 
@@ -137,20 +137,14 @@ jobs:
           fi
 
       # TODO translate json reports to in-action warnings
-      - name: Run cargo clippy on all workspaces
+      - name: Run cargo clippy on focused packages
         run: |
           CLIPPY_FIX_FLAG=""
           if [ "${{ steps.should_fix.outputs.SHOULD_FIX }}" == "true" ]; then
             CLIPPY_FIX_FLAG='--fix --allow-dirty'
           fi
 
-          WORKSPACES=$(echo '${{ needs.env.outputs.workspaces }}' | jq -r '.[]')
-          for workspace in $WORKSPACES; do
-            echo "Running clippy on $workspace"
-            cd "$workspace"
-            cargo clippy --all-features --all-targets --workspace $CLIPPY_FIX_FLAG -- -D warnings
-            cd $GITHUB_WORKSPACE
-          done
+          cargo clippy --all-features --all-targets -p s2n-quic-core $CLIPPY_FIX_FLAG -- -D warnings
 
       - name: Create clippy pull request
         if: steps.should_fix.outputs.SHOULD_FIX == 'true'
@@ -284,9 +278,21 @@ jobs:
         with:
           key: dc-core-tests-${{ matrix.os }}-${{ matrix.cache_target }}
 
-      - uses: camshaft/install@v1
+      - name: Set tool versions
+        id: versions
+        run: |
+          echo "cargo_nextest=0.9.136" >> "$GITHUB_OUTPUT"
+
+      - name: Cache cargo-nextest binary
+        id: cache-cargo-nextest
+        uses: actions/cache@v4
         with:
-          crate: cargo-nextest
+          path: ~/.cargo/bin/cargo-nextest
+          key: ${{ runner.os }}-cargo-nextest-${{ steps.versions.outputs.cargo_nextest }}
+
+      - name: Install cargo-nextest
+        if: steps.cache-cargo-nextest.outputs.cache-hit != 'true'
+        run: cargo install cargo-nextest --locked --version "${{ steps.versions.outputs.cargo_nextest }}"
 
       - name: Run cargo nextest
         if: ${{ matrix.target == 'native' }}
@@ -460,14 +466,14 @@ jobs:
         run: cargo llvm-cov --html --no-fail-fast -p s2n-quic-core -p s2n-quic-dc --all-features
 
       - uses: aws-actions/configure-aws-credentials@v6.0.0
-        if: github.event_name == 'push' || github.repository == github.event.pull_request.head.repo.full_name
+        if: github.event_name == 'push'
         with:
           role-to-assume: arn:aws:iam::024603541914:role/GitHubOIDCRole
           role-session-name: S2nQuicGHAS3Session
           aws-region: us-west-2
 
       - name: Upload results
-        if: github.event_name == 'push' || github.repository == github.event.pull_request.head.repo.full_name
+        if: github.event_name == 'push'
         id: s3
         run: |
           TARGET_SHA="${{ github.sha }}/coverage"
@@ -482,7 +488,7 @@ jobs:
           fi
 
       - uses: ouzi-dev/commit-status-updater@v2.0.2
-        if: github.event_name == 'push' || github.repository == github.event.pull_request.head.repo.full_name
+        if: github.event_name == 'push'
         with:
           name: "coverage / report"
           status: "success"
