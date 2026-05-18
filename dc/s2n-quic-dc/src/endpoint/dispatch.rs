@@ -1438,6 +1438,15 @@ fn handle_flow_init_reset(
     waker_sink: &mut impl channel::UnboundedSender<AutoWake>,
 ) {
     let Some(local_queue_id) = peer.flows.lookup(stream_id) else {
+        if attempt_id == VarInt::MAX {
+            tracing::debug!(
+                stream_id = stream_id.as_u64(),
+                "FlowInitReset for unknown stream_id has sentinel attempt_id - ignoring dedup update"
+            );
+            counters.rx_init_reset_unknown.add(1);
+            return;
+        }
+
         // Stream not found: mark attempt_id as seen so a later FlowInit with
         // the same attempt_id is rejected.
         match peer.attempt_dedup.check_attempt_id(attempt_id) {

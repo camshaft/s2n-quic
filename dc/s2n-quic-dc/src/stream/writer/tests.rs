@@ -105,6 +105,7 @@ impl PairBuilder {
             frame_rx,
             frame_storage: PriorityStorage::default(),
             assembler: PayloadAssembler::default(),
+            flow_attempt_id: VarInt::ZERO,
         };
 
         (writer, pusher)
@@ -199,6 +200,7 @@ struct Pusher {
     frame_rx: SubmissionReceiver,
     frame_storage: PriorityStorage,
     assembler: PayloadAssembler,
+    flow_attempt_id: VarInt,
 }
 
 impl Pusher {
@@ -233,11 +235,19 @@ impl Pusher {
         core::future::poll_fn(|cx| self.frame_rx.poll_swap(cx, &mut self.frame_storage)).await;
         let mut combined_frames = intrusive::Queue::default();
         for (_priority, mut queue) in self.frame_storage.drain() {
-            // Stamp init_sender_idx on FlowInit completions to simulate the assembler.
+            // Stamp FlowInit completion metadata to simulate the assembler.
             for frame in queue.iter() {
-                if matches!(frame.header, Header::FlowInit { .. }) {
+                if let Header::FlowInit { attempt_id, .. } = frame.header {
                     if let Some(completion) = &frame.completion {
                         completion.set_init_sender_idx(0);
+                        let stamped_attempt_id = if attempt_id == VarInt::MAX {
+                            let assigned = self.flow_attempt_id;
+                            self.flow_attempt_id += 1;
+                            assigned
+                        } else {
+                            attempt_id
+                        };
+                        completion.set_init_attempt_id(stamped_attempt_id);
                     }
                 }
             }
@@ -795,11 +805,12 @@ fn client_panic_drop_during_flow_init_sent_sends_flow_init_reset() {
                 matches!(
                     reset.front().unwrap().header,
                     Header::FlowInitReset {
+                        attempt_id,
                         error_code,
                         ..
-                    } if error_code == error::ABNORMAL_TERMINATION
+                    } if error_code == error::ABNORMAL_TERMINATION && attempt_id != VarInt::MAX
                 ),
-                "expected FlowInitReset(ABNORMAL_TERMINATION) on panic in FlowInitSent"
+                "expected FlowInitReset(ABNORMAL_TERMINATION) with non-sentinel attempt_id on panic in FlowInitSent"
             );
         }
         .primary()
@@ -852,11 +863,12 @@ fn client_transmission_error_during_flow_init_sent_sends_flow_init_reset() {
                 matches!(
                     reset.front().unwrap().header,
                     Header::FlowInitReset {
+                        attempt_id,
                         error_code,
                         ..
-                    } if error_code == error::RETRANSMISSIONS_EXHAUSTED
+                    } if error_code == error::RETRANSMISSIONS_EXHAUSTED && attempt_id != VarInt::MAX
                 ),
-                "expected FlowInitReset(RETRANSMISSIONS_EXHAUSTED)"
+                "expected FlowInitReset(RETRANSMISSIONS_EXHAUSTED) with non-sentinel attempt_id"
             );
         }
         .primary()
@@ -1455,11 +1467,12 @@ fn client_panic_drop_during_flow_init_sent() {
                 matches!(
                     reset.front().unwrap().header,
                     Header::FlowInitReset {
+                        attempt_id,
                         error_code,
                         ..
-                    } if error_code == error::ABNORMAL_TERMINATION
+                    } if error_code == error::ABNORMAL_TERMINATION && attempt_id != VarInt::MAX
                 ),
-                "expected FlowInitReset(ABNORMAL_TERMINATION)"
+                "expected FlowInitReset(ABNORMAL_TERMINATION) with non-sentinel attempt_id"
             );
         }
         .primary()

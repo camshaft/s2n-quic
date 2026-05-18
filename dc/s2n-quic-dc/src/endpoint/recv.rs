@@ -219,6 +219,7 @@ pub(crate) struct Context {
     /// has not yet been registered (FlowInit not yet seen), we stash the offset here.
     /// When the matching FlowInit arrives and registers the stream, we immediately
     /// apply the buffered FIN so the reader sees EOF at the correct byte offset.
+    // TODO track/dedupe FlowInitFin reordering pressure so we can bound this map safely.
     pub pending_fins: FxHashMap<VarInt, VarInt>,
     /// Intrusive links for recv-worker pending-ACK burst queue membership.
     pub ack_burst: intrusive::Links,

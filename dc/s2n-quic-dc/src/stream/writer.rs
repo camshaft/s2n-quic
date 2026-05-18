@@ -583,7 +583,15 @@ impl Inner {
 
         // Include the actual attempt_id so the server can mark it as seen in its dedup
         // window, preventing a late-arriving FlowInit duplicate from creating a new stream.
-        let attempt_id = self.completion_rx.init_attempt_id().unwrap_or(VarInt::MAX);
+        let Some(attempt_id) = self.completion_rx.init_attempt_id() else {
+            debug!(
+                stream_id = self.stream_id.as_u64(),
+                sender_idx,
+                "FlowInit transmitted without attempt_id stamp - cancelling pending FlowInitReset"
+            );
+            self.completion_rx.cancel();
+            return Ok(());
+        };
 
         let frame = Frame {
             source_sender_id: VarInt::new(sender_idx as u64).unwrap_or(VarInt::MAX),
