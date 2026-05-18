@@ -1,0 +1,103 @@
+---
+source: dc/s2n-quic-dc/src/testing.rs
+expression: logs
+---
+0:00:00.000000000 DEBUG setting up endpoint config.layout=WorkerLayout { frame_dispatch: 0, send: [0], recv_io: [0], recv_dispatch: [0], waker_drain: [0], background: 0 }
+0:00:00.000000000 DEBUG grow epoch=8
+0:00:00.000000000 DEBUG setting up endpoint config.layout=WorkerLayout { frame_dispatch: 0, send: [0], recv_io: [0], recv_dispatch: [0], waker_drain: [0], background: 0 }
+0:00:00.000000000 DEBUG grow epoch=8
+0:00:00.000000000 TRACE m#task.priority_router.drained=0
+0:00:00.000000000 TRACE m#task.frame_dispatch.drained=0
+0:00:00.000000000 TRACE m#task.context_resolver.drained[send.0]=0
+0:00:00.000000000 TRACE m#task.ack_processor.drained[send.0]=0
+0:00:00.000000000 TRACE m#task.completion.drained[send.0]=0
+0:00:00.000000000 TRACE m#task.cancelled.drained[send.0]=0
+0:00:00.000000000 TRACE m#task.tx_wheel.drained[send.0]=0
+0:00:00.000000000 TRACE m#task.pto_wheel.drained[send.0]=0
+0:00:00.000000000 TRACE m#task.idle_wheel.drained[send.0]=0
+0:00:00.000000000 TRACE m#task.assembler.drained[send.0]=0
+0:00:00.000000000 TRACE m#task.invalidation.drained[send.0]=0
+0:00:00.000000000 TRACE m#task.socket_recv.drained[recv.0]=0
+0:00:00.000000000 TRACE m#task.recv_idle_wheel.drained[recv.0]=0
+0:00:00.000000000 TRACE m#task.packet_dispatch.drained[recv.0]=0
+0:00:00.000000000 TRACE m#task.ack_burst.drained[recv.0]=0
+0:00:00.000000000 TRACE m#task.ack_completion.drained[recv.0]=0
+0:00:00.000000000 TRACE m#task.invalidation.drained[recv.0]=0
+0:00:00.000000000 TRACE m#task.waker_drain.drained[waker.0]=0
+0:00:00.000000000 TRACE m#task.invalidation_validator.drained[background]=0
+0:00:00.000000000 TRACE m#task.priority_router.drained=0
+0:00:00.000000000 TRACE m#task.frame_dispatch.drained=0
+0:00:00.000000000 TRACE m#task.context_resolver.drained[send.0]=0
+0:00:00.000000000 TRACE m#task.ack_processor.drained[send.0]=0
+0:00:00.000000000 TRACE m#task.completion.drained[send.0]=0
+0:00:00.000000000 TRACE m#task.cancelled.drained[send.0]=0
+0:00:00.000000000 TRACE m#task.tx_wheel.drained[send.0]=0
+0:00:00.000000000 TRACE m#task.pto_wheel.drained[send.0]=0
+0:00:00.000000000 TRACE m#task.idle_wheel.drained[send.0]=0
+0:00:00.000000000 TRACE m#task.assembler.drained[send.0]=0
+0:00:00.000000000 TRACE m#task.invalidation.drained[send.0]=0
+0:00:00.000000000 TRACE m#task.socket_recv.drained[recv.0]=0
+0:00:00.000000000 TRACE m#task.recv_idle_wheel.drained[recv.0]=0
+0:00:00.000000000 TRACE m#task.packet_dispatch.drained[recv.0]=0
+0:00:00.000000000 TRACE m#task.ack_burst.drained[recv.0]=0
+0:00:00.000000000 TRACE m#task.ack_completion.drained[recv.0]=0
+0:00:00.000000000 TRACE m#task.invalidation.drained[recv.0]=0
+0:00:00.000000000 TRACE m#task.waker_drain.drained[waker.0]=0
+0:00:00.000000000 TRACE m#task.invalidation_validator.drained[background]=0
+0:00:00.000000000 DEBUG event=on_send_flow_init prev=Init next=FlowInitSent location=dc/s2n-quic-dc/src/stream/writer.rs:805:21
+0:00:00.000000000 DEBUG event=on_send_fin prev=FlowInitSent next=FinSent location=dc/s2n-quic-dc/src/stream/writer.rs:808:25
+0:00:00.000000000 DEBUG Sent FlowInit with early data stream_id=0 bytes_read=4 is_fin=true
+0:00:00.000000000 DEBUG Writer dropping stream_id=0 status=FinSent next_offset=4 inflight_bytes=4 remote_max_data=0
+0:00:00.000000000 DEBUG event=on_shutdown prev=FinSent next=Shutdown location=dc/s2n-quic-dc/src/stream/writer.rs:514:25
+0:00:00.000000000 DEBUG Reader dropping stream_id=0 status=Open final_size=None consumed_len=0 total_received_len=0 is_writing_complete=false is_reading_complete=false
+0:00:00.000000000 DEBUG Reader dropped before FIN received - sent STOP_SENDING stream_id=0
+0:00:00.000000000 TRACE m#task.priority_router.drained=0
+0:00:00.000000000 TRACE m#task.frame_dispatch.drained=0
+0:00:00.000000000 TRACE m#task.context_resolver.drained[send.0]=0
+0:00:00.000000000 TRACE m#task.ack_processor.drained[send.0]=0
+0:00:00.000000000 TRACE m#task.completion.drained[send.0]=0
+0:00:00.000000000 TRACE m#task.cancelled.drained[send.0]=0
+0:00:00.000000000 TRACE m#task.tx_wheel.drained[send.0]=0
+0:00:00.000000000 TRACE m#task.pto_wheel.drained[send.0]=0
+0:00:00.000000000 TRACE m#task.idle_wheel.drained[send.0]=0
+0:00:00.000000000 TRACE m#task.assembler.drained[send.0]=0
+0:00:00.000000000 TRACE m#task.invalidation.drained[send.0]=0
+0:00:00.000000000 TRACE m#task.socket_recv.drained[recv.0]=0
+0:00:00.000000000 TRACE m#task.recv_idle_wheel.drained[recv.0]=0
+0:00:00.000000000 TRACE m#task.packet_dispatch.drained[recv.0]=0
+0:00:00.000000000 TRACE m#task.ack_burst.drained[recv.0]=0
+0:00:00.000000000 TRACE m#task.ack_completion.drained[recv.0]=0
+0:00:00.000000000 TRACE m#task.invalidation.drained[recv.0]=0
+0:00:00.000000000 TRACE m#task.waker_drain.drained[waker.0]=0
+0:00:00.000000000 TRACE m#task.invalidation_validator.drained[background]=0
+0:00:00.000000000 TRACE c#q.router_to_batcher.enq[p4]=1
+0:00:00.000000000 TRACE g#q.router_to_batcher.depth[p4]=1
+0:00:00.000000000 TRACE m#q.router_to_batcher.depth_dist[p4]=1
+0:00:00.000000000 TRACE c#q.router_to_batcher.sender[p4.task.priority_router]=1
+0:00:00.000000000 TRACE c#q.router_to_batcher.enq[p4]=1
+0:00:00.000000000 TRACE g#q.router_to_batcher.depth[p4]=2
+0:00:00.000000000 TRACE m#q.router_to_batcher.depth_dist[p4]=2
+0:00:00.000000000 TRACE m#task.priority_router.drained=1
+0:00:00.000000000 TRACE c#q.router_to_batcher.receiver[p4.task.frame_dispatch]=1
+0:00:00.000000000 TRACE c#q.router_to_batcher.drain[p4]=1
+0:00:00.000000000 TRACE g#q.router_to_batcher.depth[p4]=1
+0:00:00.000000000 TRACE m#task.frame_dispatch.drained=2
+0:00:00.000000000 TRACE m#task.context_resolver.drained[send.0]=0
+0:00:00.000000000 TRACE m#task.ack_processor.drained[send.0]=0
+0:00:00.000000000 TRACE m#task.completion.drained[send.0]=0
+0:00:00.000000000 TRACE m#task.cancelled.drained[send.0]=0
+0:00:00.000000000 TRACE m#task.tx_wheel.drained[send.0]=0
+0:00:00.000000000 TRACE m#task.pto_wheel.drained[send.0]=0
+0:00:00.000000000 TRACE m#task.idle_wheel.drained[send.0]=0
+0:00:00.000000000 TRACE m#task.assembler.drained[send.0]=0
+0:00:00.000000000 TRACE m#task.invalidation.drained[send.0]=0
+0:00:00.000000000 TRACE m#task.socket_recv.drained[recv.0]=0
+0:00:00.000000000 TRACE m#task.recv_idle_wheel.drained[recv.0]=0
+0:00:00.000000000 TRACE m#task.packet_dispatch.drained[recv.0]=0
+0:00:00.000000000 TRACE m#task.ack_burst.drained[recv.0]=0
+0:00:00.000000000 TRACE m#task.ack_completion.drained[recv.0]=0
+0:00:00.000000000 TRACE m#task.invalidation.drained[recv.0]=0
+0:00:00.000000000 TRACE m#task.waker_drain.drained[waker.0]=0
+0:00:00.000000000 TRACE m#task.invalidation_validator.drained[background]=0
+0:00:00.000000000 TRACE m#task.priority_router.drained=0
+0:00:00.000000000 TRACE m#task.frame_dispatch.drained=0
