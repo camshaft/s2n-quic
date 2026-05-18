@@ -1102,91 +1102,25 @@ fn handle_flow_control(
     response_frames: &mut PriorityInput,
     waker_sink: &mut impl channel::UnboundedSender<AutoWake>,
 ) {
-    let local_queue_id = queue_pair.dest_queue_id;
-
-    let request = flow::Request {
-        credential_id: credentials.id,
-        stream_id,
-    };
-
     let payload_len = buf.len();
     let entry = msg::Control::Frames { payload: buf }.into();
-
-    match queue_dispatcher.send_control(
-        local_queue_id,
-        Some(queue_pair.source_queue_id),
-        &request,
+    if dispatch_control_message(
+        path_secret_entry,
+        credentials,
+        queue_pair,
+        stream_id,
         entry,
+        queue_dispatcher,
+        counters,
+        response_frames,
+        waker_sink,
     ) {
-        Ok(waker) => {
-            let _ = waker_sink.send(waker);
-            counters.rx_flow_control_ok.add(1);
-            tracing::trace!(
-                stream_id = stream_id.as_u64(),
-                queue_id = local_queue_id.as_u64(),
-                payload_len,
-                "FlowControl dispatched"
-            );
-        }
-        Err(flow::queue::Error::Unallocated(_)) => {
-            counters.rx_flow_control_unallocated.add(1);
-            tracing::debug!(
-                stream_id = stream_id.as_u64(),
-                queue_id = local_queue_id.as_u64(),
-                "FlowControl for unallocated queue - sending reset"
-            );
-            push_reset_frame_with_target(
-                response_frames,
-                counters,
-                path_secret_entry,
-                queue_pair.source_queue_id,
-                stream_id,
-                ResetTarget::Both,
-                error::QUEUE_UNALLOCATED,
-            );
-        }
-        Err(flow::queue::Error::HalfClosed(_)) => {
-            counters.rx_flow_control_half_closed.add(1);
-            tracing::trace!(
-                stream_id = stream_id.as_u64(),
-                queue_id = local_queue_id.as_u64(),
-                "FlowControl for half-closed control queue - dropping"
-            );
-        }
-        Err(flow::queue::Error::ValidationFailed(_, reason)) => {
-            counters.on_flow_control_validation_failed(reason);
-            if let Some(error_code) = reason.as_reset_code() {
-                tracing::debug!(
-                    stream_id = stream_id.as_u64(),
-                    queue_id = local_queue_id.as_u64(),
-                    ?reason,
-                    "FlowControl validation failed - sending reset"
-                );
-                push_reset_frame_with_target(
-                    response_frames,
-                    counters,
-                    path_secret_entry,
-                    queue_pair.source_queue_id,
-                    stream_id,
-                    ResetTarget::Both,
-                    error_code,
-                );
-            } else {
-                tracing::trace!(
-                    stream_id = stream_id.as_u64(),
-                    queue_id = local_queue_id.as_u64(),
-                    "FlowControl for previous occupant - dropping"
-                );
-            }
-        }
-        Err(flow::queue::Error::PermanentlyClosed) => {
-            counters.rx_flow_control_perm_closed.add(1);
-            tracing::trace!(
-                stream_id = stream_id.as_u64(),
-                queue_id = local_queue_id.as_u64(),
-                "FlowControl for permanently closed queue"
-            );
-        }
+        tracing::trace!(
+            stream_id = stream_id.as_u64(),
+            queue_id = queue_pair.dest_queue_id.as_u64(),
+            payload_len,
+            "FlowControl dispatched"
+        );
     }
 }
 
@@ -1203,14 +1137,50 @@ fn handle_flow_max_data(
     response_frames: &mut PriorityInput,
     waker_sink: &mut impl channel::UnboundedSender<AutoWake>,
 ) {
+    let entry = msg::Control::MaxData { maximum_data }.into();
+    if dispatch_control_message(
+        path_secret_entry,
+        credentials,
+        queue_pair,
+        stream_id,
+        entry,
+        queue_dispatcher,
+        counters,
+        response_frames,
+        waker_sink,
+    ) {
+        tracing::trace!(
+            stream_id = stream_id.as_u64(),
+            queue_id = queue_pair.dest_queue_id.as_u64(),
+            maximum_data = maximum_data.as_u64(),
+            "FlowMaxData dispatched"
+        );
+    }
+}
+
+/// Dispatches a pre-built flow-control message into the per-queue control channel.
+///
+/// Returns `true` when the message was accepted by the queue (success path).
+/// All error paths are handled internally, including sending reset frames where
+/// appropriate. Callers that need to emit a success trace should do so after
+/// this call when the return value is `true`.
+fn dispatch_control_message(
+    path_secret_entry: &std::sync::Arc<PathSecretEntry>,
+    credentials: &Credentials,
+    queue_pair: QueuePair,
+    stream_id: VarInt,
+    entry: Entry<msg::Control>,
+    queue_dispatcher: &mut msg::queue::Dispatcher,
+    counters: &counters::Dispatch,
+    response_frames: &mut PriorityInput,
+    waker_sink: &mut impl channel::UnboundedSender<AutoWake>,
+) -> bool {
     let local_queue_id = queue_pair.dest_queue_id;
 
     let request = flow::Request {
         credential_id: credentials.id,
         stream_id,
     };
-
-    let entry = msg::Control::MaxData { maximum_data }.into();
 
     match queue_dispatcher.send_control(
         local_queue_id,
@@ -1221,19 +1191,14 @@ fn handle_flow_max_data(
         Ok(waker) => {
             let _ = waker_sink.send(waker);
             counters.rx_flow_control_ok.add(1);
-            tracing::trace!(
-                stream_id = stream_id.as_u64(),
-                queue_id = local_queue_id.as_u64(),
-                maximum_data = maximum_data.as_u64(),
-                "FlowMaxData dispatched"
-            );
+            true
         }
         Err(flow::queue::Error::Unallocated(_)) => {
             counters.rx_flow_control_unallocated.add(1);
             tracing::debug!(
                 stream_id = stream_id.as_u64(),
                 queue_id = local_queue_id.as_u64(),
-                "FlowMaxData for unallocated queue - sending reset"
+                "flow control for unallocated queue - sending reset"
             );
             push_reset_frame_with_target(
                 response_frames,
@@ -1244,14 +1209,16 @@ fn handle_flow_max_data(
                 ResetTarget::Both,
                 error::QUEUE_UNALLOCATED,
             );
+            false
         }
         Err(flow::queue::Error::HalfClosed(_)) => {
             counters.rx_flow_control_half_closed.add(1);
             tracing::trace!(
                 stream_id = stream_id.as_u64(),
                 queue_id = local_queue_id.as_u64(),
-                "FlowMaxData for half-closed control queue - dropping"
+                "flow control for half-closed control queue - dropping"
             );
+            false
         }
         Err(flow::queue::Error::ValidationFailed(_, reason)) => {
             counters.on_flow_control_validation_failed(reason);
@@ -1260,7 +1227,7 @@ fn handle_flow_max_data(
                     stream_id = stream_id.as_u64(),
                     queue_id = local_queue_id.as_u64(),
                     ?reason,
-                    "FlowMaxData validation failed - sending reset"
+                    "flow control validation failed - sending reset"
                 );
                 push_reset_frame_with_target(
                     response_frames,
@@ -1275,17 +1242,19 @@ fn handle_flow_max_data(
                 tracing::trace!(
                     stream_id = stream_id.as_u64(),
                     queue_id = local_queue_id.as_u64(),
-                    "FlowMaxData for previous occupant - dropping"
+                    "flow control for previous occupant - dropping"
                 );
             }
+            false
         }
         Err(flow::queue::Error::PermanentlyClosed) => {
             counters.rx_flow_control_perm_closed.add(1);
             tracing::trace!(
                 stream_id = stream_id.as_u64(),
                 queue_id = local_queue_id.as_u64(),
-                "FlowMaxData for permanently closed queue"
+                "flow control for permanently closed queue"
             );
+            false
         }
     }
 }
