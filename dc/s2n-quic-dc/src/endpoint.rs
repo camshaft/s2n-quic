@@ -367,7 +367,7 @@ where
     // UPS channel: recv_dispatch workers → background (UnknownPathSecret responses)
     let (ups_tx, ups_rx) = intrusive::sync::new::<ups::Response>();
     let ups_queue_gauge = counter_registry.register_queue_gauge("q.ups");
-    let ups_tx = crate::socket::channel::GaugedSender::new(ups_tx, ups_queue_gauge);
+    let ups_tx = crate::socket::channel::GaugedSender::new(ups_tx, ups_queue_gauge.clone());
 
     // Invalidation channels: recv IO → background (raw segments) and background → all workers
     let (invalidation_raw_tx, invalidation_raw_rx) = intrusive::sync::new::<descriptor::Filled>();
@@ -581,6 +581,7 @@ where
         path_secret_map: path_secret_map.clone(),
         broadcast_txs: invalidation_broadcast_txs,
         ups_rx,
+        ups_queue_gauge: counter_registry.register_queue_gauge("q.ups"),
         ups_socket,
         ups_rate,
         ups_dedup_capacity,
@@ -686,6 +687,7 @@ struct BackgroundParts<UpsSocket> {
     path_secret_map: crate::path::secret::Map,
     broadcast_txs: Vec<InvalidationSender>,
     ups_rx: sync_queue::Receiver<ups::Response>,
+    ups_queue_gauge: crate::counter::QueueGauge,
     ups_socket: UpsSocket,
     ups_rate: crate::socket::rate::Rate,
     ups_dedup_capacity: usize,
@@ -697,10 +699,8 @@ type InvalidationSender = crate::socket::channel::GaugedSender<
     Entry<crate::credentials::Id>,
 >;
 
-type UpsSender = crate::socket::channel::GaugedSender<
-    sync_queue::Sender<ups::Response>,
-    Entry<ups::Response>,
->;
+type UpsSender =
+    crate::socket::channel::GaugedSender<sync_queue::Sender<ups::Response>, Entry<ups::Response>>;
 
 // ── Worker ────────────────────────────────────────────────────────────────
 
@@ -1023,8 +1023,14 @@ where
                 );
 
                 let ups_counters = ups::Counters::new(&counter_registry);
-                let rx = tasks::ups_send(
+                let ups_rx = crate::counter::GaugedReceiver::new(
                     bg.ups_rx,
+                    bg.ups_queue_gauge
+                        .receiver("task.ups_send")
+                        .with_function("endpoint::Worker::spawn"),
+                );
+                let rx = tasks::ups_send(
+                    ups_rx,
                     bg.ups_socket,
                     clock.clone(),
                     bg.ups_rate,

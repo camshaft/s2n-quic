@@ -273,9 +273,8 @@ pub fn setup_sim_endpoint(
     let runtime = crate::runtime::bach::Handle::new(1);
     let gso = s2n_quic_platform::features::Gso::default();
 
-    let ups_socket = Arc::new(
-        bach::net::UdpSocket::new(&send_bind_opts).expect("failed to bind UPS socket"),
-    );
+    let ups_socket =
+        Arc::new(bach::net::UdpSocket::new(&send_bind_opts).expect("failed to bind UPS socket"));
 
     let endpoint_config = Config {
         layout,
@@ -293,7 +292,13 @@ pub fn setup_sim_endpoint(
         ups_dedup_window: core::time::Duration::from_secs(1),
     };
 
-    let endpoint = setup_endpoint(runtime, endpoint_config, send_sockets, recv_sockets, ups_socket);
+    let endpoint = setup_endpoint(
+        runtime,
+        endpoint_config,
+        send_sockets,
+        recv_sockets,
+        ups_socket,
+    );
 
     endpoint.counters.spawn_reporter_with_label(
         core::time::Duration::from_secs(1),
