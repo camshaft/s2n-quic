@@ -171,12 +171,13 @@ subtract, unlock. If budget is zero, insert a waker entry into the wait list and
 
 ### Option B — Atomic token bucket with parking lot fallback
 
-**Description.** Use a single `AtomicI64` as the global byte budget. Acquisition:
-`fetch_sub(requested, Acquire)` and check the result; if the result is ≥ 0 the credit is granted
-without any lock. When the result goes negative the thread must park: restore by adding back the
-requested amount, register a waker in a wait queue (protected by a separate thin mutex used only
-when parking), and return `Poll::Pending`. Release: `fetch_add(returned, Release)`, then wake at
-most *k* waiters (where *k* is derived from the amount returned, not all waiters at once).
+**Description.** Use a single `AtomicI64` as the global byte budget. Acquisition uses a CAS loop:
+load the current value, check that it is ≥ `requested`, then attempt a `compare_exchange` to
+subtract `requested`. If the exchange succeeds, credit is granted with no lock. If the current
+value is less than `requested`, the thread must park: register a waker in a wait queue (protected
+by a separate thin mutex used only when parking) and return `Poll::Pending`. Release:
+`fetch_add(returned, Release)`, then wake at most *k* waiters (where *k* is derived from the
+amount returned, not all waiters at once).
 
 More concretely:
 
@@ -270,8 +271,11 @@ R7 ✓.
 all streams compete fairly for a single pool, partition streams into two tiers:
 
 1. **Active** — a stream that has been polled (by either a writer or a reader) within the last RTT,
-   or that is explicitly marked active by the application. Active streams draw from a reserved
-   portion of the global budget (e.g. 50%) and are never denied.
+   or that is explicitly marked active by the application. Active streams draw from a separate
+   reserved counter first, and only fall back to the shared pool when the reserve is exhausted.
+   Under normal operating conditions this means an active stream is never denied; under extreme
+   memory pressure it may still park, but it competes only against other active streams rather
+   than the full set of inactive ones.
 2. **Inactive** — streams that have not been polled recently. They share the remaining budget on a
    best-effort basis.
 
@@ -357,10 +361,13 @@ peers have different pacing rates and rarely compete at the same instant.
 /// that more budget was issued than exists and must be repaid before new
 /// acquisitions are granted.
 struct CreditPool {
-    /// Remaining credits; modified by fetch_sub (acquire) and fetch_add (release).
+    /// Remaining credits available to inactive streams (and as a fallback for active streams).
+    /// Modified by CAS-loop acquisition and fetch_add release.
     available: AtomicI64,
-    /// Active-stream reserved floor; streams in the "active" tier draw from
-    /// `available` but are guaranteed at least this many bytes without parking.
+    /// Separate credit budget reserved exclusively for active streams. Active streams draw from
+    /// this counter first; only when it is exhausted do they fall through to `available`. This
+    /// physical separation means inactive streams can never consume the active-stream budget,
+    /// making the deadlock-prevention guarantee structural rather than probabilistic.
     active_reserve: AtomicI64,
     /// Wait queue protected by a thin mutex — only reached when budget is zero.
     waiters: Mutex<WaiterQueue>,
@@ -369,11 +376,13 @@ struct CreditPool {
 
 Acquisition fast path (writer wants to send `n` bytes):
 
-1. If the stream is marked **active** and `active_reserve.fetch_sub(n, Acquire) >= 0`, credit
-   granted from the active reserve. No contention with inactive streams.
-2. Otherwise, attempt `available.fetch_sub(n, Acquire)`. If result ≥ 0, credit granted.
-3. If result < 0, restore: `available.fetch_add(n, Release)`. Acquire the waiters mutex, push
-   a waker entry with the stream's priority, and return `Poll::Pending`.
+1. If the stream is marked **active**, attempt to acquire from the reserve with a CAS loop on
+   `active_reserve`: if the current value is ≥ `n`, subtract and break. Credit granted from the
+   active reserve with no contention against inactive streams.
+2. Otherwise (inactive stream, or active stream whose reserve is exhausted), attempt the same CAS
+   loop on `available`: if the current value is ≥ `n`, subtract and break. Credit granted.
+3. If neither CAS loop succeeds (both pools are insufficient), acquire the waiters mutex, push a
+   waker entry with the stream's priority, and return `Poll::Pending`.
 
 Release (ACK arrives, frame cancelled, or reader consumes data):
 
@@ -422,19 +431,25 @@ the remote sender without any protocol-level change.
 
 ### Deadlock prevention via active-stream tiering
 
-The active reserve guarantees that a stream being polled always has a path to credit. Specifically:
+The active reserve is a physically separate budget counter that inactive streams cannot touch.
+This makes the deadlock-prevention property structural: a stream being polled tries `active_reserve`
+first and only falls back to the shared pool when the reserve is exhausted. Specifically:
 
-- On every call to `poll_write_from` or `poll_read_into`, the stream sets a timestamp (a
+- On every call to `poll_write_from` or `poll_read_into`, the stream sets a timestamp (an
   `AtomicU64` epoch counter, not wall clock) marking itself active. This is a single relaxed store.
 - The credit pool's `try_acquire_active` path checks this timestamp; if the stream's last-active
-  epoch is within one RTT of the current epoch, it draws from `active_reserve`.
-- Inactive streams (not polled recently) lose their active status and compete for the shared pool.
+  epoch is within one RTT of the current epoch, it tries `active_reserve` before `available`.
+- Inactive streams (not polled recently) lose their active status and draw only from the shared
+  `available` pool.
+- The `active_reserve` refills from credits returned by any stream (active or inactive), keeping
+  the reserve topped up as long as there is overall forward progress on the endpoint.
 
 For the ordering-deadlock scenario: the client is reading from stream 0. Stream 0 is active;
 streams 1..19 are inactive. Streams 1..19 may hold large receive windows but those windows are
-served from the (intentionally larger) shared pool. Stream 0's active reserve is always topped up
-by completed reads on streams 1..19. The client never runs out of active-tier credits for the
-stream it is actively consuming.
+served from the shared `available` pool — they cannot drain `active_reserve`. Stream 0 draws from
+`active_reserve` first, which is continuously replenished by credits returned as streams 1..19's
+buffered data is eventually released. The client never exhausts the active-tier budget for the
+stream it is actively consuming unless the entire endpoint has genuinely run out of memory.
 
 ### What this does NOT address
 
