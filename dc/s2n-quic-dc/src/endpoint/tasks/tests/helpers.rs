@@ -3,9 +3,9 @@
 
 use crate::{
     endpoint::{
-        combinator::{AssemblerCounters, FrameBatch},
+        combinator::FrameBatch,
         frame::{self, Frame, Header},
-        msg, send,
+        send,
     },
     intrusive::Entry,
     packet::datagram::QueuePair,
@@ -267,50 +267,4 @@ pub fn build_send_context(
     )
     .expect("test context should be constructible");
     std::rc::Rc::new(std::cell::RefCell::new(ctx))
-}
-
-/// Binds an ephemeral UDP socket, runs `send_socket_assembler` with fixed test defaults
-/// (source sender ID 0, port 0, `Gso::default()`, `Pool::new(u16::MAX)`, rate 100 Mbps),
-/// and drains the pipeline to completion.
-///
-/// Use this as the body of a spawned assembler task to avoid repeating pipeline-wiring
-/// boilerplate across tests.  Pass the output-side channel receivers to a separate task
-/// or follow-on async block for assertions.
-pub async fn assembler_pipeline(
-    ctx_rx: unsync::Receiver<send::TxWheelAdapter>,
-    clock: Clock,
-    cancelled_tx: unsync::ListSender<crate::intrusive::EntryAdapter<Frame>>,
-    ack_completions_tx: unsync::ListSender<crate::intrusive::EntryAdapter<msg::Sender>>,
-    asm_counters: AssemblerCounters,
-    tx_wheel_tx: unsync::Sender<send::TxWheelAdapter>,
-    pto_wheel_tx: unsync::Sender<send::PtoWheelAdapter>,
-    idle_wheel_tx: unsync::Sender<send::IdleWheelAdapter>,
-) {
-    use crate::{
-        endpoint::tasks,
-        socket::{pool::Pool, rate::Rate},
-    };
-    use bach::net::UdpSocket;
-    use s2n_quic_core::varint::VarInt;
-    use s2n_quic_platform::features::Gso;
-
-    let socket = UdpSocket::bind("0.0.0.0:0").await.unwrap();
-    let rx = tasks::send_socket_assembler(
-        ctx_rx,
-        clock,
-        VarInt::from_u8(0),
-        0,
-        Gso::default(),
-        Pool::new(u16::MAX),
-        cancelled_tx,
-        ack_completions_tx,
-        asm_counters,
-        Rate::new(100.0),
-        socket,
-        tx_wheel_tx,
-        pto_wheel_tx,
-        idle_wheel_tx,
-    );
-    use crate::socket::channel::ReceiverExt as _;
-    rx.drain_budgeted(Some(32)).await;
 }

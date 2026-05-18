@@ -10,43 +10,63 @@
 //! pending-data and frame-cancellation scenarios.
 
 use super::helpers::{
-    assembler_pipeline, build_send_context, test_batch, test_batch_with_payload, test_entry_at,
-    TestReceiverExt as _,
+    build_send_context, test_batch, test_batch_with_payload, test_entry_at, TestReceiverExt as _,
 };
 use crate::{
-    endpoint::{combinator::AssemblerCounters, frame, msg, send},
-    socket::channel::{intrusive::unsync, UnboundedSender as _},
+    endpoint::{combinator::AssemblerCounters, frame, msg, send, tasks},
+    socket::{
+        channel::{intrusive::unsync, ReceiverExt as _, UnboundedSender as _},
+        pool::Pool,
+        rate::Rate,
+    },
     testing::{ext::*, sim},
     time::{bach::Clock, precision::Clock as _},
 };
+use bach::net::UdpSocket;
+use core::time::Duration;
 use s2n_quic_core::varint::VarInt;
+use s2n_quic_platform::features::Gso;
 
-// ── helper ───────────────────────────────────────────────────────────────────
+// ── helpers ───────────────────────────────────────────────────────────────────
 
-/// Create all the channels required to wire up one `send_socket_assembler` pipeline.
+/// All channels required to wire up one `send_socket_assembler` pipeline.
 ///
-/// Returns a tuple of `(input, outputs, pipeline_args)` where:
-/// - `ctx_tx` is the sender used by the feeder task
-/// - `{tx,pto,idle}_wheel_rx`, `cancelled_rx`, `ack_completions_rx` are for assertions
-/// - the last 6 values are consumed by [`assembler_pipeline`]
-type AssemblerChannels = (
-    // feeder side
-    unsync::Sender<send::TxWheelAdapter>,
-    // assertion side
-    unsync::Receiver<send::TxWheelAdapter>,
-    unsync::Receiver<send::PtoWheelAdapter>,
-    unsync::Receiver<send::IdleWheelAdapter>,
-    unsync::Receiver<crate::intrusive::EntryAdapter<frame::Frame>>,
-    unsync::Receiver<crate::intrusive::EntryAdapter<msg::Sender>>,
-    // pipeline side
-    unsync::Receiver<send::TxWheelAdapter>,
-    unsync::ListSender<crate::intrusive::EntryAdapter<frame::Frame>>,
-    unsync::ListSender<crate::intrusive::EntryAdapter<msg::Sender>>,
-    AssemblerCounters,
-    unsync::Sender<send::TxWheelAdapter>,
-    unsync::Sender<send::PtoWheelAdapter>,
-    unsync::Sender<send::IdleWheelAdapter>,
-);
+/// Call [`assembler_channels`] to create the whole set at once, then fully
+/// destructure the struct to distribute each field to the appropriate task:
+///
+/// - `ctx_tx` — feeder task (sends contexts into the pipeline)
+/// - `ctx_rx`, `cancelled_tx`, `ack_completions_tx`, `asm_counters`,
+///   `tx_wheel_tx`, `pto_wheel_tx`, `idle_wheel_tx` — pipeline task
+/// - `tx_wheel_rx`, `pto_wheel_rx`, `idle_wheel_rx`, `cancelled_rx`,
+///   `ack_completions_rx` — assertion task
+struct AssemblerChannels {
+    /// Send contexts into the pipeline (feeder task).
+    ctx_tx: unsync::Sender<send::TxWheelAdapter>,
+    /// Receive contexts out of the pipeline input (consumed by the assembler).
+    ctx_rx: unsync::Receiver<send::TxWheelAdapter>,
+    /// Cancelled-frame sink passed to the assembler.
+    cancelled_tx: unsync::ListSender<crate::intrusive::EntryAdapter<frame::Frame>>,
+    /// ACK-completion sink passed to the assembler.
+    ack_completions_tx: unsync::ListSender<crate::intrusive::EntryAdapter<msg::Sender>>,
+    /// Assembler metrics counters.
+    asm_counters: AssemblerCounters,
+    /// TX-wheel re-arm sender passed to the assembler.
+    tx_wheel_tx: unsync::Sender<send::TxWheelAdapter>,
+    /// PTO-wheel re-arm sender passed to the assembler.
+    pto_wheel_tx: unsync::Sender<send::PtoWheelAdapter>,
+    /// Idle-wheel re-arm sender passed to the assembler.
+    idle_wheel_tx: unsync::Sender<send::IdleWheelAdapter>,
+    /// Assert that the context was (or was not) re-armed on the TX wheel.
+    tx_wheel_rx: unsync::Receiver<send::TxWheelAdapter>,
+    /// Assert that the context was (or was not) re-armed on the PTO wheel.
+    pto_wheel_rx: unsync::Receiver<send::PtoWheelAdapter>,
+    /// Assert that the context was (or was not) re-armed on the idle wheel.
+    idle_wheel_rx: unsync::Receiver<send::IdleWheelAdapter>,
+    /// Assert on frames routed to the cancelled output.
+    cancelled_rx: unsync::Receiver<crate::intrusive::EntryAdapter<frame::Frame>>,
+    /// Assert on ACK-completion notifications.
+    ack_completions_rx: unsync::Receiver<crate::intrusive::EntryAdapter<msg::Sender>>,
+}
 
 fn assembler_channels(registry: &crate::counter::Registry) -> AssemblerChannels {
     let (ctx_tx, ctx_rx) = unsync::new_with_adapter::<send::TxWheelAdapter>();
@@ -56,21 +76,58 @@ fn assembler_channels(registry: &crate::counter::Registry) -> AssemblerChannels 
     let (cancelled_tx, cancelled_rx) = unsync::new::<frame::Frame>();
     let (ack_completions_tx, ack_completions_rx) = unsync::new::<msg::Sender>();
     let asm_counters = AssemblerCounters::new(registry);
-    (
+    AssemblerChannels {
         ctx_tx,
+        ctx_rx,
+        cancelled_tx: cancelled_tx.into_list_sender(),
+        ack_completions_tx: ack_completions_tx.into_list_sender(),
+        asm_counters,
+        tx_wheel_tx,
+        pto_wheel_tx,
+        idle_wheel_tx,
         tx_wheel_rx,
         pto_wheel_rx,
         idle_wheel_rx,
         cancelled_rx,
         ack_completions_rx,
+    }
+}
+
+/// Binds an ephemeral UDP socket, runs `send_socket_assembler` with fixed test defaults
+/// (source sender ID 0, port 0, `Gso::default()`, `Pool::new(u16::MAX)`, rate 100 Mbps),
+/// and drains the pipeline to completion.
+///
+/// Use this as the body of a spawned assembler task.  Callers pass the pipeline-side
+/// fields extracted from an [`AssemblerChannels`] destructuring; the assertion-side
+/// receivers are kept in the calling scope for post-drain assertions.
+async fn assembler_pipeline(
+    ctx_rx: unsync::Receiver<send::TxWheelAdapter>,
+    cancelled_tx: unsync::ListSender<crate::intrusive::EntryAdapter<frame::Frame>>,
+    ack_completions_tx: unsync::ListSender<crate::intrusive::EntryAdapter<msg::Sender>>,
+    asm_counters: AssemblerCounters,
+    tx_wheel_tx: unsync::Sender<send::TxWheelAdapter>,
+    pto_wheel_tx: unsync::Sender<send::PtoWheelAdapter>,
+    idle_wheel_tx: unsync::Sender<send::IdleWheelAdapter>,
+    clock: Clock,
+) {
+    let socket = UdpSocket::bind("0.0.0.0:0").await.unwrap();
+    let rx = tasks::send_socket_assembler(
         ctx_rx,
-        cancelled_tx.into_list_sender(),
-        ack_completions_tx.into_list_sender(),
+        clock,
+        VarInt::from_u8(0),
+        0,
+        Gso::default(),
+        Pool::new(u16::MAX),
+        cancelled_tx,
+        ack_completions_tx,
         asm_counters,
+        Rate::new(100.0),
+        socket,
         tx_wheel_tx,
         pto_wheel_tx,
         idle_wheel_tx,
-    )
+    );
+    rx.drain_budgeted(Some(32)).await;
 }
 
 // ── tests ─────────────────────────────────────────────────────────────────────
@@ -91,13 +148,8 @@ fn sends_encrypted_packet_to_peer() {
         let registry = crate::counter::Registry::default();
         let clock = Clock::default();
 
-        let (
+        let AssemblerChannels {
             mut ctx_tx,
-            mut tx_wheel_rx,
-            mut pto_wheel_rx,
-            mut idle_wheel_rx,
-            mut cancelled_rx,
-            mut ack_completions_rx,
             ctx_rx,
             cancelled_tx,
             ack_completions_tx,
@@ -105,11 +157,16 @@ fn sends_encrypted_packet_to_peer() {
             tx_wheel_tx,
             pto_wheel_tx,
             idle_wheel_tx,
-        ) = assembler_channels(&registry);
+            mut tx_wheel_rx,
+            mut pto_wheel_rx,
+            mut idle_wheel_rx,
+            mut cancelled_rx,
+            mut ack_completions_rx,
+        } = assembler_channels(&registry);
 
         // Bind the recv socket in the "server" group so its IP can be resolved by name.
         async {
-            let recv_socket = bach::net::UdpSocket::bind("0.0.0.0:4433").await.unwrap();
+            let recv_socket = UdpSocket::bind("0.0.0.0:4433").await.unwrap();
             let mut buf = vec![0u8; 1500];
             let (n, _peer) = recv_socket.recv_from(&mut buf).await.unwrap();
             tracing::debug!(n, "received encrypted datagram at server");
@@ -124,13 +181,13 @@ fn sends_encrypted_packet_to_peer() {
         async move {
             assembler_pipeline(
                 ctx_rx,
-                asm_clock,
                 cancelled_tx,
                 ack_completions_tx,
                 asm_counters,
                 tx_wheel_tx,
                 pto_wheel_tx,
                 idle_wheel_tx,
+                asm_clock,
             )
             .await;
 
@@ -165,7 +222,8 @@ fn sends_encrypted_packet_to_peer() {
         async move {
             let entry = test_entry_at("server:4433").await;
             let ctx = build_send_context(&entry, 0, &registry, &clock);
-            let _ = ctx.borrow_mut()
+            let _ = ctx
+                .borrow_mut()
                 .push_batch(test_batch(&entry).into_inner(), &clock);
             ctx.borrow_mut().tx_wheel.target_time = Some(clock.now());
             let _ = ctx_tx.send(ctx);
@@ -190,13 +248,8 @@ fn reassembles_context_to_tx_wheel_when_data_remains() {
         let registry = crate::counter::Registry::default();
         let clock = Clock::default();
 
-        let (
+        let AssemblerChannels {
             mut ctx_tx,
-            mut tx_wheel_rx,
-            mut pto_wheel_rx,
-            mut idle_wheel_rx,
-            mut cancelled_rx,
-            mut ack_completions_rx,
             ctx_rx,
             cancelled_tx,
             ack_completions_tx,
@@ -204,11 +257,16 @@ fn reassembles_context_to_tx_wheel_when_data_remains() {
             tx_wheel_tx,
             pto_wheel_tx,
             idle_wheel_tx,
-        ) = assembler_channels(&registry);
+            mut tx_wheel_rx,
+            mut pto_wheel_rx,
+            mut idle_wheel_rx,
+            mut cancelled_rx,
+            mut ack_completions_rx,
+        } = assembler_channels(&registry);
 
         // Recv side: exactly one datagram should arrive (only the first frame fits).
         async {
-            let recv_socket = bach::net::UdpSocket::bind("0.0.0.0:4433").await.unwrap();
+            let recv_socket = UdpSocket::bind("0.0.0.0:4433").await.unwrap();
             let mut buf = vec![0u8; 2000];
             let (n, _peer) = recv_socket.recv_from(&mut buf).await.unwrap();
             tracing::debug!(n, "received encrypted datagram at server");
@@ -222,13 +280,13 @@ fn reassembles_context_to_tx_wheel_when_data_remains() {
         async move {
             assembler_pipeline(
                 ctx_rx,
-                asm_clock,
                 cancelled_tx,
                 ack_completions_tx,
                 asm_counters,
                 tx_wheel_tx,
                 pto_wheel_tx,
                 idle_wheel_tx,
+                asm_clock,
             )
             .await;
 
@@ -284,7 +342,8 @@ fn reassembles_context_to_tx_wheel_when_data_remains() {
 ///
 /// Output-channel assertions:
 /// - `cancelled` receives exactly one frame (the cancelled one)
-/// - no datagram reaches the peer (nothing was encoded)
+/// - no datagram reaches the peer: the server recv is wrapped in a short bach timeout
+///   and must time out — nothing was encoded, so nothing was sent
 /// - TX wheel NOT re-armed (no pending data after the cancelled frame is discarded)
 /// - PTO wheel NOT re-armed (no inflight data)
 /// - idle wheel IS re-armed (context is still active)
@@ -295,13 +354,8 @@ fn cancelled_frame_emitted_when_completion_is_cancelled() {
         let registry = crate::counter::Registry::default();
         let clock = Clock::default();
 
-        let (
+        let AssemblerChannels {
             mut ctx_tx,
-            mut tx_wheel_rx,
-            mut pto_wheel_rx,
-            mut idle_wheel_rx,
-            mut cancelled_rx,
-            mut ack_completions_rx,
             ctx_rx,
             cancelled_tx,
             ack_completions_tx,
@@ -309,19 +363,42 @@ fn cancelled_frame_emitted_when_completion_is_cancelled() {
             tx_wheel_tx,
             pto_wheel_tx,
             idle_wheel_tx,
-        ) = assembler_channels(&registry);
+            mut tx_wheel_rx,
+            mut pto_wheel_rx,
+            mut idle_wheel_rx,
+            mut cancelled_rx,
+            mut ack_completions_rx,
+        } = assembler_channels(&registry);
+
+        // Server: assert that no datagram arrives.  The recv is wrapped in a 1 ms
+        // simulated-time timeout; since no packet is ever sent, the timeout must fire.
+        async {
+            let recv_socket = UdpSocket::bind("0.0.0.0:4433").await.unwrap();
+            let mut buf = vec![0u8; 1500];
+            let result =
+                bach::time::timeout(Duration::from_millis(1), recv_socket.recv_from(&mut buf))
+                    .await;
+            assert!(
+                result.is_err(),
+                "no datagram should arrive for a cancelled frame"
+            );
+            tracing::debug!("server confirmed no packet arrived (timeout as expected)");
+        }
+        .group("server")
+        .primary()
+        .spawn();
 
         let asm_clock = clock.clone();
         async move {
             assembler_pipeline(
                 ctx_rx,
-                asm_clock,
                 cancelled_tx,
                 ack_completions_tx,
                 asm_counters,
                 tx_wheel_tx,
                 pto_wheel_tx,
                 idle_wheel_tx,
+                asm_clock,
             )
             .await;
 
@@ -350,7 +427,6 @@ fn cancelled_frame_emitted_when_completion_is_cancelled() {
             );
             tracing::debug!("all output assertions passed");
         }
-        .primary()
         .spawn();
 
         async move {
@@ -391,7 +467,6 @@ fn cancelled_frame_emitted_when_completion_is_cancelled() {
             let _ = ctx_tx.send(ctx);
             drop(ctx_tx);
         }
-        .group("server")
         .spawn();
     });
 }
@@ -404,13 +479,8 @@ fn shuts_down_on_closed_input() {
         let registry = crate::counter::Registry::default();
         let clock = Clock::default();
 
-        let (
+        let AssemblerChannels {
             ctx_tx,
-            _tx_wheel_rx,
-            _pto_wheel_rx,
-            _idle_wheel_rx,
-            _cancelled_rx,
-            _ack_completions_rx,
             ctx_rx,
             cancelled_tx,
             ack_completions_tx,
@@ -418,7 +488,8 @@ fn shuts_down_on_closed_input() {
             tx_wheel_tx,
             pto_wheel_tx,
             idle_wheel_tx,
-        ) = assembler_channels(&registry);
+            ..
+        } = assembler_channels(&registry);
 
         // Close the input before anything is sent.
         drop(ctx_tx);
@@ -426,13 +497,13 @@ fn shuts_down_on_closed_input() {
         async move {
             assembler_pipeline(
                 ctx_rx,
-                clock,
                 cancelled_tx,
                 ack_completions_tx,
                 asm_counters,
                 tx_wheel_tx,
                 pto_wheel_tx,
                 idle_wheel_tx,
+                clock,
             )
             .await;
         }

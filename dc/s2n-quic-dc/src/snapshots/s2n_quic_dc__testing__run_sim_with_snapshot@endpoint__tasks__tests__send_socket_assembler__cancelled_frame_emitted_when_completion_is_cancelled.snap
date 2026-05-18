@@ -8,3 +8,4 @@ expression: logs
 0:00:00.000000000 TRACE c#test.pending.drain=1
 0:00:00.000000000 TRACE g#test.pending.depth=0
 0:00:00.000000000 DEBUG all output assertions passed
+0:00:00.001000000 DEBUG server confirmed no packet arrived (timeout as expected)
