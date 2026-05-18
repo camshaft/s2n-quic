@@ -375,7 +375,7 @@ expression: logs
 0:00:00.001041000 TRACE m#q.ack.depth_dist[send.0]=1
 0:00:00.001041000 TRACE m#task.ack_burst.drained[recv.0]=1
 0:00:00.001041000 DEBUG Stream reset by peer stream_id=0 error_code=2
-0:00:00.001041000 DEBUG event=on_reset prev=Open next=Reset location=dc/s2n-quic-dc/src/stream/reader.rs:753:41
+0:00:00.001041000 DEBUG event=on_reset prev=Open next=Reset location=dc/s2n-quic-dc/src/stream/reader.rs:757:41
 0:00:00.001041000 DEBUG Reader dropping stream_id=0 status=Reset final_size=None consumed_len=0 total_received_len=0 is_writing_complete=false is_reading_complete=false
 0:00:00.001041000 DEBUG Writer dropping stream_id=0 status=FlowInitSent next_offset=4 inflight_bytes=4 remote_max_data=0
 0:00:00.001041000 DEBUG event=on_shutdown prev=FlowInitSent next=Shutdown location=dc/s2n-quic-dc/src/stream/writer.rs:519:21

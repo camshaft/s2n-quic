@@ -70,6 +70,10 @@ impl PendingValidation {
         self.stream.reset(error);
     }
 
+    /// Disables both halves without emitting reset frames.
+    ///
+    /// Intended for rejection paths where the caller sends the reset frame via
+    /// endpoint dispatch and only needs to suppress per-half Drop side effects.
     #[inline]
     pub(crate) fn disable(&mut self) {
         self.stream.disable();
@@ -145,6 +149,10 @@ impl Stream {
         self.write.force_shutdown();
     }
 
+    /// Disables both halves without emitting reset frames.
+    ///
+    /// Intended for early rejection paths before normal stream ownership
+    /// handoff, where reset signaling is emitted by the caller.
     pub(crate) fn disable(&mut self) {
         self.read.force_reset();
         self.write.force_shutdown();
