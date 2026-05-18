@@ -895,7 +895,7 @@ jobs:
           exit 1
 
   loom:
-    # Kept enabled since this directly validates s2n-quic-core.
+    # Kept enabled: directly validates s2n-quic-core which is in scope for this fork.
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -948,7 +948,7 @@ jobs:
         run: cargo +stable xtask ci
 
   dc-wireshark:
-    if: false # Disabled in this fork: focus on s2n-quic-dc and s2n-quic-core crate tests only
+    if: false # Disabled in this fork: focus CI on s2n-quic-dc and s2n-quic-core
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
