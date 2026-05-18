@@ -230,12 +230,12 @@ mod tests {
 
     #[test]
     fn from_stream_errors_when_response_storage_has_no_capacity() {
-        struct EmptyResponse {
+        struct NoCapacityResponse {
             storage: Empty,
             provide_calls: Arc<AtomicUsize>,
         }
 
-        impl Response for EmptyResponse {
+        impl Response for NoCapacityResponse {
             type Storage = Empty;
             type Output = ();
 
@@ -285,7 +285,7 @@ mod tests {
                 let err = from_stream(
                     stream,
                     Bytes::from_static(b"ping"),
-                    EmptyResponse {
+                    NoCapacityResponse {
                         storage: Empty,
                         provide_calls: provide_calls_for_client,
                     },
@@ -314,9 +314,9 @@ mod tests {
 
     #[test]
     fn from_stream_propagates_finish_error() {
-        struct FinishErrorResponse(Vec<u8>);
+        struct FailingFinishResponse(Vec<u8>);
 
-        impl Response for FinishErrorResponse {
+        impl Response for FailingFinishResponse {
             type Storage = Vec<u8>;
             type Output = ();
 
@@ -373,7 +373,7 @@ mod tests {
                 let err = from_stream(
                     stream,
                     Bytes::from_static(b"ping"),
-                    FinishErrorResponse(Vec::new()),
+                    FailingFinishResponse(Vec::new()),
                 )
                 .await
                 .expect_err("rpc should propagate finish errors");
