@@ -5,12 +5,14 @@ use crate::{
     endpoint::{
         combinator::FrameBatch,
         frame::{self, Frame, Header},
+        send,
     },
     intrusive::Entry,
     packet::datagram::QueuePair,
     path::secret::map::Entry as PathSecretEntry,
-    socket::channel::{Budget, Receiver, UnboundedSender},
+    socket::channel::{intrusive::unsync, Budget, EntryBoxSender, Receiver},
     stream::endpoint::recv,
+    time::bach::Clock,
 };
 use core::task::{Poll, Waker};
 use s2n_quic_core::varint::VarInt;
@@ -91,28 +93,12 @@ impl<T> Receiver<T> for TestReceiver<T> {
     fn on_consumed(&mut self, _bytes: u64) {}
 }
 
-/// A sender that collects all sent items into a shared Vec for assertion.
-pub struct CollectingSender<T> {
-    pub items: Rc<RefCell<Vec<T>>>,
-}
-
-impl<T> CollectingSender<T> {
-    pub fn new() -> (Self, Rc<RefCell<Vec<T>>>) {
-        let items = Rc::new(RefCell::new(Vec::new()));
-        (
-            Self {
-                items: items.clone(),
-            },
-            items,
-        )
-    }
-}
-
-impl<T> UnboundedSender<T> for CollectingSender<T> {
-    fn send(&mut self, value: T) -> Result<(), T> {
-        self.items.borrow_mut().push(value);
-        Ok(())
-    }
+pub fn entry_channel<T>() -> (
+    EntryBoxSender<T, unsync::Sender<crate::intrusive::EntryAdapter<T>>>,
+    unsync::Receiver<crate::intrusive::EntryAdapter<T>>,
+) {
+    let (tx, rx) = unsync::new::<T>();
+    (EntryBoxSender::new(tx), rx)
 }
 
 // ── ReceiverExt ──────────────────────────────────────────────────────────
@@ -184,9 +170,25 @@ impl RecvContextBuilder {
     }
 }
 
-// ── Frame/Batch Helpers ──────────────────────────────────────────────────
+/// Creates a `PathSecretEntry` routed to the address resolved from `addr`.
+///
+/// Both the path-secret addr and the peer-data addr are set to the resolved
+/// address.  Accepts any Bach [`ToSocketAddrs`] — including group names like
+/// `"server:4433"` — so tests can resolve simulated IPs registered by
+/// `.group("server")` without hard-coding addresses.
+///
+/// [`ToSocketAddrs`]: bach::net::ToSocketAddrs
+pub async fn test_entry_at(addr: impl bach::net::ToSocketAddrs) -> Arc<PathSecretEntry> {
+    let addr = bach::net::lookup_host(addr)
+        .await
+        .expect("address resolution failed")
+        .next()
+        .expect("lookup_host returned empty iterator");
+    let pse = PathSecretEntry::fake_deterministic(addr, s2n_quic_core::endpoint::Type::Client);
+    pse.set_peer_data_addrs(&[addr]);
+    pse
+}
 
-/// Creates a PathSecretEntry with peer data addrs set (required for send::Cache).
 pub fn test_entry() -> Arc<PathSecretEntry> {
     let addr: SocketAddr = "127.0.0.1:4433".parse().unwrap();
     let pse = PathSecretEntry::fake_deterministic(addr, s2n_quic_core::endpoint::Type::Client);
@@ -196,6 +198,15 @@ pub fn test_entry() -> Arc<PathSecretEntry> {
 
 /// Creates a minimal FlowData frame for testing pipeline plumbing.
 pub fn test_frame(pse: &Arc<PathSecretEntry>) -> Entry<Frame> {
+    test_frame_with_payload(pse, 0)
+}
+
+/// Creates a FlowData frame whose application payload is `payload_size` zero bytes.
+///
+/// Use a payload large enough that two frames together exceed one MTU: the assembler
+/// will only be able to pack the first into a single segment and will push the second
+/// back, causing it to re-arm the TX wheel.
+pub fn test_frame_with_payload(pse: &Arc<PathSecretEntry>, payload_size: usize) -> Entry<Frame> {
     Entry::new(Frame {
         header: Header::FlowData {
             queue_pair: QueuePair {
@@ -207,7 +218,7 @@ pub fn test_frame(pse: &Arc<PathSecretEntry>) -> Entry<Frame> {
             is_fin: false,
         },
         source_sender_id: VarInt::MAX,
-        payload: Default::default(),
+        payload: bytes::BytesMut::zeroed(payload_size).into(),
         path_secret_entry: pse.clone(),
         completion: None,
         status: frame::TransmissionStatus::Pending,
@@ -218,7 +229,39 @@ pub fn test_frame(pse: &Arc<PathSecretEntry>) -> Entry<Frame> {
 
 /// Creates a single-frame FrameBatch with sender_id=0.
 pub fn test_batch(pse: &Arc<PathSecretEntry>) -> Entry<FrameBatch> {
-    let mut batch = FrameBatch::single(test_frame(pse));
+    test_batch_with_payload(pse, 0)
+}
+
+/// Creates a single-frame FrameBatch carrying `payload_size` bytes of payload.
+///
+/// Use two such batches pushed into a context with a large enough payload to ensure
+/// the assembler can only fit the first into one segment, leaving the second pending
+/// and re-arming the TX wheel.
+pub fn test_batch_with_payload(pse: &Arc<PathSecretEntry>, payload_size: usize) -> Entry<FrameBatch> {
+    let mut batch = FrameBatch::single(test_frame_with_payload(pse, payload_size));
     batch.set_sender_id(0);
     Entry::new(batch)
+}
+
+/// Creates a `send::Context` for `entry` wrapped in `Rc<RefCell<_>>`.
+///
+/// All three queue-depth gauges are registered under `test.inflight`, `test.ack`,
+/// and `test.pending`.  The context is immediately ready for use — callers push
+/// frames and set `ctx.borrow_mut().tx_wheel.target_time` as needed.
+pub fn build_send_context(
+    entry: &Arc<PathSecretEntry>,
+    sender_idx: usize,
+    registry: &crate::counter::Registry,
+    clock: &Clock,
+) -> std::rc::Rc<std::cell::RefCell<send::Context>> {
+    let ctx = send::Context::new(
+        entry,
+        registry.register_queue_gauge("test.inflight"),
+        registry.register_queue_gauge("test.ack"),
+        registry.register_queue_gauge("test.pending"),
+        sender_idx,
+        clock,
+    )
+    .expect("test context should be constructible");
+    std::rc::Rc::new(std::cell::RefCell::new(ctx))
 }

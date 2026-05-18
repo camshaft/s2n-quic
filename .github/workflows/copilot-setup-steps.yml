@@ -1,0 +1,130 @@
+name: "Copilot Setup Steps"
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - .github/workflows/copilot-setup-steps.yml
+  pull_request:
+    paths:
+      - .github/workflows/copilot-setup-steps.yml
+
+jobs:
+  copilot-setup-steps:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Set tool versions
+        id: versions
+        run: |
+          echo "cargo_insta=1.47.2" >> "$GITHUB_OUTPUT"
+          echo "cargo_nextest=0.9.136" >> "$GITHUB_OUTPUT"
+          echo "cargo_bolero=0.13.4" >> "$GITHUB_OUTPUT"
+          echo "cargo_mcp_rev=d5b2b8e6716e9e5620b48492855dd8afdabba4bb" >> "$GITHUB_OUTPUT"
+          echo "duckdb=v1.5.2" >> "$GITHUB_OUTPUT"
+
+      - name: Cache cargo-insta binary
+        id: cache-cargo-insta
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cargo-insta
+          key: ${{ runner.os }}-cargo-insta-${{ steps.versions.outputs.cargo_insta }}
+
+      - name: Install cargo-insta
+        if: steps.cache-cargo-insta.outputs.cache-hit != 'true'
+        run: cargo install cargo-insta --locked --version "${{ steps.versions.outputs.cargo_insta }}"
+
+      - name: Cache cargo-nextest binary
+        id: cache-cargo-nextest
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cargo-nextest
+          key: ${{ runner.os }}-cargo-nextest-${{ steps.versions.outputs.cargo_nextest }}
+
+      - name: Install cargo-nextest
+        if: steps.cache-cargo-nextest.outputs.cache-hit != 'true'
+        run: cargo install cargo-nextest --locked --version "${{ steps.versions.outputs.cargo_nextest }}"
+
+      - name: Cache cargo-bolero binary
+        id: cache-cargo-bolero
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cargo-bolero
+          key: ${{ runner.os }}-cargo-bolero-${{ steps.versions.outputs.cargo_bolero }}
+
+      - name: Install cargo-bolero
+        if: steps.cache-cargo-bolero.outputs.cache-hit != 'true'
+        run: cargo install cargo-bolero --locked --version "${{ steps.versions.outputs.cargo_bolero }}"
+
+      - name: Cache cargo-mcp binary
+        id: cache-cargo-mcp
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cargo-mcp
+          key: ${{ runner.os }}-cargo-mcp-${{ steps.versions.outputs.cargo_mcp_rev }}
+
+      - name: Install cargo-mcp
+        if: steps.cache-cargo-mcp.outputs.cache-hit != 'true'
+        run: cargo install --git https://github.com/camshaft/cargo-mcp --rev "${{ steps.versions.outputs.cargo_mcp_rev }}" cargo-mcp
+
+      - name: Setup cargo-mcp MCP config
+        run: |
+          MCP_CONFIG_PATH="${HOME}/.copilot/mcp-config.json"
+          mkdir -p "$(dirname "$MCP_CONFIG_PATH")"
+          export MCP_CONFIG_PATH
+          python - <<'PY'
+          import json
+          import os
+          import pathlib
+
+          config_path = pathlib.Path(os.environ["MCP_CONFIG_PATH"])
+          config = {}
+          if config_path.exists():
+              try:
+                  with config_path.open() as f:
+                      config = json.load(f)
+              except json.JSONDecodeError:
+                  print(f"::warning file={config_path}::{config_path} contained invalid JSON; recreating config")
+                  config = {}
+
+          if not isinstance(config, dict):
+              print(f"warning: {config_path} did not contain a JSON object; recreating config")
+              config = {}
+
+          mcp_servers = config.get("mcpServers")
+          if not isinstance(mcp_servers, dict):
+              if "mcpServers" in config:
+                  print(f"warning: {config_path} had a non-object mcpServers value; recreating mcpServers")
+              mcp_servers = {}
+              config["mcpServers"] = mcp_servers
+
+          mcp_servers["camshaft/cargo-mcp"] = {
+              "type": "local",
+              "command": "cargo-mcp",
+              "args": [],
+              "tools": ["*"],
+          }
+
+          with config_path.open("w") as f:
+              json.dump(config, f, indent=2, sort_keys=True)
+              f.write("\n")
+          PY
+
+      - name: Cache duckdb binary
+        id: cache-duckdb
+        uses: actions/cache@v4
+        with:
+          path: /usr/local/bin/duckdb
+          key: ${{ runner.os }}-duckdb-${{ steps.versions.outputs.duckdb }}
+
+      - name: Install duckdb
+        if: steps.cache-duckdb.outputs.cache-hit != 'true'
+        run: |
+          curl -fsSL "https://github.com/duckdb/duckdb/releases/download/${{ steps.versions.outputs.duckdb }}/duckdb_cli-linux-amd64.zip" -o /tmp/duckdb.zip
+          unzip /tmp/duckdb.zip -d /tmp/duckdb
+          sudo mv /tmp/duckdb/duckdb /usr/local/bin/duckdb
+          sudo chmod +x /usr/local/bin/duckdb

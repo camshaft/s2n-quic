@@ -10,19 +10,21 @@
 //! the three outcomes: clean completion, stale re-submission, and graceful handling of
 //! evicted contexts.
 
-use super::helpers::{CollectingSender, RecvContextBuilder, TestReceiver};
+use super::helpers::{RecvContextBuilder, TestReceiver, TestReceiverExt as _};
 use crate::{
     endpoint::{ack::state as ack_state, msg, recv, tasks},
-    intrusive::Entry,
-    socket::channel::ReceiverExt as _,
+    socket::channel::{intrusive::unsync, ReceiverExt as _},
     testing::{ext::*, sim},
     time::bach::Clock,
 };
+use bytes::Bytes;
 use s2n_quic_core::{time::Clock as _, varint::VarInt};
 use std::{cell::RefCell, rc::Rc};
 
 struct Harness {
-    collected: Rc<RefCell<Vec<Entry<msg::Sender>>>>,
+    output_rx: crate::socket::channel::intrusive::unsync::Receiver<
+        crate::intrusive::EntryAdapter<msg::Sender>,
+    >,
 }
 
 /// Creates a recv context in Flushed state (ACK in-flight) and returns both the
@@ -43,15 +45,16 @@ fn setup_flushed_context() -> (Rc<RefCell<recv::Context>>, ack_state::Submission
 /// Spawns the ack_completion task with the given cache and completion entries.
 fn setup(
     cache: Rc<RefCell<recv::Cache>>,
-    entries: impl IntoIterator<Item = Entry<msg::Sender>>,
+    entries: impl IntoIterator<Item = crate::intrusive::Entry<msg::Sender>>,
 ) -> Harness {
-    let (sender, collected) = CollectingSender::new();
+    let (sender, output_rx) = unsync::new::<msg::Sender>();
     let input = TestReceiver::new(entries);
-    let rx = tasks::ack_completion(input, cache, sender);
+    let counters = crate::endpoint::counters::Dispatch::new(&crate::counter::Registry::default());
+    let rx = tasks::ack_completion(input, cache, sender, counters);
     async move { rx.drain_budgeted(Some(32)).await }
         .primary()
         .spawn();
-    Harness { collected }
+    Harness { output_rx }
 }
 
 fn cache_with_context(
@@ -74,13 +77,15 @@ fn non_stale_completion_does_not_resubmit() {
     sim(|| {
         let (ctx, submission) = setup_flushed_context();
         let cache = cache_with_context(ctx, &submission);
-        let entry = Entry::new(msg::Sender::PendingAck(submission));
+        let entry = crate::intrusive::Entry::new(msg::Sender::PendingAck(submission));
 
-        let harness = setup(cache, [entry]);
+        let Harness { mut output_rx } = setup(cache, [entry]);
 
         async move {
-            1.ms().sleep().await;
-            assert!(harness.collected.borrow().is_empty());
+            assert!(
+                output_rx.recv().await.is_none(),
+                "non-stale completion should not re-submit"
+            );
         }
         .primary()
         .spawn();
@@ -105,15 +110,20 @@ fn stale_completion_resubmits() {
         }
 
         let cache = cache_with_context(ctx, &submission);
-        let entry = Entry::new(msg::Sender::PendingAck(submission));
+        let entry = crate::intrusive::Entry::new(msg::Sender::PendingAck(submission));
 
-        let harness = setup(cache, [entry]);
+        let Harness { mut output_rx } = setup(cache, [entry]);
 
         async move {
-            1.ms().sleep().await;
-            let items = harness.collected.borrow();
-            assert_eq!(items.len(), 1);
-            assert!(matches!(&*items[0], msg::Sender::PendingAck(_)));
+            let first = output_rx
+                .recv()
+                .await
+                .expect("stale completion should re-submit pending ack");
+            assert!(matches!(&*first, msg::Sender::PendingAck(_)));
+            assert!(
+                output_rx.recv().await.is_none(),
+                "stale completion should only re-submit once"
+            );
         }
         .primary()
         .spawn();
@@ -129,13 +139,95 @@ fn unknown_context_silently_dropped() {
 
         // Empty cache — context won't be found
         let cache = Rc::new(RefCell::new(recv::Cache::new(0)));
-        let entry = Entry::new(msg::Sender::PendingAck(submission));
+        let entry = crate::intrusive::Entry::new(msg::Sender::PendingAck(submission));
 
-        let harness = setup(cache, [entry]);
+        let Harness { mut output_rx } = setup(cache, [entry]);
 
         async move {
-            1.ms().sleep().await;
-            assert!(harness.collected.borrow().is_empty());
+            assert!(
+                output_rx.recv().await.is_none(),
+                "unknown context should drop completion"
+            );
+        }
+        .primary()
+        .spawn();
+    });
+}
+
+/// If completion arrives while context is not in a flushed state, it is ignored defensively.
+#[test]
+fn completion_from_idle_state_is_ignored() {
+    sim(|| {
+        let ctx = RecvContextBuilder::default().build();
+        let submission = ack_state::Submission {
+            // Body contents are irrelevant for this path: ack_completion only validates
+            // context state/cache lookup before deciding whether to re-submit.
+            body: Bytes::from_static(&[0]),
+            largest_recv_time: crate::time::precision::Clock::now(&Clock::default()),
+            has_ecn: false,
+            path_secret_entry: ctx.borrow().path_entry.clone(),
+            local_sender_id: ctx.borrow().dest_sender_id,
+            remote_sender_id: ctx.borrow().remote_sender_id,
+            recv_worker_id: 0,
+        };
+        let cache = cache_with_context(ctx, &submission);
+        let entry = crate::intrusive::Entry::new(msg::Sender::PendingAck(submission));
+        let Harness { mut output_rx } = setup(cache, [entry]);
+
+        async move {
+            assert!(
+                output_rx.recv().await.is_none(),
+                "completion from idle should not produce a resubmission"
+            );
+        }
+        .primary()
+        .spawn();
+    });
+}
+
+/// A stale completion may re-submit once; the next completion without new packets must settle.
+#[test]
+fn stale_resubmit_then_next_completion_settles() {
+    sim(|| {
+        let (ctx, submission) = setup_flushed_context();
+        {
+            let mut c = ctx.borrow_mut();
+            let clock = Clock::default();
+            let now = clock.get_time();
+            c.ack_ranges.on_packet_received(VarInt::from_u8(2), now);
+            c.ack_state.on_ack_eliciting().unwrap();
+        }
+
+        let cache = cache_with_context(ctx.clone(), &submission);
+        let first = crate::intrusive::Entry::new(msg::Sender::PendingAck(submission));
+        let Harness { mut output_rx } = setup(cache, [first]);
+
+        async move {
+            let resubmitted = output_rx
+                .recv()
+                .await
+                .expect("stale completion should re-submit exactly once");
+            assert!(
+                output_rx.recv().await.is_none(),
+                "stale completion should produce only one re-submission"
+            );
+
+            // Drive a second completion for the re-submitted ACK.
+            let cache = Rc::new(RefCell::new(recv::Cache::new(0)));
+            let key = {
+                let c = ctx.borrow();
+                recv::Key {
+                    id: *c.path_entry.id(),
+                    remote_sender_id: c.remote_sender_id,
+                }
+            };
+            cache.borrow_mut().senders.insert(key, ctx.clone());
+            let Harness { mut output_rx } = setup(cache, [resubmitted]);
+            assert!(
+                output_rx.recv().await.is_none(),
+                "second completion should not re-submit again without new data"
+            );
+            assert_eq!(ctx.borrow().ack_state, recv::AckState::Idle);
         }
         .primary()
         .spawn();

@@ -74,6 +74,8 @@ pub(crate) struct Dispatch {
     pub rx_process_err_decryption: Counter,
     pub rx_process_err_duplicate: Counter,
     pub rx_process_err_missing_sender_id: Counter,
+    pub rx_ack_state_impossible: Counter,
+    pub rx_ack_completion_impossible: Counter,
 
     pub rx_peer_cache_hit: Counter,
     pub rx_peer_cache_miss: Counter,
@@ -165,6 +167,8 @@ impl Dispatch {
             rx_process_err_duplicate: counters.register("!rx.process.err.duplicate"),
             rx_process_err_missing_sender_id: counters
                 .register("!rx.process.err.missing_sender_id"),
+            rx_ack_state_impossible: counters.register("!rx.ack.state_impossible"),
+            rx_ack_completion_impossible: counters.register("!rx.ack.completion_impossible"),
 
             rx_peer_cache_hit: counters.register("rx.peer_cache.hit"),
             rx_peer_cache_miss: counters.register("rx.peer_cache.miss"),
@@ -220,6 +224,7 @@ impl Dispatch {
             Header::FlowInitValidate { .. } => self.rx_init_validate.add(1),
             Header::FlowData { .. } => self.rx_data.add(1),
             Header::FlowControl { .. } => self.rx_flow_control.add(1),
+            Header::FlowMaxData { .. } => self.rx_flow_control.add(1),
             Header::FlowReset { .. } => self.rx_reset.add(1),
             Header::FlowInitReset { .. } => self.rx_init_reset.add(1),
             Header::FlowInitFin { .. } => self.rx_init_fin.add(1),

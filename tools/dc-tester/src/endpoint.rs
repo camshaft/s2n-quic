@@ -16,6 +16,7 @@ pub fn create(
     config: &EndpointConfig,
     bind_addr: SocketAddr,
     pool: &busy_poll::Pool,
+    print_pipeline_dot: bool,
 ) -> io::Result<Arc<endpoint::Endpoint>> {
     let runtime = runtime::busy_poll::Handle::new(pool.clone());
 
@@ -76,6 +77,21 @@ pub fn create(
     };
 
     let inner = endpoint::setup_endpoint(runtime, endpoint_config, send_sockets, recv_sockets);
+    if print_pipeline_dot {
+        let topology = inner.counters.topology();
+        println!("{}", topology.to_dot());
+        eprintln!("pipeline channel bindings:");
+        for binding in topology.bindings {
+            eprintln!(
+                "task '{}' {} channel '{}' ({}, fn: {})",
+                binding.task_name,
+                binding.direction,
+                binding.channel_name,
+                binding.description,
+                binding.function
+            );
+        }
+    }
 
     Ok(Arc::new(inner))
 }

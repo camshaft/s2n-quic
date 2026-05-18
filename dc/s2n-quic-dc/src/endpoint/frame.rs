@@ -372,6 +372,21 @@ pub enum Header {
         queue_pair: QueuePair,
         stream_id: VarInt,
     },
+    /// Inline window update: MAX_DATA value carried directly in the header.
+    ///
+    /// This is the fast path for the common case of the reader advertising a
+    /// new receive window to the writer.  Carrying `maximum_data` in the header
+    /// avoids encoding and decoding an opaque QUIC control-frame payload. The
+    /// payload for this frame type is always empty.
+    ///
+    /// The generic [`FlowControl`] variant with an opaque payload remains
+    /// available as an extension escape hatch for future multi-frame or
+    /// non-MAX_DATA control messages.
+    FlowMaxData {
+        queue_pair: QueuePair,
+        stream_id: VarInt,
+        maximum_data: VarInt,
+    },
     /// Reset a flow
     FlowReset {
         dest_queue_id: VarInt,
@@ -447,8 +462,9 @@ impl Header {
     const FLOW_INIT_WITH_FIN_TYPE: u8 = 8;
     const FLOW_RESET_STREAM_TYPE: u8 = 9;
     const FLOW_RESET_CONTROL_TYPE: u8 = 10;
-    const FLOW_INIT_RESET_TYPE: u8 = 11;
-    const FLOW_INIT_FIN_TYPE: u8 = 12;
+    const FLOW_MAX_DATA_TYPE: u8 = 11;
+    const FLOW_INIT_RESET_TYPE: u8 = 12;
+    const FLOW_INIT_FIN_TYPE: u8 = 13;
     const ACK_TYPE: u8 = 14;
     const ACK_ECN_TYPE: u8 = 15;
     const ACK_ELICITING_TYPE: u8 = 16;
@@ -465,7 +481,7 @@ impl Header {
                 }
             }
             Self::FlowData { .. } => Priority::FlowData,
-            Self::FlowControl { .. } => Priority::FlowControl,
+            Self::FlowControl { .. } | Self::FlowMaxData { .. } => Priority::FlowControl,
             Self::FlowReset { .. } | Self::FlowInitReset { .. } => Priority::FlowReset,
             Self::FlowInitFin { .. } => Priority::FlowInit,
             Self::FlowInitValidate { .. } | Self::FlowValidateRequest { .. } => Priority::FlowRetry,
@@ -502,6 +518,7 @@ impl Header {
             | Self::FlowControl { .. }
             | Self::Ack { .. } => true,
             Self::FlowReset { .. }
+            | Self::FlowMaxData { .. }
             | Self::FlowInitReset { .. }
             | Self::FlowInitFin { .. }
             | Self::FlowInitValidate { .. }
@@ -597,6 +614,16 @@ impl EncoderValue for Header {
                 encoder.encode(&Self::FLOW_CONTROL_TYPE);
                 encoder.encode(queue_pair);
                 encoder.encode(stream_id);
+            }
+            Self::FlowMaxData {
+                queue_pair,
+                stream_id,
+                maximum_data,
+            } => {
+                encoder.encode(&Self::FLOW_MAX_DATA_TYPE);
+                encoder.encode(queue_pair);
+                encoder.encode(stream_id);
+                encoder.encode(maximum_data);
             }
             Self::FlowReset {
                 dest_queue_id,
@@ -722,6 +749,19 @@ impl<'a> s2n_codec::DecoderValue<'a> for Header {
                     Self::FlowControl {
                         queue_pair,
                         stream_id,
+                    },
+                    buffer,
+                ))
+            }
+            Self::FLOW_MAX_DATA_TYPE => {
+                let (queue_pair, buffer) = buffer.decode()?;
+                let (stream_id, buffer) = buffer.decode()?;
+                let (maximum_data, buffer) = buffer.decode()?;
+                Ok((
+                    Self::FlowMaxData {
+                        queue_pair,
+                        stream_id,
+                        maximum_data,
                     },
                     buffer,
                 ))

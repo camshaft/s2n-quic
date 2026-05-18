@@ -88,7 +88,6 @@ use crate::{
     packet::datagram::{QueuePair, ResetTarget},
     path::secret::map::Entry as PathSecretEntry,
 };
-use s2n_codec::EncoderValue;
 use s2n_quic_core::{
     buffer::{
         self,
@@ -97,7 +96,6 @@ use s2n_quic_core::{
         reassembler::Reassembler,
         writer::{Storage as _, Writer as _},
     },
-    frame::MaxData,
     ready,
     state::{event, is},
     task::waker,
@@ -365,6 +363,18 @@ impl Reader {
             return;
         }
         let _ = self.0.send_reset_frame(error_code, ResetTarget::Both);
+        self.0.status.on_reset().ok();
+        self.0.reassembler.reset();
+    }
+
+    /// Transitions the reader to reset state without sending a reset frame.
+    ///
+    /// This is used when the caller will emit a reset via another path and only
+    /// needs to suppress Drop-time STOP_SENDING behavior.
+    pub(crate) fn force_reset(&mut self) {
+        if self.0.status.is_terminal() {
+            return;
+        }
         self.0.status.on_reset().ok();
         self.0.reassembler.reset();
     }
@@ -885,20 +895,17 @@ impl Inner {
             return Ok(());
         };
 
-        let frame = MaxData { maximum_data };
-        let encoded_bytes = frame.encode_to_vec();
-        let control_data = ByteVec::from(encoded_bytes);
-
         let frame = Frame {
             source_sender_id: VarInt::MAX,
-            header: Header::FlowControl {
+            header: Header::FlowMaxData {
                 queue_pair: QueuePair {
                     source_queue_id: self.stream_rx.queue_id(),
                     dest_queue_id: remote_queue_id,
                 },
                 stream_id: self.stream_id,
+                maximum_data,
             },
-            payload: control_data,
+            payload: ByteVec::new(),
             path_secret_entry: self.path_secret_entry.clone(),
             completion: Some(self.completion_rx.sender()),
             status: frame::TransmissionStatus::default(),
@@ -1002,7 +1009,11 @@ impl Drop for Reader {
             );
         } else if !self.0.reassembler.is_writing_complete() && !self.0.status.is_reset() {
             let error_code = error::STOP_SENDING;
-            let _ = self.0.send_reset_frame(error_code, ResetTarget::Stream);
+            // STOP_SENDING must target the *writer* on the peer side, which
+            // polls the *control* channel.  Using ResetTarget::Stream would
+            // route the reset to the peer's reader (stream queue) instead and
+            // the peer's writer would never observe the signal.
+            let _ = self.0.send_reset_frame(error_code, ResetTarget::Control);
             debug!(
                 stream_id = self.0.stream_id.as_u64(),
                 "Reader dropped before FIN received - sent STOP_SENDING"
