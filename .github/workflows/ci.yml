@@ -947,7 +947,7 @@ jobs:
         run: cargo +stable xtask ci
 
   dc-wireshark:
-    if: false # Disabled in this fork: focus CI on s2n-quic-dc and s2n-quic-core crates (excluding dc/wireshark crate tooling)
+    if: false # Disabled in this fork: focus CI on s2n-quic-dc and s2n-quic-core
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
