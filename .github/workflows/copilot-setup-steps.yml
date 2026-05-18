@@ -73,18 +73,22 @@ jobs:
 
       - name: Setup cargo-mcp MCP config
         run: |
-          mkdir -p ~/.copilot
+          MCP_CONFIG_PATH="${HOME}/.copilot/mcp-config.json"
+          mkdir -p "$(dirname "$MCP_CONFIG_PATH")"
+          export MCP_CONFIG_PATH
           python - <<'PY'
           import json
+          import os
           import pathlib
 
-          config_path = pathlib.Path.home() / ".copilot" / "mcp-config.json"
+          config_path = pathlib.Path(os.environ["MCP_CONFIG_PATH"])
           config = {}
           if config_path.exists():
               try:
                   with config_path.open() as f:
                       config = json.load(f)
               except json.JSONDecodeError:
+                  print(f"warning: {config_path} contained invalid JSON; recreating config")
                   config = {}
 
           mcp_servers = config.setdefault("mcpServers", {})
