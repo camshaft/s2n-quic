@@ -71,6 +71,32 @@ jobs:
         if: steps.cache-cargo-mcp.outputs.cache-hit != 'true'
         run: cargo install --git https://github.com/camshaft/cargo-mcp --rev "${{ steps.versions.outputs.cargo_mcp_rev }}" cargo-mcp
 
+      - name: Setup cargo-mcp MCP config
+        run: |
+          mkdir -p ~/.copilot
+          python - <<'PY'
+          import json
+          import pathlib
+
+          config_path = pathlib.Path.home() / ".copilot" / "mcp-config.json"
+          config = {}
+          if config_path.exists():
+              with config_path.open() as f:
+                  config = json.load(f)
+
+          mcp_servers = config.setdefault("mcpServers", {})
+          mcp_servers["camshaft/cargo-mcp"] = {
+              "type": "local",
+              "command": "cargo-mcp",
+              "args": [],
+              "tools": ["*"],
+          }
+
+          with config_path.open("w") as f:
+              json.dump(config, f, indent=2, sort_keys=True)
+              f.write("\n")
+          PY
+
       - name: Cache duckdb binary
         id: cache-duckdb
         uses: actions/cache@v4
