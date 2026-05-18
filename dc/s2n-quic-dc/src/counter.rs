@@ -1638,8 +1638,11 @@ impl Topology {
     pub fn to_dot(&self) -> String {
         let mut out = String::from("digraph pipeline {\n  rankdir=LR;\n");
 
+        use std::collections::BTreeMap;
         let mut task_node_ids = std::collections::HashMap::new();
         let mut channel_node_ids = std::collections::HashMap::new();
+        let mut worker_task_nodes = BTreeMap::<usize, Vec<String>>::new();
+        let mut unassigned_task_nodes = Vec::new();
 
         // Render tasks
         for (idx, task) in self.tasks.iter().enumerate() {
@@ -1654,10 +1657,29 @@ impl Topology {
                 "{}\\nfn: {}\\nbudget: {}\\nmetrics: {}\\n{}",
                 task.name, task.function, budget, metrics, task.description
             );
+            let node_line = format!("{node_id} [shape=box,label=\"{}\"];\n", escape_dot(&label));
+
+            if let Some(worker_id) = task.worker_id {
+                worker_task_nodes.entry(worker_id).or_default().push(node_line);
+            } else {
+                unassigned_task_nodes.push(node_line);
+            }
+        }
+
+        for (worker_id, task_nodes) in worker_task_nodes {
             out.push_str(&format!(
-                "  {node_id} [shape=box,label=\"{}\"];\n",
-                escape_dot(&label)
+                "  subgraph cluster_worker_{worker_id} {{\n    label=\"worker {worker_id}\";\n    style=rounded;\n"
             ));
+            for node in task_nodes {
+                out.push_str("    ");
+                out.push_str(&node);
+            }
+            out.push_str("  }\n");
+        }
+
+        for node in unassigned_task_nodes {
+            out.push_str("  ");
+            out.push_str(&node);
         }
 
         // Render channels
@@ -2914,5 +2936,28 @@ mod tests {
         assert!(errors
             .iter()
             .any(|e| e.contains("q.test3") && e.contains("no senders")));
+    }
+
+    #[test]
+    fn topology_dot_groups_tasks_by_worker_id() {
+        let topology = Topology {
+            tasks: vec![
+                TaskRegistration::new("task.worker.1", "desc", "fn").with_worker_id(Some(1)),
+                TaskRegistration::new("task.worker.2", "desc", "fn").with_worker_id(Some(2)),
+                TaskRegistration::new("task.unassigned", "desc", "fn"),
+            ],
+            channels: vec![],
+            bindings: vec![],
+        };
+
+        let dot = topology.to_dot();
+
+        assert!(dot.contains("subgraph cluster_worker_1"));
+        assert!(dot.contains("subgraph cluster_worker_2"));
+        assert!(dot.contains("label=\"worker 1\""));
+        assert!(dot.contains("label=\"worker 2\""));
+        assert!(dot.contains("t0 [shape=box"));
+        assert!(dot.contains("t1 [shape=box"));
+        assert!(dot.contains("t2 [shape=box"));
     }
 }
