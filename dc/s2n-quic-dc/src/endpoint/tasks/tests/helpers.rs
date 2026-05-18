@@ -168,9 +168,35 @@ impl RecvContextBuilder {
     }
 }
 
-// ── Frame/Batch Helpers ──────────────────────────────────────────────────
+/// A sender that silently discards any value sent to it.
+///
+/// Use wherever an [`UnboundedSender`] is required but the output is irrelevant
+/// to the test (e.g. `ack_completions_tx` when no ACK frames are assembled).
+///
+/// [`UnboundedSender`]: crate::socket::channel::UnboundedSender
+pub struct Discard;
 
-/// Creates a PathSecretEntry with peer data addrs set (required for send::Cache).
+impl<T> crate::socket::channel::UnboundedSender<T> for Discard {
+    fn send(&mut self, _value: T) -> Result<(), T> {
+        Ok(())
+    }
+}
+
+
+/// Creates a PathSecretEntry for `addr`. Both the path-secret addr and the
+/// peer-data addr are set to the given address, making the entry suitable for
+/// building a [`send::Context`] that will transmit to that address.
+///
+/// The default [`test_entry`] uses `127.0.0.1:4433`. Prefer this variant when
+/// the test also drives a real (or simulated) UDP socket that is bound to a
+/// specific address — e.g. `10.0.0.1:4433` in the bach simulation environment.
+pub fn test_entry_at(addr: std::net::SocketAddr) -> Arc<PathSecretEntry> {
+    let pse = PathSecretEntry::fake_deterministic(addr, s2n_quic_core::endpoint::Type::Client);
+    pse.set_peer_data_addrs(&[addr]);
+    pse
+}
+
+
 pub fn test_entry() -> Arc<PathSecretEntry> {
     let addr: SocketAddr = "127.0.0.1:4433".parse().unwrap();
     let pse = PathSecretEntry::fake_deterministic(addr, s2n_quic_core::endpoint::Type::Client);
