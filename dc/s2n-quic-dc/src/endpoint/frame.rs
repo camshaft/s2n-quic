@@ -482,8 +482,8 @@ impl Header {
             }
             Self::FlowData { .. } => Priority::FlowData,
             Self::FlowControl { .. } | Self::FlowMaxData { .. } => Priority::FlowControl,
-            Self::FlowReset { .. } | Self::FlowInitReset { .. } => Priority::FlowReset,
-            Self::FlowInitFin { .. } => Priority::FlowInit,
+            Self::FlowReset { .. } => Priority::FlowReset,
+            Self::FlowInitReset { .. } | Self::FlowInitFin { .. } => Priority::FlowInit,
             Self::FlowInitValidate { .. } | Self::FlowValidateRequest { .. } => Priority::FlowRetry,
             // Ack frames are assembled directly from pending_acks, never queued by priority.
             Self::Ack { .. } => Priority::FlowControl,
