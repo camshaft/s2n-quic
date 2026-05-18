@@ -23,12 +23,12 @@ use core::time::Duration;
 use s2n_codec::EncoderBuffer;
 use std::net::SocketAddr;
 
-const SIGNER_SECRET: &[u8; 16] = b"ups-test-signer!";
+const STATELESS_RESET_TAG: &[u8; 16] = b"ups-test-signer!";
 const CREDENTIAL_BYTES: [u8; 16] = [0xAB; 16];
 
 fn encode_ups_packet(id: Id) -> Vec<u8> {
     let mut buf = [0u8; secret_control::MAX_PACKET_SIZE];
-    let stateless_reset: [u8; secret_control::TAG_LEN] = *SIGNER_SECRET;
+    let stateless_reset: [u8; secret_control::TAG_LEN] = *STATELESS_RESET_TAG;
     let len = secret_control::UnknownPathSecret {
         wire_version: WireVersion::ZERO,
         credential_id: id,

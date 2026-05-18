@@ -86,7 +86,7 @@ pub fn create(
         per_socket_send_rate: Rate::new(config.per_socket_bandwidth),
         budgets: endpoint::Budgets::default(),
         submission_shards: config.submission_shards,
-        ups_rate: Rate::new(0.001),
+        ups_rate: Rate::new(0.001), // 1 Mbps — small budget; UPS is low-volume control traffic
         ups_dedup_capacity: 1024,
         ups_dedup_window: core::time::Duration::from_secs(1),
     };
