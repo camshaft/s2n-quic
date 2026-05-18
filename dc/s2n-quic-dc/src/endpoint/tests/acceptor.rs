@@ -225,126 +225,112 @@ fn duplicate_init_accepted_only_once() {
 /// and completes a ping-pong exchange normally.
 ///
 /// Timing sketch (simulated wall-clock):
-///   t=0    – server registers capacity-1 acceptor, sleeps for 20 ms
-///   t≈1 ms – client1 FlowInit arrives at server dispatch, enters channel
-///   t≈2 ms – client2 FlowInit arrives, channel full → evict oldest (client1)
+///   t=0    – server registers capacity-1 acceptor, pre-registers slot, sleeps 20 ms
+///   t≈1 ms – client1 FlowInit dispatched, enters channel → [s1]
+///   t≈2 ms – client2 FlowInit dispatched, channel full → evict front (s1=ServerBusy) → [s2]
 ///   t=20ms – server wakes, accepts client2, echoes "ping"
 #[test]
 fn overflow_fifo_evicts_oldest_stream() {
-    let server_busy_count = Arc::new(AtomicUsize::new(0));
-    let success_count = Arc::new(AtomicUsize::new(0));
+    crate::testing::sim(|| {
+        use crate::testing::ext::*;
 
-    {
-        let server_busy_count = server_busy_count.clone();
-        let success_count = success_count.clone();
+        async move {
+            let server = Server::new();
+            // capacity=1, default Front eviction → oldest stream is evicted on overflow.
+            let mut acceptor = server
+                .register_acceptor_channel(ACCEPTOR_A, 1)
+                .expect("register");
 
-        crate::testing::sim(move || {
-            use crate::testing::ext::*;
+            // Pre-register the slot so it is visible to the sender when FlowInits arrive
+            // while the application task is sleeping.  Without this the sender finds no
+            // registered slots and immediately self-unregisters the acceptor.
+            let _ = acceptor.try_recv();
 
+            // Sleep long enough for both client FlowInits to be dispatched.
+            20.ms().sleep().await;
+
+            // Exactly one stream should remain in the channel (the newer one, s2).
+            while let Ok(Some(pending)) =
+                timeout(Duration::from_millis(100), acceptor.recv()).await
             {
-                let success_srv = success_count.clone();
-
-                async move {
-                    let server = Server::new();
-                    // capacity=1, default Front eviction → oldest stream is evicted on overflow
-                    let mut acceptor = server
-                        .register_acceptor_channel(ACCEPTOR_A, 1)
-                        .expect("register");
-
-                    // Sleep long enough for both client FlowInits to be processed by dispatch.
-                    20.ms().sleep().await;
-
-                    // Exactly one stream should be in the channel (the newer one).
-                    while let Ok(Some(pending)) =
-                        timeout(Duration::from_millis(100), acceptor.recv()).await
-                    {
-                        let stream = pending.validate().await.expect("validate");
-                        let (mut reader, mut writer) = stream.into_split();
-                        let mut buf = BytesMut::with_capacity(8);
-                        loop {
-                            let n = reader.read_into(&mut buf).await.expect("read");
-                            if n == 0 {
-                                break;
-                            }
-                        }
-                        let echo = Bytes::copy_from_slice(&buf);
-                        let mut echo = echo;
-                        writer.write_all_from_fin(&mut echo).await.expect("write");
-                        success_srv.fetch_add(1, Ordering::Relaxed);
+                let stream = pending.validate().await.expect("validate");
+                let (mut reader, mut writer) = stream.into_split();
+                let mut buf = BytesMut::with_capacity(8);
+                loop {
+                    let n = reader.read_into(&mut buf).await.expect("read");
+                    if n == 0 {
+                        break;
                     }
                 }
-                .group("server")
-                .spawn();
+                let echo = Bytes::copy_from_slice(&buf);
+                let mut echo = echo;
+                writer.write_all_from_fin(&mut echo).await.expect("write");
             }
+        }
+        .group("server")
+        .spawn();
 
-            {
-                let server_busy_cli = server_busy_count.clone();
-                let success_cli = success_count.clone();
+        async move {
+            let mut client = Client::new();
 
-                async move {
-                    let mut client = Client::new();
+            // Connect both clients and send data BEFORE reading any results.
+            // Reading results first would block the task until the server processes
+            // the first stream, preventing the second FlowInit from being sent in time.
+            let stream1 = client
+                .connect("server:0", ACCEPTOR_A)
+                .await
+                .expect("connect1");
+            let (mut reader1, mut writer1) = stream1.into_split();
+            let mut ping1 = Bytes::from_static(b"ping");
+            writer1.write_all_from_fin(&mut ping1).await.expect("write1");
 
-                    // Connect client1 and immediately write so the FlowInit is sent.
-                    let stream1 = client
-                        .connect("server:0", ACCEPTOR_A)
-                        .await
-                        .expect("connect1");
-                    let (mut reader1, mut writer1) = stream1.into_split();
-                    let mut ping1 = Bytes::from_static(b"ping");
-                    writer1.write_all_from_fin(&mut ping1).await.expect("write1");
+            let stream2 = client
+                .connect("server:0", ACCEPTOR_A)
+                .await
+                .expect("connect2");
+            let (mut reader2, mut writer2) = stream2.into_split();
+            let mut ping2 = Bytes::from_static(b"ping");
+            writer2.write_all_from_fin(&mut ping2).await.expect("write2");
 
-                    // Connect client2 and write.
-                    let stream2 = client
-                        .connect("server:0", ACCEPTOR_A)
-                        .await
-                        .expect("connect2");
-                    let (mut reader2, mut writer2) = stream2.into_split();
-                    let mut ping2 = Bytes::from_static(b"ping");
-                    writer2.write_all_from_fin(&mut ping2).await.expect("write2");
+            // Stream 1 was the oldest when stream 2 arrived; Front eviction drops it.
+            let err1 = timeout(
+                Duration::from_secs(2),
+                reader1.read_into(&mut BytesMut::with_capacity(8)),
+            )
+            .await
+            .expect("client1 read must complete within timeout")
+            .expect_err("stream 1 (oldest) must be evicted with a connection reset");
 
-                    // Wait for outcomes.  client1 was evicted (ServerBusy); client2 succeeded.
-                    let result1 = timeout(
-                        Duration::from_secs(2),
-                        reader1.read_into(&mut BytesMut::with_capacity(8)),
-                    )
-                    .await
-                    .expect("client1 read must complete");
-                    if result1.is_err() {
-                        server_busy_cli.fetch_add(1, Ordering::Relaxed);
-                    } else {
-                        success_cli.fetch_add(1, Ordering::Relaxed);
-                    }
+            assert_eq!(
+                err1.kind(),
+                io::ErrorKind::ConnectionReset,
+                "eviction must produce ConnectionReset on client1"
+            );
+            let code1 = err1
+                .get_ref()
+                .and_then(|c| c.downcast_ref::<Error>())
+                .copied()
+                .expect("reset must carry an endpoint error code");
+            assert_eq!(
+                code1,
+                Error::ServerBusy,
+                "evicted stream must carry ServerBusy, not {code1:?}"
+            );
 
-                    let result2 = timeout(
-                        Duration::from_secs(2),
-                        reader2.read_into(&mut BytesMut::with_capacity(8)),
-                    )
-                    .await
-                    .expect("client2 read must complete");
-                    if result2.is_err() {
-                        server_busy_cli.fetch_add(1, Ordering::Relaxed);
-                    } else {
-                        success_cli.fetch_add(1, Ordering::Relaxed);
-                    }
-                }
-                .group("client")
-                .primary()
-                .spawn();
-            }
-        });
-    }
-
-    assert_eq!(
-        server_busy_count.load(Ordering::Relaxed),
-        1,
-        "exactly one stream should receive ServerBusy"
-    );
-    assert_eq!(
-        success_count.load(Ordering::Relaxed),
-        // server increments once (echo completed) + client increments once (read succeeded)
-        2,
-        "server and client should each count one successful stream"
-    );
+            // Stream 2 survived (it was queued after eviction) and gets its echo back.
+            let n2 = timeout(
+                Duration::from_secs(2),
+                reader2.read_into(&mut BytesMut::with_capacity(8)),
+            )
+            .await
+            .expect("client2 read must complete within timeout")
+            .expect("stream 2 (newest) must succeed");
+            assert!(n2 > 0, "stream 2 must receive echoed data");
+        }
+        .group("client")
+        .primary()
+        .spawn();
+    });
 }
 
 // ── overflow_back_eviction_evicts_newest_queued ───────────────────────────────
@@ -363,8 +349,8 @@ fn overflow_fifo_evicts_oldest_stream() {
 ///   s3 → pop_back(s2) → [s1, s3] (s2 evicted, s3 enters)
 #[test]
 fn overflow_back_eviction_evicts_newest_queued() {
-    // Track which stream ID (1-indexed) completed vs. received ServerBusy.
-    let results: Arc<std::sync::Mutex<Vec<(usize, bool)>>> =
+    // Track which stream ID (1-indexed) completed vs. received a reset.
+    let results: Arc<std::sync::Mutex<Vec<(usize, Result<(), Error>)>>> =
         Arc::new(std::sync::Mutex::new(Vec::new()));
 
     {
@@ -374,8 +360,6 @@ fn overflow_back_eviction_evicts_newest_queued() {
             use crate::testing::ext::*;
 
             {
-                let results_srv = results.clone();
-
                 async move {
                     let server = Server::new();
                     let mut acceptor = server
@@ -388,13 +372,16 @@ fn overflow_back_eviction_evicts_newest_queued() {
                         )
                         .expect("register");
 
+                    // Pre-register the slot so it is visible to the sender when FlowInits
+                    // arrive while the application task is sleeping.
+                    let _ = acceptor.try_recv();
+
                     // Wait long enough for all three FlowInits to be dispatched.
                     30.ms().sleep().await;
 
                     while let Ok(Some(pending)) =
                         timeout(Duration::from_millis(100), acceptor.recv()).await
                     {
-                        let results_srv = results_srv.clone();
                         async move {
                             let stream = pending.validate().await.expect("validate");
                             let (mut reader, mut writer) = stream.into_split();
@@ -405,9 +392,6 @@ fn overflow_back_eviction_evicts_newest_queued() {
                                     break;
                                 }
                             }
-                            // The payload carries the stream index (1, 2, or 3).
-                            let idx = buf[0] as usize;
-                            results_srv.lock().unwrap().push((idx, true));
                             let echo = Bytes::copy_from_slice(&buf);
                             let mut echo = echo;
                             writer.write_all_from_fin(&mut echo).await.expect("write");
@@ -426,30 +410,41 @@ fn overflow_back_eviction_evicts_newest_queued() {
                 async move {
                     let mut client = Client::new();
 
-                    // Each "ping" carries a 1-byte stream index so we can identify which
-                    // stream was evicted vs. which completed.
+                    // Connect and write to ALL three streams before reading from any.
+                    // Reading after each write would block the task until the server
+                    // processes that stream, preventing the remaining FlowInits from
+                    // being dispatched while the server is still sleeping.
+                    let mut readers = Vec::new();
                     for idx in 1u8..=3 {
                         let stream = client
                             .connect("server:0", ACCEPTOR_A)
                             .await
                             .expect("connect");
-                        let (mut reader, mut writer) = stream.into_split();
+                        let (reader, mut writer) = stream.into_split();
                         let mut data = Bytes::from(vec![idx]);
                         writer.write_all_from_fin(&mut data).await.expect("write");
+                        readers.push((idx, reader));
+                    }
 
+                    // Now read the results for all three streams.
+                    for (idx, mut reader) in readers {
                         let mut buf = BytesMut::with_capacity(4);
-                        let result = timeout(
+                        let outcome = timeout(
                             Duration::from_secs(3),
                             reader.read_into(&mut buf),
                         )
                         .await
-                        .expect("read must complete");
+                        .expect("read must complete within timeout");
 
-                        let succeeded = result.is_ok();
-                        results_cli
-                            .lock()
-                            .unwrap()
-                            .push((idx as usize, succeeded));
+                        let result = match outcome {
+                            Ok(_) => Ok(()),
+                            Err(ref e) => Err(e
+                                .get_ref()
+                                .and_then(|c| c.downcast_ref::<Error>())
+                                .copied()
+                                .unwrap_or(Error::Unknown(VarInt::ZERO))),
+                        };
+                        results_cli.lock().unwrap().push((idx as usize, result));
                     }
                 }
                 .group("client")
@@ -460,30 +455,22 @@ fn overflow_back_eviction_evicts_newest_queued() {
     }
 
     let outcomes = results.lock().unwrap();
-    // Streams 1 and 3 should succeed; stream 2 should be evicted.
-    let succeeded: Vec<usize> = outcomes
-        .iter()
-        .filter(|(_, ok)| *ok)
-        .map(|(idx, _)| *idx)
-        .collect();
-    let failed: Vec<usize> = outcomes
-        .iter()
-        .filter(|(_, ok)| !*ok)
-        .map(|(idx, _)| *idx)
-        .collect();
-
-    assert!(
-        succeeded.contains(&1),
-        "stream 1 (oldest) must survive Back eviction; outcomes: {outcomes:?}"
-    );
-    assert!(
-        succeeded.contains(&3),
-        "stream 3 (newest arrival) must survive Back eviction; outcomes: {outcomes:?}"
-    );
-    assert!(
-        failed.contains(&2),
-        "stream 2 (newest queued when stream 3 arrives) must be evicted; outcomes: {outcomes:?}"
-    );
+    // Stream 1 (oldest) and stream 3 (newest arrival) must survive.
+    // Stream 2 (the back of the queue when stream 3 arrived) must be evicted with ServerBusy.
+    for (idx, result) in outcomes.iter() {
+        match idx {
+            1 | 3 => assert!(
+                result.is_ok(),
+                "stream {idx} must survive Back eviction; outcomes: {outcomes:?}"
+            ),
+            2 => assert_eq!(
+                *result,
+                Err(Error::ServerBusy),
+                "stream 2 (back of queue) must be evicted with ServerBusy; outcomes: {outcomes:?}"
+            ),
+            _ => unreachable!(),
+        }
+    }
 }
 
 // ── rejecting_acceptor_sends_reset_to_client ──────────────────────────────────
@@ -575,7 +562,13 @@ impl acceptor::Acceptor<PendingValidation> for RejectingAcceptor {
 ///
 /// The `ChannelAcceptor` holds its own [`Handle`] and drops it when `send`
 /// returns an error (no registered receiver slots).  Once unregistered, the
-/// endpoint dispatch returns `ACCEPTOR_NOT_FOUND` to the initiating client.
+/// endpoint dispatch returns `AcceptorNotFound` to the initiating client on
+/// any connection that arrives after the handle is gone.
+///
+/// Two connections are made to exercise both halves of the lifecycle:
+/// 1. First connection – no registered slots → `ChannelAcceptor` drops its
+///    handle (auto-unregister) and returns `ServerBusy` to the client.
+/// 2. Second connection – acceptor is now gone → dispatch returns `AcceptorNotFound`.
 #[test]
 fn receiver_drop_unregisters_acceptor() {
     crate::testing::sim(|| {
@@ -601,7 +594,7 @@ fn receiver_drop_unregisters_acceptor() {
                 }
                 unregistered_srv.store(true, Ordering::Release);
 
-                // Keep the server group alive for the client to connect and observe the reset.
+                // Keep the server group alive for both client connections.
                 2.s().sleep().await;
             }
             .group("server")
@@ -615,40 +608,67 @@ fn receiver_drop_unregisters_acceptor() {
             }
 
             let mut client = Client::new();
-            let mut stream = client
-                .connect("server:0", ACCEPTOR_A)
-                .await
-                .expect("connect");
 
-            let mut payload = Bytes::from_static(b"hello");
-            stream.write_from(&mut payload).await.expect("write");
+            // ── First connection ─────────────────────────────────────────────
+            // The ChannelAcceptor has no registered receiver slots.  Its `send`
+            // returns Err, which causes it to drop its Handle (auto-unregistration)
+            // and return Reject(ServerBusy) to dispatch.
+            {
+                let mut stream = client
+                    .connect("server:0", ACCEPTOR_A)
+                    .await
+                    .expect("first connect");
+                let mut payload = Bytes::from_static(b"hello");
+                stream.write_from(&mut payload).await.expect("first write");
 
-            let mut buf = BytesMut::with_capacity(8);
-            let err = timeout(
-                Duration::from_secs(1),
-                stream.read_into(&mut buf),
-            )
-            .await
-            .expect("read must complete within timeout")
-            .expect_err("stream must receive a reset after acceptor is unregistered");
+                let mut buf = BytesMut::with_capacity(8);
+                let err = timeout(Duration::from_secs(1), stream.read_into(&mut buf))
+                    .await
+                    .expect("first read must complete within timeout")
+                    .expect_err("stream must receive a reset (no registered receivers)");
 
-            assert_eq!(err.kind(), io::ErrorKind::ConnectionReset);
+                assert_eq!(err.kind(), io::ErrorKind::ConnectionReset);
+                let code = err
+                    .get_ref()
+                    .and_then(|c| c.downcast_ref::<Error>())
+                    .copied()
+                    .expect("first reset must carry an error code");
+                assert_eq!(
+                    code,
+                    Error::ServerBusy,
+                    "first failure must be ServerBusy (ChannelAcceptor self-rejects when no receivers)"
+                );
+            }
 
-            // After auto-unregistration the client should see either ServerBusy (if the
-            // ChannelAcceptor fires one last reject before dropping its handle) or
-            // AcceptorNotFound (if the acceptor was already gone when the FlowInit arrived).
-            let reset_code = err
-                .get_ref()
-                .and_then(|cause| cause.downcast_ref::<Error>())
-                .copied()
-                .expect("reset must carry an endpoint error code");
-            assert!(
-                matches!(
-                    reset_code,
-                    Error::ServerBusy | Error::AcceptorNotFound
-                ),
-                "unregistered acceptor must produce ServerBusy or AcceptorNotFound, got {reset_code:?}"
-            );
+            // ── Second connection ────────────────────────────────────────────
+            // The acceptor was unregistered by the first connection.  Dispatch
+            // now returns AcceptorNotFound directly.
+            {
+                let mut stream = client
+                    .connect("server:0", ACCEPTOR_A)
+                    .await
+                    .expect("second connect");
+                let mut payload = Bytes::from_static(b"hello");
+                stream.write_from(&mut payload).await.expect("second write");
+
+                let mut buf = BytesMut::with_capacity(8);
+                let err = timeout(Duration::from_secs(1), stream.read_into(&mut buf))
+                    .await
+                    .expect("second read must complete within timeout")
+                    .expect_err("stream must receive AcceptorNotFound after unregistration");
+
+                assert_eq!(err.kind(), io::ErrorKind::ConnectionReset);
+                let code = err
+                    .get_ref()
+                    .and_then(|c| c.downcast_ref::<Error>())
+                    .copied()
+                    .expect("second reset must carry an error code");
+                assert_eq!(
+                    code,
+                    Error::AcceptorNotFound,
+                    "second failure must be AcceptorNotFound (acceptor fully unregistered)"
+                );
+            }
         }
         .group("client")
         .primary()
@@ -691,7 +711,6 @@ fn multiple_acceptor_ids_route_independently() {
                     .spawn();
                 }
             }
-            .primary()
             .spawn();
 
             // Handle streams from acceptor B — echo "handled-by-B".
@@ -707,7 +726,6 @@ fn multiple_acceptor_ids_route_independently() {
                     .spawn();
                 }
             }
-            .primary()
             .spawn();
         }
         .group("server")
