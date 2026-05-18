@@ -35,8 +35,13 @@ interface RemoteViewerConfig {
   mermaidUrl?: string;
 }
 
+const VALID_ADAPTER_TYPES = ["none", "prometheus", "cloudwatch"] as const;
+
 function isAdapterType(value: unknown): value is AdapterConfig["type"] {
-  return value === "none" || value === "prometheus" || value === "cloudwatch";
+  return (
+    typeof value === "string" &&
+    (VALID_ADAPTER_TYPES as readonly string[]).includes(value)
+  );
 }
 
 function buildAdapter(config: {
@@ -190,7 +195,7 @@ export default function App() {
         const adapter = cfg.adapterConfig as Record<string, unknown>;
         if (!isAdapterType(adapter.type)) {
           throw new Error(
-            `Invalid adapterConfig.type "${String(adapter.type)}". Expected one of: none, prometheus, cloudwatch.`,
+            `Invalid adapterConfig.type "${String(adapter.type)}". Expected one of: ${VALID_ADAPTER_TYPES.join(", ")}.`,
           );
         }
         next.adapterConfig = {
