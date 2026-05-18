@@ -894,7 +894,7 @@ jobs:
           exit 1
 
   loom:
-    # Kept enabled: directly validates s2n-quic-core which is in scope for this fork.
+    # Kept enabled: validates s2n-quic-core concurrency behavior, which is in scope for this fork.
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -947,7 +947,7 @@ jobs:
         run: cargo +stable xtask ci
 
   dc-wireshark:
-    if: false # Disabled in this fork: focus CI on s2n-quic-dc and s2n-quic-core crates (excluding dc/wireshark tooling)
+    if: false # Disabled in this fork: focus CI on s2n-quic-dc and s2n-quic-core crates (excluding dc/wireshark crate tooling)
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
