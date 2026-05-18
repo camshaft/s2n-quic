@@ -69,6 +69,11 @@ impl PendingValidation {
     pub fn reset(&mut self, error: Error) {
         self.stream.reset(error);
     }
+
+    #[inline]
+    pub(crate) fn disable(&mut self) {
+        self.stream.disable();
+    }
 }
 
 /// A bidirectional stream composed of a [`Reader`] and [`Writer`].
@@ -137,6 +142,11 @@ impl Stream {
     /// future I/O should stop.
     pub fn reset(&mut self, error: Error) {
         self.read.send_reset(error.as_varint());
+        self.write.force_shutdown();
+    }
+
+    pub(crate) fn disable(&mut self) {
+        self.read.force_reset();
         self.write.force_shutdown();
     }
 

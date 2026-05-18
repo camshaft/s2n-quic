@@ -369,6 +369,14 @@ impl Reader {
         self.0.reassembler.reset();
     }
 
+    pub(crate) fn force_reset(&mut self) {
+        if self.0.status.is_terminal() {
+            return;
+        }
+        self.0.status.on_reset().ok();
+        self.0.reassembler.reset();
+    }
+
     /// Reads the next contiguous bytes into the destination buffer.
     ///
     /// The returned byte count may be smaller than `buf`'s remaining capacity.
