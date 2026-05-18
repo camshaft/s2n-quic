@@ -245,12 +245,21 @@ jobs:
           url: "${{ steps.s3.outputs.URL }}"
 
   test:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     needs: env
     strategy:
       fail-fast: false
       matrix:
-        rust: [stable]
+        include:
+          - os: ubuntu-latest
+            rust: stable
+            target: native
+          - os: ubuntu-latest
+            rust: stable
+            target: aarch64-unknown-linux-gnu
+          - os: macOS-latest
+            rust: stable
+            target: native
     steps:
       - uses: ilammy/setup-nasm@v1
       - uses: actions/checkout@v6
@@ -263,21 +272,31 @@ jobs:
         run: |
           rustup toolchain install ${{ matrix.rust }}
           rustup override set ${{ matrix.rust }}
+          rustup toolchain install ${{ matrix.rust }} ${{ matrix.target != 'native' && format('--target {0}', matrix.target) || '' }}
 
       - uses: camshaft/rust-cache@v1
         with:
-          key: dc-core-tests
+          key: dc-core-tests-${{ matrix.os }}-${{ matrix.target }}
 
       - uses: camshaft/install@v1
         with:
           crate: cargo-nextest
 
       - name: Run cargo nextest
+        if: ${{ matrix.target == 'native' }}
         run: |
           cargo nextest run -p s2n-quic-core -p s2n-quic-dc
 
+      - name: Install cross
+        if: ${{ matrix.target != 'native' }}
+        run: cargo install cross --git https://github.com/cross-rs/cross
+
+      - name: Run cross test
+        if: ${{ matrix.target != 'native' }}
+        run: |
+          cross test -p s2n-quic-core -p s2n-quic-dc --target ${{ matrix.target }}
+
   asan:
-    if: false # Disabled in this fork: focus CI on s2n-quic-dc and s2n-quic-core
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -313,7 +332,8 @@ jobs:
           cargo test \
             -Zbuild-std \
             --target x86_64-unknown-linux-gnu \
-            --workspace
+            -p s2n-quic-core \
+            -p s2n-quic-dc
 
   fips:
     if: false # Disabled in this fork: focus CI on s2n-quic-dc and s2n-quic-core
@@ -406,7 +426,6 @@ jobs:
           cdn: $CDN
 
   coverage:
-    if: false # Disabled in this fork: focus CI on s2n-quic-dc and s2n-quic-core
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -430,7 +449,7 @@ jobs:
         run: curl -LsSf https://github.com/taiki-e/cargo-llvm-cov/releases/latest/download/cargo-llvm-cov-x86_64-unknown-linux-gnu.tar.gz | tar xzf - -C ~/.cargo/bin
 
       - name: Run cargo llvm-cov
-        run: cargo llvm-cov --html --no-fail-fast --workspace --exclude s2n-quic-qns --all-features
+        run: cargo llvm-cov --html --no-fail-fast -p s2n-quic-core -p s2n-quic-dc --all-features
 
       - uses: aws-actions/configure-aws-credentials@v6.0.0
         if: github.event_name == 'push' || github.repository == github.event.pull_request.head.repo.full_name
@@ -631,7 +650,6 @@ jobs:
           url: "${{ steps.s3.outputs.URL }}"
 
   copyright:
-    if: false # Disabled in this fork: focus CI on s2n-quic-dc and s2n-quic-core
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -701,7 +719,6 @@ jobs:
 
   # ensures there are no unused snapshots
   snapshots:
-    if: false # Disabled in this fork: focus CI on s2n-quic-dc and s2n-quic-core
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -781,7 +798,6 @@ jobs:
           url: "${{ steps.s3.outputs.URL }}"
 
   typos:
-    if: false # Disabled in this fork: focus CI on s2n-quic-dc and s2n-quic-core
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -990,7 +1006,7 @@ jobs:
   ci-status-report:
     runs-on: ubuntu-latest
     if: ${{ always() }}
-    needs: [env, rustfmt, clippy, test, loom]
+    needs: [env, rustfmt, clippy, test, asan, coverage, copyright, snapshots, typos, loom]
     steps:
       - uses: aws-actions/configure-aws-credentials@v6.0.0
         if: github.event_name == 'push' || github.event_name == 'schedule' || github.repository == github.event.pull_request.head.repo.full_name
