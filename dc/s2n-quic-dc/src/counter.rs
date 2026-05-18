@@ -1736,95 +1736,55 @@ impl Topology {
     /// Generate a Mermaid flowchart representation of the topology.
     pub fn to_mermaid(&self) -> String {
         let mut out = String::from(
-            "flowchart LR\n  classDef task_header fill:#eef2ff,stroke:#4f46e5,stroke-width:2px,font-weight:bold;\n  classDef task_property fill:#f8fafc,stroke:#94a3b8,stroke-width:1px;\n",
+            "flowchart LR\n  classDef task_node fill:#eef2ff,stroke:#4f46e5,stroke-width:2px;\n  classDef channel_node fill:#ecfeff,stroke:#0891b2,stroke-width:2px;\n",
         );
 
         use std::collections::BTreeMap;
         let mut task_node_ids = std::collections::HashMap::new();
         let mut channel_node_ids = std::collections::HashMap::new();
-        let mut worker_task_blocks = BTreeMap::<usize, Vec<String>>::new();
-        let mut unassigned_task_blocks = Vec::new();
+        let mut worker_task_nodes = BTreeMap::<usize, Vec<String>>::new();
+        let mut unassigned_task_nodes = Vec::new();
 
         // Render tasks
         for (idx, task) in self.tasks.iter().enumerate() {
-            use core::fmt::Write as _;
-
-            let node_id = format!("t{idx}_name");
+            let node_id = format!("t{idx}");
             task_node_ids.insert(task.name.clone(), node_id.clone());
             let budget = task
                 .budget
                 .map(|v| v.to_string())
                 .unwrap_or_else(|| "none".to_string());
             let metrics = metric_summary(&task.metrics);
-            let fn_node_id = format!("t{idx}_fn");
-            let budget_node_id = format!("t{idx}_budget");
-            let metrics_node_id = format!("t{idx}_metrics");
-            let desc_node_id = format!("t{idx}_desc");
-            let mut task_block = String::new();
-            writeln!(
-                task_block,
-                "subgraph task_{idx}[\"{}\"]",
-                escape_mermaid(&task.name)
-            )
-            .unwrap();
-            task_block.push_str("  direction TB\n");
-            writeln!(task_block, "  {node_id}[\"name: {}\"]", escape_mermaid(&task.name)).unwrap();
-            writeln!(
-                task_block,
-                "  {fn_node_id}[\"fn: {}\"]",
-                escape_mermaid(&task.function)
-            )
-            .unwrap();
-            writeln!(
-                task_block,
-                "  {budget_node_id}[\"budget: {}\"]",
-                escape_mermaid(&budget)
-            )
-            .unwrap();
-            writeln!(
-                task_block,
-                "  {metrics_node_id}[\"metrics: {}\"]",
-                escape_mermaid(&metrics)
-            )
-            .unwrap();
-            writeln!(
-                task_block,
-                "  {desc_node_id}[\"desc: {}\"]",
-                escape_mermaid(&task.description)
-            )
-            .unwrap();
-            writeln!(task_block, "  {node_id} --- {fn_node_id}").unwrap();
-            writeln!(task_block, "  {fn_node_id} --- {budget_node_id}").unwrap();
-            writeln!(task_block, "  {budget_node_id} --- {metrics_node_id}").unwrap();
-            writeln!(task_block, "  {metrics_node_id} --- {desc_node_id}").unwrap();
-            task_block.push_str("end\n");
-            writeln!(task_block, "class {node_id} task_header;").unwrap();
-            writeln!(
-                task_block,
-                "class {fn_node_id},{budget_node_id},{metrics_node_id},{desc_node_id} task_property;"
-            )
-            .unwrap();
+            let label = format_mermaid_card(
+                &task.name,
+                [
+                    format!("fn: {}", task.function),
+                    format!("budget: {budget}"),
+                    format!("metrics: {metrics}"),
+                    format!("desc: {}", task.description),
+                ],
+            );
+            let node_line = format!("{node_id}[\"{}\"]\nclass {node_id} task_node;\n", label);
 
             if let Some(worker_id) = task.worker_id {
-                worker_task_blocks
+                worker_task_nodes
                     .entry(worker_id)
                     .or_default()
-                    .push(task_block);
+                    .push(node_line);
             } else {
-                unassigned_task_blocks.push(task_block);
+                unassigned_task_nodes.push(node_line);
             }
         }
 
-        for (worker_id, task_blocks) in worker_task_blocks {
+        for (worker_id, task_nodes) in worker_task_nodes {
             out.push_str(&format!("  subgraph worker_{worker_id}[worker {worker_id}]\n"));
-            for block in task_blocks {
-                push_indented(&mut out, "    ", &block);
+            for node in task_nodes {
+                push_indented(&mut out, "    ", &node);
             }
             out.push_str("  end\n");
         }
 
-        for block in unassigned_task_blocks {
-            push_indented(&mut out, "  ", &block);
+        for node in unassigned_task_nodes {
+            push_indented(&mut out, "  ", &node);
         }
 
         // Render channels
@@ -1832,11 +1792,18 @@ impl Topology {
             let node_id = format!("c{idx}");
             channel_node_ids.insert(channel.name.clone(), node_id.clone());
             let metrics = metric_summary(&channel.metrics);
-            let label = format!(
-                "{}\nfn: {}\nmetrics: {}\n{}",
-                channel.name, channel.function, metrics, channel.description
+            let label = format_mermaid_card(
+                &channel.name,
+                [
+                    format!("fn: {}", channel.function),
+                    format!("metrics: {metrics}"),
+                    format!("desc: {}", channel.description),
+                ],
             );
-            out.push_str(&format!("  {node_id}((\"{}\"))\n", escape_mermaid(&label)));
+            out.push_str(&format!(
+                "  {node_id}[\"{}\"]\n  class {node_id} channel_node;\n",
+                label
+            ));
         }
 
         // Render bindings
@@ -2040,6 +2007,17 @@ fn escape_mermaid(input: &str) -> String {
         .replace('"', "\\\"")
         .replace('\n', "<br/>")
         .replace('\r', "")
+}
+
+fn format_mermaid_card(header: &str, properties: impl IntoIterator<Item = String>) -> String {
+    let mut label = String::new();
+    label.push_str(header);
+    label.push_str("\n────────");
+    for property in properties {
+        label.push('\n');
+        label.push_str(&property);
+    }
+    escape_mermaid(&label)
 }
 
 fn push_indented(out: &mut String, indent: &str, block: &str) {
