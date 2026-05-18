@@ -88,7 +88,7 @@ jobs:
                   with config_path.open() as f:
                       config = json.load(f)
               except json.JSONDecodeError:
-                  print(f"warning: {config_path} contained invalid JSON; recreating config")
+                  print(f"::warning file={config_path}::{config_path} contained invalid JSON; recreating config")
                   config = {}
 
           if not isinstance(config, dict):
