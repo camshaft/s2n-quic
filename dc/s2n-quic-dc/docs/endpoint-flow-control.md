@@ -2,8 +2,8 @@
 
 ## Background and Problem Statement
 
-`s2n-quic-dc` streams are lightweight datagram-based flows that share a single UDP socket (or a small
-pool of them) on each endpoint. Unlike a traditional TCP connection, there is no OS-level send buffer
+`s2n-quic-dc` streams are lightweight datagram-based flows that share pools of send and receive UDP
+sockets on each endpoint. Unlike a traditional TCP connection, there is no OS-level send buffer
 acting as a natural throttle; writers push frames directly into an in-process channel and the transport
 pipeline drains them. This creates two related problems that interact badly with each other.
 
@@ -14,12 +14,13 @@ path-secret `local_send_max_data` parameter. That parameter is a path-level cons
 handshake time — it bounds how many bytes a single stream may have unacknowledged, but nothing
 bounds the aggregate across all streams on the endpoint at once.
 
-Under load, hundreds of application threads may each hold a `Writer` and call `write_all_from`
-concurrently. Each one independently decides it has budget and submits frames to the shared
-channel. The channel is bounded only by memory, so the endpoint accumulates an unbounded backlog of
-encrypted-but-not-yet-sent frames. This wastes memory, inflates latency (frames queued early sit
-behind a growing pile), and defeats the CCA's pacing signal: by the time BBR wants to send a packet
-its queue is already overflowing.
+Under load, hundreds of application threads — each hosting potentially hundreds of thousands or even
+millions of async tasks — may concurrently hold `Writer` handles and call `write_all_from`. Each
+task independently decides it has budget and submits frames to the shared channel. The channel is
+bounded only by memory, so the endpoint accumulates an unbounded backlog of unencrypted frames
+awaiting transmission. This wastes memory and inflates latency: frames queued early sit behind a
+growing pile and the pipeline must encrypt each one on demand as it drains, burning CPU on work
+that is already stale.
 
 PR [#103](https://github.com/camshaft/s2n-quic/pull/103) began addressing this for the `stream3`
 (now `stream`) module by adding an endpoint-local credit controller that tracks queued bytes and
@@ -49,8 +50,9 @@ actively reads from stream 0 and ignores streams 1..N-1 until stream 0 is done. 
 sending on its own stream and is willing to fill the per-stream window. Servers 1..N-1 fill their
 allowed windows, get ACKed by the transport, and ask for more. The client keeps advertising
 `MAX_DATA` for those streams because its transport layer is happy to buffer — it just never delivers
-to the application. Meanwhile the server for stream 0 may get blocked by its _own_ per-stream
-window if the client's advertised limit is also finite.
+to the application. Meanwhile the server for stream 0 gets blocked waiting on the endpoint-wide
+receive window on the client side: all of those credits have already been consumed by the inactive
+streams whose data is sitting buffered and unread.
 
 The result is a classical credit-based deadlock:
 - Active stream (0) is blocked waiting for window.
@@ -68,7 +70,10 @@ how much work is queued or in-flight across many streams, and both need the same
 - Sub-microsecond credit acquisition on the hot path.
 - No contention between unrelated streams.
 - Wakeup delivery that scales to hundreds of concurrent waiters.
-- Fairness: a slow or idle stream should not starve a fast one.
+- Configurable priority: whether starvation of lower-priority tiers is permitted is a policy knob,
+  not a hard constraint.
+- Same-tier fairness: streams at equal priority must share credits proportionally and a newly
+  arrived stream must be able to make progress.
 - Deadlock safety: active streams must always be able to make forward progress.
 
 A single primitive that solves both would reduce implementation surface area and make it easier to
@@ -96,9 +101,10 @@ credit because an idle reader is holding a large window.
 
 ### R3 — Lock-free credit acquisition on the fast path
 
-Hundreds of threads compete for shared budget. The common case — budget is available — must
-complete with a single atomic read-modify-write (e.g. `fetch_sub` on an `AtomicU64`). No mutex,
-no park, no syscall. Slow paths (budget exhausted, wakeup delivery) may use heavier primitives.
+Hundreds of threads, collectively hosting potentially millions of concurrent async tasks, compete
+for shared budget. The common case — budget is available — must complete with a single atomic
+read-modify-write (e.g. `fetch_sub` on an `AtomicI64`). No mutex, no park, no syscall. Slow paths
+(budget exhausted, wakeup delivery) may use heavier primitives.
 
 ### R4 — Symmetric API for send and receive
 
@@ -106,11 +112,21 @@ The mechanism should be the same data structure for both sides. A sender acquiri
 credits" and a receiver acquiring "receive-window credits" are the same operation on a shared pool.
 This halves the implementation surface and makes testing easier.
 
-### R5 — Fair, priority-aware credit distribution
+### R5 — Configurable priority and same-tier fairness
 
 When the budget is exhausted and multiple streams are waiting, credits should be distributed
-fairly (FIFO within a priority tier, round-robin across tiers). Higher-priority streams (e.g.
-latency-sensitive RPCs) may preempt lower-priority ones without starving them entirely.
+according to priority. Whether higher-priority streams may fully starve lower-priority ones is a
+policy choice that should be configurable: some workloads want strict priority pre-emption (latency-
+sensitive streams always go first regardless of how long lower-priority streams wait), while others
+want bounded starvation (lower-priority streams are slowed but never blocked indefinitely).
+
+Within a single priority tier, credit distribution must be fair: two streams at the same priority
+level should share the available budget between them rather than one monopolising it. Equally
+important, when a new stream joins at the same priority level the window must not be so exhausted
+that the newcomer waits forever — this is naturally enforced by limiting how many outstanding
+un-transmitted submissions a single sender may have queued at once. The socket send layer already
+paces itself; constraining each sender's in-flight submission count before the socket is a direct
+way to bound per-sender queuing and achieve the same effect at the application layer.
 
 ### R6 — Auto-tuning
 
@@ -155,21 +171,20 @@ subtract, unlock. If budget is zero, insert a waker entry into the wait list and
 
 ### Option B — Atomic token bucket with parking lot fallback
 
-**Description.** Use a single `AtomicU64` as the global byte budget. Acquisition:
-`fetch_sub(requested, Acquire)` and check the result; if the result remains ≥ 0 (using signed
-semantics or a compare-exchange loop), the credit is acquired without any lock. When the result
-goes negative the thread must park: re-add the requested amount, register in a wait queue
-(protected by a separate thin mutex used only when parking), and return `Poll::Pending`. Release:
-`fetch_add(returned, Release)`, then wake at most *k* waiters (where *k* is derived from the
-amount returned, not all waiters at once).
+**Description.** Use a single `AtomicI64` as the global byte budget. Acquisition:
+`fetch_sub(requested, Acquire)` and check the result; if the result is ≥ 0 the credit is granted
+without any lock. When the result goes negative the thread must park: restore by adding back the
+requested amount, register a waker in a wait queue (protected by a separate thin mutex used only
+when parking), and return `Poll::Pending`. Release: `fetch_add(returned, Release)`, then wake at
+most *k* waiters (where *k* is derived from the amount returned, not all waiters at once).
 
-More concretely using saturating subtraction:
+More concretely:
 
 ```
 loop {
     let current = BUDGET.load(Acquire);
-    if current < requested { park(); return Pending; }
-    if BUDGET.compare_exchange(current, current - requested).is_ok() { break; }
+    if current < requested as i64 { park(); return Pending; }
+    if BUDGET.compare_exchange(current, current - requested as i64, ...).is_ok() { break; }
 }
 ```
 
@@ -234,10 +249,13 @@ waiter count and a lock only for the wait list; acquisition is O(1) amortized.
 - Batch acquisition allows sending a send quantum's worth of data per wakeup.
 
 **Cons.**
-- Tokio semaphore is `!Send` across runtimes and harder to use from non-Tokio contexts (Beachhead's
-  runtime uses its own executor, bach for testing, etc.).
-- Permit = MTU granularity means that at 20 million streams the permit pool must hold up to
-  20M permits — may exceed `u32::MAX` permits that Tokio supports today.
+- Tight runtime coupling: `tokio::sync::Semaphore` integrates with Tokio's task scheduler and
+  waker infrastructure. It cannot be driven from other executors (s2n-quic-dc's own worker
+  runtime, bach for deterministic testing, etc.) without wrapping or duplicating the implementation.
+- Permit granularity: one permit must represent a fixed quantum of bytes. With millions of concurrent
+  streams each holding multiple permits, the permit count can grow very large; most semaphore
+  implementations limit the pool to `usize::MAX / 2` permits, but the real concern is the memory
+  cost of tracking that many outstanding permits across the waiter list.
 - Priority ordering requires wrapping or forking the semaphore.
 - Not symmetric with the receiver side without a custom implementation.
 
