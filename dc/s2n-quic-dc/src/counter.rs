@@ -1747,6 +1747,8 @@ impl Topology {
 
         // Render tasks
         for (idx, task) in self.tasks.iter().enumerate() {
+            use core::fmt::Write as _;
+
             let node_id = format!("t{idx}_name");
             task_node_ids.insert(task.name.clone(), node_id.clone());
             let budget = task
@@ -1758,15 +1760,50 @@ impl Topology {
             let budget_node_id = format!("t{idx}_budget");
             let metrics_node_id = format!("t{idx}_metrics");
             let desc_node_id = format!("t{idx}_desc");
-            let task_block = format!(
-                "subgraph task_{idx}[\"{}\"]\n  direction TB\n  {node_id}[\"name: {}\"]\n  {fn_node_id}[\"fn: {}\"]\n  {budget_node_id}[\"budget: {}\"]\n  {metrics_node_id}[\"metrics: {}\"]\n  {desc_node_id}[\"desc: {}\"]\n  {node_id} --- {fn_node_id}\n  {fn_node_id} --- {budget_node_id}\n  {budget_node_id} --- {metrics_node_id}\n  {metrics_node_id} --- {desc_node_id}\nend\nclass {node_id} task_header;\nclass {fn_node_id},{budget_node_id},{metrics_node_id},{desc_node_id} task_property;\n",
-                escape_mermaid(&task.name),
-                escape_mermaid(&task.name),
-                escape_mermaid(&task.function),
-                escape_mermaid(&budget),
-                escape_mermaid(&metrics),
-                escape_mermaid(&task.description),
-            );
+            let mut task_block = String::new();
+            writeln!(
+                task_block,
+                "subgraph task_{idx}[\"{}\"]",
+                escape_mermaid(&task.name)
+            )
+            .unwrap();
+            task_block.push_str("  direction TB\n");
+            writeln!(task_block, "  {node_id}[\"name: {}\"]", escape_mermaid(&task.name)).unwrap();
+            writeln!(
+                task_block,
+                "  {fn_node_id}[\"fn: {}\"]",
+                escape_mermaid(&task.function)
+            )
+            .unwrap();
+            writeln!(
+                task_block,
+                "  {budget_node_id}[\"budget: {}\"]",
+                escape_mermaid(&budget)
+            )
+            .unwrap();
+            writeln!(
+                task_block,
+                "  {metrics_node_id}[\"metrics: {}\"]",
+                escape_mermaid(&metrics)
+            )
+            .unwrap();
+            writeln!(
+                task_block,
+                "  {desc_node_id}[\"desc: {}\"]",
+                escape_mermaid(&task.description)
+            )
+            .unwrap();
+            writeln!(task_block, "  {node_id} --- {fn_node_id}").unwrap();
+            writeln!(task_block, "  {fn_node_id} --- {budget_node_id}").unwrap();
+            writeln!(task_block, "  {budget_node_id} --- {metrics_node_id}").unwrap();
+            writeln!(task_block, "  {metrics_node_id} --- {desc_node_id}").unwrap();
+            task_block.push_str("end\n");
+            writeln!(task_block, "class {node_id} task_header;").unwrap();
+            writeln!(
+                task_block,
+                "class {fn_node_id},{budget_node_id},{metrics_node_id},{desc_node_id} task_property;"
+            )
+            .unwrap();
 
             if let Some(worker_id) = task.worker_id {
                 worker_task_blocks
