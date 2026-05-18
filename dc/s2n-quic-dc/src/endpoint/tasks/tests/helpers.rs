@@ -3,14 +3,16 @@
 
 use crate::{
     endpoint::{
-        combinator::FrameBatch,
+        combinator::{AssemblerCounters, FrameBatch},
         frame::{self, Frame, Header},
+        msg, send,
     },
     intrusive::Entry,
     packet::datagram::QueuePair,
     path::secret::map::Entry as PathSecretEntry,
     socket::channel::{intrusive::unsync, Budget, EntryBoxSender, Receiver},
     stream::endpoint::recv,
+    time::bach::Clock,
 };
 use core::task::{Poll, Waker};
 use s2n_quic_core::varint::VarInt;
@@ -196,6 +198,17 @@ pub fn test_entry() -> Arc<PathSecretEntry> {
 
 /// Creates a minimal FlowData frame for testing pipeline plumbing.
 pub fn test_frame(pse: &Arc<PathSecretEntry>) -> Entry<Frame> {
+    test_frame_with_payload(pse, 0)
+}
+
+/// Creates a FlowData frame whose application payload is `payload_size` zero bytes.
+///
+/// Use this to produce frames whose encoded size approaches or exceeds a single MTU
+/// (1472 bytes in tests).  A payload of ~1300 bytes combined with packet overhead
+/// (~80 bytes) fills one segment; a second frame of any size then pushes the
+/// estimated packet length beyond the MTU limit, causing the assembler to push it
+/// back and re-arm the TX wheel.
+pub fn test_frame_with_payload(pse: &Arc<PathSecretEntry>, payload_size: usize) -> Entry<Frame> {
     Entry::new(Frame {
         header: Header::FlowData {
             queue_pair: QueuePair {
@@ -207,7 +220,7 @@ pub fn test_frame(pse: &Arc<PathSecretEntry>) -> Entry<Frame> {
             is_fin: false,
         },
         source_sender_id: VarInt::MAX,
-        payload: Default::default(),
+        payload: bytes::BytesMut::zeroed(payload_size).into(),
         path_secret_entry: pse.clone(),
         completion: None,
         status: frame::TransmissionStatus::Pending,
@@ -218,7 +231,86 @@ pub fn test_frame(pse: &Arc<PathSecretEntry>) -> Entry<Frame> {
 
 /// Creates a single-frame FrameBatch with sender_id=0.
 pub fn test_batch(pse: &Arc<PathSecretEntry>) -> Entry<FrameBatch> {
-    let mut batch = FrameBatch::single(test_frame(pse));
+    test_batch_with_payload(pse, 0)
+}
+
+/// Creates a single-frame FrameBatch carrying `payload_size` bytes of payload.
+///
+/// Two such batches pushed into a context (with `payload_size ≈ 1300`) will
+/// produce enough pending data that the assembler can only send the first one
+/// before hitting the per-segment MTU limit, leaving the second pending and
+/// re-arming the TX wheel.
+pub fn test_batch_with_payload(pse: &Arc<PathSecretEntry>, payload_size: usize) -> Entry<FrameBatch> {
+    let mut batch = FrameBatch::single(test_frame_with_payload(pse, payload_size));
     batch.set_sender_id(0);
     Entry::new(batch)
+}
+
+/// Creates a `send::Context` for `entry` wrapped in `Rc<RefCell<_>>`.
+///
+/// All three queue-depth gauges are registered under `test.inflight`, `test.ack`,
+/// and `test.pending`.  The context is immediately ready for use — callers push
+/// frames and set `ctx.borrow_mut().tx_wheel.target_time` as needed.
+pub fn build_send_context(
+    entry: &Arc<PathSecretEntry>,
+    sender_idx: usize,
+    registry: &crate::counter::Registry,
+    clock: &Clock,
+) -> std::rc::Rc<std::cell::RefCell<send::Context>> {
+    let ctx = send::Context::new(
+        entry,
+        registry.register_queue_gauge("test.inflight"),
+        registry.register_queue_gauge("test.ack"),
+        registry.register_queue_gauge("test.pending"),
+        sender_idx,
+        clock,
+    )
+    .expect("test context should be constructible");
+    std::rc::Rc::new(std::cell::RefCell::new(ctx))
+}
+
+/// Binds an ephemeral UDP socket, runs `send_socket_assembler` with fixed test defaults
+/// (source sender ID 0, port 0, `Gso::default()`, `Pool::new(u16::MAX)`, rate 100 Mbps),
+/// and drains the pipeline to completion.
+///
+/// Use this as the body of a spawned assembler task to avoid repeating pipeline-wiring
+/// boilerplate across tests.  Pass the output-side channel receivers to a separate task
+/// or follow-on async block for assertions.
+pub async fn assembler_pipeline(
+    ctx_rx: unsync::Receiver<send::TxWheelAdapter>,
+    clock: Clock,
+    cancelled_tx: unsync::ListSender<crate::intrusive::EntryAdapter<Frame>>,
+    ack_completions_tx: unsync::ListSender<crate::intrusive::EntryAdapter<msg::Sender>>,
+    asm_counters: AssemblerCounters,
+    tx_wheel_tx: unsync::Sender<send::TxWheelAdapter>,
+    pto_wheel_tx: unsync::Sender<send::PtoWheelAdapter>,
+    idle_wheel_tx: unsync::Sender<send::IdleWheelAdapter>,
+) {
+    use crate::{
+        endpoint::tasks,
+        socket::{pool::Pool, rate::Rate},
+    };
+    use bach::net::UdpSocket;
+    use s2n_quic_core::varint::VarInt;
+    use s2n_quic_platform::features::Gso;
+
+    let socket = UdpSocket::bind("0.0.0.0:0").await.unwrap();
+    let rx = tasks::send_socket_assembler(
+        ctx_rx,
+        clock,
+        VarInt::from_u8(0),
+        0,
+        Gso::default(),
+        Pool::new(u16::MAX),
+        cancelled_tx,
+        ack_completions_tx,
+        asm_counters,
+        Rate::new(100.0),
+        socket,
+        tx_wheel_tx,
+        pto_wheel_tx,
+        idle_wheel_tx,
+    );
+    use crate::socket::channel::ReceiverExt as _;
+    rx.drain_budgeted(Some(32)).await;
 }
