@@ -282,9 +282,9 @@ export default function App() {
           useTopologyStore.setState({ perKindMode: cfg.perKindMode });
         }
 
-        const stateMermaidUrl = useTopologyStore.getState().mermaidUrl;
+        const currentMermaidUrl = useTopologyStore.getState().mermaidUrl;
         const explicitMermaidUrl = cleanUrlInput(
-          overrideMermaidUrl ?? stateMermaidUrl,
+          overrideMermaidUrl ?? currentMermaidUrl,
         );
         const configMermaidUrl = cleanUrlInput(cfg.mermaidUrl ?? "");
 
@@ -353,31 +353,35 @@ export default function App() {
 
   // Initial load from query params (config + mermaid links), fallback to sample.
   useEffect(() => {
-    if (bootstrapRanRef.current) return;
-    bootstrapRanRef.current = true;
-
     let cancelled = false;
+    if (bootstrapRanRef.current) return;
 
     async function loadInitial() {
-      const params = new URLSearchParams(window.location.search);
-      const configFromQuery = cleanUrlInput(params.get("config") ?? "");
-      const mermaidFromQuery = cleanUrlInput(params.get("mermaid") ?? "");
+      try {
+        const params = new URLSearchParams(window.location.search);
+        const configFromQuery = cleanUrlInput(params.get("config") ?? "");
+        const mermaidFromQuery = cleanUrlInput(params.get("mermaid") ?? "");
 
-      if (configFromQuery) setConfigUrl(configFromQuery);
-      if (mermaidFromQuery) setMermaidUrl(mermaidFromQuery);
+        if (configFromQuery) setConfigUrl(configFromQuery);
+        if (mermaidFromQuery) setMermaidUrl(mermaidFromQuery);
 
-      if (configFromQuery) {
-        await loadConfigFromUrl(configFromQuery, mermaidFromQuery);
-        return;
-      }
+        if (configFromQuery) {
+          await loadConfigFromUrl(configFromQuery, mermaidFromQuery);
+          return;
+        }
 
-      if (mermaidFromQuery) {
-        await loadMermaidFromUrl(mermaidFromQuery);
-        return;
-      }
+        if (mermaidFromQuery) {
+          await loadMermaidFromUrl(mermaidFromQuery);
+          return;
+        }
 
-      if (!cancelled) {
-        setMermaidText(SAMPLE_MERMAID);
+        if (!cancelled) {
+          setMermaidText(SAMPLE_MERMAID);
+        }
+      } finally {
+        if (!cancelled) {
+          bootstrapRanRef.current = true;
+        }
       }
     }
 
