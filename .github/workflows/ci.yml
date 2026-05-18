@@ -167,6 +167,7 @@ jobs:
             CI clippy test should pass.
 
   udeps:
+    if: false # Disabled in this fork: focus CI on s2n-quic-dc and s2n-quic-core
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -194,6 +195,7 @@ jobs:
           RUSTC_WRAPPER: ""
 
   doc:
+    if: false # Disabled in this fork: focus CI on s2n-quic-dc and s2n-quic-core
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -243,47 +245,12 @@ jobs:
           url: "${{ steps.s3.outputs.URL }}"
 
   test:
-    runs-on: ${{ matrix.os }}
+    runs-on: ubuntu-latest
     needs: env
     strategy:
       fail-fast: false
       matrix:
-        rust: ${{ fromJson(needs.env.outputs.rust-versions) }}
-        os: [ubuntu-latest, macOS-latest, windows-latest]
-        target: [native]
-        env: [default]
-        include:
-          - rust: ${{ needs.env.outputs.msrv }}
-            # s2n-quic-dc-metrics crate' MSRV is 1.88.0, which is higher than the rest
-            exclude: --exclude s2n-quic-dc-metrics
-          - os: windows-latest
-            # s2n-tls and s2n-quic-dc don't currently build on windows
-            exclude: --exclude s2n-quic-tls --exclude s2n-quic-dc --exclude s2n-quic-dc-benches --exclude s2n-quic-dc-metrics
-          - rust: stable
-            os: ubuntu-latest
-            target: aarch64-unknown-linux-gnu
-            # s2n-quic-dc tests are too slow to be emulated with QEMU
-            exclude: --exclude s2n-quic-dc --exclude s2n-quic-dc-benches --exclude s2n-quic-dc-metrics
-          - rust: stable
-            os: ubuntu-latest
-            target: i686-unknown-linux-gnu
-            # s2n-quic-dc requires a large number of threads for testing, which isn't supported on i686
-            exclude: --exclude s2n-quic-dc --exclude s2n-quic-dc-benches --exclude s2n-quic-dc-metrics
-          - rust: stable
-            os: ubuntu-latest
-            target: x86_64-unknown-linux-musl
-            args: --features aws-lc-bindgen
-          # test with different platform features
-          - rust: stable
-            os: ubuntu-latest
-            target: native
-            env: S2N_QUIC_PLATFORM_FEATURES_OVERRIDE=""
-            # s2n-quic-dc requires platform features
-            exclude: --exclude s2n-quic-dc --exclude s2n-quic-dc-benches --exclude s2n-quic-dc-metrics
-          - rust: stable
-            os: ubuntu-latest
-            target: native
-            env: S2N_QUIC_PLATFORM_FEATURES_OVERRIDE="mtu_disc,pktinfo,tos,socket_msg" >> $GITHUB_ENV; echo S2N_QUIC_RUN_VERSION_SPECIFIC_TESTS=1
+        rust: [stable]
     steps:
       - uses: ilammy/setup-nasm@v1
       - uses: actions/checkout@v6
@@ -291,46 +258,30 @@ jobs:
           lfs: true
           submodules: true
 
-      - name: Install cross target
-        if: ${{ matrix.target != 'native' }}
-        run: |
-          rustup target add ${{ matrix.target }}
-
       - name: Install rust toolchain
         id: toolchain
         run: |
           rustup toolchain install ${{ matrix.rust }}
           rustup override set ${{ matrix.rust }}
-          # if not 'native', this install the toolchain for target, otherwise it's a noop
-          rustup toolchain install ${{ matrix.rust }} ${{ matrix.target != 'native' && format('--target {0}', matrix.target) || '' }}
-
-      - name: Install cross
-        if: ${{ matrix.target != 'native' }}
-        run: cargo install cross --git https://github.com/cross-rs/cross
 
       - uses: camshaft/rust-cache@v1
-        with:
-          key: ${{ matrix.target }}
 
       - name: Restore fuzz corpus
         shell: bash
         run: |
           find . -name 'corpus.tar.gz' -exec dirname {} ';' | xargs -L 1 bash -c 'cd "$0" && rm -rf corpus && tar xf corpus.tar.gz'
 
-      - name: Set environment variables
-        if: ${{ matrix.env != 'default' }}
-        run: echo ${{ matrix.env }} >> $GITHUB_ENV
-
       # Build the tests before running to improve cross compilation speed
       - name: Run cargo/cross build
         run: |
-          ${{ matrix.target != 'native' && 'cross' || 'cargo' }} build --tests --workspace ${{ matrix.exclude }} ${{ matrix.target != 'native' && format('--target {0}', matrix.target) || '' }} ${{ matrix.args }}
+          cargo build --tests -p s2n-quic-core -p s2n-quic-dc
 
       - name: Run cargo/cross test
         run: |
-          ${{ matrix.target != 'native' && 'cross' || 'cargo' }} test --workspace ${{ matrix.exclude }} ${{ matrix.target != 'native' && format('--target {0}', matrix.target) || '' }} ${{ matrix.args }}
+          cargo test -p s2n-quic-core -p s2n-quic-dc
 
   asan:
+    if: false # Disabled in this fork: focus CI on s2n-quic-dc and s2n-quic-core
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -369,6 +320,7 @@ jobs:
             --workspace
 
   fips:
+    if: false # Disabled in this fork: focus CI on s2n-quic-dc and s2n-quic-core
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -392,6 +344,7 @@ jobs:
           cargo test --no-default-features --features "provider-tls-fips provider-tls-s2n"
 
   miri:
+    if: false # Disabled in this fork: focus CI on s2n-quic-dc and s2n-quic-core
     runs-on:
       labels: ubuntu-latest
     strategy:
@@ -421,6 +374,7 @@ jobs:
           MIRIFLAGS: -Zmiri-disable-isolation
 
   no_std:
+    if: false # Disabled in this fork: focus CI on s2n-quic-dc and s2n-quic-core
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -439,6 +393,7 @@ jobs:
         run: ./scripts/test_no_std ${{ env.RUST_NIGHTLY_TOOLCHAIN }}
 
   compliance:
+    if: false # Disabled in this fork: focus CI on s2n-quic-dc and s2n-quic-core
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -455,6 +410,7 @@ jobs:
           cdn: $CDN
 
   coverage:
+    if: false # Disabled in this fork: focus CI on s2n-quic-dc and s2n-quic-core
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -514,6 +470,7 @@ jobs:
   # workspace build. We make sure that the crates build with default features,
   # otherwise release to crates.io will be blocked
   crates:
+    if: false # Disabled in this fork: focus CI on s2n-quic-dc and s2n-quic-core
     needs: env
     runs-on: ubuntu-latest
     strategy:
@@ -535,6 +492,7 @@ jobs:
         run: cargo build --manifest-path ${{ matrix.crate }}
 
   examples:
+    if: false # Disabled in this fork: focus CI on s2n-quic-dc and s2n-quic-core
     needs: env
     runs-on: ubuntu-latest
     strategy:
@@ -576,6 +534,7 @@ jobs:
         run: cargo build
 
   recovery-simulations:
+    if: false # Disabled in this fork: focus CI on s2n-quic-dc and s2n-quic-core
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -624,6 +583,7 @@ jobs:
           url: "${{ steps.s3.outputs.URL }}"
 
   sims:
+    if: false # Disabled in this fork: focus CI on s2n-quic-dc and s2n-quic-core
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -675,6 +635,7 @@ jobs:
           url: "${{ steps.s3.outputs.URL }}"
 
   copyright:
+    if: false # Disabled in this fork: focus CI on s2n-quic-dc and s2n-quic-core
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -684,6 +645,7 @@ jobs:
           ./scripts/copyright_check
 
   s2n-events:
+    if: false # Disabled in this fork: focus CI on s2n-quic-dc and s2n-quic-core
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -717,6 +679,7 @@ jobs:
 
   # ensures the event codegen is up to date
   generate-events:
+    if: false # Disabled in this fork: focus CI on s2n-quic-dc and s2n-quic-core
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -742,6 +705,7 @@ jobs:
 
   # ensures there are no unused snapshots
   snapshots:
+    if: false # Disabled in this fork: focus CI on s2n-quic-dc and s2n-quic-core
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -773,6 +737,7 @@ jobs:
   # generates a report of time spent in compilation
   # https://doc.rust-lang.org/stable/cargo/reference/timings.html
   timing:
+    if: false # Disabled in this fork: focus CI on s2n-quic-dc and s2n-quic-core
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -820,6 +785,7 @@ jobs:
           url: "${{ steps.s3.outputs.URL }}"
 
   typos:
+    if: false # Disabled in this fork: focus CI on s2n-quic-dc and s2n-quic-core
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -844,6 +810,7 @@ jobs:
           ! grep -q '[^[:space:]]' /tmp/typos.json
 
   kani:
+    if: false # Disabled in this fork: focus CI on s2n-quic-dc and s2n-quic-core
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -860,6 +827,7 @@ jobs:
           working-directory: ${{ matrix.crate }}
 
   dhat:
+    if: false # Disabled in this fork: focus CI on s2n-quic-dc and s2n-quic-core
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -956,6 +924,7 @@ jobs:
           RUSTFLAGS: --cfg loom -Cdebug-assertions
 
   xdp:
+    if: false # Disabled in this fork: focus CI on s2n-quic-dc and s2n-quic-core
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -981,6 +950,7 @@ jobs:
         run: cargo +stable xtask ci
 
   dc-wireshark:
+    if: false # Disabled in this fork: focus CI on s2n-quic-dc and s2n-quic-core
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -1023,7 +993,7 @@ jobs:
   ci-status-report:
     runs-on: ubuntu-latest
     if: ${{ always() }}
-    needs: [env, rustfmt, clippy, udeps, doc, test, asan, fips, miri, no_std, compliance, coverage, crates, examples, recovery-simulations, sims, copyright, s2n-events, generate-events, snapshots, timing, typos, kani, dhat, loom, xdp, dc-wireshark]
+    needs: [env, rustfmt, clippy, test, loom]
     steps:
       - uses: aws-actions/configure-aws-credentials@v6.0.0
         if: github.event_name == 'push' || github.event_name == 'schedule' || github.repository == github.event.pull_request.head.repo.full_name
