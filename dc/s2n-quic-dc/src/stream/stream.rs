@@ -74,6 +74,9 @@ impl PendingValidation {
     ///
     /// Intended for rejection paths where the caller sends the reset frame via
     /// endpoint dispatch and only needs to suppress per-half Drop side effects.
+    /// This is safe to call before validation completes because it only updates
+    /// local stream-halves state and intentionally bypasses user-facing
+    /// validation flow.
     #[inline]
     pub(crate) fn disable(&mut self) {
         self.stream.disable();

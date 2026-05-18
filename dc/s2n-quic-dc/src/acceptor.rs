@@ -67,8 +67,26 @@ pub struct Dispatch {
 /// Rejection returned by an acceptor.
 #[derive(Debug)]
 pub struct Reject<T> {
+    /// The original request value being rejected.
+    ///
+    /// Ownership is returned to the caller so endpoint dispatch can perform
+    /// cleanup (for example, disabling stream drop side effects) before
+    /// emitting reset frames.
     pub request: T,
-    pub reset_code: VarInt,
+    /// The endpoint reset reason to send to the peer.
+    pub reset: crate::endpoint::error::Error,
+}
+
+impl<T> Reject<T> {
+    #[inline]
+    pub fn new(request: T, reset: crate::endpoint::error::Error) -> Self {
+        Self { request, reset }
+    }
+
+    #[inline]
+    pub fn reset_code(&self) -> VarInt {
+        self.reset.as_varint()
+    }
 }
 
 /// Trait for handling incoming requests
@@ -82,10 +100,10 @@ pub trait Acceptor<T>: Send + Sync + 'static {
     ///
     /// Returns a `Dispatch` indicating the action to take and an `AutoWake`.
     fn handle_pending(&self, request: T) -> Result<Dispatch, Reject<T>> {
-        Err(Reject {
+        Err(Reject::new(
             request,
-            reset_code: VarInt::from_u32(0),
-        })
+            crate::endpoint::error::Error::Unknown(VarInt::from_u32(0)),
+        ))
     }
 }
 
@@ -176,6 +194,9 @@ impl<T: Send + 'static> Registry<T> {
     }
 
     /// Looks up an acceptor by ID and runs the closure with a borrowed acceptor.
+    ///
+    /// `DashMap` uses sharded locking, so read-heavy workloads can run many
+    /// lookups concurrently with minimal contention.
     pub fn with_acceptor<R>(
         &self,
         acceptor_id: VarInt,

@@ -567,7 +567,7 @@ fn handle_flow_init(
                                 attempt_id = attempt_id.as_u64(),
                                 stream_id = stream_id.as_u64(),
                                 acceptor_id = acceptor_id.as_u64(),
-                                reset_code = reject.reset_code.as_u64(),
+                                reset_code = reject.reset_code().as_u64(),
                                 "FlowInit rejected - acceptor requested reset"
                             );
                             push_reset_frame(
@@ -576,7 +576,7 @@ fn handle_flow_init(
                                 &peer.path_entry,
                                 peer_queue_id,
                                 stream_id,
-                                reject.reset_code,
+                                reject.reset_code(),
                             );
                         }
                     }
@@ -701,12 +701,11 @@ fn handle_flow_init(
                         Err(mut reject) => {
                             reject.request.disable();
                             counters.rx_init_reject.add(1);
-                            counters.rx_init_acceptor_reset.add(1);
                             tracing::debug!(
                                 attempt_id = attempt_id.as_u64(),
                                 stream_id = stream_id.as_u64(),
                                 acceptor_id = acceptor_id.as_u64(),
-                                reset_code = reject.reset_code.as_u64(),
+                                reset_code = reject.reset_code().as_u64(),
                                 "FlowInit rejected"
                             );
                             push_reset_frame(
@@ -715,7 +714,7 @@ fn handle_flow_init(
                                 &peer.path_entry,
                                 peer_queue_id,
                                 stream_id,
-                                reject.reset_code,
+                                reject.reset_code(),
                             );
                         }
                     }

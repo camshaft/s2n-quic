@@ -217,10 +217,10 @@ impl ChannelAcceptor {
             Ok((None, waker)) => Ok(AutoWake::new(waker)),
             Err(stream) => {
                 drop(self.handle.lock().unwrap().take());
-                Err(acceptor::Reject {
-                    request: stream,
-                    reset_code: Error::AcceptorNotFound.as_varint(),
-                })
+                Err(acceptor::Reject::new(
+                    stream,
+                    crate::endpoint::error::Error::ServerBusy,
+                ))
             }
         }
     }
