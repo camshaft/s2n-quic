@@ -203,11 +203,9 @@ pub fn test_frame(pse: &Arc<PathSecretEntry>) -> Entry<Frame> {
 
 /// Creates a FlowData frame whose application payload is `payload_size` zero bytes.
 ///
-/// Use this to produce frames whose encoded size approaches or exceeds a single MTU
-/// (1472 bytes in tests).  A payload of ~1300 bytes combined with packet overhead
-/// (~80 bytes) fills one segment; a second frame of any size then pushes the
-/// estimated packet length beyond the MTU limit, causing the assembler to push it
-/// back and re-arm the TX wheel.
+/// Use a payload large enough that two frames together exceed one MTU: the assembler
+/// will only be able to pack the first into a single segment and will push the second
+/// back, causing it to re-arm the TX wheel.
 pub fn test_frame_with_payload(pse: &Arc<PathSecretEntry>, payload_size: usize) -> Entry<Frame> {
     Entry::new(Frame {
         header: Header::FlowData {
@@ -236,10 +234,9 @@ pub fn test_batch(pse: &Arc<PathSecretEntry>) -> Entry<FrameBatch> {
 
 /// Creates a single-frame FrameBatch carrying `payload_size` bytes of payload.
 ///
-/// Two such batches pushed into a context (with `payload_size ≈ 1300`) will
-/// produce enough pending data that the assembler can only send the first one
-/// before hitting the per-segment MTU limit, leaving the second pending and
-/// re-arming the TX wheel.
+/// Use two such batches pushed into a context with a large enough payload to ensure
+/// the assembler can only fit the first into one segment, leaving the second pending
+/// and re-arming the TX wheel.
 pub fn test_batch_with_payload(pse: &Arc<PathSecretEntry>, payload_size: usize) -> Entry<FrameBatch> {
     let mut batch = FrameBatch::single(test_frame_with_payload(pse, payload_size));
     batch.set_sender_id(0);

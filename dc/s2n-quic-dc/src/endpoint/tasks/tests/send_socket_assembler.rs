@@ -94,7 +94,7 @@ fn assembler_channels(registry: &crate::counter::Registry) -> AssemblerChannels 
 }
 
 /// Binds an ephemeral UDP socket, runs `send_socket_assembler` with fixed test defaults
-/// (source sender ID 0, port 0, `Gso::default()`, `Pool::new(u16::MAX)`, rate 100 Mbps),
+/// (source sender ID 0, port 0, `Gso::default()`, `Pool::new(u16::MAX)`, rate 100 Gbps),
 /// and drains the pipeline to completion.
 ///
 /// Use this as the body of a spawned assembler task.  Callers pass the pipeline-side
@@ -265,12 +265,23 @@ fn reassembles_context_to_tx_wheel_when_data_remains() {
         } = assembler_channels(&registry);
 
         // Recv side: exactly one datagram should arrive (only the first frame fits).
+        // A second recv wrapped in a short timeout must time out to confirm no extra
+        // datagrams were sent.
         async {
             let recv_socket = UdpSocket::bind("0.0.0.0:4433").await.unwrap();
             let mut buf = vec![0u8; 2000];
             let (n, _peer) = recv_socket.recv_from(&mut buf).await.unwrap();
             tracing::debug!(n, "received encrypted datagram at server");
             assert!(n > 0, "assembler should have sent the first large frame");
+
+            // Assert no second datagram arrives.
+            let result =
+                bach::time::timeout(Duration::from_millis(1), recv_socket.recv_from(&mut buf))
+                    .await;
+            assert!(
+                result.is_err(),
+                "only one datagram should be sent — second recv must time out"
+            );
         }
         .group("server")
         .primary()
@@ -322,9 +333,9 @@ fn reassembles_context_to_tx_wheel_when_data_remains() {
             let ctx = build_send_context(&entry, 0, &registry, &clock);
             {
                 let mut c = ctx.borrow_mut();
-                // Push two large frames.  Each has ~1300 bytes of payload;
-                // combined they exceed one MTU (1472 bytes), so the assembler
-                // can only pack the first into the single allowed segment.
+                // Push two large frames — each with a payload large enough that both
+                // together exceed one MTU, so the assembler can only pack the first
+                // into the single allowed segment.
                 let _ = c.push_batch(test_batch_with_payload(&entry, 1300).into_inner(), &clock);
                 let _ = c.push_batch(test_batch_with_payload(&entry, 1300).into_inner(), &clock);
                 c.tx_wheel.target_time = Some(clock.now());
