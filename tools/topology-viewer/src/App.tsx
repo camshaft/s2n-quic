@@ -283,13 +283,13 @@ export default function App() {
         }
 
         const currentMermaidUrl = useTopologyStore.getState().mermaidUrl;
-        const explicitMermaidUrl = cleanUrlInput(
+        const effectiveMermaidUrl = cleanUrlInput(
           overrideMermaidUrl ?? currentMermaidUrl,
         );
         const configMermaidUrl = cleanUrlInput(cfg.mermaidUrl ?? "");
 
-        if (explicitMermaidUrl) {
-          await loadMermaidFromUrl(explicitMermaidUrl);
+        if (effectiveMermaidUrl) {
+          await loadMermaidFromUrl(effectiveMermaidUrl);
         } else if (configMermaidUrl) {
           setMermaidUrl(configMermaidUrl);
           await loadMermaidFromUrl(configMermaidUrl);
@@ -354,9 +354,9 @@ export default function App() {
   // Initial load from query params (config + mermaid links), fallback to sample.
   useEffect(() => {
     let cancelled = false;
-    if (bootstrapRanRef.current) return;
 
     async function loadInitial() {
+      if (bootstrapRanRef.current) return;
       try {
         const params = new URLSearchParams(window.location.search);
         const configFromQuery = cleanUrlInput(params.get("config") ?? "");
