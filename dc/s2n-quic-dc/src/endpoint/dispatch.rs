@@ -101,8 +101,9 @@ where
         ) {
             Some(v) => v,
             None => {
-                let dest_addr =
-                    crate::msg::addr::Addr::new(packet.storage().remote_address().get());
+                let remote_addr = packet.storage().remote_address().get();
+                let mut dest_addr = crate::msg::addr::Addr::new(remote_addr);
+                dest_addr.set_port(packet.source_control_port());
                 return Err(Error::PeerStateLookup {
                     dest_addr,
                     credentials,
