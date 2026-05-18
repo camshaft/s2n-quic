@@ -98,6 +98,7 @@ fn client_write_half_close() {
                         .write_all_from_fin(&mut resp)
                         .await
                         .expect("server write");
+                    drop(writer);
                 }
                 .primary()
                 .spawn();
@@ -121,6 +122,7 @@ fn client_write_half_close() {
                 .write_all_from_fin(&mut data)
                 .await
                 .expect("client write");
+            drop(writer);
 
             // Client read half is still open: read the server's response.
             let mut buf = BytesMut::with_capacity(16);
@@ -176,6 +178,7 @@ fn server_write_half_close() {
                         .write_all_from_fin(&mut greeting)
                         .await
                         .expect("server write");
+                    drop(writer);
 
                     // Server read half is still open: drain the client request.
                     let mut buf = BytesMut::with_capacity(8);
@@ -202,6 +205,7 @@ fn server_write_half_close() {
             // server side via FlowInit, marks client write side as done).
             let mut req = Bytes::from_static(b"req");
             writer.write_all_from_fin(&mut req).await.expect("req");
+            drop(writer);
 
             // Client read half is still open: read the server's greeting to EOF.
             let mut buf = BytesMut::with_capacity(16);
@@ -244,6 +248,7 @@ fn both_sides_half_close() {
                         .write_all_from_fin(&mut data)
                         .await
                         .expect("server write");
+                    drop(writer);
 
                     // Server then reads the client's data to EOF.
                     let mut buf = BytesMut::with_capacity(32);
@@ -273,6 +278,7 @@ fn both_sides_half_close() {
                 .write_all_from_fin(&mut data)
                 .await
                 .expect("client write");
+            drop(writer);
 
             // Client reads server data to EOF.
             let mut buf = BytesMut::with_capacity(32);
@@ -652,6 +658,7 @@ fn shutdown_is_idempotent() {
             writer.shutdown().expect("shutdown 1");
             writer.shutdown().expect("shutdown 2");
             writer.shutdown().expect("shutdown 3");
+            drop(writer);
 
             let mut buf = BytesMut::with_capacity(8);
             read_to_eof!(reader, buf);
@@ -703,6 +710,7 @@ fn reader_drop_after_eof_does_not_send_stop_sending() {
                         .write_all_from_fin(&mut data)
                         .await
                         .expect("server write must succeed without ConnectionReset");
+                    drop(writer);
                 }
                 .primary()
                 .spawn();
@@ -723,6 +731,7 @@ fn reader_drop_after_eof_does_not_send_stop_sending() {
             // Establish the stream with a request + FIN.
             let mut req = Bytes::from_static(b"req");
             writer.write_all_from_fin(&mut req).await.expect("req");
+            drop(writer);
 
             // Read the server's full response to EOF.
             let mut buf = BytesMut::with_capacity(16);
@@ -765,6 +774,7 @@ fn write_after_shutdown_returns_broken_pipe() {
 
                     let mut resp = Bytes::from_static(b"ok");
                     writer.write_all_from_fin(&mut resp).await.expect("resp");
+                    drop(writer);
                 }
                 .primary()
                 .spawn();
@@ -800,6 +810,7 @@ fn write_after_shutdown_returns_broken_pipe() {
                 std::io::ErrorKind::BrokenPipe,
                 "expected BrokenPipe after shutdown, got: {err:?}"
             );
+            drop(writer);
 
             let mut buf = BytesMut::with_capacity(8);
             read_to_eof!(reader, buf);
