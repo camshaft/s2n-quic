@@ -560,7 +560,7 @@ expression: logs
 0:00:05.000000000 [client] DEBUG Writer dropping stream_id=0 status=FinSent next_offset=1024 inflight_bytes=1024 remote_max_data=0
 0:00:05.000000000 [client] DEBUG event=on_shutdown prev=FinSent next=Shutdown location=dc/s2n-quic-dc/src/stream/writer.rs:514:25
 0:00:05.000000000 [client] DEBUG Reader dropping stream_id=0 status=Open final_size=None consumed_len=0 total_received_len=0 is_writing_complete=false is_reading_complete=false
-0:00:05.000000000 [client] DEBUG Sent FlowReset stream_id=0 error_code=6 reset_target=Stream
+0:00:05.000000000 [client] DEBUG Sent FlowReset stream_id=0 error_code=6 reset_target=Control
 0:00:05.000000000 [client] DEBUG Reader dropped before FIN received - sent STOP_SENDING stream_id=0
 0:00:05.000000000 [client] TRACE c#q.router_to_batcher.enq[p0]=1
 0:00:05.000000000 [client] TRACE g#q.router_to_batcher.depth[p0]=1
