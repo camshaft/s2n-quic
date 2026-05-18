@@ -47,7 +47,7 @@ function keyToPromQL(key: string, prefix?: string): string {
     .join("_");
 
   const escapedVariant = variant
-    ? variant.replace(/\\/g, "\\\\").replace(/"/g, '\\"')
+    ? variant.replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/\n/g, "\\n")
     : undefined;
   const selector = escapedVariant ? `{variant="${escapedVariant}"}` : "";
   return `${metricName}${selector}`;

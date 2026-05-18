@@ -68,7 +68,6 @@ export default function App() {
         cloudwatchProxyUrl: adapterConfig.cloudwatchProxyUrl,
         cloudwatchNamespace: adapterConfig.cloudwatchNamespace,
       }),
-    // eslint-disable-next-line react-hooks/exhaustive-deps
     [
       adapterConfig.type,
       adapterConfig.prometheusUrl,
