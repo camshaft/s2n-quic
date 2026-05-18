@@ -1832,7 +1832,8 @@ impl Topology {
                 "{}\nfn: {}\n{}",
                 binding.direction, binding.function, binding.description
             );
-            out.push_str(&format!("  {from} -->|{}| {to}\n", escape_mermaid(&label)));
+            let edge_label = escape_mermaid(&label).replace('|', "&#124;");
+            out.push_str(&format!("  {from} -->|{}| {to}\n", edge_label));
         }
 
         out
