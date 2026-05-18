@@ -188,31 +188,34 @@ export default function App() {
 
       if (cfg.adapterConfig && typeof cfg.adapterConfig === "object") {
         const adapter = cfg.adapterConfig as Record<string, unknown>;
-        if (isAdapterType(adapter.type)) {
-          next.adapterConfig = {
-            type: adapter.type,
-            prometheusUrl:
-              typeof adapter.prometheusUrl === "string"
-                ? adapter.prometheusUrl
-                : undefined,
-            prometheusPrefix:
-              typeof adapter.prometheusPrefix === "string"
-                ? adapter.prometheusPrefix
-                : undefined,
-            cloudwatchProxyUrl:
-              typeof adapter.cloudwatchProxyUrl === "string"
-                ? adapter.cloudwatchProxyUrl
-                : undefined,
-            cloudwatchNamespace:
-              typeof adapter.cloudwatchNamespace === "string"
-                ? adapter.cloudwatchNamespace
-                : undefined,
-            cloudwatchRegion:
-              typeof adapter.cloudwatchRegion === "string"
-                ? adapter.cloudwatchRegion
-                : undefined,
-          };
+        if (!isAdapterType(adapter.type)) {
+          throw new Error(
+            `Invalid adapterConfig.type "${String(adapter.type)}". Expected one of: none, prometheus, cloudwatch.`,
+          );
         }
+        next.adapterConfig = {
+          type: adapter.type,
+          prometheusUrl:
+            typeof adapter.prometheusUrl === "string"
+              ? adapter.prometheusUrl
+              : undefined,
+          prometheusPrefix:
+            typeof adapter.prometheusPrefix === "string"
+              ? adapter.prometheusPrefix
+              : undefined,
+          cloudwatchProxyUrl:
+            typeof adapter.cloudwatchProxyUrl === "string"
+              ? adapter.cloudwatchProxyUrl
+              : undefined,
+          cloudwatchNamespace:
+            typeof adapter.cloudwatchNamespace === "string"
+              ? adapter.cloudwatchNamespace
+              : undefined,
+          cloudwatchRegion:
+            typeof adapter.cloudwatchRegion === "string"
+              ? adapter.cloudwatchRegion
+              : undefined,
+        };
       }
 
       if (typeof cfg.refreshIntervalMs === "number") {
@@ -318,6 +321,8 @@ export default function App() {
 
   // Keep query params in sync with source links.
   useEffect(() => {
+    if (!bootstrapRanRef.current) return;
+
     const params = new URLSearchParams(window.location.search);
     const nextMermaidUrl = cleanUrlInput(mermaidUrl);
     const nextConfigUrl = cleanUrlInput(configUrl);
