@@ -17,7 +17,7 @@ use s2n_quic_core::varint::VarInt;
 use std::{cell::RefCell, rc::Rc};
 
 #[test]
-fn send_ack_processor_ignores_invalid_sender_idx() {
+fn send_ack_processor_ignores_invalid_sender_id() {
     let _guard = crate::testing::without_snapshots();
     sim(|| {
         let registry = crate::counter::Registry::default();
