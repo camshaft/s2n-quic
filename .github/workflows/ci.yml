@@ -268,11 +268,6 @@ jobs:
         with:
           key: dc-core-tests
 
-      - name: Restore fuzz corpus
-        shell: bash
-        run: |
-          find . -name 'corpus.tar.gz' -exec dirname {} ';' | xargs -L 1 bash -c 'cd "$0" && rm -rf corpus && tar xf corpus.tar.gz'
-
       # Build the tests before running to improve cross compilation speed
       - name: Run cargo/cross build
         run: |
