@@ -1381,21 +1381,29 @@ impl MetricRegistration {
 
 /// Controls how a metric name is rendered inside a Mermaid node card.
 ///
+/// Metrics are always embedded as structured `%% metric:` comments on each node
+/// regardless of this formatter, so a custom Mermaid extension can read them.
+/// This trait decides whether (and how) each metric name is also shown inline
+/// in the visible node card.
+///
+/// Return `Some(name)` to include the metric in the card with the given label,
+/// or `None` to hide it from the card (it will still appear in the comments).
+///
 /// Implement this trait to map metric names to backend-specific identifiers
-/// (e.g., CloudWatch metric names or Prometheus labels). The rest of the card
-/// line — kind, variant, unit, and description — is always rendered in a
-/// standard unified format; only the metric name is customizable.
+/// (e.g., CloudWatch metric names or Prometheus labels) or to suppress the
+/// metric list for non-maintainer audiences.
 pub trait MermaidMetricFormatter {
-    fn format_metric_name(&self, metric: &MetricRegistration) -> String;
+    fn format_metric_name(&self, metric: &MetricRegistration) -> Option<String>;
 }
 
-/// Default [`MermaidMetricFormatter`] that renders each metric name as-is.
+/// Default [`MermaidMetricFormatter`] that renders each metric name as-is,
+/// showing the full list inline in the node card.
 #[derive(Clone, Debug, Default)]
 pub struct DefaultMermaidMetricFormatter;
 
 impl MermaidMetricFormatter for DefaultMermaidMetricFormatter {
-    fn format_metric_name(&self, metric: &MetricRegistration) -> String {
-        metric.label.clone()
+    fn format_metric_name(&self, metric: &MetricRegistration) -> Option<String> {
+        Some(metric.label.clone())
     }
 }
 
@@ -1711,17 +1719,21 @@ impl<'a, F: MermaidMetricFormatter> core::fmt::Display for Mermaid<'a, F> {
                 .budget
                 .map(|v| v.to_string())
                 .unwrap_or_else(|| "none".to_string());
-            let metrics = format_metrics_with_formatter(&self.formatter, &task.metrics);
-            let label = format_mermaid_card(
-                &task.name,
-                [
-                    format!("fn: {}", task.function),
-                    format!("budget: {budget}"),
-                    format!("metrics: {metrics}"),
-                    format!("desc: {}", task.description),
-                ],
+            let comments = metric_comment_lines(&task.metrics);
+            let metrics_display = format_metrics_with_formatter(&self.formatter, &task.metrics);
+            let mut props = vec![
+                format!("fn: {}", task.function),
+                format!("budget: {budget}"),
+            ];
+            if let Some(metrics) = metrics_display {
+                props.push(format!("metrics: {metrics}"));
+            }
+            props.push(format!("desc: {}", task.description));
+            let label = format_mermaid_card(&task.name, props);
+            let node_line = format!(
+                "{node_id}[\"{}\"]\nclass {node_id} task_node;\n{comments}",
+                label
             );
-            let node_line = format!("{node_id}[\"{}\"]\nclass {node_id} task_node;\n", label);
 
             if let Some(worker_id) = task.worker_id {
                 worker_task_nodes
@@ -1749,20 +1761,22 @@ impl<'a, F: MermaidMetricFormatter> core::fmt::Display for Mermaid<'a, F> {
         for (idx, channel) in topology.channels.iter().enumerate() {
             let node_id = format!("c{idx}");
             channel_node_ids.insert(channel.name.clone(), node_id.clone());
-            let metrics = format_metrics_with_formatter(&self.formatter, &channel.metrics);
-            let label = format_mermaid_card(
-                &channel.name,
-                [
-                    format!("fn: {}", channel.function),
-                    format!("metrics: {metrics}"),
-                    format!("desc: {}", channel.description),
-                ],
-            );
+            let comments = metric_comment_lines(&channel.metrics);
+            let metrics_display = format_metrics_with_formatter(&self.formatter, &channel.metrics);
+            let mut props = vec![format!("fn: {}", channel.function)];
+            if let Some(metrics) = metrics_display {
+                props.push(format!("metrics: {metrics}"));
+            }
+            props.push(format!("desc: {}", channel.description));
+            let label = format_mermaid_card(&channel.name, props);
             write!(
                 f,
                 "  {node_id}[\"{}\"]\n  class {node_id} channel_node;\n",
                 label
             )?;
+            if !comments.is_empty() {
+                write_indented(f, "  ", &comments)?;
+            }
         }
 
         // Render bindings
@@ -2189,31 +2203,60 @@ fn metric_summary(metrics: &[MetricRegistration]) -> String {
 
 /// Render a metric list using the provided formatter for names while keeping
 /// the standard unified format (`[kind variant unit]: description`) for the rest.
+/// Returns `None` when the formatter hides all metrics (so callers can omit the
+/// `metrics:` card line entirely).
 fn format_metrics_with_formatter<F: MermaidMetricFormatter>(
     formatter: &F,
     metrics: &[MetricRegistration],
-) -> String {
+) -> Option<String> {
     if metrics.is_empty() {
-        "none".to_string()
-    } else {
-        metrics
-            .iter()
-            .map(|metric| {
-                let name = formatter.format_metric_name(metric);
-                let variant = metric
-                    .variant
-                    .as_ref()
-                    .map(|variant| format!(" variant={variant}"))
-                    .unwrap_or_default();
-                let unit = metric
-                    .unit
-                    .map(|unit| format!(" unit={unit}"))
-                    .unwrap_or_default();
-                format!("{name} [{}{}{}]: {}", metric.kind, variant, unit, metric.description)
-            })
-            .collect::<Vec<_>>()
-            .join("\\n")
+        return Some("none".to_string());
     }
+    let lines: Vec<String> = metrics
+        .iter()
+        .filter_map(|metric| {
+            let name = formatter.format_metric_name(metric)?;
+            let variant = metric
+                .variant
+                .as_ref()
+                .map(|variant| format!(" variant={variant}"))
+                .unwrap_or_default();
+            let unit = metric
+                .unit
+                .map(|unit| format!(" unit={unit}"))
+                .unwrap_or_default();
+            Some(format!("{name} [{}{}{}]: {}", metric.kind, variant, unit, metric.description))
+        })
+        .collect();
+    if lines.is_empty() {
+        None
+    } else {
+        Some(lines.join("\\n"))
+    }
+}
+
+/// Emit well-structured `%% metric:` comments for a node, always using the raw
+/// metric label. These comments are machine-readable by custom Mermaid extensions
+/// regardless of whether the formatter shows metrics in the visible card.
+fn metric_comment_lines(metrics: &[MetricRegistration]) -> String {
+    metrics
+        .iter()
+        .map(|metric| {
+            let variant = metric
+                .variant
+                .as_ref()
+                .map(|variant| format!(" variant={variant}"))
+                .unwrap_or_default();
+            let unit = metric
+                .unit
+                .map(|unit| format!(" unit={unit}"))
+                .unwrap_or_default();
+            format!(
+                "%% metric: {} [{}{}{}]: {}\n",
+                metric.label, metric.kind, variant, unit, metric.description
+            )
+        })
+        .collect()
 }
 
 impl Registry {
