@@ -81,8 +81,11 @@ jobs:
           config_path = pathlib.Path.home() / ".copilot" / "mcp-config.json"
           config = {}
           if config_path.exists():
-              with config_path.open() as f:
-                  config = json.load(f)
+              try:
+                  with config_path.open() as f:
+                      config = json.load(f)
+              except json.JSONDecodeError:
+                  config = {}
 
           mcp_servers = config.setdefault("mcpServers", {})
           mcp_servers["camshaft/cargo-mcp"] = {
