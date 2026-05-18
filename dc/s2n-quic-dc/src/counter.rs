@@ -1379,31 +1379,42 @@ impl MetricRegistration {
     }
 }
 
-/// Controls how a metric name is rendered inside a Mermaid node card.
+/// Controls how metrics are rendered in a Mermaid node.
 ///
 /// Metrics are always embedded as structured `%% metric:` comments on each node
-/// regardless of this formatter, so a custom Mermaid extension can read them.
-/// This trait decides whether (and how) each metric name is also shown inline
-/// in the visible node card.
+/// so a custom Mermaid extension can read them. The comments use the name returned
+/// by [`format_metric_name`], so namespace prefixes and other transformations are
+/// reflected there too.
 ///
-/// Return `Some(name)` to include the metric in the card with the given label,
-/// or `None` to hide it from the card (it will still appear in the comments).
+/// [`should_display_metric`] separately controls whether the metric list is also
+/// shown inline in the visible node card — useful for maintainer views vs.
+/// end-user charts where only live values matter.
 ///
-/// Implement this trait to map metric names to backend-specific identifiers
-/// (e.g., CloudWatch metric names or Prometheus labels) or to suppress the
-/// metric list for non-maintainer audiences.
+/// [`format_metric_name`]: MermaidMetricFormatter::format_metric_name
+/// [`should_display_metric`]: MermaidMetricFormatter::should_display_metric
 pub trait MermaidMetricFormatter {
-    fn format_metric_name(&self, metric: &MetricRegistration) -> Option<String>;
+    /// Return the display name for this metric (used in both the `%% metric:`
+    /// comment and the visible card line).  Implement this to add a namespace
+    /// prefix or map to a backend-specific identifier.
+    fn format_metric_name(&self, metric: &MetricRegistration) -> String;
+
+    /// Return `true` to include this metric in the visible node card, or `false`
+    /// to hide it (it still appears in the `%% metric:` comments).
+    fn should_display_metric(&self, metric: &MetricRegistration) -> bool;
 }
 
-/// Default [`MermaidMetricFormatter`] that renders each metric name as-is,
-/// showing the full list inline in the node card.
+/// Default [`MermaidMetricFormatter`] that renders each metric name as-is and
+/// shows all metrics inline in the node card.
 #[derive(Clone, Debug, Default)]
 pub struct DefaultMermaidMetricFormatter;
 
 impl MermaidMetricFormatter for DefaultMermaidMetricFormatter {
-    fn format_metric_name(&self, metric: &MetricRegistration) -> Option<String> {
-        Some(metric.label.clone())
+    fn format_metric_name(&self, metric: &MetricRegistration) -> String {
+        metric.label.clone()
+    }
+
+    fn should_display_metric(&self, _metric: &MetricRegistration) -> bool {
+        true
     }
 }
 
@@ -1719,7 +1730,7 @@ impl<'a, F: MermaidMetricFormatter> core::fmt::Display for Mermaid<'a, F> {
                 .budget
                 .map(|v| v.to_string())
                 .unwrap_or_else(|| "none".to_string());
-            let comments = metric_comment_lines(&task.metrics);
+            let comments = metric_comment_lines(&self.formatter, &task.metrics);
             let metrics_display = format_metrics_with_formatter(&self.formatter, &task.metrics);
             let mut props = vec![
                 format!("fn: {}", task.function),
@@ -1761,7 +1772,7 @@ impl<'a, F: MermaidMetricFormatter> core::fmt::Display for Mermaid<'a, F> {
         for (idx, channel) in topology.channels.iter().enumerate() {
             let node_id = format!("c{idx}");
             channel_node_ids.insert(channel.name.clone(), node_id.clone());
-            let comments = metric_comment_lines(&channel.metrics);
+            let comments = metric_comment_lines(&self.formatter, &channel.metrics);
             let metrics_display = format_metrics_with_formatter(&self.formatter, &channel.metrics);
             let mut props = vec![format!("fn: {}", channel.function)];
             if let Some(metrics) = metrics_display {
@@ -2214,8 +2225,9 @@ fn format_metrics_with_formatter<F: MermaidMetricFormatter>(
     }
     let lines: Vec<String> = metrics
         .iter()
-        .filter_map(|metric| {
-            let name = formatter.format_metric_name(metric)?;
+        .filter(|metric| formatter.should_display_metric(metric))
+        .map(|metric| {
+            let name = formatter.format_metric_name(metric);
             let variant = metric
                 .variant
                 .as_ref()
@@ -2225,7 +2237,7 @@ fn format_metrics_with_formatter<F: MermaidMetricFormatter>(
                 .unit
                 .map(|unit| format!(" unit={unit}"))
                 .unwrap_or_default();
-            Some(format!("{name} [{}{}{}]: {}", metric.kind, variant, unit, metric.description))
+            format!("{name} [{}{}{}]: {}", metric.kind, variant, unit, metric.description)
         })
         .collect();
     if lines.is_empty() {
@@ -2235,13 +2247,18 @@ fn format_metrics_with_formatter<F: MermaidMetricFormatter>(
     }
 }
 
-/// Emit well-structured `%% metric:` comments for a node, always using the raw
-/// metric label. These comments are machine-readable by custom Mermaid extensions
-/// regardless of whether the formatter shows metrics in the visible card.
-fn metric_comment_lines(metrics: &[MetricRegistration]) -> String {
+/// Emit well-structured `%% metric:` comments for a node, using the formatter's
+/// `format_metric_name` so namespace prefixes and other transformations are reflected.
+/// These comments are always emitted regardless of `should_display_metric` and are
+/// machine-readable by custom Mermaid extensions.
+fn metric_comment_lines<F: MermaidMetricFormatter>(
+    formatter: &F,
+    metrics: &[MetricRegistration],
+) -> String {
     metrics
         .iter()
         .map(|metric| {
+            let name = formatter.format_metric_name(metric);
             let variant = metric
                 .variant
                 .as_ref()
@@ -2252,8 +2269,8 @@ fn metric_comment_lines(metrics: &[MetricRegistration]) -> String {
                 .map(|unit| format!(" unit={unit}"))
                 .unwrap_or_default();
             format!(
-                "%% metric: {} [{}{}{}]: {}\n",
-                metric.label, metric.kind, variant, unit, metric.description
+                "%% metric: {name} [{}{}{}]: {}\n",
+                metric.kind, variant, unit, metric.description
             )
         })
         .collect()
