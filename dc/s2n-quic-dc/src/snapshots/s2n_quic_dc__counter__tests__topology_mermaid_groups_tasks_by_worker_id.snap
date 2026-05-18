@@ -1,0 +1,12 @@
+---
+source: dc/s2n-quic-dc/src/counter.rs
+expression: topology.to_mermaid()
+---
+flowchart LR
+  subgraph worker_1[worker 1]
+    t0["task.worker.1<br/>fn: fn<br/>budget: none<br/>metrics: none<br/>desc"]
+  end
+  subgraph worker_2[worker 2]
+    t1["task.worker.2<br/>fn: fn<br/>budget: none<br/>metrics: none<br/>desc"]
+  end
+  t2["task.unassigned<br/>fn: fn<br/>budget: none<br/>metrics: none<br/>desc"]
