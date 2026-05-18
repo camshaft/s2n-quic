@@ -257,7 +257,7 @@ jobs:
           - os: ubuntu-latest
             rust: stable
             target: aarch64-unknown-linux-gnu
-          - os: macOS-latest
+          - os: macos-latest
             rust: stable
             target: native
     steps:
@@ -272,7 +272,7 @@ jobs:
         run: |
           rustup toolchain install ${{ matrix.rust }}
           rustup override set ${{ matrix.rust }}
-          rustup toolchain install ${{ matrix.rust }} ${{ matrix.target != 'native' && format('--target {0}', matrix.target) || '' }}
+          ${{ matrix.target != 'native' && format('rustup target add {0}', matrix.target) || 'echo native target selected' }}
 
       - uses: camshaft/rust-cache@v1
         with:
@@ -289,7 +289,9 @@ jobs:
 
       - name: Install cross
         if: ${{ matrix.target != 'native' }}
-        run: cargo install cross --git https://github.com/cross-rs/cross
+        uses: camshaft/install@v1
+        with:
+          crate: cross
 
       - name: Run cross test
         if: ${{ matrix.target != 'native' }}
