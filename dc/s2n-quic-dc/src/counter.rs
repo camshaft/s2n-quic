@@ -1654,7 +1654,7 @@ impl Topology {
                 .unwrap_or_else(|| "none".to_string());
             let metrics = metric_summary(&task.metrics);
             let label = format!(
-                "{}\\nfn: {}\\nbudget: {}\\nmetrics: {}\\n{}",
+                "{}\nfn: {}\nbudget: {}\nmetrics: {}\n{}",
                 task.name, task.function, budget, metrics, task.description
             );
             let node_line = format!("{node_id} [shape=box,label=\"{}\"];\n", escape_dot(&label));
@@ -1688,7 +1688,7 @@ impl Topology {
             channel_node_ids.insert(channel.name.clone(), node_id.clone());
             let metrics = metric_summary(&channel.metrics);
             let label = format!(
-                "{}\\nfn: {}\\nmetrics: {}\\n{}",
+                "{}\nfn: {}\nmetrics: {}\n{}",
                 channel.name, channel.function, metrics, channel.description
             );
             out.push_str(&format!(
