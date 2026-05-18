@@ -779,7 +779,8 @@ fn duplicated_client_init_accepts_only_once() {
         {
             let mut duplicated_first_client_packet = false;
             bach::net::monitor::on_packet_sent(move |packet| {
-                // The client's FlowInit packet is the first original packet in this sim setup.
+                // Test-setup assumption: the first non-duplicate packet emitted is the client's
+                // FlowInit packet, so duplicating that first original packet exercises init dedup.
                 if !packet.is_duplicate && !duplicated_first_client_packet {
                     duplicated_first_client_packet = true;
                     duplicated_packets_monitor.fetch_add(1, Ordering::Relaxed);
