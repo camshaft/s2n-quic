@@ -341,8 +341,8 @@ where
     let (worker_ack_txs, worker_ack_rxs): (Vec<_>, Vec<_>) = (0..num_send_workers)
         .map(|i| {
             let (tx, rx) = intrusive::sync::new::<msg::Sender>();
-            let gauge = counter_registry
-                .register_queue_gauge_nominal("q.ack", format_args!("send.{i}"));
+            let gauge =
+                counter_registry.register_queue_gauge_nominal("q.ack", format_args!("send.{i}"));
             let tx = crate::socket::channel::GaugedSender::new(tx, gauge);
             (tx, rx)
         })
@@ -471,10 +471,8 @@ where
             batch_gauge: counter_registry
                 .register_queue_gauge_nominal("q.resolver", format_args!("send.{idx}")),
             ack_rx,
-            ack_gauge: counter_registry.register_queue_gauge_nominal(
-                "q.ack",
-                format_args!("send.{idx}"),
-            ),
+            ack_gauge: counter_registry
+                .register_queue_gauge_nominal("q.ack", format_args!("send.{idx}")),
             random: crate::xorshift::Rng::new(),
             frame_tx: frame_tx.clone(),
             ack_completions_tx: ack_completions_tx.clone(),
@@ -724,8 +722,7 @@ where
 
     #[inline]
     fn spawn<R: crate::runtime::Runtime>(self, runtime: &R) {
-        use crate::runtime::Spawner as _;
-        use crate::socket::channel::ReceiverExt as _;
+        use crate::{runtime::Spawner as _, socket::channel::ReceiverExt as _};
 
         let Self {
             id,

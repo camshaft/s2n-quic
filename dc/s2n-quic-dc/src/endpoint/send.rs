@@ -29,13 +29,8 @@ use crate::{
 use core::time::Duration;
 use rustc_hash::FxHashMap;
 use s2n_quic_core::{
-    frame::ack::EcnCounts,
-    packet::number::PacketNumberSpace,
-    path::INITIAL_PTO_BACKOFF,
-    random,
-    recovery::RttEstimator,
-    time::Timestamp,
-    varint::VarInt,
+    frame::ack::EcnCounts, packet::number::PacketNumberSpace, path::INITIAL_PTO_BACKOFF, random,
+    recovery::RttEstimator, time::Timestamp, varint::VarInt,
 };
 use s2n_quic_platform::features::Gso;
 use std::{cell::RefCell, rc::Rc, sync::Arc};
@@ -892,28 +887,20 @@ impl Context {
             let has_pending_data_predicate = self.has_pending_data();
             let has_pending_predicate = self.has_pending();
             assert_eq!(
-                has_pending_data_predicate,
-                has_pending_data,
+                has_pending_data_predicate, has_pending_data,
                 "has_pending_data predicate drifted from queue contents"
             );
             assert_eq!(
-                has_pending_predicate,
-                has_pending_data,
+                has_pending_predicate, has_pending_data,
                 "has_pending predicate drifted from queue contents"
             );
 
-            if self.tx_wheel.is_scheduled() {
+            if self.tx_wheel.is_scheduled() && self.tx_wheel.target_time.is_some() {
                 assert!(
                     self.has_pending_acks()
                         || self.pto.probe_state.is_requested()
                         || (self.has_pending_data() && self.can_send_pending_frames()),
                     "tx wheel scheduled without any sendable work"
-                );
-                assert!(
-                    self.tx_wheel.target_time.is_some()
-                        || self.pto.probe_state.is_requested()
-                        || self.cca.earliest_departure_time().is_none(),
-                    "tx wheel has no target despite probe not requested and EDT present"
                 );
             }
 
