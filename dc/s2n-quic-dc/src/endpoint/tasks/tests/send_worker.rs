@@ -150,7 +150,6 @@ fn send_pto_timeout_routes_pending_context_to_tx_wheel() {
 
 #[test]
 fn send_tx_wheel_drain_routes_expired_context_to_matching_socket() {
-    let _guard = crate::testing::without_snapshots();
     sim(|| {
         let registry = crate::counter::Registry::default();
         let clock = Clock::default();
@@ -184,20 +183,19 @@ fn send_tx_wheel_drain_routes_expired_context_to_matching_socket() {
         .spawn();
 
         async move {
+            tracing::debug!("sending context to tx wheel");
             let _ = tx_wheel_tx.send(ctx);
             drop(tx_wheel_tx);
         }
         .spawn();
 
         async move {
-            assert!(
-                socket1_rx.recv().await.is_some(),
-                "sender_idx=1 context should route to socket queue 1"
-            );
-            assert!(
-                socket0_rx.recv().await.is_none(),
-                "socket queue 0 should not receive sender_idx=1 context"
-            );
+            let routed = socket1_rx.recv().await.is_some();
+            tracing::debug!(routed, "socket 1 routing result");
+            assert!(routed, "sender_idx=1 context should route to socket queue 1");
+            let unexpected = socket0_rx.recv().await.is_some();
+            tracing::debug!(unexpected, "socket 0 routing result");
+            assert!(!unexpected, "socket queue 0 should not receive sender_idx=1 context");
         }
         .primary()
         .spawn();
