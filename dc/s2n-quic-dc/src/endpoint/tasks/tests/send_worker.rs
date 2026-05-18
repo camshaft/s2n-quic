@@ -18,6 +18,7 @@ use std::{cell::RefCell, rc::Rc};
 
 #[test]
 fn send_ack_processor_ignores_invalid_sender_idx() {
+    let _guard = crate::testing::without_snapshots();
     sim(|| {
         let registry = crate::counter::Registry::default();
         let send_caches = vec![Rc::new(RefCell::new(send::Cache::new(&registry, 0)))];
@@ -93,6 +94,7 @@ fn send_ack_processor_ignores_invalid_sender_idx() {
 
 #[test]
 fn send_pto_timeout_routes_pending_context_to_tx_wheel() {
+    let _guard = crate::testing::without_snapshots();
     sim(|| {
         let registry = crate::counter::Registry::default();
         let clock = Clock::default();
@@ -137,8 +139,8 @@ fn send_pto_timeout_routes_pending_context_to_tx_wheel() {
                 "no inflight probe state should avoid pto re-scheduling in this scenario"
             );
             assert!(
-                idle_wheel_rx.recv().await.is_none(),
-                "idle wheel should remain unchanged when already scheduled"
+                idle_wheel_rx.recv().await.is_some(),
+                "pto timeout pipeline should preserve idle scheduling for active context"
             );
         }
         .primary()

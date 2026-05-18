@@ -744,7 +744,7 @@ where
 /// This pipeline decodes incoming ACK messages, updates send context state, and routes
 /// the resulting wheel interest to tx/pto/idle schedulers.
 #[allow(clippy::too_many_arguments)]
-pub fn send_ack_processor<AckRx, Clk, Rand, CompletedTx, CancelledTx, TxW, PtoW, IdleW>(
+pub fn send_ack_processor<AckRx, Clk, Rand, C, TxW, PtoW, IdleW>(
     ack_rx: AckRx,
     send_caches: Vec<Rc<RefCell<send::Cache>>>,
     sender_idx_to_local: Vec<usize>,
@@ -752,8 +752,8 @@ pub fn send_ack_processor<AckRx, Clk, Rand, CompletedTx, CancelledTx, TxW, PtoW,
     clock: Clk,
     random: Rand,
     frame_tx: frame::SubmissionSender,
-    completed_tx: CompletedTx,
-    cancelled_tx: CancelledTx,
+    completed_tx: C,
+    cancelled_tx: C,
     send_counters: Arc<endpoint::counters::Send>,
     tx_wheel_tx: TxW,
     pto_wheel_tx: PtoW,
@@ -763,8 +763,7 @@ where
     AckRx: Receiver<Entry<msg::Sender>>,
     Clk: precision::Clock + s2n_quic_core::time::Clock,
     Rand: s2n_quic_core::random::Generator,
-    CompletedTx: UnboundedSender<Entry<Frame>>,
-    CancelledTx: UnboundedSender<Entry<Frame>>,
+    C: UnboundedSender<Entry<Frame>>,
     TxW: UnboundedSender<Rc<RefCell<send::Context>>>,
     PtoW: UnboundedSender<Rc<RefCell<send::Context>>>,
     IdleW: UnboundedSender<Rc<RefCell<send::Context>>>,
