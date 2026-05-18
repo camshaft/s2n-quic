@@ -268,14 +268,13 @@ jobs:
         with:
           key: dc-core-tests
 
-      # Build the tests before running to improve cross compilation speed
-      - name: Run cargo/cross build
-        run: |
-          cargo build --tests -p s2n-quic-core -p s2n-quic-dc
+      - uses: camshaft/install@v1
+        with:
+          crate: cargo-nextest
 
-      - name: Run cargo/cross test
+      - name: Run cargo nextest
         run: |
-          cargo test -p s2n-quic-core -p s2n-quic-dc
+          cargo nextest run -p s2n-quic-core -p s2n-quic-dc
 
   asan:
     if: false # Disabled in this fork: focus CI on s2n-quic-dc and s2n-quic-core
@@ -948,7 +947,7 @@ jobs:
         run: cargo +stable xtask ci
 
   dc-wireshark:
-    if: false # Disabled in this fork: focus CI on s2n-quic-dc and s2n-quic-core
+    if: false # Disabled in this fork: focus CI on s2n-quic-dc and s2n-quic-core crates (excluding dc/wireshark tooling)
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
