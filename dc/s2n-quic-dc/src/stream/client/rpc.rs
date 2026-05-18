@@ -250,9 +250,9 @@ mod tests {
         }
 
         let _guard = crate::testing::without_snapshots();
+        let provide_calls = Arc::new(AtomicUsize::new(0));
         sim(|| {
             let acceptor_id = VarInt::from_u8(1);
-            let provide_calls = Arc::new(AtomicUsize::new(0));
 
             async move {
                 let server = Server::new();
