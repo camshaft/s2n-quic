@@ -2950,18 +2950,6 @@ mod tests {
             bindings: vec![],
         };
 
-        let dot = topology.to_dot();
-
-        assert!(dot.contains("subgraph cluster_worker_1"));
-        assert!(dot.contains("subgraph cluster_worker_2"));
-        assert!(dot.contains("label=\"worker 1\""));
-        assert!(dot.contains("label=\"worker 2\""));
-        assert!(dot.contains(
-            "subgraph cluster_worker_1 {\n    label=\"worker 1\";\n    style=rounded;\n    t0 [shape=box"
-        ));
-        assert!(dot.contains(
-            "subgraph cluster_worker_2 {\n    label=\"worker 2\";\n    style=rounded;\n    t1 [shape=box"
-        ));
-        assert!(dot.contains("\n  t2 [shape=box"));
+        insta::assert_snapshot!(topology.to_dot());
     }
 }
