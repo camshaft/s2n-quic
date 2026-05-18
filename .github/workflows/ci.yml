@@ -126,6 +126,8 @@ jobs:
           rustup override set stable
 
       - uses: camshaft/rust-cache@v1
+        with:
+          key: dc-core-tests
 
       - name: Determine if a PR should be opened
         id: should_fix
