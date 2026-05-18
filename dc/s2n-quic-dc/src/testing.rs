@@ -262,9 +262,9 @@ impl tracing_subscriber::fmt::time::FormatTime for Uptime {
         if bach::is_active() {
             write!(
                 w,
-                "{} {}",
-                bach::group::current().name(),
-                bach::time::Instant::now()
+                "{} [{}]",
+                bach::time::Instant::now(),
+                bach::group::current().name()
             )
         } else {
             self.0.format_time(w)
@@ -347,7 +347,9 @@ fn run_sim_with_snapshot(f: impl FnOnce()) {
 
     let logs = writer.take_string();
 
-    insta::assert_snapshot!(snapshot_name, logs);
+    insta::with_settings!({prepend_module_to_snapshot => false}, {
+        insta::assert_snapshot!(snapshot_name, logs);
+    });
 }
 
 #[cfg(test)]
