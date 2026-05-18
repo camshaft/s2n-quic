@@ -390,6 +390,23 @@ fn dispatch_decoded_frame(
                 waker_sink,
             );
         }
+        Header::FlowMaxData {
+            queue_pair,
+            stream_id,
+            maximum_data,
+        } => {
+            handle_flow_max_data(
+                &peer.path_entry,
+                credentials,
+                queue_pair,
+                stream_id,
+                maximum_data,
+                queue_dispatcher,
+                counters,
+                response_frames,
+                waker_sink,
+            );
+        }
         Header::FlowReset {
             dest_queue_id,
             stream_id,
@@ -1168,6 +1185,106 @@ fn handle_flow_control(
                 stream_id = stream_id.as_u64(),
                 queue_id = local_queue_id.as_u64(),
                 "FlowControl for permanently closed queue"
+            );
+        }
+    }
+}
+
+// ── FlowMaxData ───────────────────────────────────────────────────────────
+
+fn handle_flow_max_data(
+    path_secret_entry: &std::sync::Arc<PathSecretEntry>,
+    credentials: &Credentials,
+    queue_pair: QueuePair,
+    stream_id: VarInt,
+    maximum_data: VarInt,
+    queue_dispatcher: &mut msg::queue::Dispatcher,
+    counters: &counters::Dispatch,
+    response_frames: &mut PriorityInput,
+    waker_sink: &mut impl channel::UnboundedSender<AutoWake>,
+) {
+    let local_queue_id = queue_pair.dest_queue_id;
+
+    let request = flow::Request {
+        credential_id: credentials.id,
+        stream_id,
+    };
+
+    let entry = msg::Control::MaxData { maximum_data }.into();
+
+    match queue_dispatcher.send_control(
+        local_queue_id,
+        Some(queue_pair.source_queue_id),
+        &request,
+        entry,
+    ) {
+        Ok(waker) => {
+            let _ = waker_sink.send(waker);
+            counters.rx_flow_control_ok.add(1);
+            tracing::trace!(
+                stream_id = stream_id.as_u64(),
+                queue_id = local_queue_id.as_u64(),
+                maximum_data = maximum_data.as_u64(),
+                "FlowMaxData dispatched"
+            );
+        }
+        Err(flow::queue::Error::Unallocated(_)) => {
+            counters.rx_flow_control_unallocated.add(1);
+            tracing::debug!(
+                stream_id = stream_id.as_u64(),
+                queue_id = local_queue_id.as_u64(),
+                "FlowMaxData for unallocated queue - sending reset"
+            );
+            push_reset_frame_with_target(
+                response_frames,
+                counters,
+                path_secret_entry,
+                queue_pair.source_queue_id,
+                stream_id,
+                ResetTarget::Both,
+                error::QUEUE_UNALLOCATED,
+            );
+        }
+        Err(flow::queue::Error::HalfClosed(_)) => {
+            counters.rx_flow_control_half_closed.add(1);
+            tracing::trace!(
+                stream_id = stream_id.as_u64(),
+                queue_id = local_queue_id.as_u64(),
+                "FlowMaxData for half-closed control queue - dropping"
+            );
+        }
+        Err(flow::queue::Error::ValidationFailed(_, reason)) => {
+            counters.on_flow_control_validation_failed(reason);
+            if let Some(error_code) = reason.as_reset_code() {
+                tracing::debug!(
+                    stream_id = stream_id.as_u64(),
+                    queue_id = local_queue_id.as_u64(),
+                    ?reason,
+                    "FlowMaxData validation failed - sending reset"
+                );
+                push_reset_frame_with_target(
+                    response_frames,
+                    counters,
+                    path_secret_entry,
+                    queue_pair.source_queue_id,
+                    stream_id,
+                    ResetTarget::Both,
+                    error_code,
+                );
+            } else {
+                tracing::trace!(
+                    stream_id = stream_id.as_u64(),
+                    queue_id = local_queue_id.as_u64(),
+                    "FlowMaxData for previous occupant - dropping"
+                );
+            }
+        }
+        Err(flow::queue::Error::PermanentlyClosed) => {
+            counters.rx_flow_control_perm_closed.add(1);
+            tracing::trace!(
+                stream_id = stream_id.as_u64(),
+                queue_id = local_queue_id.as_u64(),
+                "FlowMaxData for permanently closed queue"
             );
         }
     }

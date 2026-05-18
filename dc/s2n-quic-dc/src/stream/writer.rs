@@ -714,6 +714,20 @@ impl Inner {
                                 debug!(stream_id = self.stream_id.as_u64(), "Flow established");
                             }
                         }
+                        msg::Control::MaxData { maximum_data } => {
+                            let prev_max = self.remote_max_data;
+                            self.remote_max_data = self.remote_max_data.max(maximum_data);
+                            trace!(
+                                stream_id = self.stream_id.as_u64(),
+                                prev_max = prev_max.as_u64(),
+                                new_max = self.remote_max_data.as_u64(),
+                                "Received MAX_DATA"
+                            );
+                            if self.status.on_flow_established().is_ok() {
+                                debug_assert!(self.control_rx.remote_queue_id().is_some());
+                                debug!(stream_id = self.stream_id.as_u64(), "Flow established");
+                            }
+                        }
                         msg::Control::Reset { error_code } => {
                             self.reset_error_code = Some(error_code);
                             self.status.on_shutdown().ok();
