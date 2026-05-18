@@ -215,9 +215,8 @@ impl ChannelAcceptor {
                 Ok(AutoWake::new(waker))
             }
             Ok((None, waker)) => Ok(AutoWake::new(waker)),
-            Err(mut stream) => {
+            Err(stream) => {
                 drop(self.handle.lock().unwrap().take());
-                stream.disable();
                 Err(acceptor::Reject {
                     request: stream,
                     reset_code: Error::AcceptorNotFound.as_varint(),
