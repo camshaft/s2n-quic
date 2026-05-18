@@ -126,8 +126,6 @@ jobs:
           rustup override set stable
 
       - uses: camshaft/rust-cache@v1
-        with:
-          key: dc-core-tests
 
       - name: Determine if a PR should be opened
         id: should_fix
@@ -183,6 +181,8 @@ jobs:
           rustup override set ${{ env.RUST_NIGHTLY_TOOLCHAIN }}
 
       - uses: camshaft/rust-cache@v1
+        with:
+          key: dc-core-tests
 
       # Ideally this would use the camshaft/install action to install cargo-udeps. However,
       # the --locked flag can't currently be provided to camshaft/install. After support for this
@@ -900,6 +900,7 @@ jobs:
           exit 1
 
   loom:
+    # Kept enabled since this directly validates s2n-quic-core.
     runs-on: ubuntu-latest
     strategy:
       matrix:
