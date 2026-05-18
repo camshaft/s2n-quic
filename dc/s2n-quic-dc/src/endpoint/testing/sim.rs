@@ -436,9 +436,21 @@ impl Server {
         acceptor_id: VarInt,
         capacity: usize,
     ) -> io::Result<accept_channel::Receiver<PendingValidation>> {
+        self.register_acceptor_channel_with_config(acceptor_id, capacity.into())
+    }
+
+    /// Register a channel-based acceptor with a fully specified [`accept_channel::Config`].
+    ///
+    /// This is the lower-level variant of [`register_acceptor_channel`] that allows callers to
+    /// control both capacity and the eviction policy (`Front` / `Back`).
+    pub fn register_acceptor_channel_with_config(
+        &self,
+        acceptor_id: VarInt,
+        config: accept_channel::Config,
+    ) -> io::Result<accept_channel::Receiver<PendingValidation>> {
         use crate::stream::server::ChannelAcceptor;
 
-        let (tx, rx) = accept_channel::new(capacity.into());
+        let (tx, rx) = accept_channel::new(config);
         let acceptor = Arc::new(ChannelAcceptor::new(tx));
         let handle = self
             .endpoint
@@ -449,6 +461,26 @@ impl Server {
             })?;
         acceptor.set_handle(handle);
         Ok(rx)
+    }
+
+    /// Register a custom acceptor directly.
+    ///
+    /// Returns an [`acceptor::Handle`] that keeps the acceptor registered for as long as it is
+    /// held. Dropping the handle unregisters the acceptor.
+    ///
+    /// Use this when you need full control over dispatch logic — for example to test rejection
+    /// behavior or custom `handle_pending` implementations.
+    pub fn register_acceptor(
+        &self,
+        acceptor_id: VarInt,
+        acceptor: Arc<dyn acceptor::Acceptor<PendingValidation>>,
+    ) -> io::Result<acceptor::Handle> {
+        self.endpoint
+            .acceptor_registry
+            .register(acceptor_id, acceptor)
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::AddrInUse, "acceptor ID already registered")
+            })
     }
 }
 
