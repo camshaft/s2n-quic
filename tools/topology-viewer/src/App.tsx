@@ -101,6 +101,7 @@ export default function App() {
   const [sourceLoadError, setSourceLoadError] = useState<string | null>(null);
   const [sourceLoadStatus, setSourceLoadStatus] = useState<string | null>(null);
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const bootstrapRanRef = useRef(false);
 
   // Memoize the adapter so it only rebuilds when the relevant config fields
   // change — not on every keystroke in unrelated inputs.
@@ -188,8 +189,9 @@ export default function App() {
           adapter.type === "prometheus" ||
           adapter.type === "cloudwatch"
         ) {
+          const type = adapter.type as AdapterConfig["type"];
           next.adapterConfig = {
-            type: adapter.type,
+            type,
             prometheusUrl:
               typeof adapter.prometheusUrl === "string"
                 ? adapter.prometheusUrl
@@ -281,7 +283,7 @@ export default function App() {
           useTopologyStore.setState({ perKindMode: cfg.perKindMode });
         }
 
-        const explicitMermaidUrl = cleanUrlInput(overrideMermaidUrl ?? mermaidUrl);
+        const explicitMermaidUrl = cleanUrlInput(overrideMermaidUrl ?? "");
         const configMermaidUrl = cleanUrlInput(cfg.mermaidUrl ?? "");
 
         if (explicitMermaidUrl) {
@@ -303,7 +305,6 @@ export default function App() {
     [
       applyConfigObject,
       loadMermaidFromUrl,
-      mermaidUrl,
       setAdapterConfig,
       setMermaidText,
       setMermaidUrl,
@@ -350,6 +351,9 @@ export default function App() {
 
   // Initial load from query params (config + mermaid links), fallback to sample.
   useEffect(() => {
+    if (bootstrapRanRef.current) return;
+    bootstrapRanRef.current = true;
+
     let cancelled = false;
 
     async function loadInitial() {
@@ -387,7 +391,7 @@ export default function App() {
       <ControlBar
         onRefresh={() => void fetchAll()}
         onLoadMermaidUrl={() => void loadMermaidFromUrl(mermaidUrl)}
-        onLoadConfigUrl={() => void loadConfigFromUrl(configUrl)}
+        onLoadConfigUrl={() => void loadConfigFromUrl(configUrl, mermaidUrl)}
       />
 
       {/* Main area */}
