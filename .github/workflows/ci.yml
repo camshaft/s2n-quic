@@ -181,8 +181,6 @@ jobs:
           rustup override set ${{ env.RUST_NIGHTLY_TOOLCHAIN }}
 
       - uses: camshaft/rust-cache@v1
-        with:
-          key: dc-core-tests
 
       # Ideally this would use the camshaft/install action to install cargo-udeps. However,
       # the --locked flag can't currently be provided to camshaft/install. After support for this
@@ -267,6 +265,8 @@ jobs:
           rustup override set ${{ matrix.rust }}
 
       - uses: camshaft/rust-cache@v1
+        with:
+          key: dc-core-tests
 
       - name: Restore fuzz corpus
         shell: bash
@@ -953,7 +953,7 @@ jobs:
         run: cargo +stable xtask ci
 
   dc-wireshark:
-    if: false # Disabled in this fork: focus CI on s2n-quic-dc and s2n-quic-core
+    if: false # Disabled in this fork: focus on s2n-quic-dc and s2n-quic-core crate tests only
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
