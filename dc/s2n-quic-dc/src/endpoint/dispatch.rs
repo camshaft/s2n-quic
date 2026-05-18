@@ -38,6 +38,7 @@ const UNSET_SOURCE_SENDER_ID: VarInt = VarInt::MAX;
 
 pub(crate) enum Error {
     PeerStateLookup {
+        dest_addr: crate::msg::addr::Addr,
         credentials: Credentials,
         control_out: Vec<u8>,
     },
@@ -100,7 +101,10 @@ where
         ) {
             Some(v) => v,
             None => {
+                let dest_addr =
+                    crate::msg::addr::Addr::new(packet.storage().remote_address().get());
                 return Err(Error::PeerStateLookup {
+                    dest_addr,
                     credentials,
                     control_out,
                 });
