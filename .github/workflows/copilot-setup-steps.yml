@@ -91,7 +91,17 @@ jobs:
                   print(f"warning: {config_path} contained invalid JSON; recreating config")
                   config = {}
 
-          mcp_servers = config.setdefault("mcpServers", {})
+          if not isinstance(config, dict):
+              print(f"warning: {config_path} did not contain a JSON object; recreating config")
+              config = {}
+
+          mcp_servers = config.get("mcpServers")
+          if not isinstance(mcp_servers, dict):
+              if "mcpServers" in config:
+                  print(f"warning: {config_path} had a non-object mcpServers value; recreating mcpServers")
+              mcp_servers = {}
+              config["mcpServers"] = mcp_servers
+
           mcp_servers["camshaft/cargo-mcp"] = {
               "type": "local",
               "command": "cargo-mcp",
