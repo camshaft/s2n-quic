@@ -386,6 +386,36 @@ fn sim_path_pair_ids_are_stable_across_identical_runs() {
     );
 }
 
+#[test]
+fn sim_path_pair_ids_increment_generation_for_same_pair() {
+    const SENDER_COUNT: usize = 4;
+    let _guard = crate::testing::without_snapshots();
+
+    sim(|| {
+        use crate::path::secret::map::testing;
+
+        let local_map = testing::new(1_024);
+        let peer_map = testing::new(1_024);
+        local_map.set_socket_sender_count(SENDER_COUNT);
+        peer_map.set_socket_sender_count(SENDER_COUNT);
+
+        let local_addr = "10.0.0.1:1111".parse().unwrap();
+        let peer_addr = "10.0.0.2:2222".parse().unwrap();
+
+        let first = local_map.test_insert_pair(local_addr, None, &peer_map, peer_addr, None);
+        let second = local_map.test_insert_pair(local_addr, None, &peer_map, peer_addr, None);
+
+        assert_ne!(
+            first.local, second.local,
+            "local credential id must advance for repeated generation of same pair"
+        );
+        assert_ne!(
+            first.peer, second.peer,
+            "peer credential id must advance for repeated generation of same pair"
+        );
+    });
+}
+
 // ── Fuzz tests ────────────────────────────────────────────────────────────────
 
 /// Fuzzes all server→client packet-loss patterns.

@@ -43,14 +43,45 @@ pub struct TestPairIds {
 
 #[cfg(any(test, feature = "testing"))]
 #[inline]
-fn deterministic_test_pair_secret(local_addr: SocketAddr, peer_addr: SocketAddr) -> [u8; 32] {
-    use std::hash::{Hash, Hasher};
+fn deterministic_test_pair_secret(
+    local_addr: SocketAddr,
+    peer_addr: SocketAddr,
+    generation: u64,
+) -> [u8; 32] {
+    #[inline]
+    fn mix(state: &mut u64, bytes: &[u8]) {
+        for &byte in bytes {
+            *state ^= byte as u64;
+            *state = state.wrapping_mul(0x1000_0000_01B3);
+        }
+    }
 
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    local_addr.hash(&mut hasher);
-    peer_addr.hash(&mut hasher);
+    #[inline]
+    fn mix_addr(state: &mut u64, addr: SocketAddr) {
+        match addr {
+            SocketAddr::V4(addr) => {
+                mix(state, &[4]);
+                mix(state, &addr.ip().octets());
+                mix(state, &addr.port().to_be_bytes());
+            }
+            SocketAddr::V6(addr) => {
+                mix(state, &[6]);
+                mix(state, &addr.ip().octets());
+                mix(state, &addr.port().to_be_bytes());
+                mix(state, &addr.flowinfo().to_be_bytes());
+                mix(state, &addr.scope_id().to_be_bytes());
+            }
+        }
+    }
+
+    // FNV-1a with a fixed offset basis and deterministic address encoding.
+    let mut state = 0xCBF2_9CE4_8422_2325;
+    mix_addr(&mut state, local_addr);
+    mix_addr(&mut state, peer_addr);
+    mix(&mut state, &generation.to_be_bytes());
+
     // Keep state odd so the splitmix64 progression is never stuck on an even-only cycle.
-    let mut state = hasher.finish() | 1;
+    let mut state = state | 1;
 
     let mut secret = [0u8; 32];
     for chunk in secret.chunks_exact_mut(8) {
@@ -64,6 +95,33 @@ fn deterministic_test_pair_secret(local_addr: SocketAddr, peer_addr: SocketAddr)
     }
 
     secret
+}
+
+#[cfg(any(test, feature = "testing"))]
+std::thread_local! {
+    static TEST_PAIR_GENERATIONS: std::cell::RefCell<
+        std::collections::HashMap<(usize, usize, SocketAddr, SocketAddr), u64>
+    > = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+#[cfg(any(test, feature = "testing"))]
+#[inline]
+fn next_test_pair_generation(
+    local_map: &Map,
+    local_addr: SocketAddr,
+    peer_map: &Map,
+    peer_addr: SocketAddr,
+) -> u64 {
+    let local_ptr = Arc::as_ptr(&local_map.store) as *const () as usize;
+    let peer_ptr = Arc::as_ptr(&peer_map.store) as *const () as usize;
+    TEST_PAIR_GENERATIONS.with(|generations| {
+        let mut generations = generations.borrow_mut();
+        let key = (local_ptr, peer_ptr, local_addr, peer_addr);
+        let generation = generations.entry(key).or_insert(0);
+        let current = *generation;
+        *generation = generation.wrapping_add(1);
+        current
+    })
 }
 
 pub use entry::Entry;
@@ -483,10 +541,12 @@ impl Map {
         let ciphersuite = schedule::Ciphersuite::AES_GCM_128_SHA256;
 
         let secret = if bach::is_active() {
-            let secret = deterministic_test_pair_secret(local_addr, peer_addr);
+            let generation = next_test_pair_generation(self, local_addr, peer, peer_addr);
+            let secret = deterministic_test_pair_secret(local_addr, peer_addr, generation);
             tracing::debug!(
                 %local_addr,
                 %peer_addr,
+                generation,
                 "using deterministic test pair secret for bach sim"
             );
             secret
