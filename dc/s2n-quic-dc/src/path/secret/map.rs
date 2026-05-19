@@ -80,7 +80,7 @@ fn deterministic_test_pair_secret(
     mix_addr(&mut state, peer_addr);
     mix(&mut state, &generation.to_be_bytes());
 
-    // Keep state odd so the splitmix64 progression is never stuck on an even-only cycle.
+    // Normalize to an odd state for stable deterministic secret derivation.
     let mut state = state | 1;
 
     let mut secret = [0u8; 32];
@@ -531,7 +531,7 @@ impl Map {
 
                 generation = generation.wrapping_add(1);
             };
-            tracing::debug!(
+            tracing::trace!(
                 %local_addr,
                 %peer_addr,
                 generation,

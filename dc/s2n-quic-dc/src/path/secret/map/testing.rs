@@ -12,7 +12,7 @@ pub fn new(capacity: usize) -> secret::Map {
         let mut secret = [0u8; 32];
         let group_id = bach::group::current().id();
         secret[..8].copy_from_slice(&group_id.to_be_bytes());
-        tracing::debug!(
+        tracing::trace!(
             group_id,
             "using deterministic stateless reset signer for bach sim map"
         );
