@@ -1487,21 +1487,29 @@ where
             } => {
                 counters.stale_or_replay_events.add(1);
                 let sender_idx = sender_id.as_u64() as usize;
-                let Some(&local_id) = sender_idx_to_local.get(sender_idx) else {
+                let local_id = sender_idx_to_local.get(sender_idx).copied();
+                debug_assert!(
+                    local_id.is_some(),
+                    "sender_id did not map to a local sender_idx entry"
+                );
+                let Some(local_id) = local_id else {
                     return;
                 };
-                let Some(cache) = send_caches.get(local_id) else {
+                let cache = send_caches.get(local_id);
+                debug_assert!(
+                    cache.is_some(),
+                    "sender_id mapped to a sender_idx not owned by this worker"
+                );
+                let Some(cache) = cache else {
                     return;
                 };
                 if let Some(drained) = cache.borrow_mut().invalidate_stale_key(
-                        &credential_id,
-                        sender_id,
-                        &mut retransmit_tx,
+                    &credential_id,
+                    sender_id,
+                    &mut retransmit_tx,
                 ) {
                     counters.stale_or_replay_contexts.add(1);
-                    counters
-                        .stale_or_replay_frames_requeued
-                        .add(drained as u64);
+                    counters.stale_or_replay_frames_requeued.add(drained as u64);
                 }
             }
         },
@@ -1515,14 +1523,11 @@ pub fn recv_invalidation<R>(
 where
     R: Receiver<Entry<Invalidation>>,
 {
-    Map::new(
-        invalidation_rx,
-        move |entry: Entry<Invalidation>| {
-            if let Invalidation::UnknownPathSecret { credential_id } = *entry {
-                recv_cache.borrow_mut().invalidate_by_id(&credential_id);
-            }
-        },
-    )
+    Map::new(invalidation_rx, move |entry: Entry<Invalidation>| {
+        if let Invalidation::UnknownPathSecret { credential_id } = *entry {
+            recv_cache.borrow_mut().invalidate_by_id(&credential_id);
+        }
+    })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1539,7 +1544,9 @@ pub enum Invalidation {
 pub fn invalidation_validator<R, Tx>(
     raw_rx: R,
     path_secret_map: crate::path::secret::Map,
-    mut broadcast_txs: Vec<Tx>,
+    mut send_txs: Vec<Tx>,
+    mut recv_txs: Vec<Tx>,
+    sender_id_to_worker: Vec<usize>,
     counters: ValidatorInvalidationCounters,
 ) -> impl Receiver<()>
 where
@@ -1560,7 +1567,8 @@ where
         };
         let Some(invalidation) = (match packet {
             secret_control::Packet::UnknownPathSecret(packet) => {
-                let Some(validated) = path_secret_map.handle_unknown_path_secret_packet(&packet, &peer)
+                let Some(validated) =
+                    path_secret_map.handle_unknown_path_secret_packet(&packet, &peer)
                 else {
                     tracing::debug!(%peer, "ignored invalidation control packet: unknown path secret rejected");
                     return;
@@ -1570,7 +1578,7 @@ where
                 tracing::debug!(
                     %peer,
                     credential_id = %local_id,
-                    sinks = broadcast_txs.len(),
+                    sinks = send_txs.len() + recv_txs.len(),
                     "validated unknown path secret invalidation"
                 );
                 counters.unknown_path_secret_validated.add(1);
@@ -1579,7 +1587,8 @@ where
                 })
             }
             secret_control::Packet::StaleKey(packet) => {
-                let Some(validated) = path_secret_map.handle_stale_key_packet(&packet, &peer) else {
+                let Some(validated) = path_secret_map.handle_stale_key_packet(&packet, &peer)
+                else {
                     tracing::debug!(%peer, "ignored invalidation control packet: stale key rejected");
                     return;
                 };
@@ -1592,7 +1601,7 @@ where
                     %peer,
                     credential_id = %local_id,
                     sender_id = sender_id.as_u64(),
-                    sinks = broadcast_txs.len(),
+                    sinks = send_txs.len(),
                     "validated stale key invalidation"
                 );
                 counters.stale_key_validated.add(1);
@@ -1616,7 +1625,7 @@ where
                     %peer,
                     credential_id = %local_id,
                     sender_id = sender_id.as_u64(),
-                    sinks = broadcast_txs.len(),
+                    sinks = send_txs.len(),
                     "validated replay detected invalidation"
                 );
                 counters.replay_detected_validated.add(1);
@@ -1629,8 +1638,35 @@ where
             return;
         };
 
-        for tx in &mut broadcast_txs {
-            let _ = tx.send(Entry::new(invalidation));
+        match invalidation {
+            Invalidation::UnknownPathSecret { .. } => {
+                for tx in &mut send_txs {
+                    let _ = tx.send(Entry::new(invalidation));
+                }
+                for tx in &mut recv_txs {
+                    let _ = tx.send(Entry::new(invalidation));
+                }
+            }
+            Invalidation::StaleKey { sender_id, .. } => {
+                let sender_idx = sender_id.as_u64() as usize;
+                let worker_id = sender_id_to_worker.get(sender_idx).copied();
+                debug_assert!(
+                    worker_id.is_some(),
+                    "stale/replay invalidation sender_id had no worker mapping"
+                );
+                let Some(worker_id) = worker_id else {
+                    return;
+                };
+                let tx = send_txs.get_mut(worker_id);
+                debug_assert!(
+                    tx.is_some(),
+                    "stale/replay invalidation worker mapping out of range"
+                );
+                let Some(tx) = tx else {
+                    return;
+                };
+                let _ = tx.send(Entry::new(invalidation));
+            }
         }
     })
 }

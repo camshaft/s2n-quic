@@ -354,12 +354,11 @@ fn send_invalidation_stale_key_targets_matching_sender_only() {
         let id = *pse.id();
         let (cancelled_tx, mut collected_rx) = unsync::new::<Frame>();
         let (retransmit_tx, mut retransmit_rx) = unsync::new::<Frame>();
-        let invalidation_rx = super::helpers::TestReceiver::new(vec![Entry::new(
-            tasks::Invalidation::StaleKey {
+        let invalidation_rx =
+            super::helpers::TestReceiver::new(vec![Entry::new(tasks::Invalidation::StaleKey {
                 credential_id: id,
                 sender_id: VarInt::from_u8(1),
-            },
-        )]);
+            })]);
         let mut rx = tasks::send_invalidation(
             invalidation_rx,
             send_caches.clone(),
