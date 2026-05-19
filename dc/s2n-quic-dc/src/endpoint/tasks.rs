@@ -1490,7 +1490,7 @@ where
                 let local_id = sender_idx_to_local.get(sender_idx).copied();
                 debug_assert!(
                     local_id.is_some(),
-                    "sender_id did not map to a local sender_idx entry"
+                    "sender_id had no local sender_idx mapping; this should not occur in normal operation and may indicate sender_id_to_worker mapping drift"
                 );
                 let Some(local_id) = local_id else {
                     return;
@@ -1498,7 +1498,7 @@ where
                 let cache = send_caches.get(local_id);
                 debug_assert!(
                     cache.is_some(),
-                    "sender_id mapped to a sender_idx not owned by this worker"
+                    "sender_id resolved to a sender_idx not owned by this worker; this should not occur in normal operation and may indicate sender_id_to_worker mapping drift"
                 );
                 let Some(cache) = cache else {
                     return;
@@ -1652,7 +1652,7 @@ where
                 let worker_id = sender_id_to_worker.get(sender_idx).copied();
                 debug_assert!(
                     worker_id.is_some(),
-                    "stale/replay invalidation sender_id had no worker mapping"
+                    "stale/replay invalidation sender_id had no sender_id_to_worker mapping; this indicates an invalid endpoint worker configuration"
                 );
                 let Some(worker_id) = worker_id else {
                     return;
@@ -1660,7 +1660,7 @@ where
                 let tx = send_txs.get_mut(worker_id);
                 debug_assert!(
                     tx.is_some(),
-                    "stale/replay invalidation worker mapping out of range"
+                    "stale/replay invalidation worker mapping exceeded send_txs length; sender_id_to_worker and send worker wiring are inconsistent"
                 );
                 let Some(tx) = tx else {
                     return;
