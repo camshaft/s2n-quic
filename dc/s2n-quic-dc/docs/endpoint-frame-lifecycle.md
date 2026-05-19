@@ -17,8 +17,8 @@ send/recv pipelines. The key split is:
 - **Per-send-worker state machine**: owns per-peer send contexts (crypto, CCA, inflight map, timers) and performs
   assembly, ACK/loss processing, retransmission, PTO probing, and completion emission.
 
-A **frame** is the application-level unit. A **packet/segment** is the transport-level unit that may contain many
-frames.
+A **frame** is the application-level unit. A **packet** (encoded into a UDP **segment** in this codebase’s send
+path) is the transport-level unit that may contain many frames.
 
 ## 1) Application submission
 
@@ -110,7 +110,8 @@ On loss, each frame is handled independently:
 
 - cancelled (`!should_transmit`) → `Failed(Cancelled)` and routed to cancelled path,
 - TTL exhausted (`ttl == 0`) → `Failed(TransmissionError)` and completed as failure,
-- otherwise TTL is decremented and frame is requeued to submission (`frame_tx.send_batch(lost_queue)`).
+- otherwise, the frame’s TTL is decremented and the frame is requeued to submission
+  (`frame_tx.send_batch(lost_queue)`).
 
 That requeue path sends lost frames back through the same global dispatch pipeline instead of bypassing it.
 
