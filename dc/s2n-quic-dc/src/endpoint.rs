@@ -375,7 +375,7 @@ where
     let (invalidation_broadcast_txs, invalidation_worker_rxs): (Vec<_>, Vec<_>) = (0
         ..num_invalidation_targets)
         .map(|i| {
-            let (tx, rx) = intrusive::sync::new::<crate::credentials::Id>();
+            let (tx, rx) = intrusive::sync::new::<tasks::Invalidation>();
             let gauge = counter_registry
                 .register_queue_gauge_nominal("q.invalidation", format_args!("worker.{i}"));
             let tx = crate::socket::channel::GaugedSender::new(tx, gauge);
@@ -633,7 +633,7 @@ struct SendWorkerParts {
         >,
     >,
     waker_sink: waker::Sink,
-    invalidation_rx: sync_queue::Receiver<crate::credentials::Id>,
+    invalidation_rx: sync_queue::Receiver<tasks::Invalidation>,
 }
 
 /// Per-socket ingredients for the socket send task.
@@ -678,7 +678,7 @@ struct RecvDispatchParts<Clk, AckSnd, Route> {
     route: Route,
     waker_sink: waker::Sink,
     ups_tx: UpsSender,
-    invalidation_rx: sync_queue::Receiver<crate::credentials::Id>,
+    invalidation_rx: sync_queue::Receiver<tasks::Invalidation>,
 }
 
 /// Ingredients for the background worker (invalidation validation + future housekeeping).
@@ -695,8 +695,8 @@ struct BackgroundParts<UpsSocket> {
 }
 
 type InvalidationSender = crate::socket::channel::GaugedSender<
-    sync_queue::Sender<crate::credentials::Id>,
-    Entry<crate::credentials::Id>,
+    sync_queue::Sender<tasks::Invalidation>,
+    Entry<tasks::Invalidation>,
 >;
 
 type UpsSender =

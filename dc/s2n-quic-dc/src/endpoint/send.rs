@@ -1207,4 +1207,18 @@ impl Cache {
         tracing::debug!(%id, sender_idx = self.sender_idx, "invalidating send context");
         ctx.drain_frames(reason, cancelled);
     }
+
+    pub fn invalidate_stale_key(
+        &mut self,
+        id: &credentials::Id,
+        sender_id: VarInt,
+        cancelled: &mut impl UnboundedSender<intrusive::Entry<Frame>>,
+    ) {
+        let sender_idx = sender_id.as_u64() as usize;
+        if self.sender_idx != sender_idx {
+            return;
+        }
+
+        self.invalidate(id, frame::FailureReason::UnknownPathSecret, cancelled);
+    }
 }

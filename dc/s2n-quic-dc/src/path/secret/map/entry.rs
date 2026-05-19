@@ -606,7 +606,7 @@ impl receiver::Error {
                 wire_version: WireVersion::ZERO,
                 credential_id: credentials.id,
                 min_key_id: entry.receiver.minimum_unseen_key_id(),
-                queue_id,
+                sender_id: queue_id,
             }
             .encode(encoder, &entry.control_sealer()),
         };

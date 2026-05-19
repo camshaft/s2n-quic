@@ -203,7 +203,7 @@ pub fn send_worker<Socket, Clk, WakerSink, AckComp>(
     worker_id: usize,
     batch_rx: impl Receiver<Entry<FrameBatch>> + 'static,
     ack_rx: impl Receiver<Entry<msg::Sender>> + 'static,
-    invalidation_rx: impl Receiver<Entry<crate::credentials::Id>> + 'static,
+    invalidation_rx: impl Receiver<Entry<Invalidation>> + 'static,
     total_sender_ids: usize,
     send_sockets: Vec<endpoint::SendSocketParts<Socket, Clk>>,
     clock: Clk,
@@ -1439,18 +1439,31 @@ pub fn send_invalidation<R>(
     mut cancelled_tx: impl UnboundedSender<Entry<Frame>> + 'static,
 ) -> impl Receiver<()>
 where
-    R: Receiver<Entry<crate::credentials::Id>>,
+    R: Receiver<Entry<Invalidation>>,
 {
     Map::new(
         invalidation_rx,
-        move |entry: Entry<crate::credentials::Id>| {
-            let id = *entry;
-            for cache in &send_caches {
-                cache.borrow_mut().invalidate(
-                    &id,
-                    frame::FailureReason::UnknownPathSecret,
-                    &mut cancelled_tx,
-                );
+        move |entry: Entry<Invalidation>| match *entry {
+            Invalidation::UnknownPathSecret { credential_id } => {
+                for cache in &send_caches {
+                    cache.borrow_mut().invalidate(
+                        &credential_id,
+                        frame::FailureReason::UnknownPathSecret,
+                        &mut cancelled_tx,
+                    );
+                }
+            }
+            Invalidation::StaleKey {
+                credential_id,
+                sender_id,
+            } => {
+                for cache in &send_caches {
+                    cache.borrow_mut().invalidate_stale_key(
+                        &credential_id,
+                        sender_id,
+                        &mut cancelled_tx,
+                    );
+                }
             }
         },
     )
@@ -1461,15 +1474,27 @@ pub fn recv_invalidation<R>(
     recv_cache: Rc<RefCell<endpoint::recv::Cache>>,
 ) -> impl Receiver<()>
 where
-    R: Receiver<Entry<crate::credentials::Id>>,
+    R: Receiver<Entry<Invalidation>>,
 {
     Map::new(
         invalidation_rx,
-        move |entry: Entry<crate::credentials::Id>| {
-            let id = *entry;
-            recv_cache.borrow_mut().invalidate_by_id(&id);
+        move |entry: Entry<Invalidation>| {
+            if let Invalidation::UnknownPathSecret { credential_id } = *entry {
+                recv_cache.borrow_mut().invalidate_by_id(&credential_id);
+            }
         },
     )
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Invalidation {
+    UnknownPathSecret {
+        credential_id: crate::credentials::Id,
+    },
+    StaleKey {
+        credential_id: crate::credentials::Id,
+        sender_id: VarInt,
+    },
 }
 
 pub fn invalidation_validator<R, Tx>(
@@ -1479,7 +1504,7 @@ pub fn invalidation_validator<R, Tx>(
 ) -> impl Receiver<()>
 where
     R: Receiver<Entry<descriptor::Filled>>,
-    Tx: UnboundedSender<Entry<crate::credentials::Id>>,
+    Tx: UnboundedSender<Entry<Invalidation>>,
 {
     use crate::packet::secret_control;
     use s2n_codec::DecoderBufferMut;
@@ -1493,21 +1518,57 @@ where
             tracing::debug!(%peer, "ignored invalidation control packet: decode failed");
             return;
         };
-        let secret_control::Packet::UnknownPathSecret(packet) = packet else {
-            tracing::debug!(%peer, "ignored invalidation control packet: unsupported control type");
+        let Some(invalidation) = (match packet {
+            secret_control::Packet::UnknownPathSecret(packet) => {
+                let Some(validated) = path_secret_map.handle_unknown_path_secret_packet(&packet, &peer)
+                else {
+                    tracing::debug!(%peer, "ignored invalidation control packet: unknown path secret rejected");
+                    return;
+                };
+
+                let local_id = validated.credential_id.for_peer();
+                tracing::debug!(
+                    %peer,
+                    credential_id = %local_id,
+                    sinks = broadcast_txs.len(),
+                    "validated unknown path secret invalidation"
+                );
+                Some(Invalidation::UnknownPathSecret {
+                    credential_id: local_id,
+                })
+            }
+            secret_control::Packet::StaleKey(packet) => {
+                let Some(validated) = path_secret_map.handle_stale_key_packet(&packet, &peer) else {
+                    tracing::debug!(%peer, "ignored invalidation control packet: stale key rejected");
+                    return;
+                };
+                let Some(sender_id) = validated.sender_id else {
+                    tracing::debug!(%peer, "ignored invalidation control packet: stale key missing sender_id");
+                    return;
+                };
+                let local_id = validated.credential_id.for_peer();
+                tracing::debug!(
+                    %peer,
+                    credential_id = %local_id,
+                    sender_id = sender_id.as_u64(),
+                    sinks = broadcast_txs.len(),
+                    "validated stale key invalidation"
+                );
+                Some(Invalidation::StaleKey {
+                    credential_id: local_id,
+                    sender_id,
+                })
+            }
+            secret_control::Packet::ReplayDetected(_) => {
+                tracing::debug!(%peer, "ignored invalidation control packet: unsupported control type");
+                None
+            }
+        }) else {
             return;
         };
 
-        let Some(validated) = path_secret_map.handle_unknown_path_secret_packet(&packet, &peer)
-        else {
-            tracing::debug!(%peer, "ignored invalidation control packet: unknown path secret rejected");
-            return;
-        };
-
-        let local_id = validated.credential_id.for_peer();
-        tracing::debug!(%peer, credential_id = %local_id, sinks = broadcast_txs.len(), "validated unknown path secret invalidation");
         for tx in &mut broadcast_txs {
-            let _ = tx.send(Entry::from(local_id));
+            let _ = tx.send(Entry::new(invalidation));
         }
     })
 }

@@ -188,8 +188,17 @@ impl<'a> Packet<'a> {
     pub fn queue_id(&self) -> Option<VarInt> {
         match self {
             Self::UnknownPathSecret(p) => p.queue_id(),
-            Self::StaleKey(p) => p.queue_id(),
+            Self::StaleKey(_) => None,
             Self::ReplayDetected(p) => p.queue_id(),
+        }
+    }
+
+    #[inline]
+    pub fn sender_id(&self) -> Option<VarInt> {
+        match self {
+            Self::UnknownPathSecret(_) => None,
+            Self::StaleKey(p) => p.sender_id(),
+            Self::ReplayDetected(_) => None,
         }
     }
 }
