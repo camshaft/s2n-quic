@@ -14,7 +14,6 @@ pub fn new(capacity: usize) -> secret::Map {
         secret[..8].copy_from_slice(&group_id.to_be_bytes());
         tracing::debug!(
             group_id,
-            signer_prefix = %hex::encode(&secret[..8]),
             "using deterministic stateless reset signer for bach sim map"
         );
         secret::stateless_reset::Signer::new(&secret)

@@ -355,7 +355,8 @@ fn sim_path_pair_ids_are_stable_across_identical_runs() {
             *ids_out.lock().unwrap() = Some(pair_ids);
         });
 
-        ids.lock().unwrap().expect("pair ids should be captured")
+        let ids = ids.lock().unwrap().expect("pair ids should be captured");
+        ids
     }
 
     let first = run_once();

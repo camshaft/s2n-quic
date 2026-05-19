@@ -373,20 +373,8 @@ impl Map {
             time::NoopClock,
             event::testing::Subscriber::no_snapshot(),
         );
-        let secret = if bach::is_active() {
-            let secret = deterministic_test_pair_secret(local_addr, peer_addr);
-            tracing::debug!(
-                %local_addr,
-                %peer_addr,
-                secret_prefix = %hex::encode(&secret[..8]),
-                "using deterministic test pair secret for bach sim"
-            );
-            secret
-        } else {
-            let mut secret = [0; 32];
-            aws_lc_rs::rand::fill(&mut secret).unwrap();
-            secret
-        };
+        let mut secret = [0; 32];
+        aws_lc_rs::rand::fill(&mut secret).unwrap();
         let mut stateless_reset = [0; control::TAG_LEN];
         aws_lc_rs::rand::fill(&mut stateless_reset).unwrap();
 
@@ -493,8 +481,19 @@ impl Map {
 
         let ciphersuite = schedule::Ciphersuite::AES_GCM_128_SHA256;
 
-        let mut secret = [0; 32];
-        aws_lc_rs::rand::fill(&mut secret).unwrap();
+        let secret = if bach::is_active() {
+            let secret = deterministic_test_pair_secret(local_addr, peer_addr);
+            tracing::debug!(
+                %local_addr,
+                %peer_addr,
+                "using deterministic test pair secret for bach sim"
+            );
+            secret
+        } else {
+            let mut secret = [0; 32];
+            aws_lc_rs::rand::fill(&mut secret).unwrap();
+            secret
+        };
 
         let insert = |map: &Self,
                       peer: &Self,
