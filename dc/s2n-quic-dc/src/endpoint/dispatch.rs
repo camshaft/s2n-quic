@@ -50,6 +50,13 @@ pub(crate) enum Error {
         credentials: Credentials,
         packet_number: VarInt,
     },
+    /// `check_dedup` detected that the key-id was already registered (definite replay)
+    /// or outside the replay window (possible replay / too old).  The peer should be
+    /// notified to trigger a re-handshake.
+    StaleKey {
+        credentials: Credentials,
+        packet_number: VarInt,
+    },
     MissingSenderId,
 }
 
@@ -95,17 +102,27 @@ where
     // Get or create peer receive state, decrypting the packet on-demand.
     //
     // The decrypt closure is invoked with the opener (cached on hit, freshly derived
-    // on miss).  `post_authentication` is called inside `get_or_insert` after a
-    // successful decrypt so that every authenticated packet is recorded in the
-    // receiver's key-id seen window.  On a cache miss the Context is only inserted
-    // once both decrypt and `post_authentication` succeed, preventing stale
-    // path-secret entries from poisoning the cache.
+    // on miss).  `post_authentication` is called inside `get_or_insert` only on a
+    // cache miss — recording the key-id in the receiver's replay window for the first
+    // packet of a new session.  Cache hits skip `post_authentication` because many
+    // packets legitimately share the same key-id within a session; per-packet replay
+    // protection is handled by `dedup_filter` inside the `Context`.  On a cache miss
+    // the Context is inserted only once both decrypt and `post_authentication` succeed,
+    // preventing stale path-secret entries from poisoning the cache.
     let mut control_out = Vec::new();
     let decrypt_fn = |opener: &crate::crypto::awslc::open::Application| {
         let _guard = counters.rx_decrypt_time.start();
         let mut buf = BytesMut::with_capacity(decrypt_len);
         let written = packet
             .decrypt_into(opener, bytes::BufMut::chunk_mut(&mut buf))
+            .map_err(|err| {
+                tracing::warn!(
+                    %credentials,
+                    packet_number = packet_number.as_u64(),
+                    error = %err,
+                    "decrypt_into failed"
+                );
+            })
             .ok()?;
         if written != decrypt_len {
             tracing::warn!(
@@ -158,7 +175,6 @@ where
                 });
             }
             Err(recv::CacheError::ReplayDetected) => {
-                counters.rx_process_err_stale_key.add(1);
                 // TODO: `check_dedup` already sends a StaleKey/ReplayDetected control
                 // packet to the peer via the map's background socket, but that path is
                 // best-effort and may not reach the peer.  We should also populate
@@ -166,7 +182,7 @@ where
                 // it via the UPS in-band path (mirroring the `PeerStateLookup` arm
                 // above) so that the peer has a reliable mechanism to learn about the
                 // stale key and trigger a re-handshake.
-                return Err(Error::Duplicate {
+                return Err(Error::StaleKey {
                     credentials,
                     packet_number,
                 });

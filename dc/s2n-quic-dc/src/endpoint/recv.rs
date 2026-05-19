@@ -18,7 +18,8 @@ pub(crate) enum CacheError {
     PathSecretNotFound,
     /// The decrypt callback returned `None` (authentication / decryption failed).
     DecryptFailed,
-    /// `post_authentication` failed: the key-id has already been seen (replay).
+    /// `post_authentication` failed: the key-id has already been seen (definite replay)
+    /// or falls outside the receiver's replay window (possible replay / too old).
     ReplayDetected,
 }
 

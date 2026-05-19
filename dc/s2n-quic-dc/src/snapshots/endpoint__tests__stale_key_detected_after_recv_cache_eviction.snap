@@ -657,7 +657,7 @@ expression: logs
 0:00:03.001561000 [server] TRACE c#rx.data_pkt=1
 0:00:03.001561000 [server]  WARN Failed to send control packet to 10.0.0.2:49153: Os { code: 1, kind: PermissionDenied, message: "Operation not permitted" }
 0:00:03.001561000 [server] TRACE c#!rx.process.err.stale_key=1
-0:00:03.001561000 [server] TRACE c#!rx.process.err.duplicate=1
+0:00:03.001561000 [server] DEBUG stale key detected - key-id already seen or outside replay window credentials=Credentials { id: 0xb2cefdb9b8fd61f7e4bb97dfaae7a010, key_id: VarInt(0) } pn=3
 0:00:03.001561000 [server] TRACE m#task.packet_dispatch.drained[recv.0]=2
 0:00:03.003392000 [client] TRACE m#task.pto_wheel.drained[send.0]=0
 0:00:03.003561000 [client] TRACE c#q.resolver_to_pto_wheel.receiver[send.0.task.pto_wheel]=1
@@ -721,7 +721,7 @@ expression: logs
 0:00:03.004061000 [server] TRACE c#rx.data_pkt=1
 0:00:03.004061000 [server]  WARN Failed to send control packet to 10.0.0.2:49153: Os { code: 1, kind: PermissionDenied, message: "Operation not permitted" }
 0:00:03.004061000 [server] TRACE c#!rx.process.err.stale_key=1
-0:00:03.004061000 [server] TRACE c#!rx.process.err.duplicate=1
+0:00:03.004061000 [server] DEBUG stale key detected - key-id already seen or outside replay window credentials=Credentials { id: 0xb2cefdb9b8fd61f7e4bb97dfaae7a010, key_id: VarInt(0) } pn=8
 0:00:03.004061000 [server] TRACE m#task.packet_dispatch.drained[recv.0]=2
 0:00:03.005952000 [client] TRACE m#task.pto_wheel.drained[send.0]=0
 0:00:03.006061000 [client] TRACE c#q.resolver_to_pto_wheel.receiver[send.0.task.pto_wheel]=1
@@ -796,7 +796,7 @@ expression: logs
 0:00:03.009061000 [server] TRACE c#rx.data_pkt=1
 0:00:03.009061000 [server]  WARN Failed to send control packet to 10.0.0.2:49153: Os { code: 1, kind: PermissionDenied, message: "Operation not permitted" }
 0:00:03.009061000 [server] TRACE c#!rx.process.err.stale_key=1
-0:00:03.009061000 [server] TRACE c#!rx.process.err.duplicate=1
+0:00:03.009061000 [server] DEBUG stale key detected - key-id already seen or outside replay window credentials=Credentials { id: 0xb2cefdb9b8fd61f7e4bb97dfaae7a010, key_id: VarInt(0) } pn=13
 0:00:03.009061000 [server] TRACE m#task.packet_dispatch.drained[recv.0]=2
 0:00:03.010816000 [client] TRACE m#task.pto_wheel.drained[send.0]=0
 0:00:03.011061000 [client] TRACE c#q.resolver_to_pto_wheel.receiver[send.0.task.pto_wheel]=1
@@ -893,7 +893,7 @@ expression: logs
 0:00:03.019061000 [server] TRACE c#rx.data_pkt=1
 0:00:03.019061000 [server]  WARN Failed to send control packet to 10.0.0.2:49153: Os { code: 1, kind: PermissionDenied, message: "Operation not permitted" }
 0:00:03.019061000 [server] TRACE c#!rx.process.err.stale_key=1
-0:00:03.019061000 [server] TRACE c#!rx.process.err.duplicate=1
+0:00:03.019061000 [server] DEBUG stale key detected - key-id already seen or outside replay window credentials=Credentials { id: 0xb2cefdb9b8fd61f7e4bb97dfaae7a010, key_id: VarInt(0) } pn=18
 0:00:03.019061000 [server] TRACE m#task.packet_dispatch.drained[recv.0]=2
 0:00:03.021056000 [client] TRACE m#task.pto_wheel.drained[send.0]=0
 0:00:03.021061000 [client] TRACE c#q.resolver_to_pto_wheel.receiver[send.0.task.pto_wheel]=1
@@ -1034,7 +1034,7 @@ expression: logs
 0:00:03.039061000 [server] TRACE c#rx.data_pkt=1
 0:00:03.039061000 [server]  WARN Failed to send control packet to 10.0.0.2:49153: Os { code: 1, kind: PermissionDenied, message: "Operation not permitted" }
 0:00:03.039061000 [server] TRACE c#!rx.process.err.stale_key=1
-0:00:03.039061000 [server] TRACE c#!rx.process.err.duplicate=1
+0:00:03.039061000 [server] DEBUG stale key detected - key-id already seen or outside replay window credentials=Credentials { id: 0xb2cefdb9b8fd61f7e4bb97dfaae7a010, key_id: VarInt(0) } pn=23
 0:00:03.039061000 [server] TRACE m#task.packet_dispatch.drained[recv.0]=2
 0:00:03.041024000 [client] TRACE m#task.pto_wheel.drained[send.0]=0
 0:00:03.041061000 [client] TRACE c#q.resolver_to_pto_wheel.receiver[send.0.task.pto_wheel]=1
@@ -1263,7 +1263,7 @@ expression: logs
 0:00:03.079061000 [server] TRACE c#rx.data_pkt=1
 0:00:03.079061000 [server]  WARN Failed to send control packet to 10.0.0.2:49153: Os { code: 1, kind: PermissionDenied, message: "Operation not permitted" }
 0:00:03.079061000 [server] TRACE c#!rx.process.err.stale_key=1
-0:00:03.079061000 [server] TRACE c#!rx.process.err.duplicate=1
+0:00:03.079061000 [server] DEBUG stale key detected - key-id already seen or outside replay window credentials=Credentials { id: 0xb2cefdb9b8fd61f7e4bb97dfaae7a010, key_id: VarInt(0) } pn=28
 0:00:03.079061000 [server] TRACE m#task.packet_dispatch.drained[recv.0]=2
 0:00:03.080960000 [client] TRACE m#task.pto_wheel.drained[send.0]=0
 0:00:03.081061000 [client] TRACE c#q.resolver_to_pto_wheel.receiver[send.0.task.pto_wheel]=1
@@ -1492,7 +1492,7 @@ expression: logs
 0:00:03.119061000 [server] TRACE c#rx.data_pkt=1
 0:00:03.119061000 [server]  WARN Failed to send control packet to 10.0.0.2:49153: Os { code: 1, kind: PermissionDenied, message: "Operation not permitted" }
 0:00:03.119061000 [server] TRACE c#!rx.process.err.stale_key=1
-0:00:03.119061000 [server] TRACE c#!rx.process.err.duplicate=1
+0:00:03.119061000 [server] DEBUG stale key detected - key-id already seen or outside replay window credentials=Credentials { id: 0xb2cefdb9b8fd61f7e4bb97dfaae7a010, key_id: VarInt(0) } pn=33
 0:00:03.119061000 [server] TRACE m#task.packet_dispatch.drained[recv.0]=2
 0:00:03.120896000 [client] TRACE m#task.pto_wheel.drained[send.0]=0
 0:00:03.121061000 [client] TRACE c#q.resolver_to_pto_wheel.receiver[send.0.task.pto_wheel]=1
@@ -1721,7 +1721,7 @@ expression: logs
 0:00:03.159061000 [server] TRACE c#rx.data_pkt=1
 0:00:03.159061000 [server]  WARN Failed to send control packet to 10.0.0.2:49153: Os { code: 1, kind: PermissionDenied, message: "Operation not permitted" }
 0:00:03.159061000 [server] TRACE c#!rx.process.err.stale_key=1
-0:00:03.159061000 [server] TRACE c#!rx.process.err.duplicate=1
+0:00:03.159061000 [server] DEBUG stale key detected - key-id already seen or outside replay window credentials=Credentials { id: 0xb2cefdb9b8fd61f7e4bb97dfaae7a010, key_id: VarInt(0) } pn=38
 0:00:03.159061000 [server] TRACE m#task.packet_dispatch.drained[recv.0]=2
 0:00:03.160832000 [client] TRACE m#task.pto_wheel.drained[send.0]=0
 0:00:03.161061000 [client] TRACE c#q.resolver_to_pto_wheel.receiver[send.0.task.pto_wheel]=1
@@ -1950,7 +1950,7 @@ expression: logs
 0:00:03.199061000 [server] TRACE c#rx.data_pkt=1
 0:00:03.199061000 [server]  WARN Failed to send control packet to 10.0.0.2:49153: Os { code: 1, kind: PermissionDenied, message: "Operation not permitted" }
 0:00:03.199061000 [server] TRACE c#!rx.process.err.stale_key=1
-0:00:03.199061000 [server] TRACE c#!rx.process.err.duplicate=1
+0:00:03.199061000 [server] DEBUG stale key detected - key-id already seen or outside replay window credentials=Credentials { id: 0xb2cefdb9b8fd61f7e4bb97dfaae7a010, key_id: VarInt(0) } pn=43
 0:00:03.199061000 [server] TRACE m#task.packet_dispatch.drained[recv.0]=2
 0:00:03.201024000 [client] TRACE m#task.pto_wheel.drained[send.0]=0
 0:00:03.201061000 [client] TRACE c#q.resolver_to_pto_wheel.receiver[send.0.task.pto_wheel]=1
@@ -2179,7 +2179,7 @@ expression: logs
 0:00:03.239061000 [server] TRACE c#rx.data_pkt=1
 0:00:03.239061000 [server]  WARN Failed to send control packet to 10.0.0.2:49153: Os { code: 1, kind: PermissionDenied, message: "Operation not permitted" }
 0:00:03.239061000 [server] TRACE c#!rx.process.err.stale_key=1
-0:00:03.239061000 [server] TRACE c#!rx.process.err.duplicate=1
+0:00:03.239061000 [server] DEBUG stale key detected - key-id already seen or outside replay window credentials=Credentials { id: 0xb2cefdb9b8fd61f7e4bb97dfaae7a010, key_id: VarInt(0) } pn=48
 0:00:03.239061000 [server] TRACE m#task.packet_dispatch.drained[recv.0]=2
 0:00:03.240960000 [client] TRACE m#task.pto_wheel.drained[send.0]=0
 0:00:03.241061000 [client] TRACE c#q.resolver_to_pto_wheel.receiver[send.0.task.pto_wheel]=1
@@ -2408,7 +2408,7 @@ expression: logs
 0:00:03.279061000 [server] TRACE c#rx.data_pkt=1
 0:00:03.279061000 [server]  WARN Failed to send control packet to 10.0.0.2:49153: Os { code: 1, kind: PermissionDenied, message: "Operation not permitted" }
 0:00:03.279061000 [server] TRACE c#!rx.process.err.stale_key=1
-0:00:03.279061000 [server] TRACE c#!rx.process.err.duplicate=1
+0:00:03.279061000 [server] DEBUG stale key detected - key-id already seen or outside replay window credentials=Credentials { id: 0xb2cefdb9b8fd61f7e4bb97dfaae7a010, key_id: VarInt(0) } pn=53
 0:00:03.279061000 [server] TRACE m#task.packet_dispatch.drained[recv.0]=2
 0:00:03.280896000 [client] TRACE m#task.pto_wheel.drained[send.0]=0
 0:00:03.281061000 [client] TRACE c#q.resolver_to_pto_wheel.receiver[send.0.task.pto_wheel]=1
@@ -2637,7 +2637,7 @@ expression: logs
 0:00:03.319061000 [server] TRACE c#rx.data_pkt=1
 0:00:03.319061000 [server]  WARN Failed to send control packet to 10.0.0.2:49153: Os { code: 1, kind: PermissionDenied, message: "Operation not permitted" }
 0:00:03.319061000 [server] TRACE c#!rx.process.err.stale_key=1
-0:00:03.319061000 [server] TRACE c#!rx.process.err.duplicate=1
+0:00:03.319061000 [server] DEBUG stale key detected - key-id already seen or outside replay window credentials=Credentials { id: 0xb2cefdb9b8fd61f7e4bb97dfaae7a010, key_id: VarInt(0) } pn=58
 0:00:03.319061000 [server] TRACE m#task.packet_dispatch.drained[recv.0]=2
 0:00:03.320832000 [client] TRACE m#task.pto_wheel.drained[send.0]=0
 0:00:03.321061000 [client] TRACE c#q.resolver_to_pto_wheel.receiver[send.0.task.pto_wheel]=1
@@ -2866,7 +2866,7 @@ expression: logs
 0:00:03.359061000 [server] TRACE c#rx.data_pkt=1
 0:00:03.359061000 [server]  WARN Failed to send control packet to 10.0.0.2:49153: Os { code: 1, kind: PermissionDenied, message: "Operation not permitted" }
 0:00:03.359061000 [server] TRACE c#!rx.process.err.stale_key=1
-0:00:03.359061000 [server] TRACE c#!rx.process.err.duplicate=1
+0:00:03.359061000 [server] DEBUG stale key detected - key-id already seen or outside replay window credentials=Credentials { id: 0xb2cefdb9b8fd61f7e4bb97dfaae7a010, key_id: VarInt(0) } pn=63
 0:00:03.359061000 [server] TRACE m#task.packet_dispatch.drained[recv.0]=2
 0:00:03.361024000 [client] TRACE m#task.pto_wheel.drained[send.0]=0
 0:00:03.361061000 [client] TRACE c#q.resolver_to_pto_wheel.receiver[send.0.task.pto_wheel]=1
@@ -3095,7 +3095,7 @@ expression: logs
 0:00:03.399061000 [server] TRACE c#rx.data_pkt=1
 0:00:03.399061000 [server]  WARN Failed to send control packet to 10.0.0.2:49153: Os { code: 1, kind: PermissionDenied, message: "Operation not permitted" }
 0:00:03.399061000 [server] TRACE c#!rx.process.err.stale_key=1
-0:00:03.399061000 [server] TRACE c#!rx.process.err.duplicate=1
+0:00:03.399061000 [server] DEBUG stale key detected - key-id already seen or outside replay window credentials=Credentials { id: 0xb2cefdb9b8fd61f7e4bb97dfaae7a010, key_id: VarInt(0) } pn=68
 0:00:03.399061000 [server] TRACE m#task.packet_dispatch.drained[recv.0]=2
 0:00:03.400960000 [client] TRACE m#task.pto_wheel.drained[send.0]=0
 0:00:03.401061000 [client] TRACE c#q.resolver_to_pto_wheel.receiver[send.0.task.pto_wheel]=1
@@ -3324,7 +3324,7 @@ expression: logs
 0:00:03.439061000 [server] TRACE c#rx.data_pkt=1
 0:00:03.439061000 [server]  WARN Failed to send control packet to 10.0.0.2:49153: Os { code: 1, kind: PermissionDenied, message: "Operation not permitted" }
 0:00:03.439061000 [server] TRACE c#!rx.process.err.stale_key=1
-0:00:03.439061000 [server] TRACE c#!rx.process.err.duplicate=1
+0:00:03.439061000 [server] DEBUG stale key detected - key-id already seen or outside replay window credentials=Credentials { id: 0xb2cefdb9b8fd61f7e4bb97dfaae7a010, key_id: VarInt(0) } pn=73
 0:00:03.439061000 [server] TRACE m#task.packet_dispatch.drained[recv.0]=2
 0:00:03.440896000 [client] TRACE m#task.pto_wheel.drained[send.0]=0
 0:00:03.441061000 [client] TRACE c#q.resolver_to_pto_wheel.receiver[send.0.task.pto_wheel]=1
@@ -3553,7 +3553,7 @@ expression: logs
 0:00:03.479061000 [server] TRACE c#rx.data_pkt=1
 0:00:03.479061000 [server]  WARN Failed to send control packet to 10.0.0.2:49153: Os { code: 1, kind: PermissionDenied, message: "Operation not permitted" }
 0:00:03.479061000 [server] TRACE c#!rx.process.err.stale_key=1
-0:00:03.479061000 [server] TRACE c#!rx.process.err.duplicate=1
+0:00:03.479061000 [server] DEBUG stale key detected - key-id already seen or outside replay window credentials=Credentials { id: 0xb2cefdb9b8fd61f7e4bb97dfaae7a010, key_id: VarInt(0) } pn=78
 0:00:03.479061000 [server] TRACE m#task.packet_dispatch.drained[recv.0]=2
 0:00:03.480832000 [client] TRACE m#task.pto_wheel.drained[send.0]=0
 0:00:03.481061000 [client] TRACE c#q.resolver_to_pto_wheel.receiver[send.0.task.pto_wheel]=1
