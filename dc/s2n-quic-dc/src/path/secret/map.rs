@@ -97,33 +97,6 @@ fn deterministic_test_pair_secret(
     secret
 }
 
-#[cfg(any(test, feature = "testing"))]
-std::thread_local! {
-    static TEST_PAIR_GENERATIONS: std::cell::RefCell<
-        std::collections::HashMap<(usize, usize, SocketAddr, SocketAddr), u64>
-    > = std::cell::RefCell::new(std::collections::HashMap::new());
-}
-
-#[cfg(any(test, feature = "testing"))]
-#[inline]
-fn next_test_pair_generation(
-    local_map: &Map,
-    local_addr: SocketAddr,
-    peer_map: &Map,
-    peer_addr: SocketAddr,
-) -> u64 {
-    let local_ptr = Arc::as_ptr(&local_map.store) as *const () as usize;
-    let peer_ptr = Arc::as_ptr(&peer_map.store) as *const () as usize;
-    TEST_PAIR_GENERATIONS.with(|generations| {
-        let mut generations = generations.borrow_mut();
-        let key = (local_ptr, peer_ptr, local_addr, peer_addr);
-        let generation = generations.entry(key).or_insert(0);
-        let current = *generation;
-        *generation = generation.wrapping_add(1);
-        current
-    })
-}
-
 pub use entry::Entry;
 use store::Store;
 
@@ -541,8 +514,23 @@ impl Map {
         let ciphersuite = schedule::Ciphersuite::AES_GCM_128_SHA256;
 
         let secret = if bach::is_active() {
-            let generation = next_test_pair_generation(self, local_addr, peer, peer_addr);
-            let secret = deterministic_test_pair_secret(local_addr, peer_addr, generation);
+            let mut generation = 0u64;
+            let secret = loop {
+                let secret = deterministic_test_pair_secret(local_addr, peer_addr, generation);
+                let local_id =
+                    *schedule::Secret::new(ciphersuite, dc::SUPPORTED_VERSIONS[0], Type::Client, &secret).id();
+                let peer_id =
+                    *schedule::Secret::new(ciphersuite, dc::SUPPORTED_VERSIONS[0], Type::Server, &secret).id();
+
+                let local_exists = self.store.get_by_id_untracked(&local_id).is_some();
+                let peer_exists = peer.store.get_by_id_untracked(&peer_id).is_some();
+
+                if !local_exists && !peer_exists {
+                    break secret;
+                }
+
+                generation = generation.wrapping_add(1);
+            };
             tracing::debug!(
                 %local_addr,
                 %peer_addr,
