@@ -124,6 +124,7 @@ fn send_invalidation_purges_cache_and_emits_failed_frames() {
         let mut rx = tasks::send_invalidation(
             invalidation_rx,
             send_caches.clone(),
+            vec![0],
             cancelled_tx,
             retransmit_tx,
             invalidation_counters(),
@@ -176,6 +177,7 @@ fn send_invalidation_noop_for_unknown_id() {
         let mut rx = tasks::send_invalidation(
             invalidation_rx,
             send_caches.clone(),
+            vec![0],
             cancelled_tx,
             retransmit_tx,
             invalidation_counters(),
@@ -361,6 +363,7 @@ fn send_invalidation_stale_key_targets_matching_sender_only() {
         let mut rx = tasks::send_invalidation(
             invalidation_rx,
             send_caches.clone(),
+            vec![0, 1],
             cancelled_tx,
             retransmit_tx,
             invalidation_counters(),

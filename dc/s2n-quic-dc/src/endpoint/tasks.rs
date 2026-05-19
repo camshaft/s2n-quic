@@ -646,6 +646,7 @@ pub fn send_worker<Socket, Clk, WakerSink, AckComp>(
         let rx = send_invalidation(
             invalidation_rx,
             send_caches,
+            sender_idx_to_local.clone(),
             invalidation_completed_tx,
             retransmit_tx,
             invalidation_counters,
@@ -1454,6 +1455,7 @@ where
 pub fn send_invalidation<R>(
     invalidation_rx: R,
     send_caches: Vec<Rc<RefCell<send::Cache>>>,
+    sender_idx_to_local: Vec<usize>,
     mut cancelled_tx: impl UnboundedSender<Entry<Frame>> + 'static,
     mut retransmit_tx: impl UnboundedSender<Entry<Frame>> + 'static,
     counters: SendInvalidationCounters,
@@ -1484,17 +1486,22 @@ where
                 sender_id,
             } => {
                 counters.stale_or_replay_events.add(1);
-                for cache in &send_caches {
-                    if let Some(drained) = cache.borrow_mut().invalidate_stale_key(
+                let sender_idx = sender_id.as_u64() as usize;
+                let Some(&local_id) = sender_idx_to_local.get(sender_idx) else {
+                    return;
+                };
+                let Some(cache) = send_caches.get(local_id) else {
+                    return;
+                };
+                if let Some(drained) = cache.borrow_mut().invalidate_stale_key(
                         &credential_id,
                         sender_id,
                         &mut retransmit_tx,
-                    ) {
-                        counters.stale_or_replay_contexts.add(1);
-                        counters
-                            .stale_or_replay_frames_requeued
-                            .add(drained as u64);
-                    }
+                ) {
+                    counters.stale_or_replay_contexts.add(1);
+                    counters
+                        .stale_or_replay_frames_requeued
+                        .add(drained as u64);
                 }
             }
         },
@@ -1600,7 +1607,7 @@ where
                     tracing::debug!(%peer, "ignored invalidation control packet: replay detected rejected");
                     return;
                 };
-                let Some(sender_id) = validated.queue_id else {
+                let Some(sender_id) = validated.sender_id else {
                     tracing::debug!(%peer, "ignored invalidation control packet: replay detected missing sender_id");
                     return;
                 };

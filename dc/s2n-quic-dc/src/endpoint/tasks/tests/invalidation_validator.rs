@@ -89,7 +89,7 @@ fn encode_replay_detected(
         wire_version: WireVersion::ZERO,
         credential_id,
         rejected_key_id,
-        queue_id: Some(sender_id),
+        sender_id: Some(sender_id),
     }
     .encode(EncoderBuffer::new(&mut out), &control_sealer);
     out[..len].to_vec()

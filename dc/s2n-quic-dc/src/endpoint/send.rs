@@ -1223,6 +1223,10 @@ impl Cache {
         retransmit: &mut impl UnboundedSender<intrusive::Entry<Frame>>,
     ) -> Option<usize> {
         let sender_idx = sender_id.as_u64() as usize;
+        debug_assert_eq!(
+            self.sender_idx, sender_idx,
+            "invalidate_stale_key called for wrong sender cache"
+        );
         if self.sender_idx != sender_idx {
             return None;
         }
