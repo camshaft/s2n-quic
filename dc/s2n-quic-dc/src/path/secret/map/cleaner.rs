@@ -16,7 +16,35 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(any(test, feature = "testing"))]
+use std::future::Future;
+
 const EVICTION_CYCLES: u64 = if cfg!(test) { 0 } else { 10 };
+
+/// Async background worker loop, generic over the sleep implementation.
+///
+/// This allows the worker to run under both a std thread (via a blocking
+/// executor) and a bach async task (for deterministic simulation testing).
+#[cfg(any(test, feature = "testing"))]
+async fn background_worker<C, S, F, Fut>(state: std::sync::Weak<State<C, S>>, sleep: F)
+where
+    C: 'static + time::Clock + Send + Sync,
+    S: event::Subscriber,
+    F: Fn(Duration) -> Fut,
+    Fut: Future<Output = ()>,
+{
+    loop {
+        sleep(Duration::from_secs(60)).await;
+
+        let Some(state) = state.upgrade() else {
+            break;
+        };
+        if state.cleaner().should_stop.load(Ordering::Relaxed) {
+            break;
+        }
+        state.cleaner().clean(&state, EVICTION_CYCLES);
+    }
+}
 
 pub struct Cleaner {
     should_stop: AtomicBool,
@@ -60,9 +88,12 @@ impl Cleaner {
         C: 'static + time::Clock + Send + Sync,
         S: event::Subscriber,
     {
-        // check to see if we're in a simulation before spawning a thread
+        // In deterministic simulation tests use a bach async task rather than a
+        // real OS thread so that the cleaner participates in simulated time.
         #[cfg(any(test, feature = "testing"))]
         if bach::is_active() {
+            let state = Arc::downgrade(&state);
+            bach::spawn(background_worker(state, |d| bach::time::sleep(d)));
             return;
         }
 

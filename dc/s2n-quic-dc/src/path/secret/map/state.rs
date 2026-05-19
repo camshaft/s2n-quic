@@ -24,7 +24,7 @@ use std::{
     net::SocketAddr,
     sync::{
         atomic::{AtomicUsize, Ordering},
-        Arc, Mutex, RwLock, Weak,
+        Arc, Mutex, OnceLock, RwLock, Weak,
     },
     time::Duration,
 };
@@ -412,7 +412,10 @@ where
 
     // This socket is used *only* for sending secret control packets.
     // FIXME: This will get replaced with sending on a handshake socket associated with the map.
-    pub(super) control_socket: Option<Arc<std::net::UdpSocket>>,
+    //
+    // Initialized lazily on first send so that socket creation does not affect
+    // the deterministic port-assignment order inside bach simulations.
+    pub(super) control_socket: OnceLock<Option<Arc<dyn ControlSocket>>>,
 
     #[allow(clippy::type_complexity)]
     pub(super) request_handshake: RwLock<
@@ -448,6 +451,30 @@ where
     >,
 }
 
+/// Minimal interface for sending control packets via UDP.
+///
+/// Abstracts over `std::net::UdpSocket` (production) and `bach::net::UdpSocket`
+/// (deterministic simulation tests) so the path secret map can operate in both
+/// environments without spawning real OS resources during simulation.
+pub(super) trait ControlSocket: Send + Sync {
+    fn try_send_to(&self, buf: &[u8], dst: &SocketAddr) -> std::io::Result<usize>;
+}
+
+impl ControlSocket for std::net::UdpSocket {
+    fn try_send_to(&self, buf: &[u8], dst: &SocketAddr) -> std::io::Result<usize> {
+        self.send_to(buf, dst)
+    }
+}
+
+#[cfg(any(test, feature = "testing"))]
+impl ControlSocket for bach::net::UdpSocket {
+    fn try_send_to(&self, buf: &[u8], dst: &SocketAddr) -> std::io::Result<usize> {
+        use std::io::IoSlice;
+        let iov = [IoSlice::new(buf)];
+        self.try_send_msg(*dst, &iov, Default::default())
+    }
+}
+
 // FIXME: Avoid the whole socket.
 //
 // We only ever send on this socket - but we really should be sending on the same
@@ -455,7 +482,22 @@ where
 // from that socket as well. Not exactly clear on how to achieve that yet though (both
 // ownership wise since the map doesn't have direct access to handshakes and in terms
 // of implementation).
-fn control_socket() -> Option<Arc<std::net::UdpSocket>> {
+fn control_socket() -> Option<Arc<dyn ControlSocket>> {
+    // In deterministic simulation tests, use a bach socket (one per State instance)
+    // rather than a shared OS socket so that the simulated network handles sends.
+    #[cfg(any(test, feature = "testing"))]
+    if bach::is_active() {
+        let mut o = bach::net::socket::Options::default();
+        o.local_addr = "[::]:0".parse().unwrap();
+        return match bach::net::UdpSocket::new(&o) {
+            Ok(socket) => Some(Arc::new(socket)),
+            Err(err) => {
+                tracing::warn!(%err, "failed to create bach control socket");
+                None
+            }
+        };
+    }
+
     // Share control sockets -- we only send on these so it doesn't really matter if there's only one
     // per process.
     static CONTROL_SOCKET: Mutex<Weak<std::net::UdpSocket>> = Mutex::new(Weak::new());
@@ -508,8 +550,6 @@ where
         clock: C,
         subscriber: S,
     ) -> Arc<Self> {
-        let control_socket = control_socket();
-
         let init_time = clock.get_time();
 
         // FIXME: Allow configuring the rehandshake_period.
@@ -530,7 +570,8 @@ where
                 rehandshake_period,
             )),
             signer,
-            control_socket,
+            // Initialized lazily on first send; see send_control_packet.
+            control_socket: OnceLock::new(),
             init_time,
             clock,
             subscriber,
@@ -1140,10 +1181,11 @@ where
     }
 
     fn send_control_packet(&self, dst: &SocketAddr, buffer: &mut [u8]) {
-        let Some(control_socket) = self.control_socket.as_ref() else {
+        let control_socket = self.control_socket.get_or_init(control_socket);
+        let Some(control_socket) = control_socket.as_ref() else {
             return;
         };
-        match control_socket.send_to(buffer, dst) {
+        match control_socket.try_send_to(buffer, dst) {
             Ok(_) => {
                 // all done
                 match control::Packet::decode(s2n_codec::DecoderBufferMut::new(buffer))
