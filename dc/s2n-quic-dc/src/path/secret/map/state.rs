@@ -415,7 +415,7 @@ where
     //
     // Initialized lazily on first send so that socket creation does not affect
     // the deterministic port-assignment order inside bach simulations.
-    pub(super) control_socket: OnceLock<Option<Arc<dyn ControlSocket>>>,
+    pub(super) control_socket: OnceLock<Option<Arc<dyn crate::socket::send::Socket + Send + Sync>>>,
 
     #[allow(clippy::type_complexity)]
     pub(super) request_handshake: RwLock<
@@ -451,30 +451,6 @@ where
     >,
 }
 
-/// Minimal interface for sending control packets via UDP.
-///
-/// Abstracts over `std::net::UdpSocket` (production) and `bach::net::UdpSocket`
-/// (deterministic simulation tests) so the path secret map can operate in both
-/// environments without spawning real OS resources during simulation.
-pub(super) trait ControlSocket: Send + Sync {
-    fn try_send_to(&self, buf: &[u8], dst: &SocketAddr) -> std::io::Result<usize>;
-}
-
-impl ControlSocket for std::net::UdpSocket {
-    fn try_send_to(&self, buf: &[u8], dst: &SocketAddr) -> std::io::Result<usize> {
-        self.send_to(buf, dst)
-    }
-}
-
-#[cfg(any(test, feature = "testing"))]
-impl ControlSocket for bach::net::UdpSocket {
-    fn try_send_to(&self, buf: &[u8], dst: &SocketAddr) -> std::io::Result<usize> {
-        use std::io::IoSlice;
-        let iov = [IoSlice::new(buf)];
-        self.try_send_msg(*dst, &iov, Default::default())
-    }
-}
-
 // FIXME: Avoid the whole socket.
 //
 // We only ever send on this socket - but we really should be sending on the same
@@ -482,7 +458,7 @@ impl ControlSocket for bach::net::UdpSocket {
 // from that socket as well. Not exactly clear on how to achieve that yet though (both
 // ownership wise since the map doesn't have direct access to handshakes and in terms
 // of implementation).
-fn control_socket() -> Option<Arc<dyn ControlSocket>> {
+fn control_socket() -> Option<Arc<dyn crate::socket::send::Socket + Send + Sync>> {
     // In deterministic simulation tests, use a bach socket (one per State instance)
     // rather than a shared OS socket so that the simulated network handles sends.
     #[cfg(any(test, feature = "testing"))]
@@ -504,7 +480,7 @@ fn control_socket() -> Option<Arc<dyn ControlSocket>> {
 
     let mut guard = CONTROL_SOCKET.lock().unwrap();
     if let Some(socket) = guard.upgrade() {
-        return Some(socket);
+        return Some(socket as Arc<dyn crate::socket::send::Socket + Send + Sync>);
     }
 
     // Try ipv6 before since that can support both
@@ -520,7 +496,7 @@ fn control_socket() -> Option<Arc<dyn ControlSocket>> {
             Ok(socket) => {
                 let socket = Arc::new(socket);
                 *guard = Arc::downgrade(&socket);
-                return Some(socket);
+                return Some(socket as Arc<dyn crate::socket::send::Socket + Send + Sync>);
             }
             Err(err) => {
                 tracing::warn!(%err, addr, "failed to create control socket");
@@ -1185,7 +1161,14 @@ where
         let Some(control_socket) = control_socket.as_ref() else {
             return;
         };
-        match control_socket.try_send_to(buffer, dst) {
+        let addr = crate::msg::addr::Addr::new((*dst).into());
+        let iov = [std::io::IoSlice::new(buffer)];
+        match control_socket.send_msg(
+            &addr,
+            &iov,
+            0,
+            s2n_quic_core::inet::ExplicitCongestionNotification::NotEct,
+        ) {
             Ok(_) => {
                 // all done
                 match control::Packet::decode(s2n_codec::DecoderBufferMut::new(buffer))

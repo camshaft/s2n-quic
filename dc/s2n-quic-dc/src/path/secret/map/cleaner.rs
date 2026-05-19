@@ -6,26 +6,27 @@ use crate::{
     event::{self, EndpointPublisher as _},
     path::secret::map::store::Store,
 };
-use rand::RngExt as _;
 use s2n_quic_core::time;
 use std::{
+    future::Future,
+    pin::pin,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex,
     },
-    time::{Duration, Instant},
+    task::{Context, Poll, RawWaker, RawWakerVTable, Waker},
+    time::Duration,
 };
-
-#[cfg(any(test, feature = "testing"))]
-use std::future::Future;
 
 const EVICTION_CYCLES: u64 = if cfg!(test) { 0 } else { 10 };
 
 /// Async background worker loop, generic over the sleep implementation.
 ///
-/// This allows the worker to run under both a std thread (via a blocking
-/// executor) and a bach async task (for deterministic simulation testing).
-#[cfg(any(test, feature = "testing"))]
+/// Both environments (std thread and bach async task) run the exact same logic;
+/// only the `sleep` closure differs:
+/// - std thread: `|d| async move { std::thread::park_timeout(d); }` — blocks
+///   the calling thread (interruptible via `thread::unpark`).
+/// - bach task:  `|d| bach::time::sleep(d)` — suspends the task cooperatively.
 async fn background_worker<C, S, F, Fut>(state: std::sync::Weak<State<C, S>>, sleep: F)
 where
     C: 'static + time::Clock + Send + Sync,
@@ -43,6 +44,29 @@ where
             break;
         }
         state.cleaner().clean(&state, EVICTION_CYCLES);
+    }
+}
+
+/// Drive a future to completion on the current thread.
+///
+/// Designed for futures where every `.await` point blocks synchronously (e.g.
+/// `park_timeout`-based sleep), so `Poll::Pending` should never be returned in
+/// practice.  A no-op waker is used; if a future does return `Pending` the
+/// executor spins until it becomes ready.
+fn block_on<F: Future<Output = ()>>(f: F) {
+    const VTABLE: RawWakerVTable = RawWakerVTable::new(
+        |p| RawWaker::new(p, &VTABLE), // clone
+        |_| {},                         // wake
+        |_| {},                         // wake_by_ref
+        |_| {},                         // drop
+    );
+    let waker = unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) };
+    let mut cx = Context::from_waker(&waker);
+    let mut f = pin!(f);
+    loop {
+        if let Poll::Ready(()) = f.as_mut().poll(&mut cx) {
+            return;
+        }
     }
 }
 
@@ -100,30 +124,12 @@ impl Cleaner {
         let state = Arc::downgrade(&state);
         let handle = std::thread::Builder::new()
             .name("dc_quic::cleaner".into())
-            .spawn(move || loop {
-                // in tests, we should try and be as deterministic as possible
-                let pause = if cfg!(test) {
-                    Duration::from_secs(60).as_millis() as u64
-                } else {
-                    rand::rng().random_range(
-                        Duration::from_secs(5).as_millis() as u64
-                            ..Duration::from_secs(60).as_millis() as u64,
-                    )
-                };
-
-                let next_start = Instant::now() + Duration::from_secs(60);
-                std::thread::park_timeout(Duration::from_millis(pause));
-
-                let Some(state) = state.upgrade() else {
-                    break;
-                };
-                if state.cleaner().should_stop.load(Ordering::Relaxed) {
-                    break;
-                }
-                state.cleaner().clean(&state, EVICTION_CYCLES);
-
-                // pause the rest of the time to run once a minute, not twice a minute
-                std::thread::park_timeout(next_start.saturating_duration_since(Instant::now()));
+            .spawn(move || {
+                // `park_timeout` blocks the thread but is interruptible via
+                // `Thread::unpark()`, which `stop()` calls to wake us early.
+                block_on(background_worker(state, |d| async move {
+                    std::thread::park_timeout(d);
+                }));
             })
             .unwrap();
         *self.thread.lock().unwrap() = Some(handle);
