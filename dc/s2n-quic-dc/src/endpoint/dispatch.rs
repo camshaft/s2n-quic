@@ -158,6 +158,7 @@ where
                 });
             }
             Err(recv::CacheError::ReplayDetected) => {
+                counters.rx_process_err_stale_key.add(1);
                 // TODO: `check_dedup` already sends a StaleKey/ReplayDetected control
                 // packet to the peer via the map's background socket, but that path is
                 // best-effort and may not reach the peer.  We should also populate
