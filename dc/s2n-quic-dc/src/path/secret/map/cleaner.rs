@@ -43,8 +43,7 @@ where
             INTERVAL
         } else {
             let ms = rand::rng().random_range(
-                Duration::from_secs(5).as_millis() as u64
-                    ..INTERVAL.as_millis() as u64,
+                Duration::from_secs(5).as_millis() as u64..INTERVAL.as_millis() as u64,
             );
             Duration::from_millis(ms)
         };

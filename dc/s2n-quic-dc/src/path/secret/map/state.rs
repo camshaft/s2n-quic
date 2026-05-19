@@ -386,8 +386,6 @@ where
     // Determines if path secret is evicted upon receiving an UnknownPathSecret packet.
     should_evict_on_unknown_path_secret: bool,
 
-    rehandshake_period: Duration,
-
     // peers is the most recent entry originating from a locally *or* remote initiated handshake.
     //
     // Handshakes use s2n-quic and the SocketAddr is the address of the handshake socket. Since
@@ -536,7 +534,6 @@ where
             max_capacity: capacity,
             socket_sender_count: AtomicUsize::new(0),
             should_evict_on_unknown_path_secret,
-            rehandshake_period,
             peers: Default::default(),
             ids: Default::default(),
             eviction_queue: Default::default(),
@@ -594,7 +591,10 @@ where
                 event::builder::PathSecretMapIdEntryEvicted {
                     peer_address: SocketAddress::from(*evicted.peer()).into_event(),
                     credential_id: evicted.id().into_event(),
-                    age: evicted.age(),
+                    age: self
+                        .clock
+                        .get_time()
+                        .saturating_duration_since(evicted.creation_time()),
                 },
             );
         }
@@ -611,7 +611,10 @@ where
                 event::builder::PathSecretMapAddressEntryEvicted {
                     peer_address: SocketAddress::from(*evicted.peer()).into_event(),
                     credential_id: evicted.id().into_event(),
-                    age: evicted.age(),
+                    age: self
+                        .clock
+                        .get_time()
+                        .saturating_duration_since(evicted.creation_time()),
                 },
             );
         }
@@ -698,6 +701,16 @@ where
             clock: &self.clock,
             subscriber: self.subscriber(),
         }
+    }
+}
+
+impl<C, S> time::Clock for State<C, S>
+where
+    C: time::Clock + Sync + Send,
+    S: event::Subscriber,
+{
+    fn get_time(&self) -> time::Timestamp {
+        self.clock.get_time()
     }
 }
 
@@ -862,7 +875,10 @@ where
                 .on_path_secret_map_address_cache_accessed_hit(
                     event::builder::PathSecretMapAddressCacheAccessedHit {
                         peer_address: SocketAddress::from(*peer).into_event(),
-                        age: entry.age(),
+                        age: self
+                            .clock
+                            .get_time()
+                            .saturating_duration_since(entry.creation_time()),
                     },
                 );
         }
@@ -889,7 +905,10 @@ where
             self.subscriber().on_path_secret_map_id_cache_accessed_hit(
                 event::builder::PathSecretMapIdCacheAccessedHit {
                     credential_id: id.into_event(),
-                    age: entry.age(),
+                    age: self
+                        .clock
+                        .get_time()
+                        .saturating_duration_since(entry.creation_time()),
                 },
             );
         }
@@ -1149,6 +1168,18 @@ where
         // de-duplicated).
         self.request_handshake(*entry.peer(), HandshakeReason::Remote);
 
+        // Advance the sender past the rejected key-id so retransmissions use a
+        // fresh key-id the peer hasn't seen.
+        if let Some(next) = packet.rejected_key_id.checked_add_usize(1) {
+            tracing::debug!(
+                credential_id = %packet.credential_id,
+                rejected_key_id = packet.rejected_key_id.as_u64(),
+                new_min_key_id = next.as_u64(),
+                "handle_replay_detected: advancing sender key-id"
+            );
+            entry.sender().update_for_stale_key(next);
+        }
+
         Some(packet)
     }
 
@@ -1159,10 +1190,12 @@ where
     fn send_control_packet(&self, dst: &SocketAddr, buffer: &mut [u8]) {
         let control_socket = self.control_socket.get_or_init(control_socket);
         let Some(control_socket) = control_socket.as_ref() else {
+            tracing::warn!(%dst, "send_control_packet: no control socket available");
             return;
         };
         match control_socket.send_to(dst, buffer) {
             Ok(_) => {
+                tracing::debug!(%dst, len = buffer.len(), "send_control_packet: sent");
                 // all done
                 match control::Packet::decode(s2n_codec::DecoderBufferMut::new(buffer))
                     .map(|(t, _)| t)
@@ -1203,10 +1236,6 @@ where
         }
     }
 
-    fn rehandshake_period(&self) -> Duration {
-        self.rehandshake_period
-    }
-
     fn check_dedup(
         &self,
         entry: &Entry,
@@ -1235,6 +1264,12 @@ where
                 Ok(())
             }
             Err(receiver::Error::AlreadyExists) => {
+                tracing::debug!(
+                    credential_id = %creds.id,
+                    key_id = key_id.as_u64(),
+                    ?queue_id,
+                    "check_dedup: replay definitely detected, sending control error"
+                );
                 self.send_control_error(entry, creds, queue_id, receiver::Error::AlreadyExists);
 
                 self.subscriber().on_replay_definitely_detected(
