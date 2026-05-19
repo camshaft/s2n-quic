@@ -1007,8 +1007,20 @@ where
             }
 
             if let Some(bg) = background {
-                let rx =
-                    tasks::invalidation_validator(bg.raw_rx, bg.path_secret_map, bg.broadcast_txs);
+                let invalidation_counters = tasks::ValidatorInvalidationCounters {
+                    unknown_path_secret_validated: counter_registry
+                        .register("invalidation.validator.ups.validated"),
+                    stale_key_validated: counter_registry
+                        .register("invalidation.validator.stale_key.validated"),
+                    replay_detected_validated: counter_registry
+                        .register("invalidation.validator.replay_detected.validated"),
+                };
+                let rx = tasks::invalidation_validator(
+                    bg.raw_rx,
+                    bg.path_secret_map,
+                    bg.broadcast_txs,
+                    invalidation_counters,
+                );
                 let task_counter = counter_registry
                     .register_nominal_task("task.invalidation_validator", "background")
                     .with_registration_metadata(

@@ -378,7 +378,7 @@ pub fn send_worker<Socket, Clk, WakerSink, AckComp>(
             total_sender_ids,
             clock.clone(),
             random,
-            frame_tx,
+            frame_tx.clone(),
             crate::counter::GaugedSender::new(completed_tx, completion_sender),
             crate::counter::GaugedSender::new(cancelled_tx.clone(), cancelled_sender),
             send_counters,
@@ -631,7 +631,25 @@ pub fn send_worker<Socket, Clk, WakerSink, AckComp>(
     // Task: invalidation drain — purge send caches on path secret revocation.
     // Routes to completed_tx (not cancelled) so CompletionDispatcher wakes streams.
     {
-        let rx = send_invalidation(invalidation_rx, send_caches, invalidation_completed_tx);
+        let invalidation_counters = SendInvalidationCounters {
+            unknown_path_secret_events: counter_registry.register("invalidation.ups.events"),
+            unknown_path_secret_contexts: counter_registry.register("invalidation.ups.contexts"),
+            unknown_path_secret_frames_failed: counter_registry
+                .register("invalidation.ups.frames_failed"),
+            stale_or_replay_events: counter_registry.register("invalidation.stale_replay.events"),
+            stale_or_replay_contexts: counter_registry
+                .register("invalidation.stale_replay.contexts"),
+            stale_or_replay_frames_requeued: counter_registry
+                .register("invalidation.stale_replay.frames_requeued"),
+        };
+        let retransmit_tx = frame_tx.clone();
+        let rx = send_invalidation(
+            invalidation_rx,
+            send_caches,
+            invalidation_completed_tx,
+            retransmit_tx,
+            invalidation_counters,
+        );
         let variant = format!("send.{worker_id}");
         let task_counter = counter_registry
             .register_nominal_task("task.invalidation", &variant)
@@ -1437,6 +1455,8 @@ pub fn send_invalidation<R>(
     invalidation_rx: R,
     send_caches: Vec<Rc<RefCell<send::Cache>>>,
     mut cancelled_tx: impl UnboundedSender<Entry<Frame>> + 'static,
+    mut retransmit_tx: impl UnboundedSender<Entry<Frame>> + 'static,
+    counters: SendInvalidationCounters,
 ) -> impl Receiver<()>
 where
     R: Receiver<Entry<Invalidation>>,
@@ -1445,24 +1465,36 @@ where
         invalidation_rx,
         move |entry: Entry<Invalidation>| match *entry {
             Invalidation::UnknownPathSecret { credential_id } => {
+                counters.unknown_path_secret_events.add(1);
                 for cache in &send_caches {
-                    cache.borrow_mut().invalidate(
+                    if let Some(drained) = cache.borrow_mut().invalidate(
                         &credential_id,
                         frame::FailureReason::UnknownPathSecret,
                         &mut cancelled_tx,
-                    );
+                    ) {
+                        counters.unknown_path_secret_contexts.add(1);
+                        counters
+                            .unknown_path_secret_frames_failed
+                            .add(drained as u64);
+                    }
                 }
             }
             Invalidation::StaleKey {
                 credential_id,
                 sender_id,
             } => {
+                counters.stale_or_replay_events.add(1);
                 for cache in &send_caches {
-                    cache.borrow_mut().invalidate_stale_key(
+                    if let Some(drained) = cache.borrow_mut().invalidate_stale_key(
                         &credential_id,
                         sender_id,
-                        &mut cancelled_tx,
-                    );
+                        &mut retransmit_tx,
+                    ) {
+                        counters.stale_or_replay_contexts.add(1);
+                        counters
+                            .stale_or_replay_frames_requeued
+                            .add(drained as u64);
+                    }
                 }
             }
         },
@@ -1501,6 +1533,7 @@ pub fn invalidation_validator<R, Tx>(
     raw_rx: R,
     path_secret_map: crate::path::secret::Map,
     mut broadcast_txs: Vec<Tx>,
+    counters: ValidatorInvalidationCounters,
 ) -> impl Receiver<()>
 where
     R: Receiver<Entry<descriptor::Filled>>,
@@ -1533,6 +1566,7 @@ where
                     sinks = broadcast_txs.len(),
                     "validated unknown path secret invalidation"
                 );
+                counters.unknown_path_secret_validated.add(1);
                 Some(Invalidation::UnknownPathSecret {
                     credential_id: local_id,
                 })
@@ -1554,6 +1588,7 @@ where
                     sinks = broadcast_txs.len(),
                     "validated stale key invalidation"
                 );
+                counters.stale_key_validated.add(1);
                 Some(Invalidation::StaleKey {
                     credential_id: local_id,
                     sender_id,
@@ -1577,6 +1612,7 @@ where
                     sinks = broadcast_txs.len(),
                     "validated replay detected invalidation"
                 );
+                counters.replay_detected_validated.add(1);
                 Some(Invalidation::StaleKey {
                     credential_id: local_id,
                     sender_id,
@@ -1590,4 +1626,21 @@ where
             let _ = tx.send(Entry::new(invalidation));
         }
     })
+}
+
+#[derive(Clone)]
+pub struct SendInvalidationCounters {
+    pub unknown_path_secret_events: crate::counter::Counter,
+    pub unknown_path_secret_contexts: crate::counter::Counter,
+    pub unknown_path_secret_frames_failed: crate::counter::Counter,
+    pub stale_or_replay_events: crate::counter::Counter,
+    pub stale_or_replay_contexts: crate::counter::Counter,
+    pub stale_or_replay_frames_requeued: crate::counter::Counter,
+}
+
+#[derive(Clone)]
+pub struct ValidatorInvalidationCounters {
+    pub unknown_path_secret_validated: crate::counter::Counter,
+    pub stale_key_validated: crate::counter::Counter,
+    pub replay_detected_validated: crate::counter::Counter,
 }

@@ -18,6 +18,15 @@ use std::net::SocketAddr;
 const SIGNER_SECRET: &[u8] = b"invalidation-validator-test-signer";
 const DETERMINISTIC_SECRET: [u8; 32] = [42u8; 32];
 
+fn validator_counters() -> tasks::ValidatorInvalidationCounters {
+    let registry = crate::counter::Registry::default();
+    tasks::ValidatorInvalidationCounters {
+        unknown_path_secret_validated: registry.register("test.invalidation.validator.ups"),
+        stale_key_validated: registry.register("test.invalidation.validator.stale"),
+        replay_detected_validated: registry.register("test.invalidation.validator.replay"),
+    }
+}
+
 fn setup_map_with_entry(peer: SocketAddr) -> (Map, Id) {
     let map = Map::new(
         stateless_reset::Signer::new(SIGNER_SECRET),
@@ -105,6 +114,7 @@ fn packet_entry(
 
 #[test]
 fn unknown_path_secret_packet_broadcasts_validated_id() {
+    let _guard = crate::testing::without_snapshots();
     sim(|| {
         let peer: SocketAddr = "127.0.0.1:4444".parse().unwrap();
         let (map, local_id) = setup_map_with_entry(peer);
@@ -116,7 +126,7 @@ fn unknown_path_secret_packet_broadcasts_validated_id() {
 
         let (tx_a, mut rx_a) = unsync::new::<tasks::Invalidation>();
         let (tx_b, mut rx_b) = unsync::new::<tasks::Invalidation>();
-        let mut rx = tasks::invalidation_validator(input, map, vec![tx_a, tx_b]);
+        let mut rx = tasks::invalidation_validator(input, map, vec![tx_a, tx_b], validator_counters());
 
         async move {
             assert!(rx.recv().await.is_some());
@@ -156,7 +166,7 @@ fn malformed_packet_is_ignored() {
 
         let input = TestReceiver::new([packet_entry(&[0x12, 0x34, 0x56], peer)]);
         let (tx, mut output_rx) = unsync::new::<tasks::Invalidation>();
-        let mut rx = tasks::invalidation_validator(input, map, vec![tx]);
+        let mut rx = tasks::invalidation_validator(input, map, vec![tx], validator_counters());
 
         async move {
             assert!(rx.recv().await.is_some());
@@ -194,7 +204,7 @@ fn stale_key_packet_broadcasts_validated_sender_target() {
         );
         let input = TestReceiver::new([packet_entry(&payload, peer)]);
         let (tx, mut output_rx) = unsync::new::<tasks::Invalidation>();
-        let mut rx = tasks::invalidation_validator(input, map, vec![tx]);
+        let mut rx = tasks::invalidation_validator(input, map, vec![tx], validator_counters());
 
         async move {
             assert!(rx.recv().await.is_some());
@@ -236,7 +246,7 @@ fn replay_detected_packet_broadcasts_validated_sender_target() {
         );
         let input = TestReceiver::new([packet_entry(&payload, peer)]);
         let (tx, mut output_rx) = unsync::new::<tasks::Invalidation>();
-        let mut rx = tasks::invalidation_validator(input, map, vec![tx]);
+        let mut rx = tasks::invalidation_validator(input, map, vec![tx], validator_counters());
 
         async move {
             assert!(rx.recv().await.is_some());

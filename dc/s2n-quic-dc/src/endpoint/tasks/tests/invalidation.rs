@@ -16,6 +16,19 @@ use crate::{
 use s2n_quic_core::varint::VarInt;
 use std::{cell::RefCell, rc::Rc, sync::Arc};
 
+fn invalidation_counters() -> tasks::SendInvalidationCounters {
+    let registry = crate::counter::Registry::default();
+    tasks::SendInvalidationCounters {
+        unknown_path_secret_events: registry.register("test.invalidation.ups.events"),
+        unknown_path_secret_contexts: registry.register("test.invalidation.ups.contexts"),
+        unknown_path_secret_frames_failed: registry.register("test.invalidation.ups.frames_failed"),
+        stale_or_replay_events: registry.register("test.invalidation.stale_replay.events"),
+        stale_or_replay_contexts: registry.register("test.invalidation.stale_replay.contexts"),
+        stale_or_replay_frames_requeued: registry
+            .register("test.invalidation.stale_replay.frames_requeued"),
+    }
+}
+
 // ── Send setup ──────────────────────────────────────────────────────────────
 
 struct SendSetup {
@@ -92,6 +105,7 @@ fn setup_recv() -> (Rc<RefCell<recv::Cache>>, credentials::Id) {
 
 #[test]
 fn send_invalidation_purges_cache_and_emits_failed_frames() {
+    let _guard = crate::testing::without_snapshots();
     sim(|| {
         let SendSetup { send_caches, pse } = setup_send();
 
@@ -102,11 +116,18 @@ fn send_invalidation_purges_cache_and_emits_failed_frames() {
 
         let id = *pse.id();
         let (cancelled_tx, mut collected_rx) = unsync::new::<Frame>();
+        let (retransmit_tx, mut retransmit_rx) = unsync::new::<Frame>();
 
         let invalidation_rx = super::helpers::TestReceiver::new(vec![Entry::new(
             tasks::Invalidation::UnknownPathSecret { credential_id: id },
         )]);
-        let mut rx = tasks::send_invalidation(invalidation_rx, send_caches.clone(), cancelled_tx);
+        let mut rx = tasks::send_invalidation(
+            invalidation_rx,
+            send_caches.clone(),
+            cancelled_tx,
+            retransmit_tx,
+            invalidation_counters(),
+        );
 
         async move {
             rx.recv().await;
@@ -130,6 +151,7 @@ fn send_invalidation_purges_cache_and_emits_failed_frames() {
                 collected_rx.recv().await.is_none(),
                 "only one failed frame should be emitted"
             );
+            assert!(retransmit_rx.recv().await.is_none());
         }
         .primary()
         .spawn();
@@ -138,18 +160,26 @@ fn send_invalidation_purges_cache_and_emits_failed_frames() {
 
 #[test]
 fn send_invalidation_noop_for_unknown_id() {
+    let _guard = crate::testing::without_snapshots();
     sim(|| {
         let SendSetup { send_caches, .. } = setup_send();
 
         let fake_id = credentials::Id::from([0xAA; 16]);
         let (cancelled_tx, mut collected_rx) = unsync::new::<Frame>();
+        let (retransmit_tx, mut retransmit_rx) = unsync::new::<Frame>();
 
         let invalidation_rx = super::helpers::TestReceiver::new(vec![Entry::new(
             tasks::Invalidation::UnknownPathSecret {
                 credential_id: fake_id,
             },
         )]);
-        let mut rx = tasks::send_invalidation(invalidation_rx, send_caches.clone(), cancelled_tx);
+        let mut rx = tasks::send_invalidation(
+            invalidation_rx,
+            send_caches.clone(),
+            cancelled_tx,
+            retransmit_tx,
+            invalidation_counters(),
+        );
 
         async move {
             rx.recv().await;
@@ -164,6 +194,7 @@ fn send_invalidation_noop_for_unknown_id() {
                 collected_rx.recv().await.is_none(),
                 "no frames should be emitted"
             );
+            assert!(retransmit_rx.recv().await.is_none());
         }
         .primary()
         .spawn();
@@ -320,13 +351,20 @@ fn send_invalidation_stale_key_targets_matching_sender_only() {
 
         let id = *pse.id();
         let (cancelled_tx, mut collected_rx) = unsync::new::<Frame>();
+        let (retransmit_tx, mut retransmit_rx) = unsync::new::<Frame>();
         let invalidation_rx = super::helpers::TestReceiver::new(vec![Entry::new(
             tasks::Invalidation::StaleKey {
                 credential_id: id,
                 sender_id: VarInt::from_u8(1),
             },
         )]);
-        let mut rx = tasks::send_invalidation(invalidation_rx, send_caches.clone(), cancelled_tx);
+        let mut rx = tasks::send_invalidation(
+            invalidation_rx,
+            send_caches.clone(),
+            cancelled_tx,
+            retransmit_tx,
+            invalidation_counters(),
+        );
 
         async move {
             rx.recv().await;
@@ -335,14 +373,12 @@ fn send_invalidation_stale_key_targets_matching_sender_only() {
             assert_eq!(send_caches[0].borrow().context_count(), 1);
             assert_eq!(send_caches[1].borrow().context_count(), 0);
 
-            let frame = collected_rx
+            let frame = retransmit_rx
                 .recv()
                 .await
-                .expect("one stale-key invalidated frame should be emitted");
-            assert_eq!(
-                frame.status,
-                frame::TransmissionStatus::Failed(frame::FailureReason::UnknownPathSecret),
-            );
+                .expect("one stale-key invalidated frame should be retransmitted");
+            assert_eq!(frame.status, frame::TransmissionStatus::Pending);
+            assert!(retransmit_rx.recv().await.is_none());
             assert!(collected_rx.recv().await.is_none());
         }
         .primary()
