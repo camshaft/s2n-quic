@@ -17,6 +17,7 @@
 //! throughput is immediately visible.
 
 use crate::{
+    endpoint::routing::hash_id_and_sender,
     stream::endpoint::testing::sim::{Client, Server, SERVER_PORT},
     testing::{ext::*, sim, without_tracing},
 };
@@ -331,6 +332,53 @@ fn sporadic_loss() {
     ])
     .sim(1 << 18);
     insta::assert_snapshot!(format!("{elapsed:?}"));
+}
+
+#[test]
+fn sim_path_pair_ids_are_stable_across_identical_runs() {
+    fn run_once() -> crate::path::secret::map::TestPairIds {
+        use crate::path::secret::map::testing;
+
+        let ids = Arc::new(Mutex::new(None));
+        let ids_out = ids.clone();
+        let _guard = crate::testing::without_snapshots();
+
+        sim(|| {
+            let local_map = testing::new(1_024);
+            let peer_map = testing::new(1_024);
+            local_map.set_socket_sender_count(4);
+            peer_map.set_socket_sender_count(4);
+
+            let local_addr = "10.0.0.1:1111".parse().unwrap();
+            let peer_addr = "10.0.0.2:2222".parse().unwrap();
+            let pair_ids = local_map.test_insert_pair(local_addr, None, &peer_map, peer_addr, None);
+            *ids_out.lock().unwrap() = Some(pair_ids);
+        });
+
+        ids.lock().unwrap().expect("pair ids should be captured")
+    }
+
+    let first = run_once();
+    let second = run_once();
+
+    assert_eq!(
+        first.local, second.local,
+        "local credential id changed across identical bach sim runs"
+    );
+    assert_eq!(
+        first.peer, second.peer,
+        "peer credential id changed across identical bach sim runs"
+    );
+
+    // Recv-worker routing uses credential_id+sender_id. If credential IDs drift,
+    // multi-recv layouts route packets differently across runs.
+    let source_sender_id = VarInt::from_u8(3);
+    let first_bucket = (hash_id_and_sender(&first.local, source_sender_id) & 3) as usize;
+    let second_bucket = (hash_id_and_sender(&second.local, source_sender_id) & 3) as usize;
+    assert_eq!(
+        first_bucket, second_bucket,
+        "recv worker bucket changed across identical runs (first={first_bucket}, second={second_bucket})"
+    );
 }
 
 // ── Fuzz tests ────────────────────────────────────────────────────────────────

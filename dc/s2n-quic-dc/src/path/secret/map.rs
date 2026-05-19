@@ -41,6 +41,30 @@ pub struct TestPairIds {
     pub peer: crate::credentials::Id,
 }
 
+#[cfg(any(test, feature = "testing"))]
+#[inline]
+fn deterministic_test_pair_secret(local_addr: SocketAddr, peer_addr: SocketAddr) -> [u8; 32] {
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    local_addr.hash(&mut hasher);
+    peer_addr.hash(&mut hasher);
+    let mut state = hasher.finish() | 1;
+
+    let mut secret = [0u8; 32];
+    for chunk in secret.chunks_exact_mut(8) {
+        // splitmix64-style step for stable diffusion from the address-derived seed
+        state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^= z >> 31;
+        chunk.copy_from_slice(&z.to_be_bytes());
+    }
+
+    secret
+}
+
 pub use entry::Entry;
 use store::Store;
 
@@ -349,8 +373,20 @@ impl Map {
             time::NoopClock,
             event::testing::Subscriber::no_snapshot(),
         );
-        let mut secret = [0; 32];
-        aws_lc_rs::rand::fill(&mut secret).unwrap();
+        let secret = if bach::is_active() {
+            let secret = deterministic_test_pair_secret(local_addr, peer_addr);
+            tracing::debug!(
+                %local_addr,
+                %peer_addr,
+                secret_prefix = %hex::encode(&secret[..8]),
+                "using deterministic test pair secret for bach sim"
+            );
+            secret
+        } else {
+            let mut secret = [0; 32];
+            aws_lc_rs::rand::fill(&mut secret).unwrap();
+            secret
+        };
         let mut stateless_reset = [0; control::TAG_LEN];
         aws_lc_rs::rand::fill(&mut stateless_reset).unwrap();
 
