@@ -158,6 +158,13 @@ where
                 });
             }
             Err(recv::CacheError::ReplayDetected) => {
+                // TODO: `check_dedup` already sends a StaleKey/ReplayDetected control
+                // packet to the peer via the map's background socket, but that path is
+                // best-effort and may not reach the peer.  We should also populate
+                // `control_out` with the appropriate stale-key notification and return
+                // it via the UPS in-band path (mirroring the `PeerStateLookup` arm
+                // above) so that the peer has a reliable mechanism to learn about the
+                // stale key and trigger a re-handshake.
                 return Err(Error::Duplicate {
                     credentials,
                     packet_number,
