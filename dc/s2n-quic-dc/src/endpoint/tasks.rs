@@ -1559,9 +1559,28 @@ where
                     sender_id,
                 })
             }
-            secret_control::Packet::ReplayDetected(_) => {
-                tracing::debug!(%peer, "ignored invalidation control packet: unsupported control type");
-                None
+            secret_control::Packet::ReplayDetected(packet) => {
+                let Some(validated) = path_secret_map.handle_replay_detected_packet(&packet, &peer)
+                else {
+                    tracing::debug!(%peer, "ignored invalidation control packet: replay detected rejected");
+                    return;
+                };
+                let Some(sender_id) = validated.queue_id else {
+                    tracing::debug!(%peer, "ignored invalidation control packet: replay detected missing sender_id");
+                    return;
+                };
+                let local_id = validated.credential_id.for_peer();
+                tracing::debug!(
+                    %peer,
+                    credential_id = %local_id,
+                    sender_id = sender_id.as_u64(),
+                    sinks = broadcast_txs.len(),
+                    "validated replay detected invalidation"
+                );
+                Some(Invalidation::StaleKey {
+                    credential_id: local_id,
+                    sender_id,
+                })
             }
         }) else {
             return;

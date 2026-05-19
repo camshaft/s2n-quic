@@ -69,6 +69,23 @@ fn encode_stale_key(
     out[..len].to_vec()
 }
 
+fn encode_replay_detected(
+    credential_id: Id,
+    sender_id: s2n_quic_core::varint::VarInt,
+    rejected_key_id: s2n_quic_core::varint::VarInt,
+    control_sealer: crate::crypto::awslc::seal::control::Secret,
+) -> Vec<u8> {
+    let mut out = [0u8; secret_control::MAX_PACKET_SIZE];
+    let len = secret_control::ReplayDetected {
+        wire_version: WireVersion::ZERO,
+        credential_id,
+        rejected_key_id,
+        queue_id: Some(sender_id),
+    }
+    .encode(EncoderBuffer::new(&mut out), &control_sealer);
+    out[..len].to_vec()
+}
+
 fn packet_entry(
     payload: &[u8],
     peer: SocketAddr,
@@ -184,6 +201,51 @@ fn stale_key_packet_broadcasts_validated_sender_target() {
             drop(rx);
             assert_eq!(
                 *output_rx.recv().await.expect("stale key should be propagated"),
+                tasks::Invalidation::StaleKey {
+                    credential_id: local_id,
+                    sender_id,
+                }
+            );
+            assert!(output_rx.recv().await.is_none());
+        }
+        .primary()
+        .spawn();
+    });
+}
+
+#[test]
+fn replay_detected_packet_broadcasts_validated_sender_target() {
+    let _guard = crate::testing::without_snapshots();
+    sim(|| {
+        let peer: SocketAddr = "127.0.0.1:7777".parse().unwrap();
+        let (map, local_id) = setup_map_with_entry(peer);
+        let peer_secret = schedule::Secret::new(
+            schedule::Ciphersuite::AES_GCM_128_SHA256,
+            dc::SUPPORTED_VERSIONS[0],
+            Type::Server,
+            &DETERMINISTIC_SECRET,
+        );
+
+        let wire_id = local_id.for_peer();
+        let sender_id = s2n_quic_core::varint::VarInt::from_u8(9);
+        let payload = encode_replay_detected(
+            wire_id,
+            sender_id,
+            s2n_quic_core::varint::VarInt::from_u8(2),
+            peer_secret.control_sealer(),
+        );
+        let input = TestReceiver::new([packet_entry(&payload, peer)]);
+        let (tx, mut output_rx) = unsync::new::<tasks::Invalidation>();
+        let mut rx = tasks::invalidation_validator(input, map, vec![tx]);
+
+        async move {
+            assert!(rx.recv().await.is_some());
+            drop(rx);
+            assert_eq!(
+                *output_rx
+                    .recv()
+                    .await
+                    .expect("replay detected should be propagated"),
                 tasks::Invalidation::StaleKey {
                     credential_id: local_id,
                     sender_id,
