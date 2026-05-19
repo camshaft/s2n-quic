@@ -156,10 +156,16 @@ fn malformed_packet_is_ignored() {
 
 #[test]
 fn stale_key_packet_broadcasts_validated_sender_target() {
+    let _guard = crate::testing::without_snapshots();
     sim(|| {
         let peer: SocketAddr = "127.0.0.1:6666".parse().unwrap();
         let (map, local_id) = setup_map_with_entry(peer);
-        let entry = map.get_raw(peer).expect("entry should exist");
+        let peer_secret = schedule::Secret::new(
+            schedule::Ciphersuite::AES_GCM_128_SHA256,
+            dc::SUPPORTED_VERSIONS[0],
+            Type::Server,
+            &DETERMINISTIC_SECRET,
+        );
 
         let wire_id = local_id.for_peer();
         let sender_id = s2n_quic_core::varint::VarInt::from_u8(7);
@@ -167,7 +173,7 @@ fn stale_key_packet_broadcasts_validated_sender_target() {
             wire_id,
             sender_id,
             s2n_quic_core::varint::VarInt::from_u8(3),
-            entry.control_sealer(),
+            peer_secret.control_sealer(),
         );
         let input = TestReceiver::new([packet_entry(&payload, peer)]);
         let (tx, mut output_rx) = unsync::new::<tasks::Invalidation>();

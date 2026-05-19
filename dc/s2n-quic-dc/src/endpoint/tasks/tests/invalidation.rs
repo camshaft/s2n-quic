@@ -300,6 +300,7 @@ fn ack_burst_after_recv_invalidation_emits_nothing() {
 
 #[test]
 fn send_invalidation_stale_key_targets_matching_sender_only() {
+    let _guard = crate::testing::without_snapshots();
     sim(|| {
         let registry = crate::counter::Registry::default();
         let clock = Clock::default();
