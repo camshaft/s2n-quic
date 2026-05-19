@@ -49,6 +49,7 @@ fn deterministic_test_pair_secret(local_addr: SocketAddr, peer_addr: SocketAddr)
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     local_addr.hash(&mut hasher);
     peer_addr.hash(&mut hasher);
+    // Keep state odd so the splitmix64 progression is never stuck on an even-only cycle.
     let mut state = hasher.finish() | 1;
 
     let mut secret = [0u8; 32];

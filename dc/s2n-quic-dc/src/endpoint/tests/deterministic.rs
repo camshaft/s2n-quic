@@ -336,6 +336,10 @@ fn sporadic_loss() {
 
 #[test]
 fn sim_path_pair_ids_are_stable_across_identical_runs() {
+    const SENDER_COUNT: usize = 4;
+    const ROUTE_MASK: u64 = (SENDER_COUNT as u64) - 1;
+    const SOURCE_SENDER_ID: u8 = 3;
+
     fn run_once() -> crate::path::secret::map::TestPairIds {
         use crate::path::secret::map::testing;
 
@@ -346,8 +350,8 @@ fn sim_path_pair_ids_are_stable_across_identical_runs() {
         sim(|| {
             let local_map = testing::new(1_024);
             let peer_map = testing::new(1_024);
-            local_map.set_socket_sender_count(4);
-            peer_map.set_socket_sender_count(4);
+            local_map.set_socket_sender_count(SENDER_COUNT);
+            peer_map.set_socket_sender_count(SENDER_COUNT);
 
             let local_addr = "10.0.0.1:1111".parse().unwrap();
             let peer_addr = "10.0.0.2:2222".parse().unwrap();
@@ -373,9 +377,9 @@ fn sim_path_pair_ids_are_stable_across_identical_runs() {
 
     // Recv-worker routing uses credential_id+sender_id. If credential IDs drift,
     // multi-recv layouts route packets differently across runs.
-    let source_sender_id = VarInt::from_u8(3);
-    let first_bucket = (hash_id_and_sender(&first.local, source_sender_id) & 3) as usize;
-    let second_bucket = (hash_id_and_sender(&second.local, source_sender_id) & 3) as usize;
+    let source_sender_id = VarInt::from_u8(SOURCE_SENDER_ID);
+    let first_bucket = (hash_id_and_sender(&first.local, source_sender_id) & ROUTE_MASK) as usize;
+    let second_bucket = (hash_id_and_sender(&second.local, source_sender_id) & ROUTE_MASK) as usize;
     assert_eq!(
         first_bucket, second_bucket,
         "recv worker bucket changed across identical runs (first={first_bucket}, second={second_bucket})"
