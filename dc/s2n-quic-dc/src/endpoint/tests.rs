@@ -1158,7 +1158,7 @@ fn stale_key_detected_after_recv_cache_eviction() {
             // This ensures the server's recv idle wheel evicts the recv context
             // well before the second stream arrives.
             let mut short_params = TEST_APPLICATION_PARAMS;
-            short_params.max_idle_timeout = NonZeroU32::new(1_000); // 1 000 ms = 1 s
+            short_params.max_idle_timeout = NonZeroU32::new(1_000); // 1,000 ms = 1 s
             short_params.remote_max_data = short_params.local_recv_max_data;
 
             // Standard idle timeout for the client-side entry (30 s).
