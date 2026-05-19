@@ -1161,14 +1161,7 @@ where
         let Some(control_socket) = control_socket.as_ref() else {
             return;
         };
-        let addr = crate::msg::addr::Addr::new((*dst).into());
-        let iov = [std::io::IoSlice::new(buffer)];
-        match control_socket.send_msg(
-            &addr,
-            &iov,
-            0,
-            s2n_quic_core::inet::ExplicitCongestionNotification::NotEct,
-        ) {
+        match control_socket.send_to(dst, buffer) {
             Ok(_) => {
                 // all done
                 match control::Packet::decode(s2n_codec::DecoderBufferMut::new(buffer))

@@ -6,6 +6,7 @@ use crate::{
     event::{self, EndpointPublisher as _},
     path::secret::map::store::Store,
 };
+use rand::RngExt as _;
 use s2n_quic_core::time;
 use std::{
     future::Future,
@@ -14,11 +15,13 @@ use std::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex,
     },
-    task::{Context, Poll, RawWaker, RawWakerVTable, Waker},
+    task::{Context, Poll},
     time::Duration,
 };
 
 const EVICTION_CYCLES: u64 = if cfg!(test) { 0 } else { 10 };
+
+const INTERVAL: Duration = Duration::from_secs(60);
 
 /// Async background worker loop, generic over the sleep implementation.
 ///
@@ -35,15 +38,41 @@ where
     Fut: Future<Output = ()>,
 {
     loop {
-        sleep(Duration::from_secs(60)).await;
+        // Random jitter avoids thundering-herd when many maps start together.
+        let jitter = if cfg!(test) {
+            INTERVAL
+        } else {
+            let ms = rand::rng().random_range(
+                Duration::from_secs(5).as_millis() as u64
+                    ..INTERVAL.as_millis() as u64,
+            );
+            Duration::from_millis(ms)
+        };
 
-        let Some(state) = state.upgrade() else {
+        let Some(st) = state.upgrade() else {
             break;
         };
-        if state.cleaner().should_stop.load(Ordering::Relaxed) {
+        let start = st.clock.get_time();
+        drop(st);
+
+        sleep(jitter).await;
+
+        let Some(st) = state.upgrade() else {
+            break;
+        };
+        if st.cleaner().should_stop.load(Ordering::Relaxed) {
             break;
         }
-        state.cleaner().clean(&state, EVICTION_CYCLES);
+        st.cleaner().clean(&st, EVICTION_CYCLES);
+
+        // Sleep the remainder of the interval so cycles stay ~60s apart.
+        let elapsed = st.clock.get_time().saturating_duration_since(start);
+        let remainder = INTERVAL.saturating_sub(elapsed);
+        drop(st);
+
+        if !remainder.is_zero() {
+            sleep(remainder).await;
+        }
     }
 }
 
@@ -54,13 +83,7 @@ where
 /// practice.  A no-op waker is used; if a future does return `Pending` the
 /// executor spins until it becomes ready.
 fn block_on<F: Future<Output = ()>>(f: F) {
-    const VTABLE: RawWakerVTable = RawWakerVTable::new(
-        |p| RawWaker::new(p, &VTABLE), // clone
-        |_| {},                         // wake
-        |_| {},                         // wake_by_ref
-        |_| {},                         // drop
-    );
-    let waker = unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) };
+    let waker = s2n_quic_core::task::waker::noop();
     let mut cx = Context::from_waker(&waker);
     let mut f = pin!(f);
     loop {
