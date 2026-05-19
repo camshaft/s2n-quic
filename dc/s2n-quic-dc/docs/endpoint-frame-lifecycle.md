@@ -1,8 +1,8 @@
 # Endpoint Frame Lifecycle (endpoint.rs + tasks.rs)
 
 This document explains the high-level send-side lifecycle implemented by
-`/home/runner/work/s2n-quic/s2n-quic/dc/s2n-quic-dc/src/endpoint.rs` and
-`/home/runner/work/s2n-quic/s2n-quic/dc/s2n-quic-dc/src/endpoint/tasks.rs`, with supporting behavior in
+`dc/s2n-quic-dc/src/endpoint.rs` and
+`dc/s2n-quic-dc/src/endpoint/tasks.rs`, with supporting behavior in
 `frame.rs`, `combinator.rs`, `send.rs`, `assemble.rs`, and `ack.rs`.
 
 The goal is to describe how a submitted frame moves through dispatch, pacing, congestion control, transmission,
