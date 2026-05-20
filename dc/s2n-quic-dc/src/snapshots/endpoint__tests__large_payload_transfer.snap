@@ -374,6 +374,7 @@ expression: logs
 0:00:00.000521000 [server] TRACE c#rx.peer_cache.miss=1
 0:00:00.000521000 [server] TRACE c#rx.ecn[ect0]=1
 0:00:00.000521000 [server] TRACE c#rx.init=1
+0:00:00.000521000 [server] TRACE c#rx.frame[flow_init]=1
 0:00:00.000521000 [server] TRACE c#flow.accepted=1
 0:00:00.000521000 [server] DEBUG FlowInit accepted - dispatched to acceptor attempt_id=0 stream_id=0 acceptor_id=1 server_queue_id=0
 0:00:00.000521000 [server] DEBUG event=on_ack_eliciting prev=Idle next=Scheduled location=dc/s2n-quic-dc/src/endpoint/dispatch.rs
@@ -511,6 +512,7 @@ expression: logs
 0:00:00.001021000 [client] TRACE c#rx.peer_cache.miss=1
 0:00:00.001021000 [client] TRACE c#rx.ecn[ect0]=1
 0:00:00.001021000 [client] TRACE c#rx.pkt_control=1
+0:00:00.001021000 [client] TRACE c#rx.frame[ack]=1
 0:00:00.001021000 [client] TRACE c#q.ack.enq[send.1]=1
 0:00:00.001021000 [client] TRACE g#q.ack.depth[send.1]=1
 0:00:00.001021000 [client] TRACE m#q.ack.depth_dist[send.1]=1
@@ -602,6 +604,7 @@ expression: logs
 0:00:00.001041000 [client] TRACE c#rx.peer_cache.miss=1
 0:00:00.001041000 [client] TRACE c#rx.ecn[ect0]=1
 0:00:00.001041000 [client] TRACE c#rx.flow_control=1
+0:00:00.001041000 [client] TRACE c#rx.frame[flow_max_data]=1
 0:00:00.001041000 [client] TRACE c#rx.flow_control.ok=1
 0:00:00.001041000 [client] DEBUG event=on_ack_eliciting prev=Idle next=Scheduled location=dc/s2n-quic-dc/src/endpoint/dispatch.rs
 0:00:00.001041000 [client] TRACE m#task.packet_dispatch.drained[recv.3]=2
@@ -777,6 +780,7 @@ expression: logs
 0:00:00.001521000 [server] TRACE c#rx.peer_cache.hit=1
 0:00:00.001521000 [server] TRACE c#rx.ecn[ect0]=1
 0:00:00.001521000 [server] TRACE c#rx.pkt_control=1
+0:00:00.001521000 [server] TRACE c#rx.frame[ack]=1
 0:00:00.001521000 [server] TRACE c#q.ack.enq[send.1]=1
 0:00:00.001521000 [server] TRACE g#q.ack.depth[send.1]=1
 0:00:00.001521000 [server] TRACE m#q.ack.depth_dist[send.1]=1
@@ -854,6 +858,7 @@ expression: logs
 0:00:00.001541000 [server] TRACE c#rx.peer_cache.miss=1
 0:00:00.001541000 [server] TRACE c#rx.ecn[ect0]=1
 0:00:00.001541000 [server] TRACE c#rx.pkt_control=1
+0:00:00.001541000 [server] TRACE c#rx.frame[ack]=1
 0:00:00.001541000 [server] TRACE c#q.ack.enq[send.1]=1
 0:00:00.001541000 [server] TRACE g#q.ack.depth[send.1]=1
 0:00:00.001541000 [server] TRACE m#q.ack.depth_dist[send.1]=1
@@ -960,6 +965,7 @@ expression: logs
 0:00:00.001561000 [server] TRACE c#rx.peer_cache.miss=1
 0:00:00.001561000 [server] TRACE c#rx.ecn[ect0]=1
 0:00:00.001561000 [server] TRACE c#rx.data=1
+0:00:00.001561000 [server] TRACE c#rx.frame[flow_data]=1
 0:00:00.001561000 [server] TRACE c#rx.data.ok=1
 0:00:00.001561000 [server] DEBUG event=on_ack_eliciting prev=Idle next=Scheduled location=dc/s2n-quic-dc/src/endpoint/dispatch.rs
 0:00:00.001561000 [server] TRACE c#q.dispatch_rx.receiver[recv.1.task.packet_dispatch]=1
@@ -969,8 +975,10 @@ expression: logs
 0:00:00.001561000 [server] TRACE c#rx.peer_cache.hit=1
 0:00:00.001561000 [server] TRACE c#rx.ecn[ect0]=1
 0:00:00.001561000 [server] TRACE c#rx.data=1
+0:00:00.001561000 [server] TRACE c#rx.frame[flow_data]=1
 0:00:00.001561000 [server] TRACE c#rx.data.ok=1
 0:00:00.001561000 [server] TRACE c#rx.data=1
+0:00:00.001561000 [server] TRACE c#rx.frame[flow_data]=1
 0:00:00.001561000 [server] TRACE c#rx.data.ok=1
 0:00:00.001561000 [server] DEBUG event=on_ack_eliciting prev=Scheduled next=Scheduled location=dc/s2n-quic-dc/src/endpoint/dispatch.rs
 0:00:00.001561000 [server] TRACE m#task.packet_dispatch.drained[recv.1]=3
@@ -1174,6 +1182,7 @@ expression: logs
 0:00:00.002021000 [client] TRACE c#rx.peer_cache.hit=1
 0:00:00.002021000 [client] TRACE c#rx.ecn[ect0]=1
 0:00:00.002021000 [client] TRACE c#rx.pkt_control=1
+0:00:00.002021000 [client] TRACE c#rx.frame[ack]=1
 0:00:00.002021000 [client] TRACE c#q.ack.enq[send.1]=1
 0:00:00.002021000 [client] TRACE g#q.ack.depth[send.1]=1
 0:00:00.002021000 [client] TRACE m#q.ack.depth_dist[send.1]=1
@@ -1207,6 +1216,7 @@ expression: logs
 0:00:00.002041000 [client] TRACE c#rx.peer_cache.miss=1
 0:00:00.002041000 [client] TRACE c#rx.ecn[ect0]=1
 0:00:00.002041000 [client] TRACE c#rx.pkt_control=1
+0:00:00.002041000 [client] TRACE c#rx.frame[ack]=1
 0:00:00.002041000 [client] TRACE c#q.ack.enq[send.3]=1
 0:00:00.002041000 [client] TRACE g#q.ack.depth[send.3]=1
 0:00:00.002041000 [client] TRACE m#q.ack.depth_dist[send.3]=1
@@ -1289,6 +1299,7 @@ expression: logs
 0:00:00.002061000 [client] TRACE c#rx.peer_cache.hit=1
 0:00:00.002061000 [client] TRACE c#rx.ecn[ect0]=1
 0:00:00.002061000 [client] TRACE c#rx.pkt_control=1
+0:00:00.002061000 [client] TRACE c#rx.frame[ack]=1
 0:00:00.002061000 [client] TRACE c#q.ack.enq[send.2]=1
 0:00:00.002061000 [client] TRACE g#q.ack.depth[send.2]=1
 0:00:00.002061000 [client] TRACE m#q.ack.depth_dist[send.2]=1
@@ -1414,6 +1425,7 @@ expression: logs
 0:00:00.002081000 [client] TRACE c#rx.peer_cache.miss=1
 0:00:00.002081000 [client] TRACE c#rx.ecn[ect0]=1
 0:00:00.002081000 [client] TRACE c#rx.data=1
+0:00:00.002081000 [client] TRACE c#rx.frame[flow_data]=1
 0:00:00.002081000 [client] TRACE c#rx.data.ok=1
 0:00:00.002081000 [client] DEBUG event=on_ack_eliciting prev=Idle next=Scheduled location=dc/s2n-quic-dc/src/endpoint/dispatch.rs
 0:00:00.002081000 [client] TRACE c#q.dispatch_rx.receiver[recv.2.task.packet_dispatch]=1
@@ -1423,6 +1435,7 @@ expression: logs
 0:00:00.002081000 [client] TRACE c#rx.peer_cache.hit=1
 0:00:00.002081000 [client] TRACE c#rx.ecn[ect0]=1
 0:00:00.002081000 [client] TRACE c#rx.data=1
+0:00:00.002081000 [client] TRACE c#rx.frame[flow_data]=1
 0:00:00.002081000 [client] TRACE c#rx.data.ok=1
 0:00:00.002081000 [client] DEBUG event=on_ack_eliciting prev=Scheduled next=Scheduled location=dc/s2n-quic-dc/src/endpoint/dispatch.rs
 0:00:00.002081000 [client] TRACE c#q.dispatch_rx.receiver[recv.2.task.packet_dispatch]=1
@@ -1432,8 +1445,10 @@ expression: logs
 0:00:00.002081000 [client] TRACE c#rx.peer_cache.hit=1
 0:00:00.002081000 [client] TRACE c#rx.ecn[ect0]=1
 0:00:00.002081000 [client] TRACE c#rx.data=1
+0:00:00.002081000 [client] TRACE c#rx.frame[flow_data]=1
 0:00:00.002081000 [client] TRACE c#rx.data.ok=1
 0:00:00.002081000 [client] TRACE c#rx.data=1
+0:00:00.002081000 [client] TRACE c#rx.frame[flow_data]=1
 0:00:00.002081000 [client] TRACE c#rx.data.ok=1
 0:00:00.002081000 [client] DEBUG event=on_ack_eliciting prev=Scheduled next=Scheduled location=dc/s2n-quic-dc/src/endpoint/dispatch.rs
 0:00:00.002081000 [client] TRACE m#task.packet_dispatch.drained[recv.2]=4

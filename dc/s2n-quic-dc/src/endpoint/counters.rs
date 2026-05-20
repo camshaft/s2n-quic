@@ -93,6 +93,18 @@ pub(crate) struct Dispatch {
     pub rx_ecn_ect1: Counter,
     pub rx_ecn_ce: Counter,
     pub rx_ecn_not_ect: Counter,
+
+    // Per-frame-type RX counters for inbound frames observed by the dispatch path.
+    pub rx_frame_flow_init: Counter,
+    pub rx_frame_flow_data: Counter,
+    pub rx_frame_flow_control: Counter,
+    pub rx_frame_flow_max_data: Counter,
+    pub rx_frame_flow_reset: Counter,
+    pub rx_frame_flow_init_reset: Counter,
+    pub rx_frame_flow_init_fin: Counter,
+    pub rx_frame_flow_init_validate: Counter,
+    pub rx_frame_flow_validate_request: Counter,
+    pub rx_frame_ack: Counter,
 }
 
 impl Dispatch {
@@ -187,6 +199,19 @@ impl Dispatch {
             rx_ecn_ect1: counters.register_nominal("rx.ecn", "ect1"),
             rx_ecn_ce: counters.register_nominal("rx.ecn", "ce"),
             rx_ecn_not_ect: counters.register_nominal("rx.ecn", "not_ect"),
+
+            rx_frame_flow_init: counters.register_nominal("rx.frame", "flow_init"),
+            rx_frame_flow_data: counters.register_nominal("rx.frame", "flow_data"),
+            rx_frame_flow_control: counters.register_nominal("rx.frame", "flow_control"),
+            rx_frame_flow_max_data: counters.register_nominal("rx.frame", "flow_max_data"),
+            rx_frame_flow_reset: counters.register_nominal("rx.frame", "flow_reset"),
+            rx_frame_flow_init_reset: counters.register_nominal("rx.frame", "flow_init_reset"),
+            rx_frame_flow_init_fin: counters.register_nominal("rx.frame", "flow_init_fin"),
+            rx_frame_flow_init_validate: counters
+                .register_nominal("rx.frame", "flow_init_validate"),
+            rx_frame_flow_validate_request: counters
+                .register_nominal("rx.frame", "flow_validate_request"),
+            rx_frame_ack: counters.register_nominal("rx.frame", "ack"),
         })
     }
 
@@ -221,16 +246,46 @@ impl Dispatch {
     #[inline]
     pub fn on_received_frame(&self, header: &Header) {
         match header {
-            Header::FlowInit { .. } => self.rx_init.add(1),
-            Header::FlowValidateRequest { .. } => self.rx_validate.add(1),
-            Header::FlowInitValidate { .. } => self.rx_init_validate.add(1),
-            Header::FlowData { .. } => self.rx_data.add(1),
-            Header::FlowControl { .. } => self.rx_flow_control.add(1),
-            Header::FlowMaxData { .. } => self.rx_flow_control.add(1),
-            Header::FlowReset { .. } => self.rx_reset.add(1),
-            Header::FlowInitReset { .. } => self.rx_init_reset.add(1),
-            Header::FlowInitFin { .. } => self.rx_init_fin.add(1),
-            Header::Ack { .. } => self.rx_pkt_control.add(1),
+            Header::FlowInit { .. } => {
+                self.rx_init.add(1);
+                self.rx_frame_flow_init.add(1);
+            }
+            Header::FlowValidateRequest { .. } => {
+                self.rx_validate.add(1);
+                self.rx_frame_flow_validate_request.add(1);
+            }
+            Header::FlowInitValidate { .. } => {
+                self.rx_init_validate.add(1);
+                self.rx_frame_flow_init_validate.add(1);
+            }
+            Header::FlowData { .. } => {
+                self.rx_data.add(1);
+                self.rx_frame_flow_data.add(1);
+            }
+            Header::FlowControl { .. } => {
+                self.rx_flow_control.add(1);
+                self.rx_frame_flow_control.add(1);
+            }
+            Header::FlowMaxData { .. } => {
+                self.rx_flow_control.add(1);
+                self.rx_frame_flow_max_data.add(1);
+            }
+            Header::FlowReset { .. } => {
+                self.rx_reset.add(1);
+                self.rx_frame_flow_reset.add(1);
+            }
+            Header::FlowInitReset { .. } => {
+                self.rx_init_reset.add(1);
+                self.rx_frame_flow_init_reset.add(1);
+            }
+            Header::FlowInitFin { .. } => {
+                self.rx_init_fin.add(1);
+                self.rx_frame_flow_init_fin.add(1);
+            }
+            Header::Ack { .. } => {
+                self.rx_pkt_control.add(1);
+                self.rx_frame_ack.add(1);
+            }
         };
     }
 
