@@ -835,6 +835,7 @@ where
                 let interest = ctx.on_pto_timeout(&clock);
                 let is_requested = ctx.pto.probe_state.is_requested();
                 if !was_requested && is_requested {
+                    // Fresh PTO escalation: timeout transitioned the context into probe mode.
                     tx_pto_requested.add(1);
                     send_counters
                         .tx_probe_backoff
@@ -843,8 +844,10 @@ where
                         send_counters.on_probe_no_response();
                     }
                 } else if was_requested && is_requested {
+                    // Timeout fired again while a prior probe request is still pending.
                     send_counters.on_pto_already_requested();
                 } else {
+                    // Timeout check ran but no probe was needed/requested this cycle.
                     send_counters.on_pto_no_probe();
                 }
                 send_counters.on_cca_state(

@@ -381,6 +381,8 @@ impl Send {
         self.send_bytes_in_flight.record_value(bytes_in_flight as u64);
         self.send_inflight_map_bytes
             .record_value(inflight_map_bytes as u64);
+        // This should normally be zero; non-zero indicates drift between CCA accounting
+        // and inflight map byte tracking at the time of sampling.
         if bytes_in_flight != inflight_map_bytes {
             self.send_inflight_bytes_mismatch.add(1);
         }
