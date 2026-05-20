@@ -142,6 +142,9 @@ pub(crate) fn process_ack<Clk, Rand>(
 
     counters.tx_ack_packets.record_value(packets_acked);
     counters.on_inflight_drain_ack(packets_acked);
+    if packets_acked == 0 {
+        counters.on_ack_empty();
+    }
 
     // Finalize loss detection for the ACK-only RTT tracker. This must be called
     // after all ranges have been processed so that the loss heuristic does not
@@ -251,6 +254,8 @@ pub(crate) fn process_ack<Clk, Rand>(
     // Sample CCA state after all mutations (ack, ECN, loss) have run.
     counters.on_cca_state(
         context.cca.congestion_window(),
+        context.cca.bytes_in_flight(),
+        context.inflight.sum_sent_bytes(),
         context.cca.bandwidth().as_bytes_per_second(),
         context.cca.is_congestion_limited(),
     );

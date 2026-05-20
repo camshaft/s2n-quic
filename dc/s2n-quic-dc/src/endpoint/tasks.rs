@@ -831,9 +831,10 @@ where
             tx_pto_check.add(1);
             let wheel_interest = {
                 let mut ctx = context.borrow_mut();
-                let requested = ctx.pto.probe_state.is_requested();
+                let was_requested = ctx.pto.probe_state.is_requested();
                 let interest = ctx.on_pto_timeout(&clock);
-                if !requested && ctx.pto.probe_state.is_requested() {
+                let is_requested = ctx.pto.probe_state.is_requested();
+                if !was_requested && is_requested {
                     tx_pto_requested.add(1);
                     send_counters
                         .tx_probe_backoff
@@ -841,7 +842,18 @@ where
                     if ctx.pto.backoff > 2 {
                         send_counters.on_probe_no_response();
                     }
+                } else if was_requested && is_requested {
+                    send_counters.on_pto_already_requested();
+                } else {
+                    send_counters.on_pto_no_probe();
                 }
+                send_counters.on_cca_state(
+                    ctx.cca.congestion_window(),
+                    ctx.cca.bytes_in_flight(),
+                    ctx.inflight.sum_sent_bytes(),
+                    ctx.cca.bandwidth().as_bytes_per_second(),
+                    ctx.cca.is_congestion_limited(),
+                );
                 interest
             };
             (context, wheel_interest)

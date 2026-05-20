@@ -259,9 +259,15 @@ pub(crate) struct Send {
     pub invalid_sender_idx: Counter,
     pub tx_ack_received: Counter,
     pub tx_ack_no_ctx: Counter,
+    pub tx_ack_decode_error: Counter,
+    pub tx_ack_unexpected_frame: Counter,
+    pub tx_ack_empty: Counter,
     pub tx_ack_packets: Summary,
     pub tx_rtt: Timer,
     pub send_cwnd: Summary,
+    pub send_bytes_in_flight: Summary,
+    pub send_inflight_map_bytes: Summary,
+    pub send_inflight_bytes_mismatch: Counter,
     pub send_pacing_rate: Summary,
     pub send_cca_limited: Counter,
     pub send_app_limited: Counter,
@@ -277,6 +283,8 @@ pub(crate) struct Send {
     pub send_context_count: Gauge,
     pub tx_probe_no_response: Counter,
     pub tx_probe_backoff: Summary,
+    pub tx_pto_already_requested: Counter,
+    pub tx_pto_no_probe: Counter,
 }
 
 impl Send {
@@ -287,10 +295,17 @@ impl Send {
             invalid_sender_idx: counters.register("!send.invalid_sender_idx"),
             tx_ack_received: counters.register("tx.ack_received"),
             tx_ack_no_ctx: counters.register("!tx.ack_no_ctx"),
+            tx_ack_decode_error: counters.register("!tx.ack.decode_error"),
+            tx_ack_unexpected_frame: counters.register("!tx.ack.unexpected_frame"),
+            tx_ack_empty: counters.register("tx.ack.empty"),
             tx_ack_packets: counters
                 .register_summary("tx.ack_packets", crate::counter::Unit::Count),
             tx_rtt: counters.register_timer("tx.rtt"),
             send_cwnd: counters.register_summary("send.cwnd", Unit::Byte),
+            send_bytes_in_flight: counters.register_summary("send.bytes_in_flight", Unit::Byte),
+            send_inflight_map_bytes: counters
+                .register_summary("send.inflight.map_bytes", Unit::Byte),
+            send_inflight_bytes_mismatch: counters.register("!send.inflight.bytes_mismatch"),
             send_pacing_rate: counters.register_summary("send.pacing_rate", Unit::Byte),
             send_cca_limited: counters.register("send.cca_limited"),
             send_app_limited: counters.register("send.app_limited"),
@@ -308,6 +323,8 @@ impl Send {
             send_context_count: counters.register_gauge("send.context.count"),
             tx_probe_no_response: counters.register("tx.probe.no_response"),
             tx_probe_backoff: counters.register_summary("tx.probe.backoff", Unit::Count),
+            tx_pto_already_requested: counters.register("tx.pto.already_requested"),
+            tx_pto_no_probe: counters.register("tx.pto.no_probe"),
         })
     }
 
@@ -332,6 +349,21 @@ impl Send {
     }
 
     #[inline]
+    pub fn on_ack_decode_error(&self) {
+        self.tx_ack_decode_error.add(1);
+    }
+
+    #[inline]
+    pub fn on_ack_unexpected_frame(&self) {
+        self.tx_ack_unexpected_frame.add(1);
+    }
+
+    #[inline]
+    pub fn on_ack_empty(&self) {
+        self.tx_ack_empty.add(1);
+    }
+
+    #[inline]
     pub fn on_rtt(&self, rtt: core::time::Duration) {
         self.tx_rtt.record(rtt);
     }
@@ -340,10 +372,18 @@ impl Send {
     pub fn on_cca_state(
         &self,
         cwnd_bytes: u32,
+        bytes_in_flight: u32,
+        inflight_map_bytes: u32,
         pacing_rate_bytes_per_sec: u64,
         is_cca_limited: bool,
     ) {
         self.send_cwnd.record_value(cwnd_bytes as u64);
+        self.send_bytes_in_flight.record_value(bytes_in_flight as u64);
+        self.send_inflight_map_bytes
+            .record_value(inflight_map_bytes as u64);
+        if bytes_in_flight != inflight_map_bytes {
+            self.send_inflight_bytes_mismatch.add(1);
+        }
         self.send_pacing_rate
             .record_value(pacing_rate_bytes_per_sec);
         if is_cca_limited {
@@ -409,5 +449,15 @@ impl Send {
     #[inline]
     pub fn on_probe_no_response(&self) {
         self.tx_probe_no_response.add(1);
+    }
+
+    #[inline]
+    pub fn on_pto_already_requested(&self) {
+        self.tx_pto_already_requested.add(1);
+    }
+
+    #[inline]
+    pub fn on_pto_no_probe(&self) {
+        self.tx_pto_no_probe.add(1);
     }
 }
