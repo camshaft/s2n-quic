@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::{Config, Handle, Pool};
+use crate::socket::channel;
 use std::{
     sync::{
         atomic::{AtomicUsize, Ordering},
@@ -31,6 +32,28 @@ impl Wake for WakeCounter {
     #[inline]
     fn wake_by_ref(self: &Arc<Self>) {
         self.wakeups.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+#[derive(Default)]
+struct WakeSender {
+    wakers: Vec<Waker>,
+}
+
+impl WakeSender {
+    #[inline]
+    fn wake_all(&mut self) {
+        for waker in self.wakers.drain(..) {
+            waker.wake();
+        }
+    }
+}
+
+impl channel::UnboundedSender<Waker> for WakeSender {
+    #[inline]
+    fn send(&mut self, waker: Waker) -> Result<(), Waker> {
+        self.wakers.push(waker);
+        Ok(())
     }
 }
 
@@ -108,7 +131,10 @@ fn release_wakes_waiter() {
         pool.poll_acquire(&mut cx, 5, inactive_epoch_for(&pool), 2),
         Poll::Pending
     ));
-    pool.release(5);
+    let mut sender = WakeSender::default();
+    pool.release(5, &mut sender);
+    assert_eq!(counter.wakeups(), 0);
+    sender.wake_all();
     assert_eq!(counter.wakeups(), 1);
 
     let res = pool.poll_acquire(&mut cx, 5, inactive_epoch_for(&pool), 2);
@@ -139,7 +165,9 @@ fn priority_ordering() {
         Poll::Pending
     ));
 
-    pool.release(5);
+    let mut sender = WakeSender::default();
+    pool.release(5, &mut sender);
+    sender.wake_all();
     assert_eq!(high_counter.wakeups(), 1);
     assert_eq!(low_counter.wakeups(), 0);
 }
@@ -168,11 +196,14 @@ fn same_tier_fifo() {
         Poll::Pending
     ));
 
-    pool.release(5);
+    let mut sender = WakeSender::default();
+    pool.release(5, &mut sender);
+    sender.wake_all();
     assert_eq!(first_counter.wakeups(), 1);
     assert_eq!(second_counter.wakeups(), 0);
 
-    pool.release(5);
+    pool.release(5, &mut sender);
+    sender.wake_all();
     assert_eq!(second_counter.wakeups(), 1);
 }
 
@@ -269,7 +300,9 @@ fn negative_available_signals_waiters() {
         Poll::Pending
     ));
 
-    pool.release(15);
+    let mut sender = WakeSender::default();
+    pool.release(15, &mut sender);
+    sender.wake_all();
     assert_eq!(counter.wakeups(), 1);
     assert_eq!(pool.poll_acquire(&mut cx, 5, inactive_epoch_for(&pool), 1), Poll::Ready(5));
 }

@@ -2,9 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::Pool;
+use crate::socket::channel;
 use std::{
     sync::Arc,
-    task::{Context, Poll},
+    task::{Context, Poll, Waker},
 };
 
 pub struct Handle {
@@ -43,10 +44,10 @@ impl Handle {
     }
 
     #[inline]
-    pub fn release(&mut self, n: u64) {
+    pub fn release<W: channel::UnboundedSender<Waker>>(&mut self, n: u64, wake_sender: &mut W) {
         let released = n.min(self.held);
         self.held -= released;
-        self.pool.release(released);
+        self.pool.release(released, wake_sender);
     }
 }
 
@@ -54,7 +55,17 @@ impl Drop for Handle {
     #[inline]
     fn drop(&mut self) {
         if self.held > 0 {
-            self.pool.release(self.held);
+            struct InlineWakeSender;
+            impl channel::UnboundedSender<Waker> for InlineWakeSender {
+                #[inline]
+                fn send(&mut self, waker: Waker) -> Result<(), Waker> {
+                    waker.wake();
+                    Ok(())
+                }
+            }
+
+            let mut sender = InlineWakeSender;
+            self.pool.release(self.held, &mut sender);
         }
     }
 }

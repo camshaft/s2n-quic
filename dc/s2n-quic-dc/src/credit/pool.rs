@@ -5,12 +5,13 @@ use super::{
     config::Config,
     waiter::{WaiterEntry, WaiterQueue, PRIORITY_LEVELS},
 };
+use crate::socket::channel;
 use std::{
     sync::{
         atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering},
         Mutex,
     },
-    task::{Context, Poll},
+    task::{Context, Poll, Waker},
 };
 
 pub struct Pool {
@@ -24,8 +25,8 @@ pub struct Pool {
     /// Monotonic epoch counter. Streams polled within 1 epoch are "active".
     epoch: AtomicU64,
 
-    /// Priority-ordered wait queue (slow path only).
-    waiters: Mutex<WaiterQueue>,
+    /// Sharded priority-ordered wait queues (slow path only).
+    waiters: [Mutex<WaiterQueue>; PRIORITY_LEVELS],
 
     waiter_total: AtomicUsize,
 
@@ -44,7 +45,7 @@ impl Pool {
             available: AtomicI64::new(available),
             active_reserve: AtomicI64::new(active_reserve),
             epoch: AtomicU64::new(0),
-            waiters: Mutex::new(WaiterQueue::new()),
+            waiters: std::array::from_fn(|_| Mutex::new(WaiterQueue::new())),
             waiter_total: AtomicUsize::new(0),
             config,
         }
@@ -73,15 +74,28 @@ impl Pool {
             return Poll::Ready(n);
         }
 
-        let mut waiters = self.waiters.lock().expect("waiters mutex poisoned");
-        waiters.push(
-            priority,
-            WaiterEntry {
-                waker: cx.waker().clone(),
-                requested: n,
-            },
-        );
-        self.waiter_total.fetch_add(1, Ordering::Relaxed);
+        let priority = priority.min(PRIORITY_LEVELS - 1);
+        self.waiter_total.fetch_add(1, Ordering::AcqRel);
+        let mut waiters = self.waiters[priority]
+            .lock()
+            .expect("waiters mutex poisoned");
+
+        if self.is_active(last_epoch) && Self::acquire_from(&self.active_reserve, n) {
+            drop(waiters);
+            self.waiter_total.fetch_sub(1, Ordering::AcqRel);
+            return Poll::Ready(n);
+        }
+
+        if Self::acquire_from(&self.available, n) {
+            drop(waiters);
+            self.waiter_total.fetch_sub(1, Ordering::AcqRel);
+            return Poll::Ready(n);
+        }
+
+        waiters.push(WaiterEntry {
+            waker: cx.waker().clone(),
+            requested: n,
+        });
         Poll::Pending
     }
 
@@ -104,8 +118,8 @@ impl Pool {
         0
     }
 
-    /// Return credits to the pool. Wakes blocked waiters in priority order.
-    pub fn release(&self, n: u64) {
+    /// Return credits to the pool and enqueue blocked waiters in priority order.
+    pub fn release<W: channel::UnboundedSender<Waker>>(&self, n: u64, wake_sender: &mut W) {
         if n == 0 {
             return;
         }
@@ -118,38 +132,33 @@ impl Pool {
 
         let mut wake_budget = n;
         let mut wake_count = 0usize;
-        let mut wakers = Vec::new();
+        let mut blocked_on_higher_tier = false;
 
-        {
-            let mut waiters = self.waiters.lock().expect("waiters mutex poisoned");
-            if waiters.total == 0 {
-                return;
+        'tiers: for waiters in &self.waiters {
+            let mut waiters = waiters.lock().expect("waiters mutex poisoned");
+            if waiters.is_empty() {
+                continue;
             }
 
-            'tiers: for tier_idx in 0..PRIORITY_LEVELS {
-                let tier = &mut waiters.tiers[tier_idx];
-
-                while let Some(front) = tier.front() {
-                    if wake_budget == 0 || front.requested > wake_budget {
-                        break 'tiers;
-                    }
-
-                    let waiter = tier.pop_front().expect("front waiter exists");
-                    wake_budget -= waiter.requested;
-                    wake_count += 1;
-                    wakers.push(waiter.waker);
+            while let Some(requested) = waiters.front_requested() {
+                if wake_budget == 0 || requested > wake_budget {
+                    blocked_on_higher_tier = true;
+                    break;
                 }
+
+                let waiter = waiters.pop().expect("front waiter exists");
+                wake_budget -= waiter.requested;
+                wake_count += 1;
+                let _ = wake_sender.send(waiter.waker);
             }
 
-            waiters.total = waiters.total.saturating_sub(wake_count);
+            if blocked_on_higher_tier {
+                break 'tiers;
+            }
         }
 
         if wake_count > 0 {
-            self.waiter_total.fetch_sub(wake_count, Ordering::Relaxed);
-        }
-
-        for waker in wakers {
-            waker.wake();
+            self.waiter_total.fetch_sub(wake_count, Ordering::AcqRel);
         }
     }
 

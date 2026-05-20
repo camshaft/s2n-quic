@@ -1,14 +1,13 @@
 // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::{collections::VecDeque, task::Waker};
+use crate::intrusive::{Entry, Queue};
+use std::task::Waker;
 
 pub(crate) const PRIORITY_LEVELS: usize = 5;
 
 pub(crate) struct WaiterQueue {
-    /// One FIFO per priority level. Index 0 = highest priority.
-    pub(crate) tiers: [VecDeque<WaiterEntry>; PRIORITY_LEVELS],
-    pub(crate) total: usize,
+    pub(crate) queue: Queue<WaiterEntry>,
 }
 
 pub(crate) struct WaiterEntry {
@@ -20,15 +19,27 @@ impl WaiterQueue {
     #[inline]
     pub(crate) fn new() -> Self {
         Self {
-            tiers: std::array::from_fn(|_| VecDeque::new()),
-            total: 0,
+            queue: Queue::new(),
         }
     }
 
     #[inline]
-    pub(crate) fn push(&mut self, priority: usize, waiter: WaiterEntry) {
-        let idx = priority.min(PRIORITY_LEVELS - 1);
-        self.tiers[idx].push_back(waiter);
-        self.total += 1;
+    pub(crate) fn is_empty(&self) -> bool {
+        self.queue.is_empty()
+    }
+
+    #[inline]
+    pub(crate) fn front_requested(&self) -> Option<u64> {
+        self.queue.front().map(|waiter| waiter.requested)
+    }
+
+    #[inline]
+    pub(crate) fn push(&mut self, waiter: WaiterEntry) {
+        self.queue.push_back(Entry::new(waiter));
+    }
+
+    #[inline]
+    pub(crate) fn pop(&mut self) -> Option<WaiterEntry> {
+        self.queue.pop_front().map(|waiter| waiter.into_inner())
     }
 }

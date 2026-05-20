@@ -38,7 +38,11 @@ impl Config {
 
     #[inline]
     pub(crate) fn clamp_request(&self, n: u64) -> u64 {
-        n.min(self.max_single_acquire)
+        if self.capacity == 0 {
+            return n.min(self.max_single_acquire);
+        }
+
+        n.min(self.max_single_acquire).min(self.capacity)
     }
 
     #[inline]
