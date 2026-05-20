@@ -669,7 +669,9 @@ impl AssemblerCounters {
             }
             // ACK frames are stripped before inflight insertion and are never retransmitted
             // as probes; this branch should be unreachable in practice.
-            frame::Header::Ack { .. } => {}
+            frame::Header::Ack { .. } => {
+                debug_assert!(false, "ACK frames should never appear as inflight entries")
+            }
         }
     }
 }

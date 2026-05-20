@@ -278,7 +278,7 @@ pub(crate) struct Send {
     pub tx_probe_no_response: Counter,
     pub tx_probe_backoff: Summary,
 
-    // Per-frame-type ACK counters (bumped inline as each inflight frame is completed).
+    // Per-frame-type ACK counters (bumped when each inflight frame is acknowledged).
     pub tx_acked_frame_flow_init: Counter,
     pub tx_acked_frame_flow_data: Counter,
     pub tx_acked_frame_flow_control: Counter,
@@ -456,7 +456,9 @@ impl Send {
             }
             // ACK frames are stripped before inflight insertion and are never ACKed as
             // inflight entries; this branch should be unreachable in practice.
-            Header::Ack { .. } => {}
+            Header::Ack { .. } => {
+                debug_assert!(false, "ACK frames should never appear as inflight entries")
+            }
         }
     }
 }
