@@ -277,6 +277,17 @@ pub(crate) struct Send {
     pub send_context_count: Gauge,
     pub tx_probe_no_response: Counter,
     pub tx_probe_backoff: Summary,
+
+    // Per-frame-type ACK counters (bumped inline as each inflight frame is completed).
+    pub tx_acked_frame_flow_init: Counter,
+    pub tx_acked_frame_flow_data: Counter,
+    pub tx_acked_frame_flow_control: Counter,
+    pub tx_acked_frame_flow_max_data: Counter,
+    pub tx_acked_frame_flow_reset: Counter,
+    pub tx_acked_frame_flow_init_reset: Counter,
+    pub tx_acked_frame_flow_init_fin: Counter,
+    pub tx_acked_frame_flow_init_validate: Counter,
+    pub tx_acked_frame_flow_validate_request: Counter,
 }
 
 impl Send {
@@ -308,6 +319,22 @@ impl Send {
             send_context_count: counters.register_gauge("send.context.count"),
             tx_probe_no_response: counters.register("tx.probe.no_response"),
             tx_probe_backoff: counters.register_summary("tx.probe.backoff", Unit::Count),
+
+            tx_acked_frame_flow_init: counters.register_nominal("tx.acked.frame", "flow_init"),
+            tx_acked_frame_flow_data: counters.register_nominal("tx.acked.frame", "flow_data"),
+            tx_acked_frame_flow_control: counters
+                .register_nominal("tx.acked.frame", "flow_control"),
+            tx_acked_frame_flow_max_data: counters
+                .register_nominal("tx.acked.frame", "flow_max_data"),
+            tx_acked_frame_flow_reset: counters.register_nominal("tx.acked.frame", "flow_reset"),
+            tx_acked_frame_flow_init_reset: counters
+                .register_nominal("tx.acked.frame", "flow_init_reset"),
+            tx_acked_frame_flow_init_fin: counters
+                .register_nominal("tx.acked.frame", "flow_init_fin"),
+            tx_acked_frame_flow_init_validate: counters
+                .register_nominal("tx.acked.frame", "flow_init_validate"),
+            tx_acked_frame_flow_validate_request: counters
+                .register_nominal("tx.acked.frame", "flow_validate_request"),
         })
     }
 
@@ -409,5 +436,27 @@ impl Send {
     #[inline]
     pub fn on_probe_no_response(&self) {
         self.tx_probe_no_response.add(1);
+    }
+
+    /// Bump the per-frame-type ACK counter for the given frame header.
+    /// Called inline as each inflight frame is acknowledged.
+    #[inline]
+    pub fn on_acked_frame(&self, header: &Header) {
+        match header {
+            Header::FlowInit { .. } => self.tx_acked_frame_flow_init.add(1),
+            Header::FlowData { .. } => self.tx_acked_frame_flow_data.add(1),
+            Header::FlowControl { .. } => self.tx_acked_frame_flow_control.add(1),
+            Header::FlowMaxData { .. } => self.tx_acked_frame_flow_max_data.add(1),
+            Header::FlowReset { .. } => self.tx_acked_frame_flow_reset.add(1),
+            Header::FlowInitReset { .. } => self.tx_acked_frame_flow_init_reset.add(1),
+            Header::FlowInitFin { .. } => self.tx_acked_frame_flow_init_fin.add(1),
+            Header::FlowInitValidate { .. } => self.tx_acked_frame_flow_init_validate.add(1),
+            Header::FlowValidateRequest { .. } => {
+                self.tx_acked_frame_flow_validate_request.add(1)
+            }
+            // ACK frames are stripped before inflight insertion and are never ACKed as
+            // inflight entries; this branch should be unreachable in practice.
+            Header::Ack { .. } => {}
+        }
     }
 }
