@@ -644,6 +644,7 @@ impl Context {
         for frame in frames_iter {
             let Ok(frame) = frame else {
                 debug!("failed to decode control frame in ACK payload");
+                counters.on_ack_decode_error();
                 break;
             };
 
@@ -658,6 +659,7 @@ impl Context {
                 | s2n_quic_core::frame::FrameMut::Ping(_) => {}
                 frame => {
                     debug!(?frame, "unexpected control frame type in ACK payload");
+                    counters.on_ack_unexpected_frame();
                 }
             }
         }
