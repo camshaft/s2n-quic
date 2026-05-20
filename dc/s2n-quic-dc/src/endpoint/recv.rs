@@ -112,16 +112,32 @@ impl crate::intrusive::Adapter for AckBurstAdapter {
 pub(crate) struct AttemptDedup {
     bitmap: [u64; Self::WORDS],
     right_edge: Option<u64>,
+    /// Tracks attempt IDs that fell outside the sliding window ("too old") but
+    /// were successfully processed via the `TooOld` retry path.  Without this
+    /// set a second copy of the same packet (e.g. a PTO retransmission that
+    /// also arrives after the window has advanced) would call `try_register`
+    /// again and – if the first stream had already completed – create a
+    /// duplicate stream on the server.
+    ///
+    /// Entries are evicted once `right_edge` has advanced `TOO_OLD_EXPIRY`
+    /// beyond them, at which point no in-flight retransmission could still
+    /// carry that attempt ID.
+    too_old_seen: rustc_hash::FxHashSet<u64>,
 }
 
 impl AttemptDedup {
     const WORDS: usize = 32;
     const CAPACITY: u64 = (Self::WORDS as u64) * 64;
+    /// How far past an entry's value the right_edge must advance before we
+    /// consider the entry safe to evict.  3× the bitmap window gives ample
+    /// room for even very large network delays / PTO back-off sequences.
+    const TOO_OLD_EXPIRY: u64 = Self::CAPACITY * 3;
 
     pub fn new() -> Self {
         Self {
             bitmap: [0; Self::WORDS],
             right_edge: None,
+            too_old_seen: Default::default(),
         }
     }
 
@@ -150,12 +166,24 @@ impl AttemptDedup {
                 self.bitmap[word] |= mask;
             }
             self.right_edge = Some(id);
+
+            // Evict stale too_old_seen entries now that the window has moved.
+            let threshold = id.saturating_sub(Self::CAPACITY + Self::TOO_OLD_EXPIRY);
+            self.too_old_seen.retain(|&a| a >= threshold);
+
             return Ok(());
         }
 
         // id < edge
         let offset = edge - id;
         if offset >= Self::CAPACITY {
+            // This attempt ID is outside the dedup bitmap window.  Check our
+            // secondary set so that a second arrival of the same TooOld ID is
+            // correctly identified as a duplicate rather than spawning a new
+            // stream.
+            if !self.too_old_seen.insert(id) {
+                return Err(AttemptDedupError::Duplicate);
+            }
             return Err(AttemptDedupError::TooOld);
         }
 
