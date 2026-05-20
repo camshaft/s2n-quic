@@ -26,7 +26,7 @@ impl Config {
     #[inline]
     pub(crate) fn normalized(self) -> Self {
         let capacity = self.capacity.min(i64::MAX as u64);
-        let max_single_acquire = self.max_single_acquire.min(capacity);
+        let max_single_acquire = self.max_single_acquire.min(i64::MAX as u64);
         let active_reserve_fraction = self.active_reserve_fraction.clamp(0.0, 1.0);
 
         Self {
