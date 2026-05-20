@@ -11,6 +11,7 @@ pub mod byte_vec;
 pub mod congestion;
 pub mod control;
 pub mod counter;
+pub mod credit;
 pub mod credentials;
 pub mod crypto;
 pub mod datagram;
