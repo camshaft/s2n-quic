@@ -1413,11 +1413,11 @@ fn five_node_random_chatter_settles_after_stop() {
                                 if reader.read_into(&mut buf).await.expect("server read") == 0 {
                                     break;
                                 }
-                                assert!(
-                                    buf.len() <= MAX_PAYLOAD_SIZE,
-                                    "unexpected oversized request payload"
-                                );
                             }
+                            assert!(
+                                buf.len() <= MAX_PAYLOAD_SIZE,
+                                "unexpected oversized request payload"
+                            );
                             let request = core::str::from_utf8(&buf)
                                 .expect("request payload should be valid UTF-8");
                             assert!(
@@ -1437,13 +1437,13 @@ fn five_node_random_chatter_settles_after_stop() {
                 .spawn();
 
                 let mut client = Client::new();
-                let unbiased_threshold =
+                let rejection_sampling_threshold =
                     ((u8::MAX as usize + 1) / NODE_NAMES.len()) * NODE_NAMES.len();
                 for tick in 0..CHAT_SECONDS {
                     let selected_peer_idx = loop {
                         let raw = bach::rand::any::<u8>() as usize;
                         // Rejection sampling to avoid modulo bias.
-                        if raw >= unbiased_threshold {
+                        if raw >= rejection_sampling_threshold {
                             continue;
                         }
                         let candidate_peer_idx = raw % NODE_NAMES.len();
@@ -1471,11 +1471,11 @@ fn five_node_random_chatter_settles_after_stop() {
                         if reader.read_into(&mut buf).await.expect("client read") == 0 {
                             break;
                         }
-                        assert!(
-                            buf.len() <= MAX_PAYLOAD_SIZE,
-                            "unexpected oversized response payload"
-                        );
                     }
+                    assert!(
+                        buf.len() <= MAX_PAYLOAD_SIZE,
+                        "unexpected oversized response payload"
+                    );
 
                     assert_eq!(
                         &buf[..],
