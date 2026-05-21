@@ -68,7 +68,7 @@ fn setup_send() -> (
     )
     .spawn();
 
-    let rx = tasks::peer_dead_broadcast(
+    let peer_dead_broadcast_task = tasks::peer_dead_broadcast(
         peer_dead_rx,
         queue_dispatcher,
         WakeNowSender,
@@ -77,7 +77,7 @@ fn setup_send() -> (
             broadcasted: registry.register("test.peer_dead.broadcasted"),
         },
     );
-    async move { rx.drain_budgeted(Some(32)).await }.spawn();
+    async move { peer_dead_broadcast_task.drain_budgeted(Some(32)).await }.spawn();
 
     (
         send_caches,
@@ -236,11 +236,11 @@ fn send_idle_wheel_expires_reader_only_queue_with_reset() {
                 "context should be evicted after idle timeout"
             );
 
-            let stream_queue = queue_stream
+            let stream_queue_entries = queue_stream
                 .try_swap()
                 .expect("stream queue should still be open");
             assert!(
-                stream_queue.iter().any(|entry| {
+                stream_queue_entries.iter().any(|entry| {
                     matches!(
                         &*entry,
                         msg::Stream::Reset {
@@ -251,11 +251,11 @@ fn send_idle_wheel_expires_reader_only_queue_with_reset() {
                 "stream queue should receive idle-timeout reset"
             );
 
-            let control_queue = queue_control
+            let control_queue_entries = queue_control
                 .try_swap()
                 .expect("control queue should still be open");
             assert!(
-                control_queue.iter().any(|entry| {
+                control_queue_entries.iter().any(|entry| {
                     matches!(
                         &*entry,
                         msg::Control::Reset {
