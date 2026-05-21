@@ -1430,7 +1430,14 @@ fn five_node_random_chatter_settles_after_stop() {
                 for tick in 0..CHAT_SECONDS {
                     let mut peer_idx = node_idx;
                     while peer_idx == node_idx {
-                        peer_idx = bach::rand::any::<u8>() as usize % NODE_NAMES.len();
+                        let candidate = loop {
+                            let raw = bach::rand::any::<u8>() as usize;
+                            // Rejection sample to avoid modulo bias for length 5.
+                            if raw < u8::MAX as usize {
+                                break raw % NODE_NAMES.len();
+                            }
+                        };
+                        peer_idx = candidate;
                     }
 
                     let peer = format!("{}:0", NODE_NAMES[peer_idx]);
@@ -1471,7 +1478,7 @@ fn five_node_random_chatter_settles_after_stop() {
             let monitor_active = monitor_active.clone();
             let packets_after_stop = packets_after_stop.clone();
             async move {
-                60.s().sleep().await;
+                Duration::from_secs(CHAT_SECONDS as u64).sleep().await;
                 monitor_active.store(true, Ordering::Relaxed);
                 SETTLE_WINDOW.sleep().await;
                 let sent = packets_after_stop.load(Ordering::Relaxed);
