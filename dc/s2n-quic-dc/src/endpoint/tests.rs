@@ -1418,6 +1418,12 @@ fn five_node_random_chatter_settles_after_stop() {
                                     "unexpected oversized request payload"
                                 );
                             }
+                            let request = core::str::from_utf8(&buf)
+                                .expect("request payload should be valid UTF-8");
+                            assert!(
+                                request.contains("->") && request.contains('@'),
+                                "unexpected request payload format: {request}"
+                            );
 
                             let mut response_data = buf.freeze();
                             writer
@@ -1434,17 +1440,17 @@ fn five_node_random_chatter_settles_after_stop() {
                 let unbiased_threshold =
                     ((u8::MAX as usize + 1) / NODE_NAMES.len()) * NODE_NAMES.len();
                 for tick in 0..CHAT_SECONDS {
-                    let mut selected_peer_idx = node_idx;
-                    while selected_peer_idx == node_idx {
-                        let candidate_peer_idx = loop {
-                            let raw = bach::rand::any::<u8>() as usize;
-                            // Rejection sampling to avoid modulo bias.
-                            if raw < unbiased_threshold {
-                                break raw % NODE_NAMES.len();
-                            }
-                        };
-                        selected_peer_idx = candidate_peer_idx;
-                    }
+                    let selected_peer_idx = loop {
+                        let raw = bach::rand::any::<u8>() as usize;
+                        // Rejection sampling to avoid modulo bias.
+                        if raw >= unbiased_threshold {
+                            continue;
+                        }
+                        let candidate_peer_idx = raw % NODE_NAMES.len();
+                        if candidate_peer_idx != node_idx {
+                            break candidate_peer_idx;
+                        }
+                    };
 
                     let peer = format!("{}:0", NODE_NAMES[selected_peer_idx]);
                     let stream = client
