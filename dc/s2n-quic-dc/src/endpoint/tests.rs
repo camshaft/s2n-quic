@@ -17,8 +17,8 @@ use s2n_quic_core::varint::VarInt;
 use std::{
     io,
     sync::{
-        Arc,
         atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc,
     },
     time::Duration,
 };

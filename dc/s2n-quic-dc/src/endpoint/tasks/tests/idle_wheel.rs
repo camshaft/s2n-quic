@@ -7,7 +7,7 @@
 //! On expiry the callback re-checks PathSecretEntry.last_activity — if still idle, the
 //! context is evicted from the cache; if activity occurred, it is rescheduled.
 
-use super::helpers::{RecvContextBuilder, TestReceiverExt, WakeNowSender, test_entry, test_frame};
+use super::helpers::{test_entry, test_frame, RecvContextBuilder, TestReceiverExt, WakeNowSender};
 use crate::{
     endpoint::{
         frame::{self, Frame},
@@ -16,7 +16,7 @@ use crate::{
     },
     flow,
     intrusive::Entry,
-    socket::channel::{ReceiverExt as _, UnboundedSender as _, intrusive::unsync},
+    socket::channel::{intrusive::unsync, ReceiverExt as _, UnboundedSender as _},
     testing::{ext::*, sim},
     time::{bach::Clock, precision},
 };

@@ -1,14 +1,14 @@
 // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 use super::{
-    Map,
     size_of::SizeOf,
     status::{Dedup, IsRetired},
+    Map,
 };
 use crate::{
     credentials::{self, Credentials},
     endpoint::id::LocalSenderId,
-    packet::{WireVersion, secret_control as control},
+    packet::{secret_control as control, WireVersion},
     path::secret::{
         open, receiver,
         schedule::{self, Initiator},
@@ -22,8 +22,8 @@ use std::{
     any::Any,
     net::SocketAddr,
     sync::{
+        atomic::{AtomicI64, AtomicU16, AtomicU32, AtomicU64, AtomicU8, Ordering},
         Arc,
-        atomic::{AtomicI64, AtomicU8, AtomicU16, AtomicU32, AtomicU64, Ordering},
     },
     time::Duration,
 };

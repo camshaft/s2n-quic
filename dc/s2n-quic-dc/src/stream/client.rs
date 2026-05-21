@@ -14,8 +14,8 @@
 use crate::{
     flow, psk,
     stream::{
+        endpoint::{msg, Endpoint},
         Reader, Stream, Writer,
-        endpoint::{Endpoint, msg},
     },
 };
 use s2n_quic::server::Name;
@@ -23,7 +23,7 @@ use s2n_quic_core::varint::VarInt;
 use std::{
     io,
     net::SocketAddr,
-    sync::{Arc, atomic::Ordering},
+    sync::{atomic::Ordering, Arc},
 };
 
 pub mod rpc;

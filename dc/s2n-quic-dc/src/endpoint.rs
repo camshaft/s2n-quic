@@ -16,7 +16,7 @@ use crate::{
     intrusive::Entry,
     packet,
     socket::{
-        channel::{GaugedSender, UnboundedSender, intrusive::sync as sync_queue},
+        channel::{intrusive::sync as sync_queue, GaugedSender, UnboundedSender},
         pool::descriptor,
     },
     stream::PendingValidation,
@@ -25,7 +25,7 @@ use crate::{
 };
 use core::time::Duration;
 use s2n_quic_core::{time, varint::VarInt};
-use std::sync::{Arc, atomic::AtomicU64};
+use std::sync::{atomic::AtomicU64, Arc};
 
 pub(crate) mod ack;
 pub(crate) mod assemble;

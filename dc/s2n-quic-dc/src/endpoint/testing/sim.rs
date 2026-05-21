@@ -30,11 +30,11 @@ use crate::{
     acceptor,
     acceptor::channel as accept_channel,
     flow,
-    path::secret::{Map as PathSecretMap, map::TestPairIds},
+    path::secret::{map::TestPairIds, Map as PathSecretMap},
     socket::{pool::Pool, rate::Rate},
     stream::{
+        endpoint::{msg, setup_endpoint, Budgets, Config, Endpoint, WorkerLayout},
         PendingValidation, Reader, Stream, Writer,
-        endpoint::{Budgets, Config, Endpoint, WorkerLayout, msg, setup_endpoint},
     },
 };
 use core::net::SocketAddr;
@@ -43,7 +43,7 @@ use std::{
     cell::RefCell,
     collections::HashMap,
     io,
-    sync::{Arc, Weak, atomic::Ordering},
+    sync::{atomic::Ordering, Arc, Weak},
 };
 
 // ── Thread-local endpoint registries ─────────────────────────────────────────
@@ -479,7 +479,9 @@ where
         .await
         .map_err(|e| io::Error::new(io::ErrorKind::AddrNotAvailable, e))?
         .next()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::AddrNotAvailable, "no address found for peer"))?;
+        .ok_or_else(|| {
+            io::Error::new(io::ErrorKind::AddrNotAvailable, "no address found for peer")
+        })?;
 
     if peer_addr.port() == 0 {
         // If the peer didn't specify a port, use the default.
