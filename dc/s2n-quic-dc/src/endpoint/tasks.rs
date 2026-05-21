@@ -220,6 +220,7 @@ pub fn send_worker<Socket, Clk, WakerSink, AckComp>(
     ack_completions_tx: AckComp,
     waker_sink: WakerSink,
     peer_dead_tx: impl UnboundedSender<Entry<PeerDead>> + Clone + 'static,
+    dead_peer_cooldown: core::time::Duration,
     budgets: Budgets,
     counter_registry: counter::Registry,
 ) where
@@ -557,6 +558,7 @@ pub fn send_worker<Socket, Clk, WakerSink, AckComp>(
             sender_idx_to_local.clone(),
             idle_expired_completed_tx,
             peer_dead_tx.clone(),
+            dead_peer_cooldown,
             counter_registry.register("idle.send.expired"),
             counter_registry.register("idle.send.rescheduled"),
             counter_registry.register_nominal_timer("idle.send.lifetime", &variant),
@@ -1006,6 +1008,7 @@ pub async fn send_idle_wheel_drain<Clk, WakerSink>(
     sender_idx_to_local: IdMap<LocalSenderId, LocalSendSocketId>,
     mut completed_tx: impl UnboundedSender<Entry<Frame>>,
     mut peer_dead_tx: WakerSink,
+    dead_peer_cooldown: core::time::Duration,
     idle_expired: counter::Counter,
     idle_rescheduled: counter::Counter,
     idle_lifetime: counter::Timer,
@@ -1034,6 +1037,8 @@ pub async fn send_idle_wheel_drain<Clk, WakerSink>(
                 if ctx.path_secret_entry.is_idle_expired(now) {
                     let id = *ctx.path_secret_entry.id();
                     let path_secret_entry = ctx.path_secret_entry.clone();
+                    let should_broadcast =
+                        path_secret_entry.mark_dead_if_cooldown_elapsed(now, dead_peer_cooldown);
                     let local_id = sender_idx_to_local[ctx.sender_idx];
                     let lifetime = now.duration_since(ctx.created_at);
                     drop(ctx);
@@ -1051,10 +1056,9 @@ pub async fn send_idle_wheel_drain<Clk, WakerSink>(
                         counters.on_inflight_leaked_on_invalidate(discarded_bytes as u64);
                     }
 
-                    let _ = peer_dead_tx.send(Entry::new(PeerDead {
-                        credential_id: id,
-                        path_secret_entry,
-                    }));
+                    if should_broadcast {
+                        let _ = peer_dead_tx.send(Entry::new(PeerDead { path_secret_entry }));
+                    }
 
                     idle_expired.add(1);
                     idle_lifetime.record(lifetime);
@@ -1079,6 +1083,7 @@ pub async fn recv_idle_wheel_drain<Clk>(
     clock: Clk,
     input_gauge: QueueGauge,
     recv_cache: Rc<RefCell<endpoint::recv::Cache>>,
+    dead_peer_cooldown: core::time::Duration,
     idle_expired: counter::Counter,
     idle_rescheduled: counter::Counter,
     idle_lifetime: counter::Timer,
@@ -1104,6 +1109,8 @@ pub async fn recv_idle_wheel_drain<Clk>(
                 let now = clock.now();
                 let ctx = context.borrow();
                 if ctx.path_entry.is_idle_expired(now) {
+                    ctx.path_entry
+                        .mark_dead_if_cooldown_elapsed(now, dead_peer_cooldown);
                     let key = endpoint::recv::Key {
                         id: *ctx.path_entry.id(),
                         remote_sender_id: ctx.remote_sender_id,
@@ -1512,7 +1519,6 @@ where
 
 #[derive(Clone, Debug)]
 pub struct PeerDead {
-    pub credential_id: crate::credentials::Id,
     pub path_secret_entry: Arc<crate::path::secret::map::Entry>,
 }
 
@@ -1520,20 +1526,16 @@ pub struct PeerDead {
 pub struct PeerDeadCounters {
     pub events: counter::Counter,
     pub broadcasted: counter::Counter,
-    pub cooldown_suppressed: counter::Counter,
 }
 
-pub fn peer_dead_broadcast<R, Clk, WakerSink>(
+pub fn peer_dead_broadcast<R, WakerSink>(
     peer_dead_rx: R,
     mut queue_dispatcher: msg::queue::Dispatcher,
     mut waker_sink: WakerSink,
-    clock: Clk,
-    cooldown: core::time::Duration,
     counters: PeerDeadCounters,
 ) -> impl Receiver<()>
 where
     R: Receiver<Entry<PeerDead>>,
-    Clk: precision::Clock,
     WakerSink: UnboundedSender<crate::flow::queue::AutoWake>,
 {
     use crate::{endpoint::error::IDLE_TIMEOUT, flow};
@@ -1541,17 +1543,10 @@ where
     Map::new(peer_dead_rx, move |entry: Entry<PeerDead>| {
         counters.events.add(1);
         let peer_dead = entry.into_inner();
-        let now = clock.now();
-        let should_broadcast = peer_dead
-            .path_secret_entry
-            .mark_dead_if_cooldown_elapsed(now, cooldown);
-        if !should_broadcast {
-            counters.cooldown_suppressed.add(1);
-            return;
-        }
+        let credential_id = *peer_dead.path_secret_entry.id();
 
         let request = flow::Request {
-            credential_id: peer_dead.credential_id,
+            credential_id,
             stream_id: None,
         };
 

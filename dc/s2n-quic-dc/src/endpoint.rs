@@ -452,6 +452,7 @@ where
                 budgets,
                 num_send,
                 clock.clone(),
+                dead_peer_cooldown,
                 counter_registry.clone(),
             )
         }));
@@ -665,7 +666,6 @@ where
         ups_rate,
         ups_dedup_capacity,
         ups_dedup_window,
-        dead_peer_cooldown,
         acceptor_cleaner: acceptor_registry.cleaner(),
         queue_dispatcher: queue_dispatcher.clone(),
         waker_sink: bg_waker_sink,
@@ -777,7 +777,6 @@ struct BackgroundParts<UpsSocket> {
     ups_rate: crate::socket::rate::Rate,
     ups_dedup_capacity: usize,
     ups_dedup_window: core::time::Duration,
-    dead_peer_cooldown: core::time::Duration,
     acceptor_cleaner: acceptor::Cleaner<PendingValidation>,
     queue_dispatcher: msg::queue::Dispatcher,
     waker_sink: waker::Sink,
@@ -795,6 +794,7 @@ struct Worker<SendSocket, RecvSocket, UpsSocket, Clk, AckSnd, Route, Inv> {
     id: usize,
     budgets: Budgets,
     total_sender_ids: usize,
+    dead_peer_cooldown: core::time::Duration,
     clock: Clk,
     counter_registry: crate::counter::Registry,
     frame_dispatch: Option<FrameDispatchParts<Clk>>,
@@ -829,12 +829,14 @@ where
         budgets: Budgets,
         total_sender_ids: usize,
         clock: Clk,
+        dead_peer_cooldown: core::time::Duration,
         counter_registry: crate::counter::Registry,
     ) -> Self {
         Self {
             id,
             budgets,
             total_sender_ids,
+            dead_peer_cooldown,
             clock,
             counter_registry,
             frame_dispatch: None,
@@ -855,6 +857,7 @@ where
             id,
             budgets,
             total_sender_ids,
+            dead_peer_cooldown,
             clock,
             counter_registry,
             frame_dispatch,
@@ -907,6 +910,7 @@ where
                     sw.ack_completions_tx,
                     sw.waker_sink,
                     sw.peer_dead_tx,
+                    dead_peer_cooldown,
                     budgets,
                     counter_registry.clone(),
                 );
@@ -975,6 +979,7 @@ where
                             clock,
                             q_recv_idle_wheel,
                             recv_cache,
+                            dead_peer_cooldown,
                             idle_expired,
                             idle_rescheduled,
                             idle_lifetime,
@@ -1125,14 +1130,11 @@ where
                 let peer_dead_counters = tasks::PeerDeadCounters {
                     events: counter_registry.register("peer_dead.events"),
                     broadcasted: counter_registry.register("peer_dead.broadcasted"),
-                    cooldown_suppressed: counter_registry.register("peer_dead.cooldown_suppressed"),
                 };
                 let rx = tasks::peer_dead_broadcast(
                     bg.peer_dead_rx,
                     bg.queue_dispatcher,
                     bg.waker_sink,
-                    clock.clone(),
-                    bg.dead_peer_cooldown,
                     peer_dead_counters,
                 );
                 let task_counter = counter_registry

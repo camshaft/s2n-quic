@@ -23,7 +23,7 @@ use std::{
     net::SocketAddr,
     sync::{
         Arc,
-        atomic::{AtomicU8, AtomicU16, AtomicU32, AtomicU64, Ordering},
+        atomic::{AtomicI64, AtomicU8, AtomicU16, AtomicU32, AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -59,7 +59,7 @@ pub struct Entry {
     accessed: AtomicU8,
     application_data: Option<ApplicationData>,
     last_activity: AtomicU64,
-    dead_at: AtomicU64,
+    dead_at: AtomicI64,
     /// The peer's data recv addresses, learned via the post-handshake exchange.
     peer_data_addrs: PeerDataAddrs,
     /// Per-socket-sender load scores encoded as u64 nanoseconds.
@@ -130,6 +130,7 @@ impl SizeOf for ApplicationData {
 impl SizeOf for AtomicU8 {}
 impl SizeOf for AtomicU16 {}
 impl SizeOf for AtomicU32 {}
+impl SizeOf for AtomicI64 {}
 
 impl Entry {
     pub fn new(
@@ -179,7 +180,7 @@ impl Entry {
             accessed: AtomicU8::new(0),
             application_data,
             last_activity: AtomicU64::new(0),
-            dead_at: AtomicU64::new(u64::MAX),
+            dead_at: AtomicI64::new(-1),
             peer_data_addrs: PeerDataAddrs::default(),
             sender_load_scores: Self::init_load_scores(socket_sender_count),
         }
@@ -463,13 +464,17 @@ impl Entry {
         now: crate::time::precision::Timestamp,
         cooldown: Duration,
     ) -> bool {
-        let cooldown_nanos = cooldown.as_nanos().min(u64::MAX as u128) as u64;
-        let previous = self.dead_at.load(Ordering::Acquire);
-        if previous != u64::MAX && now.nanos.saturating_sub(previous) < cooldown_nanos {
-            return false;
-        }
-        self.dead_at.store(now.nanos, Ordering::Release);
-        true
+        let now_ms = (now.nanos / 1_000_000).min(i64::MAX as u64) as i64;
+        let cooldown_ms = cooldown.as_millis().min(i64::MAX as u128) as i64;
+        self.dead_at
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |previous| {
+                if previous >= 0 && now_ms.saturating_sub(previous) < cooldown_ms {
+                    None
+                } else {
+                    Some(now_ms)
+                }
+            })
+            .is_ok()
     }
 
     #[inline]
@@ -478,9 +483,10 @@ impl Entry {
         now: crate::time::precision::Timestamp,
         cooldown: Duration,
     ) -> bool {
-        let cooldown_nanos = cooldown.as_nanos().min(u64::MAX as u128) as u64;
+        let now_ms = (now.nanos / 1_000_000).min(i64::MAX as u64) as i64;
+        let cooldown_ms = cooldown.as_millis().min(i64::MAX as u128) as i64;
         let dead_at = self.dead_at.load(Ordering::Acquire);
-        dead_at != u64::MAX && now.nanos.saturating_sub(dead_at) < cooldown_nanos
+        dead_at >= 0 && now_ms.saturating_sub(dead_at) < cooldown_ms
     }
 
     pub fn is_idle_expired(&self, now: crate::time::precision::Timestamp) -> bool {

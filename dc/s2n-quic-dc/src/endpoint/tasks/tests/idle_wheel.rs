@@ -59,6 +59,7 @@ fn setup_send() -> (
         sender_idx_to_local,
         completed_tx,
         peer_dead_tx,
+        crate::endpoint::DEFAULT_DEAD_PEER_COOLDOWN,
         registry.register("idle.send.expired"),
         registry.register("idle.send.rescheduled"),
         registry.register_nominal_timer("idle.send.lifetime", "send.0"),
@@ -71,12 +72,9 @@ fn setup_send() -> (
         peer_dead_rx,
         queue_dispatcher,
         WakeNowSender,
-        clock.clone(),
-        crate::endpoint::DEFAULT_DEAD_PEER_COOLDOWN,
         tasks::PeerDeadCounters {
             events: registry.register("test.peer_dead.events"),
             broadcasted: registry.register("test.peer_dead.broadcasted"),
-            cooldown_suppressed: registry.register("test.peer_dead.cooldown_suppressed"),
         },
     );
     async move { rx.drain_budgeted(Some(32)).await }.spawn();
@@ -296,6 +294,7 @@ fn setup_recv() -> (
         clock.clone(),
         q_gauge,
         recv_cache.clone(),
+        crate::endpoint::DEFAULT_DEAD_PEER_COOLDOWN,
         registry.register("idle.recv.expired"),
         registry.register("idle.recv.rescheduled"),
         registry.register_nominal_timer("idle.recv.lifetime", "recv.0"),
