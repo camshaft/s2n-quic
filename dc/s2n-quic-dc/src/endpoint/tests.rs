@@ -1499,11 +1499,11 @@ fn five_node_random_chatter_settles_after_stop() {
                 Duration::from_secs(CHAT_SECONDS as u64).sleep().await;
                 monitor_active.store(true, Ordering::Relaxed);
                 SETTLE_WINDOW.sleep().await;
-                monitor_active.store(false, Ordering::Relaxed);
                 for handle in node_handles {
                     handle.await.expect("node task should complete");
                 }
                 let sent = packets_after_stop.load(Ordering::Relaxed);
+                monitor_active.store(false, Ordering::Relaxed);
                 assert_eq!(
                     sent, 0,
                     "endpoints sent {sent} packet(s) after chatter stopped"
