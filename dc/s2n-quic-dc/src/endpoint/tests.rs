@@ -8,7 +8,7 @@
 //! group so it is treated as a separate machine from the network perspective.
 
 use crate::{
-    stream::endpoint::testing::sim::{Client, Server, SERVER_PORT},
+    stream::endpoint::testing::sim::{Client, Peer, Server, SERVER_PORT},
     tracing::*,
 };
 use bach::time::timeout;
@@ -1397,8 +1397,8 @@ fn five_node_random_chatter_settles_after_stop() {
 
         for (node_idx, node_name) in NODE_NAMES.iter().enumerate() {
             async move {
-                let server = Server::new();
-                let mut acceptor = server
+                let mut peer = Peer::new();
+                let mut acceptor = peer
                     .register_acceptor_channel(acceptor_id, 256)
                     .expect("acceptor registration");
 
@@ -1436,7 +1436,6 @@ fn five_node_random_chatter_settles_after_stop() {
                 }
                 .spawn();
 
-                let mut client = Client::new();
                 let rejection_sampling_threshold =
                     ((u8::MAX as usize + 1) / NODE_NAMES.len()) * NODE_NAMES.len();
                 for tick in 0..CHAT_SECONDS {
@@ -1452,9 +1451,9 @@ fn five_node_random_chatter_settles_after_stop() {
                         }
                     };
 
-                    let peer = format!("{}:0", NODE_NAMES[selected_peer_idx]);
-                    let stream = client
-                        .connect(peer, acceptor_id)
+                    let remote = format!("{}:0", NODE_NAMES[selected_peer_idx]);
+                    let stream = peer
+                        .connect(remote, acceptor_id)
                         .await
                         .expect("client connect");
                     let (mut reader, mut writer) = stream.into_split();
