@@ -463,8 +463,9 @@ impl Entry {
         now: crate::time::precision::Timestamp,
         cooldown: Duration,
     ) -> bool {
+        let cooldown_nanos = cooldown.as_nanos().min(u64::MAX as u128) as u64;
         let previous = self.dead_at.load(Ordering::Acquire);
-        if previous != u64::MAX && now.nanos.saturating_sub(previous) < cooldown.as_nanos() as u64 {
+        if previous != u64::MAX && now.nanos.saturating_sub(previous) < cooldown_nanos {
             return false;
         }
         self.dead_at.store(now.nanos, Ordering::Release);
@@ -477,8 +478,9 @@ impl Entry {
         now: crate::time::precision::Timestamp,
         cooldown: Duration,
     ) -> bool {
+        let cooldown_nanos = cooldown.as_nanos().min(u64::MAX as u128) as u64;
         let dead_at = self.dead_at.load(Ordering::Acquire);
-        dead_at != u64::MAX && now.nanos.saturating_sub(dead_at) < cooldown.as_nanos() as u64
+        dead_at != u64::MAX && now.nanos.saturating_sub(dead_at) < cooldown_nanos
     }
 
     pub fn is_idle_expired(&self, now: crate::time::precision::Timestamp) -> bool {
