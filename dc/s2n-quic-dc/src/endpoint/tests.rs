@@ -17,7 +17,7 @@ use s2n_quic_core::varint::VarInt;
 use std::{
     io,
     sync::{
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc,
     },
     time::Duration,
@@ -1366,6 +1366,122 @@ fn multi_server_concurrent_loss_sim() {
         .group("client")
         .primary()
         .spawn();
+    });
+}
+
+#[test]
+fn five_node_random_chatter_settles_after_stop() {
+    use crate::testing::ext::*;
+
+    const NODE_NAMES: [&str; 5] = ["node_0", "node_1", "node_2", "node_3", "node_4"];
+    const CHAT_SECONDS: usize = 60;
+    const SETTLE_WINDOW: Duration = Duration::from_secs(5);
+
+    let _no_snap = crate::testing::without_snapshots();
+    crate::testing::sim(|| {
+        let acceptor_id = VarInt::from_u8(7);
+        let monitor_active = Arc::new(AtomicBool::new(false));
+        let packets_after_stop = Arc::new(AtomicUsize::new(0));
+
+        {
+            let monitor_active = monitor_active.clone();
+            let packets_after_stop = packets_after_stop.clone();
+            bach::net::monitor::on_packet_sent(move |_packet| {
+                if monitor_active.load(Ordering::Relaxed) {
+                    packets_after_stop.fetch_add(1, Ordering::Relaxed);
+                }
+                bach::net::monitor::Command::Pass
+            });
+        }
+
+        for (node_idx, node_name) in NODE_NAMES.iter().enumerate() {
+            async move {
+                let server = Server::new();
+                let mut acceptor = server
+                    .register_acceptor_channel(acceptor_id, 256)
+                    .expect("acceptor registration");
+
+                async move {
+                    while let Some(stream) = acceptor.recv().await {
+                        async move {
+                            let stream = stream.validate().await.expect("server validate");
+                            let (mut reader, mut writer) = stream.into_split();
+                            let mut buf = BytesMut::with_capacity(256);
+
+                            loop {
+                                if reader.read_into(&mut buf).await.expect("server read") == 0 {
+                                    break;
+                                }
+                            }
+
+                            let mut echo = Bytes::copy_from_slice(&buf);
+                            writer
+                                .write_all_from_fin(&mut echo)
+                                .await
+                                .expect("server write");
+                        }
+                        .spawn();
+                    }
+                }
+                .spawn();
+
+                let mut client = Client::new();
+                for tick in 0..CHAT_SECONDS {
+                    let mut peer_idx = bach::rand::any::<u8>() as usize % (NODE_NAMES.len() - 1);
+                    if peer_idx >= node_idx {
+                        peer_idx += 1;
+                    }
+
+                    let peer = format!("{}:0", NODE_NAMES[peer_idx]);
+                    let stream = client
+                        .connect(peer, acceptor_id)
+                        .await
+                        .expect("client connect");
+                    let (mut reader, mut writer) = stream.into_split();
+
+                    let payload = format!("{node_idx}->{peer_idx}@{tick}");
+                    let mut data = Bytes::from(payload.clone());
+                    writer
+                        .write_all_from_fin(&mut data)
+                        .await
+                        .expect("client write");
+
+                    let mut buf = BytesMut::with_capacity(256);
+                    loop {
+                        if reader.read_into(&mut buf).await.expect("client read") == 0 {
+                            break;
+                        }
+                    }
+
+                    assert_eq!(
+                        &buf[..],
+                        payload.as_bytes(),
+                        "echo mismatch for node {node_idx} tick {tick}"
+                    );
+                    1.s().sleep().await;
+                }
+            }
+            .group(*node_name)
+            .spawn();
+        }
+
+        {
+            let monitor_active = monitor_active.clone();
+            let packets_after_stop = packets_after_stop.clone();
+            async move {
+                60.s().sleep().await;
+                monitor_active.store(true, Ordering::Relaxed);
+                SETTLE_WINDOW.sleep().await;
+                let sent = packets_after_stop.load(Ordering::Relaxed);
+                assert_eq!(
+                    sent, 0,
+                    "endpoints sent {sent} packet(s) after chatter stopped"
+                );
+            }
+            .group("observer")
+            .primary()
+            .spawn();
+        }
     });
 }
 
