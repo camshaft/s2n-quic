@@ -1412,6 +1412,7 @@ fn five_node_random_chatter_settles_after_stop() {
                                 if reader.read_into(&mut buf).await.expect("server read") == 0 {
                                     break;
                                 }
+                                assert!(buf.len() <= 256, "unexpected oversized request payload");
                             }
 
                             let mut response_data = buf.freeze();
@@ -1451,6 +1452,7 @@ fn five_node_random_chatter_settles_after_stop() {
                         if reader.read_into(&mut buf).await.expect("client read") == 0 {
                             break;
                         }
+                        assert!(buf.len() <= 256, "unexpected oversized response payload");
                     }
 
                     assert_eq!(
