@@ -1414,7 +1414,7 @@ fn five_node_random_chatter_settles_after_stop() {
                                 }
                             }
 
-                            let mut response_data = Bytes::copy_from_slice(&buf);
+                            let mut response_data = buf.freeze();
                             writer
                                 .write_all_from_fin(&mut response_data)
                                 .await
@@ -1440,7 +1440,7 @@ fn five_node_random_chatter_settles_after_stop() {
                     let (mut reader, mut writer) = stream.into_split();
 
                     let payload = format!("{node_idx}->{peer_idx}@{tick}");
-                    let mut data = Bytes::from(payload.clone());
+                    let mut data = Bytes::copy_from_slice(payload.as_bytes());
                     writer
                         .write_all_from_fin(&mut data)
                         .await
