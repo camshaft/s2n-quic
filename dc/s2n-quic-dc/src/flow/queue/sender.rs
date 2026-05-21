@@ -82,6 +82,14 @@ impl<S: 'static, C: 'static, Key: 'static, const PAGE_SIZE: usize> Senders<S, C,
     }
 
     #[inline]
+    /// Iterates every currently known sender page entry and invokes `f`.
+    ///
+    /// # Performance
+    ///
+    /// This is intentionally expensive: it performs an O(total_queues) walk across
+    /// the entire sender table and should only be used for rare control-plane fanout
+    /// operations (for example, credential-wide invalidations). Never call this on
+    /// hot data-path packet/frame processing.
     pub fn for_each_sender(&mut self, mut f: impl FnMut(&Sender<S, C, Key>)) {
         self.refresh_pages();
 

@@ -16,7 +16,7 @@ use crate::{
     },
     flow,
     intrusive::Entry,
-    socket::channel::{UnboundedSender as _, intrusive::unsync},
+    socket::channel::{ReceiverExt as _, UnboundedSender as _, intrusive::unsync},
     testing::{ext::*, sim},
     time::{bach::Clock, precision},
 };
@@ -47,6 +47,7 @@ fn setup_send() -> (
     let (completed_tx, completed_rx) = unsync::new::<Frame>();
     let queue_allocator = msg::queue::Allocator::new();
     let queue_dispatcher = queue_allocator.dispatcher();
+    let (peer_dead_tx, peer_dead_rx) = unsync::new::<tasks::PeerDead>();
     let q_gauge = registry.register_queue_gauge("test.idle_wheel");
 
     tasks::send_idle_wheel_drain(
@@ -57,8 +58,7 @@ fn setup_send() -> (
         send_caches.clone(),
         sender_idx_to_local,
         completed_tx,
-        queue_dispatcher,
-        WakeNowSender,
+        peer_dead_tx,
         registry.register("idle.send.expired"),
         registry.register("idle.send.rescheduled"),
         registry.register_nominal_timer("idle.send.lifetime", "send.0"),
@@ -66,6 +66,20 @@ fn setup_send() -> (
         registry.register_nominal_task("task.idle_wheel", "send.0"),
     )
     .spawn();
+
+    let rx = tasks::peer_dead_broadcast(
+        peer_dead_rx,
+        queue_dispatcher,
+        WakeNowSender,
+        clock.clone(),
+        crate::endpoint::DEFAULT_DEAD_PEER_COOLDOWN,
+        tasks::PeerDeadCounters {
+            events: registry.register("test.peer_dead.events"),
+            broadcasted: registry.register("test.peer_dead.broadcasted"),
+            cooldown_suppressed: registry.register("test.peer_dead.cooldown_suppressed"),
+        },
+    );
+    async move { rx.drain_budgeted(Some(32)).await }.spawn();
 
     (
         send_caches,
@@ -79,6 +93,7 @@ fn setup_send() -> (
 
 #[test]
 fn send_idle_wheel_expires_inactive_context() {
+    let _guard = crate::testing::without_snapshots();
     sim(|| {
         let (send_caches, mut idle_wheel_tx, mut completed_rx, clock, _registry, _queue_allocator) =
             setup_send();
@@ -132,6 +147,7 @@ fn send_idle_wheel_expires_inactive_context() {
 
 #[test]
 fn send_idle_wheel_reschedules_active_context() {
+    let _guard = crate::testing::without_snapshots();
     sim(|| {
         let (send_caches, mut idle_wheel_tx, _completed_rx, clock, _registry, _queue_allocator) =
             setup_send();

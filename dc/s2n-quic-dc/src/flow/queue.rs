@@ -248,6 +248,13 @@ where
     }
 
     #[inline]
+    /// Sends to both stream+control halves for every queue matching `params`.
+    ///
+    /// # Performance
+    ///
+    /// This is a global scan. Internally it walks the entire sender table and runs
+    /// per-queue validation, so the cost is O(total_queues) and can be very high at
+    /// large concurrency. Use sparingly for rare control-plane events only.
     pub fn send_both_by_request(
         &mut self,
         params: &K::Request,

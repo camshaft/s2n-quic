@@ -1,14 +1,14 @@
 // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 use super::{
+    Map,
     size_of::SizeOf,
     status::{Dedup, IsRetired},
-    Map,
 };
 use crate::{
     credentials::{self, Credentials},
     endpoint::id::LocalSenderId,
-    packet::{secret_control as control, WireVersion},
+    packet::{WireVersion, secret_control as control},
     path::secret::{
         open, receiver,
         schedule::{self, Initiator},
@@ -22,8 +22,8 @@ use std::{
     any::Any,
     net::SocketAddr,
     sync::{
-        atomic::{AtomicU16, AtomicU32, AtomicU64, AtomicU8, Ordering},
         Arc,
+        atomic::{AtomicU8, AtomicU16, AtomicU32, AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -59,6 +59,7 @@ pub struct Entry {
     accessed: AtomicU8,
     application_data: Option<ApplicationData>,
     last_activity: AtomicU64,
+    dead_at: AtomicU64,
     /// The peer's data recv addresses, learned via the post-handshake exchange.
     peer_data_addrs: PeerDataAddrs,
     /// Per-socket-sender load scores encoded as u64 nanoseconds.
@@ -90,6 +91,7 @@ impl SizeOf for Entry {
             accessed,
             application_data,
             last_activity,
+            dead_at,
             peer_data_addrs,
             sender_load_scores,
         } = self;
@@ -103,6 +105,7 @@ impl SizeOf for Entry {
             + accessed.size()
             + application_data.size()
             + last_activity.size()
+            + dead_at.size()
             + std::mem::size_of::<PeerDataAddrs>()
             + peer_data_addrs.get().map_or(0, |a| {
                 a.len() * std::mem::size_of::<s2n_quic_core::inet::SocketAddressV6>()
@@ -176,6 +179,7 @@ impl Entry {
             accessed: AtomicU8::new(0),
             application_data,
             last_activity: AtomicU64::new(0),
+            dead_at: AtomicU64::new(u64::MAX),
             peer_data_addrs: PeerDataAddrs::default(),
             sender_load_scores: Self::init_load_scores(socket_sender_count),
         }
@@ -448,6 +452,33 @@ impl Entry {
     pub fn last_activity(&self) -> crate::time::precision::Timestamp {
         let nanos = self.last_activity.load(Ordering::Acquire);
         crate::time::precision::Timestamp { nanos }
+    }
+
+    /// Marks the entry as dead at `now` unless it was already marked dead within `cooldown`.
+    ///
+    /// Returns `true` when the mark was updated and downstream dead-peer fanout work should run.
+    #[inline]
+    pub fn mark_dead_if_cooldown_elapsed(
+        &self,
+        now: crate::time::precision::Timestamp,
+        cooldown: Duration,
+    ) -> bool {
+        let previous = self.dead_at.load(Ordering::Acquire);
+        if previous != u64::MAX && now.nanos.saturating_sub(previous) < cooldown.as_nanos() as u64 {
+            return false;
+        }
+        self.dead_at.store(now.nanos, Ordering::Release);
+        true
+    }
+
+    #[inline]
+    pub fn is_dead_during_cooldown(
+        &self,
+        now: crate::time::precision::Timestamp,
+        cooldown: Duration,
+    ) -> bool {
+        let dead_at = self.dead_at.load(Ordering::Acquire);
+        dead_at != u64::MAX && now.nanos.saturating_sub(dead_at) < cooldown.as_nanos() as u64
     }
 
     pub fn is_idle_expired(&self, now: crate::time::precision::Timestamp) -> bool {

@@ -4,7 +4,7 @@
 use crate::{
     counter::{self, GaugedReceiver, GaugedSender, QueueGauge},
     endpoint::{
-        self,
+        self, Budgets,
         combinator::{
             AckProcessor, Assembler, AssemblerCounters, BatchFramesByPathSecret,
             CompletionDispatcher, FrameBatch, PathSecretMapEntry, PickTwo,
@@ -12,17 +12,17 @@ use crate::{
         dispatch,
         frame::{self, Frame, Priority, PriorityStorage, SubmissionReceiver},
         id::{IdJoin, IdMap, LocalSendSocketId, LocalSenderId, RecvDispatchWorkerId, SendWorkerId},
-        msg, send, Budgets,
+        msg, send,
     },
     intrusive::{Entry, Queue},
     packet::datagram::decoder::Packet,
     runtime::Spawner,
     socket::{
         channel::{
-            intrusive::{self, unsync},
             Budget, FilterMap, Flatten, FlattenList, FlattenSegments, InspectErr, Map, Paced,
             Priority as PriorityRx, Receiver, ReceiverExt as _, RouterAdapter, SocketReceiver,
             SocketSender, UnboundedSender,
+            intrusive::{self, unsync},
         },
         pool::descriptor,
         rate::Rate,
@@ -219,7 +219,7 @@ pub fn send_worker<Socket, Clk, WakerSink, AckComp>(
     frame_tx: frame::SubmissionSender,
     ack_completions_tx: AckComp,
     waker_sink: WakerSink,
-    queue_dispatcher: msg::queue::Dispatcher,
+    peer_dead_tx: impl UnboundedSender<Entry<PeerDead>> + Clone + 'static,
     budgets: Budgets,
     counter_registry: counter::Registry,
 ) where
@@ -556,8 +556,7 @@ pub fn send_worker<Socket, Clk, WakerSink, AckComp>(
             send_caches.clone(),
             sender_idx_to_local.clone(),
             idle_expired_completed_tx,
-            queue_dispatcher,
-            waker_sink,
+            peer_dead_tx.clone(),
             counter_registry.register("idle.send.expired"),
             counter_registry.register("idle.send.rescheduled"),
             counter_registry.register_nominal_timer("idle.send.lifetime", &variant),
@@ -1006,8 +1005,7 @@ pub async fn send_idle_wheel_drain<Clk, WakerSink>(
     send_caches: IdMap<LocalSendSocketId, Rc<RefCell<send::Cache>>>,
     sender_idx_to_local: IdMap<LocalSenderId, LocalSendSocketId>,
     mut completed_tx: impl UnboundedSender<Entry<Frame>>,
-    mut queue_dispatcher: msg::queue::Dispatcher,
-    mut waker_sink: WakerSink,
+    mut peer_dead_tx: WakerSink,
     idle_expired: counter::Counter,
     idle_rescheduled: counter::Counter,
     idle_lifetime: counter::Timer,
@@ -1015,7 +1013,7 @@ pub async fn send_idle_wheel_drain<Clk, WakerSink>(
     task_counter: counter::Task,
 ) where
     Clk: precision::Clock,
-    WakerSink: UnboundedSender<crate::flow::queue::AutoWake>,
+    WakerSink: UnboundedSender<Entry<PeerDead>>,
 {
     let timer = clock.timer();
     wheel_drain::<_, _, _, { wheel::SECOND_GRANULARITY }>(
@@ -1035,6 +1033,7 @@ pub async fn send_idle_wheel_drain<Clk, WakerSink>(
                 let ctx = context.borrow();
                 if ctx.path_secret_entry.is_idle_expired(now) {
                     let id = *ctx.path_secret_entry.id();
+                    let path_secret_entry = ctx.path_secret_entry.clone();
                     let local_id = sender_idx_to_local[ctx.sender_idx];
                     let lifetime = now.duration_since(ctx.created_at);
                     drop(ctx);
@@ -1052,7 +1051,10 @@ pub async fn send_idle_wheel_drain<Clk, WakerSink>(
                         counters.on_inflight_leaked_on_invalidate(discarded_bytes as u64);
                     }
 
-                    reset_flow_queues(&mut queue_dispatcher, &id, &mut waker_sink);
+                    let _ = peer_dead_tx.send(Entry::new(PeerDead {
+                        credential_id: id,
+                        path_secret_entry,
+                    }));
 
                     idle_expired.add(1);
                     idle_lifetime.record(lifetime);
@@ -1069,44 +1071,6 @@ pub async fn send_idle_wheel_drain<Clk, WakerSink>(
         task_counter,
     )
     .await;
-}
-
-/// Sends resets to local flow queues associated with an invalidated send context.
-///
-/// For each target collected during frame drain, sends a reset to the queue. `send_both`
-/// validates internally — if the queue was recycled and the credentials/stream_id no
-/// longer match, the send silently no-ops.
-fn reset_flow_queues(
-    queue_dispatcher: &mut msg::queue::Dispatcher,
-    credential_id: &crate::credentials::Id,
-    waker_sink: &mut impl UnboundedSender<crate::flow::queue::AutoWake>,
-) {
-    use crate::{endpoint::error::IDLE_TIMEOUT, flow};
-
-    let request = flow::Request {
-        credential_id: *credential_id,
-        stream_id: None,
-    };
-
-    queue_dispatcher.send_both_by_request(
-        &request,
-        || {
-            msg::Stream::Reset {
-                error_code: IDLE_TIMEOUT,
-            }
-            .into()
-        },
-        || {
-            msg::Control::Reset {
-                error_code: IDLE_TIMEOUT,
-            }
-            .into()
-        },
-        |waker_a, waker_b| {
-            let _ = waker_sink.send(waker_a);
-            let _ = waker_sink.send(waker_b);
-        },
-    );
 }
 
 pub async fn recv_idle_wheel_drain<Clk>(
@@ -1545,6 +1509,74 @@ where
 }
 
 // ── Invalidation tasks ───────────────────────────────────────────────────
+
+#[derive(Clone, Debug)]
+pub struct PeerDead {
+    pub credential_id: crate::credentials::Id,
+    pub path_secret_entry: Arc<crate::path::secret::map::Entry>,
+}
+
+#[derive(Clone)]
+pub struct PeerDeadCounters {
+    pub events: counter::Counter,
+    pub broadcasted: counter::Counter,
+    pub cooldown_suppressed: counter::Counter,
+}
+
+pub fn peer_dead_broadcast<R, Clk, WakerSink>(
+    peer_dead_rx: R,
+    mut queue_dispatcher: msg::queue::Dispatcher,
+    mut waker_sink: WakerSink,
+    clock: Clk,
+    cooldown: core::time::Duration,
+    counters: PeerDeadCounters,
+) -> impl Receiver<()>
+where
+    R: Receiver<Entry<PeerDead>>,
+    Clk: precision::Clock,
+    WakerSink: UnboundedSender<crate::flow::queue::AutoWake>,
+{
+    use crate::{endpoint::error::IDLE_TIMEOUT, flow};
+
+    Map::new(peer_dead_rx, move |entry: Entry<PeerDead>| {
+        counters.events.add(1);
+        let peer_dead = entry.into_inner();
+        let now = clock.now();
+        let should_broadcast = peer_dead
+            .path_secret_entry
+            .mark_dead_if_cooldown_elapsed(now, cooldown);
+        if !should_broadcast {
+            counters.cooldown_suppressed.add(1);
+            return;
+        }
+
+        let request = flow::Request {
+            credential_id: peer_dead.credential_id,
+            stream_id: None,
+        };
+
+        queue_dispatcher.send_both_by_request(
+            &request,
+            || {
+                msg::Stream::Reset {
+                    error_code: IDLE_TIMEOUT,
+                }
+                .into()
+            },
+            || {
+                msg::Control::Reset {
+                    error_code: IDLE_TIMEOUT,
+                }
+                .into()
+            },
+            |waker_a, waker_b| {
+                let _ = waker_sink.send(waker_a);
+                let _ = waker_sink.send(waker_b);
+            },
+        );
+        counters.broadcasted.add(1);
+    })
+}
 
 pub fn send_invalidation<R>(
     invalidation_rx: R,
