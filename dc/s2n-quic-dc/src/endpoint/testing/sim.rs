@@ -460,9 +460,14 @@ pub fn lookup_sim_map(addr: SocketAddr) -> Option<PathSecretMap> {
 
 /// High-level sim peer that combines server + client behavior on one endpoint.
 ///
-/// [`Peer::new`] binds to [`SERVER_PORT`] and returns a wrapper that can both
-/// register acceptors and initiate outbound connects, all sharing the same
-/// underlying endpoint and path-secret map.
+/// [`Peer::new`] returns the per-group endpoint wrapper that can both register
+/// acceptors and initiate outbound connects while sharing one underlying
+/// endpoint and path-secret map.
+///
+/// When no endpoint exists yet for the current Bach group, it is created with
+/// a bind hint of [`SERVER_PORT`]. If a [`Client`] or [`Server`] already
+/// created the group endpoint first, [`Peer::new`] reuses that existing
+/// endpoint and its original bind address.
 pub struct Peer {
     endpoint: Arc<Endpoint>,
     queue_allocator: msg::queue::Allocator,

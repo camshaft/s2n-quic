@@ -1395,8 +1395,9 @@ fn five_node_random_chatter_settles_after_stop() {
             });
         }
 
+        let mut node_handles = Vec::with_capacity(NODE_NAMES.len());
         for (node_idx, node_name) in NODE_NAMES.iter().enumerate() {
-            async move {
+            let handle = async move {
                 let mut peer = Peer::new();
                 let mut acceptor = peer
                     .register_acceptor_channel(acceptor_id, 256)
@@ -1483,18 +1484,25 @@ fn five_node_random_chatter_settles_after_stop() {
                     );
                     1.s().sleep().await;
                 }
+                SETTLE_WINDOW.sleep().await;
             }
             .group(*node_name)
             .spawn();
+            node_handles.push(handle);
         }
 
         {
             let monitor_active = monitor_active.clone();
             let packets_after_stop = packets_after_stop.clone();
+            let node_handles = node_handles;
             async move {
                 Duration::from_secs(CHAT_SECONDS as u64).sleep().await;
                 monitor_active.store(true, Ordering::Relaxed);
                 SETTLE_WINDOW.sleep().await;
+                monitor_active.store(false, Ordering::Relaxed);
+                for handle in node_handles {
+                    handle.await.expect("node task should complete");
+                }
                 let sent = packets_after_stop.load(Ordering::Relaxed);
                 assert_eq!(
                     sent, 0,
