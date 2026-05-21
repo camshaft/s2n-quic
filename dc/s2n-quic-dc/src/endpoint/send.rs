@@ -677,8 +677,15 @@ impl Context {
         interest
     }
 
+    #[track_caller]
     #[inline]
     pub fn touch_peer_activity(&mut self, now: precision::Timestamp) {
+        let caller = std::panic::Location::caller();
+        trace!(
+            caller = %caller,
+            now_ns = now.nanos,
+            "Context::touch_peer_activity"
+        );
         self.last_peer_activity = now;
     }
 

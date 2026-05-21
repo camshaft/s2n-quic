@@ -441,7 +441,14 @@ impl Entry {
         self.retired.retired_at()
     }
 
+    #[track_caller]
     pub fn touch_activity(&self, now: crate::time::precision::Timestamp) {
+        let caller = std::panic::Location::caller();
+        trace!(
+            caller = %caller,
+            now_ns = now.nanos,
+            "PathSecretEntry::touch_activity"
+        );
         self.last_activity.store(now.nanos, Ordering::Release);
     }
 
