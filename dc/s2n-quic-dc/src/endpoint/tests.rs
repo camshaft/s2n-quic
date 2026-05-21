@@ -1511,6 +1511,7 @@ fn zombie_flow_not_invalidated_when_path_has_other_activity() {
                 let before = probes_after_idle.load(Ordering::Relaxed);
                 30.s().sleep().await;
                 let after = probes_after_idle.load(Ordering::Relaxed);
+                info!("zombie probe counter before={before} after={after}");
 
                 if after > before {
                     zombie_still_probing.store(true, Ordering::Relaxed);

@@ -89,7 +89,7 @@ fn send_idle_wheel_expires_inactive_context() {
             let timeout = c.path_secret_entry.idle_timeout();
             c.idle_wheel.target_time = Some(precision::Clock::now(&clock) + timeout);
         }
-        let _ = idle_wheel_tx.send(ctx);
+        let _ = idle_wheel_tx.send(ctx.clone());
 
         let send_caches = send_caches.clone();
         async move {
@@ -137,7 +137,7 @@ fn send_idle_wheel_reschedules_active_context() {
             let timeout = c.path_secret_entry.idle_timeout();
             c.idle_wheel.target_time = Some(precision::Clock::now(&clock) + timeout);
         }
-        let _ = idle_wheel_tx.send(ctx);
+        let _ = idle_wheel_tx.send(ctx.clone());
 
         let send_caches = send_caches.clone();
         let ctx = ctx.clone();

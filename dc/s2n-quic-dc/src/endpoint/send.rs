@@ -689,6 +689,16 @@ impl Context {
         elapsed > timeout.as_nanos() as u64
     }
 
+    #[inline]
+    pub fn has_stale_inflight(&self, now: precision::Timestamp) -> bool {
+        let Some(time_sent) = self.inflight.oldest_time_sent() else {
+            return false;
+        };
+        let now: s2n_quic_core::time::Timestamp = now.into();
+        let elapsed = now.saturating_duration_since(time_sent);
+        elapsed > self.path_secret_entry.idle_timeout()
+    }
+
     /// Compute wheel interest after a state change
     pub(crate) fn wheel_interest<Clk>(&mut self, clock: &Clk) -> WheelInterest
     where

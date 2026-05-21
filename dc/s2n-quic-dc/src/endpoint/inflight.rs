@@ -11,6 +11,7 @@
 use crate::{congestion, counter::QueueGauge, endpoint::frame::Frame, intrusive::Queue};
 use s2n_quic_core::{
     packet::number::{Map as Inner, PacketNumber, PacketNumberRange},
+    time::Timestamp,
     varint::VarInt,
 };
 
@@ -143,6 +144,14 @@ impl Map {
             .iter()
             .find(|(_, p)| !p.frames.is_empty())
             .map(|(pn, _)| pn)
+    }
+
+    /// Returns the transmit timestamp of the oldest inflight packet with tx metadata.
+    #[inline]
+    pub fn oldest_time_sent(&self) -> Option<Timestamp> {
+        self.inner
+            .iter()
+            .find_map(|(_, p)| p.transmission_info.as_ref().map(|info| info.time_sent))
     }
 
     /// Take the frames from the oldest non-shell inflight entry for a PTO probe.
