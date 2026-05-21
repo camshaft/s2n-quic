@@ -71,13 +71,14 @@ fn send_idle_wheel_expires_inactive_context() {
         let (send_caches, mut idle_wheel_tx, mut completed_rx, clock, _registry) = setup_send();
 
         let pse = test_entry();
-        // Simulate initial activity so is_idle_expired can fire
-        pse.touch_activity(precision::Clock::now(&clock));
 
         let ctx = send_caches[LocalSendSocketId::new(0)]
             .borrow_mut()
             .get_or_insert(&pse, &clock)
             .unwrap();
+        // Simulate initial peer activity so is_idle_expired can fire.
+        ctx.borrow_mut()
+            .touch_peer_activity(precision::Clock::now(&clock));
 
         // Push a frame so invalidation has something to drain
         ctx.borrow_mut().queues[1].push_back(test_frame(&pse));
@@ -126,8 +127,9 @@ fn send_idle_wheel_reschedules_active_context() {
             .get_or_insert(&pse, &clock)
             .unwrap();
 
-        // Touch activity so the entry has a last_activity timestamp
-        pse.touch_activity(precision::Clock::now(&clock));
+        // Touch peer activity so the context has an activity timestamp.
+        ctx.borrow_mut()
+            .touch_peer_activity(precision::Clock::now(&clock));
 
         // Schedule into the idle wheel
         {
@@ -138,11 +140,12 @@ fn send_idle_wheel_reschedules_active_context() {
         let _ = idle_wheel_tx.send(ctx);
 
         let send_caches = send_caches.clone();
-        let pse = pse.clone();
+        let ctx = ctx.clone();
         async move {
             // Touch activity at 30s
             30.s().sleep().await;
-            pse.touch_activity(precision::Clock::now(&Clock::default()));
+            ctx.borrow_mut()
+                .touch_peer_activity(precision::Clock::now(&Clock::default()));
 
             // At 70s total the context should still be alive (activity at 30s → expires at 90s)
             40.s().sleep().await;

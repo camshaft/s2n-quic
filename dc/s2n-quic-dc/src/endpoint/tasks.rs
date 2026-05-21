@@ -1035,7 +1035,7 @@ pub async fn send_idle_wheel_drain<Clk, WakerSink>(
             move |context: Rc<RefCell<send::Context>>| {
                 let now = clock.now();
                 let ctx = context.borrow();
-                if ctx.path_secret_entry.is_idle_expired(now) {
+                if ctx.is_idle_expired(now) {
                     let id = *ctx.path_secret_entry.id();
                     let local_id = sender_idx_to_local[ctx.sender_idx];
                     let lifetime = now.duration_since(ctx.created_at);

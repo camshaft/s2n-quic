@@ -524,6 +524,8 @@ pub(crate) struct Context {
     /// Last-seen ECN counts from peer ACK frames; used to compute deltas for the CCA.
     pub peer_ecn_counts: EcnCounts,
     pub created_at: precision::Timestamp,
+    /// Last time this send context observed peer activity (ACK traffic).
+    pub last_peer_activity: precision::Timestamp,
     /// RTT sampler for ACK-only (read-heavy) sends.
     ///
     /// When `inflight` is empty we have no ack-eliciting packets in flight and
@@ -593,6 +595,7 @@ impl Context {
             idle_wheel: WheelLinks::new(),
             peer_ecn_counts: EcnCounts::default(),
             created_at: clock.now(),
+            last_peer_activity: clock.now(),
             rtt_tracker: AckRttTracker::default(),
         })
     }
@@ -645,6 +648,7 @@ impl Context {
         Clk: s2n_quic_core::time::Clock + precision::Clock + ?Sized,
         Rand: random::Generator,
     {
+        self.touch_peer_activity(clock.now());
         let frames_iter = crate::packet::control::decoder::ControlFramesMut::new(payload);
 
         for frame in frames_iter {
@@ -671,6 +675,18 @@ impl Context {
         let interest = self.wheel_interest(clock);
         self.invariants();
         interest
+    }
+
+    #[inline]
+    pub fn touch_peer_activity(&mut self, now: precision::Timestamp) {
+        self.last_peer_activity = now;
+    }
+
+    #[inline]
+    pub fn is_idle_expired(&self, now: precision::Timestamp) -> bool {
+        let elapsed = now.nanos_since(self.last_peer_activity);
+        let timeout = self.path_secret_entry.idle_timeout();
+        elapsed > timeout.as_nanos() as u64
     }
 
     /// Compute wheel interest after a state change
