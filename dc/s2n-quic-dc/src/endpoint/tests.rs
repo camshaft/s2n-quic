@@ -1376,6 +1376,7 @@ fn five_node_random_chatter_settles_after_stop() {
     const NODE_NAMES: [&str; 5] = ["node_0", "node_1", "node_2", "node_3", "node_4"];
     const CHAT_SECONDS: usize = 60;
     const SETTLE_WINDOW: Duration = Duration::from_secs(5);
+    const MAX_PAYLOAD_SIZE: usize = 256;
 
     let _no_snap = crate::testing::without_snapshots();
     crate::testing::sim(|| {
@@ -1406,13 +1407,16 @@ fn five_node_random_chatter_settles_after_stop() {
                         async move {
                             let stream = stream.validate().await.expect("server validate");
                             let (mut reader, mut writer) = stream.into_split();
-                            let mut buf = BytesMut::with_capacity(256);
+                            let mut buf = BytesMut::with_capacity(MAX_PAYLOAD_SIZE);
 
                             loop {
                                 if reader.read_into(&mut buf).await.expect("server read") == 0 {
                                     break;
                                 }
-                                assert!(buf.len() <= 256, "unexpected oversized request payload");
+                                assert!(
+                                    buf.len() <= MAX_PAYLOAD_SIZE,
+                                    "unexpected oversized request payload"
+                                );
                             }
 
                             let mut response_data = buf.freeze();
@@ -1429,11 +1433,13 @@ fn five_node_random_chatter_settles_after_stop() {
                 let mut client = Client::new();
                 for tick in 0..CHAT_SECONDS {
                     let mut peer_idx = node_idx;
+                    let unbiased_threshold =
+                        ((u8::MAX as usize + 1) / NODE_NAMES.len()) * NODE_NAMES.len();
                     while peer_idx == node_idx {
                         let candidate = loop {
                             let raw = bach::rand::any::<u8>() as usize;
-                            // Rejection sample to avoid modulo bias for length 5.
-                            if raw < u8::MAX as usize {
+                            // Rejection sampling to avoid modulo bias.
+                            if raw < unbiased_threshold {
                                 break raw % NODE_NAMES.len();
                             }
                         };
@@ -1454,12 +1460,15 @@ fn five_node_random_chatter_settles_after_stop() {
                         .await
                         .expect("client write");
 
-                    let mut buf = BytesMut::with_capacity(256);
+                    let mut buf = BytesMut::with_capacity(MAX_PAYLOAD_SIZE);
                     loop {
                         if reader.read_into(&mut buf).await.expect("client read") == 0 {
                             break;
                         }
-                        assert!(buf.len() <= 256, "unexpected oversized response payload");
+                        assert!(
+                            buf.len() <= MAX_PAYLOAD_SIZE,
+                            "unexpected oversized response payload"
+                        );
                     }
 
                     assert_eq!(
