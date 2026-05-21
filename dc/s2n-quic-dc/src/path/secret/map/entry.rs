@@ -133,6 +133,16 @@ impl SizeOf for AtomicU32 {}
 impl SizeOf for AtomicI64 {}
 
 impl Entry {
+    #[inline]
+    fn timestamp_to_millis(timestamp: crate::time::precision::Timestamp) -> i64 {
+        (timestamp.nanos / 1_000_000).min(i64::MAX as u64) as i64
+    }
+
+    #[inline]
+    fn duration_to_millis(duration: Duration) -> i64 {
+        duration.as_millis().min(i64::MAX as u128) as i64
+    }
+
     pub fn new(
         peer: SocketAddr,
         secret: schedule::Secret,
@@ -464,8 +474,8 @@ impl Entry {
         now: crate::time::precision::Timestamp,
         cooldown: Duration,
     ) -> bool {
-        let now_ms = (now.nanos / 1_000_000).min(i64::MAX as u64) as i64;
-        let cooldown_ms = cooldown.as_millis().min(i64::MAX as u128) as i64;
+        let now_ms = Self::timestamp_to_millis(now);
+        let cooldown_ms = Self::duration_to_millis(cooldown);
         self.dead_at
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |previous| {
                 if previous >= 0 && now_ms.saturating_sub(previous) < cooldown_ms {
@@ -483,8 +493,8 @@ impl Entry {
         now: crate::time::precision::Timestamp,
         cooldown: Duration,
     ) -> bool {
-        let now_ms = (now.nanos / 1_000_000).min(i64::MAX as u64) as i64;
-        let cooldown_ms = cooldown.as_millis().min(i64::MAX as u128) as i64;
+        let now_ms = Self::timestamp_to_millis(now);
+        let cooldown_ms = Self::duration_to_millis(cooldown);
         let dead_at = self.dead_at.load(Ordering::Acquire);
         dead_at >= 0 && now_ms.saturating_sub(dead_at) < cooldown_ms
     }

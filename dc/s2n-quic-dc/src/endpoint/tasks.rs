@@ -1037,7 +1037,7 @@ pub async fn send_idle_wheel_drain<Clk, WakerSink>(
                 if ctx.path_secret_entry.is_idle_expired(now) {
                     let id = *ctx.path_secret_entry.id();
                     let path_secret_entry = ctx.path_secret_entry.clone();
-                    let should_broadcast =
+                    let marked_dead =
                         path_secret_entry.mark_dead_if_cooldown_elapsed(now, dead_peer_cooldown);
                     let local_id = sender_idx_to_local[ctx.sender_idx];
                     let lifetime = now.duration_since(ctx.created_at);
@@ -1056,7 +1056,7 @@ pub async fn send_idle_wheel_drain<Clk, WakerSink>(
                         counters.on_inflight_leaked_on_invalidate(discarded_bytes as u64);
                     }
 
-                    if should_broadcast {
+                    if marked_dead {
                         let _ = peer_dead_tx.send(Entry::new(PeerDead { path_secret_entry }));
                     }
 
