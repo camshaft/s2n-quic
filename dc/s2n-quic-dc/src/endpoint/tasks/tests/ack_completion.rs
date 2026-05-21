@@ -13,7 +13,7 @@
 use super::helpers::{RecvContextBuilder, TestReceiver, TestReceiverExt as _};
 use crate::{
     endpoint::{ack::state as ack_state, msg, recv, tasks},
-    socket::channel::{ReceiverExt as _, intrusive::unsync},
+    socket::channel::{intrusive::unsync, ReceiverExt as _},
     testing::{ext::*, sim},
     time::bach::Clock,
 };

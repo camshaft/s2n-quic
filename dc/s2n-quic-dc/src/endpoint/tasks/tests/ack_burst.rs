@@ -11,7 +11,7 @@
 
 use super::helpers::{RecvContextBuilder, TestReceiver, TestReceiverExt as _};
 use crate::{
-    socket::channel::{ReceiverExt as _, intrusive::unsync},
+    socket::channel::{intrusive::unsync, ReceiverExt as _},
     stream::endpoint::{msg, tasks},
     testing::{ext::*, sim},
     time::bach::Clock,

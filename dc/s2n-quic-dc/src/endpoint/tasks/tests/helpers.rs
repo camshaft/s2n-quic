@@ -11,7 +11,7 @@ use crate::{
     intrusive::Entry,
     packet::datagram::QueuePair,
     path::secret::map::Entry as PathSecretEntry,
-    socket::channel::{Budget, EntryBoxSender, Receiver, intrusive::unsync},
+    socket::channel::{intrusive::unsync, Budget, EntryBoxSender, Receiver},
     stream::endpoint::recv,
     time::bach::Clock,
 };
@@ -23,8 +23,8 @@ use std::{
     net::SocketAddr,
     rc::Rc,
     sync::{
-        Arc,
         atomic::{AtomicUsize, Ordering},
+        Arc,
     },
 };
 
@@ -34,7 +34,7 @@ pub struct WakeCount(Arc<WakeCounter>);
 
 impl WakeCount {
     pub fn count(&self) -> usize {
-        self.0.0.load(Ordering::Relaxed)
+        self.0 .0.load(Ordering::Relaxed)
     }
 }
 

@@ -262,7 +262,11 @@ impl Pusher {
 
     async fn recv_frames_timeout(&mut self, duration: Duration) -> Option<intrusive::Queue<Frame>> {
         let queue = timeout(duration, self.recv_frames()).await.ok()?;
-        if queue.is_empty() { None } else { Some(queue) }
+        if queue.is_empty() {
+            None
+        } else {
+            Some(queue)
+        }
     }
 
     fn complete_all(

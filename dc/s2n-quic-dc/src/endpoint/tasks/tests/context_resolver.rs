@@ -9,14 +9,14 @@
 //! wheels based on WheelInterest. These tests verify the lookup, push, and dispatch
 //! behavior.
 
-use super::helpers::{TestReceiver, TestReceiverExt as _, test_batch, test_entry};
+use super::helpers::{test_batch, test_entry, TestReceiver, TestReceiverExt as _};
 use crate::{
     endpoint::{
         combinator::FrameBatch,
         id::{Id, IdMap, LocalSendSocketId, LocalSenderId},
         send, tasks,
     },
-    socket::channel::{ReceiverExt as _, UnboundedSender as _, intrusive::unsync},
+    socket::channel::{intrusive::unsync, ReceiverExt as _, UnboundedSender as _},
     testing::{ext::*, sim},
     time::bach::Clock,
 };
@@ -39,8 +39,7 @@ fn setup() -> Harness {
         LocalSenderId::from_index(0),
     )))]
     .into();
-    let sender_idx_to_local =
-        IdMap::<LocalSenderId, LocalSendSocketId>::new(1, LocalSendSocketId::new(0));
+    let sender_idx_to_local = IdMap::<LocalSenderId, LocalSendSocketId>::new(1, LocalSendSocketId::new(0));
 
     let (tx_wheel_tx, tx_wheel_rx) = unsync::new_with_adapter::<send::TxWheelAdapter>();
     let (pto_wheel_tx, _) = unsync::new_with_adapter::<send::PtoWheelAdapter>();

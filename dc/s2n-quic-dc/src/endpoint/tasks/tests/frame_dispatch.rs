@@ -8,18 +8,17 @@
 //! (frames for the same peer are coalesced), and pick-two load balancing across workers.
 //! These tests verify end-to-end behavior of the two cooperating subtasks.
 
-use super::helpers::{TestReceiverExt as _, test_entry, test_frame};
+use super::helpers::{test_entry, test_frame, TestReceiverExt as _};
 use crate::{
     endpoint::{
-        Budgets,
         combinator::FrameBatch,
         frame::{self, PriorityInput, SubmissionSender},
-        tasks,
+        tasks, Budgets,
     },
     intrusive::EntryAdapter,
     runtime::bach::Local,
     socket::{
-        channel::{UnboundedSender, intrusive::unsync},
+        channel::{intrusive::unsync, UnboundedSender},
         rate::Rate,
     },
     testing::{ext::*, sim},

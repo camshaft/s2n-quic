@@ -4,9 +4,12 @@
 use super::helpers::{TestReceiver, TestReceiverExt as _};
 use crate::{
     credentials::Id,
-    endpoint::{id::SendWorkerId, tasks},
+    endpoint::{
+        id::SendWorkerId,
+        tasks,
+    },
     intrusive::Entry,
-    packet::{WireVersion, secret_control},
+    packet::{secret_control, WireVersion},
     path::secret::{map::Map, schedule, stateless_reset},
     socket::{channel::intrusive::unsync, pool::Pool},
     testing::{ext::*, sim},

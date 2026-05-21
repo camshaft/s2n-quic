@@ -19,10 +19,10 @@ use crate::{
     intrusive::{Entry, Queue},
     packet::datagram::{QueuePair, ResetTarget},
     path::secret::map::Entry as PathSecretEntry,
-    socket::channel::{ByteCost, UnboundedSender, intrusive::datagram_completion},
+    socket::channel::{intrusive::datagram_completion, ByteCost, UnboundedSender},
     time::precision,
 };
-use s2n_codec::{Encoder, EncoderValue, decoder_invariant};
+use s2n_codec::{decoder_invariant, Encoder, EncoderValue};
 use s2n_quic_core::varint::VarInt;
 use std::sync::Arc;
 

@@ -7,7 +7,7 @@ use crate::credentials;
 use rustc_hash::FxHashMap;
 use s2n_quic_core::varint::VarInt;
 use std::{
-    collections::{VecDeque, hash_map},
+    collections::{hash_map, VecDeque},
     sync::Arc,
 };
 

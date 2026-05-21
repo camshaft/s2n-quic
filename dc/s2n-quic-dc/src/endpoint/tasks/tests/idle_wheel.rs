@@ -187,6 +187,7 @@ fn send_idle_wheel_reschedules_active_context() {
 
 #[test]
 fn send_idle_wheel_expires_reader_only_queue_with_reset() {
+    let _guard = crate::testing::without_snapshots();
     sim(|| {
         let (send_caches, mut idle_wheel_tx, _completed_rx, clock, _registry, mut queue_allocator) =
             setup_send();
@@ -227,10 +228,10 @@ fn send_idle_wheel_expires_reader_only_queue_with_reset() {
             assert!(
                 stream_queue.iter().any(|entry| {
                     matches!(
-                        entry.as_ref(),
+                        &*entry,
                         msg::Stream::Reset {
                             error_code
-                        } if *error_code == crate::endpoint::error::IDLE_TIMEOUT
+                        } if error_code.as_u64() == crate::endpoint::error::IDLE_TIMEOUT.as_u64()
                     )
                 }),
                 "stream queue should receive idle-timeout reset"
@@ -242,10 +243,10 @@ fn send_idle_wheel_expires_reader_only_queue_with_reset() {
             assert!(
                 control_queue.iter().any(|entry| {
                     matches!(
-                        entry.as_ref(),
+                        &*entry,
                         msg::Control::Reset {
                             error_code
-                        } if *error_code == crate::endpoint::error::IDLE_TIMEOUT
+                        } if error_code.as_u64() == crate::endpoint::error::IDLE_TIMEOUT.as_u64()
                     )
                 }),
                 "control queue should receive idle-timeout reset"

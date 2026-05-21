@@ -3,12 +3,12 @@
 
 //! Contract tests for completion-side endpoint tasks.
 
-use super::helpers::{TestReceiverExt as _, entry_channel, test_entry, test_frame};
+use super::helpers::{entry_channel, test_entry, test_frame, TestReceiverExt as _};
 use crate::{
     endpoint::{frame, tasks},
     flow::queue::AutoWake,
     intrusive::Entry,
-    socket::channel::{ReceiverExt as _, UnboundedSender as _, intrusive::unsync},
+    socket::channel::{intrusive::unsync, ReceiverExt as _, UnboundedSender as _},
     testing::{ext::*, sim},
 };
 use core::future::poll_fn;
@@ -50,8 +50,7 @@ fn completion_dispatcher_forwards_completed_frame_and_wakes() {
             let mut completion_rx = frame::completion_channel();
             let mut submitted = test_frame(&pse).into_inner();
             submitted.status = frame::TransmissionStatus::Acknowledged;
-            submitted.source_sender_id =
-                crate::endpoint::id::LocalSenderId::new(VarInt::from_u8(7));
+            submitted.source_sender_id = crate::endpoint::id::LocalSenderId::new(VarInt::from_u8(7));
             submitted.completion = Some(completion_rx.sender());
 
             let expected_source_sender_id = submitted.source_sender_id;

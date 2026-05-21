@@ -13,7 +13,7 @@ use crate::{
     credentials::Credentials,
     endpoint::{
         counters, decode, error,
-        frame::{DEFAULT_TTL, Frame, Header, PriorityInput, SubmissionSender},
+        frame::{Frame, Header, PriorityInput, SubmissionSender, DEFAULT_TTL},
         id::LocalSenderId,
         msg,
         recv::{self, AttemptDedupError},
@@ -25,7 +25,7 @@ use crate::{
         self,
         datagram::{QueuePair, ResetTarget, RoutingInfo},
     },
-    path::secret::{Map as PathSecretMap, map::Entry as PathSecretEntry},
+    path::secret::{map::Entry as PathSecretEntry, Map as PathSecretMap},
     socket::{channel, pool::descriptor},
     stream::{PendingValidation, Reader, Stream, Writer},
     tracing::*,

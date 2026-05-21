@@ -2,10 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::{
-    AutoWake,
     descriptor::Descriptor,
     inner::{Closed, Error, Half},
-    probes,
+    probes, AutoWake,
 };
 use crate::intrusive;
 use core::{

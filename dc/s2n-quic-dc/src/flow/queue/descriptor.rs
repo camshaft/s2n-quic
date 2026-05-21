@@ -13,8 +13,8 @@ use std::{
     mem::MaybeUninit,
     ptr::NonNull,
     sync::{
-        Arc,
         atomic::{AtomicU64, AtomicUsize, Ordering},
+        Arc,
     },
 };
 
@@ -247,12 +247,10 @@ impl<S: 'static, C: 'static, Key: 'static> Descriptor<S, C, Key> {
         let inner = self.inner();
         probes::on_receiver_drop(inner.id, half);
 
-        ensure!(
-            inner
-                .stream
-                .close_receiver(&inner.control, half)
-                .is_continue()
-        );
+        ensure!(inner
+            .stream
+            .close_receiver(&inner.control, half)
+            .is_continue());
 
         probes::on_receiver_free(inner.id, half);
 

@@ -13,8 +13,8 @@ use crate::{
     endpoint::{tasks, ups},
     intrusive::Entry,
     msg::addr::Addr,
-    packet::{WireVersion, secret_control},
-    socket::channel::{ReceiverExt as _, UnboundedSender as _, intrusive::unsync},
+    packet::{secret_control, WireVersion},
+    socket::channel::{intrusive::unsync, ReceiverExt as _, UnboundedSender as _},
     testing::{ext::*, sim},
     time::bach::Clock,
 };
