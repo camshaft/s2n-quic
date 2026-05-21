@@ -1083,6 +1083,7 @@ pub async fn recv_idle_wheel_drain<Clk>(
     clock: Clk,
     input_gauge: QueueGauge,
     recv_cache: Rc<RefCell<endpoint::recv::Cache>>,
+    mut peer_dead_tx: impl UnboundedSender<Entry<PeerDead>> + Clone + 'static,
     dead_peer_cooldown: core::time::Duration,
     idle_expired: counter::Counter,
     idle_rescheduled: counter::Counter,
@@ -1109,8 +1110,9 @@ pub async fn recv_idle_wheel_drain<Clk>(
                 let now = clock.now();
                 let ctx = context.borrow();
                 if ctx.path_entry.is_idle_expired(now) {
-                    ctx.path_entry
-                        .mark_dead_if_cooldown_elapsed(now, dead_peer_cooldown);
+                    let path_secret_entry = ctx.path_entry.clone();
+                    let marked_dead =
+                        path_secret_entry.mark_dead_if_cooldown_elapsed(now, dead_peer_cooldown);
                     let key = endpoint::recv::Key {
                         id: *ctx.path_entry.id(),
                         remote_sender_id: ctx.remote_sender_id,
@@ -1118,6 +1120,9 @@ pub async fn recv_idle_wheel_drain<Clk>(
                     let lifetime = now.duration_since(ctx.created_at);
                     drop(ctx);
                     recv_cache.borrow_mut().remove(&key);
+                    if marked_dead {
+                        let _ = peer_dead_tx.send(Entry::new(PeerDead { path_secret_entry }));
+                    }
                     idle_expired.add(1);
                     idle_lifetime.record(lifetime);
                 } else {

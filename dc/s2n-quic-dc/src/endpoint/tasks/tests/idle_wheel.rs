@@ -278,6 +278,7 @@ fn setup_recv() -> (
     unsync::Sender<recv::IdleWheelAdapter>,
     Clock,
     crate::counter::Registry,
+    msg::queue::Allocator,
 ) {
     let registry = crate::counter::Registry::default();
     let clock = Clock::default();
@@ -286,6 +287,9 @@ fn setup_recv() -> (
     )));
 
     let (idle_wheel_tx, idle_wheel_rx) = unsync::new_with_adapter::<recv::IdleWheelAdapter>();
+    let (peer_dead_tx, peer_dead_rx) = unsync::new::<tasks::PeerDead>();
+    let queue_allocator = msg::queue::Allocator::new();
+    let queue_dispatcher = queue_allocator.dispatcher();
     let q_gauge = registry.register_queue_gauge("test.recv_idle_wheel");
 
     tasks::recv_idle_wheel_drain(
@@ -294,6 +298,7 @@ fn setup_recv() -> (
         clock.clone(),
         q_gauge,
         recv_cache.clone(),
+        peer_dead_tx,
         crate::endpoint::DEFAULT_DEAD_PEER_COOLDOWN,
         registry.register("idle.recv.expired"),
         registry.register("idle.recv.rescheduled"),
@@ -303,13 +308,24 @@ fn setup_recv() -> (
     )
     .spawn();
 
-    (recv_cache, idle_wheel_tx, clock, registry)
+    let rx = tasks::peer_dead_broadcast(
+        peer_dead_rx,
+        queue_dispatcher,
+        WakeNowSender,
+        tasks::PeerDeadCounters {
+            events: registry.register("test.peer_dead.recv.events"),
+            broadcasted: registry.register("test.peer_dead.recv.broadcasted"),
+        },
+    );
+    async move { rx.drain_budgeted(Some(32)).await }.spawn();
+
+    (recv_cache, idle_wheel_tx, clock, registry, queue_allocator)
 }
 
 #[test]
 fn recv_idle_wheel_expires_inactive_context() {
     sim(|| {
-        let (recv_cache, mut idle_wheel_tx, clock, _registry) = setup_recv();
+        let (recv_cache, mut idle_wheel_tx, clock, _registry, _queue_allocator) = setup_recv();
 
         let ctx = RecvContextBuilder::default().build();
         // Simulate initial activity
@@ -342,7 +358,7 @@ fn recv_idle_wheel_expires_inactive_context() {
 #[test]
 fn recv_idle_wheel_reschedules_active_context() {
     sim(|| {
-        let (recv_cache, mut idle_wheel_tx, clock, _registry) = setup_recv();
+        let (recv_cache, mut idle_wheel_tx, clock, _registry, _queue_allocator) = setup_recv();
 
         let ctx = RecvContextBuilder::default().build();
         let key = {
@@ -381,6 +397,74 @@ fn recv_idle_wheel_reschedules_active_context() {
             assert!(
                 recv_cache.borrow().senders.is_empty(),
                 "recv context should be evicted after extended idle"
+            );
+        }
+        .primary()
+        .spawn();
+    });
+}
+
+#[test]
+fn recv_idle_wheel_expires_reader_only_queue_with_reset() {
+    let _guard = crate::testing::without_snapshots();
+    sim(|| {
+        let (recv_cache, mut idle_wheel_tx, clock, _registry, mut queue_allocator) = setup_recv();
+
+        let ctx = RecvContextBuilder::default().build();
+        ctx.borrow()
+            .path_entry
+            .touch_activity(precision::Clock::now(&clock));
+        let key = {
+            let c = ctx.borrow();
+            recv::Key {
+                id: *c.path_entry.id(),
+                remote_sender_id: c.remote_sender_id,
+            }
+        };
+        let path_entry = ctx.borrow().path_entry.clone();
+        let stream_id = VarInt::from_u8(9);
+        let handle = flow::Handle::client(stream_id, path_entry);
+        let (queue_control, queue_stream) = queue_allocator.alloc_or_grow(handle, None);
+
+        recv_cache.borrow_mut().senders.insert(key, ctx.clone());
+        let _ = idle_wheel_tx.send(ctx);
+
+        let recv_cache = recv_cache.clone();
+        async move {
+            61.s().sleep().await;
+            assert!(
+                recv_cache.borrow().senders.is_empty(),
+                "recv context should be evicted after idle timeout"
+            );
+
+            let stream_queue = queue_stream
+                .try_swap()
+                .expect("stream queue should still be open");
+            assert!(
+                stream_queue.iter().any(|entry| {
+                    matches!(
+                        &*entry,
+                        msg::Stream::Reset {
+                            error_code
+                        } if error_code.as_u64() == crate::endpoint::error::IDLE_TIMEOUT.as_u64()
+                    )
+                }),
+                "stream queue should receive idle-timeout reset"
+            );
+
+            let control_queue = queue_control
+                .try_swap()
+                .expect("control queue should still be open");
+            assert!(
+                control_queue.iter().any(|entry| {
+                    matches!(
+                        &*entry,
+                        msg::Control::Reset {
+                            error_code
+                        } if error_code.as_u64() == crate::endpoint::error::IDLE_TIMEOUT.as_u64()
+                    )
+                }),
+                "control queue should receive idle-timeout reset"
             );
         }
         .primary()
