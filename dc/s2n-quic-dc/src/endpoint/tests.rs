@@ -1414,9 +1414,9 @@ fn five_node_random_chatter_settles_after_stop() {
                                 }
                             }
 
-                            let mut echo = Bytes::copy_from_slice(&buf);
+                            let mut response_data = Bytes::copy_from_slice(&buf);
                             writer
-                                .write_all_from_fin(&mut echo)
+                                .write_all_from_fin(&mut response_data)
                                 .await
                                 .expect("server write");
                         }
@@ -1427,9 +1427,9 @@ fn five_node_random_chatter_settles_after_stop() {
 
                 let mut client = Client::new();
                 for tick in 0..CHAT_SECONDS {
-                    let mut peer_idx = bach::rand::any::<u8>() as usize % (NODE_NAMES.len() - 1);
-                    if peer_idx >= node_idx {
-                        peer_idx += 1;
+                    let mut peer_idx = node_idx;
+                    while peer_idx == node_idx {
+                        peer_idx = bach::rand::any::<u8>() as usize % NODE_NAMES.len();
                     }
 
                     let peer = format!("{}:0", NODE_NAMES[peer_idx]);
