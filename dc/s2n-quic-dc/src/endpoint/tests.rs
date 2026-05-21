@@ -1431,29 +1431,29 @@ fn five_node_random_chatter_settles_after_stop() {
                 .spawn();
 
                 let mut client = Client::new();
+                let unbiased_threshold =
+                    ((u8::MAX as usize + 1) / NODE_NAMES.len()) * NODE_NAMES.len();
                 for tick in 0..CHAT_SECONDS {
-                    let mut peer_idx = node_idx;
-                    let unbiased_threshold =
-                        ((u8::MAX as usize + 1) / NODE_NAMES.len()) * NODE_NAMES.len();
-                    while peer_idx == node_idx {
-                        let candidate = loop {
+                    let mut selected_peer_idx = node_idx;
+                    while selected_peer_idx == node_idx {
+                        let candidate_peer_idx = loop {
                             let raw = bach::rand::any::<u8>() as usize;
                             // Rejection sampling to avoid modulo bias.
                             if raw < unbiased_threshold {
                                 break raw % NODE_NAMES.len();
                             }
                         };
-                        peer_idx = candidate;
+                        selected_peer_idx = candidate_peer_idx;
                     }
 
-                    let peer = format!("{}:0", NODE_NAMES[peer_idx]);
+                    let peer = format!("{}:0", NODE_NAMES[selected_peer_idx]);
                     let stream = client
                         .connect(peer, acceptor_id)
                         .await
                         .expect("client connect");
                     let (mut reader, mut writer) = stream.into_split();
 
-                    let payload = format!("{node_idx}->{peer_idx}@{tick}");
+                    let payload = format!("{node_idx}->{selected_peer_idx}@{tick}");
                     let mut data = Bytes::copy_from_slice(payload.as_bytes());
                     writer
                         .write_all_from_fin(&mut data)
