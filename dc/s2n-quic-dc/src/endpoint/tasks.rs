@@ -1065,9 +1065,10 @@ pub async fn send_idle_wheel_drain<Clk, WakerSink>(
                     idle_expired.add(1);
                     idle_lifetime.record(lifetime);
                 } else {
+                    let last_activity = ctx.last_peer_activity;
                     let timeout = ctx.path_secret_entry.idle_timeout();
                     drop(ctx);
-                    context.borrow_mut().idle_wheel.target_time = Some(now + timeout);
+                    context.borrow_mut().idle_wheel.target_time = Some(last_activity + timeout);
                     let _ = UnboundedSender::send(&mut idle_wheel_tx, context);
                     idle_rescheduled.add(1);
                 }
@@ -1195,9 +1196,10 @@ pub async fn recv_idle_wheel_drain<Clk>(
                     idle_expired.add(1);
                     idle_lifetime.record(lifetime);
                 } else {
+                    let last_activity = ctx.path_entry.last_activity();
                     let timeout = ctx.path_entry.idle_timeout();
                     drop(ctx);
-                    context.borrow_mut().idle_wheel.target_time = Some(now + timeout);
+                    context.borrow_mut().idle_wheel.target_time = Some(last_activity + timeout);
                     let _ = UnboundedSender::send(&mut idle_wheel_tx, context);
                     idle_rescheduled.add(1);
                 }

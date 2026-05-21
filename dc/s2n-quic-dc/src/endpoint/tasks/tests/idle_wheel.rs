@@ -142,25 +142,27 @@ fn send_idle_wheel_reschedules_active_context() {
         let send_caches = send_caches.clone();
         let ctx = ctx.clone();
         async move {
-            // Touch activity at 30s
-            30.s().sleep().await;
+            // Touch activity at 1s — well before the first wheel fire at T=30s.
+            // The reschedule anchors to last_peer_activity, so the context must survive
+            // until last_peer_activity + idle_timeout = 1s + 30s = 31s.
+            1.s().sleep().await;
             ctx.borrow_mut()
                 .touch_peer_activity(precision::Clock::now(&Clock::default()));
 
-            // At 70s total the context should still be alive (activity at 30s → expires at 90s)
-            40.s().sleep().await;
+            // At 25s total the context should still be alive (expires at ~31s)
+            24.s().sleep().await;
             assert_eq!(
                 send_caches[LocalSendSocketId::new(0)].borrow().context_count(),
                 1,
-                "context should still be alive after activity refresh"
+                "context should still be alive before last_peer_activity + idle_timeout"
             );
 
-            // At 95s total (past 90s) it should be evicted
-            25.s().sleep().await;
+            // At 35s total (past 31s) it should be evicted
+            10.s().sleep().await;
             assert_eq!(
                 send_caches[LocalSendSocketId::new(0)].borrow().context_count(),
                 0,
-                "context should be evicted after extended idle"
+                "context should be evicted after last_peer_activity + idle_timeout"
             );
         }
         .primary()
@@ -257,26 +259,28 @@ fn recv_idle_wheel_reschedules_active_context() {
 
         let recv_cache = recv_cache.clone();
         async move {
-            // Touch activity at 30s
-            30.s().sleep().await;
+            // Touch activity at 1s — well before the first wheel fire at T=30s.
+            // The reschedule anchors to last_activity, so the context must survive
+            // until last_activity + idle_timeout = 1s + 30s = 31s.
+            1.s().sleep().await;
             let ctx = recv_cache.borrow().senders.values().next().unwrap().clone();
             ctx.borrow()
                 .path_entry
                 .touch_activity(precision::Clock::now(&Clock::default()));
 
-            // At 70s total the context should still be alive
-            40.s().sleep().await;
+            // At 25s total the context should still be alive (expires at ~31s)
+            24.s().sleep().await;
             assert_eq!(
                 recv_cache.borrow().senders.len(),
                 1,
-                "recv context should still be alive after activity refresh"
+                "recv context should still be alive before last_activity + idle_timeout"
             );
 
-            // At 95s total (past 90s) it should be evicted
-            25.s().sleep().await;
+            // At 35s total (past 31s) it should be evicted
+            10.s().sleep().await;
             assert!(
                 recv_cache.borrow().senders.is_empty(),
-                "recv context should be evicted after extended idle"
+                "recv context should be evicted after last_activity + idle_timeout"
             );
         }
         .primary()

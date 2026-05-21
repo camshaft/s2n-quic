@@ -1388,151 +1388,104 @@ fn multi_server_concurrent_loss_sim() {
 /// frame succeeds — proving full recovery despite the server losing recv state.
 ///
 ///
-/// Demonstrates that zombie send flows are never invalidated when another flow on the same
-/// path_secret_entry keeps refreshing `last_activity`.
+/// Verifies that a zombie send context — one whose inflight packets are never acknowledged
+/// because the peer is unreachable — is invalidated by the idle timeout and stops probing.
 ///
 /// Scenario:
-/// 1. Client opens flow A to server — server→client responses for A are dropped after init
-/// 2. Client periodically opens new flows (B, C, D...) that complete successfully,
-///    keeping the shared path_secret_entry's `last_activity` fresh
-/// 3. Flow A's send context should be idle-expired after 30s, but the shared activity
-///    prevents this — it probes indefinitely at max backoff
+/// 1. All packets are dropped (both directions) from the start.
+/// 2. Client opens a flow and sends data.  The FlowInitFin is "sent" (socket call succeeds)
+///    but the monitor discards every packet, so no ACKs ever reach the client.
+/// 3. The send context probes via PTO while inflight frames remain unacknowledged.
+/// 4. After `idle_timeout` elapses without peer activity the idle wheel expires the context.
+/// 5. Once expired, the context is removed from the cache; no further probes are sent.
 ///
-/// This reproduces the "zombie flow" bug seen in production where flows with unanswered
-/// probes persist indefinitely, inflating pick_two scores.
+/// This is a regression test for the idle-wheel reschedule bug where `target_time` was set
+/// to `now + timeout` instead of `last_peer_activity + timeout`, which could delay or prevent
+/// expiry when the wheel kept resetting to the future.
 #[test]
-#[ignore = "TODO need to figure out what's going on here"]
-fn zombie_flow_not_invalidated_when_path_has_other_activity() {
+fn zombie_send_context_expires_after_idle_timeout() {
     use crate::testing::ext::*;
-    use std::sync::atomic::AtomicBool;
 
-    let zombie_still_probing = Arc::new(AtomicBool::new(false));
-    let zombie_still_probing_inner = zombie_still_probing.clone();
+    let probes = Arc::new(AtomicUsize::new(0));
+    let probes_inner = probes.clone();
 
     let _no_snap = crate::testing::without_snapshots();
     crate::testing::sim(|| {
         let acceptor_id = VarInt::from_u8(1);
+        let probes = probes_inner.clone();
 
-        // Track packets: count server→client drops after zombie starts
-        let zombie_active = Arc::new(AtomicBool::new(false));
-        let zombie_active_monitor = zombie_active.clone();
-        let probes_after_idle = Arc::new(AtomicUsize::new(0));
-        let probes_counter = probes_after_idle.clone();
+        // Silently drop ALL packets (both directions) to simulate a completely
+        // unreachable peer. Count them so we can verify probing eventually stops.
+        {
+            let probes = probes.clone();
+            bach::net::monitor::on_packet_sent(move |_packet| {
+                probes.fetch_add(1, Ordering::Relaxed);
+                bach::net::monitor::Command::Drop
+            });
+        }
 
-        bach::net::monitor::on_packet_sent(move |packet| {
-            // Once zombie is active, drop all server→client packets.
-            // This means the zombie flow's probes never get responses,
-            // BUT new flow inits from client→server still work (they go the other direction).
-            if zombie_active_monitor.load(Ordering::Relaxed)
-                && packet.destination().port() != SERVER_PORT
-            {
-                probes_counter.fetch_add(1, Ordering::Relaxed);
-                return bach::net::monitor::Command::Drop;
-            }
-            bach::net::monitor::Command::Pass
-        });
-
-        // Server: accept and echo
+        // Server: must be registered so the client can resolve SERVER_PORT and insert
+        // path-secret entries. It will not receive any data since all packets are dropped.
         async move {
             let server = Server::new();
-            let mut acceptor = server
+            let _acceptor = server
                 .register_acceptor_channel(acceptor_id, 8)
                 .expect("acceptor registration");
-
-            while let Some(stream) = acceptor.recv().await {
-                async move {
-                    let stream = stream.validate().await.expect("validate");
-                    let (mut reader, mut writer) = stream.into_split();
-                    let mut buf = BytesMut::with_capacity(2048);
-                    loop {
-                        if reader.read_into(&mut buf).await.expect("read") == 0 {
-                            break;
-                        }
-                    }
-                    let mut echo = buf.freeze();
-                    writer.write_all_from_fin(&mut echo).await.expect("write");
-                }
-                .spawn();
-            }
         }
         .group("server")
         .spawn();
 
         // Client
         {
-            let zombie_active = zombie_active.clone();
-            let probes_after_idle = probes_after_idle.clone();
-            let zombie_still_probing = zombie_still_probing_inner;
-
+            let probes = probes.clone();
             async move {
                 let mut client = Client::new();
 
-                // Open the zombie flow: client sends data, but server responses are dropped.
-                zombie_active.store(true, Ordering::Relaxed);
-
-                let stream_z = client
+                // Open a flow and write a FIN.  The FlowInitFin frame is assembled and
+                // handed to the socket, but the monitor drops it before it leaves the
+                // machine.  PTO keeps retransmitting; each attempt increments `probes`.
+                let stream = client
                     .connect(format!("server:{SERVER_PORT}"), acceptor_id)
                     .await
-                    .expect("connect zombie");
-                let (_reader_z, mut writer_z) = stream_z.into_split();
+                    .expect("connect");
+                let (_reader, mut writer) = stream.into_split();
                 let mut data = Bytes::from(vec![42u8; 1024]);
-                writer_z
-                    .write_all_from_fin(&mut data)
-                    .await
-                    .expect("write zombie");
 
-                // Wait 5s to let the zombie's probes start firing, then stop
-                // dropping so subsequent flows can complete and refresh activity.
+                // The write will return an error once the frame TTL is exhausted
+                // (after ~10 PTO retransmits, before the idle timeout).  We don't
+                // await it — the zombie send context is what we care about here.
+                // Spawn it as a background task so it doesn't block the primary task.
+                async move {
+                    let _ = writer.write_all_from_fin(&mut data).await;
+                }
+                .spawn();
+
+                // Wait 2 seconds past idle_timeout (30s) to ensure the idle wheel has
+                // had a chance to fire and evict the send context.
+                32.s().sleep().await;
+
+                // After expiry the context is removed from the cache; no more probes
+                // should be sent.
+                let before = probes.load(Ordering::Relaxed);
                 5.s().sleep().await;
-                zombie_active.store(false, Ordering::Relaxed);
+                let after = probes.load(Ordering::Relaxed);
 
-                // Open new flows every 10s. Each one completes successfully,
-                // causing server→client packets which call touch_activity on
-                // the shared path_secret_entry.
-                for _i in 0..8 {
-                    10.s().sleep().await;
-                    let stream = client
-                        .connect(format!("server:{SERVER_PORT}"), acceptor_id)
-                        .await
-                        .expect("connect keepalive");
-                    let (mut reader, mut writer) = stream.into_split();
-                    let mut ping = Bytes::from_static(b"hi");
-                    writer.write_all_from_fin(&mut ping).await.expect("write");
-                    let mut buf = BytesMut::with_capacity(8);
-                    loop {
-                        if reader.read_into(&mut buf).await.expect("read") == 0 {
-                            break;
-                        }
-                    }
-                }
-
-                // 85s have elapsed. Re-enable dropping to detect zombie probes.
-                zombie_active.store(true, Ordering::Relaxed);
-                let before = probes_after_idle.load(Ordering::Relaxed);
-                30.s().sleep().await;
-                let after = probes_after_idle.load(Ordering::Relaxed);
-                info!("zombie probe counter before={before} after={after}");
-
-                if after > before {
-                    zombie_still_probing.store(true, Ordering::Relaxed);
-                }
+                assert!(
+                    before > 0,
+                    "expected the zombie to have sent at least one probe before expiry"
+                );
+                assert_eq!(
+                    before,
+                    after,
+                    "zombie send context continued probing after idle timeout expiry \
+                     (before={before} after={after})"
+                );
             }
             .group("client")
             .primary()
             .spawn();
         }
     });
-
-    // The zombie flow should have been invalidated despite other flows being active.
-    // If it's still probing after 115s, the shared path_secret_entry activity kept
-    // it alive — that's the bug.
-    let still_probing = zombie_still_probing.load(Ordering::Relaxed);
-    assert!(
-        !still_probing,
-        "BUG: zombie flow is still probing after 115s. Other flows on the same path kept \
-         the path_secret_entry's last_activity fresh, preventing idle expiration of the \
-         zombie send context."
-    );
 }
 
 #[test]

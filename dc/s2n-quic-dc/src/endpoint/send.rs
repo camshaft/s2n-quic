@@ -693,7 +693,7 @@ impl Context {
     pub fn is_idle_expired(&self, now: precision::Timestamp) -> bool {
         let elapsed = now.nanos_since(self.last_peer_activity);
         let timeout = self.path_secret_entry.idle_timeout();
-        elapsed > timeout.as_nanos() as u64
+        elapsed >= timeout.as_nanos() as u64
     }
 
     #[inline]
