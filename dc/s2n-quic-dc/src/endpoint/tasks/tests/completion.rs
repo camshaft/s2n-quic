@@ -3,12 +3,12 @@
 
 //! Contract tests for completion-side endpoint tasks.
 
-use super::helpers::{entry_channel, test_entry, test_frame, TestReceiverExt as _};
+use super::helpers::{TestReceiverExt as _, entry_channel, test_entry, test_frame};
 use crate::{
     endpoint::{frame, tasks},
     flow::queue::AutoWake,
     intrusive::Entry,
-    socket::channel::{intrusive::unsync, ReceiverExt as _, UnboundedSender as _},
+    socket::channel::{ReceiverExt as _, UnboundedSender as _, intrusive::unsync},
     testing::{ext::*, sim},
 };
 use core::future::poll_fn;

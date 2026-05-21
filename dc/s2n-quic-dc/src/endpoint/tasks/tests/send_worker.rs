@@ -2,10 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Contract tests for extracted send-worker pipeline helpers.
-use super::helpers::{test_batch, test_entry, TestReceiver, TestReceiverExt as _};
+use super::helpers::{TestReceiver, TestReceiverExt as _, test_batch, test_entry};
 use crate::{
     endpoint::{frame, id::Id, msg, send, tasks},
-    socket::channel::{intrusive::unsync, ReceiverExt as _, UnboundedSender as _},
+    socket::channel::{ReceiverExt as _, UnboundedSender as _, intrusive::unsync},
     testing::{ext::*, sim},
     time::{bach::Clock, precision},
     tracing::*,

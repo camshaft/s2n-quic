@@ -83,7 +83,7 @@ impl PairBuilder {
         let queue_id = control_rx.queue_id();
         let request = flow::Request {
             credential_id: *path_secret_entry.id(),
-            stream_id,
+            stream_id: Some(stream_id),
         };
 
         let (frame_tx, frame_rx) = frame::submission_channel(1);
@@ -262,11 +262,7 @@ impl Pusher {
 
     async fn recv_frames_timeout(&mut self, duration: Duration) -> Option<intrusive::Queue<Frame>> {
         let queue = timeout(duration, self.recv_frames()).await.ok()?;
-        if queue.is_empty() {
-            None
-        } else {
-            Some(queue)
-        }
+        if queue.is_empty() { None } else { Some(queue) }
     }
 
     fn complete_all(

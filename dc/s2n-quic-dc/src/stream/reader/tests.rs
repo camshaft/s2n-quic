@@ -23,7 +23,7 @@
 //!   The two sides talk over the real flow-queue / frame-submission channels,
 //!   without any actual UDP sockets or cryptography.
 
-use super::{error, msg, write_data_reader, ReadToEnd, Reader};
+use super::{ReadToEnd, Reader, error, msg, write_data_reader};
 use crate::{
     endpoint::frame::{self, Frame, Header, PriorityStorage, SubmissionReceiver},
     flow, intrusive,
@@ -33,7 +33,7 @@ use crate::{
 };
 use bytes::BytesMut;
 use s2n_quic_core::{
-    buffer::{writer::Storage as _, Reassembler},
+    buffer::{Reassembler, writer::Storage as _},
     endpoint,
     stream::testing::Data,
     varint::VarInt,
@@ -84,7 +84,7 @@ impl PairBuilder {
         let queue_id = stream_rx.queue_id();
         let request = flow::Request {
             credential_id: *path_secret_entry.id(),
-            stream_id,
+            stream_id: Some(stream_id),
         };
 
         let (frame_tx, frame_rx) = frame::submission_channel(1);
@@ -207,11 +207,7 @@ impl Pusher {
         let queue = bach::time::timeout(duration, self.recv_frames())
             .await
             .ok()?;
-        if queue.is_empty() {
-            None
-        } else {
-            Some(queue)
-        }
+        if queue.is_empty() { None } else { Some(queue) }
     }
 
     fn complete_with_status(

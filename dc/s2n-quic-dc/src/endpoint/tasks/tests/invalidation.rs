@@ -1,7 +1,7 @@
 // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use super::helpers::{test_entry, RecvContextBuilder, TestReceiverExt};
+use super::helpers::{RecvContextBuilder, TestReceiverExt, test_entry};
 use crate::{
     credentials,
     endpoint::{

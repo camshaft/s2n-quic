@@ -4,7 +4,7 @@
 use crate::{
     counter::{self, GaugedReceiver, GaugedSender, QueueGauge},
     endpoint::{
-        self,
+        self, Budgets,
         combinator::{
             AckProcessor, Assembler, AssemblerCounters, BatchFramesByPathSecret,
             CompletionDispatcher, FrameBatch, PathSecretMapEntry, PickTwo,
@@ -12,17 +12,17 @@ use crate::{
         dispatch,
         frame::{self, Frame, Priority, PriorityStorage, SubmissionReceiver},
         id::{IdJoin, IdMap, LocalSendSocketId, LocalSenderId, RecvDispatchWorkerId, SendWorkerId},
-        msg, send, Budgets,
+        msg, send,
     },
     intrusive::{Entry, Queue},
     packet::datagram::decoder::Packet,
     runtime::Spawner,
     socket::{
         channel::{
-            intrusive::{self, unsync},
             Budget, FilterMap, Flatten, FlattenList, FlattenSegments, InspectErr, Map, Paced,
             Priority as PriorityRx, Receiver, ReceiverExt as _, RouterAdapter, SocketReceiver,
             SocketSender, UnboundedSender,
+            intrusive::{self, unsync},
         },
         pool::descriptor,
         rate::Rate,
@@ -34,7 +34,6 @@ use crate::{
     tracing::*,
 };
 use core::task::Poll;
-use rustc_hash::FxHashSet;
 use s2n_quic_core::varint::VarInt;
 use s2n_quic_platform::features::Gso;
 use std::{cell::RefCell, rc::Rc, sync::Arc};
@@ -1031,7 +1030,6 @@ pub async fn send_idle_wheel_drain<Clk, WakerSink>(
                     .with_description("Idle wheel re-enqueues active send contexts")
                     .with_function("endpoint::tasks::send_idle_wheel_drain"),
             );
-            let mut collecting_tx = QueueTargetCollector::new(&mut completed_tx);
             move |context: Rc<RefCell<send::Context>>| {
                 let now = clock.now();
                 let ctx = context.borrow();
@@ -1041,11 +1039,10 @@ pub async fn send_idle_wheel_drain<Clk, WakerSink>(
                     let lifetime = now.duration_since(ctx.created_at);
                     drop(ctx);
 
-                    collecting_tx.clear();
                     let result = send_caches[local_id].borrow_mut().invalidate(
                         &id,
                         frame::FailureReason::PeerDead,
-                        &mut collecting_tx,
+                        &mut completed_tx,
                     );
 
                     if let Some((drained, discarded_bytes)) = result {
@@ -1055,12 +1052,7 @@ pub async fn send_idle_wheel_drain<Clk, WakerSink>(
                         counters.on_inflight_leaked_on_invalidate(discarded_bytes as u64);
                     }
 
-                    reset_flow_queues(
-                        &mut queue_dispatcher,
-                        &id,
-                        collecting_tx.targets(),
-                        &mut waker_sink,
-                    );
+                    reset_flow_queues(&mut queue_dispatcher, &id, &mut waker_sink);
 
                     idle_expired.add(1);
                     idle_lifetime.record(lifetime);
@@ -1087,71 +1079,34 @@ pub async fn send_idle_wheel_drain<Clk, WakerSink>(
 fn reset_flow_queues(
     queue_dispatcher: &mut msg::queue::Dispatcher,
     credential_id: &crate::credentials::Id,
-    queue_targets: &FxHashSet<frame::LocalQueueTarget>,
     waker_sink: &mut impl UnboundedSender<crate::flow::queue::AutoWake>,
 ) {
     use crate::{endpoint::error::IDLE_TIMEOUT, flow};
 
-    for target in queue_targets {
-        let request = flow::Request {
-            credential_id: *credential_id,
-            stream_id: target.stream_id,
-        };
+    let request = flow::Request {
+        credential_id: *credential_id,
+        stream_id: None,
+    };
 
-        let stream_entry = msg::Stream::Reset {
-            error_code: IDLE_TIMEOUT,
-        }
-        .into();
-        let control_entry = msg::Control::Reset {
-            error_code: IDLE_TIMEOUT,
-        }
-        .into();
-
-        // send_both validates internally; wakers are offloaded via waker_sink
-        let (waker_a, waker_b) = queue_dispatcher.send_both(
-            target.source_queue_id,
-            None,
-            &request,
-            stream_entry,
-            control_entry,
-        );
-        let _ = waker_sink.send(waker_a);
-        let _ = waker_sink.send(waker_b);
-    }
-}
-
-/// Wraps an `UnboundedSender<Entry<Frame>>` to collect unique queue targets as frames pass through.
-struct QueueTargetCollector<'a, S> {
-    inner: &'a mut S,
-    targets: FxHashSet<frame::LocalQueueTarget>,
-}
-
-impl<'a, S> QueueTargetCollector<'a, S> {
-    fn new(inner: &'a mut S) -> Self {
-        Self {
-            inner,
-            targets: Default::default(),
-        }
-    }
-
-    fn clear(&mut self) {
-        self.targets.clear();
-    }
-
-    fn targets(&self) -> &FxHashSet<frame::LocalQueueTarget> {
-        &self.targets
-    }
-}
-
-impl<S: UnboundedSender<Entry<Frame>>> UnboundedSender<Entry<Frame>>
-    for QueueTargetCollector<'_, S>
-{
-    fn send(&mut self, value: Entry<Frame>) -> Result<(), Entry<Frame>> {
-        if let Some(target) = value.header.local_queue_target() {
-            self.targets.insert(target);
-        }
-        self.inner.send(value)
-    }
+    queue_dispatcher.send_both_by_request(
+        &request,
+        || {
+            msg::Stream::Reset {
+                error_code: IDLE_TIMEOUT,
+            }
+            .into()
+        },
+        || {
+            msg::Control::Reset {
+                error_code: IDLE_TIMEOUT,
+            }
+            .into()
+        },
+        |waker_a, waker_b| {
+            let _ = waker_sink.send(waker_a);
+            let _ = waker_sink.send(waker_b);
+        },
+    );
 }
 
 pub async fn recv_idle_wheel_drain<Clk>(

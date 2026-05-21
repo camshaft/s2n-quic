@@ -20,7 +20,7 @@ use crate::{
     },
     intrusive::{Entry, Queue},
     packet::datagram::QueuePair,
-    socket::channel::{intrusive::unsync, UnboundedSender as _},
+    socket::channel::{UnboundedSender as _, intrusive::unsync},
     testing::sim,
     time::bach::Clock,
     xorshift::Rng,

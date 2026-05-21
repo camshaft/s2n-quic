@@ -9,12 +9,12 @@
 //! These tests verify the routing behavior of every output channel under different
 //! pending-data and frame-cancellation scenarios.
 use super::helpers::{
-    build_send_context, test_batch, test_batch_with_payload, test_entry_at, TestReceiverExt as _,
+    TestReceiverExt as _, build_send_context, test_batch, test_batch_with_payload, test_entry_at,
 };
 use crate::{
     endpoint::{combinator::AssemblerCounters, frame, id::Id, msg, send, tasks},
     socket::{
-        channel::{intrusive::unsync, ReceiverExt as _, UnboundedSender as _},
+        channel::{ReceiverExt as _, UnboundedSender as _, intrusive::unsync},
         pool::Pool,
         rate::Rate,
     },

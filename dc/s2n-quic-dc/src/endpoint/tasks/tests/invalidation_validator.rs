@@ -6,7 +6,7 @@ use crate::{
     credentials::Id,
     endpoint::{id::SendWorkerId, tasks},
     intrusive::Entry,
-    packet::{secret_control, WireVersion},
+    packet::{WireVersion, secret_control},
     path::secret::{map::Map, schedule, stateless_reset},
     socket::{channel::intrusive::unsync, pool::Pool},
     testing::{ext::*, sim},

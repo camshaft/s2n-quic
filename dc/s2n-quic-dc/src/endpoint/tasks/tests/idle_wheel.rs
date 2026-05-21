@@ -7,18 +7,20 @@
 //! On expiry the callback re-checks PathSecretEntry.last_activity — if still idle, the
 //! context is evicted from the cache; if activity occurred, it is rescheduled.
 
-use super::helpers::{test_entry, test_frame, RecvContextBuilder, TestReceiverExt, WakeNowSender};
+use super::helpers::{RecvContextBuilder, TestReceiverExt, WakeNowSender, test_entry, test_frame};
 use crate::{
     endpoint::{
         frame::{self, Frame},
         id::{Id, IdMap, LocalSendSocketId, LocalSenderId},
         msg, recv, send, tasks,
     },
+    flow,
     intrusive::Entry,
-    socket::channel::{intrusive::unsync, UnboundedSender as _},
+    socket::channel::{UnboundedSender as _, intrusive::unsync},
     testing::{ext::*, sim},
     time::{bach::Clock, precision},
 };
+use s2n_quic_core::varint::VarInt;
 use std::{cell::RefCell, rc::Rc};
 
 // ── Send idle wheel tests ────────────────────────────────────────────────────
@@ -29,6 +31,7 @@ fn setup_send() -> (
     unsync::Receiver<crate::intrusive::EntryAdapter<Frame>>,
     Clock,
     crate::counter::Registry,
+    msg::queue::Allocator,
 ) {
     let registry = crate::counter::Registry::default();
     let clock = Clock::default();
@@ -42,7 +45,8 @@ fn setup_send() -> (
 
     let (idle_wheel_tx, idle_wheel_rx) = unsync::new_with_adapter::<send::IdleWheelAdapter>();
     let (completed_tx, completed_rx) = unsync::new::<Frame>();
-    let queue_dispatcher = msg::queue::Allocator::new().dispatcher();
+    let queue_allocator = msg::queue::Allocator::new();
+    let queue_dispatcher = queue_allocator.dispatcher();
     let q_gauge = registry.register_queue_gauge("test.idle_wheel");
 
     tasks::send_idle_wheel_drain(
@@ -63,13 +67,21 @@ fn setup_send() -> (
     )
     .spawn();
 
-    (send_caches, idle_wheel_tx, completed_rx, clock, registry)
+    (
+        send_caches,
+        idle_wheel_tx,
+        completed_rx,
+        clock,
+        registry,
+        queue_allocator,
+    )
 }
 
 #[test]
 fn send_idle_wheel_expires_inactive_context() {
     sim(|| {
-        let (send_caches, mut idle_wheel_tx, mut completed_rx, clock, _registry) = setup_send();
+        let (send_caches, mut idle_wheel_tx, mut completed_rx, clock, _registry, _queue_allocator) =
+            setup_send();
 
         let pse = test_entry();
         // Simulate initial activity so is_idle_expired can fire
@@ -121,7 +133,8 @@ fn send_idle_wheel_expires_inactive_context() {
 #[test]
 fn send_idle_wheel_reschedules_active_context() {
     sim(|| {
-        let (send_caches, mut idle_wheel_tx, _completed_rx, clock, _registry) = setup_send();
+        let (send_caches, mut idle_wheel_tx, _completed_rx, clock, _registry, _queue_allocator) =
+            setup_send();
 
         let pse = test_entry();
         let ctx = send_caches[LocalSendSocketId::new(0)]
@@ -165,6 +178,77 @@ fn send_idle_wheel_reschedules_active_context() {
                     .context_count(),
                 0,
                 "context should be evicted after extended idle"
+            );
+        }
+        .primary()
+        .spawn();
+    });
+}
+
+#[test]
+fn send_idle_wheel_expires_reader_only_queue_with_reset() {
+    sim(|| {
+        let (send_caches, mut idle_wheel_tx, _completed_rx, clock, _registry, mut queue_allocator) =
+            setup_send();
+
+        let pse = test_entry();
+        pse.touch_activity(precision::Clock::now(&clock));
+
+        let stream_id = VarInt::from_u8(7);
+        let handle = flow::Handle::client(stream_id, pse.clone());
+        let (queue_control, queue_stream) = queue_allocator.alloc_or_grow(handle, None);
+
+        let ctx = send_caches[LocalSendSocketId::new(0)]
+            .borrow_mut()
+            .get_or_insert(&pse, &clock)
+            .unwrap();
+
+        {
+            let mut c = ctx.borrow_mut();
+            let timeout = c.path_secret_entry.idle_timeout();
+            c.idle_wheel.target_time = Some(precision::Clock::now(&clock) + timeout);
+        }
+        let _ = idle_wheel_tx.send(ctx);
+
+        let send_caches = send_caches.clone();
+        async move {
+            61.s().sleep().await;
+            assert_eq!(
+                send_caches[LocalSendSocketId::new(0)]
+                    .borrow()
+                    .context_count(),
+                0,
+                "context should be evicted after idle timeout"
+            );
+
+            let stream_queue = queue_stream
+                .try_swap()
+                .expect("stream queue should still be open");
+            assert!(
+                stream_queue.iter().any(|entry| {
+                    matches!(
+                        entry.as_ref(),
+                        msg::Stream::Reset {
+                            error_code
+                        } if *error_code == crate::endpoint::error::IDLE_TIMEOUT
+                    )
+                }),
+                "stream queue should receive idle-timeout reset"
+            );
+
+            let control_queue = queue_control
+                .try_swap()
+                .expect("control queue should still be open");
+            assert!(
+                control_queue.iter().any(|entry| {
+                    matches!(
+                        entry.as_ref(),
+                        msg::Control::Reset {
+                            error_code
+                        } if *error_code == crate::endpoint::error::IDLE_TIMEOUT
+                    )
+                }),
+                "control queue should receive idle-timeout reset"
             );
         }
         .primary()
