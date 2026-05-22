@@ -156,6 +156,11 @@ impl<S: 'static, C: 'static, Key: 'static> Sender<S, C, Key> {
     }
 
     #[inline]
+    pub fn queue_id(&self) -> VarInt {
+        unsafe { self.descriptor.queue_id() }
+    }
+
+    #[inline]
     pub fn send_stream(
         &self,
         entry: intrusive::Entry<S>,

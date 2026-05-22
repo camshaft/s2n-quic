@@ -1140,29 +1140,22 @@ fn handle_flow_data(
         }
         Err(flow::queue::Error::ValidationFailed(_, reason)) => {
             counters.on_data_validation_failed(reason);
-            if let Some(error_code) = reason.as_reset_code() {
-                debug!(
-                    stream_id = stream_id.as_u64(),
-                    queue_id = local_queue_id.as_u64(),
-                    ?reason,
-                    "FlowData validation failed - sending reset"
-                );
-                push_reset_frame_with_target(
-                    response_frames,
-                    counters,
-                    path_secret_entry,
-                    queue_pair.source_queue_id,
-                    stream_id,
-                    ResetTarget::Both,
-                    error_code,
-                );
-            } else {
-                trace!(
-                    stream_id = stream_id.as_u64(),
-                    queue_id = local_queue_id.as_u64(),
-                    "FlowData for previous occupant - dropping"
-                );
-            }
+            let error_code = reason.as_reset_code();
+            debug!(
+                stream_id = stream_id.as_u64(),
+                queue_id = local_queue_id.as_u64(),
+                ?reason,
+                "FlowData validation failed - sending reset"
+            );
+            push_reset_frame_with_target(
+                response_frames,
+                counters,
+                path_secret_entry,
+                queue_pair.source_queue_id,
+                stream_id,
+                ResetTarget::Both,
+                error_code,
+            );
         }
         Err(flow::queue::Error::PermanentlyClosed) => {
             counters.rx_data_perm_closed.add(1);
@@ -1308,29 +1301,22 @@ fn dispatch_control_message(
         }
         Err(flow::queue::Error::ValidationFailed(_, reason)) => {
             counters.on_flow_control_validation_failed(reason);
-            if let Some(error_code) = reason.as_reset_code() {
-                debug!(
-                    stream_id = stream_id.as_u64(),
-                    queue_id = local_queue_id.as_u64(),
-                    ?reason,
-                    "flow control validation failed - sending reset"
-                );
-                push_reset_frame_with_target(
-                    response_frames,
-                    counters,
-                    path_secret_entry,
-                    queue_pair.source_queue_id,
-                    stream_id,
-                    ResetTarget::Both,
-                    error_code,
-                );
-            } else {
-                trace!(
-                    stream_id = stream_id.as_u64(),
-                    queue_id = local_queue_id.as_u64(),
-                    "flow control for previous occupant - dropping"
-                );
-            }
+            let error_code = reason.as_reset_code();
+            debug!(
+                stream_id = stream_id.as_u64(),
+                queue_id = local_queue_id.as_u64(),
+                ?reason,
+                "flow control validation failed - sending reset"
+            );
+            push_reset_frame_with_target(
+                response_frames,
+                counters,
+                path_secret_entry,
+                queue_pair.source_queue_id,
+                stream_id,
+                ResetTarget::Both,
+                error_code,
+            );
             false
         }
         Err(flow::queue::Error::PermanentlyClosed) => {

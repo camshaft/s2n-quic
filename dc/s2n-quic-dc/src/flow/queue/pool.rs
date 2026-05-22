@@ -4,10 +4,10 @@ use super::{
     descriptor::{Descriptor, DescriptorInner},
     free_list::{self, FreeVec},
     handle::{Control, Sender, Stream},
+    queue_id,
     sender::{self, Senders},
 };
 use crate::tracing::*;
-use s2n_quic_core::varint::VarInt;
 use std::{alloc::Layout, marker::PhantomData, ptr::NonNull, sync::Arc};
 
 pub struct Pool<S: 'static + Send, C: 'static + Send, Key: 'static + Send, const PAGE_SIZE: usize> {
@@ -15,8 +15,7 @@ pub struct Pool<S: 'static + Send, C: 'static + Send, Key: 'static + Send, const
     free: Arc<FreeVec<S, C, Key>>,
     /// Holds the backing memory allocated as long as there's at least one reference
     memory_handle: Arc<free_list::Memory<S, C, Key>>,
-    epoch: VarInt,
-    base: VarInt,
+    epoch: usize,
 }
 
 impl<S: 'static + Send, C: 'static + Send, Key: 'static + Send, const PAGE_SIZE: usize> Clone
@@ -29,7 +28,6 @@ impl<S: 'static + Send, C: 'static + Send, Key: 'static + Send, const PAGE_SIZE:
             memory_handle: self.memory_handle.clone(),
             senders: self.senders.clone(),
             epoch: self.epoch,
-            base: self.base,
         }
     }
 }
@@ -42,7 +40,7 @@ where
 {
     #[inline]
     pub fn new() -> Self {
-        let epoch = VarInt::ZERO;
+        let epoch = 0;
         let senders = sender::State::new(epoch);
         let (free, memory_handle) = FreeVec::new(PAGE_SIZE);
         let mut pool = Pool {
@@ -50,7 +48,6 @@ where
             memory_handle,
             senders,
             epoch,
-            base: epoch,
         };
         pool.grow();
         pool
@@ -63,7 +60,6 @@ where
             // make sure the memory lives as long as this sender is alive
             memory_handle: self.memory_handle.clone(),
             local: Default::default(),
-            base: self.base,
         }
     }
 
@@ -95,6 +91,11 @@ where
 
     #[inline(never)] // this should happen rarely
     fn grow(&mut self) {
+        assert!(
+            self.epoch + PAGE_SIZE <= queue_id::MAX_SLOTS,
+            "flow queue slot space exhausted"
+        );
+
         let (region, layout) = Region::alloc(PAGE_SIZE);
 
         let ptr = region.ptr;
@@ -164,7 +165,7 @@ where
         // we don't need to synchronize with the senders any more so drop the local
         drop(senders);
 
-        debug!(%epoch, "grow");
+        debug!(epoch = epoch, "grow");
 
         // push all of the descriptors into the free list
         self.free.record_region(region, pending_desc);

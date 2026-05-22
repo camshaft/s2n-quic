@@ -14,6 +14,7 @@ mod handle;
 mod inner;
 mod pool;
 mod probes;
+mod queue_id;
 mod sender;
 
 // Re-export the Key trait
