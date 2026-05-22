@@ -309,7 +309,7 @@ jobs:
     permissions:
       pull-requests: write
     steps:
-      - name: Optionally request reviewers/teams
+      - name: Request reviewers/teams if configured
         uses: actions/github-script@v8
         env:
           REVIEWERS: ${{ vars.CI_AUTOFIX_REVIEWERS }}
@@ -372,6 +372,11 @@ jobs:
 
             let closedIssues = 0;
             let closedPRs = 0;
+            const closedPrNumbers = new Set();
+            const parseTimestampOrDefault = (value, fallback = 0) => {
+              const ts = Date.parse(value || '');
+              return Number.isNaN(ts) ? fallback : ts;
+            };
 
             for (const issue of openIssues) {
               if (issue.pull_request) continue;
@@ -395,7 +400,12 @@ jobs:
                 per_page: 20,
               });
 
-              const latestRun = (runs.data.workflow_runs || [])[0];
+              const workflowRuns = (runs.data.workflow_runs || []).toSorted((a, b) => {
+                const aTs = parseTimestampOrDefault(a.created_at, 0);
+                const bTs = parseTimestampOrDefault(b.created_at, 0);
+                return bTs - aTs;
+              });
+              const latestRun = workflowRuns[0];
               if (!latestRun || latestRun.conclusion !== 'success') continue;
 
               await github.rest.issues.createComment({
@@ -415,6 +425,7 @@ jobs:
               closedIssues += 1;
 
               for (const pr of openPRs) {
+                if (closedPrNumbers.has(pr.number)) continue;
                 const labels = (pr.labels || []).map(l => l.name || '');
                 const prBody = pr.body || '';
                 const title = pr.title || '';
@@ -440,6 +451,7 @@ jobs:
                   pull_number: pr.number,
                   state: 'closed',
                 });
+                closedPrNumbers.add(pr.number);
                 closedPRs += 1;
               }
             }
