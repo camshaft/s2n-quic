@@ -296,8 +296,10 @@ mod tests {
             .create()
             .expect("bind should work");
 
-        let send_local_addr = send_sockets[0].0.local_addr().expect("send addr");
-        let recv_local_addr = recv_sockets[0].local_addr().expect("recv addr");
-        assert_eq!(send_local_addr, recv_local_addr);
+        for idx in 0..2 {
+            let send_local_addr = send_sockets[idx].0.local_addr().expect("send addr");
+            let recv_local_addr = recv_sockets[idx].local_addr().expect("recv addr");
+            assert_eq!(send_local_addr, recv_local_addr);
+        }
     }
 }
