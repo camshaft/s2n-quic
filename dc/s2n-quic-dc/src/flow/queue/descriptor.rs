@@ -111,8 +111,19 @@ impl<S: 'static, C: 'static, Key: 'static> Descriptor<S, C, Key> {
     /// The caller needs to guarantee the [`Descriptor`] is still allocated.
     #[inline]
     pub unsafe fn queue_id(&self) -> VarInt {
+        self.try_queue_id()
+            .expect("queue id should be initialized while allocated")
+    }
+
+    /// Returns the queue ID if this descriptor is currently allocated.
+    ///
+    /// # Safety
+    ///
+    /// The caller needs to guarantee the [`Descriptor`] is still allocated.
+    #[inline]
+    pub unsafe fn try_queue_id(&self) -> Option<VarInt> {
         let v = self.inner().queue_id.load(Ordering::Relaxed);
-        unsafe { VarInt::new_unchecked(v) }
+        VarInt::new(v).ok()
     }
 
     /// Returns the peer's queue ID, or `None` if not yet observed.
@@ -181,8 +192,13 @@ impl<S: 'static, C: 'static, Key: 'static> Descriptor<S, C, Key> {
     pub unsafe fn into_receiver_pair(self, remote_queue_id: Option<VarInt>) -> (Self, Self) {
         let inner = self.inner();
 
-        let generation = inner.next_generation.fetch_add(1, Ordering::Relaxed);
-        let queue_id = queue_id::encode(inner.index, generation);
+        let generation = {
+            let generation = &mut *inner.next_generation.get();
+            let current = *generation;
+            *generation = current.wrapping_add(1);
+            current
+        };
+        let queue_id = queue_id::encode(inner.id.as_u64() as usize, generation);
         inner.queue_id.store(queue_id.as_u64(), Ordering::Relaxed);
 
         let has_remote_queue_id = remote_queue_id.is_some();
@@ -255,6 +271,9 @@ impl<S: 'static, C: 'static, Key: 'static> Descriptor<S, C, Key> {
 
         probes::on_receiver_free(inner.id, half);
 
+        inner
+            .queue_id
+            .store(REMOTE_QUEUE_ID_UNKNOWN, Ordering::Relaxed);
         inner.clear_key();
 
         let storage = inner.free_list.free(Descriptor {
@@ -293,13 +312,12 @@ const REMOTE_QUEUE_ID_UNKNOWN: u64 = u64::MAX;
 
 pub(super) struct DescriptorInner<S, C, Key> {
     id: VarInt,
-    index: usize,
     queue_id: AtomicU64,
     /// The peer's queue ID, written once by the dispatcher on first observation.
     /// Initialized to `u64::MAX` (unknown) and set via a relaxed store.
     remote_queue_id: AtomicU64,
     key: UnsafeCell<Option<Key>>,
-    next_generation: AtomicU64,
+    next_generation: UnsafeCell<u64>,
     stream: Queue<S>,
     control: Queue<C>,
     /// A reference back to the free list
@@ -313,11 +331,10 @@ impl<S, C, Key> DescriptorInner<S, C, Key> {
         let control = Queue::new(Half::Control);
         Self {
             id: VarInt::new(index as u64).unwrap(),
-            index,
-            queue_id: AtomicU64::new(queue_id::encode(index, 0).as_u64()),
+            queue_id: AtomicU64::new(REMOTE_QUEUE_ID_UNKNOWN),
             remote_queue_id: AtomicU64::new(REMOTE_QUEUE_ID_UNKNOWN),
             key: UnsafeCell::new(None),
-            next_generation: AtomicU64::new(0),
+            next_generation: UnsafeCell::new(0),
             stream,
             control,
             senders: AtomicUsize::new(0),
@@ -347,8 +364,7 @@ mod tests {
         let index = 1234;
         let generation = queue_id::GENERATION_MASK;
         let queue_id = queue_id::encode(index, generation);
-        let decoded_generation = queue_id.as_u64() >> queue_id::INDEX_BITS;
-        assert_eq!(decoded_generation, generation);
+        assert_eq!(queue_id::generation(queue_id), generation);
         assert_eq!(queue_id::index(queue_id), index);
     }
 }

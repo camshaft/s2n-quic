@@ -161,6 +161,11 @@ impl<S: 'static, C: 'static, Key: 'static> Sender<S, C, Key> {
     }
 
     #[inline]
+    pub(super) fn try_queue_id(&self) -> Option<VarInt> {
+        unsafe { self.descriptor.try_queue_id() }
+    }
+
+    #[inline]
     pub fn send_stream(
         &self,
         entry: intrusive::Entry<S>,

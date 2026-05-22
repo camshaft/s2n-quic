@@ -4,19 +4,49 @@
 use s2n_quic_core::varint::VarInt;
 
 pub const INDEX_BITS: u32 = 25;
-pub const INDEX_MASK: u64 = (1u64 << INDEX_BITS) - 1;
 pub const GENERATION_BITS: u32 = 62 - INDEX_BITS;
 pub const GENERATION_MASK: u64 = (1u64 << GENERATION_BITS) - 1;
 pub const MAX_SLOTS: usize = 1usize << INDEX_BITS;
+const INDEX_LOW_BITS: u32 = 20;
+const INDEX_HIGH_BITS: u32 = INDEX_BITS - INDEX_LOW_BITS;
+const GENERATION_LOW_BITS: u32 = 10;
+const INDEX_LOW_MASK: u64 = (1u64 << INDEX_LOW_BITS) - 1;
+const INDEX_HIGH_MASK: u64 = (1u64 << INDEX_HIGH_BITS) - 1;
+const GENERATION_LOW_MASK: u64 = (1u64 << GENERATION_LOW_BITS) - 1;
+const GENERATION_HIGH_MASK: u64 = (1u64 << (GENERATION_BITS - GENERATION_LOW_BITS)) - 1;
+const GENERATION_LOW_SHIFT: u32 = INDEX_LOW_BITS;
+const GENERATION_HIGH_SHIFT: u32 = INDEX_LOW_BITS + GENERATION_LOW_BITS;
+const INDEX_HIGH_SHIFT: u32 = GENERATION_HIGH_SHIFT + (GENERATION_BITS - GENERATION_LOW_BITS);
 
 #[inline]
 pub fn encode(index: usize, generation: u64) -> VarInt {
     debug_assert!(index < MAX_SLOTS);
-    let value = ((generation & GENERATION_MASK) << INDEX_BITS) | index as u64;
+    let index = index as u64;
+    let generation = generation & GENERATION_MASK;
+    let index_low = index & INDEX_LOW_MASK;
+    let index_high = (index >> INDEX_LOW_BITS) & INDEX_HIGH_MASK;
+    let generation_low = generation & GENERATION_LOW_MASK;
+    let generation_high = (generation >> GENERATION_LOW_BITS) & GENERATION_HIGH_MASK;
+    let value = index_low
+        | (generation_low << GENERATION_LOW_SHIFT)
+        | (generation_high << GENERATION_HIGH_SHIFT)
+        | (index_high << INDEX_HIGH_SHIFT);
     unsafe { VarInt::new_unchecked(value) }
 }
 
 #[inline]
 pub fn index(queue_id: VarInt) -> usize {
-    (queue_id.as_u64() & INDEX_MASK) as usize
+    let value = queue_id.as_u64();
+    let index_low = value & INDEX_LOW_MASK;
+    let index_high = (value >> INDEX_HIGH_SHIFT) & INDEX_HIGH_MASK;
+    ((index_high << INDEX_LOW_BITS) | index_low) as usize
+}
+
+#[cfg(test)]
+#[inline]
+pub fn generation(queue_id: VarInt) -> u64 {
+    let value = queue_id.as_u64();
+    let generation_low = (value >> GENERATION_LOW_SHIFT) & GENERATION_LOW_MASK;
+    let generation_high = (value >> GENERATION_HIGH_SHIFT) & GENERATION_HIGH_MASK;
+    (generation_high << GENERATION_LOW_BITS) | generation_low
 }
