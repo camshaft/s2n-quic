@@ -9,35 +9,37 @@ const DEFAULT_BUFFER_SIZE: usize = 200 * 1024 * 1024;
 
 /// Configuration for send socket creation.
 pub struct SendConfig {
-    pub num_sockets: usize,
-    pub bind_addr: SocketAddr,
+    pub bind_addrs: Vec<SocketAddr>,
+    pub nic_index: Option<u32>,
     pub gso: features::Gso,
     pub send_buffer: usize,
 }
 
 impl SendConfig {
-    pub fn new(num_sockets: usize, bind_addr: SocketAddr, gso: features::Gso) -> Self {
+    pub fn new(bind_addrs: Vec<SocketAddr>, gso: features::Gso) -> Self {
         Self {
-            num_sockets,
-            bind_addr,
+            bind_addrs,
+            nic_index: None,
             gso,
             send_buffer: DEFAULT_BUFFER_SIZE,
         }
     }
 
     /// Creates send sockets with GSO support.
-    ///
-    /// Each socket binds to an ephemeral port on the given address. Recv buffer is zeroed
-    /// since these sockets don't receive.
     pub fn create(&self) -> io::Result<Vec<GsoSocket<std::net::UdpSocket>>> {
-        let mut sockets = Vec::with_capacity(self.num_sockets);
+        if self.bind_addrs.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "at least one send bind address is required",
+            ));
+        }
 
-        let mut bind_addr = self.bind_addr;
-        bind_addr.set_port(0);
+        let mut sockets = Vec::with_capacity(self.bind_addrs.len());
 
-        for _ in 0..self.num_sockets {
+        for bind_addr in &self.bind_addrs {
             let mut opts = Options::default();
-            opts.addr = bind_addr;
+            opts.addr = *bind_addr;
+            opts.bind_interface_index = self.nic_index;
             opts.blocking = false;
             opts.send_buffer = Some(self.send_buffer);
             opts.recv_buffer = Some(0);
@@ -65,35 +67,35 @@ impl SendConfig {
 /// target individual recv workers directly (bypassing kernel RSS). The full list
 /// of bound addresses is advertised to peers during the handshake.
 pub struct RecvConfig {
-    pub num_sockets: usize,
-    pub bind_addr: SocketAddr,
+    pub bind_addrs: Vec<SocketAddr>,
+    pub nic_index: Option<u32>,
     pub recv_buffer: usize,
 }
 
 impl RecvConfig {
-    pub fn new(num_sockets: usize, bind_addr: SocketAddr) -> Self {
+    pub fn new(bind_addrs: Vec<SocketAddr>) -> Self {
         Self {
-            num_sockets,
-            bind_addr,
+            bind_addrs,
+            nic_index: None,
             recv_buffer: DEFAULT_BUFFER_SIZE,
         }
     }
 
-    /// Creates receive sockets, each bound to its own ephemeral port.
-    ///
-    /// Every socket gets a distinct address on the same IP so remote senders can
-    /// distribute traffic across recv workers without relying on RSS hashing.
-    /// GRO is enabled for coalescing received segments. Send buffer is zeroed
-    /// since these sockets don't send.
+    /// Creates receive sockets.
     pub fn create(&self) -> io::Result<Vec<std::net::UdpSocket>> {
-        let mut sockets = Vec::with_capacity(self.num_sockets);
+        if self.bind_addrs.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "at least one recv bind address is required",
+            ));
+        }
 
-        let mut bind_addr = self.bind_addr;
-        bind_addr.set_port(0);
+        let mut sockets = Vec::with_capacity(self.bind_addrs.len());
 
-        for _ in 0..self.num_sockets {
+        for bind_addr in &self.bind_addrs {
             let mut opts = Options::default();
-            opts.addr = bind_addr;
+            opts.addr = *bind_addr;
+            opts.bind_interface_index = self.nic_index;
             opts.gro = true;
             opts.blocking = false;
             opts.recv_buffer = Some(self.recv_buffer);
@@ -191,5 +193,35 @@ impl<S: crate::socket::recv::Socket> crate::socket::recv::Socket for Metered<S> 
             core::task::Poll::Pending => {}
         }
         result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{Ipv4Addr, SocketAddrV4};
+
+    #[test]
+    fn send_config_requires_bind_addrs() {
+        let config = SendConfig::new(Vec::new(), features::Gso::default());
+        let err = config.create().expect_err("empty bind_addrs should error");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn recv_config_requires_bind_addrs() {
+        let config = RecvConfig::new(Vec::new());
+        let err = config.create().expect_err("empty bind_addrs should error");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn recv_config_binds_to_each_addr() {
+        let addrs = vec![
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+        ];
+        let sockets = RecvConfig::new(addrs).create().expect("bind should work");
+        assert_eq!(sockets.len(), 2);
     }
 }

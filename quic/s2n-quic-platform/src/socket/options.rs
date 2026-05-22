@@ -24,6 +24,7 @@ pub enum ReusePort {
 #[non_exhaustive]
 pub struct Options {
     pub addr: SocketAddr,
+    pub bind_interface_index: Option<u32>,
     pub reuse_address: bool,
     pub reuse_port: ReusePort,
     pub gro: bool,
@@ -40,6 +41,7 @@ impl Default for Options {
     fn default() -> Self {
         Self {
             addr: SocketAddress::default().into(),
+            bind_interface_index: None,
             reuse_address: false,
             reuse_port: Default::default(),
             gro: true,
@@ -113,10 +115,55 @@ impl Options {
             set_reuse_port(socket)?;
         }
 
+        if let Some(interface_index) = self.bind_interface_index {
+            bind_to_interface_index(socket, interface_index)?;
+        }
+
         socket.bind(&self.addr.into())?;
 
         if let ReusePort::AfterBind = self.reuse_port {
             set_reuse_port(socket)?;
+        }
+
+        #[cfg(target_os = "linux")]
+        fn bind_to_interface_index(socket: &socket2::Socket, interface_index: u32) -> io::Result<()> {
+            use std::os::fd::AsRawFd;
+
+            let mut ifname = [0 as libc::c_char; libc::IF_NAMESIZE];
+            let ifname_ptr = unsafe { libc::if_indextoname(interface_index, ifname.as_mut_ptr()) };
+            if ifname_ptr.is_null() {
+                return Err(io::Error::last_os_error());
+            }
+
+            let ifname_len = ifname
+                .iter()
+                .position(|&c| c == 0)
+                .map(|len| len + 1)
+                .unwrap_or(ifname.len());
+
+            let ret = unsafe {
+                libc::setsockopt(
+                    socket.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_BINDTODEVICE,
+                    ifname.as_ptr() as *const _,
+                    ifname_len as _,
+                )
+            };
+
+            if ret < 0 {
+                return Err(io::Error::last_os_error());
+            }
+
+            Ok(())
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        fn bind_to_interface_index(_socket: &socket2::Socket, _interface_index: u32) -> io::Result<()> {
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "binding to a NIC index is only supported on Linux",
+            ))
         }
 
         Ok(())

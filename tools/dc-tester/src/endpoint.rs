@@ -27,7 +27,10 @@ pub fn create(
     let map = secret::Map::new(signer, 50_000, true, clock, subscriber);
 
     // Create recv sockets first to determine the data port
-    let recv_sockets = socket::RecvConfig::new(config.recv_io_workers, bind_addr).busy_poll()?;
+    let recv_bind_addrs = (0..config.recv_io_workers)
+        .map(|_| SocketAddr::new(bind_addr.ip(), 0))
+        .collect();
+    let recv_sockets = socket::RecvConfig::new(recv_bind_addrs).busy_poll()?;
 
     {
         let recv_port = recv_sockets.first().unwrap().local_addr().unwrap().port();
@@ -39,8 +42,10 @@ pub fn create(
 
     // Create send sockets
     let gso = endpoint::Gso::default();
-    let send_sockets =
-        socket::SendConfig::new(config.send_sockets, bind_addr, gso.clone()).busy_poll()?;
+    let send_bind_addrs = (0..config.send_sockets)
+        .map(|_| SocketAddr::new(bind_addr.ip(), 0))
+        .collect();
+    let send_sockets = socket::SendConfig::new(send_bind_addrs, gso.clone()).busy_poll()?;
 
     {
         let send_ports: Vec<u16> = send_sockets
