@@ -8,6 +8,7 @@ use super::{
     sender::{self, Senders},
 };
 use crate::tracing::*;
+use s2n_quic_core::varint::VarInt;
 use std::{alloc::Layout, marker::PhantomData, ptr::NonNull, sync::Arc};
 
 pub struct Pool<S: 'static + Send, C: 'static + Send, Key: 'static + Send, const PAGE_SIZE: usize> {
