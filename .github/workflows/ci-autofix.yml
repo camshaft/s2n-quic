@@ -80,7 +80,13 @@ jobs:
               const title = pr.title || '';
               const body = pr.body || '';
               const labels = (pr.labels || []).map(l => l.name || '');
-              return labels.includes('ci-autofix') && (body.includes(sha) || title.includes(sha.slice(0, 12)));
+              const shortSha = sha.slice(0, 12);
+              return labels.includes('ci-autofix') && (
+                body.includes(sha) ||
+                body.includes(shortSha) ||
+                title.includes(sha) ||
+                title.includes(shortSha)
+              );
             });
 
             if (duplicatePR) {
@@ -116,6 +122,7 @@ jobs:
           LOG_RAW="$RUNNER_TEMP/ci-autofix/failed.log"
           LOG_SNIPPET="$RUNNER_TEMP/ci-autofix/failed-snippet.txt"
           TASK_FILE="$RUNNER_TEMP/ci-autofix/task.md"
+          # Keep excerpts compact enough for issue bodies while still showing context.
           MAX_LOG_LINES=220
 
           gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID/jobs?per_page=100" > "$JOBS_JSON"
@@ -137,7 +144,10 @@ jobs:
           {
             echo "----- START OF FAILED LOG EXCERPT -----"
             if [ -s "$LOG_RAW" ]; then
-              sed -n "1,${MAX_LOG_LINES}p" "$LOG_RAW"
+              HALF_LOG_LINES=$((MAX_LOG_LINES / 2))
+              sed -n "1,${HALF_LOG_LINES}p" "$LOG_RAW"
+              echo "----- MIDDLE LOG CONTENT OMITTED -----"
+              tail -n "$HALF_LOG_LINES" "$LOG_RAW"
             else
               echo "No failed log output captured by gh run view --log-failed"
             fi
@@ -163,7 +173,7 @@ jobs:
             echo "1. Reproduce and fix the failing CI condition with the smallest possible code change."
             echo "2. Keep scope tightly limited to the failure root cause."
             echo "3. Open a PR (do not push to main) from branch: copilot/ci-autofix/$SHORT_SHA."
-            echo "4. PR title must be: [ci-autofix] $WORKFLOW_NAME failure on $SHORT_SHA."
+            echo "4. PR title must start with: [ci-autofix] $WORKFLOW_NAME failure on $SHORT_SHA."
             echo "5. Add labels: ci-autofix and bot."
             echo "6. PR body must include this run URL: $RUN_URL."
             echo "7. Ensure required checks pass before merge."
@@ -393,7 +403,12 @@ jobs:
                 const prBody = pr.body || '';
                 const title = pr.title || '';
                 const shaNeedle = sha.slice(0, 12);
-                const looksRelated = labels.includes('ci-autofix') && (prBody.includes(sha) || prBody.includes(shaNeedle) || title.includes(shaNeedle));
+                const looksRelated = labels.includes('ci-autofix') && (
+                  prBody.includes(sha) ||
+                  prBody.includes(shaNeedle) ||
+                  title.includes(sha) ||
+                  title.includes(shaNeedle)
+                );
                 if (!looksRelated) continue;
 
                 await github.rest.issues.createComment({
