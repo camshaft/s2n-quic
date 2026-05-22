@@ -7,7 +7,7 @@ use std::{ffi::CString, io, net::SocketAddr};
 
 const DEFAULT_BUFFER_SIZE: usize = 200 * 1024 * 1024;
 
-/// Configuration for send socket creation.
+/// Per-socket bind configuration.
 #[derive(Clone, Debug)]
 pub struct BindAddress {
     pub addr: SocketAddr,
@@ -21,88 +21,70 @@ impl From<SocketAddr> for BindAddress {
     }
 }
 
-/// Configuration for send socket creation.
-pub struct SendConfig {
+/// Configuration for endpoint socket creation.
+pub struct Config {
     pub bind_addrs: Vec<BindAddress>,
+    pub num_send_sockets: usize,
+    pub num_recv_sockets: usize,
     pub gso: features::Gso,
     pub send_buffer: usize,
-}
-
-impl SendConfig {
-    pub fn new(bind_addrs: Vec<BindAddress>, gso: features::Gso) -> Self {
-        Self {
-            bind_addrs,
-            gso,
-            send_buffer: DEFAULT_BUFFER_SIZE,
-        }
-    }
-
-    /// Creates send sockets with GSO support.
-    pub fn create(&self) -> io::Result<Vec<GsoSocket<std::net::UdpSocket>>> {
-        if self.bind_addrs.is_empty() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "at least one send bind address is required",
-            ));
-        }
-
-        let mut sockets = Vec::with_capacity(self.bind_addrs.len());
-
-        for bind_addr in &self.bind_addrs {
-            let mut opts = Options::default();
-            opts.addr = bind_addr.addr;
-            opts.bind_interface = bind_addr.ifname.clone();
-            opts.blocking = false;
-            opts.send_buffer = Some(self.send_buffer);
-            opts.recv_buffer = Some(0);
-            let socket = opts.build_udp()?;
-
-            let socket = GsoSocket(socket, self.gso.clone());
-            sockets.push(socket);
-        }
-
-        Ok(sockets)
-    }
-
-    pub fn busy_poll(&self) -> io::Result<Vec<GsoSocket<BusyPoll<std::net::UdpSocket>>>> {
-        let sockets = self.create()?;
-        Ok(sockets
-            .into_iter()
-            .map(|GsoSocket(s, gso)| GsoSocket(BusyPoll(s), gso))
-            .collect())
-    }
-}
-
-/// Configuration for receive socket creation.
-///
-/// Each recv socket binds to its own distinct address so that remote senders can
-/// target individual recv workers directly (bypassing kernel RSS). The full list
-/// of bound addresses is advertised to peers during the handshake.
-pub struct RecvConfig {
-    pub bind_addrs: Vec<BindAddress>,
     pub recv_buffer: usize,
 }
 
-impl RecvConfig {
-    pub fn new(bind_addrs: Vec<BindAddress>) -> Self {
+impl Config {
+    pub fn new(
+        bind_addrs: Vec<BindAddress>,
+        num_send_sockets: usize,
+        num_recv_sockets: usize,
+        gso: features::Gso,
+    ) -> Self {
         Self {
             bind_addrs,
+            num_send_sockets,
+            num_recv_sockets,
+            gso,
+            send_buffer: DEFAULT_BUFFER_SIZE,
             recv_buffer: DEFAULT_BUFFER_SIZE,
         }
     }
 
-    /// Creates receive sockets.
-    pub fn create(&self) -> io::Result<Vec<std::net::UdpSocket>> {
+    fn validate(&self) -> io::Result<()> {
         if self.bind_addrs.is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "at least one recv bind address is required",
+                "at least one bind address is required",
             ));
         }
 
-        let mut sockets = Vec::with_capacity(self.bind_addrs.len());
+        let max_sockets = self.num_send_sockets.max(self.num_recv_sockets);
+        if max_sockets == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "at least one send or recv socket is required",
+            ));
+        }
 
-        for bind_addr in &self.bind_addrs {
+        if self.bind_addrs.len() < max_sockets {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "bind_addrs length must be >= max(num_send_sockets, num_recv_sockets)",
+            ));
+        }
+
+        Ok(())
+    }
+
+    /// Creates send and receive sockets.
+    pub fn create(
+        &self,
+    ) -> io::Result<(
+        Vec<GsoSocket<std::net::UdpSocket>>,
+        Vec<std::net::UdpSocket>,
+    )> {
+        self.validate()?;
+
+        let mut recv_sockets = Vec::with_capacity(self.num_recv_sockets);
+        for bind_addr in self.bind_addrs.iter().take(self.num_recv_sockets) {
             let mut opts = Options::default();
             opts.addr = bind_addr.addr;
             opts.bind_interface = bind_addr.ifname.clone();
@@ -110,15 +92,38 @@ impl RecvConfig {
             opts.blocking = false;
             opts.recv_buffer = Some(self.recv_buffer);
             opts.send_buffer = Some(0);
-            sockets.push(opts.build_udp()?);
+            recv_sockets.push(opts.build_udp()?);
         }
 
-        Ok(sockets)
+        let mut send_sockets = Vec::with_capacity(self.num_send_sockets);
+        for bind_addr in self.bind_addrs.iter().take(self.num_send_sockets) {
+            let mut opts = Options::default();
+            opts.addr = bind_addr.addr;
+            opts.bind_interface = bind_addr.ifname.clone();
+            opts.blocking = false;
+            opts.send_buffer = Some(self.send_buffer);
+            opts.recv_buffer = Some(0);
+            let socket = opts.build_udp()?;
+            let socket = GsoSocket(socket, self.gso.clone());
+            send_sockets.push(socket);
+        }
+
+        Ok((send_sockets, recv_sockets))
     }
 
-    pub fn busy_poll(&self) -> io::Result<Vec<BusyPoll<std::net::UdpSocket>>> {
-        let sockets = self.create()?;
-        Ok(sockets.into_iter().map(BusyPoll).collect())
+    pub fn busy_poll(
+        &self,
+    ) -> io::Result<(
+        Vec<GsoSocket<BusyPoll<std::net::UdpSocket>>>,
+        Vec<BusyPoll<std::net::UdpSocket>>,
+    )> {
+        let (send_sockets, recv_sockets) = self.create()?;
+        let send_sockets = send_sockets
+            .into_iter()
+            .map(|GsoSocket(s, gso)| GsoSocket(BusyPoll(s), gso))
+            .collect();
+        let recv_sockets = recv_sockets.into_iter().map(BusyPoll).collect();
+        Ok((send_sockets, recv_sockets))
     }
 }
 
@@ -212,8 +217,8 @@ mod tests {
     use std::net::{Ipv4Addr, SocketAddrV4};
 
     #[test]
-    fn send_config_requires_bind_addrs() {
-        let config = SendConfig::new(Vec::new(), features::Gso::default());
+    fn config_requires_bind_addrs() {
+        let config = Config::new(Vec::new(), 1, 1, features::Gso::default());
         match config.create() {
             Err(err) => assert_eq!(err.kind(), io::ErrorKind::InvalidInput),
             Ok(_) => panic!("empty bind_addrs should error"),
@@ -221,21 +226,35 @@ mod tests {
     }
 
     #[test]
-    fn recv_config_requires_bind_addrs() {
-        let config = RecvConfig::new(Vec::new());
+    fn config_requires_enough_bind_addrs() {
+        let addrs = vec![SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).into()];
+        let config = Config::new(addrs, 2, 1, features::Gso::default());
         match config.create() {
             Err(err) => assert_eq!(err.kind(), io::ErrorKind::InvalidInput),
-            Ok(_) => panic!("empty bind_addrs should error"),
+            Ok(_) => panic!("insufficient bind_addrs should error"),
         }
     }
 
     #[test]
-    fn recv_config_binds_to_each_addr() {
+    fn config_requires_non_zero_socket_count() {
+        let addrs = vec![SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).into()];
+        let config = Config::new(addrs, 0, 0, features::Gso::default());
+        match config.create() {
+            Err(err) => assert_eq!(err.kind(), io::ErrorKind::InvalidInput),
+            Ok(_) => panic!("zero socket counts should error"),
+        }
+    }
+
+    #[test]
+    fn config_binds_to_each_requested_addr() {
         let addrs = vec![
             SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).into(),
             SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).into(),
         ];
-        let sockets = RecvConfig::new(addrs).create().expect("bind should work");
-        assert_eq!(sockets.len(), 2);
+        let (send_sockets, recv_sockets) = Config::new(addrs, 2, 1, features::Gso::default())
+            .create()
+            .expect("bind should work");
+        assert_eq!(send_sockets.len(), 2);
+        assert_eq!(recv_sockets.len(), 1);
     }
 }
