@@ -116,6 +116,8 @@ impl<S: 'static, C: 'static, Key: 'static> Descriptor<S, C, Key> {
             VarInt::new(v).is_ok(),
             "queue id should be initialized while allocated"
         );
+        // SAFETY: callers must only invoke this for allocated descriptors, and
+        // allocation initializes `queue_id` with a valid VarInt encoding.
         unsafe { VarInt::new_unchecked(v) }
     }
 
