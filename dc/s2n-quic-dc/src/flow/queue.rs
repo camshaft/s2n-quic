@@ -25,7 +25,10 @@ pub use inner::AutoWake;
 ///
 /// Subsequent pages double in size so the pool converges quickly to the right
 /// capacity, similar to how `std::vec::Vec` grows.
-const INITIAL_PAGE_SIZE: usize = u16::MAX as _;
+///
+/// In test builds a smaller value is used to exercise growth branches without
+/// the overhead of allocating 65 535 slots per test endpoint.
+const INITIAL_PAGE_SIZE: usize = if cfg!(test) { 8 } else { u16::MAX as _ };
 
 pub type Error<T> = inner::Error<T>;
 pub type Control<S, C, K> = handle::Control<S, C, K>;

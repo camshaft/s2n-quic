@@ -137,3 +137,60 @@ impl<S: 'static, C: 'static, Key: 'static> SenderPages<S, C, Key> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bolero::check;
+
+    /// Oracle for `find_page`: walks pages linearly so it does not share any
+    /// code with the O(1) implementation under test.
+    fn oracle_find_page<const PS: usize>(slot: usize) -> (usize, usize) {
+        let mut base = 0usize;
+        let mut page_idx = 0usize;
+        loop {
+            let page_size = PS * (1usize << page_idx);
+            let end = base + page_size;
+            if slot < end {
+                return (page_idx, slot - base);
+            }
+            base = end;
+            page_idx += 1;
+        }
+    }
+
+    #[test]
+    fn bolero_find_page_round_trip() {
+        // Use the test-mode initial page size (8) so the same value is baked
+        // into both the O(1) implementation and the oracle.
+        const PS: usize = 8;
+
+        check!().with_type::<u32>().for_each(|raw_slot| {
+            let slot = (*raw_slot as usize) % super::super::queue_id::MAX_SLOTS;
+
+            let (page_idx, offset) = Senders::<(), (), (), PS>::find_page(slot);
+
+            // Round-trip: reconstructed slot must equal the original.
+            let page_start = ((1usize << page_idx) - 1) * PS;
+            assert_eq!(
+                page_start + offset,
+                slot,
+                "round-trip failed for slot={slot}"
+            );
+
+            // Offset must lie within the page's allocated capacity.
+            let page_capacity = PS * (1usize << page_idx);
+            assert!(
+                offset < page_capacity,
+                "offset={offset} out of bounds for page {page_idx} (capacity {page_capacity})"
+            );
+
+            // Must agree with the linear-scan oracle.
+            assert_eq!(
+                (page_idx, offset),
+                oracle_find_page::<PS>(slot),
+                "O(1) result differs from oracle for slot={slot}"
+            );
+        });
+    }
+}
