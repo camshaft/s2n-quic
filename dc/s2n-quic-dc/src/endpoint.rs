@@ -964,7 +964,7 @@ where
                 );
                 let recv_dispatch_idx = rd.recv_dispatch_idx;
                 let recv_cache = std::rc::Rc::new(std::cell::RefCell::new(
-                    crate::stream::endpoint::recv::Cache::new(recv_dispatch_idx),
+                    crate::stream::endpoint::recv::Cache::new(recv_dispatch_idx, rd.queue_dispatcher.clone()),
                 ));
                 let (ack_burst_tx, ack_burst_rx) =
                     crate::socket::channel::intrusive::unsync::new_with_adapter::<
@@ -1020,7 +1020,6 @@ where
                     rd.acceptor_registry,
                     rd.frame_tx,
                     rd.ack_sender.clone(),
-                    rd.queue_dispatcher,
                     rd.counters.clone(),
                     rd.clock,
                     rd.route,

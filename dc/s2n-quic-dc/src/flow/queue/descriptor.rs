@@ -199,13 +199,7 @@ impl<S: 'static, C: 'static, Key: 'static> Descriptor<S, C, Key> {
     pub unsafe fn into_receiver_pair(self, remote_queue_id: Option<VarInt>) -> (Self, Self) {
         let inner = self.inner();
 
-        let generation = {
-            let next_generation = &mut *inner.next_generation.get();
-            let current = *next_generation;
-            *next_generation = current.wrapping_add(1);
-            current
-        };
-        let queue_id = queue_id::encode(inner.id.as_u64() as usize, generation);
+        let queue_id = queue_id::encode(inner.id.as_u64() as usize, 0);
         inner.queue_id.store(queue_id.as_u64(), Ordering::Relaxed);
 
         let has_remote_queue_id = remote_queue_id.is_some();
@@ -329,7 +323,6 @@ pub(super) struct DescriptorInner<S, C, Key> {
     /// Access must be synchronized by holding the queue mutex so key reads and key
     /// clearing cannot race with queue allocation state transitions.
     key: UnsafeCell<Option<Key>>,
-    next_generation: UnsafeCell<u64>,
     stream: Queue<S>,
     control: Queue<C>,
     /// A reference back to the free list
@@ -346,7 +339,6 @@ impl<S, C, Key> DescriptorInner<S, C, Key> {
             queue_id: AtomicU64::new(REMOTE_QUEUE_ID_UNKNOWN),
             remote_queue_id: AtomicU64::new(REMOTE_QUEUE_ID_UNKNOWN),
             key: UnsafeCell::new(None),
-            next_generation: UnsafeCell::new(0),
             stream,
             control,
             senders: AtomicUsize::new(0),
@@ -366,17 +358,15 @@ mod tests {
 
     #[test]
     fn queue_id_preserves_slot_bits() {
-        let index = (1usize << queue_id::INDEX_BITS) - 1;
+        let index = queue_id::MAX_SLOTS - 1;
         let queue_id = queue_id::encode(index, 0);
         assert_eq!(queue_id::index(queue_id), index);
     }
 
     #[test]
-    fn queue_id_preserves_generation_bits() {
+    fn queue_id_is_identity() {
         let index = 1234;
-        let generation = queue_id::GENERATION_MASK;
-        let queue_id = queue_id::encode(index, generation);
-        assert_eq!(queue_id::generation(queue_id), generation);
+        let queue_id = queue_id::encode(index, 99999);
         assert_eq!(queue_id::index(queue_id), index);
     }
 }

@@ -822,7 +822,6 @@ fn write_after_shutdown_returns_broken_pipe() {
 ///
 /// See the TODO comment in `stream/writer.rs` for the full fix description.
 #[test]
-#[ignore = "known bug: writer drop in FlowInitSent does not notify server reader (stream/writer.rs TODO)"]
 fn writer_drop_in_flow_init_sent_hangs_server_reader() {
     use std::time::Duration;
 
@@ -903,28 +902,16 @@ fn writer_drop_in_flow_init_sent_hangs_server_reader() {
     });
 }
 
-// ── flow_init_fin_lost_when_flow_init_dropped ────────────────────────────────
+// ── queue_bind_with_fin_recovered_after_packet_loss ────────────────────────────
 
-/// Demonstrates that FlowInitFin is permanently lost when the FlowInit packet
-/// is dropped but the FlowInitFin packet is acknowledged.
+/// Verifies that when the QueueBind+FIN packet is dropped, PTO retransmits
+/// it and the server eventually receives both the data and FIN.
 ///
-/// The scenario:
-/// 1. Client writes early data (FlowInit with is_fin=false) in one packet.
-/// 2. Client calls shutdown() → sends FlowInitFin in a subsequent packet.
-/// 3. The FlowInit packet is lost, but FlowInitFin arrives at the server.
-/// 4. Server doesn't recognize the stream_id (FlowInit hasn't arrived yet),
-///    so it drops the FlowInitFin frame — but ACKs the packet at the
-///    transport level (the packet was authenticated and deduped).
-/// 5. Client sees the ACK → removes FlowInitFin from inflight; won't retransmit.
-/// 6. Client PTO fires → retransmits FlowInit → server creates the stream.
-/// 7. Server reader hangs forever: the FIN will never arrive because it was
-///    already acknowledged and the client won't send it again.
-///
-/// This is a high-severity availability bug: the server-side reader blocks
-/// indefinitely waiting for a FIN that will never come.
+/// This was previously a bug when FlowInit and FlowInitFin were separate frames
+/// that could be lost independently. With QueueBind carrying is_fin inline,
+/// the entire operation is retransmitted atomically by PTO.
 #[test]
-#[ignore = "FIX THIS!"]
-fn flow_init_fin_lost_when_flow_init_dropped() {
+fn queue_bind_with_fin_recovered_after_packet_loss() {
     use crate::testing::ext::*;
     use std::sync::Arc;
 
@@ -1014,37 +1001,27 @@ fn flow_init_fin_lost_when_flow_init_dropped() {
                     .expect("connect");
                 let (_reader, mut writer) = stream.into_split();
 
-                // Activate the drop window BEFORE the FlowInit is sent.
+                // Activate the drop window BEFORE the QueueBind is sent.
                 // All client→server packets will be dropped until we disable it.
                 drop_active.store(true, Ordering::Relaxed);
 
-                // Write early data WITHOUT fin — this queues the FlowInit frame.
+                // Write data WITH fin — this queues the QueueBind frame with is_fin=true.
                 let mut data = Bytes::from_static(b"early");
                 writer
-                    .write_from(&mut data)
+                    .write_from_fin(&mut data)
                     .await
-                    .expect("write early data");
+                    .expect("write early data + fin");
 
-                // Wait long enough for the FlowInit to be transmitted AND for
+                // Wait long enough for the QueueBind to be transmitted AND for
                 // several PTO retransmissions to fire (all will be dropped).
-                // With 2ms initial RTT, PTO fires at ~6ms, ~18ms, ~42ms, ~90ms.
-                // At 200ms, we've dropped the original + multiple retransmissions.
                 Duration::from_millis(200).sleep().await;
 
-                // Disable drops — the FlowInitFin will get through, and eventually
-                // the next PTO retransmission of FlowInit will also get through.
+                // Disable drops — the next PTO retransmission will get through.
+                // Since QueueBind carries is_fin inline, the server gets both
+                // the data and FIN in a single retransmitted frame.
                 drop_active.store(false, Ordering::Relaxed);
 
-                // Shutdown the writer → sends FlowInitFin in a new packet.
-                // The server hasn't seen the FlowInit yet (all copies were dropped),
-                // so it will drop the FlowInitFin (unknown stream_id) but ACK the
-                // packet at the transport level.
-                writer.shutdown().expect("shutdown");
-
-                // Wait for the exchange to settle. The next PTO retransmission of
-                // FlowInit will eventually fire and reach the server, creating the
-                // stream. But by then the FlowInitFin has been ACKed and will never
-                // be retransmitted — the server reader hangs forever.
+                // Wait for PTO to retransmit and the server to process.
                 Duration::from_secs(15).sleep().await;
             }
             .group("client")

@@ -46,6 +46,17 @@ where
     pool: pool::Pool<S, C, K, INITIAL_PAGE_SIZE>,
 }
 
+impl<S, C, K> core::fmt::Debug for Allocator<S, C, K>
+where
+    S: 'static + Send + Sync,
+    C: 'static + Send + Sync,
+    K: 'static + Send + Sync,
+{
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Allocator").finish_non_exhaustive()
+    }
+}
+
 impl<S, C, K> Clone for Allocator<S, C, K>
 where
     S: 'static + Send + Sync,

@@ -211,8 +211,6 @@ struct Inner {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum Status {
-    /// Server-only: awaiting client validation before releasing credits
-    PendingValidation,
     /// Flow is open for reads
     #[default]
     Open,
@@ -223,15 +221,13 @@ enum Status {
 }
 
 impl Status {
-    is!(is_pending_validation, PendingValidation);
     is!(is_open, Open);
     is!(is_reset, Reset);
     is!(is_complete, Complete);
     is!(is_terminal, Reset | Complete);
 
     event! {
-        on_validated(PendingValidation => Open);
-        on_reset(PendingValidation | Open => Reset);
+        on_reset(Open => Reset);
         on_complete(Open => Complete);
     }
 }
@@ -293,34 +289,6 @@ impl Reader {
         }))
     }
 
-    pub(crate) fn new_server_pending(
-        frame_tx: SubmissionSender,
-        path_secret_entry: Arc<PathSecretEntry>,
-        stream_id: VarInt,
-        stream_rx: msg::queue::Stream,
-        peer_fin_received: bool,
-    ) -> Self {
-        let parameters = path_secret_entry.parameters();
-        let window_size = parameters.local_recv_max_data.as_u64();
-
-        Self(Box::new(Inner {
-            frame_tx,
-            completion_rx: frame::failure_completion_channel(),
-            stream_rx,
-            path_secret_entry,
-            stream_id,
-            reassembler: Reassembler::new(),
-            remote_max_data: VarInt::ZERO,
-            window_size,
-            send_flow_update_after_fin: !peer_fin_received,
-            status: Status::PendingValidation,
-            reset_error_code: None,
-            #[cfg(debug_assertions)]
-            eof_counter: 0,
-            coop: Coop::default(),
-        }))
-    }
-
     /// Waits for the reader to become valid for application use.
     ///
     /// Client-side readers are already validated, so this is usually a no-op.
@@ -343,7 +311,7 @@ impl Reader {
 
     #[inline]
     pub(crate) fn is_validated(&self) -> bool {
-        !self.0.status.is_pending_validation()
+        true
     }
 
     /// Returns the stream identifier assigned when the flow was created.
@@ -550,24 +518,8 @@ impl Inner {
     fn on_eof_returned(&mut self) {}
 
     #[inline]
-    fn poll_validate(&mut self, cx: &mut Context) -> Poll<io::Result<()>> {
-        self.poll_completions(cx)?;
-
-        if !self.status.is_pending_validation() {
-            return Poll::Ready(Ok(()));
-        }
-
-        let mut app_buf = buffer::writer::storage::Empty;
-        match self.poll_stream_rx(cx, &mut app_buf)? {
-            Poll::Ready(()) => {
-                if self.status.is_pending_validation() {
-                    Poll::Pending
-                } else {
-                    Poll::Ready(Ok(()))
-                }
-            }
-            Poll::Pending => Poll::Pending,
-        }
+    fn poll_validate(&mut self, _cx: &mut Context) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
     }
 
     #[inline]
@@ -631,12 +583,6 @@ impl Inner {
             }
         };
 
-        if self.status.is_pending_validation() {
-            return Poll::Ready(Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "stream not yet validated - call validate() first",
-            )));
-        }
 
         if tracker.has_remaining_capacity() {
             self.reassembler.infallible_copy_into(&mut tracker);
@@ -684,7 +630,7 @@ impl Inner {
     where
         S: buffer::writer::Storage + ?Sized,
     {
-        let interpose = !self.status.is_pending_validation();
+        let interpose = true;
 
         match self.stream_rx.poll_swap(cx) {
             Poll::Ready(Ok(queue)) => {
@@ -764,14 +710,7 @@ impl Inner {
                             }
                         }
                         msg::Stream::FlowValidated => {
-                            if self.status.on_validated().is_ok() {
-                                debug!(stream_id = self.stream_id.as_u64(), "Flow validated");
-                            } else {
-                                debug!(
-                                    stream_id = self.stream_id.as_u64(),
-                                    "FlowValidated received in unexpected state"
-                                );
-                            }
+                            debug!(stream_id = self.stream_id.as_u64(), "Flow validated");
                         }
                         msg::Stream::Reset { error_code } => {
                             debug!(
@@ -925,12 +864,12 @@ impl Inner {
 
         let frame = Frame {
             source_sender_id: LocalSenderId::UNSPECIFIED,
-            header: Header::FlowMaxData {
+            header: Header::QueueMaxData {
                 queue_pair: QueuePair {
                     source_queue_id: self.stream_rx.queue_id(),
                     dest_queue_id: remote_queue_id,
                 },
-                stream_id: self.stream_id,
+                binding_id: self.stream_id,
                 maximum_data,
             },
             payload: ByteVec::new(),
@@ -963,9 +902,9 @@ impl Inner {
 
         let frame = Frame {
             source_sender_id: LocalSenderId::UNSPECIFIED,
-            header: Header::FlowReset {
+            header: Header::QueueReset {
                 dest_queue_id: remote_queue_id,
-                stream_id: self.stream_id,
+                binding_id: self.stream_id,
                 reset_target,
                 error_code,
             },

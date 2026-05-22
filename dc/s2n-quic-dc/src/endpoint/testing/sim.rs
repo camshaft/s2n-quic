@@ -546,23 +546,28 @@ where
         ));
     }
 
-    // Allocate a fresh stream ID and flow queues.
-    let stream_id = VarInt::new(endpoint.next_stream_id.fetch_add(1, Ordering::Relaxed))
-        .expect("stream_id overflow");
+    // Allocate a fresh binding ID and flow queues.
+    let binding_id = path_secret_entry.alloc_binding_id();
 
-    let handle = flow::Handle::client(stream_id, path_secret_entry.clone());
+    let handle = flow::Handle::client(binding_id, path_secret_entry.clone());
     let (queue_control, queue_stream) = queue_allocator.alloc_or_grow(handle, None);
+
+    let queue_pair = crate::packet::datagram::QueuePair {
+        source_queue_id: queue_control.queue_id(),
+        dest_queue_id: queue_control.queue_id(),
+    };
 
     // Build Reader + Writer and wrap them in a Stream.
     let frame_tx = endpoint.frame_tx.clone();
     let writer = Writer::new_client(
         frame_tx.clone(),
         path_secret_entry.clone(),
-        stream_id,
+        binding_id,
+        queue_pair,
         acceptor_id,
         queue_control,
     );
-    let reader = Reader::new_client(frame_tx, path_secret_entry, stream_id, queue_stream);
+    let reader = Reader::new_client(frame_tx, path_secret_entry, binding_id, queue_stream);
 
     Ok(Stream::new(reader, writer))
 }

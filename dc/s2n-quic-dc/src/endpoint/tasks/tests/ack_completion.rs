@@ -64,6 +64,7 @@ fn cache_with_context(
 ) -> Rc<RefCell<recv::Cache>> {
     let cache = Rc::new(RefCell::new(recv::Cache::new(
         crate::endpoint::id::RecvDispatchWorkerId::new(0),
+        msg::queue::Allocator::new().dispatcher(),
     )));
     let key = recv::Key {
         id: *submission.path_secret_entry.id(),
@@ -143,6 +144,7 @@ fn unknown_context_silently_dropped() {
         // Empty cache — context won't be found
         let cache = Rc::new(RefCell::new(recv::Cache::new(
             crate::endpoint::id::RecvDispatchWorkerId::new(0),
+            msg::queue::Allocator::new().dispatcher(),
         )));
         let entry = crate::intrusive::Entry::new(msg::Sender::PendingAck(submission));
 
@@ -220,6 +222,7 @@ fn stale_resubmit_then_next_completion_settles() {
             // Drive a second completion for the re-submitted ACK.
             let cache = Rc::new(RefCell::new(recv::Cache::new(
                 crate::endpoint::id::RecvDispatchWorkerId::new(0),
+                msg::queue::Allocator::new().dispatcher(),
             )));
             let key = {
                 let c = ctx.borrow();

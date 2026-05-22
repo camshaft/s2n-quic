@@ -4,6 +4,8 @@ expression: logs
 ---
 0:00:00.000000000 [main] DEBUG s2n_quic_dc: capacity=16
 0:00:00.000000000 [main] DEBUG s2n_quic_dc: capacity=16
+0:00:00.000000000 [main] DEBUG grow epoch=8
+0:00:00.000000000 [main] DEBUG grow epoch=8
 0:00:00.000000000 [main] DEBUG s2n_quic_dc: acquire=1µs duration=1µs
 0:00:00.000000000 [main] DEBUG s2n_quic_dc: peer_address=127.0.0.1:7777 credential_id=[120, 5, 91, 114, 195, 219, 144, 209, 79, 20, 20, 63, 24, 13, 253, 238]
 0:00:00.000000000 [main] DEBUG s2n_quic_dc: acquire=1µs duration=1µs

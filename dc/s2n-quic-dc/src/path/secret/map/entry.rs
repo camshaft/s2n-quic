@@ -76,6 +76,13 @@ pub struct Entry {
     /// *wall-clock time*.  Comparisons between two scores for the same peer at the same
     /// instant are always valid; absolute values have no external meaning.
     sender_load_scores: Box<[AtomicU64]>,
+    /// Per-entry monotonic binding_id counter. Each stream bound through this
+    /// path secret gets a unique binding_id that prevents stale packets from
+    /// being injected into recycled queue slots.
+    next_binding_id: AtomicU64,
+    /// Per-entry queue pool. Both client (connect) and server (recv dispatch)
+    /// allocate from and dispatch to this pool via their own Dispatch handles.
+    queue_allocator: crate::endpoint::msg::queue::Allocator,
 }
 
 impl SizeOf for Entry {
@@ -94,6 +101,8 @@ impl SizeOf for Entry {
             dead_at,
             peer_data_addrs,
             sender_load_scores,
+            next_binding_id,
+            queue_allocator: _,
         } = self;
         creation_time.size()
             + peer.size()
@@ -106,6 +115,7 @@ impl SizeOf for Entry {
             + application_data.size()
             + last_activity.size()
             + dead_at.size()
+            + next_binding_id.size()
             + std::mem::size_of::<PeerDataAddrs>()
             + peer_data_addrs.get().map_or(0, |a| {
                 a.len() * std::mem::size_of::<s2n_quic_core::inet::SocketAddressV6>()
@@ -193,6 +203,8 @@ impl Entry {
             dead_at: AtomicI64::new(-1),
             peer_data_addrs: PeerDataAddrs::default(),
             sender_load_scores: Self::init_load_scores(socket_sender_count),
+            next_binding_id: AtomicU64::new(0),
+            queue_allocator: crate::endpoint::msg::queue::Allocator::new(),
         }
     }
 
@@ -518,6 +530,21 @@ impl Entry {
 
     pub fn parameters(&self) -> dc::ApplicationParams {
         self.parameters.clone()
+    }
+
+    /// Allocate a new binding_id from this entry's monotonic counter.
+    pub fn alloc_binding_id(&self) -> s2n_quic_core::varint::VarInt {
+        let id = self.next_binding_id.fetch_add(1, Ordering::Relaxed);
+        s2n_quic_core::varint::VarInt::new(id).unwrap()
+    }
+
+    /// Returns a new dispatcher handle backed by this entry's queue pool.
+    ///
+    /// Both client (connect) and server (recv dispatch) obtain their own
+    /// handles, each with independent local page caches but sharing the
+    /// same underlying slot storage.
+    pub fn queue_dispatcher(&self) -> crate::endpoint::msg::queue::Dispatcher {
+        self.queue_allocator.dispatcher()
     }
 
     pub fn max_datagram_size(&self) -> u16 {
