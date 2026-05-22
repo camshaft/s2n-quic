@@ -1069,7 +1069,7 @@ fn handle_flow_init_validate(
 // ── FlowData ──────────────────────────────────────────────────────────────
 
 fn handle_flow_data(
-    path_secret_entry: &std::sync::Arc<PathSecretEntry>,
+    _path_secret_entry: &std::sync::Arc<PathSecretEntry>,
     credentials: &Credentials,
     queue_pair: QueuePair,
     stream_id: VarInt,
@@ -1078,7 +1078,7 @@ fn handle_flow_data(
     buf: BytesMut,
     queue_dispatcher: &mut msg::queue::Dispatcher,
     counters: &counters::Dispatch,
-    response_frames: &mut PriorityInput,
+    _response_frames: &mut PriorityInput,
     waker_sink: &mut impl channel::UnboundedSender<AutoWake>,
 ) {
     let local_queue_id = queue_pair.dest_queue_id;
@@ -1116,18 +1116,10 @@ fn handle_flow_data(
         }
         Err(flow::queue::Error::Unallocated(_)) => {
             counters.rx_data_unallocated.add(1);
-            warn!(
+            debug!(
                 stream_id = stream_id.as_u64(),
                 queue_id = local_queue_id.as_u64(),
-                "FlowData for unallocated queue - sending reset"
-            );
-            push_reset_frame(
-                response_frames,
-                counters,
-                path_secret_entry,
-                queue_pair.source_queue_id,
-                stream_id,
-                error::QUEUE_UNALLOCATED,
+                "FlowData for unallocated queue - dropping"
             );
         }
         Err(flow::queue::Error::HalfClosed(_)) => {
@@ -1140,21 +1132,11 @@ fn handle_flow_data(
         }
         Err(flow::queue::Error::ValidationFailed(_, reason)) => {
             counters.on_data_validation_failed(reason);
-            let error_code = reason.as_reset_code();
             debug!(
                 stream_id = stream_id.as_u64(),
                 queue_id = local_queue_id.as_u64(),
                 ?reason,
-                "FlowData validation failed - sending reset"
-            );
-            push_reset_frame_with_target(
-                response_frames,
-                counters,
-                path_secret_entry,
-                queue_pair.source_queue_id,
-                stream_id,
-                ResetTarget::Both,
-                error_code,
+                "FlowData validation failed - dropping"
             );
         }
         Err(flow::queue::Error::PermanentlyClosed) => {
@@ -1240,18 +1222,17 @@ fn handle_flow_max_data(
 /// Dispatches a pre-built flow-control message into the per-queue control channel.
 ///
 /// Returns `true` when the message was accepted by the queue (success path).
-/// All error paths are handled internally, including sending reset frames where
-/// appropriate. Callers that need to emit a success trace should do so after
+/// All error paths are handled internally. Callers that need to emit a success trace should do so after
 /// this call when the return value is `true`.
 fn dispatch_control_message(
-    path_secret_entry: &std::sync::Arc<PathSecretEntry>,
+    _path_secret_entry: &std::sync::Arc<PathSecretEntry>,
     credentials: &Credentials,
     queue_pair: QueuePair,
     stream_id: VarInt,
     entry: Entry<msg::Control>,
     queue_dispatcher: &mut msg::queue::Dispatcher,
     counters: &counters::Dispatch,
-    response_frames: &mut PriorityInput,
+    _response_frames: &mut PriorityInput,
     waker_sink: &mut impl channel::UnboundedSender<AutoWake>,
 ) -> bool {
     let local_queue_id = queue_pair.dest_queue_id;
@@ -1277,16 +1258,7 @@ fn dispatch_control_message(
             debug!(
                 stream_id = stream_id.as_u64(),
                 queue_id = local_queue_id.as_u64(),
-                "flow control for unallocated queue - sending reset"
-            );
-            push_reset_frame_with_target(
-                response_frames,
-                counters,
-                path_secret_entry,
-                queue_pair.source_queue_id,
-                stream_id,
-                ResetTarget::Both,
-                error::QUEUE_UNALLOCATED,
+                "flow control for unallocated queue - dropping"
             );
             false
         }
@@ -1301,21 +1273,11 @@ fn dispatch_control_message(
         }
         Err(flow::queue::Error::ValidationFailed(_, reason)) => {
             counters.on_flow_control_validation_failed(reason);
-            let error_code = reason.as_reset_code();
             debug!(
                 stream_id = stream_id.as_u64(),
                 queue_id = local_queue_id.as_u64(),
                 ?reason,
-                "flow control validation failed - sending reset"
-            );
-            push_reset_frame_with_target(
-                response_frames,
-                counters,
-                path_secret_entry,
-                queue_pair.source_queue_id,
-                stream_id,
-                ResetTarget::Both,
-                error_code,
+                "flow control validation failed - dropping"
             );
             false
         }

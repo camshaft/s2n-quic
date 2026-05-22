@@ -111,8 +111,12 @@ impl<S: 'static, C: 'static, Key: 'static> Descriptor<S, C, Key> {
     /// The caller needs to guarantee the [`Descriptor`] is still allocated.
     #[inline]
     pub unsafe fn queue_id(&self) -> VarInt {
-        self.try_queue_id()
-            .expect("queue id should be initialized while allocated")
+        let v = self.inner().queue_id.load(Ordering::Relaxed);
+        debug_assert!(
+            VarInt::new(v).is_ok(),
+            "queue id should be initialized while allocated"
+        );
+        unsafe { VarInt::new_unchecked(v) }
     }
 
     /// Returns the queue ID if this descriptor is currently allocated.

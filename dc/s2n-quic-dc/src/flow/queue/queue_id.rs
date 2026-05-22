@@ -50,3 +50,22 @@ pub fn generation(queue_id: VarInt) -> u64 {
     let generation_high = (value >> GENERATION_HIGH_SHIFT) & GENERATION_HIGH_MASK;
     (generation_high << GENERATION_LOW_BITS) | generation_low
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bolero::check;
+
+    #[test]
+    fn bolero_round_trip_index_and_generation() {
+        check!()
+            .with_type::<(u32, u64)>()
+            .for_each(|(raw_index, generation)| {
+                let slot = (*raw_index as usize) % MAX_SLOTS;
+                let generation = *generation & GENERATION_MASK;
+                let queue_id = encode(slot, generation);
+                assert_eq!(index(queue_id), slot);
+                assert_eq!(super::generation(queue_id), generation);
+            });
+    }
+}
