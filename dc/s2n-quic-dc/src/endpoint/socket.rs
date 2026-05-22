@@ -83,8 +83,31 @@ impl Config {
     )> {
         self.validate()?;
 
+        let shared_sockets = self.num_send_sockets.min(self.num_recv_sockets);
         let mut recv_sockets = Vec::with_capacity(self.num_recv_sockets);
-        for bind_addr in self.bind_addrs.iter().take(self.num_recv_sockets) {
+        let mut send_sockets = Vec::with_capacity(self.num_send_sockets);
+
+        for bind_addr in self.bind_addrs.iter().take(shared_sockets) {
+            let mut opts = Options::default();
+            opts.addr = bind_addr.addr;
+            opts.bind_interface = bind_addr.ifname.clone();
+            opts.gro = true;
+            opts.blocking = false;
+            opts.recv_buffer = Some(self.recv_buffer);
+            opts.send_buffer = Some(self.send_buffer);
+            let recv_socket = opts.build_udp()?;
+            let send_socket = recv_socket.try_clone()?;
+
+            recv_sockets.push(recv_socket);
+            send_sockets.push(GsoSocket(send_socket, self.gso.clone()));
+        }
+
+        for bind_addr in self
+            .bind_addrs
+            .iter()
+            .take(self.num_recv_sockets)
+            .skip(shared_sockets)
+        {
             let mut opts = Options::default();
             opts.addr = bind_addr.addr;
             opts.bind_interface = bind_addr.ifname.clone();
@@ -95,8 +118,12 @@ impl Config {
             recv_sockets.push(opts.build_udp()?);
         }
 
-        let mut send_sockets = Vec::with_capacity(self.num_send_sockets);
-        for bind_addr in self.bind_addrs.iter().take(self.num_send_sockets) {
+        for bind_addr in self
+            .bind_addrs
+            .iter()
+            .take(self.num_send_sockets)
+            .skip(shared_sockets)
+        {
             let mut opts = Options::default();
             opts.addr = bind_addr.addr;
             opts.bind_interface = bind_addr.ifname.clone();
@@ -256,5 +283,21 @@ mod tests {
             .expect("bind should work");
         assert_eq!(send_sockets.len(), 2);
         assert_eq!(recv_sockets.len(), 1);
+    }
+
+    #[test]
+    fn config_shares_first_n_bind_addrs_between_send_and_recv() {
+        let addrs = vec![
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).into(),
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).into(),
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).into(),
+        ];
+        let (send_sockets, recv_sockets) = Config::new(addrs, 2, 3, features::Gso::default())
+            .create()
+            .expect("bind should work");
+
+        let send_local_addr = send_sockets[0].0.local_addr().expect("send addr");
+        let recv_local_addr = recv_sockets[0].local_addr().expect("recv addr");
+        assert_eq!(send_local_addr, recv_local_addr);
     }
 }
