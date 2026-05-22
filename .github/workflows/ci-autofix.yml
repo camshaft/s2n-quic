@@ -107,6 +107,7 @@ jobs:
         id: context
         env:
           GH_TOKEN: ${{ github.token }}
+          CI_AUTOFIX_MAX_LOG_LINES: ${{ vars.CI_AUTOFIX_MAX_LOG_LINES }}
           RUN_ID: ${{ steps.gate.outputs.run_id }}
           RUN_URL: ${{ steps.gate.outputs.run_url }}
           SHA: ${{ steps.gate.outputs.sha }}
@@ -122,9 +123,9 @@ jobs:
           LOG_RAW="$RUNNER_TEMP/ci-autofix/failed.log"
           LOG_SNIPPET="$RUNNER_TEMP/ci-autofix/failed-snippet.txt"
           TASK_FILE="$RUNNER_TEMP/ci-autofix/task.md"
-          # 220 keeps issue payloads readable while still capturing enough context from both
-          # the beginning and end of failed logs.
-          MAX_LOG_LINES=220
+          # Default to 220 (110 head + 110 tail); override with repository variable
+          # CI_AUTOFIX_MAX_LOG_LINES when needed.
+          MAX_LOG_LINES="${CI_AUTOFIX_MAX_LOG_LINES:-220}"
 
           gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID/jobs?per_page=100" > "$JOBS_JSON"
 
@@ -176,7 +177,7 @@ jobs:
             echo "1. Reproduce and fix the failing CI condition with the smallest possible code change."
             echo "2. Keep scope tightly limited to the failure root cause."
             echo "3. Open a PR (do not push to main) from branch: copilot/ci-autofix/$SHORT_SHA."
-            echo "4. PR title must start with: [ci-autofix] $WORKFLOW_NAME failure on $SHORT_SHA."
+            echo "4. PR title must be exactly: [ci-autofix] ci failure on $SHORT_SHA."
             echo "5. Add labels: ci-autofix and bot."
             echo "6. PR body must include this run URL: $RUN_URL."
             echo "7. Ensure required checks pass before merge."
@@ -221,7 +222,7 @@ jobs:
             }
 
             const taskBody = fs.readFileSync(process.env.TASK_FILE, 'utf8');
-            const title = `[ci-autofix] ${process.env.WORKFLOW_NAME} failure on ${process.env.SHORT_SHA}`;
+            const title = `[ci-autofix] ci failure on ${process.env.SHORT_SHA}`;
 
             const body = [
               '<!-- ci-autofix-managed -->',
