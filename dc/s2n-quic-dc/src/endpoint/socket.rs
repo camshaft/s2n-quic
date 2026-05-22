@@ -204,15 +204,19 @@ mod tests {
     #[test]
     fn send_config_requires_bind_addrs() {
         let config = SendConfig::new(Vec::new(), features::Gso::default());
-        let err = config.create().expect_err("empty bind_addrs should error");
-        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        match config.create() {
+            Err(err) => assert_eq!(err.kind(), io::ErrorKind::InvalidInput),
+            Ok(_) => panic!("empty bind_addrs should error"),
+        }
     }
 
     #[test]
     fn recv_config_requires_bind_addrs() {
         let config = RecvConfig::new(Vec::new());
-        let err = config.create().expect_err("empty bind_addrs should error");
-        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        match config.create() {
+            Err(err) => assert_eq!(err.kind(), io::ErrorKind::InvalidInput),
+            Ok(_) => panic!("empty bind_addrs should error"),
+        }
     }
 
     #[test]

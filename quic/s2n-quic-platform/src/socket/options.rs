@@ -126,7 +126,10 @@ impl Options {
         }
 
         #[cfg(target_os = "linux")]
-        fn bind_to_interface_index(socket: &socket2::Socket, interface_index: u32) -> io::Result<()> {
+        fn bind_to_interface_index(
+            socket: &socket2::Socket,
+            interface_index: u32,
+        ) -> io::Result<()> {
             use std::os::fd::AsRawFd;
 
             let mut ifname = [0 as libc::c_char; libc::IF_NAMESIZE];
@@ -159,7 +162,10 @@ impl Options {
         }
 
         #[cfg(not(target_os = "linux"))]
-        fn bind_to_interface_index(_socket: &socket2::Socket, _interface_index: u32) -> io::Result<()> {
+        fn bind_to_interface_index(
+            _socket: &socket2::Socket,
+            _interface_index: u32,
+        ) -> io::Result<()> {
             Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "binding to a NIC index is only supported on Linux",
