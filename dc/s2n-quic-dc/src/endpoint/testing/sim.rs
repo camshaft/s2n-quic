@@ -377,6 +377,17 @@ pub fn connect(
 
     // Fast path: already connected.
     if let Some(entry) = local_map.get_raw(peer_addr) {
+        // Self-connect: get_raw resolves to the Server entry (the address index is
+        // overwritten by the second insert in insert_fake_path_pair).  Always select
+        // the Client entry so the Writer seals packets with the correct keys.
+        if local_addr == peer_addr {
+            let client_id = entry
+                .id()
+                .for_endpoint(s2n_quic_core::endpoint::Type::Client);
+            return local_map
+                .get_by_id(&client_id)
+                .expect("self-connect Client entry must exist when get_raw succeeds");
+        }
         return entry;
     }
 
