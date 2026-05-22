@@ -18,8 +18,6 @@ pub struct Pool<S: 'static + Send, C: 'static + Send, Key: 'static + Send, const
     memory_handle: Arc<free_list::Memory<S, C, Key>>,
     epoch_summary: Option<counter::Summary>,
     epoch: usize,
-    /// Size of the next page to allocate; doubles after each successful grow.
-    next_page_size: usize,
 }
 
 impl<S: 'static + Send, C: 'static + Send, Key: 'static + Send, const INITIAL_PAGE_SIZE: usize> Clone
@@ -33,7 +31,6 @@ impl<S: 'static + Send, C: 'static + Send, Key: 'static + Send, const INITIAL_PA
             senders: self.senders.clone(),
             epoch_summary: self.epoch_summary.clone(),
             epoch: self.epoch,
-            next_page_size: self.next_page_size,
         }
     }
 }
@@ -55,7 +52,6 @@ where
             senders,
             epoch_summary,
             epoch,
-            next_page_size: INITIAL_PAGE_SIZE,
         };
         pool.grow();
         pool
@@ -99,11 +95,12 @@ where
 
     #[inline(never)] // this should happen rarely
     fn grow(&mut self) {
-        let page_size = self.next_page_size;
-        assert!(
-            self.epoch + page_size <= queue_id::MAX_SLOTS,
-            "flow queue slot space exhausted"
-        );
+        // Page sizes double with each grow: page 0 has INITIAL_PAGE_SIZE slots,
+        // page 1 has 2×, page 2 has 4×, etc.  After n grows the epoch is
+        // (2^(n+1) − 1) × INITIAL_PAGE_SIZE, so the next page size is always
+        // epoch + INITIAL_PAGE_SIZE (capped at remaining slot space).
+        let page_size = (self.epoch + INITIAL_PAGE_SIZE).min(queue_id::MAX_SLOTS - self.epoch);
+        assert!(page_size > 0, "flow queue slot space exhausted");
 
         let (region, layout) = Region::alloc(page_size);
 
@@ -178,12 +175,6 @@ where
         drop(senders);
 
         debug!(epoch = epoch, "grow");
-
-        // Double the page size for next time, saturating at the remaining slot space.
-        self.next_page_size = self
-            .next_page_size
-            .saturating_mul(2)
-            .min(queue_id::MAX_SLOTS - self.epoch);
 
         // push all of the descriptors into the free list
         self.free.record_region(region, pending_desc);
