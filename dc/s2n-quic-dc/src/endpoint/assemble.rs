@@ -665,9 +665,9 @@ fn encode_segment<S: seal::Application>(
     };
 
     // Build the application header: per-frame metadata entries.
-    // This also stamps assigned attempt_ids back into FlowInit frame headers so
+    // This also stamps assigned attempt_ids back into QueueBind frame headers so
     // PTO retransmissions reuse the same attempt_id, and records the sender index
-    // on the completion channel so the writer can route FlowInitReset/FlowInitFin
+    // on the completion channel so the writer can route QueueReset/QueueData(is_fin)
     // through the same socket.
     let total_payload_len =
         encode_frame_metadata(frames, flow_attempt_id, source_sender_id, header_buf);
@@ -704,12 +704,12 @@ fn encode_frame_metadata(
     let mut total_payload_len = 0usize;
 
     for frame in frames.iter_mut() {
-        if let frame::Header::FlowInit { stream_id, .. } = &frame.header {
+        if let frame::Header::QueueBind { binding_id, .. } = &frame.header {
             trace!(
-                stream_id = stream_id.as_u64(),
+                binding_id = binding_id.as_u64(),
                 %source_sender_id,
                 flow_attempt_id_counter = flow_attempt_id.as_u64(),
-                "encode_frame_metadata: encoding FlowInit"
+                "encode_frame_metadata: encoding QueueBind"
             );
         }
         stamp_attempt_id(&mut frame.header, flow_attempt_id);
@@ -758,64 +758,57 @@ fn push_frame_metadata(header_buf: &mut Vec<u8>, header: &frame::Header, payload
     );
 }
 
-/// Stamp attempt_id in place for FlowInit frames.
+/// Stamp binding_id in place for QueueBind frames.
 ///
-/// If the frame's attempt_id is the sentinel `VarInt::MAX`, allocates from the counter
+/// If the frame's binding_id is the sentinel `VarInt::MAX`, allocates from the counter
 /// and writes it back into the header. On PTO retransmission the header already holds
 /// the assigned value, so no new allocation occurs.
 fn stamp_attempt_id(header: &mut frame::Header, flow_attempt_id: &mut VarInt) {
-    if let frame::Header::FlowInit {
-        attempt_id,
-        stream_id,
-        ..
+    if let frame::Header::QueueBind {
+        binding_id, ..
     } = header
     {
-        if *attempt_id == VarInt::MAX {
-            *attempt_id = *flow_attempt_id;
+        if *binding_id == VarInt::MAX {
+            *binding_id = *flow_attempt_id;
             *flow_attempt_id += 1;
             trace!(
-                stream_id = stream_id.as_u64(),
-                attempt_id = attempt_id.as_u64(),
-                "stamp_attempt_id: assigned new attempt_id"
+                binding_id = binding_id.as_u64(),
+                "stamp_attempt_id: assigned new binding_id"
             );
         } else {
             trace!(
-                stream_id = stream_id.as_u64(),
-                attempt_id = attempt_id.as_u64(),
-                "stamp_attempt_id: retransmit with existing attempt_id"
+                binding_id = binding_id.as_u64(),
+                "stamp_attempt_id: retransmit with existing binding_id"
             );
         }
     }
 }
 
-/// Pin FlowInit frames to this sender and stamp the completion channel.
+/// Pin QueueBind frames to this sender and stamp the completion channel.
 ///
-/// FlowInit frames MUST be pinned because the server deduplicates by
-/// (credential_id, source_sender_id, attempt_id). If a retransmitted FlowInit
-/// migrates to a different sender, its attempt_id may collide with that sender's
+/// QueueBind frames MUST be pinned because the server deduplicates by
+/// (credential_id, source_sender_id, binding_id). If a retransmitted QueueBind
+/// migrates to a different sender, its binding_id may collide with that sender's
 /// independently-assigned IDs, causing the server to reject it as a duplicate.
 ///
-/// Other frame types (FlowData, FlowReset, ACK) are intentionally left unpinned
+/// Other frame types (QueueData, QueueReset, ACK) are intentionally left unpinned
 /// so that loss retransmissions can be redistributed via pick-two load balancing.
-///
-/// Frames that already carry a sticky sender_id (FlowInitReset, FlowInitFin) are
-/// validated to ensure they arrived at the correct assembler.
 fn stamp_sender_id(frame: &mut Frame, source_sender_id: LocalSenderId) {
     match &frame.header {
-        frame::Header::FlowInit { attempt_id, .. } => {
+        frame::Header::QueueBind { binding_id, .. } => {
             if frame.source_sender_id == LocalSenderId::UNSPECIFIED {
                 frame.source_sender_id = source_sender_id;
             } else {
                 debug_assert_eq!(
                     frame.source_sender_id, source_sender_id,
-                    "FlowInit routed to wrong sender: frame={} assembler={}",
+                    "QueueBind routed to wrong sender: frame={} assembler={}",
                     frame.source_sender_id, source_sender_id,
                 );
             }
 
             if let Some(completion) = &frame.completion {
                 completion.set_init_sender_idx(source_sender_id);
-                completion.set_init_attempt_id(*attempt_id);
+                completion.set_init_attempt_id(*binding_id);
             }
         }
         _ => {

@@ -175,12 +175,12 @@ fn new_test_frame_with_sender_id(
     }
 
     Entry::new(Frame {
-        header: Header::FlowControl {
+        header: Header::QueueControl {
             queue_pair: crate::packet::datagram::QueuePair {
                 source_queue_id: VarInt::from_u8(0),
                 dest_queue_id: VarInt::from_u8(1),
             },
-            stream_id: VarInt::from_u8(0),
+            binding_id: VarInt::from_u8(0),
         },
         source_sender_id: crate::endpoint::id::LocalSenderId::new(source_sender_id),
         payload,
@@ -573,12 +573,12 @@ fn frame_batch_tracks_byte_costs_per_priority() {
     let data = new_test_frame_with_header(
         path.clone(),
         24,
-        Header::FlowData {
+        Header::QueueData {
             queue_pair: crate::packet::datagram::QueuePair {
                 source_queue_id: VarInt::from_u8(0),
                 dest_queue_id: VarInt::from_u8(1),
             },
-            stream_id: VarInt::from_u8(0),
+            binding_id: VarInt::from_u8(0),
             offset: VarInt::ZERO,
             is_fin: false,
         },
@@ -589,9 +589,9 @@ fn frame_batch_tracks_byte_costs_per_priority() {
     let reset = new_test_frame_with_header(
         path,
         0,
-        Header::FlowReset {
+        Header::QueueReset {
             dest_queue_id: VarInt::from_u8(1),
-            stream_id: VarInt::from_u8(0),
+            binding_id: VarInt::from_u8(0),
             reset_target: crate::packet::datagram::ResetTarget::Both,
             error_code: VarInt::from_u8(7),
         },
@@ -606,14 +606,14 @@ fn frame_batch_tracks_byte_costs_per_priority() {
 
     let (queues, costs) = batch.into_queues();
     assert_eq!(
-        costs[Priority::FlowControl.as_index()],
+        costs[Priority::QueueControl.as_index()],
         MAX_FRAME_BATCH_PACKET_OVERHEAD + first_cost
     );
-    assert_eq!(costs[Priority::FlowData.as_index()], data_cost);
-    assert_eq!(costs[Priority::FlowReset.as_index()], reset_cost);
-    assert_eq!(queues[Priority::FlowControl.as_index()].len(), 1);
-    assert_eq!(queues[Priority::FlowData.as_index()].len(), 1);
-    assert_eq!(queues[Priority::FlowReset.as_index()].len(), 1);
+    assert_eq!(costs[Priority::QueueData.as_index()], data_cost);
+    assert_eq!(costs[Priority::QueueReset.as_index()], reset_cost);
+    assert_eq!(queues[Priority::QueueControl.as_index()].len(), 1);
+    assert_eq!(queues[Priority::QueueData.as_index()].len(), 1);
+    assert_eq!(queues[Priority::QueueReset.as_index()].len(), 1);
 }
 
 #[test]

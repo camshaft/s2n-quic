@@ -294,9 +294,9 @@ fn assemble_accounts_for_header_overhead() {
     for _ in 0..128 {
         context.push_back_frame(
             Frame {
-                header: Header::FlowReset {
+                header: Header::QueueReset {
                     dest_queue_id: VarInt::from_u8(1),
-                    stream_id: VarInt::from_u8(1),
+                    binding_id: VarInt::from_u8(1),
                     reset_target: ResetTarget::Both,
                     error_code: VarInt::from_u8(1),
                 },
@@ -453,33 +453,33 @@ fn encode_decode_round_trip() {
 
     let input_frames = vec![
         FrameInput {
-            header: Header::FlowData {
+            header: Header::QueueData {
                 queue_pair: crate::packet::datagram::QueuePair {
                     source_queue_id: VarInt::from_u8(1),
                     dest_queue_id: VarInt::from_u8(2),
                 },
-                stream_id: VarInt::from_u8(42),
+                binding_id: VarInt::from_u8(42),
                 offset: VarInt::ZERO,
                 is_fin: false,
             },
             payload: b"hello world".to_vec(),
         },
         FrameInput {
-            header: Header::FlowReset {
+            header: Header::QueueReset {
                 dest_queue_id: VarInt::from_u8(3),
-                stream_id: VarInt::from_u8(10),
+                binding_id: VarInt::from_u8(10),
                 reset_target: ResetTarget::Both,
                 error_code: VarInt::from_u8(1),
             },
             payload: vec![],
         },
         FrameInput {
-            header: Header::FlowData {
+            header: Header::QueueData {
                 queue_pair: crate::packet::datagram::QueuePair {
                     source_queue_id: VarInt::from_u8(4),
                     dest_queue_id: VarInt::from_u8(5),
                 },
-                stream_id: VarInt::from_u8(20),
+                binding_id: VarInt::from_u8(20),
                 offset: VarInt::from_u8(11),
                 is_fin: true,
             },
