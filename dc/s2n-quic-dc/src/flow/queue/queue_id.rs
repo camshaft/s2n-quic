@@ -13,10 +13,11 @@ use s2n_quic_core::varint::VarInt;
 /// ```
 ///
 /// where:
-/// - `index_low` uses `INDEX_LOW_BITS` LSBs,
-/// - `index_high` uses the remaining index bits in the MSB region,
-/// - `generation_low` sits between the index halves,
-/// - `generation_high` occupies the remaining middle bits.
+/// - `index_low` uses `INDEX_LOW_BITS` (=20) LSBs,
+/// - `index_high` uses `INDEX_HIGH_BITS` (=5) MSBs,
+/// - `generation_low` uses `GENERATION_LOW_BITS` (=10) bits between index halves,
+/// - `generation_high` uses `GENERATION_BITS - GENERATION_LOW_BITS` (=27) bits in
+///   the remaining middle region.
 ///
 /// Decoding is the inverse composition performed by [`index`] and [`generation`].
 pub const INDEX_BITS: u32 = 25;

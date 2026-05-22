@@ -162,6 +162,9 @@ where
         let target_epoch = self.epoch + PAGE_SIZE;
         senders.epoch = target_epoch;
         self.epoch = target_epoch;
+        // Unit tests rely on deterministic snapshots and `counter::Summary::record_value`
+        // emits metric trace lines under `cfg(test)`. Keep recording enabled for
+        // non-test builds where this metric is consumed operationally.
         #[cfg(not(test))]
         if let Some(summary) = &self.epoch_summary {
             summary.record_value(target_epoch as u64);
