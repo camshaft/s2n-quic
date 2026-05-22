@@ -161,9 +161,9 @@ mod tests {
 
     #[test]
     fn bolero_find_page_round_trip() {
-        // Use the test-mode initial page size (8) so the same value is baked
+        // Use the configured initial page size so the same value is baked
         // into both the O(1) implementation and the oracle.
-        const PS: usize = 8;
+        const PS: usize = super::super::INITIAL_PAGE_SIZE;
 
         check!().with_type::<u32>().for_each(|raw_slot| {
             let slot = (*raw_slot as usize) % super::super::queue_id::MAX_SLOTS;
