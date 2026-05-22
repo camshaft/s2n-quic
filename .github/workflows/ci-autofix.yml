@@ -79,8 +79,11 @@ jobs:
               const title = pr.title || '';
               const body = pr.body || '';
               const labels = (pr.labels || []).map(l => l.name || '');
+              const isAutofixCandidate = labels.includes('ci-autofix')
+                || title.startsWith('[ci-autofix]')
+                || (pr.head?.ref || '').startsWith('copilot/ci-autofix/');
               const shortSha = sha.slice(0, 12);
-              return labels.includes('ci-autofix') && (
+              return isAutofixCandidate && (
                 body.includes(sha) ||
                 body.includes(shortSha) ||
                 title.includes(sha) ||
@@ -126,7 +129,8 @@ jobs:
           # CI_AUTOFIX_MAX_LOG_LINES when needed.
           MAX_LOG_LINES="${CI_AUTOFIX_MAX_LOG_LINES:-220}"
 
-          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID/jobs?per_page=100" > "$JOBS_JSON"
+          gh api --paginate "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID/jobs?per_page=100" \
+            | jq -s '{jobs: (map(.jobs // []) | add)}' > "$JOBS_JSON"
 
           jq -r '
             .jobs
@@ -263,6 +267,7 @@ jobs:
     if: github.event_name == 'pull_request_target'
     runs-on: ubuntu-latest
     permissions:
+      actions: read
       pull-requests: read
     steps:
       - name: Validate autofix PR metadata and policy
@@ -278,8 +283,10 @@ jobs:
               return;
             }
 
+            const titleMatch = (pr.title || '').match(/^\[ci-autofix\] ci failure on ([a-f0-9]{12})$/);
+            const expectedShortSha = titleMatch?.[1];
             const errors = [];
-            if (!/^\[ci-autofix\] ci failure on [a-f0-9]{12}$/.test(pr.title || '')) {
+            if (!titleMatch) {
               errors.push('PR title must match `[ci-autofix] ci failure on <12-char-sha>`.');
             }
             if (!(pr.head.ref || '').startsWith('copilot/ci-autofix/')) {
@@ -291,8 +298,24 @@ jobs:
             if (!labels.includes('bot')) {
               errors.push('PR must include label `bot`.');
             }
-            if (!/\/actions\/runs\/\d+/i.test(pr.body || '')) {
-              errors.push('PR body must link to the failing workflow run URL.');
+            const runUrlMarkerMatch = (pr.body || '').match(/<!--\s*ci-autofix-run-url:https:\/\/github\.com\/[^\/]+\/[^\/]+\/actions\/runs\/(\d+)\s*-->/i);
+            if (!runUrlMarkerMatch) {
+              errors.push('PR body must include `<!-- ci-autofix-run-url:https://github.com/<owner>/<repo>/actions/runs/<run-id> -->`.');
+            } else {
+              const runId = Number(runUrlMarkerMatch[1]);
+              if (!Number.isInteger(runId) || runId <= 0) {
+                errors.push('PR body has an invalid ci-autofix run id marker.');
+              } else if (expectedShortSha) {
+                const run = await github.rest.actions.getWorkflowRun({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  run_id: runId,
+                });
+                const runHeadSha = run.data.head_sha || '';
+                if (!runHeadSha.startsWith(expectedShortSha)) {
+                  errors.push(`Run id ${runId} does not match title SHA ${expectedShortSha}.`);
+                }
+              }
             }
             if (pr.base.ref !== 'main') {
               errors.push('Autofix PR must target `main`.');
@@ -429,8 +452,11 @@ jobs:
                 const labels = (pr.labels || []).map(l => l.name || '');
                 const prBody = pr.body || '';
                 const title = pr.title || '';
+                const isAutofixCandidate = labels.includes('ci-autofix')
+                  || title.startsWith('[ci-autofix]')
+                  || (pr.head?.ref || '').startsWith('copilot/ci-autofix/');
                 const shaNeedle = sha.slice(0, 12);
-                const looksRelated = labels.includes('ci-autofix') && (
+                const looksRelated = isAutofixCandidate && (
                   prBody.includes(sha) ||
                   prBody.includes(shaNeedle) ||
                   title.includes(sha) ||
