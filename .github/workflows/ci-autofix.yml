@@ -10,12 +10,6 @@ on:
     - cron: '15 * * * *'
   workflow_dispatch:
 
-permissions:
-  contents: read
-  actions: read
-  issues: write
-  pull-requests: write
-
 concurrency:
   group: ci-autofix-${{ github.event_name }}-${{ github.event.workflow_run.id || github.event.pull_request.number || 'maintenance' }}
   cancel-in-progress: false
@@ -24,6 +18,10 @@ jobs:
   dispatch-autofix:
     if: github.event_name == 'workflow_run'
     runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      issues: write
+      pull-requests: read
     steps:
       - name: Gate autofix dispatch
         id: gate
@@ -264,6 +262,8 @@ jobs:
   validate-autofix-pr:
     if: github.event_name == 'pull_request_target'
     runs-on: ubuntu-latest
+    permissions:
+      pull-requests: read
     steps:
       - name: Validate autofix PR metadata and policy
         uses: actions/github-script@v8
@@ -302,8 +302,14 @@ jobs:
               core.setFailed(errors.join('\n'));
             }
 
+  request-autofix-reviewers:
+    if: github.event_name == 'pull_request_target' && (vars.CI_AUTOFIX_REVIEWERS != '' || vars.CI_AUTOFIX_REVIEW_TEAMS != '')
+    needs: validate-autofix-pr
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+    steps:
       - name: Optionally request reviewers/teams
-        if: ${{ vars.CI_AUTOFIX_REVIEWERS != '' || vars.CI_AUTOFIX_REVIEW_TEAMS != '' }}
         uses: actions/github-script@v8
         env:
           REVIEWERS: ${{ vars.CI_AUTOFIX_REVIEWERS }}
@@ -337,6 +343,10 @@ jobs:
   stale-cleanup:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      issues: write
+      pull-requests: write
     steps:
       - name: Auto-close stale autofix issues/PRs when failure is no longer reproducible
         uses: actions/github-script@v8
@@ -351,6 +361,12 @@ jobs:
               repo,
               state: 'open',
               labels: 'ci-autofix,autofix-in-progress',
+              per_page: 100,
+            });
+            const openPRs = await github.paginate(github.rest.pulls.list, {
+              owner,
+              repo,
+              state: 'open',
               per_page: 100,
             });
 
@@ -379,8 +395,8 @@ jobs:
                 per_page: 20,
               });
 
-              const hasSuccess = (runs.data.workflow_runs || []).some(run => run.conclusion === 'success');
-              if (!hasSuccess) continue;
+              const latestRun = (runs.data.workflow_runs || [])[0];
+              if (!latestRun || latestRun.conclusion !== 'success') continue;
 
               await github.rest.issues.createComment({
                 owner,
@@ -398,14 +414,7 @@ jobs:
               });
               closedIssues += 1;
 
-              const prs = await github.paginate(github.rest.pulls.list, {
-                owner,
-                repo,
-                state: 'open',
-                per_page: 100,
-              });
-
-              for (const pr of prs) {
+              for (const pr of openPRs) {
                 const labels = (pr.labels || []).map(l => l.name || '');
                 const prBody = pr.body || '';
                 const title = pr.title || '';
