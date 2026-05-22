@@ -116,6 +116,7 @@ jobs:
           LOG_RAW="$RUNNER_TEMP/ci-autofix/failed.log"
           LOG_SNIPPET="$RUNNER_TEMP/ci-autofix/failed-snippet.txt"
           TASK_FILE="$RUNNER_TEMP/ci-autofix/task.md"
+          MAX_LOG_LINES=220
 
           gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID/jobs?per_page=100" > "$JOBS_JSON"
 
@@ -136,7 +137,7 @@ jobs:
           {
             echo "----- START OF FAILED LOG EXCERPT -----"
             if [ -s "$LOG_RAW" ]; then
-              sed -n '1,220p' "$LOG_RAW"
+              sed -n "1,${MAX_LOG_LINES}p" "$LOG_RAW"
             else
               echo "No failed log output captured by gh run view --log-failed"
             fi
@@ -348,6 +349,8 @@ jobs:
               if (!shaMatch || !workflowMatch) continue;
 
               const sha = shaMatch[1];
+              const workflowName = workflowMatch[1].trim();
+              if (workflowName !== 'ci') continue;
 
               const runs = await github.rest.actions.listWorkflowRuns({
                 owner,
