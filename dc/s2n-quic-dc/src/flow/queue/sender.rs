@@ -18,14 +18,14 @@ impl<S: 'static, C: 'static, Key: 'static> State<S, C, Key> {
     }
 }
 
-pub struct Senders<S: 'static, C: 'static, Key: 'static, const PAGE_SIZE: usize> {
+pub struct Senders<S: 'static, C: 'static, Key: 'static, const INITIAL_PAGE_SIZE: usize> {
     pub(super) state: Arc<State<S, C, Key>>,
     pub(super) local: Vec<Arc<[Sender<S, C, Key>]>>,
     pub(super) memory_handle: Arc<free_list::Memory<S, C, Key>>,
 }
 
-impl<S: 'static, C: 'static, Key: 'static, const PAGE_SIZE: usize> Clone
-    for Senders<S, C, Key, PAGE_SIZE>
+impl<S: 'static, C: 'static, Key: 'static, const INITIAL_PAGE_SIZE: usize> Clone
+    for Senders<S, C, Key, INITIAL_PAGE_SIZE>
 {
     fn clone(&self) -> Self {
         Self {
@@ -36,7 +36,7 @@ impl<S: 'static, C: 'static, Key: 'static, const PAGE_SIZE: usize> Clone
     }
 }
 
-impl<S: 'static, C: 'static, Key: 'static, const PAGE_SIZE: usize> Senders<S, C, Key, PAGE_SIZE> {
+impl<S: 'static, C: 'static, Key: 'static, const INITIAL_PAGE_SIZE: usize> Senders<S, C, Key, INITIAL_PAGE_SIZE> {
     #[inline]
     fn refresh_pages(&mut self) {
         let Ok(senders) = self.state.pages.read() else {
@@ -51,23 +51,41 @@ impl<S: 'static, C: 'static, Key: 'static, const PAGE_SIZE: usize> Senders<S, C,
             .extend_from_slice(&senders.pages[self.local.len()..]);
     }
 
+    /// Computes the page index and intra-page offset for a slot in O(1).
+    ///
+    /// Pages grow exponentially: page `n` has `INITIAL_PAGE_SIZE * 2^n` slots and
+    /// starts at slot `(2^n - 1) * INITIAL_PAGE_SIZE`.  Given a slot `s`:
+    ///
+    /// ```text
+    /// k         = s / INITIAL_PAGE_SIZE
+    /// page_idx  = floor(log2(k + 1))          -- highest set bit of (k+1)
+    /// page_start = (2^page_idx - 1) * INITIAL_PAGE_SIZE
+    /// offset    = s - page_start
+    /// ```
+    #[inline]
+    fn find_page(slot: usize) -> (usize, usize) {
+        let k = slot / INITIAL_PAGE_SIZE;
+        let page_idx = (k + 1).ilog2() as usize;
+        let page_start = ((1usize << page_idx) - 1) * INITIAL_PAGE_SIZE;
+        (page_idx, slot - page_start)
+    }
+
     #[inline]
     pub fn lookup<T, F, V>(&mut self, queue_id: VarInt, entry: T, f: F) -> Result<V, Error<T>>
     where
         F: FnOnce(&Sender<S, C, Key>, T) -> Result<V, Error<T>>,
     {
         let slot = queue_id::index(queue_id);
-        let page = slot / PAGE_SIZE;
-        let offset = slot % PAGE_SIZE;
+        let (page_idx, offset) = Self::find_page(slot);
 
-        if self.local.len() <= page {
+        if self.local.len() <= page_idx {
             self.refresh_pages();
-            if self.local.len() <= page {
+            if self.local.len() <= page_idx {
                 return Err(Error::Unallocated(entry));
             }
         }
 
-        let Some(page) = self.local.get(page) else {
+        let Some(page) = self.local.get(page_idx) else {
             return Err(Error::Unallocated(entry));
         };
         let Some(sender) = page.get(offset) else {

@@ -11,17 +11,19 @@ use crate::{counter, tracing::*};
 use s2n_quic_core::varint::VarInt;
 use std::{alloc::Layout, marker::PhantomData, ptr::NonNull, sync::Arc};
 
-pub struct Pool<S: 'static + Send, C: 'static + Send, Key: 'static + Send, const PAGE_SIZE: usize> {
+pub struct Pool<S: 'static + Send, C: 'static + Send, Key: 'static + Send, const INITIAL_PAGE_SIZE: usize> {
     pub(super) senders: Arc<sender::State<S, C, Key>>,
     free: Arc<FreeVec<S, C, Key>>,
     /// Holds the backing memory allocated as long as there's at least one reference
     memory_handle: Arc<free_list::Memory<S, C, Key>>,
     epoch_summary: Option<counter::Summary>,
     epoch: usize,
+    /// Size of the next page to allocate; doubles after each successful grow.
+    next_page_size: usize,
 }
 
-impl<S: 'static + Send, C: 'static + Send, Key: 'static + Send, const PAGE_SIZE: usize> Clone
-    for Pool<S, C, Key, PAGE_SIZE>
+impl<S: 'static + Send, C: 'static + Send, Key: 'static + Send, const INITIAL_PAGE_SIZE: usize> Clone
+    for Pool<S, C, Key, INITIAL_PAGE_SIZE>
 {
     #[inline]
     fn clone(&self) -> Self {
@@ -31,11 +33,12 @@ impl<S: 'static + Send, C: 'static + Send, Key: 'static + Send, const PAGE_SIZE:
             senders: self.senders.clone(),
             epoch_summary: self.epoch_summary.clone(),
             epoch: self.epoch,
+            next_page_size: self.next_page_size,
         }
     }
 }
 
-impl<S, C, Key, const PAGE_SIZE: usize> Pool<S, C, Key, PAGE_SIZE>
+impl<S, C, Key, const INITIAL_PAGE_SIZE: usize> Pool<S, C, Key, INITIAL_PAGE_SIZE>
 where
     S: 'static + Send + Sync,
     C: 'static + Send + Sync,
@@ -45,20 +48,21 @@ where
     pub fn new(epoch_summary: Option<counter::Summary>) -> Self {
         let epoch = 0;
         let senders = sender::State::new(epoch);
-        let (free, memory_handle) = FreeVec::new(PAGE_SIZE);
+        let (free, memory_handle) = FreeVec::new(INITIAL_PAGE_SIZE);
         let mut pool = Pool {
             free,
             memory_handle,
             senders,
             epoch_summary,
             epoch,
+            next_page_size: INITIAL_PAGE_SIZE,
         };
         pool.grow();
         pool
     }
 
     #[inline]
-    pub fn senders(&self) -> Senders<S, C, Key, PAGE_SIZE> {
+    pub fn senders(&self) -> Senders<S, C, Key, INITIAL_PAGE_SIZE> {
         Senders {
             state: self.senders.clone(),
             // make sure the memory lives as long as this sender is alive
@@ -95,19 +99,20 @@ where
 
     #[inline(never)] // this should happen rarely
     fn grow(&mut self) {
+        let page_size = self.next_page_size;
         assert!(
-            self.epoch + PAGE_SIZE <= queue_id::MAX_SLOTS,
+            self.epoch + page_size <= queue_id::MAX_SLOTS,
             "flow queue slot space exhausted"
         );
 
-        let (region, layout) = Region::alloc(PAGE_SIZE);
+        let (region, layout) = Region::alloc(page_size);
 
         let ptr = region.ptr;
 
         let mut pending_desc = vec![];
         let mut pending_senders = vec![];
 
-        for idx in 0..PAGE_SIZE {
+        for idx in 0..page_size {
             let offset = layout.size() * idx;
 
             unsafe {
@@ -159,13 +164,9 @@ where
         }
 
         // update the epoch with the latest value
-        let target_epoch = self.epoch + PAGE_SIZE;
+        let target_epoch = self.epoch + page_size;
         senders.epoch = target_epoch;
         self.epoch = target_epoch;
-        // Unit tests rely on deterministic snapshots and `counter::Summary::record_value`
-        // emits metric trace lines under `cfg(test)`. Keep recording enabled for
-        // non-test builds where this metric is consumed operationally.
-        #[cfg(not(test))]
         if let Some(summary) = &self.epoch_summary {
             summary.record_value(target_epoch as u64);
         }
@@ -177,6 +178,12 @@ where
         drop(senders);
 
         debug!(epoch = epoch, "grow");
+
+        // Double the page size for next time, saturating at the remaining slot space.
+        self.next_page_size = self
+            .next_page_size
+            .saturating_mul(2)
+            .min(queue_id::MAX_SLOTS - self.epoch);
 
         // push all of the descriptors into the free list
         self.free.record_region(region, pending_desc);
