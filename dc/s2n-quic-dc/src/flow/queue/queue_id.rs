@@ -3,6 +3,22 @@
 
 use s2n_quic_core::varint::VarInt;
 
+/// Queue ID bit layout (62-bit QUIC varint payload).
+///
+/// We interleave index and generation fields so queue IDs keep a stable slot lookup
+/// while preserving generation for stale-handle detection:
+///
+/// ```text
+/// [ index_high | generation_high | generation_low | index_low ]
+/// ```
+///
+/// where:
+/// - `index_low` uses `INDEX_LOW_BITS` LSBs,
+/// - `index_high` uses the remaining index bits in the MSB region,
+/// - `generation_low` sits between the index halves,
+/// - `generation_high` occupies the remaining middle bits.
+///
+/// Decoding is the inverse composition performed by [`index`] and [`generation`].
 pub const INDEX_BITS: u32 = 25;
 pub const GENERATION_BITS: u32 = 62 - INDEX_BITS;
 pub const GENERATION_MASK: u64 = (1u64 << GENERATION_BITS) - 1;
@@ -31,6 +47,7 @@ pub fn encode(index: usize, generation: u64) -> VarInt {
         | (generation_low << GENERATION_LOW_SHIFT)
         | (generation_high << GENERATION_HIGH_SHIFT)
         | (index_high << INDEX_HIGH_SHIFT);
+    // SAFETY: all packed values are bounded to 62 bits by construction.
     unsafe { VarInt::new_unchecked(value) }
 }
 

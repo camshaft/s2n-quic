@@ -406,7 +406,6 @@ fn dispatch_decoded_frame(
             is_fin,
         } => {
             handle_flow_data(
-                &peer.path_entry,
                 credentials,
                 queue_pair,
                 stream_id,
@@ -415,7 +414,6 @@ fn dispatch_decoded_frame(
                 payload,
                 queue_dispatcher,
                 counters,
-                response_frames,
                 waker_sink,
             );
         }
@@ -424,14 +422,12 @@ fn dispatch_decoded_frame(
             stream_id,
         } => {
             handle_flow_control(
-                &peer.path_entry,
                 credentials,
                 queue_pair,
                 stream_id,
                 payload,
                 queue_dispatcher,
                 counters,
-                response_frames,
                 waker_sink,
             );
         }
@@ -441,14 +437,12 @@ fn dispatch_decoded_frame(
             maximum_data,
         } => {
             handle_flow_max_data(
-                &peer.path_entry,
                 credentials,
                 queue_pair,
                 stream_id,
                 maximum_data,
                 queue_dispatcher,
                 counters,
-                response_frames,
                 waker_sink,
             );
         }
@@ -1069,7 +1063,6 @@ fn handle_flow_init_validate(
 // ── FlowData ──────────────────────────────────────────────────────────────
 
 fn handle_flow_data(
-    _path_secret_entry: &std::sync::Arc<PathSecretEntry>,
     credentials: &Credentials,
     queue_pair: QueuePair,
     stream_id: VarInt,
@@ -1078,7 +1071,6 @@ fn handle_flow_data(
     buf: BytesMut,
     queue_dispatcher: &mut msg::queue::Dispatcher,
     counters: &counters::Dispatch,
-    _response_frames: &mut PriorityInput,
     waker_sink: &mut impl channel::UnboundedSender<AutoWake>,
 ) {
     let local_queue_id = queue_pair.dest_queue_id;
@@ -1153,27 +1145,23 @@ fn handle_flow_data(
 // ── FlowControl ───────────────────────────────────────────────────────────
 
 fn handle_flow_control(
-    path_secret_entry: &std::sync::Arc<PathSecretEntry>,
     credentials: &Credentials,
     queue_pair: QueuePair,
     stream_id: VarInt,
     buf: BytesMut,
     queue_dispatcher: &mut msg::queue::Dispatcher,
     counters: &counters::Dispatch,
-    response_frames: &mut PriorityInput,
     waker_sink: &mut impl channel::UnboundedSender<AutoWake>,
 ) {
     let payload_len = buf.len();
     let entry = msg::Control::Frames { payload: buf }.into();
     if dispatch_control_message(
-        path_secret_entry,
         credentials,
         queue_pair,
         stream_id,
         entry,
         queue_dispatcher,
         counters,
-        response_frames,
         waker_sink,
     ) {
         trace!(
@@ -1188,26 +1176,22 @@ fn handle_flow_control(
 // ── FlowMaxData ───────────────────────────────────────────────────────────
 
 fn handle_flow_max_data(
-    path_secret_entry: &std::sync::Arc<PathSecretEntry>,
     credentials: &Credentials,
     queue_pair: QueuePair,
     stream_id: VarInt,
     maximum_data: VarInt,
     queue_dispatcher: &mut msg::queue::Dispatcher,
     counters: &counters::Dispatch,
-    response_frames: &mut PriorityInput,
     waker_sink: &mut impl channel::UnboundedSender<AutoWake>,
 ) {
     let entry = msg::Control::MaxData { maximum_data }.into();
     if dispatch_control_message(
-        path_secret_entry,
         credentials,
         queue_pair,
         stream_id,
         entry,
         queue_dispatcher,
         counters,
-        response_frames,
         waker_sink,
     ) {
         trace!(
@@ -1225,14 +1209,12 @@ fn handle_flow_max_data(
 /// All error paths are handled internally. Callers that need to emit a success trace should do so after
 /// this call when the return value is `true`.
 fn dispatch_control_message(
-    _path_secret_entry: &std::sync::Arc<PathSecretEntry>,
     credentials: &Credentials,
     queue_pair: QueuePair,
     stream_id: VarInt,
     entry: Entry<msg::Control>,
     queue_dispatcher: &mut msg::queue::Dispatcher,
     counters: &counters::Dispatch,
-    _response_frames: &mut PriorityInput,
     waker_sink: &mut impl channel::UnboundedSender<AutoWake>,
 ) -> bool {
     let local_queue_id = queue_pair.dest_queue_id;

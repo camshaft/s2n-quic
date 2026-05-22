@@ -109,6 +109,7 @@ impl<S: 'static, C: 'static, Key: 'static> Descriptor<S, C, Key> {
     /// # Safety
     ///
     /// The caller needs to guarantee the [`Descriptor`] is still allocated.
+    /// While allocated, `queue_id` is always initialized to a valid `VarInt`.
     #[inline]
     pub unsafe fn queue_id(&self) -> VarInt {
         let v = self.inner().queue_id.load(Ordering::Relaxed);
@@ -272,15 +273,15 @@ impl<S: 'static, C: 'static, Key: 'static> Descriptor<S, C, Key> {
 
         ensure!(inner
             .stream
-            .close_receiver(&inner.control, half)
+            .close_receiver(&inner.control, half, || {
+                inner
+                    .queue_id
+                    .store(REMOTE_QUEUE_ID_UNKNOWN, Ordering::Relaxed);
+                inner.clear_key();
+            })
             .is_continue());
 
         probes::on_receiver_free(inner.id, half);
-
-        inner
-            .queue_id
-            .store(REMOTE_QUEUE_ID_UNKNOWN, Ordering::Relaxed);
-        inner.clear_key();
 
         let storage = inner.free_list.free(Descriptor {
             ptr: self.ptr,
@@ -293,7 +294,8 @@ impl<S: 'static, C: 'static, Key: 'static> Descriptor<S, C, Key> {
     ///
     /// # Safety
     ///
-    /// The caller needs to guarantee the [`Descriptor`] is still allocated.
+    /// The caller needs to guarantee the [`Descriptor`] is still allocated and key
+    /// access is synchronized by the queue mutex from the push path.
     #[inline]
     pub unsafe fn validate(
         &self,
@@ -322,6 +324,10 @@ pub(super) struct DescriptorInner<S, C, Key> {
     /// The peer's queue ID, written once by the dispatcher on first observation.
     /// Initialized to `u64::MAX` (unknown) and set via a relaxed store.
     remote_queue_id: AtomicU64,
+    /// Current allocation key.
+    ///
+    /// Access must be synchronized by holding the queue mutex so key reads and key
+    /// clearing cannot race with queue allocation state transitions.
     key: UnsafeCell<Option<Key>>,
     next_generation: UnsafeCell<u64>,
     stream: Queue<S>,

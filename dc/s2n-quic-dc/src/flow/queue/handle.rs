@@ -157,11 +157,13 @@ impl<S: 'static, C: 'static, Key: 'static> Sender<S, C, Key> {
 
     #[inline]
     pub fn queue_id(&self) -> VarInt {
+        // SAFETY: `Sender` holds a sender reference for a live descriptor handle.
         unsafe { self.descriptor.queue_id() }
     }
 
     #[inline]
     pub(super) fn try_queue_id(&self) -> Option<VarInt> {
+        // SAFETY: `Sender` holds a sender reference for a live descriptor handle.
         unsafe { self.descriptor.try_queue_id() }
     }
 

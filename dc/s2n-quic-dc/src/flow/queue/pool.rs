@@ -7,7 +7,7 @@ use super::{
     queue_id,
     sender::{self, Senders},
 };
-use crate::tracing::*;
+use crate::{counter, tracing::*};
 use s2n_quic_core::varint::VarInt;
 use std::{alloc::Layout, marker::PhantomData, ptr::NonNull, sync::Arc};
 
@@ -16,6 +16,7 @@ pub struct Pool<S: 'static + Send, C: 'static + Send, Key: 'static + Send, const
     free: Arc<FreeVec<S, C, Key>>,
     /// Holds the backing memory allocated as long as there's at least one reference
     memory_handle: Arc<free_list::Memory<S, C, Key>>,
+    epoch_summary: Option<counter::Summary>,
     epoch: usize,
 }
 
@@ -28,6 +29,7 @@ impl<S: 'static + Send, C: 'static + Send, Key: 'static + Send, const PAGE_SIZE:
             free: self.free.clone(),
             memory_handle: self.memory_handle.clone(),
             senders: self.senders.clone(),
+            epoch_summary: self.epoch_summary.clone(),
             epoch: self.epoch,
         }
     }
@@ -40,7 +42,7 @@ where
     Key: 'static + Send + Sync,
 {
     #[inline]
-    pub fn new() -> Self {
+    pub fn new(epoch_summary: Option<counter::Summary>) -> Self {
         let epoch = 0;
         let senders = sender::State::new(epoch);
         let (free, memory_handle) = FreeVec::new(PAGE_SIZE);
@@ -48,6 +50,7 @@ where
             free,
             memory_handle,
             senders,
+            epoch_summary,
             epoch,
         };
         pool.grow();
@@ -159,6 +162,10 @@ where
         let target_epoch = self.epoch + PAGE_SIZE;
         senders.epoch = target_epoch;
         self.epoch = target_epoch;
+        #[cfg(not(test))]
+        if let Some(summary) = &self.epoch_summary {
+            summary.record_value(target_epoch as u64);
+        }
 
         // update the sender list with the newly allocated channels
         senders.pages.push(pending_senders);
