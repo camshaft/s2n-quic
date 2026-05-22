@@ -122,7 +122,8 @@ jobs:
           LOG_RAW="$RUNNER_TEMP/ci-autofix/failed.log"
           LOG_SNIPPET="$RUNNER_TEMP/ci-autofix/failed-snippet.txt"
           TASK_FILE="$RUNNER_TEMP/ci-autofix/task.md"
-          # Keep excerpts compact enough for issue bodies while still showing context.
+          # 220 keeps issue payloads readable while still capturing enough context from both
+          # the beginning and end of failed logs.
           MAX_LOG_LINES=220
 
           gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID/jobs?per_page=100" > "$JOBS_JSON"
@@ -145,6 +146,8 @@ jobs:
             echo "----- START OF FAILED LOG EXCERPT -----"
             if [ -s "$LOG_RAW" ]; then
               HALF_LOG_LINES=$((MAX_LOG_LINES / 2))
+              # Integer division is intentional: for odd values, the output may be
+              # one line under MAX_LOG_LINES.
               sed -n "1,${HALF_LOG_LINES}p" "$LOG_RAW"
               echo "----- MIDDLE LOG CONTENT OMITTED -----"
               tail -n "$HALF_LOG_LINES" "$LOG_RAW"
@@ -273,8 +276,8 @@ jobs:
             }
 
             const errors = [];
-            if (!(pr.title || '').startsWith('[ci-autofix] ')) {
-              errors.push('PR title must start with `[ci-autofix] `.');
+            if (!/^\[ci-autofix\] ci failure on [a-f0-9]{12}$/i.test(pr.title || '')) {
+              errors.push('PR title must match `[ci-autofix] ci failure on <12-char-sha>`.');
             }
             if (!(pr.head.ref || '').startsWith('copilot/ci-autofix/')) {
               errors.push('PR head branch must start with `copilot/ci-autofix/`.');
@@ -362,10 +365,11 @@ jobs:
               const workflowName = workflowMatch[1].trim();
               if (workflowName !== 'ci') continue;
 
+              const workflowId = `${workflowName}.yml`;
               const runs = await github.rest.actions.listWorkflowRuns({
                 owner,
                 repo,
-                workflow_id: 'ci.yml',
+                workflow_id: workflowId,
                 branch: 'main',
                 head_sha: sha,
                 status: 'completed',
