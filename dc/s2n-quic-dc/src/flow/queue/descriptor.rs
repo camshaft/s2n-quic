@@ -193,9 +193,9 @@ impl<S: 'static, C: 'static, Key: 'static> Descriptor<S, C, Key> {
         let inner = self.inner();
 
         let generation = {
-            let generation = &mut *inner.next_generation.get();
-            let current = *generation;
-            *generation = current.wrapping_add(1);
+            let next_generation = &mut *inner.next_generation.get();
+            let current = *next_generation;
+            *next_generation = current.wrapping_add(1);
             current
         };
         let queue_id = queue_id::encode(inner.id.as_u64() as usize, generation);

@@ -188,7 +188,7 @@ impl<S: 'static, C: 'static, Key: 'static> Sender<S, C, Key> {
                 },
                 || self.descriptor.validate(params),
             )?;
-            probes::on_send(self.descriptor.queue_id(), Half::Stream, false);
+            probes::on_send(self.queue_id(), Half::Stream, false);
             Ok(waker)
         }
     }
@@ -216,7 +216,7 @@ impl<S: 'static, C: 'static, Key: 'static> Sender<S, C, Key> {
                 },
                 || self.descriptor.validate(params),
             )?;
-            probes::on_send(self.descriptor.queue_id(), Half::Control, false);
+            probes::on_send(self.queue_id(), Half::Control, false);
             Ok(waker)
         }
     }

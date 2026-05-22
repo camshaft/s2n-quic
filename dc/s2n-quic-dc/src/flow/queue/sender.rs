@@ -74,11 +74,11 @@ impl<S: 'static, C: 'static, Key: 'static, const PAGE_SIZE: usize> Senders<S, C,
             return Err(Error::Unallocated(entry));
         };
 
-        let Some(_) = sender.try_queue_id() else {
+        let Some(current_queue_id) = sender.try_queue_id() else {
             return Err(Error::Unallocated(entry));
         };
 
-        if sender.queue_id() != queue_id {
+        if current_queue_id != queue_id {
             return Err(Error::Unallocated(entry));
         }
 
