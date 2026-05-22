@@ -28,7 +28,7 @@ pub fn create(
 
     // Create recv sockets first to determine the data port
     let recv_bind_addrs = (0..config.recv_io_workers)
-        .map(|_| SocketAddr::new(bind_addr.ip(), 0))
+        .map(|_| SocketAddr::new(bind_addr.ip(), 0).into())
         .collect();
     let recv_sockets = socket::RecvConfig::new(recv_bind_addrs).busy_poll()?;
 
@@ -43,7 +43,7 @@ pub fn create(
     // Create send sockets
     let gso = endpoint::Gso::default();
     let send_bind_addrs = (0..config.send_sockets)
-        .map(|_| SocketAddr::new(bind_addr.ip(), 0))
+        .map(|_| SocketAddr::new(bind_addr.ip(), 0).into())
         .collect();
     let send_sockets = socket::SendConfig::new(send_bind_addrs, gso.clone()).busy_poll()?;
 

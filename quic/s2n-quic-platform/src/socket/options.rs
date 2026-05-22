@@ -4,6 +4,7 @@
 use crate::syscall;
 use s2n_quic_core::inet::SocketAddress;
 use std::{
+    ffi::CString,
     io,
     net::{SocketAddr, TcpListener, UdpSocket},
 };
@@ -24,7 +25,7 @@ pub enum ReusePort {
 #[non_exhaustive]
 pub struct Options {
     pub addr: SocketAddr,
-    pub bind_interface_index: Option<u32>,
+    pub bind_interface: Option<CString>,
     pub reuse_address: bool,
     pub reuse_port: ReusePort,
     pub gro: bool,
@@ -41,7 +42,7 @@ impl Default for Options {
     fn default() -> Self {
         Self {
             addr: SocketAddress::default().into(),
-            bind_interface_index: None,
+            bind_interface: None,
             reuse_address: false,
             reuse_port: Default::default(),
             gro: true,
@@ -115,8 +116,8 @@ impl Options {
             set_reuse_port(socket)?;
         }
 
-        if let Some(interface_index) = self.bind_interface_index {
-            bind_to_interface_index(socket, interface_index)?;
+        if let Some(interface_name) = &self.bind_interface {
+            bind_to_interface(socket, interface_name)?;
         }
 
         socket.bind(&self.addr.into())?;
@@ -126,31 +127,19 @@ impl Options {
         }
 
         #[cfg(target_os = "linux")]
-        fn bind_to_interface_index(
+        fn bind_to_interface(
             socket: &socket2::Socket,
-            interface_index: u32,
+            interface_name: &CString,
         ) -> io::Result<()> {
             use std::os::fd::AsRawFd;
-
-            let mut ifname = [0 as libc::c_char; libc::IF_NAMESIZE];
-            let ifname_ptr = unsafe { libc::if_indextoname(interface_index, ifname.as_mut_ptr()) };
-            if ifname_ptr.is_null() {
-                return Err(io::Error::last_os_error());
-            }
-
-            let ifname_len = ifname
-                .iter()
-                .position(|&c| c == 0)
-                .map(|len| len + 1)
-                .unwrap_or(ifname.len());
 
             let ret = unsafe {
                 libc::setsockopt(
                     socket.as_raw_fd(),
                     libc::SOL_SOCKET,
                     libc::SO_BINDTODEVICE,
-                    ifname.as_ptr() as *const _,
-                    ifname_len as _,
+                    interface_name.as_ptr() as *const _,
+                    interface_name.as_bytes_with_nul().len() as _,
                 )
             };
 
@@ -162,13 +151,13 @@ impl Options {
         }
 
         #[cfg(not(target_os = "linux"))]
-        fn bind_to_interface_index(
+        fn bind_to_interface(
             _socket: &socket2::Socket,
-            _interface_index: u32,
+            _interface_name: &CString,
         ) -> io::Result<()> {
             Err(io::Error::new(
                 io::ErrorKind::Unsupported,
-                "binding to a NIC index is only supported on Linux",
+                "binding to a NIC is only supported on Linux",
             ))
         }
 

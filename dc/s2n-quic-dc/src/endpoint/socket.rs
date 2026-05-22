@@ -3,23 +3,35 @@
 
 use crate::socket::{BusyPoll, Gso as GsoSocket, Options};
 use s2n_quic_platform::features;
-use std::{io, net::SocketAddr};
+use std::{ffi::CString, io, net::SocketAddr};
 
 const DEFAULT_BUFFER_SIZE: usize = 200 * 1024 * 1024;
 
 /// Configuration for send socket creation.
+#[derive(Clone, Debug)]
+pub struct BindAddress {
+    pub addr: SocketAddr,
+    pub ifname: Option<CString>,
+}
+
+impl From<SocketAddr> for BindAddress {
+    #[inline]
+    fn from(addr: SocketAddr) -> Self {
+        Self { addr, ifname: None }
+    }
+}
+
+/// Configuration for send socket creation.
 pub struct SendConfig {
-    pub bind_addrs: Vec<SocketAddr>,
-    pub nic_index: Option<u32>,
+    pub bind_addrs: Vec<BindAddress>,
     pub gso: features::Gso,
     pub send_buffer: usize,
 }
 
 impl SendConfig {
-    pub fn new(bind_addrs: Vec<SocketAddr>, gso: features::Gso) -> Self {
+    pub fn new(bind_addrs: Vec<BindAddress>, gso: features::Gso) -> Self {
         Self {
             bind_addrs,
-            nic_index: None,
             gso,
             send_buffer: DEFAULT_BUFFER_SIZE,
         }
@@ -38,8 +50,8 @@ impl SendConfig {
 
         for bind_addr in &self.bind_addrs {
             let mut opts = Options::default();
-            opts.addr = *bind_addr;
-            opts.bind_interface_index = self.nic_index;
+            opts.addr = bind_addr.addr;
+            opts.bind_interface = bind_addr.ifname.clone();
             opts.blocking = false;
             opts.send_buffer = Some(self.send_buffer);
             opts.recv_buffer = Some(0);
@@ -67,16 +79,14 @@ impl SendConfig {
 /// target individual recv workers directly (bypassing kernel RSS). The full list
 /// of bound addresses is advertised to peers during the handshake.
 pub struct RecvConfig {
-    pub bind_addrs: Vec<SocketAddr>,
-    pub nic_index: Option<u32>,
+    pub bind_addrs: Vec<BindAddress>,
     pub recv_buffer: usize,
 }
 
 impl RecvConfig {
-    pub fn new(bind_addrs: Vec<SocketAddr>) -> Self {
+    pub fn new(bind_addrs: Vec<BindAddress>) -> Self {
         Self {
             bind_addrs,
-            nic_index: None,
             recv_buffer: DEFAULT_BUFFER_SIZE,
         }
     }
@@ -94,8 +104,8 @@ impl RecvConfig {
 
         for bind_addr in &self.bind_addrs {
             let mut opts = Options::default();
-            opts.addr = *bind_addr;
-            opts.bind_interface_index = self.nic_index;
+            opts.addr = bind_addr.addr;
+            opts.bind_interface = bind_addr.ifname.clone();
             opts.gro = true;
             opts.blocking = false;
             opts.recv_buffer = Some(self.recv_buffer);
@@ -222,8 +232,8 @@ mod tests {
     #[test]
     fn recv_config_binds_to_each_addr() {
         let addrs = vec![
-            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
-            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).into(),
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).into(),
         ];
         let sockets = RecvConfig::new(addrs).create().expect("bind should work");
         assert_eq!(sockets.len(), 2);
