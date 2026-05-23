@@ -54,6 +54,64 @@ impl PathSecretMapEntry for Frame {
     }
 }
 
+// ── ID-mapped dispatch ─────────────────────────────────────────────────────
+
+/// Items that expose a logical ID used for routing to a destination sender.
+pub trait HasId<I> {
+    fn id(&self) -> I;
+}
+
+/// Dispatches items by first mapping a logical ID to a destination ID, then
+/// forwarding to the destination sender.
+pub struct MappedSender<T, I, D, S> {
+    senders: IdMap<D, S>,
+    id_map: IdMap<I, D>,
+    _value: PhantomData<fn() -> T>,
+}
+
+impl<T, I, D, S: Clone> Clone for MappedSender<T, I, D, S> {
+    fn clone(&self) -> Self {
+        Self {
+            senders: self.senders.clone(),
+            id_map: self.id_map.clone(),
+            _value: PhantomData,
+        }
+    }
+}
+
+impl<T, I, D, S> MappedSender<T, I, D, S> {
+    #[inline]
+    pub fn new(senders: IdMap<D, S>, id_map: IdMap<I, D>) -> Self {
+        Self {
+            senders,
+            id_map,
+            _value: PhantomData,
+        }
+    }
+}
+
+impl<T, I, D, S> UnboundedSender<T> for MappedSender<T, I, D, S>
+where
+    T: HasId<I>,
+    I: Into<usize> + Copy,
+    D: Into<usize> + Copy,
+    S: UnboundedSender<T>,
+{
+    #[inline]
+    fn send(&mut self, value: T) -> Result<(), T> {
+        let logical_id = value.id();
+        let destination_id = *self
+            .id_map
+            .get(logical_id)
+            .expect("logical id not found in mapped sender id map");
+        let sender = self
+            .senders
+            .get_mut(destination_id)
+            .expect("destination id not found in mapped sender senders");
+        sender.send(value)
+    }
+}
+
 // ── FrameBatch ────────────────────────────────────────────────────────────
 
 /// Conservative packet-level overhead estimate for stream frame batches.
