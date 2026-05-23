@@ -462,6 +462,8 @@ mod tests {
                 status: TransmissionStatus::Pending,
                 ttl: DEFAULT_TTL,
                 transmission_time: None,
+                ack_largest_recv_time: None,
+                ack_completion: None,
             }
             .into(),
         );

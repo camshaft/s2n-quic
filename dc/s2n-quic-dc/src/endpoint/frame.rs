@@ -15,7 +15,7 @@
 
 use crate::{
     byte_vec::ByteVec,
-    endpoint::id::LocalSenderId,
+    endpoint::{id::LocalSenderId, msg},
     intrusive::{Entry, Queue},
     packet::datagram::{QueuePair, ResetTarget},
     path::secret::map::Entry as PathSecretEntry,
@@ -438,7 +438,7 @@ pub enum Header {
         attempt_id: VarInt,
         stream_id: VarInt,
     },
-    /// ACK frame with ack_delay lifted into the header (direct routing path).
+    /// ACK frame with ack_delay lifted into the header.
     ///
     /// The body contains only the pre-encoded ACK ranges (and ECN counts if has_ecn).
     /// ack_delay is computed by the sender at assembly time as `now - largest_recv_time`,
@@ -871,6 +871,12 @@ pub struct Frame {
     /// interleave fairly with frames from other streams rather than forming bursts.
     /// Advisory — actual pacing happens at the Peer Context level.
     pub transmission_time: Option<precision::Timestamp>,
+    /// Largest received timestamp carried by ACK frames submitted through `frame_tx`.
+    /// The assembler stamps `ack_delay` from this just before encoding.
+    pub ack_largest_recv_time: Option<precision::Timestamp>,
+    /// One-time completion routed back to the recv worker after an ACK frame is first
+    /// packetized, allowing the recv ACK state machine to leave Flushed.
+    pub ack_completion: Option<Entry<msg::Sender>>,
 }
 
 impl Frame {
@@ -953,6 +959,8 @@ mod tests {
             status: TransmissionStatus::default(),
             ttl: DEFAULT_TTL,
             transmission_time: None,
+            ack_largest_recv_time: None,
+            ack_completion: None,
         };
 
         assert_eq!(frame.payload_len(), 5);
@@ -981,6 +989,8 @@ mod tests {
             status: TransmissionStatus::default(),
             ttl: DEFAULT_TTL,
             transmission_time: None,
+            ack_largest_recv_time: None,
+            ack_completion: None,
         };
 
         assert_eq!(frame.priority(), Priority::FlowInit);
@@ -1005,6 +1015,8 @@ mod tests {
             status: TransmissionStatus::default(),
             ttl: DEFAULT_TTL,
             transmission_time: None,
+            ack_largest_recv_time: None,
+            ack_completion: None,
         };
 
         assert_eq!(frame.priority(), Priority::FlowReset);
@@ -1035,6 +1047,8 @@ mod tests {
             status: TransmissionStatus::default(),
             ttl: DEFAULT_TTL,
             transmission_time: None,
+            ack_largest_recv_time: None,
+            ack_completion: None,
         };
 
         assert!(frame.requires_sticky_sender());

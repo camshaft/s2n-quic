@@ -361,6 +361,8 @@ mod tests {
             status: TransmissionStatus::default(),
             ttl: DEFAULT_TTL,
             transmission_time: None,
+            ack_largest_recv_time: None,
+            ack_completion: None,
         };
         frames.push_back(frame.into());
 

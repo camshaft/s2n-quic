@@ -5,7 +5,7 @@
 //!
 //! The ack burst task sits on the recv dispatch worker. When the packet dispatch task
 //! schedules an ACK (by pushing a recv::Context into the burst queue), this task encodes
-//! the ACK ranges and emits an ACK frame submission through frame_tx. These tests verify
+//! the ACK ranges and emits an ACK frame submission through `frame_tx`. These tests verify
 //! the encoding/emission contract: contexts with pending ACKs produce submissions, contexts
 //! without pending ACKs produce nothing, and already-flushed contexts are not double-submitted.
 
@@ -33,11 +33,9 @@ fn setup(
     let (sender, output_rx) = unsync::new::<crate::endpoint::frame::Frame>();
     let input = TestReceiver::new(contexts);
     let counters = crate::endpoint::counters::Dispatch::new(&crate::counter::Registry::default());
-    let clock = Clock::default();
     let rx = tasks::ack_burst(
         input,
         sender,
-        clock,
         crate::endpoint::id::RecvDispatchWorkerId::new(0),
         counters,
     );
@@ -75,6 +73,8 @@ fn context_with_pending_acks_emits_submission() {
                 &first.header,
                 crate::endpoint::frame::Header::Ack { .. }
             ));
+            assert!(first.ack_largest_recv_time.is_some());
+            assert!(first.ack_completion.is_some());
             assert!(
                 output_rx.recv().await.is_none(),
                 "expected exactly one submission"
@@ -136,6 +136,8 @@ fn multiple_contexts_each_produce_submission() {
                     &item.header,
                     crate::endpoint::frame::Header::Ack { .. }
                 ));
+                assert!(item.ack_largest_recv_time.is_some());
+                assert!(item.ack_completion.is_some());
             }
             assert!(
                 output_rx.recv().await.is_none(),
@@ -192,6 +194,8 @@ fn duplicate_context_entry_produces_single_submission() {
                 &first.header,
                 crate::endpoint::frame::Header::Ack { .. }
             ));
+            assert!(first.ack_largest_recv_time.is_some());
+            assert!(first.ack_completion.is_some());
             assert!(
                 output_rx.recv().await.is_none(),
                 "duplicate context should not double-submit"

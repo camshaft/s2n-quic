@@ -939,6 +939,8 @@ impl Inner {
             status: frame::TransmissionStatus::default(),
             ttl: DEFAULT_TTL,
             transmission_time: None,
+            ack_largest_recv_time: None,
+            ack_completion: None,
         };
 
         self.send_frame(frame)?;
@@ -975,6 +977,8 @@ impl Inner {
             status: frame::TransmissionStatus::default(),
             ttl: DEFAULT_TTL,
             transmission_time: None,
+            ack_largest_recv_time: None,
+            ack_completion: None,
         };
 
         self.send_frame(frame)?;

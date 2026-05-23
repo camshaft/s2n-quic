@@ -12,7 +12,9 @@ use super::helpers::{
     build_send_context, test_batch, test_batch_with_payload, test_entry_at, TestReceiverExt as _,
 };
 use crate::{
-    endpoint::{combinator::AssemblerCounters, frame, id::Id, msg, send, tasks},
+    endpoint::{
+        ack::state as ack_state, combinator::AssemblerCounters, frame, id::Id, msg, send, tasks,
+    },
     socket::{
         channel::{intrusive::unsync, ReceiverExt as _, UnboundedSender as _},
         pool::Pool,
@@ -506,11 +508,137 @@ fn cancelled_frame_emitted_when_completion_is_cancelled() {
                         status: frame::TransmissionStatus::Pending,
                         ttl: 3,
                         transmission_time: None,
+                        ack_largest_recv_time: None,
+                        ack_completion: None,
                     }),
                 );
                 batch.set_sender_id(crate::endpoint::id::LocalSenderId::from_index(0));
                 let _ = c.push_batch(batch, &clock);
                 c.tx_wheel.target_time = Some(clock.now());
+            }
+            let _ = ctx_tx.send(ctx);
+            drop(ctx_tx);
+        }
+        .spawn();
+    });
+}
+
+/// An ACK frame queued on the priority lane is stamped and packetized by the assembler,
+/// and exactly one completion is routed back to the recv worker.
+#[test]
+fn queued_ack_frame_emits_ack_completion_once() {
+    sim(|| {
+        let registry = crate::counter::Registry::default();
+        let clock = Clock::default();
+
+        let AssemblerChannels {
+            mut ctx_tx,
+            ctx_rx,
+            immediate_rx,
+            immediate_tx,
+            cancelled_tx,
+            ack_completions_tx,
+            asm_counters,
+            tx_wheel_tx,
+            pto_wheel_tx,
+            idle_wheel_tx,
+            mut tx_wheel_rx,
+            mut pto_wheel_rx,
+            mut idle_wheel_rx,
+            mut cancelled_rx,
+            mut ack_completions_rx,
+        } = assembler_channels(&registry);
+
+        async {
+            let recv_socket = UdpSocket::bind("0.0.0.0:4433").await.unwrap();
+            let mut buf = vec![0u8; 1500];
+            let (n, _peer) = recv_socket.recv_from(&mut buf).await.unwrap();
+            assert!(n > 0, "assembler should have sent the queued ACK frame");
+        }
+        .group("server")
+        .primary()
+        .spawn();
+
+        let asm_clock = clock.clone();
+        async move {
+            assembler_pipeline(
+                immediate_rx,
+                ctx_rx,
+                cancelled_tx,
+                ack_completions_tx,
+                asm_counters,
+                immediate_tx,
+                tx_wheel_tx,
+                pto_wheel_tx,
+                idle_wheel_tx,
+                asm_clock,
+            )
+            .await;
+
+            let completion = ack_completions_rx
+                .recv()
+                .await
+                .expect("queued ACK frame should emit a completion");
+            assert!(matches!(&*completion, msg::Sender::PendingAck(_)));
+            assert!(
+                ack_completions_rx.recv().await.is_none(),
+                "queued ACK frame should only emit one completion"
+            );
+            assert!(
+                cancelled_rx.recv().await.is_none(),
+                "queued ACK frame should not be cancelled"
+            );
+            assert!(
+                tx_wheel_rx.recv().await.is_none(),
+                "no pending data remains after sending one ACK frame"
+            );
+            assert!(
+                pto_wheel_rx.recv().await.is_none(),
+                "ack-only frame without inflight data should not arm PTO"
+            );
+            assert!(
+                idle_wheel_rx.recv().await.is_some(),
+                "active context should remain on the idle wheel"
+            );
+        }
+        .spawn();
+
+        async move {
+            let entry = test_entry_at("server:4433").await;
+            let now = clock.now();
+            let completion =
+                crate::intrusive::Entry::new(msg::Sender::PendingAck(ack_state::Submission {
+                    body: bytes::Bytes::from_static(&[0]),
+                    largest_recv_time: now,
+                    has_ecn: false,
+                    path_secret_entry: entry.clone(),
+                    local_sender_id: crate::endpoint::id::LocalSenderId::from_index(0),
+                    remote_sender_id: crate::endpoint::id::RemoteSenderId::new(VarInt::from_u8(1)),
+                    recv_worker_id: crate::endpoint::id::RecvDispatchWorkerId::new(0),
+                }));
+            let ctx = build_send_context(&entry, 0, &registry, &clock);
+            {
+                let mut c = ctx.borrow_mut();
+                c.queues[frame::Priority::Ack.as_index()].push_back(crate::intrusive::Entry::new(
+                    frame::Frame {
+                        header: frame::Header::Ack {
+                            dest_sender_id: VarInt::from_u8(1),
+                            ack_delay: VarInt::ZERO,
+                            has_ecn: false,
+                            is_ack_eliciting: false,
+                        },
+                        source_sender_id: crate::endpoint::id::LocalSenderId::UNSPECIFIED,
+                        payload: bytes::Bytes::from_static(&[0]).into(),
+                        path_secret_entry: entry.clone(),
+                        completion: None,
+                        status: frame::TransmissionStatus::Pending,
+                        ttl: 3,
+                        transmission_time: None,
+                        ack_largest_recv_time: Some(now),
+                        ack_completion: Some(completion),
+                    },
+                ));
+                c.tx_wheel.target_time = Some(now);
             }
             let _ = ctx_tx.send(ctx);
             drop(ctx_tx);

@@ -75,6 +75,8 @@ fn test_frame(pse: &Arc<crate::path::secret::map::Entry>) -> Entry<Frame> {
         status: frame::TransmissionStatus::Pending,
         ttl: 3,
         transmission_time: None,
+        ack_largest_recv_time: None,
+        ack_completion: None,
     })
 }
 
@@ -332,7 +334,6 @@ fn ack_burst_after_recv_invalidation_emits_nothing() {
         let mut ack_burst = tasks::ack_burst(
             ack_burst_rx,
             sender,
-            crate::time::bach::Clock::default(),
             crate::endpoint::id::RecvDispatchWorkerId::new(0),
             counters,
         );

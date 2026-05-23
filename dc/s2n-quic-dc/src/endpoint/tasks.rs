@@ -1417,19 +1417,17 @@ where
 /// Builds a receiver that encodes and flushes pending ACK bursts from recv contexts.
 ///
 /// For each recv context submitted to `ack_burst_rx`, calls `encode_and_flush` to produce
-/// an ACK frame submission and sends it through `frame_tx`. The caller is responsible for
-/// draining with an appropriate budget and metrics.
-pub fn ack_burst<AckBurstRx, FrameTx, Clk>(
+/// an ACK frame submission and sends it through `frame_tx`. The assembler stamps wire-time
+/// `ack_delay` during assembly and routes completion back to the recv worker.
+pub fn ack_burst<AckBurstRx, FrameTx>(
     ack_burst_rx: AckBurstRx,
     mut frame_tx: FrameTx,
-    clock: Clk,
     recv_worker_id: endpoint::id::RecvDispatchWorkerId,
     counters: Arc<endpoint::counters::Dispatch>,
 ) -> impl Receiver<()>
 where
     AckBurstRx: Receiver<Rc<RefCell<endpoint::recv::Context>>>,
     FrameTx: UnboundedSender<Entry<frame::Frame>>,
-    Clk: precision::Clock,
 {
     Map::new(
         ack_burst_rx,
@@ -1438,13 +1436,20 @@ where
             let was_scheduled = ctx.ack_state.is_scheduled();
             ctx.invariants();
             if let Some(submission) = ctx.encode_and_flush(recv_worker_id) {
-                let now = clock.now();
-                let ack_delay_duration = now.duration_since(submission.largest_recv_time);
-                let ack_delay = VarInt::new(ack_delay_duration.as_micros() as u64)
-                    .unwrap_or(VarInt::from_u32(u32::MAX));
+                let completion = Entry::new(endpoint::msg::Sender::PendingAck(
+                    endpoint::ack::state::Submission {
+                        body: submission.body.clone(),
+                        largest_recv_time: submission.largest_recv_time,
+                        has_ecn: submission.has_ecn,
+                        path_secret_entry: submission.path_secret_entry.clone(),
+                        local_sender_id: submission.local_sender_id,
+                        remote_sender_id: submission.remote_sender_id,
+                        recv_worker_id: submission.recv_worker_id,
+                    },
+                ));
                 let header = endpoint::frame::Header::Ack {
                     dest_sender_id: submission.remote_sender_id.as_varint(),
-                    ack_delay,
+                    ack_delay: VarInt::ZERO,
                     has_ecn: submission.has_ecn,
                     is_ack_eliciting: false,
                 };
@@ -1457,6 +1462,8 @@ where
                     status: Default::default(),
                     ttl: endpoint::frame::DEFAULT_TTL,
                     transmission_time: None,
+                    ack_largest_recv_time: Some(submission.largest_recv_time),
+                    ack_completion: Some(completion),
                 };
                 let _ = frame_tx.send(Entry::new(frame));
             } else if was_scheduled {

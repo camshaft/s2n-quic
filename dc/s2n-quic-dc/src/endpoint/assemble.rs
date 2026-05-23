@@ -155,19 +155,25 @@ where
 
             // Track whether ACK frames will be sent in this segment (checked before draining
             // so it's accurate for the can_piggyback_data decision even after draining).
-            let has_ack_frames =
-                !context.queues[0].is_empty() || context.has_pending_acks();
+            let has_ack_frames = !context.queues[0].is_empty() || context.has_pending_acks();
 
-            // Phase 0.5: drain Ack-priority frames (from frame_tx path).
-            // These arrive pre-assembled with ack_delay already stamped at submission time.
-            // They bypass CWND and coalesce naturally with data frames on the same sender.
+            // Phase 0.5: drain Ack-priority frames.
+            // These carry pre-encoded ACK bodies; stamp wire-time ack_delay here so they
+            // bypass CWND and coalesce naturally with data frames on the same sender.
             while let Some(mut frame_entry) = context.queues[0].pop_front() {
-                // Override is_ack_eliciting at wire time (depends on PTO/RTT probe state).
-                if let frame::Header::Ack {
-                    ref mut is_ack_eliciting,
-                    ..
-                } = frame_entry.header
+                let largest_recv_time = frame_entry.ack_largest_recv_time;
+                if let (
+                    frame::Header::Ack {
+                        ack_delay,
+                        is_ack_eliciting,
+                        ..
+                    },
+                    Some(largest_recv_time),
+                ) = (&mut frame_entry.header, largest_recv_time)
                 {
+                    let ack_delay_duration = now.duration_since(largest_recv_time);
+                    *ack_delay = VarInt::new(ack_delay_duration.as_micros() as u64)
+                        .unwrap_or(VarInt::from_u32(u32::MAX));
                     *is_ack_eliciting =
                         context.pto.probe_state.is_requested() || make_ack_eliciting;
                 }
@@ -190,6 +196,9 @@ where
                 ack_frame_count += 1;
                 metadata = next_metadata;
                 counters.on_tx_frame(&frame_entry.header);
+                if let Some(completion) = frame_entry.ack_completion.take() {
+                    let _ = ack_completions.send(completion);
+                }
                 packet_frames.push_back(frame_entry);
 
                 if estimated_len == max_segment_len {
@@ -240,6 +249,8 @@ where
                     status: Default::default(),
                     ttl: frame::DEFAULT_TTL,
                     transmission_time: None,
+                    ack_largest_recv_time: None,
+                    ack_completion: None,
                 };
 
                 is_ack_eliciting |= header.is_ack_eliciting();

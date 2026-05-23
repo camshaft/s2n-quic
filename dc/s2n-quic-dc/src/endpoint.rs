@@ -1043,7 +1043,6 @@ where
                 let rx = tasks::ack_burst(
                     crate::socket::channel::FlattenList::new(ack_burst_rx.into_list_receiver()),
                     rd.frame_tx.clone(),
-                    rd.clock,
                     recv_dispatch_idx,
                     rd.counters.clone(),
                 );

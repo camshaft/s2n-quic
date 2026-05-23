@@ -584,6 +584,9 @@ expression: logs
 0:00:00.000541000 [server] TRACE c#send.inflight.enq[send.1]=1
 0:00:00.000541000 [server] TRACE g#send.inflight.depth[send.1]=1
 0:00:00.000541000 [server] TRACE m#send.inflight.depth_dist[send.1]=1
+0:00:00.000541000 [server] TRACE c#q.dispatch.enq[recv.dispatch.2]=1
+0:00:00.000541000 [server] TRACE g#q.dispatch.depth[recv.dispatch.2]=1
+0:00:00.000541000 [server] TRACE m#q.dispatch.depth_dist[recv.dispatch.2]=1
 0:00:00.000541000 [server] TRACE m#asm.segments=1
 0:00:00.000541000 [server] TRACE c#q.resolver_to_pto_wheel.sender[send.worker.1.task.assembler.send.1]=1
 0:00:00.000541000 [server] TRACE c#q.resolver_to_pto_wheel.enq[send.worker.1]=1
@@ -601,6 +604,11 @@ expression: logs
 0:00:00.000541000 [server] TRACE m#q.wheel_to_assembler.depth_dist[send.1]=1
 0:00:00.000541000 [server] TRACE m#task.tx_wheel.drained[send.worker.1]=1
 0:00:00.000541000 [server] TRACE m#task.idle_wheel.drained[send.worker.1]=0
+0:00:00.000541000 [server] TRACE c#q.dispatch.receiver[recv.dispatch.2.task.ack_completion]=1
+0:00:00.000541000 [server] TRACE c#q.dispatch.drain[recv.dispatch.2]=1
+0:00:00.000541000 [server] TRACE g#q.dispatch.depth[recv.dispatch.2]=0
+0:00:00.000541000 [server] DEBUG event=on_flush_complete prev=Flushed next=Idle location=dc/s2n-quic-dc/src/endpoint/recv.rs
+0:00:00.000541000 [server] TRACE m#task.ack_completion.drained[recv.dispatch.2]=1
 0:00:00.000541000 [server] TRACE m#task.pto_wheel.drained[send.worker.1]=1
 0:00:00.000541000 [server] TRACE c#q.wheel_to_assembler.receiver[send.1.task.assembler.send.1]=1
 0:00:00.000541000 [server] TRACE c#q.wheel_to_assembler.drain[send.1]=1
@@ -682,7 +690,7 @@ expression: logs
 0:00:00.001041000 [client] TRACE c#send.inflight.drain.ack[send.5]=1
 0:00:00.001041000 [client] TRACE c#tx.ecn.ect0[send.5]=1
 0:00:00.001041000 [client] TRACE m#send.cwnd[send.5]=14797
-0:00:00.001041000 [client] TRACE m#send.pacing_rate[send.5]=39577938
+0:00:00.001041000 [client] TRACE m#send.pacing_rate[send.5]=40368997
 0:00:00.001041000 [client] TRACE c#send.app_limited[send.5]=1
 0:00:00.001041000 [client] TRACE m#task.ack_processor.drained[send.worker.1]=2
 0:00:00.001041000 [client] TRACE m#task.waker_drain.drained[waker.11]=1
@@ -754,11 +762,19 @@ expression: logs
 0:00:00.001061000 [client] TRACE m#tx.payload_size=8
 0:00:00.001061000 [client] TRACE c#tx.data=1
 0:00:00.001061000 [client] TRACE c#tx.data[send.6]=1
+0:00:00.001061000 [client] TRACE c#q.dispatch.enq[recv.dispatch.0]=1
+0:00:00.001061000 [client] TRACE g#q.dispatch.depth[recv.dispatch.0]=1
+0:00:00.001061000 [client] TRACE m#q.dispatch.depth_dist[recv.dispatch.0]=1
 0:00:00.001061000 [client] TRACE m#asm.segments=1
 0:00:00.001061000 [client] TRACE c#socket.tx.ops[send.6]=1
 0:00:00.001061000 [client] TRACE c#socket.tx.bytes[send.6]=54
 0:00:00.001061000 [client] TRACE m#task.assembler.drained[send.6]=1
 0:00:00.001061000 [client] TRACE m#task.idle_wheel.drained[send.worker.2]=0
+0:00:00.001061000 [client] TRACE c#q.dispatch.receiver[recv.dispatch.0.task.ack_completion]=1
+0:00:00.001061000 [client] TRACE c#q.dispatch.drain[recv.dispatch.0]=1
+0:00:00.001061000 [client] TRACE g#q.dispatch.depth[recv.dispatch.0]=0
+0:00:00.001061000 [client] DEBUG event=on_flush_complete prev=Flushed next=Idle location=dc/s2n-quic-dc/src/endpoint/recv.rs
+0:00:00.001061000 [client] TRACE m#task.ack_completion.drained[recv.dispatch.0]=1
 0:00:00.001561000 [server] TRACE c#socket.rx.ops[recv.6]=1
 0:00:00.001561000 [server] TRACE c#socket.rx.bytes[recv.6]=54
 0:00:00.001561000 [server] TRACE c#router.routed=1
@@ -820,7 +836,7 @@ expression: logs
 0:00:00.001561000 [server] TRACE c#send.inflight.drain.ack[send.1]=1
 0:00:00.001561000 [server] TRACE c#tx.ecn.ect0[send.1]=1
 0:00:00.001561000 [server] TRACE m#send.cwnd[send.1]=14814
-0:00:00.001561000 [server] TRACE m#send.pacing_rate[send.1]=39577938
+0:00:00.001561000 [server] TRACE m#send.pacing_rate[send.1]=40368997
 0:00:00.001561000 [server] TRACE c#send.app_limited[send.1]=1
 0:00:00.001561000 [server] TRACE m#task.ack_processor.drained[send.worker.1]=2
 0:00:00.001561000 [server] TRACE m#task.recv_idle_wheel.drained[recv.dispatch.2]=0
