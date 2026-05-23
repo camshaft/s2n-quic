@@ -439,12 +439,8 @@ impl Cache {
                     "recv cache key_id advanced — replacing entry"
                 );
 
-<<<<<<< HEAD
                 let dest_sender_id = route.sender_id_for_ack(remote_sender_id);
-=======
-                let dest_sender_id = route.sender_id_for_ack(&credentials.id, remote_sender_id);
                 let queue_dispatcher = path_entry.queue_dispatcher();
->>>>>>> a3c332b1 (per-entry queue dispatch: remove global allocator/dispatcher)
                 let new_ctx = Rc::new(RefCell::new(Context::new(
                     path_entry,
                     remote_sender_id,
