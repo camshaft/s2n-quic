@@ -29,13 +29,19 @@ pub trait Key: 'static + Send {
     fn validate(&self, params: &Self::Request) -> Result<(), ValidationError>;
 }
 
+/// Information about a freed queue slot, emitted when both receivers drop.
+#[derive(Debug, Clone, Copy)]
+pub struct FreedSlot {
+    /// The peer's queue_id that was bound to this slot.
+    pub remote_queue_id: VarInt,
+}
+
 /// Indicates why a queue key validation failed
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ValidationError {
-    /// The credential_id in the packet doesn't match the queue's owner
-    CredentialMismatch,
-    /// The stream_id in the packet doesn't match the queue's stream
-    StreamIdMismatch,
+    /// The binding_id in the packet doesn't match the queue slot's binding_id.
+    /// This means a stale packet was routed to a recycled slot.
+    BindingIdMismatch,
 }
 
 impl ValidationError {
@@ -43,8 +49,7 @@ impl ValidationError {
     pub fn as_reset_code(self) -> VarInt {
         use crate::stream::endpoint::error;
         match self {
-            Self::CredentialMismatch => error::CREDENTIAL_MISMATCH,
-            Self::StreamIdMismatch => error::STREAM_ID_MISMATCH,
+            Self::BindingIdMismatch => error::STREAM_ID_MISMATCH,
         }
     }
 }
@@ -57,7 +62,7 @@ impl Key for crate::credentials::Credentials {
         if self == params {
             Ok(())
         } else {
-            Err(ValidationError::CredentialMismatch)
+            Err(ValidationError::BindingIdMismatch)
         }
     }
 }
@@ -265,6 +270,9 @@ impl<S: 'static, C: 'static, Key: 'static> Descriptor<S, C, Key> {
         let inner = self.inner();
         probes::on_receiver_drop(inner.id, half);
 
+        // Capture remote_queue_id before the slot is freed — needed for QueueFree.
+        let remote_queue_id = inner.remote_queue_id.load(Ordering::Relaxed);
+
         ensure!(inner
             .stream
             .close_receiver(&inner.control, half, || {
@@ -276,6 +284,15 @@ impl<S: 'static, C: 'static, Key: 'static> Descriptor<S, C, Key> {
             .is_continue());
 
         probes::on_receiver_free(inner.id, half);
+
+        // Notify that this slot has been freed (for QueueFree emission).
+        if let Some(notify) = &inner.free_notify {
+            if let Ok(rq) = VarInt::new(remote_queue_id) {
+                notify.lock().unwrap().push(FreedSlot {
+                    remote_queue_id: rq,
+                });
+            }
+        }
 
         let storage = inner.free_list.free(Descriptor {
             ptr: self.ptr,
@@ -327,11 +344,18 @@ pub(super) struct DescriptorInner<S, C, Key> {
     control: Queue<C>,
     /// A reference back to the free list
     free_list: Arc<dyn FreeList<S, C, Key>>,
+    /// Optional notification sink for freed slots (QueueFree emission).
+    /// Set by server-side dispatchers; None on client side.
+    free_notify: Option<Arc<std::sync::Mutex<Vec<FreedSlot>>>>,
     senders: AtomicUsize,
 }
 
 impl<S, C, Key> DescriptorInner<S, C, Key> {
-    pub(super) fn new(index: usize, free_list: Arc<dyn FreeList<S, C, Key>>) -> Self {
+    pub(super) fn new(
+        index: usize,
+        free_list: Arc<dyn FreeList<S, C, Key>>,
+        free_notify: Option<Arc<std::sync::Mutex<Vec<FreedSlot>>>>,
+    ) -> Self {
         let stream = Queue::new(Half::Stream);
         let control = Queue::new(Half::Control);
         Self {
@@ -343,6 +367,7 @@ impl<S, C, Key> DescriptorInner<S, C, Key> {
             control,
             senders: AtomicUsize::new(0),
             free_list,
+            free_notify,
         }
     }
 

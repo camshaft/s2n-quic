@@ -223,6 +223,38 @@ impl<S: 'static, C: 'static, Key: 'static> Sender<S, C, Key> {
         }
     }
 
+    /// Push to stream queue without validation. Used for broadcast (peer-dead reset).
+    #[inline]
+    pub fn push_stream_unchecked(
+        &self,
+        entry: intrusive::Entry<S>,
+    ) -> Result<AutoWake, Error<intrusive::Entry<S>>> {
+        unsafe {
+            let waker = self
+                .descriptor
+                .stream_queue()
+                .push(entry, || false, || Ok(()))?;
+            probes::on_send(self.queue_id(), Half::Stream, false);
+            Ok(waker)
+        }
+    }
+
+    /// Push to control queue without validation. Used for broadcast (peer-dead reset).
+    #[inline]
+    pub fn push_control_unchecked(
+        &self,
+        entry: intrusive::Entry<C>,
+    ) -> Result<AutoWake, Error<intrusive::Entry<C>>> {
+        unsafe {
+            let waker = self
+                .descriptor
+                .control_queue()
+                .push(entry, || false, || Ok(()))?;
+            probes::on_send(self.queue_id(), Half::Control, false);
+            Ok(waker)
+        }
+    }
+
     #[inline]
     pub fn validate_stream(
         &self,

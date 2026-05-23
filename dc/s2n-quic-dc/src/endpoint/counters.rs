@@ -155,19 +155,13 @@ impl Dispatch {
     }
 
     #[inline]
-    pub fn on_data_validation_failed(&self, reason: ValidationError) {
-        match reason {
-            ValidationError::CredentialMismatch => self.rx_data_credential_mismatch.add(1),
-            ValidationError::StreamIdMismatch => self.rx_data_stream_id_mismatch.add(1),
-        }
+    pub fn on_data_validation_failed(&self, _reason: ValidationError) {
+        self.rx_data_stream_id_mismatch.add(1);
     }
 
     #[inline]
-    pub fn on_flow_control_validation_failed(&self, reason: ValidationError) {
-        match reason {
-            ValidationError::CredentialMismatch => self.rx_flow_control_credential_mismatch.add(1),
-            ValidationError::StreamIdMismatch => self.rx_flow_control_stream_id_mismatch.add(1),
-        }
+    pub fn on_flow_control_validation_failed(&self, _reason: ValidationError) {
+        self.rx_flow_control_stream_id_mismatch.add(1);
     }
 
     #[inline]

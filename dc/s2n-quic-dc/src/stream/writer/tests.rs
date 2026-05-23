@@ -64,24 +64,13 @@ impl PairBuilder {
 
         let allocator = msg::queue::Allocator::new();
         let dispatcher = allocator.dispatcher();
-        let handle = match self.ep_type {
-            endpoint::Type::Client => flow::Handle::client(stream_id, path_secret_entry.clone()),
-            endpoint::Type::Server => {
-                let tracker = flow::Tracker::new(*path_secret_entry.id());
-                tracker
-                    .try_register(stream_id, |handle| (VarInt::ZERO, handle))
-                    .expect("server handle registration should succeed")
-            }
-        };
+        let handle = flow::Handle::new(stream_id);
         let (control_rx, _stream_rx) = dispatcher
             .alloc(handle, self.initial_remote_queue_id)
             .expect("queue alloc should succeed");
 
         let queue_id = control_rx.queue_id();
-        let request = flow::Request {
-            credential_id: *path_secret_entry.id(),
-            stream_id: Some(stream_id),
-        };
+        let request = stream_id;
 
         let (frame_tx, frame_rx) = frame::submission_channel(1);
 
@@ -196,7 +185,7 @@ impl PayloadAssembler {
 struct Pusher {
     dispatcher: msg::queue::Dispatcher,
     queue_id: VarInt,
-    request: flow::Request,
+    request: VarInt,
     frame_rx: SubmissionReceiver,
     frame_storage: PriorityStorage,
     assembler: PayloadAssembler,
@@ -234,16 +223,6 @@ impl Pusher {
         core::future::poll_fn(|cx| self.frame_rx.poll_swap(cx, &mut self.frame_storage)).await;
         let mut combined_frames = intrusive::Queue::default();
         for (_priority, mut queue) in self.frame_storage.drain() {
-            // Stamp QueueBind completion metadata to simulate the assembler.
-            for frame in queue.iter() {
-                if let Header::QueueBind { binding_id, .. } = frame.header {
-                    if let Some(completion) = &frame.completion {
-                        completion
-                            .set_init_sender_idx(crate::endpoint::id::LocalSenderId::from_index(0));
-                        completion.set_init_attempt_id(binding_id);
-                    }
-                }
-            }
             combined_frames.append(&mut queue);
         }
         combined_frames

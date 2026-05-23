@@ -23,6 +23,8 @@ pub struct Pool<
     memory_handle: Arc<free_list::Memory<S, C, Key>>,
     epoch_summary: Option<counter::Summary>,
     epoch: usize,
+    /// Optional sink for freed-slot notifications (server-side QueueFree emission).
+    pub(super) free_notify: Option<Arc<std::sync::Mutex<Vec<super::descriptor::FreedSlot>>>>,
 }
 
 impl<S: 'static + Send, C: 'static + Send, Key: 'static + Send, const INITIAL_PAGE_SIZE: usize>
@@ -36,6 +38,7 @@ impl<S: 'static + Send, C: 'static + Send, Key: 'static + Send, const INITIAL_PA
             senders: self.senders.clone(),
             epoch_summary: self.epoch_summary.clone(),
             epoch: self.epoch,
+            free_notify: self.free_notify.clone(),
         }
     }
 }
@@ -57,6 +60,7 @@ where
             senders,
             epoch_summary,
             epoch,
+            free_notify: None,
         };
         pool.grow();
         pool
@@ -128,7 +132,11 @@ where
                 let free_list = self.free.clone();
 
                 // initialize the descriptor with the channels
-                descriptor.write(DescriptorInner::new(self.epoch + idx, free_list));
+                descriptor.write(DescriptorInner::new(
+                    self.epoch + idx,
+                    free_list,
+                    self.free_notify.clone(),
+                ));
 
                 let descriptor = NonNull::new_unchecked(descriptor);
                 let descriptor = Descriptor::new(descriptor);
