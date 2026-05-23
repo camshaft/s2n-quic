@@ -145,25 +145,14 @@ impl Map {
         pn_threshold: Option<PacketNumber>,
         time_threshold: Option<s2n_quic_core::time::Timestamp>,
     ) -> Option<PacketNumber> {
-        let mut cutoff = None;
-        for (pn, packet) in self.inner.iter() {
-            if pn > largest_acked {
-                break;
-            }
-
+        self.inner
+            .contiguous_prefix_cutoff(largest_acked, |pn, packet| {
             let lost_by_pn = pn_threshold.is_some_and(|threshold| pn <= threshold);
             let lost_by_time = time_threshold
                 .zip(packet.transmission_info.as_ref())
                 .is_some_and(|(threshold, tx_info)| tx_info.time_sent <= threshold);
-
-            if lost_by_pn || lost_by_time {
-                cutoff = Some(pn);
-            } else {
-                break;
-            }
-        }
-
-        cutoff
+            lost_by_pn || lost_by_time
+        })
     }
 
     /// Find the oldest inflight packet number that has data frames available for probing.

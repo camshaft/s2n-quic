@@ -488,6 +488,7 @@ mod tests {
         context.inflight.insert(make_pn(1), packet1);
         let packet2 = make_packet(&mut context, entry.clone(), make_ts(104));
         context.inflight.insert(make_pn(2), packet2);
+        context.next_packet_number = VarInt::from_u8(3);
 
         detect_loss(
             &mut context,

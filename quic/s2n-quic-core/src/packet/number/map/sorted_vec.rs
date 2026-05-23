@@ -130,6 +130,61 @@ impl<V> SortedVecMap<V> {
         self.entries.iter_mut().map(|(pn, v)| (*pn, v))
     }
 
+    /// Returns the largest packet number in the contiguous prefix where `predicate`
+    /// returns `true`, considering only entries with `pn <= max_packet_number`.
+    ///
+    /// `predicate` must be monotonic over this prefix (all `true` entries first,
+    /// then all `false` entries).
+    #[inline]
+    pub fn contiguous_prefix_cutoff<F>(
+        &self,
+        max_packet_number: PacketNumber,
+        mut predicate: F,
+    ) -> Option<PacketNumber>
+    where
+        F: FnMut(PacketNumber, &V) -> bool,
+    {
+        let upper_bound = self.partition_point_from(0, max_packet_number);
+        if upper_bound == 0 {
+            return None;
+        }
+
+        let (first_pn, first_value) = &self.entries[0];
+        if !predicate(*first_pn, first_value) {
+            return None;
+        }
+
+        const LINEAR_SCAN_LIMIT: usize = 16;
+        let cutoff_idx = if upper_bound <= LINEAR_SCAN_LIMIT {
+            let mut cutoff_idx = 0;
+            for idx in 1..upper_bound {
+                let (pn, value) = &self.entries[idx];
+                if predicate(*pn, value) {
+                    cutoff_idx = idx;
+                } else {
+                    break;
+                }
+            }
+            cutoff_idx
+        } else {
+            // `0` is known to satisfy the predicate.
+            let mut lo = 1;
+            let mut hi = upper_bound;
+            while lo < hi {
+                let mid = lo + (hi - lo) / 2;
+                let (pn, value) = &self.entries[mid];
+                if predicate(*pn, value) {
+                    lo = mid + 1;
+                } else {
+                    hi = mid;
+                }
+            }
+            lo - 1
+        };
+
+        Some(self.entries[cutoff_idx].0)
+    }
+
     /// Returns true if there are no entries.
     #[inline]
     pub fn is_empty(&self) -> bool {
@@ -292,6 +347,24 @@ mod tests {
         assert_eq!(map.iter().count(), 50);
         // First remaining entry should be PN 50
         assert_eq!(map.entries.front().unwrap().0.as_u64(), 50);
+    }
+
+    #[test]
+    fn contiguous_prefix_cutoff_stops_at_first_false() {
+        let space = PacketNumberSpace::Initial;
+        let mut map = TestMap::default();
+        for i in 0u64..100 {
+            let pn = space.new_packet_number(VarInt::new(i).unwrap());
+            map.insert(pn, i);
+        }
+
+        let max_pn = space.new_packet_number(VarInt::new(80).unwrap());
+        let cutoff = map.contiguous_prefix_cutoff(max_pn, |_, value| *value <= 50);
+        let expected = space.new_packet_number(VarInt::new(50).unwrap());
+        assert_eq!(cutoff, Some(expected));
+
+        let cutoff = map.contiguous_prefix_cutoff(max_pn, |_, _| false);
+        assert_eq!(cutoff, None);
     }
 
     #[derive(Clone, Copy, Debug, TypeGenerator)]
