@@ -571,11 +571,10 @@ fn handle_flow_init(
         }
 
         let local_queue_id = queue_control.queue_id();
-        let writer = Writer::new_server_with_sender_id(
+        let writer = Writer::new_server(
             frame_tx.clone(),
             peer.path_entry.clone(),
             stream_id,
-            peer.local_sender_id,
             queue_control,
         );
         let reader = if pending_validation {

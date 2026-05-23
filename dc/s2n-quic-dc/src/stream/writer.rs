@@ -153,8 +153,6 @@ struct Inner {
     stream_id: VarInt,
     /// Acceptor ID for server routing
     acceptor_id: VarInt,
-    /// Preferred sender ID for stream data/reset frames when the sender is known.
-    source_sender_id: LocalSenderId,
     /// Next byte offset to send
     next_offset: VarInt,
     /// Number of bytes currently in flight (not yet acknowledged)
@@ -225,7 +223,6 @@ impl Writer {
             packet_size,
             stream_id,
             acceptor_id,
-            source_sender_id: LocalSenderId::UNSPECIFIED,
             next_offset: VarInt::ZERO,
             inflight_bytes: 0,
             max_inflight_bytes,
@@ -236,27 +233,10 @@ impl Writer {
         }))
     }
 
-    #[allow(dead_code)]
     pub(crate) fn new_server(
         frame_tx: SubmissionSender,
         path_secret_entry: Arc<PathSecretEntry>,
         stream_id: VarInt,
-        control_rx: msg::queue::Control,
-    ) -> Self {
-        Self::new_server_with_sender_id(
-            frame_tx,
-            path_secret_entry,
-            stream_id,
-            LocalSenderId::UNSPECIFIED,
-            control_rx,
-        )
-    }
-
-    pub(crate) fn new_server_with_sender_id(
-        frame_tx: SubmissionSender,
-        path_secret_entry: Arc<PathSecretEntry>,
-        stream_id: VarInt,
-        source_sender_id: LocalSenderId,
         control_rx: msg::queue::Control,
     ) -> Self {
         let completion_rx = frame::completion_channel();
@@ -274,7 +254,6 @@ impl Writer {
             packet_size,
             stream_id,
             acceptor_id: VarInt::ZERO,
-            source_sender_id,
             next_offset: VarInt::ZERO,
             inflight_bytes: 0,
             max_inflight_bytes,
@@ -570,7 +549,7 @@ impl Inner {
         };
 
         let frame = Frame {
-            source_sender_id: self.source_sender_id,
+            source_sender_id: LocalSenderId::UNSPECIFIED,
             header: Header::FlowReset {
                 dest_queue_id: remote_queue_id,
                 stream_id: self.stream_id,
@@ -733,7 +712,7 @@ impl Inner {
             };
 
             let frame = Frame {
-                source_sender_id: self.source_sender_id,
+                source_sender_id: LocalSenderId::UNSPECIFIED,
                 header: Header::FlowData {
                     queue_pair,
                     stream_id: self.stream_id,
@@ -1096,7 +1075,7 @@ impl Inner {
             };
 
             let frame = Frame {
-                source_sender_id: self.source_sender_id,
+                source_sender_id: LocalSenderId::UNSPECIFIED,
                 header: Header::FlowData {
                     queue_pair,
                     stream_id: self.stream_id,
