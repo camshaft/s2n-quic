@@ -1348,7 +1348,6 @@ fn total_packet_loss_surfaces_write_timeout() {
 /// packet loss. All streams must recover within a bounded time regardless of
 /// the loss pattern.
 #[test]
-#[ignore = "requires QueueFree credit-return to prevent dest_queue_id reuse before server confirms free"]
 fn multi_server_concurrent_loss_recovery() {
     let _guard = crate::testing::without_tracing();
 
@@ -1578,7 +1577,6 @@ fn peer_self_loopback() {
 }
 
 #[test]
-#[ignore = "requires QueueFree credit-return to prevent dest_queue_id reuse before server confirms free"]
 fn five_node_random_chatter_settles_after_stop() {
     use crate::testing::ext::*;
 

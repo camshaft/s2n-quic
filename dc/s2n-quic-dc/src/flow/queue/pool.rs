@@ -51,6 +51,14 @@ where
 {
     #[inline]
     pub fn new(epoch_summary: Option<counter::Summary>) -> Self {
+        Self::with_free_notify(epoch_summary, Some(Arc::new(std::sync::Mutex::new(Vec::new()))))
+    }
+
+    #[inline]
+    fn with_free_notify(
+        epoch_summary: Option<counter::Summary>,
+        free_notify: Option<Arc<std::sync::Mutex<Vec<super::descriptor::FreedSlot>>>>,
+    ) -> Self {
         let epoch = 0;
         let senders = sender::State::new(epoch);
         let (free, memory_handle) = FreeVec::new(INITIAL_PAGE_SIZE);
@@ -60,7 +68,7 @@ where
             senders,
             epoch_summary,
             epoch,
-            free_notify: None,
+            free_notify,
         };
         pool.grow();
         pool
