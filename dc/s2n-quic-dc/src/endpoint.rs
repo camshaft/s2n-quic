@@ -1147,11 +1147,8 @@ where
                         .receiver("task.peer_dead_broadcast")
                         .with_function("endpoint::Worker::spawn"),
                 );
-                let rx = tasks::peer_dead_broadcast(
-                    peer_dead_rx,
-                    bg.waker_sink,
-                    peer_dead_counters,
-                );
+                let rx =
+                    tasks::peer_dead_broadcast(peer_dead_rx, bg.waker_sink, peer_dead_counters);
                 let task_counter = counter_registry
                     .register_nominal_task("task.peer_dead_broadcast", "background")
                     .with_registration_metadata(

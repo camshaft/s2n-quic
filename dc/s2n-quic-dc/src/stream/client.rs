@@ -13,18 +13,11 @@
 
 use crate::{
     flow, psk,
-    stream::{
-        endpoint::Endpoint,
-        Reader, Stream, Writer,
-    },
+    stream::{endpoint::Endpoint, Reader, Stream, Writer},
 };
 use s2n_quic::server::Name;
 use s2n_quic_core::varint::VarInt;
-use std::{
-    io,
-    net::SocketAddr,
-    sync::Arc,
-};
+use std::{io, net::SocketAddr, sync::Arc};
 
 pub mod rpc;
 

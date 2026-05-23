@@ -583,7 +583,6 @@ impl Inner {
             }
         };
 
-
         if tracker.has_remaining_capacity() {
             self.reassembler.infallible_copy_into(&mut tracker);
         }

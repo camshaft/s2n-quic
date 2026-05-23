@@ -648,10 +648,8 @@ impl AssemblerCounters {
                 .register_nominal("tx.probe.frame", "queue_control"),
             tx_probe_frame_queue_max_data: registry
                 .register_nominal("tx.probe.frame", "queue_max_data"),
-            tx_probe_frame_queue_reset: registry
-                .register_nominal("tx.probe.frame", "queue_reset"),
-            tx_probe_frame_queue_free: registry
-                .register_nominal("tx.probe.frame", "queue_free"),
+            tx_probe_frame_queue_reset: registry.register_nominal("tx.probe.frame", "queue_reset"),
+            tx_probe_frame_queue_free: registry.register_nominal("tx.probe.frame", "queue_free"),
         }
     }
 
@@ -677,9 +675,7 @@ impl AssemblerCounters {
     pub fn on_probe_frame(&self, header: &frame::Header) {
         match header {
             frame::Header::QueueBind { .. } => self.tx_probe_frame_queue_bind.add(1),
-            frame::Header::QueueData { is_fin: false, .. } => {
-                self.tx_probe_frame_queue_data.add(1)
-            }
+            frame::Header::QueueData { is_fin: false, .. } => self.tx_probe_frame_queue_data.add(1),
             frame::Header::QueueData { is_fin: true, .. } => {
                 self.tx_probe_frame_queue_data_fin.add(1)
             }

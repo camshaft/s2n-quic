@@ -15,9 +15,7 @@ use crate::{
         counters, decode, error,
         frame::{Frame, Header, PriorityInput, SubmissionSender, DEFAULT_TTL},
         id::LocalSenderId,
-        msg,
-        recv,
-        routing,
+        msg, recv, routing,
     },
     flow::{self, queue::AutoWake},
     intrusive::Entry,
@@ -492,7 +490,10 @@ fn handle_queue_bind(
     // Dedup: the client's source_queue_id is unique per-stream and never reused
     // without QueueFree. If we've already processed a QueueBind with this
     // peer_queue_id, it's a retransmit.
-    if peer.queue_dispatcher.test_and_set_bound(peer_queue_id, binding_id) {
+    if peer
+        .queue_dispatcher
+        .test_and_set_bound(peer_queue_id, binding_id)
+    {
         trace!(
             binding_id = binding_id.as_u64(),
             peer_queue_id = peer_queue_id.as_u64(),
@@ -502,8 +503,9 @@ fn handle_queue_bind(
     }
 
     let handle = flow::Handle::new(binding_id);
-    let (queue_control, queue_stream) =
-        peer.queue_dispatcher.alloc_or_grow(handle, Some(peer_queue_id));
+    let (queue_control, queue_stream) = peer
+        .queue_dispatcher
+        .alloc_or_grow(handle, Some(peer_queue_id));
     let local_queue_id = queue_control.queue_id();
 
     if !buf.is_empty() || is_fin {
@@ -928,4 +930,3 @@ fn handle_queue_reset(
         }
     }
 }
-

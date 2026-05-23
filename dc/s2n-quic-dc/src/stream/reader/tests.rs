@@ -795,7 +795,6 @@ fn client_fin_observed_before_gap_fill_does_not_send_max_data() {
     });
 }
 
-
 /// A server-side stream becomes readable immediately (validation is instant).
 /// MAX_DATA is emitted once data is consumed. With immediate validation there
 /// is no separate "FlowValidated" step — data receipt alone triggers the
@@ -960,7 +959,10 @@ fn server_reset_with_buffered_data() {
         .spawn();
 
         async move {
-            reader.validate().await.expect("validate succeeds immediately");
+            reader
+                .validate()
+                .await
+                .expect("validate succeeds immediately");
 
             // Buffered data should be drainable despite reset
             let mut buf = BytesMut::with_capacity(32);
@@ -1092,7 +1094,10 @@ fn server_reset_before_flow_validated_same_batch() {
         .spawn();
 
         async move {
-            reader.validate().await.expect("validate returns Ok immediately");
+            reader
+                .validate()
+                .await
+                .expect("validate returns Ok immediately");
 
             // read_into reveals the reset
             let mut buf = BytesMut::with_capacity(16);
@@ -1124,7 +1129,10 @@ fn server_flow_validated_then_reset_same_batch() {
         .spawn();
 
         async move {
-            reader.validate().await.expect("validate returns Ok immediately");
+            reader
+                .validate()
+                .await
+                .expect("validate returns Ok immediately");
 
             // read_into reveals the reset
             let mut buf = BytesMut::with_capacity(16);
@@ -1155,7 +1163,10 @@ fn server_channel_closed_surfaces_broken_pipe() {
         .spawn();
 
         async move {
-            reader.validate().await.expect("validate returns Ok immediately");
+            reader
+                .validate()
+                .await
+                .expect("validate returns Ok immediately");
             let mut buf = BytesMut::with_capacity(16);
             let err = reader
                 .read_into(&mut buf)

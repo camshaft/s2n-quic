@@ -764,10 +764,7 @@ fn push_frame_metadata(header_buf: &mut Vec<u8>, header: &frame::Header, payload
 /// and writes it back into the header. On PTO retransmission the header already holds
 /// the assigned value, so no new allocation occurs.
 fn stamp_attempt_id(header: &mut frame::Header, flow_attempt_id: &mut VarInt) {
-    if let frame::Header::QueueBind {
-        binding_id, ..
-    } = header
-    {
+    if let frame::Header::QueueBind { binding_id, .. } = header {
         if *binding_id == VarInt::MAX {
             *binding_id = *flow_attempt_id;
             *flow_attempt_id += 1;

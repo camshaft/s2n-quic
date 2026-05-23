@@ -83,9 +83,13 @@ impl PairBuilder {
                 acceptor_id,
                 control_rx,
             ),
-            endpoint::Type::Server => {
-                Writer::new_server(frame_tx, path_secret_entry, binding_id, queue_pair, control_rx)
-            }
+            endpoint::Type::Server => Writer::new_server(
+                frame_tx,
+                path_secret_entry,
+                binding_id,
+                queue_pair,
+                control_rx,
+            ),
         };
 
         let pusher = Pusher {
@@ -1035,10 +1039,7 @@ fn client_write_from_fin_after_queue_bind_sends_queue_data_fin() {
             );
             let second = iter.next().unwrap();
             assert!(
-                matches!(
-                    second.header,
-                    Header::QueueBind { is_fin: false, .. }
-                ),
+                matches!(second.header, Header::QueueBind { is_fin: false, .. }),
                 "expected QueueBind(is_fin=false) with early data"
             );
         }

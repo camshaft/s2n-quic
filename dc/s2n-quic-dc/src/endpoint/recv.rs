@@ -106,7 +106,6 @@ impl crate::intrusive::Adapter for AckBurstAdapter {
     }
 }
 
-
 /// Cached crypto state and ACK tracking for a peer.
 ///
 /// Keyed by (credentials.id, source_sender_id) because ACK spaces and
@@ -169,7 +168,6 @@ impl Context {
     #[inline]
     pub fn invariants(&self) {
         if cfg!(debug_assertions) {
-
             if self.ack_ranges.is_empty() {
                 assert!(
                     self.ack_ranges.largest_recv_time().is_none(),
