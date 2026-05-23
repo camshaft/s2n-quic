@@ -420,22 +420,26 @@ fn priority_select_on_consumed_notifies_last_ready_receiver() {
             );
             let mut budget = Budget::new(usize::MAX);
 
-            // Only fallback item queued: priority was empty so has_more = false.
+            // Only fallback item queued: priority was empty so status is Empty.
             fallback_tx.send(1).await.unwrap();
-            let (val, has_more) = select.recv(&mut budget).await.unwrap();
+            let (val, status) = select.recv(&mut budget).await.unwrap();
             assert_eq!(val, 1);
-            assert!(!has_more, "priority was empty");
+            assert_eq!(status, ImmediateQueueStatus::Empty, "priority was empty");
             select.on_consumed(5);
             assert_eq!(priority_consumed.get(), 0);
             assert_eq!(fallback_consumed.get(), 5);
 
             // Priority item queued alongside a fallback item: priority wins.
-            // No second priority item queued, so has_more = false.
+            // No second priority item queued, so status is Empty.
             priority_tx.send(2).await.unwrap();
             fallback_tx.send(3).await.unwrap();
-            let (val, has_more) = select.recv(&mut budget).await.unwrap();
+            let (val, status) = select.recv(&mut budget).await.unwrap();
             assert_eq!(val, 2);
-            assert!(!has_more, "only one priority item was queued");
+            assert_eq!(
+                status,
+                ImmediateQueueStatus::Empty,
+                "only one priority item was queued"
+            );
             select.on_consumed(7);
             assert_eq!(priority_consumed.get(), 7);
             assert_eq!(fallback_consumed.get(), 5);
@@ -446,13 +450,13 @@ fn priority_select_on_consumed_notifies_last_ready_receiver() {
 }
 
 /// Verify the peek look-ahead: when two priority items are queued, the first
-/// poll returns `has_more = true` and the second returns `has_more = false`.
+/// poll returns `HasMore` and the second returns `Empty`.
 #[test]
 fn priority_select_has_more_when_priority_queue_not_empty() {
     let _no_snap = crate::testing::without_snapshots();
     sim(|| {
-        use crate::testing::ext::*;
         use crate::socket::channel::intrusive::unsync as ch_unsync;
+        use crate::testing::ext::*;
 
         async {
             // Use unsync channels so we can enqueue multiple items at once.
@@ -462,20 +466,22 @@ fn priority_select_has_more_when_priority_queue_not_empty() {
             let mut budget = Budget::new(usize::MAX);
 
             // Enqueue two priority items; no fallback items.
-            UnboundedSender::send(&mut imm_tx, intrusive::Entry::new(10))
-                .expect("send 10");
-            UnboundedSender::send(&mut imm_tx, intrusive::Entry::new(20))
-                .expect("send 20");
+            UnboundedSender::send(&mut imm_tx, intrusive::Entry::new(10)).expect("send 10");
+            UnboundedSender::send(&mut imm_tx, intrusive::Entry::new(20)).expect("send 20");
 
-            // First poll: one item queued behind → has_more = true.
-            let (entry, has_more) = select.recv(&mut budget).await.unwrap();
+            // First poll: one item queued behind → HasMore.
+            let (entry, status) = select.recv(&mut budget).await.unwrap();
             assert_eq!(*entry, 10);
-            assert!(has_more, "item 20 was still queued");
+            assert_eq!(
+                status,
+                ImmediateQueueStatus::HasMore,
+                "item 20 was still queued"
+            );
 
-            // Second poll: peeked item returned, nothing behind → has_more = false.
-            let (entry, has_more) = select.recv(&mut budget).await.unwrap();
+            // Second poll: peeked item returned, nothing behind → Empty.
+            let (entry, status) = select.recv(&mut budget).await.unwrap();
             assert_eq!(*entry, 20);
-            assert!(!has_more, "queue was drained");
+            assert_eq!(status, ImmediateQueueStatus::Empty, "queue was drained");
         }
         .primary()
         .spawn();

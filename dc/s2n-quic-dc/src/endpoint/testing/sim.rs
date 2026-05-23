@@ -299,15 +299,13 @@ pub fn setup_sim_endpoint(
 
     // Extra send-only sockets.
     for _ in shared_count..num_send_sockets {
-        let sock =
-            bach::net::UdpSocket::new(&send_bind_opts).expect("failed to bind send socket");
+        let sock = bach::net::UdpSocket::new(&send_bind_opts).expect("failed to bind send socket");
         send_sockets.push(Arc::new(sock));
     }
 
     // Extra recv-only sockets.
     for _ in shared_count..num_recv_sockets {
-        let sock =
-            bach::net::UdpSocket::new(&send_bind_opts).expect("failed to bind recv socket");
+        let sock = bach::net::UdpSocket::new(&send_bind_opts).expect("failed to bind recv socket");
         recv_sockets.push(Arc::new(sock));
     }
 

@@ -24,7 +24,7 @@ use crate::{
         WireVersion,
     },
     socket::{
-        channel::UnboundedSender,
+        channel::{ImmediateQueueStatus, UnboundedSender},
         pool::{self, descriptor::Segments},
     },
     time::precision,
@@ -51,17 +51,23 @@ mod tests;
 /// `header_buf` is a caller-provided reusable allocation for encoding per-frame metadata
 /// into the application header region. It is cleared before use and after return.
 ///
-/// `has_more_immediate` indicates that the priority (immediate) queue still had items
-/// after this context was consumed. When `true`, Phase 3 data draining is skipped so
-/// those queued ACK/probe packets are not delayed behind paced data frames. When `false`
-/// (either the context came from the tx-wheel path or the immediate queue is now empty),
-/// data is drained normally, amortising the packet cost.
+/// `immediate_queue_status` describes the state of the priority (immediate) queue
+/// after this context was consumed:
+///
+/// - [`ImmediateQueueStatus::HasMore`] or [`ImmediateQueueStatus::BudgetExhausted`]:
+///   Phase 3 data draining is skipped so those queued ACK/probe packets are not
+///   delayed behind paced data frames.
+///
+/// - [`ImmediateQueueStatus::Empty`]: the priority queue is drained. Data may be
+///   piggybacked when the TX wheel is not scheduled (EDT has already elapsed on the
+///   normal TX path) or when the TX wheel is scheduled but its target time has already
+///   passed (`now >= target_time`). Otherwise data waits for the wheel to fire.
 ///
 /// Cancelled frames (where `should_transmit()` returns false) are sent to `cancelled`
 /// for completion notification.
 pub(crate) fn assemble<Clk>(
     context: &mut Context,
-    has_more_immediate: bool,
+    immediate_queue_status: ImmediateQueueStatus,
     clock: &Clk,
     source_sender_id: LocalSenderId,
     source_control_port: u16,
@@ -235,25 +241,35 @@ where
 
             // Phase 3: drain pending (data) frames.
             //
-            // Data is allowed when we are not blocking any high-priority work:
+            // Data is allowed only when it does not delay any high-priority work
+            // and the CCA pacing EDT has already elapsed:
             //
-            // - From the tx_wheel path (`!tx_wheel.is_scheduled()`): the context
-            //   was popped from the wheel so EDT has already elapsed → drain freely.
+            // - `HasMore` or `BudgetExhausted`: more urgent items are (or may be)
+            //   queued in the immediate path — skip data so those ACK/probe packets
+            //   are not delayed.
             //
-            // - From the immediate path with an empty priority queue
-            //   (`!has_more_immediate`): this is the last urgent transmission in
-            //   the batch; piggyback data to amortise the packet cost.
+            // - `Empty` + tx_wheel NOT scheduled: context came from the normal
+            //   tx_wheel path; EDT has already elapsed → drain freely.
             //
-            // - From the immediate path with more items queued (`has_more_immediate`):
-            //   skip data so those queued ACK/probe packets are not delayed behind
-            //   paced data.
+            // - `Empty` + tx_wheel scheduled + `now >= target_time`: EDT has already
+            //   passed even though the wheel entry is still linked (e.g. we arrived
+            //   via the immediate path with no more urgent items); piggyback data to
+            //   amortise the packet cost.
+            //
+            // - `Empty` + tx_wheel scheduled + `now < target_time`: EDT is still in
+            //   the future → skip data and let it wait for the wheel to fire.
             //
             // PTO probes are exempt in all cases: RFC 9002 §6.2.4 requires probes
             // to bypass both CWND and pacing so tail-loss recovery is not delayed.
+            let edt_elapsed = !context.tx_wheel.is_scheduled()
+                || context.tx_wheel.target_time.map_or(false, |t| now >= t);
+            let can_piggyback_data = match immediate_queue_status {
+                ImmediateQueueStatus::HasMore | ImmediateQueueStatus::BudgetExhausted => false,
+                ImmediateQueueStatus::Empty => edt_elapsed,
+            };
             let can_send_pending = context.has_pending_data()
                 && (context.pto.probe_state.is_requested()
-                    || ((!context.tx_wheel.is_scheduled() || !has_more_immediate)
-                        && context.can_send_pending_frames()));
+                    || (can_piggyback_data && context.can_send_pending_frames()));
             let phase3_is_probe = can_send_pending && context.pto.probe_state.is_requested();
 
             if can_send_pending {

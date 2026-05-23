@@ -73,7 +73,7 @@ struct AssemblerChannels {
 }
 
 fn assembler_channels(registry: &crate::counter::Registry) -> AssemblerChannels {
-    use crate::endpoint::id::{IdMap, LocalSendSocketId, LocalSenderId, Id};
+    use crate::endpoint::id::{Id, IdMap, LocalSendSocketId, LocalSenderId};
     let (ctx_tx, ctx_rx) = unsync::new_with_adapter::<send::TxWheelAdapter>();
     let (immediate_tx_raw, immediate_rx) = unsync::new_with_adapter::<send::TxImmediateAdapter>();
     let (tx_wheel_tx, tx_wheel_rx) = unsync::new_with_adapter::<send::TxWheelAdapter>();

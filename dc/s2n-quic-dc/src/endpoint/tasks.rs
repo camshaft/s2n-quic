@@ -21,7 +21,7 @@ use crate::{
         channel::{
             intrusive::{self, unsync},
             Budget, FilterMap, Flatten, FlattenList, FlattenSegments, InspectErr, Map, Paced,
-            PrioritySelect, Priority as PriorityRx, Receiver, ReceiverExt as _, RouterAdapter,
+            Priority as PriorityRx, PrioritySelect, Receiver, ReceiverExt as _, RouterAdapter,
             SocketReceiver, SocketSender, UnboundedSender,
         },
         pool::descriptor,
@@ -298,10 +298,8 @@ pub fn send_worker<Socket, Clk, WakerSink, AckComp>(
         })
         .collect();
 
-    let immediate_tx = send::ImmediateSender::new(
-        socket_immediate_txs,
-        sender_idx_to_local.clone(),
-    );
+    let immediate_tx =
+        send::ImmediateSender::new(socket_immediate_txs, sender_idx_to_local.clone());
 
     let variant = format!("send.worker.{worker_id}");
     let q_resolver_to_tx_wheel =
@@ -611,8 +609,13 @@ pub fn send_worker<Socket, Clk, WakerSink, AckComp>(
 
     // Per-socket assembler + send tasks.
     let asm_counters = AssemblerCounters::new(&counter_registry);
-    for (local_id, st, immediate_rx, context_rx, gauge) in
-        (send_sockets, socket_immediate_rxs, socket_context_rxs, q_wheel_to_assembler).join()
+    for (local_id, st, immediate_rx, context_rx, gauge) in (
+        send_sockets,
+        socket_immediate_rxs,
+        socket_context_rxs,
+        q_wheel_to_assembler,
+    )
+        .join()
     {
         let sender_idx = st.sender_idx;
         let task_name = format!("task.assembler.send.{sender_idx}");

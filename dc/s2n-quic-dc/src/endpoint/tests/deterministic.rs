@@ -191,10 +191,7 @@ impl DroppedPackets {
 
                         // Receive and validate the echoed response.
                         let mut rx = Data::new(body_len as u64);
-                        let _ = reader
-                            .read_to_end(&mut rx)
-                            .await
-                            .expect("client read");
+                        let _ = reader.read_to_end(&mut rx).await.expect("client read");
                         assert!(rx.is_finished(), "client did not receive complete echo");
                     })
                     .await
@@ -223,10 +220,7 @@ impl DroppedPackets {
 
                             // Receive and validate the client data.
                             let mut rx = Data::new(body_len as u64);
-                            let _ = reader
-                                .read_to_end(&mut rx)
-                                .await
-                                .expect("server read");
+                            let _ = reader.read_to_end(&mut rx).await.expect("server read");
                             assert!(rx.is_finished(), "server did not receive complete request");
 
                             // Echo back using Data — no need to buffer the whole payload.
@@ -1020,14 +1014,8 @@ fn symmetric_5tuple_routing() {
     let forward = forward_tuples.lock().unwrap();
     let reverse = reverse_tuples.lock().unwrap();
 
-    assert!(
-        !forward.is_empty(),
-        "no server→client packets observed"
-    );
-    assert!(
-        !reverse.is_empty(),
-        "no client→server packets observed"
-    );
+    assert!(!forward.is_empty(), "no server→client packets observed");
+    assert!(!reverse.is_empty(), "no client→server packets observed");
 
     // For every (src, dst) pair in one direction, the reverse (dst, src) must
     // exist in the other direction. This proves symmetric 5-tuples.
@@ -1079,10 +1067,7 @@ fn loss_latency_distribution() {
         })
         .collect();
 
-    let mut durations: Vec<Duration> = patterns
-        .into_iter()
-        .map(|p| p.sim(1 << 18))
-        .collect();
+    let mut durations: Vec<Duration> = patterns.into_iter().map(|p| p.sim(1 << 18)).collect();
 
     durations.sort();
     let n = durations.len();

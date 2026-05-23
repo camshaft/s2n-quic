@@ -751,21 +751,22 @@ impl Context {
         // tx-scheduled.
         let immediate = needs_urgent && !self.is_immediate_scheduled();
 
-        let transmission = if
-        // Check we have queued data packets and we're not already linked
-        !self.is_tx_scheduled() && self.has_pending_data() && self.can_send_pending_frames()
-        {
-            // Non-urgent pending data follows CCA pacing via the tx_wheel.
-            let target = self
-                .cca
-                .earliest_departure_time()
-                .map(precision::Timestamp::from);
-            // If target time is `None` then the wheel will schedule it immediately
-            self.tx_wheel.target_time = target;
-            true
-        } else {
-            false
-        };
+        let transmission =
+            if
+            // Check we have queued data packets and we're not already linked
+            !self.is_tx_scheduled() && self.has_pending_data() && self.can_send_pending_frames()
+            {
+                // Non-urgent pending data follows CCA pacing via the tx_wheel.
+                let target = self
+                    .cca
+                    .earliest_departure_time()
+                    .map(precision::Timestamp::from);
+                // If target time is `None` then the wheel will schedule it immediately
+                self.tx_wheel.target_time = target;
+                true
+            } else {
+                false
+            };
 
         let pto = if !self.is_pto_scheduled() && self.inflight.has_inflight() {
             if let Some(target) = self.pto.next_target(clock, &self.rtt_estimator) {
@@ -969,10 +970,11 @@ impl Context {
                 "has_pending predicate drifted from queue contents"
             );
 
-            // NOTE: with immediate-path data assembly (has_more_immediate = false),
-            // Phase 3 may drain all pending data even while tx_wheel remains scheduled
-            // at a future EDT.  The tx_wheel will fire and find nothing to do; that is
-            // fine.  A stricter invariant is therefore not enforceable here.
+            // NOTE: the assembler only piggybacks data on the immediate path when the
+            // CCA pacing EDT has already elapsed (`now >= tx_wheel.target_time`).
+            // It remains possible for tx_wheel to be scheduled with no pending data
+            // if the data was sent when the EDT elapsed; the wheel will fire and find
+            // nothing to do.  A stricter invariant is therefore not enforceable here.
 
             if self.pto_wheel.is_scheduled() {
                 if self.pto_wheel.target_time.is_some() {
@@ -1087,7 +1089,11 @@ pub(crate) use crate::time::wheel::WheelLinks;
 // field for its wheel, and tells the timing wheel how to read/write target_time.
 // The pointer type is Rc<RefCell<Context>> for all three.
 
-crate::rc_adapter!(pub(crate) struct TxImmediateAdapter { tx_immediate: RefCell<Context> });
+crate::rc_adapter!(
+    pub(crate) struct TxImmediateAdapter {
+        tx_immediate: RefCell<Context>,
+    }
+);
 crate::context_wheel_adapter!(TxWheelAdapter, Context, tx_wheel);
 crate::context_wheel_adapter!(PtoWheelAdapter, Context, pto_wheel);
 crate::context_wheel_adapter!(IdleWheelAdapter, Context, idle_wheel);
@@ -1125,10 +1131,7 @@ impl<T> UnboundedSender<Rc<RefCell<Context>>> for ImmediateSender<T>
 where
     T: UnboundedSender<Rc<RefCell<Context>>>,
 {
-    fn send(
-        &mut self,
-        context: Rc<RefCell<Context>>,
-    ) -> Result<(), Rc<RefCell<Context>>> {
+    fn send(&mut self, context: Rc<RefCell<Context>>) -> Result<(), Rc<RefCell<Context>>> {
         let sender_idx = context.borrow().sender_idx;
         let local_id = self.sender_idx_to_local[sender_idx];
         self.senders[local_id].send(context)
