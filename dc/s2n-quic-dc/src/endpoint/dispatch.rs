@@ -872,7 +872,6 @@ fn push_reset_frame_with_target(
         status: Default::default(),
         ttl: DEFAULT_TTL,
         transmission_time: None,
-        ack_largest_recv_time: None,
     };
     counters.on_response_frame(&frame.header);
     response_frames.push(frame.into());
@@ -905,7 +904,6 @@ fn push_validate_request_frame(
         status: Default::default(),
         ttl: DEFAULT_TTL,
         transmission_time: None,
-        ack_largest_recv_time: None,
     };
     counters.on_response_frame(&frame.header);
     response_frames.push(frame.into());
@@ -952,7 +950,6 @@ fn handle_flow_validate_request(
                 status: Default::default(),
                 ttl: DEFAULT_TTL,
                 transmission_time: None,
-                ack_largest_recv_time: None,
             };
             counters.on_response_frame(&frame.header);
             response_frames.push(frame.into());
@@ -978,7 +975,6 @@ fn handle_flow_validate_request(
                 status: Default::default(),
                 ttl: DEFAULT_TTL,
                 transmission_time: None,
-                ack_largest_recv_time: None,
             };
             counters.on_response_frame(&frame.header);
             response_frames.push(frame.into());

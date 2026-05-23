@@ -871,9 +871,6 @@ pub struct Frame {
     /// interleave fairly with frames from other streams rather than forming bursts.
     /// Advisory — actual pacing happens at the Peer Context level.
     pub transmission_time: Option<precision::Timestamp>,
-    /// Largest received timestamp carried by ACK frames submitted through `frame_tx`.
-    /// The assembler stamps `ack_delay` from this just before encoding.
-    pub ack_largest_recv_time: Option<precision::Timestamp>,
 }
 
 impl Frame {
@@ -925,7 +922,6 @@ impl std::fmt::Debug for Frame {
             .field("peer_data_addrs", self.path_secret_entry.peer_data_addrs())
             .field("ttl", &self.ttl)
             .field("transmission_time", &self.transmission_time)
-            .field("ack_largest_recv_time", &self.ack_largest_recv_time)
             .finish()
     }
 }
@@ -957,7 +953,6 @@ mod tests {
             status: TransmissionStatus::default(),
             ttl: DEFAULT_TTL,
             transmission_time: None,
-            ack_largest_recv_time: None,
         };
 
         assert_eq!(frame.payload_len(), 5);
@@ -986,7 +981,6 @@ mod tests {
             status: TransmissionStatus::default(),
             ttl: DEFAULT_TTL,
             transmission_time: None,
-            ack_largest_recv_time: None,
         };
 
         assert_eq!(frame.priority(), Priority::FlowInit);
@@ -1011,7 +1005,6 @@ mod tests {
             status: TransmissionStatus::default(),
             ttl: DEFAULT_TTL,
             transmission_time: None,
-            ack_largest_recv_time: None,
         };
 
         assert_eq!(frame.priority(), Priority::FlowReset);
@@ -1042,7 +1035,6 @@ mod tests {
             status: TransmissionStatus::default(),
             ttl: DEFAULT_TTL,
             transmission_time: None,
-            ack_largest_recv_time: None,
         };
 
         assert!(frame.requires_sticky_sender());

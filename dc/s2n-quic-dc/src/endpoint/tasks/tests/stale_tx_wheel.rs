@@ -66,7 +66,6 @@ fn inflight_frame(pse: &std::sync::Arc<crate::path::secret::map::Entry>) -> Entr
         status: frame::TransmissionStatus::Pending,
         ttl: 3,
         transmission_time: None,
-        ack_largest_recv_time: None,
     })
 }
 

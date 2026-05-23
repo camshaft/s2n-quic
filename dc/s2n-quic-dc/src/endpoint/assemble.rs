@@ -146,29 +146,28 @@ where
             // `on_non_eliciting_sent` so we have the freshest PN when the ACK arrives.
             let rtt_sample_needed = !context.inflight.has_inflight();
             // Only make the ACK packet ack-eliciting when no probe is already
-            // outstanding. This prevents an ACK loop: once the peer responds to
-            // our ack-eliciting probe, sampled=true keeps is_pending()=true and
-            // suppresses further probing until new data enters the inflight map.
-            let make_ack_eliciting = rtt_sample_needed && !context.rtt_tracker.is_pending();
+            // outstanding AND this context has previously sent data. Contexts that
+            // only forward ACKs (never had inflight data) do not need to probe —
+            // they have no RTT to keep fresh and probing would cause spurious
+            // ACK round-trips on short-lived exchanges.
+            let make_ack_eliciting =
+                rtt_sample_needed && !context.rtt_tracker.is_pending() && context.has_had_inflight;
+
+            // Track whether ACK frames will be sent in this segment (checked before draining
+            // so it's accurate for the can_piggyback_data decision even after draining).
+            let has_ack_frames =
+                !context.queues[0].is_empty() || context.has_pending_acks();
 
             // Phase 0.5: drain Ack-priority frames (from frame_tx path).
-            // These arrive with encoded ACK bodies; stamp wire-time metadata here so
-            // they bypass CWND and coalesce naturally with data frames on the same sender.
+            // These arrive pre-assembled with ack_delay already stamped at submission time.
+            // They bypass CWND and coalesce naturally with data frames on the same sender.
             while let Some(mut frame_entry) = context.queues[0].pop_front() {
-                let largest_recv_time = frame_entry.ack_largest_recv_time;
-                if let (
-                    frame::Header::Ack {
-                        ack_delay,
-                        is_ack_eliciting,
-                        ..
-                    },
-                    Some(largest_recv_time),
-                ) = (&mut frame_entry.header, largest_recv_time)
+                // Override is_ack_eliciting at wire time (depends on PTO/RTT probe state).
+                if let frame::Header::Ack {
+                    ref mut is_ack_eliciting,
+                    ..
+                } = frame_entry.header
                 {
-                    let ack_delay_duration = now.duration_since(largest_recv_time);
-                    let ack_delay_micros = ack_delay_duration.as_micros() as u64;
-                    *ack_delay =
-                        VarInt::new(ack_delay_micros).unwrap_or(VarInt::from_u32(u32::MAX));
                     *is_ack_eliciting =
                         context.pto.probe_state.is_requested() || make_ack_eliciting;
                 }
@@ -241,7 +240,6 @@ where
                     status: Default::default(),
                     ttl: frame::DEFAULT_TTL,
                     transmission_time: None,
-                    ack_largest_recv_time: None,
                 };
 
                 is_ack_eliciting |= header.is_ack_eliciting();
@@ -313,7 +311,10 @@ where
                 || context.tx_wheel.target_time.map_or(false, |t| now >= t);
             let can_piggyback_data = match immediate_queue_status {
                 ImmediateQueueStatus::HasMore | ImmediateQueueStatus::BudgetExhausted => false,
-                ImmediateQueueStatus::Empty => edt_elapsed,
+                // If ACK frames are being sent, we are already transmitting a packet.
+                // Allow data piggybacking regardless of EDT pacing to avoid sending
+                // a separate data-only packet right after the ACK packet.
+                ImmediateQueueStatus::Empty => edt_elapsed || has_ack_frames,
             };
             let can_send_pending = context.has_pending_data()
                 && (context.pto.probe_state.is_requested()
@@ -442,6 +443,7 @@ where
                     // samples via normal ACK processing. The separate ACK-only RTT tracker
                     // is no longer needed.
                     context.rtt_tracker.clear();
+                    context.has_had_inflight = true;
 
                     let has_more_app_data = context.has_pending();
                     let cc_info = context.cca.on_packet_sent(

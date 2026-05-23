@@ -178,6 +178,11 @@ pub(crate) fn process_ack<Clk, Rand>(
             random,
             now,
         );
+
+        // Data ACK provided a fresh RTT sample via the inflight path. Suppress
+        // the next ACK-only probe cycle — no separate ack-eliciting ACK is needed
+        // to keep the RTT estimate current.
+        context.rtt_tracker.on_data_rtt_sampled();
     } else if let Some(ack_only_time_sent) = ack_only_rtt_sample {
         // No data was ACKed in this frame, but the peer acknowledged our
         // ack-eliciting ACK-only packet. Use this to keep the RTT estimate fresh.
@@ -457,7 +462,6 @@ mod tests {
                 status: TransmissionStatus::Pending,
                 ttl: DEFAULT_TTL,
                 transmission_time: None,
-                ack_largest_recv_time: None,
             }
             .into(),
         );

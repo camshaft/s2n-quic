@@ -33,9 +33,11 @@ fn setup(
     let (sender, output_rx) = unsync::new::<crate::endpoint::frame::Frame>();
     let input = TestReceiver::new(contexts);
     let counters = crate::endpoint::counters::Dispatch::new(&crate::counter::Registry::default());
+    let clock = Clock::default();
     let rx = tasks::ack_burst(
         input,
         sender,
+        clock,
         crate::endpoint::id::RecvDispatchWorkerId::new(0),
         counters,
     );

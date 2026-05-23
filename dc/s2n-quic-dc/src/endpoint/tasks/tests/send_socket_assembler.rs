@@ -506,7 +506,6 @@ fn cancelled_frame_emitted_when_completion_is_cancelled() {
                         status: frame::TransmissionStatus::Pending,
                         ttl: 3,
                         transmission_time: None,
-                        ack_largest_recv_time: None,
                     }),
                 );
                 batch.set_sender_id(crate::endpoint::id::LocalSenderId::from_index(0));

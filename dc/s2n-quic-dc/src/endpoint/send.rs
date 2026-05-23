@@ -277,6 +277,21 @@ impl AckRttTracker {
         self.sampled = false;
     }
 
+    /// Suppress the next ACK-only probe cycle.
+    ///
+    /// Called when an RTT sample was obtained via the normal data-inflight path
+    /// (not via an ack-only probe). The `sampled = true` flag makes `is_pending()`
+    /// return `true`, which prevents `make_ack_eliciting` from being set on the next
+    /// ACK-only send, avoiding an unnecessary ACK round-trip when a data exchange
+    /// already provided a fresh RTT sample.
+    ///
+    /// The suppression is lifted by `clear()`, which is called when new data enters
+    /// the inflight map, starting a fresh probe cycle.
+    #[inline]
+    pub fn on_data_rtt_sampled(&mut self) {
+        self.sampled = true;
+    }
+
     /// Check whether a single ACK range covers either the `latest` or `stable` PN.
     ///
     /// `start` and `end` are the inclusive VarInt bounds of the acknowledged range.
@@ -546,6 +561,13 @@ pub(crate) struct Context {
     /// Set when the context is invalidated (removed from cache). Prevents wheels
     /// from rearming after expiry.
     pub invalidated: bool,
+    /// True once a data-carrying packet has been inserted into the inflight map.
+    ///
+    /// Used to suppress the ACK-only RTT probe on contexts that have never sent
+    /// data (e.g. a send worker that only forwards ACKs for a peer). Without this
+    /// guard, `make_ack_eliciting` would fire on every ACK-only worker for the peer,
+    /// causing spurious ACK round-trips even on fresh short-lived exchanges.
+    pub has_had_inflight: bool,
     /// RTT sampler for ACK-only (read-heavy) sends.
     ///
     /// When `inflight` is empty we have no ack-eliciting packets in flight and
@@ -625,6 +647,7 @@ impl Context {
             created_at: clock.now(),
             last_peer_activity: clock.now(),
             invalidated: false,
+            has_had_inflight: false,
             rtt_tracker: AckRttTracker::default(),
         })
     }
