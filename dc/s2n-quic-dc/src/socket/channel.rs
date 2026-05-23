@@ -1558,3 +1558,43 @@ where
         self.inner.on_consumed(bytes);
     }
 }
+
+// ── PrioritySelect ───────────────────────────────────────────────────────
+
+/// Polls a high-priority receiver first; falls back to a low-priority receiver
+/// only when the priority receiver is pending.
+pub struct PrioritySelect<T, A, B> {
+    priority: A,
+    fallback: B,
+    _phantom: PhantomData<T>,
+}
+
+impl<T, A, B> PrioritySelect<T, A, B> {
+    pub fn new(priority: A, fallback: B) -> Self {
+        Self {
+            priority,
+            fallback,
+            _phantom: PhantomData,
+        }
+    }
+}
+
+impl<T, A, B> Receiver<T> for PrioritySelect<T, A, B>
+where
+    A: Receiver<T>,
+    B: Receiver<T>,
+{
+    fn poll_recv(&mut self, cx: &mut task::Context<'_>, budget: &mut Budget) -> Poll<Option<T>> {
+        match self.priority.poll_recv(cx, budget) {
+            Poll::Ready(Some(value)) => return Poll::Ready(Some(value)),
+            Poll::Ready(None) => {}
+            Poll::Pending => {}
+        }
+        self.fallback.poll_recv(cx, budget)
+    }
+
+    fn on_consumed(&mut self, bytes: u64) {
+        self.priority.on_consumed(bytes);
+        self.fallback.on_consumed(bytes);
+    }
+}

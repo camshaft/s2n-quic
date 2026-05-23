@@ -18,7 +18,7 @@
 use crate::{
     endpoint::routing::hash_id_and_sender,
     stream::endpoint::testing::sim::{Client, Server, SERVER_PORT},
-    testing::{ext::*, sim, without_tracing},
+    testing::{ext::*, sim, without_snapshots, without_tracing},
     tracing::*,
 };
 use bach::time::{timeout, Instant};
@@ -905,4 +905,202 @@ fn init_uniqueness_fuzz() {
         .for_each(|actions| {
             sim_init_uniqueness(&actions, 10_000);
         });
+}
+
+// ── Symmetric 5-tuple routing ────────────────────────────────────────────────
+
+/// Verifies that data and ACK packets form symmetric 5-tuples.
+///
+/// For each data packet A:src_port → B:dst_port, the corresponding ACK must
+/// flow B:dst_port → A:src_port (same ports, reversed direction). This is
+/// required for conntrack/middlebox compatibility.
+///
+/// The test captures all packet (source, destination) port pairs from the
+/// network monitor, grouped by direction. It then asserts that for every
+/// port pair seen in one direction, the reverse pair exists in the other
+/// direction.
+#[test]
+fn symmetric_5tuple_routing() {
+    use std::net::SocketAddr;
+
+    let forward_tuples: Arc<Mutex<HashSet<(SocketAddr, SocketAddr)>>> =
+        Arc::new(Mutex::new(HashSet::new()));
+    let reverse_tuples: Arc<Mutex<HashSet<(SocketAddr, SocketAddr)>>> =
+        Arc::new(Mutex::new(HashSet::new()));
+
+    let forward = forward_tuples.clone();
+    let reverse = reverse_tuples.clone();
+
+    let _guard = without_tracing();
+    sim(|| {
+        // Capture all packet 5-tuples from the network.
+        {
+            let forward = forward.clone();
+            let reverse = reverse.clone();
+            bach::net::monitor::on_packet_sent(move |packet| {
+                let src = packet.source();
+                let dst = packet.destination();
+                // Classify by direction: server→client or client→server.
+                // Server is at 10.0.0.1, client at 10.0.0.2 in the sim.
+                if src.ip() == std::net::IpAddr::from([10, 0, 0, 1u8]) {
+                    forward.lock().unwrap().insert((src, dst));
+                } else {
+                    reverse.lock().unwrap().insert((src, dst));
+                }
+                bach::net::monitor::Command::Pass
+            });
+        }
+
+        let acceptor_id = VarInt::from_u8(1);
+
+        // Server: echo back whatever it receives.
+        {
+            let acceptor_id = acceptor_id;
+            async move {
+                let server = Server::new();
+                let mut acceptor = server
+                    .register_acceptor_channel(acceptor_id, 8)
+                    .expect("acceptor registration");
+
+                while let Some(stream) = acceptor.recv().await {
+                    async move {
+                        let stream = stream.validate().await.expect("validate");
+                        let (mut reader, mut writer) = stream.into_split();
+                        let mut buf = BytesMut::with_capacity(4096);
+                        loop {
+                            let n = reader.read_into(&mut buf).await.expect("read");
+                            if n == 0 {
+                                break;
+                            }
+                        }
+                        let mut response = buf.freeze();
+                        writer
+                            .write_all_from_fin(&mut response)
+                            .await
+                            .expect("write");
+                    }
+                    .spawn();
+                }
+            }
+            .group("server")
+            .spawn();
+        }
+
+        // Client: send data and read the echo back.
+        {
+            async move {
+                let mut client = Client::new();
+                let stream = client
+                    .connect("server:0", acceptor_id)
+                    .await
+                    .expect("connect");
+                let (mut reader, mut writer) = stream.into_split();
+
+                let mut body = Bytes::from(vec![42u8; 8192]);
+                writer
+                    .write_all_from_fin(&mut body)
+                    .await
+                    .expect("client write");
+
+                let mut response = BytesMut::with_capacity(8192);
+                loop {
+                    let n = reader.read_into(&mut response).await.expect("client read");
+                    if n == 0 {
+                        break;
+                    }
+                }
+            }
+            .group("client")
+            .primary()
+            .spawn();
+        }
+    });
+
+    let forward = forward_tuples.lock().unwrap();
+    let reverse = reverse_tuples.lock().unwrap();
+
+    assert!(
+        !forward.is_empty(),
+        "no server→client packets observed"
+    );
+    assert!(
+        !reverse.is_empty(),
+        "no client→server packets observed"
+    );
+
+    // For every (src, dst) pair in one direction, the reverse (dst, src) must
+    // exist in the other direction. This proves symmetric 5-tuples.
+    let mut violations = Vec::new();
+    for &(src, dst) in forward.iter() {
+        if !reverse.contains(&(dst, src)) {
+            violations.push(format!(
+                "server→client {src} → {dst} has no symmetric client→server {dst} → {src}"
+            ));
+        }
+    }
+    for &(src, dst) in reverse.iter() {
+        if !forward.contains(&(dst, src)) {
+            violations.push(format!(
+                "client→server {src} → {dst} has no symmetric server→client {dst} → {src}"
+            ));
+        }
+    }
+
+    assert!(
+        violations.is_empty(),
+        "5-tuple symmetry violated — middleboxes will not be able to correlate \
+         these flows:\n{}",
+        violations.join("\n")
+    );
+}
+
+// ── Loss distribution benchmark ──────────────────────────────────────────────
+
+/// Runs many deterministic loss patterns and prints the latency distribution.
+///
+/// This test generates 200 loss patterns from a seeded PRNG so the set is
+/// reproducible. Each pattern is a sequence of (pass, drop) run-lengths with
+/// values 0..=10 and total vector length 4..=20. The test prints p50/p90/p99/max
+/// so we can compare routing strategies.
+#[test]
+#[ignore = "run manually to compare routing strategies"]
+fn loss_latency_distribution() {
+    let _guard = without_tracing();
+
+    let mut rng_state: u64 = 0xdeadbeef_cafebabe;
+    let mut next = || -> u8 {
+        rng_state ^= rng_state << 13;
+        rng_state ^= rng_state >> 7;
+        rng_state ^= rng_state << 17;
+        (rng_state % 11) as u8
+    };
+
+    let patterns: Vec<DroppedPackets> = (0..200)
+        .map(|_| {
+            let len = 4 + (next() as usize % 17);
+            let counts: Vec<u8> = (0..len).map(|_| next()).collect();
+            DroppedPackets { counts }
+        })
+        .collect();
+
+    let mut durations: Vec<Duration> = patterns
+        .into_iter()
+        .map(|p| p.sim(1 << 18))
+        .collect();
+
+    durations.sort();
+    let n = durations.len();
+    let p50 = durations[n / 2];
+    let p90 = durations[n * 9 / 10];
+    let p99 = durations[n * 99 / 100];
+    let max = durations[n - 1];
+    let sum: Duration = durations.iter().sum();
+    let mean = sum / n as u32;
+
+    eprintln!("=== Loss Latency Distribution (n={n}) ===");
+    eprintln!("  mean: {mean:?}");
+    eprintln!("  p50:  {p50:?}");
+    eprintln!("  p90:  {p90:?}");
+    eprintln!("  p99:  {p99:?}");
+    eprintln!("  max:  {max:?}");
 }
