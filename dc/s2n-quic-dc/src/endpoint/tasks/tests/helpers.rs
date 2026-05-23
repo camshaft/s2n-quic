@@ -239,6 +239,7 @@ pub fn test_frame_with_payload(pse: &Arc<PathSecretEntry>, payload_size: usize) 
             offset: VarInt::ZERO,
             is_fin: false,
             dest_acceptor_id: None,
+            fragment: None,
         },
         source_sender_id: crate::endpoint::id::LocalSenderId::new(VarInt::MAX),
         payload: bytes::BytesMut::zeroed(payload_size).into(),

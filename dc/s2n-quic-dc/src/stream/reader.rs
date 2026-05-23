@@ -175,6 +175,20 @@ impl ReadToEnd {
     }
 }
 
+/// A pending (not yet fully received) message fragment.
+///
+/// The writer marks message boundaries by assigning each message a `fragment_id`
+/// and including the total byte count in the first frame for that id. The reader
+/// registers a `PendingFragment` on the first frame and uses it to know when the
+/// full message has arrived in the reassembler.
+#[derive(Debug)]
+struct PendingFragment {
+    /// Fragment identifier assigned by the writer.
+    id: VarInt,
+    /// Total byte count for this fragment (as communicated by the writer).
+    total_size: u64,
+}
+
 struct Inner {
     /// Channel to submit frames to the wheel
     frame_tx: SubmissionSender,
@@ -201,6 +215,12 @@ struct Inner {
     status: Status,
     /// Reset error code if the stream was reset by the peer
     reset_error_code: Option<VarInt>,
+    /// Pending message fragments in arrival order.
+    ///
+    /// Each entry was registered when the first frame for a fragment arrived
+    /// (the frame that carries `total_size`). Entries are consumed in FIFO
+    /// order by `poll_read_message`.
+    pending_fragments: std::collections::VecDeque<PendingFragment>,
     /// Counts total EOF returns in debug builds so a second `Ok(0)` can trip a
     /// debug assertion and catch post-EOF spin loops.
     #[cfg(debug_assertions)]
@@ -255,6 +275,7 @@ impl Reader {
             send_flow_update_after_fin: false,
             status: Status::Open,
             reset_error_code: None,
+            pending_fragments: std::collections::VecDeque::new(),
             #[cfg(debug_assertions)]
             eof_counter: 0,
             coop: Coop::default(),
@@ -283,6 +304,7 @@ impl Reader {
             send_flow_update_after_fin: !peer_fin_received,
             status: Status::Open,
             reset_error_code: None,
+            pending_fragments: std::collections::VecDeque::new(),
             #[cfg(debug_assertions)]
             eof_counter: 0,
             coop: Coop::default(),
@@ -454,6 +476,48 @@ impl Reader {
         S: buffer::writer::Storage,
     {
         self.0.poll_read_into(cx, buf)
+    }
+
+    /// Reads the next complete message fragment into `buf`.
+    ///
+    /// This is the message-oriented read API that pairs with
+    /// [`Writer::write_message`]. It waits until all bytes for one complete
+    /// message fragment have arrived (potentially out of order), then copies
+    /// them into `buf` all at once.
+    ///
+    /// # Guarantees
+    ///
+    /// - Messages are delivered in the order the writer sent them.
+    /// - The entire message body is available in `buf` on success; no partial
+    ///   messages are returned.
+    /// - Returns `Ok(0)` when the stream reaches EOF and there are no more
+    ///   pending messages.
+    ///
+    /// # Footguns
+    ///
+    /// - `buf` must have at least as many remaining bytes as the message size.
+    ///   If the buffer is smaller than the message, only the first
+    ///   `buf.remaining_capacity()` bytes are written and the rest are silently
+    ///   discarded.
+    /// - Mixing calls to `read_message` and `read_into` on the same reader
+    ///   may interleave stream bytes unpredictably.
+    pub async fn read_message<S>(&mut self, buf: &mut S) -> io::Result<usize>
+    where
+        S: buffer::writer::Storage,
+    {
+        core::future::poll_fn(|cx| self.poll_read_message(cx, buf)).await
+    }
+
+    /// Poll-based form of [`read_message`](Self::read_message).
+    pub fn poll_read_message<S>(
+        &mut self,
+        cx: &mut Context,
+        buf: &mut S,
+    ) -> Poll<io::Result<usize>>
+    where
+        S: buffer::writer::Storage,
+    {
+        self.0.poll_read_message(cx, buf)
     }
 }
 
@@ -639,6 +703,7 @@ impl Inner {
                             offset,
                             mut payload,
                             fin,
+                            fragment,
                         } => {
                             let Some(payload_end_offset) =
                                 offset.as_u64().checked_add(payload.len() as u64)
@@ -680,6 +745,25 @@ impl Inner {
                                 is_fin = fin,
                                 "Received data"
                             );
+
+                            // Register new fragment starts so poll_read_message
+                            // can detect when the full message has arrived.
+                            if let Some(msg::Fragment {
+                                id,
+                                total_size: Some(total_size),
+                            }) = fragment
+                            {
+                                trace!(
+                                    stream_id = self.stream_id.as_u64(),
+                                    fragment_id = id.as_u64(),
+                                    total_size = total_size.as_u64(),
+                                    "Fragment start registered"
+                                );
+                                self.pending_fragments.push_back(PendingFragment {
+                                    id,
+                                    total_size: total_size.as_u64(),
+                                });
+                            }
 
                             let mut incremental = Incremental::new(offset);
                             let mut reader = match incremental.with_storage(&mut payload, fin) {
@@ -931,6 +1015,105 @@ impl Inner {
         self.frame_tx
             .send_batch(intrusive::Entry::new(frame))
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "frame channel closed"))
+    }
+
+    /// Poll the message-oriented read path.
+    ///
+    /// Waits until the reassembler holds at least `total_size` contiguous bytes
+    /// for the first pending fragment, then drains exactly that many bytes into
+    /// `buf` and pops the entry from `pending_fragments`.
+    ///
+    /// Returns `Ok(0)` when there are no more pending fragments and the stream
+    /// is at EOF.  Returns `Pending` when data is still in flight.
+    fn poll_read_message<S>(
+        &mut self,
+        cx: &mut Context,
+        buf: &mut S,
+    ) -> Poll<io::Result<usize>>
+    where
+        S: buffer::writer::Storage,
+    {
+        waker::debug_assert_contract(cx, |cx| {
+            coop::poll(self, cx, |this, cx| this.poll_read_message_inner(cx, buf))
+        })
+    }
+
+    fn poll_read_message_inner<S>(
+        &mut self,
+        cx: &mut Context,
+        buf: &mut S,
+    ) -> Poll<io::Result<usize>>
+    where
+        S: buffer::writer::Storage,
+    {
+        self.poll_completions(cx)?;
+
+        // Surface terminal states.
+        if self.status.is_reset() && self.reassembler.is_empty() {
+            self.reassembler.reset();
+            return Poll::Ready(Err(self.reset_io_error()));
+        }
+
+        // Drain incoming stream messages into the reassembler and update the
+        // pending_fragments list.
+        if !self.status.is_reset() {
+            let mut noop_buf = buffer::writer::storage::Empty;
+            match self.poll_stream_rx(cx, &mut noop_buf) {
+                Poll::Ready(Ok(())) | Poll::Pending => {}
+                Poll::Ready(Err(e))
+                    if self.reassembler.is_writing_complete()
+                        || !self.reassembler.is_empty() =>
+                {
+                    // Defer the error – drain buffered messages first.
+                    let _ = e;
+                }
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+            }
+        }
+
+        // Check if the first pending fragment is complete.
+        if let Some(frag) = self.pending_fragments.front() {
+            let available = self.reassembler.len() as u64;
+            if available >= frag.total_size {
+                let total_size = frag.total_size as usize;
+                let frag_id = frag.id;
+                self.pending_fragments.pop_front();
+
+                // Drain exactly `total_size` bytes from the front of the
+                // reassembler into the caller's buffer.
+                let mut remaining = total_size;
+                while remaining > 0 {
+                    let Some(chunk) = self.reassembler.pop_watermarked(remaining) else {
+                        break;
+                    };
+                    remaining -= chunk.len();
+                    buf.put_bytes_mut(chunk);
+                }
+
+                trace!(
+                    stream_id = self.stream_id.as_u64(),
+                    fragment_id = frag_id.as_u64(),
+                    total_size,
+                    "Fragment delivered to application"
+                );
+
+                self.maybe_send_max_data()?;
+
+                if self.reassembler.is_reading_complete() {
+                    self.status.on_complete().ok();
+                }
+
+                return Poll::Ready(Ok(total_size));
+            }
+        } else {
+            // No pending fragments.  If the stream is complete, signal EOF.
+            if self.status.is_complete() || self.reassembler.is_reading_complete() {
+                self.status.on_complete().ok();
+                return Poll::Ready(Ok(0));
+            }
+        }
+
+        Poll::Pending
     }
 }
 

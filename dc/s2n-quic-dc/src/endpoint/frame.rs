@@ -343,6 +343,22 @@ pub enum FailureReason {
     Cancelled,
 }
 
+/// Fragment metadata for message-oriented framing within a stream.
+///
+/// When the application passes a complete message to [`Writer::write_message`],
+/// all frames for that message carry a `Fragment`. The first frame for a given
+/// `id` also carries `total_size` so the receiver can pre-allocate and know
+/// when the message is complete. Continuation frames omit `total_size`.
+#[cfg_attr(test, derive(bolero_generator::TypeGenerator))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Fragment {
+    /// Monotonically increasing identifier for this message within the stream.
+    pub id: VarInt,
+    /// Total byte count for this message. Present only in the first frame for
+    /// this `id`; absent (i.e. `None`) in all continuation frames.
+    pub total_size: Option<VarInt>,
+}
+
 /// Routing metadata for a Frame.
 ///
 /// Describes what kind of frame this is and the per-frame routing fields. The
@@ -356,12 +372,18 @@ pub enum Header {
     /// When `dest_acceptor_id` is `Some`, this is an "init" frame that can create
     /// a new binding on the server if the queue is unbound. Once the server confirms
     /// the binding (via MaxData), subsequent frames omit the acceptor_id.
+    ///
+    /// When `fragment` is `Some`, this frame belongs to a message-delimited
+    /// fragment. The first frame for a given fragment id carries
+    /// `Fragment::total_size`; continuation frames set it to `None`.
     QueueData {
         queue_pair: QueuePair,
         binding_id: VarInt,
         offset: VarInt,
         is_fin: bool,
         dest_acceptor_id: Option<VarInt>,
+        /// Optional message-fragment metadata. `None` for plain stream data.
+        fragment: Option<Fragment>,
     },
     /// Queue control (opaque control frames)
     QueueControl {
@@ -427,6 +449,14 @@ impl Header {
     const ACK_ECN_ELICITING_TYPE: u8 = 14;
     const QUEUE_DATA_INIT_NO_FIN_TYPE: u8 = 15;
     const QUEUE_DATA_INIT_WITH_FIN_TYPE: u8 = 16;
+    /// Fragment start frame (first frame for a fragment id); no fin, no init
+    const QUEUE_DATA_FRAGMENT_START_NO_FIN_TYPE: u8 = 17;
+    /// Fragment start frame; with fin, no init
+    const QUEUE_DATA_FRAGMENT_START_WITH_FIN_TYPE: u8 = 18;
+    /// Fragment continuation frame (subsequent frames for a fragment id); no fin
+    const QUEUE_DATA_FRAGMENT_CONT_NO_FIN_TYPE: u8 = 19;
+    /// Fragment continuation frame; with fin
+    const QUEUE_DATA_FRAGMENT_CONT_WITH_FIN_TYPE: u8 = 20;
 
     #[inline]
     pub fn priority(&self) -> Priority {
@@ -501,12 +531,29 @@ impl EncoderValue for Header {
                 offset,
                 is_fin,
                 dest_acceptor_id,
+                fragment,
             } => {
-                let tag = match (dest_acceptor_id.is_some(), *is_fin) {
-                    (true, false) => Self::QUEUE_DATA_INIT_NO_FIN_TYPE,
-                    (true, true) => Self::QUEUE_DATA_INIT_WITH_FIN_TYPE,
-                    (false, false) => Self::QUEUE_DATA_NO_FIN_TYPE,
-                    (false, true) => Self::QUEUE_DATA_WITH_FIN_TYPE,
+                let tag = match (dest_acceptor_id.is_some(), fragment, *is_fin) {
+                    // init frames (with dest_acceptor_id) do not carry fragment metadata
+                    (true, _, false) => Self::QUEUE_DATA_INIT_NO_FIN_TYPE,
+                    (true, _, true) => Self::QUEUE_DATA_INIT_WITH_FIN_TYPE,
+                    // fragment start: has total_size
+                    (false, Some(Fragment { total_size: Some(_), .. }), false) => {
+                        Self::QUEUE_DATA_FRAGMENT_START_NO_FIN_TYPE
+                    }
+                    (false, Some(Fragment { total_size: Some(_), .. }), true) => {
+                        Self::QUEUE_DATA_FRAGMENT_START_WITH_FIN_TYPE
+                    }
+                    // fragment continuation: id present, no total_size
+                    (false, Some(Fragment { total_size: None, .. }), false) => {
+                        Self::QUEUE_DATA_FRAGMENT_CONT_NO_FIN_TYPE
+                    }
+                    (false, Some(Fragment { total_size: None, .. }), true) => {
+                        Self::QUEUE_DATA_FRAGMENT_CONT_WITH_FIN_TYPE
+                    }
+                    // plain stream data
+                    (false, None, false) => Self::QUEUE_DATA_NO_FIN_TYPE,
+                    (false, None, true) => Self::QUEUE_DATA_WITH_FIN_TYPE,
                 };
                 encoder.encode(&tag);
                 encoder.encode(queue_pair);
@@ -514,6 +561,12 @@ impl EncoderValue for Header {
                     encoder.encode(acceptor_id);
                 }
                 encoder.encode(binding_id);
+                if let Some(frag) = fragment {
+                    encoder.encode(&frag.id);
+                    if let Some(total_size) = &frag.total_size {
+                        encoder.encode(total_size);
+                    }
+                }
                 encoder.encode(offset);
             }
             Self::QueueControl {
@@ -597,6 +650,7 @@ impl<'a> s2n_codec::DecoderValue<'a> for Header {
                         offset,
                         is_fin,
                         dest_acceptor_id: Some(dest_acceptor_id),
+                        fragment: None,
                     },
                     buffer,
                 ))
@@ -613,6 +667,52 @@ impl<'a> s2n_codec::DecoderValue<'a> for Header {
                         offset,
                         is_fin,
                         dest_acceptor_id: None,
+                        fragment: None,
+                    },
+                    buffer,
+                ))
+            }
+            Self::QUEUE_DATA_FRAGMENT_START_NO_FIN_TYPE
+            | Self::QUEUE_DATA_FRAGMENT_START_WITH_FIN_TYPE => {
+                let (queue_pair, buffer) = buffer.decode()?;
+                let (binding_id, buffer) = buffer.decode()?;
+                let (fragment_id, buffer) = buffer.decode::<VarInt>()?;
+                let (total_size, buffer) = buffer.decode::<VarInt>()?;
+                let (offset, buffer) = buffer.decode()?;
+                let is_fin = tag == Self::QUEUE_DATA_FRAGMENT_START_WITH_FIN_TYPE;
+                Ok((
+                    Self::QueueData {
+                        queue_pair,
+                        binding_id,
+                        offset,
+                        is_fin,
+                        dest_acceptor_id: None,
+                        fragment: Some(Fragment {
+                            id: fragment_id,
+                            total_size: Some(total_size),
+                        }),
+                    },
+                    buffer,
+                ))
+            }
+            Self::QUEUE_DATA_FRAGMENT_CONT_NO_FIN_TYPE
+            | Self::QUEUE_DATA_FRAGMENT_CONT_WITH_FIN_TYPE => {
+                let (queue_pair, buffer) = buffer.decode()?;
+                let (binding_id, buffer) = buffer.decode()?;
+                let (fragment_id, buffer) = buffer.decode::<VarInt>()?;
+                let (offset, buffer) = buffer.decode()?;
+                let is_fin = tag == Self::QUEUE_DATA_FRAGMENT_CONT_WITH_FIN_TYPE;
+                Ok((
+                    Self::QueueData {
+                        queue_pair,
+                        binding_id,
+                        offset,
+                        is_fin,
+                        dest_acceptor_id: None,
+                        fragment: Some(Fragment {
+                            id: fragment_id,
+                            total_size: None,
+                        }),
                     },
                     buffer,
                 ))
@@ -815,6 +915,7 @@ mod tests {
                 offset: VarInt::ZERO,
                 is_fin: false,
                 dest_acceptor_id: None,
+                fragment: None,
             },
             source_sender_id: LocalSenderId::UNSPECIFIED,
             payload,
@@ -846,6 +947,7 @@ mod tests {
                 offset: VarInt::ZERO,
                 is_fin: false,
                 dest_acceptor_id: Some(VarInt::from_u8(10)),
+                fragment: None,
             },
             source_sender_id: LocalSenderId::UNSPECIFIED,
             payload: ByteVec::new(),
@@ -903,6 +1005,7 @@ mod tests {
                 offset: VarInt::ZERO,
                 is_fin: false,
                 dest_acceptor_id: Some(VarInt::from_u8(10)),
+                fragment: None,
             },
             source_sender_id: LocalSenderId::new(VarInt::from_u8(7)),
             payload: ByteVec::new(),
@@ -915,5 +1018,106 @@ mod tests {
 
         assert!(frame.requires_sticky_sender());
         assert_eq!(frame.priority(), Priority::QueueData);
+    }
+
+    fn roundtrip_header(header: &Header) -> Header {
+        let encoded = header.encode_to_vec();
+        let (decoded, rest) = s2n_codec::DecoderBuffer::new(&encoded)
+            .decode::<Header>()
+            .expect("failed to decode header");
+        assert!(rest.is_empty(), "trailing bytes after decoded header");
+        decoded
+    }
+
+    #[test]
+    fn fragment_start_no_fin_roundtrip() {
+        let header = Header::QueueData {
+            queue_pair: QueuePair {
+                source_queue_id: VarInt::from_u8(1),
+                dest_queue_id: VarInt::from_u8(2),
+            },
+            binding_id: VarInt::from_u8(7),
+            offset: VarInt::from_u8(0),
+            is_fin: false,
+            dest_acceptor_id: None,
+            fragment: Some(Fragment {
+                id: VarInt::from_u8(3),
+                total_size: Some(VarInt::from_u32(1024)),
+            }),
+        };
+        assert_eq!(roundtrip_header(&header), header);
+    }
+
+    #[test]
+    fn fragment_start_with_fin_roundtrip() {
+        let header = Header::QueueData {
+            queue_pair: QueuePair {
+                source_queue_id: VarInt::from_u8(1),
+                dest_queue_id: VarInt::from_u8(2),
+            },
+            binding_id: VarInt::from_u8(7),
+            offset: VarInt::from_u8(50),
+            is_fin: true,
+            dest_acceptor_id: None,
+            fragment: Some(Fragment {
+                id: VarInt::from_u8(3),
+                total_size: Some(VarInt::from_u8(50)),
+            }),
+        };
+        assert_eq!(roundtrip_header(&header), header);
+    }
+
+    #[test]
+    fn fragment_continuation_no_fin_roundtrip() {
+        let header = Header::QueueData {
+            queue_pair: QueuePair {
+                source_queue_id: VarInt::from_u8(5),
+                dest_queue_id: VarInt::from_u8(6),
+            },
+            binding_id: VarInt::from_u8(11),
+            offset: VarInt::from_u32(512),
+            is_fin: false,
+            dest_acceptor_id: None,
+            fragment: Some(Fragment {
+                id: VarInt::from_u8(3),
+                total_size: None,
+            }),
+        };
+        assert_eq!(roundtrip_header(&header), header);
+    }
+
+    #[test]
+    fn fragment_continuation_with_fin_roundtrip() {
+        let header = Header::QueueData {
+            queue_pair: QueuePair {
+                source_queue_id: VarInt::from_u8(5),
+                dest_queue_id: VarInt::from_u8(6),
+            },
+            binding_id: VarInt::from_u8(11),
+            offset: VarInt::from_u32(1000),
+            is_fin: true,
+            dest_acceptor_id: None,
+            fragment: Some(Fragment {
+                id: VarInt::from_u8(3),
+                total_size: None,
+            }),
+        };
+        assert_eq!(roundtrip_header(&header), header);
+    }
+
+    #[test]
+    fn plain_queue_data_roundtrip() {
+        let header = Header::QueueData {
+            queue_pair: QueuePair {
+                source_queue_id: VarInt::from_u8(1),
+                dest_queue_id: VarInt::from_u8(2),
+            },
+            binding_id: VarInt::from_u8(42),
+            offset: VarInt::ZERO,
+            is_fin: false,
+            dest_acceptor_id: None,
+            fragment: None,
+        };
+        assert_eq!(roundtrip_header(&header), header);
     }
 }

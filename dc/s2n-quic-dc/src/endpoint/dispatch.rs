@@ -361,6 +361,7 @@ fn dispatch_decoded_frame(
             offset,
             is_fin,
             dest_acceptor_id,
+            fragment,
         } => {
             handle_queue_data(
                 peer,
@@ -369,6 +370,7 @@ fn dispatch_decoded_frame(
                 offset,
                 is_fin,
                 dest_acceptor_id,
+                fragment,
                 payload,
                 acceptor_registry,
                 frame_tx,
@@ -512,6 +514,7 @@ fn handle_queue_data(
     offset: VarInt,
     is_fin: bool,
     dest_acceptor_id: Option<VarInt>,
+    fragment: Option<crate::endpoint::frame::Fragment>,
     buf: BytesMut,
     acceptor_registry: &mut acceptor::LocalRegistry<PendingValidation>,
     frame_tx: &SubmissionSender,
@@ -527,6 +530,10 @@ fn handle_queue_data(
         offset,
         fin: is_fin,
         payload: buf,
+        fragment: fragment.map(|f| msg::Fragment {
+            id: f.id,
+            total_size: f.total_size,
+        }),
     }
     .into();
 

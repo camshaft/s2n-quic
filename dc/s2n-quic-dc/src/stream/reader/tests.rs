@@ -166,6 +166,46 @@ impl Pusher {
             offset: VarInt::new(offset).unwrap(),
             payload: BytesMut::from(data),
             fin,
+            fragment: None,
+        });
+    }
+
+    /// Push a fragment-start frame: first frame for a message with a known `total_size`.
+    fn push_fragment_start(
+        &mut self,
+        offset: u64,
+        data: &[u8],
+        fin: bool,
+        fragment_id: u8,
+        total_size: u64,
+    ) {
+        self.push(msg::Stream::Data {
+            offset: VarInt::new(offset).unwrap(),
+            payload: BytesMut::from(data),
+            fin,
+            fragment: Some(msg::Fragment {
+                id: VarInt::from_u8(fragment_id),
+                total_size: Some(VarInt::new(total_size).unwrap()),
+            }),
+        });
+    }
+
+    /// Push a fragment-continuation frame: not the first frame of the message.
+    fn push_fragment_cont(
+        &mut self,
+        offset: u64,
+        data: &[u8],
+        fin: bool,
+        fragment_id: u8,
+    ) {
+        self.push(msg::Stream::Data {
+            offset: VarInt::new(offset).unwrap(),
+            payload: BytesMut::from(data),
+            fin,
+            fragment: Some(msg::Fragment {
+                id: VarInt::from_u8(fragment_id),
+                total_size: None,
+            }),
         });
     }
 
@@ -1588,6 +1628,89 @@ fn broken_frame_channel_is_handled_gracefully() {
                 .await
                 .expect_err("expected BrokenPipe when frame channel is closed");
             assert_eq!(err.kind(), std::io::ErrorKind::BrokenPipe);
+        }
+        .primary()
+        .spawn();
+    });
+}
+
+// ─── Fragment / read_message tests ─────────────────────────────────────────────
+
+/// A single-frame message (fits in one push) is delivered atomically.
+#[test]
+fn read_message_single_frame() {
+    sim(|| {
+        let (mut reader, mut pusher) = make_pair();
+
+        async move {
+            // Deliver the full message in one push (start frame only).
+            pusher.push_fragment_start(0, b"hello world", false, 0, 11);
+            // Push FIN so the reader can eventually reach EOF.
+            pusher.push_data(11, b"", true);
+        }
+        .primary()
+        .spawn();
+
+        async move {
+            let mut buf = BytesMut::with_capacity(64);
+            let n = reader.read_message(&mut buf).await.expect("read_message failed");
+            assert_eq!(n, 11);
+            assert_eq!(&buf[..], b"hello world");
+        }
+        .primary()
+        .spawn();
+    });
+}
+
+/// A multi-frame message (split across two pushes) is only delivered once complete.
+#[test]
+fn read_message_multi_frame() {
+    sim(|| {
+        let (mut reader, mut pusher) = make_pair();
+
+        async move {
+            // Fragment start: first half of a 20-byte message.
+            pusher.push_fragment_start(0, b"0123456789", false, 0, 20);
+            // Fragment continuation: second half.
+            pusher.push_fragment_cont(10, b"ABCDEFGHIJ", false, 0);
+        }
+        .primary()
+        .spawn();
+
+        async move {
+            let mut buf = BytesMut::with_capacity(64);
+            let n = reader.read_message(&mut buf).await.expect("read_message failed");
+            assert_eq!(n, 20);
+            assert_eq!(&buf[..], b"0123456789ABCDEFGHIJ");
+        }
+        .primary()
+        .spawn();
+    });
+}
+
+/// Two consecutive messages delivered in order.
+#[test]
+fn read_message_two_messages() {
+    sim(|| {
+        let (mut reader, mut pusher) = make_pair();
+
+        async move {
+            pusher.push_fragment_start(0, b"msg1", false, 0, 4);
+            pusher.push_fragment_start(4, b"message2", false, 1, 8);
+        }
+        .primary()
+        .spawn();
+
+        async move {
+            let mut buf1 = BytesMut::with_capacity(64);
+            let n1 = reader.read_message(&mut buf1).await.expect("read_message 1 failed");
+            assert_eq!(n1, 4);
+            assert_eq!(&buf1[..], b"msg1");
+
+            let mut buf2 = BytesMut::with_capacity(64);
+            let n2 = reader.read_message(&mut buf2).await.expect("read_message 2 failed");
+            assert_eq!(n2, 8);
+            assert_eq!(&buf2[..], b"message2");
         }
         .primary()
         .spawn();

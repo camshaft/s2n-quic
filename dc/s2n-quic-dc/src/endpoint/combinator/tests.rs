@@ -582,6 +582,7 @@ fn frame_batch_tracks_byte_costs_per_priority() {
             offset: VarInt::ZERO,
             is_fin: false,
             dest_acceptor_id: None,
+            fragment: None,
         },
     );
     let data_cost = data.byte_cost();

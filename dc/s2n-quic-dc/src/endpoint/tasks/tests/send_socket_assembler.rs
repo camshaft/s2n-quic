@@ -499,6 +499,7 @@ fn cancelled_frame_emitted_when_completion_is_cancelled() {
                             offset: VarInt::ZERO,
                             is_fin: false,
                             dest_acceptor_id: None,
+                            fragment: None,
                         },
                         source_sender_id: crate::endpoint::id::LocalSenderId::new(VarInt::MAX),
                         payload: Default::default(),

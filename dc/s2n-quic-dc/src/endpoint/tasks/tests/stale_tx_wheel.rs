@@ -59,6 +59,7 @@ fn inflight_frame(pse: &std::sync::Arc<crate::path::secret::map::Entry>) -> Entr
             offset: VarInt::ZERO,
             is_fin: false,
             dest_acceptor_id: None,
+            fragment: None,
         },
         source_sender_id: crate::endpoint::id::LocalSenderId::new(VarInt::MAX),
         payload: bytes::BytesMut::zeroed(100).into(),

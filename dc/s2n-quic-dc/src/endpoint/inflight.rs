@@ -373,6 +373,7 @@ mod tests {
                 offset: VarInt::ZERO,
                 is_fin: false,
                 dest_acceptor_id: None,
+                fragment: None,
             },
             source_sender_id: LocalSenderId::UNSPECIFIED,
             payload,

@@ -10,12 +10,28 @@ use core::time::Duration;
 use s2n_quic_core::varint::VarInt;
 use std::sync::Arc;
 
+/// Fragment metadata carried in a stream data message.
+///
+/// This mirrors [`crate::endpoint::frame::Fragment`] but lives in the
+/// application-level message layer so the reader can track pending fragments
+/// without referencing the frame header types directly.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Fragment {
+    /// Fragment identifier — monotonically assigned by the writer per message.
+    pub id: VarInt,
+    /// Total byte count for this message. `Some` only in the first message for
+    /// this `id`; `None` in all continuation messages.
+    pub total_size: Option<VarInt>,
+}
+
 pub enum Stream {
     FlowValidated,
     Data {
         offset: VarInt,
         fin: bool,
         payload: BytesMut,
+        /// Optional message-fragment metadata. `None` for plain stream data.
+        fragment: Option<Fragment>,
     },
     Reset {
         error_code: VarInt,

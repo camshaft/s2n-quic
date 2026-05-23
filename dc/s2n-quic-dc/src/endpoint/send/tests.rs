@@ -55,6 +55,7 @@ fn make_frame(payload_len: usize) -> crate::intrusive::Entry<Frame> {
             offset: s2n_quic_core::varint::VarInt::ZERO,
             is_fin: false,
             dest_acceptor_id: None,
+            fragment: None,
         },
         source_sender_id: crate::endpoint::id::LocalSenderId::new(
             s2n_quic_core::varint::VarInt::MAX,

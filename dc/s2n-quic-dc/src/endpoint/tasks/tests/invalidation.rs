@@ -68,6 +68,7 @@ fn test_frame(pse: &Arc<crate::path::secret::map::Entry>) -> Entry<Frame> {
             offset: VarInt::ZERO,
             is_fin: false,
             dest_acceptor_id: None,
+            fragment: None,
         },
         source_sender_id: LocalSenderId::new(VarInt::from_u8(0)),
         payload: Default::default(),

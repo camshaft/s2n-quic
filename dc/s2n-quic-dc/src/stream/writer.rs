@@ -71,8 +71,8 @@ use crate::{
     endpoint::{
         error::{self, Error},
         frame::{
-            self, FailureReason, Frame, Header, HomogeneousBatch, Priority, SubmissionSender,
-            TransmissionStatus, DEFAULT_TTL, MAX_QUEUE_DATA_HEADER_OVERHEAD,
+            self, FailureReason, Fragment, Frame, Header, HomogeneousBatch, Priority,
+            SubmissionSender, TransmissionStatus, DEFAULT_TTL, MAX_QUEUE_DATA_HEADER_OVERHEAD,
         },
         id::LocalSenderId,
         msg,
@@ -167,6 +167,9 @@ struct Inner {
     status: Status,
     /// Reset error code if the stream was reset by the peer
     reset_error_code: Option<VarInt>,
+    /// Monotonically increasing ID assigned to each message written via
+    /// [`Writer::write_message`]. Incremented after each complete message.
+    next_fragment_id: VarInt,
     /// Cooperative yield budget
     coop: Coop,
 }
@@ -229,6 +232,7 @@ impl Writer {
             remote_max_data,
             status: Status::Init,
             reset_error_code: None,
+            next_fragment_id: VarInt::ZERO,
             coop: Coop::default(),
         }))
     }
@@ -262,6 +266,7 @@ impl Writer {
             remote_max_data: initial_remote_max_data,
             status: Status::Open,
             reset_error_code: None,
+            next_fragment_id: VarInt::ZERO,
             coop: Coop::default(),
         }))
     }
@@ -370,6 +375,74 @@ impl Writer {
     #[inline]
     pub fn peer_addr(&self) -> SocketAddr {
         *self.0.path_secret_entry.peer()
+    }
+
+    /// Writes a complete message (fragment) into the stream.
+    ///
+    /// The entire contents of `buf` at call time are treated as one atomic
+    /// message. The receiver will buffer all chunks and only deliver the full
+    /// message to the application once every byte has arrived, regardless of
+    /// how many transport frames it required.
+    ///
+    /// This is the counterpart to [`Reader::read_message`].
+    ///
+    /// # Semantics
+    ///
+    /// - The message is sent as one or more `QueueData` frames, each tagged
+    ///   with the same fragment id. The first frame also carries the total
+    ///   message size so the receiver can pre-allocate.
+    /// - Flow-control and inflight limits apply exactly as for
+    ///   [`write_from`](Self::write_from). Progress may be limited by the
+    ///   peer's `MAX_DATA` credit or the local inflight budget.
+    ///
+    /// # Footguns
+    ///
+    /// - `buf.buffered_len()` at the time of the call is taken as the total
+    ///   message size. The caller must ensure the full message is in `buf`
+    ///   before calling.
+    /// - The message size must fit in a `VarInt`; otherwise an
+    ///   `InvalidInput` error is returned.
+    /// - Mixing `write_message` and `write_from` on the same stream produces
+    ///   a stream that the peer cannot decode with `read_message`; use one
+    ///   or the other consistently.
+    pub async fn write_message<S>(&mut self, buf: &mut S) -> io::Result<usize>
+    where
+        S: buffer::reader::storage::Infallible,
+    {
+        let total_size = buf.buffered_len();
+        if total_size == 0 {
+            return Ok(0);
+        }
+        let total_size_varint = VarInt::new(total_size as u64)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "message too large"))?;
+
+        // Assign the fragment id upfront; it remains fixed for all frames of
+        // this message. Increment it only once the full message is queued.
+        let fragment_id = self.0.next_fragment_id;
+        let mut is_first_chunk = true;
+        let mut written = 0;
+
+        while !buf.buffer_is_empty() {
+            let n = core::future::poll_fn(|cx| {
+                self.0.poll_write_fragment_chunk(
+                    cx,
+                    buf,
+                    fragment_id,
+                    total_size_varint,
+                    &mut is_first_chunk,
+                )
+            })
+            .await?;
+            written += n;
+        }
+
+        self.0.next_fragment_id = self
+            .0
+            .next_fragment_id
+            .checked_add_usize(1)
+            .unwrap_or(VarInt::ZERO);
+
+        Ok(written)
     }
 
     /// Poll-based form of [`write_from`](Self::write_from) and
@@ -488,7 +561,145 @@ impl Inner {
         Poll::Ready(Ok(written))
     }
 
-    /// Checks the control queue for a pending reset that was never polled.
+    /// Sends one MTU-sized chunk from `buf` as part of fragment `fragment_id`.
+    ///
+    /// On the first call for a fragment, `*is_first_chunk` must be `true` so
+    /// that `total_size` is included in the frame header.  The caller is
+    /// responsible for setting `*is_first_chunk = false` after the first chunk
+    /// and for incrementing `next_fragment_id` once the full message is sent.
+    fn poll_write_fragment_chunk<S>(
+        &mut self,
+        cx: &mut Context,
+        buf: &mut S,
+        fragment_id: VarInt,
+        total_size: VarInt,
+        is_first_chunk: &mut bool,
+    ) -> Poll<io::Result<usize>>
+    where
+        S: buffer::reader::storage::Infallible,
+    {
+        waker::debug_assert_contract(cx, |cx| {
+            coop::poll(self, cx, |this, cx| {
+                this.poll_write_fragment_chunk_inner(
+                    cx,
+                    buf,
+                    fragment_id,
+                    total_size,
+                    is_first_chunk,
+                )
+            })
+        })
+    }
+
+    #[inline(always)]
+    fn poll_write_fragment_chunk_inner<S>(
+        &mut self,
+        cx: &mut Context,
+        buf: &mut S,
+        fragment_id: VarInt,
+        total_size: VarInt,
+        is_first_chunk: &mut bool,
+    ) -> Poll<io::Result<usize>>
+    where
+        S: buffer::reader::storage::Infallible,
+    {
+        if self.status.is_shutdown() {
+            if let Some(error_code) = self.reset_error_code {
+                let reset_error: Error = error_code.into();
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::ConnectionReset,
+                    reset_error,
+                )));
+            }
+            return Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()));
+        }
+
+        if self.status.is_fin_sent() {
+            return Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()));
+        }
+
+        self.poll_completions(cx)?;
+        let _ = self.poll_remote_budget(cx)?;
+
+        // Ensure the queue binding has been established.
+        if self.status.is_init() {
+            let empty = &mut buffer::reader::storage::Empty;
+            let (_, _) = self.send_queue_data_init(empty, false)?;
+            if self.status.is_init() {
+                return Poll::Pending;
+            }
+        }
+
+        let available = self.min_send_budget();
+        if available == 0 {
+            return Poll::Pending;
+        }
+
+        let remaining_offset_capacity = self.remaining_offset_capacity();
+        if remaining_offset_capacity == 0 {
+            return Poll::Ready(Err(offset_overflow_error()));
+        }
+
+        let mtu = self.packet_size as usize;
+        let chunk_len = mtu
+            .min(buf.buffered_len())
+            .min(available as usize)
+            .min(remaining_offset_capacity);
+
+        let mut payload = ByteVec::new();
+        {
+            let mut writer = payload.with_write_limit(chunk_len);
+            buf.infallible_copy_into(&mut writer);
+        }
+
+        let payload_len = payload.len();
+        let offset = self.next_offset;
+
+        let fragment = Some(Fragment {
+            id: fragment_id,
+            total_size: if *is_first_chunk {
+                Some(total_size)
+            } else {
+                None
+            },
+        });
+        *is_first_chunk = false;
+
+        trace!(
+            binding_id = self.binding_id.as_u64(),
+            fragment_id = fragment_id.as_u64(),
+            total_size = total_size.as_u64(),
+            offset = offset.as_u64(),
+            payload_len,
+            "Sending fragment chunk"
+        );
+
+        let frame = Frame {
+            source_sender_id: LocalSenderId::UNSPECIFIED,
+            header: Header::QueueData {
+                queue_pair: self.queue_pair,
+                binding_id: self.binding_id,
+                offset,
+                is_fin: false,
+                dest_acceptor_id: None,
+                fragment,
+            },
+            payload,
+            path_secret_entry: self.path_secret_entry.clone(),
+            completion: Some(self.completion_rx.sender()),
+            status: frame::TransmissionStatus::default(),
+            ttl: DEFAULT_TTL,
+            transmission_time: None,
+        };
+
+        let mut frames = Queue::new();
+        frames.push_back(frame.into());
+        self.send_batch(frames)?;
+        self.advance_offset(payload_len)?;
+
+        Poll::Ready(Ok(payload_len))
+    }
+
     ///
     /// If the peer was declared dead (idle timeout), the queue contains a Reset
     /// we never consumed. Transitioning to shutdown here prevents the drop path
@@ -569,6 +780,7 @@ impl Inner {
                     offset: self.next_offset,
                     is_fin: true,
                     dest_acceptor_id: None,
+                    fragment: None,
                 },
                 payload: ByteVec::new(),
                 path_secret_entry: self.path_secret_entry.clone(),
@@ -782,6 +994,7 @@ impl Inner {
                 offset: VarInt::ZERO,
                 is_fin: actual_fin,
                 dest_acceptor_id: Some(self.acceptor_id),
+                fragment: None,
             },
             payload,
             path_secret_entry: self.path_secret_entry.clone(),
@@ -914,6 +1127,7 @@ impl Inner {
                     offset,
                     is_fin: include_fin,
                     dest_acceptor_id: None,
+                    fragment: None,
                 },
                 payload,
                 path_secret_entry: self.path_secret_entry.clone(),
