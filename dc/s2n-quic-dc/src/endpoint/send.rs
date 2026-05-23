@@ -744,25 +744,32 @@ impl Context {
             "probe_state is Requested but nothing to probe with"
         );
 
-        let needs_urgent = self.has_pending_acks() || self.pto.probe_state.is_requested();
+        let has_pending_acks = self.has_pending_acks();
+        let has_sendable_data = self.has_pending_data() && self.can_send_pending_frames();
+        let needs_urgent = self.pto.probe_state.is_requested();
 
-        // Urgent work (ACK to send or PTO probe) always routes to the immediate
-        // queue to bypass EDT pacing. This avoids putting ACKs in the "slow lane"
-        // behind the tx_wheel, regardless of whether the context is already
-        // tx-scheduled.
+        // PTO probes must bypass EDT pacing and go straight to the immediate queue.
+        // Pending ACKs are routed through the tx_wheel at `now` so send-side data
+        // already queued for the same context can be folded into the same packet.
         let immediate = needs_urgent && !self.is_immediate_scheduled();
 
         let transmission =
             if
-            // Check we have queued data packets and we're not already linked
-            !self.is_tx_scheduled() && self.has_pending_data() && self.can_send_pending_frames()
+            // Schedule when there is either sendable data or pending ACK work and
+            // we're not already linked on the tx wheel.
+            !self.is_tx_scheduled() && (has_sendable_data || has_pending_acks)
             {
-                // Non-urgent pending data follows CCA pacing via the tx_wheel.
-                let target = self
-                    .cca
-                    .earliest_departure_time()
-                    .map(precision::Timestamp::from);
-                // If target time is `None` then the wheel will schedule it immediately
+                let target = if has_pending_acks {
+                    // ACK path: bypass pacing while still allowing coalescing with
+                    // same-context data that may arrive shortly after decode.
+                    Some(clock.now() + Duration::from_micros(300))
+                } else {
+                    // Data-only path: follow CCA pacing.
+                    self.cca
+                        .earliest_departure_time()
+                        .map(precision::Timestamp::from)
+                };
+                // If target time is `None` then the wheel schedules immediately.
                 self.tx_wheel.target_time = target;
                 true
             } else {

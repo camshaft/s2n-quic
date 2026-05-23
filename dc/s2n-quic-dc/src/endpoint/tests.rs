@@ -193,7 +193,7 @@ fn multistream_small_writes_fit_in_three_packets() {
                 let server_to_client_packets = server_to_client_packets.clone();
                 bach::net::monitor::on_packet_sent(move |packet| {
                     total_packets.fetch_add(1, Ordering::Relaxed);
-                    if packet.source().port() == SERVER_PORT {
+                    if packet.source().ip() == std::net::IpAddr::from([10, 0, 0, 1u8]) {
                         server_to_client_packets.fetch_add(1, Ordering::Relaxed);
                     } else {
                         client_to_server_packets.fetch_add(1, Ordering::Relaxed);
@@ -208,33 +208,43 @@ fn multistream_small_writes_fit_in_three_packets() {
                 let mut acceptor = server
                     .register_acceptor_channel(acceptor_id, STREAM_COUNT * 2)
                     .expect("acceptor registration failed");
+                let responses_sent = Arc::new(AtomicUsize::new(0));
 
-                let mut streams = Vec::with_capacity(STREAM_COUNT);
                 for _ in 0..STREAM_COUNT {
                     let pending = timeout(Duration::from_secs(1), acceptor.recv())
                         .await
                         .expect("server accept timed out")
                         .expect("server should receive stream");
-                    let mut stream = pending.validate().await.expect("server validate");
+                    let responses_sent = responses_sent.clone();
+                    async move {
+                        let mut stream = pending.validate().await.expect("server validate");
 
-                    let mut req = Vec::new();
-                    loop {
-                        let n = stream.read_into(&mut req).await.expect("server read");
-                        if n == 0 {
-                            break;
+                        let mut req: Vec<u8> = Vec::new();
+                        loop {
+                            let n = stream.read_into(&mut req).await.expect("server read");
+                            if n == 0 {
+                                break;
+                            }
                         }
+                        assert_eq!(req.len(), 1, "expected one-byte request");
+                        let id = req[0];
+                        let response = [id, id ^ 0xff];
+                        stream
+                            .write_all_from_fin(&mut &response[..])
+                            .await
+                            .expect("server write");
+                        responses_sent.fetch_add(1, Ordering::Relaxed);
                     }
-                    assert_eq!(req.len(), 1, "expected one-byte request");
-                    streams.push((req[0], stream));
+                    .spawn();
                 }
 
-                for (id, mut stream) in streams {
-                    let response = [id, id ^ 0xff];
-                    stream
-                        .write_all_from_fin(&mut &response[..])
-                        .await
-                        .expect("server write");
-                }
+                timeout(Duration::from_secs(1), async {
+                    while responses_sent.load(Ordering::Relaxed) < STREAM_COUNT {
+                        bach::time::sleep(Duration::from_micros(1)).await;
+                    }
+                })
+                .await
+                .expect("server responses timed out");
             }
             .group("server")
             .spawn();
@@ -262,7 +272,7 @@ fn multistream_small_writes_fit_in_three_packets() {
                 }
 
                 for (id, stream) in streams.iter_mut() {
-                    let mut response = Vec::with_capacity(2);
+                    let mut response: Vec<u8> = Vec::with_capacity(2);
                     loop {
                         let n = stream.read_into(&mut response).await.expect("client read");
                         if n == 0 {
@@ -275,6 +285,9 @@ fn multistream_small_writes_fit_in_three_packets() {
                         "unexpected response payload"
                     );
                 }
+
+                // Allow the final ACK for the server response packet to be emitted.
+                bach::time::sleep(Duration::from_micros(900)).await;
             }
             .group("client")
             .primary()
