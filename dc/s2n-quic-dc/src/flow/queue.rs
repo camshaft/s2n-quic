@@ -206,6 +206,19 @@ where
         self.pool.alloc_or_grow(key, remote_queue_id)
     }
 
+    /// Allocate a specific slot by index, growing pages as needed.
+    ///
+    /// Used by the server to allocate at the exact `dest_queue_id` the client specified.
+    #[inline]
+    pub fn alloc_at_or_grow(
+        &mut self,
+        slot_index: usize,
+        key: K,
+        remote_queue_id: Option<VarInt>,
+    ) -> (Control<S, C, K>, Stream<S, C, K>) {
+        self.pool.alloc_at_or_grow(slot_index, key, remote_queue_id)
+    }
+
     /// Drain freed slots that have been released since the last call.
     ///
     /// Returns freed slot entries representing queue slots whose both stream and

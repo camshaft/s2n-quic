@@ -81,6 +81,46 @@ impl<S: 'static, C: 'static, Key: 'static> FreeVec<S, C, Key> {
         }
     }
 
+    /// Allocate a specific slot by index, removing it from the free list.
+    ///
+    /// Returns `Err(key)` if the slot is not in the free list (already allocated or not grown yet).
+    #[inline]
+    pub fn alloc_at(
+        &self,
+        slot_index: usize,
+        key: Key,
+        remote_queue_id: Option<VarInt>,
+    ) -> Result<(Control<S, C, Key>, Stream<S, C, Key>), Key> {
+        let mut inner = self.inner.lock().unwrap();
+
+        let pos = inner
+            .descriptors
+            .iter()
+            .position(|d| unsafe { d.queue_id_index() } == slot_index);
+
+        let Some(pos) = pos else {
+            return Err(key);
+        };
+
+        let descriptor = inner.descriptors.remove(pos).unwrap();
+
+        #[cfg(debug_assertions)]
+        assert!(
+            inner.active.insert(descriptor.as_usize()),
+            "{} already in {:?}",
+            descriptor.as_usize(),
+            inner.active
+        );
+
+        drop(inner);
+
+        unsafe {
+            descriptor.init_key(key);
+            let (control, stream) = descriptor.into_receiver_pair(remote_queue_id);
+            Ok((Control::new(control), Stream::new(stream)))
+        }
+    }
+
     #[inline]
     pub fn record_region(
         &self,

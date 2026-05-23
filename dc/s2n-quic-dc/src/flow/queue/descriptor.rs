@@ -115,6 +115,16 @@ impl<S: 'static, C: 'static, Key: 'static> Descriptor<S, C, Key> {
         self.ptr.as_ptr().addr()
     }
 
+    /// Returns the slot index (id field) of this descriptor.
+    ///
+    /// # Safety
+    ///
+    /// The descriptor memory must be valid (initialized during pool grow).
+    #[inline]
+    pub(super) unsafe fn queue_id_index(&self) -> usize {
+        self.inner().id.as_u64() as usize
+    }
+
     /// # Safety
     ///
     /// The caller needs to guarantee the [`Descriptor`] is still allocated.
