@@ -24,7 +24,9 @@ pub struct Pool<
     epoch_summary: Option<counter::Summary>,
     epoch: usize,
     /// Optional sink for freed-slot notifications (server-side QueueFree emission).
-    pub(super) free_notify: Option<Arc<std::sync::Mutex<Vec<super::descriptor::FreedSlot>>>>,
+    pub(super) free_notify: Option<Arc<super::descriptor::FreeNotify>>,
+    /// Optional deferred waker sink, shared by all descriptors in this pool.
+    pub(super) waker_sink: Option<Arc<dyn super::descriptor::WakerSink>>,
 }
 
 impl<S: 'static + Send, C: 'static + Send, Key: 'static + Send, const INITIAL_PAGE_SIZE: usize>
@@ -39,6 +41,7 @@ impl<S: 'static + Send, C: 'static + Send, Key: 'static + Send, const INITIAL_PA
             epoch_summary: self.epoch_summary.clone(),
             epoch: self.epoch,
             free_notify: self.free_notify.clone(),
+            waker_sink: self.waker_sink.clone(),
         }
     }
 }
@@ -51,13 +54,30 @@ where
 {
     #[inline]
     pub fn new(epoch_summary: Option<counter::Summary>) -> Self {
-        Self::with_free_notify(epoch_summary, Some(Arc::new(std::sync::Mutex::new(Vec::new()))))
+        Self::with_options(
+            epoch_summary,
+            Some(Arc::new(super::descriptor::FreeNotify::new())),
+            None,
+        )
     }
 
     #[inline]
-    fn with_free_notify(
+    pub fn new_with_waker_sink(
         epoch_summary: Option<counter::Summary>,
-        free_notify: Option<Arc<std::sync::Mutex<Vec<super::descriptor::FreedSlot>>>>,
+        waker_sink: Arc<dyn super::descriptor::WakerSink>,
+    ) -> Self {
+        Self::with_options(
+            epoch_summary,
+            Some(Arc::new(super::descriptor::FreeNotify::new())),
+            Some(waker_sink),
+        )
+    }
+
+    #[inline]
+    fn with_options(
+        epoch_summary: Option<counter::Summary>,
+        free_notify: Option<Arc<super::descriptor::FreeNotify>>,
+        waker_sink: Option<Arc<dyn super::descriptor::WakerSink>>,
     ) -> Self {
         let epoch = 0;
         let senders = sender::State::new(epoch);
@@ -69,6 +89,7 @@ where
             epoch_summary,
             epoch,
             free_notify,
+            waker_sink,
         };
         pool.grow();
         pool
@@ -171,6 +192,7 @@ where
                     self.epoch + idx,
                     free_list,
                     self.free_notify.clone(),
+                    self.waker_sink.clone(),
                 ));
 
                 let descriptor = NonNull::new_unchecked(descriptor);

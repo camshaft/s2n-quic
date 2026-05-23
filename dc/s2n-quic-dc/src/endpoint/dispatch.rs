@@ -608,41 +608,6 @@ fn handle_queue_data(
     }
 }
 
-fn create_binding(
-    peer: &mut recv::Context,
-    queue_pair: QueuePair,
-    acceptor_id: VarInt,
-    binding_id: VarInt,
-    is_fin: bool,
-    acceptor_registry: &mut acceptor::LocalRegistry<PendingValidation>,
-    frame_tx: &SubmissionSender,
-    counters: &counters::Dispatch,
-    response_frames: &mut PriorityInput,
-    waker_sink: &mut impl channel::UnboundedSender<AutoWake>,
-) {
-    let peer_queue_id = queue_pair.source_queue_id;
-    let local_queue_id = queue_pair.dest_queue_id;
-
-    let handle = flow::Handle::new(binding_id);
-    let (queue_control, queue_stream) = peer
-        .queue_dispatcher
-        .alloc_at_or_grow(local_queue_id.as_u64() as usize, handle, Some(peer_queue_id));
-
-    create_binding_with_queues(
-        peer,
-        queue_pair,
-        acceptor_id,
-        binding_id,
-        is_fin,
-        queue_control,
-        queue_stream,
-        acceptor_registry,
-        frame_tx,
-        counters,
-        response_frames,
-        waker_sink,
-    );
-}
 
 fn create_binding_with_queues(
     peer: &mut recv::Context,
@@ -697,6 +662,7 @@ fn create_binding_with_queues(
             );
         }
         acceptor::SendResult::NotFound => {
+            counters.rx_init_no_acceptor.add(1);
             debug!(
                 binding_id = binding_id.as_u64(),
                 acceptor_id = acceptor_id.as_u64(),
@@ -714,6 +680,7 @@ fn create_binding_with_queues(
         acceptor::SendResult::Closed(mut stream, cleanup_waker) => {
             stream.disable();
             let _ = waker_sink.send(cleanup_waker);
+            counters.rx_init_acceptor_closed.add(1);
             debug!(
                 binding_id = binding_id.as_u64(),
                 acceptor_id = acceptor_id.as_u64(),
@@ -730,6 +697,7 @@ fn create_binding_with_queues(
         }
         acceptor::SendResult::NoSlots(mut stream) => {
             stream.disable();
+            counters.rx_init_acceptor_no_slots.add(1);
             debug!(
                 binding_id = binding_id.as_u64(),
                 acceptor_id = acceptor_id.as_u64(),
