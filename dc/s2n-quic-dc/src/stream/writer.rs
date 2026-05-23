@@ -469,7 +469,7 @@ impl Inner {
         let _ = self.poll_remote_budget(cx)?;
 
         if self.status.is_init() {
-            let (written, is_fin) = self.send_queue_bind_with_early_data(buf, is_fin)?;
+            let (written, is_fin) = self.send_queue_data_init(buf, is_fin)?;
 
             if written > 0 || is_fin {
                 return Poll::Ready(Ok(written));
@@ -559,7 +559,7 @@ impl Inner {
 
     fn send_fin_packet(&mut self) -> io::Result<()> {
         if self.status.is_init() {
-            self.send_queue_bind_with_early_data(&mut buffer::reader::storage::Empty, true)?;
+            self.send_queue_data_init(&mut buffer::reader::storage::Empty, true)?;
         } else if self.status.is_open() {
             let frame = Frame {
                 source_sender_id: LocalSenderId::UNSPECIFIED,
@@ -568,6 +568,7 @@ impl Inner {
                     binding_id: self.binding_id,
                     offset: self.next_offset,
                     is_fin: true,
+                    dest_acceptor_id: None,
                 },
                 payload: ByteVec::new(),
                 path_secret_entry: self.path_secret_entry.clone(),
@@ -763,7 +764,7 @@ impl Inner {
         Ok(())
     }
 
-    fn send_queue_bind_with_early_data<S>(
+    fn send_queue_data_init<S>(
         &mut self,
         buf: &mut S,
         is_fin: bool,
@@ -775,11 +776,12 @@ impl Inner {
 
         let frame = Frame {
             source_sender_id: LocalSenderId::UNSPECIFIED,
-            header: Header::QueueBind {
+            header: Header::QueueData {
                 queue_pair: self.queue_pair,
-                dest_acceptor_id: self.acceptor_id,
                 binding_id: self.binding_id,
+                offset: VarInt::ZERO,
                 is_fin: actual_fin,
+                dest_acceptor_id: Some(self.acceptor_id),
             },
             payload,
             path_secret_entry: self.path_secret_entry.clone(),
@@ -801,7 +803,7 @@ impl Inner {
             binding_id = self.binding_id.as_u64(),
             bytes_read,
             is_fin = actual_fin,
-            "Sent QueueBind with early data"
+            "Sent QueueData init with early data"
         );
 
         Ok((bytes_read, actual_fin))
@@ -911,6 +913,7 @@ impl Inner {
                     binding_id: self.binding_id,
                     offset,
                     is_fin: include_fin,
+                    dest_acceptor_id: None,
                 },
                 payload,
                 path_secret_entry: self.path_secret_entry.clone(),

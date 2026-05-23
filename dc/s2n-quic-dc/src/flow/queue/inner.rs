@@ -188,6 +188,46 @@ impl<T> Queue<T> {
         Ok(waker)
     }
 
+    /// Push an entry, returning both the waker and an additional value from the validate closure.
+    ///
+    /// Like `push`, but the validate closure returns `Result<V, ValidationError>` where `V` is
+    /// an additional value the caller needs (e.g., whether a new binding was created).
+    #[inline]
+    pub fn push_with_result<F, V, O>(
+        &self,
+        entry: intrusive::Entry<T>,
+        observe: O,
+        validate: F,
+    ) -> Result<(AutoWake, V), Error<intrusive::Entry<T>>>
+    where
+        F: FnOnce() -> Result<V, super::descriptor::ValidationError>,
+        O: FnOnce() -> bool,
+    {
+        let mut inner = self.lock()?;
+        ensure!(
+            inner.flags.contains(Flags::IS_OPEN),
+            Err(Error::PermanentlyClosed)
+        );
+        ensure!(
+            inner.flags.contains(Flags::HAS_RECEIVER),
+            Err(Error::HalfClosed(entry))
+        );
+        let result = match validate() {
+            Ok(v) => v,
+            Err(reason) => return Err(Error::ValidationFailed(entry, reason)),
+        };
+
+        if !inner.flags.contains(Flags::HAS_OBSERVED) && observe() {
+            inner.flags.insert(Flags::HAS_OBSERVED);
+        }
+
+        inner.queue.push_back(entry);
+        let waker = inner.take_waker();
+        drop(inner);
+
+        Ok((waker, result))
+    }
+
     #[inline]
     pub fn pop(&self) -> Result<Option<intrusive::Entry<T>>, Closed> {
         let mut inner = self.lock()?;

@@ -28,7 +28,7 @@ use crate::{
         pool::{self, descriptor::Segments},
     },
     time::precision,
-    tracing::trace,
+    tracing::*,
 };
 use s2n_codec::{Encoder, EncoderBuffer, EncoderValue};
 use s2n_quic_core::{
@@ -689,22 +689,14 @@ fn encode_segment<S: seal::Application>(
 
 fn encode_frame_metadata(
     frames: &mut Queue<Frame>,
-    source_sender_id: LocalSenderId,
+    _source_sender_id: LocalSenderId,
     header_buf: &mut Vec<u8>,
 ) -> usize {
     header_buf.clear();
     let mut total_payload_len = 0usize;
 
     for frame in frames.iter_mut() {
-        if let frame::Header::QueueBind { binding_id, .. } = &frame.header {
-            trace!(
-                binding_id = binding_id.as_u64(),
-                %source_sender_id,
-                "encode_frame_metadata: encoding QueueBind"
-            );
-        }
         push_frame_metadata(header_buf, &frame.header, frame.payload_len());
-
         total_payload_len += frame.payload_len();
     }
 

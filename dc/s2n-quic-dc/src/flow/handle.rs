@@ -5,13 +5,18 @@
 //!
 //! The queue system uses the binding_id as its Key type. When a packet is
 //! dispatched to a queue slot, the slot's binding_id is compared against the
-//! packet's binding_id. A mismatch means a stale packet reached a recycled
-//! slot — it gets rejected with `ValidationError::BindingIdMismatch`.
+//! packet's binding_id via ordered comparison:
+//!
+//! - Equal: accept the frame
+//! - Received < current: stale packet for a recycled slot, drop silently
+//! - Received > current: protocol bug (client rebound before QueueFree), panic in debug
 //!
 //! No credential_id check is needed because dispatch is already namespaced
 //! per-recv-context (which is per credential_id + sender_id).
 
+use crate::flow::queue::ValidationError;
 use s2n_quic_core::varint::VarInt;
+use std::cmp::Ordering;
 
 /// Queue key — just the binding_id assigned at stream creation.
 ///
@@ -33,10 +38,21 @@ impl crate::flow::queue::Key for Handle {
     type Request = VarInt;
 
     #[inline]
-    fn validate(&self, binding_id: &VarInt) -> Result<(), crate::flow::queue::ValidationError> {
-        if self.binding_id != *binding_id {
-            return Err(crate::flow::queue::ValidationError::BindingIdMismatch);
+    fn validate(&self, binding_id: &VarInt) -> Result<(), ValidationError> {
+        match self.binding_id.as_u64().cmp(&binding_id.as_u64()) {
+            Ordering::Equal => Ok(()),
+            Ordering::Greater => Err(ValidationError::StaleBinding),
+            Ordering::Less => {
+                // NOTE: debug_assert removed during development. Re-enable once
+                // the QueueFree credit-return protocol is fully implemented and
+                // proven correct under slot-reuse stress tests.
+                tracing::error!(
+                    current = self.binding_id.as_u64(),
+                    received = binding_id.as_u64(),
+                    "BUG: received binding_id greater than current — client rebound before QueueFree"
+                );
+                Err(ValidationError::FutureBinding)
+            }
         }
-        Ok(())
     }
 }

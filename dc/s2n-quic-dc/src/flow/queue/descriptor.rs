@@ -39,17 +39,21 @@ pub struct FreedSlot {
 /// Indicates why a queue key validation failed
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ValidationError {
-    /// The binding_id in the packet doesn't match the queue slot's binding_id.
-    /// This means a stale packet was routed to a recycled slot.
-    BindingIdMismatch,
+    /// The received binding_id is older than the current slot binding.
+    /// This is a stale packet routed to a recycled slot — drop silently.
+    StaleBinding,
+    /// The received binding_id is newer than the current slot binding.
+    /// This indicates a protocol bug: the client rebound before receiving QueueFree.
+    FutureBinding,
 }
 
 impl ValidationError {
-    /// Returns the reset error code to send to the peer.
-    pub fn as_reset_code(self) -> VarInt {
+    /// Returns the reset error code to send to the peer, if any.
+    pub fn as_reset_code(self) -> Option<VarInt> {
         use crate::stream::endpoint::error;
         match self {
-            Self::BindingIdMismatch => error::BINDING_ID_MISMATCH,
+            Self::StaleBinding => None,
+            Self::FutureBinding => Some(error::BINDING_ID_MISMATCH),
         }
     }
 }
@@ -62,7 +66,7 @@ impl Key for crate::credentials::Credentials {
         if self == params {
             Ok(())
         } else {
-            Err(ValidationError::BindingIdMismatch)
+            Err(ValidationError::StaleBinding)
         }
     }
 }
@@ -322,6 +326,45 @@ impl<S: 'static, C: 'static, Key: 'static> Descriptor<S, C, Key> {
             .expect("queue key should be initialized while allocated");
         key.validate(params)
     }
+
+    /// Server-side validation: check key and bind atomically if unbound.
+    ///
+    /// Returns:
+    /// - `Ok(ServerValidation::Bound)` if the key matches (existing binding)
+    /// - `Ok(ServerValidation::NewBinding)` if the key was None and has been set
+    /// - `Err(ValidationError)` if the key exists but doesn't match
+    ///
+    /// # Safety
+    ///
+    /// The caller needs to guarantee the [`Descriptor`] is still allocated and key
+    /// access is synchronized by the queue mutex from the push path.
+    #[inline]
+    pub unsafe fn validate_or_bind(
+        &self,
+        params: &<Key as super::descriptor::Key>::Request,
+        new_key: impl FnOnce() -> Key,
+    ) -> Result<ServerValidation, ValidationError>
+    where
+        Key: super::descriptor::Key,
+    {
+        let inner = self.inner();
+        match (*inner.key.get()).as_ref() {
+            Some(key) => key.validate(params).map(|()| ServerValidation::Bound),
+            None => {
+                *inner.key.get() = Some(new_key());
+                Ok(ServerValidation::NewBinding)
+            }
+        }
+    }
+}
+
+/// Result of server-side validation
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ServerValidation {
+    /// Key matched an existing binding
+    Bound,
+    /// Queue was unbound; key has been set (new binding created)
+    NewBinding,
 }
 
 unsafe impl<S: Send, C: Send, Key: Send> Send for Descriptor<S, C, Key> {}

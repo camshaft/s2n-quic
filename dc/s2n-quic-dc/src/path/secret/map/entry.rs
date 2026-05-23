@@ -20,7 +20,6 @@ use s2n_codec::EncoderBuffer;
 use s2n_quic_core::{dc, recovery::bandwidth::Bandwidth, time::Timestamp, varint::VarInt};
 use std::{
     any::Any,
-    collections::VecDeque,
     net::SocketAddr,
     sync::{
         atomic::{AtomicI64, AtomicU16, AtomicU32, AtomicU64, AtomicU8, Ordering},
@@ -28,7 +27,6 @@ use std::{
     },
     time::Duration,
 };
-use tokio::sync::Notify;
 
 #[cfg(test)]
 mod tests;
@@ -86,8 +84,7 @@ pub struct Entry {
     /// allocate from and dispatch to this pool via their own Dispatch handles.
     // TODO: replace Mutex with a lock-free grow strategy
     queue_allocator: std::sync::Mutex<crate::endpoint::msg::queue::Allocator>,
-    peer_queue_state: std::sync::Mutex<PeerQueueState>,
-    peer_queue_notify: Notify,
+    peer_free_list: Arc<crate::sync::free_list::FreeList>,
 }
 
 impl SizeOf for Entry {
@@ -108,8 +105,7 @@ impl SizeOf for Entry {
             sender_load_scores,
             next_binding_id,
             queue_allocator: _,
-            peer_queue_state: _,
-            peer_queue_notify: _,
+            peer_free_list: _,
         } = self;
         creation_time.size()
             + peer.size()
@@ -132,12 +128,6 @@ impl SizeOf for Entry {
     }
 }
 
-#[derive(Debug, Default)]
-struct PeerQueueState {
-    next_queue_id: u64,
-    free_queue_ids: VecDeque<u64>,
-    in_free_list: Vec<bool>,
-}
 
 impl SizeOf for Option<ApplicationData> {
     fn size(&self) -> usize {
@@ -203,6 +193,7 @@ impl Entry {
             .max_datagram_size
             .fetch_min(crate::endpoint::MAX_DATAGRAM_SIZE as _, Ordering::Relaxed);
 
+        let initial_max_queues = parameters.initial_max_queues;
         Self {
             creation_time,
             peer,
@@ -219,8 +210,7 @@ impl Entry {
             sender_load_scores: Self::init_load_scores(socket_sender_count),
             next_binding_id: AtomicU64::new(0),
             queue_allocator: std::sync::Mutex::new(crate::endpoint::msg::queue::Allocator::new()),
-            peer_queue_state: std::sync::Mutex::new(PeerQueueState::default()),
-            peer_queue_notify: Notify::new(),
+            peer_free_list: crate::sync::free_list::FreeList::new(initial_max_queues),
         }
     }
 
@@ -577,56 +567,12 @@ impl Entry {
 
     /// Allocate a queue ID from the peer free-list, waiting asynchronously if needed.
     pub async fn alloc_peer_queue_id(&self) -> Option<VarInt> {
-        loop {
-            let notified = self.peer_queue_notify.notified();
-            {
-                let mut state = self.peer_queue_state.lock().unwrap();
-
-                if let Some(id) = state.free_queue_ids.pop_front() {
-                    if let Some(is_free) = state.in_free_list.get_mut(id as usize) {
-                        *is_free = false;
-                    }
-                    // SAFETY: values in the queue are bounded by MAX_SLOTS.
-                    return Some(unsafe { VarInt::new_unchecked(id) });
-                }
-
-                if state.next_queue_id < crate::flow::queue::MAX_SLOTS as u64 {
-                    let id = state.next_queue_id;
-                    state.next_queue_id += 1;
-                    if state.in_free_list.len() <= id as usize {
-                        state.in_free_list.resize(id as usize + 1, false);
-                    }
-                    // SAFETY: `id < MAX_SLOTS <= VarInt::MAX`.
-                    return Some(unsafe { VarInt::new_unchecked(id) });
-                }
-            }
-
-            notified.await;
-        }
+        core::future::poll_fn(|cx| self.peer_free_list.poll_alloc(cx)).await
     }
 
-    /// Mark a peer queue as freed.
+    /// Mark a peer queue as freed (called when QueueFree is received from peer).
     pub fn on_peer_queue_freed(&self, queue_id: VarInt) {
-        let idx = queue_id.as_u64() as usize;
-        if idx >= crate::flow::queue::MAX_SLOTS {
-            return;
-        }
-
-        let mut did_enqueue = false;
-        let mut state = self.peer_queue_state.lock().unwrap();
-        if state.in_free_list.len() <= idx {
-            state.in_free_list.resize(idx + 1, false);
-        }
-        if !state.in_free_list[idx] {
-            state.in_free_list[idx] = true;
-            state.free_queue_ids.push_back(queue_id.as_u64());
-            did_enqueue = true;
-        }
-        drop(state);
-
-        if did_enqueue {
-            self.peer_queue_notify.notify_one();
-        }
+        self.peer_free_list.free(queue_id);
     }
 
     /// Allocates a queue slot from this entry's pool, growing if needed.

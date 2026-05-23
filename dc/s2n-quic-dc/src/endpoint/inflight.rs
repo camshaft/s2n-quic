@@ -328,6 +328,7 @@ mod tests {
                 binding_id: VarInt::from_u8(1),
                 offset: VarInt::ZERO,
                 is_fin: false,
+                dest_acceptor_id: None,
             },
             source_sender_id: LocalSenderId::UNSPECIFIED,
             payload,

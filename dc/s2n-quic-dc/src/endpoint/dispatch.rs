@@ -355,41 +355,25 @@ fn dispatch_decoded_frame(
     waker_sink: &mut impl channel::UnboundedSender<AutoWake>,
 ) {
     match header {
-        Header::QueueBind {
-            queue_pair,
-            dest_acceptor_id,
-            binding_id,
-            is_fin,
-        } => {
-            handle_queue_bind(
-                peer,
-                queue_pair,
-                dest_acceptor_id,
-                binding_id,
-                is_fin,
-                payload,
-                acceptor_registry,
-                frame_tx,
-                counters,
-                response_frames,
-                waker_sink,
-            );
-        }
         Header::QueueData {
             queue_pair,
             binding_id,
             offset,
             is_fin,
+            dest_acceptor_id,
         } => {
             handle_queue_data(
-                credentials,
+                peer,
                 queue_pair,
                 binding_id,
                 offset,
                 is_fin,
+                dest_acceptor_id,
                 payload,
-                &mut peer.queue_dispatcher,
+                acceptor_registry,
+                frame_tx,
                 counters,
+                response_frames,
                 waker_sink,
             );
         }
@@ -472,194 +456,6 @@ fn dispatch_decoded_frame(
     }
 }
 
-fn handle_queue_bind(
-    peer: &mut recv::Context,
-    queue_pair: QueuePair,
-    acceptor_id: VarInt,
-    binding_id: VarInt,
-    is_fin: bool,
-    buf: BytesMut,
-    acceptor_registry: &mut acceptor::LocalRegistry<PendingValidation>,
-    frame_tx: &SubmissionSender,
-    counters: &counters::Dispatch,
-    response_frames: &mut PriorityInput,
-    waker_sink: &mut impl channel::UnboundedSender<AutoWake>,
-) {
-    let peer_queue_id = queue_pair.source_queue_id;
-    let local_queue_id = queue_pair.dest_queue_id;
-    if peer_queue_id.as_u64() >= crate::flow::queue::MAX_SLOTS as u64
-        || local_queue_id.as_u64() >= crate::flow::queue::MAX_SLOTS as u64
-    {
-        debug!(
-            binding_id = binding_id.as_u64(),
-            peer_queue_id = peer_queue_id.as_u64(),
-            local_queue_id = local_queue_id.as_u64(),
-            "dropping QueueBind with out-of-range queue_id"
-        );
-        return;
-    }
-
-    let request = binding_id;
-    match peer
-        .queue_dispatcher
-        .validate_stream(local_queue_id, &request)
-    {
-        Ok(()) => {
-            if !buf.is_empty() || is_fin {
-                let entry = msg::Stream::Data {
-                    offset: VarInt::ZERO,
-                    fin: is_fin,
-                    payload: buf,
-                }
-                .into();
-                match peer.queue_dispatcher.send_stream(
-                    local_queue_id,
-                    Some(peer_queue_id),
-                    &request,
-                    entry,
-                ) {
-                    Ok(waker) => {
-                        let _ = waker_sink.send(waker);
-                    }
-                    Err(err) => {
-                        let _ = err;
-                        trace!("QueueBind payload forwarding failed for existing queue");
-                    }
-                }
-            }
-            trace!(
-                binding_id = binding_id.as_u64(),
-                peer_queue_id = peer_queue_id.as_u64(),
-                local_queue_id = local_queue_id.as_u64(),
-                "QueueBind matched existing binding"
-            );
-            return;
-        }
-        Err(flow::queue::ValidateError::Validation(reason)) => {
-            counters.on_data_validation_failed(reason);
-            debug!(
-                binding_id = binding_id.as_u64(),
-                peer_queue_id = peer_queue_id.as_u64(),
-                local_queue_id = local_queue_id.as_u64(),
-                ?reason,
-                "dropping QueueBind due to binding mismatch"
-            );
-            return;
-        }
-        Err(flow::queue::ValidateError::Unallocated) => {}
-    }
-
-    let handle = flow::Handle::new(binding_id);
-    let (queue_control, queue_stream) = peer
-        .queue_dispatcher
-        .alloc_or_grow(handle, Some(peer_queue_id));
-    let allocated_queue_id = queue_control.queue_id();
-    if allocated_queue_id != local_queue_id {
-        debug!(
-            binding_id = binding_id.as_u64(),
-            expected_queue_id = local_queue_id.as_u64(),
-            allocated_queue_id = allocated_queue_id.as_u64(),
-            "server queue allocator not aligned with requested queue_id"
-        );
-    }
-
-    if !buf.is_empty() || is_fin {
-        queue_stream.push(
-            msg::Stream::Data {
-                offset: VarInt::ZERO,
-                fin: is_fin,
-                payload: buf,
-            }
-            .into(),
-        );
-    }
-
-    let writer = Writer::new_server(
-        frame_tx.clone(),
-        peer.path_entry.clone(),
-        binding_id,
-        QueuePair {
-            source_queue_id: allocated_queue_id,
-            dest_queue_id: peer_queue_id,
-        },
-        queue_control,
-    );
-    let reader = Reader::new_server(
-        frame_tx.clone(),
-        peer.path_entry.clone(),
-        binding_id,
-        queue_stream,
-        is_fin,
-    );
-
-    let stream = PendingValidation::new(Stream::new(reader, writer));
-
-    match acceptor_registry.send(acceptor_id, stream) {
-        acceptor::SendResult::Ok { mut evicted, waker } => {
-            if let Some(ref mut ev) = evicted {
-                ev.reset(crate::stream::endpoint::Error::ServerBusy);
-            }
-            counters.flow_accepted.add(1);
-            let _ = waker_sink.send(waker);
-            debug!(
-                binding_id = binding_id.as_u64(),
-                acceptor_id = acceptor_id.as_u64(),
-                server_queue_id = allocated_queue_id.as_u64(),
-                peer_queue_id = peer_queue_id.as_u64(),
-                "QueueBind accepted"
-            );
-        }
-        acceptor::SendResult::NotFound => {
-            debug!(
-                binding_id = binding_id.as_u64(),
-                acceptor_id = acceptor_id.as_u64(),
-                "QueueBind rejected - acceptor not found"
-            );
-            push_reset_frame(
-                response_frames,
-                counters,
-                &peer.path_entry,
-                peer_queue_id,
-                binding_id,
-                error::ACCEPTOR_NOT_FOUND,
-            );
-        }
-        acceptor::SendResult::Closed(mut stream, cleanup_waker) => {
-            stream.disable();
-            let _ = waker_sink.send(cleanup_waker);
-            debug!(
-                binding_id = binding_id.as_u64(),
-                acceptor_id = acceptor_id.as_u64(),
-                "QueueBind rejected - acceptor channel closed"
-            );
-            push_reset_frame(
-                response_frames,
-                counters,
-                &peer.path_entry,
-                peer_queue_id,
-                binding_id,
-                error::ACCEPTOR_NOT_FOUND,
-            );
-        }
-        acceptor::SendResult::NoSlots(mut stream) => {
-            stream.disable();
-            debug!(
-                binding_id = binding_id.as_u64(),
-                acceptor_id = acceptor_id.as_u64(),
-                "QueueBind rejected - acceptor has no active receivers"
-            );
-            push_reset_frame(
-                response_frames,
-                counters,
-                &peer.path_entry,
-                peer_queue_id,
-                binding_id,
-                error::ACCEPTOR_NOT_FOUND,
-            );
-        }
-    }
-}
-
 fn push_reset_frame(
     response_frames: &mut PriorityInput,
     counters: &counters::Dispatch,
@@ -710,19 +506,21 @@ fn push_reset_frame_with_target(
 // ── QueueData ─────────────────────────────────────────────────────────────
 
 fn handle_queue_data(
-    credentials: &Credentials,
+    peer: &mut recv::Context,
     queue_pair: QueuePair,
     binding_id: VarInt,
     offset: VarInt,
     is_fin: bool,
+    dest_acceptor_id: Option<VarInt>,
     buf: BytesMut,
-    queue_dispatcher: &mut msg::queue::Dispatcher,
+    acceptor_registry: &mut acceptor::LocalRegistry<PendingValidation>,
+    frame_tx: &SubmissionSender,
     counters: &counters::Dispatch,
+    response_frames: &mut PriorityInput,
     waker_sink: &mut impl channel::UnboundedSender<AutoWake>,
 ) {
     let local_queue_id = queue_pair.dest_queue_id;
-
-    let request = binding_id;
+    let peer_queue_id = queue_pair.source_queue_id;
 
     let payload_len = buf.len();
     let entry = msg::Stream::Data {
@@ -732,10 +530,10 @@ fn handle_queue_data(
     }
     .into();
 
-    match queue_dispatcher.send_stream(
+    match peer.queue_dispatcher.send_stream(
         local_queue_id,
-        Some(queue_pair.source_queue_id),
-        &request,
+        Some(peer_queue_id),
+        &binding_id,
         entry,
     ) {
         Ok(waker) => {
@@ -747,23 +545,47 @@ fn handle_queue_data(
                 offset = offset.as_u64(),
                 payload_len,
                 is_fin,
-                "QueueData dispatched"
+                "QueueData dispatched to existing binding"
             );
         }
-        Err(flow::queue::Error::Unallocated(_)) => {
-            counters.rx_data_unallocated.add(1);
-            debug!(
-                binding_id = binding_id.as_u64(),
-                queue_id = local_queue_id.as_u64(),
-                "QueueData for unallocated queue - dropping"
-            );
+        Err(flow::queue::Error::Unallocated(returned_entry)) => {
+            if let Some(acceptor_id) = dest_acceptor_id {
+                let handle = flow::Handle::new(binding_id);
+                let (queue_control, queue_stream) = peer
+                    .queue_dispatcher
+                    .alloc_or_grow(handle, Some(peer_queue_id));
+
+                queue_stream.push(returned_entry);
+
+                create_binding_with_queues(
+                    peer,
+                    queue_pair,
+                    acceptor_id,
+                    binding_id,
+                    is_fin,
+                    queue_control,
+                    queue_stream,
+                    acceptor_registry,
+                    frame_tx,
+                    counters,
+                    response_frames,
+                    waker_sink,
+                );
+            } else {
+                counters.rx_data_unallocated.add(1);
+                debug!(
+                    binding_id = binding_id.as_u64(),
+                    queue_id = local_queue_id.as_u64(),
+                    "QueueData for unallocated queue without acceptor_id — dropping"
+                );
+            }
         }
         Err(flow::queue::Error::HalfClosed(_)) => {
             counters.rx_data_half_closed.add(1);
             trace!(
                 binding_id = binding_id.as_u64(),
                 queue_id = local_queue_id.as_u64(),
-                "QueueData for half-closed stream - dropping"
+                "QueueData for half-closed stream — dropping"
             );
         }
         Err(flow::queue::Error::ValidationFailed(_, reason)) => {
@@ -772,7 +594,7 @@ fn handle_queue_data(
                 binding_id = binding_id.as_u64(),
                 queue_id = local_queue_id.as_u64(),
                 ?reason,
-                "QueueData validation failed - dropping"
+                "QueueData validation failed — dropping"
             );
         }
         Err(flow::queue::Error::PermanentlyClosed) => {
@@ -781,6 +603,144 @@ fn handle_queue_data(
                 binding_id = binding_id.as_u64(),
                 queue_id = local_queue_id.as_u64(),
                 "QueueData for permanently closed queue"
+            );
+        }
+    }
+}
+
+fn create_binding(
+    peer: &mut recv::Context,
+    queue_pair: QueuePair,
+    acceptor_id: VarInt,
+    binding_id: VarInt,
+    is_fin: bool,
+    acceptor_registry: &mut acceptor::LocalRegistry<PendingValidation>,
+    frame_tx: &SubmissionSender,
+    counters: &counters::Dispatch,
+    response_frames: &mut PriorityInput,
+    waker_sink: &mut impl channel::UnboundedSender<AutoWake>,
+) {
+    let peer_queue_id = queue_pair.source_queue_id;
+
+    let handle = flow::Handle::new(binding_id);
+    let (queue_control, queue_stream) = peer
+        .queue_dispatcher
+        .alloc_or_grow(handle, Some(peer_queue_id));
+
+    create_binding_with_queues(
+        peer,
+        queue_pair,
+        acceptor_id,
+        binding_id,
+        is_fin,
+        queue_control,
+        queue_stream,
+        acceptor_registry,
+        frame_tx,
+        counters,
+        response_frames,
+        waker_sink,
+    );
+}
+
+fn create_binding_with_queues(
+    peer: &mut recv::Context,
+    queue_pair: QueuePair,
+    acceptor_id: VarInt,
+    binding_id: VarInt,
+    is_fin: bool,
+    queue_control: msg::queue::Control,
+    queue_stream: msg::queue::Stream,
+    acceptor_registry: &mut acceptor::LocalRegistry<PendingValidation>,
+    frame_tx: &SubmissionSender,
+    counters: &counters::Dispatch,
+    response_frames: &mut PriorityInput,
+    waker_sink: &mut impl channel::UnboundedSender<AutoWake>,
+) {
+    let peer_queue_id = queue_pair.source_queue_id;
+    let allocated_queue_id = queue_control.queue_id();
+
+    let writer = Writer::new_server(
+        frame_tx.clone(),
+        peer.path_entry.clone(),
+        binding_id,
+        QueuePair {
+            source_queue_id: allocated_queue_id,
+            dest_queue_id: peer_queue_id,
+        },
+        queue_control,
+    );
+    let reader = Reader::new_server(
+        frame_tx.clone(),
+        peer.path_entry.clone(),
+        binding_id,
+        queue_stream,
+        is_fin,
+    );
+
+    let stream = PendingValidation::new(Stream::new(reader, writer));
+
+    match acceptor_registry.send(acceptor_id, stream) {
+        acceptor::SendResult::Ok { mut evicted, waker } => {
+            if let Some(ref mut ev) = evicted {
+                ev.reset(crate::stream::endpoint::Error::ServerBusy);
+            }
+            counters.flow_accepted.add(1);
+            let _ = waker_sink.send(waker);
+            debug!(
+                binding_id = binding_id.as_u64(),
+                acceptor_id = acceptor_id.as_u64(),
+                server_queue_id = allocated_queue_id.as_u64(),
+                peer_queue_id = peer_queue_id.as_u64(),
+                "QueueData accepted — new binding created"
+            );
+        }
+        acceptor::SendResult::NotFound => {
+            debug!(
+                binding_id = binding_id.as_u64(),
+                acceptor_id = acceptor_id.as_u64(),
+                "QueueData rejected — acceptor not found"
+            );
+            push_reset_frame(
+                response_frames,
+                counters,
+                &peer.path_entry,
+                peer_queue_id,
+                binding_id,
+                error::ACCEPTOR_NOT_FOUND,
+            );
+        }
+        acceptor::SendResult::Closed(mut stream, cleanup_waker) => {
+            stream.disable();
+            let _ = waker_sink.send(cleanup_waker);
+            debug!(
+                binding_id = binding_id.as_u64(),
+                acceptor_id = acceptor_id.as_u64(),
+                "QueueData rejected — acceptor channel closed"
+            );
+            push_reset_frame(
+                response_frames,
+                counters,
+                &peer.path_entry,
+                peer_queue_id,
+                binding_id,
+                error::ACCEPTOR_NOT_FOUND,
+            );
+        }
+        acceptor::SendResult::NoSlots(mut stream) => {
+            stream.disable();
+            debug!(
+                binding_id = binding_id.as_u64(),
+                acceptor_id = acceptor_id.as_u64(),
+                "QueueData rejected — acceptor has no active receivers"
+            );
+            push_reset_frame(
+                response_frames,
+                counters,
+                &peer.path_entry,
+                peer_queue_id,
+                binding_id,
+                error::ACCEPTOR_NOT_FOUND,
             );
         }
     }
@@ -853,7 +813,7 @@ fn handle_queue_max_data(
 /// All error paths are handled internally. Callers that need to emit a success trace should do so after
 /// this call when the return value is `true`.
 fn dispatch_control_message(
-    credentials: &Credentials,
+    _credentials: &Credentials,
     queue_pair: QueuePair,
     binding_id: VarInt,
     entry: Entry<msg::Control>,

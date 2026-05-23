@@ -177,7 +177,6 @@ impl Dispatch {
     #[inline]
     pub fn on_received_frame(&self, header: &Header) {
         match header {
-            Header::QueueBind { .. } => self.rx_frame_queue_bind.add(1),
             Header::QueueData { is_fin: false, .. } => self.rx_frame_queue_data.add(1),
             Header::QueueData { is_fin: true, .. } => self.rx_frame_queue_data_fin.add(1),
             Header::QueueControl { .. } => self.rx_frame_queue_control.add(1),
@@ -398,7 +397,6 @@ impl Send {
     #[inline]
     pub fn on_acked_frame(&self, header: &Header) {
         match header {
-            Header::QueueBind { .. } => self.tx_acked_frame_queue_bind.add(1),
             Header::QueueData { is_fin: false, .. } => self.tx_acked_frame_queue_data.add(1),
             Header::QueueData { is_fin: true, .. } => self.tx_acked_frame_queue_data_fin.add(1),
             Header::QueueControl { .. } => self.tx_acked_frame_queue_control.add(1),
