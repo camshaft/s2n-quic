@@ -39,17 +39,15 @@ pub enum Priority {
     QueueReset = 1,
     QueueControl = 2,
     QueueData = 3,
-    QueueBind = 4,
 }
 
 impl Priority {
-    pub const LEVELS: usize = 5;
+    pub const LEVELS: usize = 4;
     pub const ALL: [Self; Self::LEVELS] = [
         Self::QueueFree,
         Self::QueueReset,
         Self::QueueControl,
         Self::QueueData,
-        Self::QueueBind,
     ];
 
     #[inline]
@@ -353,23 +351,17 @@ pub enum FailureReason {
 #[cfg_attr(test, derive(bolero_generator::TypeGenerator))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Header {
-    /// Bind a new queue with the server.
+    /// Stream data routed via queue pair.
     ///
-    /// The client allocates both queue IDs and sends them in queue_pair.
-    /// binding_id is a per-PathSecretEntry monotonic counter that prevents
-    /// stale packets from being injected into recycled queue slots.
-    QueueBind {
-        queue_pair: QueuePair,
-        dest_acceptor_id: VarInt,
-        binding_id: VarInt,
-        is_fin: bool,
-    },
-    /// Stream data routed via queue pair
+    /// When `dest_acceptor_id` is `Some`, this is an "init" frame that can create
+    /// a new binding on the server if the queue is unbound. Once the server confirms
+    /// the binding (via MaxData), subsequent frames omit the acceptor_id.
     QueueData {
         queue_pair: QueuePair,
         binding_id: VarInt,
         offset: VarInt,
         is_fin: bool,
+        dest_acceptor_id: Option<VarInt>,
     },
     /// Queue control (opaque control frames)
     QueueControl {
@@ -421,8 +413,6 @@ pub enum Header {
 }
 
 impl Header {
-    const QUEUE_BIND_TYPE: u8 = 1;
-    const QUEUE_BIND_WITH_FIN_TYPE: u8 = 2;
     const QUEUE_DATA_NO_FIN_TYPE: u8 = 3;
     const QUEUE_DATA_WITH_FIN_TYPE: u8 = 4;
     const QUEUE_CONTROL_TYPE: u8 = 5;
@@ -435,11 +425,12 @@ impl Header {
     const ACK_ECN_TYPE: u8 = 12;
     const ACK_ELICITING_TYPE: u8 = 13;
     const ACK_ECN_ELICITING_TYPE: u8 = 14;
+    const QUEUE_DATA_INIT_NO_FIN_TYPE: u8 = 15;
+    const QUEUE_DATA_INIT_WITH_FIN_TYPE: u8 = 16;
 
     #[inline]
     pub fn priority(&self) -> Priority {
         match self {
-            Self::QueueBind { .. } => Priority::QueueBind,
             Self::QueueData { .. } => Priority::QueueData,
             Self::QueueControl { .. } | Self::QueueMaxData { .. } => Priority::QueueControl,
             Self::QueueFree { .. } => Priority::QueueFree,
@@ -471,8 +462,7 @@ impl Header {
     #[inline]
     pub fn has_payload_length(&self) -> bool {
         match self {
-            Self::QueueBind { .. }
-            | Self::QueueData { .. }
+            Self::QueueData { .. }
             | Self::QueueControl { .. }
             | Self::QueueFree { .. }
             | Self::Ack { .. } => true,
@@ -505,35 +495,24 @@ impl Header {
 impl EncoderValue for Header {
     fn encode<E: Encoder>(&self, encoder: &mut E) {
         match self {
-            Self::QueueBind {
-                queue_pair,
-                dest_acceptor_id,
-                binding_id,
-                is_fin,
-            } => {
-                let tag = if *is_fin {
-                    Self::QUEUE_BIND_WITH_FIN_TYPE
-                } else {
-                    Self::QUEUE_BIND_TYPE
-                };
-                encoder.encode(&tag);
-                encoder.encode(queue_pair);
-                encoder.encode(dest_acceptor_id);
-                encoder.encode(binding_id);
-            }
             Self::QueueData {
                 queue_pair,
                 binding_id,
                 offset,
                 is_fin,
+                dest_acceptor_id,
             } => {
-                let tag = if *is_fin {
-                    Self::QUEUE_DATA_WITH_FIN_TYPE
-                } else {
-                    Self::QUEUE_DATA_NO_FIN_TYPE
+                let tag = match (dest_acceptor_id.is_some(), *is_fin) {
+                    (true, false) => Self::QUEUE_DATA_INIT_NO_FIN_TYPE,
+                    (true, true) => Self::QUEUE_DATA_INIT_WITH_FIN_TYPE,
+                    (false, false) => Self::QUEUE_DATA_NO_FIN_TYPE,
+                    (false, true) => Self::QUEUE_DATA_WITH_FIN_TYPE,
                 };
                 encoder.encode(&tag);
                 encoder.encode(queue_pair);
+                if let Some(acceptor_id) = dest_acceptor_id {
+                    encoder.encode(acceptor_id);
+                }
                 encoder.encode(binding_id);
                 encoder.encode(offset);
             }
@@ -605,17 +584,19 @@ impl<'a> s2n_codec::DecoderValue<'a> for Header {
         let (tag, buffer) = buffer.decode::<u8>()?;
 
         match tag {
-            Self::QUEUE_BIND_TYPE | Self::QUEUE_BIND_WITH_FIN_TYPE => {
+            Self::QUEUE_DATA_INIT_NO_FIN_TYPE | Self::QUEUE_DATA_INIT_WITH_FIN_TYPE => {
                 let (queue_pair, buffer) = buffer.decode()?;
-                let (dest_acceptor_id, buffer) = buffer.decode()?;
+                let (dest_acceptor_id, buffer) = buffer.decode::<VarInt>()?;
                 let (binding_id, buffer) = buffer.decode()?;
-                let is_fin = tag == Self::QUEUE_BIND_WITH_FIN_TYPE;
+                let (offset, buffer) = buffer.decode()?;
+                let is_fin = tag == Self::QUEUE_DATA_INIT_WITH_FIN_TYPE;
                 Ok((
-                    Self::QueueBind {
+                    Self::QueueData {
                         queue_pair,
-                        dest_acceptor_id,
                         binding_id,
+                        offset,
                         is_fin,
+                        dest_acceptor_id: Some(dest_acceptor_id),
                     },
                     buffer,
                 ))
@@ -631,6 +612,7 @@ impl<'a> s2n_codec::DecoderValue<'a> for Header {
                         binding_id,
                         offset,
                         is_fin,
+                        dest_acceptor_id: None,
                     },
                     buffer,
                 ))
@@ -832,6 +814,7 @@ mod tests {
                 binding_id: VarInt::from_u8(42),
                 offset: VarInt::ZERO,
                 is_fin: false,
+                dest_acceptor_id: None,
             },
             source_sender_id: LocalSenderId::UNSPECIFIED,
             payload,
@@ -850,18 +833,19 @@ mod tests {
     }
 
     #[test]
-    fn queue_bind_priority() {
+    fn queue_data_with_dest_acceptor_id_priority() {
         let entry = PathSecretEntry::builder("127.0.0.1:8080".parse().unwrap()).build();
 
         let frame = Frame {
-            header: Header::QueueBind {
+            header: Header::QueueData {
                 queue_pair: QueuePair {
                     source_queue_id: VarInt::from_u8(1),
                     dest_queue_id: VarInt::from_u8(2),
                 },
-                dest_acceptor_id: VarInt::from_u8(10),
                 binding_id: VarInt::from_u8(42),
+                offset: VarInt::ZERO,
                 is_fin: false,
+                dest_acceptor_id: Some(VarInt::from_u8(10)),
             },
             source_sender_id: LocalSenderId::UNSPECIFIED,
             payload: ByteVec::new(),
@@ -872,7 +856,7 @@ mod tests {
             transmission_time: None,
         };
 
-        assert_eq!(frame.priority(), Priority::QueueBind);
+        assert_eq!(frame.priority(), Priority::QueueData);
         assert!(!frame.requires_sticky_sender());
     }
 
@@ -910,14 +894,15 @@ mod tests {
         let entry = PathSecretEntry::builder("127.0.0.1:8080".parse().unwrap()).build();
 
         let frame = Frame {
-            header: Header::QueueBind {
+            header: Header::QueueData {
                 queue_pair: QueuePair {
                     source_queue_id: VarInt::from_u8(1),
                     dest_queue_id: VarInt::from_u8(2),
                 },
-                dest_acceptor_id: VarInt::from_u8(10),
                 binding_id: VarInt::from_u8(42),
+                offset: VarInt::ZERO,
                 is_fin: false,
+                dest_acceptor_id: Some(VarInt::from_u8(10)),
             },
             source_sender_id: LocalSenderId::new(VarInt::from_u8(7)),
             payload: ByteVec::new(),
@@ -929,6 +914,6 @@ mod tests {
         };
 
         assert!(frame.requires_sticky_sender());
-        assert_eq!(frame.priority(), Priority::QueueBind);
+        assert_eq!(frame.priority(), Priority::QueueData);
     }
 }

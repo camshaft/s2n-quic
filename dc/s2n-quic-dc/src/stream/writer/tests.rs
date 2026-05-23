@@ -169,11 +169,11 @@ impl PayloadAssembler {
         });
     }
 
-    /// Feeds frames expecting only `Header::QueueBind` variants.
+    /// Feeds frames expecting only `Header::QueueData` variants with `dest_acceptor_id: Some(_)`.
     fn push_queue_bind(&mut self, frames: &intrusive::Queue<Frame>) {
         self.push(frames, |header| match *header {
-            Header::QueueBind { is_fin, .. } => (VarInt::ZERO, is_fin),
-            _ => panic!("expected QueueBind frame, got {header:?}"),
+            Header::QueueData { is_fin, dest_acceptor_id: Some(_), .. } => (VarInt::ZERO, is_fin),
+            _ => panic!("expected QueueData with dest_acceptor_id frame, got {header:?}"),
         });
     }
 
@@ -275,7 +275,7 @@ fn client_write_all_from_fin_sends_queue_bind_with_early_data_and_fin() {
             let frame = frames.front().unwrap();
             assert!(matches!(
                 frame.header,
-                Header::QueueBind { is_fin: true, .. }
+                Header::QueueData { is_fin: true, dest_acceptor_id: Some(_), .. }
             ));
             assert_eq!(frame.payload, &b"hello"[..]);
         }
@@ -331,7 +331,7 @@ fn client_second_write_blocks_until_max_data() {
             let frame = frames.front().unwrap();
             assert!(matches!(
                 frame.header,
-                Header::QueueBind { is_fin: false, .. }
+                Header::QueueData { is_fin: false, dest_acceptor_id: Some(_), .. }
             ));
             assert_eq!(frame.payload, &b"hello"[..]);
 
@@ -454,7 +454,7 @@ fn client_preserves_max_data_on_out_of_order_lower_update() {
             let init_frame = init.front().unwrap();
             assert!(matches!(
                 init_frame.header,
-                Header::QueueBind { is_fin: false, .. }
+                Header::QueueData { is_fin: false, dest_acceptor_id: Some(_), .. }
             ));
             assert_eq!(init_frame.payload, &b"abc"[..]);
 
@@ -758,7 +758,7 @@ fn client_empty_fin_queue_bind() {
             let frame = frames.front().unwrap();
             assert!(matches!(
                 frame.header,
-                Header::QueueBind { is_fin: true, .. }
+                Header::QueueData { is_fin: true, dest_acceptor_id: Some(_), .. }
             ));
             assert!(frame.payload.is_empty(), "expected empty payload with FIN");
 
@@ -1023,24 +1023,24 @@ fn client_write_from_fin_after_queue_bind_sends_queue_data_fin() {
         let (mut writer, mut pusher) = make_client_pair();
 
         async move {
-            // Both QueueBind and the empty-payload FIN arrive in the same batch
-            // because FIN with no data doesn't need remote flow budget.
-            // Priority ordering puts QueueData (priority 2) before QueueBind (priority 3).
+            // Both the QueueData-init and the FIN arrive in the same batch.
+            // They are the same priority (QueueData) so they come in FIFO order:
+            // first the init frame (from write), then the FIN (from shutdown).
             let frames = pusher.recv_frames().await;
-            assert_eq!(frames.len(), 2, "expected QueueBind + FIN QueueData");
+            assert_eq!(frames.len(), 2, "expected QueueData-init + FIN QueueData");
             let mut iter = frames.iter();
             let first = iter.next().unwrap();
             assert!(
-                matches!(
-                    first.header,
-                    Header::QueueData { is_fin: true, offset, .. } if offset == VarInt::from_u8(5)
-                ),
-                "expected QueueData(is_fin=true, offset=5)"
+                matches!(first.header, Header::QueueData { is_fin: false, dest_acceptor_id: Some(_), .. }),
+                "expected QueueData-init(is_fin=false) with early data"
             );
             let second = iter.next().unwrap();
             assert!(
-                matches!(second.header, Header::QueueBind { is_fin: false, .. }),
-                "expected QueueBind(is_fin=false) with early data"
+                matches!(
+                    second.header,
+                    Header::QueueData { is_fin: true, offset, .. } if offset == VarInt::from_u8(5)
+                ),
+                "expected QueueData(is_fin=true, offset=5)"
             );
         }
         .primary()

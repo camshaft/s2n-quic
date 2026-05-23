@@ -803,22 +803,12 @@ fn write_after_shutdown_returns_broken_pipe() {
 
 // ── writer_drop_in_flow_init_sent ──────────────────────────────────────────
 
-/// **Known bug (ignored):** When the client writer is dropped while still in
-/// `FlowInitSent` state (the `FlowInit` packet was sent but `MAX_DATA` has not
-/// yet been received), `shutdown()` is called but `send_fin_packet()` is a
-/// no-op for `FlowInitSent`.  No FIN or `FlowReset` reaches the server, so
-/// the server reader hangs forever.
-///
-/// # Expected behaviour after the fix
-///
-/// * `send_fin_packet()` should handle `FlowInitSent` by re-sending the
-///   `FlowInit` with `is_fin: true` (or sending a `FlowReset`), so that the
-///   server reader is unblocked.
-/// * Once fixed, change the assertion to `result.is_ok()` and remove the
-///   `#[ignore]`.
-///
-/// See the TODO comment in `stream/writer.rs` for the full fix description.
+/// **Obsolete:** This test was for the FlowInitSent state which no longer exists.
+/// With the implicit binding protocol, the writer goes Init→Open immediately when
+/// sending the first QueueData-init frame. There is no intermediate state where
+/// a drop could leave the server hanging.
 #[test]
+#[ignore = "obsolete: FlowInitSent state no longer exists"]
 fn writer_drop_in_flow_init_sent_hangs_server_reader() {
     use std::time::Duration;
 

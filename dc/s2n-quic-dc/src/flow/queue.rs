@@ -19,7 +19,7 @@ mod queue_id;
 mod sender;
 
 // Re-export the Key trait
-pub use descriptor::{FreedSlot, Key, ValidationError};
+pub use descriptor::{FreedSlot, Key, ServerValidation, ValidationError};
 pub use inner::AutoWake;
 pub const MAX_SLOTS: usize = queue_id::MAX_SLOTS;
 
@@ -270,6 +270,49 @@ where
             Ok(waker) => {
                 trace!(%local_queue_id, "send_stream");
                 Ok(waker)
+            }
+            Err(Error::PermanentlyClosed) => {
+                self.is_open = false;
+                Err(inner::Error::PermanentlyClosed)
+            }
+            Err(Error::HalfClosed(data)) => {
+                debug!(%local_queue_id, "stream receiver closed");
+                Err(inner::Error::HalfClosed(data))
+            }
+            Err(Error::ValidationFailed(data, reason)) => {
+                debug!(%local_queue_id, ?reason, "stream queue validation failed");
+                Err(inner::Error::ValidationFailed(data, reason))
+            }
+            Err(Error::Unallocated(data)) => {
+                debug!("unroutable stream data");
+                Err(inner::Error::Unallocated(data))
+            }
+        }
+    }
+
+    /// Server-side stream send: validates binding_id and atomically creates binding if unbound.
+    ///
+    /// Returns `Ok((waker, ServerValidation))` where `ServerValidation::NewBinding` indicates
+    /// the caller must complete stream creation (register with acceptor, etc).
+    #[inline]
+    pub fn send_stream_server(
+        &mut self,
+        local_queue_id: VarInt,
+        remote_queue_id: Option<VarInt>,
+        params: &K::Request,
+        data: intrusive::Entry<S>,
+        new_key: impl FnOnce() -> K,
+    ) -> Result<(AutoWake, descriptor::ServerValidation), Error<intrusive::Entry<S>>> {
+        let res = self
+            .senders
+            .lookup(local_queue_id, data, |sender, data| {
+                sender.send_stream_server(data, remote_queue_id, params, new_key)
+            });
+
+        match res {
+            Ok((waker, validation)) => {
+                trace!(%local_queue_id, ?validation, "send_stream_server");
+                Ok((waker, validation))
             }
             Err(Error::PermanentlyClosed) => {
                 self.is_open = false;
