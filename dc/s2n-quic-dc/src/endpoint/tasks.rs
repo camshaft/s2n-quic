@@ -1628,21 +1628,14 @@ where
     R: Receiver<Entry<PeerDead>>,
     WakerSink: UnboundedSender<crate::flow::queue::AutoWake>,
 {
-    use crate::{endpoint::error::IDLE_TIMEOUT, flow};
+    use crate::endpoint::error::IDLE_TIMEOUT;
 
     Map::new(peer_dead_rx, move |entry: Entry<PeerDead>| {
         counters.events.add(1);
         let peer_dead = entry.into_inner();
-        let credential_id = *peer_dead.path_secret_entry.id();
-
-        let request = flow::Request {
-            credential_id,
-            stream_id: None,
-        };
 
         let mut queue_dispatcher = peer_dead.path_secret_entry.queue_dispatcher();
-        queue_dispatcher.send_both_by_request(
-            &request,
+        queue_dispatcher.broadcast_both(
             || {
                 msg::Stream::Reset {
                     error_code: IDLE_TIMEOUT,

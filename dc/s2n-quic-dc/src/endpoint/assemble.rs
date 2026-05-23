@@ -784,18 +784,16 @@ fn stamp_attempt_id(header: &mut frame::Header, flow_attempt_id: &mut VarInt) {
     }
 }
 
-/// Pin QueueBind frames to this sender and stamp the completion channel.
+/// Pin QueueBind frames to this sender for retransmit dedup correctness.
 ///
-/// QueueBind frames MUST be pinned because the server deduplicates by
-/// (credential_id, source_sender_id, binding_id). If a retransmitted QueueBind
-/// migrates to a different sender, its binding_id may collide with that sender's
-/// independently-assigned IDs, causing the server to reject it as a duplicate.
-///
-/// Other frame types (QueueData, QueueReset, ACK) are intentionally left unpinned
-/// so that loss retransmissions can be redistributed via pick-two load balancing.
+/// The server deduplicates QueueBind by checking per-recv-context state (which is
+/// keyed by credential_id + source_sender_id). A retransmitted QueueBind must
+/// arrive via the same sender so it hits the same recv context and dedup check.
+/// The completion channel's `init_sender_idx` is stamped so the writer can pin
+/// subsequent retransmits to the same sender.
 fn stamp_sender_id(frame: &mut Frame, source_sender_id: LocalSenderId) {
     match &frame.header {
-        frame::Header::QueueBind { binding_id, .. } => {
+        frame::Header::QueueBind { .. } => {
             if frame.source_sender_id == LocalSenderId::UNSPECIFIED {
                 frame.source_sender_id = source_sender_id;
             } else {
@@ -808,7 +806,6 @@ fn stamp_sender_id(frame: &mut Frame, source_sender_id: LocalSenderId) {
 
             if let Some(completion) = &frame.completion {
                 completion.set_init_sender_idx(source_sender_id);
-                completion.set_init_attempt_id(*binding_id);
             }
         }
         _ => {

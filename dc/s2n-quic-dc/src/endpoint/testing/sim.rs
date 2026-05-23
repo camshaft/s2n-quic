@@ -586,7 +586,7 @@ where
     // Allocate a fresh binding ID and flow queues.
     let binding_id = path_secret_entry.alloc_binding_id();
 
-    let handle = flow::Handle::client(binding_id, path_secret_entry.clone());
+    let handle = flow::Handle::new(binding_id);
     let (queue_control, queue_stream) = path_secret_entry.alloc_queue(handle, None);
 
     let queue_pair = crate::packet::datagram::QueuePair {

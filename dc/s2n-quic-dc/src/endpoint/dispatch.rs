@@ -303,6 +303,27 @@ where
             enqueue_pending_ack = true;
         }
     }
+    // Emit QueueFree frames for any slots freed during this dispatch cycle.
+    let freed = peer.queue_dispatcher.drain_freed();
+    if !freed.is_empty() {
+        for slot in &freed {
+            let frame = Frame {
+                source_sender_id: LocalSenderId::UNSPECIFIED,
+                header: crate::endpoint::frame::Header::QueueFree {
+                    binding_id: VarInt::ZERO,
+                    largest_queue_id: slot.remote_queue_id,
+                },
+                payload: crate::byte_vec::ByteVec::new(),
+                path_secret_entry: peer.path_entry.clone(),
+                completion: None,
+                status: crate::endpoint::frame::TransmissionStatus::default(),
+                ttl: crate::endpoint::frame::DEFAULT_TTL,
+                transmission_time: None,
+            };
+            response_frames.push(Entry::new(frame));
+        }
+    }
+
     peer.invariants();
     drop(peer);
 
@@ -420,8 +441,14 @@ fn dispatch_decoded_frame(
                 waker_sink,
             );
         }
-        Header::QueueFree { .. } => {
-            /* TODO: handle queue free */
+        Header::QueueFree {
+            largest_queue_id, ..
+        } => {
+            peer.queue_dispatcher.on_queue_freed(largest_queue_id);
+            trace!(
+                queue_id = largest_queue_id.as_u64(),
+                "QueueFree received — slot returned to pool"
+            );
         }
         Header::Ack {
             dest_sender_id,
@@ -462,10 +489,19 @@ fn handle_queue_bind(
 ) {
     let peer_queue_id = queue_pair.source_queue_id;
 
-    // Packet-number dedup already guarantees this is not a retransmit.
-    // Allocate a queue and deliver the stream to the acceptor.
+    // Dedup: the client's source_queue_id is unique per-stream and never reused
+    // without QueueFree. If we've already processed a QueueBind with this
+    // peer_queue_id, it's a retransmit.
+    if peer.queue_dispatcher.test_and_set_bound(peer_queue_id, binding_id) {
+        trace!(
+            binding_id = binding_id.as_u64(),
+            peer_queue_id = peer_queue_id.as_u64(),
+            "QueueBind deduplicated (retransmit)"
+        );
+        return;
+    }
 
-    let handle = flow::Handle::client(binding_id, peer.path_entry.clone());
+    let handle = flow::Handle::new(binding_id);
     let (queue_control, queue_stream) =
         peer.queue_dispatcher.alloc_or_grow(handle, Some(peer_queue_id));
     let local_queue_id = queue_control.queue_id();
@@ -509,6 +545,7 @@ fn handle_queue_bind(
                 binding_id = binding_id.as_u64(),
                 acceptor_id = acceptor_id.as_u64(),
                 server_queue_id = local_queue_id.as_u64(),
+                peer_queue_id = peer_queue_id.as_u64(),
                 "QueueBind accepted"
             );
         }
@@ -625,10 +662,7 @@ fn handle_queue_data(
 ) {
     let local_queue_id = queue_pair.dest_queue_id;
 
-    let request = flow::Request {
-        credential_id: credentials.id,
-        stream_id: Some(binding_id),
-    };
+    let request = binding_id;
 
     let payload_len = buf.len();
     let entry = msg::Stream::Data {
@@ -769,10 +803,7 @@ fn dispatch_control_message(
 ) -> bool {
     let local_queue_id = queue_pair.dest_queue_id;
 
-    let request = flow::Request {
-        credential_id: credentials.id,
-        stream_id: Some(binding_id),
-    };
+    let request = binding_id;
 
     match queue_dispatcher.send_control(
         local_queue_id,
@@ -839,10 +870,7 @@ fn handle_queue_reset(
 ) {
     let local_queue_id = dest_queue_id;
 
-    let request = flow::Request {
-        credential_id: credentials.id,
-        stream_id: Some(binding_id),
-    };
+    let request = binding_id;
 
     match reset_target {
         ResetTarget::Both => {

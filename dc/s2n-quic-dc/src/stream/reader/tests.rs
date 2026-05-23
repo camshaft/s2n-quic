@@ -78,16 +78,13 @@ impl PairBuilder {
 
         let allocator = msg::queue::Allocator::new();
         let dispatcher = allocator.dispatcher();
-        let handle = flow::Handle::client(stream_id, path_secret_entry.clone());
+        let handle = flow::Handle::new(stream_id);
         let (_control, stream_rx) = dispatcher
             .alloc(handle, Some(VarInt::from_u8(2)))
             .expect("queue alloc should succeed");
 
         let queue_id = stream_rx.queue_id();
-        let request = flow::Request {
-            credential_id: *path_secret_entry.id(),
-            stream_id: Some(stream_id),
-        };
+        let request = stream_id;
 
         let (frame_tx, frame_rx) = frame::submission_channel(1);
 
@@ -140,7 +137,7 @@ fn peer_addr_returns_handshake_addr() {
 struct Pusher {
     dispatcher: msg::queue::Dispatcher,
     queue_id: VarInt,
-    request: flow::Request,
+    request: VarInt,
     /// Outbound frames submitted by the Reader (MAX_DATA, STOP_SENDING, …).
     frame_rx: SubmissionReceiver,
     /// Reusable priority-storage buffer; avoids re-allocating the fixed-size
