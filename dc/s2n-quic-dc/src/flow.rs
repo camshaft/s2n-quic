@@ -11,4 +11,4 @@ mod handle;
 
 pub mod queue;
 
-pub use handle::{Handle, Request, Tracker};
+pub use handle::Handle;

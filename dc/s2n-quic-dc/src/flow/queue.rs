@@ -7,6 +7,7 @@
 //! is generic over the stream and control data types.
 use crate::{counter, credentials::Credentials, intrusive, tracing::*};
 use s2n_quic_core::varint::VarInt;
+use std::sync::Arc;
 
 mod descriptor;
 mod free_list;
@@ -18,8 +19,9 @@ mod queue_id;
 mod sender;
 
 // Re-export the Key trait
-pub use descriptor::{Key, ValidationError};
+pub use descriptor::{FreeNotify, FreedSlot, Key, ServerValidation, ValidationError, WakerSink};
 pub use inner::AutoWake;
+pub const MAX_SLOTS: usize = queue_id::MAX_SLOTS;
 
 /// Size of the first allocated page of queue slots.
 ///
@@ -44,6 +46,17 @@ where
     K: 'static + Send + Sync,
 {
     pool: pool::Pool<S, C, K, INITIAL_PAGE_SIZE>,
+}
+
+impl<S, C, K> core::fmt::Debug for Allocator<S, C, K>
+where
+    S: 'static + Send + Sync,
+    C: 'static + Send + Sync,
+    K: 'static + Send + Sync,
+{
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Allocator").finish_non_exhaustive()
+    }
 }
 
 impl<S, C, K> Clone for Allocator<S, C, K>
@@ -95,11 +108,32 @@ where
     }
 
     #[inline]
+    pub fn new_with_waker_sink(
+        registry: &counter::Registry,
+        waker_sink: Arc<dyn WakerSink>,
+    ) -> Self {
+        let epoch_summary = registry
+            .register_summary("flow.queue.epoch", counter::Unit::Count)
+            .with_description(
+                "Upper bound of allocated queue slots (epoch) after each allocator growth",
+            );
+        Self {
+            pool: pool::Pool::new_with_waker_sink(Some(epoch_summary), waker_sink),
+        }
+    }
+
+    #[inline]
     pub fn dispatcher(&self) -> Dispatch<S, C, K> {
+        let free_notify = self
+            .pool
+            .free_notify
+            .clone()
+            .unwrap_or_else(|| Arc::new(descriptor::FreeNotify::new()));
         Dispatch {
             senders: self.pool.senders(),
             is_open: true,
             pool: self.pool.clone(),
+            free_notify,
         }
     }
 
@@ -132,6 +166,9 @@ where
     senders: sender::Senders<S, C, K, INITIAL_PAGE_SIZE>,
     is_open: bool,
     pool: pool::Pool<S, C, K, INITIAL_PAGE_SIZE>,
+    /// Shared sink for freed-slot notifications. Populated by descriptor drop_receiver
+    /// when both queue halves close. Drained by the dispatch layer to emit QueueFree.
+    free_notify: Arc<descriptor::FreeNotify>,
 }
 
 impl<S, C, K> Clone for Dispatch<S, C, K>
@@ -145,6 +182,7 @@ where
             senders: self.senders.clone(),
             is_open: self.is_open,
             pool: self.pool.clone(),
+            free_notify: self.free_notify.clone(),
         }
     }
 }
@@ -171,6 +209,28 @@ where
         remote_queue_id: Option<VarInt>,
     ) -> (Control<S, C, K>, Stream<S, C, K>) {
         self.pool.alloc_or_grow(key, remote_queue_id)
+    }
+
+    /// Allocate a specific slot by index, growing pages as needed.
+    ///
+    /// Used by the server to allocate at the exact `dest_queue_id` the client specified.
+    #[inline]
+    pub fn alloc_at_or_grow(
+        &mut self,
+        slot_index: usize,
+        key: K,
+        remote_queue_id: Option<VarInt>,
+    ) -> (Control<S, C, K>, Stream<S, C, K>) {
+        self.pool.alloc_at_or_grow(slot_index, key, remote_queue_id)
+    }
+
+    /// Drain freed slots that have been released since the last call.
+    ///
+    /// Returns freed slot entries representing queue slots whose both stream and
+    /// control receivers have dropped. Used by the server to emit QueueFree frames.
+    /// Skips the mutex entirely when no items have been pushed (atomic fast-path).
+    pub fn drain_freed(&mut self) -> Vec<FreedSlot> {
+        self.free_notify.drain()
     }
 
     #[inline]
@@ -245,6 +305,49 @@ where
         }
     }
 
+    /// Server-side stream send: validates binding_id and atomically creates binding if unbound.
+    ///
+    /// Returns `Ok((waker, ServerValidation))` where `ServerValidation::NewBinding` indicates
+    /// the caller must complete stream creation (register with acceptor, etc).
+    #[inline]
+    pub fn send_stream_server(
+        &mut self,
+        local_queue_id: VarInt,
+        remote_queue_id: Option<VarInt>,
+        params: &K::Request,
+        data: intrusive::Entry<S>,
+        new_key: impl FnOnce() -> K,
+    ) -> Result<(AutoWake, descriptor::ServerValidation), Error<intrusive::Entry<S>>> {
+        let res = self
+            .senders
+            .lookup(local_queue_id, data, |sender, data| {
+                sender.send_stream_server(data, remote_queue_id, params, new_key)
+            });
+
+        match res {
+            Ok((waker, validation)) => {
+                trace!(%local_queue_id, ?validation, "send_stream_server");
+                Ok((waker, validation))
+            }
+            Err(Error::PermanentlyClosed) => {
+                self.is_open = false;
+                Err(inner::Error::PermanentlyClosed)
+            }
+            Err(Error::HalfClosed(data)) => {
+                debug!(%local_queue_id, "stream receiver closed");
+                Err(inner::Error::HalfClosed(data))
+            }
+            Err(Error::ValidationFailed(data, reason)) => {
+                debug!(%local_queue_id, ?reason, "stream queue validation failed");
+                Err(inner::Error::ValidationFailed(data, reason))
+            }
+            Err(Error::Unallocated(data)) => {
+                debug!("unroutable stream data");
+                Err(inner::Error::Unallocated(data))
+            }
+        }
+    }
+
     #[inline]
     pub fn send_both(
         &mut self,
@@ -278,19 +381,22 @@ where
     /// This is a global scan. Internally it walks the entire sender table and runs
     /// per-queue validation, so the cost is O(total_queues) and can be very high at
     /// large concurrency. Use sparingly for rare control-plane events only.
-    pub fn send_both_by_request(
+    /// Broadcast to all allocated queues without validation.
+    ///
+    /// Used for peer-dead reset fanout where every queue on this dispatcher
+    /// needs to receive the message regardless of binding_id.
+    pub fn broadcast_both(
         &mut self,
-        params: &K::Request,
         mut stream_data: impl FnMut() -> intrusive::Entry<S>,
         mut control_data: impl FnMut() -> intrusive::Entry<C>,
         mut on_waker: impl FnMut(AutoWake, AutoWake),
     ) {
         self.senders.for_each_sender(|sender| {
             let stream_waker = sender
-                .send_stream(stream_data(), None, params)
+                .push_stream_unchecked(stream_data())
                 .unwrap_or_default();
             let control_waker = sender
-                .send_control(control_data(), None, params)
+                .push_control_unchecked(control_data())
                 .unwrap_or_default();
             on_waker(stream_waker, control_waker);
         });

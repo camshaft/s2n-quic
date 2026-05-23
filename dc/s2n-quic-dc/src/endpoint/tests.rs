@@ -1755,7 +1755,7 @@ fn five_node_random_chatter_settles_after_stop() {
 /// This reproduces the "zombie flow" bug seen in production where flows with unanswered
 /// probes persist indefinitely, inflating pick_two scores.
 #[test]
-#[ignore = "TODO need to figure out what's going on here"]
+#[ignore = "requires per-context idle tracking independent of shared path_secret_entry.last_activity"]
 fn zombie_flow_not_invalidated_when_path_has_other_activity() {
     use crate::testing::ext::*;
     use std::sync::atomic::AtomicBool;

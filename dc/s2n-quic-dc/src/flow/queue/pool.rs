@@ -23,6 +23,10 @@ pub struct Pool<
     memory_handle: Arc<free_list::Memory<S, C, Key>>,
     epoch_summary: Option<counter::Summary>,
     epoch: usize,
+    /// Optional sink for freed-slot notifications (server-side QueueFree emission).
+    pub(super) free_notify: Option<Arc<super::descriptor::FreeNotify>>,
+    /// Optional deferred waker sink, shared by all descriptors in this pool.
+    pub(super) waker_sink: Option<Arc<dyn super::descriptor::WakerSink>>,
 }
 
 impl<S: 'static + Send, C: 'static + Send, Key: 'static + Send, const INITIAL_PAGE_SIZE: usize>
@@ -36,6 +40,8 @@ impl<S: 'static + Send, C: 'static + Send, Key: 'static + Send, const INITIAL_PA
             senders: self.senders.clone(),
             epoch_summary: self.epoch_summary.clone(),
             epoch: self.epoch,
+            free_notify: self.free_notify.clone(),
+            waker_sink: self.waker_sink.clone(),
         }
     }
 }
@@ -48,6 +54,31 @@ where
 {
     #[inline]
     pub fn new(epoch_summary: Option<counter::Summary>) -> Self {
+        Self::with_options(
+            epoch_summary,
+            Some(Arc::new(super::descriptor::FreeNotify::new())),
+            None,
+        )
+    }
+
+    #[inline]
+    pub fn new_with_waker_sink(
+        epoch_summary: Option<counter::Summary>,
+        waker_sink: Arc<dyn super::descriptor::WakerSink>,
+    ) -> Self {
+        Self::with_options(
+            epoch_summary,
+            Some(Arc::new(super::descriptor::FreeNotify::new())),
+            Some(waker_sink),
+        )
+    }
+
+    #[inline]
+    fn with_options(
+        epoch_summary: Option<counter::Summary>,
+        free_notify: Option<Arc<super::descriptor::FreeNotify>>,
+        waker_sink: Option<Arc<dyn super::descriptor::WakerSink>>,
+    ) -> Self {
         let epoch = 0;
         let senders = sender::State::new(epoch);
         let (free, memory_handle) = FreeVec::new(INITIAL_PAGE_SIZE);
@@ -57,6 +88,8 @@ where
             senders,
             epoch_summary,
             epoch,
+            free_notify,
+            waker_sink,
         };
         pool.grow();
         pool
@@ -98,6 +131,33 @@ where
         }
     }
 
+    /// Allocate a specific slot by index, growing pages as needed.
+    ///
+    /// Used by the server to allocate at the exact `dest_queue_id` the client specified.
+    #[inline]
+    pub fn alloc_at_or_grow(
+        &mut self,
+        slot_index: usize,
+        mut key: Key,
+        remote_queue_id: Option<VarInt>,
+    ) -> (Control<S, C, Key>, Stream<S, C, Key>) {
+        loop {
+            match self.free.alloc_at(slot_index, key, remote_queue_id) {
+                Ok(descriptor) => return descriptor,
+                Err(k) => {
+                    key = k;
+                    if self.epoch > slot_index {
+                        panic!(
+                            "slot {} is within range (epoch={}) but not in free list — already allocated",
+                            slot_index, self.epoch
+                        );
+                    }
+                    self.grow();
+                }
+            }
+        }
+    }
+
     #[inline(never)] // this should happen rarely
     fn grow(&mut self) {
         // Page sizes double with each grow: page 0 has INITIAL_PAGE_SIZE slots,
@@ -128,7 +188,12 @@ where
                 let free_list = self.free.clone();
 
                 // initialize the descriptor with the channels
-                descriptor.write(DescriptorInner::new(self.epoch + idx, free_list));
+                descriptor.write(DescriptorInner::new(
+                    self.epoch + idx,
+                    free_list,
+                    self.free_notify.clone(),
+                    self.waker_sink.clone(),
+                ));
 
                 let descriptor = NonNull::new_unchecked(descriptor);
                 let descriptor = Descriptor::new(descriptor);

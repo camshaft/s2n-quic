@@ -76,6 +76,15 @@ pub struct Entry {
     /// *wall-clock time*.  Comparisons between two scores for the same peer at the same
     /// instant are always valid; absolute values have no external meaning.
     sender_load_scores: Box<[AtomicU64]>,
+    /// Per-entry monotonic binding_id counter. Each stream bound through this
+    /// path secret gets a unique binding_id that prevents stale packets from
+    /// being injected into recycled queue slots.
+    next_binding_id: AtomicU64,
+    /// Per-entry queue pool. Both client (connect) and server (recv dispatch)
+    /// allocate from and dispatch to this pool via their own Dispatch handles.
+    // TODO: replace Mutex with a lock-free grow strategy
+    queue_allocator: std::sync::Mutex<crate::endpoint::msg::queue::Allocator>,
+    peer_free_list: Arc<crate::sync::free_list::FreeList>,
 }
 
 impl SizeOf for Entry {
@@ -94,6 +103,9 @@ impl SizeOf for Entry {
             dead_at,
             peer_data_addrs,
             sender_load_scores,
+            next_binding_id,
+            queue_allocator: _,
+            peer_free_list: _,
         } = self;
         creation_time.size()
             + peer.size()
@@ -106,6 +118,7 @@ impl SizeOf for Entry {
             + application_data.size()
             + last_activity.size()
             + dead_at.size()
+            + next_binding_id.size()
             + std::mem::size_of::<PeerDataAddrs>()
             + peer_data_addrs.get().map_or(0, |a| {
                 a.len() * std::mem::size_of::<s2n_quic_core::inet::SocketAddressV6>()
@@ -114,6 +127,7 @@ impl SizeOf for Entry {
             + sender_load_scores.len() * std::mem::size_of::<AtomicU64>()
     }
 }
+
 
 impl SizeOf for Option<ApplicationData> {
     fn size(&self) -> usize {
@@ -179,6 +193,7 @@ impl Entry {
             .max_datagram_size
             .fetch_min(crate::endpoint::MAX_DATAGRAM_SIZE as _, Ordering::Relaxed);
 
+        let initial_max_queues = parameters.initial_max_queues;
         Self {
             creation_time,
             peer,
@@ -193,6 +208,9 @@ impl Entry {
             dead_at: AtomicI64::new(-1),
             peer_data_addrs: PeerDataAddrs::default(),
             sender_load_scores: Self::init_load_scores(socket_sender_count),
+            next_binding_id: AtomicU64::new(0),
+            queue_allocator: std::sync::Mutex::new(crate::endpoint::msg::queue::Allocator::new()),
+            peer_free_list: crate::sync::free_list::FreeList::new(initial_max_queues),
         }
     }
 
@@ -518,6 +536,61 @@ impl Entry {
 
     pub fn parameters(&self) -> dc::ApplicationParams {
         self.parameters.clone()
+    }
+
+    /// Allocate a new binding_id from this entry's monotonic counter.
+    pub fn alloc_binding_id(&self) -> s2n_quic_core::varint::VarInt {
+        let max = s2n_quic_core::varint::VarInt::MAX.as_u64();
+        let id = self
+            .next_binding_id
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |curr| {
+                (curr < max).then_some(curr + 1)
+            })
+            .unwrap_or(max);
+
+        if id == max {
+            error!("binding_id space exhausted; reusing VarInt::MAX");
+            debug_assert!(false, "binding_id space exhausted");
+        }
+
+        // SAFETY: `id <= VarInt::MAX`.
+        unsafe { s2n_quic_core::varint::VarInt::new_unchecked(id) }
+    }
+
+    /// Returns a new dispatcher handle backed by this entry's queue pool.
+    ///
+    /// Server recv contexts obtain a dispatcher at creation time and hold it
+    /// for the context's lifetime.
+    pub fn queue_dispatcher(&self) -> crate::endpoint::msg::queue::Dispatcher {
+        self.queue_allocator.lock().unwrap().dispatcher()
+    }
+
+    /// Allocate a queue ID from the peer free-list, waiting asynchronously if needed.
+    pub async fn alloc_peer_queue_id(&self) -> Option<VarInt> {
+        core::future::poll_fn(|cx| self.peer_free_list.poll_alloc(cx)).await
+    }
+
+    /// Mark a peer queue as freed (called when QueueFree is received from peer).
+    pub fn on_peer_queue_freed(&self, queue_id: VarInt) {
+        self.peer_free_list.free(queue_id);
+    }
+
+    /// Allocates a queue slot from this entry's pool, growing if needed.
+    ///
+    /// Used by the client connect path where only allocation is needed
+    /// (no dispatch routing).
+    pub fn alloc_queue(
+        &self,
+        handle: crate::flow::Handle,
+        remote_queue_id: Option<s2n_quic_core::varint::VarInt>,
+    ) -> (
+        crate::endpoint::msg::queue::Control,
+        crate::endpoint::msg::queue::Stream,
+    ) {
+        self.queue_allocator
+            .lock()
+            .unwrap()
+            .alloc_or_grow(handle, remote_queue_id)
     }
 
     pub fn max_datagram_size(&self) -> u16 {

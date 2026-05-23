@@ -29,22 +29,79 @@ pub trait Key: 'static + Send {
     fn validate(&self, params: &Self::Request) -> Result<(), ValidationError>;
 }
 
+/// Information about a freed queue slot, emitted when both receivers drop.
+#[derive(Debug, Clone, Copy)]
+pub struct FreedSlot {
+    /// The local queue_id that was freed.
+    pub queue_id: VarInt,
+}
+
+/// Lock-guarded freed-slot notification channel with an atomic fast-path check.
+///
+/// Producers push freed slots and set the `has_items` flag. The consumer checks
+/// the flag before acquiring the mutex, skipping it entirely when empty (common case).
+pub struct FreeNotify {
+    has_items: std::sync::atomic::AtomicBool,
+    inner: std::sync::Mutex<Vec<FreedSlot>>,
+}
+
+impl FreeNotify {
+    pub fn new() -> Self {
+        Self {
+            has_items: std::sync::atomic::AtomicBool::new(false),
+            inner: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    pub fn push(&self, slot: FreedSlot) {
+        let mut guard = self.inner.lock().unwrap();
+        guard.push(slot);
+        self.has_items
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Drain all freed slots. Returns an empty Vec without acquiring the mutex
+    /// when no items have been pushed since the last drain.
+    pub fn drain(&self) -> Vec<FreedSlot> {
+        if !self
+            .has_items
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Vec::new();
+        }
+        let mut guard = self.inner.lock().unwrap();
+        self.has_items
+            .store(false, std::sync::atomic::Ordering::Release);
+        core::mem::take(&mut *guard)
+    }
+}
+
+/// Trait for deferring waker invocations off hot threads.
+///
+/// Implementations push the waker into a queue that a separate drain task services,
+/// avoiding inline syscalls on dispatch threads.
+pub trait WakerSink: 'static + Send + Sync {
+    fn defer_wake(&self, waker: std::task::Waker);
+}
+
 /// Indicates why a queue key validation failed
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ValidationError {
-    /// The credential_id in the packet doesn't match the queue's owner
-    CredentialMismatch,
-    /// The stream_id in the packet doesn't match the queue's stream
-    StreamIdMismatch,
+    /// The received binding_id is older than the current slot binding.
+    /// This is a stale packet routed to a recycled slot — drop silently.
+    StaleBinding,
+    /// The received binding_id is newer than the current slot binding.
+    /// This indicates a protocol bug: the client rebound before receiving QueueFree.
+    FutureBinding,
 }
 
 impl ValidationError {
-    /// Returns the reset error code to send to the peer.
-    pub fn as_reset_code(self) -> VarInt {
+    /// Returns the reset error code to send to the peer, if any.
+    pub fn as_reset_code(self) -> Option<VarInt> {
         use crate::stream::endpoint::error;
         match self {
-            Self::CredentialMismatch => error::CREDENTIAL_MISMATCH,
-            Self::StreamIdMismatch => error::STREAM_ID_MISMATCH,
+            Self::StaleBinding => None,
+            Self::FutureBinding => Some(error::BINDING_ID_MISMATCH),
         }
     }
 }
@@ -57,7 +114,7 @@ impl Key for crate::credentials::Credentials {
         if self == params {
             Ok(())
         } else {
-            Err(ValidationError::CredentialMismatch)
+            Err(ValidationError::StaleBinding)
         }
     }
 }
@@ -106,13 +163,23 @@ impl<S: 'static, C: 'static, Key: 'static> Descriptor<S, C, Key> {
         self.ptr.as_ptr().addr()
     }
 
+    /// Returns the slot index (id field) of this descriptor.
+    ///
+    /// # Safety
+    ///
+    /// The descriptor memory must be valid (initialized during pool grow).
+    #[inline]
+    pub(super) unsafe fn queue_id_index(&self) -> usize {
+        self.inner().id.as_u64() as usize
+    }
+
     /// # Safety
     ///
     /// The caller needs to guarantee the [`Descriptor`] is still allocated.
     /// While allocated, `queue_id` is always initialized to a valid `VarInt`.
     #[inline]
     pub unsafe fn queue_id(&self) -> VarInt {
-        let v = self.inner().queue_id.load(Ordering::Relaxed);
+        let v = self.inner().queue_id.load(Ordering::Acquire);
         debug_assert!(
             VarInt::new(v).is_ok(),
             "queue id should be initialized while allocated"
@@ -129,7 +196,7 @@ impl<S: 'static, C: 'static, Key: 'static> Descriptor<S, C, Key> {
     /// The caller needs to guarantee the [`Descriptor`] is still allocated.
     #[inline]
     pub unsafe fn try_queue_id(&self) -> Option<VarInt> {
-        let v = self.inner().queue_id.load(Ordering::Relaxed);
+        let v = self.inner().queue_id.load(Ordering::Acquire);
         VarInt::new(v).ok()
     }
 
@@ -199,14 +266,8 @@ impl<S: 'static, C: 'static, Key: 'static> Descriptor<S, C, Key> {
     pub unsafe fn into_receiver_pair(self, remote_queue_id: Option<VarInt>) -> (Self, Self) {
         let inner = self.inner();
 
-        let generation = {
-            let next_generation = &mut *inner.next_generation.get();
-            let current = *next_generation;
-            *next_generation = current.wrapping_add(1);
-            current
-        };
-        let queue_id = queue_id::encode(inner.id.as_u64() as usize, generation);
-        inner.queue_id.store(queue_id.as_u64(), Ordering::Relaxed);
+        let queue_id = queue_id::encode(inner.id.as_u64() as usize, 0);
+        inner.queue_id.store(queue_id.as_u64(), Ordering::Release);
 
         let has_remote_queue_id = remote_queue_id.is_some();
         if let Some(id) = remote_queue_id {
@@ -253,8 +314,20 @@ impl<S: 'static, C: 'static, Key: 'static> Descriptor<S, C, Key> {
         core::sync::atomic::fence(Ordering::Acquire);
 
         // close both of the queues so the receivers are notified
-        inner.control.close();
-        inner.stream.close();
+        let mut control_wake = inner.control.close();
+        let mut stream_wake = inner.stream.close();
+
+        // Defer waker invocations through the offload sink when available,
+        // avoiding inline syscalls on dispatch threads.
+        if let Some(sink) = &inner.waker_sink {
+            if let Some(waker) = control_wake.take() {
+                sink.defer_wake(waker);
+            }
+            if let Some(waker) = stream_wake.take() {
+                sink.defer_wake(waker);
+            }
+        }
+        // If no sink, AutoWake drops fire inline (acceptable for non-dispatch threads).
 
         probes::on_sender_close(inner.id);
     }
@@ -271,17 +344,30 @@ impl<S: 'static, C: 'static, Key: 'static> Descriptor<S, C, Key> {
         let inner = self.inner();
         probes::on_receiver_drop(inner.id, half);
 
+        // Capture queue IDs before the slot is freed — needed for QueueFree.
+        let remote_queue_id = inner.remote_queue_id.load(Ordering::Relaxed);
+        let queue_id = inner.queue_id.load(Ordering::Relaxed);
+
         ensure!(inner
             .stream
             .close_receiver(&inner.control, half, || {
                 inner
                     .queue_id
-                    .store(REMOTE_QUEUE_ID_UNKNOWN, Ordering::Relaxed);
+                    .store(REMOTE_QUEUE_ID_UNKNOWN, Ordering::Release);
                 inner.clear_key();
             })
             .is_continue());
 
         probes::on_receiver_free(inner.id, half);
+
+        // Notify that this slot has been freed (for QueueFree emission).
+        if let Some(notify) = &inner.free_notify {
+            if VarInt::new(remote_queue_id).is_ok() {
+                if let Ok(queue_id) = VarInt::new(queue_id) {
+                    notify.push(FreedSlot { queue_id });
+                }
+            }
+        }
 
         let storage = inner.free_list.free(Descriptor {
             ptr: self.ptr,
@@ -310,6 +396,45 @@ impl<S: 'static, C: 'static, Key: 'static> Descriptor<S, C, Key> {
             .expect("queue key should be initialized while allocated");
         key.validate(params)
     }
+
+    /// Server-side validation: check key and bind atomically if unbound.
+    ///
+    /// Returns:
+    /// - `Ok(ServerValidation::Bound)` if the key matches (existing binding)
+    /// - `Ok(ServerValidation::NewBinding)` if the key was None and has been set
+    /// - `Err(ValidationError)` if the key exists but doesn't match
+    ///
+    /// # Safety
+    ///
+    /// The caller needs to guarantee the [`Descriptor`] is still allocated and key
+    /// access is synchronized by the queue mutex from the push path.
+    #[inline]
+    pub unsafe fn validate_or_bind(
+        &self,
+        params: &<Key as super::descriptor::Key>::Request,
+        new_key: impl FnOnce() -> Key,
+    ) -> Result<ServerValidation, ValidationError>
+    where
+        Key: super::descriptor::Key,
+    {
+        let inner = self.inner();
+        match (*inner.key.get()).as_ref() {
+            Some(key) => key.validate(params).map(|()| ServerValidation::Bound),
+            None => {
+                *inner.key.get() = Some(new_key());
+                Ok(ServerValidation::NewBinding)
+            }
+        }
+    }
+}
+
+/// Result of server-side validation
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ServerValidation {
+    /// Key matched an existing binding
+    Bound,
+    /// Queue was unbound; key has been set (new binding created)
+    NewBinding,
 }
 
 unsafe impl<S: Send, C: Send, Key: Send> Send for Descriptor<S, C, Key> {}
@@ -329,16 +454,26 @@ pub(super) struct DescriptorInner<S, C, Key> {
     /// Access must be synchronized by holding the queue mutex so key reads and key
     /// clearing cannot race with queue allocation state transitions.
     key: UnsafeCell<Option<Key>>,
-    next_generation: UnsafeCell<u64>,
     stream: Queue<S>,
     control: Queue<C>,
     /// A reference back to the free list
     free_list: Arc<dyn FreeList<S, C, Key>>,
+    /// Optional notification sink for freed slots (QueueFree emission).
+    /// Set by server-side dispatchers; None on client side.
+    free_notify: Option<Arc<FreeNotify>>,
+    /// Optional deferred waker sink. When set, `drop_sender` pushes wakers here
+    /// instead of invoking them inline, avoiding syscalls on dispatch threads.
+    waker_sink: Option<Arc<dyn WakerSink>>,
     senders: AtomicUsize,
 }
 
 impl<S, C, Key> DescriptorInner<S, C, Key> {
-    pub(super) fn new(index: usize, free_list: Arc<dyn FreeList<S, C, Key>>) -> Self {
+    pub(super) fn new(
+        index: usize,
+        free_list: Arc<dyn FreeList<S, C, Key>>,
+        free_notify: Option<Arc<FreeNotify>>,
+        waker_sink: Option<Arc<dyn WakerSink>>,
+    ) -> Self {
         let stream = Queue::new(Half::Stream);
         let control = Queue::new(Half::Control);
         Self {
@@ -346,11 +481,12 @@ impl<S, C, Key> DescriptorInner<S, C, Key> {
             queue_id: AtomicU64::new(REMOTE_QUEUE_ID_UNKNOWN),
             remote_queue_id: AtomicU64::new(REMOTE_QUEUE_ID_UNKNOWN),
             key: UnsafeCell::new(None),
-            next_generation: UnsafeCell::new(0),
             stream,
             control,
             senders: AtomicUsize::new(0),
             free_list,
+            free_notify,
+            waker_sink,
         }
     }
 
@@ -366,17 +502,15 @@ mod tests {
 
     #[test]
     fn queue_id_preserves_slot_bits() {
-        let index = (1usize << queue_id::INDEX_BITS) - 1;
+        let index = queue_id::MAX_SLOTS - 1;
         let queue_id = queue_id::encode(index, 0);
         assert_eq!(queue_id::index(queue_id), index);
     }
 
     #[test]
-    fn queue_id_preserves_generation_bits() {
+    fn queue_id_is_identity() {
         let index = 1234;
-        let generation = queue_id::GENERATION_MASK;
-        let queue_id = queue_id::encode(index, generation);
-        assert_eq!(queue_id::generation(queue_id), generation);
+        let queue_id = queue_id::encode(index, 99999);
         assert_eq!(queue_id::index(queue_id), index);
     }
 }

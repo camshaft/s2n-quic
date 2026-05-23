@@ -74,8 +74,6 @@ pub struct Endpoint {
     pub frame_tx: SubmissionSender,
     /// Path secret map (shared with PSK providers)
     pub path_secret_map: crate::path::secret::Map,
-    /// Queue allocator for flow queues
-    pub queue_allocator: msg::queue::Allocator,
     /// Acceptor registry for server-side stream dispatch
     pub acceptor_registry: acceptor::Registry<PendingValidation>,
     /// Counters associated with this endpoint
@@ -399,9 +397,7 @@ where
     // Frame submission channel: all writers share one sharded sender; one dispatch task drains it.
     let (frame_tx, frame_rx) = frame::submission_channel(submission_shards);
 
-    // Shared flow-queue allocator and dispatch counters -------------------------
-    let queue_allocator = msg::queue::Allocator::new_with_registry(&counter_registry);
-    let queue_dispatcher = queue_allocator.dispatcher();
+    // Dispatch counters -----------------------------------------------------------
     let counters = counters::Dispatch::new(&counter_registry);
 
     // Per-send-worker batch channels -----------------------------------------------
@@ -640,7 +636,6 @@ where
             ack_sender: ack_sender.clone(),
             ack_completion_rx,
             recv_dispatch_idx: recv_dispatch_id,
-            queue_dispatcher: queue_dispatcher.clone(),
             counters: counters.clone(),
             clock: clock.clone(),
             route: ack_route,
@@ -684,7 +679,6 @@ where
         ups_dedup_capacity,
         ups_dedup_window,
         acceptor_cleaner: acceptor_registry.cleaner(),
-        queue_dispatcher: queue_dispatcher.clone(),
         waker_sink: bg_waker_sink,
     });
 
@@ -696,7 +690,6 @@ where
     Endpoint {
         frame_tx,
         path_secret_map,
-        queue_allocator,
         acceptor_registry,
         counters: counter_registry,
         next_stream_id: AtomicU64::new(0),
@@ -773,7 +766,6 @@ struct RecvDispatchParts<Clk, AckSnd, Route> {
     ack_completion_rx: sync_queue::Receiver<msg::Sender>,
     /// Index into the AckCompletionSender's staging array (0..num_recv_dispatch).
     recv_dispatch_idx: RecvDispatchWorkerId,
-    queue_dispatcher: msg::queue::Dispatcher,
     counters: Arc<counters::Dispatch>,
     clock: Clk,
     route: Route,
@@ -798,7 +790,6 @@ struct BackgroundParts<UpsSocket> {
     ups_dedup_capacity: usize,
     ups_dedup_window: core::time::Duration,
     acceptor_cleaner: acceptor::Cleaner<PendingValidation>,
-    queue_dispatcher: msg::queue::Dispatcher,
     waker_sink: waker::Sink,
 }
 
@@ -1020,7 +1011,6 @@ where
                     rd.acceptor_registry,
                     rd.frame_tx,
                     rd.ack_sender.clone(),
-                    rd.queue_dispatcher,
                     rd.counters.clone(),
                     rd.clock,
                     rd.route,
@@ -1157,12 +1147,8 @@ where
                         .receiver("task.peer_dead_broadcast")
                         .with_function("endpoint::Worker::spawn"),
                 );
-                let rx = tasks::peer_dead_broadcast(
-                    peer_dead_rx,
-                    bg.queue_dispatcher,
-                    bg.waker_sink,
-                    peer_dead_counters,
-                );
+                let rx =
+                    tasks::peer_dead_broadcast(peer_dead_rx, bg.waker_sink, peer_dead_counters);
                 let task_counter = counter_registry
                     .register_nominal_task("task.peer_dead_broadcast", "background")
                     .with_registration_metadata(

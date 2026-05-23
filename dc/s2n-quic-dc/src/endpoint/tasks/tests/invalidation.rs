@@ -59,14 +59,15 @@ fn setup_send() -> SendSetup {
 
 fn test_frame(pse: &Arc<crate::path::secret::map::Entry>) -> Entry<Frame> {
     Entry::new(Frame {
-        header: frame::Header::FlowData {
+        header: frame::Header::QueueData {
             queue_pair: crate::packet::datagram::QueuePair {
                 source_queue_id: VarInt::from_u8(1),
                 dest_queue_id: VarInt::from_u8(2),
             },
-            stream_id: VarInt::from_u8(1),
+            binding_id: VarInt::from_u8(1),
             offset: VarInt::ZERO,
             is_fin: false,
+            dest_acceptor_id: None,
         },
         source_sender_id: LocalSenderId::new(VarInt::from_u8(0)),
         payload: Default::default(),

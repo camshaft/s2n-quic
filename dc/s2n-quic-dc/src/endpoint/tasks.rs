@@ -1289,7 +1289,6 @@ pub fn packet_dispatch<
     acceptor_registry: crate::acceptor::Registry<crate::stream::PendingValidation>,
     frame_tx: frame::SubmissionSender,
     mut ack_sender: AckSender,
-    queue_dispatcher: msg::queue::Dispatcher,
     counters: Arc<endpoint::counters::Dispatch>,
     clock: Clk,
     route: Route,
@@ -1308,7 +1307,6 @@ where
 {
     let rx = Map::new(packet_rx, {
         let mut response_tx = frame_tx.clone();
-        let mut queue_dispatcher = queue_dispatcher;
         let counters = counters.clone();
         let mut acceptor_local = acceptor_registry.local();
 
@@ -1324,7 +1322,6 @@ where
                 &frame_tx,
                 &mut response_tx,
                 &mut ack_sender,
-                &mut queue_dispatcher,
                 &clock,
                 &counters,
                 &route,
@@ -1536,9 +1533,7 @@ where
     use crate::time::precision::Timer;
 
     let timer = clock.timer();
-    let dedup_counters = endpoint::ups::DedupCounters {
-        suppressed: counters.dedup_suppressed.clone(),
-    };
+    let dedup_counters = endpoint::ups::DedupCounters {};
     let mut dedup = endpoint::ups::DedupFilter::new(dedup_capacity, dedup_window, dedup_counters);
 
     let rx = FilterMap::new(rx, move |entry: Entry<endpoint::ups::Response>| {
@@ -1626,7 +1621,6 @@ pub struct PeerDeadCounters {
 
 pub fn peer_dead_broadcast<R, WakerSink>(
     peer_dead_rx: R,
-    mut queue_dispatcher: msg::queue::Dispatcher,
     mut waker_sink: WakerSink,
     counters: PeerDeadCounters,
 ) -> impl Receiver<()>
@@ -1634,20 +1628,14 @@ where
     R: Receiver<Entry<PeerDead>>,
     WakerSink: UnboundedSender<crate::flow::queue::AutoWake>,
 {
-    use crate::{endpoint::error::IDLE_TIMEOUT, flow};
+    use crate::endpoint::error::IDLE_TIMEOUT;
 
     Map::new(peer_dead_rx, move |entry: Entry<PeerDead>| {
         counters.events.add(1);
         let peer_dead = entry.into_inner();
-        let credential_id = *peer_dead.path_secret_entry.id();
 
-        let request = flow::Request {
-            credential_id,
-            stream_id: None,
-        };
-
-        queue_dispatcher.send_both_by_request(
-            &request,
+        let mut queue_dispatcher = peer_dead.path_secret_entry.queue_dispatcher();
+        queue_dispatcher.broadcast_both(
             || {
                 msg::Stream::Reset {
                     error_code: IDLE_TIMEOUT,

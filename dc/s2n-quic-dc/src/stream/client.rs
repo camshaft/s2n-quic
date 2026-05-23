@@ -13,18 +13,11 @@
 
 use crate::{
     flow, psk,
-    stream::{
-        endpoint::{msg, Endpoint},
-        Reader, Stream, Writer,
-    },
+    stream::{endpoint::Endpoint, Reader, Stream, Writer},
 };
 use s2n_quic::server::Name;
 use s2n_quic_core::varint::VarInt;
-use std::{
-    io,
-    net::SocketAddr,
-    sync::{atomic::Ordering, Arc},
-};
+use std::{io, net::SocketAddr, sync::Arc};
 
 pub mod rpc;
 
@@ -73,7 +66,6 @@ pub struct Client {
     endpoint: Arc<Endpoint>,
     psk: psk::client::Provider,
     server_name: Name,
-    queue_allocator: msg::queue::Allocator,
 }
 
 impl Client {
@@ -91,12 +83,10 @@ impl Client {
             *psk.map(),
             "PSK provider map must be the same instance as the endpoint map"
         );
-        let queue_allocator = endpoint.queue_allocator.clone();
         Self {
             endpoint,
             psk,
             server_name,
-            queue_allocator,
         }
     }
 
@@ -136,17 +126,30 @@ impl Client {
             ));
         }
 
-        let stream_id =
-            VarInt::new(self.endpoint.next_stream_id.fetch_add(1, Ordering::Relaxed)).unwrap();
+        let binding_id = path_secret_entry.alloc_binding_id();
 
-        let handle = flow::Handle::client(stream_id, path_secret_entry.clone());
+        let handle = flow::Handle::new(binding_id);
+        let (queue_control, queue_stream) = path_secret_entry.alloc_queue(handle, None);
 
-        let (queue_control, queue_stream) = self.queue_allocator.alloc_or_grow(handle, None);
+        let dest_queue_id = path_secret_entry
+            .alloc_peer_queue_id()
+            .await
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::OutOfMemory,
+                    "peer queue id allocator exhausted",
+                )
+            })?;
+        let queue_pair = crate::packet::datagram::QueuePair {
+            source_queue_id: queue_control.queue_id(),
+            dest_queue_id,
+        };
 
         let writer = Writer::new_client(
             self.endpoint.frame_tx.clone(),
             path_secret_entry.clone(),
-            stream_id,
+            binding_id,
+            queue_pair,
             acceptor_id,
             queue_control,
         );
@@ -154,7 +157,7 @@ impl Client {
         let reader = Reader::new_client(
             self.endpoint.frame_tx.clone(),
             path_secret_entry,
-            stream_id,
+            binding_id,
             queue_stream,
         );
 
