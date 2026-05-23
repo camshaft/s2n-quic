@@ -163,6 +163,142 @@ fn ping_pong() {
     });
 }
 
+/// Verifies small writes across several streams are packet-coalesced end-to-end.
+///
+/// The client opens multiple streams up front, sends a single-byte payload on
+/// each, and the server echoes a tiny per-stream response. With batching wired
+/// correctly, the full exchange is:
+/// 1) one client→server packet carrying all stream inits/data
+/// 2) one server→client packet carrying ACK + all responses
+/// 3) one final client→server ACK packet
+#[test]
+fn multistream_small_writes_fit_in_three_packets() {
+    const STREAM_COUNT: usize = 5;
+
+    let acceptor_id = VarInt::from_u8(1);
+    let total_packets = Arc::new(AtomicUsize::new(0));
+    let client_to_server_packets = Arc::new(AtomicUsize::new(0));
+    let server_to_client_packets = Arc::new(AtomicUsize::new(0));
+
+    {
+        let total_packets = total_packets.clone();
+        let client_to_server_packets = client_to_server_packets.clone();
+        let server_to_client_packets = server_to_client_packets.clone();
+        crate::testing::sim(|| {
+            use crate::testing::ext::*;
+
+            {
+                let total_packets = total_packets.clone();
+                let client_to_server_packets = client_to_server_packets.clone();
+                let server_to_client_packets = server_to_client_packets.clone();
+                bach::net::monitor::on_packet_sent(move |packet| {
+                    total_packets.fetch_add(1, Ordering::Relaxed);
+                    if packet.source().port() == SERVER_PORT {
+                        server_to_client_packets.fetch_add(1, Ordering::Relaxed);
+                    } else {
+                        client_to_server_packets.fetch_add(1, Ordering::Relaxed);
+                    }
+                    bach::net::monitor::Command::Pass
+                });
+            }
+
+            // ── Server ────────────────────────────────────────────────────────
+            async move {
+                let server = Server::new();
+                let mut acceptor = server
+                    .register_acceptor_channel(acceptor_id, STREAM_COUNT * 2)
+                    .expect("acceptor registration failed");
+
+                let mut streams = Vec::with_capacity(STREAM_COUNT);
+                for _ in 0..STREAM_COUNT {
+                    let pending = timeout(Duration::from_secs(1), acceptor.recv())
+                        .await
+                        .expect("server accept timed out")
+                        .expect("server should receive stream");
+                    let mut stream = pending.validate().await.expect("server validate");
+
+                    let mut req = Vec::new();
+                    loop {
+                        let n = stream.read_into(&mut req).await.expect("server read");
+                        if n == 0 {
+                            break;
+                        }
+                    }
+                    assert_eq!(req.len(), 1, "expected one-byte request");
+                    streams.push((req[0], stream));
+                }
+
+                for (id, mut stream) in streams {
+                    let response = [id, id ^ 0xff];
+                    stream
+                        .write_all_from_fin(&mut &response[..])
+                        .await
+                        .expect("server write");
+                }
+            }
+            .group("server")
+            .spawn();
+
+            // ── Client ────────────────────────────────────────────────────────
+            async move {
+                let mut client = Client::new();
+                let mut streams = Vec::with_capacity(STREAM_COUNT);
+
+                for id in 0..STREAM_COUNT as u8 {
+                    let stream = client
+                        .connect("server:0", acceptor_id)
+                        .await
+                        .expect("connect failed");
+                    streams.push((id, stream));
+                }
+
+                let mut streams = streams;
+                for (id, stream) in streams.iter_mut() {
+                    let payload = [*id];
+                    stream
+                        .write_all_from_fin(&mut &payload[..])
+                        .await
+                        .expect("client write");
+                }
+
+                for (id, stream) in streams.iter_mut() {
+                    let mut response = Vec::with_capacity(2);
+                    loop {
+                        let n = stream.read_into(&mut response).await.expect("client read");
+                        if n == 0 {
+                            break;
+                        }
+                    }
+                    assert_eq!(
+                        response.as_slice(),
+                        &[*id, *id ^ 0xff],
+                        "unexpected response payload"
+                    );
+                }
+            }
+            .group("client")
+            .primary()
+            .spawn();
+        });
+    }
+
+    assert_eq!(
+        total_packets.load(Ordering::Relaxed),
+        3,
+        "expected exactly 3 packets in the simulation"
+    );
+    assert_eq!(
+        server_to_client_packets.load(Ordering::Relaxed),
+        1,
+        "expected one batched server response packet"
+    );
+    assert_eq!(
+        client_to_server_packets.load(Ordering::Relaxed),
+        2,
+        "expected one batched client request packet and one final ACK packet"
+    );
+}
+
 /// Verifies that PTO retransmission recovers from lost server responses.
 ///
 /// The server sends "pong" back to the client but the first response packet is
