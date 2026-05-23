@@ -19,7 +19,7 @@ mod queue_id;
 mod sender;
 
 // Re-export the Key trait
-pub use descriptor::{FreedSlot, Key, ServerValidation, ValidationError};
+pub use descriptor::{FreeNotify, FreedSlot, Key, ServerValidation, ValidationError, WakerSink};
 pub use inner::AutoWake;
 pub const MAX_SLOTS: usize = queue_id::MAX_SLOTS;
 
@@ -108,12 +108,27 @@ where
     }
 
     #[inline]
+    pub fn new_with_waker_sink(
+        registry: &counter::Registry,
+        waker_sink: Arc<dyn WakerSink>,
+    ) -> Self {
+        let epoch_summary = registry
+            .register_summary("flow.queue.epoch", counter::Unit::Count)
+            .with_description(
+                "Upper bound of allocated queue slots (epoch) after each allocator growth",
+            );
+        Self {
+            pool: pool::Pool::new_with_waker_sink(Some(epoch_summary), waker_sink),
+        }
+    }
+
+    #[inline]
     pub fn dispatcher(&self) -> Dispatch<S, C, K> {
         let free_notify = self
             .pool
             .free_notify
             .clone()
-            .unwrap_or_else(|| Arc::new(std::sync::Mutex::new(Vec::new())));
+            .unwrap_or_else(|| Arc::new(descriptor::FreeNotify::new()));
         Dispatch {
             senders: self.pool.senders(),
             is_open: true,
@@ -153,7 +168,7 @@ where
     pool: pool::Pool<S, C, K, INITIAL_PAGE_SIZE>,
     /// Shared sink for freed-slot notifications. Populated by descriptor drop_receiver
     /// when both queue halves close. Drained by the dispatch layer to emit QueueFree.
-    free_notify: Arc<std::sync::Mutex<Vec<FreedSlot>>>,
+    free_notify: Arc<descriptor::FreeNotify>,
 }
 
 impl<S, C, K> Clone for Dispatch<S, C, K>
@@ -213,12 +228,9 @@ where
     ///
     /// Returns freed slot entries representing queue slots whose both stream and
     /// control receivers have dropped. Used by the server to emit QueueFree frames.
+    /// Skips the mutex entirely when no items have been pushed (atomic fast-path).
     pub fn drain_freed(&mut self) -> Vec<FreedSlot> {
-        let mut guard = self.free_notify.lock().unwrap();
-        if guard.is_empty() {
-            return Vec::new();
-        }
-        core::mem::take(&mut *guard)
+        self.free_notify.drain()
     }
 
     #[inline]

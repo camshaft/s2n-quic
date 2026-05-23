@@ -36,6 +36,54 @@ pub struct FreedSlot {
     pub queue_id: VarInt,
 }
 
+/// Lock-guarded freed-slot notification channel with an atomic fast-path check.
+///
+/// Producers push freed slots and set the `has_items` flag. The consumer checks
+/// the flag before acquiring the mutex, skipping it entirely when empty (common case).
+pub struct FreeNotify {
+    has_items: std::sync::atomic::AtomicBool,
+    inner: std::sync::Mutex<Vec<FreedSlot>>,
+}
+
+impl FreeNotify {
+    pub fn new() -> Self {
+        Self {
+            has_items: std::sync::atomic::AtomicBool::new(false),
+            inner: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    pub fn push(&self, slot: FreedSlot) {
+        let mut guard = self.inner.lock().unwrap();
+        guard.push(slot);
+        self.has_items
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Drain all freed slots. Returns an empty Vec without acquiring the mutex
+    /// when no items have been pushed since the last drain.
+    pub fn drain(&self) -> Vec<FreedSlot> {
+        if !self
+            .has_items
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Vec::new();
+        }
+        let mut guard = self.inner.lock().unwrap();
+        self.has_items
+            .store(false, std::sync::atomic::Ordering::Release);
+        core::mem::take(&mut *guard)
+    }
+}
+
+/// Trait for deferring waker invocations off hot threads.
+///
+/// Implementations push the waker into a queue that a separate drain task services,
+/// avoiding inline syscalls on dispatch threads.
+pub trait WakerSink: 'static + Send + Sync {
+    fn defer_wake(&self, waker: std::task::Waker);
+}
+
 /// Indicates why a queue key validation failed
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ValidationError {
@@ -131,7 +179,7 @@ impl<S: 'static, C: 'static, Key: 'static> Descriptor<S, C, Key> {
     /// While allocated, `queue_id` is always initialized to a valid `VarInt`.
     #[inline]
     pub unsafe fn queue_id(&self) -> VarInt {
-        let v = self.inner().queue_id.load(Ordering::Relaxed);
+        let v = self.inner().queue_id.load(Ordering::Acquire);
         debug_assert!(
             VarInt::new(v).is_ok(),
             "queue id should be initialized while allocated"
@@ -148,7 +196,7 @@ impl<S: 'static, C: 'static, Key: 'static> Descriptor<S, C, Key> {
     /// The caller needs to guarantee the [`Descriptor`] is still allocated.
     #[inline]
     pub unsafe fn try_queue_id(&self) -> Option<VarInt> {
-        let v = self.inner().queue_id.load(Ordering::Relaxed);
+        let v = self.inner().queue_id.load(Ordering::Acquire);
         VarInt::new(v).ok()
     }
 
@@ -219,7 +267,7 @@ impl<S: 'static, C: 'static, Key: 'static> Descriptor<S, C, Key> {
         let inner = self.inner();
 
         let queue_id = queue_id::encode(inner.id.as_u64() as usize, 0);
-        inner.queue_id.store(queue_id.as_u64(), Ordering::Relaxed);
+        inner.queue_id.store(queue_id.as_u64(), Ordering::Release);
 
         let has_remote_queue_id = remote_queue_id.is_some();
         if let Some(id) = remote_queue_id {
@@ -266,8 +314,20 @@ impl<S: 'static, C: 'static, Key: 'static> Descriptor<S, C, Key> {
         core::sync::atomic::fence(Ordering::Acquire);
 
         // close both of the queues so the receivers are notified
-        inner.control.close();
-        inner.stream.close();
+        let mut control_wake = inner.control.close();
+        let mut stream_wake = inner.stream.close();
+
+        // Defer waker invocations through the offload sink when available,
+        // avoiding inline syscalls on dispatch threads.
+        if let Some(sink) = &inner.waker_sink {
+            if let Some(waker) = control_wake.take() {
+                sink.defer_wake(waker);
+            }
+            if let Some(waker) = stream_wake.take() {
+                sink.defer_wake(waker);
+            }
+        }
+        // If no sink, AutoWake drops fire inline (acceptable for non-dispatch threads).
 
         probes::on_sender_close(inner.id);
     }
@@ -293,7 +353,7 @@ impl<S: 'static, C: 'static, Key: 'static> Descriptor<S, C, Key> {
             .close_receiver(&inner.control, half, || {
                 inner
                     .queue_id
-                    .store(REMOTE_QUEUE_ID_UNKNOWN, Ordering::Relaxed);
+                    .store(REMOTE_QUEUE_ID_UNKNOWN, Ordering::Release);
                 inner.clear_key();
             })
             .is_continue());
@@ -304,7 +364,7 @@ impl<S: 'static, C: 'static, Key: 'static> Descriptor<S, C, Key> {
         if let Some(notify) = &inner.free_notify {
             if VarInt::new(remote_queue_id).is_ok() {
                 if let Ok(queue_id) = VarInt::new(queue_id) {
-                    notify.lock().unwrap().push(FreedSlot { queue_id });
+                    notify.push(FreedSlot { queue_id });
                 }
             }
         }
@@ -400,7 +460,10 @@ pub(super) struct DescriptorInner<S, C, Key> {
     free_list: Arc<dyn FreeList<S, C, Key>>,
     /// Optional notification sink for freed slots (QueueFree emission).
     /// Set by server-side dispatchers; None on client side.
-    free_notify: Option<Arc<std::sync::Mutex<Vec<FreedSlot>>>>,
+    free_notify: Option<Arc<FreeNotify>>,
+    /// Optional deferred waker sink. When set, `drop_sender` pushes wakers here
+    /// instead of invoking them inline, avoiding syscalls on dispatch threads.
+    waker_sink: Option<Arc<dyn WakerSink>>,
     senders: AtomicUsize,
 }
 
@@ -408,7 +471,8 @@ impl<S, C, Key> DescriptorInner<S, C, Key> {
     pub(super) fn new(
         index: usize,
         free_list: Arc<dyn FreeList<S, C, Key>>,
-        free_notify: Option<Arc<std::sync::Mutex<Vec<FreedSlot>>>>,
+        free_notify: Option<Arc<FreeNotify>>,
+        waker_sink: Option<Arc<dyn WakerSink>>,
     ) -> Self {
         let stream = Queue::new(Half::Stream);
         let control = Queue::new(Half::Control);
@@ -422,6 +486,7 @@ impl<S, C, Key> DescriptorInner<S, C, Key> {
             senders: AtomicUsize::new(0),
             free_list,
             free_notify,
+            waker_sink,
         }
     }
 

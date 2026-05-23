@@ -28,6 +28,9 @@ pub struct FreeList {
     inner: Mutex<Inner>,
 }
 
+/// Maximum number of pending waiters to prevent unbounded growth under sustained exhaustion.
+const MAX_WAITERS: usize = 4096;
+
 struct Inner {
     freed: VecDeque<VarInt>,
     waiters: VecDeque<Waker>,
@@ -57,17 +60,34 @@ impl FreeList {
         })
     }
 
+    /// Try to allocate a fresh ID from the high-water mark using a CAS loop.
+    ///
+    /// Returns `Some(id)` on success, `None` if the mark has reached max_queues.
+    #[inline]
+    fn try_alloc_fresh(&self) -> Option<VarInt> {
+        loop {
+            let current = self.high_water_mark.load(Ordering::Relaxed);
+            if current >= self.max_queues {
+                return None;
+            }
+            match self.high_water_mark.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return VarInt::new(current).ok(),
+                Err(_) => continue,
+            }
+        }
+    }
+
     /// Try to allocate a queue ID without blocking.
     ///
     /// Returns `Some(id)` if a fresh or recycled ID is available, `None` if exhausted.
     pub fn try_alloc(&self) -> Option<VarInt> {
-        let current = self.high_water_mark.load(Ordering::Relaxed);
-        if current < self.max_queues {
-            let prev = self.high_water_mark.fetch_add(1, Ordering::Relaxed);
-            if prev < self.max_queues {
-                return VarInt::new(prev).ok();
-            }
-            // Raced past max — try freed list
+        if let Some(id) = self.try_alloc_fresh() {
+            return Some(id);
         }
 
         let mut inner = self.inner.lock().unwrap();
@@ -76,15 +96,11 @@ impl FreeList {
 
     /// Poll for a queue ID allocation (async path).
     ///
-    /// Fast path: try high-water mark increment (lock-free).
+    /// Fast path: try high-water mark increment (lock-free CAS).
     /// Slow path: try freed list, or register waker and return Pending.
     pub fn poll_alloc(&self, cx: &mut Context) -> Poll<Option<VarInt>> {
-        let current = self.high_water_mark.load(Ordering::Relaxed);
-        if current < self.max_queues {
-            let prev = self.high_water_mark.fetch_add(1, Ordering::Relaxed);
-            if prev < self.max_queues {
-                return Poll::Ready(VarInt::new(prev).ok());
-            }
+        if let Some(id) = self.try_alloc_fresh() {
+            return Poll::Ready(Some(id));
         }
 
         let mut inner = self.inner.lock().unwrap();
@@ -95,8 +111,11 @@ impl FreeList {
             return Poll::Ready(Some(id));
         }
 
-        let waker = cx.waker().clone();
-        inner.waiters.push_back(waker);
+        // Cap waiter queue to prevent unbounded growth under sustained exhaustion.
+        if inner.waiters.len() >= MAX_WAITERS {
+            inner.waiters.pop_front();
+        }
+        inner.waiters.push_back(cx.waker().clone());
         Poll::Pending
     }
 
