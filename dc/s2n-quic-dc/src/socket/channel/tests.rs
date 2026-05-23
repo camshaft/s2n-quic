@@ -3,7 +3,8 @@
 
 use super::*;
 use crate::{intrusive, testing::sim};
-use core::{future::Future, pin::pin};
+use core::{cell::Cell, future::Future, pin::pin};
+use std::rc::Rc;
 
 trait SenderExt<T>: Sender<T> {
     async fn send(&mut self, value: T) -> Result<(), T> {
@@ -365,6 +366,72 @@ fn priority_partial_close() {
             drop(tx1);
             let val = priority.recv(&mut budget).await;
             assert_eq!(val, None);
+        }
+        .primary()
+        .spawn();
+    });
+}
+
+struct CountingOnConsumed<R> {
+    inner: R,
+    consumed: Rc<Cell<u64>>,
+}
+
+impl<R> CountingOnConsumed<R> {
+    fn new(inner: R, consumed: Rc<Cell<u64>>) -> Self {
+        Self { inner, consumed }
+    }
+}
+
+impl<T, R> Receiver<T> for CountingOnConsumed<R>
+where
+    R: Receiver<T>,
+{
+    fn poll_recv(
+        &mut self,
+        cx: &mut core::task::Context<'_>,
+        budget: &mut Budget,
+    ) -> Poll<Option<T>> {
+        self.inner.poll_recv(cx, budget)
+    }
+
+    fn on_consumed(&mut self, bytes: u64) {
+        self.consumed.set(self.consumed.get() + bytes);
+        self.inner.on_consumed(bytes);
+    }
+}
+
+#[test]
+fn priority_select_on_consumed_notifies_last_ready_receiver() {
+    let _no_snap = crate::testing::without_snapshots();
+    sim(|| {
+        use crate::testing::ext::*;
+
+        async {
+            let (mut priority_tx, priority_rx) = cell::sync::new::<u32>();
+            let (mut fallback_tx, fallback_rx) = cell::sync::new::<u32>();
+
+            let priority_consumed = Rc::new(Cell::new(0));
+            let fallback_consumed = Rc::new(Cell::new(0));
+
+            let mut select = PrioritySelect::new(
+                CountingOnConsumed::new(priority_rx, priority_consumed.clone()),
+                CountingOnConsumed::new(fallback_rx, fallback_consumed.clone()),
+            );
+            let mut budget = Budget::new(usize::MAX);
+
+            fallback_tx.send(1).await.unwrap();
+            assert_eq!(select.recv(&mut budget).await, Some(1));
+            select.on_consumed(5);
+            assert_eq!(priority_consumed.get(), 0);
+            assert_eq!(fallback_consumed.get(), 5);
+
+            priority_tx.send(2).await.unwrap();
+            fallback_tx.send(3).await.unwrap();
+            assert_eq!(select.recv(&mut budget).await, Some(2));
+            select.on_consumed(7);
+            assert_eq!(priority_consumed.get(), 7);
+            assert_eq!(fallback_consumed.get(), 5);
         }
         .primary()
         .spawn();

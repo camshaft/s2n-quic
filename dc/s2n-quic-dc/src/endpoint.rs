@@ -9,8 +9,8 @@ use crate::{
     endpoint::{
         frame::SubmissionSender,
         id::{
-            Id, IdJoin, IdMap, LocalSendSocketId, LocalSenderId, RecvDispatchWorkerId,
-            RecvIoWorkerId, SendWorkerId,
+            Id, IdJoin, IdMap, LocalRecvSocketId, LocalSendSocketId, LocalSenderId,
+            RecvDispatchWorkerId, SendWorkerId,
         },
     },
     intrusive::Entry,
@@ -654,7 +654,6 @@ where
     let num_recv_io_workers = layout.recv_io.len();
     for (recv_socket_id, socket) in recv_sockets.into_iter() {
         let raw_idx = recv_socket_id.as_usize();
-        let recv_io_id = RecvIoWorkerId::new(raw_idx);
         let worker_id = layout.recv_io[raw_idx % num_recv_io_workers];
         let router = worker::FanOutRouter::<_, RecvRoute, _>::new(
             dispatch_txs.clone(),
@@ -662,7 +661,7 @@ where
             &counter_registry,
         );
         workers[worker_id].recv_sockets.push(RecvSocketParts {
-            idx: recv_io_id,
+            idx: recv_socket_id,
             socket,
             recv_pool: recv_pool.clone(),
             router,
@@ -757,7 +756,7 @@ type PacketReceiver = sync_queue::Receiver<packet::datagram::decoder::Packet<des
 
 /// Ingredients for a recv IO worker (socket read + decode + fan-out).
 struct RecvSocketParts<Socket, Route, Inv> {
-    idx: RecvIoWorkerId,
+    idx: LocalRecvSocketId,
     socket: Socket,
     recv_pool: crate::socket::pool::Pool,
     router: worker::FanOutRouter<PacketSender, Route, Inv>,

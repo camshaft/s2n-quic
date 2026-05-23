@@ -1562,10 +1562,17 @@ where
 // ── PrioritySelect ───────────────────────────────────────────────────────
 
 /// Polls a high-priority receiver first; falls back to a low-priority receiver
-/// only when the priority receiver is pending.
+/// only when the priority receiver is pending or closed.
+#[derive(Clone, Copy)]
+enum PrioritySelectBranch {
+    Priority,
+    Fallback,
+}
+
 pub struct PrioritySelect<T, A, B> {
     priority: A,
     fallback: B,
+    last_recv_branch: Option<PrioritySelectBranch>,
     _phantom: PhantomData<T>,
 }
 
@@ -1574,6 +1581,7 @@ impl<T, A, B> PrioritySelect<T, A, B> {
         Self {
             priority,
             fallback,
+            last_recv_branch: None,
             _phantom: PhantomData,
         }
     }
@@ -1586,15 +1594,27 @@ where
 {
     fn poll_recv(&mut self, cx: &mut task::Context<'_>, budget: &mut Budget) -> Poll<Option<T>> {
         match self.priority.poll_recv(cx, budget) {
-            Poll::Ready(Some(value)) => return Poll::Ready(Some(value)),
+            Poll::Ready(Some(value)) => {
+                self.last_recv_branch = Some(PrioritySelectBranch::Priority);
+                return Poll::Ready(Some(value));
+            }
             Poll::Ready(None) => {}
             Poll::Pending => {}
         }
-        self.fallback.poll_recv(cx, budget)
+        match self.fallback.poll_recv(cx, budget) {
+            Poll::Ready(Some(value)) => {
+                self.last_recv_branch = Some(PrioritySelectBranch::Fallback);
+                Poll::Ready(Some(value))
+            }
+            other => other,
+        }
     }
 
     fn on_consumed(&mut self, bytes: u64) {
-        self.priority.on_consumed(bytes);
-        self.fallback.on_consumed(bytes);
+        match self.last_recv_branch {
+            Some(PrioritySelectBranch::Priority) => self.priority.on_consumed(bytes),
+            Some(PrioritySelectBranch::Fallback) => self.fallback.on_consumed(bytes),
+            None => {}
+        }
     }
 }
