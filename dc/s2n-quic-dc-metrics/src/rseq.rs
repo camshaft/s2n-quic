@@ -1109,6 +1109,7 @@ mod tests {
         unsafe {
             channels.send_event_slow(NonNull::from(&mut rseq), 0u64);
         }
+        channels.steal_pages();
         assert_eq!(channels.get_mut(0, std::mem::take).value, 1);
         drop(channels);
 
@@ -1120,6 +1121,7 @@ mod tests {
         unsafe {
             channels.send_event_slow(NonNull::from(&mut rseq), 0u64);
         }
+        channels.steal_pages();
         assert_eq!(channels.get_mut(0, std::mem::take).value, 1);
         drop(channels);
 
@@ -1140,11 +1142,6 @@ mod tests {
             // Didn't fallback.
             assert_eq!(channels.fallback.len(), 0);
 
-            // And no events were sent on the channel -- we allocated a page and added it (this is
-            // actually sort of tested above) but because no page existed, there wasn't anything to
-            // take out and send.
-            assert_eq!(channels.get_mut(0, std::mem::take).value, 0);
-
             // Only allocated exactly one CPU, at the right index.
             assert!(!channels.per_cpu[idx as usize].get_mut().is_null());
             for (cpu_idx, cpu) in channels.per_cpu.iter_mut().enumerate() {
@@ -1154,6 +1151,9 @@ mod tests {
                 assert!(cpu.get_mut().is_null());
             }
 
+            channels.steal_pages();
+            assert_eq!(channels.get_mut(0, std::mem::take).value, 1);
+
             // Repeating the slow-send on the same CPU *will* persist exactly one event.
             unsafe {
                 channels.send_event_slow(NonNull::from(&mut rseq), 0u64);
@@ -1162,15 +1162,10 @@ mod tests {
             // Didn't fallback.
             assert_eq!(channels.fallback.len(), 0);
 
-            // And no events were sent on the channel -- we allocated a page and added it (this is
-            // actually sort of tested above) but because no page existed, there wasn't anything to
-            // take out and send.
+            channels.steal_pages();
             assert_eq!(channels.get_mut(0, std::mem::take).value, 1);
 
-            // And a new page is now persisted.
-            let taken = std::mem::take(channels.per_cpu[idx as usize].get_mut());
-            assert!(!taken.is_null());
-            drop(unsafe { Box::from_raw(taken) });
+            // Pages are consumed when we aggregate.
             for cpu in channels.per_cpu.iter_mut() {
                 assert!(cpu.get_mut().is_null());
             }
