@@ -66,6 +66,18 @@ impl core::fmt::Display for NonZeroDisplay {
     }
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct NetDevTotals {
+    rx_bytes: u64,
+    rx_packets: u64,
+    rx_errors: u64,
+    rx_dropped: u64,
+    tx_bytes: u64,
+    tx_packets: u64,
+    tx_errors: u64,
+    tx_dropped: u64,
+}
+
 const DEFAULT_STATSD_UDP_MAX_PAYLOAD: usize = 1200;
 const STATSD_HISTOGRAM_PERCENTILES: [u32; 4] = [50, 90, 95, 99];
 
@@ -554,6 +566,119 @@ fn report_once(
         let payload = ReportingPayload::from_line(&line);
         dispatch_payload_to_sinks(sinks, &payload, prefix);
     }
+}
+
+fn parse_named_proc_counter(content: &str, section: &str, field: &str) -> u64 {
+    let mut lines = content.lines();
+    while let Some(header_line) = lines.next() {
+        let Some(value_line) = lines.next() else {
+            break;
+        };
+        if !header_line.starts_with(section) {
+            continue;
+        }
+
+        let headers: Vec<&str> = header_line.split_whitespace().collect();
+        let values: Vec<&str> = value_line.split_whitespace().collect();
+
+        for (idx, name) in headers.iter().enumerate() {
+            if *name == field {
+                return values
+                    .get(idx)
+                    .and_then(|value| value.parse::<u64>().ok())
+                    .unwrap_or(0);
+            }
+        }
+    }
+
+    0
+}
+
+fn parse_udp_socket_drops(content: &str) -> u64 {
+    content
+        .lines()
+        .skip(1)
+        .filter_map(|line| line.split_whitespace().nth(12))
+        .filter_map(|value| value.parse::<u64>().ok())
+        .sum()
+}
+
+fn parse_softnet_column_sum(content: &str, column: usize) -> u64 {
+    content
+        .lines()
+        .filter_map(|line| line.split_whitespace().nth(column))
+        .filter_map(|value| u64::from_str_radix(value, 16).ok())
+        .sum()
+}
+
+fn parse_netdev_totals(content: &str) -> NetDevTotals {
+    let mut totals = NetDevTotals::default();
+    for line in content.lines().skip(2) {
+        let Some((interface, counters)) = line.split_once(':') else {
+            continue;
+        };
+        if interface.trim() == "lo" {
+            continue;
+        }
+
+        let values: Vec<&str> = counters.split_whitespace().collect();
+        if values.len() < 16 {
+            continue;
+        }
+
+        totals.rx_bytes += values[0].parse::<u64>().unwrap_or(0);
+        totals.rx_packets += values[1].parse::<u64>().unwrap_or(0);
+        totals.rx_errors += values[2].parse::<u64>().unwrap_or(0);
+        totals.rx_dropped += values[3].parse::<u64>().unwrap_or(0);
+        totals.tx_bytes += values[8].parse::<u64>().unwrap_or(0);
+        totals.tx_packets += values[9].parse::<u64>().unwrap_or(0);
+        totals.tx_errors += values[10].parse::<u64>().unwrap_or(0);
+        totals.tx_dropped += values[11].parse::<u64>().unwrap_or(0);
+    }
+    totals
+}
+
+fn parse_sockstat_value(content: &str, protocol: &str, field: &str) -> u64 {
+    for line in content.lines() {
+        if !line.starts_with(protocol) {
+            continue;
+        }
+        let mut parts = line.split_whitespace();
+        let _ = parts.next();
+        while let Some(name) = parts.next() {
+            let Some(value) = parts.next() else {
+                break;
+            };
+            if name == field {
+                return value.parse::<u64>().unwrap_or(0);
+            }
+        }
+    }
+    0
+}
+
+fn read_file(path: &str) -> String {
+    std::fs::read_to_string(path).unwrap_or_default()
+}
+
+fn read_proc_counter(path: &str, section: &str, field: &str) -> u64 {
+    parse_named_proc_counter(&read_file(path), section, field)
+}
+
+fn read_udp_socket_drops(path: &str) -> u64 {
+    parse_udp_socket_drops(&read_file(path))
+}
+
+fn read_softnet_column(path: &str, column: usize) -> u64 {
+    parse_softnet_column_sum(&read_file(path), column)
+}
+
+fn read_netdev_totals(path: &str) -> NetDevTotals {
+    parse_netdev_totals(&read_file(path))
+}
+
+fn read_sockstat_value(path: &str, protocol: &str, field: &str) -> u64 {
+    parse_sockstat_value(&read_file(path), protocol, field)
 }
 
 // ── Counter ─────────────────────────────────────────────────────────────────
@@ -2378,15 +2503,176 @@ impl Registry {
     }
 
     pub fn new() -> Self {
-        Self {
+        let registry = Self {
             inner: s2n_quic_dc_metrics::Registry::new(),
             queue_gauges: Arc::new(Mutex::new(HashMap::new())),
             queue_metadata: Arc::new(Mutex::new(HashMap::new())),
             queue_endpoint_metadata: Arc::new(Mutex::new(HashMap::new())),
             metric_metadata: Arc::new(Mutex::new(HashMap::new())),
             topology: Arc::new(Mutex::new(Topology::default())),
-        }
+        };
+        registry.register_host_network_metrics();
+        registry
     }
+
+    #[cfg(target_os = "linux")]
+    fn register_host_network_metrics(&self) {
+        macro_rules! register_host_metric {
+            ($label:expr, $unit:expr, $description:expr, $callback:expr) => {{
+                self.inner
+                    .register_list_callback($label.to_string(), None, $unit, $callback);
+                self.register_metric_metadata(
+                    $label,
+                    None,
+                    MetricKind::Gauge,
+                    Self::unit_str($unit),
+                    $description,
+                );
+            }};
+        }
+
+        register_host_metric!(
+            "host.udp.in_datagrams",
+            Unit::Count,
+            "Kernel UDP InDatagrams from /proc/net/snmp",
+            || read_proc_counter("/proc/net/snmp", "Udp:", "InDatagrams")
+        );
+        register_host_metric!(
+            "host.udp.out_datagrams",
+            Unit::Count,
+            "Kernel UDP OutDatagrams from /proc/net/snmp",
+            || read_proc_counter("/proc/net/snmp", "Udp:", "OutDatagrams")
+        );
+        register_host_metric!(
+            "host.udp.no_ports",
+            Unit::Count,
+            "Kernel UDP NoPorts from /proc/net/snmp",
+            || read_proc_counter("/proc/net/snmp", "Udp:", "NoPorts")
+        );
+        register_host_metric!(
+            "host.udp.in_errors",
+            Unit::Count,
+            "Kernel UDP InErrors from /proc/net/snmp",
+            || read_proc_counter("/proc/net/snmp", "Udp:", "InErrors")
+        );
+        register_host_metric!(
+            "host.udp.rcvbuf_errors",
+            Unit::Count,
+            "Kernel UDP RcvbufErrors from /proc/net/snmp",
+            || read_proc_counter("/proc/net/snmp", "Udp:", "RcvbufErrors")
+        );
+        register_host_metric!(
+            "host.udp.sndbuf_errors",
+            Unit::Count,
+            "Kernel UDP SndbufErrors from /proc/net/snmp",
+            || read_proc_counter("/proc/net/snmp", "Udp:", "SndbufErrors")
+        );
+        register_host_metric!(
+            "host.udp.in_csum_errors",
+            Unit::Count,
+            "Kernel UDP InCsumErrors from /proc/net/snmp",
+            || read_proc_counter("/proc/net/snmp", "Udp:", "InCsumErrors")
+        );
+        register_host_metric!(
+            "host.udp.ignored_multi",
+            Unit::Count,
+            "Kernel UDP IgnoredMulti from /proc/net/snmp",
+            || read_proc_counter("/proc/net/snmp", "Udp:", "IgnoredMulti")
+        );
+        register_host_metric!(
+            "host.udp.socket_drops",
+            Unit::Count,
+            "Kernel UDP per-socket drops from /proc/net/udp and /proc/net/udp6",
+            || read_udp_socket_drops("/proc/net/udp") + read_udp_socket_drops("/proc/net/udp6")
+        );
+        register_host_metric!(
+            "host.softnet.processed",
+            Unit::Count,
+            "Packets processed across CPUs from /proc/net/softnet_stat",
+            || read_softnet_column("/proc/net/softnet_stat", 0)
+        );
+        register_host_metric!(
+            "host.softnet.dropped",
+            Unit::Count,
+            "Packets dropped by softnet across CPUs from /proc/net/softnet_stat",
+            || read_softnet_column("/proc/net/softnet_stat", 1)
+        );
+        register_host_metric!(
+            "host.softnet.time_squeezed",
+            Unit::Count,
+            "Softnet time_squeezed events across CPUs from /proc/net/softnet_stat",
+            || read_softnet_column("/proc/net/softnet_stat", 2)
+        );
+        register_host_metric!(
+            "host.sockstat.udp.inuse",
+            Unit::Count,
+            "Current UDP sockets in use from /proc/net/sockstat",
+            || read_sockstat_value("/proc/net/sockstat", "UDP:", "inuse")
+        );
+        register_host_metric!(
+            "host.sockstat.udp.mem",
+            Unit::Count,
+            "UDP memory pages from /proc/net/sockstat",
+            || read_sockstat_value("/proc/net/sockstat", "UDP:", "mem")
+        );
+        register_host_metric!(
+            "host.sockstat.udp6.inuse",
+            Unit::Count,
+            "Current UDP6 sockets in use from /proc/net/sockstat6",
+            || read_sockstat_value("/proc/net/sockstat6", "UDP6:", "inuse")
+        );
+        register_host_metric!(
+            "host.netdev.rx.bytes",
+            Unit::Byte,
+            "Total received bytes across non-loopback interfaces from /proc/net/dev",
+            || read_netdev_totals("/proc/net/dev").rx_bytes
+        );
+        register_host_metric!(
+            "host.netdev.rx.packets",
+            Unit::Count,
+            "Total received packets across non-loopback interfaces from /proc/net/dev",
+            || read_netdev_totals("/proc/net/dev").rx_packets
+        );
+        register_host_metric!(
+            "host.netdev.rx.errors",
+            Unit::Count,
+            "Total receive errors across non-loopback interfaces from /proc/net/dev",
+            || read_netdev_totals("/proc/net/dev").rx_errors
+        );
+        register_host_metric!(
+            "host.netdev.rx.dropped",
+            Unit::Count,
+            "Total receive drops across non-loopback interfaces from /proc/net/dev",
+            || read_netdev_totals("/proc/net/dev").rx_dropped
+        );
+        register_host_metric!(
+            "host.netdev.tx.bytes",
+            Unit::Byte,
+            "Total transmitted bytes across non-loopback interfaces from /proc/net/dev",
+            || read_netdev_totals("/proc/net/dev").tx_bytes
+        );
+        register_host_metric!(
+            "host.netdev.tx.packets",
+            Unit::Count,
+            "Total transmitted packets across non-loopback interfaces from /proc/net/dev",
+            || read_netdev_totals("/proc/net/dev").tx_packets
+        );
+        register_host_metric!(
+            "host.netdev.tx.errors",
+            Unit::Count,
+            "Total transmit errors across non-loopback interfaces from /proc/net/dev",
+            || read_netdev_totals("/proc/net/dev").tx_errors
+        );
+        register_host_metric!(
+            "host.netdev.tx.dropped",
+            Unit::Count,
+            "Total transmit drops across non-loopback interfaces from /proc/net/dev",
+            || read_netdev_totals("/proc/net/dev").tx_dropped
+        );
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn register_host_network_metrics(&self) {}
 
     /// Returns a snapshot of the runtime topology tracked by this registry.
     ///
@@ -3409,5 +3695,77 @@ mod tests {
         };
 
         insta::assert_snapshot!(topology.to_mermaid());
+    }
+
+    #[test]
+    fn parse_named_proc_counter_works_for_udp_section() {
+        let snmp = "\
+Ip: Forwarding DefaultTTL InReceives InHdrErrors
+Ip: 1 64 10 0
+Udp: InDatagrams NoPorts InErrors OutDatagrams RcvbufErrors SndbufErrors
+Udp: 101 7 9 88 2 3
+";
+        assert_eq!(parse_named_proc_counter(snmp, "Udp:", "InDatagrams"), 101);
+        assert_eq!(parse_named_proc_counter(snmp, "Udp:", "NoPorts"), 7);
+        assert_eq!(parse_named_proc_counter(snmp, "Udp:", "InErrors"), 9);
+        assert_eq!(parse_named_proc_counter(snmp, "Udp:", "Missing"), 0);
+    }
+
+    #[test]
+    fn parse_udp_socket_drops_sums_ipv4_entries() {
+        let udp = "\
+   sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode ref pointer drops
+   42: 00000000:1F90 00000000:0000 07 00000000:00000000 00:00000000 00000000   100        0 12345 2 0000000000000000 5
+   43: 00000000:1F91 00000000:0000 07 00000000:00000000 00:00000000 00000000   100        0 12346 2 0000000000000000 11
+";
+        assert_eq!(parse_udp_socket_drops(udp), 16);
+    }
+
+    #[test]
+    fn parse_softnet_column_sum_reads_hex_values() {
+        let softnet = "\
+0000000a 00000002 00000001 00000000 00000000 00000000
+00000014 00000003 00000004 00000000 00000000 00000000
+";
+        assert_eq!(parse_softnet_column_sum(softnet, 0), 30);
+        assert_eq!(parse_softnet_column_sum(softnet, 1), 5);
+        assert_eq!(parse_softnet_column_sum(softnet, 2), 5);
+    }
+
+    #[test]
+    fn parse_netdev_totals_aggregates_non_loopback_interfaces() {
+        let dev = "\
+Inter-|   Receive                                                |  Transmit
+ face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed
+    lo: 100 1 0 0 0 0 0 0 100 1 0 0 0 0 0 0
+  eth0: 2000 20 2 3 0 0 0 0 3000 30 4 5 0 0 0 0
+  eth1: 7000 70 7 8 0 0 0 0 9000 90 10 11 0 0 0 0
+";
+        assert_eq!(
+            parse_netdev_totals(dev),
+            NetDevTotals {
+                rx_bytes: 9000,
+                rx_packets: 90,
+                rx_errors: 9,
+                rx_dropped: 11,
+                tx_bytes: 12000,
+                tx_packets: 120,
+                tx_errors: 14,
+                tx_dropped: 16,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_sockstat_value_extracts_named_field() {
+        let sockstat = "\
+sockets: used 264
+UDP: inuse 9 mem 3
+UDP6: inuse 2
+";
+        assert_eq!(parse_sockstat_value(sockstat, "UDP:", "inuse"), 9);
+        assert_eq!(parse_sockstat_value(sockstat, "UDP:", "mem"), 3);
+        assert_eq!(parse_sockstat_value(sockstat, "UDP6:", "inuse"), 2);
+        assert_eq!(parse_sockstat_value(sockstat, "UDP:", "missing"), 0);
     }
 }
