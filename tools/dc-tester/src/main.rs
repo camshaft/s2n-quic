@@ -5,7 +5,6 @@ mod busy_poll;
 mod client;
 mod config;
 mod endpoint;
-mod net_stats;
 mod psk;
 mod server;
 mod stats;
@@ -124,11 +123,11 @@ fn main() -> std::io::Result<()> {
 
         let mut reporter_config = s2n_quic_dc::counter::ReporterConfig::new(Duration::from_secs(1));
         reporter_config.sparse_mode = s2n_quic_dc::counter::SparseMode::Once;
+        reporter_config.os_stats = true;
         endpoint
             .counters
             .clone()
             .spawn_reporter_with_config(reporter_config);
-        net_stats::spawn(endpoint.counters.clone());
 
         match cli.command {
             Commands::Server { address, .. } => {
