@@ -7,7 +7,7 @@ use crate::{
     endpoint::{
         frame::{self, Frame},
         id::{Id, IdMap, LocalSendSocketId, LocalSenderId},
-        msg, recv, send, tasks,
+        recv, send, tasks,
     },
     intrusive::Entry,
     socket::channel::intrusive::unsync,
@@ -83,7 +83,6 @@ fn test_frame(pse: &Arc<crate::path::secret::map::Entry>) -> Entry<Frame> {
 fn setup_recv() -> (Rc<RefCell<recv::Cache>>, credentials::Id) {
     let recv_cache = Rc::new(RefCell::new(recv::Cache::new(
         crate::endpoint::id::RecvDispatchWorkerId::new(0),
-        msg::queue::Allocator::new().dispatcher(),
     )));
 
     let ctx_a = RecvContextBuilder::default()

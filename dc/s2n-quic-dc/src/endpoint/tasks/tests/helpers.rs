@@ -176,6 +176,7 @@ impl RecvContextBuilder {
             .endpoint_type(s2n_quic_core::endpoint::Type::Server)
             .build();
         let opener = entry.secret().application_opener(VarInt::ZERO);
+        let queue_dispatcher = entry.queue_dispatcher();
         let clock = crate::time::bach::Clock::default();
         Rc::new(RefCell::new(recv::Context::new(
             entry,
@@ -184,7 +185,7 @@ impl RecvContextBuilder {
             opener,
             VarInt::ZERO,
             crate::time::precision::Clock::now(&clock),
-            crate::endpoint::msg::queue::Allocator::new().dispatcher(),
+            queue_dispatcher,
         )))
     }
 }
