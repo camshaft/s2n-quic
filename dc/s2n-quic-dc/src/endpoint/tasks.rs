@@ -942,10 +942,10 @@ pub async fn send_tx_wheel_drain<Clk, TxW>(
         timer,
         input_gauge,
         {
-            let mut socket_context_txs = socket_context_txs;
+            let mut socket_context_txs =
+                endpoint::combinator::MappedSender::new(socket_context_txs, sender_idx_to_local);
             move |context: Rc<RefCell<send::Context>>| {
-                let local_id = sender_idx_to_local[context.borrow().sender_idx];
-                let _ = UnboundedSender::send(&mut socket_context_txs[local_id], context);
+                let _ = UnboundedSender::send(&mut socket_context_txs, context);
             }
         },
         budget,

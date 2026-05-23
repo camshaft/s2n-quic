@@ -100,14 +100,24 @@ where
     #[inline]
     fn send(&mut self, value: T) -> Result<(), T> {
         let logical_id = value.id();
-        let destination_id = *self
-            .id_map
-            .get(logical_id)
-            .expect("logical id not found in mapped sender id map");
-        let sender = self
-            .senders
-            .get_mut(destination_id)
-            .expect("destination id not found in mapped sender senders");
+        let logical_id_idx = logical_id.into();
+        let destination_id = self.id_map.get(logical_id).copied().unwrap_or_else(|| {
+            panic!(
+                "logical id {} not found in mapped sender id map (len={})",
+                logical_id_idx,
+                self.id_map.len()
+            )
+        });
+        let destination_id_idx = destination_id.into();
+        let senders_len = self.senders.len();
+        let sender = self.senders.get_mut(destination_id).unwrap_or_else(|| {
+            panic!(
+                "destination id {} (from logical id {}) not found in mapped sender senders (len={})",
+                destination_id_idx,
+                logical_id_idx,
+                senders_len
+            )
+        });
         sender.send(value)
     }
 }
