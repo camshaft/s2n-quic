@@ -99,7 +99,9 @@ fn parse_snmp_pairs_content(
 ) {
     let mut lines = content.lines();
     while let Some(header_line) = lines.next() {
-        let Some(value_line) = lines.next() else { break };
+        let Some(value_line) = lines.next() else {
+            break;
+        };
         let headers: Vec<&str> = header_line.split_whitespace().collect();
         let values: Vec<&str> = value_line.split_whitespace().collect();
         if headers.is_empty() || values.is_empty() || headers[0] != values[0] {
@@ -129,7 +131,9 @@ fn collect_udp_table_sums(
         return;
     };
     let mut lines = content.lines();
-    let Some(header_line) = lines.next() else { return };
+    let Some(header_line) = lines.next() else {
+        return;
+    };
     let headers: Vec<&str> = header_line.split_whitespace().collect();
     if headers.len() < 2 {
         return;
@@ -152,11 +156,7 @@ fn collect_udp_table_sums(
 }
 
 #[cfg(target_os = "linux")]
-fn collect_sockstat(
-    out: &mut std::collections::HashMap<String, u64>,
-    path: &str,
-    prefix: &str,
-) {
+fn collect_sockstat(out: &mut std::collections::HashMap<String, u64>, path: &str, prefix: &str) {
     let Ok(content) = std::fs::read_to_string(path) else {
         return;
     };
