@@ -38,10 +38,6 @@
 //
 // Performance:
 //
-// * Pace out frame transmissions at 1us interval — right now we're passing `None` for
-//   transmission_time. We also need to remember the last transmission time so we don't go
-//   backward if we do another burst.
-//
 // * MTU estimation is overly conservative. MAX_FLOW_DATA_HEADER_OVERHEAD assumes worst-case
 //   VarInt sizes for all fields (8 bytes each), but many fields have known values at frame
 //   construction time (stream_id, queue_ids, offset). We should compute the actual header
@@ -83,6 +79,8 @@ use crate::{
         datagram::{QueuePair, ResetTarget},
     },
     path::secret::map::Entry as PathSecretEntry,
+    stream::sojourn::SojournMetrics,
+    time::precision::NowClock,
     tracing::*,
 };
 use s2n_quic_core::{
@@ -169,6 +167,11 @@ struct Inner {
     reset_error_code: Option<VarInt>,
     /// Cooperative yield budget
     coop: Coop,
+    /// Monotonic clock used to stamp frames with their enqueue time.
+    clock: Box<dyn NowClock>,
+    /// Optional sojourn time metrics. Records per-outcome histograms of how
+    /// long frames spent in the pipeline from creation to final disposition.
+    sojourn: Option<Arc<SojournMetrics>>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -206,6 +209,8 @@ impl Writer {
         queue_pair: QueuePair,
         acceptor_id: VarInt,
         control_rx: msg::queue::Control,
+        clock: Box<dyn NowClock>,
+        sojourn: Option<Arc<SojournMetrics>>,
     ) -> Self {
         let completion_rx = frame::completion_channel();
         let parameters = path_secret_entry.parameters();
@@ -230,6 +235,8 @@ impl Writer {
             status: Status::Init,
             reset_error_code: None,
             coop: Coop::default(),
+            clock,
+            sojourn,
         }))
     }
 
@@ -239,6 +246,8 @@ impl Writer {
         binding_id: VarInt,
         queue_pair: QueuePair,
         control_rx: msg::queue::Control,
+        clock: Box<dyn NowClock>,
+        sojourn: Option<Arc<SojournMetrics>>,
     ) -> Self {
         let completion_rx = frame::completion_channel();
         let parameters = path_secret_entry.parameters();
@@ -263,6 +272,8 @@ impl Writer {
             status: Status::Open,
             reset_error_code: None,
             coop: Coop::default(),
+            clock,
+            sojourn,
         }))
     }
 
@@ -542,7 +553,7 @@ impl Inner {
             completion: None,
             status: frame::TransmissionStatus::default(),
             ttl: DEFAULT_TTL,
-            transmission_time: None,
+            enqueued_at: None,
         };
 
         self.send_frame(frame)?;
@@ -575,7 +586,7 @@ impl Inner {
                 completion: Some(self.completion_rx.sender()),
                 status: frame::TransmissionStatus::default(),
                 ttl: DEFAULT_TTL,
-                transmission_time: None,
+                enqueued_at: Some(self.clock.now()),
             };
 
             self.send_frame(frame)?;
@@ -593,7 +604,22 @@ impl Inner {
                 let mut freed_bytes = 0u64;
                 let mut failure = None;
 
+                // Snapshot current time once for all sojourn measurements in
+                // this completion batch.
+                let completed_at = self.sojourn.as_ref().map(|_| self.clock.now());
+
                 for completed in queue.iter() {
+                    // Record sojourn time if we have metrics and an enqueue stamp.
+                    if let (Some(ref sojourn), Some(enqueued_at), Some(completed_at)) =
+                        (&self.sojourn, completed.enqueued_at, completed_at)
+                    {
+                        let failure_reason = match completed.status {
+                            TransmissionStatus::Failed(r) => Some(r),
+                            _ => None,
+                        };
+                        sojourn.record(enqueued_at, completed_at, failure_reason);
+                    }
+
                     match completed.status {
                         TransmissionStatus::Acknowledged => {
                             freed_bytes += completed.payload.len() as u64;
@@ -788,7 +814,7 @@ impl Inner {
             completion: Some(self.completion_rx.sender()),
             status: frame::TransmissionStatus::default(),
             ttl: DEFAULT_TTL,
-            transmission_time: None,
+            enqueued_at: Some(self.clock.now()),
         };
 
         self.send_frame(frame)?;
@@ -866,6 +892,9 @@ impl Inner {
         let mtu = self.packet_size as usize;
         let mut written = 0;
 
+        // Stamp the entire batch of frames with the same enqueue time.
+        let enqueued_at = Some(self.clock.now());
+
         let mut need_fin_packet = is_fin && buf.buffer_is_empty();
         let mut frames = Queue::new();
 
@@ -920,7 +949,7 @@ impl Inner {
                 completion: Some(self.completion_rx.sender()),
                 status: frame::TransmissionStatus::default(),
                 ttl: DEFAULT_TTL,
-                transmission_time: None,
+                enqueued_at,
             };
 
             frames.push_back(frame.into());

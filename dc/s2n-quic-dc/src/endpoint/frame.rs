@@ -736,10 +736,14 @@ pub struct Frame {
     /// Remaining transmission attempts. Decremented on each retransmission.
     /// When zero, the frame completes with failure instead of being retransmitted.
     pub ttl: u16,
-    /// Target transmission time for pacing. Writers assign times at 1us granularity to
-    /// interleave fairly with frames from other streams rather than forming bursts.
-    /// Advisory — actual pacing happens at the Peer Context level.
-    pub transmission_time: Option<precision::Timestamp>,
+    /// The monotonic time at which this frame was created and submitted to the pipeline
+    /// by the application (Writer or Reader).
+    ///
+    /// Used by the endpoint to measure sojourn time: how long the frame spent in the
+    /// pipeline from creation to final disposition (acknowledged, peer dead, cancelled,
+    /// etc.).  Set to `None` for internally-generated frames (ACK responses, queue
+    /// management) that do not require sojourn tracking.
+    pub enqueued_at: Option<precision::Timestamp>,
 }
 
 impl Frame {
@@ -775,7 +779,7 @@ impl ByteCost for Frame {
     /// (type tag, routing fields, and optional payload-length varint).
     ///
     /// Used by `send::Context::pending_bytes` to track in-queue load without traversal,
-    /// and by the pick-two load balancer via `publish_next_transmission_time`.
+    /// and by the pick-two load balancer.
     #[inline]
     fn byte_cost(&self) -> u64 {
         let payload_len = self.payload.len();
@@ -790,7 +794,7 @@ impl std::fmt::Debug for Frame {
             .field("payload_len", &self.payload.len())
             .field("peer_data_addrs", self.path_secret_entry.peer_data_addrs())
             .field("ttl", &self.ttl)
-            .field("transmission_time", &self.transmission_time)
+            .field("enqueued_at", &self.enqueued_at)
             .finish()
     }
 }
@@ -822,7 +826,7 @@ mod tests {
             completion: None,
             status: TransmissionStatus::default(),
             ttl: DEFAULT_TTL,
-            transmission_time: None,
+            enqueued_at: None,
         };
 
         assert_eq!(frame.payload_len(), 5);
@@ -853,7 +857,7 @@ mod tests {
             completion: None,
             status: TransmissionStatus::default(),
             ttl: DEFAULT_TTL,
-            transmission_time: None,
+            enqueued_at: None,
         };
 
         assert_eq!(frame.priority(), Priority::QueueData);
@@ -877,7 +881,7 @@ mod tests {
             completion: None,
             status: TransmissionStatus::default(),
             ttl: DEFAULT_TTL,
-            transmission_time: None,
+            enqueued_at: None,
         };
 
         assert_eq!(frame.priority(), Priority::QueueReset);
@@ -910,7 +914,7 @@ mod tests {
             completion: None,
             status: TransmissionStatus::default(),
             ttl: DEFAULT_TTL,
-            transmission_time: None,
+            enqueued_at: None,
         };
 
         assert!(frame.requires_sticky_sender());

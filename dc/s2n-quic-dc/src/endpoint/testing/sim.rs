@@ -574,8 +574,17 @@ where
         queue_pair,
         acceptor_id,
         queue_control,
+        Box::new(crate::time::DefaultClock),
+        None,
     );
-    let reader = Reader::new_client(frame_tx, path_secret_entry, binding_id, queue_stream);
+    let reader = Reader::new_client(
+        frame_tx,
+        path_secret_entry,
+        binding_id,
+        queue_stream,
+        Box::new(crate::time::DefaultClock),
+        None,
+    );
 
     Ok(Stream::new(reader, writer))
 }

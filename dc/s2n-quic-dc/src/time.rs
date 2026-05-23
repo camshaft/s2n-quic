@@ -47,6 +47,22 @@ pub fn now() -> Timestamp {
     }
 }
 
+/// Default production clock backed by [`now()`].
+///
+/// Uses simulated Bach time in test/bench builds; falls back to the Tokio
+/// wall-clock (relative to process start) in production.  Implements
+/// [`precision::NowClock`] for use as the default clock in stream `Inner`
+/// halves.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DefaultClock;
+
+impl precision::NowClock for DefaultClock {
+    #[inline]
+    fn now(&self) -> precision::Timestamp {
+        now().into()
+    }
+}
+
 pub type SleepHandle = Pin<Box<dyn Sleep>>;
 
 pub trait Clock: 'static + Send + Sync + fmt::Debug + time::Clock {

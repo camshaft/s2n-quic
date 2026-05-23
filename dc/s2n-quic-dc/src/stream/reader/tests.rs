@@ -89,15 +89,22 @@ impl PairBuilder {
         let (frame_tx, frame_rx) = frame::submission_channel(1);
 
         let reader = match self.ep_type {
-            endpoint::Type::Client => {
-                Reader::new_client(frame_tx, path_secret_entry, stream_id, stream_rx)
-            }
+            endpoint::Type::Client => Reader::new_client(
+                frame_tx,
+                path_secret_entry,
+                stream_id,
+                stream_rx,
+                Box::new(crate::time::DefaultClock),
+                None,
+            ),
             endpoint::Type::Server => Reader::new_server(
                 frame_tx,
                 path_secret_entry,
                 stream_id,
                 stream_rx,
                 self.peer_fin_received,
+                Box::new(crate::time::DefaultClock),
+                None,
             ),
         };
 

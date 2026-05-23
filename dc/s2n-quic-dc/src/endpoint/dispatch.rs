@@ -316,7 +316,7 @@ where
                 completion: None,
                 status: crate::endpoint::frame::TransmissionStatus::default(),
                 ttl: crate::endpoint::frame::DEFAULT_TTL,
-                transmission_time: None,
+                enqueued_at: None,
             };
             response_frames.push(Entry::new(frame));
         }
@@ -497,7 +497,7 @@ fn push_reset_frame_with_target(
         completion: None,
         status: Default::default(),
         ttl: DEFAULT_TTL,
-        transmission_time: None,
+        enqueued_at: None,
     };
     counters.on_response_frame(&frame.header);
     response_frames.push(frame.into());
@@ -635,6 +635,8 @@ fn create_binding_with_queues(
             dest_queue_id: peer_queue_id,
         },
         queue_control,
+        Box::new(crate::time::DefaultClock),
+        None,
     );
     let reader = Reader::new_server(
         frame_tx.clone(),
@@ -642,6 +644,8 @@ fn create_binding_with_queues(
         binding_id,
         queue_stream,
         is_fin,
+        Box::new(crate::time::DefaultClock),
+        None,
     );
 
     let stream = PendingValidation::new(Stream::new(reader, writer));

@@ -82,6 +82,8 @@ impl PairBuilder {
                 queue_pair,
                 acceptor_id,
                 control_rx,
+                Box::new(crate::time::DefaultClock),
+                None,
             ),
             endpoint::Type::Server => Writer::new_server(
                 frame_tx,
@@ -89,6 +91,8 @@ impl PairBuilder {
                 binding_id,
                 queue_pair,
                 control_rx,
+                Box::new(crate::time::DefaultClock),
+                None,
             ),
         };
 
