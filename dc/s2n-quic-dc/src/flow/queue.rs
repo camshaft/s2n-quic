@@ -122,16 +122,6 @@ where
         }
     }
 
-    /// Enable free-slot notifications on this allocator's pool.
-    ///
-    /// Must be called before creating dispatchers if QueueFree emission is needed
-    /// (server-side). Dispatchers created after this call will share the notification
-    /// sink and new descriptors will push freed info to it.
-    pub fn enable_free_notify(&mut self) {
-        let notify = Arc::new(std::sync::Mutex::new(Vec::new()));
-        self.pool.free_notify = Some(notify);
-    }
-
     #[inline]
     pub fn alloc(
         &self,
