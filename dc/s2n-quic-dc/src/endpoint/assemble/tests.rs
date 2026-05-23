@@ -315,6 +315,7 @@ fn assemble_accounts_for_header_overhead() {
     let counters = AssemblerCounters::new(&registry);
     let segments = assemble(
         &mut context,
+        false, // has_more_immediate
         &clock,
         crate::endpoint::id::LocalSenderId::new(VarInt::from_u8(1)),
         443,
@@ -392,6 +393,7 @@ fn assemble_fuzz_respects_gso_invariants() {
             let counters = AssemblerCounters::new(&registry);
             let segments = assemble(
                 &mut context,
+                false, // has_more_immediate
                 &clock,
                 crate::endpoint::id::LocalSenderId::new(input.source_sender_id),
                 input.source_control_port,
@@ -659,6 +661,7 @@ fn assemble_probe_fuzz() {
             let counters = AssemblerCounters::new(&registry2);
             let _segments = assemble(
                 &mut context,
+                false, // has_more_immediate
                 &clock,
                 crate::endpoint::id::LocalSenderId::new(input.source_sender_id),
                 input.source_control_port,
@@ -683,6 +686,7 @@ fn assemble_probe_fuzz() {
 
             let result = assemble(
                 &mut context,
+                false, // has_more_immediate
                 &clock,
                 crate::endpoint::id::LocalSenderId::new(input.source_sender_id),
                 input.source_control_port,

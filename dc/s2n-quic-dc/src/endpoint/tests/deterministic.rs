@@ -191,16 +191,10 @@ impl DroppedPackets {
 
                         // Receive and validate the echoed response.
                         let mut rx = Data::new(body_len as u64);
-                        let mut chunk_buf = BytesMut::with_capacity(65536);
-                        loop {
-                            let n =
-                                reader.read_into(&mut chunk_buf).await.expect("client read");
-                            if n == 0 {
-                                break;
-                            }
-                            rx.receive(&[&chunk_buf[..]]);
-                            chunk_buf.clear();
-                        }
+                        let _ = reader
+                            .read_to_end(&mut rx)
+                            .await
+                            .expect("client read");
                         assert!(rx.is_finished(), "client did not receive complete echo");
                     })
                     .await
@@ -229,16 +223,10 @@ impl DroppedPackets {
 
                             // Receive and validate the client data.
                             let mut rx = Data::new(body_len as u64);
-                            let mut chunk_buf = BytesMut::with_capacity(65536);
-                            loop {
-                                let n =
-                                    reader.read_into(&mut chunk_buf).await.expect("server read");
-                                if n == 0 {
-                                    break;
-                                }
-                                rx.receive(&[&chunk_buf[..]]);
-                                chunk_buf.clear();
-                            }
+                            let _ = reader
+                                .read_to_end(&mut rx)
+                                .await
+                                .expect("server read");
                             assert!(rx.is_finished(), "server did not receive complete request");
 
                             // Echo back using Data — no need to buffer the whole payload.
@@ -982,15 +970,7 @@ fn symmetric_5tuple_routing() {
 
                         // Receive and validate the client data.
                         let mut rx = Data::new(1 << 20);
-                        let mut chunk_buf = BytesMut::with_capacity(65536);
-                        loop {
-                            let n = reader.read_into(&mut chunk_buf).await.expect("read");
-                            if n == 0 {
-                                break;
-                            }
-                            rx.receive(&[&chunk_buf[..]]);
-                            chunk_buf.clear();
-                        }
+                        let _ = reader.read_to_end(&mut rx).await.expect("read");
                         assert!(rx.is_finished(), "server did not receive full request");
 
                         // Echo back using Data — no allocation needed.
@@ -1028,15 +1008,7 @@ fn symmetric_5tuple_routing() {
 
                 // Receive and validate the echoed response.
                 let mut rx = Data::new(1 << 20);
-                let mut chunk_buf = BytesMut::with_capacity(65536);
-                loop {
-                    let n = reader.read_into(&mut chunk_buf).await.expect("client read");
-                    if n == 0 {
-                        break;
-                    }
-                    rx.receive(&[&chunk_buf[..]]);
-                    chunk_buf.clear();
-                }
+                let _ = reader.read_to_end(&mut rx).await.expect("client read");
                 assert!(rx.is_finished(), "client did not receive full echo");
             }
             .group("client")

@@ -51,10 +51,17 @@ mod tests;
 /// `header_buf` is a caller-provided reusable allocation for encoding per-frame metadata
 /// into the application header region. It is cleared before use and after return.
 ///
+/// `has_more_immediate` indicates that the priority (immediate) queue still had items
+/// after this context was consumed. When `true`, Phase 3 data draining is skipped so
+/// those queued ACK/probe packets are not delayed behind paced data frames. When `false`
+/// (either the context came from the tx-wheel path or the immediate queue is now empty),
+/// data is drained normally, amortising the packet cost.
+///
 /// Cancelled frames (where `should_transmit()` returns false) are sent to `cancelled`
 /// for completion notification.
 pub(crate) fn assemble<Clk>(
     context: &mut Context,
+    has_more_immediate: bool,
     clock: &Clk,
     source_sender_id: LocalSenderId,
     source_control_port: u16,
@@ -228,19 +235,24 @@ where
 
             // Phase 3: drain pending (data) frames.
             //
-            // Data is gated on the tx_wheel not being scheduled:
-            // - Called from the tx_wheel path: the context has been popped from the
-            //   wheel so `tx_wheel.is_scheduled()` is false → drain data freely.
-            // - Called from the immediate path with tx_wheel pending (future EDT):
-            //   `tx_wheel.is_scheduled()` is true → skip data here; the tx_wheel will
-            //   drain it when the EDT arrives.  This prevents immediate-path assembly
-            //   from bypassing CCA pacing for data frames.
+            // Data is allowed when we are not blocking any high-priority work:
             //
-            // PTO probes are exempt: RFC 9002 §6.2.4 requires probes to bypass both
-            // CWND and pacing so that tail-loss recovery is not delayed by EDT.
+            // - From the tx_wheel path (`!tx_wheel.is_scheduled()`): the context
+            //   was popped from the wheel so EDT has already elapsed → drain freely.
+            //
+            // - From the immediate path with an empty priority queue
+            //   (`!has_more_immediate`): this is the last urgent transmission in
+            //   the batch; piggyback data to amortise the packet cost.
+            //
+            // - From the immediate path with more items queued (`has_more_immediate`):
+            //   skip data so those queued ACK/probe packets are not delayed behind
+            //   paced data.
+            //
+            // PTO probes are exempt in all cases: RFC 9002 §6.2.4 requires probes
+            // to bypass both CWND and pacing so tail-loss recovery is not delayed.
             let can_send_pending = context.has_pending_data()
                 && (context.pto.probe_state.is_requested()
-                    || (!context.tx_wheel.is_scheduled()
+                    || ((!context.tx_wheel.is_scheduled() || !has_more_immediate)
                         && context.can_send_pending_frames()));
             let phase3_is_probe = can_send_pending && context.pto.probe_state.is_requested();
 

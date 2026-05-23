@@ -420,18 +420,62 @@ fn priority_select_on_consumed_notifies_last_ready_receiver() {
             );
             let mut budget = Budget::new(usize::MAX);
 
+            // Only fallback item queued: priority was empty so has_more = false.
             fallback_tx.send(1).await.unwrap();
-            assert_eq!(select.recv(&mut budget).await, Some(1));
+            let (val, has_more) = select.recv(&mut budget).await.unwrap();
+            assert_eq!(val, 1);
+            assert!(!has_more, "priority was empty");
             select.on_consumed(5);
             assert_eq!(priority_consumed.get(), 0);
             assert_eq!(fallback_consumed.get(), 5);
 
+            // Priority item queued alongside a fallback item: priority wins.
+            // No second priority item queued, so has_more = false.
             priority_tx.send(2).await.unwrap();
             fallback_tx.send(3).await.unwrap();
-            assert_eq!(select.recv(&mut budget).await, Some(2));
+            let (val, has_more) = select.recv(&mut budget).await.unwrap();
+            assert_eq!(val, 2);
+            assert!(!has_more, "only one priority item was queued");
             select.on_consumed(7);
             assert_eq!(priority_consumed.get(), 7);
             assert_eq!(fallback_consumed.get(), 5);
+        }
+        .primary()
+        .spawn();
+    });
+}
+
+/// Verify the peek look-ahead: when two priority items are queued, the first
+/// poll returns `has_more = true` and the second returns `has_more = false`.
+#[test]
+fn priority_select_has_more_when_priority_queue_not_empty() {
+    let _no_snap = crate::testing::without_snapshots();
+    sim(|| {
+        use crate::testing::ext::*;
+        use crate::socket::channel::intrusive::unsync as ch_unsync;
+
+        async {
+            // Use unsync channels so we can enqueue multiple items at once.
+            let (mut imm_tx, imm_rx) = ch_unsync::new::<u32>();
+            let (_ctx_tx, ctx_rx) = ch_unsync::new::<u32>();
+            let mut select = PrioritySelect::new(imm_rx, ctx_rx);
+            let mut budget = Budget::new(usize::MAX);
+
+            // Enqueue two priority items; no fallback items.
+            UnboundedSender::send(&mut imm_tx, intrusive::Entry::new(10))
+                .expect("send 10");
+            UnboundedSender::send(&mut imm_tx, intrusive::Entry::new(20))
+                .expect("send 20");
+
+            // First poll: one item queued behind → has_more = true.
+            let (entry, has_more) = select.recv(&mut budget).await.unwrap();
+            assert_eq!(*entry, 10);
+            assert!(has_more, "item 20 was still queued");
+
+            // Second poll: peeked item returned, nothing behind → has_more = false.
+            let (entry, has_more) = select.recv(&mut budget).await.unwrap();
+            assert_eq!(*entry, 20);
+            assert!(!has_more, "queue was drained");
         }
         .primary()
         .spawn();

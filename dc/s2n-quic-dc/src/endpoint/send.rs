@@ -969,18 +969,10 @@ impl Context {
                 "has_pending predicate drifted from queue contents"
             );
 
-            // When the tx_wheel is scheduled with a future EDT (target_time is Some)
-            // there must be pending data waiting for that EDT, or the immediate queue
-            // must still be outstanding (urgent work will run first, then tx drains data).
-            // This invariant relies on the assembler's Phase 3 gating: when called from
-            // the immediate path with tx_wheel still scheduled, Phase 3 is skipped for
-            // non-probe data, so the pending queue is preserved until tx_wheel fires.
-            if self.tx_wheel.is_scheduled() && self.tx_wheel.target_time.is_some() {
-                assert!(
-                    self.has_pending_data() || self.is_immediate_scheduled(),
-                    "tx wheel scheduled with future EDT but no pending data and no immediate work"
-                );
-            }
+            // NOTE: with immediate-path data assembly (has_more_immediate = false),
+            // Phase 3 may drain all pending data even while tx_wheel remains scheduled
+            // at a future EDT.  The tx_wheel will fire and find nothing to do; that is
+            // fine.  A stricter invariant is therefore not enforceable here.
 
             if self.pto_wheel.is_scheduled() {
                 if self.pto_wheel.target_time.is_some() {

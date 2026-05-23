@@ -1564,6 +1564,17 @@ where
 /// Polls a high-priority receiver first; falls back to a low-priority receiver
 /// only when the priority receiver is pending. Closes immediately when the
 /// priority receiver closes (returns `Ready(None)`).
+///
+/// Each item is yielded as `(T, bool)` where the `bool` indicates whether the
+/// priority queue had more items remaining after this one was consumed. This
+/// lets the consumer decide whether to defer low-urgency work (e.g. paced data
+/// frames) to avoid blocking any high-priority transmissions that are queued
+/// behind the current item.
+///
+/// The look-ahead is implemented by attempting an extra `poll_recv` on the
+/// priority receiver immediately after consuming an item. If another item is
+/// available it is stored in `peeked_priority` and returned on the next call,
+/// so no item is ever dropped.
 #[derive(Clone, Copy)]
 enum PrioritySelectBranch {
     Priority,
@@ -1573,6 +1584,8 @@ enum PrioritySelectBranch {
 pub struct PrioritySelect<T, A, B> {
     priority: A,
     fallback: B,
+    /// Pre-fetched item from the priority receiver (the look-ahead result).
+    peeked_priority: Option<T>,
     last_recv_branch: Option<PrioritySelectBranch>,
     _phantom: PhantomData<T>,
 }
@@ -1582,32 +1595,56 @@ impl<T, A, B> PrioritySelect<T, A, B> {
         Self {
             priority,
             fallback,
+            peeked_priority: None,
             last_recv_branch: None,
             _phantom: PhantomData,
         }
     }
 }
 
-impl<T, A, B> Receiver<T> for PrioritySelect<T, A, B>
+impl<T, A, B> Receiver<(T, bool)> for PrioritySelect<T, A, B>
 where
     A: Receiver<T>,
     B: Receiver<T>,
 {
-    fn poll_recv(&mut self, cx: &mut task::Context<'_>, budget: &mut Budget) -> Poll<Option<T>> {
+    fn poll_recv(
+        &mut self,
+        cx: &mut task::Context<'_>,
+        budget: &mut Budget,
+    ) -> Poll<Option<(T, bool)>> {
+        // If we pre-fetched a priority item on the previous call, return it now.
+        if let Some(value) = self.peeked_priority.take() {
+            if budget.is_exhausted() {
+                // Can't process it yet; put it back and park.
+                self.peeked_priority = Some(value);
+                budget.set_needs_wake();
+                return Poll::Pending;
+            }
+            budget.consume();
+            self.last_recv_branch = Some(PrioritySelectBranch::Priority);
+            let has_more = self.try_peek_priority(cx);
+            return Poll::Ready(Some((value, has_more)));
+        }
+
+        // Normal poll: try the priority receiver first.
         match self.priority.poll_recv(cx, budget) {
             Poll::Ready(Some(value)) => {
                 self.last_recv_branch = Some(PrioritySelectBranch::Priority);
-                return Poll::Ready(Some(value));
+                let has_more = self.try_peek_priority(cx);
+                return Poll::Ready(Some((value, has_more)));
             }
             Poll::Ready(None) => return Poll::Ready(None),
             Poll::Pending => {}
         }
+
+        // Priority empty; fall back to the low-priority receiver.
         match self.fallback.poll_recv(cx, budget) {
             Poll::Ready(Some(value)) => {
                 self.last_recv_branch = Some(PrioritySelectBranch::Fallback);
-                Poll::Ready(Some(value))
+                // Priority was confirmed empty above; no need to peek again.
+                Poll::Ready(Some((value, false)))
             }
-            other => other,
+            other => other.map(|x| x.map(|v| (v, false))),
         }
     }
 
@@ -1616,6 +1653,28 @@ where
             Some(PrioritySelectBranch::Priority) => self.priority.on_consumed(bytes),
             Some(PrioritySelectBranch::Fallback) => self.fallback.on_consumed(bytes),
             None => {}
+        }
+    }
+}
+
+impl<T, A, B> PrioritySelect<T, A, B>
+where
+    A: Receiver<T>,
+{
+    /// Attempt a non-blocking look-ahead on the priority receiver.
+    ///
+    /// Uses a fresh 1-item budget so the caller's budget is unaffected. If an
+    /// item is found it is stored in `peeked_priority` for return on the next
+    /// `poll_recv` call. Returns `true` iff an item was found.
+    fn try_peek_priority(&mut self, cx: &mut task::Context<'_>) -> bool {
+        let mut peek_budget = Budget::new(1);
+        match self.priority.poll_recv(cx, &mut peek_budget) {
+            Poll::Ready(Some(next)) => {
+                self.peeked_priority = Some(next);
+                true
+            }
+            // Priority closed or empty; no pre-fetch needed.
+            Poll::Ready(None) | Poll::Pending => false,
         }
     }
 }
