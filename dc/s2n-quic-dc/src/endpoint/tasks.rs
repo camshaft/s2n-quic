@@ -515,8 +515,10 @@ pub fn send_worker<Socket, Clk, WakerSink, AckComp>(
                 (id, sender)
             })
             .collect();
-        let socket_context_tx =
-            endpoint::combinator::MappedSender::new(socket_context_txs, sender_idx_to_local.clone());
+        let socket_context_tx = endpoint::combinator::MappedSender::new(
+            socket_context_txs,
+            sender_idx_to_local.clone(),
+        );
         let tx_wheel_task = send_tx_wheel_drain(
             tx_wheel_rx,
             clock.clone(),
@@ -1415,17 +1417,17 @@ where
 /// Builds a receiver that encodes and flushes pending ACK bursts from recv contexts.
 ///
 /// For each recv context submitted to `ack_burst_rx`, calls `encode_and_flush` to produce
-/// a PendingAck submission and sends it to the `ack_sender`. The caller is responsible for
+/// an ACK frame submission and sends it through `frame_tx`. The caller is responsible for
 /// draining with an appropriate budget and metrics.
-pub fn ack_burst<AckBurstRx, AckTx>(
+pub fn ack_burst<AckBurstRx, FrameTx>(
     ack_burst_rx: AckBurstRx,
-    mut ack_sender: AckTx,
+    mut frame_tx: FrameTx,
     recv_worker_id: endpoint::id::RecvDispatchWorkerId,
     counters: Arc<endpoint::counters::Dispatch>,
 ) -> impl Receiver<()>
 where
     AckBurstRx: Receiver<Rc<RefCell<endpoint::recv::Context>>>,
-    AckTx: UnboundedSender<Entry<msg::Sender>>,
+    FrameTx: UnboundedSender<Entry<frame::Frame>>,
 {
     Map::new(
         ack_burst_rx,
@@ -1434,7 +1436,24 @@ where
             let was_scheduled = ctx.ack_state.is_scheduled();
             ctx.invariants();
             if let Some(submission) = ctx.encode_and_flush(recv_worker_id) {
-                let _ = ack_sender.send(Entry::new(msg::Sender::PendingAck(submission)));
+                let header = endpoint::frame::Header::Ack {
+                    dest_sender_id: submission.remote_sender_id.as_varint(),
+                    ack_delay: VarInt::ZERO,
+                    has_ecn: submission.has_ecn,
+                    is_ack_eliciting: false,
+                };
+                let frame = endpoint::frame::Frame {
+                    header,
+                    source_sender_id: endpoint::id::LocalSenderId::UNSPECIFIED,
+                    payload: submission.body.into(),
+                    path_secret_entry: submission.path_secret_entry,
+                    completion: None,
+                    status: Default::default(),
+                    ttl: endpoint::frame::DEFAULT_TTL,
+                    transmission_time: None,
+                    ack_largest_recv_time: Some(submission.largest_recv_time),
+                };
+                let _ = frame_tx.send(Entry::new(frame));
             } else if was_scheduled {
                 counters.rx_ack_state_impossible.add(1);
             }

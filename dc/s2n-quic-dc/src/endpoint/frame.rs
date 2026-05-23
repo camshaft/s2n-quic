@@ -35,16 +35,18 @@ pub const MAX_FLOW_DATA_HEADER_OVERHEAD: u16 = 109;
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Priority {
-    FlowReset = 0,
-    FlowControl = 1,
-    FlowData = 2,
-    FlowRetry = 3,
-    FlowInit = 4,
+    Ack = 0,
+    FlowReset = 1,
+    FlowControl = 2,
+    FlowData = 3,
+    FlowRetry = 4,
+    FlowInit = 5,
 }
 
 impl Priority {
-    pub const LEVELS: usize = 5;
+    pub const LEVELS: usize = 6;
     pub const ALL: [Self; Self::LEVELS] = [
+        Self::Ack,
         Self::FlowReset,
         Self::FlowControl,
         Self::FlowData,
@@ -483,8 +485,7 @@ impl Header {
             Self::FlowReset { .. } => Priority::FlowReset,
             Self::FlowInitReset { .. } | Self::FlowInitFin { .. } => Priority::FlowInit,
             Self::FlowInitValidate { .. } | Self::FlowValidateRequest { .. } => Priority::FlowRetry,
-            // Ack frames are assembled directly from pending_acks, never queued by priority.
-            Self::Ack { .. } => Priority::FlowControl,
+            Self::Ack { .. } => Priority::Ack,
         }
     }
 
@@ -870,6 +871,9 @@ pub struct Frame {
     /// interleave fairly with frames from other streams rather than forming bursts.
     /// Advisory — actual pacing happens at the Peer Context level.
     pub transmission_time: Option<precision::Timestamp>,
+    /// Largest received timestamp carried by ACK frames submitted through `frame_tx`.
+    /// The assembler stamps `ack_delay` from this just before encoding.
+    pub ack_largest_recv_time: Option<precision::Timestamp>,
 }
 
 impl Frame {
@@ -921,6 +925,7 @@ impl std::fmt::Debug for Frame {
             .field("peer_data_addrs", self.path_secret_entry.peer_data_addrs())
             .field("ttl", &self.ttl)
             .field("transmission_time", &self.transmission_time)
+            .field("ack_largest_recv_time", &self.ack_largest_recv_time)
             .finish()
     }
 }
@@ -952,6 +957,7 @@ mod tests {
             status: TransmissionStatus::default(),
             ttl: DEFAULT_TTL,
             transmission_time: None,
+            ack_largest_recv_time: None,
         };
 
         assert_eq!(frame.payload_len(), 5);
@@ -980,6 +986,7 @@ mod tests {
             status: TransmissionStatus::default(),
             ttl: DEFAULT_TTL,
             transmission_time: None,
+            ack_largest_recv_time: None,
         };
 
         assert_eq!(frame.priority(), Priority::FlowInit);
@@ -1004,6 +1011,7 @@ mod tests {
             status: TransmissionStatus::default(),
             ttl: DEFAULT_TTL,
             transmission_time: None,
+            ack_largest_recv_time: None,
         };
 
         assert_eq!(frame.priority(), Priority::FlowReset);
@@ -1034,6 +1042,7 @@ mod tests {
             status: TransmissionStatus::default(),
             ttl: DEFAULT_TTL,
             transmission_time: None,
+            ack_largest_recv_time: None,
         };
 
         assert!(frame.requires_sticky_sender());

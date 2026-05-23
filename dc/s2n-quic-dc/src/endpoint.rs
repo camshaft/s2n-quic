@@ -1018,7 +1018,7 @@ where
                     recv_idle_wheel_tx,
                     rd.path_secret_map,
                     rd.acceptor_registry,
-                    rd.frame_tx,
+                    rd.frame_tx.clone(),
                     rd.ack_sender.clone(),
                     rd.queue_dispatcher,
                     rd.counters.clone(),
@@ -1042,7 +1042,7 @@ where
                 );
                 let rx = tasks::ack_burst(
                     crate::socket::channel::FlattenList::new(ack_burst_rx.into_list_receiver()),
-                    rd.ack_sender.clone(),
+                    rd.frame_tx.clone(),
                     recv_dispatch_idx,
                     rd.counters.clone(),
                 );

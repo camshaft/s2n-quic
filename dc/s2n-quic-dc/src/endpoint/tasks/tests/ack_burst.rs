@@ -5,14 +5,14 @@
 //!
 //! The ack burst task sits on the recv dispatch worker. When the packet dispatch task
 //! schedules an ACK (by pushing a recv::Context into the burst queue), this task encodes
-//! the ACK ranges and emits a PendingAck submission to the send worker. These tests verify
+//! the ACK ranges and emits an ACK frame submission through frame_tx. These tests verify
 //! the encoding/emission contract: contexts with pending ACKs produce submissions, contexts
 //! without pending ACKs produce nothing, and already-flushed contexts are not double-submitted.
 
 use super::helpers::{RecvContextBuilder, TestReceiver, TestReceiverExt as _};
 use crate::{
     socket::channel::{intrusive::unsync, ReceiverExt as _},
-    stream::endpoint::{msg, tasks},
+    stream::endpoint::tasks,
     testing::{ext::*, sim},
     time::bach::Clock,
 };
@@ -21,16 +21,16 @@ use std::{cell::RefCell, rc::Rc};
 
 struct Harness {
     output_rx: crate::socket::channel::intrusive::unsync::Receiver<
-        crate::intrusive::EntryAdapter<msg::Sender>,
+        crate::intrusive::EntryAdapter<crate::endpoint::frame::Frame>,
     >,
 }
 
 /// Spawns the ack_burst task with the given contexts and returns a harness
-/// for observing the emitted PendingAck submissions.
+/// for observing the emitted ACK frame submissions.
 fn setup(
     contexts: impl IntoIterator<Item = Rc<RefCell<crate::stream::endpoint::recv::Context>>>,
 ) -> Harness {
-    let (sender, output_rx) = unsync::new::<msg::Sender>();
+    let (sender, output_rx) = unsync::new::<crate::endpoint::frame::Frame>();
     let input = TestReceiver::new(contexts);
     let counters = crate::endpoint::counters::Dispatch::new(&crate::counter::Registry::default());
     let rx = tasks::ack_burst(
@@ -58,7 +58,7 @@ fn scheduled_context() -> Rc<RefCell<crate::stream::endpoint::recv::Context>> {
     ctx
 }
 
-/// A context with ack_state=Scheduled and recorded ACK ranges produces a PendingAck submission.
+/// A context with ack_state=Scheduled and recorded ACK ranges produces an ACK frame submission.
 #[test]
 fn context_with_pending_acks_emits_submission() {
     sim(|| {
@@ -68,8 +68,11 @@ fn context_with_pending_acks_emits_submission() {
             let first = output_rx
                 .recv()
                 .await
-                .expect("expected pending-ack submission");
-            assert!(matches!(&*first, msg::Sender::PendingAck(_)));
+                .expect("expected ACK frame submission");
+            assert!(matches!(
+                &first.header,
+                crate::endpoint::frame::Header::Ack { .. }
+            ));
             assert!(
                 output_rx.recv().await.is_none(),
                 "expected exactly one submission"
@@ -127,7 +130,10 @@ fn multiple_contexts_each_produce_submission() {
                     .recv()
                     .await
                     .expect("scheduled context should emit submission");
-                assert!(matches!(&*item, msg::Sender::PendingAck(_)));
+                assert!(matches!(
+                    &item.header,
+                    crate::endpoint::frame::Header::Ack { .. }
+                ));
             }
             assert!(
                 output_rx.recv().await.is_none(),
@@ -180,7 +186,10 @@ fn duplicate_context_entry_produces_single_submission() {
                 .recv()
                 .await
                 .expect("duplicate context should still emit first submission");
-            assert!(matches!(&*first, msg::Sender::PendingAck(_)));
+            assert!(matches!(
+                &first.header,
+                crate::endpoint::frame::Header::Ack { .. }
+            ));
             assert!(
                 output_rx.recv().await.is_none(),
                 "duplicate context should not double-submit"

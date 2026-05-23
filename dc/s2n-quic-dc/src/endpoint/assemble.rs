@@ -151,6 +151,53 @@ where
             // suppresses further probing until new data enters the inflight map.
             let make_ack_eliciting = rtt_sample_needed && !context.rtt_tracker.is_pending();
 
+            // Phase 0.5: drain Ack-priority frames (from frame_tx path).
+            // These arrive with encoded ACK bodies; stamp wire-time metadata here so
+            // they bypass CWND and coalesce naturally with data frames on the same sender.
+            while let Some(mut frame_entry) = context.queues[0].pop_front() {
+                let largest_recv_time = frame_entry.ack_largest_recv_time;
+                if let (
+                    frame::Header::Ack {
+                        ack_delay,
+                        is_ack_eliciting,
+                        ..
+                    },
+                    Some(largest_recv_time),
+                ) = (&mut frame_entry.header, largest_recv_time)
+                {
+                    let ack_delay_duration = now.duration_since(largest_recv_time);
+                    let ack_delay_micros = ack_delay_duration.as_micros() as u64;
+                    *ack_delay =
+                        VarInt::new(ack_delay_micros).unwrap_or(VarInt::from_u32(u32::MAX));
+                    *is_ack_eliciting =
+                        context.pto.probe_state.is_requested() || make_ack_eliciting;
+                }
+
+                let payload_len = frame_entry.payload_len();
+                let next_metadata = metadata.with_frame_parts(&frame_entry.header, payload_len);
+                let estimated_len = next_metadata.estimate_packet_len(
+                    source_sender_id,
+                    source_control_port,
+                    &context.credentials,
+                    seal::Application::tag_len(&context.sealer),
+                );
+
+                if estimated_len > max_segment_len {
+                    context.queues[0].push_front(frame_entry);
+                    break;
+                }
+
+                is_ack_eliciting |= frame_entry.header.is_ack_eliciting();
+                ack_frame_count += 1;
+                metadata = next_metadata;
+                counters.on_tx_frame(&frame_entry.header);
+                packet_frames.push_back(frame_entry);
+
+                if estimated_len == max_segment_len {
+                    break;
+                }
+            }
+
             // Phase 1: drain direct ACK submissions (from pending_acks queue).
             // Each entry carries an already-encoded ACK body from recv worker; stamp
             // wire-time ack_delay here. These bypass CWND like Phase 1 frames.
@@ -194,6 +241,7 @@ where
                     status: Default::default(),
                     ttl: frame::DEFAULT_TTL,
                     transmission_time: None,
+                    ack_largest_recv_time: None,
                 };
 
                 is_ack_eliciting |= header.is_ack_eliciting();

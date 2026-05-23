@@ -161,6 +161,7 @@ fn new_test_frame_with_header(
         status: TransmissionStatus::Pending,
         ttl: DEFAULT_TTL,
         transmission_time: None,
+        ack_largest_recv_time: None,
     })
 }
 
@@ -189,6 +190,7 @@ fn new_test_frame_with_sender_id(
         status: TransmissionStatus::Pending,
         ttl: DEFAULT_TTL,
         transmission_time: None,
+        ack_largest_recv_time: None,
     })
 }
 

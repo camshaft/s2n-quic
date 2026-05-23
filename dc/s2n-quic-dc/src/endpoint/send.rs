@@ -76,10 +76,6 @@ impl PendingFrames {
     /// Push a frame onto the back of the queue, updating the cost counter.
     #[inline]
     pub fn push_back(&mut self, frame: intrusive::Entry<Frame>) {
-        debug_assert!(
-            !matches!(frame.header, frame::Header::Ack { .. }),
-            "Ack frames must use pending_acks, not the priority queues"
-        );
         self.byte_cost += frame.byte_cost() as usize;
         self.gauge.enqueue(1);
         self.queue.push_back(frame);
@@ -93,10 +89,6 @@ impl PendingFrames {
     /// *not* previously popped will double-count its wire cost.
     #[inline]
     pub fn push_front(&mut self, frame: intrusive::Entry<Frame>) {
-        debug_assert!(
-            !matches!(frame.header, frame::Header::Ack { .. }),
-            "Ack frames must use pending_acks, not the priority queues"
-        );
         self.byte_cost += frame.byte_cost() as usize;
         self.gauge.enqueue(1);
         self.queue.push_front(frame);
@@ -744,7 +736,9 @@ impl Context {
             "probe_state is Requested but nothing to probe with"
         );
 
-        let needs_urgent = self.has_pending_acks() || self.pto.probe_state.is_requested();
+        let needs_urgent = !self.queues[0].is_empty()
+            || self.has_pending_acks()
+            || self.pto.probe_state.is_requested();
 
         // Urgent work (ACK to send or PTO probe) always routes to the immediate
         // queue to bypass EDT pacing. This avoids putting ACKs in the "slow lane"
@@ -803,7 +797,7 @@ impl Context {
     /// Pop the next pending frame, draining from highest priority first.
     #[inline]
     pub fn pop_pending(&mut self) -> Option<intrusive::Entry<Frame>> {
-        for queue in &mut self.queues {
+        for queue in &mut self.queues[1..] {
             if let Some(frame) = queue.pop_front() {
                 return Some(frame);
             }
@@ -888,7 +882,7 @@ impl Context {
 
     #[inline]
     pub fn has_pending_data(&self) -> bool {
-        self.queues.iter().any(|q| !q.is_empty())
+        self.queues[1..].iter().any(|q| !q.is_empty())
     }
 
     #[inline]
@@ -959,15 +953,16 @@ impl Context {
     #[inline]
     pub fn invariants(&self) {
         if cfg!(debug_assertions) {
-            let has_pending_data = self.queues.iter().any(|q| !q.is_empty());
+            let has_data_in_queues = self.queues[1..].iter().any(|q| !q.is_empty());
             let has_pending_data_predicate = self.has_pending_data();
-            let has_pending_predicate = self.has_pending();
             assert_eq!(
-                has_pending_data_predicate, has_pending_data,
+                has_pending_data_predicate, has_data_in_queues,
                 "has_pending_data predicate drifted from queue contents"
             );
+            let has_pending_predicate = self.has_pending();
+            let has_all_pending = self.queues.iter().any(|q| !q.is_empty());
             assert_eq!(
-                has_pending_predicate, has_pending_data,
+                has_pending_predicate, has_all_pending,
                 "has_pending predicate drifted from queue contents"
             );
 

@@ -75,6 +75,7 @@ fn test_frame(pse: &Arc<crate::path::secret::map::Entry>) -> Entry<Frame> {
         status: frame::TransmissionStatus::Pending,
         ttl: 3,
         transmission_time: None,
+        ack_largest_recv_time: None,
     })
 }
 
@@ -326,7 +327,7 @@ fn ack_burst_after_recv_invalidation_emits_nothing() {
         let mut invalidation = tasks::recv_invalidation(invalidation_rx, recv_cache.clone());
 
         let ack_burst_rx = super::helpers::TestReceiver::new(vec![ctx]);
-        let (sender, mut collected) = unsync::new::<crate::endpoint::msg::Sender>();
+        let (sender, mut collected) = unsync::new::<crate::endpoint::frame::Frame>();
         let counters =
             crate::endpoint::counters::Dispatch::new(&crate::counter::Registry::default());
         let mut ack_burst = tasks::ack_burst(

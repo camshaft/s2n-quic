@@ -295,9 +295,10 @@ fn detect_loss<Rand>(
     let largest_acked = PacketNumberSpace::Initial.new_packet_number(max_acked_pn);
     let pn_loss_cutoff = pn_threshold.map(|v| PacketNumberSpace::Initial.new_packet_number(v));
 
-    let Some(lost_max) = context
-        .inflight
-        .loss_cutoff(largest_acked, pn_loss_cutoff, time_loss_cutoff)
+    let Some(lost_max) =
+        context
+            .inflight
+            .loss_cutoff(largest_acked, pn_loss_cutoff, time_loss_cutoff)
     else {
         return;
     };
@@ -409,7 +410,9 @@ mod tests {
 
     fn make_path_secret_entry() -> Arc<PathSecretEntry> {
         let peer: std::net::SocketAddr = "127.0.0.1:9999".parse().unwrap();
-        let entry = PathSecretEntry::builder(peer).socket_sender_count(1).build();
+        let entry = PathSecretEntry::builder(peer)
+            .socket_sender_count(1)
+            .build();
         entry.set_peer_data_addrs(&[peer]);
         entry
     }
@@ -454,6 +457,7 @@ mod tests {
                 status: TransmissionStatus::Pending,
                 ttl: DEFAULT_TTL,
                 transmission_time: None,
+                ack_largest_recv_time: None,
             }
             .into(),
         );
@@ -475,8 +479,10 @@ mod tests {
     fn detect_loss_applies_time_threshold_without_pn_threshold() {
         let entry = make_path_secret_entry();
         let mut context = make_context(&entry);
-        let counters =
-            super::super::counters::Send::new(&Registry::default(), LocalSenderId::new(VarInt::ZERO));
+        let counters = super::super::counters::Send::new(
+            &Registry::default(),
+            LocalSenderId::new(VarInt::ZERO),
+        );
         let mut completed = CollectFrames::default();
         let mut lost = CollectFrames::default();
         let mut cancelled = CollectFrames::default();
@@ -502,7 +508,11 @@ mod tests {
             &mut random,
         );
 
-        assert_eq!(lost.0.len(), 1, "old packet should be declared lost by time");
+        assert_eq!(
+            lost.0.len(),
+            1,
+            "old packet should be declared lost by time"
+        );
         assert!(cancelled.0.is_empty());
         assert!(completed.0.is_empty());
         assert!(context.inflight.remove(make_pn(1)).is_none());
