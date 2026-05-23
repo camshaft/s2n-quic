@@ -494,7 +494,6 @@ fn encode_decode_round_trip() {
 
     let mut buf = vec![0u8; 65536];
     let mut header_buf = Vec::new();
-    let mut flow_attempt_id = VarInt::ZERO;
     let tag_len = crate::crypto::seal::Application::tag_len(&context.sealer);
     let encoded_len = encode_segment(
         &mut buf,
@@ -503,7 +502,6 @@ fn encode_decode_round_trip() {
         context.next_packet_number,
         &context.sealer,
         &context.credentials,
-        &mut flow_attempt_id,
         &mut packet_frames,
         &mut header_buf,
     );
@@ -793,8 +791,6 @@ fn encode_decode_fuzz_round_trip() {
 
             let mut buf = vec![0u8; 65536];
             let mut header_buf = Vec::new();
-            let mut flow_attempt_id = VarInt::ZERO;
-
             let encoded_len = encode_segment(
                 &mut buf,
                 input.source_control_port,
@@ -802,7 +798,6 @@ fn encode_decode_fuzz_round_trip() {
                 context.next_packet_number,
                 &context.sealer,
                 &context.credentials,
-                &mut flow_attempt_id,
                 &mut packet_frames,
                 &mut header_buf,
             );

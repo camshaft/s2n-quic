@@ -20,6 +20,7 @@ use s2n_codec::EncoderBuffer;
 use s2n_quic_core::{dc, recovery::bandwidth::Bandwidth, time::Timestamp, varint::VarInt};
 use std::{
     any::Any,
+    collections::VecDeque,
     net::SocketAddr,
     sync::{
         atomic::{AtomicI64, AtomicU16, AtomicU32, AtomicU64, AtomicU8, Ordering},
@@ -27,6 +28,7 @@ use std::{
     },
     time::Duration,
 };
+use tokio::sync::Notify;
 
 #[cfg(test)]
 mod tests;
@@ -84,6 +86,8 @@ pub struct Entry {
     /// allocate from and dispatch to this pool via their own Dispatch handles.
     // TODO: replace Mutex with a lock-free grow strategy
     queue_allocator: std::sync::Mutex<crate::endpoint::msg::queue::Allocator>,
+    peer_queue_state: std::sync::Mutex<PeerQueueState>,
+    peer_queue_notify: Notify,
 }
 
 impl SizeOf for Entry {
@@ -104,6 +108,8 @@ impl SizeOf for Entry {
             sender_load_scores,
             next_binding_id,
             queue_allocator: _,
+            peer_queue_state: _,
+            peer_queue_notify: _,
         } = self;
         creation_time.size()
             + peer.size()
@@ -124,6 +130,13 @@ impl SizeOf for Entry {
             + std::mem::size_of::<Box<[AtomicU64]>>()
             + sender_load_scores.len() * std::mem::size_of::<AtomicU64>()
     }
+}
+
+#[derive(Debug, Default)]
+struct PeerQueueState {
+    next_queue_id: u64,
+    free_queue_ids: VecDeque<u64>,
+    in_free_list: Vec<bool>,
 }
 
 impl SizeOf for Option<ApplicationData> {
@@ -206,6 +219,8 @@ impl Entry {
             sender_load_scores: Self::init_load_scores(socket_sender_count),
             next_binding_id: AtomicU64::new(0),
             queue_allocator: std::sync::Mutex::new(crate::endpoint::msg::queue::Allocator::new()),
+            peer_queue_state: std::sync::Mutex::new(PeerQueueState::default()),
+            peer_queue_notify: Notify::new(),
         }
     }
 
@@ -535,8 +550,21 @@ impl Entry {
 
     /// Allocate a new binding_id from this entry's monotonic counter.
     pub fn alloc_binding_id(&self) -> s2n_quic_core::varint::VarInt {
-        let id = self.next_binding_id.fetch_add(1, Ordering::Relaxed);
-        s2n_quic_core::varint::VarInt::new(id).unwrap()
+        let max = s2n_quic_core::varint::VarInt::MAX.as_u64();
+        let id = self
+            .next_binding_id
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |curr| {
+                (curr < max).then_some(curr + 1)
+            })
+            .unwrap_or(max);
+
+        if id == max {
+            error!("binding_id space exhausted; reusing VarInt::MAX");
+            debug_assert!(false, "binding_id space exhausted");
+        }
+
+        // SAFETY: `id <= VarInt::MAX`.
+        unsafe { s2n_quic_core::varint::VarInt::new_unchecked(id) }
     }
 
     /// Returns a new dispatcher handle backed by this entry's queue pool.
@@ -545,6 +573,60 @@ impl Entry {
     /// for the context's lifetime.
     pub fn queue_dispatcher(&self) -> crate::endpoint::msg::queue::Dispatcher {
         self.queue_allocator.lock().unwrap().dispatcher()
+    }
+
+    /// Allocate a queue ID from the peer free-list, waiting asynchronously if needed.
+    pub async fn alloc_peer_queue_id(&self) -> Option<VarInt> {
+        loop {
+            let notified = self.peer_queue_notify.notified();
+            {
+                let mut state = self.peer_queue_state.lock().unwrap();
+
+                if let Some(id) = state.free_queue_ids.pop_front() {
+                    if let Some(is_free) = state.in_free_list.get_mut(id as usize) {
+                        *is_free = false;
+                    }
+                    // SAFETY: values in the queue are bounded by MAX_SLOTS.
+                    return Some(unsafe { VarInt::new_unchecked(id) });
+                }
+
+                if state.next_queue_id < crate::flow::queue::MAX_SLOTS as u64 {
+                    let id = state.next_queue_id;
+                    state.next_queue_id += 1;
+                    if state.in_free_list.len() <= id as usize {
+                        state.in_free_list.resize(id as usize + 1, false);
+                    }
+                    // SAFETY: `id < MAX_SLOTS <= VarInt::MAX`.
+                    return Some(unsafe { VarInt::new_unchecked(id) });
+                }
+            }
+
+            notified.await;
+        }
+    }
+
+    /// Mark a peer queue as freed.
+    pub fn on_peer_queue_freed(&self, queue_id: VarInt) {
+        let idx = queue_id.as_u64() as usize;
+        if idx >= crate::flow::queue::MAX_SLOTS {
+            return;
+        }
+
+        let mut did_enqueue = false;
+        let mut state = self.peer_queue_state.lock().unwrap();
+        if state.in_free_list.len() <= idx {
+            state.in_free_list.resize(idx + 1, false);
+        }
+        if !state.in_free_list[idx] {
+            state.in_free_list[idx] = true;
+            state.free_queue_ids.push_back(queue_id.as_u64());
+            did_enqueue = true;
+        }
+        drop(state);
+
+        if did_enqueue {
+            self.peer_queue_notify.notify_one();
+        }
     }
 
     /// Allocates a queue slot from this entry's pool, growing if needed.

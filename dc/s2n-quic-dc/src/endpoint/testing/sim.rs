@@ -551,9 +551,18 @@ where
     let handle = flow::Handle::new(binding_id);
     let (queue_control, queue_stream) = path_secret_entry.alloc_queue(handle, None);
 
+    let dest_queue_id = path_secret_entry
+        .alloc_peer_queue_id()
+        .await
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::OutOfMemory,
+                "peer queue id allocator exhausted",
+            )
+        })?;
     let queue_pair = crate::packet::datagram::QueuePair {
         source_queue_id: queue_control.queue_id(),
-        dest_queue_id: queue_control.queue_id(),
+        dest_queue_id,
     };
 
     // Build Reader + Writer and wrap them in a Stream.

@@ -33,6 +33,8 @@ pub const FLOW_CONTROL_ERROR: VarInt = VarInt::from_u32(9);
 
 /// The stream_id in the packet doesn't match the queue's current occupant
 pub const STREAM_ID_MISMATCH: VarInt = VarInt::from_u32(10);
+/// The binding_id in the packet doesn't match the queue's current occupant
+pub const BINDING_ID_MISMATCH: VarInt = STREAM_ID_MISMATCH;
 
 /// The credential_id in the packet doesn't match the queue's owner
 pub const CREDENTIAL_MISMATCH: VarInt = VarInt::from_u32(11);
@@ -152,7 +154,7 @@ impl fmt::Display for Error {
             Self::StreamIdMismatch => {
                 write!(
                     f,
-                    "STREAM_ID_MISMATCH: packet stream_id does not match queue occupant"
+                    "STREAM_ID_MISMATCH: packet binding/stream id does not match queue occupant"
                 )
             }
             Self::CredentialMismatch => {

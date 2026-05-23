@@ -330,7 +330,6 @@ where
                     packet_number,
                     &context.sealer,
                     &context.credentials,
-                    &mut context.flow_attempt_id_counter,
                     &mut packet_frames,
                     header_buf,
                 )
@@ -656,7 +655,6 @@ fn encode_segment<S: seal::Application>(
     packet_number: VarInt,
     sealer: &S,
     credentials: &Credentials,
-    flow_attempt_id: &mut VarInt,
     frames: &mut Queue<Frame>,
     header_buf: &mut Vec<u8>,
 ) -> usize {
@@ -665,12 +663,7 @@ fn encode_segment<S: seal::Application>(
     };
 
     // Build the application header: per-frame metadata entries.
-    // This also stamps assigned attempt_ids back into QueueBind frame headers so
-    // PTO retransmissions reuse the same attempt_id, and records the sender index
-    // on the completion channel so the writer can route QueueReset/QueueData(is_fin)
-    // through the same socket.
-    let total_payload_len =
-        encode_frame_metadata(frames, flow_attempt_id, source_sender_id, header_buf);
+    let total_payload_len = encode_frame_metadata(frames, source_sender_id, header_buf);
 
     let header_len = VarInt::try_from(header_buf.len() as u64).unwrap_or(VarInt::ZERO);
     let payload_len_varint = VarInt::try_from(total_payload_len as u64).unwrap_or(VarInt::ZERO);
@@ -696,7 +689,6 @@ fn encode_segment<S: seal::Application>(
 
 fn encode_frame_metadata(
     frames: &mut Queue<Frame>,
-    flow_attempt_id: &mut VarInt,
     source_sender_id: LocalSenderId,
     header_buf: &mut Vec<u8>,
 ) -> usize {
@@ -708,12 +700,9 @@ fn encode_frame_metadata(
             trace!(
                 binding_id = binding_id.as_u64(),
                 %source_sender_id,
-                flow_attempt_id_counter = flow_attempt_id.as_u64(),
                 "encode_frame_metadata: encoding QueueBind"
             );
         }
-        stamp_attempt_id(&mut frame.header, flow_attempt_id);
-        stamp_sender_id(frame, source_sender_id);
         push_frame_metadata(header_buf, &frame.header, frame.payload_len());
 
         total_payload_len += frame.payload_len();
@@ -756,65 +745,6 @@ fn push_frame_metadata(header_buf: &mut Vec<u8>, header: &frame::Header, payload
         entry_size,
         "frame metadata encoder length mismatch"
     );
-}
-
-/// Stamp binding_id in place for QueueBind frames.
-///
-/// If the frame's binding_id is the sentinel `VarInt::MAX`, allocates from the counter
-/// and writes it back into the header. On PTO retransmission the header already holds
-/// the assigned value, so no new allocation occurs.
-fn stamp_attempt_id(header: &mut frame::Header, flow_attempt_id: &mut VarInt) {
-    if let frame::Header::QueueBind { binding_id, .. } = header {
-        if *binding_id == VarInt::MAX {
-            *binding_id = *flow_attempt_id;
-            *flow_attempt_id += 1;
-            trace!(
-                binding_id = binding_id.as_u64(),
-                "stamp_attempt_id: assigned new binding_id"
-            );
-        } else {
-            trace!(
-                binding_id = binding_id.as_u64(),
-                "stamp_attempt_id: retransmit with existing binding_id"
-            );
-        }
-    }
-}
-
-/// Pin QueueBind frames to this sender for retransmit dedup correctness.
-///
-/// The server deduplicates QueueBind by checking per-recv-context state (which is
-/// keyed by credential_id + source_sender_id). A retransmitted QueueBind must
-/// arrive via the same sender so it hits the same recv context and dedup check.
-/// The completion channel's `init_sender_idx` is stamped so the writer can pin
-/// subsequent retransmits to the same sender.
-fn stamp_sender_id(frame: &mut Frame, source_sender_id: LocalSenderId) {
-    match &frame.header {
-        frame::Header::QueueBind { .. } => {
-            if frame.source_sender_id == LocalSenderId::UNSPECIFIED {
-                frame.source_sender_id = source_sender_id;
-            } else {
-                debug_assert_eq!(
-                    frame.source_sender_id, source_sender_id,
-                    "QueueBind routed to wrong sender: frame={} assembler={}",
-                    frame.source_sender_id, source_sender_id,
-                );
-            }
-
-            if let Some(completion) = &frame.completion {
-                completion.set_init_sender_idx(source_sender_id);
-            }
-        }
-        _ => {
-            debug_assert!(
-                frame.source_sender_id == LocalSenderId::UNSPECIFIED
-                    || frame.source_sender_id == source_sender_id,
-                "frame routed to wrong sender: frame={} assembler={}",
-                frame.source_sender_id,
-                source_sender_id,
-            );
-        }
-    }
 }
 
 /// A Storage reader that concatenates payloads from multiple frames.

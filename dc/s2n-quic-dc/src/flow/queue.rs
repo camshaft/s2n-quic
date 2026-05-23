@@ -21,6 +21,7 @@ mod sender;
 // Re-export the Key trait
 pub use descriptor::{FreedSlot, Key, ValidationError};
 pub use inner::AutoWake;
+pub const MAX_SLOTS: usize = queue_id::MAX_SLOTS;
 
 /// Size of the first allocated page of queue slots.
 ///
@@ -106,7 +107,6 @@ where
             senders: self.pool.senders(),
             is_open: true,
             pool: self.pool.clone(),
-            bound_peer_queue_ids: Vec::new(),
             free_notify,
         }
     }
@@ -150,11 +150,6 @@ where
     senders: sender::Senders<S, C, K, INITIAL_PAGE_SIZE>,
     is_open: bool,
     pool: pool::Pool<S, C, K, INITIAL_PAGE_SIZE>,
-    /// Maps peer queue_id → binding_id for QueueBind retransmit detection.
-    /// A retransmit carries the same (peer_queue_id, binding_id) pair.
-    /// A new stream reusing a freed peer_queue_id carries a different binding_id.
-    /// Indexed by the peer's queue_id value; grows lazily. `u64::MAX` = unset.
-    bound_peer_queue_ids: Vec<u64>,
     /// Shared sink for freed-slot notifications. Populated by descriptor drop_receiver
     /// when both queue halves close. Drained by the dispatch layer to emit QueueFree.
     free_notify: Arc<std::sync::Mutex<Vec<FreedSlot>>>,
@@ -171,7 +166,6 @@ where
             senders: self.senders.clone(),
             is_open: self.is_open,
             pool: self.pool.clone(),
-            bound_peer_queue_ids: self.bound_peer_queue_ids.clone(),
             free_notify: self.free_notify.clone(),
         }
     }
@@ -201,19 +195,6 @@ where
         self.pool.alloc_or_grow(key, remote_queue_id)
     }
 
-    /// Returns `true` if this (peer_queue_id, binding_id) pair has already been
-    /// bound. A retransmit carries the same pair; a new stream reusing a freed
-    /// peer_queue_id carries a different binding_id.
-    pub fn test_and_set_bound(&mut self, peer_queue_id: VarInt, binding_id: VarInt) -> bool {
-        let idx = peer_queue_id.as_u64() as usize;
-        if idx >= self.bound_peer_queue_ids.len() {
-            self.bound_peer_queue_ids.resize(idx + 1, u64::MAX);
-        }
-        let prev = self.bound_peer_queue_ids[idx];
-        self.bound_peer_queue_ids[idx] = binding_id.as_u64();
-        prev == binding_id.as_u64()
-    }
-
     /// Drain freed slots that have been released since the last call.
     ///
     /// Returns freed slot entries representing queue slots whose both stream and
@@ -224,18 +205,6 @@ where
             return Vec::new();
         }
         core::mem::take(&mut *guard)
-    }
-
-    /// Handle a received QueueFree frame (client side).
-    ///
-    /// Clears the bound_peer_queue_ids entry for the freed queue_id, allowing
-    /// the client to reuse that slot for a new stream without being rejected
-    /// by the retransmit dedup check.
-    pub fn on_queue_freed(&mut self, queue_id: VarInt) {
-        let idx = queue_id.as_u64() as usize;
-        if idx < self.bound_peer_queue_ids.len() {
-            self.bound_peer_queue_ids[idx] = u64::MAX;
-        }
     }
 
     #[inline]

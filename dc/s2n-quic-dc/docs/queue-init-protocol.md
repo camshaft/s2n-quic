@@ -8,7 +8,7 @@ The original protocol required a multi-phase handshake: the client sent FlowInit
 
 ## Protocol Overview
 
-The client allocates both queue IDs locally at connect() time and sends a single QueueBind frame that carries everything the server needs. The server allocates its own local queue slot and immediately begins accepting data. No response is needed before data can flow.
+The client allocates a local source queue ID plus a destination queue ID from its model of the server's free list, then sends a QueueBind frame that carries everything the server needs. The server allocates its own local queue slot and immediately begins accepting data. No response is needed before data can flow.
 
 ### Wire Frames
 
@@ -44,11 +44,9 @@ The binding_id is allocated from a per-PathSecretEntry atomic counter (`next_bin
 
 Queue dispatch is per-context: each recv::Context owns its own Dispatcher instance. Since recv contexts are keyed by (credential_id, source_sender_id), queue IDs are effectively namespaced per-peer-per-sender. This means no credential_id validation is needed during dispatch — the context lookup already guarantees the packet belongs to this peer.
 
-### Retransmit Dedup
+### Queue Association Checks
 
-QueueBind retransmits (PTO with new packet number, same content) are detected by tracking (peer_queue_id, binding_id) pairs on the Dispatch struct. A retransmit carries the same pair; a new stream reusing a freed slot carries a different binding_id.
-
-QueueBind frames are pinned to a specific sender socket (via init_sender_idx on the completion channel) so that retransmits always arrive at the same recv context, hitting the same dedup state.
+Queue IDs are associated with a single binding_id at a time. If a frame arrives for an unassigned queue on the server, QueueBind establishes the association. If the queue is already associated with a different binding_id, the frame is dropped.
 
 ### Queue Validation
 
@@ -58,7 +56,7 @@ The queue Key is simply the binding_id (a VarInt). On every dispatch to a queue 
 
 When both the stream and control receivers for a queue slot are dropped (stream completed), the descriptor notifies a shared freed-slot sink. The recv worker drains this sink after processing each packet and emits QueueFree frames back to the client via the response path.
 
-On the client side, receiving a QueueFree clears the bound_peer_queue_ids entry for that slot, allowing the client to reuse the queue_id for a new connect() without being rejected by the retransmit dedup check.
+On the client side, receiving a QueueFree returns that queue_id to an async MPMC free-list queue. `connect()` allocates `dest_queue_id` from this queue and will wait when no slot is currently available.
 
 ## Per-Entry State
 
@@ -77,8 +75,8 @@ The following were removed as part of this simplification:
 - FlowInitSent writer state (no intermediate state)
 - FlowInitReset and FlowInitFin frames (no handshake to abort)
 - FlowValidateRequest and FlowInitValidate (validation is immediate)
-- AttemptDedup bitmap (packet-number dedup + binding_id validation is sufficient)
+- AttemptDedup bitmap
 - flow::Tracker (stream_id → queue_id map, replaced by per-context dispatch)
 - credential_id validation in queue dispatch (already namespaced by context)
-- init_attempt_id on completion channel (FlowInitReset no longer exists)
+- QueueBind sender pinning state on the completion channel
 - Generation encoding in queue_ids (binding_id provides anti-ABA instead)

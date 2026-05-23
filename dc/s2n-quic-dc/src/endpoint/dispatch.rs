@@ -309,7 +309,7 @@ where
                 source_sender_id: LocalSenderId::UNSPECIFIED,
                 header: crate::endpoint::frame::Header::QueueFree {
                     binding_id: VarInt::ZERO,
-                    largest_queue_id: slot.remote_queue_id,
+                    largest_queue_id: slot.queue_id,
                 },
                 payload: crate::byte_vec::ByteVec::new(),
                 path_secret_entry: peer.path_entry.clone(),
@@ -442,7 +442,7 @@ fn dispatch_decoded_frame(
         Header::QueueFree {
             largest_queue_id, ..
         } => {
-            peer.queue_dispatcher.on_queue_freed(largest_queue_id);
+            peer.path_entry.on_peer_queue_freed(largest_queue_id);
             trace!(
                 queue_id = largest_queue_id.as_u64(),
                 "QueueFree received — slot returned to pool"
@@ -486,27 +486,82 @@ fn handle_queue_bind(
     waker_sink: &mut impl channel::UnboundedSender<AutoWake>,
 ) {
     let peer_queue_id = queue_pair.source_queue_id;
-
-    // Dedup: the client's source_queue_id is unique per-stream and never reused
-    // without QueueFree. If we've already processed a QueueBind with this
-    // peer_queue_id, it's a retransmit.
-    if peer
-        .queue_dispatcher
-        .test_and_set_bound(peer_queue_id, binding_id)
+    let local_queue_id = queue_pair.dest_queue_id;
+    if peer_queue_id.as_u64() >= crate::flow::queue::MAX_SLOTS as u64
+        || local_queue_id.as_u64() >= crate::flow::queue::MAX_SLOTS as u64
     {
-        trace!(
+        debug!(
             binding_id = binding_id.as_u64(),
             peer_queue_id = peer_queue_id.as_u64(),
-            "QueueBind deduplicated (retransmit)"
+            local_queue_id = local_queue_id.as_u64(),
+            "dropping QueueBind with out-of-range queue_id"
         );
         return;
+    }
+
+    let request = binding_id;
+    match peer
+        .queue_dispatcher
+        .validate_stream(local_queue_id, &request)
+    {
+        Ok(()) => {
+            if !buf.is_empty() || is_fin {
+                let entry = msg::Stream::Data {
+                    offset: VarInt::ZERO,
+                    fin: is_fin,
+                    payload: buf,
+                }
+                .into();
+                match peer.queue_dispatcher.send_stream(
+                    local_queue_id,
+                    Some(peer_queue_id),
+                    &request,
+                    entry,
+                ) {
+                    Ok(waker) => {
+                        let _ = waker_sink.send(waker);
+                    }
+                    Err(err) => {
+                        let _ = err;
+                        trace!("QueueBind payload forwarding failed for existing queue");
+                    }
+                }
+            }
+            trace!(
+                binding_id = binding_id.as_u64(),
+                peer_queue_id = peer_queue_id.as_u64(),
+                local_queue_id = local_queue_id.as_u64(),
+                "QueueBind matched existing binding"
+            );
+            return;
+        }
+        Err(flow::queue::ValidateError::Validation(reason)) => {
+            counters.on_data_validation_failed(reason);
+            debug!(
+                binding_id = binding_id.as_u64(),
+                peer_queue_id = peer_queue_id.as_u64(),
+                local_queue_id = local_queue_id.as_u64(),
+                ?reason,
+                "dropping QueueBind due to binding mismatch"
+            );
+            return;
+        }
+        Err(flow::queue::ValidateError::Unallocated) => {}
     }
 
     let handle = flow::Handle::new(binding_id);
     let (queue_control, queue_stream) = peer
         .queue_dispatcher
         .alloc_or_grow(handle, Some(peer_queue_id));
-    let local_queue_id = queue_control.queue_id();
+    let allocated_queue_id = queue_control.queue_id();
+    if allocated_queue_id != local_queue_id {
+        debug!(
+            binding_id = binding_id.as_u64(),
+            expected_queue_id = local_queue_id.as_u64(),
+            allocated_queue_id = allocated_queue_id.as_u64(),
+            "server queue allocator not aligned with requested queue_id"
+        );
+    }
 
     if !buf.is_empty() || is_fin {
         queue_stream.push(
@@ -523,7 +578,10 @@ fn handle_queue_bind(
         frame_tx.clone(),
         peer.path_entry.clone(),
         binding_id,
-        queue_pair,
+        QueuePair {
+            source_queue_id: allocated_queue_id,
+            dest_queue_id: peer_queue_id,
+        },
         queue_control,
     );
     let reader = Reader::new_server(
@@ -546,7 +604,7 @@ fn handle_queue_bind(
             debug!(
                 binding_id = binding_id.as_u64(),
                 acceptor_id = acceptor_id.as_u64(),
-                server_queue_id = local_queue_id.as_u64(),
+                server_queue_id = allocated_queue_id.as_u64(),
                 peer_queue_id = peer_queue_id.as_u64(),
                 "QueueBind accepted"
             );
