@@ -102,6 +102,33 @@ where
         }
     }
 
+    /// Allocate a specific slot by index, growing pages as needed.
+    ///
+    /// Used by the server to allocate at the exact `dest_queue_id` the client specified.
+    #[inline]
+    pub fn alloc_at_or_grow(
+        &mut self,
+        slot_index: usize,
+        mut key: Key,
+        remote_queue_id: Option<VarInt>,
+    ) -> (Control<S, C, Key>, Stream<S, C, Key>) {
+        loop {
+            match self.free.alloc_at(slot_index, key, remote_queue_id) {
+                Ok(descriptor) => return descriptor,
+                Err(k) => {
+                    key = k;
+                    if self.epoch > slot_index {
+                        panic!(
+                            "slot {} is within range (epoch={}) but not in free list — already allocated",
+                            slot_index, self.epoch
+                        );
+                    }
+                    self.grow();
+                }
+            }
+        }
+    }
+
     #[inline(never)] // this should happen rarely
     fn grow(&mut self) {
         // Page sizes double with each grow: page 0 has INITIAL_PAGE_SIZE slots,

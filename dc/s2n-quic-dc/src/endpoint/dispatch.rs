@@ -621,11 +621,12 @@ fn create_binding(
     waker_sink: &mut impl channel::UnboundedSender<AutoWake>,
 ) {
     let peer_queue_id = queue_pair.source_queue_id;
+    let local_queue_id = queue_pair.dest_queue_id;
 
     let handle = flow::Handle::new(binding_id);
     let (queue_control, queue_stream) = peer
         .queue_dispatcher
-        .alloc_or_grow(handle, Some(peer_queue_id));
+        .alloc_at_or_grow(local_queue_id.as_u64() as usize, handle, Some(peer_queue_id));
 
     create_binding_with_queues(
         peer,
