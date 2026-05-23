@@ -12,21 +12,18 @@
 //! - Graceful shutdown: Receiver drops normally - transmit but silently drop completions
 //! - Panic/Cancel: Receiver panics or sender.cancel() - cancel all pending transmissions
 
-use crate::{endpoint::id::LocalSenderId, flow::queue::AutoWake, intrusive};
+use crate::{flow::queue::AutoWake, intrusive};
 use core::{
     mem::ManuallyDrop,
-    sync::atomic::{AtomicU64, AtomicU8, Ordering},
+    sync::atomic::{AtomicU8, Ordering},
     task::Poll,
 };
 use parking_lot::Mutex;
-use s2n_quic_core::varint::VarInt;
 use std::sync::Arc;
 
 const SHOULD_TRANSMIT: u8 = 0b01;
 const RECEIVER_ALIVE: u8 = 0b10;
 const INITIAL_STATE: u8 = SHOULD_TRANSMIT | RECEIVER_ALIVE;
-const UNSET_SENDER_IDX: u64 = u64::MAX;
-
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum SubscriptionMode {
     #[default]
@@ -45,9 +42,6 @@ struct Shared<T> {
     /// - bit 0: should_transmit
     /// - bit 1: receiver_alive
     flags: AtomicU8,
-    /// Index of the sender socket that first transmitted the QueueBind frame.
-    /// Used to pin QueueBind retransmits to the same sender for dedup correctness.
-    init_sender_idx: AtomicU64,
     inner: Mutex<Inner<T>>,
 }
 
@@ -59,7 +53,6 @@ pub fn new_with_mode<T>(mode: SubscriptionMode) -> Receiver<T> {
     let shared = Arc::new(Shared {
         mode,
         flags: AtomicU8::new(INITIAL_STATE),
-        init_sender_idx: AtomicU64::new(UNSET_SENDER_IDX),
         inner: Mutex::new(Inner {
             queue: intrusive::Queue::new(),
             recv_waker: None,
@@ -130,28 +123,6 @@ impl<T> Sender<T> {
     #[inline]
     pub fn subscription_mode(&self) -> SubscriptionMode {
         self.shared.mode
-    }
-
-    /// Record which sender-socket transmitted the QueueBind frame.
-    ///
-    /// Only stamps on the first call (compare-exchange from UNSET). Subsequent
-    /// retransmits read this value to route through the same sender.
-    #[inline]
-    pub fn set_init_sender_idx(&self, id: LocalSenderId) {
-        let _ = self.shared.init_sender_idx.compare_exchange(
-            UNSET_SENDER_IDX,
-            id.as_varint().as_u64(),
-            Ordering::Release,
-            Ordering::Relaxed,
-        );
-    }
-
-    /// Returns the sender-socket index stamped for QueueBind, if any.
-    #[inline]
-    pub fn init_sender_idx(&self) -> Option<LocalSenderId> {
-        let v = self.shared.init_sender_idx.load(Ordering::Acquire);
-        let v = VarInt::new(v).ok()?;
-        Some(LocalSenderId::new(v))
     }
 
     /// Send a completion notification, returning the receiver waker rather than invoking it.
@@ -257,14 +228,6 @@ impl<T> Receiver<T> {
         Sender {
             shared: ManuallyDrop::new(Arc::clone(&self.shared)),
         }
-    }
-
-    /// Returns the sender-socket index that transmitted QueueBind, if known.
-    #[inline]
-    pub fn init_sender_idx(&self) -> Option<LocalSenderId> {
-        let v = self.shared.init_sender_idx.load(Ordering::Acquire);
-        let v = VarInt::new(v).ok()?;
-        Some(LocalSenderId::new(v))
     }
 
     /// Cancel all pending transmissions.

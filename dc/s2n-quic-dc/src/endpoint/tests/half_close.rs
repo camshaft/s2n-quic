@@ -905,10 +905,6 @@ fn writer_drop_in_flow_init_sent_hangs_server_reader() {
 
 /// Verifies that when the QueueBind+FIN packet is dropped, PTO retransmits
 /// it and the server eventually receives both the data and FIN.
-///
-/// This was previously a bug when FlowInit and FlowInitFin were separate frames
-/// that could be lost independently. With QueueBind carrying is_fin inline,
-/// the entire operation is retransmitted atomically by PTO.
 #[test]
 fn queue_bind_with_fin_recovered_after_packet_loss() {
     use crate::testing::ext::*;

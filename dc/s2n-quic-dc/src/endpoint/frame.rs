@@ -35,15 +35,17 @@ pub const MAX_QUEUE_DATA_HEADER_OVERHEAD: u16 = 109;
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Priority {
-    QueueReset = 0,
-    QueueControl = 1,
-    QueueData = 2,
-    QueueBind = 3,
+    QueueFree = 0,
+    QueueReset = 1,
+    QueueControl = 2,
+    QueueData = 3,
+    QueueBind = 4,
 }
 
 impl Priority {
-    pub const LEVELS: usize = 4;
+    pub const LEVELS: usize = 5;
     pub const ALL: [Self; Self::LEVELS] = [
+        Self::QueueFree,
         Self::QueueReset,
         Self::QueueControl,
         Self::QueueData,
@@ -439,9 +441,8 @@ impl Header {
         match self {
             Self::QueueBind { .. } => Priority::QueueBind,
             Self::QueueData { .. } => Priority::QueueData,
-            Self::QueueControl { .. } | Self::QueueMaxData { .. } | Self::QueueFree { .. } => {
-                Priority::QueueControl
-            }
+            Self::QueueControl { .. } | Self::QueueMaxData { .. } => Priority::QueueControl,
+            Self::QueueFree { .. } => Priority::QueueFree,
             Self::QueueReset { .. } => Priority::QueueReset,
             Self::Ack { .. } => Priority::QueueControl,
         }

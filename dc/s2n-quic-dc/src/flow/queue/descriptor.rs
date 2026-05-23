@@ -32,8 +32,8 @@ pub trait Key: 'static + Send {
 /// Information about a freed queue slot, emitted when both receivers drop.
 #[derive(Debug, Clone, Copy)]
 pub struct FreedSlot {
-    /// The peer's queue_id that was bound to this slot.
-    pub remote_queue_id: VarInt,
+    /// The local queue_id that was freed.
+    pub queue_id: VarInt,
 }
 
 /// Indicates why a queue key validation failed
@@ -49,7 +49,7 @@ impl ValidationError {
     pub fn as_reset_code(self) -> VarInt {
         use crate::stream::endpoint::error;
         match self {
-            Self::BindingIdMismatch => error::STREAM_ID_MISMATCH,
+            Self::BindingIdMismatch => error::BINDING_ID_MISMATCH,
         }
     }
 }
@@ -270,8 +270,9 @@ impl<S: 'static, C: 'static, Key: 'static> Descriptor<S, C, Key> {
         let inner = self.inner();
         probes::on_receiver_drop(inner.id, half);
 
-        // Capture remote_queue_id before the slot is freed — needed for QueueFree.
+        // Capture queue IDs before the slot is freed — needed for QueueFree.
         let remote_queue_id = inner.remote_queue_id.load(Ordering::Relaxed);
+        let queue_id = inner.queue_id.load(Ordering::Relaxed);
 
         ensure!(inner
             .stream
@@ -287,10 +288,10 @@ impl<S: 'static, C: 'static, Key: 'static> Descriptor<S, C, Key> {
 
         // Notify that this slot has been freed (for QueueFree emission).
         if let Some(notify) = &inner.free_notify {
-            if let Ok(rq) = VarInt::new(remote_queue_id) {
-                notify.lock().unwrap().push(FreedSlot {
-                    remote_queue_id: rq,
-                });
+            if VarInt::new(remote_queue_id).is_ok() {
+                if let Ok(queue_id) = VarInt::new(queue_id) {
+                    notify.lock().unwrap().push(FreedSlot { queue_id });
+                }
             }
         }
 

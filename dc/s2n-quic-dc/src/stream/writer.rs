@@ -773,12 +773,8 @@ impl Inner {
     {
         let (payload, bytes_read, actual_fin) = self.prepare_early_data(buf, is_fin)?;
 
-        let source_sender_id = self
-            .completion_rx
-            .init_sender_idx()
-            .unwrap_or(LocalSenderId::UNSPECIFIED);
         let frame = Frame {
-            source_sender_id,
+            source_sender_id: LocalSenderId::UNSPECIFIED,
             header: Header::QueueBind {
                 queue_pair: self.queue_pair,
                 dest_acceptor_id: self.acceptor_id,
