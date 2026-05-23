@@ -726,18 +726,21 @@ impl<T: Absorb> Channels<T> {
             assert!(!taken.is_null());
 
             // We failed to xchg `taken` with the page in the per_cpu[current] slot. As such
-            // `taken` is still owned by us. Enqueue for background aggregation.
-            self.full_pages
-                .push(unsafe { Box::from_raw(taken) }, cpu_hint);
+            // `taken` is still owned by us. Aggregate inline — this is a very slow path that
+            // should basically never happen in production.
+            let page = unsafe { Box::from_raw(taken) };
+            let mut aggregate = self.aggregate.lock().unwrap();
+            Self::aggregate_page(&mut aggregate, page, &self.empty_pages);
         } else {
             if taken.is_null() {
                 return;
             }
 
-            // The old page was swapped out successfully. Enqueue for background aggregation
-            // rather than blocking the recording thread on the aggregate mutex.
-            self.full_pages
-                .push(unsafe { Box::from_raw(taken) }, cpu_hint);
+            // The old page was swapped out successfully. Aggregate inline to keep
+            // send_event_slow results immediately visible to callers (e.g. tests).
+            let page = unsafe { Box::from_raw(taken) };
+            let mut aggregate = self.aggregate.lock().unwrap();
+            Self::aggregate_page(&mut aggregate, page, &self.empty_pages);
         }
     }
 }
