@@ -60,7 +60,7 @@ pub struct Local {
 
     /// Enable dial9 runtime telemetry (CPU flamegraphs + Tokio task traces) on all nodes
     #[arg(long)]
-    flamegraph: bool,
+    dial9: bool,
 
     /// Workload names to run on client (defaults to first in config if omitted)
     #[arg(long, short)]
@@ -147,7 +147,7 @@ impl Local {
             }
         }
 
-        let dial9_run_id = if self.flamegraph {
+        let dial9_run_id = if self.dial9 {
             let run_id = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
