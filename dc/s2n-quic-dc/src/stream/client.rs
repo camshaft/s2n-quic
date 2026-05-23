@@ -14,7 +14,7 @@
 use crate::{
     flow, psk,
     stream::{
-        endpoint::{msg, Endpoint},
+        endpoint::Endpoint,
         Reader, Stream, Writer,
     },
 };
@@ -136,9 +136,7 @@ impl Client {
         let binding_id = path_secret_entry.alloc_binding_id();
 
         let handle = flow::Handle::client(binding_id, path_secret_entry.clone());
-
-        let mut dispatcher = path_secret_entry.queue_dispatcher();
-        let (queue_control, queue_stream) = dispatcher.alloc_or_grow(handle, None);
+        let (queue_control, queue_stream) = path_secret_entry.alloc_queue(handle, None);
 
         let queue_pair = crate::packet::datagram::QueuePair {
             source_queue_id: queue_control.queue_id(),

@@ -1621,7 +1621,6 @@ pub struct PeerDeadCounters {
 
 pub fn peer_dead_broadcast<R, WakerSink>(
     peer_dead_rx: R,
-    mut queue_dispatcher: msg::queue::Dispatcher,
     mut waker_sink: WakerSink,
     counters: PeerDeadCounters,
 ) -> impl Receiver<()>
@@ -1641,6 +1640,7 @@ where
             stream_id: None,
         };
 
+        let mut queue_dispatcher = peer_dead.path_secret_entry.queue_dispatcher();
         queue_dispatcher.send_both_by_request(
             &request,
             || {

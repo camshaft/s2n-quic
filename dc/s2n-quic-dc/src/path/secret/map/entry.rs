@@ -82,7 +82,8 @@ pub struct Entry {
     next_binding_id: AtomicU64,
     /// Per-entry queue pool. Both client (connect) and server (recv dispatch)
     /// allocate from and dispatch to this pool via their own Dispatch handles.
-    queue_allocator: crate::endpoint::msg::queue::Allocator,
+    // TODO: replace Mutex with a lock-free grow strategy
+    queue_allocator: std::sync::Mutex<crate::endpoint::msg::queue::Allocator>,
 }
 
 impl SizeOf for Entry {
@@ -204,7 +205,7 @@ impl Entry {
             peer_data_addrs: PeerDataAddrs::default(),
             sender_load_scores: Self::init_load_scores(socket_sender_count),
             next_binding_id: AtomicU64::new(0),
-            queue_allocator: crate::endpoint::msg::queue::Allocator::new(),
+            queue_allocator: std::sync::Mutex::new(crate::endpoint::msg::queue::Allocator::new()),
         }
     }
 
@@ -540,11 +541,28 @@ impl Entry {
 
     /// Returns a new dispatcher handle backed by this entry's queue pool.
     ///
-    /// Both client (connect) and server (recv dispatch) obtain their own
-    /// handles, each with independent local page caches but sharing the
-    /// same underlying slot storage.
+    /// Server recv contexts obtain a dispatcher at creation time and hold it
+    /// for the context's lifetime.
     pub fn queue_dispatcher(&self) -> crate::endpoint::msg::queue::Dispatcher {
-        self.queue_allocator.dispatcher()
+        self.queue_allocator.lock().unwrap().dispatcher()
+    }
+
+    /// Allocates a queue slot from this entry's pool, growing if needed.
+    ///
+    /// Used by the client connect path where only allocation is needed
+    /// (no dispatch routing).
+    pub fn alloc_queue(
+        &self,
+        handle: crate::flow::Handle,
+        remote_queue_id: Option<s2n_quic_core::varint::VarInt>,
+    ) -> (
+        crate::endpoint::msg::queue::Control,
+        crate::endpoint::msg::queue::Stream,
+    ) {
+        self.queue_allocator
+            .lock()
+            .unwrap()
+            .alloc_or_grow(handle, remote_queue_id)
     }
 
     pub fn max_datagram_size(&self) -> u16 {

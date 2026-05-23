@@ -4,7 +4,4 @@ expression: logs
 ---
 0:00:00.000000000 [main] DEBUG grow epoch=8
 0:00:00.000000000 [main] DEBUG grow epoch=8
-0:00:00.000000000 [main] DEBUG grow epoch=8
-0:00:00.000000000 [main] DEBUG grow epoch=8
-0:00:00.000000000 [main] DEBUG grow epoch=8
 0:00:00.000000000 [main] DEBUG invalidating recv contexts id=0xb825b05b860f8a17c74724ad21b1b2f3 removed=2 worker_id=0

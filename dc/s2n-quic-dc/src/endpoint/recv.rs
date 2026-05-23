@@ -328,18 +328,13 @@ impl core::hash::Hash for Key {
 pub(crate) struct Cache {
     pub senders: FxHashMap<Key, Rc<RefCell<Context>>>,
     pub worker_id: RecvDispatchWorkerId,
-    pub queue_dispatcher: crate::endpoint::msg::queue::Dispatcher,
 }
 
 impl Cache {
-    pub fn new(
-        worker_id: RecvDispatchWorkerId,
-        queue_dispatcher: crate::endpoint::msg::queue::Dispatcher,
-    ) -> Self {
+    pub fn new(worker_id: RecvDispatchWorkerId) -> Self {
         Self {
             senders: FxHashMap::default(),
             worker_id,
-            queue_dispatcher,
         }
     }
 
@@ -444,7 +439,12 @@ impl Cache {
                     "recv cache key_id advanced — replacing entry"
                 );
 
+<<<<<<< HEAD
                 let dest_sender_id = route.sender_id_for_ack(remote_sender_id);
+=======
+                let dest_sender_id = route.sender_id_for_ack(&credentials.id, remote_sender_id);
+                let queue_dispatcher = path_entry.queue_dispatcher();
+>>>>>>> a3c332b1 (per-entry queue dispatch: remove global allocator/dispatcher)
                 let new_ctx = Rc::new(RefCell::new(Context::new(
                     path_entry,
                     remote_sender_id,
@@ -452,7 +452,7 @@ impl Cache {
                     opener,
                     credentials.key_id,
                     clock.now(),
-                    self.queue_dispatcher.clone(),
+                    queue_dispatcher,
                 )));
                 new_ctx.borrow().invariants();
                 *entry.into_mut() = new_ctx.clone();
@@ -490,6 +490,7 @@ impl Cache {
 
                 let dest_sender_id = route.sender_id_for_ack(remote_sender_id);
 
+                let queue_dispatcher = path_entry.queue_dispatcher();
                 let ctx = Rc::new(RefCell::new(Context::new(
                     path_entry,
                     remote_sender_id,
@@ -497,7 +498,7 @@ impl Cache {
                     opener,
                     credentials.key_id,
                     clock.now(),
-                    self.queue_dispatcher.clone(),
+                    queue_dispatcher,
                 )));
                 ctx.borrow().invariants();
                 entry.insert(ctx.clone());
