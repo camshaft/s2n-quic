@@ -745,25 +745,21 @@ impl Context {
 
         let needs_urgent = self.has_pending_acks() || self.pto.probe_state.is_requested();
 
-        // If context is already sitting in the tx_wheel but urgent work arrived
-        // (ACK to send or PTO probe), route to the immediate queue so it doesn't
-        // wait for the scheduled EDT to fire.
-        let immediate = self.is_tx_scheduled() && needs_urgent && !self.is_immediate_scheduled();
+        // Urgent work (ACK to send or PTO probe) always routes to the immediate
+        // queue to bypass EDT pacing. This avoids putting ACKs in the "slow lane"
+        // behind the tx_wheel, regardless of whether the context is already
+        // tx-scheduled.
+        let immediate = needs_urgent && !self.is_immediate_scheduled();
 
         let transmission = if
-        // Check we have queued packets and we're not already linked
-        !self.is_tx_scheduled()
-            && (needs_urgent
-                || (self.has_pending_data() && self.can_send_pending_frames()))
+        // Check we have queued data packets and we're not already linked
+        !self.is_tx_scheduled() && self.has_pending_data() && self.can_send_pending_frames()
         {
-            // ACKs and probes bypass pacing — schedule immediately.
-            let target = if needs_urgent {
-                None
-            } else {
-                self.cca
-                    .earliest_departure_time()
-                    .map(precision::Timestamp::from)
-            };
+            // Non-urgent pending data follows CCA pacing via the tx_wheel.
+            let target = self
+                .cca
+                .earliest_departure_time()
+                .map(precision::Timestamp::from);
             // If target time is `None` then the wheel will schedule it immediately
             self.tx_wheel.target_time = target;
             true
@@ -973,10 +969,18 @@ impl Context {
                 "has_pending predicate drifted from queue contents"
             );
 
-            // NOTE: with the immediate-tx path, a context can be tx-scheduled (in the
-            // wheel waiting for EDT) but have no sendable work because the immediate
-            // path already drained the ACK/probe. This is harmless — the wheel will
-            // fire, the assembler will find nothing to do, and reschedule to idle.
+            // When the tx_wheel is scheduled with a future EDT (target_time is Some)
+            // there must be pending data waiting for that EDT, or the immediate queue
+            // must still be outstanding (urgent work will run first, then tx drains data).
+            // This invariant relies on the assembler's Phase 3 gating: when called from
+            // the immediate path with tx_wheel still scheduled, Phase 3 is skipped for
+            // non-probe data, so the pending queue is preserved until tx_wheel fires.
+            if self.tx_wheel.is_scheduled() && self.tx_wheel.target_time.is_some() {
+                assert!(
+                    self.has_pending_data() || self.is_immediate_scheduled(),
+                    "tx wheel scheduled with future EDT but no pending data and no immediate work"
+                );
+            }
 
             if self.pto_wheel.is_scheduled() {
                 if self.pto_wheel.target_time.is_some() {

@@ -1562,7 +1562,8 @@ where
 // ── PrioritySelect ───────────────────────────────────────────────────────
 
 /// Polls a high-priority receiver first; falls back to a low-priority receiver
-/// only when the priority receiver is pending or closed.
+/// only when the priority receiver is pending. Closes immediately when the
+/// priority receiver closes (returns `Ready(None)`).
 #[derive(Clone, Copy)]
 enum PrioritySelectBranch {
     Priority,
@@ -1598,7 +1599,7 @@ where
                 self.last_recv_branch = Some(PrioritySelectBranch::Priority);
                 return Poll::Ready(Some(value));
             }
-            Poll::Ready(None) => {}
+            Poll::Ready(None) => return Poll::Ready(None),
             Poll::Pending => {}
         }
         match self.fallback.poll_recv(cx, budget) {

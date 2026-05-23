@@ -227,10 +227,21 @@ where
             }
 
             // Phase 3: drain pending (data) frames.
-            // When a probe is requested and pending data is available, bypass CWND per
-            // RFC 9002 §6.2.4. Otherwise only drain when the congestion window allows.
+            //
+            // Data is gated on the tx_wheel not being scheduled:
+            // - Called from the tx_wheel path: the context has been popped from the
+            //   wheel so `tx_wheel.is_scheduled()` is false → drain data freely.
+            // - Called from the immediate path with tx_wheel pending (future EDT):
+            //   `tx_wheel.is_scheduled()` is true → skip data here; the tx_wheel will
+            //   drain it when the EDT arrives.  This prevents immediate-path assembly
+            //   from bypassing CCA pacing for data frames.
+            //
+            // PTO probes are exempt: RFC 9002 §6.2.4 requires probes to bypass both
+            // CWND and pacing so that tail-loss recovery is not delayed by EDT.
             let can_send_pending = context.has_pending_data()
-                && (context.pto.probe_state.is_requested() || context.can_send_pending_frames());
+                && (context.pto.probe_state.is_requested()
+                    || (!context.tx_wheel.is_scheduled()
+                        && context.can_send_pending_frames()));
             let phase3_is_probe = can_send_pending && context.pto.probe_state.is_requested();
 
             if can_send_pending {

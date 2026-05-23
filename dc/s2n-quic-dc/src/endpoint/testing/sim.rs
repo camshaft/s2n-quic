@@ -201,6 +201,11 @@ impl Default for SimEndpointConfig {
         Self {
             bind_addr: SocketAddr::new(std::net::Ipv4Addr::UNSPECIFIED.into(), 0),
             num_send_sockets: 8,
+            // TODO: support asymmetric send/recv socket counts — currently both sides
+            // must be equal so that the shared-bidirectional-socket setup in
+            // setup_sim_endpoint mirrors production Config::create(). Unequal counts
+            // are structurally valid but the sim harness does not yet wire them up
+            // correctly for symmetric-5-tuple routing tests.
             num_recv_sockets: 8,
             num_recv_io_workers: 2,
             num_send_workers: 4,
