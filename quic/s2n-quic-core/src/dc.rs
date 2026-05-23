@@ -105,6 +105,7 @@ pub struct ApplicationParams {
     pub local_recv_max_data: VarInt,
     // Actually a Duration, stored as milliseconds to shrink this struct
     pub max_idle_timeout: Option<NonZeroU32>,
+    pub initial_max_queues: VarInt,
 }
 
 impl Clone for ApplicationParams {
@@ -115,6 +116,7 @@ impl Clone for ApplicationParams {
             local_send_max_data: self.local_send_max_data,
             local_recv_max_data: self.local_recv_max_data,
             max_idle_timeout: self.max_idle_timeout,
+            initial_max_queues: self.initial_max_queues,
         }
     }
 }
@@ -135,6 +137,7 @@ impl ApplicationParams {
                 // If > u32::MAX, treat as not having an idle timeout, that's ~50 days.
                 .and_then(|v| v.as_millis().try_into().ok())
                 .and_then(NonZeroU32::new),
+            initial_max_queues: VarInt::from_u16(1024),
         }
     }
 
@@ -161,6 +164,8 @@ decoder_value!(
             })?;
             let max_idle_timeout = NonZeroU32::new(timeout_value);
 
+            let (initial_max_queues, buffer) = buffer.decode::<VarInt>()?;
+
             Ok((
                 Self {
                     max_datagram_size: AtomicU16::new(max_datagram_size),
@@ -168,6 +173,7 @@ decoder_value!(
                     local_send_max_data,
                     local_recv_max_data,
                     max_idle_timeout,
+                    initial_max_queues,
                 },
                 buffer,
             ))
@@ -190,6 +196,8 @@ impl EncoderValue for ApplicationParams {
                 buffer.encode(&VarInt::from(0u32));
             }
         }
+
+        buffer.encode(&self.initial_max_queues);
     }
 }
 

@@ -50,14 +50,15 @@ fn encode_ack_payload(largest: u64) -> BytesMut {
 /// Create a test frame suitable for inflight insertion (ack-eliciting).
 fn inflight_frame(pse: &std::sync::Arc<crate::path::secret::map::Entry>) -> Entry<Frame> {
     Entry::new(Frame {
-        header: Header::FlowData {
+        header: Header::QueueData {
             queue_pair: QueuePair {
                 source_queue_id: VarInt::from_u8(1),
                 dest_queue_id: VarInt::from_u8(2),
             },
-            stream_id: VarInt::from_u8(1),
+            binding_id: VarInt::from_u8(1),
             offset: VarInt::ZERO,
             is_fin: false,
+            dest_acceptor_id: None,
         },
         source_sender_id: crate::endpoint::id::LocalSenderId::new(VarInt::MAX),
         payload: bytes::BytesMut::zeroed(100).into(),

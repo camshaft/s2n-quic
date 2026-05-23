@@ -43,22 +43,6 @@ impl Sendable for Response {
     }
 }
 
-const CREDENTIAL_ID_OFFSET: usize = 1;
-const CREDENTIAL_ID_LEN: usize = 16;
-
-/// Extracts the credential_id from an encoded UnknownPathSecret packet.
-///
-/// The packet layout is: [tag: 1 byte][credential_id: 16 bytes][...].
-fn extract_credential_id(packet: &[u8]) -> Option<credentials::Id> {
-    let end = CREDENTIAL_ID_OFFSET + CREDENTIAL_ID_LEN;
-    if packet.len() < end {
-        return None;
-    }
-    let mut id = [0u8; CREDENTIAL_ID_LEN];
-    id.copy_from_slice(&packet[CREDENTIAL_ID_OFFSET..end]);
-    Some(credentials::Id::from(id))
-}
-
 /// Per-credential dedup filter for the UPS drain pipeline.
 ///
 /// Maintains a fixed-capacity map of credential_id → last-sent timestamp.
@@ -72,9 +56,7 @@ pub struct DedupFilter {
     pub counters: DedupCounters,
 }
 
-pub struct DedupCounters {
-    pub suppressed: Counter,
-}
+pub struct DedupCounters {}
 
 impl DedupFilter {
     pub fn new(capacity: usize, window: core::time::Duration, counters: DedupCounters) -> Self {

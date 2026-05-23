@@ -889,7 +889,6 @@ fn ack_only_probe_does_not_create_ack_loop() {
 /// opened and the test asserts that the server acceptor receives each stream
 /// ID exactly once (no duplicates, none missing).
 #[test]
-#[ignore = "this is currently failing - TODO figure out why"]
 fn init_uniqueness_fuzz() {
     bolero::check!()
         .with_type::<PacketActions>()

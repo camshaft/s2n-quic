@@ -3,7 +3,7 @@ source: dc/s2n-quic-dc/src/testing.rs
 expression: logs
 ---
 0:00:00.000000000 [main] DEBUG grow epoch=8
-0:00:00.000000000 [main] DEBUG event=on_validated prev=PendingValidation next=Open location=dc/s2n-quic-dc/src/stream/reader.rs
+0:00:00.000000000 [main] DEBUG grow epoch=8
 0:00:00.000000000 [main] DEBUG Flow validated stream_id=1
 0:00:00.000000000 [main] DEBUG Stream reset by peer stream_id=1 error_code=5
 0:00:00.000000000 [main] DEBUG event=on_reset prev=Open next=Reset location=dc/s2n-quic-dc/src/stream/reader.rs

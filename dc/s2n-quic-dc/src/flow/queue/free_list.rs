@@ -24,11 +24,11 @@ pub(super) trait FreeList<S, C, Key>: 'static + Send + Sync {
     fn free(&self, descriptor: Descriptor<S, C, Key>) -> Option<Box<dyn 'static + Send>>;
 }
 
-/// A free list of unfilled descriptors
+/// A free list of unfilled descriptors with O(1) indexed allocation.
 ///
-/// Note that this uses a [`Vec`] instead of [`std::collections::VecDeque`], which acts more
-/// like a stack than a queue. This is to prefer more-recently used descriptors which should
-/// hopefully reduce the number of cache misses.
+/// Descriptors are stored in a direct-indexed Vec (by slot index) for O(1) `alloc_at`.
+/// A separate VecDeque of free indices provides LIFO ordering for the unindexed `alloc`
+/// path, preferring recently-freed descriptors for cache locality.
 pub(super) struct FreeVec<S: 'static, C: 'static, Key: 'static> {
     inner: Mutex<FreeInner<S, C, Key>>,
 }
@@ -36,12 +36,15 @@ pub(super) struct FreeVec<S: 'static, C: 'static, Key: 'static> {
 impl<S: 'static, C: 'static, Key: 'static> FreeVec<S, C, Key> {
     #[inline]
     pub fn new(initial_cap: usize) -> (Arc<Self>, Arc<Memory<S, C, Key>>) {
-        let descriptors = VecDeque::with_capacity(initial_cap);
+        let slots = Vec::with_capacity(initial_cap);
+        let free_indices = VecDeque::with_capacity(initial_cap);
         let regions = Vec::with_capacity(1);
         let inner = FreeInner {
-            descriptors,
+            slots,
+            free_indices,
             regions,
             total: 0,
+            free_count: 0,
             open: true,
             #[cfg(debug_assertions)]
             active: Default::default(),
@@ -59,8 +62,16 @@ impl<S: 'static, C: 'static, Key: 'static> FreeVec<S, C, Key> {
         remote_queue_id: Option<VarInt>,
     ) -> Result<(Control<S, C, Key>, Stream<S, C, Key>), Key> {
         let mut inner = self.inner.lock().unwrap();
-        let Some(descriptor) = inner.descriptors.pop_front() else {
-            return Err(key);
+
+        // Skip indices that were already taken by alloc_at (lazy cleanup).
+        let descriptor = loop {
+            let Some(slot_index) = inner.free_indices.pop_front() else {
+                return Err(key);
+            };
+            if let Some(desc) = inner.slots[slot_index].take() {
+                inner.free_count -= 1;
+                break desc;
+            }
         };
 
         #[cfg(debug_assertions)]
@@ -81,6 +92,47 @@ impl<S: 'static, C: 'static, Key: 'static> FreeVec<S, C, Key> {
         }
     }
 
+    /// Allocate a specific slot by index in O(1), removing it from the free list.
+    ///
+    /// Returns `Err(key)` if the slot is not in the free list (already allocated or not grown yet).
+    ///
+    /// The corresponding entry in `free_indices` is left as a stale reference; `alloc` skips
+    /// stale entries lazily when it encounters them.
+    #[inline]
+    pub fn alloc_at(
+        &self,
+        slot_index: usize,
+        key: Key,
+        remote_queue_id: Option<VarInt>,
+    ) -> Result<(Control<S, C, Key>, Stream<S, C, Key>), Key> {
+        let mut inner = self.inner.lock().unwrap();
+
+        if slot_index >= inner.slots.len() {
+            return Err(key);
+        }
+
+        let Some(descriptor) = inner.slots[slot_index].take() else {
+            return Err(key);
+        };
+        inner.free_count -= 1;
+
+        #[cfg(debug_assertions)]
+        assert!(
+            inner.active.insert(descriptor.as_usize()),
+            "{} already in {:?}",
+            descriptor.as_usize(),
+            inner.active
+        );
+
+        drop(inner);
+
+        unsafe {
+            descriptor.init_key(key);
+            let (control, stream) = descriptor.into_receiver_pair(remote_queue_id);
+            Ok((Control::new(control), Stream::new(stream)))
+        }
+    }
+
     #[inline]
     pub fn record_region(
         &self,
@@ -92,13 +144,19 @@ impl<S: 'static, C: 'static, Key: 'static> FreeVec<S, C, Key> {
         let prev = inner.total;
         let next = prev + descriptors.len();
         inner.total = next;
-        let mut descriptors: VecDeque<_> = descriptors.into();
-        inner.descriptors.append(&mut descriptors);
-        // Even though the `descriptors` is now empty (`len=0`), it still owns
-        // capacity and will need to be freed. Drop the lock before interacting
-        // with the global allocator.
+
+        // Grow the slots vec to cover the new indices and insert each descriptor.
+        let count = descriptors.len();
+        inner.slots.resize_with(next, || None);
+        for descriptor in descriptors {
+            let idx = unsafe { descriptor.queue_id_index() };
+            debug_assert!(inner.slots[idx].is_none());
+            inner.slots[idx] = Some(descriptor);
+            inner.free_indices.push_back(idx);
+        }
+        inner.free_count += count;
+
         drop(inner);
-        drop(descriptors);
         probes::on_grow(prev, next);
     }
 
@@ -141,7 +199,12 @@ where
             inner.active
         );
 
-        inner.descriptors.push_back(descriptor);
+        let idx = unsafe { descriptor.queue_id_index() };
+        debug_assert!(inner.slots[idx].is_none());
+        inner.slots[idx] = Some(descriptor);
+        inner.free_indices.push_back(idx);
+        inner.free_count += 1;
+
         if inner.open {
             return None;
         }
@@ -152,9 +215,15 @@ where
 }
 
 struct FreeInner<S: 'static, C: 'static, Key: 'static> {
-    descriptors: VecDeque<Descriptor<S, C, Key>>,
+    /// Direct-indexed storage: slot i holds `Some(descriptor)` when free, `None` when allocated.
+    slots: Vec<Option<Descriptor<S, C, Key>>>,
+    /// LIFO ordering of free slot indices for `alloc` (most recently freed at back).
+    /// May contain stale entries for slots already taken by `alloc_at`.
+    free_indices: VecDeque<usize>,
     regions: Vec<Region<S, C, Key>>,
     total: usize,
+    /// Number of descriptors currently in the free list (slots that are Some).
+    free_count: usize,
     open: bool,
     #[cfg(debug_assertions)]
     active: std::collections::BTreeSet<usize>,
@@ -164,10 +233,10 @@ impl<S: 'static, C: 'static, Key: 'static> FreeInner<S, C, Key> {
     #[inline(never)] // this is rarely called
     fn try_free(&mut self) -> Option<Self> {
         #[cfg(debug_assertions)]
-        assert_eq!(self.total - self.descriptors.len(), self.active.len());
+        assert_eq!(self.total - self.free_count, self.active.len());
 
-        if self.descriptors.len() < self.total {
-            probes::on_draining(self.total, self.total - self.descriptors.len());
+        if self.free_count < self.total {
+            probes::on_draining(self.total, self.total - self.free_count);
             return None;
         }
 
@@ -175,9 +244,11 @@ impl<S: 'static, C: 'static, Key: 'static> FreeInner<S, C, Key> {
         Some(core::mem::replace(
             self,
             FreeInner {
-                descriptors: VecDeque::new(),
+                slots: Vec::new(),
+                free_indices: VecDeque::new(),
                 regions: Vec::new(),
                 total: 0,
+                free_count: 0,
                 open: false,
                 #[cfg(debug_assertions)]
                 active: Default::default(),
@@ -189,7 +260,7 @@ impl<S: 'static, C: 'static, Key: 'static> FreeInner<S, C, Key> {
 impl<S: 'static, C: 'static, Key: 'static> Drop for FreeInner<S, C, Key> {
     #[inline]
     fn drop(&mut self) {
-        if self.descriptors.is_empty() {
+        if self.free_count == 0 {
             return;
         }
 
@@ -198,10 +269,12 @@ impl<S: 'static, C: 'static, Key: 'static> Drop for FreeInner<S, C, Key> {
 
         probes::on_drained(self.total);
 
-        for descriptor in self.descriptors.drain(..) {
-            unsafe {
-                // SAFETY: the free list is closed and there are no outstanding descriptors
-                descriptor.drop_in_place();
+        for slot in self.slots.drain(..) {
+            if let Some(descriptor) = slot {
+                unsafe {
+                    // SAFETY: the free list is closed and there are no outstanding descriptors
+                    descriptor.drop_in_place();
+                }
             }
         }
     }

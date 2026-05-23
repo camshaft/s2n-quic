@@ -223,6 +223,71 @@ impl<S: 'static, C: 'static, Key: 'static> Sender<S, C, Key> {
         }
     }
 
+    /// Server-side send: validates and atomically binds if unbound.
+    ///
+    /// Returns `Ok((waker, ServerValidation))` on success. If the queue was unbound,
+    /// returns `ServerValidation::NewBinding` and the key has been initialized.
+    #[inline]
+    pub fn send_stream_server(
+        &self,
+        entry: intrusive::Entry<S>,
+        remote_queue_id: Option<VarInt>,
+        params: &<Key as super::descriptor::Key>::Request,
+        new_key: impl FnOnce() -> Key,
+    ) -> Result<(AutoWake, super::descriptor::ServerValidation), Error<intrusive::Entry<S>>>
+    where
+        Key: super::descriptor::Key,
+    {
+        unsafe {
+            let (waker, result) = self.descriptor.stream_queue().push_with_result(
+                entry,
+                || {
+                    if let Some(id) = remote_queue_id {
+                        self.descriptor.set_remote_queue_id(id);
+                        true
+                    } else {
+                        false
+                    }
+                },
+                || self.descriptor.validate_or_bind(params, new_key),
+            )?;
+            probes::on_send(self.queue_id(), Half::Stream, false);
+            Ok((waker, result))
+        }
+    }
+
+    /// Push to stream queue without validation. Used for broadcast (peer-dead reset).
+    #[inline]
+    pub fn push_stream_unchecked(
+        &self,
+        entry: intrusive::Entry<S>,
+    ) -> Result<AutoWake, Error<intrusive::Entry<S>>> {
+        unsafe {
+            let waker = self
+                .descriptor
+                .stream_queue()
+                .push(entry, || false, || Ok(()))?;
+            probes::on_send(self.queue_id(), Half::Stream, false);
+            Ok(waker)
+        }
+    }
+
+    /// Push to control queue without validation. Used for broadcast (peer-dead reset).
+    #[inline]
+    pub fn push_control_unchecked(
+        &self,
+        entry: intrusive::Entry<C>,
+    ) -> Result<AutoWake, Error<intrusive::Entry<C>>> {
+        unsafe {
+            let waker = self
+                .descriptor
+                .control_queue()
+                .push(entry, || false, || Ok(()))?;
+            probes::on_send(self.queue_id(), Half::Control, false);
+            Ok(waker)
+        }
+    }
+
     #[inline]
     pub fn validate_stream(
         &self,

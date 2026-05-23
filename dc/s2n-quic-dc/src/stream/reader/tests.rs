@@ -78,16 +78,13 @@ impl PairBuilder {
 
         let allocator = msg::queue::Allocator::new();
         let dispatcher = allocator.dispatcher();
-        let handle = flow::Handle::client(stream_id, path_secret_entry.clone());
+        let handle = flow::Handle::new(stream_id);
         let (_control, stream_rx) = dispatcher
             .alloc(handle, Some(VarInt::from_u8(2)))
             .expect("queue alloc should succeed");
 
         let queue_id = stream_rx.queue_id();
-        let request = flow::Request {
-            credential_id: *path_secret_entry.id(),
-            stream_id: Some(stream_id),
-        };
+        let request = stream_id;
 
         let (frame_tx, frame_rx) = frame::submission_channel(1);
 
@@ -95,7 +92,7 @@ impl PairBuilder {
             endpoint::Type::Client => {
                 Reader::new_client(frame_tx, path_secret_entry, stream_id, stream_rx)
             }
-            endpoint::Type::Server => Reader::new_server_pending(
+            endpoint::Type::Server => Reader::new_server(
                 frame_tx,
                 path_secret_entry,
                 stream_id,
@@ -140,7 +137,7 @@ fn peer_addr_returns_handshake_addr() {
 struct Pusher {
     dispatcher: msg::queue::Dispatcher,
     queue_id: VarInt,
-    request: flow::Request,
+    request: VarInt,
     /// Outbound frames submitted by the Reader (MAX_DATA, STOP_SENDING, …).
     frame_rx: SubmissionReceiver,
     /// Reusable priority-storage buffer; avoids re-allocating the fixed-size
@@ -239,7 +236,7 @@ impl Pusher {
 
 fn decode_max_data_from_flow_control(frame: &Frame) -> Option<VarInt> {
     match frame.header {
-        Header::FlowMaxData { maximum_data, .. } => Some(maximum_data),
+        Header::QueueMaxData { maximum_data, .. } => Some(maximum_data),
         _ => None,
     }
 }
@@ -603,7 +600,7 @@ fn reset_after_partial_data_byte_at_a_time_drains_before_error() {
     });
 }
 
-/// The Reader must emit a `MAX_DATA` (FlowControl) frame after the application
+/// The Reader must emit a `MAX_DATA` (QueueMaxData) frame after the application
 /// consumes enough bytes to cross the replenishment threshold (> window / 2).
 ///
 /// The endpoint task waits for the MAX_DATA frame asynchronously — mirroring
@@ -691,7 +688,7 @@ fn max_data_transmission_failure_surfaces_error() {
 }
 
 /// If the peer sends beyond the client's advertised receive window, the Reader
-/// errors and emits a FlowReset.
+/// errors and emits a QueueReset.
 #[test]
 fn flow_control_violation_errors_reader_and_sends_reset() {
     sim(|| {
@@ -706,13 +703,13 @@ fn flow_control_violation_errors_reader_and_sends_reset() {
             assert!(
                 matches!(
                     frames.front().unwrap().header,
-                    Header::FlowReset {
+                    Header::QueueReset {
                         reset_target: ResetTarget::Both,
                         error_code,
                         ..
                     } if error_code == error::FLOW_CONTROL_ERROR
                 ),
-                "expected exactly one FlowReset(Both, FLOW_CONTROL_ERROR) frame"
+                "expected exactly one QueueReset(Both, FLOW_CONTROL_ERROR) frame"
             );
         }
         .primary()
@@ -798,33 +795,10 @@ fn client_fin_observed_before_gap_fill_does_not_send_max_data() {
     });
 }
 
-/// A server-side stream starts in `PendingValidation`; calling `read_into`
-/// before `validate` returns an `InvalidInput` error.
-#[test]
-fn server_read_before_validate_fails() {
-    sim(|| {
-        let (mut reader, mut pusher) = make_server_pair();
-
-        async move {
-            pusher.push_data(0, b"hello", true);
-        }
-        .primary()
-        .spawn();
-
-        async move {
-            let mut buf = BytesMut::with_capacity(16);
-            let err = reader
-                .read_into(&mut buf)
-                .await
-                .expect_err("expected error before validation");
-            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
-        }
-        .primary()
-        .spawn();
-    });
-}
-
-/// A server-side stream becomes readable once `FlowValidated` is received.
+/// A server-side stream becomes readable immediately (validation is instant).
+/// MAX_DATA is emitted once data is consumed. With immediate validation there
+/// is no separate "FlowValidated" step — data receipt alone triggers the
+/// initial credit advertisement.
 #[test]
 fn server_validates_then_reads() {
     sim(|| {
@@ -832,16 +806,12 @@ fn server_validates_then_reads() {
         let expected_max_data = VarInt::new(reader.0.window_size + 5).unwrap();
 
         async move {
-            pusher.push_flow_validated();
-            // Encourage task interleaving so validation/read processing can run
-            // before we assert on emitted flow-control frames.
-            bach::task::yield_now().await;
             pusher.push_data(0, b"hello", true);
             bach::task::yield_now().await;
             let frames = pusher
                 .recv_frames_timeout(1.s())
                 .await
-                .expect("expected server flow update after validating/reading");
+                .expect("expected server flow update after reading");
             assert_eq!(frames.len(), 1, "expected exactly one outbound frame");
             assert_eq!(
                 frames.front().and_then(decode_max_data_from_flow_control),
@@ -864,9 +834,9 @@ fn server_validates_then_reads() {
     });
 }
 
-/// When early data arrives before FlowValidated (as happens with AcceptedWithRetry),
-/// the reader must still emit MAX_DATA after validate() + read() — even though
-/// poll_stream_rx returns Pending on the read call (channel already drained by validate).
+/// With immediate validation, data arriving triggers MAX_DATA on first read.
+/// (Previously this tested "early data before FlowValidated" but that
+/// distinction no longer exists.)
 #[test]
 fn server_early_data_before_validated_sends_max_data() {
     sim(|| {
@@ -874,17 +844,14 @@ fn server_early_data_before_validated_sends_max_data() {
         let expected_max_data = VarInt::new(reader.0.window_size + 5).unwrap();
 
         async move {
-            // Push early data FIRST (mimics FlowInit payload arriving before validation)
+            // Data arrives and is consumed immediately on the first read poll.
             pusher.push_data(0, b"hello", true);
-            bach::task::yield_now().await;
-            // Then FlowValidated arrives (after the validation round-trip)
-            pusher.push_flow_validated();
             bach::task::yield_now().await;
 
             let frames = pusher
                 .recv_frames_timeout(1.s())
                 .await
-                .expect("expected MAX_DATA after reading early data");
+                .expect("expected MAX_DATA after reading data");
             assert_eq!(frames.len(), 1);
             assert_eq!(
                 frames.front().and_then(decode_max_data_from_flow_control),
@@ -915,8 +882,6 @@ fn server_init_with_fin_suppresses_max_data() {
         let (mut reader, mut pusher) = PairBuilder::server().peer_fin_received(true).build();
 
         async move {
-            pusher.push_flow_validated();
-            bach::task::yield_now().await;
             pusher.push_data(0, b"hello", true);
             bach::task::yield_now().await;
             let frames = pusher.recv_frames_timeout(1.s()).await;
@@ -951,8 +916,6 @@ fn server_init_with_fin_suppresses_max_data_large_payload() {
 
         let payload_clone = payload.clone();
         async move {
-            pusher.push_flow_validated();
-            bach::task::yield_now().await;
             pusher.push_data(0, &payload_clone, true);
             bach::task::yield_now().await;
             let frames = pusher.recv_frames_timeout(1.s()).await;
@@ -977,16 +940,16 @@ fn server_init_with_fin_suppresses_max_data_large_payload() {
     });
 }
 
-/// Reset arrives while `validate()` is in-flight and early data is already buffered.
-/// The application must be able to drain buffered data after validate fails with
-/// ConnectionReset (TCP receive-buffer semantics: data before RST is readable).
+/// Reset arrives after early data is buffered. The application must be able to
+/// drain buffered data before seeing the reset error (TCP receive-buffer
+/// semantics: data before RST is readable).
 #[test]
-fn server_reset_during_validate_with_buffered_data() {
+fn server_reset_with_buffered_data() {
     sim(|| {
         let (mut reader, mut pusher) = make_server_pair();
 
         async move {
-            // Early data arrives first (buffered in reassembler during PendingValidation)
+            // Early data arrives first
             pusher.push_data(0, b"buffered", false);
             bach::task::yield_now().await;
             // Reset arrives in subsequent batch
@@ -996,15 +959,12 @@ fn server_reset_during_validate_with_buffered_data() {
         .spawn();
 
         async move {
-            // validate() should fail with ConnectionReset
-            let err = reader
+            reader
                 .validate()
                 .await
-                .expect_err("expected ConnectionReset from validate");
-            assert_eq!(err.kind(), std::io::ErrorKind::ConnectionReset);
-            assert!(reader.0.status.is_reset());
+                .expect("validate succeeds immediately");
 
-            // Despite validate failing, buffered data should be drainable
+            // Buffered data should be drainable despite reset
             let mut buf = BytesMut::with_capacity(32);
             let n = reader
                 .read_into(&mut buf)
@@ -1025,10 +985,9 @@ fn server_reset_during_validate_with_buffered_data() {
     });
 }
 
-/// Calling `send_reset()` on a PendingValidation reader transitions to Reset.
-/// A subsequent `validate()` call returns `Ok(())` because the early-return at
-/// line 354 fires (`!is_pending_validation()`). The application must attempt a
-/// read to discover the reset error.
+/// Calling `send_reset()` on a reader transitions to Reset.
+/// A subsequent `validate()` call returns `Ok(())`. The application must attempt
+/// a read to discover the reset error.
 #[test]
 fn server_validate_returns_ok_after_external_reset() {
     sim(|| {
@@ -1040,13 +999,13 @@ fn server_validate_returns_ok_after_external_reset() {
             assert!(
                 matches!(
                     frames.front().unwrap().header,
-                    Header::FlowReset {
+                    Header::QueueReset {
                         reset_target: ResetTarget::Both,
                         error_code,
                         ..
                     } if error_code == VarInt::from_u8(77)
                 ),
-                "expected FlowReset(Both) from send_reset"
+                "expected QueueReset(Both) from send_reset"
             );
             // No STOP_SENDING on drop since status is already Reset
             let extra = pusher.recv_frames_timeout(1.s()).await;
@@ -1079,10 +1038,8 @@ fn server_validate_returns_ok_after_external_reset() {
     });
 }
 
-/// FlowValidated and Data arrive in the same queue batch. The `interpose` flag
-/// is captured once as `false` (PendingValidation at start of poll_stream_rx),
-/// so data goes into the reassembler even though status transitions to Open
-/// mid-batch. Subsequent read_into must drain and emit MAX_DATA.
+/// FlowValidated and Data arrive in the same queue batch. Subsequent read_into
+/// must drain and emit MAX_DATA.
 #[test]
 fn server_flow_validated_and_data_same_batch() {
     sim(|| {
@@ -1122,7 +1079,7 @@ fn server_flow_validated_and_data_same_batch() {
 
 /// Reset arrives before FlowValidated in the same batch. The Reset causes
 /// poll_stream_rx to return immediately, so FlowValidated is never processed.
-/// Status goes directly PendingValidation → Reset.
+/// Status goes directly Open → Reset.
 #[test]
 fn server_reset_before_flow_validated_same_batch() {
     sim(|| {
@@ -1137,29 +1094,27 @@ fn server_reset_before_flow_validated_same_batch() {
         .spawn();
 
         async move {
-            let err = reader
+            reader
                 .validate()
                 .await
-                .expect_err("expected ConnectionReset");
-            assert_eq!(err.kind(), std::io::ErrorKind::ConnectionReset);
-            assert!(reader.0.status.is_reset());
+                .expect("validate returns Ok immediately");
 
-            // Subsequent read also errors
+            // read_into reveals the reset
             let mut buf = BytesMut::with_capacity(16);
-            let err2 = reader
+            let err = reader
                 .read_into(&mut buf)
                 .await
                 .expect_err("expected ConnectionReset on read");
-            assert_eq!(err2.kind(), std::io::ErrorKind::ConnectionReset);
+            assert_eq!(err.kind(), std::io::ErrorKind::ConnectionReset);
+            assert!(reader.0.status.is_reset());
         }
         .primary()
         .spawn();
     });
 }
 
-/// FlowValidated arrives before Reset in the same batch. FlowValidated
-/// transitions to Open, then Reset transitions Open → Reset. End state is
-/// the same as the reversed ordering (test above).
+/// FlowValidated arrives before Reset in the same batch. Reset transitions
+/// Open → Reset. End state is the same as the reversed ordering (test above).
 #[test]
 fn server_flow_validated_then_reset_same_batch() {
     sim(|| {
@@ -1174,31 +1129,29 @@ fn server_flow_validated_then_reset_same_batch() {
         .spawn();
 
         async move {
-            let err = reader
+            reader
                 .validate()
                 .await
-                .expect_err("expected ConnectionReset");
-            assert_eq!(err.kind(), std::io::ErrorKind::ConnectionReset);
-            assert!(reader.0.status.is_reset());
+                .expect("validate returns Ok immediately");
 
-            // Same end state as reset-before-validated
+            // read_into reveals the reset
             let mut buf = BytesMut::with_capacity(16);
-            let err2 = reader
+            let err = reader
                 .read_into(&mut buf)
                 .await
                 .expect_err("expected ConnectionReset on read");
-            assert_eq!(err2.kind(), std::io::ErrorKind::ConnectionReset);
+            assert_eq!(err.kind(), std::io::ErrorKind::ConnectionReset);
+            assert!(reader.0.status.is_reset());
         }
         .primary()
         .spawn();
     });
 }
 
-/// Endpoint dies (dispatcher drops) while validate() is pending. The reader
-/// surfaces BrokenPipe. Status remains PendingValidation since channel closure
-/// doesn't trigger a state transition.
+/// Endpoint dies (dispatcher drops) while the reader is open. The reader
+/// surfaces BrokenPipe on read_into.
 #[test]
-fn server_channel_closed_during_validate() {
+fn server_channel_closed_surfaces_broken_pipe() {
     sim(|| {
         let (mut reader, pusher) = make_server_pair();
 
@@ -1210,8 +1163,13 @@ fn server_channel_closed_during_validate() {
         .spawn();
 
         async move {
-            let err = reader
+            reader
                 .validate()
+                .await
+                .expect("validate returns Ok immediately");
+            let mut buf = BytesMut::with_capacity(16);
+            let err = reader
+                .read_into(&mut buf)
                 .await
                 .expect_err("expected BrokenPipe when channel closes");
             assert_eq!(err.kind(), std::io::ErrorKind::BrokenPipe);
@@ -1221,9 +1179,8 @@ fn server_channel_closed_during_validate() {
     });
 }
 
-/// Multiple out-of-order chunks arrive before FlowValidated. After validation,
-/// reassembly produces the correct ordered stream and MAX_DATA reflects total
-/// consumed bytes.
+/// Multiple out-of-order chunks arrive in a single batch. Reassembly produces
+/// the correct ordered stream and MAX_DATA reflects total consumed bytes.
 #[test]
 fn server_out_of_order_early_data_before_validated() {
     sim(|| {
@@ -1236,13 +1193,11 @@ fn server_out_of_order_early_data_before_validated() {
             pusher.push_data(0, b"hello", false);
             pusher.push_data(10, b"!", true);
             bach::task::yield_now().await;
-            pusher.push_flow_validated();
-            bach::task::yield_now().await;
 
             let frames = pusher
                 .recv_frames_timeout(1.s())
                 .await
-                .expect("expected MAX_DATA after reading out-of-order early data");
+                .expect("expected MAX_DATA after reading out-of-order data");
             assert_eq!(
                 frames.front().and_then(decode_max_data_from_flow_control),
                 Some(expected_max_data),
@@ -1263,8 +1218,8 @@ fn server_out_of_order_early_data_before_validated() {
     });
 }
 
-/// Dropping a reader that was never validated (still PendingValidation) emits
-/// STOP_SENDING so the peer knows to stop sending data for this stream.
+/// Dropping a reader before FIN is received emits STOP_SENDING so the peer
+/// knows to stop sending data for this stream.
 #[test]
 fn server_drop_during_pending_validation_sends_stop_sending() {
     sim(|| {
@@ -1276,7 +1231,7 @@ fn server_drop_during_pending_validation_sends_stop_sending() {
             assert!(
                 matches!(
                     frames.front().unwrap().header,
-                    Header::FlowReset {
+                    Header::QueueReset {
                         reset_target: ResetTarget::Control,
                         error_code,
                         ..
@@ -1297,9 +1252,9 @@ fn server_drop_during_pending_validation_sends_stop_sending() {
     });
 }
 
-/// Application-initiated rejection: `send_reset` on a PendingValidation reader
-/// emits FlowReset(Both), transitions to Reset, and suppresses further frames
-/// on drop.
+/// Application-initiated rejection: `send_reset` on a reader emits
+/// QueueReset(Both), transitions to Reset, and suppresses further frames on
+/// drop.
 #[test]
 fn server_send_reset_on_pending_reader() {
     sim(|| {
@@ -1311,13 +1266,13 @@ fn server_send_reset_on_pending_reader() {
             assert!(
                 matches!(
                     frames.front().unwrap().header,
-                    Header::FlowReset {
+                    Header::QueueReset {
                         reset_target: ResetTarget::Both,
                         error_code,
                         ..
                     } if error_code == VarInt::from_u8(42)
                 ),
-                "expected FlowReset(Both, 42) from send_reset"
+                "expected QueueReset(Both, 42) from send_reset"
             );
             // Drop must NOT emit additional STOP_SENDING (status is already Reset)
             let extra = pusher.recv_frames_timeout(1.s()).await;
@@ -1369,7 +1324,7 @@ fn server_validate_idempotent_when_already_open() {
 }
 
 /// Dropping the Reader before a FIN is received must send a `STOP_SENDING`
-/// (FlowReset) frame so the peer knows to stop.
+/// (QueueReset) frame so the peer knows to stop.
 ///
 /// The endpoint task waits for the frame asynchronously, mirroring how a
 /// real endpoint would process control frames from the application side.
@@ -1386,13 +1341,13 @@ fn drop_before_fin_sends_stop_sending() {
             assert!(
                 matches!(
                     frames.front().unwrap().header,
-                    Header::FlowReset {
+                    Header::QueueReset {
                         reset_target: ResetTarget::Control,
                         error_code,
                         ..
                     } if error_code == error::STOP_SENDING
                 ),
-                "expected exactly one FlowReset(Control, STOP_SENDING) on drop"
+                "expected exactly one QueueReset(Control, STOP_SENDING) on drop"
             );
         }
         .primary()
@@ -1421,13 +1376,13 @@ fn panic_drop_sends_abnormal_termination_reset() {
             assert!(
                 matches!(
                     frames.front().unwrap().header,
-                    Header::FlowReset {
+                    Header::QueueReset {
                         reset_target: ResetTarget::Both,
                         error_code,
                         ..
                     } if error_code == error::ABNORMAL_TERMINATION
                 ),
-                "expected exactly one FlowReset(Both, ABNORMAL_TERMINATION) on panic drop"
+                "expected exactly one QueueReset(Both, ABNORMAL_TERMINATION) on panic drop"
             );
         }
         .primary()
@@ -1492,7 +1447,7 @@ fn flow_control_violation_emits_single_reset_frame() {
             assert!(
                 matches!(
                     frames.front().unwrap().header,
-                    Header::FlowReset {
+                    Header::QueueReset {
                         reset_target: ResetTarget::Both,
                         error_code,
                         ..
