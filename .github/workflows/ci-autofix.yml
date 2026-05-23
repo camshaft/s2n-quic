@@ -263,38 +263,19 @@ jobs:
             ].join('\n');
 
             if (repoHasIssues) {
-              const issuePayload = {
+              const created = await github.rest.issues.create({
                 owner,
                 repo,
                 title,
                 body,
                 labels: ['ci-autofix', 'autofix-in-progress', 'bot'],
-              };
-
-              let created;
-              try {
-                created = await github.rest.issues.create({
-                  ...issuePayload,
-                  assignees: ['Copilot'],
-                });
-              } catch (err) {
-                const message = String(err?.message || '');
-                const unsupportedCopilotAssignee = err?.status === 422
-                  && /assignees/i.test(message)
-                  && /copilot/i.test(message);
-                if (!unsupportedCopilotAssignee) {
-                  throw err;
-                }
-
-                core.warning('Copilot cannot be assigned as an issue assignee in this repository; falling back to an unassigned issue.');
-                created = await github.rest.issues.create(issuePayload);
-                await github.rest.issues.createComment({
-                  owner,
-                  repo,
-                  issue_number: created.data.number,
-                  body: '@copilot Please take this and open a PR that satisfies all acceptance criteria below.',
-                });
-              }
+              });
+              await github.rest.issues.createComment({
+                owner,
+                repo,
+                issue_number: created.data.number,
+                body: '@copilot Please take this and open a PR that satisfies all acceptance criteria below.',
+              });
 
               core.setOutput('target_type', 'issue');
               core.setOutput('target_number', String(created.data.number));
