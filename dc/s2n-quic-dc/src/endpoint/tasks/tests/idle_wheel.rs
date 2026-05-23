@@ -78,21 +78,14 @@ fn setup_send() -> (
     );
     async move { peer_dead_broadcast_task.drain_budgeted(Some(32)).await }.spawn();
 
-    (
-        send_caches,
-        idle_wheel_tx,
-        completed_rx,
-        clock,
-        registry,
-    )
+    (send_caches, idle_wheel_tx, completed_rx, clock, registry)
 }
 
 #[test]
 fn send_idle_wheel_expires_inactive_context() {
     let _guard = crate::testing::without_snapshots();
     sim(|| {
-        let (send_caches, mut idle_wheel_tx, mut completed_rx, clock, _registry, ) =
-            setup_send();
+        let (send_caches, mut idle_wheel_tx, mut completed_rx, clock, _registry) = setup_send();
 
         let pse = test_entry();
         // Simulate initial activity so is_idle_expired can fire
@@ -145,8 +138,7 @@ fn send_idle_wheel_expires_inactive_context() {
 fn send_idle_wheel_reschedules_active_context() {
     let _guard = crate::testing::without_snapshots();
     sim(|| {
-        let (send_caches, mut idle_wheel_tx, _completed_rx, clock, _registry, ) =
-            setup_send();
+        let (send_caches, mut idle_wheel_tx, _completed_rx, clock, _registry) = setup_send();
 
         let pse = test_entry();
         let ctx = send_caches[LocalSendSocketId::new(0)]
@@ -206,8 +198,7 @@ fn send_idle_wheel_reschedules_active_context() {
 fn send_idle_wheel_expires_reader_only_queue_no_reset_without_inflight() {
     let _guard = crate::testing::without_snapshots();
     sim(|| {
-        let (send_caches, mut idle_wheel_tx, mut completed_rx, clock, _registry) =
-            setup_send();
+        let (send_caches, mut idle_wheel_tx, mut completed_rx, clock, _registry) = setup_send();
 
         let pse = test_entry();
         pse.touch_activity(precision::Clock::now(&clock));
@@ -286,8 +277,7 @@ fn send_idle_wheel_expires_reader_only_queue_no_reset_without_inflight() {
 #[test]
 fn send_idle_wheel_no_inflight_does_not_mark_dead() {
     sim(|| {
-        let (send_caches, mut idle_wheel_tx, _completed_rx, clock, _registry, ) =
-            setup_send();
+        let (send_caches, mut idle_wheel_tx, _completed_rx, clock, _registry) = setup_send();
 
         let pse = test_entry();
         pse.touch_activity(precision::Clock::now(&clock));
@@ -342,7 +332,7 @@ fn send_idle_wheel_no_inflight_does_not_mark_dead() {
 #[test]
 fn recv_idle_wheel_does_not_mark_dead() {
     sim(|| {
-        let (recv_cache, mut idle_wheel_tx, clock, _registry, ) = setup_recv();
+        let (recv_cache, mut idle_wheel_tx, clock, _registry) = setup_recv();
 
         let ctx = RecvContextBuilder::default().build();
         ctx.borrow()
@@ -422,7 +412,7 @@ fn setup_recv() -> (
 #[test]
 fn recv_idle_wheel_expires_inactive_context() {
     sim(|| {
-        let (recv_cache, mut idle_wheel_tx, clock, _registry, ) = setup_recv();
+        let (recv_cache, mut idle_wheel_tx, clock, _registry) = setup_recv();
 
         let ctx = RecvContextBuilder::default().build();
         // Simulate initial activity
@@ -455,7 +445,7 @@ fn recv_idle_wheel_expires_inactive_context() {
 #[test]
 fn recv_idle_wheel_reschedules_active_context() {
     sim(|| {
-        let (recv_cache, mut idle_wheel_tx, clock, _registry, ) = setup_recv();
+        let (recv_cache, mut idle_wheel_tx, clock, _registry) = setup_recv();
 
         let ctx = RecvContextBuilder::default().build();
         let key = {

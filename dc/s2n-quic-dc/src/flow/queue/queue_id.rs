@@ -32,13 +32,11 @@ mod tests {
 
     #[test]
     fn round_trip() {
-        check!()
-            .with_type::<u32>()
-            .for_each(|raw_index| {
-                let slot = (*raw_index as usize) % MAX_SLOTS;
-                let queue_id = encode(slot, 0);
-                assert_eq!(index(queue_id), slot);
-            });
+        check!().with_type::<u32>().for_each(|raw_index| {
+            let slot = (*raw_index as usize) % MAX_SLOTS;
+            let queue_id = encode(slot, 0);
+            assert_eq!(index(queue_id), slot);
+        });
     }
 
     #[test]

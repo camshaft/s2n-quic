@@ -557,7 +557,6 @@ impl Inner {
         Ok(())
     }
 
-
     fn send_fin_packet(&mut self) -> io::Result<()> {
         if self.status.is_init() {
             self.send_queue_bind_with_early_data(&mut buffer::reader::storage::Empty, true)?;
@@ -696,7 +695,6 @@ impl Inner {
                                     reset_error,
                                 )));
                             }
-
                         }
                         msg::Control::MaxData { maximum_data } => {
                             self.apply_max_data(maximum_data);
@@ -741,7 +739,6 @@ impl Inner {
             "Received MAX_DATA"
         );
     }
-
 
     fn handle_control_frames(&mut self, payload: &mut [u8]) -> Result<(), s2n_codec::DecoderError> {
         use s2n_quic_core::frame::{FrameMut, MaxData};

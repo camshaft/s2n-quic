@@ -292,10 +292,8 @@ impl Send {
                 .register_nominal("tx.acked.frame.queue_control", &v),
             tx_acked_frame_queue_max_data: counters
                 .register_nominal("tx.acked.frame.queue_max_data", &v),
-            tx_acked_frame_queue_reset: counters
-                .register_nominal("tx.acked.frame.queue_reset", &v),
-            tx_acked_frame_queue_free: counters
-                .register_nominal("tx.acked.frame.queue_free", &v),
+            tx_acked_frame_queue_reset: counters.register_nominal("tx.acked.frame.queue_reset", &v),
+            tx_acked_frame_queue_free: counters.register_nominal("tx.acked.frame.queue_free", &v),
         })
     }
 

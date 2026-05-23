@@ -18,4 +18,3 @@ impl StreamFilter {
         self.window.insert(packet_number)
     }
 }
-

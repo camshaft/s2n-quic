@@ -637,7 +637,13 @@ impl<'a> s2n_codec::DecoderValue<'a> for Header {
             Self::QUEUE_CONTROL_TYPE => {
                 let (queue_pair, buffer) = buffer.decode()?;
                 let (binding_id, buffer) = buffer.decode()?;
-                Ok((Self::QueueControl { queue_pair, binding_id }, buffer))
+                Ok((
+                    Self::QueueControl {
+                        queue_pair,
+                        binding_id,
+                    },
+                    buffer,
+                ))
             }
             Self::QUEUE_MAX_DATA_TYPE => {
                 let (queue_pair, buffer) = buffer.decode()?;
@@ -677,7 +683,13 @@ impl<'a> s2n_codec::DecoderValue<'a> for Header {
             Self::QUEUE_FREE_TYPE => {
                 let (binding_id, buffer) = buffer.decode()?;
                 let (largest_queue_id, buffer) = buffer.decode()?;
-                Ok((Self::QueueFree { binding_id, largest_queue_id }, buffer))
+                Ok((
+                    Self::QueueFree {
+                        binding_id,
+                        largest_queue_id,
+                    },
+                    buffer,
+                ))
             }
             Self::ACK_TYPE
             | Self::ACK_ECN_TYPE
