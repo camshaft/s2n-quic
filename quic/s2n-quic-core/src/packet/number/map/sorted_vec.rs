@@ -367,6 +367,200 @@ mod tests {
         assert_eq!(cutoff, None);
     }
 
+    #[test]
+    fn contiguous_prefix_cutoff_empty_map() {
+        let space = PacketNumberSpace::Initial;
+        let map = TestMap::default();
+        let max_pn = space.new_packet_number(VarInt::from_u8(100));
+        assert_eq!(map.contiguous_prefix_cutoff(max_pn, |_, _| true), None);
+    }
+
+    #[test]
+    fn contiguous_prefix_cutoff_max_pn_before_entries() {
+        let space = PacketNumberSpace::Initial;
+        let mut map = TestMap::default();
+        for i in 10u64..20 {
+            let pn = space.new_packet_number(VarInt::new(i).unwrap());
+            map.insert(pn, i);
+        }
+        // max_pn is strictly before every entry in the map
+        let max_pn = space.new_packet_number(VarInt::from_u8(5));
+        assert_eq!(map.contiguous_prefix_cutoff(max_pn, |_, _| true), None);
+    }
+
+    #[test]
+    fn contiguous_prefix_cutoff_all_entries_true() {
+        let space = PacketNumberSpace::Initial;
+        let mut map = TestMap::default();
+        for i in 0u64..20 {
+            let pn = space.new_packet_number(VarInt::new(i).unwrap());
+            map.insert(pn, i);
+        }
+        // Predicate always true → cutoff is exactly at max_pn (PN 15)
+        let max_pn = space.new_packet_number(VarInt::new(15).unwrap());
+        assert_eq!(map.contiguous_prefix_cutoff(max_pn, |_, _| true), Some(max_pn));
+    }
+
+    #[test]
+    fn contiguous_prefix_cutoff_large_map_binary_search() {
+        // Uses >16 entries so the binary-search code path is exercised.
+        let space = PacketNumberSpace::Initial;
+        let mut map = TestMap::default();
+        for i in 0u64..50 {
+            let pn = space.new_packet_number(VarInt::new(i).unwrap());
+            map.insert(pn, i);
+        }
+        let max_pn = space.new_packet_number(VarInt::new(49).unwrap());
+        // Predicate: value <= 30 → cutoff at PN 30
+        let result = map.contiguous_prefix_cutoff(max_pn, |_, v| *v <= 30);
+        assert_eq!(
+            result,
+            Some(space.new_packet_number(VarInt::new(30).unwrap()))
+        );
+    }
+
+    #[test]
+    fn contiguous_prefix_cutoff_sparse_gaps() {
+        // Entries at PNs 0, 10, 20, 30, 40; max_pn falls inside a gap.
+        let space = PacketNumberSpace::Initial;
+        let mut map = TestMap::default();
+        for i in [0u64, 10, 20, 30, 40] {
+            let pn = space.new_packet_number(VarInt::new(i).unwrap());
+            map.insert(pn, i);
+        }
+        // max_pn=35 → only PNs 0,10,20,30 are eligible; threshold 25 → 30 fails
+        let max_pn = space.new_packet_number(VarInt::new(35).unwrap());
+        let result = map.contiguous_prefix_cutoff(max_pn, |_, v| *v <= 25);
+        assert_eq!(
+            result,
+            Some(space.new_packet_number(VarInt::new(20).unwrap()))
+        );
+    }
+
+    // ── Differential / fuzz tests ────────────────────────────────────────────
+
+    /// Reference implementation: linear scan from index 0, used as the ground
+    /// truth for all differential tests of `contiguous_prefix_cutoff`.
+    fn reference_prefix_cutoff<V, F>(
+        map: &SortedVecMap<V>,
+        max_pn: PacketNumber,
+        mut predicate: F,
+    ) -> Option<PacketNumber>
+    where
+        F: FnMut(PacketNumber, &V) -> bool,
+    {
+        let mut result = None;
+        for (pn, v) in map.iter() {
+            if pn > max_pn {
+                break;
+            }
+            if predicate(pn, v) {
+                result = Some(pn);
+            } else {
+                break;
+            }
+        }
+        result
+    }
+
+    /// Dense-map input: entries at PNs 0..num_entries, value == PN.
+    #[derive(Clone, Debug, TypeGenerator)]
+    struct DenseCutoffInput {
+        num_entries: u8,
+        /// max_pn index; will be reduced to 0..=num_entries so it can exceed
+        /// the last inserted entry (testing the "clipped" case).
+        max_pn_raw: u8,
+        /// Predicate threshold: `pn.as_u64() <= threshold`.
+        threshold: u8,
+    }
+
+    #[test]
+    fn contiguous_prefix_cutoff_differential_dense() {
+        check!()
+            .with_type::<DenseCutoffInput>()
+            .with_iterations(10_000)
+            .for_each(|input| {
+                let space = PacketNumberSpace::ApplicationData;
+                let n = input.num_entries as u64;
+                let mut map = SortedVecMap::<u64>::default();
+
+                for i in 0..n {
+                    let pn = space.new_packet_number(VarInt::new(i).unwrap());
+                    map.insert(pn, i);
+                }
+
+                // max_pn spans 0..=n so we cover both "within" and "beyond" cases
+                let max_pn_idx = if n == 0 {
+                    0
+                } else {
+                    input.max_pn_raw as u64 % (n + 1)
+                };
+                let max_pn = space.new_packet_number(VarInt::new(max_pn_idx).unwrap());
+                let threshold = input.threshold as u64;
+
+                let optimized = map.contiguous_prefix_cutoff(max_pn, |_, v| *v <= threshold);
+                let reference = reference_prefix_cutoff(&map, max_pn, |_, v| *v <= threshold);
+                assert_eq!(
+                    reference,
+                    optimized,
+                    "n={n}, max_pn_idx={max_pn_idx}, threshold={threshold}"
+                );
+            })
+    }
+
+    /// Sparse-map input: entries have variable gaps so max_pn can fall between
+    /// entries, exercising all partition-point boundary conditions.
+    #[derive(Clone, Debug, TypeGenerator)]
+    struct SparseCutoffInput {
+        /// Gaps between consecutive entries; entry[i+1] is at PN[i] + gap[i] + 1.
+        /// Capped at 64 entries and PN <= 200 to keep values tractable.
+        gaps: Vec<u8>,
+        /// Absolute max_pn value (0..=255).
+        max_pn: u8,
+        /// Predicate threshold: `value <= threshold`.
+        threshold: u8,
+    }
+
+    #[test]
+    fn contiguous_prefix_cutoff_differential_sparse() {
+        check!()
+            .with_type::<SparseCutoffInput>()
+            .with_iterations(10_000)
+            .for_each(|input| {
+                let space = PacketNumberSpace::ApplicationData;
+                let mut map = SortedVecMap::<u64>::default();
+                let mut current_pn: u64 = 0;
+
+                for (i, &gap) in input.gaps.iter().take(64).enumerate() {
+                    if i > 0 {
+                        // gap==0 gives minimum spacing of 1, keeping PNs strictly
+                        // increasing as required by SortedVecMap invariants.
+                        current_pn += gap as u64 + 1;
+                    }
+                    if current_pn > 200 {
+                        break;
+                    }
+                    let pn = space.new_packet_number(VarInt::new(current_pn).unwrap());
+                    map.insert(pn, current_pn);
+                }
+
+                let max_pn =
+                    space.new_packet_number(VarInt::new(input.max_pn as u64).unwrap());
+                let threshold = input.threshold as u64;
+
+                let optimized = map.contiguous_prefix_cutoff(max_pn, |_, v| *v <= threshold);
+                let reference = reference_prefix_cutoff(&map, max_pn, |_, v| *v <= threshold);
+                assert_eq!(
+                    reference,
+                    optimized,
+                    "max_pn={}, threshold={}, gaps={:?}",
+                    input.max_pn,
+                    threshold,
+                    &input.gaps[..input.gaps.len().min(64)]
+                );
+            })
+    }
+
     #[derive(Clone, Copy, Debug, TypeGenerator)]
     enum Operation {
         Insert,
