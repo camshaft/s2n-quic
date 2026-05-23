@@ -1109,12 +1109,8 @@ impl HasId<LocalSenderId> for Rc<RefCell<Context>> {
 }
 
 /// Routes contexts to per-socket immediate channels based on sender_idx.
-pub(crate) type ImmediateSender<T> = super::combinator::MappedSender<
-    Rc<RefCell<Context>>,
-    LocalSenderId,
-    LocalSendSocketId,
-    T,
->;
+pub(crate) type ImmediateSender<T> =
+    super::combinator::MappedSender<Rc<RefCell<Context>>, LocalSenderId, LocalSendSocketId, T>;
 
 /// PTO (Probe Timeout) state for tail loss recovery.
 ///

@@ -69,7 +69,7 @@ pub struct MappedSender<T, I, D, S> {
     _value: PhantomData<fn() -> T>,
 }
 
-impl<T, I, D, S: Clone> Clone for MappedSender<T, I, D, S> {
+impl<T, I: Clone, D: Clone, S: Clone> Clone for MappedSender<T, I, D, S> {
     fn clone(&self) -> Self {
         Self {
             senders: self.senders.clone(),

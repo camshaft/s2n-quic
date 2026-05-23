@@ -210,6 +210,7 @@ fn with_noop_context<R>(f: impl FnOnce(&mut task::Context<'_>) -> R) -> R {
 
 // ── MappedSender tests ─────────────────────────────────────────────────────
 
+#[derive(Debug)]
 struct MappedItem {
     sender_id: LocalSenderId,
     value: usize,
