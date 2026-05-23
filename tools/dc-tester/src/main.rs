@@ -113,8 +113,6 @@ fn main() -> std::io::Result<()> {
     let runtime = dial9_tokio_telemetry::TracedRuntime::new(dial9_config);
 
     runtime.block_on(async move {
-        net_stats::spawn();
-
         let spawner = busy_poll::create_pool(busy_poll_workers);
         let data_bind: SocketAddr = "[::]:0".parse().unwrap();
         let endpoint = endpoint::create(
@@ -130,6 +128,7 @@ fn main() -> std::io::Result<()> {
             .counters
             .clone()
             .spawn_reporter_with_config(reporter_config);
+        net_stats::spawn(endpoint.counters.clone());
 
         match cli.command {
             Commands::Server { address, .. } => {
