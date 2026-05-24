@@ -104,7 +104,11 @@ impl<S: 'static, C: 'static> FreeVec<S, C> {
         drop(inner);
 
         unsafe {
-            descriptor.init_key(key.binding_id);
+            if !descriptor.init_key(key.binding_id) {
+                // Stale binding_id — put the descriptor back.
+                self.return_to_free_list(descriptor);
+                return Err(key);
+            }
             let (control, stream) = descriptor.into_receiver_pair(remote_queue_id);
             Ok((Control::new(control), Stream::new(stream)))
         }
@@ -112,7 +116,8 @@ impl<S: 'static, C: 'static> FreeVec<S, C> {
 
     /// Allocate a specific slot by index in O(1), removing it from the free list.
     ///
-    /// Returns `Err(key)` if the slot is not in the free list (already allocated or not grown yet).
+    /// Returns `Err(key)` if the slot is not in the free list (already allocated or
+    /// not grown yet), or if the binding_id is stale (retransmit of a completed stream).
     ///
     /// The corresponding entry in `free_indices` is left as a stale reference; `alloc` skips
     /// stale entries lazily when it encounters them.
@@ -145,10 +150,26 @@ impl<S: 'static, C: 'static> FreeVec<S, C> {
         drop(inner);
 
         unsafe {
-            descriptor.init_key(key.binding_id);
+            if !descriptor.init_key(key.binding_id) {
+                // Stale binding_id — put the descriptor back.
+                self.return_to_free_list(descriptor);
+                return Err(key);
+            }
             let (control, stream) = descriptor.into_receiver_pair(remote_queue_id);
             Ok((Control::new(control), Stream::new(stream)))
         }
+    }
+
+    fn return_to_free_list(&self, descriptor: Descriptor<S, C>) {
+        let mut inner = self.inner.lock().unwrap();
+        #[cfg(debug_assertions)]
+        {
+            inner.active.remove(&descriptor.as_usize());
+        }
+        let idx = descriptor.slot_index();
+        inner.slots[idx] = Some(descriptor);
+        inner.free_indices.push_back(idx);
+        inner.free_count += 1;
     }
 
     #[inline]
@@ -206,14 +227,14 @@ where
 {
     #[inline]
     fn free(&self, descriptor: Descriptor<S, C>) -> Option<Box<dyn 'static + Send>> {
-        // Read binding_id and emit QueueFree notification before clearing.
+        // Read binding_id for QueueFree notification but do NOT clear it.
+        // Keeping the last binding_id prevents stale retransmits from re-creating
+        // a binding after the stream has completed and the slot is freed.
         if let Some(notify) = &self.free_notify {
-            let freed = unsafe { descriptor.take_freed_slot() };
+            let freed = unsafe { descriptor.read_freed_slot() };
             if let Some(slot) = freed {
                 notify.push(slot);
             }
-        } else {
-            unsafe { descriptor.clear_binding() };
         }
 
         let mut inner = self.inner.lock().unwrap();

@@ -592,9 +592,19 @@ fn handle_queue_data(
                         Ok(waker) => {
                             let _ = waker_sink.send(waker);
                             counters.rx_data_ok.add(1);
+                            trace!(
+                                binding_id = binding_id.as_u64(),
+                                queue_id = local_queue_id.as_u64(),
+                                "alloc_at race: retry send_stream succeeded"
+                            );
                         }
                         Err(_) => {
                             counters.rx_data_unallocated.add(1);
+                            warn!(
+                                binding_id = binding_id.as_u64(),
+                                queue_id = local_queue_id.as_u64(),
+                                "alloc_at race: retry send_stream also failed"
+                            );
                         }
                     }
                     return;

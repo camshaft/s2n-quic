@@ -11,7 +11,7 @@ use std::{
     marker::PhantomData,
     ptr::NonNull,
     sync::{
-        atomic::{AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         Arc,
     },
 };
@@ -149,10 +149,10 @@ impl<S: 'static, C: 'static> Descriptor<S, C> {
         self.inner().id.as_u64() as usize
     }
 
-    /// Returns true if this descriptor currently has an active binding.
+    /// Returns true if this descriptor currently has active receivers (in use).
     #[inline]
     pub fn is_allocated(&self) -> bool {
-        self.inner().binding_id.load(Ordering::Acquire) != UNBOUND
+        self.inner().allocated.load(Ordering::Acquire)
     }
 
     /// Returns the queue_id for this descriptor. Queue IDs are just slot indices.
@@ -193,16 +193,22 @@ impl<S: 'static, C: 'static> Descriptor<S, C> {
         unsafe { self.ptr.as_ref() }
     }
 
-    /// Set the binding_id for this descriptor.
+    /// Set the binding_id for this descriptor. Only succeeds if the new
+    /// binding_id is strictly greater than the current value (or current is UNBOUND).
+    /// Returns false if the binding_id is stale (retransmit of an old stream).
     ///
     /// # Safety
     ///
     /// * The [`Descriptor`] needs to be marked as free of receivers
     #[inline]
-    pub unsafe fn init_key(&self, binding_id: VarInt) {
+    pub unsafe fn init_key(&self, binding_id: VarInt) -> bool {
         let inner = self.inner();
-        debug_assert_eq!(inner.binding_id.load(Ordering::Relaxed), UNBOUND);
+        let current = inner.binding_id.load(Ordering::Acquire);
+        if current != UNBOUND && binding_id.as_u64() <= current {
+            return false;
+        }
         inner.binding_id.store(binding_id.as_u64(), Ordering::Release);
+        true
     }
 
     /// # Safety
@@ -214,6 +220,7 @@ impl<S: 'static, C: 'static> Descriptor<S, C> {
     #[inline]
     pub unsafe fn into_receiver_pair(self, remote_queue_id: Option<VarInt>) -> (Self, Self) {
         let inner = self.inner();
+        inner.allocated.store(true, Ordering::Release);
 
         let has_remote_queue_id = remote_queue_id.is_some();
         if let Some(id) = remote_queue_id {
@@ -278,7 +285,9 @@ impl<S: 'static, C: 'static> Descriptor<S, C> {
 
         ensure!(inner
             .stream
-            .close_receiver(&inner.control, half, || {})
+            .close_receiver(&inner.control, half, || {
+                inner.allocated.store(false, Ordering::Release);
+            })
             .is_continue());
 
         probes::on_receiver_free(inner.id, half);
@@ -292,34 +301,23 @@ impl<S: 'static, C: 'static> Descriptor<S, C> {
         drop(storage);
     }
 
-    /// Read the binding_id and queue_id, then clear binding_id to UNBOUND.
+    /// Read the binding_id and queue_id without clearing.
     ///
-    /// Returns `Some(FreedSlot)` if the slot was bound, `None` if already unbound.
-    /// Called by the free list impl to capture state for QueueFree before recycling.
+    /// The binding_id is intentionally NOT cleared — keeping the last value
+    /// prevents stale retransmits from re-creating a binding after the stream
+    /// completes and the slot is freed.
     ///
     /// # Safety
     ///
-    /// Must only be called once during the free path, after both receivers have closed.
+    /// Must only be called during the free path, after both receivers have closed.
     #[inline]
-    pub unsafe fn take_freed_slot(&self) -> Option<FreedSlot> {
+    pub unsafe fn read_freed_slot(&self) -> Option<FreedSlot> {
         let inner = self.inner();
-        let binding_id_raw = inner.binding_id.swap(UNBOUND, Ordering::AcqRel);
+        let binding_id_raw = inner.binding_id.load(Ordering::Acquire);
         VarInt::new(binding_id_raw).ok().map(|binding_id| FreedSlot {
             queue_id: inner.id,
             binding_id,
         })
-    }
-
-    /// Clear binding_id to UNBOUND without reading it.
-    ///
-    /// Used by client-side free lists that don't need the freed slot info.
-    ///
-    /// # Safety
-    ///
-    /// Must only be called once during the free path, after both receivers have closed.
-    #[inline]
-    pub unsafe fn clear_binding(&self) {
-        self.inner().binding_id.store(UNBOUND, Ordering::Release);
     }
 
     /// Validate the binding_id against the current slot binding.
@@ -410,8 +408,10 @@ unsafe impl<S: Sync, C: Sync> Sync for Descriptor<S, C> {}
 pub(super) struct DescriptorInner<S, C> {
     /// The slot index. This IS the queue_id — it never changes after initialization.
     id: VarInt,
-    /// The current binding_id. `UNBOUND` (u64::MAX) means the slot is free/unbound.
-    /// Set atomically during init_key, cleared during drop_receiver.
+    /// Whether receivers are currently open (slot is in use, not in free list).
+    allocated: AtomicBool,
+    /// The current/last binding_id. Never cleared — monotonically increases.
+    /// Used for validation and to prevent stale retransmits from re-creating bindings.
     binding_id: AtomicU64,
     /// The peer's queue ID, written once by the dispatcher on first observation.
     /// Initialized to `u64::MAX` (unknown) and set via a relaxed store.
@@ -433,6 +433,7 @@ impl<S, C> DescriptorInner<S, C> {
         let control = Queue::new(Half::Control);
         Self {
             id: VarInt::new(index as u64).unwrap(),
+            allocated: AtomicBool::new(false),
             binding_id: AtomicU64::new(UNBOUND),
             remote_queue_id: AtomicU64::new(UNBOUND),
             stream,
