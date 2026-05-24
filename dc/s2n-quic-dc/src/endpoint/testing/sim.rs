@@ -136,9 +136,14 @@ impl MonitorHostAddr {
     }
 
     fn addr(&mut self) -> SocketAddr {
-        *self
-            .addr
-            .get_or_insert_with(|| bach::net::try_lookup((self.host, SERVER_PORT)).unwrap())
+        *self.addr.get_or_insert_with(|| {
+            bach::net::try_lookup((self.host, SERVER_PORT)).unwrap_or_else(|err| {
+                panic!(
+                    "failed to resolve monitor host '{}' on port {}: {err}",
+                    self.host, SERVER_PORT
+                )
+            })
+        })
     }
 
     pub fn ip(&mut self) -> IpAddr {
