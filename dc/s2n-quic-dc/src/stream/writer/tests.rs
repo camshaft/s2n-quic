@@ -13,7 +13,6 @@ use super::*;
 use crate::{
     endpoint::{
         frame::{self, Frame, Header, PriorityStorage, SubmissionReceiver},
-        id::Id,
     },
     flow, intrusive,
     packet::datagram::{QueuePair, ResetTarget},
@@ -450,7 +449,7 @@ fn client_preserves_max_data_on_out_of_order_lower_update() {
 
         async move {
             let init = pusher.recv_frames().await;
-            assert_eq!(init.len(), 1, "expected exactly one QueueBind frame");
+            assert_eq!(init.len(), 1, "expected exactly one QueueData-init frame");
             let init_frame = init.front().unwrap();
             assert!(matches!(
                 init_frame.header,
@@ -461,7 +460,7 @@ fn client_preserves_max_data_on_out_of_order_lower_update() {
             pusher.push_max_data(VarInt::from_u8(8));
             pusher.push_max_data(VarInt::from_u8(3));
 
-            // The QueueBind consumed 3 bytes, so the assembler starts at offset 3.
+            // The QueueData-init consumed 3 bytes, so the assembler starts at offset 3.
             pusher.assembler.expected_offset = 3;
             let next = pusher.recv_frames().await;
             pusher.assembler.push_queue_data(&next);
@@ -745,8 +744,8 @@ fn panic_drop_sends_abnormal_termination_reset() {
     });
 }
 
-/// Empty-buffer write_from_fin sends QueueBind with empty payload and FIN=true.
-/// Tests the Init → Open → FinSent transition in a single call.
+/// Empty-buffer write_from_fin sends QueueData-init with empty payload and FIN=true.
+/// Tests the Init → Binding → FinSent transition in a single call.
 #[test]
 fn client_empty_fin_queue_bind() {
     sim(|| {
@@ -1010,10 +1009,11 @@ fn server_shutdown_idempotent() {
     });
 }
 
-/// Client sends early data in QueueBind then requests graceful close via
-/// write_from_fin() — the second call emits QueueData with FIN.
+/// Client sends early data in QueueData-init then requests graceful close via
+/// write_from_fin() — the second call emits QueueData with FIN while the
+/// binding is still pending peer confirmation.
 ///
-/// This covers the scenario: client writes some data in the QueueBind (is_fin=false)
+/// This covers the scenario: client writes some data in the QueueData-init frame (is_fin=false)
 /// and then signals the end of the write side after transitioning to Open.
 /// Since FIN with empty payload needs no remote budget, both frames are submitted
 /// in the same batch.
@@ -1038,20 +1038,21 @@ fn client_write_from_fin_after_queue_bind_sends_queue_data_fin() {
             assert!(
                 matches!(
                     second.header,
-                    Header::QueueData { is_fin: true, offset, .. } if offset == VarInt::from_u8(5)
+                    Header::QueueData { is_fin: true, offset, dest_acceptor_id: Some(_), .. }
+                        if offset == VarInt::from_u8(5)
                 ),
-                "expected QueueData(is_fin=true, offset=5)"
+                "expected pending-binding QueueData(is_fin=true, offset=5)"
             );
         }
         .primary()
         .spawn();
 
         async move {
-            // First write: early data in QueueBind, no FIN
+            // First write: early data in QueueData-init, no FIN
             let mut data = Bytes::from_static(b"hello");
             let n = writer.write_from(&mut data).await.expect("first write");
             assert_eq!(n, 5);
-            assert!(writer.0.status.is_open());
+            assert!(writer.0.status.is_binding());
 
             // Graceful close - no budget needed for empty FIN
             let mut empty = Bytes::new();

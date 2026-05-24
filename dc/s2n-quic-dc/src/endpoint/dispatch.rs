@@ -304,6 +304,8 @@ where
     // Emit QueueFree frames for any slots freed during this dispatch cycle.
     let freed = peer.queue_dispatcher.drain_freed();
     if !freed.is_empty() {
+        // TODO mark/encode QueueFree ranges the way ACKs do so high-TPS paths
+        // can collapse many releases into fewer frames.
         for slot in &freed {
             let frame = Frame {
                 source_sender_id: LocalSenderId::UNSPECIFIED,
@@ -339,7 +341,7 @@ where
 ///
 /// This routes each decoded frame to the same handler as its single-frame
 /// `RoutingInfo` counterpart, using the packet-level `source_sender_id` for
-/// frame types that require it (e.g., QueueBind).
+/// frame types that require it.
 #[allow(clippy::too_many_arguments)]
 fn dispatch_decoded_frame(
     header: Header,
@@ -382,7 +384,6 @@ fn dispatch_decoded_frame(
             binding_id,
         } => {
             handle_queue_control(
-                credentials,
                 queue_pair,
                 binding_id,
                 payload,
@@ -397,7 +398,6 @@ fn dispatch_decoded_frame(
             maximum_data,
         } => {
             handle_queue_max_data(
-                credentials,
                 queue_pair,
                 binding_id,
                 maximum_data,
@@ -427,18 +427,25 @@ fn dispatch_decoded_frame(
             binding_id,
             largest_queue_id,
         } => {
-            if peer.path_entry.on_peer_queue_freed(largest_queue_id, binding_id) {
-                trace!(
+            match peer.path_entry.on_peer_queue_freed(largest_queue_id, binding_id) {
+                crate::path::secret::map::PeerQueueFreeResult::Accepted => trace!(
                     binding_id = binding_id.as_u64(),
                     queue_id = largest_queue_id.as_u64(),
                     "QueueFree received — slot returned to pool"
-                );
-            } else {
-                debug!(
+                ),
+                crate::path::secret::map::PeerQueueFreeResult::Stale => trace!(
                     binding_id = binding_id.as_u64(),
                     queue_id = largest_queue_id.as_u64(),
-                    "QueueFree rejected — binding_id validation failed"
-                );
+                    "QueueFree received for an already-freed slot"
+                ),
+                crate::path::secret::map::PeerQueueFreeResult::Future => {
+                    counters.rx_queue_free_future_binding.add(1);
+                    error!(
+                        binding_id = binding_id.as_u64(),
+                        queue_id = largest_queue_id.as_u64(),
+                        "BUG: QueueFree received for a future binding"
+                    );
+                }
             }
         }
         Header::Ack {
@@ -559,11 +566,20 @@ fn handle_queue_data(
         }
         Err(flow::queue::Error::Unallocated(returned_entry)) => {
             if let Some(acceptor_id) = dest_acceptor_id {
+                if peer.path_entry.id().endpoint_type().is_client() {
+                    counters.rx_data_init_on_client.add(1);
+                    error!(
+                        binding_id = binding_id.as_u64(),
+                        queue_id = local_queue_id.as_u64(),
+                        acceptor_id = acceptor_id.as_u64(),
+                        "BUG: client received QueueData init for an unallocated queue"
+                    );
+                    return;
+                }
                 let handle = flow::Handle::new(binding_id);
-                let slot_index = flow::queue::slot_index(local_queue_id);
                 let (queue_control, queue_stream) = peer
                     .queue_dispatcher
-                    .alloc_at_or_grow(slot_index, handle, Some(peer_queue_id));
+                    .alloc_at_or_grow(local_queue_id.as_u64() as usize, handle, Some(peer_queue_id));
 
                 queue_stream.push(returned_entry);
 
@@ -635,6 +651,10 @@ fn create_binding_with_queues(
 ) {
     let peer_queue_id = queue_pair.source_queue_id;
     let allocated_queue_id = queue_control.queue_id();
+    debug_assert_eq!(
+        allocated_queue_id, queue_pair.dest_queue_id,
+        "allocated queue_id must match the requested destination queue_id"
+    );
 
     let writer = Writer::new_server(
         frame_tx.clone(),
@@ -728,7 +748,6 @@ fn create_binding_with_queues(
 // ── QueueControl ──────────────────────────────────────────────────────────
 
 fn handle_queue_control(
-    credentials: &Credentials,
     queue_pair: QueuePair,
     binding_id: VarInt,
     buf: BytesMut,
@@ -739,7 +758,6 @@ fn handle_queue_control(
     let payload_len = buf.len();
     let entry = msg::Control::Frames { payload: buf }.into();
     if dispatch_control_message(
-        credentials,
         queue_pair,
         binding_id,
         entry,
@@ -759,7 +777,6 @@ fn handle_queue_control(
 // ── QueueMaxData ──────────────────────────────────────────────────────────
 
 fn handle_queue_max_data(
-    credentials: &Credentials,
     queue_pair: QueuePair,
     binding_id: VarInt,
     maximum_data: VarInt,
@@ -769,7 +786,6 @@ fn handle_queue_max_data(
 ) {
     let entry = msg::Control::MaxData { maximum_data }.into();
     if dispatch_control_message(
-        credentials,
         queue_pair,
         binding_id,
         entry,
@@ -792,7 +808,6 @@ fn handle_queue_max_data(
 /// All error paths are handled internally. Callers that need to emit a success trace should do so after
 /// this call when the return value is `true`.
 fn dispatch_control_message(
-    _credentials: &Credentials,
     queue_pair: QueuePair,
     binding_id: VarInt,
     entry: Entry<msg::Control>,
@@ -858,7 +873,7 @@ fn dispatch_control_message(
 // ── QueueReset ────────────────────────────────────────────────────────────
 
 fn handle_queue_reset(
-    credentials: &Credentials,
+    _credentials: &Credentials,
     dest_queue_id: VarInt,
     binding_id: VarInt,
     reset_target: ResetTarget,

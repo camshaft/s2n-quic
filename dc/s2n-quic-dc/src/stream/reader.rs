@@ -291,20 +291,17 @@ impl Reader {
 
     /// Waits for the reader to become valid for application use.
     ///
-    /// Client-side readers are already validated, so this is usually a no-op.
-    /// Server-side readers may need to wait until the transport confirms that
-    /// the incoming flow is acceptable.
+    /// Validation is now immediate for both client and server readers, so this
+    /// is a compatibility no-op that returns success right away.
     ///
     /// # Guarantees
     ///
-    /// - Once this returns `Ok(())`, subsequent reads will no longer fail with
-    ///   "stream not yet validated".
+    /// - Once this returns `Ok(())`, the reader is ready for normal use.
     /// - Calling it multiple times is harmless.
     ///
     /// # Footguns
     ///
-    /// This method has no built-in timeout. If validation is part of a request
-    /// deadline, wrap it in your own timeout.
+    /// This method does not perform any network round-trip or waiting.
     pub(crate) async fn validate(&mut self) -> io::Result<()> {
         core::future::poll_fn(|cx| self.0.poll_validate(cx)).await
     }

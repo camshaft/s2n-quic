@@ -8,16 +8,17 @@
 //! The Client holds its own clone of the queue allocator to avoid synchronization on the hot path.
 //!
 //! Flow initialization is lazy: `connect` allocates local queues and returns immediately.
-//! The [`Writer`](crate::stream::Writer) sends `FlowInit` on the first write, potentially
-//! with early data.
+//! The [`Writer`](crate::stream::Writer) sends the first `QueueData` frame on write,
+//! potentially with early data.
 
 use crate::{
+    counter::{Gauge, Timer},
     flow, psk,
     stream::{endpoint::Endpoint, Reader, Stream, Writer},
 };
 use s2n_quic::server::Name;
 use s2n_quic_core::varint::VarInt;
-use std::{io, net::SocketAddr, sync::Arc};
+use std::{io, net::SocketAddr, sync::Arc, time::Instant};
 
 pub mod rpc;
 
@@ -34,8 +35,8 @@ pub mod rpc;
 /// # Expectations and guarantees
 ///
 /// - Every clone shares the same underlying endpoint and path-secret map.
-/// - Flow initialization is lazy. The [`Writer`](crate::stream::Writer) sends `FlowInit`
-///   (with optional early data) on the first write after `connect` returns.
+/// - Flow initialization is lazy. The [`Writer`](crate::stream::Writer) sends the first
+///   `QueueData` frame (with optional early data) on the first write after `connect` returns.
 /// - The TLS handshake, if needed, is performed inside `connect` and is transparent to
 ///   the caller.
 ///
@@ -66,6 +67,8 @@ pub struct Client {
     endpoint: Arc<Endpoint>,
     psk: psk::client::Provider,
     server_name: Name,
+    blocked_open_gauge: Gauge,
+    blocked_open_time: Timer,
 }
 
 impl Client {
@@ -83,10 +86,21 @@ impl Client {
             *psk.map(),
             "PSK provider map must be the same instance as the endpoint map"
         );
+        let blocked_open_gauge = endpoint
+            .counters
+            .register_gauge("stream.connect.blocked")
+            .with_description("Number of clients currently blocked waiting for a peer queue ID");
+        let blocked_open_time = endpoint
+            .counters
+            .register_timer("stream.connect.blocked_time")
+            .with_description("Time spent blocked waiting for a peer queue ID during connect")
+            .unsampled();
         Self {
             endpoint,
             psk,
             server_name,
+            blocked_open_gauge,
+            blocked_open_time,
         }
     }
 
@@ -100,8 +114,8 @@ impl Client {
     ///
     /// # Semantics
     ///
-    /// - Flow initialization is lazy. The [`Writer`](crate::stream::Writer) sends `FlowInit`
-    ///   (possibly with early data) on the first write.
+    /// - Flow initialization is lazy. The [`Writer`](crate::stream::Writer) sends the first
+    ///   `QueueData` frame (possibly with early data) on the first write.
     /// - A successful return does not mean the server has accepted the stream yet; it only
     ///   means local setup succeeded.
     ///
@@ -131,15 +145,21 @@ impl Client {
         let handle = flow::Handle::new(binding_id);
         let (queue_control, queue_stream) = path_secret_entry.alloc_queue(handle, None);
 
-        let dest_queue_id = path_secret_entry
-            .alloc_peer_queue_id()
-            .await
-            .ok_or_else(|| {
+        let dest_queue_id = if let Some(id) = path_secret_entry.try_alloc_peer_queue_id() {
+            id
+        } else {
+            self.blocked_open_gauge.add(1);
+            let started = Instant::now();
+            let result = path_secret_entry.alloc_peer_queue_id().await;
+            self.blocked_open_gauge.sub(1);
+            self.blocked_open_time.record(started.elapsed());
+            result.ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::OutOfMemory,
                     "peer queue id allocator exhausted",
                 )
-            })?;
+            })?
+        };
         let queue_pair = crate::packet::datagram::QueuePair {
             source_queue_id: queue_control.queue_id(),
             dest_queue_id,

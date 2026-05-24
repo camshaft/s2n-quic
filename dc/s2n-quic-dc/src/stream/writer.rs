@@ -63,7 +63,7 @@
 // Testing:
 //
 // * Deterministic tests using bach for: flow control stalls and recovery, FIN delivery,
-//   early data with QueueBind, completion failure handling, panic-drop behavior, and
+//   early data with QueueData-init, completion failure handling, panic-drop behavior, and
 //   multi-stream contention on shared pipeline resources.
 use super::coop::{self, Coop, HasCoop};
 use crate::{
@@ -173,10 +173,12 @@ struct Inner {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum Status {
-    /// Initial state before sending QueueBind
+    /// Initial state before sending the first QueueData-init frame
     #[default]
     Init,
-    /// Queue bound and open for writes
+    /// QueueData-init has been sent but the peer has not confirmed the binding yet
+    Binding,
+    /// Queue bound and confirmed by peer flow-control
     Open,
     /// FIN sent
     FinSent,
@@ -186,15 +188,17 @@ enum Status {
 
 impl Status {
     is!(is_init, Init);
+    is!(is_binding, Binding);
     is!(is_open, Open);
     is!(is_fin_sent, FinSent);
     is!(is_shutdown, Shutdown);
     is!(is_terminal, FinSent | Shutdown);
 
     event! {
-        on_queue_bound(Init => Open);
-        on_send_fin(Open => FinSent);
-        on_shutdown(Init | Open | FinSent => Shutdown);
+        on_queue_bound(Init => Binding);
+        on_queue_confirmed(Binding => Open);
+        on_send_fin(Binding | Open => FinSent);
+        on_shutdown(Init | Binding | Open | FinSent => Shutdown);
     }
 }
 
@@ -401,8 +405,8 @@ impl Writer {
     /// # Footguns
     ///
     /// - Success does not guarantee a FIN frame was emitted immediately. In
-    ///   particular, if shutdown happens while the writer is still in `Init`
-    ///   state, the QueueBind will carry `is_fin: true` when first sent.
+    ///   particular, if shutdown happens before the binding is confirmed, the
+    ///   outgoing QueueData frame keeps carrying `dest_acceptor_id`.
     /// - Even when a FIN frame is emitted, success only means it was queued
     ///   locally. It does not mean the peer has observed it yet.
     pub fn shutdown(&mut self) -> io::Result<()> {
@@ -560,7 +564,7 @@ impl Inner {
     fn send_fin_packet(&mut self) -> io::Result<()> {
         if self.status.is_init() {
             self.send_queue_data_init(&mut buffer::reader::storage::Empty, true)?;
-        } else if self.status.is_open() {
+        } else if self.status.is_binding() || self.status.is_open() {
             let frame = Frame {
                 source_sender_id: LocalSenderId::UNSPECIFIED,
                 header: Header::QueueData {
@@ -568,7 +572,7 @@ impl Inner {
                     binding_id: self.binding_id,
                     offset: self.next_offset,
                     is_fin: true,
-                    dest_acceptor_id: None,
+                    dest_acceptor_id: self.pending_acceptor_id(),
                 },
                 payload: ByteVec::new(),
                 path_secret_entry: self.path_secret_entry.clone(),
@@ -733,6 +737,9 @@ impl Inner {
     fn apply_max_data(&mut self, maximum_data: VarInt) {
         let prev_max = self.remote_max_data;
         self.remote_max_data = self.remote_max_data.max(maximum_data);
+        if self.status.is_binding() {
+            self.status.on_queue_confirmed().unwrap();
+        }
         trace!(
             binding_id = self.binding_id.as_u64(),
             prev_max = prev_max.as_u64(),
@@ -913,7 +920,7 @@ impl Inner {
                     binding_id: self.binding_id,
                     offset,
                     is_fin: include_fin,
-                    dest_acceptor_id: None,
+                    dest_acceptor_id: self.pending_acceptor_id(),
                 },
                 payload,
                 path_secret_entry: self.path_secret_entry.clone(),
@@ -933,7 +940,7 @@ impl Inner {
                 offset = offset.as_u64(),
                 payload_len,
                 is_fin = include_fin,
-                "Sending FlowData"
+                "Sending QueueData"
             );
 
             if include_fin {
@@ -946,6 +953,13 @@ impl Inner {
         self.send_batch(frames)?;
 
         Ok(written)
+    }
+
+    #[inline]
+    fn pending_acceptor_id(&self) -> Option<VarInt> {
+        self.status
+            .is_binding()
+            .then_some(self.acceptor_id)
     }
 
     fn remaining_offset_capacity(&self) -> usize {

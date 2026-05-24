@@ -23,16 +23,16 @@ pub(crate) struct Dispatch {
     pub rx_data_ok: Counter,
     pub rx_data_unallocated: Counter,
     pub rx_data_half_closed: Counter,
-    pub rx_data_credential_mismatch: Counter,
-    pub rx_data_stream_id_mismatch: Counter,
+    pub rx_data_binding_mismatch: Counter,
+    pub rx_data_init_on_client: Counter,
     pub rx_data_perm_closed: Counter,
 
     pub rx_flow_control_ok: Counter,
     pub rx_flow_control_unallocated: Counter,
     pub rx_flow_control_half_closed: Counter,
-    pub rx_flow_control_credential_mismatch: Counter,
-    pub rx_flow_control_stream_id_mismatch: Counter,
+    pub rx_flow_control_binding_mismatch: Counter,
     pub rx_flow_control_perm_closed: Counter,
+    pub rx_queue_free_future_binding: Counter,
 
     pub rx_reset_both: Counter,
     pub rx_reset_stream: Counter,
@@ -92,9 +92,8 @@ impl Dispatch {
             rx_data_ok: counters.register("rx.data.ok"),
             rx_data_unallocated: counters.register_nominal("!rx.data", "unallocated"),
             rx_data_half_closed: counters.register_nominal("!rx.data", "half_closed"),
-            rx_data_credential_mismatch: counters
-                .register_nominal("!rx.data", "credential_mismatch"),
-            rx_data_stream_id_mismatch: counters.register_nominal("!rx.data", "stream_id_mismatch"),
+            rx_data_binding_mismatch: counters.register_nominal("!rx.data", "binding_mismatch"),
+            rx_data_init_on_client: counters.register("!rx.data.init_on_client"),
             rx_data_perm_closed: counters.register("rx.data.perm_closed"),
 
             rx_flow_control_ok: counters.register("rx.flow_control.ok"),
@@ -102,11 +101,10 @@ impl Dispatch {
                 .register_nominal("!rx.flow_control", "unallocated"),
             rx_flow_control_half_closed: counters
                 .register_nominal("!rx.flow_control", "half_closed"),
-            rx_flow_control_credential_mismatch: counters
-                .register_nominal("!rx.flow_control", "credential_mismatch"),
-            rx_flow_control_stream_id_mismatch: counters
-                .register_nominal("!rx.flow_control", "stream_id_mismatch"),
+            rx_flow_control_binding_mismatch: counters
+                .register_nominal("!rx.flow_control", "binding_mismatch"),
             rx_flow_control_perm_closed: counters.register("rx.flow_control.perm_closed"),
+            rx_queue_free_future_binding: counters.register("!rx.queue_free.future_binding"),
 
             rx_reset_both: counters.register("rx.reset.both"),
             rx_reset_stream: counters.register("rx.reset.stream"),
@@ -158,12 +156,12 @@ impl Dispatch {
 
     #[inline]
     pub fn on_data_validation_failed(&self, _reason: ValidationError) {
-        self.rx_data_stream_id_mismatch.add(1);
+        self.rx_data_binding_mismatch.add(1);
     }
 
     #[inline]
     pub fn on_flow_control_validation_failed(&self, _reason: ValidationError) {
-        self.rx_flow_control_stream_id_mismatch.add(1);
+        self.rx_flow_control_binding_mismatch.add(1);
     }
 
     #[inline]

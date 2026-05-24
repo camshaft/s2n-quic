@@ -13,7 +13,7 @@
 
 use s2n_quic_core::varint::VarInt;
 use std::{
-    collections::VecDeque,
+    collections::{HashSet, VecDeque},
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc, Mutex,
@@ -33,6 +33,7 @@ const MAX_WAITERS: usize = 4096;
 
 struct Inner {
     freed: VecDeque<VarInt>,
+    queued: HashSet<u64>,
     waiters: VecDeque<Waker>,
     closed: bool,
 }
@@ -41,6 +42,7 @@ impl std::fmt::Debug for Inner {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Inner")
             .field("freed_len", &self.freed.len())
+            .field("queued_len", &self.queued.len())
             .field("waiters_len", &self.waiters.len())
             .field("closed", &self.closed)
             .finish()
@@ -54,6 +56,7 @@ impl FreeList {
             max_queues: initial_max_queues.as_u64(),
             inner: Mutex::new(Inner {
                 freed: VecDeque::new(),
+                queued: HashSet::new(),
                 waiters: VecDeque::new(),
                 closed: false,
             }),
@@ -91,7 +94,9 @@ impl FreeList {
         }
 
         let mut inner = self.inner.lock().unwrap();
-        inner.freed.pop_front()
+        let id = inner.freed.pop_front()?;
+        inner.queued.remove(&id.as_u64());
+        Some(id)
     }
 
     /// Poll for a queue ID allocation (async path).
@@ -108,6 +113,7 @@ impl FreeList {
             return Poll::Ready(None);
         }
         if let Some(id) = inner.freed.pop_front() {
+            inner.queued.remove(&id.as_u64());
             return Poll::Ready(Some(id));
         }
 
@@ -129,13 +135,17 @@ impl FreeList {
     /// Push a freed queue ID back into the pool.
     ///
     /// Wakes one waiting consumer if any are registered.
-    pub fn free(&self, id: VarInt) {
+    pub fn free(&self, id: VarInt) -> bool {
         let mut inner = self.inner.lock().unwrap();
+        if !inner.queued.insert(id.as_u64()) {
+            return false;
+        }
         inner.freed.push_back(id);
         if let Some(waker) = inner.waiters.pop_front() {
             drop(inner);
             waker.wake();
         }
+        true
     }
 
     pub fn close(&self) {
@@ -146,5 +156,23 @@ impl FreeList {
         for waker in waiters {
             waker.wake();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::FreeList;
+    use s2n_quic_core::varint::VarInt;
+
+    #[test]
+    fn duplicate_frees_are_idempotent() {
+        let list = FreeList::new(VarInt::from_u8(0));
+        let id = VarInt::from_u8(7);
+
+        assert!(list.free(id));
+        assert!(!list.free(id));
+
+        assert_eq!(list.try_alloc(), Some(id));
+        assert_eq!(list.try_alloc(), None);
     }
 }

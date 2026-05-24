@@ -37,6 +37,13 @@ pub const MAX_PEER_DATA_ADDRS: usize = 32;
 
 pub type PeerDataAddrs = tokio::sync::SetOnce<Arc<[s2n_quic_core::inet::SocketAddressV6]>>;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PeerQueueFreeResult {
+    Accepted,
+    Stale,
+    Future,
+}
+
 #[derive(Debug, thiserror::Error)]
 #[error("{inner}")]
 pub struct ApplicationDataError {
@@ -539,18 +546,18 @@ impl Entry {
     }
 
     /// Allocate a new binding_id from this entry's monotonic counter.
+    ///
+    /// Even at 10M streams/sec, the 62-bit space would take roughly 14.6k years
+    /// to exhaust, and path re-handshakes should rotate state long before that.
     pub fn alloc_binding_id(&self) -> s2n_quic_core::varint::VarInt {
         let max = s2n_quic_core::varint::VarInt::MAX.as_u64();
-        let id = self
-            .next_binding_id
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |curr| {
-                (curr < max).then_some(curr + 1)
-            })
-            .unwrap_or(max);
+        let id = self.next_binding_id.fetch_add(1, Ordering::Relaxed);
 
-        if id == max {
+        if id > max {
+            self.next_binding_id.store(max, Ordering::Relaxed);
             error!("binding_id space exhausted; reusing VarInt::MAX");
             debug_assert!(false, "binding_id space exhausted");
+            return s2n_quic_core::varint::VarInt::MAX;
         }
 
         // SAFETY: `id <= VarInt::MAX`.
@@ -565,6 +572,10 @@ impl Entry {
         self.queue_allocator.lock().unwrap().dispatcher()
     }
 
+    pub fn try_alloc_peer_queue_id(&self) -> Option<VarInt> {
+        self.peer_free_list.try_alloc()
+    }
+
     /// Allocate a queue ID from the peer free-list, waiting asynchronously if needed.
     pub async fn alloc_peer_queue_id(&self) -> Option<VarInt> {
         core::future::poll_fn(|cx| self.peer_free_list.poll_alloc(cx)).await
@@ -575,13 +586,16 @@ impl Entry {
     /// Validates that `binding_id` was actually allocated by this entry. If it's from
     /// the future (>= next_binding_id), the QueueFree is invalid and dropped to prevent
     /// spoofed or replayed frees from corrupting the pool.
-    pub fn on_peer_queue_freed(&self, queue_id: VarInt, binding_id: VarInt) -> bool {
+    pub fn on_peer_queue_freed(&self, queue_id: VarInt, binding_id: VarInt) -> PeerQueueFreeResult {
         let next = self.next_binding_id.load(Ordering::Relaxed);
         if binding_id.as_u64() >= next {
-            return false;
+            return PeerQueueFreeResult::Future;
         }
-        self.peer_free_list.free(queue_id);
-        true
+        if self.peer_free_list.free(queue_id) {
+            PeerQueueFreeResult::Accepted
+        } else {
+            PeerQueueFreeResult::Stale
+        }
     }
 
     /// Allocates a queue slot from this entry's pool, growing if needed.

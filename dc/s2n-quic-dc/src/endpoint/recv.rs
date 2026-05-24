@@ -136,7 +136,7 @@ pub(crate) struct Context {
     pub created_at: crate::time::precision::Timestamp,
     pub ack_state: AckState,
     /// Per-context queue dispatcher. Routes incoming frames to the correct
-    /// queue slot and allocates new slots for QueueBind.
+    /// queue slot and lazily allocates new slots for QueueData-init.
     pub queue_dispatcher: crate::endpoint::msg::queue::Dispatcher,
     /// Intrusive links for recv-worker pending-ACK burst queue membership.
     pub ack_burst: intrusive::Links,

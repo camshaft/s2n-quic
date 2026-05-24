@@ -12,9 +12,9 @@
 //! ## Protocol note
 //!
 //! The *client* is always the stream initiator: the first write from the
-//! client writer sends a `FlowInit` packet that establishes the stream on the
-//! server.  Until `FlowInit` arrives the server acceptor never sees the
-//! stream.  Every test below therefore has the client write at least one byte
+//! client writer sends a `QueueData` init frame that establishes the stream on
+//! the server. Until that frame arrives the server acceptor never sees the
+//! stream. Every test below therefore has the client write at least one byte
 //! before relying on the server to accept the stream.
 //!
 //! ## Tests covered
@@ -36,8 +36,6 @@
 //! * **Reader drop after EOF is clean** – dropping a `Reader` that already
 //!   reached EOF does NOT send `STOP_SENDING`.
 //! * **Write after shutdown returns BrokenPipe** – writes after FIN fail fast.
-//! * **Known bug (ignored)** – writer drop during `FlowInitSent` leaves server
-//!   reader hanging.
 use crate::tracing::*;
 use bach::time::timeout;
 use bytes::{Bytes, BytesMut};
@@ -302,25 +300,23 @@ fn both_sides_half_close() {
 ///
 /// ## Payload size requirement
 ///
-/// The FlowInit early-data capacity is limited to roughly the packet MTU minus
+/// The initial QueueData early-data capacity is limited to roughly the packet MTU minus
 /// header overhead (~1363 bytes).  When the payload fits entirely in the
-/// FlowInit, `write_all_from` returns while the writer is still in
-/// `FlowInitSent` state (waiting for MAX_DATA).  `shutdown()` only handles
-/// `Init` and `Open`; it is a no-op in `FlowInitSent` (see the `#[ignore]`
-/// test `writer_drop_in_flow_init_sent_hangs_server_reader`).
+/// first packet, `write_all_from` returns while the writer is still waiting for
+/// the peer to confirm the binding with `MAX_DATA`.
 ///
-/// By sending slightly more data than the FlowInit can carry, the second write
-/// in `write_all_from` suspends until MAX_DATA arrives, which advances the
-/// state to `Open`.  Once `write_all_from` returns the writer is therefore in
-/// `Open` state and `drop(writer)` → `shutdown()` → `send_fin_packet()` works
-/// correctly.
+/// By sending slightly more data than the first packet can carry, the second
+/// write in `write_all_from` suspends until `MAX_DATA` arrives, which advances
+/// the state to `Open`. Once `write_all_from` returns the writer is therefore
+/// in `Open` state and `drop(writer)` → `shutdown()` → `send_fin_packet()`
+/// works correctly.
 #[test]
 fn writer_drop_sends_fin() {
     crate::testing::sim(|| {
         use crate::testing::ext::*;
 
-        // Payload slightly above the FlowInit early-data MTU so the second
-        // write_from call suspends in FlowInitSent until MAX_DATA arrives,
+        // Payload slightly above the initial QueueData early-data MTU so the
+        // second write_from call suspends until MAX_DATA arrives,
         // advancing the writer to Open state before write_all_from returns.
         const PAYLOAD_LEN: usize = 1500;
 
@@ -359,11 +355,12 @@ fn writer_drop_sends_fin() {
                 .expect("connect");
             let (mut reader, mut writer) = stream.into_split();
 
-            // Send a payload that overflows the FlowInit early-data MTU.
-            // The second write_from call in write_all_from will suspend in
-            // FlowInitSent until MAX_DATA arrives, leaving the writer in Open
-            // state when write_all_from returns.
-            let mut data = Data::new(PAYLOAD_LEN as u64);
+            // Send a payload that overflows the initial QueueData early-data
+            // MTU. The second write_from call in write_all_from will suspend
+            // until MAX_DATA arrives, leaving the writer in Open state when
+            // write_all_from returns.
+            let data = vec![0xAAu8; PAYLOAD_LEN];
+            let mut data = Bytes::from(data);
             writer
                 .write_all_from(&mut data)
                 .await
@@ -801,100 +798,11 @@ fn write_after_shutdown_returns_broken_pipe() {
     });
 }
 
-// ── writer_drop_in_flow_init_sent ──────────────────────────────────────────
-
-/// **Obsolete:** This test was for the FlowInitSent state which no longer exists.
-/// With the implicit binding protocol, the writer goes Init→Open immediately when
-/// sending the first QueueData-init frame. There is no intermediate state where
-/// a drop could leave the server hanging.
-#[test]
-#[ignore = "obsolete: FlowInitSent state no longer exists"]
-fn writer_drop_in_flow_init_sent_hangs_server_reader() {
-    use std::time::Duration;
-
-    crate::testing::sim(|| {
-        use crate::testing::ext::*;
-
-        let mut server_addr = crate::stream::endpoint::testing::sim::MonitorHostAddr::new("server");
-
-        // Suppress the very first server→client packet (the `MAX_DATA` /
-        // `FlowControl` response to `FlowInit`).  This keeps the client writer
-        // in `FlowInitSent` state indefinitely.
-        {
-            let mut server_pkt_count = 0u32;
-            bach::net::monitor::on_packet_sent(move |packet| {
-                if server_addr.is_packet_source(packet) {
-                    server_pkt_count += 1;
-                    if server_pkt_count == 1 {
-                        return bach::net::monitor::Command::Drop;
-                    }
-                }
-                bach::net::monitor::Command::Pass
-            });
-        }
-
-        async move {
-            let server = crate::stream::endpoint::testing::sim::Server::new();
-            let mut acceptor = server
-                .register_acceptor_channel(ACCEPTOR_ID, 8)
-                .expect("acceptor registration");
-
-            while let Some(pending) = acceptor.recv().await {
-                async move {
-                    let stream = pending.validate().await.expect("validate");
-                    let (mut reader, _writer) = stream.into_split();
-
-                    // Server reader should unblock (EOF or reset) after the
-                    // client drops its writer.  Currently it hangs (known bug).
-                    let result = bach::time::timeout(Duration::from_secs(5), async {
-                        let mut buf = BytesMut::with_capacity(16);
-                        read_to_eof!(reader, buf);
-                    })
-                    .await;
-
-                    // TODO: flip to `result.is_ok()` once the bug is fixed.
-                    assert!(
-                        result.is_err(),
-                        "server reader unexpectedly completed – was the FlowInitSent bug fixed?"
-                    );
-                }
-                .primary()
-                .spawn();
-            }
-        }
-        .group("server")
-        .spawn();
-
-        async move {
-            let mut client = crate::stream::endpoint::testing::sim::Client::new();
-            let stream = client
-                .connect("server:0", ACCEPTOR_ID)
-                .await
-                .expect("connect");
-            let (_reader, mut writer) = stream.into_split();
-
-            // Write early data so the FlowInit is sent → writer enters
-            // FlowInitSent.  MAX_DATA is suppressed, so it stays there.
-            let mut data = Bytes::from_static(b"early");
-            let _ = writer.write_from(&mut data).await;
-
-            // Drop the writer while in FlowInitSent.  `shutdown()` is called
-            // but `send_fin_packet()` is a no-op.  Server reader never sees FIN.
-            drop(writer);
-
-            // Give the server enough simulated time to observe (or miss) the FIN.
-            bach::time::sleep(Duration::from_secs(6)).await;
-        }
-        .group("client")
-        .primary()
-        .spawn();
-    });
-}
-
 // ── queue_bind_with_fin_recovered_after_packet_loss ────────────────────────────
 
-/// Verifies that when the QueueBind+FIN packet is dropped, PTO retransmits
-/// it and the server eventually receives both the data and FIN.
+/// Verifies that even if the first QueueData-init frame carrying early data is
+/// dropped, a later empty QueueData FIN still creates the queue pair and lets
+/// the peer observe EOF.
 #[test]
 fn queue_bind_with_fin_recovered_after_packet_loss() {
     use crate::testing::ext::*;
@@ -990,23 +898,23 @@ fn queue_bind_with_fin_recovered_after_packet_loss() {
                 // All client→server packets will be dropped until we disable it.
                 drop_active.store(true, Ordering::Relaxed);
 
-                // Write data WITH fin — this queues the QueueBind frame with is_fin=true.
+                // Write early data without FIN so the first QueueData-init is lost.
                 let mut data = Bytes::from_static(b"early");
                 writer
-                    .write_from_fin(&mut data)
+                    .write_from(&mut data)
                     .await
-                    .expect("write early data + fin");
+                    .expect("write early data");
 
-                // Wait long enough for the QueueBind to be transmitted AND for
+                // Wait long enough for the first QueueData-init to be transmitted AND for
                 // several PTO retransmissions to fire (all will be dropped).
                 Duration::from_millis(200).sleep().await;
 
-                // Disable drops — the next PTO retransmission will get through.
-                // Since QueueBind carries is_fin inline, the server gets both
-                // the data and FIN in a single retransmitted frame.
+                // Disable drops so shutdown's empty FIN frame gets through.
                 drop_active.store(false, Ordering::Relaxed);
 
-                // Wait for PTO to retransmit and the server to process.
+                writer.shutdown().expect("shutdown");
+
+                // Wait for the FIN frame and any retransmissions to settle.
                 Duration::from_secs(15).sleep().await;
             }
             .group("client")

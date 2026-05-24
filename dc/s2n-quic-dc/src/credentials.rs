@@ -43,6 +43,15 @@ impl Id {
         id
     }
 
+    #[inline]
+    pub fn endpoint_type(self) -> endpoint::Type {
+        if self.0[0] & Self::ENDPOINT_BIT == 0 {
+            endpoint::Type::Client
+        } else {
+            endpoint::Type::Server
+        }
+    }
+
     #[doc(hidden)]
     pub fn to_hash(self) -> u64 {
         // The ID has very high quality entropy already, so write just one half of it to keep hash

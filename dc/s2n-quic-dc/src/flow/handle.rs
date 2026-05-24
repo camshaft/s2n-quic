@@ -43,13 +43,14 @@ impl crate::flow::queue::Key for Handle {
             Ordering::Equal => Ok(()),
             Ordering::Greater => Err(ValidationError::StaleBinding),
             Ordering::Less => {
-                // NOTE: debug_assert removed during development. Re-enable once
-                // the QueueFree credit-return protocol is fully implemented and
-                // proven correct under slot-reuse stress tests.
                 tracing::error!(
                     current = self.binding_id.as_u64(),
                     received = binding_id.as_u64(),
                     "BUG: received binding_id greater than current — client rebound before QueueFree"
+                );
+                debug_assert!(
+                    false,
+                    "received binding_id greater than current — client rebound before QueueFree"
                 );
                 Err(ValidationError::FutureBinding)
             }
