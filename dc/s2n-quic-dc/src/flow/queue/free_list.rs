@@ -13,9 +13,17 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-/// Callback which releases a descriptor back into the free list
+/// Callback which releases a descriptor back into the free list.
+///
+/// The server and client provide different implementations:
+/// - Server: reads binding_id from the descriptor, pushes QueueFree notification,
+///   clears binding_id, then recycles the descriptor
+/// - Client: clears binding_id and recycles the descriptor
+///
+/// The descriptor arrives with binding_id still set (not yet UNBOUND). The impl
+/// is responsible for clearing it after reading any needed state.
 pub(super) trait FreeList<S, C>: 'static + Send + Sync {
-    /// Frees a descriptor back into the free list
+    /// Frees a descriptor back into the free list.
     ///
     /// Once the free list has been closed and all descriptors returned, the `free` function
     /// should return an object that can be dropped to release all of the memory associated
@@ -31,11 +39,22 @@ pub(super) trait FreeList<S, C>: 'static + Send + Sync {
 /// path, preferring recently-freed descriptors for cache locality.
 pub(super) struct FreeVec<S: 'static, C: 'static> {
     inner: Mutex<FreeInner<S, C>>,
+    /// Server-side: notification sink for freed slots (QueueFree emission).
+    /// None on client side — freed descriptors are silently recycled.
+    free_notify: Option<Arc<super::descriptor::FreeNotify>>,
 }
 
 impl<S: 'static, C: 'static> FreeVec<S, C> {
+    /// Returns a handle to the FreeNotify sink, if this free list has one (server-side).
+    pub fn free_notify(&self) -> Option<&Arc<super::descriptor::FreeNotify>> {
+        self.free_notify.as_ref()
+    }
+
     #[inline]
-    pub fn new(initial_cap: usize) -> (Arc<Self>, Arc<Memory<S, C>>) {
+    pub fn new(
+        initial_cap: usize,
+        free_notify: Option<Arc<super::descriptor::FreeNotify>>,
+    ) -> (Arc<Self>, Arc<Memory<S, C>>) {
         let slots = Vec::with_capacity(initial_cap);
         let free_indices = VecDeque::with_capacity(initial_cap);
         let regions = Vec::with_capacity(1);
@@ -50,7 +69,7 @@ impl<S: 'static, C: 'static> FreeVec<S, C> {
             active: Default::default(),
         };
         let inner = Mutex::new(inner);
-        let free = Arc::new(Self { inner });
+        let free = Arc::new(Self { inner, free_notify });
         let memory = Arc::new(Memory(free.clone()));
         (free, memory)
     }
@@ -187,6 +206,16 @@ where
 {
     #[inline]
     fn free(&self, descriptor: Descriptor<S, C>) -> Option<Box<dyn 'static + Send>> {
+        // Read binding_id and emit QueueFree notification before clearing.
+        if let Some(notify) = &self.free_notify {
+            let freed = unsafe { descriptor.take_freed_slot() };
+            if let Some(slot) = freed {
+                notify.push(slot);
+            }
+        } else {
+            unsafe { descriptor.clear_binding() };
+        }
+
         let mut inner = self.inner.lock().unwrap();
 
         #[cfg(debug_assertions)]

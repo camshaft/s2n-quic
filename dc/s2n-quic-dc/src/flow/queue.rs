@@ -105,8 +105,7 @@ where
     pub fn dispatcher(&self) -> Dispatch<S, C> {
         let free_notify = self
             .pool
-            .free_notify
-            .clone()
+            .free_notify()
             .unwrap_or_else(|| Arc::new(descriptor::FreeNotify::new()));
         Dispatch {
             senders: self.pool.senders(),

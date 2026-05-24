@@ -21,8 +21,6 @@ pub struct Pool<
     memory_handle: Arc<free_list::Memory<S, C>>,
     epoch_summary: Option<counter::Summary>,
     epoch: usize,
-    /// Optional sink for freed-slot notifications (server-side QueueFree emission).
-    pub(super) free_notify: Option<Arc<super::descriptor::FreeNotify>>,
 }
 
 impl<S: 'static + Send, C: 'static + Send, const INITIAL_PAGE_SIZE: usize>
@@ -36,7 +34,6 @@ impl<S: 'static + Send, C: 'static + Send, const INITIAL_PAGE_SIZE: usize>
             senders: self.senders.clone(),
             epoch_summary: self.epoch_summary.clone(),
             epoch: self.epoch,
-            free_notify: self.free_notify.clone(),
         }
     }
 }
@@ -61,14 +58,13 @@ where
     ) -> Self {
         let epoch = 0;
         let senders = sender::State::new(epoch);
-        let (free, memory_handle) = FreeVec::new(INITIAL_PAGE_SIZE);
+        let (free, memory_handle) = FreeVec::new(INITIAL_PAGE_SIZE, free_notify);
         let mut pool = Pool {
             free,
             memory_handle,
             senders,
             epoch_summary,
             epoch,
-            free_notify,
         };
         pool.grow();
         pool
@@ -82,6 +78,10 @@ where
             memory_handle: self.memory_handle.clone(),
             local: Default::default(),
         }
+    }
+
+    pub fn free_notify(&self) -> Option<Arc<super::descriptor::FreeNotify>> {
+        self.free.free_notify().cloned()
     }
 
     #[inline]
@@ -171,7 +171,6 @@ where
                 descriptor.write(DescriptorInner::new(
                     self.epoch + idx,
                     free_list,
-                    self.free_notify.clone(),
                 ));
 
                 let descriptor = NonNull::new_unchecked(descriptor);

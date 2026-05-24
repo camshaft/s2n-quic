@@ -276,33 +276,50 @@ impl<S: 'static, C: 'static> Descriptor<S, C> {
         let inner = self.inner();
         probes::on_receiver_drop(inner.id, half);
 
-        // Read the binding_id before we clear it — needed for QueueFree.
-        let binding_id_raw = inner.binding_id.load(Ordering::Relaxed);
-
         ensure!(inner
             .stream
-            .close_receiver(&inner.control, half, || {
-                inner.binding_id.store(UNBOUND, Ordering::Release);
-            })
+            .close_receiver(&inner.control, half, || {})
             .is_continue());
 
         probes::on_receiver_free(inner.id, half);
 
-        // Notify that this slot has been freed (for QueueFree emission).
-        if let Some(notify) = &inner.free_notify {
-            if let Ok(binding_id) = VarInt::new(binding_id_raw) {
-                notify.push(FreedSlot {
-                    queue_id: inner.id,
-                    binding_id,
-                });
-            }
-        }
-
+        // The free list impl handles notification (server pushes QueueFree info,
+        // client just recycles). binding_id is still set so the free list can read it.
         let storage = inner.free_list.free(Descriptor {
             ptr: self.ptr,
             phantom: PhantomData,
         });
         drop(storage);
+    }
+
+    /// Read the binding_id and queue_id, then clear binding_id to UNBOUND.
+    ///
+    /// Returns `Some(FreedSlot)` if the slot was bound, `None` if already unbound.
+    /// Called by the free list impl to capture state for QueueFree before recycling.
+    ///
+    /// # Safety
+    ///
+    /// Must only be called once during the free path, after both receivers have closed.
+    #[inline]
+    pub unsafe fn take_freed_slot(&self) -> Option<FreedSlot> {
+        let inner = self.inner();
+        let binding_id_raw = inner.binding_id.swap(UNBOUND, Ordering::AcqRel);
+        VarInt::new(binding_id_raw).ok().map(|binding_id| FreedSlot {
+            queue_id: inner.id,
+            binding_id,
+        })
+    }
+
+    /// Clear binding_id to UNBOUND without reading it.
+    ///
+    /// Used by client-side free lists that don't need the freed slot info.
+    ///
+    /// # Safety
+    ///
+    /// Must only be called once during the free path, after both receivers have closed.
+    #[inline]
+    pub unsafe fn clear_binding(&self) {
+        self.inner().binding_id.store(UNBOUND, Ordering::Release);
     }
 
     /// Validate the binding_id against the current slot binding.
@@ -401,11 +418,9 @@ pub(super) struct DescriptorInner<S, C> {
     remote_queue_id: AtomicU64,
     stream: Queue<S>,
     control: Queue<C>,
-    /// A reference back to the free list
+    /// A reference back to the free list.
+    /// Server impl pushes QueueFree notifications; client impl just recycles.
     free_list: Arc<dyn FreeList<S, C>>,
-    /// Optional notification sink for freed slots (QueueFree emission).
-    /// Set by server-side dispatchers; None on client side.
-    free_notify: Option<Arc<FreeNotify>>,
     senders: AtomicUsize,
 }
 
@@ -413,7 +428,6 @@ impl<S, C> DescriptorInner<S, C> {
     pub(super) fn new(
         index: usize,
         free_list: Arc<dyn FreeList<S, C>>,
-        free_notify: Option<Arc<FreeNotify>>,
     ) -> Self {
         let stream = Queue::new(Half::Stream);
         let control = Queue::new(Half::Control);
@@ -425,7 +439,6 @@ impl<S, C> DescriptorInner<S, C> {
             control,
             senders: AtomicUsize::new(0),
             free_list,
-            free_notify,
         }
     }
 }
