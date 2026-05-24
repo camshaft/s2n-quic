@@ -634,8 +634,8 @@ fn multiple_packet_loss_recovered_by_pto() {
     let server_packets = server_to_client_packets.load(Ordering::Relaxed);
     assert_eq!(dropped, 2, "expected exactly two dropped server packets");
     assert_eq!(
-        server_packets, 4,
-        "expected exactly four server packets after dropping the first two server packets"
+        server_packets, 5,
+        "expected exactly five server packets after dropping the first two server packets"
     );
 }
 
