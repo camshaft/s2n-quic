@@ -229,10 +229,6 @@ pub(crate) struct AckRttTracker {
     latest: Option<(VarInt, Timestamp)>,
     /// Set to `true` after a sample has been successfully consumed. Prevents
     /// re-probing until [`clear`] is called, breaking any potential ACK loop.
-    ///
-    /// Starts `true` so that a brand-new context doesn't probe on its first ACK
-    /// (the first data send will produce an RTT sample naturally). Reset to `false`
-    /// by [`clear`] when data enters inflight.
     sampled: bool,
 }
 
@@ -286,16 +282,6 @@ impl AckRttTracker {
         }
     }
 
-    /// Suppress further probing until [`clear`] is called.
-    ///
-    /// Called when inflight drains to empty after an ACK that already produced an
-    /// RTT sample via the normal data path. Prevents the immediately following
-    /// ACK-only send from redundantly probing.
-    #[inline]
-    pub fn suppress(&mut self) {
-        self.sampled = true;
-    }
-
     /// Clear all slots and reset the `sampled` flag.
     ///
     /// Called when a data-carrying packet is inserted into the inflight map.
@@ -307,6 +293,16 @@ impl AckRttTracker {
         self.stable = None;
         self.latest = None;
         self.sampled = false;
+    }
+
+    /// Suppress further probing until [`clear`] is called.
+    ///
+    /// Called when inflight drains to empty after an ACK that already produced an
+    /// RTT sample via the normal data path. Prevents the immediately following
+    /// ACK-only send from redundantly probing.
+    #[inline]
+    pub fn suppress(&mut self) {
+        self.sampled = true;
     }
 
     /// Check whether a single ACK range covers either the `latest` or `stable` PN.
@@ -546,6 +542,8 @@ pub(crate) struct Context {
     pub peer_addr: std::net::SocketAddr,
     /// Next packet number to assign
     pub next_packet_number: VarInt,
+    /// Next attempt ID for FlowInit deduplication (per-sender counter)
+    pub flow_attempt_id_counter: VarInt,
     pub cca: congestion::Controller,
     pub rtt_estimator: RttEstimator,
     pub inflight: inflight::Map,
@@ -639,6 +637,7 @@ impl Context {
             credentials,
             peer_addr,
             next_packet_number: VarInt::ZERO,
+            flow_attempt_id_counter: VarInt::ZERO,
             cca,
             rtt_estimator,
             inflight,
