@@ -359,8 +359,7 @@ fn writer_drop_sends_fin() {
             // MTU. The second write_from call in write_all_from will suspend
             // until MAX_DATA arrives, leaving the writer in Open state when
             // write_all_from returns.
-            let data = vec![0xAAu8; PAYLOAD_LEN];
-            let mut data = Bytes::from(data);
+            let mut data = Data::new(PAYLOAD_LEN as u64);
             writer
                 .write_all_from(&mut data)
                 .await
