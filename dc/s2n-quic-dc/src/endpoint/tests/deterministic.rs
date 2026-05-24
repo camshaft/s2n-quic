@@ -17,7 +17,7 @@
 //! throughput is immediately visible.
 use crate::{
     endpoint::routing::hash_id_and_sender,
-    stream::endpoint::testing::sim::{Client, Server, SERVER_PORT},
+    stream::endpoint::testing::sim::{Client, Server},
     testing::{ext::*, sim, without_tracing},
     tracing::*,
     xorshift,
