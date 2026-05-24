@@ -43,7 +43,6 @@ pub(crate) struct Dispatch {
     pub rx_res_reset_control: Counter,
 
     pub flow_accepted: Counter,
-    pub flow_pending: Counter,
 
     pub rx_process_err_peer_lookup: Counter,
     pub rx_process_err_decryption: Counter,
@@ -58,9 +57,6 @@ pub(crate) struct Dispatch {
     pub rx_peer_lookup_time: Timer,
     pub rx_decrypt_time: Timer,
     pub rx_dispatch_time: Timer,
-    pub rx_init_register_time: Timer,
-    pub rx_init_create_stream_time: Timer,
-    pub rx_init_dispatch_time: Timer,
     pub rx_frames_per_packet: Summary,
     pub rx_packet_size: Summary,
 
@@ -70,7 +66,6 @@ pub(crate) struct Dispatch {
     pub rx_ecn_not_ect: Counter,
 
     // Per-frame-type RX counters for inbound frames observed by the dispatch path.
-    pub rx_frame_queue_bind: Counter,
     pub rx_frame_queue_data: Counter,
     pub rx_frame_queue_data_fin: Counter,
     pub rx_frame_queue_control: Counter,
@@ -116,7 +111,6 @@ impl Dispatch {
             rx_res_reset_control: counters.register("rx.res.reset.control"),
 
             flow_accepted: counters.register("flow.accepted"),
-            flow_pending: counters.register("flow.pending"),
 
             rx_process_err_peer_lookup: counters.register("!rx.process.err.peer_lookup"),
             rx_process_err_decryption: counters.register("!rx.process.err.decrypt"),
@@ -132,9 +126,6 @@ impl Dispatch {
             rx_peer_lookup_time: counters.register_timer("rx.peer_lookup_time"),
             rx_decrypt_time: counters.register_timer("rx.decrypt_time"),
             rx_dispatch_time: counters.register_timer("rx.dispatch_time"),
-            rx_init_register_time: counters.register_timer("rx.init.register_time"),
-            rx_init_create_stream_time: counters.register_timer("rx.init.create_stream_time"),
-            rx_init_dispatch_time: counters.register_timer("rx.init.dispatch_time"),
             rx_frames_per_packet: counters.register_summary("rx.frames_per_packet", Unit::Count),
             rx_packet_size: counters.register_summary("rx.packet_size", Unit::Byte),
 
@@ -143,7 +134,6 @@ impl Dispatch {
             rx_ecn_ce: counters.register_nominal("rx.ecn", "ce"),
             rx_ecn_not_ect: counters.register_nominal("rx.ecn", "not_ect"),
 
-            rx_frame_queue_bind: counters.register_nominal("rx.frame", "queue_bind"),
             rx_frame_queue_data: counters.register_nominal("rx.frame", "queue_data"),
             rx_frame_queue_data_fin: counters.register_nominal("rx.frame", "queue_data_fin"),
             rx_frame_queue_control: counters.register_nominal("rx.frame", "queue_control"),
@@ -234,7 +224,6 @@ pub(crate) struct Send {
     pub tx_packets: Counter,
 
     // Per-frame-type ACK counters (bumped when each inflight frame is acknowledged).
-    pub tx_acked_frame_queue_bind: Counter,
     pub tx_acked_frame_queue_data: Counter,
     pub tx_acked_frame_queue_data_fin: Counter,
     pub tx_acked_frame_queue_control: Counter,
@@ -281,7 +270,6 @@ impl Send {
             context_count: counters.register_nominal_gauge("send.context.count", &v),
             tx_packets: counters.register_nominal("tx.data", &v),
 
-            tx_acked_frame_queue_bind: counters.register_nominal("tx.acked.frame.queue_bind", &v),
             tx_acked_frame_queue_data: counters.register_nominal("tx.acked.frame.queue_data", &v),
             tx_acked_frame_queue_data_fin: counters
                 .register_nominal("tx.acked.frame.queue_data_fin", &v),

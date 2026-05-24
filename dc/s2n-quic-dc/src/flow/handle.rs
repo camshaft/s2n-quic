@@ -3,7 +3,7 @@
 
 //! Queue key: just a binding_id for dispatch validation.
 //!
-//! The queue system uses the binding_id as its Key type. When a packet is
+//! The queue system uses the binding_id as its Key. When a packet is
 //! dispatched to a queue slot, the slot's binding_id is compared against the
 //! packet's binding_id via ordered comparison:
 //!
@@ -32,13 +32,9 @@ impl Handle {
     pub fn new(binding_id: VarInt) -> Self {
         Self { binding_id }
     }
-}
-
-impl crate::flow::queue::Key for Handle {
-    type Request = VarInt;
 
     #[inline]
-    fn validate(&self, binding_id: &VarInt) -> Result<(), ValidationError> {
+    pub fn validate(&self, binding_id: &VarInt) -> Result<(), ValidationError> {
         match self.binding_id.as_u64().cmp(&binding_id.as_u64()) {
             Ordering::Equal => Ok(()),
             Ordering::Greater => Err(ValidationError::StaleBinding),
@@ -55,10 +51,5 @@ impl crate::flow::queue::Key for Handle {
                 Err(ValidationError::FutureBinding)
             }
         }
-    }
-
-    #[inline]
-    fn binding_id(&self) -> Option<VarInt> {
-        Some(self.binding_id)
     }
 }

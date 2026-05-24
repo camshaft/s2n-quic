@@ -89,10 +89,8 @@ impl Sender {
 }
 
 pub mod queue {
-    use crate::flow;
-
-    pub type Allocator = flow::queue::Allocator<super::Stream, super::Control, flow::Handle>;
-    pub type Dispatcher = flow::queue::Dispatch<super::Stream, super::Control, flow::Handle>;
-    pub type Control = flow::queue::Control<super::Stream, super::Control, flow::Handle>;
-    pub type Stream = flow::queue::Stream<super::Stream, super::Control, flow::Handle>;
+    pub type Allocator = crate::flow::queue::Allocator<super::Stream, super::Control>;
+    pub type Dispatcher = crate::flow::queue::Dispatch<super::Stream, super::Control>;
+    pub type Control = crate::flow::queue::Control<super::Stream, super::Control>;
+    pub type Stream = crate::flow::queue::Stream<super::Stream, super::Control>;
 }

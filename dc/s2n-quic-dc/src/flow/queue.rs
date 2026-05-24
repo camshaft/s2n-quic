@@ -4,8 +4,9 @@
 //! Flow-based queue allocation and dispatching.
 //!
 //! This provides queue infrastructure similar to `stream::recv::dispatch` but
-//! is generic over the stream and control data types.
-use crate::{counter, credentials::Credentials, intrusive, tracing::*};
+//! is generic over the stream and control data types. The key type is always
+//! `flow::Handle` (binding_id wrapper).
+use crate::{counter, flow::Handle, intrusive, tracing::*};
 use s2n_quic_core::varint::VarInt;
 use std::sync::Arc;
 
@@ -18,16 +19,8 @@ mod probes;
 mod queue_id;
 mod sender;
 
-// Re-export the Key trait
-pub use descriptor::{FreeNotify, FreedSlot, Key, ServerValidation, ValidationError, WakerSink};
+pub use descriptor::{FreeNotify, FreedSlot, ServerValidation, ValidationError};
 pub use inner::AutoWake;
-pub const MAX_SLOTS: usize = queue_id::MAX_SLOTS;
-
-/// Extract the slot index from an encoded queue_id.
-#[inline]
-pub fn slot_index(queue_id: VarInt) -> usize {
-    queue_id::index(queue_id)
-}
 
 /// Size of the first allocated page of queue slots.
 ///
@@ -39,37 +32,34 @@ pub fn slot_index(queue_id: VarInt) -> usize {
 const INITIAL_PAGE_SIZE: usize = if cfg!(test) { 8 } else { u16::MAX as _ };
 
 pub type Error<T> = inner::Error<T>;
-pub type Control<S, C, K> = handle::Control<S, C, K>;
-pub type Stream<S, C, K> = handle::Stream<S, C, K>;
+pub type Control<S, C> = handle::Control<S, C>;
+pub type Stream<S, C> = handle::Stream<S, C>;
 
 /// Queue allocator for flow-based routing
 ///
 /// Generic over stream data type `S` and control data type `C`.
-pub struct Allocator<S, C, K = Credentials>
+pub struct Allocator<S, C>
 where
     S: 'static + Send + Sync,
     C: 'static + Send + Sync,
-    K: 'static + Send + Sync,
 {
-    pool: pool::Pool<S, C, K, INITIAL_PAGE_SIZE>,
+    pool: pool::Pool<S, C, INITIAL_PAGE_SIZE>,
 }
 
-impl<S, C, K> core::fmt::Debug for Allocator<S, C, K>
+impl<S, C> core::fmt::Debug for Allocator<S, C>
 where
     S: 'static + Send + Sync,
     C: 'static + Send + Sync,
-    K: 'static + Send + Sync,
 {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("Allocator").finish_non_exhaustive()
     }
 }
 
-impl<S, C, K> Clone for Allocator<S, C, K>
+impl<S, C> Clone for Allocator<S, C>
 where
     S: 'static + Send + Sync,
     C: 'static + Send + Sync,
-    K: 'static + Send + Sync,
 {
     fn clone(&self) -> Self {
         Self {
@@ -78,22 +68,20 @@ where
     }
 }
 
-impl<S, C, K> Default for Allocator<S, C, K>
+impl<S, C> Default for Allocator<S, C>
 where
     S: 'static + Send + Sync,
     C: 'static + Send + Sync,
-    K: 'static + Send + Sync,
- {
+{
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<S, C, K> Allocator<S, C, K>
+impl<S, C> Allocator<S, C>
 where
     S: 'static + Send + Sync,
     C: 'static + Send + Sync,
-    K: 'static + Send + Sync,
 {
     pub fn new() -> Self {
         Self {
@@ -114,22 +102,7 @@ where
     }
 
     #[inline]
-    pub fn new_with_waker_sink(
-        registry: &counter::Registry,
-        waker_sink: Arc<dyn WakerSink>,
-    ) -> Self {
-        let epoch_summary = registry
-            .register_summary("flow.queue.epoch", counter::Unit::Count)
-            .with_description(
-                "Upper bound of allocated queue slots (epoch) after each allocator growth",
-            );
-        Self {
-            pool: pool::Pool::new_with_waker_sink(Some(epoch_summary), waker_sink),
-        }
-    }
-
-    #[inline]
-    pub fn dispatcher(&self) -> Dispatch<S, C, K> {
+    pub fn dispatcher(&self) -> Dispatch<S, C> {
         let free_notify = self
             .pool
             .free_notify
@@ -146,42 +119,40 @@ where
     #[inline]
     pub fn alloc(
         &self,
-        key: K,
+        key: Handle,
         remote_queue_id: Option<VarInt>,
-    ) -> Result<(Control<S, C, K>, Stream<S, C, K>), K> {
-        self.pool.alloc(key, remote_queue_id, None)
+    ) -> Result<(Control<S, C>, Stream<S, C>), Handle> {
+        self.pool.alloc(key, remote_queue_id)
     }
 
     #[inline]
     pub fn alloc_or_grow(
         &mut self,
-        key: K,
+        key: Handle,
         remote_queue_id: Option<VarInt>,
-    ) -> (Control<S, C, K>, Stream<S, C, K>) {
-        self.pool.alloc_or_grow(key, remote_queue_id, None)
+    ) -> (Control<S, C>, Stream<S, C>) {
+        self.pool.alloc_or_grow(key, remote_queue_id)
     }
 }
 
 /// Dispatcher which routes data to the specified queue
-pub struct Dispatch<S, C, K = Credentials>
+pub struct Dispatch<S, C>
 where
     S: 'static + Send + Sync,
     C: 'static + Send + Sync,
-    K: 'static + Send + Sync,
 {
-    senders: sender::Senders<S, C, K, INITIAL_PAGE_SIZE>,
+    senders: sender::Senders<S, C, INITIAL_PAGE_SIZE>,
     is_open: bool,
-    pool: pool::Pool<S, C, K, INITIAL_PAGE_SIZE>,
+    pool: pool::Pool<S, C, INITIAL_PAGE_SIZE>,
     /// Shared sink for freed-slot notifications. Populated by descriptor drop_receiver
     /// when both queue halves close. Drained by the dispatch layer to emit QueueFree.
     free_notify: Arc<descriptor::FreeNotify>,
 }
 
-impl<S, C, K> Clone for Dispatch<S, C, K>
+impl<S, C> Clone for Dispatch<S, C>
 where
     S: 'static + Send + Sync,
     C: 'static + Send + Sync,
-    K: 'static + Send + Sync + Key,
 {
     fn clone(&self) -> Self {
         Self {
@@ -193,30 +164,27 @@ where
     }
 }
 
-impl<S, C, K> Dispatch<S, C, K>
+impl<S, C> Dispatch<S, C>
 where
     S: 'static + Send + Sync,
     C: 'static + Send + Sync,
-    K: 'static + Send + Sync + Key,
 {
     #[inline]
     pub fn alloc(
         &self,
-        key: K,
+        key: Handle,
         remote_queue_id: Option<VarInt>,
-    ) -> Result<(Control<S, C, K>, Stream<S, C, K>), K> {
-        let binding_id = key.binding_id();
-        self.pool.alloc(key, remote_queue_id, binding_id)
+    ) -> Result<(Control<S, C>, Stream<S, C>), Handle> {
+        self.pool.alloc(key, remote_queue_id)
     }
 
     #[inline]
     pub fn alloc_or_grow(
         &mut self,
-        key: K,
+        key: Handle,
         remote_queue_id: Option<VarInt>,
-    ) -> (Control<S, C, K>, Stream<S, C, K>) {
-        let binding_id = key.binding_id();
-        self.pool.alloc_or_grow(key, remote_queue_id, binding_id)
+    ) -> (Control<S, C>, Stream<S, C>) {
+        self.pool.alloc_or_grow(key, remote_queue_id)
     }
 
     /// Allocate a specific slot by index, growing pages as needed.
@@ -226,11 +194,10 @@ where
     pub fn alloc_at_or_grow(
         &mut self,
         slot_index: usize,
-        key: K,
+        key: Handle,
         remote_queue_id: Option<VarInt>,
-    ) -> (Control<S, C, K>, Stream<S, C, K>) {
-        let binding_id = key.binding_id();
-        self.pool.alloc_at_or_grow(slot_index, key, remote_queue_id, binding_id)
+    ) -> (Control<S, C>, Stream<S, C>) {
+        self.pool.alloc_at_or_grow(slot_index, key, remote_queue_id)
     }
 
     /// Drain freed slots that have been released since the last call.
@@ -247,7 +214,7 @@ where
         &mut self,
         local_queue_id: VarInt,
         remote_queue_id: Option<VarInt>,
-        params: &K::Request,
+        params: &VarInt,
         data: intrusive::Entry<C>,
     ) -> Result<AutoWake, Error<intrusive::Entry<C>>> {
         let res = self.senders.lookup(local_queue_id, data, |sender, data| {
@@ -283,7 +250,7 @@ where
         &mut self,
         local_queue_id: VarInt,
         remote_queue_id: Option<VarInt>,
-        params: &K::Request,
+        params: &VarInt,
         data: intrusive::Entry<S>,
     ) -> Result<AutoWake, Error<intrusive::Entry<S>>> {
         let res = self.senders.lookup(local_queue_id, data, |sender, data| {
@@ -323,14 +290,13 @@ where
         &mut self,
         local_queue_id: VarInt,
         remote_queue_id: Option<VarInt>,
-        params: &K::Request,
+        params: &VarInt,
         data: intrusive::Entry<S>,
-        new_key: impl FnOnce() -> K,
     ) -> Result<(AutoWake, descriptor::ServerValidation), Error<intrusive::Entry<S>>> {
         let res = self
             .senders
             .lookup(local_queue_id, data, |sender, data| {
-                sender.send_stream_server(data, remote_queue_id, params, new_key)
+                sender.send_stream_server(data, remote_queue_id, params)
             });
 
         match res {
@@ -362,7 +328,7 @@ where
         &mut self,
         local_queue_id: VarInt,
         remote_queue_id: Option<VarInt>,
-        params: &K::Request,
+        params: &VarInt,
         stream_data: intrusive::Entry<S>,
         control_data: intrusive::Entry<C>,
     ) -> (AutoWake, AutoWake) {
@@ -382,18 +348,14 @@ where
         res.unwrap_or_default()
     }
 
-    #[inline]
-    /// Sends to both stream+control halves for every queue matching `params`.
-    ///
-    /// # Performance
-    ///
-    /// This is a global scan. Internally it walks the entire sender table and runs
-    /// per-queue validation, so the cost is O(total_queues) and can be very high at
-    /// large concurrency. Use sparingly for rare control-plane events only.
     /// Broadcast to all allocated queues without validation.
     ///
     /// Used for peer-dead reset fanout where every queue on this dispatcher
     /// needs to receive the message regardless of binding_id.
+    ///
+    /// # Performance
+    ///
+    /// This is a global scan — O(total_queues). Use sparingly for rare control-plane events.
     pub fn broadcast_both(
         &mut self,
         mut stream_data: impl FnMut() -> intrusive::Entry<S>,
@@ -416,7 +378,7 @@ where
     pub fn validate_stream(
         &mut self,
         local_queue_id: VarInt,
-        params: &K::Request,
+        params: &VarInt,
     ) -> Result<(), ValidateError> {
         match self.senders.lookup(local_queue_id, (), |sender, ()| {
             Ok(sender.validate_stream(params))
@@ -431,7 +393,7 @@ where
     pub fn validate_control(
         &mut self,
         queue_id: VarInt,
-        params: &K::Request,
+        params: &VarInt,
     ) -> Result<(), ValidateError> {
         match self.senders.lookup(queue_id, (), |sender, ()| {
             Ok(sender.validate_control(params))

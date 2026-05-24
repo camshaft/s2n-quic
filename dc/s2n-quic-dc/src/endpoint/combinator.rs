@@ -665,7 +665,6 @@ pub(crate) struct AssemblerCounters {
     pub tx_payload_size: crate::counter::Summary,
 
     // Per-frame-type TX counters (one per transmitted frame, all phases).
-    pub tx_frame_queue_bind: crate::counter::Counter,
     pub tx_frame_queue_data: crate::counter::Counter,
     pub tx_frame_queue_data_fin: crate::counter::Counter,
     pub tx_frame_queue_control: crate::counter::Counter,
@@ -675,7 +674,6 @@ pub(crate) struct AssemblerCounters {
     pub tx_frame_ack: crate::counter::Counter,
 
     // Per-frame-type probe TX counters (Phase 2 retransmit + Phase 3 PTO bypass).
-    pub tx_probe_frame_queue_bind: crate::counter::Counter,
     pub tx_probe_frame_queue_data: crate::counter::Counter,
     pub tx_probe_frame_queue_data_fin: crate::counter::Counter,
     pub tx_probe_frame_queue_control: crate::counter::Counter,
@@ -699,7 +697,6 @@ impl AssemblerCounters {
             tx_payload_size: registry
                 .register_summary("tx.payload_size", crate::counter::Unit::Byte),
 
-            tx_frame_queue_bind: registry.register_nominal("tx.frame", "queue_bind"),
             tx_frame_queue_data: registry.register_nominal("tx.frame", "queue_data"),
             tx_frame_queue_data_fin: registry.register_nominal("tx.frame", "queue_data_fin"),
             tx_frame_queue_control: registry.register_nominal("tx.frame", "queue_control"),
@@ -708,7 +705,6 @@ impl AssemblerCounters {
             tx_frame_queue_free: registry.register_nominal("tx.frame", "queue_free"),
             tx_frame_ack: registry.register_nominal("tx.frame", "ack"),
 
-            tx_probe_frame_queue_bind: registry.register_nominal("tx.probe.frame", "queue_bind"),
             tx_probe_frame_queue_data: registry.register_nominal("tx.probe.frame", "queue_data"),
             tx_probe_frame_queue_data_fin: registry
                 .register_nominal("tx.probe.frame", "queue_data_fin"),

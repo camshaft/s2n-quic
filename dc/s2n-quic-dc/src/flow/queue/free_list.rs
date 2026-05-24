@@ -14,14 +14,14 @@ use std::{
 };
 
 /// Callback which releases a descriptor back into the free list
-pub(super) trait FreeList<S, C, Key>: 'static + Send + Sync {
+pub(super) trait FreeList<S, C>: 'static + Send + Sync {
     /// Frees a descriptor back into the free list
     ///
     /// Once the free list has been closed and all descriptors returned, the `free` function
     /// should return an object that can be dropped to release all of the memory associated
     /// with the descriptor pool. This works around any issues around the "Stacked Borrows"
     /// model by deferring freeing memory borrowed by `self`.
-    fn free(&self, descriptor: Descriptor<S, C, Key>) -> Option<Box<dyn 'static + Send>>;
+    fn free(&self, descriptor: Descriptor<S, C>) -> Option<Box<dyn 'static + Send>>;
 }
 
 /// A free list of unfilled descriptors with O(1) indexed allocation.
@@ -29,13 +29,13 @@ pub(super) trait FreeList<S, C, Key>: 'static + Send + Sync {
 /// Descriptors are stored in a direct-indexed Vec (by slot index) for O(1) `alloc_at`.
 /// A separate VecDeque of free indices provides LIFO ordering for the unindexed `alloc`
 /// path, preferring recently-freed descriptors for cache locality.
-pub(super) struct FreeVec<S: 'static, C: 'static, Key: 'static> {
-    inner: Mutex<FreeInner<S, C, Key>>,
+pub(super) struct FreeVec<S: 'static, C: 'static> {
+    inner: Mutex<FreeInner<S, C>>,
 }
 
-impl<S: 'static, C: 'static, Key: 'static> FreeVec<S, C, Key> {
+impl<S: 'static, C: 'static> FreeVec<S, C> {
     #[inline]
-    pub fn new(initial_cap: usize) -> (Arc<Self>, Arc<Memory<S, C, Key>>) {
+    pub fn new(initial_cap: usize) -> (Arc<Self>, Arc<Memory<S, C>>) {
         let slots = Vec::with_capacity(initial_cap);
         let free_indices = VecDeque::with_capacity(initial_cap);
         let regions = Vec::with_capacity(1);
@@ -58,10 +58,9 @@ impl<S: 'static, C: 'static, Key: 'static> FreeVec<S, C, Key> {
     #[inline]
     pub fn alloc(
         &self,
-        key: Key,
+        key: crate::flow::Handle,
         remote_queue_id: Option<VarInt>,
-        binding_id: Option<VarInt>,
-    ) -> Result<(Control<S, C, Key>, Stream<S, C, Key>), Key> {
+    ) -> Result<(Control<S, C>, Stream<S, C>), crate::flow::Handle> {
         let mut inner = self.inner.lock().unwrap();
 
         // Skip indices that were already taken by alloc_at (lazy cleanup).
@@ -86,8 +85,7 @@ impl<S: 'static, C: 'static, Key: 'static> FreeVec<S, C, Key> {
         drop(inner);
 
         unsafe {
-            // SAFETY: the descriptor is only owned by the free list
-            descriptor.init_key(key, binding_id);
+            descriptor.init_key(key.binding_id);
             let (control, stream) = descriptor.into_receiver_pair(remote_queue_id);
             Ok((Control::new(control), Stream::new(stream)))
         }
@@ -103,10 +101,9 @@ impl<S: 'static, C: 'static, Key: 'static> FreeVec<S, C, Key> {
     pub fn alloc_at(
         &self,
         slot_index: usize,
-        key: Key,
+        key: crate::flow::Handle,
         remote_queue_id: Option<VarInt>,
-        binding_id: Option<VarInt>,
-    ) -> Result<(Control<S, C, Key>, Stream<S, C, Key>), Key> {
+    ) -> Result<(Control<S, C>, Stream<S, C>), crate::flow::Handle> {
         let mut inner = self.inner.lock().unwrap();
 
         if slot_index >= inner.slots.len() {
@@ -129,7 +126,7 @@ impl<S: 'static, C: 'static, Key: 'static> FreeVec<S, C, Key> {
         drop(inner);
 
         unsafe {
-            descriptor.init_key(key, binding_id);
+            descriptor.init_key(key.binding_id);
             let (control, stream) = descriptor.into_receiver_pair(remote_queue_id);
             Ok((Control::new(control), Stream::new(stream)))
         }
@@ -138,8 +135,8 @@ impl<S: 'static, C: 'static, Key: 'static> FreeVec<S, C, Key> {
     #[inline]
     pub fn record_region(
         &self,
-        region: Region<S, C, Key>,
-        descriptors: Vec<Descriptor<S, C, Key>>,
+        region: Region<S, C>,
+        descriptors: Vec<Descriptor<S, C>>,
     ) {
         let mut inner = self.inner.lock().unwrap();
         inner.regions.push(region);
@@ -151,7 +148,7 @@ impl<S: 'static, C: 'static, Key: 'static> FreeVec<S, C, Key> {
         let count = descriptors.len();
         inner.slots.resize_with(next, || None);
         for descriptor in descriptors {
-            let idx = unsafe { descriptor.queue_id_index() };
+            let idx = descriptor.slot_index();
             debug_assert!(inner.slots[idx].is_none());
             inner.slots[idx] = Some(descriptor);
             inner.free_indices.push_back(idx);
@@ -163,7 +160,7 @@ impl<S: 'static, C: 'static, Key: 'static> FreeVec<S, C, Key> {
     }
 
     #[inline]
-    fn try_free(&self) -> Option<FreeInner<S, C, Key>> {
+    fn try_free(&self) -> Option<FreeInner<S, C>> {
         let mut inner = self.inner.lock().unwrap();
         inner.open = false;
         inner.try_free()
@@ -174,23 +171,22 @@ impl<S: 'static, C: 'static, Key: 'static> FreeVec<S, C, Key> {
 ///
 /// Once dropped, the pool and all associated descriptors will be
 /// freed after the last handle is dropped.
-pub(super) struct Memory<S: 'static, C: 'static, Key: 'static>(Arc<FreeVec<S, C, Key>>);
+pub(super) struct Memory<S: 'static, C: 'static>(Arc<FreeVec<S, C>>);
 
-impl<S: 'static, C: 'static, Key: 'static> Drop for Memory<S, C, Key> {
+impl<S: 'static, C: 'static> Drop for Memory<S, C> {
     #[inline]
     fn drop(&mut self) {
         drop(self.0.try_free());
     }
 }
 
-impl<S, C, Key> FreeList<S, C, Key> for FreeVec<S, C, Key>
+impl<S, C> FreeList<S, C> for FreeVec<S, C>
 where
     S: 'static + Send + Sync,
     C: 'static + Send + Sync,
-    Key: 'static + Send + Sync,
 {
     #[inline]
-    fn free(&self, descriptor: Descriptor<S, C, Key>) -> Option<Box<dyn 'static + Send>> {
+    fn free(&self, descriptor: Descriptor<S, C>) -> Option<Box<dyn 'static + Send>> {
         let mut inner = self.inner.lock().unwrap();
 
         #[cfg(debug_assertions)]
@@ -201,7 +197,7 @@ where
             inner.active
         );
 
-        let idx = unsafe { descriptor.queue_id_index() };
+        let idx = descriptor.slot_index();
         debug_assert!(inner.slots[idx].is_none());
         inner.slots[idx] = Some(descriptor);
         inner.free_indices.push_back(idx);
@@ -216,13 +212,13 @@ where
     }
 }
 
-struct FreeInner<S: 'static, C: 'static, Key: 'static> {
+struct FreeInner<S: 'static, C: 'static> {
     /// Direct-indexed storage: slot i holds `Some(descriptor)` when free, `None` when allocated.
-    slots: Vec<Option<Descriptor<S, C, Key>>>,
+    slots: Vec<Option<Descriptor<S, C>>>,
     /// LIFO ordering of free slot indices for `alloc` (most recently freed at back).
     /// May contain stale entries for slots already taken by `alloc_at`.
     free_indices: VecDeque<usize>,
-    regions: Vec<Region<S, C, Key>>,
+    regions: Vec<Region<S, C>>,
     total: usize,
     /// Number of descriptors currently in the free list (slots that are Some).
     free_count: usize,
@@ -231,7 +227,7 @@ struct FreeInner<S: 'static, C: 'static, Key: 'static> {
     active: std::collections::BTreeSet<usize>,
 }
 
-impl<S: 'static, C: 'static, Key: 'static> FreeInner<S, C, Key> {
+impl<S: 'static, C: 'static> FreeInner<S, C> {
     #[inline(never)] // this is rarely called
     fn try_free(&mut self) -> Option<Self> {
         #[cfg(debug_assertions)]
@@ -259,7 +255,7 @@ impl<S: 'static, C: 'static, Key: 'static> FreeInner<S, C, Key> {
     }
 }
 
-impl<S: 'static, C: 'static, Key: 'static> Drop for FreeInner<S, C, Key> {
+impl<S: 'static, C: 'static> Drop for FreeInner<S, C> {
     #[inline]
     fn drop(&mut self) {
         if self.free_count == 0 {

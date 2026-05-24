@@ -15,13 +15,13 @@ use s2n_quic_core::varint::VarInt;
 
 macro_rules! impl_recv {
     ($name:ident, $field:ident, $half:expr, $type_param:ident) => {
-        pub struct $name<S: 'static, C: 'static, Key: 'static> {
-            descriptor: Descriptor<S, C, Key>,
+        pub struct $name<S: 'static, C: 'static> {
+            descriptor: Descriptor<S, C>,
         }
 
-        impl<S: 'static, C: 'static, Key: 'static> $name<S, C, Key> {
+        impl<S: 'static, C: 'static> $name<S, C> {
             #[inline]
-            pub(super) fn new(descriptor: Descriptor<S, C, Key>) -> Self {
+            pub(super) fn new(descriptor: Descriptor<S, C>) -> Self {
                 Self { descriptor }
             }
 
@@ -112,7 +112,7 @@ macro_rules! impl_recv {
             }
         }
 
-        impl<S: 'static, C: 'static, Key: 'static> fmt::Debug for $name<S, C, Key> {
+        impl<S: 'static, C: 'static> fmt::Debug for $name<S, C> {
             fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
                 f.debug_struct(stringify!($name))
                     .field("queue_id", &self.queue_id())
@@ -120,7 +120,7 @@ macro_rules! impl_recv {
             }
         }
 
-        impl<S: 'static, C: 'static, Key: 'static> Drop for $name<S, C, Key> {
+        impl<S: 'static, C: 'static> Drop for $name<S, C> {
             #[inline]
             fn drop(&mut self) {
                 unsafe {
@@ -134,11 +134,11 @@ macro_rules! impl_recv {
 impl_recv!(Control, control_queue, Half::Control, C);
 impl_recv!(Stream, stream_queue, Half::Stream, S);
 
-pub struct Sender<S: 'static, C: 'static, Key: 'static> {
-    descriptor: Descriptor<S, C, Key>,
+pub struct Sender<S: 'static, C: 'static> {
+    descriptor: Descriptor<S, C>,
 }
 
-impl<S: 'static, C: 'static, Key: 'static> Clone for Sender<S, C, Key> {
+impl<S: 'static, C: 'static> Clone for Sender<S, C> {
     #[inline]
     fn clone(&self) -> Self {
         unsafe {
@@ -149,9 +149,9 @@ impl<S: 'static, C: 'static, Key: 'static> Clone for Sender<S, C, Key> {
     }
 }
 
-impl<S: 'static, C: 'static, Key: 'static> Sender<S, C, Key> {
+impl<S: 'static, C: 'static> Sender<S, C> {
     #[inline]
-    pub(super) fn new(descriptor: Descriptor<S, C, Key>) -> Self {
+    pub(super) fn new(descriptor: Descriptor<S, C>) -> Self {
         Self { descriptor }
     }
 
@@ -162,9 +162,8 @@ impl<S: 'static, C: 'static, Key: 'static> Sender<S, C, Key> {
     }
 
     #[inline]
-    pub(super) fn try_queue_id(&self) -> Option<VarInt> {
-        // SAFETY: `Sender` holds a sender reference for a live descriptor handle.
-        unsafe { self.descriptor.try_queue_id() }
+    pub(super) fn is_allocated(&self) -> bool {
+        unsafe { self.descriptor.is_allocated() }
     }
 
     #[inline]
@@ -172,10 +171,8 @@ impl<S: 'static, C: 'static, Key: 'static> Sender<S, C, Key> {
         &self,
         entry: intrusive::Entry<S>,
         remote_queue_id: Option<VarInt>,
-        params: &<Key as super::descriptor::Key>::Request,
+        params: &s2n_quic_core::varint::VarInt,
     ) -> Result<AutoWake, Error<intrusive::Entry<S>>>
-    where
-        Key: super::descriptor::Key,
     {
         unsafe {
             let waker = self.descriptor.stream_queue().push(
@@ -200,10 +197,8 @@ impl<S: 'static, C: 'static, Key: 'static> Sender<S, C, Key> {
         &self,
         entry: intrusive::Entry<C>,
         remote_queue_id: Option<VarInt>,
-        params: &<Key as super::descriptor::Key>::Request,
+        params: &s2n_quic_core::varint::VarInt,
     ) -> Result<AutoWake, Error<intrusive::Entry<C>>>
-    where
-        Key: super::descriptor::Key,
     {
         unsafe {
             let waker = self.descriptor.control_queue().push(
@@ -232,11 +227,8 @@ impl<S: 'static, C: 'static, Key: 'static> Sender<S, C, Key> {
         &self,
         entry: intrusive::Entry<S>,
         remote_queue_id: Option<VarInt>,
-        params: &<Key as super::descriptor::Key>::Request,
-        new_key: impl FnOnce() -> Key,
+        params: &s2n_quic_core::varint::VarInt,
     ) -> Result<(AutoWake, super::descriptor::ServerValidation), Error<intrusive::Entry<S>>>
-    where
-        Key: super::descriptor::Key,
     {
         unsafe {
             let (waker, result) = self.descriptor.stream_queue().push_with_result(
@@ -249,7 +241,7 @@ impl<S: 'static, C: 'static, Key: 'static> Sender<S, C, Key> {
                         false
                     }
                 },
-                || self.descriptor.validate_or_bind(params, new_key),
+                || self.descriptor.validate_or_bind(params),
             )?;
             probes::on_send(self.queue_id(), Half::Stream, false);
             Ok((waker, result))
@@ -291,10 +283,8 @@ impl<S: 'static, C: 'static, Key: 'static> Sender<S, C, Key> {
     #[inline]
     pub fn validate_stream(
         &self,
-        params: &<Key as super::descriptor::Key>::Request,
+        params: &s2n_quic_core::varint::VarInt,
     ) -> Result<(), super::ValidateError>
-    where
-        Key: super::descriptor::Key,
     {
         unsafe {
             self.descriptor
@@ -308,10 +298,8 @@ impl<S: 'static, C: 'static, Key: 'static> Sender<S, C, Key> {
     #[inline]
     pub fn validate_control(
         &self,
-        params: &<Key as super::descriptor::Key>::Request,
+        params: &s2n_quic_core::varint::VarInt,
     ) -> Result<(), super::ValidateError>
-    where
-        Key: super::descriptor::Key,
     {
         unsafe {
             self.descriptor
@@ -323,7 +311,7 @@ impl<S: 'static, C: 'static, Key: 'static> Sender<S, C, Key> {
     }
 }
 
-impl<S: 'static, C: 'static, Key: 'static> Drop for Sender<S, C, Key> {
+impl<S: 'static, C: 'static> Drop for Sender<S, C> {
     #[inline]
     fn drop(&mut self) {
         unsafe {

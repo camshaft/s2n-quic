@@ -4,7 +4,6 @@ use super::{
     descriptor::{Descriptor, DescriptorInner},
     free_list::{self, FreeVec},
     handle::{Control, Sender, Stream},
-    queue_id,
     sender::{self, Senders},
 };
 use crate::{counter, tracing::*};
@@ -14,23 +13,20 @@ use std::{alloc::Layout, marker::PhantomData, ptr::NonNull, sync::Arc};
 pub struct Pool<
     S: 'static + Send,
     C: 'static + Send,
-    Key: 'static + Send,
     const INITIAL_PAGE_SIZE: usize,
 > {
-    pub(super) senders: Arc<sender::State<S, C, Key>>,
-    free: Arc<FreeVec<S, C, Key>>,
+    pub(super) senders: Arc<sender::State<S, C>>,
+    free: Arc<FreeVec<S, C>>,
     /// Holds the backing memory allocated as long as there's at least one reference
-    memory_handle: Arc<free_list::Memory<S, C, Key>>,
+    memory_handle: Arc<free_list::Memory<S, C>>,
     epoch_summary: Option<counter::Summary>,
     epoch: usize,
     /// Optional sink for freed-slot notifications (server-side QueueFree emission).
     pub(super) free_notify: Option<Arc<super::descriptor::FreeNotify>>,
-    /// Optional deferred waker sink, shared by all descriptors in this pool.
-    pub(super) waker_sink: Option<Arc<dyn super::descriptor::WakerSink>>,
 }
 
-impl<S: 'static + Send, C: 'static + Send, Key: 'static + Send, const INITIAL_PAGE_SIZE: usize>
-    Clone for Pool<S, C, Key, INITIAL_PAGE_SIZE>
+impl<S: 'static + Send, C: 'static + Send, const INITIAL_PAGE_SIZE: usize>
+    Clone for Pool<S, C, INITIAL_PAGE_SIZE>
 {
     #[inline]
     fn clone(&self) -> Self {
@@ -41,35 +37,20 @@ impl<S: 'static + Send, C: 'static + Send, Key: 'static + Send, const INITIAL_PA
             epoch_summary: self.epoch_summary.clone(),
             epoch: self.epoch,
             free_notify: self.free_notify.clone(),
-            waker_sink: self.waker_sink.clone(),
         }
     }
 }
 
-impl<S, C, Key, const INITIAL_PAGE_SIZE: usize> Pool<S, C, Key, INITIAL_PAGE_SIZE>
+impl<S, C, const INITIAL_PAGE_SIZE: usize> Pool<S, C, INITIAL_PAGE_SIZE>
 where
     S: 'static + Send + Sync,
     C: 'static + Send + Sync,
-    Key: 'static + Send + Sync,
 {
     #[inline]
     pub fn new(epoch_summary: Option<counter::Summary>) -> Self {
         Self::with_options(
             epoch_summary,
             Some(Arc::new(super::descriptor::FreeNotify::new())),
-            None,
-        )
-    }
-
-    #[inline]
-    pub fn new_with_waker_sink(
-        epoch_summary: Option<counter::Summary>,
-        waker_sink: Arc<dyn super::descriptor::WakerSink>,
-    ) -> Self {
-        Self::with_options(
-            epoch_summary,
-            Some(Arc::new(super::descriptor::FreeNotify::new())),
-            Some(waker_sink),
         )
     }
 
@@ -77,7 +58,6 @@ where
     fn with_options(
         epoch_summary: Option<counter::Summary>,
         free_notify: Option<Arc<super::descriptor::FreeNotify>>,
-        waker_sink: Option<Arc<dyn super::descriptor::WakerSink>>,
     ) -> Self {
         let epoch = 0;
         let senders = sender::State::new(epoch);
@@ -89,14 +69,13 @@ where
             epoch_summary,
             epoch,
             free_notify,
-            waker_sink,
         };
         pool.grow();
         pool
     }
 
     #[inline]
-    pub fn senders(&self) -> Senders<S, C, Key, INITIAL_PAGE_SIZE> {
+    pub fn senders(&self) -> Senders<S, C, INITIAL_PAGE_SIZE> {
         Senders {
             state: self.senders.clone(),
             // make sure the memory lives as long as this sender is alive
@@ -108,22 +87,20 @@ where
     #[inline]
     pub fn alloc(
         &self,
-        key: Key,
+        key: crate::flow::Handle,
         remote_queue_id: Option<VarInt>,
-        binding_id: Option<VarInt>,
-    ) -> Result<(Control<S, C, Key>, Stream<S, C, Key>), Key> {
-        self.free.alloc(key, remote_queue_id, binding_id)
+    ) -> Result<(Control<S, C>, Stream<S, C>), crate::flow::Handle> {
+        self.free.alloc(key, remote_queue_id)
     }
 
     #[inline]
     pub fn alloc_or_grow(
         &mut self,
-        mut key: Key,
+        mut key: crate::flow::Handle,
         remote_queue_id: Option<VarInt>,
-        binding_id: Option<VarInt>,
-    ) -> (Control<S, C, Key>, Stream<S, C, Key>) {
+    ) -> (Control<S, C>, Stream<S, C>) {
         loop {
-            match self.alloc(key, remote_queue_id, binding_id) {
+            match self.alloc(key, remote_queue_id) {
                 Ok(descriptor) => return descriptor,
                 Err(k) => {
                     key = k;
@@ -140,12 +117,11 @@ where
     pub fn alloc_at_or_grow(
         &mut self,
         slot_index: usize,
-        mut key: Key,
+        mut key: crate::flow::Handle,
         remote_queue_id: Option<VarInt>,
-        binding_id: Option<VarInt>,
-    ) -> (Control<S, C, Key>, Stream<S, C, Key>) {
+    ) -> (Control<S, C>, Stream<S, C>) {
         loop {
-            match self.free.alloc_at(slot_index, key, remote_queue_id, binding_id) {
+            match self.free.alloc_at(slot_index, key, remote_queue_id) {
                 Ok(descriptor) => return descriptor,
                 Err(k) => {
                     key = k;
@@ -166,8 +142,9 @@ where
         // Page sizes double with each grow: page 0 has INITIAL_PAGE_SIZE slots,
         // page 1 has 2×, page 2 has 4×, etc.  After n grows the epoch is
         // (2^(n+1) − 1) × INITIAL_PAGE_SIZE, so the next page size is always
-        // epoch + INITIAL_PAGE_SIZE (capped at remaining slot space).
-        let page_size = (self.epoch + INITIAL_PAGE_SIZE).min(queue_id::MAX_SLOTS - self.epoch);
+        // epoch + INITIAL_PAGE_SIZE. VarInt::MAX provides the upper bound.
+        let max_slots = VarInt::MAX.as_u64() as usize;
+        let page_size = (self.epoch + INITIAL_PAGE_SIZE).min(max_slots - self.epoch);
         assert!(page_size > 0, "flow queue slot space exhausted");
 
         let (region, layout) = Region::alloc(page_size);
@@ -184,7 +161,7 @@ where
                 let descriptor = ptr
                     .as_ptr()
                     .add(offset)
-                    .cast::<DescriptorInner<S, C, Key>>();
+                    .cast::<DescriptorInner<S, C>>();
 
                 // Give the descriptor a non-`Strong` reference to the free list, since this will be the
                 // last reference to get dropped.
@@ -195,7 +172,6 @@ where
                     self.epoch + idx,
                     free_list,
                     self.free_notify.clone(),
-                    self.waker_sink.clone(),
                 ));
 
                 let descriptor = NonNull::new_unchecked(descriptor);
@@ -254,22 +230,22 @@ where
     }
 }
 
-pub(super) struct Region<S: 'static, C: 'static, Key: 'static> {
+pub(super) struct Region<S: 'static, C: 'static> {
     ptr: NonNull<u8>,
     layout: Layout,
-    phantom: PhantomData<(S, C, Key)>,
+    phantom: PhantomData<(S, C)>,
 }
 
-unsafe impl<S: Send, C: Send, Key: Send> Send for Region<S, C, Key> {}
-unsafe impl<S: Sync, C: Sync, Key: Sync> Sync for Region<S, C, Key> {}
+unsafe impl<S: Send, C: Send> Send for Region<S, C> {}
+unsafe impl<S: Sync, C: Sync> Sync for Region<S, C> {}
 
-impl<S: 'static, C: 'static, Key: 'static> Region<S, C, Key> {
+impl<S: 'static, C: 'static> Region<S, C> {
     #[inline]
     fn alloc(page_size: usize) -> (Self, Layout) {
         debug_assert!(page_size > 0, "need at least 1 entry in page");
 
         // first create the descriptor layout
-        let descriptor = Layout::new::<DescriptorInner<S, C, Key>>().pad_to_align();
+        let descriptor = Layout::new::<DescriptorInner<S, C>>().pad_to_align();
 
         let descriptors = {
             // TODO use `descriptor.repeat(page_size)` once stable
@@ -299,7 +275,7 @@ impl<S: 'static, C: 'static, Key: 'static> Region<S, C, Key> {
     }
 }
 
-impl<S, C, Key> Drop for Region<S, C, Key> {
+impl<S, C> Drop for Region<S, C> {
     #[inline]
     fn drop(&mut self) {
         unsafe {

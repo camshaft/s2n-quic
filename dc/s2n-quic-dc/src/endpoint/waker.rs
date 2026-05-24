@@ -12,7 +12,7 @@
 //! The drain task swaps the Vec out in O(1) and iterates the local copy.
 
 use crate::{
-    flow::queue::{AutoWake, WakerSink},
+    flow::queue::AutoWake,
     socket::channel,
 };
 use core::task::{Poll, Waker};
@@ -69,12 +69,6 @@ impl Slot {
         {
             guard.drain_waker = Some(cx.waker().clone());
         }
-    }
-}
-
-impl WakerSink for Slot {
-    fn defer_wake(&self, waker: Waker) {
-        self.push(waker);
     }
 }
 
