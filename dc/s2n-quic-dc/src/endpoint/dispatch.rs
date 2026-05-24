@@ -301,27 +301,26 @@ where
             enqueue_pending_ack = true;
         }
     }
-    // Emit QueueFree frames for any slots freed during this dispatch cycle.
-    let freed = peer.queue_dispatcher.drain_freed();
-    if !freed.is_empty() {
-        // TODO mark/encode QueueFree ranges the way ACKs do so high-TPS paths
-        // can collapse many releases into fewer frames.
-        for slot in &freed {
-            let frame = Frame {
-                source_sender_id: LocalSenderId::UNSPECIFIED,
-                header: crate::endpoint::frame::Header::QueueFree {
-                    binding_id: slot.binding_id,
-                    largest_queue_id: slot.queue_id,
-                },
-                payload: crate::byte_vec::ByteVec::new(),
-                path_secret_entry: peer.path_entry.clone(),
-                completion: None,
-                status: crate::endpoint::frame::TransmissionStatus::default(),
-                ttl: crate::endpoint::frame::DEFAULT_TTL,
-                transmission_time: None,
-            };
-            response_frames.push(Entry::new(frame));
-        }
+    // Emit QueueFree frame for any slots freed during this dispatch cycle.
+    if let Some((free_request_id, queue_ids)) = peer.queue_dispatcher.drain_freed() {
+        let largest_queue_id = queue_ids
+            .max_value()
+            .unwrap_or(s2n_quic_core::varint::VarInt::ZERO);
+        // TODO: encode range set into payload for multi-slot batches
+        let frame = Frame {
+            source_sender_id: LocalSenderId::UNSPECIFIED,
+            header: crate::endpoint::frame::Header::QueueFree {
+                free_request_id,
+                largest_queue_id,
+            },
+            payload: crate::byte_vec::ByteVec::new(),
+            path_secret_entry: peer.path_entry.clone(),
+            completion: None,
+            status: crate::endpoint::frame::TransmissionStatus::default(),
+            ttl: crate::endpoint::frame::DEFAULT_TTL,
+            transmission_time: None,
+        };
+        response_frames.push(Entry::new(frame));
     }
 
     peer.invariants();
@@ -424,28 +423,24 @@ fn dispatch_decoded_frame(
             );
         }
         Header::QueueFree {
-            binding_id,
+            free_request_id,
             largest_queue_id,
         } => {
-            match peer.path_entry.on_peer_queue_freed(largest_queue_id, binding_id) {
+            // TODO: decode range set from payload for multi-slot batches.
+            // For now, treat largest_queue_id as the single freed queue_id.
+            let mut queue_ids = s2n_quic_core::interval_set::IntervalSet::new();
+            let _ = queue_ids.insert_value(largest_queue_id);
+            match peer.path_entry.on_peer_queue_freed(free_request_id, &queue_ids) {
                 crate::path::secret::map::PeerQueueFreeResult::Accepted => trace!(
-                    binding_id = binding_id.as_u64(),
+                    free_request_id = free_request_id.as_u64(),
                     queue_id = largest_queue_id.as_u64(),
                     "QueueFree received — slot returned to pool"
                 ),
                 crate::path::secret::map::PeerQueueFreeResult::Stale => trace!(
-                    binding_id = binding_id.as_u64(),
+                    free_request_id = free_request_id.as_u64(),
                     queue_id = largest_queue_id.as_u64(),
-                    "QueueFree received for an already-freed slot"
+                    "QueueFree received — duplicate request_id"
                 ),
-                crate::path::secret::map::PeerQueueFreeResult::Future => {
-                    counters.rx_queue_free_future_binding.add(1);
-                    error!(
-                        binding_id = binding_id.as_u64(),
-                        queue_id = largest_queue_id.as_u64(),
-                        "BUG: QueueFree received for a future binding"
-                    );
-                }
             }
         }
         Header::Ack {

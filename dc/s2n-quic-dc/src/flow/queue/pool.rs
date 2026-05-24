@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 use super::{
     descriptor::{Descriptor, DescriptorInner},
-    free_list::{self, FreeVec},
+    free_list::{self, ClientFreeList, FreeVec, ServerFreeList},
     handle::{Control, Sender, Stream},
     sender::{self, Senders},
 };
@@ -21,6 +21,7 @@ pub struct Pool<
     memory_handle: Arc<free_list::Memory<S, C>>,
     epoch_summary: Option<counter::Summary>,
     epoch: usize,
+    server: bool,
 }
 
 impl<S: 'static + Send, C: 'static + Send, const INITIAL_PAGE_SIZE: usize>
@@ -34,6 +35,7 @@ impl<S: 'static + Send, C: 'static + Send, const INITIAL_PAGE_SIZE: usize>
             senders: self.senders.clone(),
             epoch_summary: self.epoch_summary.clone(),
             epoch: self.epoch,
+            server: self.server,
         }
     }
 }
@@ -43,28 +45,30 @@ where
     S: 'static + Send + Sync,
     C: 'static + Send + Sync,
 {
+    /// Create a server-side pool that records freed queue_ids for QueueFree emission.
     #[inline]
     pub fn new(epoch_summary: Option<counter::Summary>) -> Self {
-        Self::with_options(
-            epoch_summary,
-            Some(Arc::new(super::descriptor::FreeNotify::new())),
-        )
+        Self::with_options(epoch_summary, true)
+    }
+
+    /// Create a client-side pool that silently recycles descriptors.
+    #[inline]
+    pub fn new_client(epoch_summary: Option<counter::Summary>) -> Self {
+        Self::with_options(epoch_summary, false)
     }
 
     #[inline]
-    fn with_options(
-        epoch_summary: Option<counter::Summary>,
-        free_notify: Option<Arc<super::descriptor::FreeNotify>>,
-    ) -> Self {
+    fn with_options(epoch_summary: Option<counter::Summary>, server: bool) -> Self {
         let epoch = 0;
         let senders = sender::State::new(epoch);
-        let (free, memory_handle) = FreeVec::new(INITIAL_PAGE_SIZE, free_notify);
+        let (free, memory_handle) = FreeVec::new(INITIAL_PAGE_SIZE);
         let mut pool = Pool {
             free,
             memory_handle,
             senders,
             epoch_summary,
             epoch,
+            server,
         };
         pool.grow();
         pool
@@ -80,8 +84,8 @@ where
         }
     }
 
-    pub fn free_notify(&self) -> Option<Arc<super::descriptor::FreeNotify>> {
-        self.free.free_notify().cloned()
+    pub fn drain_pending_freed(&self) -> Option<(VarInt, s2n_quic_core::interval_set::IntervalSet<VarInt>)> {
+        self.free.drain_pending_freed()
     }
 
     #[inline]
@@ -165,9 +169,12 @@ where
                     .add(offset)
                     .cast::<DescriptorInner<S, C>>();
 
-                // Give the descriptor a non-`Strong` reference to the free list, since this will be the
-                // last reference to get dropped.
-                let free_list = self.free.clone();
+                // Give the descriptor a reference to the appropriate free list impl.
+                let free_list: Arc<dyn super::free_list::FreeList<S, C>> = if self.server {
+                    Arc::new(ServerFreeList(self.free.clone()))
+                } else {
+                    Arc::new(ClientFreeList(self.free.clone()))
+                };
 
                 // initialize the descriptor with the channels
                 descriptor.write(DescriptorInner::new(

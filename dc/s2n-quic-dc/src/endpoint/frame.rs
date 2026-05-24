@@ -392,11 +392,10 @@ pub enum Header {
     },
     /// Free queue slots (server→client credit return).
     ///
-    /// Uses ACK-style range encoding in the payload. The binding_id is
-    /// the binding_id of the largest_queue_id slot, making the frame
-    /// self-contained and preventing replay-based double-free.
+    /// Uses ACK-style range encoding in the payload. The free_request_id is
+    /// a monotonic stamp for receiver-side dedup of replayed/duplicate frames.
     QueueFree {
-        binding_id: VarInt,
+        free_request_id: VarInt,
         largest_queue_id: VarInt,
     },
     /// ACK frame with ack_delay lifted into the header (direct routing path).
@@ -551,11 +550,11 @@ impl EncoderValue for Header {
                 encoder.encode(error_code);
             }
             Self::QueueFree {
-                binding_id,
+                free_request_id,
                 largest_queue_id,
             } => {
                 encoder.encode(&Self::QUEUE_FREE_TYPE);
-                encoder.encode(binding_id);
+                encoder.encode(free_request_id);
                 encoder.encode(largest_queue_id);
             }
             Self::Ack {
@@ -664,11 +663,11 @@ impl<'a> s2n_codec::DecoderValue<'a> for Header {
                 ))
             }
             Self::QUEUE_FREE_TYPE => {
-                let (binding_id, buffer) = buffer.decode()?;
+                let (free_request_id, buffer) = buffer.decode()?;
                 let (largest_queue_id, buffer) = buffer.decode()?;
                 Ok((
                     Self::QueueFree {
-                        binding_id,
+                        free_request_id,
                         largest_queue_id,
                     },
                     buffer,

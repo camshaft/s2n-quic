@@ -1,19 +1,25 @@
 // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! MPMC free list channel for queue ID allocation.
+//! Client-side peer free list for tracking available server queue IDs.
 //!
-//! Multiple producer (dispatch threads push freed IDs via QueueFree) and
-//! multiple consumer (client tasks allocate dest_queue_ids for new streams).
+//! Tracks which server_queue_ids are available for allocation. Deduplicates
+//! QueueFree messages using a monotonic free_request_id tracked in an IntervalSet.
 //!
-//! The allocation model:
-//! - A high-water mark counter provides lock-free fresh ID allocation up to `initial_max_queues`
-//! - Once exhausted, consumers wait for recycled IDs pushed by producers
-//! - Producers push freed IDs which wake one waiting consumer
+//! Allocation model:
+//! - A high-water mark counter provides lock-free fresh ID allocation
+//! - Once exhausted, consumers wait for recycled IDs pushed via QueueFree
+//! - A HierarchicalBitSet provides O(4) pop_first for recycled IDs
+//!
+//! Dedup model:
+//! - Each QueueFree message from the server carries a monotonic free_request_id
+//! - The client tracks seen request IDs in an IntervalSet
+//! - Duplicate/replayed QueueFree messages are rejected without per-slot state
 
-use s2n_quic_core::varint::VarInt;
+use super::bitset::HierarchicalBitSet;
+use s2n_quic_core::{interval_set::IntervalSet, varint::VarInt};
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::VecDeque,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc, Mutex,
@@ -21,23 +27,20 @@ use std::{
     task::{Context, Poll, Waker},
 };
 
+const MAX_WAITERS: usize = 4096;
+
 #[derive(Debug)]
 pub struct FreeList {
     high_water_mark: AtomicU64,
-    max_queues: u64,
+    max_queues: AtomicU64,
     inner: Mutex<Inner>,
 }
 
-/// Maximum number of pending waiters to prevent unbounded growth under sustained exhaustion.
-const MAX_WAITERS: usize = 4096;
-
 struct Inner {
-    freed: VecDeque<VarInt>,
-    queued: HashSet<u64>,
-    /// Tracks the last freed binding_id per queue_id to reject duplicate QueueFree
-    /// messages. A QueueFree is only accepted if its binding_id > the last one freed
-    /// for that slot.
-    last_freed_binding: HashMap<u64, u64>,
+    /// Available server_queue_ids for O(4) pop_first.
+    freed: HierarchicalBitSet,
+    /// Tracks which free_request_ids have been processed for dedup.
+    seen_requests: IntervalSet<VarInt>,
     waiters: VecDeque<Waker>,
     closed: bool,
 }
@@ -46,7 +49,7 @@ impl std::fmt::Debug for Inner {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Inner")
             .field("freed_len", &self.freed.len())
-            .field("queued_len", &self.queued.len())
+            .field("seen_requests_count", &self.seen_requests.count())
             .field("waiters_len", &self.waiters.len())
             .field("closed", &self.closed)
             .finish()
@@ -55,27 +58,26 @@ impl std::fmt::Debug for Inner {
 
 impl FreeList {
     pub fn new(initial_max_queues: VarInt) -> Arc<Self> {
+        let max = initial_max_queues.as_u64();
+        let capacity = max.min(HierarchicalBitSet::MAX_CAPACITY as u64) as u32;
         Arc::new(Self {
             high_water_mark: AtomicU64::new(0),
-            max_queues: initial_max_queues.as_u64(),
+            max_queues: AtomicU64::new(max),
             inner: Mutex::new(Inner {
-                freed: VecDeque::new(),
-                queued: HashSet::new(),
-                last_freed_binding: HashMap::new(),
+                freed: HierarchicalBitSet::new(capacity.max(1)),
+                seen_requests: IntervalSet::new(),
                 waiters: VecDeque::new(),
                 closed: false,
             }),
         })
     }
 
-    /// Try to allocate a fresh ID from the high-water mark using a CAS loop.
-    ///
-    /// Returns `Some(id)` on success, `None` if the mark has reached max_queues.
     #[inline]
     fn try_alloc_fresh(&self) -> Option<VarInt> {
         loop {
             let current = self.high_water_mark.load(Ordering::Relaxed);
-            if current >= self.max_queues {
+            let max = self.max_queues.load(Ordering::Relaxed);
+            if current >= max {
                 return None;
             }
             match self.high_water_mark.compare_exchange_weak(
@@ -90,24 +92,16 @@ impl FreeList {
         }
     }
 
-    /// Try to allocate a queue ID without blocking.
-    ///
-    /// Returns `Some(id)` if a fresh or recycled ID is available, `None` if exhausted.
     pub fn try_alloc(&self) -> Option<VarInt> {
         if let Some(id) = self.try_alloc_fresh() {
             return Some(id);
         }
 
         let mut inner = self.inner.lock().unwrap();
-        let id = inner.freed.pop_front()?;
-        inner.queued.remove(&id.as_u64());
-        Some(id)
+        let index = inner.freed.pop_first()?;
+        VarInt::new(index as u64).ok()
     }
 
-    /// Poll for a queue ID allocation (async path).
-    ///
-    /// Fast path: try high-water mark increment (lock-free CAS).
-    /// Slow path: try freed list, or register waker and return Pending.
     pub fn poll_alloc(&self, cx: &mut Context) -> Poll<Option<VarInt>> {
         if let Some(id) = self.try_alloc_fresh() {
             return Poll::Ready(Some(id));
@@ -117,13 +111,10 @@ impl FreeList {
         if inner.closed {
             return Poll::Ready(None);
         }
-        if let Some(id) = inner.freed.pop_front() {
-            inner.queued.remove(&id.as_u64());
-            return Poll::Ready(Some(id));
+        if let Some(index) = inner.freed.pop_first() {
+            return Poll::Ready(VarInt::new(index as u64).ok());
         }
 
-        // Cap waiter queue to prevent unbounded growth under sustained exhaustion.
-        // Wake the evicted task so it can re-register rather than hanging forever.
         let evicted = if inner.waiters.len() >= MAX_WAITERS {
             inner.waiters.pop_front()
         } else {
@@ -137,33 +128,49 @@ impl FreeList {
         Poll::Pending
     }
 
-    /// Push a freed queue ID back into the pool.
+    /// Process a QueueFree message from the server.
     ///
-    /// Only accepts the free if `binding_id` is strictly greater than the last
-    /// freed binding_id for this slot. This prevents duplicate QueueFree packets
-    /// (from network retransmission/duplication) from double-freeing a slot that
-    /// has already been recycled and assigned to a new stream.
+    /// Returns true if the message was accepted (new free_request_id), false if
+    /// it was a duplicate/replay.
     ///
-    /// Wakes one waiting consumer if any are registered.
-    pub fn free(&self, id: VarInt, binding_id: VarInt) -> bool {
+    /// `free_request_id` is the server's monotonic stamp for this QueueFree batch.
+    /// `queue_ids` is the IntervalSet of queue_ids being freed.
+    pub fn free(&self, free_request_id: VarInt, queue_ids: &IntervalSet<VarInt>) -> bool {
         let mut inner = self.inner.lock().unwrap();
-        let last = inner
-            .last_freed_binding
-            .get(&id.as_u64())
-            .copied()
-            .unwrap_or(0);
-        if binding_id.as_u64() <= last {
+
+        // Dedup: reject if we've already seen this free_request_id
+        if inner.seen_requests.contains(&free_request_id) {
             return false;
         }
-        inner
-            .last_freed_binding
-            .insert(id.as_u64(), binding_id.as_u64());
-        if !inner.queued.insert(id.as_u64()) {
-            return false;
+        let _ = inner.seen_requests.insert_value(free_request_id);
+
+        // Insert all freed queue_ids into the available set
+        let mut woke = false;
+        for range in queue_ids.inclusive_ranges() {
+            let start = range.start().as_u64() as u32;
+            let end = range.end().as_u64() as u32;
+            for id in start..=end {
+                // Grow bitset if needed
+                let needed = id + 1;
+                if needed > inner.freed.capacity() {
+                    inner.freed.grow(needed);
+                }
+                inner.freed.insert(id);
+            }
+            if !woke {
+                if let Some(waker) = inner.waiters.pop_front() {
+                    drop(inner);
+                    waker.wake();
+                    return true;
+                }
+                woke = true;
+            }
         }
-        inner.freed.push_back(id);
-        if let Some(waker) = inner.waiters.pop_front() {
-            drop(inner);
+
+        // Wake all waiters since we may have freed multiple slots
+        let waiters: Vec<_> = inner.waiters.drain(..).collect();
+        drop(inner);
+        for waker in waiters {
             waker.wake();
         }
         true
@@ -183,26 +190,61 @@ impl FreeList {
 #[cfg(test)]
 mod tests {
     use super::FreeList;
-    use s2n_quic_core::varint::VarInt;
+    use s2n_quic_core::{interval_set::IntervalSet, varint::VarInt};
+
+    fn interval_set_single(id: VarInt) -> IntervalSet<VarInt> {
+        let mut set = IntervalSet::new();
+        let _ = set.insert_value(id);
+        set
+    }
 
     #[test]
-    fn duplicate_frees_are_idempotent() {
-        let list = FreeList::new(VarInt::from_u8(0));
-        let id = VarInt::from_u8(7);
-        let binding1 = VarInt::from_u8(1);
-        let binding2 = VarInt::from_u8(2);
+    fn fresh_allocation_up_to_max() {
+        let list = FreeList::new(VarInt::from_u8(3));
+        assert_eq!(list.try_alloc(), Some(VarInt::from_u8(0)));
+        assert_eq!(list.try_alloc(), Some(VarInt::from_u8(1)));
+        assert_eq!(list.try_alloc(), Some(VarInt::from_u8(2)));
+        assert_eq!(list.try_alloc(), None);
+    }
 
-        assert!(list.free(id, binding1));
-        // Same binding_id → rejected as duplicate
-        assert!(!list.free(id, binding1));
-
-        assert_eq!(list.try_alloc(), Some(id));
+    #[test]
+    fn free_and_recycle() {
+        let list = FreeList::new(VarInt::from_u8(2));
+        let id0 = list.try_alloc().unwrap();
+        let id1 = list.try_alloc().unwrap();
         assert_eq!(list.try_alloc(), None);
 
-        // After allocation, freeing with the SAME binding is rejected (stale duplicate)
-        assert!(!list.free(id, binding1));
-        // Freeing with a HIGHER binding succeeds (new cycle)
-        assert!(list.free(id, binding2));
-        assert_eq!(list.try_alloc(), Some(id));
+        // Free id1 with request_id=1
+        let ids = interval_set_single(id1);
+        assert!(list.free(VarInt::from_u8(1), &ids));
+        assert_eq!(list.try_alloc(), Some(id1));
+        assert_eq!(list.try_alloc(), None);
+
+        // Free both with request_id=2
+        let mut both = IntervalSet::new();
+        let _ = both.insert_value(id0);
+        let _ = both.insert_value(id1);
+        assert!(list.free(VarInt::from_u8(2), &both));
+        // pop_first returns lowest index first
+        assert_eq!(list.try_alloc(), Some(id0));
+        assert_eq!(list.try_alloc(), Some(id1));
+    }
+
+    #[test]
+    fn duplicate_request_ids_rejected() {
+        let list = FreeList::new(VarInt::from_u8(0));
+        let ids = interval_set_single(VarInt::from_u8(7));
+
+        // First free succeeds
+        assert!(list.free(VarInt::from_u8(1), &ids));
+        assert_eq!(list.try_alloc(), Some(VarInt::from_u8(7)));
+
+        // Same request_id rejected (replay)
+        assert!(!list.free(VarInt::from_u8(1), &ids));
+        assert_eq!(list.try_alloc(), None);
+
+        // New request_id succeeds
+        assert!(list.free(VarInt::from_u8(2), &ids));
+        assert_eq!(list.try_alloc(), Some(VarInt::from_u8(7)));
     }
 }

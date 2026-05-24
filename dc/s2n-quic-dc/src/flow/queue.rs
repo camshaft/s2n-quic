@@ -8,7 +8,6 @@
 //! `flow::Handle` (binding_id wrapper).
 use crate::{counter, flow::Handle, intrusive, tracing::*};
 use s2n_quic_core::varint::VarInt;
-use std::sync::Arc;
 
 mod descriptor;
 mod free_list;
@@ -19,7 +18,7 @@ mod probes;
 mod queue_id;
 mod sender;
 
-pub use descriptor::{FreeNotify, FreedSlot, ServerValidation, ValidationError};
+pub use descriptor::{ServerValidation, ValidationError};
 pub use inner::AutoWake;
 
 /// Size of the first allocated page of queue slots.
@@ -103,15 +102,10 @@ where
 
     #[inline]
     pub fn dispatcher(&self) -> Dispatch<S, C> {
-        let free_notify = self
-            .pool
-            .free_notify()
-            .unwrap_or_else(|| Arc::new(descriptor::FreeNotify::new()));
         Dispatch {
             senders: self.pool.senders(),
             is_open: true,
             pool: self.pool.clone(),
-            free_notify,
         }
     }
 
@@ -143,9 +137,6 @@ where
     senders: sender::Senders<S, C, INITIAL_PAGE_SIZE>,
     is_open: bool,
     pool: pool::Pool<S, C, INITIAL_PAGE_SIZE>,
-    /// Shared sink for freed-slot notifications. Populated by descriptor drop_receiver
-    /// when both queue halves close. Drained by the dispatch layer to emit QueueFree.
-    free_notify: Arc<descriptor::FreeNotify>,
 }
 
 impl<S, C> Clone for Dispatch<S, C>
@@ -158,7 +149,6 @@ where
             senders: self.senders.clone(),
             is_open: self.is_open,
             pool: self.pool.clone(),
-            free_notify: self.free_notify.clone(),
         }
     }
 }
@@ -200,13 +190,12 @@ where
         self.pool.alloc_at_or_grow(slot_index, key, remote_queue_id)
     }
 
-    /// Drain freed slots that have been released since the last call.
+    /// Drain freed queue_ids as an IntervalSet for range-compressed QueueFree emission.
     ///
-    /// Returns freed slot entries representing queue slots whose both stream and
-    /// control receivers have dropped. Used by the server to emit QueueFree frames.
-    /// Skips the mutex entirely when no items have been pushed (atomic fast-path).
-    pub fn drain_freed(&mut self) -> Vec<FreedSlot> {
-        self.free_notify.drain()
+    /// Returns `(free_request_id, queue_ids)` or None if no slots have been freed.
+    /// The free_request_id is stamped on the QueueFree frame for receiver-side dedup.
+    pub fn drain_freed(&self) -> Option<(VarInt, s2n_quic_core::interval_set::IntervalSet<VarInt>)> {
+        self.pool.drain_pending_freed()
     }
 
     #[inline]

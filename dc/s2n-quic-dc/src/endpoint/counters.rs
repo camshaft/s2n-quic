@@ -32,8 +32,6 @@ pub(crate) struct Dispatch {
     pub rx_flow_control_half_closed: Counter,
     pub rx_flow_control_binding_mismatch: Counter,
     pub rx_flow_control_perm_closed: Counter,
-    pub rx_queue_free_future_binding: Counter,
-
     pub rx_reset_both: Counter,
     pub rx_reset_stream: Counter,
     pub rx_reset_control: Counter,
@@ -99,7 +97,6 @@ impl Dispatch {
             rx_flow_control_binding_mismatch: counters
                 .register_nominal("!rx.flow_control", "binding_mismatch"),
             rx_flow_control_perm_closed: counters.register("rx.flow_control.perm_closed"),
-            rx_queue_free_future_binding: counters.register("!rx.queue_free.future_binding"),
 
             rx_reset_both: counters.register("rx.reset.both"),
             rx_reset_stream: counters.register("rx.reset.stream"),

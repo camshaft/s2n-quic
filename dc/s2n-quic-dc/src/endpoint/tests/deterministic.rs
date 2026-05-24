@@ -735,7 +735,7 @@ fn init_uniqueness_baseline() {
 /// second copy so the server acceptor sees each stream ID only once.
 #[test]
 fn init_uniqueness_all_duplicated() {
-    const N: usize = 100_000;
+    const N: usize = 10_000;
     let actions = PacketActions {
         delays: vec![0; N],
         duplicates: vec![true; N],

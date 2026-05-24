@@ -19,55 +19,6 @@ use std::{
 /// Sentinel: slot is unbound (no active binding).
 const UNBOUND: u64 = u64::MAX;
 
-/// Information about a freed queue slot, emitted when both receivers drop.
-#[derive(Debug, Clone, Copy)]
-pub struct FreedSlot {
-    /// The local queue_id (slot index) that was freed.
-    pub queue_id: VarInt,
-    /// The binding_id that was active when the slot was freed.
-    pub binding_id: VarInt,
-}
-
-/// Lock-guarded freed-slot notification channel with an atomic fast-path check.
-///
-/// Producers push freed slots and set the `has_items` flag. The consumer checks
-/// the flag before acquiring the mutex, skipping it entirely when empty (common case).
-pub struct FreeNotify {
-    has_items: std::sync::atomic::AtomicBool,
-    inner: std::sync::Mutex<Vec<FreedSlot>>,
-}
-
-impl FreeNotify {
-    pub fn new() -> Self {
-        Self {
-            has_items: std::sync::atomic::AtomicBool::new(false),
-            inner: std::sync::Mutex::new(Vec::new()),
-        }
-    }
-
-    pub fn push(&self, slot: FreedSlot) {
-        let mut guard = self.inner.lock().unwrap();
-        guard.push(slot);
-        self.has_items
-            .store(true, std::sync::atomic::Ordering::Release);
-    }
-
-    /// Drain all freed slots. Returns an empty Vec without acquiring the mutex
-    /// when no items have been pushed since the last drain.
-    pub fn drain(&self) -> Vec<FreedSlot> {
-        if !self
-            .has_items
-            .load(std::sync::atomic::Ordering::Acquire)
-        {
-            return Vec::new();
-        }
-        let mut guard = self.inner.lock().unwrap();
-        self.has_items
-            .store(false, std::sync::atomic::Ordering::Release);
-        core::mem::take(&mut *guard)
-    }
-}
-
 /// Indicates why a queue key validation failed
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ValidationError {
@@ -301,24 +252,6 @@ impl<S: 'static, C: 'static> Descriptor<S, C> {
         drop(storage);
     }
 
-    /// Read the binding_id and queue_id without clearing.
-    ///
-    /// The binding_id is intentionally NOT cleared — keeping the last value
-    /// prevents stale retransmits from re-creating a binding after the stream
-    /// completes and the slot is freed.
-    ///
-    /// # Safety
-    ///
-    /// Must only be called during the free path, after both receivers have closed.
-    #[inline]
-    pub unsafe fn read_freed_slot(&self) -> Option<FreedSlot> {
-        let inner = self.inner();
-        let binding_id_raw = inner.binding_id.load(Ordering::Acquire);
-        VarInt::new(binding_id_raw).ok().map(|binding_id| FreedSlot {
-            queue_id: inner.id,
-            binding_id,
-        })
-    }
 
     /// Validate the binding_id against the current slot binding.
     ///

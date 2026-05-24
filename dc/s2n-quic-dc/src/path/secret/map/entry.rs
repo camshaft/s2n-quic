@@ -40,8 +40,8 @@ pub type PeerDataAddrs = tokio::sync::SetOnce<Arc<[s2n_quic_core::inet::SocketAd
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PeerQueueFreeResult {
     Accepted,
+    /// Duplicate free_request_id — already processed this QueueFree batch.
     Stale,
-    Future,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -581,17 +581,16 @@ impl Entry {
         core::future::poll_fn(|cx| self.peer_free_list.poll_alloc(cx)).await
     }
 
-    /// Mark a peer queue as freed (called when QueueFree is received from peer).
+    /// Mark peer queues as freed (called when QueueFree is received from peer).
     ///
-    /// Validates that `binding_id` was actually allocated by this entry. If it's from
-    /// the future (>= next_binding_id), the QueueFree is invalid and dropped to prevent
-    /// spoofed or replayed frees from corrupting the pool.
-    pub fn on_peer_queue_freed(&self, queue_id: VarInt, binding_id: VarInt) -> PeerQueueFreeResult {
-        let next = self.next_binding_id.load(Ordering::Relaxed);
-        if binding_id.as_u64() >= next {
-            return PeerQueueFreeResult::Future;
-        }
-        if self.peer_free_list.free(queue_id, binding_id) {
+    /// `free_request_id` is the server's monotonic stamp for this QueueFree batch.
+    /// Deduplication uses the request_id — duplicate/replayed messages are rejected.
+    pub fn on_peer_queue_freed(
+        &self,
+        free_request_id: VarInt,
+        queue_ids: &s2n_quic_core::interval_set::IntervalSet<VarInt>,
+    ) -> PeerQueueFreeResult {
+        if self.peer_free_list.free(free_request_id, queue_ids) {
             PeerQueueFreeResult::Accepted
         } else {
             PeerQueueFreeResult::Stale
