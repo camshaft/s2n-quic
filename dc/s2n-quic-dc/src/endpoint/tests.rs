@@ -1736,16 +1736,9 @@ fn five_node_random_chatter_settles_after_stop() {
 /// 2. server→client: all 3 ACK + data + FIN response frames (1 packet)
 /// 3. client→server: all 3 final ACK frames (1 packet)
 ///
-/// Current behavior produces 8 packets due to two issues:
-///
-/// - The server's ACK is sent separately from its data response (different sim
-///   ticks). Under production load these coalesce naturally.
-///
-/// - The RTT-probe mechanism marks ACK-only sends as ack-eliciting when inflight
-///   is empty. This triggers an ACK ping-pong: each ack-eliciting ACK forces the
-///   peer to respond, which itself becomes ack-eliciting because inflight is still
-///   empty, causing another round-trip. The loop terminates when the rtt_tracker
-///   marks `sampled=true`, but not before several unnecessary packets.
+/// Current sim produces 4 packets: the server's ACK is sent in a separate packet
+/// from its data response because they fire in different sim ticks (zero-contention
+/// scheduling). Under production load these naturally coalesce into one packet.
 #[test]
 fn concurrent_tiny_streams_batch_into_minimal_packets() {
     crate::testing::sim(|| {
@@ -1848,15 +1841,13 @@ fn concurrent_tiny_streams_batch_into_minimal_packets() {
                     handle.await.expect("stream task join");
                 }
 
-                // Allow the ACK ping-pong to settle before checking counters.
+                // Allow background ACKs to flush.
                 Duration::from_millis(100).sleep().await;
 
                 let packets = total_packets.load(Ordering::Relaxed);
-                // Ideal: 3 packets (init + response + final ACK).
-                // Current: 8 due to RTT-probe ACK ping-pong (see doc comment).
-                assert_eq!(
-                    packets, 8,
-                    "expected 8 packets (3 streams batched, RTT-probe ping-pong); ideal is 3"
+                assert!(
+                    packets <= 4,
+                    "expected at most 4 packets (3 streams batched; ideal is 3), got {packets}"
                 );
             }
             .group("client")
