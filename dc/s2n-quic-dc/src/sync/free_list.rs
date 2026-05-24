@@ -13,7 +13,7 @@
 
 use s2n_quic_core::varint::VarInt;
 use std::{
-    collections::{HashSet, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc, Mutex,
@@ -34,6 +34,10 @@ const MAX_WAITERS: usize = 4096;
 struct Inner {
     freed: VecDeque<VarInt>,
     queued: HashSet<u64>,
+    /// Tracks the last freed binding_id per queue_id to reject duplicate QueueFree
+    /// messages. A QueueFree is only accepted if its binding_id > the last one freed
+    /// for that slot.
+    last_freed_binding: HashMap<u64, u64>,
     waiters: VecDeque<Waker>,
     closed: bool,
 }
@@ -57,6 +61,7 @@ impl FreeList {
             inner: Mutex::new(Inner {
                 freed: VecDeque::new(),
                 queued: HashSet::new(),
+                last_freed_binding: HashMap::new(),
                 waiters: VecDeque::new(),
                 closed: false,
             }),
@@ -134,9 +139,25 @@ impl FreeList {
 
     /// Push a freed queue ID back into the pool.
     ///
+    /// Only accepts the free if `binding_id` is strictly greater than the last
+    /// freed binding_id for this slot. This prevents duplicate QueueFree packets
+    /// (from network retransmission/duplication) from double-freeing a slot that
+    /// has already been recycled and assigned to a new stream.
+    ///
     /// Wakes one waiting consumer if any are registered.
-    pub fn free(&self, id: VarInt) -> bool {
+    pub fn free(&self, id: VarInt, binding_id: VarInt) -> bool {
         let mut inner = self.inner.lock().unwrap();
+        let last = inner
+            .last_freed_binding
+            .get(&id.as_u64())
+            .copied()
+            .unwrap_or(0);
+        if binding_id.as_u64() <= last {
+            return false;
+        }
+        inner
+            .last_freed_binding
+            .insert(id.as_u64(), binding_id.as_u64());
         if !inner.queued.insert(id.as_u64()) {
             return false;
         }
@@ -168,11 +189,20 @@ mod tests {
     fn duplicate_frees_are_idempotent() {
         let list = FreeList::new(VarInt::from_u8(0));
         let id = VarInt::from_u8(7);
+        let binding1 = VarInt::from_u8(1);
+        let binding2 = VarInt::from_u8(2);
 
-        assert!(list.free(id));
-        assert!(!list.free(id));
+        assert!(list.free(id, binding1));
+        // Same binding_id → rejected as duplicate
+        assert!(!list.free(id, binding1));
 
         assert_eq!(list.try_alloc(), Some(id));
         assert_eq!(list.try_alloc(), None);
+
+        // After allocation, freeing with the SAME binding is rejected (stale duplicate)
+        assert!(!list.free(id, binding1));
+        // Freeing with a HIGHER binding succeeds (new cycle)
+        assert!(list.free(id, binding2));
+        assert_eq!(list.try_alloc(), Some(id));
     }
 }

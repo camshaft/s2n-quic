@@ -445,7 +445,9 @@ pub fn connect(
         if let Some(client_entry) = local_map.get_by_id(&client_id) {
             return client_entry;
         }
-        return entry;
+        // Server entry exists but no Client entry — the peer connected to us first
+        // but we haven't connected to them yet. Fall through to create a new Client
+        // entry via insert_fake_path_pair.
     }
 
     // Look up the peer's map from the registry.

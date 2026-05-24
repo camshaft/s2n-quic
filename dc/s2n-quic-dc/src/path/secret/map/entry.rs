@@ -591,7 +591,7 @@ impl Entry {
         if binding_id.as_u64() >= next {
             return PeerQueueFreeResult::Future;
         }
-        if self.peer_free_list.free(queue_id) {
+        if self.peer_free_list.free(queue_id, binding_id) {
             PeerQueueFreeResult::Accepted
         } else {
             PeerQueueFreeResult::Stale

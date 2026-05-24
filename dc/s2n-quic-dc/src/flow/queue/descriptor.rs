@@ -329,7 +329,8 @@ impl<S: 'static, C: 'static> Descriptor<S, C> {
     /// - Slot unbound → StaleBinding (treated as unallocated by caller)
     #[inline]
     pub fn validate(&self, received: &VarInt) -> Result<(), ValidationError> {
-        let current = self.inner().binding_id.load(Ordering::Acquire);
+        let inner = self.inner();
+        let current = inner.binding_id.load(Ordering::Acquire);
         if current == UNBOUND {
             return Err(ValidationError::StaleBinding);
         }
@@ -337,14 +338,21 @@ impl<S: 'static, C: 'static> Descriptor<S, C> {
             std::cmp::Ordering::Equal => Ok(()),
             std::cmp::Ordering::Greater => Err(ValidationError::StaleBinding),
             std::cmp::Ordering::Less => {
+                let allocated = inner.allocated.load(Ordering::Acquire);
                 crate::tracing::error!(
+                    queue_id = inner.id.as_u64(),
                     current,
                     received = received.as_u64(),
+                    allocated,
                     "BUG: received binding_id greater than current — client rebound before QueueFree"
                 );
                 debug_assert!(
                     false,
-                    "received binding_id greater than current — client rebound before QueueFree"
+                    "received binding_id ({}) greater than current ({}) on queue_id={} allocated={}",
+                    received.as_u64(),
+                    current,
+                    inner.id.as_u64(),
+                    allocated,
                 );
                 Err(ValidationError::FutureBinding)
             }
@@ -387,14 +395,22 @@ impl<S: 'static, C: 'static> Descriptor<S, C> {
             std::cmp::Ordering::Equal => Ok(ServerValidation::Bound),
             std::cmp::Ordering::Greater => Err(ValidationError::StaleBinding),
             std::cmp::Ordering::Less => {
+                let inner = self.inner();
+                let allocated = inner.allocated.load(Ordering::Acquire);
                 crate::tracing::error!(
+                    queue_id = inner.id.as_u64(),
                     current,
                     received = received.as_u64(),
+                    allocated,
                     "BUG: received binding_id greater than current — client rebound before QueueFree"
                 );
                 debug_assert!(
                     false,
-                    "received binding_id greater than current — client rebound before QueueFree"
+                    "received binding_id ({}) greater than current ({}) on queue_id={} allocated={}",
+                    received.as_u64(),
+                    current,
+                    inner.id.as_u64(),
+                    allocated,
                 );
                 Err(ValidationError::FutureBinding)
             }
