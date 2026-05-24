@@ -63,8 +63,8 @@ where
 /// A free list of unfilled descriptors with O(1) indexed allocation.
 ///
 /// Descriptors are stored in a direct-indexed Vec (by slot index) for O(1) `alloc_at`.
-/// A separate VecDeque of free indices provides LIFO ordering for the unindexed `alloc`
-/// path, preferring recently-freed descriptors for cache locality.
+/// A separate VecDeque of free indices provides FIFO ordering for the unindexed `alloc`
+/// path, preferring lower-indexed slots for smaller VarInt encoding on the wire.
 pub(super) struct FreeVec<S: 'static, C: 'static> {
     inner: Mutex<FreeInner<S, C>>,
     /// Monotonic counter for free_request_ids stamped on QueueFree batches.
@@ -321,7 +321,8 @@ impl<S: 'static, C: 'static> Drop for Memory<S, C> {
 struct FreeInner<S: 'static, C: 'static> {
     /// Direct-indexed storage: slot i holds `Some(descriptor)` when free, `None` when allocated.
     slots: Vec<Option<Descriptor<S, C>>>,
-    /// LIFO ordering of free slot indices for `alloc` (most recently freed at back).
+    /// FIFO ordering of free slot indices for `alloc` (oldest freed at front).
+    /// Prefers lower-indexed slots for smaller VarInt encoding on the wire.
     /// May contain stale entries for slots already taken by `alloc_at`.
     free_indices: VecDeque<usize>,
     regions: Vec<Region<S, C>>,

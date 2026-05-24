@@ -541,6 +541,30 @@ fn handle_queue_data(
     }
     .into();
 
+    let is_server = peer.path_entry.id().endpoint_type().is_server();
+
+    // Server init path: frame has acceptor_id, meaning client is opening a new stream.
+    // Use lookup_unbounded to find the slot (even if unallocated) and atomically bind.
+    if is_server && dest_acceptor_id.is_some() {
+        handle_queue_data_server_init(
+            peer,
+            queue_pair,
+            binding_id,
+            offset,
+            is_fin,
+            dest_acceptor_id.unwrap(),
+            entry,
+            payload_len,
+            acceptor_registry,
+            frame_tx,
+            counters,
+            response_frames,
+            waker_sink,
+        );
+        return;
+    }
+
+    // Normal path: client, or server with established binding (no acceptor_id).
     match peer.queue_dispatcher.send_stream(
         local_queue_id,
         Some(peer_queue_id),
@@ -559,74 +583,22 @@ fn handle_queue_data(
                 "QueueData dispatched to existing binding"
             );
         }
-        Err(flow::queue::Error::Unallocated(returned_entry)) => {
-            if let Some(acceptor_id) = dest_acceptor_id {
-                if peer.path_entry.id().endpoint_type().is_client() {
-                    counters.rx_data_init_on_client.add(1);
-                    error!(
-                        binding_id = binding_id.as_u64(),
-                        queue_id = local_queue_id.as_u64(),
-                        acceptor_id = acceptor_id.as_u64(),
-                        "BUG: client received QueueData init for an unallocated queue"
-                    );
-                    return;
-                }
-                let handle = flow::Handle::new(binding_id);
-                let Some((queue_control, queue_stream)) = peer
-                    .queue_dispatcher
-                    .alloc_at_or_grow(local_queue_id.as_u64() as usize, handle, Some(peer_queue_id))
-                else {
-                    // Slot already allocated by another dispatch worker — retry
-                    // via send_stream which will validate the binding_id.
-                    match peer.queue_dispatcher.send_stream(
-                        local_queue_id,
-                        Some(peer_queue_id),
-                        &binding_id,
-                        returned_entry,
-                    ) {
-                        Ok(waker) => {
-                            let _ = waker_sink.send(waker);
-                            counters.rx_data_ok.add(1);
-                            trace!(
-                                binding_id = binding_id.as_u64(),
-                                queue_id = local_queue_id.as_u64(),
-                                "alloc_at race: retry send_stream succeeded"
-                            );
-                        }
-                        Err(_) => {
-                            counters.rx_data_unallocated.add(1);
-                            warn!(
-                                binding_id = binding_id.as_u64(),
-                                queue_id = local_queue_id.as_u64(),
-                                "alloc_at race: retry send_stream also failed"
-                            );
-                        }
-                    }
-                    return;
-                };
-
-                queue_stream.push(returned_entry);
-
-                create_binding_with_queues(
-                    peer,
-                    queue_pair,
-                    acceptor_id,
-                    binding_id,
-                    is_fin,
-                    queue_control,
-                    queue_stream,
-                    acceptor_registry,
-                    frame_tx,
-                    counters,
-                    response_frames,
-                    waker_sink,
-                );
-            } else {
+        Err(flow::queue::Error::Unallocated(_)) => {
+            if is_server {
+                // Server without acceptor_id — stale frame for freed slot
                 counters.rx_data_unallocated.add(1);
                 debug!(
                     binding_id = binding_id.as_u64(),
                     queue_id = local_queue_id.as_u64(),
                     "QueueData for unallocated queue without acceptor_id — dropping"
+                );
+            } else {
+                // Client should never receive QueueData for an unallocated queue
+                counters.rx_data_init_on_client.add(1);
+                error!(
+                    binding_id = binding_id.as_u64(),
+                    queue_id = local_queue_id.as_u64(),
+                    "BUG: client received QueueData for unallocated queue"
                 );
             }
         }
@@ -655,9 +627,137 @@ fn handle_queue_data(
                 "QueueData for permanently closed queue"
             );
         }
+        Err(flow::queue::Error::NeedsGrow(_)) => {
+            unreachable!("send_stream uses lookup which never returns NeedsGrow");
+        }
     }
 }
 
+
+/// Server init path: atomically bind or validate, using lookup_unbounded.
+///
+/// The only reason for retry is NeedsGrow (page not yet allocated).
+/// Once the page exists, alloc_at_or_grow handles the atomic bind via init_key's
+/// fetch_update CAS. If the CAS fails (another worker won), retry via send_stream
+/// validates against the winner's binding.
+#[allow(clippy::too_many_arguments)]
+fn handle_queue_data_server_init(
+    peer: &mut recv::Context,
+    queue_pair: QueuePair,
+    binding_id: VarInt,
+    offset: VarInt,
+    is_fin: bool,
+    acceptor_id: VarInt,
+    entry: crate::intrusive::Entry<msg::Stream>,
+    payload_len: usize,
+    acceptor_registry: &mut acceptor::LocalRegistry<PendingValidation>,
+    frame_tx: &SubmissionSender,
+    counters: &counters::Dispatch,
+    response_frames: &mut PriorityInput,
+    waker_sink: &mut impl channel::UnboundedSender<AutoWake>,
+) {
+    let local_queue_id = queue_pair.dest_queue_id;
+    let peer_queue_id = queue_pair.source_queue_id;
+
+    // First, try send_stream — if the binding already exists, this is the fast path.
+    match peer.queue_dispatcher.send_stream(
+        local_queue_id,
+        Some(peer_queue_id),
+        &binding_id,
+        entry,
+    ) {
+        Ok(waker) => {
+            let _ = waker_sink.send(waker);
+            counters.rx_data_ok.add(1);
+            trace!(
+                binding_id = binding_id.as_u64(),
+                queue_id = local_queue_id.as_u64(),
+                offset = offset.as_u64(),
+                payload_len,
+                is_fin,
+                "QueueData dispatched to existing binding (server init path)"
+            );
+            return;
+        }
+        Err(flow::queue::Error::Unallocated(returned_entry)) => {
+            // Slot is free or doesn't exist — allocate and bind atomically.
+            let handle = flow::Handle::new(binding_id);
+            let Some((queue_control, queue_stream)) = peer
+                .queue_dispatcher
+                .alloc_at_or_grow(local_queue_id.as_u64() as usize, handle, Some(peer_queue_id))
+            else {
+                // alloc_at_or_grow returned None: slot was already allocated by another
+                // worker (init_key CAS failed). Retry via send_stream which validates
+                // against the winner's binding_id.
+                match peer.queue_dispatcher.send_stream(
+                    local_queue_id,
+                    Some(peer_queue_id),
+                    &binding_id,
+                    returned_entry,
+                ) {
+                    Ok(waker) => {
+                        let _ = waker_sink.send(waker);
+                        counters.rx_data_ok.add(1);
+                        trace!(
+                            binding_id = binding_id.as_u64(),
+                            queue_id = local_queue_id.as_u64(),
+                            "alloc_at race resolved: retry send_stream succeeded"
+                        );
+                    }
+                    Err(_) => {
+                        counters.rx_data_unallocated.add(1);
+                        warn!(
+                            binding_id = binding_id.as_u64(),
+                            queue_id = local_queue_id.as_u64(),
+                            "alloc_at race: retry send_stream also failed"
+                        );
+                    }
+                }
+                return;
+            };
+
+            queue_stream.push(returned_entry);
+
+            create_binding_with_queues(
+                peer,
+                queue_pair,
+                acceptor_id,
+                binding_id,
+                is_fin,
+                queue_control,
+                queue_stream,
+                acceptor_registry,
+                frame_tx,
+                counters,
+                response_frames,
+                waker_sink,
+            );
+        }
+        Err(flow::queue::Error::HalfClosed(_)) => {
+            counters.rx_data_half_closed.add(1);
+            trace!(
+                binding_id = binding_id.as_u64(),
+                queue_id = local_queue_id.as_u64(),
+                "QueueData server init for half-closed stream — dropping"
+            );
+        }
+        Err(flow::queue::Error::ValidationFailed(_, reason)) => {
+            counters.on_data_validation_failed(reason);
+            debug!(
+                binding_id = binding_id.as_u64(),
+                queue_id = local_queue_id.as_u64(),
+                ?reason,
+                "QueueData server init validation failed — dropping"
+            );
+        }
+        Err(flow::queue::Error::PermanentlyClosed) => {
+            counters.rx_data_perm_closed.add(1);
+        }
+        Err(flow::queue::Error::NeedsGrow(_)) => {
+            unreachable!("send_stream uses lookup which never returns NeedsGrow");
+        }
+    }
+}
 
 fn create_binding_with_queues(
     peer: &mut recv::Context,
@@ -675,9 +775,9 @@ fn create_binding_with_queues(
 ) {
     let peer_queue_id = queue_pair.source_queue_id;
     let allocated_queue_id = queue_control.queue_id();
-    debug_assert_eq!(
+    assert_eq!(
         allocated_queue_id, queue_pair.dest_queue_id,
-        "allocated queue_id must match the requested destination queue_id"
+        "BUG: allocated queue_id must match the requested destination queue_id — stream corruption"
     );
 
     let writer = Writer::new_server(
@@ -890,6 +990,9 @@ fn dispatch_control_message(
                 "queue control for permanently closed queue"
             );
             false
+        }
+        Err(flow::queue::Error::NeedsGrow(_)) => {
+            unreachable!("send_control uses lookup which never returns NeedsGrow");
         }
     }
 }

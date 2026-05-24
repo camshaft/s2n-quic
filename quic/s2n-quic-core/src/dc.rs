@@ -164,7 +164,11 @@ decoder_value!(
             })?;
             let max_idle_timeout = NonZeroU32::new(timeout_value);
 
-            let (initial_max_queues, buffer) = buffer.decode::<VarInt>()?;
+            let (initial_max_queues, buffer) = if buffer.is_empty() {
+                (VarInt::from_u16(1024), buffer)
+            } else {
+                buffer.decode::<VarInt>()?
+            };
 
             Ok((
                 Self {

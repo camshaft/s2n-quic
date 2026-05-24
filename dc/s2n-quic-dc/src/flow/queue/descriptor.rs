@@ -11,12 +11,26 @@ use std::{
     marker::PhantomData,
     ptr::NonNull,
     sync::{
-        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
         Arc,
     },
 };
 
-/// Sentinel: slot is unbound (no active binding).
+/// MSB-encoded binding_id scheme:
+///
+/// bit 63 = UNALLOCATED (1 = slot is free, 0 = slot is in use)
+/// bits 0-61 = binding_id value (VarInt range, max 2^62-1)
+///
+/// This unifies the old `allocated: AtomicBool` and `binding_id: AtomicU64` into a single
+/// atomic word. bind, validate, and free are each a single atomic operation with no TOCTOU.
+///
+/// A fresh slot starts at UNBOUND (u64::MAX, all bits set including MSB → unallocated).
+/// When bound: binding_id alone (MSB clear → allocated).
+/// When freed: binding_id | UNALLOCATED_BIT (MSB set, preserving binding for stale detection).
+const UNALLOCATED_BIT: u64 = 1 << 63;
+
+/// Sentinel: slot has never been bound. u64::MAX has the UNALLOCATED_BIT set naturally,
+/// plus all lower bits set, making it impossible to confuse with any valid binding_id.
 const UNBOUND: u64 = u64::MAX;
 
 /// Indicates why a queue key validation failed
@@ -101,9 +115,11 @@ impl<S: 'static, C: 'static> Descriptor<S, C> {
     }
 
     /// Returns true if this descriptor currently has active receivers (in use).
+    ///
+    /// MSB clear = allocated. MSB set = free (or UNBOUND). Single condition check.
     #[inline]
     pub fn is_allocated(&self) -> bool {
-        self.inner().allocated.load(Ordering::Acquire)
+        self.inner().binding_id.load(Ordering::Acquire) & UNALLOCATED_BIT == 0
     }
 
     /// Returns the queue_id for this descriptor. Queue IDs are just slot indices.
@@ -144,34 +160,50 @@ impl<S: 'static, C: 'static> Descriptor<S, C> {
         unsafe { self.ptr.as_ref() }
     }
 
-    /// Set the binding_id for this descriptor. Only succeeds if the new
-    /// binding_id is strictly greater than the current value (or current is UNBOUND).
+    /// Atomically bind this descriptor: stores binding_id with MSB clear (= allocated).
+    ///
+    /// Only succeeds if the slot is currently free (UNALLOCATED_BIT set or UNBOUND)
+    /// AND the new binding_id is strictly greater than any prior binding on this slot.
     /// Returns false if the binding_id is stale (retransmit of an old stream).
     ///
     /// # Safety
     ///
-    /// * The [`Descriptor`] needs to be marked as free of receivers
+    /// * The [`Descriptor`] needs to be in the free list (not currently allocated)
     #[inline]
     pub unsafe fn init_key(&self, binding_id: VarInt) -> bool {
         let inner = self.inner();
-        let current = inner.binding_id.load(Ordering::Acquire);
-        if current != UNBOUND && binding_id.as_u64() <= current {
-            return false;
-        }
-        inner.binding_id.store(binding_id.as_u64(), Ordering::Release);
-        true
+        let desired = binding_id.as_u64(); // MSB clear = allocated
+        inner
+            .binding_id
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                if current == UNBOUND {
+                    return Some(desired);
+                }
+                // Slot must be free (UNALLOCATED_BIT set) and new binding must exceed prior
+                if current & UNALLOCATED_BIT != 0 {
+                    let prior_binding = current & !UNALLOCATED_BIT;
+                    if binding_id.as_u64() > prior_binding {
+                        return Some(desired);
+                    }
+                }
+                None
+            })
+            .is_ok()
     }
 
     /// # Safety
     ///
-    /// * The [`Descriptor`] needs to be marked as free of receivers
+    /// * The [`Descriptor`] must have been bound via `init_key` (ALLOCATED_BIT is set)
     ///
     /// If `remote_queue_id` is `Some`, the value is stored immediately and both queue
     /// halves are marked as already observed (no dispatcher-side store needed).
     #[inline]
     pub unsafe fn into_receiver_pair(self, remote_queue_id: Option<VarInt>) -> (Self, Self) {
         let inner = self.inner();
-        inner.allocated.store(true, Ordering::Release);
+        debug_assert!(
+            inner.binding_id.load(Ordering::Relaxed) & UNALLOCATED_BIT == 0,
+            "into_receiver_pair called on unbound descriptor"
+        );
 
         let has_remote_queue_id = remote_queue_id.is_some();
         if let Some(id) = remote_queue_id {
@@ -237,7 +269,7 @@ impl<S: 'static, C: 'static> Descriptor<S, C> {
         ensure!(inner
             .stream
             .close_receiver(&inner.control, half, || {
-                inner.allocated.store(false, Ordering::Release);
+                inner.binding_id.fetch_or(UNALLOCATED_BIT, Ordering::Release);
             })
             .is_continue());
 
@@ -255,95 +287,96 @@ impl<S: 'static, C: 'static> Descriptor<S, C> {
 
     /// Validate the binding_id against the current slot binding.
     ///
-    /// Lock-free ordered comparison:
+    /// Lock-free comparison using the MSB-encoded binding_id word:
+    /// - Slot free (UNALLOCATED_BIT set, including UNBOUND) → StaleBinding
     /// - Equal → accept
     /// - Received < current → stale (drop)
-    /// - Received > current → future (BUG)
-    /// - Slot unbound → StaleBinding (treated as unallocated by caller)
+    /// - Received > current → future (BUG: client rebound before QueueFree)
     #[inline]
     pub fn validate(&self, received: &VarInt) -> Result<(), ValidationError> {
         let inner = self.inner();
         let current = inner.binding_id.load(Ordering::Acquire);
-        if current == UNBOUND {
+        if current & UNALLOCATED_BIT != 0 {
             return Err(ValidationError::StaleBinding);
         }
+        // MSB is clear, so current IS the binding_id directly
         match current.cmp(&received.as_u64()) {
             std::cmp::Ordering::Equal => Ok(()),
             std::cmp::Ordering::Greater => Err(ValidationError::StaleBinding),
             std::cmp::Ordering::Less => {
-                let allocated = inner.allocated.load(Ordering::Acquire);
                 crate::tracing::error!(
                     queue_id = inner.id.as_u64(),
                     current,
                     received = received.as_u64(),
-                    allocated,
                     "BUG: received binding_id greater than current — client rebound before QueueFree"
                 );
                 debug_assert!(
                     false,
-                    "received binding_id ({}) greater than current ({}) on queue_id={} allocated={}",
+                    "received binding_id ({}) greater than current ({}) on queue_id={}",
                     received.as_u64(),
                     current,
                     inner.id.as_u64(),
-                    allocated,
                 );
                 Err(ValidationError::FutureBinding)
             }
         }
     }
 
-    /// Server-side: validate or atomically bind if unbound.
+    /// Server-side: validate or atomically bind if the slot is free.
     ///
-    /// Uses CAS to ensure only one caller succeeds at binding an unbound slot.
+    /// Uses `fetch_update` to atomically check "is this slot free?" (UNALLOCATED_BIT set)
+    /// and set the binding_id (MSB clear = allocated) in a single CAS. No TOCTOU possible.
     #[inline]
     pub fn validate_or_bind(
         &self,
         received: &VarInt,
     ) -> Result<ServerValidation, ValidationError> {
         let inner = self.inner();
-        let current = inner.binding_id.load(Ordering::Acquire);
+        let desired = received.as_u64(); // MSB clear = allocated
 
-        if current == UNBOUND {
-            // Attempt to atomically bind
-            match inner.binding_id.compare_exchange(
-                UNBOUND,
-                received.as_u64(),
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => return Ok(ServerValidation::NewBinding),
-                Err(actual) => {
-                    // Someone else bound it first — validate against their binding
-                    return self.validate_against(actual, received);
+        match inner.binding_id.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            if current & UNALLOCATED_BIT != 0 {
+                // Slot is free (UNBOUND or previously freed). Check stale.
+                if current != UNBOUND {
+                    let prior = current & !UNALLOCATED_BIT;
+                    if received.as_u64() <= prior {
+                        return None; // stale retransmit
+                    }
                 }
+                Some(desired)
+            } else {
+                // Slot is allocated — reject via None, validate externally
+                None
             }
+        }) {
+            Ok(_) => Ok(ServerValidation::NewBinding),
+            Err(current) => self.validate_against(current, received),
         }
-
-        self.validate_against(current, received)
     }
 
     #[inline]
     fn validate_against(&self, current: u64, received: &VarInt) -> Result<ServerValidation, ValidationError> {
+        if current & UNALLOCATED_BIT != 0 {
+            return Err(ValidationError::StaleBinding);
+        }
+        // MSB is clear, so current IS the binding_id directly
         match current.cmp(&received.as_u64()) {
             std::cmp::Ordering::Equal => Ok(ServerValidation::Bound),
             std::cmp::Ordering::Greater => Err(ValidationError::StaleBinding),
             std::cmp::Ordering::Less => {
                 let inner = self.inner();
-                let allocated = inner.allocated.load(Ordering::Acquire);
                 crate::tracing::error!(
                     queue_id = inner.id.as_u64(),
                     current,
                     received = received.as_u64(),
-                    allocated,
                     "BUG: received binding_id greater than current — client rebound before QueueFree"
                 );
                 debug_assert!(
                     false,
-                    "received binding_id ({}) greater than current ({}) on queue_id={} allocated={}",
+                    "received binding_id ({}) greater than current ({}) on queue_id={}",
                     received.as_u64(),
                     current,
                     inner.id.as_u64(),
-                    allocated,
                 );
                 Err(ValidationError::FutureBinding)
             }
@@ -357,10 +390,12 @@ unsafe impl<S: Sync, C: Sync> Sync for Descriptor<S, C> {}
 pub(super) struct DescriptorInner<S, C> {
     /// The slot index. This IS the queue_id — it never changes after initialization.
     id: VarInt,
-    /// Whether receivers are currently open (slot is in use, not in free list).
-    allocated: AtomicBool,
-    /// The current/last binding_id. Never cleared — monotonically increases.
-    /// Used for validation and to prevent stale retransmits from re-creating bindings.
+    /// MSB-encoded binding_id:
+    ///   bit 63 = ALLOCATED (in use)
+    ///   bits 0-61 = binding_id value
+    ///   u64::MAX = UNBOUND (never used)
+    ///
+    /// After free, MSB is cleared but binding_id value preserved for stale detection.
     binding_id: AtomicU64,
     /// The peer's queue ID, written once by the dispatcher on first observation.
     /// Initialized to `u64::MAX` (unknown) and set via a relaxed store.
@@ -382,7 +417,6 @@ impl<S, C> DescriptorInner<S, C> {
         let control = Queue::new(Half::Control);
         Self {
             id: VarInt::new(index as u64).unwrap(),
-            allocated: AtomicBool::new(false),
             binding_id: AtomicU64::new(UNBOUND),
             remote_queue_id: AtomicU64::new(UNBOUND),
             stream,

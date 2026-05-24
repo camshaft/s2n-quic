@@ -15,7 +15,6 @@ mod handle;
 mod inner;
 mod pool;
 mod probes;
-mod queue_id;
 mod sender;
 
 pub use descriptor::{ServerValidation, ValidationError};
@@ -227,7 +226,7 @@ where
                 debug!(%local_queue_id, ?reason, "control queue validation failed");
                 Err(inner::Error::ValidationFailed(data, reason))
             }
-            Err(Error::Unallocated(data)) => {
+            Err(Error::Unallocated(data)) | Err(Error::NeedsGrow(data)) => {
                 debug!("unroutable control data");
                 Err(inner::Error::Unallocated(data))
             }
@@ -263,7 +262,7 @@ where
                 debug!(%local_queue_id, ?reason, "stream queue validation failed");
                 Err(inner::Error::ValidationFailed(data, reason))
             }
-            Err(Error::Unallocated(data)) => {
+            Err(Error::Unallocated(data)) | Err(Error::NeedsGrow(data)) => {
                 debug!("unroutable stream data");
                 Err(inner::Error::Unallocated(data))
             }
@@ -305,7 +304,7 @@ where
                 debug!(%local_queue_id, ?reason, "stream queue validation failed");
                 Err(inner::Error::ValidationFailed(data, reason))
             }
-            Err(Error::Unallocated(data)) => {
+            Err(Error::Unallocated(data)) | Err(Error::NeedsGrow(data)) => {
                 debug!("unroutable stream data");
                 Err(inner::Error::Unallocated(data))
             }

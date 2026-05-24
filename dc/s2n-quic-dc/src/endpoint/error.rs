@@ -4,9 +4,6 @@
 use s2n_quic_core::varint::VarInt;
 use std::fmt;
 
-/// Stream ID was reused before the previous flow completed
-pub const STREAM_ID_ERROR: VarInt = VarInt::from_u32(1);
-
 /// The acceptor ID specified in FlowInit was not found
 pub const ACCEPTOR_NOT_FOUND: VarInt = VarInt::from_u32(2);
 
@@ -45,7 +42,6 @@ pub const IDLE_TIMEOUT: VarInt = VarInt::from_u32(13);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Error {
-    StreamIdError,
     AcceptorNotFound,
     QueueUnallocated,
     FrameDecodeError,
@@ -71,7 +67,6 @@ impl Error {
 
     pub fn as_varint(self) -> VarInt {
         match self {
-            Self::StreamIdError => STREAM_ID_ERROR,
             Self::AcceptorNotFound => ACCEPTOR_NOT_FOUND,
             Self::QueueUnallocated => QUEUE_UNALLOCATED,
             Self::FrameDecodeError => FRAME_DECODE_ERROR,
@@ -92,7 +87,6 @@ impl Error {
 impl From<VarInt> for Error {
     fn from(code: VarInt) -> Self {
         match code {
-            STREAM_ID_ERROR => Self::StreamIdError,
             ACCEPTOR_NOT_FOUND => Self::AcceptorNotFound,
             QUEUE_UNALLOCATED => Self::QueueUnallocated,
             FRAME_DECODE_ERROR => Self::FrameDecodeError,
@@ -113,12 +107,6 @@ impl From<VarInt> for Error {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::StreamIdError => {
-                write!(
-                    f,
-                    "STREAM_ID_ERROR: stream ID reused before previous flow completed"
-                )
-            }
             Self::AcceptorNotFound => {
                 write!(f, "ACCEPTOR_NOT_FOUND: acceptor ID not found")
             }

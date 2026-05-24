@@ -115,12 +115,23 @@ impl FreeList {
             return Poll::Ready(VarInt::new(index as u64).ok());
         }
 
-        let evicted = if inner.waiters.len() >= MAX_WAITERS {
-            inner.waiters.pop_front()
+        // Dedup: avoid accumulating identical wakers from repeated polls of the same future
+        let should_push = inner
+            .waiters
+            .back()
+            .map_or(true, |w| !w.will_wake(cx.waker()));
+        let evicted = if should_push {
+            if inner.waiters.len() >= MAX_WAITERS {
+                inner.waiters.pop_front()
+            } else {
+                None
+            }
         } else {
             None
         };
-        inner.waiters.push_back(cx.waker().clone());
+        if should_push {
+            inner.waiters.push_back(cx.waker().clone());
+        }
         drop(inner);
         if let Some(waker) = evicted {
             waker.wake();
@@ -144,30 +155,22 @@ impl FreeList {
         }
         let _ = inner.seen_requests.insert_value(free_request_id);
 
-        // Insert all freed queue_ids into the available set
-        let mut woke = false;
+        // Insert ALL freed queue_ids into the available set first, then wake.
+        // Previously this returned early after waking the first waiter, which
+        // would silently drop remaining ranges from multi-range QueueFree messages.
         for range in queue_ids.inclusive_ranges() {
             let start = range.start().as_u64() as u32;
             let end = range.end().as_u64() as u32;
             for id in start..=end {
-                // Grow bitset if needed
                 let needed = id + 1;
                 if needed > inner.freed.capacity() {
                     inner.freed.grow(needed);
                 }
                 inner.freed.insert(id);
             }
-            if !woke {
-                if let Some(waker) = inner.waiters.pop_front() {
-                    drop(inner);
-                    waker.wake();
-                    return true;
-                }
-                woke = true;
-            }
         }
 
-        // Wake all waiters since we may have freed multiple slots
+        // Wake waiters after all IDs are inserted
         let waiters: Vec<_> = inner.waiters.drain(..).collect();
         drop(inner);
         for waker in waiters {

@@ -39,6 +39,8 @@ bitflags! {
 pub enum Error<T> {
     /// The queue ID is not associated with a stream
     Unallocated(T),
+    /// The slot's page has not been grown yet (server needs to grow pool)
+    NeedsGrow(T),
     /// The queue exists but this half has no receiver
     HalfClosed(T),
     /// The queue key validation failed (credential or stream_id mismatch)

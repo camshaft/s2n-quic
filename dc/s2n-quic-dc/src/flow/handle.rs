@@ -14,9 +14,7 @@
 //! No credential_id check is needed because dispatch is already namespaced
 //! per-recv-context (which is per credential_id + sender_id).
 
-use crate::flow::queue::ValidationError;
 use s2n_quic_core::varint::VarInt;
-use std::cmp::Ordering;
 
 /// Queue key — just the binding_id assigned at stream creation.
 ///
@@ -31,25 +29,5 @@ impl Handle {
     #[inline]
     pub fn new(binding_id: VarInt) -> Self {
         Self { binding_id }
-    }
-
-    #[inline]
-    pub fn validate(&self, binding_id: &VarInt) -> Result<(), ValidationError> {
-        match self.binding_id.as_u64().cmp(&binding_id.as_u64()) {
-            Ordering::Equal => Ok(()),
-            Ordering::Greater => Err(ValidationError::StaleBinding),
-            Ordering::Less => {
-                tracing::error!(
-                    current = self.binding_id.as_u64(),
-                    received = binding_id.as_u64(),
-                    "BUG: received binding_id greater than current — client rebound before QueueFree"
-                );
-                debug_assert!(
-                    false,
-                    "received binding_id greater than current — client rebound before QueueFree"
-                );
-                Err(ValidationError::FutureBinding)
-            }
-        }
     }
 }

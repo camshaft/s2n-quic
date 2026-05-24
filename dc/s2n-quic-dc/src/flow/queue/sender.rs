@@ -1,7 +1,7 @@
 // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use super::{free_list, handle::Sender, inner::Error, queue_id};
+use super::{free_list, handle::Sender, inner::Error};
 use s2n_quic_core::varint::VarInt;
 use std::sync::{Arc, RwLock};
 
@@ -77,7 +77,7 @@ impl<S: 'static, C: 'static, const INITIAL_PAGE_SIZE: usize>
     where
         F: FnOnce(&Sender<S, C>, T) -> Result<V, Error<T>>,
     {
-        let slot = queue_id::slot_index(queue_id);
+        let slot = queue_id.as_u64() as usize;
         let (page_idx, offset) = Self::find_page(slot);
 
         if self.local.len() <= page_idx {
@@ -97,6 +97,36 @@ impl<S: 'static, C: 'static, const INITIAL_PAGE_SIZE: usize>
         if !sender.is_allocated() {
             return Err(Error::Unallocated(entry));
         }
+
+        f(sender, entry)
+    }
+
+    /// Lookup a sender without checking `is_allocated()`.
+    ///
+    /// Used by the server bind path where the descriptor may be unallocated
+    /// (free) and needs to be atomically bound via `validate_or_bind`.
+    /// Returns `NeedsGrow` if the slot's page hasn't been allocated yet.
+    #[inline]
+    pub fn lookup_unbounded<T, F, V>(&mut self, queue_id: VarInt, entry: T, f: F) -> Result<V, Error<T>>
+    where
+        F: FnOnce(&Sender<S, C>, T) -> Result<V, Error<T>>,
+    {
+        let slot = queue_id.as_u64() as usize;
+        let (page_idx, offset) = Self::find_page(slot);
+
+        if self.local.len() <= page_idx {
+            self.refresh_pages();
+            if self.local.len() <= page_idx {
+                return Err(Error::NeedsGrow(entry));
+            }
+        }
+
+        let Some(page) = self.local.get(page_idx) else {
+            return Err(Error::NeedsGrow(entry));
+        };
+        let Some(sender) = page.get(offset) else {
+            return Err(Error::NeedsGrow(entry));
+        };
 
         f(sender, entry)
     }

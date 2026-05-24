@@ -163,7 +163,7 @@ impl<S: 'static, C: 'static> Sender<S, C> {
 
     #[inline]
     pub(super) fn is_allocated(&self) -> bool {
-        unsafe { self.descriptor.is_allocated() }
+        self.descriptor.is_allocated()
     }
 
     #[inline]
