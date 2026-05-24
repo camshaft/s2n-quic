@@ -113,23 +113,25 @@ where
     /// Allocate a specific slot by index, growing pages as needed.
     ///
     /// Used by the server to allocate at the exact `dest_queue_id` the client specified.
+    /// Returns `None` if the slot is already allocated (retransmit race — caller should
+    /// retry via `send_stream` which will validate the binding_id).
     #[inline]
     pub fn alloc_at_or_grow(
         &mut self,
         slot_index: usize,
         mut key: crate::flow::Handle,
         remote_queue_id: Option<VarInt>,
-    ) -> (Control<S, C>, Stream<S, C>) {
+    ) -> Option<(Control<S, C>, Stream<S, C>)> {
         loop {
             match self.free.alloc_at(slot_index, key, remote_queue_id) {
-                Ok(descriptor) => return descriptor,
+                Ok(descriptor) => return Some(descriptor),
                 Err(k) => {
                     key = k;
                     if self.epoch > slot_index {
-                        panic!(
-                            "slot {} is within range (epoch={}) but not in free list — already allocated",
-                            slot_index, self.epoch
-                        );
+                        // Slot is within range but already allocated — another
+                        // dispatch worker won the race. Caller should retry via
+                        // send_stream which will validate the binding_id.
+                        return None;
                     }
                     self.grow();
                 }

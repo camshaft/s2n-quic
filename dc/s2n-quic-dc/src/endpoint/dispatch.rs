@@ -577,9 +577,28 @@ fn handle_queue_data(
                     return;
                 }
                 let handle = flow::Handle::new(binding_id);
-                let (queue_control, queue_stream) = peer
+                let Some((queue_control, queue_stream)) = peer
                     .queue_dispatcher
-                    .alloc_at_or_grow(local_queue_id.as_u64() as usize, handle, Some(peer_queue_id));
+                    .alloc_at_or_grow(local_queue_id.as_u64() as usize, handle, Some(peer_queue_id))
+                else {
+                    // Slot already allocated by another dispatch worker — retry
+                    // via send_stream which will validate the binding_id.
+                    match peer.queue_dispatcher.send_stream(
+                        local_queue_id,
+                        Some(peer_queue_id),
+                        &binding_id,
+                        returned_entry,
+                    ) {
+                        Ok(waker) => {
+                            let _ = waker_sink.send(waker);
+                            counters.rx_data_ok.add(1);
+                        }
+                        Err(_) => {
+                            counters.rx_data_unallocated.add(1);
+                        }
+                    }
+                    return;
+                };
 
                 queue_stream.push(returned_entry);
 
