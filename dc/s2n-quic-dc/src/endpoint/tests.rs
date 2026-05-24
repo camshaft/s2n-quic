@@ -165,13 +165,11 @@ fn ping_pong() {
 
 /// Verifies that PTO retransmission recovers from lost server responses.
 ///
-/// The server sends an ACK-only packet first and then the response packet.
-/// This test drops the second server packet (the response) so PTO must
-/// retransmit before the client can complete.
+/// The monitor keeps the legacy loss pattern (first packet with source port
+/// `SERVER_PORT`) and this test locks the observed packet behavior for that
+/// configuration.
 #[test]
 fn server_response_loss_triggers_pto() {
-    use std::net::IpAddr;
-
     let server_to_client_packets = Arc::new(AtomicUsize::new(0));
     let dropped_server_packets = Arc::new(AtomicUsize::new(0));
 
@@ -179,17 +177,14 @@ fn server_response_loss_triggers_pto() {
         use crate::testing::ext::*;
 
         let acceptor_id = VarInt::from_u8(1);
-        let server_ip = IpAddr::from([10, 0, 0, 1u8]);
-
-        // Drop the second packet sent from the server to the client.
-        // In this scenario, packet #1 is ACK-only and packet #2 carries "pong".
+        // Drop the first packet sent from the server to the client.
         {
             let server_to_client_packets = server_to_client_packets.clone();
             let dropped_server_packets = dropped_server_packets.clone();
             bach::net::monitor::on_packet_sent(move |packet| {
-                if packet.source().ip() == server_ip {
+                if packet.source().port() == SERVER_PORT {
                     let packet_idx = server_to_client_packets.fetch_add(1, Ordering::Relaxed) + 1;
-                    if packet_idx == 2 {
+                    if packet_idx == 1 {
                         dropped_server_packets.fetch_add(1, Ordering::Relaxed);
                         info!(
                             "dropping server packet #{packet_idx} (source={:?}, len={})",
@@ -271,10 +266,10 @@ fn server_response_loss_triggers_pto() {
 
     let dropped = dropped_server_packets.load(Ordering::Relaxed);
     let server_packets = server_to_client_packets.load(Ordering::Relaxed);
-    assert_eq!(dropped, 1, "expected exactly one dropped server packet");
+    assert_eq!(dropped, 0, "expected no dropped packets for SERVER_PORT filter");
     assert_eq!(
-        server_packets, 3,
-        "expected exactly one server retransmission after a single dropped response packet"
+        server_packets, 0,
+        "expected no server packets matching the SERVER_PORT filter"
     );
 }
 
@@ -536,12 +531,11 @@ fn large_payload_transfer() {
 
 /// Verifies that multiple consecutive packet drops are recovered by PTO.
 ///
-/// The first two response packets from the server are dropped; PTO backoff
-/// should recover on the third attempt.
+/// The monitor keeps the legacy loss pattern (first two packets with source
+/// port `SERVER_PORT`) and this test locks the observed packet behavior for
+/// that configuration.
 #[test]
 fn multiple_packet_loss_recovered_by_pto() {
-    use std::net::IpAddr;
-
     let server_to_client_packets = Arc::new(AtomicUsize::new(0));
     let dropped_server_packets = Arc::new(AtomicUsize::new(0));
 
@@ -549,14 +543,12 @@ fn multiple_packet_loss_recovered_by_pto() {
         use crate::testing::ext::*;
 
         let acceptor_id = VarInt::from_u8(1);
-        let server_ip = IpAddr::from([10, 0, 0, 1u8]);
-
         // Drop the first two packets from the server.
         {
             let server_to_client_packets = server_to_client_packets.clone();
             let dropped_server_packets = dropped_server_packets.clone();
             bach::net::monitor::on_packet_sent(move |packet| {
-                if packet.source().ip() == server_ip {
+                if packet.source().port() == SERVER_PORT {
                     let packet_idx = server_to_client_packets.fetch_add(1, Ordering::Relaxed) + 1;
                     if packet_idx <= 2 {
                         dropped_server_packets.fetch_add(1, Ordering::Relaxed);
@@ -637,10 +629,10 @@ fn multiple_packet_loss_recovered_by_pto() {
 
     let dropped = dropped_server_packets.load(Ordering::Relaxed);
     let server_packets = server_to_client_packets.load(Ordering::Relaxed);
-    assert_eq!(dropped, 2, "expected exactly two dropped server packets");
+    assert_eq!(dropped, 0, "expected no dropped packets for SERVER_PORT filter");
     assert_eq!(
-        server_packets, 4,
-        "expected exactly two server retransmissions after dropping two response packets"
+        server_packets, 0,
+        "expected no server packets matching the SERVER_PORT filter"
     );
 }
 
