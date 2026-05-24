@@ -110,8 +110,9 @@ where
         &self,
         key: Key,
         remote_queue_id: Option<VarInt>,
+        binding_id: Option<VarInt>,
     ) -> Result<(Control<S, C, Key>, Stream<S, C, Key>), Key> {
-        self.free.alloc(key, remote_queue_id)
+        self.free.alloc(key, remote_queue_id, binding_id)
     }
 
     #[inline]
@@ -119,9 +120,10 @@ where
         &mut self,
         mut key: Key,
         remote_queue_id: Option<VarInt>,
+        binding_id: Option<VarInt>,
     ) -> (Control<S, C, Key>, Stream<S, C, Key>) {
         loop {
-            match self.alloc(key, remote_queue_id) {
+            match self.alloc(key, remote_queue_id, binding_id) {
                 Ok(descriptor) => return descriptor,
                 Err(k) => {
                     key = k;
@@ -140,9 +142,10 @@ where
         slot_index: usize,
         mut key: Key,
         remote_queue_id: Option<VarInt>,
+        binding_id: Option<VarInt>,
     ) -> (Control<S, C, Key>, Stream<S, C, Key>) {
         loop {
-            match self.free.alloc_at(slot_index, key, remote_queue_id) {
+            match self.free.alloc_at(slot_index, key, remote_queue_id, binding_id) {
                 Ok(descriptor) => return descriptor,
                 Err(k) => {
                     key = k;

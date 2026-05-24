@@ -23,6 +23,12 @@ pub use descriptor::{FreeNotify, FreedSlot, Key, ServerValidation, ValidationErr
 pub use inner::AutoWake;
 pub const MAX_SLOTS: usize = queue_id::MAX_SLOTS;
 
+/// Extract the slot index from an encoded queue_id.
+#[inline]
+pub fn slot_index(queue_id: VarInt) -> usize {
+    queue_id::index(queue_id)
+}
+
 /// Size of the first allocated page of queue slots.
 ///
 /// Subsequent pages double in size so the pool converges quickly to the right
@@ -143,7 +149,7 @@ where
         key: K,
         remote_queue_id: Option<VarInt>,
     ) -> Result<(Control<S, C, K>, Stream<S, C, K>), K> {
-        self.pool.alloc(key, remote_queue_id)
+        self.pool.alloc(key, remote_queue_id, None)
     }
 
     #[inline]
@@ -152,7 +158,7 @@ where
         key: K,
         remote_queue_id: Option<VarInt>,
     ) -> (Control<S, C, K>, Stream<S, C, K>) {
-        self.pool.alloc_or_grow(key, remote_queue_id)
+        self.pool.alloc_or_grow(key, remote_queue_id, None)
     }
 }
 
@@ -199,7 +205,8 @@ where
         key: K,
         remote_queue_id: Option<VarInt>,
     ) -> Result<(Control<S, C, K>, Stream<S, C, K>), K> {
-        self.pool.alloc(key, remote_queue_id)
+        let binding_id = key.binding_id();
+        self.pool.alloc(key, remote_queue_id, binding_id)
     }
 
     #[inline]
@@ -208,7 +215,8 @@ where
         key: K,
         remote_queue_id: Option<VarInt>,
     ) -> (Control<S, C, K>, Stream<S, C, K>) {
-        self.pool.alloc_or_grow(key, remote_queue_id)
+        let binding_id = key.binding_id();
+        self.pool.alloc_or_grow(key, remote_queue_id, binding_id)
     }
 
     /// Allocate a specific slot by index, growing pages as needed.
@@ -221,7 +229,8 @@ where
         key: K,
         remote_queue_id: Option<VarInt>,
     ) -> (Control<S, C, K>, Stream<S, C, K>) {
-        self.pool.alloc_at_or_grow(slot_index, key, remote_queue_id)
+        let binding_id = key.binding_id();
+        self.pool.alloc_at_or_grow(slot_index, key, remote_queue_id, binding_id)
     }
 
     /// Drain freed slots that have been released since the last call.

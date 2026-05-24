@@ -571,8 +571,17 @@ impl Entry {
     }
 
     /// Mark a peer queue as freed (called when QueueFree is received from peer).
-    pub fn on_peer_queue_freed(&self, queue_id: VarInt) {
+    ///
+    /// Validates that `binding_id` was actually allocated by this entry. If it's from
+    /// the future (>= next_binding_id), the QueueFree is invalid and dropped to prevent
+    /// spoofed or replayed frees from corrupting the pool.
+    pub fn on_peer_queue_freed(&self, queue_id: VarInt, binding_id: VarInt) -> bool {
+        let next = self.next_binding_id.load(Ordering::Relaxed);
+        if binding_id.as_u64() >= next {
+            return false;
+        }
         self.peer_free_list.free(queue_id);
+        true
     }
 
     /// Allocates a queue slot from this entry's pool, growing if needed.

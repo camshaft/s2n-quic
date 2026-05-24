@@ -112,10 +112,17 @@ impl FreeList {
         }
 
         // Cap waiter queue to prevent unbounded growth under sustained exhaustion.
-        if inner.waiters.len() >= MAX_WAITERS {
-            inner.waiters.pop_front();
-        }
+        // Wake the evicted task so it can re-register rather than hanging forever.
+        let evicted = if inner.waiters.len() >= MAX_WAITERS {
+            inner.waiters.pop_front()
+        } else {
+            None
+        };
         inner.waiters.push_back(cx.waker().clone());
+        drop(inner);
+        if let Some(waker) = evicted {
+            waker.wake();
+        }
         Poll::Pending
     }
 

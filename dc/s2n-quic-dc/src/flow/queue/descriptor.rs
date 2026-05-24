@@ -27,6 +27,12 @@ pub trait Key: 'static + Send {
     /// Returns `Ok(())` if the request matches, or a specific error indicating
     /// which field mismatched.
     fn validate(&self, params: &Self::Request) -> Result<(), ValidationError>;
+
+    /// Returns the binding_id associated with this key, if any.
+    /// Used by QueueFree emission to stamp the freed slot's binding generation.
+    fn binding_id(&self) -> Option<VarInt> {
+        None
+    }
 }
 
 /// Information about a freed queue slot, emitted when both receivers drop.
@@ -34,6 +40,9 @@ pub trait Key: 'static + Send {
 pub struct FreedSlot {
     /// The local queue_id that was freed.
     pub queue_id: VarInt,
+    /// The binding_id that was active when the slot was freed.
+    /// The peer uses this to validate that it's freeing the correct generation.
+    pub binding_id: VarInt,
 }
 
 /// Lock-guarded freed-slot notification channel with an atomic fast-path check.
@@ -250,9 +259,12 @@ impl<S: 'static, C: 'static, Key: 'static> Descriptor<S, C, Key> {
     ///
     /// * The [`Descriptor`] needs to be marked as free of receivers and the key must be uninitialized
     #[inline]
-    pub unsafe fn init_key(&self, key: Key) {
+    pub unsafe fn init_key(&self, key: Key, binding_id: Option<VarInt>) {
         let inner = self.inner();
         debug_assert!((*inner.key.get()).is_none());
+        if let Some(id) = binding_id {
+            inner.binding_id.store(id.as_u64(), Ordering::Relaxed);
+        }
         *inner.key.get() = Some(key);
     }
 
@@ -344,9 +356,10 @@ impl<S: 'static, C: 'static, Key: 'static> Descriptor<S, C, Key> {
         let inner = self.inner();
         probes::on_receiver_drop(inner.id, half);
 
-        // Capture queue IDs before the slot is freed — needed for QueueFree.
+        // Capture queue IDs and binding_id before the slot is freed — needed for QueueFree.
         let remote_queue_id = inner.remote_queue_id.load(Ordering::Relaxed);
         let queue_id = inner.queue_id.load(Ordering::Relaxed);
+        let binding_id = inner.binding_id.load(Ordering::Relaxed);
 
         ensure!(inner
             .stream
@@ -362,10 +375,12 @@ impl<S: 'static, C: 'static, Key: 'static> Descriptor<S, C, Key> {
 
         // Notify that this slot has been freed (for QueueFree emission).
         if let Some(notify) = &inner.free_notify {
-            if VarInt::new(remote_queue_id).is_ok() {
-                if let Ok(queue_id) = VarInt::new(queue_id) {
-                    notify.push(FreedSlot { queue_id });
-                }
+            if let (Ok(_), Ok(queue_id), Ok(binding_id)) = (
+                VarInt::new(remote_queue_id),
+                VarInt::new(queue_id),
+                VarInt::new(binding_id),
+            ) {
+                notify.push(FreedSlot { queue_id, binding_id });
             }
         }
 
@@ -449,6 +464,9 @@ pub(super) struct DescriptorInner<S, C, Key> {
     /// The peer's queue ID, written once by the dispatcher on first observation.
     /// Initialized to `u64::MAX` (unknown) and set via a relaxed store.
     remote_queue_id: AtomicU64,
+    /// The binding_id set at allocation time. Captured on free for QueueFree emission.
+    /// Initialized to `u64::MAX` (invalid VarInt) and set during `init_key`.
+    binding_id: AtomicU64,
     /// Current allocation key.
     ///
     /// Access must be synchronized by holding the queue mutex so key reads and key
@@ -480,6 +498,7 @@ impl<S, C, Key> DescriptorInner<S, C, Key> {
             id: VarInt::new(index as u64).unwrap(),
             queue_id: AtomicU64::new(REMOTE_QUEUE_ID_UNKNOWN),
             remote_queue_id: AtomicU64::new(REMOTE_QUEUE_ID_UNKNOWN),
+            binding_id: AtomicU64::new(REMOTE_QUEUE_ID_UNKNOWN),
             key: UnsafeCell::new(None),
             stream,
             control,

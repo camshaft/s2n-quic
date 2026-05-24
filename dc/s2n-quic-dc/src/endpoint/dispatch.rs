@@ -308,7 +308,7 @@ where
             let frame = Frame {
                 source_sender_id: LocalSenderId::UNSPECIFIED,
                 header: crate::endpoint::frame::Header::QueueFree {
-                    binding_id: VarInt::ZERO,
+                    binding_id: slot.binding_id,
                     largest_queue_id: slot.queue_id,
                 },
                 payload: crate::byte_vec::ByteVec::new(),
@@ -424,13 +424,22 @@ fn dispatch_decoded_frame(
             );
         }
         Header::QueueFree {
-            largest_queue_id, ..
+            binding_id,
+            largest_queue_id,
         } => {
-            peer.path_entry.on_peer_queue_freed(largest_queue_id);
-            trace!(
-                queue_id = largest_queue_id.as_u64(),
-                "QueueFree received — slot returned to pool"
-            );
+            if peer.path_entry.on_peer_queue_freed(largest_queue_id, binding_id) {
+                trace!(
+                    binding_id = binding_id.as_u64(),
+                    queue_id = largest_queue_id.as_u64(),
+                    "QueueFree received — slot returned to pool"
+                );
+            } else {
+                debug!(
+                    binding_id = binding_id.as_u64(),
+                    queue_id = largest_queue_id.as_u64(),
+                    "QueueFree rejected — binding_id validation failed"
+                );
+            }
         }
         Header::Ack {
             dest_sender_id,
@@ -551,9 +560,10 @@ fn handle_queue_data(
         Err(flow::queue::Error::Unallocated(returned_entry)) => {
             if let Some(acceptor_id) = dest_acceptor_id {
                 let handle = flow::Handle::new(binding_id);
+                let slot_index = flow::queue::slot_index(local_queue_id);
                 let (queue_control, queue_stream) = peer
                     .queue_dispatcher
-                    .alloc_or_grow(handle, Some(peer_queue_id));
+                    .alloc_at_or_grow(slot_index, handle, Some(peer_queue_id));
 
                 queue_stream.push(returned_entry);
 

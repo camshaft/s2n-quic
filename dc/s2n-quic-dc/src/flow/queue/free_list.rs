@@ -60,6 +60,7 @@ impl<S: 'static, C: 'static, Key: 'static> FreeVec<S, C, Key> {
         &self,
         key: Key,
         remote_queue_id: Option<VarInt>,
+        binding_id: Option<VarInt>,
     ) -> Result<(Control<S, C, Key>, Stream<S, C, Key>), Key> {
         let mut inner = self.inner.lock().unwrap();
 
@@ -86,7 +87,7 @@ impl<S: 'static, C: 'static, Key: 'static> FreeVec<S, C, Key> {
 
         unsafe {
             // SAFETY: the descriptor is only owned by the free list
-            descriptor.init_key(key);
+            descriptor.init_key(key, binding_id);
             let (control, stream) = descriptor.into_receiver_pair(remote_queue_id);
             Ok((Control::new(control), Stream::new(stream)))
         }
@@ -104,6 +105,7 @@ impl<S: 'static, C: 'static, Key: 'static> FreeVec<S, C, Key> {
         slot_index: usize,
         key: Key,
         remote_queue_id: Option<VarInt>,
+        binding_id: Option<VarInt>,
     ) -> Result<(Control<S, C, Key>, Stream<S, C, Key>), Key> {
         let mut inner = self.inner.lock().unwrap();
 
@@ -127,7 +129,7 @@ impl<S: 'static, C: 'static, Key: 'static> FreeVec<S, C, Key> {
         drop(inner);
 
         unsafe {
-            descriptor.init_key(key);
+            descriptor.init_key(key, binding_id);
             let (control, stream) = descriptor.into_receiver_pair(remote_queue_id);
             Ok((Control::new(control), Stream::new(stream)))
         }

@@ -55,4 +55,9 @@ impl crate::flow::queue::Key for Handle {
             }
         }
     }
+
+    #[inline]
+    fn binding_id(&self) -> Option<VarInt> {
+        Some(self.binding_id)
+    }
 }
