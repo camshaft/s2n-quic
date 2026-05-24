@@ -1156,7 +1156,7 @@ impl QueueGauge {
             Some("count"),
             description,
         );
-        
+
         self.registry.counter_handle(
             self.registry.inner.register_counter(label, variant),
             metric_id,
@@ -2969,7 +2969,7 @@ impl Registry {
             None
         };
 
-        std::thread::Builder::new()
+        if let Err(error) = std::thread::Builder::new()
             .name("s2n-quic-dc-reporter".into())
             .spawn(move || {
                 let mut tick: u64 = 0;
@@ -2992,7 +2992,9 @@ impl Registry {
                     tick += 1;
                 }
             })
-            .ok();
+        {
+            warn!(%error, "failed to spawn s2n-quic-dc reporter thread");
+        }
     }
 }
 
