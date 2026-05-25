@@ -747,9 +747,9 @@ expression: logs
 0:00:00.001561000 [server] TRACE c#send.pending.drain[send.7]=1
 0:00:00.001561000 [server] TRACE g#send.pending.depth[send.7]=0
 0:00:00.001561000 [server] TRACE c#tx.frame[queue_free]=1
-0:00:00.001561000 [server] TRACE m#tx.packet_size=46
+0:00:00.001561000 [server] TRACE m#tx.packet_size=47
 0:00:00.001561000 [server] TRACE m#tx.frames_per_packet=1
-0:00:00.001561000 [server] TRACE m#tx.payload_size=0
+0:00:00.001561000 [server] TRACE m#tx.payload_size=1
 0:00:00.001561000 [server] TRACE c#tx.data=1
 0:00:00.001561000 [server] TRACE c#tx.data[send.7]=1
 0:00:00.001561000 [server] TRACE c#send.inflight.enq[send.7]=1
@@ -761,13 +761,13 @@ expression: logs
 0:00:00.001561000 [server] TRACE g#q.resolver_to_pto_wheel.depth[send.worker.3]=1
 0:00:00.001561000 [server] TRACE m#q.resolver_to_pto_wheel.depth_dist[send.worker.3]=1
 0:00:00.001561000 [server] TRACE c#socket.tx.ops[send.7]=1
-0:00:00.001561000 [server] TRACE c#socket.tx.bytes[send.7]=46
+0:00:00.001561000 [server] TRACE c#socket.tx.bytes[send.7]=47
 0:00:00.001561000 [server] TRACE m#task.assembler.drained[send.7]=1
 0:00:00.001561000 [server] TRACE m#task.tx_wheel.drained[send.worker.3]=0
 0:00:00.001561000 [server] TRACE m#task.pto_wheel.drained[send.worker.3]=1
 0:00:00.001561000 [server] TRACE m#task.pto_wheel.drained[send.worker.3]=0
 0:00:00.002061000 [client] TRACE c#socket.rx.ops[recv.0]=1
-0:00:00.002061000 [client] TRACE c#socket.rx.bytes[recv.0]=46
+0:00:00.002061000 [client] TRACE c#socket.rx.bytes[recv.0]=47
 0:00:00.002061000 [client] TRACE c#router.routed=1
 0:00:00.002061000 [client] TRACE c#router.routed[recv.1]=1
 0:00:00.002061000 [client] TRACE c#q.dispatch_rx.enq[recv.1]=1
@@ -784,7 +784,7 @@ expression: logs
 0:00:00.002061000 [client] DEBUG s2n_quic_dc: credential_id=[125, 162, 176, 33, 188, 81, 236, 106, 53, 74, 204, 19, 207, 132, 62, 199] key_id=2 gap=1 forward_shift=0
 0:00:00.002061000 [client] TRACE c#rx.peer_cache.miss=1
 0:00:00.002061000 [client] TRACE c#rx.ecn[ect0]=1
-0:00:00.002061000 [client] TRACE m#rx.packet_size=0
+0:00:00.002061000 [client] TRACE m#rx.packet_size=1
 0:00:00.002061000 [client] TRACE c#rx.frame[queue_free]=1
 0:00:00.002061000 [client] TRACE m#rx.frames_per_packet=1
 0:00:00.002061000 [client] DEBUG event=on_ack_eliciting prev=Idle next=Scheduled location=dc/s2n-quic-dc/src/endpoint/dispatch.rs
@@ -872,7 +872,7 @@ expression: logs
 0:00:00.002561000 [server] TRACE m#tx.ack_packets[send.7]=1
 0:00:00.002561000 [server] TRACE c#send.inflight.drain.ack[send.7]=1
 0:00:00.002561000 [server] TRACE c#tx.ecn.ect0[send.7]=1
-0:00:00.002561000 [server] TRACE m#send.cwnd[send.7]=14766
+0:00:00.002561000 [server] TRACE m#send.cwnd[send.7]=14767
 0:00:00.002561000 [server] TRACE m#send.pacing_rate[send.7]=40368997
 0:00:00.002561000 [server] TRACE c#send.app_limited[send.7]=1
 0:00:00.002561000 [server] TRACE m#task.ack_processor.drained[send.worker.3]=2
@@ -1090,8 +1090,8 @@ expression: logs
 0:00:03.001561000 [server] TRACE c#q.router_to_batcher.drain[p3]=1
 0:00:03.001561000 [server] TRACE g#q.router_to_batcher.depth[p3]=0
 0:00:03.001561000 [server] TRACE m#task.frame_dispatch.drained=2
-0:00:03.001581000 [server] TRACE m#pick_two.score_delta=3603180
-0:00:03.001581000 [server] TRACE m#pick_two.rejected[send.7]=3603180
+0:00:03.001581000 [server] TRACE m#pick_two.score_delta=3603182
+0:00:03.001581000 [server] TRACE m#pick_two.rejected[send.7]=3603182
 0:00:03.001581000 [server] TRACE c#pick_two.chosen[send.5]=1
 0:00:03.001581000 [server] TRACE c#q.resolver.enq[send.1]=1
 0:00:03.001581000 [server] TRACE g#q.resolver.depth[send.1]=1
@@ -1370,8 +1370,8 @@ expression: logs
 0:00:03.003601000 [server] TRACE c#q.router_to_batcher.drain[p3]=1
 0:00:03.003601000 [server] TRACE g#q.router_to_batcher.depth[p3]=0
 0:00:03.003601000 [server] TRACE m#task.frame_dispatch.drained=2
-0:00:03.003621000 [server] TRACE m#pick_two.score_delta=4124180
-0:00:03.003621000 [server] TRACE m#pick_two.rejected[send.7]=4124180
+0:00:03.003621000 [server] TRACE m#pick_two.score_delta=4124182
+0:00:03.003621000 [server] TRACE m#pick_two.rejected[send.7]=4124182
 0:00:03.003621000 [server] TRACE c#pick_two.chosen[send.2]=1
 0:00:03.003621000 [server] TRACE c#q.resolver.enq[send.2]=1
 0:00:03.003621000 [server] TRACE g#q.resolver.depth[send.2]=1

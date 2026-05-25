@@ -160,17 +160,15 @@ impl FreeList {
         }
         let _ = inner.seen_requests.insert_value(free_request_id);
 
-        // Insert ALL freed queue_ids into the available set first, then ship wakers.
+        // Insert ALL freed queue_ids via batch range insertion.
         for range in queue_ids.inclusive_ranges() {
             let start = range.start().as_u64() as u32;
             let end = range.end().as_u64() as u32;
-            for id in start..=end {
-                let needed = id + 1;
-                if needed > inner.freed.capacity() {
-                    inner.freed.grow(needed);
-                }
-                inner.freed.insert(id);
+            let needed = end + 1;
+            if needed > inner.freed.capacity() {
+                inner.freed.grow(needed);
             }
+            inner.freed.insert_range(start, end);
         }
 
         // Ship wakers to another thread — never wake inline on the dispatch path

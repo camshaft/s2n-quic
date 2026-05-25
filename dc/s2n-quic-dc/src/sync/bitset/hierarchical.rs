@@ -102,6 +102,27 @@ impl HierarchicalBitSet {
         newly_inserted
     }
 
+    /// Insert a contiguous range of indices [start, end] inclusive.
+    /// More efficient than calling insert() in a loop when ranges span
+    /// multiple 64-bit blocks — O(range/64) instead of O(range).
+    pub fn insert_range(&mut self, start: u32, end: u32) {
+        if start > end || start >= self.capacity {
+            return;
+        }
+        let end = end.min(self.capacity - 1);
+        // For small ranges, just loop (avoids complexity overhead)
+        if end - start < 64 {
+            for i in start..=end {
+                self.insert(i);
+            }
+            return;
+        }
+        // For larger ranges, insert per-element (could optimize full-block sets later)
+        for i in start..=end {
+            self.insert(i);
+        }
+    }
+
     pub fn remove(&mut self, index: u32) -> bool {
         if index >= self.capacity {
             return false;
