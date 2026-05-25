@@ -37,6 +37,7 @@ pub(crate) mod edt;
 pub(crate) mod error;
 pub(crate) mod frame;
 pub mod id;
+pub(crate) mod range_codec;
 pub(crate) mod inflight;
 pub(crate) mod msg;
 pub(crate) mod recv;

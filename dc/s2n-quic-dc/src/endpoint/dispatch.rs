@@ -301,19 +301,38 @@ where
             enqueue_pending_ack = true;
         }
     }
-    // Emit QueueFree frame for any slots freed during this dispatch cycle.
+    // Emit QueueFree frame with range-compressed payload for freed slots.
     if let Some((free_request_id, queue_ids)) = peer.queue_dispatcher.drain_freed() {
         let largest_queue_id = queue_ids
             .max_value()
+            .copied()
             .unwrap_or(s2n_quic_core::varint::VarInt::ZERO);
-        // TODO: encode range set into payload for multi-slot batches
+
+        // Encode ranges into a BytesMut, then wrap in ByteVec
+        let range_count = queue_ids.interval_len();
+        let mut buf = bytes::BytesMut::with_capacity(range_count * 16);
+        buf.resize(range_count * 16, 0);
+        let mut encoder = s2n_codec::EncoderBuffer::new(&mut buf);
+        crate::endpoint::range_codec::encode(
+            largest_queue_id,
+            queue_ids.inclusive_ranges().rev().map(|r| r.start()..=r.end()),
+            &mut encoder,
+        );
+        let encoded_len = buf.len() - encoder.remaining_capacity();
+        buf.truncate(encoded_len);
+
+        let mut payload = crate::byte_vec::ByteVec::new();
+        if !buf.is_empty() {
+            payload.push_back(buf.freeze());
+        }
+
         let frame = Frame {
             source_sender_id: LocalSenderId::UNSPECIFIED,
             header: crate::endpoint::frame::Header::QueueFree {
                 free_request_id,
                 largest_queue_id,
             },
-            payload: crate::byte_vec::ByteVec::new(),
+            payload,
             path_secret_entry: peer.path_entry.clone(),
             completion: None,
             status: crate::endpoint::frame::TransmissionStatus::default(),
@@ -426,10 +445,16 @@ fn dispatch_decoded_frame(
             free_request_id,
             largest_queue_id,
         } => {
-            // TODO: decode range set from payload for multi-slot batches.
-            // For now, treat largest_queue_id as the single freed queue_id.
+            // Lazy decode: iterator over ranges, no IntervalSet allocation
+            let ranges = crate::endpoint::range_codec::RangeDecoder::new(
+                largest_queue_id,
+                &payload,
+            );
+            // Build IntervalSet from decoded ranges for the free list
             let mut queue_ids = s2n_quic_core::interval_set::IntervalSet::new();
-            let _ = queue_ids.insert_value(largest_queue_id);
+            for range in ranges {
+                let _ = queue_ids.insert(range);
+            }
             match peer.path_entry.on_peer_queue_freed(
                 free_request_id,
                 &queue_ids,
