@@ -99,9 +99,44 @@ impl<S: 'static, C: 'static> FreeVec<S, C> {
         let free = Arc::new(Self {
             inner,
             next_free_request_id: std::sync::atomic::AtomicU64::new(0),
+            in_flight: std::sync::atomic::AtomicBool::new(false),
+            on_freed: None,
         });
         let memory = Arc::new(Memory(free.clone()));
         (free, memory)
+    }
+
+    /// Set the callback invoked when freed queue_ids are available for QueueFree emission.
+    ///
+    /// Must be called before any streams are created. The callback should submit a
+    /// QueueFree frame into the endpoint's frame pipeline. It is only invoked when
+    /// `in_flight` is false (at most one submission per peer at a time).
+    ///
+    /// # Safety
+    ///
+    /// This must be called on the Arc before any clones are made (i.e., during pool setup).
+    pub fn set_on_freed(self: &mut Arc<Self>, on_freed: impl Fn() + Send + Sync + 'static) {
+        Arc::get_mut(self)
+            .expect("set_on_freed must be called before Arc is shared")
+            .on_freed = Some(Arc::new(on_freed));
+    }
+
+    /// Mark the in-flight QueueFree as completed. Called by the frame pipeline after
+    /// encoding and submitting the frame. If more frees accumulated during flight,
+    /// returns true to indicate the caller should resubmit.
+    pub fn complete_in_flight(&self) -> bool {
+        self.in_flight.store(false, std::sync::atomic::Ordering::Release);
+        // Check if more frees accumulated while we were in flight
+        let inner = self.inner.lock().unwrap();
+        let has_pending = !inner.pending_freed.is_empty();
+        drop(inner);
+        if has_pending {
+            // Try to go in-flight again
+            if !self.in_flight.swap(true, std::sync::atomic::Ordering::AcqRel) {
+                return true;
+            }
+        }
+        false
     }
 
     /// Drain pending freed queue_ids as an IntervalSet for QueueFree emission.
@@ -135,6 +170,9 @@ impl<S: 'static, C: 'static> FreeVec<S, C> {
     }
 
     /// Recycle a descriptor and record its queue_id for pending QueueFree (server path).
+    ///
+    /// After inserting into pending_freed, triggers proactive QueueFree emission
+    /// via the on_freed callback if not already in-flight (single-flight dedup).
     fn recycle_with_notify(
         &self,
         descriptor: Descriptor<S, C>,
@@ -144,8 +182,24 @@ impl<S: 'static, C: 'static> FreeVec<S, C> {
         S: Send,
         C: Send,
     {
+        let should_notify = {
+            let mut inner = self.inner.lock().unwrap();
+            let was_empty = inner.pending_freed.is_empty();
+            let _ = inner.pending_freed.insert_value(queue_id);
+            was_empty
+        };
+
+        // Trigger proactive emission if pending_freed just became non-empty
+        // and no QueueFree frame is currently in the pipeline.
+        if should_notify {
+            if let Some(ref on_freed) = self.on_freed {
+                if !self.in_flight.swap(true, std::sync::atomic::Ordering::AcqRel) {
+                    on_freed();
+                }
+            }
+        }
+
         let mut inner = self.inner.lock().unwrap();
-        let _ = inner.pending_freed.insert_value(queue_id);
         Self::recycle_inner(&mut inner, descriptor)
     }
 
