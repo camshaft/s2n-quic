@@ -93,6 +93,16 @@ where
         self.free.drain_pending_freed()
     }
 
+    /// Set the proactive QueueFree emission callback.
+    /// Called lazily from the dispatch path once frame_tx is available.
+    pub fn set_on_freed(&self, on_freed: impl Fn() + Send + Sync + 'static) {
+        self.free.set_on_freed(on_freed);
+    }
+
+    pub fn complete_in_flight(&self) -> bool {
+        self.free.complete_in_flight()
+    }
+
     #[inline]
     pub fn alloc(
         &self,

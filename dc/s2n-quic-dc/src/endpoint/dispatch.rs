@@ -350,6 +350,9 @@ where
             transmission_time: None,
         };
         response_frames.push(Entry::new(frame));
+        // Clear single-flight guard so future frees can trigger proactive emission.
+        // If more frees accumulated during encoding, the next dispatch cycle picks them up.
+        peer.queue_dispatcher.complete_queue_free_flight();
     }
 
     peer.invariants();

@@ -198,6 +198,18 @@ where
         self.pool.drain_pending_freed()
     }
 
+    /// Set the proactive QueueFree emission callback (lazy, idempotent).
+    pub fn set_on_freed(&self, on_freed: impl Fn() + Send + Sync + 'static) {
+        self.pool.set_on_freed(on_freed);
+    }
+
+    /// Signal that a QueueFree frame has been emitted. Clears the single-flight
+    /// guard so future frees can trigger proactive emission again.
+    /// Returns true if more frees accumulated during flight (caller should re-drain).
+    pub fn complete_queue_free_flight(&self) -> bool {
+        self.pool.complete_in_flight()
+    }
+
     #[inline]
     pub fn send_control(
         &mut self,

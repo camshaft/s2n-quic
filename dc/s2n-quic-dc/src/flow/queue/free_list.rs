@@ -75,7 +75,9 @@ pub(super) struct FreeVec<S: 'static, C: 'static> {
     /// Callback invoked (outside mutex) when pending_freed transitions empty → non-empty.
     /// The endpoint wires this to submit a QueueFree frame into the frame pipeline.
     /// Only called when `in_flight` is false (single-flight dedup).
-    on_freed: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// Uses OnceLock for lazy initialization — the SubmissionSender doesn't exist at
+    /// pool creation time (PathSecretEntry is created before the endpoint).
+    on_freed: std::sync::OnceLock<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl<S: 'static, C: 'static> FreeVec<S, C> {
@@ -100,7 +102,7 @@ impl<S: 'static, C: 'static> FreeVec<S, C> {
             inner,
             next_free_request_id: std::sync::atomic::AtomicU64::new(0),
             in_flight: std::sync::atomic::AtomicBool::new(false),
-            on_freed: None,
+            on_freed: std::sync::OnceLock::new(),
         });
         let memory = Arc::new(Memory(free.clone()));
         (free, memory)
@@ -108,17 +110,11 @@ impl<S: 'static, C: 'static> FreeVec<S, C> {
 
     /// Set the callback invoked when freed queue_ids are available for QueueFree emission.
     ///
-    /// Must be called before any streams are created. The callback should submit a
-    /// QueueFree frame into the endpoint's frame pipeline. It is only invoked when
-    /// `in_flight` is false (at most one submission per peer at a time).
-    ///
-    /// # Safety
-    ///
-    /// This must be called on the Arc before any clones are made (i.e., during pool setup).
-    pub fn set_on_freed(self: &mut Arc<Self>, on_freed: impl Fn() + Send + Sync + 'static) {
-        Arc::get_mut(self)
-            .expect("set_on_freed must be called before Arc is shared")
-            .on_freed = Some(Arc::new(on_freed));
+    /// Uses OnceLock — can be called at any time (even after Arc is shared).
+    /// Only the first call takes effect; subsequent calls are no-ops.
+    /// The callback should submit a QueueFree frame into the endpoint's frame pipeline.
+    pub fn set_on_freed(&self, on_freed: impl Fn() + Send + Sync + 'static) {
+        let _ = self.on_freed.set(Arc::new(on_freed));
     }
 
     /// Mark the in-flight QueueFree as completed. Called by the frame pipeline after
@@ -192,7 +188,7 @@ impl<S: 'static, C: 'static> FreeVec<S, C> {
         // Trigger proactive emission if pending_freed just became non-empty
         // and no QueueFree frame is currently in the pipeline.
         if should_notify {
-            if let Some(ref on_freed) = self.on_freed {
+            if let Some(on_freed) = self.on_freed.get() {
                 if !self.in_flight.swap(true, std::sync::atomic::Ordering::AcqRel) {
                     on_freed();
                 }
