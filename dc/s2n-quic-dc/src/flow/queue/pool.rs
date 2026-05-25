@@ -65,7 +65,9 @@ where
         let epoch = 0;
         let senders = sender::State::new(epoch);
         let (free, memory_handle) = FreeVec::new(INITIAL_PAGE_SIZE);
-        let max_slots = VarInt::from_u16(1024).as_u64() as usize;
+        // Default to a large value; callers should configure via set_max_slots
+        // based on the negotiated initial_max_queues from ApplicationParams.
+        let max_slots = VarInt::from_u32(1 << 20).as_u64() as usize;
         let mut pool = Pool {
             free,
             memory_handle,

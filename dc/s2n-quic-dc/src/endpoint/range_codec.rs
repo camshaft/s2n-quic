@@ -116,10 +116,11 @@ mod tests {
 
     fn encode_to_vec(largest: VarInt, ranges: impl Iterator<Item = core::ops::RangeInclusive<VarInt>>) -> Vec<u8> {
         let mut buf = vec![0u8; 256];
-        let mut encoder = s2n_codec::EncoderBuffer::new(&mut buf);
-        encode(largest, ranges, &mut encoder);
-        let remaining = encoder.remaining_capacity();
-        let len = buf.len() - remaining;
+        let len = {
+            let mut encoder = s2n_codec::EncoderBuffer::new(&mut buf);
+            encode(largest, ranges, &mut encoder);
+            Encoder::len(&encoder)
+        };
         buf.truncate(len);
         buf
     }
@@ -139,16 +140,13 @@ mod tests {
         let _ = set.insert(VarInt::from_u8(3)..=VarInt::from_u8(5));
         let _ = set.insert(VarInt::from_u8(8)..=VarInt::from_u8(10));
 
-        let largest = *set.max_value().unwrap();
-        // IntervalSet iterates ascending; we need descending for encode
+        let largest = set.max_value().unwrap();
+        // IntervalSet iterates ascending; collect and reverse for encode
         let ranges_desc: Vec<_> = set.inclusive_ranges()
-            .map(|r| r.start()..=r.end())
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-            .collect();
+            .map(|r| *r.start()..=*r.end())
+            .collect::<Vec<_>>();
 
-        let buf = encode_to_vec(largest, ranges_desc.into_iter());
+        let buf = encode_to_vec(largest, ranges_desc.into_iter().rev());
 
         let decoder = RangeDecoder::new(largest, &buf);
         let decoded: Vec<_> = decoder.collect();

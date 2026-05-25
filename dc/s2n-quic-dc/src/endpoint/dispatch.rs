@@ -305,25 +305,27 @@ where
     if let Some((free_request_id, queue_ids)) = peer.queue_dispatcher.drain_freed() {
         let largest_queue_id = queue_ids
             .max_value()
-            .copied()
             .unwrap_or(s2n_quic_core::varint::VarInt::ZERO);
 
-        // Encode ranges into a BytesMut, then wrap in ByteVec
+        // Encode ranges into a buffer, then wrap in ByteVec
         let range_count = queue_ids.interval_len();
-        let mut buf = bytes::BytesMut::with_capacity(range_count * 16);
-        buf.resize(range_count * 16, 0);
-        let mut encoder = s2n_codec::EncoderBuffer::new(&mut buf);
-        crate::endpoint::range_codec::encode(
-            largest_queue_id,
-            queue_ids.inclusive_ranges().rev().map(|r| r.start()..=r.end()),
-            &mut encoder,
-        );
-        let encoded_len = buf.len() - encoder.remaining_capacity();
-        buf.truncate(encoded_len);
+        let alloc_size = range_count * 16;
+        let mut raw = vec![0u8; alloc_size];
+        {
+            let mut encoder = s2n_codec::EncoderBuffer::new(&mut raw);
+            crate::endpoint::range_codec::encode(
+                largest_queue_id,
+                queue_ids.inclusive_ranges().rev().map(|r| *r.start()..=*r.end()),
+                &mut encoder,
+            );
+            let encoded_len = s2n_codec::Encoder::len(&encoder);
+            raw.truncate(encoded_len);
+        }
+        let buf = bytes::Bytes::from(raw);
 
         let mut payload = crate::byte_vec::ByteVec::new();
         if !buf.is_empty() {
-            payload.push_back(buf.freeze());
+            payload.push_back(buf);
         }
 
         let frame = Frame {
