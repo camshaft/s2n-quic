@@ -301,58 +301,18 @@ where
             enqueue_pending_ack = true;
         }
     }
-    // Emit QueueFree frame with range-compressed payload for freed slots.
-    //
-    // TODO(proactive-emission): This currently piggybacks on the recv dispatch loop,
-    // meaning QueueFree emission depends on receiving a packet from the peer. The
-    // correct design is single-flight proactive emission from the application thread
-    // (when stream handles are dropped), via a SubmissionSender threaded through the
-    // ServerFreeList. This requires deferred binding since PathSecretEntry is created
-    // before the endpoint's frame_tx exists. See plan at:
-    // .claude/plans/modular-wibbling-sonnet.md §2.2
-    if let Some((free_request_id, queue_ids)) = peer.queue_dispatcher.drain_freed() {
-        let largest_queue_id = queue_ids
-            .max_value()
-            .unwrap_or(s2n_quic_core::varint::VarInt::ZERO);
-
-        // Encode ranges into a buffer, then wrap in ByteVec
-        let range_count = queue_ids.interval_len();
-        let alloc_size = range_count * 16;
-        let mut raw = vec![0u8; alloc_size];
-        {
-            let mut encoder = s2n_codec::EncoderBuffer::new(&mut raw);
-            crate::endpoint::range_codec::encode(
-                largest_queue_id,
-                queue_ids.inclusive_ranges().rev().map(|r| *r.start()..=*r.end()),
-                &mut encoder,
-            );
-            let encoded_len = s2n_codec::Encoder::len(&encoder);
-            raw.truncate(encoded_len);
-        }
-        let buf = bytes::Bytes::from(raw);
-
-        let mut payload = crate::byte_vec::ByteVec::new();
-        if !buf.is_empty() {
-            payload.push_back(buf);
-        }
-
-        let frame = Frame {
-            source_sender_id: LocalSenderId::UNSPECIFIED,
-            header: crate::endpoint::frame::Header::QueueFree {
-                free_request_id,
-                largest_queue_id,
-            },
-            payload,
-            path_secret_entry: peer.path_entry.clone(),
-            completion: None,
-            status: crate::endpoint::frame::TransmissionStatus::default(),
-            ttl: crate::endpoint::frame::DEFAULT_TTL,
-            transmission_time: None,
-        };
-        response_frames.push(Entry::new(frame));
-        // Clear single-flight guard so future frees can trigger proactive emission.
-        // If more frees accumulated during encoding, the next dispatch cycle picks them up.
-        peer.queue_dispatcher.complete_queue_free_flight();
+    // Wire proactive QueueFree emission (OnceLock — idempotent, first call wins).
+    // The on_freed callback fires from the APPLICATION thread when a stream is dropped,
+    // encodes pending_freed ranges, and submits a QueueFree frame without waiting for
+    // a peer packet. Single-flight: at most one QueueFree in pipeline per peer.
+    {
+        let frame_tx = std::sync::Mutex::new(frame_tx.clone());
+        let path_entry = peer.path_entry.clone();
+        let dispatcher = peer.queue_dispatcher.clone();
+        peer.queue_dispatcher.set_on_freed(move || {
+            let mut tx = frame_tx.lock().unwrap();
+            emit_queue_free(&dispatcher, &mut tx, &path_entry);
+        });
     }
 
     peer.invariants();
@@ -505,6 +465,62 @@ fn dispatch_decoded_frame(
                     "dropping ACK sender message; sender queue is closed"
                 );
             }
+        }
+    }
+}
+
+/// Proactive QueueFree emission: drains pending freed queue_ids from the dispatcher,
+/// encodes them as ACK-style ranges, and submits to the frame pipeline.
+/// Called from the application thread (via on_freed callback) when streams are dropped.
+fn emit_queue_free(
+    dispatcher: &msg::queue::Dispatcher,
+    frame_tx: &mut SubmissionSender,
+    path_entry: &std::sync::Arc<PathSecretEntry>,
+) {
+    while let Some((free_request_id, queue_ids)) = dispatcher.drain_freed() {
+        let largest_queue_id = queue_ids
+            .max_value()
+            .unwrap_or(s2n_quic_core::varint::VarInt::ZERO);
+
+        let range_count = queue_ids.interval_len();
+        let alloc_size = range_count * 16;
+        let mut raw = vec![0u8; alloc_size];
+        {
+            let mut encoder = s2n_codec::EncoderBuffer::new(&mut raw);
+            crate::endpoint::range_codec::encode(
+                largest_queue_id,
+                queue_ids.inclusive_ranges().rev().map(|r| *r.start()..=*r.end()),
+                &mut encoder,
+            );
+            let encoded_len = s2n_codec::Encoder::len(&encoder);
+            raw.truncate(encoded_len);
+        }
+        let buf = bytes::Bytes::from(raw);
+
+        let mut payload = ByteVec::new();
+        if !buf.is_empty() {
+            payload.push_back(buf);
+        }
+
+        let frame = Frame {
+            source_sender_id: LocalSenderId::UNSPECIFIED,
+            header: Header::QueueFree {
+                free_request_id,
+                largest_queue_id,
+            },
+            payload,
+            path_secret_entry: path_entry.clone(),
+            completion: None,
+            status: crate::endpoint::frame::TransmissionStatus::default(),
+            ttl: DEFAULT_TTL,
+            transmission_time: None,
+        };
+        let mut input = PriorityInput::default();
+        input.push(Entry::new(frame));
+        let _ = frame_tx.send_batch(input);
+
+        if !dispatcher.complete_queue_free_flight() {
+            break;
         }
     }
 }
