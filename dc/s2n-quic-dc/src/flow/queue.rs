@@ -178,14 +178,15 @@ where
     /// Allocate a specific slot by index, growing pages as needed.
     ///
     /// Used by the server to allocate at the exact `dest_queue_id` the client specified.
-    /// Returns `None` if the slot is already allocated (retransmit/duplicate race).
+    /// Returns `Ok(None)` if the slot is already allocated (retransmit/duplicate race).
+    /// Returns `Err(GrowError)` if the queue_id exceeds max_slots.
     #[inline]
     pub fn alloc_at_or_grow(
         &mut self,
         slot_index: usize,
         key: Handle,
         remote_queue_id: Option<VarInt>,
-    ) -> Option<(Control<S, C>, Stream<S, C>)> {
+    ) -> Result<Option<(Control<S, C>, Stream<S, C>)>, pool::GrowError> {
         self.pool.alloc_at_or_grow(slot_index, key, remote_queue_id)
     }
 

@@ -65,9 +65,13 @@ where
         let epoch = 0;
         let senders = sender::State::new(epoch);
         let (free, memory_handle) = FreeVec::new(INITIAL_PAGE_SIZE);
-        // Default to a large value; callers should configure via set_max_slots
-        // based on the negotiated initial_max_queues from ApplicationParams.
-        let max_slots = VarInt::from_u32(1 << 20).as_u64() as usize;
+        // Client pools grow without bound (client controls its own indices).
+        // Server pools should be configured via set_max_slots from initial_max_queues.
+        let max_slots = if server {
+            VarInt::from_u32(1 << 20).as_u64() as usize
+        } else {
+            usize::MAX
+        };
         let mut pool = Pool {
             free,
             memory_handle,
@@ -77,7 +81,7 @@ where
             max_slots,
             server,
         };
-        pool.grow();
+        pool.grow().expect("initial grow must succeed");
         pool
     }
 
@@ -108,6 +112,10 @@ where
         self.free.alloc(key, remote_queue_id)
     }
 
+    /// Client-side allocation: always succeeds (grows without bound).
+    ///
+    /// The client controls its own local queue IDs — no attacker can force a specific
+    /// index, so there's no DoS vector. The pool grows as needed.
     #[inline]
     pub fn alloc_or_grow(
         &mut self,
@@ -119,7 +127,9 @@ where
                 Ok(descriptor) => return descriptor,
                 Err(k) => {
                     key = k;
-                    self.grow();
+                    // Client pool growth is uncapped — this is safe because
+                    // the client controls allocation sequentially.
+                    let _ = self.grow();
                 }
             }
         }
@@ -130,39 +140,35 @@ where
     /// Used by the server to allocate at the exact `dest_queue_id` the client specified.
     /// Returns `None` if the slot is already allocated (retransmit race — caller should
     /// retry via `send_stream` which will validate the binding_id).
+    /// Returns `Err(GrowError)` if the queue_id exceeds max_slots (DoS prevention).
     #[inline]
     pub fn alloc_at_or_grow(
         &mut self,
         slot_index: usize,
         mut key: crate::flow::Handle,
         remote_queue_id: Option<VarInt>,
-    ) -> Option<(Control<S, C>, Stream<S, C>)> {
+    ) -> Result<Option<(Control<S, C>, Stream<S, C>)>, GrowError> {
         loop {
             match self.free.alloc_at(slot_index, key, remote_queue_id) {
-                Ok(descriptor) => return Some(descriptor),
+                Ok(descriptor) => return Ok(Some(descriptor)),
                 Err(k) => {
                     key = k;
                     if self.epoch > slot_index {
-                        // Slot is within range but already allocated — another
-                        // dispatch worker won the race. Caller should retry via
-                        // send_stream which will validate the binding_id.
-                        return None;
+                        return Ok(None);
                     }
-                    self.grow();
+                    self.grow()?;
                 }
             }
         }
     }
 
     #[inline(never)] // this should happen rarely
-    fn grow(&mut self) {
-        // Page sizes double with each grow: page 0 has INITIAL_PAGE_SIZE slots,
-        // page 1 has 2×, page 2 has 4×, etc.  After n grows the epoch is
-        // (2^(n+1) − 1) × INITIAL_PAGE_SIZE, so the next page size is always
-        // epoch + INITIAL_PAGE_SIZE. Capped by max_slots (from initial_max_queues).
+    fn grow(&mut self) -> Result<(), GrowError> {
         let remaining = self.max_slots.saturating_sub(self.epoch);
         let page_size = (self.epoch + INITIAL_PAGE_SIZE).min(remaining);
-        assert!(page_size > 0, "flow queue slot space exhausted (max_slots={})", self.max_slots);
+        if page_size == 0 {
+            return Err(GrowError);
+        }
 
         let (region, layout) = Region::alloc(page_size);
 
@@ -225,10 +231,10 @@ where
             }
 
             drop(senders);
-            debug!("grow failed");
+            debug!("grow raced — another instance grew first");
 
             // return back to the alloc method, which may have a free descriptor now
-            return;
+            return Ok(());
         }
 
         // update the epoch with the latest value
@@ -249,8 +255,12 @@ where
 
         // push all of the descriptors into the free list
         self.free.record_region(region, pending_desc);
+        Ok(())
     }
 }
+
+#[derive(Debug, Clone, Copy)]
+pub struct GrowError;
 
 pub(super) struct Region<S: 'static, C: 'static> {
     ptr: NonNull<u8>,

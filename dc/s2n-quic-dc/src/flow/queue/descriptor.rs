@@ -391,11 +391,12 @@ pub(super) struct DescriptorInner<S, C> {
     /// The slot index. This IS the queue_id — it never changes after initialization.
     id: VarInt,
     /// MSB-encoded binding_id:
-    ///   bit 63 = ALLOCATED (in use)
-    ///   bits 0-61 = binding_id value
-    ///   u64::MAX = UNBOUND (never used)
+    ///   bit 63 = UNALLOCATED_BIT (set = free, clear = in use)
+    ///   bits 0-61 = binding_id value (VarInt range)
+    ///   u64::MAX = UNBOUND (never used, naturally has MSB set → free)
     ///
-    /// After free, MSB is cleared but binding_id value preserved for stale detection.
+    /// After free: `fetch_or(UNALLOCATED_BIT)` sets MSB, preserving binding_id for
+    /// stale-retransmit detection. After bind: stores raw binding_id (MSB clear).
     binding_id: AtomicU64,
     /// The peer's queue ID, written once by the dispatcher on first observation.
     /// Initialized to `u64::MAX` (unknown) and set via a relaxed store.

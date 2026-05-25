@@ -602,7 +602,7 @@ impl Entry {
     /// Allocates a queue slot from this entry's pool, growing if needed.
     ///
     /// Used by the client connect path where only allocation is needed
-    /// (no dispatch routing).
+    /// (no dispatch routing). Always succeeds — client pool grows without bound.
     pub fn alloc_queue(
         &self,
         handle: crate::flow::Handle,

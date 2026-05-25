@@ -714,13 +714,13 @@ fn handle_queue_data_server_init(
         Err(flow::queue::Error::Unallocated(returned_entry)) => {
             // Slot is free or doesn't exist — allocate and bind atomically.
             let handle = flow::Handle::new(binding_id);
-            let Some((queue_control, queue_stream)) = peer
+            let alloc_result = peer
                 .queue_dispatcher
-                .alloc_at_or_grow(local_queue_id.as_u64() as usize, handle, Some(peer_queue_id))
-            else {
-                // alloc_at_or_grow returned None: slot was already allocated by another
-                // worker (init_key CAS failed). Retry via send_stream which validates
-                // against the winner's binding_id.
+                .alloc_at_or_grow(local_queue_id.as_u64() as usize, handle, Some(peer_queue_id));
+            let Some((queue_control, queue_stream)) = alloc_result.ok().flatten() else {
+                // Either GrowError (queue_id exceeds max_slots) or None (slot already
+                // allocated by another worker). Retry via send_stream which validates
+                // against the winner's binding_id, or drop if out of range.
                 match peer.queue_dispatcher.send_stream(
                     local_queue_id,
                     Some(peer_queue_id),
