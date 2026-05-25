@@ -69,6 +69,13 @@ pub(super) struct FreeVec<S: 'static, C: 'static> {
     inner: Mutex<FreeInner<S, C>>,
     /// Monotonic counter for free_request_ids stamped on QueueFree batches.
     next_free_request_id: std::sync::atomic::AtomicU64,
+    /// Single-flight guard: true when a QueueFree frame is already in the pipeline.
+    /// Prevents multiple concurrent submissions when many streams free simultaneously.
+    in_flight: std::sync::atomic::AtomicBool,
+    /// Callback invoked (outside mutex) when pending_freed transitions empty → non-empty.
+    /// The endpoint wires this to submit a QueueFree frame into the frame pipeline.
+    /// Only called when `in_flight` is false (single-flight dedup).
+    on_freed: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl<S: 'static, C: 'static> FreeVec<S, C> {

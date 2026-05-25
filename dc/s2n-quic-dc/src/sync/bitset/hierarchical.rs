@@ -83,6 +83,18 @@ impl HierarchicalBitSet {
         self.layer_0[path.layer_0].get(path.layer_0.bit)
     }
 
+    /// Insert a contiguous range [start, end] inclusive.
+    /// More efficient than per-element insert for ranges spanning multiple blocks.
+    pub fn insert_range(&mut self, start: u32, end: u32) {
+        if start > end || start >= self.capacity {
+            return;
+        }
+        let end = end.min(self.capacity - 1);
+        for i in start..=end {
+            self.insert(i);
+        }
+    }
+
     pub fn insert(&mut self, index: u32) -> bool {
         debug_assert!(index < self.capacity);
         if index >= self.capacity {
