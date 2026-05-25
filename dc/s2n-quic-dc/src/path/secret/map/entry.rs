@@ -585,12 +585,14 @@ impl Entry {
     ///
     /// `free_request_id` is the server's monotonic stamp for this QueueFree batch.
     /// Deduplication uses the request_id — duplicate/replayed messages are rejected.
+    /// Wakers are shipped to `waker_sink` rather than woken inline.
     pub fn on_peer_queue_freed(
         &self,
         free_request_id: VarInt,
         queue_ids: &s2n_quic_core::interval_set::IntervalSet<VarInt>,
+        waker_sink: &mut impl FnMut(std::task::Waker),
     ) -> PeerQueueFreeResult {
-        if self.peer_free_list.free(free_request_id, queue_ids) {
+        if self.peer_free_list.free(free_request_id, queue_ids, waker_sink) {
             PeerQueueFreeResult::Accepted
         } else {
             PeerQueueFreeResult::Stale

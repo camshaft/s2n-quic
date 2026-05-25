@@ -430,7 +430,11 @@ fn dispatch_decoded_frame(
             // For now, treat largest_queue_id as the single freed queue_id.
             let mut queue_ids = s2n_quic_core::interval_set::IntervalSet::new();
             let _ = queue_ids.insert_value(largest_queue_id);
-            match peer.path_entry.on_peer_queue_freed(free_request_id, &queue_ids) {
+            match peer.path_entry.on_peer_queue_freed(
+                free_request_id,
+                &queue_ids,
+                &mut |waker| { let _ = waker_sink.send(AutoWake::new(Some(waker))); },
+            ) {
                 crate::path::secret::map::PeerQueueFreeResult::Accepted => trace!(
                     free_request_id = free_request_id.as_u64(),
                     queue_id = largest_queue_id.as_u64(),

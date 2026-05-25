@@ -21,6 +21,8 @@ pub struct Pool<
     memory_handle: Arc<free_list::Memory<S, C>>,
     epoch_summary: Option<counter::Summary>,
     epoch: usize,
+    /// Maximum number of queue slots (from initial_max_queues). Prevents DoS via large queue_ids.
+    max_slots: usize,
     server: bool,
 }
 
@@ -35,6 +37,7 @@ impl<S: 'static + Send, C: 'static + Send, const INITIAL_PAGE_SIZE: usize>
             senders: self.senders.clone(),
             epoch_summary: self.epoch_summary.clone(),
             epoch: self.epoch,
+            max_slots: self.max_slots,
             server: self.server,
         }
     }
@@ -62,16 +65,22 @@ where
         let epoch = 0;
         let senders = sender::State::new(epoch);
         let (free, memory_handle) = FreeVec::new(INITIAL_PAGE_SIZE);
+        let max_slots = VarInt::from_u16(1024).as_u64() as usize;
         let mut pool = Pool {
             free,
             memory_handle,
             senders,
             epoch_summary,
             epoch,
+            max_slots,
             server,
         };
         pool.grow();
         pool
+    }
+
+    pub fn set_max_slots(&mut self, max: usize) {
+        self.max_slots = max;
     }
 
     #[inline]
@@ -148,10 +157,10 @@ where
         // Page sizes double with each grow: page 0 has INITIAL_PAGE_SIZE slots,
         // page 1 has 2×, page 2 has 4×, etc.  After n grows the epoch is
         // (2^(n+1) − 1) × INITIAL_PAGE_SIZE, so the next page size is always
-        // epoch + INITIAL_PAGE_SIZE. VarInt::MAX provides the upper bound.
-        let max_slots = VarInt::MAX.as_u64() as usize;
-        let page_size = (self.epoch + INITIAL_PAGE_SIZE).min(max_slots - self.epoch);
-        assert!(page_size > 0, "flow queue slot space exhausted");
+        // epoch + INITIAL_PAGE_SIZE. Capped by max_slots (from initial_max_queues).
+        let remaining = self.max_slots.saturating_sub(self.epoch);
+        let page_size = (self.epoch + INITIAL_PAGE_SIZE).min(remaining);
+        assert!(page_size > 0, "flow queue slot space exhausted (max_slots={})", self.max_slots);
 
         let (region, layout) = Region::alloc(page_size);
 
@@ -159,6 +168,14 @@ where
 
         let mut pending_desc = vec![];
         let mut pending_senders = vec![];
+
+        // Hoist the free list Arc outside the loop — all descriptors in a pool share
+        // the same impl. Creating it once avoids page_size unnecessary Arc allocations.
+        let free_list: Arc<dyn super::free_list::FreeList<S, C>> = if self.server {
+            Arc::new(ServerFreeList(self.free.clone()))
+        } else {
+            Arc::new(ClientFreeList(self.free.clone()))
+        };
 
         for idx in 0..page_size {
             let offset = layout.size() * idx;
@@ -169,12 +186,7 @@ where
                     .add(offset)
                     .cast::<DescriptorInner<S, C>>();
 
-                // Give the descriptor a reference to the appropriate free list impl.
-                let free_list: Arc<dyn super::free_list::FreeList<S, C>> = if self.server {
-                    Arc::new(ServerFreeList(self.free.clone()))
-                } else {
-                    Arc::new(ClientFreeList(self.free.clone()))
-                };
+                let free_list = free_list.clone();
 
                 // initialize the descriptor with the channels
                 descriptor.write(DescriptorInner::new(

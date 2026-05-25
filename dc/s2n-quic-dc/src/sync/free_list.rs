@@ -144,9 +144,14 @@ impl FreeList {
     /// Returns true if the message was accepted (new free_request_id), false if
     /// it was a duplicate/replay.
     ///
-    /// `free_request_id` is the server's monotonic stamp for this QueueFree batch.
-    /// `queue_ids` is the IntervalSet of queue_ids being freed.
-    pub fn free(&self, free_request_id: VarInt, queue_ids: &IntervalSet<VarInt>) -> bool {
+    /// Wakers are shipped to `waker_sink` rather than woken inline, because this
+    /// is called from the dispatcher thread where syscalls are unacceptable.
+    pub fn free(
+        &self,
+        free_request_id: VarInt,
+        queue_ids: &IntervalSet<VarInt>,
+        waker_sink: &mut impl FnMut(Waker),
+    ) -> bool {
         let mut inner = self.inner.lock().unwrap();
 
         // Dedup: reject if we've already seen this free_request_id
@@ -155,9 +160,7 @@ impl FreeList {
         }
         let _ = inner.seen_requests.insert_value(free_request_id);
 
-        // Insert ALL freed queue_ids into the available set first, then wake.
-        // Previously this returned early after waking the first waiter, which
-        // would silently drop remaining ranges from multi-range QueueFree messages.
+        // Insert ALL freed queue_ids into the available set first, then ship wakers.
         for range in queue_ids.inclusive_ranges() {
             let start = range.start().as_u64() as u32;
             let end = range.end().as_u64() as u32;
@@ -170,11 +173,9 @@ impl FreeList {
             }
         }
 
-        // Wake waiters after all IDs are inserted
-        let waiters: Vec<_> = inner.waiters.drain(..).collect();
-        drop(inner);
-        for waker in waiters {
-            waker.wake();
+        // Ship wakers to another thread — never wake inline on the dispatch path
+        for waker in inner.waiters.drain(..) {
+            waker_sink(waker);
         }
         true
     }
@@ -187,6 +188,13 @@ impl FreeList {
         for waker in waiters {
             waker.wake();
         }
+    }
+}
+
+impl FreeList {
+    #[cfg(test)]
+    fn free_for_test(&self, free_request_id: VarInt, queue_ids: &IntervalSet<VarInt>) -> bool {
+        self.free(free_request_id, queue_ids, &mut |w| w.wake())
     }
 }
 
@@ -219,7 +227,7 @@ mod tests {
 
         // Free id1 with request_id=1
         let ids = interval_set_single(id1);
-        assert!(list.free(VarInt::from_u8(1), &ids));
+        assert!(list.free_for_test(VarInt::from_u8(1), &ids));
         assert_eq!(list.try_alloc(), Some(id1));
         assert_eq!(list.try_alloc(), None);
 
@@ -227,7 +235,7 @@ mod tests {
         let mut both = IntervalSet::new();
         let _ = both.insert_value(id0);
         let _ = both.insert_value(id1);
-        assert!(list.free(VarInt::from_u8(2), &both));
+        assert!(list.free_for_test(VarInt::from_u8(2), &both));
         // pop_first returns lowest index first
         assert_eq!(list.try_alloc(), Some(id0));
         assert_eq!(list.try_alloc(), Some(id1));
@@ -239,15 +247,15 @@ mod tests {
         let ids = interval_set_single(VarInt::from_u8(7));
 
         // First free succeeds
-        assert!(list.free(VarInt::from_u8(1), &ids));
+        assert!(list.free_for_test(VarInt::from_u8(1), &ids));
         assert_eq!(list.try_alloc(), Some(VarInt::from_u8(7)));
 
         // Same request_id rejected (replay)
-        assert!(!list.free(VarInt::from_u8(1), &ids));
+        assert!(!list.free_for_test(VarInt::from_u8(1), &ids));
         assert_eq!(list.try_alloc(), None);
 
         // New request_id succeeds
-        assert!(list.free(VarInt::from_u8(2), &ids));
+        assert!(list.free_for_test(VarInt::from_u8(2), &ids));
         assert_eq!(list.try_alloc(), Some(VarInt::from_u8(7)));
     }
 }
