@@ -18,6 +18,8 @@ pub mod endpoint;
 pub mod event;
 pub mod flow;
 pub mod intrusive;
+pub mod queue;
+pub mod sync;
 pub mod msg;
 pub mod packet;
 pub mod path;
