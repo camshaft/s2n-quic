@@ -302,6 +302,14 @@ where
         }
     }
     // Emit QueueFree frame with range-compressed payload for freed slots.
+    //
+    // TODO(proactive-emission): This currently piggybacks on the recv dispatch loop,
+    // meaning QueueFree emission depends on receiving a packet from the peer. The
+    // correct design is single-flight proactive emission from the application thread
+    // (when stream handles are dropped), via a SubmissionSender threaded through the
+    // ServerFreeList. This requires deferred binding since PathSecretEntry is created
+    // before the endpoint's frame_tx exists. See plan at:
+    // .claude/plans/modular-wibbling-sonnet.md §2.2
     if let Some((free_request_id, queue_ids)) = peer.queue_dispatcher.drain_freed() {
         let largest_queue_id = queue_ids
             .max_value()
