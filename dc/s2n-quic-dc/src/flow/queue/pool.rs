@@ -54,12 +54,6 @@ where
         Self::with_options(epoch_summary, true)
     }
 
-    /// Create a client-side pool that silently recycles descriptors.
-    #[inline]
-    pub fn new_client(epoch_summary: Option<counter::Summary>) -> Self {
-        Self::with_options(epoch_summary, false)
-    }
-
     #[inline]
     fn with_options(epoch_summary: Option<counter::Summary>, server: bool) -> Self {
         let epoch = 0;
@@ -83,10 +77,6 @@ where
         };
         pool.grow().expect("initial grow must succeed");
         pool
-    }
-
-    pub fn set_max_slots(&mut self, max: usize) {
-        self.max_slots = max;
     }
 
     #[inline]
