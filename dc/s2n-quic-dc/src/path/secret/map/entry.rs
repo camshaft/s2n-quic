@@ -549,6 +549,8 @@ impl Entry {
     ///
     /// Even at 10M streams/sec, the 62-bit space would take roughly 14.6k years
     /// to exhaust, and path re-handshakes should rotate state long before that.
+    /// At one allocation per microsecond, a u64 counter would take ~584,942 years
+    /// to exhaust. Rehandshaking rotates entries well before that.
     pub fn alloc_binding_id(&self) -> s2n_quic_core::varint::VarInt {
         let max = s2n_quic_core::varint::VarInt::MAX.as_u64();
         let id = self.next_binding_id.fetch_add(1, Ordering::Relaxed);

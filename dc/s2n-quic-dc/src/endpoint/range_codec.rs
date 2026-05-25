@@ -14,7 +14,7 @@
 //! Gap = previous_smallest - current_end - 2 (same as RFC 9000 §19.3.1)
 //! Range = end - start (number of values beyond the first in this range)
 
-use s2n_codec::{DecoderBuffer, DecoderValue, Encoder, EncoderValue};
+use s2n_codec::{DecoderBuffer, Encoder};
 use s2n_quic_core::varint::VarInt;
 
 /// Encode freed queue_id ranges directly into an encoder. Zero allocations.

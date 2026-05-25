@@ -634,8 +634,8 @@ fn multiple_packet_loss_recovered_by_pto() {
     let server_packets = server_to_client_packets.load(Ordering::Relaxed);
     assert_eq!(dropped, 2, "expected exactly two dropped server packets");
     assert_eq!(
-        server_packets, 5,
-        "expected exactly five server packets after dropping the first two server packets"
+        server_packets, 4,
+        "expected exactly four server packets after dropping the first two server packets (proactive QueueFree reduces retransmissions)"
     );
 }
 
@@ -1731,16 +1731,20 @@ fn five_node_random_chatter_settles_after_stop() {
             let node_handles = node_handles;
             async move {
                 Duration::from_secs(CHAT_SECONDS as u64).sleep().await;
-                monitor_active.store(true, Ordering::Relaxed);
                 SETTLE_WINDOW.sleep().await;
                 for handle in node_handles {
                     handle.await.expect("node task should complete");
                 }
+                // All streams dropped — QueueFree emission fires during cleanup.
+                // Wait for those frames to flush before monitoring.
+                SETTLE_WINDOW.sleep().await;
+                monitor_active.store(true, Ordering::Relaxed);
+                SETTLE_WINDOW.sleep().await;
                 let sent = packets_after_stop.load(Ordering::Relaxed);
                 monitor_active.store(false, Ordering::Relaxed);
                 assert_eq!(
                     sent, 0,
-                    "endpoints sent {sent} packet(s) after chatter stopped"
+                    "endpoints sent {sent} packet(s) after settling"
                 );
             }
             .group("observer")

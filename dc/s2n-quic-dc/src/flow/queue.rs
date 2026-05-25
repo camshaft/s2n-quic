@@ -17,7 +17,7 @@ mod pool;
 mod probes;
 mod sender;
 
-pub use descriptor::{ServerValidation, ValidationError};
+pub use descriptor::ValidationError;
 pub use inner::AutoWake;
 
 /// Size of the first allocated page of queue slots.

@@ -1,5 +1,6 @@
 ---
 source: dc/s2n-quic-dc/src/testing.rs
+assertion_line: 352
 expression: logs
 ---
 0:00:00.000000000 [server] DEBUG s2n_quic_dc: capacity=50000
@@ -9734,7 +9735,10 @@ expression: logs
 0:00:00.001021000 [client] TRACE c#q.router_to_batcher.enq[p1]=1
 0:00:00.001021000 [client] TRACE g#q.router_to_batcher.depth[p1]=1
 0:00:00.001021000 [client] TRACE m#q.router_to_batcher.depth_dist[p1]=1
-0:00:00.001021000 [client] TRACE m#task.priority_router.drained=1
+0:00:00.001021000 [client] TRACE c#q.router_to_batcher.enq[p0]=1
+0:00:00.001021000 [client] TRACE g#q.router_to_batcher.depth[p0]=1
+0:00:00.001021000 [client] TRACE m#q.router_to_batcher.depth_dist[p0]=1
+0:00:00.001021000 [client] TRACE m#task.priority_router.drained=2
 0:00:00.001021000 [client] TRACE m#asm.max_datagram_size=1472
 0:00:00.001021000 [client] TRACE c#send.ack.drain[send.5]=1
 0:00:00.001021000 [client] TRACE g#send.ack.depth[send.5]=0
@@ -9867,10 +9871,13 @@ expression: logs
 0:00:00.001021000 [client] TRACE c#socket.tx.ops[send.3]=1
 0:00:00.001021000 [client] TRACE c#socket.tx.bytes[send.3]=54
 0:00:00.001021000 [client] TRACE m#task.assembler.drained[send.3]=1
+0:00:00.001021000 [client] TRACE c#q.router_to_batcher.receiver[p0.task.frame_dispatch]=1
+0:00:00.001021000 [client] TRACE c#q.router_to_batcher.drain[p0]=1
+0:00:00.001021000 [client] TRACE g#q.router_to_batcher.depth[p0]=0
 0:00:00.001021000 [client] TRACE c#q.router_to_batcher.receiver[p1.task.frame_dispatch]=1
 0:00:00.001021000 [client] TRACE c#q.router_to_batcher.drain[p1]=1
 0:00:00.001021000 [client] TRACE g#q.router_to_batcher.depth[p1]=0
-0:00:00.001021000 [client] TRACE m#task.frame_dispatch.drained=2
+0:00:00.001021000 [client] TRACE m#task.frame_dispatch.drained=4
 0:00:00.001021000 [client] TRACE c#q.dispatch.receiver[recv.dispatch.2.task.ack_completion]=1
 0:00:00.001021000 [client] TRACE c#q.dispatch.drain[recv.dispatch.2]=1
 0:00:00.001021000 [client] TRACE g#q.dispatch.depth[recv.dispatch.2]=1
@@ -9924,6 +9931,9 @@ expression: logs
 0:00:00.001041000 [client] TRACE c#send.pending.enq[send.6]=1
 0:00:00.001041000 [client] TRACE g#send.pending.depth[send.6]=1
 0:00:00.001041000 [client] TRACE m#send.pending.depth_dist[send.6]=1
+0:00:00.001041000 [client] TRACE c#send.pending.enq[send.6]=1
+0:00:00.001041000 [client] TRACE g#send.pending.depth[send.6]=2
+0:00:00.001041000 [client] TRACE m#send.pending.depth_dist[send.6]=2
 0:00:00.001041000 [client] TRACE c#q.resolver_to_tx_wheel.sender[send.worker.2.task.context_resolver]=1
 0:00:00.001041000 [client] TRACE c#q.resolver_to_tx_wheel.enq[send.worker.2]=1
 0:00:00.001041000 [client] TRACE g#q.resolver_to_tx_wheel.depth[send.worker.2]=1
@@ -9942,11 +9952,14 @@ expression: logs
 0:00:00.001041000 [client] TRACE g#q.wheel_to_assembler.depth[send.6]=0
 0:00:00.001041000 [client] TRACE m#asm.max_datagram_size=1472
 0:00:00.001041000 [client] TRACE c#send.pending.drain[send.6]=1
+0:00:00.001041000 [client] TRACE g#send.pending.depth[send.6]=1
+0:00:00.001041000 [client] TRACE c#tx.frame[queue_free]=1
+0:00:00.001041000 [client] TRACE c#send.pending.drain[send.6]=1
 0:00:00.001041000 [client] TRACE g#send.pending.depth[send.6]=0
 0:00:00.001041000 [client] TRACE c#tx.frame[queue_reset]=1
-0:00:00.001041000 [client] TRACE m#tx.packet_size=46
-0:00:00.001041000 [client] TRACE m#tx.frames_per_packet=1
-0:00:00.001041000 [client] TRACE m#tx.payload_size=0
+0:00:00.001041000 [client] TRACE m#tx.packet_size=51
+0:00:00.001041000 [client] TRACE m#tx.frames_per_packet=2
+0:00:00.001041000 [client] TRACE m#tx.payload_size=1
 0:00:00.001041000 [client] TRACE c#tx.data=1
 0:00:00.001041000 [client] TRACE c#tx.data[send.6]=1
 0:00:00.001041000 [client] TRACE c#send.inflight.enq[send.6]=1
@@ -9958,7 +9971,7 @@ expression: logs
 0:00:00.001041000 [client] TRACE g#q.resolver_to_pto_wheel.depth[send.worker.2]=1
 0:00:00.001041000 [client] TRACE m#q.resolver_to_pto_wheel.depth_dist[send.worker.2]=1
 0:00:00.001041000 [client] TRACE c#socket.tx.ops[send.6]=1
-0:00:00.001041000 [client] TRACE c#socket.tx.bytes[send.6]=46
+0:00:00.001041000 [client] TRACE c#socket.tx.bytes[send.6]=51
 0:00:00.001041000 [client] TRACE m#task.assembler.drained[send.6]=1
 0:00:00.001041000 [client] TRACE m#task.tx_wheel.drained[send.worker.2]=0
 0:00:00.001041000 [client] TRACE m#task.pto_wheel.drained[send.worker.2]=1
@@ -18681,7 +18694,7 @@ expression: logs
 0:00:00.001521000 [server] TRACE m#task.assembler.drained[send.3]=1
 0:00:00.001521000 [server] TRACE m#task.tx_wheel.drained[send.worker.3]=0
 0:00:00.001541000 [server] TRACE c#socket.rx.ops[recv.6]=1
-0:00:00.001541000 [server] TRACE c#socket.rx.bytes[recv.6]=46
+0:00:00.001541000 [server] TRACE c#socket.rx.bytes[recv.6]=51
 0:00:00.001541000 [server] TRACE c#router.routed=1
 0:00:00.001541000 [server] TRACE c#router.routed[recv.2]=1
 0:00:00.001541000 [server] TRACE c#q.dispatch_rx.enq[recv.2]=1
@@ -18694,11 +18707,12 @@ expression: logs
 0:00:00.001541000 [server] TRACE c#rx.data_pkt=1
 0:00:00.001541000 [server] TRACE c#rx.peer_cache.hit=1
 0:00:00.001541000 [server] TRACE c#rx.ecn[ect0]=1
-0:00:00.001541000 [server] TRACE m#rx.packet_size=0
+0:00:00.001541000 [server] TRACE m#rx.packet_size=1
+0:00:00.001541000 [server] TRACE c#rx.frame[queue_free]=1
 0:00:00.001541000 [server] TRACE c#rx.frame[queue_reset]=1
 0:00:00.001541000 [server] TRACE c#rx.reset.control=1
 0:00:00.001541000 [server] DEBUG QueueReset(Control) dispatched binding_id=0 queue_id=0 error_code=6
-0:00:00.001541000 [server] TRACE m#rx.frames_per_packet=1
+0:00:00.001541000 [server] TRACE m#rx.frames_per_packet=2
 0:00:00.001541000 [server] DEBUG event=on_ack_eliciting prev=Idle next=Scheduled location=dc/s2n-quic-dc/src/endpoint/dispatch.rs
 0:00:00.001541000 [server] TRACE m#task.packet_dispatch.drained[recv.dispatch.2]=2
 0:00:00.001541000 [server] TRACE m#task.waker_drain.drained[waker.11]=1
@@ -18718,6 +18732,10 @@ expression: logs
 0:00:00.001541000 [server] TRACE g#send.ack.depth[send.6]=1
 0:00:00.001541000 [server] TRACE m#send.ack.depth_dist[send.6]=1
 0:00:00.001541000 [server] TRACE m#task.ack_processor.drained[send.worker.2]=2
+0:00:00.001541000 [server] TRACE c#q.router_to_batcher.enq[p0]=1
+0:00:00.001541000 [server] TRACE g#q.router_to_batcher.depth[p0]=1
+0:00:00.001541000 [server] TRACE m#q.router_to_batcher.depth_dist[p0]=1
+0:00:00.001541000 [server] TRACE m#task.priority_router.drained=1
 0:00:00.001541000 [server] TRACE m#asm.max_datagram_size=1472
 0:00:00.001541000 [server] TRACE c#send.ack.drain[send.6]=1
 0:00:00.001541000 [server] TRACE g#send.ack.depth[send.6]=0
@@ -18734,6 +18752,10 @@ expression: logs
 0:00:00.001541000 [server] TRACE c#socket.tx.ops[send.6]=1
 0:00:00.001541000 [server] TRACE c#socket.tx.bytes[send.6]=54
 0:00:00.001541000 [server] TRACE m#task.assembler.drained[send.6]=1
+0:00:00.001541000 [server] TRACE c#q.router_to_batcher.receiver[p0.task.frame_dispatch]=1
+0:00:00.001541000 [server] TRACE c#q.router_to_batcher.drain[p0]=1
+0:00:00.001541000 [server] TRACE g#q.router_to_batcher.depth[p0]=0
+0:00:00.001541000 [server] TRACE m#task.frame_dispatch.drained=2
 0:00:00.001541000 [server] TRACE c#q.dispatch.receiver[recv.dispatch.2.task.ack_completion]=1
 0:00:00.001541000 [server] TRACE c#q.dispatch.drain[recv.dispatch.2]=1
 0:00:00.001541000 [server] TRACE g#q.dispatch.depth[recv.dispatch.2]=0

@@ -55,14 +55,6 @@ impl ValidationError {
     }
 }
 
-/// Result of server-side validation
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ServerValidation {
-    /// Key matched an existing binding
-    Bound,
-    /// Queue was unbound; key has been set (new binding created)
-    NewBinding,
-}
 
 /// A pointer to a single descriptor in a group
 ///
@@ -157,6 +149,9 @@ impl<S: 'static, C: 'static> Descriptor<S, C> {
 
     #[inline]
     fn inner(&self) -> &DescriptorInner<S, C> {
+        // SAFETY: The descriptor pointer is always valid while the Descriptor exists.
+        // The pointer is constructed from a valid allocation and the lifetime is tied
+        // to the descriptor's ownership by the free list.
         unsafe { self.ptr.as_ref() }
     }
 
@@ -322,66 +317,6 @@ impl<S: 'static, C: 'static> Descriptor<S, C> {
         }
     }
 
-    /// Server-side: validate or atomically bind if the slot is free.
-    ///
-    /// Uses `fetch_update` to atomically check "is this slot free?" (UNALLOCATED_BIT set)
-    /// and set the binding_id (MSB clear = allocated) in a single CAS. No TOCTOU possible.
-    #[inline]
-    pub fn validate_or_bind(
-        &self,
-        received: &VarInt,
-    ) -> Result<ServerValidation, ValidationError> {
-        let inner = self.inner();
-        let desired = received.as_u64(); // MSB clear = allocated
-
-        match inner.binding_id.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-            if current & UNALLOCATED_BIT != 0 {
-                // Slot is free (UNBOUND or previously freed). Check stale.
-                if current != UNBOUND {
-                    let prior = current & !UNALLOCATED_BIT;
-                    if received.as_u64() <= prior {
-                        return None; // stale retransmit
-                    }
-                }
-                Some(desired)
-            } else {
-                // Slot is allocated — reject via None, validate externally
-                None
-            }
-        }) {
-            Ok(_) => Ok(ServerValidation::NewBinding),
-            Err(current) => self.validate_against(current, received),
-        }
-    }
-
-    #[inline]
-    fn validate_against(&self, current: u64, received: &VarInt) -> Result<ServerValidation, ValidationError> {
-        if current & UNALLOCATED_BIT != 0 {
-            return Err(ValidationError::StaleBinding);
-        }
-        // MSB is clear, so current IS the binding_id directly
-        match current.cmp(&received.as_u64()) {
-            std::cmp::Ordering::Equal => Ok(ServerValidation::Bound),
-            std::cmp::Ordering::Greater => Err(ValidationError::StaleBinding),
-            std::cmp::Ordering::Less => {
-                let inner = self.inner();
-                crate::tracing::error!(
-                    queue_id = inner.id.as_u64(),
-                    current,
-                    received = received.as_u64(),
-                    "BUG: received binding_id greater than current — client rebound before QueueFree"
-                );
-                debug_assert!(
-                    false,
-                    "received binding_id ({}) greater than current ({}) on queue_id={}",
-                    received.as_u64(),
-                    current,
-                    inner.id.as_u64(),
-                );
-                Err(ValidationError::FutureBinding)
-            }
-        }
-    }
 }
 
 unsafe impl<S: Send, C: Send> Send for Descriptor<S, C> {}

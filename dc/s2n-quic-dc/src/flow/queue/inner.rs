@@ -190,45 +190,6 @@ impl<T> Queue<T> {
         Ok(waker)
     }
 
-    /// Push an entry, returning both the waker and an additional value from the validate closure.
-    ///
-    /// Like `push`, but the validate closure returns `Result<V, ValidationError>` where `V` is
-    /// an additional value the caller needs (e.g., whether a new binding was created).
-    #[inline]
-    pub fn push_with_result<F, V, O>(
-        &self,
-        entry: intrusive::Entry<T>,
-        observe: O,
-        validate: F,
-    ) -> Result<(AutoWake, V), Error<intrusive::Entry<T>>>
-    where
-        F: FnOnce() -> Result<V, super::descriptor::ValidationError>,
-        O: FnOnce() -> bool,
-    {
-        let mut inner = self.lock()?;
-        ensure!(
-            inner.flags.contains(Flags::IS_OPEN),
-            Err(Error::PermanentlyClosed)
-        );
-        ensure!(
-            inner.flags.contains(Flags::HAS_RECEIVER),
-            Err(Error::HalfClosed(entry))
-        );
-        let result = match validate() {
-            Ok(v) => v,
-            Err(reason) => return Err(Error::ValidationFailed(entry, reason)),
-        };
-
-        if !inner.flags.contains(Flags::HAS_OBSERVED) && observe() {
-            inner.flags.insert(Flags::HAS_OBSERVED);
-        }
-
-        inner.queue.push_back(entry);
-        let waker = inner.take_waker();
-        drop(inner);
-
-        Ok((waker, result))
-    }
 
     #[inline]
     pub fn pop(&self) -> Result<Option<intrusive::Entry<T>>, Closed> {
@@ -439,26 +400,6 @@ impl<T> Queue<T> {
         waker
     }
 
-    /// Validates the queue has a receiver (is allocated) and invokes the closure with a validation result.
-    ///
-    /// Returns Ok(R) if the queue has a receiver, Err(()) otherwise.
-    #[inline]
-    pub fn with_key<F, R>(&self, f: F) -> Result<R, ()>
-    where
-        F: FnOnce() -> R,
-    {
-        let inner = self.lock().map_err(|_| ())?;
-
-        // Check if the queue has a receiver (is allocated)
-        if !inner.flags.contains(Flags::HAS_RECEIVER) {
-            return Err(());
-        }
-
-        // Execute the closure while holding the lock
-        let result = f();
-        drop(inner);
-        Ok(result)
-    }
 
     #[inline]
     fn lock(&self) -> Result<MutexGuard<'_, Inner<T>>, Closed> {
