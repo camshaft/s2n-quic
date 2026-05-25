@@ -28,8 +28,8 @@ pub const SERVER_BUSY: VarInt = VarInt::from_u32(8);
 /// The sender exceeded advertised flow-control credit
 pub const FLOW_CONTROL_ERROR: VarInt = VarInt::from_u32(9);
 
-/// The binding_id in the packet doesn't match the queue's current occupant
-pub const BINDING_ID_MISMATCH: VarInt = VarInt::from_u32(10);
+/// The client attempted to bind a queue slot it hasn't received a QueueFree for
+pub const QUEUE_NOT_FREED: VarInt = VarInt::from_u32(10);
 
 /// The credential_id in the packet doesn't match the queue's owner
 pub const CREDENTIAL_MISMATCH: VarInt = VarInt::from_u32(11);
@@ -50,7 +50,7 @@ pub enum Error {
     RetransmissionsExhausted,
     ServerBusy,
     FlowControlError,
-    BindingIdMismatch,
+    QueueNotFreed,
     CredentialMismatch,
     FlowValidationFailed,
     IdleTimeout,
@@ -75,7 +75,7 @@ impl Error {
             Self::RetransmissionsExhausted => RETRANSMISSIONS_EXHAUSTED,
             Self::ServerBusy => SERVER_BUSY,
             Self::FlowControlError => FLOW_CONTROL_ERROR,
-            Self::BindingIdMismatch => BINDING_ID_MISMATCH,
+            Self::QueueNotFreed => QUEUE_NOT_FREED,
             Self::CredentialMismatch => CREDENTIAL_MISMATCH,
             Self::FlowValidationFailed => FLOW_VALIDATION_FAILED,
             Self::IdleTimeout => IDLE_TIMEOUT,
@@ -95,7 +95,7 @@ impl From<VarInt> for Error {
             RETRANSMISSIONS_EXHAUSTED => Self::RetransmissionsExhausted,
             SERVER_BUSY => Self::ServerBusy,
             FLOW_CONTROL_ERROR => Self::FlowControlError,
-            BINDING_ID_MISMATCH => Self::BindingIdMismatch,
+            QUEUE_NOT_FREED => Self::QueueNotFreed,
             CREDENTIAL_MISMATCH => Self::CredentialMismatch,
             FLOW_VALIDATION_FAILED => Self::FlowValidationFailed,
             IDLE_TIMEOUT => Self::IdleTimeout,
@@ -137,10 +137,10 @@ impl fmt::Display for Error {
                     "FLOW_CONTROL_ERROR: sender exceeded advertised flow-control credit"
                 )
             }
-            Self::BindingIdMismatch => {
+            Self::QueueNotFreed => {
                 write!(
                     f,
-                    "BINDING_ID_MISMATCH: packet binding does not match queue occupant"
+                    "QUEUE_NOT_FREED: client bound a queue slot without receiving QueueFree"
                 )
             }
             Self::CredentialMismatch => {

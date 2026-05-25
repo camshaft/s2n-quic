@@ -697,8 +697,11 @@ fn handle_queue_data(
 ///
 /// The only reason for retry is NeedsGrow (page not yet allocated).
 /// Once the page exists, alloc_at_or_grow handles the atomic bind via init_key's
-/// fetch_update CAS. If the CAS fails (another worker won), retry via send_stream
-/// validates against the winner's binding.
+/// Single-lock hot path for server-side QueueData-init dispatch.
+///
+/// Uses `bind_and_send_stream` which atomically validates-or-binds, opens the stream
+/// receiver if new, and pushes data — all under ONE lock acquisition. When the slot's
+/// page doesn't exist (`NeedsGrow`), falls through to `alloc_at_or_grow` (cold path).
 #[allow(clippy::too_many_arguments)]
 fn handle_queue_data_server_init(
     peer: &mut recv::Context,
@@ -718,14 +721,14 @@ fn handle_queue_data_server_init(
     let local_queue_id = queue_pair.dest_queue_id;
     let peer_queue_id = queue_pair.source_queue_id;
 
-    // First, try send_stream — if the binding already exists, this is the fast path.
-    match peer.queue_dispatcher.send_stream(
+    match peer.queue_dispatcher.bind_and_send_stream(
         local_queue_id,
         Some(peer_queue_id),
         &binding_id,
         entry,
     ) {
-        Ok(waker) => {
+        Ok(flow::queue::BindResult::Bound(waker)) => {
+            // Hot path: existing binding, data pushed. Done.
             let _ = waker_sink.send(waker);
             counters.rx_data_ok.add(1);
             trace!(
@@ -736,18 +739,37 @@ fn handle_queue_data_server_init(
                 is_fin,
                 "QueueData dispatched to existing binding (server init path)"
             );
-            return;
         }
-        Err(flow::queue::Error::Unallocated(returned_entry)) => {
-            // Slot is free or doesn't exist — allocate and bind atomically.
+        Ok(flow::queue::BindResult::NewBinding { waker, control: queue_control, stream: queue_stream }) => {
+            // Atomic bind succeeded. Stream data already pushed under the lock.
+            // Control receiver is open. Create the Writer/Reader and accept.
+            let _ = waker_sink.send(waker);
+
+            create_binding_with_queues(
+                peer,
+                queue_pair,
+                acceptor_id,
+                binding_id,
+                is_fin,
+                queue_control,
+                queue_stream,
+                acceptor_registry,
+                frame_tx,
+                counters,
+                response_frames,
+                waker_sink,
+            );
+        }
+        Err(flow::queue::Error::NeedsGrow(returned_entry)) => {
+            // Cold path: page doesn't exist yet. Grow and allocate via alloc_at_or_grow.
             let handle = flow::Handle::new(binding_id);
             let alloc_result = peer
                 .queue_dispatcher
                 .alloc_at_or_grow(local_queue_id.as_u64() as usize, handle, Some(peer_queue_id));
             let Some((queue_control, queue_stream)) = alloc_result.ok().flatten() else {
                 // Either GrowError (queue_id exceeds max_slots) or None (slot already
-                // allocated by another worker). Retry via send_stream which validates
-                // against the winner's binding_id, or drop if out of range.
+                // allocated by another worker — race). Retry via send_stream which
+                // validates against the winner's binding_id.
                 match peer.queue_dispatcher.send_stream(
                     local_queue_id,
                     Some(peer_queue_id),
@@ -812,8 +834,10 @@ fn handle_queue_data_server_init(
         Err(flow::queue::Error::PermanentlyClosed) => {
             counters.rx_data_perm_closed.add(1);
         }
-        Err(flow::queue::Error::NeedsGrow(_)) => {
-            unreachable!("send_stream uses lookup which never returns NeedsGrow");
+        Err(flow::queue::Error::Unallocated(_)) => {
+            // lookup_unbounded never returns Unallocated (it returns NeedsGrow for
+            // missing pages), but handle gracefully just in case.
+            counters.rx_data_unallocated.add(1);
         }
     }
 }

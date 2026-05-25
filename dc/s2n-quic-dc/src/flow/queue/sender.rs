@@ -101,6 +101,35 @@ impl<S: 'static, C: 'static, const INITIAL_PAGE_SIZE: usize>
         f(sender, entry)
     }
 
+    /// Lookup a queue by ID without checking if it's allocated.
+    ///
+    /// Used by the server bind path where the descriptor may be unallocated
+    /// (free) and needs to be atomically bound via `validate_or_bind`.
+    /// Returns `NeedsGrow` if the slot's page hasn't been allocated yet.
+    #[inline]
+    pub fn lookup_unbounded<T, F, V>(&mut self, queue_id: VarInt, entry: T, f: F) -> Result<V, Error<T>>
+    where
+        F: FnOnce(&Sender<S, C>, T) -> Result<V, Error<T>>,
+    {
+        let slot = queue_id.as_u64() as usize;
+        let (page_idx, offset) = Self::find_page(slot);
+
+        if self.local.len() <= page_idx {
+            self.refresh_pages();
+            if self.local.len() <= page_idx {
+                return Err(Error::NeedsGrow(entry));
+            }
+        }
+
+        let Some(page) = self.local.get(page_idx) else {
+            return Err(Error::NeedsGrow(entry));
+        };
+        let Some(sender) = page.get(offset) else {
+            return Err(Error::NeedsGrow(entry));
+        };
+
+        f(sender, entry)
+    }
 
     #[inline]
     /// Iterates every currently known sender page entry and invokes `f`.

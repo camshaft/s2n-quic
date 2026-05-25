@@ -250,6 +250,56 @@ impl<S: 'static, C: 'static> Sender<S, C> {
         }
     }
 
+    /// Server-side atomic bind-or-validate-and-send for QueueData-init frames.
+    ///
+    /// Atomically validates or binds the binding_id and pushes to the stream queue
+    /// in a SINGLE LOCK acquisition. Uses `bind_and_push` which handles the case
+    /// where the slot is unbound by setting `HAS_RECEIVER` on the stream queue
+    /// before pushing.
+    ///
+    /// When this returns `ServerValidation::NewBinding`, the stream queue's receiver
+    /// is open and data is pushed. The caller must still finalize the control queue
+    /// receiver via `finalize_new_binding`.
+    #[inline]
+    pub fn bind_and_send_stream(
+        &self,
+        entry: intrusive::Entry<S>,
+        remote_queue_id: Option<VarInt>,
+        binding_id: &VarInt,
+    ) -> Result<(AutoWake, super::descriptor::ServerValidation), Error<intrusive::Entry<S>>> {
+        unsafe {
+            let (waker, validation) = self.descriptor.stream_queue().bind_and_push(
+                entry,
+                || {
+                    if let Some(id) = remote_queue_id {
+                        self.descriptor.set_remote_queue_id(id);
+                        true
+                    } else {
+                        false
+                    }
+                },
+                || self.descriptor.validate_or_bind(binding_id),
+            )?;
+            probes::on_send(self.queue_id(), Half::Stream, false);
+            Ok((waker, validation))
+        }
+    }
+
+    /// Finalize a new binding by opening the control queue's receiver and
+    /// returning the (Control, Stream) handle pair.
+    ///
+    /// # Safety
+    ///
+    /// Must only be called after `bind_and_send_stream` returned `NewBinding`.
+    /// The descriptor must still be alive (Sender holds a sender ref).
+    #[inline]
+    pub unsafe fn finalize_new_binding(
+        &self,
+        has_remote_queue_id: bool,
+    ) -> (super::descriptor::Descriptor<S, C>, super::descriptor::Descriptor<S, C>) {
+        self.descriptor.clone_for_sender().finalize_new_binding(has_remote_queue_id)
+    }
+
 }
 
 impl<S: 'static, C: 'static> Drop for Sender<S, C> {

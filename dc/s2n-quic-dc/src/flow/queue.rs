@@ -17,8 +17,24 @@ mod pool;
 mod probes;
 mod sender;
 
-pub use descriptor::ValidationError;
+pub use descriptor::{ServerValidation, ValidationError};
 pub use inner::AutoWake;
+
+/// Result of `Dispatch::bind_and_send_stream`.
+///
+/// Encapsulates both the hot-path (existing binding) and the new-binding path
+/// where Control/Stream receiver handles are created atomically.
+pub enum BindResult<S: 'static + Send + Sync, C: 'static + Send + Sync> {
+    /// Existing binding matched. Data pushed, waker returned.
+    Bound(AutoWake),
+    /// New binding created atomically. Data pushed, stream receiver open.
+    /// Control/Stream handles are ready for `create_binding_with_queues`.
+    NewBinding {
+        waker: AutoWake,
+        control: Control<S, C>,
+        stream: Stream<S, C>,
+    },
+}
 
 /// Size of the first allocated page of queue slots.
 ///
@@ -330,6 +346,62 @@ where
                 .unwrap_or_default();
             on_waker(stream_waker, control_waker);
         });
+    }
+
+    /// Server-side atomic bind-or-validate-and-send for QueueData-init frames.
+    ///
+    /// Performs a SINGLE LOCK operation that atomically:
+    /// 1. Checks if the slot is allocated via `lookup_unbounded` (no is_allocated check)
+    /// 2. Validates or binds the binding_id via `validate_or_bind` (single fetch_update CAS)
+    /// 3. Opens the stream receiver if new binding
+    /// 4. Pushes the entry if validation succeeds
+    ///
+    /// On `NewBinding`, also opens the control queue's receiver, removes the slot from
+    /// the free list, and returns Control/Stream handles ready for `create_binding_with_queues`.
+    ///
+    /// Returns:
+    /// - `Ok(BindResult::Bound(waker))` if the binding matched an existing one
+    /// - `Ok(BindResult::NewBinding { waker, control, stream })` if a new binding was created
+    /// - `Err(Error::NeedsGrow)` if the page doesn't exist (caller should grow and retry)
+    /// - `Err(Error::ValidationFailed)` if binding_id validation failed (stale/future)
+    /// - `Err(Error::HalfClosed)` if the queue exists but the receiver dropped
+    /// - `Err(Error::PermanentlyClosed)` if the queue is permanently closed
+    #[inline]
+    pub fn bind_and_send_stream(
+        &mut self,
+        local_queue_id: VarInt,
+        remote_queue_id: Option<VarInt>,
+        binding_id: &VarInt,
+        data: intrusive::Entry<S>,
+    ) -> Result<BindResult<S, C>, Error<intrusive::Entry<S>>> {
+        let result = self.senders.lookup_unbounded(local_queue_id, data, |sender, data| {
+            let (waker, validation) = sender.bind_and_send_stream(data, remote_queue_id, binding_id)?;
+            match validation {
+                ServerValidation::Bound => Ok(BindResult::Bound(waker)),
+                ServerValidation::NewBinding => {
+                    // Stream data is pushed, stream receiver is open.
+                    // Finalize: open control receiver and get handle pair.
+                    let has_remote_queue_id = remote_queue_id.is_some();
+                    let (control_desc, stream_desc) = unsafe {
+                        sender.finalize_new_binding(has_remote_queue_id)
+                    };
+                    Ok(BindResult::NewBinding {
+                        waker,
+                        control: Control::new(control_desc),
+                        stream: Stream::new(stream_desc),
+                    })
+                }
+            }
+        })?;
+
+        // For new bindings, remove the slot from the free list. This must happen
+        // outside the closure since we need access to self.pool.
+        if matches!(result, BindResult::NewBinding { .. }) {
+            let claimed = self.pool.claim_bound_slot(local_queue_id.as_u64() as usize);
+            debug_assert!(claimed, "claim_bound_slot failed after successful NewBinding");
+        }
+
+        Ok(result)
     }
 
 }

@@ -162,6 +162,13 @@ where
         }
     }
 
+    /// Remove a slot from the free list after it was atomically bound via the
+    /// single-lock bind path. See [`FreeVec::claim_bound_slot`].
+    #[inline]
+    pub fn claim_bound_slot(&self, slot_index: usize) -> bool {
+        self.free.claim_bound_slot(slot_index)
+    }
+
     #[inline(never)] // this should happen rarely
     fn grow(&mut self) -> Result<(), GrowError> {
         let remaining = self.max_slots.saturating_sub(self.epoch);

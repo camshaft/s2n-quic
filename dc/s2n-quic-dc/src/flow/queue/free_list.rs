@@ -327,6 +327,47 @@ impl<S: 'static, C: 'static> FreeVec<S, C> {
         inner.free_count += 1;
     }
 
+    /// Remove a slot from the free list after it was atomically bound via `validate_or_bind`.
+    ///
+    /// Called by the single-lock bind path after `bind_and_push` succeeds with `NewBinding`.
+    /// The descriptor's binding_id was already set by the CAS in `validate_or_bind`, so
+    /// this just needs to remove it from the free list bookkeeping.
+    ///
+    /// Returns `true` if the slot was successfully claimed (was in the free list).
+    /// Returns `false` if the slot was already taken (race with `alloc_at` — shouldn't
+    /// happen because the CAS would have failed, but handled gracefully).
+    pub fn claim_bound_slot(&self, slot_index: usize) -> bool {
+        let mut inner = self.inner.lock().unwrap();
+
+        if slot_index >= inner.slots.len() {
+            return false;
+        }
+
+        let Some(descriptor) = inner.slots[slot_index].take() else {
+            // Already taken — another path won the race. This shouldn't happen
+            // because validate_or_bind CAS guarantees exclusivity.
+            return false;
+        };
+        inner.free_count -= 1;
+
+        #[cfg(debug_assertions)]
+        assert!(
+            inner.active.insert(descriptor.as_usize()),
+            "{} already in {:?}",
+            descriptor.as_usize(),
+            inner.active
+        );
+
+        // We don't need the descriptor handle — the Sender already has its own
+        // clone_for_sender reference. We just needed to remove it from the free list.
+        // But we can't drop it because that would call drop_in_place!
+        // Actually, the Descriptor doesn't impl Drop — it's just a pointer.
+        // We intentionally leak it here; the receiver pair will be created from
+        // clone_for_sender and will eventually free back into the free list.
+        core::mem::forget(descriptor);
+        true
+    }
+
     #[inline]
     pub fn record_region(
         &self,

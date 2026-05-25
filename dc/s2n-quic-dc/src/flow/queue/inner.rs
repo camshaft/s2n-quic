@@ -190,6 +190,45 @@ impl<T> Queue<T> {
         Ok(waker)
     }
 
+    /// Push an entry, returning both the waker and an additional value from the validate closure.
+    ///
+    /// Like `push`, but the validate closure returns `Result<V, ValidationError>` where `V` is
+    /// an additional value the caller needs (e.g., whether a new binding was created).
+    #[inline]
+    pub fn push_with_result<F, V, O>(
+        &self,
+        entry: intrusive::Entry<T>,
+        observe: O,
+        validate: F,
+    ) -> Result<(AutoWake, V), Error<intrusive::Entry<T>>>
+    where
+        F: FnOnce() -> Result<V, super::descriptor::ValidationError>,
+        O: FnOnce() -> bool,
+    {
+        let mut inner = self.lock()?;
+        ensure!(
+            inner.flags.contains(Flags::IS_OPEN),
+            Err(Error::PermanentlyClosed)
+        );
+        ensure!(
+            inner.flags.contains(Flags::HAS_RECEIVER),
+            Err(Error::HalfClosed(entry))
+        );
+        let result = match validate() {
+            Ok(v) => v,
+            Err(reason) => return Err(Error::ValidationFailed(entry, reason)),
+        };
+
+        if !inner.flags.contains(Flags::HAS_OBSERVED) && observe() {
+            inner.flags.insert(Flags::HAS_OBSERVED);
+        }
+
+        inner.queue.push_back(entry);
+        let waker = inner.take_waker();
+        drop(inner);
+
+        Ok((waker, result))
+    }
 
     #[inline]
     pub fn pop(&self) -> Result<Option<intrusive::Entry<T>>, Closed> {
@@ -400,6 +439,107 @@ impl<T> Queue<T> {
         waker
     }
 
+    /// Validates the queue has a receiver (is allocated) and invokes the closure with a validation result.
+    ///
+    /// Returns Ok(R) if the queue has a receiver, Err(()) otherwise.
+    #[inline]
+    pub fn with_key<F, R>(&self, f: F) -> Result<R, ()>
+    where
+        F: FnOnce() -> R,
+    {
+        let inner = self.lock().map_err(|_| ())?;
+
+        // Check if the queue has a receiver (is allocated)
+        if !inner.flags.contains(Flags::HAS_RECEIVER) {
+            return Err(());
+        }
+
+        // Execute the closure while holding the lock
+        let result = f();
+        drop(inner);
+        Ok(result)
+    }
+
+    /// Atomically validate-or-bind and push under a single lock acquisition.
+    ///
+    /// This is the single-lock hot path for server-side QueueData-init dispatch.
+    /// Unlike `push_with_result`, this method handles the case where the slot is
+    /// unbound (no receiver yet) by setting `HAS_RECEIVER` on THIS queue when
+    /// `validate_or_bind` returns `NewBinding`.
+    ///
+    /// After a `NewBinding` result, the caller is responsible for opening the
+    /// control queue's receiver separately (it is not touched here).
+    #[inline]
+    pub fn bind_and_push<F, O>(
+        &self,
+        entry: intrusive::Entry<T>,
+        observe: O,
+        validate_or_bind: F,
+    ) -> Result<(AutoWake, super::descriptor::ServerValidation), Error<intrusive::Entry<T>>>
+    where
+        F: FnOnce() -> Result<super::descriptor::ServerValidation, super::descriptor::ValidationError>,
+        O: FnOnce() -> bool,
+    {
+        use super::descriptor::ServerValidation;
+
+        let mut inner = self.lock()?;
+        ensure!(
+            inner.flags.contains(Flags::IS_OPEN),
+            Err(Error::PermanentlyClosed)
+        );
+
+        let result = match validate_or_bind() {
+            Ok(v) => v,
+            Err(reason) => return Err(Error::ValidationFailed(entry, reason)),
+        };
+
+        // If this is a new binding, open the receiver on THIS queue (stream) now.
+        // The control queue's receiver will be opened separately by the caller.
+        if matches!(result, ServerValidation::NewBinding) {
+            inner.flags.insert(Flags::HAS_RECEIVER);
+        }
+
+        // For existing bindings, receivers must already be open.
+        if !inner.flags.contains(Flags::HAS_RECEIVER) {
+            return Err(Error::HalfClosed(entry));
+        }
+
+        if !inner.flags.contains(Flags::HAS_OBSERVED) && observe() {
+            inner.flags.insert(Flags::HAS_OBSERVED);
+        }
+
+        inner.queue.push_back(entry);
+        let waker = inner.take_waker();
+        drop(inner);
+
+        Ok((waker, result))
+    }
+
+    /// Open the receiver on this queue half for use by `finalize_new_binding`.
+    ///
+    /// Sets `HAS_RECEIVER` (and optionally `HAS_OBSERVED`) under the lock.
+    /// This is a targeted helper for the single-lock bind path where the stream
+    /// queue's receiver was already opened inside `bind_and_push` and the control
+    /// queue needs to be opened afterward.
+    ///
+    /// # Panics
+    ///
+    /// Debug-asserts that the receiver is not already open (double-open is a bug).
+    #[inline]
+    pub fn open_receiver_single(&self, has_remote_queue_id: bool) -> Result<(), Closed> {
+        let mut inner = self.lock()?;
+        ensure!(inner.flags.contains(Flags::IS_OPEN), Err(Closed));
+        debug_assert!(
+            !inner.flags.contains(Flags::HAS_RECEIVER),
+            "control receiver already open"
+        );
+        let mut flags = Flags::HAS_RECEIVER;
+        if has_remote_queue_id {
+            flags |= Flags::HAS_OBSERVED;
+        }
+        inner.flags.insert(flags);
+        Ok(())
+    }
 
     #[inline]
     fn lock(&self) -> Result<MutexGuard<'_, Inner<T>>, Closed> {

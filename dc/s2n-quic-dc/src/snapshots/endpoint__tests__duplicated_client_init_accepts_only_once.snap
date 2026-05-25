@@ -1,6 +1,5 @@
 ---
 source: dc/s2n-quic-dc/src/testing.rs
-assertion_line: 352
 expression: logs
 ---
 0:00:00.000000000 [server] DEBUG s2n_quic_dc: capacity=50000
@@ -411,7 +410,6 @@ expression: logs
 0:00:00.000521000 [server] TRACE c#rx.ecn[ect0]=1
 0:00:00.000521000 [server] TRACE m#rx.packet_size=4
 0:00:00.000521000 [server] TRACE c#rx.frame[queue_data_fin]=1
-0:00:00.000521000 [server] DEBUG unroutable stream data
 0:00:00.000521000 [server] TRACE c#flow.accepted=1
 0:00:00.000521000 [server] DEBUG QueueData accepted — new binding created binding_id=0 acceptor_id=1 server_queue_id=0 peer_queue_id=0
 0:00:00.000521000 [server] TRACE m#rx.frames_per_packet=1

@@ -50,11 +50,19 @@ impl ValidationError {
         use crate::stream::endpoint::error;
         match self {
             Self::StaleBinding => None,
-            Self::FutureBinding => Some(error::BINDING_ID_MISMATCH),
+            Self::FutureBinding => Some(error::QUEUE_NOT_FREED),
         }
     }
 }
 
+/// Result of server-side validation
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ServerValidation {
+    /// Key matched an existing binding
+    Bound,
+    /// Queue was unbound; key has been set (new binding created)
+    NewBinding,
+}
 
 /// A pointer to a single descriptor in a group
 ///
@@ -299,6 +307,104 @@ impl<S: 'static, C: 'static> Descriptor<S, C> {
             std::cmp::Ordering::Equal => Ok(()),
             std::cmp::Ordering::Greater => Err(ValidationError::StaleBinding),
             std::cmp::Ordering::Less => {
+                crate::tracing::error!(
+                    queue_id = inner.id.as_u64(),
+                    current,
+                    received = received.as_u64(),
+                    "BUG: received binding_id greater than current — client rebound before QueueFree"
+                );
+                debug_assert!(
+                    false,
+                    "received binding_id ({}) greater than current ({}) on queue_id={}",
+                    received.as_u64(),
+                    current,
+                    inner.id.as_u64(),
+                );
+                Err(ValidationError::FutureBinding)
+            }
+        }
+    }
+
+    /// Server-side: validate or atomically bind if the slot is free.
+    ///
+    /// Uses `fetch_update` to atomically check "is this slot free?" (UNALLOCATED_BIT set)
+    /// and set the binding_id (MSB clear = allocated) in a single CAS. No TOCTOU possible.
+    #[inline]
+    pub fn validate_or_bind(
+        &self,
+        received: &VarInt,
+    ) -> Result<ServerValidation, ValidationError> {
+        let inner = self.inner();
+        let desired = received.as_u64(); // MSB clear = allocated
+
+        match inner.binding_id.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            if current & UNALLOCATED_BIT != 0 {
+                // Slot is free (UNBOUND or previously freed). Check stale.
+                if current != UNBOUND {
+                    let prior = current & !UNALLOCATED_BIT;
+                    if received.as_u64() <= prior {
+                        return None; // stale retransmit
+                    }
+                }
+                Some(desired)
+            } else {
+                // Slot is allocated — reject via None, validate externally
+                None
+            }
+        }) {
+            Ok(_) => Ok(ServerValidation::NewBinding),
+            Err(current) => self.validate_against(current, received),
+        }
+    }
+
+    /// Finalize a new binding after `bind_and_push` set `HAS_RECEIVER` on the stream queue.
+    ///
+    /// This opens the control queue's receiver (sets `HAS_RECEIVER` on the control queue)
+    /// and returns a pair of Descriptor handles suitable for creating Control and Stream
+    /// receiver handles.
+    ///
+    /// # Safety
+    ///
+    /// * The stream queue's `HAS_RECEIVER` must already be set (done by `bind_and_push`).
+    /// * The descriptor must be currently bound (UNALLOCATED_BIT clear).
+    /// * `remote_queue_id` should already be stored if it was provided during `bind_and_push`
+    ///   (via the observe callback and `HAS_OBSERVED` flag).
+    #[inline]
+    pub unsafe fn finalize_new_binding(self, has_remote_queue_id: bool) -> (Self, Self) {
+        let inner = self.inner();
+        debug_assert!(
+            inner.binding_id.load(Ordering::Relaxed) & UNALLOCATED_BIT == 0,
+            "finalize_new_binding called on unbound descriptor"
+        );
+
+        // Open the control queue's receiver. The stream queue was already opened
+        // inside bind_and_push. We only need to set flags on the control queue.
+        inner
+            .control
+            .open_receiver_single(has_remote_queue_id)
+            .unwrap();
+
+        probes::on_receiver_open(inner.id);
+
+        let other = Self {
+            ptr: self.ptr,
+            phantom: PhantomData,
+        };
+
+        (self, other)
+    }
+
+    #[inline]
+    fn validate_against(&self, current: u64, received: &VarInt) -> Result<ServerValidation, ValidationError> {
+        if current & UNALLOCATED_BIT != 0 {
+            return Err(ValidationError::StaleBinding);
+        }
+        // MSB is clear, so current IS the binding_id directly
+        match current.cmp(&received.as_u64()) {
+            std::cmp::Ordering::Equal => Ok(ServerValidation::Bound),
+            std::cmp::Ordering::Greater => Err(ValidationError::StaleBinding),
+            std::cmp::Ordering::Less => {
+                let inner = self.inner();
                 crate::tracing::error!(
                     queue_id = inner.id.as_u64(),
                     current,
