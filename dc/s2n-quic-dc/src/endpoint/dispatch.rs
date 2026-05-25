@@ -544,24 +544,25 @@ fn handle_queue_data(
     let is_server = peer.path_entry.id().endpoint_type().is_server();
 
     // Server init path: frame has acceptor_id, meaning client is opening a new stream.
-    // Use lookup_unbounded to find the slot (even if unallocated) and atomically bind.
-    if is_server && dest_acceptor_id.is_some() {
-        handle_queue_data_server_init(
-            peer,
-            queue_pair,
-            binding_id,
-            offset,
-            is_fin,
-            dest_acceptor_id.unwrap(),
-            entry,
-            payload_len,
-            acceptor_registry,
-            frame_tx,
-            counters,
-            response_frames,
-            waker_sink,
-        );
-        return;
+    if let Some(acceptor_id) = dest_acceptor_id {
+        if is_server {
+            handle_queue_data_server_init(
+                peer,
+                queue_pair,
+                binding_id,
+                offset,
+                is_fin,
+                acceptor_id,
+                entry,
+                payload_len,
+                acceptor_registry,
+                frame_tx,
+                counters,
+                response_frames,
+                waker_sink,
+            );
+            return;
+        }
     }
 
     // Normal path: client, or server with established binding (no acceptor_id).

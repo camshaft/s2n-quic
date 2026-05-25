@@ -170,7 +170,7 @@ impl<S: 'static, C: 'static> Descriptor<S, C> {
     ///
     /// * The [`Descriptor`] needs to be in the free list (not currently allocated)
     #[inline]
-    pub unsafe fn init_key(&self, binding_id: VarInt) -> bool {
+    pub unsafe fn try_bind(&self, binding_id: VarInt) -> bool {
         let inner = self.inner();
         let desired = binding_id.as_u64(); // MSB clear = allocated
         inner
@@ -193,7 +193,7 @@ impl<S: 'static, C: 'static> Descriptor<S, C> {
 
     /// # Safety
     ///
-    /// * The [`Descriptor`] must have been bound via `init_key` (ALLOCATED_BIT is set)
+    /// * The [`Descriptor`] must have been bound via `try_bind` (ALLOCATED_BIT is set)
     ///
     /// If `remote_queue_id` is `Some`, the value is stored immediately and both queue
     /// halves are marked as already observed (no dispatcher-side store needed).

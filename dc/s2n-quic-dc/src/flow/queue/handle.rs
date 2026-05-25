@@ -218,36 +218,6 @@ impl<S: 'static, C: 'static> Sender<S, C> {
         }
     }
 
-    /// Server-side send: validates and atomically binds if unbound.
-    ///
-    /// Returns `Ok((waker, ServerValidation))` on success. If the queue was unbound,
-    /// returns `ServerValidation::NewBinding` and the key has been initialized.
-    #[inline]
-    pub fn send_stream_server(
-        &self,
-        entry: intrusive::Entry<S>,
-        remote_queue_id: Option<VarInt>,
-        params: &s2n_quic_core::varint::VarInt,
-    ) -> Result<(AutoWake, super::descriptor::ServerValidation), Error<intrusive::Entry<S>>>
-    {
-        unsafe {
-            let (waker, result) = self.descriptor.stream_queue().push_with_result(
-                entry,
-                || {
-                    if let Some(id) = remote_queue_id {
-                        self.descriptor.set_remote_queue_id(id);
-                        true
-                    } else {
-                        false
-                    }
-                },
-                || self.descriptor.validate_or_bind(params),
-            )?;
-            probes::on_send(self.queue_id(), Half::Stream, false);
-            Ok((waker, result))
-        }
-    }
-
     /// Push to stream queue without validation. Used for broadcast (peer-dead reset).
     #[inline]
     pub fn push_stream_unchecked(
@@ -280,35 +250,6 @@ impl<S: 'static, C: 'static> Sender<S, C> {
         }
     }
 
-    #[inline]
-    pub fn validate_stream(
-        &self,
-        params: &s2n_quic_core::varint::VarInt,
-    ) -> Result<(), super::ValidateError>
-    {
-        unsafe {
-            self.descriptor
-                .stream_queue()
-                .with_key(|| self.descriptor.validate(params))
-                .map_err(|()| super::ValidateError::Unallocated)?
-                .map_err(super::ValidateError::Validation)
-        }
-    }
-
-    #[inline]
-    pub fn validate_control(
-        &self,
-        params: &s2n_quic_core::varint::VarInt,
-    ) -> Result<(), super::ValidateError>
-    {
-        unsafe {
-            self.descriptor
-                .control_queue()
-                .with_key(|| self.descriptor.validate(params))
-                .map_err(|()| super::ValidateError::Unallocated)?
-                .map_err(super::ValidateError::Validation)
-        }
-    }
 }
 
 impl<S: 'static, C: 'static> Drop for Sender<S, C> {

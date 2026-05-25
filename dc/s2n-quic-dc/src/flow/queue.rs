@@ -269,48 +269,6 @@ where
         }
     }
 
-    /// Server-side stream send: validates binding_id and atomically creates binding if unbound.
-    ///
-    /// Returns `Ok((waker, ServerValidation))` where `ServerValidation::NewBinding` indicates
-    /// the caller must complete stream creation (register with acceptor, etc).
-    #[inline]
-    pub fn send_stream_server(
-        &mut self,
-        local_queue_id: VarInt,
-        remote_queue_id: Option<VarInt>,
-        params: &VarInt,
-        data: intrusive::Entry<S>,
-    ) -> Result<(AutoWake, descriptor::ServerValidation), Error<intrusive::Entry<S>>> {
-        let res = self
-            .senders
-            .lookup(local_queue_id, data, |sender, data| {
-                sender.send_stream_server(data, remote_queue_id, params)
-            });
-
-        match res {
-            Ok((waker, validation)) => {
-                trace!(%local_queue_id, ?validation, "send_stream_server");
-                Ok((waker, validation))
-            }
-            Err(Error::PermanentlyClosed) => {
-                self.is_open = false;
-                Err(inner::Error::PermanentlyClosed)
-            }
-            Err(Error::HalfClosed(data)) => {
-                debug!(%local_queue_id, "stream receiver closed");
-                Err(inner::Error::HalfClosed(data))
-            }
-            Err(Error::ValidationFailed(data, reason)) => {
-                debug!(%local_queue_id, ?reason, "stream queue validation failed");
-                Err(inner::Error::ValidationFailed(data, reason))
-            }
-            Err(Error::Unallocated(data)) | Err(Error::NeedsGrow(data)) => {
-                debug!("unroutable stream data");
-                Err(inner::Error::Unallocated(data))
-            }
-        }
-    }
-
     #[inline]
     pub fn send_both(
         &mut self,
@@ -361,42 +319,4 @@ where
         });
     }
 
-    /// Validates the queue's key against the provided parameters by checking the stream queue.
-    #[inline]
-    pub fn validate_stream(
-        &mut self,
-        local_queue_id: VarInt,
-        params: &VarInt,
-    ) -> Result<(), ValidateError> {
-        match self.senders.lookup(local_queue_id, (), |sender, ()| {
-            Ok(sender.validate_stream(params))
-        }) {
-            Ok(result) => result,
-            Err(_) => Err(ValidateError::Unallocated),
-        }
-    }
-
-    /// Validates the queue's key against the provided parameters by checking the control queue.
-    #[inline]
-    pub fn validate_control(
-        &mut self,
-        queue_id: VarInt,
-        params: &VarInt,
-    ) -> Result<(), ValidateError> {
-        match self.senders.lookup(queue_id, (), |sender, ()| {
-            Ok(sender.validate_control(params))
-        }) {
-            Ok(result) => result,
-            Err(_) => Err(ValidateError::Unallocated),
-        }
-    }
-}
-
-/// Error returned by validate_stream/validate_control
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ValidateError {
-    /// Queue not found or deallocated
-    Unallocated,
-    /// Key validation failed
-    Validation(ValidationError),
 }

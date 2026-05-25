@@ -202,7 +202,7 @@ impl<S: 'static, C: 'static> FreeVec<S, C> {
         drop(inner);
 
         unsafe {
-            if !descriptor.init_key(key.binding_id) {
+            if !descriptor.try_bind(key.binding_id) {
                 // Stale binding_id — put the descriptor back.
                 self.return_to_free_list(descriptor);
                 return Err(key);
@@ -248,7 +248,7 @@ impl<S: 'static, C: 'static> FreeVec<S, C> {
         drop(inner);
 
         unsafe {
-            if !descriptor.init_key(key.binding_id) {
+            if !descriptor.try_bind(key.binding_id) {
                 // Stale binding_id — put the descriptor back.
                 self.return_to_free_list(descriptor);
                 return Err(key);
