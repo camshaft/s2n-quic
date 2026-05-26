@@ -21,7 +21,7 @@ use core::{
     task::{Context, Poll},
 };
 use s2n_quic_core::varint::VarInt;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 // ── OnFree ────────────────────────────────────────────────────────────────────
 
@@ -35,7 +35,7 @@ pub(crate) enum OnFree {
     /// `_state` keeps the pinned page table alive for the receiver's lifetime.
     Client {
         _state: Arc<State>,
-        local_free: Arc<Mutex<super::client::ClientFreeList>>,
+        local_free: Arc<super::client::LocalState>,
     },
     /// Server: notify the client that this queue_id is available again.
     Server(FreedSender, Arc<State>),
@@ -203,7 +203,7 @@ impl core::fmt::Debug for ControlReceiver {
 fn reclaim(queue_id: VarInt, on_free: &OnFree) {
     match on_free {
         OnFree::Client { local_free, .. } => {
-            local_free.lock().unwrap().push_freed(queue_id.as_u64() as usize);
+            local_free.free.lock().unwrap().push_freed(queue_id.as_u64() as usize);
         }
         OnFree::Server(freed_sender, _state) => {
             freed_sender.record(queue_id);
@@ -213,7 +213,7 @@ fn reclaim(queue_id: VarInt, on_free: &OnFree) {
 
 // ── AllocResult ───────────────────────────────────────────────────────────────
 
-/// Returned by `ClientAllocator::alloc` / `try_alloc`.
+/// Returned by `ClientAllocator::try_alloc`.
 pub struct AllocResult {
     pub stream: StreamReceiver,
     pub control: ControlReceiver,
@@ -226,4 +226,7 @@ pub struct AllocResult {
     ///
     /// Use this when addressing outbound packets to the peer's queue.
     pub dest_queue_id: VarInt,
+    /// The binding credential for this stream.  Send to the peer so it can
+    /// route packets back to this slot.
+    pub binding_id: VarInt,
 }

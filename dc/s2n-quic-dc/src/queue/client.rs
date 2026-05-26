@@ -26,7 +26,10 @@ use super::{
 };
 use crate::{bitset, endpoint::msg, intrusive, sync};
 use s2n_quic_core::varint::VarInt;
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc, Mutex,
+};
 
 // ── ClientFreeList ────────────────────────────────────────────────────────────
 
@@ -85,6 +88,31 @@ impl ClientFreeList {
     }
 }
 
+// ── LocalState ────────────────────────────────────────────────────────────────
+
+/// Shared mutable state for client-side allocation: slot recycling + binding counter.
+pub(crate) struct LocalState {
+    /// Monotonically increasing binding_id generator.  Starts at 1 so that
+    /// fresh slots (whose stored binding starts at 0) always accept the first bind.
+    next_binding: AtomicU64,
+    /// Local slot index recycling.
+    pub(crate) free: Mutex<ClientFreeList>,
+}
+
+impl LocalState {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            next_binding: AtomicU64::new(1),
+            free: Mutex::new(ClientFreeList::new()),
+        })
+    }
+
+    fn next_binding_id(&self) -> VarInt {
+        let id = self.next_binding.fetch_add(1, Ordering::Relaxed);
+        VarInt::new(id).expect("binding_id overflow")
+    }
+}
+
 // ── ClientAllocator ───────────────────────────────────────────────────────────
 
 /// Allocates local queue slots and peer `dest_queue_id`s for client streams.
@@ -95,7 +123,7 @@ impl ClientFreeList {
 #[derive(Clone)]
 pub struct ClientAllocator {
     view: SenderView,
-    local_free: Arc<Mutex<ClientFreeList>>,
+    local: Arc<LocalState>,
     peer_free: Arc<sync::free_list::FreeList>,
 }
 
@@ -105,14 +133,14 @@ impl ClientAllocator {
         let view = page_table.sender_view();
         Self {
             view,
-            local_free: Arc::new(Mutex::new(ClientFreeList::new())),
+            local: LocalState::new(),
             peer_free,
         }
     }
 
-    pub fn try_alloc(&mut self, binding_id: VarInt) -> Option<AllocResult> {
+    pub fn try_alloc(&mut self) -> Option<AllocResult> {
         let dest_queue_id = self.peer_free.try_alloc()?;
-        self.alloc_local(binding_id, dest_queue_id).ok()
+        self.alloc_local(dest_queue_id).ok()
     }
 
     pub fn peer_free(&self) -> &Arc<sync::free_list::FreeList> {
@@ -120,16 +148,12 @@ impl ClientAllocator {
     }
 
     pub fn close(&self) {
-        self.local_free.lock().unwrap().close();
+        self.local.free.lock().unwrap().close();
     }
 
-    fn alloc_local(
-        &mut self,
-        binding_id: VarInt,
-        dest_queue_id: VarInt,
-    ) -> Result<AllocResult, Error<()>> {
+    fn alloc_local(&mut self, dest_queue_id: VarInt) -> Result<AllocResult, Error<()>> {
         let index = {
-            let mut free = self.local_free.lock().unwrap();
+            let mut free = self.local.free.lock().unwrap();
             match free.pop() {
                 Some(idx) => idx,
                 None => return Err(Error::SenderClosed),
@@ -145,8 +169,10 @@ impl ClientAllocator {
             .get(index)
             .expect("slot index out of range after grow");
 
+        let binding_id = self.local.next_binding_id();
+
         if slot_ref.allocate_and_open(binding_id).is_err() {
-            self.local_free.lock().unwrap().push_freed(index);
+            self.local.free.lock().unwrap().push_freed(index);
             return Err(Error::SenderClosed);
         }
 
@@ -154,7 +180,7 @@ impl ClientAllocator {
         let local_queue_id = VarInt::new(index as u64).expect("slot index exceeds VarInt range");
         let on_free = OnFree::Client {
             _state: self.view.state().clone(),
-            local_free: self.local_free.clone(),
+            local_free: self.local.clone(),
         };
 
         Ok(AllocResult {
@@ -162,6 +188,7 @@ impl ClientAllocator {
             control: ControlReceiver::new(slot_ptr, on_free),
             local_queue_id,
             dest_queue_id,
+            binding_id,
         })
     }
 
