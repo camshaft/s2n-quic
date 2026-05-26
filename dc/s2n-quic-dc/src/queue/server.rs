@@ -221,7 +221,6 @@ mod tests {
         let result = server.bind_and_send_stream(v(0), v(1), make_stream_entry());
         assert!(matches!(result, Ok(BindResult::Bound(_))));
 
-        // Keep receivers alive
         drop(stream);
         drop(control);
     }
@@ -397,7 +396,7 @@ mod tests {
             async move {
                 for _ in 0..50 {
                     bach::task::yield_now().await;
-                    server.send_stream(v(0), v(1), make_stream_entry()).ok();
+                    assert!(server.send_stream(v(0), v(1), make_stream_entry()).is_ok());
                 }
                 drop(stream2);
             }
