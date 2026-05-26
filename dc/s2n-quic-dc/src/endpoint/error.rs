@@ -164,7 +164,7 @@ impl fmt::Display for Error {
             Self::QueueValidationFailed => {
                 write!(
                     f,
-                    "QUEUE_VALIDATION_FAILED: flow validation failed during retry handshake"
+                    "QUEUE_VALIDATION_FAILED: queue validation failed during retry handshake"
                 )
             }
             Self::IdleTimeout => {
