@@ -103,8 +103,11 @@ impl HierarchicalBitSet {
     }
 
     /// Insert a contiguous range of indices [start, end] inclusive.
-    /// More efficient than calling insert() in a loop when ranges span
-    /// multiple 64-bit blocks — O(range/64) instead of O(range).
+    ///
+    /// Currently O(range) — each element is inserted individually, which
+    /// updates all four hierarchy layers.  A future optimisation could set
+    /// whole `BitSet64` blocks in layer_0 at once (O(range/64)), but the
+    /// simpler loop is easier to audit for correctness.
     pub fn insert_range(&mut self, start: u32, end: u32) {
         if start > end || start >= self.capacity {
             return;

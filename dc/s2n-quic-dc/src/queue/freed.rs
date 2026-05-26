@@ -10,28 +10,70 @@
 //! ## Flow
 //!
 //! 1. Stream completes → `StreamReceiver` / `ControlReceiver` dropped.
-//! 2. `FreedSender::record(queue_id)` is called once (when both halves are gone).
-//! 3. Under a single lock the `queue_id` is inserted into the pending
-//!    `IntervalSet`.  If no batch is in-flight a new `FreedBatch` is submitted
-//!    to the global endpoint channel and `in_flight` is set.
-//! 4. The emission task processes `FreedBatch`, encodes a `QueueFree` frame,
-//!    and calls `FreedSender::complete_in_flight`.
-//! 5. `complete_in_flight` clears the flag and, if more IDs accumulated in the
-//!    meantime, submits another batch immediately.
+//! 2. `FreedSender::record(queue_id)` is called.
+//! 3. The `queue_id` is inserted into the pending set under the inner lock.
+//!    If no batch token is in-flight, a new `FreedBatch` token is submitted to
+//!    the global endpoint channel and `in_flight` is set.
+//! 4. The emission task calls `FreedBatch::take_snapshot` at serialisation
+//!    time to drain the pending set.  Any IDs that accumulated between step 3
+//!    and step 4 are included naturally — this is the "snapshot at transmission
+//!    time" property that yields free batching.
+//! 5. After the frame is sent the emission task calls
+//!    `FreedBatch::check_and_resubmit`.  If more IDs accumulated the token
+//!    requeues itself; otherwise `in_flight` is cleared and the next `record`
+//!    call will submit a fresh token.
 
 use crate::path::secret::map::Entry as PathSecretEntry;
 use s2n_quic_core::{interval_set::IntervalSet, varint::VarInt};
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 
-/// A ready-to-emit batch submitted to the endpoint emission channel.
+/// A token submitted to the endpoint emission task.
+///
+/// The actual freed ranges are NOT captured at submission time.  Instead,
+/// `take_snapshot` drains the shared `FreedInner` state at serialisation time,
+/// picking up any IDs that arrived after the token was enqueued.
 pub struct FreedBatch {
+    inner: Arc<FreedInner>,
     pub path_entry: Arc<PathSecretEntry>,
-    pub request_id: VarInt,
-    pub ranges: IntervalSet<VarInt>,
+    endpoint_tx: FreedBatchTx,
 }
 
-/// Channel handle for submitting `FreedBatch` items to the global emission task.
+impl FreedBatch {
+    /// Drain the pending freed set into a snapshot.
+    ///
+    /// Returns `None` if there is nothing to send (should not happen in normal
+    /// flow, but the emission task may call this defensively).
+    pub fn take_snapshot(&self) -> Option<(VarInt, IntervalSet<VarInt>)> {
+        let mut state = self.inner.state.lock().unwrap();
+        if state.freed.is_empty() {
+            return None;
+        }
+        let ranges = core::mem::replace(&mut state.freed, IntervalSet::new());
+        let request_id = state.take_next_request_id();
+        Some((request_id, ranges))
+    }
+
+    /// Called by the emission task after the frame has been transmitted.
+    ///
+    /// If more IDs have accumulated the token resubmits itself to the channel;
+    /// otherwise `in_flight` is cleared so the next `record` call can submit a
+    /// fresh token.
+    pub fn check_and_resubmit(self) {
+        let mut state = self.inner.state.lock().unwrap();
+        if state.freed.is_empty() {
+            state.in_flight = false;
+        } else {
+            // More IDs arrived; keep in_flight and requeue the token.
+            drop(state);
+            // Extract tx before moving self to avoid borrow-while-move.
+            let tx = self.endpoint_tx.clone();
+            let _ = tx.send(self);
+        }
+    }
+}
+
+/// Channel handle for submitting `FreedBatch` tokens to the global emission task.
 pub type FreedBatchTx = mpsc::UnboundedSender<FreedBatch>;
 pub type FreedBatchRx = mpsc::UnboundedReceiver<FreedBatch>;
 
@@ -79,12 +121,29 @@ impl core::fmt::Debug for FreedInner {
 }
 
 struct FreedState {
-    /// IDs that have been freed but not yet submitted in a batch.
+    /// IDs that have been freed but not yet included in a transmitted batch.
     freed: IntervalSet<VarInt>,
     /// Monotonically increasing request ID for the next batch.
-    next_request_id: u64,
-    /// True while a batch has been submitted and not yet acknowledged.
+    ///
+    /// Saturates at `VarInt::MAX` rather than wrapping to preserve monotonicity
+    /// and per-batch dedup on the client side.
+    next_request_id: VarInt,
+    /// True while a batch token has been submitted and not yet re-submitted or
+    /// cleared by `check_and_resubmit`.
     in_flight: bool,
+}
+
+impl FreedState {
+    fn take_next_request_id(&mut self) -> VarInt {
+        let id = self.next_request_id;
+        // Saturating increment within VarInt range preserves monotonicity.
+        if let Ok(next) = VarInt::new(id.as_u64().saturating_add(1)) {
+            self.next_request_id = next;
+        }
+        // If already at VarInt::MAX we keep re-using it; the client dedup
+        // mechanism handles this edge case by never rejecting VarInt::MAX.
+        id
+    }
 }
 
 impl FreedSender {
@@ -93,7 +152,7 @@ impl FreedSender {
             inner: Arc::new(FreedInner {
                 state: Mutex::new(FreedState {
                     freed: IntervalSet::new(),
-                    next_request_id: 0,
+                    next_request_id: VarInt::from_u8(0),
                     in_flight: false,
                 }),
             }),
@@ -102,64 +161,32 @@ impl FreedSender {
         }
     }
 
-    /// Record that `queue_id` has been freed and optionally emit a batch.
+    /// Record that `queue_id` has been freed and, if no token is in-flight,
+    /// submit a fresh one.
     ///
-    /// Called on the application / receiver-drop path; must be cheap.
+    /// Called on the application / receiver-drop path; designed to be cheap
+    /// (a single lock + an optional channel send).
     pub fn record(&self, queue_id: VarInt) {
         let mut state = self.inner.state.lock().unwrap();
 
         let _ = state.freed.insert_value(queue_id);
 
         if state.in_flight {
-            // A batch is already outstanding; our ID will be picked up when
-            // complete_in_flight runs.
+            // A token is already outstanding; our ID will be included when
+            // `take_snapshot` is called at serialisation time.
             return;
         }
 
-        // No batch in flight — submit one now.
-        let batch = self.take_batch(&mut state);
-        drop(state);
-
-        if let Some(batch) = batch {
-            // Best-effort: if the channel is closed we simply drop the batch.
-            let _ = self.endpoint_tx.send(batch);
-        }
-    }
-
-    /// Called by the emission task after a batch has been transmitted.
-    ///
-    /// Clears `in_flight` and immediately re-submits if more IDs accumulated.
-    pub fn complete_in_flight(&self) {
-        let mut state = self.inner.state.lock().unwrap();
-        state.in_flight = false;
-
-        if state.freed.is_empty() {
-            return;
-        }
-
-        let batch = self.take_batch(&mut state);
-        drop(state);
-
-        if let Some(batch) = batch {
-            let _ = self.endpoint_tx.send(batch);
-        }
-    }
-
-    /// Drain the pending freed set into a `FreedBatch` and mark `in_flight`.
-    ///
-    /// Returns `None` if the set is empty (should not happen in normal flow).
-    fn take_batch(&self, state: &mut FreedState) -> Option<FreedBatch> {
-        if state.freed.is_empty() {
-            return None;
-        }
-        let ranges = core::mem::replace(&mut state.freed, IntervalSet::new());
-        let request_id = VarInt::new(state.next_request_id).unwrap_or(VarInt::MAX);
-        state.next_request_id = state.next_request_id.wrapping_add(1);
+        // No token in flight — submit one now.
         state.in_flight = true;
-        Some(FreedBatch {
+        drop(state);
+
+        let token = FreedBatch {
+            inner: self.inner.clone(),
             path_entry: self.path_entry.clone(),
-            request_id,
-            ranges,
-        })
+            endpoint_tx: self.endpoint_tx.clone(),
+        };
+        // Best-effort: if the channel is closed we simply drop the token.
+        let _ = self.endpoint_tx.send(token);
     }
 }

@@ -6,6 +6,7 @@ pub mod tracing;
 
 pub mod acceptor;
 pub mod allocator;
+pub mod bitset;
 pub mod busy_poll;
 pub mod byte_vec;
 pub mod congestion;

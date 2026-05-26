@@ -6,9 +6,8 @@
 //! `StreamReceiver` and `ControlReceiver` are the read ends of a queue slot.
 //! Each holds:
 //! - A raw (but stable) pointer into the pinned page table.
-//! - The `queue_id` this slot was allocated at (needed for freed notification).
-//! - An `OnFree` discriminant that knows how to recycle the slot on drop.
-//! - An `Arc<State>` lifetime guard that keeps the page table alive.
+//! - An `OnFree` discriminant that knows how to recycle the slot on drop and
+//!   also keeps the underlying page table alive.
 
 use super::{
     freed::FreedSender,
@@ -26,49 +25,51 @@ use std::sync::{Arc, Mutex};
 
 // ── OnFree ────────────────────────────────────────────────────────────────────
 
+/// Per-allocator shared state: owns the page table and the local slot free list.
+///
+/// Combining both into one `Arc` means each `StreamReceiver` / `ControlReceiver`
+/// keeps exactly one reference, rather than separate `Arc<State>` and
+/// `Arc<Mutex<ClientFreeList>>` references.
+pub(crate) struct ClientShared {
+    pub(crate) state: Arc<State>,
+    pub(crate) local_free: Mutex<super::client::ClientFreeList>,
+}
+
 /// Reclamation strategy chosen at construction time.
+///
+/// The `OnFree` value also acts as the lifetime guard: it holds an `Arc` that
+/// keeps the pinned page table alive for at least as long as the receiver.
 pub(crate) enum OnFree {
     /// Client: return the local slot index to the client free list.
-    Client(Arc<Mutex<super::client::ClientFreeList>>),
+    Client(Arc<ClientShared>),
     /// Server: notify the client that this queue_id is available again.
-    Server(FreedSender),
+    /// The `Arc<State>` keeps the pinned page table alive.
+    Server(FreedSender, Arc<State>),
 }
 
 // ── StreamReceiver ────────────────────────────────────────────────────────────
 
 pub struct StreamReceiver {
     slot: NonNull<Slot>,
-    queue_id: VarInt,
     on_free: OnFree,
-    _lifetime: Arc<State>,
 }
 
 unsafe impl Send for StreamReceiver {}
 unsafe impl Sync for StreamReceiver {}
 
 impl StreamReceiver {
-    pub(crate) fn new(
-        slot: NonNull<Slot>,
-        queue_id: VarInt,
-        on_free: OnFree,
-        lifetime: Arc<State>,
-    ) -> Self {
-        Self {
-            slot,
-            queue_id,
-            on_free,
-            _lifetime: lifetime,
-        }
+    pub(crate) fn new(slot: NonNull<Slot>, on_free: OnFree) -> Self {
+        Self { slot, on_free }
     }
 
     #[inline]
     pub fn queue_id(&self) -> VarInt {
-        self.queue_id
+        self.slot().queue_id()
     }
 
     #[inline]
     fn slot(&self) -> &Slot {
-        // SAFETY: pinned allocation, Arc<State> lifetime guard.
+        // SAFETY: pinned allocation kept alive by the OnFree lifetime guard.
         unsafe { self.slot.as_ref() }
     }
 
@@ -107,11 +108,10 @@ impl StreamReceiver {
 impl Drop for StreamReceiver {
     fn drop(&mut self) {
         let slot = self.slot();
-        let queue_id = self.queue_id;
-        let is_last =
-            half::close_receiver(&slot.stream, &slot.control, true, || {
-                slot.mark_unallocated();
-            });
+        let queue_id = slot.queue_id();
+        let is_last = half::close_receiver(&slot.stream, &slot.control, true, || {
+            slot.mark_unallocated();
+        });
         if is_last {
             reclaim(queue_id, &self.on_free);
         }
@@ -121,7 +121,7 @@ impl Drop for StreamReceiver {
 impl core::fmt::Debug for StreamReceiver {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("StreamReceiver")
-            .field("queue_id", &self.queue_id)
+            .field("queue_id", &self.queue_id())
             .finish()
     }
 }
@@ -130,32 +130,20 @@ impl core::fmt::Debug for StreamReceiver {
 
 pub struct ControlReceiver {
     slot: NonNull<Slot>,
-    queue_id: VarInt,
     on_free: OnFree,
-    _lifetime: Arc<State>,
 }
 
 unsafe impl Send for ControlReceiver {}
 unsafe impl Sync for ControlReceiver {}
 
 impl ControlReceiver {
-    pub(crate) fn new(
-        slot: NonNull<Slot>,
-        queue_id: VarInt,
-        on_free: OnFree,
-        lifetime: Arc<State>,
-    ) -> Self {
-        Self {
-            slot,
-            queue_id,
-            on_free,
-            _lifetime: lifetime,
-        }
+    pub(crate) fn new(slot: NonNull<Slot>, on_free: OnFree) -> Self {
+        Self { slot, on_free }
     }
 
     #[inline]
     pub fn queue_id(&self) -> VarInt {
-        self.queue_id
+        self.slot().queue_id()
     }
 
     #[inline]
@@ -198,11 +186,10 @@ impl ControlReceiver {
 impl Drop for ControlReceiver {
     fn drop(&mut self) {
         let slot = self.slot();
-        let queue_id = self.queue_id;
-        let is_last =
-            half::close_receiver(&slot.stream, &slot.control, false, || {
-                slot.mark_unallocated();
-            });
+        let queue_id = slot.queue_id();
+        let is_last = half::close_receiver(&slot.stream, &slot.control, false, || {
+            slot.mark_unallocated();
+        });
         if is_last {
             reclaim(queue_id, &self.on_free);
         }
@@ -212,7 +199,7 @@ impl Drop for ControlReceiver {
 impl core::fmt::Debug for ControlReceiver {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("ControlReceiver")
-            .field("queue_id", &self.queue_id)
+            .field("queue_id", &self.queue_id())
             .finish()
     }
 }
@@ -221,11 +208,11 @@ impl core::fmt::Debug for ControlReceiver {
 
 fn reclaim(queue_id: VarInt, on_free: &OnFree) {
     match on_free {
-        OnFree::Client(free_list) => {
-            let mut list = free_list.lock().unwrap();
+        OnFree::Client(shared) => {
+            let mut list = shared.local_free.lock().unwrap();
             list.push_freed(queue_id.as_u64() as usize);
         }
-        OnFree::Server(freed_sender) => {
+        OnFree::Server(freed_sender, _state) => {
             freed_sender.record(queue_id);
         }
     }

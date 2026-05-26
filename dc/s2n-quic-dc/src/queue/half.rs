@@ -205,27 +205,6 @@ impl<T> Half<T> {
     }
 }
 
-/// Open both receiver halves atomically.
-///
-/// Always locks stream first, then control (consistent lock order).
-pub(crate) fn open_receivers<S, C>(stream: &Half<S>, control: &Half<C>) -> Result<(), Closed> {
-    let mut s = stream.inner.lock();
-    let mut c = control.inner.lock();
-
-    if !s.flags.contains(Flags::HAS_SENDER) || !c.flags.contains(Flags::HAS_SENDER) {
-        return Err(Closed);
-    }
-
-    debug_assert!(
-        !s.flags.contains(Flags::HAS_RECEIVER) && !c.flags.contains(Flags::HAS_RECEIVER),
-        "receivers already open: stream={s:?} control={c:?}"
-    );
-
-    s.flags.insert(Flags::HAS_RECEIVER);
-    c.flags.insert(Flags::HAS_RECEIVER);
-    Ok(())
-}
-
 /// Close one receiver half and potentially reclaim the slot.
 ///
 /// Always acquires `stream` lock first then `control` (consistent order).

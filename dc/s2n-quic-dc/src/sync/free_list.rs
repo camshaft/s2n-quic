@@ -16,7 +16,7 @@
 //! - The client tracks seen request IDs in an IntervalSet
 //! - Duplicate/replayed QueueFree messages are rejected without per-slot state
 
-use super::bitset::HierarchicalBitSet;
+use crate::bitset::HierarchicalBitSet;
 use s2n_quic_core::{interval_set::IntervalSet, varint::VarInt};
 use std::{
     collections::VecDeque,
@@ -162,8 +162,19 @@ impl FreeList {
 
         // Insert ALL freed queue_ids via batch range insertion.
         for range in queue_ids.inclusive_ranges() {
-            let start = range.start().as_u64() as u32;
-            let end = range.end().as_u64() as u32;
+            let start_u64 = range.start().as_u64();
+            let end_u64 = range.end().as_u64();
+
+            // Bounds check: reject values that exceed u32 or the bitset max.
+            // Values above these limits cannot be valid server queue IDs and
+            // indicate a protocol error or a misbehaving peer.
+            let cap = HierarchicalBitSet::MAX_CAPACITY as u64;
+            if start_u64 >= cap {
+                continue;
+            }
+            let start = start_u64 as u32;
+            let end = end_u64.min(cap - 1) as u32;
+
             let needed = end + 1;
             if needed > inner.freed.capacity() {
                 inner.freed.grow(needed);

@@ -1,12 +1,14 @@
 // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Clean-slate queue module.
+//! Per-peer queue slots for routing inbound `msg::Stream` and `msg::Control`
+//! frames to the correct stream handler.
 //!
-//! This replaces the generic `flow/queue` implementation with a concrete,
-//! no-generics design tailored to `msg::Stream` / `msg::Control`.
+//! Each peer connection owns a flat array of [`slot::Slot`]s held in a pinned
+//! [`page_table::PageTable`].  A slot is identified by its index, which is
+//! exchanged in the QUIC handshake as a `queue_id`.
 //!
-//! ## Modules
+//! ## Roles
 //!
 //! | Module | Responsibility |
 //! |--------|----------------|

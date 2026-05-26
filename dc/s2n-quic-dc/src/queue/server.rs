@@ -8,9 +8,10 @@
 //! job is:
 //!
 //! 1. **Bind-and-send** (`bind_and_send_stream`): on the first packet for a
-//!    stream, CAS the slot from an unbound state into the per-stream
-//!    `binding_id`.  If the CAS succeeds, open the receiver halves and return
-//!    the new `StreamReceiver` / `ControlReceiver` for the handshake path.
+//!    stream, set the slot's `binding_id` and open the receiver halves
+//!    atomically under the half locks (no CAS, no race between concurrent
+//!    packets).  Return the new `StreamReceiver` / `ControlReceiver` for the
+//!    handshake path.
 //!
 //! 2. **Dispatch** (`send_stream`, `send_control`): on subsequent packets,
 //!    validate `binding_id` and push the entry.
@@ -19,7 +20,7 @@
 //!
 //! ```text
 //! client creates stream    →  slot allocated, binding_id = session_binding_id
-//! first server packet      →  bind_and_send_stream: CAS binding_id → opened
+//! first server packet      →  bind_and_send_stream: bind + open + push (atomic)
 //! data packets             →  send_stream / send_control
 //! stream complete          →  ControlReceiver / StreamReceiver dropped
 //!                          →  freed_sender.record(queue_id) → QueueFree to client
@@ -29,13 +30,20 @@ use super::{
     freed::FreedSender,
     half::AutoWake,
     handle::{ControlReceiver, OnFree, StreamReceiver},
-    page_table::PageTable,
-    slot::{Slot, UNALLOCATED_BIT},
+    page_table::{PageTable, SenderView},
+    slot::BindState,
     Error,
 };
 use crate::{endpoint::msg, intrusive};
 use s2n_quic_core::varint::VarInt;
-use std::ptr::NonNull;
+
+/// Maximum `queue_id` the server will accept from the peer.
+///
+/// The client negotiates a peer free-list size at handshake time; this constant
+/// provides a hard per-connection cap to prevent unbounded page-table growth
+/// from a misbehaving or malicious peer.  (The integration layer should tighten
+/// this to the negotiated value.)
+const MAX_SERVER_QUEUE_ID: u64 = 1 << 20; // 1 M slots
 
 // ── BindResult ────────────────────────────────────────────────────────────────
 
@@ -54,15 +62,25 @@ pub enum BindResult {
 
 // ── ServerDispatch ────────────────────────────────────────────────────────────
 
+/// Dispatches inbound packets for a single peer connection.
+///
+/// `ServerDispatch` owns a `SenderView` that caches raw pointers into the
+/// pinned page table, so repeated dispatch calls never re-acquire the
+/// `RwLock` unless a page growth has occurred.
 pub struct ServerDispatch {
     page_table: PageTable,
+    /// Per-dispatch cached view — avoids RwLock on every packet.
+    view: SenderView,
     freed: FreedSender,
 }
 
 impl ServerDispatch {
     pub fn new(freed: FreedSender) -> Self {
+        let page_table = PageTable::new();
+        let view = page_table.sender_view();
         Self {
-            page_table: PageTable::new(),
+            page_table,
+            view,
             freed,
         }
     }
@@ -72,9 +90,12 @@ impl ServerDispatch {
     /// `queue_id` — the slot index chosen by the client.
     /// `binding_id` — the per-stream binding credential (client-chosen).
     ///
-    /// If the slot at `queue_id` is currently unallocated the binding will be
-    /// established; if it is already bound to `binding_id` the entry is simply
-    /// pushed.  Any other state is rejected.
+    /// The binding check and entry push happen inside the combined half locks
+    /// so there is no window where two concurrent packets can both create a
+    /// fresh binding for the same slot.
+    ///
+    /// Returns `Err(Unallocated)` if `queue_id` exceeds the cap or if the
+    /// slot cannot be looked up.
     pub fn bind_and_send_stream(
         &mut self,
         queue_id: VarInt,
@@ -83,37 +104,42 @@ impl ServerDispatch {
     ) -> Result<BindResult, Error<intrusive::Entry<msg::Stream>>> {
         let index = queue_id.as_u64() as usize;
 
-        // Grow the page table on demand — the client controls queue_id space.
+        // Reject absurdly large queue_ids before growing memory.
+        if queue_id.as_u64() > MAX_SERVER_QUEUE_ID {
+            return Err(Error::Unallocated(entry));
+        }
+
+        // Grow the page table on demand — the client controls queue_id space
+        // up to the validated cap above.
         if index >= self.page_table.total_slots() {
             self.page_table.grow_to_fit(index);
         }
 
-        let mut view = self.page_table.sender_view();
-        let Some(slot) = view.get(index) else {
+        let Some(slot) = self.view.get(index) else {
             return Err(Error::Unallocated(entry));
         };
 
-        // Probe the current binding_id.
-        let raw = slot.binding_id.load(core::sync::atomic::Ordering::Acquire);
-        let unallocated = raw & UNALLOCATED_BIT != 0;
-
-        if unallocated {
-            // Attempt to claim this slot with a new binding.
-            return self.try_new_binding(slot, queue_id, binding_id, entry);
-        }
-
-        // Slot is already allocated — validate binding.
-        match VarInt::new(raw).ok() {
-            Some(b) if b == binding_id => {
-                // Existing binding matches: hot path.
-                let waker = slot.stream.push(entry).map_err(|err| match err {
-                    super::half::Error::HalfClosed(e) => Error::HalfClosed(e),
-                    super::half::Error::SenderClosed => Error::SenderClosed,
-                    super::half::Error::Unallocated(e) => Error::Unallocated(e),
-                })?;
-                Ok(BindResult::Bound(waker))
+        // bind_and_push_stream performs the binding check and entry push
+        // atomically inside the combined half locks — no CAS needed.
+        match slot.bind_and_push_stream(binding_id, entry)? {
+            BindState::AlreadyBound(waker) => Ok(BindResult::Bound(waker)),
+            BindState::NewBinding(waker) => {
+                let slot_ptr = slot.as_ptr();
+                let state = self.page_table.state.clone();
+                let stream = StreamReceiver::new(
+                    slot_ptr,
+                    OnFree::Server(self.freed.clone(), state.clone()),
+                );
+                let control = ControlReceiver::new(
+                    slot_ptr,
+                    OnFree::Server(self.freed.clone(), state),
+                );
+                Ok(BindResult::NewBinding {
+                    waker,
+                    stream,
+                    control,
+                })
             }
-            _ => Err(Error::BindingMismatch(entry)),
         }
     }
 
@@ -126,9 +152,8 @@ impl ServerDispatch {
         entry: intrusive::Entry<msg::Stream>,
     ) -> Result<AutoWake, Error<intrusive::Entry<msg::Stream>>> {
         let index = queue_id.as_u64() as usize;
-        let mut view = self.page_table.sender_view();
 
-        let Some(slot) = view.get(index) else {
+        let Some(slot) = self.view.get(index) else {
             return Err(Error::Unallocated(entry));
         };
 
@@ -146,9 +171,8 @@ impl ServerDispatch {
         entry: intrusive::Entry<msg::Control>,
     ) -> Result<AutoWake, Error<intrusive::Entry<msg::Control>>> {
         let index = queue_id.as_u64() as usize;
-        let mut view = self.page_table.sender_view();
 
-        let Some(slot) = view.get(index) else {
+        let Some(slot) = self.view.get(index) else {
             return Err(Error::Unallocated(entry));
         };
 
@@ -158,70 +182,19 @@ impl ServerDispatch {
     }
 
     /// Broadcast-close all slots — called when the path secret entry is evicted.
-    pub fn close(&mut self) {
-        self.page_table.sender_view().for_each_slot(|slot| {
-            let _wakers = slot.broadcast_close();
-            // AutoWake drops here, waking stored wakers.
-        });
-    }
-
-    // ── Internal helpers ──────────────────────────────────────────────────────
-
-    fn try_new_binding(
-        &self,
-        slot: &Slot,
-        queue_id: VarInt,
-        binding_id: VarInt,
-        entry: intrusive::Entry<msg::Stream>,
-    ) -> Result<BindResult, Error<intrusive::Entry<msg::Stream>>> {
-        // CAS unallocated → binding_id.
-        if !slot.try_allocate(binding_id) {
-            // Lost the race — another thread beat us.  Retry at the caller by
-            // returning BindingMismatch so the dispatch layer re-dispatches.
-            return Err(Error::BindingMismatch(entry));
-        }
-
-        // We won the CAS.  Open both receiver halves.
-        if slot.open_receivers().is_err() {
-            // Sender was closed while we were binding.
-            slot.mark_unallocated();
-            return Err(Error::SenderClosed);
-        }
-
-        let slot_ptr =
-            unsafe { NonNull::new_unchecked(slot as *const Slot as *mut Slot) };
-        let state = self.page_table.state.clone();
-
-        let waker = slot.stream.push(entry).map_err(|err| {
-            // Roll back — drop the just-opened receivers by closing them.
-            let _ = super::half::close_receiver(&slot.stream, &slot.control, true, || {
-                slot.mark_unallocated();
-            });
-            match err {
-                super::half::Error::HalfClosed(e) => Error::HalfClosed(e),
-                super::half::Error::SenderClosed => Error::SenderClosed,
-                super::half::Error::Unallocated(e) => Error::Unallocated(e),
+    ///
+    /// Wakers are passed to `waker_sink` rather than woken inline so this is
+    /// safe to call from a dispatch thread.
+    pub fn close(&mut self, waker_sink: &mut impl FnMut(std::task::Waker)) {
+        self.view.for_each_slot(|slot| {
+            let (mut sw, mut cw) = slot.broadcast_close();
+            if let Some(w) = sw.take() {
+                waker_sink(w);
             }
-        })?;
-
-        let stream = StreamReceiver::new(
-            slot_ptr,
-            queue_id,
-            OnFree::Server(self.freed.clone()),
-            state.clone(),
-        );
-        let control = ControlReceiver::new(
-            slot_ptr,
-            queue_id,
-            OnFree::Server(self.freed.clone()),
-            state,
-        );
-
-        Ok(BindResult::NewBinding {
-            waker,
-            stream,
-            control,
-        })
+            if let Some(w) = cw.take() {
+                waker_sink(w);
+            }
+        });
     }
 }
 
@@ -229,13 +202,13 @@ impl ServerDispatch {
 
 #[inline]
 fn validate_binding<T, F>(
-    slot: &Slot,
+    slot: &super::slot::Slot,
     binding_id: VarInt,
     entry: T,
     push: F,
 ) -> Result<AutoWake, Error<T>>
 where
-    F: FnOnce(&Slot, T) -> Result<AutoWake, Error<T>>,
+    F: FnOnce(&super::slot::Slot, T) -> Result<AutoWake, Error<T>>,
 {
     match slot.binding_id() {
         Some(b) if b == binding_id => push(slot, entry),

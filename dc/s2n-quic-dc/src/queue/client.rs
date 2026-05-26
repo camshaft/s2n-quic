@@ -7,28 +7,28 @@
 //!
 //! - `ClientAllocator` — stream creation path.  Allocates a local page-table
 //!   slot and a `dest_queue_id` from the peer's `FreeList`, then opens the
-//!   receiver handles.
+//!   receiver handles.  Each `ClientAllocator` owns a dedicated `SenderView`
+//!   so repeated allocations avoid re-acquiring the page-table `RwLock`.
 //!
 //! - `ClientDispatch` — inbound packet dispatch path.  Routes an incoming
 //!   `msg::Stream` / `msg::Control` entry to the correct slot by `queue_id`
 //!   after validating `binding_id`.  No allocation logic here.
 //!
 //! - `ClientFreeList` — local slot recycling.  Uses a `HierarchicalBitSet`
-//!   for O(4) pop and a high-water mark for fresh-slot bump allocation.
+//!   that starts small and grows on demand, plus a high-water mark for fresh
+//!   slot bump allocation.
 
 use super::{
     half::AutoWake,
-    handle::{AllocResult, ControlReceiver, OnFree, StreamReceiver},
-    page_table::PageTable,
-    slot::UNALLOCATED_BIT,
+    handle::{AllocResult, ClientShared, ControlReceiver, OnFree, StreamReceiver},
+    page_table::{PageTable, SenderView},
     Error,
 };
-use crate::{endpoint::msg, intrusive, sync};
+use crate::{bitset, endpoint::msg, intrusive, sync};
 use s2n_quic_core::varint::VarInt;
 use std::{
-    ptr::NonNull,
     sync::{Arc, Mutex},
-    task::{Context, Poll},
+    task::{Context, Poll, Waker},
 };
 
 // ── ClientFreeList ────────────────────────────────────────────────────────────
@@ -36,9 +36,11 @@ use std::{
 /// Local slot recycling for the client page table.
 ///
 /// Freed slot indices are stored in a `HierarchicalBitSet` for O(4) pop.
+/// The bitset starts with capacity 1 and grows on demand so that fresh
+/// allocators pay no up-front memory cost.
 /// Fresh slots beyond the current high-water mark are allocated by bumping.
 pub struct ClientFreeList {
-    freed: sync::bitset::HierarchicalBitSet,
+    freed: bitset::HierarchicalBitSet,
     high_water_mark: usize,
     closed: bool,
     #[cfg(debug_assertions)]
@@ -46,11 +48,10 @@ pub struct ClientFreeList {
 }
 
 impl ClientFreeList {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
-            freed: sync::bitset::HierarchicalBitSet::new(
-                sync::bitset::HierarchicalBitSet::MAX_CAPACITY,
-            ),
+            // Start with the minimum valid capacity; grow on demand.
+            freed: bitset::HierarchicalBitSet::new(1),
             high_water_mark: 0,
             closed: false,
             #[cfg(debug_assertions)]
@@ -58,8 +59,9 @@ impl ClientFreeList {
         }
     }
 
-    /// Pop the next available local slot index, or `None` if closed.
+    /// Pop the next available local slot index.
     ///
+    /// Returns `None` if the free list is closed.
     /// Prefers recycled indices (pop from bitset) over fresh ones (bump).
     pub(crate) fn pop(&mut self) -> Option<usize> {
         if self.closed {
@@ -90,7 +92,7 @@ impl ClientFreeList {
         let idx = index as u32;
         if idx < self.freed.capacity() {
             self.freed.insert(idx);
-        } else if idx < sync::bitset::HierarchicalBitSet::MAX_CAPACITY {
+        } else if idx < bitset::HierarchicalBitSet::MAX_CAPACITY {
             self.freed.grow(idx + 1);
             self.freed.insert(idx);
         }
@@ -107,31 +109,46 @@ impl ClientFreeList {
 // ── ClientAllocator ───────────────────────────────────────────────────────────
 
 /// Allocates local queue slots and peer `dest_queue_id`s for client streams.
+///
+/// Each `ClientAllocator` has its own `SenderView`, so repeated calls to
+/// `try_alloc` / `poll_alloc` amortise the page-table `RwLock` acquisition
+/// — the view is only refreshed on page growth.
 pub struct ClientAllocator {
-    page_table: PageTable,
-    local_free: Arc<Mutex<ClientFreeList>>,
+    shared: Arc<ClientShared>,
     peer_free: Arc<sync::free_list::FreeList>,
+    /// Per-allocator cached view into the page table.
+    view: SenderView,
 }
 
 impl ClientAllocator {
     pub fn new(peer_free: Arc<sync::free_list::FreeList>) -> Self {
+        let page_table = PageTable::new();
+        let view = page_table.sender_view();
+        let shared = Arc::new(ClientShared {
+            state: page_table.state.clone(),
+            local_free: Mutex::new(ClientFreeList::new()),
+        });
         Self {
-            page_table: PageTable::new(),
-            local_free: Arc::new(Mutex::new(ClientFreeList::new())),
+            shared,
             peer_free,
+            view,
         }
     }
 
-    /// Non-blocking alloc.  Returns `None` if peer has no free queue IDs.
-    pub fn try_alloc(&self, binding_id: VarInt) -> Option<AllocResult> {
+    /// Non-blocking alloc.
+    ///
+    /// Returns `None` if the peer has no free queue IDs or if this allocator
+    /// has been closed.
+    pub fn try_alloc(&mut self, binding_id: VarInt) -> Option<AllocResult> {
         let dest_queue_id = self.peer_free.try_alloc()?;
-        let result = self.alloc_local(binding_id, dest_queue_id);
-        Some(result)
+        self.alloc_local(binding_id, dest_queue_id).ok()
     }
 
     /// Async alloc.  Suspends if the peer free list is exhausted.
+    ///
+    /// Returns `None` if the allocator or peer free list is permanently closed.
     pub fn poll_alloc(
-        &self,
+        &mut self,
         binding_id: VarInt,
         cx: &mut Context,
     ) -> Poll<Option<AllocResult>> {
@@ -139,66 +156,70 @@ impl ClientAllocator {
             Poll::Pending => Poll::Pending,
             Poll::Ready(None) => Poll::Ready(None),
             Poll::Ready(Some(dest_queue_id)) => {
-                Poll::Ready(Some(self.alloc_local(binding_id, dest_queue_id)))
+                Poll::Ready(self.alloc_local(binding_id, dest_queue_id).ok())
             }
         }
     }
 
     pub fn close(&self) {
-        self.local_free.lock().unwrap().close();
+        self.shared.local_free.lock().unwrap().close();
     }
 
-    fn alloc_local(&self, binding_id: VarInt, dest_queue_id: VarInt) -> AllocResult {
+    fn alloc_local(
+        &mut self,
+        binding_id: VarInt,
+        dest_queue_id: VarInt,
+    ) -> Result<AllocResult, Error<()>> {
         let index = {
-            let mut free = self.local_free.lock().unwrap();
-            free.pop().expect("ClientFreeList closed during alloc")
+            let mut free = self.shared.local_free.lock().unwrap();
+            match free.pop() {
+                Some(idx) => idx,
+                None => return Err(Error::SenderClosed),
+            }
         };
 
         // Grow the page table if this index falls outside current capacity.
-        if index >= self.page_table.total_slots() {
-            self.page_table.grow_to_fit(index);
+        let page_table = PageTable {
+            state: self.shared.state.clone(),
+        };
+        if index >= page_table.total_slots() {
+            page_table.grow_to_fit(index);
         }
 
-        let mut view = self.page_table.sender_view();
-        let slot_ref = view.get(index).expect("slot index out of range after grow");
+        let slot_ref = self
+            .view
+            .get(index)
+            .expect("slot index out of range after grow");
 
-        // CAS the slot from UNALLOCATED to `binding_id`.
-        assert!(
-            slot_ref.try_allocate(binding_id),
-            "slot {index} was not unallocated"
-        );
+        // Set binding_id and open both receiver halves atomically.
+        if slot_ref.allocate_and_open(binding_id).is_err() {
+            // The sender side was closed; return the slot index.
+            self.shared
+                .local_free
+                .lock()
+                .unwrap()
+                .push_freed(index);
+            return Err(Error::SenderClosed);
+        }
 
-        // Open both receiver halves atomically.
-        slot_ref
-            .open_receivers()
-            .expect("slot halves closed immediately after allocation");
-
-        let slot_ptr = unsafe { NonNull::new_unchecked(slot_ref as *const _ as *mut _) };
+        let slot_ptr = slot_ref.as_ptr();
         let local_queue_id = VarInt::new(index as u64).expect("slot index exceeds VarInt range");
-        let state = self.page_table.state.clone();
 
-        AllocResult {
-            stream: StreamReceiver::new(
-                slot_ptr,
-                local_queue_id,
-                OnFree::Client(self.local_free.clone()),
-                state.clone(),
-            ),
-            control: ControlReceiver::new(
-                slot_ptr,
-                local_queue_id,
-                OnFree::Client(self.local_free.clone()),
-                state,
-            ),
+        Ok(AllocResult {
+            stream: StreamReceiver::new(slot_ptr, OnFree::Client(self.shared.clone())),
+            control: ControlReceiver::new(slot_ptr, OnFree::Client(self.shared.clone())),
             local_queue_id,
             dest_queue_id,
-        }
+        })
     }
 
     /// Build a `ClientDispatch` backed by the same page table.
     pub fn dispatcher(&self) -> ClientDispatch {
         ClientDispatch {
-            view: self.page_table.sender_view(),
+            view: PageTable {
+                state: self.shared.state.clone(),
+            }
+            .sender_view(),
         }
     }
 }
@@ -210,7 +231,7 @@ impl ClientAllocator {
 /// `queue_id` is the local slot index (what the peer sent as `dest_queue_id`).
 /// `binding_id` is validated against the slot's stored value before pushing.
 pub struct ClientDispatch {
-    view: super::page_table::SenderView,
+    view: SenderView,
 }
 
 impl ClientDispatch {
@@ -248,12 +269,18 @@ impl ClientDispatch {
 
     /// Broadcast-close all currently allocated slots.
     ///
-    /// Called when the path secret entry is evicted.  Wakes all pending
-    /// receivers so they observe the closed state.
-    pub fn close(&mut self) {
+    /// Called when the path secret entry is evicted.  Collected wakers are
+    /// passed to `waker_sink` rather than woken inline, so this method is safe
+    /// to call from a dispatch thread where syscalls are unacceptable.
+    pub fn close(&mut self, waker_sink: &mut impl FnMut(Waker)) {
         self.view.for_each_slot(|slot| {
-            let (_sw, _cw) = slot.broadcast_close();
-            // AutoWake drops here, waking the stored wakers.
+            let (mut sw, mut cw) = slot.broadcast_close();
+            if let Some(w) = sw.take() {
+                waker_sink(w);
+            }
+            if let Some(w) = cw.take() {
+                waker_sink(w);
+            }
         });
     }
 }
@@ -262,7 +289,7 @@ impl ClientDispatch {
 
 #[inline]
 fn dispatch_to_slot<T, F>(
-    view: &mut super::page_table::SenderView,
+    view: &mut SenderView,
     queue_id: VarInt,
     binding_id: VarInt,
     entry: T,

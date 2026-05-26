@@ -11,6 +11,7 @@
 //! on the dispatch hot path without holding the `RwLock`.
 
 use super::slot::Slot;
+use s2n_quic_core::varint::VarInt;
 use std::{
     pin::Pin,
     ptr::NonNull,
@@ -54,15 +55,16 @@ impl PageTable {
         }
     }
 
-    /// Grow the table by at least `min_new_slots` additional slots.
+    /// Grow the table until it can hold `index`.
     ///
-    /// Called on the client alloc path when the local high-water-mark is
-    /// exhausted, and on the server dispatch path when a `queue_id` exceeds
-    /// current capacity.
+    /// Pages are sized P, 2P, 4P, 8P, … where P = `INITIAL_PAGE_SIZE`, so
+    /// page `k` has `2^k × P` slots and `find_page` indexes into them in O(1).
     pub(crate) fn grow_to_fit(&self, index: usize) {
         let mut list = self.state.pages.write().unwrap();
         while list.total_slots <= index {
-            let next_size = list.total_slots.max(INITIAL_PAGE_SIZE);
+            // Page k (0-based) has 2^k × P slots.
+            let k = list.pages.len();
+            let next_size = INITIAL_PAGE_SIZE << k;
             list.grow(next_size);
         }
     }
@@ -91,9 +93,15 @@ pub(crate) struct PageList {
 }
 
 impl PageList {
-    /// Append a new page of `page_size` fresh slots.
+    /// Append a new page of `page_size` fresh slots starting at `base_index`.
     fn grow(&mut self, page_size: usize) {
-        let slots: Vec<Slot> = (0..page_size).map(|_| Slot::new()).collect();
+        let base_index = self.total_slots;
+        let slots: Vec<Slot> = (0..page_size)
+            .map(|i| {
+                let id = VarInt::new((base_index + i) as u64).unwrap_or(VarInt::MAX);
+                Slot::with_queue_id(id)
+            })
+            .collect();
         let boxed: Box<[Slot]> = slots.into_boxed_slice();
         let pinned = Pin::new(boxed);
         self.total_slots += page_size;
@@ -199,18 +207,21 @@ impl SenderView {
 
 // ── Page index arithmetic ────────────────────────────────────────────────────
 
-/// Map a flat slot index to `(page_index, intra_page_offset)`.
+/// Map a flat slot index to `(page_index, intra-page offset)`.
 ///
-/// Page sizes follow the sequence: P, P, 2P, 4P, 8P, …  where P =
-/// `INITIAL_PAGE_SIZE`. Page 0 has P slots (the pre-allocated first page),
-/// page 1 also has P (first growth step), page 2 has 2P, etc.
+/// Pages are sized P, 2P, 4P, 8P, …  where P = `INITIAL_PAGE_SIZE` (the first
+/// page is pre-allocated with P slots and each subsequent grow doubles).
 ///
-/// This mirrors the exponential growth used in the existing `flow/queue/sender.rs`
-/// for O(1) computation without scanning pages.
+/// - Page 0 covers `[0, P)` → 1×P slots
+/// - Page 1 covers `[P, 3P)` → 2×P slots
+/// - Page 2 covers `[3P, 7P)` → 4×P slots
+///
+/// The formula: let `m = index / P`; page_idx = ⌊log₂(m+1)⌋;
+/// page_start = P × (2^page_idx − 1).
 #[inline]
 pub(crate) fn find_page(index: usize) -> (usize, usize) {
-    let k = index / INITIAL_PAGE_SIZE;
-    let page_idx = (k + 1).ilog2() as usize;
+    let m = index / INITIAL_PAGE_SIZE;
+    let page_idx = (m + 1).ilog2() as usize;
     let page_start = ((1usize << page_idx) - 1) * INITIAL_PAGE_SIZE;
     (page_idx, index - page_start)
 }
@@ -221,15 +232,32 @@ mod tests {
 
     #[test]
     fn find_page_basic() {
-        // first page: indices 0..INITIAL_PAGE_SIZE
+        // Page 0: indices [0, P)
         for i in 0..INITIAL_PAGE_SIZE {
             let (page, offset) = find_page(i);
             assert_eq!(page, 0, "index {i}");
             assert_eq!(offset, i, "index {i}");
         }
-        // second page starts at INITIAL_PAGE_SIZE
+        // Page 1: indices [P, 3P) — 2P slots
         let (page, offset) = find_page(INITIAL_PAGE_SIZE);
         assert_eq!(page, 1);
+        assert_eq!(offset, 0);
+
+        let (page, offset) = find_page(2 * INITIAL_PAGE_SIZE - 1);
+        assert_eq!(page, 1);
+        assert_eq!(offset, INITIAL_PAGE_SIZE - 1);
+    }
+
+    #[test]
+    fn find_page_2p_boundary() {
+        // Index 2P is the start of page 1's second half, still page 1
+        let (page, offset) = find_page(2 * INITIAL_PAGE_SIZE);
+        assert_eq!(page, 1, "2P should still be page 1");
+        assert_eq!(offset, INITIAL_PAGE_SIZE);
+
+        // Index 3P is the start of page 2
+        let (page, offset) = find_page(3 * INITIAL_PAGE_SIZE);
+        assert_eq!(page, 2, "3P should start page 2");
         assert_eq!(offset, 0);
     }
 
@@ -239,14 +267,31 @@ mod tests {
         let initial = pt.total_slots();
         assert_eq!(initial, INITIAL_PAGE_SIZE);
 
-        // Grow to fit an index beyond the first page.
+        // After one grow: total_slots = P + 2P = 3P
         pt.grow_to_fit(INITIAL_PAGE_SIZE);
-        assert!(pt.total_slots() > INITIAL_PAGE_SIZE);
+        assert_eq!(pt.total_slots(), 3 * INITIAL_PAGE_SIZE);
 
         let mut view = pt.sender_view();
         // slot 0 should be accessible
         assert!(view.get(0).is_some());
-        // slot at new capacity should be accessible
-        assert!(view.get(INITIAL_PAGE_SIZE).is_some());
+        // slot at 2P-1 (end of page 1) should be accessible
+        assert!(view.get(2 * INITIAL_PAGE_SIZE - 1).is_some());
+        // slot at 2P (page 1, second half) should be accessible
+        assert!(view.get(2 * INITIAL_PAGE_SIZE).is_some());
+        // 3P - 1 is the last slot in page 1
+        assert!(view.get(3 * INITIAL_PAGE_SIZE - 1).is_some());
+    }
+
+    #[test]
+    fn slot_queue_ids_are_correct() {
+        let pt = PageTable::new();
+        pt.grow_to_fit(3 * INITIAL_PAGE_SIZE);
+
+        let mut view = pt.sender_view();
+        for i in 0..pt.total_slots() {
+            let slot = view.get(i).expect("slot should exist");
+            let qid = slot.queue_id();
+            assert_eq!(qid.as_u64() as usize, i, "slot at {i} should have queue_id {i}");
+        }
     }
 }
