@@ -1212,6 +1212,155 @@ mod tests {
         Prepend,
     }
 
+    // ── Remove tests using Arc-based adapter ──────────────────────────────
+
+    struct ArcNode {
+        links: Links,
+        value: u64,
+    }
+
+    struct ArcAdapter;
+
+    impl Adapter for ArcAdapter {
+        type Value = ArcNode;
+        type Target = ArcNode;
+        type Pointer = std::sync::Arc<ArcNode>;
+
+        unsafe fn links(value: *mut Self::Value) -> *mut Links {
+            &raw mut (*value).links
+        }
+        unsafe fn target(value: *mut Self::Value) -> *mut Self::Target {
+            value
+        }
+        fn as_ptr(ptr: &Self::Pointer) -> *const Self::Value {
+            std::sync::Arc::as_ptr(ptr)
+        }
+        fn into_raw(ptr: Self::Pointer) -> *mut Self::Value {
+            std::sync::Arc::into_raw(ptr) as *mut Self::Value
+        }
+        unsafe fn from_raw(ptr: *mut Self::Value) -> Self::Pointer {
+            std::sync::Arc::from_raw(ptr)
+        }
+    }
+
+    fn arc_node(value: u64) -> std::sync::Arc<ArcNode> {
+        std::sync::Arc::new(ArcNode {
+            links: Links::new(),
+            value,
+        })
+    }
+
+    #[test]
+    fn remove_singleton() {
+        let mut list: List<ArcAdapter> = List::new();
+        let n1 = arc_node(1);
+        list.push_back(n1.clone());
+        assert_eq!(list.len(), 1);
+
+        let removed = unsafe { list.remove(&n1) };
+        assert!(removed.is_some());
+        assert_eq!(list.len(), 0);
+        assert!(list.is_empty());
+        assert!(!n1.links.is_linked());
+    }
+
+    #[test]
+    fn remove_head() {
+        let mut list: List<ArcAdapter> = List::new();
+        let n1 = arc_node(1);
+        let n2 = arc_node(2);
+        let n3 = arc_node(3);
+        list.push_back(n1.clone());
+        list.push_back(n2.clone());
+        list.push_back(n3.clone());
+
+        let removed = unsafe { list.remove(&n1) };
+        assert!(removed.is_some());
+        assert_eq!(list.len(), 2);
+        assert_eq!(list.pop_front().unwrap().value, 2);
+        assert_eq!(list.pop_front().unwrap().value, 3);
+    }
+
+    #[test]
+    fn remove_tail() {
+        let mut list: List<ArcAdapter> = List::new();
+        let n1 = arc_node(1);
+        let n2 = arc_node(2);
+        let n3 = arc_node(3);
+        list.push_back(n1.clone());
+        list.push_back(n2.clone());
+        list.push_back(n3.clone());
+
+        let removed = unsafe { list.remove(&n3) };
+        assert!(removed.is_some());
+        assert_eq!(list.len(), 2);
+        assert_eq!(list.pop_back().unwrap().value, 2);
+        assert_eq!(list.pop_back().unwrap().value, 1);
+    }
+
+    #[test]
+    fn remove_interior() {
+        let mut list: List<ArcAdapter> = List::new();
+        let n1 = arc_node(1);
+        let n2 = arc_node(2);
+        let n3 = arc_node(3);
+        list.push_back(n1.clone());
+        list.push_back(n2.clone());
+        list.push_back(n3.clone());
+
+        let removed = unsafe { list.remove(&n2) };
+        assert!(removed.is_some());
+        assert_eq!(list.len(), 2);
+        assert_eq!(list.pop_front().unwrap().value, 1);
+        assert_eq!(list.pop_front().unwrap().value, 3);
+    }
+
+    #[test]
+    fn remove_not_linked() {
+        let mut list: List<ArcAdapter> = List::new();
+        let n1 = arc_node(1);
+        // never pushed
+        let removed = unsafe { list.remove(&n1) };
+        assert!(removed.is_none());
+        assert_eq!(list.len(), 0);
+    }
+
+    #[test]
+    fn remove_already_popped() {
+        let mut list: List<ArcAdapter> = List::new();
+        let n1 = arc_node(1);
+        let n2 = arc_node(2);
+        list.push_back(n1.clone());
+        list.push_back(n2.clone());
+
+        // Pop n1 via pop_front
+        let _ = list.pop_front();
+        assert!(!n1.links.is_linked());
+
+        // Try to remove n1 again — should return None
+        let removed = unsafe { list.remove(&n1) };
+        assert!(removed.is_none());
+        assert_eq!(list.len(), 1);
+    }
+
+    #[test]
+    fn remove_all_then_reuse() {
+        let mut list: List<ArcAdapter> = List::new();
+        let n1 = arc_node(1);
+        let n2 = arc_node(2);
+        list.push_back(n1.clone());
+        list.push_back(n2.clone());
+
+        unsafe { list.remove(&n1) };
+        unsafe { list.remove(&n2) };
+        assert!(list.is_empty());
+
+        // Re-push after removal
+        list.push_back(n1.clone());
+        assert_eq!(list.len(), 1);
+        assert_eq!(list.pop_front().unwrap().value, 1);
+    }
+
     #[test]
     fn differential_test() {
         check!().with_type::<Vec<Operation>>().for_each(|ops| {
