@@ -20,7 +20,7 @@
 
 use super::{
     half::AutoWake,
-    handle::{AllocResult, ClientShared, ControlReceiver, OnFree, StreamReceiver},
+    handle::{AllocResult, ControlReceiver, OnFree, StreamReceiver},
     page_table::{PageTable, SenderView},
     Error,
 };
@@ -90,47 +90,37 @@ impl ClientFreeList {
 /// Allocates local queue slots and peer `dest_queue_id`s for client streams.
 ///
 /// Each `ClientAllocator` has its own `SenderView`, so repeated calls to
-/// `try_alloc` / `poll_alloc` amortise the page-table `RwLock` acquisition
-/// — the view is only refreshed on page growth.
+/// `try_alloc` amortise the page-table `RwLock` acquisition — the view is
+/// only refreshed on page growth.
 #[derive(Clone)]
 pub struct ClientAllocator {
-    shared: Arc<ClientShared>,
-    peer_free: Arc<sync::free_list::FreeList>,
-    /// Per-allocator cached view into the page table.
     view: SenderView,
+    local_free: Arc<Mutex<ClientFreeList>>,
+    peer_free: Arc<sync::free_list::FreeList>,
 }
 
 impl ClientAllocator {
     pub fn new(peer_free: Arc<sync::free_list::FreeList>) -> Self {
         let page_table = PageTable::new();
         let view = page_table.sender_view();
-        let shared = Arc::new(ClientShared {
-            state: page_table.state.clone(),
-            local_free: Mutex::new(ClientFreeList::new()),
-        });
         Self {
-            shared,
-            peer_free,
             view,
+            local_free: Arc::new(Mutex::new(ClientFreeList::new())),
+            peer_free,
         }
     }
 
-    /// Non-blocking alloc.
-    ///
-    /// Returns `None` if the peer has no free queue IDs or if this allocator
-    /// has been closed.
     pub fn try_alloc(&mut self, binding_id: VarInt) -> Option<AllocResult> {
         let dest_queue_id = self.peer_free.try_alloc()?;
         self.alloc_local(binding_id, dest_queue_id).ok()
     }
 
-    /// Access the peer free list for async allocation via `peer_free.alloc().await`.
     pub fn peer_free(&self) -> &Arc<sync::free_list::FreeList> {
         &self.peer_free
     }
 
     pub fn close(&self) {
-        self.shared.local_free.lock().unwrap().close();
+        self.local_free.lock().unwrap().close();
     }
 
     fn alloc_local(
@@ -139,19 +129,15 @@ impl ClientAllocator {
         dest_queue_id: VarInt,
     ) -> Result<AllocResult, Error<()>> {
         let index = {
-            let mut free = self.shared.local_free.lock().unwrap();
+            let mut free = self.local_free.lock().unwrap();
             match free.pop() {
                 Some(idx) => idx,
                 None => return Err(Error::SenderClosed),
             }
         };
 
-        // Grow the page table if this index falls outside current capacity.
-        let page_table = PageTable {
-            state: self.shared.state.clone(),
-        };
-        if index >= page_table.total_slots() {
-            page_table.grow_to_fit(index);
+        if index >= self.view.total_slots() {
+            self.view.grow_to_fit(index);
         }
 
         let slot_ref = self
@@ -159,23 +145,21 @@ impl ClientAllocator {
             .get(index)
             .expect("slot index out of range after grow");
 
-        // Set binding_id and open both receiver halves atomically.
         if slot_ref.allocate_and_open(binding_id).is_err() {
-            // The sender side was closed; return the slot index.
-            self.shared
-                .local_free
-                .lock()
-                .unwrap()
-                .push_freed(index);
+            self.local_free.lock().unwrap().push_freed(index);
             return Err(Error::SenderClosed);
         }
 
         let slot_ptr = slot_ref.as_ptr();
         let local_queue_id = VarInt::new(index as u64).expect("slot index exceeds VarInt range");
+        let on_free = OnFree::Client {
+            _state: self.view.state().clone(),
+            local_free: self.local_free.clone(),
+        };
 
         Ok(AllocResult {
-            stream: StreamReceiver::new(slot_ptr, OnFree::Client(self.shared.clone())),
-            control: ControlReceiver::new(slot_ptr, OnFree::Client(self.shared.clone())),
+            stream: StreamReceiver::new(slot_ptr, on_free.clone()),
+            control: ControlReceiver::new(slot_ptr, on_free),
             local_queue_id,
             dest_queue_id,
         })

@@ -169,9 +169,27 @@ impl SenderView {
 
     /// Total number of slots currently visible in the cache.
     #[inline]
-    #[allow(dead_code)]
     pub(crate) fn total_slots(&self) -> usize {
         self.total_cached
+    }
+
+    /// Access the underlying shared state (for passing to receivers).
+    #[inline]
+    pub(crate) fn state(&self) -> &Arc<State> {
+        &self.state
+    }
+
+    /// Grow the page table until it can hold `index`.
+    pub(crate) fn grow_to_fit(&mut self, index: usize) {
+        {
+            let mut list = self.state.pages.write().unwrap();
+            while list.total_slots <= index {
+                let k = list.pages.len();
+                let next_size = INITIAL_PAGE_SIZE << k;
+                list.grow(next_size);
+            }
+        }
+        self.refresh();
     }
 
     /// Refresh the cache from the shared `RwLock<PageList>`.

@@ -25,25 +25,19 @@ use std::sync::{Arc, Mutex};
 
 // ── OnFree ────────────────────────────────────────────────────────────────────
 
-/// Per-allocator shared state: owns the page table and the local slot free list.
-///
-/// Combining both into one `Arc` means each `StreamReceiver` / `ControlReceiver`
-/// keeps exactly one reference, rather than separate `Arc<State>` and
-/// `Arc<Mutex<ClientFreeList>>` references.
-pub(crate) struct ClientShared {
-    pub(crate) state: Arc<State>,
-    pub(crate) local_free: Mutex<super::client::ClientFreeList>,
-}
-
 /// Reclamation strategy chosen at construction time.
 ///
-/// The `OnFree` value also acts as the lifetime guard: it holds an `Arc` that
-/// keeps the pinned page table alive for at least as long as the receiver.
+/// The `OnFree` value also acts as the lifetime guard: it holds an `Arc<State>`
+/// that keeps the pinned page table alive for at least as long as the receiver.
+#[derive(Clone)]
 pub(crate) enum OnFree {
     /// Client: return the local slot index to the client free list.
-    Client(Arc<ClientShared>),
+    /// `_state` keeps the pinned page table alive for the receiver's lifetime.
+    Client {
+        _state: Arc<State>,
+        local_free: Arc<Mutex<super::client::ClientFreeList>>,
+    },
     /// Server: notify the client that this queue_id is available again.
-    /// The `Arc<State>` keeps the pinned page table alive.
     Server(FreedSender, Arc<State>),
 }
 
@@ -208,9 +202,8 @@ impl core::fmt::Debug for ControlReceiver {
 
 fn reclaim(queue_id: VarInt, on_free: &OnFree) {
     match on_free {
-        OnFree::Client(shared) => {
-            let mut list = shared.local_free.lock().unwrap();
-            list.push_freed(queue_id.as_u64() as usize);
+        OnFree::Client { local_free, .. } => {
+            local_free.lock().unwrap().push_freed(queue_id.as_u64() as usize);
         }
         OnFree::Server(freed_sender, _state) => {
             freed_sender.record(queue_id);
