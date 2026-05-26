@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::intrusive::{Adapter, Links, List};
-use std::{cell::UnsafeCell, ptr::NonNull, sync::Arc, task::Waker};
+use std::{cell::UnsafeCell, sync::Arc, task::Waker};
 
 pub(crate) struct Waiter {
     pub(crate) links: Links,

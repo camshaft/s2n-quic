@@ -7,6 +7,64 @@ use std::{
     ptr::NonNull,
 };
 
+// ── List identity tracking ────────────────────────────────────────────────
+
+/// Identifies a specific list instance.  Zero-sized in release builds.
+#[derive(Clone, Copy)]
+#[cfg(debug_assertions)]
+struct ListId(u64);
+
+#[derive(Clone, Copy)]
+#[cfg(not(debug_assertions))]
+struct ListId;
+
+impl ListId {
+    fn next() -> Self {
+        #[cfg(debug_assertions)]
+        {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static COUNTER: AtomicU64 = AtomicU64::new(1);
+            Self(COUNTER.fetch_add(1, Ordering::Relaxed))
+        }
+        #[cfg(not(debug_assertions))]
+        { Self }
+    }
+}
+
+/// Tracks which list owns a node.  Zero-sized in release builds.
+#[cfg(debug_assertions)]
+struct LinkTag(Cell<u64>);
+
+#[cfg(not(debug_assertions))]
+struct LinkTag;
+
+impl LinkTag {
+    const fn new() -> Self {
+        #[cfg(debug_assertions)]
+        { Self(Cell::new(0)) }
+        #[cfg(not(debug_assertions))]
+        { Self }
+    }
+
+    #[inline(always)]
+    fn stamp(&self, _id: ListId) {
+        #[cfg(debug_assertions)]
+        self.0.set(_id.0);
+    }
+
+    #[inline(always)]
+    fn clear(&self) {
+        #[cfg(debug_assertions)]
+        self.0.set(0);
+    }
+
+    #[inline(always)]
+    fn assert_belongs_to(&self, _id: ListId) {
+        #[cfg(debug_assertions)]
+        debug_assert_eq!(self.0.get(), _id.0, "node belongs to a different list");
+    }
+}
+
 // ── Adapter Trait ──────────────────────────────────────────────────────────
 
 /// Links embedded in a value for intrusive list membership.
@@ -16,8 +74,7 @@ use std::{
 pub struct Links {
     prev: Cell<Option<NonNull<()>>>,
     next: Cell<Option<NonNull<()>>>,
-    #[cfg(debug_assertions)]
-    list_id: Cell<u64>,
+    tag: LinkTag,
 }
 
 impl Links {
@@ -25,12 +82,10 @@ impl Links {
         Self {
             prev: Cell::new(None),
             next: Cell::new(None),
-            #[cfg(debug_assertions)]
-            list_id: Cell::new(0),
+            tag: LinkTag::new(),
         }
     }
 
-    /// Returns true if this entry is currently linked in a list
     #[inline(always)]
     pub fn is_linked(&self) -> bool {
         self.prev.get().is_some() || self.next.get().is_some()
@@ -38,34 +93,24 @@ impl Links {
 
     #[inline(always)]
     fn assert_unlinked(&self) {
-        if cfg!(debug_assertions) {
-            debug_assert!(self.prev.get().is_none());
-            debug_assert!(self.next.get().is_none());
-        }
+        debug_assert!(!self.is_linked());
     }
 
     #[inline(always)]
-    fn stamp(&self, #[cfg(debug_assertions)] list_id: u64) {
-        #[cfg(debug_assertions)]
-        self.list_id.set(list_id);
+    fn stamp(&self, id: ListId) {
+        self.tag.stamp(id);
     }
 
     #[inline(always)]
     fn clear(&self) {
         self.prev.set(None);
         self.next.set(None);
-        #[cfg(debug_assertions)]
-        self.list_id.set(0);
+        self.tag.clear();
     }
 
-    #[cfg(debug_assertions)]
     #[inline(always)]
-    fn assert_belongs_to(&self, list_id: u64) {
-        debug_assert_eq!(
-            self.list_id.get(),
-            list_id,
-            "node belongs to a different list"
-        );
+    fn assert_belongs_to(&self, id: ListId) {
+        self.tag.assert_belongs_to(id);
     }
 }
 
@@ -335,20 +380,12 @@ pub struct List<A: Adapter> {
     head: Option<NonNull<A::Value>>,
     tail: Option<NonNull<A::Value>>,
     len: usize,
-    #[cfg(debug_assertions)]
-    id: u64,
+    id: ListId,
     _phantom: core::marker::PhantomData<A>,
 }
 
 unsafe impl<A: Adapter> Send for List<A> where A::Pointer: Send {}
 unsafe impl<A: Adapter> Sync for List<A> where A::Pointer: Sync {}
-
-#[cfg(debug_assertions)]
-fn next_list_id() -> u64 {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static COUNTER: AtomicU64 = AtomicU64::new(1);
-    COUNTER.fetch_add(1, Ordering::Relaxed)
-}
 
 impl<A: Adapter> List<A> {
     /// Create a new empty list
@@ -357,8 +394,7 @@ impl<A: Adapter> List<A> {
             head: None,
             tail: None,
             len: 0,
-            #[cfg(debug_assertions)]
-            id: next_list_id(),
+            id: ListId::next(),
             _phantom: core::marker::PhantomData,
         }
     }
@@ -382,10 +418,7 @@ impl<A: Adapter> List<A> {
         unsafe {
             let links = A::links(new_tail.as_ptr());
             (*links).assert_unlinked();
-            (*links).stamp(
-                #[cfg(debug_assertions)]
-                self.id,
-            );
+            (*links).stamp(self.id);
 
             if let Some(tail) = self.tail {
                 // Non-empty list: link after current tail
@@ -419,10 +452,7 @@ impl<A: Adapter> List<A> {
         unsafe {
             let links = A::links(new_head.as_ptr());
             (*links).assert_unlinked();
-            (*links).stamp(
-                #[cfg(debug_assertions)]
-                self.id,
-            );
+            (*links).stamp(self.id);
 
             if let Some(head) = self.head {
                 // Non-empty list: link before current head
@@ -525,7 +555,6 @@ impl<A: Adapter> List<A> {
             return None;
         }
 
-        #[cfg(debug_assertions)]
         (*links).assert_belongs_to(self.id);
 
         let prev_raw = (*links).prev.get();
