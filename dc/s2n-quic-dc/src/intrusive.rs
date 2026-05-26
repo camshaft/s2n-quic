@@ -16,6 +16,8 @@ use std::{
 pub struct Links {
     prev: Cell<Option<NonNull<()>>>,
     next: Cell<Option<NonNull<()>>>,
+    #[cfg(debug_assertions)]
+    list_id: Cell<u64>,
 }
 
 impl Links {
@@ -23,6 +25,8 @@ impl Links {
         Self {
             prev: Cell::new(None),
             next: Cell::new(None),
+            #[cfg(debug_assertions)]
+            list_id: Cell::new(0),
         }
     }
 
@@ -38,6 +42,30 @@ impl Links {
             debug_assert!(self.prev.get().is_none());
             debug_assert!(self.next.get().is_none());
         }
+    }
+
+    #[inline(always)]
+    fn stamp(&self, #[cfg(debug_assertions)] list_id: u64) {
+        #[cfg(debug_assertions)]
+        self.list_id.set(list_id);
+    }
+
+    #[inline(always)]
+    fn clear(&self) {
+        self.prev.set(None);
+        self.next.set(None);
+        #[cfg(debug_assertions)]
+        self.list_id.set(0);
+    }
+
+    #[cfg(debug_assertions)]
+    #[inline(always)]
+    fn assert_belongs_to(&self, list_id: u64) {
+        debug_assert_eq!(
+            self.list_id.get(),
+            list_id,
+            "node belongs to a different list"
+        );
     }
 }
 
@@ -307,19 +335,30 @@ pub struct List<A: Adapter> {
     head: Option<NonNull<A::Value>>,
     tail: Option<NonNull<A::Value>>,
     len: usize,
+    #[cfg(debug_assertions)]
+    id: u64,
     _phantom: core::marker::PhantomData<A>,
 }
 
 unsafe impl<A: Adapter> Send for List<A> where A::Pointer: Send {}
 unsafe impl<A: Adapter> Sync for List<A> where A::Pointer: Sync {}
 
+#[cfg(debug_assertions)]
+fn next_list_id() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(1);
+    COUNTER.fetch_add(1, Ordering::Relaxed)
+}
+
 impl<A: Adapter> List<A> {
     /// Create a new empty list
-    pub const fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             head: None,
             tail: None,
             len: 0,
+            #[cfg(debug_assertions)]
+            id: next_list_id(),
             _phantom: core::marker::PhantomData,
         }
     }
@@ -343,6 +382,10 @@ impl<A: Adapter> List<A> {
         unsafe {
             let links = A::links(new_tail.as_ptr());
             (*links).assert_unlinked();
+            (*links).stamp(
+                #[cfg(debug_assertions)]
+                self.id,
+            );
 
             if let Some(tail) = self.tail {
                 // Non-empty list: link after current tail
@@ -376,6 +419,10 @@ impl<A: Adapter> List<A> {
         unsafe {
             let links = A::links(new_head.as_ptr());
             (*links).assert_unlinked();
+            (*links).stamp(
+                #[cfg(debug_assertions)]
+                self.id,
+            );
 
             if let Some(head) = self.head {
                 // Non-empty list: link before current head
@@ -423,9 +470,7 @@ impl<A: Adapter> List<A> {
                 self.tail = None;
             }
 
-            (*links).prev.set(None);
-            (*links).next.set(None);
-
+            (*links).clear();
             self.len -= 1;
 
             Some(A::from_raw(head.as_ptr()))
@@ -455,13 +500,86 @@ impl<A: Adapter> List<A> {
                 self.head = None;
             }
 
-            (*links).prev.set(None);
-            (*links).next.set(None);
-
+            (*links).clear();
             self.len -= 1;
 
             Some(A::from_raw(tail.as_ptr()))
         }
+    }
+
+    /// Remove a specific node from the list by pointer.
+    ///
+    /// Returns `Some(pointer)` if the node was linked and removed, or `None`
+    /// if the node was not linked (already removed by a concurrent drain).
+    ///
+    /// # Safety
+    ///
+    /// The provided pointer must reference a node that, if linked, belongs to
+    /// THIS list.  Passing a node from a different list is undefined behavior
+    /// (caught by debug_assert in debug builds).
+    pub unsafe fn remove(&mut self, ptr: &A::Pointer) -> Option<A::Pointer> {
+        let node = NonNull::new_unchecked(A::as_ptr(ptr) as *mut A::Value);
+        let links = A::links(node.as_ptr());
+
+        if !(*links).is_linked() {
+            return None;
+        }
+
+        #[cfg(debug_assertions)]
+        (*links).assert_belongs_to(self.id);
+
+        let prev_raw = (*links).prev.get();
+        let next_raw = (*links).next.get();
+
+        let prev = prev_raw.map(|p| NonNull::new_unchecked(p.as_ptr() as *mut A::Value));
+        let next = next_raw.map(|p| NonNull::new_unchecked(p.as_ptr() as *mut A::Value));
+
+        let is_head = prev.map_or(false, |p| p == node);
+        let is_tail = next.map_or(false, |p| p == node);
+
+        match (is_head, is_tail) {
+            (true, true) => {
+                // Singleton: clear list
+                self.head = None;
+                self.tail = None;
+            }
+            (true, false) => {
+                // Head but not tail: advance head
+                self.head = next;
+                if let Some(new_head) = next {
+                    let new_head_links = A::links(new_head.as_ptr());
+                    (*new_head_links)
+                        .prev
+                        .set(Some(NonNull::new_unchecked(new_head.as_ptr() as *mut ())));
+                }
+            }
+            (false, true) => {
+                // Tail but not head: retreat tail
+                self.tail = prev;
+                if let Some(new_tail) = prev {
+                    let new_tail_links = A::links(new_tail.as_ptr());
+                    (*new_tail_links)
+                        .next
+                        .set(Some(NonNull::new_unchecked(new_tail.as_ptr() as *mut ())));
+                }
+            }
+            (false, false) => {
+                // Interior: patch neighbors
+                if let Some(prev_node) = prev {
+                    let prev_links = A::links(prev_node.as_ptr());
+                    (*prev_links).next.set(next_raw);
+                }
+                if let Some(next_node) = next {
+                    let next_links = A::links(next_node.as_ptr());
+                    (*next_links).prev.set(prev_raw);
+                }
+            }
+        }
+
+        (*links).clear();
+        self.len -= 1;
+
+        Some(A::from_raw(node.as_ptr()))
     }
 
     /// Append another list to the back of this list

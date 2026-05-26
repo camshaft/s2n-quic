@@ -132,6 +132,7 @@ impl PageList {
 /// Caches raw pointers for O(1) slot lookup without holding the `RwLock`.
 /// Refreshes its cache lazily whenever a slot lookup falls outside the cached
 /// range (i.e. on page growth, which is rare).
+#[derive(Clone)]
 pub(crate) struct SenderView {
     state: Arc<State>,
     /// Cached (base_ptr, page_len) per page, in page order.

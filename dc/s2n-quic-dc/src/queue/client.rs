@@ -26,10 +26,7 @@ use super::{
 };
 use crate::{bitset, endpoint::msg, intrusive, sync};
 use s2n_quic_core::varint::VarInt;
-use std::{
-    sync::{Arc, Mutex},
-    task::{Context, Poll, Waker},
-};
+use std::sync::{Arc, Mutex};
 
 // ── ClientFreeList ────────────────────────────────────────────────────────────
 
@@ -43,19 +40,14 @@ pub struct ClientFreeList {
     freed: bitset::HierarchicalBitSet,
     high_water_mark: usize,
     closed: bool,
-    #[cfg(debug_assertions)]
-    active: std::collections::BTreeSet<usize>,
 }
 
 impl ClientFreeList {
     pub(crate) fn new() -> Self {
         Self {
-            // Start with the minimum valid capacity; grow on demand.
             freed: bitset::HierarchicalBitSet::new(1),
             high_water_mark: 0,
             closed: false,
-            #[cfg(debug_assertions)]
-            active: Default::default(),
         }
     }
 
@@ -68,37 +60,24 @@ impl ClientFreeList {
             return None;
         }
         if let Some(idx) = self.freed.pop_first() {
-            #[cfg(debug_assertions)]
-            {
-                debug_assert!(self.active.insert(idx as usize), "double-alloc of {idx}");
-            }
             return Some(idx as usize);
         }
         let idx = self.high_water_mark;
         self.high_water_mark += 1;
-        #[cfg(debug_assertions)]
-        {
-            debug_assert!(self.active.insert(idx), "double-alloc of {idx}");
-        }
         Some(idx)
     }
 
     /// Return a freed slot index back to the recycling set.
     pub(crate) fn push_freed(&mut self, index: usize) {
-        #[cfg(debug_assertions)]
-        {
-            debug_assert!(self.active.remove(&index), "double-free of {index}");
-        }
         let idx = index as u32;
-        if idx < self.freed.capacity() {
-            self.freed.insert(idx);
-        } else if idx < bitset::HierarchicalBitSet::MAX_CAPACITY {
+        if idx >= self.freed.capacity() {
+            if idx >= bitset::HierarchicalBitSet::MAX_CAPACITY {
+                return;
+            }
             self.freed.grow(idx + 1);
-            self.freed.insert(idx);
         }
-        // If index is absurdly large (beyond MAX_CAPACITY), silently drop it —
-        // the slot would just become permanently unavailable, which is safer
-        // than panicking.
+        let newly_inserted = self.freed.insert(idx);
+        debug_assert!(newly_inserted, "double-free of slot {index}");
     }
 
     pub(crate) fn close(&mut self) {
@@ -113,6 +92,7 @@ impl ClientFreeList {
 /// Each `ClientAllocator` has its own `SenderView`, so repeated calls to
 /// `try_alloc` / `poll_alloc` amortise the page-table `RwLock` acquisition
 /// — the view is only refreshed on page growth.
+#[derive(Clone)]
 pub struct ClientAllocator {
     shared: Arc<ClientShared>,
     peer_free: Arc<sync::free_list::FreeList>,
@@ -144,21 +124,9 @@ impl ClientAllocator {
         self.alloc_local(binding_id, dest_queue_id).ok()
     }
 
-    /// Async alloc.  Suspends if the peer free list is exhausted.
-    ///
-    /// Returns `None` if the allocator or peer free list is permanently closed.
-    pub fn poll_alloc(
-        &mut self,
-        binding_id: VarInt,
-        cx: &mut Context,
-    ) -> Poll<Option<AllocResult>> {
-        match self.peer_free.poll_alloc(cx) {
-            Poll::Pending => Poll::Pending,
-            Poll::Ready(None) => Poll::Ready(None),
-            Poll::Ready(Some(dest_queue_id)) => {
-                Poll::Ready(self.alloc_local(binding_id, dest_queue_id).ok())
-            }
-        }
+    /// Access the peer free list for async allocation via `peer_free.alloc().await`.
+    pub fn peer_free(&self) -> &Arc<sync::free_list::FreeList> {
+        &self.peer_free
     }
 
     pub fn close(&self) {
@@ -216,10 +184,7 @@ impl ClientAllocator {
     /// Build a `ClientDispatch` backed by the same page table.
     pub fn dispatcher(&self) -> ClientDispatch {
         ClientDispatch {
-            view: PageTable {
-                state: self.shared.state.clone(),
-            }
-            .sender_view(),
+            view: self.view.clone(),
         }
     }
 }
@@ -242,13 +207,11 @@ impl ClientDispatch {
         binding_id: VarInt,
         entry: intrusive::Entry<msg::Stream>,
     ) -> Result<AutoWake, Error<intrusive::Entry<msg::Stream>>> {
-        dispatch_to_slot(&mut self.view, queue_id, binding_id, entry, |slot, e| {
-            slot.stream.push(e).map_err(|err| match err {
-                super::half::Error::HalfClosed(e) => Error::HalfClosed(e),
-                super::half::Error::SenderClosed => Error::SenderClosed,
-                super::half::Error::Unallocated(e) => Error::Unallocated(e),
-            })
-        })
+        let index = queue_id.as_u64() as usize;
+        let Some(slot) = self.view.get(index) else {
+            return Err(Error::Unallocated(entry));
+        };
+        slot.push_stream(binding_id, entry)
     }
 
     #[inline]
@@ -258,57 +221,23 @@ impl ClientDispatch {
         binding_id: VarInt,
         entry: intrusive::Entry<msg::Control>,
     ) -> Result<AutoWake, Error<intrusive::Entry<msg::Control>>> {
-        dispatch_to_slot(&mut self.view, queue_id, binding_id, entry, |slot, e| {
-            slot.control.push(e).map_err(|err| match err {
-                super::half::Error::HalfClosed(e) => Error::HalfClosed(e),
-                super::half::Error::SenderClosed => Error::SenderClosed,
-                super::half::Error::Unallocated(e) => Error::Unallocated(e),
-            })
-        })
+        let index = queue_id.as_u64() as usize;
+        let Some(slot) = self.view.get(index) else {
+            return Err(Error::Unallocated(entry));
+        };
+        slot.push_control(binding_id, entry)
     }
 
     /// Broadcast-close all currently allocated slots.
     ///
-    /// Called when the path secret entry is evicted.  Collected wakers are
-    /// passed to `waker_sink` rather than woken inline, so this method is safe
-    /// to call from a dispatch thread where syscalls are unacceptable.
-    pub fn close(&mut self, waker_sink: &mut impl FnMut(Waker)) {
+    /// Called when the path secret entry is evicted.  `AutoWake` tokens are
+    /// passed to `waker_sink` — the caller can `.take()` to batch wakers for
+    /// later, or simply drop the token to wake immediately.
+    pub fn close(&mut self, waker_sink: &mut impl FnMut(AutoWake)) {
         self.view.for_each_slot(|slot| {
-            let (mut sw, mut cw) = slot.broadcast_close();
-            if let Some(w) = sw.take() {
-                waker_sink(w);
-            }
-            if let Some(w) = cw.take() {
-                waker_sink(w);
-            }
+            let (sw, cw) = slot.broadcast_close();
+            waker_sink(sw);
+            waker_sink(cw);
         });
     }
-}
-
-// ── Shared dispatch helper ────────────────────────────────────────────────────
-
-#[inline]
-fn dispatch_to_slot<T, F>(
-    view: &mut SenderView,
-    queue_id: VarInt,
-    binding_id: VarInt,
-    entry: T,
-    push: F,
-) -> Result<AutoWake, Error<T>>
-where
-    F: FnOnce(&super::slot::Slot, T) -> Result<AutoWake, Error<T>>,
-{
-    let index = queue_id.as_u64() as usize;
-
-    let Some(slot) = view.get(index) else {
-        return Err(Error::Unallocated(entry));
-    };
-
-    // Validate binding_id.
-    match slot.binding_id() {
-        Some(b) if b == binding_id => {}
-        _ => return Err(Error::BindingMismatch(entry)),
-    }
-
-    push(slot, entry)
 }

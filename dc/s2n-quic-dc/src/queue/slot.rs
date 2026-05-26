@@ -25,12 +25,12 @@ const UNALLOCATED: u64 = UNALLOCATED_BIT;
 pub(crate) struct Slot {
     /// Packed field: MSB = unallocated flag, bits 0-62 = binding_id.
     ///
-    /// Mutations to this field are protected by holding both half locks
-    /// simultaneously (lock order: stream → control).  Reads on the fast path
-    /// use an Acquire load which sees all preceding stores.
-    pub(crate) binding_id: AtomicU64,
-    /// The slot's position in the page table, fixed at allocation time.
-    queue_id: AtomicU64,
+    /// All reads and writes are performed under at least one half lock.
+    /// Writes (allocate/free) hold BOTH locks.  The Mutex provides ordering,
+    /// so all atomic operations use Relaxed.
+    binding_id: AtomicU64,
+    /// The slot's position in the page table, fixed at creation time.
+    queue_id: u64,
     pub(crate) stream: Half<msg::Stream>,
     pub(crate) control: Half<msg::Control>,
 }
@@ -47,21 +47,22 @@ pub(crate) enum BindState {
 
 impl Slot {
     /// Create a new, unallocated slot with its page-table index baked in.
+    ///
+    /// The initial stored binding is 0 (with UNALLOCATED_BIT set), so the first
+    /// `bind_and_push_stream` must use a binding_id > 0.  Callers must ensure
+    /// binding_ids start at 1 and increase monotonically per slot.
     pub(crate) fn with_queue_id(queue_id: VarInt) -> Self {
         Self {
             binding_id: AtomicU64::new(UNALLOCATED),
-            queue_id: AtomicU64::new(queue_id.as_u64()),
+            queue_id: queue_id.as_u64(),
             stream: Half::new(),
             control: Half::new(),
         }
     }
 
-    /// Returns this slot's position in the page table (set at creation time).
     #[inline]
     pub(crate) fn queue_id(&self) -> VarInt {
-        // SAFETY: set once at slot creation and never mutated.
-        let raw = self.queue_id.load(Ordering::Relaxed);
-        VarInt::new(raw).unwrap_or(VarInt::MAX)
+        VarInt::new(self.queue_id).unwrap_or(VarInt::MAX)
     }
 
     /// Returns a stable raw pointer to this slot.
@@ -73,26 +74,36 @@ impl Slot {
         unsafe { NonNull::new_unchecked(self as *const Slot as *mut Slot) }
     }
 
-    /// Returns `true` if this slot is currently allocated (bound or bindable).
-    #[inline]
-    pub(crate) fn is_allocated(&self) -> bool {
-        self.binding_id.load(Ordering::Acquire) & UNALLOCATED_BIT == 0
-    }
-
-    /// Load the current binding_id, or `None` if unallocated.
-    #[inline]
-    pub(crate) fn binding_id(&self) -> Option<VarInt> {
-        let raw = self.binding_id.load(Ordering::Acquire);
-        if raw & UNALLOCATED_BIT != 0 {
-            return None;
-        }
-        VarInt::new(raw).ok()
-    }
-
-    /// Mark the slot as unallocated (called after both receivers are closed).
+    /// Mark the slot as unallocated (called while both half locks are held).
+    ///
+    /// Preserves the old binding_id value so that stale frames arriving after
+    /// recycling can be distinguished from future-binding bugs.
     #[inline]
     pub(crate) fn mark_unallocated(&self) {
-        self.binding_id.store(UNALLOCATED, Ordering::Release);
+        let prev = self.binding_id.load(Ordering::Relaxed);
+        self.binding_id.store(prev | UNALLOCATED_BIT, Ordering::Relaxed);
+    }
+
+    /// Push to the stream half, validating binding_id inside the lock.
+    #[inline]
+    pub(crate) fn push_stream(
+        &self,
+        binding_id: VarInt,
+        entry: intrusive::Entry<msg::Stream>,
+    ) -> Result<half::AutoWake, super::Error<intrusive::Entry<msg::Stream>>> {
+        let mut inner = self.stream.inner.lock();
+        validate_and_push(binding_id, entry, &self.binding_id, &mut inner)
+    }
+
+    /// Push to the control half, validating binding_id inside the lock.
+    #[inline]
+    pub(crate) fn push_control(
+        &self,
+        binding_id: VarInt,
+        entry: intrusive::Entry<msg::Control>,
+    ) -> Result<half::AutoWake, super::Error<intrusive::Entry<msg::Control>>> {
+        let mut inner = self.control.inner.lock();
+        validate_and_push(binding_id, entry, &self.binding_id, &mut inner)
     }
 
     /// Set `binding_id` and open both receiver halves in one critical section.
@@ -131,11 +142,16 @@ impl Slot {
             return Err(super::Error::SenderClosed);
         }
 
-        // Binding check inside the lock — no race possible.
         let raw = self.binding_id.load(Ordering::Relaxed);
+        let stored = raw & !UNALLOCATED_BIT;
+        let incoming = binding_id.as_u64();
 
         if raw & UNALLOCATED_BIT != 0 {
-            // Unallocated: bind and open receivers (simple store, no CAS needed).
+            // Slot is free.  Only accept bindings strictly greater than the
+            // previous value — this rejects stale frames from old generations.
+            if incoming <= stored {
+                return Err(super::Error::StaleBinding(entry));
+            }
             Self::allocate_and_open_locked(&mut s, &mut c, &self.binding_id, binding_id)
                 .map_err(|_| super::Error::SenderClosed)?;
 
@@ -144,12 +160,15 @@ impl Slot {
             return Ok(BindState::NewBinding(waker));
         }
 
-        // Already bound: validate.
-        match VarInt::new(raw).ok() {
-            Some(b) if b == binding_id => {}
-            _ => return Err(super::Error::BindingMismatch(entry)),
+        // Slot is allocated — classify the binding relationship.
+        if incoming < stored {
+            return Err(super::Error::StaleBinding(entry));
+        }
+        if incoming > stored {
+            return Err(super::Error::FutureBinding(entry));
         }
 
+        // Binding matches.
         if !s.flags.contains(Flags::HAS_RECEIVER) {
             return Err(super::Error::HalfClosed(entry));
         }
@@ -161,13 +180,9 @@ impl Slot {
 
     /// Broadcast-close both halves: clears HAS_SENDER, wakes receivers.
     ///
-    /// This is the safe path for eviction — it does NOT push any data, so
-    /// freshly-bound streams are never poisoned by a stale Reset.
+    /// Always locks — no fast-path skip.  On unallocated slots HAS_SENDER is
+    /// already clear, so this is a no-op.
     pub(crate) fn broadcast_close(&self) -> (half::AutoWake, half::AutoWake) {
-        // Check allocated before taking locks (cheap fast path).
-        if !self.is_allocated() {
-            return (Default::default(), Default::default());
-        }
         let stream_wake = self.stream.broadcast_close();
         let control_wake = self.control.broadcast_close();
         (stream_wake, control_wake)
@@ -199,11 +214,54 @@ impl Slot {
     }
 }
 
+#[inline]
+fn validate_and_push<T>(
+    binding_id: VarInt,
+    entry: intrusive::Entry<T>,
+    slot_binding: &AtomicU64,
+    inner: &mut HalfInner<T>,
+) -> Result<half::AutoWake, super::Error<intrusive::Entry<T>>> {
+    let raw = slot_binding.load(Ordering::Relaxed);
+    let stored = raw & !UNALLOCATED_BIT;
+    let incoming = binding_id.as_u64();
+
+    if raw & UNALLOCATED_BIT != 0 {
+        // Slot is free.  Compare against the last binding to classify the error.
+        if incoming <= stored {
+            return Err(super::Error::StaleBinding(entry));
+        }
+        return Err(super::Error::Unallocated(entry));
+    }
+
+    if incoming < stored {
+        return Err(super::Error::StaleBinding(entry));
+    }
+    if incoming > stored {
+        return Err(super::Error::FutureBinding(entry));
+    }
+
+    // binding matches
+    if !inner.flags.contains(Flags::HAS_SENDER) {
+        return Err(super::Error::SenderClosed);
+    }
+    if !inner.flags.contains(Flags::HAS_RECEIVER) {
+        return Err(super::Error::HalfClosed(entry));
+    }
+    inner.queue.push_back(entry);
+    Ok(inner.take_waker())
+}
+
 impl core::fmt::Debug for Slot {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let raw = self.binding_id.load(Ordering::Relaxed);
+        let binding = if raw & UNALLOCATED_BIT != 0 {
+            None
+        } else {
+            VarInt::new(raw).ok()
+        };
         f.debug_struct("Slot")
             .field("queue_id", &self.queue_id())
-            .field("binding_id", &self.binding_id())
+            .field("binding_id", &binding)
             .field("stream", &self.stream)
             .field("control", &self.control)
             .finish()

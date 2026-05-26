@@ -31,43 +31,58 @@ use tokio::sync::mpsc;
 /// A token submitted to the endpoint emission task.
 ///
 /// The actual freed ranges are NOT captured at submission time.  Instead,
-/// `take_snapshot` drains the shared `FreedInner` state at serialisation time,
+/// `take` drains the shared `FreedInner` state at serialisation time,
 /// picking up any IDs that arrived after the token was enqueued.
+///
+/// # Contract
+///
+/// The emission task MUST call `check_and_resubmit` for every token it
+/// receives, even if transmission fails.  Dropping a `FreedBatch` without
+/// calling `check_and_resubmit` will leave `in_flight` permanently set,
+/// preventing future freed-ID emission for this peer.
 pub struct FreedBatch {
     inner: Arc<FreedInner>,
     pub path_entry: Arc<PathSecretEntry>,
-    endpoint_tx: FreedBatchTx,
 }
 
 impl FreedBatch {
-    /// Drain the pending freed set into a snapshot.
+    /// Swap the pending freed set with the caller's buffer, returning a request_id.
     ///
-    /// Returns `None` if there is nothing to send (should not happen in normal
-    /// flow, but the emission task may call this defensively).
-    pub fn take_snapshot(&self) -> Option<(VarInt, IntervalSet<VarInt>)> {
+    /// After this call, `dest` contains the IDs to encode.  The caller should
+    /// clear `dest` after encoding to preserve its allocation for the next swap.
+    /// Returns `None` if there is nothing to send.
+    pub fn take(&self, dest: &mut IntervalSet<VarInt>) -> Option<VarInt> {
         let mut state = self.inner.state.lock().unwrap();
         if state.freed.is_empty() {
             return None;
         }
-        let ranges = core::mem::replace(&mut state.freed, IntervalSet::new());
-        let request_id = state.take_next_request_id();
-        Some((request_id, ranges))
+        core::mem::swap(&mut state.freed, dest);
+        Some(state.take_next_request_id())
     }
 
-    /// Called by the emission task after the frame has been transmitted.
+    /// Merge unsent ranges back into the pending set.
     ///
-    /// If more IDs have accumulated the token resubmits itself to the channel;
-    /// otherwise `in_flight` is cleared so the next `record` call can submit a
-    /// fresh token.
-    pub fn check_and_resubmit(self) {
+    /// Used when encoding hit the MTU budget and there are leftover ranges
+    /// that need to be sent in a subsequent batch.
+    pub fn put_back(&self, remainder: &mut IntervalSet<VarInt>) {
+        let mut state = self.inner.state.lock().unwrap();
+        let _ = state.freed.union(remainder);
+        remainder.clear();
+    }
+
+    /// Called after transmission (or on failure).  If more IDs accumulated,
+    /// resubmit the token; otherwise clear `in_flight`.
+    ///
+    /// # Contract
+    ///
+    /// This MUST be called exactly once per token received from the channel.
+    /// Failure to call this permanently blocks freed-ID emission for this peer.
+    pub fn check_and_resubmit(self, tx: &FreedBatchTx) {
         let mut state = self.inner.state.lock().unwrap();
         if state.freed.is_empty() {
             state.in_flight = false;
         } else {
-            // More IDs arrived; keep in_flight and requeue the token.
             drop(state);
-            // Extract tx before moving self to avoid borrow-while-move.
-            let tx = self.endpoint_tx.clone();
             let _ = tx.send(self);
         }
     }
@@ -184,9 +199,10 @@ impl FreedSender {
         let token = FreedBatch {
             inner: self.inner.clone(),
             path_entry: self.path_entry.clone(),
-            endpoint_tx: self.endpoint_tx.clone(),
         };
-        // Best-effort: if the channel is closed we simply drop the token.
-        let _ = self.endpoint_tx.send(token);
+        if self.endpoint_tx.send(token).is_err() {
+            // Channel closed — clear in_flight so we don't permanently block.
+            self.inner.state.lock().unwrap().in_flight = false;
+        }
     }
 }

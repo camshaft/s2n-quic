@@ -16,18 +16,18 @@
 //! - The client tracks seen request IDs in an IntervalSet
 //! - Duplicate/replayed QueueFree messages are rejected without per-slot state
 
+use super::waiter::{Waiter, WaiterList};
 use crate::bitset::HierarchicalBitSet;
 use s2n_quic_core::{interval_set::IntervalSet, varint::VarInt};
 use std::{
-    collections::VecDeque,
+    future::Future,
+    pin::Pin,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc, Mutex,
     },
     task::{Context, Poll, Waker},
 };
-
-const MAX_WAITERS: usize = 4096;
 
 #[derive(Debug)]
 pub struct FreeList {
@@ -37,11 +37,9 @@ pub struct FreeList {
 }
 
 struct Inner {
-    /// Available server_queue_ids for O(4) pop_first.
     freed: HierarchicalBitSet,
-    /// Tracks which free_request_ids have been processed for dedup.
     seen_requests: IntervalSet<VarInt>,
-    waiters: VecDeque<Waker>,
+    waiters: WaiterList,
     closed: bool,
 }
 
@@ -66,7 +64,7 @@ impl FreeList {
             inner: Mutex::new(Inner {
                 freed: HierarchicalBitSet::new(capacity.max(1)),
                 seen_requests: IntervalSet::new(),
-                waiters: VecDeque::new(),
+                waiters: WaiterList::new(),
                 closed: false,
             }),
         })
@@ -102,41 +100,15 @@ impl FreeList {
         VarInt::new(index as u64).ok()
     }
 
-    pub fn poll_alloc(&self, cx: &mut Context) -> Poll<Option<VarInt>> {
-        if let Some(id) = self.try_alloc_fresh() {
-            return Poll::Ready(Some(id));
+    /// Returns a future that resolves to an allocated queue ID, or `None` if closed.
+    ///
+    /// The waiter node is allocated lazily on first `Pending` — the happy path
+    /// (ID immediately available) incurs no allocation.
+    pub fn alloc(self: &Arc<Self>) -> AllocFuture {
+        AllocFuture {
+            free_list: self.clone(),
+            waiter: None,
         }
-
-        let mut inner = self.inner.lock().unwrap();
-        if inner.closed {
-            return Poll::Ready(None);
-        }
-        if let Some(index) = inner.freed.pop_first() {
-            return Poll::Ready(VarInt::new(index as u64).ok());
-        }
-
-        // Dedup: avoid accumulating identical wakers from repeated polls of the same future
-        let should_push = inner
-            .waiters
-            .back()
-            .map_or(true, |w| !w.will_wake(cx.waker()));
-        let evicted = if should_push {
-            if inner.waiters.len() >= MAX_WAITERS {
-                inner.waiters.pop_front()
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-        if should_push {
-            inner.waiters.push_back(cx.waker().clone());
-        }
-        drop(inner);
-        if let Some(waker) = evicted {
-            waker.wake();
-        }
-        Poll::Pending
     }
 
     /// Process a QueueFree message from the server.
@@ -154,20 +126,15 @@ impl FreeList {
     ) -> bool {
         let mut inner = self.inner.lock().unwrap();
 
-        // Dedup: reject if we've already seen this free_request_id
         if inner.seen_requests.contains(&free_request_id) {
             return false;
         }
         let _ = inner.seen_requests.insert_value(free_request_id);
 
-        // Insert ALL freed queue_ids via batch range insertion.
         for range in queue_ids.inclusive_ranges() {
             let start_u64 = range.start().as_u64();
             let end_u64 = range.end().as_u64();
 
-            // Bounds check: reject values that exceed u32 or the bitset max.
-            // Values above these limits cannot be valid server queue IDs and
-            // indicate a protocol error or a misbehaving peer.
             let cap = HierarchicalBitSet::MAX_CAPACITY as u64;
             if start_u64 >= cap {
                 continue;
@@ -182,9 +149,11 @@ impl FreeList {
             inner.freed.insert_range(start, end);
         }
 
-        // Ship wakers to another thread — never wake inline on the dispatch path
-        for waker in inner.waiters.drain(..) {
-            waker_sink(waker);
+        while let Some(waiter_arc) = inner.waiters.pop_front() {
+            // SAFETY: under the inner Mutex which protects all waiter waker access
+            if let Some(w) = unsafe { waiter_arc.take_waker() } {
+                waker_sink(w);
+            }
         }
         true
     }
@@ -192,10 +161,76 @@ impl FreeList {
     pub fn close(&self) {
         let mut inner = self.inner.lock().unwrap();
         inner.closed = true;
-        let waiters: Vec<_> = inner.waiters.drain(..).collect();
+        let mut wakers = Vec::new();
+        while let Some(waiter_arc) = inner.waiters.pop_front() {
+            // SAFETY: under the inner Mutex
+            if let Some(w) = unsafe { waiter_arc.take_waker() } {
+                wakers.push(w);
+            }
+        }
         drop(inner);
-        for waker in waiters {
+        for waker in wakers {
             waker.wake();
+        }
+    }
+}
+
+/// Future returned by [`FreeList::alloc`].
+///
+/// Lazily allocates an intrusive waiter node on first `Pending`.  On the happy
+/// path (ID immediately available) no allocation occurs.
+pub struct AllocFuture {
+    free_list: Arc<FreeList>,
+    waiter: Option<Arc<Waiter>>,
+}
+
+impl Future for AllocFuture {
+    type Output = Option<VarInt>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
+        let this = self.get_mut();
+
+        if let Some(id) = this.free_list.try_alloc_fresh() {
+            return Poll::Ready(Some(id));
+        }
+
+        let mut inner = this.free_list.inner.lock().unwrap();
+
+        if inner.closed {
+            return Poll::Ready(None);
+        }
+
+        if let Some(idx) = inner.freed.pop_first() {
+            return Poll::Ready(VarInt::new(idx as u64).ok());
+        }
+
+        let waiter = this.waiter.get_or_insert_with(Waiter::new);
+
+        // SAFETY: all links and waker access is under inner's Mutex
+        unsafe {
+            if waiter.links.is_linked() {
+                waiter.set_waker(cx.waker().clone());
+            } else {
+                waiter.set_waker(cx.waker().clone());
+                inner.waiters.push_back(Arc::clone(waiter));
+            }
+        }
+
+        Poll::Pending
+    }
+}
+
+impl Drop for AllocFuture {
+    fn drop(&mut self) {
+        if let Some(waiter) = self.waiter.take() {
+            // MUST always lock — Links uses Cell (!Sync), reading is_linked
+            // without the lock while free() drains is UB.
+            let mut inner = self.free_list.inner.lock().unwrap();
+            // SAFETY: under the inner Mutex
+            if let Some(owned) = unsafe { inner.waiters.remove(&waiter) } {
+                drop(owned);
+            }
+            drop(inner);
         }
     }
 }
@@ -234,18 +269,15 @@ mod tests {
         let id1 = list.try_alloc().unwrap();
         assert_eq!(list.try_alloc(), None);
 
-        // Free id1 with request_id=1
         let ids = interval_set_single(id1);
         assert!(list.free_for_test(VarInt::from_u8(1), &ids));
         assert_eq!(list.try_alloc(), Some(id1));
         assert_eq!(list.try_alloc(), None);
 
-        // Free both with request_id=2
         let mut both = IntervalSet::new();
         let _ = both.insert_value(id0);
         let _ = both.insert_value(id1);
         assert!(list.free_for_test(VarInt::from_u8(2), &both));
-        // pop_first returns lowest index first
         assert_eq!(list.try_alloc(), Some(id0));
         assert_eq!(list.try_alloc(), Some(id1));
     }
@@ -255,15 +287,12 @@ mod tests {
         let list = FreeList::new(VarInt::from_u8(0));
         let ids = interval_set_single(VarInt::from_u8(7));
 
-        // First free succeeds
         assert!(list.free_for_test(VarInt::from_u8(1), &ids));
         assert_eq!(list.try_alloc(), Some(VarInt::from_u8(7)));
 
-        // Same request_id rejected (replay)
         assert!(!list.free_for_test(VarInt::from_u8(1), &ids));
         assert_eq!(list.try_alloc(), None);
 
-        // New request_id succeeds
         assert!(list.free_for_test(VarInt::from_u8(2), &ids));
         assert_eq!(list.try_alloc(), Some(VarInt::from_u8(7)));
     }

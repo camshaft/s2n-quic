@@ -49,8 +49,11 @@ pub enum Error<T> {
     HalfClosed(T),
     /// The sender was closed (path secret evicted).
     SenderClosed,
-    /// The provided `binding_id` does not match the slot's stored value.
-    BindingMismatch(T),
+    /// The binding_id refers to an old (already-recycled) generation of this slot.
+    StaleBinding(T),
+    /// The binding_id is ahead of the current slot binding.  This indicates a
+    /// bug — the slot hasn't been freed yet but a future binding arrived.
+    FutureBinding(T),
 }
 
 impl<T> From<half::Error<T>> for Error<T> {

@@ -152,14 +152,10 @@ impl ServerDispatch {
         entry: intrusive::Entry<msg::Stream>,
     ) -> Result<AutoWake, Error<intrusive::Entry<msg::Stream>>> {
         let index = queue_id.as_u64() as usize;
-
         let Some(slot) = self.view.get(index) else {
             return Err(Error::Unallocated(entry));
         };
-
-        validate_binding(slot, binding_id, entry, |s, e| {
-            s.stream.push(e).map_err(super::half::Error::into)
-        })
+        slot.push_stream(binding_id, entry)
     }
 
     /// Push to an already-bound control slot.
@@ -171,48 +167,22 @@ impl ServerDispatch {
         entry: intrusive::Entry<msg::Control>,
     ) -> Result<AutoWake, Error<intrusive::Entry<msg::Control>>> {
         let index = queue_id.as_u64() as usize;
-
         let Some(slot) = self.view.get(index) else {
             return Err(Error::Unallocated(entry));
         };
-
-        validate_binding(slot, binding_id, entry, |s, e| {
-            s.control.push(e).map_err(super::half::Error::into)
-        })
+        slot.push_control(binding_id, entry)
     }
 
     /// Broadcast-close all slots — called when the path secret entry is evicted.
     ///
-    /// Wakers are passed to `waker_sink` rather than woken inline so this is
-    /// safe to call from a dispatch thread.
-    pub fn close(&mut self, waker_sink: &mut impl FnMut(std::task::Waker)) {
+    /// `AutoWake` tokens are passed to `waker_sink` — the caller can `.take()`
+    /// to batch wakers, or drop to wake immediately.
+    pub fn close(&mut self, waker_sink: &mut impl FnMut(super::half::AutoWake)) {
         self.view.for_each_slot(|slot| {
-            let (mut sw, mut cw) = slot.broadcast_close();
-            if let Some(w) = sw.take() {
-                waker_sink(w);
-            }
-            if let Some(w) = cw.take() {
-                waker_sink(w);
-            }
+            let (sw, cw) = slot.broadcast_close();
+            waker_sink(sw);
+            waker_sink(cw);
         });
     }
 }
 
-// ── Binding validation helper ─────────────────────────────────────────────────
-
-#[inline]
-fn validate_binding<T, F>(
-    slot: &super::slot::Slot,
-    binding_id: VarInt,
-    entry: T,
-    push: F,
-) -> Result<AutoWake, Error<T>>
-where
-    F: FnOnce(&super::slot::Slot, T) -> Result<AutoWake, Error<T>>,
-{
-    match slot.binding_id() {
-        Some(b) if b == binding_id => push(slot, entry),
-        None => Err(Error::Unallocated(entry)),
-        _ => Err(Error::BindingMismatch(entry)),
-    }
-}
