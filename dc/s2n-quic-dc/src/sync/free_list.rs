@@ -131,6 +131,7 @@ impl FreeList {
         }
         let _ = inner.seen_requests.insert_value(free_request_id);
 
+        let mut freed_count: usize = 0;
         for range in queue_ids.inclusive_ranges() {
             let start_u64 = range.start().as_u64();
             let end_u64 = range.end().as_u64();
@@ -147,12 +148,19 @@ impl FreeList {
                 inner.freed.grow(needed);
             }
             inner.freed.insert_range(start, end);
+            freed_count += (end - start + 1) as usize;
         }
 
-        while let Some(waiter_arc) = inner.waiters.pop_front() {
+        // Wake at most as many waiters as IDs we just freed
+        let mut woken = 0;
+        while woken < freed_count {
+            let Some(waiter_arc) = inner.waiters.pop_front() else {
+                break;
+            };
             // SAFETY: under the inner Mutex which protects all waiter waker access
             if let Some(w) = unsafe { waiter_arc.take_waker() } {
                 waker_sink(w);
+                woken += 1;
             }
         }
         true
