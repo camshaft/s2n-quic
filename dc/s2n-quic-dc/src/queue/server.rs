@@ -43,7 +43,7 @@ use s2n_quic_core::varint::VarInt;
 /// provides a hard per-connection cap to prevent unbounded page-table growth
 /// from a misbehaving or malicious peer.  (The integration layer should tighten
 /// this to the negotiated value.)
-const MAX_SERVER_QUEUE_ID: u64 = 1 << 20; // 1 M slots
+const MAX_SERVER_QUEUE_ID: u64 = 1 << 24; // 16 M slots
 
 // ── BindResult ────────────────────────────────────────────────────────────────
 
