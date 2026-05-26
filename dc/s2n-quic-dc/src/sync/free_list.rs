@@ -158,19 +158,14 @@ impl FreeList {
         true
     }
 
-    pub fn close(&self) {
+    pub fn close(&self, waker_sink: &mut impl FnMut(Waker)) {
         let mut inner = self.inner.lock().unwrap();
         inner.closed = true;
-        let mut wakers = Vec::new();
         while let Some(waiter_arc) = inner.waiters.pop_front() {
             // SAFETY: under the inner Mutex
             if let Some(w) = unsafe { waiter_arc.take_waker() } {
-                wakers.push(w);
+                waker_sink(w);
             }
-        }
-        drop(inner);
-        for waker in wakers {
-            waker.wake();
         }
     }
 }
