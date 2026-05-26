@@ -126,10 +126,13 @@ impl FreeList {
     ) -> bool {
         let mut inner = self.inner.lock().unwrap();
 
-        if inner.seen_requests.contains(&free_request_id) {
+        let newly_inserted = inner
+            .seen_requests
+            .insert_value(free_request_id)
+            .unwrap_or(false);
+        if !newly_inserted {
             return false;
         }
-        let _ = inner.seen_requests.insert_value(free_request_id);
 
         let mut freed_count: usize = 0;
         for range in queue_ids.inclusive_ranges() {
