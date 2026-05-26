@@ -37,13 +37,6 @@ use super::{
 use crate::{endpoint::msg, intrusive};
 use s2n_quic_core::varint::VarInt;
 
-/// Maximum `queue_id` the server will accept from the peer.
-///
-/// The client negotiates a peer free-list size at handshake time; this constant
-/// provides a hard per-connection cap to prevent unbounded page-table growth
-/// from a misbehaving or malicious peer.  (The integration layer should tighten
-/// this to the negotiated value.)
-const MAX_SERVER_QUEUE_ID: u64 = 1 << 24; // 16 M slots
 
 // ── BindResult ────────────────────────────────────────────────────────────────
 
@@ -72,16 +65,19 @@ pub struct ServerDispatch {
     /// Per-dispatch cached view — avoids RwLock on every packet.
     view: SenderView,
     freed: FreedSender,
+    /// The max queue_id we advertised to the client.
+    max_queue_id: u64,
 }
 
 impl ServerDispatch {
-    pub fn new(freed: FreedSender) -> Self {
+    pub fn new(freed: FreedSender, max_queues: VarInt) -> Self {
         let page_table = PageTable::new();
         let view = page_table.sender_view();
         Self {
             page_table,
             view,
             freed,
+            max_queue_id: max_queues.as_u64().saturating_sub(1),
         }
     }
 
@@ -104,9 +100,8 @@ impl ServerDispatch {
     ) -> Result<BindResult, Error<intrusive::Entry<msg::Stream>>> {
         let index = queue_id.as_u64() as usize;
 
-        // Reject absurdly large queue_ids before growing memory.
-        if queue_id.as_u64() > MAX_SERVER_QUEUE_ID {
-            return Err(Error::Unallocated(entry));
+        if queue_id.as_u64() > self.max_queue_id {
+            return Err(Error::CapExceeded(entry));
         }
 
         // Grow the page table on demand — the client controls queue_id space

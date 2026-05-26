@@ -54,6 +54,8 @@ pub enum Error<T> {
     /// The binding_id is ahead of the current slot binding.  This indicates a
     /// bug — the slot hasn't been freed yet but a future binding arrived.
     FutureBinding(T),
+    /// The queue_id exceeds the negotiated cap.  Protocol violation.
+    CapExceeded(T),
 }
 
 impl<T> From<half::Error<T>> for Error<T> {
