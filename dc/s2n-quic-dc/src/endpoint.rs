@@ -1203,9 +1203,7 @@ where
                 // Freed-batch LB routing: pick socket via sender_load_score, forward
                 // to the target send worker's ack channel.
                 {
-                    use crate::socket::channel::{
-                        Receiver as _, ReceiverExt as _, UnboundedSender as _,
-                    };
+                    use crate::socket::channel::{ReceiverExt as _, UnboundedSender as _};
                     let mut ack_sender = bg.ack_sender;
                     let socket_count = total_sender_ids;
                     let mut rng = crate::xorshift::Rng::new();

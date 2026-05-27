@@ -106,5 +106,4 @@ pub mod queue {
     use crate::flow;
 
     pub type Allocator = flow::queue::Allocator<super::Stream, super::Control, flow::Handle>;
-    pub type Dispatcher = flow::queue::Dispatch<super::Stream, super::Control, flow::Handle>;
 }

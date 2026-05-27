@@ -212,6 +212,7 @@ struct Inner {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum Status {
     /// Server-only: awaiting client validation before releasing credits
+    #[expect(dead_code)]
     PendingValidation,
     /// Flow is open for reads
     #[default]

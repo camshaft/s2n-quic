@@ -45,7 +45,7 @@ use std::{
     cell::RefCell,
     collections::HashMap,
     io,
-    sync::{atomic::Ordering, Arc, Weak},
+    sync::{Arc, Weak},
 };
 
 // ── Thread-local endpoint registries ─────────────────────────────────────────

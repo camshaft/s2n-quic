@@ -26,14 +26,12 @@ use std::{net::SocketAddr, task::Poll, time::Duration};
 
 struct PairBuilder {
     ep_type: endpoint::Type,
-    initial_remote_queue_id: Option<VarInt>,
 }
 
 impl Default for PairBuilder {
     fn default() -> Self {
         Self {
             ep_type: endpoint::Type::Client,
-            initial_remote_queue_id: Some(VarInt::from_u8(2)),
         }
     }
 }
@@ -42,18 +40,11 @@ impl PairBuilder {
     fn server() -> Self {
         Self {
             ep_type: endpoint::Type::Server,
-            ..Default::default()
         }
     }
 
-    /// Create a client pair without pre-setting remote_queue_id, matching
-    /// production behavior where the peer's queue ID is unknown until flow
-    /// establishment.
     fn client_no_remote_queue_id() -> Self {
-        Self {
-            ep_type: endpoint::Type::Client,
-            initial_remote_queue_id: None,
-        }
+        Self::default()
     }
 
     fn build(self) -> (Writer, Pusher) {

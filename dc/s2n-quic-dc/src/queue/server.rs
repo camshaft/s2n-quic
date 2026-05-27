@@ -381,7 +381,7 @@ mod tests {
     #[test]
     fn freed_batch_submitted_on_receiver_drop() {
         use crate::{
-            socket::channel::{Budget, Receiver as _},
+            socket::channel::Budget,
             testing::{ext::*, sim},
         };
 

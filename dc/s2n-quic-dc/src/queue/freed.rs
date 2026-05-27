@@ -236,7 +236,7 @@ impl FreedState {
 mod tests {
     use super::*;
     use crate::{
-        socket::channel::{Budget, Receiver as _},
+        socket::channel::Budget,
         testing::{ext::*, sim},
     };
     use s2n_quic_core::varint::VarInt;
@@ -433,7 +433,7 @@ mod tests {
                     .unwrap();
 
                 let mut dest = HierarchicalBitSet::new(1);
-                let id = freed.take(&mut dest).unwrap();
+                let _id = freed.take(&mut dest).unwrap();
                 // IDs 1 and 2 are both in there (1 was never taken before clear)
                 assert!(dest.contains(1));
                 assert!(dest.contains(2));

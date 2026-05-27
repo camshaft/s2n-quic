@@ -87,6 +87,8 @@ impl ClientFreeList {
         debug_assert!(newly_inserted, "double-free of slot {index}");
     }
 
+    // TODO: path secret entry should call close on the queues when removed from the map
+    #[cfg_attr(not(test), expect(dead_code))]
     pub(crate) fn close(&mut self) {
         self.closed = true;
     }
