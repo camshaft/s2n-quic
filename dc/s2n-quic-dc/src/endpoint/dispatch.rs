@@ -602,7 +602,6 @@ fn handle_queue_data_init(
         return;
     };
 
-    let payload_is_empty = buf.is_empty();
     let entry = msg::Stream::Data {
         offset,
         fin: is_fin,
@@ -629,7 +628,7 @@ fn handle_queue_data_init(
                 acceptor_id,
                 control,
             );
-            let peer_fin = is_fin && offset == VarInt::ZERO && payload_is_empty;
+            let peer_fin = is_fin;
             let reader = Reader::new_server(
                 frame_tx.clone(),
                 peer.path_entry.clone(),

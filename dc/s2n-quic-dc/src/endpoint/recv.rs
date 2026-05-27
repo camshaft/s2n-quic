@@ -448,7 +448,7 @@ impl Cache {
         };
 
         match self.senders.entry(key) {
-            hash_map::Entry::Occupied(entry) => {
+            hash_map::Entry::Occupied(mut entry) => {
                 let ctx = entry.get().clone();
                 let cached_key_id = ctx.borrow().current_key_id;
 
@@ -500,25 +500,42 @@ impl Cache {
                     )
                     .map_err(|_| CacheError::ReplayDetected)?;
 
-                // Packet is authentic — replace the stale entry.
+                // Packet is authentic — replace the entry with a fresh context.
+                // Key advancement means the peer abandoned its old sender context
+                // (e.g., idle timeout recreation), so the old PN space is dead.
+                // Transfer flows and queue_view since those are independent of PN space.
                 debug!(
                     %credentials,
                     %remote_sender_id,
                     cached_key_id = cached_key_id.as_u64(),
+                    new_key_id = credentials.key_id.as_u64(),
                     "recv cache key_id advanced — replacing entry"
                 );
 
                 let dest_sender_id = route.sender_id_for_ack(remote_sender_id);
-                let new_ctx = Rc::new(RefCell::new(Context::new(
+                let mut new_ctx_inner = Context::new(
                     path_entry,
                     remote_sender_id,
                     dest_sender_id,
                     opener,
                     credentials.key_id,
                     clock.now(),
-                )));
+                );
+
+                {
+                    let mut old = ctx.borrow_mut();
+                    let id = *old.path_entry.id();
+                    new_ctx_inner.flows = core::mem::replace(
+                        &mut old.flows,
+                        flow::Tracker::new(id),
+                    );
+                    core::mem::swap(&mut new_ctx_inner.queue_view, &mut old.queue_view);
+                }
+
+                let new_ctx = Rc::new(RefCell::new(new_ctx_inner));
                 new_ctx.borrow().invariants();
-                *entry.into_mut() = new_ctx.clone();
+                entry.insert(new_ctx.clone());
+
                 Ok((r, new_ctx, false))
             }
             hash_map::Entry::Vacant(entry) => {
