@@ -941,14 +941,14 @@ where
         let frame = entry.into_inner();
         if let Header::QueueFree {
             free_request_id,
-            largest_queue_id,
+            smallest_queue_id,
         } = frame.header
         {
             if let QueueState::Server(ref state) = *frame.path_secret_entry.queue_state() {
                 let path_entry = frame.path_secret_entry.clone();
                 let retry = RetryEntry {
                     free_request_id,
-                    largest_queue_id,
+                    smallest_queue_id,
                     payload: frame.payload,
                 };
                 state

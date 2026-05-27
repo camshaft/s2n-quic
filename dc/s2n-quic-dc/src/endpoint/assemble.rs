@@ -23,6 +23,8 @@ use crate::{
         datagram::{self, RoutingInfo},
         WireVersion,
     },
+    path::secret::map::entry::QueueState,
+    queue::FreedBatchTx,
     socket::{
         channel::{ImmediateQueueStatus, UnboundedSender},
         pool::{self, descriptor::Segments},
@@ -38,6 +40,7 @@ use s2n_quic_core::{
     varint::VarInt,
 };
 use s2n_quic_platform::features::Gso;
+use std::sync::Arc;
 
 #[cfg(test)]
 mod tests;
@@ -76,7 +79,7 @@ pub(crate) fn assemble<Clk>(
     header_buf: &mut Vec<u8>,
     cancelled: &mut impl UnboundedSender<intrusive::Entry<Frame>>,
     ack_completions: &mut impl UnboundedSender<intrusive::Entry<msg::Sender>>,
-    freed_batch_tx: &mut crate::queue::FreedBatchTx,
+    freed_batch_tx: &mut FreedBatchTx,
     counters: &AssemblerCounters,
     send_counters: &crate::endpoint::counters::Send,
 ) -> Option<Segments>
@@ -228,7 +231,8 @@ where
             // Then encode fresh ranges (if pending_freed token is present).
             if let Some(freed_entry) = context.pending_freed.take() {
                 if let Some(frame) = assemble_queue_free(
-                    &freed_entry,
+                    freed_entry,
+                    &context.path_secret_entry,
                     source_sender_id,
                     source_control_port,
                     &context.credentials,
@@ -243,12 +247,6 @@ where
                     metadata = next_metadata;
                     counters.on_tx_frame(&frame.header);
                     packet_frames.push_back(frame.into());
-                }
-                // Resubmit token if more IDs accumulated, or park it
-                if let crate::path::secret::map::entry::QueueState::Server(ref state) =
-                    *context.path_secret_entry.queue_state()
-                {
-                    state.freed.check_and_resubmit(freed_entry, freed_batch_tx);
                 }
             }
 
@@ -555,19 +553,17 @@ fn drain_queue_free_retries(
     max_segment_len: usize,
     is_ack_eliciting: &mut bool,
     packet_frames: &mut Queue<Frame>,
-    freed_batch_tx: &mut crate::queue::FreedBatchTx,
+    freed_batch_tx: &mut FreedBatchTx,
     counters: &AssemblerCounters,
 ) {
-    let crate::path::secret::map::entry::QueueState::Server(ref server_state) =
-        *context.path_secret_entry.queue_state()
-    else {
+    let QueueState::Server(ref server_state) = *context.path_secret_entry.queue_state() else {
         return;
     };
 
     while let Some(retry) = server_state.freed.pop_retry() {
         let header = frame::Header::QueueFree {
             free_request_id: retry.free_request_id,
-            largest_queue_id: retry.largest_queue_id,
+            smallest_queue_id: retry.smallest_queue_id,
         };
         let next_metadata = metadata.with_frame_parts(&header, retry.payload.len());
         let estimated_len = next_metadata.estimate_packet_len(
@@ -580,7 +576,7 @@ fn drain_queue_free_retries(
             server_state.freed.push_retry(
                 crate::queue::freed::RetryEntry {
                     free_request_id: retry.free_request_id,
-                    largest_queue_id: retry.largest_queue_id,
+                    smallest_queue_id: retry.smallest_queue_id,
                     payload: retry.payload,
                 },
                 &context.path_secret_entry,
@@ -612,37 +608,43 @@ fn drain_queue_free_retries(
 /// Frame if encoding succeeded, or None if there was nothing to encode or it didn't
 /// fit in the segment.
 fn assemble_queue_free(
-    freed_entry: &intrusive::Entry<msg::Sender>,
+    freed_entry: intrusive::Entry<msg::Sender>,
+    path_secret_entry: &Arc<crate::path::secret::map::Entry>,
     source_sender_id: LocalSenderId,
     source_control_port: u16,
     credentials: &Credentials,
     tag_len: usize,
     metadata: &MetadataEstimate,
     max_segment_len: usize,
-    freed_batch_tx: &mut crate::queue::FreedBatchTx,
+    freed_batch_tx: &mut FreedBatchTx,
 ) -> Option<Frame> {
-    use crate::path::secret::map::entry::QueueState;
-    use s2n_quic_core::interval_set::IntervalSet;
-
-    let msg::Sender::PendingFreed {
-        ref path_secret_entry,
-        ..
-    } = **freed_entry
-    else {
-        return None;
-    };
-
     let QueueState::Server(ref server_state) = *path_secret_entry.queue_state() else {
         return None;
     };
 
-    let mut scratch = IntervalSet::new();
-    let request_id = server_state.freed.take(&mut scratch)?;
-    let largest = scratch.max_value().unwrap();
+    let mut scratch = crate::bitset::HierarchicalBitSet::new(1);
+    let request_id = match server_state.freed.take(&mut scratch) {
+        Some(id) => id,
+        None => {
+            server_state
+                .freed
+                .finish_encoding(&mut scratch, freed_entry, freed_batch_tx);
+            return None;
+        }
+    };
+
+    // Pop the first (smallest) ID for the header
+    let Some(first_id) = scratch.pop_first() else {
+        server_state
+            .freed
+            .finish_encoding(&mut scratch, freed_entry, freed_batch_tx);
+        return None;
+    };
+    let smallest_queue_id = VarInt::new(first_id as u64).unwrap_or(VarInt::ZERO);
 
     let header = frame::Header::QueueFree {
         free_request_id: request_id,
-        largest_queue_id: largest,
+        smallest_queue_id,
     };
 
     // Estimate available payload budget
@@ -651,36 +653,27 @@ fn assemble_queue_free(
     let header_cost = header.encoding_size();
     let payload_budget = max_segment_len.saturating_sub(overhead_estimate + header_cost + 4);
 
-    // Encode ranges within budget
+    // Encode deltas within budget
     let mut payload_buf = vec![0u8; payload_budget];
-    let encoded_len = {
+    let mut encoded_len = 0usize;
+    let mut prev_id = first_id;
+
+    {
         let mut encoder = EncoderBuffer::new(&mut payload_buf);
-        let ranges_desc: Vec<_> = scratch
-            .inclusive_ranges()
-            .map(|r| *r.start()..=*r.end())
-            .rev()
-            .collect();
-        let mut peekable = ranges_desc.into_iter().peekable();
-        crate::endpoint::range_codec::encode_partial(
-            largest,
-            &mut peekable,
-            &mut encoder,
-            payload_budget,
-        );
-
-        // Put back unconsumed ranges
-        if peekable.peek().is_some() {
-            let mut remainder = IntervalSet::new();
-            for range in peekable {
-                let _ = remainder.insert(range);
+        while let Some(id) = scratch.pop_first() {
+            let delta = VarInt::new((id - prev_id - 1) as u64).unwrap_or(VarInt::ZERO);
+            let cost = delta.encoding_size();
+            if encoded_len + cost > payload_budget {
+                scratch.insert(id);
+                break;
             }
-            server_state.freed.put_back(&mut remainder);
+            encoder.encode(&delta);
+            encoded_len += cost;
+            prev_id = id;
         }
+    }
 
-        Encoder::len(&encoder)
-    };
     payload_buf.truncate(encoded_len);
-
     let payload = crate::byte_vec::ByteVec::from(payload_buf);
 
     // Check that the frame actually fits
@@ -693,9 +686,17 @@ fn assemble_queue_free(
     );
 
     if estimated_len > max_segment_len {
-        server_state.freed.put_back(&mut scratch);
+        scratch.insert(first_id);
+        server_state
+            .freed
+            .finish_encoding(&mut scratch, freed_entry, freed_batch_tx);
         return None;
     }
+
+    // Single lock: put back remainder + decide resubmit
+    server_state
+        .freed
+        .finish_encoding(&mut scratch, freed_entry, freed_batch_tx);
 
     Some(Frame {
         header,

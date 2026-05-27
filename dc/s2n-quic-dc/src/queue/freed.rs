@@ -23,11 +23,11 @@
 //!    is cleared and the next `record` call will submit the token again.
 
 use crate::{
-    byte_vec::ByteVec, endpoint::id::LocalSenderId, intrusive,
+    bitset::HierarchicalBitSet, byte_vec::ByteVec, endpoint::id::LocalSenderId, intrusive,
     path::secret::map::Entry as PathSecretEntry, socket::channel::UnboundedSender,
     stream::endpoint::msg,
 };
-use s2n_quic_core::{interval_set::IntervalSet, varint::VarInt};
+use s2n_quic_core::varint::VarInt;
 use std::{
     collections::VecDeque,
     sync::{Arc, Mutex},
@@ -55,12 +55,12 @@ pub struct FreedInner {
 /// The assembler reconstructs the full `Frame` using the context's own path_secret_entry.
 pub struct RetryEntry {
     pub free_request_id: VarInt,
-    pub largest_queue_id: VarInt,
+    pub smallest_queue_id: VarInt,
     pub payload: ByteVec,
 }
 
 struct FreedState {
-    freed: IntervalSet<VarInt>,
+    freed: HierarchicalBitSet,
     next_request_id: VarInt,
     in_flight: bool,
     /// QueueFree frames that were in-flight when the send context was invalidated.
@@ -73,7 +73,7 @@ impl FreedInner {
     pub fn new() -> Self {
         Self {
             state: Mutex::new(FreedState {
-                freed: IntervalSet::new(),
+                freed: HierarchicalBitSet::new(1),
                 next_request_id: VarInt::from_u8(0),
                 in_flight: false,
                 retry_queue: VecDeque::new(),
@@ -91,7 +91,15 @@ impl FreedInner {
     ) {
         let mut state = self.state.lock().unwrap();
 
-        let _ = state.freed.insert_value(queue_id);
+        let id = queue_id.as_u64() as u32;
+        if id as u64 >= HierarchicalBitSet::MAX_CAPACITY as u64 {
+            return;
+        }
+        let needed = id + 1;
+        if needed > state.freed.capacity() {
+            state.freed.grow(needed);
+        }
+        state.freed.insert(id);
 
         if state.in_flight {
             return;
@@ -112,7 +120,7 @@ impl FreedInner {
 
     /// Drain the accumulated freed IDs into `dest`, returning a request_id.
     /// Returns `None` if there is nothing to send.
-    pub fn take(&self, dest: &mut IntervalSet<VarInt>) -> Option<VarInt> {
+    pub fn take(&self, dest: &mut HierarchicalBitSet) -> Option<VarInt> {
         let mut state = self.state.lock().unwrap();
         if state.freed.is_empty() {
             return None;
@@ -121,18 +129,16 @@ impl FreedInner {
         Some(state.take_next_request_id())
     }
 
-    /// Merge unsent ranges back into the pending set.
-    /// Used when encoding hit the MTU budget.
-    pub fn put_back(&self, remainder: &mut IntervalSet<VarInt>) {
+    /// Merge remaining IDs back and decide whether to resubmit in a single lock.
+    pub fn finish_encoding(
+        &self,
+        remainder: &mut HierarchicalBitSet,
+        entry: intrusive::Entry<msg::Sender>,
+        tx: &mut FreedBatchTx,
+    ) {
         let mut state = self.state.lock().unwrap();
-        let _ = state.freed.union(remainder);
-        remainder.clear();
-    }
+        state.freed.union(remainder);
 
-    /// After encoding: if more IDs accumulated or retry frames exist, resubmit
-    /// the entry to the freed channel; otherwise clear `in_flight` and drop the entry.
-    pub fn check_and_resubmit(&self, entry: intrusive::Entry<msg::Sender>, tx: &mut FreedBatchTx) {
-        let mut state = self.state.lock().unwrap();
         if state.freed.is_empty() && state.retry_queue.is_empty() {
             state.in_flight = false;
         } else {
@@ -141,6 +147,13 @@ impl FreedInner {
                 self.state.lock().unwrap().in_flight = false;
             }
         }
+    }
+
+    /// After encoding: if more IDs accumulated or retry frames exist, resubmit
+    /// the entry to the freed channel; otherwise clear `in_flight`.
+    pub fn check_and_resubmit(&self, entry: intrusive::Entry<msg::Sender>, tx: &mut FreedBatchTx) {
+        let mut empty = HierarchicalBitSet::new(1);
+        self.finish_encoding(&mut empty, entry, tx);
     }
 
     /// Clear the in_flight flag.
@@ -201,7 +214,7 @@ impl core::fmt::Debug for FreedInner {
         match self.state.try_lock() {
             Ok(s) => f
                 .debug_struct("FreedInner")
-                .field("freed_count", &s.freed.count())
+                .field("freed_count", &s.freed.len())
                 .field("in_flight", &s.in_flight)
                 .finish(),
             Err(_) => write!(f, "FreedInner(<locked>)"),
@@ -257,12 +270,12 @@ mod tests {
                     .unwrap();
 
                 // take() drains all accumulated IDs
-                let mut dest = IntervalSet::new();
+                let mut dest = HierarchicalBitSet::new(1);
                 let request_id = freed.take(&mut dest).unwrap();
                 assert_eq!(request_id, VarInt::from_u8(0));
-                assert!(dest.contains(&VarInt::from_u8(5)));
-                assert!(dest.contains(&VarInt::from_u8(6)));
-                assert!(dest.contains(&VarInt::from_u8(7)));
+                assert!(dest.contains(5));
+                assert!(dest.contains(6));
+                assert!(dest.contains(7));
 
                 // check_and_resubmit clears in_flight when empty
                 freed.check_and_resubmit(entry, &mut tx);
@@ -277,10 +290,10 @@ mod tests {
                     .await
                     .unwrap();
 
-                let mut dest = IntervalSet::new();
+                let mut dest = HierarchicalBitSet::new(1);
                 let request_id = freed.take(&mut dest).unwrap();
                 assert_eq!(request_id, VarInt::from_u8(1));
-                assert!(dest.contains(&VarInt::from_u8(8)));
+                assert!(dest.contains(8));
 
                 freed.check_and_resubmit(entry, &mut tx);
             }
@@ -306,7 +319,7 @@ mod tests {
                     .await
                     .unwrap();
 
-                let mut dest = IntervalSet::new();
+                let mut dest = HierarchicalBitSet::new(1);
                 freed.take(&mut dest);
 
                 // More IDs arrive while token is out
@@ -325,7 +338,7 @@ mod tests {
                     .unwrap();
                 dest.clear();
                 let id = freed.take(&mut dest).unwrap();
-                assert!(dest.contains(&VarInt::from_u8(2)));
+                assert!(dest.contains(2));
                 assert_eq!(id, VarInt::from_u8(1));
 
                 freed.check_and_resubmit(entry, &mut tx);
@@ -353,25 +366,33 @@ mod tests {
                     .await
                     .unwrap();
 
-                let mut dest = IntervalSet::new();
+                let mut dest = HierarchicalBitSet::new(1);
                 freed.take(&mut dest);
-                assert_eq!(dest.count(), 2);
+                assert_eq!(dest.len(), 2);
 
                 // Simulate partial encode: put back ID 20
-                let mut remainder = IntervalSet::new();
-                let _ = remainder.insert_value(VarInt::from_u8(20));
-                freed.put_back(&mut remainder);
-                assert!(remainder.is_empty());
+                let mut remainder = HierarchicalBitSet::new(21);
+                remainder.insert(20);
+                freed.finish_encoding(&mut remainder, entry, &mut tx);
 
                 // More IDs arrive
                 freed.record(VarInt::from_u8(30), &path_entry, &mut tx);
+
+                // Token was resubmitted since remainder was non-empty
+                let entry =
+                    crate::socket::channel::Receiver::<intrusive::Entry<msg::Sender>>::recv(
+                        &mut rx,
+                        &mut budget,
+                    )
+                    .await
+                    .unwrap();
 
                 // Next take includes put-back + new
                 dest.clear();
                 let id = freed.take(&mut dest).unwrap();
                 assert!(id.as_u64() > 0);
-                assert!(dest.contains(&VarInt::from_u8(20)));
-                assert!(dest.contains(&VarInt::from_u8(30)));
+                assert!(dest.contains(20));
+                assert!(dest.contains(30));
 
                 freed.check_and_resubmit(entry, &mut tx);
             }
@@ -411,11 +432,11 @@ mod tests {
                     .await
                     .unwrap();
 
-                let mut dest = IntervalSet::new();
+                let mut dest = HierarchicalBitSet::new(1);
                 let id = freed.take(&mut dest).unwrap();
                 // IDs 1 and 2 are both in there (1 was never taken before clear)
-                assert!(dest.contains(&VarInt::from_u8(1)));
-                assert!(dest.contains(&VarInt::from_u8(2)));
+                assert!(dest.contains(1));
+                assert!(dest.contains(2));
 
                 freed.check_and_resubmit(entry, &mut tx);
             }
@@ -441,7 +462,7 @@ mod tests {
                     .await
                     .unwrap();
 
-                let mut dest = IntervalSet::new();
+                let mut dest = HierarchicalBitSet::new(1);
                 freed.take(&mut dest);
 
                 // Second take on empty returns None

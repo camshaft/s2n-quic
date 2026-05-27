@@ -24,6 +24,7 @@ use s2n_quic_core::varint::VarInt;
 ///
 /// `largest` is the max queue_id (goes in frame header).
 /// `ranges` must yield ranges in DESCENDING order (largest first).
+#[allow(dead_code)]
 #[inline]
 pub fn encode<E: Encoder>(
     largest: VarInt,
@@ -56,6 +57,7 @@ pub fn encode<E: Encoder>(
 ///
 /// `largest` is the max queue_id (goes in frame header).
 /// `ranges` must yield ranges in DESCENDING order (largest first).
+#[allow(dead_code)]
 #[inline]
 pub fn encode_partial<E: Encoder>(
     largest: VarInt,
@@ -107,6 +109,7 @@ pub fn encode_partial<E: Encoder>(
 /// Lazy decoder: iterates over ranges without allocating.
 ///
 /// Yields ranges in DESCENDING order (largest first), matching the encoding.
+#[allow(dead_code)]
 #[derive(Clone, Copy)]
 pub struct RangeDecoder<'a> {
     largest: VarInt,
@@ -116,6 +119,7 @@ pub struct RangeDecoder<'a> {
 }
 
 impl<'a> RangeDecoder<'a> {
+    #[allow(dead_code)]
     #[inline]
     pub fn new(largest: VarInt, payload: &'a [u8]) -> Self {
         Self {

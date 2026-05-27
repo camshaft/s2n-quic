@@ -413,12 +413,12 @@ fn dispatch_decoded_frame(
         }
         Header::QueueFree {
             free_request_id,
-            largest_queue_id,
+            smallest_queue_id,
         } => {
             handle_queue_free(
                 peer,
                 free_request_id,
-                largest_queue_id,
+                smallest_queue_id,
                 payload,
                 counters,
                 waker_sink,
@@ -453,7 +453,7 @@ fn dispatch_decoded_frame(
 fn handle_queue_free(
     peer: &mut recv::Context,
     free_request_id: VarInt,
-    largest_queue_id: VarInt,
+    smallest_queue_id: VarInt,
     payload: BytesMut,
     counters: &counters::Dispatch,
     waker_sink: &mut impl channel::UnboundedSender<AutoWake>,
@@ -463,8 +463,8 @@ fn handle_queue_free(
         return;
     };
 
-    let ranges = crate::endpoint::range_codec::RangeDecoder::new(largest_queue_id, &payload);
-    let result = client_view.free(free_request_id, ranges, &mut |w| {
+    let decoder = DeltaDecoder::new(smallest_queue_id, &payload);
+    let result = client_view.free(free_request_id, decoder, &mut |w| {
         let _ = waker_sink.send(AutoWake::new(Some(w)));
     });
     counters
@@ -473,6 +473,54 @@ fn handle_queue_free(
     counters
         .rx_queue_free_ranges
         .record_value(result.ranges as u64);
+}
+
+struct DeltaDecoder<'a> {
+    pending: Option<VarInt>,
+    payload: s2n_codec::DecoderBuffer<'a>,
+}
+
+impl<'a> DeltaDecoder<'a> {
+    fn new(smallest_queue_id: VarInt, payload: &'a [u8]) -> Self {
+        Self {
+            pending: Some(smallest_queue_id),
+            payload: s2n_codec::DecoderBuffer::new(payload),
+        }
+    }
+}
+
+impl Iterator for DeltaDecoder<'_> {
+    type Item = Result<core::ops::RangeInclusive<VarInt>, s2n_codec::DecoderError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let start = self.pending.take()?;
+        let mut end = start;
+
+        loop {
+            if self.payload.is_empty() {
+                return Some(Ok(start..=end));
+            }
+            let (delta, buffer) = match self.payload.decode::<VarInt>() {
+                Ok(v) => v,
+                Err(e) => return Some(Err(e)),
+            };
+            let next_id = match end.checked_add(delta + VarInt::from_u8(1)) {
+                Some(v) => v,
+                None => {
+                    return Some(Err(s2n_codec::DecoderError::InvariantViolation(
+                        "delta overflow",
+                    )))
+                }
+            };
+            self.payload = buffer;
+            if delta == VarInt::ZERO {
+                end = next_id;
+            } else {
+                self.pending = Some(next_id);
+                return Some(Ok(start..=end));
+            }
+        }
+    }
 }
 
 fn handle_queue_data(
