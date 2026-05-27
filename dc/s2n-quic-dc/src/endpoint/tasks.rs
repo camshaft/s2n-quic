@@ -1625,45 +1625,31 @@ pub struct PeerDeadCounters {
 
 pub fn peer_dead_broadcast<R, WakerSink>(
     peer_dead_rx: R,
-    mut queue_dispatcher: msg::queue::Dispatcher,
     mut waker_sink: WakerSink,
     counters: PeerDeadCounters,
 ) -> impl Receiver<()>
 where
     R: Receiver<Entry<PeerDead>>,
-    WakerSink: UnboundedSender<crate::flow::queue::AutoWake>,
+    WakerSink: UnboundedSender<crate::queue::AutoWake>,
 {
-    use crate::{endpoint::error::IDLE_TIMEOUT, flow};
+    use crate::{endpoint::error::IDLE_TIMEOUT, path::secret::map::entry::QueueState};
 
     Map::new(peer_dead_rx, move |entry: Entry<PeerDead>| {
         counters.events.add(1);
         let peer_dead = entry.into_inner();
-        let credential_id = *peer_dead.path_secret_entry.id();
 
-        let request = flow::Request {
-            credential_id,
-            binding_id: None,
-        };
-
-        queue_dispatcher.send_both_by_request(
-            &request,
-            || {
-                msg::Stream::Reset {
-                    error_code: IDLE_TIMEOUT,
-                }
-                .into()
-            },
-            || {
-                msg::Control::Reset {
-                    error_code: IDLE_TIMEOUT,
-                }
-                .into()
-            },
-            |waker_a, waker_b| {
-                let _ = waker_sink.send(waker_a);
-                let _ = waker_sink.send(waker_b);
-            },
-        );
+        match peer_dead.path_secret_entry.queue_state() {
+            QueueState::Client(state) => {
+                state.broadcast_reset(IDLE_TIMEOUT, &mut |aw| {
+                    let _ = waker_sink.send(aw);
+                });
+            }
+            QueueState::Server(state) => {
+                state.broadcast_reset(IDLE_TIMEOUT, &mut |aw| {
+                    let _ = waker_sink.send(aw);
+                });
+            }
+        }
         counters.broadcasted.add(1);
     })
 }

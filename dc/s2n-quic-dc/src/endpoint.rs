@@ -402,7 +402,6 @@ where
 
     // Shared flow-queue allocator and dispatch counters -------------------------
     let queue_allocator = msg::queue::Allocator::new_with_registry(&counter_registry);
-    let queue_dispatcher = queue_allocator.dispatcher();
     let (freed_batch_tx, _freed_batch_rx) = crate::queue::freed_batch_channel();
     let counters = counters::Dispatch::new(&counter_registry);
 
@@ -686,7 +685,6 @@ where
         ups_dedup_capacity,
         ups_dedup_window,
         acceptor_cleaner: acceptor_registry.cleaner(),
-        queue_dispatcher: queue_dispatcher.clone(),
         waker_sink: bg_waker_sink,
     });
 
@@ -800,7 +798,6 @@ struct BackgroundParts<UpsSocket> {
     ups_dedup_capacity: usize,
     ups_dedup_window: core::time::Duration,
     acceptor_cleaner: acceptor::Cleaner<PendingValidation>,
-    queue_dispatcher: msg::queue::Dispatcher,
     waker_sink: waker::Sink,
 }
 
@@ -1161,7 +1158,6 @@ where
                 );
                 let rx = tasks::peer_dead_broadcast(
                     peer_dead_rx,
-                    bg.queue_dispatcher,
                     bg.waker_sink,
                     peer_dead_counters,
                 );

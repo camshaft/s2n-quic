@@ -101,14 +101,64 @@ at 65535 streams = u16::MAX because freed IDs never reach the client).
 
 ### Peer-dead broadcast wiring
 
-The `peer_dead_broadcast` task uses `msg::queue::Dispatcher` (the old
-`flow::queue::Dispatch`) to send resets to stream/control channels. The new
-Writer/Reader listen on `queue::StreamReceiver` / `ControlReceiver` slots
-instead. The broadcast needs to target the new slot-based channels.
+Done. The `peer_dead_broadcast` task no longer uses `msg::queue::Dispatcher`.
+Instead it accesses the `Arc<Entry>`'s `QueueState` directly from the
+`PeerDead` struct and calls `broadcast_reset` on the appropriate state:
 
-This blocks `peer_dead_cooldown_blocks_new_connects` and
-`total_packet_loss_surfaces_read_timeout` (the PTO assertion is fixed, but
-idle-timeout resets never reach the reader).
+- `ClientState::broadcast_reset` iterates all allocated slots via
+  `SenderView::for_each_slot`, pushes `Reset { IDLE_TIMEOUT }` into both
+  halves (skipping unallocated slots and halves without a receiver), then
+  calls `FreeList::wake_all` to wake any clients blocked in `alloc()`.
+
+- `ServerState::broadcast_reset` does the same slot iteration and reset push
+  for server-owned slots.
+
+- `Slot::broadcast_reset` pushes resets without binding validation and without
+  clearing `HAS_SENDER` — this is a transient notification, not a permanent
+  close. After cooldown expires, the slots remain usable for new bindings.
+
+- `ClientAllocFuture` now borrows `&Entry` and a `cooldown: Duration`. On
+  each poll it checks `entry.is_dead_during_cooldown(now, cooldown)` and
+  returns `None` if the peer is dead — callers blocked in `alloc().await`
+  bail promptly when `wake_all` fires.
+
+- `FreeList::wake_all` drains all waiters without closing the list, so after
+  cooldown expires new `alloc()` calls proceed normally against the unchanged
+  free list state.
+
+Design note: `broadcast_close` (which permanently removes `HAS_SENDER`) is
+reserved for entry eviction, not peer-dead. The `peer_free` list is not closed
+or reset either — if the peer was merely transiently unreachable, those server
+slots remain valid after cooldown. If the peer truly died and reconnects, a
+new TLS handshake creates a new Entry with a fresh `ClientState`.
+
+This unblocks `peer_dead_cooldown_blocks_new_connects`.
+`total_packet_loss_surfaces_read_timeout` may still need additional work if
+idle-timeout resets from the PTO path need similar wiring.
+
+### Entry eviction must broadcast_close
+
+When a path secret Entry is evicted from the map, `ClientState` /
+`ServerState` should have `broadcast_close` called to permanently clear
+`HAS_SENDER` on all slots. Currently `ClientDispatch::close` and
+`ServerView::close` exist but are never invoked from the eviction path.
+Without this, receivers on evicted entries may block forever waiting for data.
+
+### FreedInner leak on peer-dead
+
+When the send context is invalidated (peer-dead or unknown-path-secret),
+QueueFree frames already taken from `FreedInner` via `batch.take()` and
+submitted to `frame_tx` are abandoned. Those server queue_ids are lost from
+the client's perspective — `peer_free` never learns about them.
+
+Additionally, if `check_and_resubmit` is never called for an in-flight token
+(because the emission task's frame was cancelled), `in_flight` stays
+permanently true, blocking all future freed-ID emission for that peer.
+
+The fix requires the emission task (when wired) to handle cancellation
+gracefully: either re-inserting taken IDs on failure, or having peer-dead
+reset `in_flight` and re-accumulate any slots that the server considers free
+but the client doesn't know about.
 
 ### Cleanup (follow-up PR)
 
@@ -119,7 +169,9 @@ Once all tests pass, remove:
 - `QueueInit`, `QueueInitReset`, `QueueInitFin`, `QueueValidateRequest`,
   `QueueInitValidate` frame variants
 - `PendingValidation` reader status variant
-- `msg::queue::Allocator` / `msg::queue::Dispatcher` type aliases
+- `msg::queue::Allocator` / `msg::queue::Dispatcher` type aliases (Dispatcher
+  is no longer used by `peer_dead_broadcast`; Allocator remains in idle wheel
+  recv tests until those are ported)
 - The old `flow::queue` module
 - `Endpoint.queue_allocator` and `Endpoint.next_binding_id`
 

@@ -239,6 +239,20 @@ impl FreeList {
         FreeResult { slots, ranges }
     }
 
+    /// Wake all blocked waiters without closing the free list.
+    ///
+    /// Used by peer-dead broadcast: waiters re-poll their alloc future and
+    /// check the entry's cooldown state before deciding to bail or re-register.
+    pub fn wake_all(&self, waker_sink: &mut impl FnMut(Waker)) {
+        let mut inner = self.inner.lock().unwrap();
+        while let Some(waiter_arc) = inner.waiters.pop_front() {
+            // SAFETY: under the inner Mutex
+            if let Some(w) = unsafe { waiter_arc.take_waker() } {
+                waker_sink(w);
+            }
+        }
+    }
+
     pub fn close(&self, waker_sink: &mut impl FnMut(Waker)) {
         let mut inner = self.inner.lock().unwrap();
         inner.closed = true;

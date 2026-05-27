@@ -600,7 +600,7 @@ where
     };
 
     let alloc = client_state
-        .alloc()
+        .alloc(&path_secret_entry, endpoint.dead_peer_cooldown)
         .await
         .ok_or_else(|| io::Error::new(io::ErrorKind::ConnectionReset, "peer queue slots closed"))?;
 

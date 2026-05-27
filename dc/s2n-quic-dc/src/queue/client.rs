@@ -21,7 +21,8 @@ use super::{
     page_table::{PageTable, SenderView},
     Error,
 };
-use crate::{bitset, endpoint::msg, intrusive, sync};
+use crate::{bitset, endpoint::msg, intrusive, path::secret::map::Entry, sync};
+use core::time::Duration;
 use s2n_quic_core::varint::VarInt;
 use std::{
     future::Future,
@@ -123,16 +124,35 @@ impl ClientState {
 
     /// Allocate a queue slot, waiting for a peer-side free ID if needed.
     ///
-    /// Returns `None` if the peer is dead (free list closed).
-    ///
-    // TODO: the future should re-check `is_dead_during_cooldown` on each poll
-    // so that a `wake_all` on dead-peer transitions causes blocked clients to
-    // bail without requiring close/reopen of the free lists.
-    pub fn alloc(self: &Arc<Self>) -> ClientAllocFuture {
+    /// Returns `None` if the peer is dead (free list closed or entry in cooldown).
+    /// Checks `entry.is_dead_during_cooldown` on each poll so that a peer-dead
+    /// broadcast's `wake_all` causes blocked callers to bail promptly.
+    pub fn alloc<'a>(
+        self: &'a Arc<Self>,
+        entry: &'a Entry,
+        cooldown: Duration,
+    ) -> ClientAllocFuture<'a> {
         ClientAllocFuture {
-            state: self.clone(),
+            state: self,
+            entry,
+            cooldown,
             waiter: None,
         }
+    }
+
+    /// Push Reset into all allocated slots and wake blocked alloc waiters.
+    ///
+    /// Does NOT permanently close the slots — this is a transient peer-dead
+    /// notification.  After cooldown expires, new alloc() calls proceed normally.
+    pub fn broadcast_reset(&self, error_code: VarInt, waker_sink: &mut impl FnMut(AutoWake)) {
+        let mut view = SenderView::new();
+        view.for_each_slot(&self.pages, |slot| {
+            let (sw, cw) = slot.broadcast_reset(error_code);
+            waker_sink(sw);
+            waker_sink(cw);
+        });
+        self.peer_free
+            .wake_all(&mut |w| waker_sink(AutoWake::new(Some(w))));
     }
 
     pub(crate) fn alloc_local(self: &Arc<Self>, dest_queue_id: VarInt) -> Option<AllocResult> {
@@ -172,16 +192,25 @@ impl ClientState {
 
 // ── ClientAllocFuture ───────────────────────────────────────────────────────
 
-pub struct ClientAllocFuture {
-    state: Arc<ClientState>,
+pub struct ClientAllocFuture<'a> {
+    state: &'a Arc<ClientState>,
+    entry: &'a Entry,
+    cooldown: Duration,
     waiter: Option<Arc<sync::waiter::Waiter>>,
 }
 
-impl Future for ClientAllocFuture {
+impl Future for ClientAllocFuture<'_> {
     type Output = Option<AllocResult>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
         let this = self.get_mut();
+
+        // Reads the clock — bach-aware in test contexts.
+        let now = crate::time::precision::Timestamp::from(crate::time::now());
+        if this.entry.is_dead_during_cooldown(now, this.cooldown) {
+            return Poll::Ready(None);
+        }
+
         match this.state.peer_free.poll_alloc(&mut this.waiter, cx) {
             Poll::Ready(Some(dest_queue_id)) => Poll::Ready(this.state.alloc_local(dest_queue_id)),
             Poll::Ready(None) => Poll::Ready(None),
@@ -190,7 +219,7 @@ impl Future for ClientAllocFuture {
     }
 }
 
-impl Drop for ClientAllocFuture {
+impl Drop for ClientAllocFuture<'_> {
     fn drop(&mut self) {
         self.state.peer_free.cancel_waiter(&mut self.waiter);
     }

@@ -134,9 +134,12 @@ impl Client {
             ));
         };
 
-        let alloc = client_state.alloc().await.ok_or_else(|| {
-            io::Error::new(io::ErrorKind::ConnectionReset, "peer queue slots closed")
-        })?;
+        let alloc = client_state
+            .alloc(&path_secret_entry, self.endpoint.dead_peer_cooldown)
+            .await
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::ConnectionReset, "peer queue slots closed")
+            })?;
 
         let frame_tx = self.endpoint.frame_tx.clone();
         let writer = Writer::new_client(

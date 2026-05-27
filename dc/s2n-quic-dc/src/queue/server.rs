@@ -83,6 +83,19 @@ impl ServerState {
             view: SenderView::new(),
         }
     }
+
+    /// Push Reset into all allocated slots.
+    ///
+    /// Does NOT permanently close the slots — this is a transient peer-dead
+    /// notification.  After cooldown expires, new bindings proceed normally.
+    pub fn broadcast_reset(&self, error_code: VarInt, waker_sink: &mut impl FnMut(AutoWake)) {
+        let mut view = SenderView::new();
+        view.for_each_slot(&self.pages, |slot| {
+            let (sw, cw) = slot.broadcast_reset(error_code);
+            waker_sink(sw);
+            waker_sink(cw);
+        });
+    }
 }
 
 // ── ServerView (per recv::Context) ───────────────────────────────────────────

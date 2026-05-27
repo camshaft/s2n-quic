@@ -32,7 +32,6 @@ fn setup_send() -> (
     unsync::Receiver<crate::intrusive::EntryAdapter<Frame>>,
     Clock,
     crate::counter::Registry,
-    msg::queue::Allocator,
 ) {
     let registry = crate::counter::Registry::default();
     let clock = Clock::default();
@@ -48,8 +47,6 @@ fn setup_send() -> (
 
     let (idle_wheel_tx, idle_wheel_rx) = unsync::new_with_adapter::<send::IdleWheelAdapter>();
     let (completed_tx, completed_rx) = unsync::new::<Frame>();
-    let queue_allocator = msg::queue::Allocator::new();
-    let queue_dispatcher = queue_allocator.dispatcher();
     let (peer_dead_tx, peer_dead_rx) = unsync::new::<tasks::PeerDead>();
     let q_gauge = registry.register_queue_gauge("test.idle_wheel");
 
@@ -74,7 +71,6 @@ fn setup_send() -> (
 
     let peer_dead_broadcast_task = tasks::peer_dead_broadcast(
         peer_dead_rx,
-        queue_dispatcher,
         WakeNowSender,
         tasks::PeerDeadCounters {
             events: registry.register("test.peer_dead.events"),
@@ -89,7 +85,6 @@ fn setup_send() -> (
         completed_rx,
         clock,
         registry,
-        queue_allocator,
     )
 }
 
@@ -97,7 +92,7 @@ fn setup_send() -> (
 fn send_idle_wheel_expires_inactive_context() {
     let _guard = crate::testing::without_snapshots();
     sim(|| {
-        let (send_caches, mut idle_wheel_tx, mut completed_rx, clock, _registry, _queue_allocator) =
+        let (send_caches, mut idle_wheel_tx, mut completed_rx, clock, _registry) =
             setup_send();
 
         let pse = test_entry();
@@ -151,7 +146,7 @@ fn send_idle_wheel_expires_inactive_context() {
 fn send_idle_wheel_reschedules_active_context() {
     let _guard = crate::testing::without_snapshots();
     sim(|| {
-        let (send_caches, mut idle_wheel_tx, _completed_rx, clock, _registry, _queue_allocator) =
+        let (send_caches, mut idle_wheel_tx, _completed_rx, clock, _registry) =
             setup_send();
 
         let pse = test_entry();
@@ -206,15 +201,11 @@ fn send_idle_wheel_reschedules_active_context() {
 fn send_idle_wheel_expires_reader_only_queue_no_reset_without_inflight() {
     let _guard = crate::testing::without_snapshots();
     sim(|| {
-        let (send_caches, mut idle_wheel_tx, _completed_rx, clock, _registry, mut queue_allocator) =
+        let (send_caches, mut idle_wheel_tx, _completed_rx, clock, _registry) =
             setup_send();
 
         let pse = test_entry();
         pse.touch_activity(precision::Clock::now(&clock));
-
-        let binding_id = VarInt::from_u8(7);
-        let handle = flow::Handle::client(binding_id, pse.clone());
-        let (queue_control, queue_stream) = queue_allocator.alloc_or_grow(handle, None);
 
         let ctx = send_caches[LocalSendSocketId::new(0)]
             .borrow_mut()
@@ -242,26 +233,12 @@ fn send_idle_wheel_expires_reader_only_queue_no_reset_without_inflight() {
                 "context should be evicted after idle timeout"
             );
 
-            // Without inflight packets, the peer is not marked dead and no
-            // Reset is broadcast to the flow queues.
-            let stream_queue_entries = queue_stream
-                .try_swap()
-                .expect("stream queue should still be open");
+            // Without inflight packets, the peer is not marked dead.
+            // The entry's dead_at should remain unset (-1).
+            let now = crate::time::precision::Timestamp::from(crate::time::now());
             assert!(
-                !stream_queue_entries
-                    .iter()
-                    .any(|entry| { matches!(entry, msg::Stream::Reset { .. }) }),
-                "stream queue should NOT receive reset when idle expires without inflight"
-            );
-
-            let control_queue_entries = queue_control
-                .try_swap()
-                .expect("control queue should still be open");
-            assert!(
-                !control_queue_entries
-                    .iter()
-                    .any(|entry| { matches!(entry, msg::Control::Reset { .. }) }),
-                "control queue should NOT receive reset when idle expires without inflight"
+                !pse.is_dead_during_cooldown(now, crate::endpoint::DEFAULT_DEAD_PEER_COOLDOWN),
+                "peer should NOT be marked dead when idle expires without inflight"
             );
         }
         .primary()
@@ -275,7 +252,7 @@ fn send_idle_wheel_expires_reader_only_queue_no_reset_without_inflight() {
 #[test]
 fn send_idle_wheel_no_inflight_does_not_mark_dead() {
     sim(|| {
-        let (send_caches, mut idle_wheel_tx, _completed_rx, clock, _registry, _queue_allocator) =
+        let (send_caches, mut idle_wheel_tx, _completed_rx, clock, _registry) =
             setup_send();
 
         let pse = test_entry();

@@ -185,6 +185,42 @@ impl Slot {
         Ok(BindState::AlreadyBound(waker))
     }
 
+    /// Push Reset into both halves of an allocated slot without binding validation.
+    ///
+    /// Skips unallocated slots and halves without a receiver.  Does NOT clear
+    /// `HAS_SENDER` — this is a transient notification (peer-dead cooldown),
+    /// not a permanent close.
+    pub(crate) fn broadcast_reset(
+        &self,
+        error_code: VarInt,
+    ) -> (half::AutoWake, half::AutoWake) {
+        let mut s = self.stream.inner.lock();
+        let mut c = self.control.inner.lock();
+
+        let raw = self.binding_id.load(Ordering::Relaxed);
+        if raw & UNALLOCATED_BIT != 0 {
+            return (half::AutoWake::default(), half::AutoWake::default());
+        }
+
+        let sw = if s.flags.contains(Flags::HAS_RECEIVER) {
+            s.queue
+                .push_back(intrusive::Entry::new(msg::Stream::Reset { error_code }));
+            s.take_waker()
+        } else {
+            half::AutoWake::default()
+        };
+
+        let cw = if c.flags.contains(Flags::HAS_RECEIVER) {
+            c.queue
+                .push_back(intrusive::Entry::new(msg::Control::Reset { error_code }));
+            c.take_waker()
+        } else {
+            half::AutoWake::default()
+        };
+
+        (sw, cw)
+    }
+
     /// Broadcast-close both halves: clears HAS_SENDER, wakes receivers.
     ///
     /// Always locks — no fast-path skip.  On unallocated slots HAS_SENDER is
