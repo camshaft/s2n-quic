@@ -103,7 +103,6 @@ pub fn freed_batch_channel() -> (FreedBatchTx, FreedBatchRx) {
 
 // ── Per-peer accumulator ──────────────────────────────────────────────────────
 
-
 pub struct FreedInner {
     state: Mutex<FreedState>,
 }
@@ -191,14 +190,18 @@ impl FreedState {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::queue::server::ServerState;
     use s2n_quic_core::varint::VarInt;
 
-    fn test_setup() -> (Arc<ServerState>, Arc<PathSecretEntry>, FreedBatchTx, FreedBatchRx) {
+    fn test_setup() -> (
+        Arc<ServerState>,
+        Arc<PathSecretEntry>,
+        FreedBatchTx,
+        FreedBatchRx,
+    ) {
         let (tx, rx) = freed_batch_channel();
         let path_entry = PathSecretEntry::builder("127.0.0.1:4433".parse().unwrap()).build();
         let state = Arc::new(ServerState::new(VarInt::from_u8(100)));
@@ -208,15 +211,21 @@ mod tests {
     #[test]
     fn record_first_submits_token() {
         let (state, path_entry, tx, mut rx) = test_setup();
-        state.freed.record(VarInt::from_u8(5), &state, &path_entry, &tx);
+        state
+            .freed
+            .record(VarInt::from_u8(5), &state, &path_entry, &tx);
         assert!(rx.try_recv().is_ok());
     }
 
     #[test]
     fn record_second_no_resubmit() {
         let (state, path_entry, tx, mut rx) = test_setup();
-        state.freed.record(VarInt::from_u8(5), &state, &path_entry, &tx);
-        state.freed.record(VarInt::from_u8(6), &state, &path_entry, &tx);
+        state
+            .freed
+            .record(VarInt::from_u8(5), &state, &path_entry, &tx);
+        state
+            .freed
+            .record(VarInt::from_u8(6), &state, &path_entry, &tx);
         assert!(rx.try_recv().is_ok());
         assert!(rx.try_recv().is_err());
     }
@@ -224,9 +233,15 @@ mod tests {
     #[test]
     fn take_drains_accumulated() {
         let (state, path_entry, tx, mut rx) = test_setup();
-        state.freed.record(VarInt::from_u8(5), &state, &path_entry, &tx);
-        state.freed.record(VarInt::from_u8(6), &state, &path_entry, &tx);
-        state.freed.record(VarInt::from_u8(7), &state, &path_entry, &tx);
+        state
+            .freed
+            .record(VarInt::from_u8(5), &state, &path_entry, &tx);
+        state
+            .freed
+            .record(VarInt::from_u8(6), &state, &path_entry, &tx);
+        state
+            .freed
+            .record(VarInt::from_u8(7), &state, &path_entry, &tx);
         let batch = rx.try_recv().unwrap();
         let mut dest = IntervalSet::new();
         let request_id = batch.take(&mut dest);
@@ -239,7 +254,9 @@ mod tests {
     #[test]
     fn take_empty_returns_none() {
         let (state, path_entry, tx, mut rx) = test_setup();
-        state.freed.record(VarInt::from_u8(1), &state, &path_entry, &tx);
+        state
+            .freed
+            .record(VarInt::from_u8(1), &state, &path_entry, &tx);
         let batch = rx.try_recv().unwrap();
         let mut dest = IntervalSet::new();
         batch.take(&mut dest);
@@ -251,14 +268,18 @@ mod tests {
     fn take_request_id_increments() {
         let (state, path_entry, tx, mut rx) = test_setup();
 
-        state.freed.record(VarInt::from_u8(1), &state, &path_entry, &tx);
+        state
+            .freed
+            .record(VarInt::from_u8(1), &state, &path_entry, &tx);
         let batch = rx.try_recv().unwrap();
         let mut dest = IntervalSet::new();
         let id0 = batch.take(&mut dest).unwrap();
         assert_eq!(id0, VarInt::from_u8(0));
         batch.check_and_resubmit(&tx);
 
-        state.freed.record(VarInt::from_u8(2), &state, &path_entry, &tx);
+        state
+            .freed
+            .record(VarInt::from_u8(2), &state, &path_entry, &tx);
         let batch = rx.try_recv().unwrap();
         dest.clear();
         let id1 = batch.take(&mut dest).unwrap();
@@ -268,8 +289,12 @@ mod tests {
     #[test]
     fn put_back_merges() {
         let (state, path_entry, tx, mut rx) = test_setup();
-        state.freed.record(VarInt::from_u8(10), &state, &path_entry, &tx);
-        state.freed.record(VarInt::from_u8(20), &state, &path_entry, &tx);
+        state
+            .freed
+            .record(VarInt::from_u8(10), &state, &path_entry, &tx);
+        state
+            .freed
+            .record(VarInt::from_u8(20), &state, &path_entry, &tx);
         let batch = rx.try_recv().unwrap();
 
         let mut dest = IntervalSet::new();
@@ -281,7 +306,9 @@ mod tests {
         batch.put_back(&mut remainder);
         assert!(remainder.is_empty());
 
-        state.freed.record(VarInt::from_u8(30), &state, &path_entry, &tx);
+        state
+            .freed
+            .record(VarInt::from_u8(30), &state, &path_entry, &tx);
 
         dest.clear();
         let id = batch.take(&mut dest);
@@ -294,13 +321,17 @@ mod tests {
     fn check_and_resubmit_clears_when_empty() {
         let (state, path_entry, tx, mut rx) = test_setup();
 
-        state.freed.record(VarInt::from_u8(1), &state, &path_entry, &tx);
+        state
+            .freed
+            .record(VarInt::from_u8(1), &state, &path_entry, &tx);
         let batch = rx.try_recv().unwrap();
         let mut dest = IntervalSet::new();
         batch.take(&mut dest);
         batch.check_and_resubmit(&tx);
 
-        state.freed.record(VarInt::from_u8(2), &state, &path_entry, &tx);
+        state
+            .freed
+            .record(VarInt::from_u8(2), &state, &path_entry, &tx);
         assert!(rx.try_recv().is_ok());
     }
 
@@ -309,12 +340,16 @@ mod tests {
         let (state, path_entry, tx, mut rx) = test_setup();
         let (tx2, mut rx2) = freed_batch_channel();
 
-        state.freed.record(VarInt::from_u8(1), &state, &path_entry, &tx);
+        state
+            .freed
+            .record(VarInt::from_u8(1), &state, &path_entry, &tx);
         let batch = rx.try_recv().unwrap();
         let mut dest = IntervalSet::new();
         batch.take(&mut dest);
 
-        state.freed.record(VarInt::from_u8(2), &state, &path_entry, &tx);
+        state
+            .freed
+            .record(VarInt::from_u8(2), &state, &path_entry, &tx);
 
         batch.check_and_resubmit(&tx2);
         assert!(rx2.try_recv().is_ok());
@@ -324,7 +359,9 @@ mod tests {
     fn record_after_channel_closed() {
         let (state, path_entry, tx, rx) = test_setup();
         drop(rx);
-        state.freed.record(VarInt::from_u8(1), &state, &path_entry, &tx);
+        state
+            .freed
+            .record(VarInt::from_u8(1), &state, &path_entry, &tx);
         let inner_state = state.freed.state.lock().unwrap();
         assert!(!inner_state.in_flight);
     }
@@ -338,14 +375,18 @@ mod tests {
             inner.next_request_id = VarInt::new(VarInt::MAX.as_u64() - 1).unwrap();
         }
 
-        state.freed.record(VarInt::from_u8(1), &state, &path_entry, &tx);
+        state
+            .freed
+            .record(VarInt::from_u8(1), &state, &path_entry, &tx);
         let batch = rx.try_recv().unwrap();
         let mut dest = IntervalSet::new();
         let id = batch.take(&mut dest).unwrap();
         assert_eq!(id.as_u64(), VarInt::MAX.as_u64() - 1);
         batch.check_and_resubmit(&tx);
 
-        state.freed.record(VarInt::from_u8(2), &state, &path_entry, &tx);
+        state
+            .freed
+            .record(VarInt::from_u8(2), &state, &path_entry, &tx);
         let batch = rx.try_recv().unwrap();
         dest.clear();
         let id = batch.take(&mut dest).unwrap();

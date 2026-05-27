@@ -334,8 +334,11 @@ mod tests {
         let result = alloc.try_alloc().unwrap();
         let mut dispatch = alloc.dispatcher();
 
-        let wake =
-            dispatch.send_stream(result.local_queue_id, result.binding_id, make_stream_entry());
+        let wake = dispatch.send_stream(
+            result.local_queue_id,
+            result.binding_id,
+            make_stream_entry(),
+        );
         assert!(wake.is_ok());
 
         drop(result);

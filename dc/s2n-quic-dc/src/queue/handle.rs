@@ -66,6 +66,11 @@ impl StreamReceiver {
     }
 
     #[inline]
+    pub fn binding_id(&self) -> VarInt {
+        self.slot().binding_id()
+    }
+
+    #[inline]
     fn slot(&self) -> &Slot {
         // SAFETY: pinned allocation kept alive by the OnFree lifetime guard.
         unsafe { self.slot.as_ref() }
@@ -142,6 +147,11 @@ impl ControlReceiver {
     #[inline]
     pub fn queue_id(&self) -> VarInt {
         self.slot().queue_id()
+    }
+
+    #[inline]
+    pub fn binding_id(&self) -> VarInt {
+        self.slot().binding_id()
     }
 
     #[inline]

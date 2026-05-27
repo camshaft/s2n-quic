@@ -584,25 +584,9 @@ where
         ));
     }
 
-    // Allocate a fresh stream ID and flow queues.
-    let binding_id = VarInt::new(endpoint.next_binding_id.fetch_add(1, Ordering::Relaxed))
-        .expect("binding_id overflow");
-
-    let handle = flow::Handle::client(binding_id, path_secret_entry.clone());
-    let (queue_control, queue_stream) = queue_allocator.alloc_or_grow(handle, None);
-
-    // Build Reader + Writer and wrap them in a Stream.
-    let frame_tx = endpoint.frame_tx.clone();
-    let writer = Writer::new_client(
-        frame_tx.clone(),
-        path_secret_entry.clone(),
-        binding_id,
-        acceptor_id,
-        queue_control,
-    );
-    let reader = Reader::new_client(frame_tx, path_secret_entry, binding_id, queue_stream);
-
-    Ok(Stream::new(reader, writer))
+    // TODO: switch to ClientAllocator from Entry's QueueState
+    let _ = (path_secret_entry, acceptor_id, queue_allocator, endpoint);
+    todo!("wire sim connect to new queue module")
 }
 
 // ── Peer ───────────────────────────────────────────────────────────────────

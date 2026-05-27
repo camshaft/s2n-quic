@@ -575,34 +575,20 @@ fn handle_queue_init(
             }
         }
 
-        let local_queue_id = queue_control.queue_id();
-        let writer = Writer::new_server(
-            frame_tx.clone(),
-            peer.path_entry.clone(),
-            binding_id,
+        // TODO: switch to ServerView::bind_and_send_stream path
+        let _ = (
             queue_control,
+            queue_stream,
+            binding_id,
+            is_fin,
+            pending_validation,
         );
-        let reader = if pending_validation {
-            Reader::new_server_pending(
-                frame_tx.clone(),
-                peer.path_entry.clone(),
-                binding_id,
-                queue_stream,
-                is_fin,
-            )
-        } else {
-            Reader::new_server(
-                frame_tx.clone(),
-                peer.path_entry.clone(),
-                binding_id,
-                queue_stream,
-                is_fin,
-            )
-        };
-
+        let _ = payload;
+        todo!("wire dispatch to new queue module");
+        #[allow(unreachable_code)]
         (
-            local_queue_id,
-            PendingValidation::new(Stream::new(reader, writer)),
+            VarInt::ZERO,
+            PendingValidation::new(Stream::new(todo!(), todo!())),
         )
     };
 

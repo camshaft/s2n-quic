@@ -65,6 +65,12 @@ impl Slot {
         VarInt::new(self.queue_id).unwrap_or(VarInt::MAX)
     }
 
+    #[inline]
+    pub(crate) fn binding_id(&self) -> VarInt {
+        let raw = self.binding_id.load(Ordering::Relaxed);
+        VarInt::new(raw & !UNALLOCATED_BIT).unwrap_or(VarInt::ZERO)
+    }
+
     /// Returns a stable raw pointer to this slot.
     ///
     /// SAFETY: the pointer is valid as long as the `Arc<State>` that owns

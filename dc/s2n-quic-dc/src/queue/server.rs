@@ -190,7 +190,12 @@ mod tests {
 
     fn test_server(
         max_queues: u64,
-    ) -> (ServerView, Arc<PathSecretEntry>, FreedBatchTx, super::super::freed::FreedBatchRx) {
+    ) -> (
+        ServerView,
+        Arc<PathSecretEntry>,
+        FreedBatchTx,
+        super::super::freed::FreedBatchRx,
+    ) {
         let (tx, rx) = freed_batch_channel();
         let path_entry: Arc<PathSecretEntry> =
             PathSecretEntry::builder("127.0.0.1:4433".parse().unwrap()).build();

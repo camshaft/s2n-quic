@@ -136,33 +136,9 @@ impl Client {
             ));
         }
 
-        let binding_id = VarInt::new(
-            self.endpoint
-                .next_binding_id
-                .fetch_add(1, Ordering::Relaxed),
-        )
-        .unwrap();
-
-        let handle = flow::Handle::client(binding_id, path_secret_entry.clone());
-
-        let (queue_control, queue_stream) = self.queue_allocator.alloc_or_grow(handle, None);
-
-        let writer = Writer::new_client(
-            self.endpoint.frame_tx.clone(),
-            path_secret_entry.clone(),
-            binding_id,
-            acceptor_id,
-            queue_control,
-        );
-
-        let reader = Reader::new_client(
-            self.endpoint.frame_tx.clone(),
-            path_secret_entry,
-            binding_id,
-            queue_stream,
-        );
-
-        Ok(Stream::new(reader, writer))
+        // TODO: switch to ClientAllocator from Entry's QueueState
+        let _ = (path_secret_entry, acceptor_id);
+        todo!("wire client to new queue module")
     }
 
     /// Performs a single-round-trip RPC: sends `request` and collects `response`.
