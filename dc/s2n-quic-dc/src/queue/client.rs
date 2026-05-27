@@ -170,9 +170,11 @@ impl ClientState {
             .expect("slot index out of range after grow");
 
         let binding_id = self.next_binding_id();
-        slot_ref
-            .allocate_and_open(binding_id)
-            .expect("slot allocation failed");
+        if slot_ref.allocate_and_open(binding_id).is_err() {
+            let mut free = self.free.lock().unwrap();
+            free.push_freed(index);
+            return None;
+        }
 
         let slot_ptr = slot_ref.as_ptr();
         let local_queue_id = VarInt::new(index as u64).expect("slot index exceeds VarInt range");
