@@ -93,6 +93,4 @@ pub mod queue {
 
     pub type Allocator = flow::queue::Allocator<super::Stream, super::Control, flow::Handle>;
     pub type Dispatcher = flow::queue::Dispatch<super::Stream, super::Control, flow::Handle>;
-    pub type Control = flow::queue::Control<super::Stream, super::Control, flow::Handle>;
-    pub type Stream = flow::queue::Stream<super::Stream, super::Control, flow::Handle>;
 }

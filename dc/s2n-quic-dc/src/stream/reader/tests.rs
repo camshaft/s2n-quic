@@ -78,9 +78,9 @@ impl PairBuilder {
 
         let client_state =
             std::sync::Arc::new(crate::queue::ClientState::new(VarInt::from_u16(100)));
-        let mut allocator = crate::queue::ClientAllocator::new(client_state);
-        let alloc = allocator.try_alloc().expect("alloc should succeed");
-        let dispatcher = allocator.dispatcher();
+        let dest_queue_id = client_state.peer_free.try_alloc().unwrap();
+        let alloc = client_state.alloc_local(dest_queue_id).unwrap();
+        let dispatcher = crate::queue::ClientDispatch::new(client_state);
 
         let queue_id = alloc.stream.queue_id();
         let binding_id = alloc.stream.binding_id();

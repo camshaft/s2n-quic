@@ -37,7 +37,7 @@ pub use half::{AutoWake, Closed};
 pub use handle::{AllocResult, ControlReceiver, StreamReceiver};
 pub use server::BindResult;
 
-pub use client::{ClientAllocator, ClientDispatch, ClientState};
+pub use client::{ClientAllocFuture, ClientDispatch, ClientState};
 pub use freed::{freed_batch_channel, FreedBatch, FreedBatchRx, FreedBatchTx};
 pub use server::{ServerState, ServerView};
 

@@ -571,7 +571,7 @@ impl Inner {
                 binding_id: self.control_rx.binding_id(),
                 reset_target,
                 error_code,
-                dest_acceptor_id: None,
+                dest_acceptor_id: self.dest_acceptor_id(),
             },
             payload: ByteVec::new(),
             path_secret_entry: self.path_secret_entry.clone(),
@@ -593,130 +593,7 @@ impl Inner {
         Ok(())
     }
 
-    fn send_queue_init_reset_frame(&mut self, error_code: VarInt) -> io::Result<()> {
-        // Only meaningful when the server already received our QueueInit and registered
-        // a stream entry. In Init state the server doesn't know about us yet.
-        if !self.status.is_init_sent() {
-            debug!(
-                binding_id = self.control_rx.binding_id().as_u64(),
-                "Not sending QueueInitReset - QueueInit was never sent"
-            );
-            return Ok(());
-        }
-
-        // The completion channel records which sender socket transmitted the QueueInit.
-        // We must route QueueInitReset through the same socket so it reaches the same
-        // server-side recv::Context (which is keyed by sender ID).
-        let Some(sender_idx) = self.completion_rx.init_sender_idx() else {
-            // QueueInit is still queued and has not been transmitted by any sender socket.
-            // Cancel it so the server never sees this stream — no QueueInitReset needed.
-            debug!(
-                binding_id = self.control_rx.binding_id().as_u64(),
-                "QueueInit not yet transmitted - cancelling pending QueueInit instead of sending QueueInitReset"
-            );
-            self.completion_rx.cancel();
-            return Ok(());
-        };
-
-        // Include the actual attempt_id so the server can mark it as seen in its dedup
-        // window, preventing a late-arriving QueueInit duplicate from creating a new stream.
-        let Some(attempt_id) = self.completion_rx.init_attempt_id() else {
-            debug!(
-                binding_id = self.control_rx.binding_id().as_u64(),
-                ?sender_idx,
-                "QueueInit transmitted without attempt_id stamp - cancelling pending QueueInitReset"
-            );
-            self.completion_rx.cancel();
-            return Ok(());
-        };
-
-        let frame = Frame {
-            source_sender_id: sender_idx,
-            header: Header::QueueInitReset {
-                attempt_id,
-                binding_id: self.control_rx.binding_id(),
-                error_code,
-            },
-            payload: ByteVec::new(),
-            path_secret_entry: self.path_secret_entry.clone(),
-            completion: None,
-            status: frame::TransmissionStatus::default(),
-            ttl: DEFAULT_TTL,
-            transmission_time: None,
-        };
-
-        self.send_frame(frame)?;
-
-        debug!(
-            binding_id = self.control_rx.binding_id().as_u64(),
-            ?sender_idx,
-            attempt_id = attempt_id.as_u64(),
-            error_code = error_code.as_u64(),
-            "Sent QueueInitReset"
-        );
-
-        Ok(())
-    }
-
-    fn send_queue_init_fin_frame(&mut self) -> io::Result<()> {
-        // Only meaningful when the server already received our QueueInit.
-        if !self.status.is_init_sent() {
-            debug!(
-                binding_id = self.control_rx.binding_id().as_u64(),
-                "Not sending QueueInitFin - QueueInit was never sent"
-            );
-            return Ok(());
-        }
-
-        // The completion channel records which sender socket transmitted the QueueInit.
-        // We must route QueueInitFin through the same socket so it reaches the same
-        // server-side recv::Context (keyed by sender ID).
-        let Some(sender_idx) = self.completion_rx.init_sender_idx() else {
-            // QueueInit is still queued and has not been transmitted by any sender socket.
-            // Cancel it so the server never sees this stream — no QueueInitFin needed.
-            debug!(
-                binding_id = self.control_rx.binding_id().as_u64(),
-                "QueueInit not yet transmitted - cancelling pending QueueInit instead of sending QueueInitFin"
-            );
-            self.completion_rx.cancel();
-            self.status.on_send_fin().unwrap();
-            return Ok(());
-        };
-
-        let frame = Frame {
-            source_sender_id: sender_idx,
-            header: Header::QueueInitFin {
-                binding_id: self.control_rx.binding_id(),
-                offset: self.next_offset,
-            },
-            payload: ByteVec::new(),
-            path_secret_entry: self.path_secret_entry.clone(),
-            completion: Some(self.completion_rx.sender()),
-            status: frame::TransmissionStatus::default(),
-            ttl: DEFAULT_TTL,
-            transmission_time: None,
-        };
-
-        self.send_frame(frame)?;
-
-        debug!(
-            binding_id = self.control_rx.binding_id().as_u64(),
-            ?sender_idx,
-            offset = self.next_offset.as_u64(),
-            "Sent QueueInitFin"
-        );
-
-        self.status.on_send_fin().unwrap();
-
-        Ok(())
-    }
-
     fn send_fin_packet(&mut self) -> io::Result<()> {
-        if self.status.is_init() {
-            self.send_queue_data_init(&mut buffer::reader::storage::Empty, true)?;
-            return Ok(());
-        }
-
         let frame = Frame {
             source_sender_id: LocalSenderId::UNSPECIFIED,
             header: Header::QueueData {

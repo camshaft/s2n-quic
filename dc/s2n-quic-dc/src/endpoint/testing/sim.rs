@@ -29,11 +29,13 @@
 use crate::{
     acceptor,
     acceptor::channel as accept_channel,
-    flow,
-    path::secret::{map::TestPairIds, Map as PathSecretMap},
+    path::secret::{
+        map::{entry::QueueState, TestPairIds},
+        Map as PathSecretMap,
+    },
     socket::{pool::Pool, rate::Rate},
     stream::{
-        endpoint::{msg, setup_endpoint, Budgets, Config, Endpoint, WorkerLayout},
+        endpoint::{setup_endpoint, Budgets, Config, Endpoint, WorkerLayout},
         PendingValidation, Reader, Stream, Writer,
     },
 };
@@ -548,7 +550,6 @@ pub fn lookup_sim_map(addr: SocketAddr) -> Option<PathSecretMap> {
 
 async fn connect_stream<A>(
     endpoint: &Arc<Endpoint>,
-    queue_allocator: &mut msg::queue::Allocator,
     peer: A,
     acceptor_id: VarInt,
 ) -> io::Result<Stream>
@@ -568,7 +569,6 @@ where
         })?;
 
     if peer_addr.port() == 0 {
-        // If the peer didn't specify a port, use the default.
         peer_addr.set_port(SERVER_PORT);
     }
 
@@ -584,9 +584,28 @@ where
         ));
     }
 
-    // TODO: switch to ClientAllocator from Entry's QueueState
-    let _ = (path_secret_entry, acceptor_id, queue_allocator, endpoint);
-    todo!("wire sim connect to new queue module")
+    let QueueState::Client(client_state) = path_secret_entry.queue_state() else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "path secret entry has server queue state for client connect",
+        ));
+    };
+
+    let alloc = client_state.alloc().await.ok_or_else(|| {
+        io::Error::new(io::ErrorKind::ConnectionReset, "peer queue slots closed")
+    })?;
+
+    let frame_tx = endpoint.frame_tx.clone();
+    let writer = Writer::new_client(
+        frame_tx.clone(),
+        path_secret_entry.clone(),
+        alloc.dest_queue_id,
+        acceptor_id,
+        alloc.control,
+    );
+    let reader = Reader::new_client(frame_tx, path_secret_entry, alloc.dest_queue_id, alloc.stream);
+
+    Ok(Stream::new(reader, writer))
 }
 
 // ── Peer ───────────────────────────────────────────────────────────────────
@@ -603,7 +622,6 @@ where
 /// endpoint and its original bind address.
 pub struct Peer {
     endpoint: Arc<Endpoint>,
-    queue_allocator: msg::queue::Allocator,
 }
 
 impl Peer {
@@ -611,11 +629,7 @@ impl Peer {
     pub fn new() -> Self {
         let bind_addr = SocketAddr::new(std::net::Ipv4Addr::UNSPECIFIED.into(), SERVER_PORT);
         let endpoint = get_or_create_group_endpoint(bind_addr);
-        let queue_allocator = endpoint.queue_allocator.clone();
-        Self {
-            endpoint,
-            queue_allocator,
-        }
+        Self { endpoint }
     }
 
     /// Returns the first bound data address (for use as a connection target).
@@ -647,7 +661,7 @@ impl Peer {
     where
         A: bach::net::ToSocketAddrs,
     {
-        connect_stream(&self.endpoint, &mut self.queue_allocator, peer, acceptor_id).await
+        connect_stream(&self.endpoint, peer, acceptor_id).await
     }
 }
 
@@ -732,9 +746,6 @@ impl Default for Server {
 /// ```
 pub struct Client {
     endpoint: Arc<Endpoint>,
-    /// Cloned allocator so `connect` can call `alloc_or_grow(&mut self)` without
-    /// holding a mutable reference to the Arc-wrapped endpoint.
-    queue_allocator: msg::queue::Allocator,
 }
 
 impl Client {
@@ -745,11 +756,7 @@ impl Client {
     pub fn new() -> Self {
         let bind_addr = SocketAddr::new(std::net::Ipv4Addr::UNSPECIFIED.into(), 0);
         let endpoint = get_or_create_group_endpoint(bind_addr);
-        let queue_allocator = endpoint.queue_allocator.clone();
-        Self {
-            endpoint,
-            queue_allocator,
-        }
+        Self { endpoint }
     }
 
     /// Returns the first bound data address (for use as a connection target).
@@ -775,7 +782,7 @@ impl Client {
     where
         A: bach::net::ToSocketAddrs,
     {
-        connect_stream(&self.endpoint, &mut self.queue_allocator, peer, acceptor_id).await
+        connect_stream(&self.endpoint, peer, acceptor_id).await
     }
 }
 

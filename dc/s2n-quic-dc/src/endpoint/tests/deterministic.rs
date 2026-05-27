@@ -638,17 +638,16 @@ fn sim_init_uniqueness(actions: &PacketActions, n: usize) {
                             Err(_) => return,
                         };
 
-                        let id = stream.binding_id();
+                        let mut res: Vec<u8> = vec![];
+                        stream.read_into(&mut res).await.unwrap();
+
+                        let id = u64::from_be_bytes(res[..8].try_into().unwrap());
                         let first_time = seen_ids_sv.lock().unwrap().insert(id);
                         assert!(
                             first_time,
-                            "binding_id {id} was delivered to the server acceptor twice — \
+                            "stream id {id} was delivered to the server acceptor twice — \
                          init-protocol deduplication is broken"
                         );
-
-                        let mut res: Vec<u8> = vec![];
-                        stream.read_into(&mut res).await.unwrap();
-                        assert_eq!(res, &id.to_be_bytes());
 
                         stream
                             .write_all_from_fin(&mut &id.to_be_bytes()[..])

@@ -100,6 +100,56 @@ impl FreeList {
         VarInt::new(index as u64).ok()
     }
 
+    /// Poll for a queue ID allocation.
+    ///
+    /// Returns `Ready(Some(id))` if an ID is available, `Ready(None)` if closed,
+    /// or `Pending` if the caller must wait. The caller-owned `waiter` is registered
+    /// into the internal wait list on `Pending`.
+    pub fn poll_alloc(
+        &self,
+        waiter: &mut Option<Arc<Waiter>>,
+        cx: &mut Context,
+    ) -> Poll<Option<VarInt>> {
+        if let Some(id) = self.try_alloc_fresh() {
+            return Poll::Ready(Some(id));
+        }
+
+        let mut inner = self.inner.lock().unwrap();
+
+        if inner.closed {
+            return Poll::Ready(None);
+        }
+
+        if let Some(idx) = inner.freed.pop_first() {
+            return Poll::Ready(VarInt::new(idx as u64).ok());
+        }
+
+        let w = waiter.get_or_insert_with(Waiter::new);
+
+        // SAFETY: all links and waker access is under inner's Mutex
+        unsafe {
+            if w.links.is_linked() {
+                w.set_waker(cx.waker().clone());
+            } else {
+                w.set_waker(cx.waker().clone());
+                inner.waiters.push_back(Arc::clone(w));
+            }
+        }
+
+        Poll::Pending
+    }
+
+    /// Remove a waiter that was previously registered via `poll_alloc`.
+    pub fn cancel_waiter(&self, waiter: &mut Option<Arc<Waiter>>) {
+        if let Some(w) = waiter.take() {
+            let mut inner = self.inner.lock().unwrap();
+            // SAFETY: under the inner Mutex
+            unsafe {
+                inner.waiters.remove(&w);
+            }
+        }
+    }
+
     /// Returns a future that resolves to an allocated queue ID, or `None` if closed.
     ///
     /// The waiter node is allocated lazily on first `Pending` — the happy path

@@ -1291,7 +1291,7 @@ pub fn packet_dispatch<
     acceptor_registry: crate::acceptor::Registry<crate::stream::PendingValidation>,
     frame_tx: frame::SubmissionSender,
     mut ack_sender: AckSender,
-    queue_dispatcher: msg::queue::Dispatcher,
+    freed_batch_tx: crate::queue::FreedBatchTx,
     counters: Arc<endpoint::counters::Dispatch>,
     clock: Clk,
     route: Route,
@@ -1309,8 +1309,6 @@ where
     Route: endpoint::routing::SenderRoute,
 {
     let rx = Map::new(packet_rx, {
-        let mut response_tx = frame_tx.clone();
-        let mut queue_dispatcher = queue_dispatcher;
         let counters = counters.clone();
         let mut acceptor_local = acceptor_registry.local();
 
@@ -1324,9 +1322,8 @@ where
                 &path_secret_map,
                 &mut acceptor_local,
                 &frame_tx,
-                &mut response_tx,
                 &mut ack_sender,
-                &mut queue_dispatcher,
+                &freed_batch_tx,
                 &clock,
                 &counters,
                 &route,

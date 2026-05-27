@@ -12,19 +12,16 @@
 //! with early data.
 
 use crate::{
-    flow, psk,
+    path::secret::map::entry::QueueState,
+    psk,
     stream::{
-        endpoint::{msg, Endpoint},
+        endpoint::Endpoint,
         Reader, Stream, Writer,
     },
 };
 use s2n_quic::server::Name;
 use s2n_quic_core::varint::VarInt;
-use std::{
-    io,
-    net::SocketAddr,
-    sync::{atomic::Ordering, Arc},
-};
+use std::{io, net::SocketAddr, sync::Arc};
 
 pub mod rpc;
 
@@ -73,7 +70,6 @@ pub struct Client {
     endpoint: Arc<Endpoint>,
     psk: psk::client::Provider,
     server_name: Name,
-    queue_allocator: msg::queue::Allocator,
 }
 
 impl Client {
@@ -91,12 +87,10 @@ impl Client {
             *psk.map(),
             "PSK provider map must be the same instance as the endpoint map"
         );
-        let queue_allocator = endpoint.queue_allocator.clone();
         Self {
             endpoint,
             psk,
             server_name,
-            queue_allocator,
         }
     }
 
@@ -136,9 +130,33 @@ impl Client {
             ));
         }
 
-        // TODO: switch to ClientAllocator from Entry's QueueState
-        let _ = (path_secret_entry, acceptor_id);
-        todo!("wire client to new queue module")
+        let QueueState::Client(client_state) = path_secret_entry.queue_state() else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "path secret entry has server queue state for client connect",
+            ));
+        };
+
+        let alloc = client_state.alloc().await.ok_or_else(|| {
+            io::Error::new(io::ErrorKind::ConnectionReset, "peer queue slots closed")
+        })?;
+
+        let frame_tx = self.endpoint.frame_tx.clone();
+        let writer = Writer::new_client(
+            frame_tx.clone(),
+            path_secret_entry.clone(),
+            alloc.dest_queue_id,
+            acceptor_id,
+            alloc.control,
+        );
+        let reader = Reader::new_client(
+            frame_tx,
+            path_secret_entry,
+            alloc.dest_queue_id,
+            alloc.stream,
+        );
+
+        Ok(Stream::new(reader, writer))
     }
 
     /// Performs a single-round-trip RPC: sends `request` and collects `response`.

@@ -403,6 +403,7 @@ where
     // Shared flow-queue allocator and dispatch counters -------------------------
     let queue_allocator = msg::queue::Allocator::new_with_registry(&counter_registry);
     let queue_dispatcher = queue_allocator.dispatcher();
+    let (freed_batch_tx, _freed_batch_rx) = crate::queue::freed_batch_channel();
     let counters = counters::Dispatch::new(&counter_registry);
 
     // Per-send-worker batch channels -----------------------------------------------
@@ -641,7 +642,7 @@ where
             ack_sender: ack_sender.clone(),
             ack_completion_rx,
             recv_dispatch_idx: recv_dispatch_id,
-            queue_dispatcher: queue_dispatcher.clone(),
+            freed_batch_tx: freed_batch_tx.clone(),
             counters: counters.clone(),
             clock: clock.clone(),
             route: ack_route,
@@ -774,7 +775,7 @@ struct RecvDispatchParts<Clk, AckSnd, Route> {
     ack_completion_rx: sync_queue::Receiver<msg::Sender>,
     /// Index into the AckCompletionSender's staging array (0..num_recv_dispatch).
     recv_dispatch_idx: RecvDispatchWorkerId,
-    queue_dispatcher: msg::queue::Dispatcher,
+    freed_batch_tx: crate::queue::FreedBatchTx,
     counters: Arc<counters::Dispatch>,
     clock: Clk,
     route: Route,
@@ -1021,7 +1022,7 @@ where
                     rd.acceptor_registry,
                     rd.frame_tx,
                     rd.ack_sender.clone(),
-                    rd.queue_dispatcher,
+                    rd.freed_batch_tx,
                     rd.counters.clone(),
                     rd.clock,
                     rd.route,
