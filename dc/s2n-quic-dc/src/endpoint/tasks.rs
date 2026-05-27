@@ -934,12 +934,16 @@ where
     R: Receiver<Entry<Frame>>,
 {
     Map::new(cancelled_rx, move |entry: Entry<Frame>| {
-        use crate::endpoint::frame::Header;
-        use crate::path::secret::map::entry::QueueState;
-        use crate::queue::freed::RetryEntry;
+        use crate::{
+            endpoint::frame::Header, path::secret::map::entry::QueueState, queue::freed::RetryEntry,
+        };
 
         let frame = entry.into_inner();
-        if let Header::QueueFree { free_request_id, largest_queue_id } = frame.header {
+        if let Header::QueueFree {
+            free_request_id,
+            largest_queue_id,
+        } = frame.header
+        {
             if let QueueState::Server(ref state) = *frame.path_secret_entry.queue_state() {
                 let path_entry = frame.path_secret_entry.clone();
                 let retry = RetryEntry {
@@ -947,7 +951,9 @@ where
                     largest_queue_id,
                     payload: frame.payload,
                 };
-                state.freed.push_retry(retry, &path_entry, &mut freed_batch_tx);
+                state
+                    .freed
+                    .push_retry(retry, &path_entry, &mut freed_batch_tx);
             }
         }
     })

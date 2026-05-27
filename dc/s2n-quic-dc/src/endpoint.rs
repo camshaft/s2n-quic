@@ -792,7 +792,9 @@ struct BackgroundParts<UpsSocket> {
     peer_dead_rx: sync_queue::Receiver<tasks::PeerDead>,
     peer_dead_queue_gauge: crate::counter::QueueGauge,
     freed_batch_rx: crate::queue::FreedBatchRx,
-    ack_sender: routing::AckSender<GaugedSender<sync_queue::Sender<msg::Sender>, crate::intrusive::Entry<msg::Sender>>>,
+    ack_sender: routing::AckSender<
+        GaugedSender<sync_queue::Sender<msg::Sender>, crate::intrusive::Entry<msg::Sender>>,
+    >,
     path_secret_map: crate::path::secret::Map,
     send_txs: IdMap<id::SendWorkerId, InvalidationSender>,
     recv_txs: IdMap<id::RecvDispatchWorkerId, InvalidationSender>,
@@ -1163,11 +1165,8 @@ where
                         .receiver("task.peer_dead_broadcast")
                         .with_function("endpoint::Worker::spawn"),
                 );
-                let rx = tasks::peer_dead_broadcast(
-                    peer_dead_rx,
-                    bg.waker_sink,
-                    peer_dead_counters,
-                );
+                let rx =
+                    tasks::peer_dead_broadcast(peer_dead_rx, bg.waker_sink, peer_dead_counters);
                 let task_counter = counter_registry
                     .register_nominal_task("task.peer_dead_broadcast", "background")
                     .with_registration_metadata(
@@ -1204,7 +1203,9 @@ where
                 // Freed-batch LB routing: pick socket via sender_load_score, forward
                 // to the target send worker's ack channel.
                 {
-                    use crate::socket::channel::{Receiver as _, ReceiverExt as _, UnboundedSender as _};
+                    use crate::socket::channel::{
+                        Receiver as _, ReceiverExt as _, UnboundedSender as _,
+                    };
                     let mut ack_sender = bg.ack_sender;
                     let socket_count = total_sender_ids;
                     let mut rng = crate::xorshift::Rng::new();
@@ -1226,7 +1227,11 @@ where
                                 };
                                 let s1 = path_entry.sender_load_score(idx1);
                                 let s2 = path_entry.sender_load_score(idx2);
-                                if s1 <= s2 { idx1 } else { idx2 }
+                                if s1 <= s2 {
+                                    idx1
+                                } else {
+                                    idx2
+                                }
                             };
 
                             // Set the chosen sender and forward

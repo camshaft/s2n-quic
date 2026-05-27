@@ -190,10 +190,7 @@ impl Slot {
     /// Skips unallocated slots and halves without a receiver.  Does NOT clear
     /// `HAS_SENDER` — this is a transient notification (peer-dead cooldown),
     /// not a permanent close.
-    pub(crate) fn broadcast_reset(
-        &self,
-        error_code: VarInt,
-    ) -> (half::AutoWake, half::AutoWake) {
+    pub(crate) fn broadcast_reset(&self, error_code: VarInt) -> (half::AutoWake, half::AutoWake) {
         let mut s = self.stream.inner.lock();
         let mut c = self.control.inner.lock();
 

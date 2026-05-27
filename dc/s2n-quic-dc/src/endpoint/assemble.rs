@@ -646,12 +646,8 @@ fn assemble_queue_free(
     };
 
     // Estimate available payload budget
-    let overhead_estimate = metadata.estimate_packet_len(
-        source_sender_id,
-        source_control_port,
-        credentials,
-        tag_len,
-    );
+    let overhead_estimate =
+        metadata.estimate_packet_len(source_sender_id, source_control_port, credentials, tag_len);
     let header_cost = header.encoding_size();
     let payload_budget = max_segment_len.saturating_sub(overhead_estimate + header_cost + 4);
 

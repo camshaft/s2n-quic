@@ -48,8 +48,7 @@ fn make_pair() -> (Reader, Pusher) {
         .endpoint_type(endpoint::Type::Client)
         .build();
 
-    let client_state =
-        std::sync::Arc::new(crate::queue::ClientState::new(VarInt::from_u16(100)));
+    let client_state = std::sync::Arc::new(crate::queue::ClientState::new(VarInt::from_u16(100)));
     let dest_queue_id = client_state.peer_free.try_alloc().unwrap();
     let alloc = client_state.alloc_local(dest_queue_id).unwrap();
     let dispatcher = crate::queue::ClientDispatch::new(client_state);

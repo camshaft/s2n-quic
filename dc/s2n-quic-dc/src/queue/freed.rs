@@ -23,11 +23,8 @@
 //!    is cleared and the next `record` call will submit the token again.
 
 use crate::{
-    byte_vec::ByteVec,
-    endpoint::id::LocalSenderId,
-    intrusive,
-    path::secret::map::Entry as PathSecretEntry,
-    socket::channel::UnboundedSender,
+    byte_vec::ByteVec, endpoint::id::LocalSenderId, intrusive,
+    path::secret::map::Entry as PathSecretEntry, socket::channel::UnboundedSender,
     stream::endpoint::msg,
 };
 use s2n_quic_core::{interval_set::IntervalSet, varint::VarInt};
@@ -134,11 +131,7 @@ impl FreedInner {
 
     /// After encoding: if more IDs accumulated or retry frames exist, resubmit
     /// the entry to the freed channel; otherwise clear `in_flight` and drop the entry.
-    pub fn check_and_resubmit(
-        &self,
-        entry: intrusive::Entry<msg::Sender>,
-        tx: &mut FreedBatchTx,
-    ) {
+    pub fn check_and_resubmit(&self, entry: intrusive::Entry<msg::Sender>, tx: &mut FreedBatchTx) {
         let mut state = self.state.lock().unwrap();
         if state.freed.is_empty() && state.retry_queue.is_empty() {
             state.in_flight = false;
@@ -255,7 +248,13 @@ mod tests {
                 freed.record(VarInt::from_u8(7), &path_entry, &mut tx);
 
                 // Only one token submitted despite three records
-                let entry = crate::socket::channel::Receiver::<intrusive::Entry<msg::Sender>>::recv(&mut rx, &mut budget).await.unwrap();
+                let entry =
+                    crate::socket::channel::Receiver::<intrusive::Entry<msg::Sender>>::recv(
+                        &mut rx,
+                        &mut budget,
+                    )
+                    .await
+                    .unwrap();
 
                 // take() drains all accumulated IDs
                 let mut dest = IntervalSet::new();
@@ -270,7 +269,13 @@ mod tests {
 
                 // New record submits a fresh token
                 freed.record(VarInt::from_u8(8), &path_entry, &mut tx);
-                let entry = crate::socket::channel::Receiver::<intrusive::Entry<msg::Sender>>::recv(&mut rx, &mut budget).await.unwrap();
+                let entry =
+                    crate::socket::channel::Receiver::<intrusive::Entry<msg::Sender>>::recv(
+                        &mut rx,
+                        &mut budget,
+                    )
+                    .await
+                    .unwrap();
 
                 let mut dest = IntervalSet::new();
                 let request_id = freed.take(&mut dest).unwrap();
@@ -293,7 +298,13 @@ mod tests {
                 let mut budget = Budget::new(usize::MAX);
 
                 freed.record(VarInt::from_u8(1), &path_entry, &mut tx);
-                let entry = crate::socket::channel::Receiver::<intrusive::Entry<msg::Sender>>::recv(&mut rx, &mut budget).await.unwrap();
+                let entry =
+                    crate::socket::channel::Receiver::<intrusive::Entry<msg::Sender>>::recv(
+                        &mut rx,
+                        &mut budget,
+                    )
+                    .await
+                    .unwrap();
 
                 let mut dest = IntervalSet::new();
                 freed.take(&mut dest);
@@ -305,7 +316,13 @@ mod tests {
                 freed.check_and_resubmit(entry, &mut tx);
 
                 // Token reappears
-                let entry = crate::socket::channel::Receiver::<intrusive::Entry<msg::Sender>>::recv(&mut rx, &mut budget).await.unwrap();
+                let entry =
+                    crate::socket::channel::Receiver::<intrusive::Entry<msg::Sender>>::recv(
+                        &mut rx,
+                        &mut budget,
+                    )
+                    .await
+                    .unwrap();
                 dest.clear();
                 let id = freed.take(&mut dest).unwrap();
                 assert!(dest.contains(&VarInt::from_u8(2)));
@@ -328,7 +345,13 @@ mod tests {
 
                 freed.record(VarInt::from_u8(10), &path_entry, &mut tx);
                 freed.record(VarInt::from_u8(20), &path_entry, &mut tx);
-                let entry = crate::socket::channel::Receiver::<intrusive::Entry<msg::Sender>>::recv(&mut rx, &mut budget).await.unwrap();
+                let entry =
+                    crate::socket::channel::Receiver::<intrusive::Entry<msg::Sender>>::recv(
+                        &mut rx,
+                        &mut budget,
+                    )
+                    .await
+                    .unwrap();
 
                 let mut dest = IntervalSet::new();
                 freed.take(&mut dest);
@@ -366,7 +389,13 @@ mod tests {
                 let mut budget = Budget::new(usize::MAX);
 
                 freed.record(VarInt::from_u8(1), &path_entry, &mut tx);
-                let entry = crate::socket::channel::Receiver::<intrusive::Entry<msg::Sender>>::recv(&mut rx, &mut budget).await.unwrap();
+                let entry =
+                    crate::socket::channel::Receiver::<intrusive::Entry<msg::Sender>>::recv(
+                        &mut rx,
+                        &mut budget,
+                    )
+                    .await
+                    .unwrap();
 
                 // Simulate peer-dead: clear in_flight, drop the entry
                 freed.clear_in_flight();
@@ -374,7 +403,13 @@ mod tests {
 
                 // New record can submit again
                 freed.record(VarInt::from_u8(2), &path_entry, &mut tx);
-                let entry = crate::socket::channel::Receiver::<intrusive::Entry<msg::Sender>>::recv(&mut rx, &mut budget).await.unwrap();
+                let entry =
+                    crate::socket::channel::Receiver::<intrusive::Entry<msg::Sender>>::recv(
+                        &mut rx,
+                        &mut budget,
+                    )
+                    .await
+                    .unwrap();
 
                 let mut dest = IntervalSet::new();
                 let id = freed.take(&mut dest).unwrap();
@@ -398,7 +433,13 @@ mod tests {
                 let mut budget = Budget::new(usize::MAX);
 
                 freed.record(VarInt::from_u8(1), &path_entry, &mut tx);
-                let entry = crate::socket::channel::Receiver::<intrusive::Entry<msg::Sender>>::recv(&mut rx, &mut budget).await.unwrap();
+                let entry =
+                    crate::socket::channel::Receiver::<intrusive::Entry<msg::Sender>>::recv(
+                        &mut rx,
+                        &mut budget,
+                    )
+                    .await
+                    .unwrap();
 
                 let mut dest = IntervalSet::new();
                 freed.take(&mut dest);
