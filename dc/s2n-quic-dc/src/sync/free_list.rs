@@ -29,6 +29,19 @@ use std::{
     task::{Context, Poll, Waker},
 };
 
+#[derive(Clone, Copy, Debug)]
+pub struct FreeResult {
+    pub slots: usize,
+    pub ranges: usize,
+}
+
+impl FreeResult {
+    const DUPLICATE: Self = Self {
+        slots: 0,
+        ranges: 0,
+    };
+}
+
 #[derive(Debug)]
 pub struct FreeList {
     high_water_mark: AtomicU64,
@@ -171,9 +184,11 @@ impl FreeList {
     pub fn free(
         &self,
         free_request_id: VarInt,
-        queue_ids: &IntervalSet<VarInt>,
+        queue_ids: impl Iterator<
+            Item = Result<core::ops::RangeInclusive<VarInt>, s2n_codec::DecoderError>,
+        >,
         waker_sink: &mut impl FnMut(Waker),
-    ) -> bool {
+    ) -> FreeResult {
         let mut inner = self.inner.lock().unwrap();
 
         let newly_inserted = inner
@@ -181,11 +196,15 @@ impl FreeList {
             .insert_value(free_request_id)
             .unwrap_or(false);
         if !newly_inserted {
-            return false;
+            return FreeResult::DUPLICATE;
         }
 
-        let mut freed_count: usize = 0;
-        for range in queue_ids.inclusive_ranges() {
+        let mut slots = 0usize;
+        let mut ranges = 0usize;
+        for range in queue_ids {
+            let Ok(range) = range else {
+                break;
+            };
             let start_u64 = range.start().as_u64();
             let end_u64 = range.end().as_u64();
 
@@ -201,12 +220,13 @@ impl FreeList {
                 inner.freed.grow(needed);
             }
             inner.freed.insert_range(start, end);
-            freed_count += (end - start + 1) as usize;
+            slots += (end - start + 1) as usize;
+            ranges += 1;
         }
 
         // Wake at most as many waiters as IDs we just freed
         let mut woken = 0;
-        while woken < freed_count {
+        while woken < slots {
             let Some(waiter_arc) = inner.waiters.pop_front() else {
                 break;
             };
@@ -216,7 +236,7 @@ impl FreeList {
                 woken += 1;
             }
         }
-        true
+        FreeResult { slots, ranges }
     }
 
     pub fn close(&self, waker_sink: &mut impl FnMut(Waker)) {
@@ -294,7 +314,13 @@ impl Drop for AllocFuture {
 impl FreeList {
     #[cfg(test)]
     fn free_for_test(&self, free_request_id: VarInt, queue_ids: &IntervalSet<VarInt>) -> bool {
-        self.free(free_request_id, queue_ids, &mut |w| w.wake())
+        self.free(
+            free_request_id,
+            queue_ids.inclusive_ranges().map(Ok),
+            &mut |w| w.wake(),
+        )
+        .slots
+            > 0
     }
 }
 

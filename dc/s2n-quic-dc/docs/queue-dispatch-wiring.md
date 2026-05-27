@@ -1,99 +1,131 @@
-# Remaining work: dispatch and client wiring
+# Queue dispatch wiring — status and remaining work
 
-The Writer and Reader now use the new queue module types (`ControlReceiver`,
-`StreamReceiver`) and send QueueData-init frames instead of QueueInit. The
-three `todo!()` sites block the endpoint-level tests from passing. This doc
-describes what each site needs to become.
+## Completed
 
-## 1. Client connect (`stream/client.rs`)
+### Client connect (`stream/client.rs`)
 
-Currently `todo!("wire client to new queue module")`.
+Wired. The client gets `Arc<ClientState>` from the Entry's `QueueState::Client`
+variant, calls `client_state.alloc().await` to get an `AllocResult { stream,
+control, local_queue_id, dest_queue_id, binding_id }`, then passes those to
+`Writer::new_client` and `Reader::new_client`.
 
-The client needs to:
+### Server dispatch (`endpoint/dispatch.rs`)
 
-1. Get `Arc<ClientState>` from the Entry's `QueueState::Client` variant.
-2. Create a `ClientAllocator` (or reuse one cached on the Client struct).
-3. Call `allocator.try_alloc()` to get `AllocResult { stream, control,
-   local_queue_id, dest_queue_id, binding_id }`.
-4. Pass `control` + `dest_queue_id` to `Writer::new_client`.
-5. Pass `stream` + `dest_queue_id` to `Reader::new_client`.
-   (For the reader, `dest_queue_id` is the peer's source_queue_id — i.e. the
-   slot the peer will use to send control frames back to us. This is the same
-   `local_queue_id` from the alloc result since the client allocated both sides.)
+Wired. When a QueueData-init frame arrives (dest_acceptor_id is Some):
 
-Open question: `try_alloc` is non-blocking and returns `None` if the peer's
-free list is exhausted. The old code used `alloc_or_grow` which always
-succeeds by growing the pool. We may need an async `alloc` path that waits for
-a QueueFree from the server — or just grow locally for now (the peer free list
-starts at `max_queues` capacity and won't exhaust until QueueFree is needed).
+1. Checks `acceptor_registry.get(acceptor_id)` first — if not found, calls
+   `server_view.record_freed()` to enqueue the queue_id for QueueFree emission,
+   sends a reset with `ACCEPTOR_NOT_FOUND`, and returns early (no bind, no
+   Writer/Reader allocation).
+2. Binds via `server_view.bind_and_send_stream(...)`.
+3. On `NewBinding`: creates Writer/Reader, wraps in PendingValidation, sends
+   directly to the pre-looked-up `acceptor_sender` (avoiding double lookup).
+4. On `Bound`: wakes and continues.
 
-Actually — the peer free list starts with `max_queues` worth of fresh IDs via
-`try_alloc_fresh`, so it won't return None until all slots are in use. For the
-initial wiring this is fine.
+### Sim connect (`endpoint/testing/sim.rs`)
 
-## 2. Server dispatch (`endpoint/dispatch.rs`)
+Wired. Same pattern as the real client. The fast-path now checks
+`QueueState::Client` before returning — in bidirectional P2P scenarios the
+address map can contain a Server entry from the peer's prior connection to us.
 
-Currently `todo!("wire dispatch to new queue module")` inside the
-`create_stream` closure in `handle_queue_init`.
+### recv::Context changes
 
-When a QueueData-init frame arrives (dest_acceptor_id is Some), the dispatch
-needs to:
+Done. `QueueView` enum has `as_server_mut()` and `as_client_mut()` accessors.
+`ServerView` is stored per-context and has `record_freed()` for direct freed-ID
+submission without binding.
 
-1. Get `Arc<ServerState>` from the peer's `recv::Context` (which gets it from
-   the Entry's `QueueState::Server` variant).
-2. Get or create a `ServerView` on the recv::Context (cached for the lifetime
-   of the context).
-3. Call `server_view.bind_and_send_stream(queue_id, binding_id, entry,
-   &path_entry, &endpoint_tx)`.
-4. On `BindResult::NewBinding { stream, control, .. }`:
-   - Create `Writer::new_server(frame_tx, path_entry, source_queue_id,
-     acceptor_id, control)`
-   - Create `Reader::new_server(frame_tx, path_entry, source_queue_id,
-     stream, peer_fin)`
-   - Wrap in `Stream::new(reader, writer)` → `PendingValidation::new(stream)`
-   - Dispatch to the acceptor registry
-5. On `BindResult::Bound(waker)`: the frame was already pushed to an existing
-   stream — just wake and continue.
+### QueueFree frame type (`endpoint/frame.rs`)
 
-The `source_queue_id` for the server's Writer/Reader `dest_queue_id` param is
-the client's `queue_pair.source_queue_id` from the incoming frame — that's
-the slot the client is listening on for control/data responses.
+Added. `Header::QueueFree { free_request_id, largest_queue_id }` with:
+- Priority level 0 (highest — transmitted before all other frame types)
+- Wire tag 23
+- `has_payload_length() = true` (payload carries range-encoded freed queue_ids)
+- Full encode/decode support
+- Per-frame-type counters (tx, probe, acked, rx)
 
-The old `handle_queue_init` function also handles:
-- AttemptDedup (can be removed once QueueInit is gone — binding_id on the
-  slot handles dedup)
-- flow::Tracker (maps binding_id → queue_id — replaced by ServerView's
-  bind_and_push_stream which does this atomically)
-- QueueValidateRequest/QueueInitValidate handshake (removed — no longer needed)
+### Range codec (`endpoint/range_codec.rs`)
 
-For the initial wiring, the existing `handle_queue_init` path can remain for
-backward compat with old clients. A new `handle_queue_data_init` branch handles
-QueueData frames where `dest_acceptor_id.is_some()`.
+New module. Zero-allocation ACK-style range encoder/decoder for VarInt range
+sets. Used by QueueFree (and eventually ACK frames — TODO).
 
-## 3. Sim connect (`endpoint/testing/sim.rs`)
+- `encode(largest, ranges_descending, buffer)` — encodes directly into an Encoder
+- `RangeDecoder::new(largest, payload)` — lazy iterator yielding
+  `Result<RangeInclusive<VarInt>, DecoderError>`
 
-Currently `todo!("wire sim connect to new queue module")`.
+### QueueFree receive path (`endpoint/dispatch.rs`)
 
-Same pattern as the client: get `ClientState` from the Entry, allocate, pass
-results to Writer/Reader constructors. The sim's connect function just needs
-the same 5 lines as the real client.
+Wired. `handle_queue_free` decodes the payload lazily via `RangeDecoder`, passes
+the iterator to `ClientDispatch::free()`, which calls `FreeList::free()`. Wakers
+from unblocked alloc futures are forwarded through `waker_sink`. Emits
+`rx.queue_free.slots` and `rx.queue_free.ranges` distribution counters.
 
-## 4. recv::Context changes
+### PTO invariant fix (`endpoint/send.rs`)
 
-The `recv::Context` needs:
-- A `ServerView` field (created from the Entry's `ServerState` on first use)
-- Access to `FreedBatchTx` (the endpoint-level channel for freed-batch
-  emission) — passed in at Context creation or stored on the Context
+`invariants()` now returns early when `self.invalidated` is true. An invalidated
+context is dead — its PTO/inflight consistency is irrelevant since the idle wheel
+already drained it.
 
-## 5. What can be removed after wiring (follow-up PR)
+### Acceptor reset (`endpoint/dispatch.rs`)
 
-Once the dispatch is wired and all tests pass:
-- `handle_queue_init` function (old path)
+Generic `send_reset()` helper sends a QueueReset frame directly from dispatch.
+Used in the acceptor-not-found path. Takes `&mut SubmissionSender` (all callers
+updated to pass `&mut`).
+
+### acceptor::LocalRegistry improvements (`acceptor.rs`)
+
+Added `get(&mut self, acceptor_id) -> Option<&mut Sender<T>>` for checking
+acceptor existence before doing expensive work. The caller can then call
+`sender.send(item)` directly, avoiding a second lookup through
+`LocalRegistry::send()`.
+
+---
+
+## Remaining work
+
+### QueueFree emission task
+
+The `freed_batch_rx` channel receiver at `endpoint.rs:405` is created but
+dropped immediately (`_freed_batch_rx`). A background task needs to:
+
+1. Receive `FreedBatch` tokens from `freed_batch_rx`.
+2. At encoding time (as late as possible), call `batch.take(&mut interval_set)`
+   to snapshot all accumulated queue_ids.
+3. Encode using `range_codec::encode(largest, ranges_descending, buffer)` into
+   a `ByteVec` payload.
+4. Submit a `Frame { header: Header::QueueFree { free_request_id, largest_queue_id }, payload, ... }` to `frame_tx`.
+5. After transmission, call `batch.check_and_resubmit(&freed_batch_tx)` — if
+   more IDs accumulated while encoding/transmitting, the token requeues itself.
+
+This is what blocks the `init_uniqueness_all_duplicated` test (currently capped
+at 65535 streams = u16::MAX because freed IDs never reach the client).
+
+### Peer-dead broadcast wiring
+
+The `peer_dead_broadcast` task uses `msg::queue::Dispatcher` (the old
+`flow::queue::Dispatch`) to send resets to stream/control channels. The new
+Writer/Reader listen on `queue::StreamReceiver` / `ControlReceiver` slots
+instead. The broadcast needs to target the new slot-based channels.
+
+This blocks `peer_dead_cooldown_blocks_new_connects` and
+`total_packet_loss_surfaces_read_timeout` (the PTO assertion is fixed, but
+idle-timeout resets never reach the reader).
+
+### Cleanup (follow-up PR)
+
+Once all tests pass, remove:
+- `handle_queue_init` function (old path) and the three `todo!()` arms
 - `AttemptDedup` struct and all references
 - `flow::Tracker` and `flow::Handle`
 - `QueueInit`, `QueueInitReset`, `QueueInitFin`, `QueueValidateRequest`,
   `QueueInitValidate` frame variants
-- `PendingValidation` reader state
+- `PendingValidation` reader status variant
 - `msg::queue::Allocator` / `msg::queue::Dispatcher` type aliases
 - The old `flow::queue` module
 - `Endpoint.queue_allocator` and `Endpoint.next_binding_id`
+
+### Range codec consolidation (nice-to-have)
+
+Replace the `recv/ack_ranges.rs` ACK encoding (which uses `frame::Ack` from
+s2n-quic-core) with `range_codec::encode`. Saves a few bytes per ACK frame by
+dropping the redundant `ack_delay` field from the body (it's already in our
+`Header::Ack`).

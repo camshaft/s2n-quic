@@ -14,10 +14,7 @@
 use crate::{
     path::secret::map::entry::QueueState,
     psk,
-    stream::{
-        endpoint::Endpoint,
-        Reader, Stream, Writer,
-    },
+    stream::{endpoint::Endpoint, Reader, Stream, Writer},
 };
 use s2n_quic::server::Name;
 use s2n_quic_core::varint::VarInt;

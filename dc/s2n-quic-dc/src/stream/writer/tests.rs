@@ -11,10 +11,7 @@
 
 use super::*;
 use crate::{
-    endpoint::{
-        frame::{self, Frame, Header, PriorityStorage, SubmissionReceiver},
-        id::Id,
-    },
+    endpoint::frame::{self, Frame, Header, PriorityStorage, SubmissionReceiver},
     intrusive,
     packet::datagram::ResetTarget,
     path::secret::map::Entry as PathSecretEntry,
@@ -61,7 +58,6 @@ impl PairBuilder {
 
     fn build(self) -> (Writer, Pusher) {
         let acceptor_id = VarInt::from_u8(7);
-        let dest_queue_id = VarInt::from_u8(99);
         let peer: SocketAddr = "127.0.0.1:4433".parse().unwrap();
         let path_secret_entry = PathSecretEntry::builder(peer)
             .endpoint_type(self.ep_type)

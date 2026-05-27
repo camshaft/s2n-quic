@@ -70,7 +70,6 @@ impl PairBuilder {
     }
 
     fn build(self) -> (Reader, Pusher) {
-        let dest_queue_id = VarInt::from_u8(99);
         let peer: SocketAddr = "127.0.0.1:4433".parse().unwrap();
         let path_secret_entry = PathSecretEntry::builder(peer)
             .endpoint_type(self.ep_type)

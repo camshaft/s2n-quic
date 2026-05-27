@@ -446,7 +446,15 @@ pub fn connect(
                 .get_by_id(&client_id)
                 .expect("self-connect Client entry must exist when get_raw succeeds");
         }
-        return entry;
+        // In bidirectional P2P scenarios, the address map may contain a Server entry
+        // (created when the peer previously connected to us). Only use the fast path
+        // if the entry has Client queue state.
+        if matches!(
+            entry.queue_state(),
+            crate::path::secret::map::entry::QueueState::Client(_)
+        ) {
+            return entry;
+        }
     }
 
     // Look up the peer's map from the registry.
@@ -591,9 +599,10 @@ where
         ));
     };
 
-    let alloc = client_state.alloc().await.ok_or_else(|| {
-        io::Error::new(io::ErrorKind::ConnectionReset, "peer queue slots closed")
-    })?;
+    let alloc = client_state
+        .alloc()
+        .await
+        .ok_or_else(|| io::Error::new(io::ErrorKind::ConnectionReset, "peer queue slots closed"))?;
 
     let frame_tx = endpoint.frame_tx.clone();
     let writer = Writer::new_client(
@@ -603,7 +612,12 @@ where
         acceptor_id,
         alloc.control,
     );
-    let reader = Reader::new_client(frame_tx, path_secret_entry, alloc.dest_queue_id, alloc.stream);
+    let reader = Reader::new_client(
+        frame_tx,
+        path_secret_entry,
+        alloc.dest_queue_id,
+        alloc.stream,
+    );
 
     Ok(Stream::new(reader, writer))
 }

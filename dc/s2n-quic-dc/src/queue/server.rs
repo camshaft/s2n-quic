@@ -97,6 +97,21 @@ pub struct ServerView {
 }
 
 impl ServerView {
+    /// Record a queue_id as freed without binding it.
+    ///
+    /// Used when the server rejects an init (e.g. acceptor not found) and needs
+    /// to signal the client to reclaim the peer-side slot via QueueFree.
+    pub fn record_freed(
+        &self,
+        queue_id: VarInt,
+        path_entry: &Arc<PathSecretEntry>,
+        endpoint_tx: &FreedBatchTx,
+    ) {
+        self.state
+            .freed
+            .record(queue_id, &self.state, path_entry, endpoint_tx);
+    }
+
     /// Attempt to bind a slot and push the first stream entry.
     pub fn bind_and_send_stream(
         &mut self,

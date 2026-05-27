@@ -58,6 +58,13 @@ impl QueueView {
             Self::Client(_) => None,
         }
     }
+
+    pub fn as_client_mut(&mut self) -> Option<&mut queue::ClientDispatch> {
+        match self {
+            Self::Client(d) => Some(d),
+            Self::Server(_) => None,
+        }
+    }
 }
 
 /// Errors returned by [`Cache::get_or_insert`].

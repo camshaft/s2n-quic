@@ -30,7 +30,7 @@ use std::{
         atomic::{AtomicU64, Ordering},
         Arc, Mutex,
     },
-    task::{Context, Poll},
+    task::{Context, Poll, Waker},
 };
 
 // ── ClientFreeList ───────────────────────────────────────────────────────────
@@ -183,9 +183,7 @@ impl Future for ClientAllocFuture {
     fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
         let this = self.get_mut();
         match this.state.peer_free.poll_alloc(&mut this.waiter, cx) {
-            Poll::Ready(Some(dest_queue_id)) => {
-                Poll::Ready(this.state.alloc_local(dest_queue_id))
-            }
+            Poll::Ready(Some(dest_queue_id)) => Poll::Ready(this.state.alloc_local(dest_queue_id)),
             Poll::Ready(None) => Poll::Ready(None),
             Poll::Pending => Poll::Pending,
         }
@@ -243,6 +241,20 @@ impl ClientDispatch {
             return Err(Error::Unallocated(entry));
         };
         slot.push_control(binding_id, entry)
+    }
+
+    /// Process a received QueueFree frame, returning freed queue_ids to the peer_free list.
+    pub fn free(
+        &self,
+        free_request_id: VarInt,
+        queue_ids: impl Iterator<
+            Item = Result<core::ops::RangeInclusive<VarInt>, s2n_codec::DecoderError>,
+        >,
+        waker_sink: &mut impl FnMut(Waker),
+    ) -> crate::sync::free_list::FreeResult {
+        self.state
+            .peer_free
+            .free(free_request_id, queue_ids, waker_sink)
     }
 
     /// Broadcast-close all currently allocated slots.
