@@ -481,7 +481,7 @@ pub fn send_worker<Socket, Clk, WakerSink, AckComp>(
             .with_function("endpoint::tasks::send_worker");
 
         let rx = GaugedReceiver::new(cancelled_rx, cancelled_receiver);
-        let rx = cancelled_drain(rx);
+        let rx = cancelled_drain(rx, freed_batch_tx.clone());
         let task_counter = counter_registry
             .register_nominal_task("task.cancelled", &variant)
             .with_registration_metadata(
@@ -920,12 +920,37 @@ where
     })
 }
 
-/// Builds a receiver that drops cancelled frames (frames whose writer has been dropped).
-pub fn cancelled_drain<R>(cancelled_rx: R) -> impl Receiver<()>
+/// Builds a receiver that handles cancelled frames.
+///
+/// Most cancelled frames are simply dropped (writer was dropped). QueueFree frames
+/// are pushed onto FreedInner's retry queue so they can be retransmitted when the
+/// peer recovers from cooldown — the original encoding and request_id are preserved
+/// to allow client-side deduplication.
+pub fn cancelled_drain<R>(
+    cancelled_rx: R,
+    mut freed_batch_tx: crate::queue::FreedBatchTx,
+) -> impl Receiver<()>
 where
     R: Receiver<Entry<Frame>>,
 {
-    Map::new(cancelled_rx, |_entry: Entry<Frame>| {})
+    Map::new(cancelled_rx, move |entry: Entry<Frame>| {
+        use crate::endpoint::frame::Header;
+        use crate::path::secret::map::entry::QueueState;
+        use crate::queue::freed::RetryEntry;
+
+        let frame = entry.into_inner();
+        if let Header::QueueFree { free_request_id, largest_queue_id } = frame.header {
+            if let QueueState::Server(ref state) = *frame.path_secret_entry.queue_state() {
+                let path_entry = frame.path_secret_entry.clone();
+                let retry = RetryEntry {
+                    free_request_id,
+                    largest_queue_id,
+                    payload: frame.payload,
+                };
+                state.freed.push_retry(retry, &path_entry, &mut freed_batch_tx);
+            }
+        }
+    })
 }
 
 /// Drains the send TX wheel and routes each expired context to its socket assembler queue.

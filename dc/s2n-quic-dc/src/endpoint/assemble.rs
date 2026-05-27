@@ -213,6 +213,19 @@ where
 
             // Phase 1b: QueueFree emission (after ACKs, before PTO).
             // Bypasses CWND. Stays in inflight map for retransmission on loss.
+            drain_queue_free_retries(
+                context,
+                source_sender_id,
+                source_control_port,
+                &mut metadata,
+                max_segment_len,
+                &mut is_ack_eliciting,
+                &mut packet_frames,
+                freed_batch_tx,
+                counters,
+            );
+
+            // Then encode fresh ranges (if pending_freed token is present).
             if let Some(freed_entry) = context.pending_freed.take() {
                 if let Some(frame) = assemble_queue_free(
                     &freed_entry,
@@ -529,6 +542,69 @@ enum ProbeResult {
 
 /// Try to assemble a PTO probe from the oldest inflight packet(s).
 ///
+/// Drain retry entries from FreedInner's retry queue into the packet.
+///
+/// These are previously-transmitted QueueFree frames that were cancelled when a
+/// send context was invalidated (peer-dead). They retain their original request_id
+/// and encoding so the client deduplicates on retransmission.
+fn drain_queue_free_retries(
+    context: &mut Context,
+    source_sender_id: LocalSenderId,
+    source_control_port: u16,
+    metadata: &mut MetadataEstimate,
+    max_segment_len: usize,
+    is_ack_eliciting: &mut bool,
+    packet_frames: &mut Queue<Frame>,
+    freed_batch_tx: &mut crate::queue::FreedBatchTx,
+    counters: &AssemblerCounters,
+) {
+    let crate::path::secret::map::entry::QueueState::Server(ref server_state) =
+        *context.path_secret_entry.queue_state()
+    else {
+        return;
+    };
+
+    while let Some(retry) = server_state.freed.pop_retry() {
+        let header = frame::Header::QueueFree {
+            free_request_id: retry.free_request_id,
+            largest_queue_id: retry.largest_queue_id,
+        };
+        let next_metadata = metadata.with_frame_parts(&header, retry.payload.len());
+        let estimated_len = next_metadata.estimate_packet_len(
+            source_sender_id,
+            source_control_port,
+            &context.credentials,
+            seal::Application::tag_len(&context.sealer),
+        );
+        if estimated_len > max_segment_len {
+            server_state.freed.push_retry(
+                crate::queue::freed::RetryEntry {
+                    free_request_id: retry.free_request_id,
+                    largest_queue_id: retry.largest_queue_id,
+                    payload: retry.payload,
+                },
+                &context.path_secret_entry,
+                freed_batch_tx,
+            );
+            break;
+        }
+        let frame = Frame {
+            header,
+            source_sender_id,
+            payload: retry.payload,
+            path_secret_entry: context.path_secret_entry.clone(),
+            completion: None,
+            status: Default::default(),
+            ttl: frame::DEFAULT_TTL,
+            transmission_time: None,
+        };
+        *is_ack_eliciting = true;
+        *metadata = next_metadata;
+        counters.on_tx_frame(&frame.header);
+        packet_frames.push_back(frame.into());
+    }
+}
+
 /// Encode a QueueFree frame from the pending freed token.
 ///
 /// Drains accumulated freed IDs from FreedInner, encodes them with a byte budget,

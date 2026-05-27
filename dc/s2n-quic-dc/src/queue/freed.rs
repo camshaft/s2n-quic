@@ -23,6 +23,7 @@
 //!    is cleared and the next `record` call will submit the token again.
 
 use crate::{
+    byte_vec::ByteVec,
     endpoint::id::LocalSenderId,
     intrusive,
     path::secret::map::Entry as PathSecretEntry,
@@ -30,7 +31,10 @@ use crate::{
     stream::endpoint::msg,
 };
 use s2n_quic_core::{interval_set::IntervalSet, varint::VarInt};
-use std::sync::{Arc, Mutex};
+use std::{
+    collections::VecDeque,
+    sync::{Arc, Mutex},
+};
 
 // TODO: replace with direct AckSender submission (client-side LB) once the
 // &mut/gauge ownership story is resolved. For now we use an intermediate
@@ -48,10 +52,24 @@ pub struct FreedInner {
     state: Mutex<FreedState>,
 }
 
+/// A previously-transmitted QueueFree frame awaiting retransmission.
+///
+/// Stored without the `Arc<PathSecretEntry>` to avoid reference cycles.
+/// The assembler reconstructs the full `Frame` using the context's own path_secret_entry.
+pub struct RetryEntry {
+    pub free_request_id: VarInt,
+    pub largest_queue_id: VarInt,
+    pub payload: ByteVec,
+}
+
 struct FreedState {
     freed: IntervalSet<VarInt>,
     next_request_id: VarInt,
     in_flight: bool,
+    /// QueueFree frames that were in-flight when the send context was invalidated.
+    /// The assembler drains this first, retransmitting with the original request_id
+    /// and encoding so the client deduplicates via seen_requests.
+    retry_queue: VecDeque<RetryEntry>,
 }
 
 impl FreedInner {
@@ -61,6 +79,7 @@ impl FreedInner {
                 freed: IntervalSet::new(),
                 next_request_id: VarInt::from_u8(0),
                 in_flight: false,
+                retry_queue: VecDeque::new(),
             }),
         }
     }
@@ -113,15 +132,15 @@ impl FreedInner {
         remainder.clear();
     }
 
-    /// After encoding: if more IDs accumulated, resubmit the entry to the freed
-    /// channel; otherwise clear `in_flight` and drop the entry.
+    /// After encoding: if more IDs accumulated or retry frames exist, resubmit
+    /// the entry to the freed channel; otherwise clear `in_flight` and drop the entry.
     pub fn check_and_resubmit(
         &self,
         entry: intrusive::Entry<msg::Sender>,
         tx: &mut FreedBatchTx,
     ) {
         let mut state = self.state.lock().unwrap();
-        if state.freed.is_empty() {
+        if state.freed.is_empty() && state.retry_queue.is_empty() {
             state.in_flight = false;
         } else {
             drop(state);
@@ -136,6 +155,51 @@ impl FreedInner {
     /// (e.g., AckProcessor can't create context, or context is invalidated).
     pub fn clear_in_flight(&self) {
         self.state.lock().unwrap().in_flight = false;
+    }
+
+    /// Push a previously-transmitted QueueFree frame onto the retry queue.
+    ///
+    /// Called from cancelled_drain when peer-dead invalidates a send context.
+    /// The entry retains its original encoding and request_id so the client
+    /// deduplicates on retransmission.
+    ///
+    /// If no token is currently in-flight, submits one to trigger assembly.
+    pub fn push_retry(
+        &self,
+        entry: RetryEntry,
+        path_entry: &Arc<PathSecretEntry>,
+        endpoint_tx: &mut FreedBatchTx,
+    ) {
+        let mut state = self.state.lock().unwrap();
+        state.retry_queue.push_back(entry);
+
+        if state.in_flight {
+            return;
+        }
+
+        state.in_flight = true;
+        drop(state);
+
+        let token = intrusive::Entry::new(msg::Sender::PendingFreed {
+            path_secret_entry: path_entry.clone(),
+            local_sender_id: LocalSenderId::UNSPECIFIED,
+        });
+
+        if endpoint_tx.send(token).is_err() {
+            self.state.lock().unwrap().in_flight = false;
+        }
+    }
+
+    /// Pop the next retry entry, if any. Called by the assembler before
+    /// encoding fresh ranges.
+    pub fn pop_retry(&self) -> Option<RetryEntry> {
+        self.state.lock().unwrap().retry_queue.pop_front()
+    }
+
+    /// Returns true if there are retry frames or pending freed IDs.
+    pub fn has_pending_work(&self) -> bool {
+        let state = self.state.lock().unwrap();
+        !state.retry_queue.is_empty() || !state.freed.is_empty()
     }
 }
 
