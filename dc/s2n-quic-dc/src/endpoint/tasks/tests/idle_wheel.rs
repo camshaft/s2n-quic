@@ -541,7 +541,7 @@ fn recv_idle_wheel_expires_reader_only_queue_no_reset() {
 fn send_idle_wheel_defers_death_for_recent_inflight() {
     let _guard = crate::testing::without_snapshots();
     sim(|| {
-        let (send_caches, mut idle_wheel_tx, _completed_rx, clock, _registry, _queue_allocator) =
+        let (send_caches, mut idle_wheel_tx, _completed_rx, clock, _registry) =
             setup_send();
 
         let pse = test_entry();

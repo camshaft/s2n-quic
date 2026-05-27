@@ -17,7 +17,7 @@
 // TODO: consolidate ACK frame encoding to use this module instead of the
 // s2n-quic-core frame::Ack encoder, saving a few bytes per ACK frame.
 
-use s2n_codec::{DecoderBuffer, DecoderError, Encoder};
+use s2n_codec::{DecoderBuffer, DecoderError, Encoder, EncoderValue};
 use s2n_quic_core::varint::VarInt;
 
 /// Encode freed queue_id ranges directly into an encoder. Zero allocations.
@@ -47,6 +47,61 @@ pub fn encode<E: Encoder>(
 
         prev_smallest = Some(start);
     }
+}
+
+/// Encode ranges with a byte budget. Stops when the next range would exceed `budget`.
+///
+/// Returns the number of ranges successfully encoded. Unconsumed ranges remain
+/// in the iterator (uses peek to avoid consuming a range that doesn't fit).
+///
+/// `largest` is the max queue_id (goes in frame header).
+/// `ranges` must yield ranges in DESCENDING order (largest first).
+#[inline]
+pub fn encode_partial<E: Encoder>(
+    largest: VarInt,
+    ranges: &mut core::iter::Peekable<impl Iterator<Item = core::ops::RangeInclusive<VarInt>>>,
+    buffer: &mut E,
+    budget: usize,
+) -> usize {
+    let mut prev_smallest: Option<VarInt> = None;
+    let mut bytes_written: usize = 0;
+    let mut count: usize = 0;
+
+    while let Some(range) = ranges.peek() {
+        let (start, end) = (*range.start(), *range.end());
+
+        let cost = if prev_smallest.is_none() {
+            let first_range = largest - start;
+            first_range.encoding_size()
+        } else {
+            let gap = prev_smallest.unwrap() - end - VarInt::from_u8(2);
+            let range_len = end - start;
+            gap.encoding_size() + range_len.encoding_size()
+        };
+
+        if bytes_written + cost > budget {
+            break;
+        }
+
+        // Consume the range now that we know it fits
+        let _ = ranges.next();
+
+        if prev_smallest.is_none() {
+            let first_range = largest - start;
+            buffer.encode(&first_range);
+        } else {
+            let gap = prev_smallest.unwrap() - end - VarInt::from_u8(2);
+            let range_len = end - start;
+            buffer.encode(&gap);
+            buffer.encode(&range_len);
+        }
+
+        bytes_written += cost;
+        prev_smallest = Some(start);
+        count += 1;
+    }
+
+    count
 }
 
 /// Lazy decoder: iterates over ranges without allocating.
