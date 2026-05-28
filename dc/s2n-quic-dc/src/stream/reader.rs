@@ -797,7 +797,7 @@ impl Inner {
 
                 // Snapshot current time once for all sojourn measurements in
                 // this completion batch.
-                let completed_at = self.sojourn.as_ref().map(|_| self.clock.now());
+                let completed_at = self.sojourn.as_ref().map(|_sojourn| self.clock.now());
 
                 for completed in queue.iter() {
                     // Record sojourn time if we have metrics and an enqueue stamp.

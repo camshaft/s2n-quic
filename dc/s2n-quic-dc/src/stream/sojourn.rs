@@ -21,9 +21,9 @@ use crate::{
 
 /// Per-outcome sojourn time distributions for application frames.
 ///
-/// Each variant records the nanosecond duration from frame creation to final
-/// disposition.  The underlying [`Summary`] expects nanosecond input and
-/// formats output as microseconds.
+/// Durations are recorded in nanoseconds via [`Summary::record_value`], which
+/// [`Unit::Microsecond`] then converts to microseconds at display time.  Each
+/// field corresponds to one final disposition of a frame.
 #[derive(Clone)]
 pub struct SojournMetrics {
     /// Frame acknowledged by the peer.
