@@ -625,6 +625,7 @@ where
         .unzip();
 
     let ack_route = RecvRoute::new(num_send);
+    let stream_clock = crate::time::DefaultClock::default();
     let reader_metrics = Arc::new(crate::stream::sojourn::ReaderMetrics::new(
         &counter_registry,
         "stream.reader",
@@ -633,7 +634,6 @@ where
         &counter_registry,
         "stream.writer",
     ));
-    let stream_clock = crate::time::DefaultClock::default();
     for (recv_dispatch_id, dispatch_rx, ack_completion_rx, invalidation_rx, waker_sink) in (
         dispatch_rxs,
         ack_completion_rxs,
