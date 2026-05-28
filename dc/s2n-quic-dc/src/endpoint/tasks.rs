@@ -233,6 +233,9 @@ pub fn send_worker<Socket, Clk, WakerSink, AckComp>(
     dead_peer_cooldown: core::time::Duration,
     budgets: Budgets,
     counter_registry: counter::Registry,
+    stream_clock: crate::time::DefaultClock,
+    reader_metrics: Arc<crate::stream::metrics::ReaderMetrics>,
+    writer_metrics: Arc<crate::stream::metrics::WriterMetrics>,
 ) where
     Socket: crate::socket::send::Socket + 'static,
     Clk: precision::Clock + s2n_quic_core::time::Clock + Clone + 'static,
@@ -458,7 +461,7 @@ pub fn send_worker<Socket, Clk, WakerSink, AckComp>(
             .with_function("endpoint::tasks::send_worker");
 
         let rx = GaugedReceiver::new(completed_rx, completion_receiver);
-        let rx = completion_dispatcher(rx, waker_sink.clone());
+        let rx = completion_dispatcher(rx, waker_sink.clone(), stream_clock, reader_metrics, writer_metrics);
         let task_counter = counter_registry
             .register_nominal_task("task.completion", &variant)
             .with_registration_metadata(
@@ -909,12 +912,15 @@ where
 pub fn completion_dispatcher<R, WakerSink>(
     completed_rx: R,
     mut waker_sink: WakerSink,
+    stream_clock: crate::time::DefaultClock,
+    reader_metrics: Arc<crate::stream::metrics::ReaderMetrics>,
+    writer_metrics: Arc<crate::stream::metrics::WriterMetrics>,
 ) -> impl Receiver<()>
 where
     R: Receiver<Entry<Frame>>,
     WakerSink: UnboundedSender<crate::queue::AutoWake>,
 {
-    let rx = CompletionDispatcher::new(completed_rx);
+    let rx = CompletionDispatcher::new(completed_rx, stream_clock, reader_metrics, writer_metrics);
     Map::new(rx, move |waker: crate::queue::AutoWake| {
         let _ = waker_sink.send(waker);
     })

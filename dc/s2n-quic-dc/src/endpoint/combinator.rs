@@ -831,16 +831,27 @@ where
 pub(crate) struct CompletionDispatcher<R> {
     inner: R,
     batch: Queue<Frame>,
+    clock: crate::time::DefaultClock,
+    reader_metrics: Arc<crate::stream::metrics::ReaderMetrics>,
+    writer_metrics: Arc<crate::stream::metrics::WriterMetrics>,
 }
 
 impl<R> CompletionDispatcher<R>
 where
     R: Receiver<Entry<Frame>>,
 {
-    pub fn new(inner: R) -> Self {
+    pub fn new(
+        inner: R,
+        clock: crate::time::DefaultClock,
+        reader_metrics: Arc<crate::stream::metrics::ReaderMetrics>,
+        writer_metrics: Arc<crate::stream::metrics::WriterMetrics>,
+    ) -> Self {
         Self {
             inner,
             batch: Queue::new(),
+            clock,
+            reader_metrics,
+            writer_metrics,
         }
     }
 
@@ -924,6 +935,18 @@ where
             };
 
             if !Self::should_notify(&frame) {
+                // Record ack sojourn for frames silently dropped by FailuresOnly channels
+                // (i.e. frames whose sender only subscribes to failures, not acks).
+                if matches!(frame.status, frame::TransmissionStatus::Acknowledged) {
+                    if let Some(enqueued_at) = frame.enqueued_at {
+                        let completed_at = self.clock.now();
+                        let sojourn = match &frame.header {
+                            frame::Header::QueueMaxData { .. } => &self.reader_metrics.sojourn,
+                            _ => &self.writer_metrics.sojourn,
+                        };
+                        sojourn.record(enqueued_at, completed_at, None);
+                    }
+                }
                 continue;
             }
 

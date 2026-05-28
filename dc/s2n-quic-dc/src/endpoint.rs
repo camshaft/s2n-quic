@@ -578,6 +578,15 @@ where
     let ack_completions_tx = routing::AckCompletionSender::new(ack_completion_txs);
 
     // Assign per-send-worker batch/ack receivers.
+    let stream_clock = crate::time::DefaultClock::default();
+    let reader_metrics = Arc::new(crate::stream::metrics::ReaderMetrics::new(
+        &counter_registry,
+        "stream.reader",
+    ));
+    let writer_metrics = Arc::new(crate::stream::metrics::WriterMetrics::new(
+        &counter_registry,
+        "stream.writer",
+    ));
     for (send_worker_id, batch_rx, ack_rx, invalidation_rx, waker_sink) in (
         worker_batch_rxs,
         worker_ack_rxs,
@@ -602,6 +611,9 @@ where
             waker_sink,
             invalidation_rx,
             peer_dead_tx: peer_dead_tx.clone(),
+            stream_clock: stream_clock.clone(),
+            reader_metrics: reader_metrics.clone(),
+            writer_metrics: writer_metrics.clone(),
         });
     }
 
@@ -625,15 +637,6 @@ where
         .unzip();
 
     let ack_route = RecvRoute::new(num_send);
-    let stream_clock = crate::time::DefaultClock::default();
-    let reader_metrics = Arc::new(crate::stream::metrics::ReaderMetrics::new(
-        &counter_registry,
-        "stream.reader",
-    ));
-    let writer_metrics = Arc::new(crate::stream::metrics::WriterMetrics::new(
-        &counter_registry,
-        "stream.writer",
-    ));
     for (recv_dispatch_id, dispatch_rx, ack_completion_rx, invalidation_rx, waker_sink) in (
         dispatch_rxs,
         ack_completion_rxs,
@@ -757,6 +760,9 @@ struct SendWorkerParts {
     waker_sink: waker::Sink,
     invalidation_rx: sync_queue::Receiver<tasks::Invalidation>,
     peer_dead_tx: PeerDeadSender,
+    stream_clock: crate::time::DefaultClock,
+    reader_metrics: Arc<crate::stream::metrics::ReaderMetrics>,
+    writer_metrics: Arc<crate::stream::metrics::WriterMetrics>,
 }
 
 /// Per-socket ingredients for the socket send task.
@@ -964,6 +970,9 @@ where
                     dead_peer_cooldown,
                     budgets,
                     counter_registry.clone(),
+                    sw.stream_clock,
+                    sw.reader_metrics,
+                    sw.writer_metrics,
                 );
             }
 
