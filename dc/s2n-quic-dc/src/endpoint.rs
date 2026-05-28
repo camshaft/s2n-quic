@@ -674,18 +674,20 @@ where
     // Create one recycling channel per recv_io worker.
     // The sender is downgraded to Weak (stored in each descriptor's Header).
     // The receiver drains into a local pool created inside spawn_local.
+    type RecyclePair = (
+        crate::socket::channel::intrusive::sync::AdapterSender<descriptor::RecycleAdapter>,
+        crate::socket::channel::intrusive::sync::AdapterReceiver<descriptor::RecycleAdapter>,
+    );
     let mut recycle_weak_per_worker: Vec<Option<descriptor::WeakRecycleSender>> =
         (0..workers.len()).map(|_| None).collect();
-    let mut recycle_rx_per_worker: Vec<Option<crate::socket::channel::intrusive::sync::AdapterReceiver<descriptor::RecycleAdapter>>> =
+    let mut recycle_pair_per_worker: Vec<Option<RecyclePair>> =
         (0..workers.len()).map(|_| None).collect();
     for &worker_id in &layout.recv_io {
         let (tx, rx) = crate::socket::channel::intrusive::sync::new_with_adapter::<descriptor::RecycleAdapter>();
         let weak = tx.downgrade();
-        // The receiver holds a strong Arc ref, keeping the channel alive.
-        // Descriptors hold Weak refs; upgrade succeeds while receiver is alive.
-        drop(tx);
         recycle_weak_per_worker[worker_id] = Some(weak);
-        recycle_rx_per_worker[worker_id] = Some(rx);
+        // Keep the strong sender alive so Weak::upgrade() succeeds in drop_filled.
+        recycle_pair_per_worker[worker_id] = Some((tx, rx));
     }
 
     // Distribute recv sockets across recv_io workers round-robin.
@@ -713,8 +715,8 @@ where
 
     // Assign recycle drain receivers to their workers.
     for &worker_id in &layout.recv_io {
-        if let Some(rx) = recycle_rx_per_worker[worker_id].take() {
-            workers[worker_id].recycle_drain = Some(rx);
+        if let Some(pair) = recycle_pair_per_worker[worker_id].take() {
+            workers[worker_id].recycle_drain = Some(pair);
         }
     }
 
@@ -892,7 +894,11 @@ struct Worker<SendSocket, RecvSocket, UpsSocket, Clk, AckSnd, Route, Inv> {
     /// Recv dispatch: decrypt + dedup + frame routing (at most one per worker).
     recv_dispatch: Option<RecvDispatchParts<Clk, AckSnd, Route>>,
     /// Recycle drain: moves recycled descriptors from sync channel to local pool.
-    recycle_drain: Option<crate::socket::channel::intrusive::sync::AdapterReceiver<descriptor::RecycleAdapter>>,
+    /// The sender is kept alive so that Weak::upgrade() succeeds on descriptor drop.
+    recycle_drain: Option<(
+        crate::socket::channel::intrusive::sync::AdapterSender<descriptor::RecycleAdapter>,
+        crate::socket::channel::intrusive::sync::AdapterReceiver<descriptor::RecycleAdapter>,
+    )>,
     /// Waker drain task assigned to this worker.
     waker_drain: Option<waker::Drain>,
     /// Background worker parts (invalidation validation).
@@ -1017,7 +1023,11 @@ where
             ));
 
             // Spawn the recycle drain task if this worker has one.
-            if let Some(recycle_rx) = recycle_drain {
+            // The sender is kept alive in `_recycle_sender` so Weak::upgrade()
+            // succeeds when descriptors are dropped on dispatch workers.
+            let _recycle_sender;
+            if let Some((tx, recycle_rx)) = recycle_drain {
+                _recycle_sender = Some(tx);
                 let rx = tasks::recycle_drain(recycle_rx, local_recycle_pool.clone());
                 let task_counter = counter_registry
                     .register_task("task.recycle_drain")

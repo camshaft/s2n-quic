@@ -26,6 +26,11 @@ use std::{
 /// If upgrade fails (channel gone), the descriptor is deallocated normally.
 pub type WeakRecycleSender = Weak<AdapterShared<RecycleAdapter>>;
 
+// Debug counters for recycling diagnostics (remove after validation)
+pub static RECYCLE_SUCCESS: AtomicUsize = AtomicUsize::new(0);
+pub static RECYCLE_UPGRADE_FAIL: AtomicUsize = AtomicUsize::new(0);
+pub static RECYCLE_NO_RECYCLER: AtomicUsize = AtomicUsize::new(0);
+
 /// Intrusive adapter that allows `Descriptor` to participate directly in
 /// intrusive lists/queues without any wrapper allocation.
 pub struct RecycleAdapter;
@@ -181,11 +186,15 @@ impl Descriptor {
         if let Some(weak) = &inner.recycler {
             if let Some(shared) = weak.upgrade() {
                 trace!(recycle_desc = ?self.ptr, state = %"filled");
+                RECYCLE_SUCCESS.fetch_add(1, Ordering::Relaxed);
                 inner.references.store(1, Ordering::Relaxed);
                 let desc = Descriptor { ptr: self.ptr };
                 shared.push(desc);
                 return;
             }
+            RECYCLE_UPGRADE_FAIL.fetch_add(1, Ordering::Relaxed);
+        } else {
+            RECYCLE_NO_RECYCLER.fetch_add(1, Ordering::Relaxed);
         }
 
         trace!(free_desc = ?self.ptr, state = %"filled");
