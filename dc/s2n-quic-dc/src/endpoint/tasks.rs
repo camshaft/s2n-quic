@@ -1307,7 +1307,7 @@ pub async fn recv_idle_wheel_drain<Clk>(
 pub fn socket_recv<Socket, R>(
     socket: Socket,
     pool: crate::socket::pool::Pool,
-    local_pool: Rc<RefCell<descriptor::RecyclePool>>,
+    local_pool: Rc<RefCell<crate::intrusive::List<descriptor::RecycleAdapter>>>,
     recycle_weak: descriptor::WeakRecycleSender,
     router: R,
 ) -> impl Receiver<()>
@@ -1333,7 +1333,7 @@ where
 /// succeeds on descriptor drop. The sender lives as long as this task runs.
 pub fn recycle_drain(
     sync_rx: crate::socket::channel::intrusive::sync::AdapterReceiver<descriptor::RecycleAdapter>,
-    local_pool: Rc<RefCell<descriptor::RecyclePool>>,
+    local_pool: Rc<RefCell<crate::intrusive::List<descriptor::RecycleAdapter>>>,
     _sender_keepalive: crate::socket::channel::intrusive::sync::AdapterSender<descriptor::RecycleAdapter>,
 ) -> impl Receiver<()> {
     Map::new(sync_rx, move |mut batch: crate::intrusive::List<descriptor::RecycleAdapter>| {

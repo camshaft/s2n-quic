@@ -27,46 +27,41 @@ use std::{
 pub type WeakRecycleSender = Weak<AdapterShared<RecycleAdapter>>;
 
 
-/// Local pool of recycled descriptors with proper cleanup on drop.
+/// A descriptor in the recycling pipeline. Deallocates on drop.
 ///
-/// When this pool is dropped, all remaining descriptors are deallocated
-/// to prevent memory leaks.
-pub struct RecyclePool {
-    list: intrusive::List<RecycleAdapter>,
-}
+/// This wrapper ensures that if a recycling queue or list is dropped
+/// (e.g. on shutdown), the underlying allocation is properly freed.
+/// To reuse a recycled descriptor, call [`into_descriptor`](Self::into_descriptor).
+pub struct Recycled(Descriptor);
 
-impl RecyclePool {
-    pub fn new() -> Self {
-        Self {
-            list: intrusive::List::new(),
-        }
-    }
-
-    pub fn pop_back(&mut self) -> Option<Descriptor> {
-        self.list.pop_back()
-    }
-
-    pub fn append(&mut self, other: &mut intrusive::List<RecycleAdapter>) {
-        self.list.append(other);
+impl Recycled {
+    pub fn into_descriptor(self) -> Descriptor {
+        let desc = Descriptor { ptr: self.0.ptr };
+        core::mem::forget(self);
+        desc
     }
 }
 
-impl Drop for RecyclePool {
+impl Drop for Recycled {
     fn drop(&mut self) {
-        while let Some(desc) = self.list.pop_front() {
-            unsafe { desc.dealloc() };
-        }
+        unsafe { self.0.dealloc() };
     }
 }
 
-/// Intrusive adapter that allows `Descriptor` to participate directly in
-/// intrusive lists/queues without any wrapper allocation.
+unsafe impl Send for Recycled {}
+unsafe impl Sync for Recycled {}
+
+/// Intrusive adapter for recycled descriptors.
+///
+/// Uses `Recycled` as the pointer type so that dropping any `List<RecycleAdapter>`
+/// (in the sync channel, local pool, etc.) properly deallocates all remaining
+/// descriptors.
 pub struct RecycleAdapter;
 
 impl intrusive::Adapter for RecycleAdapter {
     type Value = Header;
     type Target = Header;
-    type Pointer = Descriptor;
+    type Pointer = Recycled;
 
     unsafe fn links(value: *mut Self::Value) -> *mut Links {
         core::ptr::addr_of_mut!((*value).links)
@@ -77,17 +72,19 @@ impl intrusive::Adapter for RecycleAdapter {
     }
 
     fn as_ptr(ptr: &Self::Pointer) -> *const Self::Value {
-        ptr.ptr.as_ptr()
+        ptr.0.ptr.as_ptr()
     }
 
     fn into_raw(ptr: Self::Pointer) -> *mut Self::Value {
-        ptr.ptr.as_ptr()
+        let raw = ptr.0.ptr.as_ptr();
+        core::mem::forget(ptr);
+        raw
     }
 
     unsafe fn from_raw(ptr: *mut Self::Value) -> Self::Pointer {
-        Descriptor {
+        Recycled(Descriptor {
             ptr: NonNull::new_unchecked(ptr),
-        }
+        })
     }
 }
 
@@ -214,15 +211,14 @@ impl Descriptor {
         if let Some(weak) = &inner.recycler {
             if let Some(shared) = weak.upgrade() {
                 inner.references.store(1, Ordering::Relaxed);
-                let desc = Descriptor { ptr: self.ptr };
-                match shared.push(desc) {
+                let recycled = Recycled(Descriptor { ptr: self.ptr });
+                match shared.push(recycled) {
                     Ok(()) => {
                         trace!(recycle_desc = ?self.ptr, state = %"filled");
                         return;
                     }
-                    Err(desc) => {
-                        // Channel closed — dealloc the returned descriptor
-                        desc.dealloc();
+                    Err(_recycled) => {
+                        // Channel closed — Recycled::drop will dealloc
                         return;
                     }
                 }
@@ -415,13 +411,14 @@ impl Drop for Unfilled {
                 if let Some(weak) = &inner.recycler {
                     if let Some(shared) = weak.upgrade() {
                         inner.references.store(1, Ordering::Relaxed);
-                        match shared.push(desc) {
+                        let recycled = Recycled(desc);
+                        match shared.push(recycled) {
                             Ok(()) => {
-                                trace!(recycle_desc = ?self as *const _, state = %"unfilled");
+                                trace!(recycle = %"unfilled");
                                 return;
                             }
-                            Err(desc) => {
-                                desc.dealloc();
+                            Err(_recycled) => {
+                                // Channel closed — Recycled::drop will dealloc
                                 return;
                             }
                         }

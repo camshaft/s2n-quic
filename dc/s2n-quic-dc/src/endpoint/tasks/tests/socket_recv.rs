@@ -21,7 +21,7 @@ use bach::net::UdpSocket;
 use std::{cell::Cell, rc::Rc};
 
 fn test_recycler() -> (
-    Rc<std::cell::RefCell<crate::socket::pool::descriptor::RecyclePool>>,
+    Rc<std::cell::RefCell<crate::intrusive::List<RecycleAdapter>>>,
     crate::socket::pool::descriptor::WeakRecycleSender,
     // Keep sender alive so Weak::upgrade succeeds
     crate::socket::channel::intrusive::sync::AdapterSender<RecycleAdapter>,
@@ -29,7 +29,7 @@ fn test_recycler() -> (
     let (tx, _rx) = sync::new_with_adapter::<RecycleAdapter>();
     let weak = tx.downgrade();
     let local_pool = Rc::new(std::cell::RefCell::new(
-        crate::socket::pool::descriptor::RecyclePool::new(),
+        crate::intrusive::List::<RecycleAdapter>::new(),
     ));
     (local_pool, weak, tx)
 }
@@ -169,6 +169,67 @@ fn closed_router_shuts_down_task() {
             rx.drain_budgeted(Some(32)).await;
         }
         .group("receiver")
+        .primary()
+        .spawn();
+    });
+}
+
+/// Descriptors are recycled back into the local pool after being dropped by the router,
+/// and are reused for subsequent allocations without hitting the allocator.
+#[test]
+fn descriptors_are_recycled_and_reused() {
+    sim(|| {
+        let segments = Rc::new(Cell::new(0));
+
+        async move {
+            let recv_socket = UdpSocket::bind("0.0.0.0:9000").await.unwrap();
+            let pool = Pool::new(1200);
+            let router = CountingRouter {
+                segments: segments.clone(),
+                expected: 3,
+            };
+            let (tx, rx) = sync::new_with_adapter::<RecycleAdapter>();
+            let weak = tx.downgrade();
+            let local_pool = Rc::new(std::cell::RefCell::new(
+                crate::intrusive::List::<RecycleAdapter>::new(),
+            ));
+
+            // Spawn the drain task to move descriptors from sync → local pool
+            let drain_rx = tasks::recycle_drain(rx, local_pool.clone(), tx);
+            crate::testing::ext::SpawnExt::spawn(
+                drain_rx.drain_budgeted(Some(32)),
+            );
+
+            let recv_rx = tasks::socket_recv(
+                recv_socket,
+                pool,
+                local_pool.clone(),
+                weak,
+                router,
+            );
+            recv_rx.drain_budgeted(Some(64)).await;
+
+            assert_eq!(segments.get(), 3);
+            // Yield to allow the drain task to poll the sync channel
+            bach::time::sleep(core::time::Duration::from_millis(1)).await;
+            // After processing 3 packets, descriptors should be in the local pool
+            let pool_size = local_pool.borrow().len();
+            assert!(
+                pool_size > 0,
+                "local recycle pool should have recycled descriptors, got {pool_size}"
+            );
+        }
+        .group("receiver")
+        .primary()
+        .spawn();
+
+        async move {
+            let sender = UdpSocket::bind("0.0.0.0:0").await.unwrap();
+            sender.send_to(b"packet1", "receiver:9000").await.unwrap();
+            sender.send_to(b"packet2", "receiver:9000").await.unwrap();
+            sender.send_to(b"packet3", "receiver:9000").await.unwrap();
+        }
+        .group("sender")
         .primary()
         .spawn();
     });

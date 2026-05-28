@@ -1012,7 +1012,7 @@ where
             // Create the local recycled-descriptor pool (Rc, single-threaded).
             // Shared by all recv sockets on this worker and the drain task.
             let local_recycle_pool = std::rc::Rc::new(std::cell::RefCell::new(
-                descriptor::RecyclePool::new(),
+                crate::intrusive::List::<descriptor::RecycleAdapter>::new(),
             ));
 
             // Spawn the recycle drain task if this worker has one.
