@@ -10,7 +10,7 @@ use crate::{
         frame::SubmissionSender,
         id::{
             Id, IdJoin, IdMap, LocalRecvSocketId, LocalSendSocketId, LocalSenderId,
-            RecvDispatchWorkerId, SendWorkerId,
+            RecvDispatchWorkerId, RecvIoWorkerId, SendWorkerId,
         },
     },
     intrusive::Entry,
@@ -678,46 +678,39 @@ where
         crate::socket::channel::intrusive::sync::AdapterSender<descriptor::RecycleAdapter>,
         crate::socket::channel::intrusive::sync::AdapterReceiver<descriptor::RecycleAdapter>,
     );
-    let mut recycle_weak_per_worker: Vec<Option<descriptor::WeakRecycleSender>> =
-        (0..workers.len()).map(|_| None).collect();
-    let mut recycle_pair_per_worker: Vec<Option<RecyclePair>> =
-        (0..workers.len()).map(|_| None).collect();
-    for &worker_id in &layout.recv_io {
-        let (tx, rx) = crate::socket::channel::intrusive::sync::new_with_adapter::<descriptor::RecycleAdapter>();
-        let weak = tx.downgrade();
-        recycle_weak_per_worker[worker_id] = Some(weak);
-        // Keep the strong sender alive so Weak::upgrade() succeeds in drop_filled.
-        recycle_pair_per_worker[worker_id] = Some((tx, rx));
-    }
+    let num_recv_io_workers = layout.recv_io.len();
+    let recycle_channels: IdMap<RecvIoWorkerId, _> = RecvIoWorkerId::range(num_recv_io_workers)
+        .map(|id| {
+            let (tx, rx) = crate::socket::channel::intrusive::sync::new_with_adapter::<descriptor::RecycleAdapter>();
+            let weak = tx.downgrade();
+            (id, (weak, tx, rx))
+        })
+        .collect();
 
     // Distribute recv sockets across recv_io workers round-robin.
-    let num_recv_io_workers = layout.recv_io.len();
     for (recv_socket_id, socket) in recv_sockets.into_iter() {
         let raw_idx = recv_socket_id.as_usize();
-        let worker_id = layout.recv_io[raw_idx % num_recv_io_workers];
+        let recv_io_idx = RecvIoWorkerId::new(raw_idx % num_recv_io_workers);
+        let worker_id = layout.recv_io[recv_io_idx.as_usize()];
         let router = worker::FanOutRouter::<_, RecvRoute, _>::new(
             dispatch_txs.clone(),
             invalidation_raw_tx.clone(),
             &counter_registry,
         );
-        let recycle_weak = recycle_weak_per_worker[worker_id]
-            .as_ref()
-            .expect("recv_io worker must have recycler")
-            .clone();
+        let (weak, _, _) = &recycle_channels[recv_io_idx];
         workers[worker_id].recv_sockets.push(RecvSocketParts {
             idx: recv_socket_id,
             socket,
             recv_pool: recv_pool.clone(),
             router,
-            recycle_weak,
+            recycle_weak: weak.clone(),
         });
     }
 
-    // Assign recycle drain receivers to their workers.
-    for &worker_id in &layout.recv_io {
-        if let Some(pair) = recycle_pair_per_worker[worker_id].take() {
-            workers[worker_id].recycle_drain = Some(pair);
-        }
+    // Assign recycle drain (sender + receiver) to their workers.
+    for (recv_io_idx, (_, tx, rx)) in recycle_channels.into_iter() {
+        let worker_id = layout.recv_io[recv_io_idx.as_usize()];
+        workers[worker_id].recycle_drain = Some((tx, rx));
     }
 
     // Background worker — invalidation validation + future housekeeping.
@@ -1019,16 +1012,16 @@ where
             // Create the local recycled-descriptor pool (Rc, single-threaded).
             // Shared by all recv sockets on this worker and the drain task.
             let local_recycle_pool = std::rc::Rc::new(std::cell::RefCell::new(
-                crate::intrusive::List::<descriptor::RecycleAdapter>::new(),
+                descriptor::RecyclePool::new(),
             ));
 
             // Spawn the recycle drain task if this worker has one.
-            // The sender is kept alive in `_recycle_sender` so Weak::upgrade()
-            // succeeds when descriptors are dropped on dispatch workers.
-            let _recycle_sender;
-            if let Some((tx, recycle_rx)) = recycle_drain {
-                _recycle_sender = Some(tx);
-                let rx = tasks::recycle_drain(recycle_rx, local_recycle_pool.clone());
+            debug_assert!(
+                recv_sockets.is_empty() || recycle_drain.is_some(),
+                "recv_io workers with sockets must have a recycle_drain task"
+            );
+            if let Some((sender_keepalive, recycle_rx)) = recycle_drain {
+                let rx = tasks::recycle_drain(recycle_rx, local_recycle_pool.clone(), sender_keepalive);
                 let task_counter = counter_registry
                     .register_task("task.recycle_drain")
                     .with_registration_metadata(

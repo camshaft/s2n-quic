@@ -1140,7 +1140,7 @@ pub struct SocketReceiver<S> {
     alloc: crate::socket::pool::Pool,
     pending: Option<descriptor::Unfilled>,
     /// Shared local pool of recycled descriptors (Rc, single-threaded, no locking)
-    local_pool: std::rc::Rc<core::cell::RefCell<crate::intrusive::List<descriptor::RecycleAdapter>>>,
+    local_pool: std::rc::Rc<core::cell::RefCell<descriptor::RecyclePool>>,
     /// Weak sender for fresh allocations — stored in each new descriptor's Header
     recycle_weak: descriptor::WeakRecycleSender,
 }
@@ -1149,7 +1149,7 @@ impl<S> SocketReceiver<S> {
     pub fn new(
         socket: S,
         alloc: crate::socket::pool::Pool,
-        local_pool: std::rc::Rc<core::cell::RefCell<crate::intrusive::List<descriptor::RecycleAdapter>>>,
+        local_pool: std::rc::Rc<core::cell::RefCell<descriptor::RecyclePool>>,
         recycle_weak: descriptor::WeakRecycleSender,
     ) -> Self {
         Self {
@@ -1174,9 +1174,9 @@ where
         use std::io;
 
         let unfilled = self.pending.take().or_else(|| {
-            // Try recycled descriptors first (no locking, single-threaded access)
+            // Try recycled descriptors first (LIFO for cache locality)
             let mut list = self.local_pool.borrow_mut();
-            if let Some(desc) = list.pop_front() {
+            if let Some(desc) = list.pop_back() {
                 return Some(descriptor::Unfilled::from_recycled(desc));
             }
             drop(list);

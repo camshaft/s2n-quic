@@ -59,13 +59,17 @@ impl<A: intrusive::Adapter> AdapterShared<A>
 where
     A::Pointer: Send,
 {
-    pub(crate) fn push(&self, value: A::Pointer) {
+    pub(crate) fn push(&self, value: A::Pointer) -> Result<(), A::Pointer> {
         let mut guard = self.inner.lock();
+        if !self.is_open.load(Ordering::Acquire) {
+            return Err(value);
+        }
         guard.queue.push_back(value);
         if let Some(waker) = guard.recv_waker.take() {
             drop(guard);
             waker.wake();
         }
+        Ok(())
     }
 }
 

@@ -21,15 +21,17 @@ use bach::net::UdpSocket;
 use std::{cell::Cell, rc::Rc};
 
 fn test_recycler() -> (
-    Rc<std::cell::RefCell<crate::intrusive::List<RecycleAdapter>>>,
+    Rc<std::cell::RefCell<crate::socket::pool::descriptor::RecyclePool>>,
     crate::socket::pool::descriptor::WeakRecycleSender,
+    // Keep sender alive so Weak::upgrade succeeds
+    crate::socket::channel::intrusive::sync::AdapterSender<RecycleAdapter>,
 ) {
     let (tx, _rx) = sync::new_with_adapter::<RecycleAdapter>();
     let weak = tx.downgrade();
     let local_pool = Rc::new(std::cell::RefCell::new(
-        crate::intrusive::List::<RecycleAdapter>::new(),
+        crate::socket::pool::descriptor::RecyclePool::new(),
     ));
-    (local_pool, weak)
+    (local_pool, weak, tx)
 }
 
 struct CountingRouter {
@@ -61,7 +63,7 @@ fn single_datagram_routed() {
                 segments: segments.clone(),
                 expected: 1,
             };
-            let (local_pool, recycle_weak) = test_recycler();
+            let (local_pool, recycle_weak, _tx) = test_recycler();
             let rx = tasks::socket_recv(recv_socket, pool, local_pool, recycle_weak, router);
             rx.drain_budgeted(Some(32)).await;
             assert_eq!(segments.get(), 1);
@@ -94,7 +96,7 @@ fn multiple_datagrams_routed() {
                 segments: segments.clone(),
                 expected: 5,
             };
-            let (local_pool, recycle_weak) = test_recycler();
+            let (local_pool, recycle_weak, _tx) = test_recycler();
             let rx = tasks::socket_recv(recv_socket, pool, local_pool, recycle_weak, router);
             rx.drain_budgeted(Some(32)).await;
             assert_eq!(segments.get(), 5);
@@ -129,7 +131,7 @@ fn variable_sized_datagrams() {
                 segments: segments.clone(),
                 expected: 4,
             };
-            let (local_pool, recycle_weak) = test_recycler();
+            let (local_pool, recycle_weak, _tx) = test_recycler();
             let rx = tasks::socket_recv(recv_socket, pool, local_pool, recycle_weak, router);
             rx.drain_budgeted(Some(32)).await;
             assert_eq!(segments.get(), 4);
@@ -162,7 +164,7 @@ fn closed_router_shuts_down_task() {
                 segments: Rc::new(Cell::new(0)),
                 expected: 0,
             };
-            let (local_pool, recycle_weak) = test_recycler();
+            let (local_pool, recycle_weak, _tx) = test_recycler();
             let rx = tasks::socket_recv(recv_socket, pool, local_pool, recycle_weak, router);
             rx.drain_budgeted(Some(32)).await;
         }

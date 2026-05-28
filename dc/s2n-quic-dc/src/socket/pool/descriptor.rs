@@ -26,10 +26,38 @@ use std::{
 /// If upgrade fails (channel gone), the descriptor is deallocated normally.
 pub type WeakRecycleSender = Weak<AdapterShared<RecycleAdapter>>;
 
-// Debug counters for recycling diagnostics (remove after validation)
-pub static RECYCLE_SUCCESS: AtomicUsize = AtomicUsize::new(0);
-pub static RECYCLE_UPGRADE_FAIL: AtomicUsize = AtomicUsize::new(0);
-pub static RECYCLE_NO_RECYCLER: AtomicUsize = AtomicUsize::new(0);
+
+/// Local pool of recycled descriptors with proper cleanup on drop.
+///
+/// When this pool is dropped, all remaining descriptors are deallocated
+/// to prevent memory leaks.
+pub struct RecyclePool {
+    list: intrusive::List<RecycleAdapter>,
+}
+
+impl RecyclePool {
+    pub fn new() -> Self {
+        Self {
+            list: intrusive::List::new(),
+        }
+    }
+
+    pub fn pop_back(&mut self) -> Option<Descriptor> {
+        self.list.pop_back()
+    }
+
+    pub fn append(&mut self, other: &mut intrusive::List<RecycleAdapter>) {
+        self.list.append(other);
+    }
+}
+
+impl Drop for RecyclePool {
+    fn drop(&mut self) {
+        while let Some(desc) = self.list.pop_front() {
+            unsafe { desc.dealloc() };
+        }
+    }
+}
 
 /// Intrusive adapter that allows `Descriptor` to participate directly in
 /// intrusive lists/queues without any wrapper allocation.
@@ -185,16 +213,20 @@ impl Descriptor {
         // Try to recycle instead of deallocating
         if let Some(weak) = &inner.recycler {
             if let Some(shared) = weak.upgrade() {
-                trace!(recycle_desc = ?self.ptr, state = %"filled");
-                RECYCLE_SUCCESS.fetch_add(1, Ordering::Relaxed);
                 inner.references.store(1, Ordering::Relaxed);
                 let desc = Descriptor { ptr: self.ptr };
-                shared.push(desc);
-                return;
+                match shared.push(desc) {
+                    Ok(()) => {
+                        trace!(recycle_desc = ?self.ptr, state = %"filled");
+                        return;
+                    }
+                    Err(desc) => {
+                        // Channel closed — dealloc the returned descriptor
+                        desc.dealloc();
+                        return;
+                    }
+                }
             }
-            RECYCLE_UPGRADE_FAIL.fetch_add(1, Ordering::Relaxed);
-        } else {
-            RECYCLE_NO_RECYCLER.fetch_add(1, Ordering::Relaxed);
         }
 
         trace!(free_desc = ?self.ptr, state = %"filled");
@@ -382,10 +414,17 @@ impl Drop for Unfilled {
                 let inner = desc.inner();
                 if let Some(weak) = &inner.recycler {
                     if let Some(shared) = weak.upgrade() {
-                        trace!(recycle_desc = ?desc.ptr, state = %"unfilled");
                         inner.references.store(1, Ordering::Relaxed);
-                        shared.push(desc);
-                        return;
+                        match shared.push(desc) {
+                            Ok(()) => {
+                                trace!(recycle_desc = ?self as *const _, state = %"unfilled");
+                                return;
+                            }
+                            Err(desc) => {
+                                desc.dealloc();
+                                return;
+                            }
+                        }
                     }
                 }
                 // SAFETY: the descriptor is in the `unfilled` state and no longer used
