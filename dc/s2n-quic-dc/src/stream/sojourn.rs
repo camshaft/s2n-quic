@@ -8,8 +8,12 @@
 //! its final disposition (acknowledged, peer dead, cancelled, etc.).
 //!
 //! [`SojournMetrics`] collects per-outcome distributions as microsecond
-//! summaries.  A single instance is typically shared between the two `Inner`
-//! halves of a stream (Writer and Reader) via [`std::sync::Arc`].
+//! summaries.
+//!
+//! [`ReaderMetrics`] and [`WriterMetrics`] are the top-level per-half metric
+//! containers required by the stream constructors.  For now each contains only
+//! sojourn histograms, but the structs can be extended with additional counters
+//! (e.g. read/write size distributions) in the future.
 //!
 //! [`Frame::enqueued_at`]: crate::endpoint::frame::Frame::enqueued_at
 
@@ -77,5 +81,41 @@ impl SojournMetrics {
             Some(FailureReason::UnknownPathSecret) => &self.unknown_path_secret,
         };
         summary.record_value(nanos);
+    }
+}
+
+/// Metrics for the read half of a stream.
+///
+/// Passed into [`Reader`](crate::stream::Reader) at construction time. Carries
+/// sojourn time histograms and can be extended with additional per-read metrics
+/// in the future.
+#[derive(Clone)]
+pub struct ReaderMetrics {
+    pub sojourn: SojournMetrics,
+}
+
+impl ReaderMetrics {
+    pub fn new(registry: &Registry, label: &str) -> Self {
+        Self {
+            sojourn: SojournMetrics::new(registry, label),
+        }
+    }
+}
+
+/// Metrics for the write half of a stream.
+///
+/// Passed into [`Writer`](crate::stream::Writer) at construction time. Carries
+/// sojourn time histograms and can be extended with additional per-write metrics
+/// in the future.
+#[derive(Clone)]
+pub struct WriterMetrics {
+    pub sojourn: SojournMetrics,
+}
+
+impl WriterMetrics {
+    pub fn new(registry: &Registry, label: &str) -> Self {
+        Self {
+            sojourn: SojournMetrics::new(registry, label),
+        }
     }
 }
