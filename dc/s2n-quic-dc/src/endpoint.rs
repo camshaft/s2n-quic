@@ -87,6 +87,8 @@ pub struct Endpoint {
     pub data_addrs: Vec<std::net::SocketAddr>,
     /// Cooldown period during which new flows are rejected after a peer is marked dead.
     pub dead_peer_cooldown: Duration,
+    /// Clock created once at endpoint construction — bach-aware in test contexts.
+    pub clock: crate::time::DefaultClock,
     /// Per-outcome sojourn metrics for stream read halves (shared across all server streams).
     pub reader_metrics: Arc<crate::stream::sojourn::ReaderMetrics>,
     /// Per-outcome sojourn metrics for stream write halves (shared across all server streams).
@@ -631,6 +633,7 @@ where
         &counter_registry,
         "stream.writer",
     ));
+    let stream_clock = crate::time::DefaultClock::default();
     for (recv_dispatch_id, dispatch_rx, ack_completion_rx, invalidation_rx, waker_sink) in (
         dispatch_rxs,
         ack_completion_rxs,
@@ -655,6 +658,7 @@ where
             freed_batch_tx: freed_batch_tx.clone(),
             counters: counters.clone(),
             clock: clock.clone(),
+            stream_clock: stream_clock.clone(),
             route: ack_route,
             waker_sink,
             ups_tx: ups_tx.clone(),
@@ -716,6 +720,7 @@ where
         next_binding_id: AtomicU64::new(0),
         data_addrs,
         dead_peer_cooldown,
+        clock: stream_clock,
         reader_metrics,
         writer_metrics,
     }
@@ -793,6 +798,8 @@ struct RecvDispatchParts<Clk, AckSnd, Route> {
     freed_batch_tx: crate::queue::FreedBatchTx,
     counters: Arc<counters::Dispatch>,
     clock: Clk,
+    /// Concrete clock used for stream construction (checked once at endpoint startup).
+    stream_clock: crate::time::DefaultClock,
     route: Route,
     waker_sink: waker::Sink,
     ups_tx: UpsSender,
@@ -1049,6 +1056,7 @@ where
                     rd.route,
                     rd.waker_sink,
                     rd.ups_tx,
+                    rd.stream_clock,
                     rd.reader_metrics,
                     rd.writer_metrics,
                 );

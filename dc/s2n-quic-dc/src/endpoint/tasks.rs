@@ -1332,6 +1332,7 @@ pub fn packet_dispatch<
     route: Route,
     mut waker_sink: WakerSink,
     ups_tx: UpsSender,
+    stream_clock: crate::time::DefaultClock,
     reader_metrics: std::sync::Arc<crate::stream::sojourn::ReaderMetrics>,
     writer_metrics: std::sync::Arc<crate::stream::sojourn::WriterMetrics>,
 ) -> impl Receiver<()>
@@ -1365,6 +1366,7 @@ where
                 &counters,
                 &route,
                 &mut waker_sink,
+                &stream_clock,
                 &reader_metrics,
                 &writer_metrics,
             )

@@ -243,6 +243,7 @@ impl Reader {
         path_secret_entry: Arc<PathSecretEntry>,
         dest_queue_id: VarInt,
         stream_rx: crate::queue::StreamReceiver,
+        clock: crate::time::DefaultClock,
         metrics: Arc<ReaderMetrics>,
     ) -> Self {
         let parameters = path_secret_entry.parameters();
@@ -264,7 +265,7 @@ impl Reader {
             #[cfg(debug_assertions)]
             eof_counter: 0,
             coop: Coop::default(),
-            clock: crate::time::DefaultClock::default(),
+            clock,
             metrics,
         }))
     }
@@ -275,6 +276,7 @@ impl Reader {
         dest_queue_id: VarInt,
         stream_rx: crate::queue::StreamReceiver,
         peer_fin_received: bool,
+        clock: crate::time::DefaultClock,
         metrics: Arc<ReaderMetrics>,
     ) -> Self {
         let parameters = path_secret_entry.parameters();
@@ -295,7 +297,7 @@ impl Reader {
             #[cfg(debug_assertions)]
             eof_counter: 0,
             coop: Coop::default(),
-            clock: crate::time::DefaultClock::default(),
+            clock,
             metrics,
         }))
     }

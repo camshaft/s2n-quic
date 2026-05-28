@@ -214,6 +214,7 @@ impl Writer {
         dest_queue_id: VarInt,
         acceptor_id: VarInt,
         control_rx: crate::queue::ControlReceiver,
+        clock: crate::time::DefaultClock,
         metrics: Arc<WriterMetrics>,
     ) -> Self {
         let completion_rx = frame::completion_channel();
@@ -238,7 +239,7 @@ impl Writer {
             status: Status::Init,
             reset_error_code: None,
             coop: Coop::default(),
-            clock: crate::time::DefaultClock::default(),
+            clock,
             metrics,
         }))
     }
@@ -249,6 +250,7 @@ impl Writer {
         dest_queue_id: VarInt,
         acceptor_id: VarInt,
         control_rx: crate::queue::ControlReceiver,
+        clock: crate::time::DefaultClock,
         metrics: Arc<WriterMetrics>,
     ) -> Self {
         let completion_rx = frame::completion_channel();
@@ -273,7 +275,7 @@ impl Writer {
             status: Status::Open,
             reset_error_code: None,
             coop: Coop::default(),
-            clock: crate::time::DefaultClock::default(),
+            clock,
             metrics,
         }))
     }

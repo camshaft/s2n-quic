@@ -64,6 +64,7 @@ fn make_pair() -> (Reader, Pusher) {
         path_secret_entry,
         dest_queue_id,
         alloc.stream,
+        crate::time::DefaultClock::default(),
         Arc::new(ReaderMetrics::new(&crate::counter::Registry::default(), "test")),
     );
 

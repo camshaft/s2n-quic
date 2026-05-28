@@ -77,6 +77,7 @@ impl PairBuilder {
                 dest_queue_id,
                 acceptor_id,
                 alloc.control,
+                crate::time::DefaultClock::default(),
                 test_writer_metrics(),
             ),
             endpoint::Type::Server => Writer::new_server(
@@ -85,6 +86,7 @@ impl PairBuilder {
                 dest_queue_id,
                 acceptor_id,
                 alloc.control,
+                crate::time::DefaultClock::default(),
                 test_writer_metrics(),
             ),
         };

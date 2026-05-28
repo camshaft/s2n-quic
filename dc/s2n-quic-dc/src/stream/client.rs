@@ -71,6 +71,7 @@ pub struct Client {
     endpoint: Arc<Endpoint>,
     psk: psk::client::Provider,
     server_name: Name,
+    clock: crate::time::DefaultClock,
     reader_metrics: Arc<ReaderMetrics>,
     writer_metrics: Arc<WriterMetrics>,
 }
@@ -91,6 +92,7 @@ impl Client {
             "PSK provider map must be the same instance as the endpoint map"
         );
         Self {
+            clock: endpoint.clock.clone(),
             reader_metrics: endpoint.reader_metrics.clone(),
             writer_metrics: endpoint.writer_metrics.clone(),
             endpoint,
@@ -126,7 +128,7 @@ impl Client {
             .await?;
 
         let path_secret_entry = peer.into_raw();
-        let now = crate::time::DefaultClock::default().now();
+        let now = self.clock.now();
         if path_secret_entry.is_dead_during_cooldown(now, self.endpoint.dead_peer_cooldown) {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
@@ -155,6 +157,7 @@ impl Client {
             alloc.dest_queue_id,
             acceptor_id,
             alloc.control,
+            self.clock.clone(),
             self.writer_metrics.clone(),
         );
         let reader = Reader::new_client(
@@ -162,6 +165,7 @@ impl Client {
             path_secret_entry,
             alloc.dest_queue_id,
             alloc.stream,
+            self.clock.clone(),
             self.reader_metrics.clone(),
         );
 

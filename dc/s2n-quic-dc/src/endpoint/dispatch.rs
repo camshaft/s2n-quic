@@ -77,6 +77,7 @@ pub(crate) fn process<Clk, Route>(
     counters: &counters::Dispatch,
     route: &Route,
     waker_sink: &mut impl channel::UnboundedSender<AutoWake>,
+    stream_clock: &crate::time::DefaultClock,
     reader_metrics: &Arc<crate::stream::sojourn::ReaderMetrics>,
     writer_metrics: &Arc<crate::stream::sojourn::WriterMetrics>,
 ) -> Result<(), Error>
@@ -257,6 +258,7 @@ where
                     sender_tx,
                     counters,
                     waker_sink,
+                    stream_clock,
                     reader_metrics,
                     writer_metrics,
                 );
@@ -332,6 +334,7 @@ fn dispatch_decoded_frame(
     sender_tx: &mut impl channel::UnboundedSender<Entry<msg::Sender>>,
     counters: &counters::Dispatch,
     waker_sink: &mut impl channel::UnboundedSender<AutoWake>,
+    stream_clock: &crate::time::DefaultClock,
     reader_metrics: &Arc<crate::stream::sojourn::ReaderMetrics>,
     writer_metrics: &Arc<crate::stream::sojourn::WriterMetrics>,
 ) {
@@ -357,6 +360,7 @@ fn dispatch_decoded_frame(
                     freed_batch_tx,
                     counters,
                     waker_sink,
+                    stream_clock,
                     reader_metrics,
                     writer_metrics,
                 );
@@ -614,6 +618,7 @@ fn handle_queue_data_init(
     freed_batch_tx: &mut crate::queue::FreedBatchTx,
     counters: &counters::Dispatch,
     waker_sink: &mut impl channel::UnboundedSender<AutoWake>,
+    stream_clock: &crate::time::DefaultClock,
     reader_metrics: &Arc<crate::stream::sojourn::ReaderMetrics>,
     writer_metrics: &Arc<crate::stream::sojourn::WriterMetrics>,
 ) {
@@ -669,6 +674,7 @@ fn handle_queue_data_init(
                 queue_pair.source_queue_id,
                 acceptor_id,
                 control,
+                stream_clock.clone(),
                 writer_metrics.clone(),
             );
             let peer_fin = is_fin;
@@ -678,6 +684,7 @@ fn handle_queue_data_init(
                 queue_pair.source_queue_id,
                 stream,
                 peer_fin,
+                stream_clock.clone(),
                 reader_metrics.clone(),
             );
             let new_stream = Stream::new(reader, writer);
