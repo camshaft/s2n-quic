@@ -940,6 +940,9 @@ where
                 if matches!(frame.status, frame::TransmissionStatus::Acknowledged) {
                     if let Some(enqueued_at) = frame.enqueued_at {
                         let completed_at = self.clock.now();
+                        // `QueueMaxData` frames are reader-originated (flow-control credit
+                        // grants sent by the stream reader); all other application-level
+                        // frames (`QueueData`, FIN, etc.) are writer-originated.
                         let sojourn = match &frame.header {
                             frame::Header::QueueMaxData { .. } => &self.reader_metrics.sojourn,
                             _ => &self.writer_metrics.sojourn,
