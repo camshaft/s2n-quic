@@ -461,7 +461,7 @@ pub fn send_worker<Socket, Clk, WakerSink, AckComp>(
             .with_function("endpoint::tasks::send_worker");
 
         let rx = GaugedReceiver::new(completed_rx, completion_receiver);
-        let rx = completion_dispatcher(rx, waker_sink.clone(), stream_clock, reader_metrics, writer_metrics);
+        let rx = completion_dispatcher(rx, waker_sink.clone(), stream_clock.clone(), reader_metrics.clone(), writer_metrics.clone());
         let task_counter = counter_registry
             .register_nominal_task("task.completion", &variant)
             .with_registration_metadata(
@@ -484,7 +484,7 @@ pub fn send_worker<Socket, Clk, WakerSink, AckComp>(
             .with_function("endpoint::tasks::send_worker");
 
         let rx = GaugedReceiver::new(cancelled_rx, cancelled_receiver);
-        let rx = cancelled_drain(rx, freed_batch_tx.clone());
+        let rx = cancelled_drain(rx, freed_batch_tx.clone(), stream_clock.clone(), reader_metrics.clone(), writer_metrics.clone());
         let task_counter = counter_registry
             .register_nominal_task("task.cancelled", &variant)
             .with_registration_metadata(
@@ -932,19 +932,39 @@ where
 /// are pushed onto FreedInner's retry queue so they can be retransmitted when the
 /// peer recovers from cooldown — the original encoding and request_id are preserved
 /// to allow client-side deduplication.
+///
+/// Frames with `enqueued_at` set have their cancelled sojourn recorded via
+/// `reader_metrics` (for `QueueMaxData`) or `writer_metrics` (for all other
+/// application-level frames) before being dropped.
 pub fn cancelled_drain<R>(
     cancelled_rx: R,
     mut freed_batch_tx: crate::queue::FreedBatchTx,
+    clock: crate::time::DefaultClock,
+    reader_metrics: Arc<crate::stream::metrics::ReaderMetrics>,
+    writer_metrics: Arc<crate::stream::metrics::WriterMetrics>,
 ) -> impl Receiver<()>
 where
     R: Receiver<Entry<Frame>>,
 {
     Map::new(cancelled_rx, move |entry: Entry<Frame>| {
         use crate::{
-            endpoint::frame::Header, path::secret::map::entry::QueueState, queue::freed::RetryEntry,
+            endpoint::frame::{FailureReason, Header},
+            path::secret::map::entry::QueueState,
+            queue::freed::RetryEntry,
         };
 
         let frame = entry.into_inner();
+
+        // Record sojourn for application-originated frames before dropping them.
+        if let Some(enqueued_at) = frame.enqueued_at {
+            let completed_at = clock.now();
+            let sojourn = match &frame.header {
+                Header::QueueMaxData { .. } => &reader_metrics.sojourn,
+                _ => &writer_metrics.sojourn,
+            };
+            sojourn.record(enqueued_at, completed_at, Some(FailureReason::Cancelled));
+        }
+
         if let Header::QueueFree {
             free_request_id,
             smallest_queue_id,
