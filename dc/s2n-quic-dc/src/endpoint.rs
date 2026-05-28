@@ -90,9 +90,9 @@ pub struct Endpoint {
     /// Clock created once at endpoint construction — bach-aware in test contexts.
     pub clock: crate::time::DefaultClock,
     /// Per-outcome sojourn metrics for stream read halves (shared across all server streams).
-    pub reader_metrics: Arc<crate::stream::sojourn::ReaderMetrics>,
+    pub reader_metrics: Arc<crate::stream::metrics::ReaderMetrics>,
     /// Per-outcome sojourn metrics for stream write halves (shared across all server streams).
-    pub writer_metrics: Arc<crate::stream::sojourn::WriterMetrics>,
+    pub writer_metrics: Arc<crate::stream::metrics::WriterMetrics>,
 }
 
 // ── Pipeline Setup ────────────────────────────────────────────────────────
@@ -626,11 +626,11 @@ where
 
     let ack_route = RecvRoute::new(num_send);
     let stream_clock = crate::time::DefaultClock::default();
-    let reader_metrics = Arc::new(crate::stream::sojourn::ReaderMetrics::new(
+    let reader_metrics = Arc::new(crate::stream::metrics::ReaderMetrics::new(
         &counter_registry,
         "stream.reader",
     ));
-    let writer_metrics = Arc::new(crate::stream::sojourn::WriterMetrics::new(
+    let writer_metrics = Arc::new(crate::stream::metrics::WriterMetrics::new(
         &counter_registry,
         "stream.writer",
     ));
@@ -804,8 +804,8 @@ struct RecvDispatchParts<Clk, AckSnd, Route> {
     waker_sink: waker::Sink,
     ups_tx: UpsSender,
     invalidation_rx: sync_queue::Receiver<tasks::Invalidation>,
-    reader_metrics: Arc<crate::stream::sojourn::ReaderMetrics>,
-    writer_metrics: Arc<crate::stream::sojourn::WriterMetrics>,
+    reader_metrics: Arc<crate::stream::metrics::ReaderMetrics>,
+    writer_metrics: Arc<crate::stream::metrics::WriterMetrics>,
 }
 
 /// Ingredients for the background worker (invalidation validation + future housekeeping).

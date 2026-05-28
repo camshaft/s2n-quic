@@ -82,7 +82,7 @@ use crate::{
         datagram::{QueuePair, ResetTarget},
     },
     path::secret::map::Entry as PathSecretEntry,
-    stream::sojourn::WriterMetrics,
+    stream::metrics::WriterMetrics,
     tracing::*,
 };
 use s2n_quic_core::{

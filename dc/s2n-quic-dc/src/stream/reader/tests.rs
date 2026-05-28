@@ -29,7 +29,7 @@ use crate::{
     intrusive,
     packet::datagram::ResetTarget,
     path::secret::map::Entry as PathSecretEntry,
-    stream::sojourn::ReaderMetrics,
+    stream::metrics::ReaderMetrics,
     testing::{ext::*, sim},
 };
 use bytes::BytesMut;

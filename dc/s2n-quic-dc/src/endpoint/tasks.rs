@@ -1333,8 +1333,8 @@ pub fn packet_dispatch<
     mut waker_sink: WakerSink,
     ups_tx: UpsSender,
     stream_clock: crate::time::DefaultClock,
-    reader_metrics: std::sync::Arc<crate::stream::sojourn::ReaderMetrics>,
-    writer_metrics: std::sync::Arc<crate::stream::sojourn::WriterMetrics>,
+    reader_metrics: std::sync::Arc<crate::stream::metrics::ReaderMetrics>,
+    writer_metrics: std::sync::Arc<crate::stream::metrics::WriterMetrics>,
 ) -> impl Receiver<()>
 where
     PacketRx: Receiver<crate::intrusive::Entry<Packet<descriptor::Filled>>>,

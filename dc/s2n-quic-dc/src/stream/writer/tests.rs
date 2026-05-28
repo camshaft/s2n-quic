@@ -15,7 +15,7 @@ use crate::{
     intrusive,
     packet::datagram::ResetTarget,
     path::secret::map::Entry as PathSecretEntry,
-    stream::sojourn::WriterMetrics,
+    stream::metrics::WriterMetrics,
     testing::sim,
 };
 use bach::{ext::*, time::timeout};

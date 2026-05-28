@@ -78,8 +78,8 @@ pub(crate) fn process<Clk, Route>(
     route: &Route,
     waker_sink: &mut impl channel::UnboundedSender<AutoWake>,
     stream_clock: &crate::time::DefaultClock,
-    reader_metrics: &Arc<crate::stream::sojourn::ReaderMetrics>,
-    writer_metrics: &Arc<crate::stream::sojourn::WriterMetrics>,
+    reader_metrics: &Arc<crate::stream::metrics::ReaderMetrics>,
+    writer_metrics: &Arc<crate::stream::metrics::WriterMetrics>,
 ) -> Result<(), Error>
 where
     Clk: s2n_quic_core::time::Clock + crate::time::precision::Clock + ?Sized,
@@ -335,8 +335,8 @@ fn dispatch_decoded_frame(
     counters: &counters::Dispatch,
     waker_sink: &mut impl channel::UnboundedSender<AutoWake>,
     stream_clock: &crate::time::DefaultClock,
-    reader_metrics: &Arc<crate::stream::sojourn::ReaderMetrics>,
-    writer_metrics: &Arc<crate::stream::sojourn::WriterMetrics>,
+    reader_metrics: &Arc<crate::stream::metrics::ReaderMetrics>,
+    writer_metrics: &Arc<crate::stream::metrics::WriterMetrics>,
 ) {
     match header {
         Header::QueueData {
@@ -619,8 +619,8 @@ fn handle_queue_data_init(
     counters: &counters::Dispatch,
     waker_sink: &mut impl channel::UnboundedSender<AutoWake>,
     stream_clock: &crate::time::DefaultClock,
-    reader_metrics: &Arc<crate::stream::sojourn::ReaderMetrics>,
-    writer_metrics: &Arc<crate::stream::sojourn::WriterMetrics>,
+    reader_metrics: &Arc<crate::stream::metrics::ReaderMetrics>,
+    writer_metrics: &Arc<crate::stream::metrics::WriterMetrics>,
 ) {
     let Some(server_view) = peer.queue_view.as_server_mut() else {
         error!(

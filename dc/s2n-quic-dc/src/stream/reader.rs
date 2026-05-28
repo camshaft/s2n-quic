@@ -87,7 +87,7 @@ use crate::{
     intrusive,
     packet::datagram::{QueuePair, ResetTarget},
     path::secret::map::Entry as PathSecretEntry,
-    stream::sojourn::ReaderMetrics,
+    stream::metrics::ReaderMetrics,
     tracing::{debug, trace},
 };
 use s2n_quic_core::{
