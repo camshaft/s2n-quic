@@ -87,8 +87,7 @@ use crate::{
     intrusive,
     packet::datagram::{QueuePair, ResetTarget},
     path::secret::map::Entry as PathSecretEntry,
-    stream::sojourn::SojournMetrics,
-    time::precision::NowClock,
+    stream::sojourn::ReaderMetrics,
     tracing::{debug, trace},
 };
 use s2n_quic_core::{
@@ -210,11 +209,9 @@ struct Inner {
     coop: Coop,
     /// Clock used to stamp `enqueued_at` on application-originated frames and to
     /// record the completion time when measuring sojourn durations.
-    clock: Box<dyn NowClock>,
-    /// Optional sojourn metrics sink. When `Some`, every completed frame with an
-    /// `enqueued_at` stamp records its sojourn duration into the appropriate
-    /// per-outcome histogram.
-    sojourn: Option<Arc<SojournMetrics>>,
+    clock: crate::time::DefaultClock,
+    /// Per-outcome sojourn time histograms shared with the application.
+    metrics: Arc<ReaderMetrics>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -246,6 +243,7 @@ impl Reader {
         path_secret_entry: Arc<PathSecretEntry>,
         dest_queue_id: VarInt,
         stream_rx: crate::queue::StreamReceiver,
+        metrics: Arc<ReaderMetrics>,
     ) -> Self {
         let parameters = path_secret_entry.parameters();
         let remote_max_data = parameters.local_recv_max_data;
@@ -266,8 +264,8 @@ impl Reader {
             #[cfg(debug_assertions)]
             eof_counter: 0,
             coop: Coop::default(),
-            clock: Box::new(crate::time::DefaultClock),
-            sojourn: None,
+            clock: crate::time::DefaultClock::default(),
+            metrics,
         }))
     }
 
@@ -277,6 +275,7 @@ impl Reader {
         dest_queue_id: VarInt,
         stream_rx: crate::queue::StreamReceiver,
         peer_fin_received: bool,
+        metrics: Arc<ReaderMetrics>,
     ) -> Self {
         let parameters = path_secret_entry.parameters();
         let window_size = parameters.local_recv_max_data.as_u64();
@@ -296,8 +295,8 @@ impl Reader {
             #[cfg(debug_assertions)]
             eof_counter: 0,
             coop: Coop::default(),
-            clock: Box::new(crate::time::DefaultClock),
-            sojourn: None,
+            clock: crate::time::DefaultClock::default(),
+            metrics,
         }))
     }
 
@@ -314,17 +313,6 @@ impl Reader {
     #[inline]
     pub fn peer_addr(&self) -> SocketAddr {
         *self.0.path_secret_entry.peer()
-    }
-
-    /// Attach sojourn metrics to this reader.
-    ///
-    /// Once set, every frame that carries an `enqueued_at` stamp will record
-    /// its queue-to-disposition duration into the appropriate per-outcome
-    /// histogram when a completion is received.
-    ///
-    /// Passing `None` disables recording (the default).
-    pub fn set_sojourn(&mut self, sojourn: Option<Arc<crate::stream::sojourn::SojournMetrics>>) {
-        self.0.sojourn = sojourn;
     }
 
     pub(crate) fn send_reset(&mut self, error_code: VarInt) {
@@ -797,18 +785,16 @@ impl Inner {
 
                 // Snapshot current time once for all sojourn measurements in
                 // this completion batch.
-                let completed_at = self.sojourn.as_ref().map(|_sojourn| self.clock.now());
+                let completed_at = self.clock.now();
 
                 for completed in queue.iter() {
-                    // Record sojourn time if we have metrics and an enqueue stamp.
-                    if let (Some(ref sojourn), Some(enqueued_at), Some(completed_at)) =
-                        (&self.sojourn, completed.enqueued_at, completed_at)
-                    {
+                    // Record sojourn time for frames that carry an enqueue stamp.
+                    if let Some(enqueued_at) = completed.enqueued_at {
                         let failure_reason = match completed.status {
                             frame::TransmissionStatus::Failed(r) => Some(r),
                             _ => None,
                         };
-                        sojourn.record(enqueued_at, completed_at, failure_reason);
+                        self.metrics.sojourn.record(enqueued_at, completed_at, failure_reason);
                     }
 
                     if let frame::TransmissionStatus::Failed(reason) = completed.status {

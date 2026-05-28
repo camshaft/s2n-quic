@@ -82,8 +82,7 @@ use crate::{
         datagram::{QueuePair, ResetTarget},
     },
     path::secret::map::Entry as PathSecretEntry,
-    stream::sojourn::SojournMetrics,
-    time::precision::NowClock,
+    stream::sojourn::WriterMetrics,
     tracing::*,
 };
 use s2n_quic_core::{
@@ -170,11 +169,9 @@ struct Inner {
     coop: Coop,
     /// Clock used to stamp `enqueued_at` on application-originated frames and to
     /// record sojourn time measurements on completion.
-    clock: Box<dyn NowClock>,
-    /// Optional per-outcome sojourn time histograms.  When `Some`, every
-    /// completed frame with an `enqueued_at` stamp records its sojourn duration
-    /// into the appropriate bucket.
-    sojourn: Option<std::sync::Arc<SojournMetrics>>,
+    clock: crate::time::DefaultClock,
+    /// Per-outcome sojourn time histograms shared with the application.
+    metrics: Arc<WriterMetrics>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -217,6 +214,7 @@ impl Writer {
         dest_queue_id: VarInt,
         acceptor_id: VarInt,
         control_rx: crate::queue::ControlReceiver,
+        metrics: Arc<WriterMetrics>,
     ) -> Self {
         let completion_rx = frame::completion_channel();
         let parameters = path_secret_entry.parameters();
@@ -240,8 +238,8 @@ impl Writer {
             status: Status::Init,
             reset_error_code: None,
             coop: Coop::default(),
-            clock: Box::new(crate::time::DefaultClock),
-            sojourn: None,
+            clock: crate::time::DefaultClock::default(),
+            metrics,
         }))
     }
 
@@ -251,6 +249,7 @@ impl Writer {
         dest_queue_id: VarInt,
         acceptor_id: VarInt,
         control_rx: crate::queue::ControlReceiver,
+        metrics: Arc<WriterMetrics>,
     ) -> Self {
         let completion_rx = frame::completion_channel();
         let parameters = path_secret_entry.parameters();
@@ -274,8 +273,8 @@ impl Writer {
             status: Status::Open,
             reset_error_code: None,
             coop: Coop::default(),
-            clock: Box::new(crate::time::DefaultClock),
-            sojourn: None,
+            clock: crate::time::DefaultClock::default(),
+            metrics,
         }))
     }
 
@@ -383,17 +382,6 @@ impl Writer {
     #[inline]
     pub fn peer_addr(&self) -> SocketAddr {
         *self.0.path_secret_entry.peer()
-    }
-
-    /// Attach sojourn metrics to this writer.
-    ///
-    /// Once set, every frame that carries an `enqueued_at` stamp will record
-    /// its queue-to-disposition duration into the appropriate per-outcome
-    /// histogram when a completion is received.
-    ///
-    /// Passing `None` disables recording (the default).
-    pub fn set_sojourn(&mut self, sojourn: Option<Arc<crate::stream::sojourn::SojournMetrics>>) {
-        self.0.sojourn = sojourn;
     }
 
     /// Poll-based form of [`write_from`](Self::write_from) and
@@ -651,18 +639,16 @@ impl Inner {
 
                 // Snapshot current time once for all sojourn measurements in
                 // this completion batch (avoids repeated clock reads).
-                let completed_at = self.sojourn.as_ref().map(|_sojourn| self.clock.now());
+                let completed_at = self.clock.now();
 
                 for completed in queue.iter() {
-                    // Record sojourn time if we have metrics and an enqueue stamp.
-                    if let (Some(ref sojourn), Some(enqueued_at), Some(completed_at)) =
-                        (&self.sojourn, completed.enqueued_at, completed_at)
-                    {
+                    // Record sojourn time for frames that carry an enqueue stamp.
+                    if let Some(enqueued_at) = completed.enqueued_at {
                         let failure_reason = match completed.status {
                             TransmissionStatus::Failed(r) => Some(r),
                             _ => None,
                         };
-                        sojourn.record(enqueued_at, completed_at, failure_reason);
+                        self.metrics.sojourn.record(enqueued_at, completed_at, failure_reason);
                     }
 
                     match completed.status {

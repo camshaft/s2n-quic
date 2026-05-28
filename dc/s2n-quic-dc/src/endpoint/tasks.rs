@@ -1332,6 +1332,8 @@ pub fn packet_dispatch<
     route: Route,
     mut waker_sink: WakerSink,
     ups_tx: UpsSender,
+    reader_metrics: std::sync::Arc<crate::stream::sojourn::ReaderMetrics>,
+    writer_metrics: std::sync::Arc<crate::stream::sojourn::WriterMetrics>,
 ) -> impl Receiver<()>
 where
     PacketRx: Receiver<crate::intrusive::Entry<Packet<descriptor::Filled>>>,
@@ -1363,6 +1365,8 @@ where
                 &counters,
                 &route,
                 &mut waker_sink,
+                &reader_metrics,
+                &writer_metrics,
             )
         }
     });

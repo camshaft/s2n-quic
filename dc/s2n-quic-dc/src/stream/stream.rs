@@ -118,24 +118,6 @@ impl Stream {
         self.read.peer_addr()
     }
 
-    /// Attach sojourn metrics to both halves of this stream.
-    ///
-    /// The same [`SojournMetrics`] instance is shared between the reader and
-    /// writer so that per-outcome distributions are aggregated across both
-    /// directions.
-    ///
-    /// See [`Reader::set_sojourn`] and [`Writer::set_sojourn`] for per-half
-    /// variants.
-    ///
-    /// [`SojournMetrics`]: crate::stream::sojourn::SojournMetrics
-    pub fn set_sojourn(
-        &mut self,
-        sojourn: Option<std::sync::Arc<crate::stream::sojourn::SojournMetrics>>,
-    ) {
-        self.read.set_sojourn(sojourn.clone());
-        self.write.set_sojourn(sojourn);
-    }
-
     /// Reads from the stream's receive half.
     ///
     /// See [`Reader::read_into`] for detailed semantics.

@@ -14,7 +14,11 @@
 use crate::{
     path::secret::map::entry::QueueState,
     psk,
-    stream::{endpoint::Endpoint, Reader, Stream, Writer},
+    stream::{
+        endpoint::Endpoint,
+        sojourn::{ReaderMetrics, WriterMetrics},
+        Reader, Stream, Writer,
+    },
 };
 use s2n_quic::server::Name;
 use s2n_quic_core::varint::VarInt;
@@ -67,6 +71,8 @@ pub struct Client {
     endpoint: Arc<Endpoint>,
     psk: psk::client::Provider,
     server_name: Name,
+    reader_metrics: Arc<ReaderMetrics>,
+    writer_metrics: Arc<WriterMetrics>,
 }
 
 impl Client {
@@ -85,6 +91,8 @@ impl Client {
             "PSK provider map must be the same instance as the endpoint map"
         );
         Self {
+            reader_metrics: endpoint.reader_metrics.clone(),
+            writer_metrics: endpoint.writer_metrics.clone(),
             endpoint,
             psk,
             server_name,
@@ -118,8 +126,7 @@ impl Client {
             .await?;
 
         let path_secret_entry = peer.into_raw();
-        let now = crate::time::now();
-        let now = crate::time::precision::Timestamp::from(now);
+        let now = crate::time::DefaultClock::default().now();
         if path_secret_entry.is_dead_during_cooldown(now, self.endpoint.dead_peer_cooldown) {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
@@ -148,12 +155,14 @@ impl Client {
             alloc.dest_queue_id,
             acceptor_id,
             alloc.control,
+            self.writer_metrics.clone(),
         );
         let reader = Reader::new_client(
             frame_tx,
             path_secret_entry,
             alloc.dest_queue_id,
             alloc.stream,
+            self.reader_metrics.clone(),
         );
 
         Ok(Stream::new(reader, writer))

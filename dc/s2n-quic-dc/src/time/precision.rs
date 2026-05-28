@@ -12,23 +12,6 @@ pub trait Clock: Send + Sync + 'static {
     fn timer(&self) -> Self::Timer;
 }
 
-/// Object-safe subset of [`Clock`] that only provides the current time.
-///
-/// Used wherever a boxed `dyn` clock is needed (e.g. `Box<dyn NowClock>` in stream
-/// inner halves) because [`Clock`] has an associated type and is therefore not
-/// object-safe.  Any type that implements [`Clock`] automatically implements
-/// `NowClock` via the blanket impl below.
-pub trait NowClock: Send + Sync + 'static {
-    fn now(&self) -> Timestamp;
-}
-
-impl<C: Clock> NowClock for C {
-    #[inline]
-    fn now(&self) -> Timestamp {
-        Clock::now(self)
-    }
-}
-
 pub trait Timer: Send + 'static {
     fn now(&self) -> Timestamp;
     fn sleep_until(&mut self, target: Timestamp) -> impl core::future::Future<Output = ()> + Send;
