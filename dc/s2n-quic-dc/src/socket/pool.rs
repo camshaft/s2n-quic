@@ -224,48 +224,86 @@ mod tests {
 
     #[test]
     fn descriptor_recycles_through_channel() {
-        use crate::socket::channel::intrusive::sync;
+        use crate::{
+            intrusive,
+            socket::channel::{intrusive::sync, Budget, Receiver as _},
+            testing::{ext::*, sim},
+        };
         use crate::socket::pool::descriptor::RecycleAdapter;
 
-        let (tx, _rx) = sync::new_with_adapter::<RecycleAdapter>();
-        let weak = tx.downgrade();
-        let pool = Pool::new(1500);
+        sim(|| {
+            async {
+                let (tx, mut rx) = sync::new_with_adapter::<RecycleAdapter>();
+                let weak = tx.downgrade();
+                let pool = Pool::new(1500);
 
-        // Allocate with recycler, fill, then drop — should recycle (not dealloc)
-        let unfilled = pool.alloc_with_recycler(&weak).unwrap();
-        let segments = unfilled
-            .fill_with(|addr, _cmsg, mut iov| {
-                iov[..4].copy_from_slice(b"test");
-                addr.set(
-                    std::net::SocketAddr::new(std::net::Ipv4Addr::LOCALHOST.into(), 1234).into(),
-                );
-                Ok::<_, std::io::Error>(4)
-            })
-            .unwrap();
-        let filled = segments.take_filled();
-        assert_eq!(filled.payload(), b"test");
-        drop(filled);
+                // Allocate with recycler, fill, then drop
+                let unfilled = pool.alloc_with_recycler(&weak).unwrap();
+                let segments = unfilled
+                    .fill_with(|addr, _cmsg, mut iov| {
+                        iov[..4].copy_from_slice(b"test");
+                        addr.set(SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 1234).into());
+                        Ok::<_, std::io::Error>(4)
+                    })
+                    .unwrap();
+                let filled = segments.take_filled();
+                assert_eq!(filled.payload(), b"test");
+                drop(filled);
 
-        // If recycling failed, this would have called dealloc.
-        // The descriptor should now be in the channel's queue.
-        // We can't easily poll the receiver without an async context,
-        // but the absence of a use-after-free or double-free confirms correctness.
+                // The descriptor should now be in the channel — recv it
+                let mut budget = Budget::new(16);
+                let batch: Option<intrusive::List<RecycleAdapter>> =
+                    rx.recv(&mut budget).await;
+                let list = batch.expect("channel should have a batch");
+                assert_eq!(list.len(), 1, "expected exactly 1 recycled descriptor");
+
+                drop(tx);
+            }
+            .primary()
+            .spawn();
+        });
     }
 
     #[test]
     fn descriptor_deallocs_without_recycler() {
-        let pool = Pool::new(1500);
-        let unfilled = pool.alloc().unwrap();
-        let segments = unfilled
-            .fill_with(|addr, _cmsg, mut iov| {
-                iov[..4].copy_from_slice(b"test");
-                addr.set(
-                    std::net::SocketAddr::new(std::net::Ipv4Addr::LOCALHOST.into(), 1234).into(),
-                );
-                Ok::<_, std::io::Error>(4)
-            })
-            .unwrap();
-        // Without a recycler, this just deallocates normally
-        drop(segments);
+        use crate::{
+            intrusive,
+            socket::channel::{intrusive::sync, Budget, Receiver as _},
+            testing::{ext::*, sim},
+        };
+        use crate::socket::pool::descriptor::RecycleAdapter;
+
+        sim(|| {
+            async {
+                let (tx, mut rx) = sync::new_with_adapter::<RecycleAdapter>();
+                let weak = tx.downgrade();
+                let pool = Pool::new(1500);
+
+                // Allocate WITHOUT recycler, fill, then drop — should dealloc, not recycle
+                let unfilled = pool.alloc().unwrap();
+                let segments = unfilled
+                    .fill_with(|addr, _cmsg, mut iov| {
+                        iov[..4].copy_from_slice(b"test");
+                        addr.set(SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 1234).into());
+                        Ok::<_, std::io::Error>(4)
+                    })
+                    .unwrap();
+                drop(segments);
+
+                // Channel should be empty — nothing was recycled.
+                // Use a timeout to confirm nothing arrives.
+                let result = bach::time::timeout(
+                    core::time::Duration::from_millis(10),
+                    rx.recv(&mut Budget::new(16)),
+                )
+                .await;
+                assert!(result.is_err(), "expected timeout (empty channel)");
+
+                drop(weak);
+                drop(tx);
+            }
+            .primary()
+            .spawn();
+        });
     }
 }

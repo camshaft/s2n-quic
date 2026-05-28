@@ -161,6 +161,7 @@ fn main() -> std::io::Result<()> {
             }
         }
     })
+}
 
 fn init_tracing() {
     use tracing_subscriber::{
