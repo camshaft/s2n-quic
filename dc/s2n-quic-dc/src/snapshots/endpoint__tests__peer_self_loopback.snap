@@ -46,10 +46,12 @@ expression: logs
 0:00:00.000000000 [peer] TRACE m#task.assembler.drained[send.3]=0
 0:00:00.000000000 [peer] TRACE m#task.assembler.drained[send.7]=0
 0:00:00.000000000 [peer] TRACE m#task.invalidation.drained[send.worker.3]=0
+0:00:00.000000000 [peer] TRACE m#task.recycle_drain.drained=0
 0:00:00.000000000 [peer] TRACE m#task.socket_recv.drained[recv.0]=0
 0:00:00.000000000 [peer] TRACE m#task.socket_recv.drained[recv.2]=0
 0:00:00.000000000 [peer] TRACE m#task.socket_recv.drained[recv.4]=0
 0:00:00.000000000 [peer] TRACE m#task.socket_recv.drained[recv.6]=0
+0:00:00.000000000 [peer] TRACE m#task.recycle_drain.drained=0
 0:00:00.000000000 [peer] TRACE m#task.socket_recv.drained[recv.1]=0
 0:00:00.000000000 [peer] TRACE m#task.socket_recv.drained[recv.3]=0
 0:00:00.000000000 [peer] TRACE m#task.socket_recv.drained[recv.5]=0

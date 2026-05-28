@@ -1,7 +1,7 @@
 // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::socket::pool::descriptor::Unfilled;
+use crate::socket::pool::descriptor::{Unfilled, WeakRecycleSender};
 use core::fmt;
 
 pub mod descriptor;
@@ -37,6 +37,15 @@ impl Pool {
     #[inline]
     pub fn alloc(&self) -> Option<Unfilled> {
         Unfilled::new(self.max_packet_size)
+    }
+
+    /// Allocates a new unfilled packet with a recycler attached.
+    ///
+    /// When the descriptor is eventually dropped, it will be pushed back to the
+    /// recycling channel instead of being deallocated.
+    #[inline]
+    pub fn alloc_with_recycler(&self, recycler: &WeakRecycleSender) -> Option<Unfilled> {
+        Unfilled::new_with_recycler(self.max_packet_size, recycler.clone())
     }
 }
 
