@@ -162,7 +162,7 @@ fn new_test_frame_with_header(
         completion: None,
         status: TransmissionStatus::Pending,
         ttl: DEFAULT_TTL,
-        transmission_time: None,
+        enqueued_at: None,
     })
 }
 

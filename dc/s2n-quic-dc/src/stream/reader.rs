@@ -87,6 +87,8 @@ use crate::{
     intrusive,
     packet::datagram::{QueuePair, ResetTarget},
     path::secret::map::Entry as PathSecretEntry,
+    stream::sojourn::SojournMetrics,
+    time::precision::NowClock,
     tracing::{debug, trace},
 };
 use s2n_quic_core::{
@@ -206,6 +208,13 @@ struct Inner {
     eof_counter: u8,
     /// Cooperative yield budget
     coop: Coop,
+    /// Clock used to stamp `enqueued_at` on application-originated frames and to
+    /// record the completion time when measuring sojourn durations.
+    clock: Box<dyn NowClock>,
+    /// Optional sojourn metrics sink. When `Some`, every completed frame with an
+    /// `enqueued_at` stamp records its sojourn duration into the appropriate
+    /// per-outcome histogram.
+    sojourn: Option<Arc<SojournMetrics>>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -257,6 +266,8 @@ impl Reader {
             #[cfg(debug_assertions)]
             eof_counter: 0,
             coop: Coop::default(),
+            clock: Box::new(crate::time::DefaultClock),
+            sojourn: None,
         }))
     }
 
@@ -285,6 +296,8 @@ impl Reader {
             #[cfg(debug_assertions)]
             eof_counter: 0,
             coop: Coop::default(),
+            clock: Box::new(crate::time::DefaultClock),
+            sojourn: None,
         }))
     }
 
@@ -301,6 +314,17 @@ impl Reader {
     #[inline]
     pub fn peer_addr(&self) -> SocketAddr {
         *self.0.path_secret_entry.peer()
+    }
+
+    /// Attach sojourn metrics to this reader.
+    ///
+    /// Once set, every frame that carries an `enqueued_at` stamp will record
+    /// its queue-to-disposition duration into the appropriate per-outcome
+    /// histogram when a completion is received.
+    ///
+    /// Passing `None` disables recording (the default).
+    pub fn set_sojourn(&mut self, sojourn: Option<Arc<crate::stream::sojourn::SojournMetrics>>) {
+        self.0.sojourn = sojourn;
     }
 
     pub(crate) fn send_reset(&mut self, error_code: VarInt) {
@@ -771,7 +795,22 @@ impl Inner {
             Poll::Ready(Some(queue)) => {
                 let mut failure = None;
 
+                // Snapshot current time once for all sojourn measurements in
+                // this completion batch.
+                let completed_at = self.sojourn.as_ref().map(|_| self.clock.now());
+
                 for completed in queue.iter() {
+                    // Record sojourn time if we have metrics and an enqueue stamp.
+                    if let (Some(ref sojourn), Some(enqueued_at), Some(completed_at)) =
+                        (&self.sojourn, completed.enqueued_at, completed_at)
+                    {
+                        let failure_reason = match completed.status {
+                            frame::TransmissionStatus::Failed(r) => Some(r),
+                            _ => None,
+                        };
+                        sojourn.record(enqueued_at, completed_at, failure_reason);
+                    }
+
                     if let frame::TransmissionStatus::Failed(reason) = completed.status {
                         if let Some(existing) = failure {
                             debug!(
@@ -832,7 +871,7 @@ impl Inner {
             completion: Some(self.completion_rx.sender()),
             status: frame::TransmissionStatus::default(),
             ttl: DEFAULT_TTL,
-            transmission_time: None,
+            enqueued_at: Some(self.clock.now()),
         };
 
         self.send_frame(frame)?;
@@ -864,7 +903,7 @@ impl Inner {
             completion: None,
             status: frame::TransmissionStatus::default(),
             ttl: DEFAULT_TTL,
-            transmission_time: None,
+            enqueued_at: None,
         };
 
         self.send_frame(frame)?;

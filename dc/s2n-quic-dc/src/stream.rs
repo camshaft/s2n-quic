@@ -5,6 +5,7 @@ pub mod client;
 mod coop;
 mod reader;
 pub mod server;
+pub mod sojourn;
 mod stream;
 mod writer;
 
