@@ -85,6 +85,8 @@ thread_local! {
 
 static SNAPSHOT_MODE_DEPTH: AtomicUsize = AtomicUsize::new(0);
 const SNAPSHOT_SPILL_THRESHOLD: usize = 256 * 1024;
+// Bound retries to avoid pathological looping under heavy contention while
+// still giving enough attempts for concurrent test threads.
 const MAX_SPILL_FILE_CREATION_ATTEMPTS: usize = 128;
 
 enum SnapshotBufferStorage {
@@ -200,7 +202,8 @@ fn create_snapshot_spill_file() -> std::io::Result<(std::fs::File, PathBuf)> {
     Err(std::io::Error::new(
         std::io::ErrorKind::AlreadyExists,
         format!(
-            "failed to create unique snapshot spill log file after {MAX_SPILL_FILE_CREATION_ATTEMPTS} attempts"
+            "failed to create unique snapshot spill log file after {MAX_SPILL_FILE_CREATION_ATTEMPTS} attempts (dir={}, thread={thread_name})",
+            temp_dir.display()
         ),
     ))
 }
@@ -472,10 +475,16 @@ fn run_sim_with_snapshot(f: impl FnOnce()) {
     // Clear the buffer so it doesn't leak into subsequent tests on this thread.
     SNAPSHOT_BUFFER.with(|cell| cell.set(None));
 
-    let bytes =
-        buffer.lock().unwrap().into_bytes().unwrap_or_else(|error| {
-            format!("failed to collect snapshot logs: {error}").into_bytes()
-        });
+    let bytes = {
+        let mut buffer = buffer.lock().unwrap();
+        buffer.into_bytes().unwrap_or_else(|error| {
+            let source = buffer
+                .spill_path()
+                .map(|path| format!("disk spill file {}", path.display()))
+                .unwrap_or_else(|| "in-memory snapshot buffer".into());
+            format!("failed to collect snapshot logs from {source}: {error}").into_bytes()
+        })
+    };
     let logs = normalize_snapshot_logs(String::from_utf8_lossy(&bytes).into_owned());
 
     insta::with_settings!({prepend_module_to_snapshot => false}, {
@@ -616,7 +625,9 @@ mod tests {
             .contains(&sanitize_thread_name(
                 std::thread::current().name().unwrap_or("unnamed")
             )));
-        assert_eq!(buffer.into_bytes().unwrap(), b"123456789");
+        let bytes = buffer.into_bytes().unwrap();
+        assert!(bytes.starts_with(b"12345678"));
+        assert_eq!(bytes, b"123456789");
 
         std::fs::remove_file(spill_path).unwrap();
     }
