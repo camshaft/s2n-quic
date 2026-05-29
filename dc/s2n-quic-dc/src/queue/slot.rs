@@ -807,10 +807,10 @@ mod tests {
             true,
             |ptr, len| {
                 write_called.store(true, Ordering::Relaxed);
-                unsafe { core::ptr::write_bytes(ptr, 0xAB, len as usize) };
                 simulate_receiver_drop(&slot);
                 let result = slot.bind_and_push_stream(v(2), make_stream_entry());
                 assert!(matches!(result, Ok(BindState::NewBinding(_))));
+                unsafe { core::ptr::write_bytes(ptr, 0xAB, len as usize) };
                 Ok::<(), ()>(())
             },
         );
