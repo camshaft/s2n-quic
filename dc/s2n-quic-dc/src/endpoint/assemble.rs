@@ -46,9 +46,9 @@ mod tests;
 
 /// Attempt to assemble pending frames into a full GSO datagram of encrypted packets.
 ///
-/// Returns None if the CCA window is full, no transmittable frames exist, or no
-/// pre-allocated buffer was supplied. The caller is responsible for re-registering the context in the
-/// timer wheel if frames remain after assembly.
+/// Returns None if the CCA window is full or no transmittable frames exist. The caller
+/// is responsible for re-registering the context in the timer wheel if frames remain
+/// after assembly.
 ///
 /// `header_buf` is a caller-provided reusable allocation for encoding per-frame metadata
 /// into the application header region. It is cleared before use and after return.
@@ -74,7 +74,7 @@ pub(crate) fn assemble<R: Recycler, Clk>(
     source_sender_id: LocalSenderId,
     source_control_port: u16,
     gso: &Gso,
-    unfilled: Option<Unfilled<R>>,
+    unfilled: Unfilled<R>,
     header_buf: &mut Vec<u8>,
     cancelled: &mut impl UnboundedSender<intrusive::Entry<Frame>>,
     ack_completions: &mut impl UnboundedSender<intrusive::Entry<msg::Sender>>,
@@ -92,8 +92,6 @@ where
         max_segments,
     } = context.path_info(gso);
     counters.max_datagram_size.record_value(mtu as u64);
-
-    let unfilled = unfilled?;
 
     let mut segment_size: u16 = 0;
     let mut segments_written: u32 = 0;

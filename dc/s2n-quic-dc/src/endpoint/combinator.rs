@@ -825,21 +825,23 @@ where
             let mut context = context.borrow_mut();
             let mut cancelled = Queue::new();
             let mut ack_completions = Queue::new();
-            let segments = assemble::assemble::<UnsyncRecycler, _>(
-                &mut context,
-                immediate_queue_status,
-                &self.clock,
-                self.source_sender_id,
-                self.source_control_port,
-                &self.gso,
-                pre_alloc,
-                &mut self.header_buf,
-                &mut cancelled,
-                &mut ack_completions,
-                &mut self.freed_batch_tx,
-                &self.counters,
-                &self.send_counters,
-            );
+            let segments = pre_alloc.and_then(|unfilled| {
+                assemble::assemble::<UnsyncRecycler, _>(
+                    &mut context,
+                    immediate_queue_status,
+                    &self.clock,
+                    self.source_sender_id,
+                    self.source_control_port,
+                    &self.gso,
+                    unfilled,
+                    &mut self.header_buf,
+                    &mut cancelled,
+                    &mut ack_completions,
+                    &mut self.freed_batch_tx,
+                    &self.counters,
+                    &self.send_counters,
+                )
+            });
             if !cancelled.is_empty() {
                 let _ = self.cancelled_tx.send(cancelled);
             }
