@@ -105,17 +105,14 @@ impl SnapshotBuffer {
     }
 
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        if matches!(self.storage, SnapshotBufferStorage::InMemory(_)) {
-            let should_spill = match &self.storage {
-                SnapshotBufferStorage::InMemory(bytes) => {
-                    bytes.len().saturating_add(buf.len()) > self.spill_threshold
-                }
-                SnapshotBufferStorage::OnDisk { .. } => false,
-            };
+        let should_spill = if let SnapshotBufferStorage::InMemory(bytes) = &self.storage {
+            bytes.len().saturating_add(buf.len()) > self.spill_threshold
+        } else {
+            false
+        };
 
-            if should_spill {
-                self.spill_to_disk()?;
-            }
+        if should_spill {
+            self.spill_to_disk()?;
         }
 
         match &mut self.storage {
@@ -132,7 +129,7 @@ impl SnapshotBuffer {
 
     fn into_bytes(&mut self) -> std::io::Result<Vec<u8>> {
         match &mut self.storage {
-            SnapshotBufferStorage::InMemory(bytes) => Ok(bytes.clone()),
+            SnapshotBufferStorage::InMemory(bytes) => Ok(std::mem::take(bytes)),
             SnapshotBufferStorage::OnDisk { file, path } => {
                 file.flush()?;
                 std::fs::read(path)
@@ -156,6 +153,7 @@ impl SnapshotBuffer {
         let (mut file, path) = create_snapshot_spill_file()?;
         file.write_all(bytes)?;
         bytes.clear();
+        bytes.shrink_to_fit();
 
         eprintln!(
             "s2n-quic-dc snapshot log buffer exceeded {} bytes; spilling to {}",
