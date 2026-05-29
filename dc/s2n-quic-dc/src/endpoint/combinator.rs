@@ -12,10 +12,13 @@ use crate::{
         frame::{self, Frame, Priority, PriorityInput},
         id::{Id, IdMap, LocalSendSocketId, LocalSenderId},
     },
-    intrusive::{Entry, Queue},
+    intrusive::{Entry, List, Queue},
     path::secret::map::Entry as PathSecretEntry,
     socket::{
-        channel::{Budget, ByteCost, ImmediateQueueStatus, Receiver, UnboundedSender},
+        channel::{
+            intrusive::sync as sync_channel, Budget, ByteCost, ImmediateQueueStatus, Receiver,
+            UnboundedSender,
+        },
         pool::descriptor,
         rate::Rate,
     },
@@ -616,6 +619,16 @@ pub(crate) struct Assembler<R, Clk, C, A> {
     freed_batch_tx: crate::queue::FreedBatchTx,
     pub(crate) counters: AssemblerCounters,
     send_counters: Rc<super::counters::Send>,
+    /// Sender keepalive: while alive, recycled `Segments` buffers are returned to
+    /// `recycle_rx` rather than being freed back to the OS allocator.
+    _recycle_tx: sync_channel::AdapterSender<descriptor::RecycleAdapter>,
+    /// Weak reference stored in each newly-allocated descriptor so that, on drop,
+    /// the buffer is pushed back into the recycle channel.
+    recycle_weak: descriptor::WeakRecycleSender,
+    /// Inbound recycled descriptors pushed by dropped `Segments` on this thread.
+    recycle_rx: sync_channel::AdapterReceiver<descriptor::RecycleAdapter>,
+    /// Thread-local LIFO cache of descriptors drained from `recycle_rx`.
+    local_pool: List<descriptor::RecycleAdapter>,
 }
 
 #[derive(Clone)]
@@ -753,6 +766,9 @@ impl<R, Clk, C, A> Assembler<R, Clk, C, A> {
         counters: AssemblerCounters,
         send_counters: Rc<super::counters::Send>,
     ) -> Self {
+        let (recycle_tx, recycle_rx) =
+            sync_channel::new_with_adapter::<descriptor::RecycleAdapter>();
+        let recycle_weak = recycle_tx.downgrade();
         Self {
             inner,
             clock,
@@ -766,6 +782,10 @@ impl<R, Clk, C, A> Assembler<R, Clk, C, A> {
             freed_batch_tx,
             counters,
             send_counters,
+            _recycle_tx: recycle_tx,
+            recycle_weak,
+            recycle_rx,
+            local_pool: List::new(),
         }
     }
 }
@@ -789,6 +809,16 @@ where
             return Poll::Ready(None);
         };
 
+        // Drain any descriptors recycled by previously-sent `Segments` back into
+        // the local pool, then try to hand a pre-allocated buffer to `assemble` so
+        // it can skip the system allocator on the hot path.
+        self.recycle_rx.drain_into(&mut self.local_pool);
+        let pre_alloc = self
+            .local_pool
+            .pop_back()
+            .map(|recycled| descriptor::Unfilled::from_recycled(recycled.into_descriptor()))
+            .or_else(|| self.pool.alloc_with_recycler(&self.recycle_weak));
+
         let (segments, wheel_interest) = {
             let mut context = context.borrow_mut();
             let mut cancelled = Queue::new();
@@ -801,6 +831,7 @@ where
                 self.source_control_port,
                 &self.gso,
                 &self.pool,
+                pre_alloc,
                 &mut self.header_buf,
                 &mut cancelled,
                 &mut ack_completions,

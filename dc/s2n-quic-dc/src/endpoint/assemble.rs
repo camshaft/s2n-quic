@@ -27,7 +27,10 @@ use crate::{
     queue::FreedBatchTx,
     socket::{
         channel::{ImmediateQueueStatus, UnboundedSender},
-        pool::{self, descriptor::Segments},
+        pool::{
+            self,
+            descriptor::{Segments, Unfilled},
+        },
     },
     time::precision,
 };
@@ -75,6 +78,7 @@ pub(crate) fn assemble<Clk>(
     source_control_port: u16,
     gso: &Gso,
     pool: &pool::Pool,
+    pre_alloc: Option<Unfilled>,
     header_buf: &mut Vec<u8>,
     cancelled: &mut impl UnboundedSender<intrusive::Entry<Frame>>,
     ack_completions: &mut impl UnboundedSender<intrusive::Entry<msg::Sender>>,
@@ -93,7 +97,7 @@ where
     } = context.path_info(gso);
     counters.max_datagram_size.record_value(mtu as u64);
 
-    let unfilled = pool.alloc()?;
+    let unfilled = pre_alloc.or_else(|| pool.alloc())?;
 
     let mut segment_size: u16 = 0;
     let mut segments_written: u32 = 0;
