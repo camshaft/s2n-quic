@@ -20,7 +20,7 @@ use crate::{
 };
 use bach::{ext::*, time::timeout};
 use bytes::Bytes;
-use s2n_quic_core::{endpoint, varint::VarInt};
+use s2n_quic_core::{endpoint, stream::testing::Data, varint::VarInt};
 use std::{net::SocketAddr, sync::Arc, task::Poll, time::Duration};
 
 fn test_writer_metrics() -> Arc<WriterMetrics> {
@@ -307,7 +307,6 @@ fn client_write_all_from_fin_sends_queue_init_with_early_data_and_fin() {
 
 #[test]
 fn write_msg_preserves_is_wakeup_flag() {
-    let _guard = crate::testing::without_snapshots();
     sim(|| {
         let (mut writer, mut pusher) = make_server_pair();
         writer.0.remote_max_data = VarInt::MAX;
@@ -339,7 +338,7 @@ fn write_msg_preserves_is_wakeup_flag() {
 
         async move {
             let payload_len = writer.0.packet_size as usize + 1;
-            let mut payload = Bytes::from(vec![0xAB; payload_len]);
+            let mut payload = Data::new(payload_len as u64);
             let written = writer
                 .write_msg(
                     &mut payload,
@@ -359,7 +358,6 @@ fn write_msg_preserves_is_wakeup_flag() {
 
 #[test]
 fn write_msg_large_payload_uses_multiple_msg_segments() {
-    let _guard = crate::testing::without_snapshots();
     sim(|| {
         let (mut writer, mut pusher) = make_server_pair();
         writer.0.remote_max_data = VarInt::MAX;
@@ -380,7 +378,7 @@ fn write_msg_large_payload_uses_multiple_msg_segments() {
             let mut second_chunk_count = 0usize;
             let mut first_fin_seen = false;
             let mut second_segment_has_non_fin_frame = false;
-            let mut reassembled = Vec::with_capacity(payload_len);
+            let mut expected = Data::new(payload_len as u64);
 
             for frame in frames.iter() {
                 let (msg_id, stream_offset, message_size, frame_chunk_size, chunk_index, is_fin) =
@@ -431,7 +429,7 @@ fn write_msg_large_payload_uses_multiple_msg_segments() {
                 }
 
                 for chunk in frame.payload.chunks() {
-                    reassembled.extend_from_slice(chunk);
+                    expected.receive(std::slice::from_ref(&chunk));
                 }
             }
 
@@ -447,14 +445,13 @@ fn write_msg_large_payload_uses_multiple_msg_segments() {
                 !second_segment_has_non_fin_frame,
                 "all frames in final segment should carry FIN"
             );
-            assert_eq!(reassembled.len(), payload_len);
-            assert!(reassembled.iter().all(|b| *b == 0xCD));
+            assert!(expected.is_finished(), "payload should reassemble completely");
         }
         .primary()
         .spawn();
 
         async move {
-            let mut payload = Bytes::from(vec![0xCD; payload_len]);
+            let mut payload = Data::new(payload_len as u64);
             let written = writer
                 .write_msg(
                     &mut payload,
