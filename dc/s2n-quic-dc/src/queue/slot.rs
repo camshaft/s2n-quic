@@ -185,8 +185,9 @@ impl Slot {
 
         // Validate + complete/cancel under the stream lock.
         let mut stream = self.stream.inner.lock();
+        let validation = validate_msg_dispatch(binding_id, &self.binding_id, &stream);
         if let Err(error) = write_result {
-            if validate_msg_dispatch(binding_id, &self.binding_id, &stream).is_ok() {
+            if validation.is_ok() {
                 if let Some(table) = stream.extra.msg_table.as_mut() {
                     table.cancel_checkout(msg_id, chunk_index);
                 }
@@ -194,7 +195,7 @@ impl Slot {
             return Err(super::MsgError::Write(error));
         }
 
-        if let Err(error) = validate_msg_dispatch(binding_id, &self.binding_id, &stream) {
+        if let Err(error) = validation {
             trace!(
                 msg_id,
                 chunk_index,

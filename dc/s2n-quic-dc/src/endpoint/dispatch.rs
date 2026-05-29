@@ -930,7 +930,13 @@ fn handle_queue_msg(
         }
         Err(crate::queue::MsgError::Queue(crate::queue::Error::SenderClosed)) => {}
         Err(crate::queue::MsgError::Queue(crate::queue::Error::CapExceeded(_))) => {}
-        Err(crate::queue::MsgError::Write(_)) => {}
+        Err(crate::queue::MsgError::Write(_)) => {
+            trace!(
+                binding_id = binding_id.as_u64(),
+                queue_id = local_queue_id.as_u64(),
+                "QueueMsg mixed-path write callback failed - dropping"
+            );
+        }
     }
 }
 
