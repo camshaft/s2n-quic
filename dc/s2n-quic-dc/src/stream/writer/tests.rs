@@ -326,7 +326,8 @@ fn write_msg_preserves_is_wakeup_flag() {
                         );
                     }
                     Header::QueueData { is_fin: true, .. } => {
-                        // writer drop can emit a trailing FIN frame
+                        // This task exits immediately after write_msg; dropping an
+                        // open writer emits a best-effort trailing FIN frame.
                     }
                     _ => panic!("unexpected frame while validating QueueMsg: {:?}", frame.header),
                 }
@@ -378,7 +379,7 @@ fn write_msg_large_payload_uses_multiple_msg_segments() {
             let mut first_chunk_count = 0usize;
             let mut second_chunk_count = 0usize;
             let mut first_fin_seen = false;
-            let mut second_non_fin_seen = false;
+            let mut second_segment_has_non_fin_frame = false;
             let mut reassembled = Vec::with_capacity(payload_len);
 
             for frame in frames.iter() {
@@ -426,7 +427,7 @@ fn write_msg_large_payload_uses_multiple_msg_segments() {
                     assert_eq!(chunk_index, second_next_chunk);
                     second_next_chunk += 1;
                     second_chunk_count += 1;
-                    second_non_fin_seen |= !is_fin;
+                    second_segment_has_non_fin_frame |= !is_fin;
                 }
 
                 for chunk in frame.payload.chunks() {
@@ -443,7 +444,7 @@ fn write_msg_large_payload_uses_multiple_msg_segments() {
             assert_eq!(second_chunk_count, 2, "second segment should be two chunks");
             assert!(!first_fin_seen, "first segment should not carry FIN");
             assert!(
-                !second_non_fin_seen,
+                !second_segment_has_non_fin_frame,
                 "all frames in final segment should carry FIN"
             );
             assert_eq!(reassembled.len(), payload_len);
