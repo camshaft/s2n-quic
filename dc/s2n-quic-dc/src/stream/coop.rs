@@ -48,6 +48,25 @@ where
     result
 }
 
+impl Coop {
+    /// Consume one unit of budget within an inner polling loop. Returns `true`
+    /// when the caller should yield cooperatively.
+    ///
+    /// When this returns `true`, the caller must schedule a wake-up via
+    /// `cx.waker().wake_by_ref()` and return `Poll::Pending` so that other
+    /// tasks get a chance to run before the loop resumes.
+    #[inline]
+    pub fn consume_budget(&mut self) -> bool {
+        if self.budget == 0 {
+            self.budget = BUDGET;
+            true
+        } else {
+            self.budget -= 1;
+            false
+        }
+    }
+}
+
 pub trait IsProgress {
     fn is_progress(&self) -> bool;
 }

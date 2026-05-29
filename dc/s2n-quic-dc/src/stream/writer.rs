@@ -604,6 +604,15 @@ impl Inner {
                 return Poll::Pending;
             }
 
+            // Cooperative yield: after each send-cycle, check whether we have
+            // been monopolizing the executor (e.g. a fast receiver that keeps
+            // sending MAX_DATA synchronously). If the budget is exhausted,
+            // schedule a wake-up and yield so that other tasks get a turn.
+            if self.coop.consume_budget() {
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
+
             // Refresh budget: drain completions and process MAX_DATA before retrying.
             self.poll_completions(cx)?;
             let _ = self.poll_remote_budget(cx)?;
