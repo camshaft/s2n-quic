@@ -12,11 +12,10 @@ use crate::{
         frame::{self, Frame, Priority, PriorityInput},
         id::{Id, IdMap, LocalSendSocketId, LocalSenderId},
     },
-    intrusive::{Entry, List, Queue},
+    intrusive::{Entry, Queue},
     path::secret::map::Entry as PathSecretEntry,
     socket::{
         channel::{
-            intrusive::{unsync as unsync_channel},
             Budget, ByteCost, ImmediateQueueStatus, Receiver, UnboundedSender,
         },
         pool::{
