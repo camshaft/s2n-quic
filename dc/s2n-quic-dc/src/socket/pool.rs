@@ -4,11 +4,12 @@
 use crate::{
     intrusive::List,
     socket::{
-        channel::intrusive::unsync,
-        pool::descriptor::{RecycleAdapter, Recycler, Unfilled, UnsyncRecycler},
+        channel::intrusive::{sync, unsync},
+        pool::descriptor::{RecycleAdapter, Recycler, SyncRecycler, Unfilled, UnsyncRecycler},
     },
 };
 use core::fmt;
+use std::{cell::RefCell, rc::Rc};
 
 pub mod descriptor;
 
@@ -26,6 +27,38 @@ pub struct UnsyncReusePool {
     recycle_weak: UnsyncRecycler,
     recycle_rx: unsync::Receiver<RecycleAdapter<UnsyncRecycler>>,
     local_pool: List<RecycleAdapter<UnsyncRecycler>>,
+}
+
+/// Worker-owned descriptor reuse state for the sync recv pipeline.
+///
+/// Owns the sync recycle channel keepalive/receiver and the worker-local list
+/// that recv sockets reuse from after the drain task appends recycled entries.
+pub struct SyncReusePool {
+    _recycle_tx: sync::AdapterSender<RecycleAdapter<SyncRecycler>>,
+    recycle_weak: SyncRecycler,
+    recycle_rx: Option<sync::AdapterReceiver<RecycleAdapter<SyncRecycler>>>,
+}
+
+/// Worker-local recv-side descriptor reuse state.
+pub struct SyncReuseLocal {
+    _recycle_tx: sync::AdapterSender<RecycleAdapter<SyncRecycler>>,
+    recycle_weak: SyncRecycler,
+    recycle_rx: Option<sync::AdapterReceiver<RecycleAdapter<SyncRecycler>>>,
+    local_pool: Rc<RefCell<List<RecycleAdapter<SyncRecycler>>>>,
+}
+
+/// Cloneable recv-side descriptor reuse handle shared by socket readers on a worker.
+#[derive(Clone)]
+pub struct SyncReuseHandle {
+    local_pool: Rc<RefCell<List<RecycleAdapter<SyncRecycler>>>>,
+    recycle_weak: SyncRecycler,
+}
+
+/// Drain state moved into the recycle-drain task for a recv worker.
+pub struct SyncReuseDrain {
+    pub(crate) _recycle_tx: sync::AdapterSender<RecycleAdapter<SyncRecycler>>,
+    pub(crate) recycle_rx: sync::AdapterReceiver<RecycleAdapter<SyncRecycler>>,
+    pub(crate) local_pool: Rc<RefCell<List<RecycleAdapter<SyncRecycler>>>>,
 }
 
 impl fmt::Debug for Pool {
@@ -88,6 +121,70 @@ impl UnsyncReusePool {
             .pop_back()
             .map(|recycled| Unfilled::<UnsyncRecycler>::from_recycled(recycled.into_descriptor()))
             .or_else(|| pool.alloc_with_recycler(&self.recycle_weak))
+    }
+}
+
+impl SyncReusePool {
+    #[inline]
+    pub fn new() -> Self {
+        let (recycle_tx, recycle_rx) = sync::new_with_adapter::<RecycleAdapter<SyncRecycler>>();
+        let recycle_weak = SyncRecycler(recycle_tx.downgrade());
+        Self {
+            _recycle_tx: recycle_tx,
+            recycle_weak,
+            recycle_rx: Some(recycle_rx),
+        }
+    }
+
+    #[inline]
+    pub fn into_local(self) -> SyncReuseLocal {
+        SyncReuseLocal {
+            _recycle_tx: self._recycle_tx,
+            recycle_weak: self.recycle_weak,
+            recycle_rx: self.recycle_rx,
+            local_pool: Rc::new(RefCell::new(List::new())),
+        }
+    }
+}
+
+impl SyncReuseLocal {
+    #[inline]
+    pub fn take_drain(&mut self) -> Option<SyncReuseDrain> {
+        let recycle_rx = self.recycle_rx.take()?;
+        Some(SyncReuseDrain {
+            _recycle_tx: self._recycle_tx.clone(),
+            recycle_rx,
+            local_pool: self.local_pool.clone(),
+        })
+    }
+
+    #[inline]
+    pub fn handle(&self) -> SyncReuseHandle {
+        SyncReuseHandle {
+            local_pool: self.local_pool.clone(),
+            recycle_weak: self.recycle_weak.clone(),
+        }
+    }
+}
+
+impl SyncReuseHandle {
+    /// Returns either a recycled descriptor from the worker-local list or a
+    /// fresh descriptor from `pool` with the worker-local weak recycler attached.
+    #[inline]
+    pub fn alloc_or_reuse(&self, pool: &Pool) -> Option<Unfilled<SyncRecycler>> {
+        let mut list = self.local_pool.borrow_mut();
+        if let Some(recycled) = list.pop_back() {
+            return Some(Unfilled::<SyncRecycler>::from_recycled(
+                recycled.into_descriptor(),
+            ));
+        }
+        drop(list);
+        pool.alloc_with_recycler(&self.recycle_weak)
+    }
+
+    #[inline]
+    pub fn local_pool(&self) -> Rc<RefCell<List<RecycleAdapter<SyncRecycler>>>> {
+        self.local_pool.clone()
     }
 }
 
