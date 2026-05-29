@@ -2556,6 +2556,118 @@ fn queue_msg_multi_chunk() {
     });
 }
 
+/// Verifies that write_msg keeps a single QueueMsg segment even when the sender's
+/// local send window is smaller than the message. The receiver should observe a
+/// single contiguous chunk when reading into ByteVec.
+#[test]
+fn queue_msg_send_window_smaller_than_segment() {
+    use crate::{
+        byte_vec::ByteVec,
+        endpoint::testing::sim::{self, SERVER_PORT},
+    };
+    use s2n_quic_core::dc::testing::TEST_APPLICATION_PARAMS;
+
+    crate::testing::sim(|| {
+        use crate::testing::ext::*;
+
+        let acceptor_id = VarInt::from_u8(1);
+        const MSG_SIZE: usize = 64 * 1024;
+        let send_window = VarInt::from_u16(8 * 1024);
+
+        async move {
+            let server = Server::new();
+            let mut acceptor = server
+                .register_acceptor_channel(acceptor_id, 8)
+                .expect("acceptor registration failed");
+
+            while let Some(stream) = acceptor.recv().await {
+                async move {
+                    let (mut reader, _writer) = stream.into_split();
+                    let mut recv = ByteVec::new();
+                    loop {
+                        let n = timeout(5.s(), reader.read_into(&mut recv))
+                            .await
+                            .expect("server read timeout")
+                            .expect("server read");
+                        if n == 0 {
+                            break;
+                        }
+                    }
+                    assert_eq!(recv.len(), MSG_SIZE);
+                    assert_eq!(
+                        recv.chunks().count(),
+                        1,
+                        "single QueueMsg segment should be delivered as one chunk"
+                    );
+                }
+                .primary()
+                .spawn();
+            }
+        }
+        .group("server")
+        .spawn();
+
+        async move {
+            let mut client = Client::new();
+            bach::task::yield_now().await;
+
+            let server_addr = bach::net::lookup_host(format!("server:{SERVER_PORT}"))
+                .await
+                .expect("lookup")
+                .next()
+                .expect("no addr");
+
+            let client_addr = client.data_addr();
+            let client_map = sim::lookup_sim_map(client_addr).expect("client map");
+            let server_map = sim::lookup_sim_map(server_addr).expect("server map");
+
+            let mut server_params = TEST_APPLICATION_PARAMS;
+            server_params.remote_max_data = server_params.local_recv_max_data;
+
+            let mut client_params = TEST_APPLICATION_PARAMS;
+            client_params.local_send_max_data = send_window;
+            client_params.remote_max_data = client_params.local_recv_max_data;
+
+            client_map.test_insert_pair(
+                client_addr,
+                Some(server_params),
+                &server_map,
+                server_addr,
+                Some(client_params),
+            );
+
+            if let Some(entry) = client_map.get_raw(server_addr) {
+                entry.set_peer_data_addrs(&[server_addr]);
+            }
+            if let Some(entry) = server_map.get_raw(client_addr) {
+                entry.set_peer_data_addrs(&[client_addr]);
+            }
+
+            let stream = client
+                .connect(format!("server:{SERVER_PORT}"), acceptor_id)
+                .await
+                .expect("connect failed");
+
+            let (_reader, mut writer) = stream.into_split();
+
+            let mut data = Data::new(MSG_SIZE as u64);
+            writer
+                .write_msg(
+                    &mut data,
+                    crate::stream::MsgFlags {
+                        is_fin: true,
+                        is_wakeup: true,
+                    },
+                )
+                .await
+                .expect("client write_msg");
+        }
+        .group("client")
+        .primary()
+        .spawn();
+    });
+}
+
 /// Large message requiring multi-segment split — verifies that write_msg correctly
 /// splits messages larger than MAX_CHUNKS * chunk_size into multiple msg_ids.
 /// With ~1328-byte chunks and 256 MAX_CHUNKS, max_segment_size is ~340KB.
