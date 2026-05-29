@@ -12,8 +12,9 @@ use std::{
     cell::Cell,
     io::Write as _,
     path::PathBuf,
+    process,
     sync::{atomic::AtomicUsize, OnceLock},
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 #[cfg(any(test, feature = "testing"))]
@@ -152,11 +153,7 @@ impl SnapshotBuffer {
             return Ok(());
         };
 
-        let mut temp_file = tempfile::Builder::new()
-            .prefix("s2n-quic-dc-test-logs-")
-            .suffix(".log")
-            .tempfile()?;
-        let (mut file, path) = temp_file.keep()?;
+        let (mut file, path) = create_snapshot_spill_file()?;
         file.write_all(bytes)?;
         bytes.clear();
 
@@ -169,6 +166,38 @@ impl SnapshotBuffer {
         self.storage = SnapshotBufferStorage::OnDisk { path, file };
         Ok(())
     }
+}
+
+fn create_snapshot_spill_file() -> std::io::Result<(std::fs::File, PathBuf)> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let temp_dir = std::env::temp_dir();
+
+    for attempt in 0..128 {
+        let path = temp_dir.join(format!(
+            "s2n-quic-dc-test-logs-{}-{:?}-{now}-{attempt}.log",
+            process::id(),
+            std::thread::current().id()
+        ));
+
+        match std::fs::OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(&path)
+        {
+            Ok(file) => return Ok((file, path)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "failed to create unique snapshot spill log file",
+    ))
 }
 
 struct TracingDisabledGuard;
@@ -434,9 +463,10 @@ fn run_sim_with_snapshot(f: impl FnOnce()) {
     // Clear the buffer so it doesn't leak into subsequent tests on this thread.
     SNAPSHOT_BUFFER.with(|cell| cell.set(None));
 
-    let bytes = buffer.lock().unwrap().into_bytes().unwrap_or_else(|error| {
-        format!("failed to collect snapshot logs: {error}").into_bytes()
-    });
+    let bytes =
+        buffer.lock().unwrap().into_bytes().unwrap_or_else(|error| {
+            format!("failed to collect snapshot logs: {error}").into_bytes()
+        });
     let logs = normalize_snapshot_logs(String::from_utf8_lossy(&bytes).into_owned());
 
     insta::with_settings!({prepend_module_to_snapshot => false}, {
@@ -545,34 +575,34 @@ impl std::io::Write for ThreadLocalSnapshotWriterGuard {
     fn flush(&mut self) -> std::io::Result<()> {
         Ok(())
     }
+}
 
-    #[cfg(test)]
-    mod tests {
-        use super::SnapshotBuffer;
+#[cfg(test)]
+mod tests {
+    use super::SnapshotBuffer;
 
-        #[test]
-        fn snapshot_buffer_stays_in_memory_below_threshold() {
-            let mut buffer = SnapshotBuffer::new(32);
-            buffer.write(b"hello").unwrap();
-            buffer.write(b" world").unwrap();
+    #[test]
+    fn snapshot_buffer_stays_in_memory_below_threshold() {
+        let mut buffer = SnapshotBuffer::new(32);
+        buffer.write(b"hello").unwrap();
+        buffer.write(b" world").unwrap();
 
-            assert!(buffer.spill_path().is_none());
-            assert_eq!(buffer.into_bytes().unwrap(), b"hello world");
-        }
+        assert!(buffer.spill_path().is_none());
+        assert_eq!(buffer.into_bytes().unwrap(), b"hello world");
+    }
 
-        #[test]
-        fn snapshot_buffer_spills_to_disk_at_threshold() {
-            let mut buffer = SnapshotBuffer::new(8);
-            buffer.write(b"1234").unwrap();
-            buffer.write(b"5678").unwrap();
-            buffer.write(b"9").unwrap();
+    #[test]
+    fn snapshot_buffer_spills_to_disk_at_threshold() {
+        let mut buffer = SnapshotBuffer::new(8);
+        buffer.write(b"1234").unwrap();
+        buffer.write(b"5678").unwrap();
+        buffer.write(b"9").unwrap();
 
-            let spill_path = buffer.spill_path().expect("expected spill path");
-            assert!(spill_path.exists());
-            assert_eq!(buffer.into_bytes().unwrap(), b"123456789");
+        let spill_path = buffer.spill_path().expect("expected spill path");
+        assert!(spill_path.exists());
+        assert_eq!(buffer.into_bytes().unwrap(), b"123456789");
 
-            std::fs::remove_file(spill_path).unwrap();
-        }
+        std::fs::remove_file(spill_path).unwrap();
     }
 }
 
