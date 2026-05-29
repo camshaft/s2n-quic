@@ -477,9 +477,9 @@ fn run_sim_with_snapshot(f: impl FnOnce()) {
 
     let bytes = {
         let mut buffer = buffer.lock().unwrap();
+        let spill_path = buffer.spill_path();
         buffer.into_bytes().unwrap_or_else(|error| {
-            let source = buffer
-                .spill_path()
+            let source = spill_path
                 .map(|path| format!("disk spill file {}", path.display()))
                 .unwrap_or_else(|| "in-memory snapshot buffer".into());
             format!("failed to collect snapshot logs from {source}: {error}").into_bytes()
@@ -625,9 +625,7 @@ mod tests {
             .contains(&sanitize_thread_name(
                 std::thread::current().name().unwrap_or("unnamed")
             )));
-        let bytes = buffer.into_bytes().unwrap();
-        assert!(bytes.starts_with(b"12345678"));
-        assert_eq!(bytes, b"123456789");
+        assert_eq!(buffer.into_bytes().unwrap(), b"123456789");
 
         std::fs::remove_file(spill_path).unwrap();
     }
