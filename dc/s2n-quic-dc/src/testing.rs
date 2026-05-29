@@ -10,7 +10,7 @@ use s2n_quic::{provider::tls::Provider, server::Name};
 use s2n_quic_core::{crypto::tls::testing::certificates, time::StdClock};
 use std::{
     cell::Cell,
-    io::Write as _,
+    io::{BufWriter, Write as _},
     path::PathBuf,
     process,
     sync::{atomic::AtomicUsize, OnceLock},
@@ -89,7 +89,10 @@ const MAX_SPILL_FILE_CREATION_ATTEMPTS: usize = 128;
 
 enum SnapshotBufferStorage {
     InMemory(Vec<u8>),
-    OnDisk { path: PathBuf, file: std::fs::File },
+    OnDisk {
+        path: PathBuf,
+        file: BufWriter<std::fs::File>,
+    },
 }
 
 struct SnapshotBuffer {
@@ -151,7 +154,8 @@ impl SnapshotBuffer {
             return Ok(());
         };
 
-        let (mut file, path) = create_snapshot_spill_file()?;
+        let (file, path) = create_snapshot_spill_file()?;
+        let mut file = BufWriter::new(file);
         file.write_all(bytes)?;
         bytes.clear();
         bytes.shrink_to_fit();
@@ -174,13 +178,13 @@ fn create_snapshot_spill_file() -> std::io::Result<(std::fs::File, PathBuf)> {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
+    let thread_name = sanitize_thread_name(std::thread::current().name().unwrap_or("unnamed"));
     let temp_dir = std::env::temp_dir();
 
     for attempt in 0..MAX_SPILL_FILE_CREATION_ATTEMPTS {
         let path = temp_dir.join(format!(
-            "s2n-quic-dc-test-logs-{}-{:?}-{now}-{attempt}.log",
+            "s2n-quic-dc-test-logs-{thread_name}-{}-{now}-{attempt}.log",
             process::id(),
-            std::thread::current().id()
         ));
 
         match std::fs::OpenOptions::new()
@@ -201,6 +205,10 @@ fn create_snapshot_spill_file() -> std::io::Result<(std::fs::File, PathBuf)> {
             "failed to create unique snapshot spill log file after {MAX_SPILL_FILE_CREATION_ATTEMPTS} attempts"
         ),
     ))
+}
+
+fn sanitize_thread_name(name: &str) -> String {
+    name.replace([':', '/', '\\', '.', ' '], "_")
 }
 
 struct TracingDisabledGuard;
@@ -582,7 +590,7 @@ impl std::io::Write for ThreadLocalSnapshotWriterGuard {
 
 #[cfg(test)]
 mod tests {
-    use super::SnapshotBuffer;
+    use super::{sanitize_thread_name, SnapshotBuffer};
 
     #[test]
     fn snapshot_buffer_stays_in_memory_below_threshold() {
@@ -603,6 +611,13 @@ mod tests {
 
         let spill_path = buffer.spill_path().expect("expected spill path");
         assert!(spill_path.exists());
+        assert!(spill_path
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .contains(&sanitize_thread_name(
+                std::thread::current().name().unwrap_or("unnamed")
+            )));
         assert_eq!(buffer.into_bytes().unwrap(), b"123456789");
 
         std::fs::remove_file(spill_path).unwrap();
