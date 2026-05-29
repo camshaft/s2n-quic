@@ -1,7 +1,13 @@
 // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::socket::pool::descriptor::{Recycler, Unfilled};
+use crate::{
+    intrusive::List,
+    socket::{
+        channel::intrusive::unsync,
+        pool::descriptor::{RecycleAdapter, Recycler, Unfilled, UnsyncRecycler},
+    },
+};
 use core::fmt;
 
 pub mod descriptor;
@@ -9,6 +15,17 @@ pub mod descriptor;
 #[derive(Clone)]
 pub struct Pool {
     max_packet_size: u16,
+}
+
+/// Single-threaded descriptor reuse state for send pipelines.
+///
+/// Owns the unsync recycle channel keepalive, weak recycler handle written into
+/// newly allocated descriptors, and a local LIFO list for fast reuse.
+pub struct UnsyncReusePool {
+    _recycle_tx: unsync::Sender<RecycleAdapter<UnsyncRecycler>>,
+    recycle_weak: UnsyncRecycler,
+    recycle_rx: unsync::Receiver<RecycleAdapter<UnsyncRecycler>>,
+    local_pool: List<RecycleAdapter<UnsyncRecycler>>,
 }
 
 impl fmt::Debug for Pool {
@@ -46,6 +63,31 @@ impl Pool {
     #[inline]
     pub fn alloc_with_recycler<R: Recycler + Clone>(&self, recycler: &R) -> Option<Unfilled<R>> {
         Unfilled::new_with_recycler(self.max_packet_size, recycler.clone())
+    }
+}
+
+impl UnsyncReusePool {
+    #[inline]
+    pub fn new() -> Self {
+        let (recycle_tx, recycle_rx) = unsync::new_with_adapter::<RecycleAdapter<UnsyncRecycler>>();
+        let recycle_weak = UnsyncRecycler(recycle_tx.downgrade());
+        Self {
+            _recycle_tx: recycle_tx,
+            recycle_weak,
+            recycle_rx,
+            local_pool: List::new(),
+        }
+    }
+
+    /// Drains recycled descriptors and returns either a reused descriptor or a
+    /// fresh descriptor from `pool` with the local weak recycler attached.
+    #[inline]
+    pub fn alloc_or_reuse(&mut self, pool: &Pool) -> Option<Unfilled<UnsyncRecycler>> {
+        self.recycle_rx.drain_into(&mut self.local_pool);
+        self.local_pool
+            .pop_back()
+            .map(|recycled| Unfilled::<UnsyncRecycler>::from_recycled(recycled.into_descriptor()))
+            .or_else(|| pool.alloc_with_recycler(&self.recycle_weak))
     }
 }
 
