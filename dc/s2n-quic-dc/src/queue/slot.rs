@@ -416,15 +416,9 @@ fn validate_and_push<T, X>(
     slot_binding: &AtomicU64,
     inner: &mut HalfInner<T, X>,
 ) -> Result<half::AutoWake, super::Error<intrusive::Entry<T>>> {
-    match validate_binding_state(binding_id, slot_binding, &inner.flags) {
-        Err(ValidationError::StaleBinding) => return Err(super::Error::StaleBinding(entry)),
-        Err(ValidationError::Unallocated) => return Err(super::Error::Unallocated(entry)),
-        Err(ValidationError::FutureBinding) => return Err(super::Error::FutureBinding(entry)),
-        Err(ValidationError::SenderClosed) => return Err(super::Error::SenderClosed),
-        Err(ValidationError::HalfClosed) => return Err(super::Error::HalfClosed(entry)),
-        Ok(()) => {}
+    if let Err(error) = validate_binding_state(binding_id, slot_binding, &inner.flags) {
+        return Err(map_validation_error_entry(error, entry));
     }
-
     inner.queue.push_back(entry);
     Ok(inner.take_waker())
 }
@@ -435,24 +429,28 @@ fn validate_msg_dispatch(
     slot_binding: &AtomicU64,
     inner: &HalfInner<msg::Stream, StreamState>,
 ) -> Result<(), super::Error<()>> {
-    validate_binding_state(binding_id, slot_binding, &inner.flags).map_err(|error| match error {
-        ValidationError::StaleBinding => super::Error::StaleBinding(()),
-        ValidationError::Unallocated => super::Error::Unallocated(()),
-        ValidationError::FutureBinding => super::Error::FutureBinding(()),
-        ValidationError::SenderClosed => super::Error::SenderClosed,
-        ValidationError::HalfClosed => super::Error::HalfClosed(()),
-    })
+    validate_binding_state(binding_id, slot_binding, &inner.flags).map_err(map_validation_error_unit)
 }
 
-#[derive(Clone, Copy)]
+/// Internal-only binding-state validation result used to centralize checks.
+///
+/// Callers must map this value to the appropriate `super::Error` form before
+/// returning so public APIs continue to expose the existing error types.
+#[derive(Clone, Copy, Debug)]
 enum ValidationError {
+    /// Incoming binding is from an older generation (or equal while unallocated).
     StaleBinding,
+    /// Slot is unallocated, but incoming binding is newer than the last generation.
     Unallocated,
+    /// Incoming binding is from a not-yet-active future generation.
     FutureBinding,
+    /// Sender half has already been closed.
     SenderClosed,
+    /// Receiver half has already been closed.
     HalfClosed,
 }
 
+/// Validates binding generation and half-open state for dispatch under lock.
 #[inline]
 fn validate_binding_state(
     binding_id: VarInt,
@@ -482,6 +480,31 @@ fn validate_binding_state(
         return Err(ValidationError::HalfClosed);
     }
     Ok(())
+}
+
+#[inline]
+fn map_validation_error_entry<T>(
+    error: ValidationError,
+    entry: intrusive::Entry<T>,
+) -> super::Error<intrusive::Entry<T>> {
+    match error {
+        ValidationError::StaleBinding => super::Error::StaleBinding(entry),
+        ValidationError::Unallocated => super::Error::Unallocated(entry),
+        ValidationError::FutureBinding => super::Error::FutureBinding(entry),
+        ValidationError::SenderClosed => super::Error::SenderClosed,
+        ValidationError::HalfClosed => super::Error::HalfClosed(entry),
+    }
+}
+
+#[inline]
+fn map_validation_error_unit(error: ValidationError) -> super::Error<()> {
+    match error {
+        ValidationError::StaleBinding => super::Error::StaleBinding(()),
+        ValidationError::Unallocated => super::Error::Unallocated(()),
+        ValidationError::FutureBinding => super::Error::FutureBinding(()),
+        ValidationError::SenderClosed => super::Error::SenderClosed,
+        ValidationError::HalfClosed => super::Error::HalfClosed(()),
+    }
 }
 
 impl core::fmt::Debug for Slot {
