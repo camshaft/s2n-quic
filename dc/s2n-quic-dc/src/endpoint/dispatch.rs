@@ -30,7 +30,11 @@ use crate::{
 use bytes::BytesMut;
 use core::time::Duration;
 use s2n_quic_core::varint::VarInt;
-use std::{cell::RefCell, rc::Rc, sync::Arc};
+use std::{
+    cell::{Cell, RefCell},
+    rc::Rc,
+    sync::Arc,
+};
 
 pub(crate) enum Error {
     PeerStateLookup {
@@ -174,6 +178,7 @@ fn decrypt_fast_path(
     }
 
     // Scatter-decrypt directly into the slot buffer
+    let decrypt_failed = Cell::new(false);
     let waker = queue_view.send_msg(
         queue_pair.dest_queue_id,
         binding_id,
@@ -189,16 +194,23 @@ fn decrypt_fast_path(
             let dest = unsafe { bytes::buf::UninitSlice::from_raw_parts_mut(ptr, len as usize) };
             packet
                 .decrypt_into(opener, dest)
-                .map_err(|_| ())
+                .map_err(|_| {
+                    decrypt_failed.set(true);
+                })
                 .and_then(|written| {
                     if written == len as usize {
                         Ok(())
                     } else {
+                        decrypt_failed.set(true);
                         Err(())
                     }
                 })
         },
     );
+
+    if decrypt_failed.get() {
+        return None;
+    }
 
     Some(match waker {
         Ok(w) => {
