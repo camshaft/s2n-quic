@@ -2014,9 +2014,13 @@ fn write_msg_after_remote_reset_returns_connection_reset() {
 #[test]
 fn write_msg_after_shutdown_returns_broken_pipe() {
     sim(|| {
-        let (mut writer, _pusher) = make_server_pair();
+        let (mut writer, pusher) = make_server_pair();
 
         async move {
+            // Keep the pusher alive so the frame channel stays open; shutdown()
+            // sends a FIN frame and would fail with "frame channel closed" if
+            // the receiver were dropped before the task runs.
+            let _pusher = pusher;
             writer.shutdown().expect("shutdown should succeed");
             let mut payload = Bytes::from_static(b"data");
             let err = writer
@@ -2073,16 +2077,29 @@ fn write_msg_after_fin_sent_returns_broken_pipe() {
     });
 }
 
-/// Client write_msg sends QueueData-init on the first write (bootstrap message
-/// that triggers the server to send MAX_DATA), then blocks in InitSent waiting
-/// for the server to confirm.
+/// Client write_msg sends a QueueData-init frame on the first write (the
+/// bootstrap message that lets the server know which acceptor queue to use and
+/// triggers it to send MAX_DATA), then blocks on any subsequent write while in
+/// InitSent waiting for the server to confirm the stream.
+///
+/// Crucially, the client starts with `remote_max_data = VarInt::ZERO` (zero
+/// flow-control window), yet the first write still completes immediately — the
+/// init packet is always sent unconditionally so the stream can be established.
+/// See also `client_write_msg_zero_window_does_not_block_init`.
 #[test]
 fn client_write_msg_first_write_sends_queue_data_init_then_blocks() {
     sim(|| {
         let (mut writer, mut pusher) = make_client_pair();
+        // Clients always start with a zero remote window — the init frame must
+        // bypass this restriction.
+        assert_eq!(
+            writer.0.remote_max_data,
+            VarInt::ZERO,
+            "client must start with zero remote budget"
+        );
 
         async move {
-            // Bootstrap QueueData-init frame arrives first.
+            // The bootstrap QueueData-init frame must arrive.
             let frames = pusher.recv_frames().await;
             assert_eq!(frames.len(), 1, "expected exactly one QueueData-init frame");
             assert!(
@@ -2093,7 +2110,8 @@ fn client_write_msg_first_write_sends_queue_data_init_then_blocks() {
                         ..
                     }
                 ),
-                "expected QueueData with dest_acceptor_id (init frame)"
+                "expected QueueData with dest_acceptor_id (init frame), got {:?}",
+                frames.front().unwrap().header
             );
 
             // No further frames — writer is blocked in InitSent until MAX_DATA.
@@ -2109,16 +2127,35 @@ fn client_write_msg_first_write_sends_queue_data_init_then_blocks() {
         .spawn();
 
         async move {
-            // Payload larger than packet_size so write_msg uses QueueMsg, not the
-            // QueueData fast-path, but the init bootstrap still goes as QueueData-init.
-            let payload_len = writer.0.packet_size as usize + 1;
-
-            // First poll: sends bootstrap and transitions to InitSent, then blocks.
-            let blocked = core::future::poll_fn(|cx| {
-                let mut buf = Data::new(payload_len as u64);
-                match writer.0.poll_write_msg(
+            // Small payload (≤ packet_size) → send_queue_data_init fast-path.
+            // The write completes immediately despite the zero window because the
+            // init frame is always sent unconditionally.
+            let payload_len = writer.0.packet_size as usize;
+            let mut buf = Data::new(payload_len as u64);
+            let result = core::future::poll_fn(|cx| {
+                writer.0.poll_write_msg(
                     cx,
                     &mut buf,
+                    MsgFlags {
+                        is_fin: false,
+                        is_wakeup: false,
+                    },
+                )
+            })
+            .await;
+            assert!(result.is_ok(), "first write should succeed: {result:?}");
+            assert!(
+                writer.0.status.is_init_sent(),
+                "writer should be in InitSent after first write"
+            );
+
+            // A second write call must block: we are now in InitSent, waiting
+            // for the server's MAX_DATA before more data can be sent.
+            let blocked = core::future::poll_fn(|cx| {
+                let mut buf2 = Data::new(1);
+                match writer.0.poll_write_msg(
+                    cx,
+                    &mut buf2,
                     MsgFlags {
                         is_fin: false,
                         is_wakeup: false,
@@ -2131,11 +2168,69 @@ fn client_write_msg_first_write_sends_queue_data_init_then_blocks() {
             .await;
             assert!(
                 blocked,
-                "expected write_msg to block in InitSent after bootstrap message"
+                "second write_msg should block while in InitSent"
             );
+        }
+        .primary()
+        .spawn();
+    });
+}
+
+/// Client write_msg does NOT block on the first write even when the remote
+/// flow-control window is zero.
+///
+/// Servers correctly block when their budget is zero (see
+/// `server_write_msg_blocks_when_remote_budget_zero`), but clients in the Init
+/// state must always be able to send the bootstrap packet that establishes the
+/// stream and triggers the server to open a flow-control window.
+#[test]
+fn client_write_msg_zero_window_does_not_block_init() {
+    sim(|| {
+        let (mut writer, mut pusher) = make_client_pair();
+        // Clients always start with zero remote budget.
+        assert_eq!(writer.0.remote_max_data, VarInt::ZERO);
+
+        async move {
+            // The init frame must arrive despite the zero window.
+            let frames = pusher.recv_frames().await;
             assert!(
-                writer.0.status.is_init_sent(),
-                "writer should be in InitSent after first write"
+                !frames.is_empty(),
+                "client must send init frame even with zero window"
+            );
+            let has_init = frames.iter().any(|f| {
+                matches!(
+                    f.header,
+                    Header::QueueData {
+                        dest_acceptor_id: Some(_),
+                        ..
+                    } | Header::QueueMsg {
+                        dest_acceptor_id: Some(_),
+                        ..
+                    }
+                )
+            });
+            assert!(has_init, "init frame must carry dest_acceptor_id");
+        }
+        .primary()
+        .spawn();
+
+        async move {
+            let mut payload = Bytes::from_static(b"hello");
+            // First write should complete (not block) even with zero window.
+            let result = core::future::poll_fn(|cx| {
+                writer.0.poll_write_msg(
+                    cx,
+                    &mut payload,
+                    MsgFlags {
+                        is_fin: false,
+                        is_wakeup: false,
+                    },
+                )
+            })
+            .await;
+            assert!(
+                result.is_ok(),
+                "client first write must succeed despite zero window: {result:?}"
             );
         }
         .primary()
@@ -2161,23 +2256,24 @@ fn write_msg_coop_yields_after_budget_completions() {
         let ran = Arc::new(AtomicBool::new(false));
         let ran_clone = ran.clone();
 
-        // Competing task: marks itself as having run, then loops forever.
+        // Competing task: marks itself as having run, then keeps yielding.
+        // Non-primary so it doesn't prevent the sim from terminating once the
+        // writer task (the only primary) completes.
         async move {
             ran_clone.store(true, Ordering::Relaxed);
             loop {
                 bach::task::yield_now().await;
             }
         }
-        .primary()
         .spawn();
 
         // Frame-drainer task: keeps the frame channel from filling up.
+        // Also non-primary for the same reason.
         async move {
             loop {
                 let _ = pusher.recv_frames().await;
             }
         }
-        .primary()
         .spawn();
 
         async move {
