@@ -8,10 +8,11 @@
 //! binding IDs have the top two bits clear (QUIC VarInt encoding), so there is
 //! no overlap.
 
-use crate::tracing::*;
 use super::{
     half::{self, Flags, Half, HalfInner},
+    msg_table::MsgTable,
 };
+use crate::tracing::*;
 use crate::{endpoint::msg, intrusive};
 use core::{
     ptr::NonNull,
@@ -34,8 +35,12 @@ pub(crate) struct Slot {
     binding_id: AtomicU64,
     /// The slot's position in the page table, fixed at creation time.
     queue_id: u64,
-    pub(crate) stream: Half<msg::Stream>,
+    pub(crate) stream: Half<msg::Stream, StreamState>,
     pub(crate) control: Half<msg::Control>,
+}
+
+pub(crate) struct StreamState {
+    pub(crate) msg_table: Option<MsgTable>,
 }
 
 /// Result of `Slot::bind_and_push_stream`.
@@ -58,7 +63,7 @@ impl Slot {
         Self {
             binding_id: AtomicU64::new(UNALLOCATED),
             queue_id: queue_id.as_u64(),
-            stream: Half::new(),
+            stream: Half::with_extra(StreamState { msg_table: None }),
             control: Half::new(),
         }
     }
@@ -148,8 +153,9 @@ impl Slot {
             let mut stream = self.stream.inner.lock();
             validate_msg_dispatch(binding_id, &self.binding_id, &stream)?;
             let table = stream
+                .extra
                 .msg_table
-                .get_or_insert_with(super::msg_table::MsgTable::new);
+                .get_or_insert_with(MsgTable::new);
 
             match table.insert(
                 msg_id,
@@ -185,7 +191,7 @@ impl Slot {
             return Ok(half::AutoWake::default());
         }
         let local_queue = {
-            let Some(table) = stream.msg_table.as_mut() else {
+            let Some(table) = stream.extra.msg_table.as_mut() else {
                 return Ok(half::AutoWake::default());
             };
             if !write_ok {
@@ -224,7 +230,10 @@ impl Slot {
                     trace!(should_wake, has_waker, "slot::send_msg segment complete");
                     Ok(waker)
                 } else {
-                    trace!(should_wake, "slot::send_msg segment complete (no wakeup flag)");
+                    trace!(
+                        should_wake,
+                        "slot::send_msg segment complete (no wakeup flag)"
+                    );
                     Ok(half::AutoWake::default())
                 }
             }
@@ -251,7 +260,7 @@ impl Slot {
 
         Self::allocate_and_open_locked(&mut s, &mut c, &self.binding_id, binding_id)?;
         // Clear any poisoned msg_table from the previous binding.
-        s.msg_table = None;
+        s.extra.msg_table = None;
         Ok(true)
     }
 
@@ -293,7 +302,7 @@ impl Slot {
                 .map_err(|_| super::Error::SenderClosed)?;
 
             // Clear any poisoned msg_table from the previous binding.
-            s.msg_table = None;
+            s.extra.msg_table = None;
 
             s.queue.push_back(entry);
             let waker = s.take_waker();
@@ -333,7 +342,7 @@ impl Slot {
         }
 
         // Poison the msg_table so in-flight chunk writes see Poisoned on complete.
-        if let Some(table) = s.msg_table.as_mut() {
+        if let Some(table) = s.extra.msg_table.as_mut() {
             table.poison();
         }
 
@@ -372,7 +381,7 @@ impl Slot {
     /// half locks are already held.  Returns `Err(Closed)` if either sender
     /// is gone.
     fn allocate_and_open_locked(
-        s: &mut HalfInner<msg::Stream>,
+        s: &mut HalfInner<msg::Stream, StreamState>,
         c: &mut HalfInner<msg::Control>,
         binding_id_cell: &AtomicU64,
         binding_id: VarInt,
@@ -433,7 +442,7 @@ fn validate_and_push<T>(
 fn validate_msg_dispatch(
     binding_id: VarInt,
     slot_binding: &AtomicU64,
-    inner: &HalfInner<msg::Stream>,
+    inner: &HalfInner<msg::Stream, StreamState>,
 ) -> Result<(), super::Error<()>> {
     let raw = slot_binding.load(Ordering::Relaxed);
     let stored = raw & !UNALLOCATED_BIT;
@@ -716,7 +725,7 @@ mod tests {
         });
 
         // msg_table exists (even if entries were drained, the table itself is Some)
-        assert!(slot.stream.inner.lock().msg_table.is_some());
+        assert!(slot.stream.inner.lock().extra.msg_table.is_some());
 
         // Simulate receiver drop + mark unallocated
         simulate_receiver_drop(&slot);
@@ -726,7 +735,7 @@ mod tests {
         assert!(matches!(result, Ok(BindState::NewBinding(_))));
 
         // msg_table should be cleared — new sender starts fresh
-        assert!(slot.stream.inner.lock().msg_table.is_none());
+        assert!(slot.stream.inner.lock().extra.msg_table.is_none());
     }
 
     #[test]
@@ -824,6 +833,38 @@ mod tests {
 
         assert!(result.is_ok());
         assert!(write_called.load(Ordering::Relaxed));
-        assert!(slot.stream.inner.lock().msg_table.is_none());
+        assert!(slot.stream.inner.lock().extra.msg_table.is_none());
+        assert_eq!(slot.stream.inner.lock().queue.len(), 1);
+    }
+
+    #[test]
+    fn push_msg_tolerates_rebind_on_write_error() {
+        let slot = Slot::with_queue_id(v(0));
+        slot.allocate_and_open(v(1)).unwrap();
+        let write_called = AtomicBool::new(false);
+
+        let result = slot.push_msg(
+            v(1),
+            0,
+            0,
+            4096,
+            8192,
+            0,
+            4096,
+            false,
+            true,
+            |_ptr, _len| {
+                write_called.store(true, Ordering::Relaxed);
+                simulate_receiver_drop(&slot);
+                let result = slot.bind_and_push_stream(v(2), make_stream_entry());
+                assert!(matches!(result, Ok(BindState::NewBinding(_))));
+                Err::<(), ()>(())
+            },
+        );
+
+        assert!(result.is_ok());
+        assert!(write_called.load(Ordering::Relaxed));
+        assert!(slot.stream.inner.lock().extra.msg_table.is_none());
+        assert_eq!(slot.stream.inner.lock().queue.len(), 1);
     }
 }
