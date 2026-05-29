@@ -65,6 +65,11 @@ enum DecryptResult {
     SlowPath(BytesMut),
 }
 
+enum FastPathError {
+    HeaderMismatch,
+    WriteFailed,
+}
+
 /// Fast path: decrypt a single-QueueMsg-frame packet directly into the slot buffer.
 ///
 /// Handles both init (with binding setup) and non-init frames.
@@ -83,7 +88,7 @@ fn decrypt_fast_path(
     stream_clock: &crate::time::DefaultClock,
     reader_metrics: &Arc<crate::stream::metrics::ReaderMetrics>,
     writer_metrics: &Arc<crate::stream::metrics::WriterMetrics>,
-) -> Result<AutoWake, ()> {
+) -> Result<AutoWake, FastPathError> {
     let Header::QueueMsg {
         queue_pair,
         binding_id,
@@ -97,7 +102,7 @@ fn decrypt_fast_path(
         dest_acceptor_id,
     } = header
     else {
-        return Err(());
+        return Err(FastPathError::HeaderMismatch);
     };
 
     // Handle init: bind the slot before attempting push_msg
@@ -213,7 +218,7 @@ fn decrypt_fast_path(
             w
         }
         Err(crate::queue::MsgError::Queue(_)) => AutoWake::default(),
-        Err(crate::queue::MsgError::Write(_)) => return Err(()),
+        Err(crate::queue::MsgError::Write(_)) => return Err(FastPathError::WriteFailed),
     })
 }
 
