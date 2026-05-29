@@ -157,8 +157,6 @@ impl SnapshotBuffer {
         let (file, path) = create_snapshot_spill_file()?;
         let mut file = BufWriter::new(file);
         file.write_all(bytes)?;
-        bytes.clear();
-        bytes.shrink_to_fit();
 
         eprintln!(
             "s2n-quic-dc snapshot log buffer exceeded {} bytes; spilling to {}",
@@ -462,8 +460,8 @@ fn is_snapshots_disabled() -> bool {
 fn run_sim_with_snapshot(f: impl FnOnce()) {
     let snapshot_name = std::thread::current()
         .name()
-        .unwrap_or("unknown")
-        .replace([':', '/', '\\', '.', ' '], "_");
+        .map(sanitize_thread_name)
+        .unwrap_or_else(|| "unknown".into());
 
     let buffer = Arc::new(Mutex::new(SnapshotBuffer::new(SNAPSHOT_SPILL_THRESHOLD)));
     SNAPSHOT_BUFFER.with(|cell| cell.set(Some(buffer.clone())));
