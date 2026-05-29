@@ -170,12 +170,13 @@ impl Slot {
             }
         }
 
-        // Lock msg_table, insert (checkout)
-        let (ptr, expected_len, chunk_index) = {
+        // Lock msg_table, insert (checkout), write, and complete/cancel while keeping
+        // the checked-out buffer alive across the callback.
+        let local_queue = {
             let mut table = self.msg_table.lock();
             let table = table.get_or_insert_with(MsgTable::new);
 
-            match table.insert(
+            let checkout = match table.insert(
                 msg_id,
                 stream_offset,
                 message_size,
@@ -185,30 +186,25 @@ impl Slot {
                 is_fin,
                 is_wakeup,
             ) {
-                Ok(checkout) => (checkout.ptr, checkout.expected_len, checkout.chunk_index),
+                Ok(checkout) => checkout,
                 Err(e) => {
                     trace!(msg_id, chunk_index, ?e, "slot::send_msg insert failed");
                     return Ok(half::AutoWake::default());
                 }
-            }
-        };
+            };
 
-        // Invoke the write callback (outside both locks).
-        // For the mixed path: memcpy from decrypted BytesMut.
-        // For the fast path: scatter-decrypt directly into ptr.
-        let write_ok = write_fn(ptr, expected_len).is_ok();
-
-        // Lock msg_table, complete or cancel the chunk
-        let local_queue = {
-            let mut guard = self.msg_table.lock();
-            let table = guard.as_mut().expect("table must exist after checkout");
+            // Keep msg_table locked while writing so the checked-out BytesMut storage
+            // remains alive even if receivers are concurrently dropped/rebound.
+            let write_ok = write_fn(checkout.ptr, checkout.expected_len).is_ok();
 
             if !write_ok {
-                table.cancel_checkout(msg_id, chunk_index);
+                table.cancel_checkout(msg_id, checkout.chunk_index);
                 return Ok(half::AutoWake::default());
             }
 
-            match table.complete(msg_id, chunk_index) {
+            validate_binding(binding_id, self.binding_id.load(Ordering::Relaxed))?;
+
+            match table.complete(msg_id, checkout.chunk_index) {
                 super::msg_table::CompleteOutcome::Ready => {
                     let mut queue = intrusive::Queue::new();
                     let mut should_wake = false;
@@ -233,6 +229,13 @@ impl Slot {
         match local_queue {
             Some((mut queue, should_wake)) => {
                 let mut stream = self.stream.inner.lock();
+                validate_binding(binding_id, self.binding_id.load(Ordering::Relaxed))?;
+                if !stream.flags.contains(Flags::HAS_RECEIVER) {
+                    return Err(super::Error::HalfClosed(()));
+                }
+                if !stream.flags.contains(Flags::HAS_SENDER) {
+                    return Err(super::Error::SenderClosed);
+                }
                 stream.queue.append(&mut queue);
                 if should_wake {
                     let waker = stream.take_waker();
@@ -423,6 +426,23 @@ fn validate_and_push<T>(
         // Slot is free.  Compare against the last binding to classify the error.
         if incoming <= stored {
             return Err(super::Error::StaleBinding(entry));
+        }
+
+        #[inline]
+        fn validate_binding(binding_id: VarInt, stored: u64) -> Result<(), super::Error<()>> {
+            let incoming = binding_id.as_u64();
+
+            if stored & UNALLOCATED_BIT != 0 {
+                return Err(super::Error::Unallocated(()));
+            }
+            if incoming < stored {
+                return Err(super::Error::StaleBinding(()));
+            }
+            if incoming > stored {
+                return Err(super::Error::FutureBinding(()));
+            }
+
+            Ok(())
         }
         return Err(super::Error::Unallocated(entry));
     }
@@ -772,5 +792,48 @@ mod tests {
         // Now the waker SHOULD fire
         drop(result);
         assert_eq!(wake_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn push_msg_revalidates_binding_after_write_before_complete() {
+        use std::{
+            sync::{
+                Arc,
+                atomic::{AtomicBool, Ordering as AtomicOrdering},
+                mpsc,
+            },
+            thread,
+            time::Duration,
+        };
+
+        let slot = Arc::new(Slot::with_queue_id(v(0)));
+        slot.allocate_and_open(v(1)).unwrap();
+
+        let (start_tx, start_rx) = mpsc::channel::<()>();
+        let (dropped_tx, dropped_rx) = mpsc::channel::<()>();
+        let finished = Arc::new(AtomicBool::new(false));
+
+        let slot2 = slot.clone();
+        let finished2 = finished.clone();
+        let rebind = thread::spawn(move || {
+            start_rx.recv().unwrap();
+            simulate_receiver_drop(&slot2);
+            dropped_tx.send(()).unwrap();
+            let result = slot2.bind_and_push_stream(v(2), make_stream_entry());
+            assert!(matches!(result, Ok(BindState::NewBinding(_))));
+            finished2.store(true, AtomicOrdering::SeqCst);
+        });
+
+        let result = slot.push_msg(v(1), 0, 0, 8192, 8192, 0, 8192, false, true, |ptr, len| {
+            start_tx.send(()).unwrap();
+            dropped_rx.recv().unwrap();
+            thread::sleep(Duration::from_millis(20));
+            assert!(!finished.load(AtomicOrdering::SeqCst));
+            unsafe { core::ptr::write_bytes(ptr, 0xAB, len as usize) };
+            Ok::<(), ()>(())
+        });
+
+        assert!(matches!(result, Err(super::super::Error::Unallocated(()))));
+        rebind.join().unwrap();
     }
 }
