@@ -2556,9 +2556,9 @@ fn queue_msg_multi_chunk() {
     });
 }
 
-/// Verifies that write_msg keeps a single QueueMsg segment even when the sender's
-/// local send window is smaller than the message. The receiver should observe a
-/// single contiguous chunk when reading into ByteVec.
+/// Verifies that write_msg segment sizing is not capped by a small send window.
+/// With a 2 MiB message and 64 KiB window, transfer should block on flow control,
+/// but receiver chunks should still include full-sized QueueMsg segments.
 #[test]
 fn queue_msg_send_window_smaller_than_segment() {
     use crate::{
@@ -2571,8 +2571,8 @@ fn queue_msg_send_window_smaller_than_segment() {
         use crate::testing::ext::*;
 
         let acceptor_id = VarInt::from_u8(1);
-        const MSG_SIZE: usize = 64 * 1024;
-        let send_window = VarInt::from_u16(8 * 1024);
+        const MSG_SIZE: usize = 2 * 1024 * 1024;
+        let send_window = VarInt::from_u32(64 * 1024);
 
         async move {
             let server = Server::new();
@@ -2580,31 +2580,30 @@ fn queue_msg_send_window_smaller_than_segment() {
                 .register_acceptor_channel(acceptor_id, 8)
                 .expect("acceptor registration failed");
 
-            while let Some(stream) = acceptor.recv().await {
-                async move {
-                    let (mut reader, _writer) = stream.into_split();
-                    let mut recv = ByteVec::new();
-                    loop {
-                        let n = timeout(5.s(), reader.read_into(&mut recv))
-                            .await
-                            .expect("server read timeout")
-                            .expect("server read");
-                        if n == 0 {
-                            break;
-                        }
-                    }
-                    assert_eq!(recv.len(), MSG_SIZE);
-                    assert_eq!(
-                        recv.chunks().count(),
-                        1,
-                        "single QueueMsg segment should be delivered as one chunk"
-                    );
+            let stream = timeout(5.s(), acceptor.recv())
+                .await
+                .expect("server accept timeout")
+                .expect("server stream closed");
+            let (mut reader, _writer) = stream.into_split();
+            let mut recv = ByteVec::new();
+            loop {
+                let n = timeout(5.s(), reader.read_into(&mut recv))
+                    .await
+                    .expect("server read timeout")
+                    .expect("server read");
+                if n == 0 {
+                    break;
                 }
-                .primary()
-                .spawn();
             }
+            assert_eq!(recv.len(), MSG_SIZE);
+
+            assert!(
+                recv.chunks().count() > 1,
+                "2 MiB payload should span multiple QueueMsg segments"
+            );
         }
         .group("server")
+        .primary()
         .spawn();
 
         async move {
