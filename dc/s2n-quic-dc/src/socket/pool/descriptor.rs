@@ -720,12 +720,12 @@ impl<R: Recycler> s2n_quic_core::buffer::reader::Storage for Filled<R> {
     }
 }
 
-impl Filled {
+impl<R: Recycler> Filled<R> {
     /// Creates a deep copy of this filled descriptor by allocating a new buffer
     /// and copying the payload bytes. This is safe because the copy gets its own
     /// exclusive memory region.
     pub fn deep_copy(&self) -> Option<Self> {
-        let Some(unfilled) = Unfilled::new(self.len) else {
+        let Some(unfilled) = Unfilled::<R>::new(self.len) else {
             return None;
         };
         let payload = self.payload();
@@ -925,7 +925,7 @@ pub struct SegmentsIter<R: Recycler = SyncRecycler> {
     segment_len: u16,
 }
 
-impl SegmentsIter {
+impl<R: Recycler> SegmentsIter<R> {
     /// Creates an empty iterator that yields no segments.
     pub const fn empty() -> Self {
         Self {

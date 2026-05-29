@@ -619,8 +619,8 @@ pub(crate) struct Assembler<R, Clk, C, A> {
     freed_batch_tx: crate::queue::FreedBatchTx,
     pub(crate) counters: AssemblerCounters,
     send_counters: Rc<super::counters::Send>,
-    /// Sender keepalive: while alive, recycled `Segments` buffers are returned to
-    /// `recycle_rx` rather than being freed back to the OS allocator.
+    /// Sender keepalive: keeps the recycle channel open so that `Arc::strong_count > 1`
+    /// and `recycle_rx` does not treat the channel as closed when polling for recycled buffers.
     _recycle_tx: unsync_channel::Sender<descriptor::RecycleAdapter<UnsyncRecycler>>,
     /// Weak reference stored in each newly-allocated descriptor so that, on drop,
     /// the buffer is pushed back into the recycle channel without a mutex.
@@ -832,7 +832,6 @@ where
                 self.source_sender_id,
                 self.source_control_port,
                 &self.gso,
-                &self.pool,
                 pre_alloc,
                 &mut self.header_buf,
                 &mut cancelled,
