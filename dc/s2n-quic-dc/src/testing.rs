@@ -81,6 +81,9 @@ thread_local! {
     /// Per-test snapshot buffer. Set by `run_sim_with_snapshot`, read by the
     /// snapshot fmt layer's MakeWriter.
     static SNAPSHOT_BUFFER: Cell<Option<Arc<Mutex<SnapshotBuffer>>>> = const { Cell::new(None) };
+    /// Per-test stdout spill buffer. Set by `run_sim_with_snapshot`, read by the
+    /// stdout fmt layer's MakeWriter.
+    static STDOUT_BUFFER: Cell<Option<Arc<Mutex<SnapshotBuffer>>>> = const { Cell::new(None) };
 }
 
 static SNAPSHOT_MODE_DEPTH: AtomicUsize = AtomicUsize::new(0);
@@ -474,13 +477,20 @@ fn run_sim_with_snapshot(f: impl FnOnce()) {
         .unwrap_or_else(|| "unknown".into());
 
     let buffer = Arc::new(Mutex::new(SnapshotBuffer::new(SNAPSHOT_SPILL_THRESHOLD)));
+    let stdout_buffer = Arc::new(Mutex::new(SnapshotBuffer::new(SNAPSHOT_SPILL_THRESHOLD)));
     SNAPSHOT_BUFFER.with(|cell| cell.set(Some(buffer.clone())));
+    STDOUT_BUFFER.with(|cell| cell.set(Some(stdout_buffer.clone())));
     let _snapshot_mode_guard = SnapshotModeGuard::enter();
 
     run_sim(f);
 
     // Clear the buffer so it doesn't leak into subsequent tests on this thread.
     SNAPSHOT_BUFFER.with(|cell| cell.set(None));
+    STDOUT_BUFFER.with(|cell| cell.set(None));
+
+    if let Err(error) = stdout_buffer.lock().unwrap().flush() {
+        eprintln!("failed to flush stdout spill logs: {error}");
+    }
 
     let bytes = {
         let mut buffer = buffer.lock().unwrap();
@@ -540,28 +550,44 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for StdoutWriter {
 
     fn make_writer(&'a self) -> Self::Writer {
         let active = !TRACING_DISABLED_DEPTH.with(|depth| depth.get() > 0);
-        StdoutWriterGuard { active }
+        let buffer = STDOUT_BUFFER.with(|cell| {
+            let opt = cell.take();
+            let cloned = opt.clone();
+            cell.set(opt);
+            cloned
+        });
+        StdoutWriterGuard { active, buffer }
     }
 }
 
 struct StdoutWriterGuard {
     active: bool,
+    buffer: Option<Arc<Mutex<SnapshotBuffer>>>,
 }
 
 impl std::io::Write for StdoutWriterGuard {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        if self.active {
-            std::io::stderr().write(buf)
-        } else {
+        if !self.active {
+            return Ok(buf.len());
+        }
+
+        if let Some(buffer) = &self.buffer {
+            buffer.lock().unwrap().write(buf)?;
             Ok(buf.len())
+        } else {
+            std::io::stderr().write(buf)
         }
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
-        if self.active {
-            std::io::stderr().flush()
+        if !self.active {
+            return Ok(());
+        }
+
+        if let Some(buffer) = &self.buffer {
+            buffer.lock().unwrap().flush()
         } else {
-            Ok(())
+            std::io::stderr().flush()
         }
     }
 }
@@ -607,7 +633,9 @@ impl std::io::Write for ThreadLocalSnapshotWriterGuard {
 
 #[cfg(test)]
 mod tests {
-    use super::{sanitize_thread_name, SnapshotBuffer};
+    use super::{sanitize_thread_name, SnapshotBuffer, StdoutWriter, STDOUT_BUFFER};
+    use std::{io::Write as _, sync::{Arc, Mutex}};
+    use tracing_subscriber::fmt::MakeWriter as _;
 
     #[test]
     fn snapshot_buffer_stays_in_memory_below_threshold() {
@@ -635,6 +663,27 @@ mod tests {
             .contains(&sanitize_thread_name(
                 std::thread::current().name().unwrap_or("unnamed")
             )));
+        assert_eq!(buffer.into_bytes().unwrap(), b"123456789");
+
+        std::fs::remove_file(spill_path).unwrap();
+    }
+
+    #[test]
+    fn stdout_writer_spills_to_disk_at_threshold() {
+        let buffer = Arc::new(Mutex::new(SnapshotBuffer::new(8)));
+        STDOUT_BUFFER.with(|cell| cell.set(Some(buffer.clone())));
+
+        let mut writer = StdoutWriter.make_writer();
+        writer.write_all(b"1234").unwrap();
+        writer.write_all(b"5678").unwrap();
+        writer.write_all(b"9").unwrap();
+        writer.flush().unwrap();
+
+        STDOUT_BUFFER.with(|cell| cell.set(None));
+
+        let mut buffer = buffer.lock().unwrap();
+        let spill_path = buffer.spill_path().expect("expected spill path");
+        assert!(spill_path.exists());
         assert_eq!(buffer.into_bytes().unwrap(), b"123456789");
 
         std::fs::remove_file(spill_path).unwrap();
