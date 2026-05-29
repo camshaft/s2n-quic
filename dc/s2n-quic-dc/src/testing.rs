@@ -81,9 +81,6 @@ thread_local! {
     /// Per-test snapshot buffer. Set by `run_sim_with_snapshot`, read by the
     /// snapshot fmt layer's MakeWriter.
     static SNAPSHOT_BUFFER: Cell<Option<Arc<Mutex<SnapshotBuffer>>>> = const { Cell::new(None) };
-    /// Per-test stdout spill buffer. Set by `run_sim_with_snapshot`, read by the
-    /// stdout fmt layer's MakeWriter.
-    static STDOUT_BUFFER: Cell<Option<Arc<Mutex<SnapshotBuffer>>>> = const { Cell::new(None) };
 }
 
 static SNAPSHOT_MODE_DEPTH: AtomicUsize = AtomicUsize::new(0);
@@ -488,28 +485,23 @@ fn run_sim_with_snapshot(f: impl FnOnce()) {
         .unwrap_or_else(|| "unknown".into());
 
     let buffer = Arc::new(Mutex::new(SnapshotBuffer::new(SNAPSHOT_SPILL_THRESHOLD)));
-    let stdout_buffer = Arc::new(Mutex::new(SnapshotBuffer::new(SNAPSHOT_SPILL_THRESHOLD)));
     SNAPSHOT_BUFFER.with(|cell| cell.set(Some(buffer.clone())));
-    STDOUT_BUFFER.with(|cell| cell.set(Some(stdout_buffer.clone())));
     let _snapshot_mode_guard = SnapshotModeGuard::enter();
 
     run_sim(f);
 
     // Clear the buffer so it doesn't leak into subsequent tests on this thread.
     SNAPSHOT_BUFFER.with(|cell| cell.set(None));
-    STDOUT_BUFFER.with(|cell| cell.set(None));
-
-    let mut stdout_buffer = stdout_buffer.lock().unwrap();
-    stdout_buffer.flush().unwrap_or_else(|error| {
-        let stdout_source = stdout_buffer
-            .spill_path()
-            .map(|path| format!("disk spill file {}", path.display()))
-            .unwrap_or_else(|| "in-memory stdout spill buffer".into());
-        panic!("failed to flush stdout spill logs from {stdout_source}: {error}")
-    });
 
     let bytes = {
         let mut buffer = buffer.lock().unwrap();
+        buffer.flush().unwrap_or_else(|error| {
+            let source = buffer
+                .spill_path()
+                .map(|path| format!("disk spill file {}", path.display()))
+                .unwrap_or_else(|| "in-memory snapshot buffer".into());
+            panic!("failed to flush snapshot logs from {source}: {error}")
+        });
         let spill_path = buffer.spill_path();
         buffer.into_bytes().unwrap_or_else(|error| {
             let source = spill_path
@@ -566,7 +558,7 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for StdoutWriter {
 
     fn make_writer(&'a self) -> Self::Writer {
         let active = !TRACING_DISABLED_DEPTH.with(|depth| depth.get() > 0);
-        let buffer = STDOUT_BUFFER.with(clone_thread_local_buffer);
+        let buffer = SNAPSHOT_BUFFER.with(clone_thread_local_buffer);
         StdoutWriterGuard { active, buffer }
     }
 }
@@ -638,7 +630,7 @@ impl std::io::Write for ThreadLocalSnapshotWriterGuard {
 
 #[cfg(test)]
 mod tests {
-    use super::{sanitize_thread_name, SnapshotBuffer, StdoutWriter, STDOUT_BUFFER};
+    use super::{sanitize_thread_name, SnapshotBuffer, StdoutWriter, SNAPSHOT_BUFFER};
     use std::{
         io::Write as _,
         sync::{Arc, Mutex},
@@ -679,7 +671,7 @@ mod tests {
     #[test]
     fn stdout_writer_spills_to_disk_at_threshold() {
         let buffer = Arc::new(Mutex::new(SnapshotBuffer::new(8)));
-        STDOUT_BUFFER.with(|cell| cell.set(Some(buffer.clone())));
+        SNAPSHOT_BUFFER.with(|cell| cell.set(Some(buffer.clone())));
 
         let mut writer = StdoutWriter.make_writer();
         writer.write_all(b"1234").unwrap();
@@ -687,7 +679,7 @@ mod tests {
         writer.write_all(b"9").unwrap();
         writer.flush().unwrap();
 
-        STDOUT_BUFFER.with(|cell| cell.set(None));
+        SNAPSHOT_BUFFER.with(|cell| cell.set(None));
 
         let mut buffer = buffer.lock().unwrap();
         let spill_path = buffer.spill_path().expect("expected spill path");
@@ -699,7 +691,7 @@ mod tests {
 
     #[test]
     fn stdout_writer_falls_back_without_spill_buffer() {
-        STDOUT_BUFFER.with(|cell| cell.set(None));
+        SNAPSHOT_BUFFER.with(|cell| cell.set(None));
 
         let mut writer = StdoutWriter.make_writer();
         assert_eq!(writer.write(b"x").unwrap(), 1);
