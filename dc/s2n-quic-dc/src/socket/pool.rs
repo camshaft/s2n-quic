@@ -183,7 +183,7 @@ impl SyncReuseHandle {
     }
 
     #[inline]
-    pub fn local_pool(&self) -> Rc<RefCell<List<RecycleAdapter<SyncRecycler>>>> {
+    pub(crate) fn local_pool(&self) -> Rc<RefCell<List<RecycleAdapter<SyncRecycler>>>> {
         self.local_pool.clone()
     }
 }
