@@ -30,11 +30,7 @@ use crate::{
 use bytes::BytesMut;
 use core::time::Duration;
 use s2n_quic_core::varint::VarInt;
-use std::{
-    cell::{Cell, RefCell},
-    rc::Rc,
-    sync::Arc,
-};
+use std::{cell::RefCell, rc::Rc, sync::Arc};
 
 pub(crate) enum Error {
     PeerStateLookup {
@@ -178,7 +174,6 @@ fn decrypt_fast_path(
     }
 
     // Scatter-decrypt directly into the slot buffer
-    let decrypt_failed = Cell::new(false);
     let waker = queue_view.send_msg(
         queue_pair.dest_queue_id,
         binding_id,
@@ -194,23 +189,16 @@ fn decrypt_fast_path(
             let dest = unsafe { bytes::buf::UninitSlice::from_raw_parts_mut(ptr, len as usize) };
             packet
                 .decrypt_into(opener, dest)
-                .map_err(|_| {
-                    decrypt_failed.set(true);
-                })
+                .map_err(|_| ())
                 .and_then(|written| {
                     if written == len as usize {
                         Ok(())
                     } else {
-                        decrypt_failed.set(true);
                         Err(())
                     }
                 })
         },
     );
-
-    if decrypt_failed.get() {
-        return None;
-    }
 
     Some(match waker {
         Ok(w) => {
@@ -224,7 +212,8 @@ fn decrypt_fast_path(
             }
             w
         }
-        Err(_) => AutoWake::default(),
+        Err(crate::queue::MsgError::Queue(_)) => AutoWake::default(),
+        Err(crate::queue::MsgError::Write(_)) => return None,
     })
 }
 
@@ -927,20 +916,21 @@ fn handle_queue_msg(
             }
             let _ = waker_sink.send(waker);
         }
-        Err(crate::queue::Error::Unallocated(_)) => {
+        Err(crate::queue::MsgError::Queue(crate::queue::Error::Unallocated(_))) => {
             counters.rx_data_unallocated.add(1);
         }
-        Err(crate::queue::Error::HalfClosed(_)) => {
+        Err(crate::queue::MsgError::Queue(crate::queue::Error::HalfClosed(_))) => {
             counters.rx_data_half_closed.add(1);
         }
-        Err(crate::queue::Error::StaleBinding(_)) => {
+        Err(crate::queue::MsgError::Queue(crate::queue::Error::StaleBinding(_))) => {
             counters.rx_data_stale_binding.add(1);
         }
-        Err(crate::queue::Error::FutureBinding(_)) => {
+        Err(crate::queue::MsgError::Queue(crate::queue::Error::FutureBinding(_))) => {
             counters.rx_data_future_binding.add(1);
         }
-        Err(crate::queue::Error::SenderClosed) => {}
-        Err(crate::queue::Error::CapExceeded(_)) => {}
+        Err(crate::queue::MsgError::Queue(crate::queue::Error::SenderClosed)) => {}
+        Err(crate::queue::MsgError::Queue(crate::queue::Error::CapExceeded(_))) => {}
+        Err(crate::queue::MsgError::Write(_)) => {}
     }
 }
 
