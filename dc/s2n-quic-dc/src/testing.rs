@@ -143,6 +143,13 @@ impl SnapshotBuffer {
         }
     }
 
+    fn flush(&mut self) -> std::io::Result<()> {
+        if let SnapshotBufferStorage::OnDisk { file, .. } = &mut self.storage {
+            file.flush()?;
+        }
+        Ok(())
+    }
+
     #[cfg(test)]
     fn spill_path(&self) -> Option<PathBuf> {
         match &self.storage {
@@ -591,6 +598,9 @@ impl std::io::Write for ThreadLocalSnapshotWriterGuard {
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
+        if let Some(buffer) = &self.buffer {
+            buffer.lock().unwrap().flush()?;
+        }
         Ok(())
     }
 }
