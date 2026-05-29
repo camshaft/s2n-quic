@@ -152,10 +152,7 @@ impl Slot {
         let (ptr, expected_len, chunk_index, keep_alive) = {
             let mut stream = self.stream.inner.lock();
             validate_msg_dispatch(binding_id, &self.binding_id, &stream)?;
-            let table = stream
-                .extra
-                .msg_table
-                .get_or_insert_with(MsgTable::new);
+            let table = stream.extra.msg_table.get_or_insert_with(MsgTable::new);
 
             match table.insert(
                 msg_id,
@@ -402,11 +399,11 @@ impl Slot {
 }
 
 #[inline]
-fn validate_and_push<T>(
+fn validate_and_push<T, X>(
     binding_id: VarInt,
     entry: intrusive::Entry<T>,
     slot_binding: &AtomicU64,
-    inner: &mut HalfInner<T>,
+    inner: &mut HalfInner<T, X>,
 ) -> Result<half::AutoWake, super::Error<intrusive::Entry<T>>> {
     let raw = slot_binding.load(Ordering::Relaxed);
     let stored = raw & !UNALLOCATED_BIT;
