@@ -222,6 +222,17 @@ fn sanitize_thread_name(name: &str) -> String {
     name.replace([':', '/', '\\', '.', ' '], "_")
 }
 
+fn clone_thread_local_buffer(
+    cell: &Cell<Option<Arc<Mutex<SnapshotBuffer>>>>,
+) -> Option<Arc<Mutex<SnapshotBuffer>>> {
+    // `Cell::get` requires `Copy`, but this thread-local value is `Option<Arc<_>>`.
+    // Temporarily take, clone, and restore to safely duplicate the Arc.
+    let opt = cell.take();
+    let cloned = opt.clone();
+    cell.set(opt);
+    cloned
+}
+
 struct TracingDisabledGuard;
 
 impl TracingDisabledGuard {
@@ -488,9 +499,14 @@ fn run_sim_with_snapshot(f: impl FnOnce()) {
     SNAPSHOT_BUFFER.with(|cell| cell.set(None));
     STDOUT_BUFFER.with(|cell| cell.set(None));
 
-    if let Err(error) = stdout_buffer.lock().unwrap().flush() {
-        eprintln!("failed to flush stdout spill logs: {error}");
-    }
+    let mut stdout_buffer = stdout_buffer.lock().unwrap();
+    stdout_buffer.flush().unwrap_or_else(|error| {
+        let stdout_source = stdout_buffer
+            .spill_path()
+            .map(|path| format!("disk spill file {}", path.display()))
+            .unwrap_or_else(|| "in-memory stdout spill buffer".into());
+        panic!("failed to flush stdout spill logs from {stdout_source}: {error}")
+    });
 
     let bytes = {
         let mut buffer = buffer.lock().unwrap();
@@ -550,12 +566,7 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for StdoutWriter {
 
     fn make_writer(&'a self) -> Self::Writer {
         let active = !TRACING_DISABLED_DEPTH.with(|depth| depth.get() > 0);
-        let buffer = STDOUT_BUFFER.with(|cell| {
-            let opt = cell.take();
-            let cloned = opt.clone();
-            cell.set(opt);
-            cloned
-        });
+        let buffer = STDOUT_BUFFER.with(clone_thread_local_buffer);
         StdoutWriterGuard { active, buffer }
     }
 }
@@ -600,13 +611,7 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for ThreadLocalSnapshotWriter {
     type Writer = ThreadLocalSnapshotWriterGuard;
 
     fn make_writer(&'a self) -> Self::Writer {
-        let buffer = SNAPSHOT_BUFFER.with(|cell| {
-            // SAFETY: we borrow the Option, clone the Arc if present, then put it back.
-            let opt = cell.take();
-            let cloned = opt.clone();
-            cell.set(opt);
-            cloned
-        });
+        let buffer = SNAPSHOT_BUFFER.with(clone_thread_local_buffer);
         ThreadLocalSnapshotWriterGuard { buffer }
     }
 }
@@ -634,7 +639,10 @@ impl std::io::Write for ThreadLocalSnapshotWriterGuard {
 #[cfg(test)]
 mod tests {
     use super::{sanitize_thread_name, SnapshotBuffer, StdoutWriter, STDOUT_BUFFER};
-    use std::{io::Write as _, sync::{Arc, Mutex}};
+    use std::{
+        io::Write as _,
+        sync::{Arc, Mutex},
+    };
     use tracing_subscriber::fmt::MakeWriter as _;
 
     #[test]
@@ -687,6 +695,15 @@ mod tests {
         assert_eq!(buffer.into_bytes().unwrap(), b"123456789");
 
         std::fs::remove_file(spill_path).unwrap();
+    }
+
+    #[test]
+    fn stdout_writer_falls_back_without_spill_buffer() {
+        STDOUT_BUFFER.with(|cell| cell.set(None));
+
+        let mut writer = StdoutWriter.make_writer();
+        assert_eq!(writer.write(b"x").unwrap(), 1);
+        writer.flush().unwrap();
     }
 }
 
