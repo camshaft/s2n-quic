@@ -29,7 +29,7 @@ use crate::{
         channel::{ImmediateQueueStatus, UnboundedSender},
         pool::{
             self,
-            descriptor::{Segments, Unfilled},
+            descriptor::{Recycler, Segments, Unfilled},
         },
     },
     time::precision,
@@ -70,7 +70,7 @@ mod tests;
 ///
 /// Cancelled frames (where `should_transmit()` returns false) are sent to `cancelled`
 /// for completion notification.
-pub(crate) fn assemble<Clk>(
+pub(crate) fn assemble<R: Recycler, Clk>(
     context: &mut Context,
     immediate_queue_status: ImmediateQueueStatus,
     clock: &Clk,
@@ -78,14 +78,14 @@ pub(crate) fn assemble<Clk>(
     source_control_port: u16,
     gso: &Gso,
     pool: &pool::Pool,
-    pre_alloc: Option<Unfilled>,
+    pre_alloc: Option<Unfilled<R>>,
     header_buf: &mut Vec<u8>,
     cancelled: &mut impl UnboundedSender<intrusive::Entry<Frame>>,
     ack_completions: &mut impl UnboundedSender<intrusive::Entry<msg::Sender>>,
     freed_batch_tx: &mut FreedBatchTx,
     counters: &AssemblerCounters,
     send_counters: &crate::endpoint::counters::Send,
-) -> Option<Segments>
+) -> Option<Segments<R>>
 where
     Clk: precision::Clock + ?Sized,
 {
@@ -97,7 +97,7 @@ where
     } = context.path_info(gso);
     counters.max_datagram_size.record_value(mtu as u64);
 
-    let unfilled = pre_alloc.or_else(|| pool.alloc())?;
+    let unfilled = pre_alloc.or_else(|| pool.alloc::<R>())?;
 
     let mut segment_size: u16 = 0;
     let mut segments_written: u32 = 0;

@@ -667,7 +667,7 @@ fn assemble_probe_fuzz() {
             // Phase 1: normal assembly — puts frames into inflight.
             let registry2 = Registry::new();
             let counters = AssemblerCounters::new(&registry2);
-            let _segments = assemble(
+            let _segments = assemble::<crate::socket::pool::descriptor::SyncRecycler, _>(
                 &mut context,
                 ImmediateQueueStatus::Empty, // no more immediate items
                 &clock,

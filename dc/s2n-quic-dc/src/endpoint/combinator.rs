@@ -16,10 +16,10 @@ use crate::{
     path::secret::map::Entry as PathSecretEntry,
     socket::{
         channel::{
-            intrusive::sync as sync_channel, Budget, ByteCost, ImmediateQueueStatus, Receiver,
-            UnboundedSender,
+            intrusive::{unsync as unsync_channel},
+            Budget, ByteCost, ImmediateQueueStatus, Receiver, UnboundedSender,
         },
-        pool::descriptor,
+        pool::descriptor::{self, UnsyncRecycler},
         rate::Rate,
     },
     stream::endpoint::{msg, send},
@@ -621,14 +621,14 @@ pub(crate) struct Assembler<R, Clk, C, A> {
     send_counters: Rc<super::counters::Send>,
     /// Sender keepalive: while alive, recycled `Segments` buffers are returned to
     /// `recycle_rx` rather than being freed back to the OS allocator.
-    _recycle_tx: sync_channel::AdapterSender<descriptor::RecycleAdapter>,
+    _recycle_tx: unsync_channel::Sender<descriptor::RecycleAdapter<UnsyncRecycler>>,
     /// Weak reference stored in each newly-allocated descriptor so that, on drop,
-    /// the buffer is pushed back into the recycle channel.
-    recycle_weak: descriptor::WeakRecycleSender,
+    /// the buffer is pushed back into the recycle channel without a mutex.
+    recycle_weak: UnsyncRecycler,
     /// Inbound recycled descriptors pushed by dropped `Segments` on this thread.
-    recycle_rx: sync_channel::AdapterReceiver<descriptor::RecycleAdapter>,
+    recycle_rx: unsync_channel::Receiver<descriptor::RecycleAdapter<UnsyncRecycler>>,
     /// Thread-local LIFO cache of descriptors drained from `recycle_rx`.
-    local_pool: List<descriptor::RecycleAdapter>,
+    local_pool: List<descriptor::RecycleAdapter<UnsyncRecycler>>,
 }
 
 #[derive(Clone)]
@@ -749,7 +749,7 @@ impl AssemblerCounters {
 type AssemblerOutput = (
     Rc<RefCell<send::Context>>,
     send::WheelInterest,
-    Option<descriptor::Segments>,
+    Option<descriptor::Segments<UnsyncRecycler>>,
 );
 
 impl<R, Clk, C, A> Assembler<R, Clk, C, A> {
@@ -767,8 +767,8 @@ impl<R, Clk, C, A> Assembler<R, Clk, C, A> {
         send_counters: Rc<super::counters::Send>,
     ) -> Self {
         let (recycle_tx, recycle_rx) =
-            sync_channel::new_with_adapter::<descriptor::RecycleAdapter>();
-        let recycle_weak = recycle_tx.downgrade();
+            unsync_channel::new_with_adapter::<descriptor::RecycleAdapter<UnsyncRecycler>>();
+        let recycle_weak = UnsyncRecycler(recycle_tx.downgrade());
         Self {
             inner,
             clock,
@@ -816,14 +816,16 @@ where
         let pre_alloc = self
             .local_pool
             .pop_back()
-            .map(|recycled| descriptor::Unfilled::from_recycled(recycled.into_descriptor()))
+            .map(|recycled| {
+                descriptor::Unfilled::<UnsyncRecycler>::from_recycled(recycled.into_descriptor())
+            })
             .or_else(|| self.pool.alloc_with_recycler(&self.recycle_weak));
 
         let (segments, wheel_interest) = {
             let mut context = context.borrow_mut();
             let mut cancelled = Queue::new();
             let mut ack_completions = Queue::new();
-            let segments = assemble::assemble(
+            let segments = assemble::assemble::<UnsyncRecycler, _>(
                 &mut context,
                 immediate_queue_status,
                 &self.clock,
