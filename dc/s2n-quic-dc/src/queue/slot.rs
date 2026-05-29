@@ -184,7 +184,18 @@ impl Slot {
 
         // Validate + complete/cancel under the stream lock.
         let mut stream = self.stream.inner.lock();
-        if validate_msg_dispatch(binding_id, &self.binding_id, &stream).is_err() {
+        if let Err(error) = validate_msg_dispatch(binding_id, &self.binding_id, &stream) {
+            trace!(
+                msg_id,
+                chunk_index,
+                ?error,
+                "slot::send_msg completion validation failed"
+            );
+            if matches!(error, super::Error::HalfClosed(_) | super::Error::SenderClosed) {
+                if let Some(table) = stream.extra.msg_table.as_mut() {
+                    table.cancel_checkout(msg_id, chunk_index);
+                }
+            }
             return Ok(half::AutoWake::default());
         }
         let local_queue = {
@@ -797,7 +808,7 @@ mod tests {
     }
 
     #[test]
-    fn push_msg_tolerates_rebind_while_write_in_flight() {
+    fn push_msg_detects_rebind_during_write_and_completes_to_new_binding() {
         let slot = Slot::with_queue_id(v(0));
         slot.allocate_and_open(v(1)).unwrap();
         let msg_id = 0;
@@ -830,12 +841,20 @@ mod tests {
 
         assert!(result.is_ok());
         assert!(write_called.load(Ordering::Relaxed));
-        assert!(slot.stream.inner.lock().extra.msg_table.is_none());
-        assert_eq!(slot.stream.inner.lock().queue.len(), 1);
+        let mut stream = slot.stream.inner.lock();
+        assert!(stream.extra.msg_table.is_none());
+        assert_eq!(stream.queue.len(), 1);
+        match stream.queue.pop_front().map(|e| e.into_inner()) {
+            Some(msg::Stream::Data { payload, .. }) => {
+                assert_eq!(payload.len(), 1);
+                assert_eq!(payload[0], 42);
+            }
+            _ => panic!("expected rebound stream entry"),
+        }
     }
 
     #[test]
-    fn push_msg_tolerates_rebind_on_write_error() {
+    fn push_msg_detects_rebind_after_write_error() {
         let slot = Slot::with_queue_id(v(0));
         slot.allocate_and_open(v(1)).unwrap();
         let write_called = AtomicBool::new(false);
@@ -861,7 +880,39 @@ mod tests {
 
         assert!(result.is_ok());
         assert!(write_called.load(Ordering::Relaxed));
-        assert!(slot.stream.inner.lock().extra.msg_table.is_none());
-        assert_eq!(slot.stream.inner.lock().queue.len(), 1);
+        let mut stream = slot.stream.inner.lock();
+        assert!(stream.extra.msg_table.is_none());
+        assert_eq!(stream.queue.len(), 1);
+        match stream.queue.pop_front().map(|e| e.into_inner()) {
+            Some(msg::Stream::Data { payload, .. }) => {
+                assert_eq!(payload.len(), 1);
+                assert_eq!(payload[0], 42);
+            }
+            _ => panic!("expected rebound stream entry"),
+        }
+    }
+
+    #[test]
+    fn push_msg_cancel_checkout_allows_retry() {
+        let slot = Slot::with_queue_id(v(0));
+        slot.allocate_and_open(v(1)).unwrap();
+
+        let first = slot.push_msg(v(1), 0, 0, 4096, 8192, 0, 4096, false, true, |_ptr, _len| {
+            Err::<(), ()>(())
+        });
+        assert!(first.is_ok());
+
+        let retry = slot.push_msg(v(1), 0, 0, 4096, 8192, 0, 4096, false, true, |ptr, len| {
+            unsafe { core::ptr::write_bytes(ptr, 0xAA, len as usize) };
+            Ok::<(), ()>(())
+        });
+        assert!(retry.is_ok());
+
+        let mut stream = slot.stream.inner.lock();
+        assert_eq!(stream.queue.len(), 1);
+        match stream.queue.pop_front().map(|e| e.into_inner()) {
+            Some(msg::Stream::Data { payload, .. }) => assert_eq!(payload.len(), 4096),
+            _ => panic!("expected retried stream data"),
+        }
     }
 }
