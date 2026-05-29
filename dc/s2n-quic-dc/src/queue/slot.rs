@@ -416,32 +416,15 @@ fn validate_and_push<T, X>(
     slot_binding: &AtomicU64,
     inner: &mut HalfInner<T, X>,
 ) -> Result<half::AutoWake, super::Error<intrusive::Entry<T>>> {
-    let raw = slot_binding.load(Ordering::Relaxed);
-    let stored = raw & !UNALLOCATED_BIT;
-    let incoming = binding_id.as_u64();
-
-    if raw & UNALLOCATED_BIT != 0 {
-        // Slot is free.  Compare against the last binding to classify the error.
-        if incoming <= stored {
-            return Err(super::Error::StaleBinding(entry));
-        }
-        return Err(super::Error::Unallocated(entry));
+    match validate_binding_state(binding_id, slot_binding, &inner.flags) {
+        Err(ValidationError::StaleBinding) => return Err(super::Error::StaleBinding(entry)),
+        Err(ValidationError::Unallocated) => return Err(super::Error::Unallocated(entry)),
+        Err(ValidationError::FutureBinding) => return Err(super::Error::FutureBinding(entry)),
+        Err(ValidationError::SenderClosed) => return Err(super::Error::SenderClosed),
+        Err(ValidationError::HalfClosed) => return Err(super::Error::HalfClosed(entry)),
+        Ok(()) => {}
     }
 
-    if incoming < stored {
-        return Err(super::Error::StaleBinding(entry));
-    }
-    if incoming > stored {
-        return Err(super::Error::FutureBinding(entry));
-    }
-
-    // binding matches
-    if !inner.flags.contains(Flags::HAS_SENDER) {
-        return Err(super::Error::SenderClosed);
-    }
-    if !inner.flags.contains(Flags::HAS_RECEIVER) {
-        return Err(super::Error::HalfClosed(entry));
-    }
     inner.queue.push_back(entry);
     Ok(inner.take_waker())
 }
@@ -452,27 +435,51 @@ fn validate_msg_dispatch(
     slot_binding: &AtomicU64,
     inner: &HalfInner<msg::Stream, StreamState>,
 ) -> Result<(), super::Error<()>> {
+    validate_binding_state(binding_id, slot_binding, &inner.flags).map_err(|error| match error {
+        ValidationError::StaleBinding => super::Error::StaleBinding(()),
+        ValidationError::Unallocated => super::Error::Unallocated(()),
+        ValidationError::FutureBinding => super::Error::FutureBinding(()),
+        ValidationError::SenderClosed => super::Error::SenderClosed,
+        ValidationError::HalfClosed => super::Error::HalfClosed(()),
+    })
+}
+
+#[derive(Clone, Copy)]
+enum ValidationError {
+    StaleBinding,
+    Unallocated,
+    FutureBinding,
+    SenderClosed,
+    HalfClosed,
+}
+
+#[inline]
+fn validate_binding_state(
+    binding_id: VarInt,
+    slot_binding: &AtomicU64,
+    flags: &Flags,
+) -> Result<(), ValidationError> {
     let raw = slot_binding.load(Ordering::Relaxed);
     let stored = raw & !UNALLOCATED_BIT;
     let incoming = binding_id.as_u64();
 
     if raw & UNALLOCATED_BIT != 0 {
         if incoming <= stored {
-            return Err(super::Error::StaleBinding(()));
+            return Err(ValidationError::StaleBinding);
         }
-        return Err(super::Error::Unallocated(()));
+        return Err(ValidationError::Unallocated);
     }
     if incoming < stored {
-        return Err(super::Error::StaleBinding(()));
+        return Err(ValidationError::StaleBinding);
     }
     if incoming > stored {
-        return Err(super::Error::FutureBinding(()));
+        return Err(ValidationError::FutureBinding);
     }
-    if !inner.flags.contains(Flags::HAS_SENDER) {
-        return Err(super::Error::SenderClosed);
+    if !flags.contains(Flags::HAS_SENDER) {
+        return Err(ValidationError::SenderClosed);
     }
-    if !inner.flags.contains(Flags::HAS_RECEIVER) {
-        return Err(super::Error::HalfClosed(()));
+    if !flags.contains(Flags::HAS_RECEIVER) {
+        return Err(ValidationError::HalfClosed);
     }
     Ok(())
 }
