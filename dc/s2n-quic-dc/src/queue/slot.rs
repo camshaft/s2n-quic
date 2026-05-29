@@ -171,7 +171,7 @@ impl Slot {
         }
 
         // Lock msg_table, insert (checkout)
-        let (ptr, expected_len, chunk_index, _keep_alive) = {
+        let (ptr, expected_len, chunk_index, keep_alive) = {
             let mut table = self.msg_table.lock();
             let table = table.get_or_insert_with(MsgTable::new);
 
@@ -236,6 +236,7 @@ impl Slot {
             }
         };
         // msg_table lock released here
+        drop(keep_alive);
 
         match local_queue {
             Some((mut queue, should_wake)) => {
@@ -473,6 +474,7 @@ impl core::fmt::Debug for Slot {
 mod tests {
     use super::*;
     use crate::queue::testing::*;
+    use core::sync::atomic::AtomicBool;
 
     fn v(n: u64) -> VarInt {
         VarInt::new(n).unwrap()
@@ -785,16 +787,36 @@ mod tests {
     fn push_msg_tolerates_rebind_while_write_in_flight() {
         let slot = Slot::with_queue_id(v(0));
         slot.allocate_and_open(v(1)).unwrap();
+        let msg_id = 0;
+        let stream_offset = 0;
+        let message_size = 4096;
+        let chunk_size = 8192;
+        let chunk_index = 0;
+        let payload_len = 4096;
+        let write_called = AtomicBool::new(false);
 
-        let result = slot.push_msg(v(1), 0, 0, 4096, 8192, 0, 4096, false, true, |ptr, len| {
-            unsafe { core::ptr::write_bytes(ptr, 0xAB, len as usize) };
-            simulate_receiver_drop(&slot);
-            let result = slot.bind_and_push_stream(v(2), make_stream_entry());
-            assert!(matches!(result, Ok(BindState::NewBinding(_))));
-            Ok::<(), ()>(())
-        });
+        let result = slot.push_msg(
+            v(1),
+            msg_id,
+            stream_offset,
+            message_size,
+            chunk_size,
+            chunk_index,
+            payload_len,
+            false,
+            true,
+            |ptr, len| {
+                write_called.store(true, Ordering::Relaxed);
+                unsafe { core::ptr::write_bytes(ptr, 0xAB, len as usize) };
+                simulate_receiver_drop(&slot);
+                let result = slot.bind_and_push_stream(v(2), make_stream_entry());
+                assert!(matches!(result, Ok(BindState::NewBinding(_))));
+                Ok::<(), ()>(())
+            },
+        );
 
         assert!(result.is_ok());
+        assert!(write_called.load(Ordering::Relaxed));
         assert!(slot.msg_table.lock().is_none());
     }
 }

@@ -73,9 +73,14 @@ impl MsgEntry {
         let chunk_count = chunks_for_size(message_size, chunk_size);
         debug_assert!(chunk_count as u32 <= MAX_CHUNKS);
 
+        // +1 byte provides a tiny prefix we can split/freeze as a keep-alive handle.
+        // This avoids copying/cloning the message payload while still creating a ref-counted
+        // handle that keeps the original allocation alive during checkout writes.
         let mut buffer = BytesMut::with_capacity(message_size as usize + 1);
         // SAFETY: The received bitset guarantees that only fully-written regions are ever
         // read. No consumer sees the buffer until all chunks are marked received.
+        // We reserve one extra prefix byte and split/freeze it as a keep-alive handle so
+        // checked-out pointers remain valid even if the table is cleared concurrently.
         unsafe { buffer.set_len(message_size as usize + 1) };
         let keep_alive = buffer.split_to(1).freeze();
 
