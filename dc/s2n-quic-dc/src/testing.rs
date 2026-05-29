@@ -500,7 +500,7 @@ fn run_sim_with_snapshot(f: impl FnOnce()) {
                 .spill_path()
                 .map(|path| format!("disk spill file {}", path.display()))
                 .unwrap_or_else(|| "in-memory snapshot buffer".into());
-            panic!("failed to flush snapshot logs from {source}: {error}")
+            panic!("failed to flush snapshot/tracing logs from {source}: {error}")
         });
         let spill_path = buffer.spill_path();
         buffer.into_bytes().unwrap_or_else(|error| {
