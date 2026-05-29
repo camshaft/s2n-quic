@@ -83,7 +83,7 @@ fn decrypt_fast_path(
     stream_clock: &crate::time::DefaultClock,
     reader_metrics: &Arc<crate::stream::metrics::ReaderMetrics>,
     writer_metrics: &Arc<crate::stream::metrics::WriterMetrics>,
-) -> Option<AutoWake> {
+) -> Result<AutoWake, ()> {
     let Header::QueueMsg {
         queue_pair,
         binding_id,
@@ -97,13 +97,13 @@ fn decrypt_fast_path(
         dest_acceptor_id,
     } = header
     else {
-        return None;
+        return Err(());
     };
 
     // Handle init: bind the slot before attempting push_msg
     if let Some(acceptor_id) = dest_acceptor_id {
         let Some(server_view) = queue_view.as_server_mut() else {
-            return Some(AutoWake::default());
+            return Ok(AutoWake::default());
         };
 
         let Some(acceptor_sender) = acceptor_registry.get(acceptor_id) else {
@@ -116,7 +116,7 @@ fn decrypt_fast_path(
                 error::ACCEPTOR_NOT_FOUND,
                 frame_tx,
             );
-            return Some(AutoWake::default());
+            return Ok(AutoWake::default());
         };
 
         match server_view.bind_for_msg(
@@ -169,7 +169,7 @@ fn decrypt_fast_path(
                 }
             }
             Ok(crate::queue::BindResult::Bound(_)) => {}
-            Err(_) => return Some(AutoWake::default()),
+            Err(_) => return Ok(AutoWake::default()),
         }
     }
 
@@ -200,7 +200,7 @@ fn decrypt_fast_path(
         },
     );
 
-    Some(match waker {
+    Ok(match waker {
         Ok(w) => {
             if w.is_some() {
                 counters.rx_msg_segment_completed.add(1);
@@ -213,7 +213,7 @@ fn decrypt_fast_path(
             w
         }
         Err(crate::queue::MsgError::Queue(_)) => AutoWake::default(),
-        Err(crate::queue::MsgError::Write(_)) => return None,
+        Err(crate::queue::MsgError::Write(_)) => return Err(()),
     })
 }
 
@@ -280,7 +280,7 @@ where
 
         // Fast path: single QueueMsg frame — decrypt directly into the slot buffer.
         if let Some(header) = single_queue_msg {
-            if let Some(waker) = decrypt_fast_path(
+            return decrypt_fast_path(
                 header,
                 opener,
                 &packet,
@@ -294,9 +294,9 @@ where
                 stream_clock,
                 reader_metrics,
                 writer_metrics,
-            ) {
-                return Some(DecryptResult::FastPath(waker));
-            }
+            )
+            .map(DecryptResult::FastPath)
+            .ok();
         }
 
         // Slow path: allocate BytesMut, decrypt into it, dispatch frames later.
