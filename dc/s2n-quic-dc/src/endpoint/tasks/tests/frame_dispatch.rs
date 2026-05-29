@@ -207,11 +207,12 @@ fn pacing_delays_frames_beyond_burst() {
             let pse = crate::path::secret::map::Entry::builder("127.0.0.1:4433".parse().unwrap())
                 .socket_sender_count(1)
                 .build();
-            let mut input = PriorityInput::default();
             // Each frame is larger than the burst budget; BatchFramesByPathSecret will emit
             // them as two separate FrameBatches because the first already fills a batch.
-            input.push(test_frame_with_payload(&pse, u16::MAX as usize));
-            input.push(test_frame_with_payload(&pse, u16::MAX as usize));
+            const OVERSIZED_FRAME_SIZE: usize = u16::MAX as usize;
+            let mut input = PriorityInput::default();
+            input.push(test_frame_with_payload(&pse, OVERSIZED_FRAME_SIZE));
+            input.push(test_frame_with_payload(&pse, OVERSIZED_FRAME_SIZE));
             frame_tx.send_batch(input).unwrap();
         }
         .primary()
