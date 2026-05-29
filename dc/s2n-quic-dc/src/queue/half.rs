@@ -9,6 +9,7 @@
 //! dropped).
 
 use crate::intrusive;
+use super::msg_table::MsgTable;
 use bitflags::bitflags;
 use core::{
     fmt,
@@ -35,6 +36,7 @@ pub(crate) struct HalfInner<T> {
     pub(crate) queue: intrusive::Queue<T>,
     pub(crate) flags: Flags,
     pub(crate) waker: Option<Waker>,
+    pub(crate) msg_table: Option<MsgTable>,
 }
 
 impl<T> HalfInner<T> {
@@ -110,6 +112,7 @@ impl<T> Half<T> {
                 queue: intrusive::Queue::new(),
                 flags: Flags::HAS_SENDER,
                 waker: None,
+                msg_table: None,
             }),
         }
     }
