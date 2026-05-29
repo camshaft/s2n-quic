@@ -85,6 +85,7 @@ thread_local! {
 
 static SNAPSHOT_MODE_DEPTH: AtomicUsize = AtomicUsize::new(0);
 const SNAPSHOT_SPILL_THRESHOLD: usize = 256 * 1024;
+const MAX_SPILL_FILE_CREATION_ATTEMPTS: usize = 128;
 
 enum SnapshotBufferStorage {
     InMemory(Vec<u8>),
@@ -167,13 +168,15 @@ impl SnapshotBuffer {
 }
 
 fn create_snapshot_spill_file() -> std::io::Result<(std::fs::File, PathBuf)> {
+    // Intentionally create a persistent file in the temp directory so logs remain
+    // available for debugging after the test process exits.
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
     let temp_dir = std::env::temp_dir();
 
-    for attempt in 0..128 {
+    for attempt in 0..MAX_SPILL_FILE_CREATION_ATTEMPTS {
         let path = temp_dir.join(format!(
             "s2n-quic-dc-test-logs-{}-{:?}-{now}-{attempt}.log",
             process::id(),
@@ -194,7 +197,9 @@ fn create_snapshot_spill_file() -> std::io::Result<(std::fs::File, PathBuf)> {
 
     Err(std::io::Error::new(
         std::io::ErrorKind::AlreadyExists,
-        "failed to create unique snapshot spill log file",
+        format!(
+            "failed to create unique snapshot spill log file after {MAX_SPILL_FILE_CREATION_ATTEMPTS} attempts"
+        ),
     ))
 }
 
