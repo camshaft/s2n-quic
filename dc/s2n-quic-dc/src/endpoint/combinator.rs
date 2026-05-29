@@ -441,7 +441,7 @@ pub struct PickTwo<T, R, S, Clk> {
     socket_edts: crate::endpoint::edt::Local,
     clock: Clk,
     rng: crate::xorshift::Rng,
-    /// Round-robin cursor for the first pick candidate. Wraps around modulo sender count.
+    /// Round-robin cursor for the first pick candidate. Always in `[0, senders.len())`.
     round_robin_idx: usize,
     pick_counters: IdMap<LocalSenderId, crate::counter::Counter>,
     rejected_counters: IdMap<LocalSenderId, crate::counter::Summary>,
@@ -526,8 +526,9 @@ where
             } else {
                 // First candidate: round-robin for deterministic striping across senders.
                 let rr = *round_robin_idx;
-                *round_robin_idx = round_robin_idx.wrapping_add(1);
-                let idx1 = LocalSenderId::from_index(rr % len);
+                let next = rr + 1;
+                *round_robin_idx = if next >= len { 0 } else { next };
+                let idx1 = LocalSenderId::from_index(rr);
 
                 // Second candidate: random, but always distinct from idx1.
                 let idx2 = if len == 2 {
