@@ -84,6 +84,7 @@ thread_local! {
 }
 
 static SNAPSHOT_MODE_DEPTH: AtomicUsize = AtomicUsize::new(0);
+static SHARED_SNAPSHOT_BUFFER: OnceLock<Mutex<Option<Arc<Mutex<SnapshotBuffer>>>>> = OnceLock::new();
 const SNAPSHOT_SPILL_THRESHOLD: usize = 256 * 1024;
 // Bound retries to avoid pathological looping under heavy contention while
 // still giving enough attempts for concurrent test threads.
@@ -230,6 +231,14 @@ fn clone_thread_local_buffer(
     cloned
 }
 
+fn clone_shared_snapshot_buffer() -> Option<Arc<Mutex<SnapshotBuffer>>> {
+    SHARED_SNAPSHOT_BUFFER
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap()
+        .clone()
+}
+
 struct TracingDisabledGuard;
 
 impl TracingDisabledGuard {
@@ -322,58 +331,27 @@ pub fn init_tracing() {
 
     // make sure this only gets initialized once
     TRACING.call_once(|| {
-        let default_level = if std::env::var("CI").is_ok() {
-            tracing::Level::INFO
-        } else if cfg!(debug_assertions) {
-            tracing::Level::DEBUG
-        } else {
-            tracing::Level::WARN
-        };
-
         let stdout_filter = tracing_subscriber::EnvFilter::builder()
-            .with_default_directive(default_level.into())
-            .with_env_var("S2N_LOG")
-            .from_env()
-            .unwrap();
-
-        // Stdout layer: always active unless tracing is explicitly disabled.
-        let mut stdout_layer = tracing_subscriber::fmt::layer().event_format(
-            tracing_subscriber::fmt::format()
-                .with_timer(Uptime::default())
-                .compact(),
-        );
-
-        // avoid ANSI with agents
-        if std::env::var("CLAUDECODE").is_ok() {
-            stdout_layer = stdout_layer.with_ansi(false);
-        }
-
-        let stdout_layer = stdout_layer
-            .with_writer(StdoutWriter)
-            .with_filter(stdout_filter);
-
-        // Snapshot layer: only writes when SNAPSHOT_BUFFER is set on this thread.
-        // Fixed filter — never reads env vars so snapshot content is deterministic.
-        let snapshot_filter = tracing_subscriber::EnvFilter::builder()
             .with_default_directive(tracing::Level::DEBUG.into())
             .parse("")
             .unwrap()
             .add_directive("s2n_quic_dc::metric=trace".parse().unwrap());
 
-        let snapshot_layer = tracing_subscriber::fmt::layer()
-            .event_format(
-                tracing_subscriber::fmt::format()
-                    .with_timer(Uptime::default())
-                    .with_target(false)
-                    .compact(),
-            )
-            .with_ansi(false)
-            .with_writer(ThreadLocalSnapshotWriter)
-            .with_filter(snapshot_filter);
+        // Stdout layer: always active unless tracing is explicitly disabled.
+        let mut stdout_layer = tracing_subscriber::fmt::layer().event_format(
+            tracing_subscriber::fmt::format()
+                .with_timer(Uptime::default())
+                .with_target(false)
+                .compact(),
+        );
 
-        let subscriber = tracing_subscriber::registry()
-            .with(stdout_layer)
-            .with(snapshot_layer);
+        stdout_layer = stdout_layer.with_ansi(false);
+
+        let stdout_layer = stdout_layer
+            .with_writer(StdoutWriter)
+            .with_filter(stdout_filter);
+
+        let subscriber = tracing_subscriber::registry().with(stdout_layer);
 
         tracing::subscriber::set_global_default(subscriber)
             .expect("failed to set global tracing subscriber");
@@ -486,12 +464,20 @@ fn run_sim_with_snapshot(f: impl FnOnce()) {
 
     let buffer = Arc::new(Mutex::new(SnapshotBuffer::new(SNAPSHOT_SPILL_THRESHOLD)));
     SNAPSHOT_BUFFER.with(|cell| cell.set(Some(buffer.clone())));
+    *SHARED_SNAPSHOT_BUFFER
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap() = Some(buffer.clone());
     let _snapshot_mode_guard = SnapshotModeGuard::enter();
 
     run_sim(f);
 
     // Clear the buffer so it doesn't leak into subsequent tests on this thread.
     SNAPSHOT_BUFFER.with(|cell| cell.set(None));
+    *SHARED_SNAPSHOT_BUFFER
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap() = None;
 
     let bytes = {
         let mut buffer = buffer.lock().unwrap();
@@ -557,24 +543,22 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for StdoutWriter {
     type Writer = StdoutWriterGuard;
 
     fn make_writer(&'a self) -> Self::Writer {
-        let active = !TRACING_DISABLED_DEPTH.with(|depth| depth.get() > 0);
-        let buffer = SNAPSHOT_BUFFER.with(clone_thread_local_buffer);
-        StdoutWriterGuard { active, buffer }
+        StdoutWriterGuard
     }
 }
 
-struct StdoutWriterGuard {
-    active: bool,
-    buffer: Option<Arc<Mutex<SnapshotBuffer>>>,
-}
+struct StdoutWriterGuard;
 
 impl std::io::Write for StdoutWriterGuard {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        if !self.active {
+        let active = !TRACING_DISABLED_DEPTH.with(|depth| depth.get() > 0);
+        if !active {
             return Ok(buf.len());
         }
 
-        if let Some(buffer) = &self.buffer {
+        let buffer =
+            SNAPSHOT_BUFFER.with(clone_thread_local_buffer).or_else(clone_shared_snapshot_buffer);
+        if let Some(buffer) = buffer {
             buffer.lock().unwrap().write(buf)?;
             Ok(buf.len())
         } else {
@@ -583,48 +567,18 @@ impl std::io::Write for StdoutWriterGuard {
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
-        if !self.active {
+        let active = !TRACING_DISABLED_DEPTH.with(|depth| depth.get() > 0);
+        if !active {
             return Ok(());
         }
 
-        if let Some(buffer) = &self.buffer {
+        let buffer =
+            SNAPSHOT_BUFFER.with(clone_thread_local_buffer).or_else(clone_shared_snapshot_buffer);
+        if let Some(buffer) = buffer {
             buffer.lock().unwrap().flush()
         } else {
             std::io::stderr().flush()
         }
-    }
-}
-
-/// MakeWriter for the snapshot layer. Writes to the per-test SNAPSHOT_BUFFER
-/// thread-local when set, otherwise discards.
-struct ThreadLocalSnapshotWriter;
-
-impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for ThreadLocalSnapshotWriter {
-    type Writer = ThreadLocalSnapshotWriterGuard;
-
-    fn make_writer(&'a self) -> Self::Writer {
-        let buffer = SNAPSHOT_BUFFER.with(clone_thread_local_buffer);
-        ThreadLocalSnapshotWriterGuard { buffer }
-    }
-}
-
-struct ThreadLocalSnapshotWriterGuard {
-    buffer: Option<Arc<Mutex<SnapshotBuffer>>>,
-}
-
-impl std::io::Write for ThreadLocalSnapshotWriterGuard {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        if let Some(buffer) = &self.buffer {
-            buffer.lock().unwrap().write(buf)?;
-        }
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        if let Some(buffer) = &self.buffer {
-            buffer.lock().unwrap().flush()?;
-        }
-        Ok(())
     }
 }
 
