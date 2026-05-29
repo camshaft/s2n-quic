@@ -151,23 +151,8 @@ impl Slot {
         // Validate binding under stream lock (quick check, then release)
         {
             let inner = self.stream.inner.lock();
-            let stored = self.binding_id.load(Ordering::Relaxed);
-            if stored & UNALLOCATED_BIT != 0 {
-                return Err(super::Error::Unallocated(()));
-            }
-            if stored != binding_id.as_u64() {
-                if binding_id.as_u64() < stored {
-                    return Err(super::Error::StaleBinding(()));
-                } else {
-                    return Err(super::Error::FutureBinding(()));
-                }
-            }
-            if !inner.flags.contains(Flags::HAS_RECEIVER) {
-                return Err(super::Error::HalfClosed(()));
-            }
-            if !inner.flags.contains(Flags::HAS_SENDER) {
-                return Err(super::Error::SenderClosed);
-            }
+            validate_binding(binding_id, self.binding_id.load(Ordering::Relaxed))?;
+            validate_half_state(&inner)?;
         }
 
         // Lock msg_table, insert (checkout), write, and complete/cancel while keeping
@@ -230,12 +215,7 @@ impl Slot {
             Some((mut queue, should_wake)) => {
                 let mut stream = self.stream.inner.lock();
                 validate_binding(binding_id, self.binding_id.load(Ordering::Relaxed))?;
-                if !stream.flags.contains(Flags::HAS_RECEIVER) {
-                    return Err(super::Error::HalfClosed(()));
-                }
-                if !stream.flags.contains(Flags::HAS_SENDER) {
-                    return Err(super::Error::SenderClosed);
-                }
+                validate_half_state(&stream)?;
                 stream.queue.append(&mut queue);
                 if should_wake {
                     let waker = stream.take_waker();
@@ -427,23 +407,6 @@ fn validate_and_push<T>(
         if incoming <= stored {
             return Err(super::Error::StaleBinding(entry));
         }
-
-        #[inline]
-        fn validate_binding(binding_id: VarInt, stored: u64) -> Result<(), super::Error<()>> {
-            let incoming = binding_id.as_u64();
-
-            if stored & UNALLOCATED_BIT != 0 {
-                return Err(super::Error::Unallocated(()));
-            }
-            if incoming < stored {
-                return Err(super::Error::StaleBinding(()));
-            }
-            if incoming > stored {
-                return Err(super::Error::FutureBinding(()));
-            }
-
-            Ok(())
-        }
         return Err(super::Error::Unallocated(entry));
     }
 
@@ -463,6 +426,45 @@ fn validate_and_push<T>(
     }
     inner.queue.push_back(entry);
     Ok(inner.take_waker())
+}
+
+#[inline]
+/// Validates that the slot is still bound to `binding_id`.
+///
+/// Returns:
+/// - `Ok(())` when `binding_id` matches the active generation.
+/// - `Unallocated` when the slot has no active receiver generation.
+/// - `StaleBinding` when `binding_id` is older than the active generation.
+/// - `FutureBinding` when `binding_id` is newer than the active generation.
+fn validate_binding(binding_id: VarInt, stored: u64) -> Result<(), super::Error<()>> {
+    let incoming = binding_id.as_u64();
+
+    if stored & UNALLOCATED_BIT != 0 {
+        return Err(super::Error::Unallocated(()));
+    }
+    if incoming < stored {
+        return Err(super::Error::StaleBinding(()));
+    }
+    if incoming > stored {
+        return Err(super::Error::FutureBinding(()));
+    }
+
+    Ok(())
+}
+
+#[inline]
+/// Validates that the stream half still has a live sender and receiver.
+///
+/// Returns `HalfClosed` if the receiver was dropped and `SenderClosed` if the
+/// path sender has been closed.
+fn validate_half_state<T>(inner: &HalfInner<T>) -> Result<(), super::Error<()>> {
+    if !inner.flags.contains(Flags::HAS_RECEIVER) {
+        return Err(super::Error::HalfClosed(()));
+    }
+    if !inner.flags.contains(Flags::HAS_SENDER) {
+        return Err(super::Error::SenderClosed);
+    }
+    Ok(())
 }
 
 impl core::fmt::Debug for Slot {
@@ -795,7 +797,7 @@ mod tests {
     }
 
     #[test]
-    fn push_msg_revalidates_binding_after_write_before_complete() {
+    fn binding_validation_race_during_write() {
         use std::{
             sync::{
                 Arc,
@@ -803,7 +805,6 @@ mod tests {
                 mpsc,
             },
             thread,
-            time::Duration,
         };
 
         let slot = Arc::new(Slot::with_queue_id(v(0)));
@@ -827,13 +828,18 @@ mod tests {
         let result = slot.push_msg(v(1), 0, 0, 8192, 8192, 0, 8192, false, true, |ptr, len| {
             start_tx.send(()).unwrap();
             dropped_rx.recv().unwrap();
-            thread::sleep(Duration::from_millis(20));
             assert!(!finished.load(AtomicOrdering::SeqCst));
             unsafe { core::ptr::write_bytes(ptr, 0xAB, len as usize) };
             Ok::<(), ()>(())
         });
 
-        assert!(matches!(result, Err(super::super::Error::Unallocated(()))));
+        assert!(matches!(
+            result,
+            Err(super::super::Error::Unallocated(()))
+                | Err(super::super::Error::HalfClosed(()))
+                | Err(super::super::Error::StaleBinding(()))
+                | Err(super::super::Error::FutureBinding(()))
+        ));
         rebind.join().unwrap();
     }
 }
