@@ -14,4 +14,4 @@ SELECT
 FROM runs
 WHERE type = 'queue'
 GROUP BY label, log_group, stream, env, metric
-ORDER BY label, log_group, stream, env, max_depth DESC;
+ORDER BY label, max_depth DESC, log_group, stream, env;
