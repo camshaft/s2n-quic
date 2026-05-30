@@ -4,6 +4,13 @@ version = "0.1.0"
 edition = "2021"
 publish = false
 
+[features]
+## Run benchmarks under Valgrind (cachegrind / callgrind) instead of criterion.
+##
+## Build the `iai` bench binary and execute it under `valgrind --tool=cachegrind`
+## or `valgrind --tool=callgrind` to collect instruction counts.
+iai = []
+
 [dependencies]
 aws-lc-rs = "1.12"
 criterion = { version = "0.8", features = ["html_reports", "async_tokio"] }
@@ -14,3 +21,8 @@ tokio = { version = "1", features = ["full"] }
 [[bench]]
 name = "bench"
 harness = false
+
+[[bench]]
+name = "iai"
+harness = false
+required-features = ["iai"]
