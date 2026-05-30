@@ -1,9 +1,7 @@
 // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::bench::{black_box, BenchmarkId, Criterion, Throughput};
-#[cfg(not(feature = "cachegrind"))]
-use criterion::BatchSize;
+use crate::bench::{black_box, BatchSize, BenchmarkId, Criterion, Throughput};
 
 pub fn benchmarks(c: &mut Criterion) {
     assemble_benches(c);
@@ -25,34 +23,19 @@ fn assemble_benches(c: &mut Criterion) {
         let input_name =
             format!("packets={packets},frames={frames_per_packet},payload={payload_len}");
         group.bench_with_input(BenchmarkId::new("assemble", &input_name), &(), |b, _| {
-            #[cfg(not(feature = "cachegrind"))]
             b.iter_batched(
                 || {
-                    s2n_quic_dc::endpoint::testing::bench::setup_assemble_benchmark(
+                    s2n_quic_dc::endpoint::testing::bench::AssembleBenchmark::new(
                         packets,
                         frames_per_packet,
                         payload_len,
                     )
                 },
                 |benchmark| {
-                    black_box(s2n_quic_dc::endpoint::testing::bench::run_assemble_benchmark(
-                        benchmark,
-                    ));
+                    black_box(benchmark.run());
                 },
                 BatchSize::SmallInput,
             );
-
-            #[cfg(feature = "cachegrind")]
-            b.iter(|| {
-                let benchmark = s2n_quic_dc::endpoint::testing::bench::setup_assemble_benchmark(
-                    packets,
-                    frames_per_packet,
-                    payload_len,
-                );
-                black_box(s2n_quic_dc::endpoint::testing::bench::run_assemble_benchmark(
-                    benchmark,
-                ));
-            });
         });
     }
 }
@@ -73,10 +56,9 @@ fn ack_processing_benches(c: &mut Criterion) {
             "packets={packets},frames={frames_per_packet},payload={payload_len},ack_frames={ack_frames}"
         );
         group.bench_with_input(BenchmarkId::new("ack", &input_name), &(), |b, _| {
-            #[cfg(not(feature = "cachegrind"))]
             b.iter_batched(
                 || {
-                    s2n_quic_dc::endpoint::testing::bench::setup_ack_processing_benchmark(
+                    s2n_quic_dc::endpoint::testing::bench::AckProcessingBenchmark::new(
                         packets,
                         frames_per_packet,
                         payload_len,
@@ -84,26 +66,10 @@ fn ack_processing_benches(c: &mut Criterion) {
                     )
                 },
                 |benchmark| {
-                    black_box(s2n_quic_dc::endpoint::testing::bench::run_ack_processing_benchmark(
-                        benchmark,
-                    ));
+                    black_box(benchmark.run());
                 },
                 BatchSize::SmallInput,
             );
-
-            #[cfg(feature = "cachegrind")]
-            b.iter(|| {
-                let benchmark =
-                    s2n_quic_dc::endpoint::testing::bench::setup_ack_processing_benchmark(
-                        packets,
-                        frames_per_packet,
-                        payload_len,
-                        ack_frames,
-                    );
-                black_box(s2n_quic_dc::endpoint::testing::bench::run_ack_processing_benchmark(
-                    benchmark,
-                ));
-            });
         });
     }
 }

@@ -21,7 +21,8 @@ use s2n_quic_core::{
 use s2n_quic_platform::features::{gso::MaxSegments, Gso};
 use std::{rc::Rc, sync::Arc};
 
-const TEST_MTU: u16 = 1400;
+// Benchmarks target jumbo-frame deployments.
+const TEST_MTU: u16 = 9000;
 const SOURCE_CONTROL_PORT: u16 = 4433;
 
 pub struct AssembleBenchmark {
@@ -37,80 +38,77 @@ pub struct AssembleBenchmark {
     gso: Gso,
 }
 
-pub fn setup_assemble_benchmark(
-    packets: usize,
-    frames_per_packet: usize,
-    payload_len: usize,
-) -> AssembleBenchmark {
-    let registry = crate::counter::Registry::default();
-    let clock = Clock::default();
-    let entry = test_path_secret_entry();
-    let mut context = make_context(&entry, &registry, &clock);
-    let send_counters =
-        counters::Send::new(&registry, crate::endpoint::id::LocalSenderId::from_index(0));
-    let assembler_counters = AssemblerCounters::new(&registry);
-    let pool = pool::Pool::new(u16::MAX);
-    let header_buf = Vec::new();
-    let cancelled = Queue::new();
-    let ack_completions = Queue::new();
-    let (freed_batch_tx, _freed_batch_rx) = crate::queue::freed_batch_channel();
-    let gso: Gso = MaxSegments::try_from(1usize).unwrap().into();
+impl AssembleBenchmark {
+    pub fn new(packets: usize, frames_per_packet: usize, payload_len: usize) -> Self {
+        let registry = crate::counter::Registry::default();
+        let clock = Clock::default();
+        let entry = test_path_secret_entry();
+        let mut context = make_context(&entry, &registry, &clock);
+        let send_counters =
+            counters::Send::new(&registry, crate::endpoint::id::LocalSenderId::from_index(0));
+        let assembler_counters = AssemblerCounters::new(&registry);
+        let pool = pool::Pool::new(u16::MAX);
+        let header_buf = Vec::new();
+        let cancelled = Queue::new();
+        let ack_completions = Queue::new();
+        let (freed_batch_tx, _freed_batch_rx) = crate::queue::freed_batch_channel();
+        let gso: Gso = MaxSegments::try_from(1usize).unwrap().into();
 
-    for packet_idx in 0..packets {
-        for frame_idx in 0..frames_per_packet {
-            context.push_back_frame(benchmark_frame(
-                &entry,
-                packet_idx * frames_per_packet + frame_idx,
-                payload_len,
-            ));
+        for packet_idx in 0..packets {
+            for frame_idx in 0..frames_per_packet {
+                context.push_back_frame(benchmark_frame(
+                    &entry,
+                    packet_idx * frames_per_packet + frame_idx,
+                    payload_len,
+                ));
+            }
         }
 
+        Self {
+            context,
+            clock,
+            send_counters,
+            assembler_counters,
+            pool,
+            header_buf,
+            cancelled,
+            ack_completions,
+            freed_batch_tx,
+            gso,
+        }
     }
 
-    AssembleBenchmark {
-        context,
-        clock,
-        send_counters,
-        assembler_counters,
-        pool,
-        header_buf,
-        cancelled,
-        ack_completions,
-        freed_batch_tx,
-        gso,
-    }
-}
+    pub fn run(mut self) -> u64 {
+        let mut total_segments = 0u64;
+        loop {
+            let Some(unfilled) = self.pool.alloc::<SyncRecycler>() else {
+                break;
+            };
+            let Some(segments) = assemble::assemble::<SyncRecycler, _>(
+                &mut self.context,
+                ImmediateQueueStatus::Empty,
+                &self.clock,
+                crate::endpoint::id::LocalSenderId::from_index(0),
+                SOURCE_CONTROL_PORT,
+                &self.gso,
+                unfilled,
+                &mut self.header_buf,
+                &mut self.cancelled,
+                &mut self.ack_completions,
+                &mut self.freed_batch_tx,
+                &self.assembler_counters,
+                &self.send_counters,
+            ) else {
+                break;
+            };
+            total_segments += segments.segment_count() as u64;
+        }
 
-pub fn run_assemble_benchmark(mut benchmark: AssembleBenchmark) -> u64 {
-    let mut total_segments = 0u64;
-    loop {
-        let Some(unfilled) = benchmark.pool.alloc::<SyncRecycler>() else {
-            break;
-        };
-        let Some(segments) = assemble::assemble::<SyncRecycler, _>(
-            &mut benchmark.context,
-            ImmediateQueueStatus::Empty,
-            &benchmark.clock,
-            crate::endpoint::id::LocalSenderId::from_index(0),
-            SOURCE_CONTROL_PORT,
-            &benchmark.gso,
-            unfilled,
-            &mut benchmark.header_buf,
-            &mut benchmark.cancelled,
-            &mut benchmark.ack_completions,
-            &mut benchmark.freed_batch_tx,
-            &benchmark.assembler_counters,
-            &benchmark.send_counters,
-        ) else {
-            break;
-        };
-        total_segments += segments.segment_count() as u64;
+        total_segments
+            .saturating_add(self.cancelled.len() as u64)
+            .saturating_add(self.ack_completions.len() as u64)
+            .saturating_add(self.context.inflight.has_inflight() as u64)
     }
-
-    total_segments
-        .saturating_add(benchmark.cancelled.len() as u64)
-        .saturating_add(benchmark.ack_completions.len() as u64)
-        .saturating_add(benchmark.context.inflight.has_inflight() as u64)
 }
 
 pub struct AckProcessingBenchmark {
@@ -120,61 +118,63 @@ pub struct AckProcessingBenchmark {
     payload: BytesMut,
 }
 
-pub fn setup_ack_processing_benchmark(
-    packets: usize,
-    frames_per_packet: usize,
-    payload_len: usize,
-    ack_frames: usize,
-) -> AckProcessingBenchmark {
-    let registry = crate::counter::Registry::default();
-    let clock = Clock::default();
-    let entry = test_path_secret_entry();
-    let mut context = make_context(&entry, &registry, &clock);
-    let send_counters =
-        counters::Send::new(&registry, crate::endpoint::id::LocalSenderId::from_index(0));
+impl AckProcessingBenchmark {
+    pub fn new(
+        packets: usize,
+        frames_per_packet: usize,
+        payload_len: usize,
+        ack_frames: usize,
+    ) -> Self {
+        let registry = crate::counter::Registry::default();
+        let clock = Clock::default();
+        let entry = test_path_secret_entry();
+        let mut context = make_context(&entry, &registry, &clock);
+        let send_counters =
+            counters::Send::new(&registry, crate::endpoint::id::LocalSenderId::from_index(0));
 
-    seed_inflight_packets(
-        &mut context,
-        &entry,
-        &clock,
-        packets,
-        frames_per_packet,
-        payload_len,
-    );
+        seed_inflight_packets(
+            &mut context,
+            &entry,
+            &clock,
+            packets,
+            frames_per_packet,
+            payload_len,
+        );
 
-    let payload = encode_ack_payload(packets, ack_frames);
-    AckProcessingBenchmark {
-        context,
-        clock,
-        send_counters,
-        payload,
+        let payload = encode_ack_payload(packets, ack_frames);
+        Self {
+            context,
+            clock,
+            send_counters,
+            payload,
+        }
     }
-}
 
-pub fn run_ack_processing_benchmark(mut benchmark: AckProcessingBenchmark) -> u64 {
-    let mut completed = Queue::new();
-    let mut lost = Queue::new();
-    let mut cancelled = Queue::new();
-    let mut rng = Rng::new();
-    let mut deferred = Vec::new();
-    let _ = benchmark.context.process_ack_payload(
-        &mut benchmark.payload,
-        Duration::ZERO,
-        &benchmark.send_counters,
-        &mut completed,
-        &mut lost,
-        &mut cancelled,
-        &benchmark.clock,
-        &mut rng,
-        &mut deferred,
-    );
+    pub fn run(mut self) -> u64 {
+        let mut completed = Queue::new();
+        let mut lost = Queue::new();
+        let mut cancelled = Queue::new();
+        let mut rng = Rng::new();
+        let mut deferred = Vec::new();
+        let _ = self.context.process_ack_payload(
+            &mut self.payload,
+            Duration::ZERO,
+            &self.send_counters,
+            &mut completed,
+            &mut lost,
+            &mut cancelled,
+            &self.clock,
+            &mut rng,
+            &mut deferred,
+        );
 
-    completed
-        .len()
-        .saturating_add(lost.len())
-        .saturating_add(cancelled.len())
-        .saturating_add(deferred.len())
-        .saturating_add(benchmark.context.inflight.has_inflight() as usize) as u64
+        completed
+            .len()
+            .saturating_add(lost.len())
+            .saturating_add(cancelled.len())
+            .saturating_add(deferred.len())
+            .saturating_add(self.context.inflight.has_inflight() as usize) as u64
+    }
 }
 
 fn test_path_secret_entry() -> Arc<PathSecretEntry> {

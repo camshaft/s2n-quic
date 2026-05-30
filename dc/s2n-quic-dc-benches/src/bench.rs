@@ -72,14 +72,16 @@ pub const fn backend() -> Backend {
 // ── Criterion backend (default) ───────────────────────────────────────────────
 
 #[cfg(not(feature = "cachegrind"))]
-pub use criterion::{BenchmarkGroup, BenchmarkId, Criterion, Throughput};
+pub use criterion::{BatchSize, BenchmarkGroup, BenchmarkId, Criterion, Throughput};
 #[cfg(not(feature = "cachegrind"))]
 pub use std::hint::black_box;
 
 // ── Cachegrind backend ────────────────────────────────────────────────────────
 
 #[cfg(feature = "cachegrind")]
-pub use cachegrind_backend::{black_box, BenchmarkGroup, BenchmarkId, Criterion, Throughput};
+pub use cachegrind_backend::{
+    black_box, BatchSize, BenchmarkGroup, BenchmarkId, Criterion, Throughput,
+};
 #[cfg(feature = "cachegrind")]
 mod cachegrind_backend {
     use core::fmt;
@@ -127,6 +129,19 @@ mod cachegrind_backend {
         }
     }
 
+    // ── BatchSize ─────────────────────────────────────────────────────────────
+
+    /// Batch-size hint kept for criterion API parity.
+    #[derive(Clone, Copy, Debug)]
+    #[non_exhaustive]
+    pub enum BatchSize {
+        SmallInput,
+        LargeInput,
+        PerIteration,
+        NumBatches(u64),
+        NumIterations(u64),
+    }
+
     // ── Bencher ───────────────────────────────────────────────────────────────
 
     /// Single-iteration benchmark runner.
@@ -143,6 +158,18 @@ mod cachegrind_backend {
         #[inline(always)]
         pub fn iter<F: FnMut()>(&mut self, mut f: F) {
             f();
+        }
+
+        /// Run a setup closure and benchmark closure once.
+        #[inline(always)]
+        pub fn iter_batched<I, S, R>(&mut self, mut setup: S, mut routine: R, size: BatchSize)
+        where
+            S: FnMut() -> I,
+            R: FnMut(I),
+        {
+            // Cachegrind mode executes exactly one setup+run per benchmark harness.
+            let _ = size;
+            routine(setup());
         }
 
         /// Run `f` with a single iteration count and ignore the returned
@@ -174,12 +201,7 @@ mod cachegrind_backend {
         /// Register and immediately run a benchmark with a borrowed input.
         ///
         /// Matches `criterion::BenchmarkGroup::bench_with_input`.
-        pub fn bench_with_input<I, F>(
-            &mut self,
-            id: BenchmarkId,
-            input: &I,
-            mut f: F,
-        ) -> &mut Self
+        pub fn bench_with_input<I, F>(&mut self, id: BenchmarkId, input: &I, mut f: F) -> &mut Self
         where
             I: ?Sized,
             F: FnMut(&mut Bencher, &I),
