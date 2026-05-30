@@ -340,6 +340,7 @@ mod cachegrind_backend {
         // run captures cold-cache instruction counts.
         crabgrind::callgrind::start_instrumentation();
         routine(cold_input);
+        crabgrind::callgrind::stop_instrumentation();
         crabgrind::callgrind::dump_stats(Some(cold_label));
         // Zero counters so the warm dump only reflects the second execution.
         crabgrind::callgrind::zero_stats();
@@ -349,12 +350,10 @@ mod cachegrind_backend {
         // measures the steady-state (cache-hot) path. Setup is run again so the
         // warm pass benchmarks the same routine against a freshly prepared input.
         let warm_input = setup();
+        crabgrind::callgrind::start_instrumentation();
         routine(warm_input);
-        crabgrind::callgrind::dump_stats(Some(warm_label));
-
-        // Stop counting so inter-benchmark overhead is not attributed to the
-        // next harness's cold run.
         crabgrind::callgrind::stop_instrumentation();
+        crabgrind::callgrind::dump_stats(Some(warm_label));
     }
 
     /// Build a `CString` label of the form `"<name> [<suffix>]"`.
