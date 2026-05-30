@@ -5,7 +5,6 @@ use anyhow::{Context, Result};
 use arrow::{
     array::*,
     datatypes::{DataType, Field, Schema},
-    record_batch::RecordBatch,
 };
 use clap::Args;
 use parquet::{
@@ -21,6 +20,8 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use xshell::Shell;
+
+use super::metrics_parquet::{MetricsBatchBuilder, metrics_schema};
 
 #[derive(Args)]
 pub struct Cwlogs {
@@ -266,183 +267,12 @@ impl EventBatchBuilder {
 
 const BATCH_SIZE: usize = 8192;
 
-fn parquet_schema() -> Arc<Schema> {
-    Arc::new(Schema::new(vec![
-        Field::new("ts", DataType::Float64, false),
-        Field::new("log_group", DataType::Utf8, false),
-        Field::new("stream", DataType::Utf8, false),
-        Field::new("env", DataType::Utf8, true),
-        Field::new("metric", DataType::Utf8, false),
-        Field::new("type", DataType::Utf8, false),
-        Field::new("variant", DataType::Utf8, true),
-        Field::new("unit", DataType::Utf8, true),
-        Field::new("value", DataType::Int64, true),
-        Field::new("enq", DataType::UInt64, true),
-        Field::new("drain", DataType::UInt64, true),
-        Field::new("depth", DataType::Int64, true),
-        Field::new("hit", DataType::UInt64, true),
-        Field::new("miss", DataType::UInt64, true),
-        Field::new("bytes", DataType::UInt64, true),
-        Field::new("count", DataType::UInt64, true),
-        Field::new("p50", DataType::UInt64, true),
-        Field::new("p99", DataType::UInt64, true),
-        Field::new("max", DataType::UInt64, true),
-        Field::new("buckets", DataType::Utf8, true),
-    ]))
-}
-
-struct BatchBuilder {
-    ts: Float64Builder,
-    log_group: StringBuilder,
-    stream: StringBuilder,
-    env: StringBuilder,
-    metric: StringBuilder,
-    r#type: StringBuilder,
-    variant: StringBuilder,
-    unit: StringBuilder,
-    value: Int64Builder,
-    enq: UInt64Builder,
-    drain: UInt64Builder,
-    depth: Int64Builder,
-    hit: UInt64Builder,
-    miss: UInt64Builder,
-    bytes: UInt64Builder,
-    count: UInt64Builder,
-    p50: UInt64Builder,
-    p99: UInt64Builder,
-    max: UInt64Builder,
-    buckets: StringBuilder,
-    row_count: usize,
-}
-
-impl BatchBuilder {
-    fn new() -> Self {
-        Self {
-            ts: Float64Builder::new(),
-            log_group: StringBuilder::new(),
-            stream: StringBuilder::new(),
-            env: StringBuilder::new(),
-            metric: StringBuilder::new(),
-            r#type: StringBuilder::new(),
-            variant: StringBuilder::new(),
-            unit: StringBuilder::new(),
-            value: Int64Builder::new(),
-            enq: UInt64Builder::new(),
-            drain: UInt64Builder::new(),
-            depth: Int64Builder::new(),
-            hit: UInt64Builder::new(),
-            miss: UInt64Builder::new(),
-            bytes: UInt64Builder::new(),
-            count: UInt64Builder::new(),
-            p50: UInt64Builder::new(),
-            p99: UInt64Builder::new(),
-            max: UInt64Builder::new(),
-            buckets: StringBuilder::new(),
-            row_count: 0,
-        }
-    }
-
-    fn push(
-        &mut self,
-        ts: f64,
-        log_group: &str,
-        stream: &str,
-        env: Option<&str>,
-        row: &serde_json::Value,
-    ) {
-        self.ts.append_value(ts);
-        self.log_group.append_value(log_group);
-        self.stream.append_value(stream);
-        match env {
-            Some(e) => self.env.append_value(e),
-            None => self.env.append_null(),
-        }
-
-        let metric = row.get("metric").and_then(|v| v.as_str()).unwrap_or("");
-        let metric_type = row.get("type").and_then(|v| v.as_str()).unwrap_or("");
-        self.metric.append_value(metric);
-        self.r#type.append_value(metric_type);
-
-        append_opt_str(&mut self.variant, row.get("variant"));
-        append_opt_str(&mut self.unit, row.get("unit"));
-        append_opt_i64(&mut self.value, row.get("value"));
-        append_opt_u64(&mut self.enq, row.get("enq"));
-        append_opt_u64(&mut self.drain, row.get("drain"));
-        append_opt_i64(&mut self.depth, row.get("depth"));
-        append_opt_u64(&mut self.hit, row.get("hit"));
-        append_opt_u64(&mut self.miss, row.get("miss"));
-        append_opt_u64(&mut self.bytes, row.get("bytes"));
-        append_opt_u64(&mut self.count, row.get("count"));
-        append_opt_u64(&mut self.p50, row.get("p50"));
-        append_opt_u64(&mut self.p99, row.get("p99"));
-        append_opt_u64(&mut self.max, row.get("max"));
-
-        match row.get("buckets") {
-            Some(b) if !b.is_null() => self.buckets.append_value(b.to_string()),
-            _ => self.buckets.append_null(),
-        }
-
-        self.row_count += 1;
-    }
-
-    fn finish(&mut self) -> RecordBatch {
-        let schema = parquet_schema();
-        RecordBatch::try_new(
-            schema,
-            vec![
-                Arc::new(self.ts.finish()),
-                Arc::new(self.log_group.finish()),
-                Arc::new(self.stream.finish()),
-                Arc::new(self.env.finish()),
-                Arc::new(self.metric.finish()),
-                Arc::new(self.r#type.finish()),
-                Arc::new(self.variant.finish()),
-                Arc::new(self.unit.finish()),
-                Arc::new(self.value.finish()),
-                Arc::new(self.enq.finish()),
-                Arc::new(self.drain.finish()),
-                Arc::new(self.depth.finish()),
-                Arc::new(self.hit.finish()),
-                Arc::new(self.miss.finish()),
-                Arc::new(self.bytes.finish()),
-                Arc::new(self.count.finish()),
-                Arc::new(self.p50.finish()),
-                Arc::new(self.p99.finish()),
-                Arc::new(self.max.finish()),
-                Arc::new(self.buckets.finish()),
-            ],
-        )
-        .expect("schema mismatch in batch builder")
-    }
-}
-
-fn append_opt_str(builder: &mut StringBuilder, val: Option<&serde_json::Value>) {
-    match val.and_then(|v| v.as_str()) {
-        Some(s) => builder.append_value(s),
-        None => builder.append_null(),
-    }
-}
-
-fn append_opt_u64(builder: &mut UInt64Builder, val: Option<&serde_json::Value>) {
-    match val.and_then(|v| v.as_u64()) {
-        Some(n) => builder.append_value(n),
-        None => builder.append_null(),
-    }
-}
-
-fn append_opt_i64(builder: &mut Int64Builder, val: Option<&serde_json::Value>) {
-    match val.and_then(|v| v.as_i64()) {
-        Some(n) => builder.append_value(n),
-        None => builder.append_null(),
-    }
-}
-
 fn parse_to_parquet(
     events_path: &std::path::Path,
     parquet_path: &std::path::Path,
     log_group: &str,
 ) -> Result<()> {
-    let schema = parquet_schema();
+    let schema = metrics_schema();
     let props = WriterProperties::builder()
         .set_compression(Compression::ZSTD(Default::default()))
         .set_max_row_group_size(100_000)
@@ -461,7 +291,7 @@ fn parse_to_parquet(
         .build()
         .context("Failed to build cached events parquet reader")?;
 
-    let mut batch = BatchBuilder::new();
+    let mut batch = MetricsBatchBuilder::new();
     let mut total_rows = 0u64;
     let mut lines_processed = 0u64;
 
@@ -501,13 +331,23 @@ fn parse_to_parquet(
             }
 
             for row in parsed.to_json_rows() {
-                batch.push(ts, log_group, stream, env, &row);
+                batch.push(
+                    ts,
+                    "cwlogs",
+                    None,
+                    None,
+                    None,
+                    (!log_group.is_empty()).then_some(log_group),
+                    Some(stream),
+                    env,
+                    &row,
+                );
                 total_rows += 1;
 
                 if batch.row_count >= BATCH_SIZE {
                     let record_batch = batch.finish();
                     writer.write(&record_batch)?;
-                    batch = BatchBuilder::new();
+                    batch = MetricsBatchBuilder::new();
                 }
             }
 
