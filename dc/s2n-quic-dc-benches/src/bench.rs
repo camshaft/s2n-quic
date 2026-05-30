@@ -4,12 +4,13 @@
 //! Benchmark backend abstraction.
 //!
 //! All benchmark modules write against a single, criterion-compatible API.
-//! The actual backend is selected at compile time via the `iai` feature flag:
+//! The actual backend is selected at compile time via the `cachegrind` feature
+//! flag:
 //!
 //! | feature | backend | measures |
 //! |---------|---------|---------|
 //! | *(none)* | [criterion](https://docs.rs/criterion) | wall-clock time |
-//! | `iai` | custom runner + callgrind client requests | instruction counts |
+//! | `cachegrind` | custom runner + callgrind client requests | instruction counts |
 //!
 //! # Querying the backend at runtime
 //!
@@ -20,7 +21,7 @@
 //!
 //! match backend() {
 //!     Backend::Criterion => { /* timing-sensitive setup */ }
-//!     Backend::Iai => { /* instruction-count-friendly setup */ }
+//!     Backend::Cachegrind => { /* instruction-count-friendly setup */ }
 //! }
 //! ```
 //!
@@ -29,12 +30,12 @@
 //! Build and run the `bench` binary under callgrind or cachegrind:
 //!
 //! ```sh
-//! cargo build --bench bench --features iai --profile bench
+//! cargo build --bench bench --features cachegrind --profile bench
 //!
-//! # Callgrind: produces one output file per benchmark (labelled by name)
+//! # Callgrind: two output files per benchmark (<name> [cold] and <name> [warm])
 //! valgrind --tool=callgrind \
 //!     --callgrind-out-file=callgrind.%p \
-//!     --dump-instr=yes \
+//!     --instr-atstart=no \
 //!     ./target/bench/deps/bench-*
 //! callgrind_annotate callgrind.out.<pid>.*
 //!
@@ -52,44 +53,45 @@ pub enum Backend {
     Criterion,
     /// Instruction-count benchmarking for use with Valgrind
     /// (cachegrind or callgrind).
-    Iai,
+    Cachegrind,
 }
 
 /// Returns the active benchmark backend.
 #[inline]
 pub const fn backend() -> Backend {
-    #[cfg(not(feature = "iai"))]
+    #[cfg(not(feature = "cachegrind"))]
     {
         Backend::Criterion
     }
-    #[cfg(feature = "iai")]
+    #[cfg(feature = "cachegrind")]
     {
-        Backend::Iai
+        Backend::Cachegrind
     }
 }
 
 // ── Criterion backend (default) ───────────────────────────────────────────────
 
-#[cfg(not(feature = "iai"))]
+#[cfg(not(feature = "cachegrind"))]
 pub use criterion::{BenchmarkId, Criterion, Throughput};
-#[cfg(not(feature = "iai"))]
+#[cfg(not(feature = "cachegrind"))]
 pub use std::hint::black_box;
 
-// ── Iai backend ───────────────────────────────────────────────────────────────
+// ── Cachegrind backend ────────────────────────────────────────────────────────
 
-#[cfg(feature = "iai")]
-pub use iai_backend::{black_box, BenchmarkId, Criterion, Throughput};
+#[cfg(feature = "cachegrind")]
+pub use cachegrind_backend::{black_box, BenchmarkId, Criterion, Throughput};
 
-#[cfg(feature = "iai")]
-mod iai_backend {
+#[cfg(feature = "cachegrind")]
+mod cachegrind_backend {
     use core::fmt;
     use std::ffi::CString;
     pub use std::hint::black_box;
 
     // ── Throughput ────────────────────────────────────────────────────────────
 
-    /// Throughput hint (kept for API parity; not used for measurement in iai
-    /// mode since we track instruction counts rather than data rates).
+    /// Throughput hint (kept for API parity; not used for measurement in
+    /// cachegrind mode since we track instruction counts rather than data
+    /// rates).
     #[derive(Clone, Debug)]
     #[non_exhaustive]
     pub enum Throughput {
@@ -130,20 +132,22 @@ mod iai_backend {
 
     /// Single-iteration benchmark runner.
     ///
-    /// In iai mode each closure is executed **exactly once**.  Running the
-    /// resulting binary under `valgrind --tool=cachegrind` (or `callgrind`)
-    /// then yields stable instruction counts and cache statistics.
+    /// In cachegrind mode each closure is executed **exactly twice** per
+    /// [`Criterion::run_bench`] call — once for cold-cache and once for
+    /// warm-cache measurements.  Running the resulting binary under
+    /// `valgrind --tool=callgrind` (or `cachegrind`) then yields stable
+    /// instruction counts and cache statistics for both scenarios.
     pub struct Bencher;
 
     impl Bencher {
-        /// Run `f` once (iai mode) rather than many times (criterion mode).
+        /// Run `f` once.
         #[inline(always)]
         pub fn iter<F: FnMut()>(&mut self, mut f: F) {
             f();
         }
 
         /// Run `f` with a single iteration count and ignore the returned
-        /// duration (iai mode does not measure wall time).
+        /// duration (cachegrind mode does not measure wall time).
         #[inline(always)]
         pub fn iter_custom<F>(&mut self, mut f: F)
         where
@@ -155,14 +159,14 @@ mod iai_backend {
 
     // ── BenchmarkGroup ────────────────────────────────────────────────────────
 
-    /// An iai-mode analogue of `criterion::BenchmarkGroup`.
+    /// A cachegrind-mode analogue of `criterion::BenchmarkGroup`.
     pub struct BenchmarkGroup<'c> {
         criterion: &'c mut Criterion,
         group_name: String,
     }
 
     impl<'c> BenchmarkGroup<'c> {
-        /// Set throughput (no-op in iai mode; kept for API parity).
+        /// Set throughput (no-op in cachegrind mode; kept for API parity).
         #[inline]
         pub fn throughput(&mut self, _throughput: Throughput) -> &mut Self {
             self
@@ -201,25 +205,26 @@ mod iai_backend {
             self
         }
 
-        /// Finish the group.  No-op in iai mode; present for API parity.
+        /// Finish the group.  No-op in cachegrind mode; present for API
+        /// parity.
         pub fn finish(self) {}
     }
 
     // ── Criterion ─────────────────────────────────────────────────────────────
 
-    /// Top-level iai benchmark runner.
+    /// Top-level cachegrind benchmark runner.
     ///
     /// Create one instance, pass it to your `benchmarks` function, then let
     /// it drop (the `Drop` impl prints a summary).  Each call to
     /// [`BenchmarkGroup::bench_with_input`] / [`BenchmarkGroup::bench_function`]
-    /// immediately executes the closure once so that Valgrind can count the
-    /// resulting instructions.
+    /// runs the closure **twice** — cold then warm — so a single Valgrind
+    /// execution yields per-harness instruction counts for both scenarios.
     pub struct Criterion {
         count: usize,
     }
 
     impl Criterion {
-        /// Create a new iai runner.
+        /// Create a new cachegrind runner.
         pub fn new() -> Self {
             Self { count: 0 }
         }
@@ -234,36 +239,69 @@ mod iai_backend {
             }
         }
 
-        /// Run a single benchmark closure, printing its name to stderr.
+        /// Run a single benchmark closure twice — cold then warm — emitting a
+        /// labelled callgrind dump after each run.
         ///
-        /// Emits callgrind client requests around the closure:
+        /// ## Cold run
         ///
-        /// - [`callgrind::zero_stats`] before running — so the dump only captures
-        ///   instructions from this benchmark, not any prior ones.
-        /// - [`callgrind::dump_stats`] after running — labelled with the benchmark
-        ///   name, which produces one output file per benchmark when running under
-        ///   `valgrind --tool=callgrind`.
+        /// `callgrind::start_instrumentation()` flushes the simulated cache and
+        /// starts instruction counting, so the first execution measures the
+        /// cold-cache path.  After the run the stats are dumped and then zeroed
+        /// so the warm run starts from a clean counter state.
         ///
-        /// Both requests are no-ops when not running under Valgrind, so the binary
-        /// can also be used under cachegrind or executed without Valgrind at all.
+        /// ## Warm run
+        ///
+        /// The second execution reuses the warm cache left by the cold run, so
+        /// the dump reflects the steady-state (cache-hot) instruction counts.
+        /// `callgrind::stop_instrumentation()` is called afterwards to exclude
+        /// any inter-benchmark housekeeping from the next harness's cold run.
+        ///
+        /// Both `start_instrumentation` / `stop_instrumentation` and
+        /// `dump_stats` are no-ops when not running under Valgrind, so the
+        /// binary works correctly under cachegrind and without Valgrind too.
         fn run_bench(&mut self, name: &str, f: &mut dyn FnMut()) {
             self.count += 1;
-            eprintln!("[iai] {:>4}  {name}", self.count);
-            // Zero stats so the dump captures only this benchmark's instructions.
-            crabgrind::callgrind::zero_stats();
+            eprintln!("[cachegrind] {:>4}  {name}", self.count);
+
+            let cold_label = make_label(name, "cold");
+            let warm_label = make_label(name, "warm");
+
+            // ── Cold run ──────────────────────────────────────────────────────
+            // start_instrumentation triggers a full simulated-cache flush so
+            // this run captures cold-cache instruction counts.
+            crabgrind::callgrind::start_instrumentation();
             f();
-            // Emit a per-benchmark dump so a single execution yields one output
-            // file per harness, enabling fine-grained instruction-count analysis.
-            let label = CString::new(name).unwrap_or_else(|e| {
-                let pos = e.nul_position();
-                eprintln!(
-                    "[iai] warning: benchmark name {name:?} contains a null byte at \
-                     position {pos}; dump label will be truncated"
-                );
-                CString::new(&name[..pos]).unwrap()
-            });
-            crabgrind::callgrind::dump_stats(Some(label.as_c_str()));
+            crabgrind::callgrind::dump_stats(Some(cold_label.as_c_str()));
+            // Zero counters so the warm dump only reflects the second execution.
+            crabgrind::callgrind::zero_stats();
+
+            // ── Warm run ──────────────────────────────────────────────────────
+            // The cache is now populated from the cold run; this second
+            // execution measures the steady-state (cache-hot) path.
+            f();
+            crabgrind::callgrind::dump_stats(Some(warm_label.as_c_str()));
+
+            // Stop counting so inter-benchmark overhead is not attributed to
+            // the next harness's cold run.
+            crabgrind::callgrind::stop_instrumentation();
         }
+    }
+
+    /// Build a `CString` label of the form `"<name> [<suffix>]"`.
+    ///
+    /// If `name` contains a null byte (which is disallowed in C strings) the
+    /// name is silently truncated at that position and a warning is printed to
+    /// stderr.
+    fn make_label(name: &str, suffix: &str) -> CString {
+        let display = format!("{name} [{suffix}]");
+        CString::new(display.as_str()).unwrap_or_else(|e| {
+            let pos = e.nul_position();
+            eprintln!(
+                "[cachegrind] warning: benchmark name {name:?} contains a null \
+                 byte at position {pos}; dump label will be truncated"
+            );
+            CString::new(&display[..pos]).unwrap()
+        })
     }
 
     impl Default for Criterion {
@@ -275,7 +313,10 @@ mod iai_backend {
     impl Drop for Criterion {
         fn drop(&mut self) {
             if self.count > 0 {
-                eprintln!("[iai] completed {count} benchmarks", count = self.count);
+                eprintln!(
+                    "[cachegrind] completed {count} benchmarks",
+                    count = self.count
+                );
             }
         }
     }
