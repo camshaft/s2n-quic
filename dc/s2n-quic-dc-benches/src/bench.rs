@@ -168,11 +168,12 @@ mod cachegrind_backend {
             R: FnMut(I),
         {
             let _ = size;
-            // Exclude setup from measurements and reset counters so only `routine`
-            // is captured by the surrounding benchmark dump.
+            // Disable counter collection while setup builds the input.
             crabgrind::callgrind::toggle_collect();
             let input = setup();
+            // Drop any setup-attributed counts from the current benchmark run.
             crabgrind::callgrind::zero_stats();
+            // Re-enable collection so only `routine` is measured.
             crabgrind::callgrind::toggle_collect();
             routine(input);
         }
