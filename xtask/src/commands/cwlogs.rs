@@ -331,7 +331,7 @@ fn parse_to_parquet(
                 continue;
             }
 
-            for row in parsed.to_json_rows() {
+            for row in parsed.to_rows() {
                 batch.push(
                     ts,
                     "cwlogs",

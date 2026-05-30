@@ -6,6 +6,7 @@ use arrow::{
     datatypes::{DataType, Field, Schema},
     record_batch::RecordBatch,
 };
+use s2n_quic_dc_metrics::format::MetricRow;
 use std::sync::{Arc, OnceLock};
 
 pub const METRICS_BATCH_SIZE: usize = 8192;
@@ -35,7 +36,24 @@ pub fn metrics_schema() -> Arc<Schema> {
                 Field::new("p50", DataType::UInt64, true),
                 Field::new("p99", DataType::UInt64, true),
                 Field::new("max", DataType::UInt64, true),
-                Field::new("buckets", DataType::Utf8, true),
+                Field::new(
+                    "buckets",
+                    DataType::Map(
+                        Arc::new(Field::new(
+                            "entries",
+                            DataType::Struct(
+                                vec![
+                                    Arc::new(Field::new("key", DataType::UInt64, false)),
+                                    Arc::new(Field::new("value", DataType::UInt64, false)),
+                                ]
+                                .into(),
+                            ),
+                            false,
+                        )),
+                        false,
+                    ),
+                    true,
+                ),
             ]))
         })
         .clone()
@@ -62,7 +80,7 @@ pub struct MetricsBatchBuilder {
     p50: UInt64Builder,
     p99: UInt64Builder,
     max: UInt64Builder,
-    buckets: StringBuilder,
+    buckets: MapBuilder<UInt64Builder, UInt64Builder>,
     pub row_count: usize,
 }
 
@@ -89,7 +107,7 @@ impl MetricsBatchBuilder {
             p50: UInt64Builder::new(),
             p99: UInt64Builder::new(),
             max: UInt64Builder::new(),
-            buckets: StringBuilder::new(),
+            buckets: MapBuilder::new(None, UInt64Builder::new(), UInt64Builder::new()),
             row_count: 0,
         }
     }
@@ -102,7 +120,7 @@ impl MetricsBatchBuilder {
         log_group: Option<&str>,
         stream: Option<&str>,
         env: Option<&str>,
-        row: &serde_json::Value,
+        row: &MetricRow,
     ) {
         self.ts.append_value(ts);
         self.source.append_value(source);
@@ -110,28 +128,37 @@ impl MetricsBatchBuilder {
         self.stream.append_value(stream.unwrap_or_default());
         self.env.append_value(env.unwrap_or_default());
 
-        self.metric
-            .append_value(row.get("metric").and_then(|v| v.as_str()).unwrap_or(""));
-        self.r#type
-            .append_value(row.get("type").and_then(|v| v.as_str()).unwrap_or(""));
+        self.metric.append_value(row.metric);
+        self.r#type.append_value(row.r#type);
 
-        append_opt_json_str(&mut self.variant, row.get("variant"));
-        append_opt_json_str(&mut self.unit, row.get("unit"));
-        append_opt_i64(&mut self.value, row.get("value"));
-        append_opt_u64(&mut self.enq, row.get("enq"));
-        append_opt_u64(&mut self.drain, row.get("drain"));
-        append_opt_i64(&mut self.depth, row.get("depth"));
-        append_opt_u64(&mut self.hit, row.get("hit"));
-        append_opt_u64(&mut self.miss, row.get("miss"));
-        append_opt_u64(&mut self.bytes, row.get("bytes"));
-        append_opt_u64(&mut self.count, row.get("count"));
-        append_opt_u64(&mut self.p50, row.get("p50"));
-        append_opt_u64(&mut self.p99, row.get("p99"));
-        append_opt_u64(&mut self.max, row.get("max"));
+        append_opt_str(&mut self.variant, row.variant);
+        append_opt_str(&mut self.unit, row.unit);
+        append_opt_i64(&mut self.value, row.value);
+        append_opt_u64(&mut self.enq, row.enq);
+        append_opt_u64(&mut self.drain, row.drain);
+        append_opt_i64(&mut self.depth, row.depth);
+        append_opt_u64(&mut self.hit, row.hit);
+        append_opt_u64(&mut self.miss, row.miss);
+        append_opt_u64(&mut self.bytes, row.bytes);
+        append_opt_u64(&mut self.count, row.count);
+        append_opt_u64(&mut self.p50, row.p50);
+        append_opt_u64(&mut self.p99, row.p99);
+        append_opt_u64(&mut self.max, row.max);
 
-        match row.get("buckets") {
-            Some(b) if !b.is_null() => self.buckets.append_value(b.to_string()),
-            _ => self.buckets.append_null(),
+        match row.buckets.as_ref() {
+            Some(buckets) => {
+                for (bucket_value, bucket_count) in buckets {
+                    self.buckets.keys().append_value(*bucket_value);
+                    self.buckets.values().append_value(*bucket_count);
+                }
+                self.buckets
+                    .append(true)
+                    .expect("keys and values must be equal-length");
+            }
+            None => self
+                .buckets
+                .append(false)
+                .expect("keys and values must be equal-length"),
         }
 
         self.row_count += 1;
@@ -168,22 +195,22 @@ impl MetricsBatchBuilder {
     }
 }
 
-fn append_opt_json_str(builder: &mut StringBuilder, val: Option<&serde_json::Value>) {
-    match val.and_then(|v| v.as_str()) {
+fn append_opt_str(builder: &mut StringBuilder, val: Option<&str>) {
+    match val {
         Some(s) => builder.append_value(s),
         None => builder.append_null(),
     }
 }
 
-fn append_opt_u64(builder: &mut UInt64Builder, val: Option<&serde_json::Value>) {
-    match val.and_then(|v| v.as_u64()) {
+fn append_opt_u64(builder: &mut UInt64Builder, val: Option<u64>) {
+    match val {
         Some(n) => builder.append_value(n),
         None => builder.append_null(),
     }
 }
 
-fn append_opt_i64(builder: &mut Int64Builder, val: Option<&serde_json::Value>) {
-    match val.and_then(|v| v.as_i64()) {
+fn append_opt_i64(builder: &mut Int64Builder, val: Option<i64>) {
+    match val {
         Some(n) => builder.append_value(n),
         None => builder.append_null(),
     }

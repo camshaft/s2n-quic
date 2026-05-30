@@ -917,7 +917,7 @@ async fn run_processes(
                             .duration_since(std::time::UNIX_EPOCH)
                             .unwrap()
                             .as_secs_f64();
-                        for row in parsed.to_json_rows() {
+                        for row in parsed.to_rows() {
                             // local context mapped to unified CW-style columns:
                             // run_name -> log_group, process label -> stream, workloads -> env
                             metrics_batch.push(
