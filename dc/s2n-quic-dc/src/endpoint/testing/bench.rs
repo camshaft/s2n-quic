@@ -2,9 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
-    endpoint::{
-        assemble, combinator::AssemblerCounters, counters, frame, inflight, send, DEFAULT_IDLE_TIMEOUT,
-    },
+    endpoint::{assemble, combinator::AssemblerCounters, counters, frame, id::Id, inflight, send},
     intrusive::{Entry, Queue},
     path::secret::map::Entry as PathSecretEntry,
     socket::{
@@ -18,13 +16,9 @@ use bytes::BytesMut;
 use core::time::Duration;
 use s2n_codec::EncoderValue as _;
 use s2n_quic_core::{
-    ack,
-    frame as quic_frame,
-    packet::number::PacketNumberSpace,
-    time::Clock as _,
-    varint::VarInt,
+    ack, frame as quic_frame, packet::number::PacketNumberSpace, time::Clock as _, varint::VarInt,
 };
-use s2n_quic_platform::features::{Gso, MaxSegments};
+use s2n_quic_platform::features::{gso::MaxSegments, Gso};
 use std::sync::Arc;
 
 const TEST_MTU: u16 = 1400;
@@ -35,7 +29,8 @@ pub fn run_assemble_benchmark(packets: usize, frames_per_packet: usize, payload_
     let clock = Clock::default();
     let entry = test_path_secret_entry();
     let mut context = make_context(&entry, &registry, &clock);
-    let send_counters = counters::Send::new(&registry, crate::endpoint::id::LocalSenderId::from_index(0));
+    let send_counters =
+        counters::Send::new(&registry, crate::endpoint::id::LocalSenderId::from_index(0));
     let assembler_counters = AssemblerCounters::new(&registry);
     let pool = pool::Pool::new(u16::MAX);
     let mut header_buf = Vec::new();
@@ -101,7 +96,7 @@ pub fn run_assemble_benchmark(packets: usize, frames_per_packet: usize, payload_
     total_segments
         .saturating_add(cancelled.len() as u64)
         .saturating_add(ack_completions.len() as u64)
-        .saturating_add(context.inflight.len() as u64)
+        .saturating_add(context.inflight.has_inflight() as u64)
 }
 
 pub fn run_ack_processing_benchmark(
@@ -114,13 +109,21 @@ pub fn run_ack_processing_benchmark(
     let clock = Clock::default();
     let entry = test_path_secret_entry();
     let mut context = make_context(&entry, &registry, &clock);
-    let send_counters = counters::Send::new(&registry, crate::endpoint::id::LocalSenderId::from_index(0));
+    let send_counters =
+        counters::Send::new(&registry, crate::endpoint::id::LocalSenderId::from_index(0));
     let mut completed = Queue::new();
     let mut lost = Queue::new();
     let mut cancelled = Queue::new();
     let mut rng = Rng::new();
 
-    seed_inflight_packets(&mut context, &entry, &clock, packets, frames_per_packet, payload_len);
+    seed_inflight_packets(
+        &mut context,
+        &entry,
+        &clock,
+        packets,
+        frames_per_packet,
+        payload_len,
+    );
 
     let mut payload = encode_ack_payload(packets, ack_frames);
     let mut deferred = Vec::new();
@@ -141,15 +144,16 @@ pub fn run_ack_processing_benchmark(
         .saturating_add(lost.len())
         .saturating_add(cancelled.len())
         .saturating_add(deferred.len())
-        .saturating_add(context.inflight.len()) as u64
+        .saturating_add(context.inflight.has_inflight() as usize) as u64
 }
 
 fn test_path_secret_entry() -> Arc<PathSecretEntry> {
     let peer: std::net::SocketAddr = "127.0.0.1:4433".parse().unwrap();
-    let entry = PathSecretEntry::builder(peer).socket_sender_count(1).build();
+    let entry = PathSecretEntry::builder(peer)
+        .socket_sender_count(1)
+        .build();
     entry.set_peer_data_addrs(&[peer]);
     entry.update_max_datagram_size(TEST_MTU);
-    entry.update_idle_timeout(DEFAULT_IDLE_TIMEOUT);
     entry
 }
 
@@ -172,7 +176,11 @@ fn make_context(
     .unwrap()
 }
 
-fn benchmark_frame(entry: &Arc<PathSecretEntry>, idx: usize, payload_len: usize) -> Entry<frame::Frame> {
+fn benchmark_frame(
+    entry: &Arc<PathSecretEntry>,
+    idx: usize,
+    payload_len: usize,
+) -> Entry<frame::Frame> {
     let queue_id = VarInt::new((idx as u64 % 1024) + 1).unwrap();
     Entry::new(frame::Frame {
         header: frame::Header::QueueData {
