@@ -493,7 +493,7 @@ fn parse_to_parquet(
             let (raw, env) = match extract_metrics_payload(message) {
                 Some(v) => v,
                 None => continue,
-            }
+            };
 
             let parsed = s2n_quic_dc_metrics::format::ParsedMetricsLine::parse(raw);
             if parsed.is_empty() {
