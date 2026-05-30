@@ -167,9 +167,14 @@ mod cachegrind_backend {
             S: FnMut() -> I,
             R: FnMut(I),
         {
-            // Cachegrind mode executes exactly one setup+run per benchmark harness.
             let _ = size;
-            routine(setup());
+            // Exclude setup from measurements and reset counters so only `routine`
+            // is captured by the surrounding benchmark dump.
+            crabgrind::callgrind::toggle_collect();
+            let input = setup();
+            crabgrind::callgrind::zero_stats();
+            crabgrind::callgrind::toggle_collect();
+            routine(input);
         }
 
         /// Run `f` with a single iteration count and ignore the returned
