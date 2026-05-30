@@ -55,12 +55,13 @@ enum Cmd {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Simple FNV-1a 64-bit hash over a string.
-fn fnv1a(s: &str) -> u64 {
-    let mut h: u64 = 14695981039346656037;
-    for b in s.bytes() {
+const FNV1A_OFFSET_BASIS: u64 = 14695981039346656037;
+const FNV1A_PRIME: u64 = 1099511628211;
+
+fn fnv1a_update(mut h: u64, bytes: &[u8]) -> u64 {
+    for &b in bytes {
         h ^= b as u64;
-        h = h.wrapping_mul(1099511628211);
+        h = h.wrapping_mul(FNV1A_PRIME);
     }
     h
 }
@@ -70,21 +71,24 @@ fn fnv1a(s: &str) -> u64 {
 ///   - the mtime + size of every input file (invalidates on content change)
 ///   - the name + content of every SQL file loaded from queries_dir
 fn cache_key(inputs: &[PathBuf], sql_files: &SqlFiles) -> String {
-    let mut h: u64 = 0;
+    let mut h = FNV1A_OFFSET_BASIS;
     for path in inputs {
-        h ^= fnv1a(&path.display().to_string());
+        h = fnv1a_update(h, &[0x01]);
+        h = fnv1a_update(h, path.to_string_lossy().as_bytes());
         if let Ok(meta) = path.metadata() {
             if let Ok(mtime) = meta.modified() {
                 if let Ok(dur) = mtime.duration_since(std::time::UNIX_EPOCH) {
-                    h ^= fnv1a(&dur.as_nanos().to_string());
+                    h = fnv1a_update(h, dur.as_nanos().to_string().as_bytes());
                 }
             }
-            h ^= fnv1a(&meta.len().to_string());
+            h = fnv1a_update(h, meta.len().to_string().as_bytes());
         }
     }
     for (name, content) in sql_files.all_named() {
-        h ^= fnv1a(name);
-        h ^= fnv1a(content);
+        h = fnv1a_update(h, &[0x02]);
+        h = fnv1a_update(h, name.as_bytes());
+        h = fnv1a_update(h, &[0x00]);
+        h = fnv1a_update(h, content.as_bytes());
     }
     format!("{h:016x}")
 }
@@ -210,6 +214,10 @@ fn default_cache_dir() -> PathBuf {
     std::env::temp_dir().join("s2n-quic-investigate")
 }
 
+fn quote_sql_string(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
 /// Build the SQL script that creates all views from scratch.
 fn build_init_sql(inputs: &[PathBuf], sql_files: &SqlFiles) -> String {
     let mut sql = String::new();
@@ -217,7 +225,7 @@ fn build_init_sql(inputs: &[PathBuf], sql_files: &SqlFiles) -> String {
     // Base metrics view covering all input files.
     let path_list = inputs
         .iter()
-        .map(|p| format!("'{}'", p.display()))
+        .map(|p| quote_sql_string(&p.to_string_lossy()))
         .collect::<Vec<_>>()
         .join(", ");
     sql.push_str(&format!(
@@ -229,10 +237,10 @@ fn build_init_sql(inputs: &[PathBuf], sql_files: &SqlFiles) -> String {
         let unions = inputs
             .iter()
             .map(|p| {
+                let path = p.to_string_lossy();
+                let quoted_path = quote_sql_string(&path);
                 format!(
-                    "SELECT *, '{}' AS label FROM read_parquet('{}')",
-                    p.display(),
-                    p.display()
+                    "SELECT *, {quoted_path} AS label FROM read_parquet({quoted_path})"
                 )
             })
             .collect::<Vec<_>>()
@@ -315,12 +323,9 @@ fn exec_duckdb_shell(db: &str, init_sql: Option<&str>) -> Result<()> {
     let mut cmd = Command::new("duckdb");
     cmd.arg(db);
 
-    // Keep the temp file alive until after exec().
-    let _tmpfile;
     if let Some(sql) = init_sql {
         let path = write_temp_sql(sql)?;
-        cmd.arg("-init").arg(&path);
-        _tmpfile = path;
+        cmd.arg("-init").arg(path);
     }
 
     #[cfg(unix)]
@@ -352,7 +357,7 @@ impl Investigate {
         let queries_dir = self
             .queries_dir
             .clone()
-            .unwrap_or_else(|| find_queries_dir());
+            .unwrap_or_else(find_queries_dir);
 
         // 3. Load SQL files.
         let sql_files = SqlFiles::load(&queries_dir)?;
