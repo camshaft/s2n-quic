@@ -19,12 +19,29 @@ use s2n_quic_core::{
     ack, frame as quic_frame, packet::number::PacketNumberSpace, time::Clock as _, varint::VarInt,
 };
 use s2n_quic_platform::features::{gso::MaxSegments, Gso};
-use std::sync::Arc;
+use std::{rc::Rc, sync::Arc};
 
 const TEST_MTU: u16 = 1400;
 const SOURCE_CONTROL_PORT: u16 = 4433;
 
-pub fn run_assemble_benchmark(packets: usize, frames_per_packet: usize, payload_len: usize) -> u64 {
+pub struct AssembleBenchmark {
+    context: send::Context,
+    clock: Clock,
+    send_counters: Rc<counters::Send>,
+    assembler_counters: AssemblerCounters,
+    pool: pool::Pool,
+    header_buf: Vec<u8>,
+    cancelled: Queue<frame::Frame>,
+    ack_completions: Queue<crate::endpoint::msg::Sender>,
+    freed_batch_tx: crate::queue::FreedBatchTx,
+    gso: Gso,
+}
+
+pub fn setup_assemble_benchmark(
+    packets: usize,
+    frames_per_packet: usize,
+    payload_len: usize,
+) -> AssembleBenchmark {
     let registry = crate::counter::Registry::default();
     let clock = Clock::default();
     let entry = test_path_secret_entry();
@@ -33,10 +50,10 @@ pub fn run_assemble_benchmark(packets: usize, frames_per_packet: usize, payload_
         counters::Send::new(&registry, crate::endpoint::id::LocalSenderId::from_index(0));
     let assembler_counters = AssemblerCounters::new(&registry);
     let pool = pool::Pool::new(u16::MAX);
-    let mut header_buf = Vec::new();
-    let mut cancelled = Queue::new();
-    let mut ack_completions = Queue::new();
-    let (mut freed_batch_tx, _freed_batch_rx) = crate::queue::freed_batch_channel();
+    let header_buf = Vec::new();
+    let cancelled = Queue::new();
+    let ack_completions = Queue::new();
+    let (freed_batch_tx, _freed_batch_rx) = crate::queue::freed_batch_channel();
     let gso: Gso = MaxSegments::try_from(1usize).unwrap().into();
 
     for packet_idx in 0..packets {
@@ -48,45 +65,42 @@ pub fn run_assemble_benchmark(packets: usize, frames_per_packet: usize, payload_
             ));
         }
 
-        let Some(unfilled) = pool.alloc::<SyncRecycler>() else {
-            break;
-        };
-        let _ = assemble::assemble::<SyncRecycler, _>(
-            &mut context,
-            ImmediateQueueStatus::Empty,
-            &clock,
-            crate::endpoint::id::LocalSenderId::from_index(0),
-            SOURCE_CONTROL_PORT,
-            &gso,
-            unfilled,
-            &mut header_buf,
-            &mut cancelled,
-            &mut ack_completions,
-            &mut freed_batch_tx,
-            &assembler_counters,
-            &send_counters,
-        );
     }
 
+    AssembleBenchmark {
+        context,
+        clock,
+        send_counters,
+        assembler_counters,
+        pool,
+        header_buf,
+        cancelled,
+        ack_completions,
+        freed_batch_tx,
+        gso,
+    }
+}
+
+pub fn run_assemble_benchmark(mut benchmark: AssembleBenchmark) -> u64 {
     let mut total_segments = 0u64;
     loop {
-        let Some(unfilled) = pool.alloc::<SyncRecycler>() else {
+        let Some(unfilled) = benchmark.pool.alloc::<SyncRecycler>() else {
             break;
         };
         let Some(segments) = assemble::assemble::<SyncRecycler, _>(
-            &mut context,
+            &mut benchmark.context,
             ImmediateQueueStatus::Empty,
-            &clock,
+            &benchmark.clock,
             crate::endpoint::id::LocalSenderId::from_index(0),
             SOURCE_CONTROL_PORT,
-            &gso,
+            &benchmark.gso,
             unfilled,
-            &mut header_buf,
-            &mut cancelled,
-            &mut ack_completions,
-            &mut freed_batch_tx,
-            &assembler_counters,
-            &send_counters,
+            &mut benchmark.header_buf,
+            &mut benchmark.cancelled,
+            &mut benchmark.ack_completions,
+            &mut benchmark.freed_batch_tx,
+            &benchmark.assembler_counters,
+            &benchmark.send_counters,
         ) else {
             break;
         };
@@ -94,27 +108,30 @@ pub fn run_assemble_benchmark(packets: usize, frames_per_packet: usize, payload_
     }
 
     total_segments
-        .saturating_add(cancelled.len() as u64)
-        .saturating_add(ack_completions.len() as u64)
-        .saturating_add(context.inflight.has_inflight() as u64)
+        .saturating_add(benchmark.cancelled.len() as u64)
+        .saturating_add(benchmark.ack_completions.len() as u64)
+        .saturating_add(benchmark.context.inflight.has_inflight() as u64)
 }
 
-pub fn run_ack_processing_benchmark(
+pub struct AckProcessingBenchmark {
+    context: send::Context,
+    clock: Clock,
+    send_counters: Rc<counters::Send>,
+    payload: BytesMut,
+}
+
+pub fn setup_ack_processing_benchmark(
     packets: usize,
     frames_per_packet: usize,
     payload_len: usize,
     ack_frames: usize,
-) -> u64 {
+) -> AckProcessingBenchmark {
     let registry = crate::counter::Registry::default();
     let clock = Clock::default();
     let entry = test_path_secret_entry();
     let mut context = make_context(&entry, &registry, &clock);
     let send_counters =
         counters::Send::new(&registry, crate::endpoint::id::LocalSenderId::from_index(0));
-    let mut completed = Queue::new();
-    let mut lost = Queue::new();
-    let mut cancelled = Queue::new();
-    let mut rng = Rng::new();
 
     seed_inflight_packets(
         &mut context,
@@ -125,16 +142,29 @@ pub fn run_ack_processing_benchmark(
         payload_len,
     );
 
-    let mut payload = encode_ack_payload(packets, ack_frames);
+    let payload = encode_ack_payload(packets, ack_frames);
+    AckProcessingBenchmark {
+        context,
+        clock,
+        send_counters,
+        payload,
+    }
+}
+
+pub fn run_ack_processing_benchmark(mut benchmark: AckProcessingBenchmark) -> u64 {
+    let mut completed = Queue::new();
+    let mut lost = Queue::new();
+    let mut cancelled = Queue::new();
+    let mut rng = Rng::new();
     let mut deferred = Vec::new();
-    let _ = context.process_ack_payload(
-        &mut payload,
+    let _ = benchmark.context.process_ack_payload(
+        &mut benchmark.payload,
         Duration::ZERO,
-        &send_counters,
+        &benchmark.send_counters,
         &mut completed,
         &mut lost,
         &mut cancelled,
-        &clock,
+        &benchmark.clock,
         &mut rng,
         &mut deferred,
     );
@@ -144,7 +174,7 @@ pub fn run_ack_processing_benchmark(
         .saturating_add(lost.len())
         .saturating_add(cancelled.len())
         .saturating_add(deferred.len())
-        .saturating_add(context.inflight.has_inflight() as usize) as u64
+        .saturating_add(benchmark.context.inflight.has_inflight() as usize) as u64
 }
 
 fn test_path_secret_entry() -> Arc<PathSecretEntry> {
