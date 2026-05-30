@@ -1,0 +1,1467 @@
+# callgrind format
+version: 1
+creator: callgrind-3.22.0
+pid: 37574
+cmd:  target/release/deps/bench-16caf08bffb047d9
+part: 19
+
+
+desc: I1 cache: 
+desc: D1 cache: 
+desc: LL cache: 
+
+desc: Timerange: Basic block 9725 - 10272
+desc: Trigger: Client Request: crypto/encrypt/aes_128_gcm_fresh/payload=100,header=0 [cold]
+
+positions: line
+events: Ir
+summary: 18446744073709548903
+
+
+ob=(2) /usr/lib/x86_64-linux-gnu/libc.so.6
+fl=(30) ./string/../sysdeps/x86_64/multiarch/memmove-vec-unaligned-erms.S
+fn=(98) __memcpy_avx_unaligned_erms
+255 1
++1 1
++6 1
++1 1
++2 1
++1 1
++1 1
+375 1
++1 1
++1 1
++1 1
++1 1
++1 1
++1 2
++5 1
++1 1
++5 1
++1 1
++2 1
++1 1
++1 1
+
+fl=(25) ./string/../sysdeps/x86_64/multiarch/memset-vec-unaligned-erms.S
+fn=(86) __memset_avx2_unaligned_erms
+158 3
++1 6
++5 3
++1 3
++1 1
++1 1
++1 1
++69 1
++1 1
++6 1
++1 1
++12 1
++3 1
++1 1
++12 1
++1 1
++13 1
++1 1
++2 1
++3 1
++3 1
++3 1
++1 1
++1 1
++1 1
++1 1
++1 1
++1 1
+-6 2
++1 2
++1 2
++1 2
++1 2
++1 2
++1 3
++3 1
++1 1
++1 1
++1 1
++3 2
++23 2
++9 2
++1 2
++31 2
++1 2
++1 2
+
+fl=(16) ./malloc/./malloc/malloc.c
+fn=(40) malloc
+3294 16
++7 4
+1326 4
++19 10
+3311 4
++2 8
++3 4
++2 6
+3178 4
++4 4
++4 2
++4 2
+-4 6
++4 2
++1 2
+3354 12
+
+fn=(150) free
+3359 2
++4 4
+-4 6
++14 2
+-14 6
++12 2
++4 2
+-4 2
++4 4
++17 6
+fi=(17) ./malloc/./malloc/arena.c
+153 6
+fe=(16)
+3398 6
+cfn=(154) _int_free
+calls=2 4495 
+* 108
++3 2
++1 12
+
+fn=(154)
+4495 14
++4 6
++6 8
++1 4
++4 10
++8 8
+-1 4
++1 4
++29 2
+-20 2
+-6 2
++6 4
++20 8
+4658 12
+3163 2
++4 2
+-4 2
++2 8
++1 2
++1 2
+4550 2
+
+fl=(11) ./nptl/./nptl/pthread_once.c
+fn=(22) pthread_once@@GLIBC_2.34
+136 1
++3 1
++1 2
++4 2
+
+ob=(1) /home/runner/work/s2n-quic/s2n-quic/target/release/deps/bench-16caf08bffb047d9
+fl=(23) /aws-lc/crypto/fipsmodule/aes/mode_wrappers.c
+fn=(172) aes_hw_ctr32_encrypt_blocks_wrapper
+29 1
++1 1
+cfi=(21) /aws-lc/generated-src/linux-x86_64/crypto/fipsmodule/aesni-x86_64.S
+cfn=(174) aws_lc_0_41_0_aes_hw_ctr32_encrypt_blocks
+calls=1 884 
+* 218
+
+fn=(70) aes_hw_encrypt_wrapper
+17 3
++1 3
+cfi=(21)
+cfn=(72) aws_lc_0_41_0_aes_hw_encrypt
+calls=3 -2 
+* 174
+
+fl=(34) /aws-lc/generated-src/linux-x86_64/crypto/fipsmodule/aesni-gcm-x86_64.S
+fn=(122) aws_lc_0_41_0_aesni_gcm_encrypt
+573 1
++6 1
++5 1
++1 1
+860 1
+
+fl=(15) /aws-lc/crypto/mem.c
+fn=(146) aws_lc_0_41_0_OPENSSL_free
+171 1
++1 2
+-1 1
++4 1
+-4 3
++4 2
++11 2
++9 1
+-4 1
++4 4
+cfn=(82) aws_lc_0_41_0_OPENSSL_cleanse
+calls=1 +61 
+* 63
++8 2
++6 1
+-3 1
++3 2
+-3 1
+cob=(2)
+cfi=(16)
+cfn=(150)
+calls=1 3359 
+* 85
+* 1
+
+fn=(36) aws_lc_0_41_0_OPENSSL_malloc
+114 6
++1 3
++9 2
++28 3
+-18 2
++4 2
+cob=(2)
+cfi=(16)
+cfn=(40)
+calls=1 3294 
+* 45
+* 1
++1 2
++4 1
++3 2
+
+fn=(82)
+256 3
++2 12
+-2 3
+fi=(13) /usr/include/x86_64-linux-gnu/bits/string_fortified.h
+59 6
+fe=(15)
+256 3
+fi=(13)
+59 3
+cob=(2)
+cfi=(25)
+cfn=(86)
+calls=3 +99 
+* 72
+* 3
+fe=(15)
+274 6
+
+fl=(2) /home/runner/work/s2n-quic/s2n-quic/dc/s2n-quic-dc-benches/src/bench.rs
+fn=(2) s2n_quic_dc_benches::bench::cachegrind_backend::Criterion::run_bench
+fi=(3) /home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/crabgrind-0.2.6/src/requests/mod.rs
+cfi=(1) /home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/crabgrind-0.2.6/valgrind/native.c
+cfn=(0) valgrind_client_request_expr
+calls=1 30 
+17 18446744073709546243
+fe=(2)
+
+fn=(3) s2n_quic_dc_benches::bench::cachegrind_backend::Criterion::run_bench'2
+272 2
+cfn=(6) s2n_quic_dc_benches::bench::cachegrind_backend::BenchmarkGroup::bench_with_input::{{closure}}
+calls=1 -82 
+* 2649
+fi=(3)
+17 9
+cfi=(1)
+cfn=(0)
+calls=1 -2 
+* 25
+* 8
+fe=(2)
+
+fn=(6)
+190 9
+fi=(4) /home/runner/work/s2n-quic/s2n-quic/dc/s2n-quic-dc-benches/src/crypto/encrypt.rs
+46 1
+-46 1
+fi=(36) /rustc/f8297e351a40c1439a467bbbb6879088047f50b3/library/core/src/intrinsics/mod.rs
+457 1
+fe=(2)
+190 2
+fi=(4)
+46 1
+fi=(28) /rustc/f8297e351a40c1439a467bbbb6879088047f50b3/library/alloc/src/raw_vec/mod.rs
+467 1
+fi=(27) /rustc/f8297e351a40c1439a467bbbb6879088047f50b3/library/std/src/sys/alloc/unix.rs
+14 2
+cob=(2)
+cfi=(16)
+cfn=(40)
+calls=1 3294 
+* 45
+fi=(28)
+476 2
+0 2
+fi=(29) /rustc/f8297e351a40c1439a467bbbb6879088047f50b3/library/core/src/ptr/mod.rs
+547 4
+cob=(2)
+cfi=(30)
+cfn=(98)
+calls=1 255 
+* 22
+fi=(31) /rustc/f8297e351a40c1439a467bbbb6879088047f50b3/library/core/src/hint.rs
+-75 4
+fi=(4)
+48 10
+-48 1
+49 1
+cfn=(8) s2n_quic_dc_benches::crypto::encrypt::awslc::key
+calls=1 +14 
+* 1074
+-49 2
+50 2
+fi=(28)
+508 1
+fi=(38) /rustc/f8297e351a40c1439a467bbbb6879088047f50b3/library/alloc/src/vec/mod.rs
+1703 1
+fi=(4)
+50 4
+cfn=(102) s2n_quic_dc_benches::crypto::encrypt::awslc::encrypt
+calls=1 +21 
+* 1154
++1 1
+fi=(18) /home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/aws-lc-rs-1.17.0/src/ptr.rs
+205 1
+cfi=(19) /aws-lc/crypto/fipsmodule/cipher/aead.c
+cfn=(140) aws_lc_0_41_0_EVP_AEAD_CTX_free
+calls=1 47 
+* 203
+fi=(28)
+523 2
+fe=(2)
+146 1
+fi=(27)
+-98 1
+cob=(2)
+cfi=(16)
+cfn=(150)
+calls=1 3359 
+* 85
+fe=(2)
+190 8
+
+fl=(1)
+fn=(0)
+15 8
++2 12
++13 3
+-13 2
++13 7
+
+fl=(21)
+fn=(72)
+16 3
++6 3
++1 3
++1 3
++1 3
++1 3
++1 6
++3 3
++1 3
++1 3
++1 3
+-6 24
++3 24
++1 24
++1 24
++1 27
++2 3
++1 3
++1 3
++1 6
+
+fn=(64) aws_lc_0_41_0_aes_hw_set_encrypt_key
+2945 2
++6 1
++1 1
++1 1
++1 1
++1 1
++2 1
++1 1
++1 1
++1 1
++1 1
++1 1
++1 1
++1 1
++1 1
++1 1
++1 1
++1 1
++3 1
++1 1
++1 1
++30 1
++1 1
++1 1
++1 1
++1 1
++1 17
++6 8
++1 8
++2 8
++1 8
++1 8
++1 8
++1 8
++1 8
++1 8
++2 8
++1 8
++1 8
++2 8
++1 8
++2 3
++4 1
++2 1
++1 1
++1 1
++1 1
++1 1
++1 1
++1 1
++2 1
++1 1
++2 3
++4 1
++1 1
++1 1
++1 1
++1 1
++1 1
++1 1
++2 1
++1 1
++2 1
++1 1
++1 1
+3237 1
++1 1
++1 1
++1 1
++1 1
++1 1
++1 2
+
+fn=(174)
+884 1
++4 1
++1 1
++1 1
++28 1
++2 1
++2 1
++1 1
++5 1
++1 1
++1 1
++1 1
++1 1
++1 1
++1 1
++1 1
++1 1
++1 1
++1 1
++1 1
++1 1
++1 1
++1 1
++2 1
++1 1
++1 1
++1 1
++1 1
++1 2
++2 1
++1 2
++2 1
++1 1
++1 1
++1 1
++1 1
++1 2
++2 1
++1 1
++1 1
++1 1
++1 1
++1 1
++1 1
++1 1
++1 1
++1 1
++1 1
++1 1
++1 1
++1 1
++1 1
++1 1
++2 1
++2 1
++1 1
++2 1
++1 1
+1225 1
++1 1
++1 1
++1 1
++3 1
++1 1
++1 1
++2 3
++3 1
++1 2
++2 1
++1 3
++3 1
++1 3
++4 1
+cfn=(176) _aesni_encrypt8
+calls=1 434 
+* 89
++2 1
++1 1
++1 1
++1 1
++1 1
++1 1
++1 1
++1 1
++1 1
++1 1
++1 1
++1 1
++1 1
++1 1
++2 1
++1 1
++1 1
++1 1
++65 1
++1 1
++1 1
++1 1
++1 1
++1 1
++1 1
++1 1
++1 1
++1 1
++1 1
++1 1
++1 1
++1 1
++1 1
++1 1
++1 1
++1 1
++1 1
++1 1
++1 1
++1 1
++1 1
++1 1
++1 1
++1 1
++2 2
+
+fn=(176)
+421 24
++13 3
++1 27
++9 3
++1 3
+-11 1
++1 9
++9 1
++1 18
+
+fl=(9) /aws-lc/crypto/thread_pthread.c
+fn=(18) aws_lc_0_41_0_CRYPTO_once
+227 3
++1 1
+cob=(2)
+cfi=(11)
+cfn=(22)
+calls=1 -92 
+* 6
+* 1
+* 2
++3 2
+
+fl=(6) /home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/aws-lc-rs-1.17.0/src/aead/aes_gcm.rs
+fn=(12) aws_lc_rs::aead::aes_gcm::init_128_aead
+51 9
+fi=(7) /home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/aws-lc-rs-1.17.0/src/aead/aead_ctx.rs
+205 2
+0 2
+241 1
+cfi=(8) /aws-lc/crypto/fipsmodule/cipher/e_aes.c
+cfn=(16) aws_lc_0_41_0_EVP_aead_aes_128_gcm
+calls=1 1198 
+* 24
+* 1
++5 2
+cfi=(15)
+cfn=(36)
+calls=1 114 
+* 69
+fi=(18)
+-58 2
+fi=(7)
++58 1
++2 2
+cfi=(19)
+cfn=(50) aws_lc_0_41_0_EVP_AEAD_CTX_zero
+calls=1 26 
+* 84
++14 7
+cfi=(19)
+cfn=(54) aws_lc_0_41_0_EVP_AEAD_CTX_init
+calls=1 57 
+* 828
+-12 2
+0 1
+250 1
+fe=(6)
+53 10
+
+fl=(4)
+fn=(102)
+71 8
++2 1
+fi=(5) /rustc/f8297e351a40c1439a467bbbb6879088047f50b3/library/core/src/num/uint_macros.rs
+467 1
+fe=(4)
+77 2
+fi=(37) /home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/aws-lc-rs-1.17.0/src/aead.rs
+936 2
+fi=(32) /home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/aws-lc-rs-1.17.0/src/aead/unbound_key.rs
+252 2
+0 2
+219 1
++3 3
+0 1
+222 10
+cfi=(19)
+cfn=(106) aws_lc_0_41_0_EVP_AEAD_CTX_seal_scatter
+calls=1 -67 
+* 1098
+* 1
+-1 2
+fi=(29)
+2201 12
+fi=(26) /rustc/f8297e351a40c1439a467bbbb6879088047f50b3/library/core/src/result.rs
+1224 2
+fe=(4)
+81 1
++1 5
+
+fn=(8)
+63 6
++1 3
+fi=(37)
+976 1
+0 1
+fi=(5)
+796 1
+0 2
+fi=(32)
+48 2
+cfi=(6)
+cfn=(12)
+calls=1 +3 
+* 1048
+fi=(26)
+2161 2
+1225 3
+fe=(4)
+68 5
+
+fl=(22) /aws-lc/crypto/fipsmodule/modes/gcm.c
+fn=(66) aws_lc_0_41_0_CRYPTO_gcm128_init_key
+290 2
+fi=(13)
+59 1
+fe=(22)
+290 5
+fi=(13)
+59 1
+fe=(22)
+290 2
+fi=(13)
+59 2
+fe=(22)
+290 4
+fi=(13)
+59 43
+fe=(22)
+296 1
+-4 1
++4 3
+cfi=(23)
+cfn=(70)
+calls=1 17 
+* 60
++3 6
+cfn=(74) aws_lc_0_41_0_CRYPTO_ghash_init
+calls=1 -92 
+* 356
++2 3
+cfi=(15)
+cfn=(82)
+calls=1 -45 
+* 24
++5 10
++2 9
+
+fn=(76) aws_lc_0_41_0_crypto_gcm_avx512_enabled
+843 3
+fi=(20) /aws-lc/crypto/fipsmodule/aes/../cpucap/internal.h
+135 3
+fe=(22)
+850 3
+fi=(20)
+135 3
+fe=(22)
+850 6
++5 6
+
+fn=(128) aws_lc_0_41_0_CRYPTO_gcm128_finish
+805 5
++7 1
+-7 4
++7 1
+-7 3
++6 1
+-4 1
++4 1
++1 3
+cfi=(24) /aws-lc/generated-src/linux-x86_64/crypto/fipsmodule/ghash-x86_64.S
+cfn=(130) aws_lc_0_41_0_gcm_gmult_avx
+calls=1 -85 
+* 43
+* 1
++4 1
+fi=(35) /aws-lc/crypto/fipsmodule/aes/../modes/internal.h
+47 1
+fe=(22)
+819 1
+-3 1
+fi=(13)
+29 2
+fe=(22)
+817 2
+fi=(13)
+29 2
+fi=(35)
++18 1
+fi=(13)
+-18 1
+fe=(22)
+819 1
+cfi=(24)
+cfn=(130)
+calls=1 -92 
+* 43
+fi=(35)
+47 3
+fi=(13)
+-18 1
+fe=(22)
+822 2
++5 1
+-2 1
++2 7
+
+fn=(74)
+207 16
++1 1
+fi=(33) /aws-lc/crypto/fipsmodule/../internal.h
+751 2
+fe=(22)
+211 1
+fi=(33)
+751 2
+fe=(22)
+211 1
++5 1
+cfn=(76)
+calls=1 843 
+* 8
+* 2
++8 1
+cfn=(78) aws_lc_0_41_0_crypto_gcm_clmul_enabled
+calls=1 835 
+* 9
+* 1
+fi=(20)
+93 1
+fe=(22)
+224 1
++62 3
+cfi=(15)
+cfn=(82)
+calls=1 -30 
+* 24
++1 11
+-62 1
++1 3
+-1 3
++1 1
+cfi=(24)
+cfn=(80) aws_lc_0_41_0_gcm_init_avx
+calls=1 615 
+* 257
++1 2
++1 2
++1 1
++1 1
+
+fn=(120) aws_lc_0_41_0_CRYPTO_gcm128_encrypt_ctr32
+598 7
++9 1
+-9 4
++4 1
+-4 2
++2 1
++2 1
++4 3
++1 5
++6 1
+-2 3
++2 2
++7 2
++76 8
+-76 1
+cfn=(76)
+calls=1 843 
+* 8
+* 2
++6 1
++1 2
++16 4
+94 1
+646 1
+94 8
+cfi=(34)
+cfn=(122)
+calls=1 573 
+* 5
+648 1
++1 1
++1 3
+fi=(33)
++97 2
+fe=(22)
+-92 2
++10 4
++1 1
++2 3
+-2 1
++2 5
+cfi=(23)
+cfn=(172)
+calls=1 29 
+* 220
++1 1
++3 1
++1 3
+-4 1
++3 1
+fi=(33)
++75 2
+fi=(13)
+29 1
+fe=(22)
+673 2
+cfi=(24)
+cfn=(170) aws_lc_0_41_0_gcm_ghash_avx
+calls=1 +64 
+* 121
++3 2
++2 1
+-1 3
+fi=(33)
++70 1
+fe=(22)
+-70 1
+cfi=(23)
+cfn=(70)
+calls=1 17 
+* 60
+fi=(13)
+29 1
+fe=(22)
+684 2
+-13 2
++3 1
++14 3
++6 1
+-72 2
++67 4
+-1 2
++1 4
+-1 2
++1 4
+-1 2
++1 4
+-1 4
+
+fn=(78)
+835 1
+fi=(20)
+59 1
+fe=(22)
+837 6
++4 1
+
+fn=(126) aws_lc_0_41_0_CRYPTO_gcm128_tag
+829 7
++1 1
+-1 2
++1 1
+-1 1
++1 1
+cfn=(128)
+calls=1 -25 
+* 135
+fi=(33)
++23 2
+fe=(22)
+-22 3
+fi=(13)
+29 25
+fe=(22)
+832 6
+
+fn=(116) aws_lc_0_41_0_CRYPTO_gcm128_setiv
+311 2
+fi=(13)
+59 1
+fe=(22)
+311 10
++2 1
+-2 4
+fi=(13)
+59 2
+fe=(22)
+319 1
++3 1
+-3 1
++6 2
++7 2
++29 3
+fi=(33)
+747 1
+fe=(22)
+361 1
+cfi=(23)
+cfn=(70)
+calls=1 17 
+* 60
+fi=(13)
+29 1
+fe=(22)
+364 11
+-39 1
+cfn=(76)
+calls=1 843 
+* 8
+* 2
+fi=(13)
+29 4
+fe=(22)
+334 1
+fi=(13)
+29 1
+fe=(22)
+335 1
+
+fl=(24)
+fn=(170)
+737 1
++1 1
++2 1
++1 1
++1 1
++1 1
++1 1
++1 1
++1 1
+965 1
++1 1
++1 1
++1 1
++1 1
++2 1
++1 1
++1 1
++1 1
++1 1
++2 1
++1 1
++1 1
++1 1
++1 1
++1 1
++1 1
++1 1
++1 1
++1 1
++1 1
++1 1
++1 1
++1 1
++2 1
++1 1
++1 1
++1 1
++1 1
++1 1
++1 1
++1 1
++1 1
++1 1
++1 1
++1 1
++1 1
++1 1
++2 1
++1 1
++1 1
++1 1
++1 1
++1 1
++1 1
++1 1
++1 1
++1 1
++1 1
++1 1
++1 1
++1 1
++2 1
++1 1
++1 1
++1 1
++1 1
++1 1
++1 1
++1 1
++1 1
++1 1
++1 1
++1 1
++1 1
++1 1
++2 1
++1 1
++1 1
++1 1
++1 1
++1 1
++1 1
++1 1
++1 1
++1 1
++1 1
++1 1
++1 1
++1 1
++19 1
++2 1
++1 1
++1 1
++1 1
++1 1
++1 1
++1 1
++1 1
++2 1
++2 1
++1 1
++1 1
++2 1
++1 1
++1 1
++1 1
++1 1
++1 1
++2 1
++1 1
++1 1
++2 1
++1 1
++1 1
++1 1
++2 1
++1 1
++2 1
++1 1
++1 2
+
+fn=(80)
+615 1
++1 1
++2 1
++1 1
++3 1
++1 1
++1 1
++1 1
++1 1
++1 1
++1 1
++3 1
++1 1
++2 1
++1 1
++1 1
++1 1
++1 1
++3 3
++1 3
++1 3
++1 3
++1 3
++1 3
++1 3
++1 3
++1 3
++2 3
++1 3
++1 3
++1 3
++1 3
++1 3
++1 3
++1 3
++1 3
++1 3
++1 3
++1 3
++1 3
++2 3
++1 3
++1 3
++1 3
++1 3
++1 3
++1 3
++2 3
++1 3
++1 3
++1 3
++1 3
++1 3
++1 3
++1 3
++2 3
++1 3
++1 3
++1 3
++1 3
++1 3
++1 3
++1 3
++1 3
++1 3
++1 3
++1 3
++1 3
++2 3
++1 3
++1 3
++1 3
++1 3
++1 3
++1 3
++1 3
++1 3
++1 3
+-32 1
++1 1
++1 1
++1 1
++1 1
++1 1
++1 1
++1 1
++2 1
++1 1
++1 1
++1 1
++1 1
++1 1
++1 1
++1 1
++1 1
++1 1
++1 1
++1 1
++1 1
++2 1
++1 1
++1 1
++1 1
++1 1
++1 1
++1 1
++1 1
++1 1
++1 1
++1 1
++1 1
++1 1
++1 1
++1 1
++1 1
+-5 3
++1 3
++1 3
++1 3
++1 3
++1 3
++2 1
++1 1
++2 2
+
+fn=(130)
+178 2
++1 2
++1 2
++1 4
++2 2
++1 2
++1 8
++4 2
++1 2
++2 2
++1 2
++1 2
++1 2
++1 2
++2 2
++1 2
++1 2
++1 2
++1 2
++1 2
++1 2
++1 2
++1 2
++1 2
++1 2
++1 2
++3 2
++1 2
++1 2
++1 2
++1 2
++1 2
++1 2
++1 4
++2 4
+727 2
++1 2
+
+fl=(8)
+fn=(16)
+1198 6
+cfi=(9)
+cfn=(18)
+calls=1 227 
+* 15
+* 3
+
+fn=(112) aead_aes_gcm_seal_scatter_impl
+1066 18
++1 2
++4 2
++4 2
+fi=(13)
+59 7
+-30 1
++30 49
+-30 42
+fe=(8)
+1085 4
+cfi=(22)
+cfn=(116)
+calls=1 311 
+* 122
++2 5
++4 3
++1 6
+cfi=(22)
+cfn=(120)
+calls=1 598 
+* 556
+* 2
++10 2
++13 5
+cfi=(22)
+cfn=(126)
+calls=1 829 
+* 184
++1 1
++2 2
++1 11
+
+fn=(110) aead_aes_gcm_seal_scatter
+1125 3
++1 1
++2 1
+-3 1
++3 9
+cfn=(112)
+calls=1 -62 
+* 1026
++3 2
+
+fn=(60) aws_lc_0_41_0_aes_ctr_set_key
+244 2
++2 2
+-2 9
++2 2
+fi=(20)
+86 1
+fe=(8)
+248 2
+fi=(20)
+86 1
+fe=(8)
+247 2
++1 1
+cfi=(21)
+cfn=(64)
+calls=1 2945 
+* 192
++1 2
++1 5
+cfi=(22)
+cfn=(66)
+calls=1 +40 
+* 533
++2 2
++32 1
+-29 1
++29 5
+
+fn=(144) aead_aes_gcm_cleanup
+1060 2
+
+fn=(58) aead_aes_gcm_init
+1047 2
+-30 1
++30 1
+-28 2
++28 4
+-28 2
++5 2
++4 2
++28 1
+-22 6
+cfn=(60)
+calls=1 244 
+* 763
++22 1
+-23 1
++24 1
++1 4
+
+fl=(19)
+fn=(50)
+26 1
+fi=(13)
++33 1
+fe=(19)
+-33 1
+fi=(13)
++33 80
+fe=(19)
+-31 1
+
+fn=(142) aws_lc_0_41_0_EVP_AEAD_CTX_cleanup
+94 1
++1 3
+-1 5
++4 1
+cfi=(8)
+cfn=(144)
+calls=1 1060 
+* 2
++1 1
++1 3
+
+fn=(54)
+57 6
++1 2
++7 1
+-2 1
++2 1
+-2 1
+cfn=(56) aws_lc_0_41_0_EVP_AEAD_CTX_init_with_direction
+calls=1 +7 
+* 816
+
+fn=(140)
+47 1
++1 2
+-1 5
++4 1
+cfn=(142)
+calls=1 +43 
+* 16
++1 1
++1 2
+-1 1
+cfi=(15)
+cfn=(146)
+calls=1 171 
+* 174
+
+fn=(56)
+70 8
++2 4
++9 1
+-3 1
++3 2
++1 2
+cfi=(8)
+cfn=(58)
+calls=1 1047 
+* 793
++5 2
++5 3
+
+fn=(106)
+155 15
+fi=(33)
+-9 4
+fe=(19)
++12 2
+fi=(33)
+-12 4
+fe=(19)
++19 4
++5 13
+cfi=(8)
+cfn=(110)
+calls=1 1125 
+* 1043
+* 1
++3 1
+-3 3
++13 8
+
+totals: 2700

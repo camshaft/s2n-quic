@@ -1,0 +1,86 @@
+# callgrind format
+version: 1
+creator: callgrind-3.22.0
+pid: 37574
+cmd:  target/release/deps/bench-16caf08bffb047d9
+part: 432
+
+
+desc: I1 cache: 
+desc: D1 cache: 
+desc: LL cache: 
+
+desc: Timerange: Basic block 23783670 - 23783689
+desc: Trigger: Client Request: datagram/recv/test/1 [warm]
+
+positions: line
+events: Ir
+summary: 102
+
+
+ob=(1) /home/runner/work/s2n-quic/s2n-quic/target/release/deps/bench-16caf08bffb047d9
+fl=(101) /home/runner/work/s2n-quic/s2n-quic/dc/s2n-quic-dc-benches/src/datagram/recv.rs
+fn=(714) bench::main
+fi=(3) /home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/crabgrind-0.2.6/src/requests/mod.rs
+cfi=(1) /home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/crabgrind-0.2.6/valgrind/native.c
+cfn=(0) valgrind_client_request_expr
+calls=0 15 
+17 25
+57 12
+fi=(31) /rustc/f8297e351a40c1439a467bbbb6879088047f50b3/library/core/src/hint.rs
+472 5
+fe=(101)
+57 2
+cfn=(718) s2n_quic_dc_benches::datagram::recv::null::parse
+calls=1 -28 
+* 50
+fi=(3)
+-40 8
+fe=(101)
+
+fn=(718)
+29 6
+fi=(106) /home/runner/work/s2n-quic/s2n-quic/common/s2n-codec/src/decoder/mod.rs
+349 2
+fi=(102) /home/runner/work/s2n-quic/s2n-quic/common/s2n-codec/src/decoder/value.rs
+47 1
+fi=(103) /home/runner/work/s2n-quic/s2n-quic/dc/s2n-quic-dc/src/packet/tag.rs
+-23 4
+-17 2
+-7 2
+fi=(109) /home/runner/work/s2n-quic/s2n-quic/dc/s2n-quic-dc/src/packet/datagram/decoder.rs
+33 2
+fi=(104) /rustc/f8297e351a40c1439a467bbbb6879088047f50b3/library/core/src/slice/index.rs
+214 3
+fi=(102)
+31 2
+fi=(110) /rustc/f8297e351a40c1439a467bbbb6879088047f50b3/library/core/src/clone.rs
+581 1
+fi=(105) /home/runner/work/s2n-quic/s2n-quic/quic/s2n-quic-core/src/varint/mod.rs
+217 6
++2 1
+fi=(111) /rustc/f8297e351a40c1439a467bbbb6879088047f50b3/library/core/src/ptr/const_ptr.rs
+863 1
+fi=(112) /rustc/f8297e351a40c1439a467bbbb6879088047f50b3/library/core/src/slice/mod.rs
+2047 1
+fi=(105)
+222 1
+fi=(106)
+349 2
+fi=(107) /home/runner/work/s2n-quic/s2n-quic/dc/s2n-quic-dc/src/packet/wire_version.rs
+18 2
+-18 2
+fi=(109)
+144 2
+fi=(108) /rustc/f8297e351a40c1439a467bbbb6879088047f50b3/library/core/src/option.rs
+2670 1
+fe=(101)
+40 6
+
+fl=(1)
+fn=(0)
+15 8
++2 12
++13 5
+
+totals: 102
