@@ -7,13 +7,16 @@ publish = false
 [features]
 ## Run benchmarks under Valgrind (cachegrind / callgrind) instead of criterion.
 ##
-## Build the `iai` bench binary and execute it under `valgrind --tool=cachegrind`
-## or `valgrind --tool=callgrind` to collect instruction counts.
-iai = []
+## Build the `bench` binary and execute it under `valgrind --tool=callgrind`
+## or `valgrind --tool=cachegrind` to collect instruction counts.
+## Each benchmark emits a separate callgrind dump (labelled by name) so
+## per-harness instruction counts are available from a single execution.
+iai = ["dep:crabgrind"]
 
 [dependencies]
 aws-lc-rs = "1.12"
 criterion = { version = "0.8", features = ["html_reports", "async_tokio"] }
+crabgrind = { version = "0.2", optional = true }
 s2n-codec = { path = "../../common/s2n-codec" }
 s2n-quic-dc = { path = "../s2n-quic-dc", features = ["testing"] }
 tokio = { version = "1", features = ["full"] }
@@ -21,8 +24,3 @@ tokio = { version = "1", features = ["full"] }
 [[bench]]
 name = "bench"
 harness = false
-
-[[bench]]
-name = "iai"
-harness = false
-required-features = ["iai"]

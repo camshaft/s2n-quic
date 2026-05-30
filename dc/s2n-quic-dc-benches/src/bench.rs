@@ -9,7 +9,7 @@
 //! | feature | backend | measures |
 //! |---------|---------|---------|
 //! | *(none)* | [criterion](https://docs.rs/criterion) | wall-clock time |
-//! | `iai` | custom iai runner | instruction counts (via Valgrind cachegrind / callgrind) |
+//! | `iai` | custom runner + callgrind client requests | instruction counts |
 //!
 //! # Querying the backend at runtime
 //!
@@ -26,15 +26,23 @@
 //!
 //! # Running under Valgrind
 //!
-//! Build and run the `iai` binary under cachegrind or callgrind to capture
-//! instruction counts:
+//! Build and run the `bench` binary under callgrind or cachegrind:
 //!
 //! ```sh
-//! cargo build --bench iai --features iai --profile bench
-//! valgrind --tool=cachegrind ./target/bench/deps/iai-*
-//! # or:
-//! valgrind --tool=callgrind --callgrind-out-file=callgrind.%p \
-//!     ./target/bench/deps/iai-*
+//! cargo build --bench bench --features iai --profile bench
+//!
+//! # Callgrind: produces one output file per benchmark (labelled by name)
+//! valgrind --tool=callgrind \
+//!     --callgrind-out-file=callgrind.%p \
+//!     --dump-instr=yes \
+//!     ./target/bench/deps/bench-*
+//! callgrind_annotate callgrind.out.<pid>.*
+//!
+//! # Cachegrind: single output file for the whole run
+//! valgrind --tool=cachegrind \
+//!     --cachegrind-out-file=cachegrind.out \
+//!     ./target/bench/deps/bench-*
+//! cg_annotate cachegrind.out
 //! ```
 
 /// The benchmark backend currently in use.
@@ -75,6 +83,7 @@ pub use iai_backend::{black_box, BenchmarkId, Criterion, Throughput};
 #[cfg(feature = "iai")]
 mod iai_backend {
     use core::fmt;
+    use std::ffi::CString;
     pub use std::hint::black_box;
 
     // ── Throughput ────────────────────────────────────────────────────────────
@@ -227,14 +236,33 @@ mod iai_backend {
 
         /// Run a single benchmark closure, printing its name to stderr.
         ///
-        /// This is the central dispatch point.  Future work can add callgrind
-        /// client-request markers here (e.g. `CALLGRIND_START_INSTRUMENTATION`
-        /// / `CALLGRIND_ZERO_STATS` / `CALLGRIND_DUMP_STATS_AT`) for
-        /// per-benchmark instruction-count segmentation.
+        /// Emits callgrind client requests around the closure:
+        ///
+        /// - [`callgrind::zero_stats`] before running — so the dump only captures
+        ///   instructions from this benchmark, not any prior ones.
+        /// - [`callgrind::dump_stats`] after running — labelled with the benchmark
+        ///   name, which produces one output file per benchmark when running under
+        ///   `valgrind --tool=callgrind`.
+        ///
+        /// Both requests are no-ops when not running under Valgrind, so the binary
+        /// can also be used under cachegrind or executed without Valgrind at all.
         fn run_bench(&mut self, name: &str, f: &mut dyn FnMut()) {
             self.count += 1;
             eprintln!("[iai] {:>4}  {name}", self.count);
+            // Zero stats so the dump captures only this benchmark's instructions.
+            crabgrind::callgrind::zero_stats();
             f();
+            // Emit a per-benchmark dump so a single execution yields one output
+            // file per harness, enabling fine-grained instruction-count analysis.
+            let label = CString::new(name).unwrap_or_else(|e| {
+                let pos = e.nul_position();
+                eprintln!(
+                    "[iai] warning: benchmark name {name:?} contains a null byte at \
+                     position {pos}; dump label will be truncated"
+                );
+                CString::new(&name[..pos]).unwrap()
+            });
+            crabgrind::callgrind::dump_stats(Some(label.as_c_str()));
         }
     }
 
