@@ -3,6 +3,9 @@
 -- A persistently positive depth indicates a consumer is falling behind.
 CREATE OR REPLACE VIEW queue_depths AS
 SELECT
+    log_group,
+    stream,
+    env,
     metric,
     SUM(enq)                AS total_enqueued,
     SUM(drain)              AS total_drained,
@@ -10,5 +13,5 @@ SELECT
     ROUND(AVG(depth), 1)    AS avg_depth
 FROM metrics
 WHERE type = 'queue'
-GROUP BY metric
-ORDER BY max_depth DESC;
+GROUP BY log_group, stream, env, metric
+ORDER BY max_depth DESC, log_group, stream, env, metric;

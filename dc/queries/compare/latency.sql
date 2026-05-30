@@ -2,6 +2,9 @@
 CREATE OR REPLACE VIEW compare_latency AS
 SELECT
     label,
+    log_group,
+    stream,
+    env,
     metric,
     SUM(count)  AS samples,
     MAX(p50)    AS p50_us,
@@ -15,5 +18,5 @@ WHERE type = 'histogram'
       'rx.decrypt_time',
       'rx.dispatch_time'
   )
-GROUP BY label, metric
-ORDER BY label, metric;
+GROUP BY label, log_group, stream, env, metric
+ORDER BY label, log_group, stream, env, metric;

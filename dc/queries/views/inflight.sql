@@ -3,6 +3,9 @@
 -- A cwnd near zero or a growing inflight count may indicate congestion.
 CREATE OR REPLACE VIEW inflight AS
 SELECT
+    log_group,
+    stream,
+    env,
     metric,
     variant,
     SUM(count)              AS observations,
@@ -12,11 +15,14 @@ SELECT
 FROM metrics
 WHERE type = 'histogram'
   AND metric = 'send.cwnd'
-GROUP BY metric, variant
+GROUP BY log_group, stream, env, metric, variant
 
 UNION ALL
 
 SELECT
+    log_group,
+    stream,
+    env,
     metric,
     variant,
     COUNT(*)                AS observations,
@@ -26,6 +32,6 @@ SELECT
 FROM metrics
 WHERE metric LIKE 'send.inflight%'
    OR metric = 'send.context.count'
-GROUP BY metric, variant
+GROUP BY log_group, stream, env, metric, variant
 
-ORDER BY metric, variant;
+ORDER BY log_group, stream, env, metric, variant;

@@ -4,6 +4,9 @@
 -- rx.dispatch_time: time from receive to application delivery (µs)
 CREATE OR REPLACE VIEW rtt AS
 SELECT
+    log_group,
+    stream,
+    env,
     metric,
     variant,
     SUM(count)  AS samples,
@@ -18,5 +21,5 @@ WHERE type = 'histogram'
       'rx.decrypt_time',
       'rx.dispatch_time'
   )
-GROUP BY metric, variant
-ORDER BY metric, variant;
+GROUP BY log_group, stream, env, metric, variant
+ORDER BY log_group, stream, env, metric, variant;

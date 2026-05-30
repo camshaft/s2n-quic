@@ -4,6 +4,9 @@
 -- Both metrics are histograms; the variant column carries a per-worker identifier.
 CREATE OR REPLACE VIEW task_polls AS
 SELECT
+    log_group,
+    stream,
+    env,
     metric,
     SUM(count)              AS total_polls,
     MAX(p50)                AS p50_us,
@@ -12,5 +15,5 @@ SELECT
 FROM metrics
 WHERE type = 'histogram'
   AND (metric LIKE 'task.%.time' OR metric LIKE 'task.%.next_poll_latency')
-GROUP BY metric
-ORDER BY metric;
+GROUP BY log_group, stream, env, metric
+ORDER BY log_group, stream, env, metric;

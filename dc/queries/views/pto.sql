@@ -5,23 +5,29 @@
 -- High backoff values (variant > 4) suggest chronic path or receiver issues.
 CREATE OR REPLACE VIEW pto AS
 SELECT
+    log_group,
+    stream,
+    env,
     metric,
     variant,
     SUM(CAST(value AS BIGINT))  AS total
 FROM metrics
 WHERE (metric LIKE 'tx.probe.%' OR metric LIKE '!tx.probe.%')
   AND type = 'nominal'
-GROUP BY metric, variant
+GROUP BY log_group, stream, env, metric, variant
 
 UNION ALL
 
 SELECT
+    log_group,
+    stream,
+    env,
     metric,
     NULL                        AS variant,
     SUM(count)                  AS total
 FROM metrics
 WHERE (metric LIKE 'tx.probe.%' OR metric LIKE '!tx.probe.%')
   AND type = 'histogram'
-GROUP BY metric
+GROUP BY log_group, stream, env, metric
 
-ORDER BY metric, variant;
+ORDER BY log_group, stream, env, metric, variant;

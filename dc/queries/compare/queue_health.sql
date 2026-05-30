@@ -3,6 +3,9 @@
 CREATE OR REPLACE VIEW compare_queue_health AS
 SELECT
     label,
+    log_group,
+    stream,
+    env,
     metric,
     SUM(enq)                AS total_enqueued,
     SUM(drain)              AS total_drained,
@@ -10,5 +13,5 @@ SELECT
     ROUND(AVG(depth), 1)    AS avg_depth
 FROM runs
 WHERE type = 'queue'
-GROUP BY label, metric
-ORDER BY label, max_depth DESC;
+GROUP BY label, log_group, stream, env, metric
+ORDER BY label, log_group, stream, env, max_depth DESC;

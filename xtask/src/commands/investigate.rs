@@ -1,7 +1,7 @@
 // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::{Args, Subcommand};
 use std::{
     ffi::OsStr,
@@ -20,7 +20,7 @@ pub struct Investigate {
     #[arg(long)]
     no_cache: bool,
 
-    /// Override the cache directory (default: ~/.cache/s2n-quic-investigate)
+    /// Override the cache directory (default: $TMPDIR/s2n-quic-investigate)
     #[arg(long)]
     cache_dir: Option<PathBuf>,
 
@@ -156,6 +156,7 @@ impl SqlFiles {
 }
 
 /// Load all `*.sql` files in `dir`, sorted by filename, returning `(filename, content)` pairs.
+/// Prefixes like `010_` can be used to make load order explicit.
 fn load_sql_dir(dir: &Path) -> Result<Vec<(String, String)>> {
     let mut files: Vec<(String, String)> = Vec::new();
     if !dir.exists() {
@@ -179,7 +180,26 @@ fn load_sql_dir(dir: &Path) -> Result<Vec<(String, String)>> {
 
 /// Return the stem (filename without `.sql`) for a SQL filename.
 fn stem(filename: &str) -> String {
-    filename.strip_suffix(".sql").unwrap_or(filename).to_owned()
+    let stem = filename.strip_suffix(".sql").unwrap_or(filename);
+    if let Some((prefix, rest)) = stem.split_once('_') {
+        if !rest.is_empty() && prefix.chars().all(|c| c.is_ascii_digit()) {
+            return rest.to_owned();
+        }
+    }
+    stem.to_owned()
+}
+
+fn resolve_query_view_name(sql_files: &SqlFiles, name: &str) -> Option<String> {
+    if sql_files.view_names().iter().any(|n| n == name) {
+        return Some(name.to_owned());
+    }
+    if sql_files.dashboard_names().iter().any(|n| n == name) {
+        return Some(format!("dashboard_{name}"));
+    }
+    if sql_files.compare_names().iter().any(|n| n == name) {
+        return Some(format!("compare_{name}"));
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -187,13 +207,7 @@ fn stem(filename: &str) -> String {
 // ---------------------------------------------------------------------------
 
 fn default_cache_dir() -> PathBuf {
-    if let Ok(home) = std::env::var("HOME") {
-        PathBuf::from(home).join(".cache").join("s2n-quic-investigate")
-    } else if let Ok(xdg) = std::env::var("XDG_CACHE_HOME") {
-        PathBuf::from(xdg).join("s2n-quic-investigate")
-    } else {
-        std::env::temp_dir().join("s2n-quic-investigate")
-    }
+    std::env::temp_dir().join("s2n-quic-investigate")
 }
 
 /// Build the SQL script that creates all views from scratch.
@@ -241,8 +255,9 @@ fn build_init_sql(inputs: &[PathBuf], sql_files: &SqlFiles) -> String {
 fn build_dashboard_sql(sql_files: &SqlFiles) -> String {
     let mut sql = String::new();
     for name in sql_files.dashboard_names() {
+        let view = format!("dashboard_{name}");
         sql.push_str(&format!(
-            "SELECT '{name}' AS view;\nSELECT * FROM {name};\n"
+            "SELECT '{name}' AS view;\nSELECT * FROM {view};\n"
         ));
     }
     sql
@@ -252,8 +267,9 @@ fn build_dashboard_sql(sql_files: &SqlFiles) -> String {
 fn build_compare_sql(sql_files: &SqlFiles) -> String {
     let mut sql = String::new();
     for name in sql_files.compare_names() {
+        let view = format!("compare_{name}");
         sql.push_str(&format!(
-            "SELECT '{name}' AS view;\nSELECT * FROM {name};\n"
+            "SELECT '{name}' AS view;\nSELECT * FROM {view};\n"
         ));
     }
     sql
@@ -266,10 +282,8 @@ fn build_compare_sql(sql_files: &SqlFiles) -> String {
 /// Write `content` to a named temp file and return its path.
 /// The file is placed in `std::env::temp_dir()` so it survives a process exec.
 fn write_temp_sql(content: &str) -> Result<PathBuf> {
-    let path = std::env::temp_dir().join(format!(
-        "s2n-quic-investigate-{}.sql",
-        std::process::id()
-    ));
+    let path =
+        std::env::temp_dir().join(format!("s2n-quic-investigate-{}.sql", std::process::id()));
     std::fs::write(&path, content)
         .with_context(|| format!("cannot write temp file: {}", path.display()))?;
     Ok(path)
@@ -361,14 +375,13 @@ impl Investigate {
         // 6. Determine database path and whether init is needed.
         let (db_path, need_init) = if self.no_cache {
             // --no-cache: always use a fresh temp db so views are available in shell.
-            let tmp = std::env::temp_dir()
-                .join(format!("s2n-quic-investigate-{}.duckdb", std::process::id()));
+            let tmp = std::env::temp_dir().join(format!(
+                "s2n-quic-investigate-{}.duckdb",
+                std::process::id()
+            ));
             (tmp.display().to_string(), true)
         } else {
-            let cache_dir = self
-                .cache_dir
-                .clone()
-                .unwrap_or_else(default_cache_dir);
+            let cache_dir = self.cache_dir.clone().unwrap_or_else(default_cache_dir);
             std::fs::create_dir_all(&cache_dir)
                 .with_context(|| format!("cannot create cache dir: {}", cache_dir.display()))?;
             let key = cache_key(&inputs, &sql_files);
@@ -395,7 +408,12 @@ impl Investigate {
                 run_duckdb(&db_path, &script)?;
             }
             Cmd::Query { name } => {
-                let query = format!("SELECT * FROM {name};\n");
+                let Some(view_name) = resolve_query_view_name(&sql_files, &name) else {
+                    bail!(
+                        "unknown query '{name}'; run `cargo xtask investigate --input <glob> list`"
+                    );
+                };
+                let query = format!("SELECT * FROM {view_name};\n");
                 let script = full_script(init_sql.as_deref(), &query);
                 run_duckdb(&db_path, &script)?;
             }
