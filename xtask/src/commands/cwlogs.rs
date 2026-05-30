@@ -319,6 +319,7 @@ fn parse_to_parquet(
             let ts = timestamps.value(row_idx) as f64 / 1000.0;
             let stream = streams.value(row_idx);
             let message = messages.value(row_idx);
+            let normalized_log_group = log_group.trim();
 
             let (raw, env) = match extract_metrics_payload(message) {
                 Some(v) => v,
@@ -337,7 +338,7 @@ fn parse_to_parquet(
                     None,
                     None,
                     None,
-                    (!log_group.is_empty()).then_some(log_group),
+                    (!normalized_log_group.is_empty()).then_some(normalized_log_group),
                     Some(stream),
                     env,
                     &row,
