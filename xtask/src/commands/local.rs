@@ -921,12 +921,9 @@ async fn run_processes(
                             metrics_batch.push(
                                 ts,
                                 "local",
-                                Some(&label),
                                 Some(&run_config.run_name),
+                                Some(&label),
                                 Some(&workloads_json),
-                                None,
-                                None,
-                                None,
                                 &row,
                             );
                             if metrics_batch.row_count >= METRICS_BATCH_SIZE {

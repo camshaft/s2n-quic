@@ -335,9 +335,6 @@ fn parse_to_parquet(
                 batch.push(
                     ts,
                     "cwlogs",
-                    None,
-                    None,
-                    None,
                     (!normalized_log_group.is_empty()).then_some(normalized_log_group),
                     Some(stream),
                     env,

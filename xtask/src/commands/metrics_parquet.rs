@@ -14,9 +14,6 @@ pub fn metrics_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
         Field::new("ts", DataType::Float64, false),
         Field::new("source", DataType::Utf8, false),
-        Field::new("process", DataType::Utf8, false),
-        Field::new("run", DataType::Utf8, false),
-        Field::new("workloads", DataType::Utf8, false),
         Field::new("log_group", DataType::Utf8, false),
         Field::new("stream", DataType::Utf8, false),
         Field::new("env", DataType::Utf8, false),
@@ -42,9 +39,6 @@ pub fn metrics_schema() -> Arc<Schema> {
 pub struct MetricsBatchBuilder {
     ts: Float64Builder,
     source: StringBuilder,
-    process: StringBuilder,
-    run: StringBuilder,
-    workloads: StringBuilder,
     log_group: StringBuilder,
     stream: StringBuilder,
     env: StringBuilder,
@@ -72,9 +66,6 @@ impl MetricsBatchBuilder {
         Self {
             ts: Float64Builder::new(),
             source: StringBuilder::new(),
-            process: StringBuilder::new(),
-            run: StringBuilder::new(),
-            workloads: StringBuilder::new(),
             log_group: StringBuilder::new(),
             stream: StringBuilder::new(),
             env: StringBuilder::new(),
@@ -103,26 +94,16 @@ impl MetricsBatchBuilder {
         &mut self,
         ts: f64,
         source: &str,
-        process: Option<&str>,
-        run: Option<&str>,
-        workloads: Option<&str>,
         log_group: Option<&str>,
         stream: Option<&str>,
         env: Option<&str>,
         row: &serde_json::Value,
     ) {
-        let (process, stream) = mirror_context_pair(process, stream);
-        let (run, log_group) = mirror_context_pair(run, log_group);
-        let (workloads, env) = mirror_context_pair(workloads, env);
-
         self.ts.append_value(ts);
         self.source.append_value(source);
-        self.process.append_value(process);
-        self.run.append_value(run);
-        self.workloads.append_value(workloads);
-        self.log_group.append_value(log_group);
-        self.stream.append_value(stream);
-        self.env.append_value(env);
+        self.log_group.append_value(log_group.unwrap_or_default());
+        self.stream.append_value(stream.unwrap_or_default());
+        self.env.append_value(env.unwrap_or_default());
 
         self.metric
             .append_value(row.get("metric").and_then(|v| v.as_str()).unwrap_or(""));
@@ -157,9 +138,6 @@ impl MetricsBatchBuilder {
             vec![
                 Arc::new(self.ts.finish()),
                 Arc::new(self.source.finish()),
-                Arc::new(self.process.finish()),
-                Arc::new(self.run.finish()),
-                Arc::new(self.workloads.finish()),
                 Arc::new(self.log_group.finish()),
                 Arc::new(self.stream.finish()),
                 Arc::new(self.env.finish()),
@@ -182,14 +160,6 @@ impl MetricsBatchBuilder {
             ],
         )
         .expect("schema mismatch in metrics batch builder")
-    }
-}
-
-fn mirror_context_pair<'a>(left: Option<&'a str>, right: Option<&'a str>) -> (&'a str, &'a str) {
-    match (left, right) {
-        (Some(left), Some(right)) => (left, right),
-        (Some(value), None) | (None, Some(value)) => (value, value),
-        (None, None) => ("", ""),
     }
 }
 
