@@ -862,8 +862,8 @@ async fn run_processes(
             },
         )?;
     let mut metrics_batch = MetricsBatchBuilder::new();
-    let workloads_json =
-        serde_json::to_string(&run_config.workloads).unwrap_or_else(|_| "[]".into());
+    let workloads_json = serde_json::to_string(&run_config.workloads)
+        .context("Failed to serialize workloads to JSON")?;
 
     let mut children = Vec::new();
     let (tx, mut rx) = mpsc::channel(512);

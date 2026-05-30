@@ -6,34 +6,39 @@ use arrow::{
     datatypes::{DataType, Field, Schema},
     record_batch::RecordBatch,
 };
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 pub const METRICS_BATCH_SIZE: usize = 8192;
 
 pub fn metrics_schema() -> Arc<Schema> {
-    Arc::new(Schema::new(vec![
-        Field::new("ts", DataType::Float64, false),
-        Field::new("source", DataType::Utf8, false),
-        Field::new("log_group", DataType::Utf8, false),
-        Field::new("stream", DataType::Utf8, false),
-        Field::new("env", DataType::Utf8, false),
-        Field::new("metric", DataType::Utf8, false),
-        Field::new("type", DataType::Utf8, false),
-        Field::new("variant", DataType::Utf8, true),
-        Field::new("unit", DataType::Utf8, true),
-        Field::new("value", DataType::Int64, true),
-        Field::new("enq", DataType::UInt64, true),
-        Field::new("drain", DataType::UInt64, true),
-        Field::new("depth", DataType::Int64, true),
-        Field::new("hit", DataType::UInt64, true),
-        Field::new("miss", DataType::UInt64, true),
-        Field::new("bytes", DataType::UInt64, true),
-        Field::new("count", DataType::UInt64, true),
-        Field::new("p50", DataType::UInt64, true),
-        Field::new("p99", DataType::UInt64, true),
-        Field::new("max", DataType::UInt64, true),
-        Field::new("buckets", DataType::Utf8, true),
-    ]))
+    static SCHEMA: OnceLock<Arc<Schema>> = OnceLock::new();
+    SCHEMA
+        .get_or_init(|| {
+            Arc::new(Schema::new(vec![
+                Field::new("ts", DataType::Float64, false),
+                Field::new("source", DataType::Utf8, false),
+                Field::new("log_group", DataType::Utf8, false),
+                Field::new("stream", DataType::Utf8, false),
+                Field::new("env", DataType::Utf8, false),
+                Field::new("metric", DataType::Utf8, false),
+                Field::new("type", DataType::Utf8, false),
+                Field::new("variant", DataType::Utf8, true),
+                Field::new("unit", DataType::Utf8, true),
+                Field::new("value", DataType::Int64, true),
+                Field::new("enq", DataType::UInt64, true),
+                Field::new("drain", DataType::UInt64, true),
+                Field::new("depth", DataType::Int64, true),
+                Field::new("hit", DataType::UInt64, true),
+                Field::new("miss", DataType::UInt64, true),
+                Field::new("bytes", DataType::UInt64, true),
+                Field::new("count", DataType::UInt64, true),
+                Field::new("p50", DataType::UInt64, true),
+                Field::new("p99", DataType::UInt64, true),
+                Field::new("max", DataType::UInt64, true),
+                Field::new("buckets", DataType::Utf8, true),
+            ]))
+        })
+        .clone()
 }
 
 pub struct MetricsBatchBuilder {
