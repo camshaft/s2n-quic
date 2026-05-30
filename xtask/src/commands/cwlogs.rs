@@ -5,12 +5,16 @@ use anyhow::{Context, Result};
 use arrow::{
     array::*,
     datatypes::{DataType, Field, Schema},
+    record_batch::RecordBatch,
 };
 use clap::Args;
-use parquet::{arrow::ArrowWriter, basic::Compression, file::properties::WriterProperties};
+use parquet::{
+    arrow::{ArrowWriter, arrow_reader::ParquetRecordBatchReaderBuilder},
+    basic::Compression,
+    file::properties::WriterProperties,
+};
 use serde::Deserialize;
 use std::{
-    io::{BufRead, BufReader, Write},
     path::PathBuf,
     process::Command,
     sync::Arc,
@@ -36,7 +40,7 @@ pub struct Cwlogs {
     #[arg(long, short = 'o', default_value = "logs/cwlogs")]
     output_dir: PathBuf,
 
-    /// Skip fetching, only re-parse existing cached events.jsonl
+    /// Skip fetching, only re-parse existing cached events.parquet
     #[arg(long)]
     parse_only: bool,
 
@@ -55,7 +59,7 @@ impl Cwlogs {
             format!("Failed to create output dir: {}", self.output_dir.display())
         })?;
 
-        let events_path = self.output_dir.join("events.jsonl");
+        let events_path = self.output_dir.join("events.parquet");
         let parquet_path = self.output_dir.join("metrics.parquet");
 
         if !self.parse_only {
@@ -112,8 +116,15 @@ fn fetch_logs(
     profile: Option<&str>,
     output_path: &std::path::Path,
 ) -> Result<()> {
-    let mut file = std::fs::File::create(output_path)
+    let file = std::fs::File::create(output_path)
         .with_context(|| format!("Failed to create {}", output_path.display()))?;
+    let props = WriterProperties::builder()
+        .set_compression(Compression::ZSTD(Default::default()))
+        .set_max_row_group_size(100_000)
+        .build();
+    let mut writer = ArrowWriter::try_new(file, events_schema(), Some(props))
+        .context("Failed to create events parquet writer")?;
+    let mut event_batch = EventBatchBuilder::new();
 
     let mut next_token: Option<String> = None;
     let mut total_events = 0u64;
@@ -161,8 +172,12 @@ fn fetch_logs(
         total_events += event_count as u64;
 
         for event in &response.events {
-            serde_json::to_writer(&mut file, event)?;
-            writeln!(file)?;
+            event_batch.push(event);
+            if event_batch.row_count >= BATCH_SIZE {
+                let record_batch = event_batch.finish();
+                writer.write(&record_batch)?;
+                event_batch = EventBatchBuilder::new();
+            }
         }
 
         eprint!("\r  page {page}: {total_events} events fetched");
@@ -172,6 +187,11 @@ fn fetch_logs(
             _ => break,
         }
     }
+    if event_batch.row_count > 0 {
+        let record_batch = event_batch.finish();
+        writer.write(&record_batch)?;
+    }
+    writer.close()?;
 
     eprintln!();
     eprintln!("  cached to {}", output_path.display());
@@ -195,6 +215,51 @@ struct LogEvent {
     log_stream_name: String,
     #[serde(default)]
     message: String,
+}
+
+fn events_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("timestamp", DataType::Int64, false),
+        Field::new("log_stream_name", DataType::Utf8, false),
+        Field::new("message", DataType::Utf8, false),
+    ]))
+}
+
+struct EventBatchBuilder {
+    timestamp: Int64Builder,
+    log_stream_name: StringBuilder,
+    message: StringBuilder,
+    row_count: usize,
+}
+
+impl EventBatchBuilder {
+    fn new() -> Self {
+        Self {
+            timestamp: Int64Builder::new(),
+            log_stream_name: StringBuilder::new(),
+            message: StringBuilder::new(),
+            row_count: 0,
+        }
+    }
+
+    fn push(&mut self, event: &LogEvent) {
+        self.timestamp.append_value(event.timestamp);
+        self.log_stream_name.append_value(&event.log_stream_name);
+        self.message.append_value(&event.message);
+        self.row_count += 1;
+    }
+
+    fn finish(&mut self) -> RecordBatch {
+        RecordBatch::try_new(
+            events_schema(),
+            vec![
+                Arc::new(self.timestamp.finish()),
+                Arc::new(self.log_stream_name.finish()),
+                Arc::new(self.message.finish()),
+            ],
+        )
+        .expect("schema mismatch in events batch builder")
+    }
 }
 
 // ── Phase 2: Parse + write Parquet ──────────────────────────────────────────
@@ -390,51 +455,65 @@ fn parse_to_parquet(
 
     let input = std::fs::File::open(events_path)
         .with_context(|| format!("Failed to open {}", events_path.display()))?;
-    let reader = BufReader::with_capacity(256 * 1024, input);
+    let mut reader = ParquetRecordBatchReaderBuilder::try_new(input)
+        .context("Failed to open cached events parquet")?
+        .with_batch_size(BATCH_SIZE)
+        .build()
+        .context("Failed to build cached events parquet reader")?;
 
     let mut batch = BatchBuilder::new();
     let mut total_rows = 0u64;
     let mut lines_processed = 0u64;
 
-    for line in reader.lines() {
-        let line = line?;
-        if line.is_empty() {
-            continue;
-        }
+    for record_batch in &mut reader {
+        let record_batch = record_batch?;
+        let timestamps = record_batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .context("Invalid cached events parquet timestamp column")?;
+        let streams = record_batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .context("Invalid cached events parquet stream column")?;
+        let messages = record_batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .context("Invalid cached events parquet message column")?;
 
-        let event: LogEvent = match serde_json::from_str(&line) {
-            Ok(e) => e,
-            Err(_) => continue,
-        };
+        for row_idx in 0..record_batch.num_rows() {
+            lines_processed += 1;
 
-        lines_processed += 1;
+            let ts = timestamps.value(row_idx) as f64 / 1000.0;
+            let stream = streams.value(row_idx);
+            let message = messages.value(row_idx);
 
-        let ts = event.timestamp as f64 / 1000.0;
-        let stream = &event.log_stream_name;
-
-        let (raw, env) = match extract_metrics_payload(&event.message) {
-            Some(v) => v,
-            None => continue,
-        };
-
-        let parsed = s2n_quic_dc_metrics::format::ParsedMetricsLine::parse(raw);
-        if parsed.is_empty() {
-            continue;
-        }
-
-        for row in parsed.to_json_rows() {
-            batch.push(ts, log_group, stream, env, &row);
-            total_rows += 1;
-
-            if batch.row_count >= BATCH_SIZE {
-                let record_batch = batch.finish();
-                writer.write(&record_batch)?;
-                batch = BatchBuilder::new();
+            let (raw, env) = match extract_metrics_payload(message) {
+                Some(v) => v,
+                None => continue,
             }
-        }
 
-        if lines_processed % 10_000 == 0 {
-            eprint!("\r  {lines_processed} lines → {total_rows} metric rows");
+            let parsed = s2n_quic_dc_metrics::format::ParsedMetricsLine::parse(raw);
+            if parsed.is_empty() {
+                continue;
+            }
+
+            for row in parsed.to_json_rows() {
+                batch.push(ts, log_group, stream, env, &row);
+                total_rows += 1;
+
+                if batch.row_count >= BATCH_SIZE {
+                    let record_batch = batch.finish();
+                    writer.write(&record_batch)?;
+                    batch = BatchBuilder::new();
+                }
+            }
+
+            if lines_processed % 10_000 == 0 {
+                eprint!("\r  {lines_processed} lines → {total_rows} metric rows");
+            }
         }
     }
 

@@ -2,7 +2,13 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use anyhow::{Context, Result};
+use arrow::{
+    array::*,
+    datatypes::{DataType, Field, Schema},
+    record_batch::RecordBatch,
+};
 use clap::Args;
+use parquet::{arrow::ArrowWriter, basic::Compression, file::properties::WriterProperties};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
@@ -787,6 +793,179 @@ fn epoch_days_to_date(days: u64) -> (u64, u64, u64) {
     (y, m, d)
 }
 
+const LOCAL_METRICS_BATCH_SIZE: usize = 8192;
+
+fn local_metrics_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("ts", DataType::Float64, false),
+        Field::new("process", DataType::Utf8, false),
+        Field::new("run", DataType::Utf8, false),
+        Field::new("workloads", DataType::Utf8, false),
+        Field::new("metric", DataType::Utf8, false),
+        Field::new("type", DataType::Utf8, false),
+        Field::new("variant", DataType::Utf8, true),
+        Field::new("unit", DataType::Utf8, true),
+        Field::new("value", DataType::Int64, true),
+        Field::new("enq", DataType::UInt64, true),
+        Field::new("drain", DataType::UInt64, true),
+        Field::new("depth", DataType::Int64, true),
+        Field::new("hit", DataType::UInt64, true),
+        Field::new("miss", DataType::UInt64, true),
+        Field::new("bytes", DataType::UInt64, true),
+        Field::new("count", DataType::UInt64, true),
+        Field::new("p50", DataType::UInt64, true),
+        Field::new("p99", DataType::UInt64, true),
+        Field::new("max", DataType::UInt64, true),
+        Field::new("buckets", DataType::Utf8, true),
+    ]))
+}
+
+struct LocalMetricsBatchBuilder {
+    ts: Float64Builder,
+    process: StringBuilder,
+    run: StringBuilder,
+    workloads: StringBuilder,
+    metric: StringBuilder,
+    r#type: StringBuilder,
+    variant: StringBuilder,
+    unit: StringBuilder,
+    value: Int64Builder,
+    enq: UInt64Builder,
+    drain: UInt64Builder,
+    depth: Int64Builder,
+    hit: UInt64Builder,
+    miss: UInt64Builder,
+    bytes: UInt64Builder,
+    count: UInt64Builder,
+    p50: UInt64Builder,
+    p99: UInt64Builder,
+    max: UInt64Builder,
+    buckets: StringBuilder,
+    row_count: usize,
+}
+
+impl LocalMetricsBatchBuilder {
+    fn new() -> Self {
+        Self {
+            ts: Float64Builder::new(),
+            process: StringBuilder::new(),
+            run: StringBuilder::new(),
+            workloads: StringBuilder::new(),
+            metric: StringBuilder::new(),
+            r#type: StringBuilder::new(),
+            variant: StringBuilder::new(),
+            unit: StringBuilder::new(),
+            value: Int64Builder::new(),
+            enq: UInt64Builder::new(),
+            drain: UInt64Builder::new(),
+            depth: Int64Builder::new(),
+            hit: UInt64Builder::new(),
+            miss: UInt64Builder::new(),
+            bytes: UInt64Builder::new(),
+            count: UInt64Builder::new(),
+            p50: UInt64Builder::new(),
+            p99: UInt64Builder::new(),
+            max: UInt64Builder::new(),
+            buckets: StringBuilder::new(),
+            row_count: 0,
+        }
+    }
+
+    fn push(&mut self, ts: f64, process: &str, run: &str, workloads: &str, row: &serde_json::Value) {
+        self.ts.append_value(ts);
+        self.process.append_value(process);
+        self.run.append_value(run);
+        self.workloads.append_value(workloads);
+        self.metric
+            .append_value(row.get("metric").and_then(|v| v.as_str()).unwrap_or(""));
+        self.r#type
+            .append_value(row.get("type").and_then(|v| v.as_str()).unwrap_or(""));
+        append_opt_str(&mut self.variant, row.get("variant"));
+        append_opt_str(&mut self.unit, row.get("unit"));
+        append_opt_i64(&mut self.value, row.get("value"));
+        append_opt_u64(&mut self.enq, row.get("enq"));
+        append_opt_u64(&mut self.drain, row.get("drain"));
+        append_opt_i64(&mut self.depth, row.get("depth"));
+        append_opt_u64(&mut self.hit, row.get("hit"));
+        append_opt_u64(&mut self.miss, row.get("miss"));
+        append_opt_u64(&mut self.bytes, row.get("bytes"));
+        append_opt_u64(&mut self.count, row.get("count"));
+        append_opt_u64(&mut self.p50, row.get("p50"));
+        append_opt_u64(&mut self.p99, row.get("p99"));
+        append_opt_u64(&mut self.max, row.get("max"));
+
+        match row.get("buckets") {
+            Some(b) if !b.is_null() => self.buckets.append_value(b.to_string()),
+            _ => self.buckets.append_null(),
+        }
+
+        self.row_count += 1;
+    }
+
+    fn finish(&mut self) -> RecordBatch {
+        RecordBatch::try_new(
+            local_metrics_schema(),
+            vec![
+                Arc::new(self.ts.finish()),
+                Arc::new(self.process.finish()),
+                Arc::new(self.run.finish()),
+                Arc::new(self.workloads.finish()),
+                Arc::new(self.metric.finish()),
+                Arc::new(self.r#type.finish()),
+                Arc::new(self.variant.finish()),
+                Arc::new(self.unit.finish()),
+                Arc::new(self.value.finish()),
+                Arc::new(self.enq.finish()),
+                Arc::new(self.drain.finish()),
+                Arc::new(self.depth.finish()),
+                Arc::new(self.hit.finish()),
+                Arc::new(self.miss.finish()),
+                Arc::new(self.bytes.finish()),
+                Arc::new(self.count.finish()),
+                Arc::new(self.p50.finish()),
+                Arc::new(self.p99.finish()),
+                Arc::new(self.max.finish()),
+                Arc::new(self.buckets.finish()),
+            ],
+        )
+        .expect("schema mismatch in local metrics batch builder")
+    }
+}
+
+fn append_opt_str(builder: &mut StringBuilder, val: Option<&serde_json::Value>) {
+    match val.and_then(|v| v.as_str()) {
+        Some(s) => builder.append_value(s),
+        None => builder.append_null(),
+    }
+}
+
+fn append_opt_u64(builder: &mut UInt64Builder, val: Option<&serde_json::Value>) {
+    match val.and_then(|v| v.as_u64()) {
+        Some(n) => builder.append_value(n),
+        None => builder.append_null(),
+    }
+}
+
+fn append_opt_i64(builder: &mut Int64Builder, val: Option<&serde_json::Value>) {
+    match val.and_then(|v| v.as_i64()) {
+        Some(n) => builder.append_value(n),
+        None => builder.append_null(),
+    }
+}
+
+fn flush_local_metrics_batch(
+    writer: &mut ArrowWriter<std::fs::File>,
+    batch: &mut LocalMetricsBatchBuilder,
+) -> Result<()> {
+    if batch.row_count == 0 {
+        return Ok(());
+    }
+    let record_batch = batch.finish();
+    writer.write(&record_batch)?;
+    *batch = LocalMetricsBatchBuilder::new();
+    Ok(())
+}
+
 struct ProcessConfig {
     target: Node,
     label: String,
@@ -827,11 +1006,20 @@ async fn run_processes(
     std::fs::create_dir_all(&run_config.log_dir)
         .with_context(|| format!("Failed to create log dir: {}", run_config.log_dir.display()))?;
     let log_path = run_config.log_dir.join("output.log");
-    let metrics_path = run_config.log_dir.join("metrics.jsonl");
+    let metrics_path = run_config.log_dir.join("metrics.parquet");
     let mut log_file = std::fs::File::create(&log_path)
         .with_context(|| format!("Failed to create log file: {}", log_path.display()))?;
-    let mut metrics_file = std::fs::File::create(&metrics_path)
+    let metrics_file = std::fs::File::create(&metrics_path)
         .with_context(|| format!("Failed to create metrics file: {}", metrics_path.display()))?;
+    let metrics_props = WriterProperties::builder()
+        .set_compression(Compression::ZSTD(Default::default()))
+        .set_max_row_group_size(100_000)
+        .build();
+    let mut metrics_writer =
+        ArrowWriter::try_new(metrics_file, local_metrics_schema(), Some(metrics_props))
+            .with_context(|| format!("Failed to create parquet writer: {}", metrics_path.display()))?;
+    let mut metrics_batch = LocalMetricsBatchBuilder::new();
+    let workloads_json = serde_json::to_string(&run_config.workloads).unwrap_or_else(|_| "[]".into());
 
     let mut children = Vec::new();
     let (tx, mut rx) = mpsc::channel(512);
@@ -880,19 +1068,16 @@ async fn run_processes(
                             print_line(&mut stdout, color, &label, format_args!("{} {}", prefix.trim_end(), pretty), max_label_len)?;
                         }
 
-                        // Write structured JSONL — one row per metric
+                        // Write structured parquet — one row per metric
                         let ts = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .unwrap()
                             .as_secs_f64();
-                        for mut row in parsed.to_json_rows() {
-                            if let Some(obj) = row.as_object_mut() {
-                                obj.insert("process".into(), serde_json::Value::String(label.to_string()));
-                                obj.insert("ts".into(), serde_json::json!(ts));
-                                obj.insert("run".into(), serde_json::Value::String(run_config.run_name.clone()));
-                                obj.insert("workloads".into(), serde_json::json!(run_config.workloads));
+                        for row in parsed.to_json_rows() {
+                            metrics_batch.push(ts, &label, &run_config.run_name, &workloads_json, &row);
+                            if metrics_batch.row_count >= LOCAL_METRICS_BATCH_SIZE {
+                                flush_local_metrics_batch(&mut metrics_writer, &mut metrics_batch)?;
                             }
-                            let _ = writeln!(metrics_file, "{}", row);
                         }
                     }
                 } else {
@@ -932,6 +1117,8 @@ async fn run_processes(
     if !exit_task.is_finished() {
         let _ = exit_task.await;
     }
+    flush_local_metrics_batch(&mut metrics_writer, &mut metrics_batch)?;
+    metrics_writer.close()?;
 
     eprintln!("Log: {}", log_path.display());
     eprintln!("Metrics: {}", metrics_path.display());
