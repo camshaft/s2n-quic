@@ -14,12 +14,12 @@ pub fn metrics_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
         Field::new("ts", DataType::Float64, false),
         Field::new("source", DataType::Utf8, false),
-        Field::new("process", DataType::Utf8, true),
-        Field::new("run", DataType::Utf8, true),
-        Field::new("workloads", DataType::Utf8, true),
-        Field::new("log_group", DataType::Utf8, true),
-        Field::new("stream", DataType::Utf8, true),
-        Field::new("env", DataType::Utf8, true),
+        Field::new("process", DataType::Utf8, false),
+        Field::new("run", DataType::Utf8, false),
+        Field::new("workloads", DataType::Utf8, false),
+        Field::new("log_group", DataType::Utf8, false),
+        Field::new("stream", DataType::Utf8, false),
+        Field::new("env", DataType::Utf8, false),
         Field::new("metric", DataType::Utf8, false),
         Field::new("type", DataType::Utf8, false),
         Field::new("variant", DataType::Utf8, true),
@@ -111,14 +111,18 @@ impl MetricsBatchBuilder {
         env: Option<&str>,
         row: &serde_json::Value,
     ) {
+        let (process, stream) = mirror_context_pair(process, stream);
+        let (run, log_group) = mirror_context_pair(run, log_group);
+        let (workloads, env) = mirror_context_pair(workloads, env);
+
         self.ts.append_value(ts);
         self.source.append_value(source);
-        append_opt_str(&mut self.process, process);
-        append_opt_str(&mut self.run, run);
-        append_opt_str(&mut self.workloads, workloads);
-        append_opt_str(&mut self.log_group, log_group);
-        append_opt_str(&mut self.stream, stream);
-        append_opt_str(&mut self.env, env);
+        self.process.append_value(process);
+        self.run.append_value(run);
+        self.workloads.append_value(workloads);
+        self.log_group.append_value(log_group);
+        self.stream.append_value(stream);
+        self.env.append_value(env);
 
         self.metric
             .append_value(row.get("metric").and_then(|v| v.as_str()).unwrap_or(""));
@@ -181,10 +185,11 @@ impl MetricsBatchBuilder {
     }
 }
 
-fn append_opt_str(builder: &mut StringBuilder, val: Option<&str>) {
-    match val {
-        Some(s) => builder.append_value(s),
-        None => builder.append_null(),
+fn mirror_context_pair<'a>(left: Option<&'a str>, right: Option<&'a str>) -> (&'a str, &'a str) {
+    match (left, right) {
+        (Some(left), Some(right)) => (left, right),
+        (Some(value), None) | (None, Some(value)) => (value, value),
+        (None, None) => ("", ""),
     }
 }
 
