@@ -324,8 +324,9 @@ jobs:
         run: |
           BENCH_BIN="$(find target/release/deps -maxdepth 1 -type f -executable -name 'bench-*' | head -n1)"
           test -n "$BENCH_BIN"
-          valgrind --tool=callgrind --callgrind-out-file=callgrind.out --instr-atstart=no "$BENCH_BIN"
-          test -f callgrind.out
+          mkdir -p artifacts/callgrind
+          valgrind --tool=callgrind --callgrind-out-file=artifacts/callgrind/callgrind.out --instr-atstart=no "$BENCH_BIN"
+          test -f artifacts/callgrind/callgrind.out
 
   asan:
     runs-on: ubuntu-latest
