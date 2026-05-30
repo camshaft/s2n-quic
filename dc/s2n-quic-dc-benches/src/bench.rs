@@ -72,15 +72,14 @@ pub const fn backend() -> Backend {
 // ── Criterion backend (default) ───────────────────────────────────────────────
 
 #[cfg(not(feature = "cachegrind"))]
-pub use criterion::{BenchmarkId, Criterion, Throughput};
+pub use criterion::{BenchmarkGroup, BenchmarkId, Criterion, Throughput};
 #[cfg(not(feature = "cachegrind"))]
 pub use std::hint::black_box;
 
 // ── Cachegrind backend ────────────────────────────────────────────────────────
 
 #[cfg(feature = "cachegrind")]
-pub use cachegrind_backend::{black_box, BenchmarkId, Criterion, Throughput};
-
+pub use cachegrind_backend::{black_box, BenchmarkGroup, BenchmarkId, Criterion, Throughput};
 #[cfg(feature = "cachegrind")]
 mod cachegrind_backend {
     use core::fmt;
