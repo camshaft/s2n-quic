@@ -319,6 +319,7 @@ jobs:
 
       - name: Build benchmark
         run: |
+          rm -f target/release/deps/bench-*
           cargo build --bench bench --features cachegrind --profile bench -p s2n-quic-dc-benches
 
       - name: Run benchmark under callgrind
