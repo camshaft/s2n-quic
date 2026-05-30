@@ -853,10 +853,17 @@ async fn run_processes(
         .set_max_row_group_size(100_000)
         .build();
     let mut metrics_writer =
-        ArrowWriter::try_new(metrics_file, metrics_schema(), Some(metrics_props))
-            .with_context(|| format!("Failed to create parquet writer: {}", metrics_path.display()))?;
+        ArrowWriter::try_new(metrics_file, metrics_schema(), Some(metrics_props)).with_context(
+            || {
+                format!(
+                    "Failed to create parquet writer: {}",
+                    metrics_path.display()
+                )
+            },
+        )?;
     let mut metrics_batch = MetricsBatchBuilder::new();
-    let workloads_json = serde_json::to_string(&run_config.workloads).unwrap_or_else(|_| "[]".into());
+    let workloads_json =
+        serde_json::to_string(&run_config.workloads).unwrap_or_else(|_| "[]".into());
 
     let mut children = Vec::new();
     let (tx, mut rx) = mpsc::channel(512);
