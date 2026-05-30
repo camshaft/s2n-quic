@@ -428,6 +428,8 @@ impl<'a> ParsedMetricsLine<'a> {
     }
 }
 
+/// Structured metric row used by exporters for direct serialization
+/// into tabular sinks (e.g., Parquet) without first materializing JSON.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MetricRow<'a> {
     pub metric: &'a str,

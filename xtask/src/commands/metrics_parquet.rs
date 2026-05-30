@@ -153,12 +153,12 @@ impl MetricsBatchBuilder {
                 }
                 self.buckets
                     .append(true)
-                    .expect("keys and values must be equal-length");
+                    .expect("map builder state inconsistent");
             }
             None => self
                 .buckets
                 .append(false)
-                .expect("keys and values must be equal-length"),
+                .expect("map builder state inconsistent"),
         }
 
         self.row_count += 1;
