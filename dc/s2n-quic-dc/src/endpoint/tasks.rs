@@ -1095,8 +1095,9 @@ where
 
 /// Drains the send-side idle wheel for one send worker.
 ///
-/// Contexts that are still active are re-armed on the idle wheel. Contexts that have truly gone
-/// idle are invalidated from the send cache, any failed frames are completed with
+/// Contexts whose idle deadline remains at least one wheel tick in the future are re-armed on
+/// the idle wheel. Expired contexts (including deadlines that fall within the current wheel
+/// tick) are invalidated from the send cache; any failed frames are completed with
 /// [`frame::FailureReason::PeerDead`], and `peer_dead_tx` is notified only when the idle expiry
 /// also indicates an unresponsive peer with inflight data.
 pub async fn send_idle_wheel_drain<Clk, WakerSink>(
