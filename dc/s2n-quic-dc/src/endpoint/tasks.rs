@@ -1219,9 +1219,10 @@ pub async fn send_idle_wheel_drain<Clk, WakerSink>(
 
 /// Drains the receive-side idle wheel for one receive worker.
 ///
-/// Active contexts are re-armed on the idle wheel. Expired contexts are removed from
-/// `recv_cache`. Unlike the send side, this task never marks a peer dead: a quiet receive path
-/// does not prove reachability failure.
+/// Contexts whose idle deadline remains at least one wheel tick in the future are re-armed on
+/// the idle wheel. Expired contexts (including deadlines that fall within the current wheel
+/// tick) are removed from `recv_cache`. Unlike the send side, this task never marks a peer dead:
+/// a quiet receive path does not prove reachability failure.
 pub async fn recv_idle_wheel_drain<Clk>(
     rx: intrusive::unsync::Receiver<endpoint::recv::IdleWheelAdapter>,
     idle_wheel_tx: intrusive::unsync::Sender<endpoint::recv::IdleWheelAdapter>,
