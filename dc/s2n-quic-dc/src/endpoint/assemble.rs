@@ -135,6 +135,9 @@ where
             // Number of leading ACK frames in packet_frames (from the direct path).
             // These are stripped before inflight insertion since ACKs are stale on retransmit.
             let mut ack_frame_count: usize = 0;
+            // Set when a Ping frame is appended in Phase 2. Stripped before inflight
+            // insertion (Ping has no retransmission or completion semantics).
+            let mut has_ping = false;
             // If a probe is encoded in this segment, this records which old inflight
             // entry was turned into a shell so we can link it to the new PN after
             // the segment is registered in the inflight map.
@@ -288,6 +291,7 @@ where
                                 enqueued_at: None,
                             });
                             is_ack_eliciting = true;
+                            has_ping = true;
                             counters.on_tx_frame(&ping.header);
                             counters.on_probe_frame(&ping.header);
                             packet_frames.push_back(ping);
@@ -301,8 +305,12 @@ where
                                 "PTO probe: nothing to probe (no inflight entries)"
                             );
                         }
-                        // Skip directly to Idle — nothing left to probe.
+                        // No inflight entries remain — skip to Idle.
                         let _ = context.pto.probe_state.on_all_acked();
+                    }
+                    ProbeResult::DoesNotFit => {
+                        // Probe frames exist but don't fit in this segment.
+                        // Leave probe_state unchanged; the next assemble() call will retry.
                     }
                 }
             }
@@ -448,13 +456,16 @@ where
                     drop(frame);
                 }
 
-                // Strip Ping frames — they make the packet ack-eliciting but have no
-                // retransmission or completion semantics.
-                while packet_frames
-                    .front()
-                    .is_some_and(|f| matches!(f.header, frame::Header::Ping))
-                {
-                    packet_frames.pop_front();
+                // Strip the Ping frame — it makes the packet ack-eliciting but has no
+                // retransmission or completion semantics. Always at the back since it's
+                // appended last in Phase 2.
+                if has_ping {
+                    let ping = packet_frames.pop_back();
+                    debug_assert!(
+                        ping.as_ref()
+                            .is_some_and(|f| matches!(f.header, frame::Header::Ping)),
+                        "has_ping set but back frame is not Ping"
+                    );
                 }
 
                 // Notify probe state that an ack-eliciting packet was transmitted.
@@ -577,7 +588,11 @@ where
 
 enum ProbeResult {
     Assembled { old_pn: PacketNumber },
+    /// No inflight entries available to probe (all shells or empty map).
     NothingToProbe,
+    /// Probe frames exist but don't fit in the current segment (GSO size constraint).
+    /// The frames were restored; retry on the next assembly call.
+    DoesNotFit,
 }
 
 /// Try to assemble a PTO probe from the oldest inflight packet(s).
@@ -792,7 +807,7 @@ fn assemble_probe(
                 // (locked by a prior segment) is too small for this frame.
                 probe_frames.push_front(frame);
                 context.inflight.restore_probe_frames(old_pn, probe_frames);
-                return ProbeResult::NothingToProbe;
+                return ProbeResult::DoesNotFit;
             } else {
                 probe_frames.push_front(frame);
                 break;

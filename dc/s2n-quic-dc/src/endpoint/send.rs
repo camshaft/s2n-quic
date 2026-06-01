@@ -523,8 +523,8 @@ impl ProbeState {
     );
 
     s2n_quic_core::state::event! {
-        /// Transition `Idle → ProbeTwice` when a PTO fires.
-        request(Idle => ProbeTwice);
+        /// Transition to ProbeTwice when a PTO fires. Re-arms if already in ProbeOnce.
+        request(Idle | ProbeOnce => ProbeTwice);
         /// Transition after the assembler transmits an ack-eliciting probe segment.
         on_transmit(ProbeTwice => ProbeOnce, ProbeOnce => Idle);
         /// Transition when all inflight data is ACKed before the probe fires.
