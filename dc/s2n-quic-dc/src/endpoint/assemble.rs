@@ -281,6 +281,8 @@ where
                     ProbeResult::NothingToProbe => {
                         if context.pto.probe_state.is_probe_once() {
                             // Already sent one probe — emit Ping for the second segment.
+                            // Don't clear probe_state here; the general on_transmit()
+                            // fires after the Ping segment is encoded (ProbeOnce → Idle).
                             let ping = crate::intrusive::Entry::new(Frame {
                                 header: frame::Header::Ping,
                                 payload: crate::byte_vec::ByteVec::default(),
@@ -300,13 +302,13 @@ where
                                 "PTO probe: emitting Ping as second segment"
                             );
                         } else {
+                            // No inflight entries and no prior probe sent — clear to Idle.
+                            let _ = context.pto.probe_state.on_all_acked();
                             trace!(
                                 credentials = %context.credentials.id,
                                 "PTO probe: nothing to probe (no inflight entries)"
                             );
                         }
-                        // No inflight entries remain — skip to Idle.
-                        let _ = context.pto.probe_state.on_all_acked();
                     }
                     ProbeResult::DoesNotFit => {
                         // Probe frames exist but don't fit in this segment.
