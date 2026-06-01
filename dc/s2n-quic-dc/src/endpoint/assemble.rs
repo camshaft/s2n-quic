@@ -30,6 +30,7 @@ use crate::{
         pool::descriptor::{Recycler, Segments, Unfilled},
     },
     time::precision,
+    tracing::*,
 };
 use s2n_codec::{Encoder, EncoderBuffer, EncoderValue};
 use s2n_quic_core::{
@@ -248,12 +249,11 @@ where
 
             // Phase 2: PTO probe assembly.
             //
-            // Only entered when a probe is requested and there is no pending data to serve
-            // as the probe. If pending data is present, Phase 3 will bypass CWND and act
-            // as the probe (RFC 9002 §6.2.4), so no retransmit is needed here.
-            //
-            // Skipping 4 PNs creates a gap large enough that the peer will immediately
-            // ACK the probe (RFC 9000 §13.2.1 / RFC 9002 §6.2.4).
+            // When a PTO fires and there is no pending data, we retransmit inflight
+            // frames as probe packets. The state machine emits 2 ack-eliciting segments
+            // (ProbeTwice → ProbeOnce → Idle) so the peer receives enough contiguous PNs
+            // to satisfy the loss detection threshold (PN-threshold = 2). If only one
+            // inflight entry is available, the second segment is a Ping frame.
             if context.pto.probe_state.is_requested() && !context.has_pending_data() {
                 match assemble_probe(
                     context,
@@ -268,9 +268,41 @@ where
                     ProbeResult::Assembled { old_pn } => {
                         is_ack_eliciting = true;
                         probe_from_pn = Some(old_pn);
+                        trace!(
+                            credentials = %context.credentials.id,
+                            old_pn = old_pn.as_u64(),
+                            ?context.pto.probe_state,
+                            "PTO probe: assembled retransmit segment"
+                        );
                     }
                     ProbeResult::NothingToProbe => {
-                        let _ = context.pto.probe_state.on_transmit();
+                        if context.pto.probe_state.is_probe_once() {
+                            // Already sent one probe — emit Ping for the second segment.
+                            let ping = crate::intrusive::Entry::new(Frame {
+                                header: frame::Header::Ping,
+                                payload: crate::byte_vec::ByteVec::default(),
+                                path_secret_entry: context.path_secret_entry.clone(),
+                                completion: None,
+                                status: Default::default(),
+                                ttl: frame::DEFAULT_TTL,
+                                enqueued_at: None,
+                            });
+                            is_ack_eliciting = true;
+                            counters.on_tx_frame(&ping.header);
+                            counters.on_probe_frame(&ping.header);
+                            packet_frames.push_back(ping);
+                            trace!(
+                                credentials = %context.credentials.id,
+                                "PTO probe: emitting Ping as second segment"
+                            );
+                        } else {
+                            trace!(
+                                credentials = %context.credentials.id,
+                                "PTO probe: nothing to probe (no inflight entries)"
+                            );
+                        }
+                        // Skip directly to Idle — nothing left to probe.
+                        let _ = context.pto.probe_state.on_all_acked();
                     }
                 }
             }
@@ -414,6 +446,15 @@ where
                         "expected ACK frame during stripping, got a data frame"
                     );
                     drop(frame);
+                }
+
+                // Strip Ping frames — they make the packet ack-eliciting but have no
+                // retransmission or completion semantics.
+                while packet_frames
+                    .front()
+                    .is_some_and(|f| matches!(f.header, frame::Header::Ping))
+                {
+                    packet_frames.pop_front();
                 }
 
                 // Notify probe state that an ack-eliciting packet was transmitted.
@@ -710,8 +751,8 @@ fn assemble_queue_free(
 }
 
 /// Skips packets whose frames have all been cancelled (writer dropped). If a
-/// transmittable packet is found, its frames are added to `packet_frames` and the
-/// PN is advanced by 4 to create the gap that triggers an immediate ACK.
+/// transmittable packet is found, its frames are added to `packet_frames` using
+/// the next contiguous PN (no gap). The outer loop assigns the PN at encoding time.
 fn assemble_probe(
     context: &mut Context,
     metadata: &mut MetadataEstimate,
@@ -723,7 +764,6 @@ fn assemble_probe(
     counters: &AssemblerCounters,
 ) -> ProbeResult {
     while let Some((old_pn, mut probe_frames)) = context.inflight.take_oldest_for_probe() {
-        let next_packet_number = context.next_packet_number + 4;
         let mut probe_metadata = *metadata;
         let mut has_frame = false;
 
@@ -747,17 +787,9 @@ fn assemble_probe(
                 counters.on_probe_frame(&frame.header);
                 packet_frames.push_back(frame);
             } else if !has_frame {
-                // First probe frame doesn't fit. This is only legitimate when
-                // ACK frames already consumed part of the segment budget.
-                assert!(
-                    metadata.payload_len > 0 || metadata.header_len > 0,
-                    "first probe frame does not fit in a clean packet — header estimate is wrong; \
-                     est_len={est_len}, max_segment_len={max_segment_len}, \
-                     metadata={probe_metadata:?}, \
-                     frame_header={:?}, frame_payload_len={}",
-                    frame.header,
-                    frame.payload_len(),
-                );
+                // First probe frame doesn't fit. Legitimate when ACK frames
+                // consumed part of the budget, or when the GSO segment size
+                // (locked by a prior segment) is too small for this frame.
                 probe_frames.push_front(frame);
                 context.inflight.restore_probe_frames(old_pn, probe_frames);
                 return ProbeResult::NothingToProbe;
@@ -781,7 +813,6 @@ fn assemble_probe(
             continue;
         }
 
-        context.next_packet_number = next_packet_number;
         *metadata = probe_metadata;
 
         for frame in probe_frames {
