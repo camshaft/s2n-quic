@@ -10,8 +10,11 @@ use s2n_quic::{provider::tls::Provider, server::Name};
 use s2n_quic_core::{crypto::tls::testing::certificates, time::StdClock};
 use std::{
     cell::Cell,
+    io::{BufWriter, Write as _},
+    path::PathBuf,
+    process,
     sync::{atomic::AtomicUsize, OnceLock},
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 #[cfg(any(test, feature = "testing"))]
@@ -77,10 +80,164 @@ thread_local! {
     static SNAPSHOT_DISABLED_DEPTH: Cell<usize> = const { Cell::new(0) };
     /// Per-test snapshot buffer. Set by `run_sim_with_snapshot`, read by the
     /// snapshot fmt layer's MakeWriter.
-    static SNAPSHOT_BUFFER: Cell<Option<Arc<Mutex<Vec<u8>>>>> = const { Cell::new(None) };
+    static SNAPSHOT_BUFFER: Cell<Option<Arc<Mutex<SnapshotBuffer>>>> = const { Cell::new(None) };
 }
 
 static SNAPSHOT_MODE_DEPTH: AtomicUsize = AtomicUsize::new(0);
+static SHARED_SNAPSHOT_BUFFER: OnceLock<Mutex<Option<Arc<Mutex<SnapshotBuffer>>>>> = OnceLock::new();
+const SNAPSHOT_SPILL_THRESHOLD: usize = 256 * 1024;
+// Bound retries to avoid pathological looping under heavy contention while
+// still giving enough attempts for concurrent test threads.
+const MAX_SPILL_FILE_CREATION_ATTEMPTS: usize = 128;
+
+enum SnapshotBufferStorage {
+    InMemory(Vec<u8>),
+    OnDisk {
+        path: PathBuf,
+        file: BufWriter<std::fs::File>,
+    },
+}
+
+struct SnapshotBuffer {
+    spill_threshold: usize,
+    storage: SnapshotBufferStorage,
+}
+
+impl SnapshotBuffer {
+    fn new(spill_threshold: usize) -> Self {
+        Self {
+            spill_threshold,
+            storage: SnapshotBufferStorage::InMemory(Vec::new()),
+        }
+    }
+
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let should_spill = if let SnapshotBufferStorage::InMemory(bytes) = &self.storage {
+            bytes.len().saturating_add(buf.len()) > self.spill_threshold
+        } else {
+            false
+        };
+
+        if should_spill {
+            self.spill_to_disk()?;
+        }
+
+        match &mut self.storage {
+            SnapshotBufferStorage::InMemory(bytes) => {
+                bytes.extend_from_slice(buf);
+            }
+            SnapshotBufferStorage::OnDisk { file, .. } => {
+                file.write_all(buf)?;
+            }
+        }
+
+        Ok(buf.len())
+    }
+
+    fn into_bytes(&mut self) -> std::io::Result<Vec<u8>> {
+        match &mut self.storage {
+            SnapshotBufferStorage::InMemory(bytes) => Ok(std::mem::take(bytes)),
+            SnapshotBufferStorage::OnDisk { file, path } => {
+                file.flush()?;
+                std::fs::read(path)
+            }
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        if let SnapshotBufferStorage::OnDisk { file, .. } = &mut self.storage {
+            file.flush()?;
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn spill_path(&self) -> Option<PathBuf> {
+        match &self.storage {
+            SnapshotBufferStorage::OnDisk { path, .. } => Some(path.clone()),
+            SnapshotBufferStorage::InMemory(_) => None,
+        }
+    }
+
+    fn spill_to_disk(&mut self) -> std::io::Result<()> {
+        let SnapshotBufferStorage::InMemory(bytes) = &mut self.storage else {
+            return Ok(());
+        };
+
+        let (file, path) = create_snapshot_spill_file()?;
+        let mut file = BufWriter::new(file);
+        file.write_all(bytes)?;
+
+        eprintln!(
+            "s2n-quic-dc snapshot log buffer exceeded {} bytes; spilling to {}",
+            self.spill_threshold,
+            path.display()
+        );
+
+        self.storage = SnapshotBufferStorage::OnDisk { path, file };
+        Ok(())
+    }
+}
+
+fn create_snapshot_spill_file() -> std::io::Result<(std::fs::File, PathBuf)> {
+    // Intentionally create a persistent file in the temp directory so logs remain
+    // available for debugging after the test process exits.
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let thread_name = sanitize_thread_name(std::thread::current().name().unwrap_or("unnamed"));
+    let temp_dir = std::env::temp_dir();
+
+    for attempt in 0..MAX_SPILL_FILE_CREATION_ATTEMPTS {
+        let path = temp_dir.join(format!(
+            "s2n-quic-dc-test-logs-{thread_name}-{}-{now}-{attempt}.log",
+            process::id(),
+        ));
+
+        match std::fs::OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(&path)
+        {
+            Ok(file) => return Ok((file, path)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        format!(
+            "failed to create unique snapshot spill log file after {MAX_SPILL_FILE_CREATION_ATTEMPTS} attempts (dir={}, thread={thread_name})",
+            temp_dir.display()
+        ),
+    ))
+}
+
+fn sanitize_thread_name(name: &str) -> String {
+    name.replace([':', '/', '\\', '.', ' '], "_")
+}
+
+fn clone_thread_local_buffer(
+    cell: &Cell<Option<Arc<Mutex<SnapshotBuffer>>>>,
+) -> Option<Arc<Mutex<SnapshotBuffer>>> {
+    // `Cell::get` requires `Copy`, but this thread-local value is `Option<Arc<_>>`.
+    // Temporarily take, clone, and restore to safely duplicate the Arc.
+    let opt = cell.take();
+    let cloned = opt.clone();
+    cell.set(opt);
+    cloned
+}
+
+fn clone_shared_snapshot_buffer() -> Option<Arc<Mutex<SnapshotBuffer>>> {
+    SHARED_SNAPSHOT_BUFFER
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap()
+        .clone()
+}
 
 struct TracingDisabledGuard;
 
@@ -174,58 +331,27 @@ pub fn init_tracing() {
 
     // make sure this only gets initialized once
     TRACING.call_once(|| {
-        let default_level = if std::env::var("CI").is_ok() {
-            tracing::Level::INFO
-        } else if cfg!(debug_assertions) {
-            tracing::Level::DEBUG
-        } else {
-            tracing::Level::WARN
-        };
-
         let stdout_filter = tracing_subscriber::EnvFilter::builder()
-            .with_default_directive(default_level.into())
-            .with_env_var("S2N_LOG")
-            .from_env()
-            .unwrap();
-
-        // Stdout layer: always active unless tracing is explicitly disabled.
-        let mut stdout_layer = tracing_subscriber::fmt::layer().event_format(
-            tracing_subscriber::fmt::format()
-                .with_timer(Uptime::default())
-                .compact(),
-        );
-
-        // avoid ANSI with agents
-        if std::env::var("CLAUDECODE").is_ok() {
-            stdout_layer = stdout_layer.with_ansi(false);
-        }
-
-        let stdout_layer = stdout_layer
-            .with_writer(StdoutWriter)
-            .with_filter(stdout_filter);
-
-        // Snapshot layer: only writes when SNAPSHOT_BUFFER is set on this thread.
-        // Fixed filter — never reads env vars so snapshot content is deterministic.
-        let snapshot_filter = tracing_subscriber::EnvFilter::builder()
             .with_default_directive(tracing::Level::DEBUG.into())
             .parse("")
             .unwrap()
             .add_directive("s2n_quic_dc::metric=trace".parse().unwrap());
 
-        let snapshot_layer = tracing_subscriber::fmt::layer()
-            .event_format(
-                tracing_subscriber::fmt::format()
-                    .with_timer(Uptime::default())
-                    .with_target(false)
-                    .compact(),
-            )
-            .with_ansi(false)
-            .with_writer(ThreadLocalSnapshotWriter)
-            .with_filter(snapshot_filter);
+        // Stdout layer: always active unless tracing is explicitly disabled.
+        let mut stdout_layer = tracing_subscriber::fmt::layer().event_format(
+            tracing_subscriber::fmt::format()
+                .with_timer(Uptime::default())
+                .with_target(false)
+                .compact(),
+        );
 
-        let subscriber = tracing_subscriber::registry()
-            .with(stdout_layer)
-            .with(snapshot_layer);
+        stdout_layer = stdout_layer.with_ansi(false);
+
+        let stdout_layer = stdout_layer
+            .with_writer(StdoutWriter)
+            .with_filter(stdout_filter);
+
+        let subscriber = tracing_subscriber::registry().with(stdout_layer);
 
         tracing::subscriber::set_global_default(subscriber)
             .expect("failed to set global tracing subscriber");
@@ -333,19 +459,43 @@ fn is_snapshots_disabled() -> bool {
 fn run_sim_with_snapshot(f: impl FnOnce()) {
     let snapshot_name = std::thread::current()
         .name()
-        .unwrap_or("unknown")
-        .replace([':', '/', '\\', '.', ' '], "_");
+        .map(sanitize_thread_name)
+        .unwrap_or_else(|| "unknown".into());
 
-    let buffer = Arc::new(Mutex::new(Vec::new()));
+    let buffer = Arc::new(Mutex::new(SnapshotBuffer::new(SNAPSHOT_SPILL_THRESHOLD)));
     SNAPSHOT_BUFFER.with(|cell| cell.set(Some(buffer.clone())));
+    *SHARED_SNAPSHOT_BUFFER
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap() = Some(buffer.clone());
     let _snapshot_mode_guard = SnapshotModeGuard::enter();
 
     run_sim(f);
 
     // Clear the buffer so it doesn't leak into subsequent tests on this thread.
     SNAPSHOT_BUFFER.with(|cell| cell.set(None));
+    *SHARED_SNAPSHOT_BUFFER
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap() = None;
 
-    let bytes = buffer.lock().unwrap().clone();
+    let bytes = {
+        let mut buffer = buffer.lock().unwrap();
+        buffer.flush().unwrap_or_else(|error| {
+            let source = buffer
+                .spill_path()
+                .map(|path| format!("disk spill file {}", path.display()))
+                .unwrap_or_else(|| "in-memory snapshot buffer".into());
+            panic!("failed to flush snapshot/tracing logs from {source}: {error}")
+        });
+        let spill_path = buffer.spill_path();
+        buffer.into_bytes().unwrap_or_else(|error| {
+            let source = spill_path
+                .map(|path| format!("disk spill file {}", path.display()))
+                .unwrap_or_else(|| "in-memory snapshot buffer".into());
+            format!("failed to collect snapshot logs from {source}: {error}").into_bytes()
+        })
+    };
     let logs = normalize_snapshot_logs(String::from_utf8_lossy(&bytes).into_owned());
 
     insta::with_settings!({prepend_module_to_snapshot => false}, {
@@ -393,66 +543,113 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for StdoutWriter {
     type Writer = StdoutWriterGuard;
 
     fn make_writer(&'a self) -> Self::Writer {
-        let active = !TRACING_DISABLED_DEPTH.with(|depth| depth.get() > 0);
-        StdoutWriterGuard { active }
+        StdoutWriterGuard
     }
 }
 
-struct StdoutWriterGuard {
-    active: bool,
-}
+struct StdoutWriterGuard;
 
 impl std::io::Write for StdoutWriterGuard {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        if self.active {
-            std::io::stderr().write(buf)
-        } else {
+        let active = !TRACING_DISABLED_DEPTH.with(|depth| depth.get() > 0);
+        if !active {
+            return Ok(buf.len());
+        }
+
+        let buffer =
+            SNAPSHOT_BUFFER.with(clone_thread_local_buffer).or_else(clone_shared_snapshot_buffer);
+        if let Some(buffer) = buffer {
+            buffer.lock().unwrap().write(buf)?;
             Ok(buf.len())
-        }
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        if self.active {
-            std::io::stderr().flush()
         } else {
-            Ok(())
+            std::io::stderr().write(buf)
         }
-    }
-}
-
-/// MakeWriter for the snapshot layer. Writes to the per-test SNAPSHOT_BUFFER
-/// thread-local when set, otherwise discards.
-struct ThreadLocalSnapshotWriter;
-
-impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for ThreadLocalSnapshotWriter {
-    type Writer = ThreadLocalSnapshotWriterGuard;
-
-    fn make_writer(&'a self) -> Self::Writer {
-        let buffer = SNAPSHOT_BUFFER.with(|cell| {
-            // SAFETY: we borrow the Option, clone the Arc if present, then put it back.
-            let opt = cell.take();
-            let cloned = opt.clone();
-            cell.set(opt);
-            cloned
-        });
-        ThreadLocalSnapshotWriterGuard { buffer }
-    }
-}
-
-struct ThreadLocalSnapshotWriterGuard {
-    buffer: Option<Arc<Mutex<Vec<u8>>>>,
-}
-
-impl std::io::Write for ThreadLocalSnapshotWriterGuard {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        if let Some(buffer) = &self.buffer {
-            buffer.lock().unwrap().extend_from_slice(buf);
-        }
-        Ok(buf.len())
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
+        let active = !TRACING_DISABLED_DEPTH.with(|depth| depth.get() > 0);
+        if !active {
+            return Ok(());
+        }
+
+        let buffer =
+            SNAPSHOT_BUFFER.with(clone_thread_local_buffer).or_else(clone_shared_snapshot_buffer);
+        if let Some(buffer) = buffer {
+            buffer.lock().unwrap().flush()
+        } else {
+            std::io::stderr().flush()
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{sanitize_thread_name, SnapshotBuffer, StdoutWriter, SNAPSHOT_BUFFER};
+    use std::{
+        io::Write as _,
+        sync::{Arc, Mutex},
+    };
+    use tracing_subscriber::fmt::MakeWriter as _;
+
+    #[test]
+    fn snapshot_buffer_stays_in_memory_below_threshold() {
+        let mut buffer = SnapshotBuffer::new(32);
+        buffer.write(b"hello").unwrap();
+        buffer.write(b" world").unwrap();
+
+        assert!(buffer.spill_path().is_none());
+        assert_eq!(buffer.into_bytes().unwrap(), b"hello world");
+    }
+
+    #[test]
+    fn snapshot_buffer_spills_to_disk_at_threshold() {
+        let mut buffer = SnapshotBuffer::new(8);
+        buffer.write(b"1234").unwrap();
+        buffer.write(b"5678").unwrap();
+        buffer.write(b"9").unwrap();
+
+        let spill_path = buffer.spill_path().expect("expected spill path");
+        assert!(spill_path.exists());
+        assert!(spill_path
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .contains(&sanitize_thread_name(
+                std::thread::current().name().unwrap_or("unnamed")
+            )));
+        assert_eq!(buffer.into_bytes().unwrap(), b"123456789");
+
+        std::fs::remove_file(spill_path).unwrap();
+    }
+
+    #[test]
+    fn stdout_writer_spills_to_disk_at_threshold() {
+        let buffer = Arc::new(Mutex::new(SnapshotBuffer::new(8)));
+        SNAPSHOT_BUFFER.with(|cell| cell.set(Some(buffer.clone())));
+
+        let mut writer = StdoutWriter.make_writer();
+        writer.write_all(b"1234").unwrap();
+        writer.write_all(b"5678").unwrap();
+        writer.write_all(b"9").unwrap();
+        writer.flush().unwrap();
+
+        SNAPSHOT_BUFFER.with(|cell| cell.set(None));
+
+        let mut buffer = buffer.lock().unwrap();
+        let spill_path = buffer.spill_path().expect("expected spill path");
+        assert!(spill_path.exists());
+        assert_eq!(buffer.into_bytes().unwrap(), b"123456789");
+
+        std::fs::remove_file(spill_path).unwrap();
+    }
+
+    #[test]
+    fn stdout_writer_falls_back_without_spill_buffer() {
+        SNAPSHOT_BUFFER.with(|cell| cell.set(None));
+
+        let mut writer = StdoutWriter.make_writer();
+        assert_eq!(writer.write(b"x").unwrap(), 1);
+        writer.flush().unwrap();
     }
 }
 
