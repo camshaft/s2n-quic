@@ -24,11 +24,7 @@ impl super::macros::InstantHandle for Handle {
     type Sleep = time::Sleep;
 
     fn new() -> Self {
-        let root = unsafe {
-            // SAFETY: bach stores durations
-            // TODO: add a `zero` method in bach
-            core::mem::transmute::<std::time::Duration, bach::time::Instant>(Duration::ZERO)
-        };
+        let root = Instant::zero();
         Self {
             root,
             cached_elapsed_nanos: Default::default(),

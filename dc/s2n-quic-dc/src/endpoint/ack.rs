@@ -249,12 +249,21 @@ pub(crate) fn process_ack<Clk, Rand>(
     // If the tx wheel entry is now stale (scheduling reason removed by the ACK), clear
     // target_time so the wheel treats it as expired on next tick rather than firing the
     // invariant. The assembler handles stale pops gracefully (produces zero segments).
-    #[allow(clippy::nonminimal_bool)]
-    if context.tx_wheel.is_scheduled()
-        && !context.has_pending_acks()
-        && !context.pto.probe_state.is_requested()
-        && !(context.has_pending_data() && context.can_send_pending_frames())
-    {
+    let mut should_clear_target_time = true;
+
+    // Only clear when there is a scheduled entry to clear.
+    should_clear_target_time &= context.tx_wheel.is_scheduled();
+
+    // Keep the target if ACKs are pending.
+    should_clear_target_time &= !context.has_pending_acks();
+
+    // Keep the target if PTO probes are requested.
+    should_clear_target_time &= !context.pto.probe_state.is_requested();
+
+    // Keep the target if there is pending data and we can send frames now.
+    should_clear_target_time &= !(context.has_pending_data() && context.can_send_pending_frames());
+
+    if should_clear_target_time {
         context.tx_wheel.target_time = None;
     }
 
