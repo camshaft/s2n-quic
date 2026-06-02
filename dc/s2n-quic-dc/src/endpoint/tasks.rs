@@ -1456,10 +1456,10 @@ where
     Map::new(completion_rx, move |mut entry: Entry<msg::Sender>| {
         let (key, recv_worker_id) = match &mut *entry {
             msg::Sender::ReceivedAck { payload, .. } => {
-                if ack_payload_pool.borrow().len() < ACK_PAYLOAD_POOL_CAPACITY {
-                    let mut reused = core::mem::take(payload);
-                    reused.clear();
-                    ack_payload_pool.borrow_mut().push(reused);
+                let mut pool = ack_payload_pool.borrow_mut();
+                if pool.len() < ACK_PAYLOAD_POOL_CAPACITY {
+                    let reused = core::mem::take(payload);
+                    pool.push(reused);
                 }
                 return;
             }

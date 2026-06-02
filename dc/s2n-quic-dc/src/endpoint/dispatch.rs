@@ -312,9 +312,7 @@ where
             .pop()
             .unwrap_or_else(|| BytesMut::with_capacity(decrypt_len));
         buf.clear();
-        if buf.capacity() < decrypt_len {
-            buf.reserve(decrypt_len - buf.capacity());
-        }
+        buf.reserve(decrypt_len.saturating_sub(buf.capacity()));
         let written = packet
             .decrypt_into(opener, bytes::BufMut::chunk_mut(&mut buf))
             .map_err(|err| {
