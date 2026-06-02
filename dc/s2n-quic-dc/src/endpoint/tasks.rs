@@ -1368,6 +1368,7 @@ pub fn packet_dispatch<
     recv_cache: Rc<RefCell<endpoint::recv::Cache>>,
     mut ack_burst_tx: AckBurstSender,
     mut idle_wheel_tx: IdleWheelSender,
+    ack_payload_pool: Rc<RefCell<Vec<bytes::BytesMut>>>,
     path_secret_map: crate::path::secret::Map,
     acceptor_registry: crate::acceptor::Registry<crate::stream::Stream>,
     mut frame_tx: frame::SubmissionSender,
@@ -1403,6 +1404,7 @@ where
                 &mut recv_cache.borrow_mut(),
                 &mut ack_burst_tx,
                 &mut idle_wheel_tx,
+                &ack_payload_pool,
                 &path_secret_map,
                 &mut acceptor_local,
                 &mut frame_tx,
@@ -1441,6 +1443,7 @@ pub fn waker_drain(drain: endpoint::waker::Drain) -> impl Receiver<()> {
 pub fn ack_completion<CompRx, AckTx>(
     completion_rx: CompRx,
     recv_cache: Rc<RefCell<endpoint::recv::Cache>>,
+    ack_payload_pool: Rc<RefCell<Vec<bytes::BytesMut>>>,
     mut ack_sender: AckTx,
     counters: Arc<endpoint::counters::Dispatch>,
 ) -> impl Receiver<()>
@@ -1448,8 +1451,18 @@ where
     CompRx: Receiver<Entry<msg::Sender>>,
     AckTx: UnboundedSender<Entry<msg::Sender>>,
 {
-    Map::new(completion_rx, move |entry: Entry<msg::Sender>| {
-        let (key, recv_worker_id) = match &*entry {
+    const ACK_PAYLOAD_POOL_CAPACITY: usize = 1024;
+
+    Map::new(completion_rx, move |mut entry: Entry<msg::Sender>| {
+        let (key, recv_worker_id) = match &mut *entry {
+            msg::Sender::ReceivedAck { payload, .. } => {
+                if ack_payload_pool.borrow().len() < ACK_PAYLOAD_POOL_CAPACITY {
+                    let mut reused = core::mem::take(payload);
+                    reused.clear();
+                    ack_payload_pool.borrow_mut().push(reused);
+                }
+                return;
+            }
             msg::Sender::PendingAck(submission) => (
                 endpoint::recv::Key {
                     id: *submission.path_secret_entry.id(),

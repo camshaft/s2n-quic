@@ -42,6 +42,7 @@ pub enum Sender {
     /// Inbound ACK from the peer — decoded payload drives loss detection and CCA updates.
     ReceivedAck {
         local_sender_id: LocalSenderId,
+        recv_worker_id: super::id::RecvDispatchWorkerId,
         path_secret_entry: Arc<PathSecretEntry>,
         payload: BytesMut,
         /// Wire-time ACK delay: time from when the largest acknowledged packet was received
@@ -94,7 +95,7 @@ impl Sender {
     #[inline]
     pub fn recv_worker_id(&self) -> Option<super::id::RecvDispatchWorkerId> {
         match self {
-            Self::ReceivedAck { .. } => None,
+            Self::ReceivedAck { recv_worker_id, .. } => Some(*recv_worker_id),
             Self::PendingAck(submission) => Some(submission.recv_worker_id),
             Self::PendingFreed { .. } => None,
         }

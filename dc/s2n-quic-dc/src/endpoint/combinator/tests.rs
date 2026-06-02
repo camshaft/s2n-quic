@@ -731,6 +731,7 @@ fn ack_processor_drops_message_with_out_of_range_sender_idx() {
             local_sender_id: crate::endpoint::id::LocalSenderId::new(
                 VarInt::new(OUT_OF_RANGE_SENDER_ID).expect("valid varint"),
             ),
+            recv_worker_id: crate::endpoint::id::RecvDispatchWorkerId::new(0),
             path_secret_entry,
             payload: BytesMut::new(),
             ack_delay: core::time::Duration::ZERO,

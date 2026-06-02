@@ -1139,7 +1139,14 @@ where
 
         let cache = match self.resolve_cache(sender_idx) {
             Some(cache) => cache.clone(),
-            None => return Poll::Ready(Some(None)),
+            None => {
+                if is_ack {
+                    let mut completions = Queue::new();
+                    completions.push_back(entry);
+                    let _ = self.ack_completions_tx.send(completions);
+                }
+                return Poll::Ready(Some(None));
+            }
         };
 
         let counters = cache.borrow().send_counters().clone();
@@ -1161,6 +1168,9 @@ where
 
                 let Some(ctx_rc) = ctx_rc else {
                     counters.on_received_ack_no_ctx();
+                    let mut completions = Queue::new();
+                    completions.push_back(entry);
+                    let _ = self.ack_completions_tx.send(completions);
                     return Poll::Ready(Some(None));
                 };
 
@@ -1187,6 +1197,9 @@ where
                     counters.on_lost(lost_queue.len() as u64);
                     let _ = self.frame_tx.send_batch(lost_queue);
                 }
+                let mut completions = Queue::new();
+                completions.push_back(entry);
+                let _ = self.ack_completions_tx.send(completions);
 
                 Some((ctx_rc, wheel_interest))
             }

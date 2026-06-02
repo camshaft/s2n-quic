@@ -1048,6 +1048,7 @@ where
                 let recv_cache = std::rc::Rc::new(std::cell::RefCell::new(
                     crate::stream::endpoint::recv::Cache::new(recv_dispatch_idx),
                 ));
+                let ack_payload_pool = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
                 let (ack_burst_tx, ack_burst_rx) =
                     crate::socket::channel::intrusive::unsync::new_with_adapter::<
                         crate::stream::endpoint::recv::AckBurstAdapter,
@@ -1098,6 +1099,7 @@ where
                     recv_cache.clone(),
                     ack_burst_tx,
                     recv_idle_wheel_tx,
+                    ack_payload_pool.clone(),
                     rd.path_secret_map,
                     rd.acceptor_registry,
                     rd.frame_tx,
@@ -1154,6 +1156,7 @@ where
                 let rx = tasks::ack_completion(
                     ack_completion_rx,
                     recv_cache.clone(),
+                    ack_payload_pool,
                     rd.ack_sender,
                     rd.counters.clone(),
                 );

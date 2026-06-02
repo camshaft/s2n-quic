@@ -232,6 +232,7 @@ pub(crate) fn process<Clk, Route>(
     recv_cache: &mut recv::Cache,
     ack_burst_tx: &mut impl channel::UnboundedSender<Rc<RefCell<recv::Context>>>,
     idle_wheel_tx: &mut impl channel::UnboundedSender<Rc<RefCell<recv::Context>>>,
+    ack_payload_pool: &Rc<RefCell<Vec<BytesMut>>>,
     path_secret_map: &PathSecretMap,
     acceptor_registry: &mut acceptor::LocalRegistry<Stream>,
     frame_tx: &mut SubmissionSender,
@@ -249,6 +250,7 @@ where
     Clk: s2n_quic_core::time::Clock + crate::time::precision::Clock + ?Sized,
     Route: routing::SenderRoute,
 {
+    let recv_worker_id = recv_cache.worker_id;
     let credentials = *packet.credentials();
     let packet_number = packet.packet_number();
     let routing_info = packet.routing_info();
@@ -305,7 +307,14 @@ where
         }
 
         // Slow path: allocate BytesMut, decrypt into it, dispatch frames later.
-        let mut buf = BytesMut::with_capacity(decrypt_len);
+        let mut buf = ack_payload_pool
+            .borrow_mut()
+            .pop()
+            .unwrap_or_else(|| BytesMut::with_capacity(decrypt_len));
+        buf.clear();
+        if buf.capacity() < decrypt_len {
+            buf.reserve(decrypt_len - buf.capacity());
+        }
         let written = packet
             .decrypt_into(opener, bytes::BufMut::chunk_mut(&mut buf))
             .map_err(|err| {
@@ -471,6 +480,7 @@ where
                 dispatch_decoded_frame(
                     header,
                     source_sender_id,
+                    recv_worker_id,
                     frame_payload,
                     &mut peer,
                     &credentials,
@@ -554,6 +564,7 @@ where
 fn dispatch_decoded_frame(
     header: Header,
     source_sender_id: VarInt,
+    recv_worker_id: crate::endpoint::id::RecvDispatchWorkerId,
     payload: BytesMut,
     peer: &mut recv::Context,
     credentials: &Credentials,
@@ -657,6 +668,7 @@ fn dispatch_decoded_frame(
             let ack_delay = Duration::from_micros(ack_delay_micros.as_u64());
             let message = msg::Sender::ReceivedAck {
                 local_sender_id: crate::endpoint::id::LocalSenderId::new(dest_sender_id),
+                recv_worker_id,
                 path_secret_entry: peer.path_entry.clone(),
                 payload,
                 ack_delay,

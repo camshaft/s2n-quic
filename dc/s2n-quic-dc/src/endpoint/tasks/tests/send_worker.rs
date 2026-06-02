@@ -89,6 +89,7 @@ fn send_ack_processor_ignores_invalid_sender_id() {
             let entry = test_entry();
             let _ = ack_tx.send(crate::intrusive::Entry::new(msg::Sender::ReceivedAck {
                 local_sender_id: crate::endpoint::id::LocalSenderId::new(VarInt::from_u8(3)),
+                recv_worker_id: crate::endpoint::id::RecvDispatchWorkerId::new(0),
                 path_secret_entry: entry,
                 payload: BytesMut::new(),
                 ack_delay: Duration::ZERO,

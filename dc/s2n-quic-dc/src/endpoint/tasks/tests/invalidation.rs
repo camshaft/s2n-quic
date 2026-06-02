@@ -307,8 +307,9 @@ fn ack_completion_after_recv_invalidation_does_not_resurrect_context() {
         let (sender, mut collected) = unsync::new::<crate::endpoint::msg::Sender>();
         let counters =
             crate::endpoint::counters::Dispatch::new(&crate::counter::Registry::default());
+        let ack_payload_pool = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
         let mut completion =
-            tasks::ack_completion(completion_rx, recv_cache.clone(), sender, counters);
+            tasks::ack_completion(completion_rx, recv_cache.clone(), ack_payload_pool, sender, counters);
 
         async move {
             invalidation.recv().await;

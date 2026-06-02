@@ -51,7 +51,8 @@ fn setup(
     let (sender, output_rx) = unsync::new::<msg::Sender>();
     let input = TestReceiver::new(entries);
     let counters = crate::endpoint::counters::Dispatch::new(&crate::counter::Registry::default());
-    let rx = tasks::ack_completion(input, cache, sender, counters);
+    let ack_payload_pool = Rc::new(RefCell::new(Vec::new()));
+    let rx = tasks::ack_completion(input, cache, ack_payload_pool, sender, counters);
     async move { rx.drain_budgeted(Some(32)).await }
         .primary()
         .spawn();
