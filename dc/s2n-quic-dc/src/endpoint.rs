@@ -227,15 +227,20 @@ pub struct Config {
     pub ups_dedup_window: core::time::Duration,
     /// Cooldown period during which new flows are rejected after a peer is marked dead.
     pub dead_peer_cooldown: core::time::Duration,
-    /// Number of descriptors to pre-allocate into each descriptor reuse pool at startup.
+    /// Number of descriptors to pre-allocate into each send descriptor reuse pool at startup.
     ///
-    /// Pre-warming the pool avoids hitting the system allocator on the first `N` sends or
-    /// receives. Both the send-side [`UnsyncReusePool`] (one per socket) and the recv-side
-    /// [`SyncReuseLocal`] (one per recv-IO worker) are seeded with this many descriptors.
+    /// Pre-warming avoids hitting the system allocator on the first `N` sends. Each send-side
+    /// [`UnsyncReusePool`] (one per socket) is seeded with this many descriptors.
     ///
     /// [`UnsyncReusePool`]: crate::socket::pool::UnsyncReusePool
+    pub initial_tx_descriptor_allocs: usize,
+    /// Number of descriptors to pre-allocate into each recv descriptor reuse pool at startup.
+    ///
+    /// Pre-warming avoids hitting the system allocator on the first `N` receives. Each recv-side
+    /// [`SyncReuseLocal`] (one per recv-IO worker) is seeded with this many descriptors.
+    ///
     /// [`SyncReuseLocal`]: crate::socket::pool::SyncReuseLocal
-    pub initial_descriptor_allocs: usize,
+    pub initial_rx_descriptor_allocs: usize,
 }
 
 // ── setup_endpoint ────────────────────────────────────────────────────────
@@ -372,7 +377,8 @@ where
         ups_dedup_capacity,
         ups_dedup_window,
         dead_peer_cooldown,
-        initial_descriptor_allocs,
+        initial_tx_descriptor_allocs,
+        initial_rx_descriptor_allocs,
     } = config;
 
     let clock = runtime.clock();
@@ -498,7 +504,7 @@ where
                 clock.clone(),
                 dead_peer_cooldown,
                 counter_registry.clone(),
-                initial_descriptor_allocs,
+                initial_rx_descriptor_allocs,
             )
         }));
         v
@@ -521,7 +527,7 @@ where
             pool: send_pool.clone(),
             clock: clock.clone(),
             per_socket_send_rate,
-            initial_descriptor_allocs,
+            initial_tx_descriptor_allocs,
         });
     }
 
@@ -798,7 +804,7 @@ pub(crate) struct SendSocketParts<Socket, Clk> {
     pool: crate::socket::pool::Pool,
     clock: Clk,
     per_socket_send_rate: crate::socket::rate::Rate,
-    initial_descriptor_allocs: usize,
+    initial_tx_descriptor_allocs: usize,
 }
 
 type PacketSender = GaugedSender<
@@ -892,8 +898,8 @@ struct Worker<SendSocket, RecvSocket, UpsSocket, Clk, AckSnd, Route, Inv> {
     waker_drain: Option<waker::Drain>,
     /// Background worker parts (invalidation validation).
     background: Option<BackgroundParts<UpsSocket>>,
-    /// Number of descriptors to pre-allocate into each reuse pool on startup.
-    initial_descriptor_allocs: usize,
+    /// Number of descriptors to pre-allocate into each recv reuse pool on startup.
+    initial_rx_descriptor_allocs: usize,
 }
 
 impl<SendSocket, RecvSocket, UpsSocket, Clk, AckSnd, Route, Inv>
@@ -915,7 +921,7 @@ where
         clock: Clk,
         dead_peer_cooldown: core::time::Duration,
         counter_registry: crate::counter::Registry,
-        initial_descriptor_allocs: usize,
+        initial_rx_descriptor_allocs: usize,
     ) -> Self {
         Self {
             id,
@@ -932,7 +938,7 @@ where
             recycle_pool: None,
             waker_drain: None,
             background: None,
-            initial_descriptor_allocs,
+            initial_rx_descriptor_allocs,
         }
     }
 
@@ -955,7 +961,7 @@ where
             recycle_pool,
             waker_drain,
             background,
-            initial_descriptor_allocs,
+            initial_rx_descriptor_allocs,
         } = self;
 
         runtime.spawn_local(id, move |mut local| {
@@ -1007,7 +1013,6 @@ where
                     sw.stream_clock,
                     sw.reader_metrics,
                     sw.writer_metrics,
-                    initial_descriptor_allocs,
                 );
             }
 
@@ -1017,7 +1022,7 @@ where
             if let (Some(recycle_pool), Some(first_socket)) =
                 (recycle_pool.as_mut(), recv_sockets.first())
             {
-                recycle_pool.prime(&first_socket.recv_pool, initial_descriptor_allocs);
+                recycle_pool.prime(&first_socket.recv_pool, initial_rx_descriptor_allocs);
             }
 
             // Spawn the recycle drain task if this worker has one.

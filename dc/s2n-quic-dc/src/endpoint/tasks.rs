@@ -205,7 +205,6 @@ pub fn send_worker<Socket, Clk, WakerSink, AckComp>(
     stream_clock: crate::time::DefaultClock,
     reader_metrics: Arc<crate::stream::metrics::ReaderMetrics>,
     writer_metrics: Arc<crate::stream::metrics::WriterMetrics>,
-    initial_descriptor_allocs: usize,
 ) where
     Socket: crate::socket::send::Socket + 'static,
     Clk: precision::Clock + s2n_quic_core::time::Clock + Clone + 'static,
@@ -666,7 +665,7 @@ pub fn send_worker<Socket, Clk, WakerSink, AckComp>(
             tx_wheel_tx,
             pto_wheel_tx,
             idle_wheel_tx,
-            st.initial_descriptor_allocs,
+            st.initial_tx_descriptor_allocs,
         );
         let variant = format!("send.{sender_idx}");
         let task_counter = counter_registry
@@ -1064,7 +1063,7 @@ pub fn send_socket_assembler<ImmediateRx, ContextRx, Clk, Socket, C, A, ImmW, Tx
     tx_wheel_tx: TxW,
     pto_wheel_tx: PtoW,
     idle_wheel_tx: IdleW,
-    initial_descriptor_allocs: usize,
+    initial_tx_descriptor_allocs: usize,
 ) -> impl Receiver<()>
 where
     ImmediateRx: Receiver<Rc<RefCell<send::Context>>>,
@@ -1091,7 +1090,7 @@ where
         freed_batch_tx,
         asm_counters,
         send_counters,
-        initial_descriptor_allocs,
+        initial_tx_descriptor_allocs,
     );
     let rx = send::WheelRouter::new(rx, immediate_tx, tx_wheel_tx, pto_wheel_tx, idle_wheel_tx);
     let rx = Flatten::new(rx);
