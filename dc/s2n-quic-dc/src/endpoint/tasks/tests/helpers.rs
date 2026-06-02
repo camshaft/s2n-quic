@@ -107,10 +107,12 @@ impl<T> Receiver<T> for TestReceiver<T> {
     fn on_consumed(&mut self, _bytes: u64) {}
 }
 
-pub fn entry_channel<T>() -> (
+pub type EntryChannelPair<T> = (
     EntryBoxSender<T, unsync::Sender<crate::intrusive::EntryAdapter<T>>>,
     unsync::Receiver<crate::intrusive::EntryAdapter<T>>,
-) {
+);
+
+pub fn entry_channel<T>() -> EntryChannelPair<T> {
     let (tx, rx) = unsync::new::<T>();
     (EntryBoxSender::new(tx), rx)
 }

@@ -442,9 +442,10 @@ fn builder_reader_model_test() {
 
                         // Read from builder using partial_copy_into with a limited dest
                         let mut dest = BytesMut::with_capacity(cap);
-                        let mut limited = dest.with_write_limit(cap);
-                        let chunk = builder.partial_copy_into(&mut limited).unwrap();
-                        drop(limited);
+                        let chunk = {
+                            let mut limited = dest.with_write_limit(cap);
+                            builder.partial_copy_into(&mut limited).unwrap()
+                        };
 
                         // The dest should have been filled up to capacity (or all data)
                         let expected_written = cap.min(oracle.len());

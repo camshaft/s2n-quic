@@ -388,6 +388,8 @@ pub mod inspector {
         sync::{Arc, Mutex},
     };
 
+    type FutureList = Arc<Mutex<Vec<Pin<Box<dyn Future<Output = ()> + 'static>>>>>;
+
     /// Inspector runtime for topology introspection.
     ///
     /// Spawned tasks are recorded without being executed.
@@ -395,7 +397,7 @@ pub mod inspector {
     pub struct Handle {
         worker_count: usize,
         clock: Clock,
-        futures: Arc<Mutex<Vec<Pin<Box<dyn Future<Output = ()> + 'static>>>>>,
+        futures: FutureList,
     }
 
     /// Simple clock for inspector runtime.
@@ -410,7 +412,7 @@ pub mod inspector {
 
     pub struct Local {
         worker_id: usize,
-        futures: Arc<Mutex<Vec<Pin<Box<dyn Future<Output = ()> + 'static>>>>>,
+        futures: FutureList,
     }
 
     #[derive(Clone, Copy)]
@@ -424,6 +426,7 @@ pub mod inspector {
     }
 
     impl Handle {
+        #[allow(clippy::arc_with_non_send_sync)]
         pub fn new(worker_count: usize) -> Self {
             Self {
                 worker_count: worker_count.max(1),

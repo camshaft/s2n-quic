@@ -418,7 +418,7 @@ impl<A: Adapter> List<A> {
     /// Push an entry to the back of the list
     pub fn push_back(&mut self, ptr: A::Pointer) {
         let raw = A::into_raw(ptr);
-        let new_tail = unsafe { NonNull::new_unchecked(raw as *mut A::Value) };
+        let new_tail = unsafe { NonNull::new_unchecked(raw) };
         let self_ref = unsafe { NonNull::new_unchecked(new_tail.as_ptr() as *mut ()) };
 
         unsafe {
@@ -452,7 +452,7 @@ impl<A: Adapter> List<A> {
     /// Push an entry to the front of the list
     pub fn push_front(&mut self, ptr: A::Pointer) {
         let raw = A::into_raw(ptr);
-        let new_head = unsafe { NonNull::new_unchecked(raw as *mut A::Value) };
+        let new_head = unsafe { NonNull::new_unchecked(raw) };
         let self_ref = unsafe { NonNull::new_unchecked(new_head.as_ptr() as *mut ()) };
 
         unsafe {
@@ -569,8 +569,8 @@ impl<A: Adapter> List<A> {
         let prev = prev_raw.map(|p| NonNull::new_unchecked(p.as_ptr() as *mut A::Value));
         let next = next_raw.map(|p| NonNull::new_unchecked(p.as_ptr() as *mut A::Value));
 
-        let is_head = prev.map_or(false, |p| p == node);
-        let is_tail = next.map_or(false, |p| p == node);
+        let is_head = prev == Some(node);
+        let is_tail = next == Some(node);
 
         match (is_head, is_tail) {
             (true, true) => {
@@ -1249,6 +1249,7 @@ mod tests {
         }
     }
 
+    #[allow(clippy::arc_with_non_send_sync)]
     fn arc_node(value: u64) -> std::sync::Arc<ArcNode> {
         std::sync::Arc::new(ArcNode {
             links: Links::new(),

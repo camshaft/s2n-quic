@@ -99,6 +99,12 @@ impl Pool {
     }
 }
 
+impl Default for UnsyncReusePool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl UnsyncReusePool {
     #[inline]
     pub fn new() -> Self {
@@ -121,6 +127,12 @@ impl UnsyncReusePool {
             .pop_back()
             .map(|recycled| Unfilled::<UnsyncRecycler>::from_recycled(recycled.into_descriptor()))
             .or_else(|| pool.alloc_with_recycler(&self.recycle_weak))
+    }
+}
+
+impl Default for SyncReusePool {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -182,6 +194,7 @@ impl SyncReuseHandle {
         pool.alloc_with_recycler(&self.recycle_weak)
     }
 
+    #[cfg(test)]
     #[inline]
     pub(crate) fn local_pool(&self) -> Rc<RefCell<List<RecycleAdapter<SyncRecycler>>>> {
         self.local_pool.clone()

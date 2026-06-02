@@ -1292,6 +1292,7 @@ impl Inner {
             };
 
             let is_resuming = self.pending_chunk_index > 0;
+            #[allow(clippy::nonminimal_bool)]
             if !is_resuming && !(is_first && force_first) && (remote_budget as usize) < segment_size
             {
                 break;

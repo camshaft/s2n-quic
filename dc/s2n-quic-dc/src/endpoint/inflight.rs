@@ -294,21 +294,16 @@ impl Map {
         let mut frames = Queue::new();
         let mut discarded_bytes: usize = 0;
 
-        loop {
-            match self.inner.remove(pn) {
-                Some(packet) => {
-                    self.inflight_gauge.dequeue();
-                    if let Some(tx_info) = &packet.transmission_info {
-                        discarded_bytes += tx_info.sent_bytes as usize;
-                    }
-                    if let Some(next_pn) = packet.probed_to {
-                        pn = next_pn;
-                    } else {
-                        frames = packet.frames;
-                        break;
-                    }
-                }
-                None => break,
+        while let Some(packet) = self.inner.remove(pn) {
+            self.inflight_gauge.dequeue();
+            if let Some(tx_info) = &packet.transmission_info {
+                discarded_bytes += tx_info.sent_bytes as usize;
+            }
+            if let Some(next_pn) = packet.probed_to {
+                pn = next_pn;
+            } else {
+                frames = packet.frames;
+                break;
             }
         }
 

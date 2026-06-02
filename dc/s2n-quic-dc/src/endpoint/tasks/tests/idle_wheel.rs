@@ -25,13 +25,15 @@ use std::{cell::RefCell, rc::Rc};
 
 // ── Send idle wheel tests ────────────────────────────────────────────────────
 
-fn setup_send() -> (
+type SetupSendResult = (
     IdMap<LocalSendSocketId, Rc<RefCell<send::Cache>>>,
     unsync::Sender<send::IdleWheelAdapter>,
     unsync::Receiver<crate::intrusive::EntryAdapter<Frame>>,
     Clock,
     crate::counter::Registry,
-) {
+);
+
+fn setup_send() -> SetupSendResult {
     let registry = crate::counter::Registry::default();
     let clock = Clock::default();
     let send_caches: IdMap<LocalSendSocketId, _> = vec![Rc::new(RefCell::new(send::Cache::new(

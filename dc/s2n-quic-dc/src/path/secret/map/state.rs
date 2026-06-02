@@ -947,9 +947,7 @@ where
         packet: &control::QueueReset,
         out: &mut [u8],
     ) -> Option<usize> {
-        let Some(entry) = self.ids.get(packet.credentials.id) else {
-            return None;
-        };
+        let entry = self.ids.get(packet.credentials.id)?;
         let len = packet.encode(s2n_codec::EncoderBuffer::new(out), &entry.control_sealer());
         Some(len)
     }

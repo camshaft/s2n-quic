@@ -106,6 +106,7 @@ impl Meta {
 
     /// Combine this metadata with storage to create a Packet
     #[inline]
+    #[allow(clippy::result_large_err)]
     pub fn with_storage<S: storage::Bytes>(self, storage: S) -> Result<Packet<S>, (Self, S)> {
         Packet::from_parts(self, storage)
     }
@@ -255,6 +256,7 @@ impl<S: storage::Bytes> Packet<S> {
 
     /// Create a packet from metadata and storage, validating that the storage is compatible
     #[inline]
+    #[allow(clippy::result_large_err)]
     pub fn from_parts(meta: Meta, storage: S) -> Result<Self, (Meta, S)> {
         // Validate storage by attempting to get the ranges
         // This will panic in debug mode if ranges are invalid
@@ -310,6 +312,7 @@ impl<S: storage::Bytes> Packet<S> {
 
     /// Replace the storage with a new one, validating that it's still valid for the ranges
     #[inline]
+    #[allow(clippy::result_large_err)]
     pub fn replace_storage<S2: storage::Bytes>(
         self,
         new_storage: S2,

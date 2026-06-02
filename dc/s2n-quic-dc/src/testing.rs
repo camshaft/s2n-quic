@@ -10,9 +10,11 @@ use s2n_quic::{provider::tls::Provider, server::Name};
 use s2n_quic_core::{crypto::tls::testing::certificates, time::StdClock};
 use std::{
     cell::Cell,
-    sync::{atomic::AtomicUsize, OnceLock},
+    sync::OnceLock,
     time::Duration,
 };
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
 
 #[cfg(any(test, feature = "testing"))]
 use std::sync::{Arc, Mutex};
@@ -80,6 +82,7 @@ thread_local! {
     static SNAPSHOT_BUFFER: Cell<Option<Arc<Mutex<Vec<u8>>>>> = const { Cell::new(None) };
 }
 
+#[cfg(test)]
 static SNAPSHOT_MODE_DEPTH: AtomicUsize = AtomicUsize::new(0);
 
 struct TracingDisabledGuard;

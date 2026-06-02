@@ -170,7 +170,6 @@ impl DroppedPackets {
             // ── Client ────────────────────────────────────────────────────────
             {
                 let end_time = end_time_inner.clone();
-                let acceptor_id = acceptor_id;
                 async move {
                     let mut client = Client::new();
                     let stream = client
@@ -206,7 +205,6 @@ impl DroppedPackets {
 
             // ── Server ────────────────────────────────────────────────────────
             {
-                let acceptor_id = acceptor_id;
                 async move {
                     let server = Server::new();
                     let mut acceptor = server
@@ -945,7 +943,6 @@ fn symmetric_5tuple_routing() {
 
         // Server: validate and echo back.
         {
-            let acceptor_id = acceptor_id;
             async move {
                 let server = Server::new();
                 let mut acceptor = server

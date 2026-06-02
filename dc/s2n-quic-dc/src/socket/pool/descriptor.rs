@@ -66,7 +66,7 @@ unsafe impl Recycler for SyncRecycler {
     #[inline]
     unsafe fn try_push(&self, recycled: Recycled<Self>) -> Result<(), Recycled<Self>> {
         if let Some(shared) = self.0.upgrade() {
-            shared.push(recycled).map_err(|r| r)
+            shared.push(recycled)
         } else {
             Err(recycled)
         }
@@ -96,7 +96,7 @@ unsafe impl Recycler for UnsyncRecycler {
     unsafe fn try_push(&self, recycled: Recycled<Self>) -> Result<(), Recycled<Self>> {
         if let Some(shared) = self.0.upgrade() {
             // SAFETY: `UnsyncRecycler` is `!Send`; all access is on the same thread.
-            shared.push_recycled(recycled).map_err(|r| r)
+            shared.push_recycled(recycled)
         } else {
             Err(recycled)
         }
@@ -727,9 +727,7 @@ impl<R: Recycler> Filled<R> {
     /// and copying the payload bytes. This is safe because the copy gets its own
     /// exclusive memory region.
     pub fn deep_copy(&self) -> Option<Self> {
-        let Some(unfilled) = Unfilled::<R>::new(self.len) else {
-            return None;
-        };
+        let unfilled = Unfilled::<R>::new(self.len)?;
         let payload = self.payload();
         let result = unfilled.fill_with(|addr, _cmsg, mut iov| {
             iov[..payload.len()].copy_from_slice(payload);

@@ -31,6 +31,11 @@ pub struct Config {
     pub recv_buffer: usize,
 }
 
+type BusyPollSockets = (
+    Vec<GsoSocket<BusyPoll<std::net::UdpSocket>>>,
+    Vec<BusyPoll<std::net::UdpSocket>>,
+);
+
 impl Config {
     pub fn new(
         bind_addrs: Vec<BindAddress>,
@@ -138,12 +143,7 @@ impl Config {
         Ok((send_sockets, recv_sockets))
     }
 
-    pub fn busy_poll(
-        &self,
-    ) -> io::Result<(
-        Vec<GsoSocket<BusyPoll<std::net::UdpSocket>>>,
-        Vec<BusyPoll<std::net::UdpSocket>>,
-    )> {
+    pub fn busy_poll(&self) -> io::Result<BusyPollSockets> {
         let (send_sockets, recv_sockets) = self.create()?;
         let send_sockets = send_sockets
             .into_iter()
