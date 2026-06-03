@@ -33,6 +33,20 @@ mod tests;
 
 pub type ApplicationData = Arc<dyn Any + Send + Sync>;
 
+/// Inputs to the `make_application_data` callback (registered via
+/// [`super::Map`]). Bundled in a `#[non_exhaustive]` struct so additional
+/// context (e.g. cert chain, endpoint type) can be added later without
+/// breaking the callback signature.
+///
+/// `peer_info` is the remote peer's `DcPeerInfo` transport-parameter bytes,
+/// available here so application-level negotiation can run once at handshake
+/// time and store its result as the connection's [`ApplicationData`].
+#[non_exhaustive]
+pub struct ApplicationDataRequest<'a> {
+    pub tls: &'a dyn s2n_quic_core::crypto::tls::TlsSession,
+    pub peer_info: Option<&'a bytes::Bytes>,
+}
+
 pub const MAX_PEER_DATA_ADDRS: usize = 128;
 
 pub type PeerDataAddrs = tokio::sync::SetOnce<Arc<[s2n_quic_core::inet::SocketAddressV6]>>;

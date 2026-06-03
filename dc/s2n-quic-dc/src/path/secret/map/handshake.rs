@@ -138,7 +138,11 @@ impl HandshakingPathInner {
         &mut self,
         session: &impl s2n_quic_core::crypto::tls::TlsSession,
     ) -> Result<Vec<s2n_quic_core::stateless_reset::Token>, s2n_quic_core::transport::Error> {
-        match self.map.store.application_data(session) {
+        let request = super::ApplicationDataRequest {
+            tls: session,
+            peer_info: self.peer_info.as_ref(),
+        };
+        match self.map.store.application_data(request) {
             Ok(application_data) => {
                 self.application_data = application_data;
             }

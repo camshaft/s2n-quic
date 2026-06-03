@@ -47,8 +47,8 @@ use store::Store;
 #[cfg(any(test, feature = "testing"))]
 pub use entry::TestEntryBuilder;
 pub use entry::{
-    ApplicationData, ApplicationDataError, ApplicationPair, Bidirectional, ControlPair,
-    PeerDataAddrs, MAX_PEER_DATA_ADDRS,
+    ApplicationData, ApplicationDataError, ApplicationDataRequest, ApplicationPair, Bidirectional,
+    ControlPair, PeerDataAddrs, MAX_PEER_DATA_ADDRS,
 };
 pub use handshake::HandshakingPath;
 pub use peer::Peer;
@@ -157,14 +157,6 @@ impl Map {
         cb: Box<dyn Fn(SocketAddr, HandshakeReason) -> Option<JoinHandle<()>> + Send + Sync>,
     ) {
         self.store.register_request_handshake(cb);
-    }
-
-    /// Register a callback that fires when a dc handshake completes.
-    pub fn register_on_handshake_complete(
-        &self,
-        cb: Box<dyn Fn(&std::sync::Arc<Entry>) + Send + Sync>,
-    ) {
-        self.store.register_on_handshake_complete(cb);
     }
 
     /// Set the local peer info bytes for the DcPeerInfo transport parameter.
@@ -537,7 +529,7 @@ impl Map {
         &self,
         cb: Box<
             dyn Fn(
-                    &dyn s2n_quic_core::crypto::tls::TlsSession,
+                    ApplicationDataRequest,
                 ) -> Result<Option<ApplicationData>, ApplicationDataError>
                 + Send
                 + Sync,

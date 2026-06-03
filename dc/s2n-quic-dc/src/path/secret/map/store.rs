@@ -93,8 +93,6 @@ pub trait Store: 'static + Send + Sync + time::Clock {
         cb: Box<dyn Fn(SocketAddr, HandshakeReason) -> Option<JoinHandle<()>> + Send + Sync>,
     );
 
-    fn register_on_handshake_complete(&self, cb: Box<dyn Fn(&Arc<Entry>) + Send + Sync>);
-
     fn check_dedup(
         &self,
         entry: &Entry,
@@ -175,7 +173,7 @@ pub trait Store: 'static + Send + Sync + time::Clock {
         &self,
         cb: Box<
             dyn Fn(
-                    &dyn s2n_quic_core::crypto::tls::TlsSession,
+                    super::ApplicationDataRequest,
                 ) -> Result<Option<ApplicationData>, ApplicationDataError>
                 + Send
                 + Sync,
@@ -184,7 +182,7 @@ pub trait Store: 'static + Send + Sync + time::Clock {
 
     fn application_data(
         &self,
-        session: &dyn s2n_quic_core::crypto::tls::TlsSession,
+        request: super::ApplicationDataRequest,
     ) -> Result<Option<ApplicationData>, ApplicationDataError>;
 
     #[cfg(test)]
