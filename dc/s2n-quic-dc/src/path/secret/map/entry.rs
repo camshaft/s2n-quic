@@ -184,6 +184,7 @@ impl Entry {
         parameters: dc::ApplicationParams,
         creation_time: Timestamp,
         application_data: Option<ApplicationData>,
+        peer_info: Option<bytes::Bytes>,
     ) -> Self {
         Self::new_with_socket_senders(
             peer,
@@ -193,10 +194,12 @@ impl Entry {
             parameters,
             creation_time,
             application_data,
+            peer_info,
             1,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn new_with_socket_senders(
         peer: SocketAddr,
         secret: schedule::Secret,
@@ -205,6 +208,7 @@ impl Entry {
         parameters: dc::ApplicationParams,
         creation_time: Timestamp,
         application_data: Option<ApplicationData>,
+        peer_info: Option<bytes::Bytes>,
         socket_sender_count: usize,
     ) -> Self {
         // clamp max datagram size to a well-known value
@@ -234,7 +238,7 @@ impl Entry {
             parameters,
             accessed: AtomicU8::new(0),
             application_data,
-            peer_info: None,
+            peer_info,
             last_activity: AtomicU64::new(0),
             dead_at: AtomicI64::new(-1),
             peer_data_addrs: PeerDataAddrs::default(),
@@ -605,19 +609,10 @@ impl Entry {
         &self.application_data
     }
 
-    /// Returns the remote peer's PeerInfo bytes.
+    /// Returns the remote peer's PeerInfo bytes (the inbound DcPeerInfo
+    /// transport parameter), captured at construction time.
     pub fn peer_info(&self) -> Option<&bytes::Bytes> {
         self.peer_info.as_ref()
-    }
-
-    pub fn set_peer_info(&mut self, peer_info: Option<bytes::Bytes>) {
-        tracing::debug!(
-            target: "dc_negotiation",
-            peer = %self.peer,
-            len = peer_info.as_ref().map_or(0, |b| b.len()),
-            "set_peer_info: received remote DcPeerInfo transport parameter"
-        );
-        self.peer_info = peer_info;
     }
 
     #[cfg(test)]
@@ -635,6 +630,8 @@ pub struct TestEntryBuilder<'a> {
     generation: u64,
     params: Option<dc::ApplicationParams>,
     signer: Option<&'a super::stateless_reset::Signer>,
+    application_data: Option<ApplicationData>,
+    peer_info: Option<bytes::Bytes>,
 }
 
 #[cfg(any(test, feature = "testing"))]
@@ -648,7 +645,23 @@ impl<'a> TestEntryBuilder<'a> {
             generation: 0,
             params: None,
             signer: None,
+            application_data: None,
+            peer_info: None,
         }
+    }
+
+    /// Set the `application_data` the built `Entry` will carry (as the
+    /// `make_application_data` hook would produce at handshake time).
+    pub fn application_data(mut self, application_data: Option<ApplicationData>) -> Self {
+        self.application_data = application_data;
+        self
+    }
+
+    /// Set the remote peer's `peer_info` bytes (the inbound DcPeerInfo
+    /// transport parameter) the built `Entry` will carry.
+    pub fn peer_info(mut self, peer_info: Option<bytes::Bytes>) -> Self {
+        self.peer_info = peer_info;
+        self
     }
 
     pub fn local(mut self, addr: SocketAddr) -> Self {
@@ -723,7 +736,8 @@ impl<'a> TestEntryBuilder<'a> {
             receiver::State::new(),
             params,
             crate::time::DefaultClock::default().now().into(),
-            None,
+            self.application_data.clone(),
+            self.peer_info.clone(),
             self.socket_sender_count,
         ))
     }

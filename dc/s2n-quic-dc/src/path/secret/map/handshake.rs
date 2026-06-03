@@ -102,8 +102,8 @@ impl dc::Endpoint for Map {
         }
     }
 
-    fn local_peer_info(&self) -> Option<bytes::Bytes> {
-        self.get_local_peer_info()
+    fn advertised_peer_info(&self) -> Option<bytes::Bytes> {
+        self.advertised_peer_info()
     }
 }
 
@@ -201,7 +201,7 @@ impl HandshakingPathInner {
         let receiver = receiver::State::new();
         let socket_sender_count = self.map.store.socket_sender_count();
 
-        let mut entry = Entry::new_with_socket_senders(
+        let entry = Entry::new_with_socket_senders(
             self.peer,
             self.secret
                 .take()
@@ -211,10 +211,11 @@ impl HandshakingPathInner {
             self.parameters.clone(),
             self.map.store.get_time(),
             self.application_data.take(),
+            // The remote peer's DcPeerInfo transport parameter, captured on the
+            // path when the handshake began.
+            self.peer_info.take(),
             socket_sender_count,
         );
-        // Set peer_info from the remote peer's DcPeerInfo transport parameter
-        entry.set_peer_info(self.peer_info.take());
         let entry = Arc::new(entry);
         self.entry = Some(entry.clone());
         self.map.store.on_new_path_secrets(entry);

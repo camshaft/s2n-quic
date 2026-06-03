@@ -70,9 +70,11 @@ pub(crate) use status::Dedup;
 #[derive(Clone)]
 pub struct Map {
     store: Arc<dyn Store>,
-    /// Local peer info bytes to be sent as a QUIC transport parameter.
-    /// Set once before the Map is used for connections; never changes after that.
-    local_peer_info: Arc<std::sync::OnceLock<bytes::Bytes>>,
+    /// The local `DcPeerInfo` payload this endpoint advertises to peers (sent as
+    /// the outbound QUIC transport parameter). Distinct from the *inbound*
+    /// `Entry::peer_info`, which is what a remote peer advertised to us. Set
+    /// once before the Map is used for connections; never changes after that.
+    advertised_peer_info: Arc<std::sync::OnceLock<bytes::Bytes>>,
 }
 
 impl PartialEq for Map {
@@ -116,7 +118,7 @@ impl Map {
 
         Self {
             store,
-            local_peer_info: Arc::new(std::sync::OnceLock::new()),
+            advertised_peer_info: Arc::new(std::sync::OnceLock::new()),
         }
     }
 
@@ -159,19 +161,20 @@ impl Map {
         self.store.register_request_handshake(cb);
     }
 
-    /// Set the local peer info bytes for the DcPeerInfo transport parameter.
-    pub fn set_local_peer_info(&self, bytes: bytes::Bytes) {
+    /// Set the local `DcPeerInfo` payload this endpoint advertises to peers
+    /// (the outbound QUIC transport parameter).
+    pub fn set_advertised_peer_info(&self, bytes: bytes::Bytes) {
         tracing::debug!(
             target: "dc_negotiation",
             len = bytes.len(),
-            "set_local_peer_info: stamping local DcPeerInfo transport parameter"
+            "set_advertised_peer_info: stamping local DcPeerInfo transport parameter"
         );
-        let _ = self.local_peer_info.set(bytes);
+        let _ = self.advertised_peer_info.set(bytes);
     }
 
-    /// Get a clone of the stored local peer info bytes.
-    pub fn get_local_peer_info(&self) -> Option<bytes::Bytes> {
-        self.local_peer_info.get().cloned()
+    /// Get a clone of the local `DcPeerInfo` payload advertised to peers.
+    pub fn advertised_peer_info(&self) -> Option<bytes::Bytes> {
+        self.advertised_peer_info.get().cloned()
     }
 
     /// Gets the [`Peer`] entry for the given address
@@ -397,6 +400,7 @@ impl Map {
                 dc::testing::TEST_APPLICATION_PARAMS,
                 crate::time::DefaultClock::default().now().into(),
                 None,
+                None,
             );
             let entry = Arc::new(entry);
             provider.store.test_insert(entry);
@@ -528,9 +532,7 @@ impl Map {
     pub fn register_make_application_data(
         &self,
         cb: Box<
-            dyn Fn(
-                    ApplicationDataRequest,
-                ) -> Result<Option<ApplicationData>, ApplicationDataError>
+            dyn Fn(ApplicationDataRequest) -> Result<Option<ApplicationData>, ApplicationDataError>
                 + Send
                 + Sync,
         >,

@@ -27,6 +27,7 @@ fn test_entry_with_senders(sender_count: usize) -> Entry {
         s2n_quic_core::dc::testing::TEST_APPLICATION_PARAMS,
         crate::time::DefaultClock::default().now().into(),
         None,
+        None,
         sender_count,
     )
 }
