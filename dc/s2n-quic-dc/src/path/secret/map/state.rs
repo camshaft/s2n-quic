@@ -449,7 +449,7 @@ where
     >,
 
     /// Callback fired when a dc handshake completes and the Entry is ready.
-    /// Used by Membrain to trigger application-level negotiation (PeerInfo exchange).
+    /// Optionally used by the application to implement service negotiation.
     #[allow(clippy::type_complexity)]
     on_handshake_complete_cb: RwLock<Option<Box<dyn Fn(&Arc<Entry>) + Send + Sync>>>,
 }
