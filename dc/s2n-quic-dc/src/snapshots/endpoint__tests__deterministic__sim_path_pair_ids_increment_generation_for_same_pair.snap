@@ -8,19 +8,23 @@ expression: logs
 0:00:00.000000000 [main] DEBUG s2n_quic_dc: peer_address=10.0.0.2:2222 credential_id=[96, 18, 210, 113, 247, 218, 16, 86, 217, 206, 5, 46, 13, 118, 60, 117]
 0:00:00.000000000 [main] DEBUG s2n_quic_dc: acquire=1µs duration=1µs
 0:00:00.000000000 [main] DEBUG s2n_quic_dc: peer_address=10.0.0.2:2222 credential_id=[96, 18, 210, 113, 247, 218, 16, 86, 217, 206, 5, 46, 13, 118, 60, 117]
+0:00:00.000000000 [main] DEBUG on_handshake_complete: no negotiation callback registered peer=10.0.0.2:2222
 0:00:00.000000000 [main] DEBUG s2n_quic_dc: acquire=1µs duration=1µs
 0:00:00.000000000 [main] DEBUG s2n_quic_dc: peer_address=10.0.0.1:1111 credential_id=[224, 18, 210, 113, 247, 218, 16, 86, 217, 206, 5, 46, 13, 118, 60, 117]
 0:00:00.000000000 [main] DEBUG s2n_quic_dc: acquire=1µs duration=1µs
 0:00:00.000000000 [main] DEBUG s2n_quic_dc: peer_address=10.0.0.1:1111 credential_id=[224, 18, 210, 113, 247, 218, 16, 86, 217, 206, 5, 46, 13, 118, 60, 117]
+0:00:00.000000000 [main] DEBUG on_handshake_complete: no negotiation callback registered peer=10.0.0.1:1111
 0:00:00.000000000 [main] DEBUG s2n_quic_dc: acquire=1µs duration=1µs
 0:00:00.000000000 [main] DEBUG s2n_quic_dc: peer_address=10.0.0.2:2222 credential_id=[46, 222, 167, 129, 198, 46, 82, 228, 245, 21, 117, 173, 73, 131, 124, 77]
 0:00:00.000000000 [main] DEBUG s2n_quic_dc: acquire=1µs duration=1µs
 0:00:00.000000000 [main] DEBUG s2n_quic_dc: peer_address=10.0.0.2:2222 new_credential_id=[46, 222, 167, 129, 198, 46, 82, 228, 245, 21, 117, 173, 73, 131, 124, 77] previous_credential_id=[96, 18, 210, 113, 247, 218, 16, 86, 217, 206, 5, 46, 13, 118, 60, 117]
 0:00:00.000000000 [main] DEBUG s2n_quic_dc: peer_address=10.0.0.2:2222 credential_id=[46, 222, 167, 129, 198, 46, 82, 228, 245, 21, 117, 173, 73, 131, 124, 77]
+0:00:00.000000000 [main] DEBUG on_handshake_complete: no negotiation callback registered peer=10.0.0.2:2222
 0:00:00.000000000 [main] DEBUG s2n_quic_dc: acquire=1µs duration=1µs
 0:00:00.000000000 [main] DEBUG s2n_quic_dc: peer_address=10.0.0.1:1111 credential_id=[174, 222, 167, 129, 198, 46, 82, 228, 245, 21, 117, 173, 73, 131, 124, 77]
 0:00:00.000000000 [main] DEBUG s2n_quic_dc: acquire=1µs duration=1µs
 0:00:00.000000000 [main] DEBUG s2n_quic_dc: peer_address=10.0.0.1:1111 new_credential_id=[174, 222, 167, 129, 198, 46, 82, 228, 245, 21, 117, 173, 73, 131, 124, 77] previous_credential_id=[224, 18, 210, 113, 247, 218, 16, 86, 217, 206, 5, 46, 13, 118, 60, 117]
 0:00:00.000000000 [main] DEBUG s2n_quic_dc: peer_address=10.0.0.1:1111 credential_id=[174, 222, 167, 129, 198, 46, 82, 228, 245, 21, 117, 173, 73, 131, 124, 77]
+0:00:00.000000000 [main] DEBUG on_handshake_complete: no negotiation callback registered peer=10.0.0.1:1111
 0:00:00.000000000 [main] DEBUG s2n_quic_dc: capacity=1024 entries=2 lifetime=1µs
 0:00:00.000000000 [main] DEBUG s2n_quic_dc: capacity=1024 entries=2 lifetime=1µs

@@ -58,6 +58,10 @@ pub struct Entry {
     // maps while not having two writes and wasting an extra byte of space.
     accessed: AtomicU8,
     application_data: Option<ApplicationData>,
+    /// Opaque peer info bytes received from the remote peer via the DcPeerInfo
+    /// transport parameter during the QUIC TLS handshake. Used for application-level
+    /// negotiation (service discovery and RPC version negotiation).
+    peer_info: Option<bytes::Bytes>,
     last_activity: AtomicU64,
     dead_at: AtomicI64,
     /// The peer's data recv addresses, learned via the post-handshake exchange.
@@ -101,6 +105,7 @@ impl SizeOf for Entry {
             parameters,
             accessed,
             application_data,
+            peer_info,
             last_activity,
             dead_at,
             peer_data_addrs,
@@ -116,6 +121,7 @@ impl SizeOf for Entry {
             + parameters.size()
             + accessed.size()
             + application_data.size()
+            + peer_info.as_ref().map_or(0, |b| b.len())
             + last_activity.size()
             + dead_at.size()
             + std::mem::size_of::<PeerDataAddrs>()
@@ -214,6 +220,7 @@ impl Entry {
             parameters,
             accessed: AtomicU8::new(0),
             application_data,
+            peer_info: None,
             last_activity: AtomicU64::new(0),
             dead_at: AtomicI64::new(-1),
             peer_data_addrs: PeerDataAddrs::default(),
@@ -582,6 +589,21 @@ impl Entry {
 
     pub fn application_data(&self) -> &Option<ApplicationData> {
         &self.application_data
+    }
+
+    /// Returns the remote peer's PeerInfo bytes.
+    pub fn peer_info(&self) -> Option<&bytes::Bytes> {
+        self.peer_info.as_ref()
+    }
+
+    pub fn set_peer_info(&mut self, peer_info: Option<bytes::Bytes>) {
+        tracing::debug!(
+            target: "dc_negotiation",
+            peer = %self.peer,
+            len = peer_info.as_ref().map_or(0, |b| b.len()),
+            "set_peer_info: received remote DcPeerInfo transport parameter"
+        );
+        self.peer_info = peer_info;
     }
 
     #[cfg(test)]

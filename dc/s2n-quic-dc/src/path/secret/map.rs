@@ -70,6 +70,9 @@ pub(crate) use status::Dedup;
 #[derive(Clone)]
 pub struct Map {
     store: Arc<dyn Store>,
+    /// Local peer info bytes to be sent as a QUIC transport parameter.
+    /// Set once before the Map is used for connections; never changes after that.
+    local_peer_info: Arc<std::sync::OnceLock<bytes::Bytes>>,
 }
 
 impl PartialEq for Map {
@@ -111,7 +114,10 @@ impl Map {
             .build()
             .unwrap();
 
-        Self { store }
+        Self {
+            store,
+            local_peer_info: Arc::new(std::sync::OnceLock::new()),
+        }
     }
 
     /// The number of trusted secrets.
@@ -151,6 +157,29 @@ impl Map {
         cb: Box<dyn Fn(SocketAddr, HandshakeReason) -> Option<JoinHandle<()>> + Send + Sync>,
     ) {
         self.store.register_request_handshake(cb);
+    }
+
+    /// Register a callback that fires when a dc handshake completes.
+    pub fn register_on_handshake_complete(
+        &self,
+        cb: Box<dyn Fn(&std::sync::Arc<Entry>) + Send + Sync>,
+    ) {
+        self.store.register_on_handshake_complete(cb);
+    }
+
+    /// Set the local peer info bytes for the DcPeerInfo transport parameter.
+    pub fn set_local_peer_info(&self, bytes: bytes::Bytes) {
+        tracing::debug!(
+            target: "dc_negotiation",
+            len = bytes.len(),
+            "set_local_peer_info: stamping local DcPeerInfo transport parameter"
+        );
+        let _ = self.local_peer_info.set(bytes);
+    }
+
+    /// Get a clone of the stored local peer info bytes.
+    pub fn get_local_peer_info(&self) -> Option<bytes::Bytes> {
+        self.local_peer_info.get().cloned()
     }
 
     /// Gets the [`Peer`] entry for the given address

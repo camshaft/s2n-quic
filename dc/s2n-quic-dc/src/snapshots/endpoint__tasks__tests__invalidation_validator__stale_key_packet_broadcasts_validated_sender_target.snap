@@ -8,10 +8,12 @@ expression: logs
 0:00:00.000000000 [main] DEBUG s2n_quic_dc: peer_address=127.0.0.1:6666 credential_id=[40, 119, 117, 27, 96, 119, 52, 74, 73, 75, 49, 123, 247, 174, 31, 92]
 0:00:00.000000000 [main] DEBUG s2n_quic_dc: acquire=1µs duration=1µs
 0:00:00.000000000 [main] DEBUG s2n_quic_dc: peer_address=127.0.0.1:6666 credential_id=[40, 119, 117, 27, 96, 119, 52, 74, 73, 75, 49, 123, 247, 174, 31, 92]
+0:00:00.000000000 [main] DEBUG on_handshake_complete: no negotiation callback registered peer=127.0.0.1:6666
 0:00:00.000000000 [main] DEBUG s2n_quic_dc: acquire=1µs duration=1µs
 0:00:00.000000000 [main] DEBUG s2n_quic_dc: peer_address=127.0.0.1:3333 credential_id=[168, 119, 117, 27, 96, 119, 52, 74, 73, 75, 49, 123, 247, 174, 31, 92]
 0:00:00.000000000 [main] DEBUG s2n_quic_dc: acquire=1µs duration=1µs
 0:00:00.000000000 [main] DEBUG s2n_quic_dc: peer_address=127.0.0.1:3333 credential_id=[168, 119, 117, 27, 96, 119, 52, 74, 73, 75, 49, 123, 247, 174, 31, 92]
+0:00:00.000000000 [main] DEBUG on_handshake_complete: no negotiation callback registered peer=127.0.0.1:3333
 0:00:00.000000000 [main] DEBUG s2n_quic_dc: capacity=16 entries=1 lifetime=1µs
 0:00:00.000000000 [main] DEBUG s2n_quic_dc: peer_address=127.0.0.1:6666 credential_id=[168, 119, 117, 27, 96, 119, 52, 74, 73, 75, 49, 123, 247, 174, 31, 92]
 0:00:00.000000000 [main] DEBUG s2n_quic_dc: peer_address=127.0.0.1:6666 credential_id=[168, 119, 117, 27, 96, 119, 52, 74, 73, 75, 49, 123, 247, 174, 31, 92]

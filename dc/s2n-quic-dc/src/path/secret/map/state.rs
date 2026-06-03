@@ -447,6 +447,11 @@ where
             >,
         >,
     >,
+
+    /// Callback fired when a dc handshake completes and the Entry is ready.
+    /// Used by Membrain to trigger application-level negotiation (PeerInfo exchange).
+    #[allow(clippy::type_complexity)]
+    on_handshake_complete_cb: RwLock<Option<Box<dyn Fn(&Arc<Entry>) + Send + Sync>>>,
 }
 
 // FIXME: Avoid the whole socket.
@@ -550,6 +555,7 @@ where
             subscriber,
             request_handshake: RwLock::new(None),
             mk_application_data: RwLock::new(None),
+            on_handshake_complete_cb: RwLock::new(None),
         };
 
         // Growing to double our maximum inserted entries should ensure that we never grow again, see:
@@ -657,6 +663,15 @@ where
         // FIXME: Maybe panic if already initialized?
         *self
             .request_handshake
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = Some(cb);
+    }
+
+    /// Register a callback that fires when a dc handshake completes.
+    /// The callback receives the completed Entry (which contains peer_info).
+    pub fn register_on_handshake_complete(&self, cb: Box<dyn Fn(&Arc<Entry>) + Send + Sync>) {
+        *self
+            .on_handshake_complete_cb
             .write()
             .unwrap_or_else(|e| e.into_inner()) = Some(cb);
     }
@@ -828,6 +843,27 @@ where
                 peer_address: SocketAddress::from(peer).into_event(),
                 credential_id: id.into_event(),
             });
+
+        // Fire the registered on_handshake_complete callback
+        if let Some(cb) = &*self
+            .on_handshake_complete_cb
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+        {
+            tracing::debug!(
+                target: "dc_negotiation",
+                peer = %peer,
+                peer_info_len = entry.peer_info().map_or(0, |b| b.len()),
+                "on_handshake_complete: invoking registered negotiation callback"
+            );
+            (cb)(&entry);
+        } else {
+            tracing::debug!(
+                target: "dc_negotiation",
+                peer = %peer,
+                "on_handshake_complete: no negotiation callback registered"
+            );
+        }
     }
 
     fn register_request_handshake(
@@ -835,6 +871,10 @@ where
         cb: Box<dyn Fn(SocketAddr, HandshakeReason) -> Option<JoinHandle<()>> + Send + Sync>,
     ) {
         self.register_request_handshake(cb);
+    }
+
+    fn register_on_handshake_complete(&self, cb: Box<dyn Fn(&Arc<Entry>) + Send + Sync>) {
+        self.register_on_handshake_complete(cb);
     }
 
     #[allow(clippy::type_complexity)]

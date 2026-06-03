@@ -31,6 +31,8 @@ struct HandshakingPathInner {
     secret: Option<schedule::Secret>,
     entry: Option<Arc<Entry>>,
     application_data: Option<ApplicationData>,
+    /// Remote peer's PeerInfo bytes from the DcPeerInfo transport parameter.
+    peer_info: Option<bytes::Bytes>,
     map: Map,
 
     error: Option<Box<dyn Error + Send + Sync>>,
@@ -43,6 +45,8 @@ impl HandshakingPath {
             event::api::EndpointType::Client { .. } => endpoint::Type::Client,
         };
 
+        let peer_info = connection_info.peer_info.clone();
+
         HandshakingPath {
             inner: Arc::new(Mutex::new(HandshakingPathInner {
                 peer: connection_info.remote_address.clone().into(),
@@ -52,6 +56,7 @@ impl HandshakingPath {
                 secret: None,
                 entry: None,
                 application_data: None,
+                peer_info,
                 map,
                 error: None,
             })),
@@ -95,6 +100,10 @@ impl dc::Endpoint for Map {
             }
             Err(_) => false,
         }
+    }
+
+    fn local_peer_info(&self) -> Option<bytes::Bytes> {
+        self.get_local_peer_info()
     }
 }
 
@@ -188,7 +197,7 @@ impl HandshakingPathInner {
         let receiver = receiver::State::new();
         let socket_sender_count = self.map.store.socket_sender_count();
 
-        let entry = Entry::new_with_socket_senders(
+        let mut entry = Entry::new_with_socket_senders(
             self.peer,
             self.secret
                 .take()
@@ -200,6 +209,8 @@ impl HandshakingPathInner {
             self.application_data.take(),
             socket_sender_count,
         );
+        // Set peer_info from the remote peer's DcPeerInfo transport parameter
+        entry.set_peer_info(self.peer_info.take());
         let entry = Arc::new(entry);
         self.entry = Some(entry.clone());
         self.map.store.on_new_path_secrets(entry);
