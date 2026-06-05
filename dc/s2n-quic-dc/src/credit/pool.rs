@@ -122,12 +122,13 @@ impl Pool {
 
     /// Return credits to the pool and distribute to waiting streams.
     ///
-    /// Walks tiers high→low priority. At each tier, accumulates that tier's
-    /// `carry` into the budget and grants as many waiters as `min_grant` allows.
-    /// If a tier still has unserved waiters, the remaining budget is stashed in
-    /// that tier's `carry` and we return — lower-priority tiers wait for the
-    /// next release cycle. If we walk all tiers without finding waiters, leftover
-    /// is deposited into `available` for the fast path.
+    /// Walks tiers high→low priority. The carry from prior under-distributed
+    /// releases is pulled into the budget at the start. Each tier with waiters
+    /// gets as many grants as `min_grant` allows. If a tier still has unserved
+    /// waiters, the remaining budget is stashed back in the global carry and
+    /// we return — lower-priority tiers wait for the next release cycle.
+    /// If we walk all tiers without finding waiters, leftover is deposited
+    /// into `available` for the fast path.
     ///
     /// Critical property: the fast path only sees `available`. `available`
     /// receives credits only after we've confirmed there are no waiters
@@ -135,6 +136,8 @@ impl Pool {
     ///
     /// Wakers and dead slots are deferred via `UnboundedSender`s for the caller
     /// to drain after this returns — neither is processed under any tier lock.
+    /// (`UnboundedSender::send` may itself wake or drop, which we don't want
+    /// running under the tier mutex.)
     pub fn release<W, D>(&self, n: u64, wakers: &mut W, dead: &mut D)
     where
         W: UnboundedSender<Waker>,
@@ -144,8 +147,10 @@ impl Pool {
             return;
         }
 
-        // Pull any previously-stashed carry into our budget.
-        let mut budget = n.saturating_add(self.carry.swap(0, Ordering::AcqRel));
+        // Pull any previously-stashed carry into our budget. Clamp to i64::MAX
+        // since `available` is i64 and we'll eventually cast for fetch_add.
+        let pulled = self.carry.swap(0, Ordering::AcqRel);
+        let mut budget = n.saturating_add(pulled).min(i64::MAX as u64);
 
         for tier_mutex in &self.tiers {
             let mut tier = tier_mutex.lock();
@@ -185,12 +190,14 @@ impl Pool {
                 }
             }
 
-            // If this tier still has waiters, the remaining budget belongs to
+            let still_has_waiters = !tier.is_empty();
+            drop(tier);
+
+            // If this tier still had waiters, the remaining budget belongs to
             // them. Stash globally so the next release picks it up. We do NOT
             // continue to lower-priority tiers while higher-priority waiters
             // are unserved.
-            if !tier.is_empty() {
-                drop(tier);
+            if still_has_waiters {
                 self.carry.fetch_add(budget, Ordering::Release);
                 return;
             }

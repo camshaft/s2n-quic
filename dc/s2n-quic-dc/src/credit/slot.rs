@@ -128,23 +128,40 @@ impl Slot {
     /// the slot back to the application.
     ///
     /// Returns the waker to be called after releasing the mutex.
-    /// Returns `None` if the slot is dead (app abandoned it).
+    /// Returns `None` if the slot is dead (app abandoned it concurrently).
+    ///
+    /// Uses CAS so the grant only succeeds if the slot is still LINKED — if
+    /// the app raced and stored DEAD, this returns None and the pool treats
+    /// the slot as abandoned.
     ///
     /// # Safety
     ///
     /// Must be called while holding the tier mutex, after popping from the list.
     #[inline]
     pub unsafe fn grant(&self, amount: u64) -> Option<Waker> {
-        let rc = self.refcount.load(Ordering::Relaxed);
-        match rc {
-            RC_LINKED => {
-                *self.granted.get() = amount;
-                let waker = (*self.waker.get()).take();
-                self.refcount.store(RC_APP, Ordering::Release);
-                waker
+        // Speculatively write the grant fields. If the CAS fails (app abandoned),
+        // these writes are observable to nobody — the app already dropped its
+        // reference and won't read these fields, and the pool's `DeadSlot::drop`
+        // will free the allocation.
+        *self.granted.get() = amount;
+        let waker = (*self.waker.get()).take();
+
+        // Try to transition LINKED → APP. If the app raced and set DEAD, the
+        // CAS fails and we return None so the pool can free the allocation.
+        match self.refcount.compare_exchange(
+            RC_LINKED,
+            RC_APP,
+            Ordering::Release,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => waker,
+            Err(rc) => {
+                debug_assert_eq!(rc, RC_DEAD, "unexpected refcount {rc} in grant");
+                // App abandoned. Drop the waker we took (it would never be
+                // useful). The pool will free the slot.
+                drop(waker);
+                None
             }
-            RC_DEAD => None,
-            _ => unreachable!("unexpected refcount {rc} in grant"),
         }
     }
 
@@ -166,17 +183,38 @@ impl Slot {
 
     /// Abandon the slot from the application side while linked.
     ///
-    /// After this call, the pool is responsible for freeing the memory
-    /// via `drop_fn` when it eventually pops this entry.
+    /// Returns `Ok(())` if the slot was successfully marked DEAD — the pool
+    /// will free the allocation when it next pops this entry.
+    ///
+    /// Returns `Err(granted)` if the pool concurrently granted credits — the
+    /// caller must perform an idle-state cleanup (free the allocation itself
+    /// since the pool has already released ownership). The returned `granted`
+    /// value indicates how much was granted (which the caller might want to
+    /// release back to the pool).
     ///
     /// # Safety
     ///
-    /// Must only be called when refcount=2 (slot is linked). The caller
-    /// must NOT access any fields after this call.
+    /// Must only be called from the application side while the slot is in the
+    /// LINKED or APP state. The caller must NOT access any non-thread-safe
+    /// fields after a successful abandon (Ok return).
     #[inline]
-    pub unsafe fn abandon(&self) {
-        debug_assert_eq!(self.refcount.load(Ordering::Relaxed), RC_LINKED);
-        self.refcount.store(RC_DEAD, Ordering::Release);
+    pub unsafe fn abandon(&self) -> Result<(), u64> {
+        // Try to transition LINKED → DEAD. If the pool already transitioned
+        // to APP (granted), the CAS fails and we report the grant amount.
+        match self.refcount.compare_exchange(
+            RC_LINKED,
+            RC_DEAD,
+            Ordering::Release,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => Ok(()),
+            Err(rc) => {
+                debug_assert_eq!(rc, RC_APP, "unexpected refcount {rc} in abandon");
+                // Pool granted just before we abandoned. Read the grant; the
+                // caller now owns the allocation outright.
+                Err(*self.granted.get())
+            }
+        }
     }
 
     /// Call the stored drop function to free the outer allocation.
@@ -245,22 +283,31 @@ impl Drop for SlotPtr {
     fn drop(&mut self) {
         unsafe {
             let slot = &*self.0.as_ptr();
-            let rc = slot.refcount.load(Ordering::Relaxed);
-            match rc {
-                RC_LINKED => {
-                    // Pool is shutting down. Signal closure to the app.
-                    *slot.granted.get() = GRANT_CLOSED;
-                    let waker = (*slot.waker.get()).take();
-                    slot.refcount.store(RC_APP, Ordering::Release);
+
+            // Speculatively write the closed sentinel. The CAS below decides
+            // whether this write survives.
+            *slot.granted.get() = GRANT_CLOSED;
+            let waker = (*slot.waker.get()).take();
+
+            // Try to transition LINKED → APP, signalling closure. If the app
+            // raced and abandoned, the CAS fails (rc was DEAD) and we own
+            // the allocation.
+            match slot.refcount.compare_exchange(
+                RC_LINKED,
+                RC_APP,
+                Ordering::Release,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
                     if let Some(w) = waker {
                         w.wake();
                     }
                 }
-                RC_DEAD => {
-                    // App already abandoned. Free the allocation.
+                Err(rc) => {
+                    debug_assert_eq!(rc, RC_DEAD, "unexpected refcount {rc} in SlotPtr::drop");
+                    drop(waker);
                     Slot::call_drop_fn(self.0);
                 }
-                _ => unreachable!("unexpected refcount {rc} in SlotPtr::drop"),
             }
         }
     }

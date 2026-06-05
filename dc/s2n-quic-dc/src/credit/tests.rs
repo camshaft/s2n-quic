@@ -295,7 +295,7 @@ fn drop_while_linked() {
 
     // Simulate app dropping while linked
     let slot = unsafe { &*slot_ptr.as_ptr() };
-    unsafe { slot.abandon() };
+    unsafe { slot.abandon().expect("slot was linked") };
 
     // Pool releases — encounters dead slot, pushes to dead queue
     let mut dead = DeadSlotQueue::new();
@@ -413,7 +413,7 @@ fn dead_entry_skipped_in_distribution() {
     let result = unsafe { pool.poll_acquire(&mut cx2, slot2, 10, Priority::Medium) };
     assert!(matches!(result, Poll::Pending));
 
-    unsafe { (*slot1.as_ptr()).abandon() };
+    unsafe { (*slot1.as_ptr()).abandon().expect("slot was linked") };
 
     let mut dead = DeadSlotQueue::new();
     pool.release(20, &mut InlineWakeSender, &mut dead);
@@ -449,7 +449,7 @@ fn mixed_alive_and_dead_in_distribution() {
         assert!(matches!(result, Poll::Pending));
     }
 
-    unsafe { (*slots[2].as_ptr()).abandon() };
+    unsafe { (*slots[2].as_ptr()).abandon().expect("slot was linked") };
 
     DROP_COUNT.store(0, Ordering::Relaxed);
     let mut dead = DeadSlotQueue::new();
