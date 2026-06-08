@@ -1,10 +1,13 @@
 // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::credit::{
-    AbandonResult, Config, DeadSlotQueue, Distributor, GrantResult, Pool, Priority, Slot,
+use crate::{
+    credit::{
+        AbandonResult, Config, DeadSlotQueue, Distributor, GrantResult, Pool, Priority, Slot,
+    },
+    intrusive::Queue,
+    socket::channel::{Budget, UnboundedSender},
 };
-use crate::socket::channel::{Budget, UnboundedSender};
 use std::{
     alloc::{self, Layout},
     ptr::NonNull,
@@ -77,12 +80,15 @@ impl Wake for WakeCounter {
     }
 }
 
-/// Waker sender that immediately wakes (mirrors the grant path delivering a waker).
+/// Waker sender that immediately wakes every waker in the batch (mirrors a downstream that
+/// drains and delivers the wakers).
 struct InlineWakeSender;
 
-impl UnboundedSender<Waker> for InlineWakeSender {
-    fn send(&mut self, waker: Waker) -> Result<(), Waker> {
-        waker.wake();
+impl UnboundedSender<Queue<Waker>> for InlineWakeSender {
+    fn send(&mut self, mut batch: Queue<Waker>) -> Result<(), Queue<Waker>> {
+        while let Some(entry) = batch.pop_front() {
+            entry.into_inner().wake();
+        }
         Ok(())
     }
 }
@@ -132,17 +138,12 @@ impl Harness {
         self.pool.release(n);
     }
 
-    /// Run the distributor to quiescence, returning the dead-slot queue it produced (dropping the
-    /// queue frees those allocations).
-    fn distribute(&mut self) -> DeadSlotQueue {
-        let mut cx = Context::from_waker(&self.dist_waker);
+    /// Run the distributor to quiescence. Dead slots are freed when poll_distribute returns.
+    fn distribute(&mut self) {
+        self.dist.pool.waker.register(&self.dist_waker);
         let mut budget = Budget::new(1 << 20);
         let mut wakers = InlineWakeSender;
-        let mut dead = DeadSlotQueue::new();
-        let _ = self
-            .dist
-            .poll_distribute(&mut cx, &mut budget, &mut wakers, &mut dead);
-        dead
+        let _ = self.dist.poll_distribute(&mut budget, &mut wakers);
     }
 }
 
@@ -187,8 +188,7 @@ fn fast_path_exhaustion_parks() {
 
     // Returning the missing 10 lets the distributor grant the full 20.
     h.release(10);
-    let dead = h.distribute();
-    assert!(dead.is_empty());
+    h.distribute();
     assert_eq!(counter.wakeups(), 1);
 
     let slot_ref = unsafe { &*slot.as_ptr() };
@@ -212,9 +212,8 @@ fn park_and_grant() {
     assert!(matches!(result, Poll::Pending));
 
     h.release(10);
-    let dead = h.distribute();
+    h.distribute();
     assert_eq!(counter.wakeups(), 1);
-    assert!(dead.is_empty());
 
     let slot_ref = unsafe { &*slot.as_ptr() };
     assert_eq!(slot_ref.poll_granted(), GrantResult::Granted(10));
@@ -240,7 +239,7 @@ fn full_grants_to_multiple_waiters() {
     }
 
     h.release(60);
-    let _dead = h.distribute();
+    h.distribute();
 
     for c in &counters {
         assert_eq!(c.wakeups(), 1);
@@ -274,7 +273,7 @@ fn partial_budget_serves_priority_prefix() {
     }
 
     h.release(50);
-    let _dead = h.distribute();
+    h.distribute();
 
     assert_eq!(counters[0].wakeups(), 1);
     assert_eq!(counters[1].wakeups(), 1);
@@ -288,7 +287,7 @@ fn partial_budget_serves_priority_prefix() {
 
     // Releasing the remaining 10 serves the third on the next pass.
     h.release(10);
-    let _dead = h.distribute();
+    h.distribute();
     assert_eq!(counters[2].wakeups(), 1);
 
     for slot in slots {
@@ -312,7 +311,7 @@ fn grant_is_exactly_requested_surplus_to_fast_path() {
     assert!(matches!(result, Poll::Pending));
 
     h.release(1000);
-    let _dead = h.distribute();
+    h.distribute();
 
     let slot_ref = unsafe { &*slot.as_ptr() };
     assert_eq!(slot_ref.poll_granted(), GrantResult::Granted(10));
@@ -349,7 +348,7 @@ fn spurious_wake_then_grant() {
     assert_eq!(slot_ref.poll_granted(), GrantResult::Pending);
 
     h.release(100);
-    let _dead = h.distribute();
+    h.distribute();
     // Requested 50 → granted exactly 50; the other 50 is surplus.
     assert_eq!(slot_ref.poll_granted(), GrantResult::Granted(50));
     assert_eq!(h.pool.debug_available(), 50);
@@ -380,12 +379,12 @@ fn priority_ordering() {
 
     // Only enough for one grant: strict priority gives it to the high tier.
     h.release(10);
-    let _dead = h.distribute();
+    h.distribute();
     assert_eq!(high_counter.wakeups(), 1);
     assert_eq!(low_counter.wakeups(), 0);
 
     h.release(10);
-    let _dead = h.distribute();
+    h.distribute();
     assert_eq!(low_counter.wakeups(), 1);
 
     unsafe {
@@ -414,14 +413,10 @@ fn drop_while_linked() {
     let slot_ref = unsafe { &*slot.as_ptr() };
     assert_eq!(unsafe { slot_ref.abandon() }, AbandonResult::Abandoned);
 
-    // The distributor reaps the dead slot; nothing is granted.
+    // The distributor reaps and frees the dead slot inline; nothing is granted.
     h.release(10);
-    let dead = h.distribute();
+    h.distribute();
     assert_eq!(counter.wakeups(), 0);
-    assert!(!dead.is_empty());
-
-    // Dropping the dead queue frees the slot.
-    drop(dead);
     assert_eq!(DROP_COUNT.load(Ordering::Relaxed), 1);
 }
 
@@ -459,15 +454,15 @@ fn dead_entry_skipped_in_distribution() {
     let result = unsafe { h.poll_acquire(slot2, 10, Priority::Medium, &waker2) };
     assert!(matches!(result, Poll::Pending));
 
-    assert_eq!(unsafe { (*slot1.as_ptr()).abandon() }, AbandonResult::Abandoned);
+    assert_eq!(
+        unsafe { (*slot1.as_ptr()).abandon() },
+        AbandonResult::Abandoned
+    );
 
     h.release(20);
-    let dead = h.distribute();
+    h.distribute();
     assert_eq!(counter1.wakeups(), 0);
     assert_eq!(counter2.wakeups(), 1);
-    assert!(!dead.is_empty());
-
-    drop(dead);
     assert_eq!(DROP_COUNT.load(Ordering::Relaxed), 1);
 
     let slot2_ref = unsafe { &*slot2.as_ptr() };
@@ -493,13 +488,15 @@ fn mixed_alive_and_dead_in_distribution() {
         assert!(matches!(result, Poll::Pending));
     }
 
-    assert_eq!(unsafe { (*slots[2].as_ptr()).abandon() }, AbandonResult::Abandoned);
+    assert_eq!(
+        unsafe { (*slots[2].as_ptr()).abandon() },
+        AbandonResult::Abandoned
+    );
 
     DROP_COUNT.store(0, Ordering::Relaxed);
     h.release(150);
-    let dead = h.distribute();
+    h.distribute();
 
-    drop(dead);
     assert_eq!(DROP_COUNT.load(Ordering::Relaxed), 1);
 
     for i in [0, 1, 3, 4] {
@@ -561,14 +558,14 @@ fn newcomer_cannot_snipe_parked_waiter() {
     assert!(matches!(result, Poll::Pending), "newcomer must not snipe");
 
     // The distributor serves the original waiter.
-    let _dead = h.distribute();
+    h.distribute();
     assert_eq!(counter.wakeups(), 1);
     let slot_ref = unsafe { &*slot.as_ptr() };
     assert_eq!(slot_ref.poll_granted(), GrantResult::Granted(10));
 
     // Clean up: serve the newcomer too so we can free it.
     h.release(1);
-    let _dead = h.distribute();
+    h.distribute();
     assert_eq!(nc_counter.wakeups(), 1);
 
     unsafe {
@@ -624,7 +621,10 @@ fn abandon_then_pool_drop_frees_dead_slot() {
         assert!(matches!(result, Poll::Pending));
 
         // Abandon while linked, then drop the pool without ever distributing.
-        assert_eq!(unsafe { (*slot.as_ptr()).abandon() }, AbandonResult::Abandoned);
+        assert_eq!(
+            unsafe { (*slot.as_ptr()).abandon() },
+            AbandonResult::Abandoned
+        );
     }
 
     // The DEAD slot was freed by the shutdown close path, and never woken.
@@ -656,7 +656,7 @@ fn split_credit_no_longer_strands() {
 
     // A's bytes complete and are returned.
     h.release(50);
-    let _dead = h.distribute();
+    h.distribute();
 
     // B is served its full 60.
     assert_eq!(b_counter.wakeups(), 1);
@@ -692,12 +692,11 @@ fn second_refill_drains_fresh_arrivals_behind_cached_head() {
     // First pass with no credit: the distributor refills the mirror with A, finds it unaffordable
     // (free = 0, req = 5), and breaks. A is now cached in the mirror across passes.
     let mut budget = Budget::new(1 << 20);
-    let mut sink = InlineWakeSender;
+    let mut pending = Queue::<Waker>::new();
     let mut dead = DeadSlotQueue::new();
-    let progressed = h.dist.pass(&mut budget, &mut sink, &mut dead);
+    let progressed = h.dist.pass(&mut budget, &mut pending, &mut dead);
     assert!(!progressed);
     assert_eq!(counters[0].wakeups(), 0);
-    drop(dead);
 
     // B and C park behind A. Because A is in the mirror, B and C go straight to the shared tier.
     let r = unsafe { h.poll_acquire(slots[1], 5, Priority::Medium, &wakers[1]) };
@@ -712,14 +711,22 @@ fn second_refill_drains_fresh_arrivals_behind_cached_head() {
     // shared tier, then grants B and C. Without the second refill, only A would be served and
     // B/C would have to wait for another pass.
     let mut budget = Budget::new(1 << 20);
-    let mut sink = InlineWakeSender;
+    let mut pending = Queue::<Waker>::new();
     let mut dead = DeadSlotQueue::new();
-    let progressed = h.dist.pass(&mut budget, &mut sink, &mut dead);
+    let progressed = h.dist.pass(&mut budget, &mut pending, &mut dead);
     assert!(progressed);
-    drop(dead);
+
+    // Deliver the wakers that this single pass staged; a real run would flush them to the waker
+    // channel at end-of-poll, but the test drives `pass` directly.
+    let mut sink = InlineWakeSender;
+    let _ = sink.send(pending);
 
     for (i, counter) in counters.iter().enumerate() {
-        assert_eq!(counter.wakeups(), 1, "waiter {i} not served in a single pass");
+        assert_eq!(
+            counter.wakeups(),
+            1,
+            "waiter {i} not served in a single pass"
+        );
         let slot_ref = unsafe { &*slots[i].as_ptr() };
         assert_eq!(slot_ref.poll_granted(), GrantResult::Granted(5));
     }
@@ -749,7 +756,7 @@ fn concurrent_release_halves_serve_waiter() {
     // Two independent half-releases (sub-threshold individually).
     h.release(5);
     h.release(5);
-    let _dead = h.distribute();
+    h.distribute();
 
     assert_eq!(counter.wakeups(), 1);
     let slot_ref = unsafe { &*slot.as_ptr() };

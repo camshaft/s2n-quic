@@ -44,11 +44,11 @@
 
 use super::{
     config::Config,
-    slot::{DeadSlot, Slot, SlotAdapter, SlotPtr},
+    slot::{DeadSlot, DeadSlotQueue, Slot, SlotAdapter, SlotPtr},
     waker::TaskWaker,
 };
 use crate::{
-    intrusive::List,
+    intrusive::{Entry, List, Queue},
     socket::channel::{Budget, UnboundedSender},
     sync::{lock, Arc, AtomicI64, AtomicU64, Mutex, Ordering},
 };
@@ -196,9 +196,9 @@ impl Pool {
 
 /// The single owner of all credit distribution.
 ///
-/// Holds the task-local mirror (one list per priority) and an [`Arc`] to the shared [`Pool`]. The
-/// eventual integration spawns one of these as a task; the [`Distributor::poll_distribute`] core is
-/// exposed directly so tests can drive it synchronously.
+/// Holds the task-local mirror (one list per priority) and an [`Arc`] to the shared [`Pool`]. Run
+/// it as a task with [`Distributor::distribute`]; the future registers the distributor's waker on
+/// the pool once and yields cooperatively under a budget.
 ///
 /// On drop, the mirror lists drop, which closes (writes `GRANT_CLOSED` and wakes) any waiters the
 /// distributor was holding — the distributor-owned half of the shutdown path. Slots still in the
@@ -228,49 +228,93 @@ impl Distributor {
         self.paid_demand
     }
 
-    /// Run bounded distribution passes until quiescent or the budget is exhausted.
+    /// Drive the distributor as an async task.
     ///
-    /// Registers the distributor's waker first (lost-wakeup discipline), then loops passes while
-    /// each makes progress and budget remains. When a pass makes no progress, returns
-    /// `Poll::Pending` cleanly; when budget runs out with work remaining, sets `needs_wake` so the
-    /// outer drain re-polls (yielding to other tasks). Work per poll is bounded by the budget,
-    /// regardless of backlog size or `release`-during-pass churn.
-    ///
-    /// `wakers` receives the [`Waker`] of every granted slot and `dead` receives every abandoned
-    /// slot; both are drained by the caller **after** this returns — neither is touched under a tier
-    /// lock (sending may itself wake or free, which must not run under the lock).
-    pub fn poll_distribute<W, D>(
-        &mut self,
-        cx: &mut Context<'_>,
-        budget: &mut Budget,
-        wakers: &mut W,
-        dead: &mut D,
-    ) -> Poll<()>
+    /// `budget` bounds the work per poll; the future yields when the budget is exhausted and
+    /// re-arms via the standard `take_needs_wake` self-wake. `wakers_tx` receives one
+    /// [`Queue<Waker>`] batch per poll cycle holding every slot the distributor woke during that
+    /// cycle — empty cycles do not send. The future never resolves; drop the task to shut down.
+    pub async fn distribute<W>(mut self, mut budget: Budget, mut wakers_tx: W)
     where
-        W: UnboundedSender<Waker>,
-        D: UnboundedSender<DeadSlot>,
+        W: UnboundedSender<Queue<Waker>>,
     {
-        self.pool.waker.register(cx.waker());
+        // Register exactly once on the first poll. Subsequent polls keep the registered waker —
+        // the steady-state loop below never touches it.
+        core::future::poll_fn(|cx| {
+            self.pool.waker.register(cx.waker());
+            Poll::Ready(())
+        })
+        .await;
 
-        loop {
-            let progressed = self.pass(budget, wakers, dead);
+        core::future::poll_fn(move |cx| {
+            budget.reset();
+            let _ = self.poll_distribute(&mut budget, &mut wakers_tx);
+            // poll_distribute always returns Pending (it loops until quiescent); honor the
+            // standard budget-exhausted self-wake.
+            if budget.take_needs_wake() {
+                cx.waker().wake_by_ref();
+            }
+            Poll::Pending
+        })
+        .await
+    }
+
+    /// Run bounded distribution passes until quiescent or the budget is exhausted, then flush any
+    /// accumulated waker batch.
+    ///
+    /// Loops passes while each makes progress and budget remains. When a pass makes no progress,
+    /// returns `Poll::Pending`; when budget runs out with work remaining, sets `needs_wake` so the
+    /// outer drain re-polls. Work per poll is bounded by the budget, regardless of backlog size or
+    /// `release`-during-pass churn. The caller is responsible for [`register_waker`](Self::register_waker)
+    /// (lost-wakeup discipline) before the first poll.
+    ///
+    /// On every `Pending` exit, the accumulated waker batch is shipped to `wakers_tx` as a single
+    /// send (no send when empty). Dead slots are freed inline inside `pass`, outside any tier lock.
+    pub(crate) fn poll_distribute<W>(&mut self, budget: &mut Budget, wakers_tx: &mut W) -> Poll<()>
+    where
+        W: UnboundedSender<Queue<Waker>>,
+    {
+        // Wakers and dead slots accumulate during the pass and are flushed at the end of the
+        // poll cycle: linking each one is two pointer writes (cheap), but the actual work — a
+        // channel send for the wakers, and `drop_fn` per dead slot for the dead queue — would
+        // otherwise stall the inner loop on every grant/reap. Both queues live on the poll stack,
+        // so storage is reclaimed between polls.
+        let mut pending_wakers = Queue::<Waker>::new();
+        let mut dead = DeadSlotQueue::new();
+        let result = loop {
+            let progressed = self.pass(budget, &mut pending_wakers, &mut dead);
             if budget.is_exhausted() {
                 budget.set_needs_wake();
-                return Poll::Pending;
+                break Poll::Pending;
             }
             if !progressed {
-                return Poll::Pending;
+                break Poll::Pending;
             }
+        };
+
+        if !pending_wakers.is_empty() {
+            // UnboundedSender::send returning Err means the channel is closed; the returned batch
+            // drops here, which is fine — a closed waker channel implies shutdown and the slots
+            // will see Closed via the pool's drop path.
+            let _ = wakers_tx.send(pending_wakers);
         }
+        // `dead` drops here at the end of the poll cycle — its drop walks the list and runs each
+        // slot's `drop_fn`, freeing the outer allocations outside the work loop.
+        drop(dead);
+
+        result
     }
 
     /// A single distribution pass. Returns whether it made progress (granted or reaped anything, or
-    /// pulled fresh credit). Stops early if the budget is exhausted.
-    fn pass<W, D>(&mut self, budget: &mut Budget, wakers: &mut W, dead: &mut D) -> bool
-    where
-        W: UnboundedSender<Waker>,
-        D: UnboundedSender<DeadSlot>,
-    {
+    /// pulled fresh credit). Stops early if the budget is exhausted. Granted slots' wakers are
+    /// pushed into `pending_wakers`; dead slots are pushed into `dead` and freed when that queue
+    /// drops at the end of the poll cycle (their drop_fn must run outside any tier lock).
+    fn pass(
+        &mut self,
+        budget: &mut Budget,
+        pending_wakers: &mut Queue<Waker>,
+        dead: &mut DeadSlotQueue,
+    ) -> bool {
         // Recover true free credit `= capacity − in_flight = available + outstanding_demand`,
         // plus the newly-returned `pull`. `available` is held negative by every parked waiter's
         // subtraction; `outstanding_demand` cancels exactly that.
@@ -330,9 +374,9 @@ impl Distributor {
                     dead_released += req;
                     free += req as i64;
                     // SAFETY: a dead slot (refcount=0) has been popped from every list and is owned
-                    // by us; wrapping it in `DeadSlot` transfers that ownership to the dead queue,
-                    // which frees the allocation on drop.
-                    let _ = dead.send(unsafe { DeadSlot::new(ptr) });
+                    // by us; wrapping it in `DeadSlot` transfers ownership to the dead queue, which
+                    // runs the drop_fn at end-of-poll outside the work loop.
+                    dead.push_back(unsafe { DeadSlot::new(ptr) });
                     continue;
                 }
 
@@ -360,18 +404,19 @@ impl Distributor {
                     match res {
                         Some(waker) => {
                             // Full grant: the waiter's park-time subtraction stays in `available`
-                            // (reclassified parked → in-flight); we only drop its demand.
+                            // (reclassified parked → in-flight); we only drop its demand. Stash
+                            // the waker locally; the batch is shipped at the end of the poll cycle.
                             free -= req as i64;
                             granted_any = true;
-                            let _ = wakers.send(waker);
+                            pending_wakers.push_back(Entry::new(waker));
                         }
                         None => {
                             // Raced: the app abandoned between our `is_dead` check and the CAS.
+                            // `grant` returning None means refcount=0 and the slot is ours to free.
+                            // Push into the dead queue; its drop at end-of-poll frees the slot.
                             dead_released += req;
                             free += req as i64;
-                            // SAFETY: `grant` returning None means the slot is now refcount=0 and
-                            // owned by us; hand it to the dead queue to free.
-                            let _ = dead.send(DeadSlot::new(ptr));
+                            dead.push_back(DeadSlot::new(ptr));
                         }
                     }
                 }

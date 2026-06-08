@@ -7,7 +7,8 @@
 
 use super::*;
 use crate::{
-    credit::slot::{AbandonResult, DeadSlotQueue, GrantResult, Slot},
+    credit::slot::{AbandonResult, GrantResult, Slot},
+    intrusive::Queue,
     testing::loom,
 };
 use core::task::{Context, Poll, Waker};
@@ -58,12 +59,14 @@ fn noop() -> Waker {
     Waker::from(std::sync::Arc::new(Noop))
 }
 
-/// Counts grants delivered by the distributor (and forwards the granted slot's waker).
+/// Counts grants delivered by the distributor (and forwards each granted slot's waker).
 struct CountWake(Arc<crate::sync::AtomicUsize>);
-impl UnboundedSender<Waker> for CountWake {
-    fn send(&mut self, waker: Waker) -> Result<(), Waker> {
-        self.0.fetch_add(1, Ordering::Release);
-        waker.wake();
+impl UnboundedSender<Queue<Waker>> for CountWake {
+    fn send(&mut self, mut batch: Queue<Waker>) -> Result<(), Queue<Waker>> {
+        while let Some(entry) = batch.pop_front() {
+            self.0.fetch_add(1, Ordering::Release);
+            entry.into_inner().wake();
+        }
         Ok(())
     }
 }
@@ -84,11 +87,11 @@ fn spawn_distributor(
 ) -> loom::thread::JoinHandle<u64> {
     loom::thread::spawn(move || {
         let mut dist = Distributor::new(pool);
-        let mut dead = DeadSlotQueue::new();
         let mut wakers = CountWake(granted.clone());
         loom::future::block_on(core::future::poll_fn(|cx| {
+            dist.register_waker(cx);
             let mut budget = Budget::new(1 << 16);
-            let _ = dist.poll_distribute(cx, &mut budget, &mut wakers, &mut dead);
+            let _ = dist.poll_distribute(&mut budget, &mut wakers);
             if granted.load(Ordering::Acquire) >= target {
                 Poll::Ready(())
             } else {
@@ -132,13 +135,13 @@ fn park_races_distributor_no_overcommit() {
             let pool = pool.clone();
             loom::thread::spawn(move || {
                 let mut dist = Distributor::new(pool);
-                let mut dead = DeadSlotQueue::new();
                 let granted = Arc::new(crate::sync::AtomicUsize::new(0));
                 let mut wakers = CountWake(granted);
                 let mut budget = Budget::new(1 << 16);
                 let dwaker = noop();
                 let mut dcx = Context::from_waker(&dwaker);
-                let _ = dist.poll_distribute(&mut dcx, &mut budget, &mut wakers, &mut dead);
+                dist.register_waker(&mut dcx);
+                let _ = dist.poll_distribute(&mut budget, &mut wakers);
                 dist.debug_paid_demand()
             })
         };
@@ -155,19 +158,18 @@ fn park_races_distributor_no_overcommit() {
                 let mut wcx = Context::from_waker(&ww);
                 // May succeed (if capacity frees up as w0 is served) or park — either is correct.
                 // What must NOT happen is an over-count letting more total credit out than CAP.
-                let granted_now = match unsafe {
-                    pool.poll_acquire(&mut wcx, w, CAP as u64, Priority::Low)
-                } {
-                    Poll::Ready(n) => {
-                        // took it via the fast path; release it straight back so teardown is clean
-                        pool.release(n);
-                        true
-                    }
-                    Poll::Pending => {
-                        let _ = unsafe { (*w.as_ptr()).abandon() };
-                        false
-                    }
-                };
+                let granted_now =
+                    match unsafe { pool.poll_acquire(&mut wcx, w, CAP as u64, Priority::Low) } {
+                        Poll::Ready(n) => {
+                            // took it via the fast path; release it straight back so teardown is clean
+                            pool.release(n);
+                            true
+                        }
+                        Poll::Pending => {
+                            let _ = unsafe { (*w.as_ptr()).abandon() };
+                            false
+                        }
+                    };
                 (SendPtr(w), granted_now)
             })
         };
@@ -314,7 +316,10 @@ fn newcomer_cannot_snipe() {
                 let nwaker = noop();
                 let mut ncx = Context::from_waker(&nwaker);
                 let r = unsafe { pool.poll_acquire(&mut ncx, n, 5, Priority::Medium) };
-                assert!(matches!(r, Poll::Pending), "newcomer sniped a parked waiter");
+                assert!(
+                    matches!(r, Poll::Pending),
+                    "newcomer sniped a parked waiter"
+                );
                 // The newcomer parked; mark it dead so the tier-list drop frees it (no
                 // distributor runs in this model).
                 let dead = matches!(unsafe { (*n.as_ptr()).abandon() }, AbandonResult::Abandoned);
