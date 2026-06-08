@@ -5,10 +5,8 @@
 pub struct Config {
     /// Total byte budget for the pool.
     pub capacity: u64,
-    /// Minimum bytes to grant per woken stream. Prevents fragmenting credits
-    /// into units too small for meaningful work.
-    pub min_grant: u64,
-    /// Maximum bytes a single CAS fast-path acquisition can take.
+    /// Maximum bytes a single acquisition can request. Requests are clamped to this, which also
+    /// bounds how far `available` can go negative: at most `concurrent_waiters * max_single_acquire`.
     pub max_single_acquire: u64,
 }
 
@@ -17,7 +15,6 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             capacity: 256 * 1024 * 1024,
-            min_grant: 64 * 1024,
             max_single_acquire: 4 * 1024 * 1024,
         }
     }
@@ -28,7 +25,6 @@ impl Config {
     pub(crate) fn normalized(self) -> Self {
         Self {
             capacity: self.capacity.min(i64::MAX as u64),
-            min_grant: self.min_grant.max(1),
             max_single_acquire: self.max_single_acquire.max(1).min(i64::MAX as u64),
         }
     }

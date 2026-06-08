@@ -5,10 +5,13 @@ mod config;
 mod pool;
 mod slot;
 mod tier;
+mod waker;
 
-#[cfg(test)]
+// The deterministic suite uses the production sync types and `std`'s `Wake` trait; under loom we
+// run only the `pool::loom_tests` models, so skip it there.
+#[cfg(all(test, not(feature = "loom")))]
 mod tests;
 
 pub use config::Config;
-pub use pool::{Pool, Priority};
-pub use slot::{GrantResult, Slot};
+pub use pool::{Distributor, Pool, Priority};
+pub use slot::{AbandonResult, DeadSlot, DeadSlotQueue, GrantResult, Slot};

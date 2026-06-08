@@ -15,9 +15,29 @@ pub enum GrantResult {
     /// Credits were granted by the pool.
     Granted(u64),
     /// The pool was dropped. No more credits will be issued.
+    ///
+    /// **Ownership:** `Closed` transfers the slot's allocation back to the application — the pool
+    /// has released its reference (refcount is back to APP) and will never touch the slot again.
+    /// The caller must run its idle-state cleanup (free the allocation), exactly as it must after a
+    /// successful [`Slot::abandon`]. Dropping the future without freeing leaks the allocation.
     Closed,
     /// Spurious wake — still linked, no grant yet.
     Pending,
+}
+
+/// Result of an application-side [`Slot::abandon`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AbandonResult {
+    /// The slot was successfully marked dead while linked. The pool will free the allocation when
+    /// it next pops this entry; the caller must NOT touch the slot again.
+    Abandoned,
+    /// The pool granted credits concurrently (it won the LINKED→APP race). The caller now owns the
+    /// allocation outright and must run idle-state cleanup; `u64` is the granted amount, which the
+    /// caller may release back to the pool.
+    Granted(u64),
+    /// The pool was dropped concurrently and signalled closure. The caller owns the allocation and
+    /// must run idle-state cleanup, but must NOT release anything back to the (gone) pool.
+    Closed,
 }
 
 /// Refcount value when the application owns the slot exclusively.
@@ -94,8 +114,12 @@ impl Slot {
         *self.waker.get() = None;
     }
 
-    /// Transition from app-owned to linked. Must be called under the tier mutex
-    /// after linking into the list.
+    /// Transition from app-owned to linked.
+    ///
+    /// # Safety
+    ///
+    /// Must be called under the tier mutex, after `prepare_park` and after linking the slot into the
+    /// list, while the slot is still app-owned (refcount=1).
     #[inline]
     pub unsafe fn transition_to_linked(&self) {
         debug_assert_eq!(self.refcount.load(Ordering::Relaxed), RC_APP);
@@ -181,38 +205,43 @@ impl Slot {
         self.refcount.load(Ordering::Relaxed) == RC_DEAD
     }
 
-    /// Abandon the slot from the application side while linked.
+    /// Abandon the slot from the application side while it is LINKED.
     ///
-    /// Returns `Ok(())` if the slot was successfully marked DEAD — the pool
-    /// will free the allocation when it next pops this entry.
+    /// Returns [`AbandonResult::Abandoned`] if the slot was successfully marked DEAD — the pool will
+    /// free the allocation when it next pops this entry, and the caller must not touch the slot again.
     ///
-    /// Returns `Err(granted)` if the pool concurrently granted credits — the
-    /// caller must perform an idle-state cleanup (free the allocation itself
-    /// since the pool has already released ownership). The returned `granted`
-    /// value indicates how much was granted (which the caller might want to
-    /// release back to the pool).
+    /// If the pool won the LINKED→APP race, the CAS fails and the caller now owns the allocation:
+    /// [`AbandonResult::Granted`] if the pool delivered a real grant, or [`AbandonResult::Closed`] if
+    /// the pool was dropped (it wrote the `GRANT_CLOSED` sentinel). Distinguishing these matters —
+    /// `Granted(n)` may be released back to the pool, but `Closed` must not (the pool is gone), and
+    /// folding the `u64::MAX` sentinel into a byte count would corrupt the budget.
     ///
     /// # Safety
     ///
-    /// Must only be called from the application side while the slot is in the
-    /// LINKED or APP state. The caller must NOT access any non-thread-safe
-    /// fields after a successful abandon (Ok return).
+    /// Must only be called from the application side while the slot is **LINKED** (it was parked via
+    /// `poll_acquire` returning `Pending` and not yet granted). Calling it on an idle APP slot is a
+    /// contract violation: the code cannot distinguish a never-parked slot from a granted one. After
+    /// any non-`Abandoned` return the caller owns the allocation; after `Abandoned` it must not
+    /// access any non-thread-safe field.
     #[inline]
-    pub unsafe fn abandon(&self) -> Result<(), u64> {
-        // Try to transition LINKED → DEAD. If the pool already transitioned
-        // to APP (granted), the CAS fails and we report the grant amount.
+    pub unsafe fn abandon(&self) -> AbandonResult {
+        // Try to transition LINKED → DEAD. If the pool already transitioned to APP (granted or
+        // closed), the CAS fails and the caller owns the allocation.
         match self.refcount.compare_exchange(
             RC_LINKED,
             RC_DEAD,
             Ordering::Release,
             Ordering::Acquire,
         ) {
-            Ok(_) => Ok(()),
+            Ok(_) => AbandonResult::Abandoned,
             Err(rc) => {
-                debug_assert_eq!(rc, RC_APP, "unexpected refcount {rc} in abandon");
-                // Pool granted just before we abandoned. Read the grant; the
-                // caller now owns the allocation outright.
-                Err(*self.granted.get())
+                debug_assert_eq!(rc, RC_APP, "abandon must only be called on a LINKED slot, got {rc}");
+                let granted = *self.granted.get();
+                if granted == GRANT_CLOSED {
+                    AbandonResult::Closed
+                } else {
+                    AbandonResult::Granted(granted)
+                }
             }
         }
     }

@@ -659,6 +659,27 @@ impl<A: Adapter> List<A> {
         core::mem::swap(self, other);
     }
 
+    /// Detach all entries into a new list that shares this list's identity.
+    ///
+    /// Moves `head`/`tail`/`len` into the returned list and leaves `self` empty (but with the same
+    /// `id`). Unlike constructing a fresh `List`, the detached list inherits `self.id`, so the moved
+    /// nodes' link-tags still match and a later `prepend` back into `self` (or any `remove` on either
+    /// handle) keeps the debug ownership stamp consistent. O(1).
+    ///
+    /// This is the sanctioned way to move a list's contents out from under a lock, operate on them
+    /// off-lock, and splice the remainder back: both handles speak for the same logical list.
+    pub fn detach(&mut self) -> Self {
+        let detached = Self {
+            head: self.head.take(),
+            tail: self.tail.take(),
+            len: self.len,
+            id: self.id,
+            _phantom: core::marker::PhantomData,
+        };
+        self.len = 0;
+        detached
+    }
+
     /// Peek at the front entry without removing it
     /// Peek at the first entry without removing it
     pub fn front(&self) -> Option<&A::Target> {
@@ -1216,6 +1237,7 @@ mod tests {
         PopBack,
         Append,
         Prepend,
+        Detach,
     }
 
     // ── Remove tests using Arc-based adapter ──────────────────────────────
@@ -1368,6 +1390,52 @@ mod tests {
     }
 
     #[test]
+    fn detach_preserves_remove_stamp() {
+        // A node detached into a separate handle (sharing the id) must still be removable from
+        // that handle — the debug ownership stamp must not trip `assert_belongs_to`.
+        let mut list: List<ArcAdapter> = List::new();
+        let n1 = arc_node(1);
+        let n2 = arc_node(2);
+        let n3 = arc_node(3);
+        list.push_back(n1.clone());
+        list.push_back(n2.clone());
+        list.push_back(n3.clone());
+
+        let mut detached = list.detach();
+        assert!(list.is_empty());
+        assert_eq!(detached.len(), 3);
+
+        // remove an interior node from the detached handle (would panic on a stamp mismatch)
+        let removed = unsafe { detached.remove(&n2) };
+        assert!(removed.is_some());
+        assert_eq!(detached.len(), 2);
+
+        // prepend the remainder back into the original handle; nodes minted there are still valid
+        list.prepend(&mut detached);
+        assert!(detached.is_empty());
+        assert_eq!(list.len(), 2);
+
+        // a node that was never detached/removed remains removable from the original handle
+        let removed = unsafe { list.remove(&n1) };
+        assert!(removed.is_some());
+        assert_eq!(list.pop_front().unwrap().value, 3);
+        assert!(list.is_empty());
+    }
+
+    #[test]
+    fn detach_empty() {
+        let mut list: List<ArcAdapter> = List::new();
+        let detached = list.detach();
+        assert!(detached.is_empty());
+        assert!(list.is_empty());
+        // re-detaching / using the empty handle is a no-op
+        list.push_back(arc_node(7));
+        let mut d = list.detach();
+        assert_eq!(d.len(), 1);
+        assert_eq!(d.pop_front().unwrap().value, 7);
+    }
+
+    #[test]
     fn differential_test() {
         check!().with_type::<Vec<Operation>>().for_each(|ops| {
             let mut values = 0u64..;
@@ -1421,6 +1489,18 @@ mod tests {
                         oracle = temp;
                         subject.prepend(&mut subject_other);
                         assert!(subject_other.is_empty());
+                        assert_eq!(oracle.len(), subject.len());
+                    }
+                    Operation::Detach => {
+                        // Detach moves everything into a handle sharing the list's id, then
+                        // prepends it straight back — a round-trip that must restore the exact
+                        // contents and ordering (the oracle is unchanged). This exercises that the
+                        // shared id keeps node membership consistent across the move + splice.
+                        let mut detached = subject.detach();
+                        assert!(subject.is_empty());
+                        assert_eq!(detached.len(), oracle.len());
+                        subject.prepend(&mut detached);
+                        assert!(detached.is_empty());
                         assert_eq!(oracle.len(), subject.len());
                     }
                 }

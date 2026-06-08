@@ -20,11 +20,6 @@ impl Tier {
         self.list.is_empty()
     }
 
-    #[inline]
-    pub(crate) fn len(&self) -> usize {
-        self.list.len()
-    }
-
     /// Link a slot into the back of this tier's wait list.
     ///
     /// # Safety
@@ -36,13 +31,20 @@ impl Tier {
         self.list.push_back(SlotPtr::new(ptr));
     }
 
-    /// Pop the first slot from the list.
+    /// Detach the entire wait list into the distributor's task-local mirror, which shares this
+    /// tier's list identity.
     ///
-    /// Returns the owning `SlotPtr`. The caller must either:
-    /// - Call `.take()` to suppress the drop (normal grant path), or
-    /// - Let it drop (pool shutdown path — writes sentinel and wakes).
+    /// The distributor calls this only to refill an *empty* mirror: it moves all currently-parked
+    /// waiters out from under the tier mutex in one O(1) splice, then grants them off-lock across
+    /// however many passes are needed. Unserved waiters remain in the mirror — they are never
+    /// prepended back — so under a sustained backlog the tier mutex is taken only on refill.
+    /// Because the returned list shares the tier's id, slots moving between the two keep the debug
+    /// ownership stamp valid (and a slot lives in exactly one of the two lists at any time).
+    ///
+    /// Safe: holding `&mut self` (only reachable through the tier `MutexGuard`) is what authorizes
+    /// the move; `List::detach` itself has no preconditions.
     #[inline]
-    pub(crate) fn pop_front(&mut self) -> Option<SlotPtr> {
-        self.list.pop_front()
+    pub(crate) fn detach(&mut self) -> List<SlotAdapter> {
+        self.list.detach()
     }
 }
