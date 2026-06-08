@@ -672,6 +672,64 @@ fn split_credit_no_longer_strands() {
 }
 
 #[test]
+fn second_refill_drains_fresh_arrivals_behind_cached_head() {
+    // Regression for the bounded second-refill behavior. After a prior pass leaves a head cached
+    // in the mirror (it was unaffordable at the time), fresh waiters arrive in the shared tier
+    // behind it. The next pass must refill the mirror once more after granting the cached head, so
+    // those fresh waiters are served in the same pass — not stranded until the next one.
+    let mut h = Harness::new(Config {
+        capacity: 0,
+        max_single_acquire: 100,
+    });
+    let counters: Vec<_> = (0..3).map(|_| Arc::new(WakeCounter::default())).collect();
+    let wakers: Vec<_> = counters.iter().map(|c| Waker::from(c.clone())).collect();
+    let slots: Vec<_> = (0..3).map(|_| alloc_test_slot()).collect();
+
+    // A parks first; it lands in the shared Medium tier.
+    let r = unsafe { h.poll_acquire(slots[0], 5, Priority::Medium, &wakers[0]) };
+    assert!(matches!(r, Poll::Pending));
+
+    // First pass with no credit: the distributor refills the mirror with A, finds it unaffordable
+    // (free = 0, req = 5), and breaks. A is now cached in the mirror across passes.
+    let mut budget = Budget::new(1 << 20);
+    let mut sink = InlineWakeSender;
+    let mut dead = DeadSlotQueue::new();
+    let progressed = h.dist.pass(&mut budget, &mut sink, &mut dead);
+    assert!(!progressed);
+    assert_eq!(counters[0].wakeups(), 0);
+    drop(dead);
+
+    // B and C park behind A. Because A is in the mirror, B and C go straight to the shared tier.
+    let r = unsafe { h.poll_acquire(slots[1], 5, Priority::Medium, &wakers[1]) };
+    assert!(matches!(r, Poll::Pending));
+    let r = unsafe { h.poll_acquire(slots[2], 5, Priority::Medium, &wakers[2]) };
+    assert!(matches!(r, Poll::Pending));
+
+    // Enough credit for all three.
+    h.release(15);
+
+    // Single pass: grants A from the cached mirror, mirror drains, refills once more from the
+    // shared tier, then grants B and C. Without the second refill, only A would be served and
+    // B/C would have to wait for another pass.
+    let mut budget = Budget::new(1 << 20);
+    let mut sink = InlineWakeSender;
+    let mut dead = DeadSlotQueue::new();
+    let progressed = h.dist.pass(&mut budget, &mut sink, &mut dead);
+    assert!(progressed);
+    drop(dead);
+
+    for (i, counter) in counters.iter().enumerate() {
+        assert_eq!(counter.wakeups(), 1, "waiter {i} not served in a single pass");
+        let slot_ref = unsafe { &*slots[i].as_ptr() };
+        assert_eq!(slot_ref.poll_granted(), GrantResult::Granted(5));
+    }
+
+    for slot in slots {
+        unsafe { free_test_slot(slot) };
+    }
+}
+
+#[test]
 fn concurrent_release_halves_serve_waiter() {
     // The old design's concurrent-release double-stash strands a waiter when two sub-threshold
     // releases race. With a single counter, two releases simply sum; the distributor serves the

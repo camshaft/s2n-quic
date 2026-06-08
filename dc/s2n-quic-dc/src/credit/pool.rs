@@ -265,25 +265,32 @@ impl Distributor {
         let mut granted_any = false;
 
         'walk: for (local, tier) in self.local.iter_mut().zip(&self.pool.tiers) {
-            // Refill an empty mirror from the shared tier (the only place we lock a tier). Holding
-            // the guard is what authorizes the move, so `detach` is a safe operation.
-            if local.is_empty() {
-                let mut tier = lock(tier);
-                if tier.is_empty() {
-                    continue;
-                }
-                core::mem::swap(local, &mut *tier);
-            }
-
-            // Grant heads while affordable. Reap dead heads unconditionally (a dead corpse at the
-            // head must not block live waiters behind it). Stop the whole walk at the first live
-            // head we cannot afford — strict priority means lower tiers wait too.
+            // Refill from the shared tier when the mirror drains, capped at one extra refill per
+            // tier per pass. The cap bounds tier-lock acquisitions: at most two locks per tier per
+            // pass even if waiters keep arriving. Without the second refill, cached mirror entries
+            // would shadow fresh arrivals in the shared tier — granting only the cached ones and
+            // moving on, leaving the new ones for the next pass.
+            let mut refilled = false;
             loop {
-                let Some(front) = local.front() else {
-                    break;
-                };
+                if local.is_empty() {
+                    if refilled {
+                        break;
+                    }
+                    refilled = true;
+                    let mut shared = lock(tier);
+                    if shared.is_empty() {
+                        break;
+                    }
+                    core::mem::swap(local, &mut *shared);
+                }
+
+                // Grant heads while affordable. Reap dead heads unconditionally (a dead corpse at
+                // the head must not block live waiters behind it). Stop the whole walk at the first
+                // live head we cannot afford — strict priority means lower tiers wait too.
+                //
                 // SAFETY: the slot is in our mirror, so it is linked (not idle); `requested` was set
                 // at park time under the tier lock and is stable until we grant or reap it here.
+                let front = local.front().unwrap();
                 let req = unsafe { front.requested() };
 
                 if front.is_dead() {
@@ -313,18 +320,21 @@ impl Distributor {
                 // (refcount CAS) and our `grant` race, and `grant` resolves that race.
                 unsafe {
                     let slot = &*ptr.as_ptr();
-                    match slot.grant(req) {
+                    let res = slot.grant(req);
+
+                    // reduce the parked demand counter
+                    self.pool.parked_demand.fetch_sub(req, Ordering::AcqRel);
+
+                    match res {
                         Some(waker) => {
                             // Full grant: the waiter's park-time subtraction stays in `available`
                             // (reclassified parked → in-flight); we only drop its demand.
-                            self.pool.parked_demand.fetch_sub(req, Ordering::AcqRel);
                             free -= req as i64;
                             granted_any = true;
                             let _ = wakers.send(waker);
                         }
                         None => {
                             // Raced: the app abandoned between our `is_dead` check and the CAS.
-                            self.pool.parked_demand.fetch_sub(req, Ordering::AcqRel);
                             dead_released += req;
                             free += req as i64;
                             // SAFETY: `grant` returning None means the slot is now refcount=0 and
