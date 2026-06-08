@@ -5,7 +5,7 @@
 //!
 //! # Counter model
 //!
-//! Free credit is tracked with **two credit counters plus one demand counter**:
+//! Free credit is tracked with **two credit counters plus one monotonic demand counter**:
 //!
 //! - [`Pool::available`] (`AtomicI64`, init `capacity`) — the fast-path debit counter.
 //!   [`Pool::poll_acquire`] does a lone `fetch_sub`. The distributor is the *only* actor that ever
@@ -14,18 +14,19 @@
 //!   fast path never reads it. The distributor swaps it to zero at the top of each pass. Routing
 //!   returned credit here (instead of into `available`) is what prevents a brand-new acquirer from
 //!   sniping credit a parked waiter has been waiting for.
-//! - [`Pool::parked_demand`] (`AtomicU64`) — the sum of `requested` over all currently-parked
-//!   waiters. Bumped by `poll_acquire` only on the park branch; decremented by the distributor per
-//!   grant / dead-slot. It is *not* a third credit pool: it lets the distributor recover true free
-//!   credit from the signed `available` exactly, since `available + parked_demand` cancels every
-//!   parked waiter's subtraction, yielding `capacity − in_flight`.
+//! - [`Pool::parked_demand`] (`AtomicU64`) — **monotonic** running total of every park's `requested`.
+//!   `poll_acquire` adds on the park branch; nobody ever subtracts. The distributor maintains a
+//!   private `paid_demand` accumulator (one `u64` field) and recovers outstanding demand as
+//!   `parked_demand − paid_demand`. Making the shared atomic add-only halves its contention (one
+//!   atomic op per park instead of one-per-park plus one-per-grant) and removes the producer/
+//!   distributor RMW race on the same line.
 //!
 //! ## Invariants (verified by the loom tests)
 //!
-//! At every quiescent point:
+//! At every quiescent point, with `outstanding = parked_demand − paid_demand`:
 //!
 //! ```text
-//! available + parked_demand + returned + in_flight == capacity
+//! available + outstanding + returned + in_flight == capacity
 //! ```
 //!
 //! and operationally `available <= 0` holds **whenever any waiter is parked** — so the fast path
@@ -52,6 +53,7 @@ use crate::{
     sync::{lock, Arc, AtomicI64, AtomicU64, Mutex, Ordering},
 };
 use core::task::{Context, Poll, Waker};
+use crossbeam_utils::CachePadded;
 use std::ptr::NonNull;
 
 #[cfg(all(test, not(feature = "loom")))]
@@ -79,16 +81,23 @@ impl Priority {
 
 pub struct Pool {
     /// Fast-path debit counter. `poll_acquire` subtracts; the distributor is the sole adder.
-    available: AtomicI64,
+    /// Padded to keep producer fast-path RMWs off the same line as `returned`/`parked_demand`.
+    available: CachePadded<AtomicI64>,
     /// No-snipe staging buffer for returned credit. The fast path never reads this.
-    returned: AtomicU64,
-    /// Sum of `requested` over all parked waiters. Lets the distributor recover true free credit.
-    parked_demand: AtomicU64,
+    /// Padded — releasers and the distributor's `swap` would otherwise share a line with
+    /// `available`'s hot fast-path traffic.
+    returned: CachePadded<AtomicU64>,
+    /// Monotonic running total of `requested` over every park. Producers `fetch_add`; the
+    /// distributor only loads. Outstanding demand is recovered as `parked_demand − paid_demand`
+    /// (a Distributor-private `u64`), so this atomic carries no decrements.
+    parked_demand: CachePadded<AtomicU64>,
     config: Config,
     waker: TaskWaker,
     /// One wait list per priority. Held under a mutex; the distributor briefly locks each tier
-    /// only to refill an empty mirror via `List::detach`.
-    tiers: [Mutex<List<SlotAdapter>>; Priority::LEVELS],
+    /// only to refill an empty mirror via `List::detach`. Each tier is cache-padded so that
+    /// producers parking on different priorities don't share a line — without padding, a producer
+    /// on tier 3 invalidates the distributor's cached read of tier 4 on every walk.
+    tiers: [CachePadded<Mutex<List<SlotAdapter>>>; Priority::LEVELS],
 }
 
 impl Pool {
@@ -96,12 +105,12 @@ impl Pool {
         let config = config.normalized();
 
         Self {
-            available: AtomicI64::new(config.capacity as i64),
-            returned: AtomicU64::new(0),
-            parked_demand: AtomicU64::new(0),
+            available: CachePadded::new(AtomicI64::new(config.capacity as i64)),
+            returned: CachePadded::new(AtomicU64::new(0)),
+            parked_demand: CachePadded::new(AtomicU64::new(0)),
             config,
             waker: TaskWaker::new(),
-            tiers: std::array::from_fn(|_| Mutex::new(List::new())),
+            tiers: std::array::from_fn(|_| CachePadded::new(Mutex::new(List::new()))),
         }
     }
 
@@ -110,8 +119,8 @@ impl Pool {
     /// The fast path is a single `fetch_sub`. If the previous value was sufficient, the subtraction
     /// holds and the acquire succeeds. Otherwise the subtraction is **left in place** — the parked
     /// slot is the record of that demand — the slot is linked into its priority tier, and
-    /// `parked_demand` is bumped under the tier lock. The distributor will deliver a full grant and
-    /// wake the slot once enough credit is returned.
+    /// `parked_demand` is bumped (monotonic, never decremented). The distributor will deliver a
+    /// full grant and wake the slot once enough credit is returned.
     ///
     /// # Safety
     ///
@@ -131,7 +140,11 @@ impl Pool {
         }
 
         // Fast path: a single debit. Success if the pool had the credit.
-        let prev = self.available.fetch_sub(n as i64, Ordering::AcqRel);
+        //
+        // Acquire pairs with the distributor's writeback at end-of-pass so a successful debit
+        // observes returned credit promptly. The park branch publishes via
+        // `parked_demand.fetch_add(Release)` below, so no Release is needed here.
+        let prev = self.available.fetch_sub(n as i64, Ordering::Acquire);
         if prev >= n as i64 {
             return Poll::Ready(n);
         }
@@ -194,6 +207,10 @@ pub struct Distributor {
     pool: Arc<Pool>,
     /// One mirror list per priority. Each shares its shared tier's list id (seeded by `detach`).
     local: [List<SlotAdapter>; Priority::LEVELS],
+    /// Cumulative `requested` for every park we have already granted or reaped. Outstanding demand
+    /// is `pool.parked_demand − paid_demand`. Lives here so the shared atomic stays add-only —
+    /// producers never contend with the distributor on the same line for a decrement.
+    paid_demand: u64,
 }
 
 impl Distributor {
@@ -201,7 +218,14 @@ impl Distributor {
         Self {
             pool,
             local: std::array::from_fn(|_| List::new()),
+            paid_demand: 0,
         }
+    }
+
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub(crate) fn debug_paid_demand(&self) -> u64 {
+        self.paid_demand
     }
 
     /// Run bounded distribution passes until quiescent or the budget is exhausted.
@@ -247,9 +271,14 @@ impl Distributor {
         W: UnboundedSender<Waker>,
         D: UnboundedSender<DeadSlot>,
     {
-        // Recover true free credit `= capacity − in_flight = available + parked_demand`, plus the
-        // newly-returned `pull`. `available` is held negative by every parked waiter's subtraction;
-        // `parked_demand` cancels exactly that.
+        // Recover true free credit `= capacity − in_flight = available + outstanding_demand`,
+        // plus the newly-returned `pull`. `available` is held negative by every parked waiter's
+        // subtraction; `outstanding_demand` cancels exactly that.
+        //
+        // `parked_demand` is monotonic (producers `fetch_add`, nobody subtracts). The distributor
+        // tracks every grant/reap in its private `paid_demand`, so true outstanding demand is
+        // `parked_demand − paid_demand`. Equivalent to the old `parked_demand` semantics; the only
+        // change is that the subtraction lives in this thread's local instead of in a shared RMW.
         //
         // Load order matters: `poll_acquire`'s park does `available -= n` and THEN
         // `parked_demand += n` (two non-atomic steps). We read `parked_demand` FIRST, then
@@ -257,9 +286,11 @@ impl Distributor {
         // `available` without the matching `+n` in `parked_demand` — i.e. `free` is *under*-counted
         // (conservative, that waiter is simply served next pass). The reverse order could
         // *over*-count by `n` and grant a waiter we can't afford (over-commit past capacity).
-        let pull = self.pool.returned.swap(0, Ordering::AcqRel);
-        let parked = self.pool.parked_demand.load(Ordering::Acquire) as i64;
-        let mut free = self.pool.available.load(Ordering::Acquire) + parked + pull as i64;
+        // Acquire pairs with `release()`'s Release-add. The stored `0` has no acquiring reader.
+        let pull = self.pool.returned.swap(0, Ordering::Acquire);
+        let outstanding =
+            (self.pool.parked_demand.load(Ordering::Acquire) - self.paid_demand) as i64;
+        let mut free = self.pool.available.load(Ordering::Acquire) + outstanding + pull as i64;
 
         let mut dead_released: u64 = 0;
         let mut granted_any = false;
@@ -295,7 +326,7 @@ impl Distributor {
 
                 if front.is_dead() {
                     let ptr = local.pop_front().unwrap().take();
-                    self.pool.parked_demand.fetch_sub(req, Ordering::AcqRel);
+                    self.paid_demand += req;
                     dead_released += req;
                     free += req as i64;
                     // SAFETY: a dead slot (refcount=0) has been popped from every list and is owned
@@ -322,8 +353,9 @@ impl Distributor {
                     let slot = &*ptr.as_ptr();
                     let res = slot.grant(req);
 
-                    // reduce the parked demand counter
-                    self.pool.parked_demand.fetch_sub(req, Ordering::AcqRel);
+                    // Whether granted or raced, this park is now resolved — credit it locally so
+                    // the next pass's `outstanding` reflects reality.
+                    self.paid_demand += req;
 
                     match res {
                         Some(waker) => {

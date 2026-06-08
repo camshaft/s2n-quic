@@ -31,15 +31,22 @@ mod once_lock {
         /// stores, later calls are a no-op (the runtime hands the same waker each poll).
         #[inline]
         pub fn register(&self, waker: &Waker) {
-            if let Some(existing) = self.0.get() {
-                debug_assert!(
-                    existing.will_wake(waker),
-                    "distributor waker changed across polls; this runtime is not supported by \
-                     the OnceLock TaskWaker — switch to the loom RwLock impl or relax to refresh"
-                );
-                return;
+            for noop in [
+                &s2n_quic_core::task::waker::noop(),
+                core::task::Waker::noop(),
+            ] {
+                // no point in registering the noop waker
+                if waker.data() == noop.data() && waker.vtable() == noop.vtable() {
+                    return;
+                }
             }
-            let _ = self.0.set(waker.clone());
+
+            let prev = self.0.get_or_init(|| waker.clone());
+            debug_assert!(
+                prev.will_wake(waker),
+                "distributor waker changed across polls; this runtime is not supported by \
+                 the OnceLock TaskWaker — switch to the RwLock impl or relax to refresh"
+            );
         }
 
         /// Wake the distributor. Lock-free atomic load; never clears the stored waker.

@@ -75,17 +75,18 @@ unsafe impl Send for SendPtr {}
 /// Drive the distributor to completion on its own thread, parking via `block_on` whenever
 /// `poll_distribute` yields `Pending`. The thread is re-polled ONLY by a real wakeup, so a lost
 /// wakeup manifests as a permanent park → loom deadlock. Completes once `granted` reaches
-/// `target`.
+/// `target`. Returns the distributor's final `paid_demand` so the caller can recover outstanding
+/// demand (`parked_demand − paid_demand`) for conservation assertions.
 fn spawn_distributor(
     pool: Arc<Pool>,
     granted: Arc<crate::sync::AtomicUsize>,
     target: usize,
-) -> loom::thread::JoinHandle<()> {
+) -> loom::thread::JoinHandle<u64> {
     loom::thread::spawn(move || {
         let mut dist = Distributor::new(pool);
         let mut dead = DeadSlotQueue::new();
         let mut wakers = CountWake(granted.clone());
-        loom::future::block_on(core::future::poll_fn(move |cx| {
+        loom::future::block_on(core::future::poll_fn(|cx| {
             let mut budget = Budget::new(1 << 16);
             let _ = dist.poll_distribute(cx, &mut budget, &mut wakers, &mut dead);
             if granted.load(Ordering::Acquire) >= target {
@@ -94,6 +95,7 @@ fn spawn_distributor(
                 Poll::Pending
             }
         }));
+        dist.debug_paid_demand()
     })
 }
 
@@ -102,8 +104,9 @@ fn spawn_distributor(
 /// `parked_demand += n`, and the distributor reads `parked_demand` then `available`. If the loads
 /// were in the wrong order the distributor could observe the `+n` without the `-n` and over-count
 /// free credit, granting a slot it cannot afford and driving the conserved total past capacity.
-/// We assert conservation (`available + parked_demand + returned + in_flight == capacity`) holds
-/// after every interleaving.
+/// `parked_demand` is monotonic; outstanding demand is recovered after the distributor joins as
+/// `parked_demand − granted_total` (here, `granted` × the per-grant amount). We assert conservation
+/// (`available + outstanding + returned + in_flight == capacity`) holds after every interleaving.
 #[test]
 fn park_races_distributor_no_overcommit() {
     loom::model(|| {
@@ -136,6 +139,7 @@ fn park_races_distributor_no_overcommit() {
                 let dwaker = noop();
                 let mut dcx = Context::from_waker(&dwaker);
                 let _ = dist.poll_distribute(&mut dcx, &mut budget, &mut wakers, &mut dead);
+                dist.debug_paid_demand()
             })
         };
 
@@ -170,18 +174,21 @@ fn park_races_distributor_no_overcommit() {
 
         releaser.join().unwrap();
         let (w_ptr, granted_now) = parker.join().unwrap();
-        dist.join().unwrap();
+        let paid = dist.join().unwrap() as i64;
 
         // Conservation: whatever the interleaving, the conserved total must never imply more than
         // CAP bytes in flight. The wrong load order over-counts free credit and breaks this.
+        // `parked_demand` is monotonic; outstanding demand is `parked_demand − paid`.
         let available = pool.available.load(Ordering::Relaxed);
         let parked = pool.parked_demand.load(Ordering::Relaxed) as i64;
+        let outstanding = parked - paid;
         let returned = pool.returned.load(Ordering::Relaxed) as i64;
-        let in_flight = CAP - (available + parked + returned);
+        let in_flight = CAP - (available + outstanding + returned);
         assert!(
             (0..=CAP).contains(&in_flight),
             "over-commit: in_flight={in_flight} not in 0..={CAP} \
-             (available={available} parked={parked} returned={returned})"
+             (available={available} outstanding={outstanding} returned={returned} \
+              parked={parked} paid={paid})"
         );
 
         drop(pool);
@@ -216,13 +223,14 @@ fn release_wakes_parked_waiter() {
         // Releaser races the distributor's first poll/park.
         pool.release(10);
 
-        dist.join().unwrap();
+        let paid = dist.join().unwrap();
 
         let slot_ref = unsafe { &*slot.as_ptr() };
         assert_eq!(slot_ref.poll_granted(), GrantResult::Granted(10));
         // Conservation: the 10 is now in-flight; nothing stranded.
+        // `parked_demand` is monotonic, so the cancellation check is parked == paid.
         assert_eq!(pool.available.load(Ordering::Relaxed), 0);
-        assert_eq!(pool.parked_demand.load(Ordering::Relaxed), 0);
+        assert_eq!(pool.parked_demand.load(Ordering::Relaxed), paid);
         assert_eq!(pool.returned.load(Ordering::Relaxed), 0);
 
         unsafe { free_slot(slot) };
@@ -260,12 +268,12 @@ fn concurrent_releases_accumulate() {
 
         r1.join().unwrap();
         r2.join().unwrap();
-        dist.join().unwrap();
+        let paid = dist.join().unwrap();
 
         let slot_ref = unsafe { &*slot.as_ptr() };
         assert_eq!(slot_ref.poll_granted(), GrantResult::Granted(10));
         assert_eq!(pool.available.load(Ordering::Relaxed), 0);
-        assert_eq!(pool.parked_demand.load(Ordering::Relaxed), 0);
+        assert_eq!(pool.parked_demand.load(Ordering::Relaxed), paid);
 
         unsafe { free_slot(slot) };
     });
