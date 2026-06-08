@@ -977,7 +977,7 @@ jobs:
         # actually run before s2n-quic-dc gained loom support.
         # LOOM_MAX_PREEMPTIONS bounds the exploration so the multi-thread models finish in CI time
         # (the standard loom knob; 2-3 preemptions catch essentially all real ordering bugs).
-        run: cd dc/s2n-quic-dc && cargo test --profile release-debug --features loom credit::pool::loom_tests
+        run: cd dc/s2n-quic-dc && cargo test --profile release-debug --features loom credit::pool::loom
         env:
           LOOM_MAX_PREEMPTIONS: "3"
 

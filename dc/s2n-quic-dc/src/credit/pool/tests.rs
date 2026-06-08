@@ -1,10 +1,8 @@
 // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use super::{
-    pool::{Distributor, Priority},
-    slot::{AbandonResult, DeadSlotQueue, GrantResult, Slot},
-    Config, Pool,
+use crate::credit::{
+    AbandonResult, Config, DeadSlotQueue, Distributor, GrantResult, Pool, Priority, Slot,
 };
 use crate::socket::channel::{Budget, UnboundedSender};
 use std::{

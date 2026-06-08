@@ -235,7 +235,10 @@ impl Slot {
         ) {
             Ok(_) => AbandonResult::Abandoned,
             Err(rc) => {
-                debug_assert_eq!(rc, RC_APP, "abandon must only be called on a LINKED slot, got {rc}");
+                debug_assert_eq!(
+                    rc, RC_APP,
+                    "abandon must only be called on a LINKED slot, got {rc}"
+                );
                 let granted = *self.granted.get();
                 if granted == GRANT_CLOSED {
                     AbandonResult::Closed
@@ -289,11 +292,6 @@ impl SlotPtr {
     #[inline]
     pub fn new(ptr: NonNull<Slot>) -> Self {
         Self(ptr)
-    }
-
-    #[inline]
-    pub fn as_non_null(&self) -> NonNull<Slot> {
-        self.0
     }
 
     /// Consume the pointer without running the drop logic.
