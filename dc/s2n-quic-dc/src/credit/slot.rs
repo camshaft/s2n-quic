@@ -57,6 +57,11 @@ pub const GRANT_CLOSED: u64 = u64::MAX;
 /// (`WriterAlloc`, `ReaderAlloc`, etc.) using the `#[repr(C)]` guarantee that `Slot`
 /// shares the same address as the outer struct.
 ///
+/// **The embedded field MUST be named `slot` and MUST live at offset 0** of the outer
+/// `#[repr(C)]` type — the pool's `drop_fn` recovers the outer type by casting `NonNull<Slot>`,
+/// which is sound only at offset 0. Use [`crate::assert_slot_at_offset_zero!`] on each outer type
+/// to enforce this at compile time.
+///
 /// Thread safety is enforced by the refcount state machine — see module-level docs.
 #[repr(C)]
 pub struct Slot {
@@ -112,6 +117,23 @@ impl Slot {
     pub unsafe fn cancel_park(&self) {
         debug_assert_eq!(self.refcount.load(Ordering::Relaxed), RC_APP);
         *self.waker.get() = None;
+    }
+
+    /// Stamp `GRANT_CLOSED` on a slot that is still APP-owned (never linked).
+    ///
+    /// Used by `Pool::poll_acquire` when it observes `closed` and short-circuits the park — the
+    /// slot stays at refcount=APP, but `poll_granted` will return `Closed` because it sees the
+    /// sentinel in `granted`.
+    ///
+    /// # Safety
+    ///
+    /// Must be called while the caller holds exclusive APP ownership of the slot (refcount=1) and
+    /// will not subsequently link it.
+    #[inline]
+    pub unsafe fn signal_closed_idle(&self) {
+        debug_assert_eq!(self.refcount.load(Ordering::Relaxed), RC_APP);
+        *self.waker.get() = None;
+        *self.granted.get() = GRANT_CLOSED;
     }
 
     /// Transition from app-owned to linked.

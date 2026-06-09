@@ -9,6 +9,7 @@ use super::*;
 use crate::{
     credit::slot::{AbandonResult, GrantResult, Slot},
     intrusive::Queue,
+    sync::AutoWake,
     testing::loom,
 };
 use core::task::{Context, Poll, Waker};
@@ -22,6 +23,7 @@ use std::{
 struct TestAlloc {
     slot: Slot,
 }
+crate::assert_slot_at_offset_zero!(TestAlloc);
 
 unsafe fn drop_test_alloc(ptr: NonNull<Slot>) {
     let ptr = ptr.cast::<TestAlloc>();
@@ -61,11 +63,13 @@ fn noop() -> Waker {
 
 /// Counts grants delivered by the distributor (and forwards each granted slot's waker).
 struct CountWake(Arc<crate::sync::AtomicUsize>);
-impl UnboundedSender<Queue<Waker>> for CountWake {
-    fn send(&mut self, mut batch: Queue<Waker>) -> Result<(), Queue<Waker>> {
+impl UnboundedSender<Queue<AutoWake>> for CountWake {
+    fn send(&mut self, mut batch: Queue<AutoWake>) -> Result<(), Queue<AutoWake>> {
         while let Some(entry) = batch.pop_front() {
             self.0.fetch_add(1, Ordering::Release);
-            entry.into_inner().wake();
+            if let Some(w) = entry.into_inner().take() {
+                w.wake();
+            }
         }
         Ok(())
     }
@@ -85,13 +89,30 @@ fn spawn_distributor(
     granted: Arc<crate::sync::AtomicUsize>,
     target: usize,
 ) -> loom::thread::JoinHandle<u64> {
+    spawn_distributor_with_budget(pool, granted, target, 1 << 16)
+}
+
+/// Same as [`spawn_distributor`] but with a configurable per-poll budget. Use a tiny budget to
+/// force the budget-exhaustion exit path through the conservation arithmetic.
+fn spawn_distributor_with_budget(
+    pool: Arc<Pool>,
+    granted: Arc<crate::sync::AtomicUsize>,
+    target: usize,
+    budget_size: usize,
+) -> loom::thread::JoinHandle<u64> {
     loom::thread::spawn(move || {
         let mut dist = Distributor::new(pool);
         let mut wakers = CountWake(granted.clone());
         loom::future::block_on(core::future::poll_fn(|cx| {
-            dist.register_waker(cx);
-            let mut budget = Budget::new(1 << 16);
+            dist.pool.waker.register(cx.waker());
+            let mut budget = Budget::new(budget_size);
             let _ = dist.poll_distribute(&mut budget, &mut wakers);
+            // Self-wake honoring the budget contract: when the budget exhausts mid-walk with work
+            // remaining, the distributor sets `needs_wake` so the caller re-polls without waiting
+            // on a `release`. Match the production wiring in `Distributor::distribute`.
+            if budget.take_needs_wake() {
+                cx.waker().wake_by_ref();
+            }
             if granted.load(Ordering::Acquire) >= target {
                 Poll::Ready(())
             } else {
@@ -117,7 +138,7 @@ fn park_races_distributor_no_overcommit() {
         const CAP: i64 = 10;
         let pool = Arc::new(Pool::new(Config {
             capacity: 0,
-            max_single_acquire: 100,
+            max_single_acquire: [100; Priority::LEVELS],
         }));
 
         // Park a waiter wanting CAP → available = -CAP, parked_demand = CAP.
@@ -139,8 +160,7 @@ fn park_races_distributor_no_overcommit() {
                 let mut wakers = CountWake(granted);
                 let mut budget = Budget::new(1 << 16);
                 let dwaker = noop();
-                let mut dcx = Context::from_waker(&dwaker);
-                dist.register_waker(&mut dcx);
+                dist.pool.waker.register(&dwaker);
                 let _ = dist.poll_distribute(&mut budget, &mut wakers);
                 dist.debug_paid_demand()
             })
@@ -209,7 +229,7 @@ fn release_wakes_parked_waiter() {
     loom::model(|| {
         let pool = Arc::new(Pool::new(Config {
             capacity: 0,
-            max_single_acquire: 100,
+            max_single_acquire: [100; Priority::LEVELS],
         }));
 
         let slot = alloc_slot();
@@ -247,7 +267,7 @@ fn concurrent_releases_accumulate() {
     loom::model(|| {
         let pool = Arc::new(Pool::new(Config {
             capacity: 0,
-            max_single_acquire: 100,
+            max_single_acquire: [100; Priority::LEVELS],
         }));
 
         let slot = alloc_slot();
@@ -281,6 +301,153 @@ fn concurrent_releases_accumulate() {
     });
 }
 
+/// Budget-exhaustion conservation: with a tight per-poll budget, the distributor must shed pull
+/// across multiple polls (carry surplus locally, fold it into the next pull). Two waiters race a
+/// release; under any interleaving conservation must hold and the per-pass writeback must never
+/// drive `available` positive while live demand remains. Loom would deadlock if a needed re-poll
+/// was lost, and the final assertion catches over-/under-count of free credit.
+#[test]
+fn budget_exhaustion_conservation() {
+    loom::model(|| {
+        const CAP: i64 = 20;
+        let pool = Arc::new(Pool::new(Config {
+            capacity: 0,
+            max_single_acquire: [100; Priority::LEVELS],
+        }));
+
+        let s1 = alloc_slot();
+        let s2 = alloc_slot();
+        let w1 = noop();
+        let w2 = noop();
+        let mut cx1 = Context::from_waker(&w1);
+        let mut cx2 = Context::from_waker(&w2);
+        let r = unsafe { pool.poll_acquire(&mut cx1, s1, 10, Priority::Medium) };
+        assert!(matches!(r, Poll::Pending));
+        let r = unsafe { pool.poll_acquire(&mut cx2, s2, 10, Priority::Medium) };
+        assert!(matches!(r, Poll::Pending));
+
+        let granted = Arc::new(crate::sync::AtomicUsize::new(0));
+        // budget=1 forces budget-exhaustion exits — the distributor will need at least two polls
+        // to satisfy both waiters, so any lost wakeup or missing carry-forward deadlocks.
+        let dist = spawn_distributor_with_budget(pool.clone(), granted.clone(), 2, 1);
+
+        let releaser = {
+            let pool = pool.clone();
+            loom::thread::spawn(move || pool.release(CAP as u64))
+        };
+        releaser.join().unwrap();
+        let paid = dist.join().unwrap();
+
+        let s1_ref = unsafe { &*s1.as_ptr() };
+        let s2_ref = unsafe { &*s2.as_ptr() };
+        assert_eq!(s1_ref.poll_granted(), GrantResult::Granted(10));
+        assert_eq!(s2_ref.poll_granted(), GrantResult::Granted(10));
+        // Conservation: parked_demand monotonic, all 20 reclassified parked → in-flight, nothing
+        // stranded in returned. (Carry can't survive on success — a quiescent pass writes it out.)
+        assert_eq!(pool.available.load(Ordering::Relaxed), 0);
+        assert_eq!(pool.parked_demand.load(Ordering::Relaxed), paid);
+        assert_eq!(pool.returned.load(Ordering::Relaxed), 0);
+
+        unsafe {
+            free_slot(s1);
+            free_slot(s2);
+        }
+    });
+}
+
+/// Distributor drop racing a release: a parked waiter's terminal state must be exactly one of
+/// `Granted` (the release won the race and the distributor served the slot before drop) or
+/// `Closed` (drop won and the slot was woken by the close path). It must never be a stranded
+/// `Pending` (lost wakeup) or a missing wake.
+#[test]
+fn distributor_drop_races_release() {
+    loom::model(|| {
+        let pool = Arc::new(Pool::new(Config {
+            capacity: 0,
+            max_single_acquire: [100; Priority::LEVELS],
+        }));
+
+        let slot = alloc_slot();
+        let waker = noop();
+        let mut cx = Context::from_waker(&waker);
+        let r = unsafe { pool.poll_acquire(&mut cx, slot, 10, Priority::Medium) };
+        assert!(matches!(r, Poll::Pending));
+
+        let dist = Distributor::new(pool.clone());
+
+        let releaser = {
+            let pool = pool.clone();
+            loom::thread::spawn(move || pool.release(10))
+        };
+        let dropper = loom::thread::spawn(move || {
+            // Run a single pass before dropping — this is the realistic race: the distributor task
+            // might still be polling when its task gets cancelled.
+            let mut wakers = CountWake(Arc::new(crate::sync::AtomicUsize::new(0)));
+            let mut budget = Budget::new(1 << 16);
+            let dwaker = noop();
+            dist.pool.waker.register(&dwaker);
+            let mut dist = dist;
+            let _ = dist.poll_distribute(&mut budget, &mut wakers);
+            // Now drop.
+            drop(dist);
+        });
+
+        releaser.join().unwrap();
+        dropper.join().unwrap();
+
+        let slot_ref = unsafe { &*slot.as_ptr() };
+        let result = slot_ref.poll_granted();
+        assert!(
+            matches!(result, GrantResult::Granted(10) | GrantResult::Closed),
+            "stranded slot: {result:?}"
+        );
+
+        unsafe { free_slot(slot) };
+    });
+}
+
+/// Distributor drop racing a fresh `poll_acquire`: the parker's terminal state must be one of
+/// `Granted` (impossible here without a release, but legal in shape) or `Closed` (the drop's
+/// close walk picked it up after it linked) or — if the parker observed `closed=true` after
+/// taking the tier lock — a direct `Closed` via `signal_closed_idle`. Never stranded Pending.
+#[test]
+fn distributor_drop_races_poll_acquire() {
+    loom::model(|| {
+        let pool = Arc::new(Pool::new(Config {
+            capacity: 0,
+            max_single_acquire: [100; Priority::LEVELS],
+        }));
+
+        let dist = Distributor::new(pool.clone());
+
+        let parker = {
+            let pool = pool.clone();
+            loom::thread::spawn(move || {
+                let n = alloc_slot();
+                let nwaker = noop();
+                let mut ncx = Context::from_waker(&nwaker);
+                let _ = unsafe { pool.poll_acquire(&mut ncx, n, 5, Priority::Medium) };
+                SendPtr(n)
+            })
+        };
+        let dropper = loom::thread::spawn(move || {
+            drop(dist);
+        });
+
+        let n_ptr = parker.join().unwrap().0;
+        dropper.join().unwrap();
+
+        let n_ref = unsafe { &*n_ptr.as_ptr() };
+        let result = n_ref.poll_granted();
+        assert!(
+            matches!(result, GrantResult::Closed),
+            "expected Closed, got: {result:?}"
+        );
+
+        unsafe { free_slot(n_ptr) };
+    });
+}
+
 /// No-snipe: while a waiter is parked, a newcomer's fast-path `poll_acquire` racing a `release`
 /// must never succeed — released credit goes to `returned` (invisible to the fast path) and the
 /// fast path debits an `available` already driven negative by the parked waiter's demand. We
@@ -292,7 +459,7 @@ fn newcomer_cannot_snipe() {
     loom::model(|| {
         let pool = Arc::new(Pool::new(Config {
             capacity: 0,
-            max_single_acquire: 100,
+            max_single_acquire: [100; Priority::LEVELS],
         }));
 
         // Pre-park a waiter requesting 10 → available = -10.

@@ -41,18 +41,30 @@
 //! (never re-linked), so under a sustained backlog the tier mutex is taken only on refill. Grants
 //! are **full** (`requested`), strict priority, FIFO within a tier, and the walk stops at the first
 //! affordable-but-unaffordable live head (head-of-line blocking by design).
+//!
+//! # Lifetime contract
+//!
+//! The pool is owned by `Arc<Pool>`; producers and the [`Distributor`] both hold one. Dropping the
+//! `Distributor` **closes the pool**: each tier mutex is taken to mark the tier closed and drain
+//! its waiters (each one woken with [`crate::credit::slot::GrantResult::Closed`]), and any
+//! subsequent `poll_acquire` short-circuits the park under the same mutex. This is the production
+//! close path — the implicit `Arc<Pool>` drop only runs after the *last* outstanding stream
+//! finishes, which is too late to recover from an unwanted distributor cancellation. See
+//! [`Distributor`]'s docs for the full contract.
 
 use super::{
     config::Config,
+    counters::Counters,
     slot::{DeadSlot, DeadSlotQueue, Slot, SlotAdapter, SlotPtr},
     waker::TaskWaker,
 };
 use crate::{
     intrusive::{Entry, List, Queue},
     socket::channel::{Budget, UnboundedSender},
-    sync::{lock, Arc, AtomicI64, AtomicU64, Mutex, Ordering},
+    sync::{lock, Arc, AtomicI64, AtomicU64, AutoWake, Mutex, Ordering},
 };
-use core::task::{Context, Poll, Waker};
+use crate::tracing::{debug, trace};
+use core::task::{Context, Poll};
 use crossbeam_utils::CachePadded;
 use std::ptr::NonNull;
 
@@ -94,14 +106,47 @@ pub struct Pool {
     config: Config,
     waker: TaskWaker,
     /// One wait list per priority. Held under a mutex; the distributor briefly locks each tier
-    /// only to refill an empty mirror via `List::detach`. Each tier is cache-padded so that
-    /// producers parking on different priorities don't share a line — without padding, a producer
-    /// on tier 3 invalidates the distributor's cached read of tier 4 on every walk.
-    tiers: [CachePadded<Mutex<List<SlotAdapter>>>; Priority::LEVELS],
+    /// only to refill an empty mirror. Each tier is cache-padded so that producers parking on
+    /// different priorities don't share a line — without padding, a producer on tier 3
+    /// invalidates the distributor's cached read of tier 4 on every walk.
+    ///
+    /// The per-tier `closed` flag rides under the same mutex as the list. [`Distributor::drop`]
+    /// sets it while draining each tier; concurrent [`Pool::poll_acquire`] callers observe it
+    /// when they take the tier lock to push and short-circuit the park, signalling closure on
+    /// the slot directly. Folding `closed` into the existing critical section avoids a separate
+    /// atomic load on the slow path — producers already pay the lock acquire to push.
+    ///
+    /// `release` does NOT check closure: it only touches `returned` (a benign atomic that no
+    /// one will ever read on a closed pool) and the distributor's waker (a no-op load when the
+    /// distributor is gone). Skipping the check there saves an atomic on the hot release path.
+    tiers: [CachePadded<Mutex<Tier>>; Priority::LEVELS],
+    /// Observability handles. Default is a no-op `Registry` (every emit is dropped on the floor).
+    /// Wire in real counters via [`Pool::with_counters`].
+    counters: Counters,
+}
+
+/// A single priority tier: the wait list plus a closed flag, both protected by the same mutex.
+struct Tier {
+    list: List<SlotAdapter>,
+    closed: bool,
+}
+
+impl Tier {
+    fn new() -> Self {
+        Self {
+            list: List::new(),
+            closed: false,
+        }
+    }
 }
 
 impl Pool {
     pub fn new(config: Config) -> Self {
+        Self::with_counters(config, Counters::default())
+    }
+
+    /// Construct a pool with externally-registered observability counters.
+    pub fn with_counters(config: Config, counters: Counters) -> Self {
         let config = config.normalized();
 
         Self {
@@ -110,7 +155,8 @@ impl Pool {
             parked_demand: CachePadded::new(AtomicU64::new(0)),
             config,
             waker: TaskWaker::new(),
-            tiers: std::array::from_fn(|_| CachePadded::new(Mutex::new(List::new()))),
+            tiers: std::array::from_fn(|_| CachePadded::new(Mutex::new(Tier::new()))),
+            counters,
         }
     }
 
@@ -134,7 +180,7 @@ impl Pool {
         n: u64,
         priority: Priority,
     ) -> Poll<u64> {
-        let n = self.config.clamp_request(n);
+        let n = self.config.clamp_request(n, priority);
         if n == 0 {
             return Poll::Ready(0);
         }
@@ -146,6 +192,8 @@ impl Pool {
         // `parked_demand.fetch_add(Release)` below, so no Release is needed here.
         let prev = self.available.fetch_sub(n as i64, Ordering::Acquire);
         if prev >= n as i64 {
+            self.counters.acquire_fast_path.add(1);
+            self.counters.acquire_bytes.add(n);
             return Poll::Ready(n);
         }
 
@@ -160,9 +208,31 @@ impl Pool {
         slot_ref.prepare_park(n, cx.waker());
 
         let mut tier = lock(&self.tiers[priority as usize]);
+        // Once the distributor has marked this tier closed, the drain walk has either run or is
+        // running and there is no agent to deliver credit. Skip the park, signal closure on the
+        // slot directly, and wake the caller so its next poll observes `GrantResult::Closed`.
+        // The mutex itself synchronizes us with `Distributor::drop`: either the drain swapped
+        // the list and set `closed` before we got the lock (we see `closed=true` and bail), or
+        // we got the lock first and pushed (the drain will pick up our slot under the same lock).
+        if tier.closed {
+            slot_ref.cancel_park();
+            // Refund the speculative debit; the slot never linked, so this credit is "as if" the
+            // poll had never happened.
+            self.available.fetch_add(n as i64, Ordering::Release);
+            slot_ref.signal_closed_idle();
+            trace!(target: "credit::pool", n, "poll_acquire on closed pool");
+            cx.waker().wake_by_ref();
+            return Poll::Pending;
+        }
         self.parked_demand.fetch_add(n, Ordering::Release);
-        tier.push_back(SlotPtr::new(slot));
+        tier.list.push_back(SlotPtr::new(slot));
         slot_ref.transition_to_linked();
+
+        self.counters.acquire_parked[priority as usize].add(1);
+        // The bytes counter is incremented at park time (not grant time) so the metric reflects
+        // *demand*, not *delivered* throughput; pair with `credit.distributor.granted` to
+        // distinguish backlog from in-flight.
+        self.counters.acquire_bytes.add(n);
 
         Poll::Pending
     }
@@ -172,11 +242,19 @@ impl Pool {
     /// Returned credit is staged in `returned`, where the fast path cannot see it, so a concurrent
     /// acquirer cannot snipe ahead of a parked waiter. The distributor pulls `returned` at the top
     /// of its next pass.
+    ///
+    /// `release` does not check whether the pool is closed: the only side effects are the
+    /// `returned` add (a benign atomic that goes nowhere if the distributor is gone) and the
+    /// `waker.wake()` call (a no-op load when the registered waker has already been dropped). A
+    /// closed-pool check here would add an extra atomic load on the hot release path — which the
+    /// integration plan calls per `bytes_in_flight` decrement — for no behavioural benefit.
     pub fn release(&self, n: u64) {
         if n == 0 {
             return;
         }
         self.returned.fetch_add(n, Ordering::Release);
+        self.counters.release_bytes.add(n);
+        self.counters.release_calls.add(1);
         self.waker.wake();
     }
 
@@ -200,9 +278,21 @@ impl Pool {
 /// it as a task with [`Distributor::distribute`]; the future registers the distributor's waker on
 /// the pool once and yields cooperatively under a budget.
 ///
-/// On drop, the mirror lists drop, which closes (writes `GRANT_CLOSED` and wakes) any waiters the
-/// distributor was holding — the distributor-owned half of the shutdown path. Slots still in the
-/// shared tiers are closed by [`Pool`]'s implicit drop.
+/// # Lifetime contract
+///
+/// Dropping the [`Distributor`] **closes the [`Pool`]**: each tier mutex is taken to mark the
+/// tier closed and drain its waiters (each woken with [`GrantResult::Closed`]); the distributor's
+/// local mirror is closed implicitly when the field drops. Subsequent calls to [`Pool::release`]
+/// remain functional but go nowhere — `returned` accumulates uselessly and the dead waker is a
+/// no-op load — so producers don't need a closed check on the hot release path. Subsequent calls
+/// to [`Pool::poll_acquire`] short-circuit the park under the same per-tier mutex used by the
+/// drain: the slot's `granted` field is stamped with `GRANT_CLOSED` directly and the caller's
+/// waker fires so the next poll observes [`GrantResult::Closed`].
+///
+/// This is the production close path. With every stream in the integration plan holding
+/// `Arc<Pool>`, only [`Distributor::drop`] can guarantee the close timing — the implicit
+/// `Arc<Pool>` drop happens after the *last* stream finishes, which is too late for an unwanted
+/// distributor cancellation.
 pub struct Distributor {
     pool: Arc<Pool>,
     /// One mirror list per priority. Each shares its shared tier's list id (seeded by `detach`).
@@ -211,14 +301,21 @@ pub struct Distributor {
     /// is `pool.parked_demand − paid_demand`. Lives here so the shared atomic stays add-only —
     /// producers never contend with the distributor on the same line for a decrement.
     paid_demand: u64,
+    /// Pull bytes the previous pass could not safely write back without driving `available`
+    /// positive while live parked waiters still demand credit. Folded into `pull` at the top of the
+    /// next pass. Holding the surplus distributor-locally (instead of staging it back through
+    /// `returned`) keeps the shared `returned` line a single producer/single consumer atomic.
+    carry: u64,
 }
 
 impl Distributor {
     pub fn new(pool: Arc<Pool>) -> Self {
+        debug!(target: "credit::pool", "distributor created");
         Self {
             pool,
             local: std::array::from_fn(|_| List::new()),
             paid_demand: 0,
+            carry: 0,
         }
     }
 
@@ -228,15 +325,27 @@ impl Distributor {
         self.paid_demand
     }
 
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub(crate) fn debug_carry(&self) -> u64 {
+        self.carry
+    }
+
     /// Drive the distributor as an async task.
     ///
     /// `budget` bounds the work per poll; the future yields when the budget is exhausted and
     /// re-arms via the standard `take_needs_wake` self-wake. `wakers_tx` receives one
-    /// [`Queue<Waker>`] batch per poll cycle holding every slot the distributor woke during that
-    /// cycle — empty cycles do not send. The future never resolves; drop the task to shut down.
+    /// [`Queue<AutoWake>`] batch per poll cycle holding every slot the distributor woke during
+    /// that cycle — empty cycles do not send. The future never resolves; drop the task to shut down.
+    ///
+    /// The wakers ride through the channel as [`AutoWake`] tokens: if the channel is closed or the
+    /// downstream drops the batch without draining, every still-`Some` token wakes its parked task
+    /// on drop. A grant that has already mutated the slot's `granted` field cannot be retracted,
+    /// so the parked task must be woken regardless of channel state — `AutoWake` makes that
+    /// guarantee structural rather than relying on the producer to handle each failure mode.
     pub async fn distribute<W>(mut self, mut budget: Budget, mut wakers_tx: W)
     where
-        W: UnboundedSender<Queue<Waker>>,
+        W: UnboundedSender<Queue<AutoWake>>,
     {
         // Register exactly once on the first poll. Subsequent polls keep the registered waker —
         // the steady-state loop below never touches it.
@@ -265,21 +374,22 @@ impl Distributor {
     /// Loops passes while each makes progress and budget remains. When a pass makes no progress,
     /// returns `Poll::Pending`; when budget runs out with work remaining, sets `needs_wake` so the
     /// outer drain re-polls. Work per poll is bounded by the budget, regardless of backlog size or
-    /// `release`-during-pass churn. The caller is responsible for [`register_waker`](Self::register_waker)
-    /// (lost-wakeup discipline) before the first poll.
+    /// `release`-during-pass churn. The caller is responsible for registering the distributor's
+    /// waker on the pool (see [`Distributor::distribute`] for the standard wiring) before the first
+    /// poll, otherwise releases will not drive a re-poll.
     ///
     /// On every `Pending` exit, the accumulated waker batch is shipped to `wakers_tx` as a single
     /// send (no send when empty). Dead slots are freed inline inside `pass`, outside any tier lock.
     pub(crate) fn poll_distribute<W>(&mut self, budget: &mut Budget, wakers_tx: &mut W) -> Poll<()>
     where
-        W: UnboundedSender<Queue<Waker>>,
+        W: UnboundedSender<Queue<AutoWake>>,
     {
         // Wakers and dead slots accumulate during the pass and are flushed at the end of the
         // poll cycle: linking each one is two pointer writes (cheap), but the actual work — a
         // channel send for the wakers, and `drop_fn` per dead slot for the dead queue — would
         // otherwise stall the inner loop on every grant/reap. Both queues live on the poll stack,
         // so storage is reclaimed between polls.
-        let mut pending_wakers = Queue::<Waker>::new();
+        let mut pending_wakers = Queue::<AutoWake>::new();
         let mut dead = DeadSlotQueue::new();
         let result = loop {
             let progressed = self.pass(budget, &mut pending_wakers, &mut dead);
@@ -293,9 +403,9 @@ impl Distributor {
         };
 
         if !pending_wakers.is_empty() {
-            // UnboundedSender::send returning Err means the channel is closed; the returned batch
-            // drops here, which is fine — a closed waker channel implies shutdown and the slots
-            // will see Closed via the pool's drop path.
+            // `send` returning Err returns the batch — `AutoWake` drops in each entry will fire
+            // the wake automatically, so a closed channel cannot strand a granted slot. We
+            // intentionally discard the Err and let the drop path do the work.
             let _ = wakers_tx.send(pending_wakers);
         }
         // `dead` drops here at the end of the poll cycle — its drop walks the list and runs each
@@ -305,16 +415,24 @@ impl Distributor {
         result
     }
 
-    /// A single distribution pass. Returns whether it made progress (granted or reaped anything, or
-    /// pulled fresh credit). Stops early if the budget is exhausted. Granted slots' wakers are
-    /// pushed into `pending_wakers`; dead slots are pushed into `dead` and freed when that queue
-    /// drops at the end of the poll cycle (their drop_fn must run outside any tier lock).
+    /// A single distribution pass. Returns whether it made progress (granted or reaped anything,
+    /// or had pulled credit — including carried credit from a previous pass). Stops early if the
+    /// budget is exhausted. Granted slots' wakers are pushed into `pending_wakers`; dead slots are
+    /// pushed into `dead` and freed when that queue drops at the end of the poll cycle (their
+    /// drop_fn must run outside any tier lock).
+    ///
+    /// No-snipe across all exits: the end-of-pass writeback caps the pull portion at the
+    /// after-grant live parked demand. On the unaffordability exit this is a no-op (the cap is
+    /// never tighter than the natural bound). On the budget-exhaustion exit, where affordable
+    /// waiters can still be linked, the cap prevents `available` from going positive while owed
+    /// credit still has parkers; the surplus carries to the next pass via `self.carry`.
     fn pass(
         &mut self,
         budget: &mut Budget,
-        pending_wakers: &mut Queue<Waker>,
+        pending_wakers: &mut Queue<AutoWake>,
         dead: &mut DeadSlotQueue,
     ) -> bool {
+        self.pool.counters.distributor_passes.add(1);
         // Recover true free credit `= capacity − in_flight = available + outstanding_demand`,
         // plus the newly-returned `pull`. `available` is held negative by every parked waiter's
         // subtraction; `outstanding_demand` cancels exactly that.
@@ -331,7 +449,12 @@ impl Distributor {
         // (conservative, that waiter is simply served next pass). The reverse order could
         // *over*-count by `n` and grant a waiter we can't afford (over-commit past capacity).
         // Acquire pairs with `release()`'s Release-add. The stored `0` has no acquiring reader.
-        let pull = self.pool.returned.swap(0, Ordering::Acquire);
+        //
+        // Fold any `carry` surplus from the previous pass back into `pull`. Carry exists when the
+        // previous pass could not write the full pulled credit back to `available` without driving
+        // it positive past live parked demand (which would let a fresh fast-path acquirer snipe).
+        let pull = self.pool.returned.swap(0, Ordering::Acquire) + self.carry;
+        self.carry = 0;
         let outstanding =
             (self.pool.parked_demand.load(Ordering::Acquire) - self.paid_demand) as i64;
         let mut free = self.pool.available.load(Ordering::Acquire) + outstanding + pull as i64;
@@ -353,10 +476,10 @@ impl Distributor {
                     }
                     refilled = true;
                     let mut shared = lock(tier);
-                    if shared.is_empty() {
+                    if shared.list.is_empty() {
                         break;
                     }
-                    core::mem::swap(local, &mut *shared);
+                    core::mem::swap(local, &mut shared.list);
                 }
 
                 // Grant heads while affordable. Reap dead heads unconditionally (a dead corpse at
@@ -373,6 +496,7 @@ impl Distributor {
                     self.paid_demand += req;
                     dead_released += req;
                     free += req as i64;
+                    self.pool.counters.distributor_reaped.add(1);
                     // SAFETY: a dead slot (refcount=0) has been popped from every list and is owned
                     // by us; wrapping it in `DeadSlot` transfers ownership to the dead queue, which
                     // runs the drop_fn at end-of-poll outside the work loop.
@@ -385,6 +509,7 @@ impl Distributor {
                 }
 
                 if !budget.consume() {
+                    self.pool.counters.distributor_budget_exhausted.add(1);
                     break 'walk;
                 }
 
@@ -406,9 +531,14 @@ impl Distributor {
                             // Full grant: the waiter's park-time subtraction stays in `available`
                             // (reclassified parked → in-flight); we only drop its demand. Stash
                             // the waker locally; the batch is shipped at the end of the poll cycle.
+                            // Wrap in AutoWake so the wake fires even if the batch is dropped
+                            // before delivery — a granted slot has already had its `granted` field
+                            // mutated and MUST be woken.
                             free -= req as i64;
                             granted_any = true;
-                            pending_wakers.push_back(Entry::new(waker));
+                            self.pool.counters.distributor_granted.add(1);
+                            trace!(target: "credit::pool", req, "grant");
+                            pending_wakers.push_back(Entry::new(AutoWake::new(Some(waker))));
                         }
                         None => {
                             // Raced: the app abandoned between our `is_dead` check and the CAS.
@@ -416,6 +546,8 @@ impl Distributor {
                             // Push into the dead queue; its drop at end-of-poll frees the slot.
                             dead_released += req;
                             free += req as i64;
+                            self.pool.counters.abandon_granted_race.add(1);
+                            trace!(target: "credit::pool", req, "abandon_granted_race");
                             dead.push_back(DeadSlot::new(ptr));
                         }
                     }
@@ -423,16 +555,78 @@ impl Distributor {
             }
         }
 
-        // Single end-of-pass write: return pulled credit plus any reclaimed dead demand. Grants do
-        // not write `available`. If any live waiter remains, its `requested` exceeded `free`, which
-        // forces `available <= 0` here — preserving no-snipe.
-        let writeback = pull + dead_released;
+        // End-of-pass writeback. We hold `pull + dead_released` total credit:
+        //   * `pull` — bytes pulled from `returned` (plus any carried-over from a prior pass).
+        //   * `dead_released` — avail-debits the walk reclaimed when reaping dead slots, which
+        //     must be returned to `available` to balance the original park-time `available -= req`.
+        //
+        // If we wrote back the full total, two pass exit paths are safe and one is not:
+        //
+        //   * The unaffordability exit (`req > free` for a live head) leaves the walk's outstanding
+        //     demand unreduced relative to the credit we pulled, so `available + writeback <= 0`
+        //     holds naturally and no-snipe is preserved.
+        //   * Quiescent exits (all live heads granted) drain `live_parked` to zero; nobody can be
+        //     sniped because nobody is parked.
+        //   * The budget-exhaustion exit can leave affordable waiters still linked. Writing the
+        //     full pull then drives `available` positive while owed credit still has parkers — a
+        //     fresh fast-path acquirer would snipe credit destined for those parkers. To preserve
+        //     no-snipe across this exit, we cap the writeback by the live remaining demand and
+        //     hold the surplus in `self.carry` for the next pass to fold back into `pull`.
+        //
+        // `dead_released` always writes back (those debits are real reclaimed credit, not pull).
+        // The pull portion is capped at `live_parked` so `available` never overruns after-grant
+        // outstanding demand.
+        let live_parked = self
+            .pool
+            .parked_demand
+            .load(Ordering::Acquire)
+            .saturating_sub(self.paid_demand);
+        let total = pull + dead_released;
+        let writeback = if live_parked == 0 {
+            total
+        } else {
+            total.min(live_parked + dead_released)
+        };
+        self.carry = total - writeback;
+        self.pool
+            .counters
+            .distributor_carry_bytes
+            .set(self.carry as i64);
         if writeback > 0 {
             self.pool
                 .available
                 .fetch_add(writeback as i64, Ordering::Release);
         }
 
+        // Forward progress: `pull > 0` covers the "carried credit waiting to be written back"
+        // case, since carry is folded into `pull` at the top of every pass.
         granted_any || dead_released > 0 || pull > 0
+    }
+}
+
+impl Drop for Distributor {
+    fn drop(&mut self) {
+        debug!(target: "credit::pool", "distributor dropping; closing pool");
+        // Drain each shared tier under its lock, marking the tier `closed` in the same critical
+        // section. Concurrent `poll_acquire` callers serialize on the tier mutex: they either
+        // observe `closed=false` and push (we'll pick up their slot here), or they observe
+        // `closed=true` after we've already drained and short-circuit on the slot directly.
+        // No separate atomic flag — the lock itself is the synchronization point.
+        //
+        // Drop the drained list OUTSIDE the lock: `SlotPtr::drop` performs the LINKED→APP CAS,
+        // writes `GRANT_CLOSED`, and wakes the parked task; that wake can be arbitrarily slow
+        // (runtime-dependent) and would otherwise stall a hot critical section.
+        for tier in self.pool.tiers.iter() {
+            let mut drained: List<SlotAdapter> = List::new();
+            {
+                let mut shared = lock(tier);
+                shared.closed = true;
+                core::mem::swap(&mut drained, &mut shared.list);
+            }
+            drop(drained);
+        }
+
+        // The local mirror drops automatically with the field. Each entry there is also a
+        // `SlotPtr`, so its drop closes the slot just as the shared-tier walk above does.
     }
 }

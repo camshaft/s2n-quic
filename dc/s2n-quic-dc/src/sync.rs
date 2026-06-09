@@ -17,6 +17,9 @@
 
 pub mod free_list;
 pub(crate) mod waiter;
+pub mod wake;
+
+pub use wake::AutoWake;
 
 #[cfg(all(feature = "loom", test))]
 #[allow(unused_imports)]
