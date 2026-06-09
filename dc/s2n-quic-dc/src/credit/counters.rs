@@ -90,8 +90,7 @@ impl Counters {
             distributor_granted: registry.register("credit.distributor.granted"),
             distributor_reaped: registry.register("credit.distributor.reaped"),
             distributor_carry_bytes: registry.register_gauge("credit.distributor.carry_bytes"),
-            distributor_budget_exhausted: registry
-                .register("!credit.distributor.budget_exhausted"),
+            distributor_budget_exhausted: registry.register("!credit.distributor.budget_exhausted"),
             abandon_granted_race: registry.register("!credit.abandon.granted_race"),
         }
     }

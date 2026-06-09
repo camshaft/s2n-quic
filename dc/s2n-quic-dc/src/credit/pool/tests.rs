@@ -779,7 +779,10 @@ fn budget_exhaustion_preserves_no_snipe() {
 
     // Two of the four are now granted.
     let granted_count: usize = counters.iter().map(|c| c.wakeups()).sum();
-    assert_eq!(granted_count, 2, "expected exactly two grants under budget=2");
+    assert_eq!(
+        granted_count, 2,
+        "expected exactly two grants under budget=2"
+    );
 
     // Two waiters remain pending.
     let pending_count = counters.iter().filter(|c| c.wakeups() == 0).count();

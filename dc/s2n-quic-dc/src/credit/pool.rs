@@ -62,8 +62,8 @@ use crate::{
     intrusive::{Entry, List, Queue},
     socket::channel::{Budget, UnboundedSender},
     sync::{lock, Arc, AtomicI64, AtomicU64, AutoWake, Mutex, Ordering},
+    tracing::{debug, trace},
 };
-use crate::tracing::{debug, trace};
 use core::task::{Context, Poll};
 use crossbeam_utils::CachePadded;
 use std::ptr::NonNull;
