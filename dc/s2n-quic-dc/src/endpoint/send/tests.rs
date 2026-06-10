@@ -55,6 +55,7 @@ fn make_frame(payload_len: usize) -> crate::intrusive::Entry<Frame> {
             offset: s2n_quic_core::varint::VarInt::ZERO,
             is_fin: false,
             dest_acceptor_id: None,
+            priority: crate::credit::Priority::default(),
         },
         payload,
         path_secret_entry: make_path_secret_entry(),
@@ -62,6 +63,7 @@ fn make_frame(payload_len: usize) -> crate::intrusive::Entry<Frame> {
         status: TransmissionStatus::Pending,
         ttl: DEFAULT_TTL,
         enqueued_at: None,
+        flow_credits: 0,
     }
     .into()
 }

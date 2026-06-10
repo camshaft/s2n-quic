@@ -1,13 +1,20 @@
 ---
 source: dc/s2n-quic-dc/src/testing.rs
+assertion_line: 352
 expression: logs
 ---
 0:00:00.000000000 [server] DEBUG s2n_quic_dc: capacity=50000
 0:00:00.000000000 [server] DEBUG setting up endpoint config.layout=WorkerLayout { frame_dispatch: 0, send: [1, 2, 3, 4], recv_io: [5, 6], recv_dispatch: [7, 8, 9, 10], waker_drain: [11], background: 12 } send_sockets=[10.0.0.1:4433, 10.0.0.1:49152, 10.0.0.1:49153, 10.0.0.1:49154, 10.0.0.1:49155, 10.0.0.1:49156, 10.0.0.1:49157, 10.0.0.1:49158] recv_sockets=[10.0.0.1:4433, 10.0.0.1:49152, 10.0.0.1:49153, 10.0.0.1:49154, 10.0.0.1:49155, 10.0.0.1:49156, 10.0.0.1:49157, 10.0.0.1:49158]
+0:00:00.000000000 [server] DEBUG distributor created
+0:00:00.000000000 [server] DEBUG distributor created
 0:00:00.000000000 [client] DEBUG s2n_quic_dc: capacity=50000
 0:00:00.000000000 [client] DEBUG setting up endpoint config.layout=WorkerLayout { frame_dispatch: 0, send: [1, 2, 3, 4], recv_io: [5, 6], recv_dispatch: [7, 8, 9, 10], waker_drain: [11], background: 12 } send_sockets=[10.0.0.2:49152, 10.0.0.2:49153, 10.0.0.2:49154, 10.0.0.2:49155, 10.0.0.2:49156, 10.0.0.2:49157, 10.0.0.2:49158, 10.0.0.2:49159] recv_sockets=[10.0.0.2:49152, 10.0.0.2:49153, 10.0.0.2:49154, 10.0.0.2:49155, 10.0.0.2:49156, 10.0.0.2:49157, 10.0.0.2:49158, 10.0.0.2:49159]
+0:00:00.000000000 [client] DEBUG distributor created
+0:00:00.000000000 [client] DEBUG distributor created
 0:00:00.000000000 [server] TRACE m#task.priority_router.drained=0
 0:00:00.000000000 [server] TRACE m#task.frame_dispatch.drained=0
+0:00:00.000000000 [server] TRACE c#credit.send.distributor.passes=1
+0:00:00.000000000 [server] TRACE c#credit.recv.distributor.passes=1
 0:00:00.000000000 [server] TRACE m#task.context_resolver.drained[send.worker.0]=0
 0:00:00.000000000 [server] TRACE m#task.ack_processor.drained[send.worker.0]=0
 0:00:00.000000000 [server] TRACE m#task.completion.drained[send.worker.0]=0
@@ -85,6 +92,8 @@ expression: logs
 0:00:00.000000000 [server] TRACE m#task.freed_batch_router.drained[background]=0
 0:00:00.000000000 [client] TRACE m#task.priority_router.drained=0
 0:00:00.000000000 [client] TRACE m#task.frame_dispatch.drained=0
+0:00:00.000000000 [client] TRACE c#credit.send.distributor.passes=1
+0:00:00.000000000 [client] TRACE c#credit.recv.distributor.passes=1
 0:00:00.000000000 [client] TRACE m#task.context_resolver.drained[send.worker.0]=0
 0:00:00.000000000 [client] TRACE m#task.ack_processor.drained[send.worker.0]=0
 0:00:00.000000000 [client] TRACE m#task.completion.drained[send.worker.0]=0
@@ -173,10 +182,14 @@ expression: logs
 0:00:00.000000000 [client] DEBUG Reader dropping binding_id=1 status=Open final_size=None consumed_len=0 total_received_len=0 is_writing_complete=false is_reading_complete=false
 0:00:00.000000000 [client] DEBUG Sent QueueReset binding_id=1 error_code=4 reset_target=Control
 0:00:00.000000000 [client] DEBUG Reader dropped before FIN received - sent STOP_SENDING binding_id=1
+0:00:00.000000000 [client] TRACE c#credit.send.acquire.fast_path=1
+0:00:00.000000000 [client] TRACE c#credit.send.acquire.bytes=1361
 0:00:00.000000000 [client] DEBUG event=on_init_sent prev=Init next=InitSent location=dc/s2n-quic-dc/src/stream/writer.rs
 0:00:00.000000000 [client] DEBUG Sent QueueInit with early data binding_id=1 bytes_read=1361 is_fin=false
 0:00:00.000000000 [server] TRACE m#task.priority_router.drained=0
 0:00:00.000000000 [server] TRACE m#task.frame_dispatch.drained=0
+0:00:00.000000000 [server] TRACE c#credit.send.distributor.passes=1
+0:00:00.000000000 [server] TRACE c#credit.recv.distributor.passes=1
 0:00:00.000000000 [server] TRACE m#task.context_resolver.drained[send.worker.0]=0
 0:00:00.000000000 [server] TRACE m#task.ack_processor.drained[send.worker.0]=0
 0:00:00.000000000 [server] TRACE m#task.completion.drained[send.worker.0]=0
@@ -266,6 +279,8 @@ expression: logs
 0:00:00.000000000 [client] TRACE c#q.router_to_batcher.drain[p3]=1
 0:00:00.000000000 [client] TRACE g#q.router_to_batcher.depth[p3]=0
 0:00:00.000000000 [client] TRACE m#task.frame_dispatch.drained=4
+0:00:00.000000000 [client] TRACE c#credit.send.distributor.passes=1
+0:00:00.000000000 [client] TRACE c#credit.recv.distributor.passes=1
 0:00:00.000000000 [client] TRACE m#task.context_resolver.drained[send.worker.0]=0
 0:00:00.000000000 [client] TRACE m#task.ack_processor.drained[send.worker.0]=0
 0:00:00.000000000 [client] TRACE m#task.completion.drained[send.worker.0]=0
@@ -390,7 +405,7 @@ expression: logs
 0:00:00.000021000 [client] TRACE c#send.pending.drain[send.0]=1
 0:00:00.000021000 [client] TRACE g#send.pending.depth[send.0]=0
 0:00:00.000021000 [client] TRACE c#tx.frame[queue_data]=1
-0:00:00.000021000 [client] TRACE m#tx.packet_size=1416
+0:00:00.000021000 [client] TRACE m#tx.packet_size=1417
 0:00:00.000021000 [client] TRACE m#tx.frames_per_packet=2
 0:00:00.000021000 [client] TRACE m#tx.payload_size=1361
 0:00:00.000021000 [client] TRACE c#tx.data=1
@@ -398,19 +413,23 @@ expression: logs
 0:00:00.000021000 [client] TRACE c#send.inflight.enq[send.0]=1
 0:00:00.000021000 [client] TRACE g#send.inflight.depth[send.0]=1
 0:00:00.000021000 [client] TRACE m#send.inflight.depth_dist[send.0]=1
+0:00:00.000021000 [client] TRACE c#credit.send.release.bytes=1361
+0:00:00.000021000 [client] TRACE c#credit.send.release.calls=1
 0:00:00.000021000 [client] TRACE m#asm.segments=1
 0:00:00.000021000 [client] TRACE c#q.resolver_to_pto_wheel.sender[send.worker.0.task.assembler.send.0]=1
 0:00:00.000021000 [client] TRACE c#q.resolver_to_pto_wheel.enq[send.worker.0]=1
 0:00:00.000021000 [client] TRACE g#q.resolver_to_pto_wheel.depth[send.worker.0]=1
 0:00:00.000021000 [client] TRACE m#q.resolver_to_pto_wheel.depth_dist[send.worker.0]=1
 0:00:00.000021000 [client] TRACE c#socket.tx.ops[send.0]=1
-0:00:00.000021000 [client] TRACE c#socket.tx.bytes[send.0]=1416
+0:00:00.000021000 [client] TRACE c#socket.tx.bytes[send.0]=1417
 0:00:00.000021000 [client] TRACE m#task.assembler.drained[send.0]=1
 0:00:00.000021000 [client] TRACE m#task.tx_wheel.drained[send.worker.0]=0
+0:00:00.000021000 [client] TRACE c#credit.send.distributor.passes=1
+0:00:00.000021000 [client] TRACE c#credit.send.distributor.passes=1
 0:00:00.000021000 [client] TRACE m#task.pto_wheel.drained[send.worker.0]=1
 0:00:00.000021000 [client] TRACE m#task.pto_wheel.drained[send.worker.0]=0
 0:00:00.000521000 [server] TRACE c#socket.rx.ops[recv.0]=1
-0:00:00.000521000 [server] TRACE c#socket.rx.bytes[recv.0]=1416
+0:00:00.000521000 [server] TRACE c#socket.rx.bytes[recv.0]=1417
 0:00:00.000521000 [server] TRACE c#router.routed=1
 0:00:00.000521000 [server] TRACE c#router.routed[recv.0]=1
 0:00:00.000521000 [server] TRACE c#q.dispatch_rx.enq[recv.0]=1
@@ -613,7 +632,7 @@ expression: logs
 0:00:00.001021000 [client] TRACE m#tx.ack_packets[send.0]=1
 0:00:00.001021000 [client] TRACE c#send.inflight.drain.ack[send.0]=1
 0:00:00.001021000 [client] TRACE c#tx.ecn.ect0[send.0]=1
-0:00:00.001021000 [client] TRACE m#send.cwnd[send.0]=16136
+0:00:00.001021000 [client] TRACE m#send.cwnd[send.0]=16137
 0:00:00.001021000 [client] TRACE m#send.pacing_rate[send.0]=40368997
 0:00:00.001021000 [client] TRACE c#send.app_limited[send.0]=1
 0:00:00.001021000 [client] TRACE m#task.ack_processor.drained[send.worker.0]=2
@@ -667,6 +686,8 @@ expression: logs
 0:00:00.001041000 [client] DEBUG poll_remote_budget received messages binding_id=1 status=InitSent msg_count=1
 0:00:00.001041000 [client] DEBUG event=on_confirmed prev=InitSent next=Open location=dc/s2n-quic-dc/src/stream/writer.rs
 0:00:00.001041000 [client] DEBUG Flow established binding_id=1
+0:00:00.001041000 [client] TRACE c#credit.send.acquire.fast_path=1
+0:00:00.001041000 [client] TRACE c#credit.send.acquire.bytes=64175
 0:00:00.001041000 [client] DEBUG event=on_send_fin prev=Open next=FinSent location=dc/s2n-quic-dc/src/stream/writer.rs
 0:00:00.001041000 [client] DEBUG Writer dropping binding_id=1 status=FinSent next_offset=65536 inflight_bytes=64175 remote_max_data=1049937
 0:00:00.001041000 [client] DEBUG event=on_shutdown prev=FinSent next=Shutdown location=dc/s2n-quic-dc/src/stream/writer.rs
@@ -914,6 +935,8 @@ expression: logs
 0:00:00.001041000 [client] TRACE c#send.pending.enq[send.1]=1
 0:00:00.001041000 [client] TRACE g#send.pending.depth[send.1]=44
 0:00:00.001041000 [client] TRACE m#send.pending.depth_dist[send.1]=44
+0:00:00.001041000 [client] TRACE c#credit.send.release.bytes=1361
+0:00:00.001041000 [client] TRACE c#credit.send.release.calls=1
 0:00:00.001041000 [client] TRACE m#asm.segments=1
 0:00:00.001041000 [client] TRACE c#q.resolver_to_pto_wheel.sender[send.worker.1.task.assembler.send.1]=1
 0:00:00.001041000 [client] TRACE c#q.resolver_to_pto_wheel.enq[send.worker.1]=1
@@ -934,6 +957,8 @@ expression: logs
 0:00:00.001041000 [client] TRACE g#q.wheel_to_assembler.depth[send.1]=1
 0:00:00.001041000 [client] TRACE m#q.wheel_to_assembler.depth_dist[send.1]=1
 0:00:00.001041000 [client] TRACE m#task.tx_wheel.drained[send.worker.1]=1
+0:00:00.001041000 [client] TRACE c#credit.send.distributor.passes=1
+0:00:00.001041000 [client] TRACE c#credit.send.distributor.passes=1
 0:00:00.001041000 [client] TRACE m#task.pto_wheel.drained[send.worker.1]=1
 0:00:00.001041000 [client] TRACE c#q.wheel_to_assembler.receiver[send.1.task.assembler.send.1]=1
 0:00:00.001041000 [client] TRACE c#q.wheel_to_assembler.drain[send.1]=1
@@ -960,6 +985,8 @@ expression: logs
 0:00:00.001041000 [client] TRACE c#send.pending.enq[send.1]=1
 0:00:00.001041000 [client] TRACE g#send.pending.depth[send.1]=43
 0:00:00.001041000 [client] TRACE m#send.pending.depth_dist[send.1]=43
+0:00:00.001041000 [client] TRACE c#credit.send.release.bytes=1361
+0:00:00.001041000 [client] TRACE c#credit.send.release.calls=1
 0:00:00.001041000 [client] TRACE m#asm.segments=1
 0:00:00.001041000 [client] TRACE c#q.resolver_to_tx_wheel.sender[send.worker.1.task.assembler.send.1]=1
 0:00:00.001041000 [client] TRACE c#q.resolver_to_tx_wheel.enq[send.worker.1]=1
@@ -977,6 +1004,8 @@ expression: logs
 0:00:00.001041000 [client] TRACE m#q.wheel_to_assembler.depth_dist[send.1]=1
 0:00:00.001041000 [client] TRACE m#task.tx_wheel.drained[send.worker.1]=1
 0:00:00.001041000 [client] TRACE m#task.pto_wheel.drained[send.worker.1]=0
+0:00:00.001041000 [client] TRACE c#credit.send.distributor.passes=1
+0:00:00.001041000 [client] TRACE c#credit.send.distributor.passes=1
 0:00:00.001041000 [client] TRACE c#q.wheel_to_assembler.receiver[send.1.task.assembler.send.1]=1
 0:00:00.001041000 [client] TRACE c#q.wheel_to_assembler.drain[send.1]=1
 0:00:00.001041000 [client] TRACE g#q.wheel_to_assembler.depth[send.1]=0
@@ -1002,6 +1031,8 @@ expression: logs
 0:00:00.001041000 [client] TRACE c#send.pending.enq[send.1]=1
 0:00:00.001041000 [client] TRACE g#send.pending.depth[send.1]=42
 0:00:00.001041000 [client] TRACE m#send.pending.depth_dist[send.1]=42
+0:00:00.001041000 [client] TRACE c#credit.send.release.bytes=1361
+0:00:00.001041000 [client] TRACE c#credit.send.release.calls=1
 0:00:00.001041000 [client] TRACE m#asm.segments=1
 0:00:00.001041000 [client] TRACE c#q.resolver_to_tx_wheel.sender[send.worker.1.task.assembler.send.1]=1
 0:00:00.001041000 [client] TRACE c#q.resolver_to_tx_wheel.enq[send.worker.1]=1
@@ -1018,6 +1049,8 @@ expression: logs
 0:00:00.001041000 [client] TRACE g#q.wheel_to_assembler.depth[send.1]=1
 0:00:00.001041000 [client] TRACE m#q.wheel_to_assembler.depth_dist[send.1]=1
 0:00:00.001041000 [client] TRACE m#task.tx_wheel.drained[send.worker.1]=1
+0:00:00.001041000 [client] TRACE c#credit.send.distributor.passes=1
+0:00:00.001041000 [client] TRACE c#credit.send.distributor.passes=1
 0:00:00.001041000 [client] TRACE c#q.wheel_to_assembler.receiver[send.1.task.assembler.send.1]=1
 0:00:00.001041000 [client] TRACE c#q.wheel_to_assembler.drain[send.1]=1
 0:00:00.001041000 [client] TRACE g#q.wheel_to_assembler.depth[send.1]=0
@@ -1043,6 +1076,8 @@ expression: logs
 0:00:00.001041000 [client] TRACE c#send.pending.enq[send.1]=1
 0:00:00.001041000 [client] TRACE g#send.pending.depth[send.1]=41
 0:00:00.001041000 [client] TRACE m#send.pending.depth_dist[send.1]=41
+0:00:00.001041000 [client] TRACE c#credit.send.release.bytes=1361
+0:00:00.001041000 [client] TRACE c#credit.send.release.calls=1
 0:00:00.001041000 [client] TRACE m#asm.segments=1
 0:00:00.001041000 [client] TRACE c#q.resolver_to_tx_wheel.sender[send.worker.1.task.assembler.send.1]=1
 0:00:00.001041000 [client] TRACE c#q.resolver_to_tx_wheel.enq[send.worker.1]=1
@@ -1059,6 +1094,8 @@ expression: logs
 0:00:00.001041000 [client] TRACE g#q.wheel_to_assembler.depth[send.1]=1
 0:00:00.001041000 [client] TRACE m#q.wheel_to_assembler.depth_dist[send.1]=1
 0:00:00.001041000 [client] TRACE m#task.tx_wheel.drained[send.worker.1]=1
+0:00:00.001041000 [client] TRACE c#credit.send.distributor.passes=1
+0:00:00.001041000 [client] TRACE c#credit.send.distributor.passes=1
 0:00:00.001041000 [client] TRACE c#q.wheel_to_assembler.receiver[send.1.task.assembler.send.1]=1
 0:00:00.001041000 [client] TRACE c#q.wheel_to_assembler.drain[send.1]=1
 0:00:00.001041000 [client] TRACE g#q.wheel_to_assembler.depth[send.1]=0
@@ -1084,6 +1121,8 @@ expression: logs
 0:00:00.001041000 [client] TRACE c#send.pending.enq[send.1]=1
 0:00:00.001041000 [client] TRACE g#send.pending.depth[send.1]=40
 0:00:00.001041000 [client] TRACE m#send.pending.depth_dist[send.1]=40
+0:00:00.001041000 [client] TRACE c#credit.send.release.bytes=1361
+0:00:00.001041000 [client] TRACE c#credit.send.release.calls=1
 0:00:00.001041000 [client] TRACE m#asm.segments=1
 0:00:00.001041000 [client] TRACE c#q.resolver_to_tx_wheel.sender[send.worker.1.task.assembler.send.1]=1
 0:00:00.001041000 [client] TRACE c#q.resolver_to_tx_wheel.enq[send.worker.1]=1
@@ -1100,6 +1139,8 @@ expression: logs
 0:00:00.001041000 [client] TRACE g#q.wheel_to_assembler.depth[send.1]=1
 0:00:00.001041000 [client] TRACE m#q.wheel_to_assembler.depth_dist[send.1]=1
 0:00:00.001041000 [client] TRACE m#task.tx_wheel.drained[send.worker.1]=1
+0:00:00.001041000 [client] TRACE c#credit.send.distributor.passes=1
+0:00:00.001041000 [client] TRACE c#credit.send.distributor.passes=1
 0:00:00.001041000 [client] TRACE c#q.wheel_to_assembler.receiver[send.1.task.assembler.send.1]=1
 0:00:00.001041000 [client] TRACE c#q.wheel_to_assembler.drain[send.1]=1
 0:00:00.001041000 [client] TRACE g#q.wheel_to_assembler.depth[send.1]=0
@@ -1125,6 +1166,8 @@ expression: logs
 0:00:00.001041000 [client] TRACE c#send.pending.enq[send.1]=1
 0:00:00.001041000 [client] TRACE g#send.pending.depth[send.1]=39
 0:00:00.001041000 [client] TRACE m#send.pending.depth_dist[send.1]=39
+0:00:00.001041000 [client] TRACE c#credit.send.release.bytes=1361
+0:00:00.001041000 [client] TRACE c#credit.send.release.calls=1
 0:00:00.001041000 [client] TRACE m#asm.segments=1
 0:00:00.001041000 [client] TRACE c#q.resolver_to_tx_wheel.sender[send.worker.1.task.assembler.send.1]=1
 0:00:00.001041000 [client] TRACE c#q.resolver_to_tx_wheel.enq[send.worker.1]=1
@@ -1141,6 +1184,8 @@ expression: logs
 0:00:00.001041000 [client] TRACE g#q.wheel_to_assembler.depth[send.1]=1
 0:00:00.001041000 [client] TRACE m#q.wheel_to_assembler.depth_dist[send.1]=1
 0:00:00.001041000 [client] TRACE m#task.tx_wheel.drained[send.worker.1]=1
+0:00:00.001041000 [client] TRACE c#credit.send.distributor.passes=1
+0:00:00.001041000 [client] TRACE c#credit.send.distributor.passes=1
 0:00:00.001041000 [client] TRACE c#q.wheel_to_assembler.receiver[send.1.task.assembler.send.1]=1
 0:00:00.001041000 [client] TRACE c#q.wheel_to_assembler.drain[send.1]=1
 0:00:00.001041000 [client] TRACE g#q.wheel_to_assembler.depth[send.1]=0
@@ -1166,6 +1211,8 @@ expression: logs
 0:00:00.001041000 [client] TRACE c#send.pending.enq[send.1]=1
 0:00:00.001041000 [client] TRACE g#send.pending.depth[send.1]=38
 0:00:00.001041000 [client] TRACE m#send.pending.depth_dist[send.1]=38
+0:00:00.001041000 [client] TRACE c#credit.send.release.bytes=1361
+0:00:00.001041000 [client] TRACE c#credit.send.release.calls=1
 0:00:00.001041000 [client] TRACE m#asm.segments=1
 0:00:00.001041000 [client] TRACE c#q.resolver_to_tx_wheel.sender[send.worker.1.task.assembler.send.1]=1
 0:00:00.001041000 [client] TRACE c#q.resolver_to_tx_wheel.enq[send.worker.1]=1
@@ -1182,6 +1229,8 @@ expression: logs
 0:00:00.001041000 [client] TRACE g#q.wheel_to_assembler.depth[send.1]=1
 0:00:00.001041000 [client] TRACE m#q.wheel_to_assembler.depth_dist[send.1]=1
 0:00:00.001041000 [client] TRACE m#task.tx_wheel.drained[send.worker.1]=1
+0:00:00.001041000 [client] TRACE c#credit.send.distributor.passes=1
+0:00:00.001041000 [client] TRACE c#credit.send.distributor.passes=1
 0:00:00.001041000 [client] TRACE c#q.wheel_to_assembler.receiver[send.1.task.assembler.send.1]=1
 0:00:00.001041000 [client] TRACE c#q.wheel_to_assembler.drain[send.1]=1
 0:00:00.001041000 [client] TRACE g#q.wheel_to_assembler.depth[send.1]=0
@@ -1207,6 +1256,8 @@ expression: logs
 0:00:00.001041000 [client] TRACE c#send.pending.enq[send.1]=1
 0:00:00.001041000 [client] TRACE g#send.pending.depth[send.1]=37
 0:00:00.001041000 [client] TRACE m#send.pending.depth_dist[send.1]=37
+0:00:00.001041000 [client] TRACE c#credit.send.release.bytes=1361
+0:00:00.001041000 [client] TRACE c#credit.send.release.calls=1
 0:00:00.001041000 [client] TRACE m#asm.segments=1
 0:00:00.001041000 [client] TRACE c#q.resolver_to_tx_wheel.sender[send.worker.1.task.assembler.send.1]=1
 0:00:00.001041000 [client] TRACE c#q.resolver_to_tx_wheel.enq[send.worker.1]=1
@@ -1223,6 +1274,8 @@ expression: logs
 0:00:00.001041000 [client] TRACE g#q.wheel_to_assembler.depth[send.1]=1
 0:00:00.001041000 [client] TRACE m#q.wheel_to_assembler.depth_dist[send.1]=1
 0:00:00.001041000 [client] TRACE m#task.tx_wheel.drained[send.worker.1]=1
+0:00:00.001041000 [client] TRACE c#credit.send.distributor.passes=1
+0:00:00.001041000 [client] TRACE c#credit.send.distributor.passes=1
 0:00:00.001041000 [client] TRACE c#q.wheel_to_assembler.receiver[send.1.task.assembler.send.1]=1
 0:00:00.001041000 [client] TRACE c#q.wheel_to_assembler.drain[send.1]=1
 0:00:00.001041000 [client] TRACE g#q.wheel_to_assembler.depth[send.1]=0
@@ -1248,6 +1301,8 @@ expression: logs
 0:00:00.001041000 [client] TRACE c#send.pending.enq[send.1]=1
 0:00:00.001041000 [client] TRACE g#send.pending.depth[send.1]=36
 0:00:00.001041000 [client] TRACE m#send.pending.depth_dist[send.1]=36
+0:00:00.001041000 [client] TRACE c#credit.send.release.bytes=1361
+0:00:00.001041000 [client] TRACE c#credit.send.release.calls=1
 0:00:00.001041000 [client] TRACE m#asm.segments=1
 0:00:00.001041000 [client] TRACE c#q.resolver_to_tx_wheel.sender[send.worker.1.task.assembler.send.1]=1
 0:00:00.001041000 [client] TRACE c#q.resolver_to_tx_wheel.enq[send.worker.1]=1
@@ -1264,6 +1319,8 @@ expression: logs
 0:00:00.001041000 [client] TRACE g#q.wheel_to_assembler.depth[send.1]=1
 0:00:00.001041000 [client] TRACE m#q.wheel_to_assembler.depth_dist[send.1]=1
 0:00:00.001041000 [client] TRACE m#task.tx_wheel.drained[send.worker.1]=1
+0:00:00.001041000 [client] TRACE c#credit.send.distributor.passes=1
+0:00:00.001041000 [client] TRACE c#credit.send.distributor.passes=1
 0:00:00.001041000 [client] TRACE c#q.wheel_to_assembler.receiver[send.1.task.assembler.send.1]=1
 0:00:00.001041000 [client] TRACE c#q.wheel_to_assembler.drain[send.1]=1
 0:00:00.001041000 [client] TRACE g#q.wheel_to_assembler.depth[send.1]=0
@@ -1284,13 +1341,17 @@ expression: logs
 0:00:00.001041000 [client] TRACE c#send.inflight.enq[send.1]=1
 0:00:00.001041000 [client] TRACE g#send.inflight.depth[send.1]=10
 0:00:00.001041000 [client] TRACE m#send.inflight.depth_dist[send.1]=10
+0:00:00.001041000 [client] TRACE c#credit.send.release.bytes=1361
+0:00:00.001041000 [client] TRACE c#credit.send.release.calls=1
 0:00:00.001041000 [client] TRACE m#asm.segments=1
 0:00:00.001041000 [client] TRACE c#socket.tx.ops[send.1]=1
 0:00:00.001041000 [client] TRACE c#socket.tx.bytes[send.1]=1412
 0:00:00.001041000 [client] TRACE m#task.assembler.drained[send.1]=1
 0:00:00.001041000 [client] TRACE m#task.tx_wheel.drained[send.worker.1]=0
-0:00:00.001061000 [client] TRACE m#pick_two.score_delta=1046374
-0:00:00.001061000 [client] TRACE m#pick_two.rejected[send.0]=1046374
+0:00:00.001041000 [client] TRACE c#credit.send.distributor.passes=1
+0:00:00.001041000 [client] TRACE c#credit.send.distributor.passes=1
+0:00:00.001061000 [client] TRACE m#pick_two.score_delta=1046376
+0:00:00.001061000 [client] TRACE m#pick_two.rejected[send.0]=1046376
 0:00:00.001061000 [client] TRACE c#pick_two.chosen[send.2]=1
 0:00:00.001061000 [client] TRACE c#q.resolver.enq[send.2]=1
 0:00:00.001061000 [client] TRACE g#q.resolver.depth[send.2]=1
@@ -1348,6 +1409,8 @@ expression: logs
 0:00:00.001061000 [client] TRACE c#send.pending.enq[send.2]=1
 0:00:00.001061000 [client] TRACE g#send.pending.depth[send.2]=2
 0:00:00.001061000 [client] TRACE m#send.pending.depth_dist[send.2]=2
+0:00:00.001061000 [client] TRACE c#credit.send.release.bytes=1361
+0:00:00.001061000 [client] TRACE c#credit.send.release.calls=1
 0:00:00.001061000 [client] TRACE m#asm.segments=1
 0:00:00.001061000 [client] TRACE c#q.resolver_to_pto_wheel.sender[send.worker.2.task.assembler.send.2]=1
 0:00:00.001061000 [client] TRACE c#q.resolver_to_pto_wheel.enq[send.worker.2]=1
@@ -1368,6 +1431,8 @@ expression: logs
 0:00:00.001061000 [client] TRACE g#q.wheel_to_assembler.depth[send.2]=1
 0:00:00.001061000 [client] TRACE m#q.wheel_to_assembler.depth_dist[send.2]=1
 0:00:00.001061000 [client] TRACE m#task.tx_wheel.drained[send.worker.2]=1
+0:00:00.001061000 [client] TRACE c#credit.send.distributor.passes=1
+0:00:00.001061000 [client] TRACE c#credit.send.distributor.passes=1
 0:00:00.001061000 [client] TRACE m#task.pto_wheel.drained[send.worker.2]=1
 0:00:00.001061000 [client] TRACE c#q.wheel_to_assembler.receiver[send.2.task.assembler.send.2]=1
 0:00:00.001061000 [client] TRACE c#q.wheel_to_assembler.drain[send.2]=1
@@ -1400,12 +1465,16 @@ expression: logs
 0:00:00.001061000 [client] TRACE c#send.inflight.enq[send.2]=1
 0:00:00.001061000 [client] TRACE g#send.inflight.depth[send.2]=3
 0:00:00.001061000 [client] TRACE m#send.inflight.depth_dist[send.2]=3
+0:00:00.001061000 [client] TRACE c#credit.send.release.bytes=1569
+0:00:00.001061000 [client] TRACE c#credit.send.release.calls=1
 0:00:00.001061000 [client] TRACE m#asm.segments=2
 0:00:00.001061000 [client] TRACE c#socket.tx.ops[send.2]=1
 0:00:00.001061000 [client] TRACE c#socket.tx.bytes[send.2]=1675
 0:00:00.001061000 [client] TRACE m#task.assembler.drained[send.2]=1
 0:00:00.001061000 [client] TRACE m#task.tx_wheel.drained[send.worker.2]=0
 0:00:00.001061000 [client] TRACE m#task.pto_wheel.drained[send.worker.2]=0
+0:00:00.001061000 [client] TRACE c#credit.send.distributor.passes=1
+0:00:00.001061000 [client] TRACE c#credit.send.distributor.passes=1
 0:00:00.001541000 [server] TRACE c#socket.rx.ops[recv.7]=1
 0:00:00.001541000 [server] TRACE c#socket.rx.bytes[recv.7]=51
 0:00:00.001541000 [server] TRACE c#router.routed=1
@@ -1958,6 +2027,8 @@ expression: logs
 0:00:00.002041000 [client] TRACE c#send.pending.enq[send.1]=1
 0:00:00.002041000 [client] TRACE g#send.pending.depth[send.1]=34
 0:00:00.002041000 [client] TRACE m#send.pending.depth_dist[send.1]=34
+0:00:00.002041000 [client] TRACE c#credit.send.release.bytes=1361
+0:00:00.002041000 [client] TRACE c#credit.send.release.calls=1
 0:00:00.002041000 [client] TRACE m#asm.segments=1
 0:00:00.002041000 [client] TRACE c#q.resolver_to_tx_wheel.sender[send.worker.1.task.assembler.send.1]=1
 0:00:00.002041000 [client] TRACE c#q.resolver_to_tx_wheel.enq[send.worker.1]=1
@@ -1974,6 +2045,8 @@ expression: logs
 0:00:00.002041000 [client] TRACE g#q.wheel_to_assembler.depth[send.1]=1
 0:00:00.002041000 [client] TRACE m#q.wheel_to_assembler.depth_dist[send.1]=1
 0:00:00.002041000 [client] TRACE m#task.tx_wheel.drained[send.worker.1]=1
+0:00:00.002041000 [client] TRACE c#credit.send.distributor.passes=1
+0:00:00.002041000 [client] TRACE c#credit.send.distributor.passes=1
 0:00:00.002041000 [client] TRACE c#q.wheel_to_assembler.receiver[send.1.task.assembler.send.1]=1
 0:00:00.002041000 [client] TRACE c#q.wheel_to_assembler.drain[send.1]=1
 0:00:00.002041000 [client] TRACE g#q.wheel_to_assembler.depth[send.1]=0
@@ -1999,6 +2072,8 @@ expression: logs
 0:00:00.002041000 [client] TRACE c#send.pending.enq[send.1]=1
 0:00:00.002041000 [client] TRACE g#send.pending.depth[send.1]=33
 0:00:00.002041000 [client] TRACE m#send.pending.depth_dist[send.1]=33
+0:00:00.002041000 [client] TRACE c#credit.send.release.bytes=1361
+0:00:00.002041000 [client] TRACE c#credit.send.release.calls=1
 0:00:00.002041000 [client] TRACE m#asm.segments=1
 0:00:00.002041000 [client] TRACE c#q.resolver_to_tx_wheel.sender[send.worker.1.task.assembler.send.1]=1
 0:00:00.002041000 [client] TRACE c#q.resolver_to_tx_wheel.enq[send.worker.1]=1
@@ -2015,6 +2090,8 @@ expression: logs
 0:00:00.002041000 [client] TRACE g#q.wheel_to_assembler.depth[send.1]=1
 0:00:00.002041000 [client] TRACE m#q.wheel_to_assembler.depth_dist[send.1]=1
 0:00:00.002041000 [client] TRACE m#task.tx_wheel.drained[send.worker.1]=1
+0:00:00.002041000 [client] TRACE c#credit.send.distributor.passes=1
+0:00:00.002041000 [client] TRACE c#credit.send.distributor.passes=1
 0:00:00.002041000 [client] TRACE c#q.wheel_to_assembler.receiver[send.1.task.assembler.send.1]=1
 0:00:00.002041000 [client] TRACE c#q.wheel_to_assembler.drain[send.1]=1
 0:00:00.002041000 [client] TRACE g#q.wheel_to_assembler.depth[send.1]=0
@@ -2040,6 +2117,8 @@ expression: logs
 0:00:00.002041000 [client] TRACE c#send.pending.enq[send.1]=1
 0:00:00.002041000 [client] TRACE g#send.pending.depth[send.1]=32
 0:00:00.002041000 [client] TRACE m#send.pending.depth_dist[send.1]=32
+0:00:00.002041000 [client] TRACE c#credit.send.release.bytes=1361
+0:00:00.002041000 [client] TRACE c#credit.send.release.calls=1
 0:00:00.002041000 [client] TRACE m#asm.segments=1
 0:00:00.002041000 [client] TRACE c#q.resolver_to_tx_wheel.sender[send.worker.1.task.assembler.send.1]=1
 0:00:00.002041000 [client] TRACE c#q.resolver_to_tx_wheel.enq[send.worker.1]=1
@@ -2056,6 +2135,8 @@ expression: logs
 0:00:00.002041000 [client] TRACE g#q.wheel_to_assembler.depth[send.1]=1
 0:00:00.002041000 [client] TRACE m#q.wheel_to_assembler.depth_dist[send.1]=1
 0:00:00.002041000 [client] TRACE m#task.tx_wheel.drained[send.worker.1]=1
+0:00:00.002041000 [client] TRACE c#credit.send.distributor.passes=1
+0:00:00.002041000 [client] TRACE c#credit.send.distributor.passes=1
 0:00:00.002041000 [client] TRACE c#q.wheel_to_assembler.receiver[send.1.task.assembler.send.1]=1
 0:00:00.002041000 [client] TRACE c#q.wheel_to_assembler.drain[send.1]=1
 0:00:00.002041000 [client] TRACE g#q.wheel_to_assembler.depth[send.1]=0
@@ -2081,6 +2162,8 @@ expression: logs
 0:00:00.002041000 [client] TRACE c#send.pending.enq[send.1]=1
 0:00:00.002041000 [client] TRACE g#send.pending.depth[send.1]=31
 0:00:00.002041000 [client] TRACE m#send.pending.depth_dist[send.1]=31
+0:00:00.002041000 [client] TRACE c#credit.send.release.bytes=1361
+0:00:00.002041000 [client] TRACE c#credit.send.release.calls=1
 0:00:00.002041000 [client] TRACE m#asm.segments=1
 0:00:00.002041000 [client] TRACE c#q.resolver_to_tx_wheel.sender[send.worker.1.task.assembler.send.1]=1
 0:00:00.002041000 [client] TRACE c#q.resolver_to_tx_wheel.enq[send.worker.1]=1
@@ -2097,6 +2180,8 @@ expression: logs
 0:00:00.002041000 [client] TRACE g#q.wheel_to_assembler.depth[send.1]=1
 0:00:00.002041000 [client] TRACE m#q.wheel_to_assembler.depth_dist[send.1]=1
 0:00:00.002041000 [client] TRACE m#task.tx_wheel.drained[send.worker.1]=1
+0:00:00.002041000 [client] TRACE c#credit.send.distributor.passes=1
+0:00:00.002041000 [client] TRACE c#credit.send.distributor.passes=1
 0:00:00.002041000 [client] TRACE c#q.wheel_to_assembler.receiver[send.1.task.assembler.send.1]=1
 0:00:00.002041000 [client] TRACE c#q.wheel_to_assembler.drain[send.1]=1
 0:00:00.002041000 [client] TRACE g#q.wheel_to_assembler.depth[send.1]=0
@@ -2122,6 +2207,8 @@ expression: logs
 0:00:00.002041000 [client] TRACE c#send.pending.enq[send.1]=1
 0:00:00.002041000 [client] TRACE g#send.pending.depth[send.1]=30
 0:00:00.002041000 [client] TRACE m#send.pending.depth_dist[send.1]=30
+0:00:00.002041000 [client] TRACE c#credit.send.release.bytes=1361
+0:00:00.002041000 [client] TRACE c#credit.send.release.calls=1
 0:00:00.002041000 [client] TRACE m#asm.segments=1
 0:00:00.002041000 [client] TRACE c#q.resolver_to_tx_wheel.sender[send.worker.1.task.assembler.send.1]=1
 0:00:00.002041000 [client] TRACE c#q.resolver_to_tx_wheel.enq[send.worker.1]=1
@@ -2138,6 +2225,8 @@ expression: logs
 0:00:00.002041000 [client] TRACE g#q.wheel_to_assembler.depth[send.1]=1
 0:00:00.002041000 [client] TRACE m#q.wheel_to_assembler.depth_dist[send.1]=1
 0:00:00.002041000 [client] TRACE m#task.tx_wheel.drained[send.worker.1]=1
+0:00:00.002041000 [client] TRACE c#credit.send.distributor.passes=1
+0:00:00.002041000 [client] TRACE c#credit.send.distributor.passes=1
 0:00:00.002041000 [client] TRACE c#q.wheel_to_assembler.receiver[send.1.task.assembler.send.1]=1
 0:00:00.002041000 [client] TRACE c#q.wheel_to_assembler.drain[send.1]=1
 0:00:00.002041000 [client] TRACE g#q.wheel_to_assembler.depth[send.1]=0
@@ -2163,6 +2252,8 @@ expression: logs
 0:00:00.002041000 [client] TRACE c#send.pending.enq[send.1]=1
 0:00:00.002041000 [client] TRACE g#send.pending.depth[send.1]=29
 0:00:00.002041000 [client] TRACE m#send.pending.depth_dist[send.1]=29
+0:00:00.002041000 [client] TRACE c#credit.send.release.bytes=1361
+0:00:00.002041000 [client] TRACE c#credit.send.release.calls=1
 0:00:00.002041000 [client] TRACE m#asm.segments=1
 0:00:00.002041000 [client] TRACE c#q.resolver_to_tx_wheel.sender[send.worker.1.task.assembler.send.1]=1
 0:00:00.002041000 [client] TRACE c#q.resolver_to_tx_wheel.enq[send.worker.1]=1
@@ -2179,6 +2270,8 @@ expression: logs
 0:00:00.002041000 [client] TRACE g#q.wheel_to_assembler.depth[send.1]=1
 0:00:00.002041000 [client] TRACE m#q.wheel_to_assembler.depth_dist[send.1]=1
 0:00:00.002041000 [client] TRACE m#task.tx_wheel.drained[send.worker.1]=1
+0:00:00.002041000 [client] TRACE c#credit.send.distributor.passes=1
+0:00:00.002041000 [client] TRACE c#credit.send.distributor.passes=1
 0:00:00.002041000 [client] TRACE c#q.wheel_to_assembler.receiver[send.1.task.assembler.send.1]=1
 0:00:00.002041000 [client] TRACE c#q.wheel_to_assembler.drain[send.1]=1
 0:00:00.002041000 [client] TRACE g#q.wheel_to_assembler.depth[send.1]=0
@@ -2204,6 +2297,8 @@ expression: logs
 0:00:00.002041000 [client] TRACE c#send.pending.enq[send.1]=1
 0:00:00.002041000 [client] TRACE g#send.pending.depth[send.1]=28
 0:00:00.002041000 [client] TRACE m#send.pending.depth_dist[send.1]=28
+0:00:00.002041000 [client] TRACE c#credit.send.release.bytes=1361
+0:00:00.002041000 [client] TRACE c#credit.send.release.calls=1
 0:00:00.002041000 [client] TRACE m#asm.segments=1
 0:00:00.002041000 [client] TRACE c#q.resolver_to_tx_wheel.sender[send.worker.1.task.assembler.send.1]=1
 0:00:00.002041000 [client] TRACE c#q.resolver_to_tx_wheel.enq[send.worker.1]=1
@@ -2220,6 +2315,8 @@ expression: logs
 0:00:00.002041000 [client] TRACE g#q.wheel_to_assembler.depth[send.1]=1
 0:00:00.002041000 [client] TRACE m#q.wheel_to_assembler.depth_dist[send.1]=1
 0:00:00.002041000 [client] TRACE m#task.tx_wheel.drained[send.worker.1]=1
+0:00:00.002041000 [client] TRACE c#credit.send.distributor.passes=1
+0:00:00.002041000 [client] TRACE c#credit.send.distributor.passes=1
 0:00:00.002041000 [client] TRACE c#q.wheel_to_assembler.receiver[send.1.task.assembler.send.1]=1
 0:00:00.002041000 [client] TRACE c#q.wheel_to_assembler.drain[send.1]=1
 0:00:00.002041000 [client] TRACE g#q.wheel_to_assembler.depth[send.1]=0
@@ -2245,6 +2342,8 @@ expression: logs
 0:00:00.002041000 [client] TRACE c#send.pending.enq[send.1]=1
 0:00:00.002041000 [client] TRACE g#send.pending.depth[send.1]=27
 0:00:00.002041000 [client] TRACE m#send.pending.depth_dist[send.1]=27
+0:00:00.002041000 [client] TRACE c#credit.send.release.bytes=1361
+0:00:00.002041000 [client] TRACE c#credit.send.release.calls=1
 0:00:00.002041000 [client] TRACE m#asm.segments=1
 0:00:00.002041000 [client] TRACE c#q.resolver_to_tx_wheel.sender[send.worker.1.task.assembler.send.1]=1
 0:00:00.002041000 [client] TRACE c#q.resolver_to_tx_wheel.enq[send.worker.1]=1
@@ -2261,6 +2360,8 @@ expression: logs
 0:00:00.002041000 [client] TRACE g#q.wheel_to_assembler.depth[send.1]=1
 0:00:00.002041000 [client] TRACE m#q.wheel_to_assembler.depth_dist[send.1]=1
 0:00:00.002041000 [client] TRACE m#task.tx_wheel.drained[send.worker.1]=1
+0:00:00.002041000 [client] TRACE c#credit.send.distributor.passes=1
+0:00:00.002041000 [client] TRACE c#credit.send.distributor.passes=1
 0:00:00.002041000 [client] TRACE c#q.wheel_to_assembler.receiver[send.1.task.assembler.send.1]=1
 0:00:00.002041000 [client] TRACE c#q.wheel_to_assembler.drain[send.1]=1
 0:00:00.002041000 [client] TRACE g#q.wheel_to_assembler.depth[send.1]=0
@@ -2286,6 +2387,8 @@ expression: logs
 0:00:00.002041000 [client] TRACE c#send.pending.enq[send.1]=1
 0:00:00.002041000 [client] TRACE g#send.pending.depth[send.1]=26
 0:00:00.002041000 [client] TRACE m#send.pending.depth_dist[send.1]=26
+0:00:00.002041000 [client] TRACE c#credit.send.release.bytes=1361
+0:00:00.002041000 [client] TRACE c#credit.send.release.calls=1
 0:00:00.002041000 [client] TRACE m#asm.segments=1
 0:00:00.002041000 [client] TRACE c#q.resolver_to_tx_wheel.sender[send.worker.1.task.assembler.send.1]=1
 0:00:00.002041000 [client] TRACE c#q.resolver_to_tx_wheel.enq[send.worker.1]=1
@@ -2302,6 +2405,8 @@ expression: logs
 0:00:00.002041000 [client] TRACE g#q.wheel_to_assembler.depth[send.1]=1
 0:00:00.002041000 [client] TRACE m#q.wheel_to_assembler.depth_dist[send.1]=1
 0:00:00.002041000 [client] TRACE m#task.tx_wheel.drained[send.worker.1]=1
+0:00:00.002041000 [client] TRACE c#credit.send.distributor.passes=1
+0:00:00.002041000 [client] TRACE c#credit.send.distributor.passes=1
 0:00:00.002041000 [client] TRACE c#q.wheel_to_assembler.receiver[send.1.task.assembler.send.1]=1
 0:00:00.002041000 [client] TRACE c#q.wheel_to_assembler.drain[send.1]=1
 0:00:00.002041000 [client] TRACE g#q.wheel_to_assembler.depth[send.1]=0
@@ -2327,6 +2432,8 @@ expression: logs
 0:00:00.002041000 [client] TRACE c#send.pending.enq[send.1]=1
 0:00:00.002041000 [client] TRACE g#send.pending.depth[send.1]=25
 0:00:00.002041000 [client] TRACE m#send.pending.depth_dist[send.1]=25
+0:00:00.002041000 [client] TRACE c#credit.send.release.bytes=1361
+0:00:00.002041000 [client] TRACE c#credit.send.release.calls=1
 0:00:00.002041000 [client] TRACE m#asm.segments=1
 0:00:00.002041000 [client] TRACE c#q.resolver_to_tx_wheel.sender[send.worker.1.task.assembler.send.1]=1
 0:00:00.002041000 [client] TRACE c#q.resolver_to_tx_wheel.enq[send.worker.1]=1
@@ -2343,6 +2450,8 @@ expression: logs
 0:00:00.002041000 [client] TRACE g#q.wheel_to_assembler.depth[send.1]=1
 0:00:00.002041000 [client] TRACE m#q.wheel_to_assembler.depth_dist[send.1]=1
 0:00:00.002041000 [client] TRACE m#task.tx_wheel.drained[send.worker.1]=1
+0:00:00.002041000 [client] TRACE c#credit.send.distributor.passes=1
+0:00:00.002041000 [client] TRACE c#credit.send.distributor.passes=1
 0:00:00.002041000 [client] TRACE c#q.wheel_to_assembler.receiver[send.1.task.assembler.send.1]=1
 0:00:00.002041000 [client] TRACE c#q.wheel_to_assembler.drain[send.1]=1
 0:00:00.002041000 [client] TRACE g#q.wheel_to_assembler.depth[send.1]=0
@@ -2368,6 +2477,8 @@ expression: logs
 0:00:00.002041000 [client] TRACE c#send.pending.enq[send.1]=1
 0:00:00.002041000 [client] TRACE g#send.pending.depth[send.1]=24
 0:00:00.002041000 [client] TRACE m#send.pending.depth_dist[send.1]=24
+0:00:00.002041000 [client] TRACE c#credit.send.release.bytes=1361
+0:00:00.002041000 [client] TRACE c#credit.send.release.calls=1
 0:00:00.002041000 [client] TRACE m#asm.segments=1
 0:00:00.002041000 [client] TRACE c#q.resolver_to_tx_wheel.sender[send.worker.1.task.assembler.send.1]=1
 0:00:00.002041000 [client] TRACE c#q.resolver_to_tx_wheel.enq[send.worker.1]=1
@@ -2384,6 +2495,8 @@ expression: logs
 0:00:00.002041000 [client] TRACE g#q.wheel_to_assembler.depth[send.1]=1
 0:00:00.002041000 [client] TRACE m#q.wheel_to_assembler.depth_dist[send.1]=1
 0:00:00.002041000 [client] TRACE m#task.tx_wheel.drained[send.worker.1]=1
+0:00:00.002041000 [client] TRACE c#credit.send.distributor.passes=1
+0:00:00.002041000 [client] TRACE c#credit.send.distributor.passes=1
 0:00:00.002041000 [client] TRACE c#q.wheel_to_assembler.receiver[send.1.task.assembler.send.1]=1
 0:00:00.002041000 [client] TRACE c#q.wheel_to_assembler.drain[send.1]=1
 0:00:00.002041000 [client] TRACE g#q.wheel_to_assembler.depth[send.1]=0
@@ -2409,6 +2522,8 @@ expression: logs
 0:00:00.002041000 [client] TRACE c#send.pending.enq[send.1]=1
 0:00:00.002041000 [client] TRACE g#send.pending.depth[send.1]=23
 0:00:00.002041000 [client] TRACE m#send.pending.depth_dist[send.1]=23
+0:00:00.002041000 [client] TRACE c#credit.send.release.bytes=1361
+0:00:00.002041000 [client] TRACE c#credit.send.release.calls=1
 0:00:00.002041000 [client] TRACE m#asm.segments=1
 0:00:00.002041000 [client] TRACE c#q.resolver_to_tx_wheel.sender[send.worker.1.task.assembler.send.1]=1
 0:00:00.002041000 [client] TRACE c#q.resolver_to_tx_wheel.enq[send.worker.1]=1
@@ -2425,6 +2540,8 @@ expression: logs
 0:00:00.002041000 [client] TRACE g#q.wheel_to_assembler.depth[send.1]=1
 0:00:00.002041000 [client] TRACE m#q.wheel_to_assembler.depth_dist[send.1]=1
 0:00:00.002041000 [client] TRACE m#task.tx_wheel.drained[send.worker.1]=1
+0:00:00.002041000 [client] TRACE c#credit.send.distributor.passes=1
+0:00:00.002041000 [client] TRACE c#credit.send.distributor.passes=1
 0:00:00.002041000 [client] TRACE c#q.wheel_to_assembler.receiver[send.1.task.assembler.send.1]=1
 0:00:00.002041000 [client] TRACE c#q.wheel_to_assembler.drain[send.1]=1
 0:00:00.002041000 [client] TRACE g#q.wheel_to_assembler.depth[send.1]=0
@@ -2450,6 +2567,8 @@ expression: logs
 0:00:00.002041000 [client] TRACE c#send.pending.enq[send.1]=1
 0:00:00.002041000 [client] TRACE g#send.pending.depth[send.1]=22
 0:00:00.002041000 [client] TRACE m#send.pending.depth_dist[send.1]=22
+0:00:00.002041000 [client] TRACE c#credit.send.release.bytes=1361
+0:00:00.002041000 [client] TRACE c#credit.send.release.calls=1
 0:00:00.002041000 [client] TRACE m#asm.segments=1
 0:00:00.002041000 [client] TRACE c#q.resolver_to_tx_wheel.sender[send.worker.1.task.assembler.send.1]=1
 0:00:00.002041000 [client] TRACE c#q.resolver_to_tx_wheel.enq[send.worker.1]=1
@@ -2466,6 +2585,8 @@ expression: logs
 0:00:00.002041000 [client] TRACE g#q.wheel_to_assembler.depth[send.1]=1
 0:00:00.002041000 [client] TRACE m#q.wheel_to_assembler.depth_dist[send.1]=1
 0:00:00.002041000 [client] TRACE m#task.tx_wheel.drained[send.worker.1]=1
+0:00:00.002041000 [client] TRACE c#credit.send.distributor.passes=1
+0:00:00.002041000 [client] TRACE c#credit.send.distributor.passes=1
 0:00:00.002041000 [client] TRACE c#q.wheel_to_assembler.receiver[send.1.task.assembler.send.1]=1
 0:00:00.002041000 [client] TRACE c#q.wheel_to_assembler.drain[send.1]=1
 0:00:00.002041000 [client] TRACE g#q.wheel_to_assembler.depth[send.1]=0
@@ -2491,6 +2612,8 @@ expression: logs
 0:00:00.002041000 [client] TRACE c#send.pending.enq[send.1]=1
 0:00:00.002041000 [client] TRACE g#send.pending.depth[send.1]=21
 0:00:00.002041000 [client] TRACE m#send.pending.depth_dist[send.1]=21
+0:00:00.002041000 [client] TRACE c#credit.send.release.bytes=1361
+0:00:00.002041000 [client] TRACE c#credit.send.release.calls=1
 0:00:00.002041000 [client] TRACE m#asm.segments=1
 0:00:00.002041000 [client] TRACE c#q.resolver_to_tx_wheel.sender[send.worker.1.task.assembler.send.1]=1
 0:00:00.002041000 [client] TRACE c#q.resolver_to_tx_wheel.enq[send.worker.1]=1
@@ -2507,6 +2630,8 @@ expression: logs
 0:00:00.002041000 [client] TRACE g#q.wheel_to_assembler.depth[send.1]=1
 0:00:00.002041000 [client] TRACE m#q.wheel_to_assembler.depth_dist[send.1]=1
 0:00:00.002041000 [client] TRACE m#task.tx_wheel.drained[send.worker.1]=1
+0:00:00.002041000 [client] TRACE c#credit.send.distributor.passes=1
+0:00:00.002041000 [client] TRACE c#credit.send.distributor.passes=1
 0:00:00.002041000 [client] TRACE c#q.wheel_to_assembler.receiver[send.1.task.assembler.send.1]=1
 0:00:00.002041000 [client] TRACE c#q.wheel_to_assembler.drain[send.1]=1
 0:00:00.002041000 [client] TRACE g#q.wheel_to_assembler.depth[send.1]=0
@@ -2532,6 +2657,8 @@ expression: logs
 0:00:00.002041000 [client] TRACE c#send.pending.enq[send.1]=1
 0:00:00.002041000 [client] TRACE g#send.pending.depth[send.1]=20
 0:00:00.002041000 [client] TRACE m#send.pending.depth_dist[send.1]=20
+0:00:00.002041000 [client] TRACE c#credit.send.release.bytes=1361
+0:00:00.002041000 [client] TRACE c#credit.send.release.calls=1
 0:00:00.002041000 [client] TRACE m#asm.segments=1
 0:00:00.002041000 [client] TRACE c#q.resolver_to_tx_wheel.sender[send.worker.1.task.assembler.send.1]=1
 0:00:00.002041000 [client] TRACE c#q.resolver_to_tx_wheel.enq[send.worker.1]=1
@@ -2548,6 +2675,8 @@ expression: logs
 0:00:00.002041000 [client] TRACE g#q.wheel_to_assembler.depth[send.1]=1
 0:00:00.002041000 [client] TRACE m#q.wheel_to_assembler.depth_dist[send.1]=1
 0:00:00.002041000 [client] TRACE m#task.tx_wheel.drained[send.worker.1]=1
+0:00:00.002041000 [client] TRACE c#credit.send.distributor.passes=1
+0:00:00.002041000 [client] TRACE c#credit.send.distributor.passes=1
 0:00:00.002041000 [client] TRACE c#q.wheel_to_assembler.receiver[send.1.task.assembler.send.1]=1
 0:00:00.002041000 [client] TRACE c#q.wheel_to_assembler.drain[send.1]=1
 0:00:00.002041000 [client] TRACE g#q.wheel_to_assembler.depth[send.1]=0
@@ -2573,6 +2702,8 @@ expression: logs
 0:00:00.002041000 [client] TRACE c#send.pending.enq[send.1]=1
 0:00:00.002041000 [client] TRACE g#send.pending.depth[send.1]=19
 0:00:00.002041000 [client] TRACE m#send.pending.depth_dist[send.1]=19
+0:00:00.002041000 [client] TRACE c#credit.send.release.bytes=1361
+0:00:00.002041000 [client] TRACE c#credit.send.release.calls=1
 0:00:00.002041000 [client] TRACE m#asm.segments=1
 0:00:00.002041000 [client] TRACE c#q.resolver_to_tx_wheel.sender[send.worker.1.task.assembler.send.1]=1
 0:00:00.002041000 [client] TRACE c#q.resolver_to_tx_wheel.enq[send.worker.1]=1
@@ -2589,6 +2720,8 @@ expression: logs
 0:00:00.002041000 [client] TRACE g#q.wheel_to_assembler.depth[send.1]=1
 0:00:00.002041000 [client] TRACE m#q.wheel_to_assembler.depth_dist[send.1]=1
 0:00:00.002041000 [client] TRACE m#task.tx_wheel.drained[send.worker.1]=1
+0:00:00.002041000 [client] TRACE c#credit.send.distributor.passes=1
+0:00:00.002041000 [client] TRACE c#credit.send.distributor.passes=1
 0:00:00.002041000 [client] TRACE c#q.wheel_to_assembler.receiver[send.1.task.assembler.send.1]=1
 0:00:00.002041000 [client] TRACE c#q.wheel_to_assembler.drain[send.1]=1
 0:00:00.002041000 [client] TRACE g#q.wheel_to_assembler.depth[send.1]=0
@@ -2614,6 +2747,8 @@ expression: logs
 0:00:00.002041000 [client] TRACE c#send.pending.enq[send.1]=1
 0:00:00.002041000 [client] TRACE g#send.pending.depth[send.1]=18
 0:00:00.002041000 [client] TRACE m#send.pending.depth_dist[send.1]=18
+0:00:00.002041000 [client] TRACE c#credit.send.release.bytes=1361
+0:00:00.002041000 [client] TRACE c#credit.send.release.calls=1
 0:00:00.002041000 [client] TRACE m#asm.segments=1
 0:00:00.002041000 [client] TRACE c#q.resolver_to_tx_wheel.sender[send.worker.1.task.assembler.send.1]=1
 0:00:00.002041000 [client] TRACE c#q.resolver_to_tx_wheel.enq[send.worker.1]=1
@@ -2630,6 +2765,8 @@ expression: logs
 0:00:00.002041000 [client] TRACE g#q.wheel_to_assembler.depth[send.1]=1
 0:00:00.002041000 [client] TRACE m#q.wheel_to_assembler.depth_dist[send.1]=1
 0:00:00.002041000 [client] TRACE m#task.tx_wheel.drained[send.worker.1]=1
+0:00:00.002041000 [client] TRACE c#credit.send.distributor.passes=1
+0:00:00.002041000 [client] TRACE c#credit.send.distributor.passes=1
 0:00:00.002041000 [client] TRACE c#q.wheel_to_assembler.receiver[send.1.task.assembler.send.1]=1
 0:00:00.002041000 [client] TRACE c#q.wheel_to_assembler.drain[send.1]=1
 0:00:00.002041000 [client] TRACE g#q.wheel_to_assembler.depth[send.1]=0
@@ -2655,6 +2792,8 @@ expression: logs
 0:00:00.002041000 [client] TRACE c#send.pending.enq[send.1]=1
 0:00:00.002041000 [client] TRACE g#send.pending.depth[send.1]=17
 0:00:00.002041000 [client] TRACE m#send.pending.depth_dist[send.1]=17
+0:00:00.002041000 [client] TRACE c#credit.send.release.bytes=1361
+0:00:00.002041000 [client] TRACE c#credit.send.release.calls=1
 0:00:00.002041000 [client] TRACE m#asm.segments=1
 0:00:00.002041000 [client] TRACE c#q.resolver_to_tx_wheel.sender[send.worker.1.task.assembler.send.1]=1
 0:00:00.002041000 [client] TRACE c#q.resolver_to_tx_wheel.enq[send.worker.1]=1
@@ -2671,6 +2810,8 @@ expression: logs
 0:00:00.002041000 [client] TRACE g#q.wheel_to_assembler.depth[send.1]=1
 0:00:00.002041000 [client] TRACE m#q.wheel_to_assembler.depth_dist[send.1]=1
 0:00:00.002041000 [client] TRACE m#task.tx_wheel.drained[send.worker.1]=1
+0:00:00.002041000 [client] TRACE c#credit.send.distributor.passes=1
+0:00:00.002041000 [client] TRACE c#credit.send.distributor.passes=1
 0:00:00.002041000 [client] TRACE c#q.wheel_to_assembler.receiver[send.1.task.assembler.send.1]=1
 0:00:00.002041000 [client] TRACE c#q.wheel_to_assembler.drain[send.1]=1
 0:00:00.002041000 [client] TRACE g#q.wheel_to_assembler.depth[send.1]=0
@@ -2696,6 +2837,8 @@ expression: logs
 0:00:00.002041000 [client] TRACE c#send.pending.enq[send.1]=1
 0:00:00.002041000 [client] TRACE g#send.pending.depth[send.1]=16
 0:00:00.002041000 [client] TRACE m#send.pending.depth_dist[send.1]=16
+0:00:00.002041000 [client] TRACE c#credit.send.release.bytes=1361
+0:00:00.002041000 [client] TRACE c#credit.send.release.calls=1
 0:00:00.002041000 [client] TRACE m#asm.segments=1
 0:00:00.002041000 [client] TRACE c#q.resolver_to_tx_wheel.sender[send.worker.1.task.assembler.send.1]=1
 0:00:00.002041000 [client] TRACE c#q.resolver_to_tx_wheel.enq[send.worker.1]=1
@@ -2712,6 +2855,8 @@ expression: logs
 0:00:00.002041000 [client] TRACE g#q.wheel_to_assembler.depth[send.1]=1
 0:00:00.002041000 [client] TRACE m#q.wheel_to_assembler.depth_dist[send.1]=1
 0:00:00.002041000 [client] TRACE m#task.tx_wheel.drained[send.worker.1]=1
+0:00:00.002041000 [client] TRACE c#credit.send.distributor.passes=1
+0:00:00.002041000 [client] TRACE c#credit.send.distributor.passes=1
 0:00:00.002041000 [client] TRACE c#q.wheel_to_assembler.receiver[send.1.task.assembler.send.1]=1
 0:00:00.002041000 [client] TRACE c#q.wheel_to_assembler.drain[send.1]=1
 0:00:00.002041000 [client] TRACE g#q.wheel_to_assembler.depth[send.1]=0
@@ -2732,11 +2877,15 @@ expression: logs
 0:00:00.002041000 [client] TRACE c#send.inflight.enq[send.1]=1
 0:00:00.002041000 [client] TRACE g#send.inflight.depth[send.1]=20
 0:00:00.002041000 [client] TRACE m#send.inflight.depth_dist[send.1]=20
+0:00:00.002041000 [client] TRACE c#credit.send.release.bytes=1361
+0:00:00.002041000 [client] TRACE c#credit.send.release.calls=1
 0:00:00.002041000 [client] TRACE m#asm.segments=1
 0:00:00.002041000 [client] TRACE c#socket.tx.ops[send.1]=1
 0:00:00.002041000 [client] TRACE c#socket.tx.bytes[send.1]=1414
 0:00:00.002041000 [client] TRACE m#task.assembler.drained[send.1]=1
 0:00:00.002041000 [client] TRACE m#task.tx_wheel.drained[send.worker.1]=0
+0:00:00.002041000 [client] TRACE c#credit.send.distributor.passes=1
+0:00:00.002041000 [client] TRACE c#credit.send.distributor.passes=1
 0:00:00.002061000 [client] TRACE c#socket.rx.ops[recv.2]=1
 0:00:00.002061000 [client] TRACE c#socket.rx.bytes[recv.2]=51
 0:00:00.002061000 [client] TRACE c#router.routed=1
@@ -3442,6 +3591,8 @@ expression: logs
 0:00:00.003041000 [client] TRACE c#send.pending.enq[send.1]=1
 0:00:00.003041000 [client] TRACE g#send.pending.depth[send.1]=14
 0:00:00.003041000 [client] TRACE m#send.pending.depth_dist[send.1]=14
+0:00:00.003041000 [client] TRACE c#credit.send.release.bytes=1361
+0:00:00.003041000 [client] TRACE c#credit.send.release.calls=1
 0:00:00.003041000 [client] TRACE m#asm.segments=1
 0:00:00.003041000 [client] TRACE c#q.resolver_to_tx_wheel.sender[send.worker.1.task.assembler.send.1]=1
 0:00:00.003041000 [client] TRACE c#q.resolver_to_tx_wheel.enq[send.worker.1]=1
@@ -3458,6 +3609,8 @@ expression: logs
 0:00:00.003041000 [client] TRACE g#q.wheel_to_assembler.depth[send.1]=1
 0:00:00.003041000 [client] TRACE m#q.wheel_to_assembler.depth_dist[send.1]=1
 0:00:00.003041000 [client] TRACE m#task.tx_wheel.drained[send.worker.1]=1
+0:00:00.003041000 [client] TRACE c#credit.send.distributor.passes=1
+0:00:00.003041000 [client] TRACE c#credit.send.distributor.passes=1
 0:00:00.003041000 [client] TRACE c#q.wheel_to_assembler.receiver[send.1.task.assembler.send.1]=1
 0:00:00.003041000 [client] TRACE c#q.wheel_to_assembler.drain[send.1]=1
 0:00:00.003041000 [client] TRACE g#q.wheel_to_assembler.depth[send.1]=0
@@ -3483,6 +3636,8 @@ expression: logs
 0:00:00.003041000 [client] TRACE c#send.pending.enq[send.1]=1
 0:00:00.003041000 [client] TRACE g#send.pending.depth[send.1]=13
 0:00:00.003041000 [client] TRACE m#send.pending.depth_dist[send.1]=13
+0:00:00.003041000 [client] TRACE c#credit.send.release.bytes=1361
+0:00:00.003041000 [client] TRACE c#credit.send.release.calls=1
 0:00:00.003041000 [client] TRACE m#asm.segments=1
 0:00:00.003041000 [client] TRACE c#q.resolver_to_tx_wheel.sender[send.worker.1.task.assembler.send.1]=1
 0:00:00.003041000 [client] TRACE c#q.resolver_to_tx_wheel.enq[send.worker.1]=1
@@ -3499,6 +3654,8 @@ expression: logs
 0:00:00.003041000 [client] TRACE g#q.wheel_to_assembler.depth[send.1]=1
 0:00:00.003041000 [client] TRACE m#q.wheel_to_assembler.depth_dist[send.1]=1
 0:00:00.003041000 [client] TRACE m#task.tx_wheel.drained[send.worker.1]=1
+0:00:00.003041000 [client] TRACE c#credit.send.distributor.passes=1
+0:00:00.003041000 [client] TRACE c#credit.send.distributor.passes=1
 0:00:00.003041000 [client] TRACE c#q.wheel_to_assembler.receiver[send.1.task.assembler.send.1]=1
 0:00:00.003041000 [client] TRACE c#q.wheel_to_assembler.drain[send.1]=1
 0:00:00.003041000 [client] TRACE g#q.wheel_to_assembler.depth[send.1]=0
@@ -3524,6 +3681,8 @@ expression: logs
 0:00:00.003041000 [client] TRACE c#send.pending.enq[send.1]=1
 0:00:00.003041000 [client] TRACE g#send.pending.depth[send.1]=12
 0:00:00.003041000 [client] TRACE m#send.pending.depth_dist[send.1]=12
+0:00:00.003041000 [client] TRACE c#credit.send.release.bytes=1361
+0:00:00.003041000 [client] TRACE c#credit.send.release.calls=1
 0:00:00.003041000 [client] TRACE m#asm.segments=1
 0:00:00.003041000 [client] TRACE c#q.resolver_to_tx_wheel.sender[send.worker.1.task.assembler.send.1]=1
 0:00:00.003041000 [client] TRACE c#q.resolver_to_tx_wheel.enq[send.worker.1]=1
@@ -3540,6 +3699,8 @@ expression: logs
 0:00:00.003041000 [client] TRACE g#q.wheel_to_assembler.depth[send.1]=1
 0:00:00.003041000 [client] TRACE m#q.wheel_to_assembler.depth_dist[send.1]=1
 0:00:00.003041000 [client] TRACE m#task.tx_wheel.drained[send.worker.1]=1
+0:00:00.003041000 [client] TRACE c#credit.send.distributor.passes=1
+0:00:00.003041000 [client] TRACE c#credit.send.distributor.passes=1
 0:00:00.003041000 [client] TRACE c#q.wheel_to_assembler.receiver[send.1.task.assembler.send.1]=1
 0:00:00.003041000 [client] TRACE c#q.wheel_to_assembler.drain[send.1]=1
 0:00:00.003041000 [client] TRACE g#q.wheel_to_assembler.depth[send.1]=0
@@ -3565,6 +3726,8 @@ expression: logs
 0:00:00.003041000 [client] TRACE c#send.pending.enq[send.1]=1
 0:00:00.003041000 [client] TRACE g#send.pending.depth[send.1]=11
 0:00:00.003041000 [client] TRACE m#send.pending.depth_dist[send.1]=11
+0:00:00.003041000 [client] TRACE c#credit.send.release.bytes=1361
+0:00:00.003041000 [client] TRACE c#credit.send.release.calls=1
 0:00:00.003041000 [client] TRACE m#asm.segments=1
 0:00:00.003041000 [client] TRACE c#q.resolver_to_tx_wheel.sender[send.worker.1.task.assembler.send.1]=1
 0:00:00.003041000 [client] TRACE c#q.resolver_to_tx_wheel.enq[send.worker.1]=1
@@ -3581,6 +3744,8 @@ expression: logs
 0:00:00.003041000 [client] TRACE g#q.wheel_to_assembler.depth[send.1]=1
 0:00:00.003041000 [client] TRACE m#q.wheel_to_assembler.depth_dist[send.1]=1
 0:00:00.003041000 [client] TRACE m#task.tx_wheel.drained[send.worker.1]=1
+0:00:00.003041000 [client] TRACE c#credit.send.distributor.passes=1
+0:00:00.003041000 [client] TRACE c#credit.send.distributor.passes=1
 0:00:00.003041000 [client] TRACE c#q.wheel_to_assembler.receiver[send.1.task.assembler.send.1]=1
 0:00:00.003041000 [client] TRACE c#q.wheel_to_assembler.drain[send.1]=1
 0:00:00.003041000 [client] TRACE g#q.wheel_to_assembler.depth[send.1]=0
@@ -3606,6 +3771,8 @@ expression: logs
 0:00:00.003041000 [client] TRACE c#send.pending.enq[send.1]=1
 0:00:00.003041000 [client] TRACE g#send.pending.depth[send.1]=10
 0:00:00.003041000 [client] TRACE m#send.pending.depth_dist[send.1]=10
+0:00:00.003041000 [client] TRACE c#credit.send.release.bytes=1361
+0:00:00.003041000 [client] TRACE c#credit.send.release.calls=1
 0:00:00.003041000 [client] TRACE m#asm.segments=1
 0:00:00.003041000 [client] TRACE c#q.resolver_to_tx_wheel.sender[send.worker.1.task.assembler.send.1]=1
 0:00:00.003041000 [client] TRACE c#q.resolver_to_tx_wheel.enq[send.worker.1]=1
@@ -3622,6 +3789,8 @@ expression: logs
 0:00:00.003041000 [client] TRACE g#q.wheel_to_assembler.depth[send.1]=1
 0:00:00.003041000 [client] TRACE m#q.wheel_to_assembler.depth_dist[send.1]=1
 0:00:00.003041000 [client] TRACE m#task.tx_wheel.drained[send.worker.1]=1
+0:00:00.003041000 [client] TRACE c#credit.send.distributor.passes=1
+0:00:00.003041000 [client] TRACE c#credit.send.distributor.passes=1
 0:00:00.003041000 [client] TRACE c#q.wheel_to_assembler.receiver[send.1.task.assembler.send.1]=1
 0:00:00.003041000 [client] TRACE c#q.wheel_to_assembler.drain[send.1]=1
 0:00:00.003041000 [client] TRACE g#q.wheel_to_assembler.depth[send.1]=0
@@ -3647,6 +3816,8 @@ expression: logs
 0:00:00.003041000 [client] TRACE c#send.pending.enq[send.1]=1
 0:00:00.003041000 [client] TRACE g#send.pending.depth[send.1]=9
 0:00:00.003041000 [client] TRACE m#send.pending.depth_dist[send.1]=9
+0:00:00.003041000 [client] TRACE c#credit.send.release.bytes=1361
+0:00:00.003041000 [client] TRACE c#credit.send.release.calls=1
 0:00:00.003041000 [client] TRACE m#asm.segments=1
 0:00:00.003041000 [client] TRACE c#q.resolver_to_tx_wheel.sender[send.worker.1.task.assembler.send.1]=1
 0:00:00.003041000 [client] TRACE c#q.resolver_to_tx_wheel.enq[send.worker.1]=1
@@ -3663,6 +3834,8 @@ expression: logs
 0:00:00.003041000 [client] TRACE g#q.wheel_to_assembler.depth[send.1]=1
 0:00:00.003041000 [client] TRACE m#q.wheel_to_assembler.depth_dist[send.1]=1
 0:00:00.003041000 [client] TRACE m#task.tx_wheel.drained[send.worker.1]=1
+0:00:00.003041000 [client] TRACE c#credit.send.distributor.passes=1
+0:00:00.003041000 [client] TRACE c#credit.send.distributor.passes=1
 0:00:00.003041000 [client] TRACE c#q.wheel_to_assembler.receiver[send.1.task.assembler.send.1]=1
 0:00:00.003041000 [client] TRACE c#q.wheel_to_assembler.drain[send.1]=1
 0:00:00.003041000 [client] TRACE g#q.wheel_to_assembler.depth[send.1]=0
@@ -3688,6 +3861,8 @@ expression: logs
 0:00:00.003041000 [client] TRACE c#send.pending.enq[send.1]=1
 0:00:00.003041000 [client] TRACE g#send.pending.depth[send.1]=8
 0:00:00.003041000 [client] TRACE m#send.pending.depth_dist[send.1]=8
+0:00:00.003041000 [client] TRACE c#credit.send.release.bytes=1361
+0:00:00.003041000 [client] TRACE c#credit.send.release.calls=1
 0:00:00.003041000 [client] TRACE m#asm.segments=1
 0:00:00.003041000 [client] TRACE c#q.resolver_to_tx_wheel.sender[send.worker.1.task.assembler.send.1]=1
 0:00:00.003041000 [client] TRACE c#q.resolver_to_tx_wheel.enq[send.worker.1]=1
@@ -3704,6 +3879,8 @@ expression: logs
 0:00:00.003041000 [client] TRACE g#q.wheel_to_assembler.depth[send.1]=1
 0:00:00.003041000 [client] TRACE m#q.wheel_to_assembler.depth_dist[send.1]=1
 0:00:00.003041000 [client] TRACE m#task.tx_wheel.drained[send.worker.1]=1
+0:00:00.003041000 [client] TRACE c#credit.send.distributor.passes=1
+0:00:00.003041000 [client] TRACE c#credit.send.distributor.passes=1
 0:00:00.003041000 [client] TRACE c#q.wheel_to_assembler.receiver[send.1.task.assembler.send.1]=1
 0:00:00.003041000 [client] TRACE c#q.wheel_to_assembler.drain[send.1]=1
 0:00:00.003041000 [client] TRACE g#q.wheel_to_assembler.depth[send.1]=0
@@ -3729,6 +3906,8 @@ expression: logs
 0:00:00.003041000 [client] TRACE c#send.pending.enq[send.1]=1
 0:00:00.003041000 [client] TRACE g#send.pending.depth[send.1]=7
 0:00:00.003041000 [client] TRACE m#send.pending.depth_dist[send.1]=7
+0:00:00.003041000 [client] TRACE c#credit.send.release.bytes=1361
+0:00:00.003041000 [client] TRACE c#credit.send.release.calls=1
 0:00:00.003041000 [client] TRACE m#asm.segments=1
 0:00:00.003041000 [client] TRACE c#q.resolver_to_tx_wheel.sender[send.worker.1.task.assembler.send.1]=1
 0:00:00.003041000 [client] TRACE c#q.resolver_to_tx_wheel.enq[send.worker.1]=1
@@ -3745,6 +3924,8 @@ expression: logs
 0:00:00.003041000 [client] TRACE g#q.wheel_to_assembler.depth[send.1]=1
 0:00:00.003041000 [client] TRACE m#q.wheel_to_assembler.depth_dist[send.1]=1
 0:00:00.003041000 [client] TRACE m#task.tx_wheel.drained[send.worker.1]=1
+0:00:00.003041000 [client] TRACE c#credit.send.distributor.passes=1
+0:00:00.003041000 [client] TRACE c#credit.send.distributor.passes=1
 0:00:00.003041000 [client] TRACE c#q.wheel_to_assembler.receiver[send.1.task.assembler.send.1]=1
 0:00:00.003041000 [client] TRACE c#q.wheel_to_assembler.drain[send.1]=1
 0:00:00.003041000 [client] TRACE g#q.wheel_to_assembler.depth[send.1]=0
@@ -3770,6 +3951,8 @@ expression: logs
 0:00:00.003041000 [client] TRACE c#send.pending.enq[send.1]=1
 0:00:00.003041000 [client] TRACE g#send.pending.depth[send.1]=6
 0:00:00.003041000 [client] TRACE m#send.pending.depth_dist[send.1]=6
+0:00:00.003041000 [client] TRACE c#credit.send.release.bytes=1361
+0:00:00.003041000 [client] TRACE c#credit.send.release.calls=1
 0:00:00.003041000 [client] TRACE m#asm.segments=1
 0:00:00.003041000 [client] TRACE c#q.resolver_to_tx_wheel.sender[send.worker.1.task.assembler.send.1]=1
 0:00:00.003041000 [client] TRACE c#q.resolver_to_tx_wheel.enq[send.worker.1]=1
@@ -3786,6 +3969,8 @@ expression: logs
 0:00:00.003041000 [client] TRACE g#q.wheel_to_assembler.depth[send.1]=1
 0:00:00.003041000 [client] TRACE m#q.wheel_to_assembler.depth_dist[send.1]=1
 0:00:00.003041000 [client] TRACE m#task.tx_wheel.drained[send.worker.1]=1
+0:00:00.003041000 [client] TRACE c#credit.send.distributor.passes=1
+0:00:00.003041000 [client] TRACE c#credit.send.distributor.passes=1
 0:00:00.003041000 [client] TRACE c#q.wheel_to_assembler.receiver[send.1.task.assembler.send.1]=1
 0:00:00.003041000 [client] TRACE c#q.wheel_to_assembler.drain[send.1]=1
 0:00:00.003041000 [client] TRACE g#q.wheel_to_assembler.depth[send.1]=0
@@ -3811,6 +3996,8 @@ expression: logs
 0:00:00.003041000 [client] TRACE c#send.pending.enq[send.1]=1
 0:00:00.003041000 [client] TRACE g#send.pending.depth[send.1]=5
 0:00:00.003041000 [client] TRACE m#send.pending.depth_dist[send.1]=5
+0:00:00.003041000 [client] TRACE c#credit.send.release.bytes=1361
+0:00:00.003041000 [client] TRACE c#credit.send.release.calls=1
 0:00:00.003041000 [client] TRACE m#asm.segments=1
 0:00:00.003041000 [client] TRACE c#q.resolver_to_tx_wheel.sender[send.worker.1.task.assembler.send.1]=1
 0:00:00.003041000 [client] TRACE c#q.resolver_to_tx_wheel.enq[send.worker.1]=1
@@ -3827,6 +4014,8 @@ expression: logs
 0:00:00.003041000 [client] TRACE g#q.wheel_to_assembler.depth[send.1]=1
 0:00:00.003041000 [client] TRACE m#q.wheel_to_assembler.depth_dist[send.1]=1
 0:00:00.003041000 [client] TRACE m#task.tx_wheel.drained[send.worker.1]=1
+0:00:00.003041000 [client] TRACE c#credit.send.distributor.passes=1
+0:00:00.003041000 [client] TRACE c#credit.send.distributor.passes=1
 0:00:00.003041000 [client] TRACE c#q.wheel_to_assembler.receiver[send.1.task.assembler.send.1]=1
 0:00:00.003041000 [client] TRACE c#q.wheel_to_assembler.drain[send.1]=1
 0:00:00.003041000 [client] TRACE g#q.wheel_to_assembler.depth[send.1]=0
@@ -3852,6 +4041,8 @@ expression: logs
 0:00:00.003041000 [client] TRACE c#send.pending.enq[send.1]=1
 0:00:00.003041000 [client] TRACE g#send.pending.depth[send.1]=4
 0:00:00.003041000 [client] TRACE m#send.pending.depth_dist[send.1]=4
+0:00:00.003041000 [client] TRACE c#credit.send.release.bytes=1361
+0:00:00.003041000 [client] TRACE c#credit.send.release.calls=1
 0:00:00.003041000 [client] TRACE m#asm.segments=1
 0:00:00.003041000 [client] TRACE c#q.resolver_to_tx_wheel.sender[send.worker.1.task.assembler.send.1]=1
 0:00:00.003041000 [client] TRACE c#q.resolver_to_tx_wheel.enq[send.worker.1]=1
@@ -3868,6 +4059,8 @@ expression: logs
 0:00:00.003041000 [client] TRACE g#q.wheel_to_assembler.depth[send.1]=1
 0:00:00.003041000 [client] TRACE m#q.wheel_to_assembler.depth_dist[send.1]=1
 0:00:00.003041000 [client] TRACE m#task.tx_wheel.drained[send.worker.1]=1
+0:00:00.003041000 [client] TRACE c#credit.send.distributor.passes=1
+0:00:00.003041000 [client] TRACE c#credit.send.distributor.passes=1
 0:00:00.003041000 [client] TRACE c#q.wheel_to_assembler.receiver[send.1.task.assembler.send.1]=1
 0:00:00.003041000 [client] TRACE c#q.wheel_to_assembler.drain[send.1]=1
 0:00:00.003041000 [client] TRACE g#q.wheel_to_assembler.depth[send.1]=0
@@ -3893,6 +4086,8 @@ expression: logs
 0:00:00.003041000 [client] TRACE c#send.pending.enq[send.1]=1
 0:00:00.003041000 [client] TRACE g#send.pending.depth[send.1]=3
 0:00:00.003041000 [client] TRACE m#send.pending.depth_dist[send.1]=3
+0:00:00.003041000 [client] TRACE c#credit.send.release.bytes=1361
+0:00:00.003041000 [client] TRACE c#credit.send.release.calls=1
 0:00:00.003041000 [client] TRACE m#asm.segments=1
 0:00:00.003041000 [client] TRACE c#q.resolver_to_tx_wheel.sender[send.worker.1.task.assembler.send.1]=1
 0:00:00.003041000 [client] TRACE c#q.resolver_to_tx_wheel.enq[send.worker.1]=1
@@ -3909,6 +4104,8 @@ expression: logs
 0:00:00.003041000 [client] TRACE g#q.wheel_to_assembler.depth[send.1]=1
 0:00:00.003041000 [client] TRACE m#q.wheel_to_assembler.depth_dist[send.1]=1
 0:00:00.003041000 [client] TRACE m#task.tx_wheel.drained[send.worker.1]=1
+0:00:00.003041000 [client] TRACE c#credit.send.distributor.passes=1
+0:00:00.003041000 [client] TRACE c#credit.send.distributor.passes=1
 0:00:00.003041000 [client] TRACE c#q.wheel_to_assembler.receiver[send.1.task.assembler.send.1]=1
 0:00:00.003041000 [client] TRACE c#q.wheel_to_assembler.drain[send.1]=1
 0:00:00.003041000 [client] TRACE g#q.wheel_to_assembler.depth[send.1]=0
@@ -3934,6 +4131,8 @@ expression: logs
 0:00:00.003041000 [client] TRACE c#send.pending.enq[send.1]=1
 0:00:00.003041000 [client] TRACE g#send.pending.depth[send.1]=2
 0:00:00.003041000 [client] TRACE m#send.pending.depth_dist[send.1]=2
+0:00:00.003041000 [client] TRACE c#credit.send.release.bytes=1361
+0:00:00.003041000 [client] TRACE c#credit.send.release.calls=1
 0:00:00.003041000 [client] TRACE m#asm.segments=1
 0:00:00.003041000 [client] TRACE c#q.resolver_to_tx_wheel.sender[send.worker.1.task.assembler.send.1]=1
 0:00:00.003041000 [client] TRACE c#q.resolver_to_tx_wheel.enq[send.worker.1]=1
@@ -3950,6 +4149,8 @@ expression: logs
 0:00:00.003041000 [client] TRACE g#q.wheel_to_assembler.depth[send.1]=1
 0:00:00.003041000 [client] TRACE m#q.wheel_to_assembler.depth_dist[send.1]=1
 0:00:00.003041000 [client] TRACE m#task.tx_wheel.drained[send.worker.1]=1
+0:00:00.003041000 [client] TRACE c#credit.send.distributor.passes=1
+0:00:00.003041000 [client] TRACE c#credit.send.distributor.passes=1
 0:00:00.003041000 [client] TRACE c#q.wheel_to_assembler.receiver[send.1.task.assembler.send.1]=1
 0:00:00.003041000 [client] TRACE c#q.wheel_to_assembler.drain[send.1]=1
 0:00:00.003041000 [client] TRACE g#q.wheel_to_assembler.depth[send.1]=0
@@ -3975,6 +4176,8 @@ expression: logs
 0:00:00.003041000 [client] TRACE c#send.pending.enq[send.1]=1
 0:00:00.003041000 [client] TRACE g#send.pending.depth[send.1]=1
 0:00:00.003041000 [client] TRACE m#send.pending.depth_dist[send.1]=1
+0:00:00.003041000 [client] TRACE c#credit.send.release.bytes=1361
+0:00:00.003041000 [client] TRACE c#credit.send.release.calls=1
 0:00:00.003041000 [client] TRACE m#asm.segments=1
 0:00:00.003041000 [client] TRACE c#q.resolver_to_tx_wheel.sender[send.worker.1.task.assembler.send.1]=1
 0:00:00.003041000 [client] TRACE c#q.resolver_to_tx_wheel.enq[send.worker.1]=1
@@ -3991,6 +4194,8 @@ expression: logs
 0:00:00.003041000 [client] TRACE g#q.wheel_to_assembler.depth[send.1]=1
 0:00:00.003041000 [client] TRACE m#q.wheel_to_assembler.depth_dist[send.1]=1
 0:00:00.003041000 [client] TRACE m#task.tx_wheel.drained[send.worker.1]=1
+0:00:00.003041000 [client] TRACE c#credit.send.distributor.passes=1
+0:00:00.003041000 [client] TRACE c#credit.send.distributor.passes=1
 0:00:00.003041000 [client] TRACE c#q.wheel_to_assembler.receiver[send.1.task.assembler.send.1]=1
 0:00:00.003041000 [client] TRACE c#q.wheel_to_assembler.drain[send.1]=1
 0:00:00.003041000 [client] TRACE g#q.wheel_to_assembler.depth[send.1]=0
@@ -4006,11 +4211,15 @@ expression: logs
 0:00:00.003041000 [client] TRACE c#send.inflight.enq[send.1]=1
 0:00:00.003041000 [client] TRACE g#send.inflight.depth[send.1]=15
 0:00:00.003041000 [client] TRACE m#send.inflight.depth_dist[send.1]=15
+0:00:00.003041000 [client] TRACE c#credit.send.release.bytes=1361
+0:00:00.003041000 [client] TRACE c#credit.send.release.calls=1
 0:00:00.003041000 [client] TRACE m#asm.segments=1
 0:00:00.003041000 [client] TRACE c#socket.tx.ops[send.1]=1
 0:00:00.003041000 [client] TRACE c#socket.tx.bytes[send.1]=1414
 0:00:00.003041000 [client] TRACE m#task.assembler.drained[send.1]=1
 0:00:00.003041000 [client] TRACE m#task.tx_wheel.drained[send.worker.1]=0
+0:00:00.003041000 [client] TRACE c#credit.send.distributor.passes=1
+0:00:00.003041000 [client] TRACE c#credit.send.distributor.passes=1
 0:00:00.003541000 [server] TRACE c#socket.rx.ops[recv.1]=1
 0:00:00.003541000 [server] TRACE c#socket.rx.bytes[recv.1]=21210
 0:00:00.003541000 [server] TRACE c#router.routed=1
@@ -4317,3 +4526,7 @@ expression: logs
 0:00:00.003541000 [server] TRACE c#socket.tx.ops[send.7]=1
 0:00:00.003541000 [server] TRACE c#socket.tx.bytes[send.7]=46
 0:00:00.003541000 [server] TRACE m#task.assembler.drained[send.7]=1
+0:00:00.003541000 [main] DEBUG distributor dropping; closing pool
+0:00:00.003541000 [main] DEBUG distributor dropping; closing pool
+0:00:00.003541000 [main] DEBUG distributor dropping; closing pool
+0:00:00.003541000 [main] DEBUG distributor dropping; closing pool

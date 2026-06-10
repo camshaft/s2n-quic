@@ -446,6 +446,8 @@ pub fn setup_sim_endpoint(
         dead_peer_cooldown,
         initial_tx_descriptor_allocs: 0,
         initial_rx_descriptor_allocs: 0,
+        send_credit_pool_config: crate::credit::Config::default(),
+        recv_credit_pool_config: crate::credit::Config::default(),
     };
 
     let endpoint = setup_endpoint(
@@ -564,8 +566,9 @@ pub fn connect(
             server_entry.set_peer_data_addrs(&peer_data_addrs);
         }
     } else {
-        // Also set our addrs on the peer's entry for us.
-        if let Some(peer_entry) = peer_map.get_raw(local_addr) {
+        // Set our addrs on the peer's server-side entry (looked up by ID since
+        // server entries are not in the address-keyed client map).
+        if let Some(peer_entry) = peer_map.get_by_id(&ids.peer) {
             peer_entry.set_peer_data_addrs(&local_endpoint.data_addrs);
         }
     }
@@ -675,6 +678,8 @@ where
         alloc.control,
         endpoint.clock.clone(),
         endpoint.writer_metrics.clone(),
+        endpoint.send_credit_pool.clone(),
+        crate::credit::Priority::default(),
     );
     let reader = Reader::new_client(
         frame_tx,

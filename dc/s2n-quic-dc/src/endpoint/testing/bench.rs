@@ -86,6 +86,7 @@ impl AssembleBenchmark {
             let Some(unfilled) = self.recycle_pool.alloc_or_reuse(&self.pool) else {
                 break;
             };
+            let credit_pool = crate::credit::Pool::new(crate::credit::Config::default());
             let Some(segments) = assemble::assemble::<UnsyncRecycler, _>(
                 &mut self.context,
                 ImmediateQueueStatus::Empty,
@@ -100,6 +101,7 @@ impl AssembleBenchmark {
                 &mut self.freed_batch_tx,
                 &self.assembler_counters,
                 &self.send_counters,
+                &credit_pool,
             ) else {
                 break;
             };
@@ -232,6 +234,7 @@ fn benchmark_frame(
             offset: VarInt::ZERO,
             is_fin: false,
             dest_acceptor_id: None,
+            priority: crate::credit::Priority::default(),
         },
         payload: BytesMut::zeroed(payload_len).into(),
         path_secret_entry: entry.clone(),
@@ -239,6 +242,7 @@ fn benchmark_frame(
         status: frame::TransmissionStatus::Pending,
         ttl: frame::DEFAULT_TTL,
         enqueued_at: None,
+        flow_credits: 0,
     })
 }
 

@@ -82,6 +82,7 @@ pub(crate) fn assemble<R: Recycler, Clk>(
     freed_batch_tx: &mut FreedBatchTx,
     counters: &AssemblerCounters,
     send_counters: &crate::endpoint::counters::Send,
+    send_credit_pool: &crate::credit::Pool,
 ) -> Option<Segments<R>>
 where
     Clk: precision::Clock + ?Sized,
@@ -97,6 +98,11 @@ where
     let mut segment_size: u16 = 0;
     let mut segments_written: u32 = 0;
     let mut sent_inflight_packet = false;
+    // Sum of `flow_credits` admitted to the inflight map across every segment in this
+    // GSO batch. We release once at the end of the batch (a single atomic add) instead
+    // of once per packet — same trade-off as the acquire path: one mutex/atomic op per
+    // batch, not per frame.
+    let mut flow_credits_to_release: u64 = 0;
 
     let result = unfilled.fill_with(|addr, cmsg, mut payload| {
         addr.set(context.peer_addr.into());
@@ -200,6 +206,7 @@ where
                     status: Default::default(),
                     ttl: frame::DEFAULT_TTL,
                     enqueued_at: None,
+                    flow_credits: 0,
                 };
 
                 is_ack_eliciting |= header.is_ack_eliciting();
@@ -293,6 +300,7 @@ where
                                 status: Default::default(),
                                 ttl: frame::DEFAULT_TTL,
                                 enqueued_at: None,
+                                flow_credits: 0,
                             });
                             is_ack_eliciting = true;
                             has_ping = true;
@@ -353,7 +361,7 @@ where
             let phase3_is_probe = can_send_pending && context.pto.probe_state.is_requested();
 
             if can_send_pending {
-                while let Some(frame) = context.pop_pending() {
+                while let Some(mut frame) = context.pop_pending() {
                     if !frame.should_transmit() {
                         let _ = cancelled.send(frame);
                         continue;
@@ -378,6 +386,12 @@ where
                     if phase3_is_probe {
                         counters.on_probe_frame(&frame.header);
                     }
+                    // Take credits before the move into packet_frames; the field stays at
+                    // 0 inside the inflight map so any later disposal can't double-release.
+                    // The total is summed across the whole GSO batch and released once
+                    // after fill_with returns.
+                    flow_credits_to_release = flow_credits_to_release
+                        .saturating_add(core::mem::take(&mut frame.flow_credits));
                     packet_frames.push_back(frame);
 
                     if estimated_len == max_segment_len {
@@ -518,6 +532,14 @@ where
                         if discarded > 0 {
                             context.cca.on_packet_discarded(discarded);
                         }
+                        trace!(
+                            credentials = %context.credentials.id,
+                            sender_idx = %context.sender_idx,
+                            shell_pn = old_pn.as_u64(),
+                            probe_pn = pn.as_u64(),
+                            discarded_bytes = discarded,
+                            "PTO probe: shell created (old PN -> new PN)"
+                        );
                     }
                 } else if rtt_sample_needed {
                     // ACK-only ack-eliciting packet (our own RTT probe or PTO-triggered).
@@ -569,6 +591,13 @@ where
     });
 
     let segments = result.expect("fill_with closure is infallible");
+
+    // Release credit-pool budget for every frame admitted across this whole GSO batch
+    // in a single atomic add. Packets that were stripped from `packet_frames` (ACKs,
+    // PINGs) carry `flow_credits == 0` and contributed nothing to the total.
+    if flow_credits_to_release > 0 {
+        send_credit_pool.release(flow_credits_to_release);
+    }
 
     if segments_written == 0 {
         // Frames may have been drained (e.g. all cancelled); publish the updated
@@ -655,6 +684,7 @@ fn drain_queue_free_retries(
             status: Default::default(),
             ttl: frame::DEFAULT_TTL,
             enqueued_at: None,
+            flow_credits: 0,
         };
         *is_ack_eliciting = true;
         *metadata = next_metadata;
@@ -768,6 +798,7 @@ fn assemble_queue_free(
         status: Default::default(),
         ttl: frame::DEFAULT_TTL,
         enqueued_at: None,
+        flow_credits: 0,
     })
 }
 
@@ -831,6 +862,13 @@ fn assemble_probe(
                     context.cca.on_packet_discarded(tx_info.sent_bytes as usize);
                 }
             }
+
+            // Removing the cancelled tail can drop `bytes_in_flight` to zero while
+            // predecessor shells (whose forward chain pointed at tails already gone)
+            // still linger. Those shells carry no bytes and can never resolve, so they
+            // would otherwise pin `has_inflight()` true and keep the PTO arming forever.
+            // Reap them as soon as nothing is genuinely in flight.
+            context.reap_shells_if_drained();
             continue;
         }
 

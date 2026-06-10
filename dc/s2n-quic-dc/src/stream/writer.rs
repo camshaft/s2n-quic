@@ -93,9 +93,11 @@ use s2n_quic_core::{
     varint::VarInt,
 };
 use std::{
+    alloc::{self, Layout},
     io,
     net::SocketAddr,
     pin::Pin,
+    ptr::NonNull,
     sync::Arc,
     task::{Context, Poll},
 };
@@ -147,7 +149,125 @@ pub struct MsgFlags {
 ///     Ok(())
 /// }
 /// ```
-pub struct Writer(Box<Inner>);
+pub struct Writer(WriterAllocPtr);
+
+#[repr(C)]
+struct WriterAlloc {
+    /// MUST live at offset 0 — the credit pool casts `NonNull<Slot>` back to
+    /// `NonNull<WriterAlloc>` via the registered `drop_fn`. Enforced at compile
+    /// time by [`crate::assert_slot_at_offset_zero!`] below.
+    slot: crate::credit::Slot,
+    inner: Inner,
+}
+
+crate::assert_slot_at_offset_zero!(WriterAlloc);
+
+/// Owning pointer to a `WriterAlloc`. Derefs to `Inner` so the writer body keeps
+/// its `self.0.field` ergonomics, while drop is staged through the credit slot's
+/// abandon/grant state machine: a parked acquire can transfer ownership of the
+/// allocation to the pool, which then calls [`drop_writer_alloc`] to free it.
+struct WriterAllocPtr(NonNull<WriterAlloc>);
+
+// SAFETY: `WriterAllocPtr` owns the heap allocation exclusively. `Inner`'s fields
+// are all `Send` (and not `Sync`), and `credit::Slot` is `Send`/`Sync`. The pool
+// only ever reads/writes `Slot` fields under its own state machine; it never
+// touches `Inner`.
+unsafe impl Send for WriterAllocPtr {}
+
+impl WriterAllocPtr {
+    /// Allocate a `WriterAlloc` initialized with `inner` and an idle (rc=APP)
+    /// `Slot` registered against [`drop_writer_alloc`].
+    fn new(inner: Inner) -> Self {
+        let layout = Layout::new::<WriterAlloc>();
+        let raw = unsafe { alloc::alloc(layout) } as *mut WriterAlloc;
+        let ptr = NonNull::new(raw).unwrap_or_else(|| alloc::handle_alloc_error(layout));
+        unsafe {
+            std::ptr::write(
+                ptr.as_ptr(),
+                WriterAlloc {
+                    slot: crate::credit::Slot::new(drop_writer_alloc),
+                    inner,
+                },
+            );
+        }
+        Self(ptr)
+    }
+
+    /// Pointer to the embedded `Slot` for handing to the credit pool.
+    #[inline]
+    fn slot_ptr(&self) -> NonNull<crate::credit::Slot> {
+        self.0.cast()
+    }
+}
+
+impl core::ops::Deref for WriterAllocPtr {
+    type Target = Inner;
+    #[inline]
+    fn deref(&self) -> &Inner {
+        unsafe { &(*self.0.as_ptr()).inner }
+    }
+}
+
+impl core::ops::DerefMut for WriterAllocPtr {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut Inner {
+        unsafe { &mut (*self.0.as_ptr()).inner }
+    }
+}
+
+impl Drop for WriterAllocPtr {
+    fn drop(&mut self) {
+        // Always go through `abandon` — its CAS is the single source of truth for who owns the
+        // allocation. On a never-parked-or-already-consumed slot the CAS fails harmlessly and
+        // returns `Granted(0)` (because `poll_granted` consumed the prior grant, or because no
+        // grant was ever delivered).
+        //
+        // SAFETY: `abandon`'s relaxed contract (post step-5) permits calling it in any APP-owned
+        // or LINKED state, exactly the range the slot can be in when the writer drops.
+        let slot = unsafe { &(*self.0.as_ptr()).slot };
+        match unsafe { slot.abandon() } {
+            crate::credit::AbandonResult::Abandoned => {
+                // The slot was LINKED and is now DEAD. The pool's pop walk will call
+                // `drop_writer_alloc` to free the allocation; we must not touch it again.
+                return;
+            }
+            crate::credit::AbandonResult::Granted(n) => {
+                // We own the allocation. The slot may carry unconsumed credit (a grant the
+                // writer never observed via `poll_granted`) and `Inner.pending_credits` may
+                // hold credit acquired-but-not-yet-attached when the send batch aborted (peer
+                // reset, transmission failure, frame channel closed mid-batch). Release both
+                // back to the pool so the budget recovers; otherwise repeated mid-batch
+                // failures would slowly bleed the pool dry.
+                let inner = unsafe { &(*self.0.as_ptr()).inner };
+                let to_release = n.saturating_add(inner.pending_credits);
+                if to_release > 0 {
+                    inner.send_credit_pool.release(to_release);
+                }
+            }
+            crate::credit::AbandonResult::Closed => {
+                // Pool was dropped concurrently. We own the allocation; do not touch the pool.
+            }
+        }
+        // SAFETY: The slot is APP-owned and we hold the only reference. Drop `Inner` and free
+        // the heap block.
+        unsafe {
+            std::ptr::drop_in_place(&raw mut (*self.0.as_ptr()).inner);
+            alloc::dealloc(self.0.as_ptr().cast(), Layout::new::<WriterAlloc>());
+        }
+    }
+}
+
+/// `drop_fn` invoked by the credit pool when it pops a dead slot — i.e. the
+/// writer was dropped while its slot was linked, the pool then dequeued the
+/// dead entry and now owns the allocation. Drops `Inner` and frees the block.
+unsafe fn drop_writer_alloc(ptr: NonNull<crate::credit::Slot>) {
+    // SAFETY: `Slot` lives at offset 0 of `WriterAlloc` (see
+    // `assert_slot_at_offset_zero!`), so the cast points back to the original
+    // allocation. The pool guarantees this is called exactly once.
+    let ptr = ptr.cast::<WriterAlloc>();
+    std::ptr::drop_in_place(&raw mut (*ptr.as_ptr()).inner);
+    alloc::dealloc(ptr.as_ptr().cast(), Layout::new::<WriterAlloc>());
+}
 
 struct Inner {
     /// Channel to submit frames to the wheel
@@ -203,6 +323,17 @@ struct Inner {
     clock: crate::time::DefaultClock,
     /// Per-outcome sojourn time histograms shared with the application.
     metrics: Arc<WriterMetrics>,
+    /// Priority tier this writer acquires credits at. Stable over the writer's
+    /// lifetime; mutated only via `set_priority` (future acquires only — already
+    /// parked acquires retain the priority they were parked under).
+    priority: crate::credit::Priority,
+    /// Endpoint-shared send credit pool. Cloned at construction so the writer's
+    /// `Slot` (offset 0 of `WriterAlloc`) can stay registered with this pool.
+    send_credit_pool: crate::sync::Arc<crate::credit::Pool>,
+    /// Credits granted by the most recent `poll_acquire` that have not yet been
+    /// attached to a frame. Carry-over after a batch consumes less than was
+    /// granted is released back to the pool.
+    pending_credits: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -247,6 +378,8 @@ impl Writer {
         control_rx: crate::queue::ControlReceiver,
         clock: crate::time::DefaultClock,
         metrics: Arc<WriterMetrics>,
+        send_credit_pool: crate::sync::Arc<crate::credit::Pool>,
+        priority: crate::credit::Priority,
     ) -> Self {
         let completion_rx = frame::completion_channel();
         let parameters = path_secret_entry.parameters();
@@ -257,7 +390,7 @@ impl Writer {
         let initial_remote_max_data = parameters.remote_max_data.as_u64();
         let remote_max_data = VarInt::ZERO;
 
-        Self(Box::new(Inner {
+        Self(WriterAllocPtr::new(Inner {
             frame_tx,
             completion_rx,
             control_rx,
@@ -281,6 +414,9 @@ impl Writer {
             coop: Coop::default(),
             clock,
             metrics,
+            priority,
+            send_credit_pool,
+            pending_credits: 0,
         }))
     }
 
@@ -292,6 +428,8 @@ impl Writer {
         control_rx: crate::queue::ControlReceiver,
         clock: crate::time::DefaultClock,
         metrics: Arc<WriterMetrics>,
+        send_credit_pool: crate::sync::Arc<crate::credit::Pool>,
+        priority: crate::credit::Priority,
     ) -> Self {
         let completion_rx = frame::completion_channel();
         let parameters = path_secret_entry.parameters();
@@ -301,7 +439,7 @@ impl Writer {
         let max_inflight_bytes = parameters.local_send_max_data.as_u64();
         let initial_remote_max_data = parameters.remote_max_data.as_u64();
 
-        Self(Box::new(Inner {
+        Self(WriterAllocPtr::new(Inner {
             frame_tx,
             completion_rx,
             control_rx,
@@ -325,7 +463,25 @@ impl Writer {
             coop: Coop::default(),
             clock,
             metrics,
+            priority,
+            send_credit_pool,
+            pending_credits: 0,
         }))
+    }
+
+    /// Returns the priority this writer is currently acquiring credits at.
+    #[inline]
+    pub fn priority(&self) -> crate::credit::Priority {
+        self.0.priority
+    }
+
+    /// Set the priority used for **future** credit acquires. Already-parked
+    /// acquires keep the priority they were parked under (the slot is linked
+    /// in that tier's wait list and cannot be migrated without racing the
+    /// distributor).
+    #[inline]
+    pub fn set_priority(&mut self, priority: crate::credit::Priority) {
+        self.0.priority = priority;
     }
 
     /// Writes bytes from the source buffer into the stream.
@@ -438,7 +594,11 @@ impl Writer {
         S: buffer::reader::storage::Infallible,
     {
         let total = buf.buffered_len();
-        core::future::poll_fn(|cx| self.0.poll_write_msg(cx, buf, flags)).await?;
+        core::future::poll_fn(|cx| {
+            let slot = self.0.slot_ptr();
+            self.0.poll_write_msg(cx, slot, buf, flags)
+        })
+        .await?;
         Ok(total)
     }
 
@@ -465,7 +625,8 @@ impl Writer {
     where
         S: buffer::reader::storage::Infallible,
     {
-        self.0.poll_write_from(cx, buf, is_fin)
+        let slot = self.0.slot_ptr();
+        self.0.poll_write_from(cx, slot, buf, is_fin)
     }
 
     /// Locally half-closes the write side of the stream.
@@ -512,6 +673,19 @@ impl Inner {
             Some(self.acceptor_id)
         }
     }
+
+    /// Priority field to encode on the next outgoing frame. Init frames (those carrying
+    /// `dest_acceptor_id`) emit the writer's actual priority; non-init frames emit the default
+    /// because the wire format only encodes priority when `dest_acceptor_id.is_some()`. Mirrors
+    /// `Header::canonicalize_for_wire` so production code never produces a non-canonical header.
+    #[inline]
+    fn wire_priority(&self) -> crate::credit::Priority {
+        if self.dest_acceptor_id().is_some() {
+            self.priority
+        } else {
+            crate::credit::Priority::default()
+        }
+    }
 }
 
 impl HasCoop for Inner {
@@ -526,6 +700,7 @@ impl Inner {
     fn poll_write_from<S>(
         &mut self,
         cx: &mut Context,
+        slot: NonNull<crate::credit::Slot>,
         buf: &mut S,
         is_fin: bool,
     ) -> Poll<io::Result<usize>>
@@ -534,7 +709,7 @@ impl Inner {
     {
         waker::debug_assert_contract(cx, |cx| {
             coop::poll(self, cx, |this, cx| {
-                this.poll_write_from_inner(cx, buf, is_fin)
+                this.poll_write_from_inner(cx, slot, buf, is_fin)
             })
         })
     }
@@ -542,6 +717,7 @@ impl Inner {
     fn poll_write_msg<S>(
         &mut self,
         cx: &mut Context,
+        slot: NonNull<crate::credit::Slot>,
         buf: &mut S,
         flags: MsgFlags,
     ) -> Poll<io::Result<usize>>
@@ -550,7 +726,7 @@ impl Inner {
     {
         waker::debug_assert_contract(cx, |cx| {
             coop::poll(self, cx, |this, cx| {
-                this.poll_write_msg_inner(cx, buf, flags)
+                this.poll_write_msg_inner(cx, slot, buf, flags)
             })
         })
     }
@@ -558,6 +734,7 @@ impl Inner {
     fn poll_write_msg_inner<S>(
         &mut self,
         cx: &mut Context,
+        slot: NonNull<crate::credit::Slot>,
         buf: &mut S,
         flags: MsgFlags,
     ) -> Poll<io::Result<usize>>
@@ -581,6 +758,21 @@ impl Inner {
 
         self.poll_completions(cx)?;
         let _ = self.poll_remote_budget(cx)?;
+
+        // Acquire credits for the planned send batch. Init state bypasses the flow-control
+        // window (init frame always goes out); steady-state uses the full window clamped by
+        // the buffer. The pool further clamps by `max_single_acquire`, so we may get less than
+        // `want` and just send whatever we got.
+        let want = if self.status.is_init() {
+            (buf.buffered_len() as u64).min(self.packet_size as u64)
+        } else {
+            self.flow_budget().min(buf.buffered_len() as u64)
+        };
+        match unsafe { self.poll_acquire_credits(cx, slot, want) } {
+            Poll::Ready(Ok(())) => {}
+            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+            Poll::Pending => return Poll::Pending,
+        }
 
         // Handle Init state: first write triggers QueueMsg-init with dest_acceptor_id.
         // send_msg already includes dest_acceptor_id when status is not confirmed.
@@ -633,9 +825,16 @@ impl Inner {
                 return Poll::Pending;
             }
 
-            // Refresh budget: drain completions and process MAX_DATA before retrying.
+            // Refresh budget: drain completions, process MAX_DATA, and top up credits before
+            // retrying. If the credit acquire parks, exit; the next poll picks up where we left.
             self.poll_completions(cx)?;
             let _ = self.poll_remote_budget(cx)?;
+            let want = self.flow_budget().min(buf.buffered_len() as u64);
+            match unsafe { self.poll_acquire_credits(cx, slot, want) } {
+                Poll::Ready(Ok(())) => {}
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => return Poll::Pending,
+            }
         }
     }
 
@@ -643,6 +842,7 @@ impl Inner {
     fn poll_write_from_inner<S>(
         &mut self,
         cx: &mut Context,
+        slot: NonNull<crate::credit::Slot>,
         buf: &mut S,
         is_fin: bool,
     ) -> Poll<io::Result<usize>>
@@ -674,6 +874,22 @@ impl Inner {
 
         self.poll_completions(cx)?;
         let _ = self.poll_remote_budget(cx)?;
+
+        // Acquire credits for the planned send batch before producing frames. The init frame
+        // (`Init` state) bypasses the flow-control window — it must always go out — so its
+        // credit ask is just `min(buf_len, packet_size)`. Steady-state asks for the full
+        // flow-control window clamped by the buffer. Control-only paths (FIN-on-empty) acquire
+        // zero, which `poll_acquire_credits` short-circuits.
+        let want = if self.status.is_init() {
+            (buf.buffered_len() as u64).min(self.packet_size as u64)
+        } else {
+            self.flow_budget().min(buf.buffered_len() as u64)
+        };
+        match unsafe { self.poll_acquire_credits(cx, slot, want) } {
+            Poll::Ready(Ok(())) => {}
+            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+            Poll::Pending => return Poll::Pending,
+        }
 
         if self.status.is_init() {
             let (written, is_fin) = self.send_queue_data_init(buf, is_fin)?;
@@ -781,6 +997,7 @@ impl Inner {
             status: frame::TransmissionStatus::default(),
             ttl: DEFAULT_TTL,
             enqueued_at: None,
+            flow_credits: 0,
         };
 
         self.send_frame(frame)?;
@@ -803,6 +1020,7 @@ impl Inner {
                 offset: self.next_offset,
                 is_fin: true,
                 dest_acceptor_id: self.dest_acceptor_id(),
+                priority: self.wire_priority(),
             },
             payload: ByteVec::new(),
             path_secret_entry: self.path_secret_entry.clone(),
@@ -810,6 +1028,7 @@ impl Inner {
             status: frame::TransmissionStatus::default(),
             ttl: DEFAULT_TTL,
             enqueued_at: Some(self.clock.now()),
+            flow_credits: 0,
         };
 
         self.send_frame(frame)?;
@@ -1034,6 +1253,7 @@ impl Inner {
     {
         let (payload, bytes_read, actual_fin) = self.prepare_early_data(buf, is_fin)?;
 
+        let flow_credits = self.take_credits(payload.len());
         let frame = Frame {
             header: Header::QueueData {
                 queue_pair: self.queue_pair(),
@@ -1041,6 +1261,7 @@ impl Inner {
                 offset: VarInt::ZERO,
                 is_fin: actual_fin,
                 dest_acceptor_id: Some(self.acceptor_id),
+                priority: self.wire_priority(),
             },
             payload,
             path_secret_entry: self.path_secret_entry.clone(),
@@ -1048,6 +1269,7 @@ impl Inner {
             status: frame::TransmissionStatus::default(),
             ttl: DEFAULT_TTL,
             enqueued_at: Some(self.clock.now()),
+            flow_credits,
         };
 
         self.send_frame(frame)?;
@@ -1108,7 +1330,11 @@ impl Inner {
         Ok((payload, bytes_read, actual_is_fin))
     }
 
-    fn min_send_budget(&self) -> u64 {
+    /// Local + remote send budget, ignoring credit gating.
+    ///
+    /// Used to compute how much credit we *want* to acquire from the pool. The credit clamp is
+    /// applied separately by `min_send_budget`.
+    fn flow_budget(&self) -> u64 {
         let local_available = self.max_inflight_bytes.saturating_sub(self.inflight_bytes);
         let remote_available = self
             .remote_max_data
@@ -1116,6 +1342,84 @@ impl Inner {
             .saturating_sub(self.next_offset.as_u64());
 
         local_available.min(remote_available)
+    }
+
+    /// Effective send budget for the current poll: the flow-control window further clamped by the
+    /// credits already held (`pending_credits`). The send loops use this so they never produce a
+    /// frame they can't attribute to a credit.
+    fn min_send_budget(&self) -> u64 {
+        self.flow_budget().min(self.pending_credits)
+    }
+
+    /// Drain any delivered grant into `pending_credits`, then top up by `want` bytes from the pool
+    /// if we don't already have enough. Returns `Pending` if either the slot is still parked from a
+    /// prior poll or a fresh acquire just parked.
+    ///
+    /// `want` should be `flow_budget()` clamped by the buffered length the caller intends to send;
+    /// the pool further clamps by `max_single_acquire`. We always send whatever the pool gives us.
+    ///
+    /// # Safety
+    ///
+    /// `slot` must point to the `Slot` embedded in this writer's `WriterAlloc` (offset 0). It is
+    /// the only legal slot for this `Inner` because `Pool::poll_acquire` writes a waker for *this*
+    /// task into it.
+    unsafe fn poll_acquire_credits(
+        &mut self,
+        cx: &mut Context,
+        slot: NonNull<crate::credit::Slot>,
+        want: u64,
+    ) -> Poll<io::Result<()>> {
+        // Drain any grant the distributor delivered while we were away.
+        let slot_ref = unsafe { slot.as_ref() };
+        match slot_ref.poll_granted() {
+            crate::credit::GrantResult::Pending => {
+                // Still parked from a previous poll. Don't issue a fresh acquire — that would
+                // race the distributor for the same slot.
+                return Poll::Pending;
+            }
+            crate::credit::GrantResult::Closed => {
+                // Pool went away. Surface as broken pipe; future polls will keep returning the
+                // same Closed (the sentinel persists), so this is idempotent.
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "credit pool closed",
+                )));
+            }
+            crate::credit::GrantResult::Granted(n) => {
+                self.pending_credits = self.pending_credits.saturating_add(n);
+            }
+        }
+
+        if self.pending_credits >= want || want == 0 {
+            return Poll::Ready(Ok(()));
+        }
+
+        let need = want - self.pending_credits;
+        // SAFETY: caller's invariants: `slot` is this writer's idle slot.
+        match unsafe {
+            self.send_credit_pool
+                .poll_acquire(cx, slot, need, self.priority)
+        } {
+            Poll::Ready(n) => {
+                self.pending_credits = self.pending_credits.saturating_add(n);
+                Poll::Ready(Ok(()))
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    /// Subtract `n` from `pending_credits`. Returns `n` so it can be assigned to
+    /// `Frame.flow_credits` in one expression.
+    #[inline]
+    fn take_credits(&mut self, n: usize) -> u64 {
+        let n = n as u64;
+        debug_assert!(
+            self.pending_credits >= n,
+            "take_credits({n}) exceeds pending_credits {}",
+            self.pending_credits
+        );
+        self.pending_credits = self.pending_credits.saturating_sub(n);
+        n
     }
 
     fn send_data<S>(&mut self, buf: &mut S, is_fin: bool) -> io::Result<usize>
@@ -1169,6 +1473,7 @@ impl Inner {
             let is_last_chunk = buf.buffer_is_empty();
             let include_fin = is_fin && is_last_chunk;
 
+            let flow_credits = self.take_credits(payload_len);
             let frame = Frame {
                 header: Header::QueueData {
                     queue_pair: self.queue_pair(),
@@ -1176,6 +1481,7 @@ impl Inner {
                     offset,
                     is_fin: include_fin,
                     dest_acceptor_id: self.dest_acceptor_id(),
+                    priority: self.wire_priority(),
                 },
                 payload,
                 path_secret_entry: self.path_secret_entry.clone(),
@@ -1183,6 +1489,7 @@ impl Inner {
                 status: frame::TransmissionStatus::default(),
                 ttl: DEFAULT_TTL,
                 enqueued_at: batch_enqueued_at,
+                flow_credits,
             };
 
             frames.push_back(frame.into());
@@ -1298,6 +1605,12 @@ impl Inner {
             {
                 break;
             }
+            // Stop if we don't have enough credits for at least one chunk of this segment. The
+            // outer poll loop will refresh `pending_credits` and re-enter; resume handles the
+            // partial-segment case via `pending_chunk_index`.
+            if !is_resuming && (self.pending_credits as usize) < chunk_size as usize {
+                break;
+            }
             is_first = false;
 
             let is_last_segment = if self.pending_chunk_index > 0 {
@@ -1334,6 +1647,7 @@ impl Inner {
                 buf.infallible_copy_into(&mut writer);
                 segment_remaining -= chunk_len;
 
+                let flow_credits = self.take_credits(chunk_len);
                 let frame = Frame {
                     header: Header::QueueMsg {
                         queue_pair: self.queue_pair(),
@@ -1346,6 +1660,7 @@ impl Inner {
                         is_fin: segment_is_fin,
                         is_wakeup,
                         dest_acceptor_id: self.dest_acceptor_id(),
+                        priority: self.wire_priority(),
                     },
                     payload,
                     path_secret_entry: self.path_secret_entry.clone(),
@@ -1353,6 +1668,7 @@ impl Inner {
                     status: frame::TransmissionStatus::default(),
                     ttl: DEFAULT_TTL,
                     enqueued_at: batch_enqueued_at,
+                    flow_credits,
                 };
 
                 frames.push_back(frame.into());
@@ -1480,6 +1796,9 @@ impl Drop for Writer {
         } else {
             let _ = self.shutdown();
         }
+        // The allocation itself is freed by `WriterAllocPtr::drop`, which runs
+        // after this body returns. That drop branches on the credit slot's
+        // state to handle the parked-acquire case (step 8).
     }
 }
 

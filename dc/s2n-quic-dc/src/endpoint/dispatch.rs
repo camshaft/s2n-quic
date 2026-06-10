@@ -88,6 +88,7 @@ fn decrypt_fast_path(
     stream_clock: &crate::time::DefaultClock,
     reader_metrics: &Arc<crate::stream::metrics::ReaderMetrics>,
     writer_metrics: &Arc<crate::stream::metrics::WriterMetrics>,
+    send_credit_pool: &crate::sync::Arc<crate::credit::Pool>,
 ) -> Result<AutoWake, FastPathError> {
     let Header::QueueMsg {
         queue_pair,
@@ -100,6 +101,7 @@ fn decrypt_fast_path(
         is_fin,
         is_wakeup,
         dest_acceptor_id,
+        priority,
     } = header
     else {
         return Err(FastPathError::HeaderMismatch);
@@ -143,6 +145,8 @@ fn decrypt_fast_path(
                     control,
                     stream_clock.clone(),
                     writer_metrics.clone(),
+                    send_credit_pool.clone(),
+                    priority,
                 );
                 let reader = Reader::new_server(
                     frame_tx.clone(),
@@ -244,6 +248,7 @@ pub(crate) fn process<Clk, Route>(
     stream_clock: &crate::time::DefaultClock,
     reader_metrics: &Arc<crate::stream::metrics::ReaderMetrics>,
     writer_metrics: &Arc<crate::stream::metrics::WriterMetrics>,
+    send_credit_pool: &crate::sync::Arc<crate::credit::Pool>,
 ) -> Result<(), Error>
 where
     Clk: s2n_quic_core::time::Clock + crate::time::precision::Clock + ?Sized,
@@ -299,6 +304,7 @@ where
                 stream_clock,
                 reader_metrics,
                 writer_metrics,
+                send_credit_pool,
             )
             .map(DecryptResult::FastPath)
             .ok();
@@ -485,6 +491,7 @@ where
                     stream_clock,
                     reader_metrics,
                     writer_metrics,
+                    send_credit_pool,
                 );
             }
             Err(err) => {
@@ -570,6 +577,7 @@ fn dispatch_decoded_frame(
     stream_clock: &crate::time::DefaultClock,
     reader_metrics: &Arc<crate::stream::metrics::ReaderMetrics>,
     writer_metrics: &Arc<crate::stream::metrics::WriterMetrics>,
+    send_credit_pool: &crate::sync::Arc<crate::credit::Pool>,
 ) {
     match header {
         Header::QueueData {
@@ -578,6 +586,7 @@ fn dispatch_decoded_frame(
             offset,
             is_fin,
             dest_acceptor_id,
+            priority,
         } => {
             if let Some(acceptor_id) = dest_acceptor_id {
                 handle_queue_data_init(
@@ -596,6 +605,8 @@ fn dispatch_decoded_frame(
                     stream_clock,
                     reader_metrics,
                     writer_metrics,
+                    send_credit_pool,
+                    priority,
                 );
             } else {
                 handle_queue_data(
@@ -691,6 +702,7 @@ fn dispatch_decoded_frame(
             is_fin,
             is_wakeup,
             dest_acceptor_id,
+            priority,
         } => {
             if let Some(acceptor_id) = dest_acceptor_id {
                 handle_queue_msg_init(
@@ -714,6 +726,8 @@ fn dispatch_decoded_frame(
                     stream_clock,
                     reader_metrics,
                     writer_metrics,
+                    send_credit_pool,
+                    priority,
                 );
             } else {
                 handle_queue_msg(
@@ -993,6 +1007,8 @@ fn handle_queue_msg_init(
     stream_clock: &crate::time::DefaultClock,
     reader_metrics: &Arc<crate::stream::metrics::ReaderMetrics>,
     writer_metrics: &Arc<crate::stream::metrics::WriterMetrics>,
+    send_credit_pool: &crate::sync::Arc<crate::credit::Pool>,
+    priority: crate::credit::Priority,
 ) {
     let Some(server_view) = peer.queue_view.as_server_mut() else {
         return;
@@ -1031,6 +1047,8 @@ fn handle_queue_msg_init(
                 control,
                 stream_clock.clone(),
                 writer_metrics.clone(),
+                send_credit_pool.clone(),
+                priority,
             );
             let reader = Reader::new_server(
                 frame_tx.clone(),
@@ -1105,6 +1123,8 @@ fn handle_queue_data_init(
     stream_clock: &crate::time::DefaultClock,
     reader_metrics: &Arc<crate::stream::metrics::ReaderMetrics>,
     writer_metrics: &Arc<crate::stream::metrics::WriterMetrics>,
+    send_credit_pool: &crate::sync::Arc<crate::credit::Pool>,
+    priority: crate::credit::Priority,
 ) {
     let Some(server_view) = peer.queue_view.as_server_mut() else {
         error!(
@@ -1160,6 +1180,8 @@ fn handle_queue_data_init(
                 control,
                 stream_clock.clone(),
                 writer_metrics.clone(),
+                send_credit_pool.clone(),
+                priority,
             );
             let peer_fin = is_fin;
             let reader = Reader::new_server(
@@ -1240,6 +1262,7 @@ fn send_reset(
         status: crate::endpoint::frame::TransmissionStatus::default(),
         ttl: DEFAULT_TTL,
         enqueued_at: None,
+        flow_credits: 0,
     };
     let _ = frame_tx.send_batch(Entry::new(frame));
 }

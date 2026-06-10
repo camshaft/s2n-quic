@@ -68,6 +68,7 @@ fn test_frame(pse: &Arc<crate::path::secret::map::Entry>) -> Entry<Frame> {
             offset: VarInt::ZERO,
             is_fin: false,
             dest_acceptor_id: None,
+            priority: crate::credit::Priority::default(),
         },
         payload: Default::default(),
         path_secret_entry: pse.clone(),
@@ -75,6 +76,7 @@ fn test_frame(pse: &Arc<crate::path::secret::map::Entry>) -> Entry<Frame> {
         status: frame::TransmissionStatus::Pending,
         ttl: 3,
         enqueued_at: None,
+        flow_credits: 0,
     })
 }
 

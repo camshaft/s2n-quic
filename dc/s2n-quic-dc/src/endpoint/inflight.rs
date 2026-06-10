@@ -243,6 +243,39 @@ impl Map {
         Some(packet)
     }
 
+    /// Drop every remaining entry once no bytes are in flight.
+    ///
+    /// When `bytes_in_flight` reaches zero, the byte-accounting invariant
+    /// (`sum_sent_bytes == cca.bytes_in_flight`) guarantees every entry still in the
+    /// map is a zero-byte shell: a live entry always carries `sent_bytes > 0`. Those
+    /// shells are PTO-probe tombstones whose live tail is already gone (ACKed, lost,
+    /// or cancelled), so they can never resolve to a completion or carry a probe —
+    /// they only keep `has_inflight()` true and the PTO armed forever. The caller is
+    /// responsible for confirming `bytes_in_flight == 0` before calling this.
+    #[inline]
+    pub fn clear_orphaned_shells(&mut self) {
+        let count = self.inner.len() as u64;
+        if count == 0 {
+            return;
+        }
+        // SAFETY (logical, not memory): the caller guarantees `bytes_in_flight == 0`.
+        // Combined with the accounting invariant `sum_sent_bytes == cca.bytes_in_flight`,
+        // every remaining entry must have `sent_bytes == 0` (a live entry always carries
+        // bytes), so clearing drops only shells. A violation here means a prior bug in the
+        // byte accounting (on_packet_sent/ack/lost/discarded); the debug_assert surfaces it
+        // in development. In release builds a violation would silently drop a live entry, so
+        // the byte invariant in `send::Context::invariants` is the real guard.
+        debug_assert!(
+            self.inner.iter().all(|(_, p)| p.transmission_info.is_none()
+                || p.transmission_info
+                    .as_ref()
+                    .is_some_and(|i| i.sent_bytes == 0)),
+            "clear_orphaned_shells called with non-shell entries still in the map"
+        );
+        self.inner.clear();
+        self.inflight_gauge.dequeue_n(count);
+    }
+
     /// Set the `probed_to` forward pointer on an existing inflight entry and
     /// release its `sent_bytes` from `bytes_in_flight` accounting.
     ///
@@ -391,6 +424,7 @@ mod tests {
                 offset: VarInt::ZERO,
                 is_fin: false,
                 dest_acceptor_id: None,
+                priority: crate::credit::Priority::default(),
             },
             payload,
             path_secret_entry: entry,
@@ -398,6 +432,7 @@ mod tests {
             status: TransmissionStatus::default(),
             ttl: DEFAULT_TTL,
             enqueued_at: None,
+            flow_credits: 0,
         };
         frames.push_back(frame.into());
 
