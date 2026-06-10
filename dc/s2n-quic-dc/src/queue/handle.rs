@@ -118,6 +118,14 @@ impl StreamReceiver {
     pub fn finish_recv_accounting(&self, advertised: u64) -> u64 {
         self.slot().finish_recv_accounting(advertised)
     }
+
+    /// Publish the reader's currently-advertised receive window so the dispatch
+    /// side can bound its per-arrival recv-credit release to it. Lock-free and
+    /// monotonic; see [`Slot::advertise_window`].
+    #[inline]
+    pub fn advertise_window(&self, advertised: u64) {
+        self.slot().advertise_window(advertised);
+    }
 }
 
 impl Drop for StreamReceiver {

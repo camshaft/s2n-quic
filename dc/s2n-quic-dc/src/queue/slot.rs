@@ -34,6 +34,23 @@ pub(crate) struct Slot {
     binding_id: AtomicU64,
     /// The slot's position in the page table, fixed at creation time.
     queue_id: u64,
+    /// The reader's currently-advertised receive window (`remote_max_data`),
+    /// published lock-free by the reader so the dispatch side can bound its
+    /// per-arrival credit release to what the reader actually acquired.
+    ///
+    /// The reader only debits the recv pool when it grows this window, but
+    /// dispatch releases credit per arriving byte. A peer that overshoots the
+    /// advertised window would otherwise make dispatch release credit that was
+    /// never acquired — phantom credit that inflates the shared pool. Dispatch
+    /// clamps each `observe_offset` to this ceiling so only acquired bytes are
+    /// released.
+    ///
+    /// Written by the reader (`StreamReceiver::advertise_window`) with `Release`
+    /// outside any half lock; read by dispatch under the stream-half lock with
+    /// `Acquire`. Monotonic, and never below the unbacked initial window. A
+    /// brief lag between the reader's store and a dispatch read only makes the
+    /// clamp momentarily conservative, which is harmless for this bound.
+    advertised_window: AtomicU64,
     pub(crate) stream: Half<msg::Stream, StreamState>,
     pub(crate) control: Half<msg::Control>,
 }
@@ -86,13 +103,24 @@ impl StreamState {
     /// many of those bytes are pool-backed (i.e. beyond the initial window).
     /// `initial_window_remaining` is consumed monotonically for the new bytes.
     ///
+    /// `advertised` is the reader's published receive window ceiling. `end` is
+    /// clamped to it before accounting: the reader only ever acquired pool
+    /// credit up to what it advertised, so bytes a (misbehaving) peer sends
+    /// beyond that window must release nothing — releasing them would inject
+    /// credit the pool never had. Clamping also keeps the invariant
+    /// `max_received_offset <= advertised` that `finish_recv_accounting` relies
+    /// on for an exact terminal reconciliation. The reader's own window
+    /// enforcement still resets such a stream; this clamp only protects the
+    /// shared pool's accounting in the meantime.
+    ///
     /// Returns zero once [`finish_recv_accounting`] has run: the terminal
     /// reconciliation released the remainder of the advertised window in one
     /// shot, so releasing per-arrival again here would double-count.
     ///
     /// [`finish_recv_accounting`]: StreamState::finish_recv_accounting
     #[inline]
-    pub(crate) fn observe_offset(&mut self, end: u64) -> u64 {
+    pub(crate) fn observe_offset(&mut self, end: u64, advertised: u64) -> u64 {
+        let end = end.min(advertised);
         if self.recv_finished || end <= self.max_received_offset {
             return 0;
         }
@@ -160,6 +188,7 @@ impl Slot {
         Self {
             binding_id: AtomicU64::new(UNALLOCATED),
             queue_id: queue_id.as_u64(),
+            advertised_window: AtomicU64::new(0),
             stream: Half::with_extra(StreamState {
                 msg_table: None,
                 flush_watermark: 0,
@@ -207,6 +236,24 @@ impl Slot {
             .store(prev | UNALLOCATED_BIT, Ordering::Relaxed);
     }
 
+    /// Publish the reader's currently-advertised receive window so dispatch can
+    /// clamp its per-arrival credit release to it. Lock-free; called by the
+    /// reader off the stream-half lock. `fetch_max` keeps the published value
+    /// monotonic against a stale concurrent store.
+    #[inline]
+    pub(crate) fn advertise_window(&self, advertised: u64) {
+        self.advertised_window
+            .fetch_max(advertised, Ordering::Release);
+    }
+
+    /// The reader's currently-advertised receive window, the ceiling dispatch
+    /// uses to bound credit release. Read with `Acquire` to pair with
+    /// [`Slot::advertise_window`]'s `Release`.
+    #[inline]
+    fn advertised_window(&self) -> u64 {
+        self.advertised_window.load(Ordering::Acquire)
+    }
+
     /// Reconcile the advertised receive window on termination, returning the
     /// pool-backed credits the reader must release. See
     /// [`StreamState::finish_recv_accounting`]. Idempotent; serialized with
@@ -245,7 +292,7 @@ impl Slot {
             if end > inner.extra.flush_watermark {
                 inner.extra.flush_watermark = end;
             }
-            release_bytes = inner.extra.observe_offset(end);
+            release_bytes = inner.extra.observe_offset(end, self.advertised_window());
         }
         inner.queue.push_back(entry);
         Ok((inner.take_waker(), release_bytes))
@@ -367,7 +414,7 @@ impl Slot {
         let chunk_start =
             stream_offset.saturating_add((chunk_index as u64).saturating_mul(chunk_size as u64));
         let chunk_end = chunk_start.saturating_add(payload_len as u64);
-        let release_bytes = stream.extra.observe_offset(chunk_end);
+        let release_bytes = stream.extra.observe_offset(chunk_end, self.advertised_window());
 
         let local_queue = {
             let watermark = stream.extra.flush_watermark;
@@ -444,6 +491,10 @@ impl Slot {
         Self::allocate_and_open_locked(&mut s, &mut c, &self.binding_id, binding_id)?;
         s.extra.clear();
         s.extra.initial_window_remaining = initial_window;
+        // Seed the dispatch-side ceiling to the unbacked initial window; both
+        // halves are locked, so this plain store can't race a reader.
+        self.advertised_window
+            .store(initial_window, Ordering::Release);
         Ok(true)
     }
 
@@ -487,6 +538,12 @@ impl Slot {
 
             s.extra.clear();
             s.extra.initial_window_remaining = initial_window;
+            // Seed the dispatch-side ceiling to the unbacked initial window the
+            // reader starts with. A plain store (not fetch_max) resets any value
+            // left by a prior generation on this recycled slot; both halves are
+            // locked here so no reader for this binding can race the store.
+            self.advertised_window
+                .store(initial_window, Ordering::Release);
 
             let release_bytes = if let msg::Stream::Data {
                 offset, payload, ..
@@ -496,7 +553,7 @@ impl Slot {
                 if end > s.extra.flush_watermark {
                     s.extra.flush_watermark = end;
                 }
-                s.extra.observe_offset(end)
+                s.extra.observe_offset(end, self.advertised_window())
             } else {
                 0
             };
@@ -527,7 +584,7 @@ impl Slot {
             if end > s.extra.flush_watermark {
                 s.extra.flush_watermark = end;
             }
-            s.extra.observe_offset(end)
+            s.extra.observe_offset(end, self.advertised_window())
         } else {
             0
         };
@@ -1321,26 +1378,17 @@ mod tests {
         );
     }
 
-    /// Regression: `observe_offset` releases recv-pool credit for every new
-    /// byte beyond the unbacked initial window, with no ceiling tied to the reader's *advertised*
-    /// receive window. The reader only ever acquires pool credit up to what it advertises (it grows
-    /// `remote_max_data` from the pool), so a peer that delivers data past the advertised window
-    /// makes the dispatch side release credit that was never acquired — silently inflating the
-    /// shared pool above `capacity` and defeating receive-side backpressure.
+    /// Regression (review finding M1): `observe_offset` must clamp its per-arrival recv-credit
+    /// release to the reader's *advertised* receive window. The reader only acquires pool credit up
+    /// to what it advertises (growing `remote_max_data`), but dispatch releases per arriving byte;
+    /// without the clamp a peer that overshoots the advertised window makes dispatch release credit
+    /// that was never acquired, silently inflating the shared pool and defeating backpressure.
     ///
-    /// The bootstrap case is the most reachable: a server slot binds with `initial_window_remaining
-    /// = 0` (the unbacked window is consumed up front, or the slot is bound with a zero initial
-    /// window), so every arriving byte is treated as pool-backed and released — yet the reader has
-    /// advertised nothing and acquired nothing.
-    ///
-    /// This unit test pins the missing clamp: with a zero initial window, `observe_offset(N)`
-    /// returns the full `N` unconditionally. There is no advertised-ceiling parameter for it to
-    /// clamp against. Once the fix plumbs the advertised window into the slot, `observe_offset`
-    /// must cap its release at what the reader actually acquired (this assertion then changes to
-    /// expect the clamped value).
+    /// The bootstrap case is the most reachable: a slot binds with `initial_window_remaining = 0`
+    /// (or the unbacked window already consumed), so every arriving byte is pool-backed — yet the
+    /// reader may have advertised only a small window.
     #[test]
-    #[ignore = "TODO"]
-    fn observe_offset_releases_beyond_advertised_window() {
+    fn observe_offset_clamps_release_to_advertised_window() {
         let mut state = StreamState {
             msg_table: None,
             flush_watermark: 0,
@@ -1351,18 +1399,43 @@ mod tests {
             recv_finished: false,
         };
 
-        // The reader has advertised (and therefore acquired) only 10 bytes of pool credit. A peer
-        // that overshoots to 1000 bytes should not cause more than 10 bytes to be released — but
-        // `observe_offset` has no notion of the advertised ceiling and returns the full 1000.
+        // The reader advertised (and therefore acquired) only 10 bytes of pool credit. A peer that
+        // overshoots to 1000 bytes must release at most the advertised 10; the excess releases
+        // nothing because the reader never acquired it.
         let advertised = 10u64;
-        let released = state.observe_offset(1000);
-
-        assert!(
-            released <= advertised,
-            "observe_offset released {released} bytes of pool credit but the reader only \
-             advertised/acquired {advertised}; the {} byte excess is phantom credit injected \
-             into the shared pool",
-            released - advertised,
+        let released = state.observe_offset(1000, advertised);
+        assert_eq!(
+            released, advertised,
+            "observe_offset must clamp its release to the advertised window ({advertised}), \
+             got {released}",
         );
+
+        // A second overshooting arrival must release nothing further: the ceiling is already
+        // fully accounted, so no phantom credit can be injected.
+        let released_again = state.observe_offset(2000, advertised);
+        assert_eq!(
+            released_again, 0,
+            "no further credit may be released once the advertised window is fully observed",
+        );
+    }
+
+    /// Within the advertised window `observe_offset` still releases exactly the pool-backed bytes
+    /// (those beyond the unbacked initial window), so the clamp does not under-release for a
+    /// well-behaved peer.
+    #[test]
+    fn observe_offset_releases_pool_backed_bytes_within_window() {
+        let mut state = StreamState {
+            msg_table: None,
+            flush_watermark: 0,
+            max_received_offset: 0,
+            initial_window_remaining: 4,
+            recv_finished: false,
+        };
+
+        // Advertised window comfortably above what arrives. First 4 bytes are unbacked (release 0),
+        // the next 6 are pool-backed (release 6).
+        let advertised = 100u64;
+        assert_eq!(state.observe_offset(4, advertised), 0);
+        assert_eq!(state.observe_offset(10, advertised), 6);
     }
 }

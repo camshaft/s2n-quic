@@ -956,6 +956,69 @@ fn max_data_send_failure_does_not_release_unbacked_window() {
     });
 }
 
+/// Regression (review finding M1), integration: the dispatch-side per-arrival credit release must
+/// be clamped to the reader's advertised window. A server reader bootstraps with
+/// `remote_max_data = 0`, so the hard receive-window check is skipped (the bootstrap special-case)
+/// and inbound data is accepted before the first MAX_DATA. The reader publishes its unbacked
+/// initial window (`window_size`) as the dispatch ceiling. If a peer overshoots *that* window, the
+/// dispatch path (`push_stream` -> `observe_offset` -> `recv_credit_pool.release`) would, without
+/// the clamp, release credit for the overshoot — credit the reader never acquired — inflating the
+/// shared pool above `capacity`.
+///
+/// The `advertised_window` ceiling caps the release at the window the reader actually advertised,
+/// so the pool is never inflated. Pre-fix: `available + returned` exceeds `capacity` by the
+/// overshoot beyond `window_size`.
+#[test]
+fn dispatch_release_clamped_to_advertised_window_on_bootstrap_overshoot() {
+    sim(|| {
+        let capacity = 8 * 1024 * 1024u64;
+        let pool = crate::sync::Arc::new(crate::credit::Pool::new(
+            crate::credit::Config::new(capacity).with_max_single_acquire_uniform(capacity),
+        ));
+        let assert_pool = pool.clone();
+
+        // Server reader: `remote_max_data` starts at 0 (receive-window enforcement skipped), and the
+        // unbacked initial window equals `window_size` — the production invariant. The reader
+        // publishes that window as the dispatch ceiling at construction.
+        let window_size = 1024 * 1024u64;
+        let (reader, mut pusher) =
+            make_server_pair_with_pool_and_initial_window(pool, window_size);
+        assert_eq!(reader.0.remote_max_data.as_u64(), 0);
+        assert_eq!(reader.0.window_size, window_size);
+
+        async move {
+            // Peer overshoots the reader's advertised window before any MAX_DATA growth. `Pusher`
+            // mirrors dispatch: it releases `observe_offset`'s `release_bytes` back to the pool.
+            // Only the in-window portion is unbacked (releases 0); the overshoot must release
+            // nothing rather than injecting credit the reader never acquired.
+            let overshoot = (window_size + 100_000) as usize;
+            pusher.push_data(0, &vec![0xabu8; overshoot], false);
+            bach::task::yield_now().await;
+
+            let available = assert_pool.debug_available();
+            let returned = assert_pool.debug_returned();
+            assert_eq!(
+                available + returned as i64,
+                capacity as i64,
+                "pool inflated by phantom credit: available({available}) + returned({returned}) \
+                 != capacity({capacity}); the dispatch release was not clamped to the advertised \
+                 window, releasing credit for bytes beyond what the reader acquired",
+            );
+        }
+        .primary()
+        .spawn();
+
+        // Keep the reader alive for the duration so its slot (and the published ceiling) stays
+        // valid while the pusher injects and asserts.
+        async move {
+            let _reader = reader;
+            1.s().sleep().await;
+        }
+        .primary()
+        .spawn();
+    });
+}
+
 /// Right-sizing: a client reader bootstraps with a full `window_size` already advertised. When the
 /// writer's hint says it wants to send less than that standing window, consuming past the top-up
 /// threshold must NOT emit a MAX_DATA — there is no point advertising beyond what the writer wants.

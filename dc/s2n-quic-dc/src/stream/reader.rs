@@ -420,6 +420,11 @@ impl Reader {
         let remote_max_data = parameters.local_recv_max_data;
         let window_size = remote_max_data.as_u64();
 
+        // Publish the initial advertised window so the dispatch side clamps its per-arrival credit
+        // release to it from the first frame. The client advertises its full window up front, so
+        // that is the ceiling. (`fetch_max`, so this composes with the bind-time seed.)
+        stream_rx.advertise_window(window_size);
+
         Self(ReaderAllocPtr::new(Inner {
             frame_tx,
             completion_rx: frame::failure_completion_channel(),
@@ -462,6 +467,12 @@ impl Reader {
     ) -> Self {
         let parameters = path_secret_entry.parameters();
         let window_size = parameters.local_recv_max_data.as_u64();
+
+        // The server advertises 0 to the peer, but its unbacked initial window (`window_size`) is
+        // the real dispatch-side ceiling during bootstrap: data within it is accepted before the
+        // first MAX_DATA and must not be released as pool credit (it was never acquired). Publish
+        // that ceiling so dispatch clamps to it. (`fetch_max`, composes with the bind-time seed.)
+        stream_rx.advertise_window(window_size);
 
         Self(ReaderAllocPtr::new(Inner {
             frame_tx,
@@ -1212,6 +1223,10 @@ impl Inner {
             return Err(err);
         }
         self.remote_max_data = new_max_data;
+        // Publish the grown window so the dispatch side can clamp its per-arrival
+        // credit release to what we actually advertised (and acquired). Monotonic
+        // and lock-free; see `Slot::advertise_window`.
+        self.stream_rx.advertise_window(new_max_data.as_u64());
 
         Ok(())
     }
