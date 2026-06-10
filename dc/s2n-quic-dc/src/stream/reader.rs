@@ -974,11 +974,15 @@ impl Inner {
     /// the writer's hint structurally tops out near `current_max`.
     fn on_blocked_signal(&mut self, desired: u64) {
         let consumed = self.reassembler.consumed_len();
-        let cap = consumed.saturating_add(self.window_size.saturating_mul(self.growth_ratio as u64));
+        let cap =
+            consumed.saturating_add(self.window_size.saturating_mul(self.growth_ratio as u64));
         if desired > cap && desired > self.acted_blocked_offset {
             self.acted_blocked_offset = desired;
             let prev = self.growth_ratio;
-            self.growth_ratio = self.growth_ratio.saturating_mul(2).min(self.max_growth_ratio());
+            self.growth_ratio = self
+                .growth_ratio
+                .saturating_mul(2)
+                .min(self.max_growth_ratio());
             trace!(
                 binding_id = self.stream_rx.binding_id().as_u64(),
                 desired,
@@ -1064,7 +1068,8 @@ impl Inner {
         // window, and never below what we've already consumed. Before any hint arrives
         // (`peer_max_offset == 0`) preserve the original fixed bootstrap window so server/client
         // startup is unchanged.
-        let cap = consumed.saturating_add(self.window_size.saturating_mul(self.growth_ratio as u64));
+        let cap =
+            consumed.saturating_add(self.window_size.saturating_mul(self.growth_ratio as u64));
         let target_max_data = if self.peer_max_offset == 0 {
             consumed.saturating_add(self.window_size)
         } else {

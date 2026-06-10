@@ -642,6 +642,99 @@ fn max_data_sent_after_consuming() {
     });
 }
 
+/// Right-sizing: a client reader bootstraps with a full `window_size` already advertised. When the
+/// writer's hint says it wants to send less than that standing window, consuming past the top-up
+/// threshold must NOT emit a MAX_DATA — there is no point advertising beyond what the writer wants.
+/// (Contrast `max_data_sent_after_consuming`, where the hint asks for a full window ahead.)
+#[test]
+fn bounded_hint_does_not_over_advertise() {
+    sim(|| {
+        let (mut reader, mut pusher) = make_pair();
+        let window_size = reader.0.window_size;
+        // Cross the > window/2 threshold, but the writer only wants a little past what we consume.
+        let payload = vec![0xabu8; (window_size / 2 + 1) as usize];
+        let payload_len = payload.len();
+        let hint = payload_len as u64 + 8;
+
+        async move {
+            pusher.push_data_hint(0, &payload, false, hint);
+            // No MAX_DATA should be emitted: the writer's desired offset is already below the
+            // standing advertised window.
+            let frames = pusher.recv_frames_timeout(Duration::from_millis(100)).await;
+            assert!(
+                frames.is_none(),
+                "expected no MAX_DATA when the writer wants less than the standing window, got {:?}",
+                frames.map(|q| q.iter().map(|f| f.header).collect::<Vec<_>>())
+            );
+        }
+        .primary()
+        .spawn();
+
+        async move {
+            let mut buf = BytesMut::with_capacity(payload_len + 16);
+            let read = reader.read_into(&mut buf).await.expect("read failed");
+            assert_eq!(read, payload_len);
+            assert_eq!(
+                reader.0.growth_ratio, 1,
+                "growth ratio must not change without a blocked signal"
+            );
+            1.s().sleep().await;
+        }
+        .primary()
+        .spawn();
+    });
+}
+
+/// A blocked signal whose desired offset outstrips the current cap doubles the growth ratio
+/// (slow-start); a blocked signal within the current cap, or a duplicate, is a no-op.
+#[test]
+fn blocked_signal_doubles_growth_ratio_and_dedups() {
+    sim(|| {
+        // The growth ratio is capped at `max_single_acquire / window_size`, so the pool's
+        // per-request ceiling must comfortably exceed the reader's window for doubling to occur.
+        // Build the reader first to learn `window_size`, then size the pool around it.
+        let probe = make_pair().0;
+        let window_size = probe.0.window_size;
+        drop(probe);
+        let cap = window_size.saturating_mul(64).max(1024 * 1024);
+        let pool = crate::sync::Arc::new(crate::credit::Pool::new(
+            crate::credit::Config::new(cap).with_max_single_acquire_uniform(cap),
+        ));
+        let (mut reader, mut pusher) = make_pair_with_pool(pool);
+        let payload = vec![0xcdu8; 64];
+        let payload_len = payload.len();
+        // Desired offset well beyond consumed + window so the `> cap` gate fires once.
+        let desired = window_size.saturating_mul(4);
+
+        async move {
+            pusher.push_data(0, &payload, false);
+            pusher.push_blocked(desired);
+            // Duplicate at the same offset → deduped, no further growth.
+            pusher.push_blocked(desired);
+            1.s().sleep().await;
+        }
+        .primary()
+        .spawn();
+
+        async move {
+            let mut buf = BytesMut::with_capacity(payload_len + 16);
+            let _ = reader.read_into(&mut buf).await.expect("read failed");
+            for _ in 0..4 {
+                bach::task::yield_now().await;
+            }
+            // One distinct over-cap blocked signal → exactly one doubling (1 → 2). The duplicate is
+            // deduped by the `desired > cap`/`acted_blocked_offset` gate.
+            assert_eq!(
+                reader.0.growth_ratio, 2,
+                "expected exactly one doubling from a single distinct over-cap blocked signal"
+            );
+            1.s().sleep().await;
+        }
+        .primary()
+        .spawn();
+    });
+}
+
 #[test]
 fn max_data_transmission_failure_surfaces_error() {
     sim(|| {

@@ -330,6 +330,36 @@ mod tests {
     // insert args: msg_id, stream_offset, peer_max_offset, message_size, chunk_size, chunk_index,
     //              payload_len, is_fin, blocked
 
+    /// Like `write_chunk` but with explicit `peer_max_offset` and `blocked` per chunk.
+    #[allow(clippy::too_many_arguments)]
+    fn write_chunk_hint(
+        table: &mut MsgTable,
+        msg_id: u64,
+        stream_offset: u64,
+        peer_max_offset: u64,
+        blocked: bool,
+        message_size: u32,
+        chunk_index: u32,
+        payload_len: u32,
+    ) -> CompleteOutcome {
+        let checkout = table
+            .insert(
+                msg_id,
+                stream_offset,
+                peer_max_offset,
+                message_size,
+                CHUNK_SIZE,
+                chunk_index,
+                payload_len,
+                false,
+                blocked,
+            )
+            .expect("insert should succeed");
+        assert_eq!(checkout.expected_len, payload_len);
+        unsafe { core::ptr::write_bytes(checkout.ptr, 0xAB, payload_len as usize) };
+        table.complete(msg_id, checkout.chunk_index)
+    }
+
     #[test]
     fn single_message_single_chunk() {
         let mut table = MsgTable::new();
@@ -360,6 +390,48 @@ mod tests {
         let delivered: Vec<_> = table.drain_complete().collect();
         assert_eq!(delivered.len(), 1);
         assert_eq!(delivered[0].payload.len(), msg_size as usize);
+    }
+
+    /// The delivered message folds `largest_offset` (max) and `blocked` (OR) across all chunks,
+    /// so a fresher hint or a blocked bit on any single chunk (e.g. a retransmit) is preserved.
+    #[test]
+    fn folds_largest_offset_and_blocked_across_chunks() {
+        let mut table = MsgTable::new();
+        let msg_size = CHUNK_SIZE as u32 * 3;
+
+        // chunk 0: small hint, not blocked.
+        write_chunk_hint(
+            &mut table,
+            0,
+            0,
+            1000,
+            false,
+            msg_size,
+            0,
+            CHUNK_SIZE as u32,
+        );
+        // chunk 1: larger hint, blocked.
+        write_chunk_hint(&mut table, 0, 0, 5000, true, msg_size, 1, CHUNK_SIZE as u32);
+        // chunk 2: smaller hint again, not blocked — must not regress the folded values.
+        let outcome = write_chunk_hint(
+            &mut table,
+            0,
+            0,
+            2000,
+            false,
+            msg_size,
+            2,
+            CHUNK_SIZE as u32,
+        );
+        assert!(matches!(outcome, CompleteOutcome::Ready));
+
+        let delivered: Vec<_> = table.drain_complete().collect();
+        assert_eq!(delivered.len(), 1);
+        assert_eq!(
+            delivered[0].largest_offset, 5000,
+            "largest_offset must be the max across chunks"
+        );
+        assert!(delivered[0].blocked, "blocked must be OR-ed across chunks");
     }
 
     #[test]
@@ -452,7 +524,17 @@ mod tests {
         write_chunk(&mut table, 0, 0, CHUNK_SIZE as u32, 0, CHUNK_SIZE as u32);
 
         // Try again with different message_size
-        let result = table.insert(0, 0, 0, 9999, CHUNK_SIZE, 0, CHUNK_SIZE as u32, false, false);
+        let result = table.insert(
+            0,
+            0,
+            0,
+            9999,
+            CHUNK_SIZE,
+            0,
+            CHUNK_SIZE as u32,
+            false,
+            false,
+        );
         assert_eq!(result.unwrap_err(), InsertError::SizeMismatch);
     }
 
@@ -463,11 +545,31 @@ mod tests {
 
         // First frame says no fin
         table
-            .insert(0, 0, 0, msg_size, CHUNK_SIZE, 0, CHUNK_SIZE as u32, false, false)
+            .insert(
+                0,
+                0,
+                0,
+                msg_size,
+                CHUNK_SIZE,
+                0,
+                CHUNK_SIZE as u32,
+                false,
+                false,
+            )
             .unwrap();
 
         // Second frame for same msg says fin — mismatch
-        let result = table.insert(0, 0, 0, msg_size, CHUNK_SIZE, 1, CHUNK_SIZE as u32, true, false);
+        let result = table.insert(
+            0,
+            0,
+            0,
+            msg_size,
+            CHUNK_SIZE,
+            1,
+            CHUNK_SIZE as u32,
+            true,
+            false,
+        );
         assert_eq!(result.unwrap_err(), InsertError::FinMismatch);
     }
 
@@ -485,7 +587,17 @@ mod tests {
         let msg_size = CHUNK_SIZE as u32 * 2;
         write_chunk(&mut table, 0, 0, msg_size, 0, CHUNK_SIZE as u32);
 
-        let result = table.insert(0, 0, 0, msg_size, CHUNK_SIZE, 0, CHUNK_SIZE as u32, false, false);
+        let result = table.insert(
+            0,
+            0,
+            0,
+            msg_size,
+            CHUNK_SIZE,
+            0,
+            CHUNK_SIZE as u32,
+            false,
+            false,
+        );
         assert_eq!(result.unwrap_err(), InsertError::Duplicate);
     }
 
@@ -513,7 +625,9 @@ mod tests {
     fn fin_delivery() {
         let mut table = MsgTable::new();
 
-        let checkout = table.insert(0, 0, 0, 4096, CHUNK_SIZE, 0, 4096, true, false).unwrap();
+        let checkout = table
+            .insert(0, 0, 0, 4096, CHUNK_SIZE, 0, 4096, true, false)
+            .unwrap();
         unsafe { core::ptr::write_bytes(checkout.ptr, 0, checkout.expected_len as usize) };
         table.complete(0, checkout.chunk_index);
 
@@ -536,7 +650,9 @@ mod tests {
         let mut table = MsgTable::new();
 
         // Deliver a FIN message
-        let checkout = table.insert(0, 0, 0, 4096, CHUNK_SIZE, 0, 4096, true, false).unwrap();
+        let checkout = table
+            .insert(0, 0, 0, 4096, CHUNK_SIZE, 0, 4096, true, false)
+            .unwrap();
         unsafe { core::ptr::write_bytes(checkout.ptr, 0, checkout.expected_len as usize) };
         table.complete(0, checkout.chunk_index);
         table.drain_complete().count();
@@ -555,7 +671,17 @@ mod tests {
 
         // Insert first chunk of FIN message
         let checkout = table
-            .insert(0, 0, 0, msg_size, CHUNK_SIZE, 0, CHUNK_SIZE as u32, true, false)
+            .insert(
+                0,
+                0,
+                0,
+                msg_size,
+                CHUNK_SIZE,
+                0,
+                CHUNK_SIZE as u32,
+                true,
+                false,
+            )
             .unwrap();
         unsafe { core::ptr::write_bytes(checkout.ptr, 0, checkout.expected_len as usize) };
         table.complete(0, checkout.chunk_index);
@@ -565,7 +691,17 @@ mod tests {
 
         // Second chunk should still work
         let checkout = table
-            .insert(0, 0, 0, msg_size, CHUNK_SIZE, 1, CHUNK_SIZE as u32, true, false)
+            .insert(
+                0,
+                0,
+                0,
+                msg_size,
+                CHUNK_SIZE,
+                1,
+                CHUNK_SIZE as u32,
+                true,
+                false,
+            )
             .unwrap();
         unsafe { core::ptr::write_bytes(checkout.ptr, 0, checkout.expected_len as usize) };
         table.complete(0, checkout.chunk_index);

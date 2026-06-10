@@ -1528,9 +1528,9 @@ fn handle_queue_reset(
             counters.rx_reset_both.add(1);
             let stream_entry = msg::Stream::Reset { error_code }.into();
             let control_entry = msg::Control::Reset { error_code }.into();
-            if let Ok((waker, _)) = peer
-                .queue_view
-                .send_stream(dest_queue_id, binding_id, stream_entry)
+            if let Ok((waker, _)) =
+                peer.queue_view
+                    .send_stream(dest_queue_id, binding_id, stream_entry)
             {
                 let _ = waker_sink.send(waker);
             }
@@ -1550,9 +1550,9 @@ fn handle_queue_reset(
         ResetTarget::Stream => {
             counters.rx_reset_stream.add(1);
             let stream_entry = msg::Stream::Reset { error_code }.into();
-            if let Ok((waker, _)) = peer
-                .queue_view
-                .send_stream(dest_queue_id, binding_id, stream_entry)
+            if let Ok((waker, _)) =
+                peer.queue_view
+                    .send_stream(dest_queue_id, binding_id, stream_entry)
             {
                 let _ = waker_sink.send(waker);
             }

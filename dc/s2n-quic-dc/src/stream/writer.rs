@@ -924,6 +924,16 @@ impl Inner {
 
         let available = self.min_send_budget();
         if available == 0 && (!is_fin || !buf.buffer_is_empty()) {
+            // Fully blocked with data to send and no data frame to carry the in-band `blocked`
+            // bit. Emit a standalone QueueDataBlocked so the reader can grow its window. Gated to
+            // the remote-window-limited case (not local-budget-limited, which the reader can't fix)
+            // and deduped on `last_blocked_offset`.
+            if !buf.buffer_is_empty() {
+                let high_watermark = self.high_watermark(buf);
+                if high_watermark > self.remote_max_data.as_u64() {
+                    self.send_data_blocked_frame(high_watermark)?;
+                }
+            }
             return Poll::Pending;
         }
 
@@ -1588,11 +1598,16 @@ impl Inner {
 
         self.send_batch(frames)?;
 
-        // Cold case: the loop produced no data frame (window already exhausted) but the writer
-        // still has buffered data it wants to send. No frame carried the in-band `blocked` bit, so
-        // emit a standalone signal carrying the desired high watermark.
-        if blocked && written == 0 && !buf.buffer_is_empty() {
-            self.send_data_blocked_frame(high_watermark)?;
+        if blocked && !buf.buffer_is_empty() {
+            if written > 0 {
+                // A data frame carried the in-band `blocked` bit for this high watermark. Record it
+                // so the standalone path (here and in the poll gate) won't re-emit the same signal.
+                self.last_blocked_offset = self.last_blocked_offset.max(high_watermark);
+            } else {
+                // Cold case: no data frame went out (window already exhausted), so no in-band bit
+                // was carried. Emit a standalone signal carrying the desired high watermark.
+                self.send_data_blocked_frame(high_watermark)?;
+            }
         }
 
         Ok(written)
@@ -1833,11 +1848,15 @@ impl Inner {
             self.send_batch(frames)?;
         }
 
-        // Cold case: the segment loop produced no frame (remote window exhausted before the first
-        // segment) but data remains. No frame carried the in-band `blocked` bit, so emit a
-        // standalone signal. (When frames were produced they already carry the bit.)
-        if blocked && total_written == 0 && !buf.buffer_is_empty() {
-            self.send_data_blocked_frame(high_watermark)?;
+        if blocked && !buf.buffer_is_empty() {
+            if total_written > 0 {
+                // Frames carried the in-band `blocked` bit; record the watermark so the standalone
+                // path won't re-emit the same signal.
+                self.last_blocked_offset = self.last_blocked_offset.max(high_watermark);
+            } else {
+                // Cold case: no frame went out, so emit a standalone signal.
+                self.send_data_blocked_frame(high_watermark)?;
+            }
         }
 
         Ok(total_written)

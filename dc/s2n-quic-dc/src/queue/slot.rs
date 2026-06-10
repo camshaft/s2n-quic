@@ -301,8 +301,8 @@ impl Slot {
         // The chunk wrote successfully and the binding is still valid: this
         // chunk's payload is now buffered. Charge it against the per-binding
         // dedup watermark and surface any new bytes for pool release.
-        let chunk_start = stream_offset
-            .saturating_add((chunk_index as u64).saturating_mul(chunk_size as u64));
+        let chunk_start =
+            stream_offset.saturating_add((chunk_index as u64).saturating_mul(chunk_size as u64));
         let chunk_end = chunk_start.saturating_add(payload_len as u64);
         let release_bytes = stream.extra.observe_offset(chunk_end);
 
@@ -872,20 +872,46 @@ mod tests {
         slot.allocate_and_open(v(1), 0).unwrap();
 
         // Insert a partial message (first chunk only of a 2-chunk message)
-        let result = slot.push_msg(v(1), 0, 0, 0, 16384, 8192, 0, 8192, false, true, false, |ptr, len| {
-            unsafe { core::ptr::write_bytes(ptr, 0xAB, len as usize) };
-            Ok::<(), ()>(())
-        });
+        let result = slot.push_msg(
+            v(1),
+            0,
+            0,
+            0,
+            16384,
+            8192,
+            0,
+            8192,
+            false,
+            true,
+            false,
+            |ptr, len| {
+                unsafe { core::ptr::write_bytes(ptr, 0xAB, len as usize) };
+                Ok::<(), ()>(())
+            },
+        );
         assert!(result.is_ok());
 
         // Reset the slot
         slot.broadcast_reset(v(42));
 
         // The msg_table should be poisoned — second chunk write returns default waker
-        let result = slot.push_msg(v(1), 0, 0, 0, 16384, 8192, 1, 8192, false, true, false, |ptr, len| {
-            unsafe { core::ptr::write_bytes(ptr, 0xCD, len as usize) };
-            Ok::<(), ()>(())
-        });
+        let result = slot.push_msg(
+            v(1),
+            0,
+            0,
+            0,
+            16384,
+            8192,
+            1,
+            8192,
+            false,
+            true,
+            false,
+            |ptr, len| {
+                unsafe { core::ptr::write_bytes(ptr, 0xCD, len as usize) };
+                Ok::<(), ()>(())
+            },
+        );
         // Should succeed (returns Ok with empty waker) — the chunk completes
         // but the poisoned table discards the result.
         assert!(result.is_ok());
@@ -897,10 +923,23 @@ mod tests {
         slot.allocate_and_open(v(1), 0).unwrap();
 
         // Push a complete message to create and populate the msg_table
-        let _ = slot.push_msg(v(1), 0, 0, 0, 4096, 8192, 0, 4096, false, true, false, |ptr, len| {
-            unsafe { core::ptr::write_bytes(ptr, 0, len as usize) };
-            Ok::<(), ()>(())
-        });
+        let _ = slot.push_msg(
+            v(1),
+            0,
+            0,
+            0,
+            4096,
+            8192,
+            0,
+            4096,
+            false,
+            true,
+            false,
+            |ptr, len| {
+                unsafe { core::ptr::write_bytes(ptr, 0, len as usize) };
+                Ok::<(), ()>(())
+            },
+        );
 
         // msg_table exists (even if entries were drained, the table itself is Some)
         assert!(slot.stream.inner.lock().extra.msg_table.is_some());
@@ -930,10 +969,23 @@ mod tests {
 
         // Push a complete message with is_wakeup=false — watermark stays at 0,
         // so stream_offset(0) is NOT < watermark(0) → no wake.
-        let result = slot.push_msg(v(1), 0, 0, 0, 4096, 8192, 0, 4096, false, false, false, |ptr, len| {
-            unsafe { core::ptr::write_bytes(ptr, 0, len as usize) };
-            Ok::<(), ()>(())
-        });
+        let result = slot.push_msg(
+            v(1),
+            0,
+            0,
+            0,
+            4096,
+            8192,
+            0,
+            4096,
+            false,
+            false,
+            false,
+            |ptr, len| {
+                unsafe { core::ptr::write_bytes(ptr, 0, len as usize) };
+                Ok::<(), ()>(())
+            },
+        );
         assert!(result.is_ok());
         assert_eq!(wake_count.load(Ordering::SeqCst), 0);
 
@@ -1078,10 +1130,23 @@ mod tests {
         );
         assert!(matches!(first, Err(super::super::MsgError::Write(()))));
 
-        let retry = slot.push_msg(v(1), 0, 0, 0, 4096, 8192, 0, 4096, false, true, false, |ptr, len| {
-            unsafe { core::ptr::write_bytes(ptr, 0xAA, len as usize) };
-            Ok::<(), ()>(())
-        });
+        let retry = slot.push_msg(
+            v(1),
+            0,
+            0,
+            0,
+            4096,
+            8192,
+            0,
+            4096,
+            false,
+            true,
+            false,
+            |ptr, len| {
+                unsafe { core::ptr::write_bytes(ptr, 0xAA, len as usize) };
+                Ok::<(), ()>(())
+            },
+        );
         assert!(retry.is_ok());
 
         let mut stream = slot.stream.inner.lock();
@@ -1110,10 +1175,23 @@ mod tests {
 
         // First binding: push a message with is_wakeup=true to set watermark high.
         // stream_offset=0, message_size=65536 → watermark = 65536
-        let result = slot.push_msg(v(1), 0, 0, 0, 65536, 8192, 0, 8192, false, true, false, |ptr, len| {
-            unsafe { core::ptr::write_bytes(ptr, 0, len as usize) };
-            Ok::<(), ()>(())
-        });
+        let result = slot.push_msg(
+            v(1),
+            0,
+            0,
+            0,
+            65536,
+            8192,
+            0,
+            8192,
+            false,
+            true,
+            false,
+            |ptr, len| {
+                unsafe { core::ptr::write_bytes(ptr, 0, len as usize) };
+                Ok::<(), ()>(())
+            },
+        );
         assert!(result.is_ok());
 
         // Verify watermark was set
@@ -1151,10 +1229,23 @@ mod tests {
         // stream_offset, so should_wake=false and the waker should NOT fire —
         // the stale 65536 watermark from the previous binding would have caused
         // a spurious wake.
-        let result = slot.push_msg(v(2), 0, 4096, 0, 4096, 8192, 0, 4096, false, false, false, |ptr, len| {
-            unsafe { core::ptr::write_bytes(ptr, 0, len as usize) };
-            Ok::<(), ()>(())
-        });
+        let result = slot.push_msg(
+            v(2),
+            0,
+            4096,
+            0,
+            4096,
+            8192,
+            0,
+            4096,
+            false,
+            false,
+            false,
+            |ptr, len| {
+                unsafe { core::ptr::write_bytes(ptr, 0, len as usize) };
+                Ok::<(), ()>(())
+            },
+        );
         assert!(result.is_ok());
         drop(result);
 

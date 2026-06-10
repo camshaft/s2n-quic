@@ -657,6 +657,55 @@ fn server_queue_control_budget_caps_transmitted_bytes() {
     });
 }
 
+/// When the writer can send part of its buffer but the remainder exceeds the remote window, the
+/// emitted data frame carries the in-band `blocked` bit and a `largest_offset` equal to the full
+/// high watermark — so the reader learns the writer wants more without a standalone frame.
+#[test]
+fn data_frame_carries_blocked_bit_when_partially_windowed() {
+    sim(|| {
+        let (mut writer, mut pusher) = make_server_pair();
+        writer.0.remote_max_data = VarInt::from_u8(3);
+
+        async move {
+            let frames = pusher.recv_frames().await;
+            let data = frames
+                .iter()
+                .find(|f| matches!(f.header, Header::QueueData { .. }))
+                .expect("expected a QueueData frame");
+            match data.header {
+                Header::QueueData {
+                    offset,
+                    largest_offset,
+                    blocked,
+                    ..
+                } => {
+                    assert_eq!(offset, VarInt::ZERO);
+                    assert!(
+                        blocked,
+                        "data frame must carry the blocked bit when more is buffered"
+                    );
+                    // High watermark is the full 6-byte buffer even though only 3 bytes fit.
+                    assert_eq!(largest_offset, VarInt::from_u8(6));
+                }
+                _ => unreachable!(),
+            }
+        }
+        .primary()
+        .spawn();
+
+        async move {
+            let mut payload = Bytes::from_static(b"abcdef");
+            let written = writer
+                .write_from(&mut payload)
+                .await
+                .expect("write should respect remote budget");
+            assert_eq!(written, 3);
+        }
+        .primary()
+        .spawn();
+    });
+}
+
 #[test]
 fn client_preserves_max_data_on_out_of_order_lower_update() {
     sim(|| {
@@ -714,39 +763,48 @@ fn server_write_from_fin_blocks_while_budget_exhausted_then_sends_single_fin_fra
         writer.0.remote_max_data = VarInt::from_u8(1);
 
         async move {
+            // The first burst contains the "a" data frame and may also contain a standalone
+            // QueueDataBlocked signal (emitted when the follow-up write hits the exhausted window).
+            // Exactly one data frame, the rest blocked signals.
             let first = pusher.recv_frames().await;
-            assert_eq!(first.len(), 1, "expected exactly one frame");
-            let first_frame = first.front().unwrap();
+            let data: Vec<_> = first
+                .iter()
+                .filter(|f| matches!(f.header, Header::QueueData { .. }))
+                .collect();
+            assert_eq!(data.len(), 1, "expected exactly one data frame");
             assert!(matches!(
-                first_frame.header,
+                data[0].header,
                 Header::QueueData {
                     is_fin: false,
                     offset,
                     ..
                 } if offset == VarInt::ZERO
             ));
-            assert_eq!(first_frame.payload, &b"a"[..]);
-
-            let extra = pusher.recv_frames_timeout(Duration::from_millis(100)).await;
+            assert_eq!(data[0].payload, &b"a"[..]);
             assert!(
-                extra.is_none(),
-                "expected no frame while remote flow budget is exhausted"
+                first
+                    .iter()
+                    .all(|f| matches!(
+                        f.header,
+                        Header::QueueData { .. } | Header::QueueDataBlocked { .. }
+                    )),
+                "only data or blocked frames expected in the first burst"
             );
 
             pusher.push_max_data(VarInt::from_u8(2));
 
+            // After MAX_DATA the FIN data frame goes out (the blocked signal, if any, was already
+            // consumed above).
             let second = pusher.recv_frames().await;
-            assert_eq!(second.len(), 1, "expected exactly one frame");
-            let second_frame = second.front().unwrap();
+            let fin = second
+                .iter()
+                .find(|f| matches!(f.header, Header::QueueData { is_fin: true, .. }))
+                .expect("expected a FIN data frame after MAX_DATA");
             assert!(matches!(
-                second_frame.header,
-                Header::QueueData {
-                    is_fin: true,
-                    offset,
-                    ..
-                } if offset == VarInt::from_u8(1)
+                fin.header,
+                Header::QueueData { offset, .. } if offset == VarInt::from_u8(1)
             ));
-            assert_eq!(second_frame.payload, &b"b"[..]);
+            assert_eq!(fin.payload, &b"b"[..]);
         }
         .primary()
         .spawn();
@@ -2008,6 +2066,58 @@ fn server_write_msg_unblocks_after_max_data() {
                 )
                 .await
                 .expect("write_msg should complete after MAX_DATA");
+        }
+        .primary()
+        .spawn();
+    });
+}
+
+/// A write into a zero remote window with no data frame to carry the in-band `blocked` bit emits a
+/// standalone `QueueDataBlocked` frame carrying the desired high-water offset, and re-emits only
+/// when that watermark grows (dedup on `last_blocked_offset`).
+#[test]
+fn write_from_blocked_emits_queue_data_blocked() {
+    sim(|| {
+        let (mut writer, mut pusher) = make_server_pair();
+        writer.0.remote_max_data = VarInt::ZERO;
+
+        async move {
+            let frames = pusher.recv_frames().await;
+            let mut blocked = frames
+                .iter()
+                .filter_map(|f| match f.header {
+                    Header::QueueDataBlocked { desired_offset, .. } => Some(desired_offset),
+                    _ => None,
+                })
+                .peekable();
+            assert!(
+                blocked.peek().is_some(),
+                "expected a QueueDataBlocked frame, got {:?}",
+                frames.iter().map(|f| &f.header).collect::<Vec<_>>()
+            );
+            // The desired offset is the writer's high watermark (5 bytes buffered from offset 0).
+            assert_eq!(blocked.next(), Some(VarInt::from_u8(5)));
+        }
+        .primary()
+        .spawn();
+
+        async move {
+            let slot = writer.0.slot_ptr();
+            // Poll twice with the same buffered data: the first emits a blocked frame, the second
+            // must not re-emit (same high watermark → deduped).
+            for _ in 0..2 {
+                let pending = core::future::poll_fn(|cx| {
+                    let mut buf = Bytes::from_static(b"hello");
+                    match writer.0.poll_write_from(cx, slot, &mut buf, false) {
+                        Poll::Pending => Poll::Ready(true),
+                        Poll::Ready(_) => Poll::Ready(false),
+                    }
+                })
+                .await;
+                assert!(pending, "write must block while remote window is zero");
+            }
+            // Keep the writer alive so the pusher observes the frame before drop.
+            10.ms().sleep().await;
         }
         .primary()
         .spawn();

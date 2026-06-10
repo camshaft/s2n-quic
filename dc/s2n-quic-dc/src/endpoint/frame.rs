@@ -846,8 +846,10 @@ impl EncoderValue for Header {
                 encoder.encode(stream_offset);
                 // See QueueData: omitted on non-init FIN frames, else a delta from `stream_offset`.
                 if is_init || !*is_fin {
-                    encoder
-                        .encode(&Self::encode_largest_offset_delta(*stream_offset, *largest_offset));
+                    encoder.encode(&Self::encode_largest_offset_delta(
+                        *stream_offset,
+                        *largest_offset,
+                    ));
                 }
                 encoder.encode(message_size);
                 encoder.encode(chunk_size);
@@ -1527,7 +1529,10 @@ mod tests {
         // message_size=65536 (4-byte varint), chunk_size=8192 (2-byte varint),
         // chunk_index=1 (1 byte)
         assert_eq!(buf[0], 34);
-        assert_eq!(header.encoding_size(), 1 + 1 + 1 + 1 + 1 + 4 + 1 + 4 + 2 + 1);
+        assert_eq!(
+            header.encoding_size(),
+            1 + 1 + 1 + 1 + 1 + 4 + 1 + 4 + 2 + 1
+        );
     }
 
     #[test]
