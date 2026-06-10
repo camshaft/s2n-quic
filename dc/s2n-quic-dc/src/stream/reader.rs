@@ -327,6 +327,19 @@ struct Inner {
     reassembler: Reassembler,
     /// Remote flow control: maximum offset we've advertised to the sender
     remote_max_data: VarInt,
+    /// Unbacked window the reader may still advertise WITHOUT acquiring pool credit.
+    ///
+    /// Seeded to `local_recv_max_data` at construction (same value the slot seeds into its
+    /// `initial_window_remaining`, see `path/secret/map/entry.rs`). The peer is already bounded by
+    /// this handshake parameter, so this first window is "free" — the dispatch side never releases
+    /// pool credit for bytes that land inside it, and `finish_recv_accounting` subtracts the unused
+    /// remainder at termination. Advertising it therefore must NOT draw from the pool.
+    ///
+    /// This is what guarantees the server's first MAX_DATA — the one that confirms the binding and
+    /// unblocks the peer writer out of `InitSent` — always goes out even when the recv pool is
+    /// drained. Window growth *beyond* the unbacked window is pool-backed as before. Each MAX_DATA
+    /// extension draws from this first, and only the remainder is acquired from the pool.
+    unbacked_remaining: u64,
     /// Bootstrap window and top-up threshold (no longer the acquire ceiling). The advertised
     /// window now tracks the writer's hinted high watermark, grown multiplicatively on blocked
     /// signals up to the recv pool's `max_single_acquire`.
@@ -415,6 +428,10 @@ impl Reader {
             path_secret_entry,
             reassembler: Reassembler::new(),
             remote_max_data,
+            // The client advertises its full unbacked window (`local_recv_max_data`) up front via
+            // `remote_max_data`, so none remains to advertise later: invariant
+            // `advertised_at_construction + unbacked_remaining == initial_window` ⇒ 0 here.
+            unbacked_remaining: 0,
             window_size,
             peer_max_offset: 0,
             acted_blocked_offset: 0,
@@ -453,7 +470,13 @@ impl Reader {
             dest_queue_id,
             path_secret_entry,
             reassembler: Reassembler::new(),
+            // Server starts at zero advertised window; its first consumption forces the MAX_DATA
+            // that confirms the binding to the peer writer. That whole first window is unbacked
+            // (the peer is bounded by the handshake `local_recv_max_data`), so it is advertised
+            // without drawing pool credit — which is what lets binding confirmation proceed even
+            // when the recv pool is drained.
             remote_max_data: VarInt::ZERO,
+            unbacked_remaining: window_size,
             window_size,
             peer_max_offset: 0,
             acted_blocked_offset: 0,
@@ -1122,15 +1145,24 @@ impl Inner {
             "maybe_send_max_data: extending window"
         );
 
-        // Apply any grant the distributor already delivered toward the delta;
-        // only ask the pool for the remainder. If the prior grant alone
-        // satisfies (or overshoots) the request, return any surplus and skip
-        // the acquire entirely.
-        let mut granted = prior_grant.min(delta);
-        let surplus = prior_grant.saturating_sub(delta);
+        // Cover the extension from three sources, cheapest first:
+        //   1. `unbacked_remaining` — the initial window we may advertise for free (no pool
+        //      credit). This always lets the first/confirming MAX_DATA go out, even against a
+        //      drained pool, which is what prevents the binding-confirmation deadlock.
+        //   2. `prior_grant` — credit the distributor already delivered to our slot.
+        //   3. a fresh `poll_acquire` for whatever remains.
+        let from_unbacked = self.unbacked_remaining.min(delta);
+        self.unbacked_remaining -= from_unbacked;
+        let mut granted = from_unbacked;
+
+        let remaining = delta - granted;
+        let from_prior = prior_grant.min(remaining);
+        let surplus = prior_grant - from_prior;
         if surplus > 0 {
             self.recv_credit_pool.release(surplus);
         }
+        granted += from_prior;
+
         let need = delta - granted;
         if need > 0 {
             // SAFETY: caller's invariant — `slot` is this reader's idle slot,
@@ -1144,12 +1176,12 @@ impl Inner {
                     granted = granted.saturating_add(n);
                 }
                 Poll::Pending => {
-                    // We parked for `need` more credit. Any `prior_grant` we
-                    // already collected is consumed by advertising it now —
-                    // there is no `pending_credits` carry on the reader, so
-                    // dropping it would strand the credit until the next
-                    // grant. Advertise the partial and let the next poll
-                    // re-evaluate when the distributor delivers the rest.
+                    // We parked for `need` more credit. Any credit already
+                    // collected (unbacked + prior grant) is consumed by
+                    // advertising it now — there is no `pending_credits` carry
+                    // on the reader, so dropping it would strand it. Advertise
+                    // the partial and let the next poll re-evaluate when the
+                    // distributor delivers the rest.
                 }
             }
         }

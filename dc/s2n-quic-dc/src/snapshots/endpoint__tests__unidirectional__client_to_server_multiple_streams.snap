@@ -1,6 +1,5 @@
 ---
 source: dc/s2n-quic-dc/src/testing.rs
-assertion_line: 352
 expression: logs
 ---
 0:00:00.000000000 [server] DEBUG s2n_quic_dc: capacity=50000
@@ -483,8 +482,6 @@ expression: logs
 0:00:00.000521000 [server] DEBUG Sent FIN binding_id=1
 0:00:00.000521000 [server] DEBUG event=on_send_fin prev=Open next=FinSent location=dc/s2n-quic-dc/src/stream/writer.rs
 0:00:00.000521000 [server] DEBUG event=on_shutdown prev=FinSent next=Shutdown location=dc/s2n-quic-dc/src/stream/writer.rs
-0:00:00.000521000 [server] TRACE c#credit.recv.acquire.fast_path=1
-0:00:00.000521000 [server] TRACE c#credit.recv.acquire.bytes=65536
 0:00:00.000521000 [server] TRACE m#task.idle_wheel.drained[send.worker.0]=1
 0:00:00.000521000 [server] TRACE m#asm.max_datagram_size=1472
 0:00:00.000521000 [server] TRACE c#send.ack.drain[send.0]=1
@@ -1927,8 +1924,6 @@ expression: logs
 0:00:00.001561000 [server] DEBUG Sent FIN binding_id=2
 0:00:00.001561000 [server] DEBUG event=on_send_fin prev=Open next=FinSent location=dc/s2n-quic-dc/src/stream/writer.rs
 0:00:00.001561000 [server] DEBUG event=on_shutdown prev=FinSent next=Shutdown location=dc/s2n-quic-dc/src/stream/writer.rs
-0:00:00.001561000 [server] TRACE c#credit.recv.acquire.fast_path=1
-0:00:00.001561000 [server] TRACE c#credit.recv.acquire.bytes=65536
 0:00:00.001561000 [server] TRACE m#task.idle_wheel.drained[send.worker.2]=1
 0:00:00.001561000 [server] TRACE m#asm.max_datagram_size=1472
 0:00:00.001561000 [server] TRACE c#send.ack.drain[send.2]=1
@@ -4772,8 +4767,6 @@ expression: logs
 0:00:00.002601000 [server] DEBUG Sent FIN binding_id=3
 0:00:00.002601000 [server] DEBUG event=on_send_fin prev=Open next=FinSent location=dc/s2n-quic-dc/src/stream/writer.rs
 0:00:00.002601000 [server] DEBUG event=on_shutdown prev=FinSent next=Shutdown location=dc/s2n-quic-dc/src/stream/writer.rs
-0:00:00.002601000 [server] TRACE c#credit.recv.acquire.fast_path=1
-0:00:00.002601000 [server] TRACE c#credit.recv.acquire.bytes=65536
 0:00:00.002601000 [server] TRACE m#task.idle_wheel.drained[send.worker.0]=1
 0:00:00.002601000 [server] TRACE m#asm.max_datagram_size=1472
 0:00:00.002601000 [server] TRACE c#send.ack.drain[send.4]=1
@@ -8828,8 +8821,6 @@ expression: logs
 0:00:00.003641000 [server] DEBUG Sent FIN binding_id=4
 0:00:00.003641000 [server] DEBUG event=on_send_fin prev=Open next=FinSent location=dc/s2n-quic-dc/src/stream/writer.rs
 0:00:00.003641000 [server] DEBUG event=on_shutdown prev=FinSent next=Shutdown location=dc/s2n-quic-dc/src/stream/writer.rs
-0:00:00.003641000 [server] TRACE c#credit.recv.acquire.fast_path=1
-0:00:00.003641000 [server] TRACE c#credit.recv.acquire.bytes=65536
 0:00:00.003641000 [server] TRACE m#task.idle_wheel.drained[send.worker.2]=1
 0:00:00.003641000 [server] TRACE m#asm.max_datagram_size=1472
 0:00:00.003641000 [server] TRACE c#send.ack.drain[send.6]=1
@@ -13175,8 +13166,6 @@ expression: logs
 0:00:00.004681000 [server] DEBUG Sent FIN binding_id=5
 0:00:00.004681000 [server] DEBUG event=on_send_fin prev=Open next=FinSent location=dc/s2n-quic-dc/src/stream/writer.rs
 0:00:00.004681000 [server] DEBUG event=on_shutdown prev=FinSent next=Shutdown location=dc/s2n-quic-dc/src/stream/writer.rs
-0:00:00.004681000 [server] TRACE c#credit.recv.acquire.fast_path=1
-0:00:00.004681000 [server] TRACE c#credit.recv.acquire.bytes=65536
 0:00:00.004681000 [server] TRACE m#asm.max_datagram_size=1472
 0:00:00.004681000 [server] TRACE c#send.ack.drain[send.2]=1
 0:00:00.004681000 [server] TRACE g#send.ack.depth[send.2]=0

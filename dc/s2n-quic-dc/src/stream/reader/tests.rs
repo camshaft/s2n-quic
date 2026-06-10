@@ -106,11 +106,130 @@ fn make_pair_with_pool_and_initial_window(
     (reader, pusher)
 }
 
+/// Build a *server* reader (via `Reader::new_server`) plus a `Pusher` that injects stream messages
+/// into the same queue slot. `peer_fin_received = false` so the server reader emits a flow update
+/// after consuming, modeling the binding-confirmation path. The slot's unbacked initial window is
+/// seeded to `initial_recv_window` to match production.
+fn make_server_pair_with_pool_and_initial_window(
+    recv_credit_pool: crate::sync::Arc<crate::credit::Pool>,
+    initial_recv_window: u64,
+) -> (Reader, Pusher) {
+    let peer: SocketAddr = "127.0.0.1:4433".parse().unwrap();
+    let path_secret_entry = PathSecretEntry::builder(peer)
+        .endpoint_type(endpoint::Type::Client)
+        .build();
+
+    let client_state = std::sync::Arc::new(crate::queue::ClientState::new(
+        VarInt::from_u16(100),
+        initial_recv_window,
+    ));
+    let dest_queue_id = client_state.peer_free.try_alloc().unwrap();
+    let alloc = client_state.alloc_local(dest_queue_id).unwrap();
+    let dispatcher = crate::queue::ClientDispatch::new(client_state);
+
+    let queue_id = alloc.stream.queue_id();
+    let binding_id = alloc.stream.binding_id();
+
+    let (frame_tx, frame_rx) = frame::submission_channel(1);
+
+    let reader = Reader::new_server(
+        frame_tx,
+        path_secret_entry,
+        dest_queue_id,
+        alloc.stream,
+        false, // peer_fin_received: emit flow update after consuming
+        crate::time::DefaultClock::default(),
+        Arc::new(ReaderMetrics::new(
+            &crate::counter::Registry::default(),
+            "test",
+        )),
+        recv_credit_pool.clone(),
+        crate::credit::Priority::default(),
+    );
+
+    let pusher = Pusher {
+        dispatcher,
+        queue_id,
+        binding_id,
+        frame_rx,
+        frame_storage: PriorityStorage::default(),
+        recv_credit_pool: Some(recv_credit_pool),
+    };
+
+    (reader, pusher)
+}
+
 #[test]
 fn peer_addr_returns_handshake_addr() {
     let (reader, _) = make_pair();
     let expected: SocketAddr = "127.0.0.1:4433".parse().unwrap();
     assert_eq!(reader.peer_addr(), expected);
+}
+
+/// Finding 2 (bootstrap deadlock): a server reader must advertise its initial window — the
+/// MAX_DATA that confirms the binding and unblocks the peer writer out of `InitSent` — even when
+/// the recv pool is fully drained. The initial window is unbacked (the peer is already bounded by
+/// the handshake `local_recv_max_data`), so advertising it must not require pool credit.
+///
+/// Before the unbacked-window fix, the server's first `maybe_send_max_data` called `poll_acquire`
+/// for the whole window; against a drained pool that returned `Pending`, no MAX_DATA was sent, and
+/// the peer hung in `InitSent` forever (the connection wedged, and in the sim the run never
+/// terminated → unbounded memory). This test pins that the MAX_DATA still goes out.
+#[test]
+fn server_advertises_initial_window_against_drained_pool() {
+    sim(|| {
+        // Zero-capacity pool with an unrestricted per-priority cap: any pool acquire parks
+        // forever (no distributor is run). The server must NOT depend on the pool to advertise
+        // its initial window.
+        let cfg = crate::credit::Config {
+            capacity: 0,
+            max_single_acquire: [u64::MAX; crate::credit::Priority::LEVELS],
+        };
+        let pool = crate::sync::Arc::new(crate::credit::Pool::new(cfg));
+        // Hold a distributor so the pool stays open (drop would close it and change the path).
+        let distributor = crate::credit::Distributor::new(pool.clone());
+
+        // Seed the slot's unbacked initial window to the reader's window, as production does.
+        let (mut reader, mut pusher) =
+            make_server_pair_with_pool_and_initial_window(pool, 1024 * 1024);
+        let window_size = reader.0.window_size;
+        assert!(window_size > 0);
+
+        async move {
+            // Peer sends a small amount of data (well within the unbacked window).
+            pusher.push_data(0, b"hello server", false);
+            // The server must emit a MAX_DATA advertising its initial window despite the drained
+            // pool — this is the binding-confirmation signal.
+            let frames = pusher.recv_frames_timeout(1.s()).await;
+            let frames = frames.expect(
+                "server must advertise its initial window (send MAX_DATA) even when the recv \
+                 pool is drained — otherwise the peer writer hangs in InitSent (Finding 2)",
+            );
+            let max_data = frames
+                .iter()
+                .find_map(decode_max_data_from_queue_control)
+                .expect("expected a QueueMaxData frame confirming the binding");
+            assert!(
+                max_data.as_u64() > 0,
+                "advertised window must be > 0 to confirm the binding, got {}",
+                max_data.as_u64()
+            );
+            let _keep_alive = &distributor;
+            1.s().sleep().await;
+        }
+        .primary()
+        .spawn();
+
+        async move {
+            let mut buf = BytesMut::with_capacity(64);
+            let n = reader.read_into(&mut buf).await.expect("server read failed");
+            assert_eq!(n, b"hello server".len());
+            assert_eq!(&buf[..], b"hello server");
+            1.s().sleep().await;
+        }
+        .primary()
+        .spawn();
+    });
 }
 
 /// Mock endpoint side of a reader test.
