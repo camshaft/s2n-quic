@@ -506,3 +506,95 @@ fn newcomer_cannot_snipe() {
         unsafe { free_slot(w) };
     });
 }
+
+/// Finding 4: `grant()` and `abandon()` race on the same parked slot, and the value the
+/// application reads back from `abandon()` must be exactly what the distributor wrote — never a
+/// torn or stale `granted`.
+///
+/// `grant()` writes `*granted = amount` then does a `Release` CAS LINKED→APP; `abandon()` does a
+/// CAS LINKED→DEAD with `Acquire` failure ordering then reads `*granted`. The two outcomes:
+///   * abandon wins the CAS (slot → DEAD): grant's CAS then fails (returns `None`), the slot is
+///     ours-then-pool-freed, and no grant was observed.
+///   * grant wins the CAS (slot → APP): abandon's CAS fails, and its `Acquire` load
+///     synchronizes-with grant's `Release` CAS, so the `granted` read sees exactly `amount`.
+/// Either way the app must never see a partial/garbage value, and pool credit must be conserved.
+#[test]
+fn grant_races_abandon_reads_exact_granted() {
+    loom::model(|| {
+        const CAP: u64 = 10;
+        let pool = Arc::new(Pool::new(Config {
+            capacity: CAP,
+            max_single_acquire: [100; Priority::LEVELS],
+        }));
+
+        // Drain capacity with a throwaway fast-path acquire so the next acquire is forced to park.
+        let drain = alloc_slot();
+        let dwaker = noop();
+        let mut dcx = Context::from_waker(&dwaker);
+        let r = unsafe { pool.poll_acquire(&mut dcx, drain, CAP, Priority::Medium) };
+        assert!(matches!(r, Poll::Ready(n) if n == CAP));
+
+        // Park the waiter we will race on: available is 0, so this parks for CAP.
+        let w = alloc_slot();
+        let wwaker = noop();
+        let mut wcx = Context::from_waker(&wwaker);
+        let r = unsafe { pool.poll_acquire(&mut wcx, w, CAP, Priority::Medium) };
+        assert!(matches!(r, Poll::Pending));
+
+        // Return the drained credit so the distributor has CAP to grant to the parked waiter.
+        pool.release(CAP);
+
+        // Thread A: the distributor runs one pass, attempting to grant the parked waiter.
+        let dist = {
+            let pool = pool.clone();
+            loom::thread::spawn(move || {
+                let mut dist = Distributor::new(pool);
+                let granted = Arc::new(crate::sync::AtomicUsize::new(0));
+                let mut wakers = CountWake(granted);
+                let mut budget = Budget::new(1 << 16);
+                let dwaker = noop();
+                dist.pool.waker.register(&dwaker);
+                let _ = dist.poll_distribute(&mut budget, &mut wakers);
+            })
+        };
+
+        // Thread B: the application abandons concurrently with the grant.
+        let app = {
+            let pool = pool.clone();
+            loom::thread::spawn(move || {
+                let slot = unsafe { &*w.as_ptr() };
+                match unsafe { slot.abandon() } {
+                    AbandonResult::Abandoned => {
+                        // We won the CAS; the pool frees the slot on its pop/drop. No credit was
+                        // observed, so nothing to release.
+                        false
+                    }
+                    AbandonResult::Granted(n) => {
+                        // Grant won the CAS. The value MUST be exactly CAP (the full grant) or 0
+                        // (grant had not written yet / nothing outstanding) — never torn.
+                        assert!(
+                            n == CAP || n == 0,
+                            "abandon read a torn/unexpected granted value: {n} (expected {CAP} or 0)"
+                        );
+                        if n > 0 {
+                            pool.release(n);
+                        }
+                        true
+                    }
+                    AbandonResult::Closed => true,
+                }
+            })
+        };
+
+        dist.join().unwrap();
+        let app_owns = app.join().unwrap();
+
+        drop(pool);
+        // If abandon won, the slot is DEAD and freed by the pool's tier drop. If the grant won,
+        // the app owns the now-idle slot and frees it here.
+        if app_owns {
+            unsafe { free_slot(w) };
+        }
+        unsafe { free_slot(drain) };
+    });
+}
