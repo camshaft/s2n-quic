@@ -33,7 +33,7 @@ impl QueueView {
         queue_id: VarInt,
         binding_id: VarInt,
         entry: intrusive::Entry<msg::Stream>,
-    ) -> Result<queue::AutoWake, queue::Error<intrusive::Entry<msg::Stream>>> {
+    ) -> Result<(queue::AutoWake, u64), queue::Error<intrusive::Entry<msg::Stream>>> {
         match self {
             Self::Client(d) => d.send_stream(queue_id, binding_id, entry),
             Self::Server(d) => d.send_stream(queue_id, binding_id, entry),
@@ -66,7 +66,7 @@ impl QueueView {
         is_fin: bool,
         is_wakeup: bool,
         write_fn: impl FnOnce(*mut u8, u32) -> Result<(), E>,
-    ) -> Result<queue::AutoWake, queue::MsgError<E>> {
+    ) -> Result<(queue::AutoWake, u64), queue::MsgError<E>> {
         match self {
             Self::Client(d) => d.send_msg(
                 queue_id,

@@ -49,7 +49,8 @@ fn make_pair() -> (Reader, Pusher) {
         .endpoint_type(endpoint::Type::Client)
         .build();
 
-    let client_state = std::sync::Arc::new(crate::queue::ClientState::new(VarInt::from_u16(100)));
+    let client_state =
+        std::sync::Arc::new(crate::queue::ClientState::new(VarInt::from_u16(100), 0));
     let dest_queue_id = client_state.peer_free.try_alloc().unwrap();
     let alloc = client_state.alloc_local(dest_queue_id).unwrap();
     let dispatcher = crate::queue::ClientDispatch::new(client_state);
@@ -58,6 +59,10 @@ fn make_pair() -> (Reader, Pusher) {
     let binding_id = alloc.stream.binding_id();
 
     let (frame_tx, frame_rx) = frame::submission_channel(1);
+
+    let recv_credit_pool = crate::sync::Arc::new(crate::credit::Pool::new(
+        crate::credit::Config::default(),
+    ));
 
     let reader = Reader::new_client(
         frame_tx,
@@ -69,6 +74,8 @@ fn make_pair() -> (Reader, Pusher) {
             &crate::counter::Registry::default(),
             "test",
         )),
+        recv_credit_pool,
+        crate::credit::Priority::default(),
     );
 
     let pusher = Pusher {

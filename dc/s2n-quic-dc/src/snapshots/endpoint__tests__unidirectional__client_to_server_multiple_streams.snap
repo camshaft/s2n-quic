@@ -483,6 +483,8 @@ expression: logs
 0:00:00.000521000 [server] DEBUG Sent FIN binding_id=1
 0:00:00.000521000 [server] DEBUG event=on_send_fin prev=Open next=FinSent location=dc/s2n-quic-dc/src/stream/writer.rs
 0:00:00.000521000 [server] DEBUG event=on_shutdown prev=FinSent next=Shutdown location=dc/s2n-quic-dc/src/stream/writer.rs
+0:00:00.000521000 [server] TRACE c#credit.recv.acquire.fast_path=1
+0:00:00.000521000 [server] TRACE c#credit.recv.acquire.bytes=1048576
 0:00:00.000521000 [server] TRACE m#task.idle_wheel.drained[send.worker.0]=1
 0:00:00.000521000 [server] TRACE m#asm.max_datagram_size=1472
 0:00:00.000521000 [server] TRACE c#send.ack.drain[send.0]=1
@@ -690,7 +692,7 @@ expression: logs
 0:00:00.001041000 [client] TRACE c#credit.send.acquire.bytes=64175
 0:00:00.001041000 [client] DEBUG event=on_send_fin prev=Open next=FinSent location=dc/s2n-quic-dc/src/stream/writer.rs
 0:00:00.001041000 [client]  INFO stream 0 completed
-0:00:00.001041000 [client] DEBUG Writer dropping binding_id=1 status=FinSent next_offset=65536 inflight_bytes=64175 remote_max_data=1049937
+0:00:00.001041000 [client] DEBUG Writer dropping binding_id=1 status=FinSent next_offset=65536 inflight_bytes=64175 remote_max_data=1048576
 0:00:00.001041000 [client] DEBUG event=on_shutdown prev=FinSent next=Shutdown location=dc/s2n-quic-dc/src/stream/writer.rs
 0:00:00.001041000 [client] TRACE c#q.ack.receiver[send.3.task.ack_processor]=1
 0:00:00.001041000 [client] TRACE c#q.ack.drain[send.3]=1
@@ -1925,6 +1927,8 @@ expression: logs
 0:00:00.001561000 [server] DEBUG Sent FIN binding_id=2
 0:00:00.001561000 [server] DEBUG event=on_send_fin prev=Open next=FinSent location=dc/s2n-quic-dc/src/stream/writer.rs
 0:00:00.001561000 [server] DEBUG event=on_shutdown prev=FinSent next=Shutdown location=dc/s2n-quic-dc/src/stream/writer.rs
+0:00:00.001561000 [server] TRACE c#credit.recv.acquire.fast_path=1
+0:00:00.001561000 [server] TRACE c#credit.recv.acquire.bytes=1048576
 0:00:00.001561000 [server] TRACE m#task.idle_wheel.drained[send.worker.2]=1
 0:00:00.001561000 [server] TRACE m#asm.max_datagram_size=1472
 0:00:00.001561000 [server] TRACE c#send.ack.drain[send.2]=1
@@ -3185,7 +3189,7 @@ expression: logs
 0:00:00.002081000 [client] TRACE c#credit.send.acquire.bytes=64175
 0:00:00.002081000 [client] DEBUG event=on_send_fin prev=Open next=FinSent location=dc/s2n-quic-dc/src/stream/writer.rs
 0:00:00.002081000 [client]  INFO stream 1 completed
-0:00:00.002081000 [client] DEBUG Writer dropping binding_id=2 status=FinSent next_offset=65536 inflight_bytes=64175 remote_max_data=1049937
+0:00:00.002081000 [client] DEBUG Writer dropping binding_id=2 status=FinSent next_offset=65536 inflight_bytes=64175 remote_max_data=1048576
 0:00:00.002081000 [client] DEBUG event=on_shutdown prev=FinSent next=Shutdown location=dc/s2n-quic-dc/src/stream/writer.rs
 0:00:00.002081000 [client] TRACE c#q.ack.receiver[send.1.task.ack_processor]=1
 0:00:00.002081000 [client] TRACE c#q.ack.drain[send.1]=1
@@ -4768,6 +4772,8 @@ expression: logs
 0:00:00.002601000 [server] DEBUG Sent FIN binding_id=3
 0:00:00.002601000 [server] DEBUG event=on_send_fin prev=Open next=FinSent location=dc/s2n-quic-dc/src/stream/writer.rs
 0:00:00.002601000 [server] DEBUG event=on_shutdown prev=FinSent next=Shutdown location=dc/s2n-quic-dc/src/stream/writer.rs
+0:00:00.002601000 [server] TRACE c#credit.recv.acquire.fast_path=1
+0:00:00.002601000 [server] TRACE c#credit.recv.acquire.bytes=1048576
 0:00:00.002601000 [server] TRACE m#task.idle_wheel.drained[send.worker.0]=1
 0:00:00.002601000 [server] TRACE m#asm.max_datagram_size=1472
 0:00:00.002601000 [server] TRACE c#send.ack.drain[send.4]=1
@@ -6929,7 +6935,7 @@ expression: logs
 0:00:00.003121000 [client] TRACE c#credit.send.acquire.bytes=64175
 0:00:00.003121000 [client] DEBUG event=on_send_fin prev=Open next=FinSent location=dc/s2n-quic-dc/src/stream/writer.rs
 0:00:00.003121000 [client]  INFO stream 2 completed
-0:00:00.003121000 [client] DEBUG Writer dropping binding_id=3 status=FinSent next_offset=65536 inflight_bytes=64175 remote_max_data=1049937
+0:00:00.003121000 [client] DEBUG Writer dropping binding_id=3 status=FinSent next_offset=65536 inflight_bytes=64175 remote_max_data=1048576
 0:00:00.003121000 [client] DEBUG event=on_shutdown prev=FinSent next=Shutdown location=dc/s2n-quic-dc/src/stream/writer.rs
 0:00:00.003121000 [client] TRACE c#q.ack.receiver[send.0.task.ack_processor]=1
 0:00:00.003121000 [client] TRACE c#q.ack.drain[send.0]=1
@@ -8820,6 +8826,8 @@ expression: logs
 0:00:00.003641000 [server] DEBUG Sent FIN binding_id=4
 0:00:00.003641000 [server] DEBUG event=on_send_fin prev=Open next=FinSent location=dc/s2n-quic-dc/src/stream/writer.rs
 0:00:00.003641000 [server] DEBUG event=on_shutdown prev=FinSent next=Shutdown location=dc/s2n-quic-dc/src/stream/writer.rs
+0:00:00.003641000 [server] TRACE c#credit.recv.acquire.fast_path=1
+0:00:00.003641000 [server] TRACE c#credit.recv.acquire.bytes=1048576
 0:00:00.003641000 [server] TRACE m#task.idle_wheel.drained[send.worker.2]=1
 0:00:00.003641000 [server] TRACE m#asm.max_datagram_size=1472
 0:00:00.003641000 [server] TRACE c#send.ack.drain[send.6]=1
@@ -11220,7 +11228,7 @@ expression: logs
 0:00:00.004161000 [client] TRACE c#credit.send.acquire.bytes=64175
 0:00:00.004161000 [client] DEBUG event=on_send_fin prev=Open next=FinSent location=dc/s2n-quic-dc/src/stream/writer.rs
 0:00:00.004161000 [client]  INFO stream 3 completed
-0:00:00.004161000 [client] DEBUG Writer dropping binding_id=4 status=FinSent next_offset=65536 inflight_bytes=64175 remote_max_data=1049937
+0:00:00.004161000 [client] DEBUG Writer dropping binding_id=4 status=FinSent next_offset=65536 inflight_bytes=64175 remote_max_data=1048576
 0:00:00.004161000 [client] DEBUG event=on_shutdown prev=FinSent next=Shutdown location=dc/s2n-quic-dc/src/stream/writer.rs
 0:00:00.004161000 [client] TRACE c#q.ack.receiver[send.3.task.ack_processor]=1
 0:00:00.004161000 [client] TRACE c#q.ack.drain[send.3]=1
@@ -13163,6 +13171,8 @@ expression: logs
 0:00:00.004681000 [server] DEBUG Sent FIN binding_id=5
 0:00:00.004681000 [server] DEBUG event=on_send_fin prev=Open next=FinSent location=dc/s2n-quic-dc/src/stream/writer.rs
 0:00:00.004681000 [server] DEBUG event=on_shutdown prev=FinSent next=Shutdown location=dc/s2n-quic-dc/src/stream/writer.rs
+0:00:00.004681000 [server] TRACE c#credit.recv.acquire.fast_path=1
+0:00:00.004681000 [server] TRACE c#credit.recv.acquire.bytes=1048576
 0:00:00.004681000 [server] TRACE m#asm.max_datagram_size=1472
 0:00:00.004681000 [server] TRACE c#send.ack.drain[send.2]=1
 0:00:00.004681000 [server] TRACE g#send.ack.depth[send.2]=0
@@ -15649,7 +15659,7 @@ expression: logs
 0:00:00.005201000 [client] TRACE c#credit.send.acquire.bytes=64175
 0:00:00.005201000 [client] DEBUG event=on_send_fin prev=Open next=FinSent location=dc/s2n-quic-dc/src/stream/writer.rs
 0:00:00.005201000 [client]  INFO stream 4 completed
-0:00:00.005201000 [client] DEBUG Writer dropping binding_id=5 status=FinSent next_offset=65536 inflight_bytes=64175 remote_max_data=1049937
+0:00:00.005201000 [client] DEBUG Writer dropping binding_id=5 status=FinSent next_offset=65536 inflight_bytes=64175 remote_max_data=1048576
 0:00:00.005201000 [client] DEBUG event=on_shutdown prev=FinSent next=Shutdown location=dc/s2n-quic-dc/src/stream/writer.rs
 0:00:00.005201000 [client] TRACE c#q.ack.receiver[send.0.task.ack_processor]=1
 0:00:00.005201000 [client] TRACE c#q.ack.drain[send.0]=1

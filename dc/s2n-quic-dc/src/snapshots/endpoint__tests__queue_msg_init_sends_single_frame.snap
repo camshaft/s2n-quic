@@ -438,6 +438,8 @@ expression: logs
 0:00:00.000521000 [server] TRACE m#rx.frames_per_packet=1
 0:00:00.000521000 [server] DEBUG event=on_ack_eliciting prev=Idle next=Scheduled location=dc/s2n-quic-dc/src/endpoint/dispatch.rs
 0:00:00.000521000 [server] TRACE m#task.packet_dispatch.drained[recv.dispatch.0]=2
+0:00:00.000521000 [server] TRACE c#credit.recv.acquire.fast_path=1
+0:00:00.000521000 [server] TRACE c#credit.recv.acquire.bytes=1048576
 0:00:00.000521000 [server] TRACE m#task.recv_idle_wheel.drained[recv.dispatch.0]=1
 0:00:00.000521000 [server] DEBUG event=on_flush prev=Scheduled next=Flushed location=dc/s2n-quic-dc/src/endpoint/recv.rs
 0:00:00.000521000 [server] TRACE c#q.ack.enq[send.0]=1

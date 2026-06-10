@@ -104,9 +104,11 @@ use s2n_quic_core::{
     varint::VarInt,
 };
 use std::{
+    alloc::{self, Layout},
     io,
     net::SocketAddr,
     pin::Pin,
+    ptr::NonNull,
     sync::Arc,
     task::{Context, Poll},
 };
@@ -149,7 +151,136 @@ use std::{
 ///     Ok(body)
 /// }
 /// ```
-pub struct Reader(Box<Inner>);
+pub struct Reader(ReaderAllocPtr);
+
+#[repr(C)]
+struct ReaderAlloc {
+    /// MUST live at offset 0 — the credit pool casts `NonNull<Slot>` back to
+    /// `NonNull<ReaderAlloc>` via the registered `drop_fn`. Enforced at compile
+    /// time by [`crate::assert_slot_at_offset_zero!`] below.
+    slot: crate::credit::Slot,
+    inner: Inner,
+}
+
+crate::assert_slot_at_offset_zero!(ReaderAlloc);
+
+/// Owning pointer to a `ReaderAlloc`. Derefs to `Inner` so the reader body keeps
+/// its `self.0.field` ergonomics, while drop is staged through the credit slot's
+/// abandon/grant state machine: a parked acquire can transfer ownership of the
+/// allocation to the recv credit pool, which then calls [`drop_reader_alloc`]
+/// to free it.
+struct ReaderAllocPtr(NonNull<ReaderAlloc>);
+
+// SAFETY: `ReaderAllocPtr` owns the heap allocation exclusively. `Inner`'s
+// fields are all `Send` (and not `Sync`), and `credit::Slot` is `Send`/`Sync`.
+// The pool only ever reads/writes `Slot` fields under its own state machine; it
+// never touches `Inner`.
+unsafe impl Send for ReaderAllocPtr {}
+
+impl ReaderAllocPtr {
+    /// Allocate a `ReaderAlloc` initialized with `inner` and an idle (rc=APP)
+    /// `Slot` registered against [`drop_reader_alloc`].
+    fn new(inner: Inner) -> Self {
+        let layout = Layout::new::<ReaderAlloc>();
+        let raw = unsafe { alloc::alloc(layout) } as *mut ReaderAlloc;
+        let ptr = NonNull::new(raw).unwrap_or_else(|| alloc::handle_alloc_error(layout));
+        unsafe {
+            std::ptr::write(
+                ptr.as_ptr(),
+                ReaderAlloc {
+                    slot: crate::credit::Slot::new(drop_reader_alloc),
+                    inner,
+                },
+            );
+        }
+        Self(ptr)
+    }
+
+    /// Pointer to the embedded `Slot` for handing to the credit pool.
+    #[inline]
+    fn slot_ptr(&self) -> NonNull<crate::credit::Slot> {
+        self.0.cast()
+    }
+}
+
+impl core::ops::Deref for ReaderAllocPtr {
+    type Target = Inner;
+    #[inline]
+    fn deref(&self) -> &Inner {
+        unsafe { &(*self.0.as_ptr()).inner }
+    }
+}
+
+impl core::ops::DerefMut for ReaderAllocPtr {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut Inner {
+        unsafe { &mut (*self.0.as_ptr()).inner }
+    }
+}
+
+impl Drop for ReaderAllocPtr {
+    fn drop(&mut self) {
+        // Always go through `abandon` — its CAS is the single source of truth
+        // for who owns the allocation. Unlike the writer, the reader never
+        // accumulates pending credits: each `poll_acquire` immediately commits
+        // the granted bytes to the advertised window, and dispatch-side
+        // releases happen as data arrives. So even on the `Granted(n)` branch
+        // we have nothing to release back to the pool — `n` represents a grant
+        // that, if observed, would have been advertised; since we did not
+        // advertise it, the unused credit is returned implicitly by simply not
+        // having raised the window.
+        //
+        // Wait — that reasoning has a hole. If the distributor delivered a
+        // grant *while we were unparked*, we have not yet observed it via
+        // `poll_granted`, so the pool's view is "this slot was granted N
+        // bytes." Without releasing, those bytes remain debited. Release them
+        // here to balance the pool.
+        //
+        // SAFETY: `abandon`'s relaxed contract permits calling it in any
+        // APP-owned or LINKED state, exactly the range the slot can be in
+        // when the reader drops.
+        let slot = unsafe { &(*self.0.as_ptr()).slot };
+        match unsafe { slot.abandon() } {
+            crate::credit::AbandonResult::Abandoned => {
+                // The slot was LINKED and is now DEAD. The pool's pop walk
+                // will call `drop_reader_alloc` to free the allocation; we
+                // must not touch it again.
+                return;
+            }
+            crate::credit::AbandonResult::Granted(n) => {
+                // We own the allocation. If the pool delivered a grant we
+                // never observed, return it — otherwise it would leak from
+                // the pool's accounting until restart.
+                if n > 0 {
+                    let inner = unsafe { &(*self.0.as_ptr()).inner };
+                    inner.recv_credit_pool.release(n);
+                }
+            }
+            crate::credit::AbandonResult::Closed => {
+                // Pool was dropped concurrently. We own the allocation; do
+                // not touch the pool.
+            }
+        }
+        // SAFETY: The slot is APP-owned and we hold the only reference. Drop
+        // `Inner` and free the heap block.
+        unsafe {
+            std::ptr::drop_in_place(&raw mut (*self.0.as_ptr()).inner);
+            alloc::dealloc(self.0.as_ptr().cast(), Layout::new::<ReaderAlloc>());
+        }
+    }
+}
+
+/// `drop_fn` invoked by the credit pool when it pops a dead slot — i.e. the
+/// reader was dropped while its slot was linked, the pool then dequeued the
+/// dead entry and now owns the allocation. Drops `Inner` and frees the block.
+unsafe fn drop_reader_alloc(ptr: NonNull<crate::credit::Slot>) {
+    // SAFETY: `Slot` lives at offset 0 of `ReaderAlloc` (see
+    // `assert_slot_at_offset_zero!`), so the cast points back to the original
+    // allocation. The pool guarantees this is called exactly once.
+    let ptr = ptr.cast::<ReaderAlloc>();
+    std::ptr::drop_in_place(&raw mut (*ptr.as_ptr()).inner);
+    alloc::dealloc(ptr.as_ptr().cast(), Layout::new::<ReaderAlloc>());
+}
 
 use super::coop::{self, Coop, HasCoop};
 
@@ -192,6 +323,11 @@ struct Inner {
     remote_max_data: VarInt,
     /// Window size for flow control
     window_size: u64,
+    /// Endpoint-wide recv credit pool. Window-extension acquires draw from
+    /// here; dispatch-side releases happen elsewhere as bytes arrive.
+    recv_credit_pool: crate::sync::Arc<crate::credit::Pool>,
+    /// Priority tier for `poll_acquire` calls against the recv pool.
+    priority: crate::credit::Priority,
     /// Whether this endpoint should emit a flow update after FIN is consumed.
     /// Server-side readers set this to true so FIN consumption can act as an
     /// acceptance signal to the peer. Client-side readers set it to false since
@@ -245,12 +381,14 @@ impl Reader {
         stream_rx: crate::queue::StreamReceiver,
         clock: crate::time::DefaultClock,
         metrics: Arc<ReaderMetrics>,
+        recv_credit_pool: crate::sync::Arc<crate::credit::Pool>,
+        priority: crate::credit::Priority,
     ) -> Self {
         let parameters = path_secret_entry.parameters();
         let remote_max_data = parameters.local_recv_max_data;
         let window_size = remote_max_data.as_u64();
 
-        Self(Box::new(Inner {
+        Self(ReaderAllocPtr::new(Inner {
             frame_tx,
             completion_rx: frame::failure_completion_channel(),
             stream_rx,
@@ -259,6 +397,8 @@ impl Reader {
             reassembler: Reassembler::new(),
             remote_max_data,
             window_size,
+            recv_credit_pool,
+            priority,
             send_flow_update_after_fin: false,
             status: Status::Open,
             reset_error_code: None,
@@ -278,11 +418,13 @@ impl Reader {
         peer_fin_received: bool,
         clock: crate::time::DefaultClock,
         metrics: Arc<ReaderMetrics>,
+        recv_credit_pool: crate::sync::Arc<crate::credit::Pool>,
+        priority: crate::credit::Priority,
     ) -> Self {
         let parameters = path_secret_entry.parameters();
         let window_size = parameters.local_recv_max_data.as_u64();
 
-        Self(Box::new(Inner {
+        Self(ReaderAllocPtr::new(Inner {
             frame_tx,
             completion_rx: frame::failure_completion_channel(),
             stream_rx,
@@ -291,6 +433,8 @@ impl Reader {
             reassembler: Reassembler::new(),
             remote_max_data: VarInt::ZERO,
             window_size,
+            recv_credit_pool,
+            priority,
             send_flow_update_after_fin: !peer_fin_received,
             status: Status::Open,
             reset_error_code: None,
@@ -441,7 +585,11 @@ impl Reader {
     where
         S: buffer::writer::Storage,
     {
-        self.0.poll_read_into(cx, buf)
+        let slot = self.0.slot_ptr();
+        // SAFETY: `slot` is the slot embedded at offset 0 of this reader's
+        // `ReaderAlloc`. It is the only legal slot for `poll_acquire` because
+        // the pool stores a waker for *this* task into it.
+        unsafe { self.0.poll_read_into(cx, buf, slot) }
     }
 }
 
@@ -506,17 +654,29 @@ impl Inner {
     fn on_eof_returned(&mut self) {}
 
     #[inline]
-    fn poll_read_into<S>(&mut self, cx: &mut Context, buf: &mut S) -> Poll<io::Result<usize>>
+    unsafe fn poll_read_into<S>(
+        &mut self,
+        cx: &mut Context,
+        buf: &mut S,
+        slot: NonNull<crate::credit::Slot>,
+    ) -> Poll<io::Result<usize>>
     where
         S: buffer::writer::Storage,
     {
         waker::debug_assert_contract(cx, |cx| {
-            coop::poll(self, cx, |this, cx| this.poll_read_into_inner(cx, buf))
+            coop::poll(self, cx, |this, cx| unsafe {
+                this.poll_read_into_inner(cx, buf, slot)
+            })
         })
     }
 
     #[inline(always)]
-    fn poll_read_into_inner<S>(&mut self, cx: &mut Context, buf: &mut S) -> Poll<io::Result<usize>>
+    unsafe fn poll_read_into_inner<S>(
+        &mut self,
+        cx: &mut Context,
+        buf: &mut S,
+        slot: NonNull<crate::credit::Slot>,
+    ) -> Poll<io::Result<usize>>
     where
         S: buffer::writer::Storage,
     {
@@ -563,9 +723,12 @@ impl Inner {
                 // the reassembler and call maybe_send_max_data.
                 Poll::Pending if !self.reassembler.is_empty() => None,
                 Poll::Pending => {
-                    // Even with no data available, send initial credits so the
-                    // peer can start transmitting.
-                    self.maybe_send_max_data()?;
+                    // Even with no data available, try to extend the window so
+                    // the peer can start (or keep) transmitting. Pending here
+                    // means the pool didn't grant — that's fine, we're already
+                    // returning Pending anyway.
+                    // SAFETY: caller's invariant — `slot` is this reader's idle slot.
+                    unsafe { self.maybe_send_max_data(cx, slot)? };
                     return Poll::Pending;
                 }
                 other => return other.map_ok(|()| 0usize),
@@ -584,7 +747,8 @@ impl Inner {
         // Attempting to send in that state would produce an error that discards
         // the data we just buffered, which is wrong.
         if deferred_err.is_none() {
-            self.maybe_send_max_data()?;
+            // SAFETY: caller's invariant — `slot` is this reader's idle slot.
+            unsafe { self.maybe_send_max_data(cx, slot)? };
         }
 
         if self.reassembler.is_reading_complete() {
@@ -747,7 +911,27 @@ impl Inner {
         Poll::Ready(Err(io::Error::new(io::ErrorKind::InvalidData, reset_error)))
     }
 
-    fn maybe_send_max_data(&mut self) -> io::Result<()> {
+    /// Decide whether to extend the advertised window and, if so, acquire the
+    /// new credit from the recv pool before sending MAX_DATA.
+    ///
+    /// `slot` must point to the embedded `Slot` of the `ReaderAlloc` that owns
+    /// this `Inner`; the pool stores a waker pointing at our task on `Pending`.
+    ///
+    /// `Poll::Pending` here means "the pool would not grant fresh credit; do
+    /// not advertise more." It does not stall application reads — the reader
+    /// keeps draining whatever data is already buffered. The distributor will
+    /// wake the reader's task when credit becomes available.
+    ///
+    /// # Safety
+    ///
+    /// `slot` must be the slot embedded at offset 0 of this reader's
+    /// `ReaderAlloc`. It is the only legal slot because `Pool::poll_acquire`
+    /// writes a waker for *this* task into it.
+    unsafe fn maybe_send_max_data(
+        &mut self,
+        cx: &mut Context,
+        slot: NonNull<crate::credit::Slot>,
+    ) -> io::Result<()> {
         if let Some(final_size) = self.reassembler.final_size() {
             if !self.send_flow_update_after_fin {
                 return Ok(());
@@ -762,17 +946,7 @@ impl Inner {
         let current_max = self.remote_max_data.as_u64();
         let threshold = current_max.saturating_sub(self.window_size / 2);
 
-        if consumed >= threshold {
-            let new_max_data = consumed + self.window_size;
-            let new_max_data = VarInt::new(new_max_data)
-                .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "max_data overflow"))?;
-
-            // Frame send errors are propagated: if we cannot communicate flow
-            // control credits the peer may stall, so it is better to surface
-            // the failure immediately.
-            self.send_max_data_frame(new_max_data)?;
-            self.remote_max_data = new_max_data;
-        } else {
+        if consumed < threshold {
             trace!(
                 binding_id = self.stream_rx.binding_id().as_u64(),
                 consumed,
@@ -781,7 +955,48 @@ impl Inner {
                 window_size = self.window_size,
                 "maybe_send_max_data: below threshold, not sending"
             );
+            return Ok(());
         }
+
+        let target_max_data = consumed + self.window_size;
+        let delta = target_max_data.saturating_sub(current_max);
+        if delta == 0 {
+            return Ok(());
+        }
+
+        // SAFETY: `slot` is this reader's idle slot per the caller's invariant.
+        let granted = match unsafe {
+            self.recv_credit_pool
+                .poll_acquire(cx, slot, delta, self.priority)
+        } {
+            Poll::Ready(n) => n,
+            Poll::Pending => {
+                // Pool is exhausted — leave the window where it is. The peer's
+                // own flow control naturally caps in-flight data; the
+                // distributor will wake the reader's task when credit is
+                // available so the next poll can re-evaluate.
+                return Ok(());
+            }
+        };
+
+        if granted == 0 {
+            return Ok(());
+        }
+
+        let new_max_data = current_max.saturating_add(granted);
+        let new_max_data = VarInt::new(new_max_data)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "max_data overflow"))?;
+
+        // Frame send errors are propagated: if we cannot communicate flow
+        // control credits the peer may stall, so it is better to surface
+        // the failure immediately.
+        if let Err(err) = self.send_max_data_frame(new_max_data) {
+            // Frame submission failed — return the credits we just acquired
+            // so the pool's accounting stays balanced.
+            self.recv_credit_pool.release(granted);
+            return Err(err);
+        }
+        self.remote_max_data = new_max_data;
 
         Ok(())
     }

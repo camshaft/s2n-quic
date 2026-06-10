@@ -688,6 +688,8 @@ where
         alloc.stream,
         endpoint.clock.clone(),
         endpoint.reader_metrics.clone(),
+        endpoint.recv_credit_pool.clone(),
+        crate::credit::Priority::default(),
     );
 
     Ok(Stream::new(reader, writer))

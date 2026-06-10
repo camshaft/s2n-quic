@@ -476,6 +476,8 @@ expression: logs
 0:00:00.000521000 [server] TRACE m#q.resolver_to_idle_wheel.depth_dist[send.worker.0]=1
 0:00:00.000521000 [server] TRACE m#task.ack_processor.drained[send.worker.0]=2
 0:00:00.000521000 [server] TRACE m#task.recycle_drain.drained=0
+0:00:00.000521000 [server] TRACE c#credit.recv.acquire.fast_path=1
+0:00:00.000521000 [server] TRACE c#credit.recv.acquire.bytes=1048576
 0:00:00.000521000 [server] DEBUG Reader complete - all data consumed binding_id=1 final_size=Some(5) consumed_len=5
 0:00:00.000521000 [server] DEBUG event=on_complete prev=Open next=Complete location=dc/s2n-quic-dc/src/stream/reader.rs
 0:00:00.000521000 [server] DEBUG Writer dropping binding_id=1 status=Open next_offset=0 inflight_bytes=0 remote_max_data=1048576

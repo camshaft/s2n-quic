@@ -89,6 +89,7 @@ fn decrypt_fast_path(
     reader_metrics: &Arc<crate::stream::metrics::ReaderMetrics>,
     writer_metrics: &Arc<crate::stream::metrics::WriterMetrics>,
     send_credit_pool: &crate::sync::Arc<crate::credit::Pool>,
+    recv_credit_pool: &crate::sync::Arc<crate::credit::Pool>,
 ) -> Result<AutoWake, FastPathError> {
     let Header::QueueMsg {
         queue_pair,
@@ -136,6 +137,7 @@ fn decrypt_fast_path(
                 waker: _,
                 stream,
                 control,
+                release_bytes: _,
             }) => {
                 let writer = Writer::new_server(
                     frame_tx.clone(),
@@ -156,6 +158,8 @@ fn decrypt_fast_path(
                     is_fin,
                     stream_clock.clone(),
                     reader_metrics.clone(),
+                    recv_credit_pool.clone(),
+                    priority,
                 );
                 let new_stream = Stream::new(reader, writer);
                 match acceptor_sender.send(new_stream) {
@@ -177,7 +181,7 @@ fn decrypt_fast_path(
                     }
                 }
             }
-            Ok(crate::queue::BindResult::Bound(_)) => {}
+            Ok(crate::queue::BindResult::Bound { .. }) => {}
             Err(_) => return Ok(AutoWake::default()),
         }
     }
@@ -210,7 +214,7 @@ fn decrypt_fast_path(
     );
 
     Ok(match waker {
-        Ok(w) => {
+        Ok((w, release_bytes)) => {
             if w.is_some() {
                 counters.rx_msg_segment_completed.add(1);
                 counters
@@ -219,6 +223,7 @@ fn decrypt_fast_path(
                 let chunks = message_size.as_u64().div_ceil(chunk_size.as_u64().max(1));
                 counters.rx_msg_chunks_per_segment.record_value(chunks);
             }
+            recv_credit_pool.release(release_bytes);
             w
         }
         Err(crate::queue::MsgError::Queue(_)) => AutoWake::default(),
@@ -249,6 +254,7 @@ pub(crate) fn process<Clk, Route>(
     reader_metrics: &Arc<crate::stream::metrics::ReaderMetrics>,
     writer_metrics: &Arc<crate::stream::metrics::WriterMetrics>,
     send_credit_pool: &crate::sync::Arc<crate::credit::Pool>,
+    recv_credit_pool: &crate::sync::Arc<crate::credit::Pool>,
 ) -> Result<(), Error>
 where
     Clk: s2n_quic_core::time::Clock + crate::time::precision::Clock + ?Sized,
@@ -305,6 +311,7 @@ where
                 reader_metrics,
                 writer_metrics,
                 send_credit_pool,
+                recv_credit_pool,
             )
             .map(DecryptResult::FastPath)
             .ok();
@@ -492,6 +499,7 @@ where
                     reader_metrics,
                     writer_metrics,
                     send_credit_pool,
+                    recv_credit_pool,
                 );
             }
             Err(err) => {
@@ -578,6 +586,7 @@ fn dispatch_decoded_frame(
     reader_metrics: &Arc<crate::stream::metrics::ReaderMetrics>,
     writer_metrics: &Arc<crate::stream::metrics::WriterMetrics>,
     send_credit_pool: &crate::sync::Arc<crate::credit::Pool>,
+    recv_credit_pool: &crate::sync::Arc<crate::credit::Pool>,
 ) {
     match header {
         Header::QueueData {
@@ -606,11 +615,20 @@ fn dispatch_decoded_frame(
                     reader_metrics,
                     writer_metrics,
                     send_credit_pool,
+                    recv_credit_pool,
                     priority,
                 );
             } else {
                 handle_queue_data(
-                    peer, queue_pair, binding_id, offset, is_fin, payload, counters, waker_sink,
+                    peer,
+                    queue_pair,
+                    binding_id,
+                    offset,
+                    is_fin,
+                    payload,
+                    counters,
+                    waker_sink,
+                    recv_credit_pool,
                 );
             }
         }
@@ -727,6 +745,7 @@ fn dispatch_decoded_frame(
                     reader_metrics,
                     writer_metrics,
                     send_credit_pool,
+                    recv_credit_pool,
                     priority,
                 );
             } else {
@@ -744,6 +763,7 @@ fn dispatch_decoded_frame(
                     payload,
                     counters,
                     waker_sink,
+                    recv_credit_pool,
                 );
             }
         }
@@ -835,6 +855,7 @@ fn handle_queue_data(
     buf: BytesMut,
     counters: &counters::Dispatch,
     waker_sink: &mut impl channel::UnboundedSender<AutoWake>,
+    recv_credit_pool: &crate::sync::Arc<crate::credit::Pool>,
 ) {
     let local_queue_id = queue_pair.dest_queue_id;
     let payload_len = buf.len();
@@ -849,8 +870,9 @@ fn handle_queue_data(
         .queue_view
         .send_stream(local_queue_id, binding_id, entry)
     {
-        Ok(waker) => {
+        Ok((waker, release_bytes)) => {
             let _ = waker_sink.send(waker);
+            recv_credit_pool.release(release_bytes);
             counters.rx_data_ok.add(1);
             trace!(
                 binding_id = binding_id.as_u64(),
@@ -926,6 +948,7 @@ fn handle_queue_msg(
     payload: BytesMut,
     counters: &counters::Dispatch,
     waker_sink: &mut impl channel::UnboundedSender<AutoWake>,
+    recv_credit_pool: &crate::sync::Arc<crate::credit::Pool>,
 ) {
     let local_queue_id = queue_pair.dest_queue_id;
     let payload_len = payload.len() as u32;
@@ -948,7 +971,7 @@ fn handle_queue_msg(
             Ok(())
         },
     ) {
-        Ok(waker) => {
+        Ok((waker, release_bytes)) => {
             if waker.is_some() {
                 counters.rx_msg_segment_completed.add(1);
                 counters
@@ -958,6 +981,7 @@ fn handle_queue_msg(
                 counters.rx_msg_chunks_per_segment.record_value(chunks);
             }
             let _ = waker_sink.send(waker);
+            recv_credit_pool.release(release_bytes);
         }
         Err(crate::queue::MsgError::Queue(crate::queue::Error::Unallocated(_))) => {
             counters.rx_data_unallocated.add(1);
@@ -1008,6 +1032,7 @@ fn handle_queue_msg_init(
     reader_metrics: &Arc<crate::stream::metrics::ReaderMetrics>,
     writer_metrics: &Arc<crate::stream::metrics::WriterMetrics>,
     send_credit_pool: &crate::sync::Arc<crate::credit::Pool>,
+    recv_credit_pool: &crate::sync::Arc<crate::credit::Pool>,
     priority: crate::credit::Priority,
 ) {
     let Some(server_view) = peer.queue_view.as_server_mut() else {
@@ -1038,6 +1063,7 @@ fn handle_queue_msg_init(
             waker: _,
             stream,
             control,
+            release_bytes: _,
         }) => {
             let writer = Writer::new_server(
                 frame_tx.clone(),
@@ -1058,6 +1084,8 @@ fn handle_queue_msg_init(
                 is_fin,
                 stream_clock.clone(),
                 reader_metrics.clone(),
+                recv_credit_pool.clone(),
+                priority,
             );
             let new_stream = Stream::new(reader, writer);
 
@@ -1079,7 +1107,7 @@ fn handle_queue_msg_init(
                 }
             }
         }
-        Ok(crate::queue::BindResult::Bound(_)) => {
+        Ok(crate::queue::BindResult::Bound { .. }) => {
             // Already bound — just push the msg data below
         }
         Err(_) => {
@@ -1102,6 +1130,7 @@ fn handle_queue_msg_init(
         payload,
         counters,
         waker_sink,
+        recv_credit_pool,
     );
 }
 
@@ -1124,6 +1153,7 @@ fn handle_queue_data_init(
     reader_metrics: &Arc<crate::stream::metrics::ReaderMetrics>,
     writer_metrics: &Arc<crate::stream::metrics::WriterMetrics>,
     send_credit_pool: &crate::sync::Arc<crate::credit::Pool>,
+    recv_credit_pool: &crate::sync::Arc<crate::credit::Pool>,
     priority: crate::credit::Priority,
 ) {
     let Some(server_view) = peer.queue_view.as_server_mut() else {
@@ -1171,6 +1201,7 @@ fn handle_queue_data_init(
             waker,
             stream,
             control,
+            release_bytes,
         }) => {
             let writer = Writer::new_server(
                 frame_tx.clone(),
@@ -1192,6 +1223,8 @@ fn handle_queue_data_init(
                 peer_fin,
                 stream_clock.clone(),
                 reader_metrics.clone(),
+                recv_credit_pool.clone(),
+                priority,
             );
             let new_stream = Stream::new(reader, writer);
 
@@ -1214,6 +1247,7 @@ fn handle_queue_data_init(
             }
 
             let _ = waker_sink.send(waker);
+            recv_credit_pool.release(release_bytes);
 
             debug!(
                 binding_id = binding_id.as_u64(),
@@ -1222,8 +1256,12 @@ fn handle_queue_data_init(
                 "QueueData init - new binding created"
             );
         }
-        Ok(crate::queue::BindResult::Bound(waker)) => {
+        Ok(crate::queue::BindResult::Bound {
+            waker,
+            release_bytes,
+        }) => {
             let _ = waker_sink.send(waker);
+            recv_credit_pool.release(release_bytes);
             counters.rx_data_ok.add(1);
             trace!(
                 binding_id = binding_id.as_u64(),
@@ -1390,7 +1428,7 @@ fn handle_queue_reset(
             counters.rx_reset_both.add(1);
             let stream_entry = msg::Stream::Reset { error_code }.into();
             let control_entry = msg::Control::Reset { error_code }.into();
-            if let Ok(waker) = peer
+            if let Ok((waker, _)) = peer
                 .queue_view
                 .send_stream(dest_queue_id, binding_id, stream_entry)
             {
@@ -1412,7 +1450,7 @@ fn handle_queue_reset(
         ResetTarget::Stream => {
             counters.rx_reset_stream.add(1);
             let stream_entry = msg::Stream::Reset { error_code }.into();
-            if let Ok(waker) = peer
+            if let Ok((waker, _)) = peer
                 .queue_view
                 .send_stream(dest_queue_id, binding_id, stream_entry)
             {
