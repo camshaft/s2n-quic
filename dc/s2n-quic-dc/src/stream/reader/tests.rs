@@ -52,13 +52,25 @@ fn make_pair() -> (Reader, Pusher) {
 fn make_pair_with_pool(
     recv_credit_pool: crate::sync::Arc<crate::credit::Pool>,
 ) -> (Reader, Pusher) {
+    // Most tests don't exercise pool accounting, so the slot's unbacked initial window defaults to
+    // zero here. `make_pair_for_conservation` seeds it to the reader's window (matching production
+    // in `path/secret/map/entry.rs`) so the acquire/release books actually balance.
+    make_pair_with_pool_and_initial_window(recv_credit_pool, 0)
+}
+
+fn make_pair_with_pool_and_initial_window(
+    recv_credit_pool: crate::sync::Arc<crate::credit::Pool>,
+    initial_recv_window: u64,
+) -> (Reader, Pusher) {
     let peer: SocketAddr = "127.0.0.1:4433".parse().unwrap();
     let path_secret_entry = PathSecretEntry::builder(peer)
         .endpoint_type(endpoint::Type::Client)
         .build();
 
-    let client_state =
-        std::sync::Arc::new(crate::queue::ClientState::new(VarInt::from_u16(100), 0));
+    let client_state = std::sync::Arc::new(crate::queue::ClientState::new(
+        VarInt::from_u16(100),
+        initial_recv_window,
+    ));
     let dest_queue_id = client_state.peer_free.try_alloc().unwrap();
     let alloc = client_state.alloc_local(dest_queue_id).unwrap();
     let dispatcher = crate::queue::ClientDispatch::new(client_state);
@@ -78,7 +90,7 @@ fn make_pair_with_pool(
             &crate::counter::Registry::default(),
             "test",
         )),
-        recv_credit_pool,
+        recv_credit_pool.clone(),
         crate::credit::Priority::default(),
     );
 
@@ -88,6 +100,7 @@ fn make_pair_with_pool(
         binding_id,
         frame_rx,
         frame_storage: PriorityStorage::default(),
+        recv_credit_pool: Some(recv_credit_pool),
     };
 
     (reader, pusher)
@@ -115,11 +128,15 @@ struct Pusher {
     /// Reusable priority-storage buffer; avoids re-allocating the fixed-size
     /// array on every `recv_frames` call.
     frame_storage: PriorityStorage,
+    /// Recv credit pool, so the pusher can mirror the real dispatch path and
+    /// `release` the `release_bytes` returned by `send_stream`. Conservation
+    /// tests rely on this; most tests ignore it.
+    recv_credit_pool: Option<crate::sync::Arc<crate::credit::Pool>>,
 }
 
 impl Pusher {
     fn push(&mut self, message: msg::Stream) {
-        let _ = self
+        let (_waker, release_bytes) = self
             .dispatcher
             .send_stream(
                 self.queue_id,
@@ -127,6 +144,11 @@ impl Pusher {
                 intrusive::Entry::new(message),
             )
             .unwrap_or_else(|_| panic!("send_stream should succeed in tests"));
+        // Mirror `endpoint/dispatch.rs`: as buffered bytes cross the unbacked
+        // initial window they are released back to the recv pool.
+        if let Some(pool) = &self.recv_credit_pool {
+            pool.release(release_bytes);
+        }
     }
 
     fn push_data(&mut self, offset: u64, data: &[u8], fin: bool) {
@@ -642,6 +664,89 @@ fn max_data_sent_after_consuming() {
     });
 }
 
+/// Recv-credit conservation across a full stream lifecycle.
+///
+/// With no parked waiters the pool holds the invariant `available + returned == capacity`: every
+/// byte a reader acquires by extending its advertised window must eventually be returned, either as
+/// inbound data arrives (`release` on the dispatch side) or as the unfilled tail of the window is
+/// reclaimed when the stream terminates.
+///
+/// This reproduces the leak: a reader extends its window past what the peer actually sends, then
+/// the stream completes and the reader drops. The advertised-but-unfilled window
+/// (`remote_max_data - max(initial_window, max_received_offset)`) is acquired from the pool but
+/// never released, so `available + returned` ends up short by exactly that gap.
+///
+/// The harness seeds the slot's unbacked initial window to the reader's `window_size` (matching
+/// production in `path/secret/map/entry.rs`, where both come from `local_recv_max_data`) and mirrors
+/// the dispatch release path via `Pusher::push`, so the books balance exactly when there is no leak.
+#[test]
+fn recv_credit_conserved_across_stream_lifecycle() {
+    sim(|| {
+        // Pool large enough that the window extension succeeds on the fast path (no parking), so
+        // `available` directly reflects acquires and `returned` directly reflects releases.
+        let capacity = 8 * 1024 * 1024;
+        let pool = crate::sync::Arc::new(crate::credit::Pool::new(
+            crate::credit::Config::new(capacity).with_max_single_acquire_uniform(capacity),
+        ));
+        let assert_pool = pool.clone();
+
+        // Seed the slot's unbacked initial window to the reader's window so the client's unbacked
+        // starting window and the suppressed initial release cancel — exactly as in production.
+        let window_size = 1024 * 1024;
+        let (mut reader, mut pusher) =
+            make_pair_with_pool_and_initial_window(pool, window_size as u64);
+        assert_eq!(reader.0.window_size, window_size as u64);
+
+        // Peer sends a fraction of the window, but hints it wants to send far more — forcing the
+        // reader to acquire a window extension it will never fill.
+        let body = vec![0xabu8; 600_000];
+        let body_len = body.len();
+        let hint = 2 * 1024 * 1024; // writer wants well beyond the standing window
+        let tail_len = 8usize;
+        let total_len = body_len + tail_len;
+
+        async move {
+            pusher.push_data_hint(0, &body, false, hint);
+            // Let the app consume `body` and extend the window (the acquire happens here).
+            for _ in 0..4 {
+                bach::task::yield_now().await;
+            }
+            // FIN at a low offset: the peer never comes close to filling the extended window.
+            pusher.push_data(body_len as u64, &vec![0xcdu8; tail_len], true);
+            1.s().sleep().await;
+        }
+        .primary()
+        .spawn();
+
+        async move {
+            let mut buf = BytesMut::with_capacity(total_len + 16);
+            let outcome = reader.read_to_end(&mut buf).await.expect("read failed");
+            assert_eq!(outcome, ReadToEnd::Complete(total_len));
+            assert!(reader.0.status.is_complete());
+            // The reader advertised well past what arrived; confirm the gap exists before drop.
+            assert!(
+                reader.0.remote_max_data.as_u64() > window_size as u64,
+                "test setup: reader should have extended its window"
+            );
+            // Drop the reader: its terminal path must release the unfilled window back to the pool.
+            drop(reader);
+            // Drop is synchronous, but yield so any wake bookkeeping settles before we assert.
+            bach::task::yield_now().await;
+
+            let available = assert_pool.debug_available();
+            let returned = assert_pool.debug_returned();
+            assert_eq!(
+                available + returned as i64,
+                capacity as i64,
+                "recv-credit leak: available({available}) + returned({returned}) != capacity({capacity}); \
+                 the advertised-but-unfilled window was acquired but never released on termination"
+            );
+        }
+        .primary()
+        .spawn();
+    });
+}
+
 /// Right-sizing: a client reader bootstraps with a full `window_size` already advertised. When the
 /// writer's hint says it wants to send less than that standing window, consuming past the top-up
 /// threshold must NOT emit a MAX_DATA — there is no point advertising beyond what the writer wants.
@@ -1123,6 +1228,7 @@ fn broken_frame_channel_is_handled_gracefully() {
             binding_id,
             frame_rx: _closed,
             frame_storage,
+            recv_credit_pool,
         } = pusher;
         let mut pusher = Pusher {
             dispatcher,
@@ -1131,6 +1237,7 @@ fn broken_frame_channel_is_handled_gracefully() {
             // Dummy disconnected receiver — not used for assertions in this test.
             frame_rx: frame::submission_channel(1).1,
             frame_storage,
+            recv_credit_pool,
         };
 
         // Endpoint task: push enough data to trigger a MAX_DATA send without

@@ -220,22 +220,28 @@ impl core::ops::DerefMut for ReaderAllocPtr {
 
 impl Drop for ReaderAllocPtr {
     fn drop(&mut self) {
-        // Always go through `abandon` — its CAS is the single source of truth
-        // for who owns the allocation. Unlike the writer, the reader never
-        // accumulates pending credits: each `poll_acquire` immediately commits
-        // the granted bytes to the advertised window, and dispatch-side
-        // releases happen as data arrives. So even on the `Granted(n)` branch
-        // we have nothing to release back to the pool — `n` represents a grant
-        // that, if observed, would have been advertised; since we did not
-        // advertise it, the unused credit is returned implicitly by simply not
-        // having raised the window.
+        // Two distinct quantities must return to the recv pool on drop:
         //
-        // Wait — that reasoning has a hole. If the distributor delivered a
-        // grant *while we were unparked*, we have not yet observed it via
-        // `poll_granted`, so the pool's view is "this slot was granted N
-        // bytes." Without releasing, those bytes remain debited. Release them
-        // here to balance the pool.
-        //
+        // 1. The advertised-but-unfilled window. Each `poll_acquire` commits its
+        //    grant straight into `remote_max_data`; the dispatch side only
+        //    releases credit as bytes actually arrive. The window the reader
+        //    advertised beyond what the peer sent is therefore still debited.
+        //    `StreamReceiver::finish_recv_accounting` computes that leftover
+        //    (`remote_max_data - max_received_offset - initial_window_remaining`)
+        //    under the slot lock, idempotently and race-free against any
+        //    concurrent dispatch release. We do this BEFORE `abandon` so it runs
+        //    regardless of which ownership branch the CAS lands on.
+        // 2. An unobserved distributor grant. If the distributor granted while
+        //    we were unparked, the grant sits in the slot unseen by
+        //    `poll_granted`; the `abandon` CAS surfaces it as `Granted(n)`.
+        let inner = unsafe { &(*self.0.as_ptr()).inner };
+        let leftover = inner
+            .stream_rx
+            .finish_recv_accounting(inner.remote_max_data.as_u64());
+        if leftover > 0 {
+            inner.recv_credit_pool.release(leftover);
+        }
+
         // SAFETY: `abandon`'s relaxed contract permits calling it in any
         // APP-owned or LINKED state, exactly the range the slot can be in
         // when the reader drops.
@@ -244,7 +250,8 @@ impl Drop for ReaderAllocPtr {
             crate::credit::AbandonResult::Abandoned => {
                 // The slot was LINKED and is now DEAD. The pool's pop walk
                 // will call `drop_reader_alloc` to free the allocation; we
-                // must not touch it again.
+                // must not touch it again. (The leftover release above already
+                // ran and touched only the pool, not the slot allocation.)
                 return;
             }
             crate::credit::AbandonResult::Granted(n) => {
@@ -252,7 +259,6 @@ impl Drop for ReaderAllocPtr {
                 // never observed, return it — otherwise it would leak from
                 // the pool's accounting until restart.
                 if n > 0 {
-                    let inner = unsafe { &(*self.0.as_ptr()).inner };
                     inner.recv_credit_pool.release(n);
                 }
             }

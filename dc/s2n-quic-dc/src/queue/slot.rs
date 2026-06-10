@@ -64,6 +64,12 @@ pub(crate) struct StreamState {
     /// new-byte release subtracts from this first, so only bytes beyond the
     /// initial window are returned to the recv credit pool.
     pub(crate) initial_window_remaining: u64,
+    /// Set once the reader has reconciled its advertised window on termination
+    /// (see [`StreamState::finish_recv_accounting`]). After this point
+    /// [`StreamState::observe_offset`] stops releasing, because the terminal
+    /// reconciliation already accounted for the full advertised window — any
+    /// late-arriving (but in-window) bytes would otherwise be released twice.
+    pub(crate) recv_finished: bool,
 }
 
 impl StreamState {
@@ -71,6 +77,7 @@ impl StreamState {
         self.msg_table = None;
         self.flush_watermark = 0;
         self.max_received_offset = 0;
+        self.recv_finished = false;
         // initial_window_remaining is reset by the caller on bind because the
         // value comes from configuration that lives outside the slot.
     }
@@ -78,9 +85,15 @@ impl StreamState {
     /// Update `max_received_offset` to cover `[offset, end)` and return how
     /// many of those bytes are pool-backed (i.e. beyond the initial window).
     /// `initial_window_remaining` is consumed monotonically for the new bytes.
+    ///
+    /// Returns zero once [`finish_recv_accounting`] has run: the terminal
+    /// reconciliation released the remainder of the advertised window in one
+    /// shot, so releasing per-arrival again here would double-count.
+    ///
+    /// [`finish_recv_accounting`]: StreamState::finish_recv_accounting
     #[inline]
     pub(crate) fn observe_offset(&mut self, end: u64) -> u64 {
-        if end <= self.max_received_offset {
+        if self.recv_finished || end <= self.max_received_offset {
             return 0;
         }
         let new_bytes = end - self.max_received_offset;
@@ -88,6 +101,42 @@ impl StreamState {
         let from_initial = new_bytes.min(self.initial_window_remaining);
         self.initial_window_remaining -= from_initial;
         new_bytes - from_initial
+    }
+
+    /// Reconcile the advertised receive window on stream termination and return
+    /// how many pool-backed credits the reader must release.
+    ///
+    /// A reader debits the recv pool whenever it grows its advertised window
+    /// (`advertised`), but the dispatch side only releases credit for bytes that
+    /// actually arrive (via [`observe_offset`]). The gap between the advertised
+    /// window and what arrived — minus the still-unconsumed unbacked initial
+    /// window, which was never acquired — is credit the reader holds but will
+    /// never see filled. On termination that gap must go back to the pool:
+    ///
+    /// ```text
+    /// leftover = advertised - max_received_offset - initial_window_remaining
+    /// ```
+    ///
+    /// Window enforcement guarantees `max_received_offset <= advertised` and
+    /// `max_received_offset + initial_window_remaining <= advertised`, so the
+    /// result is exact; the saturating subtraction is defensive.
+    ///
+    /// Idempotent: the first call returns the leftover and latches
+    /// `recv_finished`; subsequent calls (and any further `observe_offset`)
+    /// return zero. Callers must hold the stream-half lock, which serializes
+    /// this against concurrent dispatch `observe_offset` calls so a byte is
+    /// released exactly once.
+    ///
+    /// [`observe_offset`]: StreamState::observe_offset
+    #[inline]
+    pub(crate) fn finish_recv_accounting(&mut self, advertised: u64) -> u64 {
+        if self.recv_finished {
+            return 0;
+        }
+        self.recv_finished = true;
+        advertised
+            .saturating_sub(self.max_received_offset)
+            .saturating_sub(self.initial_window_remaining)
     }
 }
 
@@ -116,6 +165,7 @@ impl Slot {
                 flush_watermark: 0,
                 max_received_offset: 0,
                 initial_window_remaining: 0,
+                recv_finished: false,
             }),
             control: Half::new(),
         }
@@ -155,6 +205,19 @@ impl Slot {
         let prev = self.binding_id.load(Ordering::Relaxed);
         self.binding_id
             .store(prev | UNALLOCATED_BIT, Ordering::Relaxed);
+    }
+
+    /// Reconcile the advertised receive window on termination, returning the
+    /// pool-backed credits the reader must release. See
+    /// [`StreamState::finish_recv_accounting`]. Idempotent; serialized with
+    /// dispatch `observe_offset` by the stream-half lock.
+    #[inline]
+    pub(crate) fn finish_recv_accounting(&self, advertised: u64) -> u64 {
+        self.stream
+            .inner
+            .lock()
+            .extra
+            .finish_recv_accounting(advertised)
     }
 
     /// Push to the stream half, validating binding_id inside the lock.

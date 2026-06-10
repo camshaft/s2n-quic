@@ -307,6 +307,14 @@ impl Pool {
         self.available.load(Ordering::Relaxed)
     }
 
+    /// Staged-but-not-yet-reconciled returned credit. With no parked waiters the pool conserves
+    /// `available + returned == capacity`; a recv-credit leak shows up as this sum falling short.
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub(crate) fn debug_returned(&self) -> u64 {
+        self.returned.load(Ordering::Relaxed)
+    }
+
     #[cfg(test)]
     #[allow(dead_code)]
     pub(crate) fn debug_parked_demand(&self) -> u64 {
