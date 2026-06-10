@@ -917,10 +917,17 @@ impl Inner {
     /// `slot` must point to the embedded `Slot` of the `ReaderAlloc` that owns
     /// this `Inner`; the pool stores a waker pointing at our task on `Pending`.
     ///
-    /// `Poll::Pending` here means "the pool would not grant fresh credit; do
-    /// not advertise more." It does not stall application reads — the reader
-    /// keeps draining whatever data is already buffered. The distributor will
-    /// wake the reader's task when credit becomes available.
+    /// Re-entry safety: a prior call may have parked the slot. Each invocation
+    /// drains any delivered grant via `poll_granted` and short-circuits on
+    /// `Pending` so we never call `prepare_park` twice on the same slot — that
+    /// would violate the credit pool's refcount=APP precondition. This mirrors
+    /// the writer's `poll_acquire_credits` pattern at
+    /// [stream/writer.rs:poll_acquire_credits].
+    ///
+    /// `Poll::Pending` here means "leave the advertised window where it is."
+    /// It does not stall application reads — the reader keeps draining
+    /// whatever data is already buffered. The distributor will wake the
+    /// reader's task when credit becomes available.
     ///
     /// # Safety
     ///
@@ -932,12 +939,40 @@ impl Inner {
         cx: &mut Context,
         slot: NonNull<crate::credit::Slot>,
     ) -> io::Result<()> {
+        // Drain any grant the distributor delivered while we were away. This
+        // also tells us whether the slot is still parked from a prior poll —
+        // in which case we MUST NOT issue a fresh acquire (the slot's
+        // `prepare_park` requires refcount=APP and would panic on RC_LINKED).
+        let slot_ref = unsafe { slot.as_ref() };
+        let prior_grant = match slot_ref.poll_granted() {
+            crate::credit::GrantResult::Pending => {
+                // Slot is still linked into the pool's tier. The distributor
+                // will wake us when it grants; nothing more to do this turn.
+                return Ok(());
+            }
+            crate::credit::GrantResult::Closed => {
+                // Pool was dropped; surface as broken pipe so subsequent
+                // polls don't loop.
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "recv credit pool closed",
+                ));
+            }
+            crate::credit::GrantResult::Granted(n) => n,
+        };
+
         if let Some(final_size) = self.reassembler.final_size() {
             if !self.send_flow_update_after_fin {
+                if prior_grant > 0 {
+                    self.recv_credit_pool.release(prior_grant);
+                }
                 return Ok(());
             }
 
             if self.remote_max_data.as_u64() >= final_size {
+                if prior_grant > 0 {
+                    self.recv_credit_pool.release(prior_grant);
+                }
                 return Ok(());
             }
         }
@@ -955,29 +990,52 @@ impl Inner {
                 window_size = self.window_size,
                 "maybe_send_max_data: below threshold, not sending"
             );
+            if prior_grant > 0 {
+                self.recv_credit_pool.release(prior_grant);
+            }
             return Ok(());
         }
 
         let target_max_data = consumed + self.window_size;
         let delta = target_max_data.saturating_sub(current_max);
         if delta == 0 {
+            if prior_grant > 0 {
+                self.recv_credit_pool.release(prior_grant);
+            }
             return Ok(());
         }
 
-        // SAFETY: `slot` is this reader's idle slot per the caller's invariant.
-        let granted = match unsafe {
-            self.recv_credit_pool
-                .poll_acquire(cx, slot, delta, self.priority)
-        } {
-            Poll::Ready(n) => n,
-            Poll::Pending => {
-                // Pool is exhausted — leave the window where it is. The peer's
-                // own flow control naturally caps in-flight data; the
-                // distributor will wake the reader's task when credit is
-                // available so the next poll can re-evaluate.
-                return Ok(());
+        // Apply any grant the distributor already delivered toward the delta;
+        // only ask the pool for the remainder. If the prior grant alone
+        // satisfies (or overshoots) the request, return any surplus and skip
+        // the acquire entirely.
+        let mut granted = prior_grant.min(delta);
+        let surplus = prior_grant.saturating_sub(delta);
+        if surplus > 0 {
+            self.recv_credit_pool.release(surplus);
+        }
+        let need = delta - granted;
+        if need > 0 {
+            // SAFETY: caller's invariant — `slot` is this reader's idle slot,
+            // and `poll_granted` above confirmed it is currently APP-owned
+            // (RC=1), satisfying `poll_acquire`'s precondition.
+            match unsafe {
+                self.recv_credit_pool
+                    .poll_acquire(cx, slot, need, self.priority)
+            } {
+                Poll::Ready(n) => {
+                    granted = granted.saturating_add(n);
+                }
+                Poll::Pending => {
+                    // We parked for `need` more credit. Any `prior_grant` we
+                    // already collected is consumed by advertising it now —
+                    // there is no `pending_credits` carry on the reader, so
+                    // dropping it would strand the credit until the next
+                    // grant. Advertise the partial and let the next poll
+                    // re-evaluate when the distributor delivers the rest.
+                }
             }
-        };
+        }
 
         if granted == 0 {
             return Ok(());

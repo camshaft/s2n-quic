@@ -44,6 +44,14 @@ use std::{net::SocketAddr, sync::Arc, time::Duration};
 // ─── Test helpers ─────────────────────────────────────────────────────────────
 
 fn make_pair() -> (Reader, Pusher) {
+    make_pair_with_pool(crate::sync::Arc::new(crate::credit::Pool::new(
+        crate::credit::Config::default(),
+    )))
+}
+
+fn make_pair_with_pool(
+    recv_credit_pool: crate::sync::Arc<crate::credit::Pool>,
+) -> (Reader, Pusher) {
     let peer: SocketAddr = "127.0.0.1:4433".parse().unwrap();
     let path_secret_entry = PathSecretEntry::builder(peer)
         .endpoint_type(endpoint::Type::Client)
@@ -59,10 +67,6 @@ fn make_pair() -> (Reader, Pusher) {
     let binding_id = alloc.stream.binding_id();
 
     let (frame_tx, frame_rx) = frame::submission_channel(1);
-
-    let recv_credit_pool = crate::sync::Arc::new(crate::credit::Pool::new(
-        crate::credit::Config::default(),
-    ));
 
     let reader = Reader::new_client(
         frame_tx,
@@ -1020,6 +1024,85 @@ fn broken_frame_channel_is_handled_gracefully() {
                 .await
                 .expect_err("expected BrokenPipe when frame channel is closed");
             assert_eq!(err.kind(), std::io::ErrorKind::BrokenPipe);
+        }
+        .primary()
+        .spawn();
+    });
+}
+
+/// Reproduces the production panic: the reader's first
+/// `maybe_send_max_data` parks on a recv pool that cannot grant the full
+/// delta. On the *next* poll — driven by the stream channel waking the
+/// reader's task when more data arrives — `maybe_send_max_data` re-enters
+/// `poll_acquire` while the slot is still RC_LINKED, tripping the
+/// `prepare_park` debug assertion (refcount=1 vs. 2).
+///
+/// Setup:
+///   * Recv pool capacity is small, and we pre-park a separate slot that
+///     consumes everything. The reader's window-extension acquire then
+///     genuinely parks on a live tier list (no closed-pool short-circuit).
+///   * The distributor is constructed but never run, so no grants ever
+///     fire — the slot stays RC_LINKED indefinitely.
+///   * The pusher delivers data in two batches separated by a yield so
+///     the reader's task is re-woken via the stream channel while the
+///     pool slot is still parked.
+#[test]
+fn maybe_send_max_data_re_polls_without_double_parking() {
+    sim(|| {
+        // Zero-capacity pool with an unrestricted per-priority cap: every
+        // acquire takes the park branch. (`Config::normalized` clamps
+        // `max_single_acquire` to capacity *unless* capacity is zero,
+        // which is exactly the carve-out tests use to force parking.)
+        let cfg = crate::credit::Config {
+            capacity: 0,
+            max_single_acquire: [u64::MAX; crate::credit::Priority::LEVELS],
+        };
+        let pool = crate::sync::Arc::new(crate::credit::Pool::new(cfg));
+        // Keep a distributor alive (so the pool stays open) but never
+        // run it — `Distributor::drop` is what closes the pool.
+        let distributor = crate::credit::Distributor::new(pool.clone());
+
+        let (mut reader, mut pusher) = make_pair_with_pool(pool);
+        let window_size = reader.0.window_size;
+        let payload_first = vec![0xab; (window_size / 2 + 1) as usize];
+        let payload_first_len = payload_first.len();
+        let payload_second = vec![0xcd; 64];
+        let payload_second_len = payload_second.len();
+
+        async move {
+            pusher.push_data(0, &payload_first, false);
+            // Yield so the app task consumes the first batch and parks
+            // on the pool. Then push more — the stream-channel wake
+            // re-polls the reader's task while the pool slot is still
+            // RC_LINKED, exercising the `poll_granted` short-circuit.
+            bach::task::yield_now().await;
+            bach::task::yield_now().await;
+            pusher.push_data(payload_first_len as u64, &payload_second, false);
+            // Hold the distributor for the lifetime of the test so the
+            // pool never closes mid-poll.
+            let _keep_alive = &distributor;
+            // Let the app task make whatever progress it can; if the
+            // double-park bug fires, this test panics in poll_acquire
+            // before either side completes.
+            1.s().sleep().await;
+        }
+        .primary()
+        .spawn();
+
+        async move {
+            let mut buf = BytesMut::with_capacity(payload_first_len + payload_second_len + 16);
+            let n = reader.read_into(&mut buf).await.expect("first read failed");
+            assert_eq!(n, payload_first_len);
+            // The second read drives `poll_read_into_inner` again; before
+            // the fix this panicked in `prepare_park`'s debug_assert.
+            // After the fix it returns Pending on the existing park and
+            // delivers the buffered payload_second when the stream
+            // channel fires.
+            let n2 = reader
+                .read_into(&mut buf)
+                .await
+                .expect("second read failed");
+            assert_eq!(n2, payload_second_len);
         }
         .primary()
         .spawn();
