@@ -130,10 +130,39 @@ impl Pusher {
     }
 
     fn push_data(&mut self, offset: u64, data: &[u8], fin: bool) {
+        let peer_max_offset = offset + data.len() as u64;
+        self.push_data_hint(offset, data, fin, peer_max_offset);
+    }
+
+    /// Push a data frame with an explicit writer high-watermark hint. Use when the test needs the
+    /// writer to signal it wants to send beyond this frame (so the reader extends its window).
+    fn push_data_hint(&mut self, offset: u64, data: &[u8], fin: bool, peer_max_offset: u64) {
         self.push(msg::Stream::Data {
             offset: VarInt::new(offset).unwrap(),
+            peer_max_offset: VarInt::new(peer_max_offset).unwrap(),
             payload: BytesMut::from(data),
             fin,
+            blocked: false,
+        });
+    }
+
+    /// Push a data frame carrying the writer's `blocked` signal with an explicit desired offset.
+    #[allow(dead_code)]
+    fn push_data_blocked(&mut self, offset: u64, data: &[u8], peer_max_offset: u64) {
+        self.push(msg::Stream::Data {
+            offset: VarInt::new(offset).unwrap(),
+            peer_max_offset: VarInt::new(peer_max_offset).unwrap(),
+            payload: BytesMut::from(data),
+            fin: false,
+            blocked: true,
+        });
+    }
+
+    /// Push a standalone `QueueDataBlocked` signal.
+    #[allow(dead_code)]
+    fn push_blocked(&mut self, desired_offset: u64) {
+        self.push(msg::Stream::Blocked {
+            desired_offset: VarInt::new(desired_offset).unwrap(),
         });
     }
 
@@ -580,9 +609,13 @@ fn max_data_sent_after_consuming() {
         let payload_len = payload.len();
         let expected_max_data = VarInt::new(window_size + payload_len as u64).unwrap();
 
+        // The writer signals it wants to send well beyond this frame (a full window past what we
+        // consume), so the reader extends the window to `consumed + window_size`.
+        let hint = window_size + payload_len as u64;
+
         // Endpoint task: push data, then wait for the MAX_DATA frame.
         async move {
-            pusher.push_data(0, &payload, false);
+            pusher.push_data_hint(0, &payload, false, hint);
             let frames = pusher.recv_frames().await;
             assert_eq!(frames.len(), 1, "expected exactly one outbound frame");
             assert_eq!(
@@ -616,9 +649,10 @@ fn max_data_transmission_failure_surfaces_error() {
         let window_size = reader.0.window_size;
         let payload = vec![0u8; (window_size / 2 + 1) as usize];
         let payload_len = payload.len();
+        let hint = window_size + payload_len as u64;
 
         async move {
-            pusher.push_data(0, &payload, false);
+            pusher.push_data_hint(0, &payload, false, hint);
 
             let frames = pusher.recv_frames().await;
             pusher.complete_with_status(
@@ -1007,11 +1041,13 @@ fn broken_frame_channel_is_handled_gracefully() {
         };
 
         // Endpoint task: push enough data to trigger a MAX_DATA send without
-        // exceeding the advertised receive window.
+        // exceeding the advertised receive window. The hint signals ongoing writer demand so the
+        // reader attempts a window extension (which then fails on the closed frame channel).
         let payload = vec![0u8; (window_size / 2 + 1) as usize];
         let payload_len = payload.len();
+        let hint = window_size + payload_len as u64;
         async move {
-            pusher.push_data(0, &payload, false);
+            pusher.push_data_hint(0, &payload, false, hint);
         }
         .primary()
         .spawn();
@@ -1068,9 +1104,12 @@ fn maybe_send_max_data_re_polls_without_double_parking() {
         let payload_first_len = payload_first.len();
         let payload_second = vec![0xcd; 64];
         let payload_second_len = payload_second.len();
+        // Signal ongoing writer demand so the reader attempts a window extension and parks on the
+        // zero-capacity pool — that park is what the double-park short-circuit must handle.
+        let hint = window_size + payload_first_len as u64;
 
         async move {
-            pusher.push_data(0, &payload_first, false);
+            pusher.push_data_hint(0, &payload_first, false, hint);
             // Yield so the app task consumes the first batch and parks
             // on the pool. Then push more — the stream-channel wake
             // re-polls the reader's task while the pool slot is still

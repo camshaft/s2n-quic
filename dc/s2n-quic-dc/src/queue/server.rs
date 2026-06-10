@@ -279,18 +279,21 @@ impl ServerView {
 
     #[inline]
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     pub fn send_msg<E>(
         &mut self,
         queue_id: VarInt,
         binding_id: VarInt,
         msg_id: u64,
         stream_offset: u64,
+        peer_max_offset: u64,
         message_size: u32,
         chunk_size: u16,
         chunk_index: u32,
         payload_len: u32,
         is_fin: bool,
         is_wakeup: bool,
+        blocked: bool,
         write_fn: impl FnOnce(*mut u8, u32) -> Result<(), E>,
     ) -> Result<(AutoWake, u64), super::MsgError<E>> {
         let index = queue_id.as_u64() as usize;
@@ -301,12 +304,14 @@ impl ServerView {
             binding_id,
             msg_id,
             stream_offset,
+            peer_max_offset,
             message_size,
             chunk_size,
             chunk_index,
             payload_len,
             is_fin,
             is_wakeup,
+            blocked,
             write_fn,
         )
     }

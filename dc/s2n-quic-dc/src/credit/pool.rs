@@ -292,6 +292,14 @@ impl Pool {
         self.waker.wake();
     }
 
+    /// Per-request acquire ceiling for `priority` (the normalized `max_single_acquire`). Callers
+    /// use this to bound speculative sizing — e.g. the reader caps its window-growth ratio so a
+    /// grown window can never exceed what a single acquire could satisfy.
+    #[inline]
+    pub fn max_single_acquire(&self, priority: Priority) -> u64 {
+        self.config.max_single_acquire[priority as usize]
+    }
+
     // Used by the deterministic suite (compiled out under the loom feature, hence allow(dead_code)).
     #[cfg(test)]
     #[allow(dead_code)]

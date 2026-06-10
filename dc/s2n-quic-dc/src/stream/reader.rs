@@ -321,8 +321,21 @@ struct Inner {
     reassembler: Reassembler,
     /// Remote flow control: maximum offset we've advertised to the sender
     remote_max_data: VarInt,
-    /// Window size for flow control
+    /// Bootstrap window and top-up threshold (no longer the acquire ceiling). The advertised
+    /// window now tracks the writer's hinted high watermark, grown multiplicatively on blocked
+    /// signals up to the recv pool's `max_single_acquire`.
     window_size: u64,
+    /// Highest absolute offset the writer has told us it wants to send (running max of the
+    /// per-frame `peer_max_offset` hint and any blocked `desired_offset`). Zero until the first
+    /// hint arrives, which keeps the bootstrap window behavior unchanged.
+    peer_max_offset: u64,
+    /// Highest blocked `desired_offset` we have already grown the window for. With the
+    /// `desired > cap` gate this dedups duplicate/reordered/retransmitted blocked signals.
+    acted_blocked_offset: u64,
+    /// Multiplicative window-growth factor (slow-start). Starts at 1×, doubles on each blocked
+    /// signal that outstrips the current cap, clamped so the window can't exceed the pool's
+    /// `max_single_acquire`. Held until the stream goes idle (never reset mid-stream).
+    growth_ratio: u32,
     /// Endpoint-wide recv credit pool. Window-extension acquires draw from
     /// here; dispatch-side releases happen elsewhere as bytes arrive.
     recv_credit_pool: crate::sync::Arc<crate::credit::Pool>,
@@ -397,6 +410,9 @@ impl Reader {
             reassembler: Reassembler::new(),
             remote_max_data,
             window_size,
+            peer_max_offset: 0,
+            acted_blocked_offset: 0,
+            growth_ratio: 1,
             recv_credit_pool,
             priority,
             send_flow_update_after_fin: false,
@@ -433,6 +449,9 @@ impl Reader {
             reassembler: Reassembler::new(),
             remote_max_data: VarInt::ZERO,
             window_size,
+            peer_max_offset: 0,
+            acted_blocked_offset: 0,
+            growth_ratio: 1,
             recv_credit_pool,
             priority,
             send_flow_update_after_fin: !peer_fin_received,
@@ -788,9 +807,20 @@ impl Inner {
                     match msg.into_inner() {
                         msg::Stream::Data {
                             offset,
+                            peer_max_offset,
                             mut payload,
                             fin,
+                            blocked,
                         } => {
+                            // Track the writer's desired high watermark and, if it signaled it is
+                            // blocked, possibly grow the window. Done before the receive-window
+                            // check so a blocked signal still drives growth even on an empty frame.
+                            self.peer_max_offset =
+                                self.peer_max_offset.max(peer_max_offset.as_u64());
+                            if blocked {
+                                self.on_blocked_signal(peer_max_offset.as_u64());
+                            }
+
                             let Some(payload_end_offset) =
                                 offset.as_u64().checked_add(payload.len() as u64)
                             else {
@@ -856,6 +886,19 @@ impl Inner {
                                 return self.protocol_error();
                             }
                         }
+                        msg::Stream::Blocked { desired_offset } => {
+                            // Standalone blocked signal (cold-start path): no payload, just drives
+                            // window growth. The subsequent maybe_send_max_data in the caller
+                            // emits the extension.
+                            trace!(
+                                binding_id = self.stream_rx.binding_id().as_u64(),
+                                desired_offset = desired_offset.as_u64(),
+                                "Received QueueDataBlocked"
+                            );
+                            self.peer_max_offset =
+                                self.peer_max_offset.max(desired_offset.as_u64());
+                            self.on_blocked_signal(desired_offset.as_u64());
+                        }
                         msg::Stream::Reset { error_code } => {
                             debug!(
                                 binding_id = self.stream_rx.binding_id().as_u64(),
@@ -909,6 +952,42 @@ impl Inner {
         let _ = self.send_reset_frame(error_code, ResetTarget::Both);
         let reset_error: Error = error_code.into();
         Poll::Ready(Err(io::Error::new(io::ErrorKind::InvalidData, reset_error)))
+    }
+
+    /// Maximum window-growth ratio: the most we can scale `window_size` before the resulting
+    /// acquire would exceed the pool's per-request ceiling. Clamping the *ratio* (not just the
+    /// byte target) is what makes the doubling terminate.
+    #[inline]
+    fn max_growth_ratio(&self) -> u32 {
+        let max_single = self.recv_credit_pool.max_single_acquire(self.priority);
+        let ratio = max_single / self.window_size.max(1);
+        (ratio as u32).max(1)
+    }
+
+    /// React to a blocked signal (in-band `blocked` bit or standalone `QueueDataBlocked`).
+    ///
+    /// Doubles the growth ratio only when the writer's `desired` offset outstrips what the current
+    /// ratio can advertise (`desired > cap`); a signal the current window already covers is a
+    /// no-op. The `acted_blocked_offset` watermark plus this `> cap` gate make
+    /// duplicate/reordered/retransmitted signals idempotent. The ratio is held until the stream
+    /// goes idle (never reset mid-stream) to avoid thrashing during steady-state streaming, where
+    /// the writer's hint structurally tops out near `current_max`.
+    fn on_blocked_signal(&mut self, desired: u64) {
+        let consumed = self.reassembler.consumed_len();
+        let cap = consumed.saturating_add(self.window_size.saturating_mul(self.growth_ratio as u64));
+        if desired > cap && desired > self.acted_blocked_offset {
+            self.acted_blocked_offset = desired;
+            let prev = self.growth_ratio;
+            self.growth_ratio = self.growth_ratio.saturating_mul(2).min(self.max_growth_ratio());
+            trace!(
+                binding_id = self.stream_rx.binding_id().as_u64(),
+                desired,
+                cap,
+                prev_growth_ratio = prev,
+                growth_ratio = self.growth_ratio,
+                "on_blocked_signal: growing window"
+            );
+        }
     }
 
     /// Decide whether to extend the advertised window and, if so, acquire the
@@ -981,14 +1060,31 @@ impl Inner {
         let current_max = self.remote_max_data.as_u64();
         let threshold = current_max.saturating_sub(self.window_size / 2);
 
-        if consumed < threshold {
+        // Target window: sized to the writer's hinted demand, capped by the (possibly grown) local
+        // window, and never below what we've already consumed. Before any hint arrives
+        // (`peer_max_offset == 0`) preserve the original fixed bootstrap window so server/client
+        // startup is unchanged.
+        let cap = consumed.saturating_add(self.window_size.saturating_mul(self.growth_ratio as u64));
+        let target_max_data = if self.peer_max_offset == 0 {
+            consumed.saturating_add(self.window_size)
+        } else {
+            self.peer_max_offset.max(consumed).min(cap)
+        };
+
+        // Trigger on hint-or-threshold: extend when the writer wants more room than we've
+        // advertised (`target > current_max`) OR consumption crossed the top-up threshold.
+        let wants_more = target_max_data > current_max;
+        if consumed < threshold && !wants_more {
             trace!(
                 binding_id = self.stream_rx.binding_id().as_u64(),
                 consumed,
                 current_max,
                 threshold,
+                target_max_data,
+                peer_max_offset = self.peer_max_offset,
+                growth_ratio = self.growth_ratio,
                 window_size = self.window_size,
-                "maybe_send_max_data: below threshold, not sending"
+                "maybe_send_max_data: below threshold and no new demand, not sending"
             );
             if prior_grant > 0 {
                 self.recv_credit_pool.release(prior_grant);
@@ -996,7 +1092,6 @@ impl Inner {
             return Ok(());
         }
 
-        let target_max_data = consumed + self.window_size;
         let delta = target_max_data.saturating_sub(current_max);
         if delta == 0 {
             if prior_grant > 0 {
@@ -1004,6 +1099,17 @@ impl Inner {
             }
             return Ok(());
         }
+
+        trace!(
+            binding_id = self.stream_rx.binding_id().as_u64(),
+            consumed,
+            current_max,
+            target_max_data,
+            delta,
+            peer_max_offset = self.peer_max_offset,
+            growth_ratio = self.growth_ratio,
+            "maybe_send_max_data: extending window"
+        );
 
         // Apply any grant the distributor already delivered toward the delta;
         // only ask the pool for the remainder. If the prior grant alone

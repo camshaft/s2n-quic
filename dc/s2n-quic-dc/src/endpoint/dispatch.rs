@@ -96,11 +96,13 @@ fn decrypt_fast_path(
         binding_id,
         msg_id,
         stream_offset,
+        largest_offset,
         message_size,
         chunk_size,
         chunk_index,
         is_fin,
         is_wakeup,
+        blocked,
         dest_acceptor_id,
         priority,
     } = header
@@ -192,12 +194,14 @@ fn decrypt_fast_path(
         binding_id,
         msg_id.as_u64(),
         stream_offset.as_u64(),
+        largest_offset.as_u64(),
         message_size.as_u64() as u32,
         chunk_size.as_u64() as u16,
         chunk_index.as_u64() as u32,
         decrypt_len as u32,
         is_fin,
         is_wakeup,
+        blocked,
         |ptr, len| {
             let dest = unsafe { bytes::buf::UninitSlice::from_raw_parts_mut(ptr, len as usize) };
             packet
@@ -593,17 +597,23 @@ fn dispatch_decoded_frame(
             queue_pair,
             binding_id,
             offset,
+            largest_offset,
             is_fin,
+            blocked,
             dest_acceptor_id,
             priority,
         } => {
+            // `largest_offset` is already reconstructed to absolute by decode.
+            let peer_max_offset = largest_offset.as_u64();
             if let Some(acceptor_id) = dest_acceptor_id {
                 handle_queue_data_init(
                     peer,
                     queue_pair,
                     binding_id,
                     offset,
+                    peer_max_offset,
                     is_fin,
+                    blocked,
                     acceptor_id,
                     payload,
                     acceptor_registry,
@@ -624,7 +634,9 @@ fn dispatch_decoded_frame(
                     queue_pair,
                     binding_id,
                     offset,
+                    peer_max_offset,
                     is_fin,
+                    blocked,
                     payload,
                     counters,
                     waker_sink,
@@ -714,14 +726,18 @@ fn dispatch_decoded_frame(
             binding_id,
             msg_id,
             stream_offset,
+            largest_offset,
             message_size,
             chunk_size,
             chunk_index,
             is_fin,
             is_wakeup,
+            blocked,
             dest_acceptor_id,
             priority,
         } => {
+            // `largest_offset` is already reconstructed to absolute by decode.
+            let peer_max_offset = largest_offset.as_u64();
             if let Some(acceptor_id) = dest_acceptor_id {
                 handle_queue_msg_init(
                     peer,
@@ -730,11 +746,13 @@ fn dispatch_decoded_frame(
                     acceptor_id,
                     msg_id,
                     stream_offset,
+                    peer_max_offset,
                     message_size,
                     chunk_size,
                     chunk_index,
                     is_fin,
                     is_wakeup,
+                    blocked,
                     payload,
                     acceptor_registry,
                     frame_tx,
@@ -755,11 +773,13 @@ fn dispatch_decoded_frame(
                     binding_id,
                     msg_id,
                     stream_offset,
+                    peer_max_offset,
                     message_size,
                     chunk_size,
                     chunk_index,
                     is_fin,
                     is_wakeup,
+                    blocked,
                     payload,
                     counters,
                     waker_sink,
@@ -768,6 +788,20 @@ fn dispatch_decoded_frame(
             }
         }
         Header::Ping => {}
+        Header::QueueDataBlocked {
+            queue_pair,
+            binding_id,
+            desired_offset,
+        } => {
+            handle_queue_data_blocked(
+                peer,
+                queue_pair,
+                binding_id,
+                desired_offset,
+                counters,
+                waker_sink,
+            );
+        }
     }
 }
 
@@ -846,12 +880,15 @@ impl Iterator for DeltaDecoder<'_> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_queue_data(
     peer: &mut recv::Context,
     queue_pair: QueuePair,
     binding_id: VarInt,
     offset: VarInt,
+    peer_max_offset: u64,
     is_fin: bool,
+    blocked: bool,
     buf: BytesMut,
     counters: &counters::Dispatch,
     waker_sink: &mut impl channel::UnboundedSender<AutoWake>,
@@ -861,7 +898,9 @@ fn handle_queue_data(
     let payload_len = buf.len();
     let entry = msg::Stream::Data {
         offset,
+        peer_max_offset: VarInt::new(peer_max_offset).unwrap_or(VarInt::MAX),
         fin: is_fin,
+        blocked,
         payload: buf,
     }
     .into();
@@ -934,17 +973,20 @@ fn handle_queue_data(
 
 // ── QueueMsg ──────────────────────────────────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 fn handle_queue_msg(
     peer: &mut recv::Context,
     queue_pair: QueuePair,
     binding_id: VarInt,
     msg_id: VarInt,
     stream_offset: VarInt,
+    peer_max_offset: u64,
     message_size: VarInt,
     chunk_size: VarInt,
     chunk_index: VarInt,
     is_fin: bool,
     is_wakeup: bool,
+    blocked: bool,
     payload: BytesMut,
     counters: &counters::Dispatch,
     waker_sink: &mut impl channel::UnboundedSender<AutoWake>,
@@ -958,12 +1000,14 @@ fn handle_queue_msg(
         binding_id,
         msg_id.as_u64(),
         stream_offset.as_u64(),
+        peer_max_offset,
         message_size.as_u64() as u32,
         chunk_size.as_u64() as u16,
         chunk_index.as_u64() as u32,
         payload_len,
         is_fin,
         is_wakeup,
+        blocked,
         |ptr, len| -> Result<(), ()> {
             unsafe {
                 core::ptr::copy_nonoverlapping(payload.as_ptr(), ptr, len as usize);
@@ -1017,11 +1061,13 @@ fn handle_queue_msg_init(
     acceptor_id: VarInt,
     msg_id: VarInt,
     stream_offset: VarInt,
+    peer_max_offset: u64,
     message_size: VarInt,
     chunk_size: VarInt,
     chunk_index: VarInt,
     is_fin: bool,
     is_wakeup: bool,
+    blocked: bool,
     payload: BytesMut,
     acceptor_registry: &mut acceptor::LocalRegistry<Stream>,
     frame_tx: &mut SubmissionSender,
@@ -1122,11 +1168,13 @@ fn handle_queue_msg_init(
         binding_id,
         msg_id,
         stream_offset,
+        peer_max_offset,
         message_size,
         chunk_size,
         chunk_index,
         is_fin,
         is_wakeup,
+        blocked,
         payload,
         counters,
         waker_sink,
@@ -1136,12 +1184,15 @@ fn handle_queue_msg_init(
 
 // ── QueueData Init ─────────────────────────────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 fn handle_queue_data_init(
     peer: &mut recv::Context,
     queue_pair: QueuePair,
     binding_id: VarInt,
     offset: VarInt,
+    peer_max_offset: u64,
     is_fin: bool,
+    blocked: bool,
     acceptor_id: VarInt,
     buf: BytesMut,
     acceptor_registry: &mut acceptor::LocalRegistry<Stream>,
@@ -1185,7 +1236,9 @@ fn handle_queue_data_init(
 
     let entry = msg::Stream::Data {
         offset,
+        peer_max_offset: VarInt::new(peer_max_offset).unwrap_or(VarInt::MAX),
         fin: is_fin,
+        blocked,
         payload: buf,
     }
     .into();
@@ -1407,6 +1460,53 @@ fn handle_queue_max_data(
                 binding_id = binding_id.as_u64(),
                 queue_id = local_queue_id.as_u64(),
                 "QueueMaxData dispatch error - dropping"
+            );
+        }
+    }
+}
+
+// ── QueueDataBlocked ───────────────────────────────────────────────────────
+
+/// Deliver a standalone writer-blocked signal to the reader.
+///
+/// Unlike `QueueMaxData` (reader→writer, routed via the control half), this is writer→reader and
+/// the reader drains only the stream half, so it rides the stream queue as `msg::Stream::Blocked`.
+/// `send_stream` returns an `AutoWake` so a reader parked in `poll_read_into` with no pending data
+/// is still woken to process the signal.
+fn handle_queue_data_blocked(
+    peer: &mut recv::Context,
+    queue_pair: QueuePair,
+    binding_id: VarInt,
+    desired_offset: VarInt,
+    counters: &counters::Dispatch,
+    waker_sink: &mut impl channel::UnboundedSender<AutoWake>,
+) {
+    let local_queue_id = queue_pair.dest_queue_id;
+    let entry = msg::Stream::Blocked { desired_offset }.into();
+
+    match peer
+        .queue_view
+        .send_stream(local_queue_id, binding_id, entry)
+    {
+        Ok((waker, release_bytes)) => {
+            let _ = waker_sink.send(waker);
+            // A blocked signal carries no payload, so there is nothing to release; assert the
+            // invariant rather than silently relying on it.
+            debug_assert_eq!(release_bytes, 0);
+            counters.rx_data_ok.add(1);
+            trace!(
+                binding_id = binding_id.as_u64(),
+                queue_id = local_queue_id.as_u64(),
+                desired_offset = desired_offset.as_u64(),
+                "QueueDataBlocked dispatched"
+            );
+        }
+        Err(_) => {
+            // Unallocated / half-closed / stale binding — the signal is advisory, so drop it.
+            trace!(
+                binding_id = binding_id.as_u64(),
+                queue_id = local_queue_id.as_u64(),
+                "QueueDataBlocked dispatch error - dropping"
             );
         }
     }

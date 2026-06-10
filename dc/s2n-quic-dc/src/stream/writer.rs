@@ -303,6 +303,11 @@ struct Inner {
     acceptor_id: VarInt,
     /// Next byte offset to send
     next_offset: VarInt,
+    /// Highest desired offset for which we have emitted a standalone `QueueDataBlocked` frame.
+    /// Guards against re-emitting an identical signal every poll; only a larger high watermark
+    /// (genuinely new demand) triggers a fresh standalone frame. The in-band `blocked` bit on
+    /// data frames needs no such guard since it rides a frame that is going out anyway.
+    last_blocked_offset: u64,
     /// Number of bytes currently in flight (not yet acknowledged)
     inflight_bytes: u64,
     /// Maximum number of bytes allowed in flight (local flow control)
@@ -405,6 +410,7 @@ impl Writer {
             dest_queue_id,
             acceptor_id,
             next_offset: VarInt::ZERO,
+            last_blocked_offset: 0,
             inflight_bytes: 0,
             max_inflight_bytes,
             initial_remote_max_data,
@@ -454,6 +460,7 @@ impl Writer {
             dest_queue_id,
             acceptor_id,
             next_offset: VarInt::ZERO,
+            last_blocked_offset: 0,
             inflight_bytes: 0,
             max_inflight_bytes,
             initial_remote_max_data,
@@ -1018,7 +1025,10 @@ impl Inner {
                 queue_pair: self.queue_pair(),
                 binding_id: self.control_rx.binding_id(),
                 offset: self.next_offset,
+                // FIN: no data beyond this point, and the delta is omitted on the wire.
+                largest_offset: self.next_offset,
                 is_fin: true,
+                blocked: false,
                 dest_acceptor_id: self.dest_acceptor_id(),
                 priority: self.wire_priority(),
             },
@@ -1253,13 +1263,21 @@ impl Inner {
     {
         let (payload, bytes_read, actual_fin) = self.prepare_early_data(buf, is_fin)?;
 
+        // Base offset is 0 for the init frame; the high watermark is what we just read plus
+        // whatever remains buffered. Init bypasses flow control (it bootstraps the binding), so
+        // we never mark it blocked, but the hint still seeds the reader's window sizing.
+        let largest_offset =
+            VarInt::new((bytes_read + buf.buffered_len()) as u64).unwrap_or(VarInt::MAX);
+
         let flow_credits = self.take_credits(payload.len());
         let frame = Frame {
             header: Header::QueueData {
                 queue_pair: self.queue_pair(),
                 binding_id: self.control_rx.binding_id(),
                 offset: VarInt::ZERO,
+                largest_offset,
                 is_fin: actual_fin,
+                blocked: false,
                 dest_acceptor_id: Some(self.acceptor_id),
                 priority: self.wire_priority(),
             },
@@ -1351,6 +1369,51 @@ impl Inner {
         self.flow_budget().min(self.pending_credits)
     }
 
+    /// Absolute high watermark of stream data the writer currently wants to send:
+    /// `next_offset + buffered_len`. Carried to the reader as the `largest_offset` hint so it can
+    /// right-size the receive window. Stable across a single send call.
+    #[inline]
+    fn high_watermark<S>(&self, buf: &S) -> u64
+    where
+        S: buffer::reader::storage::Infallible,
+    {
+        self.next_offset
+            .as_u64()
+            .saturating_add(buf.buffered_len() as u64)
+    }
+
+    /// Emit a standalone `QueueDataBlocked` frame for the cold case where the writer is fully
+    /// blocked with no data frame to carry the in-band `blocked` bit. Deduped on
+    /// `last_blocked_offset` so an identical signal is not re-sent every poll; loss is handled by
+    /// normal retransmission, and the reader self-dedups on the monotonic `desired_offset`.
+    fn send_data_blocked_frame(&mut self, desired_offset: u64) -> io::Result<()> {
+        if desired_offset <= self.last_blocked_offset {
+            return Ok(());
+        }
+        let frame = Frame {
+            header: Header::QueueDataBlocked {
+                queue_pair: self.queue_pair(),
+                binding_id: self.control_rx.binding_id(),
+                desired_offset: VarInt::new(desired_offset).unwrap_or(VarInt::MAX),
+            },
+            payload: ByteVec::new(),
+            path_secret_entry: self.path_secret_entry.clone(),
+            completion: Some(self.completion_rx.sender()),
+            status: frame::TransmissionStatus::default(),
+            ttl: DEFAULT_TTL,
+            enqueued_at: Some(self.clock.now()),
+            flow_credits: 0,
+        };
+        self.send_frame(frame)?;
+        self.last_blocked_offset = desired_offset;
+        trace!(
+            binding_id = self.control_rx.binding_id().as_u64(),
+            desired_offset,
+            "Sent QueueDataBlocked"
+        );
+        Ok(())
+    }
+
     /// Drain any delivered grant into `pending_credits`, then top up by `want` bytes from the pool
     /// if we don't already have enough. Returns `Pending` if either the slot is still parked from a
     /// prior poll or a fresh acquire just parked.
@@ -1432,6 +1495,14 @@ impl Inner {
         let mut need_fin_packet = is_fin && buf.buffer_is_empty();
         let mut frames = Queue::new();
 
+        // High watermark of stream data the writer currently wants to send. Stable across this
+        // call: `next_offset` advances exactly as `buffered_len` shrinks. `blocked` is true when
+        // the writer wants to go past the advertised remote window — the one limit the reader can
+        // relieve by extending MAX_DATA (local/congestion limits are not the reader's to fix).
+        let high_watermark = self.high_watermark(buf);
+        let largest_offset = VarInt::new(high_watermark).unwrap_or(VarInt::MAX);
+        let blocked = high_watermark > self.remote_max_data.as_u64();
+
         // Capture enqueue time once for all frames in this send batch so that
         // every frame shares the same reference point for sojourn measurement.
         let batch_enqueued_at = Some(self.clock.now());
@@ -1479,7 +1550,10 @@ impl Inner {
                     queue_pair: self.queue_pair(),
                     binding_id: self.control_rx.binding_id(),
                     offset,
+                    largest_offset,
                     is_fin: include_fin,
+                    // A FIN means we sent everything we have, so we are not blocked.
+                    blocked: blocked && !include_fin,
                     dest_acceptor_id: self.dest_acceptor_id(),
                     priority: self.wire_priority(),
                 },
@@ -1513,6 +1587,13 @@ impl Inner {
         }
 
         self.send_batch(frames)?;
+
+        // Cold case: the loop produced no data frame (window already exhausted) but the writer
+        // still has buffered data it wants to send. No frame carried the in-band `blocked` bit, so
+        // emit a standalone signal carrying the desired high watermark.
+        if blocked && written == 0 && !buf.buffer_is_empty() {
+            self.send_data_blocked_frame(high_watermark)?;
+        }
 
         Ok(written)
     }
@@ -1573,6 +1654,14 @@ impl Inner {
         let mut frames = Queue::new();
         let mut total_written = 0usize;
 
+        // High watermark of all data this call wants to send, stable across the segment loop.
+        // `blocked` is true when that watermark lies past the advertised remote window — the only
+        // limit the reader can relieve. Init (`force_first`) bypasses flow control, so it is never
+        // marked blocked even though the remote window may be zero during the handshake.
+        let high_watermark = self.high_watermark(buf);
+        let largest_offset = VarInt::new(high_watermark).unwrap_or(VarInt::MAX);
+        let blocked = !force_first && high_watermark > self.remote_max_data.as_u64();
+
         let mut is_first = true;
         while !buf.buffer_is_empty() {
             // Gate on remote window only — the receiver enforces this limit and
@@ -1595,9 +1684,15 @@ impl Inner {
                     .min(max_segment_size)
                     .min(self.initial_remote_max_data as usize)
             } else {
+                // Clamp by the credits actually held (`pending_credits`), not just the remote
+                // window. Credits were acquired via `flow_budget()` = min(local, remote); when the
+                // reader grows the remote window past our local send budget, sizing a segment by
+                // `remote_budget` alone would consume more credits than we hold and underflow
+                // `take_credits`. The remainder is sent on a later poll after re-acquiring.
                 buf.buffered_len()
                     .min(max_segment_size)
                     .min((remote_budget as usize).max(chunk_size as usize))
+                    .min((self.pending_credits as usize).max(chunk_size as usize))
             };
 
             let is_resuming = self.pending_chunk_index > 0;
@@ -1654,11 +1749,16 @@ impl Inner {
                         binding_id: self.control_rx.binding_id(),
                         msg_id: VarInt::new(msg_id).unwrap_or(VarInt::MAX),
                         stream_offset,
+                        largest_offset,
                         message_size: VarInt::new(segment_size as u64).unwrap_or(VarInt::MAX),
                         chunk_size: VarInt::new(chunk_size as u64).unwrap_or(VarInt::MAX),
                         chunk_index: VarInt::new(chunk_index as u64).unwrap_or(VarInt::MAX),
                         is_fin: segment_is_fin,
                         is_wakeup,
+                        // A FIN segment sent everything; otherwise carry the call-level blocked
+                        // state. The reader dedups on the desired offset, so repeating the bit
+                        // across a segment's chunks is harmless.
+                        blocked: blocked && !segment_is_fin,
                         dest_acceptor_id: self.dest_acceptor_id(),
                         priority: self.wire_priority(),
                     },
@@ -1731,6 +1831,13 @@ impl Inner {
 
         if !frames.is_empty() {
             self.send_batch(frames)?;
+        }
+
+        // Cold case: the segment loop produced no frame (remote window exhausted before the first
+        // segment) but data remains. No frame carried the in-band `blocked` bit, so emit a
+        // standalone signal. (When frames were produced they already carry the bit.)
+        if blocked && total_written == 0 && !buf.buffer_is_empty() {
+            self.send_data_blocked_frame(high_watermark)?;
         }
 
         Ok(total_written)

@@ -1908,11 +1908,14 @@ fn server_write_msg_blocks_when_remote_budget_zero() {
         writer.0.remote_max_data = VarInt::ZERO;
 
         async move {
-            // No frame should arrive while budget is zero.
+            // No data frame should arrive while budget is zero.
             let early = pusher.recv_frames_timeout(Duration::from_millis(100)).await;
             assert!(
-                early.is_none(),
-                "expected no frame while remote flow budget is zero"
+                early
+                    .iter()
+                    .flat_map(|q| q.iter())
+                    .all(|f| matches!(f.header, Header::QueueDataBlocked { .. })),
+                "expected no data frame while remote flow budget is zero"
             );
 
             // Grant budget; the blocked write_msg should now complete.
@@ -1972,9 +1975,15 @@ fn server_write_msg_unblocks_after_max_data() {
         writer.0.remote_max_data = VarInt::ZERO;
 
         async move {
-            // First wait confirms nothing arrives while budget is 0.
-            let no_frames = pusher.recv_frames_timeout(Duration::from_millis(100)).await;
-            assert!(no_frames.is_none(), "no frame expected before MAX_DATA");
+            // While budget is 0 no data frame arrives (only possibly a QueueDataBlocked signal).
+            let early = pusher.recv_frames_timeout(Duration::from_millis(100)).await;
+            assert!(
+                early
+                    .iter()
+                    .flat_map(|q| q.iter())
+                    .all(|f| matches!(f.header, Header::QueueDataBlocked { .. })),
+                "no data frame expected before MAX_DATA"
+            );
 
             pusher.push_max_data(VarInt::from_u16(8192));
 
