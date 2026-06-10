@@ -782,12 +782,10 @@ fn server_write_from_fin_blocks_while_budget_exhausted_then_sends_single_fin_fra
             ));
             assert_eq!(data[0].payload, &b"a"[..]);
             assert!(
-                first
-                    .iter()
-                    .all(|f| matches!(
-                        f.header,
-                        Header::QueueData { .. } | Header::QueueDataBlocked { .. }
-                    )),
+                first.iter().all(|f| matches!(
+                    f.header,
+                    Header::QueueData { .. } | Header::QueueDataBlocked { .. }
+                )),
                 "only data or blocked frames expected in the first burst"
             );
 
@@ -1625,9 +1623,7 @@ fn server_send_pool_caps_local_write() {
         }
         .spawn();
 
-        let (mut writer, mut pusher) = PairBuilder::server()
-            .with_credit_pool(pool.clone())
-            .build();
+        let (mut writer, mut pusher) = PairBuilder::server().with_credit_pool(pool.clone()).build();
 
         let pool_for_pusher = pool.clone();
         async move {
@@ -2603,8 +2599,7 @@ fn write_msg_resume_does_not_underflow_credits_when_pool_cap_below_chunk() {
             probe.0.msg_packet_size as u64
         };
         let pool = crate::sync::Arc::new(crate::credit::Pool::new(
-            crate::credit::Config::new(2 * 1024 * 1024)
-                .with_max_single_acquire_uniform(chunk_size),
+            crate::credit::Config::new(2 * 1024 * 1024).with_max_single_acquire_uniform(chunk_size),
         ));
         let (mut writer, mut pusher) = PairBuilder::default()
             .with_credit_pool(pool.clone())

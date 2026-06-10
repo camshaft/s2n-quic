@@ -222,7 +222,10 @@ fn server_advertises_initial_window_against_drained_pool() {
 
         async move {
             let mut buf = BytesMut::with_capacity(64);
-            let n = reader.read_into(&mut buf).await.expect("server read failed");
+            let n = reader
+                .read_into(&mut buf)
+                .await
+                .expect("server read failed");
             assert_eq!(n, b"hello server".len());
             assert_eq!(&buf[..], b"hello server");
             1.s().sleep().await;
@@ -894,8 +897,7 @@ fn max_data_send_failure_does_not_release_unbacked_window() {
 
         // Server reader: remote_max_data = 0, unbacked_remaining = window_size.
         let window_size = 1024 * 1024u64;
-        let (mut reader, pusher) =
-            make_server_pair_with_pool_and_initial_window(pool, window_size);
+        let (mut reader, pusher) = make_server_pair_with_pool_and_initial_window(pool, window_size);
         assert_eq!(reader.0.window_size, window_size);
         assert_eq!(reader.0.remote_max_data.as_u64(), 0);
 
