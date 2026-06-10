@@ -1320,4 +1320,49 @@ mod tests {
              should_wake to evaluate as true for the new binding's messages."
         );
     }
+
+    /// Regression: `observe_offset` releases recv-pool credit for every new
+    /// byte beyond the unbacked initial window, with no ceiling tied to the reader's *advertised*
+    /// receive window. The reader only ever acquires pool credit up to what it advertises (it grows
+    /// `remote_max_data` from the pool), so a peer that delivers data past the advertised window
+    /// makes the dispatch side release credit that was never acquired — silently inflating the
+    /// shared pool above `capacity` and defeating receive-side backpressure.
+    ///
+    /// The bootstrap case is the most reachable: a server slot binds with `initial_window_remaining
+    /// = 0` (the unbacked window is consumed up front, or the slot is bound with a zero initial
+    /// window), so every arriving byte is treated as pool-backed and released — yet the reader has
+    /// advertised nothing and acquired nothing.
+    ///
+    /// This unit test pins the missing clamp: with a zero initial window, `observe_offset(N)`
+    /// returns the full `N` unconditionally. There is no advertised-ceiling parameter for it to
+    /// clamp against. Once the fix plumbs the advertised window into the slot, `observe_offset`
+    /// must cap its release at what the reader actually acquired (this assertion then changes to
+    /// expect the clamped value).
+    #[test]
+    #[ignore = "TODO"]
+    fn observe_offset_releases_beyond_advertised_window() {
+        let mut state = StreamState {
+            msg_table: None,
+            flush_watermark: 0,
+            max_received_offset: 0,
+            // No unbacked initial window: model the post-bootstrap / zero-initial-window slot where
+            // every byte is accounted as pool-backed.
+            initial_window_remaining: 0,
+            recv_finished: false,
+        };
+
+        // The reader has advertised (and therefore acquired) only 10 bytes of pool credit. A peer
+        // that overshoots to 1000 bytes should not cause more than 10 bytes to be released — but
+        // `observe_offset` has no notion of the advertised ceiling and returns the full 1000.
+        let advertised = 10u64;
+        let released = state.observe_offset(1000);
+
+        assert!(
+            released <= advertised,
+            "observe_offset released {released} bytes of pool credit but the reader only \
+             advertised/acquired {advertised}; the {} byte excess is phantom credit injected \
+             into the shared pool",
+            released - advertised,
+        );
+    }
 }

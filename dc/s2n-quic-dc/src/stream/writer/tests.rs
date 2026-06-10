@@ -2575,6 +2575,121 @@ fn client_write_msg_partial_segment_resume_must_use_queue_msg_not_queue_data() {
     });
 }
 
+/// Regression: resuming a partial QueueMsg segment must never `take_credits` more than the
+/// writer currently holds.
+///
+/// The init path (`force_first`) sends only chunk 0 of its first segment, leaving a multi-chunk
+/// pending segment. On resume the two segment-level credit guards in `send_msg`
+/// (segment-fits-in-remote-budget and pending_credits >= chunk_size) are both skipped because
+/// `is_resuming` is true, and the inner chunk loop calls `take_credits(chunk_len)` for each
+/// remaining chunk. A single pool acquire only tops `pending_credits` up by `max_single_acquire`,
+/// so when the pending segment spans more bytes than one acquire delivers, the loop drains the
+/// held credit below one chunk and the next `take_credits` underflows (debug panic; release builds
+/// silently stamp a too-small `flow_credits`, corrupting the receiver's flow accounting).
+///
+/// This is the residual of the production `Config::new(2 MiB)` regression: even once the
+/// per-acquire cap is floored at one chunk (so the writer makes forward progress), a segment
+/// larger than the cap still needs several acquires, and the resume loop must re-check held credit
+/// per chunk. Here the cap is pinned to exactly one chunk so each poll sends exactly one chunk —
+/// liveness is preserved while the multi-acquire underflow is exercised.
+#[test]
+fn write_msg_resume_does_not_underflow_credits_when_pool_cap_below_chunk() {
+    sim(|| {
+        // Build the pair first so we can read the negotiated chunk size, then pin the pool's
+        // per-acquire cap to exactly one chunk: a single acquire delivers one chunk's worth of
+        // credit, so a multi-chunk resume segment requires several acquires.
+        let chunk_size = {
+            let (probe, _) = PairBuilder::default().build();
+            probe.0.msg_packet_size as u64
+        };
+        let pool = crate::sync::Arc::new(crate::credit::Pool::new(
+            crate::credit::Config::new(2 * 1024 * 1024)
+                .with_max_single_acquire_uniform(chunk_size),
+        ));
+        let (mut writer, mut pusher) = PairBuilder::default()
+            .with_credit_pool(pool.clone())
+            .build();
+        assert_eq!(
+            pool.max_single_acquire(crate::credit::Priority::default()),
+            writer.0.msg_packet_size as u64,
+            "test precondition: per-acquire cap is one chunk, so a multi-chunk segment needs \
+             several acquires and the resume loop must re-check held credit per chunk"
+        );
+
+        // Distributor folds released/parked credit back into the pool and wakes the parked writer
+        // so the resume poll actually runs.
+        let dist = crate::credit::Distributor::new(pool.clone());
+        async move {
+            use crate::socket::channel::Budget;
+            dist.distribute(Budget::new(1 << 20), TestWakerSink).await;
+        }
+        .spawn();
+
+        // Several full chunks in one segment: init (force_first) sends only chunk 0 and parks the
+        // rest as a pending segment that spans multiple chunks. Resuming it requires more credit
+        // than one acquire delivers, so the writer sends one chunk per poll and re-acquires
+        // between chunks. Before the per-chunk guard, the resume loop kept taking full chunks past
+        // the credit it held and underflowed `take_credits`.
+        let chunk_bytes = writer.0.msg_packet_size as usize;
+        let payload_len = 4 * chunk_bytes;
+        let pool_for_pusher = pool.clone();
+
+        async move {
+            // Init bootstrap batch (chunk 0) — drain it and release its credits to simulate
+            // admission, then grant a large remote window so the writer confirms (InitSent→Open)
+            // and the resume is gated only by held credit, not the remote budget.
+            let init = pusher.recv_frames().await;
+            let mut total_payload: usize = init.iter().map(|f| f.payload.len()).sum();
+            pool_for_pusher.release(sum_flow_credits(&init));
+            pusher.push_max_data(VarInt::from_u32(1 << 20));
+
+            // Drain the remaining chunks batch-by-batch, releasing each batch's credits to simulate
+            // the assembler admitting them. Each release lets the distributor grant the next
+            // chunk's worth of credit (the cap is one chunk), waking the parked writer. Loop until
+            // the whole message has been received.
+            while total_payload < payload_len {
+                let batch = pusher
+                    .recv_frames_timeout(Duration::from_secs(5))
+                    .await
+                    .expect("writer should keep making progress, one chunk per acquire");
+                for frame in batch.iter() {
+                    total_payload += frame.payload.len();
+                    // Every chunk must carry credits equal to its payload — never a value
+                    // truncated by a saturating underflow.
+                    assert_eq!(
+                        frame.flow_credits,
+                        frame.payload.len() as u64,
+                        "each chunk must carry credits equal to its payload size"
+                    );
+                }
+                pool_for_pusher.release(sum_flow_credits(&batch));
+            }
+            assert_eq!(
+                total_payload, payload_len,
+                "all payload bytes must be transmitted across the resumed chunks"
+            );
+        }
+        .primary()
+        .spawn();
+
+        async move {
+            let mut payload = Data::new(payload_len as u64);
+            writer
+                .write_msg(
+                    &mut payload,
+                    MsgFlags {
+                        is_fin: true,
+                        is_wakeup: true,
+                    },
+                )
+                .await
+                .expect("write_msg should succeed without credit underflow");
+        }
+        .primary()
+        .spawn();
+    });
+}
+
 /// write_msg with FIN on a large multi-segment payload marks FIN only on the
 /// last chunk of the last segment, not on intermediate segments.
 ///

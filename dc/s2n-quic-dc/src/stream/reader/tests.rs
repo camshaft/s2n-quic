@@ -866,6 +866,94 @@ fn recv_credit_conserved_across_stream_lifecycle() {
     });
 }
 
+/// Regression (review finding H1): when a server reader's first/confirming MAX_DATA fails to send,
+/// the credit it "returns" to the pool must not include the *unbacked* initial window, which was
+/// never acquired from the pool.
+///
+/// A server reader starts with `remote_max_data = 0` and `unbacked_remaining = window_size`. Its
+/// first consumption funds the confirming MAX_DATA extension entirely from `unbacked_remaining`
+/// (no pool draw). If `send_max_data_frame` then fails (frame channel closed during teardown),
+/// `maybe_send_max_data`'s error path runs `recv_credit_pool.release(granted)` — but `granted`
+/// here is pure unbacked credit. Releasing it injects phantom credit into the shared pool,
+/// permanently inflating it above `capacity` and breaking conservation (`available + returned`
+/// must equal `capacity` with no parked waiters), which defeats receive-side backpressure for
+/// every stream sharing the pool.
+///
+/// Pre-fix: `available + returned` exceeds `capacity` by the unbacked amount. The fix releases
+/// only the pool-backed portion (`granted - from_unbacked`) and restores `unbacked_remaining`.
+#[test]
+fn max_data_send_failure_does_not_release_unbacked_window() {
+    sim(|| {
+        // Full, untouched pool: any genuine acquire takes the fast path. We assert the pool is
+        // never inflated above this capacity by the failed-send path.
+        let capacity = 8 * 1024 * 1024u64;
+        let pool = crate::sync::Arc::new(crate::credit::Pool::new(
+            crate::credit::Config::new(capacity).with_max_single_acquire_uniform(capacity),
+        ));
+        let assert_pool = pool.clone();
+
+        // Server reader: remote_max_data = 0, unbacked_remaining = window_size.
+        let window_size = 1024 * 1024u64;
+        let (mut reader, pusher) =
+            make_server_pair_with_pool_and_initial_window(pool, window_size);
+        assert_eq!(reader.0.window_size, window_size);
+        assert_eq!(reader.0.remote_max_data.as_u64(), 0);
+
+        // Replace the frame receiver with a fresh disconnected one so the reader's `frame_tx`
+        // returns BrokenPipe when it tries to send the confirming MAX_DATA — modeling endpoint /
+        // submission-task teardown while the stream future is still polled.
+        let Pusher {
+            dispatcher,
+            queue_id,
+            binding_id,
+            frame_rx: _closed,
+            frame_storage,
+            recv_credit_pool,
+        } = pusher;
+        let mut pusher = Pusher {
+            dispatcher,
+            queue_id,
+            binding_id,
+            frame_rx: frame::submission_channel(1).1,
+            frame_storage,
+            recv_credit_pool,
+        };
+
+        async move {
+            // Small amount of data, well within the unbacked initial window: the reader's first
+            // consume funds the confirming MAX_DATA entirely from `unbacked_remaining`.
+            pusher.push_data(0, b"hello server", false);
+            1.s().sleep().await;
+        }
+        .primary()
+        .spawn();
+
+        async move {
+            let mut buf = BytesMut::with_capacity(64);
+            // The confirming MAX_DATA send fails on the closed channel → BrokenPipe surfaces.
+            let err = reader
+                .read_into(&mut buf)
+                .await
+                .expect_err("expected BrokenPipe when frame channel is closed");
+            assert_eq!(err.kind(), std::io::ErrorKind::BrokenPipe);
+            drop(reader);
+            bach::task::yield_now().await;
+
+            let available = assert_pool.debug_available();
+            let returned = assert_pool.debug_returned();
+            assert_eq!(
+                available + returned as i64,
+                capacity as i64,
+                "pool inflated by phantom credit: available({available}) + returned({returned}) \
+                 != capacity({capacity}); the failed MAX_DATA send released the unbacked initial \
+                 window, which was never acquired from the pool",
+            );
+        }
+        .primary()
+        .spawn();
+    });
+}
+
 /// Right-sizing: a client reader bootstraps with a full `window_size` already advertised. When the
 /// writer's hint says it wants to send less than that standing window, consuming past the top-up
 /// threshold must NOT emit a MAX_DATA — there is no point advertising beyond what the writer wants.

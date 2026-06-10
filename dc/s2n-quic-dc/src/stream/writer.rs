@@ -1739,6 +1739,20 @@ impl Inner {
                 segment_size - (start_chunk_index as usize * chunk_size as usize).min(segment_size);
             while segment_remaining > 0 {
                 let chunk_len = (chunk_size as usize).min(segment_remaining);
+
+                // Stop if the credit we currently hold can't cover this chunk. The non-resume
+                // entry guards this at the segment level (the `pending_credits < chunk_size` break
+                // above), but a resuming segment skips those guards and a single pool acquire only
+                // tops up by `max_single_acquire` — which may cover fewer chunks than the segment
+                // has. Re-checking per chunk keeps `take_credits` from underflowing; the remaining
+                // chunks fall through to the partial-segment save below and resume after the outer
+                // poll loop re-acquires. Liveness depends on `max_single_acquire >= chunk_size` so
+                // at least one chunk is sent per poll (otherwise this would break at chunk 0 with
+                // no forward progress).
+                if (self.pending_credits as usize) < chunk_len {
+                    break;
+                }
+
                 let mut payload = ByteVec::new();
                 let mut writer = payload.with_write_limit(chunk_len);
                 buf.infallible_copy_into(&mut writer);

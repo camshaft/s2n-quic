@@ -1198,9 +1198,17 @@ impl Inner {
         // control credits the peer may stall, so it is better to surface
         // the failure immediately.
         if let Err(err) = self.send_max_data_frame(new_max_data) {
-            // Frame submission failed — return the credits we just acquired
-            // so the pool's accounting stays balanced.
-            self.recv_credit_pool.release(granted);
+            // Frame submission failed — undo the credit we collected for this
+            // extension so accounting stays balanced. Only `granted -
+            // from_unbacked` came from the pool (prior grant + fresh acquire);
+            // `from_unbacked` was drawn from `unbacked_remaining`, never the
+            // pool, so releasing it would inject phantom pool credit. Return
+            // the unbacked portion to its own budget instead so it is not lost.
+            let pool_backed = granted - from_unbacked;
+            if pool_backed > 0 {
+                self.recv_credit_pool.release(pool_backed);
+            }
+            self.unbacked_remaining += from_unbacked;
             return Err(err);
         }
         self.remote_max_data = new_max_data;
