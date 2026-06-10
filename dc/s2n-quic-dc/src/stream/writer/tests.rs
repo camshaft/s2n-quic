@@ -1608,30 +1608,44 @@ fn client_write_after_shutdown_returns_broken_pipe() {
     });
 }
 
-/// Local inflight budget (max_inflight_bytes) caps how much data the writer
-/// can send before completions free up space.
+/// The endpoint send credit pool is the sole local send bound: with a pool that holds only 3
+/// bytes, the writer sends 3 bytes and then blocks until the simulated admit path releases those
+/// credits back to the pool, at which point it can send more.
 #[test]
-fn server_local_inflight_budget_blocks_write() {
+fn server_send_pool_caps_local_write() {
     sim(|| {
-        let (mut writer, mut pusher) = make_server_pair();
-        writer.0.max_inflight_bytes = 3;
+        const CAPACITY: u64 = 3;
+        let pool = test_credit_pool(CAPACITY);
 
+        // Distributor folds released credits back into `available` and wakes the parked writer.
+        let dist = crate::credit::Distributor::new(pool.clone());
+        async move {
+            use crate::socket::channel::Budget;
+            dist.distribute(Budget::new(1 << 20), TestWakerSink).await;
+        }
+        .spawn();
+
+        let (mut writer, mut pusher) = PairBuilder::server()
+            .with_credit_pool(pool.clone())
+            .build();
+
+        let pool_for_pusher = pool.clone();
         async move {
             let first = pusher.recv_frames().await;
             pusher.assembler.push_queue_data(&first);
             pusher.assembler.assert_payload(b"abc");
 
-            // Writer is blocked — no more frames
+            // Writer is blocked — the pool is drained and nothing has been admitted yet.
             let extra = pusher.recv_frames_timeout(Duration::from_millis(100)).await;
             assert!(
                 extra.is_none(),
-                "writer should block when local inflight budget is exhausted"
+                "writer should block when the send pool is exhausted"
             );
 
-            // Free up budget via completions
-            pusher.complete_all(first, frame::TransmissionStatus::Acknowledged);
+            // Simulate the assembler admitting the first batch: release its credits back to the
+            // pool. This wakes the parked writer.
+            pool_for_pusher.release(sum_flow_credits(&first));
 
-            // Writer unblocks and sends more data
             let second = pusher.recv_frames().await;
             pusher.assembler.push_queue_data(&second);
             pusher.assembler.assert_payload(b"abcdef");
@@ -1642,10 +1656,10 @@ fn server_local_inflight_budget_blocks_write() {
         async move {
             let mut payload = Bytes::from_static(b"abcdef");
             let first = writer.write_from(&mut payload).await.expect("first write");
-            assert_eq!(first, 3, "capped by local inflight budget");
+            assert_eq!(first, 3, "capped by the send pool capacity");
 
             let second = writer.write_from(&mut payload).await.expect("second write");
-            assert_eq!(second, 3, "freed budget allows more data");
+            assert_eq!(second, 3, "released credits allow more data");
         }
         .primary()
         .spawn();

@@ -29,13 +29,6 @@
 
 // TODOs:
 //
-// Flow control:
-//
-// * Auto-tune max_inflight_bytes based on completion queue delivery rate. Currently using a
-//   fixed budget. If completions arrive quickly, grow the budget to keep the pipe full. If
-//   slow, shrink to avoid buffering data that doesn't contribute to throughput. Similar in
-//   spirit to recv_budget in the existing streams.
-//
 // Performance:
 //
 // * Pace out frame transmissions at 1us interval — right now we're passing `None` for
@@ -308,10 +301,9 @@ struct Inner {
     /// (genuinely new demand) triggers a fresh standalone frame. The in-band `blocked` bit on
     /// data frames needs no such guard since it rides a frame that is going out anyway.
     last_blocked_offset: u64,
-    /// Number of bytes currently in flight (not yet acknowledged)
+    /// Number of bytes currently in flight (not yet acknowledged). Tracked for observability; the
+    /// local send rate is bounded by the endpoint send credit pool, not a per-stream inflight cap.
     inflight_bytes: u64,
-    /// Maximum number of bytes allowed in flight (local flow control)
-    max_inflight_bytes: u64,
     /// The peer's initial receive window from handshake params. Used to cap the
     /// init segment so the message completes as soon as the server grants credits.
     initial_remote_max_data: u64,
@@ -391,7 +383,6 @@ impl Writer {
         let mtu = parameters.max_datagram_size();
         let packet_size = mtu.saturating_sub(MAX_QUEUE_DATA_HEADER_OVERHEAD);
         let msg_packet_size = mtu.saturating_sub(MAX_QUEUE_MSG_HEADER_OVERHEAD);
-        let max_inflight_bytes = parameters.local_send_max_data.as_u64();
         let initial_remote_max_data = parameters.remote_max_data.as_u64();
         let remote_max_data = VarInt::ZERO;
 
@@ -412,7 +403,6 @@ impl Writer {
             next_offset: VarInt::ZERO,
             last_blocked_offset: 0,
             inflight_bytes: 0,
-            max_inflight_bytes,
             initial_remote_max_data,
             remote_max_data,
             status: Status::Init,
@@ -442,7 +432,6 @@ impl Writer {
         let mtu = parameters.max_datagram_size();
         let packet_size = mtu.saturating_sub(MAX_QUEUE_DATA_HEADER_OVERHEAD);
         let msg_packet_size = mtu.saturating_sub(MAX_QUEUE_MSG_HEADER_OVERHEAD);
-        let max_inflight_bytes = parameters.local_send_max_data.as_u64();
         let initial_remote_max_data = parameters.remote_max_data.as_u64();
 
         Self(WriterAllocPtr::new(Inner {
@@ -462,7 +451,6 @@ impl Writer {
             next_offset: VarInt::ZERO,
             last_blocked_offset: 0,
             inflight_bytes: 0,
-            max_inflight_bytes,
             initial_remote_max_data,
             remote_max_data: VarInt::new(initial_remote_max_data).unwrap_or(VarInt::MAX),
             status: Status::Open,
@@ -1363,13 +1351,12 @@ impl Inner {
     /// Used to compute how much credit we *want* to acquire from the pool. The credit clamp is
     /// applied separately by `min_send_budget`.
     fn flow_budget(&self) -> u64 {
-        let local_available = self.max_inflight_bytes.saturating_sub(self.inflight_bytes);
-        let remote_available = self
-            .remote_max_data
+        // The peer's advertised receive window is the only flow-control bound here; the local
+        // send rate is governed by the endpoint send credit pool (acquired in
+        // `poll_acquire_credits` and clamped by `min_send_budget`), not a per-stream inflight cap.
+        self.remote_max_data
             .as_u64()
-            .saturating_sub(self.next_offset.as_u64());
-
-        local_available.min(remote_available)
+            .saturating_sub(self.next_offset.as_u64())
     }
 
     /// Effective send budget for the current poll: the flow-control window further clamped by the
