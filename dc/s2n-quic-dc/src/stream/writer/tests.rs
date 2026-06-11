@@ -2880,6 +2880,8 @@ fn test_credit_pool(capacity: u64) -> crate::sync::Arc<crate::credit::Pool> {
     crate::sync::Arc::new(crate::credit::Pool::new(crate::credit::Config {
         capacity,
         max_single_acquire: [capacity; crate::credit::Priority::LEVELS],
+        // Floor == cap so a single acquire can drain the whole pool (no fair-share split).
+        min_grant_slice: [capacity; crate::credit::Priority::LEVELS],
     }))
 }
 

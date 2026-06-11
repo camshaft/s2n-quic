@@ -414,7 +414,9 @@ impl Slot {
         let chunk_start =
             stream_offset.saturating_add((chunk_index as u64).saturating_mul(chunk_size as u64));
         let chunk_end = chunk_start.saturating_add(payload_len as u64);
-        let release_bytes = stream.extra.observe_offset(chunk_end, self.advertised_window());
+        let release_bytes = stream
+            .extra
+            .observe_offset(chunk_end, self.advertised_window());
 
         let local_queue = {
             let watermark = stream.extra.flush_watermark;

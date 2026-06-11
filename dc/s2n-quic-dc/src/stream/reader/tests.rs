@@ -184,6 +184,7 @@ fn server_advertises_initial_window_against_drained_pool() {
         let cfg = crate::credit::Config {
             capacity: 0,
             max_single_acquire: [u64::MAX; crate::credit::Priority::LEVELS],
+            min_grant_slice: [u64::MAX; crate::credit::Priority::LEVELS],
         };
         let pool = crate::sync::Arc::new(crate::credit::Pool::new(cfg));
         // Hold a distributor so the pool stays open (drop would close it and change the path).
@@ -981,8 +982,7 @@ fn dispatch_release_clamped_to_advertised_window_on_bootstrap_overshoot() {
         // unbacked initial window equals `window_size` — the production invariant. The reader
         // publishes that window as the dispatch ceiling at construction.
         let window_size = 1024 * 1024u64;
-        let (reader, mut pusher) =
-            make_server_pair_with_pool_and_initial_window(pool, window_size);
+        let (reader, mut pusher) = make_server_pair_with_pool_and_initial_window(pool, window_size);
         assert_eq!(reader.0.remote_max_data.as_u64(), 0);
         assert_eq!(reader.0.window_size, window_size);
 
@@ -1679,6 +1679,7 @@ fn maybe_send_max_data_re_polls_without_double_parking() {
         let cfg = crate::credit::Config {
             capacity: 0,
             max_single_acquire: [u64::MAX; crate::credit::Priority::LEVELS],
+            min_grant_slice: [u64::MAX; crate::credit::Priority::LEVELS],
         };
         let pool = crate::sync::Arc::new(crate::credit::Pool::new(cfg));
         // Keep a distributor alive (so the pool stays open) but never

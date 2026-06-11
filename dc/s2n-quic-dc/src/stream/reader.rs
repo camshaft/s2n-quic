@@ -1118,13 +1118,6 @@ impl Inner {
         // window, and never below what we've already consumed. Before any hint arrives
         // (`peer_max_offset == 0`) preserve the original fixed bootstrap window so server/client
         // startup is unchanged.
-        //
-        // `cap` is the runway we are willing to advertise speculatively. It is `window_size` scaled
-        // by `growth_ratio`, which ramps up while the writer keeps signaling it is blocked (see
-        // `on_blocked_signal`) — that runway is what lets a small-chunk streamer get room ahead of
-        // its hint and stop emitting a blocked frame per chunk. `min(cap)` keeps us from
-        // over-advertising past that runway; the `peer_max_offset` term keeps us from advertising
-        // past what the writer actually wants (the FIN boundary).
         let cap =
             consumed.saturating_add(self.window_size.saturating_mul(self.growth_ratio as u64));
         let target_max_data = if self.peer_max_offset == 0 {
@@ -1133,8 +1126,8 @@ impl Inner {
             self.peer_max_offset.max(consumed).min(cap)
         };
 
-        // Trigger on hint-or-threshold: extend when the writer wants more room than we've
-        // advertised (`target > current_max`) OR consumption crossed the top-up threshold.
+        // Trigger on hint-or-threshold: extend when the writer wants more room than we've advertised
+        // (`target > current_max`) OR consumption crossed the top-up threshold.
         let wants_more = target_max_data > current_max;
         if consumed < threshold && !wants_more {
             trace!(

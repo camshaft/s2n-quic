@@ -134,6 +134,8 @@ fn park_races_distributor_no_overcommit() {
         let pool = Arc::new(Pool::new(Config {
             capacity: 0,
             max_single_acquire: [100; Priority::LEVELS],
+            // Floor == cap: full grants, so these concurrency-invariant tests are unaffected by slicing.
+            min_grant_slice: [100; Priority::LEVELS],
         }));
 
         // Park a waiter wanting CAP → available = -CAP, parked_demand = CAP.
@@ -225,6 +227,8 @@ fn release_wakes_parked_waiter() {
         let pool = Arc::new(Pool::new(Config {
             capacity: 0,
             max_single_acquire: [100; Priority::LEVELS],
+            // Floor == cap: full grants, so these concurrency-invariant tests are unaffected by slicing.
+            min_grant_slice: [100; Priority::LEVELS],
         }));
 
         let slot = alloc_slot();
@@ -263,6 +267,8 @@ fn concurrent_releases_accumulate() {
         let pool = Arc::new(Pool::new(Config {
             capacity: 0,
             max_single_acquire: [100; Priority::LEVELS],
+            // Floor == cap: full grants, so these concurrency-invariant tests are unaffected by slicing.
+            min_grant_slice: [100; Priority::LEVELS],
         }));
 
         let slot = alloc_slot();
@@ -308,6 +314,8 @@ fn budget_exhaustion_conservation() {
         let pool = Arc::new(Pool::new(Config {
             capacity: 0,
             max_single_acquire: [100; Priority::LEVELS],
+            // Floor == cap: full grants, so these concurrency-invariant tests are unaffected by slicing.
+            min_grant_slice: [100; Priority::LEVELS],
         }));
 
         let s1 = alloc_slot();
@@ -360,6 +368,8 @@ fn distributor_drop_races_release() {
         let pool = Arc::new(Pool::new(Config {
             capacity: 0,
             max_single_acquire: [100; Priority::LEVELS],
+            // Floor == cap: full grants, so these concurrency-invariant tests are unaffected by slicing.
+            min_grant_slice: [100; Priority::LEVELS],
         }));
 
         let slot = alloc_slot();
@@ -411,6 +421,8 @@ fn distributor_drop_races_poll_acquire() {
         let pool = Arc::new(Pool::new(Config {
             capacity: 0,
             max_single_acquire: [100; Priority::LEVELS],
+            // Floor == cap: full grants, so these concurrency-invariant tests are unaffected by slicing.
+            min_grant_slice: [100; Priority::LEVELS],
         }));
 
         let dist = Distributor::new(pool.clone());
@@ -455,6 +467,8 @@ fn newcomer_cannot_snipe() {
         let pool = Arc::new(Pool::new(Config {
             capacity: 0,
             max_single_acquire: [100; Priority::LEVELS],
+            // Floor == cap: full grants, so these concurrency-invariant tests are unaffected by slicing.
+            min_grant_slice: [100; Priority::LEVELS],
         }));
 
         // Pre-park a waiter requesting 10 → available = -10.
@@ -525,6 +539,8 @@ fn grant_races_abandon_reads_exact_granted() {
         let pool = Arc::new(Pool::new(Config {
             capacity: CAP,
             max_single_acquire: [100; Priority::LEVELS],
+            // Floor == cap: full grants, so these concurrency-invariant tests are unaffected by slicing.
+            min_grant_slice: [100; Priority::LEVELS],
         }));
 
         // Drain capacity with a throwaway fast-path acquire so the next acquire is forced to park.
