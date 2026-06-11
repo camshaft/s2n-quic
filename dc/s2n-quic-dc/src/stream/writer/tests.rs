@@ -551,7 +551,7 @@ fn write_msg_large_payload_uses_multiple_msg_segments() {
 /// actually advertises and enforces (`local_recv_max_data`), regardless of the larger
 /// connection-level `remote_max_data`.
 ///
-/// Production split (`change flow configs`, ba1433cd): `remote_max_data` (the connection-level data
+/// Production split: `remote_max_data` (the connection-level data
 /// window, ~8 MiB) and `local_recv_max_data` (the per-stream recv window, 64 KiB) diverged. But
 /// `Writer::new_server` seeds its initial flow-control budget from `parameters.remote_max_data` and
 /// starts in `Open`, so the server writer believes it may send the full 8 MiB immediately — before
@@ -3211,6 +3211,163 @@ fn parked_writer_drop_transfers_ownership_to_pool() {
             // `drop_writer_alloc`. The test's success criterion is "no leak/panic at drop"; the
             // bach runtime tears down cleanly because the distributor handles the dead slot.
             drop(writer);
+        }
+        .primary()
+        .spawn();
+    });
+}
+
+/// Dropping a writer that is parked on a credit acquire while still **holding** unconsumed
+/// `pending_credits` must release that credit back to the pool. This is the leak regression for
+/// `drop_writer_alloc`: that path runs only on the LINKED→DEAD abandon branch (writer dropped while
+/// parked), where the pool — not the app — frees the allocation, so it is the only place the held
+/// remainder can be returned.
+///
+/// Construction: the per-acquire cap is one chunk **plus a sub-chunk remainder**. The msg path
+/// frames the one whole chunk it can, leaving the remainder in `pending_credits`; since the
+/// remainder is below one chunk (`msg_progress_floor`), the resume loop re-acquires for the rest and
+/// parks — while still holding the remainder. Dropping there exercises the leak path. The test
+/// asserts the pool's `available` returns to the full capacity once the distributor reaps the dead
+/// slot; before the fix the remainder stayed permanently debited.
+#[test]
+fn parked_writer_drop_releases_held_pending_credits() {
+    let _no_snap = crate::testing::without_snapshots();
+    sim(|| {
+        let chunk_size = {
+            let (probe, _) = PairBuilder::default().build();
+            probe.0.msg_packet_size as u64
+        };
+        // Per-acquire cap = one chunk + a sub-chunk remainder. Each acquire delivers
+        // `chunk + remainder` credit; the msg path frames the one whole chunk, leaving `remainder`
+        // in `pending_credits`. Because `remainder < chunk` (the msg progress floor), the resume
+        // re-acquires for the next chunk — and with the pool drained that acquire parks while the
+        // writer is still holding `remainder`. That is the state the leak fix must clean up.
+        let remainder = chunk_size / 2;
+        let per_acquire = chunk_size + remainder;
+        // Capacity == one acquire's worth: a single acquire drains the pool, so the very next
+        // acquire parks. Small enough that even after the pusher admits the emitted chunk, the
+        // freed credit (`chunk`) is below the parked acquire's need (`chunk + remainder`), so the
+        // writer stays parked rather than being re-granted.
+        let capacity = per_acquire;
+        let pool = crate::sync::Arc::new(crate::credit::Pool::new(crate::credit::Config {
+            capacity,
+            max_single_acquire: [per_acquire; crate::credit::Priority::LEVELS],
+            min_grant_slice: [per_acquire; crate::credit::Priority::LEVELS],
+        }));
+        let (mut writer, mut pusher) = PairBuilder::default()
+            .with_credit_pool(pool.clone())
+            .build();
+
+        let dist = crate::credit::Distributor::new(pool.clone());
+        async move {
+            use crate::socket::channel::Budget;
+            dist.distribute(Budget::new(1 << 20), TestWakerSink).await;
+        }
+        .spawn();
+
+        // Multi-chunk message so the writer must acquire more than once: the init sends chunk 0 and
+        // parks the rest as a pending multi-chunk segment that the resume loop drives.
+        let chunk_bytes = writer.0.msg_packet_size as usize;
+        let payload_len = 4 * chunk_bytes;
+
+        let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        // ── Pusher: collect emitted credit, but release it only AFTER the drop ──
+        // Holding releases until after the drop serves two purposes:
+        //   1. The pool stays drained, so the writer parks early (holding its sub-chunk remainder)
+        //      instead of being continuously re-granted.
+        //   2. The single post-drop release is what wakes the distributor, so its next pass reaps
+        //      the now-dead slot (recovering the parked acquire's bytes) AND runs `drop_writer_alloc`
+        //      (which must release the held remainder). Without a post-drop wake the dead slot is
+        //      never reaped and the pool can't reach quiescence.
+        // Once quiescent, `available == capacity` iff the held remainder was released; a leak leaves
+        // it short by exactly `remainder`.
+        let pool_for_pusher = pool.clone();
+        let dropped_pusher = dropped.clone();
+        async move {
+            let init = pusher.recv_frames().await;
+            let mut held = sum_flow_credits(&init);
+            pusher.push_max_data(VarInt::from_u32(1 << 20));
+
+            // Accumulate every emitted frame's credit without releasing, until the writer is dropped.
+            while !dropped_pusher.load(std::sync::atomic::Ordering::Relaxed) {
+                if let Some(batch) = pusher.recv_frames_timeout(Duration::from_millis(1)).await {
+                    held += sum_flow_credits(&batch);
+                }
+                bach::task::yield_now().await;
+            }
+            // Drain anything emitted right before the drop, then release everything at once. This
+            // release wakes the distributor to reap the dead slot and fold all returned credit back.
+            if let Some(batch) = pusher.recv_frames_timeout(Duration::from_millis(1)).await {
+                held += sum_flow_credits(&batch);
+            }
+            pool_for_pusher.release(held);
+        }
+        .primary()
+        .spawn();
+
+        let pool_for_assert = pool.clone();
+        async move {
+            // Drive the write until it confirms, frames the chunk it can afford, and parks holding
+            // the sub-chunk remainder.
+            let mut payload = Data::new(payload_len as u64);
+            for _ in 0..16 {
+                let done = core::future::poll_fn(|cx| {
+                    let slot = writer.0.slot_ptr();
+                    match writer.0.poll_write_msg(
+                        cx,
+                        slot,
+                        &mut payload,
+                        MsgFlags {
+                            is_fin: true,
+                            is_wakeup: true,
+                        },
+                    ) {
+                        Poll::Ready(r) => {
+                            r.expect("write_msg poll failed");
+                            Poll::Ready(true)
+                        }
+                        Poll::Pending => Poll::Ready(false),
+                    }
+                })
+                .await;
+                if done {
+                    break;
+                }
+                bach::task::yield_now().await;
+            }
+
+            // Precondition: the writer is parked (slot LINKED) and still holds credit. If either is
+            // false the test isn't exercising the leak path.
+            assert!(
+                writer.0.pending_credits > 0,
+                "test precondition: writer must be holding unconsumed credit at drop, got 0"
+            );
+            let slot = writer.0.slot_ptr();
+            assert!(
+                unsafe { slot.as_ref() }.is_linked(),
+                "test precondition: writer's slot must be parked (LINKED) at drop"
+            );
+
+            // Drop while parked & holding credit → LINKED→DEAD abandon → the distributor reaps the
+            // dead slot via `drop_writer_alloc`, which must release the held remainder.
+            drop(writer);
+            dropped.store(true, std::sync::atomic::Ordering::Relaxed);
+
+            // Let the pusher observe the drop, release all its held credit (waking the distributor),
+            // and the distributor reap the dead slot and fold all returned credit back into
+            // `available`. The pusher polls on a 1ms `recv_frames_timeout`, so advance real
+            // simulated time (not zero-time `yield_now`) to let that timeout elapse and the release
+            // + reap run to quiescence.
+            bach::time::sleep(Duration::from_millis(50)).await;
+
+            assert_eq!(
+                pool_for_assert.debug_available(),
+                capacity as i64,
+                "pool must fully recover after a parked writer holding credit is dropped; \
+                 a short result means the held pending_credits leaked \
+                 (regression in drop_writer_alloc)"
+            );
         }
         .primary()
         .spawn();

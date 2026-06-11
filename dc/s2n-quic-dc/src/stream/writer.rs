@@ -258,6 +258,18 @@ unsafe fn drop_writer_alloc(ptr: NonNull<crate::credit::Slot>) {
     // `assert_slot_at_offset_zero!`), so the cast points back to the original
     // allocation. The pool guarantees this is called exactly once.
     let ptr = ptr.cast::<WriterAlloc>();
+    // Release any credit the writer was still holding. This path runs when the writer was dropped
+    // while its slot was LINKED (the `AbandonResult::Abandoned` branch in `WriterAllocPtr::drop`),
+    // so the pool's dead-slot walk — not the app — frees the allocation. The app branch releases
+    // `pending_credits` itself; here the app is already gone, so we must release it on the pool's
+    // behalf or the budget bleeds (one sub-chunk remainder per writer abandoned mid-acquire). The
+    // slot is DEAD (refcount=0, pool-owned and popped from every list), so reading `Inner` is sound
+    // — no concurrent access remains. `release` only stages into `returned` and wakes the
+    // distributor, both safe to call from inside the distributor's own end-of-poll dead-slot drain.
+    let inner = &(*ptr.as_ptr()).inner;
+    if inner.pending_credits > 0 {
+        inner.send_credit_pool.release(inner.pending_credits);
+    }
     std::ptr::drop_in_place(&raw mut (*ptr.as_ptr()).inner);
     alloc::dealloc(ptr.as_ptr().cast(), Layout::new::<WriterAlloc>());
 }
@@ -773,7 +785,10 @@ impl Inner {
         } else {
             self.flow_budget().min(buf.buffered_len() as u64)
         };
-        match unsafe { self.poll_acquire_credits(cx, slot, want) } {
+        // The msg path frames a full chunk at a time, so one chunk is the smallest credit that
+        // lets `send_msg` make progress; `poll_acquire_credits` caps it by `want` for a sub-chunk
+        // tail.
+        match unsafe { self.poll_acquire_credits(cx, slot, want, self.msg_progress_floor()) } {
             Poll::Ready(Ok(())) => {}
             Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
             Poll::Pending => return Poll::Pending,
@@ -843,7 +858,7 @@ impl Inner {
             self.poll_completions(cx)?;
             let _ = self.poll_remote_budget(cx)?;
             let want = self.flow_budget().min(buf.buffered_len() as u64);
-            match unsafe { self.poll_acquire_credits(cx, slot, want) } {
+            match unsafe { self.poll_acquire_credits(cx, slot, want, self.msg_progress_floor()) } {
                 Poll::Ready(Ok(())) => {}
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                 Poll::Pending => return Poll::Pending,
@@ -851,6 +866,18 @@ impl Inner {
         }
 
         Poll::Pending
+    }
+
+    /// Smallest credit that lets the QueueMsg path frame one chunk. When a partial segment is
+    /// pending the chunk size is fixed at `pending_chunk_size` (the receiver expects that size for
+    /// the rest of the segment); otherwise a fresh segment uses the full `msg_packet_size`.
+    #[inline]
+    fn msg_progress_floor(&self) -> u64 {
+        if self.pending_chunk_index > 0 {
+            self.pending_chunk_size as u64
+        } else {
+            self.msg_packet_size as u64
+        }
     }
 
     #[inline(always)]
@@ -900,7 +927,9 @@ impl Inner {
         } else {
             self.flow_budget().min(buf.buffered_len() as u64)
         };
-        match unsafe { self.poll_acquire_credits(cx, slot, want) } {
+        // The byte-stream path frames whatever credit it holds (clamped per-frame by
+        // `min_send_budget`), so a single byte is enough forward progress.
+        match unsafe { self.poll_acquire_credits(cx, slot, want, 1) } {
             Poll::Ready(Ok(())) => {}
             Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
             Poll::Pending => return Poll::Pending,
@@ -1448,6 +1477,7 @@ impl Inner {
         cx: &mut Context,
         slot: NonNull<crate::credit::Slot>,
         want: u64,
+        min_progress: u64,
     ) -> Poll<io::Result<()>> {
         // Drain any grant the distributor delivered while we were away.
         let slot_ref = unsafe { slot.as_ref() };
@@ -1470,10 +1500,29 @@ impl Inner {
             }
         }
 
-        if self.pending_credits >= want || want == 0 {
+        // We need only enough credit to emit one frame's worth of forward progress, not the whole
+        // `want` window. `min_progress` is that floor: 1 byte for the byte-stream path (any credit
+        // lets `send_data` emit a frame, clamped by `min_send_budget`) and one full chunk for the
+        // QueueMsg path (a chunk is the smallest unit `send_msg` can frame). Capped by `want` so a
+        // tail smaller than a chunk doesn't demand more than the window holds.
+        //
+        // Returning as soon as we hold `target` — rather than blocking for the full `want` — is
+        // what avoids the send-pool wedge: under contention the fair-share distributor hands out a
+        // partial `min_grant_slice` grant and wakes us. If we re-parked for the remainder without
+        // first sending (and eventually releasing) the slice we already hold, every contending
+        // writer would pin a sub-`want` slice, nothing would be sent, nothing released, and the
+        // pool would deadlock. Partials below `target` stay accumulated on `pending_credits` and we
+        // re-acquire for the rest; a partial we can't yet use still leaves us parked (Pending), so
+        // the wake stays registered. The leftover `pending_credits` is released on drop.
+        let target = min_progress.min(want);
+        if self.pending_credits >= target || want == 0 {
             return Poll::Ready(Ok(()));
         }
 
+        // We hold less than one frame's worth. Acquire the rest of `want` (the pool clamps to
+        // `max_single_acquire`, which is configured >= one chunk, so a successful acquire always
+        // lifts us to at least `target`); either the fast path satisfies it and we return `Ready`,
+        // or we park until the distributor grants a slice.
         let need = want - self.pending_credits;
         // SAFETY: caller's invariants: `slot` is this writer's idle slot.
         match unsafe {

@@ -31,7 +31,7 @@
 
 use crate::{
     credit::Config as CreditConfig,
-    stream::endpoint::testing::sim::{Client, SimEndpointConfig},
+    stream::endpoint::testing::sim::{Client, Server, SimEndpointConfig},
     testing::{ext::*, sim},
     tracing::*,
 };
@@ -226,6 +226,117 @@ fn run_fair_share(
         writers_done.load(Ordering::Relaxed),
         readers_done.load(Ordering::Relaxed),
     )
+}
+
+/// Mirror of [`run_fair_share`] but contending the client-side **send** credit pool instead of the
+/// server recv pool. The server gets a large recv pool (so the writer is never gated by the
+/// advertised window) and the client gets an undersized send pool sized to `(send_cap,
+/// max_single_acquire)`. This isolates the writer's local send-credit acquire/release loop — the
+/// exact path dc-tester exercises with its production-sized send pool.
+fn run_send_fair_share(
+    num_streams: usize,
+    body_len: u64,
+    send_cap: u64,
+    max_single_acquire: u64,
+) -> (usize, usize) {
+    let acceptor_id = VarInt::from_u8(1);
+
+    let writers_done = Arc::new(AtomicUsize::new(0));
+    let readers_done = Arc::new(AtomicUsize::new(0));
+
+    let writers_done_cl = writers_done.clone();
+    let readers_done_sv = readers_done.clone();
+
+    sim(|| {
+        // ── Server: large recv pool, read-only ─────────────────────────────────
+        // The server reader must never be the bottleneck — give it a big recv pool so the only
+        // contention in the system is the client's send pool.
+        {
+            let readers_done_sv = readers_done_sv.clone();
+            async move {
+                let server = Server::new();
+                let mut acceptor = server
+                    .register_acceptor_channel(acceptor_id, num_streams * 2)
+                    .expect("acceptor registration failed");
+
+                let mut idx = 0usize;
+                while let Some(stream) = acceptor.recv().await {
+                    let readers_done_sv = readers_done_sv.clone();
+                    let stream_idx = idx;
+                    idx += 1;
+                    async move {
+                        let (mut reader, _writer) = stream.into_split();
+                        drain_reader(&mut reader, body_len, stream_idx).await;
+                        readers_done_sv.fetch_add(1, Ordering::Relaxed);
+                    }
+                    .primary()
+                    .spawn();
+                }
+            }
+            .group("server")
+            .spawn();
+        }
+
+        // ── Client: undersized send pool, open all streams, upload concurrently ─
+        {
+            async move {
+                let send_pool_config =
+                    CreditConfig::new(send_cap).with_max_single_acquire_uniform(max_single_acquire);
+                let mut client = Client::with_config(
+                    SimEndpointConfig::default().send_credit_pool_config(send_pool_config),
+                );
+
+                let mut streams = Vec::with_capacity(num_streams);
+                for _ in 0..num_streams {
+                    let stream = client
+                        .connect("server:0", acceptor_id)
+                        .await
+                        .expect("connect failed");
+                    streams.push(stream);
+                }
+
+                for (i, stream) in streams.into_iter().enumerate() {
+                    let writers_done_cl = writers_done_cl.clone();
+                    async move {
+                        let (_reader, mut writer) = stream.into_split();
+                        drive_writer(&mut writer, body_len, i).await;
+                        writers_done_cl.fetch_add(1, Ordering::Relaxed);
+                    }
+                    .primary()
+                    .spawn();
+                }
+            }
+            .group("client")
+            .primary()
+            .spawn();
+        }
+    });
+
+    (
+        writers_done.load(Ordering::Relaxed),
+        readers_done.load(Ordering::Relaxed),
+    )
+}
+
+/// Reproduction of the dc-tester send-pool wedge: many concurrent writers share an undersized send
+/// credit pool. With the production sizing (2 MiB capacity, 256 KiB per-acquire cap) and a 64 KiB
+/// fair-share `min_grant_slice`, each writer asks for its full flow-control window, gets a partial
+/// 64 KiB grant from the distributor, but `poll_acquire_credits` refuses to return until it has the
+/// *whole* `want` — so it re-parks without sending the slice it holds. Every writer pins a slice
+/// below its want, nothing is sent, nothing is released, and the pool wedges. If the writer is fixed
+/// to send whatever partial credit it gets, every writer makes forward progress and completes.
+#[test]
+fn send_fair_share_partial_grants_no_stragglers() {
+    let _no_snap = crate::testing::without_snapshots();
+    let _no_trace = crate::testing::without_tracing();
+
+    // 64 streams, 2 MiB each. 2 MiB send pool, 256 KiB per-acquire cap — production dc-tester
+    // sizing. 64 streams * (>=64 KiB pinned each) overcommits the 2 MiB pool.
+    let (writers, readers) = run_send_fair_share(64, 2 * 1024 * 1024, 2 * 1024 * 1024, 256 * 1024);
+
+    info!(writers, readers, "send_fair_share result");
+    assert_eq!(writers, 64, "all 64 writers must complete");
+    assert_eq!(readers, 64, "all 64 readers must complete");
 }
 
 /// Smoke test: a handful of streams against a pool that comfortably fits a couple of windows.
