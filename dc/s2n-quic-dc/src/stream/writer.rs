@@ -825,9 +825,17 @@ impl Inner {
                 return Poll::Pending;
             }
 
+            // Per-frame budget exhausted by send_msg's chunk loop (or a prior call). Break out
+            // and let the coop gate yield on the next poll — avoiding a double-yield (a
+            // self-wake here plus another from the gate).
+            //
+            // Break-safe: send_msg's partial-segment state (`pending_chunk_index` /
+            // `pending_segment_size` / `pending_chunk_size` / `pending_stream_offset`) and
+            // `next_msg_id` already carry mid-message resume, and `next_offset` /
+            // `inflight_bytes` account for everything that went out. `buf` is the caller's
+            // buffer — what's left in it is exactly what the next poll will continue with.
             if !self.coop.consume() {
-                cx.waker().wake_by_ref();
-                return Poll::Pending;
+                break;
             }
 
             // Refresh budget: drain completions, process MAX_DATA, and top up credits before
@@ -841,6 +849,8 @@ impl Inner {
                 Poll::Pending => return Poll::Pending,
             }
         }
+
+        Poll::Pending
     }
 
     #[inline(always)]
@@ -1519,6 +1529,25 @@ impl Inner {
                 break;
             }
 
+            // Per-frame coop accounting. Stop emitting frames when the budget is drained.
+            //
+            // Break-safe:
+            //   - Frames already produced this call sit in the local `frames` queue and will
+            //     flush via the unchanged `self.send_batch(frames)?` below the loop.
+            //   - `next_offset` / `inflight_bytes` advance per frame via `advance_offset`, so
+            //     the next poll re-derives `high_watermark`/`largest_offset`/`blocked` correctly
+            //     against the new offset.
+            //   - The remaining bytes are still in `buf` (the caller's storage); we never
+            //     consumed past what we framed.
+            //   - `need_fin_packet` covers the FIN-on-empty-buffer case. Because the coop gate
+            //     guarantees `budget >= 1` on entry to the body (it self-yields and refills when
+            //     exhausted), the first iteration always passes this check, so a pure-FIN call
+            //     always emits the FIN frame on this poll. Mid-stream, a budget-deferred FIN
+            //     produces one poll later — no loss.
+            if !self.coop.consume() {
+                break;
+            }
+
             let remaining_offset_capacity = self.remaining_offset_capacity();
             if !need_fin_packet && remaining_offset_capacity == 0 {
                 if written == 0 {
@@ -1750,6 +1779,26 @@ impl Inner {
             while segment_remaining > 0 {
                 let chunk_len = (chunk_size as usize).min(segment_remaining);
 
+                // Per-frame coop accounting.
+                //
+                // Break-safe: the partial-segment save below (`pending_chunk_index` /
+                // `pending_segment_size` / `pending_chunk_size` / `pending_stream_offset`) is
+                // the exact same machinery the credit-bounded break (`pending_credits <
+                // chunk_len`, immediately below) relies on. The post-loop block sees
+                // `segment_remaining > 0`, persists the resume cursor, calls
+                // `advance_offset(bytes_sent)` for the chunks already framed, and breaks the
+                // outer segment loop. `next_msg_id` is only bumped on segment completion, so
+                // resuming chunks share the same msg_id. Nothing was consumed from `buf` past
+                // what we framed.
+                //
+                // Edge case: breaking on the very first chunk of a fresh segment leaves
+                // `pending_chunk_index == 0` (read elsewhere as "no resume"). That's
+                // identical to the credit-bounded break at the segment-level entry above, and
+                // produces a fresh segment next poll — same data, same offsets, no loss.
+                if !self.coop.consume() {
+                    break;
+                }
+
                 // Stop if the credit we currently hold can't cover this chunk. The non-resume
                 // entry guards this at the segment level (the `pending_credits < chunk_size` break
                 // above), but a resuming segment skips those guards and a single pool acquire only
@@ -1821,12 +1870,18 @@ impl Inner {
                 self.pending_chunk_size = chunk_size;
                 self.pending_stream_offset = stream_offset;
 
-                self.metrics
-                    .tx_msg_segment_size
-                    .record_value(segment_size as u64);
-                self.metrics
-                    .tx_msg_chunks_per_segment
-                    .record_value(chunks_sent as u64);
+                // Skip the histogram record when no chunk went out this call (e.g. the coop
+                // budget or credit ran out exactly at the segment boundary). Recording a
+                // 0-chunk "segment" would pollute the per-segment distribution with a phantom
+                // empty segment; the resuming call records the segment once it actually emits.
+                if chunks_sent > 0 {
+                    self.metrics
+                        .tx_msg_segment_size
+                        .record_value(segment_size as u64);
+                    self.metrics
+                        .tx_msg_chunks_per_segment
+                        .record_value(chunks_sent as u64);
+                }
 
                 self.advance_offset(bytes_sent)?;
                 total_written += bytes_sent;

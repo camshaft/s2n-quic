@@ -575,6 +575,95 @@ fn out_of_order_reassembly() {
     });
 }
 
+/// Per-frame coop budget: a batch larger than `BUDGET` frames must drain across multiple polls,
+/// in order, with the unprocessed remainder stashed in `pending_rx` between polls. Each frame is a
+/// distinct 1-byte payload at a contiguous offset so reassembly order is observable, and the total
+/// exceeds `BUDGET` so at least one budget break occurs.
+#[test]
+fn pending_rx_drains_across_polls_in_order() {
+    // >BUDGET single-byte frames emit hundreds of repetitive per-frame trace lines; snapshotting
+    // that is unreasonably large and adds no regression signal beyond the explicit assertions.
+    let _guard = crate::testing::without_snapshots();
+    sim(|| {
+        let (mut reader, mut pusher) = make_pair();
+        let budget = crate::stream::coop::BUDGET as u64;
+        // One more than two full budgets, so we span at least three polls.
+        let total = budget * 2 + 1;
+
+        async move {
+            // Push every frame up front as a single backlog, then FIN. A single `poll_swap` will
+            // hand the reader the whole batch; the per-frame budget forces it to stash the tail.
+            for offset in 0..total {
+                pusher.push_data(offset, b"x", false);
+            }
+            pusher.push_data(total, b"", true); // FIN at the end
+        }
+        .primary()
+        .spawn();
+
+        async move {
+            let mut buf = BytesMut::with_capacity((total + 1) as usize);
+            let outcome = reader.read_to_end(&mut buf).await.expect("read failed");
+            assert_eq!(outcome, ReadToEnd::Complete(total as usize));
+            // Every byte arrived, in order, exactly once.
+            assert_eq!(buf.len(), total as usize);
+            assert!(buf.iter().all(|&b| b == b'x'));
+            // The backlog fully drained: nothing left stashed.
+            assert!(reader.0.pending_rx.is_empty());
+        }
+        .primary()
+        .spawn();
+    });
+}
+
+/// A reset stashed behind the budget boundary (i.e. left in `pending_rx` after a budget break)
+/// must still be observed: the data ahead of it is delivered first, then the reset surfaces on a
+/// later poll. This exercises the drain-`pending_rx`-before-`poll_swap` path.
+#[test]
+fn stashed_reset_after_budget_is_observed() {
+    // >BUDGET frames → unreasonably large snapshot; rely on the explicit assertions instead.
+    let _guard = crate::testing::without_snapshots();
+    sim(|| {
+        let (mut reader, mut pusher) = make_pair();
+        let budget = crate::stream::coop::BUDGET as u64;
+        // Enough data to overflow one budget, followed by a reset that lands behind the boundary.
+        let total = budget + 10;
+
+        async move {
+            for offset in 0..total {
+                pusher.push_data(offset, b"y", false);
+            }
+            pusher.push_reset(VarInt::from_u8(7));
+        }
+        .primary()
+        .spawn();
+
+        async move {
+            let mut buf = BytesMut::with_capacity((total + 1) as usize);
+            loop {
+                match reader.read_into(&mut buf).await {
+                    Ok(0) => panic!("unexpected clean EOF, expected reset"),
+                    // A read that drains buffered data in the same poll the Reset is processed
+                    // returns the data via `buf` and then surfaces the error on that same call
+                    // (the reassembler is empty so the error is not deferred), so count delivered
+                    // bytes from `buf`, not the `Ok` returns.
+                    Ok(_) => {}
+                    Err(e) => {
+                        assert_eq!(e.kind(), std::io::ErrorKind::ConnectionReset);
+                        break;
+                    }
+                }
+            }
+            // All data ahead of the reset landed in the buffer before the reset surfaced.
+            assert_eq!(buf.len(), total as usize);
+            assert!(buf.iter().all(|&b| b == b'y'));
+            assert!(reader.0.status.is_reset());
+        }
+        .primary()
+        .spawn();
+    });
+}
+
 /// A reset terminates a read with `ConnectionReset`.
 #[test]
 fn reset_terminates_read() {
@@ -1413,6 +1502,53 @@ fn drop_before_fin_sends_stop_sending() {
             let mut buf = BytesMut::with_capacity(64);
             let _ = reader.read_into(&mut buf).await;
             drop(reader); // no FIN received → Drop sends STOP_SENDING
+        }
+        .primary()
+        .spawn();
+    });
+}
+
+/// A Reset stashed in `pending_rx` behind the budget boundary must still suppress the drop-time
+/// STOP_SENDING. The app does exactly one read — which delivers `BUDGET` data frames and stashes
+/// the remainder (more data + the Reset) — then drops the reader without reading again. The drop
+/// path scans `pending_rx`, sees the Reset, and must NOT emit STOP_SENDING to the (already
+/// resetting) peer.
+#[test]
+fn drop_with_reset_in_pending_rx_suppresses_stop_sending() {
+    // >BUDGET frames → unreasonably large snapshot; rely on the explicit assertions instead.
+    let _guard = crate::testing::without_snapshots();
+    sim(|| {
+        let (mut reader, mut pusher) = make_pair();
+        let budget = crate::stream::coop::BUDGET as u64;
+        // More than one budget of data so a single read leaves a non-empty `pending_rx`, with the
+        // Reset stashed behind the boundary.
+        let total = budget + 5;
+
+        async move {
+            for offset in 0..total {
+                pusher.push_data(offset, b"z", false);
+            }
+            pusher.push_reset(VarInt::from_u8(9));
+            // No STOP_SENDING must arrive: the reader saw the stashed Reset on drop.
+            let frames = pusher.recv_frames_timeout(1.s()).await;
+            assert!(
+                frames.is_none(),
+                "no STOP_SENDING should be emitted when a Reset was stashed in pending_rx"
+            );
+        }
+        .primary()
+        .spawn();
+
+        async move {
+            let mut buf = BytesMut::with_capacity((total + 1) as usize);
+            // Exactly one read: delivers BUDGET frames, stashes the rest (incl. the Reset).
+            let n = reader.read_into(&mut buf).await.expect("first read failed");
+            assert!(n > 0, "first read should deliver data");
+            assert!(
+                !reader.0.pending_rx.is_empty(),
+                "remainder (incl. Reset) must be stashed after one budget-bounded read"
+            );
+            drop(reader); // drain_pending_reset must find the stashed Reset → no STOP_SENDING
         }
         .primary()
         .spawn();

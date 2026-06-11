@@ -24,7 +24,7 @@ use s2n_quic_core::{endpoint, stream::testing::Data, varint::VarInt};
 use std::{
     net::SocketAddr,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc,
     },
     task::Poll,
@@ -293,6 +293,28 @@ impl Pusher {
         }
     }
 
+    /// Accumulate frames across multiple `recv_frames` batches until a FIN-bearing frame is
+    /// observed, returning the combined queue in wire order.
+    ///
+    /// Per-frame cooperative yielding (`stream/coop.rs`) can split a single large `write_msg`
+    /// across several polls, so its frames arrive in more than one `poll_swap` batch. Tests that
+    /// assert on the *entire* message (e.g. "exactly one FIN", "all chunks present") must drain
+    /// until the FIN rather than inspecting just the first batch.
+    async fn recv_frames_until_fin(&mut self) -> intrusive::Queue<Frame> {
+        let mut combined = intrusive::Queue::default();
+        loop {
+            let mut batch = self.recv_frames().await;
+            let saw_fin = batch.iter().any(|frame| match frame.header {
+                Header::QueueMsg { is_fin, .. } | Header::QueueData { is_fin, .. } => is_fin,
+                _ => false,
+            });
+            combined.append(&mut batch);
+            if saw_fin {
+                return combined;
+            }
+        }
+    }
+
     fn complete_all(
         &mut self,
         mut frames: intrusive::Queue<Frame>,
@@ -413,65 +435,74 @@ fn write_msg_large_payload_uses_multiple_msg_segments() {
         let payload_len = first_segment_size + second_segment_size;
 
         async move {
-            let frames = pusher.recv_frames().await;
+            let frames = pusher.recv_frames_until_fin().await;
             assert!(!frames.is_empty(), "expected QueueMsg frames");
 
+            // The first segment must be a full `MAX_CHUNKS` QueueMsg segment at offset 0 carrying
+            // no FIN — that is the "splits into multiple segments" invariant this test guards.
+            //
+            // The remaining bytes after the first segment may be framed either as a second
+            // QueueMsg segment OR, when per-frame coop yielding defers the small tail to a fresh
+            // poll where it fits the QueueData fast path, as QueueData. Either is correct, so for
+            // the tail we only assert reassembly and FIN placement.
             let mut first_msg_id = None::<u64>;
-            let mut second_msg_id = None::<u64>;
             let mut first_next_chunk = 0u64;
-            let mut second_next_chunk = 0u64;
             let mut first_chunk_count = 0usize;
-            let mut second_chunk_count = 0usize;
-            let mut first_fin_seen = false;
-            let mut second_segment_has_non_fin_frame = false;
+            let mut fin_count = 0usize;
+            let mut last_was_fin = false;
+            let mut in_tail = false;
             let mut expected = Data::new(payload_len as u64);
 
             for frame in frames.iter() {
-                let (msg_id, stream_offset, message_size, frame_chunk_size, chunk_index, is_fin) =
-                    match frame.header {
-                        Header::QueueMsg {
-                            msg_id,
-                            stream_offset,
-                            message_size,
-                            chunk_size,
-                            chunk_index,
-                            is_fin,
-                            ..
-                        } => (
-                            msg_id.as_u64(),
-                            stream_offset.as_u64(),
-                            message_size.as_u64(),
-                            chunk_size.as_u64(),
-                            chunk_index.as_u64(),
-                            is_fin,
-                        ),
-                        _ => panic!("expected QueueMsg frame, got {:?}", frame.header),
-                    };
+                assert!(
+                    !last_was_fin,
+                    "no frame may follow the FIN: {:?}",
+                    frame.header
+                );
 
-                if first_msg_id.is_none() {
-                    first_msg_id = Some(msg_id);
-                }
-
-                if Some(msg_id) == first_msg_id {
-                    assert_eq!(stream_offset, 0);
-                    assert_eq!(message_size, first_segment_size as u64);
-                    assert_eq!(frame_chunk_size, chunk_size as u64);
-                    assert_eq!(chunk_index, first_next_chunk);
-                    first_next_chunk += 1;
-                    first_chunk_count += 1;
-                    first_fin_seen |= is_fin;
-                } else {
-                    if second_msg_id.is_none() {
-                        second_msg_id = Some(msg_id);
+                match frame.header {
+                    Header::QueueMsg {
+                        msg_id,
+                        stream_offset,
+                        message_size,
+                        chunk_size: frame_chunk_size,
+                        chunk_index,
+                        is_fin,
+                        ..
+                    } if !in_tail && first_msg_id.is_none_or(|id| id == msg_id.as_u64()) => {
+                        // First segment.
+                        first_msg_id.get_or_insert(msg_id.as_u64());
+                        assert_eq!(stream_offset.as_u64(), 0);
+                        assert_eq!(message_size.as_u64(), first_segment_size as u64);
+                        assert_eq!(frame_chunk_size.as_u64(), chunk_size as u64);
+                        assert_eq!(chunk_index.as_u64(), first_next_chunk);
+                        assert!(!is_fin, "first segment must not carry FIN");
+                        first_next_chunk += 1;
+                        first_chunk_count += 1;
                     }
-                    assert_eq!(Some(msg_id), second_msg_id, "unexpected third msg_id");
-                    assert_eq!(stream_offset, first_segment_size as u64);
-                    assert_eq!(message_size, second_segment_size as u64);
-                    assert_eq!(frame_chunk_size, chunk_size as u64);
-                    assert_eq!(chunk_index, second_next_chunk);
-                    second_next_chunk += 1;
-                    second_chunk_count += 1;
-                    second_segment_has_non_fin_frame |= !is_fin;
+                    Header::QueueMsg {
+                        stream_offset,
+                        is_fin,
+                        ..
+                    } => {
+                        // Tail framed as a second QueueMsg segment.
+                        in_tail = true;
+                        assert_eq!(stream_offset.as_u64(), first_segment_size as u64);
+                        if is_fin {
+                            fin_count += 1;
+                            last_was_fin = true;
+                        }
+                    }
+                    Header::QueueData { offset, is_fin, .. } => {
+                        // Tail re-routed to the QueueData fast path by coop deferral.
+                        in_tail = true;
+                        assert_eq!(offset.as_u64(), first_segment_size as u64);
+                        if is_fin {
+                            fin_count += 1;
+                            last_was_fin = true;
+                        }
+                    }
+                    other => panic!("expected QueueMsg or QueueData, got {:?}", other),
                 }
 
                 for chunk in frame.payload.chunks() {
@@ -479,18 +510,16 @@ fn write_msg_large_payload_uses_multiple_msg_segments() {
                 }
             }
 
-            assert!(second_msg_id.is_some(), "expected at least two msg_ids");
             assert_eq!(
                 first_chunk_count,
                 crate::queue::msg_entry::MAX_CHUNKS as usize,
                 "first segment should fill MAX_CHUNKS"
             );
-            assert_eq!(second_chunk_count, 2, "second segment should be two chunks");
-            assert!(!first_fin_seen, "first segment should not carry FIN");
             assert!(
-                !second_segment_has_non_fin_frame,
-                "all frames in final segment should carry FIN"
+                in_tail,
+                "expected a tail segment after the first MAX_CHUNKS segment"
             );
+            assert_eq!(fin_count, 1, "exactly one FIN-bearing frame expected");
             assert!(
                 expected.is_finished(),
                 "payload should reassemble completely"
@@ -2518,44 +2547,54 @@ fn client_write_msg_zero_window_does_not_block_init() {
     });
 }
 
-/// write_msg yields cooperatively when the inner send_msg loop exhausts the
-/// coop budget, giving other tasks a chance to run even under continuous write
-/// pressure with unlimited credits.
+/// write_msg yields cooperatively when the inner send_msg chunk loop exhausts the per-frame coop
+/// budget, giving other tasks repeated chances to run even under continuous write pressure with
+/// unlimited credits. A single payload spanning many budgets must yield many times, so a competing
+/// task that runs once per yield is observed to run multiple times *during* the write.
 #[test]
-#[ignore = "needs endpoint-level harness to exercise multi-segment coop yielding"]
 fn write_msg_coop_yields_after_budget_completions() {
+    // The multi-budget payload emits thousands of per-frame trace lines — unreasonably large to
+    // snapshot; the interleaving assertion is the regression signal.
+    let _guard = crate::testing::without_snapshots();
     sim(|| {
         let (mut writer, mut pusher) = make_server_pair();
         writer.0.remote_max_data = VarInt::MAX;
 
-        let ran = Arc::new(AtomicBool::new(false));
-        let ran_clone = ran.clone();
+        // Counts how many times the competing task was scheduled. With per-frame coop yielding the
+        // writer hands control back repeatedly mid-message, so this climbs well above 1.
+        let runs = Arc::new(AtomicUsize::new(0));
+        let runs_clone = runs.clone();
+        let done = Arc::new(AtomicBool::new(false));
+        let done_clone = done.clone();
 
-        // Competing task: marks itself as having run, then keeps yielding.
+        let drain_done = done.clone();
+
+        // Competing task: tick once per scheduling, until the writer signals completion.
         async move {
-            ran_clone.store(true, Ordering::Relaxed);
-            loop {
+            while !done_clone.load(Ordering::Relaxed) {
+                runs_clone.fetch_add(1, Ordering::Relaxed);
                 bach::task::yield_now().await;
             }
         }
         .spawn();
 
-        // Frame-drainer task: keeps the frame channel from filling up.
+        // Frame-drainer task: keeps the frame channel from filling up. Bounded by `done` so the
+        // sim can terminate once the writer finishes (a perpetual self-waking task would otherwise
+        // keep bach runnable forever and spin wall-clock).
         async move {
-            loop {
-                let _ = pusher.recv_frames().await;
+            while !drain_done.load(Ordering::Relaxed) {
+                let _ = pusher.recv_frames_timeout(Duration::from_millis(1)).await;
             }
         }
         .spawn();
 
         async move {
-            // Use a payload large enough to require >128 segments so the inner
-            // coop check in send_msg's loop fires. Each segment is max_segment_size
-            // (~340KB at MTU 1472), so we need 128 * 340KB ≈ 43MB. Use a large
-            // Data buffer to avoid actual allocation of that much memory.
+            // Payload spanning many coop budgets so the inner send_msg chunk loop yields
+            // repeatedly. Sized in whole segments to keep the framing tidy; `Data` is a virtual
+            // generator so no real allocation occurs.
             let chunk_size = writer.0.msg_packet_size as usize;
             let max_segment_size = crate::queue::msg_entry::MAX_CHUNKS as usize * chunk_size;
-            let payload_len = max_segment_size * 130;
+            let payload_len = max_segment_size * 4;
             let mut payload = Data::new(payload_len as u64);
             writer
                 .write_msg(
@@ -2567,9 +2606,75 @@ fn write_msg_coop_yields_after_budget_completions() {
                 )
                 .await
                 .expect("write_msg should succeed");
+            done.store(true, Ordering::Relaxed);
+            // The write spanned many budgets (payload >> BUDGET frames), so the competing task must
+            // have been scheduled multiple times mid-write — proving repeated cooperative yields.
             assert!(
-                ran.load(Ordering::Relaxed),
-                "competing task should have run during write_msg coop yield"
+                runs.load(Ordering::Relaxed) > 1,
+                "competing task should run repeatedly during a multi-budget write_msg coop yield, ran {} time(s)",
+                runs.load(Ordering::Relaxed),
+            );
+        }
+        .primary()
+        .spawn();
+    });
+}
+
+/// send_data (the `write_from` path) yields cooperatively when its per-frame coop budget is
+/// exhausted under a large buffer with effectively unlimited credit, and still transmits every
+/// byte. Mirrors `write_msg_coop_yields_after_budget_completions` for the QueueData path.
+#[test]
+fn send_data_yields_under_large_buffer() {
+    // >BUDGET QueueData frames emit too many per-frame trace lines to snapshot reasonably.
+    let _guard = crate::testing::without_snapshots();
+    sim(|| {
+        let (mut writer, mut pusher) = make_server_pair();
+        writer.0.remote_max_data = VarInt::MAX;
+
+        let runs = Arc::new(AtomicUsize::new(0));
+        let runs_clone = runs.clone();
+        let done = Arc::new(AtomicBool::new(false));
+        let done_clone = done.clone();
+
+        let drain_done = done.clone();
+
+        async move {
+            while !done_clone.load(Ordering::Relaxed) {
+                runs_clone.fetch_add(1, Ordering::Relaxed);
+                bach::task::yield_now().await;
+            }
+        }
+        .spawn();
+
+        // Bounded drainer (see the write_msg variant for why a perpetual loop spins wall-clock).
+        async move {
+            while !drain_done.load(Ordering::Relaxed) {
+                let _ = pusher.recv_frames_timeout(Duration::from_millis(1)).await;
+            }
+        }
+        .spawn();
+
+        async move {
+            // Several budgets' worth of MTU-sized QueueData frames so send_data's per-frame coop
+            // break fires repeatedly across polls.
+            let mtu = writer.0.packet_size as usize;
+            let budget = crate::stream::coop::BUDGET as usize;
+            let total = mtu * budget * 4;
+            use s2n_quic_core::buffer::reader::Storage as _;
+            let mut payload = Data::new(total as u64);
+            let mut written = 0usize;
+            while !payload.buffer_is_empty() {
+                written += writer
+                    .write_from(&mut payload)
+                    .await
+                    .expect("write_from should succeed");
+            }
+            done.store(true, Ordering::Relaxed);
+            assert_eq!(written, total, "every buffered byte must be transmitted");
+            assert!(
+                runs.load(Ordering::Relaxed) > 1,
+                "competing task should run repeatedly during a multi-budget send_data coop yield, ran {} time(s)",
+                runs.load(Ordering::Relaxed),
             );
         }
         .primary()
@@ -2817,31 +2922,31 @@ fn write_msg_fin_only_on_last_chunk_of_last_segment() {
         let payload_len = first_segment + second_segment;
 
         async move {
-            let frames = pusher.recv_frames().await;
+            let frames = pusher.recv_frames_until_fin().await;
             assert!(!frames.is_empty());
 
             let mut fin_count = 0usize;
             let mut non_fin_before_fin = false;
             let mut last_was_fin = false;
 
+            // Per-frame coop yielding can split this message across polls, so the small final
+            // segment may be re-routed through the QueueData fast path (the buffer holds a single
+            // chunk on a fresh poll and `pending_chunk_index == 0`). Either framing is correct —
+            // assert only on FIN placement: exactly one FIN, nothing after it, non-FIN frames
+            // before it.
             for frame in frames.iter() {
-                match frame.header {
-                    Header::QueueMsg { is_fin, msg_id, .. } => {
-                        if last_was_fin {
-                            panic!(
-                                "frame after FIN: msg_id={} is_fin={}",
-                                msg_id.as_u64(),
-                                is_fin
-                            );
-                        }
-                        if is_fin {
-                            fin_count += 1;
-                            last_was_fin = true;
-                        } else {
-                            non_fin_before_fin = true;
-                        }
-                    }
-                    _ => panic!("expected QueueMsg, got {:?}", frame.header),
+                let is_fin = match frame.header {
+                    Header::QueueMsg { is_fin, .. } | Header::QueueData { is_fin, .. } => is_fin,
+                    _ => panic!("expected QueueMsg or QueueData, got {:?}", frame.header),
+                };
+                if last_was_fin {
+                    panic!("frame after FIN: {:?}", frame.header);
+                }
+                if is_fin {
+                    fin_count += 1;
+                    last_was_fin = true;
+                } else {
+                    non_fin_before_fin = true;
                 }
             }
 
