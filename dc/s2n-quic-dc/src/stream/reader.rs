@@ -348,8 +348,12 @@ struct Inner {
     /// per-frame `peer_max_offset` hint and any blocked `desired_offset`). Zero until the first
     /// hint arrives, which keeps the bootstrap window behavior unchanged.
     peer_max_offset: u64,
-    /// Highest blocked `desired_offset` we have already grown the window for. With the
-    /// `desired > cap` gate this dedups duplicate/reordered/retransmitted blocked signals.
+    /// `consumed_len` at the most recent window-growth doubling. Growth is gated on `consumed`
+    /// advancing past this mark, which paces doublings to roughly once per drained window and
+    /// dedups the burst of blocked frames (and any retransmits/reorders) that arrive at the same
+    /// consumption level. Keying on the *writer's* absolute `desired_offset` would be wrong: a bulk
+    /// writer's high watermark is constant, so a single doubling would latch and the window would
+    /// never open past `2 * window_size` while the writer stayed blocked.
     acted_blocked_offset: u64,
     /// Multiplicative window-growth factor (slow-start). Starts at 1×, doubles on each blocked
     /// signal that outstrips the current cap, clamped so the window can't exceed the pool's
@@ -1006,18 +1010,23 @@ impl Inner {
 
     /// React to a blocked signal (in-band `blocked` bit or standalone `QueueDataBlocked`).
     ///
-    /// Doubles the growth ratio only when the writer's `desired` offset outstrips what the current
-    /// ratio can advertise (`desired > cap`); a signal the current window already covers is a
-    /// no-op. The `acted_blocked_offset` watermark plus this `> cap` gate make
-    /// duplicate/reordered/retransmitted signals idempotent. The ratio is held until the stream
-    /// goes idle (never reset mid-stream) to avoid thrashing during steady-state streaming, where
-    /// the writer's hint structurally tops out near `current_max`.
+    /// Doubles the growth ratio when the writer still wants past our current runway (`desired >
+    /// cap`) AND the application has made progress since the last doubling (`consumed >
+    /// acted_blocked_offset`). The two conditions together mean: the writer is *persistently*
+    /// blocked — it keeps hitting the window edge even as we drain — so we widen the runway. The
+    /// `consumed`-advanced gate both paces growth (≈ one doubling per drained window) and dedups the
+    /// burst of blocked frames / retransmits that share a consumption level.
+    ///
+    /// Growth terminates on its own: once the runway outpaces the writer (`desired <= cap`) the
+    /// writer stops setting the blocked bit, so no more signals arrive; and `growth_ratio` is hard
+    /// capped at `max_growth_ratio` regardless. The ratio is held (never reset mid-stream) to avoid
+    /// thrashing during steady state.
     fn on_blocked_signal(&mut self, desired: u64) {
         let consumed = self.reassembler.consumed_len();
         let cap =
             consumed.saturating_add(self.window_size.saturating_mul(self.growth_ratio as u64));
-        if desired > cap && desired > self.acted_blocked_offset {
-            self.acted_blocked_offset = desired;
+        if desired > cap && consumed >= self.acted_blocked_offset {
+            self.acted_blocked_offset = consumed.saturating_add(self.window_size);
             let prev = self.growth_ratio;
             self.growth_ratio = self
                 .growth_ratio
@@ -1026,6 +1035,7 @@ impl Inner {
             trace!(
                 binding_id = self.stream_rx.binding_id().as_u64(),
                 desired,
+                consumed,
                 cap,
                 prev_growth_ratio = prev,
                 growth_ratio = self.growth_ratio,
@@ -1108,6 +1118,13 @@ impl Inner {
         // window, and never below what we've already consumed. Before any hint arrives
         // (`peer_max_offset == 0`) preserve the original fixed bootstrap window so server/client
         // startup is unchanged.
+        //
+        // `cap` is the runway we are willing to advertise speculatively. It is `window_size` scaled
+        // by `growth_ratio`, which ramps up while the writer keeps signaling it is blocked (see
+        // `on_blocked_signal`) — that runway is what lets a small-chunk streamer get room ahead of
+        // its hint and stop emitting a blocked frame per chunk. `min(cap)` keeps us from
+        // over-advertising past that runway; the `peer_max_offset` term keeps us from advertising
+        // past what the writer actually wants (the FIN boundary).
         let cap =
             consumed.saturating_add(self.window_size.saturating_mul(self.growth_ratio as u64));
         let target_max_data = if self.peer_max_offset == 0 {

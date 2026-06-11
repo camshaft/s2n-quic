@@ -1112,6 +1112,121 @@ fn blocked_signal_doubles_growth_ratio_and_dedups() {
     });
 }
 
+/// Repro for the bulk-streaming throughput collapse observed in dc-tester (xlarge-request fell to
+/// ~3.5 Gbps once reader flow control was wired up).
+///
+/// Model: a writer is continuously backlogged (every data frame carries the `blocked` bit with a
+/// `peer_max_offset` far past what has been advertised), and the application drains in MTU-sized
+/// chunks. This is exactly the steady state of a saturated bulk transfer. To keep the pipe full the
+/// reader must open its advertised window to roughly a bandwidth-delay product ahead of what the
+/// application has consumed; if instead the window saturates at a small multiple of the initial
+/// window, the sender's flow-control budget (`remote_max_data - next_offset`) is capped there and
+/// the link runs at a fraction of capacity.
+///
+/// This pins the failure to the window-growth *ceiling*. The reader doubles `window_size *
+/// growth_ratio` on each blocked signal but clamps the ratio to `max_single_acquire / window_size`
+/// (see `Inner::max_growth_ratio`). The dc-tester recv pool uses `max_single_acquire = 2 MiB` with a
+/// 1 MiB initial window, so the ratio saturates at 2× — the advertised window can never exceed
+/// ~2 MiB, far below the multi-MiB BDP a 30 Gbps × ~500 µs path needs. The pool here mirrors that
+/// production sizing exactly so the test exercises the real ceiling, not an artificially generous one.
+///
+/// Assertion: after the application has consumed `TARGET` bytes from a perpetually-blocked writer,
+/// the advertised window must lead `consumed` by at least a BDP-class margin (`min_lead`). On the
+/// pre-fix policy the lead saturates at ~2× the initial window, so this fails; a fix that lets the
+/// window open to the BDP (e.g. decoupling growth from `max_single_acquire`, or seeding a larger
+/// window) makes it pass.
+#[test]
+fn bulk_stream_opens_window_to_bdp() {
+    sim(|| {
+        // Pool sized so the per-request ceiling (`max_single_acquire`) is a generous multiple of the
+        // 1 MiB initial window. This is what discriminates the bug from the fix: the slow-start ramp
+        // dedups on a constant demand and pins `growth_ratio` at 2 (→ ~2 MiB lead) regardless of how
+        // wide the ceiling is, whereas a demand-driven target opens straight to the ceiling. With a
+        // 2 MiB ceiling (== 2× window) the two are indistinguishable; an 8 MiB ceiling separates them.
+        let pool = crate::sync::Arc::new(crate::credit::Pool::new(
+            crate::credit::Config::new(16 * 1024 * 1024)
+                .with_max_single_acquire_uniform(8 * 1024 * 1024),
+        ));
+        // Hold a distributor so pool acquires can actually be granted (otherwise growth parks).
+        let distributor = crate::credit::Distributor::new(pool.clone());
+
+        let (mut reader, mut pusher) = make_pair_with_pool(pool);
+        let window_size = reader.0.window_size;
+
+        // Drain ~8 MiB in MTU-sized chunks. A healthy window should be several MiB wide by the end.
+        const CHUNK: usize = 8 * 1024;
+        const TARGET: usize = 8 * 1024 * 1024;
+        // The writer always wants to send far past the advertised edge.
+        const FAR_AHEAD: u64 = 64 * 1024 * 1024;
+        // Require the advertised window to lead consumption by >= 4x the initial window. The
+        // demand-driven fix opens to the ~8 MiB pool ceiling; the buggy ramp saturates at ~2 MiB.
+        let min_lead = window_size.saturating_mul(4);
+
+        // Endpoint task: feed a perpetually-backlogged writer and drain its outbound MAX_DATA frames
+        // so the submission channel never blocks.
+        //
+        // Faithful to a real bulk `write_from_fin`: the writer's high-watermark (`largest_offset`,
+        // delivered here as `peer_max_offset`) is the *total* outstanding demand, which stays
+        // essentially CONSTANT across the transfer (`next_offset + buffered_len` ≈ the fixed total).
+        // This matters: the reader dedups blocked signals on `desired > acted_blocked_offset`, so a
+        // constant demand only ever trips the growth-ratio doubling once. (An earlier version of
+        // this test ramped `peer_max_offset` with `offset`, which masked the bug by re-tripping the
+        // gate every frame.)
+        let total_demand = TARGET as u64 + FAR_AHEAD;
+        let writer = async move {
+            let mut offset = 0u64;
+            let payload = vec![0xa5u8; CHUNK];
+            while offset < TARGET as u64 {
+                pusher.push(msg::Stream::Data {
+                    offset: VarInt::new(offset).unwrap(),
+                    // Constant total demand, far past anything advertised — the writer wants to send
+                    // the whole stream and says so on every frame.
+                    peer_max_offset: VarInt::new(total_demand).unwrap(),
+                    payload: BytesMut::from(&payload[..]),
+                    fin: false,
+                    blocked: true,
+                });
+                offset += CHUNK as u64;
+                // Drain any MAX_DATA the reader emitted; don't block forever if none this turn.
+                let _ = pusher.recv_frames_timeout(Duration::from_millis(1)).await;
+                bach::task::yield_now().await;
+            }
+            let _keep_alive = &distributor;
+            1.s().sleep().await;
+        };
+
+        // App task: consume in chunks, then assert the advertised window opened up.
+        let app = async move {
+            let mut consumed = 0usize;
+            let mut buf = BytesMut::with_capacity(CHUNK);
+            while consumed < TARGET {
+                buf.clear();
+                let n = reader.read_into(&mut buf).await.expect("read failed");
+                if n == 0 {
+                    bach::task::yield_now().await;
+                    continue;
+                }
+                consumed += n;
+            }
+
+            let advertised = reader.0.remote_max_data.as_u64();
+            let lead = advertised.saturating_sub(consumed as u64);
+            assert!(
+                lead >= min_lead,
+                "advertised window collapsed to a dribble under sustained streaming: \
+                 advertised={advertised}, consumed={consumed}, lead={lead} \
+                 (need >= {min_lead}); a perpetually-blocked writer is being held to a ~1-window \
+                 budget so the link can't stay full (growth_ratio={})",
+                reader.0.growth_ratio,
+            );
+            1.s().sleep().await;
+        };
+
+        writer.primary().spawn();
+        app.primary().spawn();
+    });
+}
+
 #[test]
 fn max_data_transmission_failure_surfaces_error() {
     sim(|| {

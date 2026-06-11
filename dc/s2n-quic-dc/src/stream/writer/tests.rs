@@ -44,6 +44,7 @@ struct PairBuilder {
     ep_type: endpoint::Type,
     credit_pool: Option<crate::sync::Arc<crate::credit::Pool>>,
     priority: crate::credit::Priority,
+    params: Option<s2n_quic_core::dc::ApplicationParams>,
 }
 
 impl Default for PairBuilder {
@@ -52,6 +53,7 @@ impl Default for PairBuilder {
             ep_type: endpoint::Type::Client,
             credit_pool: None,
             priority: crate::credit::Priority::default(),
+            params: None,
         }
     }
 }
@@ -62,7 +64,16 @@ impl PairBuilder {
             ep_type: endpoint::Type::Server,
             credit_pool: None,
             priority: crate::credit::Priority::default(),
+            params: None,
         }
+    }
+
+    /// Override the handshake `ApplicationParams` used to build the writer. Lets a test model the
+    /// production split where the connection-level `remote_max_data` differs from the per-stream
+    /// `local_recv_max_data` the peer actually advertises and enforces.
+    fn with_params(mut self, params: s2n_quic_core::dc::ApplicationParams) -> Self {
+        self.params = Some(params);
+        self
     }
 
     fn client_no_remote_queue_id() -> Self {
@@ -84,9 +95,11 @@ impl PairBuilder {
     fn build(self) -> (Writer, Pusher) {
         let acceptor_id = VarInt::from_u8(7);
         let peer: SocketAddr = "127.0.0.1:4433".parse().unwrap();
-        let path_secret_entry = PathSecretEntry::builder(peer)
-            .endpoint_type(self.ep_type)
-            .build();
+        let mut entry_builder = PathSecretEntry::builder(peer).endpoint_type(self.ep_type);
+        if let Some(params) = self.params {
+            entry_builder = entry_builder.params(params);
+        }
+        let path_secret_entry = entry_builder.build();
 
         let client_state =
             std::sync::Arc::new(crate::queue::ClientState::new(VarInt::from_u16(100), 0));
@@ -499,6 +512,108 @@ fn write_msg_large_payload_uses_multiple_msg_segments() {
                 .await
                 .expect("write_msg should succeed");
             assert_eq!(written, payload_len);
+        }
+        .primary()
+        .spawn();
+    });
+}
+
+/// Reproduction: the server writer must not send past the per-stream receive window the peer
+/// actually advertises and enforces (`local_recv_max_data`), regardless of the larger
+/// connection-level `remote_max_data`.
+///
+/// Production split (`change flow configs`, ba1433cd): `remote_max_data` (the connection-level data
+/// window, ~8 MiB) and `local_recv_max_data` (the per-stream recv window, 64 KiB) diverged. But
+/// `Writer::new_server` seeds its initial flow-control budget from `parameters.remote_max_data` and
+/// starts in `Open`, so the server writer believes it may send the full 8 MiB immediately — before
+/// the peer's reader has advertised any pool-backed window. The peer reader only ever advertises and
+/// enforces `local_recv_max_data` (plus pool-backed growth), so the writer overshoots its real
+/// window and the reader tears the connection down with `QUEUE_CONTROL_ERROR` ("sender exceeded
+/// receive window").
+///
+/// This test pins the invariant at the writer boundary: with a 64 KiB peer recv window, the server
+/// writer must not emit any frame whose end offset exceeds 64 KiB until MAX_DATA grows the window.
+/// Before the fix the writer's `remote_max_data` is 8 MiB and it streams a >64 KiB message out in
+/// one shot, so the assertion fails.
+#[test]
+fn server_writer_respects_peer_recv_window_not_connection_window() {
+    sim(|| {
+        // Model the production split: large connection-level window, small per-stream recv window.
+        const CONNECTION_WINDOW: u32 = 8 * 1024 * 1024;
+        const PEER_RECV_WINDOW: u32 = 64 * 1024;
+
+        let mut params = s2n_quic_core::dc::testing::TEST_APPLICATION_PARAMS.clone();
+        params.remote_max_data = VarInt::from_u32(CONNECTION_WINDOW);
+        params.local_send_max_data = VarInt::from_u32(CONNECTION_WINDOW);
+        // The peer's reader advertises and enforces this; it is the only true bound on the writer.
+        params.local_recv_max_data = VarInt::from_u32(PEER_RECV_WINDOW);
+
+        let (mut writer, mut pusher) = PairBuilder::server().with_params(params).build();
+
+        // A message comfortably larger than the peer recv window but well within the connection
+        // window.
+        let payload_len = (PEER_RECV_WINDOW as usize) * 4;
+
+        async move {
+            // Collect everything the writer emits before any MAX_DATA is granted. The peer would
+            // enforce its advertised window of PEER_RECV_WINDOW; any frame whose end offset exceeds
+            // that is data the peer never authorized and would reset the connection over.
+            let mut max_end_offset = 0u64;
+            while let Some(frames) = pusher.recv_frames_timeout(Duration::from_millis(50)).await {
+                for frame in frames.iter() {
+                    let (offset, len) = match frame.header {
+                        Header::QueueData { offset, .. } => (offset.as_u64(), frame.payload.len()),
+                        Header::QueueMsg {
+                            stream_offset,
+                            chunk_size,
+                            chunk_index,
+                            ..
+                        } => (
+                            stream_offset.as_u64()
+                                + chunk_index.as_u64() * chunk_size.as_u64(),
+                            frame.payload.len(),
+                        ),
+                        // Blocked/other control frames carry no stream bytes.
+                        _ => continue,
+                    };
+                    max_end_offset = max_end_offset.max(offset + len as u64);
+                }
+            }
+
+            assert!(
+                max_end_offset <= PEER_RECV_WINDOW as u64,
+                "server writer sent data up to offset {max_end_offset} but the peer only advertised \
+                 a {PEER_RECV_WINDOW}-byte receive window; the overshoot is data the peer never \
+                 authorized and would trigger QUEUE_CONTROL_ERROR (\"sender exceeded receive \
+                 window\")",
+            );
+        }
+        .primary()
+        .spawn();
+
+        async move {
+            let mut payload = Data::new(payload_len as u64);
+            // Drive the writer once. It blocks once it has sent up to its (believed) window.
+            let slot = writer.0.slot_ptr();
+            let _ = core::future::poll_fn(|cx| {
+                let mut buf = Data::new(payload_len as u64);
+                match writer.0.poll_write_msg(
+                    cx,
+                    slot,
+                    &mut buf,
+                    MsgFlags {
+                        is_fin: false,
+                        is_wakeup: false,
+                    },
+                ) {
+                    Poll::Pending => Poll::Ready(()),
+                    Poll::Ready(_) => Poll::Ready(()),
+                }
+            })
+            .await;
+            // Keep the writer alive long enough for the pusher to drain frames.
+            let _ = &mut payload;
+            50.ms().sleep().await;
         }
         .primary()
         .spawn();

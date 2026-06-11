@@ -383,7 +383,13 @@ impl Writer {
         let mtu = parameters.max_datagram_size();
         let packet_size = mtu.saturating_sub(MAX_QUEUE_DATA_HEADER_OVERHEAD);
         let msg_packet_size = mtu.saturating_sub(MAX_QUEUE_MSG_HEADER_OVERHEAD);
-        let initial_remote_max_data = parameters.remote_max_data.as_u64();
+        // The peer's per-stream initial recv window — the only window the peer's reader advertises
+        // and enforces for free before any pool-backed MAX_DATA grant. NOT the connection-level
+        // `remote_max_data`: a writer that sized its budget by the (much larger) connection window
+        // would overshoot the per-stream window and the reader would reset the stream with
+        // QUEUE_CONTROL_ERROR. The local send window is not consulted at all — the endpoint send
+        // credit pool governs the local send rate now.
+        let initial_remote_max_data = parameters.local_recv_max_data.as_u64();
         let remote_max_data = VarInt::ZERO;
 
         Self(WriterAllocPtr::new(Inner {
@@ -432,7 +438,11 @@ impl Writer {
         let mtu = parameters.max_datagram_size();
         let packet_size = mtu.saturating_sub(MAX_QUEUE_DATA_HEADER_OVERHEAD);
         let msg_packet_size = mtu.saturating_sub(MAX_QUEUE_MSG_HEADER_OVERHEAD);
-        let initial_remote_max_data = parameters.remote_max_data.as_u64();
+        // The peer's per-stream initial recv window (see `new_client` for why this is
+        // `local_recv_max_data`, not the connection-level `remote_max_data`). The server writer
+        // starts in `Open` and seeds its `remote_max_data` from this so its very first burst stays
+        // within the window the peer's reader advertises for free.
+        let initial_remote_max_data = parameters.local_recv_max_data.as_u64();
 
         Self(WriterAllocPtr::new(Inner {
             frame_tx,
