@@ -56,6 +56,8 @@ struct PeerTransportParams {
     dc_version: Option<dc::Version>,
     /// Opaque peer info bytes from the remote peer's DcPeerInfo transport parameter.
     dc_peer_info: s2n_quic_core::transport::parameters::DcPeerInfo,
+    /// Peer's data-plane addresses from the DcDataAddresses transport parameter.
+    dc_data_addresses: s2n_quic_core::transport::parameters::DcDataAddresses,
     /// The peer is both prepared to receive MtuProbingComplete frame and will send the frame if the local side indicates
     /// it supports MtuProbingComplete frame via transport parameter.
     mtu_probing_complete_support: MtuProbingCompleteSupport,
@@ -221,6 +223,7 @@ impl<Config: endpoint::Config, Pub: event::ConnectionPublisher> SessionContext<'
             max_ack_delay: peer_parameters.max_ack_delay,
             dc_version,
             dc_peer_info: peer_parameters.dc_peer_info,
+            dc_data_addresses: peer_parameters.dc_data_addresses,
             mtu_probing_complete_support: peer_parameters.mtu_probing_complete_support,
         })
     }
@@ -280,6 +283,7 @@ impl<Config: endpoint::Config, Pub: event::ConnectionPublisher> SessionContext<'
             max_ack_delay: peer_parameters.max_ack_delay,
             dc_version,
             dc_peer_info: peer_parameters.dc_peer_info,
+            dc_data_addresses: peer_parameters.dc_data_addresses,
             mtu_probing_complete_support: peer_parameters.mtu_probing_complete_support,
         })
     }
@@ -470,12 +474,18 @@ impl<Config: endpoint::Config, Pub: event::ConnectionPublisher>
             } else {
                 None
             };
+            let peer_data_addrs = if !peer_params.dc_data_addresses.is_empty() {
+                dc::data_addresses::decode(peer_params.dc_data_addresses.data()).ok()
+            } else {
+                None
+            };
             let conn_info = dc::ConnectionInfo::new(
                 &remote_address,
                 dc_version,
                 application_params,
                 Config::ENDPOINT_TYPE.into_event(),
                 peer_info,
+                peer_data_addrs,
             );
             let dc_path = self.dc.new_path(&conn_info);
 

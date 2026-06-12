@@ -44,6 +44,16 @@ pub trait Endpoint: 'static + Send {
     fn advertised_peer_info(&self) -> Option<bytes::Bytes> {
         None
     }
+
+    /// Returns the local data-plane addresses encoded as a `DcDataAddresses`
+    /// transport parameter payload. The remote peer receives these at handshake
+    /// completion and can begin sending DC packets immediately.
+    ///
+    /// Returns `None` if no data addresses should be advertised (default).
+    #[cfg(feature = "alloc")]
+    fn local_data_addrs(&self) -> Option<bytes::Bytes> {
+        None
+    }
 }
 
 /// A dc path

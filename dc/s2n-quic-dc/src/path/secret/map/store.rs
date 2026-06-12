@@ -95,6 +95,8 @@ pub trait Store: 'static + Send + Sync + time::Clock {
 
     fn advertised_peer_info(&self) -> Option<bytes::Bytes>;
 
+    fn advertised_data_addrs(&self) -> Option<bytes::Bytes>;
+
     fn check_dedup(
         &self,
         entry: &Entry,
