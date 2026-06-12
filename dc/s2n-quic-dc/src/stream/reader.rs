@@ -358,7 +358,19 @@ struct Inner {
     /// Multiplicative window-growth factor (slow-start). Starts at 1×, doubles on each blocked
     /// signal that outstrips the current cap, clamped so the window can't exceed the pool's
     /// `max_single_acquire`. Held until the stream goes idle (never reset mid-stream).
+    ///
+    /// This is the *streaming* mechanism: it serves a writer with open-ended demand that keeps
+    /// hitting the window edge (real `QueueDataBlocked` / in-band `blocked` bit). It deliberately
+    /// does NOT serve the known-demand QueueMsg case — see [`known_msg_demand`](Self::known_msg_demand).
     growth_ratio: u32,
+    /// A specific, *known* receive offset the window must reach to let an oversized QueueMsg segment
+    /// complete. Set only from a synthetic blocked signal (`msg::Stream::Blocked { synthetic: true
+    /// }`), which the receiver's dispatch generates when a message allocation won't fit the
+    /// advertised window. Unlike `growth_ratio` (open-ended streaming slow-start), this is a fixed
+    /// target bounded by the max segment size: the window opens straight to it, in
+    /// `max_single_acquire`-sized acquires, regardless of the streaming ramp. Zero when no such
+    /// segment is outstanding. Monotonic running max; a delivered segment simply stops refreshing it.
+    known_msg_demand: u64,
     /// Endpoint-wide recv credit pool. Window-extension acquires draw from
     /// here; dispatch-side releases happen elsewhere as bytes arrive.
     recv_credit_pool: crate::sync::Arc<crate::credit::Pool>,
@@ -450,6 +462,7 @@ impl Reader {
             peer_max_offset: 0,
             acted_blocked_offset: 0,
             growth_ratio: 1,
+            known_msg_demand: 0,
             recv_credit_pool,
             priority,
             send_flow_update_after_fin: false,
@@ -502,6 +515,7 @@ impl Reader {
             peer_max_offset: 0,
             acted_blocked_offset: 0,
             growth_ratio: 1,
+            known_msg_demand: 0,
             recv_credit_pool,
             priority,
             send_flow_update_after_fin: !peer_fin_received,
@@ -1007,17 +1021,34 @@ impl Inner {
                         return self.protocol_error();
                     }
                 }
-                msg::Stream::Blocked { desired_offset } => {
-                    // Standalone blocked signal (cold-start path): no payload, just drives
-                    // window growth. The subsequent maybe_send_max_data in the caller
-                    // emits the extension.
-                    trace!(
-                        binding_id = self.stream_rx.binding_id().as_u64(),
-                        desired_offset = desired_offset.as_u64(),
-                        "Received QueueDataBlocked"
-                    );
-                    self.peer_max_offset = self.peer_max_offset.max(desired_offset.as_u64());
-                    self.on_blocked_signal(desired_offset.as_u64());
+                msg::Stream::Blocked {
+                    desired_offset,
+                    synthetic,
+                } => {
+                    // Standalone blocked signal: no payload, just drives window growth. The
+                    // subsequent maybe_send_max_data in the caller emits the extension.
+                    let desired = desired_offset.as_u64();
+                    self.peer_max_offset = self.peer_max_offset.max(desired);
+                    if synthetic {
+                        // Receiver-generated: a QueueMsg segment won't fit the advertised window.
+                        // Demand is known and bounded (the segment end). Record it as a hard target
+                        // the window must reach — independent of the streaming slow-start ramp.
+                        trace!(
+                            binding_id = self.stream_rx.binding_id().as_u64(),
+                            desired_offset = desired,
+                            "Received synthetic blocked signal (oversized message)"
+                        );
+                        self.known_msg_demand = self.known_msg_demand.max(desired);
+                    } else {
+                        // Real peer QueueDataBlocked: streaming back-pressure, open-ended demand.
+                        // Drive the multiplicative slow-start ramp.
+                        trace!(
+                            binding_id = self.stream_rx.binding_id().as_u64(),
+                            desired_offset = desired,
+                            "Received QueueDataBlocked"
+                        );
+                        self.on_blocked_signal(desired);
+                    }
                 }
                 msg::Stream::Reset { error_code } => {
                     debug!(
@@ -1183,17 +1214,27 @@ impl Inner {
         let current_max = self.remote_max_data.as_u64();
         let threshold = current_max.saturating_sub(self.window_size / 2);
 
-        // Target window: sized to the writer's hinted demand, capped by the (possibly grown) local
-        // window, and never below what we've already consumed. Before any hint arrives
-        // (`peer_max_offset == 0`) preserve the original fixed bootstrap window so server/client
-        // startup is unchanged.
+        // Target window. Two demand regimes feed it (see `growth_ratio` vs `known_msg_demand`):
+        //
+        //   * Streaming: the writer's hinted demand (`peer_max_offset`), capped by the slow-start
+        //     `cap` (`consumed + window_size * growth_ratio`) so an open-ended bulk writer ramps the
+        //     window toward the BDP without overshooting. Before any hint (`peer_max_offset == 0`)
+        //     this is the fixed bootstrap window, preserving server/client startup unchanged.
+        //   * Known message: `known_msg_demand`, the end offset of an oversized QueueMsg segment the
+        //     receiver told us about via a synthetic blocked signal. This is a fixed, bounded target
+        //     the window MUST reach for the segment to complete, so it bypasses the slow-start cap
+        //     (which would otherwise be too small, and can't be paced by consumption — a stalled
+        //     segment delivers nothing). Bounded by the max segment size, so it can't run away.
+        //
+        // The window targets the larger of the two, never below what we've already consumed.
         let cap =
             consumed.saturating_add(self.window_size.saturating_mul(self.growth_ratio as u64));
-        let target_max_data = if self.peer_max_offset == 0 {
+        let streaming_target = if self.peer_max_offset == 0 {
             consumed.saturating_add(self.window_size)
         } else {
             self.peer_max_offset.max(consumed).min(cap)
         };
+        let target_max_data = streaming_target.max(self.known_msg_demand);
 
         // Trigger on hint-or-threshold: extend when the writer wants more room than we've advertised
         // (`target > current_max`) OR consumption crossed the top-up threshold.
@@ -1315,6 +1356,17 @@ impl Inner {
         // credit release to what we actually advertised (and acquired). Monotonic
         // and lock-free; see `Slot::advertise_window`.
         self.stream_rx.advertise_window(new_max_data.as_u64());
+
+        // A known-message target can exceed `max_single_acquire`, which clamps each `poll_acquire`
+        // to one slice — so a single extension may only advertise part of the way to the segment
+        // end. When we're still short of a known demand and the slot isn't parked for more (a park
+        // re-polls us via the distributor), self-wake to acquire the next slice on the following
+        // poll. Without this the window would stall one slice short of an oversized segment, which
+        // can never then complete. The streaming target is naturally re-driven by further peer
+        // blocked signals, so this only needs to chase the bounded `known_msg_demand`.
+        if self.known_msg_demand > new_max_data.as_u64() && !slot_ref.is_linked() {
+            cx.waker().wake_by_ref();
+        }
 
         Ok(())
     }

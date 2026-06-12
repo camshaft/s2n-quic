@@ -334,11 +334,21 @@ impl Pusher {
         });
     }
 
-    /// Push a standalone `QueueDataBlocked` signal.
+    /// Push a standalone `QueueDataBlocked` signal (real peer streaming back-pressure).
     #[allow(dead_code)]
     fn push_blocked(&mut self, desired_offset: u64) {
         self.push(msg::Stream::Blocked {
             desired_offset: VarInt::new(desired_offset).unwrap(),
+            synthetic: false,
+        });
+    }
+
+    /// Push a synthetic blocked signal (receiver-generated for an oversized QueueMsg segment).
+    #[allow(dead_code)]
+    fn push_synthetic_blocked(&mut self, desired_offset: u64) {
+        self.push(msg::Stream::Blocked {
+            desired_offset: VarInt::new(desired_offset).unwrap(),
+            synthetic: true,
         });
     }
 
@@ -1354,6 +1364,67 @@ fn blocked_signal_doubles_growth_ratio_and_dedups() {
             assert_eq!(
                 reader.0.growth_ratio, 2,
                 "expected exactly one doubling from a single distinct over-cap blocked signal"
+            );
+            1.s().sleep().await;
+        }
+        .primary()
+        .spawn();
+    });
+}
+
+/// A *synthetic* blocked signal (receiver-generated for an oversized QueueMsg segment) opens the
+/// window straight to the known demand offset, bypassing the streaming slow-start ramp. This is the
+/// distinction from [`blocked_signal_doubles_growth_ratio_and_dedups`]: a real peer signal ramps
+/// `growth_ratio`; a synthetic one targets a fixed, bounded offset because the demand is known.
+#[test]
+fn synthetic_blocked_opens_window_to_known_demand_without_growth() {
+    sim(|| {
+        // Pool ceiling well above the demand so a single extension could in principle cover it; the
+        // point under test is that the *target* is the known demand, not a slow-start multiple.
+        let probe = make_pair().0;
+        let window_size = probe.0.window_size;
+        drop(probe);
+        let cap = window_size.saturating_mul(64).max(1024 * 1024);
+        let pool = crate::sync::Arc::new(crate::credit::Pool::new(
+            crate::credit::Config::new(cap).with_max_single_acquire_uniform(cap),
+        ));
+        // Hold a distributor so acquires are granted rather than parking.
+        let distributor = crate::credit::Distributor::new(pool.clone());
+        let (mut reader, mut pusher) = make_pair_with_pool(pool);
+
+        // A known message demand of 4× the bootstrap window — past the initial slow-start cap (1×).
+        let demand = window_size.saturating_mul(4);
+
+        let payload = vec![0xabu8; 64];
+        let payload_len = payload.len();
+
+        async move {
+            // A little real data so the reader's poll makes progress (returns Ready), plus the
+            // synthetic blocked carrying the known demand.
+            pusher.push_data(0, &payload, false);
+            pusher.push_synthetic_blocked(demand);
+            let _keep_alive = &distributor;
+            1.s().sleep().await;
+        }
+        .primary()
+        .spawn();
+
+        async move {
+            let mut buf = BytesMut::with_capacity(payload_len + 16);
+            let _ = reader.read_into(&mut buf).await.expect("read failed");
+            for _ in 0..8 {
+                bach::task::yield_now().await;
+            }
+            // The advertised window reached the known demand, even though `growth_ratio` never moved
+            // off its initial 1× (the synthetic path does not ramp slow-start).
+            assert_eq!(
+                reader.0.growth_ratio, 1,
+                "synthetic blocked must not drive the streaming growth ramp"
+            );
+            assert!(
+                reader.0.remote_max_data.as_u64() >= demand,
+                "window must open to the known message demand: advertised={}, demand={demand}",
+                reader.0.remote_max_data.as_u64(),
             );
             1.s().sleep().await;
         }

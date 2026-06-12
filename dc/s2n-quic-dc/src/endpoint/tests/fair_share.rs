@@ -389,8 +389,8 @@ fn run_reset_cancel_drain(
         {
             let leak_capture = leak_capture.clone();
             async move {
-                let send_pool_config = CreditConfig::new(send_cap)
-                    .with_max_single_acquire_uniform(max_single_acquire);
+                let send_pool_config =
+                    CreditConfig::new(send_cap).with_max_single_acquire_uniform(max_single_acquire);
                 let server = SimEndpointConfig::default()
                     .send_credit_pool_config(send_pool_config)
                     .server();
@@ -418,7 +418,8 @@ fn run_reset_cancel_drain(
                             if payload.is_finished() {
                                 break;
                             }
-                            match timeout(CHUNK_TIMEOUT, writer.write_from_fin(&mut payload)).await {
+                            match timeout(CHUNK_TIMEOUT, writer.write_from_fin(&mut payload)).await
+                            {
                                 Ok(Ok(_)) => {}
                                 // Cancelled by the peer reset, or genuinely done — either way this
                                 // sender is finished. A real wedge (pool drained by leaked credit)
@@ -482,18 +483,18 @@ fn run_reset_cancel_drain(
                                 // Re-borrow the reader each iteration so `stream` stays owned and
                                 // can be `reset()` on the cancel branch below.
                                 let (reader, _writer) = stream.split();
-                                let n = match timeout(CHUNK_TIMEOUT, reader.read_into(&mut rx)).await
-                                {
-                                    Ok(Ok(n)) => n,
-                                    Ok(Err(_)) => break,
-                                    Err(_) => {
-                                        panic!(
-                                            "reader stalled at offset {before}/{body_len} — \
+                                let n =
+                                    match timeout(CHUNK_TIMEOUT, reader.read_into(&mut rx)).await {
+                                        Ok(Ok(n)) => n,
+                                        Ok(Err(_)) => break,
+                                        Err(_) => {
+                                            panic!(
+                                                "reader stalled at offset {before}/{body_len} — \
                                              surviving stream could not make progress (send pool \
                                              drained by leaked credit on cancelled streams?)"
-                                        );
-                                    }
-                                };
+                                            );
+                                        }
+                                    };
                                 if n == 0 {
                                     break;
                                 }
@@ -540,14 +541,7 @@ fn reset_cancel_send_credit_conserved() {
     // 128 KiB. 2 MiB send pool, 256 KiB per-acquire cap — production dc-tester sizing, oversubscribed
     // (24 concurrent senders vs a pool that holds ~8 windows) so any credit withheld by a
     // cancelled-but-not-yet-dropped writer drains it and stalls survivors.
-    let leak = run_reset_cancel_drain(
-        6,
-        24,
-        512 * 1024,
-        128 * 1024,
-        2 * 1024 * 1024,
-        256 * 1024,
-    );
+    let leak = run_reset_cancel_drain(6, 24, 512 * 1024, 128 * 1024, 2 * 1024 * 1024, 256 * 1024);
 
     info!(leak, "reset_cancel send pool shortfall");
     assert_eq!(
@@ -611,7 +605,8 @@ fn run_recv_reset_cancel_drain(
                             if payload.is_finished() {
                                 break;
                             }
-                            match timeout(CHUNK_TIMEOUT, writer.write_from_fin(&mut payload)).await {
+                            match timeout(CHUNK_TIMEOUT, writer.write_from_fin(&mut payload)).await
+                            {
                                 Ok(Ok(_)) => {}
                                 // Peer reset (cancelled reader) or done — either way this sender
                                 // stops. A real recv-pool drain surfaces on a *surviving* stream's
@@ -668,18 +663,18 @@ fn run_recv_reset_cancel_drain(
                             loop {
                                 let before = rx.current_offset().as_u64();
                                 let (reader, _writer) = stream.split();
-                                let n = match timeout(CHUNK_TIMEOUT, reader.read_into(&mut rx)).await
-                                {
-                                    Ok(Ok(n)) => n,
-                                    Ok(Err(_)) => break,
-                                    Err(_) => {
-                                        panic!(
-                                            "reader stalled at offset {before}/{body_len} — \
+                                let n =
+                                    match timeout(CHUNK_TIMEOUT, reader.read_into(&mut rx)).await {
+                                        Ok(Ok(n)) => n,
+                                        Ok(Err(_)) => break,
+                                        Err(_) => {
+                                            panic!(
+                                                "reader stalled at offset {before}/{body_len} — \
                                              surviving stream could not grow its window (recv pool \
                                              drained by leaked credit on cancelled readers?)"
-                                        );
-                                    }
-                                };
+                                            );
+                                        }
+                                    };
                                 if n == 0 {
                                     break;
                                 }
@@ -732,14 +727,8 @@ fn recv_reset_cancel_credit_conserved() {
     // 128 KiB. 2 MiB recv pool, 256 KiB per-acquire cap — oversubscribed (24 concurrent readers vs
     // a pool that holds only a few windows) so any window credit withheld by a cancelled reader
     // drains it and stalls survivors.
-    let leak = run_recv_reset_cancel_drain(
-        6,
-        24,
-        512 * 1024,
-        128 * 1024,
-        2 * 1024 * 1024,
-        256 * 1024,
-    );
+    let leak =
+        run_recv_reset_cancel_drain(6, 24, 512 * 1024, 128 * 1024, 2 * 1024 * 1024, 256 * 1024);
 
     info!(leak, "recv reset_cancel pool shortfall");
     assert_eq!(
@@ -777,7 +766,12 @@ async fn drive_msg_writer(
             Err(_) => {
                 // Liveness probe: missed waker vs genuine stall.
                 let mut retry = Data::new(msg_len as u64);
-                match timeout(Duration::from_millis(1), writer.write_msg(&mut retry, flags)).await {
+                match timeout(
+                    Duration::from_millis(1),
+                    writer.write_msg(&mut retry, flags),
+                )
+                .await
+                {
                     Ok(Ok(n)) if n > 0 => {
                         panic!(
                             "BUG: missed waker on msg writer! wrote {n} bytes on immediate retry \
@@ -924,8 +918,7 @@ fn fair_share_msg_contended_no_stragglers() {
     // 32 streams, 8 messages of 256 KiB each (2 MiB/stream). 4 MiB recv pool, 1 MiB per-acquire cap
     // — only ~4 streams can hold a full window at once, so all 32 readers must round-robin credit
     // while their peer writers drive the segmented message path.
-    let (writers, readers) =
-        run_fair_share_msg(32, 256 * 1024, 8, 4 * 1024 * 1024, 1024 * 1024);
+    let (writers, readers) = run_fair_share_msg(32, 256 * 1024, 8, 4 * 1024 * 1024, 1024 * 1024);
 
     info!(writers, readers, "fair_share_msg_contended result");
     assert_eq!(writers, 32, "all 32 msg writers must complete");
@@ -944,10 +937,16 @@ fn fair_share_msg_contended_no_stragglers() {
 ///
 /// Drives one `write_msg` of `total_len` bytes (no FIN split into separate messages) so the entire
 /// transfer is a single back-pressured message that must cross window boundaries repeatedly.
-fn run_giant_msg_small_window(
+fn run_giant_msg_small_window(num_streams: usize, total_len: usize, window: u64) -> (usize, usize) {
+    // Default: large recv pool so the per-stream *window* is the only back-pressure.
+    run_giant_msg_small_window_pool(num_streams, total_len, window, None)
+}
+
+fn run_giant_msg_small_window_pool(
     num_streams: usize,
     total_len: usize,
     window: u64,
+    recv_pool: Option<(u64, u64)>,
 ) -> (usize, usize) {
     use crate::stream::MsgFlags;
     let acceptor_id = VarInt::from_u8(1);
@@ -959,16 +958,23 @@ fn run_giant_msg_small_window(
 
     let body_len = total_len as u64;
 
-    sim(|| {
+    sim(move || {
         // Server reader: small per-stream window (set via send_window, which also sets
-        // local_recv_max_data), large recv pool so the *window* — not pool credit — is the only
-        // back-pressure. This isolates the window-growth signalling path.
+        // local_recv_max_data). The recv pool is large by default so the *window* — not pool
+        // credit — is the only back-pressure, isolating the window-growth signalling path; an
+        // explicit `(capacity, max_single_acquire)` lets a test pin the per-acquire ceiling below
+        // the writer's max segment size (the boundary where growth alone can't cover a segment).
         {
             let readers_done_sv = readers_done_sv.clone();
             async move {
-                let server = SimEndpointConfig::default()
-                    .send_window(VarInt::new(window).unwrap())
-                    .server();
+                let mut config =
+                    SimEndpointConfig::default().send_window(VarInt::new(window).unwrap());
+                if let Some((cap, max_single)) = recv_pool {
+                    config = config.recv_credit_pool_config(
+                        CreditConfig::new(cap).with_max_single_acquire_uniform(max_single),
+                    );
+                }
+                let server = config.server();
                 let mut acceptor = server
                     .register_acceptor_channel(acceptor_id, num_streams * 2)
                     .expect("acceptor registration failed");
@@ -1078,11 +1084,6 @@ fn run_giant_msg_small_window(
 /// immune because `send_data` emits partial frames clamped to the window. Messages whose segments
 /// each fit the window (the `fair_share_msg_*` tests) pass fine.
 #[test]
-#[ignore = "KNOWN BUG (flow-control-hunt 2026-06-12): a write_msg whose QueueMsg segment exceeds \
-            the peer's advertised window deadlocks — the segment can never complete so the receiver \
-            never delivers, the window never grows, and no blocked signal escapes. Un-ignore once \
-            send_msg clamps segment size to the remote window (or the receiver delivers partial \
-            segments)."]
 fn giant_msg_small_window_no_stall() {
     let _no_snap = crate::testing::without_snapshots();
     let _no_trace = crate::testing::without_tracing();
@@ -1090,6 +1091,78 @@ fn giant_msg_small_window_no_stall() {
     let (writers, readers) = run_giant_msg_small_window(4, 512 * 1024, 256 * 1024);
 
     info!(writers, readers, "giant_msg_small_window result");
+    assert_eq!(writers, 4, "all 4 giant-msg writers must complete");
+    assert_eq!(readers, 4, "all 4 readers must complete");
+}
+
+/// Harder variant: a segment more than 2× the window. A single `on_blocked_signal` doubling
+/// (growth_ratio 1→2) only covers up to 2× the bootstrap window; a segment past that needs the
+/// window to grow further while `consumed` is still stuck at 0 (nothing delivered). This pins
+/// whether the synthetic-blocked fix drives *enough* growth, not just one doubling.
+#[test]
+fn giant_msg_tiny_window_no_stall() {
+    let _no_snap = crate::testing::without_snapshots();
+    let _no_trace = crate::testing::without_tracing();
+
+    // 96 KiB window; the writer's max segment (~330 KiB at 1500 MTU) is ~3.4× the window, so a
+    // single doubling (96→192 KiB) is not enough — growth must reach ≥ 4× (96→192→384 KiB).
+    let (writers, readers) = run_giant_msg_small_window(2, 512 * 1024, 96 * 1024);
+
+    info!(writers, readers, "giant_msg_tiny_window result");
+    assert_eq!(writers, 2, "all 2 giant-msg writers must complete");
+    assert_eq!(readers, 2, "all 2 readers must complete");
+}
+
+/// The hardest case: the recv pool's per-acquire ceiling (`max_single_acquire`) is *smaller* than
+/// the writer's max segment. A single `poll_acquire` can never cover a whole segment, so the reader
+/// must acquire across *multiple* `max_single_acquire`-sized slices — advertising a partial window
+/// and re-arming until the writer's demand is met — for the segment to ever complete. This is the
+/// case a fixed window cap (or a single-slice advertisement) cannot solve, and is reachable in
+/// production at jumbo MTU on a latency-sensitive tier (max segment ≈ 2.16 MiB vs a 1 MiB
+/// control-tier ceiling). The demand-targeting reader (see `maybe_send_max_data`) handles it.
+#[test]
+fn giant_msg_segment_exceeds_pool_ceiling_no_stall() {
+    let _no_snap = crate::testing::without_snapshots();
+    let _no_trace = crate::testing::without_tracing();
+
+    // 64 KiB window, and a 128 KiB per-acquire ceiling — BELOW the writer's ~330 KiB max segment.
+    // No single acquire covers the segment; the reader must stitch together multiple slices.
+    let (writers, readers) = run_giant_msg_small_window_pool(
+        1,
+        512 * 1024,
+        64 * 1024,
+        Some((4 * 1024 * 1024, 128 * 1024)),
+    );
+
+    info!(
+        writers,
+        readers, "giant_msg_segment_exceeds_pool_ceiling result"
+    );
+    assert_eq!(writers, 1, "writer must complete");
+    assert_eq!(readers, 1, "reader must complete");
+}
+
+/// Boundary: the recv pool's per-acquire ceiling (`max_single_acquire`) is itself larger than the
+/// writer's max segment, so window growth — capped at `max_single_acquire / window_size` — can
+/// always reach a full segment. This confirms the synthetic-blocked + demand-driven-growth fix
+/// holds when the pool ceiling is the binding constraint rather than the bootstrap window, as long
+/// as the ceiling admits one segment.
+#[test]
+fn giant_msg_small_window_constrained_pool_no_stall() {
+    let _no_snap = crate::testing::without_snapshots();
+    let _no_trace = crate::testing::without_tracing();
+
+    // 64 KiB window, 4 MiB pool with a 1 MiB per-acquire ceiling. The max segment (~330 KiB) is
+    // well under the 1 MiB ceiling, so growth (64 KiB → … → up to 1 MiB) can always cover a
+    // segment; the pool capacity (4 MiB) forces readers to park/re-acquire across the transfer.
+    let (writers, readers) = run_giant_msg_small_window_pool(
+        4,
+        512 * 1024,
+        64 * 1024,
+        Some((4 * 1024 * 1024, 1024 * 1024)),
+    );
+
+    info!(writers, readers, "giant_msg_constrained_pool result");
     assert_eq!(writers, 4, "all 4 giant-msg writers must complete");
     assert_eq!(readers, 4, "all 4 readers must complete");
 }
@@ -1249,7 +1322,8 @@ fn msg_reset_recv_credit_conserved() {
     // 4 rounds × 18 streams = 72 cancellable msg transfers. 8 messages of 256 KiB each
     // (2 MiB/stream), cancel survivors after 2 messages. 4 MiB recv pool, 1 MiB per-acquire cap —
     // oversubscribed so readers park/re-acquire repeatedly and any teardown leak accumulates.
-    let leak = run_msg_reset_recv_conservation(4, 18, 256 * 1024, 8, 2, 4 * 1024 * 1024, 1024 * 1024);
+    let leak =
+        run_msg_reset_recv_conservation(4, 18, 256 * 1024, 8, 2, 4 * 1024 * 1024, 1024 * 1024);
 
     info!(leak, "msg_reset recv pool shortfall");
     assert_eq!(

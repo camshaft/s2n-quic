@@ -87,6 +87,18 @@ pub(crate) struct StreamState {
     /// reconciliation already accounted for the full advertised window — any
     /// late-arriving (but in-window) bytes would otherwise be released twice.
     pub(crate) recv_finished: bool,
+    /// Highest QueueMsg segment-end (`stream_offset + message_size`) for which dispatch has already
+    /// injected a synthetic blocked signal toward the reader.
+    ///
+    /// A QueueMsg segment is reassembled *whole*: it is never delivered until every chunk arrives,
+    /// which cannot happen while its extent lies past the reader's advertised window. The writer's
+    /// demand hints (`largest_offset`, the in-band `blocked` bit) ride *inside* those undelivered
+    /// chunks, so the reader would never learn to grow the window — a mutual stall. Dispatch holds
+    /// the demand on the first chunk (`message_size`), so it injects a synthetic
+    /// `msg::Stream::Blocked { synthetic: true }` carrying the segment end, which drives the reader
+    /// to open its window to that known offset. Deduped on this monotonic offset so the signal goes
+    /// out once per segment, not once per chunk.
+    pub(crate) synth_blocked_offset: u64,
 }
 
 impl StreamState {
@@ -95,6 +107,7 @@ impl StreamState {
         self.flush_watermark = 0;
         self.max_received_offset = 0;
         self.recv_finished = false;
+        self.synth_blocked_offset = 0;
         // initial_window_remaining is reset by the caller on bind because the
         // value comes from configuration that lives outside the slot.
     }
@@ -207,6 +220,7 @@ impl Slot {
                 max_received_offset: 0,
                 initial_window_remaining: 0,
                 recv_finished: false,
+                synth_blocked_offset: 0,
             }),
             control: Half::new(),
         }
@@ -477,7 +491,38 @@ impl Slot {
                     Ok((half::AutoWake::default(), release_bytes))
                 }
             }
-            None => Ok((half::AutoWake::default(), release_bytes)),
+            // The segment did NOT complete this chunk. If its full extent lies past the reader's
+            // advertised window it can *never* complete (every chunk stays checked out in the
+            // MsgTable, nothing is delivered) and the writer's demand hints are stranded inside
+            // those undelivered chunks. Inject a synthetic blocked signal carrying the segment end
+            // so the reader opens its window to that known demand. Deduped on `synth_blocked_offset`
+            // so it goes out once per segment, not per chunk; the returned waker ensures a reader
+            // parked with no deliverable data still wakes to process it.
+            None => {
+                let segment_end = stream_offset.saturating_add(message_size as u64);
+                if segment_end > self.advertised_window()
+                    && segment_end > stream.extra.synth_blocked_offset
+                {
+                    stream.extra.synth_blocked_offset = segment_end;
+                    let entry: intrusive::Entry<msg::Stream> = msg::Stream::Blocked {
+                        desired_offset: VarInt::new(segment_end).unwrap_or(VarInt::MAX),
+                        synthetic: true,
+                    }
+                    .into();
+                    stream.queue.push_back(entry);
+                    trace!(
+                        msg_id,
+                        stream_offset,
+                        message_size,
+                        segment_end,
+                        advertised = self.advertised_window(),
+                        "slot::send_msg synthetic blocked signal (segment exceeds advertised window)"
+                    );
+                    Ok((stream.take_waker(), release_bytes))
+                } else {
+                    Ok((half::AutoWake::default(), release_bytes))
+                }
+            }
         }
     }
 
@@ -1004,7 +1049,7 @@ mod tests {
         let slot = Slot::with_queue_id(v(0));
         slot.allocate_and_open(v(5), 0).unwrap();
         simulate_receiver_drop(&slot); // tombstone = 5
-        // A stale init (binding 4 < tombstone 5) must NOT resurrect the slot.
+                                       // A stale init (binding 4 < tombstone 5) must NOT resurrect the slot.
         assert_eq!(
             slot.allocate_and_open(v(4), 0),
             Ok(AllocateOutcome::Stale),
@@ -1021,7 +1066,7 @@ mod tests {
         let slot = Slot::with_queue_id(v(0));
         slot.allocate_and_open(v(5), 0).unwrap();
         simulate_receiver_drop(&slot); // tombstone = 5
-        // A duplicate init for the just-freed binding (5 == tombstone 5) is stale too.
+                                       // A duplicate init for the just-freed binding (5 == tombstone 5) is stale too.
         assert_eq!(
             slot.allocate_and_open(v(5), 0),
             Ok(AllocateOutcome::Stale),
@@ -1034,7 +1079,7 @@ mod tests {
         let slot = Slot::with_queue_id(v(0));
         slot.allocate_and_open(v(5), 0).unwrap();
         simulate_receiver_drop(&slot); // tombstone = 5
-        // A strictly-greater binding is a legitimate new generation.
+                                       // A strictly-greater binding is a legitimate new generation.
         assert_eq!(
             slot.allocate_and_open(v(6), 0),
             Ok(AllocateOutcome::Allocated),
@@ -1487,6 +1532,7 @@ mod tests {
             // every byte is accounted as pool-backed.
             initial_window_remaining: 0,
             recv_finished: false,
+            synth_blocked_offset: 0,
         };
 
         // The reader advertised (and therefore acquired) only 10 bytes of pool credit. A peer that
@@ -1520,6 +1566,7 @@ mod tests {
             max_received_offset: 0,
             initial_window_remaining: 4,
             recv_finished: false,
+            synth_blocked_offset: 0,
         };
 
         // Advertised window comfortably above what arrives. First 4 bytes are unbacked (release 0),
