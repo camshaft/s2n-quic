@@ -494,18 +494,25 @@ impl Slot {
             // The segment did NOT complete this chunk. If its full extent lies past the reader's
             // advertised window it can *never* complete (every chunk stays checked out in the
             // MsgTable, nothing is delivered) and the writer's demand hints are stranded inside
-            // those undelivered chunks. Inject a synthetic blocked signal carrying the segment end
-            // so the reader opens its window to that known demand. Deduped on `synth_blocked_offset`
-            // so it goes out once per segment, not per chunk; the returned waker ensures a reader
-            // parked with no deliverable data still wakes to process it.
+            // those undelivered chunks — the synthetic signal is the ONLY path those hints can
+            // reach the reader, since the chunks themselves never deliver. So carry the writer's
+            // full hinted demand, not just this segment's end:
+            //   * `peer_max_offset` — the writer's `largest_offset` high watermark (`next_offset +
+            //     buffered_len`), i.e. everything it wants to send. Opening the window to this lets
+            //     a multi-segment message advance without re-blocking once per segment.
+            //   * `segment_end` (`stream_offset + message_size`) — the floor: this specific segment
+            //     must be coverable to complete. `peer_max_offset` is normally >= it, but take the
+            //     max defensively in case a hint lagged.
+            // Deduped on `synth_blocked_offset` so the signal goes out once per demand level, not
+            // per chunk; the returned waker wakes a reader parked with no deliverable data.
             None => {
                 let segment_end = stream_offset.saturating_add(message_size as u64);
-                if segment_end > self.advertised_window()
-                    && segment_end > stream.extra.synth_blocked_offset
+                let desired = peer_max_offset.max(segment_end);
+                if desired > self.advertised_window() && desired > stream.extra.synth_blocked_offset
                 {
-                    stream.extra.synth_blocked_offset = segment_end;
+                    stream.extra.synth_blocked_offset = desired;
                     let entry: intrusive::Entry<msg::Stream> = msg::Stream::Blocked {
-                        desired_offset: VarInt::new(segment_end).unwrap_or(VarInt::MAX),
+                        desired_offset: VarInt::new(desired).unwrap_or(VarInt::MAX),
                         synthetic: true,
                     }
                     .into();
@@ -515,6 +522,8 @@ impl Slot {
                         stream_offset,
                         message_size,
                         segment_end,
+                        peer_max_offset,
+                        desired,
                         advertised = self.advertised_window(),
                         "slot::send_msg synthetic blocked signal (segment exceeds advertised window)"
                     );
