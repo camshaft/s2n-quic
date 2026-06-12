@@ -344,6 +344,23 @@ impl Slot {
     ///
     /// If `write_fn` returns `Err`, the checkout is cleared without marking received
     /// (the transport will retransmit).
+    ///
+    /// # Oversized-message deadlock breaker
+    ///
+    /// A QueueMsg message is delivered only once a whole segment is reassembled. A message whose
+    /// extent (`stream_offset + message_size`) lies past the reader's advertised receive window can
+    /// therefore *never* complete: every chunk stays checked out in the [`MsgTable`] and nothing is
+    /// delivered. The writer's demand hints (`peer_max_offset` / the in-band `blocked` bit) ride
+    /// inside those undelivered chunks, so the reader would never learn it must grow the window — a
+    /// mutual stall (writer waits for window, reader waits for a completed message to learn the
+    /// demand). We have the demand in hand here on the very first chunk, so when a segment won't fit
+    /// the advertised window we inject a *synthetic* `msg::Stream::Blocked { synthetic: true }`
+    /// carrying the writer's hinted demand directly onto the stream queue — bypassing the MsgTable,
+    /// exactly as a real `QueueDataBlocked` would. The reader opens its window to that demand (see
+    /// the "Window sizing" docs on [`crate::stream`]'s reader). The `synthetic` flag tells the reader
+    /// this is known, bounded demand, NOT streaming back-pressure, so it must not ramp the
+    /// speculative `growth_ratio` headroom. Deduped on [`StreamState::synth_blocked_offset`] so the
+    /// signal goes out once per demand level, not once per chunk.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn push_msg<E>(
         &self,

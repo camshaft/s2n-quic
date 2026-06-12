@@ -17,6 +17,58 @@
 //! Flow control is managed by tracking how much data the application has consumed and
 //! periodically sending MAX_DATA frames to increase the sender's window. The initial window
 //! is advertised during flow establishment.
+//!
+//! ## Window sizing: two independent mechanisms (read before touching `growth_ratio`)
+//!
+//! The advertised receive window (`remote_max_data`) is driven by **two distinct, deliberately
+//! separate** inputs. They have been conflated and the second one removed more than once; both are
+//! load-bearing, and the bugs they prevent are subtle (silent stalls / throughput collapse, not
+//! crashes), so the distinction is spelled out here.
+//!
+//! 1. **Explicit demand — `peer_max_offset`.** The highest offset the writer has told us it wants
+//!    to reach, via the per-frame `largest_offset` hint, a real `QueueDataBlocked`, or a synthetic
+//!    blocked signal (see below). The reader advertises a window *up to this offset and no further*.
+//!    Demand is pursued **directly**: the only thing that bounds how fast we get there is the recv
+//!    credit pool (each `poll_acquire` is clamped to `max_single_acquire`, with capacity and
+//!    fair-share gating the rest), so a demand larger than one acquire is satisfied across
+//!    successive polls, never refused. We never advertise past the demand, so a writer that wants
+//!    less than the standing window does not inflate it.
+//!
+//! 2. **Streaming headroom — `growth_ratio`.** Demand alone is *not enough* for a continuously
+//!    backlogged (bulk-streaming) writer. Such a writer's hinted high-water mark trails its true
+//!    intent by roughly one RTT of in-flight data: by the time a MAX_DATA we send reaches it and it
+//!    sends more, it has already hit the window edge again. If the window only ever equalled the
+//!    last-observed demand, the sender's flow-control budget (`remote_max_data - next_offset`) would
+//!    sit at ~zero every round trip and throughput would collapse to one window per RTT — a small
+//!    fraction of a high-bandwidth-delay-product path. So when a writer *repeatedly* signals blocked
+//!    (real `QueueDataBlocked` / in-band `blocked` bit), we slow-start the window *ahead* of its
+//!    observed demand — `consumed + window_size * growth_ratio`, doubling `growth_ratio` per drained
+//!    window — to keep a BDP of runway in front of it. This is purely additive headroom layered on
+//!    top of (1); it does **not** cap demand.
+//!
+//!    This is why `growth_ratio` cannot be deleted "because we already track `peer_max_offset`":
+//!    `peer_max_offset` is *reactive* (where the writer has been), `growth_ratio` is *predictive*
+//!    (where a streaming writer is about to be). Removing it reintroduces the bulk-throughput
+//!    collapse pinned by `bulk_stream_opens_window_to_bdp`.
+//!
+//! The two are combined in [`Inner::maybe_send_max_data`]: `target = peer_max_offset`, plus the
+//! `growth_ratio` runway *only while a real streaming writer is actively blocking* (`growth_ratio >
+//! 1`). A non-streaming writer (one-shot request, bounded message) gets exactly its demand with no
+//! speculative headroom.
+//!
+//! ### The synthetic blocked signal (oversized QueueMsg messages)
+//!
+//! A QueueMsg message is reassembled *whole* on the receiver: it is never delivered to the
+//! application until every chunk of a segment arrives. A message larger than the currently
+//! advertised window therefore can never complete — and the writer's demand hints ride *inside*
+//! those undelivered chunks, so without help the reader would never learn to grow the window: a
+//! mutual stall (see [`crate::queue::slot::Slot::push_msg`]). To break it, the dispatch side — which
+//! sees the message size on the first chunk — injects a *synthetic* `msg::Stream::Blocked` carrying
+//! the message's demand. That feeds mechanism (1) directly (it is known, bounded demand) but
+//! deliberately does **not** drive mechanism (2): a one-shot message is not evidence of a streaming
+//! writer, and ramping `growth_ratio` off it would inflate the window for unrelated later traffic.
+//! The `synthetic: bool` flag on `msg::Stream::Blocked` is exactly this distinction: "record the
+//! demand, but do not ramp the streaming headroom."
 
 // TODOs:
 //
@@ -340,9 +392,12 @@ struct Inner {
     /// drained. Window growth *beyond* the unbacked window is pool-backed as before. Each MAX_DATA
     /// extension draws from this first, and only the remainder is acquired from the pool.
     unbacked_remaining: u64,
-    /// Bootstrap window and top-up threshold (no longer the acquire ceiling). The advertised
-    /// window now tracks the writer's hinted high watermark, grown multiplicatively on blocked
-    /// signals up to the recv pool's `max_single_acquire`.
+    /// Bootstrap window and top-up unit — NOT the acquire ceiling. Two roles:
+    ///   * the window the reader advertises before any demand hint arrives (cold start), and
+    ///   * the base unit of the streaming-headroom runway (`window_size * growth_ratio`) and the
+    ///     `window_size / 2` hysteresis at which a consumed-driven top-up fires.
+    /// The advertised window itself tracks the writer's hinted demand (`peer_max_offset`); see the
+    /// module-level "Window sizing" docs.
     window_size: u64,
     /// Highest absolute offset the writer has told us it wants to send — its explicit demand.
     /// Running max of the per-frame `peer_max_offset` hint, any blocked `desired_offset`, and the
@@ -1102,9 +1157,15 @@ impl Inner {
         Poll::Ready(Err(io::Error::new(io::ErrorKind::InvalidData, reset_error)))
     }
 
-    /// Maximum window-growth ratio: the most we can scale `window_size` before the resulting
-    /// acquire would exceed the pool's per-request ceiling. Clamping the *ratio* (not just the
-    /// byte target) is what makes the doubling terminate.
+    /// Maximum window-growth ratio: the most we can scale `window_size` before a single window
+    /// extension would exceed the pool's per-request ceiling (`max_single_acquire`). Clamping the
+    /// *ratio* here is what makes the slow-start doubling in [`on_blocked_signal`] terminate.
+    ///
+    /// Note this bounds only the *speculative streaming headroom* (mechanism (2) in the module
+    /// docs). It does not bound explicit demand (`peer_max_offset`): demand past this ceiling is
+    /// still pursued, just across multiple `max_single_acquire`-sized acquires rather than one.
+    ///
+    /// [`on_blocked_signal`]: Self::on_blocked_signal
     #[inline]
     fn max_growth_ratio(&self) -> u32 {
         let max_single = self.recv_credit_pool.max_single_acquire(self.priority);
@@ -1112,19 +1173,42 @@ impl Inner {
         (ratio as u32).max(1)
     }
 
-    /// React to a blocked signal (in-band `blocked` bit or standalone `QueueDataBlocked`).
+    /// React to a **real** peer blocked signal (in-band `blocked` bit or standalone
+    /// `QueueDataBlocked`) by widening the *streaming headroom* — mechanism (2) in the module-level
+    /// "Window sizing" docs.
     ///
-    /// Doubles the growth ratio when the writer still wants past our current runway (`desired >
-    /// cap`) AND the application has made progress since the last doubling (`consumed >
-    /// acted_blocked_offset`). The two conditions together mean: the writer is *persistently*
-    /// blocked — it keeps hitting the window edge even as we drain — so we widen the runway. The
-    /// `consumed`-advanced gate both paces growth (≈ one doubling per drained window) and dedups the
-    /// burst of blocked frames / retransmits that share a consumption level.
+    /// # Why this exists (do not remove)
     ///
-    /// Growth terminates on its own: once the runway outpaces the writer (`desired <= cap`) the
-    /// writer stops setting the blocked bit, so no more signals arrive; and `growth_ratio` is hard
-    /// capped at `max_growth_ratio` regardless. The ratio is held (never reset mid-stream) to avoid
-    /// thrashing during steady state.
+    /// It is tempting to delete this and rely on `peer_max_offset` alone, since both feed the same
+    /// advertised window. That is wrong and has regressed bulk throughput before. `peer_max_offset`
+    /// is *reactive* — the highest offset the writer has already told us it wants. A continuously
+    /// backlogged writer's hint always trails its real intent by ~one RTT of in-flight data, so a
+    /// window sized to exactly the last hint leaves the sender with ~zero flow-control budget every
+    /// round trip and throughput collapses to one window per RTT. `growth_ratio` is the *predictive*
+    /// half: a writer that keeps signalling blocked is outrunning our updates, so we open the runway
+    /// *ahead* of its observed demand to keep a bandwidth-delay product in flight. This is the exact
+    /// failure `bulk_stream_opens_window_to_bdp` pins.
+    ///
+    /// # Mechanism
+    ///
+    /// Double `growth_ratio` when the writer still wants past our current runway (`desired > cap`)
+    /// AND the application has drained past the last level we grew for (`consumed >=
+    /// acted_blocked_offset`). The two conditions together mean the writer is *persistently* blocked
+    /// — still hitting the edge even as we drain — which is the signal that more headroom is
+    /// warranted. The `consumed`-advanced gate paces growth to ≈ one doubling per drained window and
+    /// dedups the burst of blocked frames / retransmits that share a consumption level. Keying the
+    /// dedup on `consumed` (not on the writer's absolute `desired`) is deliberate: a bulk writer's
+    /// high-water mark is roughly constant, so keying on `desired` would latch after one doubling
+    /// and the runway would never open past `2 * window_size`.
+    ///
+    /// Growth terminates on its own: once the runway outpaces the writer it stops setting the
+    /// blocked bit (no more signals), and `growth_ratio` is hard-capped at [`max_growth_ratio`]
+    /// regardless. The ratio is held (never reset mid-stream) to avoid thrashing in steady state.
+    ///
+    /// Only *real* peer signals reach here — a synthetic (oversized-message) blocked signal records
+    /// demand without ramping headroom, so the caller routes it past this. See the module docs.
+    ///
+    /// [`max_growth_ratio`]: Self::max_growth_ratio
     fn on_blocked_signal(&mut self, desired: u64) {
         let consumed = self.reassembler.consumed_len();
         let cap =
