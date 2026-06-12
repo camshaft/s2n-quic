@@ -4,7 +4,6 @@
 use crate::{
     credentials::{Credentials, Id},
     crypto::{self, awslc},
-    event,
     packet::{secret_control as control, Packet},
     path::secret::{
         open,
@@ -346,11 +345,13 @@ impl Map {
         use crate::path::secret::{receiver, schedule, sender};
 
         let provider = Self::new(
-            stateless_reset::Signer::random(),
-            peers.len() * 3,
-            false,
-            time::NoopClock,
-            event::testing::Subscriber::no_snapshot(),
+            Self::builder()
+                .with_signer(stateless_reset::Signer::random())
+                .with_capacity(peers.len() * 3)
+                .with_clock(time::NoopClock)
+                .with_subscriber(crate::event::testing::Subscriber::no_snapshot())
+                .build()
+                .unwrap(),
         );
         let mut secret = [0; 32];
         aws_lc_rs::rand::fill(&mut secret).unwrap();
