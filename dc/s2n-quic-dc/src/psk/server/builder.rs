@@ -22,7 +22,6 @@ pub struct Builder<
     pub(crate) recv_window: u64,
     pub(crate) mtu: u16,
     pub(crate) max_idle_timeout: Duration,
-    pub(crate) data_addrs: Vec<SocketAddr>,
     pub(crate) pto_jitter_percentage: u8,
     #[cfg(any(test, feature = "testing"))]
     pub(crate) endpoint_limits: Option<TestEndpointLimiter>,
@@ -52,7 +51,6 @@ impl Default for Builder<s2n_quic::provider::event::default::Subscriber> {
             recv_window: DEFAULT_RECV_WINDOW,
             mtu: DEFAULT_MTU,
             max_idle_timeout: DEFAULT_IDLE_TIMEOUT,
-            data_addrs: Vec::new(),
             pto_jitter_percentage: DEFAULT_PTO_JITTER_PERCENTAGE,
             #[cfg(any(test, feature = "testing"))]
             endpoint_limits: None,
@@ -72,7 +70,6 @@ impl<Event: s2n_quic::provider::event::Subscriber> Builder<Event> {
             recv_window: self.recv_window,
             mtu: self.mtu,
             max_idle_timeout: self.max_idle_timeout,
-            data_addrs: self.data_addrs,
             pto_jitter_percentage: self.pto_jitter_percentage,
             #[cfg(any(test, feature = "testing"))]
             endpoint_limits: self.endpoint_limits,
@@ -116,12 +113,6 @@ impl<Event: s2n_quic::provider::event::Subscriber> Builder<Event> {
     /// timeout.
     pub fn with_max_idle_timeout(mut self, max_idle_timeout: Duration) -> Self {
         self.max_idle_timeout = max_idle_timeout;
-        self
-    }
-
-    /// Sets the local data addresses to advertise to the peer.
-    pub fn with_data_addrs(mut self, addrs: Vec<SocketAddr>) -> Self {
-        self.data_addrs = addrs;
         self
     }
 
