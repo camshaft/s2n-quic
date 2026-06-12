@@ -81,18 +81,6 @@ pub(crate) struct StreamState {
     /// new-byte release subtracts from this first, so only bytes beyond the
     /// initial window are returned to the recv credit pool.
     pub(crate) initial_window_remaining: u64,
-    /// Highest QueueMsg segment-end (`stream_offset + message_size`) for which dispatch has already
-    /// injected a synthetic blocked signal toward the reader.
-    ///
-    /// A QueueMsg segment is reassembled *whole*: it is never delivered until every chunk arrives,
-    /// which cannot happen while its extent lies past the reader's advertised window. The writer's
-    /// demand hints (`largest_offset`, the in-band `blocked` bit) ride *inside* those undelivered
-    /// chunks, so the reader would never learn to grow the window — a mutual stall. Dispatch holds
-    /// the demand on the first chunk (`message_size`), so it injects a synthetic
-    /// `msg::Stream::Blocked { synthetic: true }` carrying the segment end, which drives the reader
-    /// to open its window to that known offset. Deduped on this monotonic offset so the signal goes
-    /// out once per segment, not once per chunk.
-    pub(crate) synth_blocked_offset: u64,
     /// Set once the reader has reconciled its advertised window on termination
     /// (see [`StreamState::finish_recv_accounting`]). After this point
     /// [`StreamState::observe_offset`] stops releasing, because the terminal
@@ -107,7 +95,6 @@ impl StreamState {
         self.flush_watermark = 0;
         self.max_received_offset = 0;
         self.recv_finished = false;
-        self.synth_blocked_offset = 0;
         // initial_window_remaining is reset by the caller on bind because the
         // value comes from configuration that lives outside the slot.
     }
@@ -220,7 +207,6 @@ impl Slot {
                 max_received_offset: 0,
                 initial_window_remaining: 0,
                 recv_finished: false,
-                synth_blocked_offset: 0,
             }),
             control: Half::new(),
         }
@@ -359,8 +345,9 @@ impl Slot {
     /// exactly as a real `QueueDataBlocked` would. The reader opens its window to that demand (see
     /// the "Window sizing" docs on [`crate::stream`]'s reader). The `synthetic` flag tells the reader
     /// this is known, bounded demand, NOT streaming back-pressure, so it must not ramp the
-    /// speculative `growth_ratio` headroom. Deduped on [`StreamState::synth_blocked_offset`] so the
-    /// signal goes out once per demand level, not once per chunk.
+    /// speculative `growth_ratio` headroom. Deduped via a per-message latch on the MsgTable entry
+    /// ([`MsgTable::mark_synth_signal_sent`]) so the signal goes out once per stalled message, not
+    /// once per chunk.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn push_msg<E>(
         &self,
@@ -520,14 +507,20 @@ impl Slot {
             //   * `segment_end` (`stream_offset + message_size`) — the floor: this specific segment
             //     must be coverable to complete. `peer_max_offset` is normally >= it, but take the
             //     max defensively in case a hint lagged.
-            // Deduped on `synth_blocked_offset` so the signal goes out once per demand level, not
-            // per chunk; the returned waker wakes a reader parked with no deliverable data.
+            // Deduped via a per-message latch on the MsgTable entry (`mark_synth_signal_sent`) so
+            // the signal goes out once per stalled message, not once per chunk; a message's demand
+            // is constant across its chunks, so there is no higher demand to re-signal. The returned
+            // waker wakes a reader parked with no deliverable data.
             None => {
                 let segment_end = stream_offset.saturating_add(message_size as u64);
                 let desired = peer_max_offset.max(segment_end);
-                if desired > self.advertised_window() && desired > stream.extra.synth_blocked_offset
-                {
-                    stream.extra.synth_blocked_offset = desired;
+                let first_signal = desired > self.advertised_window()
+                    && stream
+                        .extra
+                        .msg_table
+                        .as_mut()
+                        .is_some_and(|t| t.mark_synth_signal_sent(msg_id));
+                if first_signal {
                     let entry: intrusive::Entry<msg::Stream> = msg::Stream::Blocked {
                         desired_offset: VarInt::new(desired).unwrap_or(VarInt::MAX),
                         synthetic: true,
@@ -1558,7 +1551,6 @@ mod tests {
             // every byte is accounted as pool-backed.
             initial_window_remaining: 0,
             recv_finished: false,
-            synth_blocked_offset: 0,
         };
 
         // The reader advertised (and therefore acquired) only 10 bytes of pool credit. A peer that
@@ -1592,7 +1584,6 @@ mod tests {
             max_received_offset: 0,
             initial_window_remaining: 4,
             recv_finished: false,
-            synth_blocked_offset: 0,
         };
 
         // Advertised window comfortably above what arrives. First 4 bytes are unbacked (release 0),
