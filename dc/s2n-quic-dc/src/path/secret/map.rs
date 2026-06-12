@@ -91,14 +91,6 @@ impl fmt::Debug for Map {
 }
 
 impl Map {
-    pub fn new<S>(store: Arc<S>) -> Self
-    where
-        S: Store,
-    {
-        let store: Arc<dyn Store> = store;
-        Self { store }
-    }
-
     pub fn builder() -> StateBuilder<time::StdClock, crate::event::tracing::Subscriber> {
         state::State::builder()
     }
@@ -140,12 +132,6 @@ impl Map {
         cb: Box<dyn Fn(SocketAddr, HandshakeReason) -> Option<JoinHandle<()>> + Send + Sync>,
     ) {
         self.store.register_request_handshake(cb);
-    }
-
-    /// Set the local `DcPeerInfo` payload this endpoint advertises to peers
-    /// (the outbound QUIC transport parameter).
-    pub fn set_advertised_peer_info(&self, bytes: bytes::Bytes) {
-        self.store.set_advertised_peer_info(bytes);
     }
 
     /// Get a clone of the local `DcPeerInfo` payload advertised to peers.
@@ -344,15 +330,13 @@ impl Map {
     ) -> (Self, Vec<Id>) {
         use crate::path::secret::{receiver, schedule, sender};
 
-        let provider = Self::new(
-            Self::builder()
-                .with_signer(stateless_reset::Signer::random())
-                .with_capacity(peers.len() * 3)
-                .with_clock(time::NoopClock)
-                .with_subscriber(crate::event::testing::Subscriber::no_snapshot())
-                .build()
-                .unwrap(),
-        );
+        let provider = Self::builder()
+            .with_signer(stateless_reset::Signer::random())
+            .with_capacity(peers.len() * 3)
+            .with_clock(time::NoopClock)
+            .with_subscriber(crate::event::testing::Subscriber::no_snapshot())
+            .build()
+            .unwrap();
         let mut secret = [0; 32];
         aws_lc_rs::rand::fill(&mut secret).unwrap();
         let mut stateless_reset = [0; control::TAG_LEN];
