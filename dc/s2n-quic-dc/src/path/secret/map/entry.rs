@@ -72,10 +72,6 @@ pub struct Entry {
     // maps while not having two writes and wasting an extra byte of space.
     accessed: AtomicU8,
     application_data: Option<ApplicationData>,
-    /// Opaque peer info bytes received from the remote peer via the DcPeerInfo
-    /// transport parameter during the QUIC TLS handshake. Used for application-level
-    /// negotiation (service discovery and RPC version negotiation).
-    peer_info: Option<bytes::Bytes>,
     last_activity: AtomicU64,
     dead_at: AtomicI64,
     /// The peer's data recv addresses, learned via the post-handshake exchange.
@@ -119,7 +115,6 @@ impl SizeOf for Entry {
             parameters,
             accessed,
             application_data,
-            peer_info,
             last_activity,
             dead_at,
             peer_data_addrs,
@@ -135,7 +130,6 @@ impl SizeOf for Entry {
             + parameters.size()
             + accessed.size()
             + application_data.size()
-            + peer_info.as_ref().map_or(0, |b| b.len())
             + last_activity.size()
             + dead_at.size()
             + std::mem::size_of::<PeerDataAddrs>()
@@ -184,7 +178,6 @@ impl Entry {
         parameters: dc::ApplicationParams,
         creation_time: Timestamp,
         application_data: Option<ApplicationData>,
-        peer_info: Option<bytes::Bytes>,
     ) -> Self {
         Self::new_with_socket_senders(
             peer,
@@ -194,7 +187,6 @@ impl Entry {
             parameters,
             creation_time,
             application_data,
-            peer_info,
             1,
         )
     }
@@ -208,7 +200,6 @@ impl Entry {
         parameters: dc::ApplicationParams,
         creation_time: Timestamp,
         application_data: Option<ApplicationData>,
-        peer_info: Option<bytes::Bytes>,
         socket_sender_count: usize,
     ) -> Self {
         // clamp max datagram size to a well-known value
@@ -238,7 +229,6 @@ impl Entry {
             parameters,
             accessed: AtomicU8::new(0),
             application_data,
-            peer_info,
             last_activity: AtomicU64::new(0),
             dead_at: AtomicI64::new(-1),
             peer_data_addrs: PeerDataAddrs::default(),
@@ -609,12 +599,6 @@ impl Entry {
         &self.application_data
     }
 
-    /// Returns the remote peer's PeerInfo bytes (the inbound DcPeerInfo
-    /// transport parameter), captured at construction time.
-    pub fn peer_info(&self) -> Option<&bytes::Bytes> {
-        self.peer_info.as_ref()
-    }
-
     #[cfg(test)]
     pub fn reset_sender_counter(&self) {
         self.sender.reset_counter();
@@ -631,7 +615,6 @@ pub struct TestEntryBuilder<'a> {
     params: Option<dc::ApplicationParams>,
     signer: Option<&'a super::stateless_reset::Signer>,
     application_data: Option<ApplicationData>,
-    peer_info: Option<bytes::Bytes>,
 }
 
 #[cfg(any(test, feature = "testing"))]
@@ -646,7 +629,6 @@ impl<'a> TestEntryBuilder<'a> {
             params: None,
             signer: None,
             application_data: None,
-            peer_info: None,
         }
     }
 
@@ -654,13 +636,6 @@ impl<'a> TestEntryBuilder<'a> {
     /// `make_application_data` hook would produce at handshake time).
     pub fn application_data(mut self, application_data: Option<ApplicationData>) -> Self {
         self.application_data = application_data;
-        self
-    }
-
-    /// Set the remote peer's `peer_info` bytes (the inbound DcPeerInfo
-    /// transport parameter) the built `Entry` will carry.
-    pub fn peer_info(mut self, peer_info: Option<bytes::Bytes>) -> Self {
-        self.peer_info = peer_info;
         self
     }
 
@@ -737,7 +712,6 @@ impl<'a> TestEntryBuilder<'a> {
             params,
             crate::time::DefaultClock::default().now().into(),
             self.application_data.clone(),
-            self.peer_info.clone(),
             self.socket_sender_count,
         ))
     }

@@ -152,7 +152,6 @@ impl Model {
                     dc::testing::TEST_APPLICATION_PARAMS,
                     crate::time::DefaultClock::default().now().into(),
                     None,
-                    None,
                 )));
 
                 self.invariants.insert(Invariant::ContainsIp(ip));
@@ -515,20 +514,17 @@ fn application_data_callback_error_propagates() {
     assert_eq!(err.msg, "boom");
 }
 
-/// The `Entry` carries the `peer_info` and `application_data` it was constructed
-/// with — the values the handshake path moves in (previously set post-hoc via
-/// the removed `set_peer_info`).
+/// The `Entry` carries the `application_data` it was constructed with — the
+/// value the handshake path moves in (produced by the `make_application_data`
+/// callback at handshake time).
 #[test]
-fn entry_carries_peer_info_and_application_data_from_constructor() {
-    let peer_info = bytes::Bytes::from_static(b"remote-peer-info");
+fn entry_carries_application_data_from_constructor() {
     let app_data: super::super::ApplicationData = Arc::new(7u32);
 
     let entry = Entry::builder((Ipv4Addr::LOCALHOST, 1).into())
-        .peer_info(Some(peer_info.clone()))
         .application_data(Some(app_data))
         .build();
 
-    assert_eq!(entry.peer_info(), Some(&peer_info));
     let stored = entry
         .application_data()
         .as_ref()
@@ -536,10 +532,9 @@ fn entry_carries_peer_info_and_application_data_from_constructor() {
     assert_eq!(*stored.clone().downcast::<u32>().unwrap(), 7);
 }
 
-/// An `Entry` built without negotiation carries neither.
+/// An `Entry` built without negotiation carries no application data.
 #[test]
-fn entry_without_negotiation_has_no_peer_info_or_application_data() {
+fn entry_without_negotiation_has_no_application_data() {
     let entry = Entry::builder((Ipv4Addr::LOCALHOST, 1).into()).build();
-    assert!(entry.peer_info().is_none());
     assert!(entry.application_data().is_none());
 }

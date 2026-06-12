@@ -400,7 +400,6 @@ impl Map {
                 dc::testing::TEST_APPLICATION_PARAMS,
                 crate::time::DefaultClock::default().now().into(),
                 None,
-                None,
             );
             let entry = Arc::new(entry);
             provider.store.test_insert(entry);

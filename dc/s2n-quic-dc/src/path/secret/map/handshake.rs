@@ -211,9 +211,6 @@ impl HandshakingPathInner {
             self.parameters.clone(),
             self.map.store.get_time(),
             self.application_data.take(),
-            // The remote peer's DcPeerInfo transport parameter, captured on the
-            // path when the handshake began.
-            self.peer_info.take(),
             socket_sender_count,
         );
         let entry = Arc::new(entry);
