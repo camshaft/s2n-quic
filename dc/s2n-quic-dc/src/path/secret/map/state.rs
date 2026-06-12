@@ -386,7 +386,7 @@ impl IdMap {
     }
 }
 
-pub(super) struct State<C, S>
+pub struct State<C, S>
 where
     C: 'static + time::Clock + Sync + Send,
     S: event::Subscriber,
@@ -430,6 +430,8 @@ where
     pub(super) request_handshake: RwLock<
         Option<Box<dyn Fn(SocketAddr, HandshakeReason) -> Option<JoinHandle<()>> + Send + Sync>>,
     >,
+
+    advertised_peer_info: OnceLock<bytes::Bytes>,
 
     cleaner: Cleaner,
 
@@ -561,6 +563,7 @@ where
             clock,
             subscriber,
             request_handshake: RwLock::new(None),
+            advertised_peer_info: OnceLock::new(),
             mk_application_data: RwLock::new(None),
         };
 
@@ -855,6 +858,19 @@ where
         cb: Box<dyn Fn(SocketAddr, HandshakeReason) -> Option<JoinHandle<()>> + Send + Sync>,
     ) {
         self.register_request_handshake(cb);
+    }
+
+    fn set_advertised_peer_info(&self, bytes: bytes::Bytes) {
+        tracing::debug!(
+            target: "dc_negotiation",
+            len = bytes.len(),
+            "set_advertised_peer_info: stamping local DcPeerInfo transport parameter"
+        );
+        let _ = self.advertised_peer_info.set(bytes);
+    }
+
+    fn advertised_peer_info(&self) -> Option<bytes::Bytes> {
+        self.advertised_peer_info.get().cloned()
     }
 
     #[allow(clippy::type_complexity)]

@@ -33,7 +33,15 @@ fn map(capacity: usize) -> Map {
 fn map_sub(capacity: usize, sub: Arc<Subscriber>) -> Map {
     let signer = stateless_reset::Signer::random();
 
-    let map = Map::new(signer, capacity, false, NoopClock, sub);
+    let map = Map::new(
+        Map::builder()
+            .with_signer(signer)
+            .with_capacity(capacity)
+            .with_clock(NoopClock)
+            .with_subscriber(sub)
+            .build()
+            .unwrap(),
+    );
 
     // stop the cleaner thread to avoid any out of order events
     map.test_stop_cleaner();

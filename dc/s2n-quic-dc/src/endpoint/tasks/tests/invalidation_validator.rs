@@ -35,20 +35,26 @@ struct TestSetup {
 
 fn setup(local_addr: SocketAddr, peer_addr: SocketAddr) -> TestSetup {
     let local_map = Map::new(
-        stateless_reset::Signer::new(SIGNER_SECRET),
-        16,
-        true,
-        NoopClock,
-        crate::event::tracing::Subscriber::default(),
+        Map::builder()
+            .with_signer(stateless_reset::Signer::new(SIGNER_SECRET))
+            .with_capacity(16)
+            .with_evict_on_unknown_path_secret(true)
+            .with_clock(NoopClock)
+            .with_subscriber(crate::event::tracing::Subscriber::default())
+            .build()
+            .unwrap(),
     );
     local_map.test_stop_cleaner();
 
     let peer_map = Map::new(
-        stateless_reset::Signer::new(b"peer-signer"),
-        16,
-        true,
-        NoopClock,
-        crate::event::tracing::Subscriber::default(),
+        Map::builder()
+            .with_signer(stateless_reset::Signer::new(b"peer-signer"))
+            .with_capacity(16)
+            .with_evict_on_unknown_path_secret(true)
+            .with_clock(NoopClock)
+            .with_subscriber(crate::event::tracing::Subscriber::default())
+            .build()
+            .unwrap(),
     );
     peer_map.test_stop_cleaner();
 

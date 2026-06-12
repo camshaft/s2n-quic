@@ -52,6 +52,7 @@ pub use entry::{
 };
 pub use handshake::HandshakingPath;
 pub use peer::Peer;
+pub use state::{State, StateBuilder, StateBuilderError};
 
 pub(crate) use size_of::SizeOf;
 pub(crate) use status::Dedup;
@@ -70,11 +71,6 @@ pub(crate) use status::Dedup;
 #[derive(Clone)]
 pub struct Map {
     store: Arc<dyn Store>,
-    /// The local `DcPeerInfo` payload this endpoint advertises to peers (sent as
-    /// the outbound QUIC transport parameter). Distinct from the *inbound*
-    /// `Entry::peer_info`, which is what a remote peer advertised to us. Set
-    /// once before the Map is used for connections; never changes after that.
-    advertised_peer_info: Arc<std::sync::OnceLock<bytes::Bytes>>,
 }
 
 impl PartialEq for Map {
@@ -96,30 +92,16 @@ impl fmt::Debug for Map {
 }
 
 impl Map {
-    pub fn new<C, S>(
-        signer: stateless_reset::Signer,
-        capacity: usize,
-        should_evict_on_unknown_path_secret: bool,
-        clock: C,
-        subscriber: S,
-    ) -> Self
+    pub fn new<S>(store: Arc<S>) -> Self
     where
-        C: 'static + time::Clock + Send + Sync,
-        S: event::Subscriber,
+        S: Store,
     {
-        let store = state::State::builder()
-            .with_signer(signer)
-            .with_capacity(capacity)
-            .with_evict_on_unknown_path_secret(should_evict_on_unknown_path_secret)
-            .with_clock(clock)
-            .with_subscriber(subscriber)
-            .build()
-            .unwrap();
+        let store: Arc<dyn Store> = store;
+        Self { store }
+    }
 
-        Self {
-            store,
-            advertised_peer_info: Arc::new(std::sync::OnceLock::new()),
-        }
+    pub fn builder() -> StateBuilder<time::StdClock, crate::event::tracing::Subscriber> {
+        state::State::builder()
     }
 
     /// The number of trusted secrets.
@@ -164,17 +146,12 @@ impl Map {
     /// Set the local `DcPeerInfo` payload this endpoint advertises to peers
     /// (the outbound QUIC transport parameter).
     pub fn set_advertised_peer_info(&self, bytes: bytes::Bytes) {
-        tracing::debug!(
-            target: "dc_negotiation",
-            len = bytes.len(),
-            "set_advertised_peer_info: stamping local DcPeerInfo transport parameter"
-        );
-        let _ = self.advertised_peer_info.set(bytes);
+        self.store.set_advertised_peer_info(bytes);
     }
 
     /// Get a clone of the local `DcPeerInfo` payload advertised to peers.
     pub fn advertised_peer_info(&self) -> Option<bytes::Bytes> {
-        self.advertised_peer_info.get().cloned()
+        self.store.advertised_peer_info()
     }
 
     /// Gets the [`Peer`] entry for the given address
