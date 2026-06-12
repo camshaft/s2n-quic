@@ -36,10 +36,10 @@ pub(crate) struct MsgEntry {
     /// Whether dispatch has already injected a synthetic blocked signal for this message.
     ///
     /// A message larger than the reader's advertised window can never complete (its chunks stay
-    /// checked out, never delivered), so dispatch synthesizes a blocked signal carrying the demand
-    /// to make the reader grow its window — see [`crate::queue::slot::Slot::push_msg`]. Without a
-    /// dedup that fires once per *chunk* of the stalled message (up to `MAX_CHUNKS`); this latches
-    /// after the first so the signal goes out once per message. A bool suffices because a message's
+    /// checked out and are never delivered), so dispatch synthesizes a blocked signal carrying the demand
+    /// to make the reader grow its window — see [`crate::queue::slot::Slot::push_msg`]. Without deduplication,
+    /// dispatch would inject that signal once per arriving chunk (up to `MAX_CHUNKS`); this latches after
+    /// the first so the signal goes out once per message.
     /// demand (`largest_offset`, the writer's whole-message high-water mark, identical on every
     /// chunk) does not rise within the message — so there is no higher demand to re-signal. Scoped
     /// to the entry: it is cleared for free when the entry drops on completion/eviction.
