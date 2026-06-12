@@ -344,9 +344,15 @@ struct Inner {
     /// window now tracks the writer's hinted high watermark, grown multiplicatively on blocked
     /// signals up to the recv pool's `max_single_acquire`.
     window_size: u64,
-    /// Highest absolute offset the writer has told us it wants to send (running max of the
-    /// per-frame `peer_max_offset` hint and any blocked `desired_offset`). Zero until the first
-    /// hint arrives, which keeps the bootstrap window behavior unchanged.
+    /// Highest absolute offset the writer has told us it wants to send — its explicit demand.
+    /// Running max of the per-frame `peer_max_offset` hint, any blocked `desired_offset`, and the
+    /// synthetic blocked signal's segment-demand. Zero until the first hint arrives, which keeps the
+    /// bootstrap window behavior unchanged.
+    ///
+    /// This is the window-sizing *target*: the reader always tries to advertise up to here, limited
+    /// only by the recv pool (per-acquire `max_single_acquire`, capacity, fair-share) — never by the
+    /// streaming `growth_ratio`. Demand is demand; if the peer says it wants the bytes we try to make
+    /// room for them.
     peer_max_offset: u64,
     /// `consumed_len` at the most recent window-growth doubling. Growth is gated on `consumed`
     /// advancing past this mark, which paces doublings to roughly once per drained window and
@@ -355,22 +361,17 @@ struct Inner {
     /// writer's high watermark is constant, so a single doubling would latch and the window would
     /// never open past `2 * window_size` while the writer stayed blocked.
     acted_blocked_offset: u64,
-    /// Multiplicative window-growth factor (slow-start). Starts at 1×, doubles on each blocked
-    /// signal that outstrips the current cap, clamped so the window can't exceed the pool's
-    /// `max_single_acquire`. Held until the stream goes idle (never reset mid-stream).
+    /// Multiplicative window-growth factor (slow-start), serving the *streaming* case. Starts at 1×,
+    /// doubles on each real `QueueDataBlocked` / in-band `blocked` bit that outstrips the current
+    /// runway, clamped at `max_single_acquire / window_size`. Held until the stream goes idle.
     ///
-    /// This is the *streaming* mechanism: it serves a writer with open-ended demand that keeps
-    /// hitting the window edge (real `QueueDataBlocked` / in-band `blocked` bit). It deliberately
-    /// does NOT serve the known-demand QueueMsg case — see [`known_msg_demand`](Self::known_msg_demand).
+    /// It does NOT cap `peer_max_offset` — explicit demand is always pursued directly. Rather, it
+    /// adds *headroom beyond* the observed demand: a writer that keeps hitting the window edge is
+    /// streaming faster than our window updates can keep up, so we grow the runway ahead of its
+    /// hinted high-water mark to stay a bandwidth-delay product ahead and break the blocked cycle.
+    /// A synthetic blocked signal (known, bounded message demand) does not ramp this — see
+    /// [`on_blocked_signal`](Self::on_blocked_signal).
     growth_ratio: u32,
-    /// A specific, *known* receive offset the window must reach to let an oversized QueueMsg segment
-    /// complete. Set only from a synthetic blocked signal (`msg::Stream::Blocked { synthetic: true
-    /// }`), which the receiver's dispatch generates when a message allocation won't fit the
-    /// advertised window. Unlike `growth_ratio` (open-ended streaming slow-start), this is a fixed
-    /// target bounded by the max segment size: the window opens straight to it, in
-    /// `max_single_acquire`-sized acquires, regardless of the streaming ramp. Zero when no such
-    /// segment is outstanding. Monotonic running max; a delivered segment simply stops refreshing it.
-    known_msg_demand: u64,
     /// Endpoint-wide recv credit pool. Window-extension acquires draw from
     /// here; dispatch-side releases happen elsewhere as bytes arrive.
     recv_credit_pool: crate::sync::Arc<crate::credit::Pool>,
@@ -462,7 +463,6 @@ impl Reader {
             peer_max_offset: 0,
             acted_blocked_offset: 0,
             growth_ratio: 1,
-            known_msg_demand: 0,
             recv_credit_pool,
             priority,
             send_flow_update_after_fin: false,
@@ -515,7 +515,6 @@ impl Reader {
             peer_max_offset: 0,
             acted_blocked_offset: 0,
             growth_ratio: 1,
-            known_msg_demand: 0,
             recv_credit_pool,
             priority,
             send_flow_update_after_fin: !peer_fin_received,
@@ -1028,20 +1027,25 @@ impl Inner {
                     // Standalone blocked signal: no payload, just drives window growth. The
                     // subsequent maybe_send_max_data in the caller emits the extension.
                     let desired = desired_offset.as_u64();
+                    // Both signals record explicit demand the window will pursue directly. They
+                    // differ only in whether they ALSO ramp the streaming `growth_ratio` headroom:
                     self.peer_max_offset = self.peer_max_offset.max(desired);
                     if synthetic {
-                        // Receiver-generated: a QueueMsg segment won't fit the advertised window.
-                        // Demand is known and bounded (the segment end). Record it as a hard target
-                        // the window must reach — independent of the streaming slow-start ramp.
+                        // Receiver-generated for an oversized QueueMsg segment: the demand is known
+                        // and bounded (one message), not open-ended streaming. Recording it in
+                        // `peer_max_offset` (above) is sufficient — the window pursues it directly,
+                        // limited only by the pool. Do NOT ramp `growth_ratio`: there is no evidence
+                        // of a streaming writer outrunning our window, and ramping off a one-shot
+                        // message would inflate the window for every subsequent stream.
                         trace!(
                             binding_id = self.stream_rx.binding_id().as_u64(),
                             desired_offset = desired,
                             "Received synthetic blocked signal (oversized message)"
                         );
-                        self.known_msg_demand = self.known_msg_demand.max(desired);
                     } else {
-                        // Real peer QueueDataBlocked: streaming back-pressure, open-ended demand.
-                        // Drive the multiplicative slow-start ramp.
+                        // Real peer QueueDataBlocked: the writer is streaming and keeps hitting the
+                        // window edge, so ALSO grow the runway beyond its observed demand to stay
+                        // ahead of it.
                         trace!(
                             binding_id = self.stream_rx.binding_id().as_u64(),
                             desired_offset = desired,
@@ -1214,27 +1218,34 @@ impl Inner {
         let current_max = self.remote_max_data.as_u64();
         let threshold = current_max.saturating_sub(self.window_size / 2);
 
-        // Target window. Two demand regimes feed it (see `growth_ratio` vs `known_msg_demand`):
+        // Target window:
         //
-        //   * Streaming: the writer's hinted demand (`peer_max_offset`), capped by the slow-start
-        //     `cap` (`consumed + window_size * growth_ratio`) so an open-ended bulk writer ramps the
-        //     window toward the BDP without overshooting. Before any hint (`peer_max_offset == 0`)
-        //     this is the fixed bootstrap window, preserving server/client startup unchanged.
-        //   * Known message: `known_msg_demand`, the end offset of an oversized QueueMsg segment the
-        //     receiver told us about via a synthetic blocked signal. This is a fixed, bounded target
-        //     the window MUST reach for the segment to complete, so it bypasses the slow-start cap
-        //     (which would otherwise be too small, and can't be paced by consumption — a stalled
-        //     segment delivers nothing). Bounded by the max segment size, so it can't run away.
-        //
-        // The window targets the larger of the two, never below what we've already consumed.
-        let cap =
-            consumed.saturating_add(self.window_size.saturating_mul(self.growth_ratio as u64));
-        let streaming_target = if self.peer_max_offset == 0 {
+        //   * Before any hint arrives (`peer_max_offset == 0`): the fixed bootstrap window ahead of
+        //     consumption, so a cold-start writer has room to begin. Preserves startup unchanged.
+        //   * Once the writer has hinted its demand (`peer_max_offset`): pursue that demand
+        //     directly. It is NOT capped by the slow-start ramp — demand is demand, and the only
+        //     thing that bounds how much we advertise is the recv pool (each `poll_acquire` is
+        //     clamped to `max_single_acquire`; capacity/fair-share gate the rest), so a large demand
+        //     is satisfied across successive acquires rather than refused. We never advertise *more*
+        //     than the writer wants, so a writer asking for less than the standing window does not
+        //     inflate it.
+        //   * EXCEPT when a real streaming writer keeps hitting the window edge (`growth_ratio > 1`,
+        //     ramped only by real `QueueDataBlocked` — never by a synthetic/known-message signal):
+        //     then it is outrunning our window updates, so we additionally open the runway *ahead*
+        //     of its observed demand (`consumed + window_size * growth_ratio`) to stay a BDP ahead
+        //     and break the blocked cycle. This headroom applies on top of the demand, not as a cap.
+        let target_max_data = if self.peer_max_offset == 0 {
             consumed.saturating_add(self.window_size)
         } else {
-            self.peer_max_offset.max(consumed).min(cap)
+            let demand = self.peer_max_offset.max(consumed);
+            if self.growth_ratio > 1 {
+                let runway = consumed
+                    .saturating_add(self.window_size.saturating_mul(self.growth_ratio as u64));
+                demand.max(runway)
+            } else {
+                demand
+            }
         };
-        let target_max_data = streaming_target.max(self.known_msg_demand);
 
         // Trigger on hint-or-threshold: extend when the writer wants more room than we've advertised
         // (`target > current_max`) OR consumption crossed the top-up threshold.
@@ -1357,14 +1368,14 @@ impl Inner {
         // and lock-free; see `Slot::advertise_window`.
         self.stream_rx.advertise_window(new_max_data.as_u64());
 
-        // A known-message target can exceed `max_single_acquire`, which clamps each `poll_acquire`
-        // to one slice — so a single extension may only advertise part of the way to the segment
-        // end. When we're still short of a known demand and the slot isn't parked for more (a park
-        // re-polls us via the distributor), self-wake to acquire the next slice on the following
-        // poll. Without this the window would stall one slice short of an oversized segment, which
-        // can never then complete. The streaming target is naturally re-driven by further peer
-        // blocked signals, so this only needs to chase the bounded `known_msg_demand`.
-        if self.known_msg_demand > new_max_data.as_u64() && !slot_ref.is_linked() {
+        // The target can exceed `max_single_acquire`, which clamps each `poll_acquire` to one slice
+        // — so a single extension may only advertise part of the way to the target. When we're still
+        // short of the target and the slot isn't already parked for more (a park re-polls us via the
+        // distributor), self-wake to acquire the next slice on the following poll. Without this the
+        // window would stall one slice short of the demand. This matters most for an oversized
+        // QueueMsg segment (which can never complete until the window covers it), but applies to any
+        // demand larger than a single acquire.
+        if target_max_data > new_max_data.as_u64() && !slot_ref.is_linked() {
             cx.waker().wake_by_ref();
         }
 

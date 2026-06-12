@@ -1444,26 +1444,24 @@ fn synthetic_blocked_opens_window_to_known_demand_without_growth() {
 /// window, the sender's flow-control budget (`remote_max_data - next_offset`) is capped there and
 /// the link runs at a fraction of capacity.
 ///
-/// This pins the failure to the window-growth *ceiling*. The reader doubles `window_size *
-/// growth_ratio` on each blocked signal but clamps the ratio to `max_single_acquire / window_size`
-/// (see `Inner::max_growth_ratio`). The dc-tester recv pool uses `max_single_acquire = 2 MiB` with a
-/// 1 MiB initial window, so the ratio saturates at 2× — the advertised window can never exceed
-/// ~2 MiB, far below the multi-MiB BDP a 30 Gbps × ~500 µs path needs. The pool here mirrors that
-/// production sizing exactly so the test exercises the real ceiling, not an artificially generous one.
+/// The window must track the writer's hinted demand directly, limited only by the recv pool — not
+/// by the streaming slow-start ramp. The writer advertises a high-water mark (`peer_max_offset`)
+/// far past what has been advertised; the reader pursues it across `max_single_acquire`-sized
+/// acquires (parking and re-arming as the pool grants), so the advertised window leads consumption
+/// by a BDP-class margin. `growth_ratio` adds headroom *beyond* the observed demand but does not cap
+/// it — so even with a constant demand hint (which `growth_ratio`'s consume-paced dedup would pin at
+/// a low multiple) the window still opens to that demand. The pool here mirrors production sizing
+/// (16 MiB capacity, 8 MiB per-acquire) so the acquire-slicing path is exercised, not bypassed.
 ///
 /// Assertion: after the application has consumed `TARGET` bytes from a perpetually-blocked writer,
-/// the advertised window must lead `consumed` by at least a BDP-class margin (`min_lead`). On the
-/// pre-fix policy the lead saturates at ~2× the initial window, so this fails; a fix that lets the
-/// window open to the BDP (e.g. decoupling growth from `max_single_acquire`, or seeding a larger
-/// window) makes it pass.
+/// the advertised window must lead `consumed` by at least a BDP-class margin (`min_lead`). A policy
+/// that clamps the demand to a small multiple of the initial window (the original bug) fails this;
+/// pursuing demand directly passes it.
 #[test]
 fn bulk_stream_opens_window_to_bdp() {
     sim(|| {
-        // Pool sized so the per-request ceiling (`max_single_acquire`) is a generous multiple of the
-        // 1 MiB initial window. This is what discriminates the bug from the fix: the slow-start ramp
-        // dedups on a constant demand and pins `growth_ratio` at 2 (→ ~2 MiB lead) regardless of how
-        // wide the ceiling is, whereas a demand-driven target opens straight to the ceiling. With a
-        // 2 MiB ceiling (== 2× window) the two are indistinguishable; an 8 MiB ceiling separates them.
+        // Pool sized so the per-request ceiling (`max_single_acquire`, 8 MiB) is a generous multiple
+        // of the 1 MiB initial window, so the window can open well past a couple of initial windows.
         let pool = crate::sync::Arc::new(crate::credit::Pool::new(
             crate::credit::Config::new(16 * 1024 * 1024)
                 .with_max_single_acquire_uniform(8 * 1024 * 1024),
