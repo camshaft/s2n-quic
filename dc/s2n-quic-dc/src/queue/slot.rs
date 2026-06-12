@@ -81,12 +81,6 @@ pub(crate) struct StreamState {
     /// new-byte release subtracts from this first, so only bytes beyond the
     /// initial window are returned to the recv credit pool.
     pub(crate) initial_window_remaining: u64,
-    /// Set once the reader has reconciled its advertised window on termination
-    /// (see [`StreamState::finish_recv_accounting`]). After this point
-    /// [`StreamState::observe_offset`] stops releasing, because the terminal
-    /// reconciliation already accounted for the full advertised window — any
-    /// late-arriving (but in-window) bytes would otherwise be released twice.
-    pub(crate) recv_finished: bool,
     /// Highest QueueMsg segment-end (`stream_offset + message_size`) for which dispatch has already
     /// injected a synthetic blocked signal toward the reader.
     ///
@@ -99,6 +93,12 @@ pub(crate) struct StreamState {
     /// to open its window to that known offset. Deduped on this monotonic offset so the signal goes
     /// out once per segment, not once per chunk.
     pub(crate) synth_blocked_offset: u64,
+    /// Set once the reader has reconciled its advertised window on termination
+    /// (see [`StreamState::finish_recv_accounting`]). After this point
+    /// [`StreamState::observe_offset`] stops releasing, because the terminal
+    /// reconciliation already accounted for the full advertised window — any
+    /// late-arriving (but in-window) bytes would otherwise be released twice.
+    pub(crate) recv_finished: bool,
 }
 
 impl StreamState {
