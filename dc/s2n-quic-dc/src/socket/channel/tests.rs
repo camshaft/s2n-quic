@@ -558,12 +558,31 @@ fn flatten_empty_queue_skipped() {
 fn flatten_segments_does_not_drop_buffered_segment_when_budget_exhausted() {
     use std::net::{Ipv4Addr, SocketAddr};
 
-    let (mut tx, rx) = cell::unsync::new::<crate::socket::pool::descriptor::Segments>();
-    let mut cx = noop_cx();
+    struct OneShotSegmentsRx {
+        segments: Option<crate::socket::pool::descriptor::Segments>,
+    }
+
+    impl Receiver<crate::socket::pool::descriptor::Segments> for OneShotSegmentsRx {
+        fn poll_recv(
+            &mut self,
+            _cx: &mut core::task::Context<'_>,
+            budget: &mut Budget,
+        ) -> Poll<Option<crate::socket::pool::descriptor::Segments>> {
+            if budget.is_exhausted() {
+                budget.set_needs_wake();
+                return Poll::Pending;
+            }
+
+            budget.consume();
+            Poll::Ready(self.segments.take())
+        }
+
+        fn on_consumed(&mut self, _bytes: u64) {}
+    }
 
     let pool = crate::socket::pool::Pool::new(64);
     let unfilled = pool
-        .alloc::<crate::socket::pool::SyncRecycler>()
+        .alloc::<crate::socket::pool::descriptor::SyncRecycler>()
         .expect("descriptor alloc");
     let segments = unfilled
         .fill_with(|addr, cmsg, mut payload| {
@@ -574,13 +593,10 @@ fn flatten_segments_does_not_drop_buffered_segment_when_budget_exhausted() {
         })
         .expect("fill descriptor");
 
-    {
-        let mut fut = pin!(tx.send(segments));
-        assert!(matches!(fut.as_mut().poll(&mut cx), Poll::Ready(Ok(()))));
-    }
-    drop(tx);
-
-    let mut flat = FlattenSegments::new(rx);
+    let mut cx = noop_cx();
+    let mut flat = FlattenSegments::new(OneShotSegmentsRx {
+        segments: Some(segments),
+    });
     let mut budget = Budget::new(1);
 
     let first = match flat.poll_recv(&mut cx, &mut budget) {
@@ -599,6 +615,7 @@ fn flatten_segments_does_not_drop_buffered_segment_when_budget_exhausted() {
     };
     assert_eq!(second.len(), 3);
 
+    budget.reset();
     assert!(matches!(flat.poll_recv(&mut cx, &mut budget), Poll::Ready(None)));
 }
 
