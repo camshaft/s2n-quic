@@ -385,8 +385,7 @@ fn detect_loss<Rand>(
 
     for (num, mut packet) in lost_packets {
         let tx_info = packet.transmission_info.take().unwrap();
-        let new_loss_burst = prev_lost_packet_number
-            .is_none_or(|prev: VarInt| prev.as_u64().checked_add(1) != Some(num.as_u64()));
+        let new_loss_burst = prev_lost_packet_number.is_none_or(|prev| !is_contiguous(prev, num));
         prev_lost_packet_number = Some(num);
 
         trace!(
@@ -484,10 +483,7 @@ fn persistent_congestion(
             continue;
         }
 
-        let contiguous = prev_packet_number
-            .is_some_and(|prev: VarInt| {
-                prev.as_u64().checked_add(1) == Some(packet_number.as_u64())
-            });
+        let contiguous = prev_packet_number.is_some_and(|prev| is_contiguous(prev, packet_number));
 
         if contiguous {
             if let Some(start) = current_period_start {
@@ -500,6 +496,11 @@ fn persistent_congestion(
     }
 
     max_duration > rtt_estimator.persistent_congestion_threshold()
+}
+
+#[inline]
+fn is_contiguous(prev: VarInt, current: VarInt) -> bool {
+    prev.as_u64().checked_add(1) == Some(current.as_u64())
 }
 
 #[cfg(test)]
@@ -693,6 +694,10 @@ mod tests {
             &mut random,
         );
 
+        // Each tuple is (persistent_congestion, new_loss_burst):
+        // - PN 1 starts a new burst
+        // - PN 2 is contiguous with PN 1
+        // - PN 4 starts a new burst after a PN gap
         assert_eq!(
             context.cca.loss_events(),
             &[(true, true), (true, false), (true, true)]
