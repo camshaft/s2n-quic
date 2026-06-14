@@ -385,8 +385,8 @@ fn detect_loss<Rand>(
 
     for (num, mut packet) in lost_packets {
         let tx_info = packet.transmission_info.take().unwrap();
-        let new_loss_burst =
-            prev_lost_packet_number.is_none_or(|prev: VarInt| num.checked_sub(prev) != Some(1));
+        let new_loss_burst = prev_lost_packet_number
+            .is_none_or(|prev: VarInt| prev.as_u64().checked_add(1) != Some(num.as_u64()));
         prev_lost_packet_number = Some(num);
 
         trace!(
@@ -470,7 +470,6 @@ fn persistent_congestion(
     };
 
     let mut current_period_start = None;
-    let mut current_period_end = None;
     let mut prev_packet_number = None;
     let mut max_duration = Duration::ZERO;
 
@@ -481,25 +480,23 @@ fn persistent_congestion(
 
         if tx_info.sent_bytes == 0 || tx_info.time_sent < first_rtt_sample {
             current_period_start = None;
-            current_period_end = None;
             prev_packet_number = None;
             continue;
         }
 
         let contiguous = prev_packet_number
-            .is_some_and(|prev: VarInt| packet_number.checked_sub(prev) == Some(1));
+            .is_some_and(|prev: VarInt| {
+                prev.as_u64().checked_add(1) == Some(packet_number.as_u64())
+            });
 
         if contiguous {
-            current_period_end = Some(tx_info.time_sent);
+            if let Some(start) = current_period_start {
+                max_duration = max_duration.max(tx_info.time_sent.saturating_duration_since(start));
+            }
         } else {
             current_period_start = Some(tx_info.time_sent);
-            current_period_end = Some(tx_info.time_sent);
         }
         prev_packet_number = Some(packet_number);
-
-        if let (Some(start), Some(end)) = (current_period_start, current_period_end) {
-            max_duration = max_duration.max(end.saturating_duration_since(start));
-        }
     }
 
     max_duration > rtt_estimator.persistent_congestion_threshold()
@@ -676,26 +673,23 @@ mod tests {
             PacketNumberSpace::ApplicationData,
         );
 
-        context
-            .inflight
-            .insert(make_pn(1), make_packet(&mut context, entry.clone(), make_ts(100)));
-        context
-            .inflight
-            .insert(make_pn(2), make_packet(&mut context, entry.clone(), make_ts(115)));
-        context
-            .inflight
-            .insert(make_pn(4), make_packet(&mut context, entry.clone(), make_ts(130)));
+        let packet1 = make_packet(&mut context, entry.clone(), make_ts(100));
+        context.inflight.insert(make_pn(1), packet1);
+        let packet2 = make_packet(&mut context, entry.clone(), make_ts(350));
+        context.inflight.insert(make_pn(2), packet2);
+        let packet4 = make_packet(&mut context, entry.clone(), make_ts(600));
+        context.inflight.insert(make_pn(4), packet4);
         context.next_packet_number = VarInt::from_u8(5);
 
         detect_loss(
             &mut context,
             VarInt::from_u8(10),
-            make_ts(130),
+            make_ts(600),
             &counters,
             &mut completed,
             &mut lost,
             &mut cancelled,
-            make_ts(140),
+            make_ts(610),
             &mut random,
         );
 
