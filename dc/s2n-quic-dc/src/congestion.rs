@@ -16,6 +16,8 @@ pub type PacketInfo = <BbrCongestionController as CongestionController>::PacketI
 pub struct Controller {
     controller: BbrCongestionController,
     last_packet_sent_time: Option<Timestamp>,
+    #[cfg(test)]
+    loss_events: Vec<(bool, bool)>,
 }
 
 impl Controller {
@@ -24,6 +26,8 @@ impl Controller {
         Self {
             controller: BbrCongestionController::new(max_datagram_size, Default::default()),
             last_packet_sent_time: None,
+            #[cfg(test)]
+            loss_events: Vec::new(),
         }
     }
 
@@ -98,12 +102,14 @@ impl Controller {
         &mut self,
         bytes_lost: u32,
         packet_info: PacketInfo,
+        persistent_congestion: bool,
+        new_loss_burst: bool,
         random_generator: &mut dyn random::Generator,
         now: Timestamp,
     ) {
-        // TODO where do these come from?
-        let persistent_congestion = false;
-        let new_loss_burst = false;
+        #[cfg(test)]
+        self.loss_events
+            .push((persistent_congestion, new_loss_burst));
 
         let publisher = &mut NoopPublisher;
         self.controller.on_packet_lost(
@@ -115,6 +121,12 @@ impl Controller {
             now,
             publisher,
         );
+    }
+
+    #[cfg(test)]
+    #[inline]
+    pub(crate) fn loss_events(&self) -> &[(bool, bool)] {
+        &self.loss_events
     }
 
     #[inline]

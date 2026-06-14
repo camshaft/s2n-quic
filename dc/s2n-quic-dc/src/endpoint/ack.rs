@@ -375,12 +375,19 @@ fn detect_loss<Rand>(
 
     let lost_min = PacketNumberSpace::Initial.new_packet_number(VarInt::ZERO);
     let range = PacketNumberRange::new(lost_min, lost_max);
+    let lost_packets: Vec<_> = context.inflight.remove_range(range).collect();
+    let persistent_congestion = persistent_congestion(&lost_packets, &context.rtt_estimator);
+
     let mut lost_count = 0usize;
     let mut cancelled_count = 0usize;
     let mut ttl_exhausted_count = 0usize;
+    let mut prev_lost_packet_number = None;
 
-    for (num, mut packet) in context.inflight.remove_range(range) {
+    for (num, mut packet) in lost_packets {
         let tx_info = packet.transmission_info.take().unwrap();
+        let new_loss_burst =
+            prev_lost_packet_number.is_none_or(|prev: VarInt| num.checked_sub(prev) != Some(1));
+        prev_lost_packet_number = Some(num);
 
         trace!(
             pn = num.as_u64(),
@@ -390,9 +397,14 @@ fn detect_loss<Rand>(
         );
 
         if tx_info.sent_bytes > 0 {
-            context
-                .cca
-                .on_packet_lost(tx_info.sent_bytes as u32, tx_info.cc_info, random, now);
+            context.cca.on_packet_lost(
+                tx_info.sent_bytes as u32,
+                tx_info.cc_info,
+                persistent_congestion,
+                new_loss_burst,
+                random,
+                now,
+            );
         }
 
         for mut entry in packet.frames {
@@ -442,6 +454,55 @@ fn detect_loss<Rand>(
             "Loss detection triggered"
         );
     }
+
+    if persistent_congestion {
+        context.rtt_estimator.on_persistent_congestion();
+    }
+}
+
+#[inline]
+fn persistent_congestion(
+    lost_packets: &[(VarInt, super::inflight::Packet)],
+    rtt_estimator: &s2n_quic_core::recovery::RttEstimator,
+) -> bool {
+    let Some(first_rtt_sample) = rtt_estimator.first_rtt_sample() else {
+        return false;
+    };
+
+    let mut current_period_start = None;
+    let mut current_period_end = None;
+    let mut prev_packet_number = None;
+    let mut max_duration = Duration::ZERO;
+
+    for &(packet_number, ref packet) in lost_packets {
+        let Some(tx_info) = packet.transmission_info.as_ref() else {
+            continue;
+        };
+
+        if tx_info.sent_bytes == 0 || tx_info.time_sent < first_rtt_sample {
+            current_period_start = None;
+            current_period_end = None;
+            prev_packet_number = None;
+            continue;
+        }
+
+        let contiguous = prev_packet_number
+            .is_some_and(|prev: VarInt| packet_number.checked_sub(prev) == Some(1));
+
+        if contiguous {
+            current_period_end = Some(tx_info.time_sent);
+        } else {
+            current_period_start = Some(tx_info.time_sent);
+            current_period_end = Some(tx_info.time_sent);
+        }
+        prev_packet_number = Some(packet_number);
+
+        if let (Some(start), Some(end)) = (current_period_start, current_period_end) {
+            max_duration = max_duration.max(end.saturating_duration_since(start));
+        }
+    }
+
+    max_duration > rtt_estimator.persistent_congestion_threshold()
 }
 
 #[cfg(test)]
@@ -592,6 +653,60 @@ mod tests {
         assert!(completed.0.is_empty());
         assert!(context.inflight.remove(make_pn(1)).is_none());
         assert!(context.inflight.remove(make_pn(2)).is_some());
+    }
+
+    #[test]
+    fn detect_loss_propagates_loss_signals() {
+        let entry = make_path_secret_entry();
+        let mut context = make_context(&entry);
+        let counters = super::super::counters::Send::new(
+            &Registry::default(),
+            LocalSenderId::new(VarInt::ZERO),
+        );
+        let mut completed = CollectFrames::default();
+        let mut lost = CollectFrames::default();
+        let mut cancelled = CollectFrames::default();
+        let mut random = xorshift::Rng::with_seed(1);
+
+        context.rtt_estimator.update_rtt(
+            Duration::ZERO,
+            Duration::from_millis(2),
+            make_ts(50),
+            true,
+            PacketNumberSpace::ApplicationData,
+        );
+
+        context
+            .inflight
+            .insert(make_pn(1), make_packet(&mut context, entry.clone(), make_ts(100)));
+        context
+            .inflight
+            .insert(make_pn(2), make_packet(&mut context, entry.clone(), make_ts(115)));
+        context
+            .inflight
+            .insert(make_pn(4), make_packet(&mut context, entry.clone(), make_ts(130)));
+        context.next_packet_number = VarInt::from_u8(5);
+
+        detect_loss(
+            &mut context,
+            VarInt::from_u8(10),
+            make_ts(130),
+            &counters,
+            &mut completed,
+            &mut lost,
+            &mut cancelled,
+            make_ts(140),
+            &mut random,
+        );
+
+        assert_eq!(
+            context.cca.loss_events(),
+            &[(true, true), (true, false), (true, true)]
+        );
+        assert!(
+            context.rtt_estimator.first_rtt_sample().is_none(),
+            "persistent congestion should reset first RTT sample"
+        );
     }
 
     /// When an ACK drains all bytes in flight, any leftover zero-byte shells (probe
