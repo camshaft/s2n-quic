@@ -14,7 +14,6 @@ use s2n_quic::{
         tls::Provider as Prov,
     },
     server::Name,
-    Connection,
 };
 use s2n_quic_core::{
     event::api::{self as events, Subscriber as CoreSub},
@@ -30,11 +29,7 @@ use std::{
     },
     time::Duration,
 };
-use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    sync::Semaphore,
-    time::Instant as TokioInstant,
-};
+use tokio::{sync::Semaphore, time::Instant as TokioInstant};
 
 pub use crate::endpoint::DEFAULT_IDLE_TIMEOUT;
 /// Connection-level flow-control window and the local send window. Bounds the peer's
@@ -63,16 +58,6 @@ pub(crate) struct DcPathContext {
     path: Option<HandshakingPath>,
 }
 
-impl DcPathCapture {
-    fn take_entry(conn: &mut Connection) -> Option<Arc<secret::map::Entry>> {
-        conn.query_event_context_mut(|ctx: &mut DcPathContext| {
-            ctx.path.as_ref().and_then(|p| p.entry())
-        })
-        .ok()
-        .flatten()
-    }
-}
-
 impl CoreSub for DcPathCapture {
     type ConnectionContext = DcPathContext;
 
@@ -94,63 +79,6 @@ impl CoreSub for DcPathCapture {
             context.path = path.clone();
         }
     }
-}
-
-/// Wire format: `u8 count` followed by `count` addresses, each 18 bytes (16 IPv6 + 2 port).
-/// IPv4 addresses are encoded as IPv4-mapped IPv6.
-const ADDR_WIRE_LEN: usize = 18;
-
-fn encode_data_addrs(addrs: &[SocketAddr]) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(1 + addrs.len() * ADDR_WIRE_LEN);
-    buf.push(addrs.len() as u8);
-    for addr in addrs {
-        let v6 = match addr {
-            SocketAddr::V6(v6) => *v6,
-            SocketAddr::V4(v4) => {
-                std::net::SocketAddrV6::new(v4.ip().to_ipv6_mapped(), v4.port(), 0, 0)
-            }
-        };
-        buf.extend_from_slice(&v6.ip().octets());
-        buf.extend_from_slice(&v6.port().to_be_bytes());
-    }
-    buf
-}
-
-async fn read_data_addrs<R: AsyncReadExt + Unpin>(reader: &mut R) -> io::Result<Vec<SocketAddr>> {
-    use crate::path::secret::map::MAX_PEER_DATA_ADDRS;
-
-    let mut header = [0u8; 1];
-    reader.read_exact(&mut header).await?;
-    let count = header[0] as usize;
-
-    if count == 0 {
-        warn!("peer provided 0 data addrs");
-        return Ok(Vec::new());
-    }
-
-    if count > MAX_PEER_DATA_ADDRS {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "invalid data addr count",
-        ));
-    }
-
-    let total = count * ADDR_WIRE_LEN;
-    let mut buf = vec![0u8; total];
-    reader.read_exact(&mut buf).await?;
-
-    let mut addrs = Vec::with_capacity(count);
-    for chunk in buf.chunks_exact(ADDR_WIRE_LEN) {
-        let ip = std::net::Ipv6Addr::from(<[u8; 16]>::try_from(&chunk[..16]).unwrap());
-        let port = u16::from_be_bytes([chunk[16], chunk[17]]);
-        let addr = match ip.to_ipv4_mapped() {
-            Some(v4) => SocketAddr::new(v4.into(), port),
-            None => SocketAddr::new(ip.into(), port),
-        };
-        addrs.push(addr);
-    }
-
-    Ok(addrs)
 }
 
 pub type Error = Box<dyn std::error::Error + Send + Sync + 'static>;
@@ -240,8 +168,6 @@ pub(super) async fn server<
     subscriber: Subscriber,
     on_ready: tokio::sync::oneshot::Sender<Result<SocketAddr, Error>>,
 ) {
-    let local_data_addrs = builder.data_addrs.clone();
-
     let mut server = match Server::bind::<Provider, Subscriber, Event>(
         address,
         map.clone(),
@@ -261,48 +187,21 @@ pub(super) async fn server<
 
     while let Some(mut connection) = server.server.accept().await {
         let map_clone = map.clone();
-        let local_data_addrs = local_data_addrs.clone();
         tokio::spawn(async move {
             // The accepted connection must remain open until the client has finished inserting
             // the entry into its map. The client indicates this by sending a ConnectionClose
             // when it is done.
             //
             // A 10 second timeout is specified to avoid spawned tasks piling up when the
-            // ConnectionClose from the client is lost. This timeout covers both the dc handshake
-            // confirmation, addr exchange, and MTU probing completion.
+            // ConnectionClose from the client is lost. This timeout covers dc handshake
+            // confirmation and MTU probing completion. Data addresses are exchanged via
+            // transport parameters during the TLS handshake.
             let deadline = TokioInstant::now() + Duration::from_secs(10);
 
-            let initial_exchange = async {
-                let stream = connection.accept_bidirectional_stream().await?;
-
-                let addr_exchange = async move {
-                    let Some(mut stream) = stream else {
-                        return Err(io::ErrorKind::ConnectionAborted.into());
-                    };
-
-                    stream
-                        .write_all(&encode_data_addrs(&local_data_addrs))
-                        .await?;
-                    stream.finish()?;
-
-                    let peer_addrs = read_data_addrs(&mut stream).await?;
-
-                    io::Result::Ok(peer_addrs)
-                };
-
-                let confirm = ConfirmComplete::wait_ready(&mut connection);
-
-                tokio::try_join!(confirm, addr_exchange)
-            };
-
-            match tokio::time::timeout_at(deadline, initial_exchange).await {
-                Ok(Ok(((), peer_data_addrs))) => {
-                    if let Some(entry) = DcPathCapture::take_entry(&mut connection) {
-                        entry.set_peer_data_addrs(&peer_data_addrs);
-                    } else {
-                        warn!("no dc path entry available for connection");
-                    }
-
+            match tokio::time::timeout_at(deadline, ConfirmComplete::wait_ready(&mut connection))
+                .await
+            {
+                Ok(Ok(())) => {
                     let _ = tokio::time::timeout_at(
                         deadline,
                         MtuConfirmComplete::wait_ready(&mut connection),
@@ -330,7 +229,6 @@ pub struct Client {
     client: s2n_quic::Client,
     map: secret::Map,
     queue: Arc<HandshakeQueue>,
-    data_addrs: Arc<[SocketAddr]>,
 }
 
 impl Client {
@@ -382,7 +280,6 @@ impl Client {
             client,
             map: map.clone(),
             queue: Arc::new(HandshakeQueue::new(builder.success_jitter)),
-            data_addrs: builder.data_addrs.into(),
         })
     }
 
@@ -394,14 +291,7 @@ impl Client {
     ) -> Result<(), HandshakeFailed> {
         self.queue
             .clone()
-            .handshake(
-                &self.client,
-                &self.map,
-                peer,
-                reason,
-                server_name,
-                self.data_addrs.clone(),
-            )
+            .handshake(&self.client, &self.map, peer, reason, server_name)
             .await
     }
 }
@@ -525,7 +415,6 @@ impl HandshakeQueue {
         peer: SocketAddr,
         reason: HandshakeReason,
         server_name: Name,
-        local_data_addrs: Arc<[SocketAddr]>,
     ) -> Result<(), HandshakeFailed> {
         let entry = self.allocate_entry(peer, reason);
         let entry2 = entry.clone();
@@ -561,42 +450,15 @@ impl HandshakeQueue {
 
             let mut connection = attempt.await?;
 
-            // A 10 second deadline is used to bound ConfirmComplete, port exchange, and
+            // A 10 second deadline is used to bound ConfirmComplete and
             // MtuConfirmComplete, avoiding unbounded waits if the peer is slow.
+            // Data addresses are exchanged via transport parameters during the
+            // TLS handshake.
             let deadline = TokioInstant::now() + Duration::from_secs(10);
 
-            let addr_exchange = {
-                use tokio::io::AsyncWriteExt;
-
-                let mut stream = connection.open_bidirectional_stream().await?;
-
-                async move {
-                    stream
-                        .write_all(&encode_data_addrs(&local_data_addrs))
-                        .await?;
-                    stream.finish()?;
-
-                    let peer_addrs = read_data_addrs(&mut stream).await?;
-                    io::Result::Ok(peer_addrs)
-                }
-            };
-
-            let confirm_result = ConfirmComplete::wait_ready(&mut connection);
-
-            let (confirm_result, addr_result) = tokio::time::timeout_at(deadline, async move {
-                tokio::join!(confirm_result, addr_exchange,)
-            })
-            .await
-            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "handshake timeout"))?;
-
-            confirm_result?;
-            let peer_data_addrs = addr_result?;
-
-            if let Some(entry) = DcPathCapture::take_entry(&mut connection) {
-                entry.set_peer_data_addrs(&peer_data_addrs);
-            } else {
-                warn!("no dc path entry available for connection to {peer}");
-            }
+            tokio::time::timeout_at(deadline, ConfirmComplete::wait_ready(&mut connection))
+                .await
+                .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "handshake timeout"))??;
 
             // Don't wait for the connection to fully close, just wait until dc.complete to
             // drop the permit.

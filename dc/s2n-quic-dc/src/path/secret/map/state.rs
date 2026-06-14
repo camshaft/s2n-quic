@@ -65,6 +65,7 @@ where
     capacity: Option<usize>,
     should_evict_on_unknown_path_secret: bool,
     advertised_peer_info: Option<bytes::Bytes>,
+    advertised_data_addrs: Option<bytes::Bytes>,
     clock: Option<C>,
     subscriber: Option<S>,
 }
@@ -80,6 +81,7 @@ where
             capacity: None,
             should_evict_on_unknown_path_secret: false,
             advertised_peer_info: None,
+            advertised_data_addrs: None,
             clock: None,
             subscriber: None,
         }
@@ -110,6 +112,18 @@ where
         self
     }
 
+    pub fn with_advertised_data_addrs(mut self, addrs: &[std::net::SocketAddr]) -> Self {
+        let encoded = s2n_quic_core::dc::data_addresses::encode(addrs);
+        tracing::debug!(
+            target: "dc_negotiation",
+            count = addrs.len(),
+            encoded_len = encoded.len(),
+            "with_advertised_data_addrs: stamping local DcDataAddresses transport parameter"
+        );
+        self.advertised_data_addrs = Some(encoded);
+        self
+    }
+
     pub fn with_clock<C2: 'static + time::Clock + Sync + Send>(
         self,
         clock: C2,
@@ -119,6 +133,7 @@ where
             subscriber: self.subscriber,
             should_evict_on_unknown_path_secret: self.should_evict_on_unknown_path_secret,
             advertised_peer_info: self.advertised_peer_info,
+            advertised_data_addrs: self.advertised_data_addrs,
             signer: self.signer,
             capacity: self.capacity,
         }
@@ -130,6 +145,7 @@ where
             subscriber: Some(subscriber),
             should_evict_on_unknown_path_secret: self.should_evict_on_unknown_path_secret,
             advertised_peer_info: self.advertised_peer_info,
+            advertised_data_addrs: self.advertised_data_addrs,
             signer: self.signer,
             capacity: self.capacity,
         }
@@ -154,6 +170,7 @@ where
             capacity,
             self.should_evict_on_unknown_path_secret,
             self.advertised_peer_info,
+            self.advertised_data_addrs,
             clock,
             subscriber,
         ))
@@ -453,6 +470,7 @@ where
     >,
 
     advertised_peer_info: Option<bytes::Bytes>,
+    advertised_data_addrs: Option<bytes::Bytes>,
 
     cleaner: Cleaner,
 
@@ -556,6 +574,7 @@ where
         capacity: usize,
         should_evict_on_unknown_path_secret: bool,
         advertised_peer_info: Option<bytes::Bytes>,
+        advertised_data_addrs: Option<bytes::Bytes>,
         clock: C,
         subscriber: S,
     ) -> Arc<Self> {
@@ -586,6 +605,7 @@ where
             subscriber,
             request_handshake: RwLock::new(None),
             advertised_peer_info,
+            advertised_data_addrs,
             mk_application_data: RwLock::new(None),
         };
 
@@ -884,6 +904,10 @@ where
 
     fn advertised_peer_info(&self) -> Option<bytes::Bytes> {
         self.advertised_peer_info.clone()
+    }
+
+    fn advertised_data_addrs(&self) -> Option<bytes::Bytes> {
+        self.advertised_data_addrs.clone()
     }
 
     #[allow(clippy::type_complexity)]

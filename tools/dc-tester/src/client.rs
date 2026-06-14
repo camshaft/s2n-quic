@@ -57,10 +57,8 @@ pub async fn run(
         }
     }
 
-    let data_addrs = endpoint.data_addrs.clone();
-
-    // Create PSK client provider with data addrs
-    let handshake = crate::psk::client(data_addrs, endpoint.path_secret_map.clone())?;
+    // Create PSK client provider
+    let handshake = crate::psk::client(endpoint.path_secret_map.clone())?;
 
     // Create stream3 client
     let server_name = crate::psk::server_name();
