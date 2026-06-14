@@ -554,6 +554,54 @@ fn flatten_empty_queue_skipped() {
     });
 }
 
+#[test]
+fn flatten_segments_does_not_drop_buffered_segment_when_budget_exhausted() {
+    use std::net::{Ipv4Addr, SocketAddr};
+
+    let (mut tx, rx) = cell::unsync::new::<crate::socket::pool::descriptor::Segments>();
+    let mut cx = noop_cx();
+
+    let pool = crate::socket::pool::Pool::new(64);
+    let unfilled = pool
+        .alloc::<crate::socket::pool::SyncRecycler>()
+        .expect("descriptor alloc");
+    let segments = unfilled
+        .fill_with(|addr, cmsg, mut payload| {
+            addr.set(SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 12345).into());
+            cmsg.set_segment_len(3);
+            payload[..6].copy_from_slice(b"abcdef");
+            Ok::<_, ()>(6)
+        })
+        .expect("fill descriptor");
+
+    {
+        let mut fut = pin!(tx.send(segments));
+        assert!(matches!(fut.as_mut().poll(&mut cx), Poll::Ready(Ok(()))));
+    }
+    drop(tx);
+
+    let mut flat = FlattenSegments::new(rx);
+    let mut budget = Budget::new(1);
+
+    let first = match flat.poll_recv(&mut cx, &mut budget) {
+        Poll::Ready(Some(segment)) => segment,
+        other => panic!("expected first segment, got {other:?}"),
+    };
+    assert_eq!(first.len(), 3);
+    assert!(budget.is_exhausted());
+
+    assert!(matches!(flat.poll_recv(&mut cx, &mut budget), Poll::Pending));
+
+    budget.reset();
+    let second = match flat.poll_recv(&mut cx, &mut budget) {
+        Poll::Ready(Some(segment)) => segment,
+        other => panic!("expected second segment, got {other:?}"),
+    };
+    assert_eq!(second.len(), 3);
+
+    assert!(matches!(flat.poll_recv(&mut cx, &mut budget), Poll::Ready(None)));
+}
+
 // ── Paced tests ────────────────────────────────────────────────────
 
 #[test]
