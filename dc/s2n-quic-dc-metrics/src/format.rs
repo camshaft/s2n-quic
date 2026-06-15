@@ -3,188 +3,40 @@
 
 // ── Metrics line formatting ─────────────────────────────────────────────────
 
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ParsedMetricsLine<'a> {
-    pub entries: Vec<MetricEntry<'a>>,
+    line: &'a str,
 }
 
 impl<'a> ParsedMetricsLine<'a> {
     pub fn parse(line: &'a str) -> Self {
-        use std::collections::{BTreeMap, BTreeSet, HashSet};
+        Self { line }
+    }
 
-        let mut metrics: BTreeMap<&'a str, &'a str> = BTreeMap::new();
-        let mut nominals: BTreeMap<&'a str, Vec<NominalVariant<'a>>> = BTreeMap::new();
-        let mut variant_histograms: BTreeMap<&'a str, Vec<HistogramVariant<'a>>> = BTreeMap::new();
+    /// Returns an iterator of grouped metric entries.
+    ///
+    /// Note: this reparses the input line and rebuilds grouped entries each time it is called.
+    pub fn compound_iter(&self) -> ParsedMetricsLineIter<'a> {
+        ParsedMetricsLineIter::new(self.line)
+    }
 
-        for part in line.split(',') {
-            let Some((key, value)) = part.split_once('=') else {
-                continue;
-            };
+    /// Alias for [`Self::compound_iter`].
+    pub fn iter(&self) -> ParsedMetricsLineIter<'a> {
+        self.compound_iter()
+    }
 
-            if let Some((val, rest)) = value.split_once(' ') {
-                if val.bytes().all(|b| b.is_ascii_digit()) {
-                    if is_valid_scalar_unit(rest) {
-                        metrics.insert(key, value);
-                        continue;
-                    }
-                    nominals.entry(key).or_default().push(NominalVariant {
-                        label: rest,
-                        value: val,
-                    });
-                    continue;
-                }
-
-                if val.contains('*') && !is_histogram_unit_only(rest) {
-                    variant_histograms
-                        .entry(key)
-                        .or_default()
-                        .push(HistogramVariant::parse(value));
-                    continue;
-                }
-            }
-
-            metrics.insert(key, value);
-        }
-
-        let mut queue_bases = BTreeSet::new();
-        let mut hit_miss_bases = BTreeSet::new();
-        for key in metrics.keys() {
-            if let Some(base) = key.strip_suffix(".enq") {
-                queue_bases.insert(base);
-            } else if let Some(base) = key.strip_suffix(".drain") {
-                queue_bases.insert(base);
-            } else if let Some(base) = key.strip_suffix(".depth") {
-                queue_bases.insert(base);
-            } else if let Some(base) = key.strip_suffix(".hit") {
-                hit_miss_bases.insert(base);
-            } else if let Some(base) = key.strip_suffix(".miss") {
-                hit_miss_bases.insert(base);
-            }
-        }
-
-        let mut entries = Vec::new();
-        let mut consumed: HashSet<&'a str> = HashSet::new();
-
-        for (&key, &value) in &metrics {
-            if consumed.contains(key) {
-                continue;
-            }
-
-            let queue_base = key
-                .strip_suffix(".enq")
-                .or_else(|| key.strip_suffix(".drain"))
-                .or_else(|| key.strip_suffix(".depth"));
-
-            if let Some(base) = queue_base.filter(|base| queue_bases.contains(base)) {
-                let enq_key = format!("{base}.enq");
-                let drain_key = format!("{base}.drain");
-                let depth_key = format!("{base}.depth");
-                if let Some((&enq_key, _)) = metrics.get_key_value(enq_key.as_str()) {
-                    consumed.insert(enq_key);
-                }
-                if let Some((&drain_key, _)) = metrics.get_key_value(drain_key.as_str()) {
-                    consumed.insert(drain_key);
-                }
-                if let Some((&depth_key, _)) = metrics.get_key_value(depth_key.as_str()) {
-                    consumed.insert(depth_key);
-                }
-
-                entries.push(MetricEntry::QueueGauge(QueueGaugeMetric {
-                    name: base,
-                    enq: metrics.get(enq_key.as_str()).copied().unwrap_or("0"),
-                    drain: metrics.get(drain_key.as_str()).copied().unwrap_or("0"),
-                    depth: metrics
-                        .get(depth_key.as_str())
-                        .copied()
-                        .filter(|depth| *depth != "0"),
-                }));
-                continue;
-            }
-
-            let hit_miss_base = key
-                .strip_suffix(".hit")
-                .or_else(|| key.strip_suffix(".miss"));
-
-            if let Some(base) = hit_miss_base.filter(|base| hit_miss_bases.contains(base)) {
-                let hit_key = format!("{base}.hit");
-                let miss_key = format!("{base}.miss");
-                if let Some((&hit_key, _)) = metrics.get_key_value(hit_key.as_str()) {
-                    consumed.insert(hit_key);
-                }
-                if let Some((&miss_key, _)) = metrics.get_key_value(miss_key.as_str()) {
-                    consumed.insert(miss_key);
-                }
-
-                entries.push(MetricEntry::HitMiss(HitMissMetric {
-                    name: base,
-                    hit: metrics.get(hit_key.as_str()).copied().unwrap_or("0"),
-                    miss: metrics.get(miss_key.as_str()).copied().unwrap_or("0"),
-                }));
-                continue;
-            }
-
-            consumed.insert(key);
-
-            if let Some(name) = key.strip_suffix(":bytes") {
-                let bytes = value
-                    .parse::<u64>()
-                    .ok()
-                    .or_else(|| parse_byte_value(value));
-                if let Some(bytes) = bytes {
-                    if bytes == 0 {
-                        continue;
-                    }
-
-                    entries.push(MetricEntry::Throughput(ThroughputMetric { name, bytes }));
-                }
-
-                continue;
-            }
-
-            if let Some(bytes) = parse_byte_value(value) {
-                if bytes == 0 {
-                    continue;
-                }
-
-                entries.push(MetricEntry::Throughput(ThroughputMetric {
-                    name: key,
-                    bytes,
-                }));
-                continue;
-            }
-
-            if value.contains('*') {
-                entries.push(MetricEntry::Histogram(HistogramMetric {
-                    name: key,
-                    histogram: Histogram::parse(value),
-                }));
-                continue;
-            }
-
-            entries.push(MetricEntry::Scalar(ScalarMetric { name: key, value }));
-        }
-
-        for (key, variants) in nominals {
-            entries.push(MetricEntry::Nominal(NominalMetric {
-                name: key,
-                variants,
-            }));
-        }
-
-        for (key, variants) in variant_histograms {
-            entries.push(MetricEntry::VariantHistograms(VariantHistogramMetric {
-                name: key,
-                variants,
-            }));
-        }
-
-        Self { entries }
+    /// Returns an iterator of primitive metric entries before grouping/combinator logic is applied.
+    ///
+    /// Note: this reparses the input line each time it is called.
+    /// Each item is a parse result, allowing callers to observe parse errors directly.
+    pub fn primitive_iter(&self) -> PrimitiveMetricIter<'a> {
+        parse_primitive_metrics(self.line)
     }
 
     pub fn format_pretty(&self) -> String {
         let mut output = String::new();
 
-        for entry in &self.entries {
+        for entry in self.compound_iter().flatten() {
             entry.write_to(&mut output);
         }
 
@@ -192,13 +44,13 @@ impl<'a> ParsedMetricsLine<'a> {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+        self.compound_iter().flatten().next().is_none()
     }
 
     pub fn to_rows(&self) -> Vec<MetricRow<'a>> {
         let mut rows = Vec::new();
 
-        for entry in &self.entries {
+        for entry in self.compound_iter().flatten() {
             match entry {
                 MetricEntry::QueueGauge(m) => {
                     rows.push(MetricRow {
@@ -450,6 +302,317 @@ pub struct MetricRow<'a> {
     pub buckets: Option<Vec<(u64, u64)>>,
 }
 
+impl<'a> IntoIterator for ParsedMetricsLine<'a> {
+    type Item = Result<MetricEntry<'a>, MetricParseError<'a>>;
+    type IntoIter = ParsedMetricsLineIter<'a>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.compound_iter()
+    }
+}
+
+impl<'line, 'parsed> IntoIterator for &'parsed ParsedMetricsLine<'line> {
+    type Item = Result<MetricEntry<'line>, MetricParseError<'line>>;
+    type IntoIter = ParsedMetricsLineIter<'line>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.compound_iter()
+    }
+}
+
+#[derive(Debug)]
+pub struct ParsedMetricsLineIter<'a> {
+    entry_iter: std::vec::IntoIter<Result<MetricEntry<'a>, MetricParseError<'a>>>,
+}
+
+impl<'a> ParsedMetricsLineIter<'a> {
+    fn new(line: &'a str) -> Self {
+        let mut primitive_entries = Vec::new();
+        let mut errors = Vec::new();
+
+        for entry in parse_primitive_metrics(line) {
+            match entry {
+                Ok(entry) => primitive_entries.push(entry),
+                Err(error) => errors.push(error),
+            }
+        }
+
+        let combined = combine_metrics(primitive_entries);
+        let mut entry_iter =
+            Vec::with_capacity(combined.entries.len() + combined.errors.len() + errors.len());
+        entry_iter.extend(combined.entries.into_iter().map(Ok));
+        entry_iter.extend(combined.errors.into_iter().map(Err));
+        entry_iter.extend(errors.into_iter().map(Err));
+
+        Self {
+            entry_iter: entry_iter.into_iter(),
+        }
+    }
+}
+
+impl<'a> Iterator for ParsedMetricsLineIter<'a> {
+    type Item = Result<MetricEntry<'a>, MetricParseError<'a>>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.entry_iter.next()
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum PrimitiveMetricEntry<'a> {
+    Scalar {
+        key: &'a str,
+        value: &'a str,
+    },
+    NominalVariant {
+        key: &'a str,
+        value: &'a str,
+        label: &'a str,
+    },
+    HistogramVariant {
+        key: &'a str,
+        value: &'a str,
+    },
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum MetricParseError<'a> {
+    InvalidMetricFragment { fragment: &'a str },
+    InvalidThroughputValue { key: &'a str, value: &'a str },
+    InvalidHistogramValue { key: &'a str, value: &'a str },
+    InvalidVariantHistogramValue { key: &'a str, value: &'a str },
+}
+
+pub struct PrimitiveMetricIter<'a> {
+    parts: std::str::Split<'a, char>,
+}
+
+impl<'a> Iterator for PrimitiveMetricIter<'a> {
+    type Item = Result<PrimitiveMetricEntry<'a>, MetricParseError<'a>>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        for part in self.parts.by_ref() {
+            let part = part.trim();
+            if part.is_empty() {
+                continue;
+            }
+
+            let Some((key, value)) = part.split_once('=') else {
+                return Some(Err(MetricParseError::InvalidMetricFragment {
+                    fragment: part,
+                }));
+            };
+
+            if let Some((val, rest)) = value.split_once(' ') {
+                if val.bytes().all(|b| b.is_ascii_digit()) {
+                    if is_valid_scalar_unit(rest) {
+                        return Some(Ok(PrimitiveMetricEntry::Scalar { key, value }));
+                    }
+
+                    return Some(Ok(PrimitiveMetricEntry::NominalVariant {
+                        key,
+                        value: val,
+                        label: rest,
+                    }));
+                }
+
+                if val.contains('*') && !is_histogram_unit_only(rest) {
+                    return Some(Ok(PrimitiveMetricEntry::HistogramVariant { key, value }));
+                }
+            }
+
+            return Some(Ok(PrimitiveMetricEntry::Scalar { key, value }));
+        }
+
+        None
+    }
+}
+
+fn parse_primitive_metrics<'a>(line: &'a str) -> PrimitiveMetricIter<'a> {
+    PrimitiveMetricIter {
+        parts: line.split(','),
+    }
+}
+
+struct CombinedMetrics<'a> {
+    entries: Vec<MetricEntry<'a>>,
+    errors: Vec<MetricParseError<'a>>,
+}
+
+fn combine_metrics<'a>(
+    primitive_entries: impl IntoIterator<Item = PrimitiveMetricEntry<'a>>,
+) -> CombinedMetrics<'a> {
+    use std::collections::{BTreeMap, BTreeSet, HashSet};
+
+    let mut metrics: BTreeMap<&'a str, &'a str> = BTreeMap::new();
+    let mut nominals: BTreeMap<&'a str, Vec<NominalVariant<'a>>> = BTreeMap::new();
+    let mut variant_histograms: BTreeMap<&'a str, Vec<HistogramVariant<'a>>> = BTreeMap::new();
+    let mut errors = Vec::new();
+
+    for primitive_entry in primitive_entries {
+        match primitive_entry {
+            PrimitiveMetricEntry::Scalar { key, value } => {
+                metrics.insert(key, value);
+            }
+            PrimitiveMetricEntry::NominalVariant { key, value, label } => {
+                nominals
+                    .entry(key)
+                    .or_default()
+                    .push(NominalVariant { label, value });
+            }
+            PrimitiveMetricEntry::HistogramVariant { key, value } => {
+                let histogram = HistogramVariant::parse(value);
+                if histogram.histogram.buckets.is_empty() {
+                    errors.push(MetricParseError::InvalidVariantHistogramValue { key, value });
+                } else {
+                    variant_histograms.entry(key).or_default().push(histogram);
+                }
+            }
+        }
+    }
+
+    let mut queue_bases = BTreeSet::new();
+    let mut hit_miss_bases = BTreeSet::new();
+    for key in metrics.keys() {
+        if let Some(base) = key.strip_suffix(".enq") {
+            queue_bases.insert(base);
+        } else if let Some(base) = key.strip_suffix(".drain") {
+            queue_bases.insert(base);
+        } else if let Some(base) = key.strip_suffix(".depth") {
+            queue_bases.insert(base);
+        } else if let Some(base) = key.strip_suffix(".hit") {
+            hit_miss_bases.insert(base);
+        } else if let Some(base) = key.strip_suffix(".miss") {
+            hit_miss_bases.insert(base);
+        }
+    }
+
+    let mut entries = Vec::new();
+    let mut consumed: HashSet<&'a str> = HashSet::new();
+
+    for (&key, &value) in &metrics {
+        if consumed.contains(key) {
+            continue;
+        }
+
+        let queue_base = key
+            .strip_suffix(".enq")
+            .or_else(|| key.strip_suffix(".drain"))
+            .or_else(|| key.strip_suffix(".depth"));
+
+        if let Some(base) = queue_base.filter(|base| queue_bases.contains(base)) {
+            let enq_key = format!("{base}.enq");
+            let drain_key = format!("{base}.drain");
+            let depth_key = format!("{base}.depth");
+            if let Some((&enq_key, _)) = metrics.get_key_value(enq_key.as_str()) {
+                consumed.insert(enq_key);
+            }
+            if let Some((&drain_key, _)) = metrics.get_key_value(drain_key.as_str()) {
+                consumed.insert(drain_key);
+            }
+            if let Some((&depth_key, _)) = metrics.get_key_value(depth_key.as_str()) {
+                consumed.insert(depth_key);
+            }
+
+            entries.push(MetricEntry::QueueGauge(QueueGaugeMetric {
+                name: base,
+                enq: metrics.get(enq_key.as_str()).copied().unwrap_or("0"),
+                drain: metrics.get(drain_key.as_str()).copied().unwrap_or("0"),
+                depth: metrics
+                    .get(depth_key.as_str())
+                    .copied()
+                    .filter(|depth| *depth != "0"),
+            }));
+            continue;
+        }
+
+        let hit_miss_base = key
+            .strip_suffix(".hit")
+            .or_else(|| key.strip_suffix(".miss"));
+
+        if let Some(base) = hit_miss_base.filter(|base| hit_miss_bases.contains(base)) {
+            let hit_key = format!("{base}.hit");
+            let miss_key = format!("{base}.miss");
+            if let Some((&hit_key, _)) = metrics.get_key_value(hit_key.as_str()) {
+                consumed.insert(hit_key);
+            }
+            if let Some((&miss_key, _)) = metrics.get_key_value(miss_key.as_str()) {
+                consumed.insert(miss_key);
+            }
+
+            entries.push(MetricEntry::HitMiss(HitMissMetric {
+                name: base,
+                hit: metrics.get(hit_key.as_str()).copied().unwrap_or("0"),
+                miss: metrics.get(miss_key.as_str()).copied().unwrap_or("0"),
+            }));
+            continue;
+        }
+
+        consumed.insert(key);
+
+        if let Some(name) = key.strip_suffix(":bytes") {
+            let bytes = value
+                .parse::<u64>()
+                .ok()
+                .or_else(|| parse_byte_value(value));
+            if let Some(bytes) = bytes {
+                if bytes == 0 {
+                    continue;
+                }
+
+                entries.push(MetricEntry::Throughput(ThroughputMetric { name, bytes }));
+            } else {
+                errors.push(MetricParseError::InvalidThroughputValue { key, value });
+            }
+
+            continue;
+        }
+
+        if let Some(bytes) = parse_byte_value(value) {
+            if bytes == 0 {
+                continue;
+            }
+
+            entries.push(MetricEntry::Throughput(ThroughputMetric {
+                name: key,
+                bytes,
+            }));
+            continue;
+        }
+
+        if value.contains('*') {
+            let histogram = Histogram::parse(value);
+            if histogram.buckets.is_empty() {
+                errors.push(MetricParseError::InvalidHistogramValue { key, value });
+            } else {
+                entries.push(MetricEntry::Histogram(HistogramMetric {
+                    name: key,
+                    histogram,
+                }));
+            }
+            continue;
+        }
+
+        entries.push(MetricEntry::Scalar(ScalarMetric { name: key, value }));
+    }
+
+    for (key, variants) in nominals {
+        entries.push(MetricEntry::Nominal(NominalMetric {
+            name: key,
+            variants,
+        }));
+    }
+
+    for (key, variants) in variant_histograms {
+        entries.push(MetricEntry::VariantHistograms(VariantHistogramMetric {
+            name: key,
+            variants,
+        }));
+    }
+
+    CombinedMetrics { entries, errors }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum MetricEntry<'a> {
     QueueGauge(QueueGaugeMetric<'a>),
@@ -604,7 +767,7 @@ impl<'a> Histogram<'a> {
 
     fn parse_parts(data: &'a str, unit: &'a str) -> Self {
         Self {
-            buckets: parse_histogram_buckets(data),
+            buckets: parse_histogram_buckets_with_unit(data, unit),
             unit,
         }
     }
@@ -629,6 +792,18 @@ impl<'a> Histogram<'a> {
                 format_duration_us(p50),
                 format_duration_us(p99),
                 format_duration_us(max),
+            )
+            .unwrap();
+            return;
+        }
+
+        if self.unit == "%" {
+            write!(
+                output,
+                "{key}(n={total_count} p50={} p99={} max={})",
+                format_percent(p50),
+                format_percent(p99),
+                format_percent(max),
             )
             .unwrap();
             return;
@@ -666,6 +841,18 @@ impl<'a> Histogram<'a> {
             return;
         }
 
+        if self.unit == "%" {
+            write!(
+                output,
+                "{label}=(n={total_count} p50={} p99={} max={})",
+                format_percent(p50),
+                format_percent(p99),
+                format_percent(max),
+            )
+            .unwrap();
+            return;
+        }
+
         write!(
             output,
             "{label}=(n={total_count} p50={p50} p99={p99} max={max}"
@@ -688,11 +875,11 @@ pub struct HistogramBucket {
 /// is a recognized unit suffix only (e.g. "us", "B"), as opposed to containing a
 /// variant name.
 fn is_histogram_unit_only(rest: &str) -> bool {
-    matches!(rest, "us" | "ms" | "s" | "B" | "KB" | "MB" | "GB")
+    HISTOGRAM_UNITS.contains(&rest)
 }
 
 fn is_valid_scalar_unit(rest: &str) -> bool {
-    is_histogram_unit_only(rest) || rest == "%"
+    SCALAR_UNITS.contains(&rest)
 }
 
 fn parse_byte_value(value: &str) -> Option<u64> {
@@ -750,17 +937,34 @@ pub fn histogram_value_at_percentile(buckets: &[HistogramBucket], percentile: u3
 }
 
 pub fn parse_histogram_buckets(data: &str) -> Vec<HistogramBucket> {
+    parse_histogram_buckets_with_unit(data, "")
+}
+
+fn parse_histogram_buckets_with_unit(data: &str, unit: &str) -> Vec<HistogramBucket> {
     let mut buckets = Vec::new();
 
     for entry in data.split('+') {
         if let Some((value, count)) = entry.split_once('*') {
-            if let (Ok(value), Ok(count)) = (value.parse::<u64>(), count.parse::<u64>()) {
+            let value = parse_histogram_bucket_value(value, unit);
+            if let (Some(value), Ok(count)) = (value, count.parse::<u64>()) {
                 buckets.push(HistogramBucket { value, count });
             }
         }
     }
 
     buckets
+}
+
+fn parse_histogram_bucket_value(value: &str, unit: &str) -> Option<u64> {
+    if unit == "%" {
+        let scaled = (value.parse::<f64>().ok()? * PERCENT_TO_MILLI_PERCENT).round();
+        if !scaled.is_finite() || scaled < 0.0 || scaled > u64::MAX as f64 {
+            return None;
+        }
+        return Some(scaled as u64);
+    }
+
+    value.parse::<u64>().ok()
 }
 
 /// Splits a histogram value string into (data, unit, variant).
@@ -798,6 +1002,14 @@ pub fn format_duration_us(us: u64) -> String {
     }
 }
 
+fn format_percent(milli_percent: u64) -> String {
+    format!("{:.3}%", milli_percent as f64 / PERCENT_TO_MILLI_PERCENT)
+}
+
+const HISTOGRAM_UNITS: &[&str] = &["us", "ms", "s", "B", "KB", "MB", "GB", "%"];
+const SCALAR_UNITS: &[&str] = &["us", "ms", "s", "B", "KB", "MB", "GB", "%"];
+const PERCENT_TO_MILLI_PERCENT: f64 = 1000.0;
+
 pub fn format_bits_per_second(bytes: u64) -> (f64, &'static str) {
     let mut rate = bytes as f64 * 8.0;
     let prefixes = [("G", 1e9), ("M", 1e6), ("K", 1e3)];
@@ -817,77 +1029,158 @@ pub fn format_bits_per_second(bytes: u64) -> (f64, &'static str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{Registry, Unit};
+
+    fn parsed_entries(line: &str) -> Vec<MetricEntry<'_>> {
+        ParsedMetricsLine::parse(line)
+            .compound_iter()
+            .map(|entry| entry.expect("expected parseable metric"))
+            .collect()
+    }
+
+    fn parse_errors(line: &str) -> Vec<MetricParseError<'_>> {
+        ParsedMetricsLine::parse(line)
+            .compound_iter()
+            .filter_map(Result::err)
+            .collect()
+    }
 
     #[test]
     fn parse_structures_formatted_metrics() {
-        let parsed = ParsedMetricsLine::parse(
+        let parsed = parsed_entries(
             "q.packet.drain=45662,q.packet.depth=875,q.packet.enq=46180,rx.ecn=500 ect0,rx.ecn=3 ect1",
         );
 
         assert_eq!(
             parsed,
-            ParsedMetricsLine {
-                entries: vec![
-                    MetricEntry::QueueGauge(QueueGaugeMetric {
-                        name: "q.packet",
-                        enq: "46180",
-                        drain: "45662",
-                        depth: Some("875"),
-                    }),
-                    MetricEntry::Nominal(NominalMetric {
-                        name: "rx.ecn",
-                        variants: vec![
-                            NominalVariant {
-                                label: "ect0",
-                                value: "500",
-                            },
-                            NominalVariant {
-                                label: "ect1",
-                                value: "3",
-                            },
-                        ],
-                    }),
-                ],
-            }
+            vec![
+                MetricEntry::QueueGauge(QueueGaugeMetric {
+                    name: "q.packet",
+                    enq: "46180",
+                    drain: "45662",
+                    depth: Some("875"),
+                }),
+                MetricEntry::Nominal(NominalMetric {
+                    name: "rx.ecn",
+                    variants: vec![
+                        NominalVariant {
+                            label: "ect0",
+                            value: "500",
+                        },
+                        NominalVariant {
+                            label: "ect1",
+                            value: "3",
+                        },
+                    ],
+                }),
+            ]
         );
     }
 
     #[test]
     fn parse_histogram_variants_into_structured_data() {
-        let parsed = ParsedMetricsLine::parse(
+        let parsed = parsed_entries(
             "task.time=5*2+10*1 us packet_dispatch.0,task.time=7*3 us packet_dispatch.1",
         );
 
         assert_eq!(
             parsed,
-            ParsedMetricsLine {
-                entries: vec![MetricEntry::VariantHistograms(VariantHistogramMetric {
-                    name: "task.time",
-                    variants: vec![
-                        HistogramVariant {
-                            label: "packet_dispatch.0",
-                            histogram: Histogram {
-                                buckets: vec![
-                                    HistogramBucket { value: 5, count: 2 },
-                                    HistogramBucket {
-                                        value: 10,
-                                        count: 1
-                                    },
-                                ],
-                                unit: "us",
-                            },
+            vec![MetricEntry::VariantHistograms(VariantHistogramMetric {
+                name: "task.time",
+                variants: vec![
+                    HistogramVariant {
+                        label: "packet_dispatch.0",
+                        histogram: Histogram {
+                            buckets: vec![
+                                HistogramBucket { value: 5, count: 2 },
+                                HistogramBucket {
+                                    value: 10,
+                                    count: 1,
+                                },
+                            ],
+                            unit: "us",
                         },
-                        HistogramVariant {
-                            label: "packet_dispatch.1",
-                            histogram: Histogram {
-                                buckets: vec![HistogramBucket { value: 7, count: 3 }],
-                                unit: "us",
-                            },
+                    },
+                    HistogramVariant {
+                        label: "packet_dispatch.1",
+                        histogram: Histogram {
+                            buckets: vec![HistogramBucket { value: 7, count: 3 }],
+                            unit: "us",
                         },
-                    ],
-                })],
-            }
+                    },
+                ],
+            })]
         );
+    }
+
+    #[test]
+    fn parse_is_iterator_based() {
+        let parsed = ParsedMetricsLine::parse("a=1,b=2");
+        let entries: Vec<_> = parsed
+            .iter()
+            .map(|entry| entry.expect("expected parseable metric"))
+            .collect();
+        assert_eq!(
+            entries,
+            vec![
+                MetricEntry::Scalar(ScalarMetric {
+                    name: "a",
+                    value: "1",
+                }),
+                MetricEntry::Scalar(ScalarMetric {
+                    name: "b",
+                    value: "2",
+                }),
+            ]
+        );
+    }
+
+    #[test]
+    fn primitive_iterator_exposes_raw_entries() {
+        let parsed = ParsedMetricsLine::parse("q.packet.enq=10,rx.ecn=7 ect0");
+        let entries: Vec<_> = parsed
+            .primitive_iter()
+            .map(|entry| entry.expect("expected parseable primitive metric"))
+            .collect();
+
+        assert_eq!(
+            entries,
+            vec![
+                PrimitiveMetricEntry::Scalar {
+                    key: "q.packet.enq",
+                    value: "10",
+                },
+                PrimitiveMetricEntry::NominalVariant {
+                    key: "rx.ecn",
+                    value: "7",
+                    label: "ect0",
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn parser_emits_fragment_error() {
+        let errors = parse_errors("bad");
+        assert!(errors
+            .iter()
+            .any(|error| matches!(error, MetricParseError::InvalidMetricFragment { fragment } if *fragment == "bad")));
+    }
+
+    #[test]
+    fn parser_emits_throughput_error() {
+        let errors = parse_errors("socket.tx:bytes=oops");
+        assert!(errors.iter().any(
+            |error| matches!(error, MetricParseError::InvalidThroughputValue { key, value } if *key == "socket.tx:bytes" && *value == "oops")
+        ));
+    }
+
+    #[test]
+    fn parser_emits_histogram_error() {
+        let errors = parse_errors("latency=bad*value us");
+        assert!(errors.iter().any(
+            |error| matches!(error, MetricParseError::InvalidHistogramValue { key, value } if *key == "latency" && *value == "bad*value us")
+        ));
     }
 
     #[test]
@@ -990,5 +1283,110 @@ mod tests {
         assert!(result.starts_with("task.budget(packet_dispatch.0=(n="));
         assert!(result.contains("packet_dispatch.1=(n="));
         assert!(result.ends_with(')'));
+    }
+
+    #[test]
+    fn format_percent_histogram() {
+        let line = "loss=1.500*4+2.250*3+3.000*2 %";
+        let result = ParsedMetricsLine::parse(line).format_pretty();
+        assert_eq!(result, "loss(n=9 p50=2.250% p99=3.000% max=3.000%)");
+    }
+
+    #[test]
+    fn parser_round_trips_registry_metric_types() {
+        let registry = Registry::new();
+
+        let scalar = registry.register_counter("scalar".into(), None);
+        scalar.increment(7);
+
+        let queue_enq = registry.register_counter("queue.depth.enq".into(), None);
+        let queue_drain = registry.register_counter("queue.depth.drain".into(), None);
+        let queue_depth = registry.register_counter("queue.depth.depth".into(), None);
+        queue_enq.increment(9);
+        queue_drain.increment(4);
+        queue_depth.increment(5);
+
+        let hit = registry.register_counter("cache.hit".into(), None);
+        let miss = registry.register_counter("cache.miss".into(), None);
+        hit.increment(3);
+        miss.increment(1);
+
+        let throughput = registry.register_counter("socket.tx:bytes".into(), None);
+        throughput.increment(256);
+
+        let histogram = registry.register_summary("latency".into(), None, Unit::Microsecond);
+        histogram.record_duration(std::time::Duration::from_micros(10));
+        histogram.record_duration(std::time::Duration::from_micros(20));
+
+        let percent = registry.register_summary("loss".into(), None, Unit::Percent);
+        percent.record_value(1250);
+        percent.record_value(2750);
+
+        let nominal = registry.register_counter("agg.counter".into(), Some("Task|worker.0".into()));
+        nominal.increment(11);
+
+        let variant = registry.register_summary(
+            "agg.summary".into(),
+            Some("Task|worker.0".into()),
+            Unit::Count,
+        );
+        variant.record_value(4);
+        variant.record_value(8);
+
+        let bool_metric = registry.register_bool("success".into(), None);
+        bool_metric.record(true);
+        bool_metric.record(false);
+
+        registry.register_list_callback::<u64, _>("callback".into(), None, Unit::Count, || 42);
+
+        let line = registry.take_current_metrics_line();
+        let entries = parsed_entries(&line);
+
+        assert!(entries.iter().any(
+            |entry| matches!(entry, MetricEntry::Scalar(m) if m.name == "scalar" && m.value == "7")
+        ));
+        assert!(entries
+            .iter()
+            .any(|entry| matches!(entry, MetricEntry::QueueGauge(m) if m.name == "queue.depth" && m.enq == "9" && m.drain == "4" && m.depth == Some("5"))));
+        assert!(entries
+            .iter()
+            .any(|entry| matches!(entry, MetricEntry::HitMiss(m) if m.name == "cache" && m.hit == "3" && m.miss == "1")));
+        assert!(entries
+            .iter()
+            .any(|entry| matches!(entry, MetricEntry::Throughput(m) if m.name == "socket.tx" && m.bytes == 256)));
+        assert!(entries
+            .iter()
+            .any(|entry| matches!(entry, MetricEntry::Histogram(m) if m.name == "latency" && m.histogram.unit == "us")));
+        assert!(entries
+            .iter()
+            .any(|entry| matches!(entry, MetricEntry::Histogram(m) if m.name == "loss" && m.histogram.unit == "%")));
+        assert!(entries
+            .iter()
+            .any(|entry| matches!(entry, MetricEntry::Histogram(m) if m.name == "success")));
+        assert!(entries
+            .iter()
+            .any(|entry| matches!(entry, MetricEntry::Nominal(m) if m.name == "agg.counter" && m.variants.len() == 1 && m.variants[0].label == "Task|worker.0")));
+        assert!(entries
+            .iter()
+            .any(|entry| matches!(entry, MetricEntry::VariantHistograms(m) if m.name == "agg.summary" && m.variants.len() == 1 && m.variants[0].label == "Task|worker.0")));
+        assert!(entries
+            .iter()
+            .any(|entry| matches!(entry, MetricEntry::Scalar(m) if m.name == "callback" && m.value == "42")));
+    }
+
+    #[test]
+    fn parser_fuzz_arbitrary_inputs() {
+        bolero::check!().with_type::<Vec<u8>>().for_each(|input| {
+            let line = String::from_utf8_lossy(input);
+            let parsed = ParsedMetricsLine::parse(&line);
+            let _ = parsed.iter().count();
+            let _ = parsed.primitive_iter().count();
+            let pretty = parsed.format_pretty();
+            let _ = parsed.to_json_rows();
+            let reparsed = ParsedMetricsLine::parse(&pretty);
+            let _ = reparsed.iter().count();
+            let _ = reparsed.primitive_iter().count();
+            let _ = reparsed.to_json_rows();
+        });
     }
 }

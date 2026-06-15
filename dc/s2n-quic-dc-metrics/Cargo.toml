@@ -30,3 +30,4 @@ harness = false
 
 [dev-dependencies]
 criterion = "0.8"
+bolero = "0.13"
