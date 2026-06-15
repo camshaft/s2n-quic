@@ -64,6 +64,16 @@ impl Rng {
 
         self.next_u64() as usize % bound
     }
+
+    /// Returns a uniformly distributed `f64` in the half-open range `[0, 1)`.
+    ///
+    /// Uses the top 53 bits of `next_u64` to fill the mantissa, so it inherits the same
+    /// deterministic behavior under `bolero`/`bach` as the other generators.
+    #[inline]
+    pub fn next_f64(&mut self) -> f64 {
+        // 53 bits of randomness scaled to [0, 1): the largest precision an f64 mantissa holds.
+        (self.next_u64() >> 11) as f64 / (1u64 << 53) as f64
+    }
 }
 
 impl Default for Rng {
