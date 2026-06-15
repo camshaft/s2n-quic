@@ -48,6 +48,18 @@ use std::{cell::RefCell, rc::Rc, sync::Arc};
 #[cfg(test)]
 mod tests;
 
+/// Upper bound on how far into the future the tx_wheel may be scheduled for paced
+/// transmission.
+///
+/// The CCA's earliest-departure-time reflects a pacing interval of `send_quantum /
+/// pacing_rate`, which is at most a few tens of milliseconds on any legitimate path. One
+/// second is roughly two orders of magnitude beyond that, so this clamp is inert during
+/// healthy operation and only engages when the pacing rate has degenerated toward zero and
+/// the interval blows up to days — at which point we cap the delay rather than strand the
+/// context. This is a backstop; the root cause of a zero pacing rate is prevented in BBR's
+/// bandwidth model.
+const MAX_TX_PACING_DELAY: Duration = Duration::from_secs(1);
+
 /// Pending frame queue with an integrated wire-cost counter.
 ///
 /// This struct ensures that `byte_cost` always mirrors the true accumulated
@@ -808,7 +820,16 @@ impl Context {
                 let target = self
                     .cca
                     .earliest_departure_time()
-                    .map(precision::Timestamp::from);
+                    .map(precision::Timestamp::from)
+                    // Backstop: never park the tx_wheel further out than MAX_TX_PACING_DELAY.
+                    // A legitimate pacing interval is `send_quantum / pacing_rate`, at most a
+                    // few tens of milliseconds even on the slowest path (the pacer floors the
+                    // rate near 1.2 Mbps). A far-future departure time means the CCA's pacing
+                    // rate has degenerated toward zero — e.g. a collapsed bandwidth estimate —
+                    // and dividing the quantum by it yields an interval of days. Clamping here
+                    // keeps a degenerate EDT from stranding the context regardless of how the
+                    // CCA produced it; the root-cause guard lives in BBR's bandwidth model.
+                    .map(|edt| edt.min(clock.now() + MAX_TX_PACING_DELAY));
                 // If target time is `None` then the wheel will schedule it immediately
                 self.tx_wheel.target_time = target;
                 true
