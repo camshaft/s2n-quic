@@ -103,6 +103,21 @@ impl Model {
         //# reflect application limits.  However, the estimator does use application-limited samples
         //# if the measured delivery rate happens to be larger than the current BBR.max_bw estimate,
         //# since this indicates the current BBR.Max_bw estimate is too low.
+
+        // A sample that delivered no bytes (zero delivery rate) carries no bandwidth
+        // information — it reflects a gap in delivery, not the path's capacity. Admitting it
+        // to the windowed-max filter can never raise `max_bw` (zero is the lowest possible
+        // bandwidth), but on window expiry the filter replaces its stored maximum with the
+        // newest sample regardless of magnitude, so a zero sample silently collapses `max_bw`
+        // to zero. That zero then propagates `bw -> pacing_rate -> 0`, making the pacer's
+        // `send_quantum / pacing_rate` interval blow up (~208 days) and parking the flow.
+        // The canonical algorithm assumes continuous delivery for non-app-limited samples and
+        // never contemplates a zero rate; treat it like an app-limited sample and discard it
+        // so `max_bw` is held across delivery gaps rather than decaying to zero.
+        if rate_sample.delivery_rate() == Bandwidth::ZERO {
+            return;
+        }
+
         if rate_sample.delivery_rate() > self.max_bw() || !rate_sample.is_app_limited {
             self.max_bw_filter
                 .update(rate_sample.delivery_rate(), self.cycle_count);
@@ -214,6 +229,66 @@ mod tests {
         // The sample is app limited so the max stays the same
         model.update_max_bw(rate_sample);
         assert_eq!(bw, model.max_bw());
+    }
+
+    //= type=test
+    // A non-app-limited sample that delivered zero bytes must not collapse `max_bw` (and
+    // therefore `bw`) to `Bandwidth::ZERO`.
+    //
+    // Such a sample has a zero delivery rate. The windowed-max filter overwrites its stored
+    // maximum with the newest sample once the window expires, regardless of magnitude, so
+    // before the fix a single zero-delivery sample arriving after the prior max aged out
+    // replaced a healthy `max_bw` with zero. That zero propagated to `bw -> pacing_rate -> 0`,
+    // blowing the pacer's `send_quantum / pacing_rate` interval up to ~208 days and parking
+    // the flow. Production counters confirmed this path fires fleet-wide (zero-delivery,
+    // non-app-limited samples feeding the filter). `update_max_bw` now discards zero-rate
+    // samples so `max_bw` is held across delivery gaps.
+    #[test]
+    fn zero_delivery_sample_does_not_collapse_max_bw() {
+        let mut model = Model::new();
+
+        // Establish a healthy max_bw from a real, non-app-limited delivery sample.
+        let good = RateSample {
+            interval: Duration::from_millis(10),
+            delivered_bytes: 100,
+            is_app_limited: false,
+            ..Default::default()
+        };
+        let healthy_bw = good.delivery_rate();
+        model.update_max_bw(good);
+        model.bound_bw_for_model();
+        assert_eq!(healthy_bw, model.max_bw());
+        assert_eq!(healthy_bw, model.bw());
+
+        // Age the healthy sample out of the 2-cycle filter window so the next sample would
+        // otherwise be accepted via the window-expiry path.
+        model.advance_max_bw_filter();
+        model.advance_max_bw_filter();
+
+        // A non-app-limited sample that delivered nothing over the interval — a delivery gap,
+        // not a capacity measurement.
+        let stalled = RateSample {
+            interval: Duration::from_millis(10),
+            delivered_bytes: 0,
+            is_app_limited: false,
+            ..Default::default()
+        };
+        assert_eq!(Bandwidth::ZERO, stalled.delivery_rate());
+
+        model.update_max_bw(stalled);
+        model.bound_bw_for_model();
+
+        // The zero sample is discarded, so the modeled bandwidth survives the gap.
+        assert_eq!(
+            healthy_bw,
+            model.max_bw(),
+            "zero-delivery sample collapsed max_bw"
+        );
+        assert_ne!(
+            Bandwidth::ZERO,
+            model.bw(),
+            "zero-delivery sample collapsed modeled bandwidth to zero"
+        );
     }
 
     #[test]
