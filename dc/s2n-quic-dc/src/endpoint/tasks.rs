@@ -261,7 +261,7 @@ pub fn send_worker<Socket, Clk, WakerSink, AckComp>(
     ) = send_sockets
         .iter()
         .map(|(id, st)| {
-            let (tx, rx) = unsync::new_with_adapter::<send::TxWheelAdapter>();
+            let (tx, rx) = unsync::new_with_adapter::<send::TxAssemblyAdapter>();
             let gauge = counter_registry.register_queue_gauge_nominal(
                 "q.wheel_to_assembler",
                 format_args!("send.{}", st.sender_idx),
