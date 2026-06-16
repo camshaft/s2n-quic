@@ -185,13 +185,15 @@ impl Controller {
     }
 
     /// True if the underlying BBR controller is still in Startup.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "testing"))]
+    #[doc(hidden)]
     pub fn is_in_startup(&self) -> bool {
         self.controller.is_in_startup()
     }
 
     /// True if the underlying BBR controller is in an application-limited period.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "testing"))]
+    #[doc(hidden)]
     pub fn is_app_limited(&self) -> bool {
         self.controller.is_app_limited()
     }
