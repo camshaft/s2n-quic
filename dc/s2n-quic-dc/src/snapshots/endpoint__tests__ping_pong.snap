@@ -1,5 +1,6 @@
 ---
 source: dc/s2n-quic-dc/src/testing.rs
+assertion_line: 352
 expression: logs
 ---
 0:00:00.000000000 [server] DEBUG s2n_quic_dc: capacity=50000
@@ -466,7 +467,7 @@ expression: logs
 0:00:00.000521000 [server] TRACE c#credit.send.acquire.fast_path=1
 0:00:00.000521000 [server] TRACE c#credit.send.acquire.bytes=4
 0:00:00.000521000 [server] DEBUG event=on_send_fin prev=Open next=FinSent location=dc/s2n-quic-dc/src/stream/writer.rs
-0:00:00.000521000 [server] DEBUG Writer dropping binding_id=1 status=FinSent next_offset=4 inflight_bytes=4 remote_max_data=1048576
+0:00:00.000521000 [server] DEBUG Writer dropping binding_id=1 status=FinSent next_offset=4 remote_max_data=1048576
 0:00:00.000521000 [server] DEBUG event=on_shutdown prev=FinSent next=Shutdown location=dc/s2n-quic-dc/src/stream/writer.rs
 0:00:00.000521000 [server] DEBUG Reader dropping binding_id=1 status=Complete final_size=Some(4) consumed_len=4 total_received_len=4 is_writing_complete=true is_reading_complete=true
 0:00:00.000521000 [server] TRACE m#task.idle_wheel.drained[send.worker.2]=1
@@ -682,6 +683,7 @@ expression: logs
 0:00:00.001021000 [client] TRACE c#q.ack_to_completion.receiver[send.worker.2.task.completion]=1
 0:00:00.001021000 [client] TRACE c#q.ack_to_completion.drain[send.worker.2]=1
 0:00:00.001021000 [client] TRACE g#q.ack_to_completion.depth[send.worker.2]=0
+0:00:00.001021000 [client] TRACE m#stream.writer.sojourn[acked]=1021000
 0:00:00.001021000 [client] TRACE m#task.completion.drained[send.worker.2]=1
 0:00:00.001021000 [client] TRACE m#task.recycle_drain.drained=0
 0:00:00.001021000 [client] TRACE m#task.recv_idle_wheel.drained[recv.dispatch.0]=0
@@ -699,7 +701,6 @@ expression: logs
 0:00:00.001021000 [client] TRACE m#q.resolver_to_idle_wheel.depth_dist[send.worker.1]=1
 0:00:00.001021000 [client] TRACE m#task.ack_processor.drained[send.worker.1]=2
 0:00:00.001021000 [client] TRACE m#task.recycle_drain.drained=0
-0:00:00.001021000 [client] TRACE m#task.waker_drain.drained[waker.11]=1
 0:00:00.001021000 [client] TRACE m#task.idle_wheel.drained[send.worker.1]=1
 0:00:00.001021000 [client] TRACE m#asm.max_datagram_size=1472
 0:00:00.001021000 [client] TRACE c#send.ack.drain[send.1]=1
@@ -759,7 +760,7 @@ expression: logs
 0:00:00.001041000 [client] DEBUG Reader complete - all data consumed binding_id=1 final_size=Some(4) consumed_len=4
 0:00:00.001041000 [client] DEBUG event=on_complete prev=Open next=Complete location=dc/s2n-quic-dc/src/stream/reader.rs
 0:00:00.001041000 [client]  INFO ping_pong passed
-0:00:00.001041000 [client] DEBUG Writer dropping binding_id=1 status=FinSent next_offset=4 inflight_bytes=4 remote_max_data=0
+0:00:00.001041000 [client] DEBUG Writer dropping binding_id=1 status=FinSent next_offset=4 remote_max_data=0
 0:00:00.001041000 [client] DEBUG event=on_shutdown prev=FinSent next=Shutdown location=dc/s2n-quic-dc/src/stream/writer.rs
 0:00:00.001041000 [client] DEBUG Reader dropping binding_id=1 status=Complete final_size=Some(4) consumed_len=4 total_received_len=4 is_writing_complete=true is_reading_complete=true
 0:00:00.001041000 [client] TRACE c#q.ack.receiver[send.3.task.ack_processor]=1

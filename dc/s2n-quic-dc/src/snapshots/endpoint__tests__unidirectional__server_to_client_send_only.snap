@@ -1,5 +1,6 @@
 ---
 source: dc/s2n-quic-dc/src/testing.rs
+assertion_line: 352
 expression: logs
 ---
 0:00:00.000000000 [server] DEBUG s2n_quic_dc: capacity=50000
@@ -178,7 +179,7 @@ expression: logs
 0:00:00.000000000 [client] DEBUG s2n_quic_dc: peer_address=10.0.0.2:49152 credential_id=[253, 162, 176, 33, 188, 81, 236, 106, 53, 74, 204, 19, 207, 132, 62, 199]
 0:00:00.000000000 [client] DEBUG setting peer data addresses peer=10.0.0.1:4433 addrs=[SocketAddressV6([::ffff:10.0.0.1]:4433), SocketAddressV6([::ffff:10.0.0.1]:49152), SocketAddressV6([::ffff:10.0.0.1]:49153), SocketAddressV6([::ffff:10.0.0.1]:49154), SocketAddressV6([::ffff:10.0.0.1]:49155), SocketAddressV6([::ffff:10.0.0.1]:49156), SocketAddressV6([::ffff:10.0.0.1]:49157), SocketAddressV6([::ffff:10.0.0.1]:49158)]
 0:00:00.000000000 [client] DEBUG setting peer data addresses peer=10.0.0.2:49152 addrs=[SocketAddressV6([::ffff:10.0.0.2]:49152), SocketAddressV6([::ffff:10.0.0.2]:49153), SocketAddressV6([::ffff:10.0.0.2]:49154), SocketAddressV6([::ffff:10.0.0.2]:49155), SocketAddressV6([::ffff:10.0.0.2]:49156), SocketAddressV6([::ffff:10.0.0.2]:49157), SocketAddressV6([::ffff:10.0.0.2]:49158), SocketAddressV6([::ffff:10.0.0.2]:49159)]
-0:00:00.000000000 [client] DEBUG Writer dropping binding_id=1 status=Init next_offset=0 inflight_bytes=0 remote_max_data=0
+0:00:00.000000000 [client] DEBUG Writer dropping binding_id=1 status=Init next_offset=0 remote_max_data=0
 0:00:00.000000000 [client] DEBUG event=on_init_sent prev=Init next=InitSent location=dc/s2n-quic-dc/src/stream/writer.rs
 0:00:00.000000000 [client] DEBUG event=on_send_fin prev=InitSent next=FinSent location=dc/s2n-quic-dc/src/stream/writer.rs
 0:00:00.000000000 [client] DEBUG Sent QueueInit with early data binding_id=1 bytes_read=0 is_fin=true
@@ -463,7 +464,7 @@ expression: logs
 0:00:00.000521000 [server] TRACE c#credit.send.acquire.fast_path=1
 0:00:00.000521000 [server] TRACE c#credit.send.acquire.bytes=65536
 0:00:00.000521000 [server] DEBUG event=on_send_fin prev=Open next=FinSent location=dc/s2n-quic-dc/src/stream/writer.rs
-0:00:00.000521000 [server] DEBUG Writer dropping binding_id=1 status=FinSent next_offset=65536 inflight_bytes=65536 remote_max_data=1048576
+0:00:00.000521000 [server] DEBUG Writer dropping binding_id=1 status=FinSent next_offset=65536 remote_max_data=1048576
 0:00:00.000521000 [server] DEBUG event=on_shutdown prev=FinSent next=Shutdown location=dc/s2n-quic-dc/src/stream/writer.rs
 0:00:00.000521000 [server] TRACE m#task.idle_wheel.drained[send.worker.2]=1
 0:00:00.000521000 [server] TRACE m#asm.max_datagram_size=1472
@@ -1593,6 +1594,7 @@ expression: logs
 0:00:00.001021000 [client] TRACE c#q.ack_to_completion.receiver[send.worker.2.task.completion]=1
 0:00:00.001021000 [client] TRACE c#q.ack_to_completion.drain[send.worker.2]=1
 0:00:00.001021000 [client] TRACE g#q.ack_to_completion.depth[send.worker.2]=0
+0:00:00.001021000 [client] TRACE m#stream.writer.sojourn[acked]=1021000
 0:00:00.001021000 [client] TRACE m#task.completion.drained[send.worker.2]=1
 0:00:00.001021000 [client] TRACE m#task.recycle_drain.drained=0
 0:00:00.001021000 [client] TRACE m#task.recv_idle_wheel.drained[recv.dispatch.0]=0
@@ -1978,33 +1980,43 @@ expression: logs
 0:00:00.001521000 [server] TRACE c#q.ack_to_completion.receiver[send.worker.3.task.completion]=1
 0:00:00.001521000 [server] TRACE c#q.ack_to_completion.drain[send.worker.3]=1
 0:00:00.001521000 [server] TRACE g#q.ack_to_completion.depth[send.worker.3]=9
+0:00:00.001521000 [server] TRACE m#stream.writer.sojourn[acked]=1000000
 0:00:00.001521000 [server] TRACE c#q.ack_to_completion.receiver[send.worker.3.task.completion]=1
 0:00:00.001521000 [server] TRACE c#q.ack_to_completion.drain[send.worker.3]=1
 0:00:00.001521000 [server] TRACE g#q.ack_to_completion.depth[send.worker.3]=8
+0:00:00.001521000 [server] TRACE m#stream.writer.sojourn[acked]=1000000
 0:00:00.001521000 [server] TRACE c#q.ack_to_completion.receiver[send.worker.3.task.completion]=1
 0:00:00.001521000 [server] TRACE c#q.ack_to_completion.drain[send.worker.3]=1
 0:00:00.001521000 [server] TRACE g#q.ack_to_completion.depth[send.worker.3]=7
+0:00:00.001521000 [server] TRACE m#stream.writer.sojourn[acked]=1000000
 0:00:00.001521000 [server] TRACE c#q.ack_to_completion.receiver[send.worker.3.task.completion]=1
 0:00:00.001521000 [server] TRACE c#q.ack_to_completion.drain[send.worker.3]=1
 0:00:00.001521000 [server] TRACE g#q.ack_to_completion.depth[send.worker.3]=6
+0:00:00.001521000 [server] TRACE m#stream.writer.sojourn[acked]=1000000
 0:00:00.001521000 [server] TRACE c#q.ack_to_completion.receiver[send.worker.3.task.completion]=1
 0:00:00.001521000 [server] TRACE c#q.ack_to_completion.drain[send.worker.3]=1
 0:00:00.001521000 [server] TRACE g#q.ack_to_completion.depth[send.worker.3]=5
+0:00:00.001521000 [server] TRACE m#stream.writer.sojourn[acked]=1000000
 0:00:00.001521000 [server] TRACE c#q.ack_to_completion.receiver[send.worker.3.task.completion]=1
 0:00:00.001521000 [server] TRACE c#q.ack_to_completion.drain[send.worker.3]=1
 0:00:00.001521000 [server] TRACE g#q.ack_to_completion.depth[send.worker.3]=4
+0:00:00.001521000 [server] TRACE m#stream.writer.sojourn[acked]=1000000
 0:00:00.001521000 [server] TRACE c#q.ack_to_completion.receiver[send.worker.3.task.completion]=1
 0:00:00.001521000 [server] TRACE c#q.ack_to_completion.drain[send.worker.3]=1
 0:00:00.001521000 [server] TRACE g#q.ack_to_completion.depth[send.worker.3]=3
+0:00:00.001521000 [server] TRACE m#stream.writer.sojourn[acked]=1000000
 0:00:00.001521000 [server] TRACE c#q.ack_to_completion.receiver[send.worker.3.task.completion]=1
 0:00:00.001521000 [server] TRACE c#q.ack_to_completion.drain[send.worker.3]=1
 0:00:00.001521000 [server] TRACE g#q.ack_to_completion.depth[send.worker.3]=2
+0:00:00.001521000 [server] TRACE m#stream.writer.sojourn[acked]=1000000
 0:00:00.001521000 [server] TRACE c#q.ack_to_completion.receiver[send.worker.3.task.completion]=1
 0:00:00.001521000 [server] TRACE c#q.ack_to_completion.drain[send.worker.3]=1
 0:00:00.001521000 [server] TRACE g#q.ack_to_completion.depth[send.worker.3]=1
+0:00:00.001521000 [server] TRACE m#stream.writer.sojourn[acked]=1000000
 0:00:00.001521000 [server] TRACE c#q.ack_to_completion.receiver[send.worker.3.task.completion]=1
 0:00:00.001521000 [server] TRACE c#q.ack_to_completion.drain[send.worker.3]=1
 0:00:00.001521000 [server] TRACE g#q.ack_to_completion.depth[send.worker.3]=0
+0:00:00.001521000 [server] TRACE m#stream.writer.sojourn[acked]=1000000
 0:00:00.001521000 [server] TRACE m#task.completion.drained[send.worker.3]=11
 0:00:00.001521000 [server] TRACE c#q.resolver_to_tx_wheel.receiver[send.worker.3.task.wheel_drain]=1
 0:00:00.001521000 [server] TRACE c#q.resolver_to_tx_wheel.drain[send.worker.3]=1
@@ -2968,15 +2980,19 @@ expression: logs
 0:00:00.001541000 [server] TRACE c#q.ack_to_completion.receiver[send.worker.0.task.completion]=1
 0:00:00.001541000 [server] TRACE c#q.ack_to_completion.drain[send.worker.0]=1
 0:00:00.001541000 [server] TRACE g#q.ack_to_completion.depth[send.worker.0]=3
+0:00:00.001541000 [server] TRACE m#stream.writer.sojourn[acked]=1020000
 0:00:00.001541000 [server] TRACE c#q.ack_to_completion.receiver[send.worker.0.task.completion]=1
 0:00:00.001541000 [server] TRACE c#q.ack_to_completion.drain[send.worker.0]=1
 0:00:00.001541000 [server] TRACE g#q.ack_to_completion.depth[send.worker.0]=2
+0:00:00.001541000 [server] TRACE m#stream.writer.sojourn[acked]=1020000
 0:00:00.001541000 [server] TRACE c#q.ack_to_completion.receiver[send.worker.0.task.completion]=1
 0:00:00.001541000 [server] TRACE c#q.ack_to_completion.drain[send.worker.0]=1
 0:00:00.001541000 [server] TRACE g#q.ack_to_completion.depth[send.worker.0]=1
+0:00:00.001541000 [server] TRACE m#stream.writer.sojourn[acked]=1020000
 0:00:00.001541000 [server] TRACE c#q.ack_to_completion.receiver[send.worker.0.task.completion]=1
 0:00:00.001541000 [server] TRACE c#q.ack_to_completion.drain[send.worker.0]=1
 0:00:00.001541000 [server] TRACE g#q.ack_to_completion.depth[send.worker.0]=0
+0:00:00.001541000 [server] TRACE m#stream.writer.sojourn[acked]=1020000
 0:00:00.001541000 [server] TRACE m#task.completion.drained[send.worker.0]=4
 0:00:00.001541000 [server] TRACE m#task.recycle_drain.drained=0
 0:00:00.002021000 [client] TRACE c#socket.rx.ops[recv.7]=1
@@ -3521,63 +3537,83 @@ expression: logs
 0:00:00.002521000 [server] TRACE c#q.ack_to_completion.receiver[send.worker.3.task.completion]=1
 0:00:00.002521000 [server] TRACE c#q.ack_to_completion.drain[send.worker.3]=1
 0:00:00.002521000 [server] TRACE g#q.ack_to_completion.depth[send.worker.3]=19
+0:00:00.002521000 [server] TRACE m#stream.writer.sojourn[acked]=2000000
 0:00:00.002521000 [server] TRACE c#q.ack_to_completion.receiver[send.worker.3.task.completion]=1
 0:00:00.002521000 [server] TRACE c#q.ack_to_completion.drain[send.worker.3]=1
 0:00:00.002521000 [server] TRACE g#q.ack_to_completion.depth[send.worker.3]=18
+0:00:00.002521000 [server] TRACE m#stream.writer.sojourn[acked]=2000000
 0:00:00.002521000 [server] TRACE c#q.ack_to_completion.receiver[send.worker.3.task.completion]=1
 0:00:00.002521000 [server] TRACE c#q.ack_to_completion.drain[send.worker.3]=1
 0:00:00.002521000 [server] TRACE g#q.ack_to_completion.depth[send.worker.3]=17
+0:00:00.002521000 [server] TRACE m#stream.writer.sojourn[acked]=2000000
 0:00:00.002521000 [server] TRACE c#q.ack_to_completion.receiver[send.worker.3.task.completion]=1
 0:00:00.002521000 [server] TRACE c#q.ack_to_completion.drain[send.worker.3]=1
 0:00:00.002521000 [server] TRACE g#q.ack_to_completion.depth[send.worker.3]=16
+0:00:00.002521000 [server] TRACE m#stream.writer.sojourn[acked]=2000000
 0:00:00.002521000 [server] TRACE c#q.ack_to_completion.receiver[send.worker.3.task.completion]=1
 0:00:00.002521000 [server] TRACE c#q.ack_to_completion.drain[send.worker.3]=1
 0:00:00.002521000 [server] TRACE g#q.ack_to_completion.depth[send.worker.3]=15
+0:00:00.002521000 [server] TRACE m#stream.writer.sojourn[acked]=2000000
 0:00:00.002521000 [server] TRACE c#q.ack_to_completion.receiver[send.worker.3.task.completion]=1
 0:00:00.002521000 [server] TRACE c#q.ack_to_completion.drain[send.worker.3]=1
 0:00:00.002521000 [server] TRACE g#q.ack_to_completion.depth[send.worker.3]=14
+0:00:00.002521000 [server] TRACE m#stream.writer.sojourn[acked]=2000000
 0:00:00.002521000 [server] TRACE c#q.ack_to_completion.receiver[send.worker.3.task.completion]=1
 0:00:00.002521000 [server] TRACE c#q.ack_to_completion.drain[send.worker.3]=1
 0:00:00.002521000 [server] TRACE g#q.ack_to_completion.depth[send.worker.3]=13
+0:00:00.002521000 [server] TRACE m#stream.writer.sojourn[acked]=2000000
 0:00:00.002521000 [server] TRACE c#q.ack_to_completion.receiver[send.worker.3.task.completion]=1
 0:00:00.002521000 [server] TRACE c#q.ack_to_completion.drain[send.worker.3]=1
 0:00:00.002521000 [server] TRACE g#q.ack_to_completion.depth[send.worker.3]=12
+0:00:00.002521000 [server] TRACE m#stream.writer.sojourn[acked]=2000000
 0:00:00.002521000 [server] TRACE c#q.ack_to_completion.receiver[send.worker.3.task.completion]=1
 0:00:00.002521000 [server] TRACE c#q.ack_to_completion.drain[send.worker.3]=1
 0:00:00.002521000 [server] TRACE g#q.ack_to_completion.depth[send.worker.3]=11
+0:00:00.002521000 [server] TRACE m#stream.writer.sojourn[acked]=2000000
 0:00:00.002521000 [server] TRACE c#q.ack_to_completion.receiver[send.worker.3.task.completion]=1
 0:00:00.002521000 [server] TRACE c#q.ack_to_completion.drain[send.worker.3]=1
 0:00:00.002521000 [server] TRACE g#q.ack_to_completion.depth[send.worker.3]=10
+0:00:00.002521000 [server] TRACE m#stream.writer.sojourn[acked]=2000000
 0:00:00.002521000 [server] TRACE c#q.ack_to_completion.receiver[send.worker.3.task.completion]=1
 0:00:00.002521000 [server] TRACE c#q.ack_to_completion.drain[send.worker.3]=1
 0:00:00.002521000 [server] TRACE g#q.ack_to_completion.depth[send.worker.3]=9
+0:00:00.002521000 [server] TRACE m#stream.writer.sojourn[acked]=2000000
 0:00:00.002521000 [server] TRACE c#q.ack_to_completion.receiver[send.worker.3.task.completion]=1
 0:00:00.002521000 [server] TRACE c#q.ack_to_completion.drain[send.worker.3]=1
 0:00:00.002521000 [server] TRACE g#q.ack_to_completion.depth[send.worker.3]=8
+0:00:00.002521000 [server] TRACE m#stream.writer.sojourn[acked]=2000000
 0:00:00.002521000 [server] TRACE c#q.ack_to_completion.receiver[send.worker.3.task.completion]=1
 0:00:00.002521000 [server] TRACE c#q.ack_to_completion.drain[send.worker.3]=1
 0:00:00.002521000 [server] TRACE g#q.ack_to_completion.depth[send.worker.3]=7
+0:00:00.002521000 [server] TRACE m#stream.writer.sojourn[acked]=2000000
 0:00:00.002521000 [server] TRACE c#q.ack_to_completion.receiver[send.worker.3.task.completion]=1
 0:00:00.002521000 [server] TRACE c#q.ack_to_completion.drain[send.worker.3]=1
 0:00:00.002521000 [server] TRACE g#q.ack_to_completion.depth[send.worker.3]=6
+0:00:00.002521000 [server] TRACE m#stream.writer.sojourn[acked]=2000000
 0:00:00.002521000 [server] TRACE c#q.ack_to_completion.receiver[send.worker.3.task.completion]=1
 0:00:00.002521000 [server] TRACE c#q.ack_to_completion.drain[send.worker.3]=1
 0:00:00.002521000 [server] TRACE g#q.ack_to_completion.depth[send.worker.3]=5
+0:00:00.002521000 [server] TRACE m#stream.writer.sojourn[acked]=2000000
 0:00:00.002521000 [server] TRACE c#q.ack_to_completion.receiver[send.worker.3.task.completion]=1
 0:00:00.002521000 [server] TRACE c#q.ack_to_completion.drain[send.worker.3]=1
 0:00:00.002521000 [server] TRACE g#q.ack_to_completion.depth[send.worker.3]=4
+0:00:00.002521000 [server] TRACE m#stream.writer.sojourn[acked]=2000000
 0:00:00.002521000 [server] TRACE c#q.ack_to_completion.receiver[send.worker.3.task.completion]=1
 0:00:00.002521000 [server] TRACE c#q.ack_to_completion.drain[send.worker.3]=1
 0:00:00.002521000 [server] TRACE g#q.ack_to_completion.depth[send.worker.3]=3
+0:00:00.002521000 [server] TRACE m#stream.writer.sojourn[acked]=2000000
 0:00:00.002521000 [server] TRACE c#q.ack_to_completion.receiver[send.worker.3.task.completion]=1
 0:00:00.002521000 [server] TRACE c#q.ack_to_completion.drain[send.worker.3]=1
 0:00:00.002521000 [server] TRACE g#q.ack_to_completion.depth[send.worker.3]=2
+0:00:00.002521000 [server] TRACE m#stream.writer.sojourn[acked]=2000000
 0:00:00.002521000 [server] TRACE c#q.ack_to_completion.receiver[send.worker.3.task.completion]=1
 0:00:00.002521000 [server] TRACE c#q.ack_to_completion.drain[send.worker.3]=1
 0:00:00.002521000 [server] TRACE g#q.ack_to_completion.depth[send.worker.3]=1
+0:00:00.002521000 [server] TRACE m#stream.writer.sojourn[acked]=2000000
 0:00:00.002521000 [server] TRACE c#q.ack_to_completion.receiver[send.worker.3.task.completion]=1
 0:00:00.002521000 [server] TRACE c#q.ack_to_completion.drain[send.worker.3]=1
 0:00:00.002521000 [server] TRACE g#q.ack_to_completion.depth[send.worker.3]=0
+0:00:00.002521000 [server] TRACE m#stream.writer.sojourn[acked]=2000000
 0:00:00.002521000 [server] TRACE m#task.completion.drained[send.worker.3]=20
 0:00:00.002521000 [server] TRACE c#q.resolver_to_tx_wheel.receiver[send.worker.3.task.wheel_drain]=1
 0:00:00.002521000 [server] TRACE c#q.resolver_to_tx_wheel.drain[send.worker.3]=1

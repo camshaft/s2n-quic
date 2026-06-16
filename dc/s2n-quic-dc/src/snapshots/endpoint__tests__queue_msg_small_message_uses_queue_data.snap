@@ -185,7 +185,7 @@ expression: logs
 0:00:00.000000000 [client] DEBUG event=on_send_fin prev=InitSent next=FinSent location=dc/s2n-quic-dc/src/stream/writer.rs
 0:00:00.000000000 [client] DEBUG Sent QueueInit with early data binding_id=1 bytes_read=100 is_fin=true
 0:00:00.000000000 [client]  INFO queue_msg_small_message_uses_queue_data passed
-0:00:00.000000000 [client] DEBUG Writer dropping binding_id=1 status=FinSent next_offset=100 inflight_bytes=100 remote_max_data=0
+0:00:00.000000000 [client] DEBUG Writer dropping binding_id=1 status=FinSent next_offset=100 remote_max_data=0
 0:00:00.000000000 [client] DEBUG event=on_shutdown prev=FinSent next=Shutdown location=dc/s2n-quic-dc/src/stream/writer.rs
 0:00:00.000000000 [client] DEBUG Reader dropping binding_id=1 status=Open final_size=None consumed_len=0 total_received_len=0 is_writing_complete=false is_reading_complete=false
 0:00:00.000000000 [client] DEBUG Sent QueueReset binding_id=1 error_code=4 reset_target=Control

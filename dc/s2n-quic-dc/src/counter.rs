@@ -2406,6 +2406,14 @@ impl Registry {
         self.topology.lock().unwrap().clone()
     }
 
+    /// Drains and returns the current metrics line (aggregating all per-CPU/fallback pages
+    /// first), or `None` if nothing has been recorded. Test-only: lets a unit test assert that
+    /// a specific metric (e.g. `stream.writer.sojourn[acked]`) was observed without snapshotting.
+    #[cfg(test)]
+    pub fn take_current_metrics_line(&self) -> Option<String> {
+        self.inner.try_take_current_metrics_line_sparse(false)
+    }
+
     /// Register a task in the topology.
     pub(crate) fn register_task_topology(&self, task: TaskRegistration) {
         self.topology.lock().unwrap().tasks.push(task);

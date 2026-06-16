@@ -169,6 +169,91 @@ fn completion_dispatcher_releases_flow_credits_on_drained_frame() {
 
 unsafe fn noop_drop_slot(_ptr: std::ptr::NonNull<crate::credit::Slot>) {}
 
+/// The production writer subscribes to its completion channel with `FailuresOnly` (see
+/// `Writer::new_client`): acked frames must be dropped at the dispatcher — emitting no wake to
+/// the application — while their `acked` sojourn is still recorded endpoint-side. This is the
+/// per-frame-wake elimination on the steady-state ack path; the test pins both halves so a
+/// future change back to `All` (or a lost endpoint-side sojourn record) fails loudly.
+#[test]
+fn failures_only_acked_frame_records_sojourn_without_waking() {
+    sim(|| {
+        // Build the dispatcher inline so we retain the writer-metrics handle to inspect.
+        let (mut frame_tx, frame_rx) = unsync::new::<frame::Frame>();
+        let (wake_tx, mut wake_rx) = entry_channel::<AutoWake>();
+        let registry = crate::counter::Registry::default();
+        let clock = crate::time::DefaultClock::default();
+        let reader_metrics = std::sync::Arc::new(crate::stream::metrics::ReaderMetrics::new(
+            &registry,
+            "test.reader",
+        ));
+        let writer_metrics = std::sync::Arc::new(crate::stream::metrics::WriterMetrics::new(
+            &registry,
+            "test.writer",
+        ));
+        let send_credit_pool = crate::sync::Arc::new(crate::credit::Pool::new(
+            crate::credit::Config::new(1_000_000),
+        ));
+        let rx = tasks::completion_dispatcher(
+            frame_rx,
+            wake_tx,
+            clock,
+            reader_metrics,
+            writer_metrics,
+            send_credit_pool,
+        );
+
+        async move { rx.drain_budgeted(Some(32)).await }
+            .primary()
+            .spawn();
+
+        async move {
+            let pse = test_entry();
+
+            // A `FailuresOnly` completion channel, exactly as the production writer uses.
+            let mut completion_rx = frame::failure_completion_channel();
+
+            // An acknowledged frame carrying an enqueue stamp so the dispatcher records sojourn.
+            let mut submitted = test_frame(&pse).into_inner();
+            submitted.status = frame::TransmissionStatus::Acknowledged;
+            submitted.completion = Some(completion_rx.sender());
+            submitted.enqueued_at = Some(crate::time::DefaultClock::default().now());
+
+            let _ = frame_tx.send(Entry::new(submitted));
+            drop(frame_tx);
+
+            // The win: an acked frame on a FailuresOnly channel emits no wake — the application
+            // task is not poked per acknowledged frame.
+            assert!(
+                wake_rx.recv().await.is_none(),
+                "acked frame on FailuresOnly channel must not wake the application"
+            );
+
+            // And it is not delivered to the channel's receiver (dropped at the dispatcher).
+            // `poll_swap` parks forever on an empty queue rather than returning `None`, so poll
+            // it exactly once and assert it has nothing to hand back.
+            let waker = s2n_quic_core::task::waker::noop();
+            let mut cx = core::task::Context::from_waker(&waker);
+            assert!(
+                completion_rx.poll_swap(&mut cx).is_pending(),
+                "acked frame must not be delivered on a FailuresOnly channel"
+            );
+
+            // But the endpoint-side `acked` sojourn was still recorded, so the metric survives
+            // the move off per-frame writer notifications.
+            let line = registry
+                .take_current_metrics_line()
+                .expect("registry should have recorded at least one metric");
+            assert!(
+                line.contains("test.writer.sojourn") && line.contains("acked"),
+                "endpoint must record acked sojourn even when the writer doesn't subscribe to \
+                 acks; metrics line was: {line}"
+            );
+        }
+        .primary()
+        .spawn();
+    });
+}
+
 /// Frames without a completion sender do not emit any wake notifications.
 #[test]
 fn completion_dispatcher_ignores_frames_without_completion_sender() {
