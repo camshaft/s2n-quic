@@ -27,7 +27,6 @@ pub const MAX_TX_PACING_DELAY: Duration = Duration::from_secs(1);
 #[derive(Clone, Debug)]
 pub struct Controller {
     controller: BbrCongestionController,
-    last_packet_sent_time: Option<Timestamp>,
 }
 
 impl Controller {
@@ -35,7 +34,6 @@ impl Controller {
     pub fn new(max_datagram_size: u16) -> Self {
         Self {
             controller: BbrCongestionController::new(max_datagram_size, Default::default()),
-            last_packet_sent_time: None,
         }
     }
 
@@ -49,19 +47,16 @@ impl Controller {
     ) -> PacketInfo {
         let sent_bytes = sent_bytes as usize;
 
-        // Only mark as app-limited if the sender has been idle for longer than one
-        // pacing interval. This prevents brief inter-RPC gaps (microseconds) from being
-        // classified as app-limited, which would cause BBR's pipe-filling estimator to
-        // skip evaluation and keep the CCA stuck in Startup indefinitely.
-        let is_idle = !has_more_app_data
-            && self.last_packet_sent_time.is_some_and(|last| {
-                let elapsed = time_sent.saturating_duration_since(last);
-                let pacing_interval = self.send_quantum() as u64 / self.bandwidth();
-                elapsed > pacing_interval
-            });
-        let app_limited = Some(is_idle);
-
-        self.last_packet_sent_time = Some(time_sent);
+        // The sender is application-limited whenever it has no more application data queued at
+        // send time. We feed this signal honestly. A previous idle-gap heuristic here (only flag
+        // app-limited when the inter-send gap exceeded one pacing interval) existed solely to
+        // work around a bandwidth-estimator latch: `on_app_limited` re-armed the end-mark on
+        // every send, so a per-context controller repeatedly flagged app-limited under spray
+        // never closed the period and never left Startup. That latch is now fixed at its source
+        // (the estimator pins the end-mark to the first send of each period), so the period
+        // closes once the in-flight bytes drain and the controller exits Startup normally. The
+        // heuristic is no longer needed and is removed.
+        let app_limited = Some(!has_more_app_data);
 
         let publisher = &mut NoopPublisher;
         self.controller
@@ -188,6 +183,18 @@ impl Controller {
     pub fn bandwidth(&self) -> Bandwidth {
         self.controller.pacing_rate()
     }
+
+    /// True if the underlying BBR controller is still in Startup.
+    #[cfg(test)]
+    pub fn is_in_startup(&self) -> bool {
+        self.controller.is_in_startup()
+    }
+
+    /// True if the underlying BBR controller is in an application-limited period.
+    #[cfg(test)]
+    pub fn is_app_limited(&self) -> bool {
+        self.controller.is_app_limited()
+    }
 }
 
 impl timer::Provider for Controller {
@@ -239,5 +246,82 @@ impl Publisher for NoopPublisher {
     #[inline]
     fn on_bbr_state_changed(&mut self, _state: event::builder::BbrState) {
         // TODO
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use s2n_quic_core::{
+        packet::number::PacketNumberSpace,
+        random,
+        time::{Clock, NoopClock},
+    };
+
+    /// Models the spray regime that the removed idle-gap heuristic was meant to handle: a
+    /// per-context controller receives work in bursts (whose body carries more queued app data,
+    /// i.e. NOT app-limited) followed by an application-limited tail when the context drains.
+    /// With the honest `app_limited = !has_more_app_data` signal restored and the estimator
+    /// latch fixed (#398), the app-limited tail's period closes once its bubble drains, so the
+    /// next burst's body is correctly seen as non-app-limited and BBR's full-pipe estimator
+    /// advances and exits Startup.
+    ///
+    /// Before #398 the tail opened an app-limited period that never closed, poisoning every
+    /// subsequent send (including the next burst's body) into being flagged app-limited, so the
+    /// full-pipe estimator never ran and the controller was stuck in Startup forever. That latch
+    /// is why the heuristic existed; with it fixed the heuristic is unnecessary. This test asserts
+    /// the controller leaves Startup, which it cannot do if the latch is present.
+    #[test]
+    fn bursty_app_limited_sender_exits_startup() {
+        let mtu = s2n_quic_core::path::MINIMUM_MAX_DATAGRAM_SIZE;
+        let mut cca = Controller::new(mtu);
+        let mut rng = random::testing::Generator::default();
+        let mut rtt = RttEstimator::new(Duration::from_millis(10));
+        let mut now = NoopClock.get_time();
+
+        // Prime an RTT sample so the estimator has a real smoothed_rtt.
+        let sample_rtt = |rtt: &mut RttEstimator, now| {
+            rtt.update_rtt(
+                Duration::ZERO,
+                Duration::from_millis(10),
+                now,
+                true,
+                PacketNumberSpace::ApplicationData,
+            );
+        };
+        now += Duration::from_millis(10);
+        sample_rtt(&mut rtt, now);
+
+        // Send bursts of several packets. Within a burst, every packet but the last reports more
+        // queued app data (not app-limited); the last reports none (app-limited tail). Each burst
+        // is acked a round later, then the context idles briefly before the next burst.
+        const BURST: usize = 8;
+        'outer: for _ in 0..30 {
+            let mut inflight = Vec::new();
+            for i in 0..BURST {
+                let has_more = i + 1 < BURST;
+                let sent_at = now;
+                let info = cca.on_packet_sent(sent_at, mtu, has_more, &rtt);
+                inflight.push((sent_at, info));
+            }
+            // Ack the burst one round later.
+            now += Duration::from_millis(10);
+            sample_rtt(&mut rtt, now);
+            for (sent_at, info) in inflight {
+                cca.on_packet_ack(sent_at, mtu as usize, info, &rtt, &mut rng, now);
+                if !cca.is_in_startup() {
+                    break 'outer;
+                }
+            }
+            // Idle gap between bursts (longer than a pacing interval).
+            now += Duration::from_millis(50);
+        }
+
+        assert!(
+            !cca.is_in_startup(),
+            "controller stuck in Startup under bursty app-limited traffic — without the #398 \
+             estimator latch fix the app-limited tail never clears and poisons later bursts, so \
+             the full-pipe estimator never runs"
+        );
     }
 }
