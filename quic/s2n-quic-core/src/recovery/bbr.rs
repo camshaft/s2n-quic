@@ -875,7 +875,18 @@ impl BbrCongestionController {
             // The Linux TCP BBRv2 implementation and Chromium BBRv2 implementation both use 2 * initial_cwnd here
             // See https://github.com/google/bbr/blob/1ee29b79317a3028ed1fcd85cb46da009f45de00/net/ipv4/tcp_bbr2.c#L931
             // and https://source.chromium.org/chromium/chromium/src/+/main:net/third_party/quiche/src/quiche/quic/core/congestion_control/bbr2_sender.cc;l=404;bpv=1;bpt=1
-            cwnd += newly_acked as u32;
+            //
+            // Saturate rather than wrap: this is the Startup growth path, where cwnd grows by
+            // `newly_acked` with no `max_inflight` cap (that cap only applies once `filled_pipe`).
+            // If a controller stays in Startup across many gigabytes of cumulative ACKs — which a
+            // per-context CCA can, when it latches application-limited and never exits Startup —
+            // `cwnd` reaches `u32::MAX` and a plain `+=` panics with "attempt to add with
+            // overflow". A congestion controller must never panic on arithmetic; the value is
+            // clamped to `bound_cwnd_for_model()` immediately below, so saturating here is inert
+            // in healthy operation and matches the post-Startup path above. The latch that drives
+            // cwnd this high is a separate problem (app-limited Startup never terminating); this
+            // is defense in depth so the symptom can never be a crash.
+            cwnd = cwnd.saturating_add(newly_acked as u32);
         } else {
             self.try_fast_path = true;
         }
