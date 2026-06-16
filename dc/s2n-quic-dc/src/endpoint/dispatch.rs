@@ -154,11 +154,19 @@ fn decrypt_fast_path(
             freed_batch_tx,
         ) {
             Ok(crate::queue::BindResult::NewBinding {
-                waker: _,
+                waker,
                 stream,
                 control,
-                release_bytes: _,
+                release_bytes,
             }) => {
+                // `bind_for_msg` only allocates the slot, so this waker is empty
+                // and `release_bytes` zero today; the real wake/release comes from
+                // the `send_msg` below. Unlike the slow path there is no waker sink
+                // here (the fast path returns a single `AutoWake`), so let this
+                // `waker` drop-wake as its failsafe and release any bytes
+                // explicitly — never silently dropped.
+                recv_credit_pool.release(release_bytes);
+                drop(waker);
                 let writer = Writer::new_server(
                     frame_tx.clone(),
                     path_entry.clone(),
@@ -222,7 +230,16 @@ fn decrypt_fast_path(
                     }
                 }
             }
-            Ok(crate::queue::BindResult::Bound { .. }) => {}
+            Ok(crate::queue::BindResult::Bound {
+                waker,
+                release_bytes,
+            }) => {
+                // Slot already bound (init retransmit / coalesced frames). As with
+                // NewBinding above: no waker sink here, so release bytes
+                // explicitly and let `waker` drop-wake as its failsafe.
+                recv_credit_pool.release(release_bytes);
+                drop(waker);
+            }
             // Un-authenticated reject — caller must authenticate before ACKing. See `AuthForDrop`.
             Err(_) => return Err(FastPathError::AuthForDrop),
         }
@@ -1194,11 +1211,19 @@ fn handle_queue_msg_init(
         freed_batch_tx,
     ) {
         Ok(crate::queue::BindResult::NewBinding {
-            waker: _,
+            waker,
             stream,
             control,
-            release_bytes: _,
+            release_bytes,
         }) => {
+            // `bind_for_msg` only allocates the slot, so today this waker is empty
+            // and `release_bytes` is zero (the real wake/release for this packet
+            // comes from the `push_msg` below). Deliver them through the proper
+            // channels anyway rather than relying on `AutoWake`'s drop-wake
+            // failsafe — if `bind_for_msg` ever produces a live waker (e.g. to
+            // wake a parked acceptor) it is routed, not merely dropped.
+            let _ = waker_sink.send(waker);
+            recv_credit_pool.release(release_bytes);
             let writer = Writer::new_server(
                 frame_tx.clone(),
                 peer.path_entry.clone(),
@@ -1258,8 +1283,16 @@ fn handle_queue_msg_init(
                 }
             }
         }
-        Ok(crate::queue::BindResult::Bound { .. }) => {
-            // Already bound — just push the msg data below
+        Ok(crate::queue::BindResult::Bound {
+            waker,
+            release_bytes,
+        }) => {
+            // Already bound (init retransmit / coalesced frames). Deliver any
+            // waker/bytes through the proper channels rather than relying on
+            // drop-wake — see the NewBinding arm. The push_msg below does the
+            // real wake/release for this packet.
+            let _ = waker_sink.send(waker);
+            recv_credit_pool.release(release_bytes);
         }
         Err(_) => {
             return;
