@@ -354,6 +354,33 @@ pub enum FailureReason {
     Cancelled,
 }
 
+/// The extra fields a frame carries when it can *create* a binding on the
+/// server (an "init" frame), shared by `QueueData`, `QueueMsg`, and
+/// `QueueReset`. Present only on the first frame(s) of a stream, before the
+/// server has confirmed the binding; omitted once confirmed.
+///
+/// Both fields must be identical no matter which init frame establishes the
+/// binding, otherwise the bound stream's state would depend on arrival order:
+///
+///   * `dest_acceptor_id` — which acceptor the new server stream is handed to.
+///   * `priority` — the credit tier the inbound stream parks on. If a reset
+///     could bind without it (or with a different value than the data-init that
+///     races it), the same stream would land on different tiers depending on
+///     which frame arrived first. Carrying it on every init frame removes that
+///     non-determinism.
+///
+/// The sender's own queue id is *not* here: every routed frame (init or not)
+/// already carries it in its `QueuePair`, so it is always available.
+#[cfg_attr(test, derive(bolero_generator::TypeGenerator))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Init {
+    /// Which acceptor the freshly-bound server stream is handed to.
+    pub dest_acceptor_id: VarInt,
+    /// Credit tier the inbound stream parks on. Must match across all init
+    /// frames for a binding so the bound tier is arrival-order independent.
+    pub priority: crate::credit::Priority,
+}
+
 /// Routing metadata for a Frame.
 ///
 /// Describes what kind of frame this is and the per-frame routing fields. The
@@ -412,11 +439,19 @@ pub enum Header {
     },
     /// Reset a flow
     QueueReset {
-        dest_queue_id: VarInt,
+        /// Always present (like every other routed frame) so a reset that races
+        /// ahead of the QueueInit can bind a correctly-routed slot. `source` is
+        /// the sender's own queue id; `dest` is the slot being reset.
+        queue_pair: QueuePair,
         binding_id: VarInt,
         reset_target: ResetTarget,
         error_code: VarInt,
-        dest_acceptor_id: Option<VarInt>,
+        /// Init fields, present only when this reset may need to *create* the
+        /// binding (it raced ahead of the QueueInit). `None` is a plain reset
+        /// against an existing binding. Same shape as `QueueData`/`QueueMsg`
+        /// init so the bound stream is identical regardless of which init frame
+        /// wins the race — see [`Init`].
+        init: Option<Init>,
     },
     /// Free queue slots (server→client credit return).
     ///
@@ -766,13 +801,13 @@ impl EncoderValue for Header {
                 encoder.encode(maximum_data);
             }
             Self::QueueReset {
-                dest_queue_id,
+                queue_pair,
                 binding_id,
                 reset_target,
                 error_code,
-                dest_acceptor_id,
+                init,
             } => {
-                let reset_type = match (dest_acceptor_id.is_some(), reset_target) {
+                let reset_type = match (init.is_some(), reset_target) {
                     (false, ResetTarget::Both) => Self::QUEUE_RESET_BOTH_TYPE,
                     (false, ResetTarget::Stream) => Self::QUEUE_RESET_STREAM_TYPE,
                     (false, ResetTarget::Control) => Self::QUEUE_RESET_CONTROL_TYPE,
@@ -781,9 +816,15 @@ impl EncoderValue for Header {
                     (true, ResetTarget::Control) => Self::QUEUE_RESET_CONTROL_INIT_TYPE,
                 };
                 encoder.encode(&reset_type);
-                encoder.encode(dest_queue_id);
-                if let Some(acceptor_id) = dest_acceptor_id {
-                    encoder.encode(acceptor_id);
+                // Always carry the full queue pair (like every other routed
+                // frame) so an init reset can bind a correctly-routed slot.
+                encoder.encode(queue_pair);
+                // On init, the same {acceptor_id, priority} the data/msg init
+                // frames carry, in the same order, so the bound stream is
+                // identical no matter which init frame wins the race.
+                if let Some(init) = init {
+                    encoder.encode(&init.dest_acceptor_id);
+                    encoder.encode(&init.priority.as_u8());
                 }
                 encoder.encode(binding_id);
                 encoder.encode(error_code);
@@ -957,17 +998,26 @@ impl<'a> s2n_codec::DecoderValue<'a> for Header {
                     Self::QUEUE_RESET_CONTROL_INIT_TYPE => ResetTarget::Control,
                     _ => unreachable!(),
                 };
-                let (dest_queue_id, buffer) = buffer.decode()?;
+                let (queue_pair, buffer) = buffer.decode()?;
                 let (dest_acceptor_id, buffer) = buffer.decode::<VarInt>()?;
+                let (priority_byte, buffer) = buffer.decode::<u8>()?;
+                let priority = crate::credit::Priority::from_u8(priority_byte).ok_or(
+                    s2n_codec::DecoderError::InvariantViolation(
+                        "credit::Priority value out of range",
+                    ),
+                )?;
                 let (binding_id, buffer) = buffer.decode()?;
                 let (error_code, buffer) = buffer.decode()?;
                 Ok((
                     Self::QueueReset {
-                        dest_queue_id,
+                        queue_pair,
                         binding_id,
                         reset_target,
                         error_code,
-                        dest_acceptor_id: Some(dest_acceptor_id),
+                        init: Some(Init {
+                            dest_acceptor_id,
+                            priority,
+                        }),
                     },
                     buffer,
                 ))
@@ -981,16 +1031,16 @@ impl<'a> s2n_codec::DecoderValue<'a> for Header {
                     Self::QUEUE_RESET_CONTROL_TYPE => ResetTarget::Control,
                     _ => unreachable!(),
                 };
-                let (dest_queue_id, buffer) = buffer.decode()?;
+                let (queue_pair, buffer) = buffer.decode()?;
                 let (binding_id, buffer) = buffer.decode()?;
                 let (error_code, buffer) = buffer.decode()?;
                 Ok((
                     Self::QueueReset {
-                        dest_queue_id,
+                        queue_pair,
                         binding_id,
                         reset_target,
                         error_code,
-                        dest_acceptor_id: None,
+                        init: None,
                     },
                     buffer,
                 ))
@@ -1260,11 +1310,14 @@ mod tests {
 
         let frame = Frame {
             header: Header::QueueReset {
-                dest_queue_id: VarInt::from_u8(3),
+                queue_pair: QueuePair {
+                    source_queue_id: VarInt::from_u8(2),
+                    dest_queue_id: VarInt::from_u8(3),
+                },
                 binding_id: VarInt::from_u8(42),
                 reset_target: ResetTarget::Both,
                 error_code: VarInt::from_u8(1),
-                dest_acceptor_id: None,
+                init: None,
             },
             payload: ByteVec::new(),
             path_secret_entry: entry,

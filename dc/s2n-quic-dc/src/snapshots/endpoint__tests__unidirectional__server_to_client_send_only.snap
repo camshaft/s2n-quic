@@ -1,6 +1,5 @@
 ---
 source: dc/s2n-quic-dc/src/testing.rs
-assertion_line: 352
 expression: logs
 ---
 0:00:00.000000000 [server] DEBUG s2n_quic_dc: capacity=50000
@@ -734,7 +733,7 @@ expression: logs
 0:00:00.000521000 [server] TRACE c#send.pending.enq[send.7]=1
 0:00:00.000521000 [server] TRACE g#send.pending.depth[send.7]=44
 0:00:00.000521000 [server] TRACE m#send.pending.depth_dist[send.7]=44
-0:00:00.000521000 [server] TRACE m#tx.packet_size=1411
+0:00:00.000521000 [server] TRACE m#tx.packet_size=1412
 0:00:00.000521000 [server] TRACE m#tx.frames_per_packet=2
 0:00:00.000521000 [server] TRACE m#tx.payload_size=1353
 0:00:00.000521000 [server] TRACE c#tx.data=1
@@ -759,7 +758,7 @@ expression: logs
 0:00:00.000521000 [server] TRACE g#q.resolver_to_tx_wheel.depth[send.worker.3]=1
 0:00:00.000521000 [server] TRACE m#q.resolver_to_tx_wheel.depth_dist[send.worker.3]=1
 0:00:00.000521000 [server] TRACE c#socket.tx.ops[send.7]=1
-0:00:00.000521000 [server] TRACE c#socket.tx.bytes[send.7]=1411
+0:00:00.000521000 [server] TRACE c#socket.tx.bytes[send.7]=1412
 0:00:00.000521000 [server] TRACE m#task.assembler.drained[send.7]=1
 0:00:00.000521000 [server] TRACE c#q.resolver_to_tx_wheel.receiver[send.worker.3.task.wheel_drain]=1
 0:00:00.000521000 [server] TRACE c#q.resolver_to_tx_wheel.drain[send.worker.3]=1
@@ -1350,7 +1349,7 @@ expression: logs
 0:00:00.001021000 [client] TRACE m#q.dispatch_rx.depth_dist[recv.0]=1
 0:00:00.001021000 [client] TRACE m#task.socket_recv.drained[recv.1]=0
 0:00:00.001021000 [client] TRACE c#socket.rx.ops[recv.7]=1
-0:00:00.001021000 [client] TRACE c#socket.rx.bytes[recv.7]=2819
+0:00:00.001021000 [client] TRACE c#socket.rx.bytes[recv.7]=2820
 0:00:00.001021000 [client] TRACE c#router.routed=1
 0:00:00.001021000 [client] TRACE c#router.routed[recv.1]=1
 0:00:00.001021000 [client] TRACE c#q.dispatch_rx.enq[recv.1]=1
@@ -1613,6 +1612,7 @@ expression: logs
 0:00:00.001021000 [client] TRACE m#task.ack_processor.drained[send.worker.1]=2
 0:00:00.001021000 [client] TRACE m#task.recycle_drain.drained=0
 0:00:00.001021000 [client] TRACE m#task.recv_idle_wheel.drained[recv.dispatch.1]=0
+0:00:00.001021000 [client] DEBUG event=on_received prev=Init next=Open location=dc/s2n-quic-dc/src/stream/reader.rs
 0:00:00.001021000 [client] TRACE c#q.ack.receiver[send.3.task.ack_processor]=1
 0:00:00.001021000 [client] TRACE c#q.ack.drain[send.3]=1
 0:00:00.001021000 [client] TRACE g#q.ack.depth[send.3]=0
@@ -1959,7 +1959,7 @@ expression: logs
 0:00:00.001521000 [server] TRACE m#tx.ack_packets[send.7]=10
 0:00:00.001521000 [server] TRACE c#send.inflight.drain.ack[send.7]=10
 0:00:00.001521000 [server] TRACE c#tx.ecn.ect0[send.7]=10
-0:00:00.001521000 [server] TRACE m#send.cwnd[send.7]=28803
+0:00:00.001521000 [server] TRACE m#send.cwnd[send.7]=28804
 0:00:00.001521000 [server] TRACE m#send.pacing_rate[send.7]=40368997
 0:00:00.001521000 [server] TRACE c#send.app_limited[send.7]=1
 0:00:00.001521000 [server] TRACE c#q.resolver_to_tx_wheel.sender[send.worker.3.task.ack_processor]=1
@@ -3525,7 +3525,7 @@ expression: logs
 0:00:00.002521000 [server] TRACE m#tx.ack_packets[send.7]=20
 0:00:00.002521000 [server] TRACE c#send.inflight.drain.ack[send.7]=20
 0:00:00.002521000 [server] TRACE c#tx.ecn.ect0[send.7]=20
-0:00:00.002521000 [server] TRACE m#send.cwnd[send.7]=56997
+0:00:00.002521000 [server] TRACE m#send.cwnd[send.7]=56998
 0:00:00.002521000 [server] TRACE m#send.pacing_rate[send.7]=77323869
 0:00:00.002521000 [server] TRACE c#send.app_limited[send.7]=1
 0:00:00.002521000 [server] TRACE c#q.resolver_to_tx_wheel.sender[send.worker.3.task.ack_processor]=1

@@ -1,6 +1,5 @@
 ---
 source: dc/s2n-quic-dc/src/testing.rs
-assertion_line: 352
 expression: logs
 ---
 0:00:00.000000000 [server] DEBUG s2n_quic_dc: capacity=50000
@@ -471,7 +470,7 @@ expression: logs
 0:00:00.000120000 [client] TRACE c#send.pending.drain[send.0]=1
 0:00:00.000120000 [client] TRACE g#send.pending.depth[send.0]=0
 0:00:00.000120000 [client] TRACE c#tx.frame[queue_reset]=1
-0:00:00.000120000 [client] TRACE m#tx.packet_size=47
+0:00:00.000120000 [client] TRACE m#tx.packet_size=49
 0:00:00.000120000 [client] TRACE m#tx.frames_per_packet=1
 0:00:00.000120000 [client] TRACE m#tx.payload_size=0
 0:00:00.000120000 [client] TRACE c#tx.data=1
@@ -485,7 +484,7 @@ expression: logs
 0:00:00.000120000 [client] TRACE g#q.resolver_to_pto_wheel.depth[send.worker.0]=1
 0:00:00.000120000 [client] TRACE m#q.resolver_to_pto_wheel.depth_dist[send.worker.0]=1
 0:00:00.000120000 [client] TRACE c#socket.tx.ops[send.0]=1
-0:00:00.000120000 [client] TRACE c#socket.tx.bytes[send.0]=47
+0:00:00.000120000 [client] TRACE c#socket.tx.bytes[send.0]=49
 0:00:00.000120000 [client] TRACE m#task.assembler.drained[send.0]=1
 0:00:00.000120000 [client] TRACE m#task.tx_wheel.drained[send.worker.0]=0
 0:00:00.000120000 [client] TRACE m#task.pto_wheel.drained[send.worker.0]=1
@@ -628,7 +627,7 @@ expression: logs
 0:00:00.000541000 [server] TRACE m#task.pto_wheel.drained[send.worker.3]=1
 0:00:00.000541000 [server] TRACE m#task.pto_wheel.drained[send.worker.3]=0
 0:00:00.000620000 [server] TRACE c#socket.rx.ops[recv.0]=1
-0:00:00.000620000 [server] TRACE c#socket.rx.bytes[recv.0]=47
+0:00:00.000620000 [server] TRACE c#socket.rx.bytes[recv.0]=49
 0:00:00.000620000 [server] TRACE c#router.routed=1
 0:00:00.000620000 [server] TRACE c#router.routed[recv.0]=1
 0:00:00.000620000 [server] TRACE c#q.dispatch_rx.enq[recv.0]=1
@@ -981,7 +980,7 @@ expression: logs
 0:00:00.001120000 [client] TRACE m#tx.ack_packets[send.0]=1
 0:00:00.001120000 [client] TRACE c#send.inflight.drain.ack[send.0]=1
 0:00:00.001120000 [client] TRACE c#tx.ecn.ect0[send.0]=1
-0:00:00.001120000 [client] TRACE m#send.cwnd[send.0]=14767
+0:00:00.001120000 [client] TRACE m#send.cwnd[send.0]=14769
 0:00:00.001120000 [client] TRACE m#send.pacing_rate[send.0]=40368997
 0:00:00.001120000 [client] TRACE c#send.app_limited[send.0]=1
 0:00:00.001120000 [client] TRACE m#task.ack_processor.drained[send.worker.0]=2
@@ -45960,7 +45959,7 @@ expression: logs
 0:00:04.998950000 [client] TRACE c#credit.recv.refill.skipped=1
 0:00:04.998950000 [client] TRACE c#credit.recv.distributor.passes=1
 0:00:05.000100000 [client]  INFO write_msg_drop_during_init_stalls_reader passed
-0:00:05.000100000 [client] DEBUG Reader dropping binding_id=1 status=Open final_size=None consumed_len=0 total_received_len=0 is_writing_complete=false is_reading_complete=false
+0:00:05.000100000 [client] DEBUG Reader dropping binding_id=1 status=Init final_size=None consumed_len=0 total_received_len=0 is_writing_complete=false is_reading_complete=false
 0:00:05.000100000 [client] DEBUG Sent QueueReset binding_id=1 error_code=4 reset_target=Control
 0:00:05.000100000 [client] DEBUG Reader dropped before FIN received - sent STOP_SENDING binding_id=1
 0:00:05.000100000 [client] TRACE c#q.router_to_batcher.enq[p0]=1

@@ -1,6 +1,5 @@
 ---
 source: dc/s2n-quic-dc/src/testing.rs
-assertion_line: 352
 expression: logs
 ---
 0:00:00.000000000 [server] DEBUG s2n_quic_dc: capacity=50000
@@ -757,6 +756,7 @@ expression: logs
 0:00:00.001041000 [client] TRACE m#task.ack_burst.drained[recv.dispatch.1]=1
 0:00:00.001041000 [client] TRACE m#task.recycle_drain.drained=1
 0:00:00.001041000 [client] TRACE m#task.recv_idle_wheel.drained[recv.dispatch.1]=0
+0:00:00.001041000 [client] DEBUG event=on_received prev=Init next=Open location=dc/s2n-quic-dc/src/stream/reader.rs
 0:00:00.001041000 [client] DEBUG Reader complete - all data consumed binding_id=1 final_size=Some(128) consumed_len=128
 0:00:00.001041000 [client] DEBUG event=on_complete prev=Open next=Complete location=dc/s2n-quic-dc/src/stream/reader.rs
 0:00:00.001041000 [client] DEBUG Writer dropping binding_id=1 status=FinSent next_offset=128 remote_max_data=0
@@ -1285,6 +1285,7 @@ expression: logs
 0:00:00.002081000 [client] TRACE m#q.ack.depth_dist[send.1]=1
 0:00:00.002081000 [client] TRACE m#task.ack_burst.drained[recv.dispatch.0]=1
 0:00:00.002081000 [client] TRACE m#task.recycle_drain.drained=1
+0:00:00.002081000 [client] DEBUG event=on_received prev=Init next=Open location=dc/s2n-quic-dc/src/stream/reader.rs
 0:00:00.002081000 [client] DEBUG Reader complete - all data consumed binding_id=2 final_size=Some(128) consumed_len=128
 0:00:00.002081000 [client] DEBUG event=on_complete prev=Open next=Complete location=dc/s2n-quic-dc/src/stream/reader.rs
 0:00:00.002081000 [client] DEBUG Writer dropping binding_id=2 status=FinSent next_offset=128 remote_max_data=0
@@ -1828,6 +1829,7 @@ expression: logs
 0:00:00.003121000 [client] TRACE m#q.ack.depth_dist[send.2]=1
 0:00:00.003121000 [client] TRACE m#task.ack_burst.drained[recv.dispatch.0]=1
 0:00:00.003121000 [client] TRACE m#task.recycle_drain.drained=1
+0:00:00.003121000 [client] DEBUG event=on_received prev=Init next=Open location=dc/s2n-quic-dc/src/stream/reader.rs
 0:00:00.003121000 [client] DEBUG Reader complete - all data consumed binding_id=3 final_size=Some(128) consumed_len=128
 0:00:00.003121000 [client] DEBUG event=on_complete prev=Open next=Complete location=dc/s2n-quic-dc/src/stream/reader.rs
 0:00:00.003121000 [client] DEBUG Writer dropping binding_id=3 status=FinSent next_offset=128 remote_max_data=0

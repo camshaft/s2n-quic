@@ -1,6 +1,5 @@
 ---
 source: dc/s2n-quic-dc/src/testing.rs
-assertion_line: 352
 expression: logs
 ---
 0:00:00.000000000 [server] DEBUG s2n_quic_dc: capacity=50000
@@ -590,7 +589,7 @@ expression: logs
 0:00:00.000541000 [server] TRACE c#send.pending.drain[send.7]=1
 0:00:00.000541000 [server] TRACE g#send.pending.depth[send.7]=0
 0:00:00.000541000 [server] TRACE c#tx.frame[queue_data_fin]=1
-0:00:00.000541000 [server] TRACE m#tx.packet_size=56
+0:00:00.000541000 [server] TRACE m#tx.packet_size=57
 0:00:00.000541000 [server] TRACE m#tx.frames_per_packet=2
 0:00:00.000541000 [server] TRACE m#tx.payload_size=4
 0:00:00.000541000 [server] TRACE c#tx.data=1
@@ -606,7 +605,7 @@ expression: logs
 0:00:00.000541000 [server] TRACE g#q.resolver_to_pto_wheel.depth[send.worker.3]=1
 0:00:00.000541000 [server] TRACE m#q.resolver_to_pto_wheel.depth_dist[send.worker.3]=1
 0:00:00.000541000 [server] TRACE c#socket.tx.ops[send.7]=1
-0:00:00.000541000 [server] TRACE c#socket.tx.bytes[send.7]=56
+0:00:00.000541000 [server] TRACE c#socket.tx.bytes[send.7]=57
 0:00:00.000541000 [server] TRACE m#task.assembler.drained[send.7]=1
 0:00:00.000541000 [server] TRACE m#task.tx_wheel.drained[send.worker.3]=0
 0:00:00.000541000 [server] TRACE c#credit.send.distributor.passes=1
@@ -736,7 +735,7 @@ expression: logs
 0:00:00.001021000 [client] DEBUG event=on_flush_complete prev=Flushed next=Idle location=dc/s2n-quic-dc/src/endpoint/recv.rs
 0:00:00.001021000 [client] TRACE m#task.ack_completion.drained[recv.dispatch.0]=1
 0:00:00.001041000 [client] TRACE c#socket.rx.ops[recv.7]=1
-0:00:00.001041000 [client] TRACE c#socket.rx.bytes[recv.7]=56
+0:00:00.001041000 [client] TRACE c#socket.rx.bytes[recv.7]=57
 0:00:00.001041000 [client] TRACE c#router.routed=1
 0:00:00.001041000 [client] TRACE c#router.routed[recv.1]=1
 0:00:00.001041000 [client] TRACE c#q.dispatch_rx.enq[recv.1]=1
@@ -773,6 +772,7 @@ expression: logs
 0:00:00.001041000 [client] TRACE m#task.recv_idle_wheel.drained[recv.dispatch.1]=0
 0:00:00.001041000 [client] DEBUG poll_remote_budget received messages binding_id=1 status=InitSent msg_count=1
 0:00:00.001041000 [client] DEBUG event=on_shutdown prev=InitSent next=Shutdown location=dc/s2n-quic-dc/src/stream/writer.rs
+0:00:00.001041000 [client] DEBUG event=on_received prev=Init next=Open location=dc/s2n-quic-dc/src/stream/reader.rs
 0:00:00.001041000 [client] DEBUG Reader complete - all data consumed binding_id=1 final_size=Some(4) consumed_len=4
 0:00:00.001041000 [client] DEBUG event=on_complete prev=Open next=Complete location=dc/s2n-quic-dc/src/stream/reader.rs
 0:00:00.001041000 [client] DEBUG Writer dropping binding_id=1 status=Shutdown next_offset=1024 remote_max_data=0

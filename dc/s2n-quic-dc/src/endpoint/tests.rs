@@ -1352,6 +1352,264 @@ fn total_packet_loss_surfaces_write_timeout() {
     });
 }
 
+/// A reader-drop STOP_SENDING that arrives *before* the binding exists must
+/// still tear the peer's writer down once the binding is established.
+///
+/// Scenario (the ordering is the whole point):
+///
+/// 1. The client opens a stream but does not write yet.
+/// 2. The client drops its Reader. Nothing has been sent on this stream, so the
+///    write side is unconfirmed and this emits a STOP_SENDING
+///    `QueueReset(Control)` as its own packet. The server has no slot for the
+///    queue id, so the reset is ACKed (transport level) and then silently
+///    discarded against the unallocated slot — and, being ACKed, never
+///    retransmitted.
+/// 3. After a short delay (so the reset is not coalesced with the init), the
+///    client writes "ping" + FIN, which sends the QueueInit that binds the slot
+///    on the server. The server accepts the stream and reads "ping" + EOF.
+/// 4. The server writes a response larger than the initial flow-control window,
+///    so its Writer blocks waiting for MAX_DATA.
+///
+/// The client dropped its Reader, so it will *never* advertise more window. The
+/// only thing that could release the server's Writer was the STOP_SENDING the
+/// client already sent — but that landed before the binding existed and was
+/// dropped. The correct behavior is for the server Writer to fail with
+/// `ConnectionReset` promptly.
+///
+/// On `main` it instead hangs until the 30 s idle timeout: the reset path
+/// neither carries (`reader.rs` sends `dest_acceptor_id: None`) nor honors
+/// (`dispatch.rs` discards it) an acceptor id, so a reset that arrives before
+/// the binding cannot establish it and is lost against the unallocated slot.
+#[test]
+fn reader_drop_reset_before_binding_resets_peer_writer() {
+    // Snapshot disabled: a 2 MiB transfer / idle-timeout drive produces a large,
+    // tuning-sensitive trace. The assertion carries the test's value.
+    let _guard = crate::testing::without_snapshots();
+    sim(|| {
+        use crate::testing::ext::*;
+
+        let acceptor_id = VarInt::from_u8(1);
+
+        // ── Server ────────────────────────────────────────────────────────
+        async move {
+            let server = Server::new();
+            let mut acceptor = server
+                .register_acceptor_channel(acceptor_id, 8)
+                .expect("acceptor registration failed");
+
+            while let Some(stream) = acceptor.recv().await {
+                async move {
+                    let stream = stream;
+                    let (mut reader, mut writer) = stream.into_split();
+
+                    // Read "ping" + EOF (the QueueInit carried "ping" + FIN).
+                    let mut buf = BytesMut::with_capacity(8);
+                    loop {
+                        let n = reader.read_into(&mut buf).await.expect("server read");
+                        if n == 0 {
+                            break;
+                        }
+                    }
+                    assert_eq!(&buf[..], b"ping");
+
+                    // Respond with more than the initial flow-control window so
+                    // the Writer must block waiting for MAX_DATA. The client
+                    // dropped its Reader and will never advertise more window —
+                    // the STOP_SENDING it already sent is the only thing that
+                    // can release us.
+                    let mut data = Data::new(2 * 1024 * 1024);
+                    let result = timeout(5.s(), writer.write_all_from_fin(&mut data)).await;
+
+                    match result {
+                        Err(_elapsed) => {
+                            panic!(
+                                "server writer is stuck: the client's reader-drop STOP_SENDING \
+                                 raced ahead of the binding and was silently dropped, so the \
+                                 writer never observed the reset and blocked on a window that \
+                                 will never grow"
+                            );
+                        }
+                        Ok(Ok(_)) => {
+                            panic!(
+                                "server write completed — the client dropped its reader, the \
+                                 writer should have been reset rather than delivering 2 MiB"
+                            );
+                        }
+                        Ok(Err(e)) => {
+                            info!(?e, "server writer reset as expected");
+                            assert_eq!(
+                                e.kind(),
+                                io::ErrorKind::ConnectionReset,
+                                "expected ConnectionReset from the client's STOP_SENDING, got: {e:?}"
+                            );
+                        }
+                    }
+                }
+                .primary()
+                .spawn();
+            }
+        }
+        .group("server")
+        .spawn();
+
+        // ── Client ────────────────────────────────────────────────────────
+        async move {
+            let mut client = Client::new();
+            let stream = client
+                .connect("server:0", acceptor_id)
+                .await
+                .expect("connect failed");
+
+            let (reader, mut writer) = stream.into_split();
+
+            // Drop the reader *before* writing anything. The write side is
+            // unconfirmed, so this emits a STOP_SENDING QueueReset as its own
+            // packet. It reaches the server before any QueueInit, so there is no
+            // binding for it — it is ACKed and then dropped against the
+            // unallocated slot, and never retransmitted.
+            drop(reader);
+
+            // Let the reset flush as its own packet before the init, so the two
+            // do not share a datagram (a coalesced reset would ride along with
+            // the init and land *after* the binding is created, masking the bug).
+            1.ms().sleep().await;
+
+            // Now send "ping" + FIN. This QueueInit binds the slot on the server
+            // — but the STOP_SENDING that should tear the peer writer down has
+            // already come and gone.
+            let mut ping = Bytes::from_static(b"ping");
+            writer
+                .write_all_from_fin(&mut ping)
+                .await
+                .expect("client write");
+
+            // Keep the client endpoint alive so its transport keeps ACKing the
+            // server's data; only the application read side is gone.
+            30.s().sleep().await;
+
+            info!("reader_drop_reset_before_binding_resets_peer_writer client done");
+        }
+        .group("client")
+        .primary()
+        .spawn();
+    });
+}
+
+/// Companion to `reader_drop_reset_before_binding_resets_peer_writer` for the
+/// *other* race ordering: the QueueInit binds the slot first, then the
+/// STOP_SENDING arrives. Here the client writes "ping" + FIN, then immediately
+/// drops its reader — both go out close together (often the same datagram), so
+/// the init binds and the reset lands on the now-bound slot. This must reset the
+/// server writer just as the before-binding case does, proving the outcome is
+/// independent of which frame wins the race.
+///
+/// Verifies the symmetric path to the before-binding repro; both orderings —
+/// reset-binds-then-init and init-binds-then-reset — converge on a writer that
+/// observes `ConnectionReset` rather than hanging.
+#[test]
+fn reader_drop_reset_after_binding_resets_peer_writer() {
+    let _guard = crate::testing::without_snapshots();
+    sim(|| {
+        use crate::testing::ext::*;
+
+        let acceptor_id = VarInt::from_u8(1);
+
+        // ── Server ────────────────────────────────────────────────────────
+        async move {
+            let server = Server::new();
+            let mut acceptor = server
+                .register_acceptor_channel(acceptor_id, 8)
+                .expect("acceptor registration failed");
+
+            while let Some(stream) = acceptor.recv().await {
+                async move {
+                    let stream = stream;
+                    let (mut reader, mut writer) = stream.into_split();
+
+                    let mut buf = BytesMut::with_capacity(8);
+                    loop {
+                        let n = reader.read_into(&mut buf).await.expect("server read");
+                        if n == 0 {
+                            break;
+                        }
+                    }
+                    assert_eq!(&buf[..], b"ping");
+
+                    // Respond with more than the initial flow-control window so
+                    // the writer blocks on MAX_DATA. The client dropped its
+                    // reader, so the STOP_SENDING is the only thing that can
+                    // release us.
+                    let mut data = Data::new(2 * 1024 * 1024);
+                    let result = timeout(5.s(), writer.write_all_from_fin(&mut data)).await;
+
+                    match result {
+                        Err(_elapsed) => {
+                            panic!(
+                                "server writer is stuck: the reader-drop STOP_SENDING that \
+                                 landed on the bound slot did not reset the writer"
+                            );
+                        }
+                        Ok(Ok(_)) => {
+                            panic!(
+                                "server write completed — the client dropped its reader, the \
+                                 writer should have been reset rather than delivering 2 MiB"
+                            );
+                        }
+                        Ok(Err(e)) => {
+                            info!(?e, "server writer reset as expected");
+                            assert_eq!(
+                                e.kind(),
+                                io::ErrorKind::ConnectionReset,
+                                "expected ConnectionReset from the client's STOP_SENDING, got: {e:?}"
+                            );
+                        }
+                    }
+                }
+                .primary()
+                .spawn();
+            }
+        }
+        .group("server")
+        .spawn();
+
+        // ── Client ────────────────────────────────────────────────────────
+        async move {
+            let mut client = Client::new();
+            let stream = client
+                .connect("server:0", acceptor_id)
+                .await
+                .expect("connect failed");
+
+            let (reader, mut writer) = stream.into_split();
+
+            // Write "ping" + FIN first — this sends the QueueInit that binds the
+            // slot on the server.
+            let mut ping = Bytes::from_static(b"ping");
+            writer
+                .write_all_from_fin(&mut ping)
+                .await
+                .expect("client write");
+
+            // Let the init reach the server and bind the slot (one RTT is 1ms in
+            // the sim) before the reader drop, so the STOP_SENDING lands on an
+            // *already-bound* slot — the init-binds-first ordering. The reader is
+            // still in `Init` here (no packet received), so its reset still
+            // carries the init fields; dispatch's `bind_for_msg` sees the slot is
+            // already bound and simply delivers the reset.
+            5.ms().sleep().await;
+            drop(reader);
+
+            // Keep the client endpoint alive so its transport keeps ACKing.
+            30.s().sleep().await;
+
+            info!("reader_drop_reset_after_binding_resets_peer_writer client done");
+        }
+        .group("client")
+        .primary()
+        .spawn();
+    });
+}
+
 /// Fuzz test: one client sends concurrent requests to two servers under random
 /// packet loss. All streams must recover within a bounded time regardless of
 /// the loss pattern.

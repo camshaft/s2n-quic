@@ -306,11 +306,14 @@ fn assemble_accounts_for_header_overhead() {
         context.push_back_frame(
             Frame {
                 header: Header::QueueReset {
-                    dest_queue_id: VarInt::from_u8(1),
+                    queue_pair: crate::packet::datagram::QueuePair {
+                        source_queue_id: VarInt::from_u8(1),
+                        dest_queue_id: VarInt::from_u8(1),
+                    },
                     binding_id: VarInt::from_u8(1),
                     reset_target: ResetTarget::Both,
                     error_code: VarInt::from_u8(1),
-                    dest_acceptor_id: None,
+                    init: None,
                 },
                 payload: ByteVec::new(),
                 path_secret_entry: entry.clone(),
@@ -487,11 +490,14 @@ fn encode_decode_round_trip() {
         },
         FrameInput {
             header: Header::QueueReset {
-                dest_queue_id: VarInt::from_u8(3),
+                queue_pair: crate::packet::datagram::QueuePair {
+                    source_queue_id: VarInt::from_u8(3),
+                    dest_queue_id: VarInt::from_u8(3),
+                },
                 binding_id: VarInt::from_u8(10),
                 reset_target: ResetTarget::Both,
                 error_code: VarInt::from_u8(1),
-                dest_acceptor_id: None,
+                init: None,
             },
             payload: vec![],
         },

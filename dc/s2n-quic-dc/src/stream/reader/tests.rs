@@ -93,6 +93,7 @@ fn make_pair_with_pool_and_initial_window_and_entry(
         frame_tx,
         path_secret_entry,
         dest_queue_id,
+        VarInt::from_u16(1),
         alloc.stream,
         crate::time::DefaultClock::default(),
         Arc::new(ReaderMetrics::new(
@@ -145,6 +146,7 @@ fn make_server_pair_with_pool_and_initial_window(
         frame_tx,
         path_secret_entry,
         dest_queue_id,
+        VarInt::from_u16(1),
         alloc.stream,
         false, // peer_fin_received: emit flow update after consuming
         crate::time::DefaultClock::default(),

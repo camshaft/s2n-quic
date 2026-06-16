@@ -1,11 +1,11 @@
 ---
 source: dc/s2n-quic-dc/src/testing.rs
-assertion_line: 352
 expression: logs
 ---
 0:00:00.000000000 [main] DEBUG distributor created
 0:00:00.000000000 [main] TRACE c#credit.release.bytes=524289
 0:00:00.000000000 [main] TRACE c#credit.release.calls=1
+0:00:00.000000000 [main] DEBUG event=on_received prev=Init next=Open location=dc/s2n-quic-dc/src/stream/reader.rs
 0:00:00.000000000 [main] TRACE c#credit.acquire.parked[Medium]=1
 0:00:00.000000000 [main] TRACE c#credit.acquire.bytes=524289
 0:00:00.000000000 [main] TRACE c#rx.flow.max_data_not_sent[credit_parked]=1

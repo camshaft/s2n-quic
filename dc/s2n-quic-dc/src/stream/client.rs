@@ -200,6 +200,7 @@ impl Client {
             frame_tx,
             path_secret_entry,
             alloc.dest_queue_id,
+            acceptor_id,
             alloc.stream,
             self.endpoint.clock.clone(),
             self.endpoint.reader_metrics.clone(),
