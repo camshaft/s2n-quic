@@ -315,9 +315,6 @@ struct Inner {
     /// (genuinely new demand) triggers a fresh standalone frame. The in-band `blocked` bit on
     /// data frames needs no such guard since it rides a frame that is going out anyway.
     last_blocked_offset: u64,
-    /// Number of bytes currently in flight (not yet acknowledged). Tracked for observability; the
-    /// local send rate is bounded by the endpoint send credit pool, not a per-stream inflight cap.
-    inflight_bytes: u64,
     /// The peer's initial receive window from handshake params. Used to cap the
     /// init segment so the message completes as soon as the server grants credits.
     initial_remote_max_data: u64,
@@ -392,7 +389,14 @@ impl Writer {
         send_credit_pool: crate::sync::Arc<crate::credit::Pool>,
         priority: crate::credit::Priority,
     ) -> Self {
-        let completion_rx = frame::completion_channel();
+        // Subscribe only to failures: acked frames drive nothing the writer must react to. The
+        // send rate is governed by the endpoint send credit pool (no per-stream inflight cap),
+        // and the `acked` sojourn is recorded endpoint-side for frames a `FailuresOnly` channel
+        // drops (see `CompletionDispatcher`). Subscribing to every ack would wake the application
+        // task per frame on the steady-state path for no behavioral effect. Only failures (peer
+        // dead / transmission error / unknown secret / cancelled) trigger a writer state
+        // transition, so those are the only completions delivered.
+        let completion_rx = frame::failure_completion_channel();
         let parameters = path_secret_entry.parameters();
         let mtu = parameters.max_datagram_size();
         let packet_size = mtu.saturating_sub(MAX_QUEUE_DATA_HEADER_OVERHEAD);
@@ -422,7 +426,6 @@ impl Writer {
             acceptor_id,
             next_offset: VarInt::ZERO,
             last_blocked_offset: 0,
-            inflight_bytes: 0,
             initial_remote_max_data,
             remote_max_data,
             status: Status::Init,
@@ -447,7 +450,10 @@ impl Writer {
         send_credit_pool: crate::sync::Arc<crate::credit::Pool>,
         priority: crate::credit::Priority,
     ) -> Self {
-        let completion_rx = frame::completion_channel();
+        // See `new_client`: only failures require a writer reaction; acked-frame sojourn is
+        // recorded endpoint-side, so subscribing to every ack would wake the task per frame
+        // for no behavioral effect.
+        let completion_rx = frame::failure_completion_channel();
         let parameters = path_secret_entry.parameters();
         let mtu = parameters.max_datagram_size();
         let packet_size = mtu.saturating_sub(MAX_QUEUE_DATA_HEADER_OVERHEAD);
@@ -474,7 +480,6 @@ impl Writer {
             acceptor_id,
             next_offset: VarInt::ZERO,
             last_blocked_offset: 0,
-            inflight_bytes: 0,
             initial_remote_max_data,
             remote_max_data: VarInt::new(initial_remote_max_data).unwrap_or(VarInt::MAX),
             status: Status::Open,
@@ -859,9 +864,9 @@ impl Inner {
             //
             // Break-safe: send_msg's partial-segment state (`pending_chunk_index` /
             // `pending_segment_size` / `pending_chunk_size` / `pending_stream_offset`) and
-            // `next_msg_id` already carry mid-message resume, and `next_offset` /
-            // `inflight_bytes` account for everything that went out. `buf` is the caller's
-            // buffer — what's left in it is exactly what the next poll will continue with.
+            // `next_msg_id` already carry mid-message resume, and `next_offset` accounts for
+            // everything that went out. `buf` is the caller's buffer — what's left in it is
+            // exactly what the next poll will continue with.
             if !self.coop.consume() {
                 break;
             }
@@ -1121,13 +1126,16 @@ impl Inner {
     fn poll_completions(&mut self, cx: &mut Context) -> io::Result<()> {
         match self.completion_rx.poll_swap(cx) {
             Poll::Ready(Some(queue)) => {
-                let mut freed_bytes = 0u64;
                 let mut failure = None;
 
                 // Snapshot current time once for all sojourn measurements in
                 // this completion batch (avoids repeated clock reads).
                 let completed_at = self.clock.now();
 
+                // The completion channel is `FailuresOnly`, so every frame delivered here is a
+                // failure — acked frames are dropped (and their sojourn recorded) endpoint-side
+                // by `CompletionDispatcher`. The non-failure arms are kept defensive: a stray
+                // ack or pending status is recorded/logged but drives no state transition.
                 for completed in queue.iter() {
                     // Record sojourn time for frames that carry an enqueue stamp.
                     if let Some(enqueued_at) = completed.enqueued_at {
@@ -1141,12 +1149,9 @@ impl Inner {
                     }
 
                     match completed.status {
-                        TransmissionStatus::Acknowledged => {
-                            freed_bytes += completed.payload.len() as u64;
-                        }
+                        TransmissionStatus::Acknowledged => {}
                         TransmissionStatus::Failed(reason) => {
                             failure.get_or_insert(reason);
-                            freed_bytes += completed.payload.len() as u64;
 
                             debug!(
                                 binding_id = self.control_rx.binding_id().as_u64(),
@@ -1162,15 +1167,6 @@ impl Inner {
                         }
                     }
                 }
-
-                self.inflight_bytes = self.inflight_bytes.saturating_sub(freed_bytes);
-
-                trace!(
-                    binding_id = self.control_rx.binding_id().as_u64(),
-                    freed_bytes,
-                    inflight_bytes = self.inflight_bytes,
-                    "Completions received"
-                );
 
                 if let Some(reason) = failure {
                     return match reason {
@@ -1610,9 +1606,9 @@ impl Inner {
             // Break-safe:
             //   - Frames already produced this call sit in the local `frames` queue and will
             //     flush via the unchanged `self.send_batch(frames)?` below the loop.
-            //   - `next_offset` / `inflight_bytes` advance per frame via `advance_offset`, so
-            //     the next poll re-derives `high_watermark`/`largest_offset`/`blocked` correctly
-            //     against the new offset.
+            //   - `next_offset` advances per frame via `advance_offset`, so the next poll
+            //     re-derives `high_watermark`/`largest_offset`/`blocked` correctly against the
+            //     new offset.
             //   - The remaining bytes are still in `buf` (the caller's storage); we never
             //     consumed past what we framed.
             //   - `need_fin_packet` covers the FIN-on-empty-buffer case. Because the coop gate
@@ -2037,7 +2033,6 @@ impl Inner {
             .next_offset
             .checked_add_usize(payload_len)
             .ok_or_else(offset_overflow_error)?;
-        self.inflight_bytes += payload_len as u64;
         Ok(())
     }
 
@@ -2065,7 +2060,6 @@ impl Drop for Writer {
             binding_id = self.0.control_rx.binding_id().as_u64(),
             status = ?self.0.status,
             next_offset = self.0.next_offset.as_u64(),
-            inflight_bytes = self.0.inflight_bytes,
             remote_max_data = self.0.remote_max_data.as_u64(),
             "Writer dropping"
         );

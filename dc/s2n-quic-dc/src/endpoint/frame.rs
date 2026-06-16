@@ -315,7 +315,11 @@ pub fn submission_channel(shard_count: usize) -> (SubmissionSender, SubmissionRe
     )
 }
 
-/// Create a new completion channel for Frames.
+/// Create a new completion channel for Frames that delivers every transmission outcome
+/// (acks and failures). Production streams subscribe via [`failure_completion_channel`] —
+/// acked-frame sojourn is recorded endpoint-side and no other ack-driven writer state exists,
+/// so the all-outcomes channel is retained only for tests that assert on ack delivery.
+#[cfg(test)]
 pub fn completion_channel() -> CompletionReceiver {
     datagram_completion::new_with_mode(datagram_completion::SubscriptionMode::All)
 }

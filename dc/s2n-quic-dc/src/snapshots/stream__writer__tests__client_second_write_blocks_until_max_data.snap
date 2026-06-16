@@ -13,5 +13,5 @@ expression: logs
 0:00:00.000000000 [main] TRACE c#credit.acquire.fast_path=1
 0:00:00.000000000 [main] TRACE c#credit.acquire.bytes=1
 0:00:00.000000000 [main] DEBUG event=on_send_fin prev=Open next=FinSent location=dc/s2n-quic-dc/src/stream/writer.rs
-0:00:00.000000000 [main] DEBUG Writer dropping binding_id=1 status=FinSent next_offset=6 inflight_bytes=6 remote_max_data=4096
+0:00:00.000000000 [main] DEBUG Writer dropping binding_id=1 status=FinSent next_offset=6 remote_max_data=4096
 0:00:00.000000000 [main] DEBUG event=on_shutdown prev=FinSent next=Shutdown location=dc/s2n-quic-dc/src/stream/writer.rs

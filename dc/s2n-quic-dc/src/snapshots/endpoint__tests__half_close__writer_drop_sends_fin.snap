@@ -1,5 +1,6 @@
 ---
 source: dc/s2n-quic-dc/src/testing.rs
+assertion_line: 352
 expression: logs
 ---
 0:00:00.000000000 [server] DEBUG s2n_quic_dc: capacity=50000
@@ -600,10 +601,9 @@ expression: logs
 0:00:00.001021000 [client] TRACE c#q.ack_to_completion.receiver[send.worker.2.task.completion]=1
 0:00:00.001021000 [client] TRACE c#q.ack_to_completion.drain[send.worker.2]=1
 0:00:00.001021000 [client] TRACE g#q.ack_to_completion.depth[send.worker.2]=0
+0:00:00.001021000 [client] TRACE m#stream.writer.sojourn[acked]=1021000
 0:00:00.001021000 [client] TRACE m#task.completion.drained[send.worker.2]=1
 0:00:00.001021000 [client] TRACE m#task.recycle_drain.drained=0
-0:00:00.001021000 [client] TRACE m#task.waker_drain.drained[waker.11]=1
-0:00:00.001021000 [client] TRACE m#stream.writer.sojourn[acked]=1021000
 0:00:00.001041000 [client] TRACE c#socket.rx.ops[recv.7]=1
 0:00:00.001041000 [client] TRACE c#socket.rx.bytes[recv.7]=48
 0:00:00.001041000 [client] TRACE c#router.routed=1
@@ -642,7 +642,7 @@ expression: logs
 0:00:00.001041000 [client] DEBUG Flow established binding_id=1
 0:00:00.001041000 [client] TRACE c#credit.send.acquire.fast_path=1
 0:00:00.001041000 [client] TRACE c#credit.send.acquire.bytes=147
-0:00:00.001041000 [client] DEBUG Writer dropping binding_id=1 status=Open next_offset=1500 inflight_bytes=147 remote_max_data=1500
+0:00:00.001041000 [client] DEBUG Writer dropping binding_id=1 status=Open next_offset=1500 remote_max_data=1500
 0:00:00.001041000 [client] DEBUG Sent FIN binding_id=1
 0:00:00.001041000 [client] DEBUG event=on_send_fin prev=Open next=FinSent location=dc/s2n-quic-dc/src/stream/writer.rs
 0:00:00.001041000 [client] DEBUG event=on_shutdown prev=FinSent next=Shutdown location=dc/s2n-quic-dc/src/stream/writer.rs
@@ -868,7 +868,7 @@ expression: logs
 0:00:00.001561000 [server] TRACE c#credit.send.acquire.fast_path=1
 0:00:00.001561000 [server] TRACE c#credit.send.acquire.bytes=2
 0:00:00.001561000 [server] DEBUG event=on_send_fin prev=Open next=FinSent location=dc/s2n-quic-dc/src/stream/writer.rs
-0:00:00.001561000 [server] DEBUG Writer dropping binding_id=1 status=FinSent next_offset=2 inflight_bytes=2 remote_max_data=1048576
+0:00:00.001561000 [server] DEBUG Writer dropping binding_id=1 status=FinSent next_offset=2 remote_max_data=1048576
 0:00:00.001561000 [server] DEBUG event=on_shutdown prev=FinSent next=Shutdown location=dc/s2n-quic-dc/src/stream/writer.rs
 0:00:00.001561000 [server] DEBUG Reader dropping binding_id=1 status=Complete final_size=Some(1500) consumed_len=1500 total_received_len=1500 is_writing_complete=true is_reading_complete=true
 0:00:00.001561000 [server] TRACE c#q.ack.receiver[send.0.task.ack_processor]=1
@@ -1087,9 +1087,11 @@ expression: logs
 0:00:00.002061000 [client] TRACE c#q.ack_to_completion.receiver[send.worker.0.task.completion]=1
 0:00:00.002061000 [client] TRACE c#q.ack_to_completion.drain[send.worker.0]=1
 0:00:00.002061000 [client] TRACE g#q.ack_to_completion.depth[send.worker.0]=1
+0:00:00.002061000 [client] TRACE m#stream.writer.sojourn[acked]=1020000
 0:00:00.002061000 [client] TRACE c#q.ack_to_completion.receiver[send.worker.0.task.completion]=1
 0:00:00.002061000 [client] TRACE c#q.ack_to_completion.drain[send.worker.0]=1
 0:00:00.002061000 [client] TRACE g#q.ack_to_completion.depth[send.worker.0]=0
+0:00:00.002061000 [client] TRACE m#stream.writer.sojourn[acked]=1020000
 0:00:00.002061000 [client] TRACE m#task.completion.drained[send.worker.0]=2
 0:00:00.002061000 [client] TRACE m#task.recycle_drain.drained=0
 0:00:00.002061000 [client] TRACE c#q.ack.receiver[send.1.task.ack_processor]=1
