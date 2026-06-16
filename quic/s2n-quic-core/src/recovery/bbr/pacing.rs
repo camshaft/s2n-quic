@@ -55,6 +55,27 @@ impl Pacer {
             return;
         }
 
+        // Floor the pacing rate against a degenerate (near-zero) bandwidth estimate.
+        //
+        // BBR's bandwidth model can be poisoned by a delivery sample that carries a tiny but
+        // non-zero rate — e.g. a single byte acknowledged tens of seconds after a stall, where
+        // the rate-sample interval is `max(send_elapsed, ack_elapsed)`. Such a sample is not
+        // `Bandwidth::ZERO`, so the exact-zero guard in `data_rate::Model::update_max_bw` does
+        // not reject it, yet once it ages into the windowed-max filter it collapses `max_bw`
+        // down to a near-zero rate. That rate propagates to `pacing_rate`, and the departure
+        // interval `send_quantum / pacing_rate` explodes to hours or days, parking the flow.
+        //
+        // The floor is derived from real observations rather than a fixed constant: we should
+        // always be able to drain one `send_quantum` within a few round trips. Three RTTs is
+        // far slower than any healthy pacing interval (so this clamp is inert in normal
+        // operation), yet fast enough that PTO probes remain fillable — and if we cannot pace
+        // even that slowly the path is unusable regardless of what the CCA believes. Clamping
+        // the rate (rather than just the interval) also protects every other `pacing_rate`
+        // consumer, including the app-limited classifier whose `send_quantum / bandwidth`
+        // interval would otherwise blow up and feed yet more poisoned samples back in.
+        let floor = Bandwidth::new(self.send_quantum as u64, 3 * rtt);
+        self.pacing_rate = self.pacing_rate.max(floor);
+
         if self.capacity == 0 {
             if let Some(next_packet_departure_time) = self.next_packet_departure_time {
                 self.next_packet_departure_time =
@@ -318,6 +339,56 @@ mod tests {
         // send_quantum = min(100000, 12_000) = 12_000
         // send_quantum = max(12_000, 2 * MINIMUM_MAX_DATAGRAM_SIZE) = 12_000
         assert_eq!(12_000, pacer.send_quantum);
+    }
+
+    //= type=test
+    // Regression test for the "EDT 68 hours into the future" report.
+    //
+    // A near-zero (but non-zero) pacing rate makes the pacer's departure interval,
+    // `send_quantum / pacing_rate`, explode. A single byte delivered over ~56 seconds — the
+    // kind of poisoned delivery sample that survives the exact-zero guard in
+    // `data_rate::Model::update_max_bw` and collapses `max_bw` — yields a `pacing_rate` that,
+    // with `send_quantum = 12_000`, produces a departure interval of ~68 hours, parking the
+    // flow effectively forever.
+    //
+    // `on_packet_sent` now floors `pacing_rate` at `send_quantum / (3 * rtt)`, so even a fully
+    // collapsed rate cannot push the departure time more than three round trips out. Before the
+    // floor was added this asserted ~68h; it now confirms the interval stays bounded.
+    #[test]
+    fn near_zero_pacing_rate_is_floored() {
+        let mut pacer = Pacer::new(MINIMUM_MAX_DATAGRAM_SIZE, &Default::default());
+        let now = NoopClock.get_time();
+        let rtt = Duration::from_millis(100);
+
+        // A collapsed-but-non-zero pacing rate: one byte per 56 seconds.
+        pacer.pacing_rate = Bandwidth::new(1, Duration::from_secs(56));
+        // Worst-case quantum (10 * MINIMUM_MAX_DATAGRAM_SIZE = 12_000), as set once the rate has
+        // been healthy at some point.
+        pacer.set_send_quantum_for_test(12_000);
+
+        // First send establishes the initial interval.
+        pacer.on_packet_sent(now, MINIMUM_MAX_DATAGRAM_SIZE as usize, rtt);
+        assert_eq!(Some(now + INITIAL_INTERVAL), pacer.earliest_departure_time());
+
+        // Drain the current slot's capacity, then send again so the pacer recomputes the
+        // departure time. The floor must keep the recomputed interval bounded.
+        let now = now + INITIAL_INTERVAL;
+        pacer.on_packet_sent(now, 12_000, rtt);
+        pacer.on_packet_sent(now, MINIMUM_MAX_DATAGRAM_SIZE as usize, rtt);
+
+        let edt = pacer
+            .earliest_departure_time()
+            .expect("a departure time should be scheduled");
+        let delay = edt - now;
+
+        // The floor is `send_quantum / (3 * rtt)`, so the interval is at most ~3 RTTs (300ms
+        // here). Allow generous headroom; the unfixed value was ~68 hours.
+        assert!(
+            delay <= 3 * rtt,
+            "departure time scheduled {delay:?} into the future (expected <= 3*rtt = {:?}); \
+             the near-zero pacing rate floor did not engage",
+            3 * rtt
+        );
     }
 
     #[test]

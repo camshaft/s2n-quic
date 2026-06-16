@@ -43,6 +43,12 @@ impl Clock {
     }
 }
 
+impl s2n_quic_core::time::Clock for Clock {
+    fn get_time(&self) -> s2n_quic_core::time::Timestamp {
+        self.get_time().into()
+    }
+}
+
 impl precision::Clock for Clock {
     type Timer = Timer;
 

@@ -1278,7 +1278,7 @@ pub async fn send_idle_wheel_drain<Clk, WakerSink, AckComp>(
                 let idle_timeout_ms = ctx.path_secret_entry.idle_timeout().as_millis();
                 let key_id = ctx.credentials.key_id.as_u64();
                 let credentials_id = *ctx.path_secret_entry.id();
-                let edt = ctx.cca.earliest_departure_time();
+                let edt = ctx.cca.earliest_departure_time(&now);
                 let bandwidth_bytes_per_sec = ctx.cca.bandwidth().as_bytes_per_second();
                 drop(ctx);
 
