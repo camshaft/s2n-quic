@@ -4251,3 +4251,171 @@ fn queue_msg_gap_exceeded_silent_drop_stalls_reader() {
          leaving a permanent stream hole"
     );
 }
+
+/// BUG HUNT (stale-binding acked-drop wedge): recreate the reduce-phase incast that wedged
+/// `strss-1-dcquic` — a client rapidly opening many short streams over a SCARCE queue-id space, so
+/// slots are recycled aggressively, while packet loss forces old-binding data to arrive after a
+/// slot has been rebound to a newer stream.
+///
+/// The production symptom was a reader stuck Open at `consumed=77` (right after init) while its
+/// own post-init data was `stale_binding`-dropped AND acked — a permanent hole. At the single-slot
+/// level that is impossible (the binding gate returns Ok only for a matching binding with a live
+/// receiver), so the bug must be a slot / queue_id reused or recycled while a `StreamReceiver`
+/// still holds it. The sim-only live-receiver registry (`queue::testing`) detects exactly that: if
+/// `Slot::push_stream` ever drops stream data for a `(slot, binding)` that still has a live
+/// receiver, it panics with full context.
+///
+/// This test's job is to DRIVE that condition, not to assert on it directly — the instrumentation
+/// is the oracle. We use a deliberately small queue-id space and heavy churn + loss to maximize
+/// recycle/in-flight overlap. If the invariant holds the streams simply complete; if it is
+/// violated the registry panics and pinpoints the offending `(queue_id, binding)`.
+#[test]
+fn incast_churn_stale_binding_never_drops_live_receiver() {
+    let _guard = crate::testing::without_tracing();
+    // Sweep seeds, slot scarcity, and loss so we widen the search for the recycle/in-flight overlap
+    // that lets old-binding data land on a slot whose receiver is still live. The in-dispatch
+    // invariant (queue/slot.rs `push_stream`) is the oracle — it panics the moment that happens.
+    for seed in 0..6u64 {
+        for &max_queues in &[2u8, 4] {
+            for &drop in &[200u64, 500] {
+                incast_churn_sim(
+                    seed.wrapping_mul(0x9e37_79b9_7f4a_7c15).wrapping_add(1),
+                    max_queues,
+                    drop,
+                );
+            }
+        }
+    }
+}
+
+/// One incast-churn run. A client opens `NUM_STREAMS` short streams over a `max_queues`-slot peer
+/// space (so slots recycle constantly) with `drop_in_1000`/1000 bidirectional packet loss (so
+/// retransmits arrive late, after recycling). A fraction of streams drop their reader mid-flight
+/// (independent-half drop). Returns the number of streams that completed; the real signal is the
+/// invariant panic, this is just a churn-happened sanity check.
+fn incast_churn_sim(seed: u64, max_queues: u8, drop_in_1000: u64) {
+    use crate::stream::endpoint::testing::sim::SimEndpointConfig;
+
+    const NUM_STREAMS: usize = 80;
+    const CONCURRENCY: usize = 12;
+    // Multi-packet payload so streams stay in flight across several packets — a single lost packet
+    // then retransmits AFTER the stream's slot may have been recycled.
+    const PAYLOAD_LEN: usize = 4 * 1024;
+
+    let completed = Arc::new(AtomicUsize::new(0));
+    let completed_check = completed.clone();
+
+    sim(|| {
+        let acceptor_id = VarInt::from_u8(1);
+
+        {
+            let rng = Arc::new(std::sync::Mutex::new(crate::xorshift::Rng::with_seed(seed)));
+            bach::net::monitor::on_packet_sent(move |_packet| {
+                let roll = rng.lock().unwrap().next_u64() % 1000;
+                if roll < drop_in_1000 {
+                    return bach::net::monitor::Command::Drop;
+                }
+                bach::net::monitor::Command::Pass
+            });
+        }
+
+        // ── Server: accept, drain, echo back — with a scarce queue-id space ──
+        async move {
+            let server = Peer::with_config(SimEndpointConfig {
+                max_queues: Some(VarInt::from_u8(max_queues)),
+                ..SimEndpointConfig::default()
+            });
+            let mut acceptor = server
+                .register_acceptor_channel(acceptor_id, 4096)
+                .expect("acceptor registration");
+
+            while let Some(stream) = acceptor.recv().await {
+                async move {
+                    let stream = stream;
+                    let (mut reader, mut writer) = stream.into_split();
+                    let mut rx = Data::new(PAYLOAD_LEN as u64);
+                    let _ = reader.read_to_end(&mut rx).await;
+                    let mut response = Data::new(PAYLOAD_LEN as u64);
+                    let _ = writer.write_all_from_fin(&mut response).await;
+                }
+                .spawn();
+            }
+        }
+        .group("server")
+        .spawn();
+
+        // ── Client: many concurrent short streams over a scarce slot space ───
+        async move {
+            let mut client = Peer::with_config(SimEndpointConfig {
+                max_queues: Some(VarInt::from_u8(max_queues)),
+                ..SimEndpointConfig::default()
+            });
+
+            let mut next = 0usize;
+            while next < NUM_STREAMS {
+                let batch = CONCURRENCY.min(NUM_STREAMS - next);
+                let mut handles = Vec::with_capacity(batch);
+                for i in 0..batch {
+                    let idx = next + i;
+                    // Allocating a stream needs a free peer slot; with scarce slots this blocks
+                    // until a prior stream's slot recycles — the reuse pressure we want.
+                    let stream = match timeout(
+                        60.s(),
+                        client.connect(format!("server:{SERVER_PORT}"), acceptor_id),
+                    )
+                    .await
+                    {
+                        Ok(Ok(s)) => s,
+                        _ => continue,
+                    };
+                    let completed = completed.clone();
+                    let h = async move {
+                        let (mut reader, mut writer) = stream.into_split();
+                        let mut data = Data::new(PAYLOAD_LEN as u64);
+                        if writer.write_all_from_fin(&mut data).await.is_err() {
+                            return;
+                        }
+                        // Drop the reader mid-flight on a fraction of streams: frees the
+                        // StreamReceiver while the control half (writer) and in-flight server data
+                        // may still be live — the independent-half-drop + fast-recycle path.
+                        if idx % 4 == 0 {
+                            drop(reader);
+                            completed.fetch_add(1, Ordering::Relaxed);
+                            return;
+                        }
+                        let mut rx = Data::new(PAYLOAD_LEN as u64);
+                        if timeout(60.s(), reader.read_to_end(&mut rx)).await.is_err() {
+                            return;
+                        }
+                        completed.fetch_add(1, Ordering::Relaxed);
+                    }
+                    .spawn();
+                    handles.push(h);
+                }
+                // Await only HALF the batch before launching the next, so streams from different
+                // batches overlap on the scarce slot space — maximizing recycle/in-flight overlap.
+                let keep = handles.split_off(handles.len() / 2);
+                for h in handles {
+                    let _ = h.await;
+                }
+                drop(keep);
+                next += batch;
+            }
+            info!(
+                seed,
+                max_queues, drop_in_1000, "client finished driving churn streams"
+            );
+        }
+        .group("client")
+        .primary()
+        .spawn();
+    });
+
+    // Sanity check that churn actually happened (the invariant panic is the real oracle).
+    let done = completed_check.load(Ordering::Relaxed);
+    assert!(
+        done > 0,
+        "no streams completed for seed={seed} max_queues={max_queues} drop={drop_in_1000}; \
+         the sim stalled before it could exercise the recycle race"
+    );
+}

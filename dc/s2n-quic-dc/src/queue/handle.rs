@@ -49,6 +49,11 @@ pub(crate) enum OnFree {
 pub struct StreamReceiver {
     slot: NonNull<Slot>,
     on_free: OnFree,
+    /// Binding this receiver was created for, captured so the sim-only live-receiver registry
+    /// (un)registers symmetrically even if the slot is rebound under us — which is the very bug
+    /// the registry is meant to catch.
+    #[cfg(test)]
+    registered_binding: u64,
 }
 
 unsafe impl Send for StreamReceiver {}
@@ -56,6 +61,18 @@ unsafe impl Sync for StreamReceiver {}
 
 impl StreamReceiver {
     pub(crate) fn new(slot: NonNull<Slot>, on_free: OnFree) -> Self {
+        #[cfg(test)]
+        {
+            // SAFETY: pinned allocation kept alive by `on_free`.
+            let binding = unsafe { slot.as_ref() }.binding_id().as_u64();
+            super::testing::register_stream_receiver(slot.as_ptr() as usize, binding);
+            return Self {
+                slot,
+                on_free,
+                registered_binding: binding,
+            };
+        }
+        #[cfg(not(test))]
         Self { slot, on_free }
     }
 
@@ -132,6 +149,11 @@ impl Drop for StreamReceiver {
     fn drop(&mut self) {
         let slot = self.slot();
         let queue_id = slot.queue_id();
+        #[cfg(test)]
+        super::testing::unregister_stream_receiver(
+            self.slot.as_ptr() as usize,
+            self.registered_binding,
+        );
         let is_last = half::close_receiver(&slot.stream, &slot.control, true, || {
             slot.mark_unallocated();
         });

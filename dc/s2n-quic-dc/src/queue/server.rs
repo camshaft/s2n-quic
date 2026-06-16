@@ -124,12 +124,46 @@ impl ServerView {
     ///
     /// Used when the server rejects an init (e.g. acceptor not found) and needs
     /// to signal the client to reclaim the peer-side slot via QueueFree.
+    ///
+    /// The free is gated on the init actually representing a *fresh, idle* slot
+    /// generation, mirroring the bind validation in `bind_and_push_stream` /
+    /// `bind_for_msg`. A QueueFree is keyed only on `queue_id`, so emitting one
+    /// for a `queue_id` that is currently live-bound — or that the client has
+    /// already recycled past this `binding_id` — tells the client to reclaim a
+    /// slot it is actively using. The client then re-allocates that `queue_id`
+    /// under a strictly higher monotonic `binding_id`, and the server's live slot
+    /// silently rejects every frame of the new stream as `FutureBinding`: a
+    /// permanent black hole with no reset. This arises from stale / duplicated /
+    /// reordered / misrouted inits naming an unregistered acceptor.
+    ///
+    /// So free only when the init would have been a clean new binding had the
+    /// acceptor existed:
+    /// - the slot was never materialized in the page table (the server never saw
+    ///   this `queue_id`), or
+    /// - the slot is unallocated *and* `binding_id` is strictly newer than its
+    ///   tombstone.
+    ///
+    /// Any other state (live binding, or a stale binding `<=` the tombstone) means
+    /// the QueueFree would desync the peer, so the init is dropped without one.
     pub fn record_freed(
-        &self,
+        &mut self,
         queue_id: VarInt,
+        binding_id: VarInt,
         path_entry: &Arc<PathSecretEntry>,
         endpoint_tx: &mut FreedBatchTx,
     ) {
+        let index = queue_id.as_u64() as usize;
+        if let Some(slot) = self.view.get(index, &self.state.pages) {
+            let raw = slot.binding_id_raw();
+            let unallocated = raw & super::slot::UNALLOCATED_BIT != 0;
+            let tombstone = raw & !super::slot::UNALLOCATED_BIT;
+            // Live binding, or a stale init at/below the recycle tombstone — a
+            // QueueFree here would reclaim a slot the client still owns at a newer
+            // generation. Drop the stale init silently instead.
+            if !unallocated || binding_id.as_u64() <= tombstone {
+                return;
+            }
+        }
         self.state.freed.record(queue_id, path_entry, endpoint_tx);
     }
 
@@ -634,5 +668,135 @@ mod tests {
         let result =
             server.bind_and_send_stream(v(0), v(2), make_stream_entry(), &path_entry, &mut tx);
         assert!(matches!(result, Ok(BindResult::NewBinding { .. })));
+    }
+
+    /// Regression (failed on HEAD before the `record_freed` binding/slot guard): a
+    /// stale / duplicate / reordered / misrouted QueueInit that names an acceptor the
+    /// registry no longer knows about must NOT make the server emit a QueueFree for a
+    /// `queue_id` whose slot is still bound to a live binding.
+    ///
+    /// Before the fix, the acceptor-not-found arms in `endpoint/dispatch.rs`
+    /// (`handle_queue_data_init`, `handle_queue_msg_init`, and the fast path
+    /// `decrypt_fast_path`) called `record_freed(dest_queue_id)` keyed only on
+    /// `queue_id`, with no binding check. A QueueFree for a live `queue_id` makes the
+    /// client recycle a slot it is actively using and re-allocate it under a strictly
+    /// higher monotonic `binding_id` (client.rs `next_binding_id`). The server's slot
+    /// is still bound at the OLD binding, so it rejects every frame of the new stream
+    /// as `FutureBinding` — silently dropped by dispatch (`rx_data_future_binding`).
+    /// The two sides disagree about the binding permanently: a black hole on a
+    /// freshly-accepted stream, with no reset and no recovery.
+    ///
+    /// The guard gates `record_freed` on the init representing a genuinely fresh, idle
+    /// slot generation (mirroring bind validation). This test drives that call on a
+    /// live slot and asserts NO QueueFree is queued, so the client never recycles the
+    /// live id and the desync cannot arise.
+    #[test]
+    fn record_freed_skips_live_binding() {
+        use crate::bitset::HierarchicalBitSet;
+
+        let (mut server, path_entry, mut tx, _rx) = test_server(10);
+
+        // A real stream is accepted on queue 0 at binding 2. Hold the receivers so the
+        // slot stays bound and "live" — this is the reader the acceptor handed to the
+        // application; it is actively reading.
+        let result =
+            server.bind_and_send_stream(v(0), v(2), make_stream_entry(), &path_entry, &mut tx);
+        let Ok(BindResult::NewBinding {
+            stream: _live_stream,
+            control: _live_control,
+            ..
+        }) = result
+        else {
+            panic!("expected NewBinding");
+        };
+
+        // Sanity: slot 0 is bound to binding 2 with a live receiver.
+        let slot = server
+            .view
+            .get(0, &server.state.pages)
+            .expect("slot 0 must exist");
+        assert_eq!(slot.binding_id(), v(2), "slot is live-bound at binding 2");
+        assert_eq!(
+            slot.binding_id_raw() & crate::queue::slot::UNALLOCATED_BIT,
+            0,
+            "slot 0 must still be allocated (live receiver held)"
+        );
+
+        // A stale / reordered / misrouted QueueInit for queue 0 arrives naming an
+        // acceptor that is no longer registered. Its binding (1) is BELOW the live
+        // binding (2). The acceptor-not-found arm calls record_freed with that binding.
+        server.record_freed(v(0), v(1), &path_entry, &mut tx);
+
+        // The guard must drop it: no QueueFree may be queued for a live queue_id.
+        let mut freed_ids = HierarchicalBitSet::new(1);
+        assert!(
+            server.state.freed.take(&mut freed_ids).is_none(),
+            "live queue 0 must NOT be advertised as free — doing so desyncs the client"
+        );
+
+        // A future-binding init (above the live binding) is likewise not freed — the
+        // slot is still live, so freeing would reclaim an in-use id.
+        server.record_freed(v(0), v(5), &path_entry, &mut tx);
+        assert!(
+            server.state.freed.take(&mut freed_ids).is_none(),
+            "a future-binding init on a live slot must not free it either"
+        );
+    }
+
+    /// Companion to `record_freed_skips_live_binding`: the guard must still free the
+    /// peer slot in the cases it legitimately needs to — otherwise an init that names
+    /// a missing acceptor would strand the client's queue_id forever (the client waits
+    /// on a QueueFree that never comes). Two legitimate cases:
+    ///
+    /// 1. The server never materialized this `queue_id` (no slot in the page table) —
+    ///    the init is the first thing it ever saw for that id.
+    /// 2. The slot exists but is unallocated and the init's `binding_id` is strictly
+    ///    newer than the recycle tombstone — a clean new binding that only failed
+    ///    because the acceptor was gone.
+    #[test]
+    fn record_freed_frees_idle_and_fresh_slots() {
+        use crate::bitset::HierarchicalBitSet;
+
+        let (mut server, path_entry, mut tx, _rx) = test_server(10);
+
+        // Case 1: a queue_id the server never touched. The init names a missing
+        // acceptor; the client must be told to reclaim its peer slot.
+        server.record_freed(v(3), v(1), &path_entry, &mut tx);
+        let mut freed_ids = HierarchicalBitSet::new(1);
+        let _ = server
+            .state
+            .freed
+            .take(&mut freed_ids)
+            .expect("fresh queue_id must be freed back to the client");
+        assert!(freed_ids.contains(3), "queue 3 freed");
+
+        // Case 2: an idle (recycled) slot. Bind then drop the receivers so the slot is
+        // unallocated with tombstone = 2; a strictly-newer init (binding 3) that fails
+        // acceptor lookup is a clean would-be binding and must free.
+        let result =
+            server.bind_and_send_stream(v(0), v(2), make_stream_entry(), &path_entry, &mut tx);
+        let Ok(BindResult::NewBinding {
+            stream, control, ..
+        }) = result
+        else {
+            panic!("expected NewBinding");
+        };
+        drop(stream);
+        drop(control);
+        // Drain whatever the receiver-drop free queued so we observe only the next call.
+        let mut sink = HierarchicalBitSet::new(1);
+        let _ = server.state.freed.take(&mut sink);
+
+        server.record_freed(v(0), v(3), &path_entry, &mut tx);
+        let mut freed_ids = HierarchicalBitSet::new(1);
+        let _ = server
+            .state
+            .freed
+            .take(&mut freed_ids)
+            .expect("fresh-binding init on an idle slot must be freed");
+        assert!(
+            freed_ids.contains(0),
+            "idle queue 0 freed for a newer binding"
+        );
     }
 }

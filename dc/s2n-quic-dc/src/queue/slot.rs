@@ -313,6 +313,33 @@ impl Slot {
     ) -> Result<(half::AutoWake, u64), super::Error<intrusive::Entry<msg::Stream>>> {
         let mut inner = self.stream.inner.lock();
         if let Err(error) = validate_binding_state(binding_id, &self.binding_id, &inner.flags) {
+            // INVARIANT (sim-only): we must never drop stream data whose binding matches a
+            // currently-live `StreamReceiver` on this slot. That is the production wedge's exact
+            // signature — a binding that is simultaneously an Open reader and the target of
+            // stale_binding drops. Dropping data for an OLDER binding (incoming < live) is the
+            // EXPECTED ack-and-drop after a clean recycle: that stream's reader is genuinely gone,
+            // and re-sending a reset per chunk would be overkill. The bug is specifically dropping
+            // data for the binding the live reader was created at — its OWN data — which can only
+            // happen if the slot's stored generation diverged from the receiver still holding it.
+            #[cfg(test)]
+            {
+                if let Some(live_binding) =
+                    super::testing::live_receiver_binding(self.as_ptr().as_ptr() as usize)
+                {
+                    if binding_id.as_u64() == live_binding {
+                        panic!(
+                            "acked-but-dropped a LIVE binding: dropping QueueData for queue_id={} \
+                             binding_id={} ({:?}, stored_raw={:#x}) but a StreamReceiver created at \
+                             that SAME binding is still alive on this slot — the reader is Open yet \
+                             its own data is being discarded, so it will hang forever",
+                            self.queue_id().as_u64(),
+                            binding_id.as_u64(),
+                            error,
+                            self.binding_id.load(Ordering::Relaxed),
+                        );
+                    }
+                }
+            }
             return Err(map_validation_error_entry(error, entry));
         }
         let mut release_bytes = 0u64;
@@ -1050,6 +1077,35 @@ mod tests {
         slot.allocate_and_open(v(5), 0).unwrap();
         let result = slot.bind_and_push_stream(v(3), make_stream_entry(), 0);
         assert!(matches!(result, Err(super::super::Error::StaleBinding(_))));
+    }
+
+    /// Oracle self-test: the live-receiver invariant in `push_stream` MUST fire when stream data is
+    /// dropped for a binding that still has a live `StreamReceiver` registered on the slot. This
+    /// proves the instrumentation actually detects the production wedge (a binding that is both an
+    /// Open reader and the target of stale_binding drops) rather than silently never tripping.
+    ///
+    /// We simulate the divergence directly: bind the slot at binding 5, register a live receiver
+    /// for binding 5 (as `StreamReceiver::new` would), then advance the slot's stored generation
+    /// past it (recycle to 6) WITHOUT unregistering the receiver — the use-after-recycle the bug
+    /// would produce. A `push_stream` for binding 5 then both stale-drops AND matches a live
+    /// receiver, which must panic.
+    #[test]
+    #[should_panic(expected = "acked-but-dropped a LIVE binding")]
+    fn push_stream_live_receiver_invariant_fires_on_divergence() {
+        // Start from a clean registry: the panic below skips the unregister, and this process-wide
+        // thread-local could otherwise carry state from (or into) another test on this thread.
+        super::super::testing::clear_live_stream_receivers();
+        let slot = Slot::with_queue_id(v(0));
+        slot.allocate_and_open(v(5), 0).unwrap();
+        let slot_addr = slot.as_ptr().as_ptr() as usize;
+        // A live StreamReceiver exists for binding 5 (what the open reader holds).
+        super::super::testing::register_stream_receiver(slot_addr, 5);
+        // The slot is recycled and rebound to a higher generation under that still-live receiver.
+        slot.mark_unallocated();
+        slot.allocate_and_open(v(6), 0).unwrap();
+        // Old-binding (5) data arrives: stale-dropped, but binding 5 still has a live receiver.
+        let _ = slot.push_stream(v(5), make_stream_entry());
+        // (unreachable: the push panics; cleanup omitted for the should_panic test)
     }
 
     #[test]

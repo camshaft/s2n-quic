@@ -135,7 +135,12 @@ fn decrypt_fast_path(
 
         let Some(acceptor_sender) = acceptor_registry.get(acceptor_id) else {
             counters.rx_init_no_acceptor.add(1);
-            server_view.record_freed(queue_pair.dest_queue_id, path_entry, freed_batch_tx);
+            server_view.record_freed(
+                queue_pair.dest_queue_id,
+                binding_id,
+                path_entry,
+                freed_batch_tx,
+            );
             send_reset(
                 path_entry,
                 queue_pair,
@@ -1192,7 +1197,12 @@ fn handle_queue_msg_init(
 
     let Some(acceptor_sender) = acceptor_registry.get(acceptor_id) else {
         counters.rx_init_no_acceptor.add(1);
-        server_view.record_freed(queue_pair.dest_queue_id, &peer.path_entry, freed_batch_tx);
+        server_view.record_freed(
+            queue_pair.dest_queue_id,
+            binding_id,
+            &peer.path_entry,
+            freed_batch_tx,
+        );
         send_reset(
             &peer.path_entry,
             queue_pair,
@@ -1361,7 +1371,12 @@ fn handle_queue_data_init(
             acceptor_id = acceptor_id.as_u64(),
             "QueueData init rejected - acceptor not found, sending reset"
         );
-        server_view.record_freed(queue_pair.dest_queue_id, &peer.path_entry, freed_batch_tx);
+        server_view.record_freed(
+            queue_pair.dest_queue_id,
+            binding_id,
+            &peer.path_entry,
+            freed_batch_tx,
+        );
         send_reset(
             &peer.path_entry,
             queue_pair,
@@ -1838,7 +1853,7 @@ fn bind_for_reset(
             acceptor_id = acceptor_id.as_u64(),
             "init reset rejected - acceptor not found, sending reset"
         );
-        server_view.record_freed(dest_queue_id, &peer.path_entry, freed_batch_tx);
+        server_view.record_freed(dest_queue_id, binding_id, &peer.path_entry, freed_batch_tx);
         send_reset(
             &peer.path_entry,
             queue_pair,
@@ -1928,7 +1943,10 @@ fn bind_for_reset(
                 "init reset - new binding created"
             );
         }
-        Ok(crate::queue::BindResult::Bound { waker, release_bytes }) => {
+        Ok(crate::queue::BindResult::Bound {
+            waker,
+            release_bytes,
+        }) => {
             // The init already bound the slot; nothing to create. Reset delivery
             // proceeds against the existing binding.
             let _ = waker_sink.send(waker);
