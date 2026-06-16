@@ -625,6 +625,23 @@ impl BbrCongestionController {
         self.pacer.pacing_rate()
     }
 
+    /// True if the controller is still in the Startup state.
+    ///
+    /// Exposed for tests that need to verify the controller leaves Startup (e.g. that an
+    /// application-limited sender is not stuck there indefinitely).
+    #[cfg(any(test, feature = "testing"))]
+    #[inline]
+    pub fn is_in_startup(&self) -> bool {
+        self.state.is_startup()
+    }
+
+    /// True if the bandwidth estimator is currently in an application-limited period.
+    #[cfg(any(test, feature = "testing"))]
+    #[inline]
+    pub fn is_app_limited(&self) -> bool {
+        self.bw_estimator.is_app_limited()
+    }
+
     /// The bandwidth-delay product
     ///
     /// Based on the current estimate of maximum sending bandwidth and minimum RTT

@@ -453,7 +453,23 @@ impl Estimator {
         //# MarkConnectionAppLimited():
         //#   C.app_limited =
         //#     (C.delivered + packets_in_flight) ? : 1
-        self.app_limited_delivered_bytes = Some(self.delivered_bytes + bytes_in_flight as u64);
+
+        // Only arm the end-mark when no app-limited period is already open. Re-arming on every
+        // app-limited send moves the mark to `delivered + bytes_in_flight`, i.e. one full flight
+        // ahead of cumulative delivered, on each send. A sender that is repeatedly flagged
+        // app-limited before it delivers past the prior mark — the regime a per-context BBR
+        // controller sees behind s2n-quic-dc's global pacer and pick-two spray — then pushes the
+        // mark forward faster than `delivered` can catch it, so the period never closes. While it
+        // stays open the full-pipe estimator skips every round and the controller never leaves
+        // Startup (the unbounded `send.app_limited` / stuck-in-Startup bug). Pinning the mark to
+        // the first send of the period lets it close once that initial bubble drains; the next
+        // app-limited send after the period has closed simply opens a fresh one. The mark is
+        // still pulled earlier by `on_loss` / `on_packet_discarded` for bytes that will never be
+        // delivered, so it cannot be stranded above a `delivered` total that can no longer reach
+        // it.
+        if self.app_limited_delivered_bytes.is_none() {
+            self.app_limited_delivered_bytes = Some(self.delivered_bytes + bytes_in_flight as u64);
+        }
     }
 
     #[cfg(test)]
