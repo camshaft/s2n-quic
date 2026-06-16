@@ -386,7 +386,12 @@ fn sender_error_returns_value() {
 /// Set sender `idx`'s published load score to exactly `score_nanos` by feeding a base timestamp
 /// of that many nanoseconds with zero queued bytes (so the queue-drain term is zero and the stored
 /// score equals the base).
+///
+/// `score_nanos` must be a whole number of microseconds: the core `Timestamp` stores microseconds
+/// internally and truncates sub-microsecond nanos (see `score_as_u64`), so a value like `1_500` ns
+/// would round down to `1_000` ns. Callers here pass millisecond-scale gaps, so this is exact.
 fn set_load_score(entry: &Arc<PathSecretEntry>, idx: usize, score_nanos: u64) {
+    debug_assert_eq!(score_nanos % 1_000, 0, "score resolution is one microsecond");
     let base =
         unsafe { s2n_quic_core::time::Timestamp::from_duration(core::time::Duration::from_nanos(score_nanos)) };
     entry.update_sender_load_score(

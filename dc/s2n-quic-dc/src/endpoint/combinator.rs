@@ -473,6 +473,10 @@ impl<T: FlowCredits> FlowCredits for crate::intrusive::Entry<T> {
 /// to it only at the [`PICK_TWO_WORSE_FLOOR`] rate. The selection curve is derived so the smooth
 /// logistic decay meets the floor exactly at this gap (no abrupt knee) — see
 /// [`pick_two_worse_probability`]. This and the floor are the two intuitive tuning knobs.
+///
+/// The scores carry a nanosecond unit but only microsecond resolution (they flow through the core
+/// `Timestamp`, which stores microseconds — see `score_as_u64`). At 1ms this gap is 1000 quanta
+/// wide, so the quantization is far finer than the logistic resolves and has no bearing on routing.
 const PICK_TWO_WORST_CASE_GAP_NANOS: f64 = 1_000_000.0;
 
 /// Minimum probability of routing to the higher-scored (worse) candidate, also the probability at
