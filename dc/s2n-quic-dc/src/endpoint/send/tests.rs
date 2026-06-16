@@ -604,7 +604,7 @@ fn edt_floor_raises_score_when_pacing_gated() {
 
     let edt = ctx_paced
         .cca
-        .earliest_departure_time()
+        .earliest_departure_time(&t0)
         .expect("BBR should set earliest_departure_time after two on_packet_sent calls");
     assert!(
         edt > t0,

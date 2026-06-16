@@ -3,7 +3,7 @@
 
 use std::{fmt, ops, time::Duration};
 
-pub trait Clock: Send + Sync + 'static {
+pub trait Clock: s2n_quic_core::time::Clock + Send + Sync + 'static {
     type Timer: Timer;
 
     fn now(&self) -> Timestamp;

@@ -291,6 +291,67 @@ mod tests {
         );
     }
 
+    //= type=test
+    // Documents the gap left by the exact-zero guard added in #384
+    // (`zero_delivery_sample_does_not_collapse_max_bw`): that guard only discards samples whose
+    // delivery rate is *exactly* `Bandwidth::ZERO`. A sample that delivers a tiny, non-zero
+    // amount of data over a very long interval (e.g. one byte over ~56 seconds, as produced by
+    // `Estimator::on_ack` setting the interval to `max(send_elapsed, ack_elapsed)` after a
+    // stall) has a tiny *non-zero* rate, so it sails past the guard and the windowed-max filter
+    // collapses `max_bw` to a near-zero value on window expiry.
+    //
+    // We intentionally do NOT fix this in the data-rate model: a near-zero `max_bw` is a benign
+    // intermediate state once the pacer floors the resulting rate at `send_quantum / (3 * rtt)`
+    // (see `pacing::tests::near_zero_pacing_rate_is_floored`). This test pins the model's actual
+    // behavior — the collapse still happens here — so that if a future change moves the floor
+    // back into the model this assertion flags it for review.
+    #[test]
+    fn tiny_nonzero_sample_collapses_max_bw_in_model() {
+        let mut model = Model::new();
+
+        // Establish a healthy max_bw from a real, non-app-limited delivery sample
+        // (100 bytes / 10ms).
+        let good = RateSample {
+            interval: Duration::from_millis(10),
+            delivered_bytes: 100,
+            is_app_limited: false,
+            ..Default::default()
+        };
+        let healthy_bw = good.delivery_rate();
+        model.update_max_bw(good);
+        model.bound_bw_for_model();
+        assert_eq!(healthy_bw, model.max_bw());
+
+        // Age the healthy sample out of the 2-cycle filter window so the next sample is
+        // accepted via the window-expiry path.
+        model.advance_max_bw_filter();
+        model.advance_max_bw_filter();
+
+        // A non-app-limited sample that delivered a single byte over ~56 seconds: a tiny,
+        // *non-zero* delivery rate.
+        let stalled = RateSample {
+            interval: Duration::from_secs(56),
+            delivered_bytes: 1,
+            is_app_limited: false,
+            ..Default::default()
+        };
+        // The sample is non-zero, so the exact-zero guard from #384 does not reject it.
+        assert_ne!(Bandwidth::ZERO, stalled.delivery_rate());
+
+        model.update_max_bw(stalled);
+        model.bound_bw_for_model();
+
+        // The model still collapses to the tiny rate — this is the gap the pacer floor covers
+        // downstream. If this ever changes (e.g. a model-level floor is added), revisit the
+        // pacer floor and this test.
+        assert_eq!(
+            stalled.delivery_rate(),
+            model.max_bw(),
+            "expected the tiny-non-zero sample to collapse max_bw in the model; \
+             if a model-level floor was added, update the pacer floor accordingly"
+        );
+    }
+
     #[test]
     fn update_lower_bound() {
         let mut model = Model::new();

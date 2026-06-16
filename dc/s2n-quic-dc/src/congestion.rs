@@ -7,10 +7,22 @@ use s2n_quic_core::{
         bandwidth::Bandwidth, bbr::BbrCongestionController, congestion_controller::Publisher,
         CongestionController, RttEstimator,
     },
-    time::{timer, Timestamp},
+    time::{timer, Clock, Timestamp},
 };
+use core::time::Duration;
 
 pub type PacketInfo = <BbrCongestionController as CongestionController>::PacketInfo;
+
+/// Upper bound on how far into the future a paced transmission may be scheduled.
+///
+/// A legitimate pacing interval is `send_quantum / pacing_rate`, at most a few tens of
+/// milliseconds even on the slowest path (the BBR pacer floors the rate at
+/// `send_quantum / (3 * rtt)`). One second is roughly two orders of magnitude beyond that, so
+/// this clamp is inert during healthy operation and only engages if a degenerate
+/// earliest-departure-time ever reaches a scheduler — at which point we cap the delay rather
+/// than strand the context. This is a backstop; the root cause of a near-zero pacing rate is
+/// prevented in BBR's pacer.
+pub const MAX_TX_PACING_DELAY: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Debug)]
 pub struct Controller {
@@ -151,9 +163,25 @@ impl Controller {
         self.controller.send_quantum().unwrap_or(usize::MAX)
     }
 
+    /// The earliest time a paced packet may depart, clamped to at most
+    /// [`MAX_TX_PACING_DELAY`] into the future.
+    ///
+    /// The clamp lives here, on the single accessor, rather than at each scheduling callsite.
+    /// A degenerate (near-zero) pacing rate would otherwise produce a departure time days into
+    /// the future; the BBR pacer now floors the rate at `send_quantum / (3 * rtt)` so this is
+    /// already bounded, but applying the clamp centrally means every consumer — the tx_wheel,
+    /// the sender load score, and any future caller — inherits the backstop without each
+    /// having to remember to apply it. This was the gap behind the original report: the
+    /// tx_wheel callsite clamped but the load-score path did not.
+    ///
+    /// The clock is queried lazily — only when there is actually a departure time to clamp —
+    /// so callers that pass a bare `Timestamp` (which is itself a `Clock`) incur a no-op while
+    /// callers that hold a real clock avoid an unnecessary `now` read when the CCA has no EDT.
     #[inline]
-    pub fn earliest_departure_time(&self) -> Option<Timestamp> {
-        self.controller.earliest_departure_time()
+    pub fn earliest_departure_time<C: Clock + ?Sized>(&self, clock: &C) -> Option<Timestamp> {
+        self.controller
+            .earliest_departure_time()
+            .map(|edt| edt.min(clock.get_time() + MAX_TX_PACING_DELAY))
     }
 
     #[inline]
@@ -165,7 +193,11 @@ impl Controller {
 impl timer::Provider for Controller {
     #[inline]
     fn timers<Q: timer::Query>(&self, query: &mut Q) -> timer::Result {
-        if let Some(time) = self.earliest_departure_time() {
+        // No `now` is available here, so query the raw (unclamped) departure time. The pacer's
+        // `send_quantum / (3 * rtt)` rate floor already bounds this; the additional
+        // `MAX_TX_PACING_DELAY` clamp is applied by `earliest_departure_time` at the scheduling
+        // callsites that do have a clock.
+        if let Some(time) = self.controller.earliest_departure_time() {
             let mut timer = timer::Timer::default();
             timer.set(time);
             query.on_timer(&timer)?;
