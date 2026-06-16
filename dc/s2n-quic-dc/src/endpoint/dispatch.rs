@@ -773,7 +773,12 @@ fn dispatch_decoded_frame(
             largest_acknowledged,
             ack_range,
             ecn_counts,
-            ..
+            // `is_ack_eliciting` (this ACK acting as a PING) is consumed earlier
+            // via `header.is_ack_eliciting()` when deciding whether to schedule
+            // an ACK back — see the ack-eliciting accounting in `process`. It is
+            // not needed to build the inbound `ReceivedAck`, so spell it out
+            // rather than dropping it with `..`.
+            is_ack_eliciting: _,
         } => {
             let ack_delay = Duration::from_micros(ack_delay_micros.as_u64());
             let message = msg::Sender::ReceivedAck {
