@@ -743,6 +743,41 @@ fn set_cwnd_probing_rtt() {
     assert_eq!(11_000, bbr.cwnd);
 }
 
+//= type=test
+// Regression test for a production panic: `cwnd += newly_acked` at the Startup growth path in
+// `set_cwnd` overflowed `u32` with "attempt to add with overflow".
+//
+// A per-context BBR controller can latch application-limited and never exit Startup (see the
+// app-limited / spray investigation). While in Startup the `max_inflight` cap does not apply, so
+// `cwnd` grows by `newly_acked` on every ACK with no upper bound until it reaches `u32::MAX`
+// after ~4.3 GB of cumulative ACKs. A plain `+=` then panics. The fix saturates instead; the
+// value is clamped to `bound_cwnd_for_model()` immediately afterward (which is `u32::MAX` in
+// Startup, so saturating is the correct inert behavior). This test drives cwnd to the boundary
+// and asserts the controller does not panic and clamps sanely.
+#[test]
+fn set_cwnd_startup_growth_saturates_without_panic() {
+    let mut bbr = BbrCongestionController::new(MINIMUM_MAX_DATAGRAM_SIZE, Default::default());
+
+    // Still in Startup — the unbounded growth path.
+    assert!(bbr.state.is_startup());
+    assert!(!bbr.full_pipe_estimator.filled_pipe());
+
+    // In Startup there are no model bounds (inflight_hi/lo are Infinity), so
+    // bound_cwnd_for_model is u32::MAX and will not clamp the result down before the add.
+    assert_eq!(u32::MAX, bbr.bound_cwnd_for_model());
+
+    // Push cwnd to within one ack of overflowing. The pre-fix `+=` panicked here.
+    bbr.cwnd = u32::MAX - 100;
+    bbr.set_cwnd(1000);
+
+    // Saturated rather than wrapped or panicked.
+    assert_eq!(u32::MAX, bbr.cwnd);
+
+    // And a subsequent ack at the ceiling stays saturated.
+    bbr.set_cwnd(1000);
+    assert_eq!(u32::MAX, bbr.cwnd);
+}
+
 #[test]
 fn set_cwnd_clamp() {
     let mut bbr = BbrCongestionController::new(MINIMUM_MAX_DATAGRAM_SIZE, Default::default());
