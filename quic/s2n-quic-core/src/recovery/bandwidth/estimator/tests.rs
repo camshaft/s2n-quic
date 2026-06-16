@@ -291,22 +291,24 @@ fn app_limited_period_closes_under_sustained_app_limited_sends() {
         "app-limited period should have started"
     );
 
-    // Steady spray pattern: deliver the previous send's bytes (advancing `delivered`), checking
-    // after each ack whether the period has closed, then immediately send another app-limited
-    // packet. On HEAD that send re-arms the mark one flight ahead, so the post-ack check never
-    // observes a closed period.
+    // Steady spray pattern: each iteration acknowledges the most recently sent packet (advancing
+    // `delivered`), checks whether the period has closed, then sends another app-limited packet.
+    // The newly sent packet's `PacketInfo` is threaded into the next iteration's ack, matching
+    // `on_ack`'s contract that it receives the newest-acked packet's info. On HEAD each send
+    // re-arms the mark one flight ahead, so the post-ack check never observes a closed period.
     let mut now = t0;
     let mut ever_closed = false;
+    let mut newest = first_packet;
     for _ in 0..32 {
         now += Duration::from_millis(10);
-        // Acknowledge the previous packet's bytes — delivered advances.
-        bw_estimator.on_ack(1000, now, first_packet, now, &mut publisher);
+        // Acknowledge the most recently sent packet's bytes — delivered advances.
+        bw_estimator.on_ack(1000, now, newest, now, &mut publisher);
         if !bw_estimator.is_app_limited() {
             ever_closed = true;
         }
         // Send another packet while still app-limited. On HEAD this re-arms the end-mark to
         // delivered + bytes_in_flight, one flight ahead of where we just delivered.
-        let _ = bw_estimator.on_packet_sent(1000, 1000, Some(true), now);
+        newest = bw_estimator.on_packet_sent(1000, 1000, Some(true), now);
     }
 
     // We delivered 32_000 bytes — far past the first bubble's ~2_000-byte mark. A correct
