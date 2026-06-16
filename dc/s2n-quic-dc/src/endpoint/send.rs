@@ -592,6 +592,13 @@ pub(crate) struct Context {
     pub sender_idx: LocalSenderId,
     /// Intrusive links for the immediate transmission queue (ACKs, probes)
     pub tx_immediate: crate::intrusive::Links,
+    /// Intrusive links for the wheel→assembler ready queue.
+    ///
+    /// Set once the context has expired off the `tx_wheel` and is queued, ready-now,
+    /// for paced assembly. Kept distinct from `tx_wheel` so that "waiting in the wheel
+    /// for a future EDT" and "already drained, queued for assembly" are independent,
+    /// unambiguous states rather than two meanings of one shared link.
+    pub tx_assembly: crate::intrusive::Links,
     /// Intrusive links and target time for the transmission pacing wheel
     pub tx_wheel: WheelLinks,
     /// Intrusive links and target time for the PTO (probe timeout) wheel
@@ -678,6 +685,7 @@ impl Context {
             pending_freed: None,
             sender_idx,
             tx_immediate: crate::intrusive::Links::new(),
+            tx_assembly: crate::intrusive::Links::new(),
             tx_wheel: WheelLinks::new(),
             pto_wheel: WheelLinks::new(),
             idle_wheel: WheelLinks::new(),
@@ -813,8 +821,14 @@ impl Context {
 
         let transmission =
             if
-            // Check we have queued data packets and we're not already linked
-            !self.is_tx_scheduled() && self.has_pending_data() && self.can_send_pending_frames()
+            // Only insert into the tx_wheel when the context is neither already
+            // waiting in the wheel nor already queued for assembly. Both links must
+            // be clear: an intrusive node can live in only one list at a time, and a
+            // double-insert would trip the list's unlinked assertion / corrupt it.
+            !self.is_tx_scheduled()
+                && !self.is_queued_for_assembly()
+                && self.has_pending_data()
+                && self.can_send_pending_frames()
             {
                 // Non-urgent pending data follows CCA pacing via the tx_wheel.
                 let target = self
@@ -972,6 +986,15 @@ impl Context {
     #[inline]
     pub fn is_immediate_scheduled(&self) -> bool {
         self.tx_immediate.is_linked()
+    }
+
+    /// True while the context is queued in the wheel→assembler ready channel
+    /// (drained off the wheel, awaiting assembly). Distinct from
+    /// [`is_tx_scheduled`](Self::is_tx_scheduled), which means "still waiting in
+    /// the wheel for a future EDT".
+    #[inline]
+    pub fn is_queued_for_assembly(&self) -> bool {
+        self.tx_assembly.is_linked()
     }
 
     #[inline]
@@ -1193,6 +1216,11 @@ pub(crate) use crate::time::wheel::WheelLinks;
 crate::rc_adapter!(
     pub(crate) struct TxImmediateAdapter {
         tx_immediate: RefCell<Context>,
+    }
+);
+crate::rc_adapter!(
+    pub(crate) struct TxAssemblyAdapter {
+        tx_assembly: RefCell<Context>,
     }
 );
 crate::context_wheel_adapter!(TxWheelAdapter, Context, tx_wheel);

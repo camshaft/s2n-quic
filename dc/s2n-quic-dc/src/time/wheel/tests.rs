@@ -325,6 +325,329 @@ fn test_some_to_none_while_queued_still_returns_entry() {
     assert!(queue.is_empty());
 }
 
+/// Regression for the claimed "tick_to forward-only first_occupied_after strands
+/// level-0 slots behind current_slot" bug.
+///
+/// We insert an entry whose target tick is in the NEXT rotation (so its level-0
+/// slot index is numerically LESS than current_slot), advance current_tick to a
+/// point past that slot index but still within the same rotation, then keep
+/// advancing across the cascade boundary to the target. The claim says the entry
+/// strands forever; the invariant says it must drain exactly at its target tick.
+#[test]
+fn next_rotation_low_slot_drains_after_wrap() {
+    // Start at a tick whose slot index is high within the rotation.
+    // base_us chosen so start_tick & 255 == 200.
+    let base_us = 256 * 4000 + 200; // rotation-aligned + slot 200
+    let clock = Clock::new(Duration::from_micros(base_us));
+    let channel = TestChannel::new();
+    let mut wheel: TestWheel = Wheel::new(&channel, clock.timer());
+
+    let start_tick = wheel.current_tick;
+    assert_eq!(start_tick & 0xff, 200, "test setup: expected slot 200");
+
+    // Target 100µs in the future: absolute tick = start+100, slot index
+    // = (start+100) & 255 = (200+100) & 255 = 44 — BEHIND current_slot 200.
+    let target_offset = 100u64;
+    let future_time = clock.get_time() + Duration::from_micros(target_offset);
+    let target_tick = start_tick + target_offset;
+    assert_eq!(
+        (target_tick & 0xff) as usize,
+        44,
+        "test setup: target lands in slot 44 (behind current_slot 200)"
+    );
+
+    let mut batch = Queue::new();
+    batch.push_back(
+        TestEntry {
+            meta: 1234,
+            transmission_time: Some(future_time),
+        }
+        .into(),
+    );
+    channel.send_batch(batch);
+
+    // Insert into wheel.
+    let result = poll_once(core::future::poll_fn(|cx| {
+        wheel.poll_recv(cx, &mut channel::Budget::new(usize::MAX))
+    }));
+    assert!(result.is_none(), "entry should be queued, not yet due");
+    assert_eq!(wheel.len, 1);
+
+    // Advance to a tick PAST slot 44's index but BEFORE the cascade boundary and
+    // before the target. e.g. advance 10µs -> current_tick slot 210. This is the
+    // moment the claim says first_occupied_after(210) returns None and strands
+    // slot 44.
+    clock.advance(Duration::from_micros(10));
+    let result = poll_once(core::future::poll_fn(|cx| {
+        wheel.poll_recv(cx, &mut channel::Budget::new(usize::MAX))
+    }));
+    assert!(
+        result.is_none(),
+        "entry still in the future (target is +100), nothing due yet"
+    );
+    assert_eq!(wheel.len, 1, "entry must still be queued, NOT stranded/lost");
+
+    // Now advance to the target time. The wheel must cross the cascade boundary
+    // (256-aligned) and drain slot 44 in the next rotation.
+    clock.set(future_time);
+    let queue = poll_once(core::future::poll_fn(|cx| {
+        wheel.poll_recv(cx, &mut channel::Budget::new(usize::MAX))
+    }));
+
+    let mut queue = queue
+        .expect("poll should be Ready")
+        .expect("entry must be delivered, not stranded");
+    let entry = queue.pop_front().expect("the +100µs entry must drain");
+    assert_eq!(entry.meta, 1234);
+    assert_eq!(wheel.len, 0, "wheel drained");
+}
+
+/// Scheduler-driven oracle fuzz test.
+///
+/// The existing `fuzz_oracle_comparison` re-polls the wheel at EVERY tick, so it
+/// exercises `tick_to` exhaustively but NEVER depends on `next_expiry()` to decide
+/// when to wake. Production does the opposite: the consumer sleeps until the time
+/// `next_expiry()` reports, then polls once. A "context linked in the wheel that
+/// never fires" is a wake-scheduling failure on exactly this path — invisible to
+/// the every-tick oracle. This test drives the wheel the way production does.
+#[test]
+fn fuzz_next_expiry_driven() {
+    use bolero::check;
+
+    const MAX_OFFSET: u64 = 5_000_000;
+
+    check!()
+        .with_type::<(u32, Vec<u32>)>()
+        .with_test_time(core::time::Duration::from_secs(10))
+        .for_each(|(start_offset, offsets)| {
+            if offsets.is_empty() {
+                return;
+            }
+            let base_us = 1_000 + (*start_offset as u64) * 256;
+            let start = precision::Timestamp {
+                nanos: Duration::from_micros(base_us).as_nanos() as u64,
+            };
+            let clock = Clock::new(Duration::from_micros(base_us));
+            let channel = TestChannel::new();
+            let mut wheel: TestWheel = Wheel::new(&channel, clock.timer());
+
+            let start_tick = timestamp_to_tick(start, 1);
+
+            let mut oracle: BTreeMap<u64, Vec<u16>> = BTreeMap::new();
+            let mut batch = Queue::new();
+            for (i, &raw_offset) in offsets.iter().enumerate() {
+                let offset_us = ((raw_offset as u64) % MAX_OFFSET) + 1;
+                let target_tick = start_tick + offset_us;
+                let time = start + Duration::from_micros(offset_us);
+                batch.push_back(
+                    TestEntry {
+                        meta: i as u16,
+                        transmission_time: Some(time),
+                    }
+                    .into(),
+                );
+                oracle.entry(target_tick).or_default().push(i as u16);
+            }
+            let expected_count = offsets.len();
+            channel.send_batch(batch);
+
+            // Insert.
+            let _ = poll_once(core::future::poll_fn(|cx| {
+                wheel.poll_recv(cx, &mut channel::Budget::new(usize::MAX))
+            }));
+            assert_eq!(wheel.len, expected_count);
+
+            // Drive the wheel ONLY by what next_expiry() reports. If next_expiry
+            // ever returns None while entries remain, or reports a time past which
+            // an entry was already due (so it gets skipped), we either spin forever
+            // (caught by the guard) or lose entries (caught by the final count).
+            let mut total_collected = 0usize;
+            let mut guard = 0usize;
+            let guard_limit = expected_count * 4 + 16;
+
+            while !oracle.is_empty() {
+                guard += 1;
+                assert!(
+                    guard <= guard_limit,
+                    "next_expiry-driven loop exceeded {guard_limit} iterations: \
+                     likely a stranded entry (next_expiry not advancing). \
+                     remaining oracle entries: {}",
+                    oracle.values().map(|v| v.len()).sum::<usize>()
+                );
+
+                let expiry = wheel
+                    .next_expiry()
+                    .expect("entries remain but next_expiry() returned None (stranded!)");
+
+                // next_expiry() must NEVER over-report: the wake time it returns
+                // must not be strictly later than the earliest still-pending entry.
+                // If it did, production would sleep past a due entry, leaving a
+                // linked context stranded (the field-observed symptom). The clamp
+                // is `earliest_tick.max(base + 1)`, so the floor is current_tick+1.
+                let earliest_due_tick = *oracle.keys().next().unwrap();
+                let expiry_tick_check = timestamp_to_tick(expiry, 1);
+                assert!(
+                    expiry_tick_check <= earliest_due_tick.max(wheel.current_tick + 1),
+                    "next_expiry() over-reported: returned tick {expiry_tick_check} but \
+                     earliest pending entry is due at tick {earliest_due_tick} \
+                     (current_tick={}). Sleeping this long strands the entry.",
+                    wheel.current_tick
+                );
+
+                // Sleep exactly until the reported expiry, like production does.
+                clock.set(expiry);
+                let expiry_tick = timestamp_to_tick(expiry, 1);
+
+                let poll_result = poll_once(core::future::poll_fn(|cx| {
+                    wheel.poll_recv(cx, &mut channel::Budget::new(usize::MAX))
+                }));
+
+                if let Some(Some(mut queue)) = poll_result {
+                    while let Some(entry) = queue.pop_front() {
+                        // Every drained entry must have been genuinely due.
+                        let due_tick = oracle
+                            .iter()
+                            .find(|(_, metas)| metas.contains(&entry.meta))
+                            .map(|(t, _)| *t)
+                            .expect("drained an entry not in oracle (double-drain?)");
+                        assert!(
+                            due_tick <= expiry_tick,
+                            "entry {} drained at tick {expiry_tick} but was due at {due_tick} \
+                             (next_expiry woke us too early/late)",
+                            entry.meta
+                        );
+                        // remove from oracle
+                        if let Some(metas) = oracle.get_mut(&due_tick) {
+                            metas.retain(|m| *m != entry.meta);
+                            if metas.is_empty() {
+                                oracle.remove(&due_tick);
+                            }
+                        }
+                        total_collected += 1;
+                    }
+                }
+            }
+
+            assert_eq!(
+                total_collected, expected_count,
+                "all entries must drain via next_expiry-driven scheduling"
+            );
+            assert_eq!(wheel.len, 0);
+        });
+}
+
+/// Drives the wheel the way production does: instead of polling every tick, it
+/// only advances the clock to the wake time the wheel itself requests via its
+/// internal `next_expiry`/timer. If `next_expiry` ever schedules a wake later
+/// than an entry's true due time, that entry comes out late — exactly the
+/// "stuck past its due date" symptom. We assert no entry is ever drained late.
+#[test]
+fn next_expiry_never_strands_entry() {
+    use bolero::check;
+
+    const MAX_OFFSET: u64 = 5_000_000;
+
+    check!()
+        .with_type::<(u32, Vec<u32>)>()
+        .with_test_time(core::time::Duration::from_secs(10))
+        .for_each(|(start_offset, offsets)| {
+            if offsets.is_empty() {
+                return;
+            }
+
+            let base_us = 1_000 + (*start_offset as u64) * 7;
+            let start = precision::Timestamp {
+                nanos: Duration::from_micros(base_us).as_nanos() as u64,
+            };
+            let clock = Clock::new(Duration::from_micros(base_us));
+            let channel = TestChannel::new();
+            let mut wheel: TestWheel = Wheel::new(&channel, clock.timer());
+
+            let start_tick = timestamp_to_tick(start, 1);
+
+            // record the due tick for each entry
+            let mut due_tick: BTreeMap<u16, u64> = BTreeMap::new();
+            let mut batch = Queue::new();
+            for (i, &raw_offset) in offsets.iter().enumerate() {
+                let offset_us = ((raw_offset as u64) % MAX_OFFSET) + 1;
+                let time = start + Duration::from_micros(offset_us);
+                let meta = i as u16;
+                batch.push_back(
+                    TestEntry {
+                        meta,
+                        transmission_time: Some(time),
+                    }
+                    .into(),
+                );
+                due_tick.insert(meta, (start_tick + offset_us).max(start_tick));
+            }
+            let expected_count = offsets.len();
+            channel.send_batch(batch);
+
+            // initial poll: insert everything, arm the timer
+            let _ = poll_once(core::future::poll_fn(|cx| {
+                wheel.poll_recv(cx, &mut channel::Budget::new(usize::MAX))
+            }));
+
+            // Track which entries are still queued and their due ticks.
+            let mut remaining: BTreeMap<u16, u64> = due_tick.clone();
+
+            let mut guard = 0u64;
+            // Drive ONLY via the wheel's requested wake time, like the real task.
+            while !remaining.is_empty() {
+                guard += 1;
+                assert!(
+                    guard < (expected_count as u64 + 16) * 8,
+                    "wheel failed to make progress: {} entries left",
+                    remaining.len()
+                );
+
+                // The earliest tick at which SOME queued entry is actually due.
+                let earliest_due = *remaining.values().min().unwrap();
+
+                // What time does the wheel want to be woken at?
+                let Some(expiry) = wheel.next_expiry() else {
+                    panic!(
+                        "next_expiry returned None with {} entries still queued",
+                        wheel.len
+                    );
+                };
+                let expiry_tick = timestamp_to_tick(expiry, 1);
+
+                // CORE INVARIANT: the wheel must not schedule its wake LATER than the
+                // earliest due entry. If it does, the task sleeps past the due time and
+                // the entry is stranded until some unrelated event re-polls the wheel.
+                assert!(
+                    expiry_tick <= earliest_due.max(timestamp_to_tick(clock.get_time(), 1)),
+                    "next_expiry scheduled wake at tick {expiry_tick}, but an entry is \
+                     due at tick {earliest_due} — entry stranded past its due date"
+                );
+
+                // Simulate the task sleeping until exactly that wake time.
+                let now = expiry.max(clock.get_time());
+                clock.set(now);
+                let now_tick = timestamp_to_tick(now, 1);
+
+                let poll_result = poll_once(core::future::poll_fn(|cx| {
+                    wheel.poll_recv(cx, &mut channel::Budget::new(usize::MAX))
+                }));
+
+                if let Some(Some(mut queue)) = poll_result {
+                    while let Some(entry) = queue.pop_front() {
+                        let d = remaining.remove(&entry.meta).expect("entry drained twice");
+                        assert!(
+                            now_tick >= d,
+                            "entry {} drained early at tick {now_tick} but due at {d}",
+                            entry.meta
+                        );
+                    }
+                }
+            }
+
+            assert_eq!(wheel.len, 0, "all entries should be drained");
+        });
+}
+
 /// Oracle-based fuzz test: compare the wheel against a BTreeMap oracle.
 ///
 /// For random insertion patterns, we verify that:
