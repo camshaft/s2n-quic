@@ -383,6 +383,130 @@ fn sender_error_returns_value() {
     assert_eq!(drop_counter.load(Ordering::Relaxed), 1);
 }
 
+/// Set sender `idx`'s published load score to exactly `score_nanos` by feeding a base timestamp
+/// of that many nanoseconds with zero queued bytes (so the queue-drain term is zero and the stored
+/// score equals the base).
+///
+/// `score_nanos` must be a whole number of microseconds: the core `Timestamp` stores microseconds
+/// internally and truncates sub-microsecond nanos (see `score_as_u64`), so a value like `1_500` ns
+/// would round down to `1_000` ns. Callers here pass millisecond-scale gaps, so this is exact.
+fn set_load_score(entry: &Arc<PathSecretEntry>, idx: usize, score_nanos: u64) {
+    debug_assert_eq!(score_nanos % 1_000, 0, "score resolution is one microsecond");
+    let base =
+        unsafe { s2n_quic_core::time::Timestamp::from_duration(core::time::Duration::from_nanos(score_nanos)) };
+    entry.update_sender_load_score(
+        LocalSenderId::from_index(idx),
+        base,
+        0,
+        s2n_quic_core::recovery::bandwidth::Bandwidth::new(1_000, core::time::Duration::from_millis(1)),
+    );
+}
+
+/// Run `iters` pick-two routings between two senders with the given load-score gap and return the
+/// number of times the higher-scored (worse) sender was chosen. Sender 0 is the better candidate
+/// (score 0); sender 1 is worse (score `gap_nanos`).
+fn count_worse_picks(gap_nanos: u64, iters: usize, seed: u64) -> usize {
+    let entry = test_path_secret_entry();
+    set_load_score(&entry, 0, 0);
+    set_load_score(&entry, 1, gap_nanos);
+
+    let mut rng = crate::xorshift::Rng::with_seed(seed);
+    let mut rr = 0;
+    let mut worse = 0;
+    for _ in 0..iters {
+        let mut senders = vec![
+            TestSender {
+                accept: true,
+                calls: 0,
+            },
+            TestSender {
+                accept: true,
+                calls: 0,
+            },
+        ];
+        let item = new_test_item(entry.clone(), Arc::new(AtomicUsize::new(0)));
+        assert!(try_send_pick_two_with_rr(item, &mut senders, &mut rng, &mut rr).is_ok());
+        // Sender 1 is the worse (higher-score) candidate.
+        worse += senders[1].calls;
+    }
+    worse
+}
+
+/// `PICK_TWO_FLOOR_LN_RATIO` is a hand-pinned literal because `f64::ln` is not const-stable. This
+/// guards it against drifting out of sync with the floor — change the floor without updating the
+/// literal and this fails instead of silently skewing the curve.
+#[test]
+fn pick_two_worse_probability_floor_ratio_literal() {
+    let expected = ((1.0 - PICK_TWO_WORSE_FLOOR) / PICK_TWO_WORSE_FLOOR).ln();
+    assert!(
+        (PICK_TWO_FLOOR_LN_RATIO - expected).abs() < 1e-12,
+        "PICK_TWO_FLOOR_LN_RATIO={PICK_TWO_FLOOR_LN_RATIO} is stale; expected ln((1-floor)/floor)={expected}"
+    );
+}
+
+#[test]
+fn pick_two_worse_probability_curve() {
+    // Equal scores must be a fair coin flip (no structural bias toward idx1 or idx2).
+    assert_eq!(pick_two_worse_probability(0), 0.5);
+
+    // The curve is derived so the logistic meets the floor *exactly* at the worst-case gap — the
+    // smooth decay and the clamp join with no knee.
+    let worst_case = PICK_TWO_WORST_CASE_GAP_NANOS as u64;
+    let p_worst = pick_two_worse_probability(worst_case);
+    assert!(
+        (p_worst - PICK_TWO_WORSE_FLOOR).abs() < 1e-6,
+        "expected logistic to equal the floor {PICK_TWO_WORSE_FLOOR} at the worst-case gap, got {p_worst}"
+    );
+
+    // Intermediate gaps follow the derived logistic: ~9% at half the worst-case gap.
+    let p_half = pick_two_worse_probability(worst_case / 2);
+    assert!(
+        (0.08..0.10).contains(&p_half),
+        "expected ~0.09 at half the worst-case gap, got {p_half}"
+    );
+
+    // Probability is monotonically non-increasing as the gap widens.
+    assert!(pick_two_worse_probability(2 * worst_case) <= p_worst);
+
+    // A huge gap clamps to the floor rather than collapsing to zero — this is what prevents a
+    // structurally-worse target from ever being fully starved.
+    assert_eq!(pick_two_worse_probability(u64::MAX), PICK_TWO_WORSE_FLOOR);
+}
+
+/// Regression test for the starvation problem with the old deterministic `score1 <= score2` rule:
+/// a sender that is consistently worse received *zero* traffic. With the probabilistic rule it must
+/// keep getting a probe trickle at roughly the floor rate, never zero.
+#[test]
+fn consistently_worse_sender_is_not_starved() {
+    const ITERS: usize = 20_000;
+    // A gap far larger than the worst-case gap: the logistic term is effectively zero here, so any
+    // traffic the worse sender receives comes from the floor. The old deterministic rule routed 0.
+    let worse = count_worse_picks(1_000 * PICK_TWO_WORST_CASE_GAP_NANOS as u64, ITERS, 0x5eed_1234);
+
+    let share = worse as f64 / ITERS as f64;
+    assert!(
+        worse > 0,
+        "consistently-worse sender was fully starved (the bug this fix addresses)"
+    );
+    // Should hover around the floor (1%). Allow a statistical band around it.
+    assert!(
+        (0.005..0.015).contains(&share),
+        "worse-sender share {share} should be near the {PICK_TWO_WORSE_FLOOR} floor"
+    );
+}
+
+/// With equal load scores the two candidates must split traffic roughly evenly.
+#[test]
+fn equal_scores_split_evenly() {
+    const ITERS: usize = 20_000;
+    let worse = count_worse_picks(0, ITERS, 0xabcd_9876);
+    let share = worse as f64 / ITERS as f64;
+    assert!(
+        (0.45..0.55).contains(&share),
+        "equal-score split {share} should be ~0.5"
+    );
+}
+
 #[test]
 fn pick_two_drops_unsent_entry_on_shutdown() {
     const CAP: u64 = 1_000_000;

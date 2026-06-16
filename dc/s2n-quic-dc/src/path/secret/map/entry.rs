@@ -319,7 +319,15 @@ impl Entry {
         }
     }
 
-    /// Encode a `Timestamp` as a u64 load-score value (nanoseconds since epoch).
+    /// Encode a `Timestamp` as a u64 load-score value, in nanoseconds since epoch.
+    ///
+    /// Note the *value* is nanoseconds but the *resolution* is one microsecond: the core
+    /// `Timestamp` stores microseconds internally (see `Timestamp::from_duration_impl`), and
+    /// everything that feeds a load score — `earliest_departure_time`, the RTT estimator — is
+    /// already microsecond-quantized. So the low three digits are always zero; the nanosecond unit
+    /// is just a convenience for arithmetic, not real sub-microsecond precision. That quantum is ~1/1000
+    /// of the pick-two worst-case gap, far finer than the selection logistic resolves, so the lost
+    /// precision is immaterial to routing.
     fn score_as_u64(ts: Timestamp) -> u64 {
         // SAFETY: `Timestamp` values in this crate are monotonic and treated as non-negative.
         let nanos = unsafe { ts.as_duration().as_nanos() };
