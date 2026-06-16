@@ -751,11 +751,14 @@ fn frame_batch_tracks_byte_costs_per_priority() {
         path,
         0,
         Header::QueueReset {
-            dest_queue_id: VarInt::from_u8(1),
+            queue_pair: crate::packet::datagram::QueuePair {
+                source_queue_id: VarInt::from_u8(1),
+                dest_queue_id: VarInt::from_u8(1),
+            },
             binding_id: VarInt::from_u8(0),
             reset_target: crate::packet::datagram::ResetTarget::Both,
             error_code: VarInt::from_u8(7),
-            dest_acceptor_id: None,
+            init: None,
         },
     );
     let reset_cost = reset.byte_cost();

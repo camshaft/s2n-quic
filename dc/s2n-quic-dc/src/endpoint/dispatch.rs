@@ -138,7 +138,7 @@ fn decrypt_fast_path(
             server_view.record_freed(queue_pair.dest_queue_id, path_entry, freed_batch_tx);
             send_reset(
                 path_entry,
-                queue_pair.source_queue_id,
+                queue_pair,
                 binding_id,
                 error::ACCEPTOR_NOT_FOUND,
                 frame_tx,
@@ -174,6 +174,7 @@ fn decrypt_fast_path(
                     frame_tx.clone(),
                     path_entry.clone(),
                     queue_pair.source_queue_id,
+                    acceptor_id,
                     stream,
                     is_fin,
                     stream_clock.clone(),
@@ -200,7 +201,7 @@ fn decrypt_fast_path(
                         // Notify it like the acceptor-not-found arm does.
                         send_reset(
                             path_entry,
-                            queue_pair.source_queue_id,
+                            queue_pair,
                             binding_id,
                             error::ACCEPTOR_NOT_FOUND,
                             frame_tx,
@@ -213,7 +214,7 @@ fn decrypt_fast_path(
                         // wedges in InitSent after its QueueInit is ACKed.
                         send_reset(
                             path_entry,
-                            queue_pair.source_queue_id,
+                            queue_pair,
                             binding_id,
                             error::SERVER_BUSY,
                             frame_tx,
@@ -728,20 +729,29 @@ fn dispatch_decoded_frame(
             );
         }
         Header::QueueReset {
-            dest_queue_id,
+            queue_pair,
             binding_id,
             reset_target,
             error_code,
-            dest_acceptor_id: _,
+            init,
         } => {
             handle_queue_reset(
                 peer,
-                dest_queue_id,
+                queue_pair,
                 binding_id,
                 reset_target,
                 error_code,
+                init,
+                acceptor_registry,
+                frame_tx,
+                freed_batch_tx,
                 counters,
                 waker_sink,
+                stream_clock,
+                reader_metrics,
+                writer_metrics,
+                send_credit_pool,
+                recv_credit_pool,
             );
         }
         Header::QueueFree {
@@ -1163,7 +1173,7 @@ fn handle_queue_msg_init(
         server_view.record_freed(queue_pair.dest_queue_id, &peer.path_entry, freed_batch_tx);
         send_reset(
             &peer.path_entry,
-            queue_pair.source_queue_id,
+            queue_pair,
             binding_id,
             error::ACCEPTOR_NOT_FOUND,
             frame_tx,
@@ -1199,6 +1209,7 @@ fn handle_queue_msg_init(
                 frame_tx.clone(),
                 peer.path_entry.clone(),
                 queue_pair.source_queue_id,
+                acceptor_id,
                 stream,
                 is_fin,
                 stream_clock.clone(),
@@ -1223,7 +1234,7 @@ fn handle_queue_msg_init(
                     // ACKed QueueInit doesn't leave the writer wedged in InitSent forever.
                     send_reset(
                         &peer.path_entry,
-                        queue_pair.source_queue_id,
+                        queue_pair,
                         binding_id,
                         error::ACCEPTOR_NOT_FOUND,
                         frame_tx,
@@ -1234,7 +1245,7 @@ fn handle_queue_msg_init(
                     counters.rx_init_acceptor_no_slots.add(1);
                     send_reset(
                         &peer.path_entry,
-                        queue_pair.source_queue_id,
+                        queue_pair,
                         binding_id,
                         error::SERVER_BUSY,
                         frame_tx,
@@ -1315,7 +1326,7 @@ fn handle_queue_data_init(
         server_view.record_freed(queue_pair.dest_queue_id, &peer.path_entry, freed_batch_tx);
         send_reset(
             &peer.path_entry,
-            queue_pair.source_queue_id,
+            queue_pair,
             binding_id,
             error::ACCEPTOR_NOT_FOUND,
             frame_tx,
@@ -1361,6 +1372,7 @@ fn handle_queue_data_init(
                 frame_tx.clone(),
                 peer.path_entry.clone(),
                 queue_pair.source_queue_id,
+                acceptor_id,
                 stream,
                 peer_fin,
                 stream_clock.clone(),
@@ -1385,7 +1397,7 @@ fn handle_queue_data_init(
                     // ACKed QueueInit doesn't leave the writer wedged in InitSent forever.
                     send_reset(
                         &peer.path_entry,
-                        queue_pair.source_queue_id,
+                        queue_pair,
                         binding_id,
                         error::ACCEPTOR_NOT_FOUND,
                         frame_tx,
@@ -1396,7 +1408,7 @@ fn handle_queue_data_init(
                     counters.rx_init_acceptor_no_slots.add(1);
                     send_reset(
                         &peer.path_entry,
-                        queue_pair.source_queue_id,
+                        queue_pair,
                         binding_id,
                         error::SERVER_BUSY,
                         frame_tx,
@@ -1437,20 +1449,25 @@ fn handle_queue_data_init(
     }
 }
 
+/// Send a plain (non-init) reset in response to the frame whose routing is
+/// `incoming_pair`. The reset travels back toward the originator, so the pair is
+/// reversed: its `dest_queue_id` is the originator's slot (where the reset is
+/// delivered) and its `source_queue_id` is our slot. This is a rejection — the
+/// binding does not (and will not) exist here — so no init fields are sent.
 fn send_reset(
     path_secret_entry: &Arc<PathSecretEntry>,
-    dest_queue_id: VarInt,
+    incoming_pair: QueuePair,
     binding_id: VarInt,
     error_code: VarInt,
     frame_tx: &mut SubmissionSender,
 ) {
     let frame = Frame {
         header: Header::QueueReset {
-            dest_queue_id,
+            queue_pair: incoming_pair.reverse(),
             binding_id,
             reset_target: ResetTarget::Both,
             error_code,
-            dest_acceptor_id: None,
+            init: None,
         },
         payload: ByteVec::new(),
         path_secret_entry: path_secret_entry.clone(),
@@ -1625,15 +1642,56 @@ fn handle_queue_data_blocked(
 
 // ── QueueReset ─────────────────────────────────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 fn handle_queue_reset(
     peer: &mut recv::Context,
-    dest_queue_id: VarInt,
+    queue_pair: QueuePair,
     binding_id: VarInt,
     reset_target: ResetTarget,
     error_code: VarInt,
+    init: Option<crate::endpoint::frame::Init>,
+    acceptor_registry: &mut acceptor::LocalRegistry<Stream>,
+    frame_tx: &mut SubmissionSender,
+    freed_batch_tx: &mut crate::queue::FreedBatchTx,
     counters: &counters::Dispatch,
     waker_sink: &mut impl channel::UnboundedSender<AutoWake>,
+    stream_clock: &crate::time::DefaultClock,
+    reader_metrics: &Arc<crate::stream::metrics::ReaderMetrics>,
+    writer_metrics: &Arc<crate::stream::metrics::WriterMetrics>,
+    send_credit_pool: &crate::sync::Arc<crate::credit::Pool>,
+    recv_credit_pool: &crate::sync::Arc<crate::credit::Pool>,
 ) {
+    let dest_queue_id = queue_pair.dest_queue_id;
+
+    // An init reset (one carrying the acceptor id + priority, alongside the
+    // sender's queue id in `queue_pair`) can arrive before the QueueInit that
+    // would bind the slot — e.g. a client drops its reader before its first
+    // write is confirmed, emitting STOP_SENDING. Without binding here the reset
+    // would hit an unallocated slot and be silently discarded (`send_control` →
+    // `Unallocated`), wedging the peer writer until the idle timeout. Establish
+    // the binding from the reset itself — exactly as `handle_queue_data_init`
+    // does for a data frame, with the same {acceptor_id, priority} — so a server
+    // stream exists to deliver the reset to. Idempotent: if the init already
+    // bound the slot this is a no-op `Bound` result and delivery below proceeds.
+    if let Some(init) = init {
+        bind_for_reset(
+            peer,
+            queue_pair,
+            binding_id,
+            init,
+            acceptor_registry,
+            frame_tx,
+            freed_batch_tx,
+            counters,
+            waker_sink,
+            stream_clock,
+            reader_metrics,
+            writer_metrics,
+            send_credit_pool,
+            recv_credit_pool,
+        );
+    }
+
     match reset_target {
         ResetTarget::Both => {
             counters.rx_reset_both.add(1);
@@ -1688,6 +1746,166 @@ fn handle_queue_reset(
                 queue_id = dest_queue_id.as_u64(),
                 error_code = error_code.as_u64(),
                 "QueueReset(Control) dispatched"
+            );
+        }
+    }
+}
+
+/// Establish a server binding from an init reset, mirroring the `NewBinding`
+/// arm of [`handle_queue_data_init`] but without any data entry.
+///
+/// A reset that races ahead of its QueueInit must still be able to create the
+/// server stream so the eventual writer observes it. This binds the slot
+/// (creating the stream/control receivers), builds the server `Reader`/`Writer`
+/// pair, and hands the stream to the acceptor — after which the reset delivery
+/// in [`handle_queue_reset`] pushes the actual reset entry into the now-bound
+/// slot. If the slot is already bound (the init won the race) this is a no-op.
+#[allow(clippy::too_many_arguments)]
+fn bind_for_reset(
+    peer: &mut recv::Context,
+    queue_pair: QueuePair,
+    binding_id: VarInt,
+    init: crate::endpoint::frame::Init,
+    acceptor_registry: &mut acceptor::LocalRegistry<Stream>,
+    frame_tx: &mut SubmissionSender,
+    freed_batch_tx: &mut crate::queue::FreedBatchTx,
+    counters: &counters::Dispatch,
+    waker_sink: &mut impl channel::UnboundedSender<AutoWake>,
+    stream_clock: &crate::time::DefaultClock,
+    reader_metrics: &Arc<crate::stream::metrics::ReaderMetrics>,
+    writer_metrics: &Arc<crate::stream::metrics::WriterMetrics>,
+    send_credit_pool: &crate::sync::Arc<crate::credit::Pool>,
+    recv_credit_pool: &crate::sync::Arc<crate::credit::Pool>,
+) {
+    let dest_queue_id = queue_pair.dest_queue_id;
+    let source_queue_id = queue_pair.source_queue_id;
+    let crate::endpoint::frame::Init {
+        dest_acceptor_id: acceptor_id,
+        priority,
+    } = init;
+
+    let Some(server_view) = peer.queue_view.as_server_mut() else {
+        error!(
+            binding_id = binding_id.as_u64(),
+            queue_id = dest_queue_id.as_u64(),
+            "init reset received on client context - not binding"
+        );
+        return;
+    };
+
+    let Some(acceptor_sender) = acceptor_registry.get(acceptor_id) else {
+        counters.rx_init_no_acceptor.add(1);
+        debug!(
+            binding_id = binding_id.as_u64(),
+            acceptor_id = acceptor_id.as_u64(),
+            "init reset rejected - acceptor not found, sending reset"
+        );
+        server_view.record_freed(dest_queue_id, &peer.path_entry, freed_batch_tx);
+        send_reset(
+            &peer.path_entry,
+            queue_pair,
+            binding_id,
+            error::ACCEPTOR_NOT_FOUND,
+            frame_tx,
+        );
+        return;
+    };
+
+    match server_view.bind_for_msg(dest_queue_id, binding_id, &peer.path_entry, freed_batch_tx) {
+        Ok(crate::queue::BindResult::NewBinding {
+            waker,
+            stream,
+            control,
+            release_bytes,
+        }) => {
+            // Use the priority the peer stamped on the init reset, identical to
+            // what a racing data/msg init would carry, so the bound stream lands
+            // on the same credit tier regardless of which init frame wins.
+            let writer = Writer::new_server(
+                frame_tx.clone(),
+                peer.path_entry.clone(),
+                source_queue_id,
+                acceptor_id,
+                control,
+                stream_clock.clone(),
+                writer_metrics.clone(),
+                send_credit_pool.clone(),
+                priority,
+            );
+            // No data arrived with the reset, so the reader has not observed a
+            // peer FIN: `peer_fin_received = false`.
+            let reader = Reader::new_server(
+                frame_tx.clone(),
+                peer.path_entry.clone(),
+                source_queue_id,
+                acceptor_id,
+                stream,
+                false,
+                stream_clock.clone(),
+                reader_metrics.clone(),
+                recv_credit_pool.clone(),
+                priority,
+            );
+            let new_stream = Stream::new(reader, writer);
+
+            match acceptor_sender.send(new_stream) {
+                Ok((mut evicted, acceptor_waker)) => {
+                    if let Some(ref mut ev) = evicted {
+                        ev.reset(crate::stream::endpoint::Error::ServerBusy);
+                    }
+                    counters.queue_accepted.add(1);
+                    let _ = waker_sink.send(AutoWake::new(acceptor_waker));
+                }
+                Err(acceptor::channel::SendError::Closed(mut stream)) => {
+                    stream.disable();
+                    counters.rx_init_acceptor_closed.add(1);
+                    send_reset(
+                        &peer.path_entry,
+                        queue_pair,
+                        binding_id,
+                        error::ACCEPTOR_NOT_FOUND,
+                        frame_tx,
+                    );
+                }
+                Err(acceptor::channel::SendError::NoSlots(mut stream)) => {
+                    stream.disable();
+                    counters.rx_init_acceptor_no_slots.add(1);
+                    send_reset(
+                        &peer.path_entry,
+                        queue_pair,
+                        binding_id,
+                        error::SERVER_BUSY,
+                        frame_tx,
+                    );
+                }
+            }
+
+            let _ = waker_sink.send(waker);
+            recv_credit_pool.release(release_bytes);
+
+            debug!(
+                binding_id = binding_id.as_u64(),
+                queue_id = dest_queue_id.as_u64(),
+                acceptor_id = acceptor_id.as_u64(),
+                "init reset - new binding created"
+            );
+        }
+        Ok(crate::queue::BindResult::Bound { waker, release_bytes }) => {
+            // The init already bound the slot; nothing to create. Reset delivery
+            // proceeds against the existing binding.
+            let _ = waker_sink.send(waker);
+            recv_credit_pool.release(release_bytes);
+            trace!(
+                binding_id = binding_id.as_u64(),
+                queue_id = dest_queue_id.as_u64(),
+                "init reset - slot already bound"
+            );
+        }
+        Err(_) => {
+            debug!(
+                binding_id = binding_id.as_u64(),
+                queue_id = dest_queue_id.as_u64(),
+                "init reset bind failed - dropping"
             );
         }
     }

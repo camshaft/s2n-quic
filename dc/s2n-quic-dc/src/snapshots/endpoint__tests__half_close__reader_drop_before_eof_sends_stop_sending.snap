@@ -1,6 +1,5 @@
 ---
 source: dc/s2n-quic-dc/src/testing.rs
-assertion_line: 352
 expression: logs
 ---
 0:00:00.000000000 [server] DEBUG s2n_quic_dc: capacity=50000
@@ -11126,6 +11125,7 @@ expression: logs
 0:00:00.001021000 [client] TRACE m#task.completion.drained[send.worker.2]=1
 0:00:00.001021000 [client] TRACE m#task.recycle_drain.drained=0
 0:00:00.001021000 [client] TRACE m#task.recv_idle_wheel.drained[recv.dispatch.1]=0
+0:00:00.001021000 [client] DEBUG event=on_received prev=Init next=Open location=dc/s2n-quic-dc/src/stream/reader.rs
 0:00:00.001021000 [client] DEBUG Reader dropping binding_id=1 status=Open final_size=None consumed_len=1024 total_received_len=1024 is_writing_complete=false is_reading_complete=false
 0:00:00.001021000 [client] DEBUG Sent QueueReset binding_id=1 error_code=4 reset_target=Control
 0:00:00.001021000 [client] DEBUG Reader dropped before FIN received - sent STOP_SENDING binding_id=1
@@ -11519,7 +11519,7 @@ expression: logs
 0:00:00.001041000 [client] TRACE c#send.pending.drain[send.0]=1
 0:00:00.001041000 [client] TRACE g#send.pending.depth[send.0]=0
 0:00:00.001041000 [client] TRACE c#tx.frame[queue_reset]=1
-0:00:00.001041000 [client] TRACE m#tx.packet_size=46
+0:00:00.001041000 [client] TRACE m#tx.packet_size=47
 0:00:00.001041000 [client] TRACE m#tx.frames_per_packet=1
 0:00:00.001041000 [client] TRACE m#tx.payload_size=0
 0:00:00.001041000 [client] TRACE c#tx.data=1
@@ -11533,7 +11533,7 @@ expression: logs
 0:00:00.001041000 [client] TRACE g#q.resolver_to_pto_wheel.depth[send.worker.0]=1
 0:00:00.001041000 [client] TRACE m#q.resolver_to_pto_wheel.depth_dist[send.worker.0]=1
 0:00:00.001041000 [client] TRACE c#socket.tx.ops[send.0]=1
-0:00:00.001041000 [client] TRACE c#socket.tx.bytes[send.0]=46
+0:00:00.001041000 [client] TRACE c#socket.tx.bytes[send.0]=47
 0:00:00.001041000 [client] TRACE m#task.assembler.drained[send.0]=1
 0:00:00.001041000 [client] TRACE m#task.tx_wheel.drained[send.worker.0]=0
 0:00:00.001041000 [client] TRACE m#task.pto_wheel.drained[send.worker.0]=1
@@ -16837,7 +16837,7 @@ expression: logs
 0:00:00.001539000 [server] TRACE c#credit.send.distributor.passes=1
 0:00:00.001539000 [server] TRACE c#credit.send.distributor.passes=1
 0:00:00.001541000 [server] TRACE c#socket.rx.ops[recv.0]=1
-0:00:00.001541000 [server] TRACE c#socket.rx.bytes[recv.0]=46
+0:00:00.001541000 [server] TRACE c#socket.rx.bytes[recv.0]=47
 0:00:00.001541000 [server] TRACE c#router.routed=1
 0:00:00.001541000 [server] TRACE c#router.routed[recv.0]=1
 0:00:00.001541000 [server] TRACE c#q.dispatch_rx.enq[recv.0]=1

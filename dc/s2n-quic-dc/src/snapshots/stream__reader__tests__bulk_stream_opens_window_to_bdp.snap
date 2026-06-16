@@ -5,6 +5,7 @@ expression: logs
 0:00:00.000000000 [main] DEBUG distributor created
 0:00:00.000000000 [main] TRACE c#credit.release.bytes=8192
 0:00:00.000000000 [main] TRACE c#credit.release.calls=1
+0:00:00.000000000 [main] DEBUG event=on_received prev=Init next=Open location=dc/s2n-quic-dc/src/stream/reader.rs
 0:00:00.000000000 [main] TRACE c#credit.acquire.fast_path=1
 0:00:00.000000000 [main] TRACE c#credit.acquire.bytes=8388608
 0:00:00.000000000 [main] TRACE c#credit.acquire.fast_path=1

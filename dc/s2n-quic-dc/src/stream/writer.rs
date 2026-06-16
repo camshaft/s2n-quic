@@ -1061,13 +1061,22 @@ impl Inner {
         error_code: VarInt,
         reset_target: ResetTarget,
     ) -> io::Result<()> {
+        // Before confirmation the binding may not exist on the peer yet, so an
+        // init reset carries what dispatch needs to establish it — the acceptor
+        // id and credit priority — the same fields a data/msg init carries.
+        // (Our own queue id always rides in `queue_pair`.) After confirmation it
+        // is a plain reset.
+        let init = self.dest_acceptor_id().map(|dest_acceptor_id| frame::Init {
+            dest_acceptor_id,
+            priority: self.priority,
+        });
         let frame = Frame {
             header: Header::QueueReset {
-                dest_queue_id: self.dest_queue_id,
+                queue_pair: self.queue_pair(),
                 binding_id: self.control_rx.binding_id(),
                 reset_target,
                 error_code,
-                dest_acceptor_id: self.dest_acceptor_id(),
+                init,
             },
             payload: ByteVec::new(),
             path_secret_entry: self.path_secret_entry.clone(),

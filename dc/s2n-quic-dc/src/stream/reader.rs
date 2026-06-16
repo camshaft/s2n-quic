@@ -373,6 +373,18 @@ struct Inner {
     stream_rx: crate::queue::StreamReceiver,
     /// The peer's queue slot index (for sending MAX_DATA / Reset back)
     dest_queue_id: VarInt,
+    /// Acceptor id this stream belongs to.
+    ///
+    /// Stamped onto a reset emitted while still in `Status::Init`: a client
+    /// reader can be dropped before the server has bound the queue slot (the
+    /// binding only exists once the server processes the QueueInit), and the
+    /// STOP_SENDING it emits would then arrive at an unbound slot and be silently
+    /// discarded. Carrying the acceptor id lets dispatch establish the binding
+    /// from the reset itself — the same way an init data frame does — so the
+    /// eventual server writer still observes the reset. Server readers carry it
+    /// too (they are constructed already-bound) but never emit it, since they
+    /// start in `Status::Open`.
+    acceptor_id: VarInt,
     /// Path secret entry providing MTU and crypto material
     path_secret_entry: Arc<PathSecretEntry>,
     /// Reassembly buffer for out-of-order data
@@ -461,6 +473,14 @@ struct Inner {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum Status {
+    /// Client-only bootstrap state: the stream has been opened locally but no
+    /// packet has been received from the peer yet, so the server binding is not
+    /// known to exist. Mirrors the writer's `Init` state. In this state the
+    /// reader does not advertise a window (no MAX_DATA), and any reset it emits
+    /// carries `dest_acceptor_id` so a reset that races ahead of the binding can
+    /// still establish it on the server. The first received packet transitions
+    /// to `Open`. Server readers are created already-bound and start at `Open`.
+    Init,
     /// Flow is open for reads
     #[default]
     Open,
@@ -471,13 +491,15 @@ enum Status {
 }
 
 impl Status {
+    is!(is_init, Init);
     is!(is_open, Open);
     is!(is_reset, Reset);
     is!(is_complete, Complete);
     is!(is_terminal, Reset | Complete);
 
     event! {
-        on_reset(Open => Reset);
+        on_received(Init => Open);
+        on_reset(Init | Open => Reset);
         on_complete(Open => Complete);
     }
 }
@@ -487,6 +509,7 @@ impl Reader {
         frame_tx: SubmissionSender,
         path_secret_entry: Arc<PathSecretEntry>,
         dest_queue_id: VarInt,
+        acceptor_id: VarInt,
         stream_rx: crate::queue::StreamReceiver,
         clock: crate::time::DefaultClock,
         metrics: Arc<ReaderMetrics>,
@@ -507,6 +530,7 @@ impl Reader {
             completion_rx: frame::failure_completion_channel(),
             stream_rx,
             dest_queue_id,
+            acceptor_id,
             path_secret_entry,
             reassembler: Reassembler::new(),
             remote_max_data,
@@ -521,7 +545,10 @@ impl Reader {
             recv_credit_pool,
             priority,
             send_flow_update_after_fin: false,
-            status: Status::Open,
+            // A client reader has not heard from the server yet; the binding may
+            // not exist. Start in `Init` so a pre-binding reset carries the
+            // acceptor id and no MAX_DATA is advertised until a packet arrives.
+            status: Status::Init,
             reset_error_code: None,
             #[cfg(debug_assertions)]
             eof_counter: 0,
@@ -536,6 +563,7 @@ impl Reader {
         frame_tx: SubmissionSender,
         path_secret_entry: Arc<PathSecretEntry>,
         dest_queue_id: VarInt,
+        acceptor_id: VarInt,
         stream_rx: crate::queue::StreamReceiver,
         peer_fin_received: bool,
         clock: crate::time::DefaultClock,
@@ -557,6 +585,7 @@ impl Reader {
             completion_rx: frame::failure_completion_channel(),
             stream_rx,
             dest_queue_id,
+            acceptor_id,
             path_secret_entry,
             reassembler: Reassembler::new(),
             // Server starts at zero advertised window; its first consumption forces the MAX_DATA
@@ -573,6 +602,7 @@ impl Reader {
             recv_credit_pool,
             priority,
             send_flow_update_after_fin: !peer_fin_received,
+            // Already bound: the server reader is open for reads immediately.
             status: Status::Open,
             reset_error_code: None,
             #[cfg(debug_assertions)]
@@ -995,6 +1025,13 @@ impl Inner {
                 self.pending_rx = queue;
                 return Poll::Ready(Ok(()));
             }
+            // Any frame from the peer proves the server has bound the slot (it
+            // could not have produced this otherwise), so leave `Init`. After
+            // this the reader advertises its window and stops stamping the
+            // acceptor id on resets, mirroring the writer's InitSent → Open
+            // transition. Idempotent once `Open`.
+            self.status.on_received().ok();
+
             match entry.into_inner() {
                 msg::Stream::Data {
                     offset,
@@ -1260,6 +1297,16 @@ impl Inner {
         cx: &mut Context,
         slot: NonNull<crate::credit::Slot>,
     ) -> io::Result<()> {
+        // While still in `Init` (client reader that has not heard from the
+        // server) the binding is not known to exist, so advertising a window to
+        // it is premature — a MAX_DATA would race the binding exactly as a reset
+        // can. The first received packet flips us to `Open`; only then do we
+        // start extending the window. Server readers begin `Open` and are
+        // unaffected.
+        if self.status.is_init() {
+            return Ok(());
+        }
+
         // Drain any grant the distributor delivered while we were away. This
         // also tells us whether the slot is still parked from a prior poll —
         // in which case we MUST NOT issue a fresh acquire (the slot's
@@ -1562,6 +1609,27 @@ impl Inner {
         Ok(())
     }
 
+    /// Init fields to stamp on an outgoing reset, or `None` for a plain reset.
+    ///
+    /// While the reader is still in `Init` (a client reader that has not yet
+    /// heard from the server) the binding may not exist yet, so the reset
+    /// carries what dispatch needs to establish it — the acceptor id and the
+    /// credit priority — mirroring `Writer::dest_acceptor_id`. (The sender's own
+    /// queue id always rides in the reset's `queue_pair`, init or not.) Once a
+    /// packet has arrived (`Open`) the binding is confirmed and no init fields
+    /// are sent. Server readers begin `Open`, so they never emit them.
+    #[inline]
+    fn reset_init(&self) -> Option<frame::Init> {
+        if self.status.is_init() {
+            Some(frame::Init {
+                dest_acceptor_id: self.acceptor_id,
+                priority: self.priority,
+            })
+        } else {
+            None
+        }
+    }
+
     fn send_reset_frame(
         &mut self,
         error_code: VarInt,
@@ -1569,11 +1637,14 @@ impl Inner {
     ) -> io::Result<()> {
         let frame = Frame {
             header: Header::QueueReset {
-                dest_queue_id: self.dest_queue_id,
+                queue_pair: QueuePair {
+                    source_queue_id: self.stream_rx.queue_id(),
+                    dest_queue_id: self.dest_queue_id,
+                },
                 binding_id: self.stream_rx.binding_id(),
                 reset_target,
                 error_code,
-                dest_acceptor_id: None,
+                init: self.reset_init(),
             },
             payload: ByteVec::new(),
             path_secret_entry: self.path_secret_entry.clone(),

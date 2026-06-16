@@ -708,6 +708,7 @@ where
         frame_tx,
         path_secret_entry,
         alloc.dest_queue_id,
+        acceptor_id,
         alloc.stream,
         endpoint.clock.clone(),
         endpoint.reader_metrics.clone(),
