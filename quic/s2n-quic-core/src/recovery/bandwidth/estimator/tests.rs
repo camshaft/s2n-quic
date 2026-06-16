@@ -196,7 +196,9 @@ fn app_limited() {
         bw_estimator.app_limited_delivered_bytes
     );
 
-    // Packet is sent while not app-limited, but the app limited continues until all previous bytes in flight have been acknowledged
+    // Packet is sent while not app-limited, but the app limited period continues until all bytes
+    // in flight when it began have been acknowledged. The end-mark is NOT re-armed — it stays
+    // pinned at the first app-limited send's value.
     let packet_info = bw_estimator.on_packet_sent(500, 100, Some(false), first_sent_time);
     assert!(packet_info.is_app_limited);
     assert_eq!(
@@ -204,11 +206,14 @@ fn app_limited() {
         bw_estimator.app_limited_delivered_bytes
     );
 
-    // Packet is sent while app-limited is not determined, this should default to app-limited
+    // Packet is sent while app-limited is not determined, which defaults to app-limited. The
+    // end-mark still does not move: re-arming on every send is exactly the bug that prevents the
+    // period from ever closing under sustained app-limited sends (see
+    // `app_limited_period_closes_under_sustained_app_limited_sends`).
     let packet_info = bw_estimator.on_packet_sent(2500, 100, None, first_sent_time);
     assert!(packet_info.is_app_limited);
     assert_eq!(
-        Some(2500 + 15000 + 100),
+        Some(1500 + 15000 + 100),
         bw_estimator.app_limited_delivered_bytes
     );
 
@@ -222,21 +227,22 @@ fn app_limited() {
         is_app_limited: false,
     };
 
-    // Acknowledge all the bytes that were inflight when the app-limited period began
+    // Acknowledge enough bytes to bring delivered (15000) just up to — but not past — the pinned
+    // end-mark of 16600. The period must still be open (clears only when delivered EXCEEDS it).
     bw_estimator.on_ack(
-        2600,
+        1600,
         delivered_time,
         packet_info,
         delivered_time,
         &mut publisher,
     );
-    // Still app_limited, since we need bytes to be acknowledged after the app limited period
+    assert_eq!(15000 + 1600, bw_estimator.delivered_bytes);
     assert_eq!(
-        Some(2500 + 100 + 15000),
+        Some(1500 + 15000 + 100),
         bw_estimator.app_limited_delivered_bytes
     );
 
-    // Acknowledge one more byte
+    // Acknowledge one more byte, crossing the mark.
     bw_estimator.on_ack(
         1,
         delivered_time,
@@ -244,8 +250,119 @@ fn app_limited() {
         delivered_time,
         &mut publisher,
     );
-    // Now the app limited period is over
+    // Now the app limited period is over.
     assert_eq!(None, bw_estimator.app_limited_delivered_bytes);
+}
+
+//= type=test
+// Reproduction for the application-limited latch behind s2n-quic-dc's "stuck in Startup forever"
+// / unbounded `send.app_limited` bug.
+//
+// `on_app_limited` re-arms the end-mark to `delivered_bytes + bytes_in_flight` on EVERY
+// app-limited send. The mark therefore always sits one full flight ahead of `delivered_bytes`.
+// `on_ack` only clears the app-limited period once `delivered_bytes` exceeds the mark. A sender
+// that keeps being flagged app-limited before it delivers past the previous mark — exactly the
+// regime a per-context BBR controller sees behind dc's global pacer and pick-two spray — pushes
+// the mark forward on every send, so cumulative delivered can never overtake it and the
+// app-limited period NEVER closes. While it stays open, BBR's full-pipe estimator skips every
+// round and the controller never leaves Startup.
+//
+// This test drives that regime: each iteration delivers the previous send's bytes (advancing
+// `delivered`) and then sends one more small packet while app-limited. The observable is whether
+// the app-limited period EVER closes between sends across the whole run. On HEAD the
+// perpetually-re-armed mark stays ahead of `delivered` on every ack, so the period never closes
+// once — the assertion FAILS. With the idempotent-arm fix the mark is pinned to the first send,
+// so the period closes as soon as that bubble drains (and a later send opens a fresh one).
+#[test]
+fn app_limited_period_closes_under_sustained_app_limited_sends() {
+    // The assertion is on the app-limited period state, not on emitted events, and the run emits
+    // one delivery-rate sample per ack — capture none of that incidental output.
+    let mut publisher = event::testing::Publisher::no_snapshot();
+    let mut publisher = PathPublisher::new(&mut publisher, path::Id::test_id());
+    let t0 = NoopClock.get_time();
+
+    // Start with a packet in flight so the estimator is initialized, then enter an app-limited
+    // period: one small packet sent with no more app data, the canonical start of the bubble.
+    let mut bw_estimator = Estimator::default();
+    let _ = bw_estimator.on_packet_sent(0, 1000, Some(false), t0);
+    let first_packet = bw_estimator.on_packet_sent(1000, 1000, Some(true), t0);
+    assert!(
+        bw_estimator.is_app_limited(),
+        "app-limited period should have started"
+    );
+
+    // Steady spray pattern: deliver the previous send's bytes (advancing `delivered`), checking
+    // after each ack whether the period has closed, then immediately send another app-limited
+    // packet. On HEAD that send re-arms the mark one flight ahead, so the post-ack check never
+    // observes a closed period.
+    let mut now = t0;
+    let mut ever_closed = false;
+    for _ in 0..32 {
+        now += Duration::from_millis(10);
+        // Acknowledge the previous packet's bytes — delivered advances.
+        bw_estimator.on_ack(1000, now, first_packet, now, &mut publisher);
+        if !bw_estimator.is_app_limited() {
+            ever_closed = true;
+        }
+        // Send another packet while still app-limited. On HEAD this re-arms the end-mark to
+        // delivered + bytes_in_flight, one flight ahead of where we just delivered.
+        let _ = bw_estimator.on_packet_sent(1000, 1000, Some(true), now);
+    }
+
+    // We delivered 32_000 bytes — far past the first bubble's ~2_000-byte mark. A correct
+    // estimator closes the app-limited period the moment that first bubble drains. On HEAD the
+    // perpetually-re-armed mark keeps `delivered` permanently behind it, so the period never
+    // closes across the entire run.
+    assert!(
+        ever_closed,
+        "app-limited period never closed across 32 sends delivering {} bytes — the end-mark is \
+         re-armed on every send and can never be overtaken (the dc Startup latch)",
+        bw_estimator.delivered_bytes
+    );
+}
+
+//= type=test
+// Companion to `app_limited_period_closes_under_sustained_app_limited_sends`: the
+// idempotent-arm fix must still classify a GENUINELY app-limited sender correctly. Pinning the
+// end-mark to the first send must not close the period early — it stays open across a real idle
+// gap until the bytes that were in flight when it began are actually acknowledged, which is the
+// behavior BBR relies on to discard under-filled delivery samples.
+#[test]
+fn genuine_idle_keeps_app_limited_until_inflight_drains() {
+    let mut publisher = event::testing::Publisher::no_snapshot();
+    let mut publisher = PathPublisher::new(&mut publisher, path::Id::test_id());
+    let t0 = NoopClock.get_time();
+
+    // Put 5000 bytes in flight, then go application-limited with one more small send and no
+    // further data. The end-mark is delivered(0) + bytes_in_flight(5000 + 500) = 5500.
+    let mut bw_estimator = Estimator::default();
+    let _ = bw_estimator.on_packet_sent(0, 5000, Some(false), t0);
+    let in_flight = bw_estimator.on_packet_sent(5000, 500, Some(true), t0);
+    assert!(bw_estimator.is_app_limited());
+    assert_eq!(Some(5500), bw_estimator.app_limited_delivered_bytes);
+
+    // A long idle gap with no sends. Acknowledge the in-flight bytes in pieces; the period must
+    // remain open until delivered exceeds the mark — and any sample taken meanwhile is flagged
+    // app-limited so BBR discards it.
+    let mut now = t0;
+    now += Duration::from_secs(1);
+    bw_estimator.on_ack(5000, now, in_flight, now, &mut publisher);
+    assert!(
+        bw_estimator.is_app_limited(),
+        "period must stay open while in-flight bytes are still draining"
+    );
+    assert!(
+        bw_estimator.rate_sample().is_app_limited,
+        "samples during the app-limited period must be flagged so BBR discards them"
+    );
+
+    // Cross the mark: now the genuinely-idle period correctly ends.
+    now += Duration::from_secs(1);
+    bw_estimator.on_ack(600, now, in_flight, now, &mut publisher);
+    assert!(
+        !bw_estimator.is_app_limited(),
+        "period should end once the bytes in flight when it began are acknowledged"
+    );
 }
 
 #[test]
