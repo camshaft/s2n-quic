@@ -18,6 +18,10 @@
 //! The whole facility is gated behind [`super::dbg::ENABLED`]: in plain release builds [`record`]
 //! and [`trigger`] fold to nothing and no ring is ever allocated. It is active under `test`, the
 //! `testing` feature, or the `queue-dbg` feature — the same builds that already speak `QueueDbg`.
+//!
+//! Environment overrides (read once at first use): `S2N_DC_FRAME_TRACE_PATH` (base dump path),
+//! `S2N_DC_FRAME_TRACE_BYTES` (ring capacity), and `S2N_DC_FRAME_TRACE_THROTTLE_MS` (minimum
+//! interval between dumps; back-to-back triggers within it are dropped to cap disk churn).
 
 use super::frame::Header;
 use crate::sync::BumpRing;
@@ -46,6 +50,11 @@ const DEFAULT_CAPACITY: usize = 16 << 20;
 /// Sentinel stored in [`FrameRecord::packet_number`] when a frame has no packet number yet.
 const NO_PACKET_NUMBER: u64 = u64::MAX;
 
+/// The endpoint bit in byte 0 of a `credentials::Id` (mirrors the private `Id::ENDPOINT_BIT`). It
+/// flips between the server and client view of the same id, so it is masked off before storing the
+/// id in a record — see [`build`].
+const CRED_ENDPOINT_BIT: u8 = 0x80;
+
 /// Where a frame was observed. Stored in [`FrameRecord::direction`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
@@ -66,8 +75,9 @@ pub(crate) enum Direction {
 
 /// A compact, fixed-size record of one observed frame.
 ///
-/// Field order places the 8-byte fields first so the struct is naturally aligned with no implicit
-/// padding — a requirement for the `zerocopy::IntoBytes` derive. Total size is 64 bytes.
+/// Field order places the 8-byte fields first, then the 16-byte (1-aligned) credential id, then the
+/// `u32`/`u8` tail — so the struct is naturally aligned with no implicit padding (a requirement for
+/// the `zerocopy::IntoBytes` derive). Total size is 80 bytes.
 #[repr(C)]
 #[derive(
     Clone,
@@ -90,6 +100,11 @@ pub struct FrameRecord {
     pub source_queue_id: u64,
     pub dest_queue_id: u64,
     pub binding_id: u64,
+    /// The 16-byte credential id (`credentials::Id`) of the path this frame belongs to, big-endian
+    /// as on the wire. This is the join key against the existing QueueDbg / dispatch log lines,
+    /// which all print `credentials=0x…`; it also disambiguates streams that reuse a `queue_id`
+    /// across different sessions. Zero when no credential is in scope (e.g. [`Header::Ping`] paths).
+    pub cred_id: [u8; 16],
     /// Global monotonic sequence number — definitive ordering across all directions.
     pub seq: u32,
     /// Always [`RECORD_MAGIC`]; a secondary torn-record guard for the parser.
@@ -137,7 +152,8 @@ pub fn header_kind(header: &Header) -> u8 {
     }
 }
 
-/// Builds a [`FrameRecord`] from a frame header. `pn` is the packet number if known.
+/// Builds a [`FrameRecord`] from a frame header. `pn` is the packet number if known; `cred_id` is
+/// the 16-byte credential id of the path (all zeros when none is in scope).
 ///
 /// `seq` and `timestamp_nanos` are stamped by the caller from the global recorder state.
 fn build(
@@ -146,7 +162,13 @@ fn build(
     dir: Direction,
     header: &Header,
     pn: Option<VarInt>,
+    mut cred_id: [u8; 16],
 ) -> FrameRecord {
+    // Canonicalize the credential id by masking off the endpoint bit (MSB of byte 0). That bit
+    // encodes which side a `credentials::Id` is viewed from — the server and client hold the same
+    // logical id with this bit flipped (see `Id::for_endpoint`/`for_peer`). Clearing it makes a
+    // record from either endpoint share one id, so a single grep correlates both ends of a stream.
+    cred_id[0] &= !CRED_ENDPOINT_BIT;
     let mut rec = FrameRecord {
         timestamp_nanos,
         packet_number: pn.map_or(NO_PACKET_NUMBER, |p| p.as_u64()),
@@ -155,6 +177,7 @@ fn build(
         source_queue_id: 0,
         dest_queue_id: 0,
         binding_id: 0,
+        cred_id,
         seq,
         magic: RECORD_MAGIC,
         direction: dir as u8,
@@ -295,13 +318,21 @@ fn build(
 
 /// Records one observed frame into the global ring. A no-op (folded away) when the diagnostic is
 /// disabled.
+///
+/// `cred_id` is the credential id of the path the frame belongs to — the join key against the
+/// QueueDbg / dispatch logs. Pass [`crate::credentials::Id`] (it derefs to `[u8; 16]`).
 #[inline]
-pub(crate) fn record(dir: Direction, header: &Header, pn: Option<VarInt>) {
+pub(crate) fn record(
+    dir: Direction,
+    header: &Header,
+    pn: Option<VarInt>,
+    cred_id: crate::credentials::Id,
+) {
     super::dbg::on_enabled(|| {
         let st = state();
         let seq = st.seq.fetch_add(1, Ordering::Relaxed);
         let ts = st.start.elapsed().as_nanos() as u64;
-        let rec = build(seq, ts, dir, header, pn);
+        let rec = build(seq, ts, dir, header, pn, *cred_id);
         use zerocopy::IntoBytes as _;
         st.ring.push(rec.as_bytes());
     });
@@ -336,7 +367,14 @@ struct Dumper {
     requested: Mutex<bool>,
     condvar: Condvar,
     path: PathBuf,
+    /// Minimum wall-clock interval between dumps. A request arriving within this window of the last
+    /// dump is dropped, so a QueueDbg storm can't write a dump per trigger and fill the disk. The
+    /// first dump is never throttled. Configurable via `S2N_DC_FRAME_TRACE_THROTTLE_MS`.
+    throttle: std::time::Duration,
 }
+
+/// Default minimum interval between dumps (`S2N_DC_FRAME_TRACE_THROTTLE_MS`).
+const DEFAULT_THROTTLE_MS: u64 = 1000;
 
 static STATE: OnceLock<State> = OnceLock::new();
 
@@ -359,10 +397,15 @@ fn state() -> &'static State {
             .unwrap_or_else(|| {
                 std::env::temp_dir().join(format!("s2n_dc_frame_trace.{}.bin", std::process::id()))
             });
+        let throttle_ms = std::env::var("S2N_DC_FRAME_TRACE_THROTTLE_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(DEFAULT_THROTTLE_MS);
         let dumper = Arc::new(Dumper {
             requested: Mutex::new(false),
             condvar: Condvar::new(),
             path,
+            throttle: std::time::Duration::from_millis(throttle_ms),
         });
 
         spawn_dumper(ring.clone(), dumper.clone());
@@ -387,6 +430,7 @@ fn spawn_dumper(ring: Arc<BumpRing>, dumper: Arc<Dumper>) {
             // the *first* dump is the most valuable (closest to when the stream was noticed stuck),
             // so we must never clobber it. Later triggers still produce additional dumps.
             let mut seq = 0u64;
+            let mut last_dump: Option<Instant> = None;
             loop {
                 {
                     let mut requested = dumper.requested.lock().unwrap();
@@ -394,6 +438,17 @@ fn spawn_dumper(ring: Arc<BumpRing>, dumper: Arc<Dumper>) {
                         requested = dumper.condvar.wait(requested).unwrap();
                     }
                     *requested = false;
+                }
+
+                // Throttle: drop a request that arrives within `throttle` of the last completed dump
+                // (the first dump always proceeds). The ring already retains the history, so a dump
+                // this close would be near-identical; this caps disk churn under a QueueDbg storm.
+                if throttled(last_dump.map(|l| l.elapsed()), dumper.throttle) {
+                    crate::tracing::debug!(
+                        throttle_ms = dumper.throttle.as_millis() as u64,
+                        "frame trace dump throttled"
+                    );
+                    continue;
                 }
 
                 let path = numbered_path(&dumper.path, seq);
@@ -405,9 +460,17 @@ fn spawn_dumper(ring: Arc<BumpRing>, dumper: Arc<Dumper>) {
                 } else {
                     crate::tracing::info!(path = ?path, seq, head, "frame trace dumped");
                 }
+                last_dump = Some(Instant::now());
                 seq += 1;
             }
         });
+}
+
+/// Whether a dump request should be dropped. `since_last` is the time elapsed since the previous
+/// completed dump (`None` if there hasn't been one — the first dump is never throttled). A request
+/// is throttled iff a previous dump happened less than `throttle` ago.
+fn throttled(since_last: Option<std::time::Duration>, throttle: std::time::Duration) -> bool {
+    matches!(since_last, Some(elapsed) if elapsed < throttle)
 }
 
 /// Builds the per-dump filename by inserting a zero-padded sequence number before the base path's
@@ -479,15 +542,23 @@ mod tests {
 
     #[test]
     fn build_maps_queue_data_fields() {
+        // A cred id with the endpoint bit set; `build` must canonicalize it off.
+        let mut raw = [0u8; 16];
+        raw[0] = 0x80 | 0x12;
+        raw[1] = 0x34;
         let rec = build(
             42,
             1234,
             Direction::Inbound,
             &dummy_data_header(),
             Some(VarInt::from_u32(55)),
+            raw,
         );
         assert_eq!(rec.magic, RECORD_MAGIC);
         assert_eq!(rec.seq, 42);
+        // Endpoint bit cleared, rest preserved.
+        assert_eq!(rec.cred_id[0], 0x12);
+        assert_eq!(rec.cred_id[1], 0x34);
         assert_eq!(rec.timestamp_nanos, 1234);
         assert_eq!(rec.direction, Direction::Inbound as u8);
         assert_eq!(rec.frame_type, KIND_QUEUE_DATA);
@@ -501,15 +572,16 @@ mod tests {
 
     #[test]
     fn no_packet_number_uses_sentinel() {
-        let rec = build(0, 0, Direction::Outbound, &Header::Ping, None);
+        let rec = build(0, 0, Direction::Outbound, &Header::Ping, None, [0u8; 16]);
         assert_eq!(rec.packet_number, NO_PACKET_NUMBER);
         assert_eq!(rec.frame_type, KIND_PING);
     }
 
     #[test]
-    fn record_is_64_bytes_with_no_padding() {
-        // zerocopy::IntoBytes derive already enforces no padding at compile time; this pins the size.
-        assert_eq!(core::mem::size_of::<FrameRecord>(), 64);
+    fn record_size_has_no_padding() {
+        // zerocopy::IntoBytes derive already enforces no padding at compile time; this pins the
+        // size: 7×u64 (56) + [u8;16] (16) + u32 (4) + 4×u8 (4) = 80.
+        assert_eq!(core::mem::size_of::<FrameRecord>(), 80);
     }
 
     #[test]
@@ -536,7 +608,7 @@ mod tests {
             ),
         ];
         for (i, (dir, header, pn)) in headers.iter().enumerate() {
-            let rec = build(i as u32, i as u64, *dir, header, *pn);
+            let rec = build(i as u32, i as u64, *dir, header, *pn, [0u8; 16]);
             ring.push(rec.as_bytes());
         }
 
@@ -569,6 +641,15 @@ mod tests {
     fn trigger_drives_background_dump() {
         // A process-unique dump_id (masked to 32 bits, the FrameRecord field reading we assert on).
         let marker = (std::process::id() as u64) & 0x00ff_ffff | 0x0100_0000;
+        // A cred id whose first byte has the endpoint bit set, so we can also assert canonicalization.
+        let mut cred = crate::credentials::Id::from([0u8; 16]);
+        cred[0] = CRED_ENDPOINT_BIT | 0x2a;
+        cred[1] = (marker & 0xff) as u8;
+        let want_cred = {
+            let mut c = *cred;
+            c[0] &= !CRED_ENDPOINT_BIT;
+            c
+        };
 
         // Record a couple of frames then trigger, just as the QueueDbg handler does. The QueueDbg's
         // dump_id is our unique marker so we can recognize *our* dump among any others.
@@ -576,6 +657,7 @@ mod tests {
             Direction::Outbound,
             &dummy_data_header(),
             Some(VarInt::from_u32(11)),
+            cred,
         );
         record(
             Direction::Inbound,
@@ -588,6 +670,7 @@ mod tests {
                 binding_id: VarInt::from_u32(4),
             },
             None,
+            cred,
         );
         let base = dump_path();
         trigger();
@@ -619,7 +702,13 @@ mod tests {
         // tests push to the same global ring concurrently, so our records can be interleaved with
         // theirs and need not be at any fixed position — search by content, not index.
         let mut found = None;
-        'poll: for _ in 0..300 {
+        'poll: for i in 0..300 {
+            // The dumper throttles back-to-back dumps, so our first `trigger()` may have been
+            // dropped if another test dumped moments earlier. Re-trigger periodically (the poll
+            // window far exceeds the default throttle) so a request eventually lands.
+            if i > 0 && i % 50 == 0 {
+                trigger();
+            }
             // Walk seq downward from a generous bound so we prefer the most recent dump.
             for seq in (0..64u64).rev() {
                 let path = numbered_path(&base, seq);
@@ -643,9 +732,10 @@ mod tests {
         // QueueData we recorded (unique pn=11 + source_queue_id=7 from `dummy_data_header`) must
         // also have made it into the same ring.
         assert!(
-            recs.iter()
-                .any(|r| r.frame_type == KIND_QUEUE_DBG && r.dump_id == marker),
-            "marked QueueDbg present"
+            recs.iter().any(|r| r.frame_type == KIND_QUEUE_DBG
+                && r.dump_id == marker
+                && r.cred_id == want_cred),
+            "marked QueueDbg present with canonicalized cred id"
         );
         assert!(
             recs.iter().any(|r| r.frame_type == KIND_QUEUE_DATA
@@ -653,6 +743,22 @@ mod tests {
                 && r.source_queue_id == 7),
             "recorded QueueData present"
         );
+    }
+
+    #[test]
+    fn throttle_drops_only_within_window() {
+        use std::time::Duration;
+        let throttle = Duration::from_millis(1000);
+        // First dump (no previous) is never throttled.
+        assert!(!throttled(None, throttle));
+        // A dump that just happened throttles the next request.
+        assert!(throttled(Some(Duration::from_millis(10)), throttle));
+        assert!(throttled(Some(Duration::from_millis(999)), throttle));
+        // Past the window, the request proceeds.
+        assert!(!throttled(Some(Duration::from_millis(1000)), throttle));
+        assert!(!throttled(Some(Duration::from_millis(5000)), throttle));
+        // A zero throttle never drops anything.
+        assert!(!throttled(Some(Duration::ZERO), Duration::ZERO));
     }
 
     #[test]
@@ -680,6 +786,7 @@ mod tests {
             Direction::Inbound,
             &dummy_data_header(),
             Some(VarInt::from_u32(9)),
+            [0u8; 16],
         );
         ring.push(rec.as_bytes());
 
