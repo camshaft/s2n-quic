@@ -876,12 +876,11 @@ impl Context {
         // tx-scheduled.
         let immediate = needs_urgent && !self.is_immediate_scheduled();
 
-        let transmission = if
         // Only insert into the tx_wheel when the context is neither already
         // waiting in the wheel nor already queued for assembly. Both links must
         // be clear: an intrusive node can live in only one list at a time, and a
         // double-insert would trip the list's unlinked assertion / corrupt it.
-        !self.is_tx_scheduled()
+        let transmission = if !self.is_tx_scheduled()
             && !self.is_queued_for_assembly()
             && self.has_pending_data()
             && self.can_send_pending_frames()
