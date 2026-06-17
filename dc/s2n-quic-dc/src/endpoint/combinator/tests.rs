@@ -391,14 +391,22 @@ fn sender_error_returns_value() {
 /// internally and truncates sub-microsecond nanos (see `score_as_u64`), so a value like `1_500` ns
 /// would round down to `1_000` ns. Callers here pass millisecond-scale gaps, so this is exact.
 fn set_load_score(entry: &Arc<PathSecretEntry>, idx: usize, score_nanos: u64) {
-    debug_assert_eq!(score_nanos % 1_000, 0, "score resolution is one microsecond");
-    let base =
-        unsafe { s2n_quic_core::time::Timestamp::from_duration(core::time::Duration::from_nanos(score_nanos)) };
+    debug_assert_eq!(
+        score_nanos % 1_000,
+        0,
+        "score resolution is one microsecond"
+    );
+    let base = unsafe {
+        s2n_quic_core::time::Timestamp::from_duration(core::time::Duration::from_nanos(score_nanos))
+    };
     entry.update_sender_load_score(
         LocalSenderId::from_index(idx),
         base,
         0,
-        s2n_quic_core::recovery::bandwidth::Bandwidth::new(1_000, core::time::Duration::from_millis(1)),
+        s2n_quic_core::recovery::bandwidth::Bandwidth::new(
+            1_000,
+            core::time::Duration::from_millis(1),
+        ),
     );
 }
 
@@ -481,7 +489,11 @@ fn consistently_worse_sender_is_not_starved() {
     const ITERS: usize = 20_000;
     // A gap far larger than the worst-case gap: the logistic term is effectively zero here, so any
     // traffic the worse sender receives comes from the floor. The old deterministic rule routed 0.
-    let worse = count_worse_picks(1_000 * PICK_TWO_WORST_CASE_GAP_NANOS as u64, ITERS, 0x5eed_1234);
+    let worse = count_worse_picks(
+        1_000 * PICK_TWO_WORST_CASE_GAP_NANOS as u64,
+        ITERS,
+        0x5eed_1234,
+    );
 
     let share = worse as f64 / ITERS as f64;
     assert!(

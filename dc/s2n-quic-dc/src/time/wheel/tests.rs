@@ -385,7 +385,10 @@ fn next_rotation_low_slot_drains_after_wrap() {
         result.is_none(),
         "entry still in the future (target is +100), nothing due yet"
     );
-    assert_eq!(wheel.len, 1, "entry must still be queued, NOT stranded/lost");
+    assert_eq!(
+        wheel.len, 1,
+        "entry must still be queued, NOT stranded/lost"
+    );
 
     // Now advance to the target time. The wheel must cross the cascade boundary
     // (256-aligned) and drain slot 44 in the next rotation.

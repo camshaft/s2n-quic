@@ -368,7 +368,10 @@ mod tests {
 
         // First send establishes the initial interval.
         pacer.on_packet_sent(now, MINIMUM_MAX_DATAGRAM_SIZE as usize, rtt);
-        assert_eq!(Some(now + INITIAL_INTERVAL), pacer.earliest_departure_time());
+        assert_eq!(
+            Some(now + INITIAL_INTERVAL),
+            pacer.earliest_departure_time()
+        );
 
         // Drain the current slot's capacity, then send again so the pacer recomputes the
         // departure time. The floor must keep the recomputed interval bounded.
