@@ -408,6 +408,17 @@ where
                     if phase3_is_probe {
                         counters.on_probe_frame(&frame.header);
                     }
+                    crate::endpoint::frame_trace::record(
+                        crate::endpoint::frame_trace::Direction::Outbound,
+                        &frame.header,
+                        Some(context.next_packet_number),
+                    );
+                    // Sending a QueueDbg means this node noticed its own stream is stuck (via
+                    // `emit_debug`), so dump its send-side flight history locally too — don't rely
+                    // on the peer's dump (the frame may be lost, or the peer may be the healthy one).
+                    if matches!(frame.header, frame::Header::QueueDbg { .. }) {
+                        crate::endpoint::frame_trace::trigger();
+                    }
                     crate::endpoint::dbg::on_enabled(|| {
                         if let frame::Header::QueueDbg {
                             dump_id,
