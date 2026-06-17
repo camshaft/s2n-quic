@@ -284,7 +284,9 @@ impl Slot {
             (inner.flags, inner.queue.len())
         };
         SlotDiag {
-            stored_binding: raw & !UNALLOCATED_BIT,
+            stored_binding: VarInt::new(raw & !UNALLOCATED_BIT)
+                .unwrap_or(VarInt::ZERO)
+                .as_u64(),
             unallocated: raw & UNALLOCATED_BIT != 0,
             advertised_window: self.advertised_window.load(Ordering::Acquire),
             stream_has_sender: stream_flags.contains(Flags::HAS_SENDER),
