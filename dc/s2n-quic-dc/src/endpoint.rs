@@ -37,6 +37,7 @@ pub(crate) mod dispatch;
 pub(crate) mod edt;
 pub(crate) mod error;
 pub(crate) mod frame;
+pub(crate) mod frame_trace;
 pub mod id;
 pub(crate) mod inflight;
 pub(crate) mod msg;

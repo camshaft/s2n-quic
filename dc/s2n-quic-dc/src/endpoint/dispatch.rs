@@ -371,6 +371,11 @@ where
 
         // Fast path: single QueueMsg frame — decrypt directly into the slot buffer.
         if let Some(header) = single_queue_msg {
+            crate::endpoint::frame_trace::record(
+                crate::endpoint::frame_trace::Direction::InboundFastPath,
+                &header,
+                Some(packet_number),
+            );
             return match decrypt_fast_path(
                 header,
                 opener,
@@ -549,6 +554,11 @@ where
             Ok((header, frame_payload_len)) => {
                 frame_count += 1;
                 counters.on_received_frame(&header);
+                crate::endpoint::frame_trace::record(
+                    crate::endpoint::frame_trace::Direction::Inbound,
+                    &header,
+                    Some(packet_number),
+                );
                 // Validate that the claimed payload length fits within the
                 // remaining payload storage.
                 if frame_payload_len > payload_storage.len() {
@@ -943,6 +953,20 @@ fn handle_queue_dbg(
     crate::endpoint::dbg::on_enabled(|| {
         let dest_queue_id = queue_pair.dest_queue_id;
         let peer_cred_id = credentials.id;
+
+        // Record this QueueDbg into the flight recorder (so the dump's newest record carries the
+        // trigger dump_id), then dump the whole ring. The first QueueDbg produces the dump; later
+        // ones simply re-arm the single-flag handoff.
+        crate::endpoint::frame_trace::record(
+            crate::endpoint::frame_trace::Direction::Inbound,
+            &Header::QueueDbg {
+                dump_id,
+                queue_pair,
+                binding_id,
+            },
+            None,
+        );
+        crate::endpoint::frame_trace::trigger();
 
         info!(
             dump_id = dump_id.as_u64(),

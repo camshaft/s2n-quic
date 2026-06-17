@@ -152,6 +152,11 @@ pub(crate) fn process_ack<Clk, Rand>(
             } else {
                 for mut entry in packet.frames {
                     counters.on_acked_frame(&entry.header);
+                    crate::endpoint::frame_trace::record(
+                        crate::endpoint::frame_trace::Direction::AckCompleted,
+                        &entry.header,
+                        Some(num),
+                    );
 
                     crate::endpoint::dbg::on_enabled(|| {
                         if let frame::Header::QueueDbg {
@@ -189,6 +194,11 @@ pub(crate) fn process_ack<Clk, Rand>(
                 .map(crate::time::precision::Timestamp::from);
             for mut entry in removal.frames {
                 counters.on_acked_frame(&entry.header);
+                crate::endpoint::frame_trace::record(
+                    crate::endpoint::frame_trace::Direction::AckCompleted,
+                    &entry.header,
+                    Some(PacketNumber::as_varint(probe_pn)),
+                );
 
                 crate::endpoint::dbg::on_enabled(|| {
                     if let frame::Header::QueueDbg {
@@ -570,6 +580,11 @@ fn detect_loss<Rand>(
                         ));
                     }
                 });
+                crate::endpoint::frame_trace::record(
+                    crate::endpoint::frame_trace::Direction::AckCancelled,
+                    &entry.header,
+                    Some(num),
+                );
                 entry.status = TransmissionStatus::Failed(frame::FailureReason::Cancelled);
                 let _ = cancelled.send(entry);
                 cancelled_count += 1;
@@ -597,6 +612,11 @@ fn detect_loss<Rand>(
                         ));
                     }
                 });
+                crate::endpoint::frame_trace::record(
+                    crate::endpoint::frame_trace::Direction::AckCancelled,
+                    &entry.header,
+                    Some(num),
+                );
                 entry.status = TransmissionStatus::Failed(frame::FailureReason::TransmissionError);
                 let _ = completed.send(entry);
                 ttl_exhausted_count += 1;
@@ -617,6 +637,11 @@ fn detect_loss<Rand>(
                     ));
                 }
             });
+            crate::endpoint::frame_trace::record(
+                crate::endpoint::frame_trace::Direction::AckLost,
+                &entry.header,
+                Some(num),
+            );
             let _ = lost.send(entry);
             lost_count += 1;
         }
