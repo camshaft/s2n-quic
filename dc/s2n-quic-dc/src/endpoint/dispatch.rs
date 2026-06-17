@@ -956,7 +956,7 @@ fn handle_queue_dbg(
 
         // Wake whichever of the peer Reader/Writer is parked so each dumps its own `Inner`. Push to
         // both halves; the entry carries the peer-claimed identity so the handle can flag a mismatch.
-        match peer.queue_view.send_stream(
+        let stream_err = match peer.queue_view.send_stream(
             dest_queue_id,
             binding_id,
             crate::endpoint::msg::Stream::Debug {
@@ -971,19 +971,12 @@ fn handle_queue_dbg(
                 let _ = waker_sink.send(waker);
                 // A diagnostic marker carries no payload, so there is nothing to release.
                 debug_assert_eq!(release_bytes, 0);
+                None
             }
-            Err(err) => {
-                info!(
-                    dump_id = dump_id.as_u64(),
-                    binding_id = binding_id.as_u64(),
-                    queue_id = dest_queue_id.as_u64(),
-                    reason = queue_error_reason(&err),
-                    "QueueDbg stream-half delivery failed (binding gone/diverged)"
-                );
-            }
-        }
+            Err(err) => Some(queue_error_reason(&err)),
+        };
 
-        match peer.queue_view.send_control(
+        let control_err = match peer.queue_view.send_control(
             dest_queue_id,
             binding_id,
             crate::endpoint::msg::Control::Debug {
@@ -996,16 +989,38 @@ fn handle_queue_dbg(
         ) {
             Ok(waker) => {
                 let _ = waker_sink.send(waker);
+                None
             }
-            Err(err) => {
-                info!(
-                    dump_id = dump_id.as_u64(),
-                    binding_id = binding_id.as_u64(),
-                    queue_id = dest_queue_id.as_u64(),
-                    reason = queue_error_reason(&err),
-                    "QueueDbg control-half delivery failed (binding gone/diverged)"
-                );
-            }
+            Err(err) => Some(queue_error_reason(&err)),
+        };
+
+        // A delivery failure is itself a finding — the binding is gone or has diverged. Read back
+        // the slot's *actual* current state so the log shows the divergence: what binding the slot
+        // holds now vs. the `binding_id` the marker (and the wedged peer stream) is using, whether
+        // the slot is unallocated, and whether either receiver half is still attached. This is the
+        // smoking gun for the record_freed/FutureBinding/StaleBinding class.
+        if stream_err.is_some() || control_err.is_some() {
+            let diag = peer.queue_view.slot_diag(dest_queue_id);
+            info!(
+                dump_id = dump_id.as_u64(),
+                %credentials,
+                binding_id = binding_id.as_u64(),
+                queue_id = dest_queue_id.as_u64(),
+                source_queue_id = queue_pair.source_queue_id.as_u64(),
+                stream_reason = stream_err,
+                control_reason = control_err,
+                slot_found = diag.is_some(),
+                slot_stored_binding = diag.map(|d| d.stored_binding),
+                slot_unallocated = diag.map(|d| d.unallocated),
+                slot_advertised_window = diag.map(|d| d.advertised_window),
+                slot_stream_has_sender = diag.map(|d| d.stream_has_sender),
+                slot_stream_has_receiver = diag.map(|d| d.stream_has_receiver),
+                slot_stream_depth = diag.map(|d| d.stream_depth),
+                slot_control_has_sender = diag.map(|d| d.control_has_sender),
+                slot_control_has_receiver = diag.map(|d| d.control_has_receiver),
+                slot_control_depth = diag.map(|d| d.control_depth),
+                "QueueDbg delivery failed (binding gone/diverged); slot state attached"
+            );
         }
     });
 }

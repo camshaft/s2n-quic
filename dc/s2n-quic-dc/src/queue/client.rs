@@ -285,6 +285,16 @@ impl ClientDispatch {
         slot.push_stream(binding_id, entry)
     }
 
+    /// Read-only diagnostic snapshot of the slot at `queue_id`, or `None` if no slot is mapped
+    /// there. For logging why a delivery was rejected; see [`super::slot::Slot::diag`].
+    #[inline]
+    pub(crate) fn slot_diag(&mut self, queue_id: VarInt) -> Option<super::slot::SlotDiag> {
+        let index = queue_id.as_u64() as usize;
+        self.view
+            .get(index, &self.state.pages)
+            .map(|slot| slot.diag())
+    }
+
     #[inline]
     pub fn send_control(
         &mut self,
