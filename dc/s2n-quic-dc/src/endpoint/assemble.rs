@@ -371,13 +371,17 @@ where
                             } = frame.header
                             {
                                 // The marker was cancelled before assembly (its emitting handle is
-                                // already gone) — record where it died.
+                                // already gone) — record where it died. Nothing is on the wire yet,
+                                // so `time_sent` is None; `sojourn_us` shows the full queue wait.
                                 context.dump_queue_dbg(
                                     dump_id,
                                     queue_pair,
                                     binding_id,
                                     "assemble_cancelled",
                                     context.next_packet_number,
+                                    now,
+                                    frame.enqueued_at,
+                                    None,
                                 );
                             }
                         });
@@ -412,13 +416,18 @@ where
                         } = frame.header
                         {
                             // The packet number this frame is about to be assigned (see the
-                            // `next_packet_number` assignment after this loop).
+                            // `next_packet_number` assignment after this loop). `sojourn_us` here is
+                            // how long the marker waited in the transmit queue before assembly; it
+                            // is about to be put on the wire, so `time_sent` is still None.
                             context.dump_queue_dbg(
                                 dump_id,
                                 queue_pair,
                                 binding_id,
                                 if phase3_is_probe { "probe" } else { "assemble" },
                                 context.next_packet_number,
+                                now,
+                                frame.enqueued_at,
+                                None,
                             );
                         }
                     });

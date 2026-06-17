@@ -319,13 +319,15 @@ impl Map {
     /// the tail of the probe chain. All intermediate shells and the tail itself are
     /// removed from the map so no zombie entries remain.
     ///
-    /// Returns the tail's frames and the total `sent_bytes` of all removed entries
-    /// that still had `transmission_info`. The caller must release these bytes from
-    /// the CCA via `on_packet_discarded`.
+    /// Returns the tail's frames, the total `sent_bytes` of all removed entries
+    /// that still had `transmission_info`, and the tail's `time_sent` (the last
+    /// wire transmission of the chain, used for QueueDbg round-trip timing). The
+    /// caller must release the discarded bytes from the CCA via `on_packet_discarded`.
     #[inline]
     pub fn remove_chain(&mut self, mut pn: PacketNumber) -> ChainRemoval {
         let mut frames = Queue::new();
         let mut discarded_bytes: usize = 0;
+        let mut tail_time_sent = None;
 
         loop {
             match self.inner.remove(pn) {
@@ -337,6 +339,7 @@ impl Map {
                     if let Some(next_pn) = packet.probed_to {
                         pn = next_pn;
                     } else {
+                        tail_time_sent = packet.transmission_info.as_ref().map(|i| i.time_sent);
                         frames = packet.frames;
                         break;
                     }
@@ -348,6 +351,7 @@ impl Map {
         ChainRemoval {
             frames,
             discarded_bytes,
+            tail_time_sent,
         }
     }
 }
@@ -356,6 +360,9 @@ impl Map {
 pub(crate) struct ChainRemoval {
     pub frames: Queue<Frame>,
     pub discarded_bytes: usize,
+    /// `time_sent` of the chain tail (the live probe transmission), if it still had
+    /// transmission info. `None` when the tail was already removed (e.g. ACKed first).
+    pub tail_time_sent: Option<s2n_quic_core::time::Timestamp>,
 }
 
 pub(crate) struct RemoveRange<'a, I> {

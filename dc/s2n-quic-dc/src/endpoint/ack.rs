@@ -73,8 +73,19 @@ pub(crate) fn process_ack<Clk, Rand>(
     // `&context`, which would conflict with the `remove_range`/`remove_chain` iterators. Stays an
     // empty (unallocated) Vec in production: `QueueDbg` frames are only ever emitted when the
     // diagnostic is enabled, so nothing is ever pushed.
-    let mut acked_dbg: Vec<(VarInt, crate::packet::datagram::QueuePair, VarInt, VarInt)> =
-        Vec::new();
+    //
+    // Tuple: (dump_id, queue_pair, binding_id, pn, enqueued_at, time_sent). `enqueued_at` is the
+    // frame's pipeline-entry stamp and `time_sent` is when the acked packet was put on the wire;
+    // together they give the dump the submit-to-ack sojourn and the wire round-trip.
+    type AckedDbg = (
+        VarInt,
+        crate::packet::datagram::QueuePair,
+        VarInt,
+        VarInt,
+        Option<crate::time::precision::Timestamp>,
+        Option<crate::time::precision::Timestamp>,
+    );
+    let mut acked_dbg: Vec<AckedDbg> = Vec::new();
 
     // Process all ranges: first range from header, then extra gap/range pairs from payload.
     for pn_range in AckRangeIter::new(largest_acknowledged, ack_range, extra_ranges) {
@@ -106,6 +117,13 @@ pub(crate) fn process_ack<Clk, Rand>(
         for (num, mut packet) in context.inflight.remove_range(range) {
             packets_acked += 1;
 
+            // Wire-send time of this packet, used to derive the QueueDbg round-trip. Captured before
+            // `take()` consumes the transmission info.
+            let packet_time_sent = packet
+                .transmission_info
+                .as_ref()
+                .map(|info| crate::time::precision::Timestamp::from(info.time_sent));
+
             if let Some(tx_info) = packet.transmission_info.take() {
                 let time_sent = tx_info.time_sent;
                 max_acked_tx_time = max_acked_tx_time.max(Some(time_sent));
@@ -134,14 +152,25 @@ pub(crate) fn process_ack<Clk, Rand>(
             } else {
                 for mut entry in packet.frames {
                     counters.on_acked_frame(&entry.header);
-                    if let frame::Header::QueueDbg {
-                        dump_id,
-                        queue_pair,
-                        binding_id,
-                    } = entry.header
-                    {
-                        acked_dbg.push((dump_id, queue_pair, binding_id, num));
-                    }
+
+                    crate::endpoint::dbg::on_enabled(|| {
+                        if let frame::Header::QueueDbg {
+                            dump_id,
+                            queue_pair,
+                            binding_id,
+                        } = entry.header
+                        {
+                            acked_dbg.push((
+                                dump_id,
+                                queue_pair,
+                                binding_id,
+                                num,
+                                entry.enqueued_at,
+                                packet_time_sent,
+                            ));
+                        }
+                    });
+
                     entry.status = TransmissionStatus::Acknowledged;
                     let _ = completed.send(entry);
                 }
@@ -155,30 +184,51 @@ pub(crate) fn process_ack<Clk, Rand>(
             if removal.discarded_bytes > 0 {
                 context.cca.on_packet_discarded(removal.discarded_bytes);
             }
+            let tail_time_sent = removal
+                .tail_time_sent
+                .map(crate::time::precision::Timestamp::from);
             for mut entry in removal.frames {
                 counters.on_acked_frame(&entry.header);
-                if let frame::Header::QueueDbg {
-                    dump_id,
-                    queue_pair,
-                    binding_id,
-                } = entry.header
-                {
-                    acked_dbg.push((
+
+                crate::endpoint::dbg::on_enabled(|| {
+                    if let frame::Header::QueueDbg {
                         dump_id,
                         queue_pair,
                         binding_id,
-                        PacketNumber::as_varint(probe_pn),
-                    ));
-                }
+                    } = entry.header
+                    {
+                        acked_dbg.push((
+                            dump_id,
+                            queue_pair,
+                            binding_id,
+                            PacketNumber::as_varint(probe_pn),
+                            entry.enqueued_at,
+                            tail_time_sent,
+                        ));
+                    }
+                });
+
                 entry.status = TransmissionStatus::Acknowledged;
                 let _ = completed.send(entry);
             }
         }
     }
 
-    for (dump_id, queue_pair, binding_id, pn) in acked_dbg {
-        context.dump_queue_dbg(dump_id, queue_pair, binding_id, "acked", pn);
-    }
+    crate::endpoint::dbg::on_enabled(|| {
+        let now_precision = crate::time::precision::Timestamp::from(now);
+        for (dump_id, queue_pair, binding_id, pn, enqueued_at, time_sent) in acked_dbg {
+            context.dump_queue_dbg(
+                dump_id,
+                queue_pair,
+                binding_id,
+                "acked",
+                pn,
+                now_precision,
+                enqueued_at,
+                time_sent,
+            );
+        }
+    });
 
     counters.ack_packets.record_value(packets_acked);
     counters.on_inflight_drain_ack(packets_acked);
@@ -451,17 +501,23 @@ fn detect_loss<Rand>(
 
     // QueueDbg markers that met a fate this call; dumped after the `remove_range` borrow on
     // `context.inflight` releases (see the ACK path for the same pattern). Empty (unallocated) in
-    // production. The final tuple element is the fate ("lost" / "cancelled" / "ttl_exhausted").
+    // production. Tuple: (dump_id, queue_pair, binding_id, pn, fate, enqueued_at, time_sent), where
+    // fate is "lost" / "cancelled" / "ttl_exhausted" and the two timestamps drive the sojourn dump.
     let mut lost_dbg: Vec<(
         VarInt,
         crate::packet::datagram::QueuePair,
         VarInt,
         VarInt,
         &'static str,
+        Option<crate::time::precision::Timestamp>,
+        Option<crate::time::precision::Timestamp>,
     )> = Vec::new();
 
     for (num, mut packet) in context.inflight.remove_range(range) {
         let tx_info = packet.transmission_info.take().unwrap();
+        // Wire-send time of the lost packet (always present in the loss path — the entry carried
+        // bytes), used to show how long the marker had been on the wire before being declared lost.
+        let packet_time_sent = Some(crate::time::precision::Timestamp::from(tx_info.time_sent));
 
         let new_loss_burst = starts_new_loss_burst(prev_lost_pn, num);
         prev_lost_pn = Some(num);
@@ -501,9 +557,19 @@ fn detect_loss<Rand>(
             };
 
             if !entry.should_transmit() {
-                if let Some((dump_id, queue_pair, binding_id)) = dbg {
-                    lost_dbg.push((dump_id, queue_pair, binding_id, num, "cancelled"));
-                }
+                crate::endpoint::dbg::on_enabled(|| {
+                    if let Some((dump_id, queue_pair, binding_id)) = dbg {
+                        lost_dbg.push((
+                            dump_id,
+                            queue_pair,
+                            binding_id,
+                            num,
+                            "cancelled",
+                            entry.enqueued_at,
+                            packet_time_sent,
+                        ));
+                    }
+                });
                 entry.status = TransmissionStatus::Failed(frame::FailureReason::Cancelled);
                 let _ = cancelled.send(entry);
                 cancelled_count += 1;
@@ -518,9 +584,19 @@ fn detect_loss<Rand>(
                     frame = ?*entry,
                     "frame TTL exhausted - this should never happen"
                 );
-                if let Some((dump_id, queue_pair, binding_id)) = dbg {
-                    lost_dbg.push((dump_id, queue_pair, binding_id, num, "ttl_exhausted"));
-                }
+                crate::endpoint::dbg::on_enabled(|| {
+                    if let Some((dump_id, queue_pair, binding_id)) = dbg {
+                        lost_dbg.push((
+                            dump_id,
+                            queue_pair,
+                            binding_id,
+                            num,
+                            "ttl_exhausted",
+                            entry.enqueued_at,
+                            packet_time_sent,
+                        ));
+                    }
+                });
                 entry.status = TransmissionStatus::Failed(frame::FailureReason::TransmissionError);
                 let _ = completed.send(entry);
                 ttl_exhausted_count += 1;
@@ -528,17 +604,39 @@ fn detect_loss<Rand>(
             }
 
             entry.ttl -= 1;
-            if let Some((dump_id, queue_pair, binding_id)) = dbg {
-                lost_dbg.push((dump_id, queue_pair, binding_id, num, "lost"));
-            }
+            crate::endpoint::dbg::on_enabled(|| {
+                if let Some((dump_id, queue_pair, binding_id)) = dbg {
+                    lost_dbg.push((
+                        dump_id,
+                        queue_pair,
+                        binding_id,
+                        num,
+                        "lost",
+                        entry.enqueued_at,
+                        packet_time_sent,
+                    ));
+                }
+            });
             let _ = lost.send(entry);
             lost_count += 1;
         }
     }
 
-    for (dump_id, queue_pair, binding_id, pn, phase) in lost_dbg {
-        context.dump_queue_dbg(dump_id, queue_pair, binding_id, phase, pn);
-    }
+    crate::endpoint::dbg::on_enabled(|| {
+        let now_precision = crate::time::precision::Timestamp::from(now);
+        for (dump_id, queue_pair, binding_id, pn, phase, enqueued_at, time_sent) in lost_dbg {
+            context.dump_queue_dbg(
+                dump_id,
+                queue_pair,
+                binding_id,
+                phase,
+                pn,
+                now_precision,
+                enqueued_at,
+                time_sent,
+            );
+        }
+    });
 
     if ttl_exhausted_count > 0 {
         counters.ttl_exhausted.add(ttl_exhausted_count as u64);

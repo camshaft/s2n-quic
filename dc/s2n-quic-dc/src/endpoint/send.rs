@@ -639,6 +639,17 @@ impl Context {
     /// acked, or lost). Stamped with the shared `dump_id` plus the `cred_id`/`binding_id`
     /// correlation key so the line joins the end-to-end trace. The body is gated by
     /// [`crate::endpoint::dbg::on_enabled`], so it is inert in a production build.
+    ///
+    /// `now` is the time of this hop. `enqueued_at` is when the marker entered the pipeline
+    /// (always set for `QueueDbg` frames) and `time_sent` is when the packet carrying it was last
+    /// put on the wire (`None` until the frame is assembled). From these two the dump derives:
+    ///
+    /// * `sojourn_us` — `now - enqueued_at`: total time since the marker was submitted. At the
+    ///   `assemble`/`probe` hop this is how long it waited in the transmit queue; at the `acked`
+    ///   hop it is the full end-to-end submit-to-ack latency.
+    /// * `since_sent_us` — `now - time_sent`: wire latency of the acked/lost transmission (the
+    ///   round-trip for the `acked` hop). `None` at the assemble hops, where nothing is on the
+    ///   wire yet.
     pub(crate) fn dump_queue_dbg(
         &self,
         dump_id: VarInt,
@@ -646,6 +657,9 @@ impl Context {
         binding_id: VarInt,
         phase: &'static str,
         pn: VarInt,
+        now: precision::Timestamp,
+        enqueued_at: Option<precision::Timestamp>,
+        time_sent: Option<precision::Timestamp>,
     ) {
         crate::endpoint::dbg::on_enabled(|| {
             use crate::endpoint::frame::Priority;
@@ -661,6 +675,11 @@ impl Context {
                 dest_queue_id = queue_pair.dest_queue_id.as_u64(),
                 source_queue_id = queue_pair.source_queue_id.as_u64(),
                 pn = pn.as_u64(),
+                // ── sojourn timing ──
+                // How long the marker has been in the pipeline, and (on ack/loss) the wire latency
+                // of the transmission that just resolved. See the method docs.
+                sojourn_us = ?enqueued_at.map(|e| now.duration_since(e).as_micros() as u64),
+                since_sent_us = ?time_sent.map(|t| now.duration_since(t).as_micros() as u64),
                 // ── why can't it transmit? the Phase-3 gates ──
                 is_congestion_limited = self.cca.is_congestion_limited(),
                 requires_fast_retransmission = self.cca.requires_fast_retransmission(),
