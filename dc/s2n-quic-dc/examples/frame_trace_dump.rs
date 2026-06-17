@@ -89,12 +89,34 @@ fn flags_str(f: u8) -> String {
     parts.join("|")
 }
 
+/// Inserts a zero-padded sequence number before the extension, matching the recorder's
+/// `numbered_path`: `s2n_dc_frame_trace.bin` → `s2n_dc_frame_trace.000.bin`.
+fn numbered(base: &std::path::Path, seq: u64) -> PathBuf {
+    let stem = base.file_stem().map(|s| s.to_string_lossy().into_owned());
+    let ext = base.extension().map(|s| s.to_string_lossy().into_owned());
+    let name = match (stem, ext) {
+        (Some(stem), Some(ext)) => format!("{stem}.{seq:03}.{ext}"),
+        (Some(stem), None) => format!("{stem}.{seq:03}"),
+        _ => format!("frame_trace.{seq:03}.bin"),
+    };
+    base.with_file_name(name)
+}
+
 fn main() {
-    let path = std::env::args()
+    let base = std::env::args()
         .nth(1)
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("S2N_DC_FRAME_TRACE_PATH").map(PathBuf::from))
         .unwrap_or_else(|| std::env::temp_dir().join("s2n_dc_frame_trace.bin"));
+
+    // The recorder writes numbered dumps, so the literal base path usually does not exist. Prefer
+    // it if it does (an explicit numbered file passed as the arg), else fall back to the first
+    // numbered dump `.000` — usually the most useful.
+    let path = if base.exists() {
+        base.clone()
+    } else {
+        numbered(&base, 0)
+    };
 
     let bytes = match std::fs::read(&path) {
         Ok(b) => b,

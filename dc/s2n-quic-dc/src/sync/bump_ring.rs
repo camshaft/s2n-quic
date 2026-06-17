@@ -90,7 +90,10 @@ impl BumpRing {
     /// with one `fetch_add` and then copies the bytes in; it never blocks.
     ///
     /// # Panics
-    /// Panics if `payload.len() > MAX_RECORD`.
+    /// Panics if `payload.len() > MAX_RECORD`, or if the whole record (`payload.len() + LEN_SUFFIX`)
+    /// does not fit in [`capacity`](Self::capacity). A record larger than the ring could never be
+    /// recovered anyway, and writing it would wrap more than once — corrupting unrelated records and
+    /// (since the wrap math assumes a single wrap) writing out of bounds.
     pub fn push(&self, payload: &[u8]) -> usize {
         assert!(
             payload.len() <= MAX_RECORD,
@@ -100,6 +103,12 @@ impl BumpRing {
         );
 
         let total = payload.len() + LEN_SUFFIX;
+        assert!(
+            total <= self.capacity(),
+            "record size {} exceeds ring capacity {}",
+            total,
+            self.capacity()
+        );
         // Reserve our slice of the ring. Relaxed is sufficient: writers never read each other's
         // bytes, and a reader establishes ordering via its own `head()` (Acquire) load plus the
         // park/unpark (or other) synchronization that delivered the dump request.
@@ -116,12 +125,16 @@ impl BumpRing {
 
     /// Copies `src` into the ring starting at absolute offset `abs`, splitting the copy if it
     /// straddles the power-of-two boundary.
+    ///
+    /// `src.len()` must be `<= capacity()` (enforced by [`push`](Self::push)); the wrap math assumes
+    /// at most a single wrap.
     #[inline]
     fn write_wrapping(&self, abs: usize, src: &[u8]) {
         if src.is_empty() {
             return;
         }
         let cap = self.capacity();
+        debug_assert!(src.len() <= cap, "write_wrapping src exceeds capacity");
         let begin = abs & self.mask;
         let first = (cap - begin).min(src.len());
         // SAFETY: `begin < cap` and `first <= cap - begin`, so this range is in bounds. The bytes
@@ -288,6 +301,23 @@ mod tests {
         assert_eq!(BumpRing::new(1).capacity(), 1);
         assert_eq!(BumpRing::new(3).capacity(), 4);
         assert_eq!(BumpRing::new(1000).capacity(), 1024);
+    }
+
+    #[test]
+    fn largest_record_that_fits_round_trips() {
+        // capacity 16, suffix 2 → max payload is 14.
+        let ring = BumpRing::new(16);
+        let payload = vec![0x5A; 14];
+        ring.push(&payload);
+        assert_eq!(collect(&ring), vec![payload]);
+    }
+
+    #[test]
+    #[should_panic(expected = "exceeds ring capacity")]
+    fn push_record_larger_than_capacity_panics() {
+        // 15-byte payload + 2-byte suffix = 17 > capacity 16: must panic, not write OOB.
+        let ring = BumpRing::new(16);
+        ring.push(&[0u8; 15]);
     }
 
     #[test]

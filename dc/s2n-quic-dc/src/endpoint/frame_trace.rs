@@ -346,12 +346,19 @@ fn state() -> &'static State {
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .filter(|v| *v > 0)
-            .unwrap_or(DEFAULT_CAPACITY);
+            .unwrap_or(DEFAULT_CAPACITY)
+            // Floor at one page: the ring must hold at least a full record (`BumpRing::push`
+            // panics on a record larger than capacity), and a sub-record ring is useless anyway.
+            .max(4096);
         let ring = Arc::new(BumpRing::new(capacity));
 
+        // Default base path is PID-qualified so concurrent processes (multiple endpoints on a host,
+        // or `cargo nextest`'s per-test processes) don't clobber each other's numbered dumps.
         let path = std::env::var_os("S2N_DC_FRAME_TRACE_PATH")
             .map(PathBuf::from)
-            .unwrap_or_else(|| std::env::temp_dir().join("s2n_dc_frame_trace.bin"));
+            .unwrap_or_else(|| {
+                std::env::temp_dir().join(format!("s2n_dc_frame_trace.{}.bin", std::process::id()))
+            });
         let dumper = Arc::new(Dumper {
             requested: Mutex::new(false),
             condvar: Condvar::new(),
@@ -370,7 +377,8 @@ fn state() -> &'static State {
 }
 
 /// Spawns the single-consumer dumper thread. It blocks on the condvar and, on each request,
-/// snapshots the ring and writes it to disk (overwriting any previous dump).
+/// snapshots the ring and writes it to its own sequence-numbered file (`numbered_path`), so an
+/// earlier dump is never overwritten.
 fn spawn_dumper(ring: Arc<BumpRing>, dumper: Arc<Dumper>) {
     let _ = std::thread::Builder::new()
         .name("dc_quic::frame_trace_dump".into())
@@ -551,20 +559,19 @@ mod tests {
     /// End-to-end: `record` + `trigger` (exactly what `handle_queue_dbg` does) must drive the
     /// background dumper to write a parseable file containing the recorded frames.
     ///
-    /// Relies on nextest running each test in its own process, so setting the path env var before
-    /// the first `record`/`trigger` (which lazily initializes the global state) is race-free.
+    /// Must be robust to a pre-initialized global recorder: other tests in this binary
+    /// (e.g. `endpoint::tests::queue_dbg_dumps_state_end_to_end` via `emit_debug`) may have already
+    /// initialized the `OnceLock` with a different path and written earlier numbered dumps. So this
+    /// test does not assume control of the path or the dump sequence number — it tags its records
+    /// with a unique `dump_id`, triggers a dump, then scans every numbered dump under the *actual*
+    /// configured base path until it finds the one whose newest record carries that marker.
     #[test]
     fn trigger_drives_background_dump() {
-        let base = std::env::temp_dir().join(format!("s2n_dc_ft_e2e_{}.bin", std::process::id()));
-        // The dumper writes the first dump to the `.000.bin` numbered file.
-        let path = numbered_path(&base, 0);
-        let _ = std::fs::remove_file(&path);
-        // SAFETY: single-threaded test setup before the recorder thread is spawned.
-        unsafe {
-            std::env::set_var("S2N_DC_FRAME_TRACE_PATH", &base);
-        }
+        // A process-unique dump_id (masked to 32 bits, the FrameRecord field reading we assert on).
+        let marker = (std::process::id() as u64) & 0x00ff_ffff | 0x0100_0000;
 
-        // Record a few frames then trigger, just as the QueueDbg handler does.
+        // Record a couple of frames then trigger, just as the QueueDbg handler does. The QueueDbg's
+        // dump_id is our unique marker so we can recognize *our* dump among any others.
         record(
             Direction::Outbound,
             &dummy_data_header(),
@@ -573,7 +580,7 @@ mod tests {
         record(
             Direction::Inbound,
             &Header::QueueDbg {
-                dump_id: VarInt::from_u32(123),
+                dump_id: VarInt::new(marker).unwrap(),
                 queue_pair: crate::packet::datagram::QueuePair {
                     source_queue_id: VarInt::from_u32(1),
                     dest_queue_id: VarInt::from_u32(2),
@@ -582,46 +589,70 @@ mod tests {
             },
             None,
         );
-        assert_eq!(
-            dump_path(),
-            base,
-            "global state must have used our env base path"
-        );
+        let base = dump_path();
         trigger();
 
-        // The dumper is a fire-and-forget background thread; poll for the file to appear and
-        // contain our QueueDbg dump_id as the newest record.
+        // The dumper is a fire-and-forget background thread; poll the numbered dump files (scanning
+        // newest seq first) until one's newest record is our marked QueueDbg.
+        let parse = |bytes: &[u8]| -> Option<Vec<FrameRecord>> {
+            if bytes.len() < 32 || bytes[..8] != FILE_MAGIC {
+                return None;
+            }
+            let capacity = u64::from_le_bytes(bytes[16..24].try_into().unwrap()) as usize;
+            let head = u64::from_le_bytes(bytes[24..32].try_into().unwrap()) as usize;
+            if bytes.len() < 32 + capacity {
+                return None;
+            }
+            let region = &bytes[32..32 + capacity];
+            let mut recs = Vec::new();
+            bump_ring::walk(region, head, capacity, |payload| {
+                if let Ok(rec) = FrameRecord::read_from_bytes(payload) {
+                    if rec.magic == RECORD_MAGIC {
+                        recs.push(rec);
+                    }
+                }
+            });
+            Some(recs)
+        };
+
+        // A dump "matches" if it contains our marked QueueDbg anywhere. Under `cargo test` other
+        // tests push to the same global ring concurrently, so our records can be interleaved with
+        // theirs and need not be at any fixed position — search by content, not index.
         let mut found = None;
-        for _ in 0..200 {
-            if let Ok(bytes) = std::fs::read(&path) {
-                if bytes.len() >= 32 && bytes[..8] == FILE_MAGIC {
-                    found = Some(bytes);
-                    break;
+        'poll: for _ in 0..300 {
+            // Walk seq downward from a generous bound so we prefer the most recent dump.
+            for seq in (0..64u64).rev() {
+                let path = numbered_path(&base, seq);
+                if let Ok(bytes) = std::fs::read(&path) {
+                    if let Some(recs) = parse(&bytes) {
+                        if recs
+                            .iter()
+                            .any(|r| r.frame_type == KIND_QUEUE_DBG && r.dump_id == marker)
+                        {
+                            found = Some(recs);
+                            break 'poll;
+                        }
+                    }
                 }
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
-        let bytes = found.expect("background dumper should write the file");
+        let recs = found.expect("background dumper should write a dump with our marker");
 
-        let capacity = u64::from_le_bytes(bytes[16..24].try_into().unwrap()) as usize;
-        let head = u64::from_le_bytes(bytes[24..32].try_into().unwrap()) as usize;
-        let region = &bytes[32..32 + capacity];
-        let mut recs = Vec::new();
-        bump_ring::walk(region, head, capacity, |payload| {
-            if let Ok(rec) = FrameRecord::read_from_bytes(payload) {
-                if rec.magic == RECORD_MAGIC {
-                    recs.push(rec);
-                }
-            }
-        });
-        let _ = std::fs::remove_file(&path);
-
-        // Newest record is the QueueDbg we recorded last.
-        assert!(recs.len() >= 2, "expected at least the two recorded frames");
-        assert_eq!(recs[0].frame_type, KIND_QUEUE_DBG);
-        assert_eq!(recs[0].dump_id, 123);
-        assert_eq!(recs[1].frame_type, KIND_QUEUE_DATA);
-        assert_eq!(recs[1].packet_number, 11);
+        // Our marked QueueDbg must be present (proves record + trigger + dump + parse), and the
+        // QueueData we recorded (unique pn=11 + source_queue_id=7 from `dummy_data_header`) must
+        // also have made it into the same ring.
+        assert!(
+            recs.iter()
+                .any(|r| r.frame_type == KIND_QUEUE_DBG && r.dump_id == marker),
+            "marked QueueDbg present"
+        );
+        assert!(
+            recs.iter().any(|r| r.frame_type == KIND_QUEUE_DATA
+                && r.packet_number == 11
+                && r.source_queue_id == 7),
+            "recorded QueueData present"
+        );
     }
 
     #[test]
