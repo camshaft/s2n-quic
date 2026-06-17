@@ -789,6 +789,104 @@ fn bidirectional_simultaneous_send() {
     });
 }
 
+/// End-to-end exercise of the `QueueDbg` stuck-stream diagnostic.
+///
+/// Sets up a genuinely stuck bidirectional stream — the client reads nothing, so the server's
+/// writer wedges flow-control-blocked against the small advertised window while the server's reader
+/// parks waiting for more data — then has the client fire `emit_debug` on it. The captured log
+/// (snapshotted by `sim`) shows the full chain stamped with one shared `dump_id`:
+///   * the client's own Reader/Writer dumps at the emit site,
+///   * each send-pipeline hop the marker frames pass through (assemble, then acked),
+///   * the server dispatch-context dump on receipt, and
+///   * the server's woken (parked) Reader/Writer dumps — including the peer-claimed-identity fields
+///     and the `id_mismatch` flag.
+///
+/// `emit_debug` and the dump path are available here because the crate's own tests build with
+/// `cfg(test)` (see [`crate::endpoint::dbg::ENABLED`]). The id source uses the deterministic bach
+/// thread-local counter, so `dump_id` is stable across runs for the snapshot.
+#[test]
+fn queue_dbg_dumps_state_end_to_end() {
+    use crate::endpoint::testing::sim::SimEndpointConfig;
+
+    sim(|| {
+        let acceptor_id = VarInt::from_u8(1);
+        // Small window so the server's writer wedges flow-control-blocked (parked) after the first
+        // few bytes, since the client never reads to grant more credit.
+        let window = VarInt::from_u8(8);
+
+        // ── Server ────────────────────────────────────────────────────────
+        async move {
+            let server = Server::with_config(SimEndpointConfig::default().send_window(window));
+            let mut acceptor = server
+                .register_acceptor_channel(acceptor_id, 8)
+                .expect("acceptor registration failed");
+
+            while let Some(stream) = acceptor.recv().await {
+                async move {
+                    let (mut reader, mut writer) = stream.into_split();
+
+                    // Writer half: try to send more than the peer's window admits, so it parks
+                    // flow-control-blocked — a live, wedged Writer for the QueueDbg to wake. The
+                    // client is `.primary()` and controls sim shutdown, so this task just needs to
+                    // stay parked in `write_all_from` until then; no explicit hold is required.
+                    async move {
+                        let mut data = Bytes::from_static(b"server-response-larger-than-window");
+                        let _ = writer.write_all_from(&mut data).await;
+                    }
+                    .spawn();
+
+                    // Reader half: consume the client's "ping", then loop — parking in `read_into`
+                    // waiting for more data that never comes. A live, parked Reader to wake.
+                    let mut buf = BytesMut::with_capacity(8);
+                    loop {
+                        let n = reader.read_into(&mut buf).await.expect("server read");
+                        if n == 0 {
+                            break;
+                        }
+                    }
+                }
+                .primary()
+                .spawn();
+            }
+        }
+        .group("server")
+        .spawn();
+
+        // ── Client ────────────────────────────────────────────────────────
+        async move {
+            let mut client = Client::with_config(SimEndpointConfig::default().send_window(window));
+            let mut stream = client
+                .connect("server:0", acceptor_id)
+                .await
+                .expect("connect failed");
+
+            // Send "ping" to establish the binding on both ends, then deliberately never read the
+            // server's response — leaving the server writer wedged at the window edge.
+            {
+                let (_reader, writer) = stream.split();
+                let mut ping = Bytes::from_static(b"ping");
+                writer.write_from(&mut ping).await.expect("client write");
+            }
+
+            // Let the ping, the server's blocked response, and the ACKs settle so the dump reflects
+            // the wedged steady state rather than mid-handshake. The sim RTT is ~1ms; keep the waits
+            // tight so the snapshot stays focused on the dump rather than wheel-tick noise.
+            10.ms().sleep().await;
+
+            // Fire the diagnostic: one shared dump_id across both halves and every hop.
+            stream.emit_debug();
+
+            // Let the marker round-trip: client assemble → server dispatch + wake → ACK back.
+            10.ms().sleep().await;
+
+            info!("queue_dbg_dumps_state_end_to_end client done");
+        }
+        .group("client")
+        .primary()
+        .spawn();
+    });
+}
+
 /// Verifies duplicate client init traffic does not create duplicate accepted streams.
 ///
 /// The first client packet toward the server is duplicated at the network layer.

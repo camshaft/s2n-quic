@@ -91,6 +91,21 @@ impl Stream {
         self.read.binding_id()
     }
 
+    /// Emit a `QueueDbg` stuck-stream diagnostic for both halves of this stream (see the
+    /// `queue-dbg` feature). Both halves share a single `dump_id` so the whole diagnostic episode —
+    /// each local dump, every hop the marker frames touch, and the peer's woken handles — groups
+    /// under one id. Grep that id to reconstruct the end-to-end trace.
+    ///
+    /// No-op unless the `queue-dbg` feature (or a test/`testing` build) is enabled — the whole body
+    /// is gated by [`crate::endpoint::dbg::on_enabled`].
+    pub fn emit_debug(&mut self) {
+        crate::endpoint::dbg::on_enabled(|| {
+            let dump_id = crate::endpoint::dbg::next_dump_id();
+            self.read.emit_debug_with_id(dump_id);
+            self.write.emit_debug_with_id(dump_id);
+        });
+    }
+
     /// Returns borrowed access to the read and write halves.
     ///
     /// This is convenient for running both halves in the same task.

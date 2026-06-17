@@ -46,6 +46,18 @@ pub enum Stream {
     Reset {
         error_code: VarInt,
     },
+    /// Stuck-stream diagnostic wake-up (see the `queue-dbg` feature). Carries no application data;
+    /// its job is to wake the parked reader so it dumps its own `Inner` state. The fields carry the
+    /// `dump_id` (so the woken handle's log line joins the same end-to-end trace) and the routing
+    /// identity the *peer* used, so the reader can flag a divergence against what it believes its own
+    /// binding/queue are. Always present so the queue types are identical across builds; only ever
+    /// constructed/observed when the diagnostic is enabled (see [`crate::endpoint::dbg::ENABLED`]).
+    Debug {
+        dump_id: u64,
+        peer_queue_pair: crate::packet::datagram::QueuePair,
+        peer_binding_id: VarInt,
+        peer_cred_id: crate::credentials::Id,
+    },
 }
 
 pub enum Control {
@@ -62,6 +74,15 @@ pub enum Control {
     },
     Reset {
         error_code: VarInt,
+    },
+    /// Stuck-stream diagnostic wake-up (see the `queue-dbg` feature). The control-half counterpart to
+    /// [`Stream::Debug`]: wakes the parked writer so it dumps its own `Inner` state. See that variant
+    /// for the meaning of the fields. Always present (see [`Stream::Debug`]).
+    Debug {
+        dump_id: u64,
+        peer_queue_pair: crate::packet::datagram::QueuePair,
+        peer_binding_id: VarInt,
+        peer_cred_id: crate::credentials::Id,
     },
 }
 

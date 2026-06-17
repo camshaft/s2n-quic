@@ -620,6 +620,29 @@ impl Reader {
         self.0.stream_rx.binding_id().as_u64()
     }
 
+    /// Emit a `QueueDbg` stuck-stream diagnostic from this reader (see the `queue-dbg` feature).
+    ///
+    /// Call this when the read half appears wedged. It dumps this reader's state and triggers an
+    /// end-to-end dump: every hop the marker frame touches, and the peer's parked Reader/Writer,
+    /// log their own state stamped with one shared `dump_id`. Grep that id to reconstruct the trace.
+    ///
+    /// No-op unless the `queue-dbg` feature (or a test/`testing` build) is enabled — the whole body
+    /// is gated by [`crate::endpoint::dbg::on_enabled`], so a production build mints no id and sends
+    /// nothing. Waking the peer can unstick a genuine lost-wakeup, so the dump is observational, not
+    /// side-effect-free.
+    pub fn emit_debug(&mut self) {
+        crate::endpoint::dbg::on_enabled(|| {
+            let dump_id = crate::endpoint::dbg::next_dump_id();
+            self.0.emit_debug_with_id(dump_id);
+        });
+    }
+
+    /// Emit a `QueueDbg` from this reader using a caller-supplied `dump_id`, so a `Stream` can share
+    /// one id across both halves. See [`Reader::emit_debug`].
+    pub(crate) fn emit_debug_with_id(&mut self, dump_id: u64) {
+        self.0.emit_debug_with_id(dump_id);
+    }
+
     /// Returns the handshake peer address used to identify this stream.
     ///
     /// This is the stable endpoint identity for the peer, even if data is
@@ -1168,6 +1191,21 @@ impl Inner {
                         reset_error,
                     )));
                 }
+                msg::Stream::Debug {
+                    dump_id,
+                    peer_queue_pair,
+                    peer_binding_id,
+                    peer_cred_id,
+                } => {
+                    // Woken by a peer QueueDbg: dump our own state alongside the routing identity
+                    // the peer used, flagging any divergence. Advisory — consume no credit, return
+                    // no error, keep draining. `dump_state` itself is gated, so this is a no-op in
+                    // production (where the variant is never constructed anyway).
+                    self.dump_state(
+                        dump_id,
+                        Some((peer_queue_pair, peer_binding_id, peer_cred_id)),
+                    );
+                }
             }
         }
 
@@ -1577,6 +1615,91 @@ impl Inner {
             )),
             Poll::Pending => Ok(()),
         }
+    }
+
+    /// Emit a `QueueDbg` stuck-stream diagnostic for this reader (see the `queue-dbg` feature).
+    ///
+    /// Mints a fresh `dump_id`, dumps this reader's own state, and sends a payload-less `QueueDbg`
+    /// frame to the peer so every hop it touches — and the peer's parked Reader/Writer — dumps its
+    /// own state stamped with the same `dump_id`. Grep that id to get the whole end-to-end trace.
+    ///
+    /// Note: waking the peer handle can itself unstick a genuine lost-wakeup, so a live repro may
+    /// stop reproducing once this fires. The dump is observational, not side-effect-free.
+    fn emit_debug_with_id(&mut self, dump_id: u64) {
+        // `next_dump_id` is masked to fit a `VarInt`, so this never clamps.
+        let dump_id_varint = VarInt::new(dump_id).unwrap_or(VarInt::MAX);
+        self.dump_state(dump_id, None);
+        let frame = Frame {
+            header: Header::QueueDbg {
+                dump_id: dump_id_varint,
+                queue_pair: QueuePair {
+                    source_queue_id: self.stream_rx.queue_id(),
+                    dest_queue_id: self.dest_queue_id,
+                },
+                binding_id: self.stream_rx.binding_id(),
+            },
+            payload: ByteVec::new(),
+            path_secret_entry: self.path_secret_entry.clone(),
+            completion: Some(self.completion_rx.sender()),
+            status: frame::TransmissionStatus::default(),
+            ttl: DEFAULT_TTL,
+            enqueued_at: Some(self.clock.now()),
+            flow_credits: 0,
+        };
+        let _ = self.send_frame(frame);
+    }
+
+    /// Dump this reader's `Inner` state to `tracing`, stamped with `dump_id`. When woken by a peer
+    /// `QueueDbg`, `peer` carries the routing identity the peer used so a binding/queue divergence
+    /// shows up as a mismatch against our own ids. The body is gated by
+    /// [`crate::endpoint::dbg::on_enabled`], so it is inert in a production build.
+    fn dump_state(&self, dump_id: u64, peer: Option<(QueuePair, VarInt, crate::credentials::Id)>) {
+        crate::endpoint::dbg::on_enabled(|| {
+            let local_binding_id = self.stream_rx.binding_id();
+            let local_queue_id = self.stream_rx.queue_id();
+            let cred_id = self.path_secret_entry.id();
+            let mismatch = peer.is_some_and(|(pp, pb, pc)| {
+                pb != local_binding_id || pp.dest_queue_id != local_queue_id || pc != *cred_id
+            });
+            let consumed = self.reassembler.consumed_len();
+            let received = self.reassembler.total_received_len();
+            let buffered = self.reassembler.len();
+            // received - consumed exceeding the contiguous buffer ⇒ out-of-order data is parked
+            // behind a hole: bytes are held that can't be released because an earlier offset is
+            // missing. A classic "stuck read with data present" signature.
+            let suspected_reassembly_hole = received.saturating_sub(consumed) > buffered as u64;
+            crate::tracing::info!(
+                dump_id,
+                side = "reader",
+                %cred_id,
+                peer = %self.path_secret_entry.peer(),
+                binding_id = local_binding_id.as_u64(),
+                queue_id = local_queue_id.as_u64(),
+                dest_queue_id = self.dest_queue_id.as_u64(),
+                acceptor_id = self.acceptor_id.as_u64(),
+                status = ?self.status,
+                reset_error_code = ?self.reset_error_code.map(|c| c.as_u64()),
+                remote_max_data = self.remote_max_data.as_u64(),
+                unbacked_remaining = self.unbacked_remaining,
+                window_size = self.window_size,
+                peer_max_offset = self.peer_max_offset,
+                acted_blocked_offset = self.acted_blocked_offset,
+                growth_ratio = self.growth_ratio,
+                consumed_len = consumed,
+                total_received_len = received,
+                buffered_len = buffered,
+                suspected_reassembly_hole,
+                final_size = ?self.reassembler.final_size(),
+                reassembler_empty = self.reassembler.is_empty(),
+                reading_complete = self.reassembler.is_reading_complete(),
+                writing_complete = self.reassembler.is_writing_complete(),
+                pending_rx_len = self.pending_rx.len(),
+                peer_binding_id = ?peer.map(|(_, b, _)| b.as_u64()),
+                peer_dest_queue_id = ?peer.map(|(pp, _, _)| pp.dest_queue_id.as_u64()),
+                id_mismatch = mismatch,
+                "QueueDbg reader dump"
+            );
+        });
     }
 
     fn send_max_data_frame(&mut self, maximum_data: VarInt) -> io::Result<()> {

@@ -31,6 +31,7 @@ pub(crate) mod ack;
 pub(crate) mod assemble;
 pub(crate) mod combinator;
 pub mod counters;
+pub(crate) mod dbg;
 pub(crate) mod decode;
 pub(crate) mod dispatch;
 pub(crate) mod edt;

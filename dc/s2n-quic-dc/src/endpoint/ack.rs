@@ -68,6 +68,14 @@ pub(crate) fn process_ack<Clk, Rand>(
 
     let max_acked_pn = largest_acknowledged;
 
+    // QueueDbg markers acked this call. Collected during the inflight-drain loops (which hold a
+    // borrow on `context.inflight`) and dumped after that borrow releases — `dump_queue_dbg` takes
+    // `&context`, which would conflict with the `remove_range`/`remove_chain` iterators. Stays an
+    // empty (unallocated) Vec in production: `QueueDbg` frames are only ever emitted when the
+    // diagnostic is enabled, so nothing is ever pushed.
+    let mut acked_dbg: Vec<(VarInt, crate::packet::datagram::QueuePair, VarInt, VarInt)> =
+        Vec::new();
+
     // Process all ranges: first range from header, then extra gap/range pairs from payload.
     for pn_range in AckRangeIter::new(largest_acknowledged, ack_range, extra_ranges) {
         let (pmin, pmax) = (*pn_range.start(), *pn_range.end());
@@ -126,6 +134,14 @@ pub(crate) fn process_ack<Clk, Rand>(
             } else {
                 for mut entry in packet.frames {
                     counters.on_acked_frame(&entry.header);
+                    if let frame::Header::QueueDbg {
+                        dump_id,
+                        queue_pair,
+                        binding_id,
+                    } = entry.header
+                    {
+                        acked_dbg.push((dump_id, queue_pair, binding_id, num));
+                    }
                     entry.status = TransmissionStatus::Acknowledged;
                     let _ = completed.send(entry);
                 }
@@ -141,10 +157,27 @@ pub(crate) fn process_ack<Clk, Rand>(
             }
             for mut entry in removal.frames {
                 counters.on_acked_frame(&entry.header);
+                if let frame::Header::QueueDbg {
+                    dump_id,
+                    queue_pair,
+                    binding_id,
+                } = entry.header
+                {
+                    acked_dbg.push((
+                        dump_id,
+                        queue_pair,
+                        binding_id,
+                        PacketNumber::as_varint(probe_pn),
+                    ));
+                }
                 entry.status = TransmissionStatus::Acknowledged;
                 let _ = completed.send(entry);
             }
         }
+    }
+
+    for (dump_id, queue_pair, binding_id, pn) in acked_dbg {
+        context.dump_queue_dbg(dump_id, queue_pair, binding_id, "acked", pn);
     }
 
     counters.ack_packets.record_value(packets_acked);
@@ -416,6 +449,17 @@ fn detect_loss<Rand>(
     // "loss occurred". Computed inline in the existing loop — no extra pass, no allocation.
     let mut prev_lost_pn: Option<VarInt> = None;
 
+    // QueueDbg markers that met a fate this call; dumped after the `remove_range` borrow on
+    // `context.inflight` releases (see the ACK path for the same pattern). Empty (unallocated) in
+    // production. The final tuple element is the fate ("lost" / "cancelled" / "ttl_exhausted").
+    let mut lost_dbg: Vec<(
+        VarInt,
+        crate::packet::datagram::QueuePair,
+        VarInt,
+        VarInt,
+        &'static str,
+    )> = Vec::new();
+
     for (num, mut packet) in context.inflight.remove_range(range) {
         let tx_info = packet.transmission_info.take().unwrap();
 
@@ -441,7 +485,25 @@ fn detect_loss<Rand>(
         }
 
         for mut entry in packet.frames {
+            // A QueueDbg marker can meet three fates in this loop — cancelled (writer/reader gone),
+            // TTL-exhausted (dropped for good), or lost-and-retransmitted. Record the fate with a
+            // distinct phase so the trace shows exactly where the marker (and, by proxy, real
+            // traffic on this stream) is dying. No fate is a blind spot.
+            let dbg = if let frame::Header::QueueDbg {
+                dump_id,
+                queue_pair,
+                binding_id,
+            } = entry.header
+            {
+                Some((dump_id, queue_pair, binding_id))
+            } else {
+                None
+            };
+
             if !entry.should_transmit() {
+                if let Some((dump_id, queue_pair, binding_id)) = dbg {
+                    lost_dbg.push((dump_id, queue_pair, binding_id, num, "cancelled"));
+                }
                 entry.status = TransmissionStatus::Failed(frame::FailureReason::Cancelled);
                 let _ = cancelled.send(entry);
                 cancelled_count += 1;
@@ -456,6 +518,9 @@ fn detect_loss<Rand>(
                     frame = ?*entry,
                     "frame TTL exhausted - this should never happen"
                 );
+                if let Some((dump_id, queue_pair, binding_id)) = dbg {
+                    lost_dbg.push((dump_id, queue_pair, binding_id, num, "ttl_exhausted"));
+                }
                 entry.status = TransmissionStatus::Failed(frame::FailureReason::TransmissionError);
                 let _ = completed.send(entry);
                 ttl_exhausted_count += 1;
@@ -463,9 +528,16 @@ fn detect_loss<Rand>(
             }
 
             entry.ttl -= 1;
+            if let Some((dump_id, queue_pair, binding_id)) = dbg {
+                lost_dbg.push((dump_id, queue_pair, binding_id, num, "lost"));
+            }
             let _ = lost.send(entry);
             lost_count += 1;
         }
+    }
+
+    for (dump_id, queue_pair, binding_id, pn, phase) in lost_dbg {
+        context.dump_queue_dbg(dump_id, queue_pair, binding_id, phase, pn);
     }
 
     if ttl_exhausted_count > 0 {

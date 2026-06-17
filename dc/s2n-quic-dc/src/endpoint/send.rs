@@ -633,6 +633,75 @@ impl std::fmt::Display for ContextError {
 }
 
 impl Context {
+    /// Dump this send context's congestion/flow state for a `QueueDbg` frame passing through a
+    /// send-pipeline hop (see the `queue-dbg` feature). `phase` names the hop ("assemble", "probe",
+    /// "acked", "lost"); `pn` is the relevant packet number for that hop (the one being assigned,
+    /// acked, or lost). Stamped with the shared `dump_id` plus the `cred_id`/`binding_id`
+    /// correlation key so the line joins the end-to-end trace. The body is gated by
+    /// [`crate::endpoint::dbg::on_enabled`], so it is inert in a production build.
+    pub(crate) fn dump_queue_dbg(
+        &self,
+        dump_id: VarInt,
+        queue_pair: crate::packet::datagram::QueuePair,
+        binding_id: VarInt,
+        phase: &'static str,
+        pn: VarInt,
+    ) {
+        crate::endpoint::dbg::on_enabled(|| {
+            use crate::endpoint::frame::Priority;
+            let q = &self.queues;
+            let range = self.inflight.get_range();
+            ::tracing::info!(
+                dump_id = dump_id.as_u64(),
+                phase,
+                %self.credentials,
+                sender_idx = %self.sender_idx,
+                peer = %self.peer_addr,
+                binding_id = binding_id.as_u64(),
+                dest_queue_id = queue_pair.dest_queue_id.as_u64(),
+                source_queue_id = queue_pair.source_queue_id.as_u64(),
+                pn = pn.as_u64(),
+                // ── why can't it transmit? the Phase-3 gates ──
+                is_congestion_limited = self.cca.is_congestion_limited(),
+                requires_fast_retransmission = self.cca.requires_fast_retransmission(),
+                can_send_pending_frames = self.can_send_pending_frames(),
+                cwnd = self.cca.congestion_window(),
+                bytes_in_flight = self.cca.bytes_in_flight(),
+                send_quantum = self.cca.send_quantum(),
+                pacing_rate_bps = self.cca.bandwidth().as_bytes_per_second(),
+                // ── pacer departure timing (pacer-runaway diagnosis) ──
+                // The raw CCA earliest-departure-time (unclamped) vs. when the tx wheel is actually
+                // armed to fire. A raw EDT far in the future is the pacer-rate-collapse signature.
+                cca_earliest_departure_time = ?self.cca.earliest_departure_time_raw(),
+                tx_wheel_target = ?self.tx_wheel.target_time,
+                // ── scheduling: which wheels is it on? ──
+                is_tx_scheduled = self.is_tx_scheduled(),
+                is_queued_for_assembly = self.is_queued_for_assembly(),
+                is_immediate_scheduled = self.is_immediate_scheduled(),
+                is_pto_scheduled = self.is_pto_scheduled(),
+                // ── pending work per priority ──
+                pending_reset = q[Priority::QueueReset.as_index()].len(),
+                pending_control = q[Priority::QueueControl.as_index()].len(),
+                pending_data = q[Priority::QueueData.as_index()].len(),
+                pending_init = q[Priority::QueueInit.as_index()].len(),
+                has_pending_acks = self.has_pending_acks(),
+                pending_freed = self.pending_freed.is_some(),
+                // ── inflight + pto + rtt ──
+                has_inflight = self.inflight.has_inflight(),
+                inflight_range_start = range.start().as_u64(),
+                inflight_range_end = range.end().as_u64(),
+                inflight_sum_bytes = self.inflight.sum_sent_bytes(),
+                pto_backoff = self.pto.backoff,
+                pto_is_armed = self.pto.is_armed(),
+                probe_requested = self.pto.probe_state.is_requested(),
+                probe_state = ?self.pto.probe_state,
+                smoothed_rtt_us = self.rtt_estimator.smoothed_rtt().as_micros(),
+                next_packet_number = self.next_packet_number.as_u64(),
+                "QueueDbg send-pipeline dump"
+            );
+        });
+    }
+
     pub fn new(
         entry: &Arc<PathSecretEntry>,
         inflight_gauge: QueueGauge,
@@ -807,30 +876,28 @@ impl Context {
         // tx-scheduled.
         let immediate = needs_urgent && !self.is_immediate_scheduled();
 
-        let transmission =
-            if
-            // Only insert into the tx_wheel when the context is neither already
-            // waiting in the wheel nor already queued for assembly. Both links must
-            // be clear: an intrusive node can live in only one list at a time, and a
-            // double-insert would trip the list's unlinked assertion / corrupt it.
-            !self.is_tx_scheduled()
-                && !self.is_queued_for_assembly()
-                && self.has_pending_data()
-                && self.can_send_pending_frames()
-            {
-                // Non-urgent pending data follows CCA pacing via the tx_wheel. The
-                // earliest-departure-time is clamped to MAX_TX_PACING_DELAY inside the accessor,
-                // so a degenerate pacing rate cannot park the wheel days out.
-                let target = self
-                    .cca
-                    .earliest_departure_time(clock)
-                    .map(precision::Timestamp::from);
-                // If target time is `None` then the wheel will schedule it immediately
-                self.tx_wheel.target_time = target;
-                true
-            } else {
-                false
-            };
+        // Only insert into the tx_wheel when the context is neither already
+        // waiting in the wheel nor already queued for assembly. Both links must
+        // be clear: an intrusive node can live in only one list at a time, and a
+        // double-insert would trip the list's unlinked assertion / corrupt it.
+        let transmission = if !self.is_tx_scheduled()
+            && !self.is_queued_for_assembly()
+            && self.has_pending_data()
+            && self.can_send_pending_frames()
+        {
+            // Non-urgent pending data follows CCA pacing via the tx_wheel. The
+            // earliest-departure-time is clamped to MAX_TX_PACING_DELAY inside the accessor,
+            // so a degenerate pacing rate cannot park the wheel days out.
+            let target = self
+                .cca
+                .earliest_departure_time(clock)
+                .map(precision::Timestamp::from);
+            // If target time is `None` then the wheel will schedule it immediately
+            self.tx_wheel.target_time = target;
+            true
+        } else {
+            false
+        };
 
         let pto = if !self.is_pto_scheduled() && self.inflight.has_inflight() {
             if let Some(target) = self.pto.next_target(clock, &self.rtt_estimator) {
