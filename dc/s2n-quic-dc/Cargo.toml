@@ -16,6 +16,11 @@ testing = ["dep:bach", "bolero-generator", "s2n-quic-core/testing", "s2n-quic-pl
 tracing = []
 tokio = ["tokio/io-util", "tokio/net", "tokio/rt-multi-thread", "tokio/time"]
 metric-tracing = []
+# Enables the QueueDbg end-to-end stuck-stream diagnostic: the `emit_debug` API,
+# the receiver wake-and-dump path, and per-hop state dumps. Pulls in `tracing` so
+# the dump macros actually emit. The `QueueDbg` frame variant itself always
+# compiles (so the wire stays decodable); this feature only gates emission/dumping.
+queue-dbg = ["tracing"]
 # Enables loom-instrumented concurrency models. Crate-scoped (a cargo feature, not a global
 # `--cfg loom`), so it does not leak into dependencies like concurrent-queue.
 loom = ["dep:loom"]

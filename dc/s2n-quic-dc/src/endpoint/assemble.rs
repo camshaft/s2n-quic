@@ -363,6 +363,24 @@ where
             if can_send_pending {
                 while let Some(mut frame) = context.pop_pending() {
                     if !frame.should_transmit() {
+                        crate::endpoint::dbg::on_enabled(|| {
+                            if let frame::Header::QueueDbg {
+                                dump_id,
+                                queue_pair,
+                                binding_id,
+                            } = frame.header
+                            {
+                                // The marker was cancelled before assembly (its emitting handle is
+                                // already gone) — record where it died.
+                                context.dump_queue_dbg(
+                                    dump_id,
+                                    queue_pair,
+                                    binding_id,
+                                    "assemble_cancelled",
+                                    context.next_packet_number,
+                                );
+                            }
+                        });
                         let _ = cancelled.send(frame);
                         continue;
                     }
@@ -386,6 +404,24 @@ where
                     if phase3_is_probe {
                         counters.on_probe_frame(&frame.header);
                     }
+                    crate::endpoint::dbg::on_enabled(|| {
+                        if let frame::Header::QueueDbg {
+                            dump_id,
+                            queue_pair,
+                            binding_id,
+                        } = frame.header
+                        {
+                            // The packet number this frame is about to be assigned (see the
+                            // `next_packet_number` assignment after this loop).
+                            context.dump_queue_dbg(
+                                dump_id,
+                                queue_pair,
+                                binding_id,
+                                if phase3_is_probe { "probe" } else { "assemble" },
+                                context.next_packet_number,
+                            );
+                        }
+                    });
                     // Take credits before the move into packet_frames; the field stays at
                     // 0 inside the inflight map so any later disposal can't double-release.
                     // The total is summed across the whole GSO batch and released once

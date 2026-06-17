@@ -527,6 +527,19 @@ pub enum Header {
         binding_id: VarInt,
         desired_offset: VarInt,
     },
+    /// Stuck-stream diagnostic marker (see the `queue-dbg` feature).
+    ///
+    /// Payload-less. Carries a unique `dump_id` plus routing identity so that every entity that
+    /// touches it — the emitter, each send-pipeline hop, the receiving dispatch context, and the
+    /// woken peer Reader/Writer — logs its own state stamped with the same `dump_id`. Grep one
+    /// `dump_id` and the whole end-to-end trace falls out in order. The frame is a pure trigger:
+    /// it transmits no state, since each entity's own live fields are richer than any snapshot we
+    /// could serialize.
+    QueueDbg {
+        dump_id: VarInt,
+        queue_pair: QueuePair,
+        binding_id: VarInt,
+    },
 }
 
 impl Header {
@@ -550,6 +563,7 @@ impl Header {
     const ACK_ELICITING_TYPE: u8 = 19;
     const PING_TYPE: u8 = 20;
     const QUEUE_DATA_BLOCKED_TYPE: u8 = 21;
+    const QUEUE_DBG_TYPE: u8 = 22;
     // QueueMsg: 16 type tags with bit-positioned flags.
     // Bit 0: is_fin, Bit 1: is_wakeup, Bit 2: has_dest_acceptor_id (init), Bit 3: blocked
     const QUEUE_MSG_BASE_TYPE: u8 = 32;
@@ -574,9 +588,11 @@ impl Header {
             Self::QueueControl { .. }
             | Self::QueueMaxData { .. }
             | Self::QueueDataBlocked { .. } => Priority::QueueControl,
-            Self::QueueFree { .. } | Self::Ack { .. } | Self::QueueReset { .. } | Self::Ping => {
-                Priority::QueueReset
-            }
+            Self::QueueFree { .. }
+            | Self::Ack { .. }
+            | Self::QueueReset { .. }
+            | Self::Ping
+            | Self::QueueDbg { .. } => Priority::QueueReset,
         }
     }
 
@@ -724,6 +740,7 @@ impl Header {
             Self::QueueReset { .. }
             | Self::QueueMaxData { .. }
             | Self::QueueDataBlocked { .. }
+            | Self::QueueDbg { .. }
             | Self::Ping => false,
         }
     }
@@ -912,6 +929,16 @@ impl EncoderValue for Header {
                 encoder.encode(queue_pair);
                 encoder.encode(binding_id);
                 encoder.encode(desired_offset);
+            }
+            Self::QueueDbg {
+                dump_id,
+                queue_pair,
+                binding_id,
+            } => {
+                encoder.encode(&Self::QUEUE_DBG_TYPE);
+                encoder.encode(dump_id);
+                encoder.encode(queue_pair);
+                encoder.encode(binding_id);
             }
         }
     }
@@ -1142,6 +1169,19 @@ impl<'a> s2n_codec::DecoderValue<'a> for Header {
                         queue_pair,
                         binding_id,
                         desired_offset,
+                    },
+                    buffer,
+                ))
+            }
+            Self::QUEUE_DBG_TYPE => {
+                let (dump_id, buffer) = buffer.decode()?;
+                let (queue_pair, buffer) = buffer.decode()?;
+                let (binding_id, buffer) = buffer.decode()?;
+                Ok((
+                    Self::QueueDbg {
+                        dump_id,
+                        queue_pair,
+                        binding_id,
                     },
                     buffer,
                 ))
@@ -1769,5 +1809,43 @@ mod tests {
             "MAX_QUEUE_MSG_HEADER_OVERHEAD ({MAX_QUEUE_MSG_HEADER_OVERHEAD}) does not match \
              computed worst-case ({computed})"
         );
+    }
+
+    #[test]
+    fn queue_dbg_roundtrip() {
+        let qp = QueuePair {
+            source_queue_id: VarInt::from_u8(5),
+            dest_queue_id: VarInt::from_u8(7),
+        };
+        // Small values and full-width VarInts both round-trip.
+        for (dump_id, binding_id) in [
+            (VarInt::ZERO, VarInt::from_u8(42)),
+            (VarInt::MAX, VarInt::MAX),
+            (VarInt::new(1 << 40).unwrap(), VarInt::new(1 << 30).unwrap()),
+        ] {
+            roundtrip(Header::QueueDbg {
+                dump_id,
+                queue_pair: qp,
+                binding_id,
+            });
+        }
+    }
+
+    #[test]
+    fn queue_dbg_frame_properties() {
+        let header = Header::QueueDbg {
+            dump_id: VarInt::from_u8(1),
+            queue_pair: QueuePair {
+                source_queue_id: VarInt::ZERO,
+                dest_queue_id: VarInt::ZERO,
+            },
+            binding_id: VarInt::ZERO,
+        };
+        // Payload-less: no per-frame payload-length varint on the wire.
+        assert!(!header.has_payload_length());
+        // Ack-eliciting so it is retransmitted on loss and reliably reaches the peer.
+        assert!(header.is_ack_eliciting());
+        // Lowest priority tier — diagnostics must never displace real traffic.
+        assert_eq!(header.priority(), Priority::QueueReset);
     }
 }

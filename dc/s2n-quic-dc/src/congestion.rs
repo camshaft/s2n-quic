@@ -1,6 +1,7 @@
 // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+use core::time::Duration;
 use s2n_quic_core::{
     event, random,
     recovery::{
@@ -9,7 +10,6 @@ use s2n_quic_core::{
     },
     time::{timer, Clock, Timestamp},
 };
-use core::time::Duration;
 
 pub type PacketInfo = <BbrCongestionController as CongestionController>::PacketInfo;
 
@@ -177,6 +177,16 @@ impl Controller {
         self.controller
             .earliest_departure_time()
             .map(|edt| edt.min(clock.get_time() + MAX_TX_PACING_DELAY))
+    }
+
+    /// The raw, unclamped earliest-departure-time straight from the pacer, with no
+    /// [`MAX_TX_PACING_DELAY`] backstop applied. For diagnostics only (it needs no clock): a
+    /// departure time far in the future here — while [`earliest_departure_time`] reports a clamped
+    /// value — is the signature of a pacer-rate collapse, exactly the case we want visible in a
+    /// `QueueDbg` dump.
+    #[inline]
+    pub fn earliest_departure_time_raw(&self) -> Option<Timestamp> {
+        self.controller.earliest_departure_time()
     }
 
     #[inline]

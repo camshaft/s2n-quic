@@ -897,6 +897,129 @@ fn dispatch_decoded_frame(
                 waker_sink,
             );
         }
+        Header::QueueDbg {
+            dump_id,
+            queue_pair,
+            binding_id,
+        } => {
+            handle_queue_dbg(
+                peer,
+                dump_id,
+                queue_pair,
+                binding_id,
+                credentials,
+                counters,
+                waker_sink,
+            );
+        }
+    }
+}
+
+// ── QueueDbg ───────────────────────────────────────────────────────────────
+
+/// Handle a received `QueueDbg` stuck-stream diagnostic marker (see the `queue-dbg` feature).
+///
+/// Dumps the whole `recv::Context` — stamped with the shared `dump_id` so the line joins the
+/// end-to-end trace — then wakes the parked peer Reader **and** Writer by pushing a `Debug` entry
+/// onto both queue halves. Each woken handle logs its own `Inner` plus the peer's claimed routing
+/// identity, so a binding/queue divergence shows up as a mismatch. Unlike the sibling handlers,
+/// a delivery failure here is itself a finding (the binding is gone/diverged), so it is logged in
+/// full rather than silently dropped.
+///
+/// When the diagnostic is disabled (the common production case) the whole body is gated behind
+/// [`dbg::on_enabled`], which folds to nothing: the frame still decodes (the wire stays
+/// compatible) but nothing is logged, pushed, or woken.
+#[allow(clippy::too_many_arguments)]
+fn handle_queue_dbg(
+    peer: &mut recv::Context,
+    dump_id: VarInt,
+    queue_pair: QueuePair,
+    binding_id: VarInt,
+    credentials: &Credentials,
+    counters: &counters::Dispatch,
+    waker_sink: &mut impl channel::UnboundedSender<AutoWake>,
+) {
+    let _ = counters;
+    crate::endpoint::dbg::on_enabled(|| {
+        let dest_queue_id = queue_pair.dest_queue_id;
+        let peer_cred_id = credentials.id;
+
+        info!(
+            dump_id = dump_id.as_u64(),
+            %credentials,
+            binding_id = binding_id.as_u64(),
+            dest_queue_id = dest_queue_id.as_u64(),
+            source_queue_id = queue_pair.source_queue_id.as_u64(),
+            context = ?peer,
+            "QueueDbg received: recv::Context state"
+        );
+
+        // Wake whichever of the peer Reader/Writer is parked so each dumps its own `Inner`. Push to
+        // both halves; the entry carries the peer-claimed identity so the handle can flag a mismatch.
+        match peer.queue_view.send_stream(
+            dest_queue_id,
+            binding_id,
+            crate::endpoint::msg::Stream::Debug {
+                dump_id: dump_id.as_u64(),
+                peer_queue_pair: queue_pair,
+                peer_binding_id: binding_id,
+                peer_cred_id,
+            }
+            .into(),
+        ) {
+            Ok((waker, release_bytes)) => {
+                let _ = waker_sink.send(waker);
+                // A diagnostic marker carries no payload, so there is nothing to release.
+                debug_assert_eq!(release_bytes, 0);
+            }
+            Err(err) => {
+                info!(
+                    dump_id = dump_id.as_u64(),
+                    binding_id = binding_id.as_u64(),
+                    queue_id = dest_queue_id.as_u64(),
+                    reason = queue_error_reason(&err),
+                    "QueueDbg stream-half delivery failed (binding gone/diverged)"
+                );
+            }
+        }
+
+        match peer.queue_view.send_control(
+            dest_queue_id,
+            binding_id,
+            crate::endpoint::msg::Control::Debug {
+                dump_id: dump_id.as_u64(),
+                peer_queue_pair: queue_pair,
+                peer_binding_id: binding_id,
+                peer_cred_id,
+            }
+            .into(),
+        ) {
+            Ok(waker) => {
+                let _ = waker_sink.send(waker);
+            }
+            Err(err) => {
+                info!(
+                    dump_id = dump_id.as_u64(),
+                    binding_id = binding_id.as_u64(),
+                    queue_id = dest_queue_id.as_u64(),
+                    reason = queue_error_reason(&err),
+                    "QueueDbg control-half delivery failed (binding gone/diverged)"
+                );
+            }
+        }
+    });
+}
+
+/// A static label for a queue dispatch error, for diagnostic logging without requiring the
+/// (entry-carrying) `Error<T>` to be `Debug`/`Display`.
+fn queue_error_reason<T>(err: &crate::queue::Error<T>) -> &'static str {
+    match err {
+        crate::queue::Error::Unallocated(_) => "unallocated",
+        crate::queue::Error::HalfClosed(_) => "half_closed",
+        crate::queue::Error::SenderClosed => "sender_closed",
+        crate::queue::Error::StaleBinding(_) => "stale_binding",
+        crate::queue::Error::FutureBinding(_) => "future_binding",
+        crate::queue::Error::CapExceeded(_) => "cap_exceeded",
     }
 }
 
@@ -1928,7 +2051,10 @@ fn bind_for_reset(
                 "init reset - new binding created"
             );
         }
-        Ok(crate::queue::BindResult::Bound { waker, release_bytes }) => {
+        Ok(crate::queue::BindResult::Bound {
+            waker,
+            release_bytes,
+        }) => {
             // The init already bound the slot; nothing to create. Reset delivery
             // proceeds against the existing binding.
             let _ = waker_sink.send(waker);
