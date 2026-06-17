@@ -52,6 +52,15 @@ impl QueueView {
         }
     }
 
+    /// Read-only diagnostic snapshot of the slot at `queue_id`. For logging why a delivery was
+    /// rejected; see [`queue::slot::Slot::diag`].
+    pub fn slot_diag(&mut self, queue_id: VarInt) -> Option<queue::slot::SlotDiag> {
+        match self {
+            Self::Client(d) => d.slot_diag(queue_id),
+            Self::Server(d) => d.slot_diag(queue_id),
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     #[allow(clippy::too_many_arguments)]
     pub fn send_msg<E>(

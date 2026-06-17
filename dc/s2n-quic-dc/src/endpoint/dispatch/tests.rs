@@ -420,3 +420,37 @@ fn fast_path_insert_reject_requires_auth_before_ack() {
         }
     );
 }
+
+/// `QueueView::slot_diag` reports the slot's real current state — the data the enriched QueueDbg
+/// delivery-failure log relies on to show a binding divergence. A bound slot reports its stored
+/// binding with both halves live; an unbound slot reports `unallocated` with no receivers.
+#[test]
+fn slot_diag_reports_bound_vs_unallocated_state() {
+    let queue_id = VarInt::from_u8(7);
+    let binding_id = VarInt::from_u8(42);
+
+    // Bound slot: stored binding matches, both halves attached, queues empty.
+    let mut bound = bound_server_view(queue_id, binding_id);
+    let diag = bound
+        .slot_diag(queue_id)
+        .expect("bound slot must be present");
+    assert!(!diag.unallocated, "a freshly bound slot is allocated");
+    assert_eq!(
+        diag.stored_binding,
+        binding_id.as_u64(),
+        "slot must report the binding it was bound with"
+    );
+    assert!(diag.stream_has_receiver && diag.control_has_receiver);
+    assert_eq!(diag.stream_depth, 0);
+    assert_eq!(diag.control_depth, 0);
+
+    // A never-bound slot in the same view reads back as unallocated with no receiver attached —
+    // exactly the divergence a stale/unallocated QueueDbg delivery surfaces.
+    let other_queue_id = VarInt::from_u8(9);
+    assert!(
+        bound
+            .slot_diag(other_queue_id)
+            .is_none_or(|d| d.unallocated && !d.stream_has_receiver),
+        "an unbound slot must read back as unallocated with no receiver"
+    );
+}

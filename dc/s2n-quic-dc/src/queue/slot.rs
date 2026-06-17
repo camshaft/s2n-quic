@@ -55,6 +55,25 @@ pub(crate) struct Slot {
     pub(crate) control: Half<msg::Control>,
 }
 
+/// Read-only snapshot of a slot's current routing/liveness state, for diagnostic logging when a
+/// delivery is rejected. See [`Slot::diag`].
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SlotDiag {
+    /// The binding id currently stored in the slot (UNALLOCATED bit stripped). Compare against the
+    /// binding the rejected delivery presented to read the divergence.
+    pub stored_binding: u64,
+    /// Whether the slot is currently unallocated (no live binding).
+    pub unallocated: bool,
+    /// Reader's currently-advertised receive window.
+    pub advertised_window: u64,
+    pub stream_has_sender: bool,
+    pub stream_has_receiver: bool,
+    pub stream_depth: usize,
+    pub control_has_sender: bool,
+    pub control_has_receiver: bool,
+    pub control_depth: usize,
+}
+
 pub(crate) struct StreamState {
     pub(crate) msg_table: Option<MsgTable>,
     /// Stream offset up to which MsgTable deliveries must always wake the reader.
@@ -246,6 +265,37 @@ impl Slot {
     pub(crate) fn binding_id(&self) -> VarInt {
         let raw = self.binding_id.load(Ordering::Relaxed);
         VarInt::new(raw & !UNALLOCATED_BIT).unwrap_or(VarInt::ZERO)
+    }
+
+    /// Read-only diagnostic snapshot of this slot's current routing/liveness state.
+    ///
+    /// For logging *why* a delivery to this slot was rejected (stale/unallocated binding): it
+    /// captures what the slot actually holds now, so the log can show the divergence against the
+    /// binding the caller presented. Takes each half lock briefly to read flags and queue depth;
+    /// the binding word is a relaxed atomic load. Diagnostics-only — never on a hot path.
+    pub(crate) fn diag(&self) -> SlotDiag {
+        let raw = self.binding_id.load(Ordering::Relaxed);
+        let (stream_flags, stream_depth) = {
+            let inner = self.stream.inner.lock();
+            (inner.flags, inner.queue.len())
+        };
+        let (control_flags, control_depth) = {
+            let inner = self.control.inner.lock();
+            (inner.flags, inner.queue.len())
+        };
+        SlotDiag {
+            stored_binding: VarInt::new(raw & !UNALLOCATED_BIT)
+                .unwrap_or(VarInt::ZERO)
+                .as_u64(),
+            unallocated: raw & UNALLOCATED_BIT != 0,
+            advertised_window: self.advertised_window.load(Ordering::Acquire),
+            stream_has_sender: stream_flags.contains(Flags::HAS_SENDER),
+            stream_has_receiver: stream_flags.contains(Flags::HAS_RECEIVER),
+            stream_depth,
+            control_has_sender: control_flags.contains(Flags::HAS_SENDER),
+            control_has_receiver: control_flags.contains(half::Flags::HAS_RECEIVER),
+            control_depth,
+        }
     }
 
     /// Returns a stable raw pointer to this slot.
