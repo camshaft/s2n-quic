@@ -375,6 +375,7 @@ where
                 crate::endpoint::frame_trace::Direction::InboundFastPath,
                 &header,
                 Some(packet_number),
+                credentials.id,
             );
             return match decrypt_fast_path(
                 header,
@@ -558,6 +559,7 @@ where
                     crate::endpoint::frame_trace::Direction::Inbound,
                     &header,
                     Some(packet_number),
+                    credentials.id,
                 );
                 // Validate that the claimed payload length fits within the
                 // remaining payload storage.
@@ -965,6 +967,7 @@ fn handle_queue_dbg(
                 binding_id,
             },
             None,
+            credentials.id,
         );
         crate::endpoint::frame_trace::trigger();
 
