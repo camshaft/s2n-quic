@@ -54,7 +54,11 @@ fn setup(local_addr: SocketAddr, peer_addr: SocketAddr) -> TestSetup {
         .unwrap();
     peer_map.test_stop_cleaner();
 
-    let ids = local_map.test_insert_pair(local_addr, None, &peer_map, peer_addr, None);
+    let ids = local_map.test_insert_pair(
+        crate::path::secret::map::Entry::builder(peer_addr).local(local_addr),
+        &peer_map,
+        crate::path::secret::map::Entry::builder(local_addr).local(peer_addr),
+    );
 
     let local_entry = local_map
         .get_by_id(&ids.local)

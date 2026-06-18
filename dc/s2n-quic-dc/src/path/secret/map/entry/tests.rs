@@ -27,6 +27,7 @@ fn test_entry_with_senders(sender_count: usize) -> Entry {
         s2n_quic_core::dc::testing::TEST_APPLICATION_PARAMS,
         crate::time::DefaultClock::default().now().into(),
         None,
+        Arc::from([peer]),
         sender_count,
     )
 }
@@ -43,7 +44,7 @@ fn entry_size() {
     if should_check {
         assert_eq!(
             Entry::builder((std::net::Ipv4Addr::LOCALHOST, 0).into())
-                .build()
+                .build(None)
                 .size(),
             // Includes per-entry sender scheduling storage metadata (Box<[AtomicU64]>).
             323

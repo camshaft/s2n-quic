@@ -20,19 +20,9 @@ pub fn create(
 ) -> io::Result<Arc<endpoint::Endpoint>> {
     let runtime = runtime::busy_poll::Handle::new(pool.clone());
 
-    // Create the path secret map (shared by endpoint, client PSK, server PSK)
-    let signer = Signer::new(b"dc-tester");
-    let clock = s2n_quic_dc::time::tokio::Clock::default();
-    let subscriber = s2n_quic_dc::event::tracing::Subscriber::default();
-    let map = secret::Map::builder()
-        .with_signer(signer)
-        .with_capacity(50_000)
-        .with_evict_on_unknown_path_secret(true)
-        .with_clock(clock)
-        .with_subscriber(subscriber)
-        .build()
-        .unwrap();
-
+    // Bind the sockets first: the recv socket addresses are advertised to peers via the
+    // path-secret map's `DcDataAddresses` transport parameter, so the map must be built
+    // after the sockets exist and their bound addresses are known.
     let gso = endpoint::Gso::default();
     let num_sockets = config.recv_io_workers.max(config.send_sockets);
     let bind_addrs = (0..num_sockets)
@@ -50,6 +40,12 @@ pub fn create(
     );
     let (send_sockets, recv_sockets) = socket_config.busy_poll()?;
 
+    // The recv socket addresses are what peers should target with DC data packets.
+    let data_addrs: Vec<SocketAddr> = recv_sockets
+        .iter()
+        .map(|s| s.local_addr().expect("recv socket must have a local address"))
+        .collect();
+
     {
         let recv_port = recv_sockets.first().unwrap().local_addr().unwrap().port();
         info!(
@@ -57,6 +53,22 @@ pub fn create(
             recv_port, "Recv sockets bound"
         );
     }
+
+    // Create the path secret map (shared by endpoint, client PSK, server PSK). The recv
+    // socket addresses are advertised to peers in the `DcDataAddresses` transport
+    // parameter so senders can target individual recv workers directly.
+    let signer = Signer::new(b"dc-tester");
+    let clock = s2n_quic_dc::time::tokio::Clock::default();
+    let subscriber = s2n_quic_dc::event::tracing::Subscriber::default();
+    let map = secret::Map::builder()
+        .with_signer(signer)
+        .with_capacity(50_000)
+        .with_evict_on_unknown_path_secret(true)
+        .with_advertised_data_addrs(&data_addrs)
+        .with_clock(clock)
+        .with_subscriber(subscriber)
+        .build()
+        .unwrap();
 
     {
         let send_ports: Vec<u16> = send_sockets

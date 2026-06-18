@@ -193,8 +193,7 @@ fn test_path_secret_entry() -> Arc<PathSecretEntry> {
     let peer: std::net::SocketAddr = "127.0.0.1:4433".parse().unwrap();
     let entry = PathSecretEntry::builder(peer)
         .socket_sender_count(1)
-        .build();
-    entry.set_peer_data_addrs(&[peer]);
+        .build(None);
     entry.update_max_datagram_size(TEST_MTU);
     entry
 }

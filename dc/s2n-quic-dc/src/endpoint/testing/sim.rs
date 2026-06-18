@@ -568,6 +568,9 @@ pub fn connect(
     // For self-connect (local_addr == peer_addr, same map), get_raw returns the last-inserted
     // entry which is the Server entry — wrong for the Writer side.  Look up the Client entry
     // (ids.local) explicitly so the Writer seals packets with the correct Client-type keys.
+    // `insert_fake_path_pair` stamps each entry's `peer_data_addrs` at construction
+    // (the full recv-socket list the other side advertises), so both the local entry
+    // and the peer's server-side entry can already resolve a send destination.
     let entry = if local_addr == peer_addr {
         local_map
             .get_by_id(&ids.local)
@@ -577,24 +580,6 @@ pub fn connect(
             .get_raw(peer_addr)
             .expect("path-secret entry just inserted by insert_fake_path_pair")
     };
-
-    // Set the peer's full recv address list (simulates the post-handshake exchange).
-    let peer_data_addrs = lookup_peer_data_addrs(peer_addr);
-    entry.set_peer_data_addrs(&peer_data_addrs);
-
-    if local_addr == peer_addr {
-        // Self-connect: also set peer_data_addrs on the Server entry so that the
-        // acceptor-side Writer can route the echo packets back.
-        if let Some(server_entry) = local_map.get_by_id(&ids.peer) {
-            server_entry.set_peer_data_addrs(&peer_data_addrs);
-        }
-    } else {
-        // Set our addrs on the peer's server-side entry (looked up by ID since
-        // server entries are not in the address-keyed client map).
-        if let Some(peer_entry) = peer_map.get_by_id(&ids.peer) {
-            peer_entry.set_peer_data_addrs(&local_endpoint.data_addrs);
-        }
-    }
 
     entry
 }
@@ -620,10 +605,27 @@ pub fn insert_fake_path_pair(
     peer_map: &PathSecretMap,
     peer_addr: SocketAddr,
 ) -> TestPairIds {
-    let local_params = lookup_sim_params(local_addr);
-    let peer_params = lookup_sim_params(peer_addr);
+    use crate::path::secret::map::Entry;
 
-    local_map.test_insert_pair(local_addr, local_params, peer_map, peer_addr, peer_params)
+    // Each side's `peer_data_addrs` is the full recv-socket address list the *other*
+    // endpoint advertises, mirroring what the `DcDataAddresses` transport parameter
+    // supplies at handshake completion. The local-side entry (keyed by peer_addr) targets
+    // the peer's addrs; the peer-side entry (keyed by local_addr) targets ours.
+    let mut local_builder = Entry::builder(peer_addr)
+        .local(local_addr)
+        .peer_data_addrs(lookup_peer_data_addrs(peer_addr));
+    if let Some(params) = lookup_sim_params(local_addr) {
+        local_builder = local_builder.params(params);
+    }
+
+    let mut peer_builder = Entry::builder(local_addr)
+        .local(peer_addr)
+        .peer_data_addrs(lookup_peer_data_addrs(local_addr));
+    if let Some(params) = lookup_sim_params(peer_addr) {
+        peer_builder = peer_builder.params(params);
+    }
+
+    local_map.test_insert_pair(local_builder, peer_map, peer_builder)
 }
 
 /// Returns the [`PathSecretMap`] registered for the given address, or `None`

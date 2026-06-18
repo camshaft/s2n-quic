@@ -249,7 +249,7 @@ mod tests {
 
     fn test_setup() -> (Arc<PathSecretEntry>, FreedInner, FreedBatchTx, FreedBatchRx) {
         let (tx, rx) = freed_batch_channel();
-        let path_entry = PathSecretEntry::builder("127.0.0.1:4433".parse().unwrap()).build();
+        let path_entry = PathSecretEntry::builder("127.0.0.1:4433".parse().unwrap()).build(None);
         let freed = FreedInner::new();
         (path_entry, freed, tx, rx)
     }

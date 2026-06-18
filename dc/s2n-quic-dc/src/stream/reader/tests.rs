@@ -67,7 +67,7 @@ fn make_pair_with_pool_and_initial_window(
         initial_recv_window,
         PathSecretEntry::builder("127.0.0.1:4433".parse().unwrap())
             .endpoint_type(endpoint::Type::Client)
-            .build(),
+            .build(None),
     )
 }
 
@@ -127,7 +127,7 @@ fn make_server_pair_with_pool_and_initial_window(
     let peer: SocketAddr = "127.0.0.1:4433".parse().unwrap();
     let path_secret_entry = PathSecretEntry::builder(peer)
         .endpoint_type(endpoint::Type::Client)
-        .build();
+        .build(None);
 
     let client_state = std::sync::Arc::new(crate::queue::ClientState::new(
         VarInt::from_u16(100),
@@ -190,7 +190,7 @@ fn application_data_returns_value_from_path_secret_entry() {
     let entry = PathSecretEntry::builder(peer)
         .endpoint_type(endpoint::Type::Client)
         .application_data(Some(data.clone()))
-        .build();
+        .build(None);
     let pool = crate::sync::Arc::new(crate::credit::Pool::new(crate::credit::Config::default()));
     let (reader, _) = make_pair_with_pool_and_initial_window_and_entry(pool, 0, entry);
     let returned = reader

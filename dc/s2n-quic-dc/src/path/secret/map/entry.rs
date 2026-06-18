@@ -49,7 +49,7 @@ pub struct ApplicationDataRequest<'a> {
 
 pub const MAX_PEER_DATA_ADDRS: usize = 128;
 
-pub type PeerDataAddrs = tokio::sync::SetOnce<Arc<[s2n_quic_core::inet::SocketAddressV6]>>;
+pub type PeerDataAddrs = Arc<[SocketAddr]>;
 
 #[derive(Debug, thiserror::Error)]
 #[error("{inner}")]
@@ -133,9 +133,7 @@ impl SizeOf for Entry {
             + last_activity.size()
             + dead_at.size()
             + std::mem::size_of::<PeerDataAddrs>()
-            + peer_data_addrs.get().map_or(0, |a| {
-                a.len() * std::mem::size_of::<s2n_quic_core::inet::SocketAddressV6>()
-            })
+            + peer_data_addrs.len() * std::mem::size_of::<s2n_quic_core::inet::SocketAddressV6>()
             + std::mem::size_of::<Box<[AtomicU64]>>()
             + sender_load_scores.len() * std::mem::size_of::<AtomicU64>()
             + std::mem::size_of::<QueueState>()
@@ -187,6 +185,7 @@ impl Entry {
             parameters,
             creation_time,
             application_data,
+            Default::default(),
             1,
         )
     }
@@ -200,6 +199,7 @@ impl Entry {
         parameters: dc::ApplicationParams,
         creation_time: Timestamp,
         application_data: Option<ApplicationData>,
+        peer_data_addrs: Arc<[SocketAddr]>,
         socket_sender_count: usize,
     ) -> Self {
         // clamp max datagram size to a well-known value
@@ -235,14 +235,14 @@ impl Entry {
             application_data,
             last_activity: AtomicU64::new(0),
             dead_at: AtomicI64::new(-1),
-            peer_data_addrs: PeerDataAddrs::default(),
+            peer_data_addrs,
             sender_load_scores: Self::init_load_scores(socket_sender_count),
             queue_state,
         }
     }
 
     #[cfg(any(test, feature = "testing"))]
-    pub fn builder(peer: SocketAddr) -> TestEntryBuilder<'static> {
+    pub fn builder(peer: SocketAddr) -> TestEntryBuilder {
         TestEntryBuilder::new(peer)
     }
 
@@ -258,55 +258,7 @@ impl Entry {
     /// Returns true if the peer's data addresses have been learned via the post-handshake exchange.
     #[inline]
     pub fn has_data_addrs(&self) -> bool {
-        self.peer_data_addrs.get().is_some()
-    }
-
-    /// Set the peer's data addresses, learned from the post-handshake exchange.
-    ///
-    /// Wildcard IPs in the address list are replaced with the peer's handshake IP,
-    /// since the peer bound to `[::]` but is reachable at the address we connected to.
-    ///
-    /// Returns `false` if validation fails (empty list, wildcard ports, or
-    /// loopback addrs from a non-loopback peer).
-    pub fn set_peer_data_addrs(&self, addrs: &[SocketAddr]) -> bool {
-        use s2n_quic_core::inet::SocketAddress;
-
-        if addrs.is_empty() {
-            error!(peer = %self.peer, "peer data addrs list is empty");
-            return false;
-        }
-
-        let peer_ip = self.peer.ip();
-        let peer_is_loopback = peer_ip.is_loopback();
-        let mut v6_addrs = Vec::with_capacity(addrs.len());
-
-        for addr in addrs {
-            if addr.port() == 0 {
-                error!(%addr, peer = %self.peer, "peer data addr has wildcard port");
-                return false;
-            }
-
-            let ip = match addr.ip() {
-                ip if ip.is_unspecified() => peer_ip,
-                ip => ip,
-            };
-
-            if !peer_is_loopback && ip.is_loopback() {
-                error!(
-                    %addr, peer = %self.peer,
-                    "peer data addr is loopback but handshake addr is not"
-                );
-                return false;
-            }
-
-            let resolved = SocketAddr::new(ip, addr.port());
-            v6_addrs.push(SocketAddress::from(resolved).to_ipv6_mapped());
-        }
-
-        ::tracing::debug!(peer = %self.peer, addrs = ?v6_addrs, "setting peer data addresses");
-
-        let _ = self.peer_data_addrs.set(v6_addrs.into());
-        true
+        !self.peer_data_addrs.is_empty()
     }
 
     fn sender_index(&self, sender_idx: LocalSenderId) -> Option<usize> {
@@ -618,19 +570,19 @@ impl Entry {
 }
 
 #[cfg(any(test, feature = "testing"))]
-pub struct TestEntryBuilder<'a> {
+pub struct TestEntryBuilder {
     local: SocketAddr,
     peer: SocketAddr,
     endpoint_type: s2n_quic_core::endpoint::Type,
     socket_sender_count: usize,
     generation: u64,
     params: Option<dc::ApplicationParams>,
-    signer: Option<&'a super::stateless_reset::Signer>,
     application_data: Option<ApplicationData>,
+    peer_data_addrs: Arc<[SocketAddr]>,
 }
 
 #[cfg(any(test, feature = "testing"))]
-impl<'a> TestEntryBuilder<'a> {
+impl TestEntryBuilder {
     fn new(peer: SocketAddr) -> Self {
         Self {
             local: peer,
@@ -639,8 +591,10 @@ impl<'a> TestEntryBuilder<'a> {
             socket_sender_count: 0,
             generation: 0,
             params: None,
-            signer: None,
             application_data: None,
+            // Default to the single peer address so the common test entry can resolve a
+            // send context without extra setup. Override via `peer_data_addrs`.
+            peer_data_addrs: Arc::from([peer]),
         }
     }
 
@@ -676,6 +630,13 @@ impl<'a> TestEntryBuilder<'a> {
         self
     }
 
+    /// Set the peer's data-plane addresses the built `Entry` will carry, as the
+    /// validated `DcDataAddresses` transport parameter would supply at handshake time.
+    pub fn peer_data_addrs(mut self, addrs: impl Into<Arc<[SocketAddr]>>) -> Self {
+        self.peer_data_addrs = addrs.into();
+        self
+    }
+
     fn secret_bytes(&self) -> [u8; 32] {
         use s2n_quic_core::endpoint::Type;
 
@@ -686,15 +647,16 @@ impl<'a> TestEntryBuilder<'a> {
         Self::deterministic_secret(client_addr, server_addr, self.generation)
     }
 
-    pub fn signer(mut self, signer: &'a super::stateless_reset::Signer) -> Self {
-        self.signer = Some(signer);
-        self
-    }
-
-    pub fn build(&self) -> Arc<Entry> {
+    /// Build the `Entry`.
+    ///
+    /// `signer` produces the stateless-reset token. Pass `None` to derive a default
+    /// signer from this entry's deterministic secret (sufficient for entries used in
+    /// isolation); pass `Some` to cross-sign a path pair (see `test_insert_pair`), where
+    /// each side must be signed by the *other* side's signer.
+    pub fn build(&self, signer: Option<&super::stateless_reset::Signer>) -> Arc<Entry> {
         let secret_bytes = self.secret_bytes();
         let default_signer;
-        let signer = match self.signer {
+        let signer = match signer {
             Some(s) => s,
             None => {
                 default_signer = super::stateless_reset::Signer::new(&secret_bytes);
@@ -724,6 +686,7 @@ impl<'a> TestEntryBuilder<'a> {
             params,
             crate::time::DefaultClock::default().now().into(),
             self.application_data.clone(),
+            self.peer_data_addrs.clone(),
             self.socket_sender_count,
         ))
     }

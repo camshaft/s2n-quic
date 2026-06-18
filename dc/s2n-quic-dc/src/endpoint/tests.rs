@@ -2581,21 +2581,20 @@ fn queue_free_lost_on_peer_dead_invalidation() {
             client_params.max_queues = VarInt::from_u8(2);
             client_params.remote_max_data = client_params.local_recv_max_data;
 
-            // Insert path pair. local_params → server_map entry, peer_params → client_map entry.
+            // Insert path pair. The client-side entry (in client_map, keyed by
+            // server_addr) carries server_send_params; the server-side entry
+            // (in server_map, keyed by client_addr) carries client_params. Each
+            // builder's default peer_data_addrs is its `Entry::builder` address, so
+            // the send context can resolve the destination without extra setup.
             client_map.test_insert_pair(
-                client_addr,
-                Some(server_send_params),
+                crate::path::secret::map::Entry::builder(server_addr)
+                    .local(client_addr)
+                    .params(server_send_params),
                 &server_map,
-                server_addr,
-                Some(client_params),
+                crate::path::secret::map::Entry::builder(client_addr)
+                    .local(server_addr)
+                    .params(client_params),
             );
-
-            if let Some(entry) = client_map.get_raw(server_addr) {
-                entry.set_peer_data_addrs(&[server_addr]);
-            }
-            if let Some(entry) = server_map.get_raw(client_addr) {
-                entry.set_peer_data_addrs(&[client_addr]);
-            }
 
             // ── Stream 1: complete successfully (uses peer slot 0) ───────
             let stream1 = client
@@ -2766,29 +2765,20 @@ fn stale_key_detected_after_recv_cache_eviction() {
             let mut long_params = TEST_APPLICATION_PARAMS;
             long_params.remote_max_data = long_params.local_recv_max_data;
 
-            // Insert the path-secret pair.
-            //
-            // In test_insert_pair, `local_params` is used by the peer (server_map)
-            // and `peer_params` is used by self (client_map):
-            //
-            //   client_map entry (for server_addr): peer_params  → LONG timeout
-            //   server_map entry (for client_addr): local_params → SHORT timeout
+            // Insert the path-secret pair, preserving the original param routing:
+            // the entry in client_map (keyed by server_addr) carries short_params and
+            // the entry in server_map (keyed by client_addr) carries long_params.
+            // Each builder's default peer_data_addrs is its `Entry::builder` address,
+            // so the send context can resolve the destination without extra setup.
             client_map.test_insert_pair(
-                client_addr,
-                Some(short_params), // local_params → goes to server_map's entry for client_addr
+                crate::path::secret::map::Entry::builder(server_addr)
+                    .local(client_addr)
+                    .params(short_params),
                 &server_map,
-                server_addr,
-                Some(long_params), // peer_params → goes to client_map's entry for server_addr
+                crate::path::secret::map::Entry::builder(client_addr)
+                    .local(server_addr)
+                    .params(long_params),
             );
-
-            // Populate peer data addresses so the send context knows where to
-            // deliver packets.
-            if let Some(entry) = client_map.get_raw(server_addr) {
-                entry.set_peer_data_addrs(&[server_addr]);
-            }
-            if let Some(entry) = server_map.get_raw(client_addr) {
-                entry.set_peer_data_addrs(&[client_addr]);
-            }
 
             // ── First stream: should complete successfully ──────────────────────
             //

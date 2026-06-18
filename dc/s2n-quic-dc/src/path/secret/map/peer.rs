@@ -2,7 +2,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::{dc, seal, Bidirectional, Credentials, Entry, Id, Map};
-use crate::path::secret::map::PeerDataAddrs;
 use std::sync::Arc;
 
 pub struct Peer {
@@ -39,12 +38,6 @@ impl Peer {
     #[inline]
     pub fn map(&self) -> &Map {
         &self.map
-    }
-
-    /// Returns true if the peer's data addresses have been learned via the post-handshake exchange.
-    #[inline]
-    pub fn peer_data_addrs(&self) -> &PeerDataAddrs {
-        self.entry.peer_data_addrs()
     }
 
     /// Consume the Peer and return the underlying Arc<Entry>.

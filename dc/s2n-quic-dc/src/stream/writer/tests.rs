@@ -110,7 +110,7 @@ impl PairBuilder {
         if self.application_data.is_some() {
             entry_builder = entry_builder.application_data(self.application_data);
         }
-        let path_secret_entry = entry_builder.build();
+        let path_secret_entry = entry_builder.build(None);
 
         let client_state =
             std::sync::Arc::new(crate::queue::ClientState::new(VarInt::from_u16(100), 0));

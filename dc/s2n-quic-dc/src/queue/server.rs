@@ -380,7 +380,7 @@ mod tests {
             PathSecretEntry::builder("127.0.0.1:4433".parse().unwrap())
                 .endpoint_type(s2n_quic_core::endpoint::Type::Server)
                 .params(params)
-                .build();
+                .build(None);
         let crate::path::secret::map::entry::QueueState::Server(ref state) =
             *path_entry.queue_state()
         else {
