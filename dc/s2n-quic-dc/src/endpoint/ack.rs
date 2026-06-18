@@ -148,6 +148,11 @@ pub(crate) fn process_ack<Clk, Rand>(
             );
 
             if let Some(probe_pn) = packet.probed_to {
+                // The peer ACKed a shell PN: the original transmission of these frames arrived
+                // after we had already retransmitted them under `probe_pn` (reordering or a
+                // spurious PTO). Count it so we can measure how often the shell machinery is
+                // exercised at all; `shell_resolved` (below) counts when it does unique work.
+                counters.tx_probe_shell_acked.add(1);
                 deferred.push(probe_pn);
             } else {
                 for mut entry in packet.frames {
@@ -192,6 +197,13 @@ pub(crate) fn process_ack<Clk, Rand>(
             let tail_time_sent = removal
                 .tail_time_sent
                 .map(crate::time::precision::Timestamp::from);
+            // The shell did unique work only if the chain still had frames to complete — i.e. the
+            // tail was not already ACKed/removed directly. An empty chain means the frames were
+            // completed elsewhere and the shell merely needed reaping (no benefit over a design
+            // that removed the old entry on retransmit).
+            if !removal.frames.is_empty() {
+                counters.tx_probe_shell_resolved.add(1);
+            }
             for mut entry in removal.frames {
                 counters.on_acked_frame(&entry.header);
                 crate::endpoint::frame_trace::record(
