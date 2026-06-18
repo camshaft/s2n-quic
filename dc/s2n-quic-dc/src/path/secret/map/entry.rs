@@ -133,7 +133,7 @@ impl SizeOf for Entry {
             + last_activity.size()
             + dead_at.size()
             + std::mem::size_of::<PeerDataAddrs>()
-            + peer_data_addrs.len() * std::mem::size_of::<s2n_quic_core::inet::SocketAddressV6>()
+            + peer_data_addrs.len() * std::mem::size_of::<SocketAddr>()
             + std::mem::size_of::<Box<[AtomicU64]>>()
             + sender_load_scores.len() * std::mem::size_of::<AtomicU64>()
             + std::mem::size_of::<QueueState>()
@@ -255,7 +255,8 @@ impl Entry {
         &self.peer_data_addrs
     }
 
-    /// Returns true if the peer's data addresses have been learned via the post-handshake exchange.
+    /// Returns true if the peer advertised a non-empty data address list (via the
+    /// `DcDataAddresses` transport parameter), validated at handshake completion.
     #[inline]
     pub fn has_data_addrs(&self) -> bool {
         !self.peer_data_addrs.is_empty()
