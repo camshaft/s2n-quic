@@ -32,7 +32,7 @@ use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 // ── On-disk framing (must match endpoint::frame_trace::write_dump) ──────────────────────────────
 
 const FILE_MAGIC: [u8; 8] = *b"DCFTRC01";
-const FILE_VERSION: u32 = 2;
+const FILE_VERSION: u32 = 3;
 const RECORD_MAGIC: u8 = 0xF7;
 const PACKET_RECORD_MAGIC: u8 = 0xF8;
 const NO_PACKET_NUMBER: u64 = u64::MAX;

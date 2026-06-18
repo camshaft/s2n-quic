@@ -210,7 +210,8 @@ fn main() {
 
     eprintln!(
         "frame-trace dump v{version} (len_suffix={len_suffix} stride={payload_stride} \
-         capacity={capacity} head={head}) — records newest-first:"
+         capacity={capacity} head={head}) — records newest-first \
+         (v3+: t= is Unix-epoch nanoseconds):"
     );
 
     let region = &bytes[32..32 + capacity.min(bytes.len() - 32)];

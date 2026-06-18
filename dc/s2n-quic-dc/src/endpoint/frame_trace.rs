@@ -52,7 +52,7 @@ use std::{
         atomic::{AtomicU32, Ordering},
         Arc, Condvar, Mutex, OnceLock,
     },
-    time::Instant,
+    time::{Instant, SystemTime},
 };
 
 /// Magic bytes at the front of every [`FrameRecord`] payload. Combined with the ring's trailing
@@ -68,9 +68,12 @@ const PACKET_RECORD_MAGIC: u8 = 0xF8;
 const FILE_MAGIC: [u8; 8] = *b"DCFTRC01";
 /// Dump format version. v2 added [`Direction`] variants for the application edges and drop sites,
 /// the [`FrameRecord::reason`]/[`FrameRecord::payload_len`] tail, and interleaved [`PacketRecord`]s.
-/// A v1 parser reads v2 frame records correctly for the leading 80 bytes but does not know about the
-/// new directions or packet records; bump again on any further layout change.
-const FILE_VERSION: u32 = 2;
+/// v3 changed `timestamp_nanos` from a duration-since-recorder-start to a Unix-epoch wall-clock
+/// nanosecond timestamp so that records from different hosts can be compared directly. In bach
+/// simulations it is the simulated time since epoch 0. The binary layout is unchanged; parsers
+/// that previously displayed timestamps as relative durations must treat them as absolute Unix
+/// epoch nanoseconds.
+const FILE_VERSION: u32 = 3;
 
 /// Default ring capacity (bytes) when `S2N_DC_FRAME_TRACE_BYTES` is unset. 16 MiB ≈ 256k records.
 const DEFAULT_CAPACITY: usize = 16 << 20;
@@ -188,7 +191,10 @@ pub(crate) enum DropReason {
     zerocopy::KnownLayout,
 )]
 pub struct FrameRecord {
-    /// Nanoseconds since the recorder started (a process-local monotonic clock).
+    /// Nanoseconds since the Unix epoch (wall clock). In bach simulations this is the
+    /// simulated time since epoch 0, deterministic and host-independent. In production the wall
+    /// clock is latched once at recorder startup so that records from different hosts are directly
+    /// comparable.
     pub timestamp_nanos: u64,
     /// Packet number, or [`NO_PACKET_NUMBER`] when not yet assigned.
     pub packet_number: u64,
@@ -292,7 +298,7 @@ pub(crate) enum PacketEvent {
     zerocopy::KnownLayout,
 )]
 pub struct PacketRecord {
-    /// Nanoseconds since the recorder started (shares the clock and `seq` space with [`FrameRecord`]).
+    /// Nanoseconds since the Unix epoch (shares the wall clock and `seq` space with [`FrameRecord`]).
     pub timestamp_nanos: u64,
     /// The packet number this record is about.
     pub packet_number: u64,
@@ -670,12 +676,36 @@ pub(crate) fn record_packet(
     });
 }
 
-/// Fetches the next sequence number and elapsed-nanos timestamp from the recorder state. Shared by
-/// every record kind so frame and packet records draw from one monotonic `seq` space.
+/// Returns the current time as nanoseconds since the Unix epoch.
+///
+/// In bach simulations the simulated clock is used (bach time starts at epoch 0, so the value is
+/// the simulated elapsed time). In production the wall clock latched at [`State`] initialization is
+/// added to the monotonic elapsed duration, giving absolute timestamps that can be compared across
+/// hosts.
+#[inline]
+fn wall_nanos_now(st: &State) -> u64 {
+    #[cfg(any(test, feature = "testing"))]
+    if ::bach::is_active() {
+        // Bach simulations: time starts at the unix epoch (Duration::ZERO). Transmuting
+        // Duration::ZERO to bach::time::Instant gives the zero-epoch anchor — the same
+        // technique used in time/bach.rs for the clock's root handle. `try_elapsed` then
+        // returns the current simulated time as a duration from epoch 0.
+        let root: ::bach::time::Instant = unsafe {
+            // SAFETY: bach represents Instant as a Duration internally; Duration::ZERO is valid.
+            core::mem::transmute(core::time::Duration::ZERO)
+        };
+        return root.try_elapsed().map(|d| d.as_nanos() as u64).unwrap_or(0);
+    }
+
+    st.wall_nanos_at_start + st.start.elapsed().as_nanos() as u64
+}
+
+/// Fetches the next sequence number and Unix-epoch nanosecond timestamp from the recorder state.
+/// Shared by every record kind so frame and packet records draw from one monotonic `seq` space.
 #[inline]
 fn stamp(st: &State) -> (u32, u64) {
     let seq = st.seq.fetch_add(1, Ordering::Relaxed);
-    let ts = st.start.elapsed().as_nanos() as u64;
+    let ts = wall_nanos_now(st);
     (seq, ts)
 }
 
@@ -720,6 +750,10 @@ struct State {
     ring: Arc<BumpRing>,
     seq: AtomicU32,
     start: Instant,
+    /// Unix-epoch nanoseconds at the moment `start` was captured. Used to convert the
+    /// monotonic `start.elapsed()` to an absolute wall-clock timestamp in [`wall_nanos_now`].
+    /// Always 0 in bach simulations (where simulated time already starts at the unix epoch).
+    wall_nanos_at_start: u64,
     dumper: Arc<Dumper>,
 }
 
@@ -771,10 +805,20 @@ fn state() -> &'static State {
 
         spawn_dumper(ring.clone(), dumper.clone());
 
+        // Latch the wall clock alongside the monotonic start instant so that every subsequent
+        // `stamp()` call can produce an absolute Unix-epoch timestamp by adding the elapsed
+        // monotonic duration. Sampling both near-simultaneously keeps the skew negligible.
+        let start = Instant::now();
+        let wall_nanos_at_start = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+
         State {
             ring,
             seq: AtomicU32::new(0),
-            start: Instant::now(),
+            start,
+            wall_nanos_at_start,
             dumper,
         }
     })
