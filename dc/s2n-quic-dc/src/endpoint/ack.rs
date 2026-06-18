@@ -147,6 +147,19 @@ pub(crate) fn process_ack<Clk, Rand>(
                 "packet ACKed"
             );
 
+            // Packet acknowledged by the peer. For a shell, `linked_pn` points at the probe PN
+            // whose tail actually carries the frames (resolved in Phase 2 below), so the dump shows
+            // the shell→tail hop; `frame_count` is the frames completing directly under this PN.
+            crate::endpoint::frame_trace::record_packet(
+                crate::endpoint::frame_trace::PacketEvent::Acked,
+                num,
+                context.credentials.id,
+                0,
+                packet.frames.len() as u16,
+                packet.probed_to.map(PacketNumber::as_varint),
+                crate::endpoint::frame_trace::DropReason::None,
+            );
+
             if let Some(probe_pn) = packet.probed_to {
                 // The peer ACKed a shell PN: the original transmission of these frames arrived
                 // after we had already retransmitted them under `probe_pn` (reordering or a
@@ -563,6 +576,22 @@ fn detect_loss<Rand>(
                 now,
             );
         }
+
+        // Packet declared lost. `sent_bytes` is what left the CCA; `frame_count` is how many frames
+        // are about to be individually evaluated for retransmit/cancel/TTL below. A shell carries
+        // `linked_pn` to its probe tail. The per-frame AckLost/AckCancelled records below add the
+        // per-frame fate; this is the packet-level summary. (Loss here is by the contiguous
+        // pn/time-threshold prefix — see `loss_cutoff`; the reason stays `None` as the trigger is
+        // not distinguished per packet.)
+        crate::endpoint::frame_trace::record_packet(
+            crate::endpoint::frame_trace::PacketEvent::Lost,
+            num,
+            context.credentials.id,
+            tx_info.sent_bytes as u32,
+            packet.frames.len() as u16,
+            packet.probed_to.map(PacketNumber::as_varint),
+            crate::endpoint::frame_trace::DropReason::None,
+        );
 
         for mut entry in packet.frames {
             // A QueueDbg marker can meet three fates in this loop — cancelled (writer/reader gone),

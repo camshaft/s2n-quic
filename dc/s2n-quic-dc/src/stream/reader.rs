@@ -953,6 +953,22 @@ impl Inner {
 
         let bytes_read = tracker.written_len();
 
+        // Reassembled stream bytes crossing to the application — the last sighting of received
+        // data. Pairs with the Inbound record at decode so the wire→consume latency (where reader
+        // lost-wakeup stalls hide) is visible. Mirror the inbound QueueData routing convention so
+        // the two records share queue ids: the wire frame's dest is our local queue and its source
+        // is the peer's. `offset` is the start of the range just delivered.
+        if bytes_read > 0 {
+            crate::endpoint::frame_trace::record_app_recv(
+                self.dest_queue_id,
+                self.stream_rx.queue_id(),
+                self.stream_rx.binding_id(),
+                self.reassembler.consumed_len().saturating_sub(bytes_read as u64),
+                bytes_read as u32,
+                *self.path_secret_entry.id(),
+            );
+        }
+
         // Only update flow-control while the channel is healthy.  When
         // `deferred_err` is set the sender's channel has already closed, which
         // means no more data is coming and there is nothing to send MAX_DATA to.
@@ -1100,6 +1116,17 @@ impl Inner {
                             payload_end_offset,
                             remote_max_data = self.remote_max_data.as_u64(),
                             "Peer exceeded advertised receive window"
+                        );
+                        // Stream-layer drop (no wire Header here): the peer sent past the window
+                        // and we're about to reset the stream. Mirror the inbound routing
+                        // convention (dest = our local queue, source = peer's).
+                        crate::endpoint::frame_trace::record_reader_drop(
+                            self.dest_queue_id,
+                            self.stream_rx.queue_id(),
+                            self.stream_rx.binding_id(),
+                            offset.as_u64(),
+                            crate::endpoint::frame_trace::DropReason::WindowViolation,
+                            *self.path_secret_entry.id(),
                         );
                         return self.queue_control_error();
                     }
@@ -1791,6 +1818,15 @@ impl Inner {
     }
 
     fn send_frame(&mut self, frame: Frame) -> io::Result<()> {
+        // Application (reader-originated control: MAX_DATA, reset, QueueDbg) submitting a frame into
+        // the send pipeline — the first sighting, before aggregation/credit/pacing/assembly. Pairs
+        // with the Outbound record at assembly. PN is not assigned yet.
+        crate::endpoint::frame_trace::record(
+            crate::endpoint::frame_trace::Direction::AppSend,
+            &frame.header,
+            None,
+            *self.path_secret_entry.id(),
+        );
         self.frame_tx
             .send_batch(intrusive::Entry::new(frame))
             .map_err(|mut returned| {
