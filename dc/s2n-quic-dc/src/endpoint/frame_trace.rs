@@ -683,15 +683,8 @@ pub(crate) fn record_packet(
 fn wall_nanos_now(st: &State) -> u64 {
     #[cfg(any(test, feature = "testing"))]
     if ::bach::is_active() {
-        // Bach simulations: time starts at the unix epoch (Duration::ZERO). Transmuting
-        // Duration::ZERO to bach::time::Instant gives the zero-epoch anchor — the same
-        // technique used in time/bach.rs for the clock's root handle. `try_elapsed` then
-        // returns the current simulated time as a duration from epoch 0.
-        let root: ::bach::time::Instant = unsafe {
-            // SAFETY: bach represents Instant as a Duration internally; Duration::ZERO is valid.
-            core::mem::transmute(core::time::Duration::ZERO)
-        };
-        return root.try_elapsed().map(|d| d.as_nanos() as u64).unwrap_or(0);
+        // Bach simulations: time starts at the unix epoch (Duration::ZERO).
+        return ::bach::time::Instant::now().elapsed_since_start().as_nanos() as u64
     }
 
     st.wall_nanos_at_start + st.start.elapsed().as_nanos() as u64
