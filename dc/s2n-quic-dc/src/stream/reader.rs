@@ -963,7 +963,9 @@ impl Inner {
                 self.dest_queue_id,
                 self.stream_rx.queue_id(),
                 self.stream_rx.binding_id(),
-                self.reassembler.consumed_len().saturating_sub(bytes_read as u64),
+                self.reassembler
+                    .consumed_len()
+                    .saturating_sub(bytes_read as u64),
                 bytes_read as u32,
                 *self.path_secret_entry.id(),
             );

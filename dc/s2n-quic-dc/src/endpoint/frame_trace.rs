@@ -684,7 +684,9 @@ fn wall_nanos_now(st: &State) -> u64 {
     #[cfg(any(test, feature = "testing"))]
     if ::bach::is_active() {
         // Bach simulations: time starts at the unix epoch (Duration::ZERO).
-        return ::bach::time::Instant::now().elapsed_since_start().as_nanos() as u64
+        return ::bach::time::Instant::now()
+            .elapsed_since_start()
+            .as_nanos() as u64;
     }
 
     st.wall_nanos_at_start + st.start.elapsed().as_nanos() as u64
@@ -918,7 +920,10 @@ pub(crate) fn dump_path() -> PathBuf {
 /// across packet records. Lets an end-to-end test assert the new trace points actually fire during
 /// a real transfer without going through the on-disk dump.
 #[cfg(test)]
-pub(crate) fn resident_event_kinds() -> (std::collections::BTreeSet<u8>, std::collections::BTreeSet<u8>) {
+pub(crate) fn resident_event_kinds() -> (
+    std::collections::BTreeSet<u8>,
+    std::collections::BTreeSet<u8>,
+) {
     use zerocopy::FromBytes as _;
     let st = state();
     let mut region = vec![0u8; st.ring.capacity()];
@@ -1302,7 +1307,15 @@ mod tests {
     #[test]
     fn packet_record_has_no_padding() {
         // zerocopy::IntoBytes enforces this at compile time; the round-trip below also relies on it.
-        let rec = build_packet(0, PacketEvent::Sent, VarInt::from_u32(1), 1200, 3, None, DropReason::None);
+        let rec = build_packet(
+            0,
+            PacketEvent::Sent,
+            VarInt::from_u32(1),
+            1200,
+            3,
+            None,
+            DropReason::None,
+        );
         assert_eq!(rec.as_bytes().len(), core::mem::size_of::<PacketRecord>());
     }
 
@@ -1366,7 +1379,15 @@ mod tests {
 
     #[test]
     fn packet_record_no_link_uses_sentinel() {
-        let rec = build_packet(0, PacketEvent::RxArrived, VarInt::from_u32(5), 0, 0, None, DropReason::None);
+        let rec = build_packet(
+            0,
+            PacketEvent::RxArrived,
+            VarInt::from_u32(5),
+            0,
+            0,
+            None,
+            DropReason::None,
+        );
         assert_eq!(rec.linked_pn, NO_PACKET_NUMBER);
         assert_eq!(rec.event, PacketEvent::RxArrived as u8);
         assert_eq!(rec.reason, DropReason::None as u8);
@@ -1440,11 +1461,11 @@ mod tests {
     fn record_app_recv_maps_fields() {
         let marker_qid = ((std::process::id() as u64) & 0x00ff_ffff) | 0x0300_0000;
         record_app_recv(
-            VarInt::from_u32(55),            // source (peer) queue id
+            VarInt::from_u32(55),             // source (peer) queue id
             VarInt::new(marker_qid).unwrap(), // dest (our local) queue id
-            VarInt::from_u32(8),             // binding id
-            4096,                            // consumed offset
-            1500,                            // bytes delivered this read
+            VarInt::from_u32(8),              // binding id
+            4096,                             // consumed offset
+            1500,                             // bytes delivered this read
             crate::credentials::Id::from([0u8; 16]),
         );
 
@@ -1468,7 +1489,10 @@ mod tests {
         assert_eq!(rec.binding_id, 8);
         assert_eq!(rec.offset, 4096);
         assert_eq!(rec.payload_len, 1500);
-        assert_eq!(rec.packet_number, NO_PACKET_NUMBER, "no PN at the app layer");
+        assert_eq!(
+            rec.packet_number, NO_PACKET_NUMBER,
+            "no PN at the app layer"
+        );
     }
 
     /// `record_reader_drop` synthesises an `RxDropped` QueueData record (no wire `Header` at the

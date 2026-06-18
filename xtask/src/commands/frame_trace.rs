@@ -398,7 +398,8 @@ impl RowBuilder {
             v => self.payload_len.append_value(v),
         }
         self.flag_fin.append_value(rec.flags & FLAG_FIN != 0);
-        self.flag_blocked.append_value(rec.flags & FLAG_BLOCKED != 0);
+        self.flag_blocked
+            .append_value(rec.flags & FLAG_BLOCKED != 0);
         self.flag_wakeup.append_value(rec.flags & FLAG_WAKEUP != 0);
         self.flag_ack_eliciting
             .append_value(rec.flags & FLAG_ACK_ELICITING != 0);

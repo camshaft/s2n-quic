@@ -37,9 +37,7 @@ impl EncoderValue for Addrs<'_> {
         for addr in self.0 {
             let v6 = match addr {
                 SocketAddr::V6(v6) => *v6,
-                SocketAddr::V4(v4) => {
-                    SocketAddrV6::new(v4.ip().to_ipv6_mapped(), v4.port(), 0, 0)
-                }
+                SocketAddr::V4(v4) => SocketAddrV6::new(v4.ip().to_ipv6_mapped(), v4.port(), 0, 0),
             };
             buffer.encode(&ADDR_TYPE_SOCKET_V6);
             buffer.encode(&SOCKET_V6_LEN);

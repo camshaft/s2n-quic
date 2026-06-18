@@ -968,8 +968,7 @@ fn frame_trace_captures_app_and_packet_lifecycle() {
             // Let the final ACKs settle before sampling the ring.
             10.ms().sleep().await;
 
-            let (directions, packet_events) =
-                crate::endpoint::frame_trace::resident_event_kinds();
+            let (directions, packet_events) = crate::endpoint::frame_trace::resident_event_kinds();
 
             for dir in [
                 Direction::AppSend,

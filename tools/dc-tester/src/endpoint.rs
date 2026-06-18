@@ -43,7 +43,10 @@ pub fn create(
     // The recv socket addresses are what peers should target with DC data packets.
     let data_addrs: Vec<SocketAddr> = recv_sockets
         .iter()
-        .map(|s| s.local_addr().expect("recv socket must have a local address"))
+        .map(|s| {
+            s.local_addr()
+                .expect("recv socket must have a local address")
+        })
         .collect();
 
     {
