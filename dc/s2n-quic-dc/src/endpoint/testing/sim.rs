@@ -256,6 +256,11 @@ pub struct SimEndpointConfig {
 
     /// Send credit pool config. Defaults to [`crate::credit::Config::default`].
     pub send_credit_pool_config: crate::credit::Config,
+
+    /// Override the negotiated `max_queues` (peer queue-slot cap). Defaults to the
+    /// `TEST_APPLICATION_PARAMS` value (effectively unbounded). Set a small value to make queue
+    /// slots scarce so they are recycled aggressively under churn — exercises slot-reuse races.
+    pub max_queues: Option<VarInt>,
 }
 
 impl Default for SimEndpointConfig {
@@ -281,6 +286,7 @@ impl Default for SimEndpointConfig {
             dead_peer_cooldown: crate::stream::endpoint::DEFAULT_DEAD_PEER_COOLDOWN,
             recv_credit_pool_config: crate::credit::Config::default(),
             send_credit_pool_config: crate::credit::Config::default(),
+            max_queues: None,
         }
     }
 }
@@ -363,6 +369,7 @@ pub fn setup_sim_endpoint(
         dead_peer_cooldown,
         recv_credit_pool_config,
         send_credit_pool_config,
+        max_queues,
     } = config;
 
     assert!(
@@ -499,6 +506,9 @@ pub fn setup_sim_endpoint(
         params.local_send_max_data = window;
         params.local_recv_max_data = window;
         params.remote_max_data = window;
+    }
+    if let Some(max_queues) = max_queues {
+        params.max_queues = max_queues;
     }
 
     // Register in the thread-local registry so `connect` can find it.
