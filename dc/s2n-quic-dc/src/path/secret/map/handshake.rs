@@ -33,7 +33,11 @@ struct HandshakingPathInner {
     application_data: Option<ApplicationData>,
     /// Remote peer's PeerInfo bytes from the DcPeerInfo transport parameter.
     peer_info: Option<bytes::Bytes>,
-    /// Remote peer's data-plane addresses from the DcDataAddresses transport parameter.
+    /// Raw bytes of the peer's `DcDataAddresses` transport parameter, decoded
+    /// and validated lazily in `validate_peer_data_addrs`.
+    peer_data_addrs_bytes: Option<bytes::Bytes>,
+    /// Decoded and validated peer data addresses, populated by
+    /// `validate_peer_data_addrs` and consumed by `on_peer_stateless_reset_tokens`.
     peer_data_addrs: Option<Vec<SocketAddr>>,
     map: Map,
 
@@ -48,7 +52,7 @@ impl HandshakingPath {
         };
 
         let peer_info = connection_info.peer_info.clone();
-        let peer_data_addrs = connection_info.peer_data_addrs.clone();
+        let peer_data_addrs_bytes = connection_info.peer_data_addrs.clone();
 
         HandshakingPath {
             inner: Arc::new(Mutex::new(HandshakingPathInner {
@@ -60,7 +64,8 @@ impl HandshakingPath {
                 entry: None,
                 application_data: None,
                 peer_info,
-                peer_data_addrs,
+                peer_data_addrs_bytes,
+                peer_data_addrs: None,
                 map,
                 error: None,
             })),
@@ -145,10 +150,11 @@ impl HandshakingPathInner {
     /// Validate and normalize the peer's advertised data addresses, learned from the
     /// `DcDataAddresses` transport parameter.
     ///
-    /// Wildcard IPs in the address list are replaced with the peer's handshake IP, since
-    /// a peer that bound to `[::]` is reachable at the address we connected to. A `None`
-    /// or empty list is left as-is (the peer simply advertised nothing); per-send context
-    /// creation handles the no-addrs case.
+    /// Decodes the raw transport parameter bytes, then validates and normalizes the
+    /// resulting addresses. Wildcard IPs in the address list are replaced with the
+    /// peer's handshake IP, since a peer that bound to `[::]` is reachable at the
+    /// address we connected to. A `None` or empty list is left as-is (the peer simply
+    /// advertised nothing); per-send context creation handles the no-addrs case.
     ///
     /// Returns `TRANSPORT_PARAMETER_ERROR` if the peer advertised more than
     /// [`MAX_PEER_DATA_ADDRS`](super::MAX_PEER_DATA_ADDRS) addresses, a wildcard port, or a
@@ -156,8 +162,15 @@ impl HandshakingPathInner {
     fn validate_peer_data_addrs(&mut self) -> Result<(), s2n_quic_core::transport::Error> {
         use s2n_quic_core::transport::Error;
 
-        let Some(addrs) = self.peer_data_addrs.as_mut() else {
+        let Some(bytes) = self.peer_data_addrs_bytes.take() else {
             return Ok(());
+        };
+
+        // Decode the raw transport parameter bytes; a malformed encoding is treated
+        // the same as an absent parameter (the peer simply advertised nothing).
+        let mut addrs = match super::data_addresses::decode(&bytes) {
+            Ok(addrs) => addrs,
+            Err(_) => return Ok(()),
         };
 
         if addrs.is_empty() {
@@ -206,6 +219,8 @@ impl HandshakingPathInner {
         }
 
         ::tracing::debug!(peer = %self.peer, ?addrs, "validated peer data addresses");
+
+        self.peer_data_addrs = Some(addrs);
 
         Ok(())
     }

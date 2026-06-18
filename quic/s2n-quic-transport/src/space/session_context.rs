@@ -475,7 +475,7 @@ impl<Config: endpoint::Config, Pub: event::ConnectionPublisher>
                 None
             };
             let peer_data_addrs = if !peer_params.dc_data_addresses.is_empty() {
-                dc::data_addresses::decode(peer_params.dc_data_addresses.data()).ok()
+                Some(peer_params.dc_data_addresses.into_bytes())
             } else {
                 None
             };

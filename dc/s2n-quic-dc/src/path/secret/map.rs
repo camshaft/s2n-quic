@@ -18,6 +18,7 @@ use std::{net::SocketAddr, sync::Arc};
 use tokio::task::JoinHandle;
 
 mod cleaner;
+pub mod data_addresses;
 pub(crate) mod entry;
 mod handshake;
 mod peer;
