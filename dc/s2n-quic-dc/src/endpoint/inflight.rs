@@ -409,7 +409,7 @@ mod tests {
     }
 
     fn fake_entry() -> Arc<PathSecretEntry> {
-        PathSecretEntry::builder("127.0.0.1:9999".parse().unwrap()).build()
+        PathSecretEntry::builder("127.0.0.1:9999".parse().unwrap()).build(None)
     }
 
     /// Create a Packet containing one QueueData (ack-eliciting) frame.

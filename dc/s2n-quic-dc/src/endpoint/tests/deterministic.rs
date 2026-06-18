@@ -336,7 +336,7 @@ fn sim_path_pair_ids_are_stable_across_identical_runs() {
     const SOURCE_SENDER_ID: u8 = 3;
 
     fn run_once() -> crate::path::secret::map::TestPairIds {
-        use crate::path::secret::map::testing;
+        use crate::path::secret::map::{testing, Entry};
 
         let ids = Arc::new(Mutex::new(None));
         let ids_out = ids.clone();
@@ -349,7 +349,11 @@ fn sim_path_pair_ids_are_stable_across_identical_runs() {
 
             let local_addr = "10.0.0.1:1111".parse().unwrap();
             let peer_addr = "10.0.0.2:2222".parse().unwrap();
-            let pair_ids = local_map.test_insert_pair(local_addr, None, &peer_map, peer_addr, None);
+            let pair_ids = local_map.test_insert_pair(
+                Entry::builder(peer_addr).local(local_addr),
+                &peer_map,
+                Entry::builder(local_addr).local(peer_addr),
+            );
             *ids_out.lock().unwrap() = Some(pair_ids);
         });
 
@@ -385,7 +389,7 @@ fn sim_path_pair_ids_increment_generation_for_same_pair() {
     const SENDER_COUNT: usize = 4;
 
     sim(|| {
-        use crate::path::secret::map::testing;
+        use crate::path::secret::map::{testing, Entry};
 
         let local_map = testing::new(1_024);
         let peer_map = testing::new(1_024);
@@ -395,8 +399,16 @@ fn sim_path_pair_ids_increment_generation_for_same_pair() {
         let local_addr = "10.0.0.1:1111".parse().unwrap();
         let peer_addr = "10.0.0.2:2222".parse().unwrap();
 
-        let first = local_map.test_insert_pair(local_addr, None, &peer_map, peer_addr, None);
-        let second = local_map.test_insert_pair(local_addr, None, &peer_map, peer_addr, None);
+        let first = local_map.test_insert_pair(
+            Entry::builder(peer_addr).local(local_addr),
+            &peer_map,
+            Entry::builder(local_addr).local(peer_addr),
+        );
+        let second = local_map.test_insert_pair(
+            Entry::builder(peer_addr).local(local_addr),
+            &peer_map,
+            Entry::builder(local_addr).local(peer_addr),
+        );
 
         assert_ne!(
             first.local, second.local,

@@ -155,7 +155,6 @@ impl Provider {
         server_name: Name,
     ) -> std::io::Result<(secret::map::Peer, HandshakeKind)> {
         if let Some(entry) = self.state.map.get_tracked(peer) {
-            let _ = entry.peer_data_addrs().wait().await;
             return Ok((entry, HandshakeKind::Cached));
         }
 
@@ -190,8 +189,6 @@ impl Provider {
                 format!("handshake failed to exchange credentials for {peer}"),
             )
         })?;
-
-        let _ = peer.peer_data_addrs().wait().await;
 
         Ok((peer, HandshakeKind::Fresh))
     }

@@ -142,10 +142,83 @@ impl dc::Path for HandshakingPath {
 }
 
 impl HandshakingPathInner {
+    /// Validate and normalize the peer's advertised data addresses, learned from the
+    /// `DcDataAddresses` transport parameter.
+    ///
+    /// Wildcard IPs in the address list are replaced with the peer's handshake IP, since
+    /// a peer that bound to `[::]` is reachable at the address we connected to. A `None`
+    /// or empty list is left as-is (the peer simply advertised nothing); per-send context
+    /// creation handles the no-addrs case.
+    ///
+    /// Returns `TRANSPORT_PARAMETER_ERROR` if the peer advertised more than
+    /// [`MAX_PEER_DATA_ADDRS`](super::MAX_PEER_DATA_ADDRS) addresses, a wildcard port, or a
+    /// loopback address from a non-loopback peer.
+    fn validate_peer_data_addrs(&mut self) -> Result<(), s2n_quic_core::transport::Error> {
+        use s2n_quic_core::transport::Error;
+
+        let Some(addrs) = self.peer_data_addrs.as_mut() else {
+            return Ok(());
+        };
+
+        if addrs.is_empty() {
+            return Ok(());
+        }
+
+        if addrs.len() > super::MAX_PEER_DATA_ADDRS {
+            ::tracing::error!(
+                count = addrs.len(),
+                max = super::MAX_PEER_DATA_ADDRS,
+                peer = %self.peer,
+                "peer advertised too many data addrs"
+            );
+            return Err(Error::TRANSPORT_PARAMETER_ERROR
+                .with_reason("peer advertised too many data addrs"));
+        }
+
+        let peer_ip = self.peer.ip();
+        let peer_is_loopback = peer_ip.is_loopback();
+
+        for addr in addrs.iter_mut() {
+            if addr.port() == 0 {
+                ::tracing::error!(%addr, peer = %self.peer, "peer data addr has wildcard port");
+                return Err(Error::TRANSPORT_PARAMETER_ERROR
+                    .with_reason("peer data addr has wildcard port"));
+            }
+
+            // A peer that bound to a wildcard IP (e.g. `[::]`) is reachable at the address
+            // we completed the handshake against; substitute that.
+            let ip = if addr.ip().is_unspecified() {
+                peer_ip
+            } else {
+                addr.ip()
+            };
+
+            if !peer_is_loopback && ip.is_loopback() {
+                ::tracing::error!(
+                    %addr, peer = %self.peer,
+                    "peer data addr is loopback but handshake addr is not"
+                );
+                return Err(Error::TRANSPORT_PARAMETER_ERROR
+                    .with_reason("peer data addr is loopback but handshake addr is not"));
+            }
+
+            *addr = SocketAddr::new(ip, addr.port());
+        }
+
+        ::tracing::debug!(peer = %self.peer, ?addrs, "validated peer data addresses");
+
+        Ok(())
+    }
+
     fn on_path_secrets_ready(
         &mut self,
         session: &impl s2n_quic_core::crypto::tls::TlsSession,
     ) -> Result<Vec<s2n_quic_core::stateless_reset::Token>, s2n_quic_core::transport::Error> {
+        // Validate and normalize the peer's advertised data addresses before doing any
+        // other work, so a malformed `DcDataAddresses` transport parameter aborts the
+        // handshake fast rather than after deriving secrets.
+        self.validate_peer_data_addrs()?;
+
         let request = super::ApplicationDataRequest {
             tls: session,
             peer_info: self.peer_info.as_ref(),
@@ -208,6 +281,7 @@ impl HandshakingPathInner {
 
         let receiver = receiver::State::new();
         let socket_sender_count = self.map.store.socket_sender_count();
+        let peer_data_addrs = core::mem::take(&mut self.peer_data_addrs);
 
         let entry = Entry::new_with_socket_senders(
             self.peer,
@@ -219,11 +293,9 @@ impl HandshakingPathInner {
             self.parameters.clone(),
             self.map.store.get_time(),
             self.application_data.take(),
+            peer_data_addrs.unwrap_or_default().into(),
             socket_sender_count,
         );
-        if let Some(ref addrs) = self.peer_data_addrs {
-            entry.set_peer_data_addrs(addrs);
-        }
         let entry = Arc::new(entry);
         self.entry = Some(entry.clone());
         self.map.store.on_new_path_secrets(entry);

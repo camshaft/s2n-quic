@@ -51,10 +51,10 @@ fn sealed_queue_msg_packet_geometry(
     let peer: SocketAddr = "127.0.0.1:8080".parse().unwrap();
     let sealer_entry = PathSecretEntry::builder(peer)
         .endpoint_type(endpoint::Type::Client)
-        .build();
+        .build(None);
     let opener_entry = PathSecretEntry::builder(peer)
         .endpoint_type(endpoint::Type::Server)
-        .build();
+        .build(None);
 
     let key_id = VarInt::ZERO;
     let sealer = sealer_entry.secret().application_sealer(key_id);
@@ -144,7 +144,7 @@ fn sealed_queue_msg_packet_geometry(
 fn fresh_server_view() -> recv::QueueView {
     let entry = PathSecretEntry::builder("127.0.0.1:4433".parse().unwrap())
         .endpoint_type(endpoint::Type::Server)
-        .build();
+        .build(None);
     match entry.queue_state() {
         crate::path::secret::map::entry::QueueState::Server(state) => {
             recv::QueueView::Server(state.view())
@@ -160,7 +160,7 @@ fn fresh_server_view() -> recv::QueueView {
 fn bound_server_view(queue_id: VarInt, binding_id: VarInt) -> recv::QueueView {
     let entry = PathSecretEntry::builder("127.0.0.1:4433".parse().unwrap())
         .endpoint_type(endpoint::Type::Server)
-        .build();
+        .build(None);
     let mut view = match entry.queue_state() {
         crate::path::secret::map::entry::QueueState::Server(state) => {
             recv::QueueView::Server(state.view())
@@ -228,7 +228,7 @@ impl FastPathHarness {
             )),
             path_entry: PathSecretEntry::builder("127.0.0.1:4433".parse().unwrap())
                 .endpoint_type(endpoint::Type::Server)
-                .build(),
+                .build(None),
             _freed_batch_rx,
         }
     }

@@ -16,7 +16,7 @@ use std::{
 fn fake_entry(generation: u64) -> Arc<Entry> {
     Entry::builder((Ipv4Addr::LOCALHOST, 1).into())
         .generation(generation)
-        .build()
+        .build(None)
 }
 
 #[test]
@@ -523,7 +523,7 @@ fn entry_carries_application_data_from_constructor() {
 
     let entry = Entry::builder((Ipv4Addr::LOCALHOST, 1).into())
         .application_data(Some(app_data))
-        .build();
+        .build(None);
 
     let stored = entry
         .application_data()
@@ -535,6 +535,6 @@ fn entry_carries_application_data_from_constructor() {
 /// An `Entry` built without negotiation carries no application data.
 #[test]
 fn entry_without_negotiation_has_no_application_data() {
-    let entry = Entry::builder((Ipv4Addr::LOCALHOST, 1).into()).build();
+    let entry = Entry::builder((Ipv4Addr::LOCALHOST, 1).into()).build(None);
     assert!(entry.application_data().is_none());
 }

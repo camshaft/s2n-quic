@@ -144,7 +144,7 @@ fn test_path_secret_entry() -> Arc<PathSecretEntry> {
     let peer: std::net::SocketAddr = "127.0.0.1:4433".parse().unwrap();
     PathSecretEntry::builder(peer)
         .socket_sender_count(2)
-        .build()
+        .build(None)
 }
 
 fn new_test_item(

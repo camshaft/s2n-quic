@@ -619,14 +619,12 @@ impl crate::socket::channel::ByteCost for Context {
 
 #[derive(Debug)]
 pub enum ContextError {
-    PeerDataAddrsNotReady,
     PeerDataAddrsEmpty,
 }
 
 impl std::fmt::Display for ContextError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::PeerDataAddrsNotReady => write!(f, "peer data addrs not yet exchanged"),
             Self::PeerDataAddrsEmpty => write!(f, "peer data addrs list is empty"),
         }
     }
@@ -734,15 +732,11 @@ impl Context {
         let rtt_estimator = RttEstimator::new(Duration::from_millis(2));
         let inflight = inflight::Map::new(inflight_gauge);
 
-        let addrs = entry
-            .peer_data_addrs()
-            .get()
-            .ok_or(ContextError::PeerDataAddrsNotReady)?;
+        let addrs = entry.peer_data_addrs();
         if addrs.is_empty() {
             return Err(ContextError::PeerDataAddrsEmpty);
         }
-        let peer_addr =
-            std::net::SocketAddr::from(addrs[usize::from(sender_idx) % addrs.len()].unmap());
+        let peer_addr = addrs[usize::from(sender_idx) % addrs.len()];
 
         ::tracing::debug!(%credentials, %peer_addr, %sender_idx, "deriving sealer for credentials");
 

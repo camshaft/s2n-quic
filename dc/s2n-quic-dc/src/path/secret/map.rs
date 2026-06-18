@@ -47,7 +47,7 @@ use store::Store;
 pub use entry::TestEntryBuilder;
 pub use entry::{
     ApplicationData, ApplicationDataError, ApplicationDataRequest, ApplicationPair, Bidirectional,
-    ControlPair, PeerDataAddrs, MAX_PEER_DATA_ADDRS,
+    ControlPair, MAX_PEER_DATA_ADDRS,
 };
 pub use handshake::HandshakingPath;
 pub use peer::Peer;
@@ -404,38 +404,35 @@ impl Map {
         let entry = Entry::builder(peer)
             .endpoint_type(endpoint_type)
             .socket_sender_count(self.store.socket_sender_count())
-            .build();
+            .build(None);
         self.store.test_insert(entry);
     }
 
+    /// Insert a matching pair of path-secret entries so two simulated endpoints can
+    /// exchange encrypted packets without a real handshake.
+    ///
+    /// `local_builder` becomes the client-side entry in `self`; `peer_builder` becomes the
+    /// server-side entry in `peer`. Callers configure the addresses (`Entry::builder(peer)
+    /// .local(local)`), `params`, and `peer_data_addrs`; this method stamps the structural
+    /// bits a pair requires: endpoint type, each map's socket-sender count, the
+    /// cross-signed stateless-reset tokens (each side is signed by the *other* map's
+    /// signer), and a non-colliding generation.
     #[cfg(any(test, feature = "testing"))]
     pub(crate) fn test_insert_pair(
         &self,
-        local_addr: SocketAddr,
-        local_params: Option<dc::ApplicationParams>,
+        local_builder: TestEntryBuilder,
         peer: &Self,
-        peer_addr: SocketAddr,
-        peer_params: Option<dc::ApplicationParams>,
+        peer_builder: TestEntryBuilder,
     ) -> TestPairIds {
         use s2n_quic_core::endpoint::Type;
 
-        let mut local_builder = Entry::builder(peer_addr)
-            .local(local_addr)
+        let mut local_builder = local_builder
             .endpoint_type(Type::Client)
-            .socket_sender_count(self.store.socket_sender_count())
-            .signer(peer.store.signer());
-        if let Some(params) = local_params {
-            local_builder = local_builder.params(params);
-        }
+            .socket_sender_count(self.store.socket_sender_count());
 
-        let mut peer_builder = Entry::builder(local_addr)
-            .local(peer_addr)
+        let mut peer_builder = peer_builder
             .endpoint_type(Type::Server)
-            .socket_sender_count(peer.store.socket_sender_count())
-            .signer(self.store.signer());
-        if let Some(params) = peer_params {
-            peer_builder = peer_builder.params(params);
-        }
+            .socket_sender_count(peer.store.socket_sender_count());
 
         // Bump generation until we find one that doesn't collide with existing entries.
         let mut generation = 0u64;
@@ -443,8 +440,8 @@ impl Map {
             local_builder = local_builder.generation(generation);
             peer_builder = peer_builder.generation(generation);
 
-            let local_entry = local_builder.build();
-            let peer_entry = peer_builder.build();
+            let local_entry = local_builder.build(Some(peer.store.signer()));
+            let peer_entry = peer_builder.build(Some(self.store.signer()));
 
             debug_assert_eq!(
                 local_entry.secret().peer_id(),

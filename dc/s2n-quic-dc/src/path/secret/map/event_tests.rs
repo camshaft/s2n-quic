@@ -4,7 +4,7 @@
 use crate::{
     event,
     packet::{secret_control as control, WireVersion},
-    path::secret::{stateless_reset, Map},
+    path::secret::{map::Entry, stateless_reset, Map},
 };
 use s2n_codec::{DecoderBufferMut, EncoderBuffer};
 use s2n_quic_core::time::NoopClock;
@@ -70,7 +70,11 @@ fn control_packets() {
     let client_addr = "127.0.0.1:1234".parse().unwrap();
     let server_addr = "127.0.0.1:5678".parse().unwrap();
 
-    let ids = client.test_insert_pair(client_addr, None, &server, server_addr, None);
+    let ids = client.test_insert_pair(
+        Entry::builder(server_addr).local(client_addr),
+        &server,
+        Entry::builder(client_addr).local(server_addr),
+    );
 
     let mut out = [0; 128];
 

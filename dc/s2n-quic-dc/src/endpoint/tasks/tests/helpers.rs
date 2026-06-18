@@ -171,7 +171,7 @@ impl RecvContextBuilder {
     pub fn build(self) -> Rc<RefCell<recv::Context>> {
         let entry = PathSecretEntry::builder(self.peer)
             .endpoint_type(s2n_quic_core::endpoint::Type::Server)
-            .build();
+            .build(None);
         let opener = entry.secret().application_opener(VarInt::ZERO);
         let clock = crate::time::bach::Clock::default();
         let queue_view = match entry.queue_state() {
@@ -208,8 +208,7 @@ pub async fn test_entry_at(addr: impl bach::net::ToSocketAddrs) -> Arc<PathSecre
         .expect("address resolution failed")
         .next()
         .expect("lookup_host returned empty iterator");
-    let pse = PathSecretEntry::builder(addr).build();
-    pse.set_peer_data_addrs(&[addr]);
+    let pse = PathSecretEntry::builder(addr).build(None);
     pse
 }
 
@@ -217,8 +216,7 @@ pub fn test_entry() -> Arc<PathSecretEntry> {
     let addr: SocketAddr = "127.0.0.1:4433".parse().unwrap();
     let pse = PathSecretEntry::builder(addr)
         .socket_sender_count(8)
-        .build();
-    pse.set_peer_data_addrs(&[addr]);
+        .build(None);
     pse
 }
 

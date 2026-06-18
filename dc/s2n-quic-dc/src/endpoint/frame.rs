@@ -1336,7 +1336,7 @@ mod tests {
 
     #[test]
     fn queue_data() {
-        let entry = PathSecretEntry::builder("127.0.0.1:8080".parse().unwrap()).build();
+        let entry = PathSecretEntry::builder("127.0.0.1:8080".parse().unwrap()).build(None);
         let mut payload = ByteVec::new();
         payload.push_back(bytes::Bytes::from_static(b"hello"));
 
@@ -1371,7 +1371,7 @@ mod tests {
 
     #[test]
     fn queue_reset() {
-        let entry = PathSecretEntry::builder("10.0.0.1:9000".parse().unwrap()).build();
+        let entry = PathSecretEntry::builder("10.0.0.1:9000".parse().unwrap()).build(None);
 
         let frame = Frame {
             header: Header::QueueReset {

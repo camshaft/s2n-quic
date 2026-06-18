@@ -261,15 +261,16 @@ fn wheel_router_routes_all_interest_combinations() {
     });
 }
 
-/// A PathSecretEntry whose peer data addresses have NOT been exchanged yet, so
-/// `send::Context::new` fails with `ContextError::PeerDataAddrsNotReady`. This is the
-/// realistic state for the very first batch(es) routed to a freshly-handshaked peer.
+/// A PathSecretEntry with an empty peer data address list, so `send::Context::new` fails
+/// with `ContextError::PeerDataAddrsEmpty`. This models a peer that advertised no usable
+/// `DcDataAddresses`, so no send destination can be resolved.
 fn entry_without_data_addrs() -> Arc<PathSecretEntry> {
     let addr: SocketAddr = "127.0.0.1:4433".parse().unwrap();
-    // Note: deliberately do NOT call `set_peer_data_addrs`.
+    // Override the builder's default single-address list with an empty one.
     PathSecretEntry::builder(addr)
         .socket_sender_count(8)
-        .build()
+        .peer_data_addrs(Vec::<SocketAddr>::new())
+        .build(None)
 }
 
 /// A single-frame `FrameBatch` whose frame carries `flow_credits` borrowed from the send

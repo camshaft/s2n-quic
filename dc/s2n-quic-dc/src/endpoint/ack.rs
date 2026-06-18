@@ -770,8 +770,7 @@ mod tests {
         let peer: std::net::SocketAddr = "127.0.0.1:9999".parse().unwrap();
         let entry = PathSecretEntry::builder(peer)
             .socket_sender_count(1)
-            .build();
-        entry.set_peer_data_addrs(&[peer]);
+            .build(None);
         entry
     }
 

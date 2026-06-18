@@ -78,7 +78,7 @@ fn single_frame_arrives_at_worker() {
         async move {
             let pse = crate::path::secret::map::Entry::builder("127.0.0.1:4433".parse().unwrap())
                 .socket_sender_count(1)
-                .build();
+                .build(None);
             let mut input = PriorityInput::default();
             input.push(test_frame(&pse));
             frame_tx.send_batch(input).unwrap();
@@ -105,7 +105,7 @@ fn same_peer_frames_batched() {
         async move {
             let pse = crate::path::secret::map::Entry::builder("127.0.0.1:4433".parse().unwrap())
                 .socket_sender_count(1)
-                .build();
+                .build(None);
             let mut input = PriorityInput::default();
             for _ in 0..5 {
                 input.push(test_frame(&pse));
@@ -135,7 +135,7 @@ fn multiple_workers_receive_frames() {
         async move {
             let pse = crate::path::secret::map::Entry::builder("127.0.0.1:4433".parse().unwrap())
                 .socket_sender_count(2)
-                .build();
+                .build(None);
             let mut input = PriorityInput::default();
             input.push(test_frame(&pse));
             frame_tx.send_batch(input).unwrap();
@@ -209,7 +209,7 @@ fn pacing_delays_frames_beyond_burst() {
         async move {
             let pse = crate::path::secret::map::Entry::builder("127.0.0.1:4433".parse().unwrap())
                 .socket_sender_count(1)
-                .build();
+                .build(None);
             // Each frame is larger than the burst budget; BatchFramesByPathSecret will emit
             // them as two separate FrameBatches because the first already fills a batch.
             const OVERSIZED_FRAME_SIZE: usize = u16::MAX as usize;

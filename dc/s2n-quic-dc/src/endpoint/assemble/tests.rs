@@ -100,9 +100,8 @@ impl bolero_generator::TypeGenerator for HarnessInput {
 
 fn make_context(mtu: u16, registry: &Registry) -> (Context, Arc<PathSecretEntry>) {
     let peer: std::net::SocketAddr = "127.0.0.1:8080".parse().unwrap();
-    let entry = PathSecretEntry::builder(peer).build();
+    let entry = PathSecretEntry::builder(peer).build(None);
     entry.update_max_datagram_size(mtu);
-    entry.set_peer_data_addrs(&[peer]);
     let inflight_gauge = registry.register_queue_gauge("test.inflight");
     let ack_gauge = registry.register_queue_gauge("test.ack");
     let pending_gauge = registry.register_queue_gauge("test.pending");
@@ -446,13 +445,11 @@ fn encode_decode_round_trip() {
     // same underlying secret and therefore the same derived application key.
     let sealer_entry = PathSecretEntry::builder("127.0.0.1:8080".parse().unwrap())
         .endpoint_type(endpoint::Type::Client)
-        .build();
+        .build(None);
     let opener_entry = PathSecretEntry::builder("127.0.0.1:8080".parse().unwrap())
         .endpoint_type(endpoint::Type::Server)
-        .build();
+        .build(None);
     sealer_entry.update_max_datagram_size(1500);
-    let peer: std::net::SocketAddr = "127.0.0.1:8080".parse().unwrap();
-    sealer_entry.set_peer_data_addrs(&[peer]);
 
     let registry = Registry::new();
     let inflight_gauge = registry.register_queue_gauge("test.inflight");
@@ -760,13 +757,11 @@ fn encode_decode_fuzz_round_trip() {
         .for_each(|input| {
             let sealer_entry = PathSecretEntry::builder("127.0.0.1:8080".parse().unwrap())
                 .endpoint_type(endpoint::Type::Client)
-                .build();
+                .build(None);
             let opener_entry = PathSecretEntry::builder("127.0.0.1:8080".parse().unwrap())
                 .endpoint_type(endpoint::Type::Server)
-                .build();
+                .build(None);
             sealer_entry.update_max_datagram_size(input.mtu);
-            let peer: std::net::SocketAddr = "127.0.0.1:8080".parse().unwrap();
-            sealer_entry.set_peer_data_addrs(&[peer]);
 
             let registry = Registry::new();
             let inflight_gauge = registry.register_queue_gauge("test.inflight");
