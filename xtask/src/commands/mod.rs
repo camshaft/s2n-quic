@@ -3,6 +3,7 @@
 
 pub mod analyze;
 pub mod cwlogs;
+pub mod frame_trace;
 pub mod investigate;
 pub mod local;
 pub mod metrics_parquet;
@@ -21,6 +22,8 @@ pub enum Command {
     Cwlogs(cwlogs::Cwlogs),
     /// Investigate s2n-quic-dc metrics stored in Parquet files
     Investigate(investigate::Investigate),
+    /// Convert a frame-trace dump file into a queryable Parquet file
+    FrameTrace(frame_trace::FrameTrace),
 }
 
 impl Command {
@@ -30,6 +33,7 @@ impl Command {
             Self::Analyze(cmd) => cmd.run(sh),
             Self::Cwlogs(cmd) => cmd.run(sh),
             Self::Investigate(cmd) => cmd.run(sh),
+            Self::FrameTrace(cmd) => cmd.run(sh),
         }
     }
 }
