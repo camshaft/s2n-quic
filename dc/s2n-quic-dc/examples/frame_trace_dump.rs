@@ -21,9 +21,11 @@ use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 const FILE_MAGIC: [u8; 8] = *b"DCFTRC01";
 const RECORD_MAGIC: u8 = 0xF7;
+const PACKET_RECORD_MAGIC: u8 = 0xF8;
 const NO_PACKET_NUMBER: u64 = u64::MAX;
 
-// Must match `endpoint::frame_trace::FrameRecord`.
+// Must match `endpoint::frame_trace::FrameRecord` (88 bytes). The leading 80 bytes are the v1
+// layout; `reason`/`_pad`/`payload_len` were appended in v2.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, FromBytes, IntoBytes, Immutable, KnownLayout)]
 struct FrameRecord {
@@ -42,6 +44,59 @@ struct FrameRecord {
     direction: u8,
     frame_type: u8,
     flags: u8,
+    /// v2: a `DropReason` discriminant for `RxDropped`, else 0.
+    reason: u8,
+    _pad: [u8; 3],
+    /// v2: bytes delivered for `AppRecv`, else 0.
+    payload_len: u32,
+}
+
+// Must match `endpoint::frame_trace::PacketRecord` (56 bytes). Discriminated from a frame record by
+// its distinct length and `PACKET_RECORD_MAGIC`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, FromBytes, IntoBytes, Immutable, KnownLayout)]
+struct PacketRecord {
+    timestamp_nanos: u64,
+    packet_number: u64,
+    linked_pn: u64,
+    cred_id: [u8; 16],
+    seq: u32,
+    sent_bytes: u32,
+    frame_count: u16,
+    magic: u8,
+    event: u8,
+    reason: u8,
+    _pad: [u8; 3],
+}
+
+fn packet_event_str(e: u8) -> &'static str {
+    match e {
+        0 => "rx-arrived",
+        1 => "rx-dropped",
+        2 => "sent",
+        3 => "acked",
+        4 => "lost",
+        _ => "?",
+    }
+}
+
+fn reason_str(r: u8) -> &'static str {
+    match r {
+        0 => "",
+        1 => "unallocated",
+        2 => "half-closed",
+        3 => "stale-binding",
+        4 => "future-binding",
+        5 => "sender-closed",
+        6 => "cap-exceeded",
+        7 => "window-violation",
+        8 => "msg-insert-rejected",
+        9 => "decrypt-failed",
+        10 => "replay-detected",
+        11 => "duplicate",
+        12 => "path-secret-not-found",
+        _ => "?",
+    }
 }
 
 /// Format the credential id the same way `credentials::Id` Displays in the logs: `0x` + big-endian
@@ -58,6 +113,10 @@ fn direction_str(d: u8) -> &'static str {
         3 => "ack-ok",
         4 => "ack-lost",
         5 => "ack-cancel",
+        6 => "app-send",
+        7 => "app-recv",
+        8 => "send-cancel",
+        9 => "rx-drop",
         _ => "?",
     }
 }
@@ -152,34 +211,95 @@ fn main() {
 
     let region = &bytes[32..32 + capacity.min(bytes.len() - 32)];
     let mut n = 0usize;
+    // The ring interleaves two record types of different sizes. Discriminate on payload length
+    // first (the framing the producer guarantees), then validate the per-type magic — a length that
+    // matches but whose magic doesn't means we walked into an overwritten/torn tail, so we stop.
     walk(region, head, capacity, |payload| {
-        match FrameRecord::read_from_bytes(payload) {
-            Ok(rec) if rec.magic == RECORD_MAGIC => {
-                let pn = if rec.packet_number == NO_PACKET_NUMBER {
-                    "-".to_string()
-                } else {
-                    rec.packet_number.to_string()
-                };
-                println!(
-                    "seq={:>10} t={:>14}ns {:>10} {:<16} cred={} src={} dst={} bind={} pn={} off={} dump_id={} [{}]",
-                    rec.seq,
-                    rec.timestamp_nanos,
-                    direction_str(rec.direction),
-                    kind_str(rec.frame_type),
-                    cred_str(&rec.cred_id),
-                    rec.source_queue_id,
-                    rec.dest_queue_id,
-                    rec.binding_id,
-                    pn,
-                    rec.offset,
-                    rec.dump_id,
-                    flags_str(rec.flags),
-                );
-                n += 1;
+        if payload.len() == core::mem::size_of::<FrameRecord>() {
+            if let Ok(rec) = FrameRecord::read_from_bytes(payload) {
+                if rec.magic == RECORD_MAGIC {
+                    print_frame(&rec);
+                    n += 1;
+                }
             }
-            // A bad magic means we walked into an overwritten/torn tail — stop reporting.
-            _ => {}
+        } else if payload.len() == core::mem::size_of::<PacketRecord>() {
+            if let Ok(rec) = PacketRecord::read_from_bytes(payload) {
+                if rec.magic == PACKET_RECORD_MAGIC {
+                    print_packet(&rec);
+                    n += 1;
+                }
+            }
         }
     });
     eprintln!("{n} records");
+}
+
+fn pn_str(pn: u64) -> String {
+    if pn == NO_PACKET_NUMBER {
+        "-".to_string()
+    } else {
+        pn.to_string()
+    }
+}
+
+fn print_frame(rec: &FrameRecord) {
+    // Append the v2 extras only when they carry information, so v1-shaped records read identically.
+    let mut extra = flags_str(rec.flags);
+    let reason = reason_str(rec.reason);
+    if !reason.is_empty() {
+        if !extra.is_empty() {
+            extra.push('|');
+        }
+        extra.push_str(reason);
+    }
+    if rec.payload_len != 0 {
+        if !extra.is_empty() {
+            extra.push('|');
+        }
+        extra.push_str(&format!("len={}", rec.payload_len));
+    }
+    println!(
+        "seq={:>10} t={:>14}ns {:>11} {:<16} cred={} src={} dst={} bind={} pn={} off={} dump_id={} [{}]",
+        rec.seq,
+        rec.timestamp_nanos,
+        direction_str(rec.direction),
+        kind_str(rec.frame_type),
+        cred_str(&rec.cred_id),
+        rec.source_queue_id,
+        rec.dest_queue_id,
+        rec.binding_id,
+        pn_str(rec.packet_number),
+        rec.offset,
+        rec.dump_id,
+        extra,
+    );
+}
+
+fn print_packet(rec: &PacketRecord) {
+    let mut extra = Vec::new();
+    if rec.sent_bytes != 0 {
+        extra.push(format!("bytes={}", rec.sent_bytes));
+    }
+    if rec.frame_count != 0 {
+        extra.push(format!("frames={}", rec.frame_count));
+    }
+    if rec.linked_pn != NO_PACKET_NUMBER {
+        extra.push(format!("linked_pn={}", rec.linked_pn));
+    }
+    let reason = reason_str(rec.reason);
+    if !reason.is_empty() {
+        extra.push(reason.to_string());
+    }
+    // Packet records carry no frame type / offsets; the leading columns line up with frame records
+    // so a mixed dump stays readable, and the PACKET marker makes the row type obvious.
+    println!(
+        "seq={:>10} t={:>14}ns {:>11} {:<16} cred={} pn={} [{}]",
+        rec.seq,
+        rec.timestamp_nanos,
+        packet_event_str(rec.event),
+        "PACKET",
+        cred_str(&rec.cred_id),
+        pn_str(rec.packet_number),
+        extra.join("|"),
+    );
 }

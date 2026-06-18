@@ -302,6 +302,30 @@ fn decrypt_fast_path(
     })
 }
 
+/// Records a pre-decode packet drop ([`PacketEvent::RxDropped`]) into the frame flight recorder.
+///
+/// These drops happen before any frame is decoded — there is no `Header` to attach an `RxDropped`
+/// *frame* record to — so the reason rides on the packet record instead. Pairs with the
+/// `RxArrived` record emitted on entry, so a dump shows arrival immediately followed by the drop.
+///
+/// [`PacketEvent::RxDropped`]: crate::endpoint::frame_trace::PacketEvent::RxDropped
+#[inline]
+fn record_packet_drop(
+    packet_number: VarInt,
+    cred_id: crate::credentials::Id,
+    reason: crate::endpoint::frame_trace::DropReason,
+) {
+    crate::endpoint::frame_trace::record_packet(
+        crate::endpoint::frame_trace::PacketEvent::RxDropped,
+        packet_number,
+        cred_id,
+        0,
+        0,
+        None,
+        reason,
+    );
+}
+
 /// Process a received datagram packet.
 ///
 /// Authenticates (decrypt), deduplicates by packet number, updates ACK state, then
@@ -334,6 +358,20 @@ where
     let credentials = *packet.credentials();
     let packet_number = packet.packet_number();
     let routing_info = packet.routing_info();
+
+    // Earliest possible sighting of this packet — recorded off the wire before decrypt, dedup, and
+    // frame dispatch. A gap in the RxArrived packet-number sequence pins loss to the wire, ruling
+    // out anything between arrival and processing. Recorded even for the malformed cases below so
+    // they don't vanish.
+    crate::endpoint::frame_trace::record_packet(
+        crate::endpoint::frame_trace::PacketEvent::RxArrived,
+        packet_number,
+        credentials.id,
+        0,
+        0,
+        None,
+        crate::endpoint::frame_trace::DropReason::None,
+    );
 
     let source_sender_id = match routing_info {
         RoutingInfo::SenderId { source_sender_id } => source_sender_id,
@@ -447,6 +485,11 @@ where
         ) {
             Ok(v) => v,
             Err(recv::CacheError::PathSecretNotFound) => {
+                record_packet_drop(
+                    packet_number,
+                    credentials.id,
+                    crate::endpoint::frame_trace::DropReason::PathSecretNotFound,
+                );
                 let mut dest_addr = crate::msg::addr::Addr::new(remote_addr);
                 dest_addr.set_port(source_control_port);
                 return Err(Error::PeerStateLookup {
@@ -456,6 +499,11 @@ where
                 });
             }
             Err(recv::CacheError::DecryptFailed) => {
+                record_packet_drop(
+                    packet_number,
+                    credentials.id,
+                    crate::endpoint::frame_trace::DropReason::DecryptFailed,
+                );
                 warn!(
                     %credentials,
                     packet_number = packet_number.as_u64(),
@@ -467,6 +515,11 @@ where
                 });
             }
             Err(recv::CacheError::ReplayDetected) => {
+                record_packet_drop(
+                    packet_number,
+                    credentials.id,
+                    crate::endpoint::frame_trace::DropReason::ReplayDetected,
+                );
                 let mut dest_addr = crate::msg::addr::Addr::new(remote_addr);
                 dest_addr.set_port(source_control_port);
                 return Err(Error::StaleKey {
@@ -488,6 +541,11 @@ where
 
     // Packet number deduplication
     if peer.dedup_filter.on_packet_number(packet_number).is_err() {
+        record_packet_drop(
+            packet_number,
+            credentials.id,
+            crate::endpoint::frame_trace::DropReason::Duplicate,
+        );
         return Err(Error::Duplicate {
             credentials,
             packet_number,
@@ -583,6 +641,7 @@ where
                 dispatch_decoded_frame(
                     header,
                     source_sender_id,
+                    packet_number,
                     frame_payload,
                     &mut peer,
                     &credentials,
@@ -670,6 +729,7 @@ where
 fn dispatch_decoded_frame(
     header: Header,
     source_sender_id: VarInt,
+    packet_number: VarInt,
     payload: BytesMut,
     peer: &mut recv::Context,
     credentials: &Credentials,
@@ -721,19 +781,27 @@ fn dispatch_decoded_frame(
                     recv_credit_pool,
                     priority,
                 );
-            } else {
-                handle_queue_data(
-                    peer,
-                    queue_pair,
-                    binding_id,
-                    offset,
-                    peer_max_offset,
-                    is_fin,
-                    blocked,
-                    payload,
-                    counters,
-                    waker_sink,
-                    recv_credit_pool,
+            } else if let Some(reason) = handle_queue_data(
+                peer,
+                queue_pair,
+                binding_id,
+                offset,
+                peer_max_offset,
+                is_fin,
+                blocked,
+                payload,
+                counters,
+                waker_sink,
+                recv_credit_pool,
+            ) {
+                // Authenticated and decoded but rejected before reaching the application — record
+                // where it died so the drop isn't a blind spot. `header` is still the authentic
+                // wire frame (it is `Copy`, untouched by the match binding above).
+                crate::endpoint::frame_trace::record_drop(
+                    &header,
+                    packet_number,
+                    credentials.id,
+                    reason,
                 );
             }
         }
@@ -873,24 +941,30 @@ fn dispatch_decoded_frame(
                     recv_credit_pool,
                     priority,
                 );
-            } else {
-                handle_queue_msg(
-                    peer,
-                    queue_pair,
-                    binding_id,
-                    msg_id,
-                    stream_offset,
-                    peer_max_offset,
-                    message_size,
-                    chunk_size,
-                    chunk_index,
-                    is_fin,
-                    is_wakeup,
-                    blocked,
-                    payload,
-                    counters,
-                    waker_sink,
-                    recv_credit_pool,
+            } else if let Some(reason) = handle_queue_msg(
+                peer,
+                queue_pair,
+                binding_id,
+                msg_id,
+                stream_offset,
+                peer_max_offset,
+                message_size,
+                chunk_size,
+                chunk_index,
+                is_fin,
+                is_wakeup,
+                blocked,
+                payload,
+                counters,
+                waker_sink,
+                recv_credit_pool,
+            ) {
+                // See the QueueData arm: record the post-decode drop against the authentic header.
+                crate::endpoint::frame_trace::record_drop(
+                    &header,
+                    packet_number,
+                    credentials.id,
+                    reason,
                 );
             }
         }
@@ -1141,6 +1215,8 @@ impl Iterator for DeltaDecoder<'_> {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Returns `Some(reason)` if the frame was dropped after decode, so the caller (which still holds
+/// the intact `Header`) can record an `RxDropped` frame-trace event; `None` on successful dispatch.
 fn handle_queue_data(
     peer: &mut recv::Context,
     queue_pair: QueuePair,
@@ -1153,7 +1229,8 @@ fn handle_queue_data(
     counters: &counters::Dispatch,
     waker_sink: &mut impl channel::UnboundedSender<AutoWake>,
     recv_credit_pool: &crate::sync::Arc<crate::credit::Pool>,
-) {
+) -> Option<crate::endpoint::frame_trace::DropReason> {
+    use crate::endpoint::frame_trace::DropReason;
     let local_queue_id = queue_pair.dest_queue_id;
     let payload_len = buf.len();
     let entry = msg::Stream::Data {
@@ -1181,6 +1258,7 @@ fn handle_queue_data(
                 is_fin,
                 "QueueData dispatched"
             );
+            None
         }
         Err(crate::queue::Error::Unallocated(_)) => {
             counters.rx_data_unallocated.add(1);
@@ -1189,6 +1267,7 @@ fn handle_queue_data(
                 queue_id = local_queue_id.as_u64(),
                 "QueueData for unallocated queue - dropping"
             );
+            Some(DropReason::Unallocated)
         }
         Err(crate::queue::Error::HalfClosed(_)) => {
             counters.rx_data_half_closed.add(1);
@@ -1197,6 +1276,7 @@ fn handle_queue_data(
                 queue_id = local_queue_id.as_u64(),
                 "QueueData for half-closed stream - dropping"
             );
+            Some(DropReason::HalfClosed)
         }
         Err(crate::queue::Error::StaleBinding(_)) => {
             counters.rx_data_stale_binding.add(1);
@@ -1205,6 +1285,7 @@ fn handle_queue_data(
                 queue_id = local_queue_id.as_u64(),
                 "QueueData stale binding - dropping"
             );
+            Some(DropReason::StaleBinding)
         }
         Err(crate::queue::Error::FutureBinding(_)) => {
             counters.rx_data_future_binding.add(1);
@@ -1213,6 +1294,7 @@ fn handle_queue_data(
                 queue_id = local_queue_id.as_u64(),
                 "QueueData future binding - dropping"
             );
+            Some(DropReason::FutureBinding)
         }
         Err(crate::queue::Error::SenderClosed) => {
             trace!(
@@ -1220,6 +1302,7 @@ fn handle_queue_data(
                 queue_id = local_queue_id.as_u64(),
                 "QueueData for closed sender - dropping"
             );
+            Some(DropReason::SenderClosed)
         }
         Err(crate::queue::Error::CapExceeded(_)) => {
             debug!(
@@ -1227,6 +1310,7 @@ fn handle_queue_data(
                 queue_id = local_queue_id.as_u64(),
                 "QueueData queue_id exceeds cap - dropping"
             );
+            Some(DropReason::CapExceeded)
         }
     }
 }
@@ -1251,7 +1335,8 @@ fn handle_queue_msg(
     counters: &counters::Dispatch,
     waker_sink: &mut impl channel::UnboundedSender<AutoWake>,
     recv_credit_pool: &crate::sync::Arc<crate::credit::Pool>,
-) {
+) -> Option<crate::endpoint::frame_trace::DropReason> {
+    use crate::endpoint::frame_trace::DropReason;
     let local_queue_id = queue_pair.dest_queue_id;
     let payload_len = payload.len() as u32;
 
@@ -1286,21 +1371,30 @@ fn handle_queue_msg(
             }
             let _ = waker_sink.send(waker);
             recv_credit_pool.release(release_bytes);
+            None
         }
         Err(crate::queue::MsgError::Queue(crate::queue::Error::Unallocated(_))) => {
             counters.rx_data_unallocated.add(1);
+            Some(DropReason::Unallocated)
         }
         Err(crate::queue::MsgError::Queue(crate::queue::Error::HalfClosed(_))) => {
             counters.rx_data_half_closed.add(1);
+            Some(DropReason::HalfClosed)
         }
         Err(crate::queue::MsgError::Queue(crate::queue::Error::StaleBinding(_))) => {
             counters.rx_data_stale_binding.add(1);
+            Some(DropReason::StaleBinding)
         }
         Err(crate::queue::MsgError::Queue(crate::queue::Error::FutureBinding(_))) => {
             counters.rx_data_future_binding.add(1);
+            Some(DropReason::FutureBinding)
         }
-        Err(crate::queue::MsgError::Queue(crate::queue::Error::SenderClosed)) => {}
-        Err(crate::queue::MsgError::Queue(crate::queue::Error::CapExceeded(_))) => {}
+        Err(crate::queue::MsgError::Queue(crate::queue::Error::SenderClosed)) => {
+            Some(DropReason::SenderClosed)
+        }
+        Err(crate::queue::MsgError::Queue(crate::queue::Error::CapExceeded(_))) => {
+            Some(DropReason::CapExceeded)
+        }
         Err(crate::queue::MsgError::InsertRejected) => {
             // The MsgTable rejected this chunk's geometry. On the slow path the packet was already
             // authenticated (decrypted up front before frame dispatch), so dropping the chunk is
@@ -1310,6 +1404,7 @@ fn handle_queue_msg(
                 queue_id = local_queue_id.as_u64(),
                 "QueueMsg mixed-path insert rejected - dropping"
             );
+            Some(DropReason::MsgInsertRejected)
         }
         Err(crate::queue::MsgError::Write(_)) => {
             trace!(
@@ -1317,6 +1412,9 @@ fn handle_queue_msg(
                 queue_id = local_queue_id.as_u64(),
                 "QueueMsg mixed-path write callback failed - dropping"
             );
+            // A write-callback failure is a local copy fault, not a routing/window drop; reuse the
+            // closest reason rather than minting a new one. The trace line above disambiguates.
+            Some(DropReason::MsgInsertRejected)
         }
     }
 }
@@ -1464,8 +1562,10 @@ fn handle_queue_msg_init(
         }
     }
 
-    // Now push the actual chunk data through the msg path.
-    handle_queue_msg(
+    // Now push the actual chunk data through the msg path. A post-bind drop here is already
+    // covered by the bind/acceptor instrumentation on the init path (counters + send_reset), so
+    // the returned reason is intentionally not turned into a second RxDropped record.
+    let _ = handle_queue_msg(
         peer,
         queue_pair,
         binding_id,

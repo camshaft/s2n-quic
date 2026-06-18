@@ -887,6 +887,118 @@ fn queue_dbg_dumps_state_end_to_end() {
     });
 }
 
+/// End-to-end coverage that the frame flight recorder captures the full lifecycle — the
+/// application edges and the per-packet records added alongside the wire/ack events.
+///
+/// Runs a tiny bidirectional transfer (client pings, server pongs, both read to completion) and
+/// then asserts the global ring contains, at minimum:
+///   * `AppSend` — a frame submitted by the application into the send pipeline,
+///   * `Outbound` / `Inbound` — the wire edges,
+///   * `AppRecv` — reassembled bytes delivered to the application,
+///   * packet `RxArrived` — a packet recorded off the wire before decrypt/dedup,
+///   * packet `Sent` — a packet assembled and put on the wire.
+///
+/// The ring is process-global and shared across all bach tests in the binary, so this asserts
+/// *presence* of each kind (a superset is fine) rather than exact counts. The recorder is active
+/// because the crate's own tests build with `cfg(test)`.
+#[test]
+fn frame_trace_captures_app_and_packet_lifecycle() {
+    use crate::endpoint::frame_trace::{Direction, PacketEvent};
+
+    sim(|| {
+        let acceptor_id = VarInt::from_u8(1);
+
+        async move {
+            let server = Server::new();
+            let mut acceptor = server
+                .register_acceptor_channel(acceptor_id, 8)
+                .expect("acceptor registration failed");
+
+            while let Some(stream) = acceptor.recv().await {
+                async move {
+                    let (mut reader, mut writer) = stream.into_split();
+                    // Read the client's ping to completion, then send a pong with FIN.
+                    let mut buf = BytesMut::with_capacity(8);
+                    loop {
+                        let n = reader.read_into(&mut buf).await.expect("server read");
+                        if n == 0 {
+                            break;
+                        }
+                    }
+                    let mut pong = Bytes::from_static(b"pong");
+                    writer
+                        .write_all_from_fin(&mut pong)
+                        .await
+                        .expect("server write");
+                }
+                .primary()
+                .spawn();
+            }
+        }
+        .group("server")
+        .spawn();
+
+        async move {
+            let mut client = Client::new();
+            let mut stream = client
+                .connect("server:0", acceptor_id)
+                .await
+                .expect("connect failed");
+
+            {
+                let (mut reader, mut writer) = stream.split();
+                let mut ping = Bytes::from_static(b"ping");
+                writer
+                    .write_all_from_fin(&mut ping)
+                    .await
+                    .expect("client write");
+
+                // Read the server's pong to completion so the AppRecv delivery point fires on the
+                // client and the server's data is ACKed (driving packet Acked records).
+                let mut buf = BytesMut::with_capacity(8);
+                loop {
+                    let n = reader.read_into(&mut buf).await.expect("client read");
+                    if n == 0 {
+                        break;
+                    }
+                }
+                assert_eq!(&buf[..], b"pong");
+            }
+
+            // Let the final ACKs settle before sampling the ring.
+            10.ms().sleep().await;
+
+            let (directions, packet_events) =
+                crate::endpoint::frame_trace::resident_event_kinds();
+
+            for dir in [
+                Direction::AppSend,
+                Direction::Outbound,
+                Direction::Inbound,
+                Direction::AppRecv,
+            ] {
+                assert!(
+                    directions.contains(&dir.as_u8()),
+                    "expected a {:?} frame record in the ring; saw directions {:?}",
+                    dir,
+                    directions
+                );
+            }
+            for event in [PacketEvent::RxArrived, PacketEvent::Sent] {
+                assert!(
+                    packet_events.contains(&event.as_u8()),
+                    "expected a {:?} packet record in the ring; saw events {:?}",
+                    event,
+                    packet_events
+                );
+            }
+        }
+        .group("client")
+        .primary()
+        .spawn();
+    });
+}
+
 /// Verifies duplicate client init traffic does not create duplicate accepted streams.
 ///
 /// The first client packet toward the server is duplicated at the network layer.
