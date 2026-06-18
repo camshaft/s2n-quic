@@ -2158,7 +2158,17 @@ impl Inner {
     fn send_frame(&mut self, frame: Frame) -> io::Result<()> {
         self.frame_tx
             .send_batch(Entry::new(frame))
-            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "frame channel closed"))
+            .map_err(|mut returned| {
+                // The submission channel is closed (the transport receiver is gone), so this
+                // frame will never reach the wire — it has definitively failed to transmit.
+                // Mark it `Failed` before it drops: the disposition is accurate, and it honors
+                // the `Frame` drop invariant (a completion-bearing frame must not die `Pending`).
+                // The caller is notified through the `BrokenPipe` error below, so the unfired
+                // completion is moot.
+                returned.status =
+                    frame::TransmissionStatus::Failed(frame::FailureReason::TransmissionError);
+                io::Error::new(io::ErrorKind::BrokenPipe, "frame channel closed")
+            })
     }
 
     fn send_batch(&mut self, queue: Queue<Frame>) -> io::Result<()> {
@@ -2169,7 +2179,11 @@ impl Inner {
             .unwrap_or(Priority::QueueData);
         self.frame_tx
             .send_batch(HomogeneousBatch { queue, priority })
-            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "frame channel closed"))
+            .map_err(|returned| {
+                // See `send_frame`: the channel is closed, so these frames failed to transmit.
+                fail_undelivered_frames(returned.queue);
+                io::Error::new(io::ErrorKind::BrokenPipe, "frame channel closed")
+            })
     }
 }
 
@@ -2200,6 +2214,18 @@ impl Drop for Writer {
         // The allocation itself is freed by `WriterAllocPtr::drop`, which runs
         // after this body returns. That drop branches on the credit slot's
         // state to handle the parked-acquire case (step 8).
+    }
+}
+
+/// Mark frames as `Failed` before they drop on the channel-closed send path.
+///
+/// When the submission channel is closed the transport receiver is gone, so these frames will
+/// never be transmitted. Recording the failure keeps the `Frame` drop invariant satisfied and
+/// gives an accurate disposition. The completion fires only if the receiver is still alive; the
+/// caller surfaces the `BrokenPipe` error regardless.
+fn fail_undelivered_frames(mut frames: Queue<Frame>) {
+    for frame in frames.iter_mut() {
+        frame.status = frame::TransmissionStatus::Failed(frame::FailureReason::TransmissionError);
     }
 }
 
