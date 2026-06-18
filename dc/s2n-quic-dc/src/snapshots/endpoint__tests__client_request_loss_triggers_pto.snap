@@ -790,6 +790,7 @@ expression: logs
 0:00:00.007016000 [client] TRACE c#tx.ack_received[send.6]=1
 0:00:00.007016000 [client] TRACE c#send.inflight.drain[send.6]=1
 0:00:00.007016000 [client] TRACE g#send.inflight.depth[send.6]=2
+0:00:00.007016000 [client] TRACE c#tx.probe.shell_acked[send.6]=1
 0:00:00.007016000 [client] TRACE c#send.inflight.drain[send.6]=1
 0:00:00.007016000 [client] TRACE g#send.inflight.depth[send.6]=1
 0:00:00.007016000 [client] TRACE c#tx.acked.frame.queue_data_fin[send.6]=1

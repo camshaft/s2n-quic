@@ -208,6 +208,16 @@ pub(crate) struct Send {
     pub inflight_leaked_on_invalidate: Summary,
     pub probe_no_response: Counter,
     pub tx_probe_backoff: Summary,
+    // Probe-shell benefit accounting. `shell_acked` counts ACKs that named a shell PN (an old
+    // pre-probe packet number whose frames were retransmitted under a newer PN) — i.e. the peer
+    // acknowledged the original transmission after a probe was already sent (reordering or a
+    // spurious PTO). `shell_resolved` counts the subset where following the shell's `probed_to`
+    // chain actually produced frames to complete (the tail had not already been ACKed directly).
+    // `shell_resolved` is the work the forward-pointer shell does that a plain "remove on
+    // retransmit" design could not: completing frames off a late ACK of the old PN. The ratio of
+    // these to total ACKs measures how often the shell machinery earns its complexity.
+    pub tx_probe_shell_acked: Counter,
+    pub tx_probe_shell_resolved: Counter,
     pub routing_asymmetry: Counter,
     pub context_count: Gauge,
     pub tx_packets: Counter,
@@ -258,6 +268,8 @@ impl Send {
                 &v,
                 Unit::Count,
             ),
+            tx_probe_shell_acked: counters.register_nominal("tx.probe.shell_acked", &v),
+            tx_probe_shell_resolved: counters.register_nominal("tx.probe.shell_resolved", &v),
             routing_asymmetry: counters.register_nominal("!send.routing_asymmetry", &v),
             context_count: counters.register_nominal_gauge("send.context.count", &v),
             tx_packets: counters.register_nominal("tx.data", &v),
