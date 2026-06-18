@@ -170,7 +170,14 @@ impl HandshakingPathInner {
         // the same as an absent parameter (the peer simply advertised nothing).
         let mut addrs = match super::data_addresses::decode(&bytes) {
             Ok(addrs) => addrs,
-            Err(_) => return Ok(()),
+            Err(err) => {
+                ::tracing::debug!(
+                    peer = %self.peer,
+                    error = %err,
+                    "ignoring malformed DcDataAddresses transport parameter"
+                );
+                return Ok(());
+            }
         };
 
         if addrs.is_empty() {
