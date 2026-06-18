@@ -68,12 +68,9 @@ const PACKET_RECORD_MAGIC: u8 = 0xF8;
 const FILE_MAGIC: [u8; 8] = *b"DCFTRC01";
 /// Dump format version. v2 added [`Direction`] variants for the application edges and drop sites,
 /// the [`FrameRecord::reason`]/[`FrameRecord::payload_len`] tail, and interleaved [`PacketRecord`]s.
-/// v3 changed `timestamp_nanos` from a duration-since-recorder-start to a Unix-epoch wall-clock
-/// nanosecond timestamp so that records from different hosts can be compared directly. In bach
-/// simulations it is the simulated time since epoch 0. The binary layout is unchanged; parsers
-/// that previously displayed timestamps as relative durations must treat them as absolute Unix
-/// epoch nanoseconds.
-const FILE_VERSION: u32 = 3;
+/// A v1 parser reads v2 frame records correctly for the leading 80 bytes but does not know about the
+/// new directions or packet records; bump again on any further layout change.
+const FILE_VERSION: u32 = 2;
 
 /// Default ring capacity (bytes) when `S2N_DC_FRAME_TRACE_BYTES` is unset. 16 MiB ≈ 256k records.
 const DEFAULT_CAPACITY: usize = 16 << 20;
