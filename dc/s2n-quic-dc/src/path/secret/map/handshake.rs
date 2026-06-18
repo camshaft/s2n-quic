@@ -141,72 +141,95 @@ impl dc::Path for HandshakingPath {
     }
 }
 
-impl HandshakingPathInner {
-    /// Validate and normalize the peer's advertised data addresses, learned from the
-    /// `DcDataAddresses` transport parameter.
-    ///
-    /// Wildcard IPs in the address list are replaced with the peer's handshake IP, since
-    /// a peer that bound to `[::]` is reachable at the address we connected to. A `None`
-    /// or empty list is left as-is (the peer simply advertised nothing); per-send context
-    /// creation handles the no-addrs case.
-    ///
-    /// Returns `TRANSPORT_PARAMETER_ERROR` if the peer advertised more than
-    /// [`MAX_PEER_DATA_ADDRS`](super::MAX_PEER_DATA_ADDRS) addresses, a wildcard port, or a
-    /// loopback address from a non-loopback peer.
-    fn validate_peer_data_addrs(&mut self) -> Result<(), s2n_quic_core::transport::Error> {
-        use s2n_quic_core::transport::Error;
+/// Validate and normalize the peer's advertised data addresses, learned from the
+/// `DcDataAddresses` transport parameter, against the `peer` address the handshake completed
+/// against.
+///
+/// Wildcard IPs in the address list are replaced with the peer's handshake IP, since a peer
+/// that bound to `[::]` is reachable at the address we connected to. Each address is then
+/// normalized to the handshake peer's address family — an IPv4 data addr learned from an IPv6
+/// handshake is mapped to IPv4-mapped IPv6 — so it can be sent on the (typically dual-stack
+/// IPv6) socket we communicate with the peer over; otherwise the send path would hand the
+/// kernel an `AF_INET` sockaddr on an IPv6 socket. An empty list is left as-is (the peer simply
+/// advertised nothing); per-send context creation handles the no-addrs case.
+///
+/// Returns `TRANSPORT_PARAMETER_ERROR` if the peer advertised more than
+/// [`MAX_PEER_DATA_ADDRS`](super::MAX_PEER_DATA_ADDRS) addresses, a wildcard port, or a loopback
+/// address from a non-loopback peer.
+fn validate_peer_data_addrs(
+    peer: SocketAddr,
+    addrs: &mut [SocketAddr],
+) -> Result<(), s2n_quic_core::transport::Error> {
+    use std::net::IpAddr;
 
-        let Some(addrs) = self.peer_data_addrs.as_mut() else {
-            return Ok(());
+    use s2n_quic_core::transport::Error;
+
+    if addrs.is_empty() {
+        return Ok(());
+    }
+
+    if addrs.len() > super::MAX_PEER_DATA_ADDRS {
+        ::tracing::error!(
+            count = addrs.len(),
+            max = super::MAX_PEER_DATA_ADDRS,
+            %peer,
+            "peer advertised too many data addrs"
+        );
+        return Err(
+            Error::TRANSPORT_PARAMETER_ERROR.with_reason("peer advertised too many data addrs")
+        );
+    }
+
+    let peer_ip = peer.ip();
+    let peer_is_loopback = peer_ip.is_loopback();
+
+    for addr in addrs.iter_mut() {
+        if addr.port() == 0 {
+            ::tracing::error!(%addr, %peer, "peer data addr has wildcard port");
+            return Err(
+                Error::TRANSPORT_PARAMETER_ERROR.with_reason("peer data addr has wildcard port")
+            );
+        }
+
+        // A peer that bound to a wildcard IP (e.g. `[::]`) is reachable at the address we
+        // completed the handshake against; substitute that.
+        let ip = if addr.ip().is_unspecified() {
+            peer_ip
+        } else {
+            addr.ip()
         };
 
-        if addrs.is_empty() {
-            return Ok(());
-        }
-
-        if addrs.len() > super::MAX_PEER_DATA_ADDRS {
+        if !peer_is_loopback && ip.is_loopback() {
             ::tracing::error!(
-                count = addrs.len(),
-                max = super::MAX_PEER_DATA_ADDRS,
-                peer = %self.peer,
-                "peer advertised too many data addrs"
+                %addr, %peer,
+                "peer data addr is loopback but handshake addr is not"
             );
             return Err(Error::TRANSPORT_PARAMETER_ERROR
-                .with_reason("peer advertised too many data addrs"));
+                .with_reason("peer data addr is loopback but handshake addr is not"));
         }
 
-        let peer_ip = self.peer.ip();
-        let peer_is_loopback = peer_ip.is_loopback();
+        // Match the handshake peer's address family so the address is sendable on the socket
+        // we reached the peer over (see the function docs).
+        let ip = match (peer_ip, ip) {
+            (IpAddr::V6(_), IpAddr::V4(v4)) => IpAddr::V6(v4.to_ipv6_mapped()),
+            _ => ip,
+        };
 
-        for addr in addrs.iter_mut() {
-            if addr.port() == 0 {
-                ::tracing::error!(%addr, peer = %self.peer, "peer data addr has wildcard port");
-                return Err(Error::TRANSPORT_PARAMETER_ERROR
-                    .with_reason("peer data addr has wildcard port"));
-            }
+        *addr = SocketAddr::new(ip, addr.port());
+    }
 
-            // A peer that bound to a wildcard IP (e.g. `[::]`) is reachable at the address
-            // we completed the handshake against; substitute that.
-            let ip = if addr.ip().is_unspecified() {
-                peer_ip
-            } else {
-                addr.ip()
-            };
+    ::tracing::debug!(%peer, ?addrs, "validated peer data addresses");
 
-            if !peer_is_loopback && ip.is_loopback() {
-                ::tracing::error!(
-                    %addr, peer = %self.peer,
-                    "peer data addr is loopback but handshake addr is not"
-                );
-                return Err(Error::TRANSPORT_PARAMETER_ERROR
-                    .with_reason("peer data addr is loopback but handshake addr is not"));
-            }
+    Ok(())
+}
 
-            *addr = SocketAddr::new(ip, addr.port());
+impl HandshakingPathInner {
+    /// Validate and normalize the peer's advertised data addresses (see
+    /// [`validate_peer_data_addrs`]) in place.
+    fn validate_peer_data_addrs(&mut self) -> Result<(), s2n_quic_core::transport::Error> {
+        if let Some(addrs) = self.peer_data_addrs.as_mut() {
+            validate_peer_data_addrs(self.peer, addrs)?;
         }
-
-        ::tracing::debug!(peer = %self.peer, ?addrs, "validated peer data addresses");
-
         Ok(())
     }
 
@@ -313,5 +336,85 @@ impl HandshakingPathInner {
         if let Some(entry) = self.entry.as_ref() {
             entry.update_max_datagram_size(mtu);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_peer_data_addrs;
+    use std::net::SocketAddr;
+
+    fn addr(s: &str) -> SocketAddr {
+        s.parse().unwrap()
+    }
+
+    fn validate(peer: &str, addrs: &[&str]) -> Result<Vec<SocketAddr>, ()> {
+        let mut addrs: Vec<SocketAddr> = addrs.iter().map(|s| addr(s)).collect();
+        validate_peer_data_addrs(addr(peer), &mut addrs)
+            .map(|()| addrs)
+            .map_err(|_| ())
+    }
+
+    /// An IPv4 data addr from an IPv6 peer is rewritten to IPv4-mapped IPv6 so the send path
+    /// can target it on the dual-stack IPv6 socket. This is the regression behind a v4 sockaddr
+    /// being handed to an IPv6 socket.
+    #[test]
+    fn ipv4_addr_from_ipv6_peer_is_v6_mapped() {
+        let out = validate("[2001:db8::1]:443", &["10.0.0.1:9000"]).unwrap();
+        assert_eq!(out, vec![addr("[::ffff:10.0.0.1]:9000")]);
+    }
+
+    /// Families that already match (or a v4 peer) are left untouched.
+    #[test]
+    fn matching_family_is_unchanged() {
+        assert_eq!(
+            validate("[2001:db8::1]:443", &["[2001:db8::2]:9000"]).unwrap(),
+            vec![addr("[2001:db8::2]:9000")]
+        );
+        assert_eq!(
+            validate("10.0.0.5:443", &["10.0.0.1:9000"]).unwrap(),
+            vec![addr("10.0.0.1:9000")]
+        );
+    }
+
+    /// A wildcard advertised IP is replaced with the handshake peer IP, then family-normalized.
+    #[test]
+    fn wildcard_ip_uses_peer_ip() {
+        assert_eq!(
+            validate("203.0.113.7:443", &["0.0.0.0:9000"]).unwrap(),
+            vec![addr("203.0.113.7:9000")]
+        );
+        // Wildcard v6 against a v6 peer keeps the port and adopts the peer IP.
+        assert_eq!(
+            validate("[2001:db8::1]:443", &["[::]:9000"]).unwrap(),
+            vec![addr("[2001:db8::1]:9000")]
+        );
+    }
+
+    #[test]
+    fn empty_list_is_ok() {
+        assert_eq!(validate("10.0.0.5:443", &[]).unwrap(), Vec::new());
+    }
+
+    #[test]
+    fn wildcard_port_is_rejected() {
+        assert!(validate("10.0.0.5:443", &["10.0.0.1:0"]).is_err());
+    }
+
+    /// A loopback data addr from a non-loopback peer is rejected; a loopback peer may advertise
+    /// loopback addrs (local testing).
+    #[test]
+    fn loopback_from_non_loopback_peer_is_rejected() {
+        assert!(validate("10.0.0.5:443", &["127.0.0.1:9000"]).is_err());
+        assert!(validate("127.0.0.1:443", &["127.0.0.1:9000"]).is_ok());
+    }
+
+    #[test]
+    fn too_many_addrs_is_rejected() {
+        let many: Vec<String> = (0..=super::super::MAX_PEER_DATA_ADDRS)
+            .map(|i| format!("10.0.0.1:{}", 9000 + i))
+            .collect();
+        let refs: Vec<&str> = many.iter().map(|s| s.as_str()).collect();
+        assert!(validate("10.0.0.5:443", &refs).is_err());
     }
 }
