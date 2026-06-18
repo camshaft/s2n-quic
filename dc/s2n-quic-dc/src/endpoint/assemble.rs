@@ -412,6 +412,7 @@ where
                         crate::endpoint::frame_trace::Direction::Outbound,
                         &frame.header,
                         Some(context.next_packet_number),
+                        context.credentials.id,
                     );
                     // Sending a QueueDbg means this node noticed its own stream is stuck (via
                     // `emit_debug`), so dump its send-side flight history locally too — don't rely

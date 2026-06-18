@@ -34,11 +34,20 @@ struct FrameRecord {
     source_queue_id: u64,
     dest_queue_id: u64,
     binding_id: u64,
+    /// Canonicalized 16-byte credential id (endpoint bit cleared), big-endian as on the wire — the
+    /// join key against `credentials=0x…` log lines.
+    cred_id: [u8; 16],
     seq: u32,
     magic: u8,
     direction: u8,
     frame_type: u8,
     flags: u8,
+}
+
+/// Format the credential id the same way `credentials::Id` Displays in the logs: `0x` + big-endian
+/// hex of the 16 bytes (`{:#01x}` of the u128), so a grep matches.
+fn cred_str(id: &[u8; 16]) -> String {
+    format!("{:#01x}", u128::from_be_bytes(*id))
 }
 
 fn direction_str(d: u8) -> &'static str {
@@ -152,11 +161,12 @@ fn main() {
                     rec.packet_number.to_string()
                 };
                 println!(
-                    "seq={:>10} t={:>14}ns {:>10} {:<16} src={} dst={} bind={} pn={} off={} dump_id={} [{}]",
+                    "seq={:>10} t={:>14}ns {:>10} {:<16} cred={} src={} dst={} bind={} pn={} off={} dump_id={} [{}]",
                     rec.seq,
                     rec.timestamp_nanos,
                     direction_str(rec.direction),
                     kind_str(rec.frame_type),
+                    cred_str(&rec.cred_id),
                     rec.source_queue_id,
                     rec.dest_queue_id,
                     rec.binding_id,

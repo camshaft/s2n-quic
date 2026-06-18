@@ -161,6 +161,7 @@ pub(crate) fn process_ack<Clk, Rand>(
                         crate::endpoint::frame_trace::Direction::AckCompleted,
                         &entry.header,
                         Some(num),
+                        context.credentials.id,
                     );
 
                     crate::endpoint::dbg::on_enabled(|| {
@@ -210,6 +211,7 @@ pub(crate) fn process_ack<Clk, Rand>(
                     crate::endpoint::frame_trace::Direction::AckCompleted,
                     &entry.header,
                     Some(PacketNumber::as_varint(probe_pn)),
+                    context.credentials.id,
                 );
 
                 crate::endpoint::dbg::on_enabled(|| {
@@ -596,6 +598,7 @@ fn detect_loss<Rand>(
                     crate::endpoint::frame_trace::Direction::AckCancelled,
                     &entry.header,
                     Some(num),
+                    context.credentials.id,
                 );
                 entry.status = TransmissionStatus::Failed(frame::FailureReason::Cancelled);
                 let _ = cancelled.send(entry);
@@ -628,6 +631,7 @@ fn detect_loss<Rand>(
                     crate::endpoint::frame_trace::Direction::AckCancelled,
                     &entry.header,
                     Some(num),
+                    context.credentials.id,
                 );
                 entry.status = TransmissionStatus::Failed(frame::FailureReason::TransmissionError);
                 let _ = completed.send(entry);
@@ -653,6 +657,7 @@ fn detect_loss<Rand>(
                 crate::endpoint::frame_trace::Direction::AckLost,
                 &entry.header,
                 Some(num),
+                context.credentials.id,
             );
             let _ = lost.send(entry);
             lost_count += 1;
