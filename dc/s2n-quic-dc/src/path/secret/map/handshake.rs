@@ -212,6 +212,11 @@ fn validate_peer_data_addrs(
         // we reached the peer over (see the function docs).
         let ip = match (peer_ip, ip) {
             (IpAddr::V6(_), IpAddr::V4(v4)) => IpAddr::V6(v4.to_ipv6_mapped()),
+            (IpAddr::V4(_), IpAddr::V6(v6)) => {
+                ::tracing::error!(%addr, %peer, "peer data addr family does not match handshake addr");
+                return Err(Error::TRANSPORT_PARAMETER_ERROR
+                    .with_reason("peer data addr family does not match handshake addr"));
+            }
             _ => ip,
         };
 
