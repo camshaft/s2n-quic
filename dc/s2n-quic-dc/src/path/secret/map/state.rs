@@ -113,7 +113,7 @@ where
     }
 
     pub fn with_advertised_data_addrs(mut self, addrs: &[std::net::SocketAddr]) -> Self {
-        let encoded = s2n_quic_core::dc::data_addresses::encode(addrs);
+        let encoded = super::data_addresses::encode(addrs);
         tracing::debug!(
             target: "dc_negotiation",
             count = addrs.len(),

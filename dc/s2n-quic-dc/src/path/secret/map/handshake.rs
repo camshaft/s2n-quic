@@ -33,7 +33,11 @@ struct HandshakingPathInner {
     application_data: Option<ApplicationData>,
     /// Remote peer's PeerInfo bytes from the DcPeerInfo transport parameter.
     peer_info: Option<bytes::Bytes>,
-    /// Remote peer's data-plane addresses from the DcDataAddresses transport parameter.
+    /// Raw bytes of the peer's `DcDataAddresses` transport parameter, decoded
+    /// and validated lazily in `validate_peer_data_addrs`.
+    peer_data_addrs_bytes: Option<bytes::Bytes>,
+    /// Decoded and validated peer data addresses, populated by
+    /// `validate_peer_data_addrs` and consumed by `on_peer_stateless_reset_tokens`.
     peer_data_addrs: Option<Vec<SocketAddr>>,
     map: Map,
 
@@ -48,7 +52,7 @@ impl HandshakingPath {
         };
 
         let peer_info = connection_info.peer_info.clone();
-        let peer_data_addrs = connection_info.peer_data_addrs.clone();
+        let peer_data_addrs_bytes = connection_info.peer_data_addrs.clone();
 
         HandshakingPath {
             inner: Arc::new(Mutex::new(HandshakingPathInner {
@@ -60,7 +64,8 @@ impl HandshakingPath {
                 entry: None,
                 application_data: None,
                 peer_info,
-                peer_data_addrs,
+                peer_data_addrs_bytes,
+                peer_data_addrs: None,
                 map,
                 error: None,
             })),
@@ -212,7 +217,7 @@ fn validate_peer_data_addrs(
         // we reached the peer over (see the function docs).
         let ip = match (peer_ip, ip) {
             (IpAddr::V6(_), IpAddr::V4(v4)) => IpAddr::V6(v4.to_ipv6_mapped()),
-            (IpAddr::V4(_), IpAddr::V6(v6)) => {
+            (IpAddr::V4(_), IpAddr::V6(_)) => {
                 ::tracing::error!(%addr, %peer, "peer data addr family does not match handshake addr");
                 return Err(Error::TRANSPORT_PARAMETER_ERROR
                     .with_reason("peer data addr family does not match handshake addr"));
@@ -229,12 +234,29 @@ fn validate_peer_data_addrs(
 }
 
 impl HandshakingPathInner {
-    /// Validate and normalize the peer's advertised data addresses (see
-    /// [`validate_peer_data_addrs`]) in place.
+    /// Decode and validate the peer's advertised data addresses from the raw
+    /// `DcDataAddresses` transport parameter bytes (see [`validate_peer_data_addrs`]).
     fn validate_peer_data_addrs(&mut self) -> Result<(), s2n_quic_core::transport::Error> {
-        if let Some(addrs) = self.peer_data_addrs.as_mut() {
-            validate_peer_data_addrs(self.peer, addrs)?;
-        }
+        let Some(bytes) = self.peer_data_addrs_bytes.take() else {
+            return Ok(());
+        };
+
+        // Decode the raw transport parameter bytes; a malformed encoding is treated
+        // the same as an absent parameter (the peer simply advertised nothing).
+        let mut addrs = match super::data_addresses::decode(&bytes) {
+            Ok(addrs) => addrs,
+            Err(err) => {
+                ::tracing::debug!(
+                    peer = %self.peer,
+                    error = %err,
+                    "ignoring malformed DcDataAddresses transport parameter"
+                );
+                return Ok(());
+            }
+        };
+
+        validate_peer_data_addrs(self.peer, &mut addrs)?;
+        self.peer_data_addrs = Some(addrs);
         Ok(())
     }
 
