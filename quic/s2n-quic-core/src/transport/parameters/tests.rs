@@ -85,6 +85,7 @@ fn server_transport_parameters() -> ServerTransportParameters {
             versions: [3, 0, 0, 0],
         },
         dc_peer_info: DcPeerInfo::from_slice(b"server-peer-info"),
+        dc_data_addresses: DcDataAddresses::from_slice(b"\x01\x01\x01\x00\x12\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01\x1f\x90"),
         mtu_probing_complete_support: MtuProbingCompleteSupport::Enabled,
     }
 }
@@ -128,6 +129,7 @@ fn client_transport_parameters() -> ClientTransportParameters {
             versions: [1, 2, 3, 4],
         },
         dc_peer_info: DcPeerInfo::from_slice(b"client-peer-info"),
+        dc_data_addresses: DcDataAddresses::from_slice(b"\x01\x01\x01\x00\x12\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01\x1f\x90"),
         mtu_probing_complete_support: MtuProbingCompleteSupport::Enabled,
     }
 }

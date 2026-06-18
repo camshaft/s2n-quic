@@ -239,6 +239,11 @@ impl<Config: endpoint::Config> endpoint::Endpoint<Config> {
                 s2n_quic_core::transport::parameters::DcPeerInfo::new(peer_info);
         }
 
+        if let Some(data_addrs) = endpoint_context.dc.local_data_addrs() {
+            transport_parameters.dc_data_addresses =
+                s2n_quic_core::transport::parameters::DcDataAddresses::new(data_addrs);
+        }
+
         let local_address = header.path.local_address();
         let connection_info = tls::ConnectionInfo::new(local_address, remote_address);
 

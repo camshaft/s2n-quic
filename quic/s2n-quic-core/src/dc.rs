@@ -62,6 +62,10 @@ pub struct ConnectionInfo<'a> {
     /// support).
     #[cfg(feature = "alloc")]
     pub peer_info: Option<bytes::Bytes>,
+    /// Peer's data-plane addresses received via the `DcDataAddresses`
+    /// transport parameter. Available immediately at handshake completion.
+    #[cfg(feature = "alloc")]
+    pub peer_data_addrs: Option<alloc::vec::Vec<core::net::SocketAddr>>,
 }
 impl<'a> ConnectionInfo<'a> {
     #[cfg(feature = "alloc")]
@@ -73,6 +77,7 @@ impl<'a> ConnectionInfo<'a> {
         application_params: ApplicationParams,
         endpoint_type: EndpointType,
         peer_info: Option<bytes::Bytes>,
+        peer_data_addrs: Option<alloc::vec::Vec<core::net::SocketAddr>>,
     ) -> Self {
         Self {
             remote_address: remote_address.into_event(),
@@ -80,6 +85,7 @@ impl<'a> ConnectionInfo<'a> {
             application_params,
             endpoint_type,
             peer_info,
+            peer_data_addrs,
         }
     }
 
@@ -224,6 +230,86 @@ impl EncoderValue for ApplicationParams {
         }
 
         buffer.encode(&self.max_queues);
+    }
+}
+
+#[cfg(feature = "alloc")]
+pub mod data_addresses {
+    use alloc::vec::Vec;
+    use core::net::{Ipv6Addr, SocketAddr, SocketAddrV6};
+    use s2n_codec::DecoderError;
+
+    pub const VERSION: u8 = 0x01;
+    pub const ADDR_TYPE_SOCKET_V6: u8 = 0x01;
+
+    const SOCKET_V6_LEN: u16 = 18;
+
+    pub fn encode(addrs: &[SocketAddr]) -> bytes::Bytes {
+        let mut buf = Vec::with_capacity(2 + addrs.len() * (1 + 2 + SOCKET_V6_LEN as usize));
+        buf.push(VERSION);
+        buf.push(addrs.len() as u8);
+        for addr in addrs {
+            buf.push(ADDR_TYPE_SOCKET_V6);
+            buf.extend_from_slice(&SOCKET_V6_LEN.to_be_bytes());
+            let v6 = match addr {
+                SocketAddr::V6(v6) => *v6,
+                SocketAddr::V4(v4) => SocketAddrV6::new(v4.ip().to_ipv6_mapped(), v4.port(), 0, 0),
+            };
+            buf.extend_from_slice(&v6.ip().octets());
+            buf.extend_from_slice(&v6.port().to_be_bytes());
+        }
+        bytes::Bytes::from(buf)
+    }
+
+    pub fn decode(data: &[u8]) -> Result<Vec<SocketAddr>, DecoderError> {
+        if data.len() < 2 {
+            return Err(DecoderError::InvariantViolation(
+                "DcDataAddresses: buffer too short",
+            ));
+        }
+
+        let version = data[0];
+        if version != VERSION {
+            return Err(DecoderError::InvariantViolation(
+                "DcDataAddresses: unsupported version",
+            ));
+        }
+
+        let count = data[1] as usize;
+        let mut offset = 2;
+        let mut addrs = Vec::with_capacity(count);
+
+        for _ in 0..count {
+            if offset + 3 > data.len() {
+                return Err(DecoderError::InvariantViolation(
+                    "DcDataAddresses: truncated entry header",
+                ));
+            }
+
+            let addr_type = data[offset];
+            let value_len = u16::from_be_bytes([data[offset + 1], data[offset + 2]]) as usize;
+            offset += 3;
+
+            if offset + value_len > data.len() {
+                return Err(DecoderError::InvariantViolation(
+                    "DcDataAddresses: truncated entry value",
+                ));
+            }
+
+            if addr_type == ADDR_TYPE_SOCKET_V6 && value_len == SOCKET_V6_LEN as usize {
+                let ip = Ipv6Addr::from(<[u8; 16]>::try_from(&data[offset..offset + 16]).unwrap());
+                let port = u16::from_be_bytes([data[offset + 16], data[offset + 17]]);
+                let addr = match ip.to_ipv4_mapped() {
+                    Some(v4) => SocketAddr::new(v4.into(), port),
+                    None => SocketAddr::new(ip.into(), port),
+                };
+                addrs.push(addr);
+            }
+
+            offset += value_len;
+        }
+
+        Ok(addrs)
     }
 }
 

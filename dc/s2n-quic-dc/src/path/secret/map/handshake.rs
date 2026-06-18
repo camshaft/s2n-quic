@@ -33,6 +33,8 @@ struct HandshakingPathInner {
     application_data: Option<ApplicationData>,
     /// Remote peer's PeerInfo bytes from the DcPeerInfo transport parameter.
     peer_info: Option<bytes::Bytes>,
+    /// Remote peer's data-plane addresses from the DcDataAddresses transport parameter.
+    peer_data_addrs: Option<Vec<SocketAddr>>,
     map: Map,
 
     error: Option<Box<dyn Error + Send + Sync>>,
@@ -46,6 +48,7 @@ impl HandshakingPath {
         };
 
         let peer_info = connection_info.peer_info.clone();
+        let peer_data_addrs = connection_info.peer_data_addrs.clone();
 
         HandshakingPath {
             inner: Arc::new(Mutex::new(HandshakingPathInner {
@@ -57,6 +60,7 @@ impl HandshakingPath {
                 entry: None,
                 application_data: None,
                 peer_info,
+                peer_data_addrs,
                 map,
                 error: None,
             })),
@@ -104,6 +108,10 @@ impl dc::Endpoint for Map {
 
     fn advertised_peer_info(&self) -> Option<bytes::Bytes> {
         self.advertised_peer_info()
+    }
+
+    fn local_data_addrs(&self) -> Option<bytes::Bytes> {
+        self.advertised_data_addrs()
     }
 }
 
@@ -213,6 +221,9 @@ impl HandshakingPathInner {
             self.application_data.take(),
             socket_sender_count,
         );
+        if let Some(ref addrs) = self.peer_data_addrs {
+            entry.set_peer_data_addrs(addrs);
+        }
         let entry = Arc::new(entry);
         self.entry = Some(entry.clone());
         self.map.store.on_new_path_secrets(entry);

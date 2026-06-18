@@ -1336,6 +1336,128 @@ decoder_value!(
 #[cfg(feature = "alloc")]
 impl TransportParameterValidator for DcPeerInfo {}
 
+#[cfg(feature = "alloc")]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DcDataAddresses {
+    data: bytes::Bytes,
+}
+
+#[cfg(feature = "alloc")]
+impl DcDataAddresses {
+    pub fn new(data: bytes::Bytes) -> Self {
+        Self { data }
+    }
+
+    pub fn from_slice(bytes: &[u8]) -> Self {
+        Self {
+            data: bytes::Bytes::copy_from_slice(bytes),
+        }
+    }
+
+    pub fn data(&self) -> &[u8] {
+        &self.data
+    }
+
+    pub fn into_bytes(self) -> bytes::Bytes {
+        self.data
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.data.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.data.len()
+    }
+}
+
+#[cfg(feature = "alloc")]
+impl TransportParameter for DcDataAddresses {
+    type CodecValue = Self;
+
+    const ID: TransportParameterId = TransportParameterId::from_u32(0xdc0004);
+
+    fn from_codec_value(value: Self::CodecValue) -> Self {
+        value
+    }
+
+    fn try_into_codec_value(&self) -> Option<&Self::CodecValue> {
+        if self.is_empty() {
+            None
+        } else {
+            Some(self)
+        }
+    }
+
+    fn default_value() -> Self {
+        Self::default()
+    }
+}
+
+#[cfg(feature = "alloc")]
+impl EncoderValue for DcDataAddresses {
+    fn encode<E: Encoder>(&self, buffer: &mut E) {
+        buffer.write_slice(&self.data);
+    }
+
+    fn encoding_size(&self) -> usize {
+        self.data.len()
+    }
+}
+
+#[cfg(feature = "alloc")]
+decoder_value!(
+    impl<'a> DcDataAddresses {
+        fn decode(buffer: Buffer) -> Result<Self> {
+            let len = buffer.len();
+            let (slice, buffer) = buffer.decode_slice(len)?;
+            let data = bytes::Bytes::copy_from_slice(slice.into_less_safe_slice());
+            Ok((Self { data }, buffer))
+        }
+    }
+);
+
+#[cfg(feature = "alloc")]
+impl TransportParameterValidator for DcDataAddresses {}
+
+#[cfg(not(feature = "alloc"))]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DcDataAddresses;
+
+#[cfg(not(feature = "alloc"))]
+impl TransportParameter for DcDataAddresses {
+    type CodecValue = ();
+    const ID: TransportParameterId = TransportParameterId::from_u32(0xdc0004);
+    fn from_codec_value(_value: ()) -> Self {
+        Self
+    }
+    fn try_into_codec_value(&self) -> Option<&()> {
+        None
+    }
+    fn default_value() -> Self {
+        Self
+    }
+}
+
+#[cfg(not(feature = "alloc"))]
+impl EncoderValue for DcDataAddresses {
+    fn encode<E: Encoder>(&self, _buffer: &mut E) {}
+}
+
+#[cfg(not(feature = "alloc"))]
+decoder_value!(
+    impl<'a> DcDataAddresses {
+        fn decode(buffer: Buffer) -> Result<Self> {
+            let len = buffer.len();
+            let buffer = buffer.skip(len)?;
+            Ok((Self, buffer))
+        }
+    }
+);
+
+#[cfg(not(feature = "alloc"))]
+impl TransportParameterValidator for DcDataAddresses {}
+
 /// No-op DcPeerInfo when alloc is not available
 #[cfg(not(feature = "alloc"))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -1736,6 +1858,7 @@ impl_transport_parameters!(
         retry_source_connection_id: RetrySourceConnectionId,
         dc_supported_versions: DcSupportedVersions,
         dc_peer_info: DcPeerInfo,
+        dc_data_addresses: DcDataAddresses,
         mtu_probing_complete_support: MtuProbingCompleteSupport,
     }
 );

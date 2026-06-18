@@ -139,6 +139,11 @@ impl Map {
         self.store.advertised_peer_info()
     }
 
+    /// Get a clone of the pre-encoded `DcDataAddresses` TP payload.
+    pub fn advertised_data_addrs(&self) -> Option<bytes::Bytes> {
+        self.store.advertised_data_addrs()
+    }
+
     /// Gets the [`Peer`] entry for the given address
     ///
     /// NOTE: This function is used to track cache hit ratios so it

@@ -1240,6 +1240,11 @@ impl<Cfg: Config> Endpoint<Cfg> {
                 transport_parameters.dc_peer_info =
                     s2n_quic_core::transport::parameters::DcPeerInfo::new(peer_info);
             }
+
+            if let Some(data_addrs) = endpoint_context.dc.local_data_addrs() {
+                transport_parameters.dc_data_addresses =
+                    s2n_quic_core::transport::parameters::DcDataAddresses::new(data_addrs);
+            }
         }
 
         //= https://www.rfc-editor.org/rfc/rfc9000#section-7.2

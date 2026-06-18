@@ -79,5 +79,8 @@ TransportParameters {
     dc_peer_info: DcPeerInfo {
         data: b"",
     },
+    dc_data_addresses: DcDataAddresses {
+        data: b"",
+    },
     mtu_probing_complete_support: Disabled,
 }
