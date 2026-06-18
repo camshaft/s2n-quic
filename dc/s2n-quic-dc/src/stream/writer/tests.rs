@@ -277,6 +277,28 @@ struct Pusher {
     assembler: PayloadAssembler,
 }
 
+impl Drop for Pusher {
+    fn drop(&mut self) {
+        // The Writer (which holds the completion receiver) often outlives the frames it submits:
+        // a drop-time FIN or a buffered data frame can still be sitting in the submission channel
+        // when the test ends and never gets drained by `recv_frames`. Drain and mark them here so
+        // those frames don't trip the `Frame` drop invariant (a frame with a live completion
+        // receiver must not be destroyed while still `Pending`). This mirrors the real transport,
+        // whose submission receiver always outlives the streams feeding it.
+        let waker = core::task::Waker::noop();
+        let mut cx = core::task::Context::from_waker(waker);
+        while let core::task::Poll::Ready(Some(())) =
+            self.frame_rx.poll_swap(&mut cx, &mut self.frame_storage)
+        {
+            for (_priority, queue) in self.frame_storage.drain() {
+                for mut frame in queue {
+                    frame.status = frame::TransmissionStatus::Acknowledged;
+                }
+            }
+        }
+    }
+}
+
 impl Pusher {
     fn push_control(&mut self, message: msg::Control) {
         if self
@@ -309,6 +331,14 @@ impl Pusher {
         let mut combined_frames = intrusive::Queue::default();
         for (_priority, mut queue) in self.frame_storage.drain() {
             combined_frames.append(&mut queue);
+        }
+        // Captured frames stand in for "transmitted and acked": the harness pulls them off the
+        // submission channel to inspect, then drops them without running the completion pipeline.
+        // Mark them completed so the `Frame` drop invariant (a frame with a live completion
+        // receiver must not be dropped while still `Pending`) is satisfied. Tests that route the
+        // returned frames through `complete_all` overwrite this, so it is inert there.
+        for frame in combined_frames.iter_mut() {
+            frame.status = frame::TransmissionStatus::Acknowledged;
         }
         combined_frames
     }

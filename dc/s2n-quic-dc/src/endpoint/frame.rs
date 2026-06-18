@@ -1280,6 +1280,31 @@ impl Frame {
     }
 }
 
+impl Drop for Frame {
+    #[inline]
+    fn drop(&mut self) {
+        // A frame that carries a completion sender owes its producer (e.g. the Writer) a
+        // final disposition: it should reach `Acknowledged` or `Failed` before being dropped.
+        // A `Pending` drop while the producer is still listening means the completion was
+        // lost — the pipeline destroyed the frame without resolving it, which strands the
+        // producer (leaked inflight budget, lost wakeup). This is the drop-side complement of
+        // the `CompletionDispatcher::should_notify` assertion.
+        //
+        // Two cases are exempt because dropping `Pending` is correct there:
+        //   * Best-effort frames (`completion: None` — stripped ACK/Ping/control frames) never
+        //     carry a status.
+        //   * Frames whose completion receiver has already been dropped: the channel discards
+        //     completions silently once the receiver is gone (graceful shutdown / endpoint
+        //     teardown), so no producer is waiting to be notified.
+        debug_assert!(
+            self.completion.as_ref().is_none_or(|c| !c.receiver_alive())
+                || !matches!(self.status, TransmissionStatus::Pending),
+            "frame with a live completion receiver dropped while still Pending — \
+             completion notification was lost: {self:?}"
+        );
+    }
+}
+
 impl ByteCost for Frame {
     /// Returns the total wire cost of this frame: payload bytes plus the header metadata
     /// (type tag, routing fields, and optional payload-length varint).

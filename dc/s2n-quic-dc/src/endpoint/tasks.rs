@@ -1016,7 +1016,7 @@ where
             queue::freed::RetryEntry,
         };
 
-        let frame = entry.into_inner();
+        let mut frame = entry.into_inner();
 
         // Release any credit pool budget the frame is still holding. The admit path zeros
         // `flow_credits` before inserting into the inflight map, so a non-zero value here
@@ -1045,7 +1045,7 @@ where
                 let retry = RetryEntry {
                     free_request_id,
                     smallest_queue_id,
-                    payload: frame.payload,
+                    payload: core::mem::take(&mut frame.payload),
                 };
                 state
                     .freed

@@ -113,6 +113,16 @@ impl<T> Sender<T> {
         self.shared.flags.load(Ordering::Acquire) & SHOULD_TRANSMIT != 0
     }
 
+    /// Returns true if the receiver is still alive and expects completion notifications.
+    ///
+    /// When false, the receiver has been dropped (graceful shutdown) and any completion
+    /// sent on this channel is silently discarded — so a frame can be destroyed without a
+    /// disposition. When true, a producer is still waiting and a lost completion strands it.
+    #[inline]
+    pub fn receiver_alive(&self) -> bool {
+        self.shared.flags.load(Ordering::Acquire) & RECEIVER_ALIVE != 0
+    }
+
     /// Returns a pointer address for this sender (for equality comparisons).
     ///
     /// This can be used to group datagrams by their completion channel.

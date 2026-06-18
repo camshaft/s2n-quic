@@ -1793,7 +1793,16 @@ impl Inner {
     fn send_frame(&mut self, frame: Frame) -> io::Result<()> {
         self.frame_tx
             .send_batch(intrusive::Entry::new(frame))
-            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "frame channel closed"))
+            .map_err(|mut returned| {
+                // The submission channel is closed (the transport receiver is gone), so this
+                // frame will never reach the wire — it has definitively failed to transmit.
+                // Mark it `Failed` before it drops so the `Frame` drop invariant holds (a
+                // completion-bearing frame must not die `Pending`) and the disposition is
+                // accurate. The caller is notified through the `BrokenPipe` error regardless.
+                returned.status =
+                    frame::TransmissionStatus::Failed(frame::FailureReason::TransmissionError);
+                io::Error::new(io::ErrorKind::BrokenPipe, "frame channel closed")
+            })
     }
 }
 

@@ -291,7 +291,36 @@ struct Pusher {
     recv_credit_pool: Option<crate::sync::Arc<crate::credit::Pool>>,
 }
 
+impl Drop for Pusher {
+    fn drop(&mut self) {
+        // The Reader (which holds the completion receiver) often outlives the frames it submits:
+        // a buffered window update / blocked signal can still be sitting in the submission channel
+        // when the test ends and never gets drained by `recv_frames`. Drain and mark them here so
+        // those frames don't trip the `Frame` drop invariant (a frame with a live completion
+        // receiver must not be destroyed while still `Pending`). This mirrors the real transport,
+        // whose submission receiver always outlives the streams feeding it.
+        let waker = core::task::Waker::noop();
+        let mut cx = core::task::Context::from_waker(waker);
+        while let core::task::Poll::Ready(Some(())) =
+            self.frame_rx.poll_swap(&mut cx, &mut self.frame_storage)
+        {
+            for (_priority, queue) in self.frame_storage.drain() {
+                for mut frame in queue {
+                    frame.status = frame::TransmissionStatus::Acknowledged;
+                }
+            }
+        }
+    }
+}
+
 impl Pusher {
+    /// Drops the reader's frame receiver (so the reader's `frame_tx` sees a closed channel and
+    /// returns `BrokenPipe`) by swapping in a fresh disconnected receiver. Replaces the older
+    /// destructure-and-rebuild pattern, which a `Drop` impl forbids.
+    fn close_frame_channel(&mut self) {
+        self.frame_rx = frame::submission_channel(1).1;
+    }
+
     fn push(&mut self, message: msg::Stream) {
         let (_waker, release_bytes) = self
             .dispatcher
@@ -376,6 +405,14 @@ impl Pusher {
         let mut result = intrusive::Queue::default();
         for (_priority, mut queue) in self.frame_storage.drain() {
             result.append(&mut queue);
+        }
+        // Captured frames stand in for "transmitted and acked": the harness pulls them off the
+        // submission channel to inspect, then drops them without running the completion pipeline.
+        // Mark them completed so the `Frame` drop invariant (a frame with a live completion
+        // receiver must not be dropped while still `Pending`) is satisfied. Tests that route the
+        // returned frames through `complete_with_status` overwrite this, so it is inert there.
+        for frame in result.iter_mut() {
+            frame.status = frame::TransmissionStatus::Acknowledged;
         }
         result
     }
@@ -1166,29 +1203,15 @@ fn max_data_send_failure_does_not_release_unbacked_window() {
 
         // Server reader: remote_max_data = 0, unbacked_remaining = window_size.
         let window_size = 1024 * 1024u64;
-        let (mut reader, pusher) = make_server_pair_with_pool_and_initial_window(pool, window_size);
+        let (mut reader, mut pusher) =
+            make_server_pair_with_pool_and_initial_window(pool, window_size);
         assert_eq!(reader.0.window_size, window_size);
         assert_eq!(reader.0.remote_max_data.as_u64(), 0);
 
         // Replace the frame receiver with a fresh disconnected one so the reader's `frame_tx`
         // returns BrokenPipe when it tries to send the confirming MAX_DATA — modeling endpoint /
         // submission-task teardown while the stream future is still polled.
-        let Pusher {
-            dispatcher,
-            queue_id,
-            binding_id,
-            frame_rx: _closed,
-            frame_storage,
-            recv_credit_pool,
-        } = pusher;
-        let mut pusher = Pusher {
-            dispatcher,
-            queue_id,
-            binding_id,
-            frame_rx: frame::submission_channel(1).1,
-            frame_storage,
-            recv_credit_pool,
-        };
+        pusher.close_frame_channel();
 
         async move {
             // Small amount of data, well within the unbacked initial window: the reader's first
@@ -1977,29 +2000,12 @@ fn read_to_end_full_buffer_returns_buffer_full() {
 #[test]
 fn broken_frame_channel_is_handled_gracefully() {
     sim(|| {
-        let (mut reader, pusher) = make_pair();
+        let (mut reader, mut pusher) = make_pair();
         let window_size = reader.0.window_size;
 
-        // Destructure pusher to drop the original frame_rx (breaks reader's
-        // frame_tx).  A fresh disconnected receiver takes its place so the
-        // Pusher struct remains valid for pushing stream messages.
-        let Pusher {
-            dispatcher,
-            queue_id,
-            binding_id,
-            frame_rx: _closed,
-            frame_storage,
-            recv_credit_pool,
-        } = pusher;
-        let mut pusher = Pusher {
-            dispatcher,
-            queue_id,
-            binding_id,
-            // Dummy disconnected receiver — not used for assertions in this test.
-            frame_rx: frame::submission_channel(1).1,
-            frame_storage,
-            recv_credit_pool,
-        };
+        // Drop the original frame_rx (breaks the reader's frame_tx) by swapping in a fresh
+        // disconnected receiver, so the reader sees a closed channel on its next send.
+        pusher.close_frame_channel();
 
         // Endpoint task: push enough data to trigger a MAX_DATA send without
         // exceeding the advertised receive window. The hint signals ongoing writer demand so the
