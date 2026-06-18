@@ -3,6 +3,10 @@
 
 //! Offline parser for frame-trace dump files written by `endpoint::frame_trace`.
 //!
+//! This prints the dump as text (newest-first) for quick inspection. For analysis with external
+//! tooling (DuckDB, pandas, …), prefer `cargo run -p xtask -- frame-trace <PATH>`, which emits the
+//! same records as a queryable Parquet file.
+//!
 //! Usage: `cargo run --example frame_trace_dump -- <PATH>`
 //!
 //! `PATH` is a numbered dump file (`…​.000.bin`, `…​.001.bin`, …) written by the recorder — the
