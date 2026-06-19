@@ -49,7 +49,7 @@ use crate::{
     credit::Pool,
     fs::{
         op::{CompletionReceiver, IoBuf, IoKind, IoOp, IoStatus},
-        scheduler::{alloc::SubmitterAlloc, BlockRef, SubmitHandle},
+        scheduler::{alloc::SubmitterAlloc, BlockRef},
     },
     sched::TierPriority,
     sync::Arc,
@@ -95,6 +95,32 @@ impl From<ByteVec> for Block {
     }
 }
 
+/// Stream an ordered object whose blocks scatter across devices, delivering blocks in FIFO order via
+/// **buffered** reads. Each block carries its own `Arc<Device>`, so the stream submits against each
+/// block's device directly — no registry handle needed.
+///
+/// The source yields anything that converts into a [`Block`]: a [`BlockRef`] (read it from a device)
+/// or a [`Block::Resident`] (already-in-memory bytes spliced into the stream in order, bypassing the
+/// filesystem). Membrain interleaves both.
+pub fn materialize<I>(blocks: I, priority: TierPriority) -> MaterializeStream<I::IntoIter>
+where
+    I: IntoIterator,
+    I::Item: Into<Block>,
+{
+    MaterializeStream::new(blocks.into_iter(), priority, false)
+}
+
+/// Like [`materialize`] but issues **zero-copy `O_DIRECT`** reads into page-aligned buffers — the mode
+/// Membrain uses. Each *read* block's `offset` and `len` must be block-aligned (a misaligned block
+/// surfaces as an `InvalidInput` error in delivery order); resident blocks are unaffected by alignment.
+pub fn materialize_direct<I>(blocks: I, priority: TierPriority) -> MaterializeStream<I::IntoIter>
+where
+    I: IntoIterator,
+    I::Item: Into<Block>,
+{
+    MaterializeStream::new(blocks.into_iter(), priority, true)
+}
+
 /// A block pulled from the source but not yet enqueued: it is waiting for its device's acquire slot.
 /// Carries the resolved pool + cost (validated at pull time) so the reactor enqueues without
 /// re-validating.
@@ -137,7 +163,6 @@ impl DeviceSlot {
 /// Poll it with [`MaterializeStream::next`]; each call resolves to the next block's bytes in FIFO
 /// order (the `n`-th call yields the `n`-th block of `blocks`), or `None` at end of stream.
 pub struct MaterializeStream<I> {
-    handle: SubmitHandle,
     blocks: I,
     priority: TierPriority,
     /// Whether to issue zero-copy `O_DIRECT` reads (page-aligned [`AlignedBuf`]) instead of buffered
@@ -168,14 +193,11 @@ where
     I: Iterator,
     I::Item: Into<Block>,
 {
-    pub(crate) fn new(
-        handle: SubmitHandle,
-        blocks: I,
-        priority: TierPriority,
-        direct: bool,
-    ) -> Self {
+    /// Build a materialize stream over `blocks`. Each block carries its own `Arc<Device>`, so the
+    /// stream needs no registry handle — it submits against `block.device` directly. `direct` selects
+    /// zero-copy `O_DIRECT` reads (the Membrain mode) vs. buffered reads.
+    pub fn new(blocks: I, priority: TierPriority, direct: bool) -> Self {
         Self {
-            handle,
             blocks,
             priority,
             direct,
@@ -288,13 +310,10 @@ where
             // A direct read requires `offset` and `len` to be block-aligned; `prepare` rejects a
             // misaligned op (it does not round anything up — the caller sizes the block). Buffered
             // reads have no alignment constraint.
-            match self.handle.prepare(
-                &block.device,
-                IoKind::Read,
-                block.offset,
-                block.len,
-                self.direct,
-            ) {
+            match block
+                .device
+                .prepare(IoKind::Read, block.offset, block.len, self.direct)
+            {
                 Ok((pool, cost)) => {
                     // Find (or create) this device's acquire slot by `Arc` identity and queue the
                     // block on it.
@@ -354,9 +373,8 @@ where
                         // and sets the length to bytes read (no zero-fill, short read leaves no tail).
                         IoBuf::Read(bytes::BytesMut::with_capacity(block.len as usize))
                     };
-                    let r = self.handle.enqueue(
+                    let r = block.device.enqueue(
                         IoKind::Read,
-                        &block.device,
                         block.fd.clone(),
                         block.offset,
                         block.len,

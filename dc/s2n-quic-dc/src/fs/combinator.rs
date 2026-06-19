@@ -86,3 +86,24 @@ pub fn complete(mut op: Entry<IoOp>) {
     }
     let _wake = sender.send_entry(op);
 }
+
+/// Discard an op a backend chose **not** to execute because its submitter already dropped its
+/// completion receiver ([`IoOp::is_cancelled`](crate::fs::op::IoOp::is_cancelled)) — the result would
+/// have nowhere to go, so issuing the syscall/SQE would be wasted device work.
+///
+/// Unlike [`complete`], this records **no** success/failure disposition or sojourn sample (the op
+/// never ran), only the per-device `cancelled` skip counter. It still releases the op's borrowed
+/// credit back to its device pool — the same release-exactly-once invariant `complete` upholds — so
+/// conservation holds whether an op completes or is skipped. The op is then dropped; there is no
+/// receiver to notify.
+///
+/// Call this only after [`IoOp::is_cancelled`] returned true: a backend checks that before building
+/// the op's SQE / running its syscall and routes here instead of executing.
+pub fn complete_cancelled(mut op: Entry<IoOp>) {
+    op.device.counters.cancelled.add(1);
+    // Release the borrowed credit back to the device pool exactly once (same invariant as `complete`).
+    op.release_credits();
+    // The receiver is gone (that is why we are here); drop the op without sending. Take the sender out
+    // so no stray wake fires.
+    drop(op.completion.take());
+}

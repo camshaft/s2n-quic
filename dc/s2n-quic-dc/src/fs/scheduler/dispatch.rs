@@ -1,8 +1,12 @@
 // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! The submission dispatch task: route admitted ops from the `Send` submission channel to a backend
-//! execution lane.
+//! A device's submission dispatch task: route admitted ops from **that device's** `Send` submission
+//! channel to one of **that device's** execution lanes.
+//!
+//! There is one dispatch task per device (built by the registrar on the worker, alongside the
+//! device's lanes and distributor) — devices do not share a router, so the pick-two below balances
+//! load only across the lanes belonging to a single device.
 //!
 //! This is the storage analog of the endpoint's `frame_dispatch` → `PickTwo` stage, and it routes
 //! the **same way**: a per-lane earliest-departure-time ([`edt::Local`]) load score plus stochastic
@@ -15,8 +19,8 @@
 //! credit pool gated admission); EDT here balances lane occupancy, exactly as `PickTwo` balances send
 //! sockets after the send pool admitted a frame.
 //!
-//! The task owns the `!Send` lane senders (so the handle never has to) and drains the cross-thread
-//! submission channel via the standard `Map` + `drain_budgeted` combinator — no hand-rolled poll
+//! The task owns the device's `!Send` lane senders (so the `Arc<Device>` never has to) and drains the
+//! cross-thread submission channel via the standard `Map` + `drain_budgeted` combinator — no hand-rolled poll
 //! loop. On a closed lane (a backend that exited on a fatal error) the op is stamped `Failed` and
 //! **completed in place** via [`combinator::complete`](crate::fs::combinator::complete) so its
 //! submitter's await resolves with an error and its credit is released exactly once, rather than

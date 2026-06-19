@@ -43,11 +43,18 @@ impl CostModel {
 }
 
 /// Per-op-kind cost multiplier (fixed-point, in 1/256ths so `256` == weight 1.0). A write debits
-/// `cost * write / 256` credits; a read debits `cost * read / 256`. Defaults to 1.0 for both.
+/// `cost * write / 256` credits; a read debits `cost * read / 256`.
 ///
+/// The **default weights a write at 2.0× a read** (`read 1.0`, `write 2.0`): our testing shows a
+/// write costs roughly twice a read of equal size on the SSD/NVMe-backed devices this scheduler
+/// targets (NAND program-vs-read asymmetry plus the read-tail-latency externality a write imposes).
 /// There is no universal write multiplier — large sequential writes approach write-amplification 1
-/// (weight ~1), small random writes on a full drive are far costlier — so this is operator-tunable
-/// and should default near the device's published read:write ratio.
+/// (weight ~1), small random writes on a full drive are far costlier — so this stays operator-tunable
+/// via [`OpWeights::new`], with `2.0` as the calibrated starting point.
+///
+/// The weight only bites in [`PoolMode::Shared`], where reads and writes contend for one budget. In
+/// [`PoolMode::Split`] each pool already has its own capacity, so the read:write ratio is expressed
+/// by the two capacities and the weight is typically left at default.
 #[derive(Clone, Copy, Debug)]
 pub struct OpWeights {
     read_256ths: u32,
@@ -57,9 +64,10 @@ pub struct OpWeights {
 impl Default for OpWeights {
     #[inline]
     fn default() -> Self {
+        // Read 1.0×, write 2.0× — writes are ~2× as expensive as reads on our target devices.
         Self {
             read_256ths: 256,
-            write_256ths: 256,
+            write_256ths: 512,
         }
     }
 }
@@ -99,7 +107,19 @@ pub enum PoolMode {
     },
 }
 
+/// The default number of execution lanes a device gets when [`DeviceConfig`] does not override it.
+/// One lane is the simplest shape (a single ring / one blocking thread); raise it for a device that
+/// benefits from spreading work across several rings/threads.
+pub const DEFAULT_LANE_COUNT: usize = 1;
+
 /// Per-device configuration.
+///
+/// Each device now **owns its own execution**: its credit pool(s), cost model, pacer rate, and its
+/// own set of execution lanes. `lane_count` is therefore a per-device knob — the maximum number of
+/// rings / blocking-pool threads this device's ops fan out across — decoupled from any other device.
+/// The device's *queue depth* (max ops concurrently in flight) is governed separately by the credit
+/// pool capacity ([`pool_mode`](Self::pool_mode)); `lane_count` is how that in-flight work is spread
+/// across execution resources.
 #[derive(Clone, Debug)]
 pub struct DeviceConfig {
     /// The credit budget(s) for this device.
@@ -111,6 +131,9 @@ pub struct DeviceConfig {
     /// Read-vs-write cost weighting (applies within a shared pool; in split mode each pool already
     /// has its own capacity so the weight is typically left at default).
     pub op_weights: OpWeights,
+    /// Number of execution lanes (rings / blocking-pool threads) this device's ops fan out across.
+    /// Per-device and independent of the credit-pool queue depth. Defaults to [`DEFAULT_LANE_COUNT`].
+    pub lane_count: usize,
 }
 
 impl DeviceConfig {
@@ -121,6 +144,7 @@ impl DeviceConfig {
             rate,
             cost_model: CostModel::Bytes,
             op_weights: OpWeights::default(),
+            lane_count: DEFAULT_LANE_COUNT,
         }
     }
 
@@ -132,21 +156,13 @@ impl DeviceConfig {
             rate,
             cost_model: CostModel::Iops { io_unit },
             op_weights: OpWeights::default(),
+            lane_count: DEFAULT_LANE_COUNT,
         }
     }
-}
 
-/// Top-level scheduler configuration.
-///
-/// Devices are **not** listed here: the application registers each device after construction with
-/// [`Scheduler::register_device`](crate::fs::scheduler::Scheduler::register_device) and holds the
-/// returned `Arc<Device>` (the setup site often does not know its devices yet). Likewise the
-/// execution backend is not named here: like the network stack (where the socket implementation is a
-/// concrete type handed to the endpoint, not an enum), the backend is chosen by passing a concrete
-/// [`Backend`](crate::fs::backend::Backend) impl to
-/// [`Scheduler::new`](crate::fs::scheduler::Scheduler::new). So `Config` carries only the lane count.
-#[derive(Clone, Debug)]
-pub struct Config {
-    /// Number of execution lanes (worker rings / shared-pool slots). Decoupled from device count.
-    pub ring_count: usize,
+    /// Override the per-device lane count (builder style).
+    pub fn with_lane_count(mut self, lane_count: usize) -> Self {
+        self.lane_count = lane_count.max(1);
+        self
+    }
 }

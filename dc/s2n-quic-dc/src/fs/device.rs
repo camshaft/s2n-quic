@@ -1,70 +1,46 @@
 // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Devices and execution lanes — the resource and the executor.
+//! The device — the limited resource **and** its own scheduler.
 //!
-//! A **device** is the limited resource (a disk / EBS volume / NVMe namespace): it owns the credit
-//! pool(s) and the cost model that govern how much work may be in flight against it, mirroring how
-//! the network endpoint's *sender* owns a send-credit pool. A device is referred to by
-//! `Arc<Device>` — the application registers one with the scheduler, gets the `Arc` back, holds it,
-//! and passes it to reads/writes; the op carries the same `Arc` so it can finish itself. There is no
-//! device table, numeric id, or lookup: the `Arc` *is* the device handle (the storage analog of
-//! `endpoint::frame::Frame` carrying `Arc<PathSecretEntry>`). One scheduler serves every device, so
-//! adding a device adds data structures, not threads.
+//! A **device** is the limited resource (a disk / EBS volume / NVMe namespace). It owns the credit
+//! pool(s) and the cost model that govern how much work may be in flight against it, *and* it owns
+//! its own execution: a submission channel, a dispatch task routing admitted ops to that device's
+//! execution lanes, and a credit distributor. There is no global scheduler arbitrating across
+//! devices — each device schedules itself, so adding a device adds an independent, self-contained
+//! unit, and there is no cross-device footgun (an op physically cannot be submitted to the wrong
+//! device's pool, because the submit method *is* the device's).
 //!
-//! An **execution lane** ([`LocalRingId`]) is the analog of a send socket: a worker's io_uring ring
-//! or a slot in the shared blocking pool. Lanes are decoupled from devices — ops for many devices
-//! flow through one lane — which is what keeps the blocking-thread count tied to worker count, not
-//! device count.
+//! A device is referred to by `Arc<Device>`: the application registers one with the
+//! [`DeviceRegistry`](crate::fs::scheduler::DeviceRegistry), gets the `Arc` back, holds it, and
+//! calls reads/writes **on it directly** (`device.read(..)`); the op carries the same `Arc` so it can
+//! finish itself. There is no device table, numeric id, or lookup: the `Arc` *is* the device handle
+//! (the storage analog of `endpoint::frame::Frame` carrying `Arc<PathSecretEntry>`).
+//!
+//! An **execution lane** ([`LocalRingId`]) is one of a device's worker rings / blocking-pool slots.
+//! A device fans its admitted ops across its [`lane_count`](crate::fs::config::DeviceConfig) lanes
+//! via its dispatch task's pick-two load balancer. Lane count is a per-device knob, independent of
+//! the device's queue depth (which the credit pool capacity governs).
 
 use crate::{
     fs::{
         config::{CostModel, DeviceConfig, OpWeights, PoolMode},
-        op::IoKind,
+        op::{CompletionReceiver, CompletionSender, Fd, IoBuf, IoKind, IoOp, IoStatus},
+        scheduler::alloc::SubmitterAlloc,
     },
-    sched::Pool,
+    intrusive::Entry,
+    sched::{Budget, Pool, TierPriority},
+    socket::channel::intrusive::sync as sync_chan,
     sync::Arc,
 };
+use core::{future::poll_fn, task::Context};
 
-/// A unique, per-[`Scheduler`](crate::fs::scheduler::Scheduler) origin stamp, used **only** to catch
-/// the footgun of passing a device registered with one scheduler to a different scheduler's handle
-/// (which would pace against the wrong pool and key the wrong materialize slot).
-///
-/// Now that a device is a free-floating `Arc<Device>` with no owning table, nothing structurally ties
-/// it to its scheduler — so each scheduler stamps its devices with its `SchedulerId`, and the submit
-/// chokepoint `debug_assert`s the op's device came from the same scheduler. The id is carried only in
-/// `#[cfg(debug_assertions)]` builds (a process-wide monotonic `u64`); in release it is a zero-sized
-/// type and every comparison compiles to nothing.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct SchedulerId {
-    #[cfg(debug_assertions)]
-    id: u64,
-}
-
-impl SchedulerId {
-    /// Mint the next process-unique scheduler id (debug builds only; a no-op ZST in release).
-    pub fn next() -> Self {
-        #[cfg(debug_assertions)]
-        {
-            use core::sync::atomic::{AtomicU64, Ordering};
-            static NEXT: AtomicU64 = AtomicU64::new(0);
-            Self {
-                id: NEXT.fetch_add(1, Ordering::Relaxed),
-            }
-        }
-        #[cfg(not(debug_assertions))]
-        {
-            Self {}
-        }
-    }
-}
-
-/// Identifies an execution lane (worker ring / blocking-pool slot).
+/// Identifies an execution lane (worker ring / blocking-pool slot) within one device.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct LocalRingId(pub u32);
 
 impl LocalRingId {
-    /// Sentinel for "not yet routed". `PickRing` overwrites it.
+    /// Sentinel for "not yet routed". The device's dispatch task overwrites it.
     pub const UNSET: LocalRingId = LocalRingId(u32::MAX);
 
     #[inline]
@@ -109,26 +85,26 @@ impl DevicePools {
     }
 }
 
-/// A device: its budget pool(s), cost model, and weights — carried by `Arc<Device>` on every
-/// [`IoOp`](crate::fs::op::IoOp) (the storage analog of `Arc<PathSecretEntry>`), so an op holds
-/// everything it needs to validate, pace, and finish itself with no table lookup. The pacer
-/// ([`crate::sched::Rate`]) is applied by the pipeline's load-balancing stage; the rate is stored
-/// here so the pipeline can read it.
+/// A device: its budget pool(s), cost model, weights, **and its own submission channel** — so a read
+/// or write is a method *on the device* and the op it builds carries the `Arc<Device>` straight
+/// through the device's own pipeline (the storage analog of `Arc<PathSecretEntry>`), finishing itself
+/// with no table lookup. The pacer ([`crate::sched::Rate`]) is applied by the device's dispatch
+/// load-balancing stage; the rate is stored here so the pipeline can read it.
+///
+/// The submit API lives here as methods taking `self: &Arc<Device>` ([`Device::read`],
+/// [`Device::write`], [`Device::submit`], …): a holder of the `Arc<Device>` submits against it
+/// directly, with no separate handle type and no global scheduler.
 pub struct Device {
     /// Application-supplied label (e.g. `"nvme0"`, `"ebs-data"`). Diagnostics only — gauge prefixes
     /// and logs. There is no application-visible numeric id and no lookup table; a device *is* its
-    /// `Arc<Device>`, which the application holds and passes to reads/writes, and which the op carries
+    /// `Arc<Device>`, which the application holds and submits against, and which the op carries
     /// through the pipeline.
     pub label: Arc<str>,
-    /// Dense, monotonic, **crate-internal** registration index, stamped by the scheduler. Not part of
+    /// Dense, monotonic, **crate-internal** registration index, stamped by the registry. Not part of
     /// the public API (the application deals in `Arc<Device>` + label) — it exists only so internal
     /// per-device indexers can do O(1) direct array indexing instead of a map lookup or pointer scan.
     /// Its sole consumer is [`MaterializeStream`](crate::fs::materialize)'s per-device acquire slots.
     pub(crate) index: usize,
-    /// Which scheduler registered this device. Used by the submit chokepoint to `debug_assert` the
-    /// device belongs to the handle's scheduler (a free-floating `Arc<Device>` is otherwise easy to
-    /// misroute). Zero-sized in release builds.
-    pub(crate) origin: SchedulerId,
     pub pools: DevicePools,
     pub cost_model: CostModel,
     pub op_weights: OpWeights,
@@ -137,6 +113,12 @@ pub struct Device {
     /// `Arc<Device>`, both the submit path and the in-place completion path bump these directly — no
     /// extra plumbing — giving per-device IOPS / bytes / failure visibility.
     pub counters: crate::fs::counters::DeviceCounters,
+    /// This device's **own** `Send` submission channel: every `submit`/`enqueue` pushes the built
+    /// `IoOp` here; the device's dispatch task (on a worker) drains it and routes to *this device's*
+    /// lanes. There is no shared cross-device submission path.
+    pub(crate) submission: sync_chan::Sender<IoOp>,
+    /// Clock used to stamp `enqueued_at` for sojourn metrics.
+    pub(crate) clock: crate::time::DefaultClock,
     /// Capacity of the read / write pool (in the cost-model currency), recorded so `prepare` can
     /// reject an op whose cost exceeds it (an `IoOp` is atomic — it has no partial-submit escape, so
     /// a `cost > capacity` acquire could never be satisfied and would park forever).
@@ -156,14 +138,16 @@ impl core::fmt::Debug for Device {
 
 impl Device {
     /// Build a device (and its not-yet-spawned credit pools) from config under `label`, with the
-    /// crate-internal registration `index` and `origin` scheduler stamp the scheduler assigned, and
-    /// its per-device nominal counters registered against `registry`.
-    pub fn new(
+    /// crate-internal registration `index` the registry assigned, its per-device nominal counters
+    /// registered against `registry`, and its own `submission` channel sender (whose receiver the
+    /// registry hands to the registrar to build this device's dispatch task + lanes).
+    pub(crate) fn new(
         label: Arc<str>,
         index: usize,
-        origin: SchedulerId,
         registry: &crate::counter::Registry,
         cfg: &DeviceConfig,
+        submission: sync_chan::Sender<IoOp>,
+        clock: crate::time::DefaultClock,
     ) -> Self {
         let counters = crate::fs::counters::DeviceCounters::register(registry, &label);
         let (pools, read_capacity, write_capacity) = match &cfg.pool_mode {
@@ -190,12 +174,13 @@ impl Device {
         Self {
             label,
             index,
-            origin,
             pools,
             cost_model: cfg.cost_model,
             op_weights: cfg.op_weights,
             rate: cfg.rate,
             counters,
+            submission,
+            clock,
             read_capacity,
             write_capacity,
         }
@@ -227,13 +212,26 @@ impl Device {
     }
 
     /// Validate a prospective op against this device and resolve the pool it draws from plus its
-    /// credit cost. The hot-path replacement for the old `SubmitHandle::prepare` + `DeviceTable`
-    /// index: the caller already holds the `Arc<Device>`, so there is no lookup here.
+    /// credit cost, bumping the rejection counter on failure. The hot-path admission check: the caller
+    /// already holds the `Arc<Device>`, so there is no lookup here.
     ///
     /// Rejects (with `InvalidInput`) an offset that would wrap a signed `off_t`, a misaligned direct
     /// op, or a cost exceeding the pool capacity (an atomic `IoOp` has no partial-submit escape, so
     /// an over-capacity op could never be admitted and would park forever).
     pub fn prepare(
+        &self,
+        kind: IoKind,
+        offset: u64,
+        len: u32,
+        is_direct: bool,
+    ) -> std::io::Result<(Arc<Pool>, u64)> {
+        self.prepare_inner(kind, offset, len, is_direct)
+            .inspect_err(|_| {
+                self.counters.rejected.add(1);
+            })
+    }
+
+    fn prepare_inner(
         &self,
         kind: IoKind,
         offset: u64,
@@ -271,6 +269,257 @@ impl Device {
             ));
         }
         Ok((self.pool_for(kind).clone(), cost))
+    }
+
+    // ── Submit API (moved off the old `SubmitHandle`; submit is now a method on the device) ────────
+
+    /// Submit a read of `len` bytes at `offset` on `fd`, resolving with the filled buffer.
+    ///
+    /// The scheduler allocates a `BytesMut` with capacity `len` and reads into its uninitialized
+    /// spare capacity (no zero-fill); the returned buffer's `len()` is the bytes actually read (a
+    /// short read at EOF returns fewer bytes, never a zero-padded tail). The returned future is
+    /// `'static` (captures an `Arc<Device>` clone).
+    pub fn read(
+        self: &Arc<Self>,
+        fd: Fd,
+        offset: u64,
+        len: u32,
+        priority: TierPriority,
+    ) -> impl core::future::Future<Output = std::io::Result<bytes::BytesMut>> + 'static {
+        let device = self.clone();
+        async move {
+            // Caller-owned, pre-sized, logically-empty buffer: the backend reads into spare capacity
+            // and `set_len`s to bytes read. No allocation or memset happens inside the backend.
+            let buf = bytes::BytesMut::with_capacity(len as usize);
+            let op = device
+                .submit(IoKind::Read, fd, offset, len, IoBuf::Read(buf), priority)
+                .await?;
+            match op.buf {
+                IoBuf::Read(buf) => Ok(buf),
+                _ => unreachable!("read op returned non-read buffer"),
+            }
+        }
+    }
+
+    /// Submit a write of `data` at `offset` on `fd`, resolving with the number of bytes written.
+    pub fn write(
+        self: &Arc<Self>,
+        fd: Fd,
+        offset: u64,
+        data: bytes::Bytes,
+        priority: TierPriority,
+    ) -> impl core::future::Future<Output = std::io::Result<usize>> + 'static {
+        let device = self.clone();
+        async move {
+            let len = data.len() as u32;
+            let op = device
+                .submit(IoKind::Write, fd, offset, len, IoBuf::Write(data), priority)
+                .await?;
+            match op.status {
+                IoStatus::Done(n) => Ok(n),
+                other => unreachable!("submit returned non-Done op: {other:?}"),
+            }
+        }
+    }
+
+    /// Submit a **zero-copy** `O_DIRECT` read at `offset` into the caller-owned, page-aligned `buf`,
+    /// reading up to `buf.len()` bytes. Resolves with `(buffer, n)` where `n` is the bytes actually
+    /// read — the buffer is filled in place and its logical length set to `n`. Both `offset` and
+    /// `buf.len()` must be block-aligned (validated; `InvalidInput` otherwise).
+    pub fn read_direct(
+        self: &Arc<Self>,
+        fd: Fd,
+        offset: u64,
+        buf: crate::fs::direct::AlignedBuf,
+        priority: TierPriority,
+    ) -> impl core::future::Future<Output = std::io::Result<(crate::fs::direct::AlignedBuf, usize)>>
+           + 'static {
+        let device = self.clone();
+        async move {
+            let len = buf.len() as u32;
+            let op = device
+                .submit(IoKind::Read, fd, offset, len, IoBuf::Direct(buf), priority)
+                .await?;
+            match (op.status, op.buf) {
+                (IoStatus::Done(n), IoBuf::Direct(buf)) => Ok((buf, n)),
+                other => unreachable!("direct read returned unexpected op: {other:?}"),
+            }
+        }
+    }
+
+    /// Submit a **zero-copy** `O_DIRECT` write at `offset` from the caller-owned, page-aligned `buf`,
+    /// writing `buf.len()` bytes in place. Resolves with the buffer returned and the byte count.
+    /// `offset` must be block-aligned (validated; `InvalidInput` otherwise).
+    pub fn write_direct(
+        self: &Arc<Self>,
+        fd: Fd,
+        offset: u64,
+        buf: crate::fs::direct::AlignedBuf,
+        priority: TierPriority,
+    ) -> impl core::future::Future<Output = std::io::Result<(crate::fs::direct::AlignedBuf, usize)>>
+           + 'static {
+        let device = self.clone();
+        async move {
+            let len = buf.len() as u32;
+            let op = device
+                .submit(IoKind::Write, fd, offset, len, IoBuf::Direct(buf), priority)
+                .await?;
+            match (op.status, op.buf) {
+                (IoStatus::Done(n), IoBuf::Direct(buf)) => Ok((buf, n)),
+                other => unreachable!("direct write returned unexpected op: {other:?}"),
+            }
+        }
+    }
+
+    /// The atomic submit primitive: acquire credit, hand the op to one of this device's lanes, await
+    /// completion.
+    ///
+    /// Returns only **successfully completed** ops — a `Failed` completion, an oversized op, a
+    /// misaligned direct op, or a closed lane all surface as `Err`, so callers never have to
+    /// re-inspect `op.status`. Acquires the op's credit from this device's pool **before** the op is
+    /// handed to the pipeline: a submitter that cannot get credit parks cooperatively on a waker
+    /// (never a thread), so admitted work can never exceed the pool capacity and the blocking-pool
+    /// hold-and-wait deadlock cannot form.
+    pub async fn submit(
+        self: &Arc<Self>,
+        kind: IoKind,
+        fd: Fd,
+        offset: u64,
+        len: u32,
+        buf: IoBuf,
+        priority: TierPriority,
+    ) -> std::io::Result<IoOp> {
+        let completion_rx: CompletionReceiver =
+            crate::socket::channel::intrusive::datagram_completion::new::<IoOp>();
+        // A one-shot submit allocates a fresh acquire context; long-lived submitters reuse one (see
+        // `submit_with`).
+        let mut alloc = SubmitterAlloc::new();
+        self.submit_with(
+            &mut alloc,
+            kind,
+            fd,
+            offset,
+            len,
+            buf,
+            priority,
+            completion_rx.sender(),
+            0,
+        )
+        .await?;
+        let op = await_completion(completion_rx).await?;
+        match op.status {
+            IoStatus::Done(_) => Ok(op),
+            IoStatus::Failed(kind) => Err(kind.into()),
+            IoStatus::Pending => unreachable!("dispatcher routed a still-pending op"),
+        }
+    }
+
+    /// Acquire credit (reusing the caller's `alloc`) and enqueue an op whose completion is delivered
+    /// to the caller-provided `completion` sender (tagged with `user_data`), then return — **without**
+    /// awaiting the completion. The building block for a submitter that funnels many ops onto one
+    /// shared completion channel and reuses one acquire context across them (e.g.
+    /// [`MaterializeStream`](crate::fs::materialize)), avoiding a per-op slot allocation.
+    ///
+    /// `Ok(())` means the op was admitted (credit acquired) and enqueued. An `Err` (misaligned/
+    /// oversized op, closed scheduler) means no completion will arrive and any acquired credit was
+    /// released.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn submit_with(
+        self: &Arc<Self>,
+        alloc: &mut SubmitterAlloc,
+        kind: IoKind,
+        fd: Fd,
+        offset: u64,
+        len: u32,
+        buf: IoBuf,
+        priority: TierPriority,
+        completion: CompletionSender,
+        user_data: u64,
+    ) -> std::io::Result<()> {
+        // Validate + resolve the device pool and cost directly on this device (no lookup).
+        let (pool, cost) = self.prepare(kind, offset, len, buf.is_direct())?;
+
+        // Acquire credit, parking cooperatively if the device is at capacity. This is the
+        // backpressure that prevents the blocking-pool deadlock.
+        alloc.acquire(&pool, cost, priority).await?;
+
+        // Move the granted credit (>= cost) onto the op so the alloc resets clean and the completion
+        // path releases it exactly once.
+        let granted = alloc.take_all();
+        debug_assert!(granted >= cost, "acquire returned less than cost");
+
+        self.enqueue(kind, fd, offset, len, buf, completion, user_data, granted)
+    }
+
+    /// Build an admitted op (credit already `granted`) carrying this `Arc<Device>` and push it into
+    /// the device's submission channel; the device's dispatch task routes it to one of its lanes. On a
+    /// closed channel (device torn down) the credit is released and an error returned, since no
+    /// completion can arrive. Shared by `submit_with` and the materialize reactor.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn enqueue(
+        self: &Arc<Self>,
+        kind: IoKind,
+        fd: Fd,
+        offset: u64,
+        len: u32,
+        buf: IoBuf,
+        completion: CompletionSender,
+        user_data: u64,
+        granted: u64,
+    ) -> std::io::Result<()> {
+        // Per-device admission counters (the caller holds the `Arc<Device>`, so no extra plumbing):
+        // bump this op-kind's submitted count and, for data ops, its submit-size histogram.
+        let opk = self.counters.op(kind);
+        opk.submitted.add(1);
+        if let Some(hist) = &opk.submit_bytes {
+            hist.record_value(len as u64);
+        }
+
+        let op = IoOp {
+            kind,
+            device: self.clone(),
+            fd,
+            offset,
+            len,
+            buf,
+            completion: Some(completion),
+            status: IoStatus::Pending,
+            flow_credits: granted,
+            // `LocalRingId::UNSET` until the dispatch task picks a lane (which overwrites it).
+            ring_id: LocalRingId::UNSET,
+            user_data,
+            enqueued_at: Some(self.clock.now()),
+        };
+
+        if let Err(mut undelivered) = self.submission.send_entry(Entry::new(op)) {
+            undelivered.release_credits();
+            undelivered.device.counters.rejected.add(1);
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "io scheduler: submission channel closed",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Await the single completion of a submitted op.
+async fn await_completion(mut rx: CompletionReceiver) -> std::io::Result<IoOp> {
+    let mut budget = Budget::new(1);
+    // Disambiguate: `datagram_completion::Receiver` is `Receiver` for both `Entry<T>` and `Queue<T>`;
+    // we want the single-entry form.
+    let entry: Option<Entry<IoOp>> = poll_fn(|cx: &mut Context<'_>| {
+        budget.reset();
+        crate::sched::Receiver::<Entry<IoOp>>::poll_recv(&mut rx, cx, &mut budget)
+    })
+    .await;
+
+    match entry {
+        Some(entry) => Ok(entry.into_inner()),
+        None => Err(std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "io scheduler completion channel closed before completion",
+        )),
     }
 }
 

@@ -25,10 +25,13 @@
 //! # Layers
 //!
 //! * **Stream** — a caller-defined opaque handle and fairness participant. Submits [`op::IoOp`]s.
-//! * **Device** ([`device::Device`]) — the limited resource; owns the credit pool(s) and cost
-//!   model. One scheduler serves all devices.
-//! * **Execution lane** ([`device::LocalRingId`]) — a worker ring / blocking-pool slot, decoupled
-//!   from device count.
+//! * **Device** ([`device::Device`]) — the limited resource **and its own scheduler**: it owns the
+//!   credit pool(s), cost model, submission channel, dispatch task, and execution lanes. A read/write
+//!   is a method on the `Arc<Device>`; there is no global scheduler arbitrating across devices.
+//! * **Device registry** ([`scheduler::DeviceRegistry`]) — the factory that owns the backend and
+//!   mints self-scheduling devices via [`register_device`](scheduler::DeviceRegistry::register_device).
+//! * **Execution lane** ([`device::LocalRingId`]) — one of a device's worker rings / blocking-pool
+//!   slots. Lane count is a per-device knob, independent of the device's queue depth.
 
 pub mod backend;
 pub mod combinator;
@@ -44,8 +47,8 @@ mod tests;
 
 pub mod counters;
 
-pub use config::{Config, CostModel, DeviceConfig, OpWeights, PoolMode};
+pub use config::{CostModel, DeviceConfig, OpWeights, PoolMode, DEFAULT_LANE_COUNT};
 pub use device::{Device, LocalRingId};
 pub use op::{IoBuf, IoKind, IoOp, IoStatus};
-pub use materialize::Block;
-pub use scheduler::{BlockRef, Scheduler, SubmitHandle};
+pub use materialize::{materialize, materialize_direct, Block, MaterializeStream};
+pub use scheduler::{BlockRef, DeviceRegistry};
