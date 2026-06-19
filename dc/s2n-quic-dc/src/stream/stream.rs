@@ -206,6 +206,26 @@ impl Stream {
     pub fn shutdown(&mut self) -> io::Result<()> {
         self.write.shutdown()
     }
+
+    /// Polls whether the peer still wants this stream's data.
+    ///
+    /// Delegates to the write half. See [`Writer::poll_peer_cancellation`] for the full
+    /// semantics, including the task-affinity contract.
+    #[inline]
+    pub fn poll_peer_cancellation(
+        &mut self,
+        cx: &mut core::task::Context,
+    ) -> core::task::Poll<io::Error> {
+        self.write.poll_peer_cancellation(cx)
+    }
+
+    /// Awaitable form of [`poll_peer_cancellation`](Self::poll_peer_cancellation).
+    ///
+    /// See [`Writer::peer_cancellation`].
+    #[inline]
+    pub async fn peer_cancellation(&mut self) -> io::Error {
+        self.write.peer_cancellation().await
+    }
 }
 
 #[cfg(feature = "tokio")]

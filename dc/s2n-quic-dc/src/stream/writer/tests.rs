@@ -807,6 +807,142 @@ fn control_reset_terminates_write() {
     });
 }
 
+/// The motivating case: a producer is busy gathering its next item (modeled here by a long sleep
+/// standing in for a disk read) and is NOT writing. The peer drops its reader, sending
+/// STOP_SENDING. `peer_cancellation` must resolve with the reset error even though no
+/// `write_from` is ever called — proving the producer can abandon its work the moment the peer
+/// goes away.
+#[test]
+fn peer_cancellation_resolves_on_stop_sending() {
+    sim(|| {
+        let (mut writer, mut pusher) = make_server_pair();
+
+        async move {
+            // Yield first so the producer registers its waker before the reset arrives — this
+            // exercises the wake path, not just an already-present reset.
+            bach::task::yield_now().await;
+            pusher.push_reset(error::STOP_SENDING);
+            // Keep the pusher alive so any in-flight frames drain on its Drop.
+            100.ms().sleep().await;
+        }
+        .primary()
+        .spawn();
+
+        async move {
+            tokio::select! {
+                biased;
+                err = writer.peer_cancellation() => {
+                    assert_eq!(err.kind(), io::ErrorKind::ConnectionReset);
+                }
+                _ = 10.s().sleep() => {
+                    panic!("gather should not finish; the peer cancelled first");
+                }
+            }
+            // The cancellation was observed without any write having occurred.
+            assert!(writer.0.status.is_shutdown());
+        }
+        .primary()
+        .spawn();
+    });
+}
+
+/// `peer_cancellation` stays `Pending` while the peer is alive, and a non-reset control message
+/// (MAX_DATA) must NOT be mistaken for a cancellation — it is consumed and the future remains
+/// `Pending`. Only the subsequent reset resolves it.
+#[test]
+fn peer_cancellation_pending_while_peer_alive() {
+    sim(|| {
+        async move {
+            let (mut writer, mut pusher) = make_server_pair();
+
+            // No signal yet: still alive.
+            let pending = core::future::poll_fn(|cx| {
+                Poll::Ready(writer.poll_peer_cancellation(cx).is_pending())
+            })
+            .await;
+            assert!(pending, "expected Pending while peer alive");
+
+            // MAX_DATA is normal flow-control traffic, not a cancellation.
+            pusher.push_max_data(VarInt::from_u16(4096));
+            let still_pending = core::future::poll_fn(|cx| {
+                Poll::Ready(writer.poll_peer_cancellation(cx).is_pending())
+            })
+            .await;
+            assert!(
+                still_pending,
+                "MAX_DATA must be consumed without being mistaken for cancellation"
+            );
+
+            // The reset resolves it.
+            pusher.push_reset(error::STOP_SENDING);
+            let err = writer.peer_cancellation().await;
+            assert_eq!(err.kind(), io::ErrorKind::ConnectionReset);
+        }
+        .primary()
+        .spawn();
+    });
+}
+
+/// After a local half-close (`shutdown`), there is nothing left for the peer to cancel, so
+/// `peer_cancellation` reports `BrokenPipe` immediately rather than a peer-originated reset.
+#[test]
+fn peer_cancellation_terminal_is_broken_pipe() {
+    sim(|| {
+        let (mut writer, mut pusher) = make_server_pair();
+
+        async move {
+            // Drain the FIN frame that `shutdown` emits so its completion invariant holds.
+            let frames = pusher.recv_frames().await;
+            assert_eq!(frames.len(), 1, "expected exactly one FIN frame");
+            assert!(matches!(
+                frames.front().unwrap().header,
+                Header::QueueData { is_fin: true, .. }
+            ));
+            100.ms().sleep().await;
+        }
+        .primary()
+        .spawn();
+
+        async move {
+            writer.shutdown().expect("shutdown");
+            let err = writer.peer_cancellation().await;
+            assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
+        }
+        .primary()
+        .spawn();
+    });
+}
+
+/// A connection-level failure (idle timeout) surfaces through the completion channel as
+/// `PeerDead`, which `peer_cancellation` must report as `TimedOut`.
+#[test]
+fn peer_cancellation_resolves_on_peer_dead() {
+    sim(|| {
+        let (mut writer, mut pusher) = make_server_pair();
+
+        async move {
+            let first = pusher.recv_frames().await;
+            pusher.complete_all(
+                first,
+                frame::TransmissionStatus::Failed(frame::FailureReason::PeerDead),
+            );
+            100.ms().sleep().await;
+        }
+        .primary()
+        .spawn();
+
+        async move {
+            let mut payload = Bytes::from_static(b"hello");
+            writer.write_from(&mut payload).await.expect("first write");
+
+            let err = writer.peer_cancellation().await;
+            assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        }
+        .primary()
+        .spawn();
+    });
+}
+
 #[test]
 fn client_second_write_blocks_until_max_data() {
     sim(|| {
