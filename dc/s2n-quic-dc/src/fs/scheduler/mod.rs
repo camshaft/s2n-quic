@@ -150,14 +150,11 @@ impl Scheduler {
         // 2. Build the backend's execution lanes. A lane completes each finished op in place (it
         //    holds the counters), so there is no completion sink to wire.
         let lane_count = config.ring_count.max(1);
-        let lanes = backend.spawn_lanes(
-            LaneSetup {
-                lane_count,
-                counters: counters.clone(),
-                registry: registry.clone(),
-            },
-            spawner,
-        );
+        let lanes = backend.spawn_lanes(LaneSetup {
+            lane_count,
+            counters: counters.clone(),
+            registry: registry.clone(),
+        });
 
         // 3. Spawn the submission dispatch task: it drains the Send submission channel and routes
         //    each admitted op to a backend lane. This task owns the !Send lane senders.

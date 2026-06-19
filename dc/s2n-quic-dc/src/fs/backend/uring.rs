@@ -50,20 +50,19 @@ use crate::{
             inflight::{InFlight, InFlightSlab},
             Backend, LaneSetup,
         },
-        combinator::{complete, DRAIN_BUDGET},
+        combinator::complete,
         counters::Counters,
         op::{IoBuf, IoKind, IoOp, IoStatus},
     },
     intrusive::Entry,
-    runtime::Spawner,
-    socket::channel::{intrusive::sync as sync_chan, Budget, Receiver as _, UnboundedSender},
+    socket::channel::{intrusive::sync as sync_chan, Budget, UnboundedSender},
     sync::Arc,
 };
 use io_uring::{opcode, types, IoUring};
 use std::{
     os::fd::RawFd,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicUsize, Ordering},
         Arc as StdArc,
     },
     task::{Context, Wake, Waker},
@@ -166,15 +165,48 @@ impl Drop for EventFd {
     }
 }
 
+/// `ALIVE` bit of [`EventFdWaker::state`]: set while the ring thread is running; cleared on teardown
+/// so a late wake skips the syscall.
+const WAKER_ALIVE: usize = 0b01;
+/// `NOTIFIED` bit of [`EventFdWaker::state`]: a wake has been signalled but the ring has not yet
+/// consumed it. Coalesces a burst — only the producer that sets this bit writes the eventfd.
+const WAKER_NOTIFIED: usize = 0b10;
+
 /// The [`Waker`] the ring's intake channel fires when a producer sends an op: it writes the eventfd,
 /// which completes the ring's armed [`PollAdd`](opcode::PollAdd) and breaks `submit_and_wait`. It
 /// **owns a shared reference to the [`EventFd`]** (`StdArc<EventFd>`), so the descriptor stays open as
-/// long as any waker exists — even after the ring loop has exited and dropped its own reference. The
-/// `alive` flag is a cheap post-teardown short-circuit (skip the syscall once the ring is gone), not a
-/// safety mechanism: the `Arc` is what guarantees the fd is valid.
+/// long as any waker exists — even after the ring loop has exited and dropped its own reference (the
+/// `Arc`, not a flag, is what guarantees the fd is valid).
+///
+/// A single packed `state` word holds both control bits ([`WAKER_ALIVE`], [`WAKER_NOTIFIED`]), so a
+/// producer does **one** atomic op to decide whether to write:
+///
+/// * **liveness** — after teardown the ring clears `ALIVE`, so a late wake on a stale registered waker
+///   is a no-op (a cheap short-circuit; safety is the `Arc`).
+/// * **burst coalescing** — only the producer that flips `NOTIFIED` off → on performs the eventfd
+///   write; while a wake is still unconsumed the rest skip the syscall (the kernel counter would
+///   coalesce them into one `POLLIN`, but this avoids even the `write`). The ring clears `NOTIFIED`
+///   *before* draining the channel each loop, so a send that races the drain re-takes the transition
+///   and re-signals — never lost. Same flag discipline as the thread-park waker in
+///   [`blocking`](super::blocking).
 struct EventFdWaker {
     efd: StdArc<EventFd>,
-    alive: AtomicBool,
+    state: AtomicUsize,
+}
+
+impl EventFdWaker {
+    /// Clear `NOTIFIED`, called by the ring thread immediately before it drains the channel so a wake
+    /// racing the drain re-signals.
+    #[inline]
+    fn clear_notified(&self) {
+        self.state.fetch_and(!WAKER_NOTIFIED, Ordering::AcqRel);
+    }
+
+    /// Clear `ALIVE` on ring teardown so later wakes short-circuit.
+    #[inline]
+    fn mark_dead(&self) {
+        self.state.fetch_and(!WAKER_ALIVE, Ordering::Release);
+    }
 }
 
 impl Wake for EventFdWaker {
@@ -183,10 +215,12 @@ impl Wake for EventFdWaker {
     }
 
     fn wake_by_ref(self: &StdArc<Self>) {
-        if !self.alive.load(Ordering::Acquire) {
-            return;
+        // One atomic: set NOTIFIED and read the prior state. Write the eventfd only if the ring is
+        // ALIVE and NOTIFIED was not already set (this producer won the burst's first wake).
+        let prev = self.state.fetch_or(WAKER_NOTIFIED, Ordering::AcqRel);
+        if prev & WAKER_ALIVE != 0 && prev & WAKER_NOTIFIED == 0 {
+            self.efd.signal();
         }
-        self.efd.signal();
     }
 }
 
@@ -261,9 +295,19 @@ fn ring_loop(
         // 3. Drain newly-submitted ops from the intake channel into the SQ, bounded by free ring
         //    space. `poll_recv` with our eventfd waker registers it whenever the channel goes empty,
         //    so the next `send` wakes us. A closed channel (all senders dropped) flips `rx_open`.
+        //
+        // Clear NOTIFIED *before* draining: a producer that enqueues after this point (racing the
+        // drain) re-takes the wake transition and re-signals the eventfd, so its op is never stranded
+        // waiting for a wake we already consumed.
+        waker.clear_notified();
         budget.reset();
         while slab.outstanding() < depth {
-            let polled = sync_chan::Receiver::<Entry<IoOp>>::poll_recv(&mut rx, &mut cx, &mut budget);
+            // Disambiguate: the `sync` channel's `Receiver<IoOp>` implements
+            // `channel::Receiver<Entry<IoOp>>` (single-entry) and `..<Queue<IoOp>>` (batch); we want
+            // the single-entry form so each `Ready(Some(_))` is one `Entry<IoOp>`.
+            let polled = <sync_chan::Receiver<IoOp> as crate::socket::channel::Receiver<
+                Entry<IoOp>,
+            >>::poll_recv(&mut rx, &mut cx, &mut budget);
             match polled {
                 core::task::Poll::Ready(Some(op)) => {
                     // Park the op (and its buffer) in the slab — it owns the op for the whole kernel
@@ -293,9 +337,10 @@ fn ring_loop(
             }
         }
 
-        // 4. Exit check: channel closed and nothing in flight → tear down.
+        // 4. Exit check: channel closed and nothing in flight → tear down. Mark the waker dead so any
+        //    late wake on a still-registered copy short-circuits (the fd stays valid via the `Arc`).
         if !rx_open && slab.is_idle() {
-            waker.alive.store(false, Ordering::Release);
+            waker.mark_dead();
             return;
         }
 
@@ -544,15 +589,17 @@ impl Default for UringBackend {
 impl Backend for UringBackend {
     type Lane = RingSubmit;
 
-    fn spawn_lanes<S: Spawner>(&self, setup: LaneSetup, _spawner: &mut S) -> Vec<RingSubmit> {
+    fn spawn_lanes(&self, setup: LaneSetup) -> Vec<RingSubmit> {
         let mut senders = Vec::with_capacity(setup.lane_count);
         let mut joins = Vec::with_capacity(setup.lane_count);
         for idx in 0..setup.lane_count {
             let (tx, rx) = sync_chan::new::<IoOp>();
-            let efd = EventFd::new().expect("failed to create eventfd for io_uring lane");
+            // Shared ownership of the eventfd: the ring loop and the waker each hold an `Arc`, so the
+            // fd outlives every registered waker (the channel can keep one past teardown) — no UAF.
+            let efd = StdArc::new(EventFd::new().expect("failed to create eventfd for io_uring lane"));
             let waker = StdArc::new(EventFdWaker {
-                fd: efd.fd,
-                alive: AtomicBool::new(true),
+                efd: efd.clone(),
+                state: AtomicUsize::new(WAKER_ALIVE),
             });
             let ring_depth = self.depth;
             let depth = self.depth as usize;
@@ -870,6 +917,69 @@ mod tests {
                     .await
                     .unwrap();
                 assert_eq!(&buf[..], &payload[..]);
+                for pool in dev.pools.all() {
+                    assert_eq!(pool.debug_free_total(), pool.debug_capacity() as i64);
+                }
+                drop(file);
+                let _ = std::fs::remove_file(&path);
+            }
+        });
+    }
+
+    /// Zero-copy `O_DIRECT` roundtrip through io_uring: write a page-aligned buffer then read it back
+    /// into another, in place. `O_DIRECT` is a property of the *fd* (set at open), not the opcode — so
+    /// the ring issues the same `Read`/`Write` and the kernel honors the file's flags. Falls back to
+    /// buffered on tmpfs (the `direct` open flag is a no-op there), so the test stays portable while
+    /// exercising the `IoBuf::Direct` path on real `O_DIRECT` storage when available.
+    #[test]
+    fn uring_direct_zero_copy_roundtrip() {
+        use crate::fs::direct::{AlignedBuf, ALIGNMENT};
+        let path = temp_path("direct");
+        let file = File::open(
+            &path,
+            Options {
+                truncate: true,
+                size: 1 << 20,
+                direct: true,
+            },
+        )
+        .unwrap();
+        let fd = file.raw_fd();
+        run_local(|mut spawn, registry| {
+            let path = path.clone();
+            async move {
+                let scheduler = Scheduler::new(
+                    &config(1),
+                    &UringBackend::default(),
+                    &mut spawn,
+                    &registry,
+                    clock(),
+                );
+                let dev = scheduler.register_device("test", &byte_device(1 << 20)).unwrap();
+                let h = scheduler.handle();
+
+                let mut wbuf = AlignedBuf::new(ALIGNMENT);
+                for (i, b) in wbuf.as_mut_slice().iter_mut().enumerate() {
+                    *b = (i & 0xff) as u8;
+                }
+                let (wbuf, n) = h
+                    .write_direct(&dev, fd, 0, wbuf, TierPriority::Medium)
+                    .await
+                    .expect("direct write");
+                assert_eq!(n, ALIGNMENT);
+                drop(wbuf);
+
+                let rbuf = AlignedBuf::new(ALIGNMENT);
+                let (rbuf, rn) = h
+                    .read_direct(&dev, fd, 0, rbuf, TierPriority::High)
+                    .await
+                    .expect("direct read");
+                assert_eq!(rn, ALIGNMENT, "direct read returned wrong byte count");
+                assert_eq!(rbuf.len(), ALIGNMENT, "direct read buffer len not set to n");
+                for (i, b) in rbuf.as_slice().iter().enumerate() {
+                    assert_eq!(*b, (i & 0xff) as u8, "direct read byte {i} mismatch");
+                }
+
                 for pool in dev.pools.all() {
                     assert_eq!(pool.debug_free_total(), pool.debug_capacity() as i64);
                 }

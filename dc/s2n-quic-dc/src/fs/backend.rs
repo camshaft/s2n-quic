@@ -40,13 +40,11 @@ use crate::{
     counter::Registry,
     fs::{counters::Counters, op::IoOp},
     intrusive::Entry,
-    runtime::Spawner,
     sched::UnboundedSender,
     sync::Arc,
 };
 
-/// Context handed to a backend when it builds its lanes. The spawner is passed separately to
-/// [`Backend::spawn_lanes`] (the `Spawner` trait is not object-safe, so it cannot live in a struct).
+/// Context handed to a backend when it builds its lanes.
 pub struct LaneSetup {
     /// How many lanes to create.
     pub lane_count: usize,
@@ -59,13 +57,19 @@ pub struct LaneSetup {
 }
 
 /// A storage IO execution backend.
+///
+/// Note there is **no `Spawner`**: a backend spawns its execution lanes as dedicated OS threads
+/// through its own [`blocking::Runtime`] (syscall, io_uring), or — for the bach mock — as bach tasks
+/// via the global bach spawner. The cooperative worker `Spawner` that drives the scheduler's *own*
+/// `!Send` tasks (registrar, dispatch) is the scheduler's concern, not the backend's; since
+/// completion is now in place (no reaper task), the backend never touches it.
 pub trait Backend {
     /// The concrete sender type the submission dispatcher uses to hand an op to one lane. Knowing the
     /// concrete type (rather than `Box<dyn>`) lets the dispatch loop monomorphize — no vtable, no
     /// per-lane heap box.
     type Lane: UnboundedSender<Entry<IoOp>> + 'static;
 
-    /// Build `setup.lane_count` lanes, spawning each lane's execution task on `spawner`, and return
-    /// the submit handles in lane order. `LocalRingId(i)` routes to `handles[i]`.
-    fn spawn_lanes<S: Spawner>(&self, setup: LaneSetup, spawner: &mut S) -> Vec<Self::Lane>;
+    /// Build `setup.lane_count` lanes, spawning each lane's execution thread/task on the backend's own
+    /// runtime, and return the submit handles in lane order. `LocalRingId(i)` routes to `handles[i]`.
+    fn spawn_lanes(&self, setup: LaneSetup) -> Vec<Self::Lane>;
 }

@@ -20,7 +20,6 @@ use crate::{
         op::{IoOp, IoStatus},
         scheduler::{BlockRef, Scheduler},
     },
-    runtime::Spawner,
     sched::{CreditConfig, Rate, TierPriority},
     testing::{ext::*, sim},
     time::bach::Clock,
@@ -39,7 +38,7 @@ impl Backend for DeadLaneBackend {
     type Lane =
         crate::socket::channel::intrusive::unsync::Sender<crate::intrusive::EntryAdapter<IoOp>>;
 
-    fn spawn_lanes<S: Spawner>(&self, setup: LaneSetup, _spawner: &mut S) -> Vec<Self::Lane> {
+    fn spawn_lanes(&self, setup: LaneSetup) -> Vec<Self::Lane> {
         let mut handles = Vec::with_capacity(setup.lane_count);
         for _ in 0..setup.lane_count {
             let (tx, rx) = crate::socket::channel::intrusive::unsync::new::<IoOp>();
@@ -456,11 +455,13 @@ fn materialize_cross_device_no_hol() {
 /// ADVERSARIAL REPRO (case #7): dropping a `MaterializeStream` mid-spray — with some blocks in
 /// flight (credit on `op.flow_credits`, awaiting backend completion) and some parked on a starved
 /// device's credit — must conserve credit at quiescence. On drop:
-///   * every `DeviceSlot`'s `SubmitterAlloc` releases any residual `pending_credits` (parked grant),
-///   * `ToSubmit` slots hold no credit (acquired only on enqueue), so they release nothing,
-///   * in-flight ops still complete through the backend → dispatcher, which releases their credit
-///     BEFORE discarding the completion onto the now-dead `completion_rx` (receiver_alive == false).
-/// If the dispatcher released after the dead-receiver check, or if a residual alloc grant were
+///
+/// * every `DeviceSlot`'s `SubmitterAlloc` releases any residual `pending_credits` (parked grant),
+/// * `ToSubmit` slots hold no credit (acquired only on enqueue), so they release nothing,
+/// * in-flight ops still complete in the backend, where `complete()` releases their credit BEFORE
+///   discarding the completion onto the now-dead `completion_rx` (receiver_alive == false).
+///
+/// If `complete()` released after the dead-receiver check, or if a residual alloc grant were
 /// abandoned without release, this would leak. Assert the pools return to full capacity.
 #[test]
 fn materialize_drop_mid_spray_conserves_credit() {

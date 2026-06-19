@@ -34,10 +34,10 @@ pub enum OpMix {
 pub struct Config {
     /// Backend to drive.
     pub backend: Backend,
-    /// Number of execution lanes (worker threads / io_uring rings).
+    /// Number of execution lanes. One dedicated blocking thread per lane on either backend (a
+    /// `pread`/`pwrite` worker for syscall, an io_uring ring thread for uring) — there is no separate
+    /// worker-pool knob; the thread count *is* the lane count.
     pub lanes: usize,
-    /// Worker threads for the syscall backend (ignored by uring, which is one ring per lane).
-    pub syscall_workers: usize,
     /// io_uring ring depth (uring only).
     pub ring_depth: u32,
     /// Use O_DIRECT (unbuffered, zero-copy aligned) IO.
@@ -64,7 +64,6 @@ impl Default for Config {
         Self {
             backend: Backend::Syscall,
             lanes: 2,
-            syscall_workers: 4,
             ring_depth: 256,
             direct: false,
             queue_depth: 128,

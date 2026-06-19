@@ -36,7 +36,6 @@ use crate::{
         op::{IoBuf, IoKind, IoOp, IoStatus},
     },
     intrusive::Entry,
-    runtime::Spawner,
     socket::channel::{intrusive::sync as sync_chan, Map, ReceiverExt as _, UnboundedSender},
     sync::Arc,
 };
@@ -267,7 +266,7 @@ impl Default for SyscallBackend {
 impl Backend for SyscallBackend {
     type Lane = LaneSubmit;
 
-    fn spawn_lanes<S: Spawner>(&self, setup: LaneSetup, _spawner: &mut S) -> Vec<LaneSubmit> {
+    fn spawn_lanes(&self, setup: LaneSetup) -> Vec<LaneSubmit> {
         // One lane future per lane, each owning its lane's submission-channel receiver and the
         // counters it completes ops against. Spawned on the blocking runtime (one dedicated thread
         // each); the resulting join guards are gathered into a shared `Arc<[JoinOnDrop]>` so the

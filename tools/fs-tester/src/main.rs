@@ -278,7 +278,15 @@ fn build_uring(
     clock: Clock,
     ring_depth: u32,
 ) -> Scheduler {
-    use s2n_quic_dc::fs::backend::uring::UringBackend;
+    use s2n_quic_dc::fs::backend::uring::{self, UringBackend};
+    // Detect whether io_uring is actually usable here (kernel too old, the `io_uring_disabled`
+    // sysctl, a seccomp filter, or a low memlock rlimit). If not, fall back to the blocking syscall
+    // pool rather than panicking — and report why, so a misconfigured host is obvious.
+    if let Err(e) = uring::probe() {
+        eprintln!("io_uring unavailable ({e}); falling back to the blocking syscall backend");
+        let backend = SyscallBackend::new(Runtime::new("fs-tester-io"));
+        return Scheduler::new(fs_config, &backend, spawn, registry, clock);
+    }
     let backend = UringBackend::new(Runtime::new("fs-tester-uring"), ring_depth);
     Scheduler::new(fs_config, &backend, spawn, registry, clock)
 }

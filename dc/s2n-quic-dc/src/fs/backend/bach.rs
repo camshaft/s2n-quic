@@ -26,7 +26,6 @@ use crate::{
         op::{IoBuf, IoKind, IoOp, IoStatus},
     },
     intrusive::Entry,
-    runtime::Spawner,
     socket::channel::{intrusive::unsync, Map, ReceiverExt as _},
     sync::Arc,
     time::precision::{self, Timer as _},
@@ -135,7 +134,7 @@ where
 {
     type Lane = unsync::Sender<crate::intrusive::EntryAdapter<IoOp>>;
 
-    fn spawn_lanes<S: Spawner>(&self, setup: LaneSetup, spawner: &mut S) -> Vec<Self::Lane> {
+    fn spawn_lanes(&self, setup: LaneSetup) -> Vec<Self::Lane> {
         let mut handles = Vec::with_capacity(setup.lane_count);
         for _ in 0..setup.lane_count {
             let (tx, rx) = unsync::new::<IoOp>();
@@ -146,7 +145,10 @@ where
                 latency: self.latency,
                 process: self.process.clone(),
             };
-            spawner.spawn_named("fs.bach.lane", lane.run());
+            // The lane drain loop is `!Send` but bach is single-threaded; spawn it via the global bach
+            // spawner (the same path the per-op timer tasks use) rather than threading a `Spawner`
+            // through the backend trait — which the real backends do not need.
+            crate::runtime::bach::spawn_named("fs.bach.lane", lane.run());
             handles.push(tx);
         }
         handles
