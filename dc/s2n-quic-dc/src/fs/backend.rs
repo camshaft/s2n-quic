@@ -4,57 +4,64 @@
 //! The backend seam — channel-wired, not a lowest-common-denominator per-op trait.
 //!
 //! A backend is a *constructor* of execution lanes. Given a way to spawn tasks, a completion sink,
-//! the device table, and a clock, it returns one [`LaneSubmit`] per lane and spawns whatever
-//! internal tasks it wants (a mock timer loop, a bounded blocking thread pool, an io_uring CQ
-//! reaper). The dispatcher routes each admitted [`IoOp`] to a lane's `LaneSubmit`; the backend
-//! drains it, executes the op however it likes (reading the rich `IoOp` fields directly, taking the
-//! buffer by value), stamps `status`, and pushes the completed op into the completion sink.
+//! the device table, and a clock, it returns one lane submit handle per lane and spawns whatever
+//! internal tasks it wants (bach per-op timer tasks, a bounded blocking thread pool, an io_uring CQ
+//! reaper). The submission dispatch task routes each admitted [`IoOp`] to a lane; the backend drains
+//! it, executes the op however it likes (reading the rich `IoOp` fields directly, taking the buffer
+//! by value), stamps `status`, and pushes the completed op into the completion sink.
 //!
 //! This mirrors how `endpoint::tasks::send_worker` is handed `batch_rx` + a completion sender and
 //! builds its own internal pipeline — the *channel* is the abstraction, so io_uring's out-of-order
 //! completion and the blocking pool's thread hand-off both fit without a common syscall signature.
+//!
+//! The seam is fully **monomorphized**: a backend declares its concrete lane sender via
+//! [`Backend::Lane`] and receives the concrete [`ChannelCompletionSink`], so there is no `Box<dyn>`
+//! or vtable indirection per lane or per completion.
 
-pub mod mock;
+/// Deterministic in-memory backend for bach simulation tests.
+#[cfg(any(test, feature = "testing"))]
+pub mod bach;
+/// Drives a `Receiver` on a dedicated blocking OS thread via a thread-park waker (the syscall pool).
+mod blocking;
+/// In-flight slab keyed by `user_data` (used by the io_uring backend; platform-agnostic + unit-tested
+/// on all platforms even though only `uring` consumes it — hence `dead_code` off-Linux).
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+mod inflight;
 pub mod syscall;
 /// io_uring backend — Linux only.
 #[cfg(target_os = "linux")]
 pub mod uring;
 
 use crate::{
-    fs::{device::DeviceTable, op::IoOp, SpawnHandle},
+    counter::Registry,
+    fs::{combinator::CompletionSink, device::DeviceTable, op::IoOp},
+    intrusive::Entry,
+    runtime::Spawner,
     sched::UnboundedSender,
     sync::Arc,
 };
 
-/// A handle the dispatcher uses to submit ops to one execution lane. Boxed unbounded-sender of
-/// `Entry<IoOp>`; the lane's own task drains it (the credit pool has already bounded total admitted
-/// work upstream, so the lane needs no separate cap in v1).
-pub type LaneSubmit = Box<dyn UnboundedSender<crate::intrusive::Entry<IoOp>>>;
-
-/// A cloneable sink the backend pushes completed ops into. Completions feed the completion
-/// dispatcher, which releases credit and routes each op back to its submitter.
-pub trait CompletionSink {
-    /// Push one completed op toward the completion dispatcher.
-    fn send(&self, op: crate::intrusive::Entry<IoOp>);
-    /// Clone into a fresh boxed sink (one per lane).
-    fn boxed_clone(&self) -> Box<dyn CompletionSink>;
-}
-
-/// Context handed to a backend when it builds its lanes.
+/// Context handed to a backend when it builds its lanes. The spawner is passed separately to
+/// [`Backend::spawn_lanes`] (the `Spawner` trait is not object-safe, so it cannot live in a struct).
 pub struct LaneSetup {
     /// The device table (fds, cost models) — backends that touch real files resolve fds here.
     pub devices: Arc<DeviceTable>,
     /// How many lanes to create.
     pub lane_count: usize,
-    /// Sink for completed ops (the backend takes `boxed_clone`s, one per lane).
-    pub completion: Box<dyn CompletionSink>,
-    /// Cloneable spawner for the lanes' internal tasks.
-    pub spawn: SpawnHandle,
+    /// The channel completed ops are pushed into; the backend clones it per lane (cheap `Rc` clone).
+    pub completion: CompletionSink,
+    /// Registry for the backend's own counters/task topology.
+    pub registry: Registry,
 }
 
 /// A storage IO execution backend.
 pub trait Backend {
-    /// Build `setup.lane_count` lanes, spawning each lane's execution task, and return the submit
-    /// handles in lane order. `LocalRingId(i)` routes to `handles[i]`.
-    fn spawn_lanes(&self, setup: LaneSetup) -> Vec<LaneSubmit>;
+    /// The concrete sender type the submission dispatcher uses to hand an op to one lane. Knowing the
+    /// concrete type (rather than `Box<dyn>`) lets the dispatch loop monomorphize — no vtable, no
+    /// per-lane heap box.
+    type Lane: UnboundedSender<Entry<IoOp>> + 'static;
+
+    /// Build `setup.lane_count` lanes, spawning each lane's execution task on `spawner`, and return
+    /// the submit handles in lane order. `LocalRingId(i)` routes to `handles[i]`.
+    fn spawn_lanes<S: Spawner>(&self, setup: LaneSetup, spawner: &mut S) -> Vec<Self::Lane>;
 }

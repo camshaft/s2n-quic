@@ -42,35 +42,9 @@ pub mod scheduler;
 #[cfg(test)]
 mod tests;
 
-pub use config::{BackendKind, Config, CostModel, DeviceConfig, OpWeights, PoolMode};
+pub mod counters;
+
+pub use config::{Config, CostModel, DeviceConfig, OpWeights, PoolMode};
 pub use device::{DeviceId, LocalRingId};
 pub use op::{IoBuf, IoKind, IoOp, IoStatus};
 pub use scheduler::{BlockRef, Scheduler, SubmitHandle};
-
-use std::{future::Future, pin::Pin, rc::Rc};
-
-/// A cloneable, `!Send` task spawner. The scheduler and backends spawn their internal tasks through
-/// this so the core stays decoupled from any concrete runtime: under bach tests it wraps
-/// `bach::spawn`, in production it wraps [`crate::runtime::Spawner::spawn`].
-///
-/// `!Send` because the pipeline tasks hold `Rc`/`RefCell` state pinned to one worker, exactly like
-/// the network endpoint's per-worker tasks.
-#[derive(Clone)]
-pub struct SpawnHandle {
-    spawn: Rc<dyn Fn(Pin<Box<dyn Future<Output = ()>>>)>,
-}
-
-impl SpawnHandle {
-    /// Build a spawn handle from a closure that drives a `'static` future to completion.
-    pub fn new(spawn: impl Fn(Pin<Box<dyn Future<Output = ()>>>) + 'static) -> Self {
-        Self {
-            spawn: Rc::new(spawn),
-        }
-    }
-
-    /// Spawn a `'static` future onto the runtime.
-    #[inline]
-    pub fn spawn(&self, future: impl Future<Output = ()> + 'static) {
-        (self.spawn)(Box::pin(future));
-    }
-}

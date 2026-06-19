@@ -30,6 +30,6 @@ pub use crate::socket::rate::{Rate, TokenBucket};
 
 // ── Credit pool (priority-tiered, demand-elastic fair share) ────────────────
 pub use crate::credit::{
-    AbandonResult, Config as CreditConfig, Distributor, GrantResult, Pool, Priority as TierPriority,
-    Refill, Slot, WakerSink,
+    AbandonResult, Config as CreditConfig, Distributor, GrantResult, Pool,
+    Priority as TierPriority, Refill, Slot, WakerSink,
 };

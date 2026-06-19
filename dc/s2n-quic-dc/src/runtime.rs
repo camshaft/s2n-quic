@@ -194,12 +194,26 @@ pub mod bach {
         }
     }
 
-    /// Wrapper to make !Send futures Send for bach's API
-    struct SendWrapper<F>(F);
+    /// Wrapper to make !Send futures Send for bach's API.
+    ///
+    /// `pub(crate)` so bach-only components that need to spawn `!Send` per-op tasks directly on the
+    /// bach executor (e.g. the `fs::backend::bach` mock) share this single source of the unsafe
+    /// `Send`/`Sync` assertion rather than re-deriving it.
+    pub(crate) struct SendWrapper<F>(pub(crate) F);
 
     // SAFETY: Bach is single-threaded and never executes concurrently
     unsafe impl<F> Send for SendWrapper<F> {}
     unsafe impl<F> Sync for SendWrapper<F> {}
+
+    /// Spawn a (possibly `!Send`) future on the bach executor under `name`. The bach scheduler is
+    /// single-threaded, so the `SendWrapper` assertion is sound. Used by bach-only components that
+    /// spawn work outside the `Spawner` setup phase (which only borrows the spawner transiently).
+    pub(crate) fn spawn_named<F>(name: &str, future: F)
+    where
+        F: Future<Output = ()> + 'static,
+    {
+        ::bach::task::spawn_named(SendWrapper(future), name);
+    }
 
     impl<F> Future for SendWrapper<F>
     where
@@ -321,6 +335,14 @@ pub mod tokio {
     /// Tokio local spawner that uses spawn_local within a LocalSet.
     pub struct Local {
         worker_id: usize,
+    }
+
+    impl Local {
+        /// Construct a spawner that `spawn_local`s onto the current `LocalSet`. The `worker_id` is
+        /// only used for topology/introspection labelling.
+        pub fn new(worker_id: usize) -> Self {
+            Self { worker_id }
+        }
     }
 
     impl Spawner for Local {

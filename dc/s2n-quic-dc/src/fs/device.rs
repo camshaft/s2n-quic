@@ -103,7 +103,11 @@ impl Device {
         let (pools, read_capacity, write_capacity) = match &cfg.pool_mode {
             PoolMode::Shared(c) => {
                 let c = atomic_grant(*c);
-                (DevicePools::Shared(Arc::new(Pool::new(c))), c.capacity, c.capacity)
+                (
+                    DevicePools::Shared(Arc::new(Pool::new(c))),
+                    c.capacity,
+                    c.capacity,
+                )
             }
             PoolMode::Split { read, write } => {
                 let (read, write) = (atomic_grant(*read), atomic_grant(*write));

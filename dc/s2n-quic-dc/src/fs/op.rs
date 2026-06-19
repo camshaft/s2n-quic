@@ -131,6 +131,10 @@ pub struct IoOp {
     /// Execution lane assigned by `PickRing` (the send-socket analog). `LocalRingId::UNSET` until
     /// routed.
     pub ring_id: LocalRingId,
+    /// Opaque caller correlation token, echoed back on completion. Lets a submitter that funnels
+    /// many ops onto one shared completion channel (e.g. [`MaterializeStream`](crate::fs::materialize))
+    /// identify which op completed without a per-op channel allocation.
+    pub user_data: u64,
     /// When the op was submitted, for sojourn metrics. Set by the scheduler.
     pub enqueued_at: Option<crate::time::precision::Timestamp>,
 }

@@ -62,12 +62,12 @@ impl AlignedBuf {
     /// Allocate a zeroed buffer whose capacity is `align_up(len)` and whose logical length is `len`.
     pub fn new(len: usize) -> Self {
         let cap = align_up(len.max(1));
-        let layout = std::alloc::Layout::from_size_align(cap, ALIGNMENT)
-            .expect("valid aligned layout");
+        let layout =
+            std::alloc::Layout::from_size_align(cap, ALIGNMENT).expect("valid aligned layout");
         // SAFETY: layout has non-zero size (cap >= ALIGNMENT) and valid alignment.
         let raw = unsafe { std::alloc::alloc_zeroed(layout) };
-        let ptr = std::ptr::NonNull::new(raw)
-            .unwrap_or_else(|| std::alloc::handle_alloc_error(layout));
+        let ptr =
+            std::ptr::NonNull::new(raw).unwrap_or_else(|| std::alloc::handle_alloc_error(layout));
         Self { ptr, len, cap }
     }
 
@@ -127,10 +127,17 @@ impl AlignedBuf {
 
 impl Drop for AlignedBuf {
     fn drop(&mut self) {
-        let layout = std::alloc::Layout::from_size_align(self.cap, ALIGNMENT)
-            .expect("valid aligned layout");
+        let layout =
+            std::alloc::Layout::from_size_align(self.cap, ALIGNMENT).expect("valid aligned layout");
         // SAFETY: `ptr`/`cap`/alignment match the original allocation.
         unsafe { std::alloc::dealloc(self.ptr.as_ptr(), layout) };
+    }
+}
+
+impl AsRef<[u8]> for AlignedBuf {
+    #[inline]
+    fn as_ref(&self) -> &[u8] {
+        self.as_slice()
     }
 }
 
@@ -209,7 +216,11 @@ impl File {
 /// which rejects it); on macOS sets `F_NOCACHE` after open.
 fn open_file(path: &Path, truncate: bool, direct: bool) -> io::Result<std::fs::File> {
     let mut options = OpenOptions::new();
-    options.read(true).write(true).create(true).truncate(truncate);
+    options
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(truncate);
 
     #[cfg(target_os = "linux")]
     {

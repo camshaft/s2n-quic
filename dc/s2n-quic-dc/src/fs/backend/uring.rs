@@ -25,13 +25,18 @@
 
 use crate::{
     fs::{
-        backend::{Backend, CompletionSink, LaneSetup, LaneSubmit},
+        backend::{
+            inflight::{InFlight, InFlightSlab},
+            {Backend, LaneSetup},
+        },
+        combinator::CompletionSink,
         op::{IoBuf, IoKind, IoOp, IoStatus},
     },
     intrusive::{Entry, Queue},
-    socket::channel::{intrusive::sync as sync_chan, Budget, UnboundedSender},
+    runtime::Spawner,
+    socket::channel::{intrusive::sync as sync_chan, Map, ReceiverExt as _, UnboundedSender},
+    sync::Arc,
 };
-use core::task::Poll;
 use io_uring::{opcode, types, IoUring};
 use std::{
     os::fd::RawFd,
@@ -43,9 +48,17 @@ use std::{
 /// count so the SQ never backs up before the credit pool does.
 pub const DEFAULT_RING_DEPTH: u32 = 256;
 
-/// One ring + its dedicated worker thread, plus the queue feeding it. Each lane gets one.
+/// One ring + its dedicated worker thread, plus the intake queue feeding it. Each lane gets one.
+///
+/// The ring thread cannot use the shared thread-park `Receiver` driver the syscall pool uses: it must
+/// wake for *two* independent events — a newly-submitted op AND a kernel completion — and it must NOT
+/// park while ops are outstanding (it has to stay in `submit_and_wait` reaping them). So intake keeps
+/// a small private `Mutex<Queue> + Condvar`: the thread blocks on the condvar only when both its
+/// queue is empty and nothing is in flight. (Folding this onto the `sync` channel + park waker is
+/// deferred until that dual-wait is designed; the in-flight bookkeeping is already the shared
+/// [`InFlightSlab`].)
 struct Ring {
-    shared: std::sync::Arc<Shared>,
+    shared: Arc<Shared>,
     worker: Option<JoinHandle<()>>,
 }
 
@@ -64,7 +77,7 @@ struct JobQueue {
 impl Ring {
     /// Build a ring whose worker forwards completions to `done_tx` (this lane's reaper).
     fn new(depth: u32, done_tx: sync_chan::Sender<IoOp>) -> std::io::Result<Self> {
-        let shared = std::sync::Arc::new(Shared {
+        let shared = Arc::new(Shared {
             queue: Mutex::new(JobQueue {
                 jobs: Queue::new(),
                 shutdown: false,
@@ -123,17 +136,6 @@ impl Drop for Ring {
     }
 }
 
-/// An in-flight op: the op plus how many bytes of a read/write have completed so far. A short
-/// completion advances `done` and the remainder is re-submitted, so the op stays pinned in the slab
-/// (and its buffer stays valid for the kernel) until the FULL transfer finishes or it errors.
-struct InFlight {
-    op: Entry<IoOp>,
-    /// Bytes transferred so far (for read/write progress across short completions).
-    done: usize,
-    /// Total bytes requested (the op's transfer length).
-    want: usize,
-}
-
 /// What a reaped CQE means for its op.
 enum Reaped {
     /// The op is finished (success or error); take it out of the slab and complete it.
@@ -144,107 +146,100 @@ enum Reaped {
 
 /// The ring thread: pull submitted jobs, build SQEs, submit, reap CQEs, forward completions.
 ///
-/// Drains newly-queued jobs into the SQ (parking each op in the in-flight slab keyed by `user_data`),
-/// submits, waits for at least one completion whenever work is outstanding, and reaps every available
-/// CQE. Short reads/writes advance the op's progress cursor and re-submit the remainder. Blocks on
-/// the condvar only when both the queue and the in-flight set are empty — so it sleeps when idle and
-/// never busy-spins.
+/// The in-flight set is the shared [`InFlightSlab`] (owning, `user_data`-keyed, recycled ids); intake
+/// is the private `Mutex<Queue> + Condvar` on `shared` (see [`Ring`] for why this can't yet be the
+/// `sync` channel + park waker). The thread blocks on the condvar only when **both** the queue is
+/// empty AND nothing is in flight; while ops are outstanding it stays hot in `submit_and_wait` to
+/// reap their completions, never busy-spinning.
 ///
-/// **Buffer-lifetime invariant:** an op's buffer is freed *only* when its final CQE is reaped, never
-/// based on a `submit` result. A submit error keeps every outstanding op pinned and the loop keeps
-/// reaping, so the kernel never holds a pointer into freed memory.
+/// **Buffer-lifetime invariant:** an op's buffer is freed *only* when its final CQE is reaped (via
+/// [`InFlightSlab::take`]), never based on a `submit` result. A submit error keeps every outstanding
+/// op pinned in the slab and the loop keeps reaping, so the kernel never holds a freed pointer.
 fn ring_loop(
     mut ring: IoUring,
-    shared: std::sync::Arc<Shared>,
+    shared: Arc<Shared>,
     depth: usize,
     done_tx: sync_chan::Sender<IoOp>,
 ) {
-    // In-flight ops keyed by user_data; the slab owns each op (and its buffer) until its final CQE.
-    // A slab (indexed `Vec<Option>`) is the right structure here — O(1) CQE-by-user_data lookup with
-    // no per-op allocation beyond the op itself, and slots are recycled via `free_ids`.
-    let mut inflight: Vec<Option<InFlight>> = Vec::with_capacity(depth);
-    let mut free_ids: Vec<usize> = Vec::with_capacity(depth);
-    let mut outstanding = 0usize;
+    let mut slab = InFlightSlab::<IoOp>::with_capacity(depth);
     // Scratch buffers RETAINED across loop iterations (cleared, never reallocated): ids whose tail
     // must be re-submitted after a short completion, and ids completed this pass.
     let mut to_resubmit: Vec<usize> = Vec::with_capacity(depth);
     let mut completed: Vec<usize> = Vec::with_capacity(depth);
 
     loop {
-        // 1. Pull queued ops (block only when nothing is queued AND nothing is in flight).
+        // 1. Pull queued ops (block on the condvar only when nothing is queued AND nothing is in
+        //    flight AND no resubmit work remains).
         {
             let mut q = shared.queue.lock().unwrap();
             loop {
                 if !q.jobs.is_empty() || !to_resubmit.is_empty() {
                     break;
                 }
-                if q.shutdown && outstanding == 0 {
+                if q.shutdown && slab.is_idle() {
                     return;
                 }
-                if outstanding > 0 {
+                if !slab.is_idle() {
                     // Work is in the kernel; don't block on the condvar — go reap its completions.
                     break;
                 }
                 q = shared.cond.wait(q).unwrap();
             }
-            // Re-submit the tails of short-completed ops first (they're already pinned in the slab
-            // and counted in `outstanding`; only the SQE needs re-pushing).
+            // Re-submit the tails of short-completed ops first (already pinned in the slab and counted
+            // outstanding; only the SQE needs re-pushing). Drop those the SQ accepts; keep the rest.
             to_resubmit.retain(|&id| {
-                let Some(slot) = inflight[id].as_ref() else {
+                let Some(slot) = slab.get(id) else {
                     return false;
                 };
                 let entry = build_sqe(&slot.op, slot.done, id as u64);
-                // SAFETY: the op (and its buffer) is pinned in `inflight[id]` until its final CQE.
+                // SAFETY: the op (and its buffer) is pinned in the slab until its final CQE.
                 match unsafe { ring.submission().push(&entry) } {
                     Ok(()) => false, // submitted; drop from the resubmit list
                     Err(_) => true,  // SQ full; retry next iteration
                 }
             });
             // Move newly-queued ops into the SQ, bounded by available ring space.
-            while outstanding < depth {
-                let Some(mut op) = q.jobs.pop_front() else { break };
-                let id = free_ids.pop().unwrap_or_else(|| {
-                    inflight.push(None);
-                    inflight.len() - 1
-                });
+            while slab.outstanding() < depth {
+                let Some(mut op) = q.jobs.pop_front() else {
+                    break;
+                };
                 // Prepare the op's buffer with exclusive access *before* parking it in the slab, then
-                // build the SQE from the (now-stable) buffer pointer. The op then moves into the
-                // slab and stays put until its final CQE.
+                // build the SQE from the (now-stable) buffer pointer.
                 prepare_buf(&mut op);
                 let want = transfer_len(&op);
-                let entry = build_sqe(&op, 0, id as u64);
-                inflight[id] = Some(InFlight { op, done: 0, want });
-                // SAFETY: the op (and its buffer) lives in `inflight[id]` until its CQE is reaped, so
-                // the buffer pointer in the SQE stays valid for the kernel operation's duration.
+                let id = slab.insert(op, want);
+                let entry = build_sqe(&slab.get(id).unwrap().op, 0, id as u64);
+                // SAFETY: the op (and its buffer) lives in the slab until its CQE is reaped, so the
+                // buffer pointer in the SQE stays valid for the kernel operation's duration.
                 match unsafe { ring.submission().push(&entry) } {
-                    Ok(()) => outstanding += 1,
+                    Ok(()) => {}
                     Err(_) => {
-                        // SQ full despite the bound check — put the op back and stop filling.
-                        let op = inflight[id].take().unwrap().op;
-                        free_ids.push(id);
-                        q.jobs.push_front(op);
+                        // SQ full despite the bound check — take the op back out and re-queue it.
+                        if let Some(op) = slab.take(id) {
+                            q.jobs.push_front(op);
+                        }
                         break;
                     }
                 }
             }
         }
 
-        if outstanding == 0 {
+        if slab.is_idle() {
+            // Nothing in flight: loop back to block on the condvar (or exit if shut down).
             continue;
         }
 
-        // 2. Submit and wait for at least one completion. A submit error NEVER frees in-flight
-        //    buffers — they stay pinned and we fall through to reap whatever completions exist
-        //    (treating the error like EINTR), so the kernel never holds a freed pointer. A persistent
-        //    submit failure with no completions would spin, but `submit_and_wait(1)` blocks until at
-        //    least one CQE is available whenever work is outstanding, so it makes progress.
+        // 3. Submit and wait for at least one completion. A submit error NEVER frees in-flight buffers
+        //    — they stay pinned and we fall through to reap whatever completions exist (treating the
+        //    error like EINTR). `submit_and_wait(1)` blocks until at least one CQE is available
+        //    whenever work is outstanding, so it makes progress and never busy-spins.
         match ring.submit_and_wait(1) {
             Ok(_) => {}
             Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => {}
             Err(_) => {}
         }
 
-        // 3. Reap completions. Short read/write → advance progress and mark for re-submit; otherwise
+        // 4. Reap completions. Short read/write → advance progress and mark for re-submit; otherwise
         //    complete the op and free its slab slot (and thus its buffer).
         completed.clear();
         {
@@ -252,32 +247,29 @@ fn ring_loop(
             cq.sync();
             for cqe in &mut cq {
                 let id = cqe.user_data() as usize;
-                let Some(slot) = inflight.get_mut(id).and_then(|s| s.as_mut()) else {
+                let Some(slot) = slab.get_mut(id) else {
                     // Orphan CQE for an already-completed/reaped id — harmless tombstone.
                     continue;
                 };
                 match apply_cqe(slot, cqe.result()) {
                     Reaped::Resubmit => to_resubmit.push(id),
-                    Reaped::Done => {
-                        let mut op = inflight[id].take().unwrap().op;
-                        finalize(&mut op);
-                        // `send_entry` takes `&self`, so no per-op clone of the sender.
-                        let _ = done_tx.send_entry(op);
-                        completed.push(id);
-                    }
+                    Reaped::Done => completed.push(id),
                 }
             }
         }
         for &id in &completed {
-            free_ids.push(id);
-            outstanding -= 1;
+            if let Some(mut op) = slab.take(id) {
+                finalize(&mut op);
+                // `send_entry` takes `&self`, so no per-op clone of the sender.
+                let _ = done_tx.send_entry(op);
+            }
         }
     }
 }
 
 /// Apply a CQE result to an in-flight op, returning whether it is finished or needs its tail
 /// re-submitted. `result` is `-errno` on failure, else the bytes transferred (0 for fsync/trim).
-fn apply_cqe(slot: &mut InFlight, result: i32) -> Reaped {
+fn apply_cqe(slot: &mut InFlight<IoOp>, result: i32) -> Reaped {
     if result < 0 {
         let err = std::io::Error::from_raw_os_error(-result);
         slot.op.status = IoStatus::Failed(err.kind());
@@ -447,25 +439,27 @@ impl Default for UringBackend {
 }
 
 impl Backend for UringBackend {
-    fn spawn_lanes(&self, setup: LaneSetup) -> Vec<LaneSubmit> {
+    type Lane = RingSubmit;
+
+    fn spawn_lanes<S: Spawner>(&self, setup: LaneSetup, spawner: &mut S) -> Vec<RingSubmit> {
         let mut handles = Vec::with_capacity(setup.lane_count);
         for _ in 0..setup.lane_count {
             // Send channel: this lane's ring thread → this lane's reaper task. The ring thread holds
-            // `done_tx` (no per-op completion state); the reaper bridges to the !Send sink.
+            // `done_tx` (no per-op completion state); the reaper bridges to the completion sink.
             let (done_tx, done_rx) = sync_chan::new::<IoOp>();
-            setup.spawn.spawn(reaper(done_rx, setup.completion.boxed_clone()));
+            spawner.spawn_named("fs.uring.reaper", reaper(done_rx, setup.completion.clone()));
             // One ring (+ its thread) per lane; the ring thread owns `done_tx`.
             let ring = std::sync::Arc::new(
                 Ring::new(self.depth, done_tx).expect("failed to create io_uring for lane"),
             );
-            handles.push(Box::new(RingSubmit { ring }) as LaneSubmit);
+            handles.push(RingSubmit { ring });
         }
         handles
     }
 }
 
 /// The lane's submit handle: enqueues each op onto its ring's thread (bare intrusive `Entry<IoOp>`).
-struct RingSubmit {
+pub struct RingSubmit {
     ring: std::sync::Arc<Ring>,
 }
 
@@ -476,29 +470,14 @@ impl UnboundedSender<Entry<IoOp>> for RingSubmit {
     }
 }
 
-/// Drain a lane's `Send` completion channel and forward each op to the `!Send` completion sink.
-async fn reaper(mut done_rx: sync_chan::Receiver<IoOp>, sink: Box<dyn CompletionSink>) {
-    let mut budget = Budget::new(1 << 20);
-    core::future::poll_fn(move |cx| {
-        budget.reset();
-        loop {
-            match crate::socket::channel::Receiver::<Entry<IoOp>>::poll_recv(
-                &mut done_rx,
-                cx,
-                &mut budget,
-            ) {
-                Poll::Ready(Some(op)) => {
-                    sink.send(op);
-                    if budget.is_exhausted() {
-                        cx.waker().wake_by_ref();
-                        return Poll::Pending;
-                    }
-                }
-                Poll::Ready(None) => return Poll::Ready(()),
-                Poll::Pending => return Poll::Pending,
-            }
-        }
+/// Drain a lane's `Send` completion channel and forward each op to the completion sink. A `Map`
+/// combinator driven by `drain_budgeted` (the standard channel task driver, not a hand-rolled poll
+/// loop); the explicit `Entry<IoOp>` closure parameter selects the single-entry `Receiver` impl.
+async fn reaper(done_rx: sync_chan::Receiver<IoOp>, sink: CompletionSink) {
+    Map::new(done_rx, move |op: Entry<IoOp>| {
+        let _ = sink.send_entry(op);
     })
+    .drain_budgeted(Some(crate::fs::combinator::DRAIN_BUDGET))
     .await;
 }
 
@@ -506,13 +485,14 @@ async fn reaper(mut done_rx: sync_chan::Receiver<IoOp>, sink: Box<dyn Completion
 mod tests {
     use super::*;
     use crate::{
+        counter::Registry,
         fs::{
-            config::{BackendKind, Config, CostModel, DeviceConfig, OpWeights, PoolMode},
+            config::{Config, CostModel, DeviceConfig, OpWeights, PoolMode},
             device::DeviceId,
             direct::{File, Options},
             scheduler::Scheduler,
-            SpawnHandle,
         },
+        runtime::tokio::Local,
         sched::{CreditConfig, Rate, TierPriority},
     };
     use std::rc::Rc;
@@ -538,16 +518,17 @@ mod tests {
         }
     }
 
-    fn run_local<F: std::future::Future<Output = ()> + 'static>(body: impl FnOnce(SpawnHandle) -> F) {
+    fn run_local<F, B>(body: B)
+    where
+        F: std::future::Future<Output = ()> + 'static,
+        B: FnOnce(Local, Registry) -> F,
+    {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
         let local = tokio::task::LocalSet::new();
-        let spawn = SpawnHandle::new(|fut| {
-            tokio::task::spawn_local(fut);
-        });
-        local.block_on(&rt, body(spawn));
+        local.block_on(&rt, body(Local::new(0), Registry::default()));
     }
 
     fn clock() -> crate::busy_poll::clock::Clock {
@@ -558,25 +539,44 @@ mod tests {
     #[test]
     fn uring_write_then_read_roundtrip() {
         let path = temp_path("rt");
-        let file = File::open(&path, Options { truncate: true, size: 1 << 20, direct: false }).unwrap();
+        let file = File::open(
+            &path,
+            Options {
+                truncate: true,
+                size: 1 << 20,
+                direct: false,
+            },
+        )
+        .unwrap();
         let fd = file.raw_fd();
-        run_local(|spawn| {
+        run_local(|mut spawn, registry| {
             let path = path.clone();
             async move {
                 let config = Config {
                     devices: vec![byte_device(1 << 20)],
                     ring_count: 1,
-                    backend: BackendKind::Uring,
                 };
-                let scheduler = Scheduler::new(&config, &UringBackend::default(), spawn, clock());
+                let scheduler = Scheduler::new(
+                    &config,
+                    &UringBackend::default(),
+                    &mut spawn,
+                    &registry,
+                    clock(),
+                );
                 let h = scheduler.handle();
                 let dev = DeviceId(0);
 
                 let payload = bytes::Bytes::from_static(b"io_uring round trip payload");
-                let n = h.write(dev, fd, 0, payload.clone(), TierPriority::Medium).await.unwrap();
+                let n = h
+                    .write(dev, fd, 0, payload.clone(), TierPriority::Medium)
+                    .await
+                    .unwrap();
                 assert_eq!(n, payload.len());
 
-                let buf = h.read(dev, fd, 0, payload.len() as u32, TierPriority::High).await.unwrap();
+                let buf = h
+                    .read(dev, fd, 0, payload.len() as u32, TierPriority::High)
+                    .await
+                    .unwrap();
                 assert_eq!(&buf[..], &payload[..]);
 
                 drop(file);
@@ -590,17 +590,30 @@ mod tests {
     #[test]
     fn uring_high_concurrency_conserves() {
         let path = temp_path("stress");
-        let file = File::open(&path, Options { truncate: true, size: 1 << 20, direct: false }).unwrap();
+        let file = File::open(
+            &path,
+            Options {
+                truncate: true,
+                size: 1 << 20,
+                direct: false,
+            },
+        )
+        .unwrap();
         let fd = file.raw_fd();
-        run_local(|spawn| {
+        run_local(|mut spawn, registry| {
             let path = path.clone();
             async move {
                 let config = Config {
                     devices: vec![byte_device(4096)],
                     ring_count: 1,
-                    backend: BackendKind::Uring,
                 };
-                let scheduler = Scheduler::new(&config, &UringBackend::default(), spawn, clock());
+                let scheduler = Scheduler::new(
+                    &config,
+                    &UringBackend::default(),
+                    &mut spawn,
+                    &registry,
+                    clock(),
+                );
                 let dev = DeviceId(0);
                 let completed = Rc::new(std::cell::Cell::new(0usize));
                 let mut tasks = Vec::new();
@@ -611,7 +624,10 @@ mod tests {
                         for i in 0..4u64 {
                             let off = (w * 4 + i) * 512;
                             let data = bytes::Bytes::from(vec![(w & 0xff) as u8; 256]);
-                            if h.write(dev, fd, off, data, TierPriority::Medium).await.is_ok() {
+                            if h.write(dev, fd, off, data, TierPriority::Medium)
+                                .await
+                                .is_ok()
+                            {
                                 completed.set(completed.get() + 1);
                             }
                         }
@@ -620,7 +636,11 @@ mod tests {
                 for t in tasks {
                     t.await.unwrap();
                 }
-                assert_eq!(completed.get(), 32 * 4, "every op must complete through the ring");
+                assert_eq!(
+                    completed.get(),
+                    32 * 4,
+                    "every op must complete through the ring"
+                );
                 let device = scheduler.devices().get(dev).unwrap();
                 for pool in device.pools.all() {
                     assert_eq!(
@@ -638,13 +658,18 @@ mod tests {
     /// A read on a bad fd surfaces as Err (io_uring returns -EBADF in the CQE), not a hang.
     #[test]
     fn uring_bad_fd_fails() {
-        run_local(|spawn| async move {
+        run_local(|mut spawn, registry| async move {
             let config = Config {
                 devices: vec![byte_device(1 << 16)],
                 ring_count: 1,
-                backend: BackendKind::Uring,
             };
-            let scheduler = Scheduler::new(&config, &UringBackend::default(), spawn, clock());
+            let scheduler = Scheduler::new(
+                &config,
+                &UringBackend::default(),
+                &mut spawn,
+                &registry,
+                clock(),
+            );
             let dev = DeviceId(0);
             let h = scheduler.handle();
             let result = h.read(dev, -1, 0, 4096, TierPriority::Medium).await;

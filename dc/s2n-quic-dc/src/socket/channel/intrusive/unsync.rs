@@ -178,6 +178,29 @@ impl<A: intrusive::Adapter> super::super::Sender<A::Pointer> for Sender<A> {
 }
 
 impl<A: intrusive::Adapter> Sender<A> {
+    /// Send a single value to the queue, taking `&self` so callers need not hold (or clone) a
+    /// `&mut` sender. Mirrors [`sync::Sender::send_entry`](super::sync::Sender::send_entry); sound
+    /// here because `Shared` is `!Send` (`Rc`-confined to one thread) and the borrow checker keeps
+    /// `&Sender` and `&mut Receiver` from overlapping, so the queue access never races.
+    ///
+    /// Returns `Err(value)` if the channel is closed, so the caller can recover/deallocate it.
+    #[inline]
+    pub fn send_entry(&self, value: A::Pointer) -> Result<(), A::Pointer> {
+        if !self.shared.is_alive() {
+            return Err(value);
+        }
+
+        unsafe {
+            // SAFETY: `Shared` is `!Send` (`Rc`); this runs on the owning thread and the borrow
+            // checker prevents an overlapping `&mut Receiver` from touching the queue concurrently.
+            let queue = &mut *self.shared.queue.get();
+            queue.push_back(value);
+            self.shared.wake_receiver();
+        }
+
+        Ok(())
+    }
+
     /// Returns a weak reference to the underlying `Shared` state.
     ///
     /// The weak reference can be stored in descriptors so they can push themselves

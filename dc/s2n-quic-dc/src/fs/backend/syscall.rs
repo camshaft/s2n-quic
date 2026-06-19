@@ -7,127 +7,80 @@
 //! deadlocks: each pool spawns blocking threads with no global bound and no backpressure on thread
 //! spawn, so under load the pool exhausts and in-flight ops wait on ops that can never be scheduled.
 //!
-//! This backend fixes that structurally. It owns **one** bounded thread pool — a fixed number of
-//! worker threads created once at construction and **never** dynamically spawned — shared across all
-//! lanes. Workers block on a condvar-guarded job queue, run `pread`/`pwrite`/`fsync` on the op's fd,
-//! and push the completed op back through a `Send` channel to a per-lane reaper task on the
-//! scheduler thread, which bridges to the `!Send` completion sink. Crucially, admission is bounded
-//! *upstream* by the credit pool (a submitter that can't get credit parks on a waker, never a
-//! thread), so the pool's queue can never grow without bound and the hold-and-wait deadlock cannot
-//! form.
+//! This backend fixes that structurally. It owns a **fixed** set of worker threads — one per
+//! execution lane, created once at construction and **never** dynamically spawned. Each worker owns
+//! its lane's [`sync`](crate::socket::channel::intrusive::sync) submission-channel receiver and
+//! drives it with a thread-park waker ([`blocking::run`]): it runs `pread`/`pwrite`/`fsync` on each
+//! op's fd, then forwards the completed op through a shared `Send` channel to a single reaper task on
+//! the scheduler thread, which bridges to the `!Send` completion sink. Per-lane channels let the
+//! dispatch EDT pick-two balance work across lanes. Crucially, admission is bounded *upstream* by the
+//! credit pool (a submitter that can't get credit parks on a waker, never a thread), so a lane's
+//! queue can never grow without bound and the hold-and-wait deadlock cannot form.
 //!
-//! Unlike the mock backend, this runs on real OS threads against real files, so it cannot run under
+//! Reusing the ordinary `sync` channel (rather than a bespoke `Mutex+Condvar` queue) means the same
+//! channel and the same `Waker` wake-path serve both the async pipeline and these blocking threads —
+//! a producer's plain `waker.wake()` unparks a blocked worker with no special-casing at the send
+//! site. The thread-park driver lives in [`blocking`](super::blocking).
+//!
+//! Unlike the bach backend, this runs on real OS threads against real files, so it cannot run under
 //! the bach simulated clock — its tests use real threads + temp files.
 
 use crate::{
     fs::{
-        backend::{Backend, CompletionSink, LaneSetup, LaneSubmit},
+        backend::{
+            blocking, {Backend, LaneSetup},
+        },
+        combinator::CompletionSink,
         op::{IoBuf, IoKind, IoOp, IoStatus},
     },
-    intrusive::{Entry, Queue},
-    socket::channel::{intrusive::sync as sync_chan, Budget, UnboundedSender},
+    intrusive::Entry,
+    runtime::Spawner,
+    socket::channel::{intrusive::sync as sync_chan, Map, ReceiverExt as _, UnboundedSender},
     sync::Arc,
 };
-use core::task::Poll;
-use std::{
-    os::fd::RawFd,
-    sync::{Condvar, Mutex},
-    thread::JoinHandle,
-};
+use std::{os::fd::RawFd, thread::JoinHandle};
 
-/// The bounded worker pool. Created once; the worker count is fixed for its lifetime. The pool is
-/// shared across all lanes (the whole point of the bound — total threads, not per-device), and all
-/// workers push completed ops to ONE shared `Send` completion channel drained by a single reaper, so
-/// there is no per-op completion-routing state: the in-flight ops flow as bare `Entry<IoOp>`
-/// (already an intrusive node) through an intrusive [`Queue`], with no per-op wrapper allocation.
-struct Pool {
-    shared: Arc<Shared>,
-    workers: Vec<JoinHandle<()>>,
+/// One execution lane: a `sync` submission channel feeding a dedicated blocking worker thread that
+/// `pread`/`pwrite`s each op and forwards the completed op to the lane's reaper. The worker owns the
+/// channel's `Receiver` and drives it with a thread-park waker ([`blocking::run`]) — the same channel
+/// and `Waker` mechanism the async pipeline uses, just consumed on a thread that can block on a
+/// syscall. Dropping the lane's `Sender` (scheduler teardown) closes the channel, so `run` returns
+/// and the worker exits; the handle then joins it.
+struct Worker {
+    handle: Option<JoinHandle<()>>,
 }
 
-struct Shared {
-    queue: Mutex<JobQueue>,
-    cond: Condvar,
-    /// Single completion channel shared by all workers → the pool's one reaper task.
-    done_tx: sync_chan::Sender<IoOp>,
-}
-
-struct JobQueue {
-    /// Intrusive FIFO of submitted ops awaiting a worker. No `Vec`/`VecDeque` and no per-op wrapper:
-    /// the `Entry<IoOp>` produced by the scheduler IS the queue node, moved in/out by pointer.
-    jobs: Queue<IoOp>,
-    shutdown: bool,
-}
-
-impl Pool {
-    fn new(worker_count: usize, done_tx: sync_chan::Sender<IoOp>) -> Arc<Self> {
-        debug_assert!(worker_count > 0, "fs syscall backend worker_count must be > 0");
-        let shared = Arc::new(Shared {
-            queue: Mutex::new(JobQueue {
-                jobs: Queue::new(),
-                shutdown: false,
-            }),
-            cond: Condvar::new(),
-            done_tx,
-        });
-        let mut workers = Vec::with_capacity(worker_count);
-        for i in 0..worker_count.max(1) {
-            let shared = shared.clone();
-            let handle = std::thread::Builder::new()
-                .name(format!("s2n-dc-fs-io-{i}"))
-                .spawn(move || worker_loop(shared))
-                .expect("failed to spawn fs io worker");
-            workers.push(handle);
-        }
-        Arc::new(Self { shared, workers })
-    }
-
-    /// Enqueue an op and wake one worker. Non-blocking — the credit pool already bounded the number
-    /// of in-flight ops, so the intrusive queue never grows without bound.
-    fn enqueue(&self, op: Entry<IoOp>) {
-        {
-            let mut q = self.shared.queue.lock().unwrap();
-            q.jobs.push_back(op);
-        }
-        self.shared.cond.notify_one();
-    }
-}
-
-impl Drop for Pool {
+impl Drop for Worker {
     fn drop(&mut self) {
-        {
-            let mut q = self.shared.queue.lock().unwrap();
-            q.shutdown = true;
-        }
-        self.shared.cond.notify_all();
-        for handle in self.workers.drain(..) {
+        if let Some(handle) = self.handle.take() {
             let _ = handle.join();
         }
     }
 }
 
-/// A worker thread: pull an op, run its syscall, push the completed op to the shared reaper.
-fn worker_loop(shared: Arc<Shared>) {
-    loop {
-        let mut op = {
-            let mut q = shared.queue.lock().unwrap();
-            loop {
-                if let Some(op) = q.jobs.pop_front() {
-                    break op;
-                }
-                if q.shutdown {
-                    return;
-                }
-                q = shared.cond.wait(q).unwrap();
-            }
-        };
-
-        execute(&mut op);
-        // Forward the completed op to the pool's reaper. If the reaper is gone the send fails and the
-        // op (and its credit) drops here — acceptable only on full teardown. `send_entry` takes
-        // `&self`, so no per-op clone of the sender.
-        let _ = shared.done_tx.send_entry(op);
-    }
+/// Spawn one lane: a `sync` channel + a worker thread draining it via [`blocking::run`], completing
+/// each op onto `done_tx` (this lane's reaper bridge to the `!Send` completion sink). Returns the
+/// lane's submission `Sender` and the worker handle (which joins the thread on drop).
+fn spawn_worker(idx: usize, done_tx: sync_chan::Sender<IoOp>) -> (sync_chan::Sender<IoOp>, Worker) {
+    let (tx, rx) = sync_chan::new::<IoOp>();
+    let handle = std::thread::Builder::new()
+        .name(format!("s2n-dc-fs-io-{idx}"))
+        .spawn(move || {
+            blocking::run(rx, |mut op: Entry<IoOp>| {
+                execute(&mut op);
+                // Forward the completed op to the reaper. If the reaper is gone the send fails and
+                // the op (and its credit) drops here — acceptable only on full teardown. `send_entry`
+                // takes `&self`, so no per-op clone of the sender.
+                let _ = done_tx.send_entry(op);
+            });
+        })
+        .expect("failed to spawn fs io worker");
+    (
+        tx,
+        Worker {
+            handle: Some(handle),
+        },
+    )
 }
 
 /// Run the op's syscall on its fd, stamping `status`.
@@ -268,82 +221,88 @@ fn fsync(fd: RawFd, data_only: bool) -> std::io::Result<()> {
 
 // ── Backend wiring ──────────────────────────────────────────────────────────
 
-/// A bounded blocking-syscall backend with a fixed-size shared thread pool.
+/// A bounded blocking-syscall backend: one dedicated worker thread per execution lane, each draining
+/// its own `sync` submission channel (so the dispatch EDT pick-two routes work across lanes). The
+/// thread count is therefore the lane count — fixed at construction, never dynamically spawned, which
+/// is what structurally removes the `spawn_blocking` deadlock.
 ///
 /// Direct vs. buffered IO is a per-op property (the [`IoBuf`] variant the submitter chose) and a
 /// property of how each file was opened ([`crate::fs::direct::File`] with `direct: true/false`), not
 /// a backend-wide mode — so a single backend serves both buffered and `O_DIRECT` files. The op's
 /// buffer variant and the file's open flags must agree; a mismatch surfaces as the kernel's `EINVAL`
 /// on the syscall (stamped `Failed`), never silent corruption.
-pub struct SyscallBackend {
-    worker_count: usize,
-}
+pub struct SyscallBackend;
 
 impl SyscallBackend {
-    /// Build a backend with `worker_count` fixed worker threads. The pool itself is created when the
-    /// scheduler calls [`Backend::spawn_lanes`] (so the shared completion channel can be wired then).
-    pub fn new(worker_count: usize) -> Self {
-        Self {
-            worker_count: worker_count.max(1),
-        }
+    /// Build a syscall backend. One worker thread is spawned per execution lane when the scheduler
+    /// calls [`Backend::spawn_lanes`] (lane count = `Config::ring_count`).
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl Default for SyscallBackend {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
 impl Backend for SyscallBackend {
-    fn spawn_lanes(&self, setup: LaneSetup) -> Vec<LaneSubmit> {
-        // One shared completion channel for the whole pool (not per-lane): every worker pushes
-        // completed ops here, and ONE reaper drains it into the !Send completion sink. This is why an
-        // op needs no per-op completion-routing state and can flow as a bare intrusive Entry<IoOp>.
+    type Lane = LaneSubmit;
+
+    fn spawn_lanes<S: Spawner>(&self, setup: LaneSetup, spawner: &mut S) -> Vec<LaneSubmit> {
+        // One shared completion channel (not per-lane): every worker pushes completed ops here, and
+        // ONE reaper drains it into the completion sink. Completions need no per-op routing state, so
+        // they flow as bare intrusive `Entry<IoOp>`; the reaper bridges the `Send` worker threads to
+        // the `!Send` completion sink on the scheduler task.
         let (done_tx, done_rx) = sync_chan::new::<IoOp>();
-        setup.spawn.spawn(reaper(done_rx, setup.completion));
+        spawner.spawn_named("fs.syscall.reaper", reaper(done_rx, setup.completion));
 
-        // One bounded thread pool shared across all lanes.
-        let pool = Pool::new(self.worker_count, done_tx);
+        // One worker thread per lane, each owning its lane's submission-channel receiver. Workers are
+        // wrapped in a shared `Arc<[Worker]>` so the threads are joined exactly once — when the last
+        // lane handle drops — after the senders have closed the channels and the workers have exited.
+        let mut senders = Vec::with_capacity(setup.lane_count);
+        let mut workers = Vec::with_capacity(setup.lane_count);
+        for idx in 0..setup.lane_count {
+            let (tx, worker) = spawn_worker(idx, done_tx.clone());
+            senders.push(tx);
+            workers.push(worker);
+        }
+        let workers: Arc<[Worker]> = workers.into();
 
-        // Every lane submits onto the same shared pool; the LaneSubmit is just a cheap Arc handle.
-        (0..setup.lane_count)
-            .map(|_| Box::new(PoolSubmit { pool: pool.clone() }) as LaneSubmit)
+        senders
+            .into_iter()
+            .map(|tx| LaneSubmit {
+                tx,
+                _workers: workers.clone(),
+            })
             .collect()
     }
 }
 
-/// The lane's submit handle: enqueues each op onto the shared bounded pool.
-struct PoolSubmit {
-    pool: Arc<Pool>,
+/// The lane's submit handle: pushes each op onto its lane's `sync` channel (waking the lane's worker
+/// thread via the thread-park waker). Holds an `Arc` to the worker set so the threads outlive every
+/// lane handle and are joined when the last one drops.
+pub struct LaneSubmit {
+    tx: sync_chan::Sender<IoOp>,
+    _workers: Arc<[Worker]>,
 }
 
-impl UnboundedSender<Entry<IoOp>> for PoolSubmit {
+impl UnboundedSender<Entry<IoOp>> for LaneSubmit {
     fn send(&mut self, op: Entry<IoOp>) -> Result<(), Entry<IoOp>> {
-        self.pool.enqueue(op);
-        Ok(())
+        self.tx.send_entry(op)
     }
 }
 
-/// Drain the pool's shared `Send` completion channel and forward each op to the `!Send` sink.
-async fn reaper(mut done_rx: sync_chan::Receiver<IoOp>, sink: Box<dyn CompletionSink>) {
-    let mut budget = Budget::new(1 << 20);
-    core::future::poll_fn(move |cx| {
-        budget.reset();
-        loop {
-            match crate::socket::channel::Receiver::<Entry<IoOp>>::poll_recv(
-                &mut done_rx,
-                cx,
-                &mut budget,
-            ) {
-                Poll::Ready(Some(op)) => {
-                    sink.send(op);
-                    if budget.is_exhausted() {
-                        // Queue may still be non-empty; self-wake to re-poll (the receiver did not
-                        // register its waker on this drained-but-budget-spent path).
-                        cx.waker().wake_by_ref();
-                        return Poll::Pending;
-                    }
-                }
-                Poll::Ready(None) => return Poll::Ready(()),
-                Poll::Pending => return Poll::Pending,
-            }
-        }
+/// Drain the shared `Send` completion channel and forward each op to the completion sink. A `Map`
+/// combinator over the completion receiver, driven by `drain_budgeted` — the channel layer's standard
+/// task driver, not a hand-rolled poll loop. The explicit `Entry<IoOp>` closure parameter selects the
+/// single-entry `Receiver` impl (the channel also impls the batch form).
+async fn reaper(done_rx: sync_chan::Receiver<IoOp>, sink: CompletionSink) {
+    Map::new(done_rx, move |op: Entry<IoOp>| {
+        let _ = sink.send_entry(op);
     })
+    .drain_budgeted(Some(crate::fs::combinator::DRAIN_BUDGET))
     .await;
 }
 
@@ -351,13 +310,14 @@ async fn reaper(mut done_rx: sync_chan::Receiver<IoOp>, sink: Box<dyn Completion
 mod tests {
     use super::*;
     use crate::{
+        counter::Registry,
         fs::{
             config::{Config, CostModel, DeviceConfig, OpWeights, PoolMode},
             device::DeviceId,
             direct::{File, Options},
             scheduler::Scheduler,
-            SpawnHandle,
         },
+        runtime::tokio::Local,
         sched::{CreditConfig, Rate, TierPriority},
     };
     use std::rc::Rc;
@@ -387,17 +347,19 @@ mod tests {
     }
 
     /// Run a `!Send` scheduler test body on a tokio current-thread runtime + LocalSet (the real,
-    /// non-bach executor M2 needs because the worker pool runs on OS threads).
-    fn run_local<F: std::future::Future<Output = ()> + 'static>(body: impl FnOnce(SpawnHandle) -> F) {
+    /// non-bach executor M2 needs because the worker pool runs on OS threads). The body receives a
+    /// `Local` spawner (which `spawn_local`s onto the `LocalSet`) and a fresh counter `Registry`.
+    fn run_local<F, B>(body: B)
+    where
+        F: std::future::Future<Output = ()> + 'static,
+        B: FnOnce(Local, Registry) -> F,
+    {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
         let local = tokio::task::LocalSet::new();
-        let spawn = SpawnHandle::new(|fut| {
-            tokio::task::spawn_local(fut);
-        });
-        local.block_on(&rt, body(spawn));
+        local.block_on(&rt, body(Local::new(0), Registry::default()));
     }
 
     fn clock() -> crate::busy_poll::clock::Clock {
@@ -409,28 +371,46 @@ mod tests {
     #[test]
     fn write_then_read_roundtrip() {
         let path = temp_path("roundtrip");
-        let file = File::open(&path, Options { truncate: true, size: 1 << 20, direct: false }).unwrap();
+        let file = File::open(
+            &path,
+            Options {
+                truncate: true,
+                size: 1 << 20,
+                direct: false,
+            },
+        )
+        .unwrap();
         let fd = file.raw_fd();
 
-        run_local(|spawn| {
+        run_local(|mut spawn, _registry| {
             let path = path.clone();
             async move {
                 let config = Config {
                     devices: vec![byte_device(1 << 20)],
                     ring_count: 2,
-                    backend: super::super::super::config::BackendKind::Syscall,
                 };
-                let backend = SyscallBackend::new(4);
-                let scheduler = Scheduler::new(&config, &backend, spawn, clock());
+                let backend = SyscallBackend::new();
+                let scheduler = Scheduler::new(&config, &backend, &mut spawn, &_registry, clock());
                 let h = scheduler.handle();
                 let dev = DeviceId(0);
 
-                let payload = bytes::Bytes::from_static(b"the quick brown fox jumps over the lazy dog");
-                let n = h.write(dev, fd, 0, payload.clone(), TierPriority::Medium).await.unwrap();
+                let payload =
+                    bytes::Bytes::from_static(b"the quick brown fox jumps over the lazy dog");
+                let n = h
+                    .write(dev, fd, 0, payload.clone(), TierPriority::Medium)
+                    .await
+                    .unwrap();
                 assert_eq!(n, payload.len());
 
-                let buf = h.read(dev, fd, 0, payload.len() as u32, TierPriority::High).await.unwrap();
-                assert_eq!(&buf[..], &payload[..], "read-back bytes must match what was written");
+                let buf = h
+                    .read(dev, fd, 0, payload.len() as u32, TierPriority::High)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    &buf[..],
+                    &payload[..],
+                    "read-back bytes must match what was written"
+                );
 
                 // Keep the file handle alive across the IO.
                 drop(file);
@@ -446,10 +426,18 @@ mod tests {
     #[test]
     fn high_concurrency_stays_bounded_and_conserves() {
         let path = temp_path("stress");
-        let file = File::open(&path, Options { truncate: true, size: 1 << 20, direct: false }).unwrap();
+        let file = File::open(
+            &path,
+            Options {
+                truncate: true,
+                size: 1 << 20,
+                direct: false,
+            },
+        )
+        .unwrap();
         let fd = file.raw_fd();
 
-        run_local(|spawn| {
+        run_local(|mut spawn, _registry| {
             let path = path.clone();
             async move {
                 // Tiny capacity (4 KiB) + only 2 worker threads, but 32 concurrent writers each
@@ -457,10 +445,9 @@ mod tests {
                 let config = Config {
                     devices: vec![byte_device(4096)],
                     ring_count: 2,
-                    backend: super::super::super::config::BackendKind::Syscall,
                 };
-                let backend = SyscallBackend::new(2);
-                let scheduler = Scheduler::new(&config, &backend, spawn, clock());
+                let backend = SyscallBackend::new();
+                let scheduler = Scheduler::new(&config, &backend, &mut spawn, &_registry, clock());
                 let dev = DeviceId(0);
 
                 let completed = Rc::new(std::cell::Cell::new(0usize));
@@ -474,7 +461,10 @@ mod tests {
                             let data = bytes::Bytes::from(vec![(w & 0xff) as u8; 256]);
                             // Each write is 256 bytes; with 4 KiB capacity at most 16 can be admitted
                             // at once, so the rest park on credit (never on a thread).
-                            if h.write(dev, fd, off, data, TierPriority::Medium).await.is_ok() {
+                            if h.write(dev, fd, off, data, TierPriority::Medium)
+                                .await
+                                .is_ok()
+                            {
                                 completed.set(completed.get() + 1);
                             }
                         }
@@ -506,14 +496,13 @@ mod tests {
     /// past a bad fd surfaces as `Err` rather than hanging.
     #[test]
     fn bad_fd_read_fails_not_hangs() {
-        run_local(|spawn| async move {
+        run_local(|mut spawn, _registry| async move {
             let config = Config {
                 devices: vec![byte_device(1 << 16)],
                 ring_count: 1,
-                backend: super::super::super::config::BackendKind::Syscall,
             };
-            let backend = SyscallBackend::new(2);
-            let scheduler = Scheduler::new(&config, &backend, spawn, clock());
+            let backend = SyscallBackend::new();
+            let scheduler = Scheduler::new(&config, &backend, &mut spawn, &_registry, clock());
             let dev = DeviceId(0);
             let h = scheduler.handle();
 
@@ -538,20 +527,27 @@ mod tests {
         use crate::fs::direct::{AlignedBuf, ALIGNMENT};
         let path = temp_path("direct");
         // Open in direct mode (falls back to buffered on tmpfs / macOS without O_DIRECT semantics).
-        let file = File::open(&path, Options { truncate: true, size: 1 << 20, direct: true }).unwrap();
+        let file = File::open(
+            &path,
+            Options {
+                truncate: true,
+                size: 1 << 20,
+                direct: true,
+            },
+        )
+        .unwrap();
         let fd = file.raw_fd();
 
-        run_local(|spawn| {
+        run_local(|mut spawn, _registry| {
             let path = path.clone();
             async move {
                 // Capacity in bytes large enough for one block; atomic_grant makes the grant whole.
                 let config = Config {
                     devices: vec![byte_device(1 << 20)],
                     ring_count: 1,
-                    backend: super::super::super::config::BackendKind::Syscall,
                 };
-                let backend = SyscallBackend::new(2);
-                let scheduler = Scheduler::new(&config, &backend, spawn, clock());
+                let backend = SyscallBackend::new();
+                let scheduler = Scheduler::new(&config, &backend, &mut spawn, &_registry, clock());
                 let dev = DeviceId(0);
                 let h = scheduler.handle();
 
@@ -583,19 +579,97 @@ mod tests {
                 let bad = AlignedBuf::new(ALIGNMENT);
                 let err = h.read_direct(dev, fd, 1, bad, TierPriority::Medium).await;
                 assert!(
-                    matches!(err.as_ref().map_err(|e| e.kind()), Err(std::io::ErrorKind::InvalidInput)),
+                    matches!(
+                        err.as_ref().map_err(|e| e.kind()),
+                        Err(std::io::ErrorKind::InvalidInput)
+                    ),
                     "misaligned direct offset must be rejected, got {:?}",
                     err.as_ref().map(|_| ())
                 );
 
                 // A misaligned direct LENGTH must also be rejected at submit (not deep-EINVAL).
                 let bad_len = AlignedBuf::new(100); // len 100 is not block-aligned
-                let err = h.read_direct(dev, fd, 0, bad_len, TierPriority::Medium).await;
+                let err = h
+                    .read_direct(dev, fd, 0, bad_len, TierPriority::Medium)
+                    .await;
                 assert!(
-                    matches!(err.as_ref().map_err(|e| e.kind()), Err(std::io::ErrorKind::InvalidInput)),
+                    matches!(
+                        err.as_ref().map_err(|e| e.kind()),
+                        Err(std::io::ErrorKind::InvalidInput)
+                    ),
                     "misaligned direct length must be rejected, got {:?}",
                     err.as_ref().map(|_| ())
                 );
+
+                drop(file);
+                let _ = std::fs::remove_file(&path);
+            }
+        });
+    }
+
+    /// End-to-end `materialize_direct` over real `O_DIRECT` files: write block-aligned data, then
+    /// stream it back through the direct-IO materialize path and verify FIFO order + bytes. Exercises
+    /// the zero-copy `AlignedBuf` → `Bytes::from_owner` delivery and the per-device acquire reactor on
+    /// the real syscall backend (not just the bach mock).
+    #[test]
+    fn materialize_direct_streams_in_order() {
+        use crate::fs::{direct::ALIGNMENT, scheduler::BlockRef};
+        let path = temp_path("materialize-direct");
+        let file = File::open(
+            &path,
+            Options {
+                truncate: true,
+                size: 1 << 20,
+                direct: true,
+            },
+        )
+        .unwrap();
+        let fd = file.raw_fd();
+
+        // Pre-fill 8 aligned blocks with a per-block pattern (block k -> byte value k).
+        let nblocks = 8usize;
+        for k in 0..nblocks {
+            let buf = vec![k as u8; ALIGNMENT];
+            file.write_at(&buf, (k * ALIGNMENT) as u64).unwrap();
+        }
+        file.sync().unwrap();
+
+        run_local(|mut spawn, registry| {
+            let path = path.clone();
+            async move {
+                let config = Config {
+                    devices: vec![byte_device(1 << 20)],
+                    ring_count: 2,
+                };
+                let backend = SyscallBackend::new();
+                let scheduler = Scheduler::new(&config, &backend, &mut spawn, &registry, clock());
+                let dev = DeviceId(0);
+                let h = scheduler.handle();
+
+                let blocks: Vec<BlockRef> = (0..nblocks)
+                    .map(|k| BlockRef::whole(dev, fd, (k * ALIGNMENT) as u64, ALIGNMENT as u32))
+                    .collect();
+
+                let mut stream = h.materialize_direct(blocks, TierPriority::High);
+                let mut delivered = 0usize;
+                while let Some(chunk) = stream.next().await {
+                    let bytes = chunk.expect("direct block read failed");
+                    assert_eq!(bytes.len(), ALIGNMENT, "block {delivered} wrong len");
+                    assert!(
+                        bytes.iter().all(|&b| b == delivered as u8),
+                        "block {delivered} content/order mismatch"
+                    );
+                    delivered += 1;
+                }
+                assert_eq!(
+                    delivered, nblocks,
+                    "did not deliver all direct blocks in order"
+                );
+
+                let device = scheduler.devices().get(dev).unwrap();
+                for pool in device.pools.all() {
+                    assert_eq!(pool.debug_free_total(), pool.debug_capacity() as i64);
+                }
 
                 drop(file);
                 let _ = std::fs::remove_file(&path);
@@ -608,32 +682,118 @@ mod tests {
     #[test]
     fn short_read_at_eof_reports_actual_len() {
         let path = temp_path("eof");
-        let file = File::open(&path, Options { truncate: true, size: 0, direct: false }).unwrap();
+        let file = File::open(
+            &path,
+            Options {
+                truncate: true,
+                size: 0,
+                direct: false,
+            },
+        )
+        .unwrap();
         let fd = file.raw_fd();
         // Write exactly 10 bytes, then ask for 4096.
         file.write_at(b"0123456789", 0).unwrap();
         file.sync().unwrap();
 
-        run_local(|spawn| {
+        run_local(|mut spawn, _registry| {
             let path = path.clone();
             async move {
                 let config = Config {
                     devices: vec![byte_device(1 << 20)],
                     ring_count: 1,
-                    backend: super::super::super::config::BackendKind::Syscall,
                 };
-                let backend = SyscallBackend::new(2);
-                let scheduler = Scheduler::new(&config, &backend, spawn, clock());
+                let backend = SyscallBackend::new();
+                let scheduler = Scheduler::new(&config, &backend, &mut spawn, &_registry, clock());
                 let dev = DeviceId(0);
                 let h = scheduler.handle();
 
-                let buf = h.read(dev, fd, 0, 4096, TierPriority::Medium).await.unwrap();
-                assert_eq!(buf.len(), 10, "short read must report only the bytes that exist");
+                let buf = h
+                    .read(dev, fd, 0, 4096, TierPriority::Medium)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    buf.len(),
+                    10,
+                    "short read must report only the bytes that exist"
+                );
                 assert_eq!(&buf[..], b"0123456789");
 
                 drop(file);
                 let _ = std::fs::remove_file(&path);
             }
         });
+    }
+
+    /// The scheduler is a single, process-wide, `Send + Sync` object. On ONE multi-threaded runtime,
+    /// the scheduler's own (`!Send`) tasks run on a `LocalSet` while many concurrent submitter tasks
+    /// are `tokio::spawn`ed onto the multi-thread pool — which *requires* the submit futures (and the
+    /// `SubmitHandle` they capture) to be `Send`. They all share one scheduler via cheap handle
+    /// clones, the model `stream::Client`/`Arc<Endpoint>` uses.
+    #[test]
+    fn handle_shared_across_threads() {
+        let path = temp_path("mt");
+        let file = File::open(
+            &path,
+            Options {
+                truncate: true,
+                size: 1 << 20,
+                direct: false,
+            },
+        )
+        .unwrap();
+        let fd = file.raw_fd();
+
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(4)
+            .enable_all()
+            .build()
+            .unwrap();
+        let local = tokio::task::LocalSet::new();
+
+        let total = local.block_on(&rt, async move {
+            let config = Config {
+                devices: vec![byte_device(1 << 20)],
+                ring_count: 4,
+            };
+            let backend = SyscallBackend::new();
+            // The scheduler's internal tasks are !Send → the tokio `Local` spawner `spawn_local`s
+            // them onto the surrounding `LocalSet`.
+            let mut spawn = Local::new(0);
+            let registry = Registry::default();
+            let scheduler = Scheduler::new(&config, &backend, &mut spawn, &registry, clock());
+
+            // Concurrent submitters via `tokio::spawn` (multi-thread pool): this only compiles if the
+            // submit future + captured SubmitHandle are Send.
+            let threads = 8usize;
+            let per_task = 64u64;
+            let mut tasks = Vec::new();
+            for t in 0..threads {
+                let h = scheduler.handle();
+                tasks.push(tokio::spawn(async move {
+                    let mut ok = 0u64;
+                    for i in 0..per_task {
+                        let off = (t as u64 * per_task + i) * 4096;
+                        let data = bytes::Bytes::from(vec![(t & 0xff) as u8; 256]);
+                        if h.write(DeviceId(0), fd, off, data, TierPriority::Medium)
+                            .await
+                            .is_ok()
+                        {
+                            ok += 1;
+                        }
+                    }
+                    ok
+                }));
+            }
+            let mut total = 0u64;
+            for t in tasks {
+                total += t.await.unwrap();
+            }
+            total
+        });
+
+        assert_eq!(total, 8 * 64, "all cross-thread submits must complete");
+        drop(file);
+        let _ = std::fs::remove_file(&path);
     }
 }

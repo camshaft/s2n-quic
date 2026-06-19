@@ -9,14 +9,16 @@
 //! credit conservation (acquire-on-submit / release-on-complete, zero leak at quiescence).
 
 use crate::{
+    counter::Registry,
     fs::{
-        backend::mock::{Latency, MockBackend},
-        backend::{Backend, LaneSetup, LaneSubmit},
-        config::{BackendKind, Config, CostModel, DeviceConfig, OpWeights, PoolMode},
+        backend::bach::{BachBackend, Latency},
+        backend::{Backend, LaneSetup},
+        config::{Config, CostModel, DeviceConfig, OpWeights, PoolMode},
         device::DeviceId,
+        op::{IoOp, IoStatus},
         scheduler::{BlockRef, Scheduler},
-        SpawnHandle,
     },
+    runtime::Spawner,
     sched::{CreditConfig, Rate, TierPriority},
     testing::{ext::*, sim},
     time::bach::Clock,
@@ -27,68 +29,58 @@ use std::{cell::RefCell, rc::Rc};
 
 /// A backend whose lanes are immediately dead: it builds the lane submit senders but drops the
 /// matching receivers right away (modelling a lane task that failed/exited while the scheduler keeps
-/// accepting submits — e.g. a syscall/uring lane that hit a fatal error in M2/M3). `push_to_lane`'s
-/// `lane.send(...)` then returns `Err(op)` and the op (with its `flow_credits`) is dropped.
+/// accepting submits — e.g. a syscall/uring lane that hit a fatal error in M2/M3). The dispatch task's
+/// `lane.send(...)` then returns `Err(op)` and the op is routed to the completion sink stamped Failed.
 struct DeadLaneBackend;
 
 impl Backend for DeadLaneBackend {
-    fn spawn_lanes(&self, setup: LaneSetup) -> Vec<LaneSubmit> {
+    type Lane =
+        crate::socket::channel::intrusive::unsync::Sender<crate::intrusive::EntryAdapter<IoOp>>;
+
+    fn spawn_lanes<S: Spawner>(&self, setup: LaneSetup, _spawner: &mut S) -> Vec<Self::Lane> {
         let mut handles = Vec::with_capacity(setup.lane_count);
         for _ in 0..setup.lane_count {
-            let (tx, rx) =
-                crate::socket::channel::intrusive::unsync::new::<crate::fs::op::IoOp>();
+            let (tx, rx) = crate::socket::channel::intrusive::unsync::new::<IoOp>();
             // Drop the receiver immediately: the lane channel is now closed, so every send fails.
             drop(rx);
-            handles.push(Box::new(tx) as LaneSubmit);
+            handles.push(tx);
         }
         handles
     }
 }
 
-/// A backend whose lanes immediately complete every op as `Failed` (modelling a real backend whose
-/// syscall errored — e.g. EIO / O_DIRECT EINVAL). It drains its lane and routes the op straight to
-/// the completion sink with a `Failed` status, so the submit path's error mapping is exercised.
-struct FailBackend {
+/// A bach backend whose processor stamps every op `Failed` (modelling a real backend whose syscall
+/// errored — e.g. EIO / O_DIRECT EINVAL). The old dedicated `FailBackend` is now just `BachBackend`
+/// with a failing processor closure.
+fn fail_backend(
+    clock: Clock,
     kind: std::io::ErrorKind,
+) -> BachBackend<Clock, impl Fn(&mut IoOp) + Clone> {
+    BachBackend::with_processor(clock, Latency::default(), move |op: &mut IoOp| {
+        op.status = IoStatus::Failed(kind);
+    })
 }
 
-impl Backend for FailBackend {
-    fn spawn_lanes(&self, setup: LaneSetup) -> Vec<LaneSubmit> {
-        use crate::fs::op::{IoOp, IoStatus};
-        use crate::socket::channel::{intrusive::unsync, Budget, Receiver as _};
-        let mut handles = Vec::with_capacity(setup.lane_count);
-        for _ in 0..setup.lane_count {
-            let (tx, mut rx) = unsync::new::<IoOp>();
-            let completion = setup.completion.boxed_clone();
-            let err_kind = self.kind;
-            setup.spawn.spawn(async move {
-                let mut budget = Budget::new(1 << 20);
-                core::future::poll_fn(move |cx| {
-                    budget.reset();
-                    loop {
-                        match rx.poll_recv(cx, &mut budget) {
-                            core::task::Poll::Ready(Some(mut entry)) => {
-                                entry.status = IoStatus::Failed(err_kind);
-                                completion.send(entry);
-                            }
-                            core::task::Poll::Ready(None) => return core::task::Poll::Ready(()),
-                            core::task::Poll::Pending => return core::task::Poll::Pending,
-                        }
-                    }
-                })
-                .await;
-            });
-            handles.push(Box::new(tx) as LaneSubmit);
-        }
-        handles
-    }
+/// Build a scheduler over `devices` with a `Bach` backend at the given latency and `ring_count`.
+fn build(devices: Vec<DeviceConfig>, ring_count: usize, latency: Latency) -> Scheduler {
+    let config = Config {
+        devices,
+        ring_count,
+    };
+    let clock = Clock::default();
+    let backend = BachBackend::new(clock.clone(), latency);
+    let mut spawn = bach_spawner();
+    Scheduler::new(&config, &backend, &mut spawn, &Registry::default(), clock)
+}
+
+/// The bach spawner used by every sim test (drives `!Send` futures on the bach executor).
+fn bach_spawner() -> crate::runtime::bach::Local {
+    crate::runtime::bach::Local::new(0)
 }
 
 /// A submit whose op cannot be handed to its lane (closed lane channel — e.g. a syscall/uring lane
 /// that hit a fatal error in M2/M3) must (1) fail the submit promptly with `Err` rather than hang
 /// the parked future forever, and (2) release the op's borrowed credit so the pool does not leak.
-/// Before the fix, `push_to_lane` dropped the credit-bearing op silently and the submit future
-/// parked forever (the per-op completion channel cannot signal a dropped sender to the waiter).
 #[test]
 fn lane_send_failure_fails_submit_and_conserves_credit() {
     let _no_snap = crate::testing::without_snapshots();
@@ -96,10 +88,16 @@ fn lane_send_failure_fails_submit_and_conserves_credit() {
         let config = Config {
             devices: vec![iops_device(8)],
             ring_count: 1,
-            backend: BackendKind::Mock,
         };
         let clock = Clock::default();
-        let scheduler = Scheduler::new(&config, &DeadLaneBackend, bach_spawn(), clock);
+        let mut spawn = bach_spawner();
+        let scheduler = Scheduler::new(
+            &config,
+            &DeadLaneBackend,
+            &mut spawn,
+            &Registry::default(),
+            clock,
+        );
         let dev = DeviceId(0);
 
         let h = scheduler.handle();
@@ -127,45 +125,6 @@ fn lane_send_failure_fails_submit_and_conserves_credit() {
         .primary()
         .spawn();
     });
-}
-
-/// Wrap a `!Send` future so it can be handed to `bach::spawn` (which requires `Send`). Sound because
-/// bach is single-threaded and never moves a task across threads — the same shim `runtime.rs` uses.
-struct SendWrapper<F>(F);
-// SAFETY: bach executes on a single thread; the future is never sent across threads.
-unsafe impl<F> Send for SendWrapper<F> {}
-impl<F: core::future::Future> core::future::Future for SendWrapper<F> {
-    type Output = F::Output;
-    fn poll(
-        self: core::pin::Pin<&mut Self>,
-        cx: &mut core::task::Context<'_>,
-    ) -> core::task::Poll<Self::Output> {
-        unsafe {
-            core::future::Future::poll(
-                core::pin::Pin::new_unchecked(&mut self.get_unchecked_mut().0),
-                cx,
-            )
-        }
-    }
-}
-
-/// A `SpawnHandle` that drives `!Send` futures on the bach executor.
-fn bach_spawn() -> SpawnHandle {
-    SpawnHandle::new(|fut| {
-        bach::spawn(SendWrapper(fut));
-    })
-}
-
-/// Build a scheduler over `devices` with a `Mock` backend at the given latency and `ring_count`.
-fn build(devices: Vec<DeviceConfig>, ring_count: usize, latency: Latency) -> Scheduler {
-    let config = Config {
-        devices,
-        ring_count,
-        backend: BackendKind::Mock,
-    };
-    let clock = Clock::default();
-    let backend = MockBackend::new(clock.clone(), latency);
-    Scheduler::new(&config, &backend, bach_spawn(), clock)
 }
 
 /// A tiny IOPS device: `queue_depth` outstanding ops, one IOP per 4 KiB, paced generously so the
@@ -247,10 +206,6 @@ fn run_streams(
 /// free/num_waiters` round-robin should hand all four near-equal throughput.
 #[test]
 fn fair_share_within_tier() {
-    // The credit pool emits a per-op metric `trace!` for every acquire/release, so a throughput sim
-    // floods the snapshot buffer with thousands of identical counter lines (the same reason every
-    // credit-driven sim test in stream/{reader,writer} opts out). The gate here is the runtime
-    // fairness/conservation assertions, not a verbatim metric log.
     let _no_snap = crate::testing::without_snapshots();
     sim(|| {
         let counts = run_streams(
@@ -274,7 +229,6 @@ fn fair_share_within_tier() {
             );
             info!(?counts_only, min, max, "fair share within tier");
             assert!(min > 0, "a contending stream was starved within its tier");
-            // Near-equal: the spread is a small fraction of the max (FIFO round-robin rotation).
             assert!(
                 max - min <= (max / 4).max(2),
                 "unfair within tier: spread {min}..{max}"
@@ -286,9 +240,7 @@ fn fair_share_within_tier() {
 }
 
 /// Strict priority *across tiers*: with the queue depth (2) below combined demand (4), the two
-/// `High` streams should out-complete the two `Background` streams. (Strict priority can starve the
-/// lower tier under sustained higher-tier load — "head-of-line blocking by design" — so we assert
-/// dominance, not Background liveness.)
+/// `High` streams should out-complete the two `Background` streams.
 #[test]
 fn strict_priority_across_tiers() {
     let _no_snap = crate::testing::without_snapshots();
@@ -306,20 +258,26 @@ fn strict_priority_across_tiers() {
         async move {
             55.ms().sleep().await;
             let c = counts.borrow().clone();
-            let get = |name: &str| c.iter().find(|(l, _)| *l == name).map(|(_, n)| *n).unwrap_or(0);
+            let get = |name: &str| {
+                c.iter()
+                    .find(|(l, _)| *l == name)
+                    .map(|(_, n)| *n)
+                    .unwrap_or(0)
+            };
             let high = get("high-a") + get("high-b");
             let bg = get("bg-a") + get("bg-b");
             info!(high, bg, "strict priority across tiers");
-            assert!(high > bg, "High tier did not out-complete Background ({high} vs {bg})");
+            assert!(
+                high > bg,
+                "High tier did not out-complete Background ({high} vs {bg})"
+            );
         }
         .primary()
         .spawn();
     });
 }
 
-/// Device isolation: a saturated device must not steal a second device's budget. Two devices, one
-/// pounded by many streams, the other lightly used; the light device's stream should still complete
-/// at its own pace, and each device's credit conserves independently.
+/// Device isolation: a saturated device must not steal a second device's budget.
 #[test]
 fn device_isolation() {
     let _no_snap = crate::testing::without_snapshots();
@@ -330,7 +288,6 @@ fn device_isolation() {
 
         let quiet_done = Rc::new(RefCell::new(0u64));
 
-        // Four streams saturate the busy device.
         for _ in 0..4 {
             let h = scheduler.handle();
             async move {
@@ -345,7 +302,6 @@ fn device_isolation() {
             .spawn();
         }
 
-        // One stream uses the quiet device.
         {
             let h = scheduler.handle();
             let quiet_done = quiet_done.clone();
@@ -354,7 +310,10 @@ fn device_isolation() {
                 let mut offset = 0u64;
                 let mut n = 0u64;
                 while start.elapsed() < 40.ms() {
-                    if h.read(quiet, FD, offset, 4096, TierPriority::Medium).await.is_ok() {
+                    if h.read(quiet, FD, offset, 4096, TierPriority::Medium)
+                        .await
+                        .is_ok()
+                    {
                         n += 1;
                         offset += 4096;
                     }
@@ -388,14 +347,13 @@ fn device_isolation() {
     });
 }
 
-/// Ordered spray: a `materialize` stream over blocks scattered across two devices, with the mock
-/// completing blocks out of order (writes/reads of differing latency), must deliver bytes in strict
-/// FIFO order. The deterministic fill (`byte i = (offset+i) as u8`) lets us verify each block.
+/// Ordered spray: a `materialize` stream over blocks scattered across two devices, with the bach
+/// backend completing blocks out of order, must deliver bytes in strict FIFO order. The deterministic
+/// fill (`byte i = (offset+i) as u8`) lets us verify each block.
 #[test]
 fn materialize_delivers_in_order() {
     let _no_snap = crate::testing::without_snapshots();
     sim(|| {
-        // Differing per-device latency so completions arrive out of submission order.
         let latency = Latency {
             read: Duration::from_micros(100),
             write: Duration::from_micros(100),
@@ -414,12 +372,11 @@ fn materialize_delivers_in_order() {
                 })
                 .collect();
 
-            let mut stream = h.materialize(blocks.clone(), TierPriority::High, 4);
+            let mut stream = h.materialize(blocks.clone(), TierPriority::High);
             let mut delivered = 0u64;
             while let Some(chunk) = stream.next().await {
                 let buf = chunk.expect("block read failed");
                 let block = &blocks[delivered as usize];
-                // Verify FIFO: the n-th delivered block is the n-th submitted block.
                 assert_eq!(buf.len(), block.len as usize, "block {delivered} wrong len");
                 for (j, b) in buf.iter().enumerate() {
                     let expected = (block.offset.wrapping_add(j as u64) & 0xff) as u8;
@@ -435,9 +392,147 @@ fn materialize_delivers_in_order() {
     });
 }
 
+/// Cross-device head-of-line blocking: a materialize stream whose blocks alternate between a
+/// **credit-starved** device (depth 1) and a roomy one must still make progress and deliver all
+/// blocks in FIFO order. With one shared acquire slot, a block parked on the starved device's credit
+/// would block submitting the *next* block — even though its device has free credit — and the stream
+/// would crawl at the starved device's rate or wedge. The per-device acquire slots let the roomy
+/// device's blocks submit while the starved device's block is parked.
+#[test]
+fn materialize_cross_device_no_hol() {
+    let _no_snap = crate::testing::without_snapshots();
+    sim(|| {
+        // Device 0: depth 1 (one op in flight at a time) — the credit-starved device. Device 1:
+        // depth 8 — roomy. Equal latency so ordering is driven by submission, not completion time.
+        let latency = Latency {
+            read: Duration::from_micros(100),
+            write: Duration::from_micros(100),
+            per_byte_nanos: 0,
+        };
+        let scheduler = build(vec![iops_device(1), iops_device(8)], 2, latency);
+        let h = scheduler.handle();
+        let devices = scheduler.devices().clone();
+        async move {
+            // 20 blocks alternating devices; device 0 (even indices) is depth-1 so its blocks must
+            // serialize, while device 1 (odd indices) can have many in flight at once.
+            let blocks: Vec<BlockRef> = (0..20u64)
+                .map(|i| BlockRef::whole(DeviceId((i % 2) as u32), FD, i * 1024, 1024))
+                .collect();
+
+            let mut stream = h.materialize(blocks.clone(), TierPriority::High);
+            let mut delivered = 0u64;
+            while let Some(chunk) = stream.next().await {
+                let buf = chunk.expect("block read failed");
+                let block = &blocks[delivered as usize];
+                assert_eq!(buf.len(), block.len as usize, "block {delivered} wrong len");
+                for (j, b) in buf.iter().enumerate() {
+                    let expected = (block.offset.wrapping_add(j as u64) & 0xff) as u8;
+                    assert_eq!(*b, expected, "block {delivered} byte {j} out of order");
+                }
+                delivered += 1;
+            }
+            assert_eq!(delivered, 20, "did not deliver all blocks across devices");
+            // Conservation across both pools at quiescence.
+            for (id, device) in devices.iter() {
+                for pool in device.pools.all() {
+                    assert_eq!(
+                        pool.debug_free_total(),
+                        pool.debug_capacity() as i64,
+                        "credit leak on device {id:?}"
+                    );
+                }
+            }
+            info!(
+                delivered,
+                "materialize: cross-device delivered in order, no HOL wedge"
+            );
+        }
+        .primary()
+        .spawn();
+    });
+}
+
+/// ADVERSARIAL REPRO (case #7): dropping a `MaterializeStream` mid-spray — with some blocks in
+/// flight (credit on `op.flow_credits`, awaiting backend completion) and some parked on a starved
+/// device's credit — must conserve credit at quiescence. On drop:
+///   * every `DeviceSlot`'s `SubmitterAlloc` releases any residual `pending_credits` (parked grant),
+///   * `ToSubmit` slots hold no credit (acquired only on enqueue), so they release nothing,
+///   * in-flight ops still complete through the backend → dispatcher, which releases their credit
+///     BEFORE discarding the completion onto the now-dead `completion_rx` (receiver_alive == false).
+/// If the dispatcher released after the dead-receiver check, or if a residual alloc grant were
+/// abandoned without release, this would leak. Assert the pools return to full capacity.
+#[test]
+fn materialize_drop_mid_spray_conserves_credit() {
+    let _no_snap = crate::testing::without_snapshots();
+    sim(|| {
+        // Non-trivial latency so ops stay in flight across the drop; device 0 is depth-1 (starved,
+        // forces parked-on-credit ToSubmit blocks), device 1 is roomy (many in flight).
+        let latency = Latency {
+            read: Duration::from_micros(500),
+            write: Duration::from_micros(500),
+            per_byte_nanos: 0,
+        };
+        let scheduler = build(vec![iops_device(1), iops_device(8)], 2, latency);
+        let h = scheduler.handle();
+        let devices = scheduler.devices().clone();
+        async move {
+            // 40 blocks alternating devices: device 0 (even) serializes at depth 1, device 1 (odd)
+            // piles up in flight. More blocks than either pool depth, so at the drop point there are
+            // both in-flight ops and ToSubmit blocks parked on device 0's credit.
+            let blocks: Vec<BlockRef> = (0..40u64)
+                .map(|i| BlockRef::whole(DeviceId((i % 2) as u32), FD, i * 1024, 1024))
+                .collect();
+
+            let mut stream = h.materialize(blocks, TierPriority::High);
+            // Deliver a few blocks to drive the spray into steady state (ops in flight + parked),
+            // then drop the stream mid-flight.
+            let mut delivered = 0u64;
+            while delivered < 4 {
+                match stream.next().await {
+                    Some(Ok(_)) => delivered += 1,
+                    Some(Err(e)) => panic!("unexpected block error: {e}"),
+                    None => break,
+                }
+            }
+            // Prove the drop is genuinely mid-flight: at least one pool has credit out (in-flight
+            // ops + parked-on-credit ToSubmit blocks), so this exercises the release-on-late-
+            // completion path rather than a quiescent no-op drop.
+            let in_flight = devices.iter().any(|(_, device)| {
+                device
+                    .pools
+                    .all()
+                    .any(|pool| pool.debug_free_total() < pool.debug_capacity() as i64)
+            });
+            assert!(
+                in_flight,
+                "test precondition: expected credit in flight at drop point"
+            );
+            drop(stream);
+
+            // Let any in-flight ops complete (their completions route to the dropped receiver, but
+            // the dispatcher releases their credit first) and the dropped allocs release residuals.
+            10.ms().sleep().await;
+
+            for (id, device) in devices.iter() {
+                for pool in device.pools.all() {
+                    let free = pool.debug_free_total();
+                    let cap = pool.debug_capacity() as i64;
+                    info!(?id, free, cap, "drop-mid-spray conservation check");
+                    assert_eq!(
+                        free, cap,
+                        "credit leaked on device {id:?} after mid-spray drop"
+                    );
+                }
+            }
+            info!("materialize: drop mid-spray conserved credit");
+        }
+        .primary()
+        .spawn();
+    });
+}
+
 /// A backend completion of `Failed` must surface as `Err` from `read()`/`write()` — never as `Ok`
-/// with a bogus buffer. (Before the fix, `read()` ignored `op.status` and returned the empty/short
-/// buffer, which `materialize` would then reassemble and deliver as if valid.)
+/// with a bogus buffer.
 #[test]
 fn failed_completion_surfaces_as_err() {
     let _no_snap = crate::testing::without_snapshots();
@@ -445,13 +540,11 @@ fn failed_completion_surfaces_as_err() {
         let config = Config {
             devices: vec![iops_device(8)],
             ring_count: 1,
-            backend: BackendKind::Mock,
         };
         let clock = Clock::default();
-        let backend = FailBackend {
-            kind: std::io::ErrorKind::Other,
-        };
-        let scheduler = Scheduler::new(&config, &backend, bach_spawn(), clock);
+        let backend = fail_backend(clock.clone(), std::io::ErrorKind::Other);
+        let mut spawn = bach_spawner();
+        let scheduler = Scheduler::new(&config, &backend, &mut spawn, &Registry::default(), clock);
         let dev = DeviceId(0);
 
         let h = scheduler.handle();
@@ -460,10 +553,15 @@ fn failed_completion_surfaces_as_err() {
             let read = h.read(dev, FD, 0, 4096, TierPriority::Medium).await;
             assert!(read.is_err(), "failed read must surface as Err, got Ok");
             let write = h
-                .write(dev, FD, 0, bytes::Bytes::from_static(b"abcd"), TierPriority::Medium)
+                .write(
+                    dev,
+                    FD,
+                    0,
+                    bytes::Bytes::from_static(b"abcd"),
+                    TierPriority::Medium,
+                )
                 .await;
             assert!(write.is_err(), "failed write must surface as Err, got Ok");
-            // Credit still conserves on the failure path (dispatcher releases on the failed op).
             let device = devices.get(dev).unwrap();
             for pool in device.pools.all() {
                 assert_eq!(
@@ -480,8 +578,7 @@ fn failed_completion_surfaces_as_err() {
 }
 
 /// An op whose credit cost exceeds its device pool capacity must fail fast with `Err`, not park
-/// forever (an atomic `IoOp` has no partial-submit escape). With a 4-IOP pool and a 4 KiB IO unit, a
-/// 64 KiB read costs 16 IOPS > 4 and must be rejected immediately.
+/// forever (an atomic `IoOp` has no partial-submit escape).
 #[test]
 fn oversize_op_fails_fast() {
     let _no_snap = crate::testing::without_snapshots();
@@ -490,7 +587,6 @@ fn oversize_op_fails_fast() {
         let dev = DeviceId(0);
         let h = scheduler.handle();
         async move {
-            // 64 KiB / 4 KiB = 16 IOPS, well above the queue depth of 4.
             let result = h.read(dev, FD, 0, 64 * 1024, TierPriority::Medium).await;
             assert!(
                 matches!(

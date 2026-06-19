@@ -136,35 +136,26 @@ impl DeviceConfig {
     }
 }
 
-/// Which backend executes admitted ops.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum BackendKind {
-    /// Deterministic in-memory backend for bach tests (M1).
-    Mock,
-    /// Bounded blocking pread/pwrite thread pool (M2).
-    Syscall,
-    /// io_uring, one ring per worker (M3).
-    Uring,
-}
-
 /// Top-level scheduler configuration.
+///
+/// The execution backend is *not* named here: like the network stack (where the socket
+/// implementation is a concrete type handed to the endpoint, not an enum), the backend is chosen by
+/// passing a concrete [`Backend`](crate::fs::backend::Backend) impl to
+/// [`Scheduler::new`](crate::fs::scheduler::Scheduler::new).
 #[derive(Clone, Debug)]
 pub struct Config {
     /// One entry per device; the index is the [`crate::fs::device::DeviceId`].
     pub devices: Vec<DeviceConfig>,
     /// Number of execution lanes (worker rings / shared-pool slots). Decoupled from device count.
     pub ring_count: usize,
-    /// Which backend to run.
-    pub backend: BackendKind,
 }
 
 impl Config {
-    /// A single-device, single-lane mock config for tests.
-    pub fn mock_single(device: DeviceConfig) -> Self {
+    /// A single-device, single-lane config for tests.
+    pub fn single(device: DeviceConfig) -> Self {
         Self {
             devices: vec![device],
             ring_count: 1,
-            backend: BackendKind::Mock,
         }
     }
 }
