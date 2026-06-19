@@ -38,8 +38,7 @@ use crate::{
 use core::{
     future::Future,
     pin::Pin,
-    task::{Context, Poll},
-    task::Waker,
+    task::{Context, Poll, Waker},
 };
 use std::collections::VecDeque;
 
@@ -111,11 +110,12 @@ where
             loop {
                 // Disambiguate: the `sync` receiver impls `Receiver` for both `Entry<T>` and
                 // `Queue<T>`; we want the single-entry form.
-                let polled = crate::sched::Receiver::<crate::intrusive::Entry<Registration>>::poll_recv(
-                    &mut this.rx,
-                    cx,
-                    &mut this.budget,
-                );
+                let polled =
+                    crate::sched::Receiver::<crate::intrusive::Entry<Registration>>::poll_recv(
+                        &mut this.rx,
+                        cx,
+                        &mut this.budget,
+                    );
                 match polled {
                     Poll::Ready(Some(entry)) => {
                         let Registration { pool } = entry.into_inner();

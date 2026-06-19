@@ -268,10 +268,7 @@ where
         );
         let mut progress = false;
         loop {
-            let Some(&idx) = self.devices[dev]
-                .as_ref()
-                .and_then(|s| s.to_submit.front())
-            else {
+            let Some(&idx) = self.devices[dev].as_ref().and_then(|s| s.to_submit.front()) else {
                 return progress;
             };
             let pos = (idx - self.base) as usize;
@@ -287,12 +284,12 @@ where
                 }
             };
 
-            match self.devices[dev]
-                .as_mut()
-                .unwrap()
-                .alloc
-                .poll_acquire(cx, &pool, cost, self.priority)
-            {
+            match self.devices[dev].as_mut().unwrap().alloc.poll_acquire(
+                cx,
+                &pool,
+                cost,
+                self.priority,
+            ) {
                 Poll::Ready(Ok(())) => {
                     let slot = self.devices[dev].as_mut().unwrap();
                     let granted = slot.alloc.take_all();

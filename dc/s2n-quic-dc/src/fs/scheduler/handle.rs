@@ -59,7 +59,15 @@ impl SubmitHandle {
             // and `set_len`s to bytes read. No allocation or memset happens inside the backend.
             let buf = bytes::BytesMut::with_capacity(len as usize);
             let op = handle
-                .submit(IoKind::Read, device, fd, offset, len, IoBuf::Read(buf), priority)
+                .submit(
+                    IoKind::Read,
+                    device,
+                    fd,
+                    offset,
+                    len,
+                    IoBuf::Read(buf),
+                    priority,
+                )
                 .await?;
             match op.buf {
                 IoBuf::Read(buf) => Ok(buf),
@@ -82,7 +90,15 @@ impl SubmitHandle {
         async move {
             let len = data.len() as u32;
             let op = handle
-                .submit(IoKind::Write, device, fd, offset, len, IoBuf::Write(data), priority)
+                .submit(
+                    IoKind::Write,
+                    device,
+                    fd,
+                    offset,
+                    len,
+                    IoBuf::Write(data),
+                    priority,
+                )
                 .await?;
             match op.status {
                 IoStatus::Done(n) => Ok(n),
@@ -108,7 +124,15 @@ impl SubmitHandle {
         async move {
             let len = buf.len() as u32;
             let op = handle
-                .submit(IoKind::Read, device, fd, offset, len, IoBuf::Direct(buf), priority)
+                .submit(
+                    IoKind::Read,
+                    device,
+                    fd,
+                    offset,
+                    len,
+                    IoBuf::Direct(buf),
+                    priority,
+                )
                 .await?;
             match (op.status, op.buf) {
                 (IoStatus::Done(n), IoBuf::Direct(buf)) => Ok((buf, n)),
@@ -133,7 +157,15 @@ impl SubmitHandle {
         async move {
             let len = buf.len() as u32;
             let op = handle
-                .submit(IoKind::Write, device, fd, offset, len, IoBuf::Direct(buf), priority)
+                .submit(
+                    IoKind::Write,
+                    device,
+                    fd,
+                    offset,
+                    len,
+                    IoBuf::Direct(buf),
+                    priority,
+                )
                 .await?;
             match (op.status, op.buf) {
                 (IoStatus::Done(n), IoBuf::Direct(buf)) => Ok((buf, n)),
@@ -219,7 +251,9 @@ impl SubmitHandle {
         let granted = alloc.take_all();
         debug_assert!(granted >= cost, "acquire returned less than cost");
 
-        self.enqueue(kind, &device, fd, offset, len, buf, completion, user_data, granted)
+        self.enqueue(
+            kind, &device, fd, offset, len, buf, completion, user_data, granted,
+        )
     }
 
     /// Validate a prospective op against `device` and resolve the pool it draws from plus its credit
@@ -243,9 +277,11 @@ impl SubmitHandle {
             device.origin == self.inner.origin,
             "io scheduler: device was registered with a different Scheduler than this handle"
         );
-        device.prepare(kind, offset, len, is_direct).inspect_err(|_| {
-            device.counters.rejected.add(1);
-        })
+        device
+            .prepare(kind, offset, len, is_direct)
+            .inspect_err(|_| {
+                device.counters.rejected.add(1);
+            })
     }
 
     /// Build an admitted op (credit already `granted`) carrying its `Arc<Device>` and push it into
@@ -310,7 +346,12 @@ impl SubmitHandle {
     where
         I: IntoIterator<Item = BlockRef>,
     {
-        crate::fs::materialize::MaterializeStream::new(self.clone(), blocks.into_iter(), priority, false)
+        crate::fs::materialize::MaterializeStream::new(
+            self.clone(),
+            blocks.into_iter(),
+            priority,
+            false,
+        )
     }
 
     /// Like [`materialize`](Self::materialize) but issues **zero-copy `O_DIRECT`** reads into
@@ -324,7 +365,12 @@ impl SubmitHandle {
     where
         I: IntoIterator<Item = BlockRef>,
     {
-        crate::fs::materialize::MaterializeStream::new(self.clone(), blocks.into_iter(), priority, true)
+        crate::fs::materialize::MaterializeStream::new(
+            self.clone(),
+            blocks.into_iter(),
+            priority,
+            true,
+        )
     }
 
     /// Number of execution lanes.

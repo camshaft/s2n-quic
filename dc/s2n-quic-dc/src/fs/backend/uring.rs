@@ -502,7 +502,12 @@ fn ring_loop(
 }
 
 /// Push the eventfd poll SQE if not currently armed. Returns whether it is armed after the call.
-fn push_eventfd_poll(ring: &mut IoUring, efd: &EventFd, already_armed: bool, multishot: bool) -> bool {
+fn push_eventfd_poll(
+    ring: &mut IoUring,
+    efd: &EventFd,
+    already_armed: bool,
+    multishot: bool,
+) -> bool {
     if already_armed {
         return true;
     }

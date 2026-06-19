@@ -148,7 +148,9 @@ impl core::fmt::Debug for Device {
     /// Minimal — `IoOp` derives `Debug` and carries `Arc<Device>`, but the pools/cost model are not
     /// usefully printable. Show the label only.
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("Device").field("label", &self.label).finish()
+        f.debug_struct("Device")
+            .field("label", &self.label)
+            .finish()
     }
 }
 
@@ -241,7 +243,10 @@ impl Device {
         // The end offset (`offset + len`) must fit in a signed `off_t`: the backends compute
         // `offset + done` and cast to `libc::off_t`, so an end past `i64::MAX` would wrap to a
         // negative offset (kernel `EINVAL`, surfaced confusingly as a `Failed` op). Reject up front.
-        if offset.checked_add(len as u64).is_none_or(|end| end > i64::MAX as u64) {
+        if offset
+            .checked_add(len as u64)
+            .is_none_or(|end| end > i64::MAX as u64)
+        {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "io scheduler: offset + len exceeds i64::MAX",
@@ -302,4 +307,3 @@ fn atomic_grant(config: crate::sched::CreditConfig) -> crate::sched::CreditConfi
     let caps = config.max_single_acquire;
     config.with_min_grant_slice_per_priority(caps)
 }
-

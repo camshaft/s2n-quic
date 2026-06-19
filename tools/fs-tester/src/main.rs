@@ -264,9 +264,15 @@ async fn run_one(
                 .is_ok()
         }
     } else if is_read {
-        h.read(dev.clone(), fd.clone(), offset, op_size as u32, Priority::Medium)
-            .await
-            .is_ok()
+        h.read(
+            dev.clone(),
+            fd.clone(),
+            offset,
+            op_size as u32,
+            Priority::Medium,
+        )
+        .await
+        .is_ok()
     } else {
         let data = bytes::Bytes::from(vec![0u8; op_size]);
         h.write(dev.clone(), fd.clone(), offset, data, Priority::Medium)

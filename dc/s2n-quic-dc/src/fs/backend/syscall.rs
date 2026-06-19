@@ -396,15 +396,17 @@ mod tests {
     #[test]
     fn write_then_read_roundtrip() {
         let path = temp_path("roundtrip");
-        let file = std::sync::Arc::new(File::open(
-            &path,
-            Options {
-                truncate: true,
-                size: 1 << 20,
-                direct: false,
-            },
-        )
-        .unwrap());
+        let file = std::sync::Arc::new(
+            File::open(
+                &path,
+                Options {
+                    truncate: true,
+                    size: 1 << 20,
+                    direct: false,
+                },
+            )
+            .unwrap(),
+        );
         let fd = crate::fs::op::Fd::new(file.clone());
 
         run_local(|mut spawn, registry| {
@@ -416,13 +418,25 @@ mod tests {
                 let payload =
                     bytes::Bytes::from_static(b"the quick brown fox jumps over the lazy dog");
                 let n = h
-                    .write(dev.clone(), fd.clone(), 0, payload.clone(), TierPriority::Medium)
+                    .write(
+                        dev.clone(),
+                        fd.clone(),
+                        0,
+                        payload.clone(),
+                        TierPriority::Medium,
+                    )
                     .await
                     .unwrap();
                 assert_eq!(n, payload.len());
 
                 let buf = h
-                    .read(dev.clone(), fd.clone(), 0, payload.len() as u32, TierPriority::High)
+                    .read(
+                        dev.clone(),
+                        fd.clone(),
+                        0,
+                        payload.len() as u32,
+                        TierPriority::High,
+                    )
                     .await
                     .unwrap();
                 assert_eq!(
@@ -445,15 +459,17 @@ mod tests {
     #[test]
     fn high_concurrency_stays_bounded_and_conserves() {
         let path = temp_path("stress");
-        let file = std::sync::Arc::new(File::open(
-            &path,
-            Options {
-                truncate: true,
-                size: 1 << 20,
-                direct: false,
-            },
-        )
-        .unwrap());
+        let file = std::sync::Arc::new(
+            File::open(
+                &path,
+                Options {
+                    truncate: true,
+                    size: 1 << 20,
+                    direct: false,
+                },
+            )
+            .unwrap(),
+        );
         let fd = crate::fs::op::Fd::new(file.clone());
 
         run_local(|mut spawn, registry| {
@@ -514,7 +530,9 @@ mod tests {
 
             // fd -1 is never valid: the pread fails with EBADF and must surface as Err promptly.
             let bad = crate::fs::op::Fd::new(Arc::new(BadFd));
-            let result = h.read(dev.clone(), bad, 0, 4096, TierPriority::Medium).await;
+            let result = h
+                .read(dev.clone(), bad, 0, 4096, TierPriority::Medium)
+                .await;
             assert!(result.is_err(), "read on a bad fd must fail, not hang");
 
             // Conservation holds on the failure path too.
@@ -531,15 +549,17 @@ mod tests {
         use crate::fs::direct::{AlignedBuf, ALIGNMENT};
         let path = temp_path("direct");
         // Open in direct mode (falls back to buffered on tmpfs / macOS without O_DIRECT semantics).
-        let file = std::sync::Arc::new(File::open(
-            &path,
-            Options {
-                truncate: true,
-                size: 1 << 20,
-                direct: true,
-            },
-        )
-        .unwrap());
+        let file = std::sync::Arc::new(
+            File::open(
+                &path,
+                Options {
+                    truncate: true,
+                    size: 1 << 20,
+                    direct: true,
+                },
+            )
+            .unwrap(),
+        );
         let fd = crate::fs::op::Fd::new(file.clone());
 
         run_local(|mut spawn, registry| {
@@ -575,7 +595,9 @@ mod tests {
 
                 // A misaligned offset must be rejected before any IO.
                 let bad = AlignedBuf::new(ALIGNMENT);
-                let err = h.read_direct(dev.clone(), fd.clone(), 1, bad, TierPriority::Medium).await;
+                let err = h
+                    .read_direct(dev.clone(), fd.clone(), 1, bad, TierPriority::Medium)
+                    .await;
                 assert!(
                     matches!(
                         err.as_ref().map_err(|e| e.kind()),
@@ -613,15 +635,17 @@ mod tests {
     fn materialize_direct_streams_in_order() {
         use crate::fs::{direct::ALIGNMENT, scheduler::BlockRef};
         let path = temp_path("materialize-direct");
-        let file = std::sync::Arc::new(File::open(
-            &path,
-            Options {
-                truncate: true,
-                size: 1 << 20,
-                direct: true,
-            },
-        )
-        .unwrap());
+        let file = std::sync::Arc::new(
+            File::open(
+                &path,
+                Options {
+                    truncate: true,
+                    size: 1 << 20,
+                    direct: true,
+                },
+            )
+            .unwrap(),
+        );
         let fd = crate::fs::op::Fd::new(file.clone());
 
         // Pre-fill 8 aligned blocks with a per-block pattern (block k -> byte value k).
@@ -640,7 +664,12 @@ mod tests {
 
                 let blocks: Vec<BlockRef> = (0..nblocks)
                     .map(|k| {
-                        BlockRef::whole(dev.clone(), fd.clone(), (k * ALIGNMENT) as u64, ALIGNMENT as u32)
+                        BlockRef::whole(
+                            dev.clone(),
+                            fd.clone(),
+                            (k * ALIGNMENT) as u64,
+                            ALIGNMENT as u32,
+                        )
                     })
                     .collect();
 
@@ -673,15 +702,17 @@ mod tests {
     #[test]
     fn short_read_at_eof_reports_actual_len() {
         let path = temp_path("eof");
-        let file = std::sync::Arc::new(File::open(
-            &path,
-            Options {
-                truncate: true,
-                size: 0,
-                direct: false,
-            },
-        )
-        .unwrap());
+        let file = std::sync::Arc::new(
+            File::open(
+                &path,
+                Options {
+                    truncate: true,
+                    size: 0,
+                    direct: false,
+                },
+            )
+            .unwrap(),
+        );
         let fd = crate::fs::op::Fd::new(file.clone());
         // Write exactly 10 bytes, then ask for 4096.
         file.write_at(b"0123456789", 0).unwrap();
@@ -718,15 +749,17 @@ mod tests {
     #[test]
     fn handle_shared_across_threads() {
         let path = temp_path("mt");
-        let file = std::sync::Arc::new(File::open(
-            &path,
-            Options {
-                truncate: true,
-                size: 1 << 20,
-                direct: false,
-            },
-        )
-        .unwrap());
+        let file = std::sync::Arc::new(
+            File::open(
+                &path,
+                Options {
+                    truncate: true,
+                    size: 1 << 20,
+                    direct: false,
+                },
+            )
+            .unwrap(),
+        );
         let fd = crate::fs::op::Fd::new(file.clone());
 
         let rt = tokio::runtime::Builder::new_multi_thread()

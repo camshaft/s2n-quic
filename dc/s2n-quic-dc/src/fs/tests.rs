@@ -129,7 +129,9 @@ fn lane_send_failure_fails_submit_and_conserves_credit() {
             // promptly (not hang). `.await` directly — if the future hung, the sim would never
             // reach quiescence and the test would time out.
             for i in 0..5u64 {
-                let result = h.read(dev.clone(), fd(), i * 4096, 4096, TierPriority::Medium).await;
+                let result = h
+                    .read(dev.clone(), fd(), i * 4096, 4096, TierPriority::Medium)
+                    .await;
                 assert!(
                     result.is_err(),
                     "submit to a closed lane must fail, not succeed or hang"
@@ -274,7 +276,10 @@ fn run_streams(
             let start = bach::time::Instant::now();
             let mut offset = 0u64;
             while start.elapsed() < window {
-                if h.read(dev.clone(), fd(), offset, 4096, priority).await.is_ok() {
+                if h.read(dev.clone(), fd(), offset, 4096, priority)
+                    .await
+                    .is_ok()
+                {
                     done += 1;
                     offset += 4096;
                 }
@@ -381,7 +386,8 @@ fn strict_priority_across_tiers() {
 fn device_isolation() {
     let _no_snap = crate::testing::without_snapshots();
     sim(|| {
-        let (scheduler, devices) = build(vec![iops_device(2), iops_device(2)], 2, Latency::default());
+        let (scheduler, devices) =
+            build(vec![iops_device(2), iops_device(2)], 2, Latency::default());
         let busy = devices[0].clone();
         let quiet = devices[1].clone();
 
@@ -394,7 +400,9 @@ fn device_isolation() {
                 let start = bach::time::Instant::now();
                 let mut offset = 0u64;
                 while start.elapsed() < 40.ms() {
-                    let _ = h.read(busy.clone(), fd(), offset, 4096, TierPriority::Medium).await;
+                    let _ = h
+                        .read(busy.clone(), fd(), offset, 4096, TierPriority::Medium)
+                        .await;
                     offset += 4096;
                 }
             }
@@ -628,7 +636,9 @@ fn failed_completion_surfaces_as_err() {
 
         let h = scheduler.handle();
         async move {
-            let read = h.read(dev.clone(), fd(), 0, 4096, TierPriority::Medium).await;
+            let read = h
+                .read(dev.clone(), fd(), 0, 4096, TierPriority::Medium)
+                .await;
             assert!(read.is_err(), "failed read must surface as Err, got Ok");
             let write = h
                 .write(
@@ -658,7 +668,9 @@ fn oversize_op_fails_fast() {
         let dev = devices[0].clone();
         let h = scheduler.handle();
         async move {
-            let result = h.read(dev.clone(), fd(), 0, 64 * 1024, TierPriority::Medium).await;
+            let result = h
+                .read(dev.clone(), fd(), 0, 64 * 1024, TierPriority::Medium)
+                .await;
             assert!(
                 matches!(
                     result.as_ref().map_err(|e| e.kind()),

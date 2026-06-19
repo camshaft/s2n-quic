@@ -156,11 +156,7 @@ impl Scheduler {
         let (submission_tx, submission_rx) = sync_chan::new::<crate::fs::op::IoOp>();
         spawner.spawn_named(
             "fs.dispatch",
-            dispatch::dispatch_loop(
-                submission_rx,
-                lanes,
-                crate::time::DefaultClock::default(),
-            ),
+            dispatch::dispatch_loop(submission_rx, lanes, crate::time::DefaultClock::default()),
         );
 
         Self {
@@ -204,7 +200,10 @@ impl Scheduler {
 
         // Register each pool's gauges and hand its distributor work to the registrar.
         for (pool_idx, pool) in device.pools.all().enumerate() {
-            pool.register_gauges(&inner.registry, &format!("fs.credit.{label}.pool{pool_idx}"));
+            pool.register_gauges(
+                &inner.registry,
+                &format!("fs.credit.{label}.pool{pool_idx}"),
+            );
             let reg = registrar::Registration { pool: pool.clone() };
             if inner.registration.send_entry(Entry::new(reg)).is_err() {
                 return Err(std::io::Error::new(

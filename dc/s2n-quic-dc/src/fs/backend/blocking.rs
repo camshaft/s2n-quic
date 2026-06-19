@@ -197,7 +197,9 @@ mod tests {
     use super::*;
     use crate::{
         intrusive::Entry,
-        socket::channel::{intrusive::sync as sync_chan, Map, ReceiverExt as _, UnboundedSender as _},
+        socket::channel::{
+            intrusive::sync as sync_chan, Map, ReceiverExt as _, UnboundedSender as _,
+        },
     };
     use std::sync::atomic::AtomicU64;
 
