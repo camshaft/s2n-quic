@@ -686,6 +686,46 @@ impl Writer {
         self.0.poll_write_from(cx, slot, buf, is_fin)
     }
 
+    /// Polls whether the peer still wants this stream's data.
+    ///
+    /// - [`Poll::Pending`] while the peer is still interested. The current task's waker is
+    ///   registered so a later cancellation, reset, or peer-death wakes it — no read or write is
+    ///   required to observe the signal.
+    /// - [`Poll::Ready`] once the peer has cancelled (sent `STOP_SENDING` by dropping its reader
+    ///   before FIN), the stream was reset, or the connection died (idle timeout / transmission
+    ///   failure). The yielded [`io::Error`] is the same one a [`poll_write_from`](Self::poll_write_from)
+    ///   would surface for that condition.
+    ///
+    /// This never resolves "still alive" — that is the [`Poll::Pending`] state — so the future
+    /// yields an [`io::Error`] directly rather than an [`io::Result`], leaving no `Ok` arm to handle.
+    ///
+    /// # Task affinity (contract)
+    ///
+    /// This shares the writer's single control- and completion-channel waker slots with the write
+    /// path. It MUST be polled from the same task that performs writes — typically as one branch of
+    /// a `tokio::select!` alongside the producing future. `&mut Writer` enforces this: a concurrent
+    /// `poll_write_*` from another task is impossible because both need `&mut self`, and within one
+    /// task all branches share a single waker.
+    pub fn poll_peer_cancellation(&mut self, cx: &mut Context) -> Poll<io::Error> {
+        self.0.poll_peer_cancellation(cx)
+    }
+
+    /// Awaitable form of [`poll_peer_cancellation`](Self::poll_peer_cancellation).
+    ///
+    /// Resolves to the [`io::Error`] describing why the peer was lost, so a producer can race it
+    /// against the future that produces data:
+    ///
+    /// ```ignore
+    /// tokio::select! {
+    ///     biased;
+    ///     item = gather_next_item() => { /* send it */ }
+    ///     err  = writer.peer_cancellation() => return Err(err.into()),
+    /// }
+    /// ```
+    pub async fn peer_cancellation(&mut self) -> io::Error {
+        core::future::poll_fn(|cx| self.poll_peer_cancellation(cx)).await
+    }
+
     /// Locally half-closes the write side of the stream.
     ///
     /// This is the explicit half-close operation for the write side.
@@ -1096,6 +1136,58 @@ impl Inner {
         let written = self.send_data(buf, is_fin)?;
 
         Poll::Ready(Ok(written))
+    }
+
+    fn poll_peer_cancellation(&mut self, cx: &mut Context) -> Poll<io::Error> {
+        // Intentionally NOT wrapped in `coop::poll`: this is a status probe that produces no
+        // frames, so a coop self-wake under budget pressure would busy-spin the caller's `select!`
+        // with nothing to advance. It does not touch `self.coop` at all. The waker contract is
+        // still satisfied — the inner body registers real channel wakers on its `Pending` paths —
+        // and `debug_assert_contract` enforces it in debug builds.
+        waker::debug_assert_contract(cx, |cx| self.poll_peer_cancellation_inner(cx))
+    }
+
+    fn poll_peer_cancellation_inner(&mut self, cx: &mut Context) -> Poll<io::Error> {
+        // Already terminal: report immediately and register no waker. A reset code means the peer
+        // cancelled (or the connection failed); its absence means we closed our own write side, so
+        // there is nothing left for the peer to cancel.
+        if self.status.is_shutdown() {
+            if let Some(error_code) = self.reset_error_code {
+                let reset_error: Error = error_code.into();
+                return Poll::Ready(io::Error::new(io::ErrorKind::ConnectionReset, reset_error));
+            }
+            return Poll::Ready(io::Error::from(io::ErrorKind::BrokenPipe));
+        }
+        if self.status.is_fin_sent() {
+            return Poll::Ready(io::Error::from(io::ErrorKind::BrokenPipe));
+        }
+
+        // Failure completions (PeerDead / TransmissionError / Cancelled / UnknownPathSecret).
+        // `poll_completions` registers the completion-channel waker on its internal `Pending` path.
+        if let Err(e) = self.poll_completions(cx) {
+            return Poll::Ready(e);
+        }
+
+        // Control queue. `poll_remote_budget` is the only place a `msg::Control::Reset` (the peer's
+        // STOP_SENDING) is observed, and it also applies MAX_DATA into the persistent monotonic
+        // `remote_max_data`, so draining it here advances exactly the state a write would — it is
+        // not lossy for a later write.
+        match self.poll_remote_budget(cx) {
+            // Drained a non-reset control batch (MAX_DATA / Frames). `poll_swap` only re-registers
+            // the waker on its `Ready(Ok)` path when the queue was non-empty, leaving it
+            // unregistered against the now-empty queue. Re-poll once so an empty queue takes the
+            // `Pending` arm and registers the waker; a back-to-back reset is caught as `Ready(Err)`.
+            Poll::Ready(Ok(())) => match self.poll_remote_budget(cx) {
+                Poll::Ready(Ok(())) => {}
+                Poll::Ready(Err(e)) => return Poll::Ready(e),
+                Poll::Pending => {}
+            },
+            // The peer cancelled (reset) or the control channel closed.
+            Poll::Ready(Err(e)) => return Poll::Ready(e),
+            Poll::Pending => {}
+        }
+
+        Poll::Pending
     }
 
     /// Checks the control queue for a pending reset that was never polled.
