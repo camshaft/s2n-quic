@@ -119,7 +119,9 @@ impl DeviceRegistry {
     /// Build the registry: spawn a single registrar task that **owns** `backend` and drives every
     /// device's execution. `spawner` drives the registrar; `registry` receives each device's per-pool
     /// credit gauges and per-device nominal counters as devices register; `clock` is the precision
-    /// clock used by the distributors and the per-device dispatch EDT. After construction the
+    /// clock the **credit distributors** read for their refill/liveness timing. (The per-device
+    /// dispatch EDT load balancer uses the process `DefaultClock` independently — it needs only
+    /// relative timestamps to score lane occupancy, not this clock's epoch.) After construction the
     /// application registers each device with [`register_device`] and holds the returned `Arc<Device>`.
     ///
     /// [`register_device`]: Self::register_device

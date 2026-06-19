@@ -275,10 +275,10 @@ impl Device {
 
     /// Submit a read of `len` bytes at `offset` on `fd`, resolving with the filled buffer.
     ///
-    /// The scheduler allocates a `BytesMut` with capacity `len` and reads into its uninitialized
-    /// spare capacity (no zero-fill); the returned buffer's `len()` is the bytes actually read (a
-    /// short read at EOF returns fewer bytes, never a zero-padded tail). The returned future is
-    /// `'static` (captures an `Arc<Device>` clone).
+    /// Allocates a `BytesMut` with capacity `len` and reads into its uninitialized spare capacity (no
+    /// zero-fill); the returned buffer's `len()` is the bytes actually read (a short read at EOF
+    /// returns fewer bytes, never a zero-padded tail). The returned future is `'static` (captures an
+    /// `Arc<Device>` clone).
     pub fn read(
         self: &Arc<Self>,
         fd: Fd,
@@ -421,8 +421,8 @@ impl Device {
     /// [`MaterializeStream`](crate::fs::materialize)), avoiding a per-op slot allocation.
     ///
     /// `Ok(())` means the op was admitted (credit acquired) and enqueued. An `Err` (misaligned/
-    /// oversized op, closed scheduler) means no completion will arrive and any acquired credit was
-    /// released.
+    /// oversized op, or this device's submission channel closed on teardown) means no completion will
+    /// arrive and any acquired credit was released.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn submit_with(
         self: &Arc<Self>,
@@ -496,7 +496,7 @@ impl Device {
             undelivered.device.counters.rejected.add(1);
             return Err(std::io::Error::new(
                 std::io::ErrorKind::BrokenPipe,
-                "io scheduler: submission channel closed",
+                "io scheduler: device submission channel closed (device torn down)",
             ));
         }
         Ok(())
@@ -518,7 +518,7 @@ async fn await_completion(mut rx: CompletionReceiver) -> std::io::Result<IoOp> {
         Some(entry) => Ok(entry.into_inner()),
         None => Err(std::io::Error::new(
             std::io::ErrorKind::BrokenPipe,
-            "io scheduler completion channel closed before completion",
+            "io scheduler: device completion channel closed before completion",
         )),
     }
 }

@@ -52,9 +52,12 @@ impl CostModel {
 /// (weight ~1), small random writes on a full drive are far costlier — so this stays operator-tunable
 /// via [`OpWeights::new`], with `2.0` as the calibrated starting point.
 ///
-/// The weight only bites in [`PoolMode::Shared`], where reads and writes contend for one budget. In
-/// [`PoolMode::Split`] each pool already has its own capacity, so the read:write ratio is expressed
-/// by the two capacities and the weight is typically left at default.
+/// [`Device::cost`](crate::fs::device::Device::cost) applies the weight in **both** pool modes (it is
+/// a property of the op, not the pool). It *matters most* in [`PoolMode::Shared`], where reads and
+/// writes contend for one budget and the weight is what rebalances them. In [`PoolMode::Split`] each
+/// pool already has its own capacity, so the read:write ratio is usually expressed by the two
+/// capacities and these weights left at the default — but the weight still scales each op's debit
+/// against its own pool, so a non-default weight there shrinks that pool's effective queue depth.
 #[derive(Clone, Copy, Debug)]
 pub struct OpWeights {
     read_256ths: u32,
