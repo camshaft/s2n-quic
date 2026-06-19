@@ -24,50 +24,51 @@ use crate::{
         backend::{Backend, CompletionSink, LaneSetup, LaneSubmit},
         op::{IoBuf, IoKind, IoOp, IoStatus},
     },
-    intrusive::Entry,
+    intrusive::{Entry, Queue},
     socket::channel::{intrusive::sync as sync_chan, Budget, UnboundedSender},
     sync::Arc,
 };
 use core::task::Poll;
 use std::{
-    collections::VecDeque,
     os::fd::RawFd,
     sync::{Condvar, Mutex},
     thread::JoinHandle,
 };
 
-/// A unit of work handed to a worker thread: the op plus the `Send` completion channel back to its
-/// lane's reaper.
-struct Job {
-    op: Entry<IoOp>,
-    completion: sync_chan::Sender<IoOp>,
-}
-
-/// The bounded worker pool. Created once; the worker count is fixed for its lifetime.
+/// The bounded worker pool. Created once; the worker count is fixed for its lifetime. The pool is
+/// shared across all lanes (the whole point of the bound — total threads, not per-device), and all
+/// workers push completed ops to ONE shared `Send` completion channel drained by a single reaper, so
+/// there is no per-op completion-routing state: the in-flight ops flow as bare `Entry<IoOp>`
+/// (already an intrusive node) through an intrusive [`Queue`], with no per-op wrapper allocation.
 struct Pool {
     shared: Arc<Shared>,
     workers: Vec<JoinHandle<()>>,
 }
 
 struct Shared {
-    queue: Mutex<Queue>,
+    queue: Mutex<JobQueue>,
     cond: Condvar,
+    /// Single completion channel shared by all workers → the pool's one reaper task.
+    done_tx: sync_chan::Sender<IoOp>,
 }
 
-struct Queue {
-    jobs: VecDeque<Job>,
+struct JobQueue {
+    /// Intrusive FIFO of submitted ops awaiting a worker. No `Vec`/`VecDeque` and no per-op wrapper:
+    /// the `Entry<IoOp>` produced by the scheduler IS the queue node, moved in/out by pointer.
+    jobs: Queue<IoOp>,
     shutdown: bool,
 }
 
 impl Pool {
-    fn new(worker_count: usize) -> Arc<Self> {
+    fn new(worker_count: usize, done_tx: sync_chan::Sender<IoOp>) -> Arc<Self> {
         debug_assert!(worker_count > 0, "fs syscall backend worker_count must be > 0");
         let shared = Arc::new(Shared {
-            queue: Mutex::new(Queue {
-                jobs: VecDeque::new(),
+            queue: Mutex::new(JobQueue {
+                jobs: Queue::new(),
                 shutdown: false,
             }),
             cond: Condvar::new(),
+            done_tx,
         });
         let mut workers = Vec::with_capacity(worker_count);
         for i in 0..worker_count.max(1) {
@@ -81,12 +82,12 @@ impl Pool {
         Arc::new(Self { shared, workers })
     }
 
-    /// Enqueue a job and wake one worker. Non-blocking — the credit pool already bounded the number
-    /// of in-flight jobs, so this never grows without bound.
-    fn enqueue(&self, job: Job) {
+    /// Enqueue an op and wake one worker. Non-blocking — the credit pool already bounded the number
+    /// of in-flight ops, so the intrusive queue never grows without bound.
+    fn enqueue(&self, op: Entry<IoOp>) {
         {
             let mut q = self.shared.queue.lock().unwrap();
-            q.jobs.push_back(job);
+            q.jobs.push_back(op);
         }
         self.shared.cond.notify_one();
     }
@@ -105,14 +106,14 @@ impl Drop for Pool {
     }
 }
 
-/// A worker thread: pull a job, run its syscall, push the completed op to its lane's reaper.
+/// A worker thread: pull an op, run its syscall, push the completed op to the shared reaper.
 fn worker_loop(shared: Arc<Shared>) {
     loop {
-        let job = {
+        let mut op = {
             let mut q = shared.queue.lock().unwrap();
             loop {
-                if let Some(job) = q.jobs.pop_front() {
-                    break job;
+                if let Some(op) = q.jobs.pop_front() {
+                    break op;
                 }
                 if q.shutdown {
                     return;
@@ -121,12 +122,11 @@ fn worker_loop(shared: Arc<Shared>) {
             }
         };
 
-        let Job { mut op, completion } = job;
         execute(&mut op);
-        // Forward the completed op to the lane reaper. If the reaper is gone the channel send fails;
-        // the op (and its credit) drops here — acceptable only on full teardown.
-        let mut completion = completion;
-        let _ = UnboundedSender::send(&mut completion, op);
+        // Forward the completed op to the pool's reaper. If the reaper is gone the send fails and the
+        // op (and its credit) drops here — acceptable only on full teardown. `send_entry` takes
+        // `&self`, so no per-op clone of the sender.
+        let _ = shared.done_tx.send_entry(op);
     }
 }
 
@@ -276,55 +276,50 @@ fn fsync(fd: RawFd, data_only: bool) -> std::io::Result<()> {
 /// buffer variant and the file's open flags must agree; a mismatch surfaces as the kernel's `EINVAL`
 /// on the syscall (stamped `Failed`), never silent corruption.
 pub struct SyscallBackend {
-    pool: Arc<Pool>,
+    worker_count: usize,
 }
 
 impl SyscallBackend {
-    /// Build a backend with `worker_count` fixed worker threads.
+    /// Build a backend with `worker_count` fixed worker threads. The pool itself is created when the
+    /// scheduler calls [`Backend::spawn_lanes`] (so the shared completion channel can be wired then).
     pub fn new(worker_count: usize) -> Self {
         Self {
-            pool: Pool::new(worker_count),
+            worker_count: worker_count.max(1),
         }
     }
 }
 
 impl Backend for SyscallBackend {
     fn spawn_lanes(&self, setup: LaneSetup) -> Vec<LaneSubmit> {
-        let mut handles = Vec::with_capacity(setup.lane_count);
-        for _ in 0..setup.lane_count {
-            // Send channel: worker threads → this lane's reaper (on the scheduler thread).
-            let (done_tx, done_rx) = sync_chan::new::<IoOp>();
-            // Reaper task: bridge the Send completion channel to the !Send completion sink.
-            let sink = setup.completion.boxed_clone();
-            setup.spawn.spawn(reaper(done_rx, sink));
-            // The lane submit handle enqueues jobs onto the shared pool, tagging each with a clone of
-            // this lane's done channel so the worker can route the completion back here.
-            handles.push(Box::new(PoolSubmit {
-                pool: self.pool.clone(),
-                done_tx,
-            }) as LaneSubmit);
-        }
-        handles
+        // One shared completion channel for the whole pool (not per-lane): every worker pushes
+        // completed ops here, and ONE reaper drains it into the !Send completion sink. This is why an
+        // op needs no per-op completion-routing state and can flow as a bare intrusive Entry<IoOp>.
+        let (done_tx, done_rx) = sync_chan::new::<IoOp>();
+        setup.spawn.spawn(reaper(done_rx, setup.completion));
+
+        // One bounded thread pool shared across all lanes.
+        let pool = Pool::new(self.worker_count, done_tx);
+
+        // Every lane submits onto the same shared pool; the LaneSubmit is just a cheap Arc handle.
+        (0..setup.lane_count)
+            .map(|_| Box::new(PoolSubmit { pool: pool.clone() }) as LaneSubmit)
+            .collect()
     }
 }
 
-/// The lane's submit handle: enqueues each op as a job on the bounded pool.
+/// The lane's submit handle: enqueues each op onto the shared bounded pool.
 struct PoolSubmit {
     pool: Arc<Pool>,
-    done_tx: sync_chan::Sender<IoOp>,
 }
 
 impl UnboundedSender<Entry<IoOp>> for PoolSubmit {
     fn send(&mut self, op: Entry<IoOp>) -> Result<(), Entry<IoOp>> {
-        self.pool.enqueue(Job {
-            op,
-            completion: self.done_tx.clone(),
-        });
+        self.pool.enqueue(op);
         Ok(())
     }
 }
 
-/// Drain a lane's `Send` completion channel and forward each op to the `!Send` completion sink.
+/// Drain the pool's shared `Send` completion channel and forward each op to the `!Send` sink.
 async fn reaper(mut done_rx: sync_chan::Receiver<IoOp>, sink: Box<dyn CompletionSink>) {
     let mut budget = Budget::new(1 << 20);
     core::future::poll_fn(move |cx| {

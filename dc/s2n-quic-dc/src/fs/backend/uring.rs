@@ -28,13 +28,12 @@ use crate::{
         backend::{Backend, CompletionSink, LaneSetup, LaneSubmit},
         op::{IoBuf, IoKind, IoOp, IoStatus},
     },
-    intrusive::Entry,
+    intrusive::{Entry, Queue},
     socket::channel::{intrusive::sync as sync_chan, Budget, UnboundedSender},
 };
 use core::task::Poll;
 use io_uring::{opcode, types, IoUring};
 use std::{
-    collections::VecDeque,
     os::fd::RawFd,
     sync::{Condvar, Mutex},
     thread::JoinHandle,
@@ -44,12 +43,6 @@ use std::{
 /// count so the SQ never backs up before the credit pool does.
 pub const DEFAULT_RING_DEPTH: u32 = 256;
 
-/// A job handed to a ring thread: the op plus the `Send` completion channel back to its reaper.
-struct Job {
-    op: Entry<IoOp>,
-    completion: sync_chan::Sender<IoOp>,
-}
-
 /// One ring + its dedicated worker thread, plus the queue feeding it. Each lane gets one.
 struct Ring {
     shared: std::sync::Arc<Shared>,
@@ -57,20 +50,23 @@ struct Ring {
 }
 
 struct Shared {
-    queue: Mutex<Queue>,
+    queue: Mutex<JobQueue>,
     cond: Condvar,
 }
 
-struct Queue {
-    jobs: VecDeque<Job>,
+struct JobQueue {
+    /// Intrusive FIFO of submitted ops awaiting the ring. The `Entry<IoOp>` IS the node — no
+    /// `Vec`/`VecDeque` and no per-op wrapper allocation.
+    jobs: Queue<IoOp>,
     shutdown: bool,
 }
 
 impl Ring {
-    fn new(depth: u32) -> std::io::Result<Self> {
+    /// Build a ring whose worker forwards completions to `done_tx` (this lane's reaper).
+    fn new(depth: u32, done_tx: sync_chan::Sender<IoOp>) -> std::io::Result<Self> {
         let shared = std::sync::Arc::new(Shared {
-            queue: Mutex::new(Queue {
-                jobs: VecDeque::new(),
+            queue: Mutex::new(JobQueue {
+                jobs: Queue::new(),
                 shutdown: false,
             }),
             cond: Condvar::new(),
@@ -83,7 +79,7 @@ impl Ring {
             .spawn(move || match IoUring::new(depth) {
                 Ok(ring) => {
                     let _ = ready_tx.send(Ok(()));
-                    ring_loop(ring, thread_shared, depth as usize);
+                    ring_loop(ring, thread_shared, depth as usize, done_tx);
                 }
                 Err(e) => {
                     let _ = ready_tx.send(Err(e));
@@ -105,10 +101,10 @@ impl Ring {
         })
     }
 
-    fn enqueue(&self, job: Job) {
+    fn enqueue(&self, op: Entry<IoOp>) {
         {
             let mut q = self.shared.queue.lock().unwrap();
-            q.jobs.push_back(job);
+            q.jobs.push_back(op);
         }
         self.shared.cond.notify_one();
     }
@@ -127,11 +123,11 @@ impl Drop for Ring {
     }
 }
 
-/// An in-flight op: the job plus how many bytes of a read/write have completed so far. A short
+/// An in-flight op: the op plus how many bytes of a read/write have completed so far. A short
 /// completion advances `done` and the remainder is re-submitted, so the op stays pinned in the slab
 /// (and its buffer stays valid for the kernel) until the FULL transfer finishes or it errors.
 struct InFlight {
-    job: Job,
+    op: Entry<IoOp>,
     /// Bytes transferred so far (for read/write progress across short completions).
     done: usize,
     /// Total bytes requested (the op's transfer length).
@@ -157,17 +153,25 @@ enum Reaped {
 /// **Buffer-lifetime invariant:** an op's buffer is freed *only* when its final CQE is reaped, never
 /// based on a `submit` result. A submit error keeps every outstanding op pinned and the loop keeps
 /// reaping, so the kernel never holds a pointer into freed memory.
-fn ring_loop(mut ring: IoUring, shared: std::sync::Arc<Shared>, depth: usize) {
+fn ring_loop(
+    mut ring: IoUring,
+    shared: std::sync::Arc<Shared>,
+    depth: usize,
+    done_tx: sync_chan::Sender<IoOp>,
+) {
     // In-flight ops keyed by user_data; the slab owns each op (and its buffer) until its final CQE.
+    // A slab (indexed `Vec<Option>`) is the right structure here — O(1) CQE-by-user_data lookup with
+    // no per-op allocation beyond the op itself, and slots are recycled via `free_ids`.
     let mut inflight: Vec<Option<InFlight>> = Vec::with_capacity(depth);
-    let mut free_ids: Vec<usize> = Vec::new();
+    let mut free_ids: Vec<usize> = Vec::with_capacity(depth);
     let mut outstanding = 0usize;
-    // Ids whose tail must be re-submitted after a short completion (collected during reap, pushed
-    // before the next submit).
-    let mut to_resubmit: Vec<usize> = Vec::new();
+    // Scratch buffers RETAINED across loop iterations (cleared, never reallocated): ids whose tail
+    // must be re-submitted after a short completion, and ids completed this pass.
+    let mut to_resubmit: Vec<usize> = Vec::with_capacity(depth);
+    let mut completed: Vec<usize> = Vec::with_capacity(depth);
 
     loop {
-        // 1. Pull queued jobs (block only when nothing is queued AND nothing is in flight).
+        // 1. Pull queued ops (block only when nothing is queued AND nothing is in flight).
         {
             let mut q = shared.queue.lock().unwrap();
             loop {
@@ -186,19 +190,19 @@ fn ring_loop(mut ring: IoUring, shared: std::sync::Arc<Shared>, depth: usize) {
             // Re-submit the tails of short-completed ops first (they're already pinned in the slab
             // and counted in `outstanding`; only the SQE needs re-pushing).
             to_resubmit.retain(|&id| {
-                let Some(inflight_op) = inflight[id].as_ref() else {
+                let Some(slot) = inflight[id].as_ref() else {
                     return false;
                 };
-                let entry = build_sqe(&inflight_op.job.op, inflight_op.done, id as u64);
+                let entry = build_sqe(&slot.op, slot.done, id as u64);
                 // SAFETY: the op (and its buffer) is pinned in `inflight[id]` until its final CQE.
                 match unsafe { ring.submission().push(&entry) } {
-                    Ok(()) => false,  // submitted; drop from the resubmit list
-                    Err(_) => true,   // SQ full; retry next iteration
+                    Ok(()) => false, // submitted; drop from the resubmit list
+                    Err(_) => true,  // SQ full; retry next iteration
                 }
             });
-            // Move newly-queued jobs into the SQ, bounded by available ring space.
+            // Move newly-queued ops into the SQ, bounded by available ring space.
             while outstanding < depth {
-                let Some(mut job) = q.jobs.pop_front() else { break };
+                let Some(mut op) = q.jobs.pop_front() else { break };
                 let id = free_ids.pop().unwrap_or_else(|| {
                     inflight.push(None);
                     inflight.len() - 1
@@ -206,19 +210,19 @@ fn ring_loop(mut ring: IoUring, shared: std::sync::Arc<Shared>, depth: usize) {
                 // Prepare the op's buffer with exclusive access *before* parking it in the slab, then
                 // build the SQE from the (now-stable) buffer pointer. The op then moves into the
                 // slab and stays put until its final CQE.
-                prepare_buf(&mut job.op);
-                let want = transfer_len(&job.op);
-                let entry = build_sqe(&job.op, 0, id as u64);
-                inflight[id] = Some(InFlight { job, done: 0, want });
+                prepare_buf(&mut op);
+                let want = transfer_len(&op);
+                let entry = build_sqe(&op, 0, id as u64);
+                inflight[id] = Some(InFlight { op, done: 0, want });
                 // SAFETY: the op (and its buffer) lives in `inflight[id]` until its CQE is reaped, so
                 // the buffer pointer in the SQE stays valid for the kernel operation's duration.
                 match unsafe { ring.submission().push(&entry) } {
                     Ok(()) => outstanding += 1,
                     Err(_) => {
-                        // SQ full despite the bound check — put the job back and stop filling.
-                        let job = inflight[id].take().unwrap().job;
+                        // SQ full despite the bound check — put the op back and stop filling.
+                        let op = inflight[id].take().unwrap().op;
                         free_ids.push(id);
-                        q.jobs.push_front(job);
+                        q.jobs.push_front(op);
                         break;
                     }
                 }
@@ -242,7 +246,7 @@ fn ring_loop(mut ring: IoUring, shared: std::sync::Arc<Shared>, depth: usize) {
 
         // 3. Reap completions. Short read/write → advance progress and mark for re-submit; otherwise
         //    complete the op and free its slab slot (and thus its buffer).
-        let mut completed: Vec<usize> = Vec::new();
+        completed.clear();
         {
             let mut cq = ring.completion();
             cq.sync();
@@ -255,16 +259,16 @@ fn ring_loop(mut ring: IoUring, shared: std::sync::Arc<Shared>, depth: usize) {
                 match apply_cqe(slot, cqe.result()) {
                     Reaped::Resubmit => to_resubmit.push(id),
                     Reaped::Done => {
-                        let mut job = inflight[id].take().unwrap().job;
-                        finalize(&mut job.op);
-                        let mut c = job.completion;
-                        let _ = UnboundedSender::send(&mut c, job.op);
+                        let mut op = inflight[id].take().unwrap().op;
+                        finalize(&mut op);
+                        // `send_entry` takes `&self`, so no per-op clone of the sender.
+                        let _ = done_tx.send_entry(op);
                         completed.push(id);
                     }
                 }
             }
         }
-        for id in completed {
+        for &id in &completed {
             free_ids.push(id);
             outstanding -= 1;
         }
@@ -276,21 +280,21 @@ fn ring_loop(mut ring: IoUring, shared: std::sync::Arc<Shared>, depth: usize) {
 fn apply_cqe(slot: &mut InFlight, result: i32) -> Reaped {
     if result < 0 {
         let err = std::io::Error::from_raw_os_error(-result);
-        slot.job.op.status = IoStatus::Failed(err.kind());
+        slot.op.status = IoStatus::Failed(err.kind());
         return Reaped::Done;
     }
     let n = result as usize;
-    let kind = slot.job.op.kind;
+    let kind = slot.op.kind;
     match kind {
         IoKind::Write => {
             slot.done += n;
             if slot.done >= slot.want {
-                slot.job.op.status = IoStatus::Done(slot.done);
+                slot.op.status = IoStatus::Done(slot.done);
                 Reaped::Done
             } else if n == 0 {
                 // A 0-byte non-error write makes no progress — mirror pwrite_all's WriteZero guard
                 // rather than spin forever.
-                slot.job.op.status = IoStatus::Failed(std::io::ErrorKind::WriteZero);
+                slot.op.status = IoStatus::Failed(std::io::ErrorKind::WriteZero);
                 Reaped::Done
             } else {
                 // Short write: re-submit the unwritten tail.
@@ -302,12 +306,12 @@ fn apply_cqe(slot: &mut InFlight, result: i32) -> Reaped {
             // done with `done + n` bytes. We do NOT re-issue reads — a short read is a legitimate
             // end, not an error, matching the buffered backend's truncate-to-n behavior.
             slot.done += n;
-            slot.job.op.status = IoStatus::Done(slot.done);
+            slot.op.status = IoStatus::Done(slot.done);
             Reaped::Done
         }
         // fsync / fdatasync / trim: single completion, no byte progress.
         _ => {
-            slot.job.op.status = IoStatus::Done(0);
+            slot.op.status = IoStatus::Done(0);
             Reaped::Done
         }
     }
@@ -446,32 +450,28 @@ impl Backend for UringBackend {
     fn spawn_lanes(&self, setup: LaneSetup) -> Vec<LaneSubmit> {
         let mut handles = Vec::with_capacity(setup.lane_count);
         for _ in 0..setup.lane_count {
-            // One ring (+ its thread) per lane.
-            let ring = std::sync::Arc::new(
-                Ring::new(self.depth).expect("failed to create io_uring for lane"),
-            );
-            // Send channel: ring thread → this lane's reaper (on the scheduler thread).
+            // Send channel: this lane's ring thread → this lane's reaper task. The ring thread holds
+            // `done_tx` (no per-op completion state); the reaper bridges to the !Send sink.
             let (done_tx, done_rx) = sync_chan::new::<IoOp>();
-            let sink = setup.completion.boxed_clone();
-            setup.spawn.spawn(reaper(done_rx, sink));
-            handles.push(Box::new(RingSubmit { ring, done_tx }) as LaneSubmit);
+            setup.spawn.spawn(reaper(done_rx, setup.completion.boxed_clone()));
+            // One ring (+ its thread) per lane; the ring thread owns `done_tx`.
+            let ring = std::sync::Arc::new(
+                Ring::new(self.depth, done_tx).expect("failed to create io_uring for lane"),
+            );
+            handles.push(Box::new(RingSubmit { ring }) as LaneSubmit);
         }
         handles
     }
 }
 
-/// The lane's submit handle: enqueues each op onto its ring's thread.
+/// The lane's submit handle: enqueues each op onto its ring's thread (bare intrusive `Entry<IoOp>`).
 struct RingSubmit {
     ring: std::sync::Arc<Ring>,
-    done_tx: sync_chan::Sender<IoOp>,
 }
 
 impl UnboundedSender<Entry<IoOp>> for RingSubmit {
     fn send(&mut self, op: Entry<IoOp>) -> Result<(), Entry<IoOp>> {
-        self.ring.enqueue(Job {
-            op,
-            completion: self.done_tx.clone(),
-        });
+        self.ring.enqueue(op);
         Ok(())
     }
 }
