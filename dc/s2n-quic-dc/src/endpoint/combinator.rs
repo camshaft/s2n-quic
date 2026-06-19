@@ -464,61 +464,14 @@ impl<T: FlowCredits> FlowCredits for crate::intrusive::Entry<T> {
 
 // ── PickTwo ───────────────────────────────────────────────────────────────
 
-/// Worst-case drain-time gap (in nanoseconds) at which a worse candidate bottoms out at the floor
-/// probability.
-///
-/// Sender load scores are absolute drain-time timestamps in nanoseconds, so the delta between two
-/// candidates is a *duration*: how much later the higher-scored candidate would finish. Once that
-/// gap reaches `PICK_TWO_WORST_CASE_GAP_NANOS` we consider the candidate "clearly worse" and route
-/// to it only at the [`PICK_TWO_WORSE_FLOOR`] rate. The selection curve is derived so the smooth
-/// logistic decay meets the floor exactly at this gap (no abrupt knee) — see
-/// [`pick_two_worse_probability`]. This and the floor are the two intuitive tuning knobs.
-///
-/// The scores carry a nanosecond unit but only microsecond resolution (they flow through the core
-/// `Timestamp`, which stores microseconds — see `score_as_u64`). At 1ms this gap is 1000 quanta
-/// wide, so the quantization is far finer than the logistic resolves and has no bearing on routing.
-const PICK_TWO_WORST_CASE_GAP_NANOS: f64 = 1_000_000.0;
-
-/// Minimum probability of routing to the higher-scored (worse) candidate, also the probability at
-/// the worst-case gap.
-///
-/// A purely logistic rule drives the worse candidate's share toward zero as the delta grows, which
-/// would permanently starve a *structurally* worse target (e.g. a slower link whose score stays
-/// higher forever). This floor guarantees every candidate keeps receiving a probe trickle so it is
-/// never fully starved and its load estimate stays fresh. Kept low (1%) so a target that is
-/// genuinely a worst-case gap behind still gets sampled occasionally without stealing real traffic.
-const PICK_TWO_WORSE_FLOOR: f64 = 0.01;
-
-/// `ln((1 − floor) / floor)` for the default 1% floor, i.e. `ln(99)`.
-///
-/// This is the only transcendental term in the curve derivation and `f64::ln` is not yet
-/// const-stable, so it is pinned as a literal. [`pick_two_worse_probability_floor_ratio_literal`]
-/// asserts the literal still matches the floor, so changing [`PICK_TWO_WORSE_FLOOR`] without
-/// updating this constant fails the test rather than silently skewing the curve.
-const PICK_TWO_FLOOR_LN_RATIO: f64 = 4.595_119_850_134_59;
-
-/// Time-scale `τ` (nanoseconds) of the logistic, *derived* from the worst-case gap and the floor
-/// rather than tuned directly:
-///
-///   τ = PICK_TWO_WORST_CASE_GAP_NANOS / ln((1 − floor) / floor)
-///
-/// so the logistic equals the floor exactly at `delta == PICK_TWO_WORST_CASE_GAP_NANOS` and the
-/// clamp only takes over beyond the worst case. Const-evaluated (division is const-stable) so it is
-/// folded at compile time rather than recomputed on the hot path. ≈ 218µs with the default knobs.
-const PICK_TWO_TAU_NANOS: f64 = PICK_TWO_WORST_CASE_GAP_NANOS / PICK_TWO_FLOOR_LN_RATIO;
-
-/// Probability of routing to the higher-scored (worse) candidate given the absolute score delta.
-///
-/// Logistic decay `1 / (1 + exp(delta / τ))` clamped up to [`PICK_TWO_WORSE_FLOOR`], with `τ` =
-/// [`PICK_TWO_TAU_NANOS`]. At `delta == 0` this is `0.5` (a fair coin flip, with no bias toward
-/// either candidate); with the default 1ms/1% knobs the worse candidate gets ~9% at half the
-/// worst-case gap and ~24% at a quarter of it. Only the `delta`-dependent `exp` runs per call —
-/// every other term is a compile-time constant.
-#[inline]
-fn pick_two_worse_probability(delta: u64) -> f64 {
-    let logistic = 1.0 / (1.0 + (delta as f64 / PICK_TWO_TAU_NANOS).exp());
-    logistic.max(PICK_TWO_WORSE_FLOOR)
-}
+// The pick-two selection curve lives in `endpoint::edt` (shared with the storage scheduler's lane
+// dispatch). Re-import the fn and the constants its tests assert against so this module — and
+// `combinator::tests` via `use super::*` — keep referring to them unqualified.
+use crate::endpoint::edt::pick_two_worse_probability;
+#[cfg(test)]
+use crate::endpoint::edt::{
+    PICK_TWO_FLOOR_LN_RATIO, PICK_TWO_WORSE_FLOOR, PICK_TWO_WORST_CASE_GAP_NANOS,
+};
 
 /// Receiver combinator that routes items to socket senders using a hybrid round-robin +
 /// random pick-two path scheduling strategy from the path secret map entry associated

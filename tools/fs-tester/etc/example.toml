@@ -1,0 +1,32 @@
+# Example fs-tester workload. All fields are optional; unset fields fall back to defaults.
+# Run with:  fs-tester --config tools/fs-tester/etc/example.toml
+# CLI flags (--backend, --op-size, --streams, --queue-depth, --op-mix, --direct, --duration, --file)
+# override individual fields.
+
+# Backend: "syscall" (bounded blocking pread/pwrite pool) or "uring" (io_uring, Linux only).
+backend = "uring"
+
+# Execution lanes: io_uring rings (uring) or shared-pool submit handles (syscall).
+lanes = 4
+# Worker threads for the syscall backend (ignored by uring).
+syscall_workers = 8
+# io_uring ring depth (uring only).
+ring_depth = 256
+
+# Use O_DIRECT (unbuffered, zero-copy aligned IO). Requires op_size to be a multiple of 4096.
+direct = true
+
+# Device queue depth — max in-flight ops (the credit-pool capacity governs concurrency).
+queue_depth = 256
+# Concurrent submitter tasks (streams contending for the device's fair-share credit).
+streams = 64
+# Bytes per op (multiple of 4096 in direct mode).
+op_size = 4096
+# Read / write mix: "read", "write", or "mixed" (alternating).
+op_mix = "mixed"
+# Total file size; ops wrap within this range.
+file_size = 1073741824   # 1 GiB
+# Run duration in seconds.
+duration_secs = 10
+# Test file path (created/truncated). Omit for a temp path.
+# file = "/mnt/nvme1/fs-tester.dat"
