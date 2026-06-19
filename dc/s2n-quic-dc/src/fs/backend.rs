@@ -15,6 +15,7 @@
 //! completion and the blocking pool's thread hand-off both fit without a common syscall signature.
 
 pub mod mock;
+pub mod syscall;
 
 use crate::{
     fs::{device::DeviceTable, op::IoOp, SpawnHandle},

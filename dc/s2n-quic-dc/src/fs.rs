@@ -34,6 +34,7 @@ pub mod backend;
 pub mod combinator;
 pub mod config;
 pub mod device;
+pub mod direct;
 pub mod materialize;
 pub mod op;
 pub mod scheduler;

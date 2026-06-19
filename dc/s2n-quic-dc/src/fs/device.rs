@@ -101,15 +101,21 @@ impl Device {
     /// Build a device and its (not-yet-spawned) distributors from config.
     pub fn new(cfg: &DeviceConfig) -> Self {
         let (pools, read_capacity, write_capacity) = match &cfg.pool_mode {
-            PoolMode::Shared(c) => (DevicePools::Shared(Arc::new(Pool::new(*c))), c.capacity, c.capacity),
-            PoolMode::Split { read, write } => (
-                DevicePools::Split {
-                    read: Arc::new(Pool::new(*read)),
-                    write: Arc::new(Pool::new(*write)),
-                },
-                read.capacity,
-                write.capacity,
-            ),
+            PoolMode::Shared(c) => {
+                let c = atomic_grant(*c);
+                (DevicePools::Shared(Arc::new(Pool::new(c))), c.capacity, c.capacity)
+            }
+            PoolMode::Split { read, write } => {
+                let (read, write) = (atomic_grant(*read), atomic_grant(*write));
+                (
+                    DevicePools::Split {
+                        read: Arc::new(Pool::new(read)),
+                        write: Arc::new(Pool::new(write)),
+                    },
+                    read.capacity,
+                    write.capacity,
+                )
+            }
         };
         Self {
             pools,
@@ -145,6 +151,25 @@ impl Device {
             self.write_capacity
         }
     }
+}
+
+/// Force **atomic** credit grants for a storage pool by flooring `min_grant_slice` at
+/// `max_single_acquire` per priority.
+///
+/// The credit pool's demand-elastic fair share normally splits a parked waiter's request into
+/// `free / num_waiters` slices (great for QUIC byte-streams, which send the partial and release it).
+/// But an [`IoOp`](crate::fs::op::IoOp) is **indivisible** — it cannot execute, and therefore cannot
+/// release, until it holds its *full* cost. If two contending ops each pinned a partial slice,
+/// neither could run, nothing would release, and the pool would wedge (exactly the deadlock the
+/// `Writer` docs warn about, but with no partial-progress escape). Flooring the slice at the per-op
+/// ceiling makes every grant all-or-nothing: a waiter is served only when its whole request fits,
+/// so an admitted op (cost ≤ capacity, enforced at submit time) always gets granted in one wake.
+///
+/// Fairness across streams is preserved — the distributor still walks waiters FIFO within a tier and
+/// serves whole ops round-robin; it just never hands out a sub-op sliver.
+fn atomic_grant(config: crate::sched::CreditConfig) -> crate::sched::CreditConfig {
+    let caps = config.max_single_acquire;
+    config.with_min_grant_slice_per_priority(caps)
 }
 
 /// The scheduler's device registry, indexed by [`DeviceId`].
