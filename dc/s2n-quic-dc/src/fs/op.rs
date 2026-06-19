@@ -21,6 +21,43 @@ use crate::{
     fs::device::{Device, LocalRingId},
     sync::Arc,
 };
+use std::os::fd::{AsRawFd, RawFd};
+
+/// A file descriptor handle that **keeps the file open for the op's whole lifetime**.
+///
+/// A raw `i32` fd is a use-after-free hazard here: an [`IoOp`] outlives the `submit` call — it sits
+/// in a lane channel and (for io_uring) in the in-flight slab through the entire kernel operation —
+/// so if the application drops its `File` between submit and completion, the fd is closed and may be
+/// recycled, and the backend would `pread`/`pwrite` (or hand io_uring) a **stale or reused**
+/// descriptor. Worse for io_uring, the kernel holds the fd across the async op.
+///
+/// `Fd` carries an `Arc<dyn AsRawFd + Send + Sync>` — typically an `Arc<File>` — so the op pins the
+/// file open until it completes and is dropped, exactly as it pins its [`Device`] and its buffer.
+/// Cloning is a cheap `Arc` bump; `as_raw()` yields the descriptor for the backend syscall/SQE, valid
+/// because the `Fd` (held by the op) outlives that call.
+#[derive(Clone)]
+pub struct Fd(Arc<dyn AsRawFd + Send + Sync>);
+
+impl Fd {
+    /// Wrap a shared, raw-fd-bearing handle (e.g. `Arc<File>`); the op holds it open until done.
+    #[inline]
+    pub fn new(file: Arc<dyn AsRawFd + Send + Sync>) -> Self {
+        Self(file)
+    }
+
+    /// The raw descriptor, for a backend syscall / SQE. Valid for the duration of the call because
+    /// the owning op (and thus this `Fd`) outlives it.
+    #[inline]
+    pub fn as_raw(&self) -> RawFd {
+        self.0.as_raw_fd()
+    }
+}
+
+impl core::fmt::Debug for Fd {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_tuple("Fd").field(&self.as_raw()).finish()
+    }
+}
 
 /// A completion notification handle for a single submitter, parameterized over the work-unit so the
 /// completed [`IoOp`] (with its filled buffer and result) is delivered back. This is the exact
@@ -170,8 +207,9 @@ pub struct IoOp {
     /// release its own credit (`device.pool_for(kind).release(..)`) on whatever thread completes it,
     /// with no `DeviceTable` lookup. Assigned at submit time.
     pub device: Arc<Device>,
-    /// Target file descriptor (resolved by the caller; opaque to the scheduler core).
-    pub fd: i32,
+    /// Target file, carried as an [`Fd`] (`Arc<dyn AsRawFd>`) so the op keeps it open for its whole
+    /// lifetime — no use-after-free if the caller drops its `File` before the op completes.
+    pub fd: Fd,
     /// Byte offset within the file.
     pub offset: u64,
     /// Transfer length in bytes (control ops use 0).

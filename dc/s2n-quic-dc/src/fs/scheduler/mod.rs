@@ -57,7 +57,9 @@ pub struct BlockRef {
     /// and the op carries it straight through. Obtain the handle from
     /// [`Scheduler::register_device`].
     pub device: Arc<Device>,
-    pub fd: i32,
+    /// The file this block lives in, carried as an [`Fd`](crate::fs::op::Fd) so the read keeps it
+    /// open until the op completes (no UAF if the caller drops its `File` mid-spray).
+    pub fd: crate::fs::op::Fd,
     pub offset: u64,
     pub len: u32,
     /// Bytes to trim from the head of the read result (for a range starting mid-block).
@@ -68,7 +70,7 @@ pub struct BlockRef {
 
 impl BlockRef {
     /// A whole-block read with no trimming.
-    pub fn whole(device: Arc<Device>, fd: i32, offset: u64, len: u32) -> Self {
+    pub fn whole(device: Arc<Device>, fd: crate::fs::op::Fd, offset: u64, len: u32) -> Self {
         Self {
             device,
             fd,

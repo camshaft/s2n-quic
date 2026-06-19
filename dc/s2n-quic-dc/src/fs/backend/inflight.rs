@@ -125,11 +125,22 @@ mod tests {
         ))
     }
 
+    /// A throwaway [`Fd`] — the slab never issues a syscall, so the descriptor is never dereferenced.
+    fn dummy_fd() -> crate::fs::op::Fd {
+        struct DummyFd;
+        impl std::os::fd::AsRawFd for DummyFd {
+            fn as_raw_fd(&self) -> std::os::fd::RawFd {
+                -1
+            }
+        }
+        crate::fs::op::Fd::new(Arc::new(DummyFd))
+    }
+
     fn op(offset: u64) -> Entry<IoOp> {
         Entry::new(IoOp {
             kind: IoKind::Read,
             device: device(),
-            fd: 0,
+            fd: dummy_fd(),
             offset,
             len: 0,
             buf: IoBuf::None,

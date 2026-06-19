@@ -21,7 +21,7 @@
 use crate::{
     fs::{
         device::Device,
-        op::{CompletionReceiver, CompletionSender, IoBuf, IoKind, IoOp, IoStatus},
+        op::{CompletionReceiver, CompletionSender, Fd, IoBuf, IoKind, IoOp, IoStatus},
         scheduler::{alloc::SubmitterAlloc, BlockRef, SchedulerInner},
     },
     intrusive::Entry,
@@ -47,20 +47,19 @@ impl SubmitHandle {
     /// `'static` (captures a handle clone).
     pub fn read(
         &self,
-        device: &Arc<Device>,
-        fd: i32,
+        device: Arc<Device>,
+        fd: Fd,
         offset: u64,
         len: u32,
         priority: TierPriority,
     ) -> impl core::future::Future<Output = std::io::Result<bytes::BytesMut>> + 'static {
         let handle = self.clone();
-        let device = device.clone();
         async move {
             // Caller-owned, pre-sized, logically-empty buffer: the backend reads into spare capacity
             // and `set_len`s to bytes read. No allocation or memset happens inside the backend.
             let buf = bytes::BytesMut::with_capacity(len as usize);
             let op = handle
-                .submit(IoKind::Read, &device, fd, offset, len, IoBuf::Read(buf), priority)
+                .submit(IoKind::Read, device, fd, offset, len, IoBuf::Read(buf), priority)
                 .await?;
             match op.buf {
                 IoBuf::Read(buf) => Ok(buf),
@@ -73,18 +72,17 @@ impl SubmitHandle {
     /// written.
     pub fn write(
         &self,
-        device: &Arc<Device>,
-        fd: i32,
+        device: Arc<Device>,
+        fd: Fd,
         offset: u64,
         data: bytes::Bytes,
         priority: TierPriority,
     ) -> impl core::future::Future<Output = std::io::Result<usize>> + 'static {
         let handle = self.clone();
-        let device = device.clone();
         async move {
             let len = data.len() as u32;
             let op = handle
-                .submit(IoKind::Write, &device, fd, offset, len, IoBuf::Write(data), priority)
+                .submit(IoKind::Write, device, fd, offset, len, IoBuf::Write(data), priority)
                 .await?;
             match op.status {
                 IoStatus::Done(n) => Ok(n),
@@ -99,19 +97,18 @@ impl SubmitHandle {
     /// `buf.len()` must be block-aligned (validated; `InvalidInput` otherwise).
     pub fn read_direct(
         &self,
-        device: &Arc<Device>,
-        fd: i32,
+        device: Arc<Device>,
+        fd: Fd,
         offset: u64,
         buf: crate::fs::direct::AlignedBuf,
         priority: TierPriority,
     ) -> impl core::future::Future<Output = std::io::Result<(crate::fs::direct::AlignedBuf, usize)>>
            + 'static {
         let handle = self.clone();
-        let device = device.clone();
         async move {
             let len = buf.len() as u32;
             let op = handle
-                .submit(IoKind::Read, &device, fd, offset, len, IoBuf::Direct(buf), priority)
+                .submit(IoKind::Read, device, fd, offset, len, IoBuf::Direct(buf), priority)
                 .await?;
             match (op.status, op.buf) {
                 (IoStatus::Done(n), IoBuf::Direct(buf)) => Ok((buf, n)),
@@ -125,19 +122,18 @@ impl SubmitHandle {
     /// `offset` must be block-aligned (validated; `InvalidInput` otherwise).
     pub fn write_direct(
         &self,
-        device: &Arc<Device>,
-        fd: i32,
+        device: Arc<Device>,
+        fd: Fd,
         offset: u64,
         buf: crate::fs::direct::AlignedBuf,
         priority: TierPriority,
     ) -> impl core::future::Future<Output = std::io::Result<(crate::fs::direct::AlignedBuf, usize)>>
            + 'static {
         let handle = self.clone();
-        let device = device.clone();
         async move {
             let len = buf.len() as u32;
             let op = handle
-                .submit(IoKind::Write, &device, fd, offset, len, IoBuf::Direct(buf), priority)
+                .submit(IoKind::Write, device, fd, offset, len, IoBuf::Direct(buf), priority)
                 .await?;
             match (op.status, op.buf) {
                 (IoStatus::Done(n), IoBuf::Direct(buf)) => Ok((buf, n)),
@@ -155,8 +151,8 @@ impl SubmitHandle {
     pub async fn submit(
         &self,
         kind: IoKind,
-        device: &Arc<Device>,
-        fd: i32,
+        device: Arc<Device>,
+        fd: Fd,
         offset: u64,
         len: u32,
         buf: IoBuf,
@@ -202,8 +198,8 @@ impl SubmitHandle {
         &self,
         alloc: &mut SubmitterAlloc,
         kind: IoKind,
-        device: &Arc<Device>,
-        fd: i32,
+        device: Arc<Device>,
+        fd: Fd,
         offset: u64,
         len: u32,
         buf: IoBuf,
@@ -212,7 +208,7 @@ impl SubmitHandle {
         user_data: u64,
     ) -> std::io::Result<()> {
         // Validate + resolve the device pool and cost directly on the carried device (no lookup).
-        let (pool, cost) = self.prepare(device, kind, offset, len, buf.is_direct())?;
+        let (pool, cost) = self.prepare(&device, kind, offset, len, buf.is_direct())?;
 
         // Acquire credit, parking cooperatively if the device is at capacity. This is the
         // backpressure that prevents the blocking-pool deadlock.
@@ -223,7 +219,7 @@ impl SubmitHandle {
         let granted = alloc.take_all();
         debug_assert!(granted >= cost, "acquire returned less than cost");
 
-        self.enqueue(kind, device, fd, offset, len, buf, completion, user_data, granted)
+        self.enqueue(kind, &device, fd, offset, len, buf, completion, user_data, granted)
     }
 
     /// Validate a prospective op against `device` and resolve the pool it draws from plus its credit
@@ -261,7 +257,7 @@ impl SubmitHandle {
         &self,
         kind: IoKind,
         device: &Arc<Device>,
-        fd: i32,
+        fd: Fd,
         offset: u64,
         len: u32,
         buf: IoBuf,

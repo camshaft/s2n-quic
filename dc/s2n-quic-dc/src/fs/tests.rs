@@ -129,7 +129,7 @@ fn lane_send_failure_fails_submit_and_conserves_credit() {
             // promptly (not hang). `.await` directly — if the future hung, the sim would never
             // reach quiescence and the test would time out.
             for i in 0..5u64 {
-                let result = h.read(&dev, FD, i * 4096, 4096, TierPriority::Medium).await;
+                let result = h.read(dev.clone(), fd(), i * 4096, 4096, TierPriority::Medium).await;
                 assert!(
                     result.is_err(),
                     "submit to a closed lane must fail, not succeed or hang"
@@ -162,7 +162,17 @@ fn iops_device(queue_depth: u64) -> DeviceConfig {
     }
 }
 
-const FD: i32 = 7;
+/// A throwaway [`Fd`](crate::fs::op::Fd) for the bach tests: the bach backend fills buffers
+/// synthetically and never issues a real syscall, so the descriptor is never dereferenced.
+fn fd() -> crate::fs::op::Fd {
+    struct DummyFd;
+    impl std::os::fd::AsRawFd for DummyFd {
+        fn as_raw_fd(&self) -> std::os::fd::RawFd {
+            7
+        }
+    }
+    crate::fs::op::Fd::new(Arc::new(DummyFd))
+}
 
 /// Run `n` identical reader streams at `priority` against `device` for a fixed simulated window,
 /// returning each stream's completion count. Each stream keeps exactly one op in flight (submit →
@@ -186,7 +196,7 @@ fn run_streams(
             let start = bach::time::Instant::now();
             let mut offset = 0u64;
             while start.elapsed() < window {
-                if h.read(&dev, FD, offset, 4096, priority).await.is_ok() {
+                if h.read(dev.clone(), fd(), offset, 4096, priority).await.is_ok() {
                     done += 1;
                     offset += 4096;
                 }
@@ -306,7 +316,7 @@ fn device_isolation() {
                 let start = bach::time::Instant::now();
                 let mut offset = 0u64;
                 while start.elapsed() < 40.ms() {
-                    let _ = h.read(&busy, FD, offset, 4096, TierPriority::Medium).await;
+                    let _ = h.read(busy.clone(), fd(), offset, 4096, TierPriority::Medium).await;
                     offset += 4096;
                 }
             }
@@ -323,7 +333,7 @@ fn device_isolation() {
                 let mut offset = 0u64;
                 let mut n = 0u64;
                 while start.elapsed() < 40.ms() {
-                    if h.read(&quiet, FD, offset, 4096, TierPriority::Medium)
+                    if h.read(quiet.clone(), fd(), offset, 4096, TierPriority::Medium)
                         .await
                         .is_ok()
                     {
@@ -374,7 +384,7 @@ fn materialize_delivers_in_order() {
             let blocks: Vec<BlockRef> = (0..10u64)
                 .map(|i| {
                     let dev = devices[(i % 2) as usize].clone();
-                    BlockRef::whole(dev, FD, i * 1024, 1024)
+                    BlockRef::whole(dev, fd(), i * 1024, 1024)
                 })
                 .collect();
 
@@ -421,7 +431,7 @@ fn materialize_cross_device_no_hol() {
             // 20 blocks alternating devices; device 0 (even indices) is depth-1 so its blocks must
             // serialize, while device 1 (odd indices) can have many in flight at once.
             let blocks: Vec<BlockRef> = (0..20u64)
-                .map(|i| BlockRef::whole(devices[(i % 2) as usize].clone(), FD, i * 1024, 1024))
+                .map(|i| BlockRef::whole(devices[(i % 2) as usize].clone(), fd(), i * 1024, 1024))
                 .collect();
 
             let mut stream = h.materialize(blocks.clone(), TierPriority::High);
@@ -481,7 +491,7 @@ fn materialize_drop_mid_spray_conserves_credit() {
             // piles up in flight. More blocks than either pool depth, so at the drop point there are
             // both in-flight ops and ToSubmit blocks parked on device 0's credit.
             let blocks: Vec<BlockRef> = (0..40u64)
-                .map(|i| BlockRef::whole(devices[(i % 2) as usize].clone(), FD, i * 1024, 1024))
+                .map(|i| BlockRef::whole(devices[(i % 2) as usize].clone(), fd(), i * 1024, 1024))
                 .collect();
 
             let mut stream = h.materialize(blocks, TierPriority::High);
@@ -540,12 +550,12 @@ fn failed_completion_surfaces_as_err() {
 
         let h = scheduler.handle();
         async move {
-            let read = h.read(&dev, FD, 0, 4096, TierPriority::Medium).await;
+            let read = h.read(dev.clone(), fd(), 0, 4096, TierPriority::Medium).await;
             assert!(read.is_err(), "failed read must surface as Err, got Ok");
             let write = h
                 .write(
-                    &dev,
-                    FD,
+                    dev.clone(),
+                    fd(),
                     0,
                     bytes::Bytes::from_static(b"abcd"),
                     TierPriority::Medium,
@@ -570,7 +580,7 @@ fn oversize_op_fails_fast() {
         let dev = devices[0].clone();
         let h = scheduler.handle();
         async move {
-            let result = h.read(&dev, FD, 0, 64 * 1024, TierPriority::Medium).await;
+            let result = h.read(dev.clone(), fd(), 0, 64 * 1024, TierPriority::Medium).await;
             assert!(
                 matches!(
                     result.as_ref().map_err(|e| e.kind()),

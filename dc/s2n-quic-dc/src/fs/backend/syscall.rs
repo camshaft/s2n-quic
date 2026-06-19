@@ -51,7 +51,7 @@ use std::os::fd::RawFd;
 /// reads into / writes from the caller's page-aligned [`AlignedBuf`] in place. (`O_DIRECT` alignment
 /// of the offset is validated at submit time; the buffer pointer/length are aligned by `AlignedBuf`.)
 fn execute(op: &mut Entry<IoOp>) {
-    let fd = op.fd as RawFd;
+    let fd = op.fd.as_raw();
     let offset = op.offset;
     let want = op.len as usize;
     let result = match op.kind {
@@ -396,7 +396,7 @@ mod tests {
     #[test]
     fn write_then_read_roundtrip() {
         let path = temp_path("roundtrip");
-        let file = File::open(
+        let file = std::sync::Arc::new(File::open(
             &path,
             Options {
                 truncate: true,
@@ -404,8 +404,8 @@ mod tests {
                 direct: false,
             },
         )
-        .unwrap();
-        let fd = file.raw_fd();
+        .unwrap());
+        let fd = crate::fs::op::Fd::new(file.clone());
 
         run_local(|mut spawn, registry| {
             let path = path.clone();
@@ -416,13 +416,13 @@ mod tests {
                 let payload =
                     bytes::Bytes::from_static(b"the quick brown fox jumps over the lazy dog");
                 let n = h
-                    .write(&dev, fd, 0, payload.clone(), TierPriority::Medium)
+                    .write(dev.clone(), fd.clone(), 0, payload.clone(), TierPriority::Medium)
                     .await
                     .unwrap();
                 assert_eq!(n, payload.len());
 
                 let buf = h
-                    .read(&dev, fd, 0, payload.len() as u32, TierPriority::High)
+                    .read(dev.clone(), fd.clone(), 0, payload.len() as u32, TierPriority::High)
                     .await
                     .unwrap();
                 assert_eq!(
@@ -445,7 +445,7 @@ mod tests {
     #[test]
     fn high_concurrency_stays_bounded_and_conserves() {
         let path = temp_path("stress");
-        let file = File::open(
+        let file = std::sync::Arc::new(File::open(
             &path,
             Options {
                 truncate: true,
@@ -453,8 +453,8 @@ mod tests {
                 direct: false,
             },
         )
-        .unwrap();
-        let fd = file.raw_fd();
+        .unwrap());
+        let fd = crate::fs::op::Fd::new(file.clone());
 
         run_local(|mut spawn, registry| {
             let path = path.clone();
@@ -468,6 +468,7 @@ mod tests {
                 for w in 0..32u64 {
                     let h = scheduler.handle();
                     let dev = dev.clone();
+                    let fd = fd.clone();
                     let completed = completed.clone();
                     tasks.push(tokio::task::spawn_local(async move {
                         for i in 0..4u64 {
@@ -475,7 +476,7 @@ mod tests {
                             let data = bytes::Bytes::from(vec![(w & 0xff) as u8; 256]);
                             // Each write is 256 bytes; with 4 KiB capacity at most 16 can be admitted
                             // at once, so the rest park on credit (never on a thread).
-                            if h.write(&dev, fd, off, data, TierPriority::Medium)
+                            if h.write(dev.clone(), fd.clone(), off, data, TierPriority::Medium)
                                 .await
                                 .is_ok()
                             {
@@ -500,12 +501,20 @@ mod tests {
     /// A read past a bad fd surfaces as `Err` rather than hanging, and conserves credit.
     #[test]
     fn bad_fd_read_fails_not_hangs() {
+        // An `Fd` wrapping a never-valid descriptor (-1) — the `pread` fails with EBADF.
+        struct BadFd;
+        impl std::os::fd::AsRawFd for BadFd {
+            fn as_raw_fd(&self) -> std::os::fd::RawFd {
+                -1
+            }
+        }
         run_local(|mut spawn, registry| async move {
             let (scheduler, dev) = build(&mut spawn, &registry, 1 << 16);
             let h = scheduler.handle();
 
             // fd -1 is never valid: the pread fails with EBADF and must surface as Err promptly.
-            let result = h.read(&dev, -1, 0, 4096, TierPriority::Medium).await;
+            let bad = crate::fs::op::Fd::new(Arc::new(BadFd));
+            let result = h.read(dev.clone(), bad, 0, 4096, TierPriority::Medium).await;
             assert!(result.is_err(), "read on a bad fd must fail, not hang");
 
             // Conservation holds on the failure path too.
@@ -522,7 +531,7 @@ mod tests {
         use crate::fs::direct::{AlignedBuf, ALIGNMENT};
         let path = temp_path("direct");
         // Open in direct mode (falls back to buffered on tmpfs / macOS without O_DIRECT semantics).
-        let file = File::open(
+        let file = std::sync::Arc::new(File::open(
             &path,
             Options {
                 truncate: true,
@@ -530,8 +539,8 @@ mod tests {
                 direct: true,
             },
         )
-        .unwrap();
-        let fd = file.raw_fd();
+        .unwrap());
+        let fd = crate::fs::op::Fd::new(file.clone());
 
         run_local(|mut spawn, registry| {
             let path = path.clone();
@@ -546,7 +555,7 @@ mod tests {
                     *b = (i & 0xff) as u8;
                 }
                 let (wbuf, n) = h
-                    .write_direct(&dev, fd, 0, wbuf, TierPriority::Medium)
+                    .write_direct(dev.clone(), fd.clone(), 0, wbuf, TierPriority::Medium)
                     .await
                     .expect("direct write");
                 assert_eq!(n, ALIGNMENT);
@@ -555,7 +564,7 @@ mod tests {
                 // Read it back into a fresh aligned buffer, in place.
                 let rbuf = AlignedBuf::new(ALIGNMENT);
                 let (rbuf, rn) = h
-                    .read_direct(&dev, fd, 0, rbuf, TierPriority::High)
+                    .read_direct(dev.clone(), fd.clone(), 0, rbuf, TierPriority::High)
                     .await
                     .expect("direct read");
                 assert_eq!(rn, ALIGNMENT, "direct read returned wrong byte count");
@@ -566,7 +575,7 @@ mod tests {
 
                 // A misaligned offset must be rejected before any IO.
                 let bad = AlignedBuf::new(ALIGNMENT);
-                let err = h.read_direct(&dev, fd, 1, bad, TierPriority::Medium).await;
+                let err = h.read_direct(dev.clone(), fd.clone(), 1, bad, TierPriority::Medium).await;
                 assert!(
                     matches!(
                         err.as_ref().map_err(|e| e.kind()),
@@ -579,7 +588,7 @@ mod tests {
                 // A misaligned direct LENGTH must also be rejected at submit (not deep-EINVAL).
                 let bad_len = AlignedBuf::new(100); // len 100 is not block-aligned
                 let err = h
-                    .read_direct(&dev, fd, 0, bad_len, TierPriority::Medium)
+                    .read_direct(dev.clone(), fd.clone(), 0, bad_len, TierPriority::Medium)
                     .await;
                 assert!(
                     matches!(
@@ -604,7 +613,7 @@ mod tests {
     fn materialize_direct_streams_in_order() {
         use crate::fs::{direct::ALIGNMENT, scheduler::BlockRef};
         let path = temp_path("materialize-direct");
-        let file = File::open(
+        let file = std::sync::Arc::new(File::open(
             &path,
             Options {
                 truncate: true,
@@ -612,8 +621,8 @@ mod tests {
                 direct: true,
             },
         )
-        .unwrap();
-        let fd = file.raw_fd();
+        .unwrap());
+        let fd = crate::fs::op::Fd::new(file.clone());
 
         // Pre-fill 8 aligned blocks with a per-block pattern (block k -> byte value k).
         let nblocks = 8usize;
@@ -631,7 +640,7 @@ mod tests {
 
                 let blocks: Vec<BlockRef> = (0..nblocks)
                     .map(|k| {
-                        BlockRef::whole(dev.clone(), fd, (k * ALIGNMENT) as u64, ALIGNMENT as u32)
+                        BlockRef::whole(dev.clone(), fd.clone(), (k * ALIGNMENT) as u64, ALIGNMENT as u32)
                     })
                     .collect();
 
@@ -664,7 +673,7 @@ mod tests {
     #[test]
     fn short_read_at_eof_reports_actual_len() {
         let path = temp_path("eof");
-        let file = File::open(
+        let file = std::sync::Arc::new(File::open(
             &path,
             Options {
                 truncate: true,
@@ -672,8 +681,8 @@ mod tests {
                 direct: false,
             },
         )
-        .unwrap();
-        let fd = file.raw_fd();
+        .unwrap());
+        let fd = crate::fs::op::Fd::new(file.clone());
         // Write exactly 10 bytes, then ask for 4096.
         file.write_at(b"0123456789", 0).unwrap();
         file.sync().unwrap();
@@ -685,7 +694,7 @@ mod tests {
                 let h = _scheduler.handle();
 
                 let buf = h
-                    .read(&dev, fd, 0, 4096, TierPriority::Medium)
+                    .read(dev.clone(), fd.clone(), 0, 4096, TierPriority::Medium)
                     .await
                     .unwrap();
                 assert_eq!(
@@ -709,7 +718,7 @@ mod tests {
     #[test]
     fn handle_shared_across_threads() {
         let path = temp_path("mt");
-        let file = File::open(
+        let file = std::sync::Arc::new(File::open(
             &path,
             Options {
                 truncate: true,
@@ -717,8 +726,8 @@ mod tests {
                 direct: false,
             },
         )
-        .unwrap();
-        let fd = file.raw_fd();
+        .unwrap());
+        let fd = crate::fs::op::Fd::new(file.clone());
 
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(4)
@@ -752,12 +761,13 @@ mod tests {
             for t in 0..threads {
                 let h = scheduler.handle();
                 let dev = dev.clone();
+                let fd = fd.clone();
                 tasks.push(tokio::spawn(async move {
                     let mut ok = 0u64;
                     for i in 0..per_task {
                         let off = (t as u64 * per_task + i) * 4096;
                         let data = bytes::Bytes::from(vec![(t & 0xff) as u8; 256]);
-                        if h.write(&dev, fd, off, data, TierPriority::Medium)
+                        if h.write(dev.clone(), fd.clone(), off, data, TierPriority::Medium)
                             .await
                             .is_ok()
                         {

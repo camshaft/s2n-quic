@@ -167,38 +167,48 @@ impl Drop for EventFd {
 /// `ALIVE` bit of [`EventFdWaker::state`]: set while the ring thread is running; cleared on teardown
 /// so a late wake skips the syscall.
 const WAKER_ALIVE: usize = 0b01;
-/// `NOTIFIED` bit of [`EventFdWaker::state`]: a wake has been signalled but the ring has not yet
-/// consumed it. Coalesces a burst — only the producer that sets this bit writes the eventfd.
-const WAKER_NOTIFIED: usize = 0b10;
+/// `PARKED` bit of [`EventFdWaker::state`]: the ring is about to block (or is blocked) in
+/// `submit_and_wait` **with nothing in flight**, so the eventfd is the *only* thing that can wake it.
+/// A producer writes the eventfd **only** when this bit is set — see the type docs.
+const WAKER_PARKED: usize = 0b10;
 
-/// The [`Waker`] the ring's intake channel fires when a producer sends an op: it writes the eventfd,
-/// which completes the ring's armed [`PollAdd`](opcode::PollAdd) and breaks `submit_and_wait`. It
-/// **owns a shared reference to the [`EventFd`]** (`StdArc<EventFd>`), so the descriptor stays open as
-/// long as any waker exists — even after the ring loop has exited and dropped its own reference (the
-/// `Arc`, not a flag, is what guarantees the fd is valid).
+/// The [`Waker`] the ring's intake channel fires when a producer sends an op. It **owns a shared
+/// reference to the [`EventFd`]** (`StdArc<EventFd>`), so the descriptor stays open as long as any
+/// waker exists — even after the ring loop has exited and dropped its own reference (the `Arc`, not a
+/// flag, is what guarantees the fd is valid).
 ///
-/// A single packed `state` word holds both control bits ([`WAKER_ALIVE`], [`WAKER_NOTIFIED`]), so a
-/// producer does **one** atomic op to decide whether to write:
+/// # Signal only when the ring is parked (the throughput fix)
 ///
-/// * **liveness** — after teardown the ring clears `ALIVE`, so a late wake on a stale registered waker
-///   is a no-op (a cheap short-circuit; safety is the `Arc`).
-/// * **burst coalescing** — only the producer that flips `NOTIFIED` off → on performs the eventfd
-///   write; while a wake is still unconsumed the rest skip the syscall (the kernel counter would
-///   coalesce them into one `POLLIN`, but this avoids even the `write`). The ring clears `NOTIFIED`
-///   *before* draining the channel each loop, so a send that races the drain re-takes the transition
-///   and re-signals — never lost. Same flag discipline as the thread-park waker in
-///   [`blocking`](super::blocking).
+/// io_uring has its own internal concurrency (the kernel `io-wq` pool), and `submit_and_wait(1)`
+/// already wakes on the next completion **whenever any op is in flight**. So the eventfd write is
+/// needed in exactly one situation: the ring has gone **idle** (nothing outstanding) and blocked,
+/// where no completion will ever arrive to wake it. When the ring is busy, a producer's op is picked
+/// up on the next completion's re-drain — signalling would be a wasted syscall *on the hot dispatch
+/// thread* (measured: ~1 eventfd `write` per op, the dominant cost of the loaded uring path).
+///
+/// The packed `state` word carries [`WAKER_ALIVE`] + [`WAKER_PARKED`]. A producer does one atomic:
+/// clear `PARKED` and read the prior value; it writes the eventfd **iff** the ring was `ALIVE` and
+/// `PARKED`. That both gates the write to the parked state *and* coalesces — only the producer that
+/// wins the parked→unparked transition writes; a concurrent burst sees `PARKED` already clear and
+/// skips. The ring re-checks the channel *after* arming `PARKED` (see [`ring_loop`]), closing the
+/// enqueue-races-park window so a wake is never lost.
 struct EventFdWaker {
     efd: StdArc<EventFd>,
     state: AtomicUsize,
 }
 
 impl EventFdWaker {
-    /// Clear `NOTIFIED`, called by the ring thread immediately before it drains the channel so a wake
-    /// racing the drain re-signals.
+    /// Arm `PARKED` before the ring blocks idle. Paired with a re-check of the channel so an op that
+    /// arrived just before this is not stranded.
     #[inline]
-    fn clear_notified(&self) {
-        self.state.fetch_and(!WAKER_NOTIFIED, Ordering::AcqRel);
+    fn arm_park(&self) {
+        self.state.fetch_or(WAKER_PARKED, Ordering::AcqRel);
+    }
+
+    /// Clear `PARKED` — on wake, or to cancel an arm when the post-arm re-check found work.
+    #[inline]
+    fn disarm_park(&self) {
+        self.state.fetch_and(!WAKER_PARKED, Ordering::AcqRel);
     }
 
     /// Clear `ALIVE` on ring teardown so later wakes short-circuit.
@@ -214,16 +224,67 @@ impl Wake for EventFdWaker {
     }
 
     fn wake_by_ref(self: &StdArc<Self>) {
-        // One atomic: set NOTIFIED and read the prior state. Write the eventfd only if the ring is
-        // ALIVE and NOTIFIED was not already set (this producer won the burst's first wake).
-        let prev = self.state.fetch_or(WAKER_NOTIFIED, Ordering::AcqRel);
-        if prev & WAKER_ALIVE != 0 && prev & WAKER_NOTIFIED == 0 {
+        // One atomic: clear PARKED and read the prior state. Write the eventfd only if the ring was
+        // ALIVE **and** PARKED — i.e. idle and blocked, the only state that needs an external wake.
+        // A busy (un-parked) ring picks the op up on its next completion re-drain, so we skip the
+        // syscall. Clearing PARKED also coalesces a burst to a single write.
+        let prev = self.state.fetch_and(!WAKER_PARKED, Ordering::AcqRel);
+        if prev & WAKER_ALIVE != 0 && prev & WAKER_PARKED != 0 {
             self.efd.signal();
         }
     }
 }
 
 // ── Ring loop ─────────────────────────────────────────────────────────────────
+
+/// Drain newly-submitted ops from the intake channel into the ring's SQ, bounded by free ring space
+/// (`outstanding < depth`). Parks the op in the slab (it owns the op + buffer for the whole kernel
+/// operation) and pushes its SQE from the now-stable buffer pointer. Returns `false` when the channel
+/// has closed (all senders dropped). Called both at the top of each loop and again after arming the
+/// park (to close the enqueue-races-park window).
+#[allow(clippy::too_many_arguments)]
+fn drain_into_sq(
+    ring: &mut IoUring,
+    slab: &mut InFlightSlab<IoOp>,
+    rx: &mut sync_chan::Receiver<IoOp>,
+    cx: &mut Context<'_>,
+    budget: &mut Budget,
+    to_resubmit: &mut Vec<usize>,
+    depth: usize,
+) -> bool {
+    budget.reset();
+    while slab.outstanding() < depth {
+        // Disambiguate: the `sync` channel's `Receiver<IoOp>` implements
+        // `channel::Receiver<Entry<IoOp>>` (single-entry) and `..<Queue<IoOp>>` (batch); we want the
+        // single-entry form so each `Ready(Some(_))` is one `Entry<IoOp>`.
+        let polled = <sync_chan::Receiver<IoOp> as crate::socket::channel::Receiver<
+            Entry<IoOp>,
+        >>::poll_recv(rx, cx, budget);
+        match polled {
+            core::task::Poll::Ready(Some(op)) => {
+                let want = transfer_len(&op);
+                let id = slab.insert(op, want);
+                let entry = build_sqe(&slab.get(id).unwrap().op, 0, id as u64);
+                // SAFETY: the op (and its buffer) lives in the slab until its CQE is reaped, so the
+                // buffer pointer in the SQE stays valid for the kernel operation's duration.
+                match unsafe { ring.submission().push(&entry) } {
+                    Ok(()) => {}
+                    Err(_) => {
+                        // SQ full despite the outstanding<depth bound: keep the op pinned and re-push
+                        // its SQE on a later iteration (done=0). Stop draining — the SQ has no room.
+                        to_resubmit.push(id);
+                        break;
+                    }
+                }
+                budget.reset();
+            }
+            // Channel closed (all senders dropped) → teardown signal.
+            core::task::Poll::Ready(None) => return false,
+            core::task::Poll::Pending => break,
+        }
+    }
+    true
+}
 
 /// Build an SQE that arms a **multishot** poll on the eventfd for `POLLIN`, tagged with
 /// [`EVENTFD_TOKEN`]. Multishot stays armed across firings (kernel ≥ 5.13); the loop re-arms if the
@@ -291,49 +352,18 @@ fn ring_loop(
             }
         });
 
-        // 3. Drain newly-submitted ops from the intake channel into the SQ, bounded by free ring
-        //    space. `poll_recv` with our eventfd waker registers it whenever the channel goes empty,
-        //    so the next `send` wakes us. A closed channel (all senders dropped) flips `rx_open`.
-        //
-        // Clear NOTIFIED *before* draining: a producer that enqueues after this point (racing the
-        // drain) re-takes the wake transition and re-signals the eventfd, so its op is never stranded
-        // waiting for a wake we already consumed.
-        waker.clear_notified();
-        budget.reset();
-        while slab.outstanding() < depth {
-            // Disambiguate: the `sync` channel's `Receiver<IoOp>` implements
-            // `channel::Receiver<Entry<IoOp>>` (single-entry) and `..<Queue<IoOp>>` (batch); we want
-            // the single-entry form so each `Ready(Some(_))` is one `Entry<IoOp>`.
-            let polled = <sync_chan::Receiver<IoOp> as crate::socket::channel::Receiver<
-                Entry<IoOp>,
-            >>::poll_recv(&mut rx, &mut cx, &mut budget);
-            match polled {
-                core::task::Poll::Ready(Some(op)) => {
-                    // Park the op (and its buffer) in the slab — it owns the op for the whole kernel
-                    // operation — then build the SQE from the now-stable buffer pointer.
-                    let want = transfer_len(&op);
-                    let id = slab.insert(op, want);
-                    let entry = build_sqe(&slab.get(id).unwrap().op, 0, id as u64);
-                    // SAFETY: the op (and its buffer) lives in the slab until its CQE is reaped, so the
-                    // buffer pointer in the SQE stays valid for the kernel operation's duration.
-                    match unsafe { ring.submission().push(&entry) } {
-                        Ok(()) => {}
-                        Err(_) => {
-                            // SQ full despite the outstanding<depth bound: keep the op pinned in the
-                            // slab and re-push its SQE on a later iteration (done=0). Stop draining
-                            // this pass — the SQ has no room.
-                            to_resubmit.push(id);
-                            break;
-                        }
-                    }
-                    budget.reset();
-                }
-                core::task::Poll::Ready(None) => {
-                    rx_open = false;
-                    break;
-                }
-                core::task::Poll::Pending => break,
-            }
+        // 3. Drain newly-submitted ops from the intake channel into the SQ (bounded by free ring
+        //    space). `poll_recv` registers the eventfd waker whenever the channel goes empty.
+        if !drain_into_sq(
+            &mut ring,
+            &mut slab,
+            &mut rx,
+            &mut cx,
+            &mut budget,
+            &mut to_resubmit,
+            depth,
+        ) {
+            rx_open = false;
         }
 
         // 4. Exit check: channel closed and nothing in flight → tear down. Mark the waker dead so any
@@ -343,25 +373,68 @@ fn ring_loop(
             return;
         }
 
-        // 5. Submit and wait for at least one completion (a real CQE or the eventfd poll). A submit
-        //    error NEVER frees in-flight buffers — they stay pinned and we fall through to reap
-        //    whatever completions exist (treating the error like EINTR).
-        match ring.submit_and_wait(1) {
-            Ok(_) => {}
-            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-            Err(_) => {}
+        // 5. Wait for progress. Two regimes:
+        //
+        //    * **Busy** (ops in flight): a completion is guaranteed to arrive and break
+        //      `submit_and_wait(1)`, after which step 3 re-drains and picks up any newly-queued op.
+        //      We do NOT arm the park, so producers see `PARKED` clear and **skip the eventfd write
+        //      entirely** — this is the fix that removes the ~1-syscall-per-op producer tax under
+        //      load. The armed eventfd poll is harmless here (it just never fires).
+        //    * **Idle** (nothing in flight, channel open, nothing queued): no completion will ever
+        //      wake us, so the eventfd is the only wake source. Arm `PARKED`, then **re-drain once**
+        //      to close the window where an op was enqueued between step 3 and the arm (its waker saw
+        //      `PARKED` clear and skipped the write). If that re-drain finds work, disarm and loop
+        //      without blocking; otherwise block in `submit_and_wait(1)` on the eventfd poll alone.
+        //
+        //    A submit error NEVER frees in-flight buffers — they stay pinned and we fall through to
+        //    reap whatever completions exist (treating the error like EINTR).
+        let idle = slab.is_idle() && to_resubmit.is_empty();
+        if idle && rx_open {
+            waker.arm_park();
+            // Re-check the channel after arming: an op enqueued just before `arm_park` had its waker
+            // observe `PARKED` clear and skip the eventfd write, so we must pick it up ourselves —
+            // otherwise it would wait for a wake that never comes (lost wakeup).
+            if !drain_into_sq(
+                &mut ring,
+                &mut slab,
+                &mut rx,
+                &mut cx,
+                &mut budget,
+                &mut to_resubmit,
+                depth,
+            ) {
+                rx_open = false;
+            }
+            if !slab.is_idle() || !to_resubmit.is_empty() || !rx_open {
+                // Work arrived (or teardown) during the arm — cancel the park and loop to handle it.
+                waker.disarm_park();
+            } else {
+                // Genuinely idle: block until the eventfd poll fires (a producer wrote it because
+                // `PARKED` is set), then disarm.
+                let _ = ring.submit_and_wait(1);
+                waker.disarm_park();
+            }
+        } else {
+            // Busy: block for the next completion. No park arm → no producer eventfd write.
+            match ring.submit_and_wait(1) {
+                Ok(_) => {}
+                Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(_) => {}
+            }
         }
 
-        // 6. Reap completions. The eventfd token is drained + (if no longer multishot) re-armed; a
-        //    short read/write advances progress and is marked for re-submit; otherwise the op is
-        //    completed in place and its slab slot (and buffer) freed.
+        // 6. Reap completions. The eventfd token's counter is drained only if it fired; a short
+        //    read/write advances progress and is marked for re-submit; otherwise the op is completed
+        //    in place and its slab slot (and buffer) freed.
         completed.clear();
+        let mut saw_wake = false;
         {
             let mut cq = ring.completion();
             cq.sync();
             for cqe in &mut cq {
                 let token = cqe.user_data();
                 if token == EVENTFD_TOKEN {
+                    saw_wake = true;
                     // The poll fired (a producer wrote the eventfd). If the kernel says it is no
                     // longer armed, re-arm next iteration.
                     if !io_uring::cqueue::more(cqe.flags()) {
@@ -380,8 +453,12 @@ fn ring_loop(
                 }
             }
         }
-        // Drain the eventfd counter AFTER reaping so a write that raced the drain re-fires the poll.
-        efd.drain();
+        // Drain the eventfd counter only when its poll actually fired — skipping the per-iteration
+        // `read` syscall on the hot (busy) path, where the eventfd is never written. Drained AFTER
+        // reaping so a write that raced the drain re-fires the (multishot) poll rather than being lost.
+        if saw_wake {
+            efd.drain();
+        }
 
         for &id in &completed {
             if let Some(mut op) = slab.take(id) {
@@ -488,7 +565,7 @@ fn transfer_len(op: &IoOp) -> usize {
 /// buffer arrives pre-sized + logically empty per the [`IoBuf::Read`] contract); the kernel fills it
 /// and the CQE's byte count is applied via `set_len` in `finalize`. No `resize`/zero-fill.
 fn build_sqe(op: &IoOp, done: usize, user_data: u64) -> io_uring::squeue::Entry {
-    let fd = types::Fd(op.fd as RawFd);
+    let fd = types::Fd(op.fd.as_raw());
     let off = op.offset + done as u64;
     match op.kind {
         IoKind::Read => {
@@ -701,7 +778,7 @@ mod tests {
     #[test]
     fn uring_write_then_read_roundtrip() {
         let path = temp_path("rt");
-        let file = File::open(
+        let file = std::sync::Arc::new(File::open(
             &path,
             Options {
                 truncate: true,
@@ -709,8 +786,8 @@ mod tests {
                 direct: false,
             },
         )
-        .unwrap();
-        let fd = file.raw_fd();
+        .unwrap());
+        let fd = crate::fs::op::Fd::new(file.clone());
         run_local(|mut spawn, registry| {
             let path = path.clone();
             async move {
@@ -726,13 +803,13 @@ mod tests {
 
                 let payload = bytes::Bytes::from_static(b"io_uring round trip payload");
                 let n = h
-                    .write(&dev, fd, 0, payload.clone(), TierPriority::Medium)
+                    .write(dev.clone(), fd.clone(), 0, payload.clone(), TierPriority::Medium)
                     .await
                     .unwrap();
                 assert_eq!(n, payload.len());
 
                 let buf = h
-                    .read(&dev, fd, 0, payload.len() as u32, TierPriority::High)
+                    .read(dev.clone(), fd.clone(), 0, payload.len() as u32, TierPriority::High)
                     .await
                     .unwrap();
                 assert_eq!(&buf[..], &payload[..]);
@@ -748,7 +825,7 @@ mod tests {
     #[test]
     fn uring_high_concurrency_conserves() {
         let path = temp_path("stress");
-        let file = File::open(
+        let file = std::sync::Arc::new(File::open(
             &path,
             Options {
                 truncate: true,
@@ -756,8 +833,8 @@ mod tests {
                 direct: false,
             },
         )
-        .unwrap();
-        let fd = file.raw_fd();
+        .unwrap());
+        let fd = crate::fs::op::Fd::new(file.clone());
         run_local(|mut spawn, registry| {
             let path = path.clone();
             async move {
@@ -774,12 +851,13 @@ mod tests {
                 for w in 0..32u64 {
                     let h = scheduler.handle();
                     let dev = dev.clone();
+                    let fd = fd.clone();
                     let completed = completed.clone();
                     tasks.push(tokio::task::spawn_local(async move {
                         for i in 0..4u64 {
                             let off = (w * 4 + i) * 512;
                             let data = bytes::Bytes::from(vec![(w & 0xff) as u8; 256]);
-                            if h.write(&dev, fd, off, data, TierPriority::Medium)
+                            if h.write(dev.clone(), fd.clone(), off, data, TierPriority::Medium)
                                 .await
                                 .is_ok()
                             {
@@ -822,7 +900,15 @@ mod tests {
             );
             let dev = scheduler.register_device("test", &byte_device(1 << 16)).unwrap();
             let h = scheduler.handle();
-            let result = h.read(&dev, -1, 0, 4096, TierPriority::Medium).await;
+            // An `Fd` wrapping a never-valid descriptor (-1): io_uring returns -EBADF in the CQE.
+            struct BadFd;
+            impl std::os::fd::AsRawFd for BadFd {
+                fn as_raw_fd(&self) -> std::os::fd::RawFd {
+                    -1
+                }
+            }
+            let bad = crate::fs::op::Fd::new(Arc::new(BadFd));
+            let result = h.read(dev.clone(), bad, 0, 4096, TierPriority::Medium).await;
             assert!(result.is_err(), "bad fd read must fail, not hang");
             for pool in dev.pools.all() {
                 assert_eq!(pool.debug_free_total(), pool.debug_capacity() as i64);
@@ -838,7 +924,7 @@ mod tests {
     #[test]
     fn uring_producer_wakes_idle_ring() {
         let path = temp_path("dualwait");
-        let file = File::open(
+        let file = std::sync::Arc::new(File::open(
             &path,
             Options {
                 truncate: true,
@@ -846,8 +932,8 @@ mod tests {
                 direct: false,
             },
         )
-        .unwrap();
-        let fd = file.raw_fd();
+        .unwrap());
+        let fd = crate::fs::op::Fd::new(file.clone());
         file.write_at(b"dual-wait payload", 0).unwrap();
         file.sync().unwrap();
         run_local(|mut spawn, registry| {
@@ -866,7 +952,7 @@ mod tests {
                 // exercises the producer-wakes-idle-ring path rather than a busy ring.
                 tokio::time::sleep(std::time::Duration::from_millis(20)).await;
                 let buf = h
-                    .read(&dev, fd, 0, b"dual-wait payload".len() as u32, TierPriority::High)
+                    .read(dev.clone(), fd.clone(), 0, b"dual-wait payload".len() as u32, TierPriority::High)
                     .await
                     .expect("idle-ring read must complete via eventfd wake");
                 assert_eq!(&buf[..], b"dual-wait payload");
@@ -882,7 +968,7 @@ mod tests {
     #[test]
     fn uring_lazy_registration_works() {
         let path = temp_path("lazyreg");
-        let file = File::open(
+        let file = std::sync::Arc::new(File::open(
             &path,
             Options {
                 truncate: true,
@@ -890,8 +976,8 @@ mod tests {
                 direct: false,
             },
         )
-        .unwrap();
-        let fd = file.raw_fd();
+        .unwrap());
+        let fd = crate::fs::op::Fd::new(file.clone());
         run_local(|mut spawn, registry| {
             let path = path.clone();
             async move {
@@ -908,11 +994,11 @@ mod tests {
                     .expect("lazy registration");
                 let h = scheduler.handle();
                 let payload = bytes::Bytes::from_static(b"lazily registered device");
-                h.write(&dev, fd, 0, payload.clone(), TierPriority::Medium)
+                h.write(dev.clone(), fd.clone(), 0, payload.clone(), TierPriority::Medium)
                     .await
                     .unwrap();
                 let buf = h
-                    .read(&dev, fd, 0, payload.len() as u32, TierPriority::High)
+                    .read(dev.clone(), fd.clone(), 0, payload.len() as u32, TierPriority::High)
                     .await
                     .unwrap();
                 assert_eq!(&buf[..], &payload[..]);
@@ -934,7 +1020,7 @@ mod tests {
     fn uring_direct_zero_copy_roundtrip() {
         use crate::fs::direct::{AlignedBuf, ALIGNMENT};
         let path = temp_path("direct");
-        let file = File::open(
+        let file = std::sync::Arc::new(File::open(
             &path,
             Options {
                 truncate: true,
@@ -942,8 +1028,8 @@ mod tests {
                 direct: true,
             },
         )
-        .unwrap();
-        let fd = file.raw_fd();
+        .unwrap());
+        let fd = crate::fs::op::Fd::new(file.clone());
         run_local(|mut spawn, registry| {
             let path = path.clone();
             async move {
@@ -962,7 +1048,7 @@ mod tests {
                     *b = (i & 0xff) as u8;
                 }
                 let (wbuf, n) = h
-                    .write_direct(&dev, fd, 0, wbuf, TierPriority::Medium)
+                    .write_direct(dev.clone(), fd.clone(), 0, wbuf, TierPriority::Medium)
                     .await
                     .expect("direct write");
                 assert_eq!(n, ALIGNMENT);
@@ -970,7 +1056,7 @@ mod tests {
 
                 let rbuf = AlignedBuf::new(ALIGNMENT);
                 let (rbuf, rn) = h
-                    .read_direct(&dev, fd, 0, rbuf, TierPriority::High)
+                    .read_direct(dev.clone(), fd.clone(), 0, rbuf, TierPriority::High)
                     .await
                     .expect("direct read");
                 assert_eq!(rn, ALIGNMENT, "direct read returned wrong byte count");

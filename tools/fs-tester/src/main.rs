@@ -138,16 +138,20 @@ async fn run_workload(cfg: Config) {
             std::process::id()
         )
     });
-    let file = File::open(
-        &path,
-        Options {
-            truncate: true,
-            size: cfg.file_size,
-            direct: cfg.direct,
-        },
-    )
-    .expect("open test file");
-    let fd = file.raw_fd();
+    let file = Arc::new(
+        File::open(
+            &path,
+            Options {
+                truncate: true,
+                size: cfg.file_size,
+                direct: cfg.direct,
+            },
+        )
+        .expect("open test file"),
+    );
+    // Carry the file as an `Fd` (Arc-backed) so every in-flight op pins it open — no UAF if the
+    // `file` handle is dropped before the op completes.
+    let fd = s2n_quic_dc::fs::op::Fd::new(file.clone());
 
     // One device sized in bytes (bandwidth-cost model), queue depth = capacity. Registered after the
     // scheduler is built (the new lazy-registration API), which hands back the `Arc<Device>` handle.
@@ -195,6 +199,7 @@ async fn run_workload(cfg: Config) {
     for s in 0..cfg.streams {
         let h = scheduler.handle();
         let dev = dev.clone();
+        let fd = fd.clone();
         let stop = stop.clone();
         let counters = counters.clone();
         let op_size = cfg.op_size;
@@ -213,7 +218,7 @@ async fn run_workload(cfg: Config) {
                     OpMix::Mixed => i.is_multiple_of(2),
                 };
                 let start = Instant::now();
-                let ok = run_one(&h, &dev, fd, offset, op_size, is_read, direct).await;
+                let ok = run_one(&h, &dev, &fd, offset, op_size, is_read, direct).await;
                 let elapsed_us = start.elapsed().as_micros() as u64;
                 counters.record(ok, op_size as u64, elapsed_us);
                 i += 1;
@@ -239,7 +244,7 @@ async fn run_workload(cfg: Config) {
 async fn run_one(
     h: &SubmitHandle,
     dev: &Arc<Device>,
-    fd: i32,
+    fd: &s2n_quic_dc::fs::op::Fd,
     offset: u64,
     op_size: usize,
     is_read: bool,
@@ -249,22 +254,22 @@ async fn run_one(
         use s2n_quic_dc::fs::direct::AlignedBuf;
         if is_read {
             let buf = AlignedBuf::new(op_size);
-            h.read_direct(dev, fd, offset, buf, Priority::Medium)
+            h.read_direct(dev.clone(), fd.clone(), offset, buf, Priority::Medium)
                 .await
                 .is_ok()
         } else {
             let buf = AlignedBuf::new(op_size);
-            h.write_direct(dev, fd, offset, buf, Priority::Medium)
+            h.write_direct(dev.clone(), fd.clone(), offset, buf, Priority::Medium)
                 .await
                 .is_ok()
         }
     } else if is_read {
-        h.read(dev, fd, offset, op_size as u32, Priority::Medium)
+        h.read(dev.clone(), fd.clone(), offset, op_size as u32, Priority::Medium)
             .await
             .is_ok()
     } else {
         let data = bytes::Bytes::from(vec![0u8; op_size]);
-        h.write(dev, fd, offset, data, Priority::Medium)
+        h.write(dev.clone(), fd.clone(), offset, data, Priority::Medium)
             .await
             .is_ok()
     }

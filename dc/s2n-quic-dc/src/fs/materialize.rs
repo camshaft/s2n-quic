@@ -308,7 +308,7 @@ where
                     let r = self.handle.enqueue(
                         IoKind::Read,
                         &block.device,
-                        block.fd,
+                        block.fd.clone(),
                         block.offset,
                         block.len,
                         buf,

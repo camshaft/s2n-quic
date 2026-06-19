@@ -168,6 +168,15 @@ pub struct File {
     path: PathBuf,
 }
 
+impl std::os::fd::AsRawFd for File {
+    /// Lets `Arc<File>` coerce to `Arc<dyn AsRawFd + Send + Sync>` so it can back an
+    /// [`Fd`](crate::fs::op::Fd) — the file then stays open for an op's whole lifetime.
+    #[inline]
+    fn as_raw_fd(&self) -> std::os::fd::RawFd {
+        self.inner.as_raw_fd()
+    }
+}
+
 impl File {
     /// Open `path` per `options`, optionally in direct (unbuffered) mode.
     pub fn open(path: impl AsRef<Path>, options: Options) -> io::Result<Self> {
