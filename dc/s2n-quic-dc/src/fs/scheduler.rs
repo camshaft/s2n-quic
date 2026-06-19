@@ -333,8 +333,10 @@ impl SubmitHandle {
     }
 
     /// Submit a **zero-copy** `O_DIRECT` read at `offset` into the caller-owned, page-aligned `buf`,
-    /// reading `buf.len()` bytes. Resolves with the same buffer, filled in place — no data-path copy.
-    /// `offset` must be block-aligned (validated; `InvalidInput` otherwise).
+    /// reading up to `buf.len()` bytes. Resolves with `(buffer, n)` where `n` is the bytes actually
+    /// read — the buffer is filled in place and its logical length is set to `n`, so a short read at
+    /// EOF leaves no stale/zero tail (`buf.as_slice()` exposes exactly the `n` valid bytes). Both the
+    /// `offset` and `buf.len()` must be block-aligned (validated; `InvalidInput` otherwise).
     pub fn read_direct(
         &self,
         device: DeviceId,
@@ -342,17 +344,18 @@ impl SubmitHandle {
         offset: u64,
         buf: crate::fs::direct::AlignedBuf,
         priority: TierPriority,
-    ) -> impl core::future::Future<Output = std::io::Result<crate::fs::direct::AlignedBuf>> + 'static
-    {
+    ) -> impl core::future::Future<
+        Output = std::io::Result<(crate::fs::direct::AlignedBuf, usize)>,
+    > + 'static {
         let handle = self.clone();
         async move {
             let len = buf.len() as u32;
             let op = handle
                 .submit(IoKind::Read, device, fd, offset, len, IoBuf::Direct(buf), priority)
                 .await?;
-            match op.buf {
-                IoBuf::Direct(buf) => Ok(buf),
-                _ => unreachable!("direct read returned non-direct buffer"),
+            match (op.status, op.buf) {
+                (IoStatus::Done(n), IoBuf::Direct(buf)) => Ok((buf, n)),
+                other => unreachable!("direct read returned unexpected op: {other:?}"),
             }
         }
     }
@@ -408,14 +411,34 @@ impl SubmitHandle {
         })?;
         let cost = device.cost(kind, len);
 
-        // A zero-copy `O_DIRECT` op operates on the caller's buffer in place, so the **file offset**
-        // must be block-aligned (the buffer pointer/length are aligned by `AlignedBuf`). Validate up
-        // front — fail fast rather than let the kernel `EINVAL` it after burning a credit acquire.
-        if buf.is_direct() && !offset.is_multiple_of(crate::fs::direct::ALIGNMENT as u64) {
+        // The backends pass `offset` to positional syscalls / SQEs as a signed `off_t`; reject an
+        // offset that would wrap negative rather than issuing an IO at a bogus location.
+        if offset > i64::MAX as u64 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
-                "io scheduler: direct op offset is not block-aligned",
+                "io scheduler: offset exceeds i64::MAX",
             ));
+        }
+
+        // A zero-copy `O_DIRECT` op operates on the caller's buffer in place, so the **file offset**
+        // AND the **transfer length** must both be block-aligned (the buffer *pointer* is aligned by
+        // `AlignedBuf`, but its logical `len` is whatever the caller set). Validate both up front so
+        // a misaligned request fails fast at submit rather than as a confusing kernel `EINVAL` deep
+        // in the backend after burning a credit acquire.
+        if buf.is_direct() {
+            let align = crate::fs::direct::ALIGNMENT as u64;
+            if !offset.is_multiple_of(align) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "io scheduler: direct op offset is not block-aligned",
+                ));
+            }
+            if !(len as u64).is_multiple_of(align) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "io scheduler: direct op length is not block-aligned",
+                ));
+            }
         }
 
         // An `IoOp` is atomic — it has no partial-submit path — so an op costing more than its pool

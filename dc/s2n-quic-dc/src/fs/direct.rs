@@ -81,43 +81,40 @@ impl AlignedBuf {
         self.len == 0
     }
 
-    /// The page-rounded capacity (the size a direct read/write actually transfers).
+    /// The page-rounded allocation capacity (always a whole number of [`ALIGNMENT`] pages, and
+    /// `>= len`). This is the maximum the logical length can be set to, not necessarily what a given
+    /// transfer moves.
     #[inline]
-    pub fn aligned_len(&self) -> usize {
+    pub fn capacity(&self) -> usize {
         self.cap
     }
 
     #[inline]
     pub fn as_slice(&self) -> &[u8] {
-        // SAFETY: `ptr` is valid for `len` initialized bytes (alloc_zeroed initialized all `cap`).
+        // SAFETY: `ptr` is valid for `len` initialized bytes (alloc_zeroed initialized all `cap`,
+        // and `len <= cap` is maintained by `new`/`set_len`).
         unsafe { core::slice::from_raw_parts(self.ptr.as_ptr(), self.len) }
     }
 
     /// The logical-length mutable slice, for an in-place direct read destination (zero-copy).
     #[inline]
     pub fn as_mut_slice(&mut self) -> &mut [u8] {
-        // SAFETY: `ptr` is valid for `len` zero-initialized bytes and we hold `&mut self`.
+        // SAFETY: `ptr` is valid for `len` zero-initialized bytes (`len <= cap`) and we hold
+        // `&mut self`.
         unsafe { core::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len) }
     }
 
-    /// The full page-rounded slice, for an aligned direct write source.
-    #[inline]
-    pub fn as_aligned_slice(&self) -> &[u8] {
-        // SAFETY: all `cap` bytes were zero-initialized at allocation.
-        unsafe { core::slice::from_raw_parts(self.ptr.as_ptr(), self.cap) }
-    }
-
-    /// The full page-rounded mutable slice, for an aligned direct read destination.
-    #[inline]
-    pub fn as_aligned_mut(&mut self) -> &mut [u8] {
-        // SAFETY: all `cap` bytes were zero-initialized and we hold `&mut self`.
-        unsafe { core::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.cap) }
-    }
-
-    /// Set the logical length (must be `<= aligned capacity`).
+    /// Set the logical length, which must be `<= capacity`. The bound is a hard `assert!` (not a
+    /// `debug_assert!`) because `as_slice`/`as_mut_slice` build slices of `len` bytes via unsafe —
+    /// a `len > cap` would make those slices read/write out of bounds (UB), so the check must hold
+    /// in release builds too.
     #[inline]
     pub fn set_len(&mut self, len: usize) {
-        debug_assert!(len <= self.cap);
+        assert!(
+            len <= self.cap,
+            "AlignedBuf::set_len({len}) exceeds capacity {}",
+            self.cap
+        );
         self.len = len;
     }
 
@@ -272,9 +269,9 @@ mod tests {
         let buf = AlignedBuf::new(100);
         assert!(buf.is_aligned());
         assert_eq!(buf.len(), 100);
-        assert_eq!(buf.aligned_len(), ALIGNMENT);
+        assert_eq!(buf.capacity(), ALIGNMENT);
         let buf = AlignedBuf::new(ALIGNMENT + 1);
-        assert_eq!(buf.aligned_len(), 2 * ALIGNMENT);
+        assert_eq!(buf.capacity(), 2 * ALIGNMENT);
     }
 
     #[test]

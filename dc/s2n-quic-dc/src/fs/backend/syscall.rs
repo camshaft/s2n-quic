@@ -61,6 +61,7 @@ struct Queue {
 
 impl Pool {
     fn new(worker_count: usize) -> Arc<Self> {
+        debug_assert!(worker_count > 0, "fs syscall backend worker_count must be > 0");
         let shared = Arc::new(Shared {
             queue: Mutex::new(Queue {
                 jobs: VecDeque::new(),
@@ -153,8 +154,14 @@ fn execute(op: &mut Entry<IoOp>) {
                 r
             }
             IoBuf::Direct(buf) => {
-                // Zero-copy direct read: read straight into the caller's aligned buffer.
-                pread(fd, buf.as_mut_slice(), offset)
+                // Zero-copy direct read: read straight into the caller's aligned buffer, then set the
+                // logical length to the bytes actually read so a short read at EOF exposes no
+                // stale/zero tail.
+                let r = pread(fd, buf.as_mut_slice(), offset);
+                if let Ok(n) = r {
+                    buf.set_len(n);
+                }
+                r
             }
             _ => Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -567,10 +574,12 @@ mod tests {
 
                 // Read it back into a fresh aligned buffer, in place.
                 let rbuf = AlignedBuf::new(ALIGNMENT);
-                let rbuf = h
+                let (rbuf, rn) = h
                     .read_direct(dev, fd, 0, rbuf, TierPriority::High)
                     .await
                     .expect("direct read");
+                assert_eq!(rn, ALIGNMENT, "direct read returned wrong byte count");
+                assert_eq!(rbuf.len(), ALIGNMENT, "direct read buffer len not set to n");
                 for (i, b) in rbuf.as_slice().iter().enumerate() {
                     assert_eq!(*b, (i & 0xff) as u8, "direct read byte {i} mismatch");
                 }
@@ -581,8 +590,51 @@ mod tests {
                 assert!(
                     matches!(err.as_ref().map_err(|e| e.kind()), Err(std::io::ErrorKind::InvalidInput)),
                     "misaligned direct offset must be rejected, got {:?}",
-                    err.map(|_| ())
+                    err.as_ref().map(|_| ())
                 );
+
+                // A misaligned direct LENGTH must also be rejected at submit (not deep-EINVAL).
+                let bad_len = AlignedBuf::new(100); // len 100 is not block-aligned
+                let err = h.read_direct(dev, fd, 0, bad_len, TierPriority::Medium).await;
+                assert!(
+                    matches!(err.as_ref().map_err(|e| e.kind()), Err(std::io::ErrorKind::InvalidInput)),
+                    "misaligned direct length must be rejected, got {:?}",
+                    err.as_ref().map(|_| ())
+                );
+
+                drop(file);
+                let _ = std::fs::remove_file(&path);
+            }
+        });
+    }
+
+    /// A buffered read past EOF returns only the bytes that exist — the completion's byte count and
+    /// the delivered buffer length both reflect the short read, never a zero-padded full length.
+    #[test]
+    fn short_read_at_eof_reports_actual_len() {
+        let path = temp_path("eof");
+        let file = File::open(&path, Options { truncate: true, size: 0, direct: false }).unwrap();
+        let fd = file.raw_fd();
+        // Write exactly 10 bytes, then ask for 4096.
+        file.write_at(b"0123456789", 0).unwrap();
+        file.sync().unwrap();
+
+        run_local(|spawn| {
+            let path = path.clone();
+            async move {
+                let config = Config {
+                    devices: vec![byte_device(1 << 20)],
+                    ring_count: 1,
+                    backend: super::super::super::config::BackendKind::Syscall,
+                };
+                let backend = SyscallBackend::new(2);
+                let scheduler = Scheduler::new(&config, &backend, spawn, clock());
+                let dev = DeviceId(0);
+                let h = scheduler.handle();
+
+                let buf = h.read(dev, fd, 0, 4096, TierPriority::Medium).await.unwrap();
+                assert_eq!(buf.len(), 10, "short read must report only the bytes that exist");
+                assert_eq!(&buf[..], b"0123456789");
 
                 drop(file);
                 let _ = std::fs::remove_file(&path);
