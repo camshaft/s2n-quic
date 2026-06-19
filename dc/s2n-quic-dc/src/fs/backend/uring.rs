@@ -75,6 +75,47 @@ pub const DEFAULT_RING_DEPTH: u32 = 256;
 /// real op's slab id (slab ids are dense from 0 and the slab never approaches `u64::MAX`).
 const EVENTFD_TOKEN: u64 = u64::MAX;
 
+/// Reserved `user_data` token for the one-shot `IOSQE_ASYNC` capability probe (see
+/// [`probe_async_flag`]). Distinct from [`EVENTFD_TOKEN`] and from any real op's slab id.
+const ASYNC_PROBE_TOKEN: u64 = u64::MAX - 1;
+
+/// Probe whether the kernel honors [`IOSQE_ASYNC`](io_uring::squeue::Flags::ASYNC) by submitting a
+/// single `Nop` with the flag set and inspecting its CQE. The flag bit only became part of the valid
+/// SQE-flags mask in **kernel 5.6**; on 5.1–5.5 (io_uring exists but predates the flag) the kernel
+/// rejects any SQE carrying it with `-EINVAL`. Since we set the flag on every buffered op to push its
+/// page-cache copy onto io-wq, an un-probed flag would turn every buffered read/write into a
+/// `Failed(InvalidInput)` on those kernels — a correctness regression, not just a perf one. So we
+/// probe once at ring startup (mirroring the multishot-`PollAdd` runtime fallback) and only set the
+/// flag when the kernel accepts it; otherwise buffered ops run inline (today's pre-optimization
+/// behavior — slower large buffered reads, but correct, and the direct path is unaffected either way).
+///
+/// A `Nop` is the ideal probe: it touches no fd or buffer, so the *only* thing that can make it fail
+/// is the kernel rejecting the flag — unlike inferring support from a real op's `-EINVAL`, which could
+/// equally be a genuine alignment/argument error. Returns `true` (flag honored) on any non-negative
+/// CQE result, `false` on `-EINVAL` (or any submit/CQE error — fail safe to inline).
+fn probe_async_flag(ring: &mut IoUring) -> bool {
+    let nop = opcode::Nop::new()
+        .build()
+        .flags(io_uring::squeue::Flags::ASYNC)
+        .user_data(ASYNC_PROBE_TOKEN);
+    // SAFETY: the `Nop` SQE references no fd or buffer, so there is nothing to keep alive past submit.
+    if unsafe { ring.submission().push(&nop) }.is_err() {
+        return false;
+    }
+    if ring.submit_and_wait(1).is_err() {
+        return false;
+    }
+    let mut cq = ring.completion();
+    cq.sync();
+    let mut supported = false;
+    for cqe in &mut cq {
+        if cqe.user_data() == ASYNC_PROBE_TOKEN {
+            supported = cqe.result() >= 0;
+        }
+    }
+    supported
+}
+
 /// Probe whether io_uring is usable in the current environment, returning the underlying
 /// `io_uring_setup(2)` error if not — so the application can fall back to the blocking
 /// [`SyscallBackend`](super::syscall::SyscallBackend) and log *why*.
@@ -249,6 +290,7 @@ fn drain_into_sq(
     budget: &mut Budget,
     to_resubmit: &mut Vec<usize>,
     depth: usize,
+    async_ok: bool,
 ) -> bool {
     budget.reset();
     while slab.outstanding() < depth {
@@ -263,7 +305,7 @@ fn drain_into_sq(
             core::task::Poll::Ready(Some(op)) => {
                 let want = transfer_len(&op);
                 let id = slab.insert(op, want);
-                let entry = build_sqe(&slab.get(id).unwrap().op, 0, id as u64);
+                let entry = build_sqe(&slab.get(id).unwrap().op, 0, id as u64, async_ok);
                 // SAFETY: the op (and its buffer) lives in the slab until its CQE is reaped, so the
                 // buffer pointer in the SQE stays valid for the kernel operation's duration.
                 match unsafe { ring.submission().push(&entry) } {
@@ -326,6 +368,12 @@ fn ring_loop(
     let mut cx = Context::from_waker(&std_waker);
     let mut budget = Budget::new(depth.max(1));
 
+    // Probe `IOSQE_ASYNC` once on the empty ring (before arming the eventfd poll). When honored, every
+    // buffered op carries the flag so its page-cache copy runs on io-wq instead of inline on this one
+    // thread; when not (kernel 5.1–5.5), buffered ops run inline — correct, just slower on large
+    // buffered reads. Direct ops never use the flag, so the direct path is identical either way.
+    let async_ok = probe_async_flag(&mut ring);
+
     // Arm the eventfd poll once up front. If the SQ is somehow full (impossible on an empty ring) the
     // push is retried at the top of the loop via `poll_armed`.
     //
@@ -350,7 +398,7 @@ fn ring_loop(
             let Some(slot) = slab.get(id) else {
                 return false;
             };
-            let entry = build_sqe(&slot.op, slot.done, id as u64);
+            let entry = build_sqe(&slot.op, slot.done, id as u64, async_ok);
             // SAFETY: the op (and its buffer) is pinned in the slab until its final CQE.
             match unsafe { ring.submission().push(&entry) } {
                 Ok(()) => false, // submitted; drop from the resubmit list
@@ -368,6 +416,7 @@ fn ring_loop(
             &mut budget,
             &mut to_resubmit,
             depth,
+            async_ok,
         ) {
             rx_open = false;
         }
@@ -415,6 +464,7 @@ fn ring_loop(
                 &mut budget,
                 &mut to_resubmit,
                 depth,
+                async_ok,
             ) {
                 rx_open = false;
             }
@@ -598,15 +648,45 @@ fn transfer_len(op: &IoOp) -> usize {
 /// For a buffered read the destination is the op's `BytesMut` **uninitialized spare capacity** (the
 /// buffer arrives pre-sized + logically empty per the [`IoBuf::Read`] contract); the kernel fills it
 /// and the CQE's byte count is applied via `set_len` in `finalize`. No `resize`/zero-fill.
-fn build_sqe(op: &IoOp, done: usize, user_data: u64) -> io_uring::squeue::Entry {
+///
+/// `async_ok` is the startup [`probe_async_flag`] result — when `false` (kernel 5.1–5.5, no
+/// `IOSQE_ASYNC` support) no op gets the flag and everything runs inline.
+///
+/// # Buffered ops are forced async (`IOSQE_ASYNC`); direct ops stay inline
+///
+/// A *buffered* read/write whose pages are resident in the page cache completes **synchronously
+/// inside `io_uring_enter`** — on the single ring thread — so the in-kernel `copy_to_user` /
+/// `copy_from_user` for every cache-hit op serializes on that one CPU. The blocking syscall backend
+/// spreads the same copies across its many lane threads, so a single inline ring loses to it on
+/// large buffered transfers (measured: 64 KiB buffered read ~‑19%). Setting [`IOSQE_ASYNC`] on a
+/// buffered op punts it to the kernel's `io-wq` worker pool, which runs those copies on multiple
+/// kernel threads — recovering (and exceeding) the syscall backend's parallelism without adding
+/// rings (more rings would fragment SQE batching and hurt the direct path).
+///
+/// A *direct* (`O_DIRECT`) op does **not** get the flag: it never copies through the cache and is
+/// genuinely async at the block layer, so io-wq punting would only add worker-handoff latency and
+/// erode the small-op batching win (measured best at one ring). The flag is therefore keyed off the
+/// buffer variant — [`IoBuf::Direct`] inline, every other buffered variant async.
+fn build_sqe(op: &IoOp, done: usize, user_data: u64, async_ok: bool) -> io_uring::squeue::Entry {
     let fd = types::Fd(op.fd.as_raw());
     let off = op.offset + done as u64;
+    // Buffered transfers copy through the page cache and can complete inline on the ring thread;
+    // force them onto io-wq so the copies parallelize. Direct ops bypass the cache — keep inline.
+    // Only set the flag when the kernel honors it (`async_ok`, probed once at startup); on 5.1–5.5 it
+    // would reject the op with -EINVAL, so we fall back to inline (correct, just unoptimized).
+    let buffered = matches!(op.buf, IoBuf::Read(_) | IoBuf::Write(_));
+    let async_flag = if buffered && async_ok {
+        io_uring::squeue::Flags::ASYNC
+    } else {
+        io_uring::squeue::Flags::empty()
+    };
     match op.kind {
         IoKind::Read => {
             let (ptr, len) = read_ptr(op, done);
             opcode::Read::new(fd, ptr, len)
                 .offset(off)
                 .build()
+                .flags(async_flag)
                 .user_data(user_data)
         }
         IoKind::Write => {
@@ -614,6 +694,7 @@ fn build_sqe(op: &IoOp, done: usize, user_data: u64) -> io_uring::squeue::Entry 
             opcode::Write::new(fd, ptr.cast_mut(), len)
                 .offset(off)
                 .build()
+                .flags(async_flag)
                 .user_data(user_data)
         }
         IoKind::Fsync => opcode::Fsync::new(fd).build().user_data(user_data),
