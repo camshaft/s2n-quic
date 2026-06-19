@@ -59,6 +59,11 @@ bitvec = { version = "1.0.1", default-features = false }
 nix = { version = "0.31.1", features = ["socket", "uio", "fs", "time"] }
 loom = { version = "0.7", features = ["checkpoint", "futures"], optional = true }
 
+# io_uring is Linux-only; the storage scheduler's uring backend (fs::backend::uring) is gated on
+# target_os = "linux" and absent on every other platform.
+[target.'cfg(target_os = "linux")'.dependencies]
+io-uring = "0.7"
+
 [dev-dependencies]
 bach = { version = "0.1.0", features = ["net", "net-monitor", "tokio-compat"] }
 s2n-tls-tokio = "0.3"

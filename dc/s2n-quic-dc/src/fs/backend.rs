@@ -16,6 +16,9 @@
 
 pub mod mock;
 pub mod syscall;
+/// io_uring backend — Linux only.
+#[cfg(target_os = "linux")]
+pub mod uring;
 
 use crate::{
     fs::{device::DeviceTable, op::IoOp, SpawnHandle},
