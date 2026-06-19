@@ -31,12 +31,27 @@ pub fn align_up(n: usize) -> usize {
 /// A page-aligned heap buffer for direct IO. The allocation pointer is aligned to [`ALIGNMENT`] and
 /// the capacity is rounded up to a whole number of pages, so a read/write of an aligned length is a
 /// valid `O_DIRECT` transfer.
+///
+/// This is the caller-owned buffer for **zero-copy** direct IO: the application fills it (write) or
+/// receives into it (read) with no intermediate copy in the data path. Its pointer is always
+/// [`ALIGNMENT`]-aligned and its `aligned_len` is a whole number of pages, satisfying two of
+/// `O_DIRECT`'s three constraints; the third (a block-aligned file offset) is the caller's
+/// responsibility and is validated at submit time.
 pub struct AlignedBuf {
     ptr: std::ptr::NonNull<u8>,
     /// Logical length exposed to callers (may be < `cap`).
     len: usize,
     /// Page-rounded allocation size.
     cap: usize,
+}
+
+impl core::fmt::Debug for AlignedBuf {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("AlignedBuf")
+            .field("len", &self.len)
+            .field("cap", &self.cap)
+            .finish()
+    }
 }
 
 // SAFETY: `AlignedBuf` owns its allocation exclusively; the bytes are plain data.
@@ -76,6 +91,13 @@ impl AlignedBuf {
     pub fn as_slice(&self) -> &[u8] {
         // SAFETY: `ptr` is valid for `len` initialized bytes (alloc_zeroed initialized all `cap`).
         unsafe { core::slice::from_raw_parts(self.ptr.as_ptr(), self.len) }
+    }
+
+    /// The logical-length mutable slice, for an in-place direct read destination (zero-copy).
+    #[inline]
+    pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        // SAFETY: `ptr` is valid for `len` zero-initialized bytes and we hold `&mut self`.
+        unsafe { core::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len) }
     }
 
     /// The full page-rounded slice, for an aligned direct write source.

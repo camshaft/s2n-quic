@@ -150,17 +150,22 @@ impl<Clk: precision::Clock + Clone> LaneTask<Clk> {
 /// Stamp a successful completion: fill a read buffer to its requested length and record the result.
 fn complete(op: &mut IoOp) {
     let len = op.len as usize;
+    let base = op.offset;
+    // Deterministic fill: byte i = (offset + i) as u8, so the test can verify ordering.
+    let fill = |slice: &mut [u8]| {
+        for (i, b) in slice.iter_mut().enumerate() {
+            *b = (base.wrapping_add(i as u64) & 0xff) as u8;
+        }
+    };
     match &mut op.buf {
         IoBuf::Read(buf) => {
-            // Deterministic fill: byte i = (offset + i) as u8, so the test can verify ordering.
             buf.clear();
             buf.resize(len, 0);
-            let base = op.offset;
-            for (i, b) in buf.iter_mut().enumerate() {
-                *b = (base.wrapping_add(i as u64) & 0xff) as u8;
-            }
+            fill(buf);
         }
-        IoBuf::Write(_) | IoBuf::None => {}
+        // A direct read fills the caller's aligned buffer in place (zero-copy).
+        IoBuf::Direct(buf) if op.kind.is_read() => fill(buf.as_mut_slice()),
+        IoBuf::Direct(_) | IoBuf::Write(_) | IoBuf::None => {}
     }
     op.status = IoStatus::Done(len);
 }

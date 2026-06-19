@@ -49,10 +49,17 @@ impl IoKind {
 /// abstraction boundary.
 #[derive(Debug)]
 pub enum IoBuf {
-    /// Read destination. Filled by the backend; handed back to the submitter on completion.
+    /// Buffered read destination (scheduler-allocated, grown to the op length). Used for buffered
+    /// (non-`O_DIRECT`) IO where the kernel page cache absorbs the copy anyway.
     Read(bytes::BytesMut),
-    /// Write source.
+    /// Buffered write source.
     Write(bytes::Bytes),
+    /// A caller-owned, page-aligned buffer for **zero-copy** `O_DIRECT` IO — used **in place** as
+    /// the destination of a direct read or the source of a direct write, with no bounce-buffer copy
+    /// in the data path. The caller allocates it (e.g. via [`crate::fs::direct::AlignedBuf`]) and
+    /// gets it back on completion. The submit path validates the offset is block-aligned; the
+    /// pointer and transfer length are aligned by `AlignedBuf` construction.
+    Direct(crate::fs::direct::AlignedBuf),
     /// No buffer (fsync / fdatasync / trim).
     None,
 }
@@ -64,6 +71,7 @@ impl IoBuf {
         match self {
             IoBuf::Read(b) => b.len(),
             IoBuf::Write(b) => b.len(),
+            IoBuf::Direct(b) => b.len(),
             IoBuf::None => 0,
         }
     }
@@ -71,6 +79,12 @@ impl IoBuf {
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// Whether this is a direct (zero-copy, aligned) buffer.
+    #[inline]
+    pub fn is_direct(&self) -> bool {
+        matches!(self, IoBuf::Direct(_))
     }
 }
 

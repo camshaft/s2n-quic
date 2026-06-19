@@ -22,7 +22,6 @@
 use crate::{
     fs::{
         backend::{Backend, CompletionSink, LaneSetup, LaneSubmit},
-        direct::AlignedBuf,
         op::{IoBuf, IoKind, IoOp, IoStatus},
     },
     intrusive::Entry,
@@ -36,16 +35,6 @@ use std::{
     sync::{Condvar, Mutex},
     thread::JoinHandle,
 };
-
-/// Whether the worker pool issues unbuffered (`O_DIRECT`) IO. In direct mode each op is bounced
-/// through a page-aligned buffer so the syscall sees an aligned pointer/length.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Mode {
-    /// Buffered IO directly on the op's `BytesMut`/`Bytes` (portable; for tmpfs/tests).
-    Buffered,
-    /// Unbuffered `O_DIRECT` IO via a page-aligned bounce buffer.
-    Direct,
-}
 
 /// A unit of work handed to a worker thread: the op plus the `Send` completion channel back to its
 /// lane's reaper.
@@ -71,7 +60,7 @@ struct Queue {
 }
 
 impl Pool {
-    fn new(worker_count: usize, mode: Mode) -> Arc<Self> {
+    fn new(worker_count: usize) -> Arc<Self> {
         let shared = Arc::new(Shared {
             queue: Mutex::new(Queue {
                 jobs: VecDeque::new(),
@@ -84,7 +73,7 @@ impl Pool {
             let shared = shared.clone();
             let handle = std::thread::Builder::new()
                 .name(format!("s2n-dc-fs-io-{i}"))
-                .spawn(move || worker_loop(shared, mode))
+                .spawn(move || worker_loop(shared))
                 .expect("failed to spawn fs io worker");
             workers.push(handle);
         }
@@ -116,7 +105,7 @@ impl Drop for Pool {
 }
 
 /// A worker thread: pull a job, run its syscall, push the completed op to its lane's reaper.
-fn worker_loop(shared: Arc<Shared>, mode: Mode) {
+fn worker_loop(shared: Arc<Shared>) {
     loop {
         let job = {
             let mut q = shared.queue.lock().unwrap();
@@ -132,7 +121,7 @@ fn worker_loop(shared: Arc<Shared>, mode: Mode) {
         };
 
         let Job { mut op, completion } = job;
-        execute(&mut op, mode);
+        execute(&mut op);
         // Forward the completed op to the lane reaper. If the reaper is gone the channel send fails;
         // the op (and its credit) drops here — acceptable only on full teardown.
         let mut completion = completion;
@@ -141,20 +130,41 @@ fn worker_loop(shared: Arc<Shared>, mode: Mode) {
 }
 
 /// Run the op's syscall on its fd, stamping `status`.
-fn execute(op: &mut Entry<IoOp>, mode: Mode) {
+///
+/// **Zero-copy:** the op operates directly on its own buffer — a buffered read fills the op's
+/// `BytesMut` in place, a buffered write `pwrite`s from the op's `Bytes` in place, and a `Direct`
+/// op reads into / writes from the caller's page-aligned [`AlignedBuf`] in place. There is no
+/// bounce-buffer copy on any path. (`O_DIRECT` alignment of the offset is validated at submit time;
+/// the buffer pointer/length are aligned by `AlignedBuf` construction.)
+fn execute(op: &mut Entry<IoOp>) {
     let fd = op.fd as RawFd;
     let offset = op.offset;
-    let len = op.len as usize;
+    let want = op.len as usize;
     let result = match op.kind {
         IoKind::Read => match &mut op.buf {
-            IoBuf::Read(buf) => read_into(fd, offset, len, buf, mode),
+            IoBuf::Read(buf) => {
+                // Buffered read: grow the scheduler-allocated dst to the op length and read in place.
+                buf.clear();
+                buf.resize(want, 0);
+                let r = pread(fd, buf.as_mut(), offset);
+                if let Ok(n) = r {
+                    buf.truncate(n);
+                }
+                r
+            }
+            IoBuf::Direct(buf) => {
+                // Zero-copy direct read: read straight into the caller's aligned buffer.
+                pread(fd, buf.as_mut_slice(), offset)
+            }
             _ => Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "read op without a read buffer",
             )),
         },
         IoKind::Write => match &op.buf {
-            IoBuf::Write(data) => write_from(fd, offset, data, mode).map(|()| data.len()),
+            IoBuf::Write(data) => pwrite_all(fd, data, offset).map(|()| data.len()),
+            // Zero-copy direct write: write straight from the caller's aligned buffer.
+            IoBuf::Direct(buf) => pwrite_all(fd, buf.as_slice(), offset).map(|()| buf.len()),
             _ => Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "write op without a write buffer",
@@ -168,47 +178,6 @@ fn execute(op: &mut Entry<IoOp>, mode: Mode) {
         Ok(n) => IoStatus::Done(n),
         Err(e) => IoStatus::Failed(e.kind()),
     };
-}
-
-/// Read `want` bytes at `offset` into `buf` (the op's read destination, built empty by the
-/// scheduler), returning the bytes actually read.
-fn read_into(
-    fd: RawFd,
-    offset: u64,
-    want: usize,
-    buf: &mut bytes::BytesMut,
-    mode: Mode,
-) -> std::io::Result<usize> {
-    match mode {
-        Mode::Buffered => {
-            buf.clear();
-            buf.resize(want, 0);
-            let n = pread(fd, buf.as_mut(), offset)?;
-            buf.truncate(n);
-            Ok(n)
-        }
-        Mode::Direct => {
-            let mut aligned = AlignedBuf::new(want.max(1));
-            let n = pread(fd, aligned.as_aligned_mut(), offset)?;
-            let n = n.min(want);
-            buf.clear();
-            buf.extend_from_slice(&aligned.as_aligned_slice()[..n]);
-            Ok(n)
-        }
-    }
-}
-
-fn write_from(fd: RawFd, offset: u64, data: &bytes::Bytes, mode: Mode) -> std::io::Result<()> {
-    match mode {
-        Mode::Buffered => pwrite_all(fd, data, offset),
-        Mode::Direct => {
-            let mut aligned = AlignedBuf::new(data.len().max(1));
-            aligned.as_aligned_mut()[..data.len()].copy_from_slice(data);
-            // Direct writes must transfer an aligned length; the file is pre-sized so the padding
-            // tail is harmless.
-            pwrite_all(fd, aligned.as_aligned_slice(), offset)
-        }
-    }
 }
 
 // ── Raw positional syscalls (libc) ──────────────────────────────────────────
@@ -293,15 +262,21 @@ fn fsync(fd: RawFd, data_only: bool) -> std::io::Result<()> {
 // ── Backend wiring ──────────────────────────────────────────────────────────
 
 /// A bounded blocking-syscall backend with a fixed-size shared thread pool.
+///
+/// Direct vs. buffered IO is a per-op property (the [`IoBuf`] variant the submitter chose) and a
+/// property of how each file was opened ([`crate::fs::direct::File`] with `direct: true/false`), not
+/// a backend-wide mode — so a single backend serves both buffered and `O_DIRECT` files. The op's
+/// buffer variant and the file's open flags must agree; a mismatch surfaces as the kernel's `EINVAL`
+/// on the syscall (stamped `Failed`), never silent corruption.
 pub struct SyscallBackend {
     pool: Arc<Pool>,
 }
 
 impl SyscallBackend {
-    /// Build a backend with `worker_count` fixed worker threads in `mode`.
-    pub fn new(worker_count: usize, mode: Mode) -> Self {
+    /// Build a backend with `worker_count` fixed worker threads.
+    pub fn new(worker_count: usize) -> Self {
         Self {
-            pool: Pool::new(worker_count, mode),
+            pool: Pool::new(worker_count),
         }
     }
 }
@@ -443,7 +418,7 @@ mod tests {
                     ring_count: 2,
                     backend: super::super::super::config::BackendKind::Syscall,
                 };
-                let backend = SyscallBackend::new(4, Mode::Buffered);
+                let backend = SyscallBackend::new(4);
                 let scheduler = Scheduler::new(&config, &backend, spawn, clock());
                 let h = scheduler.handle();
                 let dev = DeviceId(0);
@@ -482,7 +457,7 @@ mod tests {
                     ring_count: 2,
                     backend: super::super::super::config::BackendKind::Syscall,
                 };
-                let backend = SyscallBackend::new(2, Mode::Buffered);
+                let backend = SyscallBackend::new(2);
                 let scheduler = Scheduler::new(&config, &backend, spawn, clock());
                 let dev = DeviceId(0);
 
@@ -535,7 +510,7 @@ mod tests {
                 ring_count: 1,
                 backend: super::super::super::config::BackendKind::Syscall,
             };
-            let backend = SyscallBackend::new(2, Mode::Buffered);
+            let backend = SyscallBackend::new(2);
             let scheduler = Scheduler::new(&config, &backend, spawn, clock());
             let dev = DeviceId(0);
             let h = scheduler.handle();
@@ -548,6 +523,69 @@ mod tests {
             let device = scheduler.devices().get(dev).unwrap();
             for pool in device.pools.all() {
                 assert_eq!(pool.debug_free_total(), pool.debug_capacity() as i64);
+            }
+        });
+    }
+
+    /// Zero-copy direct IO roundtrip: write an aligned buffer in place, read it back into another
+    /// aligned buffer in place — no bounce-buffer copy on either path. Uses `O_DIRECT` on Linux
+    /// (the `is_tmpfs` guard falls back to buffered if the temp dir is tmpfs, so the test is
+    /// portable while still exercising the in-place `IoBuf::Direct` path).
+    #[test]
+    fn direct_zero_copy_roundtrip() {
+        use crate::fs::direct::{AlignedBuf, ALIGNMENT};
+        let path = temp_path("direct");
+        // Open in direct mode (falls back to buffered on tmpfs / macOS without O_DIRECT semantics).
+        let file = File::open(&path, Options { truncate: true, size: 1 << 20, direct: true }).unwrap();
+        let fd = file.raw_fd();
+
+        run_local(|spawn| {
+            let path = path.clone();
+            async move {
+                // Capacity in bytes large enough for one block; atomic_grant makes the grant whole.
+                let config = Config {
+                    devices: vec![byte_device(1 << 20)],
+                    ring_count: 1,
+                    backend: super::super::super::config::BackendKind::Syscall,
+                };
+                let backend = SyscallBackend::new(2);
+                let scheduler = Scheduler::new(&config, &backend, spawn, clock());
+                let dev = DeviceId(0);
+                let h = scheduler.handle();
+
+                // Build a page-aligned write buffer with a known pattern.
+                let mut wbuf = AlignedBuf::new(ALIGNMENT);
+                for (i, b) in wbuf.as_mut_slice().iter_mut().enumerate() {
+                    *b = (i & 0xff) as u8;
+                }
+                let (wbuf, n) = h
+                    .write_direct(dev, fd, 0, wbuf, TierPriority::Medium)
+                    .await
+                    .expect("direct write");
+                assert_eq!(n, ALIGNMENT);
+                drop(wbuf);
+
+                // Read it back into a fresh aligned buffer, in place.
+                let rbuf = AlignedBuf::new(ALIGNMENT);
+                let rbuf = h
+                    .read_direct(dev, fd, 0, rbuf, TierPriority::High)
+                    .await
+                    .expect("direct read");
+                for (i, b) in rbuf.as_slice().iter().enumerate() {
+                    assert_eq!(*b, (i & 0xff) as u8, "direct read byte {i} mismatch");
+                }
+
+                // A misaligned offset must be rejected before any IO.
+                let bad = AlignedBuf::new(ALIGNMENT);
+                let err = h.read_direct(dev, fd, 1, bad, TierPriority::Medium).await;
+                assert!(
+                    matches!(err.as_ref().map_err(|e| e.kind()), Err(std::io::ErrorKind::InvalidInput)),
+                    "misaligned direct offset must be rejected, got {:?}",
+                    err.map(|_| ())
+                );
+
+                drop(file);
+                let _ = std::fs::remove_file(&path);
             }
         });
     }

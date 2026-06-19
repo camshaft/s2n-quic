@@ -332,6 +332,57 @@ impl SubmitHandle {
         }
     }
 
+    /// Submit a **zero-copy** `O_DIRECT` read at `offset` into the caller-owned, page-aligned `buf`,
+    /// reading `buf.len()` bytes. Resolves with the same buffer, filled in place — no data-path copy.
+    /// `offset` must be block-aligned (validated; `InvalidInput` otherwise).
+    pub fn read_direct(
+        &self,
+        device: DeviceId,
+        fd: i32,
+        offset: u64,
+        buf: crate::fs::direct::AlignedBuf,
+        priority: TierPriority,
+    ) -> impl core::future::Future<Output = std::io::Result<crate::fs::direct::AlignedBuf>> + 'static
+    {
+        let handle = self.clone();
+        async move {
+            let len = buf.len() as u32;
+            let op = handle
+                .submit(IoKind::Read, device, fd, offset, len, IoBuf::Direct(buf), priority)
+                .await?;
+            match op.buf {
+                IoBuf::Direct(buf) => Ok(buf),
+                _ => unreachable!("direct read returned non-direct buffer"),
+            }
+        }
+    }
+
+    /// Submit a **zero-copy** `O_DIRECT` write at `offset` from the caller-owned, page-aligned `buf`,
+    /// writing `buf.len()` bytes in place — no data-path copy. Resolves with the buffer returned and
+    /// the byte count. `offset` must be block-aligned (validated; `InvalidInput` otherwise).
+    pub fn write_direct(
+        &self,
+        device: DeviceId,
+        fd: i32,
+        offset: u64,
+        buf: crate::fs::direct::AlignedBuf,
+        priority: TierPriority,
+    ) -> impl core::future::Future<
+        Output = std::io::Result<(crate::fs::direct::AlignedBuf, usize)>,
+    > + 'static {
+        let handle = self.clone();
+        async move {
+            let len = buf.len() as u32;
+            let op = handle
+                .submit(IoKind::Write, device, fd, offset, len, IoBuf::Direct(buf), priority)
+                .await?;
+            match (op.status, op.buf) {
+                (IoStatus::Done(n), IoBuf::Direct(buf)) => Ok((buf, n)),
+                other => unreachable!("direct write returned unexpected op: {other:?}"),
+            }
+        }
+    }
+
     /// The atomic submit primitive: acquire credit, hand the op to a lane, await completion.
     ///
     /// Returns only **successfully completed** ops — a `Failed` completion, an out-of-range device,
@@ -356,6 +407,16 @@ impl SubmitHandle {
             )
         })?;
         let cost = device.cost(kind, len);
+
+        // A zero-copy `O_DIRECT` op operates on the caller's buffer in place, so the **file offset**
+        // must be block-aligned (the buffer pointer/length are aligned by `AlignedBuf`). Validate up
+        // front — fail fast rather than let the kernel `EINVAL` it after burning a credit acquire.
+        if buf.is_direct() && !offset.is_multiple_of(crate::fs::direct::ALIGNMENT as u64) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "io scheduler: direct op offset is not block-aligned",
+            ));
+        }
 
         // An `IoOp` is atomic — it has no partial-submit path — so an op costing more than its pool
         // could ever hold can never be admitted and would park forever. Reject it up front. (M2 may
