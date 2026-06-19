@@ -9,6 +9,12 @@
 //! materialization spins up today (one `spawn_blocking` storm per stream, no coordination — the
 //! deadlock and the lost fairness).
 //!
+//! Each source item is a [`Block`]: a [`Read`](Block::Read) (a `BlockRef` fetched from a device,
+//! credit-gated) or a [`Resident`](Block::Resident) (already-in-memory `Bytes` spliced into the
+//! stream in order, **bypassing** `prepare`/credit/device/backend). Membrain objects are a mix of
+//! on-disk extents and cached/just-written data, so a stream interleaves both and the consumer sees
+//! one seamless ordered byte stream.
+//!
 //! # Shape
 //!
 //! Every block is sprayed via the scheduler's submit path against **one** shared completion channel,
@@ -57,6 +63,30 @@ use std::{collections::VecDeque, io};
 /// live (the front block always eventually completes and frees a slot); this is sized generously
 /// because the per-device credit pool governs the healthy case and this only bites under a stall.
 const MAX_RESIDENT_BLOCKS: usize = 256;
+
+/// One unit of a materialize stream: either a block to **read** from a device, or **resident** bytes
+/// the caller already holds in memory.
+///
+/// Membrain materializes objects whose blocks are a mix of on-disk extents and in-memory (cached or
+/// just-written) data, delivered as one ordered stream. A [`Resident`](Block::Resident) block carries
+/// its bytes directly and is delivered in FIFO order **without** touching `prepare`, the credit pool,
+/// a device, or any backend — it bypasses the filesystem entirely, slotting into the reorder window
+/// alongside the device reads so the consumer sees one seamless ordered stream.
+#[derive(Clone, Debug)]
+pub enum Block {
+    /// Read this block from its device (credit-gated; runs through the backend).
+    Read(BlockRef),
+    /// Deliver these already-in-memory bytes in stream order, bypassing the filesystem. The caller is
+    /// responsible for any trimming — they are delivered verbatim.
+    Resident(Bytes),
+}
+
+impl From<BlockRef> for Block {
+    #[inline]
+    fn from(block: BlockRef) -> Self {
+        Block::Read(block)
+    }
+}
 
 /// A block pulled from the source but not yet enqueued: it is waiting for its device's acquire slot.
 /// Carries the resolved pool + cost (validated at pull time) so the reactor enqueues without
@@ -128,7 +158,8 @@ pub struct MaterializeStream<I> {
 
 impl<I> MaterializeStream<I>
 where
-    I: Iterator<Item = BlockRef>,
+    I: Iterator,
+    I::Item: Into<Block>,
 {
     pub(crate) fn new(
         handle: SubmitHandle,
@@ -228,11 +259,25 @@ where
     /// so the consumer observes it in delivery order rather than as a silent gap.
     fn pull(&mut self) {
         while !self.source_done && self.window.len() < MAX_RESIDENT_BLOCKS {
-            let Some(block) = self.blocks.next() else {
+            let Some(item) = self.blocks.next() else {
                 self.source_done = true;
                 break;
             };
+            let item: Block = item.into();
             let idx = self.base + self.window.len() as u64;
+
+            // Resident bytes bypass the filesystem entirely: file them `Ready` straight into the
+            // reorder window so they deliver in FIFO order alongside the device reads — no `prepare`,
+            // no credit, no device, no backend. This is the in-memory / cached / just-written path
+            // Membrain interleaves with on-disk extents.
+            let block = match item {
+                Block::Read(block) => block,
+                Block::Resident(bytes) => {
+                    self.window.push_back(Slot::Ready(Ok(bytes)));
+                    continue;
+                }
+            };
+
             // A direct read requires `offset` and `len` to be block-aligned; `prepare` rejects a
             // misaligned op (it does not round anything up — the caller sizes the block). Buffered
             // reads have no alignment constraint.

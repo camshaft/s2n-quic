@@ -494,6 +494,69 @@ fn materialize_delivers_in_order() {
     });
 }
 
+/// Mixed resident + device blocks (Membrain's case): a materialize stream interleaving in-memory
+/// `Block::Resident(Bytes)` with on-disk `Block::Read(BlockRef)` must deliver them in FIFO order,
+/// with the resident bytes spliced in **verbatim** and **bypassing** the device (no credit consumed,
+/// no backend read). Odd indices are resident (filled with byte value `0xAA`); even indices are
+/// device reads (the bach backend fills `byte j = (offset + j) & 0xff`). The device pool conserving
+/// at exactly its capacity at quiescence proves the resident blocks took no credit.
+#[test]
+fn materialize_mixes_resident_and_device_blocks() {
+    use crate::fs::materialize::Block;
+    let _no_snap = crate::testing::without_snapshots();
+    sim(|| {
+        let latency = Latency {
+            read: Duration::from_micros(100),
+            write: Duration::from_micros(100),
+            per_byte_nanos: 0,
+        };
+        let (scheduler, devices) = build(vec![iops_device(8)], 1, latency);
+        let dev = devices[0].clone();
+        let h = scheduler.handle();
+        async move {
+            const N: u64 = 12;
+            const RESIDENT: u8 = 0xAA;
+            // Even idx → device read at offset `idx*1024`; odd idx → resident 1 KiB of `0xAA`.
+            let items: Vec<Block> = (0..N)
+                .map(|i| {
+                    if i % 2 == 0 {
+                        Block::Read(BlockRef::whole(dev.clone(), fd(), i * 1024, 1024))
+                    } else {
+                        Block::Resident(bytes::Bytes::from(vec![RESIDENT; 1024]))
+                    }
+                })
+                .collect();
+
+            let mut stream = h.materialize(items, TierPriority::High);
+            let mut delivered = 0u64;
+            while let Some(chunk) = stream.next().await {
+                let buf = chunk.expect("block failed");
+                assert_eq!(buf.len(), 1024, "block {delivered} wrong len");
+                if delivered % 2 == 0 {
+                    // Device read: bach fills byte j = (offset + j) & 0xff, offset = delivered*1024.
+                    let offset = delivered * 1024;
+                    for (j, b) in buf.iter().enumerate() {
+                        let expected = (offset.wrapping_add(j as u64) & 0xff) as u8;
+                        assert_eq!(*b, expected, "device block {delivered} byte {j} mismatch");
+                    }
+                } else {
+                    assert!(
+                        buf.iter().all(|&b| b == RESIDENT),
+                        "resident block {delivered} not delivered verbatim"
+                    );
+                }
+                delivered += 1;
+            }
+            assert_eq!(delivered, N, "did not deliver all mixed blocks in order");
+            // Resident blocks consumed no credit; every device read released → pool back to full.
+            assert_conserved(&dev);
+            info!("materialize: resident+device interleave delivered in order, pool conserved");
+        }
+        .primary()
+        .spawn();
+    });
+}
+
 /// Cross-device head-of-line blocking: a materialize stream whose blocks alternate between a
 /// **credit-starved** device (depth 1) and a roomy one must still make progress and deliver all
 /// blocks in FIFO order. With one shared acquire slot, a block parked on the starved device's credit

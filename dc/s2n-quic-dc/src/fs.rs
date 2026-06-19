@@ -47,4 +47,5 @@ pub mod counters;
 pub use config::{Config, CostModel, DeviceConfig, OpWeights, PoolMode};
 pub use device::{Device, LocalRingId};
 pub use op::{IoBuf, IoKind, IoOp, IoStatus};
+pub use materialize::Block;
 pub use scheduler::{BlockRef, Scheduler, SubmitHandle};

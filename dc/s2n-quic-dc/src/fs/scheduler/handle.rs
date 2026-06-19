@@ -22,7 +22,7 @@ use crate::{
     fs::{
         device::Device,
         op::{CompletionReceiver, CompletionSender, Fd, IoBuf, IoKind, IoOp, IoStatus},
-        scheduler::{alloc::SubmitterAlloc, BlockRef, SchedulerInner},
+        scheduler::{alloc::SubmitterAlloc, SchedulerInner},
     },
     intrusive::Entry,
     sched::{Budget, TierPriority},
@@ -338,39 +338,36 @@ impl SubmitHandle {
 
     /// Stream an ordered object whose blocks scatter across devices, delivering blocks in FIFO order
     /// via **buffered** reads. See [`crate::fs::materialize::MaterializeStream`].
+    ///
+    /// The source yields anything that converts into a [`Block`](crate::fs::materialize::Block): a
+    /// `BlockRef` (read it from a device) or a `Block::Resident(Bytes)` (already-in-memory bytes
+    /// spliced into the stream in order, bypassing the filesystem). Membrain interleaves both.
     pub fn materialize<I>(
         &self,
         blocks: I,
         priority: TierPriority,
     ) -> crate::fs::materialize::MaterializeStream<I::IntoIter>
     where
-        I: IntoIterator<Item = BlockRef>,
+        I: IntoIterator,
+        I::Item: Into<crate::fs::materialize::Block>,
     {
-        crate::fs::materialize::MaterializeStream::new(
-            self.clone(),
-            blocks.into_iter(),
-            priority,
-            false,
-        )
+        crate::fs::materialize::MaterializeStream::new(self.clone(), blocks.into_iter(), priority, false)
     }
 
     /// Like [`materialize`](Self::materialize) but issues **zero-copy `O_DIRECT`** reads into
-    /// page-aligned buffers — the mode Membrain uses. Each block's `offset` and `len` must be
-    /// block-aligned (a misaligned block surfaces as an `InvalidInput` error in delivery order).
+    /// page-aligned buffers — the mode Membrain uses. Each *read* block's `offset` and `len` must be
+    /// block-aligned (a misaligned block surfaces as an `InvalidInput` error in delivery order);
+    /// resident blocks are unaffected by alignment.
     pub fn materialize_direct<I>(
         &self,
         blocks: I,
         priority: TierPriority,
     ) -> crate::fs::materialize::MaterializeStream<I::IntoIter>
     where
-        I: IntoIterator<Item = BlockRef>,
+        I: IntoIterator,
+        I::Item: Into<crate::fs::materialize::Block>,
     {
-        crate::fs::materialize::MaterializeStream::new(
-            self.clone(),
-            blocks.into_iter(),
-            priority,
-            true,
-        )
+        crate::fs::materialize::MaterializeStream::new(self.clone(), blocks.into_iter(), priority, true)
     }
 
     /// Number of execution lanes.
