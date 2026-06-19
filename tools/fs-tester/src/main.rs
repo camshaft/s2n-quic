@@ -22,11 +22,10 @@ use s2n_quic_dc::{
     busy_poll::clock::Clock,
     fs::{
         backend::{blocking::Runtime, syscall::SyscallBackend},
-        config::{Config as FsConfig, CostModel, DeviceConfig, OpWeights, PoolMode},
+        config::{CostModel, DeviceConfig, OpWeights, PoolMode},
         device::Device,
         direct::{File, Options, ALIGNMENT},
-        scheduler::Scheduler,
-        SubmitHandle,
+        scheduler::DeviceRegistry,
     },
     runtime::tokio::Local,
     sched::{CreditConfig, Rate, TierPriority as Priority},
@@ -153,8 +152,9 @@ async fn run_workload(cfg: Config) {
     // `file` handle is dropped before the op completes.
     let fd = s2n_quic_dc::fs::op::Fd::new(file.clone());
 
-    // One device sized in bytes (bandwidth-cost model), queue depth = capacity. Registered after the
-    // scheduler is built (the new lazy-registration API), which hands back the `Arc<Device>` handle.
+    // One device sized in bytes (bandwidth-cost model), queue depth = capacity, fanning its ops out
+    // across `cfg.lanes` execution lanes. Registered after the registry is built (the lazy-
+    // registration API), which hands back the `Arc<Device>` we submit against.
     let device_cfg = DeviceConfig {
         pool_mode: PoolMode::Shared(
             CreditConfig::new(
@@ -168,24 +168,23 @@ async fn run_workload(cfg: Config) {
         rate: Rate::new(1_000_000.0), // effectively unlimited; the pool (queue depth) governs
         cost_model: CostModel::Bytes,
         op_weights: OpWeights::default(),
-    };
-    let fs_config = FsConfig {
-        ring_count: cfg.lanes.max(1),
+        lane_count: cfg.lanes.max(1),
     };
 
     let mut spawn = Local::new(0);
     let registry = s2n_quic_dc::counter::Registry::default();
     let clock = Clock::default();
 
-    // Build the scheduler with the chosen backend (over a blocking runtime), then register the device.
-    let scheduler = match cfg.backend {
+    // Build the device registry with the chosen backend (over a blocking runtime), then register the
+    // device and get back its `Arc<Device>` handle.
+    let device_registry = match cfg.backend {
         Backend::Syscall => {
             let backend = SyscallBackend::new(Runtime::new("fs-tester-io"));
-            Scheduler::new(&fs_config, &backend, &mut spawn, &registry, clock)
+            DeviceRegistry::new(backend, &mut spawn, &registry, clock)
         }
-        Backend::Uring => build_uring(&fs_config, &mut spawn, &registry, clock, cfg.ring_depth),
+        Backend::Uring => build_uring(&mut spawn, &registry, clock, cfg.ring_depth),
     };
-    let dev = scheduler
+    let dev = device_registry
         .register_device("dev0", &device_cfg)
         .expect("register device");
 
@@ -197,7 +196,6 @@ async fn run_workload(cfg: Config) {
     let blocks_per_stream = (cfg.file_size / cfg.op_size as u64).max(1);
     let mut tasks = Vec::with_capacity(cfg.streams);
     for s in 0..cfg.streams {
-        let h = scheduler.handle();
         let dev = dev.clone();
         let fd = fd.clone();
         let stop = stop.clone();
@@ -218,7 +216,7 @@ async fn run_workload(cfg: Config) {
                     OpMix::Mixed => i.is_multiple_of(2),
                 };
                 let start = Instant::now();
-                let ok = run_one(&h, &dev, &fd, offset, op_size, is_read, direct).await;
+                let ok = run_one(&dev, &fd, offset, op_size, is_read, direct).await;
                 let elapsed_us = start.elapsed().as_micros() as u64;
                 counters.record(ok, op_size as u64, elapsed_us);
                 i += 1;
@@ -240,9 +238,9 @@ async fn run_workload(cfg: Config) {
     let _ = std::fs::remove_file(&path);
 }
 
-/// Issue a single op of the requested kind, returning whether it succeeded.
+/// Issue a single op of the requested kind, returning whether it succeeded. Submits directly on the
+/// `Arc<Device>` (each device is its own scheduler).
 async fn run_one(
-    h: &SubmitHandle,
     dev: &Arc<Device>,
     fd: &s2n_quic_dc::fs::op::Fd,
     offset: u64,
@@ -254,28 +252,22 @@ async fn run_one(
         use s2n_quic_dc::fs::direct::AlignedBuf;
         if is_read {
             let buf = AlignedBuf::new(op_size);
-            h.read_direct(dev.clone(), fd.clone(), offset, buf, Priority::Medium)
+            dev.read_direct(fd.clone(), offset, buf, Priority::Medium)
                 .await
                 .is_ok()
         } else {
             let buf = AlignedBuf::new(op_size);
-            h.write_direct(dev.clone(), fd.clone(), offset, buf, Priority::Medium)
+            dev.write_direct(fd.clone(), offset, buf, Priority::Medium)
                 .await
                 .is_ok()
         }
     } else if is_read {
-        h.read(
-            dev.clone(),
-            fd.clone(),
-            offset,
-            op_size as u32,
-            Priority::Medium,
-        )
-        .await
-        .is_ok()
+        dev.read(fd.clone(), offset, op_size as u32, Priority::Medium)
+            .await
+            .is_ok()
     } else {
         let data = bytes::Bytes::from(vec![0u8; op_size]);
-        h.write(dev.clone(), fd.clone(), offset, data, Priority::Medium)
+        dev.write(fd.clone(), offset, data, Priority::Medium)
             .await
             .is_ok()
     }
@@ -283,12 +275,11 @@ async fn run_one(
 
 #[cfg(target_os = "linux")]
 fn build_uring(
-    fs_config: &FsConfig,
     spawn: &mut Local,
     registry: &s2n_quic_dc::counter::Registry,
     clock: Clock,
     ring_depth: u32,
-) -> Scheduler {
+) -> DeviceRegistry {
     use s2n_quic_dc::fs::backend::uring::{self, UringBackend};
     // Detect whether io_uring is actually usable here (kernel too old, the `io_uring_disabled`
     // sysctl, a seccomp filter, or a low memlock rlimit). If not, fall back to the blocking syscall
@@ -296,20 +287,19 @@ fn build_uring(
     if let Err(e) = uring::probe() {
         eprintln!("io_uring unavailable ({e}); falling back to the blocking syscall backend");
         let backend = SyscallBackend::new(Runtime::new("fs-tester-io"));
-        return Scheduler::new(fs_config, &backend, spawn, registry, clock);
+        return DeviceRegistry::new(backend, spawn, registry, clock);
     }
     let backend = UringBackend::new(Runtime::new("fs-tester-uring"), ring_depth);
-    Scheduler::new(fs_config, &backend, spawn, registry, clock)
+    DeviceRegistry::new(backend, spawn, registry, clock)
 }
 
 #[cfg(not(target_os = "linux"))]
 fn build_uring(
-    _: &FsConfig,
     _: &mut Local,
     _: &s2n_quic_dc::counter::Registry,
     _: Clock,
     _: u32,
-) -> Scheduler {
+) -> DeviceRegistry {
     panic!("the uring backend is only available on Linux");
 }
 

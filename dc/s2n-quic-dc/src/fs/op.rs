@@ -243,6 +243,22 @@ impl IoOp {
         core::mem::take(&mut self.flow_credits)
     }
 
+    /// Whether the submitter has already dropped its completion receiver, so executing this op would
+    /// be wasted work — the result has nowhere to go. A backend checks this **before** issuing the
+    /// syscall/SQE and, when true, skips execution and discards the op (releasing its credit) via
+    /// [`combinator::complete_cancelled`](crate::fs::combinator::complete_cancelled).
+    ///
+    /// Returns `false` for a **fire-and-forget** op (no `completion` sender): such an op has no
+    /// receiver to lose, so it is never "cancelled" and always runs. Only an op with a live waiter
+    /// that has since vanished is cancellable.
+    #[inline]
+    pub fn is_cancelled(&self) -> bool {
+        match &self.completion {
+            Some(sender) => !sender.receiver_alive(),
+            None => false,
+        }
+    }
+
     /// Release this op's borrowed credit back to its own device pool, exactly once. Because the op
     /// carries its `Arc<Device>`, this needs no table lookup and works on whatever thread completes
     /// the op — the basis for a backend worker completing its own op in place (no completion bridge).

@@ -109,19 +109,23 @@ mod tests {
     };
 
     /// A throwaway `Arc<Device>` for the slab tests — they only need the op to carry *a* device, never
-    /// touching its pool (the slab is pure id/buffer bookkeeping, independent of the device).
+    /// touching its pool or submission channel (the slab is pure id/buffer bookkeeping, independent of
+    /// the device). The submission sender is dropped immediately (no dispatch task is wired up).
     fn device() -> Arc<Device> {
+        let (submission, _rx) = crate::socket::channel::intrusive::sync::new::<IoOp>();
         Arc::new(Device::new(
             "inflight-test".into(),
             0,
-            crate::fs::device::SchedulerId::next(),
             &crate::counter::Registry::default(),
             &DeviceConfig {
                 pool_mode: PoolMode::Shared(CreditConfig::new(1 << 20)),
                 rate: Rate::new(100.0),
                 cost_model: CostModel::Bytes,
                 op_weights: OpWeights::default(),
+                lane_count: 1,
             },
+            submission,
+            crate::time::DefaultClock::default(),
         ))
     }
 

@@ -77,6 +77,10 @@ pub struct DeviceCounters {
     /// `!` Completed ops whose submitter had already dropped its receiver (cancelled read-ahead,
     /// occasionally a bug) — the result is discarded.
     pub orphaned: Counter,
+    /// Ops a backend skipped before execution because the submitter had already dropped its receiver
+    /// — the IO (syscall / SQE / processing) was never issued, saving the work. Not an error (it is
+    /// the optimization working); a high rate just signals heavy upstream cancellation/churn.
+    pub cancelled: Counter,
     /// `!` Ops the dispatcher could not hand to a lane (lane/backend closed); surfaced as failed.
     pub lane_closed: Counter,
     /// Sojourn: submit→complete latency in microseconds (the end-to-end time an op spent in the
@@ -86,13 +90,14 @@ pub struct DeviceCounters {
 
 impl DeviceCounters {
     /// Register this device's nominal counters under `label` (the variant). Called once per device by
-    /// [`Scheduler::register_device`](crate::fs::scheduler::Scheduler::register_device).
+    /// [`DeviceRegistry::register_device`](crate::fs::scheduler::DeviceRegistry::register_device).
     pub fn register(registry: &Registry, label: &str) -> Self {
         Self {
             op: IoKind::ALL.map(|kind| OpKindCounters::register(registry, kind, label)),
             rejected: registry.register_nominal("fs.device.!rejected", label),
             failed: registry.register_nominal("fs.device.!failed", label),
             orphaned: registry.register_nominal("fs.device.!orphaned", label),
+            cancelled: registry.register_nominal("fs.device.cancelled", label),
             lane_closed: registry.register_nominal("fs.device.!lane_closed", label),
             sojourn_us: registry.register_nominal_summary(
                 "fs.device.sojourn",

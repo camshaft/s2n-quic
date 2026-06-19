@@ -34,7 +34,7 @@ use crate::{
             blocking::{JoinOnDrop, Runtime},
             Backend, LaneSetup,
         },
-        combinator::{complete, DRAIN_BUDGET},
+        combinator::{complete, complete_cancelled, DRAIN_BUDGET},
         op::{IoBuf, IoKind, IoOp, IoStatus},
     },
     intrusive::Entry,
@@ -265,6 +265,13 @@ impl Backend for SyscallBackend {
             // complete it in place (record on the op's own device counters, release credit to its
             // device pool, notify its submitter).
             let lane = Map::new(rx, move |mut op: Entry<IoOp>| {
+                // Skip the syscall entirely if the submitter already dropped its completion receiver:
+                // the read/write result would have nowhere to go, so running it is wasted device work.
+                // `complete_cancelled` still releases the op's credit (conservation holds).
+                if op.is_cancelled() {
+                    complete_cancelled(op);
+                    return;
+                }
                 execute(&mut op);
                 complete(op);
             })
@@ -305,10 +312,11 @@ mod tests {
     use crate::{
         counter::Registry,
         fs::{
-            config::{Config, CostModel, DeviceConfig, OpWeights, PoolMode},
+            config::{CostModel, DeviceConfig, OpWeights, PoolMode},
             device::Device,
             direct::{File, Options},
-            scheduler::Scheduler,
+            materialize::materialize_direct,
+            scheduler::DeviceRegistry,
         },
         runtime::tokio::Local,
         sched::{CreditConfig, Rate, TierPriority},
@@ -336,25 +344,17 @@ mod tests {
             rate: Rate::new(100.0),
             cost_model: CostModel::Bytes,
             op_weights: OpWeights::default(),
+            lane_count: 2,
         }
     }
 
-    /// Build a scheduler, then register one device lazily — exercising the post-construction
-    /// registration path the production setup uses. Returns the scheduler and the device handle to
-    /// submit against.
-    fn build(spawn: &mut Local, registry: &Registry, capacity: u64) -> (Scheduler, Arc<Device>) {
-        let config = Config { ring_count: 2 };
-        let scheduler = Scheduler::new(
-            &config,
-            &SyscallBackend::default(),
-            spawn,
-            registry,
-            clock(),
-        );
-        let device = scheduler
-            .register_device("test", &byte_device(capacity))
-            .unwrap();
-        (scheduler, device)
+    /// Build a device registry, then register one device lazily — exercising the post-construction
+    /// registration path the production setup uses. Returns the registry and the `Arc<Device>` to
+    /// submit against (submit is now a method on the device itself).
+    fn build(spawn: &mut Local, registry: &Registry, capacity: u64) -> (DeviceRegistry, Arc<Device>) {
+        let reg = DeviceRegistry::new(SyscallBackend::default(), spawn, registry, clock());
+        let device = reg.register_device("test", &byte_device(capacity)).unwrap();
+        (reg, device)
     }
 
     /// Run a `!Send` scheduler test body on a tokio current-thread runtime + LocalSet (the real,
@@ -413,13 +413,10 @@ mod tests {
             let path = path.clone();
             async move {
                 let (_scheduler, dev) = build(&mut spawn, &registry, 1 << 20);
-                let h = _scheduler.handle();
 
                 let payload =
                     bytes::Bytes::from_static(b"the quick brown fox jumps over the lazy dog");
-                let n = h
-                    .write(
-                        dev.clone(),
+                let n = dev.write(
                         fd.clone(),
                         0,
                         payload.clone(),
@@ -429,9 +426,7 @@ mod tests {
                     .unwrap();
                 assert_eq!(n, payload.len());
 
-                let buf = h
-                    .read(
-                        dev.clone(),
+                let buf = dev.read(
                         fd.clone(),
                         0,
                         payload.len() as u32,
@@ -477,12 +472,11 @@ mod tests {
             async move {
                 // Tiny capacity (4 KiB) + only 2 lanes, but 32 concurrent writers each doing several
                 // ops: admission is credit-bounded, execution is lane-bounded.
-                let (scheduler, dev) = build(&mut spawn, &registry, 4096);
+                let (_scheduler, dev) = build(&mut spawn, &registry, 4096);
 
                 let completed = Rc::new(std::cell::Cell::new(0usize));
                 let mut tasks = Vec::new();
                 for w in 0..32u64 {
-                    let h = scheduler.handle();
                     let dev = dev.clone();
                     let fd = fd.clone();
                     let completed = completed.clone();
@@ -492,7 +486,7 @@ mod tests {
                             let data = bytes::Bytes::from(vec![(w & 0xff) as u8; 256]);
                             // Each write is 256 bytes; with 4 KiB capacity at most 16 can be admitted
                             // at once, so the rest park on credit (never on a thread).
-                            if h.write(dev.clone(), fd.clone(), off, data, TierPriority::Medium)
+                            if dev.write(fd.clone(), off, data, TierPriority::Medium)
                                 .await
                                 .is_ok()
                             {
@@ -525,13 +519,12 @@ mod tests {
             }
         }
         run_local(|mut spawn, registry| async move {
-            let (scheduler, dev) = build(&mut spawn, &registry, 1 << 16);
-            let h = scheduler.handle();
+            let (_scheduler, dev) = build(&mut spawn, &registry, 1 << 16);
 
             // fd -1 is never valid: the pread fails with EBADF and must surface as Err promptly.
             let bad = crate::fs::op::Fd::new(Arc::new(BadFd));
-            let result = h
-                .read(dev.clone(), bad, 0, 4096, TierPriority::Medium)
+            let result = dev
+                .read(bad, 0, 4096, TierPriority::Medium)
                 .await;
             assert!(result.is_err(), "read on a bad fd must fail, not hang");
 
@@ -567,15 +560,14 @@ mod tests {
             async move {
                 // Capacity in bytes large enough for one block; atomic_grant makes the grant whole.
                 let (_scheduler, dev) = build(&mut spawn, &registry, 1 << 20);
-                let h = _scheduler.handle();
 
                 // Build a page-aligned write buffer with a known pattern.
                 let mut wbuf = AlignedBuf::new(ALIGNMENT);
                 for (i, b) in wbuf.as_mut_slice().iter_mut().enumerate() {
                     *b = (i & 0xff) as u8;
                 }
-                let (wbuf, n) = h
-                    .write_direct(dev.clone(), fd.clone(), 0, wbuf, TierPriority::Medium)
+                let (wbuf, n) = dev
+                    .write_direct(fd.clone(), 0, wbuf, TierPriority::Medium)
                     .await
                     .expect("direct write");
                 assert_eq!(n, ALIGNMENT);
@@ -583,8 +575,8 @@ mod tests {
 
                 // Read it back into a fresh aligned buffer, in place.
                 let rbuf = AlignedBuf::new(ALIGNMENT);
-                let (rbuf, rn) = h
-                    .read_direct(dev.clone(), fd.clone(), 0, rbuf, TierPriority::High)
+                let (rbuf, rn) = dev
+                    .read_direct(fd.clone(), 0, rbuf, TierPriority::High)
                     .await
                     .expect("direct read");
                 assert_eq!(rn, ALIGNMENT, "direct read returned wrong byte count");
@@ -595,8 +587,8 @@ mod tests {
 
                 // A misaligned offset must be rejected before any IO.
                 let bad = AlignedBuf::new(ALIGNMENT);
-                let err = h
-                    .read_direct(dev.clone(), fd.clone(), 1, bad, TierPriority::Medium)
+                let err = dev
+                    .read_direct(fd.clone(), 1, bad, TierPriority::Medium)
                     .await;
                 assert!(
                     matches!(
@@ -609,8 +601,8 @@ mod tests {
 
                 // A misaligned direct LENGTH must also be rejected at submit (not deep-EINVAL).
                 let bad_len = AlignedBuf::new(100); // len 100 is not block-aligned
-                let err = h
-                    .read_direct(dev.clone(), fd.clone(), 0, bad_len, TierPriority::Medium)
+                let err = dev
+                    .read_direct(fd.clone(), 0, bad_len, TierPriority::Medium)
                     .await;
                 assert!(
                     matches!(
@@ -659,8 +651,7 @@ mod tests {
         run_local(|mut spawn, registry| {
             let path = path.clone();
             async move {
-                let (scheduler, dev) = build(&mut spawn, &registry, 1 << 20);
-                let h = scheduler.handle();
+                let (_scheduler, dev) = build(&mut spawn, &registry, 1 << 20);
 
                 let blocks: Vec<BlockRef> = (0..nblocks)
                     .map(|k| {
@@ -673,7 +664,7 @@ mod tests {
                     })
                     .collect();
 
-                let mut stream = h.materialize_direct(blocks, TierPriority::High);
+                let mut stream = materialize_direct(blocks, TierPriority::High);
                 let mut delivered = 0usize;
                 while let Some(chunk) = stream.next().await {
                     let bytes = chunk.expect("direct block read failed").copy_to_bytes();
@@ -722,10 +713,9 @@ mod tests {
             let path = path.clone();
             async move {
                 let (_scheduler, dev) = build(&mut spawn, &registry, 1 << 20);
-                let h = _scheduler.handle();
 
-                let buf = h
-                    .read(dev.clone(), fd.clone(), 0, 4096, TierPriority::Medium)
+                let buf = dev
+                    .read(fd.clone(), 0, 4096, TierPriority::Medium)
                     .await
                     .unwrap();
                 assert_eq!(
@@ -741,11 +731,11 @@ mod tests {
         });
     }
 
-    /// The scheduler is a single, process-wide, `Send + Sync` object. On ONE multi-threaded runtime,
-    /// the scheduler's own (`!Send`) tasks run on a `LocalSet` while many concurrent submitter tasks
-    /// are `tokio::spawn`ed onto the multi-thread pool — which *requires* the submit futures (and the
-    /// `SubmitHandle` + `Arc<Device>` they capture) to be `Send`. They all share one scheduler via
-    /// cheap handle clones, the model `stream::Client`/`Arc<Endpoint>` uses.
+    /// A device is a single, process-wide, `Send + Sync` object. On ONE multi-threaded runtime, the
+    /// registry's own (`!Send`) tasks run on a `LocalSet` while many concurrent submitter tasks are
+    /// `tokio::spawn`ed onto the multi-thread pool — which *requires* the submit futures (and the
+    /// `Arc<Device>` they capture) to be `Send`. They all submit against one shared `Arc<Device>`, the
+    /// model `stream::Client`/`Arc<Endpoint>` uses.
     #[test]
     fn handle_shared_across_threads() {
         let path = temp_path("mt");
@@ -770,29 +760,21 @@ mod tests {
         let local = tokio::task::LocalSet::new();
 
         let total = local.block_on(&rt, async move {
-            let config = Config { ring_count: 4 };
-            // The scheduler's internal tasks are !Send → the tokio `Local` spawner `spawn_local`s
+            // The registry's internal tasks are !Send → the tokio `Local` spawner `spawn_local`s
             // them onto the surrounding `LocalSet`.
             let mut spawn = Local::new(0);
             let registry = Registry::default();
-            let scheduler = Scheduler::new(
-                &config,
-                &SyscallBackend::default(),
-                &mut spawn,
-                &registry,
-                clock(),
-            );
-            let dev = scheduler
-                .register_device("test", &byte_device(1 << 20))
+            let reg = DeviceRegistry::new(SyscallBackend::default(), &mut spawn, &registry, clock());
+            let dev = reg
+                .register_device("test", &byte_device(1 << 20).with_lane_count(4))
                 .unwrap();
 
             // Concurrent submitters via `tokio::spawn` (multi-thread pool): this only compiles if the
-            // submit future + captured SubmitHandle + Arc<Device> are Send.
+            // submit future + captured Arc<Device> are Send.
             let threads = 8usize;
             let per_task = 64u64;
             let mut tasks = Vec::new();
             for t in 0..threads {
-                let h = scheduler.handle();
                 let dev = dev.clone();
                 let fd = fd.clone();
                 tasks.push(tokio::spawn(async move {
@@ -800,7 +782,7 @@ mod tests {
                     for i in 0..per_task {
                         let off = (t as u64 * per_task + i) * 4096;
                         let data = bytes::Bytes::from(vec![(t & 0xff) as u8; 256]);
-                        if h.write(dev.clone(), fd.clone(), off, data, TierPriority::Medium)
+                        if dev.write(fd.clone(), off, data, TierPriority::Medium)
                             .await
                             .is_ok()
                         {

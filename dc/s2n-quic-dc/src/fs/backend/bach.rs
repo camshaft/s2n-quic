@@ -21,7 +21,7 @@
 use crate::{
     fs::{
         backend::{Backend, LaneSetup},
-        combinator::{complete, DRAIN_BUDGET},
+        combinator::{complete, complete_cancelled, DRAIN_BUDGET},
         op::{IoBuf, IoKind, IoOp, IoStatus},
     },
     intrusive::Entry,
@@ -186,6 +186,13 @@ where
             crate::runtime::bach::spawn_named("fs.bach.op", async move {
                 timer.sleep_until(deadline).await;
                 let mut entry = entry;
+                // If the submitter dropped its receiver while the op waited out its latency, skip
+                // processing — the result has nowhere to go. `complete_cancelled` still releases the
+                // op's credit, so conservation holds.
+                if entry.is_cancelled() {
+                    complete_cancelled(entry);
+                    return;
+                }
                 process(&mut entry);
                 // Complete the op in place: record on its own device counters, release its credit to
                 // its device pool, notify its submitter (or drop it if the receiver is gone).
