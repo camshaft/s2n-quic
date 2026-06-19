@@ -238,10 +238,13 @@ impl Device {
         len: u32,
         is_direct: bool,
     ) -> std::io::Result<(Arc<Pool>, u64)> {
-        if offset > i64::MAX as u64 {
+        // The end offset (`offset + len`) must fit in a signed `off_t`: the backends compute
+        // `offset + done` and cast to `libc::off_t`, so an end past `i64::MAX` would wrap to a
+        // negative offset (kernel `EINVAL`, surfaced confusingly as a `Failed` op). Reject up front.
+        if offset.checked_add(len as u64).is_none_or(|end| end > i64::MAX as u64) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
-                "io scheduler: offset exceeds i64::MAX",
+                "io scheduler: offset + len exceeds i64::MAX",
             ));
         }
 
@@ -266,21 +269,36 @@ impl Device {
     }
 }
 
-/// Force **atomic** credit grants for a storage pool by flooring `min_grant_slice` at
-/// `max_single_acquire` per priority.
+/// Force **atomic** credit grants for a storage pool: raise `max_single_acquire` to the full
+/// capacity and floor `min_grant_slice` at that same ceiling, per priority.
 ///
 /// The credit pool's demand-elastic fair share normally splits a parked waiter's request into
 /// `free / num_waiters` slices (great for QUIC byte-streams, which send the partial and release it).
 /// But an [`IoOp`](crate::fs::op::IoOp) is **indivisible** — it cannot execute, and therefore cannot
 /// release, until it holds its *full* cost. If two contending ops each pinned a partial slice,
 /// neither could run, nothing would release, and the pool would wedge (exactly the deadlock the
-/// `Writer` docs warn about, but with no partial-progress escape). Flooring the slice at the per-op
-/// ceiling makes every grant all-or-nothing: a waiter is served only when its whole request fits,
-/// so an admitted op (cost ≤ capacity, enforced at submit time) always gets granted in one wake.
+/// `Writer` docs warn about, but with no partial-progress escape).
 ///
-/// Fairness across streams is preserved — the distributor still walks waiters FIFO within a tier and
-/// serves whole ops round-robin; it just never hands out a sub-op sliver.
+/// Atomicity has **two** sides and we must close both:
+/// * the **grant** side — the distributor's `min_grant_slice`, floored here at the per-op ceiling so
+///   the distributor never hands a parked waiter a sub-op sliver;
+/// * the **acquire** side — the pool clamps every acquire request to `max_single_acquire`
+///   ([`Pool::poll_acquire`](crate::credit::Pool) → `clamp_request`), so if `max_single_acquire`
+///   stayed at the demand-elastic default (`capacity/256 .. capacity/64`), an op whose
+///   `cost > max_single_acquire` would *itself* fragment into capped partial fast-path grants that
+///   accumulate below `cost` and pin the pool — the same wedge, reintroduced on the acquire path.
+///
+/// So we raise `max_single_acquire` to `capacity` first. Combined with the submit-time guard that an
+/// op's `cost ≤ capacity`, every admitted op is now requested **and** granted whole in one wake — a
+/// true all-or-nothing acquisition. Fairness across streams is preserved: the distributor still walks
+/// waiters FIFO within a tier and serves whole ops round-robin.
+///
+/// (Trade-off: a larger `max_single_acquire` widens the worst-case transient negative `available`
+/// excursion to one full op per parked waiter — acceptable for an isolated per-device pool, and the
+/// price of indivisible ops.)
 fn atomic_grant(config: crate::sched::CreditConfig) -> crate::sched::CreditConfig {
+    let cap = config.capacity.max(1);
+    let config = config.with_max_single_acquire_uniform(cap);
     let caps = config.max_single_acquire;
     config.with_min_grant_slice_per_priority(caps)
 }

@@ -22,10 +22,17 @@ use std::{
 /// Device block alignment for direct IO. 4 KiB covers every common page/sector size.
 pub const ALIGNMENT: usize = 4096;
 
-/// Round `n` up to the next multiple of [`ALIGNMENT`].
+/// Round `n` up to the next multiple of [`ALIGNMENT`], **saturating** at the largest aligned value
+/// rather than overflowing. `n + ALIGNMENT - 1` would wrap for `n > usize::MAX - ALIGNMENT + 1`;
+/// since `align_up` sizes an `AlignedBuf` allocation whose `as_slice`/`as_mut_slice` build slices via
+/// unsafe, a wrapped (undersized) `cap` would be a soundness hole — so we saturate (an allocation of
+/// that size fails cleanly in `Layout`/`alloc` instead).
 #[inline]
 pub fn align_up(n: usize) -> usize {
-    (n + ALIGNMENT - 1) & !(ALIGNMENT - 1)
+    match n.checked_add(ALIGNMENT - 1) {
+        Some(s) => s & !(ALIGNMENT - 1),
+        None => usize::MAX & !(ALIGNMENT - 1),
+    }
 }
 
 /// A page-aligned heap buffer for direct IO. The allocation pointer is aligned to [`ALIGNMENT`] and

@@ -144,6 +144,84 @@ fn lane_send_failure_fails_submit_and_conserves_credit() {
     });
 }
 
+/// REGRESSION (swarm review, correctness): an op whose cost exceeds the credit pool's
+/// **`max_single_acquire`** (but not its capacity) must still be granted atomically and complete —
+/// it must NOT fragment into partial grants that pin the pool and wedge.
+///
+/// The public `DeviceConfig::shared_bytes` constructor uses `CreditConfig::new`, whose default
+/// per-priority caps are `capacity/256` (Medium) .. `capacity/64`. The acquire path clamps each
+/// request to `max_single_acquire`, so without the fix an op with `max_single_acquire < cost <=
+/// capacity` accumulates `max_single_acquire`-sized partial grants in its alloc, never reaching
+/// `cost`; with enough concurrent such ops every byte is pinned across parked allocs, nothing is in
+/// flight to release, and the pool deadlocks (the exact partial-pin wedge `atomic_grant` exists to
+/// prevent — but which it only closed on the grant side, not the acquire/clamp side).
+///
+/// Here capacity = 256 KiB (so Medium `max_single_acquire` = 1 KiB) and three concurrent 128 KiB
+/// reads (≫ the 1 KiB cap, and 1.5× capacity in aggregate so they must serialize through the pool).
+/// Before the fix this completes 0 of 3 (hang → sim never quiesces → timeout); after, all 3 complete.
+#[test]
+fn op_larger_than_max_single_acquire_grants_atomically() {
+    let _no_snap = crate::testing::without_snapshots();
+    sim(|| {
+        // Public constructor → default (non-uniform, capacity-scaled) caps. Refill off so only the
+        // grant machinery (not the liveness pacer) can make progress — isolating the wedge.
+        let mut cfg = DeviceConfig::shared_bytes(256 * 1024, Rate::new(1_000_000.0));
+        let PoolMode::Shared(c) = cfg.pool_mode else {
+            unreachable!()
+        };
+        cfg.pool_mode = PoolMode::Shared(c.without_refill());
+
+        let (scheduler, devices) = {
+            let config = Config { ring_count: 2 };
+            let clock = Clock::default();
+            // Latency long enough that all three ops are concurrently in flight / contending.
+            let latency = Latency {
+                read: Duration::from_micros(200),
+                write: Duration::from_micros(200),
+                per_byte_nanos: 0,
+            };
+            let backend = BachBackend::new(clock.clone(), latency);
+            let mut spawn = bach_spawner();
+            let s = Scheduler::new(&config, &backend, &mut spawn, &Registry::default(), clock);
+            let dev = s.register_device("bulk", &cfg).unwrap();
+            (s, vec![dev])
+        };
+        let dev = devices[0].clone();
+
+        let completed = Rc::new(std::cell::Cell::new(0u64));
+        for i in 0..3u64 {
+            let h = scheduler.handle();
+            let dev = dev.clone();
+            let completed = completed.clone();
+            async move {
+                // 128 KiB ≫ Medium max_single_acquire (1 KiB) but < capacity (256 KiB).
+                if h.read(dev, fd(), i * 128 * 1024, 128 * 1024, TierPriority::Medium)
+                    .await
+                    .is_ok()
+                {
+                    completed.set(completed.get() + 1);
+                }
+            }
+            .primary()
+            .spawn();
+        }
+
+        let completed_r = completed.clone();
+        async move {
+            50.ms().sleep().await;
+            assert_eq!(
+                completed_r.get(),
+                3,
+                "ops larger than max_single_acquire wedged the pool (partial-pin deadlock)"
+            );
+            assert_conserved(&dev);
+            info!("large-op atomic grant: all completed, pool conserved");
+        }
+        .primary()
+        .spawn();
+    });
+}
+
 /// A tiny IOPS device: `queue_depth` outstanding ops, one IOP per 4 KiB, paced generously so the
 /// credit pool (not the pacer) governs concurrency in these tests.
 fn iops_device(queue_depth: u64) -> DeviceConfig {

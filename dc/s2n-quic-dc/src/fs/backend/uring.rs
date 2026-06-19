@@ -142,9 +142,7 @@ impl EventFd {
         let val: u64 = 1;
         // SAFETY: `&val` is a valid 8-byte source; `self` (and thus `fd`) is kept alive by the
         // `Arc<EventFd>` the waker holds, so the fd is open for the whole call — no UAF/reuse.
-        let _ = unsafe {
-            libc::write(self.fd, &val as *const u64 as *const libc::c_void, 8)
-        };
+        let _ = unsafe { libc::write(self.fd, &val as *const u64 as *const libc::c_void, 8) };
     }
 
     /// Drain the eventfd's accumulated counter (one non-blocking 8-byte read). Called by the ring
@@ -257,9 +255,10 @@ fn drain_into_sq(
         // Disambiguate: the `sync` channel's `Receiver<IoOp>` implements
         // `channel::Receiver<Entry<IoOp>>` (single-entry) and `..<Queue<IoOp>>` (batch); we want the
         // single-entry form so each `Ready(Some(_))` is one `Entry<IoOp>`.
-        let polled = <sync_chan::Receiver<IoOp> as crate::socket::channel::Receiver<
-            Entry<IoOp>,
-        >>::poll_recv(rx, cx, budget);
+        let polled =
+            <sync_chan::Receiver<IoOp> as crate::socket::channel::Receiver<Entry<IoOp>>>::poll_recv(
+                rx, cx, budget,
+            );
         match polled {
             core::task::Poll::Ready(Some(op)) => {
                 let want = transfer_len(&op);
@@ -286,12 +285,13 @@ fn drain_into_sq(
     true
 }
 
-/// Build an SQE that arms a **multishot** poll on the eventfd for `POLLIN`, tagged with
-/// [`EVENTFD_TOKEN`]. Multishot stays armed across firings (kernel ≥ 5.13); the loop re-arms if the
-/// kernel reports it is no longer `more()`.
-fn arm_eventfd_poll(efd: RawFd) -> io_uring::squeue::Entry {
+/// Build an SQE that arms a poll on the eventfd for `POLLIN`, tagged with [`EVENTFD_TOKEN`].
+/// `multishot` stays armed across firings (kernel ≥ 5.13) and the loop re-arms when the kernel
+/// reports `!more()`; a `false` here is the **oneshot fallback** the loop drops to if the kernel
+/// rejects a multishot poll at runtime (a `-EINVAL` CQE on the token), which `probe()` cannot detect.
+fn arm_eventfd_poll(efd: RawFd, multishot: bool) -> io_uring::squeue::Entry {
     opcode::PollAdd::new(types::Fd(efd), libc::POLLIN as u32)
-        .multi(true)
+        .multi(multishot)
         .build()
         .user_data(EVENTFD_TOKEN)
 }
@@ -328,15 +328,21 @@ fn ring_loop(
 
     // Arm the eventfd poll once up front. If the SQ is somehow full (impossible on an empty ring) the
     // push is retried at the top of the loop via `poll_armed`.
+    //
+    // `multishot` starts true (assume kernel ≥ 5.13, which `probe()` cannot confirm). If the kernel
+    // rejects a multishot poll at runtime — a `-EINVAL` CQE on `EVENTFD_TOKEN` — the reap flips this
+    // to false and re-arms a oneshot poll instead, so the backend degrades gracefully on 5.4–5.12
+    // rather than spinning on a poll that never arms.
+    let mut multishot = true;
     let mut poll_armed = false;
-    poll_armed |= push_eventfd_poll(&mut ring, &efd, poll_armed);
+    poll_armed = push_eventfd_poll(&mut ring, &efd, poll_armed, multishot);
 
     let mut rx_open = true;
 
     loop {
         // 1. Re-arm the eventfd poll if a previous firing consumed it (oneshot fallback / kernel said
-        //    not-more). Idempotent: skipped when already armed.
-        poll_armed |= push_eventfd_poll(&mut ring, &efd, poll_armed);
+        //    not-more, or multishot was rejected). Idempotent: skipped when already armed.
+        poll_armed = push_eventfd_poll(&mut ring, &efd, poll_armed, multishot);
 
         // 2. Re-submit the tails of short-completed ops first (already pinned in the slab and counted
         //    outstanding; only the SQE needs re-pushing). Drop those the SQ accepts; keep the rest.
@@ -388,8 +394,15 @@ fn ring_loop(
         //
         //    A submit error NEVER frees in-flight buffers — they stay pinned and we fall through to
         //    reap whatever completions exist (treating the error like EINTR).
+        // Only park when the eventfd poll is actually armed. If step 1's re-arm push lost the race
+        // for a full SQ (`poll_armed == false`), parking now would block in `submit_and_wait` with
+        // NO wake source — nothing in flight to complete and no poll watching the eventfd — so a
+        // producer's write would never break the wait: a permanent lane stall. Instead fall through
+        // to the busy branch, which `submit()`s the pending SQEs (draining the SQ) and loops so the
+        // poll re-arms next iteration. (At the idle point the SQ holds at most the eventfd poll, so
+        // this is rare, but it is an availability hazard, not a latency blip.)
         let idle = slab.is_idle() && to_resubmit.is_empty();
-        if idle && rx_open {
+        if idle && rx_open && poll_armed {
             waker.arm_park();
             // Re-check the channel after arming: an op enqueued just before `arm_park` had its waker
             // observe `PARKED` clear and skip the eventfd write, so we must pick it up ourselves —
@@ -414,13 +427,19 @@ fn ring_loop(
                 let _ = ring.submit_and_wait(1);
                 waker.disarm_park();
             }
-        } else {
-            // Busy: block for the next completion. No park arm → no producer eventfd write.
+        } else if !slab.is_idle() || !to_resubmit.is_empty() {
+            // Busy: a completion is guaranteed to arrive, so block for it. No park arm → producers
+            // see `PARKED` clear and skip the eventfd write.
             match ring.submit_and_wait(1) {
                 Ok(_) => {}
                 Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => {}
                 Err(_) => {}
             }
+        } else {
+            // Idle but the eventfd poll is not armed (SQ-full race at step 1) — we must NOT block for
+            // a completion (none is coming). Just `submit()` to flush the SQ (so the poll can re-arm)
+            // and loop; the next iteration re-arms and parks correctly. Non-blocking, so no stall.
+            let _ = ring.submit();
         }
 
         // 6. Reap completions. The eventfd token's counter is drained only if it fired; a short
@@ -434,9 +453,19 @@ fn ring_loop(
             for cqe in &mut cq {
                 let token = cqe.user_data();
                 if token == EVENTFD_TOKEN {
+                    // A negative result means the kernel rejected this poll (e.g. it does not support
+                    // multishot `PollAdd`, kernel < 5.13 — which `probe()` cannot detect). Drop to a
+                    // oneshot poll and re-arm; without this the same multishot SQE would be re-pushed
+                    // and rejected forever, and an idle ring would never wake → permanent stall.
+                    if cqe.result() < 0 {
+                        multishot = false;
+                        poll_armed = false;
+                        // Not a real wake — don't drain the (untouched) eventfd counter.
+                        continue;
+                    }
                     saw_wake = true;
                     // The poll fired (a producer wrote the eventfd). If the kernel says it is no
-                    // longer armed, re-arm next iteration.
+                    // longer armed (oneshot, or multishot reported `!more()`), re-arm next iteration.
                     if !io_uring::cqueue::more(cqe.flags()) {
                         poll_armed = false;
                     }
@@ -473,11 +502,11 @@ fn ring_loop(
 }
 
 /// Push the eventfd poll SQE if not currently armed. Returns whether it is armed after the call.
-fn push_eventfd_poll(ring: &mut IoUring, efd: &EventFd, already_armed: bool) -> bool {
+fn push_eventfd_poll(ring: &mut IoUring, efd: &EventFd, already_armed: bool, multishot: bool) -> bool {
     if already_armed {
-        return false;
+        return true;
     }
-    let entry = arm_eventfd_poll(efd.fd);
+    let entry = arm_eventfd_poll(efd.fd, multishot);
     // SAFETY: the eventfd outlives the ring (owned by `ring_loop`); the poll SQE references only its
     // fd, no buffer.
     matches!(unsafe { ring.submission().push(&entry) }, Ok(()))
@@ -673,7 +702,8 @@ impl Backend for UringBackend {
             let (tx, rx) = sync_chan::new::<IoOp>();
             // Shared ownership of the eventfd: the ring loop and the waker each hold an `Arc`, so the
             // fd outlives every registered waker (the channel can keep one past teardown) — no UAF.
-            let efd = StdArc::new(EventFd::new().expect("failed to create eventfd for io_uring lane"));
+            let efd =
+                StdArc::new(EventFd::new().expect("failed to create eventfd for io_uring lane"));
             let waker = StdArc::new(EventFdWaker {
                 efd: efd.clone(),
                 state: AtomicUsize::new(WAKER_ALIVE),
@@ -778,15 +808,17 @@ mod tests {
     #[test]
     fn uring_write_then_read_roundtrip() {
         let path = temp_path("rt");
-        let file = std::sync::Arc::new(File::open(
-            &path,
-            Options {
-                truncate: true,
-                size: 1 << 20,
-                direct: false,
-            },
-        )
-        .unwrap());
+        let file = std::sync::Arc::new(
+            File::open(
+                &path,
+                Options {
+                    truncate: true,
+                    size: 1 << 20,
+                    direct: false,
+                },
+            )
+            .unwrap(),
+        );
         let fd = crate::fs::op::Fd::new(file.clone());
         run_local(|mut spawn, registry| {
             let path = path.clone();
@@ -798,18 +830,32 @@ mod tests {
                     &registry,
                     clock(),
                 );
-                let dev = scheduler.register_device("test", &byte_device(1 << 20)).unwrap();
+                let dev = scheduler
+                    .register_device("test", &byte_device(1 << 20))
+                    .unwrap();
                 let h = scheduler.handle();
 
                 let payload = bytes::Bytes::from_static(b"io_uring round trip payload");
                 let n = h
-                    .write(dev.clone(), fd.clone(), 0, payload.clone(), TierPriority::Medium)
+                    .write(
+                        dev.clone(),
+                        fd.clone(),
+                        0,
+                        payload.clone(),
+                        TierPriority::Medium,
+                    )
                     .await
                     .unwrap();
                 assert_eq!(n, payload.len());
 
                 let buf = h
-                    .read(dev.clone(), fd.clone(), 0, payload.len() as u32, TierPriority::High)
+                    .read(
+                        dev.clone(),
+                        fd.clone(),
+                        0,
+                        payload.len() as u32,
+                        TierPriority::High,
+                    )
                     .await
                     .unwrap();
                 assert_eq!(&buf[..], &payload[..]);
@@ -825,15 +871,17 @@ mod tests {
     #[test]
     fn uring_high_concurrency_conserves() {
         let path = temp_path("stress");
-        let file = std::sync::Arc::new(File::open(
-            &path,
-            Options {
-                truncate: true,
-                size: 1 << 20,
-                direct: false,
-            },
-        )
-        .unwrap());
+        let file = std::sync::Arc::new(
+            File::open(
+                &path,
+                Options {
+                    truncate: true,
+                    size: 1 << 20,
+                    direct: false,
+                },
+            )
+            .unwrap(),
+        );
         let fd = crate::fs::op::Fd::new(file.clone());
         run_local(|mut spawn, registry| {
             let path = path.clone();
@@ -845,7 +893,9 @@ mod tests {
                     &registry,
                     clock(),
                 );
-                let dev = scheduler.register_device("test", &byte_device(4096)).unwrap();
+                let dev = scheduler
+                    .register_device("test", &byte_device(4096))
+                    .unwrap();
                 let completed = Rc::new(std::cell::Cell::new(0usize));
                 let mut tasks = Vec::new();
                 for w in 0..32u64 {
@@ -898,7 +948,9 @@ mod tests {
                 &registry,
                 clock(),
             );
-            let dev = scheduler.register_device("test", &byte_device(1 << 16)).unwrap();
+            let dev = scheduler
+                .register_device("test", &byte_device(1 << 16))
+                .unwrap();
             let h = scheduler.handle();
             // An `Fd` wrapping a never-valid descriptor (-1): io_uring returns -EBADF in the CQE.
             struct BadFd;
@@ -908,7 +960,9 @@ mod tests {
                 }
             }
             let bad = crate::fs::op::Fd::new(Arc::new(BadFd));
-            let result = h.read(dev.clone(), bad, 0, 4096, TierPriority::Medium).await;
+            let result = h
+                .read(dev.clone(), bad, 0, 4096, TierPriority::Medium)
+                .await;
             assert!(result.is_err(), "bad fd read must fail, not hang");
             for pool in dev.pools.all() {
                 assert_eq!(pool.debug_free_total(), pool.debug_capacity() as i64);
@@ -924,15 +978,17 @@ mod tests {
     #[test]
     fn uring_producer_wakes_idle_ring() {
         let path = temp_path("dualwait");
-        let file = std::sync::Arc::new(File::open(
-            &path,
-            Options {
-                truncate: true,
-                size: 1 << 20,
-                direct: false,
-            },
-        )
-        .unwrap());
+        let file = std::sync::Arc::new(
+            File::open(
+                &path,
+                Options {
+                    truncate: true,
+                    size: 1 << 20,
+                    direct: false,
+                },
+            )
+            .unwrap(),
+        );
         let fd = crate::fs::op::Fd::new(file.clone());
         file.write_at(b"dual-wait payload", 0).unwrap();
         file.sync().unwrap();
@@ -946,13 +1002,21 @@ mod tests {
                     &registry,
                     clock(),
                 );
-                let dev = scheduler.register_device("test", &byte_device(1 << 20)).unwrap();
+                let dev = scheduler
+                    .register_device("test", &byte_device(1 << 20))
+                    .unwrap();
                 let h = scheduler.handle();
                 // Let the ring thread reach its idle `submit_and_wait` park before we submit, so this
                 // exercises the producer-wakes-idle-ring path rather than a busy ring.
                 tokio::time::sleep(std::time::Duration::from_millis(20)).await;
                 let buf = h
-                    .read(dev.clone(), fd.clone(), 0, b"dual-wait payload".len() as u32, TierPriority::High)
+                    .read(
+                        dev.clone(),
+                        fd.clone(),
+                        0,
+                        b"dual-wait payload".len() as u32,
+                        TierPriority::High,
+                    )
                     .await
                     .expect("idle-ring read must complete via eventfd wake");
                 assert_eq!(&buf[..], b"dual-wait payload");
@@ -968,15 +1032,17 @@ mod tests {
     #[test]
     fn uring_lazy_registration_works() {
         let path = temp_path("lazyreg");
-        let file = std::sync::Arc::new(File::open(
-            &path,
-            Options {
-                truncate: true,
-                size: 1 << 20,
-                direct: false,
-            },
-        )
-        .unwrap());
+        let file = std::sync::Arc::new(
+            File::open(
+                &path,
+                Options {
+                    truncate: true,
+                    size: 1 << 20,
+                    direct: false,
+                },
+            )
+            .unwrap(),
+        );
         let fd = crate::fs::op::Fd::new(file.clone());
         run_local(|mut spawn, registry| {
             let path = path.clone();
@@ -994,11 +1060,23 @@ mod tests {
                     .expect("lazy registration");
                 let h = scheduler.handle();
                 let payload = bytes::Bytes::from_static(b"lazily registered device");
-                h.write(dev.clone(), fd.clone(), 0, payload.clone(), TierPriority::Medium)
-                    .await
-                    .unwrap();
+                h.write(
+                    dev.clone(),
+                    fd.clone(),
+                    0,
+                    payload.clone(),
+                    TierPriority::Medium,
+                )
+                .await
+                .unwrap();
                 let buf = h
-                    .read(dev.clone(), fd.clone(), 0, payload.len() as u32, TierPriority::High)
+                    .read(
+                        dev.clone(),
+                        fd.clone(),
+                        0,
+                        payload.len() as u32,
+                        TierPriority::High,
+                    )
                     .await
                     .unwrap();
                 assert_eq!(&buf[..], &payload[..]);
@@ -1020,15 +1098,17 @@ mod tests {
     fn uring_direct_zero_copy_roundtrip() {
         use crate::fs::direct::{AlignedBuf, ALIGNMENT};
         let path = temp_path("direct");
-        let file = std::sync::Arc::new(File::open(
-            &path,
-            Options {
-                truncate: true,
-                size: 1 << 20,
-                direct: true,
-            },
-        )
-        .unwrap());
+        let file = std::sync::Arc::new(
+            File::open(
+                &path,
+                Options {
+                    truncate: true,
+                    size: 1 << 20,
+                    direct: true,
+                },
+            )
+            .unwrap(),
+        );
         let fd = crate::fs::op::Fd::new(file.clone());
         run_local(|mut spawn, registry| {
             let path = path.clone();
@@ -1040,7 +1120,9 @@ mod tests {
                     &registry,
                     clock(),
                 );
-                let dev = scheduler.register_device("test", &byte_device(1 << 20)).unwrap();
+                let dev = scheduler
+                    .register_device("test", &byte_device(1 << 20))
+                    .unwrap();
                 let h = scheduler.handle();
 
                 let mut wbuf = AlignedBuf::new(ALIGNMENT);
