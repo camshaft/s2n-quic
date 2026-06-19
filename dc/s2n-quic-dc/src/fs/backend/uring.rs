@@ -51,7 +51,6 @@ use crate::{
             Backend, LaneSetup,
         },
         combinator::complete,
-        counters::Counters,
         op::{IoBuf, IoKind, IoOp, IoStatus},
     },
     intrusive::Entry,
@@ -242,15 +241,15 @@ fn arm_eventfd_poll(efd: RawFd) -> io_uring::squeue::Entry {
 /// (every lane sender dropped) and nothing remains in flight.
 ///
 /// `rx` is the lane's submission channel; `efd` its dual-wait eventfd; `waker` the eventfd-writing
-/// waker the channel fires on `send` (kept alive here, marked dead on exit). `counters` is where each
-/// completed op records its disposition.
+/// waker the channel fires on `send` (kept alive here, marked dead on exit). Each completed op
+/// records its disposition on its own `Arc<Device>` counters (carried by the op), so the ring loop
+/// needs no counters handle.
 fn ring_loop(
     mut ring: IoUring,
     mut rx: sync_chan::Receiver<IoOp>,
     efd: StdArc<EventFd>,
     waker: StdArc<EventFdWaker>,
     depth: usize,
-    counters: Arc<Counters>,
 ) {
     let mut slab = InFlightSlab::<IoOp>::with_capacity(depth);
     // Scratch buffers RETAINED across iterations (cleared, never reallocated): ids whose tail must be
@@ -387,9 +386,10 @@ fn ring_loop(
         for &id in &completed {
             if let Some(mut op) = slab.take(id) {
                 finalize(&mut op);
-                // Complete the op in place: release its credit to its own device pool, notify its
-                // submitter. Runs on this ring thread — no completion bridge.
-                complete(op, &counters);
+                // Complete the op in place: record on the op's own device counters, release its
+                // credit to its device pool, notify its submitter. Runs on this ring thread — no
+                // completion bridge.
+                complete(op);
             }
         }
     }
@@ -603,13 +603,12 @@ impl Backend for UringBackend {
             });
             let ring_depth = self.depth;
             let depth = self.depth as usize;
-            let counters = setup.counters.clone();
             // The ring loop blocks in `submit_and_wait`, so it cannot be a cooperative future — spawn
             // it as a plain blocking closure on the runtime (one dedicated thread per ring). The ring
             // is built ON the ring thread (an `IoUring` is not `Send`).
             let join = self.runtime.spawn_blocking(idx, move || {
                 let ring = IoUring::new(ring_depth).expect("failed to create io_uring for lane");
-                ring_loop(ring, rx, efd, waker, depth, counters);
+                ring_loop(ring, rx, efd, waker, depth);
             });
             senders.push(tx);
             joins.push(join);

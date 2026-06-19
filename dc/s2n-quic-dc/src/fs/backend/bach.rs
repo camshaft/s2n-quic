@@ -22,12 +22,10 @@ use crate::{
     fs::{
         backend::{Backend, LaneSetup},
         combinator::{complete, DRAIN_BUDGET},
-        counters::Counters,
         op::{IoBuf, IoKind, IoOp, IoStatus},
     },
     intrusive::Entry,
     socket::channel::{intrusive::unsync, Map, ReceiverExt as _},
-    sync::Arc,
     time::precision::{self, Timer as _},
 };
 use core::time::Duration;
@@ -140,7 +138,6 @@ where
             let (tx, rx) = unsync::new::<IoOp>();
             let lane = LaneTask {
                 rx,
-                counters: setup.counters.clone(),
                 clock: self.clock.clone(),
                 latency: self.latency,
                 process: self.process.clone(),
@@ -159,7 +156,6 @@ where
 /// holds no pending state — every op's delay lives in its own spawned task, scheduled by bach.
 struct LaneTask<Clk: precision::Clock, P> {
     rx: unsync::Receiver<crate::intrusive::EntryAdapter<IoOp>>,
-    counters: Arc<Counters>,
     clock: Clk,
     latency: Latency,
     process: P,
@@ -173,7 +169,6 @@ where
     async fn run(self) {
         let LaneTask {
             rx,
-            counters,
             clock,
             latency,
             process,
@@ -186,16 +181,15 @@ where
         Map::new(rx, move |entry: Entry<IoOp>| {
             // The op completes at `now + latency` on the simulated clock; bach schedules the wake.
             let deadline = clock.now() + latency.for_op(entry.kind, entry.len);
-            let counters = counters.clone();
             let process = process.clone();
             let mut timer = clock.timer();
             crate::runtime::bach::spawn_named("fs.bach.op", async move {
                 timer.sleep_until(deadline).await;
                 let mut entry = entry;
                 process(&mut entry);
-                // Complete the op in place: release its credit to its own device pool and notify its
-                // submitter (or drop it if the receiver is gone).
-                complete(entry, &counters);
+                // Complete the op in place: record on its own device counters, release its credit to
+                // its device pool, notify its submitter (or drop it if the receiver is gone).
+                complete(entry);
             });
         })
         .drain_budgeted(Some(DRAIN_BUDGET))

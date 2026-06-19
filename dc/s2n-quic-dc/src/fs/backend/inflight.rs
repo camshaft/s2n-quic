@@ -115,6 +115,7 @@ mod tests {
             "inflight-test".into(),
             0,
             crate::fs::device::SchedulerId::next(),
+            &crate::counter::Registry::default(),
             &DeviceConfig {
                 pool_mode: PoolMode::Shared(CreditConfig::new(1 << 20)),
                 rate: Rate::new(100.0),

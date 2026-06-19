@@ -26,6 +26,8 @@
 //! Unlike the bach backend, this runs on real OS threads against real files, so it cannot run under
 //! the bach simulated clock — its tests use real threads + temp files.
 
+use bytes::buf::UninitSlice;
+
 use crate::{
     fs::{
         backend::{
@@ -59,14 +61,28 @@ fn execute(op: &mut Entry<IoOp>) {
                 // `read_exact_into` loops until the full `want` is read or EOF, then we set the
                 // logical length to the bytes actually read (a short result means EOF).
                 debug_assert!(buf.is_empty(), "read buffer arrives logically empty");
-                debug_assert!(buf.capacity() >= want, "read buffer must be pre-sized to op.len");
-                read_exact_into(fd, buf, want, offset)
+                debug_assert!(
+                    buf.capacity() >= want,
+                    "read buffer must be pre-sized to op.len"
+                );
+                // The spare capacity beyond `done` (the buffer's logical len tracks `done`).
+                let before_len = buf.len();
+                let spare = buf.spare_capacity_mut();
+                let spare = UninitSlice::uninit(spare);
+                let r = pread_exact(fd, spare, want, offset);
+                if let Ok(len) = r {
+                    unsafe {
+                        buf.set_len(before_len + len);
+                    }
+                }
+                r
             }
             IoBuf::Direct(buf) => {
                 // Zero-copy direct read straight into the caller's aligned buffer. `pread_exact`
                 // fills the whole length (looping on partial reads), then we set the logical length
                 // to the bytes actually read so a short read at EOF exposes no stale/zero tail.
-                let r = pread_exact(fd, buf.as_mut_slice(), offset);
+                let spare = UninitSlice::new(buf.as_mut_slice());
+                let r = pread_exact(fd, spare, want, offset);
                 if let Ok(n) = r {
                     buf.set_len(n);
                 }
@@ -104,19 +120,21 @@ fn execute(op: &mut Entry<IoOp>) {
 /// logical length to the total read. This is the no-memset path: a short read at EOF simply leaves a
 /// shorter buffer, never a zero-padded one, and a partial kernel read does not cost a pipeline
 /// resubmit.
-fn read_exact_into(
+fn pread_exact(
     fd: RawFd,
-    buf: &mut bytes::BytesMut,
+    buf: &mut bytes::buf::UninitSlice,
     want: usize,
     offset: u64,
 ) -> std::io::Result<usize> {
+    let want = want.min(buf.len());
     let mut done = 0usize;
     while done < want {
-        // The spare capacity beyond `done` (the buffer's logical len tracks `done`).
-        let spare = buf.spare_capacity_mut();
-        let dst = &mut spare[..want - done];
-        // SAFETY: `dst` is a valid writable region of `want - done` bytes (the buffer was sized to
-        // `>= want` capacity and `done <= want`); `fd` is owned by the caller.
+        // The uninitialized destination region for the tail starting at `done`.
+        let dst = &mut buf[done..want];
+        // SAFETY: `dst` is a valid writable region of `want - done` bytes. The kernel only *writes*
+        // it (it never reads the uninitialized bytes), and we return the count so the caller
+        // `set_len`s exactly the initialized prefix — no uninitialized byte is ever exposed as
+        // readable. `fd` is owned by the caller.
         let ret = unsafe {
             libc::pread(
                 fd,
@@ -134,41 +152,8 @@ fn read_exact_into(
         }
         let n = ret as usize;
         done += n;
-        // SAFETY: `done <= want <= capacity`, and the kernel initialized the `n` bytes just read.
-        unsafe { buf.set_len(done) };
         if n == 0 {
             break; // EOF: fewer than `want` bytes exist.
-        }
-    }
-    Ok(done)
-}
-
-/// Read into `buf` with `read_exact` semantics: loop on partial reads until `buf` is full or EOF,
-/// returning the total bytes read (`< buf.len()` only at EOF). For the direct path, where the
-/// destination is a caller-owned aligned slice.
-fn pread_exact(fd: RawFd, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
-    let mut done = 0usize;
-    while done < buf.len() {
-        // SAFETY: `buf[done..]` is a valid writable slice; `fd` is owned by the caller.
-        let ret = unsafe {
-            libc::pread(
-                fd,
-                buf[done..].as_mut_ptr() as *mut libc::c_void,
-                buf.len() - done,
-                (offset + done as u64) as libc::off_t,
-            )
-        };
-        if ret < 0 {
-            let err = std::io::Error::last_os_error();
-            if err.kind() == std::io::ErrorKind::Interrupted {
-                continue;
-            }
-            return Err(err);
-        }
-        let n = ret as usize;
-        done += n;
-        if n == 0 {
-            break; // EOF
         }
     }
     Ok(done)
@@ -276,12 +261,12 @@ impl Backend for SyscallBackend {
         let mut guards = Vec::with_capacity(setup.lane_count);
         for idx in 0..setup.lane_count {
             let (tx, rx) = sync_chan::new::<IoOp>();
-            let counters = setup.counters.clone();
             // The lane IS the standard combinator: pop an op, run its blocking syscall inline, then
-            // complete it in place (release credit to its own device pool, notify its submitter).
+            // complete it in place (record on the op's own device counters, release credit to its
+            // device pool, notify its submitter).
             let lane = Map::new(rx, move |mut op: Entry<IoOp>| {
                 execute(&mut op);
-                complete(op, &counters);
+                complete(op);
             })
             .drain_budgeted(Some(DRAIN_BUDGET));
             let guard = self.runtime.spawn(idx, lane);
@@ -313,7 +298,6 @@ impl UnboundedSender<Entry<IoOp>> for LaneSubmit {
         self.tx.send_entry(op)
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -360,7 +344,13 @@ mod tests {
     /// submit against.
     fn build(spawn: &mut Local, registry: &Registry, capacity: u64) -> (Scheduler, Arc<Device>) {
         let config = Config { ring_count: 2 };
-        let scheduler = Scheduler::new(&config, &SyscallBackend::default(), spawn, registry, clock());
+        let scheduler = Scheduler::new(
+            &config,
+            &SyscallBackend::default(),
+            spawn,
+            registry,
+            clock(),
+        );
         let device = scheduler
             .register_device("test", &byte_device(capacity))
             .unwrap();
@@ -640,7 +630,9 @@ mod tests {
                 let h = scheduler.handle();
 
                 let blocks: Vec<BlockRef> = (0..nblocks)
-                    .map(|k| BlockRef::whole(dev.clone(), fd, (k * ALIGNMENT) as u64, ALIGNMENT as u32))
+                    .map(|k| {
+                        BlockRef::whole(dev.clone(), fd, (k * ALIGNMENT) as u64, ALIGNMENT as u32)
+                    })
                     .collect();
 
                 let mut stream = h.materialize_direct(blocks, TierPriority::High);
@@ -741,9 +733,16 @@ mod tests {
             // them onto the surrounding `LocalSet`.
             let mut spawn = Local::new(0);
             let registry = Registry::default();
-            let scheduler =
-                Scheduler::new(&config, &SyscallBackend::default(), &mut spawn, &registry, clock());
-            let dev = scheduler.register_device("test", &byte_device(1 << 20)).unwrap();
+            let scheduler = Scheduler::new(
+                &config,
+                &SyscallBackend::default(),
+                &mut spawn,
+                &registry,
+                clock(),
+            );
+            let dev = scheduler
+                .register_device("test", &byte_device(1 << 20))
+                .unwrap();
 
             // Concurrent submitters via `tokio::spawn` (multi-thread pool): this only compiles if the
             // submit future + captured SubmitHandle + Arc<Device> are Send.

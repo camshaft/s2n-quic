@@ -38,7 +38,6 @@ use crate::{
     fs::{
         backend::{Backend, LaneSetup},
         config::{Config, DeviceConfig},
-        counters::Counters,
         device::Device,
     },
     intrusive::Entry,
@@ -95,8 +94,8 @@ pub(crate) struct SchedulerInner {
     registration: sync_chan::Sender<registrar::Registration>,
     pub(crate) lane_count: usize,
     pub(crate) clock: crate::time::DefaultClock,
-    pub(crate) counters: Arc<Counters>,
-    /// Registry kept so [`Scheduler::register_device`] can register a device's credit gauges.
+    /// Registry kept so [`Scheduler::register_device`] can register a device's credit gauges and its
+    /// per-device nominal counters.
     registry: Registry,
     /// Monotonic source of each device's crate-internal registration index (dense from 0). Stamped
     /// onto the `Device` so internal per-device indexers (materialize's acquire slots) can index an
@@ -136,8 +135,6 @@ impl Scheduler {
         S: Spawner,
         Clk: precision::Clock + Clone + Send + 'static,
     {
-        let counters = Counters::register(registry);
-
         // 1. Spawn the registrar task: it owns and drives the growable set of per-device credit
         //    distributors, adding one each time `register_device` sends a pool. Spawned once, up
         //    front; lazily-registered devices reach it over the (Send) registration channel.
@@ -147,14 +144,10 @@ impl Scheduler {
             registrar::registrar(registration_rx, clock.clone()),
         );
 
-        // 2. Build the backend's execution lanes. A lane completes each finished op in place (it
-        //    holds the counters), so there is no completion sink to wire.
+        // 2. Build the backend's execution lanes. A lane completes each finished op in place on its
+        //    own device counters, so there is no scheduler counters handle to wire.
         let lane_count = config.ring_count.max(1);
-        let lanes = backend.spawn_lanes(LaneSetup {
-            lane_count,
-            counters: counters.clone(),
-            registry: registry.clone(),
-        });
+        let lanes = backend.spawn_lanes(LaneSetup { lane_count });
 
         // 3. Spawn the submission dispatch task: it drains the Send submission channel and routes
         //    each admitted op to a backend lane. This task owns the !Send lane senders.
@@ -164,7 +157,6 @@ impl Scheduler {
             dispatch::dispatch_loop(
                 submission_rx,
                 lanes,
-                counters.clone(),
                 crate::time::DefaultClock::default(),
             ),
         );
@@ -175,7 +167,6 @@ impl Scheduler {
                 registration: registration_tx,
                 lane_count,
                 clock: crate::time::DefaultClock::default(),
-                counters,
                 registry: registry.clone(),
                 next_device_id: AtomicUsize::new(0),
                 origin: crate::fs::device::SchedulerId::next(),
@@ -201,7 +192,13 @@ impl Scheduler {
         let inner = &self.inner;
         let label = label.into();
         let index = inner.next_device_id.fetch_add(1, Ordering::Relaxed);
-        let device = Arc::new(Device::new(label.clone(), index, inner.origin, cfg));
+        let device = Arc::new(Device::new(
+            label.clone(),
+            index,
+            inner.origin,
+            &inner.registry,
+            cfg,
+        ));
 
         // Register each pool's gauges and hand its distributor work to the registrar.
         for (pool_idx, pool) in device.pools.all().enumerate() {

@@ -43,11 +43,52 @@ pub enum IoKind {
 }
 
 impl IoKind {
+    /// Every op kind, in `index` order — for registering one per-kind metric per device.
+    pub const ALL: [IoKind; 5] = [
+        IoKind::Read,
+        IoKind::Write,
+        IoKind::Fsync,
+        IoKind::Fdatasync,
+        IoKind::Trim,
+    ];
+
     /// Whether this op reads from the device (true) or writes to / mutates it (false). Used to
     /// route the op to the correct pool in split mode and to apply the read-vs-write cost weight.
     #[inline]
     pub fn is_read(self) -> bool {
         matches!(self, IoKind::Read)
+    }
+
+    /// Whether this op transfers a payload (read/write) rather than being a zero-byte control op
+    /// (fsync/fdatasync/trim). Only data ops get a byte-size histogram recorded.
+    #[inline]
+    pub fn is_data(self) -> bool {
+        matches!(self, IoKind::Read | IoKind::Write)
+    }
+
+    /// Lower-snake metric-name fragment (`read`, `write`, `fsync`, `fdatasync`, `trim`), used to build
+    /// the per-kind device metric names (`fs.device.op.{name}.*`).
+    #[inline]
+    pub fn name(self) -> &'static str {
+        match self {
+            IoKind::Read => "read",
+            IoKind::Write => "write",
+            IoKind::Fsync => "fsync",
+            IoKind::Fdatasync => "fdatasync",
+            IoKind::Trim => "trim",
+        }
+    }
+
+    /// Dense index into a per-kind metric array (matches [`ALL`](Self::ALL) order).
+    #[inline]
+    pub fn index(self) -> usize {
+        match self {
+            IoKind::Read => 0,
+            IoKind::Write => 1,
+            IoKind::Fsync => 2,
+            IoKind::Fdatasync => 3,
+            IoKind::Trim => 4,
+        }
     }
 }
 

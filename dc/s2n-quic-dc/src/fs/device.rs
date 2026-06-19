@@ -133,6 +133,10 @@ pub struct Device {
     pub cost_model: CostModel,
     pub op_weights: OpWeights,
     pub rate: crate::sched::Rate,
+    /// Per-device nominal counters (`fs.device.*{device=label}`). Because the op carries this
+    /// `Arc<Device>`, both the submit path and the in-place completion path bump these directly — no
+    /// extra plumbing — giving per-device IOPS / bytes / failure visibility.
+    pub counters: crate::fs::counters::DeviceCounters,
     /// Capacity of the read / write pool (in the cost-model currency), recorded so `prepare` can
     /// reject an op whose cost exceeds it (an `IoOp` is atomic — it has no partial-submit escape, so
     /// a `cost > capacity` acquire could never be satisfied and would park forever).
@@ -150,8 +154,16 @@ impl core::fmt::Debug for Device {
 
 impl Device {
     /// Build a device (and its not-yet-spawned credit pools) from config under `label`, with the
-    /// crate-internal registration `index` and `origin` scheduler stamp the scheduler assigned.
-    pub fn new(label: Arc<str>, index: usize, origin: SchedulerId, cfg: &DeviceConfig) -> Self {
+    /// crate-internal registration `index` and `origin` scheduler stamp the scheduler assigned, and
+    /// its per-device nominal counters registered against `registry`.
+    pub fn new(
+        label: Arc<str>,
+        index: usize,
+        origin: SchedulerId,
+        registry: &crate::counter::Registry,
+        cfg: &DeviceConfig,
+    ) -> Self {
+        let counters = crate::fs::counters::DeviceCounters::register(registry, &label);
         let (pools, read_capacity, write_capacity) = match &cfg.pool_mode {
             PoolMode::Shared(c) => {
                 let c = atomic_grant(*c);
@@ -181,6 +193,7 @@ impl Device {
             cost_model: cfg.cost_model,
             op_weights: cfg.op_weights,
             rate: cfg.rate,
+            counters,
             read_capacity,
             write_capacity,
         }

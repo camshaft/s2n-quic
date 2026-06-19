@@ -36,24 +36,15 @@ pub mod syscall;
 #[cfg(target_os = "linux")]
 pub mod uring;
 
-use crate::{
-    counter::Registry,
-    fs::{counters::Counters, op::IoOp},
-    intrusive::Entry,
-    sched::UnboundedSender,
-    sync::Arc,
-};
+use crate::{fs::op::IoOp, intrusive::Entry, sched::UnboundedSender};
 
-/// Context handed to a backend when it builds its lanes.
+/// Context handed to a backend when it builds its lanes. Just the lane count: a lane completes each
+/// finished op in place via [`combinator::complete`](crate::fs::combinator::complete), which records
+/// the disposition on the op's **own** `Arc<Device>` counters — so the backend needs no counters
+/// handle and no registry.
 pub struct LaneSetup {
     /// How many lanes to create.
     pub lane_count: usize,
-    /// The scheduler counters. A lane completes each finished op in place via
-    /// [`combinator::complete`](crate::fs::combinator::complete), which records its disposition
-    /// here, so every lane holds an `Arc<Counters>`.
-    pub counters: Arc<Counters>,
-    /// Registry for the backend's own counters/task topology.
-    pub registry: Registry,
 }
 
 /// A storage IO execution backend.

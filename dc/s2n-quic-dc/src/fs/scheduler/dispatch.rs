@@ -29,14 +29,12 @@ use crate::{
     },
     fs::{
         combinator::complete,
-        counters::Counters,
         device::LocalRingId,
         op::{IoOp, IoStatus},
     },
     intrusive::Entry,
     sched::{ByteCost as _, Map, Rate, ReceiverExt as _, UnboundedSender},
     socket::channel::intrusive::sync as sync_chan,
-    sync::Arc,
     xorshift::Rng,
 };
 
@@ -109,7 +107,6 @@ impl Router {
 pub(super) async fn dispatch_loop<L>(
     rx: sync_chan::Receiver<IoOp>,
     mut lanes: Vec<L>,
-    counters: Arc<Counters>,
     clock: crate::time::DefaultClock,
 ) where
     L: UnboundedSender<Entry<IoOp>>,
@@ -120,11 +117,12 @@ pub(super) async fn dispatch_loop<L>(
         let lane = router.choose(byte_cost, clock.now());
         entry.ring_id = LocalRingId(lane as u32);
         if let Err(mut undeliverable) = lanes[lane].send(entry) {
-            // Lane closed: stamp Failed and complete it in place so the submitter resolves with an
-            // error and its credit is released exactly once (never a hang).
-            counters.dispatch_lane_closed.add(1);
+            // Lane closed: record on the op's own device counters, stamp Failed, and complete it in
+            // place so the submitter resolves with an error and its credit is released exactly once
+            // (never a hang).
+            undeliverable.device.counters.lane_closed.add(1);
             undeliverable.status = IoStatus::Failed(std::io::ErrorKind::BrokenPipe);
-            complete(undeliverable, &counters);
+            complete(undeliverable);
         }
     })
     .drain_budgeted(Some(crate::fs::combinator::DRAIN_BUDGET))

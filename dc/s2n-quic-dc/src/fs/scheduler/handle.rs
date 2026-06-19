@@ -248,7 +248,7 @@ impl SubmitHandle {
             "io scheduler: device was registered with a different Scheduler than this handle"
         );
         device.prepare(kind, offset, len, is_direct).inspect_err(|_| {
-            self.inner.counters.submit_rejected.add(1);
+            device.counters.rejected.add(1);
         })
     }
 
@@ -269,9 +269,13 @@ impl SubmitHandle {
         user_data: u64,
         granted: u64,
     ) -> std::io::Result<()> {
-        let counters = &self.inner.counters;
-        counters.submit_ok.add(1);
-        counters.submit_bytes.add(len as u64);
+        // Per-device admission counters (the caller holds the `Arc<Device>`, so no extra plumbing):
+        // bump this op-kind's submitted count and, for data ops, its submit-size histogram.
+        let opk = device.counters.op(kind);
+        opk.submitted.add(1);
+        if let Some(hist) = &opk.submit_bytes {
+            hist.record_value(len as u64);
+        }
 
         let op = IoOp {
             kind,
@@ -291,7 +295,7 @@ impl SubmitHandle {
 
         if let Err(mut undelivered) = self.inner.submission.send_entry(Entry::new(op)) {
             undelivered.release_credits();
-            counters.submit_rejected.add(1);
+            undelivered.device.counters.rejected.add(1);
             return Err(std::io::Error::new(
                 std::io::ErrorKind::BrokenPipe,
                 "io scheduler: submission channel closed",
