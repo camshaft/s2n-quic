@@ -10,7 +10,7 @@
 //! deadlock and the lost fairness).
 //!
 //! Each source item is a [`Block`]: a [`Read`](Block::Read) (a `BlockRef` fetched from a device,
-//! credit-gated) or a [`Resident`](Block::Resident) (already-in-memory `Bytes` spliced into the
+//! credit-gated) or a [`Resident`](Block::Resident) (already-in-memory [`ByteVec`] spliced into the
 //! stream in order, **bypassing** `prepare`/credit/device/backend). Membrain objects are a mix of
 //! on-disk extents and cached/just-written data, so a stream interleaves both and the consumer sees
 //! one seamless ordered byte stream.
@@ -45,6 +45,7 @@
 //! healthy case; the cap only bites when the consumer stalls.
 
 use crate::{
+    byte_vec::ByteVec,
     credit::Pool,
     fs::{
         op::{CompletionReceiver, IoBuf, IoKind, IoOp, IoStatus},
@@ -53,7 +54,6 @@ use crate::{
     sched::TierPriority,
     sync::Arc,
 };
-use bytes::Bytes;
 use core::task::{Context, Poll};
 use std::{collections::VecDeque, io};
 
@@ -78,13 +78,20 @@ pub enum Block {
     Read(BlockRef),
     /// Deliver these already-in-memory bytes in stream order, bypassing the filesystem. The caller is
     /// responsible for any trimming — they are delivered verbatim.
-    Resident(Bytes),
+    Resident(ByteVec),
 }
 
 impl From<BlockRef> for Block {
     #[inline]
     fn from(block: BlockRef) -> Self {
         Block::Read(block)
+    }
+}
+
+impl From<ByteVec> for Block {
+    #[inline]
+    fn from(bytes: ByteVec) -> Self {
+        Block::Resident(bytes)
     }
 }
 
@@ -105,7 +112,7 @@ enum Slot {
     /// Enqueued (credit acquired, op in flight). Holds the block's trim metadata for completion.
     InFlight(BlockRef),
     /// Completed; the (trimmed) bytes or an error, awaiting its turn at the front.
-    Ready(io::Result<Bytes>),
+    Ready(io::Result<ByteVec>),
 }
 
 /// Per-device submission state: the device's one reusable credit-acquire slot and the FIFO of window
@@ -195,7 +202,7 @@ where
     }
 
     /// Await the next block in FIFO order, or `None` at end of stream.
-    pub async fn next(&mut self) -> Option<io::Result<Bytes>> {
+    pub async fn next(&mut self) -> Option<io::Result<ByteVec>> {
         core::future::poll_fn(|cx| self.poll_next(cx)).await
     }
 
@@ -203,7 +210,7 @@ where
     /// drive every device's acquire slot (out of order across devices), and drain completions. Loops
     /// while it makes progress; returns `Pending` once every wake source (each parked device slot and
     /// the completion channel) has the current waker registered.
-    fn poll_next(&mut self, cx: &mut Context<'_>) -> Poll<Option<io::Result<Bytes>>> {
+    fn poll_next(&mut self, cx: &mut Context<'_>) -> Poll<Option<io::Result<ByteVec>>> {
         loop {
             // 1. Deliver the front block if it is already complete, advancing the cursor.
             if matches!(self.window.front(), Some(Slot::Ready(_))) {
@@ -431,25 +438,19 @@ where
     }
 }
 
-/// Turn a completed read buffer into the delivered `Bytes`, applying head/tail trim. Buffered reads
-/// freeze their `BytesMut` (zero-copy); direct reads hand the page-aligned `AlignedBuf` to
-/// `Bytes::from_owner` (zero-copy — the buffer is moved, not copied) and slice it for trim.
-fn finish(buf: IoBuf, head_trim: u32, tail_trim: u32) -> Bytes {
-    let head = head_trim as usize;
-    let tail = tail_trim as usize;
-    match buf {
-        IoBuf::Read(b) => {
-            let bytes = b.freeze();
-            trim_bytes(bytes, head, tail)
-        }
-        IoBuf::Direct(b) => {
-            // `from_owner` exposes the buffer's logical length (set to the bytes actually read by the
-            // backend) without a copy; slice for any sub-block trim.
-            let bytes = Bytes::from_owner(b);
-            trim_bytes(bytes, head, tail)
-        }
-        _ => Bytes::new(),
-    }
+/// Turn a completed read buffer into the delivered [`ByteVec`], applying head/tail trim. Buffered
+/// reads freeze their `BytesMut` (zero-copy); direct reads hand the page-aligned `AlignedBuf` to
+/// `Bytes::from_owner` (zero-copy — the buffer is moved, not copied). Either way the single chunk
+/// becomes a `ByteVec`, trimmed via `advance`/`truncate` (no copy — both adjust chunk bounds).
+fn finish(buf: IoBuf, head_trim: u32, tail_trim: u32) -> ByteVec {
+    let bytes: bytes::Bytes = match buf {
+        IoBuf::Read(b) => b.freeze(),
+        // `from_owner` exposes the buffer's logical length (set to the bytes actually read by the
+        // backend) without a copy.
+        IoBuf::Direct(b) => bytes::Bytes::from_owner(b),
+        _ => bytes::Bytes::new(),
+    };
+    trim(bytes.into(), head_trim as usize, tail_trim as usize)
 }
 
 /// Apply head/tail trim to a block's bytes (for sub-range reads whose edge blocks are partial).
@@ -457,14 +458,19 @@ fn finish(buf: IoBuf, head_trim: u32, tail_trim: u32) -> Bytes {
 /// `head`/`tail` were computed against the block's *requested* length. If the backend returned a
 /// **short** read (fewer bytes than requested — only possible at EOF, since a mid-file block is
 /// always fully present), `len` here is the short count: a `head` past the returned data yields an
-/// empty slice and the tail trim is clamped. This is panic-safe (every index is bounded below), and
-/// for Membrain's use the blocks are fully-present interior reads so no trim/short-read interaction
-/// arises; a genuinely short edge read simply delivers the bytes that existed.
-fn trim_bytes(bytes: Bytes, head: usize, tail: usize) -> Bytes {
+/// empty buffer and the tail trim is clamped. Panic-safe (every bound is clamped), and for Membrain's
+/// interior reads no trim/short-read interaction arises. `advance`/`truncate` are zero-copy (they
+/// adjust chunk boundaries, never memcpy).
+fn trim(mut bytes: ByteVec, head: usize, tail: usize) -> ByteVec {
     let len = bytes.len();
     if head >= len {
-        return Bytes::new();
+        return ByteVec::new();
     }
-    let end = len.saturating_sub(tail).max(head);
-    bytes.slice(head..end)
+    // Drop the tail first (so head offsets are still measured against the original front), then the
+    // head. `tail` is clamped so we never truncate below `head`.
+    let keep = len.saturating_sub(tail).max(head);
+    bytes.truncate(keep);
+    // `head < len` and `head <= keep`, so advancing `head` bytes cannot exceed the buffer.
+    let _ = bytes.advance(head);
+    bytes
 }

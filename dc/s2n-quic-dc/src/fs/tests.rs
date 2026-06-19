@@ -477,7 +477,7 @@ fn materialize_delivers_in_order() {
             let mut stream = h.materialize(blocks.clone(), TierPriority::High);
             let mut delivered = 0u64;
             while let Some(chunk) = stream.next().await {
-                let buf = chunk.expect("block read failed");
+                let buf = chunk.expect("block read failed").copy_to_bytes();
                 let block = &blocks[delivered as usize];
                 assert_eq!(buf.len(), block.len as usize, "block {delivered} wrong len");
                 for (j, b) in buf.iter().enumerate() {
@@ -522,7 +522,7 @@ fn materialize_mixes_resident_and_device_blocks() {
                     if i % 2 == 0 {
                         Block::Read(BlockRef::whole(dev.clone(), fd(), i * 1024, 1024))
                     } else {
-                        Block::Resident(bytes::Bytes::from(vec![RESIDENT; 1024]))
+                        Block::Resident(crate::byte_vec::ByteVec::from(vec![RESIDENT; 1024]))
                     }
                 })
                 .collect();
@@ -530,7 +530,8 @@ fn materialize_mixes_resident_and_device_blocks() {
             let mut stream = h.materialize(items, TierPriority::High);
             let mut delivered = 0u64;
             while let Some(chunk) = stream.next().await {
-                let buf = chunk.expect("block failed");
+                // The delivered `ByteVec` is chunked; copy to a contiguous view for byte assertions.
+                let buf = chunk.expect("block failed").copy_to_bytes();
                 assert_eq!(buf.len(), 1024, "block {delivered} wrong len");
                 if delivered % 2 == 0 {
                     // Device read: bach fills byte j = (offset + j) & 0xff, offset = delivered*1024.
@@ -586,7 +587,7 @@ fn materialize_cross_device_no_hol() {
             let mut stream = h.materialize(blocks.clone(), TierPriority::High);
             let mut delivered = 0u64;
             while let Some(chunk) = stream.next().await {
-                let buf = chunk.expect("block read failed");
+                let buf = chunk.expect("block read failed").copy_to_bytes();
                 let block = &blocks[delivered as usize];
                 assert_eq!(buf.len(), block.len as usize, "block {delivered} wrong len");
                 for (j, b) in buf.iter().enumerate() {

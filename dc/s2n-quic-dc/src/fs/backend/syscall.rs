@@ -676,7 +676,7 @@ mod tests {
                 let mut stream = h.materialize_direct(blocks, TierPriority::High);
                 let mut delivered = 0usize;
                 while let Some(chunk) = stream.next().await {
-                    let bytes = chunk.expect("direct block read failed");
+                    let bytes = chunk.expect("direct block read failed").copy_to_bytes();
                     assert_eq!(bytes.len(), ALIGNMENT, "block {delivered} wrong len");
                     assert!(
                         bytes.iter().all(|&b| b == delivered as u8),
