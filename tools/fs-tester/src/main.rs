@@ -21,19 +21,23 @@ use config::{Backend, Config, OpMix};
 use s2n_quic_dc::{
     busy_poll::clock::Clock,
     fs::{
-        backend::syscall::SyscallBackend,
+        backend::{blocking::Runtime, syscall::SyscallBackend},
         config::{Config as FsConfig, CostModel, DeviceConfig, OpWeights, PoolMode},
-        device::DeviceId,
+        device::Device,
         direct::{File, Options, ALIGNMENT},
         scheduler::Scheduler,
-        SpawnHandle,
+        SubmitHandle,
     },
+    runtime::tokio::Local,
     sched::{CreditConfig, Rate, TierPriority as Priority},
 };
 use std::{
     cell::Cell,
     rc::Rc,
-    sync::atomic::{AtomicBool, Ordering},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
     time::Instant,
 };
 
@@ -127,10 +131,13 @@ fn run(cfg: Config) {
 
 async fn run_workload(cfg: Config) {
     // Test file.
-    let path = cfg
-        .file
-        .clone()
-        .unwrap_or_else(|| format!("{}/fs-tester-{}.dat", std::env::temp_dir().display(), std::process::id()));
+    let path = cfg.file.clone().unwrap_or_else(|| {
+        format!(
+            "{}/fs-tester-{}.dat",
+            std::env::temp_dir().display(),
+            std::process::id()
+        )
+    });
     let file = File::open(
         &path,
         Options {
@@ -142,37 +149,41 @@ async fn run_workload(cfg: Config) {
     .expect("open test file");
     let fd = file.raw_fd();
 
-    // One device sized in bytes (bandwidth-cost model), queue depth = capacity.
-    let device = DeviceConfig {
+    // One device sized in bytes (bandwidth-cost model), queue depth = capacity. Registered after the
+    // scheduler is built (the new lazy-registration API), which hands back the `Arc<Device>` handle.
+    let device_cfg = DeviceConfig {
         pool_mode: PoolMode::Shared(
-            CreditConfig::new(cfg.queue_depth.saturating_mul(cfg.op_size as u64).max(cfg.op_size as u64))
-                .with_max_single_acquire_uniform(cfg.op_size as u64)
-                .without_refill(),
+            CreditConfig::new(
+                cfg.queue_depth
+                    .saturating_mul(cfg.op_size as u64)
+                    .max(cfg.op_size as u64),
+            )
+            .with_max_single_acquire_uniform(cfg.op_size as u64)
+            .without_refill(),
         ),
         rate: Rate::new(1_000_000.0), // effectively unlimited; the pool (queue depth) governs
         cost_model: CostModel::Bytes,
         op_weights: OpWeights::default(),
     };
     let fs_config = FsConfig {
-        devices: vec![device],
         ring_count: cfg.lanes.max(1),
-        backend: s2n_quic_dc::fs::config::BackendKind::Syscall, // inert; the &B below selects
     };
 
-    let spawn = SpawnHandle::new(|fut| {
-        tokio::task::spawn_local(fut);
-    });
+    let mut spawn = Local::new(0);
+    let registry = s2n_quic_dc::counter::Registry::default();
     let clock = Clock::default();
 
-    // Build the scheduler with the chosen backend.
+    // Build the scheduler with the chosen backend (over a blocking runtime), then register the device.
     let scheduler = match cfg.backend {
         Backend::Syscall => {
-            let backend = SyscallBackend::new(cfg.syscall_workers);
-            Scheduler::new(&fs_config, &backend, spawn, clock)
+            let backend = SyscallBackend::new(Runtime::new("fs-tester-io"));
+            Scheduler::new(&fs_config, &backend, &mut spawn, &registry, clock)
         }
-        Backend::Uring => build_uring(&fs_config, spawn, clock, cfg.ring_depth),
+        Backend::Uring => build_uring(&fs_config, &mut spawn, &registry, clock, cfg.ring_depth),
     };
-    let dev = DeviceId(0);
+    let dev = scheduler
+        .register_device("dev0", &device_cfg)
+        .expect("register device");
 
     // Shared run state.
     let stop = Rc::new(AtomicBool::new(false));
@@ -183,6 +194,7 @@ async fn run_workload(cfg: Config) {
     let mut tasks = Vec::with_capacity(cfg.streams);
     for s in 0..cfg.streams {
         let h = scheduler.handle();
+        let dev = dev.clone();
         let stop = stop.clone();
         let counters = counters.clone();
         let op_size = cfg.op_size;
@@ -201,7 +213,7 @@ async fn run_workload(cfg: Config) {
                     OpMix::Mixed => i.is_multiple_of(2),
                 };
                 let start = Instant::now();
-                let ok = run_one(&h, dev, fd, offset, op_size, is_read, direct).await;
+                let ok = run_one(&h, &dev, fd, offset, op_size, is_read, direct).await;
                 let elapsed_us = start.elapsed().as_micros() as u64;
                 counters.record(ok, op_size as u64, elapsed_us);
                 i += 1;
@@ -225,8 +237,8 @@ async fn run_workload(cfg: Config) {
 
 /// Issue a single op of the requested kind, returning whether it succeeded.
 async fn run_one(
-    h: &s2n_quic_dc::fs::SubmitHandle,
-    dev: DeviceId,
+    h: &SubmitHandle,
+    dev: &Arc<Device>,
     fd: i32,
     offset: u64,
     op_size: usize,
@@ -237,27 +249,48 @@ async fn run_one(
         use s2n_quic_dc::fs::direct::AlignedBuf;
         if is_read {
             let buf = AlignedBuf::new(op_size);
-            h.read_direct(dev, fd, offset, buf, Priority::Medium).await.is_ok()
+            h.read_direct(dev, fd, offset, buf, Priority::Medium)
+                .await
+                .is_ok()
         } else {
             let buf = AlignedBuf::new(op_size);
-            h.write_direct(dev, fd, offset, buf, Priority::Medium).await.is_ok()
+            h.write_direct(dev, fd, offset, buf, Priority::Medium)
+                .await
+                .is_ok()
         }
     } else if is_read {
-        h.read(dev, fd, offset, op_size as u32, Priority::Medium).await.is_ok()
+        h.read(dev, fd, offset, op_size as u32, Priority::Medium)
+            .await
+            .is_ok()
     } else {
         let data = bytes::Bytes::from(vec![0u8; op_size]);
-        h.write(dev, fd, offset, data, Priority::Medium).await.is_ok()
+        h.write(dev, fd, offset, data, Priority::Medium)
+            .await
+            .is_ok()
     }
 }
 
 #[cfg(target_os = "linux")]
-fn build_uring(fs_config: &FsConfig, spawn: SpawnHandle, clock: Clock, ring_depth: u32) -> Scheduler {
-    let backend = s2n_quic_dc::fs::backend::uring::UringBackend::new(ring_depth);
-    Scheduler::new(fs_config, &backend, spawn, clock)
+fn build_uring(
+    fs_config: &FsConfig,
+    spawn: &mut Local,
+    registry: &s2n_quic_dc::counter::Registry,
+    clock: Clock,
+    ring_depth: u32,
+) -> Scheduler {
+    use s2n_quic_dc::fs::backend::uring::UringBackend;
+    let backend = UringBackend::new(Runtime::new("fs-tester-uring"), ring_depth);
+    Scheduler::new(fs_config, &backend, spawn, registry, clock)
 }
 
 #[cfg(not(target_os = "linux"))]
-fn build_uring(_: &FsConfig, _: SpawnHandle, _: Clock, _: u32) -> Scheduler {
+fn build_uring(
+    _: &FsConfig,
+    _: &mut Local,
+    _: &s2n_quic_dc::counter::Registry,
+    _: Clock,
+    _: u32,
+) -> Scheduler {
     panic!("the uring backend is only available on Linux");
 }
 
@@ -276,7 +309,9 @@ impl Default for RunCounters {
             bytes: Cell::new(0),
             errors: Cell::new(0),
             // 1us..60s, 3 sig figs.
-            hist: std::cell::RefCell::new(hdrhistogram::Histogram::new_with_bounds(1, 60_000_000, 3).unwrap()),
+            hist: std::cell::RefCell::new(
+                hdrhistogram::Histogram::new_with_bounds(1, 60_000_000, 3).unwrap(),
+            ),
         }
     }
 }
@@ -305,7 +340,8 @@ impl RunCounters {
         println!("ops             {ops}  ({} errors)", self.errors.get());
         println!("IOPS            {iops:.0}");
         println!("throughput      {gbps:.2} Gbps  ({mibs:.0} MiB/s)");
-        println!("latency (us)    p50={} p90={} p99={} p999={} max={}",
+        println!(
+            "latency (us)    p50={} p90={} p99={} p999={} max={}",
             h.value_at_quantile(0.50),
             h.value_at_quantile(0.90),
             h.value_at_quantile(0.99),

@@ -98,12 +98,36 @@ impl<T> InFlightSlab<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fs::op::{IoBuf, IoKind, IoOp, IoStatus};
+    use crate::{
+        fs::{
+            config::{CostModel, DeviceConfig, OpWeights, PoolMode},
+            device::Device,
+            op::{IoBuf, IoKind, IoOp, IoStatus},
+        },
+        sched::{CreditConfig, Rate},
+        sync::Arc,
+    };
+
+    /// A throwaway `Arc<Device>` for the slab tests — they only need the op to carry *a* device, never
+    /// touching its pool (the slab is pure id/buffer bookkeeping, independent of the device).
+    fn device() -> Arc<Device> {
+        Arc::new(Device::new(
+            "inflight-test".into(),
+            0,
+            crate::fs::device::SchedulerId::next(),
+            &DeviceConfig {
+                pool_mode: PoolMode::Shared(CreditConfig::new(1 << 20)),
+                rate: Rate::new(100.0),
+                cost_model: CostModel::Bytes,
+                op_weights: OpWeights::default(),
+            },
+        ))
+    }
 
     fn op(offset: u64) -> Entry<IoOp> {
         Entry::new(IoOp {
             kind: IoKind::Read,
-            device: crate::fs::device::DeviceId(0),
+            device: device(),
             fd: 0,
             offset,
             len: 0,

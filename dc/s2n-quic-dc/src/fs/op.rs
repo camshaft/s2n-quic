@@ -9,10 +9,18 @@
 //! the disposition the pipeline stamps as the op flows through.
 //!
 //! Like `Frame`, `IoOp` has **no `Drop` that releases `flow_credits`** — every drop path in the
-//! pipeline (undeliverable route, backend error, completion dispatch) must release the credit back
-//! to the op's device pool exactly once and zero the field. See [`IoOp::take_credits`].
+//! pipeline (undeliverable route, backend error, completion) must release the credit back to the
+//! op's device pool exactly once and zero the field. See [`IoOp::take_credits`].
+//!
+//! Also like `Frame` (which carries `Arc<PathSecretEntry>`), `IoOp` carries its **`Arc<Device>`**
+//! rather than a `DeviceId` index: the op holds everything it needs to finish itself — the pool to
+//! release credit to and the `Send + Sync` completion sender — so a backend worker thread can
+//! complete its own op in place with no table lookup and no cross-thread completion bridge.
 
-use crate::fs::device::{DeviceId, LocalRingId};
+use crate::{
+    fs::device::{Device, LocalRingId},
+    sync::Arc,
+};
 
 /// A completion notification handle for a single submitter, parameterized over the work-unit so the
 /// completed [`IoOp`] (with its filled buffer and result) is delivered back. This is the exact
@@ -49,8 +57,13 @@ impl IoKind {
 /// abstraction boundary.
 #[derive(Debug)]
 pub enum IoBuf {
-    /// Buffered read destination (scheduler-allocated, grown to the op length). Used for buffered
-    /// (non-`O_DIRECT`) IO where the kernel page cache absorbs the copy anyway.
+    /// Buffered read destination for non-`O_DIRECT` IO. The buffer arrives **pre-sized with
+    /// capacity** (`BytesMut::with_capacity(len)`) and **logically empty** (`len() == 0`): the
+    /// backend reads straight into its uninitialized spare capacity and then `set_len`s to the
+    /// bytes actually read. The scheduler never `resize`s or zero-fills it — there is no `memset`
+    /// on the read path, and a short read at EOF leaves no zero-padded tail. The op carries the
+    /// requested transfer length in [`IoOp::len`] (the capacity is `>= len`); on completion the
+    /// buffer's `len()` is the bytes read.
     Read(bytes::BytesMut),
     /// Buffered write source.
     Write(bytes::Bytes),
@@ -111,8 +124,11 @@ impl IoStatus {
 pub struct IoOp {
     /// Read / write / fsync / ...
     pub kind: IoKind,
-    /// Which device's budget and pacer this op draws from. Assigned at submit time.
-    pub device: DeviceId,
+    /// The device this op draws budget from, carried by `Arc` (the storage analog of
+    /// `Frame::path_secret_entry`). Holding the `Arc` — not a `DeviceId` index — means the op can
+    /// release its own credit (`device.pool_for(kind).release(..)`) on whatever thread completes it,
+    /// with no `DeviceTable` lookup. Assigned at submit time.
+    pub device: Arc<Device>,
     /// Target file descriptor (resolved by the caller; opaque to the scheduler core).
     pub fd: i32,
     /// Byte offset within the file.
@@ -146,6 +162,18 @@ impl IoOp {
     #[inline]
     pub fn take_credits(&mut self) -> u64 {
         core::mem::take(&mut self.flow_credits)
+    }
+
+    /// Release this op's borrowed credit back to its own device pool, exactly once. Because the op
+    /// carries its `Arc<Device>`, this needs no table lookup and works on whatever thread completes
+    /// the op — the basis for a backend worker completing its own op in place (no completion bridge).
+    /// Idempotent: [`take_credits`](Self::take_credits) zeroes the field, so a second call is a no-op.
+    #[inline]
+    pub fn release_credits(&mut self) {
+        let credits = self.take_credits();
+        if credits > 0 {
+            self.device.pool_for(self.kind).release(credits);
+        }
     }
 }
 

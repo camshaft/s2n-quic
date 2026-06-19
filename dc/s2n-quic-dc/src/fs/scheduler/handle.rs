@@ -12,9 +12,15 @@
 //! acquires the op's credit from its device pool **before** the op is handed to the pipeline. A
 //! submitter that cannot get credit parks cooperatively on a waker (never a thread), so admitted work
 //! can never exceed the pool capacity and the blocking-pool hold-and-wait deadlock cannot form.
+//!
+//! The read/write methods take the target device as **`&Arc<Device>`** (obtained once from
+//! [`Scheduler::register_device`](crate::fs::scheduler::Scheduler::register_device)), not a
+//! `DeviceId` index: the handle validates and acquires against that device directly, and the op
+//! carries the `Arc<Device>` through the pipeline so it can finish itself with no table lookup.
 
 use crate::{
     fs::{
+        device::Device,
         op::{CompletionReceiver, CompletionSender, IoBuf, IoKind, IoOp, IoStatus},
         scheduler::{alloc::SubmitterAlloc, BlockRef, SchedulerInner},
     },
@@ -22,7 +28,7 @@ use crate::{
     sched::{Budget, TierPriority},
     sync::Arc,
 };
-use core::{future::poll_fn, sync::atomic::Ordering, task::Context};
+use core::{future::poll_fn, task::Context};
 
 /// A cloneable, **`Send + Sync`** handle for submitting IO. Clones share the scheduler's devices,
 /// submission channel, and spawned tasks — so a single process-wide scheduler can be handed to and
@@ -33,28 +39,28 @@ pub struct SubmitHandle {
 }
 
 impl SubmitHandle {
-    /// Submit a read of `len` bytes at `offset` on `fd`/`device` at `priority`; resolve with the
-    /// filled buffer. The returned future is `'static` (captures a handle clone).
+    /// Submit a read of `len` bytes at `offset` on `fd`/`device`, resolving with the filled buffer.
+    ///
+    /// The scheduler allocates a `BytesMut` with capacity `len` and reads into its uninitialized
+    /// spare capacity (no zero-fill); the returned buffer's `len()` is the bytes actually read (a
+    /// short read at EOF returns fewer bytes, never a zero-padded tail). The returned future is
+    /// `'static` (captures a handle clone).
     pub fn read(
         &self,
-        device: crate::fs::device::DeviceId,
+        device: &Arc<Device>,
         fd: i32,
         offset: u64,
         len: u32,
         priority: TierPriority,
     ) -> impl core::future::Future<Output = std::io::Result<bytes::BytesMut>> + 'static {
         let handle = self.clone();
+        let device = device.clone();
         async move {
+            // Caller-owned, pre-sized, logically-empty buffer: the backend reads into spare capacity
+            // and `set_len`s to bytes read. No allocation or memset happens inside the backend.
+            let buf = bytes::BytesMut::with_capacity(len as usize);
             let op = handle
-                .submit(
-                    IoKind::Read,
-                    device,
-                    fd,
-                    offset,
-                    len,
-                    IoBuf::Read(bytes::BytesMut::new()),
-                    priority,
-                )
+                .submit(IoKind::Read, &device, fd, offset, len, IoBuf::Read(buf), priority)
                 .await?;
             match op.buf {
                 IoBuf::Read(buf) => Ok(buf),
@@ -63,29 +69,22 @@ impl SubmitHandle {
         }
     }
 
-    /// Submit a write of `data` at `offset` on `fd`/`device` at `priority`; resolve with the number
-    /// of bytes written.
+    /// Submit a write of `data` at `offset` on `fd`/`device`, resolving with the number of bytes
+    /// written.
     pub fn write(
         &self,
-        device: crate::fs::device::DeviceId,
+        device: &Arc<Device>,
         fd: i32,
         offset: u64,
         data: bytes::Bytes,
         priority: TierPriority,
     ) -> impl core::future::Future<Output = std::io::Result<usize>> + 'static {
         let handle = self.clone();
+        let device = device.clone();
         async move {
             let len = data.len() as u32;
             let op = handle
-                .submit(
-                    IoKind::Write,
-                    device,
-                    fd,
-                    offset,
-                    len,
-                    IoBuf::Write(data),
-                    priority,
-                )
+                .submit(IoKind::Write, &device, fd, offset, len, IoBuf::Write(data), priority)
                 .await?;
             match op.status {
                 IoStatus::Done(n) => Ok(n),
@@ -100,7 +99,7 @@ impl SubmitHandle {
     /// `buf.len()` must be block-aligned (validated; `InvalidInput` otherwise).
     pub fn read_direct(
         &self,
-        device: crate::fs::device::DeviceId,
+        device: &Arc<Device>,
         fd: i32,
         offset: u64,
         buf: crate::fs::direct::AlignedBuf,
@@ -108,18 +107,11 @@ impl SubmitHandle {
     ) -> impl core::future::Future<Output = std::io::Result<(crate::fs::direct::AlignedBuf, usize)>>
            + 'static {
         let handle = self.clone();
+        let device = device.clone();
         async move {
             let len = buf.len() as u32;
             let op = handle
-                .submit(
-                    IoKind::Read,
-                    device,
-                    fd,
-                    offset,
-                    len,
-                    IoBuf::Direct(buf),
-                    priority,
-                )
+                .submit(IoKind::Read, &device, fd, offset, len, IoBuf::Direct(buf), priority)
                 .await?;
             match (op.status, op.buf) {
                 (IoStatus::Done(n), IoBuf::Direct(buf)) => Ok((buf, n)),
@@ -133,7 +125,7 @@ impl SubmitHandle {
     /// `offset` must be block-aligned (validated; `InvalidInput` otherwise).
     pub fn write_direct(
         &self,
-        device: crate::fs::device::DeviceId,
+        device: &Arc<Device>,
         fd: i32,
         offset: u64,
         buf: crate::fs::direct::AlignedBuf,
@@ -141,18 +133,11 @@ impl SubmitHandle {
     ) -> impl core::future::Future<Output = std::io::Result<(crate::fs::direct::AlignedBuf, usize)>>
            + 'static {
         let handle = self.clone();
+        let device = device.clone();
         async move {
             let len = buf.len() as u32;
             let op = handle
-                .submit(
-                    IoKind::Write,
-                    device,
-                    fd,
-                    offset,
-                    len,
-                    IoBuf::Direct(buf),
-                    priority,
-                )
+                .submit(IoKind::Write, &device, fd, offset, len, IoBuf::Direct(buf), priority)
                 .await?;
             match (op.status, op.buf) {
                 (IoStatus::Done(n), IoBuf::Direct(buf)) => Ok((buf, n)),
@@ -163,13 +148,14 @@ impl SubmitHandle {
 
     /// The atomic submit primitive: acquire credit, hand the op to a lane, await completion.
     ///
-    /// Returns only **successfully completed** ops — a `Failed` completion, an out-of-range device,
-    /// an oversized op, or a closed lane all surface as `Err`, so callers never have to re-inspect
-    /// `op.status`.
+    /// Returns only **successfully completed** ops — a `Failed` completion, an oversized op, a
+    /// misaligned direct op, or a closed lane all surface as `Err`, so callers never have to
+    /// re-inspect `op.status`.
+    #[allow(clippy::too_many_arguments)]
     pub async fn submit(
         &self,
         kind: IoKind,
-        device_id: crate::fs::device::DeviceId,
+        device: &Arc<Device>,
         fd: i32,
         offset: u64,
         len: u32,
@@ -184,7 +170,7 @@ impl SubmitHandle {
         self.submit_with(
             &mut alloc,
             kind,
-            device_id,
+            device,
             fd,
             offset,
             len,
@@ -208,15 +194,15 @@ impl SubmitHandle {
     /// shared completion channel and reuses one acquire context across them (e.g.
     /// [`MaterializeStream`](crate::fs::materialize)), avoiding a per-op slot allocation.
     ///
-    /// `Ok(())` means the op was admitted (credit acquired) and enqueued. An `Err` (bad device,
-    /// misaligned/oversized op, closed scheduler) means no completion will arrive and any acquired
-    /// credit was released.
+    /// `Ok(())` means the op was admitted (credit acquired) and enqueued. An `Err` (misaligned/
+    /// oversized op, closed scheduler) means no completion will arrive and any acquired credit was
+    /// released.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn submit_with(
         &self,
         alloc: &mut SubmitterAlloc,
         kind: IoKind,
-        device_id: crate::fs::device::DeviceId,
+        device: &Arc<Device>,
         fd: i32,
         offset: u64,
         len: u32,
@@ -225,89 +211,56 @@ impl SubmitHandle {
         completion: CompletionSender,
         user_data: u64,
     ) -> std::io::Result<()> {
-        // Validate + resolve the device pool and cost (shared with the materialize reactor).
-        let (pool, _cost) = self.prepare(kind, device_id, offset, len, buf.is_direct())?;
+        // Validate + resolve the device pool and cost directly on the carried device (no lookup).
+        let (pool, cost) = self.prepare(device, kind, offset, len, buf.is_direct())?;
 
         // Acquire credit, parking cooperatively if the device is at capacity. This is the
         // backpressure that prevents the blocking-pool deadlock.
-        alloc.acquire(&pool, _cost, priority).await?;
+        alloc.acquire(&pool, cost, priority).await?;
 
         // Move the granted credit (>= cost) onto the op so the alloc resets clean and the completion
-        // dispatcher releases it exactly once.
+        // path releases it exactly once.
         let granted = alloc.take_all();
-        debug_assert!(granted >= _cost, "acquire returned less than cost");
+        debug_assert!(granted >= cost, "acquire returned less than cost");
 
-        self.enqueue(
-            kind, device_id, fd, offset, len, buf, completion, user_data, granted,
-        )
+        self.enqueue(kind, device, fd, offset, len, buf, completion, user_data, granted)
     }
 
-    /// Validate a prospective op and resolve the device pool it draws from plus its credit cost.
-    /// Shared by [`submit_with`](Self::submit_with) and the [`MaterializeStream`] reactor, which
-    /// drives the credit acquire itself (one slot per device, to avoid cross-device head-of-line
-    /// blocking) and so needs the pool + cost without committing to an acquire.
-    ///
-    /// Rejects (with `InvalidInput`) an out-of-range device, an offset that would wrap a signed
-    /// `off_t`, a misaligned direct op, or a cost exceeding the pool capacity (an atomic `IoOp` has
-    /// no partial-submit escape, so an over-capacity op could never be admitted).
+    /// Validate a prospective op against `device` and resolve the pool it draws from plus its credit
+    /// cost. A thin wrapper over [`Device::prepare`] that also bumps the rejection counter, shared by
+    /// [`submit_with`](Self::submit_with) and the [`MaterializeStream`] reactor.
     ///
     /// [`MaterializeStream`]: crate::fs::materialize::MaterializeStream
     pub(crate) fn prepare(
         &self,
+        device: &Arc<Device>,
         kind: IoKind,
-        device_id: crate::fs::device::DeviceId,
         offset: u64,
         len: u32,
         is_direct: bool,
     ) -> std::io::Result<(Arc<crate::credit::Pool>, u64)> {
-        let counters = &self.inner.counters;
-        let device = self.inner.devices.get(device_id).ok_or_else(|| {
-            counters.submit_rejected.add(1);
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "io scheduler: device id out of range",
-            )
-        })?;
-
-        if offset > i64::MAX as u64 {
-            counters.submit_rejected.add(1);
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "io scheduler: offset exceeds i64::MAX",
-            ));
-        }
-
-        if is_direct {
-            let align = crate::fs::direct::ALIGNMENT as u64;
-            if !offset.is_multiple_of(align) || !(len as u64).is_multiple_of(align) {
-                counters.submit_rejected.add(1);
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "io scheduler: direct op offset/length is not block-aligned",
-                ));
-            }
-        }
-
-        let cost = device.cost(kind, len);
-        if cost > device.capacity_for(kind) {
-            counters.submit_rejected.add(1);
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "io scheduler: op cost exceeds device pool capacity",
-            ));
-        }
-        Ok((device.pool_for(kind).clone(), cost))
+        // A device is a free-floating `Arc<Device>` with no owning table, so guard the footgun of
+        // submitting one scheduler's device to a different scheduler's handle (it would pace against
+        // the wrong pool and key the wrong materialize slot). Debug-only — `SchedulerId` is a ZST in
+        // release, so this compiles to nothing.
+        debug_assert!(
+            device.origin == self.inner.origin,
+            "io scheduler: device was registered with a different Scheduler than this handle"
+        );
+        device.prepare(kind, offset, len, is_direct).inspect_err(|_| {
+            self.inner.counters.submit_rejected.add(1);
+        })
     }
 
-    /// Build an admitted op (credit already `granted`) and push it into the submission channel; the
-    /// dispatch task routes it to a lane. On a closed channel (scheduler torn down) the credit is
-    /// released and an error returned, since no completion can arrive. Shared by `submit_with` and
-    /// the materialize reactor.
+    /// Build an admitted op (credit already `granted`) carrying its `Arc<Device>` and push it into
+    /// the submission channel; the dispatch task routes it to a lane. On a closed channel (scheduler
+    /// torn down) the credit is released and an error returned, since no completion can arrive.
+    /// Shared by `submit_with` and the materialize reactor.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn enqueue(
         &self,
         kind: IoKind,
-        device_id: crate::fs::device::DeviceId,
+        device: &Arc<Device>,
         fd: i32,
         offset: u64,
         len: u32,
@@ -320,11 +273,9 @@ impl SubmitHandle {
         counters.submit_ok.add(1);
         counters.submit_bytes.add(len as u64);
 
-        // Round-robin lane hint (the dispatch task makes the final choice).
-        let hint = self.inner.round_robin.fetch_add(1, Ordering::Relaxed) % self.inner.lane_count;
         let op = IoOp {
             kind,
-            device: device_id,
+            device: device.clone(),
             fd,
             offset,
             len,
@@ -332,18 +283,14 @@ impl SubmitHandle {
             completion: Some(completion),
             status: IoStatus::Pending,
             flow_credits: granted,
-            ring_id: crate::fs::device::LocalRingId(hint as u32),
+            // `LocalRingId::UNSET` until the dispatch EDT picks a lane (which overwrites it).
+            ring_id: crate::fs::device::LocalRingId::UNSET,
             user_data,
             enqueued_at: Some(self.inner.clock.now()),
         };
 
         if let Err(mut undelivered) = self.inner.submission.send_entry(Entry::new(op)) {
-            let credits = undelivered.take_credits();
-            if credits > 0 {
-                if let Some(device) = self.inner.devices.get(undelivered.device) {
-                    device.pool_for(undelivered.kind).release(credits);
-                }
-            }
+            undelivered.release_credits();
             counters.submit_rejected.add(1);
             return Err(std::io::Error::new(
                 std::io::ErrorKind::BrokenPipe,
@@ -351,11 +298,6 @@ impl SubmitHandle {
             ));
         }
         Ok(())
-    }
-
-    /// Number of registered devices (the materialize reactor sizes one acquire slot per device).
-    pub(crate) fn device_count(&self) -> usize {
-        self.inner.devices.len()
     }
 
     /// Stream an ordered object whose blocks scatter across devices, delivering blocks in FIFO order
@@ -368,12 +310,7 @@ impl SubmitHandle {
     where
         I: IntoIterator<Item = BlockRef>,
     {
-        crate::fs::materialize::MaterializeStream::new(
-            self.clone(),
-            blocks.into_iter(),
-            priority,
-            false,
-        )
+        crate::fs::materialize::MaterializeStream::new(self.clone(), blocks.into_iter(), priority, false)
     }
 
     /// Like [`materialize`](Self::materialize) but issues **zero-copy `O_DIRECT`** reads into
@@ -387,12 +324,7 @@ impl SubmitHandle {
     where
         I: IntoIterator<Item = BlockRef>,
     {
-        crate::fs::materialize::MaterializeStream::new(
-            self.clone(),
-            blocks.into_iter(),
-            priority,
-            true,
-        )
+        crate::fs::materialize::MaterializeStream::new(self.clone(), blocks.into_iter(), priority, true)
     }
 
     /// Number of execution lanes.

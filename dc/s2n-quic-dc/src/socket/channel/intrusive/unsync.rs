@@ -70,18 +70,27 @@ impl<A: intrusive::Adapter> Shared<A> {
     ///
     /// # Safety
     ///
-    /// The caller must have exclusive access to `Shared`: `Shared` is wrapped
-    /// in `Rc` (non-`Send`), so all access must be on the same thread.
-    /// Calling this while the receiver's `poll_recv` is concurrently reading
-    /// `self.waker` via `&mut self` would be unsound.  Because `Rc` prevents
-    /// sharing across threads and Rust's borrow checker ensures `&mut Receiver`
-    /// and `&mut Sender` are not held simultaneously in safe code, this
-    /// invariant is upheld automatically.
+    /// Accessing `self.waker` through the `UnsafeCell` must not alias another
+    /// live reference to it. This is **not** enforced by the borrow checker —
+    /// `Sender` and `Receiver` hold *independent* `Rc<Shared>` handles, so a
+    /// `&Sender` and a `&mut Receiver` freely coexist; nothing statically
+    /// prevents the sender and receiver from both reaching into `Shared`. The
+    /// real guarantees are dynamic:
+    ///
+    /// * **Single-threaded.** `Shared` is reachable only via `Rc`/`rc::Weak`
+    ///   (both `!Send`), so the sender and receiver are pinned to one thread and
+    ///   cannot run concurrently.
+    /// * **Non-reentrant, borrow released first.** Every access — `send`,
+    ///   `send_entry`, `poll_recv` — takes a transient `&mut` of the cell,
+    ///   finishes with it, and drops it before returning. `poll_recv` writes the
+    ///   waker and returns; the producers `take()` it here and only `wake()`
+    ///   *after* the cell borrow has ended. So even though `wake()` may re-enter
+    ///   the executor, no borrow of `self.waker` is live across it.
     #[inline(always)]
     unsafe fn wake_receiver(&self) {
-        // SAFETY: guaranteed to be on the same thread as the receiver because
-        // `Shared` is wrapped in `Rc`.  The `&mut self` of `send` and
-        // `poll_recv` ensures the waker slot is accessed by at most one caller.
+        // SAFETY: same thread as the receiver (`Shared` is `Rc`-confined), and the
+        // `take()` ends the cell borrow before `wake()` runs — so no aliasing of the
+        // waker slot even if `wake()` re-enters this channel.
         if let Some(waker) = (*self.waker.get()).take() {
             waker.wake();
         }
@@ -180,8 +189,10 @@ impl<A: intrusive::Adapter> super::super::Sender<A::Pointer> for Sender<A> {
 impl<A: intrusive::Adapter> Sender<A> {
     /// Send a single value to the queue, taking `&self` so callers need not hold (or clone) a
     /// `&mut` sender. Mirrors [`sync::Sender::send_entry`](super::sync::Sender::send_entry); sound
-    /// here because `Shared` is `!Send` (`Rc`-confined to one thread) and the borrow checker keeps
-    /// `&Sender` and `&mut Receiver` from overlapping, so the queue access never races.
+    /// here **not** because of the borrow checker (a `&Sender` and a `&mut Receiver` hold independent
+    /// `Rc` handles and freely coexist) but because `Shared` is `!Send` — `Rc`-confined to one thread
+    /// — and every access is synchronous and non-reentrant: this transiently borrows the queue,
+    /// pushes, and releases that borrow before `wake_receiver` runs, so the queue is never aliased.
     ///
     /// Returns `Err(value)` if the channel is closed, so the caller can recover/deallocate it.
     #[inline]

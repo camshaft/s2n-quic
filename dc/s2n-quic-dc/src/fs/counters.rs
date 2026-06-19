@@ -8,8 +8,10 @@
 //! are `fs.submit.*` (admission), `fs.complete.*` (completions), and `fs.credit.*` (the credit
 //! pools' own gauges, registered via [`crate::credit::Pool::register_gauges`]).
 
-use crate::counter::{Counter, Registry};
-use crate::sync::Arc;
+use crate::{
+    counter::{Counter, Registry},
+    sync::Arc,
+};
 
 /// Scheduler-wide counters, shared (`Arc`) across the submit path and the completion dispatcher.
 pub struct Counters {

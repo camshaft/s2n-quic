@@ -3,137 +3,109 @@
 
 //! io_uring backend — one ring per lane (Linux only).
 //!
-//! Each execution lane owns one [`io_uring`](io_uring::IoUring) driven by a dedicated OS thread.
-//! The thread drains the lane's submission channel, builds SQEs straight from the op's
-//! fields (zero-copy: the SQE points at the op's own buffer), submits, blocks in
-//! `submit_and_wait` for completions, reaps CQEs, and pushes the finished ops back through the same
-//! `Send` channel → per-lane reaper → `!Send` completion sink bridge the syscall backend uses.
+//! Each execution lane owns one [`io_uring`](io_uring::IoUring) driven by a dedicated OS thread (from
+//! the backend's blocking [`Runtime`](super::blocking::Runtime)). The thread drains the lane's
+//! submission channel, builds SQEs straight from each op's fields (zero-copy: the SQE points at the
+//! op's own buffer), submits, blocks in `submit_and_wait` for completions, reaps CQEs, and
+//! **completes each finished op in place** ([`combinator::complete`](crate::fs::combinator::complete))
+//! — releasing its credit to its own `Arc<Device>` pool and notifying its submitter on the ring
+//! thread. There is no reaper task and no cross-thread completion bridge.
 //!
-//! Like the syscall backend, the thread (and therefore ring) count is **fixed** (one per lane,
-//! created once, never dynamically spawned), and admission is credit-gated upstream — so the ring's
-//! in-flight set is bounded by the device pool and the hold-and-wait deadlock cannot form. The ring
-//! depth is sized to comfortably exceed the lane's credit-bounded in-flight count.
+//! # Dual-wait intake (eventfd)
 //!
-//! An op handed to a worker is parked in a slab keyed by the SQE's `user_data`; the slab owns the
-//! `IoOp` (and thus its heap buffer) for the entire kernel operation, so the buffer the kernel
-//! reads/writes stays pinned and alive until its CQE arrives. This is the io_uring memory-safety
-//! contract: a submitted buffer must outlive its completion.
+//! The ring thread must react to **two** independent events: a kernel completion *and* a producer
+//! wanting to submit more work. A plain blocking `submit_and_wait(1)` only wakes on a CQE, so a
+//! producer with spare ring capacity would wait until some unrelated completion happened to break the
+//! wait — adding latency. The fix is an **eventfd self-pipe** folded into the ring as just another
+//! completion source:
 //!
-//! Direct (`O_DIRECT`) vs. buffered is a per-op / per-file property exactly as in the syscall
-//! backend; io_uring issues the same `read`/`write` opcodes either way and the kernel honors the
-//! file's open flags.
+//! * Each ring owns one `eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK)`.
+//! * Intake is the shared [`sync`](crate::socket::channel::intrusive::sync) channel (the same channel
+//!   type the rest of the pipeline uses), driven with a **custom [`Waker`] that writes the eventfd**.
+//!   A producer `send`s an op and the channel fires that waker, which bumps the eventfd counter.
+//! * A **multishot [`PollAdd`](opcode::PollAdd)** is armed on the eventfd with a reserved `user_data`
+//!   token. When the eventfd becomes readable the poll yields a CQE, which breaks `submit_and_wait`.
+//!   (Multishot needs kernel ≥ 5.13; the loop re-arms a fresh poll whenever the kernel reports the
+//!   armed poll is no longer `more()`, so a one-shot fallback works on older kernels too.)
+//!
+//! So each loop wakes on a real CQE **or** new work, drains the channel into the ring's free SQE
+//! slots, submits, and reaps — never blocked against a producer that has work to give it.
+//!
+//! # Buffer lifetime
+//!
+//! An op handed to the kernel is parked in an [`InFlightSlab`] keyed by the SQE's `user_data`; the
+//! slab owns the `IoOp` (and thus its heap buffer) for the whole kernel operation, so the buffer the
+//! kernel reads/writes stays pinned and alive until its CQE arrives — the io_uring memory-safety
+//! contract. A submit error never frees in-flight buffers; they stay pinned and the loop keeps
+//! reaping. Admission is credit-gated upstream, so the in-flight set is bounded by the device pool and
+//! the hold-and-wait deadlock cannot form.
+//!
+//! Direct (`O_DIRECT`) vs. buffered is a per-op / per-file property exactly as in the syscall backend;
+//! io_uring issues the same `read`/`write` opcodes either way and the kernel honors the file's flags.
 
 use crate::{
     fs::{
         backend::{
+            blocking::{JoinOnDrop, Runtime},
             inflight::{InFlight, InFlightSlab},
-            {Backend, LaneSetup},
+            Backend, LaneSetup,
         },
-        combinator::CompletionSink,
+        combinator::{complete, DRAIN_BUDGET},
+        counters::Counters,
         op::{IoBuf, IoKind, IoOp, IoStatus},
     },
-    intrusive::{Entry, Queue},
+    intrusive::Entry,
     runtime::Spawner,
-    socket::channel::{intrusive::sync as sync_chan, Map, ReceiverExt as _, UnboundedSender},
+    socket::channel::{intrusive::sync as sync_chan, Budget, Receiver as _, UnboundedSender},
     sync::Arc,
 };
 use io_uring::{opcode, types, IoUring};
 use std::{
     os::fd::RawFd,
-    sync::{Condvar, Mutex},
-    thread::JoinHandle,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc as StdArc,
+    },
+    task::{Context, Wake, Waker},
 };
 
 /// Default ring depth (entries per ring). Sized well above any reasonable credit-bounded in-flight
 /// count so the SQ never backs up before the credit pool does.
 pub const DEFAULT_RING_DEPTH: u32 = 256;
 
-/// One ring + its dedicated worker thread, plus the intake queue feeding it. Each lane gets one.
+/// Reserved `user_data` token for the eventfd's armed [`PollAdd`](opcode::PollAdd). Distinct from any
+/// real op's slab id (slab ids are dense from 0 and the slab never approaches `u64::MAX`).
+const EVENTFD_TOKEN: u64 = u64::MAX;
+
+/// Probe whether io_uring is usable in the current environment, returning the underlying
+/// `io_uring_setup(2)` error if not — so the application can fall back to the blocking
+/// [`SyscallBackend`](super::syscall::SyscallBackend) and log *why*.
 ///
-/// The ring thread cannot use the shared thread-park `Receiver` driver the syscall pool uses: it must
-/// wake for *two* independent events — a newly-submitted op AND a kernel completion — and it must NOT
-/// park while ops are outstanding (it has to stay in `submit_and_wait` reaping them). So intake keeps
-/// a small private `Mutex<Queue> + Condvar`: the thread blocks on the condvar only when both its
-/// queue is empty and nothing is in flight. (Folding this onto the `sync` channel + park waker is
-/// deferred until that dual-wait is designed; the in-flight bookkeeping is already the shared
-/// [`InFlightSlab`].)
-struct Ring {
-    shared: Arc<Shared>,
-    worker: Option<JoinHandle<()>>,
-}
-
-struct Shared {
-    queue: Mutex<JobQueue>,
-    cond: Condvar,
-}
-
-struct JobQueue {
-    /// Intrusive FIFO of submitted ops awaiting the ring. The `Entry<IoOp>` IS the node — no
-    /// `Vec`/`VecDeque` and no per-op wrapper allocation.
-    jobs: Queue<IoOp>,
-    shutdown: bool,
-}
-
-impl Ring {
-    /// Build a ring whose worker forwards completions to `done_tx` (this lane's reaper).
-    fn new(depth: u32, done_tx: sync_chan::Sender<IoOp>) -> std::io::Result<Self> {
-        let shared = Arc::new(Shared {
-            queue: Mutex::new(JobQueue {
-                jobs: Queue::new(),
-                shutdown: false,
-            }),
-            cond: Condvar::new(),
-        });
-        // Build the ring on the worker thread (an IoUring is not Send) and signal readiness.
-        let thread_shared = shared.clone();
-        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<std::io::Result<()>>();
-        let worker = std::thread::Builder::new()
-            .name("s2n-dc-fs-uring".to_string())
-            .spawn(move || match IoUring::new(depth) {
-                Ok(ring) => {
-                    let _ = ready_tx.send(Ok(()));
-                    ring_loop(ring, thread_shared, depth as usize, done_tx);
-                }
-                Err(e) => {
-                    let _ = ready_tx.send(Err(e));
-                }
-            })?;
-        // Propagate a ring-construction failure as the backend's error rather than a dead thread.
-        match ready_rx.recv() {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => return Err(e),
-            Err(_) => {
-                return Err(std::io::Error::other(
-                    "uring worker died before signalling readiness",
-                ))
-            }
-        }
-        Ok(Self {
-            shared,
-            worker: Some(worker),
-        })
-    }
-
-    fn enqueue(&self, op: Entry<IoOp>) {
-        {
-            let mut q = self.shared.queue.lock().unwrap();
-            q.jobs.push_back(op);
-        }
-        self.shared.cond.notify_one();
-    }
-}
-
-impl Drop for Ring {
-    fn drop(&mut self) {
-        {
-            let mut q = self.shared.queue.lock().unwrap();
-            q.shutdown = true;
-        }
-        self.shared.cond.notify_all();
-        if let Some(worker) = self.worker.take() {
-            let _ = worker.join();
-        }
-    }
+/// The robust signal is to actually create a ring and observe the failure: `io_uring_setup` is the
+/// one syscall that surfaces every disablement reason in a single check —
+///
+/// * **`ENOSYS`** — the kernel predates io_uring (< 5.1) or was built without it;
+/// * **`EPERM`** — the `kernel.io_uring_disabled` sysctl (≥ 6.6: `1` = unprivileged-off, `2` =
+///   fully off), or a seccomp filter blocking the syscall (common in hardened containers/sandboxes);
+/// * **`ENOMEM`** — the locked-memory rlimit (`RLIMIT_MEMLOCK`) is too low to set up the ring.
+///
+/// On success the probe ring is created and immediately dropped — a cheap, side-effect-free
+/// capability check. Run it once at startup:
+///
+/// ```ignore
+/// let scheduler = match uring::probe() {
+///     Ok(()) => Scheduler::new(&cfg, &UringBackend::default(), &mut spawn, &reg, clock),
+///     Err(e) => {
+///         tracing::warn!("io_uring unavailable ({e}); using the blocking syscall pool");
+///         Scheduler::new(&cfg, &SyscallBackend::default(), &mut spawn, &reg, clock)
+///     }
+/// };
+/// // then: let dev = scheduler.register_device("nvme0", &device_cfg)?;
+/// ```
+pub fn probe() -> std::io::Result<()> {
+    // A minimal ring (8 entries — the smallest a depth ever rounds up to) is enough to exercise
+    // `io_uring_setup`; the depth does not affect whether the syscall is permitted. Dropped at once.
+    IoUring::new(8).map(drop)
 }
 
 /// What a reaped CQE means for its op.
@@ -144,109 +116,216 @@ enum Reaped {
     Resubmit,
 }
 
-/// The ring thread: pull submitted jobs, build SQEs, submit, reap CQEs, forward completions.
+// ── eventfd ──────────────────────────────────────────────────────────────────
+
+/// An owned `eventfd(2)` — the ring's "new work" wake source. **Shared ownership** (`StdArc<EventFd>`)
+/// between the ring loop and the [`EventFdWaker`]: the channel can keep a registered waker alive past
+/// ring teardown, so the fd must outlive every waker. Closing it here only when the last `Arc` drops
+/// (ring loop + all wakers gone) prevents a use-after-free / fd-reuse where a late `wake` writes a
+/// closed-and-recycled descriptor.
+struct EventFd {
+    fd: RawFd,
+}
+
+impl EventFd {
+    /// Create a non-blocking, close-on-exec eventfd with an initial count of 0.
+    fn new() -> std::io::Result<Self> {
+        // SAFETY: `eventfd` is a plain syscall; the flags are valid.
+        let fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(Self { fd })
+    }
+
+    /// Bump the counter by 1 (an 8-byte write, the eventfd ABI), making the fd readable so the ring's
+    /// armed `PollAdd` completes. Called from the producer thread via the waker.
+    fn signal(&self) {
+        let val: u64 = 1;
+        // SAFETY: `&val` is a valid 8-byte source; `self` (and thus `fd`) is kept alive by the
+        // `Arc<EventFd>` the waker holds, so the fd is open for the whole call — no UAF/reuse.
+        let _ = unsafe {
+            libc::write(self.fd, &val as *const u64 as *const libc::c_void, 8)
+        };
+    }
+
+    /// Drain the eventfd's accumulated counter (one non-blocking 8-byte read). Called by the ring
+    /// thread after the armed poll fires so the next write re-triggers it.
+    fn drain(&self) {
+        let mut buf = [0u8; 8];
+        // SAFETY: `buf` is a valid 8-byte destination; a non-blocking eventfd read either returns 8
+        // or fails with EAGAIN (nothing to drain) — both fine.
+        let _ = unsafe { libc::read(self.fd, buf.as_mut_ptr() as *mut libc::c_void, 8) };
+    }
+}
+
+impl Drop for EventFd {
+    fn drop(&mut self) {
+        // SAFETY: we own `fd` (last `Arc<EventFd>` reference) and it is not used after close.
+        unsafe { libc::close(self.fd) };
+    }
+}
+
+/// The [`Waker`] the ring's intake channel fires when a producer sends an op: it writes the eventfd,
+/// which completes the ring's armed [`PollAdd`](opcode::PollAdd) and breaks `submit_and_wait`. It
+/// **owns a shared reference to the [`EventFd`]** (`StdArc<EventFd>`), so the descriptor stays open as
+/// long as any waker exists — even after the ring loop has exited and dropped its own reference. The
+/// `alive` flag is a cheap post-teardown short-circuit (skip the syscall once the ring is gone), not a
+/// safety mechanism: the `Arc` is what guarantees the fd is valid.
+struct EventFdWaker {
+    efd: StdArc<EventFd>,
+    alive: AtomicBool,
+}
+
+impl Wake for EventFdWaker {
+    fn wake(self: StdArc<Self>) {
+        self.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &StdArc<Self>) {
+        if !self.alive.load(Ordering::Acquire) {
+            return;
+        }
+        self.efd.signal();
+    }
+}
+
+// ── Ring loop ─────────────────────────────────────────────────────────────────
+
+/// Build an SQE that arms a **multishot** poll on the eventfd for `POLLIN`, tagged with
+/// [`EVENTFD_TOKEN`]. Multishot stays armed across firings (kernel ≥ 5.13); the loop re-arms if the
+/// kernel reports it is no longer `more()`.
+fn arm_eventfd_poll(efd: RawFd) -> io_uring::squeue::Entry {
+    opcode::PollAdd::new(types::Fd(efd), libc::POLLIN as u32)
+        .multi(true)
+        .build()
+        .user_data(EVENTFD_TOKEN)
+}
+
+/// The ring thread: drain submitted ops from the intake channel, build SQEs, submit, reap CQEs, and
+/// complete each finished op in place. Runs on a dedicated blocking thread (it blocks in
+/// `submit_and_wait`, so it cannot be a cooperative future). Returns when the intake channel closes
+/// (every lane sender dropped) and nothing remains in flight.
 ///
-/// The in-flight set is the shared [`InFlightSlab`] (owning, `user_data`-keyed, recycled ids); intake
-/// is the private `Mutex<Queue> + Condvar` on `shared` (see [`Ring`] for why this can't yet be the
-/// `sync` channel + park waker). The thread blocks on the condvar only when **both** the queue is
-/// empty AND nothing is in flight; while ops are outstanding it stays hot in `submit_and_wait` to
-/// reap their completions, never busy-spinning.
-///
-/// **Buffer-lifetime invariant:** an op's buffer is freed *only* when its final CQE is reaped (via
-/// [`InFlightSlab::take`]), never based on a `submit` result. A submit error keeps every outstanding
-/// op pinned in the slab and the loop keeps reaping, so the kernel never holds a freed pointer.
+/// `rx` is the lane's submission channel; `efd` its dual-wait eventfd; `waker` the eventfd-writing
+/// waker the channel fires on `send` (kept alive here, marked dead on exit). `counters` is where each
+/// completed op records its disposition.
 fn ring_loop(
     mut ring: IoUring,
-    shared: Arc<Shared>,
+    mut rx: sync_chan::Receiver<IoOp>,
+    efd: StdArc<EventFd>,
+    waker: StdArc<EventFdWaker>,
     depth: usize,
-    done_tx: sync_chan::Sender<IoOp>,
+    counters: Arc<Counters>,
 ) {
     let mut slab = InFlightSlab::<IoOp>::with_capacity(depth);
-    // Scratch buffers RETAINED across loop iterations (cleared, never reallocated): ids whose tail
-    // must be re-submitted after a short completion, and ids completed this pass.
+    // Scratch buffers RETAINED across iterations (cleared, never reallocated): ids whose tail must be
+    // re-submitted after a short completion, and ids completed this pass.
     let mut to_resubmit: Vec<usize> = Vec::with_capacity(depth);
     let mut completed: Vec<usize> = Vec::with_capacity(depth);
 
+    // Build a std `Waker`/`Context` over the eventfd waker, used to drive the (non-async) intake
+    // channel: `poll_recv` registers this waker, so a producer's `send` fires it → writes the eventfd
+    // → completes the armed poll → breaks our `submit_and_wait`. One unit of budget per drain pass is
+    // irrelevant (we pass a large budget); the ring-space bound governs how many we pull.
+    let std_waker: Waker = waker.clone().into();
+    let mut cx = Context::from_waker(&std_waker);
+    let mut budget = Budget::new(depth.max(1));
+
+    // Arm the eventfd poll once up front. If the SQ is somehow full (impossible on an empty ring) the
+    // push is retried at the top of the loop via `poll_armed`.
+    let mut poll_armed = false;
+    poll_armed |= push_eventfd_poll(&mut ring, &efd, poll_armed);
+
+    let mut rx_open = true;
+
     loop {
-        // 1. Pull queued ops (block on the condvar only when nothing is queued AND nothing is in
-        //    flight AND no resubmit work remains).
-        {
-            let mut q = shared.queue.lock().unwrap();
-            loop {
-                if !q.jobs.is_empty() || !to_resubmit.is_empty() {
-                    break;
-                }
-                if q.shutdown && slab.is_idle() {
-                    return;
-                }
-                if !slab.is_idle() {
-                    // Work is in the kernel; don't block on the condvar — go reap its completions.
-                    break;
-                }
-                q = shared.cond.wait(q).unwrap();
+        // 1. Re-arm the eventfd poll if a previous firing consumed it (oneshot fallback / kernel said
+        //    not-more). Idempotent: skipped when already armed.
+        poll_armed |= push_eventfd_poll(&mut ring, &efd, poll_armed);
+
+        // 2. Re-submit the tails of short-completed ops first (already pinned in the slab and counted
+        //    outstanding; only the SQE needs re-pushing). Drop those the SQ accepts; keep the rest.
+        to_resubmit.retain(|&id| {
+            let Some(slot) = slab.get(id) else {
+                return false;
+            };
+            let entry = build_sqe(&slot.op, slot.done, id as u64);
+            // SAFETY: the op (and its buffer) is pinned in the slab until its final CQE.
+            match unsafe { ring.submission().push(&entry) } {
+                Ok(()) => false, // submitted; drop from the resubmit list
+                Err(_) => true,  // SQ full; retry next iteration
             }
-            // Re-submit the tails of short-completed ops first (already pinned in the slab and counted
-            // outstanding; only the SQE needs re-pushing). Drop those the SQ accepts; keep the rest.
-            to_resubmit.retain(|&id| {
-                let Some(slot) = slab.get(id) else {
-                    return false;
-                };
-                let entry = build_sqe(&slot.op, slot.done, id as u64);
-                // SAFETY: the op (and its buffer) is pinned in the slab until its final CQE.
-                match unsafe { ring.submission().push(&entry) } {
-                    Ok(()) => false, // submitted; drop from the resubmit list
-                    Err(_) => true,  // SQ full; retry next iteration
-                }
-            });
-            // Move newly-queued ops into the SQ, bounded by available ring space.
-            while slab.outstanding() < depth {
-                let Some(mut op) = q.jobs.pop_front() else {
-                    break;
-                };
-                // Prepare the op's buffer with exclusive access *before* parking it in the slab, then
-                // build the SQE from the (now-stable) buffer pointer.
-                prepare_buf(&mut op);
-                let want = transfer_len(&op);
-                let id = slab.insert(op, want);
-                let entry = build_sqe(&slab.get(id).unwrap().op, 0, id as u64);
-                // SAFETY: the op (and its buffer) lives in the slab until its CQE is reaped, so the
-                // buffer pointer in the SQE stays valid for the kernel operation's duration.
-                match unsafe { ring.submission().push(&entry) } {
-                    Ok(()) => {}
-                    Err(_) => {
-                        // SQ full despite the bound check — take the op back out and re-queue it.
-                        if let Some(op) = slab.take(id) {
-                            q.jobs.push_front(op);
+        });
+
+        // 3. Drain newly-submitted ops from the intake channel into the SQ, bounded by free ring
+        //    space. `poll_recv` with our eventfd waker registers it whenever the channel goes empty,
+        //    so the next `send` wakes us. A closed channel (all senders dropped) flips `rx_open`.
+        budget.reset();
+        while slab.outstanding() < depth {
+            let polled = sync_chan::Receiver::<Entry<IoOp>>::poll_recv(&mut rx, &mut cx, &mut budget);
+            match polled {
+                core::task::Poll::Ready(Some(op)) => {
+                    // Park the op (and its buffer) in the slab — it owns the op for the whole kernel
+                    // operation — then build the SQE from the now-stable buffer pointer.
+                    let want = transfer_len(&op);
+                    let id = slab.insert(op, want);
+                    let entry = build_sqe(&slab.get(id).unwrap().op, 0, id as u64);
+                    // SAFETY: the op (and its buffer) lives in the slab until its CQE is reaped, so the
+                    // buffer pointer in the SQE stays valid for the kernel operation's duration.
+                    match unsafe { ring.submission().push(&entry) } {
+                        Ok(()) => {}
+                        Err(_) => {
+                            // SQ full despite the outstanding<depth bound: keep the op pinned in the
+                            // slab and re-push its SQE on a later iteration (done=0). Stop draining
+                            // this pass — the SQ has no room.
+                            to_resubmit.push(id);
+                            break;
                         }
-                        break;
                     }
+                    budget.reset();
                 }
+                core::task::Poll::Ready(None) => {
+                    rx_open = false;
+                    break;
+                }
+                core::task::Poll::Pending => break,
             }
         }
 
-        if slab.is_idle() {
-            // Nothing in flight: loop back to block on the condvar (or exit if shut down).
-            continue;
+        // 4. Exit check: channel closed and nothing in flight → tear down.
+        if !rx_open && slab.is_idle() {
+            waker.alive.store(false, Ordering::Release);
+            return;
         }
 
-        // 3. Submit and wait for at least one completion. A submit error NEVER frees in-flight buffers
-        //    — they stay pinned and we fall through to reap whatever completions exist (treating the
-        //    error like EINTR). `submit_and_wait(1)` blocks until at least one CQE is available
-        //    whenever work is outstanding, so it makes progress and never busy-spins.
+        // 5. Submit and wait for at least one completion (a real CQE or the eventfd poll). A submit
+        //    error NEVER frees in-flight buffers — they stay pinned and we fall through to reap
+        //    whatever completions exist (treating the error like EINTR).
         match ring.submit_and_wait(1) {
             Ok(_) => {}
             Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => {}
             Err(_) => {}
         }
 
-        // 4. Reap completions. Short read/write → advance progress and mark for re-submit; otherwise
-        //    complete the op and free its slab slot (and thus its buffer).
+        // 6. Reap completions. The eventfd token is drained + (if no longer multishot) re-armed; a
+        //    short read/write advances progress and is marked for re-submit; otherwise the op is
+        //    completed in place and its slab slot (and buffer) freed.
         completed.clear();
         {
             let mut cq = ring.completion();
             cq.sync();
             for cqe in &mut cq {
-                let id = cqe.user_data() as usize;
+                let token = cqe.user_data();
+                if token == EVENTFD_TOKEN {
+                    // The poll fired (a producer wrote the eventfd). If the kernel says it is no
+                    // longer armed, re-arm next iteration.
+                    if !io_uring::cqueue::more(cqe.flags()) {
+                        poll_armed = false;
+                    }
+                    continue;
+                }
+                let id = token as usize;
                 let Some(slot) = slab.get_mut(id) else {
                     // Orphan CQE for an already-completed/reaped id — harmless tombstone.
                     continue;
@@ -257,14 +336,29 @@ fn ring_loop(
                 }
             }
         }
+        // Drain the eventfd counter AFTER reaping so a write that raced the drain re-fires the poll.
+        efd.drain();
+
         for &id in &completed {
             if let Some(mut op) = slab.take(id) {
                 finalize(&mut op);
-                // `send_entry` takes `&self`, so no per-op clone of the sender.
-                let _ = done_tx.send_entry(op);
+                // Complete the op in place: release its credit to its own device pool, notify its
+                // submitter. Runs on this ring thread — no completion bridge.
+                complete(op, &counters);
             }
         }
     }
+}
+
+/// Push the eventfd poll SQE if not currently armed. Returns whether it is armed after the call.
+fn push_eventfd_poll(ring: &mut IoUring, efd: &EventFd, already_armed: bool) -> bool {
+    if already_armed {
+        return false;
+    }
+    let entry = arm_eventfd_poll(efd.fd);
+    // SAFETY: the eventfd outlives the ring (owned by `ring_loop`); the poll SQE references only its
+    // fd, no buffer.
+    matches!(unsafe { ring.submission().push(&entry) }, Ok(()))
 }
 
 /// Apply a CQE result to an in-flight op, returning whether it is finished or needs its tail
@@ -296,7 +390,7 @@ fn apply_cqe(slot: &mut InFlight<IoOp>, result: i32) -> Reaped {
         IoKind::Read => {
             // A short read means EOF (or a partial that the file simply had no more for): the op is
             // done with `done + n` bytes. We do NOT re-issue reads — a short read is a legitimate
-            // end, not an error, matching the buffered backend's truncate-to-n behavior.
+            // end, not an error, matching the buffered backend's read-exact-to-EOF behavior.
             slot.done += n;
             slot.op.status = IoStatus::Done(slot.done);
             Reaped::Done
@@ -310,8 +404,8 @@ fn apply_cqe(slot: &mut InFlight<IoOp>, result: i32) -> Reaped {
 }
 
 /// Finalize a completed op's buffer so the delivered length reflects the bytes actually transferred:
-/// truncate a buffered read's `BytesMut`, or shrink a direct read's `AlignedBuf` logical length.
-/// (Writes leave their source buffer untouched.)
+/// publish a buffered read's bytes via `set_len`, or shrink a direct read's `AlignedBuf` logical
+/// length. (Writes leave their source buffer untouched.)
 fn finalize(op: &mut IoOp) {
     if op.kind != IoKind::Read {
         return;
@@ -321,30 +415,22 @@ fn finalize(op: &mut IoOp) {
         _ => return,
     };
     match &mut op.buf {
-        IoBuf::Read(b) => b.truncate(n),
+        // The buffered-read `BytesMut` arrived logically EMPTY (len 0); the kernel wrote `n` bytes
+        // into its spare capacity, so we publish them with `set_len(n)` (NOT `truncate`, which would
+        // leave len 0). `n <= op.len <= capacity` by the read contract.
+        // SAFETY: the kernel initialized exactly the first `n` bytes of the spare capacity the SQE
+        // pointed at (`read_ptr` used `op.len`, and `n` is the CQE byte count, so `n <= op.len <=
+        // capacity`); `set_len(n)` exposes only those initialized bytes.
+        IoBuf::Read(b) => unsafe { b.set_len(n) },
         IoBuf::Direct(b) => b.set_len(n),
         _ => {}
-    }
-}
-
-/// Prepare an op's buffer for submission, with exclusive `&mut` access (called before the op is
-/// parked in the slab). For a buffered read the scheduler hands an empty `BytesMut`; size it to the
-/// op length here so the SQE points at a valid `op.len`-byte destination. Other variants are already
-/// sized by the caller (direct buffer / write source).
-fn prepare_buf(op: &mut IoOp) {
-    if op.kind == IoKind::Read {
-        if let IoBuf::Read(b) = &mut op.buf {
-            let cap = op.len as usize;
-            b.clear();
-            b.resize(cap, 0);
-        }
     }
 }
 
 /// The total transfer length of a read/write op (0 for control ops).
 fn transfer_len(op: &IoOp) -> usize {
     match op.kind {
-        IoKind::Read | IoKind::Write => op.buf.len(),
+        IoKind::Read | IoKind::Write => op.len as usize,
         _ => 0,
     }
 }
@@ -352,6 +438,10 @@ fn transfer_len(op: &IoOp) -> usize {
 /// Build an SQE for `op` starting at byte offset `done` into its buffer (0 for the first submission,
 /// `>0` when re-submitting a short-completed tail), tagged with `user_data`. The op stays pinned in
 /// the slab so the buffer pointer is valid until the final CQE.
+///
+/// For a buffered read the destination is the op's `BytesMut` **uninitialized spare capacity** (the
+/// buffer arrives pre-sized + logically empty per the [`IoBuf::Read`] contract); the kernel fills it
+/// and the CQE's byte count is applied via `set_len` in `finalize`. No `resize`/zero-fill.
 fn build_sqe(op: &IoOp, done: usize, user_data: u64) -> io_uring::squeue::Entry {
     let fd = types::Fd(op.fd as RawFd);
     let off = op.offset + done as u64;
@@ -385,20 +475,26 @@ fn build_sqe(op: &IoOp, done: usize, user_data: u64) -> io_uring::squeue::Entry 
     }
 }
 
-/// Read destination pointer/len for the tail starting at `done`. The op's buffer is pinned in the
-/// slab until the final CQE, so the pointer is valid for the kernel operation.
+/// Read destination pointer/len for the tail starting at `done`. For a buffered read the destination
+/// is the buffer's uninitialized spare capacity (the op carries `len` and an empty pre-sized
+/// `BytesMut`); for a direct read it is the aligned buffer. The op is pinned in the slab until the
+/// final CQE, so the pointer is valid for the kernel operation.
 fn read_ptr(op: &IoOp, done: usize) -> (*mut u8, u32) {
-    let (base, total): (*const u8, usize) = match &op.buf {
-        IoBuf::Read(b) => (b.as_ptr(), b.len()),
+    let (base, total): (*mut u8, usize) = match &op.buf {
+        IoBuf::Read(b) => {
+            // Write into spare capacity: base is the buffer's start (len() is 0), total is `op.len`
+            // (the requested transfer; capacity is >= len by the buffer contract).
+            (b.as_ptr() as *mut u8, op.len as usize)
+        }
         IoBuf::Direct(b) => {
             let s = b.as_slice();
-            (s.as_ptr(), s.len())
+            (s.as_ptr() as *mut u8, s.len())
         }
         _ => return (core::ptr::null_mut(), 0),
     };
     let done = done.min(total);
     // SAFETY: `done <= total`, so the offset pointer is within the buffer (or one-past-the-end).
-    unsafe { (base.add(done) as *mut u8, (total - done) as u32) }
+    unsafe { (base.add(done), (total - done) as u32) }
 }
 
 /// Write source pointer/len for the tail starting at `done`.
@@ -418,67 +514,84 @@ fn write_ptr(op: &IoOp, done: usize) -> (*const u8, u32) {
 
 // ── Backend wiring ──────────────────────────────────────────────────────────
 
-/// An io_uring backend: one ring (and dedicated thread) per lane.
+/// An io_uring backend: one ring (and dedicated thread, from the blocking [`Runtime`]) per lane.
 pub struct UringBackend {
+    runtime: Runtime,
     depth: u32,
 }
 
 impl UringBackend {
-    /// Build an io_uring backend with the given ring depth (entries per ring).
-    pub fn new(depth: u32) -> Self {
+    /// Build an io_uring backend over `runtime` with the given ring depth (entries per ring).
+    pub fn new(runtime: Runtime, depth: u32) -> Self {
         Self {
+            runtime,
             depth: depth.max(8),
         }
+    }
+
+    /// Build with a fresh blocking runtime (threads named `s2n-dc-fs-uring`) and the given depth.
+    pub fn with_depth(depth: u32) -> Self {
+        Self::new(Runtime::new("s2n-dc-fs-uring"), depth)
     }
 }
 
 impl Default for UringBackend {
     fn default() -> Self {
-        Self::new(DEFAULT_RING_DEPTH)
+        Self::with_depth(DEFAULT_RING_DEPTH)
     }
 }
 
 impl Backend for UringBackend {
     type Lane = RingSubmit;
 
-    fn spawn_lanes<S: Spawner>(&self, setup: LaneSetup, spawner: &mut S) -> Vec<RingSubmit> {
-        let mut handles = Vec::with_capacity(setup.lane_count);
-        for _ in 0..setup.lane_count {
-            // Send channel: this lane's ring thread → this lane's reaper task. The ring thread holds
-            // `done_tx` (no per-op completion state); the reaper bridges to the completion sink.
-            let (done_tx, done_rx) = sync_chan::new::<IoOp>();
-            spawner.spawn_named("fs.uring.reaper", reaper(done_rx, setup.completion.clone()));
-            // One ring (+ its thread) per lane; the ring thread owns `done_tx`.
-            let ring = std::sync::Arc::new(
-                Ring::new(self.depth, done_tx).expect("failed to create io_uring for lane"),
-            );
-            handles.push(RingSubmit { ring });
+    fn spawn_lanes<S: Spawner>(&self, setup: LaneSetup, _spawner: &mut S) -> Vec<RingSubmit> {
+        let mut senders = Vec::with_capacity(setup.lane_count);
+        let mut joins = Vec::with_capacity(setup.lane_count);
+        for idx in 0..setup.lane_count {
+            let (tx, rx) = sync_chan::new::<IoOp>();
+            let efd = EventFd::new().expect("failed to create eventfd for io_uring lane");
+            let waker = StdArc::new(EventFdWaker {
+                fd: efd.fd,
+                alive: AtomicBool::new(true),
+            });
+            let ring_depth = self.depth;
+            let depth = self.depth as usize;
+            let counters = setup.counters.clone();
+            // The ring loop blocks in `submit_and_wait`, so it cannot be a cooperative future — spawn
+            // it as a plain blocking closure on the runtime (one dedicated thread per ring). The ring
+            // is built ON the ring thread (an `IoUring` is not `Send`).
+            let join = self.runtime.spawn_blocking(idx, move || {
+                let ring = IoUring::new(ring_depth).expect("failed to create io_uring for lane");
+                ring_loop(ring, rx, efd, waker, depth, counters);
+            });
+            senders.push(tx);
+            joins.push(join);
         }
-        handles
+        let joins: Arc<[JoinOnDrop]> = joins.into();
+
+        senders
+            .into_iter()
+            .map(|tx| RingSubmit {
+                tx,
+                _joins: joins.clone(),
+            })
+            .collect()
     }
 }
 
-/// The lane's submit handle: enqueues each op onto its ring's thread (bare intrusive `Entry<IoOp>`).
+/// The lane's submit handle: pushes each op onto its ring's intake `sync` channel. The channel fires
+/// the ring's eventfd-writing waker, which breaks the ring thread's `submit_and_wait` so it picks the
+/// op up immediately (dual-wait). Holds an `Arc` to the shared join set so the ring threads outlive
+/// every lane handle and are joined when the last one drops.
 pub struct RingSubmit {
-    ring: std::sync::Arc<Ring>,
+    tx: sync_chan::Sender<IoOp>,
+    _joins: Arc<[JoinOnDrop]>,
 }
 
 impl UnboundedSender<Entry<IoOp>> for RingSubmit {
     fn send(&mut self, op: Entry<IoOp>) -> Result<(), Entry<IoOp>> {
-        self.ring.enqueue(op);
-        Ok(())
+        self.tx.send_entry(op)
     }
-}
-
-/// Drain a lane's `Send` completion channel and forward each op to the completion sink. A `Map`
-/// combinator driven by `drain_budgeted` (the standard channel task driver, not a hand-rolled poll
-/// loop); the explicit `Entry<IoOp>` closure parameter selects the single-entry `Receiver` impl.
-async fn reaper(done_rx: sync_chan::Receiver<IoOp>, sink: CompletionSink) {
-    Map::new(done_rx, move |op: Entry<IoOp>| {
-        let _ = sink.send_entry(op);
-    })
-    .drain_budgeted(Some(crate::fs::combinator::DRAIN_BUDGET))
-    .await;
 }
 
 #[cfg(test)]
@@ -488,7 +601,6 @@ mod tests {
         counter::Registry,
         fs::{
             config::{Config, CostModel, DeviceConfig, OpWeights, PoolMode},
-            device::DeviceId,
             direct::{File, Options},
             scheduler::Scheduler,
         },
@@ -535,6 +647,10 @@ mod tests {
         crate::busy_poll::clock::Clock::default()
     }
 
+    fn config(ring_count: usize) -> Config {
+        Config { ring_count }
+    }
+
     /// End-to-end through io_uring: write then read back, verifying bytes.
     #[test]
     fn uring_write_then_read_roundtrip() {
@@ -552,29 +668,25 @@ mod tests {
         run_local(|mut spawn, registry| {
             let path = path.clone();
             async move {
-                let config = Config {
-                    devices: vec![byte_device(1 << 20)],
-                    ring_count: 1,
-                };
                 let scheduler = Scheduler::new(
-                    &config,
+                    &config(1),
                     &UringBackend::default(),
                     &mut spawn,
                     &registry,
                     clock(),
                 );
+                let dev = scheduler.register_device("test", &byte_device(1 << 20)).unwrap();
                 let h = scheduler.handle();
-                let dev = DeviceId(0);
 
                 let payload = bytes::Bytes::from_static(b"io_uring round trip payload");
                 let n = h
-                    .write(dev, fd, 0, payload.clone(), TierPriority::Medium)
+                    .write(&dev, fd, 0, payload.clone(), TierPriority::Medium)
                     .await
                     .unwrap();
                 assert_eq!(n, payload.len());
 
                 let buf = h
-                    .read(dev, fd, 0, payload.len() as u32, TierPriority::High)
+                    .read(&dev, fd, 0, payload.len() as u32, TierPriority::High)
                     .await
                     .unwrap();
                 assert_eq!(&buf[..], &payload[..]);
@@ -603,28 +715,25 @@ mod tests {
         run_local(|mut spawn, registry| {
             let path = path.clone();
             async move {
-                let config = Config {
-                    devices: vec![byte_device(4096)],
-                    ring_count: 1,
-                };
                 let scheduler = Scheduler::new(
-                    &config,
+                    &config(1),
                     &UringBackend::default(),
                     &mut spawn,
                     &registry,
                     clock(),
                 );
-                let dev = DeviceId(0);
+                let dev = scheduler.register_device("test", &byte_device(4096)).unwrap();
                 let completed = Rc::new(std::cell::Cell::new(0usize));
                 let mut tasks = Vec::new();
                 for w in 0..32u64 {
                     let h = scheduler.handle();
+                    let dev = dev.clone();
                     let completed = completed.clone();
                     tasks.push(tokio::task::spawn_local(async move {
                         for i in 0..4u64 {
                             let off = (w * 4 + i) * 512;
                             let data = bytes::Bytes::from(vec![(w & 0xff) as u8; 256]);
-                            if h.write(dev, fd, off, data, TierPriority::Medium)
+                            if h.write(&dev, fd, off, data, TierPriority::Medium)
                                 .await
                                 .is_ok()
                             {
@@ -641,8 +750,7 @@ mod tests {
                     32 * 4,
                     "every op must complete through the ring"
                 );
-                let device = scheduler.devices().get(dev).unwrap();
-                for pool in device.pools.all() {
+                for pool in dev.pools.all() {
                     assert_eq!(
                         pool.debug_free_total(),
                         pool.debug_capacity() as i64,
@@ -659,24 +767,114 @@ mod tests {
     #[test]
     fn uring_bad_fd_fails() {
         run_local(|mut spawn, registry| async move {
-            let config = Config {
-                devices: vec![byte_device(1 << 16)],
-                ring_count: 1,
-            };
             let scheduler = Scheduler::new(
-                &config,
+                &config(1),
                 &UringBackend::default(),
                 &mut spawn,
                 &registry,
                 clock(),
             );
-            let dev = DeviceId(0);
+            let dev = scheduler.register_device("test", &byte_device(1 << 16)).unwrap();
             let h = scheduler.handle();
-            let result = h.read(dev, -1, 0, 4096, TierPriority::Medium).await;
+            let result = h.read(&dev, -1, 0, 4096, TierPriority::Medium).await;
             assert!(result.is_err(), "bad fd read must fail, not hang");
-            let device = scheduler.devices().get(dev).unwrap();
-            for pool in device.pools.all() {
+            for pool in dev.pools.all() {
                 assert_eq!(pool.debug_free_total(), pool.debug_capacity() as i64);
+            }
+        });
+    }
+
+    /// Dual-wait: a producer that submits a single op to an otherwise-idle ring (the ring is parked in
+    /// `submit_and_wait` with nothing else in flight) must have it picked up promptly via the eventfd
+    /// wake — not stalled waiting for some unrelated completion. With one op and a generous pool, the
+    /// only thing that can break the ring's wait is the eventfd the channel waker writes; if that path
+    /// were broken the read would hang and the test would time out (nextest enforces the timeout).
+    #[test]
+    fn uring_producer_wakes_idle_ring() {
+        let path = temp_path("dualwait");
+        let file = File::open(
+            &path,
+            Options {
+                truncate: true,
+                size: 1 << 20,
+                direct: false,
+            },
+        )
+        .unwrap();
+        let fd = file.raw_fd();
+        file.write_at(b"dual-wait payload", 0).unwrap();
+        file.sync().unwrap();
+        run_local(|mut spawn, registry| {
+            let path = path.clone();
+            async move {
+                let scheduler = Scheduler::new(
+                    &config(1),
+                    &UringBackend::default(),
+                    &mut spawn,
+                    &registry,
+                    clock(),
+                );
+                let dev = scheduler.register_device("test", &byte_device(1 << 20)).unwrap();
+                let h = scheduler.handle();
+                // Let the ring thread reach its idle `submit_and_wait` park before we submit, so this
+                // exercises the producer-wakes-idle-ring path rather than a busy ring.
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                let buf = h
+                    .read(&dev, fd, 0, b"dual-wait payload".len() as u32, TierPriority::High)
+                    .await
+                    .expect("idle-ring read must complete via eventfd wake");
+                assert_eq!(&buf[..], b"dual-wait payload");
+                drop(file);
+                let _ = std::fs::remove_file(&path);
+            }
+        });
+    }
+
+    /// Lazy registration on the io_uring backend: a device registered *after* `Scheduler::new` (the
+    /// config had no eager devices) is fully functional — its distributor was spawned via the
+    /// registrar and credit conserves.
+    #[test]
+    fn uring_lazy_registration_works() {
+        let path = temp_path("lazyreg");
+        let file = File::open(
+            &path,
+            Options {
+                truncate: true,
+                size: 1 << 20,
+                direct: false,
+            },
+        )
+        .unwrap();
+        let fd = file.raw_fd();
+        run_local(|mut spawn, registry| {
+            let path = path.clone();
+            async move {
+                // No devices at construction; register one lazily afterwards.
+                let scheduler = Scheduler::new(
+                    &config(1),
+                    &UringBackend::default(),
+                    &mut spawn,
+                    &registry,
+                    clock(),
+                );
+                let dev = scheduler
+                    .register_device("lazy", &byte_device(1 << 20))
+                    .expect("lazy registration");
+                let h = scheduler.handle();
+                let payload = bytes::Bytes::from_static(b"lazily registered device");
+                h.write(&dev, fd, 0, payload.clone(), TierPriority::Medium)
+                    .await
+                    .unwrap();
+                let buf = h
+                    .read(&dev, fd, 0, payload.len() as u32, TierPriority::High)
+                    .await
+                    .unwrap();
+                assert_eq!(&buf[..], &payload[..]);
+                for pool in dev.pools.all() {
+                    assert_eq!(pool.debug_free_total(), pool.debug_capacity() as i64);
+                }
+                drop(file);
+                let _ = std::fs::remove_file(&path);
             }
         });
     }

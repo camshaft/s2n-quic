@@ -138,24 +138,15 @@ impl DeviceConfig {
 
 /// Top-level scheduler configuration.
 ///
-/// The execution backend is *not* named here: like the network stack (where the socket
-/// implementation is a concrete type handed to the endpoint, not an enum), the backend is chosen by
-/// passing a concrete [`Backend`](crate::fs::backend::Backend) impl to
-/// [`Scheduler::new`](crate::fs::scheduler::Scheduler::new).
+/// Devices are **not** listed here: the application registers each device after construction with
+/// [`Scheduler::register_device`](crate::fs::scheduler::Scheduler::register_device) and holds the
+/// returned `Arc<Device>` (the setup site often does not know its devices yet). Likewise the
+/// execution backend is not named here: like the network stack (where the socket implementation is a
+/// concrete type handed to the endpoint, not an enum), the backend is chosen by passing a concrete
+/// [`Backend`](crate::fs::backend::Backend) impl to
+/// [`Scheduler::new`](crate::fs::scheduler::Scheduler::new). So `Config` carries only the lane count.
 #[derive(Clone, Debug)]
 pub struct Config {
-    /// One entry per device; the index is the [`crate::fs::device::DeviceId`].
-    pub devices: Vec<DeviceConfig>,
     /// Number of execution lanes (worker rings / shared-pool slots). Decoupled from device count.
     pub ring_count: usize,
-}
-
-impl Config {
-    /// A single-device, single-lane config for tests.
-    pub fn single(device: DeviceConfig) -> Self {
-        Self {
-            devices: vec![device],
-            ring_count: 1,
-        }
-    }
 }

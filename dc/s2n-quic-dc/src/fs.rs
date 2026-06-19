@@ -45,6 +45,6 @@ mod tests;
 pub mod counters;
 
 pub use config::{Config, CostModel, DeviceConfig, OpWeights, PoolMode};
-pub use device::{DeviceId, LocalRingId};
+pub use device::{Device, LocalRingId};
 pub use op::{IoBuf, IoKind, IoOp, IoStatus};
 pub use scheduler::{BlockRef, Scheduler, SubmitHandle};

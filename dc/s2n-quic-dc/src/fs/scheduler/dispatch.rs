@@ -18,8 +18,9 @@
 //! The task owns the `!Send` lane senders (so the handle never has to) and drains the cross-thread
 //! submission channel via the standard `Map` + `drain_budgeted` combinator — no hand-rolled poll
 //! loop. On a closed lane (a backend that exited on a fatal error) the op is stamped `Failed` and
-//! routed to the completion sink so its submitter's await resolves with an error and its credit is
-//! released exactly once, rather than hanging.
+//! **completed in place** via [`combinator::complete`](crate::fs::combinator::complete) so its
+//! submitter's await resolves with an error and its credit is released exactly once, rather than
+//! hanging.
 
 use crate::{
     endpoint::{
@@ -27,7 +28,7 @@ use crate::{
         id::{Id as _, LocalSenderId},
     },
     fs::{
-        combinator::CompletionSink,
+        combinator::complete,
         counters::Counters,
         device::LocalRingId,
         op::{IoOp, IoStatus},
@@ -108,7 +109,6 @@ impl Router {
 pub(super) async fn dispatch_loop<L>(
     rx: sync_chan::Receiver<IoOp>,
     mut lanes: Vec<L>,
-    sink: CompletionSink,
     counters: Arc<Counters>,
     clock: crate::time::DefaultClock,
 ) where
@@ -120,11 +120,11 @@ pub(super) async fn dispatch_loop<L>(
         let lane = router.choose(byte_cost, clock.now());
         entry.ring_id = LocalRingId(lane as u32);
         if let Err(mut undeliverable) = lanes[lane].send(entry) {
-            // Lane closed: stamp Failed and route to the completion sink so the submitter resolves
-            // with an error and its credit is released exactly once there (never a hang).
+            // Lane closed: stamp Failed and complete it in place so the submitter resolves with an
+            // error and its credit is released exactly once (never a hang).
             counters.dispatch_lane_closed.add(1);
             undeliverable.status = IoStatus::Failed(std::io::ErrorKind::BrokenPipe);
-            let _ = sink.send_entry(undeliverable);
+            complete(undeliverable, &counters);
         }
     })
     .drain_budgeted(Some(crate::fs::combinator::DRAIN_BUDGET))

@@ -108,11 +108,14 @@ pub struct MaterializeStream<I> {
     ///
     /// [`AlignedBuf`]: crate::fs::direct::AlignedBuf
     direct: bool,
-    /// Per-device submission state, indexed by `DeviceId`: each device's own reusable credit-acquire
-    /// slot plus the FIFO of window indices awaiting submission on it. Keeping the acquire slot and
-    /// its pending queue together (rather than two parallel vecs) is the unit a device is driven by —
-    /// a device parked on credit does not head-of-line-block another device whose slot can grant.
-    devices: Vec<DeviceSlot>,
+    /// Per-device submission state, indexed directly by the device's crate-internal
+    /// [`index`](crate::fs::device::Device::index) (dense, monotonic from registration), lazily
+    /// populated: each distinct device a block names gets its own reusable credit-acquire slot plus
+    /// the FIFO of window indices awaiting submission on it. Keeping the acquire slot and its pending
+    /// queue together is the unit a device is driven by — a device parked on credit does not
+    /// head-of-line-block another device whose slot can grant. Direct array indexing (`Vec<Option>`
+    /// grown on demand) — no map, no hash, no pointer scan.
+    devices: Vec<Option<DeviceSlot>>,
     /// Single completion channel all sprayed blocks complete on; drained in `poll_next`.
     completion_rx: CompletionReceiver,
     /// Reorder window, front = the next block to deliver (block index `base`).
@@ -133,18 +136,31 @@ where
         priority: TierPriority,
         direct: bool,
     ) -> Self {
-        let device_count = handle.device_count().max(1);
         Self {
             handle,
             blocks,
             priority,
             direct,
-            devices: (0..device_count).map(|_| DeviceSlot::new()).collect(),
+            devices: Vec::new(),
             completion_rx: crate::socket::channel::intrusive::datagram_completion::new::<IoOp>(),
             window: VecDeque::new(),
             base: 0,
             source_done: false,
         }
+    }
+
+    /// The per-device slot index for `device` — its crate-internal registration index — growing the
+    /// (lazily populated) `devices` vec and creating the slot on first use. O(1) direct indexing, no
+    /// map or scan.
+    fn device_slot(&mut self, device: &Arc<crate::fs::device::Device>) -> usize {
+        let idx = device.index;
+        if idx >= self.devices.len() {
+            self.devices.resize_with(idx + 1, || None);
+        }
+        if self.devices[idx].is_none() {
+            self.devices[idx] = Some(DeviceSlot::new());
+        }
+        idx
     }
 
     /// Await the next block in FIFO order, or `None` at end of stream.
@@ -180,7 +196,9 @@ where
             // 4. Drive each device's acquire slot. Out-of-order across devices: a device parked on
             //    credit does not block another device whose slot can grant.
             for dev in 0..self.devices.len() {
-                progress |= self.drive_device(cx, dev);
+                if self.devices[dev].is_some() {
+                    progress |= self.drive_device(cx, dev);
+                }
             }
 
             // 5. Drain the entire completion queue in one atomic swap; file every landed op. Always
@@ -215,29 +233,23 @@ where
                 break;
             };
             let idx = self.base + self.window.len() as u64;
-            // For a direct read the transfer length must be block-aligned; round the buffer up (the
-            // submit path validates the offset). Buffered reads have no alignment constraint.
+            // A direct read requires `offset` and `len` to be block-aligned; `prepare` rejects a
+            // misaligned op (it does not round anything up — the caller sizes the block). Buffered
+            // reads have no alignment constraint.
             match self.handle.prepare(
+                &block.device,
                 IoKind::Read,
-                block.device,
                 block.offset,
                 block.len,
                 self.direct,
             ) {
                 Ok((pool, cost)) => {
-                    let dev = block.device.as_usize();
-                    if dev < self.devices.len() {
-                        self.devices[dev].to_submit.push_back(idx);
-                        self.window
-                            .push_back(Slot::ToSubmit(PendingBlock { block, pool, cost }));
-                    } else {
-                        // Device id out of range for our per-device tables (cannot happen — `prepare`
-                        // already validated it — but stay total rather than panic).
-                        self.window.push_back(Slot::Ready(Err(io::Error::new(
-                            io::ErrorKind::InvalidInput,
-                            "materialize: device id out of range",
-                        ))));
-                    }
+                    // Find (or create) this device's acquire slot by `Arc` identity and queue the
+                    // block on it.
+                    let dev = self.device_slot(&block.device);
+                    self.devices[dev].as_mut().unwrap().to_submit.push_back(idx);
+                    self.window
+                        .push_back(Slot::ToSubmit(PendingBlock { block, pool, cost }));
                 }
                 Err(e) => self.window.push_back(Slot::Ready(Err(e))),
             }
@@ -248,40 +260,54 @@ where
     /// stopping when the slot parks (Pending) or the device's queue empties. Returns whether it
     /// enqueued (or failed) at least one block this call.
     fn drive_device(&mut self, cx: &mut Context<'_>, dev: usize) -> bool {
+        // The slot is always `Some` here: `pull` creates it before queueing any block for `dev`, and
+        // `poll_next` only drives indices that are populated.
+        debug_assert!(
+            self.devices.get(dev).is_some_and(Option::is_some),
+            "drive_device on an unpopulated slot {dev}"
+        );
         let mut progress = false;
         loop {
-            let Some(&idx) = self.devices[dev].to_submit.front() else {
+            let Some(&idx) = self.devices[dev]
+                .as_ref()
+                .and_then(|s| s.to_submit.front())
+            else {
                 return progress;
             };
             let pos = (idx - self.base) as usize;
-            // `BlockRef` is `Copy`, so read it (plus the resolved pool + cost) out from under the
-            // borrow without moving the slot — the slot is overwritten only on a successful acquire.
+            // Clone the block (it carries an `Arc<Device>`) plus the resolved pool + cost out from
+            // under the borrow without moving the slot — the slot is overwritten only on a successful
+            // acquire.
             let (block, pool, cost) = match &self.window[pos] {
-                Slot::ToSubmit(p) => (p.block, p.pool.clone(), p.cost),
+                Slot::ToSubmit(p) => (p.block.clone(), p.pool.clone(), p.cost),
                 _ => {
                     debug_assert!(false, "materialize: device queue index {idx} not ToSubmit");
-                    self.devices[dev].to_submit.pop_front();
+                    self.devices[dev].as_mut().unwrap().to_submit.pop_front();
                     continue;
                 }
             };
 
             match self.devices[dev]
+                .as_mut()
+                .unwrap()
                 .alloc
                 .poll_acquire(cx, &pool, cost, self.priority)
             {
                 Poll::Ready(Ok(())) => {
-                    let granted = self.devices[dev].alloc.take_all();
+                    let slot = self.devices[dev].as_mut().unwrap();
+                    let granted = slot.alloc.take_all();
                     debug_assert!(granted >= cost, "acquire returned less than cost");
-                    self.devices[dev].to_submit.pop_front();
-                    self.window[pos] = Slot::InFlight(block);
+                    slot.to_submit.pop_front();
                     let buf = if self.direct {
                         IoBuf::Direct(crate::fs::direct::AlignedBuf::new(block.len as usize))
                     } else {
-                        IoBuf::Read(bytes::BytesMut::new())
+                        // Pre-sized, logically-empty buffer: the backend reads into spare capacity
+                        // and sets the length to bytes read (no zero-fill, short read leaves no tail).
+                        IoBuf::Read(bytes::BytesMut::with_capacity(block.len as usize))
                     };
                     let r = self.handle.enqueue(
                         IoKind::Read,
-                        block.device,
+                        &block.device,
                         block.fd,
                         block.offset,
                         block.len,
@@ -290,6 +316,7 @@ where
                         idx,
                         granted,
                     );
+                    self.window[pos] = Slot::InFlight(block);
                     if let Err(e) = r {
                         // Submission channel closed: file the error in place (it stays in delivery
                         // order). The credit was released by `enqueue`.
@@ -299,7 +326,7 @@ where
                 }
                 Poll::Ready(Err(e)) => {
                     // Pool closed: file the error in place and drop the block from the queue.
-                    self.devices[dev].to_submit.pop_front();
+                    self.devices[dev].as_mut().unwrap().to_submit.pop_front();
                     self.window[pos] = Slot::Ready(Err(e));
                     progress = true;
                 }
@@ -335,8 +362,10 @@ where
         if pos >= self.window.len() {
             return;
         }
-        let block = match &self.window[pos] {
-            Slot::InFlight(b) => *b,
+        // Only the trim metadata is needed to finish the buffer; read it out without cloning the
+        // block's `Arc<Device>`.
+        let (head_trim, tail_trim) = match &self.window[pos] {
+            Slot::InFlight(b) => (b.head_trim, b.tail_trim),
             _ => {
                 debug_assert!(
                     false,
@@ -346,7 +375,7 @@ where
             }
         };
         let result = match op.status {
-            IoStatus::Done(_) => Ok(finish(op.buf, block)),
+            IoStatus::Done(_) => Ok(finish(op.buf, head_trim, tail_trim)),
             IoStatus::Failed(kind) => Err(kind.into()),
             IoStatus::Pending => {
                 debug_assert!(
@@ -363,9 +392,9 @@ where
 /// Turn a completed read buffer into the delivered `Bytes`, applying head/tail trim. Buffered reads
 /// freeze their `BytesMut` (zero-copy); direct reads hand the page-aligned `AlignedBuf` to
 /// `Bytes::from_owner` (zero-copy — the buffer is moved, not copied) and slice it for trim.
-fn finish(buf: IoBuf, block: BlockRef) -> Bytes {
-    let head = block.head_trim as usize;
-    let tail = block.tail_trim as usize;
+fn finish(buf: IoBuf, head_trim: u32, tail_trim: u32) -> Bytes {
+    let head = head_trim as usize;
+    let tail = tail_trim as usize;
     match buf {
         IoBuf::Read(b) => {
             let bytes = b.freeze();

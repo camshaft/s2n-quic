@@ -5,11 +5,12 @@
 //!
 //! Each lane is one task that drains its submission channel and, for every admitted op, **spawns one
 //! async task on the bach executor** that sleeps until the op's simulated completion time
-//! (`now + latency(kind, len)`) and then *processes* the op and forwards it to the completion sink.
-//! Bach's discrete-event scheduler *is* the timer — there is no hand-rolled deadline heap or timer
-//! wheel; out-of-order completion falls out naturally (a short op spawned later wakes before a long op
-//! spawned earlier). This mirrors how `bach`'s own network impl models per-packet delay. No fd, no
-//! thread, no real IO.
+//! (`now + latency(kind, len)`) and then *processes* the op and **completes it in place**
+//! ([`combinator::complete`](crate::fs::combinator::complete)) — releasing its credit to its own
+//! device pool and notifying its submitter. Bach's discrete-event scheduler *is* the timer — there is
+//! no hand-rolled deadline heap or timer wheel; out-of-order completion falls out naturally (a short
+//! op spawned later wakes before a long op spawned earlier). This mirrors how `bach`'s own network
+//! impl models per-packet delay. No fd, no thread, no real IO.
 //!
 //! How an op is *processed* — fill a read buffer and stamp `Done`, or inject a `Failed`, or anything
 //! else a test wants to assert — is a pluggable closure ([`BachBackend::with_processor`]). The default
@@ -20,12 +21,14 @@
 use crate::{
     fs::{
         backend::{Backend, LaneSetup},
-        combinator::{CompletionSink, DRAIN_BUDGET},
+        combinator::{complete, DRAIN_BUDGET},
+        counters::Counters,
         op::{IoBuf, IoKind, IoOp, IoStatus},
     },
     intrusive::Entry,
     runtime::Spawner,
     socket::channel::{intrusive::unsync, Map, ReceiverExt as _},
+    sync::Arc,
     time::precision::{self, Timer as _},
 };
 use core::time::Duration;
@@ -73,9 +76,16 @@ pub fn process_default(op: &mut IoOp) {
     };
     match &mut op.buf {
         IoBuf::Read(buf) => {
-            buf.clear();
-            buf.resize(len, 0);
-            fill(buf);
+            // The buffer arrives pre-sized (capacity >= len) and logically empty; fill its spare
+            // capacity and set the length — the no-memset path the real backends use.
+            debug_assert!(buf.is_empty(), "read buffer arrives logically empty");
+            let spare = buf.spare_capacity_mut();
+            let n = len.min(spare.len());
+            for (i, slot) in spare[..n].iter_mut().enumerate() {
+                slot.write((base.wrapping_add(i as u64) & 0xff) as u8);
+            }
+            // SAFETY: we just initialized the first `n` bytes of spare capacity.
+            unsafe { buf.set_len(n) };
         }
         // A direct read fills the caller's aligned buffer in place (zero-copy).
         IoBuf::Direct(buf) if op.kind.is_read() => fill(buf.as_mut_slice()),
@@ -131,7 +141,7 @@ where
             let (tx, rx) = unsync::new::<IoOp>();
             let lane = LaneTask {
                 rx,
-                completion: setup.completion.clone(),
+                counters: setup.counters.clone(),
                 clock: self.clock.clone(),
                 latency: self.latency,
                 process: self.process.clone(),
@@ -147,7 +157,7 @@ where
 /// holds no pending state — every op's delay lives in its own spawned task, scheduled by bach.
 struct LaneTask<Clk: precision::Clock, P> {
     rx: unsync::Receiver<crate::intrusive::EntryAdapter<IoOp>>,
-    completion: CompletionSink,
+    counters: Arc<Counters>,
     clock: Clk,
     latency: Latency,
     process: P,
@@ -161,27 +171,29 @@ where
     async fn run(self) {
         let LaneTask {
             rx,
-            completion,
+            counters,
             clock,
             latency,
             process,
         } = self;
 
-        // Drain the lane via the standard `Map` + `drain_budgeted` combinator (the same idiom as the
-        // completion dispatcher); the map closure spawns one bach task per op. When the channel
-        // closes, `drain_budgeted` returns and the lane ends — already-spawned op tasks finish on
-        // their own (each owns its entry, completion sink, timer, and processor).
+        // Drain the lane via the standard `Map` + `drain_budgeted` combinator; the map closure spawns
+        // one bach task per op. When the channel closes, `drain_budgeted` returns and the lane ends —
+        // already-spawned op tasks finish on their own (each owns its entry, counters, timer, and
+        // processor).
         Map::new(rx, move |entry: Entry<IoOp>| {
             // The op completes at `now + latency` on the simulated clock; bach schedules the wake.
             let deadline = clock.now() + latency.for_op(entry.kind, entry.len);
-            let completion = completion.clone();
+            let counters = counters.clone();
             let process = process.clone();
             let mut timer = clock.timer();
             crate::runtime::bach::spawn_named("fs.bach.op", async move {
                 timer.sleep_until(deadline).await;
                 let mut entry = entry;
                 process(&mut entry);
-                let _ = completion.send_entry(entry);
+                // Complete the op in place: release its credit to its own device pool and notify its
+                // submitter (or drop it if the receiver is gone).
+                complete(entry, &counters);
             });
         })
         .drain_budgeted(Some(DRAIN_BUDGET))

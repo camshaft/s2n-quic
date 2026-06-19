@@ -11,10 +11,12 @@
 use crate::{
     counter::Registry,
     fs::{
-        backend::bach::{BachBackend, Latency},
-        backend::{Backend, LaneSetup},
+        backend::{
+            bach::{BachBackend, Latency},
+            Backend, LaneSetup,
+        },
         config::{Config, CostModel, DeviceConfig, OpWeights, PoolMode},
-        device::DeviceId,
+        device::Device,
         op::{IoOp, IoStatus},
         scheduler::{BlockRef, Scheduler},
     },
@@ -25,7 +27,7 @@ use crate::{
     tracing::*,
 };
 use core::time::Duration;
-use std::{cell::RefCell, rc::Rc};
+use std::{cell::RefCell, rc::Rc, sync::Arc};
 
 /// A backend whose lanes are immediately dead: it builds the lane submit senders but drops the
 /// matching receivers right away (modelling a lane task that failed/exited while the scheduler keeps
@@ -61,16 +63,41 @@ fn fail_backend(
     })
 }
 
-/// Build a scheduler over `devices` with a `Bach` backend at the given latency and `ring_count`.
-fn build(devices: Vec<DeviceConfig>, ring_count: usize, latency: Latency) -> Scheduler {
-    let config = Config {
-        devices,
-        ring_count,
-    };
+/// Build a scheduler with a `Bach` backend at the given latency and `ring_count`, then register each
+/// device config (labelled `dev{i}`) and return the scheduler alongside the registered device
+/// handles. Tests submit against `&devices[i]` and conservation-check the held handles directly.
+fn build(
+    device_cfgs: Vec<DeviceConfig>,
+    ring_count: usize,
+    latency: Latency,
+) -> (Scheduler, Vec<Arc<Device>>) {
+    let config = Config { ring_count };
     let clock = Clock::default();
     let backend = BachBackend::new(clock.clone(), latency);
     let mut spawn = bach_spawner();
-    Scheduler::new(&config, &backend, &mut spawn, &Registry::default(), clock)
+    let scheduler = Scheduler::new(&config, &backend, &mut spawn, &Registry::default(), clock);
+    let devices = device_cfgs
+        .iter()
+        .enumerate()
+        .map(|(i, cfg)| {
+            scheduler
+                .register_device(format!("dev{i}").as_str(), cfg)
+                .unwrap()
+        })
+        .collect();
+    (scheduler, devices)
+}
+
+/// Assert every pool of `device` returned to full capacity (no credit leak).
+fn assert_conserved(device: &Arc<Device>) {
+    for pool in device.pools.all() {
+        assert_eq!(
+            pool.debug_free_total(),
+            pool.debug_capacity() as i64,
+            "credit leaked on device {:?}",
+            device.label
+        );
+    }
 }
 
 /// The bach spawner used by every sim test (drives `!Send` futures on the bach executor).
@@ -85,10 +112,7 @@ fn bach_spawner() -> crate::runtime::bach::Local {
 fn lane_send_failure_fails_submit_and_conserves_credit() {
     let _no_snap = crate::testing::without_snapshots();
     sim(|| {
-        let config = Config {
-            devices: vec![iops_device(8)],
-            ring_count: 1,
-        };
+        let config = Config { ring_count: 1 };
         let clock = Clock::default();
         let mut spawn = bach_spawner();
         let scheduler = Scheduler::new(
@@ -98,29 +122,23 @@ fn lane_send_failure_fails_submit_and_conserves_credit() {
             &Registry::default(),
             clock,
         );
-        let dev = DeviceId(0);
+        let dev = scheduler.register_device("busy", &iops_device(8)).unwrap();
 
         let h = scheduler.handle();
-        let devices = scheduler.devices().clone();
         async move {
             // Each read acquires credit, fails to push to the dead lane, and must resolve to Err
             // promptly (not hang). `.await` directly — if the future hung, the sim would never
             // reach quiescence and the test would time out.
             for i in 0..5u64 {
-                let result = h.read(dev, FD, i * 4096, 4096, TierPriority::Medium).await;
+                let result = h.read(&dev, FD, i * 4096, 4096, TierPriority::Medium).await;
                 assert!(
                     result.is_err(),
                     "submit to a closed lane must fail, not succeed or hang"
                 );
             }
             // Conservation: every acquired credit was released back to the pool on the failed path.
-            let device = devices.get(dev).unwrap();
-            for pool in device.pools.all() {
-                let free = pool.debug_free_total();
-                let cap = pool.debug_capacity() as i64;
-                info!(free, cap, "lane-send-failure conservation check");
-                assert_eq!(free, cap, "credit leaked when lane send failed");
-            }
+            info!("lane-send-failure conservation check");
+            assert_conserved(&dev);
         }
         .primary()
         .spawn();
@@ -156,19 +174,20 @@ fn run_streams(
     streams: Vec<(&'static str, TierPriority)>,
     window: Duration,
 ) -> Rc<RefCell<Vec<(&'static str, u64)>>> {
-    let scheduler = build(vec![device], 1, Latency::default());
-    let dev = DeviceId(0);
+    let (scheduler, devices) = build(vec![device], 1, Latency::default());
+    let dev = devices[0].clone();
     let counts: Rc<RefCell<Vec<(&'static str, u64)>>> = Rc::new(RefCell::new(Vec::new()));
 
     for (label, priority) in streams {
         let h = scheduler.handle();
         let counts = counts.clone();
+        let dev = dev.clone();
         async move {
             let mut done = 0u64;
             let start = bach::time::Instant::now();
             let mut offset = 0u64;
             while start.elapsed() < window {
-                if h.read(dev, FD, offset, 4096, priority).await.is_ok() {
+                if h.read(&dev, FD, offset, 4096, priority).await.is_ok() {
                     done += 1;
                     offset += 4096;
                 }
@@ -179,21 +198,14 @@ fn run_streams(
         .spawn();
     }
 
-    // Keep the scheduler (and its devices) alive past the window for the conservation check.
+    // Keep the scheduler (and its device) alive past the window for the conservation check.
     let counts_ret = counts.clone();
-    let devices = scheduler.devices().clone();
     async move {
         (window.as_millis() as u64 + 10).ms().sleep().await;
         // Conservation: at quiescence every acquired credit was released back to the pool.
-        let device = devices.get(dev).unwrap();
-        for pool in device.pools.all() {
-            assert_eq!(
-                pool.debug_free_total(),
-                pool.debug_capacity() as i64,
-                "credit leak at quiescence"
-            );
-        }
+        assert_conserved(&dev);
         info!("device pool conserved at quiescence");
+        drop(scheduler);
     }
     .primary()
     .spawn();
@@ -282,19 +294,20 @@ fn strict_priority_across_tiers() {
 fn device_isolation() {
     let _no_snap = crate::testing::without_snapshots();
     sim(|| {
-        let scheduler = build(vec![iops_device(2), iops_device(2)], 2, Latency::default());
-        let busy = DeviceId(0);
-        let quiet = DeviceId(1);
+        let (scheduler, devices) = build(vec![iops_device(2), iops_device(2)], 2, Latency::default());
+        let busy = devices[0].clone();
+        let quiet = devices[1].clone();
 
         let quiet_done = Rc::new(RefCell::new(0u64));
 
         for _ in 0..4 {
             let h = scheduler.handle();
+            let busy = busy.clone();
             async move {
                 let start = bach::time::Instant::now();
                 let mut offset = 0u64;
                 while start.elapsed() < 40.ms() {
-                    let _ = h.read(busy, FD, offset, 4096, TierPriority::Medium).await;
+                    let _ = h.read(&busy, FD, offset, 4096, TierPriority::Medium).await;
                     offset += 4096;
                 }
             }
@@ -305,12 +318,13 @@ fn device_isolation() {
         {
             let h = scheduler.handle();
             let quiet_done = quiet_done.clone();
+            let quiet = quiet.clone();
             async move {
                 let start = bach::time::Instant::now();
                 let mut offset = 0u64;
                 let mut n = 0u64;
                 while start.elapsed() < 40.ms() {
-                    if h.read(quiet, FD, offset, 4096, TierPriority::Medium)
+                    if h.read(&quiet, FD, offset, 4096, TierPriority::Medium)
                         .await
                         .is_ok()
                     {
@@ -325,22 +339,15 @@ fn device_isolation() {
         }
 
         let quiet_done_r = quiet_done.clone();
-        let devices = scheduler.devices().clone();
         async move {
             50.ms().sleep().await;
             let n = *quiet_done_r.borrow();
             info!(quiet_completed = n, "isolation: quiet device throughput");
             assert!(n > 0, "quiet device starved by busy device");
-            for (id, device) in devices.iter() {
-                for pool in device.pools.all() {
-                    assert_eq!(
-                        pool.debug_free_total(),
-                        pool.debug_capacity() as i64,
-                        "credit leak on device {id:?}"
-                    );
-                }
-            }
+            assert_conserved(&busy);
+            assert_conserved(&quiet);
             info!("isolation: both device pools conserved");
+            drop(scheduler);
         }
         .primary()
         .spawn();
@@ -359,7 +366,7 @@ fn materialize_delivers_in_order() {
             write: Duration::from_micros(100),
             per_byte_nanos: 0,
         };
-        let scheduler = build(vec![iops_device(8), iops_device(8)], 2, latency);
+        let (scheduler, devices) = build(vec![iops_device(8), iops_device(8)], 2, latency);
 
         let h = scheduler.handle();
         async move {
@@ -367,7 +374,7 @@ fn materialize_delivers_in_order() {
             // out of order; offsets are strictly increasing in submission order.
             let blocks: Vec<BlockRef> = (0..10u64)
                 .map(|i| {
-                    let dev = DeviceId((i % 2) as u32);
+                    let dev = devices[(i % 2) as usize].clone();
                     BlockRef::whole(dev, FD, i * 1024, 1024)
                 })
                 .collect();
@@ -409,14 +416,13 @@ fn materialize_cross_device_no_hol() {
             write: Duration::from_micros(100),
             per_byte_nanos: 0,
         };
-        let scheduler = build(vec![iops_device(1), iops_device(8)], 2, latency);
+        let (scheduler, devices) = build(vec![iops_device(1), iops_device(8)], 2, latency);
         let h = scheduler.handle();
-        let devices = scheduler.devices().clone();
         async move {
             // 20 blocks alternating devices; device 0 (even indices) is depth-1 so its blocks must
             // serialize, while device 1 (odd indices) can have many in flight at once.
             let blocks: Vec<BlockRef> = (0..20u64)
-                .map(|i| BlockRef::whole(DeviceId((i % 2) as u32), FD, i * 1024, 1024))
+                .map(|i| BlockRef::whole(devices[(i % 2) as usize].clone(), FD, i * 1024, 1024))
                 .collect();
 
             let mut stream = h.materialize(blocks.clone(), TierPriority::High);
@@ -432,15 +438,10 @@ fn materialize_cross_device_no_hol() {
                 delivered += 1;
             }
             assert_eq!(delivered, 20, "did not deliver all blocks across devices");
-            // Conservation across both pools at quiescence.
-            for (id, device) in devices.iter() {
-                for pool in device.pools.all() {
-                    assert_eq!(
-                        pool.debug_free_total(),
-                        pool.debug_capacity() as i64,
-                        "credit leak on device {id:?}"
-                    );
-                }
+            // Conservation across both pools at quiescence. (The blocks above hold clones of these
+            // handles, so they remain valid; check each held handle directly.)
+            for device in &devices {
+                assert_conserved(device);
             }
             info!(
                 delivered,
@@ -472,15 +473,14 @@ fn materialize_drop_mid_spray_conserves_credit() {
             write: Duration::from_micros(500),
             per_byte_nanos: 0,
         };
-        let scheduler = build(vec![iops_device(1), iops_device(8)], 2, latency);
+        let (scheduler, devices) = build(vec![iops_device(1), iops_device(8)], 2, latency);
         let h = scheduler.handle();
-        let devices = scheduler.devices().clone();
         async move {
             // 40 blocks alternating devices: device 0 (even) serializes at depth 1, device 1 (odd)
             // piles up in flight. More blocks than either pool depth, so at the drop point there are
             // both in-flight ops and ToSubmit blocks parked on device 0's credit.
             let blocks: Vec<BlockRef> = (0..40u64)
-                .map(|i| BlockRef::whole(DeviceId((i % 2) as u32), FD, i * 1024, 1024))
+                .map(|i| BlockRef::whole(devices[(i % 2) as usize].clone(), FD, i * 1024, 1024))
                 .collect();
 
             let mut stream = h.materialize(blocks, TierPriority::High);
@@ -497,7 +497,7 @@ fn materialize_drop_mid_spray_conserves_credit() {
             // Prove the drop is genuinely mid-flight: at least one pool has credit out (in-flight
             // ops + parked-on-credit ToSubmit blocks), so this exercises the release-on-late-
             // completion path rather than a quiescent no-op drop.
-            let in_flight = devices.iter().any(|(_, device)| {
+            let in_flight = devices.iter().any(|device| {
                 device
                     .pools
                     .all()
@@ -513,16 +513,9 @@ fn materialize_drop_mid_spray_conserves_credit() {
             // the dispatcher releases their credit first) and the dropped allocs release residuals.
             10.ms().sleep().await;
 
-            for (id, device) in devices.iter() {
-                for pool in device.pools.all() {
-                    let free = pool.debug_free_total();
-                    let cap = pool.debug_capacity() as i64;
-                    info!(?id, free, cap, "drop-mid-spray conservation check");
-                    assert_eq!(
-                        free, cap,
-                        "credit leaked on device {id:?} after mid-spray drop"
-                    );
-                }
+            for device in &devices {
+                info!(label = ?device.label, "drop-mid-spray conservation check");
+                assert_conserved(device);
             }
             info!("materialize: drop mid-spray conserved credit");
         }
@@ -537,24 +530,20 @@ fn materialize_drop_mid_spray_conserves_credit() {
 fn failed_completion_surfaces_as_err() {
     let _no_snap = crate::testing::without_snapshots();
     sim(|| {
-        let config = Config {
-            devices: vec![iops_device(8)],
-            ring_count: 1,
-        };
+        let config = Config { ring_count: 1 };
         let clock = Clock::default();
         let backend = fail_backend(clock.clone(), std::io::ErrorKind::Other);
         let mut spawn = bach_spawner();
         let scheduler = Scheduler::new(&config, &backend, &mut spawn, &Registry::default(), clock);
-        let dev = DeviceId(0);
+        let dev = scheduler.register_device("dev0", &iops_device(8)).unwrap();
 
         let h = scheduler.handle();
-        let devices = scheduler.devices().clone();
         async move {
-            let read = h.read(dev, FD, 0, 4096, TierPriority::Medium).await;
+            let read = h.read(&dev, FD, 0, 4096, TierPriority::Medium).await;
             assert!(read.is_err(), "failed read must surface as Err, got Ok");
             let write = h
                 .write(
-                    dev,
+                    &dev,
                     FD,
                     0,
                     bytes::Bytes::from_static(b"abcd"),
@@ -562,14 +551,7 @@ fn failed_completion_surfaces_as_err() {
                 )
                 .await;
             assert!(write.is_err(), "failed write must surface as Err, got Ok");
-            let device = devices.get(dev).unwrap();
-            for pool in device.pools.all() {
-                assert_eq!(
-                    pool.debug_free_total(),
-                    pool.debug_capacity() as i64,
-                    "credit leaked on failed completion"
-                );
-            }
+            assert_conserved(&dev);
             info!("failed completion surfaced as Err and conserved credit");
         }
         .primary()
@@ -583,11 +565,11 @@ fn failed_completion_surfaces_as_err() {
 fn oversize_op_fails_fast() {
     let _no_snap = crate::testing::without_snapshots();
     sim(|| {
-        let scheduler = build(vec![iops_device(4)], 1, Latency::default());
-        let dev = DeviceId(0);
+        let (scheduler, devices) = build(vec![iops_device(4)], 1, Latency::default());
+        let dev = devices[0].clone();
         let h = scheduler.handle();
         async move {
-            let result = h.read(dev, FD, 0, 64 * 1024, TierPriority::Medium).await;
+            let result = h.read(&dev, FD, 0, 64 * 1024, TierPriority::Medium).await;
             assert!(
                 matches!(
                     result.as_ref().map_err(|e| e.kind()),
@@ -596,30 +578,6 @@ fn oversize_op_fails_fast() {
                 "oversize op must fail fast with InvalidInput, got {result:?}"
             );
             info!("oversize op rejected fast");
-        }
-        .primary()
-        .spawn();
-    });
-}
-
-/// An out-of-range, caller-supplied `DeviceId` must surface as `Err`, not panic the shared worker.
-#[test]
-fn out_of_range_device_id_errs() {
-    let _no_snap = crate::testing::without_snapshots();
-    sim(|| {
-        let scheduler = build(vec![iops_device(4)], 1, Latency::default());
-        let bad = DeviceId(99);
-        let h = scheduler.handle();
-        async move {
-            let result = h.read(bad, FD, 0, 4096, TierPriority::Medium).await;
-            assert!(
-                matches!(
-                    result.as_ref().map_err(|e| e.kind()),
-                    Err(std::io::ErrorKind::InvalidInput)
-                ),
-                "out-of-range device id must error, got {result:?}"
-            );
-            info!("out-of-range device id rejected");
         }
         .primary()
         .spawn();
