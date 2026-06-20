@@ -6,7 +6,6 @@ use crate::{
     tracing::*,
 };
 use cfg_if::cfg_if;
-use rand::RngExt;
 use s2n_quic::{
     provider::{
         dc::{ConfirmComplete, MtuConfirmComplete},
@@ -29,7 +28,7 @@ use std::{
     },
     time::Duration,
 };
-use tokio::{sync::Semaphore, time::Instant as TokioInstant};
+use tokio::sync::Semaphore;
 
 pub use crate::endpoint::DEFAULT_IDLE_TIMEOUT;
 /// Connection-level flow-control window and the local send window. Bounds the peer's
@@ -85,6 +84,125 @@ pub type Error = Box<dyn std::error::Error + Send + Sync + 'static>;
 
 pub type Result<T = (), E = Error> = core::result::Result<T, E>;
 
+/// Runtime shim for the handshake driver.
+///
+/// In production the handshake server loop and the per-handshake `HandshakeQueue` bookkeeping run on
+/// a dedicated OS thread driving a `tokio` current-thread runtime, so they use `tokio::spawn` and
+/// `tokio::time`. In deterministic tests the *same* code runs inside a `bach` simulation, where
+/// those tokio primitives have no runtime to attach to and would not advance bach's virtual clock.
+///
+/// Each helper detects the environment with [`bach::is_active`] and dispatches to the matching
+/// primitive. The detection is per-call and leaf-level, so the production path is behaviorally
+/// identical to the original (the bach branch is unreachable when a tokio runtime is driving
+/// things, and vice versa). This mirrors the existing split in s2n-quic's
+/// `MtuConfirmComplete::wait_ready`. The two `cfg` variants below keep the call sites identical in
+/// both build configurations rather than `cfg`-ing every line of the driver.
+#[cfg(any(test, feature = "testing"))]
+mod rt {
+    use super::*;
+    use std::future::Future;
+
+    /// A deadline anchored in whichever runtime created it. Both the server loop and the client
+    /// handshake share a single deadline across `ConfirmComplete` *and* `MtuConfirmComplete`, so the
+    /// shim preserves a real instant (rather than re-deriving a relative timeout per step, which
+    /// would silently double the budget).
+    #[derive(Clone, Copy)]
+    pub(super) enum Deadline {
+        Bach(bach::time::Instant),
+        Tokio(tokio::time::Instant),
+    }
+
+    /// Spawn a detached task on whichever runtime is currently driving execution.
+    ///
+    /// `bach::spawn` requires only `'static` (bach is single-threaded), while `tokio::spawn`
+    /// requires `Send`; the bound here is the intersection so both branches accept the future.
+    pub(super) fn spawn<F>(future: F)
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        if bach::is_active() {
+            bach::spawn(future);
+        } else {
+            tokio::spawn(future);
+        }
+    }
+
+    /// A deadline `after` from now, on whichever runtime is active.
+    pub(super) fn deadline(after: Duration) -> Deadline {
+        if bach::is_active() {
+            Deadline::Bach(bach::time::Instant::now() + after)
+        } else {
+            Deadline::Tokio(tokio::time::Instant::now() + after)
+        }
+    }
+
+    /// Run `future` until `deadline`, returning `None` if the deadline elapsed first.
+    pub(super) async fn timeout_at<F: Future>(deadline: Deadline, future: F) -> Option<F::Output> {
+        match deadline {
+            Deadline::Bach(at) => bach::time::timeout_at(at, future).await.ok(),
+            Deadline::Tokio(at) => tokio::time::timeout_at(at, future).await.ok(),
+        }
+    }
+
+    /// Sleep for `duration` on whichever runtime is active.
+    pub(super) async fn sleep(duration: Duration) {
+        if bach::is_active() {
+            bach::time::sleep(duration).await;
+        } else {
+            tokio::time::sleep(duration).await;
+        }
+    }
+
+    /// Pick a random delay whose millisecond count falls in `range`.
+    ///
+    /// Under bach this draws from the seeded simulation RNG so backoff timing is reproducible;
+    /// otherwise it uses the thread RNG, matching the original production behavior.
+    pub(super) fn jitter(range: core::ops::RangeInclusive<u64>) -> Duration {
+        let ms = if bach::is_active() {
+            use bach::rand::Any;
+            range.any()
+        } else {
+            use rand::RngExt;
+            rand::rng().random_range(range)
+        };
+        Duration::from_millis(ms)
+    }
+}
+
+/// In non-testing builds there is no bach, so the shim is just the tokio primitives.
+#[cfg(not(any(test, feature = "testing")))]
+mod rt {
+    use super::*;
+    use std::future::Future;
+
+    #[derive(Clone, Copy)]
+    pub(super) struct Deadline(tokio::time::Instant);
+
+    pub(super) fn spawn<F>(future: F)
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        tokio::spawn(future);
+    }
+
+    pub(super) fn deadline(after: Duration) -> Deadline {
+        Deadline(tokio::time::Instant::now() + after)
+    }
+
+    pub(super) async fn timeout_at<F: Future>(deadline: Deadline, future: F) -> Option<F::Output> {
+        tokio::time::timeout_at(deadline.0, future).await.ok()
+    }
+
+    pub(super) async fn sleep(duration: Duration) {
+        tokio::time::sleep(duration).await;
+    }
+
+    pub(super) fn jitter(range: core::ops::RangeInclusive<u64>) -> Duration {
+        use rand::RngExt;
+        Duration::from_millis(rand::rng().random_range(range))
+    }
+}
+
 pub struct Server {
     server: s2n_quic::Server,
 }
@@ -101,6 +219,22 @@ impl Server {
         subscriber: Subscriber,
         builder: server::Builder<Event>,
     ) -> Result<Self, Error> {
+        // Under bach, bind the handshake listener on the simulated network instead of an OS socket.
+        // The rest of the builder chain (limits, dc, event, tls) is identical regardless of IO, so
+        // it is factored into `build_server` and reused. Gated on the testing feature so production
+        // builds are byte-for-byte unchanged.
+        #[cfg(any(test, feature = "testing"))]
+        if bach::is_active() {
+            let io = s2n_quic::provider::io::bach::Builder::default()
+                .with_address(addr)?
+                .with_base_mtu(DEFAULT_BASE_MTU.min(builder.mtu))?
+                .with_initial_mtu(builder.mtu)?
+                .with_max_mtu(builder.mtu)?
+                .build()?;
+            let server = build_server(io, map, tls_materials_provider, subscriber, builder)?;
+            return Ok(Self { server });
+        }
+
         let io = s2n_quic::provider::io::default::Builder::default()
             .with_receive_address(addr)?
             .with_base_mtu(DEFAULT_BASE_MTU.min(builder.mtu))?
@@ -108,45 +242,7 @@ impl Server {
             .with_max_mtu(builder.mtu)?
             .with_internal_recv_buffer_size(BUFFER_SIZE)?
             .build()?;
-
-        let server = s2n_quic::Server::builder().with_io(io)?;
-
-        let connection_limits = s2n_quic::provider::limits::Limits::new()
-            .with_max_idle_timeout(builder.max_idle_timeout)?
-            .with_data_window(builder.data_window)?
-            .with_bidirectional_local_data_window(builder.data_window)?
-            .with_bidirectional_remote_data_window(builder.recv_window)?
-            .with_initial_round_trip_time(DEFAULT_INITIAL_RTT)?;
-
-        let event = (
-            (ConfirmComplete, (MtuConfirmComplete, DcPathCapture)),
-            subscriber,
-        );
-
-        cfg_if!(
-            if #[cfg(any(test, feature = "testing"))] {
-                let server = {
-                    let server = server
-                        .with_limits(connection_limits)?
-                        .with_dc(map.clone())?
-                        .with_event(event)?
-                        .with_tls(tls_materials_provider)?;
-                    if let Some(limiter) = builder.endpoint_limits {
-                        server.with_endpoint_limits(limiter)?.start()?
-                    } else {
-                        server.start()?
-                    }
-                };
-            } else {
-                let server = server
-                    .with_limits(connection_limits)?
-                    .with_dc(map.clone())?
-                    .with_event(event)?
-                    .with_tls(tls_materials_provider)?
-                    .start()?;
-            }
-        );
-
+        let server = build_server(io, map, tls_materials_provider, subscriber, builder)?;
         Ok(Self { server })
     }
 
@@ -154,6 +250,65 @@ impl Server {
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
         self.server.local_addr()
     }
+}
+
+/// Applies the dc handshake server configuration (limits, dc map, confirmation events, TLS) on top
+/// of an already-selected IO provider and starts the server.
+///
+/// Factored out of [`Server::bind`] so the bach and production IO providers share one copy of the
+/// builder chain.
+fn build_server<Io, Provider, Subscriber, Event>(
+    io: Io,
+    map: secret::Map,
+    tls_materials_provider: Provider,
+    subscriber: Subscriber,
+    builder: server::Builder<Event>,
+) -> Result<s2n_quic::Server, Error>
+where
+    Io: s2n_quic::provider::io::Provider,
+    Provider: Prov + Send + Sync + 'static,
+    Subscriber: Sub + Send + Sync + 'static,
+    Event: s2n_quic::provider::event::Subscriber,
+{
+    let server = s2n_quic::Server::builder().with_io(io)?;
+
+    let connection_limits = s2n_quic::provider::limits::Limits::new()
+        .with_max_idle_timeout(builder.max_idle_timeout)?
+        .with_data_window(builder.data_window)?
+        .with_bidirectional_local_data_window(builder.data_window)?
+        .with_bidirectional_remote_data_window(builder.recv_window)?
+        .with_initial_round_trip_time(DEFAULT_INITIAL_RTT)?;
+
+    let event = (
+        (ConfirmComplete, (MtuConfirmComplete, DcPathCapture)),
+        subscriber,
+    );
+
+    cfg_if!(
+        if #[cfg(any(test, feature = "testing"))] {
+            let server = {
+                let server = server
+                    .with_limits(connection_limits)?
+                    .with_dc(map.clone())?
+                    .with_event(event)?
+                    .with_tls(tls_materials_provider)?;
+                if let Some(limiter) = builder.endpoint_limits {
+                    server.with_endpoint_limits(limiter)?.start()?
+                } else {
+                    server.start()?
+                }
+            };
+        } else {
+            let server = server
+                .with_limits(connection_limits)?
+                .with_dc(map.clone())?
+                .with_event(event)?
+                .with_tls(tls_materials_provider)?
+                .start()?;
+        }
+    );
+
+    Ok(server)
 }
 
 pub(super) async fn server<
@@ -185,42 +340,53 @@ pub(super) async fn server<
 
     let _ = on_ready.send(Ok(server.local_addr().unwrap()));
 
-    while let Some(mut connection) = server.server.accept().await {
-        let map_clone = map.clone();
-        tokio::spawn(async move {
-            // The accepted connection must remain open until the client has finished inserting
-            // the entry into its map. The client indicates this by sending a ConnectionClose
-            // when it is done.
-            //
-            // A 10 second timeout is specified to avoid spawned tasks piling up when the
-            // ConnectionClose from the client is lost. This timeout covers dc handshake
-            // confirmation and MTU probing completion. Data addresses are exchanged via
-            // transport parameters during the TLS handshake.
-            let deadline = TokioInstant::now() + Duration::from_secs(10);
+    server.accept_loop(map).await;
+}
 
-            match tokio::time::timeout_at(deadline, ConfirmComplete::wait_ready(&mut connection))
-                .await
-            {
-                Ok(Ok(())) => {
-                    let _ = tokio::time::timeout_at(
-                        deadline,
-                        MtuConfirmComplete::wait_ready(&mut connection),
-                    )
-                    .await;
-                }
-                Ok(Err(e)) => {
-                    debug!(
-                        "failed to establish DC connection with {:?}: {:?}",
-                        address, e
-                    );
-                }
-                Err(_) => {
-                    if let Ok(peer_address) = connection.remote_addr() {
-                        map_clone.on_dc_connection_timeout(&peer_address);
+impl Server {
+    /// Accepts connections forever, spawning a per-connection task that drives dc-handshake and MTU
+    /// confirmation. Returns only when the underlying acceptor closes.
+    ///
+    /// Split out of [`server`] so a bach caller can bind synchronously (the bind is itself
+    /// synchronous) and then drive just this loop as a task — bach has no separate runtime to
+    /// `block_on` a bind future.
+    pub(super) async fn accept_loop(mut self, map: secret::Map) {
+        let address = self.server.local_addr().ok();
+        while let Some(mut connection) = self.server.accept().await {
+            let map_clone = map.clone();
+            rt::spawn(async move {
+                // The accepted connection must remain open until the client has finished inserting
+                // the entry into its map. The client indicates this by sending a ConnectionClose
+                // when it is done.
+                //
+                // A 10 second timeout is specified to avoid spawned tasks piling up when the
+                // ConnectionClose from the client is lost. This timeout covers dc handshake
+                // confirmation and MTU probing completion. Data addresses are exchanged via
+                // transport parameters during the TLS handshake.
+                let deadline = rt::deadline(Duration::from_secs(10));
+
+                match rt::timeout_at(deadline, ConfirmComplete::wait_ready(&mut connection)).await {
+                    Some(Ok(())) => {
+                        let _ = rt::timeout_at(
+                            deadline,
+                            MtuConfirmComplete::wait_ready(&mut connection),
+                        )
+                        .await;
+                    }
+                    Some(Err(e)) => {
+                        debug!(
+                            "failed to establish DC connection with {:?}: {:?}",
+                            address, e
+                        );
+                    }
+                    None => {
+                        if let Ok(peer_address) = connection.remote_addr() {
+                            map_clone.on_dc_connection_timeout(&peer_address);
+                        }
                     }
                 }
-            }
-        });
+            });
+        }
     }
 }
 
@@ -247,39 +413,45 @@ impl Client {
         subscriber: Subscriber,
         builder: client::Builder<Event>,
     ) -> Result<Self, Error> {
-        let io = s2n_quic::provider::io::default::Builder::default()
-            .with_receive_address(addr)?
-            .with_base_mtu(DEFAULT_BASE_MTU.min(builder.mtu))?
-            .with_initial_mtu(builder.mtu)?
-            .with_max_mtu(builder.mtu)?
-            .with_internal_recv_buffer_size(BUFFER_SIZE)?
-            .build()?;
+        let success_jitter = builder.success_jitter;
 
-        let client = s2n_quic::Client::builder().with_io(io)?;
+        // Under bach, bind on the simulated network; see the comment in `Server::bind`.
+        #[cfg(any(test, feature = "testing"))]
+        let client = if bach::is_active() {
+            let io = s2n_quic::provider::io::bach::Builder::default()
+                .with_address(addr)?
+                .with_base_mtu(DEFAULT_BASE_MTU.min(builder.mtu))?
+                .with_initial_mtu(builder.mtu)?
+                .with_max_mtu(builder.mtu)?
+                .build()?;
+            build_client(io, map.clone(), tls_materials_provider, subscriber, builder)?
+        } else {
+            let io = s2n_quic::provider::io::default::Builder::default()
+                .with_receive_address(addr)?
+                .with_base_mtu(DEFAULT_BASE_MTU.min(builder.mtu))?
+                .with_initial_mtu(builder.mtu)?
+                .with_max_mtu(builder.mtu)?
+                .with_internal_recv_buffer_size(BUFFER_SIZE)?
+                .build()?;
+            build_client(io, map.clone(), tls_materials_provider, subscriber, builder)?
+        };
 
-        let connection_limits = s2n_quic::provider::limits::Limits::new()
-            .with_max_idle_timeout(builder.max_idle_timeout)?
-            .with_data_window(builder.data_window)?
-            .with_bidirectional_local_data_window(builder.data_window)?
-            .with_bidirectional_remote_data_window(builder.recv_window)?
-            .with_initial_round_trip_time(DEFAULT_INITIAL_RTT)?;
-
-        let event = (
-            (ConfirmComplete, (MtuConfirmComplete, DcPathCapture)),
-            subscriber,
-        );
-
-        let client = client
-            .with_limits(connection_limits)?
-            .with_dc(map.clone())?
-            .with_event(event)?
-            .with_tls(tls_materials_provider)?
-            .start()?;
+        #[cfg(not(any(test, feature = "testing")))]
+        let client = {
+            let io = s2n_quic::provider::io::default::Builder::default()
+                .with_receive_address(addr)?
+                .with_base_mtu(DEFAULT_BASE_MTU.min(builder.mtu))?
+                .with_initial_mtu(builder.mtu)?
+                .with_max_mtu(builder.mtu)?
+                .with_internal_recv_buffer_size(BUFFER_SIZE)?
+                .build()?;
+            build_client(io, map.clone(), tls_materials_provider, subscriber, builder)?
+        };
 
         Ok(Self {
             client,
-            map: map.clone(),
-            queue: Arc::new(HandshakeQueue::new(builder.success_jitter)),
+            map,
+            queue: Arc::new(HandshakeQueue::new(success_jitter)),
         })
     }
 
@@ -306,6 +478,48 @@ impl Client {
         let guard = self.queue.inner.lock().unwrap();
         guard.table.find(peer_hash, |e| e.peer == peer).is_some()
     }
+}
+
+/// Applies the dc handshake client configuration (limits, dc map, confirmation events, TLS) on top
+/// of an already-selected IO provider and starts the client.
+///
+/// Factored out of [`Client::bind`] so the bach and production IO providers share one copy of the
+/// builder chain.
+fn build_client<Io, Provider, Subscriber, Event>(
+    io: Io,
+    map: secret::Map,
+    tls_materials_provider: Provider,
+    subscriber: Subscriber,
+    builder: client::Builder<Event>,
+) -> Result<s2n_quic::Client, Error>
+where
+    Io: s2n_quic::provider::io::Provider,
+    Provider: Prov + Send + Sync + 'static,
+    Subscriber: Sub + Send + Sync + 'static,
+    Event: s2n_quic::provider::event::Subscriber,
+{
+    let client = s2n_quic::Client::builder().with_io(io)?;
+
+    let connection_limits = s2n_quic::provider::limits::Limits::new()
+        .with_max_idle_timeout(builder.max_idle_timeout)?
+        .with_data_window(builder.data_window)?
+        .with_bidirectional_local_data_window(builder.data_window)?
+        .with_bidirectional_remote_data_window(builder.recv_window)?
+        .with_initial_round_trip_time(DEFAULT_INITIAL_RTT)?;
+
+    let event = (
+        (ConfirmComplete, (MtuConfirmComplete, DcPathCapture)),
+        subscriber,
+    );
+
+    let client = client
+        .with_limits(connection_limits)?
+        .with_dc(map)?
+        .with_event(event)?
+        .with_tls(tls_materials_provider)?
+        .start()?;
+
+    Ok(client)
 }
 
 struct Entry {
@@ -454,11 +668,11 @@ impl HandshakeQueue {
             // MtuConfirmComplete, avoiding unbounded waits if the peer is slow.
             // Data addresses are exchanged via transport parameters during the
             // TLS handshake.
-            let deadline = TokioInstant::now() + Duration::from_secs(10);
+            let deadline = rt::deadline(Duration::from_secs(10));
 
-            tokio::time::timeout_at(deadline, ConfirmComplete::wait_ready(&mut connection))
+            rt::timeout_at(deadline, ConfirmComplete::wait_ready(&mut connection))
                 .await
-                .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "handshake timeout"))??;
+                .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "handshake timeout"))??;
 
             // Don't wait for the connection to fully close, just wait until dc.complete to
             // drop the permit.
@@ -471,14 +685,11 @@ impl HandshakeQueue {
             // This task also owns pruning our de-duplication tracking.
             let this = self.clone();
             let map_clone = map.clone();
-            tokio::spawn(async move {
+            rt::spawn(async move {
                 // Use the same deadline for MTU probing - any remaining time from the 10s budget
-                if tokio::time::timeout_at(
-                    deadline,
-                    MtuConfirmComplete::wait_ready(&mut connection),
-                )
-                .await
-                .is_err()
+                if rt::timeout_at(deadline, MtuConfirmComplete::wait_ready(&mut connection))
+                    .await
+                    .is_none()
                 {
                     map_clone.on_dc_connection_timeout(&peer);
                 }
@@ -498,11 +709,7 @@ impl HandshakeQueue {
                 //
                 // Note that we've already dropped the connection and permit above, so we're not
                 // blocking any other peer from handshaking.
-                let duration = {
-                    let mut rng = rand::rng();
-                    rng.random_range(0..=(this.success_jitter.as_millis() as u64))
-                };
-                tokio::time::sleep(Duration::from_millis(duration)).await;
+                rt::sleep(rt::jitter(0..=(this.success_jitter.as_millis() as u64))).await;
 
                 this.remove_entry(&entry);
             });
@@ -521,7 +728,7 @@ impl HandshakeQueue {
                     error!("handshake with {peer} failed: {e}");
 
                     let this = self.clone();
-                    tokio::spawn(async move {
+                    rt::spawn(async move {
                         // Delay deleting the entry by a random time, up to 2 minutes.
                         //
                         // This avoids aggressively reconnecting to a given peer if handshakes
@@ -535,11 +742,7 @@ impl HandshakeQueue {
                         // amount (to avoid significantly extending recovery times if the server
                         // was temporarily overloaded) while still significantly reducing handshake
                         // volume (>60x for fast-failing handshakes and >10x for timeouts).
-                        let duration = {
-                            let mut rng = rand::rng();
-                            rng.random_range(1000..120_000)
-                        };
-                        tokio::time::sleep(Duration::from_millis(duration)).await;
+                        rt::sleep(rt::jitter(1000..=119_999)).await;
 
                         // If the handshake fails, we also remove the entry from the map.
                         // This permits another handshake to start for the same peer.

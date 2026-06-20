@@ -33,6 +33,42 @@ impl Provider {
         DropGuard,
     ) {
         let (tx, rx) = oneshot::channel();
+        let token = tokio_util::sync::CancellationToken::new();
+        let cancelled = token.clone().cancelled_owned();
+
+        // Under bach the accept loop runs as a task in the current simulation scope rather than on a
+        // dedicated OS thread + tokio runtime: bach is single-threaded and has no tokio runtime to
+        // `block_on`, so a caller's `start_blocking` would deadlock waiting on the oneshot if the
+        // bind happened inside a not-yet-scheduled task. Instead we bind synchronously here (the
+        // bind itself is synchronous), deliver readiness immediately, and spawn *only* the accept
+        // loop. `tokio::select!` and `CancellationToken` are runtime-agnostic, so the
+        // shutdown-on-drop contract holds: dropping the returned `DropGuard` cancels the token,
+        // letting a node-restart test tear the handshake server down deterministically.
+        #[cfg(any(test, feature = "testing"))]
+        if bach::is_active() {
+            match io::Server::bind::<Provider, Subscriber, Event>(
+                addr,
+                map.clone(),
+                tls_materials_provider,
+                subscriber,
+                builder,
+            ) {
+                Ok(server) => {
+                    let _ = tx.send(Ok(server.local_addr().unwrap()));
+                    bach::spawn(async move {
+                        tokio::select! {
+                            _ = cancelled => {}
+                            _ = server.accept_loop(map) => {}
+                        }
+                    });
+                }
+                Err(e) => {
+                    let _ = tx.send(Err(e));
+                }
+            }
+            return (rx, token.drop_guard());
+        }
+
         let server = io::server(
             addr,
             map.clone(),
@@ -41,8 +77,6 @@ impl Provider {
             subscriber,
             tx,
         );
-        let token = tokio_util::sync::CancellationToken::new();
-        let cancelled = token.clone().cancelled_owned();
         std::thread::Builder::new()
             .name(String::from("hs-server"))
             .spawn(move || {
