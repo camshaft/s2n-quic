@@ -595,3 +595,100 @@ where
         Err(err) => Err(SpawnError::Fatal(err)),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::socket::{
+        pool::{descriptor::Filled, Pool, SyncReuseRing},
+        BusyPoll,
+    };
+    use std::{
+        net::UdpSocket,
+        sync::{Arc, Mutex},
+        time::Duration,
+    };
+
+    /// A `Router` that captures each received segment's payload + peer address into a shared vec, so a
+    /// test can assert exactly what the ring delivered. It overrides `on_segment` to bypass packet
+    /// decoding (the test sends arbitrary bytes, not real dc packets).
+    #[derive(Clone)]
+    struct CaptureRouter {
+        received: Arc<Mutex<Vec<(Vec<u8>, u16)>>>,
+    }
+
+    impl Router for CaptureRouter {
+        fn is_open(&self) -> bool {
+            true
+        }
+
+        fn on_segment(&mut self, segment: Filled) {
+            // Capture the payload bytes and the source port (enough to assert correct delivery +
+            // address parsing without depending on the canonical address type's private fields).
+            let port = segment.remote_address().get().port();
+            let payload = segment.payload().to_vec();
+            self.received.lock().unwrap().push((payload, port));
+        }
+    }
+
+    /// End-to-end through a real io_uring multishot recv ring: bind a loopback UDP socket, drive it
+    /// with a ring, send datagrams from another socket, and verify each arrives with the correct
+    /// payload and source address. Exercises the shared descriptor layout, the buffer ring, and
+    /// `RecvMsgOut` parsing on real hardware. Skipped (passes trivially) if io_uring is unavailable.
+    #[test]
+    fn uring_recv_roundtrip() {
+        if probe().is_err() {
+            eprintln!("io_uring unavailable; skipping uring_recv_roundtrip");
+            return;
+        }
+
+        let recv_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        recv_sock.set_nonblocking(true).unwrap();
+        let recv_addr = recv_sock.local_addr().unwrap();
+        let socket = BusyPoll(recv_sock);
+
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let router = CaptureRouter {
+            received: received.clone(),
+        };
+
+        let pool = Pool::new(u16::MAX);
+        let reuse = SyncReuseRing::new();
+        let ring = spawn(0, socket, 64, pool, reuse, router)
+            .unwrap_or_else(|_| panic!("recv ring spawn must succeed when io_uring is available"));
+
+        // Give the ring thread a moment to register the buffer ring and arm the multishot recv.
+        std::thread::sleep(Duration::from_millis(50));
+
+        let send_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let send_addr = send_sock.local_addr().unwrap();
+        let payloads: &[&[u8]] = &[b"hello uring", b"second datagram", &[0xab; 1200]];
+        for p in payloads {
+            send_sock.send_to(p, recv_addr).unwrap();
+        }
+
+        // Poll for delivery (the ring runs on its own thread).
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if received.lock().unwrap().len() >= payloads.len() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for {} datagrams; got {}",
+                payloads.len(),
+                received.lock().unwrap().len()
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        drop(ring); // stop + join the ring thread
+
+        let got = received.lock().unwrap();
+        assert_eq!(got.len(), payloads.len(), "datagram count");
+        for (i, expected) in payloads.iter().enumerate() {
+            assert_eq!(&got[i].0, expected, "payload {i} bytes");
+            assert_eq!(got[i].1, send_addr.port(), "payload {i} source port");
+        }
+    }
+}
