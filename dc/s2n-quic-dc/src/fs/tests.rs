@@ -125,9 +125,7 @@ fn lane_send_failure_fails_submit_and_conserves_credit() {
             // promptly (not hang). `.await` directly — if the future hung, the sim would never
             // reach quiescence and the test would time out.
             for i in 0..5u64 {
-                let result = dev
-                    .read(fd(), i * 4096, 4096, TierPriority::Medium)
-                    .await;
+                let result = dev.read(fd(), i * 4096, 4096, TierPriority::Medium).await;
                 assert!(
                     result.is_err(),
                     "submit to a closed lane must fail, not succeed or hang"
@@ -191,7 +189,8 @@ fn op_larger_than_max_single_acquire_grants_atomically() {
             let completed = completed.clone();
             async move {
                 // 128 KiB ≫ Medium max_single_acquire (1 KiB) but < capacity (256 KiB).
-                if dev.read(fd(), i * 128 * 1024, 128 * 1024, TierPriority::Medium)
+                if dev
+                    .read(fd(), i * 128 * 1024, 128 * 1024, TierPriority::Medium)
                     .await
                     .is_ok()
                 {
@@ -249,6 +248,360 @@ fn fd() -> crate::fs::op::Fd {
     crate::fs::op::Fd::new(Arc::new(DummyFd))
 }
 
+/// Poll `future` once with a no-op waker and assert it parks (`Pending`). Used to drive a one-shot
+/// submit future (`Device::read`/`write`/`*_direct`) to a specific await point so the test can drop
+/// it *there* and assert the cancellation is clean. (A no-op waker is correct precisely because we
+/// never intend to re-poll — we drop the future at the park point.)
+fn poll_parks<F: core::future::Future>(future: core::pin::Pin<&mut F>) {
+    let waker = s2n_quic_core::task::waker::noop();
+    let mut cx = core::task::Context::from_waker(&waker);
+    assert!(
+        future.poll(&mut cx).is_pending(),
+        "future was expected to park at this await point"
+    );
+}
+
+/// CANCEL SAFETY — drop while parked on credit (op never enqueued).
+///
+/// A `Device::write`/`read` future dropped while it is parked acquiring credit — *before* its `IoOp`
+/// was ever built/enqueued — must: release no credit it does not hold, strand no waiter slot, and
+/// leave the device fully functional. At this await point the buffer still lives in the future's own
+/// frame (no op exists yet), so the drop simply frees it; the parked credit slot is abandoned and
+/// reclaimed by the pool's next grant walk. This is the "decide not to go through with the write
+/// while waiting for credits" case.
+#[test]
+fn drop_future_while_parked_on_credit_conserves_and_recovers() {
+    let _no_snap = crate::testing::without_snapshots();
+    sim(|| {
+        // depth-1 device + long latency: one in-flight op saturates the pool and stays out for 50ms,
+        // so a second future has no credit and parks on acquire.
+        let latency = Latency {
+            read: Duration::from_millis(50),
+            write: Duration::from_millis(50),
+            per_byte_nanos: 0,
+        };
+        let (scheduler, devices) = build(vec![iops_device(1)], 1, latency);
+        let dev = devices[0].clone();
+
+        // Occupant: holds the single credit in flight for 50ms. (Reads cost 1 credit; a write would
+        // cost 2 — the default 2× write weight — and exceed this depth-1 pool.)
+        {
+            let dev = dev.clone();
+            async move {
+                let _ = dev.read(fd(), 0, 4096, TierPriority::Medium).await;
+            }
+            .primary()
+            .spawn();
+        }
+
+        async move {
+            // Keep the scheduler (and its pool) alive for the whole sim; dropped when this task ends.
+            let _scheduler = scheduler;
+            // Let the occupant acquire the only credit and park on its 50ms completion.
+            1.ms().sleep().await;
+            assert!(
+                dev.pools
+                    .all()
+                    .any(|p| p.debug_free_total() < p.debug_capacity() as i64),
+                "precondition: occupant should hold the only credit"
+            );
+
+            // A second read now parks on credit (pool empty). Poll it to the park point, then drop it
+            // there — the op was never enqueued, so this drops the buffer and abandons the slot.
+            {
+                let mut fut = core::pin::pin!(dev.read(fd(), 4096, 4096, TierPriority::Medium));
+                poll_parks(fut.as_mut());
+                drop(fut);
+            }
+
+            // Occupant completes and releases its credit; the abandoned waiter slot is reclaimed by
+            // the distributor's grant walk rather than being handed (and losing) the credit.
+            100.ms().sleep().await;
+            assert_conserved(&dev);
+
+            // The device still works after the mid-acquire cancellation.
+            dev.read(fd(), 8192, 4096, TierPriority::Medium)
+                .await
+                .unwrap();
+            assert_conserved(&dev);
+            info!("drop-while-parked-on-credit: conserved and recovered");
+        }
+        .primary()
+        .spawn();
+    });
+}
+
+/// CANCEL SAFETY — drop after enqueue, with the op in flight (the io_uring-queue case).
+///
+/// A `Device::write` future dropped *after* its op has been handed to the pipeline (credit acquired,
+/// op + buffer enqueued) and while it awaits completion must conserve credit and leave the device
+/// functional. The crucial property: the buffer is owned by the in-flight `IoOp` **downstream** — not
+/// by the future — so dropping the future cannot pull the buffer out from under a backend (or, on the
+/// uring backend, an in-kernel) operation. The op finishes downstream, `complete`/`complete_cancelled`
+/// releases its credit, and the now-orphaned completion is discarded on the dead receiver.
+#[test]
+fn drop_future_with_op_in_flight_conserves_and_recovers() {
+    let _no_snap = crate::testing::without_snapshots();
+    sim(|| {
+        let latency = Latency {
+            read: Duration::from_millis(50),
+            write: Duration::from_millis(50),
+            per_byte_nanos: 0,
+        };
+        let (scheduler, devices) = build(vec![iops_device(8)], 1, latency);
+        let dev = devices[0].clone();
+
+        async move {
+            let _scheduler = scheduler;
+            {
+                // A single poll drives the future through credit acquire + enqueue (the op and its
+                // buffer are now downstream) and parks it on `await_completion`.
+                let mut fut = core::pin::pin!(dev.write(
+                    fd(),
+                    0,
+                    bytes::Bytes::from(vec![7u8; 4096]),
+                    TierPriority::Medium
+                ));
+                poll_parks(fut.as_mut());
+                assert!(
+                    dev.pools
+                        .all()
+                        .any(|p| p.debug_free_total() < p.debug_capacity() as i64),
+                    "precondition: op should hold credit (enqueued, in flight) before the drop"
+                );
+                // Drop with the op in flight: the buffer rides the op, not the future.
+                drop(fut);
+            }
+
+            // The in-flight op completes downstream; its credit is released before the completion is
+            // discarded on the dead receiver (or the backend skips it as cancelled — either conserves).
+            100.ms().sleep().await;
+            assert_conserved(&dev);
+
+            // The device still works after the in-flight cancellation.
+            let buf = dev.read(fd(), 0, 4096, TierPriority::Medium).await.unwrap();
+            assert_eq!(buf.len(), 4096);
+            assert_conserved(&dev);
+            info!("drop-with-op-in-flight: conserved and recovered");
+        }
+        .primary()
+        .spawn();
+    });
+}
+
+/// CANCEL-BEFORE-SUBMIT — predicate already true at submit time: the op never touches the pool.
+///
+/// `submit_cancellable` with a predicate that is true up front must short-circuit before acquiring any
+/// credit: it returns `Cancelled` (handing the buffer back), no IO is issued, the backend processor
+/// never runs, and the pool is untouched (full capacity throughout). This is the cheapest cancel — an
+/// op known dead at submit time should not even contend for credit against live ops.
+#[test]
+fn cancellable_submit_cancels_before_acquiring_credit() {
+    use crate::fs::device::SubmitOutcome;
+    let _no_snap = crate::testing::without_snapshots();
+    sim(|| {
+        let ran = Rc::new(std::cell::Cell::new(0u64));
+        let ran_proc = ran.clone();
+        let clock = Clock::default();
+        let backend =
+            BachBackend::with_processor(clock.clone(), Latency::default(), move |op: &mut IoOp| {
+                ran_proc.set(ran_proc.get() + 1);
+                crate::fs::backend::bach::process_default(op);
+            });
+        let mut spawn = bach_spawner();
+        let scheduler = DeviceRegistry::new(backend, &mut spawn, &Registry::default(), clock);
+        let dev = scheduler.register_device("dev0", &iops_device(8)).unwrap();
+
+        async move {
+            let _scheduler = scheduler;
+            let outcome = dev
+                .submit_cancellable(
+                    crate::fs::op::IoKind::Write,
+                    fd(),
+                    0,
+                    4096,
+                    crate::fs::op::IoBuf::Write(bytes::Bytes::from(vec![1u8; 4096])),
+                    TierPriority::Medium,
+                    || true, // already dead at submit time
+                )
+                .await
+                .expect("cancellable submit should not error");
+            assert!(
+                matches!(outcome, SubmitOutcome::Cancelled(_)),
+                "predicate true at submit must cancel pre-acquire"
+            );
+            10.ms().sleep().await;
+            assert_eq!(
+                ran.get(),
+                0,
+                "cancelled-before-submit op must not run any IO"
+            );
+            assert_conserved(&dev);
+            info!("cancellable submit: cancelled before acquiring credit, no IO, conserved");
+        }
+        .primary()
+        .spawn();
+    });
+}
+
+/// CANCEL-ON-GRANT — predicate flips true while the op is parked on credit: the op is dropped the
+/// instant credit is granted, **before** enqueue. This is the spill-backlog case: the data dies while
+/// the write waits for the credit pool, and we must release that credit (for live writes) and issue no
+/// disk IO — the offset is never written, so the caller can safely recycle it.
+///
+/// A depth-1 device with a 50ms occupant forces the cancellable op to park on credit. A predicate that
+/// is false at submit (so credit is acquired) but true by the time the occupant releases (so the op
+/// cancels on the grant wake) exercises the second, post-acquire/pre-enqueue cancellation point.
+#[test]
+fn cancellable_submit_cancels_on_credit_grant_before_enqueue() {
+    use crate::fs::device::SubmitOutcome;
+    let _no_snap = crate::testing::without_snapshots();
+    sim(|| {
+        let latency = Latency {
+            read: Duration::from_millis(50),
+            write: Duration::from_millis(50),
+            per_byte_nanos: 0,
+        };
+        // Record the offsets the backend actually executes. The occupant (offset 0) runs; the
+        // cancellable op (offset 4096) must NOT — so 4096 never appears.
+        let ran_offsets: Rc<RefCell<Vec<u64>>> = Rc::new(RefCell::new(Vec::new()));
+        let ran_proc = ran_offsets.clone();
+        let clock = Clock::default();
+        let backend = BachBackend::with_processor(clock.clone(), latency, move |op: &mut IoOp| {
+            ran_proc.borrow_mut().push(op.offset);
+            crate::fs::backend::bach::process_default(op);
+        });
+        let mut spawn = bach_spawner();
+        let scheduler = DeviceRegistry::new(backend, &mut spawn, &Registry::default(), clock);
+        let dev = scheduler.register_device("dev0", &iops_device(1)).unwrap();
+
+        // Occupant: holds the single credit in flight for 50ms so the cancellable op parks on credit.
+        {
+            let dev = dev.clone();
+            async move {
+                let _ = dev.read(fd(), 0, 4096, TierPriority::Medium).await;
+            }
+            .primary()
+            .spawn();
+        }
+
+        // The cancellation signal, flipped at 25ms — after the cancellable op has parked on credit
+        // (~1ms) but before the occupant releases it (50ms) — so the op is still parked when the data
+        // dies and cancels on the *grant* wake, exercising the post-acquire/pre-enqueue point. Fully
+        // event-driven (a separate timed task), so the parked op holds the real bach task waker and the
+        // grant actually wakes it.
+        let dead = Rc::new(std::cell::Cell::new(false));
+        {
+            let dead = dead.clone();
+            async move {
+                25.ms().sleep().await;
+                dead.set(true);
+            }
+            .primary()
+            .spawn();
+        }
+
+        async move {
+            let _scheduler = scheduler;
+            // Let the occupant deterministically acquire the only credit before we submit, so our op
+            // parks on credit rather than winning it.
+            1.ms().sleep().await;
+            assert!(
+                dev.pools
+                    .all()
+                    .any(|p| p.debug_free_total() < p.debug_capacity() as i64),
+                "precondition: occupant should hold the only credit so the next op parks"
+            );
+
+            let dead_pred = dead.clone();
+            // Predicate is false at submit (t=1ms) → op acquires; the pool is empty so it parks on
+            // credit. At t=25ms `dead` flips true. At t=50ms the occupant releases → the op is granted
+            // credit → re-polled → post-acquire check sees the predicate true → cancels before enqueue.
+            let outcome = dev
+                .submit_cancellable(
+                    crate::fs::op::IoKind::Read,
+                    fd(),
+                    4096,
+                    4096,
+                    crate::fs::op::IoBuf::Read(bytes::BytesMut::with_capacity(4096)),
+                    TierPriority::Medium,
+                    move || dead_pred.get(),
+                )
+                .await
+                .expect("cancellable submit should not error");
+            assert!(
+                matches!(outcome, SubmitOutcome::Cancelled(_)),
+                "op should cancel on the credit grant (dead while parked), not complete"
+            );
+            assert!(
+                !ran_offsets.borrow().contains(&4096),
+                "cancelled-on-grant op (offset 4096) must issue no IO; ran offsets: {:?}",
+                ran_offsets.borrow()
+            );
+            // Credit released back: occupant's credit returned + the cancellable op released its grant
+            // without enqueueing → pool back to full.
+            assert_conserved(&dev);
+            info!("cancellable submit: cancelled on grant before enqueue, no IO, conserved");
+        }
+        .primary()
+        .spawn();
+    });
+}
+
+/// COMPLETION PATH — predicate stays false: `submit_cancellable` behaves exactly like `submit`, and
+/// `write_direct_cancellable` returns the buffer with the bytes written. Guards against the cancel hook
+/// regressing the normal path.
+#[test]
+fn cancellable_submit_completes_when_predicate_false() {
+    use crate::fs::device::{SubmitOutcome, WriteDirectOutcome};
+    let _no_snap = crate::testing::without_snapshots();
+    sim(|| {
+        let (scheduler, devices) = build(vec![iops_device(8)], 1, Latency::default());
+        let dev = devices[0].clone();
+        async move {
+            let _scheduler = scheduler;
+            // submit_cancellable with a never-true predicate completes like submit.
+            let outcome = dev
+                .submit_cancellable(
+                    crate::fs::op::IoKind::Read,
+                    fd(),
+                    0,
+                    4096,
+                    crate::fs::op::IoBuf::Read(bytes::BytesMut::with_capacity(4096)),
+                    TierPriority::Medium,
+                    || false,
+                )
+                .await
+                .expect("submit");
+            match outcome {
+                SubmitOutcome::Completed(op) => {
+                    assert!(matches!(op.status, IoStatus::Done(4096)))
+                }
+                SubmitOutcome::Cancelled(_) => panic!("must not cancel with a false predicate"),
+            }
+
+            // write_direct_cancellable with a never-true predicate writes and returns the buffer.
+            let buf = crate::fs::direct::AlignedBuf::new(crate::fs::direct::ALIGNMENT);
+            let outcome = dev
+                .write_direct_cancellable(fd(), 0, buf, TierPriority::Medium, || false)
+                .await
+                .expect("write_direct");
+            match outcome {
+                WriteDirectOutcome::Written { len, .. } => {
+                    assert_eq!(len, crate::fs::direct::ALIGNMENT)
+                }
+                WriteDirectOutcome::Cancelled { .. } => {
+                    panic!("must not cancel with a false predicate")
+                }
+            }
+            assert_conserved(&dev);
+            info!("cancellable submit/write_direct: completed normally when predicate false");
+        }
+        .primary()
+        .spawn();
+    });
+}
+
 /// Run `n` identical reader streams at `priority` against `device` for a fixed simulated window,
 /// returning each stream's completion count. Each stream keeps exactly one op in flight (submit →
 /// await → submit), so the concurrent demand equals the stream count; set the device queue depth
@@ -270,10 +623,7 @@ fn run_streams(
             let start = bach::time::Instant::now();
             let mut offset = 0u64;
             while start.elapsed() < window {
-                if dev.read(fd(), offset, 4096, priority)
-                    .await
-                    .is_ok()
-                {
+                if dev.read(fd(), offset, 4096, priority).await.is_ok() {
                     done += 1;
                     offset += 4096;
                 }
@@ -393,9 +743,7 @@ fn device_isolation() {
                 let start = bach::time::Instant::now();
                 let mut offset = 0u64;
                 while start.elapsed() < 40.ms() {
-                    let _ = busy
-                        .read(fd(), offset, 4096, TierPriority::Medium)
-                        .await;
+                    let _ = busy.read(fd(), offset, 4096, TierPriority::Medium).await;
                     offset += 4096;
                 }
             }
@@ -411,7 +759,8 @@ fn device_isolation() {
                 let mut offset = 0u64;
                 let mut n = 0u64;
                 while start.elapsed() < 40.ms() {
-                    if quiet.read(fd(), offset, 4096, TierPriority::Medium)
+                    if quiet
+                        .read(fd(), offset, 4096, TierPriority::Medium)
                         .await
                         .is_ok()
                     {
@@ -714,9 +1063,7 @@ fn oversize_op_fails_fast() {
         let (_scheduler, devices) = build(vec![iops_device(4)], 1, Latency::default());
         let dev = devices[0].clone();
         async move {
-            let result = dev
-                .read(fd(), 0, 64 * 1024, TierPriority::Medium)
-                .await;
+            let result = dev.read(fd(), 0, 64 * 1024, TierPriority::Medium).await;
             assert!(
                 matches!(
                     result.as_ref().map_err(|e| e.kind()),
@@ -780,6 +1127,7 @@ fn cancelled_op_skips_execution_and_conserves_credit() {
                 TierPriority::Medium,
                 completion_rx.sender(),
                 0,
+                || false,
             )
             .await
             .expect("submit_with should admit the op");
