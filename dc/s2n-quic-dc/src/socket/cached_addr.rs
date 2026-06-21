@@ -58,4 +58,9 @@ impl<S: super::recv::Socket> super::recv::Socket for CachedAddr<S> {
     ) -> Poll<io::Result<usize>> {
         self.socket.poll_recv(cx, addr, cmsg, buffer)
     }
+
+    #[inline]
+    fn raw_fd(&self) -> Option<std::os::fd::RawFd> {
+        self.socket.raw_fd()
+    }
 }

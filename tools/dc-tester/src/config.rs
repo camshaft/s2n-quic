@@ -53,6 +53,12 @@ pub struct EndpointConfig {
     /// Number of shards for the frame submission channel (must be power of two)
     #[serde(default = "EndpointConfig::default_submission_shards")]
     pub submission_shards: usize,
+
+    /// Recv socket backend: `"auto"` (io_uring if available, else syscall), `"io_uring"` (prefer
+    /// io_uring, fall back to syscall if unavailable), or `"syscall"` (always the cooperative
+    /// busy-poll path). Case-insensitive; `io-uring`/`uring` also accepted.
+    #[serde(default = "EndpointConfig::default_recv_backend")]
+    pub recv_backend: String,
 }
 
 impl EndpointConfig {
@@ -86,6 +92,25 @@ impl EndpointConfig {
 
     fn default_submission_shards() -> usize {
         8
+    }
+
+    fn default_recv_backend() -> String {
+        "auto".to_string()
+    }
+
+    /// Parse [`recv_backend`](Self::recv_backend) into the endpoint enum. Unrecognized values fall
+    /// back to `Auto` with a warning rather than failing to start.
+    pub fn recv_backend(&self) -> s2n_quic_dc::stream::endpoint::RecvBackend {
+        use s2n_quic_dc::stream::endpoint::RecvBackend;
+        match self.recv_backend.trim().to_ascii_lowercase().as_str() {
+            "syscall" => RecvBackend::Syscall,
+            "io_uring" | "io-uring" | "uring" => RecvBackend::IoUring,
+            "auto" => RecvBackend::Auto,
+            other => {
+                tracing::warn!(recv_backend = other, "unknown recv_backend; using auto");
+                RecvBackend::Auto
+            }
+        }
     }
 
     /// Total number of busy-poll threads needed (frame_dispatch + all worker roles).
@@ -127,6 +152,7 @@ impl Default for EndpointConfig {
             bandwidth: Self::default_bandwidth(),
             per_socket_bandwidth: Self::default_per_socket_bandwidth(),
             submission_shards: Self::default_submission_shards(),
+            recv_backend: Self::default_recv_backend(),
         }
     }
 }

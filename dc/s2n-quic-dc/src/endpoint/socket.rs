@@ -236,6 +236,11 @@ impl<S: crate::socket::recv::Socket> crate::socket::recv::Socket for Metered<S> 
         }
         result
     }
+
+    #[inline]
+    fn raw_fd(&self) -> Option<std::os::fd::RawFd> {
+        self.inner.raw_fd()
+    }
 }
 
 #[cfg(test)]

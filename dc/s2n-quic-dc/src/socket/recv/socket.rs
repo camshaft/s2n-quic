@@ -22,6 +22,18 @@ pub trait Socket: crate::socket::LocalAddr + Send + 'static {
         cmsg: &mut cmsg::Receiver,
         buffer: &mut [IoSliceMut],
     ) -> Poll<io::Result<usize>>;
+
+    /// Returns the underlying OS receive descriptor, when the socket is backed by a real kernel UDP
+    /// socket.
+    ///
+    /// The io_uring recv backend drives the socket by its raw fd on a dedicated ring thread, so it
+    /// can only adopt a socket that exposes one. Sockets without a real fd (e.g. the in-simulation
+    /// bach socket) return `None` and always fall back to the cooperative syscall recv path. The
+    /// default returns `None`; the UDP-backed wrappers forward the real descriptor.
+    #[inline]
+    fn raw_fd(&self) -> Option<std::os::fd::RawFd> {
+        None
+    }
 }
 
 impl<T: Socket + Sync> Socket for std::sync::Arc<T> {
@@ -35,12 +47,22 @@ impl<T: Socket + Sync> Socket for std::sync::Arc<T> {
     ) -> Poll<io::Result<usize>> {
         (**self).poll_recv(cx, addr, cmsg, buffer)
     }
+
+    #[inline]
+    fn raw_fd(&self) -> Option<std::os::fd::RawFd> {
+        (**self).raw_fd()
+    }
 }
 
 impl<T> Socket for BusyPoll<T>
 where
     T: udp::Socket,
 {
+    #[inline]
+    fn raw_fd(&self) -> Option<std::os::fd::RawFd> {
+        Some(std::os::fd::AsRawFd::as_raw_fd(&self.0))
+    }
+
     #[inline]
     fn poll_recv(
         &self,

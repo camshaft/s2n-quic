@@ -90,4 +90,9 @@ impl<S: super::recv::Socket, K: std::fmt::Display + Send + 'static> super::recv:
 
         result
     }
+
+    #[inline]
+    fn raw_fd(&self) -> Option<std::os::fd::RawFd> {
+        self.socket.raw_fd()
+    }
 }
