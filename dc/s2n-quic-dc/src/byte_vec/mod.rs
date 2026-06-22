@@ -867,7 +867,7 @@ impl From<ByteVec> for VecDeque<Bytes> {
 
 impl From<ByteVec> for Vec<Bytes> {
     fn from(value: ByteVec) -> Self {
-        let mut v: VecDeque<Bytes> = value.into();
+        let v: VecDeque<Bytes> = value.into();
         v.into()
     }
 }
