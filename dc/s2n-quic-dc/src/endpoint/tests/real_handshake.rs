@@ -152,8 +152,7 @@ fn real_handshake_stream_round_trip() {
 ///
 /// 1. client sends on the stale secret → server replies `UnknownPathSecret`;
 /// 2. the client's Writer surfaces that as `ConnectionRefused` ("path secret rejected by peer");
-/// 3. handling the `UnknownPathSecret` evicts the client's stale entry (the map was built with
-///    `with_evict_on_unknown_path_secret(true)`);
+/// 3. handling the `UnknownPathSecret` evicts the client's stale entry (eviction is on by default);
 /// 4. because the entry is gone, the client's next `connect` re-handshakes from scratch and the
 ///    exchange succeeds again.
 ///

@@ -439,6 +439,8 @@ fn build_sim_map(real_handshake: bool, data_addrs: &[SocketAddr]) -> PathSecretM
 
     crate::testing::init_tracing();
 
+    // Eviction on `UnknownPathSecret` (needed for peer-restart recovery) is on by default in the
+    // map builder, so it does not need to be set here.
     let builder = Map::builder()
         .with_signer(Signer::random())
         .with_capacity(50_000)
@@ -446,13 +448,7 @@ fn build_sim_map(real_handshake: bool, data_addrs: &[SocketAddr]) -> PathSecretM
         .with_subscriber(crate::event::tracing::Subscriber::default());
 
     let builder = if real_handshake {
-        builder
-            .with_advertised_data_addrs(data_addrs)
-            // Evict the local entry when the peer reports it no longer recognizes our credential
-            // (an `UnknownPathSecret`). This is what lets a node recover after its peer restarts and
-            // forgets the shared secret: the stale entry is removed, so the next `connect`
-            // re-handshakes instead of reusing dead keys. Production (`dc-tester`) sets this too.
-            .with_evict_on_unknown_path_secret(true)
+        builder.with_advertised_data_addrs(data_addrs)
     } else {
         builder
     };
@@ -1049,11 +1045,10 @@ impl Server {
     ///
     /// This is the realistic node-recovery trigger: after this, the peer still holds the old
     /// secret, so its next data packet carries a credential the server no longer recognizes. The
-    /// server replies with `UnknownPathSecret`, which (with `with_evict_on_unknown_path_secret`)
-    /// makes the peer drop its stale entry and re-handshake. A full endpoint teardown would instead
-    /// rebind new ephemeral data ports, so the peer's stale packets would hit dead ports and never
-    /// provoke the recovery — clearing the map in place is what exercises the `UnknownPathSecret`
-    /// path.
+    /// server replies with `UnknownPathSecret`, which (with eviction on, the default) makes the peer
+    /// drop its stale entry and re-handshake. A full endpoint teardown would instead rebind new
+    /// ephemeral data ports, so the peer's stale packets would hit dead ports and never provoke the
+    /// recovery — clearing the map in place is what exercises the `UnknownPathSecret` path.
     pub fn forget_secrets(&self) {
         self.endpoint.path_secret_map.drop_state();
     }
