@@ -87,6 +87,20 @@ pub fn probe() -> std::io::Result<()> {
     IoUring::new(8).map(drop)
 }
 
+/// The system page size, queried once via `sysconf(_SC_PAGESIZE)`. The buffer ring base must be
+/// aligned to this (not a hard-coded 4096) for `IORING_REGISTER_PBUF_RING` to succeed on kernels
+/// built with larger pages (commonly 16 KiB / 64 KiB on arm64).
+fn system_page_size() -> usize {
+    // SAFETY: `sysconf` is a plain libc query with no preconditions.
+    let v = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    // Fall back to 4096 if the query fails (returns -1); 4096 is the minimum on every supported arch.
+    if v <= 0 {
+        4096
+    } else {
+        v as usize
+    }
+}
+
 // ── eventfd wake source (teardown) ─────────────────────────────────────────
 
 /// An owned `eventfd(2)` used only to break the ring's idle `submit_and_wait` at teardown.
@@ -157,6 +171,12 @@ struct BufRing {
     local_tail: u16,
 }
 
+// SAFETY: `BufRing` is constructed on the calling thread (in `spawn`) and then moved onto the
+// dedicated ring thread, which is its sole accessor thereafter. The raw `ring` pointer makes it
+// `!Send` by default; the move is sound because no other thread retains a reference (the kernel reads
+// it via the registration, not via Rust aliasing).
+unsafe impl Send for BufRing {}
+
 impl BufRing {
     /// Allocate and register a buffer ring of `entries` (rounded up to a power of two) under `bgid`.
     ///
@@ -187,8 +207,11 @@ impl BufRing {
     }
 
     fn layout(entries: u16) -> std::alloc::Layout {
-        // The kernel requires the ring base to be page-aligned.
-        let page = 4096;
+        // `IORING_REGISTER_PBUF_RING` requires the ring base to be aligned to the *system* page size,
+        // which is not always 4096 (arm64 kernels are commonly built with 16 KiB or 64 KiB pages).
+        // Query it at runtime rather than hard-coding 4096, which would make registration fail with
+        // EINVAL on those kernels.
+        let page = system_page_size();
         std::alloc::Layout::from_size_align(entries as usize * 16, page)
             .expect("valid buf ring layout")
     }
@@ -232,12 +255,6 @@ impl Drop for BufRing {
 
 // ── Ring loop ─────────────────────────────────────────────────────────────
 
-/// Per-socket recv ring parameters.
-pub struct RecvRingConfig {
-    pub fd: RawFd,
-    pub depth: u16,
-}
-
 /// Build the fixed `msghdr` the multishot recv uses: only `msg_namelen` / `msg_controllen` are read
 /// by the kernel for a provided-buffer multishot recv, and they must match the reserved prefix
 /// regions so the payload lands at `payload_offset`.
@@ -265,29 +282,21 @@ fn build_eventfd_poll(efd: RawFd) -> squeue::Entry {
         .user_data(EVENTFD_TOKEN)
 }
 
-/// The recv ring thread. Owns the socket fd, the ring, the buffer ring, and the bid→descriptor map;
-/// keeps the ring full of provided buffers, reaps recv completions into `Filled` segments, and routes
-/// them. Returns when `shutdown.closed` is observed.
+/// The recv ring thread. Takes the already-created ring + registered buffer ring (built fallibly in
+/// [`spawn`] before this thread starts, so registration failures fall back cleanly), owns the socket
+/// fd and the bid→descriptor map, keeps the ring full of provided buffers, reaps recv completions into
+/// `Filled` segments, and routes them. Returns when `shutdown.closed` is observed.
 fn ring_loop<R: Router>(
     mut ring: IoUring,
-    cfg: RecvRingConfig,
+    mut buf_ring: BufRing,
+    fd: RawFd,
     pool: Pool,
     mut reuse: SyncReuseRing,
     mut router: R,
     shutdown: Arc<Shutdown>,
 ) {
-    let depth = cfg.depth.next_power_of_two().max(2);
-    let bgid = 0;
-
-    // SAFETY: the buffer ring is unregistered (below, before the ring fd drops) and outlives every
-    // published buffer; the ring fd stays open for the whole loop.
-    let mut buf_ring = match unsafe { BufRing::register(&ring, depth, bgid) } {
-        Ok(b) => b,
-        Err(err) => {
-            tracing::warn!(%err, "failed to register io_uring recv buffer ring; recv ring exiting");
-            return;
-        }
-    };
+    let depth = buf_ring.entries;
+    let bgid = buf_ring.bgid;
 
     // bid -> the descriptor currently provided to the kernel in that buffer slot. A descriptor parked
     // here is owned by the kernel until its recv CQE arrives.
@@ -310,14 +319,18 @@ fn ring_loop<R: Router>(
     }
     buf_ring.commit();
 
-    // Arm the eventfd poll (idle wake / teardown) and the single multishot recv.
+    // Arm the eventfd poll (idle wake / teardown) and the single multishot recv. On a freshly created
+    // ring the SQ has `depth` slots free, so pushing two entries cannot fail; assert it so a future
+    // change that shrinks the SQ can't silently leave the ring unarmed (no wake source / no recv).
     {
         let mut sq = ring.submission();
         // SAFETY: the eventfd outlives the ring (owned via `shutdown`); the SQE references only its fd.
-        let _ = unsafe { sq.push(&build_eventfd_poll(shutdown.efd.fd)) };
+        unsafe { sq.push(&build_eventfd_poll(shutdown.efd.fd)) }
+            .expect("SQ has room for the eventfd poll on a fresh ring");
         // SAFETY: `msg` lives on this stack frame for the whole loop; the kernel reads only its length
         // fields and the provided buffers (pinned in `bid_map`).
-        let _ = unsafe { sq.push(&build_recv_sqe(cfg.fd, &msg, bgid)) };
+        unsafe { sq.push(&build_recv_sqe(fd, &msg, bgid)) }
+            .expect("SQ has room for the multishot recv on a fresh ring");
     }
 
     let mut recv_armed = true;
@@ -335,7 +348,7 @@ fn ring_loop<R: Router>(
         if !recv_armed {
             let mut sq = ring.submission();
             // SAFETY: same invariants as the initial arm.
-            if unsafe { sq.push(&build_recv_sqe(cfg.fd, &msg, bgid)) }.is_ok() {
+            if unsafe { sq.push(&build_recv_sqe(fd, &msg, bgid)) }.is_ok() {
                 recv_armed = true;
             }
         }
@@ -559,13 +572,29 @@ where
             router,
         ));
     };
-    // Create the eventfd *before* moving `socket`/`router` into the thread, so a failure here hands
-    // them back to the caller for a clean fall-back to the syscall recv path.
+    let depth = depth.next_power_of_two().max(2);
+    let bgid = 0;
+
+    // Do ALL fallible setup here, on the calling thread, BEFORE `socket`/`router` are committed to the
+    // ring thread — so any failure (eventfd, ring creation, or buffer-ring registration) hands them
+    // back as `Recoverable` for a clean fall-back to the syscall recv path. This matters because
+    // `probe()` only proves `io_uring_setup` works (kernel >= 5.1); provided-buffer rings need >= 5.19
+    // and can also fail on `RLIMIT_MEMLOCK`, so registration can fail even after a successful probe.
     let efd = match EventFd::new() {
         Ok(efd) => efd,
         Err(err) => return Err(SpawnError::Recoverable(err, socket, router)),
     };
-    let cfg = RecvRingConfig { fd, depth };
+    let ring = match IoUring::new(depth as u32) {
+        Ok(r) => r,
+        Err(err) => return Err(SpawnError::Recoverable(err, socket, router)),
+    };
+    // SAFETY: the buffer ring is owned by the loop (moved in below), unregistered in `ring_loop`'s
+    // teardown before the ring fd drops, and outlives every published buffer.
+    let buf_ring = match unsafe { BufRing::register(&ring, depth, bgid) } {
+        Ok(b) => b,
+        Err(err) => return Err(SpawnError::Recoverable(err, socket, router)),
+    };
+
     let shutdown = Arc::new(Shutdown {
         closed: AtomicBool::new(false),
         efd,
@@ -578,14 +607,7 @@ where
             // it is dropped here when the loop returns (after the fd is no longer referenced by any
             // in-flight SQE — the loop tears the ring down before returning).
             let _socket = socket;
-            let ring = match IoUring::new(depth.next_power_of_two().max(2) as u32) {
-                Ok(r) => r,
-                Err(err) => {
-                    tracing::warn!(%err, "failed to create io_uring for recv ring; exiting");
-                    return;
-                }
-            };
-            ring_loop(ring, cfg, pool, reuse, router, ring_shutdown);
+            ring_loop(ring, buf_ring, fd, pool, reuse, router, ring_shutdown);
         });
     match join {
         Ok(join) => Ok(RecvRing {

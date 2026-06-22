@@ -303,12 +303,14 @@ where
             Err((socket, router))
         }
         Err(uring::SpawnError::Fatal(err)) => {
-            // Socket + router were already moved into the (dropped) ring thread closure, so they
-            // cannot be recovered and this socket is unserviced. Effectively unreachable after a
-            // successful probe; surface it loudly. Returning Ok leaves it unserviced rather than
-            // panicking the endpoint.
-            warn!(%err, idx, "io_uring recv ring thread spawn failed after probe succeeded; recv socket will not be serviced");
-            Ok(())
+            // All fallible io_uring setup (ring + buffer-ring registration) now happens before the
+            // thread is spawned and surfaces as `Recoverable`, so the only way to reach `Fatal` is the
+            // OS refusing to create the ring thread itself (resource exhaustion). The socket/router
+            // were already moved into the dropped closure and cannot be recovered, so this socket
+            // could never receive. Rather than silently bring up an endpoint with a dead recv path,
+            // fail fast — a thread-spawn failure at construction is a hard environment problem the
+            // operator must see.
+            panic!("io_uring recv ring thread spawn failed for recv socket {idx}: {err}");
         }
     }
 }
