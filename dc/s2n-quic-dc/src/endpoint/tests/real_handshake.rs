@@ -15,14 +15,14 @@
 //! `without_snapshots` and assert behavior via explicit checks and a data round-trip.
 
 use crate::{
-    stream::endpoint::testing::sim::{crash_group, Client, SimEndpointConfig, SERVER_PORT},
+    stream::endpoint::testing::sim::{Client, Server, SimEndpointConfig, SERVER_PORT},
     testing::{ext::*, sim, without_snapshots},
 };
 use bach::time::timeout;
 use s2n_quic_core::{stream::testing::Data, varint::VarInt};
 use std::{
     sync::{
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, Ordering},
         Arc,
     },
     time::Duration,
@@ -30,59 +30,74 @@ use std::{
 
 const TRANSFER_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Drives one real-handshake echo exchange from the client side: connect, send `body_len` bytes,
-/// read the echo back. Used by the recovery tests to exercise the data plane before and after a
-/// simulated crash.
-async fn client_echo(client: &mut Client, acceptor_id: VarInt, body_len: usize) {
+/// Opens a connection and runs one `body_len` echo exchange, returning the result rather than
+/// panicking, so recovery tests can assert on a rejected exchange.
+async fn try_client_echo(
+    client: &mut Client,
+    acceptor_id: VarInt,
+    body_len: usize,
+) -> std::io::Result<()> {
     let stream = timeout(
         TRANSFER_TIMEOUT,
         client.connect(("server", SERVER_PORT), acceptor_id),
     )
     .await
-    .expect("connect timed out")
-    .expect("connect failed");
+    .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "connect timed out"))??;
 
     let (mut reader, mut writer) = stream.into_split();
 
-    timeout(TRANSFER_TIMEOUT, async {
-        let mut body = Data::new(body_len as u64);
-        writer
-            .write_all_from_fin(&mut body)
-            .await
-            .expect("client write");
+    let mut body = Data::new(body_len as u64);
+    writer.write_all_from_fin(&mut body).await?;
 
-        let mut rx = Data::new(body_len as u64);
-        let _ = reader.read_to_end(&mut rx).await.expect("client read");
-        assert!(rx.is_finished(), "client did not receive complete echo");
-    })
-    .await
-    .expect("transfer timed out");
+    let mut rx = Data::new(body_len as u64);
+    let _ = reader.read_to_end(&mut rx).await?;
+    assert!(rx.is_finished(), "echo response was incomplete");
+    Ok(())
 }
 
-/// Server group body: accept streams and echo each one back, forever.
-async fn run_echo_server(acceptor_id: VarInt, body_len: usize) {
+/// Like [`try_client_echo`] but panics on failure — for the happy-path round trip.
+async fn client_echo(client: &mut Client, acceptor_id: VarInt, body_len: usize) {
+    timeout(
+        TRANSFER_TIMEOUT,
+        try_client_echo(client, acceptor_id, body_len),
+    )
+    .await
+    .expect("transfer timed out")
+    .expect("echo failed");
+}
+
+/// Server group body: accept streams and echo each one back, forever. Reads/echoes are best-effort
+/// (`ok()`) so that a stream left half-open by a peer that crashed mid-exchange doesn't panic the
+/// acceptor loop.
+async fn run_echo_server(acceptor_id: VarInt, body_len: usize) -> Server {
     let server = SimEndpointConfig::default().real_handshake(true).server();
     let mut acceptor = server
         .register_acceptor_channel(acceptor_id, 8)
         .expect("acceptor registration failed");
 
-    while let Some(stream) = acceptor.recv().await {
-        async move {
-            let (mut reader, mut writer) = stream.into_split();
+    // Drive the accept loop in the background so the caller keeps the `Server` handle (needed to
+    // `forget_secrets`). The handle owns the endpoint; returning it keeps everything alive.
+    let server_clone = server.clone();
+    async move {
+        while let Some(stream) = acceptor.recv().await {
+            async move {
+                let (mut reader, mut writer) = stream.into_split();
 
-            let mut rx = Data::new(body_len as u64);
-            let _ = reader.read_to_end(&mut rx).await.expect("server read");
-            assert!(rx.is_finished(), "server did not receive complete request");
+                let mut rx = Data::new(body_len as u64);
+                if reader.read_to_end(&mut rx).await.is_err() || !rx.is_finished() {
+                    return;
+                }
 
-            let mut response = Data::new(body_len as u64);
-            writer
-                .write_all_from_fin(&mut response)
-                .await
-                .expect("server write");
+                let mut response = Data::new(body_len as u64);
+                let _ = writer.write_all_from_fin(&mut response).await;
+            }
+            .primary()
+            .spawn();
         }
-        .primary()
-        .spawn();
     }
+    .spawn();
+
+    server_clone
 }
 
 /// A client performs a real PSK handshake with a server (no `insert_fake_path_pair`), then the two
@@ -99,7 +114,11 @@ fn real_handshake_stream_round_trip() {
         let acceptor_id = VarInt::from_u8(1);
 
         async move {
-            run_echo_server(acceptor_id, body_len).await;
+            // Hold the server handle for the group's lifetime so the endpoint stays alive. Park on
+            // a bounded sleep (a wakerless `pending` would trip bach's task contract); the sim ends
+            // when the primary client task completes.
+            let _server = run_echo_server(acceptor_id, body_len).await;
+            bach::time::sleep(Duration::from_secs(300)).await;
         }
         .group("server")
         .spawn();
@@ -123,62 +142,121 @@ fn real_handshake_stream_round_trip() {
     );
 }
 
-/// Node-crash recovery via the **drop + recreate** model: the client establishes a connection,
-/// then simulates a process crash ([`crash_group`] + dropping its handles) and rebuilds a fresh
-/// endpoint, map, and PSK client in the same group. The recovered client must re-handshake from a
-/// clean slate and complete a second exchange.
+/// Node-crash recovery via the **server-forgets-secrets** model — the scenario that actually
+/// exercises the `UnknownPathSecret` recovery machinery.
 ///
-/// This is the closest analogue to a real node restart: the survivor (server) keeps running, while
-/// the crashed node comes back with no memory of the prior handshake and must re-establish it.
+/// The client handshakes and exchanges data, then the server "restarts" by dropping its
+/// path-secret map ([`Server::forget_secrets`]) while keeping its endpoint and addresses. The
+/// client still holds the now-stale secret, so its next data packet carries a credential the server
+/// no longer recognizes. The chain under test:
+///
+/// 1. client sends on the stale secret → server replies `UnknownPathSecret`;
+/// 2. the client's Writer surfaces that as `ConnectionRefused` ("path secret rejected by peer");
+/// 3. handling the `UnknownPathSecret` evicts the client's stale entry (the map was built with
+///    `with_evict_on_unknown_path_secret(true)`);
+/// 4. because the entry is gone, the client's next `connect` re-handshakes from scratch and the
+///    exchange succeeds again.
+///
+/// A full endpoint teardown would *not* test this: the restarted server would rebind new ephemeral
+/// data ports, so the stale packets would hit dead ports and never provoke `UnknownPathSecret`.
+/// Forgetting the secrets in place is what drives the recovery path.
 #[test]
-fn real_handshake_recovers_after_client_crash() {
+fn real_handshake_recovers_after_server_forgets_secrets() {
     let _no_snapshots = without_snapshots();
 
     let body_len = 16 * 1024usize;
-    let exchanges = Arc::new(AtomicUsize::new(0));
-    let exchanges_check = exchanges.clone();
+
+    // Phase coordination across the two groups.
+    let established = Arc::new(AtomicBool::new(false)); // client → server: first exchange done
+    let forgotten = Arc::new(AtomicBool::new(false)); // server → client: secrets dropped
+    let recovered = Arc::new(AtomicBool::new(false)); // client: final assertion
+    let rejected = Arc::new(AtomicBool::new(false)); // client: observed the stale-secret rejection
+
+    let recovered_check = recovered.clone();
+    let rejected_check = rejected.clone();
 
     sim(|| {
         let acceptor_id = VarInt::from_u8(1);
 
-        async move {
-            run_echo_server(acceptor_id, body_len).await;
+        // ── Server ────────────────────────────────────────────────────────
+        {
+            let established = established.clone();
+            let forgotten = forgotten.clone();
+            async move {
+                let server = run_echo_server(acceptor_id, body_len).await;
+
+                // Wait for the client's first exchange, then forget all path secrets — the
+                // in-place "restart".
+                while !established.load(Ordering::SeqCst) {
+                    bach::time::sleep(Duration::from_millis(10)).await;
+                }
+                server.forget_secrets();
+                tracing::info!("server: dropped path secrets (simulated restart)");
+                forgotten.store(true, Ordering::SeqCst);
+
+                bach::time::sleep(Duration::from_secs(300)).await;
+            }
+            .group("server")
+            .spawn();
         }
-        .group("server")
-        .spawn();
 
-        let exchanges = exchanges.clone();
+        // ── Client ────────────────────────────────────────────────────────
+        let established = established.clone();
+        let forgotten = forgotten.clone();
+        let recovered = recovered.clone();
+        let rejected = rejected.clone();
         async move {
-            // First exchange establishes the handshake.
-            {
-                let mut client = SimEndpointConfig::default().real_handshake(true).client();
-                client_echo(&mut client, acceptor_id, body_len).await;
-                exchanges.fetch_add(1, Ordering::SeqCst);
-                tracing::info!("client: first exchange complete; simulating crash");
+            let mut client = SimEndpointConfig::default().real_handshake(true).client();
 
-                // Drop the client handle (releasing the strong Arc<Endpoint>) and clear the harness
-                // caches so the next `client()` rebuilds everything from scratch.
-                drop(client);
-                crash_group();
+            // 1. Establish and prove data flows.
+            client_echo(&mut client, acceptor_id, body_len).await;
+            established.store(true, Ordering::SeqCst);
+            tracing::info!("client: first exchange complete");
+
+            // 2. Wait until the server has forgotten the secret.
+            while !forgotten.load(Ordering::SeqCst) {
+                bach::time::sleep(Duration::from_millis(10)).await;
             }
 
-            // Recovery: a brand-new client in the same group, with a fresh empty map, must
-            // re-handshake with the still-running server and complete a second exchange.
-            let mut client = SimEndpointConfig::default().real_handshake(true).client();
-            client_echo(&mut client, acceptor_id, body_len).await;
-            exchanges.fetch_add(1, Ordering::SeqCst);
+            // 3. An exchange on the stale secret must be rejected. The server returns
+            //    UnknownPathSecret, which the Writer surfaces as ConnectionRefused and which evicts
+            //    the client's stale entry. (Retry a few times: the very first post-restart packet
+            //    races the eviction, and a fresh connect right after eviction re-handshakes.)
+            let mut attempts = 0;
+            loop {
+                attempts += 1;
+                match try_client_echo(&mut client, acceptor_id, body_len).await {
+                    Ok(()) => {
+                        // Re-handshake happened and the exchange recovered.
+                        tracing::info!(attempts, "client: recovered after re-handshake");
+                        recovered.store(true, Ordering::SeqCst);
+                        break;
+                    }
+                    Err(e) => {
+                        tracing::info!(attempts, error = %e, "client: exchange rejected (expected)");
+                        rejected.store(true, Ordering::SeqCst);
+                        assert!(
+                            attempts < 10,
+                            "client never recovered after the server forgot its secrets"
+                        );
+                    }
+                }
+            }
 
-            tracing::info!("real_handshake_recovers_after_client_crash passed");
+            tracing::info!("real_handshake_recovers_after_server_forgets_secrets passed");
         }
         .group("client")
         .primary()
         .spawn();
     });
 
-    assert_eq!(
-        exchanges_check.load(Ordering::SeqCst),
-        2,
-        "client did not complete both the initial and post-crash exchanges"
+    assert!(
+        rejected_check.load(Ordering::SeqCst),
+        "the stale-secret exchange was never rejected — the UnknownPathSecret path did not fire"
+    );
+    assert!(
+        recovered_check.load(Ordering::SeqCst),
+        "client did not recover after the server forgot its secrets"
     );
 }
 

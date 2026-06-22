@@ -323,7 +323,7 @@ pub(super) async fn server<
     subscriber: Subscriber,
     on_ready: tokio::sync::oneshot::Sender<Result<SocketAddr, Error>>,
 ) {
-    let mut server = match Server::bind::<Provider, Subscriber, Event>(
+    let server = match Server::bind::<Provider, Subscriber, Event>(
         address,
         map.clone(),
         tls_materials_provider,

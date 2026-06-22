@@ -219,28 +219,6 @@ fn get_or_create_group_endpoint(config: SimEndpointConfig) -> Arc<Endpoint> {
     ep
 }
 
-/// Simulates a node crash for the current Bach group by discarding its cached endpoint and PSK
-/// handshake providers.
-///
-/// The next `Server::new` / `Client::new` / `Peer::new` in this group rebuilds everything from
-/// scratch — fresh sockets, a fresh path-secret map, and (in real-handshake mode) fresh handshake
-/// providers — exactly as a restarted process would. The caller must also drop its own
-/// `Server`/`Client` handle (which holds the strong `Arc<Endpoint>`); this only clears the harness's
-/// cached references.
-///
-/// Note: the peer's map still holds the secrets from the pre-crash handshake. Recovery therefore
-/// exercises the realistic path where the survivor must re-handshake with a peer that has forgotten
-/// the shared secret — the same situation a real redeploy produces.
-pub fn crash_group() {
-    let group_id = bach::group::current().id();
-    SIM_ENDPOINT_BY_GROUP.with(|r| {
-        r.borrow_mut().remove(&group_id);
-    });
-    SIM_PSK_BY_GROUP.with(|r| {
-        r.borrow_mut().remove(&group_id);
-    });
-}
-
 /// Stands up the PSK handshake providers for a real-handshake group, sharing the endpoint's
 /// path-secret map so completed handshakes are immediately visible to the data plane.
 ///
@@ -468,7 +446,13 @@ fn build_sim_map(real_handshake: bool, data_addrs: &[SocketAddr]) -> PathSecretM
         .with_subscriber(crate::event::tracing::Subscriber::default());
 
     let builder = if real_handshake {
-        builder.with_advertised_data_addrs(data_addrs)
+        builder
+            .with_advertised_data_addrs(data_addrs)
+            // Evict the local entry when the peer reports it no longer recognizes our credential
+            // (an `UnknownPathSecret`). This is what lets a node recover after its peer restarts and
+            // forgets the shared secret: the stale entry is removed, so the next `connect`
+            // re-handshakes instead of reusing dead keys. Production (`dc-tester`) sets this too.
+            .with_evict_on_unknown_path_secret(true)
     } else {
         builder
     };
@@ -1013,6 +997,7 @@ impl Default for Peer {
 ///
 /// Acceptors are registered via [`Server::register_acceptor_channel`], which
 /// returns an [`mpmc::Receiver<Stream>`] that yields accepted streams.
+#[derive(Clone)]
 pub struct Server {
     endpoint: Arc<Endpoint>,
 }
@@ -1057,6 +1042,20 @@ impl Server {
     /// recv-credit conservation under reader teardown / cancellation.
     pub fn recv_credit_pool(&self) -> crate::sync::Arc<crate::credit::Pool> {
         self.endpoint.recv_credit_pool.clone()
+    }
+
+    /// Simulates a server restart that forgets all path secrets, *without* tearing down the
+    /// endpoint or its sockets (so the data and handshake addresses are unchanged).
+    ///
+    /// This is the realistic node-recovery trigger: after this, the peer still holds the old
+    /// secret, so its next data packet carries a credential the server no longer recognizes. The
+    /// server replies with `UnknownPathSecret`, which (with `with_evict_on_unknown_path_secret`)
+    /// makes the peer drop its stale entry and re-handshake. A full endpoint teardown would instead
+    /// rebind new ephemeral data ports, so the peer's stale packets would hit dead ports and never
+    /// provoke the recovery — clearing the map in place is what exercises the `UnknownPathSecret`
+    /// path.
+    pub fn forget_secrets(&self) {
+        self.endpoint.path_secret_map.drop_state();
     }
 
     /// Register a channel-based acceptor for incoming streams.
