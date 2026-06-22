@@ -962,10 +962,17 @@ where
         });
     }
 
-    // Assign sync reuse pools to their workers.
+    // Assign sync reuse pools to their workers — but only to workers that actually own recv sockets.
+    // The reuse pool exists solely to feed `socket_recv` tasks (and its `recycle_drain` task drains
+    // descriptors back into it), so a recv_io worker with no sockets has no use for one. Skipping the
+    // assignment means such a worker spawns *nothing* (no `socket_recv`, no `recycle_drain`), so the
+    // executor can spin its thread down. This is the common case under the io_uring recv backend,
+    // where rings own every socket on their own threads and the recv_io workers are left empty.
     for (recv_io_idx, recycle_pool) in recycle_pools.into_iter() {
         let worker_id = layout.recv_io[recv_io_idx.as_usize()];
-        workers[worker_id].recycle_pool = Some(recycle_pool);
+        if !workers[worker_id].recv_sockets.is_empty() {
+            workers[worker_id].recycle_pool = Some(recycle_pool);
+        }
     }
 
     // Background worker — invalidation validation + future housekeeping.
