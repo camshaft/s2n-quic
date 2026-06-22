@@ -338,7 +338,7 @@ impl Runner {
             let Some(shared) = shared.upgrade() else {
                 return;
             };
-            if tasks.slots.iter().all(Option::is_none) {
+            if tasks.is_empty() {
                 heartbeat.sleeping.store(true, Ordering::Release);
                 let mut guard = shared.state.lock();
                 while guard.spawns.is_empty() {
@@ -382,6 +382,7 @@ impl Runner {
 struct Tasks {
     slots: Vec<Option<Task>>,
     free: Vec<usize>,
+    active: usize,
 }
 
 impl Tasks {
@@ -389,6 +390,7 @@ impl Tasks {
         Self {
             slots: Vec::new(),
             free: Vec::new(),
+            active: 0,
         }
     }
 
@@ -398,6 +400,11 @@ impl Tasks {
         } else {
             self.slots.push(Some(task));
         }
+        self.active += 1;
+    }
+
+    fn is_empty(&self) -> bool {
+        self.active == 0
     }
 
     fn after_spawn(&mut self) {
@@ -428,6 +435,7 @@ impl Tasks {
                     eprintln!("task {idx} done ({})", task.location);
                     *slot = None;
                     self.free.push(idx);
+                    self.active -= 1;
                 }
             }
         }
