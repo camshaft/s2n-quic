@@ -26,8 +26,22 @@
 //! the recv [`descriptor`]s themselves — each descriptor reserves a fixed
 //! [recv prefix](descriptor::RECV_PREFIX_LEN) ahead of its payload, sized so the kernel's
 //! `[io_uring_recvmsg_out | name | control | payload]` write lands the payload at the descriptor's
-//! `payload_offset`. So a completion is turned into a `Filled` with **no copy**: parse the header,
-//! copy the small `sockaddr`/cmsg out, and publish the payload in place.
+//! `payload_offset`. So a completion is turned into a `Filled` **without an application-side copy**:
+//! parse the header, copy the small `sockaddr`/cmsg out, and use the payload where it already sits.
+//!
+//! # What "no copy" means here (and what it does not)
+//!
+//! This is *provided-buffer recv*, not kernel zero-copy recv. The kernel still performs the usual
+//! `recvmsg` copy out of the socket's `skb` into the buffer we provided; what we avoid is the
+//! *second* copy the pipeline would otherwise make to stage those bytes into a `descriptor`. So
+//! "no copy" / "zero-copy" throughout this module means **no extra application-side copy** — the
+//! payload is delivered in the descriptor the kernel wrote into.
+//!
+//! True kernel zero-copy recv (`IORING_OP_RECV_ZC` + a registered interface queue, kernel ≥ 6.11)
+//! would DMA NIC data straight into pages mapped into our address space, eliminating that remaining
+//! in-kernel `skb`→buffer copy — but it needs NIC/driver support (header-data split, RX-queue
+//! steering) and a different buffer-refill model, so it is deliberately out of scope here and left
+//! as future work.
 //!
 //! # Buffer lifetime & the bid map
 //!
@@ -405,7 +419,8 @@ fn ring_loop<R: Router>(
                 }
 
                 // Successful completion: the kernel wrote `[recvmsg_out | name | control | payload]`
-                // into the descriptor's recv region. Finalize into a `Filled` (zero copy) and route.
+                // into the descriptor's recv region. Finalize into a `Filled` (no application-side
+                // copy — the payload is used in place) and route.
                 match finalize(unfilled, res as usize) {
                     Some(segments) => {
                         for segment in segments {
@@ -444,7 +459,9 @@ fn ring_loop<R: Router>(
     drop(bid_map);
 }
 
-/// Turn a successful recv completion into `Filled` segments, zero-copy. `total` is the CQE byte count
+/// Turn a successful recv completion into `Filled` segments without an application-side payload copy
+/// (the payload is used in place; see the module docs on what "no copy" does and does not mean).
+/// `total` is the CQE byte count
 /// — the length of the `[recvmsg_out | name | control | payload]` the kernel wrote into the recv
 /// region. Returns `None` (dropping the descriptor) on a parse/length anomaly.
 fn finalize(
@@ -488,7 +505,8 @@ fn finalize(
 
     // Publish the payload in place via `fill_with`: the closure does not touch the payload iov (the
     // kernel already wrote it) — it only stamps the addr/ecn and returns the received length, so the
-    // resulting `Filled` spans exactly the received payload at `payload_offset`. Zero copy.
+    // resulting `Filled` spans exactly the received payload at `payload_offset` — no application-side
+    // copy.
     let result = unfilled.fill_with(|addr, cmsg_out, _iov| {
         if let Some(remote) = remote {
             addr.set(remote);

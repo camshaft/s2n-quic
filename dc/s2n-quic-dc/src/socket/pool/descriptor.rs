@@ -529,7 +529,9 @@ impl<R: Recycler> Unfilled<R> {
     /// the [recv prefix](RECV_PREFIX_LEN) and the byte length spanning the prefix plus the full
     /// payload capacity. The kernel writes `[recvmsg_out | name | control | payload]` here, landing the
     /// payload at `payload_offset` (see the [`Descriptor`] docs), so a later [`fill_with`](Self::fill_with)
-    /// with the parsed length yields a [`Filled`] over exactly the received payload — zero copy.
+    /// with the parsed length yields a [`Filled`] over exactly the received payload, with no
+    /// application-side copy (the in-kernel `skb`→buffer copy still happens — this is provided-buffer
+    /// recv, not kernel zero-copy recv).
     ///
     /// Returned as a raw pointer + length (not a slice) because the region is uninitialized until the
     /// kernel fills it and ownership stays with the descriptor (parked in the ring's in-flight map for
