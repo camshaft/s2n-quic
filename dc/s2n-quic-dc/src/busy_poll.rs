@@ -444,7 +444,10 @@ impl Tasks {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{sync::mpsc, time::{Duration, Instant}};
+    use std::{
+        sync::mpsc,
+        time::{Duration, Instant},
+    };
 
     fn wait_until(timeout: Duration, mut pred: impl FnMut() -> bool) -> bool {
         let deadline = Instant::now() + timeout;
@@ -487,7 +490,7 @@ mod tests {
         assert!(handle.heartbeat.sleeping.load(Ordering::Acquire));
 
         handle.spawn(async move {
-            let _ = sender.send(());
+            sender.send(()).expect("channel send failed");
         });
 
         receiver.recv_timeout(Duration::from_secs(1)).unwrap();
