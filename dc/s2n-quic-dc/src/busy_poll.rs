@@ -444,13 +444,7 @@ impl Tasks {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{
-        sync::{
-            atomic::{AtomicBool, Ordering},
-            Arc,
-        },
-        time::Duration,
-    };
+    use std::time::Duration;
 
     #[test]
     fn starts_idle_until_spawned() {
