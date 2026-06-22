@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::tracing::*;
-use parking_lot::Mutex;
+use parking_lot::{Condvar, Mutex};
 use std::{
     fmt,
     future::Future,
@@ -10,7 +10,7 @@ use std::{
     panic::Location,
     pin::Pin,
     sync::{
-        atomic::{AtomicI32, AtomicI64, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU64, AtomicUsize, Ordering},
         Arc, Weak,
     },
     task::Context,
@@ -40,6 +40,7 @@ pub struct Heartbeat {
     /// Linux thread ID (set by the worker on startup). Used for signal-based thread dumps.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     tid: AtomicI32,
+    sleeping: AtomicBool,
 }
 
 impl Heartbeat {
@@ -48,6 +49,7 @@ impl Heartbeat {
             counter: AtomicU64::new(0),
             current_task: AtomicI64::new(-1),
             tid: AtomicI32::new(0),
+            sleeping: AtomicBool::new(false),
         }
     }
 }
@@ -72,7 +74,8 @@ impl Pool {
                     std::thread::sleep(timeout);
                     for (worker_id, hb) in heartbeats.iter().enumerate() {
                         let current = hb.counter.load(Ordering::Relaxed);
-                        if current == prev[worker_id] && current > 0 {
+                        let sleeping = hb.sleeping.load(Ordering::Acquire);
+                        if current == prev[worker_id] && current > 0 && !sleeping {
                             let task_idx = hb.current_task.load(Ordering::Relaxed);
                             error!(
                                 "[watchdog] worker {worker_id} stuck in task {task_idx} \
@@ -128,24 +131,28 @@ impl ops::Deref for Pool {
     }
 }
 
-#[derive(Clone)]
 pub struct Handle {
-    state: Arc<Mutex<State>>,
+    shared: Arc<Shared>,
     heartbeat: Arc<Heartbeat>,
 }
 
 impl Handle {
     pub fn new(worker_id: usize) -> (Self, Runner) {
-        let state = Arc::new(Mutex::new(State {
-            spawns: Vec::with_capacity(16),
-        }));
+        let shared = Arc::new(Shared {
+            state: Mutex::new(State {
+                spawns: Vec::with_capacity(16),
+                closed: false,
+            }),
+            spawn_cv: Condvar::new(),
+            handles: AtomicUsize::new(1),
+        });
         let heartbeat = Arc::new(Heartbeat::new());
         let handle = Self {
-            state: state.clone(),
+            shared: shared.clone(),
             heartbeat: heartbeat.clone(),
         };
         let runner = Runner {
-            state: Arc::downgrade(&state),
+            shared: Arc::downgrade(&shared),
             heartbeat,
             worker_id,
         };
@@ -179,7 +186,27 @@ impl Handle {
     where
         F: FnOnce(Spawner) + Send + 'static,
     {
-        self.state.lock().spawns.push(Spawn::new(f));
+        self.shared.state.lock().spawns.push(Spawn::new(f));
+        self.shared.spawn_cv.notify_one();
+    }
+}
+
+impl Clone for Handle {
+    fn clone(&self) -> Self {
+        self.shared.handles.fetch_add(1, Ordering::AcqRel);
+        Self {
+            shared: self.shared.clone(),
+            heartbeat: self.heartbeat.clone(),
+        }
+    }
+}
+
+impl Drop for Handle {
+    fn drop(&mut self) {
+        if self.shared.handles.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.shared.state.lock().closed = true;
+            self.shared.spawn_cv.notify_all();
+        }
     }
 }
 
@@ -228,6 +255,13 @@ impl<'a> Spawner<'a> {
 
 struct State {
     spawns: Vec<Spawn>,
+    closed: bool,
+}
+
+struct Shared {
+    state: Mutex<State>,
+    spawn_cv: Condvar,
+    handles: AtomicUsize,
 }
 
 /// A `Send` factory that produces a (possibly `!Send`) `Task` on the runner thread.
@@ -259,14 +293,14 @@ struct Task {
 
 #[must_use]
 pub struct Runner {
-    state: Weak<Mutex<State>>,
+    shared: Weak<Shared>,
     heartbeat: Arc<Heartbeat>,
     worker_id: usize,
 }
 
 impl Runner {
     pub fn run(self) {
-        let state = self.state;
+        let shared = self.shared;
         let heartbeat = self.heartbeat;
         let worker_id = self.worker_id;
 
@@ -301,23 +335,35 @@ impl Runner {
                 1_000_000
             };
 
-            for _ in 0..ITERATIONS {
-                tasks.poll(&mut cx, &heartbeat);
-            }
+            let Some(shared) = shared.upgrade() else {
+                return;
+            };
+            if tasks.is_empty() {
+                heartbeat.sleeping.store(true, Ordering::Release);
+                let mut guard = shared.state.lock();
+                while guard.spawns.is_empty() {
+                    if guard.closed {
+                        return;
+                    }
+                    shared.spawn_cv.wait(&mut guard);
+                }
+                heartbeat.sleeping.store(false, Ordering::Release);
+                core::mem::swap(&mut spawns, &mut guard.spawns);
+            } else {
+                for _ in 0..ITERATIONS {
+                    tasks.poll(&mut cx, &heartbeat);
+                }
 
-            // Yield to allow other threads (especially SCHED_OTHER threads like Tokio runtime)
-            // to make progress when running with RT scheduling
-            #[cfg(target_os = "linux")]
-            unsafe {
-                libc::sched_yield();
-            }
+                // Yield to allow other threads (especially SCHED_OTHER threads like Tokio runtime)
+                // to make progress when running with RT scheduling
+                #[cfg(target_os = "linux")]
+                unsafe {
+                    libc::sched_yield();
+                }
 
-            if let Some(state) = state.upgrade() {
-                if let Some(mut guard) = state.try_lock() {
+                if let Some(mut guard) = shared.state.try_lock() {
                     core::mem::swap(&mut spawns, &mut guard.spawns);
                 }
-            } else {
-                return;
             }
 
             if spawns.is_empty() {
@@ -336,6 +382,7 @@ impl Runner {
 struct Tasks {
     slots: Vec<Option<Task>>,
     free: Vec<usize>,
+    active: usize,
 }
 
 impl Tasks {
@@ -343,6 +390,7 @@ impl Tasks {
         Self {
             slots: Vec::new(),
             free: Vec::new(),
+            active: 0,
         }
     }
 
@@ -352,6 +400,11 @@ impl Tasks {
         } else {
             self.slots.push(Some(task));
         }
+        self.active += 1;
+    }
+
+    fn is_empty(&self) -> bool {
+        self.active == 0
     }
 
     fn after_spawn(&mut self) {
@@ -382,10 +435,72 @@ impl Tasks {
                     eprintln!("task {idx} done ({})", task.location);
                     *slot = None;
                     self.free.push(idx);
+                    self.active -= 1;
                 }
             }
         }
         heartbeat.current_task.store(-1, Ordering::Relaxed);
         heartbeat.counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{
+        sync::mpsc,
+        time::{Duration, Instant},
+    };
+
+    fn wait_until(timeout: Duration, mut pred: impl FnMut() -> bool) -> bool {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if pred() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        pred()
+    }
+
+    #[test]
+    fn starts_idle_until_spawned() {
+        let (handle, runner) = Handle::new(0);
+        let heartbeat = handle.heartbeat.clone();
+        let worker = std::thread::spawn(move || runner.run());
+
+        let sleeping = wait_until(Duration::from_secs(1), || {
+            heartbeat.sleeping.load(Ordering::Relaxed)
+        });
+        assert!(sleeping);
+        assert_eq!(heartbeat.counter.load(Ordering::Relaxed), 0);
+
+        drop(handle);
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn wakes_for_new_spawn() {
+        let (handle, runner) = Handle::new(0);
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let worker = std::thread::spawn(move || runner.run());
+
+        let sleeping = wait_until(Duration::from_secs(1), || {
+            handle.heartbeat.sleeping.load(Ordering::Relaxed)
+        });
+        assert!(sleeping);
+
+        handle.spawn(async move {
+            sender.send(()).expect("channel send failed");
+        });
+
+        receiver.recv_timeout(Duration::from_secs(1)).unwrap();
+        let awake = wait_until(Duration::from_secs(1), || {
+            !handle.heartbeat.sleeping.load(Ordering::Relaxed)
+        });
+        assert!(awake);
+        drop(handle);
+        worker.join().unwrap();
     }
 }
