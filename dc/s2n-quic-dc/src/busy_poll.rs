@@ -131,7 +131,6 @@ impl ops::Deref for Pool {
     }
 }
 
-#[derive(Clone)]
 pub struct Handle {
     shared: Arc<Shared>,
     heartbeat: Arc<Heartbeat>,
@@ -336,20 +335,10 @@ impl Runner {
                 1_000_000
             };
 
-            for _ in 0..ITERATIONS {
-                tasks.poll(&mut cx, &heartbeat);
-            }
-
-            // Yield to allow other threads (especially SCHED_OTHER threads like Tokio runtime)
-            // to make progress when running with RT scheduling
-            #[cfg(target_os = "linux")]
-            unsafe {
-                libc::sched_yield();
-            }
-
             let Some(shared) = shared.upgrade() else {
                 return;
             };
+
             if tasks.is_empty() {
                 let mut guard = shared.state.lock();
                 heartbeat.sleeping.store(true, Ordering::Relaxed);
@@ -361,8 +350,21 @@ impl Runner {
                 }
                 heartbeat.sleeping.store(false, Ordering::Relaxed);
                 core::mem::swap(&mut spawns, &mut guard.spawns);
-            } else if let Some(mut guard) = shared.state.try_lock() {
-                core::mem::swap(&mut spawns, &mut guard.spawns);
+            } else {
+                for _ in 0..ITERATIONS {
+                    tasks.poll(&mut cx, &heartbeat);
+                }
+
+                // Yield to allow other threads (especially SCHED_OTHER threads like Tokio runtime)
+                // to make progress when running with RT scheduling
+                #[cfg(target_os = "linux")]
+                unsafe {
+                    libc::sched_yield();
+                }
+
+                if let Some(mut guard) = shared.state.try_lock() {
+                    core::mem::swap(&mut spawns, &mut guard.spawns);
+                }
             }
 
             if spawns.is_empty() {
@@ -428,62 +430,62 @@ impl Tasks {
                     *slot = None;
                     self.free.push(idx);
                 }
-
-                fn is_empty(&self) -> bool {
-                    self.slots.iter().all(Option::is_none)
-                }
-            }
-
-            #[cfg(test)]
-            mod tests {
-                use super::*;
-                use std::{
-                    sync::{
-                        atomic::{AtomicBool, Ordering},
-                        Arc,
-                    },
-                    time::Duration,
-                };
-
-                #[test]
-                fn starts_idle_until_spawned() {
-                    let (handle, runner) = Handle::new(0);
-                    let heartbeat = handle.heartbeat.clone();
-                    let worker = std::thread::spawn(move || runner.run());
-
-                    std::thread::sleep(Duration::from_millis(20));
-                    assert_eq!(heartbeat.counter.load(Ordering::Relaxed), 0);
-
-                    drop(handle);
-                    worker.join().unwrap();
-                }
-
-                #[test]
-                fn wakes_for_new_spawn() {
-                    let (handle, runner) = Handle::new(0);
-                    let completed = Arc::new(AtomicBool::new(false));
-                    let completed_task = completed.clone();
-                    let worker = std::thread::spawn(move || runner.run());
-
-                    std::thread::sleep(Duration::from_millis(20));
-                    handle.spawn(async move {
-                        completed_task.store(true, Ordering::Release);
-                    });
-
-                    for _ in 0..100 {
-                        if completed.load(Ordering::Acquire) {
-                            break;
-                        }
-                        std::thread::sleep(Duration::from_millis(2));
-                    }
-
-                    assert!(completed.load(Ordering::Acquire));
-                    drop(handle);
-                    worker.join().unwrap();
-                }
             }
         }
         heartbeat.current_task.store(-1, Ordering::Relaxed);
         heartbeat.counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn is_empty(&self) -> bool {
+        self.slots.iter().all(Option::is_none)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{
+        sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        },
+        time::Duration,
+    };
+
+    #[test]
+    fn starts_idle_until_spawned() {
+        let (handle, runner) = Handle::new(0);
+        let heartbeat = handle.heartbeat.clone();
+        let worker = std::thread::spawn(move || runner.run());
+
+        std::thread::sleep(Duration::from_millis(20));
+        assert_eq!(heartbeat.counter.load(Ordering::Relaxed), 0);
+
+        drop(handle);
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn wakes_for_new_spawn() {
+        let (handle, runner) = Handle::new(0);
+        let completed = Arc::new(AtomicBool::new(false));
+        let completed_task = completed.clone();
+        let worker = std::thread::spawn(move || runner.run());
+
+        std::thread::sleep(Duration::from_millis(20));
+        handle.spawn(async move {
+            completed_task.store(true, Ordering::Release);
+        });
+
+        for _ in 0..100 {
+            if completed.load(Ordering::Acquire) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+
+        assert!(completed.load(Ordering::Acquire));
+        drop(handle);
+        worker.join().unwrap();
     }
 }
