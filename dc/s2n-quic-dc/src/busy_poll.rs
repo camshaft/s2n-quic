@@ -74,7 +74,7 @@ impl Pool {
                     std::thread::sleep(timeout);
                     for (worker_id, hb) in heartbeats.iter().enumerate() {
                         let current = hb.counter.load(Ordering::Relaxed);
-                        let sleeping = hb.sleeping.load(Ordering::Relaxed);
+                        let sleeping = hb.sleeping.load(Ordering::Acquire);
                         if current == prev[worker_id] && current > 0 && !sleeping {
                             let task_idx = hb.current_task.load(Ordering::Relaxed);
                             error!(
@@ -193,7 +193,7 @@ impl Handle {
 
 impl Clone for Handle {
     fn clone(&self) -> Self {
-        self.shared.handles.fetch_add(1, Ordering::Relaxed);
+        self.shared.handles.fetch_add(1, Ordering::AcqRel);
         Self {
             shared: self.shared.clone(),
             heartbeat: self.heartbeat.clone(),
@@ -338,17 +338,16 @@ impl Runner {
             let Some(shared) = shared.upgrade() else {
                 return;
             };
-
             if tasks.slots.iter().all(Option::is_none) {
+                heartbeat.sleeping.store(true, Ordering::Release);
                 let mut guard = shared.state.lock();
-                heartbeat.sleeping.store(true, Ordering::Relaxed);
                 while guard.spawns.is_empty() {
                     if guard.closed {
                         return;
                     }
                     shared.spawn_cv.wait(&mut guard);
                 }
-                heartbeat.sleeping.store(false, Ordering::Relaxed);
+                heartbeat.sleeping.store(false, Ordering::Release);
                 core::mem::swap(&mut spawns, &mut guard.spawns);
             } else {
                 for _ in 0..ITERATIONS {
