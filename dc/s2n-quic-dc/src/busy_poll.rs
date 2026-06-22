@@ -467,7 +467,7 @@ mod tests {
         let worker = std::thread::spawn(move || runner.run());
 
         let sleeping = wait_until(Duration::from_secs(1), || {
-            heartbeat.sleeping.load(Ordering::Acquire)
+            heartbeat.sleeping.load(Ordering::Relaxed)
         });
         assert!(sleeping);
         assert_eq!(heartbeat.counter.load(Ordering::Relaxed), 0);
@@ -483,7 +483,7 @@ mod tests {
         let worker = std::thread::spawn(move || runner.run());
 
         let sleeping = wait_until(Duration::from_secs(1), || {
-            handle.heartbeat.sleeping.load(Ordering::Acquire)
+            handle.heartbeat.sleeping.load(Ordering::Relaxed)
         });
         assert!(sleeping);
 
@@ -492,6 +492,10 @@ mod tests {
         });
 
         receiver.recv_timeout(Duration::from_secs(1)).unwrap();
+        let awake = wait_until(Duration::from_secs(1), || {
+            !handle.heartbeat.sleeping.load(Ordering::Relaxed)
+        });
+        assert!(awake);
         drop(handle);
         worker.join().unwrap();
     }
