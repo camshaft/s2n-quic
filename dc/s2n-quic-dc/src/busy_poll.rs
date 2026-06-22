@@ -446,21 +446,31 @@ mod tests {
     use super::*;
     use std::{sync::mpsc, time::{Duration, Instant}};
 
+    fn wait_until(timeout: Duration, mut pred: impl FnMut() -> bool) -> bool {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if pred() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        pred()
+    }
+
     #[test]
     fn starts_idle_until_spawned() {
         let (handle, runner) = Handle::new(0);
         let heartbeat = handle.heartbeat.clone();
         let worker = std::thread::spawn(move || runner.run());
 
-        let deadline = Instant::now() + Duration::from_secs(1);
-        while !heartbeat.sleeping.load(Ordering::Acquire) && Instant::now() < deadline {
-            std::thread::yield_now();
-        }
+        let sleeping = wait_until(Duration::from_secs(1), || {
+            heartbeat.sleeping.load(Ordering::Acquire)
+        });
+        assert!(sleeping);
         assert!(heartbeat.sleeping.load(Ordering::Acquire));
         assert_eq!(heartbeat.counter.load(Ordering::Relaxed), 0);
 
-        handle.shared.state.lock().closed = true;
-        handle.shared.spawn_cv.notify_all();
+        drop(handle);
         worker.join().unwrap();
     }
 
@@ -470,10 +480,10 @@ mod tests {
         let (sender, receiver) = mpsc::sync_channel(1);
         let worker = std::thread::spawn(move || runner.run());
 
-        let deadline = Instant::now() + Duration::from_secs(1);
-        while !handle.heartbeat.sleeping.load(Ordering::Acquire) && Instant::now() < deadline {
-            std::thread::yield_now();
-        }
+        let sleeping = wait_until(Duration::from_secs(1), || {
+            handle.heartbeat.sleeping.load(Ordering::Acquire)
+        });
+        assert!(sleeping);
         assert!(handle.heartbeat.sleeping.load(Ordering::Acquire));
 
         handle.spawn(async move {
