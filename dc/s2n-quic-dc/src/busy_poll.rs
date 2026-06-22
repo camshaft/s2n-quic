@@ -141,10 +141,10 @@ impl Handle {
         let shared = Arc::new(Shared {
             state: Mutex::new(State {
                 spawns: Vec::with_capacity(16),
+                closed: false,
             }),
             spawn_cv: Condvar::new(),
             handles: AtomicUsize::new(1),
-            closed: AtomicBool::new(false),
         });
         let heartbeat = Arc::new(Heartbeat::new());
         let handle = Self {
@@ -203,8 +203,8 @@ impl Clone for Handle {
 
 impl Drop for Handle {
     fn drop(&mut self) {
-        if self.shared.handles.fetch_sub(1, Ordering::AcqRel) == 1 {
-            self.shared.closed.store(true, Ordering::Release);
+        if self.shared.handles.fetch_sub(1, Ordering::Release) == 1 {
+            self.shared.state.lock().closed = true;
             self.shared.spawn_cv.notify_all();
         }
     }
@@ -255,13 +255,13 @@ impl<'a> Spawner<'a> {
 
 struct State {
     spawns: Vec<Spawn>,
+    closed: bool,
 }
 
 struct Shared {
     state: Mutex<State>,
     spawn_cv: Condvar,
     handles: AtomicUsize,
-    closed: AtomicBool,
 }
 
 /// A `Send` factory that produces a (possibly `!Send`) `Task` on the runner thread.
@@ -343,7 +343,7 @@ impl Runner {
                 let mut guard = shared.state.lock();
                 heartbeat.sleeping.store(true, Ordering::Relaxed);
                 while guard.spawns.is_empty() {
-                    if shared.closed.load(Ordering::Acquire) {
+                    if guard.closed {
                         return;
                     }
                     shared.spawn_cv.wait(&mut guard);
@@ -444,7 +444,7 @@ impl Tasks {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
+    use std::{sync::mpsc, time::{Duration, Instant}};
 
     #[test]
     fn starts_idle_until_spawned() {
@@ -452,33 +452,35 @@ mod tests {
         let heartbeat = handle.heartbeat.clone();
         let worker = std::thread::spawn(move || runner.run());
 
-        std::thread::sleep(Duration::from_millis(20));
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !heartbeat.sleeping.load(Ordering::Acquire) && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert!(heartbeat.sleeping.load(Ordering::Acquire));
         assert_eq!(heartbeat.counter.load(Ordering::Relaxed), 0);
 
-        drop(handle);
+        handle.shared.state.lock().closed = true;
+        handle.shared.spawn_cv.notify_all();
         worker.join().unwrap();
     }
 
     #[test]
     fn wakes_for_new_spawn() {
         let (handle, runner) = Handle::new(0);
-        let completed = Arc::new(AtomicBool::new(false));
-        let completed_task = completed.clone();
+        let (sender, receiver) = mpsc::sync_channel(1);
         let worker = std::thread::spawn(move || runner.run());
 
-        std::thread::sleep(Duration::from_millis(20));
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !handle.heartbeat.sleeping.load(Ordering::Acquire) && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert!(handle.heartbeat.sleeping.load(Ordering::Acquire));
+
         handle.spawn(async move {
-            completed_task.store(true, Ordering::Release);
+            let _ = sender.send(());
         });
 
-        for _ in 0..100 {
-            if completed.load(Ordering::Acquire) {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(2));
-        }
-
-        assert!(completed.load(Ordering::Acquire));
+        receiver.recv_timeout(Duration::from_secs(1)).unwrap();
         drop(handle);
         worker.join().unwrap();
     }
