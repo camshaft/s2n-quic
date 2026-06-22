@@ -193,7 +193,7 @@ impl Handle {
 
 impl Clone for Handle {
     fn clone(&self) -> Self {
-        self.shared.handles.fetch_add(1, Ordering::AcqRel);
+        self.shared.handles.fetch_add(1, Ordering::Relaxed);
         Self {
             shared: self.shared.clone(),
             heartbeat: self.heartbeat.clone(),
@@ -339,7 +339,7 @@ impl Runner {
                 return;
             };
 
-            if tasks.is_empty() {
+            if tasks.slots.iter().all(Option::is_none) {
                 let mut guard = shared.state.lock();
                 heartbeat.sleeping.store(true, Ordering::Relaxed);
                 while guard.spawns.is_empty() {
@@ -436,9 +436,6 @@ impl Tasks {
         heartbeat.counter.fetch_add(1, Ordering::Relaxed);
     }
 
-    fn is_empty(&self) -> bool {
-        self.slots.iter().all(Option::is_none)
-    }
 }
 
 #[cfg(test)]
