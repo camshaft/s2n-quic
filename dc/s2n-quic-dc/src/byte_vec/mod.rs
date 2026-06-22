@@ -857,6 +857,21 @@ impl From<&'static str> for ByteVec {
     }
 }
 
+impl From<ByteVec> for VecDeque<Bytes> {
+    fn from(value: ByteVec) -> Self {
+        let mut additional = value.additional;
+        additional.push_front(value.head);
+        additional
+    }
+}
+
+impl From<ByteVec> for Vec<Bytes> {
+    fn from(value: ByteVec) -> Self {
+        let mut v: VecDeque<Bytes> = value.into();
+        v.into()
+    }
+}
+
 impl ops::Index<usize> for ByteVec {
     type Output = Bytes;
 
