@@ -860,7 +860,9 @@ impl From<&'static str> for ByteVec {
 impl From<ByteVec> for VecDeque<Bytes> {
     fn from(value: ByteVec) -> Self {
         let mut additional = value.additional;
-        additional.push_front(value.head);
+        if !value.head.is_empty() {
+            additional.push_front(value.head);
+        }
         additional
     }
 }
