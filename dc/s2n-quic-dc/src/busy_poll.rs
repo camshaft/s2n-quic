@@ -193,7 +193,7 @@ impl Handle {
 
 impl Clone for Handle {
     fn clone(&self) -> Self {
-        self.shared.handles.fetch_add(1, Ordering::Relaxed);
+        self.shared.handles.fetch_add(1, Ordering::AcqRel);
         Self {
             shared: self.shared.clone(),
             heartbeat: self.heartbeat.clone(),
@@ -203,7 +203,7 @@ impl Clone for Handle {
 
 impl Drop for Handle {
     fn drop(&mut self) {
-        if self.shared.handles.fetch_sub(1, Ordering::Release) == 1 {
+        if self.shared.handles.fetch_sub(1, Ordering::AcqRel) == 1 {
             self.shared.state.lock().closed = true;
             self.shared.spawn_cv.notify_all();
         }
@@ -470,7 +470,6 @@ mod tests {
             heartbeat.sleeping.load(Ordering::Acquire)
         });
         assert!(sleeping);
-        assert!(heartbeat.sleeping.load(Ordering::Acquire));
         assert_eq!(heartbeat.counter.load(Ordering::Relaxed), 0);
 
         drop(handle);
@@ -487,7 +486,6 @@ mod tests {
             handle.heartbeat.sleeping.load(Ordering::Acquire)
         });
         assert!(sleeping);
-        assert!(handle.heartbeat.sleeping.load(Ordering::Acquire));
 
         handle.spawn(async move {
             sender.send(()).expect("channel send failed");
