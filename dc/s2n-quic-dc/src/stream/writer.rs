@@ -2253,9 +2253,11 @@ impl Inner {
         // submit→wire latency is visible. PN is not assigned yet.
         {
             use crate::endpoint::frame_trace::{self, Direction, DropReason, FrameRecord};
-            frame_trace::record(&FrameRecord::from_header(
+            frame_trace::record(|| FrameRecord::from_header(
                 Direction::AppSend,
                 &frame.header,
+                // AppSend is pre-assembly: no PN assigned yet, so no sender scope.
+                None,
                 None,
                 DropReason::None,
                 *self.path_secret_entry.id(),

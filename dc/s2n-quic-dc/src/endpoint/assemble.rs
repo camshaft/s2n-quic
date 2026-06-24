@@ -370,10 +370,11 @@ where
                             use crate::endpoint::frame_trace::{
                                 self, Direction, DropReason, FrameRecord,
                             };
-                            frame_trace::record(&FrameRecord::from_header(
+                            frame_trace::record(|| FrameRecord::from_header(
                                 Direction::SendCancelled,
                                 &frame.header,
                                 Some(context.next_packet_number),
+                                Some(source_sender_id.as_varint()),
                                 DropReason::None,
                                 context.credentials.id,
                             ));
@@ -427,10 +428,11 @@ where
                         use crate::endpoint::frame_trace::{
                             self, Direction, DropReason, FrameRecord,
                         };
-                        frame_trace::record(&FrameRecord::from_header(
+                        frame_trace::record(|| FrameRecord::from_header(
                             Direction::Outbound,
                             &frame.header,
                             Some(context.next_packet_number),
+                            Some(source_sender_id.as_varint()),
                             DropReason::None,
                             context.credentials.id,
                         ));
@@ -530,9 +532,10 @@ where
             // taken here before ACK/Ping stripping below mutates `packet_frames`.
             {
                 use crate::endpoint::frame_trace::{self, DropReason, PacketEvent, PacketRecord};
-                frame_trace::record(&PacketRecord::new(
+                frame_trace::record(|| PacketRecord::new(
                     PacketEvent::Sent,
                     packet_number,
+                    source_sender_id.as_varint(),
                     context.credentials.id,
                     encoded_len as u32,
                     packet_frames.len() as u16,

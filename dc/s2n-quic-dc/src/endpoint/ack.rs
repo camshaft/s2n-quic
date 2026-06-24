@@ -152,9 +152,10 @@ pub(crate) fn process_ack<Clk, Rand>(
             // the shell→tail hop; `frame_count` is the frames completing directly under this PN.
             {
                 use crate::endpoint::frame_trace::{self, DropReason, PacketEvent, PacketRecord};
-                frame_trace::record(&PacketRecord::new(
+                frame_trace::record(|| PacketRecord::new(
                     PacketEvent::Acked,
                     num,
+                    context.sender_idx.as_varint(),
                     context.credentials.id,
                     0,
                     packet.frames.len() as u16,
@@ -177,10 +178,11 @@ pub(crate) fn process_ack<Clk, Rand>(
                         use crate::endpoint::frame_trace::{
                             self, Direction, DropReason, FrameRecord,
                         };
-                        frame_trace::record(&FrameRecord::from_header(
+                        frame_trace::record(|| FrameRecord::from_header(
                             Direction::AckCompleted,
                             &entry.header,
                             Some(num),
+                            Some(context.sender_idx.as_varint()),
                             DropReason::None,
                             context.credentials.id,
                         ));
@@ -231,10 +233,11 @@ pub(crate) fn process_ack<Clk, Rand>(
                 counters.on_acked_frame(&entry.header);
                 {
                     use crate::endpoint::frame_trace::{self, Direction, DropReason, FrameRecord};
-                    frame_trace::record(&FrameRecord::from_header(
+                    frame_trace::record(|| FrameRecord::from_header(
                         Direction::AckCompleted,
                         &entry.header,
                         Some(PacketNumber::as_varint(probe_pn)),
+                        Some(context.sender_idx.as_varint()),
                         DropReason::None,
                         context.credentials.id,
                     ));
@@ -598,9 +601,10 @@ fn detect_loss<Rand>(
         // not distinguished per packet.)
         {
             use crate::endpoint::frame_trace::{self, DropReason, PacketEvent, PacketRecord};
-            frame_trace::record(&PacketRecord::new(
+            frame_trace::record(|| PacketRecord::new(
                 PacketEvent::Lost,
                 num,
+                context.sender_idx.as_varint(),
                 context.credentials.id,
                 tx_info.sent_bytes as u32,
                 packet.frames.len() as u16,
@@ -641,10 +645,11 @@ fn detect_loss<Rand>(
                 });
                 {
                     use crate::endpoint::frame_trace::{self, Direction, DropReason, FrameRecord};
-                    frame_trace::record(&FrameRecord::from_header(
+                    frame_trace::record(|| FrameRecord::from_header(
                         Direction::AckCancelled,
                         &entry.header,
                         Some(num),
+                        Some(context.sender_idx.as_varint()),
                         DropReason::None,
                         context.credentials.id,
                     ));
@@ -678,10 +683,11 @@ fn detect_loss<Rand>(
                 });
                 {
                     use crate::endpoint::frame_trace::{self, Direction, DropReason, FrameRecord};
-                    frame_trace::record(&FrameRecord::from_header(
+                    frame_trace::record(|| FrameRecord::from_header(
                         Direction::AckCancelled,
                         &entry.header,
                         Some(num),
+                        Some(context.sender_idx.as_varint()),
                         DropReason::None,
                         context.credentials.id,
                     ));
@@ -708,10 +714,11 @@ fn detect_loss<Rand>(
             });
             {
                 use crate::endpoint::frame_trace::{self, Direction, DropReason, FrameRecord};
-                frame_trace::record(&FrameRecord::from_header(
+                frame_trace::record(|| FrameRecord::from_header(
                     Direction::AckLost,
                     &entry.header,
                     Some(num),
+                    Some(context.sender_idx.as_varint()),
                     DropReason::None,
                     context.credentials.id,
                 ));

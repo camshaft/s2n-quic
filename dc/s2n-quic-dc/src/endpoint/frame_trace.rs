@@ -211,9 +211,18 @@ const FLAG_INIT: u8 = 1 << 4;
 #[event(namespace = "s2n_quic_dc::frame")]
 #[repr(C)]
 pub struct FrameRecord {
-    /// Packet number, or [`NO_PACKET_NUMBER`] when not yet assigned.
+    /// Packet number, or [`NO_PACKET_NUMBER`] when not yet assigned. A packet number is only unique
+    /// within a `(cred_id, sender_id)` pair — it is the local counter of whichever endpoint assigned
+    /// it — so the join key for a packet is `(cred_id, sender_id, packet_number)`, never the PN alone.
     #[event(key)]
     pub packet_number: u64,
+    /// The id of the sender that assigned [`packet_number`](Self::packet_number): our `LocalSenderId`
+    /// for frames we sent (`Outbound`/`SendCancelled`) or had acked/lost (`AckCompleted`/`AckLost`/
+    /// `AckCancelled`), and the peer's `source_sender_id` for frames we received (`Inbound`/
+    /// `InboundFastPath`/`RxDropped`). Both endpoints name the same logical sender for a given packet,
+    /// so this correlates a PN across hosts. Zero when no PN is in scope (`AppSend`/`AppRecv`).
+    #[event(key)]
+    pub sender_id: u64,
     /// Primary stream/control offset for the frame type (see [`FrameRecord::from_header`]).
     #[event(unit = "bytes")]
     pub offset: u64,
@@ -251,11 +260,18 @@ pub struct FrameRecord {
 #[event(namespace = "s2n_quic_dc::packet")]
 #[repr(C)]
 pub struct PacketRecord {
-    /// The packet number this record is about.
+    /// The packet number this record is about. Unique only within `(cred_id, sender_id)` — see
+    /// [`FrameRecord::sender_id`]. The full join key is `(cred_id, sender_id, packet_number)`.
     #[event(key)]
     pub packet_number: u64,
+    /// The id of the sender that assigned [`packet_number`](Self::packet_number) (and
+    /// [`linked_pn`](Self::linked_pn), which is in the same sender's space). See
+    /// [`FrameRecord::sender_id`].
+    #[event(key)]
+    pub sender_id: u64,
     /// For [`PacketEvent::Sent`] probes, the shell PN this packet was probed from; else
-    /// [`NO_PACKET_NUMBER`]. Links a retransmit back to the transmission it replaced.
+    /// [`NO_PACKET_NUMBER`]. In the same sender space as [`packet_number`](Self::packet_number).
+    /// Links a retransmit back to the transmission it replaced.
     pub linked_pn: u64,
     /// Canonicalized credential id (endpoint bit cleared), matching [`FrameRecord::cred_id`].
     #[event(key)]
@@ -298,18 +314,21 @@ fn canonicalize_cred(mut cred_id: [u8; 16]) -> [u8; 16] {
 }
 
 impl FrameRecord {
-    /// Builds a [`FrameRecord`] from a frame header. `pn` is the packet number if known; `reason`
-    /// tags a [`Direction::RxDropped`] record (pass [`DropReason::None`] otherwise); `cred_id` is the
-    /// 16-byte credential id of the path (all zeros when none is in scope).
+    /// Builds a [`FrameRecord`] from a frame header. `pn` is the packet number if known, scoped to
+    /// `sender_id` (the sender that assigned it — see [`FrameRecord::sender_id`]); pass both `None`
+    /// when no PN is in scope. `reason` tags a [`Direction::RxDropped`] record (pass
+    /// [`DropReason::None`] otherwise); `cred_id` is the 16-byte credential id of the path.
     pub(crate) fn from_header(
         dir: Direction,
         header: &Header,
         pn: Option<VarInt>,
+        sender_id: Option<VarInt>,
         reason: DropReason,
         cred_id: crate::credentials::Id,
     ) -> FrameRecord {
         let mut rec = FrameRecord {
             packet_number: pn.map_or(NO_PACKET_NUMBER, |p| p.as_u64()),
+            sender_id: sender_id.map_or(0, |s| s.as_u64()),
             offset: 0,
             dump_id: 0,
             source_queue_id: 0,
@@ -472,6 +491,8 @@ impl FrameRecord {
     ) -> FrameRecord {
         FrameRecord {
             packet_number: NO_PACKET_NUMBER,
+            // No PN at the stream/app layer, so no sender scope either.
+            sender_id: 0,
             offset,
             dump_id: 0,
             source_queue_id: source_queue_id.as_u64(),
@@ -494,6 +515,7 @@ impl PacketRecord {
     pub(crate) fn new(
         event: PacketEvent,
         pn: VarInt,
+        sender_id: VarInt,
         cred_id: crate::credentials::Id,
         sent_bytes: u32,
         frame_count: u16,
@@ -502,6 +524,7 @@ impl PacketRecord {
     ) -> PacketRecord {
         PacketRecord {
             packet_number: pn.as_u64(),
+            sender_id: sender_id.as_u64(),
             linked_pn: linked_pn.map_or(NO_PACKET_NUMBER, |p| p.as_u64()),
             cred_id: canonicalize_cred(*cred_id),
             sent_bytes,
@@ -513,17 +536,22 @@ impl PacketRecord {
 }
 
 /// Records one event ([`FrameRecord`] or [`PacketRecord`]) into the global recorder. A no-op —
-/// folded away entirely, with the event never constructed — when the diagnostic is disabled (the
-/// production default), since the call sites wrap the construction in [`super::dbg::on_enabled`].
+/// folded away entirely — when the diagnostic is disabled (the production default).
+///
+/// The event is built by the `make` closure, which runs *inside* the [`super::dbg::on_enabled`]
+/// gate, so when the diagnostic is compiled out (`ENABLED` is a `false` const) the optimizer strips
+/// the closure and the event is never constructed — no field-mapping work on the hot path, even in
+/// unoptimized builds. Call sites pass the constructor as a closure:
+/// `record(|| FrameRecord::from_header(...))`.
 ///
 /// `backbeat`'s capture starts disabled; arming it is the application's job. In production set
 /// `BACKBEAT_ENABLE=1` (or call [`backbeat::global::enable`] once at startup); the crate's own tests
 /// enable it in [`crate::testing::init_tracing`]. Keeping the enable out of this hot path avoids a
-/// per-record atomic — `record` is just `backbeat::global::record`, which itself folds to one
-/// relaxed load when capture is off.
+/// per-record atomic — once `make` has built the event, `record` is just `backbeat::global::record`,
+/// which itself folds to one relaxed load when capture is off.
 #[inline]
-pub(crate) fn record<E: backbeat::Event>(event: &E) {
-    super::dbg::on_enabled(|| backbeat::global::record(event));
+pub(crate) fn record<E: backbeat::Event>(make: impl FnOnce() -> E) {
+    super::dbg::on_enabled(|| backbeat::global::record(&make()));
 }
 
 /// Requests an asynchronous dump of the recorder's rings to disk. A no-op when disabled.

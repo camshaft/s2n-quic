@@ -960,7 +960,7 @@ impl Inner {
         // is the peer's. `offset` is the start of the range just delivered.
         if bytes_read > 0 {
             use crate::endpoint::frame_trace::{self, Direction, DropReason, FrameRecord};
-            frame_trace::record(&FrameRecord::stream(
+            frame_trace::record(|| FrameRecord::stream(
                 Direction::AppRecv,
                 self.dest_queue_id,
                 self.stream_rx.queue_id(),
@@ -1129,7 +1129,7 @@ impl Inner {
                             use crate::endpoint::frame_trace::{
                                 self, Direction, DropReason, FrameRecord,
                             };
-                            frame_trace::record(&FrameRecord::stream(
+                            frame_trace::record(|| FrameRecord::stream(
                                 Direction::RxDropped,
                                 self.dest_queue_id,
                                 self.stream_rx.queue_id(),
@@ -1835,9 +1835,11 @@ impl Inner {
         // with the Outbound record at assembly. PN is not assigned yet.
         {
             use crate::endpoint::frame_trace::{self, Direction, DropReason, FrameRecord};
-            frame_trace::record(&FrameRecord::from_header(
+            frame_trace::record(|| FrameRecord::from_header(
                 Direction::AppSend,
                 &frame.header,
+                // AppSend is pre-assembly: no PN assigned yet, so no sender scope.
+                None,
                 None,
                 DropReason::None,
                 *self.path_secret_entry.id(),
