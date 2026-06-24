@@ -81,6 +81,24 @@ thread_local! {
 
     static SIM_PARAMS_REGISTRY: RefCell<HashMap<SocketAddr, ApplicationParams>> =
         RefCell::new(HashMap::new());
+
+    // Real-handshake mode only: the per-group PSK handshake providers. The client drives outbound
+    // `connect` handshakes; the server (present for server/peer groups bound to `SERVER_PORT`)
+    // accepts inbound ones. Both share the group endpoint's path-secret map, so a completed
+    // handshake is immediately visible to the data plane. Keyed by Bach group id, mirroring
+    // `SIM_ENDPOINT_BY_GROUP`.
+    static SIM_PSK_BY_GROUP: RefCell<HashMap<u64, SimHandshake>> =
+        RefCell::new(HashMap::new());
+}
+
+/// Per-group PSK handshake state for real-handshake mode. Holding it keeps the client usable and
+/// the server accept loop alive; dropping it (e.g. for a node-crash test) tears the handshake
+/// endpoints down.
+#[derive(Clone)]
+struct SimHandshake {
+    client: crate::psk::client::Provider,
+    /// `Some` for server/peer groups; the provider owns the `DropGuard` that stops the accept loop.
+    _server: Option<crate::psk::server::Provider>,
 }
 
 fn register_endpoint_map(data_addrs: &[SocketAddr], map: PathSecretMap, params: ApplicationParams) {
@@ -177,23 +195,85 @@ impl MonitorHostAddr {
 /// upgrade the cached [`Weak`] reference and return the same [`Endpoint`].
 fn get_or_create_group_endpoint(config: SimEndpointConfig) -> Arc<Endpoint> {
     let group_id = bach::group::current().id();
+    if let Some(ep) =
+        SIM_ENDPOINT_BY_GROUP.with(|r| r.borrow().get(&group_id).and_then(|weak| weak.upgrade()))
+    {
+        return ep;
+    }
+
+    let real_handshake = config.real_handshake;
+    // The well-known port the handshake listener (if any) binds in real mode. A server/peer group
+    // hints `SERVER_PORT`; a pure client hints port 0 (ephemeral) and never listens.
+    let handshake_port = config.bind_addr.port();
+
+    let acceptor_registry = acceptor::Registry::new();
+    let ep = Arc::new(setup_sim_endpoint(config, acceptor_registry));
     SIM_ENDPOINT_BY_GROUP.with(|r| {
-        let mut map = r.borrow_mut();
-        if let Some(weak) = map.get(&group_id) {
-            if let Some(ep) = weak.upgrade() {
-                return ep;
-            }
-        }
-        let path_secret_map = crate::path::secret::map::testing::new(50_000);
-        let acceptor_registry = acceptor::Registry::new();
-        let ep = Arc::new(setup_sim_endpoint(
-            config,
-            path_secret_map,
-            acceptor_registry,
-        ));
-        map.insert(group_id, Arc::downgrade(&ep));
-        ep
-    })
+        r.borrow_mut().insert(group_id, Arc::downgrade(&ep));
+    });
+
+    if real_handshake {
+        create_group_handshake(group_id, &ep, handshake_port);
+    }
+
+    ep
+}
+
+/// Stands up the PSK handshake providers for a real-handshake group, sharing the endpoint's
+/// path-secret map so completed handshakes are immediately visible to the data plane.
+///
+/// A server/peer group (one whose hint port is [`SERVER_PORT`]) also runs a handshake accept loop
+/// on that port; a pure client only builds the outbound client. Stored per group so `connect` can
+/// reuse the client and so a node-crash test can drop the whole thing.
+fn create_group_handshake(group_id: u64, endpoint: &Arc<Endpoint>, handshake_port: u16) {
+    use crate::{
+        psk,
+        testing::{NoopSubscriber, TestTlsProvider},
+    };
+    use s2n_quic::provider::tls::Provider as _;
+
+    let map = endpoint.path_secret_map.clone();
+    let ip = endpoint.data_addrs[0].ip();
+
+    // Server groups listen for inbound handshakes on the well-known port.
+    let server = if handshake_port == SERVER_PORT {
+        let tls = TestTlsProvider {}.start_server().expect("server tls");
+        let provider = psk::server::Provider::builder()
+            .start_blocking(
+                SocketAddr::new(ip, SERVER_PORT),
+                tls,
+                NoopSubscriber {},
+                map.clone(),
+            )
+            .expect("psk server start");
+        Some(provider)
+    } else {
+        None
+    };
+
+    let tls = TestTlsProvider {}.start_client().expect("client tls");
+    let client = psk::client::Provider::builder()
+        // Recover immediately after a peer restart instead of waiting out the post-handshake
+        // cooldown — node-crash tests expect prompt re-establishment.
+        .with_success_jitter(core::time::Duration::ZERO)
+        .start(
+            SocketAddr::new(ip, 0),
+            map,
+            tls,
+            NoopSubscriber {},
+            crate::testing::server_name(),
+        )
+        .expect("psk client start");
+
+    SIM_PSK_BY_GROUP.with(|r| {
+        r.borrow_mut().insert(
+            group_id,
+            SimHandshake {
+                client,
+                _server: server,
+            },
+        );
+    });
 }
 
 // ── SimEndpointConfig ─────────────────────────────────────────────────────────
@@ -256,6 +336,17 @@ pub struct SimEndpointConfig {
 
     /// Send credit pool config. Defaults to [`crate::credit::Config::default`].
     pub send_credit_pool_config: crate::credit::Config,
+
+    /// When true, this endpoint establishes path secrets via a *real* QUIC/TLS PSK handshake
+    /// (driven through the bach-backed s2n-quic IO provider) instead of the deterministic
+    /// `insert_fake_path_pair` shortcut.
+    ///
+    /// In this mode the path-secret map advertises the endpoint's data-plane recv addresses via the
+    /// `DcDataAddresses` transport parameter (mirroring production `dc-tester` wiring), a PSK
+    /// handshake server listens on [`SERVER_PORT`], and `connect` drives the production
+    /// [`crate::psk`] client handshake. This pays the TLS compute cost, so it is opt-in and reserved
+    /// for tests that specifically exercise handshake / node-recovery behavior.
+    pub real_handshake: bool,
 }
 
 impl Default for SimEndpointConfig {
@@ -281,6 +372,7 @@ impl Default for SimEndpointConfig {
             dead_peer_cooldown: crate::stream::endpoint::DEFAULT_DEAD_PEER_COOLDOWN,
             recv_credit_pool_config: crate::credit::Config::default(),
             send_credit_pool_config: crate::credit::Config::default(),
+            real_handshake: false,
         }
     }
 }
@@ -316,6 +408,13 @@ impl SimEndpointConfig {
         self
     }
 
+    /// Establish path secrets via a real PSK handshake instead of `insert_fake_path_pair`.
+    /// See [`SimEndpointConfig::real_handshake`].
+    pub fn real_handshake(mut self, enabled: bool) -> Self {
+        self.real_handshake = enabled;
+        self
+    }
+
     pub fn server(self) -> Server {
         Server::with_config(self)
     }
@@ -327,6 +426,34 @@ impl SimEndpointConfig {
     pub fn peer(self) -> Peer {
         Peer::with_config(self)
     }
+}
+
+/// Builds the path-secret map for a sim endpoint.
+///
+/// Both modes use a bach clock and a group-deterministic signer (via [`Signer::random`], which is
+/// seeded from the bach group id in simulation). Real-handshake mode additionally advertises the
+/// data-plane recv addresses so the `DcDataAddresses` transport parameter carries them through the
+/// handshake — the same wiring production (`dc-tester`) uses.
+fn build_sim_map(real_handshake: bool, data_addrs: &[SocketAddr]) -> PathSecretMap {
+    use crate::path::secret::{stateless_reset::Signer, Map};
+
+    crate::testing::init_tracing();
+
+    // Eviction on `UnknownPathSecret` (needed for peer-restart recovery) is on by default in the
+    // map builder, so it does not need to be set here.
+    let builder = Map::builder()
+        .with_signer(Signer::random())
+        .with_capacity(50_000)
+        .with_clock(crate::time::bach::Clock::default())
+        .with_subscriber(crate::event::tracing::Subscriber::default());
+
+    let builder = if real_handshake {
+        builder.with_advertised_data_addrs(data_addrs)
+    } else {
+        builder
+    };
+
+    builder.build().unwrap()
 }
 
 // ── setup_sim_endpoint ────────────────────────────────────────────────────────
@@ -344,7 +471,6 @@ impl SimEndpointConfig {
 /// without the caller having to pass it explicitly.
 pub fn setup_sim_endpoint(
     config: SimEndpointConfig,
-    path_secret_map: PathSecretMap,
     acceptor_registry: acceptor::Registry<Stream>,
 ) -> Endpoint {
     let SimEndpointConfig {
@@ -363,6 +489,7 @@ pub fn setup_sim_endpoint(
         dead_peer_cooldown,
         recv_credit_pool_config,
         send_credit_pool_config,
+        real_handshake,
     } = config;
 
     assert!(
@@ -373,6 +500,15 @@ pub fn setup_sim_endpoint(
         submission_shards.is_power_of_two(),
         "submission_shards must be a power of two"
     );
+
+    // In real-handshake mode the well-known port carried in `bind_addr` is reserved for the PSK
+    // handshake listener (created by the caller), so the data-plane sockets always bind ephemeral
+    // ports — mirroring production, where the handshake and data planes use distinct sockets.
+    let bind_addr = if real_handshake {
+        SocketAddr::new(bind_addr.ip(), 0)
+    } else {
+        bind_addr
+    };
 
     // Bind send sockets using the synchronous constructor so this function can
     // be called before the Bach runtime drains async tasks.
@@ -423,6 +559,20 @@ pub fn setup_sim_endpoint(
 
     let send_pool = Pool::new(u16::MAX);
     let recv_pool = Pool::new(u16::MAX);
+
+    // Build the path-secret map now that the recv sockets are bound, mirroring production
+    // (`dc-tester`): read the data-plane recv addresses from the bound sockets, then in
+    // real-handshake mode stamp them as the advertised `DcDataAddresses` so the peer learns where to
+    // send data after the handshake. In fake-handshake mode the addresses are supplied directly by
+    // `insert_fake_path_pair`, so the map needs no advertised addrs.
+    let data_addrs: Vec<SocketAddr> = recv_sockets
+        .iter()
+        .map(|s| {
+            s.local_addr()
+                .expect("recv socket must have a local address")
+        })
+        .collect();
+    let path_secret_map = build_sim_map(real_handshake, &data_addrs);
 
     // Update path secret map so it knows how many sender slots to allocate.
     path_secret_map.set_socket_sender_count(num_send_sockets);
@@ -651,6 +801,37 @@ pub fn lookup_sim_map(addr: SocketAddr) -> Option<PathSecretMap> {
     SIM_MAP_REGISTRY.with(|r| r.borrow().get(&addr).cloned())
 }
 
+/// Returns the current Bach group's PSK handshake state, if real-handshake mode is enabled for it.
+fn group_handshake() -> Option<SimHandshake> {
+    let group_id = bach::group::current().id();
+    SIM_PSK_BY_GROUP.with(|r| r.borrow().get(&group_id).cloned())
+}
+
+/// Drives a real PSK handshake against `peer_addr` (the peer's well-known handshake port) and
+/// returns the resulting client-side path-secret entry.
+///
+/// The handshake populates the shared map keyed by `peer_addr`; the data plane addresses the peer
+/// advertised arrive on the entry's `peer_data_addrs` via the `DcDataAddresses` transport parameter,
+/// so the returned entry is immediately usable by the Writer/Reader (which target `peer_data_addrs`,
+/// not the entry key).
+async fn connect_real(
+    endpoint: &Arc<Endpoint>,
+    handshake: &SimHandshake,
+    peer_addr: SocketAddr,
+) -> io::Result<Arc<crate::path::secret::map::Entry>> {
+    handshake
+        .client
+        .handshake_with(peer_addr, crate::testing::server_name())
+        .await?;
+
+    endpoint.path_secret_map.get_raw(peer_addr).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("handshake completed but no path-secret entry for {peer_addr}"),
+        )
+    })
+}
+
 async fn connect_stream<A>(
     endpoint: &Arc<Endpoint>,
     peer: A,
@@ -675,8 +856,16 @@ where
         peer_addr.set_port(SERVER_PORT);
     }
 
-    // Auto-insert path secrets (idempotent: re-uses existing entry if present).
-    let path_secret_entry = connect(endpoint, peer_addr);
+    // Establish path secrets. In real-handshake mode (the group has a PSK client registered) this
+    // drives a genuine QUIC/TLS handshake against the peer's well-known handshake port, which
+    // populates the shared map exactly as production does. Otherwise it falls back to the
+    // deterministic `insert_fake_path_pair` shortcut.
+    let path_secret_entry = if let Some(handshake) = group_handshake() {
+        connect_real(endpoint, &handshake, peer_addr).await?
+    } else {
+        // Auto-insert path secrets (idempotent: re-uses existing entry if present).
+        connect(endpoint, peer_addr)
+    };
 
     let now = endpoint.clock.now();
     if path_secret_entry.is_dead_during_cooldown(now, endpoint.dead_peer_cooldown) {
@@ -808,6 +997,7 @@ impl Default for Peer {
 ///
 /// Acceptors are registered via [`Server::register_acceptor_channel`], which
 /// returns an [`mpmc::Receiver<Stream>`] that yields accepted streams.
+#[derive(Clone)]
 pub struct Server {
     endpoint: Arc<Endpoint>,
 }
@@ -852,6 +1042,19 @@ impl Server {
     /// recv-credit conservation under reader teardown / cancellation.
     pub fn recv_credit_pool(&self) -> crate::sync::Arc<crate::credit::Pool> {
         self.endpoint.recv_credit_pool.clone()
+    }
+
+    /// Simulates a server restart that forgets all path secrets, *without* tearing down the
+    /// endpoint or its sockets (so the data and handshake addresses are unchanged).
+    ///
+    /// This is the realistic node-recovery trigger: after this, the peer still holds the old
+    /// secret, so its next data packet carries a credential the server no longer recognizes. The
+    /// server replies with `UnknownPathSecret`, which (with eviction on, the default) makes the peer
+    /// drop its stale entry and re-handshake. A full endpoint teardown would instead rebind new
+    /// ephemeral data ports, so the peer's stale packets would hit dead ports and never provoke the
+    /// recovery — clearing the map in place is what exercises the `UnknownPathSecret` path.
+    pub fn forget_secrets(&self) {
+        self.endpoint.path_secret_map.drop_state();
     }
 
     /// Register a channel-based acceptor for incoming streams.

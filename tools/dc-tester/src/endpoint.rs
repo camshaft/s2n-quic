@@ -63,10 +63,10 @@ pub fn create(
     let signer = Signer::new(b"dc-tester");
     let clock = s2n_quic_dc::time::tokio::Clock::default();
     let subscriber = s2n_quic_dc::event::tracing::Subscriber::default();
+    // Eviction on `UnknownPathSecret` is enabled by default in the map builder.
     let map = secret::Map::builder()
         .with_signer(signer)
         .with_capacity(50_000)
-        .with_evict_on_unknown_path_secret(true)
         .with_advertised_data_addrs(&data_addrs)
         .with_clock(clock)
         .with_subscriber(subscriber)

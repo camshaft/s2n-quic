@@ -79,7 +79,12 @@ where
         Self {
             signer: None,
             capacity: None,
-            should_evict_on_unknown_path_secret: false,
+            // Default to evicting on an authenticated `UnknownPathSecret`. This is required for a
+            // node to recover after its peer restarts and forgets the shared secret: without it the
+            // stale entry stays cached and every send is rejected until the entry ages out (~24h).
+            // The packet is authenticated against the peer's stateless-reset token, so only the
+            // genuine peer can trigger an eviction — it is not a spoofable DoS vector.
+            should_evict_on_unknown_path_secret: true,
             advertised_peer_info: None,
             advertised_data_addrs: None,
             clock: None,
