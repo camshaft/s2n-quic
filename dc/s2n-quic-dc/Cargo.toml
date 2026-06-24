@@ -12,7 +12,7 @@ exclude = ["corpus.tar.gz"]
 
 [features]
 default = ["tokio"]
-testing = ["dep:bach", "bolero-generator", "s2n-quic-core/testing", "s2n-quic-platform/testing", "s2n-quic/unstable-provider-io-testing", "tracing-subscriber", "tracing"]
+testing = ["dep:bach", "backbeat/bach", "bolero-generator", "s2n-quic-core/testing", "s2n-quic-platform/testing", "s2n-quic/unstable-provider-io-testing", "tracing-subscriber", "tracing"]
 tracing = []
 tokio = ["tokio/io-util", "tokio/net", "tokio/rt-multi-thread", "tokio/time"]
 metric-tracing = []
@@ -29,6 +29,10 @@ loom = ["dep:loom"]
 arrayvec = "0.7"
 atomic-waker = "1"
 aws-lc-rs = "1.12"
+# Flight recorder backing the frame/packet trace (see endpoint::frame_trace). The `capture` runtime
+# is always compiled in; emission is gated at the call sites behind `endpoint::dbg::on_enabled`, so a
+# release build that never enables the diagnostic constructs nothing and spawns no dumper thread.
+backbeat = "0.1"
 bach = { version = "0.1.0", features = ["net", "net-monitor", "tokio-compat"], optional = true }
 bitflags = "2"
 bolero-generator = { version = "0.13", default-features = false, optional = true }
@@ -65,6 +69,12 @@ loom = { version = "0.7", features = ["checkpoint", "futures"], optional = true 
 io-uring = "0.7"
 
 [dev-dependencies]
+# Enable backbeat's `bach` feature for test builds so the flight recorder's timestamps come from
+# bach's simulated clock under `sim()` (deterministic, host-independent). CI runs the crate's own
+# tests without `--features testing`, so this dev-dependency — not the `testing` feature wiring
+# above — is what arms the bach-aware clock during `cargo nextest`. Cargo unifies it with the normal
+# `backbeat` dep. Mirrors how `bach` itself is both an optional dep and a dev-dependency here.
+backbeat = { version = "0.1", features = ["bach"] }
 bach = { version = "0.1.0", features = ["net", "net-monitor", "tokio-compat"] }
 s2n-tls-tokio = "0.3"
 bolero = "0.13"

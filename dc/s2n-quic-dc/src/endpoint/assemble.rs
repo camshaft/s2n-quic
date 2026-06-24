@@ -366,12 +366,18 @@ where
                         // The emitting handle is gone — this frame dies at assembly, before the
                         // wire. Distinct from a post-send AckCancelled; `next_packet_number` is the
                         // PN it would have been assigned.
-                        crate::endpoint::frame_trace::record(
-                            crate::endpoint::frame_trace::Direction::SendCancelled,
-                            &frame.header,
-                            Some(context.next_packet_number),
-                            context.credentials.id,
-                        );
+                        {
+                            use crate::endpoint::frame_trace::{
+                                self, Direction, DropReason, FrameRecord,
+                            };
+                            frame_trace::record(&FrameRecord::from_header(
+                                Direction::SendCancelled,
+                                &frame.header,
+                                Some(context.next_packet_number),
+                                DropReason::None,
+                                context.credentials.id,
+                            ));
+                        }
                         crate::endpoint::dbg::on_enabled(|| {
                             if let frame::Header::QueueDbg {
                                 dump_id,
@@ -417,12 +423,18 @@ where
                     if phase3_is_probe {
                         counters.on_probe_frame(&frame.header);
                     }
-                    crate::endpoint::frame_trace::record(
-                        crate::endpoint::frame_trace::Direction::Outbound,
-                        &frame.header,
-                        Some(context.next_packet_number),
-                        context.credentials.id,
-                    );
+                    {
+                        use crate::endpoint::frame_trace::{
+                            self, Direction, DropReason, FrameRecord,
+                        };
+                        frame_trace::record(&FrameRecord::from_header(
+                            Direction::Outbound,
+                            &frame.header,
+                            Some(context.next_packet_number),
+                            DropReason::None,
+                            context.credentials.id,
+                        ));
+                    }
                     // Sending a QueueDbg means this node noticed its own stream is stuck (via
                     // `emit_debug`), so dump its send-side flight history locally too — don't rely
                     // on the peer's dump (the frame may be lost, or the peer may be the healthy one).
@@ -516,15 +528,18 @@ where
             // segment, and (for a PTO probe) the shell PN this retransmit was probed from — the
             // link that ties a retransmit back to the transmission it replaced. `frame_count` is
             // taken here before ACK/Ping stripping below mutates `packet_frames`.
-            crate::endpoint::frame_trace::record_packet(
-                crate::endpoint::frame_trace::PacketEvent::Sent,
-                packet_number,
-                context.credentials.id,
-                encoded_len as u32,
-                packet_frames.len() as u16,
-                probe_from_pn.map(PacketNumber::as_varint),
-                crate::endpoint::frame_trace::DropReason::None,
-            );
+            {
+                use crate::endpoint::frame_trace::{self, DropReason, PacketEvent, PacketRecord};
+                frame_trace::record(&PacketRecord::new(
+                    PacketEvent::Sent,
+                    packet_number,
+                    context.credentials.id,
+                    encoded_len as u32,
+                    packet_frames.len() as u16,
+                    probe_from_pn.map(PacketNumber::as_varint),
+                    DropReason::None,
+                ));
+            }
 
             watermark = offset + encoded_len;
 
