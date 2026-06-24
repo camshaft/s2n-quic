@@ -81,6 +81,14 @@ pub struct DeviceCounters {
     /// — the IO (syscall / SQE / processing) was never issued, saving the work. Not an error (it is
     /// the optimization working); a high rate just signals heavy upstream cancellation/churn.
     pub cancelled: Counter,
+    /// Ops the caller's cancellation predicate cancelled **after** credit was acquired but **before**
+    /// the op was enqueued — no IO issued, the credit released, the buffer handed back untouched. Not
+    /// an error (the cancel-before-IO optimization working); a spike is expected right after the
+    /// upstream drops the data (e.g. a deleted shuffle in the spill layer). Distinct from
+    /// [`cancelled`](Self::cancelled), which counts a backend skipping an **already-enqueued** op whose
+    /// receiver vanished — by then the op (and its fixed disk offset) is owned downstream and the write
+    /// must still complete; this counter is the only point where the write is genuinely *not* issued.
+    pub cancelled_before_submit: Counter,
     /// `!` Ops the dispatcher could not hand to a lane (lane/backend closed); surfaced as failed.
     pub lane_closed: Counter,
     /// Sojourn: submit→complete latency in microseconds (the end-to-end time an op spent in the
@@ -98,6 +106,8 @@ impl DeviceCounters {
             failed: registry.register_nominal("fs.device.!failed", label),
             orphaned: registry.register_nominal("fs.device.!orphaned", label),
             cancelled: registry.register_nominal("fs.device.cancelled", label),
+            cancelled_before_submit: registry
+                .register_nominal("fs.device.cancelled_before_submit", label),
             lane_closed: registry.register_nominal("fs.device.!lane_closed", label),
             sojourn_us: registry.register_nominal_summary(
                 "fs.device.sojourn",
