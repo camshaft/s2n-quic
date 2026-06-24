@@ -65,6 +65,13 @@ pub struct Local {
     #[arg(long)]
     dial9: bool,
 
+    /// Enable the frame/packet flight recorder on all nodes, dumping every N seconds. Builds
+    /// dc-tester with `--features frame-trace`, sets `BACKBEAT_*` env per node, and rsyncs every
+    /// node's `.bb` dumps back. Merge them with `backbeat convert` for a combined client+server
+    /// Perfetto timeline. (dc-tester only.)
+    #[arg(long, value_name = "SECS")]
+    frame_trace: Option<u64>,
+
     /// Workload names to run on client (defaults to first in config if omitted)
     #[arg(long, short)]
     workloads: Vec<String>,
@@ -122,9 +129,10 @@ impl Local {
                 let sh = sh.clone();
                 let profile = &self.profile;
                 let kind = &self.kind;
+                let frame_trace = self.frame_trace.is_some();
                 handles.push(s.spawn(move || {
                     node.deploy(&sh)?;
-                    node.build(&sh, profile, kind)?;
+                    node.build(&sh, profile, kind, frame_trace)?;
                     <Result<()>>::Ok(())
                 }));
             }
@@ -164,6 +172,42 @@ impl Local {
             None
         };
 
+        // Frame-trace flight recorder: capture rolling backbeat dumps on every node, into a
+        // per-run directory we rsync back afterward. `BACKBEAT_BYTES` is bumped well above the 16
+        // MiB default so a high-volume workload retains more history before the ring wraps.
+        let frame_trace_dir = self.frame_trace.map(|secs| {
+            let run_id = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            let dir = format!("/tmp/frame-trace/{run_id}");
+            base_env.insert("BACKBEAT_PATH".into(), format!("{dir}/trace.bb"));
+            base_env.insert("BACKBEAT_BYTES".into(), (256 << 20).to_string());
+            // Each dump is the full ring (BYTES × shards), and the remote `/tmp` is often tmpfs
+            // (RAM-backed), so keep only the most recent few dumps rather than every periodic one.
+            base_env.insert("BACKBEAT_MAX_DUMPS".into(), "3".into());
+            base_env.insert("BACKBEAT_LIMIT_POLICY".into(), "keep-newest".into());
+            let _ = secs;
+            (run_id, dir)
+        });
+
+        // backbeat's dumper does a best-effort `File::create` and won't make missing parent dirs, so
+        // create the dump directory on every node up front (and locally for the Local case).
+        if let Some((_, ref dir)) = frame_trace_dir {
+            for node in nodes.nodes.iter() {
+                match node {
+                    Node::Remote(remote) => {
+                        let target = remote.ssh_target();
+                        let mkdir = format!("mkdir -p {dir}");
+                        let _ = cmd!(sh, "ssh {target} {mkdir}").quiet().run();
+                    }
+                    Node::Local => {
+                        std::fs::create_dir_all(dir).ok();
+                    }
+                }
+            }
+        }
+
         // Start servers
         for i in 0..self.servers {
             let node = &nodes[i % nodes.len()];
@@ -181,6 +225,10 @@ impl Local {
             let mut env_vars = base_env.clone();
             if let Some(ref log) = self.log_level {
                 env_vars.insert("S2N_LOG".to_string(), log.to_string());
+            }
+            if self.frame_trace.is_some() {
+                // Stamp each dump with its role so the merged Perfetto trace separates the tracks.
+                env_vars.insert("BACKBEAT_HOST".to_string(), label.clone());
             }
 
             if self.memory_dump {
@@ -221,15 +269,20 @@ impl Local {
                     },
                     server_addr.port(),
                 );
-                vec![
-                    "--trace-dir".to_string(),
-                    trace_dir,
+                let mut args = vec!["--trace-dir".to_string(), trace_dir];
+                if let Some(secs) = self.frame_trace {
+                    // Global flag — must precede the `server` subcommand.
+                    args.push("--frame-trace-interval".to_string());
+                    args.push(secs.to_string());
+                }
+                args.extend([
                     "server".to_string(),
                     "--config".to_string(),
                     config_path,
                     "--address".to_string(),
                     bind_addr.to_string(),
-                ]
+                ]);
+                args
             };
 
             processes.push(ProcessConfig {
@@ -262,6 +315,9 @@ impl Local {
             if let Some(ref log) = self.log_level {
                 env_vars.insert("S2N_LOG".to_string(), log.to_string());
             }
+            if self.frame_trace.is_some() {
+                env_vars.insert("BACKBEAT_HOST".to_string(), label.clone());
+            }
 
             if self.memory_dump {
                 // Enable jemalloc heap profiling with dumps every 1GB and at exit
@@ -284,13 +340,16 @@ impl Local {
                 ]
             } else {
                 let trace_dir = self.trace_dir.display().to_string();
-                let mut args = vec![
-                    "--trace-dir".to_string(),
-                    trace_dir,
+                let mut args = vec!["--trace-dir".to_string(), trace_dir];
+                if let Some(secs) = self.frame_trace {
+                    args.push("--frame-trace-interval".to_string());
+                    args.push(secs.to_string());
+                }
+                args.extend([
                     "client".to_string(),
                     "--config".to_string(),
                     config_path,
-                ];
+                ]);
                 for addr in &server_addresses {
                     args.push("--server-addr".to_string());
                     args.push(addr.to_string());
@@ -370,6 +429,67 @@ impl Local {
             eprintln!("View with: dial9 serve {local_trace_dir}");
         }
 
+        if let Some((run_id, remote_dir)) = frame_trace_dir {
+            // A raw `.bb` is the full ring capacity per shard (gigabytes for a high-volume run), and
+            // `backbeat convert` holds the decoded records in memory — so converting on the laptop
+            // after pulling every node's raw dumps blows up local RAM/disk. Instead we convert each
+            // node's latest dump to Parquet *on the remote* (zstd, ~100-300 MB) and pull only that.
+            // Parquet keeps the `BACKBEAT_HOST` label as a column and is the DuckDB-friendly form;
+            // for a Perfetto timeline, window-trim a slice from the Parquet (it is far too large to
+            // load whole).
+            let local_dir = format!("/tmp/frame-trace/{run_id}");
+            std::fs::create_dir_all(&local_dir).ok();
+            let mut pulled = Vec::new();
+            for node in nodes.nodes.iter() {
+                let Node::Remote(remote) = node else { continue };
+                let target = remote.ssh_target();
+                // Convert the most-recent dump on the remote. backbeat-cli is installed on demand
+                // (prebuilt musl/macos binary, no compile) to `~/.local/bin`.
+                let out_name = format!("{}.parquet", remote.host);
+                // `find ... -printf` avoids shell globbing (the remote login shell may be zsh, whose
+                // `*.bb` nomatch aborts under `set -e`); pick the newest dump by mtime.
+                let convert = format!(
+                    "set -e; \
+                     command -v backbeat >/dev/null 2>&1 || test -x ~/.local/bin/backbeat || \
+                       curl -fsSL https://raw.githubusercontent.com/camshaft/backbeat/main/install.sh | sh >/dev/null 2>&1; \
+                     bb=$(command -v backbeat || echo ~/.local/bin/backbeat); \
+                     latest=$(find {remote_dir} -maxdepth 1 -name '*.bb' -printf '%T@ %p\\n' 2>/dev/null | sort -rn | head -1 | cut -d' ' -f2-); \
+                     test -n \"$latest\" && \"$bb\" convert \"$latest\" -o {remote_dir}/{out_name}"
+                );
+                let shell_cmd = format!("bash --login -c {convert:?}");
+                if cmd!(sh, "ssh {target} {shell_cmd}").quiet().run().is_err() {
+                    eprintln!(
+                        "Frame-trace: remote convert produced nothing on {} (no dumps?)",
+                        remote.host
+                    );
+                    continue;
+                }
+                let src = format!("{target}:{remote_dir}/{out_name}");
+                let dest = format!("{local_dir}/{out_name}");
+                if cmd!(sh, "rsync -az {src} {dest}").quiet().run().is_ok() {
+                    pulled.push((remote.host.clone(), dest));
+                }
+            }
+
+            if pulled.is_empty() {
+                eprintln!("\nFrame-trace: no Parquet dumps were produced (nothing recorded?)");
+            } else {
+                eprintln!("\nFrame-trace Parquet (per node) in {local_dir}:");
+                for (host, path) in &pulled {
+                    eprintln!("  {host}: {path}");
+                }
+                eprintln!(
+                    "Query with DuckDB, e.g.:\n  \
+                     duckdb -c \"SELECT \\\"s2n_quic_dc::packet::PacketRecord\\\".event, count(*) \
+                     FROM '{local_dir}/*.parquet' GROUP BY 1\""
+                );
+                eprintln!(
+                    "For a Perfetto timeline, window-trim a slice (the full dump is too large to \
+                     load whole) — filter a ~200ms ts_nanos range and emit Chrome trace JSON."
+                );
+            }
+        }
+
         result
     }
 
@@ -416,7 +536,7 @@ impl Node {
         }
     }
 
-    fn build(&self, sh: &Shell, profile: &str, kind: &str) -> Result<()> {
+    fn build(&self, sh: &Shell, profile: &str, kind: &str, frame_trace: bool) -> Result<()> {
         match self {
             Self::Local => {
                 let (path_prefix, binary_name) = match kind {
@@ -424,9 +544,14 @@ impl Node {
                     _ => ("tools/dc-tester", "dc-tester"),
                 };
 
+                let features: &[&str] = if frame_trace && kind != "wheel-demo" {
+                    &["--features", "frame-trace"]
+                } else {
+                    &[]
+                };
                 cmd!(
                     sh,
-                    "cargo build --manifest-path {path_prefix}/Cargo.toml --profile {profile}"
+                    "cargo build --manifest-path {path_prefix}/Cargo.toml --profile {profile} {features...}"
                 )
                 .run()
                 .with_context(|| format!("Failed to build {}", binary_name))?;
@@ -463,7 +588,7 @@ impl Node {
 
                 Ok(())
             }
-            Self::Remote(node) => node.build(sh, profile, kind),
+            Self::Remote(node) => node.build(sh, profile, kind, frame_trace),
         }
     }
 
@@ -624,7 +749,7 @@ echo 950000 | sudo tee /sys/fs/cgroup/cpu,cpuacct/user.slice/cpu.rt_runtime_us >
         Ok(())
     }
 
-    fn build(&self, sh: &Shell, profile: &str, kind: &str) -> Result<()> {
+    fn build(&self, sh: &Shell, profile: &str, kind: &str, frame_trace: bool) -> Result<()> {
         let node = self.ssh_target();
         let remote_dir = self.dir.as_path();
 
@@ -633,8 +758,14 @@ echo 950000 | sudo tee /sys/fs/cgroup/cpu,cpuacct/user.slice/cpu.rt_runtime_us >
             _ => ("tools/dc-tester", "dc-tester"),
         };
 
+        // The flight recorder's trace points are gated behind dc-tester's `frame-trace` feature.
+        let features = if frame_trace && kind != "wheel-demo" {
+            " --features frame-trace"
+        } else {
+            ""
+        };
         let build_cmd = format!(
-            "cd {} && cargo build --manifest-path {}/Cargo.toml --profile {profile}",
+            "cd {} && cargo build --manifest-path {}/Cargo.toml --profile {profile}{features}",
             remote_dir.display(),
             path_prefix
         );

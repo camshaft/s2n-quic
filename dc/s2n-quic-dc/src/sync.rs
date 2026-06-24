@@ -15,12 +15,10 @@
 //! `Mutex` deliberately exposes the [`lock`] free function rather than a `.lock()` method so callers
 //! are identical across the parking_lot (infallible) and loom (`Result`) APIs.
 
-pub mod bump_ring;
 pub mod free_list;
 pub(crate) mod waiter;
 pub mod wake;
 
-pub use bump_ring::BumpRing;
 pub use wake::AutoWake;
 
 #[cfg(all(feature = "loom", test))]

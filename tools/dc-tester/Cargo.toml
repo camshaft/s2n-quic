@@ -4,7 +4,14 @@ version = "0.1.0"
 edition = "2021"
 publish = false
 
+[features]
+# Compiles in the s2n-quic-dc frame/packet flight recorder (its trace points are gated behind
+# `queue-dbg`) and pulls in `backbeat` so `--frame-trace-interval` can arm capture and dump. Off by
+# default — a normal load test records nothing and never builds the recorder.
+frame-trace = ["s2n-quic-dc/queue-dbg", "dep:backbeat"]
+
 [dependencies]
+backbeat = { version = "0.1", optional = true }
 clap = { version = "4", features = ["derive"] }
 libc = "0.2"
 tikv-jemallocator = { version = "0.6", features = ["profiling"] }
