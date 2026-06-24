@@ -109,6 +109,12 @@ pub struct Endpoint {
     /// `Distributor` task colocated with the rest of the endpoint plumbing; the Reader
     /// integration is a follow-up.
     pub recv_credit_pool: crate::sync::Arc<crate::credit::Pool>,
+    /// io_uring recv-ring lifetime guards (empty unless the io_uring recv backend adopted sockets).
+    /// Each guard signals its ring thread to stop and joins it on drop (the ring thread owns its
+    /// socket, so the fd closes there after the join), so they must live as long as the endpoint.
+    /// Held purely for its `Drop`; never read.
+    #[allow(dead_code)]
+    recv_rings: Vec<RecvRingHandle>,
 }
 
 // ── Pipeline Setup ────────────────────────────────────────────────────────
@@ -208,10 +214,131 @@ pub struct WorkerLayout {
     pub background: usize,
 }
 
+/// Selects how recv sockets are driven to read inbound datagrams.
+///
+/// The choice only affects *how* packets are pulled off the wire — every backend produces the same
+/// [`descriptor::Filled`] segments and feeds the same `FanOutRouter`, so nothing downstream changes.
+///
+/// [`descriptor::Filled`]: crate::socket::pool::descriptor::Filled
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum RecvBackend {
+    /// Use io_uring when it is available at runtime, otherwise fall back to the syscall backend.
+    ///
+    /// Availability is probed once at endpoint startup; if the kernel lacks io_uring, the
+    /// `kernel.io_uring_disabled` sysctl forbids it, or the locked-memory limit is too low, the
+    /// endpoint logs the reason and uses [`Syscall`](Self::Syscall). On non-Linux targets io_uring
+    /// does not exist, so `Auto` is always `Syscall`.
+    #[default]
+    Auto,
+    /// Prefer the io_uring recv backend. A dedicated ring thread submits a backlog of multishot
+    /// receives and reaps completions, rather than cooperatively busy-polling the socket.
+    ///
+    /// If io_uring is unavailable at runtime the endpoint logs the reason and falls back to
+    /// [`Syscall`](Self::Syscall) — `IoUring` is a preference, not a hard requirement, so a
+    /// misconfigured host degrades instead of failing to start.
+    IoUring,
+    /// Force the cooperative syscall recv path (the historical behavior): a per-socket task busy-polls
+    /// `recvmsg` and fans out the resulting segments.
+    Syscall,
+}
+
+/// Resolve [`RecvBackend`] to a concrete decision: `true` = drive recv sockets with io_uring rings,
+/// `false` = use the cooperative syscall recv path. `Auto`/`IoUring` probe io_uring once and fall
+/// back (logging why) when it is unavailable; on non-Linux targets io_uring does not exist so the
+/// answer is always `false`.
+fn resolve_recv_backend(backend: RecvBackend) -> bool {
+    match backend {
+        RecvBackend::Syscall => false,
+        #[cfg(target_os = "linux")]
+        RecvBackend::Auto | RecvBackend::IoUring => match crate::socket::recv::uring::probe() {
+            Ok(()) => {
+                debug!("io_uring recv backend enabled");
+                true
+            }
+            Err(err) => {
+                warn!(%err, "io_uring recv backend unavailable; falling back to syscall recv path");
+                false
+            }
+        },
+        #[cfg(not(target_os = "linux"))]
+        RecvBackend::Auto | RecvBackend::IoUring => false,
+    }
+}
+
+/// A running recv-ring lifetime guard held by the [`Endpoint`]. On Linux it is the real
+/// `recv::uring::RecvRing` (joins its thread on drop); off Linux io_uring does not exist, so it is an
+/// uninhabited placeholder that is never constructed.
+#[cfg(target_os = "linux")]
+type RecvRingHandle = crate::socket::recv::uring::RecvRing;
+#[cfg(not(target_os = "linux"))]
+type RecvRingHandle = core::convert::Infallible;
+
+/// Try to adopt `socket` with a dedicated io_uring recv ring driving `router`. Returns `Ok(())` when a
+/// ring was spawned (the ring thread now owns both `socket` and `router`); returns
+/// `Err((socket, router))` — handing both back — when the socket has no real fd or the ring could not
+/// be created, so the caller falls back to the syscall recv path. Linux-only; the non-Linux build
+/// never calls this (`use_uring` is always false there).
+#[cfg(target_os = "linux")]
+fn try_spawn_recv_ring<S, Router>(
+    idx: usize,
+    socket: S,
+    recv_pool: crate::socket::pool::Pool,
+    router: Router,
+    rings: &mut Vec<RecvRingHandle>,
+) -> Result<(), (S, Router)>
+where
+    S: crate::socket::recv::Socket,
+    Router: crate::socket::recv::router::Router + Send + 'static,
+{
+    use crate::socket::recv::uring;
+    let reuse = crate::socket::pool::SyncReuseRing::new();
+    match uring::spawn(idx, socket, uring::DEFAULT_RING_DEPTH, recv_pool, reuse, router) {
+        Ok(ring) => {
+            rings.push(ring);
+            Ok(())
+        }
+        Err(uring::SpawnError::Recoverable(err, socket, router)) => {
+            // Setup failed before socket/router were committed — fall back to the syscall path.
+            debug!(%err, idx, "io_uring recv ring not used for this socket; using syscall recv path");
+            Err((socket, router))
+        }
+        Err(uring::SpawnError::Fatal(err)) => {
+            // All fallible io_uring setup (ring + buffer-ring registration) now happens before the
+            // thread is spawned and surfaces as `Recoverable`, so the only way to reach `Fatal` is the
+            // OS refusing to create the ring thread itself (resource exhaustion). The socket/router
+            // were already moved into the dropped closure and cannot be recovered, so this socket
+            // could never receive. Rather than silently bring up an endpoint with a dead recv path,
+            // fail fast — a thread-spawn failure at construction is a hard environment problem the
+            // operator must see.
+            panic!("io_uring recv ring thread spawn failed for recv socket {idx}: {err}");
+        }
+    }
+}
+
+/// Non-Linux stub: io_uring does not exist, so a recv ring can never be spawned. `use_uring` is always
+/// `false` off Linux, so this is never actually called — it exists only so the (platform-independent)
+/// recv-socket distribution loop type-checks. Always hands socket + router back for the syscall path.
+#[cfg(not(target_os = "linux"))]
+fn try_spawn_recv_ring<S, Router>(
+    _idx: usize,
+    socket: S,
+    _recv_pool: crate::socket::pool::Pool,
+    router: Router,
+    _rings: &mut Vec<RecvRingHandle>,
+) -> Result<(), (S, Router)>
+where
+    S: crate::socket::recv::Socket,
+    Router: crate::socket::recv::router::Router + Send + 'static,
+{
+    Err((socket, router))
+}
+
 /// Configuration for the stream pipeline.
 pub struct Config {
     /// Worker layout — maps pipeline roles to spawner thread indices.
     pub layout: WorkerLayout,
+    /// Which backend drives the recv sockets (io_uring vs. cooperative syscall busy-poll).
+    pub recv_backend: RecvBackend,
     /// Buffer pool for outbound (send) packets.
     pub send_pool: crate::socket::pool::Pool,
     /// Buffer pool for inbound (recv) packets.
@@ -392,6 +519,7 @@ where
 
     let Config {
         layout,
+        recv_backend,
         send_pool,
         recv_pool,
         path_secret_map,
@@ -412,6 +540,12 @@ where
     } = config;
 
     let clock = runtime.clock();
+
+    // Resolve the effective recv backend once at startup. `IoUring`/`Auto` only take effect on Linux
+    // when the runtime io_uring probe succeeds; otherwise we log why and use the syscall path. The
+    // resolved value gates, per recv socket, whether we spawn a dedicated ring thread (for sockets
+    // that expose a real fd) or push the socket to a cooperative recv_io worker.
+    let use_uring = resolve_recv_backend(recv_backend);
 
     let num_workers = runtime.worker_count().max(1);
     let num_send = send_sockets.len();
@@ -784,16 +918,44 @@ where
         .map(|id| (id, SyncReusePool::new()))
         .collect();
 
-    // Distribute recv sockets across recv_io workers round-robin.
+    // io_uring recv-ring guards. A ring thread owns the socket it drives (keeping the fd open) and is
+    // joined when its guard drops, so the guards must live as long as the endpoint. Empty unless the
+    // uring backend is active and a socket exposes a real fd.
+    let mut recv_rings: Vec<RecvRingHandle> = Vec::new();
+
+    // Distribute recv sockets: io_uring-adopted sockets get a ring thread (which owns the socket); the
+    // rest go to recv_io workers round-robin (cooperative syscall busy-poll). Round-robin only counts
+    // the syscall-assigned sockets so workers stay balanced when some sockets are adopted by rings.
+    let mut syscall_recv_idx = 0usize;
     for (recv_socket_id, socket) in recv_sockets.into_iter() {
-        let raw_idx = recv_socket_id.as_usize();
-        let recv_io_idx = RecvIoWorkerId::new(raw_idx % num_recv_io_workers);
-        let worker_id = layout.recv_io[recv_io_idx.as_usize()];
         let router = worker::FanOutRouter::<_, RecvRoute, _>::new(
             dispatch_txs.clone(),
             invalidation_raw_tx.clone(),
             &counter_registry,
         );
+
+        // Try io_uring first when enabled. On success the ring thread owns both socket and router; on
+        // failure (uring disabled, no fd, or setup error) both are handed back so the syscall path can
+        // use them — the router is built exactly once either way.
+        let (socket, router) = if use_uring {
+            match try_spawn_recv_ring(
+                recv_socket_id.as_usize(),
+                socket,
+                recv_pool.clone(),
+                router,
+                &mut recv_rings,
+            ) {
+                Ok(()) => continue,
+                Err((socket, router)) => (socket, router),
+            }
+        } else {
+            (socket, router)
+        };
+
+        // Syscall path: a recv_io worker busy-polls this socket.
+        let recv_io_idx = RecvIoWorkerId::new(syscall_recv_idx % num_recv_io_workers);
+        let worker_id = layout.recv_io[recv_io_idx.as_usize()];
+        syscall_recv_idx += 1;
         workers[worker_id].recv_sockets.push(RecvSocketParts {
             idx: recv_socket_id,
             socket,
@@ -802,10 +964,17 @@ where
         });
     }
 
-    // Assign sync reuse pools to their workers.
+    // Assign sync reuse pools to their workers — but only to workers that actually own recv sockets.
+    // The reuse pool exists solely to feed `socket_recv` tasks (and its `recycle_drain` task drains
+    // descriptors back into it), so a recv_io worker with no sockets has no use for one. Skipping the
+    // assignment means such a worker spawns *nothing* (no `socket_recv`, no `recycle_drain`), so the
+    // executor can spin its thread down. This is the common case under the io_uring recv backend,
+    // where rings own every socket on their own threads and the recv_io workers are left empty.
     for (recv_io_idx, recycle_pool) in recycle_pools.into_iter() {
         let worker_id = layout.recv_io[recv_io_idx.as_usize()];
-        workers[worker_id].recycle_pool = Some(recycle_pool);
+        if !workers[worker_id].recv_sockets.is_empty() {
+            workers[worker_id].recycle_pool = Some(recycle_pool);
+        }
     }
 
     // Background worker — invalidation validation + future housekeeping.
@@ -848,6 +1017,7 @@ where
         client_metrics,
         send_credit_pool,
         recv_credit_pool,
+        recv_rings,
     }
 }
 

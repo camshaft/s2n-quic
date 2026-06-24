@@ -106,6 +106,7 @@ pub fn create(
 
     let endpoint_config = endpoint::Config {
         layout,
+        recv_backend: config.recv_backend(),
         send_pool,
         recv_pool,
         path_secret_map: map,

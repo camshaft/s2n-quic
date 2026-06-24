@@ -18,6 +18,40 @@ use std::{
     sync::atomic::{AtomicUsize, Ordering},
 };
 
+// ── Shared recv-prefix region ──────────────────────────────────────────────
+//
+// Every descriptor reserves a fixed-size *recv prefix* between the [`Addr`] slot and the payload.
+// Its only purpose is to make the descriptor layout usable as an io_uring multishot `RecvMsg`
+// destination *without* changing where the payload lives — so the syscall and io_uring recv paths
+// produce a byte-identical [`Filled`].
+//
+// A multishot `RecvMsg` completion makes the kernel write, into the buffer the application provided,
+// the sequence `[struct io_uring_recvmsg_out | name (sockaddr) | control (cmsg) | payload]`, where the
+// `name`/`control` regions are sized by the `msg_namelen`/`msg_controllen` we hand it. By reserving a
+// prefix of exactly that size and pointing the provided buffer at the prefix start, the kernel lands
+// the payload at the descriptor's `payload_offset` — the same offset the syscall path fills — so no
+// copy or relocation is needed to turn the completion into a `Filled`. The syscall path simply leaves
+// the prefix unused (a fixed ~176-byte overhead per descriptor, negligible against a 64 KiB payload).
+
+/// Size of `struct io_uring_recvmsg_out` (four `u32`s: `namelen`, `controllen`, `payloadlen`,
+/// `flags`). The kernel writes this header first in a multishot `RecvMsg` provided buffer.
+pub(crate) const RECVMSG_OUT_LEN: usize = 16;
+
+/// Reserved bytes for the received `name` (peer `sockaddr`). Sized to the largest sockaddr we accept
+/// (`sockaddr_in6` is 28 bytes) rounded up to an 8-byte boundary so the following control region and
+/// payload stay aligned. This is the `msg_namelen` the io_uring recv path hands the kernel.
+pub(crate) const RECV_NAME_LEN: usize = 32;
+
+/// Reserved bytes for received control messages (ECN/`tos` + GRO `segment_size`). Matches
+/// [`cmsg::DECODER_LEN`] so the io_uring path can decode the same cmsgs the syscall path does. This is
+/// the `msg_controllen` the io_uring recv path hands the kernel.
+pub(crate) const RECV_CONTROL_LEN: usize = cmsg::DECODER_LEN;
+
+/// Total recv-prefix size reserved ahead of the payload in every descriptor: the recvmsg_out header
+/// plus the fixed name and control regions. Kept 8-byte aligned (all three components are multiples of
+/// 8) so the payload that follows is aligned.
+pub(crate) const RECV_PREFIX_LEN: usize = RECVMSG_OUT_LEN + RECV_NAME_LEN + RECV_CONTROL_LEN;
+
 // ── Recycler trait ────────────────────────────────────────────────────────
 
 /// A strategy for returning a dropped descriptor back to a pool instead of
@@ -176,7 +210,13 @@ impl<R: Recycler> intrusive::Adapter for RecycleAdapter<R> {
 /// A pointer to a single descriptor
 ///
 /// Each descriptor owns a contiguous allocation containing:
-/// `[Header | Addr | payload bytes]`
+/// `[Header | Addr | recv prefix | payload bytes]`
+///
+/// The `recv prefix` is a fixed [`RECV_PREFIX_LEN`]-byte region the io_uring multishot recv path
+/// hands the kernel as the head of the provided buffer (so the kernel's
+/// `[recvmsg_out | name | control | payload]` write lands the payload at `payload_offset`); the
+/// syscall recv path leaves it unused. Both paths therefore fill the payload at the same offset and
+/// produce an identical [`Filled`].
 ///
 /// Reference counting allows splitting a filled descriptor into multiple
 /// segments (e.g., for GRO). When the last reference is dropped, the entire
@@ -191,7 +231,8 @@ impl<R: Recycler> Descriptor<R> {
     /// Returns `None` if the packet subheap is exhausted.
     #[inline]
     fn alloc(capacity: u16, recycler: Option<R>) -> Option<Self> {
-        let (layout, addr_offset, _payload_offset) = Header::<R>::layout(capacity);
+        let (layout, addr_offset, _recv_prefix_offset, _payload_offset) =
+            Header::<R>::layout(capacity);
 
         let ptr = allocator::packet::alloc(layout)?;
 
@@ -342,7 +383,8 @@ impl<R: Recycler> Descriptor<R> {
         const { assert!(!core::mem::needs_drop::<Addr>()) };
         const { assert!(!core::mem::needs_drop::<Links>()) };
 
-        let (layout, _addr_offset, _payload_offset) = Header::<R>::layout(capacity);
+        let (layout, _addr_offset, _recv_prefix_offset, _payload_offset) =
+            Header::<R>::layout(capacity);
         let base = self.ptr.cast::<u8>();
         allocator::packet::dealloc(base, layout);
     }
@@ -373,22 +415,39 @@ pub struct Header<R: Recycler = SyncRecycler> {
 
 impl<R: Recycler> Header<R> {
     /// Computes the layout for the contiguous allocation:
-    /// `[Header | Addr | payload bytes]`
+    /// `[Header | Addr | recv prefix | payload bytes]`
     ///
-    /// Returns `(layout, addr_offset, payload_offset)`.
+    /// The recv prefix is a fixed [`RECV_PREFIX_LEN`]-byte region reserved ahead of the payload (see
+    /// the [`Descriptor`] docs); it is allocated for every descriptor regardless of recv backend so a
+    /// single allocation works for both the syscall and io_uring paths.
+    ///
+    /// Returns `(layout, addr_offset, recv_prefix_offset, payload_offset)`.
     #[inline]
-    const fn layout(capacity: u16) -> (Layout, usize, usize) {
+    const fn layout(capacity: u16) -> (Layout, usize, usize, usize) {
         let inner = Layout::new::<Header<R>>();
         let Ok((with_addr, addr_offset)) = inner.extend(Layout::new::<Addr>()) else {
             panic!("not enough space for addr");
         };
+        // Reserve the recv prefix (8-byte aligned: all components are multiples of 8) between the
+        // addr slot and the payload.
+        let Ok(recv_prefix_layout) = Layout::from_size_align(RECV_PREFIX_LEN, 8) else {
+            panic!("invalid recv prefix layout");
+        };
+        let Ok((with_prefix, recv_prefix_offset)) = with_addr.extend(recv_prefix_layout) else {
+            panic!("not enough space for recv prefix");
+        };
         let Ok(payload_layout) = Layout::array::<u8>(capacity as usize) else {
             panic!("not enough space for payload");
         };
-        let Ok((with_payload, payload_offset)) = with_addr.extend(payload_layout) else {
+        let Ok((with_payload, payload_offset)) = with_prefix.extend(payload_layout) else {
             panic!("not enough space for payload");
         };
-        (with_payload.pad_to_align(), addr_offset, payload_offset)
+        (
+            with_payload.pad_to_align(),
+            addr_offset,
+            recv_prefix_offset,
+            payload_offset,
+        )
     }
 
     #[inline]
@@ -396,9 +455,17 @@ impl<R: Recycler> Header<R> {
         Self::layout(self.capacity).1
     }
 
+    /// Offset of the recv-prefix region — the start of the buffer the io_uring multishot recv path
+    /// hands the kernel. Only the io_uring path reads this; the syscall path leaves the prefix unused.
+    #[cfg(target_os = "linux")]
+    #[inline]
+    const fn recv_prefix_offset(&self) -> usize {
+        Self::layout(self.capacity).2
+    }
+
     #[inline]
     const fn payload_offset(&self) -> usize {
-        Self::layout(self.capacity).2
+        Self::layout(self.capacity).3
     }
 }
 
@@ -456,6 +523,35 @@ impl<R: Recycler> Unfilled<R> {
     pub(crate) fn into_recycled(mut self) -> Recycled<R> {
         let desc = self.desc.take().expect("valid state");
         Recycled(desc)
+    }
+
+    /// The destination region an io_uring multishot `RecvMsg` writes into: a pointer to the start of
+    /// the [recv prefix](RECV_PREFIX_LEN) and the byte length spanning the prefix plus the full
+    /// payload capacity. The kernel writes `[recvmsg_out | name | control | payload]` here, landing the
+    /// payload at `payload_offset` (see the [`Descriptor`] docs), so a later [`fill_with`](Self::fill_with)
+    /// with the parsed length yields a [`Filled`] over exactly the received payload, with no
+    /// application-side copy (the in-kernel `skb`→buffer copy still happens — this is provided-buffer
+    /// recv, not kernel zero-copy recv).
+    ///
+    /// Returned as a raw pointer + length (not a slice) because the region is uninitialized until the
+    /// kernel fills it and ownership stays with the descriptor (parked in the ring's in-flight map for
+    /// the duration of the kernel operation).
+    #[cfg(target_os = "linux")]
+    #[inline]
+    pub(crate) fn recv_prefix_region(&self) -> (*mut u8, u32) {
+        let desc = self.desc.as_ref().expect("valid state");
+        let capacity = desc.inner().capacity as usize;
+        let total = RECV_PREFIX_LEN + capacity;
+        // SAFETY: the allocation reserves `[recv prefix | payload(capacity)]` contiguously from
+        // `recv_prefix_offset` (see `Header::layout`), so `total` bytes from that offset are within
+        // the descriptor's allocation.
+        let ptr = unsafe {
+            desc.ptr
+                .as_ptr()
+                .cast::<u8>()
+                .add(desc.inner().recv_prefix_offset())
+        };
+        (ptr, total as u32)
     }
 
     /// Fills the packet with the given callback, if the callback is successful

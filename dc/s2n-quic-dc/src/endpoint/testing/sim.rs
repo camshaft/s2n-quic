@@ -454,6 +454,10 @@ pub fn setup_sim_endpoint(
 
     let endpoint_config = Config {
         layout,
+        // Sim sockets are in-process bach sockets without a real OS fd, so io_uring cannot drive them;
+        // pin the syscall recv path explicitly (Auto would resolve to the same thing on a host with
+        // io_uring, but being explicit keeps sim behavior independent of the host kernel).
+        recv_backend: crate::endpoint::RecvBackend::Syscall,
         send_pool,
         recv_pool,
         path_secret_map: path_secret_map.clone(),

@@ -227,6 +227,59 @@ impl SyncReuseHandle {
     }
 }
 
+/// `Send` recv-side descriptor reuse state owned entirely by an io_uring recv ring thread.
+///
+/// Unlike [`SyncReuseHandle`] (which shares an `Rc<RefCell<List>>` with the worker-local recycle-drain
+/// task and is therefore `!Send`), this owns the whole recycle channel — keepalive sender, weak
+/// recycler stamped into freshly allocated descriptors, the receiver, and a plain (non-`Rc`) local
+/// LIFO list. It is `Send` (every field is `Send`: the list's pointer type `Recycled<SyncRecycler>` is
+/// `Send`), so it can move onto the dedicated ring thread, which is the only thread that touches it.
+///
+/// Descriptors allocated through this carry the weak recycler, so when a dispatch worker finishes with
+/// a `Filled` and drops it, the descriptor is pushed back into this ring's recycle channel; the ring
+/// drains it on its next [`alloc_or_reuse`](Self::alloc_or_reuse), closing the loop without the system
+/// allocator.
+pub struct SyncReuseRing {
+    _recycle_tx: sync::AdapterSender<RecycleAdapter<SyncRecycler>>,
+    recycle_weak: SyncRecycler,
+    recycle_rx: sync::AdapterReceiver<RecycleAdapter<SyncRecycler>>,
+    local_pool: List<RecycleAdapter<SyncRecycler>>,
+}
+
+impl Default for SyncReuseRing {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SyncReuseRing {
+    #[inline]
+    pub fn new() -> Self {
+        let (recycle_tx, recycle_rx) = sync::new_with_adapter::<RecycleAdapter<SyncRecycler>>();
+        let recycle_weak = SyncRecycler(recycle_tx.downgrade());
+        Self {
+            _recycle_tx: recycle_tx,
+            recycle_weak,
+            recycle_rx,
+            local_pool: List::new(),
+        }
+    }
+
+    /// Drains any recycled descriptors, then returns a reused descriptor or a freshly allocated one
+    /// (with this ring's recycler attached). Returns `None` only when the packet allocator is
+    /// exhausted — the recv backpressure signal.
+    #[inline]
+    pub fn alloc_or_reuse(&mut self, pool: &Pool) -> Option<Unfilled<SyncRecycler>> {
+        self.recycle_rx.drain_into(&mut self.local_pool);
+        if let Some(recycled) = self.local_pool.pop_back() {
+            return Some(Unfilled::<SyncRecycler>::from_recycled(
+                recycled.into_descriptor(),
+            ));
+        }
+        pool.alloc_with_recycler(&self.recycle_weak)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
