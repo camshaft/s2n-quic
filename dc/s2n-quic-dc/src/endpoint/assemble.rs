@@ -368,16 +368,18 @@ where
                         // PN it would have been assigned.
                         {
                             use crate::endpoint::frame_trace::{
-                                self, Direction, DropReason, FrameRecord,
+                                self, DropReason, WireDirection, WireFrame,
                             };
-                            frame_trace::record(|| FrameRecord::from_header(
-                                Direction::SendCancelled,
-                                &frame.header,
-                                Some(context.next_packet_number),
-                                Some(source_sender_id.as_varint()),
-                                DropReason::None,
-                                context.credentials.id,
-                            ));
+                            frame_trace::record(|| {
+                                WireFrame::from_header(
+                                    WireDirection::SendCancelled,
+                                    &frame.header,
+                                    context.next_packet_number,
+                                    source_sender_id.as_varint(),
+                                    DropReason::None,
+                                    context.credentials.id,
+                                )
+                            });
                         }
                         crate::endpoint::dbg::on_enabled(|| {
                             if let frame::Header::QueueDbg {
@@ -426,16 +428,18 @@ where
                     }
                     {
                         use crate::endpoint::frame_trace::{
-                            self, Direction, DropReason, FrameRecord,
+                            self, DropReason, WireDirection, WireFrame,
                         };
-                        frame_trace::record(|| FrameRecord::from_header(
-                            Direction::Outbound,
-                            &frame.header,
-                            Some(context.next_packet_number),
-                            Some(source_sender_id.as_varint()),
-                            DropReason::None,
-                            context.credentials.id,
-                        ));
+                        frame_trace::record(|| {
+                            WireFrame::from_header(
+                                WireDirection::Outbound,
+                                &frame.header,
+                                context.next_packet_number,
+                                source_sender_id.as_varint(),
+                                DropReason::None,
+                                context.credentials.id,
+                            )
+                        });
                     }
                     // Sending a QueueDbg means this node noticed its own stream is stuck (via
                     // `emit_debug`), so dump its send-side flight history locally too — don't rely
@@ -532,16 +536,18 @@ where
             // taken here before ACK/Ping stripping below mutates `packet_frames`.
             {
                 use crate::endpoint::frame_trace::{self, DropReason, PacketEvent, PacketRecord};
-                frame_trace::record(|| PacketRecord::new(
-                    PacketEvent::Sent,
-                    packet_number,
-                    source_sender_id.as_varint(),
-                    context.credentials.id,
-                    encoded_len as u32,
-                    packet_frames.len() as u16,
-                    probe_from_pn.map(PacketNumber::as_varint),
-                    DropReason::None,
-                ));
+                frame_trace::record(|| {
+                    PacketRecord::new(
+                        PacketEvent::Sent,
+                        packet_number,
+                        source_sender_id.as_varint(),
+                        context.credentials.id,
+                        encoded_len as u32,
+                        packet_frames.len() as u16,
+                        probe_from_pn.map(PacketNumber::as_varint),
+                        DropReason::None,
+                    )
+                });
             }
 
             watermark = offset + encoded_len;

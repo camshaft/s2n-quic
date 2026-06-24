@@ -3,29 +3,35 @@
 
 //! Frame/packet flight recorder, backed by [`backbeat`].
 //!
-//! Every frame the endpoint observes is recorded as a compact [`FrameRecord`] [`backbeat`] event;
-//! coarser per-packet signals are recorded as [`PacketRecord`] events. Both are captured into the
+//! Every frame the endpoint observes is recorded as a compact [`backbeat`] event; coarser
+//! per-packet signals are recorded as [`PacketRecord`] events. All are captured into the
 //! process-wide [`backbeat::global`] recorder — the hot path is a CPU-sharded ring push with no
-//! allocation. Frames are captured across the whole lifecycle:
+//! allocation. There are two frame record types, split by whether the sighting has a packet number:
 //!
-//! * **App edges** — [`Direction::AppSend`] when the application submits a frame into the send
-//!   pipeline (before aggregation/credit/pacing/assembly), and [`Direction::AppRecv`] when
-//!   reassembled stream bytes are delivered to the application. These bracket the transport so the
+//! * [`WireFrame`] — a frame *with* a packet number, seen on the wire path: [`WireDirection::Inbound`]
+//!   /[`InboundFastPath`](WireDirection::InboundFastPath) at decode, [`Outbound`](WireDirection::Outbound)
+//!   at assembly, [`AckCompleted`](WireDirection::AckCompleted)/[`AckLost`](WireDirection::AckLost)/
+//!   [`AckCancelled`](WireDirection::AckCancelled) at completion, [`SendCancelled`](WireDirection::SendCancelled)
+//!   (dropped at assembly), and [`RxDropped`](WireDirection::RxDropped) (rejected after decode, tagged
+//!   with a [`DropReason`]). Every `WireFrame` has a valid `packet_number`+`sender_id` — no sentinels.
+//! * [`AppFrame`] — an app-layer sighting with *no* packet number: [`AppDirection::AppSend`] when the
+//!   application submits a frame into the send pipeline (before aggregation/credit/pacing/assembly),
+//!   [`AppRecv`](AppDirection::AppRecv) when reassembled bytes are delivered to the application, and
+//!   reader-side [`RxDropped`](AppDirection::RxDropped). These bracket the transport so the
 //!   submit→wire and wire→consume latencies (where lost-wakeup stalls hide) become visible.
-//! * **Wire** — [`Direction::Inbound`]/[`Direction::InboundFastPath`] at decode, [`Direction::Outbound`]
-//!   at assembly.
-//! * **Completion** — [`Direction::AckCompleted`], [`Direction::AckLost`], [`Direction::AckCancelled`].
-//! * **Drops** — [`Direction::SendCancelled`] (cancelled at assembly before the wire) and
-//!   [`Direction::RxDropped`] (rejected after decode, e.g. stale/future binding), each tagged with a
-//!   [`DropReason`] so a frame that silently dies between app and wire is no longer a blind spot.
+//!
+//! The two share the flow key `(cred_id, binding_id)`, so an app sighting joins to the wire frames
+//! of the same stream. Splitting them keeps each record honest — neither carries a packet-number
+//! sentinel for the cases that have no PN.
 //!
 //! Interleaved with the per-frame records are coarser per-packet [`PacketRecord`]s. They capture
 //! each packet's lifecycle — received off the wire (the earliest possible sighting of a packet
 //! number, before decrypt/dedup, so loss *before* processing is immediately distinguishable from
 //! loss on the wire), assembled/sent, acked, lost, or dropped pre-decode (decrypt/replay/dedup).
-//! Because every frame record carries its `packet_number`, frames can be grouped into their packet;
-//! the packet records add the packet-only signals a frame can't carry: wire byte count, frame
-//! count, probe shell→pn linkage, and the pre-decode drop reasons that have no frame to attach to.
+//! Because each [`WireFrame`] carries its `packet_number`+`sender_id`, frames join to their packet
+//! on `(cred_id, sender_id, packet_number)`; the packet records add the packet-only signals a frame
+//! can't carry: wire byte count, frame count, probe shell→pn linkage, and the pre-decode drop
+//! reasons that have no frame to attach to.
 //!
 //! Unlike the per-`dump_id` [`QueueDbg`](super::frame::Header::QueueDbg) diagnostic — which traces
 //! *one* stuck frame end-to-end — this records *all* frames, so the dump shows the surrounding
@@ -49,13 +55,14 @@
 use super::frame::Header;
 // `Event`/`EventEnum` name both a trait and a derive macro in backbeat (it re-exports both under the
 // same name); importing them plainly brings the derive macros — and their `#[event(...)]` helper
-// attribute — into scope, and also the traits (so `FrameRecord::ID` resolves).
+// attribute — into scope, and also the traits (so `WireFrame::ID` resolves).
 use backbeat::{Event, EventEnum};
 use s2n_quic_core::varint::VarInt;
 use zerocopy::{Immutable, IntoBytes};
 
-/// Sentinel stored in [`FrameRecord::packet_number`] / [`PacketRecord::linked_pn`] when no packet
-/// number is in scope yet.
+/// Sentinel stored in [`PacketRecord::linked_pn`] when a packet has no probed-from shell PN. (Every
+/// [`WireFrame`] and [`PacketRecord`] has a real `packet_number`; only the optional `linked_pn`
+/// back-reference can be absent.)
 const NO_PACKET_NUMBER: u64 = u64::MAX;
 
 /// The endpoint bit in byte 0 of a `credentials::Id` (mirrors the private `Id::ENDPOINT_BIT`). It
@@ -63,14 +70,18 @@ const NO_PACKET_NUMBER: u64 = u64::MAX;
 /// id in a record — see [`canonicalize_cred`].
 const CRED_ENDPOINT_BIT: u8 = 0x80;
 
-/// Where a frame was observed. Stored in [`FrameRecord::direction`].
+/// Where a *wire* frame was observed — one that has a real packet number. Stored in
+/// [`WireFrame::direction`].
 ///
-/// Discriminants are stable wire/dump values — append new variants, never renumber. `backbeat`
-/// embeds the value→label map in the dump schema (via [`EventEnum`]), so the CLI renders these as
-/// names without any out-of-band table.
+/// Discriminants are stable wire/dump values, carried over from the original unified `Direction`
+/// (append new variants, never renumber). `backbeat` embeds the value→label map in the dump schema
+/// (via [`EventEnum`]), so the CLI renders these as names without any out-of-band table.
+///
+/// The app-layer sightings that have *no* packet number ([`AppDirection`]) live in a separate enum
+/// on [`AppFrame`]; splitting the two means neither record carries a packet-number sentinel.
 #[derive(EventEnum, IntoBytes, Immutable, Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
-pub(crate) enum Direction {
+pub(crate) enum WireDirection {
     /// Received in a multi-frame packet (slow path).
     Inbound = 0,
     /// Received as a single-QueueMsg fast-path packet.
@@ -83,35 +94,45 @@ pub(crate) enum Direction {
     AckLost = 4,
     /// Cancelled before delivery (sender gone) or TTL-exhausted.
     AckCancelled = 5,
-    /// Submitted by the application into the send pipeline (before aggregation, credit, pacing, and
-    /// assembly). The first sighting of an app-originated frame; pairs with [`Outbound`] to expose
-    /// the submit→wire latency. `packet_number` is not yet assigned (sentinel).
-    ///
-    /// [`Outbound`]: Direction::Outbound
-    AppSend = 6,
-    /// Reassembled stream bytes delivered to the application by the reader. The last sighting of
-    /// received data; pairs with [`Inbound`] to expose the wire→consume latency where reader
-    /// lost-wakeup stalls hide. Synthesised from the reader's routing identity (there is no wire
-    /// `Header` at this layer — see [`FrameRecord::stream`]), so it is always a `QueueData`-kind
-    /// record carrying the delivered byte count in [`FrameRecord::payload_len`] and the consumed
-    /// stream offset in [`FrameRecord::offset`].
-    ///
-    /// [`Inbound`]: Direction::Inbound
-    AppRecv = 7,
     /// Cancelled at assembly before ever reaching the wire — the emitting handle was already gone
     /// (`should_transmit()` was false) when the assembler popped it. Distinct from [`AckCancelled`],
     /// which is a *post-send* cancellation discovered during loss detection. `packet_number` is the
     /// PN the frame would have been assigned.
     ///
-    /// [`AckCancelled`]: Direction::AckCancelled
+    /// [`AckCancelled`]: WireDirection::AckCancelled
     SendCancelled = 8,
     /// Rejected after decode on the receive path (e.g. unallocated/stale/future binding, half-closed,
     /// cap-exceeded, window violation). The frame authenticated and decoded but never reached the
-    /// application; [`FrameRecord::reason`] carries a [`DropReason`].
+    /// application; [`WireFrame::reason`] carries a [`DropReason`].
     RxDropped = 9,
 }
 
-/// Why a frame or packet was dropped, stored in [`FrameRecord::reason`] / [`PacketRecord::reason`].
+/// Where an *app-layer* frame sighting was observed — one with no packet number (a different layer
+/// from the wire entirely). Stored in [`AppFrame::direction`].
+///
+/// Discriminants keep the values they had in the original unified `Direction` enum, so existing
+/// dumps and tooling read the same numbers. These records are synthesised from the reader/writer's
+/// routing identity (there is no wire `Header` in scope), so they never have a `packet_number` or
+/// `sender_id` — which is exactly why they are a separate type from [`WireFrame`].
+#[derive(EventEnum, IntoBytes, Immutable, Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub(crate) enum AppDirection {
+    /// Submitted by the application into the send pipeline (before aggregation, credit, pacing, and
+    /// assembly). The first sighting of an app-originated frame; pairs with [`WireDirection::Outbound`]
+    /// to expose the submit→wire latency.
+    AppSend = 6,
+    /// Reassembled stream bytes delivered to the application by the reader. The last sighting of
+    /// received data; pairs with [`WireDirection::Inbound`] to expose the wire→consume latency where
+    /// reader lost-wakeup stalls hide. Carries the delivered byte count in [`AppFrame::payload_len`]
+    /// and the consumed stream offset in [`AppFrame::offset`].
+    AppRecv = 7,
+    /// Rejected at the reader before reaching the application (e.g. receive-window violation). The
+    /// stream-layer counterpart of [`WireDirection::RxDropped`]; [`AppFrame::reason`] carries the
+    /// [`DropReason`]. No packet number is in scope at this layer.
+    RxDropped = 9,
+}
+
+/// Why a frame or packet was dropped, stored in [`WireFrame::reason`]/[`AppFrame::reason`] / [`PacketRecord::reason`].
 ///
 /// Discriminants are stable dump values — append, never renumber. `None` (0) is the resting value
 /// for records that did not record a drop. The receive-side post-decode reasons mirror the
@@ -178,7 +199,7 @@ pub(crate) enum PacketEvent {
 }
 
 /// Stable frame-kind discriminant for the dump, independent of the private wire type tags. Stored
-/// in [`FrameRecord::frame_type`]; `backbeat` renders these as names from the embedded schema.
+/// in [`WireFrame::frame_type`]; `backbeat` renders these as names from the embedded schema.
 #[derive(EventEnum, IntoBytes, Immutable, Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub(crate) enum FrameKind {
@@ -194,61 +215,101 @@ pub(crate) enum FrameKind {
     QueueDbg = 10,
 }
 
-// Flag bits packed into `FrameRecord::flags`.
+// Flag bits packed into `WireFrame::flags`.
 const FLAG_FIN: u8 = 1 << 0;
 const FLAG_BLOCKED: u8 = 1 << 1;
 const FLAG_WAKEUP: u8 = 1 << 2;
 const FLAG_ACK_ELICITING: u8 = 1 << 3;
 const FLAG_INIT: u8 = 1 << 4;
 
-/// A compact record of one observed frame.
+/// A compact record of one observed *wire* frame — a frame with a real packet number, seen on the
+/// send or receive path (decode, assembly, ack/loss/cancel).
 ///
 /// `backbeat` prepends a capture timestamp and the event id to every record and reconstructs global
 /// order, so this struct carries only the frame's own fields. Field order places the 8-byte fields
-/// first, then the 1-aligned credential id, then the `u8` enums and the `u32` tail — so the layout
-/// is naturally aligned with no implicit padding (required by `zerocopy::IntoBytes`).
+/// first, then the 1-aligned credential id, then the `u8` enums — so the layout is naturally aligned
+/// with no implicit padding (required by `zerocopy::IntoBytes`).
+///
+/// Every `WireFrame` has a valid `packet_number` + `sender_id` (no sentinels): the app-layer
+/// sightings that lack a PN are a different type, [`AppFrame`].
 #[derive(Event, IntoBytes, Immutable, Debug)]
-#[event(namespace = "s2n_quic_dc::frame")]
+#[event(namespace = "s2n_quic_dc::wire_frame")]
 #[repr(C)]
-pub struct FrameRecord {
-    /// Packet number, or [`NO_PACKET_NUMBER`] when not yet assigned. A packet number is only unique
-    /// within a `(cred_id, sender_id)` pair — it is the local counter of whichever endpoint assigned
-    /// it — so the join key for a packet is `(cred_id, sender_id, packet_number)`, never the PN alone.
+pub struct WireFrame {
+    /// Packet number. A packet number is only unique within a `(cred_id, sender_id)` pair — it is the
+    /// local counter of whichever endpoint assigned it — so the join key for a packet is
+    /// `(cred_id, sender_id, packet_number)`, never the PN alone. Together with `binding_id` this row
+    /// is also the frame↔packet bridge: it ties a flow `(cred_id, binding_id)` to a packet.
     #[event(key)]
     pub packet_number: u64,
     /// The id of the sender that assigned [`packet_number`](Self::packet_number): our `LocalSenderId`
     /// for frames we sent (`Outbound`/`SendCancelled`) or had acked/lost (`AckCompleted`/`AckLost`/
     /// `AckCancelled`), and the peer's `source_sender_id` for frames we received (`Inbound`/
     /// `InboundFastPath`/`RxDropped`). Both endpoints name the same logical sender for a given packet,
-    /// so this correlates a PN across hosts. Zero when no PN is in scope (`AppSend`/`AppRecv`).
+    /// so this correlates a PN across hosts.
     #[event(key)]
     pub sender_id: u64,
-    /// Primary stream/control offset for the frame type (see [`FrameRecord::from_header`]).
+    /// Primary stream/control offset for the frame type (see [`WireFrame::from_header`]).
     #[event(unit = "bytes")]
     pub offset: u64,
-    /// `QueueDbg` dump id, else 0.
+    /// `QueueDbg` dump id, else 0 (only `QueueDbg` frames set it).
     pub dump_id: u64,
-    #[event(key)]
     pub source_queue_id: u64,
-    #[event(key)]
     pub dest_queue_id: u64,
+    /// The stream's binding id. With `cred_id` this is the flow key `(cred_id, binding_id)`.
+    #[event(key)]
     pub binding_id: u64,
     /// The 16-byte credential id (`credentials::Id`) of the path this frame belongs to, big-endian
     /// as on the wire, with the endpoint bit masked off so a record from either endpoint shares one
-    /// id (a single query correlates both ends of a stream). Zero when no credential is in scope.
+    /// id (a single query correlates both ends of a stream).
     #[event(key)]
     pub cred_id: [u8; 16],
     /// Where the frame was observed.
-    pub direction: Direction,
+    pub direction: WireDirection,
     /// The frame kind.
     pub frame_type: FrameKind,
     /// Bit flags: see the `FLAG_*` constants.
     pub flags: u8,
-    /// A [`DropReason`] for [`Direction::RxDropped`]; [`DropReason::None`] otherwise.
+    /// A [`DropReason`] for [`WireDirection::RxDropped`]; [`DropReason::None`] otherwise.
     pub reason: DropReason,
-    /// Payload byte count where meaningful: bytes delivered for [`Direction::AppRecv`], else 0.
+    /// Explicit trailing padding so the struct has no implicit gap (required by
+    /// `zerocopy::IntoBytes`). Always zero.
+    pub _pad: [u8; 4],
+}
+
+/// A compact record of one *app-layer* frame sighting — submitted into the send pipeline
+/// ([`AppDirection::AppSend`]), delivered to the application ([`AppDirection::AppRecv`]), or rejected
+/// at the reader ([`AppDirection::RxDropped`]). These have no packet number: they are observed at a
+/// different layer than the wire, synthesised from the stream's routing identity.
+///
+/// Separating them from [`WireFrame`] is the whole point of the split — neither type carries a
+/// packet-number/sender sentinel. They still share the flow key `(cred_id, binding_id)`, so an
+/// `AppSend`/`AppRecv` joins to the wire frames of the same stream.
+#[derive(Event, IntoBytes, Immutable, Debug)]
+#[event(namespace = "s2n_quic_dc::app_frame")]
+#[repr(C)]
+pub struct AppFrame {
+    /// Consumed/submitted stream offset for this sighting.
+    #[event(unit = "bytes")]
+    pub offset: u64,
+    pub source_queue_id: u64,
+    pub dest_queue_id: u64,
+    /// The stream's binding id. With `cred_id` this is the flow key `(cred_id, binding_id)`.
+    #[event(key)]
+    pub binding_id: u64,
+    /// The 16-byte credential id, canonicalized (endpoint bit masked), matching [`WireFrame::cred_id`].
+    #[event(key)]
+    pub cred_id: [u8; 16],
+    /// Bytes delivered to the application for [`AppDirection::AppRecv`], else 0.
     #[event(unit = "bytes")]
     pub payload_len: u32,
+    /// Where the sighting was observed.
+    pub direction: AppDirection,
+    /// A [`DropReason`] for [`AppDirection::RxDropped`]; [`DropReason::None`] otherwise.
+    pub reason: DropReason,
+    /// Explicit trailing padding so the struct has no implicit gap (required by
+    /// `zerocopy::IntoBytes`). Always zero.
+    pub _pad: [u8; 2],
 }
 
 /// A compact per-packet record.
@@ -261,19 +322,19 @@ pub struct FrameRecord {
 #[repr(C)]
 pub struct PacketRecord {
     /// The packet number this record is about. Unique only within `(cred_id, sender_id)` — see
-    /// [`FrameRecord::sender_id`]. The full join key is `(cred_id, sender_id, packet_number)`.
+    /// [`WireFrame::sender_id`]. The full join key is `(cred_id, sender_id, packet_number)`.
     #[event(key)]
     pub packet_number: u64,
     /// The id of the sender that assigned [`packet_number`](Self::packet_number) (and
     /// [`linked_pn`](Self::linked_pn), which is in the same sender's space). See
-    /// [`FrameRecord::sender_id`].
+    /// [`WireFrame::sender_id`].
     #[event(key)]
     pub sender_id: u64,
     /// For [`PacketEvent::Sent`] probes, the shell PN this packet was probed from; else
     /// [`NO_PACKET_NUMBER`]. In the same sender space as [`packet_number`](Self::packet_number).
     /// Links a retransmit back to the transmission it replaced.
     pub linked_pn: u64,
-    /// Canonicalized credential id (endpoint bit cleared), matching [`FrameRecord::cred_id`].
+    /// Canonicalized credential id (endpoint bit cleared), matching [`WireFrame::cred_id`].
     #[event(key)]
     pub cred_id: [u8; 16],
     /// Wire byte count for [`PacketEvent::Sent`] (else 0).
@@ -313,22 +374,22 @@ fn canonicalize_cred(mut cred_id: [u8; 16]) -> [u8; 16] {
     cred_id
 }
 
-impl FrameRecord {
-    /// Builds a [`FrameRecord`] from a frame header. `pn` is the packet number if known, scoped to
-    /// `sender_id` (the sender that assigned it — see [`FrameRecord::sender_id`]); pass both `None`
-    /// when no PN is in scope. `reason` tags a [`Direction::RxDropped`] record (pass
-    /// [`DropReason::None`] otherwise); `cred_id` is the 16-byte credential id of the path.
+impl WireFrame {
+    /// Builds a [`WireFrame`] from a frame header. `pn`/`sender_id` are the packet number and the
+    /// sender that assigned it (see [`WireFrame::sender_id`]) — always present for a wire frame.
+    /// `reason` tags a [`WireDirection::RxDropped`] record (pass [`DropReason::None`] otherwise);
+    /// `cred_id` is the 16-byte credential id of the path.
     pub(crate) fn from_header(
-        dir: Direction,
+        dir: WireDirection,
         header: &Header,
-        pn: Option<VarInt>,
-        sender_id: Option<VarInt>,
+        pn: VarInt,
+        sender_id: VarInt,
         reason: DropReason,
         cred_id: crate::credentials::Id,
-    ) -> FrameRecord {
-        let mut rec = FrameRecord {
-            packet_number: pn.map_or(NO_PACKET_NUMBER, |p| p.as_u64()),
-            sender_id: sender_id.map_or(0, |s| s.as_u64()),
+    ) -> WireFrame {
+        let mut rec = WireFrame {
+            packet_number: pn.as_u64(),
+            sender_id: sender_id.as_u64(),
             offset: 0,
             dump_id: 0,
             source_queue_id: 0,
@@ -339,7 +400,7 @@ impl FrameRecord {
             frame_type: header_kind(header),
             flags: 0,
             reason,
-            payload_len: 0,
+            _pad: [0; 4],
         };
 
         // Pull the routing identity and a single "primary" offset out of each variant. `flags`
@@ -472,15 +533,16 @@ impl FrameRecord {
 
         rec
     }
+}
 
-    /// Builds a `QueueData`-kind [`FrameRecord`] from a stream-layer routing identity, used where
-    /// there is no wire [`Header`] in scope: [`Direction::AppRecv`] (reassembled bytes crossing to
-    /// the application, `payload_len` = bytes delivered, `offset` = consumed stream offset) and the
-    /// reader-detected [`Direction::RxDropped`] (e.g. [`DropReason::WindowViolation`]). `pn` is
-    /// unknown at this layer (sentinel).
+impl AppFrame {
+    /// Builds an [`AppFrame`] from a stream-layer routing identity, used where there is no wire
+    /// [`Header`] in scope: [`AppDirection::AppRecv`] (reassembled bytes crossing to the application,
+    /// `payload_len` = bytes delivered, `offset` = consumed stream offset) and the reader-detected
+    /// [`AppDirection::RxDropped`] (e.g. [`DropReason::WindowViolation`]).
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn stream(
-        dir: Direction,
+        dir: AppDirection,
         source_queue_id: VarInt,
         dest_queue_id: VarInt,
         binding_id: VarInt,
@@ -488,23 +550,96 @@ impl FrameRecord {
         payload_len: u32,
         reason: DropReason,
         cred_id: crate::credentials::Id,
-    ) -> FrameRecord {
-        FrameRecord {
-            packet_number: NO_PACKET_NUMBER,
-            // No PN at the stream/app layer, so no sender scope either.
-            sender_id: 0,
+    ) -> AppFrame {
+        AppFrame {
             offset,
-            dump_id: 0,
             source_queue_id: source_queue_id.as_u64(),
             dest_queue_id: dest_queue_id.as_u64(),
             binding_id: binding_id.as_u64(),
             cred_id: canonicalize_cred(*cred_id),
-            direction: dir,
-            frame_type: FrameKind::QueueData,
-            flags: 0,
-            reason,
             payload_len,
+            direction: dir,
+            reason,
+            _pad: [0; 2],
         }
+    }
+
+    /// Builds an [`AppFrame`] for [`AppDirection::AppSend`] — an application frame submitted into the
+    /// send pipeline *before* assembly, so it has a wire [`Header`] (routing identity) but no packet
+    /// number yet. Pulls the routing identity (queue pair, binding, offset) out of the header; this
+    /// is an app-layer sighting, so it lands in [`AppFrame`], not [`WireFrame`].
+    pub(crate) fn from_header(
+        dir: AppDirection,
+        header: &Header,
+        cred_id: crate::credentials::Id,
+    ) -> AppFrame {
+        let (source_queue_id, dest_queue_id, binding_id, offset) = match *header {
+            Header::QueueData {
+                queue_pair,
+                binding_id,
+                offset,
+                ..
+            } => (
+                queue_pair.source_queue_id,
+                queue_pair.dest_queue_id,
+                binding_id,
+                offset.as_u64(),
+            ),
+            Header::QueueMsg {
+                queue_pair,
+                binding_id,
+                stream_offset,
+                ..
+            } => (
+                queue_pair.source_queue_id,
+                queue_pair.dest_queue_id,
+                binding_id,
+                stream_offset.as_u64(),
+            ),
+            Header::QueueControl {
+                queue_pair,
+                binding_id,
+            }
+            | Header::QueueMaxData {
+                queue_pair,
+                binding_id,
+                ..
+            }
+            | Header::QueueReset {
+                queue_pair,
+                binding_id,
+                ..
+            }
+            | Header::QueueDataBlocked {
+                queue_pair,
+                binding_id,
+                ..
+            }
+            | Header::QueueDbg {
+                queue_pair,
+                binding_id,
+                ..
+            } => (
+                queue_pair.source_queue_id,
+                queue_pair.dest_queue_id,
+                binding_id,
+                0,
+            ),
+            // No routing identity (the app never submits these as a frame); record zeros.
+            Header::QueueFree { .. } | Header::Ack { .. } | Header::Ping => {
+                (VarInt::ZERO, VarInt::ZERO, VarInt::ZERO, 0)
+            }
+        };
+        AppFrame::stream(
+            dir,
+            source_queue_id,
+            dest_queue_id,
+            binding_id,
+            offset,
+            0,
+            DropReason::None,
+            cred_id,
+        )
     }
 }
 
@@ -535,14 +670,14 @@ impl PacketRecord {
     }
 }
 
-/// Records one event ([`FrameRecord`] or [`PacketRecord`]) into the global recorder. A no-op —
-/// folded away entirely — when the diagnostic is disabled (the production default).
+/// Records one event ([`WireFrame`], [`AppFrame`], or [`PacketRecord`]) into the global recorder. A
+/// no-op — folded away entirely — when the diagnostic is disabled (the production default).
 ///
 /// The event is built by the `make` closure, which runs *inside* the [`super::dbg::on_enabled`]
 /// gate, so when the diagnostic is compiled out (`ENABLED` is a `false` const) the optimizer strips
 /// the closure and the event is never constructed — no field-mapping work on the hot path, even in
 /// unoptimized builds. Call sites pass the constructor as a closure:
-/// `record(|| FrameRecord::from_header(...))`.
+/// `record(|| WireFrame::from_header(...))`.
 ///
 /// `backbeat`'s capture starts disabled; arming it is the application's job. In production set
 /// `BACKBEAT_ENABLE=1` (or call [`backbeat::global::enable`] once at startup); the crate's own tests
@@ -566,7 +701,14 @@ pub(crate) fn trigger() {
 /// Test-only discriminant accessors so integration tests in sibling modules can name the kinds
 /// without the enums being `pub`.
 #[cfg(test)]
-impl Direction {
+impl WireDirection {
+    pub(crate) fn as_u8(self) -> u8 {
+        self as u8
+    }
+}
+
+#[cfg(test)]
+impl AppDirection {
     pub(crate) fn as_u8(self) -> u8 {
         self as u8
     }
@@ -579,34 +721,27 @@ impl PacketEvent {
     }
 }
 
-/// Test-only snapshot of which record kinds are currently resident in the global recorder: the set
-/// of [`Direction`] discriminants across frame records and the set of [`PacketEvent`] discriminants
-/// across packet records. Lets an end-to-end test assert the trace points actually fire during a
-/// real transfer without going through an on-disk dump.
+/// Test-only snapshot of which record kinds are currently resident in the global recorder: the sets
+/// of [`WireDirection`] discriminants across [`WireFrame`]s, [`AppDirection`] across [`AppFrame`]s,
+/// and [`PacketEvent`] across [`PacketRecord`]s. Lets an end-to-end test assert the trace points
+/// actually fire during a real transfer without going through an on-disk dump.
 ///
 /// Dumps the live rings in-memory (`backbeat::global::recorder().dump(...)`), parses the dump, and
-/// walks each shard, decoding any record whose `event_id` matches [`FrameRecord`]/[`PacketRecord`].
+/// walks each shard, decoding any record whose `event_id` matches one of the three event types.
 #[cfg(test)]
-pub(crate) fn resident_event_kinds() -> (
-    std::collections::BTreeSet<u8>,
-    std::collections::BTreeSet<u8>,
-) {
+pub(crate) fn resident_event_kinds() -> ResidentKinds {
     use backbeat::record::RecordView;
 
-    let bytes = backbeat::global::recorder().dump(
-        backbeat::registry::schemas(),
-        core::iter::empty(),
-        "",
-    );
+    let bytes =
+        backbeat::global::recorder().dump(backbeat::registry::schemas(), core::iter::empty(), "");
 
-    let mut directions = std::collections::BTreeSet::new();
-    let mut packet_events = std::collections::BTreeSet::new();
+    let mut kinds = ResidentKinds::default();
 
     let Ok(reader) = backbeat::wire::DumpReader::new(bytes) else {
-        return (directions, packet_events);
+        return kinds;
     };
     let Ok(shards) = reader.shards() else {
-        return (directions, packet_events);
+        return kinds;
     };
     for shard in shards {
         backbeat::ring::walk(
@@ -619,15 +754,18 @@ pub(crate) fn resident_event_kinds() -> (
                 };
                 // The fields are the struct's `IntoBytes` image (no padding), so the 1-byte enum
                 // discriminant sits at its `offset_of!` within `view.fields`.
-                if view.event_id == FrameRecord::ID {
-                    let off = core::mem::offset_of!(FrameRecord, direction);
-                    if let Some(&b) = view.fields.get(off) {
-                        directions.insert(b);
+                let read_at = |off: usize| view.fields.get(off).copied();
+                if view.event_id == WireFrame::ID {
+                    if let Some(b) = read_at(core::mem::offset_of!(WireFrame, direction)) {
+                        kinds.wire.insert(b);
+                    }
+                } else if view.event_id == AppFrame::ID {
+                    if let Some(b) = read_at(core::mem::offset_of!(AppFrame, direction)) {
+                        kinds.app.insert(b);
                     }
                 } else if view.event_id == PacketRecord::ID {
-                    let off = core::mem::offset_of!(PacketRecord, event);
-                    if let Some(&b) = view.fields.get(off) {
-                        packet_events.insert(b);
+                    if let Some(b) = read_at(core::mem::offset_of!(PacketRecord, event)) {
+                        kinds.packet.insert(b);
                     }
                 }
                 true
@@ -635,5 +773,14 @@ pub(crate) fn resident_event_kinds() -> (
         );
     }
 
-    (directions, packet_events)
+    kinds
+}
+
+/// The resident discriminant sets returned by [`resident_event_kinds`].
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct ResidentKinds {
+    pub wire: std::collections::BTreeSet<u8>,
+    pub app: std::collections::BTreeSet<u8>,
+    pub packet: std::collections::BTreeSet<u8>,
 }

@@ -152,16 +152,18 @@ pub(crate) fn process_ack<Clk, Rand>(
             // the shell→tail hop; `frame_count` is the frames completing directly under this PN.
             {
                 use crate::endpoint::frame_trace::{self, DropReason, PacketEvent, PacketRecord};
-                frame_trace::record(|| PacketRecord::new(
-                    PacketEvent::Acked,
-                    num,
-                    context.sender_idx.as_varint(),
-                    context.credentials.id,
-                    0,
-                    packet.frames.len() as u16,
-                    packet.probed_to.map(PacketNumber::as_varint),
-                    DropReason::None,
-                ));
+                frame_trace::record(|| {
+                    PacketRecord::new(
+                        PacketEvent::Acked,
+                        num,
+                        context.sender_idx.as_varint(),
+                        context.credentials.id,
+                        0,
+                        packet.frames.len() as u16,
+                        packet.probed_to.map(PacketNumber::as_varint),
+                        DropReason::None,
+                    )
+                });
             }
 
             if let Some(probe_pn) = packet.probed_to {
@@ -176,16 +178,18 @@ pub(crate) fn process_ack<Clk, Rand>(
                     counters.on_acked_frame(&entry.header);
                     {
                         use crate::endpoint::frame_trace::{
-                            self, Direction, DropReason, FrameRecord,
+                            self, DropReason, WireDirection, WireFrame,
                         };
-                        frame_trace::record(|| FrameRecord::from_header(
-                            Direction::AckCompleted,
-                            &entry.header,
-                            Some(num),
-                            Some(context.sender_idx.as_varint()),
-                            DropReason::None,
-                            context.credentials.id,
-                        ));
+                        frame_trace::record(|| {
+                            WireFrame::from_header(
+                                WireDirection::AckCompleted,
+                                &entry.header,
+                                num,
+                                context.sender_idx.as_varint(),
+                                DropReason::None,
+                                context.credentials.id,
+                            )
+                        });
                     }
 
                     crate::endpoint::dbg::on_enabled(|| {
@@ -232,15 +236,19 @@ pub(crate) fn process_ack<Clk, Rand>(
             for mut entry in removal.frames {
                 counters.on_acked_frame(&entry.header);
                 {
-                    use crate::endpoint::frame_trace::{self, Direction, DropReason, FrameRecord};
-                    frame_trace::record(|| FrameRecord::from_header(
-                        Direction::AckCompleted,
-                        &entry.header,
-                        Some(PacketNumber::as_varint(probe_pn)),
-                        Some(context.sender_idx.as_varint()),
-                        DropReason::None,
-                        context.credentials.id,
-                    ));
+                    use crate::endpoint::frame_trace::{
+                        self, DropReason, WireDirection, WireFrame,
+                    };
+                    frame_trace::record(|| {
+                        WireFrame::from_header(
+                            WireDirection::AckCompleted,
+                            &entry.header,
+                            PacketNumber::as_varint(probe_pn),
+                            context.sender_idx.as_varint(),
+                            DropReason::None,
+                            context.credentials.id,
+                        )
+                    });
                 }
 
                 crate::endpoint::dbg::on_enabled(|| {
@@ -601,16 +609,18 @@ fn detect_loss<Rand>(
         // not distinguished per packet.)
         {
             use crate::endpoint::frame_trace::{self, DropReason, PacketEvent, PacketRecord};
-            frame_trace::record(|| PacketRecord::new(
-                PacketEvent::Lost,
-                num,
-                context.sender_idx.as_varint(),
-                context.credentials.id,
-                tx_info.sent_bytes as u32,
-                packet.frames.len() as u16,
-                packet.probed_to.map(PacketNumber::as_varint),
-                DropReason::None,
-            ));
+            frame_trace::record(|| {
+                PacketRecord::new(
+                    PacketEvent::Lost,
+                    num,
+                    context.sender_idx.as_varint(),
+                    context.credentials.id,
+                    tx_info.sent_bytes as u32,
+                    packet.frames.len() as u16,
+                    packet.probed_to.map(PacketNumber::as_varint),
+                    DropReason::None,
+                )
+            });
         }
 
         for mut entry in packet.frames {
@@ -644,15 +654,19 @@ fn detect_loss<Rand>(
                     }
                 });
                 {
-                    use crate::endpoint::frame_trace::{self, Direction, DropReason, FrameRecord};
-                    frame_trace::record(|| FrameRecord::from_header(
-                        Direction::AckCancelled,
-                        &entry.header,
-                        Some(num),
-                        Some(context.sender_idx.as_varint()),
-                        DropReason::None,
-                        context.credentials.id,
-                    ));
+                    use crate::endpoint::frame_trace::{
+                        self, DropReason, WireDirection, WireFrame,
+                    };
+                    frame_trace::record(|| {
+                        WireFrame::from_header(
+                            WireDirection::AckCancelled,
+                            &entry.header,
+                            num,
+                            context.sender_idx.as_varint(),
+                            DropReason::None,
+                            context.credentials.id,
+                        )
+                    });
                 }
                 entry.status = TransmissionStatus::Failed(frame::FailureReason::Cancelled);
                 let _ = cancelled.send(entry);
@@ -682,15 +696,19 @@ fn detect_loss<Rand>(
                     }
                 });
                 {
-                    use crate::endpoint::frame_trace::{self, Direction, DropReason, FrameRecord};
-                    frame_trace::record(|| FrameRecord::from_header(
-                        Direction::AckCancelled,
-                        &entry.header,
-                        Some(num),
-                        Some(context.sender_idx.as_varint()),
-                        DropReason::None,
-                        context.credentials.id,
-                    ));
+                    use crate::endpoint::frame_trace::{
+                        self, DropReason, WireDirection, WireFrame,
+                    };
+                    frame_trace::record(|| {
+                        WireFrame::from_header(
+                            WireDirection::AckCancelled,
+                            &entry.header,
+                            num,
+                            context.sender_idx.as_varint(),
+                            DropReason::None,
+                            context.credentials.id,
+                        )
+                    });
                 }
                 entry.status = TransmissionStatus::Failed(frame::FailureReason::TransmissionError);
                 let _ = completed.send(entry);
@@ -713,15 +731,17 @@ fn detect_loss<Rand>(
                 }
             });
             {
-                use crate::endpoint::frame_trace::{self, Direction, DropReason, FrameRecord};
-                frame_trace::record(|| FrameRecord::from_header(
-                    Direction::AckLost,
-                    &entry.header,
-                    Some(num),
-                    Some(context.sender_idx.as_varint()),
-                    DropReason::None,
-                    context.credentials.id,
-                ));
+                use crate::endpoint::frame_trace::{self, DropReason, WireDirection, WireFrame};
+                frame_trace::record(|| {
+                    WireFrame::from_header(
+                        WireDirection::AckLost,
+                        &entry.header,
+                        num,
+                        context.sender_idx.as_varint(),
+                        DropReason::None,
+                        context.credentials.id,
+                    )
+                });
             }
             let _ = lost.send(entry);
             lost_count += 1;

@@ -96,14 +96,21 @@ impl Stream {
     /// each local dump, every hop the marker frames touch, and the peer's woken handles — groups
     /// under one id. Grep that id to reconstruct the end-to-end trace.
     ///
-    /// No-op unless the `queue-dbg` feature (or a test/`testing` build) is enabled — the whole body
-    /// is gated by [`crate::endpoint::dbg::on_enabled`].
-    pub fn emit_debug(&mut self) {
+    /// Returns the minted `dump_id` so the application can stamp its own trace events with it (e.g.
+    /// an `AppStreamBind` event recorded through `backbeat::global`), joining the app's world to the
+    /// dc frames of this stream. The id is always returned, even in a production build where the
+    /// `QueueDbg` frames below are not actually sent.
+    ///
+    /// Sending the `QueueDbg` frames (and the resulting dumps) is gated by
+    /// [`crate::endpoint::dbg::on_enabled`]: a no-op unless the `queue-dbg` feature (or a
+    /// test/`testing` build) is enabled. Minting the id is cheap and always runs.
+    pub fn emit_debug(&mut self) -> u64 {
+        let dump_id = crate::endpoint::dbg::next_dump_id();
         crate::endpoint::dbg::on_enabled(|| {
-            let dump_id = crate::endpoint::dbg::next_dump_id();
             self.read.emit_debug_with_id(dump_id);
             self.write.emit_debug_with_id(dump_id);
         });
+        dump_id
     }
 
     /// Returns borrowed access to the read and write halves.

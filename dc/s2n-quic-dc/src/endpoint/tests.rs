@@ -905,7 +905,7 @@ fn queue_dbg_dumps_state_end_to_end() {
 /// because the crate's own tests build with `cfg(test)`.
 #[test]
 fn frame_trace_captures_app_and_packet_lifecycle() {
-    use crate::endpoint::frame_trace::{Direction, PacketEvent};
+    use crate::endpoint::frame_trace::{AppDirection, PacketEvent, WireDirection};
 
     sim(|| {
         let acceptor_id = VarInt::from_u8(1);
@@ -970,27 +970,32 @@ fn frame_trace_captures_app_and_packet_lifecycle() {
             // Let the final ACKs settle before sampling the ring.
             10.ms().sleep().await;
 
-            let (directions, packet_events) = crate::endpoint::frame_trace::resident_event_kinds();
+            let kinds = crate::endpoint::frame_trace::resident_event_kinds();
 
-            for dir in [
-                Direction::AppSend,
-                Direction::Outbound,
-                Direction::Inbound,
-                Direction::AppRecv,
-            ] {
+            // Wire frames (have a packet number): the send/receive wire edges.
+            for dir in [WireDirection::Outbound, WireDirection::Inbound] {
                 assert!(
-                    directions.contains(&dir.as_u8()),
-                    "expected a {:?} frame record in the ring; saw directions {:?}",
+                    kinds.wire.contains(&dir.as_u8()),
+                    "expected a {:?} wire-frame record in the ring; saw wire {:?}",
                     dir,
-                    directions
+                    kinds.wire
+                );
+            }
+            // App frames (no packet number): the application submit/deliver edges.
+            for dir in [AppDirection::AppSend, AppDirection::AppRecv] {
+                assert!(
+                    kinds.app.contains(&dir.as_u8()),
+                    "expected a {:?} app-frame record in the ring; saw app {:?}",
+                    dir,
+                    kinds.app
                 );
             }
             for event in [PacketEvent::RxArrived, PacketEvent::Sent] {
                 assert!(
-                    packet_events.contains(&event.as_u8()),
+                    kinds.packet.contains(&event.as_u8()),
                     "expected a {:?} packet record in the ring; saw events {:?}",
                     event,
-                    packet_events
+                    kinds.packet
                 );
             }
         }
@@ -998,6 +1003,139 @@ fn frame_trace_captures_app_and_packet_lifecycle() {
         .primary()
         .spawn();
     });
+}
+
+/// An example application-defined event, mirroring `AppStreamBind` from the stream-correlation
+/// design (Part A.3): it ties a dc stream's `dump_id` to the application's own identifiers, recorded
+/// through the same `backbeat::global` recorder the frame trace uses so it lands in the same dump.
+/// A distinct namespace (`app_example::trace`) lets a view generator tell app events from
+/// `s2n_quic_dc::*`.
+#[cfg(test)]
+#[derive(backbeat::Event, zerocopy::IntoBytes, zerocopy::Immutable, Debug)]
+#[event(namespace = "app_example::trace")]
+#[repr(C)]
+struct AppStreamBind {
+    /// Bridge to dc: the `dump_id` returned by `Stream::emit_debug()`.
+    #[event(key)]
+    dump_id: u64,
+    /// The application's own identity for this stream.
+    #[event(key)]
+    request_id: u64,
+}
+
+/// End-to-end coverage of the application-correlation hinge (design Part A.1 + A.3): `emit_debug()`
+/// returns the minted `dump_id`, the app records its own `AppStreamBind { dump_id, request_id }`
+/// through `backbeat::global`, and that row is then resident in the same dump — joinable to the dc
+/// frames of the stream by `dump_id`. Proves the app↔dc bridge without any dc-internal plumbing.
+#[test]
+fn emit_debug_returns_dump_id_for_app_correlation() {
+    use backbeat::Event as _;
+
+    sim(|| {
+        let acceptor_id = VarInt::from_u8(1);
+
+        async move {
+            let server = Server::new();
+            let mut acceptor = server
+                .register_acceptor_channel(acceptor_id, 8)
+                .expect("acceptor registration failed");
+            while let Some(stream) = acceptor.recv().await {
+                async move {
+                    let (mut reader, _writer) = stream.into_split();
+                    let mut buf = BytesMut::with_capacity(8);
+                    while reader.read_into(&mut buf).await.expect("server read") != 0 {}
+                }
+                .primary()
+                .spawn();
+            }
+        }
+        .group("server")
+        .spawn();
+
+        async move {
+            let mut client = Client::new();
+            let mut stream = client
+                .connect("server:0", acceptor_id)
+                .await
+                .expect("connect failed");
+
+            // Establish the binding, then fire the diagnostic and capture the returned dump_id.
+            {
+                let (_reader, writer) = stream.split();
+                let mut ping = Bytes::from_static(b"ping");
+                writer.write_from(&mut ping).await.expect("client write");
+            }
+            10.ms().sleep().await;
+
+            // A.1: emit_debug now returns the minted dump_id.
+            let dump_id = stream.emit_debug();
+            assert_ne!(dump_id, 0, "emit_debug should return a real dump_id");
+
+            // A.3: the app records its own bind event, keyed by that dump_id, into the same recorder.
+            let request_id = 0xA5A5_0001;
+            backbeat::global::record(&AppStreamBind {
+                dump_id,
+                request_id,
+            });
+
+            10.ms().sleep().await;
+
+            // The bind row must be resident in the dump with our dump_id + request_id — i.e. the
+            // app↔dc join key is present and correct.
+            assert!(
+                app_bind_is_resident(dump_id, request_id),
+                "AppStreamBind {{ dump_id={dump_id:#x}, request_id={request_id:#x} }} \
+                 should be resident in the dump"
+            );
+        }
+        .group("client")
+        .primary()
+        .spawn();
+    });
+
+    /// Walks the in-memory dump for an `AppStreamBind` row matching `(dump_id, request_id)`.
+    fn app_bind_is_resident(dump_id: u64, request_id: u64) -> bool {
+        use backbeat::record::RecordView;
+
+        let bytes = backbeat::global::recorder().dump(
+            backbeat::registry::schemas(),
+            core::iter::empty(),
+            "",
+        );
+        let Ok(reader) = backbeat::wire::DumpReader::new(bytes) else {
+            return false;
+        };
+        let Ok(shards) = reader.shards() else {
+            return false;
+        };
+        let mut found = false;
+        for shard in shards {
+            backbeat::ring::walk(
+                &shard.region,
+                shard.head as usize,
+                shard.capacity as usize,
+                |payload| {
+                    let Some(view) = RecordView::parse(&payload) else {
+                        return false;
+                    };
+                    if view.event_id == AppStreamBind::ID {
+                        let d = core::mem::offset_of!(AppStreamBind, dump_id);
+                        let r = core::mem::offset_of!(AppStreamBind, request_id);
+                        let read = |off: usize| {
+                            view.fields
+                                .get(off..off + 8)
+                                .map(|b| u64::from_le_bytes(b.try_into().unwrap()))
+                        };
+                        if read(d) == Some(dump_id) && read(r) == Some(request_id) {
+                            found = true;
+                        }
+                    }
+                    true
+                },
+            );
+        }
+        found
+    }
 }
 
 /// Verifies duplicate client init traffic does not create duplicate accepted streams.
