@@ -670,7 +670,21 @@ impl Distributor {
         let capacity = self.pool.config.capacity;
         let released = core::mem::take(&mut self.released_since_tick);
 
-        let inject = pacer_inject(available, released, quantum, capacity);
+        // Headroom must count credit already in the system but not yet reflected in `available`:
+        // `refill_pending` (injection queued for the next pass) and `carry` (pull a prior pass
+        // withheld to preserve no-snipe while parkers were live). Without this, a wedge whose
+        // writeback stays capped by live parked demand keeps `available` low, so every tick sees
+        // full headroom and injects another quantum — pushing the eventual free level past
+        // `capacity`. We do NOT care that `available + in_flight` conserves to `capacity` exactly:
+        // this is a *pacer*, so credit it issued that went unused in its window simply didn't
+        // matter. What must hold is the cap itself — `available` may never exceed `capacity`, or a
+        // fresh fast-path acquirer can take credit without ever parking (unbounded, unfair acquires
+        // that defeat pacing). Charging in-system credit against the cap is what enforces that
+        // bound at the injection source. See `pacer_never_drives_available_past_capacity_in_a_wedge`.
+        let in_system = self.carry.saturating_add(self.refill_pending);
+        let effective_available = available.saturating_add(in_system as i64);
+
+        let inject = pacer_inject(effective_available, released, quantum, capacity);
 
         if inject > 0 {
             self.refill_pending = self.refill_pending.saturating_add(inject);

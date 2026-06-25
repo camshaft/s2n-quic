@@ -160,6 +160,17 @@ impl Harness {
         let mut wakers = InlineWakeSender;
         let _ = self.dist.poll_distribute(&mut budget, &mut wakers);
     }
+
+    /// Drive one refill-pacer tick followed by a bounded distributor poll — exactly the ordering
+    /// `Distributor::distribute` uses when the refill timer matures (`pacer_tick` then
+    /// `poll_distribute`). `budget` lets a test reproduce the production bounded-budget passes.
+    fn pacer_tick_and_distribute(&mut self, quantum: u64, budget: usize) {
+        self.dist.pool.waker.register(&self.dist_waker);
+        self.dist.pacer_tick(quantum);
+        let mut budget = Budget::new(budget);
+        let mut wakers = InlineWakeSender;
+        let _ = self.dist.poll_distribute(&mut budget, &mut wakers);
+    }
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
@@ -1614,4 +1625,78 @@ fn pacer_headroom_uses_zero_floor_for_negative_available() {
     assert_eq!(pacer_inject(-10_000, 0, 4096, 8192), 4096);
     // Quantum larger than capacity is capped at capacity (can't create more free than the pool).
     assert_eq!(pacer_inject(-10_000, 0, 16384, 8192), 8192);
+}
+
+#[test]
+fn pacer_never_drives_available_past_capacity_in_a_wedge() {
+    // INVARIANT UNDER TEST: `available` must never exceed `capacity`. An over-cap `available` lets
+    // fresh fast-path acquirers take credit without ever parking — unbounded and unfair, which
+    // defeats the whole point of the pool as a *pacer*. We don't care that `available + in_flight`
+    // conserves to `capacity` exactly (credit issued but not used in its window didn't matter); we
+    // care that the free level the fast path can see is bounded by the cap.
+    //
+    // The suspected ratchet: the pacer computes headroom from the raw `available` atomic, which is
+    // (a) held negative by parked demand and (b) blind to credit it has ALREADY put into the system
+    // but not yet reflected in `available` — `refill_pending` (injection queued for the next pass)
+    // and `carry` (pull the previous pass withheld to preserve no-snipe while parkers were live).
+    // If a wedge keeps the writeback capped by live parked demand, `available` stays low every tick,
+    // so the pacer keeps seeing full headroom and injects another quantum — and that injected credit
+    // accumulates in the system. When the backlog finally clears, all of it lands in `available` at
+    // once and overshoots the cap.
+    let cap = 1024 * 1024; // 1 MiB pool
+    let unit = 128 * 1024; // per-acquire size (also max_single_acquire)
+    let quantum = 256 * 1024; // pacer injects up to 256 KiB/tick
+    let mut cfg = cfg(cap, unit);
+    // A real fair-share slice (< unit) so each parked waiter is granted in slices over several
+    // passes — the production regime where writeback stays capped by live demand, not the
+    // one-full-grant regime the floor==cap helper sets up.
+    cfg.min_grant_slice = [64 * 1024; Priority::LEVELS];
+    let mut h = Harness::new(cfg);
+
+    // Drain the pool to zero with fast-path acquirers that NEVER release (they model bytes in
+    // flight on the wire). available = 0 after this.
+    let mut drain_slots = Vec::new();
+    for _ in 0..(cap / unit) {
+        let c = Arc::new(WakeCounter::default());
+        let w = Waker::from(c);
+        let s = alloc_test_slot();
+        let r = unsafe { h.poll_acquire(s, unit, Priority::Medium, &w) };
+        assert_eq!(r, Poll::Ready(unit));
+        drain_slots.push(s);
+    }
+    assert_eq!(h.pool.debug_available(), 0);
+
+    // Many waiters park, each demanding `unit`. available goes deeply negative; parked_demand is
+    // large. The consumers never re-acquire and nobody releases — a sustained wedge.
+    let n_waiters = 8u64;
+    let mut wait_slots = Vec::new();
+    for _ in 0..n_waiters {
+        let c = Arc::new(WakeCounter::default());
+        let w = Waker::from(c);
+        let s = alloc_test_slot();
+        let r = unsafe { h.poll_acquire(s, unit, Priority::Medium, &w) };
+        assert!(matches!(r, Poll::Pending));
+        wait_slots.push(s);
+    }
+    assert_eq!(h.pool.debug_available(), -((n_waiters * unit) as i64));
+
+    // The pacer ticks repeatedly. A budget of 1 grant/poll keeps live parked demand high, so the
+    // writeback stays capped — the exact condition under which carry/refill_pending accumulate the
+    // injected credit that `available` can't yet show.
+    let mut max_available = i64::MIN;
+    for _ in 0..40 {
+        h.pacer_tick_and_distribute(quantum, /* budget */ 1);
+        max_available = max_available.max(h.pool.debug_available());
+    }
+
+    assert!(
+        max_available <= cap as i64,
+        "available reached {max_available} but capacity is {cap}: the pacer injected credit into \
+         carry/refill_pending across ticks, overshooting the cap — fresh acquirers can now snipe \
+         past the pool without parking (unbounded, unfair acquires)",
+    );
+
+    for s in drain_slots.into_iter().chain(wait_slots) {
+        unsafe { free_test_slot(s) };
+    }
 }
