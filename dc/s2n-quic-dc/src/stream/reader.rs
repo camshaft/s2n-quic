@@ -964,21 +964,16 @@ impl Inner {
         // the two records share queue ids: the wire frame's dest is our local queue and its source
         // is the peer's. `offset` is the start of the range just delivered.
         if bytes_read > 0 {
-            use crate::endpoint::frame_trace::{self, AppDirection, AppFrame, DropReason};
-            frame_trace::record(|| {
-                AppFrame::stream(
-                    AppDirection::AppRecv,
-                    self.dest_queue_id,
-                    self.stream_rx.queue_id(),
-                    self.stream_rx.binding_id(),
-                    self.reassembler
-                        .consumed_len()
-                        .saturating_sub(bytes_read as u64),
-                    bytes_read as u32,
-                    DropReason::None,
-                    *self.path_secret_entry.id(),
-                )
-            });
+            crate::endpoint::frame_trace::app_recv(
+                self.dest_queue_id,
+                self.stream_rx.queue_id(),
+                self.stream_rx.binding_id(),
+                self.reassembler
+                    .consumed_len()
+                    .saturating_sub(bytes_read as u64),
+                bytes_read as u32,
+                *self.path_secret_entry.id(),
+            );
         }
 
         // Only update flow-control while the channel is healthy.  When
@@ -1132,23 +1127,14 @@ impl Inner {
                         // Stream-layer drop (no wire Header here): the peer sent past the window
                         // and we're about to reset the stream. Mirror the inbound routing
                         // convention (dest = our local queue, source = peer's).
-                        {
-                            use crate::endpoint::frame_trace::{
-                                self, AppDirection, AppFrame, DropReason,
-                            };
-                            frame_trace::record(|| {
-                                AppFrame::stream(
-                                    AppDirection::RxDropped,
-                                    self.dest_queue_id,
-                                    self.stream_rx.queue_id(),
-                                    self.stream_rx.binding_id(),
-                                    offset.as_u64(),
-                                    0,
-                                    DropReason::WindowViolation,
-                                    *self.path_secret_entry.id(),
-                                )
-                            });
-                        }
+                        crate::endpoint::frame_trace::reader_drop(
+                            self.dest_queue_id,
+                            self.stream_rx.queue_id(),
+                            self.stream_rx.binding_id(),
+                            offset.as_u64(),
+                            crate::endpoint::frame_trace::DropReason::WindowViolation,
+                            *self.path_secret_entry.id(),
+                        );
                         return self.queue_control_error();
                     }
 
@@ -1842,17 +1828,7 @@ impl Inner {
         // Application (reader-originated control: MAX_DATA, reset, QueueDbg) submitting a frame into
         // the send pipeline — the first sighting, before aggregation/credit/pacing/assembly. Pairs
         // with the Outbound record at assembly. PN is not assigned yet.
-        {
-            // AppSend is pre-assembly: no PN assigned yet, so this is an `AppFrame`, not a wire frame.
-            use crate::endpoint::frame_trace::{self, AppDirection, AppFrame};
-            frame_trace::record(|| {
-                AppFrame::from_header(
-                    AppDirection::AppSend,
-                    &frame.header,
-                    *self.path_secret_entry.id(),
-                )
-            });
-        }
+        crate::endpoint::frame_trace::app_send(&frame.header, *self.path_secret_entry.id());
         self.frame_tx
             .send_batch(intrusive::Entry::new(frame))
             .map_err(|mut returned| {

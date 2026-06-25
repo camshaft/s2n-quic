@@ -905,7 +905,7 @@ fn queue_dbg_dumps_state_end_to_end() {
 /// because the crate's own tests build with `cfg(test)`.
 #[test]
 fn frame_trace_captures_app_and_packet_lifecycle() {
-    use crate::endpoint::frame_trace::{AppDirection, PacketEvent, WireDirection};
+    use crate::endpoint::frame_trace::{Lifecycle, PacketEvent};
 
     sim(|| {
         let acceptor_id = VarInt::from_u8(1);
@@ -970,32 +970,29 @@ fn frame_trace_captures_app_and_packet_lifecycle() {
             // Let the final ACKs settle before sampling the ring.
             10.ms().sleep().await;
 
-            let kinds = crate::endpoint::frame_trace::resident_event_kinds();
+            let (lifecycles, packet_events) = crate::endpoint::frame_trace::resident_event_kinds();
 
-            // Wire frames (have a packet number): the send/receive wire edges.
-            for dir in [WireDirection::Outbound, WireDirection::Inbound] {
+            // Frame lifecycle edges: app submit/deliver (no PN) and the wire edges (with PN), all
+            // now a single `lifecycle` field across the per-kind frame events.
+            for lc in [
+                Lifecycle::AppSend,
+                Lifecycle::Outbound,
+                Lifecycle::Inbound,
+                Lifecycle::AppRecv,
+            ] {
                 assert!(
-                    kinds.wire.contains(&dir.as_u8()),
-                    "expected a {:?} wire-frame record in the ring; saw wire {:?}",
-                    dir,
-                    kinds.wire
-                );
-            }
-            // App frames (no packet number): the application submit/deliver edges.
-            for dir in [AppDirection::AppSend, AppDirection::AppRecv] {
-                assert!(
-                    kinds.app.contains(&dir.as_u8()),
-                    "expected a {:?} app-frame record in the ring; saw app {:?}",
-                    dir,
-                    kinds.app
+                    lifecycles.contains(&lc.as_u8()),
+                    "expected a {:?} frame record in the ring; saw lifecycles {:?}",
+                    lc,
+                    lifecycles
                 );
             }
             for event in [PacketEvent::RxArrived, PacketEvent::Sent] {
                 assert!(
-                    kinds.packet.contains(&event.as_u8()),
+                    packet_events.contains(&event.as_u8()),
                     "expected a {:?} packet record in the ring; saw events {:?}",
                     event,
-                    kinds.packet
+                    packet_events
                 );
             }
         }
@@ -1100,6 +1097,7 @@ fn emit_debug_returns_dump_id_for_app_correlation() {
         let bytes = backbeat::global::recorder().dump(
             backbeat::registry::schemas(),
             core::iter::empty(),
+            backbeat::registry::views(),
             "",
         );
         let Ok(reader) = backbeat::wire::DumpReader::new(bytes) else {

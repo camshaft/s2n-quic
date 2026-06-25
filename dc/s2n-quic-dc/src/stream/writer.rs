@@ -2257,17 +2257,7 @@ impl Inner {
         // Application submitting a frame into the send pipeline — the first sighting, before
         // aggregation/credit/pacing/assembly. Pairs with the Outbound record at assembly so the
         // submit→wire latency is visible. PN is not assigned yet.
-        {
-            // AppSend is pre-assembly: no PN assigned yet, so this is an `AppFrame`, not a wire frame.
-            use crate::endpoint::frame_trace::{self, AppDirection, AppFrame};
-            frame_trace::record(|| {
-                AppFrame::from_header(
-                    AppDirection::AppSend,
-                    &frame.header,
-                    *self.path_secret_entry.id(),
-                )
-            });
-        }
+        crate::endpoint::frame_trace::app_send(&frame.header, *self.path_secret_entry.id());
         self.frame_tx
             .send_batch(Entry::new(frame))
             .map_err(|mut returned| {
