@@ -120,10 +120,14 @@ pub(super) async fn dispatch_loop<L>(
         let byte_cost = entry.byte_cost();
         let lane = router.choose(byte_cost, clock.now());
         entry.ring_id = LocalRingId(lane as u32);
+        // Lane assigned (`ring_id` now set); record before the send so the row carries the lane even if
+        // the send then fails.
+        crate::fs::trace::dispatched(&entry);
         if let Err(mut undeliverable) = lanes[lane].send(entry) {
             // Lane closed: record on the op's own device counters, stamp Failed, and complete it in
             // place so the submitter resolves with an error and its credit is released exactly once
             // (never a hang).
+            crate::fs::trace::lane_closed(&undeliverable);
             undeliverable.device.counters.lane_closed.add(1);
             undeliverable.status = IoStatus::Failed(std::io::ErrorKind::BrokenPipe);
             complete(undeliverable);

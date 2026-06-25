@@ -275,8 +275,20 @@ impl Device {
         is_direct: bool,
     ) -> std::io::Result<(Arc<Pool>, u64)> {
         self.prepare_inner(kind, offset, len, is_direct)
-            .inspect_err(|_| {
+            .inspect_err(|e| {
                 self.counters.rejected.add(1);
+                // `prepare` does not take the fd (it validates kind/offset/len/alignment only), so the
+                // rejected row carries the `u64::MAX` fd sentinel; it has no `op_seq` either (no op was
+                // built). The reason is the rejection's `io::ErrorKind`.
+                crate::fs::trace::rejected(
+                    self.index,
+                    kind,
+                    u64::MAX,
+                    offset,
+                    len,
+                    is_direct,
+                    e.kind(),
+                );
             })
     }
 
@@ -633,11 +645,22 @@ impl Device {
         // enqueued, so handing the buffer back is all that is owed.
         if should_cancel() {
             self.counters.cancelled_before_submit.add(1);
+            // Pre-acquire window: no credit was ever held (`had_credit = false`), no op built.
+            crate::fs::trace::cancelled_before_submit(
+                self.index,
+                kind,
+                fd.as_raw() as u64,
+                offset,
+                len,
+                buf.is_direct(),
+                false,
+            );
             return Ok(Admitted::Cancelled(buf));
         }
 
         // Acquire credit, parking cooperatively if the device is at capacity. This is the
         // backpressure that prevents the blocking-pool deadlock.
+        alloc.set_trace_ctx(self.index, kind);
         alloc.acquire(&pool, cost, priority).await?;
 
         // Credit is granted but the op is NOT yet enqueued — the last instant cancellation is safe.
@@ -651,6 +674,16 @@ impl Device {
                 pool.release(granted);
             }
             self.counters.cancelled_before_submit.add(1);
+            // Post-acquire window: credit was granted then released (`had_credit = true`), still no op.
+            crate::fs::trace::cancelled_before_submit(
+                self.index,
+                kind,
+                fd.as_raw() as u64,
+                offset,
+                len,
+                buf.is_direct(),
+                true,
+            );
             return Ok(Admitted::Cancelled(buf));
         }
 
@@ -659,7 +692,19 @@ impl Device {
         let granted = alloc.take_all();
         debug_assert!(granted >= cost, "acquire returned less than cost");
 
-        self.enqueue(kind, fd, offset, len, buf, completion, user_data, granted)?;
+        // A one-shot submit is not part of a multi-op stream — `NO_STREAM` (the trace builds map it to
+        // SQL NULL); the materialize reactor passes its own shared id.
+        self.enqueue(
+            kind,
+            fd,
+            offset,
+            len,
+            buf,
+            completion,
+            user_data,
+            granted,
+            crate::fs::trace::NO_STREAM,
+        )?;
         Ok(Admitted::Enqueued)
     }
 
@@ -667,6 +712,10 @@ impl Device {
     /// the device's submission channel; the device's dispatch task routes it to one of its lanes. On a
     /// closed channel (device torn down) the credit is released and an error returned, since no
     /// completion can arrive. Shared by `submit_with` and the materialize reactor.
+    ///
+    /// `stream_id` groups this op with the other ops of a multi-op submitter for the
+    /// [flight recorder](crate::fs::trace) ([`NO_STREAM`](crate::fs::trace::NO_STREAM) for a one-off);
+    /// it is only stored in the trace builds.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn enqueue(
         self: &Arc<Self>,
@@ -678,6 +727,7 @@ impl Device {
         completion: CompletionSender,
         user_data: u64,
         granted: u64,
+        stream_id: u64,
     ) -> std::io::Result<()> {
         // Per-device admission counters (the caller holds the `Arc<Device>`, so no extra plumbing):
         // bump this op-kind's submitted count and, for data ops, its submit-size histogram.
@@ -701,9 +751,23 @@ impl Device {
             ring_id: LocalRingId::UNSET,
             user_data,
             enqueued_at: Some(self.clock.now()),
+            // Mint the per-op correlation id at the single admission funnel (trace builds only).
+            #[cfg(any(test, feature = "testing", feature = "io-dbg"))]
+            op_seq: crate::fs::trace::next_op_seq(),
+            // The caller-supplied stream grouping id (NO_STREAM for one-off submits).
+            #[cfg(any(test, feature = "testing", feature = "io-dbg"))]
+            stream_id,
         };
+        // `stream_id` is only read into the op under the trace cfg; reference it otherwise so the
+        // parameter is not dead in a plain build.
+        #[cfg(not(any(test, feature = "testing", feature = "io-dbg")))]
+        let _ = stream_id;
+
+        // First live sighting of the op (credit acquired, about to enter the pipeline).
+        crate::fs::trace::submitted(&op);
 
         if let Err(mut undelivered) = self.submission.send_entry(Entry::new(op)) {
+            crate::fs::trace::enqueue_closed(&undelivered);
             undelivered.release_credits();
             undelivered.device.counters.rejected.add(1);
             return Err(std::io::Error::new(

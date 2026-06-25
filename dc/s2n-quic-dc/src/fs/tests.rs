@@ -1160,3 +1160,180 @@ fn cancelled_op_skips_execution_and_conserves_credit() {
         .spawn();
     });
 }
+
+/// The per-op flight recorder ([`crate::fs::trace`]) must fire the full healthy lifecycle for a normal
+/// op: `Submitted` → `Dispatched` → `BackendStart` → `BackendDone` → `Completed`. We drive one read
+/// through the bach backend and sample the global recorder afterwards (tests have the recorder armed
+/// via `init_tracing`). Asserting *containment* keeps the test robust to the process-global ring
+/// accumulating rows from other tests.
+#[test]
+fn trace_records_full_lifecycle_for_a_normal_op() {
+    use crate::fs::trace::IoLifecycle;
+    let _no_snap = crate::testing::without_snapshots();
+    sim(|| {
+        let (_scheduler, devices) = build(vec![iops_device(8)], 1, Latency::default());
+        let dev = devices[0].clone();
+        async move {
+            let _scheduler = _scheduler;
+            let buf = dev
+                .read(fd(), 0, 4096, TierPriority::Medium)
+                .await
+                .expect("read should complete");
+            assert_eq!(buf.len(), 4096, "bach backend fills the requested length");
+            // Let the completion settle before sampling the ring.
+            10.ms().sleep().await;
+
+            let (lifecycles, kinds) = crate::fs::trace::resident_event_kinds();
+            for lc in [
+                IoLifecycle::Submitted,
+                IoLifecycle::Dispatched,
+                IoLifecycle::BackendStart,
+                IoLifecycle::BackendDone,
+                IoLifecycle::Completed,
+            ] {
+                assert!(
+                    lifecycles.contains(&lc.as_u8()),
+                    "expected a {lc:?} io_op record in the ring; saw lifecycles {lifecycles:?}"
+                );
+            }
+            assert!(
+                kinds.contains(&crate::fs::trace::IoOpKind::Read.as_u8()),
+                "expected a Read-kind io_op record; saw kinds {kinds:?}"
+            );
+            info!("trace recorded the full normal-op lifecycle");
+        }
+        .primary()
+        .spawn();
+    });
+}
+
+/// A pre-admission rejection (`Device::prepare` fails on an oversized op) must fire the
+/// [`Rejected`](crate::fs::trace::IoLifecycle::Rejected) trace point — the row that has no `op_seq`
+/// because no `IoOp` was ever built.
+#[test]
+fn trace_records_rejected_for_oversize_op() {
+    use crate::fs::trace::IoLifecycle;
+    let _no_snap = crate::testing::without_snapshots();
+    sim(|| {
+        let (_scheduler, devices) = build(vec![iops_device(4)], 1, Latency::default());
+        let dev = devices[0].clone();
+        async move {
+            let _scheduler = _scheduler;
+            let result = dev.read(fd(), 0, 64 * 1024, TierPriority::Medium).await;
+            assert!(result.is_err(), "oversize op must be rejected");
+            let (lifecycles, _kinds) = crate::fs::trace::resident_event_kinds();
+            assert!(
+                lifecycles.contains(&IoLifecycle::Rejected.as_u8()),
+                "expected a Rejected io_op record; saw lifecycles {lifecycles:?}"
+            );
+            info!("trace recorded the rejection");
+        }
+        .primary()
+        .spawn();
+    });
+}
+
+/// A submitter that parks on credit (depth-1 device with a long-latency occupant) must fire
+/// [`CreditPark`](crate::fs::trace::IoLifecycle::CreditPark), and the eventual grant must fire
+/// [`CreditGrant`](crate::fs::trace::IoLifecycle::CreditGrant). This exercises the credit-acquire trace
+/// points wired through `SubmitterAlloc`.
+#[test]
+fn trace_records_credit_park_and_grant() {
+    use crate::fs::trace::IoLifecycle;
+    let _no_snap = crate::testing::without_snapshots();
+    sim(|| {
+        // depth-1 device, 50ms latency: the first op saturates the pool and stays in flight, so the
+        // second op must park on credit and is granted only when the first completes.
+        let latency = Latency {
+            read: Duration::from_millis(50),
+            write: Duration::from_millis(50),
+            per_byte_nanos: 0,
+        };
+        let (_scheduler, devices) = build(vec![iops_device(1)], 1, latency);
+        let dev = devices[0].clone();
+        async move {
+            let _scheduler = _scheduler;
+            // Spawn two concurrent reads: the first holds the only credit for 50ms, forcing the second
+            // to park on acquire and be granted on the first's release.
+            let dev_a = dev.clone();
+            async move {
+                dev_a
+                    .read(fd(), 0, 4096, TierPriority::Medium)
+                    .await
+                    .expect("first read completes");
+            }
+            .spawn();
+            let dev_b = dev.clone();
+            async move {
+                dev_b
+                    .read(fd(), 4096, 4096, TierPriority::Medium)
+                    .await
+                    .expect("second read completes");
+            }
+            .spawn();
+
+            // Both reads (50ms each, serialized on the depth-1 pool) finish well within this window.
+            200.ms().sleep().await;
+
+            let (lifecycles, _kinds) = crate::fs::trace::resident_event_kinds();
+            for lc in [IoLifecycle::CreditPark, IoLifecycle::CreditGrant] {
+                assert!(
+                    lifecycles.contains(&lc.as_u8()),
+                    "expected a {lc:?} io_op record; saw lifecycles {lifecycles:?}"
+                );
+            }
+            info!("trace recorded credit park and grant");
+        }
+        .primary()
+        .spawn();
+    });
+}
+
+/// Every op a single `materialize` run enqueues must carry the **same** `stream_id`, so a dump can
+/// group the whole streamed read (`WHERE stream_id = N`). We run one stream of 6 device blocks and
+/// assert the recorder holds exactly one stream id, carrying multiple lifecycle rows (≥ one per block's
+/// `Submitted`). One-off `submit`s in other tests carry `NO_STREAM` and never show up here.
+#[test]
+fn trace_groups_materialize_ops_under_one_stream_id() {
+    let _no_snap = crate::testing::without_snapshots();
+    sim(|| {
+        let latency = Latency {
+            read: Duration::from_micros(100),
+            write: Duration::from_micros(100),
+            per_byte_nanos: 0,
+        };
+        let (_scheduler, devices) = build(vec![iops_device(8), iops_device(8)], 2, latency);
+        async move {
+            let _scheduler = _scheduler;
+            let blocks: Vec<BlockRef> = (0..6u64)
+                .map(|i| {
+                    let dev = devices[(i % 2) as usize].clone();
+                    BlockRef::whole(dev, fd(), i * 1024, 1024)
+                })
+                .collect();
+            let mut stream = materialize(blocks, TierPriority::High);
+            // This run's own id — assert on it directly rather than diffing the process-global recorder
+            // (other tests may record their own stream ids concurrently, so a before/after diff is racy).
+            let sid = stream.stream_id();
+            let mut delivered = 0u64;
+            while let Some(chunk) = stream.next().await {
+                chunk.expect("block read failed");
+                delivered += 1;
+            }
+            assert_eq!(delivered, 6, "all blocks delivered");
+            10.ms().sleep().await;
+
+            // Our stream id groups at least one row per block (>= 6: Submitted/Dispatched/Backend*/
+            // Completed all carry it). Keyed on `sid`, so concurrent tests' ids are irrelevant.
+            let resident = crate::fs::trace::resident_stream_ids();
+            let count = resident.get(&sid).copied().unwrap_or(0);
+            assert!(
+                count >= 6,
+                "stream id {sid} must group every block's ops (>= 6 rows); saw {count}"
+            );
+            info!(stream_id = sid, count, "materialize ops grouped under one stream id");
+        }
+        .primary()
+        .spawn();
+    });
+}

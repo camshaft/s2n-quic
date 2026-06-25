@@ -193,7 +193,9 @@ where
                     complete_cancelled(entry);
                     return;
                 }
+                crate::fs::trace::backend_start(&entry);
                 process(&mut entry);
+                crate::fs::trace::backend_done(&entry);
                 // Complete the op in place: record on its own device counters, release its credit to
                 // its device pool, notify its submitter (or drop it if the receiver is gone).
                 complete(entry);

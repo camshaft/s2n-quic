@@ -232,6 +232,21 @@ pub struct IoOp {
     pub user_data: u64,
     /// When the op was submitted, for sojourn metrics. Set by the scheduler.
     pub enqueued_at: Option<crate::time::precision::Timestamp>,
+    /// Monotonic per-op correlation id, minted at admission ([`Device::enqueue`](crate::fs::device::Device))
+    /// solely so the [flight recorder](crate::fs::trace) can stitch one op's lifecycle rows together
+    /// — submit → credit → dispatch → backend → completion. Unlike the recyclable
+    /// `(device, fd, offset)` tuple (offsets are deliberately reused on cancel→resubmit, fds recycle
+    /// on close), this is a true identity. **cfg-gated** to the same builds that compile the trace, so
+    /// it is zero struct-cost in production; read through [`crate::fs::trace::op_seq_of`].
+    #[cfg(any(test, feature = "testing", feature = "io-dbg"))]
+    pub op_seq: u64,
+    /// Stream grouping id for the [flight recorder](crate::fs::trace): every op enqueued by one
+    /// multi-op submitter (a [`MaterializeStream`](crate::fs::materialize)) carries the same value, so
+    /// the dump can group a whole run. [`crate::fs::trace::NO_STREAM`] for a one-off `submit`. Set on
+    /// the [`enqueue`](crate::fs::device::Device) path from the caller-supplied id. **cfg-gated** like
+    /// [`op_seq`](Self::op_seq); read through [`crate::fs::trace::stream_id_of`].
+    #[cfg(any(test, feature = "testing", feature = "io-dbg"))]
+    pub stream_id: u64,
 }
 
 impl IoOp {

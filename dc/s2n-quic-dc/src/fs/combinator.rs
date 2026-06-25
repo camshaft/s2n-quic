@@ -67,6 +67,15 @@ pub fn complete(mut op: Entry<IoOp>) {
             .record_value(now.nanos_since(enqueued_at) / 1_000);
     }
 
+    // Terminal flight-recorder sighting. Recorded BEFORE `release_credits` so the row still carries the
+    // op's `cost`. Whether the receiver is still alive decides Completed/Failed vs. Orphaned — checked
+    // here (the sender is taken below, but `completion` is still present).
+    let orphaned = op
+        .completion
+        .as_ref()
+        .is_some_and(|s| !s.receiver_alive());
+    crate::fs::trace::completed(&op, orphaned);
+
     // 2. Release the borrowed credit back to the op's own device pool — exactly once. The op carries
     //    the `Arc<Device>`, so this needs no table lookup. (See the load-bearing ordering note above:
     //    this MUST happen before step 3.)
@@ -101,6 +110,7 @@ pub fn complete(mut op: Entry<IoOp>) {
 /// the op's SQE / running its syscall and routes here instead of executing.
 pub fn complete_cancelled(mut op: Entry<IoOp>) {
     op.device.counters.cancelled.add(1);
+    crate::fs::trace::cancelled_skipped(&op);
     // Release the borrowed credit back to the device pool exactly once (same invariant as `complete`).
     op.release_credits();
     // The receiver is gone (that is why we are here); drop the op without sending. Take the sender out

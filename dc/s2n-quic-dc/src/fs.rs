@@ -36,11 +36,13 @@
 pub mod backend;
 pub mod combinator;
 pub mod config;
+pub(crate) mod dbg;
 pub mod device;
 pub mod direct;
 pub mod materialize;
 pub mod op;
 pub mod scheduler;
+pub(crate) mod trace;
 
 #[cfg(test)]
 mod tests;

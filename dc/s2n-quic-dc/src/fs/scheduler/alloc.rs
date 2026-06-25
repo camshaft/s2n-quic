@@ -35,6 +35,12 @@ use std::{
 struct AllocState {
     pending_credits: u64,
     pool: Option<Arc<Pool>>,
+    /// `(device_index, kind)` for the [flight recorder](crate::fs::trace), so a credit park/grant/
+    /// partial transition can be attributed to its device and op-kind. The acquire primitive itself is
+    /// device-agnostic, so the submitter sets this before driving the acquire. cfg-gated to the trace
+    /// builds (zero cost otherwise).
+    #[cfg(any(test, feature = "testing", feature = "io-dbg"))]
+    trace_ctx: Option<(u32, crate::fs::op::IoKind)>,
 }
 
 /// `#[repr(C)]` with `Slot` at offset 0 — the credit pool casts `NonNull<Slot>` back to
@@ -71,6 +77,8 @@ impl SubmitterAlloc {
                     state: AllocState {
                         pending_credits: 0,
                         pool: None,
+                        #[cfg(any(test, feature = "testing", feature = "io-dbg"))]
+                        trace_ctx: None,
                     },
                 },
             );
@@ -81,6 +89,21 @@ impl SubmitterAlloc {
     #[inline]
     fn slot_ptr(&self) -> NonNull<Slot> {
         self.0.cast()
+    }
+
+    /// Record a credit-acquire transition for the [flight recorder](crate::fs::trace), using the
+    /// `(device_index, kind)` context the submitter set via [`set_trace_ctx`](Self::set_trace_ctx).
+    /// A no-op (and fully stripped) outside the trace builds.
+    #[inline]
+    fn trace_credit(&mut self, lifecycle: crate::fs::trace::IoLifecycle, cost: u64) {
+        #[cfg(any(test, feature = "testing", feature = "io-dbg"))]
+        if let Some((device_index, kind)) = self.state().trace_ctx {
+            crate::fs::trace::credit(lifecycle, device_index, kind, cost);
+        }
+        #[cfg(not(any(test, feature = "testing", feature = "io-dbg")))]
+        {
+            let _ = (lifecycle, cost);
+        }
     }
 
     #[inline]
@@ -94,6 +117,21 @@ impl SubmitterAlloc {
     #[inline]
     pub(crate) fn take_all(&mut self) -> u64 {
         core::mem::take(&mut self.state().pending_credits)
+    }
+
+    /// Attribute subsequent credit-acquire transitions to `(device_index, kind)` for the
+    /// [flight recorder](crate::fs::trace). A no-op outside the trace builds. Callers set this before
+    /// driving [`acquire`](Self::acquire)/[`poll_acquire`](Self::poll_acquire).
+    #[inline]
+    pub(crate) fn set_trace_ctx(&mut self, device_index: usize, kind: crate::fs::op::IoKind) {
+        #[cfg(any(test, feature = "testing", feature = "io-dbg"))]
+        {
+            self.state().trace_ctx = Some((device_index as u32, kind));
+        }
+        #[cfg(not(any(test, feature = "testing", feature = "io-dbg")))]
+        {
+            let _ = (device_index, kind);
+        }
     }
 
     /// Park (cooperatively, on a waker — never a thread) until at least `cost` credits are held for
@@ -178,6 +216,8 @@ impl SubmitterAlloc {
         }
 
         if self.state().pending_credits >= cost {
+            // Already held enough (e.g. drained from a prior partial grant): a full grant.
+            self.trace_credit(crate::fs::trace::IoLifecycle::CreditGrant, cost);
             return Poll::Ready(Ok(()));
         }
 
@@ -188,16 +228,22 @@ impl SubmitterAlloc {
                 let s = self.state();
                 s.pending_credits = s.pending_credits.saturating_add(n);
                 if self.state().pending_credits >= cost {
+                    self.trace_credit(crate::fs::trace::IoLifecycle::CreditGrant, cost);
                     Poll::Ready(Ok(()))
                 } else {
                     // A partial grant (the fast path capped at `max_single_acquire`): self-wake to
                     // re-acquire the remainder. Bounded by `ceil(cost / max_single_acquire)` since
                     // `cost <= capacity` is enforced before acquire.
+                    self.trace_credit(crate::fs::trace::IoLifecycle::CreditPartial, cost);
                     cx.waker().wake_by_ref();
                     Poll::Pending
                 }
             }
-            Poll::Pending => Poll::Pending,
+            // The acquire request parked on a waker (device at capacity): the op is now waiting.
+            Poll::Pending => {
+                self.trace_credit(crate::fs::trace::IoLifecycle::CreditPark, cost);
+                Poll::Pending
+            }
         }
     }
 }

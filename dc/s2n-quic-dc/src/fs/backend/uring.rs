@@ -313,6 +313,8 @@ fn drain_into_sq(
                     continue;
                 }
                 let want = transfer_len(&op);
+                // SQE about to be built and submitted to the kernel — the start of backend execution.
+                crate::fs::trace::backend_start(&op);
                 let id = slab.insert(op, want);
                 let entry = build_sqe(&slab.get(id).unwrap().op, 0, id as u64, async_ok);
                 // SAFETY: the op (and its buffer) lives in the slab until its CQE is reaped, so the
@@ -551,6 +553,9 @@ fn ring_loop(
         for &id in &completed {
             if let Some(mut op) = slab.take(id) {
                 finalize(&mut op);
+                // CQE reaped and status stamped — the end of backend (kernel) execution. Recorded
+                // before `complete` so the SQE-submit → CQE-reap span is visible for io_uring.
+                crate::fs::trace::backend_done(&op);
                 // Complete the op in place: record on the op's own device counters, release its
                 // credit to its device pool, notify its submitter. Runs on this ring thread — no
                 // completion bridge.
