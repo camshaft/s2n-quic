@@ -14,7 +14,7 @@ use crate::{
     endpoint::{
         counters, decode, error,
         frame::{Frame, Header, SubmissionSender, DEFAULT_TTL},
-        msg, recv, routing,
+        frame_trace, msg, recv, routing,
     },
     intrusive::Entry,
     packet::{
@@ -314,11 +314,10 @@ fn record_packet_drop(
     packet_number: VarInt,
     sender_id: VarInt,
     cred_id: crate::credentials::Id,
-    reason: crate::endpoint::frame_trace::DropReason,
+    reason: frame_trace::DropReason,
 ) {
-    use crate::endpoint::frame_trace::{self, PacketEvent, PacketRecord};
-    frame_trace::record(|| PacketRecord::new(
-        PacketEvent::RxDropped,
+    frame_trace::packet(
+        frame_trace::PacketEvent::RxDropped,
         packet_number,
         sender_id,
         cred_id,
@@ -326,7 +325,7 @@ fn record_packet_drop(
         0,
         None,
         reason,
-    ));
+    );
 }
 
 /// Process a received datagram packet.
@@ -374,19 +373,16 @@ where
     // frame dispatch. A gap in the RxArrived packet-number sequence pins loss to the wire, ruling
     // out anything between arrival and processing. Recorded even for the malformed cases below so
     // they don't vanish.
-    {
-        use crate::endpoint::frame_trace::{self, DropReason, PacketEvent, PacketRecord};
-        frame_trace::record(|| PacketRecord::new(
-            PacketEvent::RxArrived,
-            packet_number,
-            source_sender_id.unwrap_or(VarInt::ZERO),
-            credentials.id,
-            0,
-            0,
-            None,
-            DropReason::None,
-        ));
-    }
+    frame_trace::packet(
+        frame_trace::PacketEvent::RxArrived,
+        packet_number,
+        source_sender_id.unwrap_or(VarInt::ZERO),
+        credentials.id,
+        0,
+        0,
+        None,
+        frame_trace::DropReason::None,
+    );
 
     let source_sender_id = match source_sender_id {
         Some(id) => id,
@@ -424,17 +420,14 @@ where
 
         // Fast path: single QueueMsg frame — decrypt directly into the slot buffer.
         if let Some(header) = single_queue_msg {
-            {
-                use crate::endpoint::frame_trace::{self, Direction, DropReason, FrameRecord};
-                frame_trace::record(|| FrameRecord::from_header(
-                    Direction::InboundFastPath,
-                    &header,
-                    Some(packet_number),
-                    Some(source_sender_id),
-                    DropReason::None,
-                    credentials.id,
-                ));
-            }
+            frame_trace::wire(
+                frame_trace::Lifecycle::InboundFastPath,
+                &header,
+                packet_number,
+                source_sender_id,
+                frame_trace::DropReason::None,
+                credentials.id,
+            );
             return match decrypt_fast_path(
                 header,
                 opener,
@@ -637,17 +630,14 @@ where
             Ok((header, frame_payload_len)) => {
                 frame_count += 1;
                 counters.on_received_frame(&header);
-                {
-                    use crate::endpoint::frame_trace::{self, Direction, DropReason, FrameRecord};
-                    frame_trace::record(|| FrameRecord::from_header(
-                        Direction::Inbound,
-                        &header,
-                        Some(packet_number),
-                        Some(source_sender_id),
-                        DropReason::None,
-                        credentials.id,
-                    ));
-                }
+                frame_trace::wire(
+                    frame_trace::Lifecycle::Inbound,
+                    &header,
+                    packet_number,
+                    source_sender_id,
+                    frame_trace::DropReason::None,
+                    credentials.id,
+                );
                 // Validate that the claimed payload length fits within the
                 // remaining payload storage.
                 if frame_payload_len > payload_storage.len() {
@@ -826,15 +816,14 @@ fn dispatch_decoded_frame(
                 // Authenticated and decoded but rejected before reaching the application — record
                 // where it died so the drop isn't a blind spot. `header` is still the authentic
                 // wire frame (it is `Copy`, untouched by the match binding above).
-                use crate::endpoint::frame_trace::{self, Direction, FrameRecord};
-                frame_trace::record(|| FrameRecord::from_header(
-                    Direction::RxDropped,
+                frame_trace::wire(
+                    frame_trace::Lifecycle::RxDropped,
                     &header,
-                    Some(packet_number),
-                    Some(source_sender_id),
+                    packet_number,
+                    source_sender_id,
                     reason,
                     credentials.id,
-                ));
+                );
             }
         }
         Header::QueueControl {
@@ -992,15 +981,14 @@ fn dispatch_decoded_frame(
                 recv_credit_pool,
             ) {
                 // See the QueueData arm: record the post-decode drop against the authentic header.
-                use crate::endpoint::frame_trace::{self, Direction, FrameRecord};
-                frame_trace::record(|| FrameRecord::from_header(
-                    Direction::RxDropped,
+                frame_trace::wire(
+                    frame_trace::Lifecycle::RxDropped,
                     &header,
-                    Some(packet_number),
-                    Some(source_sender_id),
+                    packet_number,
+                    source_sender_id,
                     reason,
                     credentials.id,
-                ));
+                );
             }
         }
         Header::Ping => {}
@@ -1065,25 +1053,10 @@ fn handle_queue_dbg(
         let dest_queue_id = queue_pair.dest_queue_id;
         let peer_cred_id = credentials.id;
 
-        // Record this QueueDbg into the flight recorder (so the dump's newest record carries the
-        // trigger dump_id), then dump the whole ring. The first QueueDbg produces the dump; later
-        // ones simply re-arm the single-flag handoff.
-        {
-            use crate::endpoint::frame_trace::{self, Direction, DropReason, FrameRecord};
-            frame_trace::record(|| FrameRecord::from_header(
-                Direction::Inbound,
-                &Header::QueueDbg {
-                    dump_id,
-                    queue_pair,
-                    binding_id,
-                },
-                // No PN for this synthesised QueueDbg sighting, so no sender scope.
-                None,
-                None,
-                DropReason::None,
-                credentials.id,
-            ));
-        }
+        // Dump the whole ring. The inbound `QueueDbg` frame was already recorded as a `WireFrame`
+        // (with its real packet number) by the decode loop in `process`, so the dump's history
+        // already contains this marker — we only need to trigger the dump here. The first QueueDbg
+        // produces the dump; later ones simply re-arm the single-flag handoff.
         crate::endpoint::frame_trace::trigger();
 
         info!(

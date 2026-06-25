@@ -626,15 +626,19 @@ impl Reader {
     /// end-to-end dump: every hop the marker frame touches, and the peer's parked Reader/Writer,
     /// log their own state stamped with one shared `dump_id`. Grep that id to reconstruct the trace.
     ///
-    /// No-op unless the `queue-dbg` feature (or a test/`testing` build) is enabled — the whole body
-    /// is gated by [`crate::endpoint::dbg::on_enabled`], so a production build mints no id and sends
-    /// nothing. Waking the peer can unstick a genuine lost-wakeup, so the dump is observational, not
-    /// side-effect-free.
-    pub fn emit_debug(&mut self) {
-        crate::endpoint::dbg::on_enabled(|| {
-            let dump_id = crate::endpoint::dbg::next_dump_id();
-            self.0.emit_debug_with_id(dump_id);
-        });
+    /// Returns the minted `dump_id` so the application can stamp its own trace events with it (see
+    /// [`crate::stream::Stream::emit_debug`]) — or `None` when the diagnostic is not compiled in.
+    ///
+    /// Gated behind [`crate::endpoint::dbg::ENABLED`]: does nothing and returns `None` unless the
+    /// `queue-dbg` feature (or a test/`testing` build) is enabled. Waking the peer can unstick a
+    /// genuine lost-wakeup, so the dump is observational, not side-effect-free.
+    pub fn emit_debug(&mut self) -> Option<u64> {
+        if !crate::endpoint::dbg::ENABLED {
+            return None;
+        }
+        let dump_id = crate::endpoint::dbg::next_dump_id();
+        self.0.emit_debug_with_id(dump_id);
+        Some(dump_id)
     }
 
     /// Emit a `QueueDbg` from this reader using a caller-supplied `dump_id`, so a `Stream` can share
@@ -959,9 +963,7 @@ impl Inner {
         // the two records share queue ids: the wire frame's dest is our local queue and its source
         // is the peer's. `offset` is the start of the range just delivered.
         if bytes_read > 0 {
-            use crate::endpoint::frame_trace::{self, Direction, DropReason, FrameRecord};
-            frame_trace::record(|| FrameRecord::stream(
-                Direction::AppRecv,
+            crate::endpoint::frame_trace::app_recv(
                 self.dest_queue_id,
                 self.stream_rx.queue_id(),
                 self.stream_rx.binding_id(),
@@ -969,9 +971,8 @@ impl Inner {
                     .consumed_len()
                     .saturating_sub(bytes_read as u64),
                 bytes_read as u32,
-                DropReason::None,
                 *self.path_secret_entry.id(),
-            ));
+            );
         }
 
         // Only update flow-control while the channel is healthy.  When
@@ -1125,21 +1126,14 @@ impl Inner {
                         // Stream-layer drop (no wire Header here): the peer sent past the window
                         // and we're about to reset the stream. Mirror the inbound routing
                         // convention (dest = our local queue, source = peer's).
-                        {
-                            use crate::endpoint::frame_trace::{
-                                self, Direction, DropReason, FrameRecord,
-                            };
-                            frame_trace::record(|| FrameRecord::stream(
-                                Direction::RxDropped,
-                                self.dest_queue_id,
-                                self.stream_rx.queue_id(),
-                                self.stream_rx.binding_id(),
-                                offset.as_u64(),
-                                0,
-                                DropReason::WindowViolation,
-                                *self.path_secret_entry.id(),
-                            ));
-                        }
+                        crate::endpoint::frame_trace::reader_drop(
+                            self.dest_queue_id,
+                            self.stream_rx.queue_id(),
+                            self.stream_rx.binding_id(),
+                            offset.as_u64(),
+                            crate::endpoint::frame_trace::DropReason::WindowViolation,
+                            *self.path_secret_entry.id(),
+                        );
                         return self.queue_control_error();
                     }
 
@@ -1833,18 +1827,7 @@ impl Inner {
         // Application (reader-originated control: MAX_DATA, reset, QueueDbg) submitting a frame into
         // the send pipeline — the first sighting, before aggregation/credit/pacing/assembly. Pairs
         // with the Outbound record at assembly. PN is not assigned yet.
-        {
-            use crate::endpoint::frame_trace::{self, Direction, DropReason, FrameRecord};
-            frame_trace::record(|| FrameRecord::from_header(
-                Direction::AppSend,
-                &frame.header,
-                // AppSend is pre-assembly: no PN assigned yet, so no sender scope.
-                None,
-                None,
-                DropReason::None,
-                *self.path_secret_entry.id(),
-            ));
-        }
+        crate::endpoint::frame_trace::app_send(&frame.header, *self.path_secret_entry.id());
         self.frame_tx
             .send_batch(intrusive::Entry::new(frame))
             .map_err(|mut returned| {

@@ -12,7 +12,7 @@ use crate::{
     congestion,
     endpoint::{
         frame::{self, Frame, TransmissionStatus},
-        send,
+        frame_trace, send,
     },
     intrusive::Entry,
     socket::channel::UnboundedSender,
@@ -150,19 +150,16 @@ pub(crate) fn process_ack<Clk, Rand>(
             // Packet acknowledged by the peer. For a shell, `linked_pn` points at the probe PN
             // whose tail actually carries the frames (resolved in Phase 2 below), so the dump shows
             // the shell→tail hop; `frame_count` is the frames completing directly under this PN.
-            {
-                use crate::endpoint::frame_trace::{self, DropReason, PacketEvent, PacketRecord};
-                frame_trace::record(|| PacketRecord::new(
-                    PacketEvent::Acked,
-                    num,
-                    context.sender_idx.as_varint(),
-                    context.credentials.id,
-                    0,
-                    packet.frames.len() as u16,
-                    packet.probed_to.map(PacketNumber::as_varint),
-                    DropReason::None,
-                ));
-            }
+            frame_trace::packet(
+                frame_trace::PacketEvent::Acked,
+                num,
+                context.sender_idx.as_varint(),
+                context.credentials.id,
+                0,
+                packet.frames.len() as u16,
+                packet.probed_to.map(PacketNumber::as_varint),
+                frame_trace::DropReason::None,
+            );
 
             if let Some(probe_pn) = packet.probed_to {
                 // The peer ACKed a shell PN: the original transmission of these frames arrived
@@ -174,19 +171,14 @@ pub(crate) fn process_ack<Clk, Rand>(
             } else {
                 for mut entry in packet.frames {
                     counters.on_acked_frame(&entry.header);
-                    {
-                        use crate::endpoint::frame_trace::{
-                            self, Direction, DropReason, FrameRecord,
-                        };
-                        frame_trace::record(|| FrameRecord::from_header(
-                            Direction::AckCompleted,
-                            &entry.header,
-                            Some(num),
-                            Some(context.sender_idx.as_varint()),
-                            DropReason::None,
-                            context.credentials.id,
-                        ));
-                    }
+                    frame_trace::wire(
+                        frame_trace::Lifecycle::AckCompleted,
+                        &entry.header,
+                        num,
+                        context.sender_idx.as_varint(),
+                        frame_trace::DropReason::None,
+                        context.credentials.id,
+                    );
 
                     crate::endpoint::dbg::on_enabled(|| {
                         if let frame::Header::QueueDbg {
@@ -231,17 +223,14 @@ pub(crate) fn process_ack<Clk, Rand>(
             }
             for mut entry in removal.frames {
                 counters.on_acked_frame(&entry.header);
-                {
-                    use crate::endpoint::frame_trace::{self, Direction, DropReason, FrameRecord};
-                    frame_trace::record(|| FrameRecord::from_header(
-                        Direction::AckCompleted,
-                        &entry.header,
-                        Some(PacketNumber::as_varint(probe_pn)),
-                        Some(context.sender_idx.as_varint()),
-                        DropReason::None,
-                        context.credentials.id,
-                    ));
-                }
+                frame_trace::wire(
+                    frame_trace::Lifecycle::AckCompleted,
+                    &entry.header,
+                    PacketNumber::as_varint(probe_pn),
+                    context.sender_idx.as_varint(),
+                    frame_trace::DropReason::None,
+                    context.credentials.id,
+                );
 
                 crate::endpoint::dbg::on_enabled(|| {
                     if let frame::Header::QueueDbg {
@@ -600,17 +589,16 @@ fn detect_loss<Rand>(
         // pn/time-threshold prefix — see `loss_cutoff`; the reason stays `None` as the trigger is
         // not distinguished per packet.)
         {
-            use crate::endpoint::frame_trace::{self, DropReason, PacketEvent, PacketRecord};
-            frame_trace::record(|| PacketRecord::new(
-                PacketEvent::Lost,
+            frame_trace::packet(
+                frame_trace::PacketEvent::Lost,
                 num,
                 context.sender_idx.as_varint(),
                 context.credentials.id,
                 tx_info.sent_bytes as u32,
                 packet.frames.len() as u16,
                 packet.probed_to.map(PacketNumber::as_varint),
-                DropReason::None,
-            ));
+                frame_trace::DropReason::None,
+            );
         }
 
         for mut entry in packet.frames {
@@ -643,17 +631,14 @@ fn detect_loss<Rand>(
                         ));
                     }
                 });
-                {
-                    use crate::endpoint::frame_trace::{self, Direction, DropReason, FrameRecord};
-                    frame_trace::record(|| FrameRecord::from_header(
-                        Direction::AckCancelled,
-                        &entry.header,
-                        Some(num),
-                        Some(context.sender_idx.as_varint()),
-                        DropReason::None,
-                        context.credentials.id,
-                    ));
-                }
+                frame_trace::wire(
+                    frame_trace::Lifecycle::AckCancelled,
+                    &entry.header,
+                    num,
+                    context.sender_idx.as_varint(),
+                    frame_trace::DropReason::None,
+                    context.credentials.id,
+                );
                 entry.status = TransmissionStatus::Failed(frame::FailureReason::Cancelled);
                 let _ = cancelled.send(entry);
                 cancelled_count += 1;
@@ -681,17 +666,14 @@ fn detect_loss<Rand>(
                         ));
                     }
                 });
-                {
-                    use crate::endpoint::frame_trace::{self, Direction, DropReason, FrameRecord};
-                    frame_trace::record(|| FrameRecord::from_header(
-                        Direction::AckCancelled,
-                        &entry.header,
-                        Some(num),
-                        Some(context.sender_idx.as_varint()),
-                        DropReason::None,
-                        context.credentials.id,
-                    ));
-                }
+                frame_trace::wire(
+                    frame_trace::Lifecycle::AckCancelled,
+                    &entry.header,
+                    num,
+                    context.sender_idx.as_varint(),
+                    frame_trace::DropReason::None,
+                    context.credentials.id,
+                );
                 entry.status = TransmissionStatus::Failed(frame::FailureReason::TransmissionError);
                 let _ = completed.send(entry);
                 ttl_exhausted_count += 1;
@@ -712,17 +694,14 @@ fn detect_loss<Rand>(
                     ));
                 }
             });
-            {
-                use crate::endpoint::frame_trace::{self, Direction, DropReason, FrameRecord};
-                frame_trace::record(|| FrameRecord::from_header(
-                    Direction::AckLost,
-                    &entry.header,
-                    Some(num),
-                    Some(context.sender_idx.as_varint()),
-                    DropReason::None,
-                    context.credentials.id,
-                ));
-            }
+            frame_trace::wire(
+                frame_trace::Lifecycle::AckLost,
+                &entry.header,
+                num,
+                context.sender_idx.as_varint(),
+                frame_trace::DropReason::None,
+                context.credentials.id,
+            );
             let _ = lost.send(entry);
             lost_count += 1;
         }

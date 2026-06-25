@@ -96,14 +96,23 @@ impl Stream {
     /// each local dump, every hop the marker frames touch, and the peer's woken handles — groups
     /// under one id. Grep that id to reconstruct the end-to-end trace.
     ///
-    /// No-op unless the `queue-dbg` feature (or a test/`testing` build) is enabled — the whole body
-    /// is gated by [`crate::endpoint::dbg::on_enabled`].
-    pub fn emit_debug(&mut self) {
-        crate::endpoint::dbg::on_enabled(|| {
-            let dump_id = crate::endpoint::dbg::next_dump_id();
-            self.read.emit_debug_with_id(dump_id);
-            self.write.emit_debug_with_id(dump_id);
-        });
+    /// Returns the minted `dump_id` so the application can stamp its own trace events with it (e.g.
+    /// an `AppStreamBind` event recorded through `backbeat::global`), joining the app's world to the
+    /// dc frames of this stream — or `None` when the diagnostic is not compiled in.
+    ///
+    /// The whole facility (minting the id, sending the `QueueDbg` frames, the resulting dumps) is
+    /// gated behind [`crate::endpoint::dbg::ENABLED`]: it does nothing and returns `None` unless the
+    /// `queue-dbg` feature (or a test/`testing` build) is enabled. There is no id to correlate
+    /// against in a production build — nothing records or dumps — so we mint none and avoid the RNG
+    /// cost entirely.
+    pub fn emit_debug(&mut self) -> Option<u64> {
+        if !crate::endpoint::dbg::ENABLED {
+            return None;
+        }
+        let dump_id = crate::endpoint::dbg::next_dump_id();
+        self.read.emit_debug_with_id(dump_id);
+        self.write.emit_debug_with_id(dump_id);
+        Some(dump_id)
     }
 
     /// Returns borrowed access to the read and write halves.
