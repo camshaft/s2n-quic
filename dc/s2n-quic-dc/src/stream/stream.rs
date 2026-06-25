@@ -98,19 +98,21 @@ impl Stream {
     ///
     /// Returns the minted `dump_id` so the application can stamp its own trace events with it (e.g.
     /// an `AppStreamBind` event recorded through `backbeat::global`), joining the app's world to the
-    /// dc frames of this stream. The id is always returned, even in a production build where the
-    /// `QueueDbg` frames below are not actually sent.
+    /// dc frames of this stream — or `None` when the diagnostic is not compiled in.
     ///
-    /// Sending the `QueueDbg` frames (and the resulting dumps) is gated by
-    /// [`crate::endpoint::dbg::on_enabled`]: a no-op unless the `queue-dbg` feature (or a
-    /// test/`testing` build) is enabled. Minting the id is cheap and always runs.
-    pub fn emit_debug(&mut self) -> u64 {
+    /// The whole facility (minting the id, sending the `QueueDbg` frames, the resulting dumps) is
+    /// gated behind [`crate::endpoint::dbg::ENABLED`]: it does nothing and returns `None` unless the
+    /// `queue-dbg` feature (or a test/`testing` build) is enabled. There is no id to correlate
+    /// against in a production build — nothing records or dumps — so we mint none and avoid the RNG
+    /// cost entirely.
+    pub fn emit_debug(&mut self) -> Option<u64> {
+        if !crate::endpoint::dbg::ENABLED {
+            return None;
+        }
         let dump_id = crate::endpoint::dbg::next_dump_id();
-        crate::endpoint::dbg::on_enabled(|| {
-            self.read.emit_debug_with_id(dump_id);
-            self.write.emit_debug_with_id(dump_id);
-        });
-        dump_id
+        self.read.emit_debug_with_id(dump_id);
+        self.write.emit_debug_with_id(dump_id);
+        Some(dump_id)
     }
 
     /// Returns borrowed access to the read and write halves.

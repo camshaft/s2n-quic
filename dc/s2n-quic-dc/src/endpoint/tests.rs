@@ -1064,9 +1064,12 @@ fn emit_debug_returns_dump_id_for_app_correlation() {
             }
             10.ms().sleep().await;
 
-            // A.1: emit_debug now returns the minted dump_id.
-            let dump_id = stream.emit_debug();
-            assert_ne!(dump_id, 0, "emit_debug should return a real dump_id");
+            // A.1: emit_debug returns the minted dump_id (Some, since the diagnostic is compiled in
+            // under `cfg(test)`; production without `queue-dbg` returns None and mints nothing).
+            let dump_id = stream
+                .emit_debug()
+                .expect("emit_debug returns Some(dump_id) when the diagnostic is enabled");
+            assert_ne!(dump_id, 0, "dump_id should be non-zero");
 
             // A.3: the app records its own bind event, keyed by that dump_id, into the same recorder.
             let request_id = 0xA5A5_0001;
@@ -1119,10 +1122,12 @@ fn emit_debug_returns_dump_id_for_app_correlation() {
                     if view.event_id == AppStreamBind::ID {
                         let d = core::mem::offset_of!(AppStreamBind, dump_id);
                         let r = core::mem::offset_of!(AppStreamBind, request_id);
+                        // `zerocopy::IntoBytes` writes integers in native-endian, so read them back
+                        // the same way (not `from_le_bytes`, which would mis-parse on big-endian).
                         let read = |off: usize| {
                             view.fields
                                 .get(off..off + 8)
-                                .map(|b| u64::from_le_bytes(b.try_into().unwrap()))
+                                .map(|b| u64::from_ne_bytes(b.try_into().unwrap()))
                         };
                         if read(d) == Some(dump_id) && read(r) == Some(request_id) {
                             found = true;

@@ -627,19 +627,18 @@ impl Reader {
     /// log their own state stamped with one shared `dump_id`. Grep that id to reconstruct the trace.
     ///
     /// Returns the minted `dump_id` so the application can stamp its own trace events with it (see
-    /// [`crate::stream::Stream::emit_debug`]). The id is always returned, even in a production build
-    /// where the `QueueDbg` frame below is not actually sent.
+    /// [`crate::stream::Stream::emit_debug`]) — or `None` when the diagnostic is not compiled in.
     ///
-    /// Sending the `QueueDbg` frame (and the resulting dump + peer wake) is gated by
-    /// [`crate::endpoint::dbg::on_enabled`] — a no-op unless the `queue-dbg` feature (or a
-    /// test/`testing` build) is enabled. Waking the peer can unstick a genuine lost-wakeup, so the
-    /// dump is observational, not side-effect-free. Minting the id is cheap and always runs.
-    pub fn emit_debug(&mut self) -> u64 {
+    /// Gated behind [`crate::endpoint::dbg::ENABLED`]: does nothing and returns `None` unless the
+    /// `queue-dbg` feature (or a test/`testing` build) is enabled. Waking the peer can unstick a
+    /// genuine lost-wakeup, so the dump is observational, not side-effect-free.
+    pub fn emit_debug(&mut self) -> Option<u64> {
+        if !crate::endpoint::dbg::ENABLED {
+            return None;
+        }
         let dump_id = crate::endpoint::dbg::next_dump_id();
-        crate::endpoint::dbg::on_enabled(|| {
-            self.0.emit_debug_with_id(dump_id);
-        });
-        dump_id
+        self.0.emit_debug_with_id(dump_id);
+        Some(dump_id)
     }
 
     /// Emit a `QueueDbg` from this reader using a caller-supplied `dump_id`, so a `Stream` can share
