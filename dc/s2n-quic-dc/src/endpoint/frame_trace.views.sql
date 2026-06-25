@@ -25,6 +25,44 @@
 -- with the per-kind struct accessor below. Rows are ordered by (ts_nanos, seq) so a deterministic
 -- simulated clock with ties still yields a stable, total order.
 
+-- EVERY event for one flow, full width, time-ordered — the primary correlation surface.
+--
+-- `convert` writes one sparse-wide table: promoted keys (cred_id, binding_id, sender_id,
+-- packet_number, …) are dense top-level columns shared by all rows, and each event type's remaining
+-- fields nest in that event's own struct column (NULL on rows of other types). So `SELECT *` filtered
+-- on the flow key keeps every event whole: a SlotPush row carries its `...::SlotPush`.woke, a FinPath
+-- row its `...::FinPath`.outcome, a QueueDataFrame row its `...::QueueDataFrame`.lifecycle, and each is
+-- NULL on the others. The crucial property: a diagnostic event type added later (with cred_id +
+-- binding_id promoted as keys) appears here automatically with all its columns — no view surgery.
+--
+-- Use this when you want the complete picture (wire frames + the stream-layer diagnostic events:
+-- SlotPush / ServerBind / MaxDataStall / FinPath / HandleDrop, none of which have a `lifecycle`). The
+-- compact `flow_frames` below is the lifecycle-only convenience view for a quick wire-frame trace.
+--
+-- Two row sources, because the binding is known at two different layers:
+--   1. Events that carry `binding_id` as a promoted key — every frame event and every stream-layer
+--      diagnostic event — selected directly by the flow key `(cred_id, binding_id)`.
+--   2. `PacketRecord`s, which are emitted at the packet layer BEFORE frame decode, so they carry
+--      `(cred_id, sender_id, packet_number)` but NOT `binding_id` — a packet has no single flow, it
+--      bundles whatever frames rode in it. We attribute a packet to this flow when one of the flow's
+--      own frames shares its `(cred_id, sender_id, packet_number)`. Without this, the packet-level
+--      lifecycle (RxArrived / Sent / Acked / Lost / pre-decode RxDropped) for the flow's frames would
+--      be missing from the wide view — exactly the wire/loss context a frame row can't carry itself.
+-- `binding_id` is NULL on the packet rows (it genuinely isn't known at that layer); every other
+-- promoted column lines up, so `UNION ALL BY NAME` keeps each row full-width.
+CREATE OR REPLACE MACRO flow_events(cred, bind) AS TABLE
+  SELECT * FROM events
+   WHERE cred_id = cred AND binding_id = bind
+  UNION ALL BY NAME
+  SELECT p.* FROM "s2n_quic_dc::packet::PacketRecord" p
+   WHERE p.cred_id = cred
+     AND EXISTS (
+       SELECT 1 FROM events f
+        WHERE f.cred_id = cred AND f.binding_id = bind
+          AND f.sender_id = p.sender_id AND f.packet_number = p.packet_number
+     )
+   ORDER BY ts_nanos, seq;
+
 -- All frame events for one flow, unioned to a uniform shape, time-ordered. Each per-kind event
 -- contributes its own `lifecycle` (out of its struct column) plus the common columns. queue_ids are
 -- carried inside the per-kind struct for context but are never join keys.
@@ -102,3 +140,16 @@ CREATE OR REPLACE MACRO stream_by_dump(d) AS TABLE
     LIMIT 1
   )
   SELECT t.* FROM s, LATERAL stream_timeline(s.cred_id, s.binding_id) t;
+
+-- dump_id -> the flow's FULL-width event stream (every event type, all columns), via the QueueDbg
+-- bridge row. The wide counterpart of `stream_by_dump`: use it when you need the diagnostic events
+-- (SlotPush / ServerBind / MaxDataStall / FinPath / HandleDrop) with their real fields, not just the
+-- lifecycle-projected wire frames.
+CREATE OR REPLACE MACRO flow_events_by_dump(d) AS TABLE
+  WITH s AS (
+    SELECT cred_id, binding_id
+    FROM "s2n_quic_dc::frame::queue_dbg::QueueDbgFrame"
+    WHERE dump_id = d
+    LIMIT 1
+  )
+  SELECT t.* FROM s, LATERAL flow_events(s.cred_id, s.binding_id) t;

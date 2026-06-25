@@ -53,6 +53,42 @@ fn entry_size() {
     }
 }
 
+/// A peer marked dead must claw back out of the cooldown as soon as we receive proof it is alive.
+///
+/// `dead_at` is otherwise only ever *set* (by [`Entry::mark_dead_if_cooldown_elapsed`]) and never
+/// cleared, so a transient blip (e.g. a deploy restart) traps the peer pair in hard-refused flows
+/// for the whole cooldown — and an idle probe re-arms the window, so it never recovers. An
+/// authenticated, de-duped packet is proof of life, and that is exactly the path that calls
+/// [`Entry::touch_activity`], so touching activity must clear the mark.
+#[test]
+fn touch_activity_clears_dead_cooldown() {
+    let entry = test_entry_with_senders(0);
+    let cooldown = crate::endpoint::DEFAULT_DEAD_PEER_COOLDOWN;
+
+    let t0: crate::time::precision::Timestamp =
+        (unsafe { Timestamp::from_duration(Duration::from_secs(100)) }).into();
+
+    // Mark the peer dead (simulating the idle wheel observing unacked inflight).
+    assert!(
+        entry.mark_dead_if_cooldown_elapsed(t0, cooldown),
+        "first mark should take effect"
+    );
+    assert!(
+        entry.is_dead_during_cooldown(t0, cooldown),
+        "peer should be in the dead cooldown right after marking"
+    );
+
+    // A packet authenticated from the peer 1s later is proof of life — touch_activity runs on that
+    // path and must release the cooldown so flows are no longer refused.
+    let t1 = t0 + Duration::from_secs(1);
+    entry.touch_activity(t1);
+
+    assert!(
+        !entry.is_dead_during_cooldown(t1, cooldown),
+        "an authenticated packet (proof of life) must clear the dead cooldown"
+    );
+}
+
 #[test]
 fn allocates_sender_schedule_slots() {
     let entry = test_entry_with_senders(4);

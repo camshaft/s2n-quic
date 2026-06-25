@@ -199,6 +199,85 @@ pub(crate) enum PacketEvent {
     Lost = 4,
 }
 
+/// Server-side outcome of an init frame's accept/bind attempt. Stored in [`ServerBind::outcome`].
+///
+/// Discriminants are stable dump values — append, never renumber.
+#[derive(EventEnum, IntoBytes, Immutable, Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub(crate) enum BindOutcome {
+    /// Init bound a fresh slot and the response stream was handed to the acceptor (success).
+    Accepted = 0,
+    /// No acceptor registered for the init's `dest_acceptor_id` — slot freed, client reset.
+    NoAcceptor = 1,
+    /// Acceptor channel was closed — slot torn down, client reset.
+    AcceptorClosed = 2,
+    /// Acceptor had no free slots (ServerBusy) — client reset.
+    NoSlots = 3,
+    /// Init arrived for a slot already bound / stale / future binding — no new stream created.
+    StaleOrBound = 4,
+}
+
+/// Why a reader's window-growth attempt advertised no — or no new — MAX_DATA. Stored in
+/// [`MaxDataStall::outcome`]. [`Entered`](MaxDataOutcome::Entered) is the "an `Open` reader was
+/// polled and reached the window-growth logic" marker: for an `Open` reader, its *absence* after a
+/// stall means the reader was never re-polled (a lost wakeup), vs. a non-`Entered` outcome which
+/// means a gate deliberately held the window. It does NOT fire for a reader still in `Init` (which
+/// short-circuits before the window logic) — reason about an Init-phase stall with [`ServerBind`].
+///
+/// Discriminants are stable dump values — append, never renumber.
+#[derive(EventEnum, IntoBytes, Immutable, Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub(crate) enum MaxDataOutcome {
+    /// An `Open` reader reached `maybe_send_max_data` — the poll-liveness marker. Not emitted while
+    /// the reader is in `Init` (it short-circuits earlier); see the enum doc.
+    Entered = 0,
+    /// Wanted to grow the window but the recv-pool acquire parked and nothing was collected; the
+    /// `poll_granted()` precheck returned Pending so the unbacked-window fallback was never reached.
+    PoolPending = 1,
+    /// Passed the demand/threshold gate but collected zero credit (unbacked exhausted + no grant +
+    /// fresh acquire parked) — advertised nothing; the window did not move.
+    GrantedZero = 2,
+    /// Below the top-up threshold and the writer signalled no new demand — intentionally not sent.
+    BelowThreshold = 3,
+    /// A final size (FIN) is known and the advertised window already covers it — intentionally not sent.
+    FinCovered = 4,
+}
+
+/// Which branch of the writer's FIN path handled (or deferred) the stream's FIN. Stored in
+/// [`FinPath::outcome`]. A stuck stream showing [`Deferred`](FinOutcome::Deferred) with no later
+/// [`RodeData`](FinOutcome::RodeData)/[`OnlyFrame`](FinOutcome::OnlyFrame) pins a missing-FIN wedge.
+///
+/// Discriminants are stable dump values — append, never renumber.
+#[derive(EventEnum, IntoBytes, Immutable, Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub(crate) enum FinOutcome {
+    /// `send_data` attached the FIN bit to the final data frame (`is_fin && is_last_chunk`) — the
+    /// healthy outcome for a response that fully drained in one call.
+    RodeData = 0,
+    /// `send_data` sent a data frame with `fin=false` because the buffer was not drained this call
+    /// (chunk clamped by credit/window/coop); the FIN is expected on a later poll.
+    Deferred = 1,
+    /// `send_data` emitted a standalone empty FIN frame (buffer already empty).
+    OnlyFrame = 2,
+    /// Writer `shutdown()` dispatched a FIN-only packet.
+    ShutdownSent = 3,
+    /// Writer `shutdown()` took an early-return branch (already shutdown / fin_sent / init / pending
+    /// reset) so no FIN packet was emitted here.
+    ShutdownSkipped = 4,
+}
+
+/// Which stream handle the application dropped. Stored in [`HandleDrop::handle`].
+///
+/// Discriminants are stable dump values — append, never renumber.
+#[derive(EventEnum, IntoBytes, Immutable, Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub(crate) enum HandleKind {
+    /// The application dropped the `Writer` handle (recorded at the top of `Writer::drop`).
+    Writer = 0,
+    /// The application dropped the `Reader` handle (recorded at the top of `Reader::drop`).
+    Reader = 1,
+}
+
 // ──────────────────────────────────────────────────────────────────────────────────────────────
 // Per-kind frame events.
 //
@@ -235,13 +314,19 @@ pub struct QueueDataFrame {
     /// Bytes delivered to the application for [`Lifecycle::AppRecv`], else 0.
     #[event(unit = "bytes")]
     pub payload_len: u32,
+    /// Retransmit generation at [`Lifecycle::Outbound`]: `0` on the original transmission, `N` on the
+    /// Nth retransmit of this exact `(cred, binding, offset)` data. Derived from the frame's TTL
+    /// (`DEFAULT_TTL - ttl`), so it is immune to packet-number recycling — unlike the PN, it identifies
+    /// "the same bytes, sent again." A row whose `retransmit_gen` keeps climbing while ACKs lag is
+    /// spurious-loss amplification. `0` at every non-`Outbound` lifecycle.
+    pub retransmit_gen: u32,
     pub lifecycle: Lifecycle,
     pub reason: DropReason,
     pub is_fin: bool,
     pub blocked: bool,
     /// This frame carries init fields (it can create the binding).
     pub is_init: bool,
-    pub _pad: [u8; 7],
+    pub _pad: [u8; 3],
 }
 
 /// `QueueMsg` — pre-allocated message data (whole-message reassembly).
@@ -272,13 +357,16 @@ pub struct QueueMsgFrame {
     pub chunk_index: u64,
     #[event(key)]
     pub cred_id: [u8; 16],
+    /// Retransmit generation at [`Lifecycle::Outbound`] (`0` original, `N` Nth retransmit of this
+    /// exact message chunk). Derived from TTL, PN-recycle-immune. See [`QueueDataFrame::retransmit_gen`].
+    pub retransmit_gen: u32,
     pub lifecycle: Lifecycle,
     pub reason: DropReason,
     pub is_fin: bool,
     pub is_wakeup: bool,
     pub blocked: bool,
     pub is_init: bool,
-    pub _pad: [u8; 2],
+    pub _pad: [u8; 6],
 }
 
 /// `QueueMaxData` — inline window update (MAX_DATA value carried in the header).
@@ -479,6 +567,125 @@ pub struct PacketRecord {
     pub reason: DropReason,
 }
 
+// ──────────────────────────────────────────────────────────────────────────────────────────────
+// Stream-layer diagnostic events.
+//
+// These are not wire frames — each is a first-class observation point with its own real columns,
+// recorded where no `Header` is in scope (server bind, reader window growth, writer FIN path, handle
+// drop, slot push). They join the same flow as the wire frames through `(cred_id, binding_id)`, and
+// carry the queue ids for context. Because backbeat makes every event type its own column set at
+// zero cost, each gets exactly the fields it needs — no value rides in a field whose name does not
+// describe it.
+// ──────────────────────────────────────────────────────────────────────────────────────────────
+
+/// The hand-off of inbound stream bytes into the receiver's per-stream slot at dispatch, one layer
+/// after the [`Lifecycle::Inbound`] wire decode. [`woke`](Self::woke) records whether a parked
+/// reader's waker rode with the push: a `false` (no waker) on beyond-window bytes with no following
+/// [`Lifecycle::AppRecv`] at the same flow is the lost-wakeup smoking gun — data queued, parked
+/// reader never woken.
+#[derive(Event, IntoBytes, Immutable, Debug)]
+#[event(namespace = "s2n_quic_dc::recv::slot_push")]
+#[repr(C)]
+pub struct SlotPush {
+    pub source_queue_id: u64,
+    pub dest_queue_id: u64,
+    #[event(key)]
+    pub binding_id: u64,
+    /// Stream offset of the pushed bytes.
+    #[event(unit = "bytes")]
+    pub offset: u64,
+    #[event(key)]
+    pub cred_id: [u8; 16],
+    /// A parked reader's waker rode with this push and will be woken.
+    pub woke: bool,
+    pub _pad: [u8; 7],
+}
+
+/// The server-side outcome of an init frame's accept/bind attempt — whether (and why not) the
+/// response stream was created. The blind spot for the "reader stuck in Init, received nothing"
+/// wedge class: an absent `ServerBind` for a flow proves the server never even attempted the bind.
+#[derive(Event, IntoBytes, Immutable, Debug)]
+#[event(namespace = "s2n_quic_dc::recv::server_bind")]
+#[repr(C)]
+pub struct ServerBind {
+    pub source_queue_id: u64,
+    pub dest_queue_id: u64,
+    #[event(key)]
+    pub binding_id: u64,
+    #[event(key)]
+    pub cred_id: [u8; 16],
+    pub outcome: BindOutcome,
+    pub _pad: [u8; 7],
+}
+
+/// A reader's window-growth decision in `maybe_send_max_data`: why it advertised no — or no new —
+/// MAX_DATA. Proves why a streaming reader's window freezes and starves the peer writer.
+/// [`peer_max_offset`](Self::peer_max_offset) is what the writer has told us it wants to reach;
+/// [`target_window`](Self::target_window) is the window the reader would advertise. The
+/// [`MaxDataOutcome::Entered`] marker is the poll-liveness signal for an `Open` reader (it does not
+/// fire while the reader is in `Init`; see [`MaxDataOutcome`]).
+#[derive(Event, IntoBytes, Immutable, Debug)]
+#[event(namespace = "s2n_quic_dc::recv::max_data_stall")]
+#[repr(C)]
+pub struct MaxDataStall {
+    pub source_queue_id: u64,
+    pub dest_queue_id: u64,
+    #[event(key)]
+    pub binding_id: u64,
+    /// The window the reader wanted to reach (0 for the bare [`MaxDataOutcome::Entered`] marker).
+    #[event(unit = "bytes")]
+    pub target_window: u64,
+    /// The largest offset the peer writer has signalled it wants to send.
+    #[event(unit = "bytes")]
+    pub peer_max_offset: u64,
+    #[event(key)]
+    pub cred_id: [u8; 16],
+    pub outcome: MaxDataOutcome,
+    pub _pad: [u8; 7],
+}
+
+/// A writer FIN-path decision — which branch handled, deferred, or dropped the stream's FIN.
+/// Separates "transport lost the FIN" from "the FIN was never framed" for the missing-FIN wedge.
+#[derive(Event, IntoBytes, Immutable, Debug)]
+#[event(namespace = "s2n_quic_dc::send::fin_path")]
+#[repr(C)]
+pub struct FinPath {
+    pub source_queue_id: u64,
+    pub dest_queue_id: u64,
+    #[event(key)]
+    pub binding_id: u64,
+    /// Bytes buffered in the writer when this decision was made.
+    #[event(unit = "bytes")]
+    pub buffered_len: u64,
+    #[event(key)]
+    pub cred_id: [u8; 16],
+    /// Bytes in the chunk this decision framed (0 for the shutdown / empty-FIN branches).
+    #[event(unit = "bytes")]
+    pub chunk_len: u32,
+    pub outcome: FinOutcome,
+    pub _pad: [u8; 3],
+}
+
+/// The application dropped a stream handle. Recorded unconditionally at the top of `Writer::drop` /
+/// `Reader::drop` before teardown — so on a stuck stream, presence vs absence separates "transport
+/// lost the drop-time FIN" from "the app never released the handle."
+#[derive(Event, IntoBytes, Immutable, Debug)]
+#[event(namespace = "s2n_quic_dc::handle_drop")]
+#[repr(C)]
+pub struct HandleDrop {
+    pub source_queue_id: u64,
+    pub dest_queue_id: u64,
+    #[event(key)]
+    pub binding_id: u64,
+    /// `next_offset` for a writer drop, `consumed_len` for a reader drop.
+    #[event(unit = "bytes")]
+    pub offset: u64,
+    #[event(key)]
+    pub cred_id: [u8; 16],
+    pub handle: HandleKind,
+    pub _pad: [u8; 7],
+}
+
 /// Canonicalizes a credential id by masking off the endpoint bit (MSB of byte 0). That bit encodes
 /// which side a `credentials::Id` is viewed from — the server and client hold the same logical id
 /// with this bit flipped (see `Id::for_endpoint`/`for_peer`). Clearing it makes a record from either
@@ -515,6 +722,33 @@ pub(crate) fn wire(
             sender_id.as_u64(),
             reason,
             cred_id,
+            0,
+        )
+    });
+}
+
+/// Records a [`Lifecycle::Outbound`] sighting at packet assembly, carrying the frame's `retransmit_gen`
+/// (`DEFAULT_TTL - ttl`): `0` on the original transmission, `N` on the Nth retransmit of this exact
+/// data. Only [`QueueDataFrame`]/[`QueueMsgFrame`] carry it; for every other kind the generation is
+/// recorded but unused. Use this instead of [`wire`] at the assembler so spurious-loss amplification
+/// (a climbing `retransmit_gen` while ACKs lag) is visible without relying on the recyclable PN.
+#[inline]
+pub(crate) fn outbound(
+    header: &Header,
+    pn: VarInt,
+    sender_id: VarInt,
+    retransmit_gen: u32,
+    cred_id: CredId,
+) {
+    super::dbg::on_enabled(|| {
+        emit_header(
+            Lifecycle::Outbound,
+            header,
+            pn.as_u64(),
+            sender_id.as_u64(),
+            DropReason::None,
+            cred_id,
+            retransmit_gen,
         )
     });
 }
@@ -532,6 +766,7 @@ pub(crate) fn app_send(header: &Header, cred_id: CredId) {
             NO_PACKET_NUMBER,
             DropReason::None,
             cred_id,
+            0,
         )
     });
 }
@@ -560,12 +795,13 @@ pub(crate) fn app_recv(
             largest_offset: 0,
             cred_id: canonicalize_cred(*cred_id),
             payload_len: delivered,
+            retransmit_gen: 0,
             lifecycle: Lifecycle::AppRecv,
             reason: DropReason::None,
             is_fin: false,
             blocked: false,
             is_init: false,
-            _pad: [0; 7],
+            _pad: [0; 3],
         })
     });
 }
@@ -592,11 +828,135 @@ pub(crate) fn reader_drop(
             largest_offset: 0,
             cred_id: canonicalize_cred(*cred_id),
             payload_len: 0,
+            retransmit_gen: 0,
             lifecycle: Lifecycle::RxDropped,
             reason,
             is_fin: false,
             blocked: false,
             is_init: false,
+            _pad: [0; 3],
+        })
+    });
+}
+
+/// Records a [`SlotPush`] — inbound stream bytes accepted into the receiver's slot at dispatch, with
+/// `woke` recording whether a parked reader's waker rode along (a `false` on beyond-window bytes with
+/// no following [`Lifecycle::AppRecv`] is the lost-wakeup signal).
+#[inline]
+pub(crate) fn slot_push(
+    source_queue_id: VarInt,
+    dest_queue_id: VarInt,
+    binding_id: VarInt,
+    offset: u64,
+    woke: bool,
+    cred_id: CredId,
+) {
+    super::dbg::on_enabled(|| {
+        backbeat::global::record(&SlotPush {
+            source_queue_id: source_queue_id.as_u64(),
+            dest_queue_id: dest_queue_id.as_u64(),
+            binding_id: binding_id.as_u64(),
+            offset,
+            cred_id: canonicalize_cred(*cred_id),
+            woke,
+            _pad: [0; 7],
+        })
+    });
+}
+
+/// Records a [`ServerBind`] — the server-side outcome of an init frame's accept/bind attempt.
+#[inline]
+pub(crate) fn server_bind(
+    source_queue_id: VarInt,
+    dest_queue_id: VarInt,
+    binding_id: VarInt,
+    outcome: BindOutcome,
+    cred_id: CredId,
+) {
+    super::dbg::on_enabled(|| {
+        backbeat::global::record(&ServerBind {
+            source_queue_id: source_queue_id.as_u64(),
+            dest_queue_id: dest_queue_id.as_u64(),
+            binding_id: binding_id.as_u64(),
+            cred_id: canonicalize_cred(*cred_id),
+            outcome,
+            _pad: [0; 7],
+        })
+    });
+}
+
+/// Records a [`MaxDataStall`] — a reader window-growth decision. `target_window` is the window the
+/// reader wanted to reach (0 for the bare [`MaxDataOutcome::Entered`] marker); `peer_max_offset` is
+/// the largest offset the peer writer has signalled.
+#[inline]
+pub(crate) fn max_data_stall(
+    source_queue_id: VarInt,
+    dest_queue_id: VarInt,
+    binding_id: VarInt,
+    target_window: u64,
+    peer_max_offset: u64,
+    outcome: MaxDataOutcome,
+    cred_id: CredId,
+) {
+    super::dbg::on_enabled(|| {
+        backbeat::global::record(&MaxDataStall {
+            source_queue_id: source_queue_id.as_u64(),
+            dest_queue_id: dest_queue_id.as_u64(),
+            binding_id: binding_id.as_u64(),
+            target_window,
+            peer_max_offset,
+            cred_id: canonicalize_cred(*cred_id),
+            outcome,
+            _pad: [0; 7],
+        })
+    });
+}
+
+/// Records a [`FinPath`] — a writer FIN-path decision. `buffered_len` is the bytes buffered in the
+/// writer at the decision; `chunk_len` the bytes the decision framed (0 for shutdown/empty-FIN).
+#[inline]
+pub(crate) fn fin_path(
+    source_queue_id: VarInt,
+    dest_queue_id: VarInt,
+    binding_id: VarInt,
+    buffered_len: u64,
+    chunk_len: u32,
+    outcome: FinOutcome,
+    cred_id: CredId,
+) {
+    super::dbg::on_enabled(|| {
+        backbeat::global::record(&FinPath {
+            source_queue_id: source_queue_id.as_u64(),
+            dest_queue_id: dest_queue_id.as_u64(),
+            binding_id: binding_id.as_u64(),
+            buffered_len,
+            cred_id: canonicalize_cred(*cred_id),
+            chunk_len,
+            outcome,
+            _pad: [0; 3],
+        })
+    });
+}
+
+/// Records a [`HandleDrop`] — the application dropped a stream handle. `offset` is `next_offset`
+/// (writer) / `consumed_len` (reader).
+#[inline]
+pub(crate) fn handle_drop(
+    source_queue_id: VarInt,
+    dest_queue_id: VarInt,
+    binding_id: VarInt,
+    offset: u64,
+    handle: HandleKind,
+    cred_id: CredId,
+) {
+    super::dbg::on_enabled(|| {
+        backbeat::global::record(&HandleDrop {
+            source_queue_id: source_queue_id.as_u64(),
+            dest_queue_id: dest_queue_id.as_u64(),
+            binding_id: binding_id.as_u64(),
+            offset,
+            cred_id: canonicalize_cred(*cred_id),
+            handle,
             _pad: [0; 7],
         })
     });
@@ -647,6 +1007,7 @@ fn emit_header(
     sender_id: u64,
     reason: DropReason,
     cred_id: CredId,
+    retransmit_gen: u32,
 ) {
     let cred = canonicalize_cred(*cred_id);
     match *header {
@@ -669,12 +1030,13 @@ fn emit_header(
             largest_offset: largest_offset.as_u64(),
             cred_id: cred,
             payload_len: 0,
+            retransmit_gen,
             lifecycle,
             reason,
             is_fin,
             blocked,
             is_init: dest_acceptor_id.is_some(),
-            _pad: [0; 7],
+            _pad: [0; 3],
         }),
         Header::QueueMsg {
             queue_pair,
@@ -703,13 +1065,14 @@ fn emit_header(
             chunk_size: chunk_size.as_u64(),
             chunk_index: chunk_index.as_u64(),
             cred_id: cred,
+            retransmit_gen,
             lifecycle,
             reason,
             is_fin,
             is_wakeup,
             blocked,
             is_init: dest_acceptor_id.is_some(),
-            _pad: [0; 2],
+            _pad: [0; 6],
         }),
         Header::QueueMaxData {
             queue_pair,
@@ -888,14 +1251,21 @@ const FRAME_LIFECYCLE: &[(backbeat::EventId, usize)] = &[
     (PingFrame::ID, core::mem::offset_of!(PingFrame, lifecycle)),
 ];
 
-/// Test-only snapshot of which kinds are currently resident in the global recorder: the set of
-/// [`Lifecycle`] discriminants across all frame events, and the set of [`PacketEvent`] discriminants
-/// across [`PacketRecord`]s. Lets an end-to-end test assert the trace points fire during a real
-/// transfer without an on-disk dump.
+/// Test-only snapshot of what is currently resident in the global recorder:
+///
+/// * the set of [`Lifecycle`] discriminants across all frame events,
+/// * the set of [`PacketEvent`] discriminants across [`PacketRecord`]s, and
+/// * the set of resident `backbeat` event ids (so a test can assert a stream-layer diagnostic event
+///   type — [`SlotPush`], [`ServerBind`], [`MaxDataStall`], [`FinPath`], [`HandleDrop`], which have
+///   no `lifecycle` — actually fired).
+///
+/// Lets an end-to-end test assert the trace points fire during a real transfer without an on-disk
+/// dump.
 #[cfg(test)]
 pub(crate) fn resident_event_kinds() -> (
     std::collections::BTreeSet<u8>,
     std::collections::BTreeSet<u8>,
+    std::collections::BTreeSet<u64>,
 ) {
     use backbeat::record::RecordView;
 
@@ -908,12 +1278,13 @@ pub(crate) fn resident_event_kinds() -> (
 
     let mut lifecycles = std::collections::BTreeSet::new();
     let mut packet_events = std::collections::BTreeSet::new();
+    let mut event_ids = std::collections::BTreeSet::new();
 
     let Ok(reader) = backbeat::wire::DumpReader::new(bytes) else {
-        return (lifecycles, packet_events);
+        return (lifecycles, packet_events, event_ids);
     };
     let Ok(shards) = reader.shards() else {
-        return (lifecycles, packet_events);
+        return (lifecycles, packet_events, event_ids);
     };
     for shard in shards {
         backbeat::ring::walk(
@@ -924,6 +1295,7 @@ pub(crate) fn resident_event_kinds() -> (
                 let Some(view) = RecordView::parse(&payload) else {
                     return false;
                 };
+                event_ids.insert(view.event_id.get());
                 if view.event_id == PacketRecord::ID {
                     if let Some(&b) = view.fields.get(core::mem::offset_of!(PacketRecord, event)) {
                         packet_events.insert(b);
@@ -940,5 +1312,5 @@ pub(crate) fn resident_event_kinds() -> (
         );
     }
 
-    (lifecycles, packet_events)
+    (lifecycles, packet_events, event_ids)
 }

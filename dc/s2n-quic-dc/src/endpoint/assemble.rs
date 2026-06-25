@@ -420,12 +420,11 @@ where
                     if phase3_is_probe {
                         counters.on_probe_frame(&frame.header);
                     }
-                    frame_trace::wire(
-                        frame_trace::Lifecycle::Outbound,
+                    frame_trace::outbound(
                         &frame.header,
                         context.next_packet_number,
                         source_sender_id.as_varint(),
-                        frame_trace::DropReason::None,
+                        (frame::DEFAULT_TTL - frame.ttl) as u32,
                         context.credentials.id,
                     );
                     // Sending a QueueDbg means this node noticed its own stream is stuck (via
