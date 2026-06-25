@@ -1311,11 +1311,10 @@ fn trace_groups_materialize_ops_under_one_stream_id() {
                     BlockRef::whole(dev, fd(), i * 1024, 1024)
                 })
                 .collect();
-            // Snapshot the stream ids already resident (from earlier tests) so this assertion is about
-            // *this* run's contribution, not the process-global accumulation.
-            let before = crate::fs::trace::resident_stream_ids();
-
             let mut stream = materialize(blocks, TierPriority::High);
+            // This run's own id — assert on it directly rather than diffing the process-global recorder
+            // (other tests may record their own stream ids concurrently, so a before/after diff is racy).
+            let sid = stream.stream_id();
             let mut delivered = 0u64;
             while let Some(chunk) = stream.next().await {
                 chunk.expect("block read failed");
@@ -1324,24 +1323,15 @@ fn trace_groups_materialize_ops_under_one_stream_id() {
             assert_eq!(delivered, 6, "all blocks delivered");
             10.ms().sleep().await;
 
-            let after = crate::fs::trace::resident_stream_ids();
-            // Exactly one NEW stream id appeared, and it carries at least one row per block.
-            let new_ids: Vec<u64> = after
-                .keys()
-                .filter(|id| !before.contains_key(id))
-                .copied()
-                .collect();
-            assert_eq!(
-                new_ids.len(),
-                1,
-                "one materialize run must mint exactly one stream id; new ids = {new_ids:?}"
-            );
-            let count = after[&new_ids[0]];
+            // Our stream id groups at least one row per block (>= 6: Submitted/Dispatched/Backend*/
+            // Completed all carry it). Keyed on `sid`, so concurrent tests' ids are irrelevant.
+            let resident = crate::fs::trace::resident_stream_ids();
+            let count = resident.get(&sid).copied().unwrap_or(0);
             assert!(
                 count >= 6,
-                "the stream id must group every block's ops (>= 6 rows); saw {count}"
+                "stream id {sid} must group every block's ops (>= 6 rows); saw {count}"
             );
-            info!(stream_id = new_ids[0], count, "materialize ops grouped under one stream id");
+            info!(stream_id = sid, count, "materialize ops grouped under one stream id");
         }
         .primary()
         .spawn();

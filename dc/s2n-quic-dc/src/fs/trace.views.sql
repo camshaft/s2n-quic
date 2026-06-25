@@ -95,13 +95,26 @@ CREATE OR REPLACE MACRO stuck_ops() AS TABLE
   HAVING bool_or(lifecycle IN ('Submitted', 'Dispatched'))
      AND NOT bool_or(lifecycle IN ('Completed', 'Failed', 'Orphaned', 'CancelledSkipped'));
 
--- Credit starvation: CreditPark rows in a window with no following CreditGrant for the same
--- (device_index, kind, cost). Correlates by the coarse credit tuple (the one-shot acquire predates
--- op_seq); a persistent imbalance is a pool that is undersized or wedged.
+-- Credit starvation: per (device_index, kind, cost), the count of CreditPark vs CreditGrant rows.
+-- The acquire primitive predates op_seq on the one-shot path, so a park cannot be joined to its own
+-- grant; instead this aggregates by the coarse credit tuple. `parked > granted` means parks
+-- outnumber grants for that tuple — acquires that have not (yet) been satisfied, the starvation
+-- signal (a persistently undersized or wedged pool). `outstanding` is that difference.
 CREATE OR REPLACE MACRO credit_waits() AS TABLE
-  SELECT seq, ts_nanos, instance_id, device_index,
-         "s2n_quic_dc::fs::io_op::IoOpEvent".kind AS kind,
-         "s2n_quic_dc::fs::io_op::IoOpEvent".cost AS cost
-    FROM "s2n_quic_dc::fs::io_op::IoOpEvent"
-   WHERE "s2n_quic_dc::fs::io_op::IoOpEvent".lifecycle = 'CreditPark'
-   ORDER BY ts_nanos, seq;
+  WITH c AS (
+    SELECT device_index,
+           "s2n_quic_dc::fs::io_op::IoOpEvent".kind      AS kind,
+           "s2n_quic_dc::fs::io_op::IoOpEvent".cost      AS cost,
+           "s2n_quic_dc::fs::io_op::IoOpEvent".lifecycle AS lifecycle
+      FROM "s2n_quic_dc::fs::io_op::IoOpEvent"
+     WHERE "s2n_quic_dc::fs::io_op::IoOpEvent".lifecycle IN ('CreditPark', 'CreditGrant')
+  )
+  SELECT device_index, kind, cost,
+         count(*) FILTER (WHERE lifecycle = 'CreditPark')  AS parked,
+         count(*) FILTER (WHERE lifecycle = 'CreditGrant') AS granted,
+         count(*) FILTER (WHERE lifecycle = 'CreditPark')
+           - count(*) FILTER (WHERE lifecycle = 'CreditGrant') AS outstanding
+    FROM c
+   GROUP BY device_index, kind, cost
+  HAVING parked > granted
+   ORDER BY outstanding DESC;

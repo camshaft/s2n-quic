@@ -245,6 +245,14 @@ where
         }
     }
 
+    /// Test-only: this stream's [flight-recorder](crate::fs::trace) grouping id, so a test can assert
+    /// on *its own* run's ops rather than inferring the id from a process-global before/after diff
+    /// (which is racy under concurrent tests sharing the recorder).
+    #[cfg(test)]
+    pub(crate) fn stream_id(&self) -> u64 {
+        self.stream_id
+    }
+
     /// Await the next block in FIFO order, or `None` at end of stream.
     pub async fn next(&mut self) -> Option<io::Result<ByteVec>> {
         core::future::poll_fn(|cx| self.poll_next(cx)).await
