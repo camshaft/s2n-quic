@@ -391,8 +391,22 @@ impl Entry {
         self.retired.retired_at()
     }
 
+    /// Records that we just observed activity from the peer.
+    ///
+    /// Called on the authenticated, de-duped receive path, so an arriving packet is proof the peer
+    /// is alive. That also clears any dead-cooldown mark: [`dead_at`](Self::mark_dead_if_cooldown_elapsed)
+    /// is otherwise only ever *set* (never cleared), which traps a peer pair in hard-refused flows
+    /// after a transient blip (e.g. a deploy restart) — and an idle probe re-arms the window, so it
+    /// never claws out. Clearing here is the recovery path. The clear is idempotent and cheap: a
+    /// relaxed load skips the store in the common (already-clear) case.
     pub fn touch_activity(&self, now: crate::time::precision::Timestamp) {
         self.last_activity.store(now.nanos, Ordering::Release);
+
+        // Common case: not dead — avoid a needless store (and its cache-line invalidation) on the
+        // hot receive path. Only pay the write when a mark actually needs clearing.
+        if self.dead_at.load(Ordering::Relaxed) >= 0 {
+            self.dead_at.store(-1, Ordering::Release);
+        }
     }
 
     pub fn last_activity(&self) -> crate::time::precision::Timestamp {
