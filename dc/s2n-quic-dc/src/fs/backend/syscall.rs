@@ -272,7 +272,9 @@ impl Backend for SyscallBackend {
                     complete_cancelled(op);
                     return;
                 }
+                crate::fs::trace::backend_start(&op);
                 execute(&mut op);
+                crate::fs::trace::backend_done(&op);
                 complete(op);
             })
             .drain_budgeted(Some(DRAIN_BUDGET));

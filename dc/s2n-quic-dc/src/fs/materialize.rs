@@ -186,6 +186,11 @@ pub struct MaterializeStream<I> {
     base: u64,
     /// Set once the block iterator is exhausted.
     source_done: bool,
+    /// Shared [flight-recorder](crate::fs::trace) grouping id stamped on every op this stream enqueues,
+    /// so a dump can group one whole materialize run (`WHERE stream_id = N`). Minted once at
+    /// construction; trace builds only.
+    #[cfg(any(test, feature = "testing", feature = "io-dbg"))]
+    stream_id: u64,
 }
 
 impl<I> MaterializeStream<I>
@@ -206,6 +211,8 @@ where
             window: VecDeque::new(),
             base: 0,
             source_done: false,
+            #[cfg(any(test, feature = "testing", feature = "io-dbg"))]
+            stream_id: crate::fs::trace::next_stream_id(),
         }
     }
 
@@ -221,6 +228,21 @@ where
             self.devices[idx] = Some(DeviceSlot::new());
         }
         idx
+    }
+
+    /// This stream's [flight-recorder](crate::fs::trace) grouping id (or
+    /// [`NO_STREAM`](crate::fs::trace::NO_STREAM) outside the trace builds), passed to `enqueue` so
+    /// every op of this run shares it.
+    #[inline]
+    fn trace_stream_id(&self) -> u64 {
+        #[cfg(any(test, feature = "testing", feature = "io-dbg"))]
+        {
+            self.stream_id
+        }
+        #[cfg(not(any(test, feature = "testing", feature = "io-dbg")))]
+        {
+            crate::fs::trace::NO_STREAM
+        }
     }
 
     /// Await the next block in FIFO order, or `None` at end of stream.
@@ -355,12 +377,12 @@ where
                 }
             };
 
-            match self.devices[dev].as_mut().unwrap().alloc.poll_acquire(
-                cx,
-                &pool,
-                cost,
-                self.priority,
-            ) {
+            let acquired = {
+                let alloc = &mut self.devices[dev].as_mut().unwrap().alloc;
+                alloc.set_trace_ctx(block.device.index, IoKind::Read);
+                alloc.poll_acquire(cx, &pool, cost, self.priority)
+            };
+            match acquired {
                 Poll::Ready(Ok(())) => {
                     let slot = self.devices[dev].as_mut().unwrap();
                     let granted = slot.alloc.take_all();
@@ -382,6 +404,7 @@ where
                         self.completion_rx.sender(),
                         idx,
                         granted,
+                        self.trace_stream_id(),
                     );
                     self.window[pos] = Slot::InFlight(block);
                     if let Err(e) = r {

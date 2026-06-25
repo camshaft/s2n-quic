@@ -21,6 +21,11 @@ metric-tracing = []
 # the dump macros actually emit. The `QueueDbg` frame variant itself always
 # compiles (so the wire stays decodable); this feature only gates emission/dumping.
 queue-dbg = ["tracing"]
+# Enables the storage IO scheduler's per-op flight recorder (see `fs::trace`): the `backbeat`
+# event-emission call sites and the cfg-gated `IoOp::op_seq` correlation id. Like `queue-dbg` this
+# only gates emission — in a build without it every `fs::trace` entry point folds to nothing and the
+# `op_seq` field does not exist, so it is zero-cost. Independent of `queue-dbg` (a distinct subsystem).
+io-dbg = []
 # Enables loom-instrumented concurrency models. Crate-scoped (a cargo feature, not a global
 # `--cfg loom`), so it does not leak into dependencies like concurrent-queue.
 loom = ["dep:loom"]

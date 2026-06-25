@@ -154,6 +154,10 @@ mod tests {
             ring_id: crate::fs::device::LocalRingId(0),
             user_data: 0,
             enqueued_at: None,
+            #[cfg(any(test, feature = "testing", feature = "io-dbg"))]
+            op_seq: 0,
+            #[cfg(any(test, feature = "testing", feature = "io-dbg"))]
+            stream_id: crate::fs::trace::NO_STREAM,
         })
     }
 
