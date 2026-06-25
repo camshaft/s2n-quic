@@ -1363,6 +1363,27 @@ impl Inner {
     /// `slot` must be the slot embedded at offset 0 of this reader's
     /// `ReaderAlloc`. It is the only legal slot because `Pool::poll_acquire`
     /// writes a waker for *this* task into it.
+    /// Records a [`crate::endpoint::frame_trace::MaxDataStall`] for this reader's flow with the given
+    /// window-growth `outcome`. Pulls the routing identity off `self` (inbound convention: our local
+    /// queue is the wire frame's dest, the peer's is its source — matching the `app_recv` record so
+    /// they share queue ids). A no-op in production via the recorder's own gate.
+    #[inline]
+    fn trace_max_data(
+        &self,
+        target_window: u64,
+        outcome: crate::endpoint::frame_trace::MaxDataOutcome,
+    ) {
+        crate::endpoint::frame_trace::max_data_stall(
+            self.dest_queue_id,
+            self.stream_rx.queue_id(),
+            self.stream_rx.binding_id(),
+            target_window,
+            self.peer_max_offset,
+            outcome,
+            *self.path_secret_entry.id(),
+        );
+    }
+
     unsafe fn maybe_send_max_data(
         &mut self,
         cx: &mut Context,
@@ -1378,6 +1399,18 @@ impl Inner {
             return Ok(());
         }
 
+        // Poll-liveness marker for an `Open` reader: it reached the window-growth logic this poll.
+        // Recorded after the `is_init` gate above, so it applies only once the reader is `Open` — a
+        // client still wedged in `Init` is re-polled but intentionally short-circuits before here, so
+        // use the `ServerBind` diagnostic (not absent-`Entered`) to reason about an Init-phase stall.
+        // For an `Open` reader, absence of `Entered` after a stall means it was never re-polled (a
+        // lost wakeup), as opposed to a non-`Entered` outcome below where a gate deliberately held
+        // the window. `peer_max_offset` is the writer's standing demand at this point.
+        self.trace_max_data(
+            self.peer_max_offset,
+            crate::endpoint::frame_trace::MaxDataOutcome::Entered,
+        );
+
         // Drain any grant the distributor delivered while we were away. This
         // also tells us whether the slot is still parked from a prior poll —
         // in which case we MUST NOT issue a fresh acquire (the slot's
@@ -1387,6 +1420,7 @@ impl Inner {
             crate::credit::GrantResult::Pending => {
                 // Slot is still linked into the pool's tier. The distributor
                 // will wake us when it grants; nothing more to do this turn.
+                self.trace_max_data(0, crate::endpoint::frame_trace::MaxDataOutcome::PoolPending);
                 return Ok(());
             }
             crate::credit::GrantResult::Closed => {
@@ -1405,6 +1439,10 @@ impl Inner {
                 if prior_grant > 0 {
                     self.recv_credit_pool.release(prior_grant);
                 }
+                self.trace_max_data(
+                    final_size,
+                    crate::endpoint::frame_trace::MaxDataOutcome::FinCovered,
+                );
                 return Ok(());
             }
 
@@ -1412,6 +1450,10 @@ impl Inner {
                 if prior_grant > 0 {
                     self.recv_credit_pool.release(prior_grant);
                 }
+                self.trace_max_data(
+                    final_size,
+                    crate::endpoint::frame_trace::MaxDataOutcome::FinCovered,
+                );
                 return Ok(());
             }
         }
@@ -1467,6 +1509,10 @@ impl Inner {
             if prior_grant > 0 {
                 self.recv_credit_pool.release(prior_grant);
             }
+            self.trace_max_data(
+                target_max_data,
+                crate::endpoint::frame_trace::MaxDataOutcome::BelowThreshold,
+            );
             return Ok(());
         }
 
@@ -1540,6 +1586,10 @@ impl Inner {
             // hint/threshold gate above) but we collected no credit at all, so
             // the window does not move this turn. The peer writer stays blocked.
             self.metrics.flow.max_data_granted_zero.add(1);
+            self.trace_max_data(
+                target_max_data,
+                crate::endpoint::frame_trace::MaxDataOutcome::GrantedZero,
+            );
             return Ok(());
         }
 
@@ -1863,6 +1913,18 @@ where
 
 impl Drop for Reader {
     fn drop(&mut self) {
+        // Recorded unconditionally before any teardown: on a stuck stream, the presence of this row
+        // (vs its absence) separates "the app released the reader" from "the reducer is still
+        // holding it open, waiting for EOF forever." `offset` is the consumed length.
+        crate::endpoint::frame_trace::handle_drop(
+            self.0.dest_queue_id,
+            self.0.stream_rx.queue_id(),
+            self.0.stream_rx.binding_id(),
+            self.0.reassembler.consumed_len(),
+            crate::endpoint::frame_trace::HandleKind::Reader,
+            *self.0.path_secret_entry.id(),
+        );
+
         debug!(
             binding_id = self.0.stream_rx.binding_id().as_u64(),
             status = ?self.0.status,

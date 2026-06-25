@@ -970,7 +970,8 @@ fn frame_trace_captures_app_and_packet_lifecycle() {
             // Let the final ACKs settle before sampling the ring.
             10.ms().sleep().await;
 
-            let (lifecycles, packet_events) = crate::endpoint::frame_trace::resident_event_kinds();
+            let (lifecycles, packet_events, event_ids) =
+                crate::endpoint::frame_trace::resident_event_kinds();
 
             // Frame lifecycle edges: app submit/deliver (no PN) and the wire edges (with PN), all
             // now a single `lifecycle` field across the per-kind frame events.
@@ -993,6 +994,27 @@ fn frame_trace_captures_app_and_packet_lifecycle() {
                     "expected a {:?} packet record in the ring; saw events {:?}",
                     event,
                     packet_events
+                );
+            }
+
+            // Stream-layer diagnostic events (no `lifecycle` — first-class event types). A ping/pong
+            // with FIN on both sides plus the handle drops at end of stream exercises each: the
+            // server bound the stream, data was pushed into reader slots, the reader reached the
+            // window-growth logic, the writer framed a FIN, and both handles dropped.
+            use backbeat::Event as _;
+            use crate::endpoint::frame_trace::{
+                FinPath, HandleDrop, MaxDataStall, ServerBind, SlotPush,
+            };
+            for (name, id) in [
+                ("ServerBind", ServerBind::ID.get()),
+                ("SlotPush", SlotPush::ID.get()),
+                ("MaxDataStall", MaxDataStall::ID.get()),
+                ("FinPath", FinPath::ID.get()),
+                ("HandleDrop", HandleDrop::ID.get()),
+            ] {
+                assert!(
+                    event_ids.contains(&id),
+                    "expected a {name} event in the ring; saw event ids {event_ids:?}",
                 );
             }
         }

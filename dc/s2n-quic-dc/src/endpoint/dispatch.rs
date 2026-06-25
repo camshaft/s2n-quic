@@ -135,6 +135,7 @@ fn decrypt_fast_path(
 
         let Some(acceptor_sender) = acceptor_registry.get(acceptor_id) else {
             counters.rx_init_no_acceptor.add(1);
+            trace_server_bind(*path_entry.id(), queue_pair, binding_id, frame_trace::BindOutcome::NoAcceptor);
             server_view.record_freed(queue_pair.dest_queue_id, path_entry, freed_batch_tx);
             send_reset(
                 path_entry,
@@ -197,12 +198,14 @@ fn decrypt_fast_path(
                             ev.reset(crate::stream::endpoint::Error::ServerBusy);
                         }
                         counters.queue_accepted.add(1);
+                        trace_server_bind(*path_entry.id(), queue_pair, binding_id, frame_trace::BindOutcome::Accepted);
                         // We'll return the msg waker; acceptor waker fires on drop
                         drop(AutoWake::new(acceptor_waker));
                     }
                     Err(acceptor::channel::SendError::Closed(mut s)) => {
                         s.disable();
                         counters.rx_init_acceptor_closed.add(1);
+                        trace_server_bind(*path_entry.id(), queue_pair, binding_id, frame_trace::BindOutcome::AcceptorClosed);
                         // `disable()` tears the bound slot down locally only (no frame). The
                         // client is still establishing this binding and the QueueInit it sent
                         // gets ACKed, so without an explicit reset it wedges in InitSent forever.
@@ -218,6 +221,7 @@ fn decrypt_fast_path(
                     Err(acceptor::channel::SendError::NoSlots(mut s)) => {
                         s.disable();
                         counters.rx_init_acceptor_no_slots.add(1);
+                        trace_server_bind(*path_entry.id(), queue_pair, binding_id, frame_trace::BindOutcome::NoSlots);
                         // See the `Closed` arm: the client must be reset explicitly or it
                         // wedges in InitSent after its QueueInit is ACKed.
                         send_reset(
@@ -234,6 +238,7 @@ fn decrypt_fast_path(
                 waker,
                 release_bytes,
             }) => {
+                trace_server_bind(*path_entry.id(), queue_pair, binding_id, frame_trace::BindOutcome::StaleOrBound);
                 // Slot already bound (init retransmit / coalesced frames). As with
                 // NewBinding above: no waker sink here, so release bytes
                 // explicitly and let `waker` drop-wake as its failsafe.
@@ -1261,6 +1266,16 @@ fn handle_queue_data(
         .send_stream(local_queue_id, binding_id, entry)
     {
         Ok((waker, release_bytes)) => {
+            // Whether this push into the per-stream slot carried a parked reader's waker. A push
+            // with no waker on beyond-window bytes (no following AppRecv) is the lost-wakeup signal.
+            frame_trace::slot_push(
+                queue_pair.source_queue_id,
+                queue_pair.dest_queue_id,
+                binding_id,
+                offset.as_u64(),
+                waker.is_some(),
+                *peer.path_entry.id(),
+            );
             let _ = waker_sink.send(waker);
             recv_credit_pool.release(release_bytes);
             counters.rx_data_ok.add(1);
@@ -1463,12 +1478,14 @@ fn handle_queue_msg_init(
     recv_credit_pool: &crate::sync::Arc<crate::credit::Pool>,
     priority: crate::credit::Priority,
 ) {
+    let cred_id = *peer.path_entry.id();
     let Some(server_view) = peer.queue_view.as_server_mut() else {
         return;
     };
 
     let Some(acceptor_sender) = acceptor_registry.get(acceptor_id) else {
         counters.rx_init_no_acceptor.add(1);
+        trace_server_bind(cred_id, queue_pair, binding_id, frame_trace::BindOutcome::NoAcceptor);
         server_view.record_freed(queue_pair.dest_queue_id, &peer.path_entry, freed_batch_tx);
         send_reset(
             &peer.path_entry,
@@ -1532,11 +1549,13 @@ fn handle_queue_msg_init(
                         ev.reset(crate::stream::endpoint::Error::ServerBusy);
                     }
                     counters.queue_accepted.add(1);
+                    trace_server_bind(cred_id, queue_pair, binding_id, frame_trace::BindOutcome::Accepted);
                     let _ = waker_sink.send(AutoWake::new(acceptor_waker));
                 }
                 Err(acceptor::channel::SendError::Closed(mut stream)) => {
                     stream.disable();
                     counters.rx_init_acceptor_closed.add(1);
+                    trace_server_bind(cred_id, queue_pair, binding_id, frame_trace::BindOutcome::AcceptorClosed);
                     // `disable()` is a local-only teardown; reset the client explicitly so its
                     // ACKed QueueInit doesn't leave the writer wedged in InitSent forever.
                     send_reset(
@@ -1550,6 +1569,7 @@ fn handle_queue_msg_init(
                 Err(acceptor::channel::SendError::NoSlots(mut stream)) => {
                     stream.disable();
                     counters.rx_init_acceptor_no_slots.add(1);
+                    trace_server_bind(cred_id, queue_pair, binding_id, frame_trace::BindOutcome::NoSlots);
                     send_reset(
                         &peer.path_entry,
                         queue_pair,
@@ -1564,6 +1584,7 @@ fn handle_queue_msg_init(
             waker,
             release_bytes,
         }) => {
+            trace_server_bind(cred_id, queue_pair, binding_id, frame_trace::BindOutcome::StaleOrBound);
             // Already bound (init retransmit / coalesced frames). Deliver any
             // waker/bytes through the proper channels rather than relying on
             // drop-wake — see the NewBinding arm. The push_msg below does the
@@ -1624,6 +1645,9 @@ fn handle_queue_data_init(
     recv_credit_pool: &crate::sync::Arc<crate::credit::Pool>,
     priority: crate::credit::Priority,
 ) {
+    // Captured before the `as_server_mut()` borrow so the frame-trace calls below don't contend
+    // with the live `&mut server_view`.
+    let cred_id = *peer.path_entry.id();
     let Some(server_view) = peer.queue_view.as_server_mut() else {
         error!(
             binding_id = binding_id.as_u64(),
@@ -1640,6 +1664,7 @@ fn handle_queue_data_init(
             acceptor_id = acceptor_id.as_u64(),
             "QueueData init rejected - acceptor not found, sending reset"
         );
+        trace_server_bind(cred_id, queue_pair, binding_id, frame_trace::BindOutcome::NoAcceptor);
         server_view.record_freed(queue_pair.dest_queue_id, &peer.path_entry, freed_batch_tx);
         send_reset(
             &peer.path_entry,
@@ -1705,11 +1730,13 @@ fn handle_queue_data_init(
                         ev.reset(crate::stream::endpoint::Error::ServerBusy);
                     }
                     counters.queue_accepted.add(1);
+                    trace_server_bind(cred_id, queue_pair, binding_id, frame_trace::BindOutcome::Accepted);
                     let _ = waker_sink.send(AutoWake::new(acceptor_waker));
                 }
                 Err(acceptor::channel::SendError::Closed(mut stream)) => {
                     stream.disable();
                     counters.rx_init_acceptor_closed.add(1);
+                    trace_server_bind(cred_id, queue_pair, binding_id, frame_trace::BindOutcome::AcceptorClosed);
                     // `disable()` is a local-only teardown; reset the client explicitly so its
                     // ACKed QueueInit doesn't leave the writer wedged in InitSent forever.
                     send_reset(
@@ -1723,6 +1750,7 @@ fn handle_queue_data_init(
                 Err(acceptor::channel::SendError::NoSlots(mut stream)) => {
                     stream.disable();
                     counters.rx_init_acceptor_no_slots.add(1);
+                    trace_server_bind(cred_id, queue_pair, binding_id, frame_trace::BindOutcome::NoSlots);
                     send_reset(
                         &peer.path_entry,
                         queue_pair,
@@ -1750,6 +1778,7 @@ fn handle_queue_data_init(
             let _ = waker_sink.send(waker);
             recv_credit_pool.release(release_bytes);
             counters.rx_data_ok.add(1);
+            trace_server_bind(cred_id, queue_pair, binding_id, frame_trace::BindOutcome::StaleOrBound);
             trace!(
                 binding_id = binding_id.as_u64(),
                 queue_id = queue_pair.dest_queue_id.as_u64(),
@@ -1764,6 +1793,26 @@ fn handle_queue_data_init(
             );
         }
     }
+}
+
+/// Records the server-side [`frame_trace::ServerBind`] outcome of an init's accept/bind attempt.
+/// Centralises the routing-identity plumbing shared by every init handler (QueueData / QueueMsg /
+/// QueueReset init) and their accept arms. Takes the cred id by value (captured before the
+/// `as_server_mut()` borrow) so it doesn't contend with the live `&mut server_view`.
+#[inline]
+fn trace_server_bind(
+    cred_id: crate::credentials::Id,
+    queue_pair: QueuePair,
+    binding_id: VarInt,
+    outcome: frame_trace::BindOutcome,
+) {
+    frame_trace::server_bind(
+        queue_pair.source_queue_id,
+        queue_pair.dest_queue_id,
+        binding_id,
+        outcome,
+        cred_id,
+    );
 }
 
 /// Send a plain (non-init) reset in response to the frame whose routing is
@@ -2096,6 +2145,7 @@ fn bind_for_reset(
 ) {
     let dest_queue_id = queue_pair.dest_queue_id;
     let source_queue_id = queue_pair.source_queue_id;
+    let cred_id = *peer.path_entry.id();
     let crate::endpoint::frame::Init {
         dest_acceptor_id: acceptor_id,
         priority,
@@ -2117,6 +2167,7 @@ fn bind_for_reset(
             acceptor_id = acceptor_id.as_u64(),
             "init reset rejected - acceptor not found, sending reset"
         );
+        trace_server_bind(cred_id, queue_pair, binding_id, frame_trace::BindOutcome::NoAcceptor);
         server_view.record_freed(dest_queue_id, &peer.path_entry, freed_batch_tx);
         send_reset(
             &peer.path_entry,
@@ -2171,11 +2222,13 @@ fn bind_for_reset(
                         ev.reset(crate::stream::endpoint::Error::ServerBusy);
                     }
                     counters.queue_accepted.add(1);
+                    trace_server_bind(cred_id, queue_pair, binding_id, frame_trace::BindOutcome::Accepted);
                     let _ = waker_sink.send(AutoWake::new(acceptor_waker));
                 }
                 Err(acceptor::channel::SendError::Closed(mut stream)) => {
                     stream.disable();
                     counters.rx_init_acceptor_closed.add(1);
+                    trace_server_bind(cred_id, queue_pair, binding_id, frame_trace::BindOutcome::AcceptorClosed);
                     send_reset(
                         &peer.path_entry,
                         queue_pair,
@@ -2187,6 +2240,7 @@ fn bind_for_reset(
                 Err(acceptor::channel::SendError::NoSlots(mut stream)) => {
                     stream.disable();
                     counters.rx_init_acceptor_no_slots.add(1);
+                    trace_server_bind(cred_id, queue_pair, binding_id, frame_trace::BindOutcome::NoSlots);
                     send_reset(
                         &peer.path_entry,
                         queue_pair,
@@ -2211,6 +2265,7 @@ fn bind_for_reset(
             waker,
             release_bytes,
         }) => {
+            trace_server_bind(cred_id, queue_pair, binding_id, frame_trace::BindOutcome::StaleOrBound);
             // The init already bound the slot; nothing to create. Reset delivery
             // proceeds against the existing binding.
             let _ = waker_sink.send(waker);

@@ -212,6 +212,22 @@ impl core::ops::DerefMut for WriterAllocPtr {
 
 impl Drop for WriterAllocPtr {
     fn drop(&mut self) {
+        // Recorded unconditionally before any teardown: on a stuck stream, the presence of this row
+        // (vs its absence) separates "the app released the writer (so the drop-time FIN/reset path
+        // ran)" from "the app leaked the writer and never finished it." `offset` is `next_offset`.
+        // SAFETY: we hold the only reference to the allocation here; reading `Inner` is sound.
+        {
+            let inner = unsafe { &(*self.0.as_ptr()).inner };
+            crate::endpoint::frame_trace::handle_drop(
+                inner.control_rx.queue_id(),
+                inner.dest_queue_id,
+                inner.control_rx.binding_id(),
+                inner.next_offset.as_u64(),
+                crate::endpoint::frame_trace::HandleKind::Writer,
+                *inner.path_secret_entry.id(),
+            );
+        }
+
         // Always go through `abandon` — its CAS is the single source of truth for who owns the
         // allocation. On a never-parked-or-already-consumed slot the CAS fails harmlessly and
         // returns `Granted(0)` (because `poll_granted` consumed the prior grant, or because no
@@ -1217,10 +1233,12 @@ impl Inner {
 
     fn shutdown(&mut self) -> io::Result<()> {
         if self.status.is_shutdown() {
+            self.trace_fin(crate::endpoint::frame_trace::FinOutcome::ShutdownSkipped);
             return Ok(());
         }
 
         if self.status.is_fin_sent() {
+            self.trace_fin(crate::endpoint::frame_trace::FinOutcome::ShutdownSkipped);
             self.status.on_shutdown().unwrap();
             return Ok(());
         }
@@ -1230,7 +1248,8 @@ impl Inner {
             // an incomplete entry that can never be filled. A FIN would bypass
             // the MsgTable (via QueueData), leaving a permanent gap in the
             // reassembler. Send a Reset so the receiver can poison the table and
-            // surface an error to the application.
+            // surface an error to the application. No FIN goes out on this path.
+            self.trace_fin(crate::endpoint::frame_trace::FinOutcome::ShutdownSkipped);
             let error_code = error::SENDER_CANCELLED;
             let _ = self.send_reset_frame(error_code, ResetTarget::Stream);
             self.status.on_shutdown().ok();
@@ -1243,9 +1262,26 @@ impl Inner {
         } else {
             self.send_fin_packet()?;
         }
+        self.trace_fin(crate::endpoint::frame_trace::FinOutcome::ShutdownSent);
         self.status.on_shutdown().unwrap();
 
         Ok(())
+    }
+
+    /// Records a [`crate::endpoint::frame_trace::FinPath`] for this writer's flow with the given
+    /// shutdown `outcome`. `buffered_len`/`chunk_len` are 0 here — `shutdown` frames no data — so the
+    /// record marks only which shutdown branch ran. A no-op in production via the recorder's gate.
+    #[inline]
+    fn trace_fin(&self, outcome: crate::endpoint::frame_trace::FinOutcome) {
+        crate::endpoint::frame_trace::fin_path(
+            self.control_rx.queue_id(),
+            self.dest_queue_id,
+            self.control_rx.binding_id(),
+            0,
+            0,
+            outcome,
+            *self.path_secret_entry.id(),
+        );
     }
 
     fn send_reset_frame(
@@ -1799,6 +1835,12 @@ impl Inner {
 
         let mut need_fin_packet = is_fin && buf.buffer_is_empty();
         let mut frames = Queue::new();
+        // FIN-path tracing: how the FIN (if requested) leaves this call. Resolved per the branch
+        // that actually framed it and recorded once below — so a stuck stream's dump shows whether
+        // the FIN rode data, went out standalone, was deferred to a later poll, or was dropped on a
+        // full drain (the off-by-one smoking gun). `buffered_len` at entry rides on the record.
+        let buffered_at_entry = buf.buffered_len() as u64;
+        let mut fin_outcome: Option<crate::endpoint::frame_trace::FinOutcome> = None;
 
         // High watermark of stream data the writer currently wants to send. Stable across this
         // call: `next_offset` advances exactly as `buffered_len` shrinks. `blocked` is true when
@@ -1868,6 +1910,16 @@ impl Inner {
             let is_last_chunk = buf.buffer_is_empty();
             let include_fin = is_fin && is_last_chunk;
 
+            // FIN-path classification for this iteration's frame: the FIN bit rode this frame as a
+            // standalone empty FIN (no data) or on the final data chunk (the healthy outcome).
+            if include_fin {
+                fin_outcome = Some(if need_fin_packet {
+                    crate::endpoint::frame_trace::FinOutcome::OnlyFrame
+                } else {
+                    crate::endpoint::frame_trace::FinOutcome::RodeData
+                });
+            }
+
             let flow_credits = self.take_credits(payload_len);
             let frame = Frame {
                 header: Header::QueueData {
@@ -1925,6 +1977,22 @@ impl Inner {
                 }
                 self.send_data_blocked_frame(high_watermark)?;
             }
+        }
+
+        // Record the FIN-path outcome. If the caller asked for FIN but no frame carried it this
+        // call, it was deferred to a later poll (buffer not drained — clamped by credit/window/coop);
+        // a stuck stream showing `Deferred` with no later `RodeData`/`OnlyFrame` lost the FIN.
+        if is_fin {
+            let outcome = fin_outcome.unwrap_or(crate::endpoint::frame_trace::FinOutcome::Deferred);
+            crate::endpoint::frame_trace::fin_path(
+                self.control_rx.queue_id(),
+                self.dest_queue_id,
+                self.control_rx.binding_id(),
+                buffered_at_entry,
+                written as u32,
+                outcome,
+                *self.path_secret_entry.id(),
+            );
         }
 
         Ok(written)
