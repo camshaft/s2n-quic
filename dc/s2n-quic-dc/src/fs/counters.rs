@@ -81,10 +81,10 @@ pub struct DeviceCounters {
     /// — the IO (syscall / SQE / processing) was never issued, saving the work. Not an error (it is
     /// the optimization working); a high rate just signals heavy upstream cancellation/churn.
     pub cancelled: Counter,
-    /// Ops the caller's cancellation predicate cancelled **after** credit was acquired but **before**
-    /// the op was enqueued — no IO issued, the credit released, the buffer handed back untouched. Not
-    /// an error (the cancel-before-IO optimization working); a spike is expected right after the
-    /// upstream drops the data (e.g. a deleted shuffle in the spill layer). Distinct from
+    /// [`Reservation`](crate::fs::device::Reservation)s dropped without `submit` — credit was acquired
+    /// but the op was **never** enqueued: no IO issued, the credit released, no buffer ever committed.
+    /// Not an error (the two-phase reserve/cancel working); a spike is expected right after the upstream
+    /// drops the data (e.g. a deleted shuffle in the spill layer). Distinct from
     /// [`cancelled`](Self::cancelled), which counts a backend skipping an **already-enqueued** op whose
     /// receiver vanished — by then the op (and its fixed disk offset) is owned downstream and the write
     /// must still complete; this counter is the only point where the write is genuinely *not* issued.

@@ -85,55 +85,6 @@ impl DevicePools {
     }
 }
 
-/// The result of a **cancellable** submit ([`Device::submit_cancellable`]).
-///
-/// The cancellation decision is made in the one window where it is provably safe: **after** the op's
-/// credit is acquired but **before** the op is enqueued to a lane. Up to that point no `IoOp` exists
-/// downstream, nothing references the target fd/offset, and no buffer has been handed to a backend (or
-/// to the kernel, on io_uring) — so cancelling is just "release the credit, hand the buffer back."
-///
-/// Once an op is enqueued it is owned by the pipeline (and its buffer pinned in the io_uring in-flight
-/// slab until the CQE reaps); the write **must** be allowed to complete, because the caller's notion of
-/// "this op is dead" may coincide with the caller recycling the op's fixed disk offset to a *new* op —
-/// and with multiple unordered lanes/rings the stale in-flight write could land after the new one and
-/// tear it. Cancellation is therefore offered *only* in the pre-enqueue window; an enqueued op runs to
-/// completion. (See `spill-write-cancellation` in the Membrain design docs for the offset-reuse race
-/// this constraint exists to prevent.)
-pub enum SubmitOutcome {
-    /// The op was enqueued and ran to a successful completion; carries the completed [`IoOp`] (filled
-    /// buffer + final status), exactly as [`Device::submit`] returns.
-    Completed(IoOp),
-    /// The caller's predicate cancelled the op after credit was acquired but before it was enqueued.
-    /// No IO was issued and the target offset was never touched; the op's buffer is handed back so the
-    /// caller can reuse or drop it. The credit was released back to the device pool.
-    Cancelled(IoBuf),
-}
-
-/// The result of a cancellable zero-copy `O_DIRECT` write ([`Device::write_direct_cancellable`]). Both
-/// arms hand the page-aligned buffer back so it is never leaked, mirroring how [`Device::write_direct`]
-/// returns the buffer on success.
-pub enum WriteDirectOutcome {
-    /// The write completed; the buffer is returned with the number of bytes written.
-    Written {
-        buf: crate::fs::direct::AlignedBuf,
-        len: usize,
-    },
-    /// The caller's predicate cancelled the write before it was enqueued — no disk IO was issued and
-    /// the target offset was never written. The buffer is returned untouched.
-    Cancelled { buf: crate::fs::direct::AlignedBuf },
-}
-
-/// Whether a credit-acquired op was handed to the pipeline or cancelled in the pre-enqueue window.
-/// Internal result of [`Device::submit_with`]; the public [`SubmitOutcome`] / [`WriteDirectOutcome`]
-/// are derived from it.
-pub(crate) enum Admitted {
-    /// The op was enqueued to a lane; a completion will arrive on the caller's channel.
-    Enqueued,
-    /// The caller's predicate cancelled the op after acquire but before enqueue; the buffer is handed
-    /// back and the acquired credit was released. No completion will arrive.
-    Cancelled(IoBuf),
-}
-
 /// A device: its budget pool(s), cost model, weights, **and its own submission channel** — so a read
 /// or write is a method *on the device* and the op it builds carries the `Arc<Device>` straight
 /// through the device's own pipeline (the storage analog of `Arc<PathSecretEntry>`), finishing itself
@@ -432,59 +383,6 @@ impl Device {
         }
     }
 
-    /// Submit a zero-copy `O_DIRECT` write like [`write_direct`](Self::write_direct), but cancellable
-    /// in the pre-enqueue window (the spill-flush use case): `should_cancel` is consulted after credit
-    /// is acquired and before the op is enqueued, and if it returns `true` the write is dropped without
-    /// touching the disk — the target `offset` is never written, so the caller may safely recycle it.
-    ///
-    /// Resolves with [`WriteDirectOutcome::Written`] (buffer + bytes written) on completion, or
-    /// [`WriteDirectOutcome::Cancelled`] (buffer handed back, untouched) on cancellation. Either way the
-    /// page-aligned buffer is returned so it is never leaked. `offset` must be block-aligned (validated).
-    ///
-    /// This is the API the Membrain spill layer uses to cancel writeback for blocks whose data was
-    /// deleted mid-flush: the predicate is the block's "no live owner / not resurrectable" refcount
-    /// check, and cancelling strictly before enqueue is what makes freeing-and-recycling the block's
-    /// fixed disk offset safe (an enqueued write owns that offset until its CQE reaps). See
-    /// [`submit_cancellable`](Self::submit_cancellable) for the full safety rationale.
-    pub fn write_direct_cancellable(
-        self: &Arc<Self>,
-        fd: Fd,
-        offset: u64,
-        buf: crate::fs::direct::AlignedBuf,
-        priority: TierPriority,
-        should_cancel: impl FnMut() -> bool + 'static,
-    ) -> impl core::future::Future<Output = std::io::Result<WriteDirectOutcome>> + 'static {
-        let device = self.clone();
-        async move {
-            let len = buf.len() as u32;
-            match device
-                .submit_cancellable(
-                    IoKind::Write,
-                    fd,
-                    offset,
-                    len,
-                    IoBuf::Direct(buf),
-                    priority,
-                    should_cancel,
-                )
-                .await?
-            {
-                SubmitOutcome::Completed(op) => match (op.status, op.buf) {
-                    (IoStatus::Done(n), IoBuf::Direct(buf)) => {
-                        Ok(WriteDirectOutcome::Written { buf, len: n })
-                    }
-                    other => unreachable!("direct write returned unexpected op: {other:?}"),
-                },
-                SubmitOutcome::Cancelled(IoBuf::Direct(buf)) => {
-                    Ok(WriteDirectOutcome::Cancelled { buf })
-                }
-                SubmitOutcome::Cancelled(other) => {
-                    unreachable!("direct write cancelled with non-direct buffer: {other:?}")
-                }
-            }
-        }
-    }
-
     /// The atomic submit primitive: acquire credit, hand the op to one of this device's lanes, await
     /// completion.
     ///
@@ -494,6 +392,11 @@ impl Device {
     /// handed to the pipeline: a submitter that cannot get credit parks cooperatively on a waker
     /// (never a thread), so admitted work can never exceed the pool capacity and the blocking-pool
     /// hold-and-wait deadlock cannot form.
+    ///
+    /// This is the all-in-one form — it [`reserve`](Self::reserve)s credit and then immediately
+    /// [`submit`](Reservation::submit)s the buffer on the reservation. A caller that wants to apply
+    /// backpressure *before* committing the buffer (or wants the option to cancel after acquiring
+    /// credit) should call [`reserve`](Self::reserve) directly and hold the [`Reservation`].
     pub async fn submit(
         self: &Arc<Self>,
         kind: IoKind,
@@ -503,215 +406,74 @@ impl Device {
         buf: IoBuf,
         priority: TierPriority,
     ) -> std::io::Result<IoOp> {
-        let completion_rx: CompletionReceiver =
-            crate::socket::channel::intrusive::datagram_completion::new::<IoOp>();
-        // A one-shot submit allocates a fresh acquire context; long-lived submitters reuse one (see
-        // `submit_with`).
-        let mut alloc = SubmitterAlloc::new();
-        // No cancellation predicate: this op always runs to completion (`|| false` never cancels).
-        match self
-            .submit_with(
-                &mut alloc,
-                kind,
-                fd,
-                offset,
-                len,
-                buf,
-                priority,
-                completion_rx.sender(),
-                0,
-                || false,
-            )
+        let is_direct = buf.is_direct();
+        self.reserve(kind, fd, offset, len, priority, is_direct)
             .await?
-        {
-            Admitted::Enqueued => {}
-            Admitted::Cancelled(_) => {
-                unreachable!("non-cancellable submit cannot cancel (predicate is `|| false`)")
-            }
-        }
-        let op = await_completion(completion_rx).await?;
-        match op.status {
-            IoStatus::Done(_) => Ok(op),
-            IoStatus::Failed(kind) => Err(kind.into()),
-            IoStatus::Pending => unreachable!("dispatcher routed a still-pending op"),
-        }
+            .submit(buf)
+            .await
     }
 
-    /// Submit like [`submit`](Self::submit) but allow the caller to **cancel the op in the one window
-    /// where cancellation is provably safe**: after its credit is acquired but before it is enqueued.
+    /// Phase one of a two-phase submit: validate the op and **acquire its credit**, returning a
+    /// [`Reservation`] that holds the granted credit. Phase two is [`Reservation::submit`] (hand over
+    /// the buffer, enqueue, await completion) — or, to cancel, simply **drop** the reservation.
     ///
-    /// `should_cancel` is consulted twice, both **pre-enqueue**: once before any credit is acquired
-    /// (an op already dead at submit time never touches the pool) and once the instant credit is
-    /// granted (an op that died while parked on credit is dropped before any IO is issued). If it
-    /// returns `true` at either point the op is **not** enqueued: its credit is released, the buffer is
-    /// handed back in [`SubmitOutcome::Cancelled`], and no syscall/SQE ever references the target
-    /// fd/offset. Otherwise the op is enqueued and awaited exactly as [`submit`](Self::submit), yielding
-    /// [`SubmitOutcome::Completed`].
+    /// This is the cancellation-safe alternative to a one-shot [`submit`](Self::submit): credit is the
+    /// scarce, indivisible resource, so acquiring it is the right place to apply backpressure and the
+    /// right granularity to cancel at. Awaiting `reserve` parks cooperatively on a waker (never a
+    /// thread) when the device is at capacity, exactly as `submit` does — so a producer can gate its
+    /// own fan-out on `reserve().await` and spawn the per-op task only once a credit slot is in hand,
+    /// bounding in-flight work to the pool capacity without a separate semaphore.
     ///
-    /// Why only this window: once enqueued, the op (and its buffer) is owned by the pipeline and, on
-    /// io_uring, pinned in the in-flight slab until the kernel CQE reaps it — so the write **must**
-    /// complete. A caller that treats "this op is dead" as license to recycle the op's fixed disk
-    /// offset to a new op would otherwise race a stale in-flight write against the new one across
-    /// unordered lanes and tear it. Cancelling strictly pre-enqueue removes that hazard by construction.
-    /// (To abandon an op that has *already* been enqueued, drop the returned future — that is
-    /// memory-safe, the buffer rides the op to completion downstream — but the write still hits the
-    /// device; it is not cancellation.)
+    /// **Cancellation = drop.** A `Reservation` that is dropped without [`submit`](Reservation::submit)
+    /// releases its credit back to the pool and issues **no** IO — the target fd/offset is never handed
+    /// to a backend or the kernel. This holds whether the drop happens after the credit is granted (the
+    /// held `Reservation`) or while the `reserve` future is still parked on credit (drop the future):
+    /// both abandon the credit slot cleanly. This is the one provably safe cancellation window. Once
+    /// [`submit`](Reservation::submit) enqueues the op it is owned by the pipeline — and on io_uring its
+    /// buffer is pinned in the in-flight slab until the CQE reaps it — so the write **must** run to
+    /// completion; a caller that treated a post-enqueue drop as license to recycle the op's fixed disk
+    /// offset would race a stale in-flight write against the new one across unordered lanes and tear it.
+    /// (See `spill-write-cancellation` in the Membrain design docs for that offset-reuse race.)
     ///
-    /// `should_cancel` is **not** re-polled while the op is parked waiting for credit (only on the
-    /// grant wake). During a churn event the dead backlog still drains without issuing IO: each parked
-    /// op, when finally granted credit, observes the predicate and releases immediately — the device
-    /// (the bottleneck) sees zero wasted writes. To cancel a parked op *sooner* (freeing its credit
-    /// slot for live writes before it reaches the grant), race this future against a cancellation
-    /// signal and drop it — dropping a parked, never-enqueued submit is clean (its credit slot is
-    /// abandoned and reclaimed).
-    #[allow(clippy::too_many_arguments)]
-    pub async fn submit_cancellable(
+    /// `is_direct` selects `O_DIRECT` validation: it must match the buffer eventually handed to
+    /// [`submit`](Reservation::submit) (a direct op requires `offset`/`len` block-aligned, validated
+    /// here, before any credit is acquired, so an op that can never be admitted never contends the pool).
+    pub async fn reserve(
         self: &Arc<Self>,
         kind: IoKind,
         fd: Fd,
         offset: u64,
         len: u32,
-        buf: IoBuf,
         priority: TierPriority,
-        should_cancel: impl FnMut() -> bool,
-    ) -> std::io::Result<SubmitOutcome> {
-        let completion_rx: CompletionReceiver =
-            crate::socket::channel::intrusive::datagram_completion::new::<IoOp>();
+        is_direct: bool,
+    ) -> std::io::Result<Reservation> {
+        // Validate + resolve the device pool and cost directly on this device (no lookup). Done before
+        // any credit is acquired so an op that can never be admitted (oversized / misaligned) is
+        // rejected without contending the pool against live ops.
+        let (pool, cost) = self.prepare(kind, offset, len, is_direct)?;
+
+        // Acquire credit, parking cooperatively if the device is at capacity. This is the backpressure
+        // that prevents the blocking-pool deadlock — and the gate a producer waits on before spawning.
         let mut alloc = SubmitterAlloc::new();
-        match self
-            .submit_with(
-                &mut alloc,
-                kind,
-                fd,
-                offset,
-                len,
-                buf,
-                priority,
-                completion_rx.sender(),
-                0,
-                should_cancel,
-            )
-            .await?
-        {
-            Admitted::Cancelled(buf) => Ok(SubmitOutcome::Cancelled(buf)),
-            Admitted::Enqueued => {
-                let op = await_completion(completion_rx).await?;
-                match op.status {
-                    IoStatus::Done(_) => Ok(SubmitOutcome::Completed(op)),
-                    IoStatus::Failed(kind) => Err(kind.into()),
-                    IoStatus::Pending => unreachable!("dispatcher routed a still-pending op"),
-                }
-            }
-        }
-    }
-
-    /// Acquire credit (reusing the caller's `alloc`) and enqueue an op whose completion is delivered
-    /// to the caller-provided `completion` sender (tagged with `user_data`), then return — **without**
-    /// awaiting the completion. The building block for a submitter that funnels many ops onto one
-    /// shared completion channel and reuses one acquire context across them (e.g.
-    /// [`MaterializeStream`](crate::fs::materialize)), avoiding a per-op slot allocation.
-    ///
-    /// `should_cancel` is the pre-enqueue cancellation hook (see [`submit_cancellable`](Self::submit_cancellable)
-    /// for the full rationale and the offset-reuse race it guards). It is consulted **only** before the
-    /// op is enqueued — once before acquiring credit and once the instant credit is granted — never
-    /// after. Read submitters that never cancel pass `|| false` (zero overhead: a never-true closure
-    /// the optimizer drops).
-    ///
-    /// Returns `Ok(Admitted::Enqueued)` when the op was admitted (credit acquired) and handed to a
-    /// lane — a completion will arrive on `completion`. Returns `Ok(Admitted::Cancelled(buf))` when the
-    /// predicate cancelled it pre-enqueue: the acquired credit was released and the buffer is handed
-    /// back; **no** completion will arrive. An `Err` (misaligned/oversized op, or this device's
-    /// submission channel closed on teardown) likewise means no completion will arrive and any acquired
-    /// credit was released.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn submit_with(
-        self: &Arc<Self>,
-        alloc: &mut SubmitterAlloc,
-        kind: IoKind,
-        fd: Fd,
-        offset: u64,
-        len: u32,
-        buf: IoBuf,
-        priority: TierPriority,
-        completion: CompletionSender,
-        user_data: u64,
-        mut should_cancel: impl FnMut() -> bool,
-    ) -> std::io::Result<Admitted> {
-        // Validate + resolve the device pool and cost directly on this device (no lookup).
-        let (pool, cost) = self.prepare(kind, offset, len, buf.is_direct())?;
-
-        // Cancel before touching the pool: an op already dead at submit time should never acquire
-        // credit (it would needlessly contend the pool against live ops). Nothing was acquired or
-        // enqueued, so handing the buffer back is all that is owed.
-        if should_cancel() {
-            self.counters.cancelled_before_submit.add(1);
-            // Pre-acquire window: no credit was ever held (`had_credit = false`), no op built.
-            crate::fs::trace::cancelled_before_submit(
-                self.index,
-                kind,
-                fd.as_raw() as u64,
-                offset,
-                len,
-                buf.is_direct(),
-                false,
-            );
-            return Ok(Admitted::Cancelled(buf));
-        }
-
-        // Acquire credit, parking cooperatively if the device is at capacity. This is the
-        // backpressure that prevents the blocking-pool deadlock.
         alloc.set_trace_ctx(self.index, kind);
         alloc.acquire(&pool, cost, priority).await?;
 
-        // Credit is granted but the op is NOT yet enqueued — the last instant cancellation is safe.
-        // An op that died while parked on credit is dropped here before any IO is issued: release the
-        // just-granted credit back to the pool (keeping it conserved and freeing the slot for a live
-        // op) and hand the buffer back. Crucially this is still pre-enqueue, so the target fd/offset
-        // was never handed to a backend/kernel and cannot race a later op reusing that offset.
-        if should_cancel() {
-            let granted = alloc.take_all();
-            if granted > 0 {
-                pool.release(granted);
-            }
-            self.counters.cancelled_before_submit.add(1);
-            // Post-acquire window: credit was granted then released (`had_credit = true`), still no op.
-            crate::fs::trace::cancelled_before_submit(
-                self.index,
-                kind,
-                fd.as_raw() as u64,
-                offset,
-                len,
-                buf.is_direct(),
-                true,
-            );
-            return Ok(Admitted::Cancelled(buf));
-        }
-
-        // Move the granted credit (>= cost) onto the op so the alloc resets clean and the completion
-        // path releases it exactly once.
-        let granted = alloc.take_all();
-        debug_assert!(granted >= cost, "acquire returned less than cost");
-
-        // A one-shot submit is not part of a multi-op stream — `NO_STREAM` (the trace builds map it to
-        // SQL NULL); the materialize reactor passes its own shared id.
-        self.enqueue(
+        Ok(Reservation {
+            device: self.clone(),
+            alloc: Some(alloc),
             kind,
             fd,
             offset,
             len,
-            buf,
-            completion,
-            user_data,
-            granted,
-            crate::fs::trace::NO_STREAM,
-        )?;
-        Ok(Admitted::Enqueued)
+            cost,
+            is_direct,
+        })
     }
 
     /// Build an admitted op (credit already `granted`) carrying this `Arc<Device>` and push it into
     /// the device's submission channel; the device's dispatch task routes it to one of its lanes. On a
     /// closed channel (device torn down) the credit is released and an error returned, since no
-    /// completion can arrive. Shared by `submit_with` and the materialize reactor.
+    /// completion can arrive. Shared by the [`Reservation`] submit path and the materialize reactor.
     ///
     /// `stream_id` groups this op with the other ops of a multi-op submitter for the
     /// [flight recorder](crate::fs::trace) ([`NO_STREAM`](crate::fs::trace::NO_STREAM) for a one-off);
@@ -776,6 +538,149 @@ impl Device {
             ));
         }
         Ok(())
+    }
+}
+
+/// A credit reservation against a [`Device`]: the held grant from a successful [`Device::reserve`],
+/// waiting for its buffer. This is phase two of the two-phase submit — the point where the indivisible
+/// scarce resource (credit) has been acquired but the op has **not** yet been built or enqueued.
+///
+/// # Two things a reservation can do
+///
+/// * [`submit`](Self::submit) the buffer — build the op, enqueue it to one of the device's lanes, and
+///   await its completion. The reservation is consumed; its held credit rides onto the op and is
+///   released exactly once when the op completes.
+/// * **be dropped** — cancellation. The held credit is released back to the pool and **no IO is
+///   issued**: the target fd/offset is never handed to a backend or the kernel, so a caller may safely
+///   recycle that offset. This is the only provably safe cancellation window (see [`Device::reserve`]
+///   for why post-enqueue is not), and it is free: dropping the owned [`SubmitterAlloc`] releases its
+///   grant under the credit slot's abandon machinery.
+///
+/// # Backpressure
+///
+/// Because `reserve` parks until credit is in hand, a producer that calls `reserve().await` *before*
+/// spawning the per-op task naturally bounds its in-flight fan-out to the device's pool capacity — the
+/// reservation *is* the permit. Holding a `Reservation` while doing other work (e.g. snapshotting the
+/// buffer to write) keeps that credit slot reserved; dropping it hands the slot back to other writers.
+///
+/// The reservation carries an `Arc<Device>`, so it is `'static` and `Send` — it can be moved into a
+/// spawned task and submitted there.
+pub struct Reservation {
+    device: Arc<Device>,
+    /// The acquire context holding the granted credit. `Some` until [`submit`](Self::submit) consumes
+    /// it (moving the credit onto the op) — `None` afterward so [`Drop`] knows not to count a cancel.
+    /// On a plain drop (cancellation) the `SubmitterAlloc`'s own `Drop` releases the held credit.
+    alloc: Option<SubmitterAlloc>,
+    kind: IoKind,
+    fd: Fd,
+    offset: u64,
+    len: u32,
+    /// The credit cost `reserve` acquired (a `debug_assert` floor on what the alloc hands back).
+    cost: u64,
+    /// Whether the eventual buffer is a zero-copy `O_DIRECT` buffer — validated at `reserve` time and
+    /// re-checked against the submitted buffer so the two cannot disagree.
+    is_direct: bool,
+}
+
+impl Reservation {
+    /// The device this reservation holds credit against.
+    #[inline]
+    pub fn device(&self) -> &Arc<Device> {
+        &self.device
+    }
+
+    /// The op kind (read/write/…) this reservation was acquired for.
+    #[inline]
+    pub fn kind(&self) -> IoKind {
+        self.kind
+    }
+
+    /// Phase two: hand over the `buf`, enqueue the op to one of the device's lanes, and await its
+    /// completion. Consumes the reservation; the held credit rides onto the op (released exactly once
+    /// when it completes). Returns only **successfully completed** ops — a `Failed` completion or a
+    /// closed lane surfaces as `Err`, exactly like [`Device::submit`].
+    ///
+    /// `buf`'s kind must match the reservation: its [`is_direct`](IoBuf::is_direct) must equal the
+    /// `is_direct` passed to [`reserve`](Device::reserve), and its length is expected to match the
+    /// reserved `len` (the credit was sized for it). A mismatch is a caller bug (`debug_assert`).
+    pub async fn submit(self, buf: IoBuf) -> std::io::Result<IoOp> {
+        let completion_rx: CompletionReceiver =
+            crate::socket::channel::intrusive::datagram_completion::new::<IoOp>();
+        self.enqueue(buf, completion_rx.sender(), 0)?;
+        let op = await_completion(completion_rx).await?;
+        match op.status {
+            IoStatus::Done(_) => Ok(op),
+            IoStatus::Failed(kind) => Err(kind.into()),
+            IoStatus::Pending => unreachable!("dispatcher routed a still-pending op"),
+        }
+    }
+
+    /// Phase two, non-awaiting: enqueue the op against the caller-provided `completion` sender (tagged
+    /// with `user_data`) and return immediately, **without** awaiting completion. Consumes the
+    /// reservation. The building block for a submitter that funnels many ops onto one shared completion
+    /// channel (e.g. a fire-many/await-elsewhere pattern); [`submit`](Self::submit) is the await-here form.
+    ///
+    /// On a closed submission channel (device torn down) the credit is released and an `Err` returned —
+    /// no completion will arrive.
+    pub fn enqueue(
+        mut self,
+        buf: IoBuf,
+        completion: CompletionSender,
+        user_data: u64,
+    ) -> std::io::Result<()> {
+        // The buffer must match the *kind* the reservation validated and sized credit for. We do not
+        // assert `buf.len() == self.len`: a buffered `IoBuf::Read` is intentionally logically empty
+        // (pre-sized *capacity*, the backend reads into spare capacity and sets the length to bytes
+        // read), so its `len()` is 0 at submit time while the reservation's `len` is the requested
+        // transfer. The reservation's `len` is the authoritative transfer length carried onto the op.
+        debug_assert_eq!(
+            buf.is_direct(),
+            self.is_direct,
+            "Reservation::submit buffer direct-ness must match the reservation"
+        );
+
+        // Move the granted credit (>= cost) off the alloc and onto the op so the alloc drops clean (no
+        // double release) and the completion path releases it exactly once. Taking the alloc here also
+        // marks the reservation consumed, so `Drop` does not count a cancel.
+        let mut alloc = self.alloc.take().expect("reservation already consumed");
+        let granted = alloc.take_all();
+        debug_assert!(granted >= self.cost, "acquire returned less than cost");
+        drop(alloc);
+
+        // A one-shot reservation submit is not part of a multi-op stream — `NO_STREAM` (the trace
+        // builds map it to SQL NULL); the materialize reactor passes its own shared id.
+        self.device.enqueue(
+            self.kind,
+            self.fd.clone(),
+            self.offset,
+            self.len,
+            buf,
+            completion,
+            user_data,
+            granted,
+            crate::fs::trace::NO_STREAM,
+        )
+    }
+}
+
+impl Drop for Reservation {
+    fn drop(&mut self) {
+        // `submit`/`enqueue` took the alloc → the op carries the credit; nothing to do. Otherwise this
+        // is a cancellation: the `SubmitterAlloc`'s own `Drop` releases the held grant back to the pool
+        // (no IO was ever issued — the offset is untouched). Record it for observability.
+        if self.alloc.take().is_some() {
+            self.device.counters.cancelled_before_submit.add(1);
+            // Credit was granted then released (`had_credit = true`); no op was ever built.
+            crate::fs::trace::cancelled_before_submit(
+                self.device.index,
+                self.kind,
+                self.fd.as_raw() as u64,
+                self.offset,
+                self.len,
+                self.is_direct,
+                true,
+            );
+        }
     }
 }
 

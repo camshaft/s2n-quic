@@ -50,7 +50,7 @@ mod tests;
 pub mod counters;
 
 pub use config::{CostModel, DeviceConfig, OpWeights, PoolMode, DEFAULT_LANE_COUNT};
-pub use device::{Device, LocalRingId};
+pub use device::{Device, LocalRingId, Reservation};
 pub use op::{IoBuf, IoKind, IoOp, IoStatus};
 pub use materialize::{materialize, materialize_direct, Block, MaterializeStream};
 pub use scheduler::{BlockRef, DeviceRegistry};
