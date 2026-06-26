@@ -34,7 +34,7 @@ pub mod counters;
 pub(crate) mod dbg;
 pub(crate) mod decode;
 pub(crate) mod dispatch;
-pub(crate) mod edt;
+pub mod edt;
 pub(crate) mod error;
 pub(crate) mod frame;
 pub(crate) mod frame_trace;

@@ -69,21 +69,34 @@ pub(crate) const PICK_TWO_WORSE_FLOOR: f64 = 0.01;
 /// [`tests::pick_two_floor_ratio_literal`] asserts it still matches the floor.
 pub(crate) const PICK_TWO_FLOOR_LN_RATIO: f64 = 4.595_119_850_134_59;
 
-/// Time-scale `τ` (nanoseconds) of the logistic, *derived* from the worst-case gap and the floor:
-/// `τ = gap / ln((1 − floor) / floor)`, so the logistic equals the floor exactly at `delta == gap`.
-/// Const-folded (division is const-stable). ≈ 218µs with the default knobs.
-const PICK_TWO_TAU_NANOS: f64 = PICK_TWO_WORST_CASE_GAP_NANOS / PICK_TWO_FLOOR_LN_RATIO;
-
-/// Probability of routing to the higher-scored (worse) candidate given the absolute score delta.
+/// Probability of routing to the higher-scored ("worse") candidate given the absolute score `delta`,
+/// with a caller-supplied `worst_case_gap` — the delta at which the worse candidate bottoms out at
+/// [`PICK_TWO_WORSE_FLOOR`]. `delta` and `worst_case_gap` must be in the **same domain**; the curve is
+/// otherwise scale-free, so the same shape serves any pick-two router regardless of what its scores
+/// measure.
 ///
-/// Logistic decay `1 / (1 + exp(delta / τ))` clamped up to [`PICK_TWO_WORSE_FLOOR`], with `τ` =
-/// [`PICK_TWO_TAU_NANOS`]. At `delta == 0` this is `0.5` (a fair coin flip); with the default 1ms/1%
-/// knobs the worse candidate gets ~9% at half the worst-case gap and ~24% at a quarter of it. Only
-/// the `delta`-dependent `exp` runs per call — every other term is a compile-time constant.
+/// The logistic time-scale `τ` is *derived* from the gap and the floor as
+/// `τ = worst_case_gap / ln((1 − floor) / floor)`, so `1 / (1 + exp(delta / τ))` equals the floor
+/// exactly at `delta == worst_case_gap` (no abrupt knee). At `delta == 0` it is `0.5` (a fair coin
+/// flip), ~24% at a quarter of the gap and ~9% at half. Only the `delta`-dependent `exp` runs per call.
+///
+/// This is the generic form. [`pick_two_worse_probability`] is the nanosecond drain-time
+/// specialization used by the EDT routers; the storage shard picker calls this directly with a
+/// cost-byte gap (a device's pool capacity) to score credit-pool load.
 #[inline]
-pub(crate) fn pick_two_worse_probability(delta: u64) -> f64 {
-    let logistic = 1.0 / (1.0 + (delta as f64 / PICK_TWO_TAU_NANOS).exp());
+pub fn pick_two_worse_probability_scaled(delta: u64, worst_case_gap: f64) -> f64 {
+    let tau = worst_case_gap / PICK_TWO_FLOOR_LN_RATIO;
+    let logistic = 1.0 / (1.0 + (delta as f64 / tau).exp());
     logistic.max(PICK_TWO_WORSE_FLOOR)
+}
+
+/// Probability of routing to the higher-scored (worse) candidate given the absolute score delta, in
+/// the **nanosecond drain-time** domain (gap = [`PICK_TWO_WORST_CASE_GAP_NANOS`] ≈ 1ms, so τ ≈ 218µs).
+/// The specialization of [`pick_two_worse_probability_scaled`] used by every EDT pick-two router (the
+/// send-socket `PickTwo` and the storage scheduler's lane dispatch).
+#[inline]
+pub fn pick_two_worse_probability(delta: u64) -> f64 {
+    pick_two_worse_probability_scaled(delta, PICK_TWO_WORST_CASE_GAP_NANOS)
 }
 
 #[cfg(test)]
@@ -152,7 +165,59 @@ mod tests {
         assert_eq!(edt.load_score(oob), 0);
     }
 
-    // The pick-two selection curve (`pick_two_worse_probability` + its constants) is exercised by the
-    // existing tests in `endpoint::combinator::tests` (floor-ratio literal + curve shape), which
-    // reach these items via the combinator's re-export.
+    // The nanosecond-domain pick-two curve (`pick_two_worse_probability` + its constants) is also
+    // exercised by `endpoint::combinator::tests` (floor-ratio literal + curve shape) via the
+    // combinator's re-export.
+
+    #[test]
+    fn scaled_curve_generalizes_to_any_domain() {
+        // The scale-free curve must have the same shape whatever the gap's units: 0.5 at delta 0,
+        // the floor exactly at `delta == gap`, ~9% at half the gap, and monotonic decay past it.
+        // Use a byte-domain gap (a 32 MiB pool capacity) wholly unrelated to the ns constants — this
+        // is exactly how the storage shard picker calls it.
+        let gap_bytes = 32.0 * 1024.0 * 1024.0;
+        let gap = gap_bytes as u64;
+
+        assert_eq!(pick_two_worse_probability_scaled(0, gap_bytes), 0.5);
+
+        let p_worst = pick_two_worse_probability_scaled(gap, gap_bytes);
+        assert!(
+            (p_worst - PICK_TWO_WORSE_FLOOR).abs() < 1e-6,
+            "logistic must meet the floor at delta == gap in any domain, got {p_worst}"
+        );
+
+        let p_half = pick_two_worse_probability_scaled(gap / 2, gap_bytes);
+        assert!(
+            (0.08..0.10).contains(&p_half),
+            "expected ~0.09 at half the gap, got {p_half}"
+        );
+
+        assert!(pick_two_worse_probability_scaled(2 * gap, gap_bytes) <= p_worst);
+        assert_eq!(
+            pick_two_worse_probability_scaled(u64::MAX, gap_bytes),
+            PICK_TWO_WORSE_FLOOR
+        );
+    }
+
+    #[test]
+    fn ns_wrapper_is_the_scaled_curve_at_the_ns_gap() {
+        // The nanosecond specialization must be exactly the scaled form fed the ns worst-case gap —
+        // refactoring the shared body must not perturb the EDT routers' behaviour.
+        for delta in [
+            0u64,
+            1,
+            1_000,
+            100_000,
+            250_000,
+            1_000_000,
+            5_000_000,
+            u64::MAX,
+        ] {
+            assert_eq!(
+                pick_two_worse_probability(delta),
+                pick_two_worse_probability_scaled(delta, PICK_TWO_WORST_CASE_GAP_NANOS),
+                "ns wrapper diverged from the scaled curve at delta={delta}"
+            );
+        }
+    }
 }

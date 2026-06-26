@@ -211,6 +211,20 @@ impl Device {
         }
     }
 
+    /// Live load on this device's pool for `kind`, in the cost-model currency: how much credit is
+    /// committed right now, `(capacity − available).max(0)`. This rises smoothly from **0 at idle**
+    /// (`available == capacity`) through in-flight work and on into parked overflow (`available` goes
+    /// negative), so unlike raw parked demand it is a useful balancing signal *before* a device
+    /// saturates. Used by the shard picker for pick-two load balancing across drives (lower is better).
+    ///
+    /// Computed entirely in the `u64` domain with saturating ops so a transient credit-accounting
+    /// skew (an over-release pushing `available` past `capacity`, or a deeply-negative parked total)
+    /// can never overflow or wrap — it just clamps to `0` or `u64::MAX`. See [`pool_load`].
+    #[inline]
+    pub fn load(&self, kind: IoKind) -> u64 {
+        pool_load(self.capacity_for(kind), self.pool_for(kind).available())
+    }
+
     /// Validate a prospective op against this device and resolve the pool it draws from plus its
     /// credit cost, bumping the rejection counter on failure. The hot-path admission check: the caller
     /// already holds the `Arc<Device>`, so there is no lookup here.
@@ -736,4 +750,59 @@ fn atomic_grant(config: crate::sched::CreditConfig) -> crate::sched::CreditConfi
     let config = config.with_max_single_acquire_uniform(cap);
     let caps = config.max_single_acquire;
     config.with_min_grant_slice_per_priority(caps)
+}
+
+/// Committed credit against a pool of `capacity` whose live counter reads `available`:
+/// `(capacity − available)` clamped to `[0, u64::MAX]`. Factored out of [`Device::load`] so the
+/// saturating arithmetic — the part that must survive an out-of-range `available` from a transient
+/// credit-accounting skew — can be unit-tested without standing up a whole device + distributor.
+///
+/// `available` is the pool's free credit: it starts at `capacity`, drops toward `0` as ops take
+/// credit, and goes **negative** by the parked demand once waiters queue. So load is `0` at idle and
+/// rises monotonically into oversubscription. The whole computation stays in `u64` with saturating
+/// ops: `available > capacity` (over-release) clamps to `0`, and a pathologically negative
+/// `available` (even `i64::MIN`) clamps at `u64::MAX` rather than overflowing.
+#[inline]
+fn pool_load(capacity: u64, available: i64) -> u64 {
+    if available >= 0 {
+        capacity.saturating_sub(available as u64)
+    } else {
+        capacity.saturating_add(available.unsigned_abs())
+    }
+}
+
+#[cfg(test)]
+mod load_tests {
+    use super::pool_load;
+
+    #[test]
+    fn zero_at_idle_rising_through_capacity() {
+        let cap = 32 * 1024 * 1024;
+        // Idle: available == capacity ⇒ no load.
+        assert_eq!(pool_load(cap, cap as i64), 0);
+        // Half the pool committed.
+        assert_eq!(pool_load(cap, (cap / 2) as i64), cap / 2);
+        // Fully committed, nothing parked yet.
+        assert_eq!(pool_load(cap, 0), cap);
+    }
+
+    #[test]
+    fn parked_overflow_adds_to_capacity() {
+        let cap = 1_000u64;
+        // 250 bytes of demand parked beyond a full pool ⇒ load = capacity + parked.
+        assert_eq!(pool_load(cap, -250), 1_250);
+    }
+
+    #[test]
+    fn out_of_range_available_saturates_not_overflows() {
+        let cap = 1_000u64;
+        // Over-release (available > capacity) must clamp to 0, never wrap negative.
+        assert_eq!(pool_load(cap, 5_000), 0);
+        // The i64::MIN worst case for naive negation must not panic: `unsigned_abs()` yields 2^63
+        // and the add (cap + 2^63) still fits in u64, so it is exact, not saturated.
+        assert_eq!(pool_load(cap, i64::MIN), cap + (i64::MIN).unsigned_abs());
+        // A sum that genuinely exceeds u64::MAX saturates rather than wrapping.
+        assert_eq!(pool_load(u64::MAX, -1), u64::MAX);
+        assert_eq!(pool_load(u64::MAX, i64::MIN), u64::MAX);
+    }
 }
