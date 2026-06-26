@@ -35,6 +35,7 @@ pub fn metrics_schema() -> Arc<Schema> {
                 Field::new("count", DataType::UInt64, true),
                 Field::new("p50", DataType::UInt64, true),
                 Field::new("p99", DataType::UInt64, true),
+                Field::new("min", DataType::UInt64, true),
                 Field::new("max", DataType::UInt64, true),
                 Field::new(
                     "buckets",
@@ -79,6 +80,7 @@ pub struct MetricsBatchBuilder {
     count: UInt64Builder,
     p50: UInt64Builder,
     p99: UInt64Builder,
+    min: UInt64Builder,
     max: UInt64Builder,
     buckets: MapBuilder<UInt64Builder, UInt64Builder>,
     pub row_count: usize,
@@ -106,6 +108,7 @@ impl MetricsBatchBuilder {
             count: UInt64Builder::new(),
             p50: UInt64Builder::new(),
             p99: UInt64Builder::new(),
+            min: UInt64Builder::new(),
             max: UInt64Builder::new(),
             buckets: MapBuilder::new(None, UInt64Builder::new(), UInt64Builder::new()),
             row_count: 0,
@@ -143,6 +146,7 @@ impl MetricsBatchBuilder {
         append_opt_u64(&mut self.count, row.count);
         append_opt_u64(&mut self.p50, row.p50);
         append_opt_u64(&mut self.p99, row.p99);
+        append_opt_u64(&mut self.min, row.min);
         append_opt_u64(&mut self.max, row.max);
 
         match row.buckets.as_ref() {
@@ -187,6 +191,7 @@ impl MetricsBatchBuilder {
                 Arc::new(self.count.finish()),
                 Arc::new(self.p50.finish()),
                 Arc::new(self.p99.finish()),
+                Arc::new(self.min.finish()),
                 Arc::new(self.max.finish()),
                 Arc::new(self.buckets.finish()),
             ],

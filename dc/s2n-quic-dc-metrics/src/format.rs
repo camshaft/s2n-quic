@@ -216,6 +216,7 @@ impl<'a> ParsedMetricsLine<'a> {
                         count: None,
                         p50: None,
                         p99: None,
+                        min: None,
                         max: None,
                         buckets: None,
                     });
@@ -236,6 +237,7 @@ impl<'a> ParsedMetricsLine<'a> {
                         count: None,
                         p50: None,
                         p99: None,
+                        min: None,
                         max: None,
                         buckets: None,
                     });
@@ -256,12 +258,13 @@ impl<'a> ParsedMetricsLine<'a> {
                         count: None,
                         p50: None,
                         p99: None,
+                        min: None,
                         max: None,
                         buckets: None,
                     });
                 }
                 MetricEntry::Histogram(m) => {
-                    let (count, p50, p99, max) = m.histogram.summarize();
+                    let (count, min, p50, p99, max) = m.histogram.summarize();
                     let buckets = m
                         .histogram
                         .buckets
@@ -283,6 +286,7 @@ impl<'a> ParsedMetricsLine<'a> {
                         count: Some(count),
                         p50: Some(p50),
                         p99: Some(p99),
+                        min: Some(min),
                         max: Some(max),
                         buckets: Some(buckets),
                     });
@@ -303,6 +307,7 @@ impl<'a> ParsedMetricsLine<'a> {
                         count: None,
                         p50: None,
                         p99: None,
+                        min: None,
                         max: None,
                         buckets: None,
                     });
@@ -324,6 +329,7 @@ impl<'a> ParsedMetricsLine<'a> {
                             count: None,
                             p50: None,
                             p99: None,
+                            min: None,
                             max: None,
                             buckets: None,
                         });
@@ -331,7 +337,7 @@ impl<'a> ParsedMetricsLine<'a> {
                 }
                 MetricEntry::VariantHistograms(m) => {
                     for v in &m.variants {
-                        let (count, p50, p99, max) = v.histogram.summarize();
+                        let (count, min, p50, p99, max) = v.histogram.summarize();
                         let buckets = v
                             .histogram
                             .buckets
@@ -353,6 +359,7 @@ impl<'a> ParsedMetricsLine<'a> {
                             count: Some(count),
                             p50: Some(p50),
                             p99: Some(p99),
+                            min: Some(min),
                             max: Some(max),
                             buckets: Some(buckets),
                         });
@@ -408,6 +415,9 @@ impl<'a> ParsedMetricsLine<'a> {
                 if let Some(p99) = row.p99 {
                     value.insert("p99".into(), p99.into());
                 }
+                if let Some(min) = row.min {
+                    value.insert("min".into(), min.into());
+                }
                 if let Some(max) = row.max {
                     value.insert("max".into(), max.into());
                 }
@@ -446,6 +456,7 @@ pub struct MetricRow<'a> {
     pub count: Option<u64>,
     pub p50: Option<u64>,
     pub p99: Option<u64>,
+    pub min: Option<u64>,
     pub max: Option<u64>,
     pub buckets: Option<Vec<(u64, u64)>>,
 }
@@ -609,14 +620,14 @@ impl<'a> Histogram<'a> {
         }
     }
 
-    pub fn summarize(&self) -> (u64, u64, u64, u64) {
+    pub fn summarize(&self) -> (u64, u64, u64, u64, u64) {
         compute_histogram_summary(&self.buckets)
     }
 
     fn write_summary(&self, key: &str, output: &mut String) {
         use std::fmt::Write;
 
-        let (total_count, p50, p99, max) = self.summarize();
+        let (total_count, _min, p50, p99, max) = self.summarize();
         if total_count == 0 {
             write!(output, "{key}=0").unwrap();
             return;
@@ -648,7 +659,7 @@ impl<'a> Histogram<'a> {
     fn write_variant(&self, label: &str, output: &mut String) {
         use std::fmt::Write;
 
-        let (total_count, p50, p99, max) = self.summarize();
+        let (total_count, _min, p50, p99, max) = self.summarize();
         if total_count == 0 {
             write!(output, "{label}=0").unwrap();
             return;
@@ -704,17 +715,18 @@ fn parse_byte_value(value: &str) -> Option<u64> {
     }
 }
 
-pub fn compute_histogram_summary(buckets: &[HistogramBucket]) -> (u64, u64, u64, u64) {
+pub fn compute_histogram_summary(buckets: &[HistogramBucket]) -> (u64, u64, u64, u64, u64) {
     let total_count = buckets.iter().map(|bucket| bucket.count).sum();
     if total_count == 0 {
-        return (0, 0, 0, 0);
+        return (0, 0, 0, 0, 0);
     }
 
+    let min = buckets.first().map_or(0, |bucket| bucket.value);
     let p50 = histogram_value_at_percentile(buckets, 50);
     let p99 = histogram_value_at_percentile(buckets, 99);
     let max = buckets.last().map_or(0, |bucket| bucket.value);
 
-    (total_count, p50, p99, max)
+    (total_count, min, p50, p99, max)
 }
 
 /// Returns `(total_count, min_value, max_value)` for histogram buckets.
