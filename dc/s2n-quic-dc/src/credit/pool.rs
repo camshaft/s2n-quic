@@ -383,6 +383,12 @@ impl Pool {
         self.waker.wake();
     }
 
+    /// Current available credit (positive = headroom, negative = parked demand).
+    #[inline]
+    pub fn available(&self) -> i64 {
+        self.available.load(Ordering::Relaxed)
+    }
+
     /// Per-request acquire ceiling for `priority` (the normalized `max_single_acquire`). Callers
     /// use this to bound speculative sizing — e.g. the reader caps its window-growth ratio so a
     /// grown window can never exceed what a single acquire could satisfy.
