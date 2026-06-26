@@ -54,7 +54,8 @@ backbeat::register_views!(include_str!("trace.views.sql"));
 pub(crate) const NO_OP_SEQ: u64 = u64::MAX;
 
 /// Stored in [`IoOpEvent::stream_id`] for an op that does not belong to a multi-op stream — a one-off
-/// [`Device::submit`](crate::fs::device::Device)/`submit_cancellable`, and every pre-op lifecycle. A
+/// [`Device::submit`](crate::fs::device::Device) / [`Reservation`](crate::fs::device::Reservation)
+/// submit, and every pre-op lifecycle. A
 /// streaming submitter (e.g. [`MaterializeStream`](crate::fs::materialize)) stamps a real, shared id so
 /// `WHERE stream_id = N` returns every op of that one run. The view layer maps the sentinel to SQL NULL
 /// (trace a standalone op by [`op_seq`](IoOpEvent::op_seq) instead).
@@ -445,9 +446,11 @@ pub(crate) fn rejected(
     });
 }
 
-/// [`CancelledBeforeSubmit`](IoLifecycle::CancelledBeforeSubmit) — the predicate cancelled the op in
-/// the pre-enqueue window. `had_credit` is `false` for the pre-acquire window (no `op_seq` yet) and
-/// `true` for the post-acquire window (credit was granted then released).
+/// [`CancelledBeforeSubmit`](IoLifecycle::CancelledBeforeSubmit) — a [`Reservation`] was dropped without
+/// `submit`, cancelling in the pre-enqueue window: credit was granted then released and no op was built.
+/// `had_credit` is always `true` (a reservation only exists once credit is in hand).
+///
+/// [`Reservation`]: crate::fs::device::Reservation
 #[allow(clippy::too_many_arguments)]
 #[inline]
 pub(crate) fn cancelled_before_submit(
