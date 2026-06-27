@@ -57,6 +57,12 @@ pub struct Counters {
     /// have driven `available` positive past live parked demand. A persistent nonzero value here
     /// is normal under heavy contention; persistent *growth* indicates a wedged tier or bug.
     pub distributor_carry_bytes: Gauge,
+    /// End-of-pass writebacks that drove `available` past `capacity` and were clamped back down
+    /// (the phantom-credit backstop — see the clamp in `Distributor::pass`). Nonzero means the
+    /// refill pacer's relaxed-conservation injections are being reclaimed instead of laundered into
+    /// an unbounded `available`; expected to tick under a saturated, refill-engaged pool and
+    /// harmless. Sustained high rates mean the pacer rate is mistuned for the workload.
+    pub distributor_overrun_clamped: Counter,
     /// Passes that exited via budget exhaustion. Should be zero or low; otherwise the budget is
     /// undersized or the pool is overdriven. (`!`-prefixed: investigate when nonzero.)
     pub distributor_budget_exhausted: Counter,
@@ -134,6 +140,8 @@ impl Counters {
             distributor_reaped: registry.register(format!("{prefix}.distributor.reaped")),
             distributor_carry_bytes: registry
                 .register_gauge(format!("{prefix}.distributor.carry_bytes")),
+            distributor_overrun_clamped: registry
+                .register(format!("{prefix}.distributor.overrun_clamped")),
             distributor_budget_exhausted: registry
                 .register(format!("!{prefix}.distributor.budget_exhausted")),
             abandon_granted_race: registry.register(format!("!{prefix}.abandon.granted_race")),

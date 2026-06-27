@@ -2047,6 +2047,7 @@ expression: logs
 0:00:00.002041000 [client] TRACE m#q.wheel_to_assembler.depth_dist[send.0]=1
 0:00:00.002041000 [client] TRACE m#task.tx_wheel.drained[send.worker.0]=1
 0:00:00.002041000 [client] TRACE c#credit.send.distributor.passes=1
+0:00:00.002041000 [client] TRACE c#credit.send.distributor.overrun_clamped=1
 0:00:00.002041000 [client] TRACE c#credit.send.distributor.passes=1
 0:00:00.002041000 [client] TRACE c#q.wheel_to_assembler.receiver[send.0.task.assembler.send.0]=1
 0:00:00.002041000 [client] TRACE c#q.wheel_to_assembler.drain[send.0]=1
@@ -2092,6 +2093,7 @@ expression: logs
 0:00:00.002041000 [client] TRACE m#q.wheel_to_assembler.depth_dist[send.0]=1
 0:00:00.002041000 [client] TRACE m#task.tx_wheel.drained[send.worker.0]=1
 0:00:00.002041000 [client] TRACE c#credit.send.distributor.passes=1
+0:00:00.002041000 [client] TRACE c#credit.send.distributor.overrun_clamped=1
 0:00:00.002041000 [client] TRACE c#credit.send.distributor.passes=1
 0:00:00.002041000 [client] TRACE c#q.wheel_to_assembler.receiver[send.0.task.assembler.send.0]=1
 0:00:00.002041000 [client] TRACE c#q.wheel_to_assembler.drain[send.0]=1
@@ -2137,6 +2139,7 @@ expression: logs
 0:00:00.002041000 [client] TRACE m#q.wheel_to_assembler.depth_dist[send.0]=1
 0:00:00.002041000 [client] TRACE m#task.tx_wheel.drained[send.worker.0]=1
 0:00:00.002041000 [client] TRACE c#credit.send.distributor.passes=1
+0:00:00.002041000 [client] TRACE c#credit.send.distributor.overrun_clamped=1
 0:00:00.002041000 [client] TRACE c#credit.send.distributor.passes=1
 0:00:00.002041000 [client] TRACE c#q.wheel_to_assembler.receiver[send.0.task.assembler.send.0]=1
 0:00:00.002041000 [client] TRACE c#q.wheel_to_assembler.drain[send.0]=1
@@ -2182,6 +2185,7 @@ expression: logs
 0:00:00.002041000 [client] TRACE m#q.wheel_to_assembler.depth_dist[send.0]=1
 0:00:00.002041000 [client] TRACE m#task.tx_wheel.drained[send.worker.0]=1
 0:00:00.002041000 [client] TRACE c#credit.send.distributor.passes=1
+0:00:00.002041000 [client] TRACE c#credit.send.distributor.overrun_clamped=1
 0:00:00.002041000 [client] TRACE c#credit.send.distributor.passes=1
 0:00:00.002041000 [client] TRACE c#q.wheel_to_assembler.receiver[send.0.task.assembler.send.0]=1
 0:00:00.002041000 [client] TRACE c#q.wheel_to_assembler.drain[send.0]=1
@@ -2227,6 +2231,7 @@ expression: logs
 0:00:00.002041000 [client] TRACE m#q.wheel_to_assembler.depth_dist[send.0]=1
 0:00:00.002041000 [client] TRACE m#task.tx_wheel.drained[send.worker.0]=1
 0:00:00.002041000 [client] TRACE c#credit.send.distributor.passes=1
+0:00:00.002041000 [client] TRACE c#credit.send.distributor.overrun_clamped=1
 0:00:00.002041000 [client] TRACE c#credit.send.distributor.passes=1
 0:00:00.002041000 [client] TRACE c#q.wheel_to_assembler.receiver[send.0.task.assembler.send.0]=1
 0:00:00.002041000 [client] TRACE c#q.wheel_to_assembler.drain[send.0]=1
@@ -2272,6 +2277,7 @@ expression: logs
 0:00:00.002041000 [client] TRACE m#q.wheel_to_assembler.depth_dist[send.0]=1
 0:00:00.002041000 [client] TRACE m#task.tx_wheel.drained[send.worker.0]=1
 0:00:00.002041000 [client] TRACE c#credit.send.distributor.passes=1
+0:00:00.002041000 [client] TRACE c#credit.send.distributor.overrun_clamped=1
 0:00:00.002041000 [client] TRACE c#credit.send.distributor.passes=1
 0:00:00.002041000 [client] TRACE c#q.wheel_to_assembler.receiver[send.0.task.assembler.send.0]=1
 0:00:00.002041000 [client] TRACE c#q.wheel_to_assembler.drain[send.0]=1
@@ -2317,6 +2323,7 @@ expression: logs
 0:00:00.002041000 [client] TRACE m#q.wheel_to_assembler.depth_dist[send.0]=1
 0:00:00.002041000 [client] TRACE m#task.tx_wheel.drained[send.worker.0]=1
 0:00:00.002041000 [client] TRACE c#credit.send.distributor.passes=1
+0:00:00.002041000 [client] TRACE c#credit.send.distributor.overrun_clamped=1
 0:00:00.002041000 [client] TRACE c#credit.send.distributor.passes=1
 0:00:00.002041000 [client] TRACE c#q.wheel_to_assembler.receiver[send.0.task.assembler.send.0]=1
 0:00:00.002041000 [client] TRACE c#q.wheel_to_assembler.drain[send.0]=1
@@ -2362,6 +2369,7 @@ expression: logs
 0:00:00.002041000 [client] TRACE m#q.wheel_to_assembler.depth_dist[send.0]=1
 0:00:00.002041000 [client] TRACE m#task.tx_wheel.drained[send.worker.0]=1
 0:00:00.002041000 [client] TRACE c#credit.send.distributor.passes=1
+0:00:00.002041000 [client] TRACE c#credit.send.distributor.overrun_clamped=1
 0:00:00.002041000 [client] TRACE c#credit.send.distributor.passes=1
 0:00:00.002041000 [client] TRACE c#q.wheel_to_assembler.receiver[send.0.task.assembler.send.0]=1
 0:00:00.002041000 [client] TRACE c#q.wheel_to_assembler.drain[send.0]=1
@@ -2407,6 +2415,7 @@ expression: logs
 0:00:00.002041000 [client] TRACE m#q.wheel_to_assembler.depth_dist[send.0]=1
 0:00:00.002041000 [client] TRACE m#task.tx_wheel.drained[send.worker.0]=1
 0:00:00.002041000 [client] TRACE c#credit.send.distributor.passes=1
+0:00:00.002041000 [client] TRACE c#credit.send.distributor.overrun_clamped=1
 0:00:00.002041000 [client] TRACE c#credit.send.distributor.passes=1
 0:00:00.002041000 [client] TRACE c#q.wheel_to_assembler.receiver[send.0.task.assembler.send.0]=1
 0:00:00.002041000 [client] TRACE c#q.wheel_to_assembler.drain[send.0]=1
@@ -2452,6 +2461,7 @@ expression: logs
 0:00:00.002041000 [client] TRACE m#q.wheel_to_assembler.depth_dist[send.0]=1
 0:00:00.002041000 [client] TRACE m#task.tx_wheel.drained[send.worker.0]=1
 0:00:00.002041000 [client] TRACE c#credit.send.distributor.passes=1
+0:00:00.002041000 [client] TRACE c#credit.send.distributor.overrun_clamped=1
 0:00:00.002041000 [client] TRACE c#credit.send.distributor.passes=1
 0:00:00.002041000 [client] TRACE c#q.wheel_to_assembler.receiver[send.0.task.assembler.send.0]=1
 0:00:00.002041000 [client] TRACE c#q.wheel_to_assembler.drain[send.0]=1
@@ -2497,6 +2507,7 @@ expression: logs
 0:00:00.002041000 [client] TRACE m#q.wheel_to_assembler.depth_dist[send.0]=1
 0:00:00.002041000 [client] TRACE m#task.tx_wheel.drained[send.worker.0]=1
 0:00:00.002041000 [client] TRACE c#credit.send.distributor.passes=1
+0:00:00.002041000 [client] TRACE c#credit.send.distributor.overrun_clamped=1
 0:00:00.002041000 [client] TRACE c#credit.send.distributor.passes=1
 0:00:00.002041000 [client] TRACE c#q.wheel_to_assembler.receiver[send.0.task.assembler.send.0]=1
 0:00:00.002041000 [client] TRACE c#q.wheel_to_assembler.drain[send.0]=1
@@ -2542,6 +2553,7 @@ expression: logs
 0:00:00.002041000 [client] TRACE m#q.wheel_to_assembler.depth_dist[send.0]=1
 0:00:00.002041000 [client] TRACE m#task.tx_wheel.drained[send.worker.0]=1
 0:00:00.002041000 [client] TRACE c#credit.send.distributor.passes=1
+0:00:00.002041000 [client] TRACE c#credit.send.distributor.overrun_clamped=1
 0:00:00.002041000 [client] TRACE c#credit.send.distributor.passes=1
 0:00:00.002041000 [client] TRACE c#q.wheel_to_assembler.receiver[send.0.task.assembler.send.0]=1
 0:00:00.002041000 [client] TRACE c#q.wheel_to_assembler.drain[send.0]=1
@@ -2587,6 +2599,7 @@ expression: logs
 0:00:00.002041000 [client] TRACE m#q.wheel_to_assembler.depth_dist[send.0]=1
 0:00:00.002041000 [client] TRACE m#task.tx_wheel.drained[send.worker.0]=1
 0:00:00.002041000 [client] TRACE c#credit.send.distributor.passes=1
+0:00:00.002041000 [client] TRACE c#credit.send.distributor.overrun_clamped=1
 0:00:00.002041000 [client] TRACE c#credit.send.distributor.passes=1
 0:00:00.002041000 [client] TRACE c#q.wheel_to_assembler.receiver[send.0.task.assembler.send.0]=1
 0:00:00.002041000 [client] TRACE c#q.wheel_to_assembler.drain[send.0]=1
@@ -2632,6 +2645,7 @@ expression: logs
 0:00:00.002041000 [client] TRACE m#q.wheel_to_assembler.depth_dist[send.0]=1
 0:00:00.002041000 [client] TRACE m#task.tx_wheel.drained[send.worker.0]=1
 0:00:00.002041000 [client] TRACE c#credit.send.distributor.passes=1
+0:00:00.002041000 [client] TRACE c#credit.send.distributor.overrun_clamped=1
 0:00:00.002041000 [client] TRACE c#credit.send.distributor.passes=1
 0:00:00.002041000 [client] TRACE c#q.wheel_to_assembler.receiver[send.0.task.assembler.send.0]=1
 0:00:00.002041000 [client] TRACE c#q.wheel_to_assembler.drain[send.0]=1
@@ -2677,6 +2691,7 @@ expression: logs
 0:00:00.002041000 [client] TRACE m#q.wheel_to_assembler.depth_dist[send.0]=1
 0:00:00.002041000 [client] TRACE m#task.tx_wheel.drained[send.worker.0]=1
 0:00:00.002041000 [client] TRACE c#credit.send.distributor.passes=1
+0:00:00.002041000 [client] TRACE c#credit.send.distributor.overrun_clamped=1
 0:00:00.002041000 [client] TRACE c#credit.send.distributor.passes=1
 0:00:00.002041000 [client] TRACE c#q.wheel_to_assembler.receiver[send.0.task.assembler.send.0]=1
 0:00:00.002041000 [client] TRACE c#q.wheel_to_assembler.drain[send.0]=1
@@ -2722,6 +2737,7 @@ expression: logs
 0:00:00.002041000 [client] TRACE m#q.wheel_to_assembler.depth_dist[send.0]=1
 0:00:00.002041000 [client] TRACE m#task.tx_wheel.drained[send.worker.0]=1
 0:00:00.002041000 [client] TRACE c#credit.send.distributor.passes=1
+0:00:00.002041000 [client] TRACE c#credit.send.distributor.overrun_clamped=1
 0:00:00.002041000 [client] TRACE c#credit.send.distributor.passes=1
 0:00:00.002041000 [client] TRACE c#q.wheel_to_assembler.receiver[send.0.task.assembler.send.0]=1
 0:00:00.002041000 [client] TRACE c#q.wheel_to_assembler.drain[send.0]=1
@@ -2767,6 +2783,7 @@ expression: logs
 0:00:00.002041000 [client] TRACE m#q.wheel_to_assembler.depth_dist[send.0]=1
 0:00:00.002041000 [client] TRACE m#task.tx_wheel.drained[send.worker.0]=1
 0:00:00.002041000 [client] TRACE c#credit.send.distributor.passes=1
+0:00:00.002041000 [client] TRACE c#credit.send.distributor.overrun_clamped=1
 0:00:00.002041000 [client] TRACE c#credit.send.distributor.passes=1
 0:00:00.002041000 [client] TRACE c#q.wheel_to_assembler.receiver[send.0.task.assembler.send.0]=1
 0:00:00.002041000 [client] TRACE c#q.wheel_to_assembler.drain[send.0]=1
@@ -2812,6 +2829,7 @@ expression: logs
 0:00:00.002041000 [client] TRACE m#q.wheel_to_assembler.depth_dist[send.0]=1
 0:00:00.002041000 [client] TRACE m#task.tx_wheel.drained[send.worker.0]=1
 0:00:00.002041000 [client] TRACE c#credit.send.distributor.passes=1
+0:00:00.002041000 [client] TRACE c#credit.send.distributor.overrun_clamped=1
 0:00:00.002041000 [client] TRACE c#credit.send.distributor.passes=1
 0:00:00.002041000 [client] TRACE c#q.wheel_to_assembler.receiver[send.0.task.assembler.send.0]=1
 0:00:00.002041000 [client] TRACE c#q.wheel_to_assembler.drain[send.0]=1
@@ -2857,6 +2875,7 @@ expression: logs
 0:00:00.002041000 [client] TRACE m#q.wheel_to_assembler.depth_dist[send.0]=1
 0:00:00.002041000 [client] TRACE m#task.tx_wheel.drained[send.worker.0]=1
 0:00:00.002041000 [client] TRACE c#credit.send.distributor.passes=1
+0:00:00.002041000 [client] TRACE c#credit.send.distributor.overrun_clamped=1
 0:00:00.002041000 [client] TRACE c#credit.send.distributor.passes=1
 0:00:00.002041000 [client] TRACE c#q.wheel_to_assembler.receiver[send.0.task.assembler.send.0]=1
 0:00:00.002041000 [client] TRACE c#q.wheel_to_assembler.drain[send.0]=1
@@ -2886,6 +2905,7 @@ expression: logs
 0:00:00.002041000 [client] TRACE m#task.assembler.drained[send.0]=1
 0:00:00.002041000 [client] TRACE m#task.tx_wheel.drained[send.worker.0]=0
 0:00:00.002041000 [client] TRACE c#credit.send.distributor.passes=1
+0:00:00.002041000 [client] TRACE c#credit.send.distributor.overrun_clamped=1
 0:00:00.002041000 [client] TRACE c#credit.send.distributor.passes=1
 0:00:00.002061000 [client] TRACE c#socket.rx.ops[recv.2]=1
 0:00:00.002061000 [client] TRACE c#socket.rx.bytes[recv.2]=51
@@ -3647,6 +3667,7 @@ expression: logs
 0:00:00.003041000 [client] TRACE m#q.wheel_to_assembler.depth_dist[send.0]=1
 0:00:00.003041000 [client] TRACE m#task.tx_wheel.drained[send.worker.0]=1
 0:00:00.003041000 [client] TRACE c#credit.send.distributor.passes=1
+0:00:00.003041000 [client] TRACE c#credit.send.distributor.overrun_clamped=1
 0:00:00.003041000 [client] TRACE c#credit.send.distributor.passes=1
 0:00:00.003041000 [client] TRACE c#q.wheel_to_assembler.receiver[send.0.task.assembler.send.0]=1
 0:00:00.003041000 [client] TRACE c#q.wheel_to_assembler.drain[send.0]=1
@@ -3692,6 +3713,7 @@ expression: logs
 0:00:00.003041000 [client] TRACE m#q.wheel_to_assembler.depth_dist[send.0]=1
 0:00:00.003041000 [client] TRACE m#task.tx_wheel.drained[send.worker.0]=1
 0:00:00.003041000 [client] TRACE c#credit.send.distributor.passes=1
+0:00:00.003041000 [client] TRACE c#credit.send.distributor.overrun_clamped=1
 0:00:00.003041000 [client] TRACE c#credit.send.distributor.passes=1
 0:00:00.003041000 [client] TRACE c#q.wheel_to_assembler.receiver[send.0.task.assembler.send.0]=1
 0:00:00.003041000 [client] TRACE c#q.wheel_to_assembler.drain[send.0]=1
@@ -3737,6 +3759,7 @@ expression: logs
 0:00:00.003041000 [client] TRACE m#q.wheel_to_assembler.depth_dist[send.0]=1
 0:00:00.003041000 [client] TRACE m#task.tx_wheel.drained[send.worker.0]=1
 0:00:00.003041000 [client] TRACE c#credit.send.distributor.passes=1
+0:00:00.003041000 [client] TRACE c#credit.send.distributor.overrun_clamped=1
 0:00:00.003041000 [client] TRACE c#credit.send.distributor.passes=1
 0:00:00.003041000 [client] TRACE c#q.wheel_to_assembler.receiver[send.0.task.assembler.send.0]=1
 0:00:00.003041000 [client] TRACE c#q.wheel_to_assembler.drain[send.0]=1
@@ -3782,6 +3805,7 @@ expression: logs
 0:00:00.003041000 [client] TRACE m#q.wheel_to_assembler.depth_dist[send.0]=1
 0:00:00.003041000 [client] TRACE m#task.tx_wheel.drained[send.worker.0]=1
 0:00:00.003041000 [client] TRACE c#credit.send.distributor.passes=1
+0:00:00.003041000 [client] TRACE c#credit.send.distributor.overrun_clamped=1
 0:00:00.003041000 [client] TRACE c#credit.send.distributor.passes=1
 0:00:00.003041000 [client] TRACE c#q.wheel_to_assembler.receiver[send.0.task.assembler.send.0]=1
 0:00:00.003041000 [client] TRACE c#q.wheel_to_assembler.drain[send.0]=1
@@ -3827,6 +3851,7 @@ expression: logs
 0:00:00.003041000 [client] TRACE m#q.wheel_to_assembler.depth_dist[send.0]=1
 0:00:00.003041000 [client] TRACE m#task.tx_wheel.drained[send.worker.0]=1
 0:00:00.003041000 [client] TRACE c#credit.send.distributor.passes=1
+0:00:00.003041000 [client] TRACE c#credit.send.distributor.overrun_clamped=1
 0:00:00.003041000 [client] TRACE c#credit.send.distributor.passes=1
 0:00:00.003041000 [client] TRACE c#q.wheel_to_assembler.receiver[send.0.task.assembler.send.0]=1
 0:00:00.003041000 [client] TRACE c#q.wheel_to_assembler.drain[send.0]=1
@@ -3872,6 +3897,7 @@ expression: logs
 0:00:00.003041000 [client] TRACE m#q.wheel_to_assembler.depth_dist[send.0]=1
 0:00:00.003041000 [client] TRACE m#task.tx_wheel.drained[send.worker.0]=1
 0:00:00.003041000 [client] TRACE c#credit.send.distributor.passes=1
+0:00:00.003041000 [client] TRACE c#credit.send.distributor.overrun_clamped=1
 0:00:00.003041000 [client] TRACE c#credit.send.distributor.passes=1
 0:00:00.003041000 [client] TRACE c#q.wheel_to_assembler.receiver[send.0.task.assembler.send.0]=1
 0:00:00.003041000 [client] TRACE c#q.wheel_to_assembler.drain[send.0]=1
@@ -3917,6 +3943,7 @@ expression: logs
 0:00:00.003041000 [client] TRACE m#q.wheel_to_assembler.depth_dist[send.0]=1
 0:00:00.003041000 [client] TRACE m#task.tx_wheel.drained[send.worker.0]=1
 0:00:00.003041000 [client] TRACE c#credit.send.distributor.passes=1
+0:00:00.003041000 [client] TRACE c#credit.send.distributor.overrun_clamped=1
 0:00:00.003041000 [client] TRACE c#credit.send.distributor.passes=1
 0:00:00.003041000 [client] TRACE c#q.wheel_to_assembler.receiver[send.0.task.assembler.send.0]=1
 0:00:00.003041000 [client] TRACE c#q.wheel_to_assembler.drain[send.0]=1
@@ -3962,6 +3989,7 @@ expression: logs
 0:00:00.003041000 [client] TRACE m#q.wheel_to_assembler.depth_dist[send.0]=1
 0:00:00.003041000 [client] TRACE m#task.tx_wheel.drained[send.worker.0]=1
 0:00:00.003041000 [client] TRACE c#credit.send.distributor.passes=1
+0:00:00.003041000 [client] TRACE c#credit.send.distributor.overrun_clamped=1
 0:00:00.003041000 [client] TRACE c#credit.send.distributor.passes=1
 0:00:00.003041000 [client] TRACE c#q.wheel_to_assembler.receiver[send.0.task.assembler.send.0]=1
 0:00:00.003041000 [client] TRACE c#q.wheel_to_assembler.drain[send.0]=1
@@ -4007,6 +4035,7 @@ expression: logs
 0:00:00.003041000 [client] TRACE m#q.wheel_to_assembler.depth_dist[send.0]=1
 0:00:00.003041000 [client] TRACE m#task.tx_wheel.drained[send.worker.0]=1
 0:00:00.003041000 [client] TRACE c#credit.send.distributor.passes=1
+0:00:00.003041000 [client] TRACE c#credit.send.distributor.overrun_clamped=1
 0:00:00.003041000 [client] TRACE c#credit.send.distributor.passes=1
 0:00:00.003041000 [client] TRACE c#q.wheel_to_assembler.receiver[send.0.task.assembler.send.0]=1
 0:00:00.003041000 [client] TRACE c#q.wheel_to_assembler.drain[send.0]=1
@@ -4052,6 +4081,7 @@ expression: logs
 0:00:00.003041000 [client] TRACE m#q.wheel_to_assembler.depth_dist[send.0]=1
 0:00:00.003041000 [client] TRACE m#task.tx_wheel.drained[send.worker.0]=1
 0:00:00.003041000 [client] TRACE c#credit.send.distributor.passes=1
+0:00:00.003041000 [client] TRACE c#credit.send.distributor.overrun_clamped=1
 0:00:00.003041000 [client] TRACE c#credit.send.distributor.passes=1
 0:00:00.003041000 [client] TRACE c#q.wheel_to_assembler.receiver[send.0.task.assembler.send.0]=1
 0:00:00.003041000 [client] TRACE c#q.wheel_to_assembler.drain[send.0]=1
@@ -4097,6 +4127,7 @@ expression: logs
 0:00:00.003041000 [client] TRACE m#q.wheel_to_assembler.depth_dist[send.0]=1
 0:00:00.003041000 [client] TRACE m#task.tx_wheel.drained[send.worker.0]=1
 0:00:00.003041000 [client] TRACE c#credit.send.distributor.passes=1
+0:00:00.003041000 [client] TRACE c#credit.send.distributor.overrun_clamped=1
 0:00:00.003041000 [client] TRACE c#credit.send.distributor.passes=1
 0:00:00.003041000 [client] TRACE c#q.wheel_to_assembler.receiver[send.0.task.assembler.send.0]=1
 0:00:00.003041000 [client] TRACE c#q.wheel_to_assembler.drain[send.0]=1
@@ -4142,6 +4173,7 @@ expression: logs
 0:00:00.003041000 [client] TRACE m#q.wheel_to_assembler.depth_dist[send.0]=1
 0:00:00.003041000 [client] TRACE m#task.tx_wheel.drained[send.worker.0]=1
 0:00:00.003041000 [client] TRACE c#credit.send.distributor.passes=1
+0:00:00.003041000 [client] TRACE c#credit.send.distributor.overrun_clamped=1
 0:00:00.003041000 [client] TRACE c#credit.send.distributor.passes=1
 0:00:00.003041000 [client] TRACE c#q.wheel_to_assembler.receiver[send.0.task.assembler.send.0]=1
 0:00:00.003041000 [client] TRACE c#q.wheel_to_assembler.drain[send.0]=1
@@ -4187,6 +4219,7 @@ expression: logs
 0:00:00.003041000 [client] TRACE m#q.wheel_to_assembler.depth_dist[send.0]=1
 0:00:00.003041000 [client] TRACE m#task.tx_wheel.drained[send.worker.0]=1
 0:00:00.003041000 [client] TRACE c#credit.send.distributor.passes=1
+0:00:00.003041000 [client] TRACE c#credit.send.distributor.overrun_clamped=1
 0:00:00.003041000 [client] TRACE c#credit.send.distributor.passes=1
 0:00:00.003041000 [client] TRACE c#q.wheel_to_assembler.receiver[send.0.task.assembler.send.0]=1
 0:00:00.003041000 [client] TRACE c#q.wheel_to_assembler.drain[send.0]=1
@@ -4232,6 +4265,7 @@ expression: logs
 0:00:00.003041000 [client] TRACE m#q.wheel_to_assembler.depth_dist[send.0]=1
 0:00:00.003041000 [client] TRACE m#task.tx_wheel.drained[send.worker.0]=1
 0:00:00.003041000 [client] TRACE c#credit.send.distributor.passes=1
+0:00:00.003041000 [client] TRACE c#credit.send.distributor.overrun_clamped=1
 0:00:00.003041000 [client] TRACE c#credit.send.distributor.passes=1
 0:00:00.003041000 [client] TRACE c#q.wheel_to_assembler.receiver[send.0.task.assembler.send.0]=1
 0:00:00.003041000 [client] TRACE c#q.wheel_to_assembler.drain[send.0]=1
@@ -4256,6 +4290,7 @@ expression: logs
 0:00:00.003041000 [client] TRACE m#task.assembler.drained[send.0]=1
 0:00:00.003041000 [client] TRACE m#task.tx_wheel.drained[send.worker.0]=0
 0:00:00.003041000 [client] TRACE c#credit.send.distributor.passes=1
+0:00:00.003041000 [client] TRACE c#credit.send.distributor.overrun_clamped=1
 0:00:00.003041000 [client] TRACE c#credit.send.distributor.passes=1
 0:00:00.003541000 [server] TRACE c#socket.rx.ops[recv.0]=1
 0:00:00.003541000 [server] TRACE c#socket.rx.bytes[recv.0]=9868
