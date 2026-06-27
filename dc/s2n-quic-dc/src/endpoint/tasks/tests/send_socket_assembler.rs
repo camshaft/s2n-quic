@@ -16,7 +16,6 @@ use crate::{
     socket::{
         channel::{intrusive::unsync, ReceiverExt as _, UnboundedSender as _},
         pool::Pool,
-        rate::Rate,
     },
     testing::{ext::*, sim},
     time::{bach::Clock, precision::Clock as _},
@@ -110,7 +109,7 @@ fn assembler_channels(registry: &crate::counter::Registry) -> AssemblerChannels 
 }
 
 /// Binds an ephemeral UDP socket, runs `send_socket_assembler` with fixed test defaults
-/// (source sender ID 0, port 0, `Gso::default()`, `Pool::new(u16::MAX)`, rate 100 Gbps),
+/// (source sender ID 0, port 0, `Gso::default()`, `Pool::new(u16::MAX)`),
 /// and drains the pipeline to completion.
 ///
 /// Use this as the body of a spawned assembler task.  Callers pass the pipeline-side
@@ -149,7 +148,6 @@ async fn assembler_pipeline(
         freed_batch_tx,
         asm_counters,
         send_counters,
-        Rate::new(100.0),
         socket,
         immediate_tx,
         tx_wheel_tx,

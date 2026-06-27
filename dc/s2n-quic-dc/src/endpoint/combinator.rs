@@ -483,11 +483,9 @@ use crate::endpoint::edt::{
 /// and load-awareness through the score comparison.
 ///
 /// Implements `Receiver<()>` so it can be drained via `ReceiverExt::drain_budgeted`.
-pub struct PickTwo<T, R, S, Clk> {
+pub struct PickTwo<T, R, S> {
     rx: R,
     senders: IdMap<LocalSenderId, S>,
-    socket_edts: crate::endpoint::edt::Local,
-    clock: Clk,
     rng: crate::xorshift::Rng,
     /// Round-robin cursor for the first pick candidate. Always in `[0, senders.len())`.
     round_robin_idx: usize,
@@ -501,24 +499,19 @@ pub struct PickTwo<T, R, S, Clk> {
     value: PhantomData<fn() -> T>,
 }
 
-impl<T, R, S, Clk> PickTwo<T, R, S, Clk>
+impl<T, R, S> PickTwo<T, R, S>
 where
     T: ByteCost + PathSecretMapEntry + AssignSender,
     R: Receiver<T>,
     S: UnboundedSender<T>,
-    Clk: precision::Clock,
 {
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         rx: R,
         senders: IdMap<LocalSenderId, S>,
-        clock: Clk,
-        per_socket_send_rate: Rate,
         rng: crate::xorshift::Rng,
         counter_registry: &crate::counter::Registry,
         send_credit_pool: crate::sync::Arc<crate::credit::Pool>,
     ) -> Self {
-        let socket_edts = crate::endpoint::edt::Local::new(senders.len(), per_socket_send_rate);
         let pick_counters = senders
             .iter()
             .map(|(id, _)| {
@@ -543,8 +536,6 @@ where
         Self {
             rx,
             senders,
-            socket_edts,
-            clock,
             rng,
             round_robin_idx: 0,
             pick_counters,
@@ -558,8 +549,6 @@ where
     fn try_send_pick_two(
         mut value: T,
         senders: &mut IdMap<LocalSenderId, S>,
-        socket_edts: &mut crate::endpoint::edt::Local,
-        now: precision::Timestamp,
         rng: &mut crate::xorshift::Rng,
         round_robin_idx: &mut usize,
         pick_counters: &IdMap<LocalSenderId, crate::counter::Counter>,
@@ -569,11 +558,9 @@ where
         debug_assert!(!senders.is_empty());
         debug_assert_eq!(senders.len(), pick_counters.len());
         debug_assert_eq!(senders.len(), rejected_counters.len());
-        debug_assert_eq!(senders.len(), socket_edts.len());
         let entry = value.path_secret_entry();
         debug_assert_eq!(senders.len(), entry.socket_sender_count());
 
-        let byte_cost = value.byte_cost();
         let chosen_idx = {
             let len = senders.len();
             if len <= 1 {
@@ -596,12 +583,8 @@ where
                     LocalSenderId::from_index(raw2)
                 };
 
-                let score1 = entry
-                    .sender_load_score(idx1)
-                    .saturating_add(socket_edts.load_score(idx1));
-                let score2 = entry
-                    .sender_load_score(idx2)
-                    .saturating_add(socket_edts.load_score(idx2));
+                let score1 = entry.sender_load_score(idx1);
+                let score2 = entry.sender_load_score(idx2);
 
                 let delta = score1.abs_diff(score2);
                 score_delta.record_value(delta);
@@ -634,7 +617,6 @@ where
             senders.len()
         );
 
-        socket_edts.advance(chosen_idx, now, byte_cost);
         pick_counters[chosen_idx].add(1);
         value.set_sender_id(chosen_idx);
 
@@ -642,12 +624,11 @@ where
     }
 }
 
-impl<T, R, S, Clk> Receiver<()> for PickTwo<T, R, S, Clk>
+impl<T, R, S> Receiver<()> for PickTwo<T, R, S>
 where
     T: ByteCost + PathSecretMapEntry + AssignSender + FlowCredits,
     R: Receiver<T>,
     S: UnboundedSender<T>,
-    Clk: precision::Clock,
 {
     fn poll_recv(&mut self, cx: &mut task::Context<'_>, budget: &mut Budget) -> Poll<Option<()>> {
         let Some(value) = ready!(self.rx.poll_recv(cx, budget)) else {
@@ -656,12 +637,9 @@ where
 
         // Capture byte cost before moving value into try_send_pick_two.
         let byte_cost = value.byte_cost();
-        let now = self.clock.now();
         match Self::try_send_pick_two(
             value,
             &mut self.senders,
-            &mut self.socket_edts,
-            now,
             &mut self.rng,
             &mut self.round_robin_idx,
             &self.pick_counters,
@@ -669,8 +647,8 @@ where
             &self.score_delta,
         ) {
             Ok(()) => {
-                // Notify upstream (e.g. Paced) that bytes were consumed so the token bucket
-                // is advanced and pacing delays are applied to subsequent items.
+                // Notify upstream (e.g. the overall Paced stage) that bytes were consumed so the
+                // token bucket is advanced and pacing delays are applied to subsequent items.
                 self.rx.on_consumed(byte_cost);
                 Poll::Ready(Some(()))
             }

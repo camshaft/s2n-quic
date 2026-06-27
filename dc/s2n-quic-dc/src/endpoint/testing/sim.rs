@@ -232,9 +232,6 @@ pub struct SimEndpointConfig {
     /// Overall send rate cap (Gbps).
     pub overall_send_rate: Rate,
 
-    /// Per-socket send rate cap (Gbps).
-    pub per_socket_send_rate: Rate,
-
     /// Per-poll budgets.
     pub budgets: Budgets,
 
@@ -274,7 +271,6 @@ impl Default for SimEndpointConfig {
             num_recv_dispatch_workers: 4,
             submission_shards: 4,
             overall_send_rate: Rate::new(25.0),
-            per_socket_send_rate: Rate::new(5.0),
             budgets: Budgets::default(),
             mtu: 1500,
             send_window: None,
@@ -298,11 +294,6 @@ impl SimEndpointConfig {
 
     pub fn overall_send_rate(mut self, rate: Rate) -> Self {
         self.overall_send_rate = rate;
-        self
-    }
-
-    pub fn per_socket_send_rate(mut self, rate: Rate) -> Self {
-        self.per_socket_send_rate = rate;
         self
     }
 
@@ -356,7 +347,6 @@ pub fn setup_sim_endpoint(
         num_recv_dispatch_workers,
         submission_shards,
         overall_send_rate,
-        per_socket_send_rate,
         budgets,
         mtu,
         send_window,
@@ -464,7 +454,6 @@ pub fn setup_sim_endpoint(
         gso,
         acceptor_registry,
         overall_send_rate,
-        per_socket_send_rate,
         budgets,
         submission_shards,
         ups_rate: crate::socket::rate::Rate::new(0.001),

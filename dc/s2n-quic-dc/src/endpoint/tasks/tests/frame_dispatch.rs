@@ -30,15 +30,11 @@ type WorkerRx = unsync::Receiver<EntryAdapter<FrameBatch>>;
 /// Spawns the frame_dispatch pipeline and returns a SubmissionSender for feeding frames.
 /// Each element of the returned Vec is a receiver for one worker.
 fn setup(num_workers: usize) -> (SubmissionSender, Vec<WorkerRx>) {
-    setup_with_rates(num_workers, Rate::new(100.0), Rate::new(100.0))
+    setup_with_rates(num_workers, Rate::new(100.0))
 }
 
-/// Like [`setup`] but with configurable overall and per-socket send rates.
-fn setup_with_rates(
-    num_workers: usize,
-    overall_rate: Rate,
-    per_socket_rate: Rate,
-) -> (SubmissionSender, Vec<WorkerRx>) {
+/// Like [`setup`] but with a configurable overall send rate.
+fn setup_with_rates(num_workers: usize, overall_rate: Rate) -> (SubmissionSender, Vec<WorkerRx>) {
     let (frame_tx, frame_rx) = frame::submission_channel(1);
 
     let mut workers = Vec::with_capacity(num_workers);
@@ -57,7 +53,6 @@ fn setup_with_rates(
         crate::xorshift::Rng::new(),
         Clock::default(),
         overall_rate,
-        per_socket_rate,
         Budgets::default(),
         crate::counter::Registry::default(),
         crate::sync::Arc::new(crate::credit::Pool::new(crate::credit::Config::new(
@@ -201,7 +196,7 @@ fn pacing_delays_frames_beyond_burst() {
         // so its transmission cost slightly exceeds the burst budget, meaning the first
         // frame consumes all burst credit and the second must wait for the pacing timer.
         let overall_rate = Rate::new(100.0);
-        let (mut frame_tx, mut rxs) = setup_with_rates(1, overall_rate, Rate::new(100.0));
+        let (mut frame_tx, mut rxs) = setup_with_rates(1, overall_rate);
         let mut worker_rx = rxs.pop().unwrap();
 
         // Submit two oversized frames in one batch so both are visible to the pipeline

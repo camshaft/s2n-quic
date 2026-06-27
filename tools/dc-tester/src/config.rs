@@ -46,10 +46,6 @@ pub struct EndpointConfig {
     #[serde(default = "EndpointConfig::default_bandwidth")]
     pub bandwidth: f64,
 
-    /// Per-socket bandwidth limit in Gbps
-    #[serde(default = "EndpointConfig::default_per_socket_bandwidth")]
-    pub per_socket_bandwidth: f64,
-
     /// Number of shards for the frame submission channel (must be power of two)
     #[serde(default = "EndpointConfig::default_submission_shards")]
     pub submission_shards: usize,
@@ -84,10 +80,6 @@ impl EndpointConfig {
 
     fn default_bandwidth() -> f64 {
         30.0
-    }
-
-    fn default_per_socket_bandwidth() -> f64 {
-        5.0
     }
 
     fn default_submission_shards() -> usize {
@@ -150,7 +142,6 @@ impl Default for EndpointConfig {
             waker_drain_workers: Self::default_waker_drain_workers(),
             send_sockets: Self::default_send_sockets(),
             bandwidth: Self::default_bandwidth(),
-            per_socket_bandwidth: Self::default_per_socket_bandwidth(),
             submission_shards: Self::default_submission_shards(),
             recv_backend: Self::default_recv_backend(),
         }

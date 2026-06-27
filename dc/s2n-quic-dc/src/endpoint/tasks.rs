@@ -70,8 +70,8 @@ mod tests;
 /// - Frames from different priority classes are never merged into the same batch.
 /// - The spawned tasks are the only side effect; callers do not receive a handle back and must
 ///   keep the underlying executor running for progress.
-/// - `overall_send_rate`, `per_socket_send_rate`, and `budgets` bound how aggressively work is
-///   drained once the tasks are spawned.
+/// - `overall_send_rate` and `budgets` bound how aggressively work is drained once the tasks are
+///   spawned.
 #[allow(clippy::too_many_arguments)]
 pub fn frame_dispatch<S, Clk>(
     spawner: &mut impl Spawner,
@@ -80,7 +80,6 @@ pub fn frame_dispatch<S, Clk>(
     rng: crate::xorshift::Rng,
     clock: Clk,
     overall_send_rate: Rate,
-    per_socket_send_rate: Rate,
     budgets: Budgets,
     counter_registry: counter::Registry,
     send_credit_pool: crate::sync::Arc<crate::credit::Pool>,
@@ -145,17 +144,8 @@ pub fn frame_dispatch<S, Clk>(
         let rx = PriorityRx::new(priority_batch_rxs);
         let rx = BatchFramesByPathSecret::new(rx, &clock, overall_send_rate);
         let rx = Map::new(rx, Entry::new);
-        let pick_two_clock = clock.clone();
         let rx = Paced::new(rx, clock, overall_send_rate);
-        let rx = PickTwo::new(
-            rx,
-            worker_senders,
-            pick_two_clock,
-            per_socket_send_rate,
-            rng,
-            &counter_registry,
-            send_credit_pool,
-        );
+        let rx = PickTwo::new(rx, worker_senders, rng, &counter_registry, send_credit_pool);
         let task_counter = counter_registry
             .register_task("task.frame_dispatch")
             .with_registration_metadata(
@@ -703,7 +693,6 @@ pub fn send_worker<Socket, Clk, WakerSink, AckComp>(
             freed_batch_tx.clone(),
             asm_counters,
             send_counters,
-            st.per_socket_send_rate,
             st.socket,
             immediate_tx.clone(),
             tx_wheel_tx,
@@ -1135,7 +1124,6 @@ pub fn send_socket_assembler<ImmediateRx, ContextRx, Clk, Socket, C, A, ImmW, Tx
     freed_batch_tx: crate::queue::FreedBatchTx,
     asm_counters: AssemblerCounters,
     send_counters: Rc<endpoint::counters::Send>,
-    per_socket_send_rate: Rate,
     socket: Socket,
     immediate_tx: ImmW,
     tx_wheel_tx: TxW,
@@ -1174,7 +1162,6 @@ where
     );
     let rx = send::WheelRouter::new(rx, immediate_tx, tx_wheel_tx, pto_wheel_tx, idle_wheel_tx);
     let rx = Flatten::new(rx);
-    let rx = Paced::new(rx, clock, per_socket_send_rate);
     let rx = SocketSender::new(rx, socket);
     let rx = InspectErr::new(rx, |(err, _segments)| {
         warn!(%err, "socket send error");
