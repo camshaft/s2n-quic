@@ -1035,9 +1035,36 @@ impl Distributor {
             .distributor_carry_bytes
             .set(self.carry as i64);
         if writeback > 0 {
-            self.pool
+            let prev = self
+                .pool
                 .available
                 .fetch_add(writeback as i64, Ordering::Release);
+            // CONSERVATION BACKSTOP (phantom-credit clamp). The refill pacer deliberately relaxes
+            // strict conservation (see `pacer_inject`): a quantum it injects is folded into `pull`
+            // and written back here, but the *real* release that injection stood in for can later
+            // land on top of it. `pacer_tick`'s `in_system` charge bounds the *inject* side — it
+            // stops a single sustained wedge from over-injecting while `carry`/`refill_pending` still
+            // hold credit `available` can't show. It cannot bound the *release* side: once the
+            // phantom quantum is granted to a waiter, `carry`/`refill_pending` are back to zero, and
+            // when those phantom-backed bytes are released on the wire they refill `available` on top
+            // of the injection that conjured them. Over many wedge→recover cycles `available`
+            // ratchets past `capacity` without bound (observed live at ≈10 GB against a 32 MiB cap),
+            // the pool stops metering, and the backend goes under-fed even as it does less work.
+            // Clamp `available` down to `capacity` here, at the single point where the distributor
+            // raises it: the fast path only ever `fetch_sub`s, so once clamped it cannot exceed
+            // `capacity` until the next over-injected writeback, which this re-clamps. Discarding the
+            // surplus is correct — it was conjured by the pacer, never debited from anything finite.
+            // Only a genuine overrun (`prev + writeback > capacity`) is clamped; the normal
+            // negative/at-cap path is untouched, so liveness is preserved.
+            let new = prev + writeback as i64;
+            let cap = self.pool.config.capacity as i64;
+            if new > cap {
+                // Subtract exactly the overrun. Racing fast-path `fetch_sub`s between our add and
+                // this correction only make the value smaller, so this can never push `available`
+                // below where conservation allows.
+                self.pool.available.fetch_sub(new - cap, Ordering::Release);
+                self.pool.counters.distributor_overrun_clamped.add(1);
+            }
         }
 
         // Forward progress: `pull > 0` covers the "carried credit waiting to be written back"

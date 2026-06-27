@@ -392,7 +392,18 @@ fn partial_budget_serves_priority_prefix() {
 #[test]
 fn grant_is_exactly_requested_surplus_to_fast_path() {
     // A waiter that requested 10 gets exactly 10; the surplus lands in `available` for the fast path.
-    let mut h = Harness::new(cfg(0, 1000));
+    // Conservation-honest: the 1000 the test releases must first be *acquired* (drained to in-flight),
+    // so the release represents real returning bytes rather than credit conjured past `capacity`.
+    let mut h = Harness::new(cfg(1000, 1000));
+
+    // Drain the pool to zero with a fast-path acquirer that holds the credit until it releases below.
+    let drain_slot = alloc_test_slot();
+    let drain_waker = Waker::from(Arc::new(WakeCounter::default()));
+    assert_eq!(
+        unsafe { h.poll_acquire(drain_slot, 1000, Priority::Medium, &drain_waker) },
+        Poll::Ready(1000)
+    );
+    assert_eq!(h.pool.debug_available(), 0);
 
     let counter = Arc::new(WakeCounter::default());
     let waker = Waker::from(counter.clone());
@@ -401,7 +412,7 @@ fn grant_is_exactly_requested_surplus_to_fast_path() {
     let result = unsafe { h.poll_acquire(slot, 10, Priority::Medium, &waker) };
     assert!(matches!(result, Poll::Pending));
 
-    h.release(1000);
+    h.release(1000); // the drained credit returning
     h.distribute();
 
     let slot_ref = unsafe { &*slot.as_ptr() };
@@ -416,6 +427,7 @@ fn grant_is_exactly_requested_surplus_to_fast_path() {
     assert_eq!(r, Poll::Ready(990));
 
     unsafe {
+        free_test_slot(drain_slot);
         free_test_slot(slot);
         free_test_slot(slot2);
     }
@@ -423,7 +435,17 @@ fn grant_is_exactly_requested_surplus_to_fast_path() {
 
 #[test]
 fn spurious_wake_then_grant() {
-    let mut h = Harness::new(cfg(0, 100));
+    // Conservation-honest: the 100 the test releases is first acquired (drained to in-flight), so the
+    // release is real returning bytes, not credit conjured past `capacity`.
+    let mut h = Harness::new(cfg(100, 100));
+
+    let drain_slot = alloc_test_slot();
+    let drain_waker = Waker::from(Arc::new(WakeCounter::default()));
+    assert_eq!(
+        unsafe { h.poll_acquire(drain_slot, 100, Priority::Medium, &drain_waker) },
+        Poll::Ready(100)
+    );
+    assert_eq!(h.pool.debug_available(), 0);
 
     let counter = Arc::new(WakeCounter::default());
     let waker = Waker::from(counter.clone());
@@ -435,13 +457,16 @@ fn spurious_wake_then_grant() {
     let slot_ref = unsafe { &*slot.as_ptr() };
     assert_eq!(slot_ref.poll_granted(), GrantResult::Pending);
 
-    h.release(100);
+    h.release(100); // the drained credit returning
     h.distribute();
     // Requested 50 → granted exactly 50; the other 50 is surplus.
     assert_eq!(slot_ref.poll_granted(), GrantResult::Granted(50));
     assert_eq!(h.pool.debug_available(), 50);
 
-    unsafe { free_test_slot(slot) };
+    unsafe {
+        free_test_slot(drain_slot);
+        free_test_slot(slot);
+    }
 }
 
 #[test]
@@ -957,7 +982,18 @@ fn carry_releases_when_queue_drains() {
     // linked. Then those waiters all abandon. The next pass must write the carry back to
     // `available` (no live parked demand → full writeback) and a fresh fast-path acquirer must
     // see it.
-    let mut h = Harness::new(cfg(0, 100));
+    //
+    // Conservation-honest: the 30 the test releases is first acquired (drained to in-flight), so the
+    // release is real returning bytes, not credit conjured past `capacity`.
+    let mut h = Harness::new(cfg(30, 100));
+
+    let drain_slot = alloc_test_slot();
+    let drain_waker = Waker::from(Arc::new(WakeCounter::default()));
+    assert_eq!(
+        unsafe { h.poll_acquire(drain_slot, 30, Priority::Medium, &drain_waker) },
+        Poll::Ready(30)
+    );
+    assert_eq!(h.pool.debug_available(), 0);
 
     let counters: Vec<_> = (0..3).map(|_| Arc::new(WakeCounter::default())).collect();
     let wakers: Vec<_> = counters.iter().map(|c| Waker::from(c.clone())).collect();
@@ -966,7 +1002,7 @@ fn carry_releases_when_queue_drains() {
         let r = unsafe { h.poll_acquire(slots[i], 10, Priority::Medium, &wakers[i]) };
         assert!(matches!(r, Poll::Pending));
     }
-    // Release enough to satisfy all three.
+    // Release the drained credit — enough to satisfy all three.
     h.release(30);
 
     // Pass with budget=1: grants one, leaves two parked, carry > 0.
@@ -1006,6 +1042,7 @@ fn carry_releases_when_queue_drains() {
 
     // Free what survived.
     unsafe {
+        free_test_slot(drain_slot);
         for (i, s) in slots.into_iter().enumerate() {
             if counters[i].wakeups() == 1 {
                 free_test_slot(s);
@@ -1698,5 +1735,105 @@ fn pacer_never_drives_available_past_capacity_in_a_wedge() {
 
     for s in drain_slots.into_iter().chain(wait_slots) {
         unsafe { free_test_slot(s) };
+    }
+}
+
+#[test]
+fn phantom_pacer_credit_released_back_does_not_drive_available_past_capacity() {
+    // INVARIANT UNDER TEST (same as `pacer_never_drives_available_past_capacity_in_a_wedge`):
+    // `available` must never exceed `capacity`. That sibling test guards the *inject* side — the
+    // `in_system` headroom charge in `pacer_tick` stops a single sustained wedge from over-injecting
+    // while `carry`/`refill_pending` still hold credit that `available` cannot yet show.
+    //
+    // This test guards the *release* side, which the inject-side charge cannot reach. The pacer
+    // deliberately relaxes conservation: a quantum it injects is PHANTOM credit, not backed by any
+    // real release. The lifecycle of that phantom quantum is what breaks the cap:
+    //
+    //   A. Wedge — the pool is drained by real holders and a waiter parks. With no real releases the
+    //      pacer injects a quantum and the following pass GRANTS it to the waiter. `available`
+    //      returns to its drained level. At this instant the pacer's own bookkeeping
+    //      (`carry`/`refill_pending`) is back to zero, so the inject-side `in_system` charge has
+    //      nothing left to observe — its job is already done.
+    //   B. Recover — the real holders release. Real credit legitimately refills `available` back up
+    //      toward `capacity`.
+    //   C. Phantom release — the waiter's granted bytes go out on the wire and are eventually
+    //      released like any other in-flight bytes. The pool cannot tell a phantom-backed release
+    //      from a real one, so this quantum lands in `returned` and is written into `available` ON
+    //      TOP of the injection that conjured it. `available` now exceeds `capacity`.
+    //
+    // Each wedge→grant→recover→phantom-release cycle leaks one quantum into `available`; over a
+    // saturated device cycling between backlog and drain it climbs without bound — observed live at
+    // ≈10 GB against a 32 MiB cap. Past the cap, fresh fast-path acquirers take credit without ever
+    // parking, the pool stops metering, and the backend goes under-fed.
+    let unit = 256 * 1024; // per-acquire size == max_single_acquire == pacer quantum
+    let quantum = unit;
+    let cap = 2 * unit; // room for two real holders to drain the pool exactly
+    let mut cfg = cfg(cap, unit);
+    cfg.min_grant_slice = [unit; Priority::LEVELS];
+    let mut h = Harness::new(cfg);
+
+    // Drain the pool with two real fast-path acquirers (model bytes in flight on the wire). They
+    // release in phase B, not before. available = 0 after this.
+    let real_a = alloc_test_slot();
+    let real_b = alloc_test_slot();
+    let noop = Waker::from(Arc::new(WakeCounter::default()));
+    assert_eq!(
+        unsafe { h.poll_acquire(real_a, unit, Priority::Medium, &noop) },
+        Poll::Ready(unit)
+    );
+    assert_eq!(
+        unsafe { h.poll_acquire(real_b, unit, Priority::Medium, &noop) },
+        Poll::Ready(unit)
+    );
+    assert_eq!(h.pool.debug_available(), 0);
+
+    // ── Phase A: wedge → inject → grant ──────────────────────────────────────────────────────────
+    // A waiter demands `unit`; the pool is drained so it parks (available goes negative).
+    let waiter = alloc_test_slot();
+    let waiter_waker = Waker::from(Arc::new(WakeCounter::default()));
+    assert!(matches!(
+        unsafe { h.poll_acquire(waiter, unit, Priority::Medium, &waiter_waker) },
+        Poll::Pending
+    ));
+    // The pacer ticks with no real releases pending: it injects a phantom quantum and the following
+    // pass grants it to the parked waiter. Those bytes are now "in flight", backed by nothing real.
+    h.pacer_tick_and_distribute(quantum, /* budget */ 1 << 20);
+    assert_eq!(
+        unsafe { &*waiter.as_ptr() }.poll_granted(),
+        GrantResult::Granted(unit),
+        "pacer must serve the parked waiter from the injected quantum",
+    );
+
+    // ── Phase B: recover ─────────────────────────────────────────────────────────────────────────
+    // The real holders release. This legitimately refills `available`. The phantom-backed waiter has
+    // NOT released yet — it is still holding its granted bytes on the wire.
+    h.release(unit); // real_a
+    h.release(unit); // real_b
+    h.distribute();
+    assert!(
+        h.pool.debug_available() <= cap as i64,
+        "available should be at or below cap after only real credit returns",
+    );
+
+    // ── Phase C: phantom release ─────────────────────────────────────────────────────────────────
+    // The waiter's granted bytes finally come back. The pool writes this quantum into `available` on
+    // top of the injection that conjured it — and there is no pacer tick here for the inject-side
+    // charge to act on.
+    h.release(unit);
+    h.distribute();
+
+    let available = h.pool.debug_available();
+    assert!(
+        available <= cap as i64,
+        "available reached {available} but capacity is {cap}: phantom pacer credit was released \
+         back into `available` on top of the injection that conjured it, so `available` overshot \
+         the cap — fresh acquirers can now snipe past the pool without parking (unbounded, unfair \
+         acquires that defeat pacing)",
+    );
+
+    unsafe {
+        free_test_slot(real_a);
+        free_test_slot(real_b);
+        free_test_slot(waiter);
     }
 }
