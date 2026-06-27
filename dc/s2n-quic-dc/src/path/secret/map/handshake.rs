@@ -272,6 +272,7 @@ impl HandshakingPathInner {
         let request = super::ApplicationDataRequest {
             tls: session,
             peer_info: self.peer_info.as_ref(),
+            peer: self.peer,
         };
         match self.map.store.application_data(request) {
             Ok(application_data) => {
