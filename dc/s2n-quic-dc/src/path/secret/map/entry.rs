@@ -41,10 +41,13 @@ pub type ApplicationData = Arc<dyn Any + Send + Sync>;
 /// `peer_info` is the remote peer's `DcPeerInfo` transport-parameter bytes,
 /// available here so application-level negotiation can run once at handshake
 /// time and store its result as the connection's [`ApplicationData`].
+///
+/// `peer` is the remote peer's address for this handshake.
 #[non_exhaustive]
 pub struct ApplicationDataRequest<'a> {
     pub tls: &'a dyn s2n_quic_core::crypto::tls::TlsSession,
     pub peer_info: Option<&'a bytes::Bytes>,
+    pub peer: SocketAddr,
 }
 
 pub const MAX_PEER_DATA_ADDRS: usize = 128;

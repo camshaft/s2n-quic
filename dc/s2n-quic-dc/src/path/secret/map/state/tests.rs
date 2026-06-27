@@ -456,6 +456,7 @@ fn application_data_none_without_callback() {
     let request = super::super::ApplicationDataRequest {
         tls: &StubTlsSession,
         peer_info: None,
+        peer: "127.0.0.1:0".parse().unwrap(),
     };
     let data = Store::application_data(&*map, request).unwrap();
     assert!(data.is_none());
@@ -483,6 +484,7 @@ fn application_data_callback_receives_peer_info_and_returns_data() {
     let request = super::super::ApplicationDataRequest {
         tls: &StubTlsSession,
         peer_info: Some(&peer_info),
+        peer: "127.0.0.1:0".parse().unwrap(),
     };
     let data = Store::application_data(&*map, request)
         .unwrap()
@@ -509,6 +511,7 @@ fn application_data_callback_error_propagates() {
     let request = super::super::ApplicationDataRequest {
         tls: &StubTlsSession,
         peer_info: None,
+        peer: "127.0.0.1:0".parse().unwrap(),
     };
     let err = Store::application_data(&*map, request).unwrap_err();
     assert_eq!(err.msg, "boom");
