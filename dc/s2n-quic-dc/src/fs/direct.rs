@@ -12,6 +12,7 @@
 //! page-rounded capacity; callers are responsible for aligned offsets/lengths. On tmpfs (where
 //! `O_DIRECT` is rejected) and on macOS the open path falls back appropriately.
 
+use s2n_quic_core::buffer::writer::Storage as _;
 use std::{
     fs::OpenOptions,
     io,
@@ -78,6 +79,64 @@ impl AlignedBuf {
         Self { ptr, len, cap }
     }
 
+    /// Allocate a buffer holding `reader`'s bytes, **block-aligned and ready for a direct write**.
+    ///
+    /// The reader's bytes are copied into the front of a page-rounded allocation, then the logical
+    /// `len` is **padded up to the next [`ALIGNMENT`] boundary**, with the padding bytes zeroed. The
+    /// result is therefore safe to hand straight to an `O_DIRECT` write — whose transfer length must
+    /// be block-aligned — without the caller having to round `len` up themselves. Since this buffer is
+    /// almost always destined for a write, padding by default avoids the easy footgun of submitting an
+    /// unaligned length and getting an `InvalidInput` rejection at submit time.
+    ///
+    /// A caller that wants only the payload (e.g. to inspect it, or to size a non-direct write) can
+    /// [`set_len`](Self::set_len) back down to the unpadded length — the data prefix is unchanged.
+    ///
+    /// Unlike [`new`](Self::new) — which `alloc_zeroed`s the whole capacity — this only memsets the
+    /// padding tail, not the data region the copy is about to overwrite. The whole `cap` stays
+    /// initialized (data prefix from the copy, remainder zeroed), so `as_slice` never exposes
+    /// uninitialized memory at any valid `len`. The reader is
+    /// [`Infallible`](s2n_quic_core::buffer::reader::storage::Infallible), so the copy cannot fail,
+    /// and the destination capacity always covers `buffered_len`, so the reader is fully drained.
+    pub fn copy_from_reader<R>(reader: &mut R) -> Self
+    where
+        R: s2n_quic_core::buffer::reader::storage::Infallible + ?Sized,
+    {
+        let len = reader.buffered_len();
+        let cap = align_up(len.max(1));
+        let layout =
+            std::alloc::Layout::from_size_align(cap, ALIGNMENT).expect("valid aligned layout");
+        // SAFETY: layout has non-zero size (cap >= ALIGNMENT) and valid alignment.
+        let raw = unsafe { std::alloc::alloc(layout) };
+        let ptr =
+            std::ptr::NonNull::new(raw).unwrap_or_else(|| std::alloc::handle_alloc_error(layout));
+
+        // Copy the reader into the `len`-byte prefix via the writer-storage machinery, tracking how
+        // many bytes actually land (== `buffered_len` for a well-behaved reader, but we trust the
+        // count, not the request).
+        // SAFETY: `ptr` is valid for writes of `len` bytes (`len <= cap`).
+        let mut dest = unsafe { bytes::buf::UninitSlice::from_raw_parts_mut(ptr.as_ptr(), len) };
+        let mut tracked = dest.track_write();
+        reader.infallible_copy_into(&mut tracked);
+        let written = tracked.written_len();
+
+        // Zero the unused tail `[written, cap)` so the entire allocation is initialized: this is the
+        // only memset, and it covers the alignment padding written to disk. (Disjoint from the copied
+        // prefix; for `written == cap` this writes nothing.)
+        // SAFETY: `ptr + written` is in-bounds and valid for `cap - written` bytes (`written <= cap`).
+        unsafe {
+            core::ptr::write_bytes(ptr.as_ptr().add(written), 0, cap - written);
+        }
+
+        // Pad the logical length up to a block boundary so the buffer is directly writable. This is
+        // `<= cap` (`written <= buffered_len`, and `cap == align_up(buffered_len)`), and the
+        // `[written, len)` padding it exposes was just zeroed. An empty reader stays `len == 0`.
+        Self {
+            ptr,
+            len: align_up(written),
+            cap,
+        }
+    }
+
     #[inline]
     pub fn len(&self) -> usize {
         self.len
@@ -98,16 +157,18 @@ impl AlignedBuf {
 
     #[inline]
     pub fn as_slice(&self) -> &[u8] {
-        // SAFETY: `ptr` is valid for `len` initialized bytes (alloc_zeroed initialized all `cap`,
-        // and `len <= cap` is maintained by `new`/`set_len`).
+        // SAFETY: `ptr` is valid for `len` initialized bytes. `new` zero-initializes all `cap`;
+        // `copy_from_reader` initializes the `len`-byte prefix it copies into. `len <= cap` and
+        // bytes `[0, len)` stay initialized — `set_len` only grows within already-initialized
+        // bounds (it asserts `len <= cap`; callers never grow past initialized data).
         unsafe { core::slice::from_raw_parts(self.ptr.as_ptr(), self.len) }
     }
 
     /// The logical-length mutable slice, for an in-place direct read destination (zero-copy).
     #[inline]
     pub fn as_mut_slice(&mut self) -> &mut [u8] {
-        // SAFETY: `ptr` is valid for `len` zero-initialized bytes (`len <= cap`) and we hold
-        // `&mut self`.
+        // SAFETY: `ptr` is valid for `len` initialized bytes (`len <= cap`, and bytes `[0, len)` are
+        // initialized by `new`/`copy_from_reader`) and we hold `&mut self`.
         unsafe { core::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len) }
     }
 
@@ -299,6 +360,57 @@ mod tests {
         assert_eq!(buf.capacity(), ALIGNMENT);
         let buf = AlignedBuf::new(ALIGNMENT + 1);
         assert_eq!(buf.capacity(), 2 * ALIGNMENT);
+    }
+
+    #[test]
+    fn copy_from_reader_pads_to_block() {
+        // A sub-page source: the logical length is padded up to a block boundary by default, with
+        // the data copied into the front and the padding zeroed — ready for a direct write.
+        let src = b"hello direct io world";
+        let mut reader: &[u8] = src;
+        let buf = AlignedBuf::copy_from_reader(&mut reader);
+
+        assert!(buf.is_aligned());
+        assert_eq!(buf.len(), ALIGNMENT, "len padded to a block boundary");
+        assert_eq!(buf.capacity(), ALIGNMENT);
+        // The reader was fully drained.
+        assert!(reader.is_empty());
+        // Data prefix is intact; the rest of the block is zero padding.
+        assert_eq!(&buf.as_slice()[..src.len()], src);
+        assert!(buf.as_slice()[src.len()..].iter().all(|&b| b == 0));
+
+        // A caller wanting only the payload can shrink back; the prefix is unchanged.
+        let mut buf = buf;
+        buf.set_len(src.len());
+        assert_eq!(buf.as_slice(), src);
+    }
+
+    #[test]
+    fn copy_from_reader_multi_page_and_empty() {
+        // A source spanning more than one page rounds capacity (and the padded len) up to the next
+        // page boundary.
+        let src = vec![0xABu8; ALIGNMENT + 1];
+        let mut reader: &[u8] = &src;
+        let buf = AlignedBuf::copy_from_reader(&mut reader);
+        assert_eq!(buf.len(), 2 * ALIGNMENT, "len padded to the next block");
+        assert_eq!(buf.capacity(), 2 * ALIGNMENT);
+        assert_eq!(&buf.as_slice()[..src.len()], &src[..]);
+        assert!(buf.as_slice()[src.len()..].iter().all(|&b| b == 0));
+
+        // An exactly block-aligned source needs no padding: len stays as-is.
+        let src = vec![0xCDu8; ALIGNMENT];
+        let mut reader: &[u8] = &src;
+        let buf = AlignedBuf::copy_from_reader(&mut reader);
+        assert_eq!(buf.len(), ALIGNMENT);
+        assert_eq!(buf.as_slice(), &src[..]);
+
+        // An empty reader still allocates a valid (one-page, zeroed) buffer with logical length 0 —
+        // there is nothing to pad.
+        let mut empty: &[u8] = &[];
+        let buf = AlignedBuf::copy_from_reader(&mut empty);
+        assert_eq!(buf.len(), 0);
+        assert_eq!(buf.capacity(), ALIGNMENT);
+        assert!(buf.is_aligned());
     }
 
     #[test]
