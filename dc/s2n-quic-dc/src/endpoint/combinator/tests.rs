@@ -295,8 +295,6 @@ fn try_send_pick_two_with_rr(
     rng: &mut crate::xorshift::Rng,
     round_robin_idx: &mut usize,
 ) -> Result<(), TestItem> {
-    use crate::time::precision::Clock as _;
-
     let registry = crate::counter::Registry::default();
     let pick_counters: Vec<_> = (0..senders.len())
         .map(|i| registry.register_nominal("pick_two.chosen", format_args!("send.{i}")))
@@ -318,26 +316,16 @@ fn try_send_pick_two_with_rr(
         rejected_counters.into();
     let mut senders_map: crate::endpoint::id::IdMap<crate::endpoint::id::LocalSenderId, _> =
         std::mem::take(senders).into();
-    let mut socket_edts =
-        crate::endpoint::edt::Local::new(senders_map.len(), crate::socket::rate::Rate::new(10.0));
-    let clock = test_clock();
-    let now = clock.now();
-    let result = PickTwo::<
-        TestItem,
-        TestReceiver<TestItem>,
-        TestSender,
-        test_clock_mod::Clock,
-    >::try_send_pick_two(
-        value,
-        &mut senders_map,
-        &mut socket_edts,
-        now,
-        rng,
-        round_robin_idx,
-        &pick_counters_map,
-        &rejected_counters_map,
-        &score_delta,
-    );
+    let result =
+        PickTwo::<TestItem, TestReceiver<TestItem>, TestSender>::try_send_pick_two(
+            value,
+            &mut senders_map,
+            rng,
+            round_robin_idx,
+            &pick_counters_map,
+            &rejected_counters_map,
+            &score_delta,
+        );
     *senders = senders_map.into_iter().map(|(_, v)| v).collect();
     result
 }
@@ -548,8 +536,6 @@ fn pick_two_drops_unsent_entry_on_shutdown() {
     let pick_two = PickTwo::new(
         rx,
         senders.into(),
-        test_clock(),
-        crate::socket::rate::Rate::new(10.0),
         crate::xorshift::Rng::new(),
         &registry,
         pool.clone(),
@@ -600,8 +586,6 @@ fn pick_two_propagates_on_consumed() {
     let mut pick_two = PickTwo::new(
         rx,
         senders.into(),
-        test_clock(),
-        crate::socket::rate::Rate::new(10.0),
         crate::xorshift::Rng::new(),
         &registry,
         pool,

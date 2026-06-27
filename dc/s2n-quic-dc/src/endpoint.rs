@@ -357,13 +357,6 @@ pub struct Config {
     ///
     /// [`Paced`]: crate::socket::channel::Paced
     pub overall_send_rate: crate::socket::rate::Rate,
-    /// Per-socket bandwidth cap applied after assembly, before socket transmission.
-    ///
-    /// Each send socket gets its own [`Paced`] stage with this rate. This prevents any
-    /// single socket from saturating the NIC queue even when the overall rate budget allows it.
-    ///
-    /// [`Paced`]: crate::socket::channel::Paced
-    pub per_socket_send_rate: crate::socket::rate::Rate,
     /// Per-poll budgets for each pipeline task.
     pub budgets: Budgets,
     /// Number of shards for the frame submission channel.
@@ -526,7 +519,6 @@ where
         gso,
         acceptor_registry,
         overall_send_rate,
-        per_socket_send_rate,
         budgets,
         submission_shards,
         ups_rate,
@@ -730,7 +722,6 @@ where
             gso: gso.clone(),
             pool: send_pool.clone(),
             clock: clock.clone(),
-            per_socket_send_rate,
             initial_tx_descriptor_allocs,
         });
     }
@@ -779,7 +770,6 @@ where
         socket_senders,
         clock: clock.clone(),
         overall_send_rate,
-        per_socket_send_rate,
         send_credit_distributor,
         recv_credit_distributor,
         send_credit_waker_sink: send_credit_distributor_waker_sink,
@@ -1032,8 +1022,6 @@ struct FrameDispatchParts<Clk> {
     clock: Clk,
     /// Overall bandwidth cap for the pacing stage.
     overall_send_rate: crate::socket::rate::Rate,
-    /// Per-socket bandwidth cap used for socket-level EDT in pick-two.
-    per_socket_send_rate: crate::socket::rate::Rate,
     /// Send-direction credit-pool distributor. Spawned alongside the frame-dispatch
     /// task on the same worker so distribution and submission share a thread.
     send_credit_distributor: crate::credit::Distributor,
@@ -1078,7 +1066,6 @@ pub(crate) struct SendSocketParts<Socket, Clk> {
     gso: s2n_quic_platform::features::Gso,
     pool: crate::socket::pool::Pool,
     clock: Clk,
-    per_socket_send_rate: crate::socket::rate::Rate,
     initial_tx_descriptor_allocs: usize,
 }
 
@@ -1258,7 +1245,6 @@ where
                     crate::xorshift::Rng::new(),
                     fd.clock,
                     fd.overall_send_rate,
-                    fd.per_socket_send_rate,
                     budgets,
                     counter_registry.clone(),
                     fd.send_credit_pool,
