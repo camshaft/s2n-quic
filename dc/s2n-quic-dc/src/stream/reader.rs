@@ -688,6 +688,53 @@ impl Reader {
         self.0.reassembler.reset();
     }
 
+    /// Polls whether the peer's write side is still open.
+    ///
+    /// - [`Poll::Pending`] while the peer's writer is still sending. The
+    ///   current task's waker is registered so a later Reset, FIN, or
+    ///   connection failure wakes it without requiring an active read.
+    /// - [`Poll::Ready(Ok(()))`] once the peer's write side has closed
+    ///   cleanly: a FIN was received (all stream data has been sent by the
+    ///   peer, though the application may not yet have consumed it all).
+    /// - [`Poll::Ready(Err(e))`] if the peer reset the stream, the
+    ///   connection died (idle timeout / transmission failure), or the stream
+    ///   channel closed unexpectedly.
+    ///
+    /// Flow control credits are **not** updated: this probe writes pending
+    /// frames into the reassembler without copying them to an application
+    /// buffer, so `consumed_len` does not advance and no `MAX_DATA` is sent.
+    ///
+    /// # Task affinity (contract)
+    ///
+    /// This shares the reader's single stream-channel and completion-channel
+    /// waker slots with the read path. It MUST be polled from the same task
+    /// that calls [`poll_read_into`](Self::poll_read_into) — typically as one
+    /// branch of a `tokio::select!` alongside the consuming future. `&mut
+    /// Reader` enforces this: concurrent reads from another task are impossible
+    /// because both paths require `&mut self`.
+    pub fn poll_peer_liveness(&mut self, cx: &mut Context) -> Poll<io::Result<()>> {
+        self.0.poll_peer_liveness(cx)
+    }
+
+    /// Awaitable form of [`poll_peer_liveness`](Self::poll_peer_liveness).
+    ///
+    /// Resolves once the peer's write side has closed or an error is detected,
+    /// so a consumer can race it against the future that processes data:
+    ///
+    /// ```ignore
+    /// tokio::select! {
+    ///     biased;
+    ///     result = reader.read_into(&mut buf) => { /* handle data */ }
+    ///     result = reader.peer_liveness() => match result {
+    ///         Ok(()) => { /* peer sent FIN; keep draining buffered data */ }
+    ///         Err(e) => return Err(e.into()),
+    ///     },
+    /// }
+    /// ```
+    pub async fn peer_liveness(&mut self) -> io::Result<()> {
+        core::future::poll_fn(|cx| self.poll_peer_liveness(cx)).await
+    }
+
     /// Reads the next contiguous bytes into the destination buffer.
     ///
     /// The returned byte count may be smaller than `buf`'s remaining capacity.
@@ -845,6 +892,144 @@ impl Inner {
                 io::Error::new(err.io_error_kind(), err)
             },
         )
+    }
+
+    fn poll_peer_liveness(&mut self, cx: &mut Context) -> Poll<io::Result<()>> {
+        // Intentionally NOT wrapped in `coop::poll`: this is a status probe that produces no
+        // frames, so a coop self-wake under budget pressure would busy-spin the caller's `select!`
+        // with nothing to advance. It does not touch `self.coop` at all. The waker contract is
+        // still satisfied — the inner body registers real channel wakers on its `Pending` paths —
+        // and `debug_assert_contract` enforces it in debug builds.
+        waker::debug_assert_contract(cx, |cx| self.poll_peer_liveness_inner(cx))
+    }
+
+    fn poll_peer_liveness_inner(&mut self, cx: &mut Context) -> Poll<io::Result<()>> {
+        // Already terminal: report immediately and register no waker.
+        if self.status.is_complete() {
+            return Poll::Ready(Ok(()));
+        }
+        if self.status.is_reset() {
+            return Poll::Ready(Err(self.reset_io_error()));
+        }
+        // FIN has been written to the reassembler (all peer data received) even if the
+        // application has not yet consumed it all.
+        if self.reassembler.is_writing_complete() {
+            return Poll::Ready(Ok(()));
+        }
+
+        // Connection-level failures (PeerDead / TransmissionError / Cancelled /
+        // UnknownPathSecret). `poll_completions` registers the completion-channel waker on its
+        // internal `Pending` path.
+        if let Err(e) = self.poll_completions(cx) {
+            return Poll::Ready(Err(e));
+        }
+
+        // Drain any frames left in pending_rx by a prior poll, then pull a fresh batch.
+        // Always call `poll_swap` even when pending_rx is non-empty so the stream-half waker
+        // is (re)registered; a stale waker would silently drop the next wake-up.
+        let mut queue = core::mem::take(&mut self.pending_rx);
+        let channel_closed = match self.stream_rx.poll_swap(cx) {
+            Poll::Ready(Ok(mut fresh)) => {
+                queue.append(&mut fresh);
+                false
+            }
+            Poll::Ready(Err(_)) => true,
+            Poll::Pending => false,
+        };
+
+        // Process every frame directly into the reassembler (no app-buffer / interposer path).
+        // Writing to the reassembler buffers the data without advancing `consumed_len`, so no
+        // MAX_DATA credit is issued here — flow-control only advances when the application
+        // actually consumes bytes through `read_into`.
+        //
+        // Because data lands in the reassembler rather than being stashed back in `pending_rx`,
+        // the read path gets proper TCP semantics for free: when a Reset is found after
+        // preceding data, `poll_read_into_inner` sees `!reassembler.is_empty()` and defers
+        // the error, draining all buffered bytes to the application before surfacing the reset.
+        while let Some(entry) = queue.pop_front() {
+            self.status.on_received().ok();
+
+            match entry.into_inner() {
+                msg::Stream::Data {
+                    offset,
+                    peer_max_offset,
+                    mut payload,
+                    fin,
+                    blocked,
+                } => {
+                    self.peer_max_offset = self.peer_max_offset.max(peer_max_offset.as_u64());
+                    if blocked {
+                        self.on_blocked_signal(peer_max_offset.as_u64());
+                    }
+
+                    let Some(payload_end_offset) =
+                        offset.as_u64().checked_add(payload.len() as u64)
+                    else {
+                        return self.protocol_error();
+                    };
+
+                    if self.remote_max_data != VarInt::ZERO
+                        && payload_end_offset > self.remote_max_data.as_u64()
+                    {
+                        return self.queue_control_error();
+                    }
+
+                    let mut incremental = Incremental::new(offset);
+                    let mut reader = match incremental.with_storage(&mut payload, fin) {
+                        Ok(r) => r,
+                        Err(_) => return self.protocol_error(),
+                    };
+
+                    // Always write directly to the reassembler, skipping the Interposer /
+                    // app-buf path used by `poll_stream_rx`. This keeps data buffered in
+                    // the reassembler (not in the application buffer) so it can be drained
+                    // in order by `read_into`.
+                    if self.reassembler.write_reader(&mut reader).is_err() {
+                        return self.protocol_error();
+                    }
+
+                    if self.reassembler.is_writing_complete() {
+                        return Poll::Ready(Ok(()));
+                    }
+                }
+                msg::Stream::Blocked {
+                    desired_offset,
+                    synthetic,
+                } => {
+                    let desired = desired_offset.as_u64();
+                    self.peer_max_offset = self.peer_max_offset.max(desired);
+                    if !synthetic {
+                        self.on_blocked_signal(desired);
+                    }
+                }
+                msg::Stream::Reset { error_code } => {
+                    self.reset_error_code = Some(error_code);
+                    self.status.on_reset().ok();
+                    // Only clear the reassembler if it is already empty. If data was buffered
+                    // before the reset, leave it so the read path can drain it first.
+                    if self.reassembler.is_empty() {
+                        self.reassembler.reset();
+                    }
+                    let reset_error: Error = error_code.into();
+                    return Poll::Ready(Err(io::Error::new(
+                        reset_error.io_error_kind(),
+                        reset_error,
+                    )));
+                }
+                msg::Stream::Debug { .. } => {
+                    // Debug frames carry no stream data; ignore in the liveness path.
+                }
+            }
+        }
+
+        if channel_closed {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "stream channel closed",
+            )));
+        }
+
+        Poll::Pending
     }
 
     #[inline]
