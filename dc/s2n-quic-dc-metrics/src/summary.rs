@@ -23,7 +23,7 @@ pub fn logging_util_float_to_integer(val: f64) -> u64 {
 /// logging_util_float_to_integer() back to a float
 /// preserving digits in the decimal. Necessary due to
 /// metrics storage only storing ints.
-fn logging_util_integer_to_float(val: u64) -> f64 {
+pub(crate) fn logging_util_integer_to_float(val: u64) -> f64 {
     val as f64 / FLOAT_INT_MULTIPLIER
 }
 
@@ -59,7 +59,7 @@ impl Default for SharedSummary {
     }
 }
 
-mod bucket;
+pub(crate) mod bucket;
 
 // Ensure the maximum bucket fits into the space we've reserved for it.
 const _: () = assert!(u16::MAX as u64 >= BUCKETS as u64);
@@ -96,6 +96,10 @@ impl Summary {
         }
     }
 
+    pub(crate) fn display_unit(&self) -> Unit {
+        self.display_unit
+    }
+
     pub fn record_value(&self, value: u64) {
         let Some(bucket) = CONFIG.value_to_index(value) else {
             return;
@@ -112,92 +116,20 @@ impl Summary {
         self.record_value(duration.as_nanos() as u64);
     }
 
-    pub fn take_current(&self, include_sparse: bool) -> Option<String> {
+    /// Reports the histogram to `backend` via a borrowed [`Histogram`](crate::Histogram) view, then
+    /// drains the buckets. The view borrows the live bucket array and is only valid for the
+    /// duration of the `record_histogram` call (which happens under the aggregate lock).
+    pub(crate) fn report(&self, info: &crate::MetricInfo<'_>, backend: &mut dyn crate::Backend) {
         self.channels.get_mut(self.idx, |hist| {
-            let res = format(&hist.value, self.display_unit, include_sparse)?;
+            let view =
+                crate::backend::Histogram::new(hist.value.as_slice(), &CONFIG, self.display_unit);
+            backend.record_histogram(info, view);
             hist.value.as_mut_slice().fill(0);
-            Some(res)
-        })
+        });
     }
 }
 
-fn format(hist: &[u64; BUCKETS], display_unit: Unit, include_sparse: bool) -> Option<String> {
-    let mut f = String::new();
-    // Shouldn't be capable of overflowing -- u64 counter generally cannot overflow.
-    let total_count = hist.iter().sum::<u64>();
-    if total_count == 0 {
-        if include_sparse {
-            f.push('0');
-        } else {
-            return None;
-        }
-    } else {
-        let quantiles = [
-            0.0f64, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 0.95, 0.99, 0.999, 1.0,
-        ]
-        .map(|q| (q * total_count as f64).ceil() as u64);
-        let mut quantile_idx = 0;
-
-        // Prefix sum up to the current bucket.
-        let mut partial_count = 0;
-        // Prefix sum excluding already reported counts (i.e., those we've written to `f`).
-        let mut since_last_write = 0;
-        let mut first = true;
-        for (idx, bucket) in hist.iter().enumerate() {
-            partial_count += *bucket;
-            since_last_write += *bucket;
-
-            // If this bucket hits the next quantile, we write out the current count.
-            //
-            // Can't panic due to the break below on partial_count == total_count.
-            if partial_count >= quantiles[quantile_idx] {
-                quantile_idx += 1;
-
-                if since_last_write != 0 {
-                    if !first {
-                        f.push('+');
-                    }
-                    first = false;
-
-                    // Use the midpoint of the bucket. We don't know where the actual value was and
-                    // this gives a balance between overestimating and under estimating.
-                    //
-                    // Note that this is skewing our data up -- we're reporting the full count since
-                    // the last reported quantile in *this* bucket.
-                    let new_value = CONFIG
-                        .index_to_lower_bound(idx)
-                        .midpoint(CONFIG.index_to_upper_bound(idx));
-                    let count = since_last_write;
-                    since_last_write = 0;
-
-                    let formatted_value = match display_unit {
-                        Unit::Count | Unit::Byte | Unit::Percent => new_value,
-                        Unit::Microsecond => Duration::from_nanos(new_value).as_micros() as u64,
-                        Unit::Second => Duration::from_nanos(new_value).as_secs(),
-                    };
-
-                    match display_unit {
-                        Unit::Percent => {
-                            let formatted_value = logging_util_integer_to_float(formatted_value);
-                            write!(f, "{formatted_value:.3}*{count}").unwrap();
-                        }
-                        _ => write!(f, "{formatted_value}*{count}").unwrap(),
-                    }
-                }
-            }
-
-            if partial_count == total_count {
-                break;
-            }
-        }
-    }
-
-    write!(f, "{}", display_unit.pmet_str()).unwrap();
-
-    Some(f)
-}
-
-const CONFIG: bucket::Config = bucket::Config::new(7, 64);
+pub(crate) const CONFIG: bucket::Config = bucket::Config::new(7, 64);
 
 impl SummaryInner {
     pub fn new(display_unit: Unit) -> SummaryInner {

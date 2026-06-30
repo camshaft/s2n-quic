@@ -53,19 +53,6 @@ pub struct MetricMetadata {
     pub description: String,
 }
 
-/// A value that displays as empty when zero, suppressing it from metrics output.
-struct NonZeroDisplay(i64);
-
-impl core::fmt::Display for NonZeroDisplay {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        if self.0 != 0 {
-            write!(f, "{}", self.0)
-        } else {
-            Ok(())
-        }
-    }
-}
-
 const DEFAULT_STATSD_UDP_MAX_PAYLOAD: usize = 1200;
 const STATSD_HISTOGRAM_PERCENTILES: [u32; 4] = [50, 90, 95, 99];
 
@@ -2611,10 +2598,12 @@ impl Registry {
         );
         let depth_inner = Arc::new(AtomicI64::new(0));
         let depth_clone = depth_inner.clone();
-        self.inner
-            .register_list_callback(format!("{label}.depth"), None, Unit::Count, move || {
-                NonZeroDisplay(depth_clone.load(Ordering::Relaxed))
-            });
+        self.inner.register_list_callback_zero_suppressed(
+            format!("{label}.depth"),
+            None,
+            Unit::Count,
+            move || depth_clone.load(Ordering::Relaxed),
+        );
         let depth_id = self.register_metric_metadata(
             format!("{label}.depth"),
             None,
@@ -2702,11 +2691,11 @@ impl Registry {
         );
         let depth_inner = Arc::new(AtomicI64::new(0));
         let depth_clone = depth_inner.clone();
-        self.inner.register_list_callback(
+        self.inner.register_list_callback_zero_suppressed(
             format!("{label}.depth"),
             variant_option.clone(),
             Unit::Count,
-            move || NonZeroDisplay(depth_clone.load(Ordering::Relaxed)),
+            move || depth_clone.load(Ordering::Relaxed),
         );
         let depth_id = self.register_metric_metadata(
             format!("{label}.depth"),
@@ -2760,10 +2749,12 @@ impl Registry {
         let metric_id = self.register_metric_metadata(&label, None, MetricKind::Gauge, None, "");
         let inner = Arc::new(AtomicI64::new(0));
         let inner_clone = inner.clone();
-        self.inner
-            .register_list_callback(label, None, Unit::Count, move || {
-                NonZeroDisplay(inner_clone.load(Ordering::Relaxed))
-            });
+        self.inner.register_list_callback_zero_suppressed(
+            label,
+            None,
+            Unit::Count,
+            move || inner_clone.load(Ordering::Relaxed),
+        );
         self.gauge_handle(inner, metric_id)
     }
 
@@ -2784,7 +2775,7 @@ impl Registry {
         let label = label.to_string();
         self.register_metric_metadata(&label, None, MetricKind::Gauge, None, "");
         self.inner
-            .register_list_callback(label, None, Unit::Count, move || NonZeroDisplay(f()));
+            .register_list_callback_zero_suppressed(label, None, Unit::Count, move || f());
     }
 
     pub fn register_nominal_gauge(
@@ -2798,10 +2789,12 @@ impl Registry {
             self.register_metric_metadata(&label, Some(&variant), MetricKind::Gauge, None, "");
         let inner = Arc::new(AtomicI64::new(0));
         let inner_clone = inner.clone();
-        self.inner
-            .register_list_callback(label, Some(variant), Unit::Count, move || {
-                NonZeroDisplay(inner_clone.load(Ordering::Relaxed))
-            });
+        self.inner.register_list_callback_zero_suppressed(
+            label,
+            Some(variant),
+            Unit::Count,
+            move || inner_clone.load(Ordering::Relaxed),
+        );
         self.gauge_handle(inner, metric_id)
     }
 
