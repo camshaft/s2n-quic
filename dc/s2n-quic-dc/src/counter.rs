@@ -3,10 +3,7 @@
 
 use crate::tracing::*;
 use core::time::Duration;
-use s2n_quic_dc_metrics::format::{
-    histogram_count_min_max, histogram_value_at_percentile, parse_histogram_buckets,
-    parse_histogram_suffix, ParsedMetricsLine,
-};
+use s2n_quic_dc_metrics::backend::{QuerylogBackend, ReportOptions, StatsdBackend, StatsdSink};
 use std::{
     collections::HashMap,
     net::SocketAddr,
@@ -52,9 +49,6 @@ pub struct MetricMetadata {
     pub unit: Option<&'static str>,
     pub description: String,
 }
-
-const DEFAULT_STATSD_UDP_MAX_PAYLOAD: usize = 1200;
-const STATSD_HISTOGRAM_PERCENTILES: [u32; 4] = [50, 90, 95, 99];
 
 /// Emits a compact metric trace event.
 ///
@@ -166,7 +160,7 @@ impl StatsdUdpConfig {
         Self {
             addr,
             tx,
-            max_payload_size: DEFAULT_STATSD_UDP_MAX_PAYLOAD,
+            max_payload_size: s2n_quic_dc_metrics::backend::DEFAULT_MAX_PAYLOAD_SIZE,
         }
     }
 
@@ -186,6 +180,31 @@ impl StatsdUdpConfig {
         tokio::spawn(statsd_udp_sender(socket, rx, rate));
 
         config
+    }
+}
+
+/// `StatsdUdpConfig` is the dc-side transport for the metrics crate's
+/// [`StatsdBackend`](s2n_quic_dc_metrics::backend::StatsdBackend): it owns the bounded channel to a
+/// `Rate`-paced UDP sender task and forwards finished payload batches non-blockingly (dropping a
+/// batch if the queue is full, as before).
+impl StatsdSink for StatsdUdpConfig {
+    fn send_batch(&mut self, payloads: Vec<Vec<u8>>) {
+        if payloads.is_empty() {
+            return;
+        }
+        let batch = StatsdUdpPayloadBatch {
+            addr: self.addr,
+            payloads,
+        };
+        match self.tx.try_send(batch) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                warn!(addr = %self.addr, "statsd payload queue full; dropping batch");
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                warn!(addr = %self.addr, "statsd payload queue disconnected; dropping batch");
+            }
+        }
     }
 }
 
@@ -225,327 +244,146 @@ pub struct StatsdUdpPayloadBatch {
     pub payloads: Vec<Vec<u8>>,
 }
 
-#[derive(Debug, PartialEq, Eq)]
-struct RawMetricSample<'a> {
-    key: &'a str,
-    value: &'a str,
+/// A [`Backend`](s2n_quic_dc_metrics::Backend) that emits the querylog line to tracing as
+/// `[METRICS]` (or `[METRICS:{prefix}]`).
+///
+/// Wraps a reusable [`QuerylogBackend`]; the assembled line is emitted in `report_end`.
+struct TracingBackend {
+    inner: QuerylogBackend,
+    prefix: Option<String>,
 }
 
-#[derive(Debug, PartialEq, Eq)]
-struct ReportingPayload<'a> {
-    raw_line: &'a str,
-    parsed: ParsedMetricsLine<'a>,
-    raw_samples: Vec<RawMetricSample<'a>>,
-}
-
-impl<'a> ReportingPayload<'a> {
-    fn from_line(line: &'a str) -> Self {
+impl TracingBackend {
+    fn new(prefix: Option<String>) -> Self {
         Self {
-            raw_line: line,
-            parsed: ParsedMetricsLine::parse(line),
-            raw_samples: parse_raw_metric_samples(line),
+            inner: QuerylogBackend::new(),
+            prefix,
         }
     }
 }
 
-trait ReporterOutputSink: Send {
-    fn emit(&mut self, payload: &ReportingPayload<'_>, prefix: Option<&str>) -> Result<(), String>;
-}
-
-struct TracingSink;
-
-impl ReporterOutputSink for TracingSink {
-    fn emit(&mut self, payload: &ReportingPayload<'_>, prefix: Option<&str>) -> Result<(), String> {
-        let raw = payload.raw_line;
+impl s2n_quic_dc_metrics::Backend for TracingBackend {
+    fn report_start(&mut self, options: &ReportOptions) {
+        self.inner.report_start(options);
+    }
+    fn record_counter(&mut self, info: &s2n_quic_dc_metrics::MetricInfo<'_>, value: u64) {
+        self.inner.record_counter(info, value);
+    }
+    fn record_gauge(&mut self, info: &s2n_quic_dc_metrics::MetricInfo<'_>, value: i64) {
+        self.inner.record_gauge(info, value);
+    }
+    fn record_bool(
+        &mut self,
+        info: &s2n_quic_dc_metrics::MetricInfo<'_>,
+        true_count: u64,
+        false_count: u64,
+    ) {
+        self.inner.record_bool(info, true_count, false_count);
+    }
+    fn record_histogram(
+        &mut self,
+        info: &s2n_quic_dc_metrics::MetricInfo<'_>,
+        hist: s2n_quic_dc_metrics::Histogram<'_>,
+    ) {
+        self.inner.record_histogram(info, hist);
+    }
+    fn record_callback(
+        &mut self,
+        info: &s2n_quic_dc_metrics::MetricInfo<'_>,
+        values: &[&dyn s2n_quic_dc_metrics::CallbackValue],
+    ) {
+        self.inner.record_callback(info, values);
+    }
+    fn report_end(&mut self) {
+        let raw = self.inner.line();
         // bypass crate::tracing suppression - metrics must always be emitted
-        if let Some(prefix) = prefix.filter(|p| !p.is_empty()) {
-            ::tracing::info!("[METRICS:{prefix}] {raw}");
-        } else {
-            ::tracing::info!("[METRICS] {raw}");
+        match self.prefix.as_deref().filter(|p| !p.is_empty()) {
+            Some(prefix) => ::tracing::info!("[METRICS:{prefix}] {raw}"),
+            None => ::tracing::info!("[METRICS] {raw}"),
         }
-        Ok(())
     }
 }
 
-struct StatsdUdpSink {
-    config: StatsdUdpConfig,
-}
-
-impl StatsdUdpSink {
-    fn new(config: StatsdUdpConfig) -> Self {
-        Self { config }
-    }
-}
-
-impl ReporterOutputSink for StatsdUdpSink {
-    fn emit(&mut self, payload: &ReportingPayload<'_>, prefix: Option<&str>) -> Result<(), String> {
-        let lines = encode_statsd_lines(&payload.raw_samples, prefix);
-        if lines.is_empty() {
-            return Ok(());
-        }
-
-        let (payloads, dropped) = chunk_statsd_lines(&lines, self.config.max_payload_size);
-        if dropped > 0 {
-            warn!(
-                dropped,
-                max_payload_size = self.config.max_payload_size,
-                "dropped oversized statsd metrics"
-            );
-        }
-
-        let batch = StatsdUdpPayloadBatch {
-            addr: self.config.addr,
-            payloads,
-        };
-        match self.config.tx.try_send(batch) {
-            Ok(()) => {}
-            Err(mpsc::error::TrySendError::Full(_)) => {
-                warn!(addr = %self.config.addr, "statsd payload queue full; dropping batch");
-            }
-            Err(mpsc::error::TrySendError::Closed(_)) => {
-                return Err("statsd payload queue disconnected".into());
-            }
-        }
-
-        Ok(())
-    }
-}
-
-/// Parses a raw metrics line into machine-exportable samples.
+/// The set of backends a reporter drives, held across report intervals so each retains its buffers.
 ///
-/// The expected input format is a comma-separated list of `key=value` pairs as emitted by the
-/// metrics registry. Malformed segments (missing `=`) are ignored.
-fn parse_raw_metric_samples(line: &str) -> Vec<RawMetricSample<'_>> {
-    line.split(',')
-        .filter_map(|part| {
-            let (key, value) = part.split_once('=')?;
-            Some(RawMetricSample {
-                key: key.trim(),
-                value: value.trim(),
-            })
-        })
-        .collect()
+/// Implements [`Backend`](s2n_quic_dc_metrics::Backend) by fanning every record call out to each
+/// active backend, so a single destructive `Registry::report` feeds all of them.
+struct ReporterBackends {
+    tracing: Option<TracingBackend>,
+    statsd: Option<StatsdBackend<StatsdUdpConfig>>,
 }
 
-/// Sanitizes metric names for StatsD formatting.
-///
-/// Allowed characters (`[a-zA-Z0-9_.-]`) are preserved, `:` is normalized to `.`, and all other
-/// characters are replaced with `_`.
-fn sanitize_metric_name(input: &str) -> String {
-    let mut output = String::with_capacity(input.len());
-    for c in input.chars() {
-        let normalized = match c {
-            'a'..='z' | 'A'..='Z' | '0'..='9' | '_' | '.' | '-' => c,
-            ':' => '.',
-            _ => '_',
-        };
-        output.push(normalized);
-    }
-    output
-}
-
-fn with_metric_prefix(name: &str, prefix: Option<&str>) -> String {
-    if let Some(prefix) = prefix.filter(|p| !p.is_empty()) {
-        let prefix = sanitize_metric_name(prefix);
-        if prefix.is_empty() {
-            sanitize_metric_name(name)
-        } else {
-            format!("{prefix}.{}", sanitize_metric_name(name))
-        }
-    } else {
-        sanitize_metric_name(name)
-    }
-}
-
-/// Parses a scalar metric value and returns `(numeric_value, optional_suffix)` when valid.
-///
-/// Examples:
-/// - `"123"` -> `Some(("123", None))`
-/// - `"123 ect0"` -> `Some(("123", Some("ect0")))`
-/// - `"abc"` -> `None`
-fn parse_scalar_value(value: &str) -> Option<(&str, Option<&str>)> {
-    let value = value.trim();
-    if value.is_empty() {
-        return None;
-    }
-
-    if let Some((number, suffix)) = value.split_once(' ') {
-        if number.parse::<f64>().is_ok() {
-            Some((number, Some(suffix.trim()).filter(|v| !v.is_empty())))
-        } else {
-            None
-        }
-    } else if value.parse::<f64>().is_ok() {
-        Some((value, None))
-    } else {
-        None
-    }
-}
-
-fn convert_to_nanos(value: u64, unit: &str) -> Option<u64> {
-    match unit {
-        "us" => Some(value * 1_000),
-        "ms" => Some(value * 1_000_000),
-        "s" => Some(value * 1_000_000_000),
-        _ => None,
-    }
-}
-
-/// Encodes raw metric samples into StatsD lines.
-///
-/// Scalars are emitted as counters (`|c`) except `.depth` metrics, which are emitted as gauges
-/// (`|g`) plus timer-formatted distribution samples (`|ms`) for percentile/burst analysis.
-/// Histogram-like values (`value` containing `*`) are emitted as `.count` plus percentile
-/// (`.p50`, `.p90`, `.p95`, `.p99`, `.max`) metrics; time units (`us`, `ms`, `s`) are normalized
-/// to StatsD timer units (`|ms`), while non-time units are emitted as gauges.
-fn encode_statsd_lines(samples: &[RawMetricSample<'_>], prefix: Option<&str>) -> Vec<String> {
-    let mut lines = Vec::new();
-
-    for sample in samples {
-        if sample.value.contains('*') {
-            let (data, unit, variant) = parse_histogram_suffix(sample.value);
-            let buckets = parse_histogram_buckets(data);
-            if buckets.is_empty() {
-                continue;
-            }
-
-            let metric = with_metric_prefix(sample.key, prefix);
-            let tag = if !variant.is_empty() {
-                format!("|#variant:{}", sanitize_metric_name(variant))
-            } else {
-                String::new()
-            };
-
-            let (count, min, max) = histogram_count_min_max(&buckets);
-            lines.push(format!("{metric}.count:{count}|c{tag}"));
-
-            if let Some(min) = convert_to_nanos(min, unit) {
-                lines.push(format!("{metric}.min:{min}|g{tag}"));
-            } else {
-                lines.push(format!("{metric}.min:{min}|g{tag}"));
-            }
-
-            for percentile in STATSD_HISTOGRAM_PERCENTILES {
-                let value = histogram_value_at_percentile(&buckets, percentile);
-                if let Some(value) = convert_to_nanos(value, unit) {
-                    lines.push(format!("{metric}.p{percentile}:{value}|g{tag}"));
-                } else {
-                    lines.push(format!("{metric}.p{percentile}:{value}|g{tag}"));
+impl ReporterBackends {
+    fn build(config: &[ReporterSink], prefix: Option<&str>) -> Self {
+        let mut tracing = None;
+        let mut statsd = None;
+        for sink in config {
+            match sink {
+                ReporterSink::Tracing => {
+                    tracing = Some(TracingBackend::new(prefix.map(str::to_string)))
+                }
+                ReporterSink::StatsdUdp(cfg) => {
+                    statsd = Some(
+                        StatsdBackend::new(cfg.clone(), prefix.map(str::to_string))
+                            .with_max_payload_size(cfg.max_payload_size),
+                    )
                 }
             }
-
-            if let Some(max) = convert_to_nanos(max, unit) {
-                lines.push(format!("{metric}.max:{max}|g{tag}"));
-            } else {
-                lines.push(format!("{metric}.max:{max}|g{tag}"));
-            }
-
-            continue;
         }
-
-        let Some((number, suffix)) = parse_scalar_value(sample.value) else {
-            continue;
-        };
-
-        let metric = with_metric_prefix(sample.key, prefix);
-        let tag = match suffix.filter(|s| *s != "B") {
-            Some(suffix) => format!("|#variant:{}", sanitize_metric_name(suffix)),
-            None => String::new(),
-        };
-
-        if sample.key.ends_with(".depth") {
-            lines.push(format!("{metric}:{number}|g{tag}"));
-            lines.push(format!("{metric}.distribution:{number}|d{tag}"));
-        } else {
-            lines.push(format!("{metric}:{number}|c{tag}"));
-        }
+        Self { tracing, statsd }
     }
-
-    lines
 }
 
-/// Batches StatsD lines into newline-delimited UDP payloads up to `max_payload_size`.
-///
-/// Returns `(payloads, dropped_oversized_lines)`. When `max_payload_size == 0`, no payloads are
-/// emitted and all lines are counted as dropped.
-fn chunk_statsd_lines(lines: &[String], max_payload_size: usize) -> (Vec<Vec<u8>>, usize) {
-    // Zero is an invalid payload size and cannot hold even a single byte, so all lines are
-    // reported as dropped in this case.
-    if max_payload_size == 0 {
-        return (Vec::new(), lines.len());
+impl s2n_quic_dc_metrics::Backend for ReporterBackends {
+    fn report_start(&mut self, options: &ReportOptions) {
+        self.tracing.report_start(options);
+        self.statsd.report_start(options);
     }
-
-    let mut payloads = Vec::new();
-    let mut current = Vec::new();
-    let mut dropped = 0;
-
-    for line in lines {
-        let bytes = line.as_bytes();
-        if bytes.len() > max_payload_size {
-            dropped += 1;
-            continue;
-        }
-
-        let required = if current.is_empty() {
-            bytes.len()
-        } else {
-            current.len() + 1 + bytes.len()
-        };
-
-        if required > max_payload_size && !current.is_empty() {
-            payloads.push(std::mem::take(&mut current));
-        }
-
-        if !current.is_empty() {
-            current.push(b'\n');
-        }
-        current.extend_from_slice(bytes);
+    fn record_counter(&mut self, info: &s2n_quic_dc_metrics::MetricInfo<'_>, value: u64) {
+        self.tracing.record_counter(info, value);
+        self.statsd.record_counter(info, value);
     }
-
-    if !current.is_empty() {
-        payloads.push(current);
+    fn record_gauge(&mut self, info: &s2n_quic_dc_metrics::MetricInfo<'_>, value: i64) {
+        self.tracing.record_gauge(info, value);
+        self.statsd.record_gauge(info, value);
     }
-
-    (payloads, dropped)
-}
-
-fn build_sinks(config: &[ReporterSink]) -> Vec<Box<dyn ReporterOutputSink>> {
-    let mut sinks: Vec<Box<dyn ReporterOutputSink>> = Vec::with_capacity(config.len());
-
-    for sink in config {
-        match sink {
-            ReporterSink::Tracing => sinks.push(Box::new(TracingSink)),
-            ReporterSink::StatsdUdp(config) => {
-                sinks.push(Box::new(StatsdUdpSink::new(config.clone())))
-            }
-        }
+    fn record_bool(
+        &mut self,
+        info: &s2n_quic_dc_metrics::MetricInfo<'_>,
+        true_count: u64,
+        false_count: u64,
+    ) {
+        self.tracing.record_bool(info, true_count, false_count);
+        self.statsd.record_bool(info, true_count, false_count);
     }
-
-    sinks
-}
-
-fn dispatch_payload_to_sinks(
-    sinks: &mut [Box<dyn ReporterOutputSink>],
-    payload: &ReportingPayload<'_>,
-    prefix: Option<&str>,
-) {
-    for sink in sinks {
-        if let Err(error) = sink.emit(payload, prefix) {
-            warn!(?error, "failed to emit metrics to sink");
-        }
+    fn record_histogram(
+        &mut self,
+        info: &s2n_quic_dc_metrics::MetricInfo<'_>,
+        hist: s2n_quic_dc_metrics::Histogram<'_>,
+    ) {
+        self.tracing.record_histogram(info, hist);
+        self.statsd.record_histogram(info, hist);
+    }
+    fn record_callback(
+        &mut self,
+        info: &s2n_quic_dc_metrics::MetricInfo<'_>,
+        values: &[&dyn s2n_quic_dc_metrics::CallbackValue],
+    ) {
+        self.tracing.record_callback(info, values);
+        self.statsd.record_callback(info, values);
+    }
+    fn report_end(&mut self) {
+        self.tracing.report_end();
+        self.statsd.report_end();
     }
 }
 
 fn report_once(
     inner: &s2n_quic_dc_metrics::Registry,
     include_sparse: bool,
-    prefix: Option<&str>,
-    sinks: &mut [Box<dyn ReporterOutputSink>],
+    backends: &mut ReporterBackends,
 ) {
-    if let Some(line) = inner.try_take_current_metrics_line_sparse(include_sparse) {
-        let payload = ReportingPayload::from_line(&line);
-        dispatch_payload_to_sinks(sinks, &payload, prefix);
-    }
+    inner.report_with(&ReportOptions::new(include_sparse), backends);
 }
 
 // ── Counter ─────────────────────────────────────────────────────────────────
@@ -2972,13 +2810,15 @@ impl Registry {
     pub fn spawn_reporter_with_config(&self, config: ReporterConfig) {
         let inner = self.inner.clone();
         let interval = config.interval;
-        let prefix = config.prefix.clone();
         let sparse_mode = config.sparse_mode.clone();
-        let mut sinks = build_sinks(&config.sinks);
+        // Built once and held across intervals so each backend retains its buffers (the
+        // QuerylogBackend line buffer, the StatsdBackend line vec), reaching a no-realloc steady
+        // state.
+        let mut backends = ReporterBackends::build(&config.sinks, config.prefix.as_deref());
 
         #[cfg(any(test, feature = "testing"))]
         if bach::is_active() {
-            bach::spawn(report_loop(inner, sparse_mode, prefix, sinks, move || {
+            bach::spawn(report_loop(inner, sparse_mode, backends, move || {
                 bach::time::sleep(interval)
             }));
             return;
@@ -3009,7 +2849,7 @@ impl Registry {
                         SparseMode::Once => tick == 0,
                         SparseMode::Every(n) => tick.is_multiple_of(*n),
                     };
-                    report_once(&inner, include_sparse, prefix.as_deref(), &mut sinks);
+                    report_once(&inner, include_sparse, &mut backends);
                     tick += 1;
                 }
             })
@@ -3023,8 +2863,7 @@ impl Registry {
 async fn report_loop<F, Fut>(
     inner: s2n_quic_dc_metrics::Registry,
     sparse_mode: SparseMode,
-    prefix: Option<String>,
-    mut sinks: Vec<Box<dyn ReporterOutputSink>>,
+    mut backends: ReporterBackends,
     sleep: F,
 ) where
     F: Fn() -> Fut,
@@ -3042,7 +2881,7 @@ async fn report_loop<F, Fut>(
             SparseMode::Once => tick == 0,
             SparseMode::Every(n) => tick.is_multiple_of(*n),
         };
-        report_once(&inner, include_sparse, prefix.as_deref(), &mut sinks);
+        report_once(&inner, include_sparse, &mut backends);
         tick += 1;
     }
 }
@@ -3185,206 +3024,74 @@ where
 mod tests {
     use super::*;
 
-    struct MockSink {
-        id: &'static str,
-        fail: bool,
-        calls: std::sync::Arc<Mutex<Vec<String>>>,
-    }
-
-    impl ReporterOutputSink for MockSink {
-        fn emit(
-            &mut self,
-            payload: &ReportingPayload<'_>,
-            _prefix: Option<&str>,
-        ) -> Result<(), String> {
-            self.calls.lock().unwrap().push(format!(
-                "{}:{}:{}",
-                self.id,
-                payload.raw_samples.len(),
-                payload.parsed.format_pretty()
-            ));
-            if self.fail {
-                return Err(format!("sink {} failed", self.id));
-            }
-            Ok(())
-        }
+    /// Builds a `ReporterBackends` with both a tracing backend and a statsd backend wired to a
+    /// freshly-created `StatsdUdpConfig`, returning the receiver so tests can inspect batches.
+    fn backends_with_statsd(
+        prefix: Option<&str>,
+        queue_depth: usize,
+    ) -> (ReporterBackends, mpsc::Receiver<StatsdUdpPayloadBatch>) {
+        let (tx, rx) = mpsc::channel(queue_depth);
+        let cfg = StatsdUdpConfig::new("127.0.0.1:8125".parse().unwrap(), tx);
+        let backends =
+            ReporterBackends::build(&[ReporterSink::StatsdUdp(cfg)], prefix);
+        (backends, rx)
     }
 
     #[test]
-    fn report_once_fans_out_single_destructive_take() {
+    fn report_once_drains_destructively_into_statsd() {
         let registry = s2n_quic_dc_metrics::Registry::new();
         let counter = registry.register_counter("rx.data".into(), None);
         counter.increment(7);
 
-        let seen = std::sync::Arc::new(Mutex::new(Vec::new()));
-        let mut sinks: Vec<Box<dyn ReporterOutputSink>> = vec![
-            Box::new(MockSink {
-                id: "a",
-                fail: false,
-                calls: seen.clone(),
-            }),
-            Box::new(MockSink {
-                id: "b",
-                fail: false,
-                calls: seen.clone(),
-            }),
-        ];
+        let (mut backends, mut rx) = backends_with_statsd(Some("svc"), 4);
 
-        report_once(&registry, false, None, &mut sinks);
-        let entries = seen.lock().unwrap().clone();
-        assert_eq!(entries.len(), 2);
-        assert!(entries[0].contains("rx.data=7"));
-        assert!(entries[1].contains("rx.data=7"));
+        report_once(&registry, false, &mut backends);
+        let batch = rx.try_recv().expect("a batch was sent");
+        let body = batch
+            .payloads
+            .iter()
+            .map(|p| String::from_utf8(p.clone()).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(body.contains("svc.rx.data:7|c"), "got: {body}");
 
-        seen.lock().unwrap().clear();
-        report_once(&registry, false, None, &mut sinks);
-        let entries = seen.lock().unwrap().clone();
-        assert_eq!(entries.len(), 2);
-        assert!(entries[0].ends_with(":"));
-        assert!(entries[1].ends_with(":"));
+        // The take is destructive: the counter drained, so a second non-sparse report omits the
+        // zeroed counter, leaving nothing to send.
+        report_once(&registry, false, &mut backends);
+        assert!(rx.try_recv().is_err(), "no batch expected after drain");
     }
 
     #[test]
-    fn dispatch_continues_after_sink_error_in_order() {
-        let payload = ReportingPayload::from_line("rx.data=1");
-        let seen = std::sync::Arc::new(Mutex::new(Vec::new()));
-        let mut sinks: Vec<Box<dyn ReporterOutputSink>> = vec![
-            Box::new(MockSink {
-                id: "first",
-                fail: true,
-                calls: seen.clone(),
-            }),
-            Box::new(MockSink {
-                id: "second",
-                fail: false,
-                calls: seen.clone(),
-            }),
-        ];
+    fn statsd_backend_drops_batch_when_queue_full() {
+        let registry = s2n_quic_dc_metrics::Registry::new();
+        registry.register_counter("rx.data".into(), None).increment(1);
 
-        dispatch_payload_to_sinks(&mut sinks, &payload, None);
-        assert_eq!(
-            seen.lock().unwrap().as_slice(),
-            &[
-                "first:1:rx.data=1".to_string(),
-                "second:1:rx.data=1".to_string()
-            ]
-        );
-    }
+        // queue depth 1: the first report fills it, the second is dropped.
+        let (mut backends, mut rx) = backends_with_statsd(None, 1);
 
-    #[test]
-    fn statsd_encoding_covers_counter_gauge_nominal_and_histogram_decisions() {
-        let line = "rx.data=255470,q.packet.depth=875,rx.ecn=500 ect0,task.time=5*2+10*1 us packet_dispatch.0";
-        let payload = ReportingPayload::from_line(line);
-        let lines = encode_statsd_lines(&payload.raw_samples, Some("svc"));
+        report_once(&registry, true, &mut backends);
+        registry.register_counter("rx.data".into(), None).increment(1);
+        report_once(&registry, true, &mut backends);
 
-        assert!(lines.contains(&"svc.rx.data:255470|c".to_string()));
-        assert!(lines.contains(&"svc.q.packet.depth:875|g".to_string()));
-        assert!(lines.contains(&"svc.q.packet.depth.distribution:875|d".to_string()));
-        assert!(lines.contains(&"svc.rx.ecn:500|c|#variant:ect0".to_string()));
-        assert!(lines.contains(&"svc.task.time.count:3|c|#variant:packet_dispatch.0".to_string()));
-        assert!(lines.contains(&"svc.task.time.min:5000|g|#variant:packet_dispatch.0".to_string()));
-        assert!(lines.contains(&"svc.task.time.p50:5000|g|#variant:packet_dispatch.0".to_string()));
-        assert!(lines.contains(&"svc.task.time.p90:10000|g|#variant:packet_dispatch.0".to_string()));
-        assert!(lines.contains(&"svc.task.time.p95:10000|g|#variant:packet_dispatch.0".to_string()));
-        assert!(lines.contains(&"svc.task.time.p99:10000|g|#variant:packet_dispatch.0".to_string()));
-        assert!(lines.contains(&"svc.task.time.max:10000|g|#variant:packet_dispatch.0".to_string()));
-    }
-
-    #[test]
-    fn statsd_encoding_byte_unit_not_appended_to_name() {
-        let payload =
-            ReportingPayload::from_line("socket.rx.bytes=273390965 B,socket.tx.bytes=272721617 B");
-        let lines = encode_statsd_lines(&payload.raw_samples, Some("svc"));
-
-        assert!(lines.contains(&"svc.socket.rx.bytes:273390965|c".to_string()));
-        assert!(lines.contains(&"svc.socket.tx.bytes:272721617|c".to_string()));
-    }
-
-    #[test]
-    fn statsd_sink_submits_payloads_as_single_batch() {
-        let (tx, mut rx) = mpsc::channel(1);
-        let config = StatsdUdpConfig::new("127.0.0.1:8125".parse().unwrap(), tx);
-        let mut sink = StatsdUdpSink::new(config);
-        let payload = ReportingPayload::from_line(
-            "rx.data=1,q.packet.depth=2,task.time=5*2+10*1 us dispatch",
-        );
-
-        sink.emit(&payload, Some("svc")).unwrap();
-        let batch = rx.try_recv().unwrap();
-        assert_eq!(batch.addr, "127.0.0.1:8125".parse().unwrap());
-        assert!(!batch.payloads.is_empty());
-    }
-
-    #[test]
-    fn statsd_sink_drops_batch_when_queue_full() {
-        let (tx, mut rx) = mpsc::channel(1);
-        let config = StatsdUdpConfig::new("127.0.0.1:8125".parse().unwrap(), tx);
-        let mut sink = StatsdUdpSink::new(config);
-        let payload = ReportingPayload::from_line("rx.data=1");
-
-        sink.emit(&payload, None).unwrap();
-        sink.emit(&payload, None).unwrap();
-
-        // only the first batch is retained in the bounded queue
         assert!(rx.try_recv().is_ok());
         assert!(rx.try_recv().is_err());
     }
 
     #[test]
-    fn statsd_chunking_honors_boundaries_and_drops_oversized_lines() {
-        let lines = vec![
-            "a:1|c".to_string(),
-            "b:22|c".to_string(),
-            "this.metric.is.way.too.long:1|c".to_string(),
-            "c:3|c".to_string(),
-        ];
-        let (payloads, dropped) = chunk_statsd_lines(&lines, 12);
-
-        assert_eq!(dropped, 1);
-        assert_eq!(payloads.len(), 2);
-        assert_eq!(payloads[0], b"a:1|c\nb:22|c".to_vec());
-        assert_eq!(payloads[1], b"c:3|c".to_vec());
-    }
-
-    #[test]
-    fn chunking_drops_all_when_payload_size_is_zero() {
-        let lines = vec!["a:1|c".to_string(), "b:1|c".to_string()];
-        let (payloads, dropped) = chunk_statsd_lines(&lines, 0);
-        assert!(payloads.is_empty());
-        assert_eq!(dropped, 2);
-    }
-
-    #[test]
-    fn single_metric_take_fans_out_to_multiple_sinks() {
+    fn tracing_and_statsd_fan_out_from_one_report() {
         let registry = s2n_quic_dc_metrics::Registry::new();
-        let counter = registry.register_counter("rx.data".into(), None);
-        counter.increment(1);
+        registry.register_counter("rx.data".into(), None).increment(3);
 
-        let seen = std::sync::Arc::new(Mutex::new(Vec::new()));
-        let mut sinks: Vec<Box<dyn ReporterOutputSink>> = vec![
-            Box::new(MockSink {
-                id: "1",
-                fail: false,
-                calls: seen.clone(),
-            }),
-            Box::new(MockSink {
-                id: "2",
-                fail: false,
-                calls: seen.clone(),
-            }),
-            Box::new(MockSink {
-                id: "3",
-                fail: false,
-                calls: seen.clone(),
-            }),
-        ];
+        let (tx, mut rx) = mpsc::channel(4);
+        let cfg = StatsdUdpConfig::new("127.0.0.1:8125".parse().unwrap(), tx);
+        let mut backends = ReporterBackends::build(
+            &[ReporterSink::Tracing, ReporterSink::StatsdUdp(cfg)],
+            Some("svc"),
+        );
 
-        if let Some(line) = registry.try_take_current_metrics_line_sparse(false) {
-            let payload = ReportingPayload::from_line(&line);
-            dispatch_payload_to_sinks(&mut sinks, &payload, None);
-        }
-
-        assert_eq!(seen.lock().unwrap().len(), 3);
+        // One destructive report feeds both backends; statsd receives a batch (tracing emits a log).
+        report_once(&registry, false, &mut backends);
+        assert!(rx.try_recv().is_ok());
     }
 
     #[test]
