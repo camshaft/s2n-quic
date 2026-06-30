@@ -1338,7 +1338,7 @@ impl std::io::Write for ByteVec {
     }
 }
 
-#[cfg(any(test, feature = "testing"))]
+#[cfg(any(test, feature = "testing", feature = "bolero-generator"))]
 impl bolero_generator::TypeGenerator for ByteVec {
     #[inline]
     fn generate<D>(driver: &mut D) -> std::option::Option<Self>

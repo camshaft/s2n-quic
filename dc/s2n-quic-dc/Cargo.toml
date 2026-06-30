@@ -12,7 +12,17 @@ exclude = ["corpus.tar.gz"]
 
 [features]
 default = ["tokio"]
-testing = ["dep:bach", "backbeat/bach", "bolero-generator", "s2n-quic-core/testing", "s2n-quic-platform/testing", "s2n-quic/unstable-provider-io-testing", "tracing-subscriber", "tracing"]
+testing = [
+    "dep:bach",
+    "backbeat/bach",
+    "bolero-generator",
+    "s2n-quic-core/testing",
+    "s2n-quic-platform/testing",
+    "s2n-quic/unstable-provider-io-testing",
+    "tracing-subscriber",
+    "tracing",
+]
+bolero-generator = ["dep:bolero-generator"]
 tracing = []
 tokio = ["tokio/io-util", "tokio/net", "tokio/rt-multi-thread", "tokio/time"]
 metric-tracing = []
