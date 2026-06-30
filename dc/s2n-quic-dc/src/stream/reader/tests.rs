@@ -39,7 +39,7 @@ use s2n_quic_core::{
     stream::testing::Data,
     varint::VarInt,
 };
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::{net::SocketAddr, sync::Arc, task::Poll, time::Duration};
 
 // ─── Test helpers ─────────────────────────────────────────────────────────────
 
@@ -2111,6 +2111,311 @@ fn maybe_send_max_data_re_polls_without_double_parking() {
                 .await
                 .expect("second read failed");
             assert_eq!(n2, payload_second_len);
+        }
+        .primary()
+        .spawn();
+    });
+}
+
+// ─── peer_liveness tests ───────────────────────────────────────────────────────
+
+/// While the peer's writer is still open (no terminal frame in the queue and no
+/// completion failure), `poll_peer_liveness` must return `Pending` and register
+/// the task's waker so it is re-polled when something changes.
+#[test]
+fn peer_liveness_pending_while_peer_alive() {
+    sim(|| {
+        async move {
+            let (mut reader, mut pusher) = make_pair();
+
+            // No signal yet: peer is still alive.
+            let pending = core::future::poll_fn(|cx| {
+                Poll::Ready(reader.poll_peer_liveness(cx).is_pending())
+            })
+            .await;
+            assert!(pending, "expected Pending while peer alive");
+
+            // Non-terminal data frames don't resolve liveness.
+            pusher.push_data(0, b"hello", false);
+            // Give the data a chance to land on the queue.
+            bach::task::yield_now().await;
+
+            let still_pending = core::future::poll_fn(|cx| {
+                Poll::Ready(reader.poll_peer_liveness(cx).is_pending())
+            })
+            .await;
+            assert!(
+                still_pending,
+                "data frame without FIN must not resolve liveness"
+            );
+        }
+        .primary()
+        .spawn();
+    });
+}
+
+/// A `Reset` message in the stream queue resolves `peer_liveness` with a
+/// `ConnectionReset` error.  Data frames that arrived in the same queue batch
+/// before the reset are preserved in `pending_rx`; when the application then
+/// calls `read_into`, the interposer delivers those bytes to the application
+/// buffer before the error is surfaced — mirroring the same-batch TCP semantics
+/// already tested in `reset_after_partial_data`.
+#[test]
+fn peer_liveness_resolves_on_reset() {
+    sim(|| {
+        let (mut reader, mut pusher) = make_pair();
+
+        async move {
+            pusher.push_data(0, b"prefix", false);
+            pusher.push_reset(VarInt::from_u8(42));
+        }
+        .primary()
+        .spawn();
+
+        async move {
+            // Wait until the queue batch has been enqueued.
+            bach::task::yield_now().await;
+
+            let err = reader
+                .peer_liveness()
+                .await
+                .expect_err("expected ConnectionReset from peer_liveness");
+            assert_eq!(err.kind(), std::io::ErrorKind::ConnectionReset);
+
+            // peer_liveness stashes [Data, Reset] in pending_rx.  When the read
+            // path processes them in the same poll, the interposer writes "prefix"
+            // to the buffer before the Reset triggers an early return with Err.
+            // This mirrors `reset_after_partial_data`: data IS in buf even though
+            // read_into returns Err.
+            let mut buf = BytesMut::with_capacity(32);
+            let read_err = reader
+                .read_into(&mut buf)
+                .await
+                .expect_err("expected ConnectionReset from read path after peer_liveness");
+            assert_eq!(read_err.kind(), std::io::ErrorKind::ConnectionReset);
+            assert_eq!(&buf[..], b"prefix");
+        }
+        .primary()
+        .spawn();
+    });
+}
+
+/// A FIN-carrying data frame resolves `peer_liveness` with `Ok(())`.  Any
+/// preceding data bytes are preserved in `pending_rx` so the application can
+/// drain them through `read_into` and then receive the clean EOF.
+#[test]
+fn peer_liveness_resolves_on_fin() {
+    sim(|| {
+        let (mut reader, mut pusher) = make_pair();
+
+        async move {
+            pusher.push_data(0, b"hello", true /* fin */);
+        }
+        .primary()
+        .spawn();
+
+        async move {
+            bach::task::yield_now().await;
+
+            reader
+                .peer_liveness()
+                .await
+                .expect("expected Ok(()) on clean FIN");
+
+            // Data before the FIN must still be readable.
+            let mut buf = BytesMut::with_capacity(32);
+            let outcome = reader.read_to_end(&mut buf).await.expect("read failed");
+            assert_eq!(outcome, ReadToEnd::Complete(5));
+            assert_eq!(&buf[..], b"hello");
+        }
+        .primary()
+        .spawn();
+    });
+}
+
+/// `peer_liveness` reports `Ok(())` immediately when the reassembler already
+/// shows `is_writing_complete` — the FIN was processed by a prior read without
+/// the application having consumed everything yet.
+#[test]
+fn peer_liveness_resolves_immediately_when_fin_already_in_reassembler() {
+    sim(|| {
+        let (mut reader, mut pusher) = make_pair();
+
+        async move {
+            pusher.push_data(0, b"abc", true);
+        }
+        .primary()
+        .spawn();
+
+        async move {
+            // First, do a partial read so the FIN data is written into the reassembler.
+            let mut buf = BytesMut::with_capacity(1);
+            let n = reader.read_into(&mut buf).await.expect("read failed");
+            assert!(n > 0);
+            // The reassembler should now know the final size (FIN written).
+            assert!(
+                reader.0.reassembler.is_writing_complete(),
+                "FIN should be in the reassembler after the first read"
+            );
+
+            // peer_liveness must resolve immediately without re-polling the channel.
+            let result = core::future::poll_fn(|cx| reader.poll_peer_liveness(cx)).await;
+            assert!(
+                result.is_ok(),
+                "expected Ok(()) from peer_liveness when FIN already written"
+            );
+        }
+        .primary()
+        .spawn();
+    });
+}
+
+/// A connection-level failure (idle timeout / PeerDead) surfaces from the
+/// completion channel.  `peer_liveness` must report the `TimedOut` error.
+#[test]
+fn peer_liveness_resolves_on_peer_dead() {
+    sim(|| {
+        let (mut reader, mut pusher) = make_pair();
+        // Push enough data to trigger a MAX_DATA frame so the reader submits
+        // a frame to the completion channel that we can fail.
+        let payload = vec![0xab; reader.0.window_size as usize / 2 + 1];
+        let payload_len = payload.len();
+        let hint = reader.0.window_size + payload_len as u64;
+
+        async move {
+            pusher.push_data_hint(0, &payload, false, hint);
+            // Wait for the reader to process the data and emit a MAX_DATA frame.
+            let frames = pusher.recv_frames().await;
+            // Complete the MAX_DATA with PeerDead to inject a completion failure.
+            pusher.complete_with_status(
+                frames,
+                frame::TransmissionStatus::Failed(frame::FailureReason::PeerDead),
+            );
+        }
+        .primary()
+        .spawn();
+
+        async move {
+            // Consume the data so the reader emits the MAX_DATA.
+            let mut buf = BytesMut::with_capacity(payload_len + 16);
+            let n = reader.read_into(&mut buf).await.expect("read failed");
+            assert_eq!(n, payload_len);
+
+            // Give the endpoint task time to complete the frame with PeerDead.
+            bach::task::yield_now().await;
+
+            let err = reader
+                .peer_liveness()
+                .await
+                .expect_err("expected TimedOut from peer_liveness on PeerDead");
+            assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+        }
+        .primary()
+        .spawn();
+    });
+}
+
+/// `peer_liveness` must not update flow-control credits (remote_max_data) even
+/// when it drains queued frames into the local stash.  Only the application
+/// actually consuming bytes via `read_into` may advance the window.
+#[test]
+fn peer_liveness_does_not_update_flow_control() {
+    sim(|| {
+        let (mut reader, mut pusher) = make_pair();
+
+        // Snapshot the initial advertised window.
+        let initial_max_data = reader.0.remote_max_data;
+
+        async move {
+            pusher.push_data(0, b"data", false);
+        }
+        .primary()
+        .spawn();
+
+        async move {
+            bach::task::yield_now().await;
+
+            let before = reader.0.remote_max_data;
+            assert_eq!(
+                before, initial_max_data,
+                "remote_max_data should be at initial value before any interaction"
+            );
+
+            // peer_liveness drains the queued data frame into pending_rx but must
+            // not call maybe_send_max_data, so the advertised window stays put.
+            let still_pending = core::future::poll_fn(|cx| {
+                Poll::Ready(reader.poll_peer_liveness(cx).is_pending())
+            })
+            .await;
+            assert!(still_pending, "expected Pending (data frame, no FIN)");
+
+            let after = reader.0.remote_max_data;
+            assert_eq!(
+                after, before,
+                "remote_max_data must not change during peer_liveness — \
+                 the application has not consumed any bytes"
+            );
+
+            // The data frame is still accessible; the read path can deliver it.
+            let mut buf = BytesMut::with_capacity(32);
+            let n = reader
+                .read_into(&mut buf)
+                .await
+                .expect("data should still be readable after peer_liveness probe");
+            assert_eq!(&buf[..n], b"data");
+        }
+        .primary()
+        .spawn();
+    });
+}
+
+/// After `peer_liveness` fires with a Reset error, the reader's status is still
+/// `Open` (the liveness probe does not modify state).  Only the read path
+/// (`poll_stream_rx`) transitions status when it processes frames from
+/// `pending_rx`.
+#[test]
+fn peer_liveness_does_not_modify_reader_state_on_reset() {
+    sim(|| {
+        let (mut reader, mut pusher) = make_pair();
+
+        async move {
+            pusher.push_data(0, b"before reset", false);
+            pusher.push_reset(VarInt::from_u8(1));
+        }
+        .primary()
+        .spawn();
+
+        async move {
+            bach::task::yield_now().await;
+
+            // Liveness check sees the Reset but does not transition status.
+            let err = reader
+                .peer_liveness()
+                .await
+                .expect_err("expected Reset from peer_liveness");
+            assert_eq!(err.kind(), std::io::ErrorKind::ConnectionReset);
+            // Status must remain Open — the read path is responsible for
+            // transitioning state so it can drain buffered data first.
+            assert!(
+                reader.0.status.is_open(),
+                "peer_liveness must not transition status"
+            );
+
+            // The read path now processes [Data, Reset] from pending_rx.  The
+            // interposer writes "before reset" to buf before surfacing the error
+            // (same-batch TCP semantics: data in buf even though Err is returned).
+            let mut buf = BytesMut::with_capacity(32);
+            let read_err = reader
+                .read_into(&mut buf)
+                .await
+                .expect_err("expected ConnectionReset from read path");
+            assert_eq!(read_err.kind(), std::io::ErrorKind::ConnectionReset);
+            assert_eq!(&buf[..], b"before reset");
+            // Now the read path has transitioned status to reset.
+            assert!(
+                reader.0.status.is_reset(),
+                "read path should have transitioned status to reset"
+            );
         }
         .primary()
         .spawn();
