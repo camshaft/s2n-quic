@@ -23,8 +23,10 @@ use std::{
 };
 
 mod querylog;
+mod statsd;
 
 pub use querylog::QuerylogBackend;
+pub use statsd::{StatsdBackend, StatsdSink, DEFAULT_MAX_PAYLOAD_SIZE};
 
 mod sealed {
     pub trait Sealed {}
@@ -469,6 +471,46 @@ impl<B: Backend> Backend for Option<B> {
     }
 }
 
+/// Fan-out over a homogeneous, runtime-sized set of backends: every method is forwarded to each
+/// element in order. Use `Vec<Box<dyn Backend>>` for a heterogeneous set.
+impl<B: Backend> Backend for Vec<B> {
+    fn report_start(&mut self, options: &ReportOptions) {
+        for b in self.iter_mut() {
+            b.report_start(options);
+        }
+    }
+    fn record_counter(&mut self, info: &MetricInfo<'_>, value: u64) {
+        for b in self.iter_mut() {
+            b.record_counter(info, value);
+        }
+    }
+    fn record_gauge(&mut self, info: &MetricInfo<'_>, value: i64) {
+        for b in self.iter_mut() {
+            b.record_gauge(info, value);
+        }
+    }
+    fn record_bool(&mut self, info: &MetricInfo<'_>, true_count: u64, false_count: u64) {
+        for b in self.iter_mut() {
+            b.record_bool(info, true_count, false_count);
+        }
+    }
+    fn record_histogram(&mut self, info: &MetricInfo<'_>, hist: Histogram<'_>) {
+        for b in self.iter_mut() {
+            b.record_histogram(info, hist);
+        }
+    }
+    fn record_callback(&mut self, info: &MetricInfo<'_>, values: &[&dyn CallbackValue]) {
+        for b in self.iter_mut() {
+            b.record_callback(info, values);
+        }
+    }
+    fn report_end(&mut self) {
+        for b in self.iter_mut() {
+            b.report_end();
+        }
+    }
+}
+
 /// Forwarding impl so a `&mut B` (or a boxed backend) can be passed where a `Backend` is expected.
 impl<B: Backend + ?Sized> Backend for &mut B {
     fn report_start(&mut self, options: &ReportOptions) {
@@ -700,6 +742,43 @@ mod test {
         let mut counting = CountingBackend::default();
         registry.report(&mut counting);
         assert_eq!(counting.counter_sum, 0);
+    }
+
+    #[test]
+    fn vec_of_backends_fans_out_to_every_entry() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::Arc;
+
+        // A backend that adds every counter value into a shared tally, so we can confirm each Vec
+        // entry was invoked (no silent overwrite).
+        struct TallyBackend(Arc<AtomicU64>);
+        impl Backend for TallyBackend {
+            fn record_counter(&mut self, _: &MetricInfo<'_>, value: u64) {
+                self.0.fetch_add(value, Ordering::Relaxed);
+            }
+            fn record_gauge(&mut self, _: &MetricInfo<'_>, _: i64) {}
+            fn record_bool(&mut self, _: &MetricInfo<'_>, _: u64, _: u64) {}
+            fn record_histogram(&mut self, _: &MetricInfo<'_>, _: Histogram<'_>) {}
+            fn record_callback(&mut self, _: &MetricInfo<'_>, _: &[&dyn CallbackValue]) {}
+        }
+
+        let registry = Registry::new();
+        registry.register_counter("a".into(), None).increment(4);
+
+        // Three entries (a Box<dyn Backend> set), all sharing one tally; every entry must be fed.
+        let tally = Arc::new(AtomicU64::new(0));
+        let mut backends: Vec<Box<dyn Backend>> = (0..3)
+            .map(|_| Box::new(TallyBackend(tally.clone())) as Box<dyn Backend>)
+            .collect();
+        registry.report(&mut backends);
+
+        // 3 entries each saw value 4 → 12. Proves fan-out reaches every entry (no overwrite).
+        assert_eq!(tally.load(Ordering::Relaxed), 12);
+
+        // And the registry drained exactly once across the whole fan-out.
+        let mut after = CountingBackend::default();
+        registry.report(&mut after);
+        assert_eq!(after.counter_sum, 0);
     }
 
     #[test]
