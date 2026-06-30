@@ -69,13 +69,11 @@ impl Counter {
             .send_event(((self.counter as u64) << 32) | count);
     }
 
-    pub(crate) fn take_current(&self, include_sparse: bool) -> Option<String> {
-        let value = self.channels.get_mut(self.counter, std::mem::take);
-        if value.value == 0 && !include_sparse {
-            None
-        } else {
-            Some(format!("{}", value.value))
-        }
+    /// Drains the accumulated value and reports it to `backend`. The drain happens unconditionally;
+    /// the backend decides whether a zero is emitted.
+    pub(crate) fn report(&self, info: &crate::MetricInfo<'_>, backend: &mut dyn crate::Backend) {
+        let value = self.channels.get_mut(self.counter, std::mem::take).value;
+        backend.record_counter(info, value);
     }
 }
 

@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{counter::SharedCounter, rseq::Channels};
-use std::{fmt::Write as _, sync::Arc};
+use std::sync::Arc;
 
 /// A `BoolCounter` represents an event with a success/failure or other binary state. For example,
 /// it can be used to count attempted outgoing connections while also representing the
@@ -31,16 +31,10 @@ impl BoolCounter {
         }
     }
 
-    pub(crate) fn take_current(&self) -> Option<String> {
-        let mut output = String::new();
+    /// Drains the accumulated true/false counts and reports them to `backend`.
+    pub(crate) fn report(&self, info: &crate::MetricInfo<'_>, backend: &mut dyn crate::Backend) {
         let true_ = self.channels.get_mut(self.true_, std::mem::take).value;
         let false_ = self.channels.get_mut(self.false_, std::mem::take).value;
-        match (true_, false_) {
-            (0, 0) => return None,
-            (t, 0) => write!(output, "1*{t}").unwrap(),
-            (0, f) => write!(output, "0*{f}").unwrap(),
-            (t, f) => write!(output, "1*{t}+0*{f}").unwrap(),
-        }
-        Some(output)
+        backend.record_bool(info, true_, false_);
     }
 }

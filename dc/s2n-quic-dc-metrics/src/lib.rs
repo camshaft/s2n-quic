@@ -12,9 +12,13 @@ mod runtime;
 mod summary;
 mod task;
 
+pub mod backend;
 pub mod format;
 
 pub use appender::MetricsWriter;
+pub use backend::{
+    Backend, CallbackValue, Histogram, MetricInfo, MetricKind, ReportOptions, Toggle, ToggleHandle,
+};
 pub use bool_counter::BoolCounter;
 pub use counter::Counter;
 pub use registry::Registry;
