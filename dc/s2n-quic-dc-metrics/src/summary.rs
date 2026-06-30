@@ -9,6 +9,9 @@ use std::{fmt::Write as _, sync::Arc, time::Duration};
 
 const FLOAT_INT_MULTIPLIER: f64 = 1000.0;
 
+/// Integer form of [`FLOAT_INT_MULTIPLIER`], for backends de-scaling stored `Percent` values.
+pub(crate) const FLOAT_INT_MULTIPLIER_U64: u64 = 1000;
+
 /// use to convert a float to an int
 /// preserving digits in the decimal by
 /// multiplying by FLOAT_INT_MULTIPLIER.

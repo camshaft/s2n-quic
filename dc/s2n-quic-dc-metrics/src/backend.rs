@@ -23,8 +23,10 @@ use std::{
 };
 
 mod querylog;
+mod statsd;
 
 pub use querylog::QuerylogBackend;
+pub use statsd::{StatsdBackend, StatsdSink, DEFAULT_MAX_PAYLOAD_SIZE};
 
 mod sealed {
     pub trait Sealed {}
