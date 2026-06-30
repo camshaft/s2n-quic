@@ -309,76 +309,27 @@ impl s2n_quic_dc_metrics::Backend for TracingBackend {
 
 /// The set of backends a reporter drives, held across report intervals so each retains its buffers.
 ///
-/// Implements [`Backend`](s2n_quic_dc_metrics::Backend) by fanning every record call out to each
-/// active backend, so a single destructive `Registry::report` feeds all of them.
-struct ReporterBackends {
-    tracing: Option<TracingBackend>,
-    statsd: Option<StatsdBackend<StatsdUdpConfig>>,
-}
+/// It's simply a tuple of optional backends: the generic `(A, B)` and `Option<T>` [`Backend`]
+/// composition impls fan a single destructive `Registry::report` out to every active backend (in
+/// tuple order), so no bespoke fan-out type is needed. [`build_reporter_backends`] constructs it
+/// from the configured sinks.
+type ReporterBackends = (Option<TracingBackend>, Option<StatsdBackend<StatsdUdpConfig>>);
 
-impl ReporterBackends {
-    fn build(config: &[ReporterSink], prefix: Option<&str>) -> Self {
-        let mut tracing = None;
-        let mut statsd = None;
-        for sink in config {
-            match sink {
-                ReporterSink::Tracing => {
-                    tracing = Some(TracingBackend::new(prefix.map(str::to_string)))
-                }
-                ReporterSink::StatsdUdp(cfg) => {
-                    statsd = Some(
-                        StatsdBackend::new(cfg.clone(), prefix.map(str::to_string))
-                            .with_max_payload_size(cfg.max_payload_size),
-                    )
-                }
+fn build_reporter_backends(config: &[ReporterSink], prefix: Option<&str>) -> ReporterBackends {
+    let mut tracing = None;
+    let mut statsd = None;
+    for sink in config {
+        match sink {
+            ReporterSink::Tracing => tracing = Some(TracingBackend::new(prefix.map(str::to_string))),
+            ReporterSink::StatsdUdp(cfg) => {
+                statsd = Some(
+                    StatsdBackend::new(cfg.clone(), prefix.map(str::to_string))
+                        .with_max_payload_size(cfg.max_payload_size),
+                )
             }
         }
-        Self { tracing, statsd }
     }
-}
-
-impl s2n_quic_dc_metrics::Backend for ReporterBackends {
-    fn report_start(&mut self, options: &ReportOptions) {
-        self.tracing.report_start(options);
-        self.statsd.report_start(options);
-    }
-    fn record_counter(&mut self, info: &s2n_quic_dc_metrics::MetricInfo<'_>, value: u64) {
-        self.tracing.record_counter(info, value);
-        self.statsd.record_counter(info, value);
-    }
-    fn record_gauge(&mut self, info: &s2n_quic_dc_metrics::MetricInfo<'_>, value: i64) {
-        self.tracing.record_gauge(info, value);
-        self.statsd.record_gauge(info, value);
-    }
-    fn record_bool(
-        &mut self,
-        info: &s2n_quic_dc_metrics::MetricInfo<'_>,
-        true_count: u64,
-        false_count: u64,
-    ) {
-        self.tracing.record_bool(info, true_count, false_count);
-        self.statsd.record_bool(info, true_count, false_count);
-    }
-    fn record_histogram(
-        &mut self,
-        info: &s2n_quic_dc_metrics::MetricInfo<'_>,
-        hist: s2n_quic_dc_metrics::Histogram<'_>,
-    ) {
-        self.tracing.record_histogram(info, hist);
-        self.statsd.record_histogram(info, hist);
-    }
-    fn record_callback(
-        &mut self,
-        info: &s2n_quic_dc_metrics::MetricInfo<'_>,
-        values: &[&dyn s2n_quic_dc_metrics::CallbackValue],
-    ) {
-        self.tracing.record_callback(info, values);
-        self.statsd.record_callback(info, values);
-    }
-    fn report_end(&mut self) {
-        self.tracing.report_end();
-        self.statsd.report_end();
-    }
+    (tracing, statsd)
 }
 
 fn report_once(
@@ -2815,9 +2766,9 @@ impl Registry {
         let interval = config.interval;
         let sparse_mode = config.sparse_mode.clone();
         // Built once and held across intervals so each backend retains its buffers (the
-        // QuerylogBackend line buffer, the StatsdBackend line vec), reaching a no-realloc steady
-        // state.
-        let mut backends = ReporterBackends::build(&config.sinks, config.prefix.as_deref());
+        // QuerylogBackend line buffer, the StatsdBackend record buffer), reaching a no-realloc
+        // steady state.
+        let mut backends = build_reporter_backends(&config.sinks, config.prefix.as_deref());
 
         #[cfg(any(test, feature = "testing"))]
         if bach::is_active() {
@@ -3027,16 +2978,15 @@ where
 mod tests {
     use super::*;
 
-    /// Builds a `ReporterBackends` with both a tracing backend and a statsd backend wired to a
-    /// freshly-created `StatsdUdpConfig`, returning the receiver so tests can inspect batches.
+    /// Builds reporter backends with a statsd backend wired to a freshly-created `StatsdUdpConfig`,
+    /// returning the receiver so tests can inspect batches.
     fn backends_with_statsd(
         prefix: Option<&str>,
         queue_depth: usize,
     ) -> (ReporterBackends, mpsc::Receiver<StatsdUdpPayloadBatch>) {
         let (tx, rx) = mpsc::channel(queue_depth);
         let cfg = StatsdUdpConfig::new("127.0.0.1:8125".parse().unwrap(), tx);
-        let backends =
-            ReporterBackends::build(&[ReporterSink::StatsdUdp(cfg)], prefix);
+        let backends = build_reporter_backends(&[ReporterSink::StatsdUdp(cfg)], prefix);
         (backends, rx)
     }
 
@@ -3087,7 +3037,7 @@ mod tests {
 
         let (tx, mut rx) = mpsc::channel(4);
         let cfg = StatsdUdpConfig::new("127.0.0.1:8125".parse().unwrap(), tx);
-        let mut backends = ReporterBackends::build(
+        let mut backends = build_reporter_backends(
             &[ReporterSink::Tracing, ReporterSink::StatsdUdp(cfg)],
             Some("svc"),
         );
