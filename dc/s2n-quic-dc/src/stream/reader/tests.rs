@@ -2155,18 +2155,13 @@ fn peer_liveness_pending_while_peer_alive() {
 }
 
 /// A `Reset` message in the stream queue resolves `peer_liveness` with a
-/// `ConnectionReset` error.  Data frames that arrived in the same queue batch
-/// before the reset are preserved in `pending_rx`; when the application then
-/// calls `read_into`, the interposer delivers those bytes to the application
-/// buffer before the error is surfaced — mirroring the same-batch TCP semantics
-/// already tested in `reset_after_partial_data`.
+/// `ConnectionReset` error and transitions the reader to the Reset state.
 #[test]
 fn peer_liveness_resolves_on_reset() {
     sim(|| {
         let (mut reader, mut pusher) = make_pair();
 
         async move {
-            pusher.push_data(0, b"prefix", false);
             pusher.push_reset(VarInt::from_u8(42));
         }
         .primary()
@@ -2182,18 +2177,13 @@ fn peer_liveness_resolves_on_reset() {
                 .expect_err("expected ConnectionReset from peer_liveness");
             assert_eq!(err.kind(), std::io::ErrorKind::ConnectionReset);
 
-            // peer_liveness stashes [Data, Reset] in pending_rx.  When the read
-            // path processes them in the same poll, the interposer writes "prefix"
-            // to the buffer before the Reset triggers an early return with Err.
-            // This mirrors `reset_after_partial_data`: data IS in buf even though
-            // read_into returns Err.
-            let mut buf = BytesMut::with_capacity(32);
-            let read_err = reader
-                .read_into(&mut buf)
+            // Status is now Reset; the reset error is sticky.
+            assert!(reader.0.status.is_reset());
+            let err2 = reader
+                .read_into(&mut BytesMut::new())
                 .await
-                .expect_err("expected ConnectionReset from read path after peer_liveness");
-            assert_eq!(read_err.kind(), std::io::ErrorKind::ConnectionReset);
-            assert_eq!(&buf[..], b"prefix");
+                .expect_err("expected sticky ConnectionReset");
+            assert_eq!(err2.kind(), std::io::ErrorKind::ConnectionReset);
         }
         .primary()
         .spawn();
@@ -2369,12 +2359,12 @@ fn peer_liveness_does_not_update_flow_control() {
     });
 }
 
-/// After `peer_liveness` fires with a Reset error, the reader's status is still
-/// `Open` (the liveness probe does not modify state).  Only the read path
-/// (`poll_stream_rx`) transitions status when it processes frames from
-/// `pending_rx`.
+/// When data frames precede a Reset in the same queue batch, `peer_liveness`
+/// writes the data into the reassembler and then sets the Reset state.  This
+/// gives the read path proper TCP semantics: `read_into` returns `Ok(data)`
+/// first, then `Err(ConnectionReset)` once the reassembler is exhausted.
 #[test]
-fn peer_liveness_does_not_modify_reader_state_on_reset() {
+fn peer_liveness_buffers_preceding_data_before_reset() {
     sim(|| {
         let (mut reader, mut pusher) = make_pair();
 
@@ -2388,34 +2378,35 @@ fn peer_liveness_does_not_modify_reader_state_on_reset() {
         async move {
             bach::task::yield_now().await;
 
-            // Liveness check sees the Reset but does not transition status.
+            // Liveness processes the Reset and returns the error.
             let err = reader
                 .peer_liveness()
                 .await
                 .expect_err("expected Reset from peer_liveness");
             assert_eq!(err.kind(), std::io::ErrorKind::ConnectionReset);
-            // Status must remain Open — the read path is responsible for
-            // transitioning state so it can drain buffered data first.
+
+            // Status is now Reset, but the reassembler still holds "before reset".
+            assert!(reader.0.status.is_reset());
             assert!(
-                reader.0.status.is_open(),
-                "peer_liveness must not transition status"
+                !reader.0.reassembler.is_empty(),
+                "reassembler should hold data that preceded the reset"
             );
 
-            // The read path now processes [Data, Reset] from pending_rx.  The
-            // interposer writes "before reset" to buf before surfacing the error
-            // (same-batch TCP semantics: data in buf even though Err is returned).
+            // TCP semantics: `read_into` drains the reassembler and returns Ok
+            // before surfacing the reset error.
             let mut buf = BytesMut::with_capacity(32);
-            let read_err = reader
+            let n = reader
                 .read_into(&mut buf)
                 .await
-                .expect_err("expected ConnectionReset from read path");
-            assert_eq!(read_err.kind(), std::io::ErrorKind::ConnectionReset);
-            assert_eq!(&buf[..], b"before reset");
-            // Now the read path has transitioned status to reset.
-            assert!(
-                reader.0.status.is_reset(),
-                "read path should have transitioned status to reset"
-            );
+                .expect("data before reset should be readable as Ok(n)");
+            assert_eq!(&buf[..n], b"before reset");
+
+            // Now the reassembler is empty; the sticky reset error surfaces.
+            let err2 = reader
+                .read_into(&mut buf)
+                .await
+                .expect_err("expected ConnectionReset after reassembler drained");
+            assert_eq!(err2.kind(), std::io::ErrorKind::ConnectionReset);
         }
         .primary()
         .spawn();

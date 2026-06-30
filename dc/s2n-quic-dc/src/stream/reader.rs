@@ -924,16 +924,9 @@ impl Inner {
             return Poll::Ready(Err(e));
         }
 
-        // Drain the stream channel into `pending_rx` and scan for terminal frames.
-        //
-        // We always call `poll_swap` even when `pending_rx` is non-empty: `poll_swap` is the
-        // only place the stream-half waker is (re)registered, and the polling task's waker can
-        // change between polls (task migration under select!/timeout/work-stealing). A stale waker
-        // left after a budget break would silently lose the next wake-up.
-        //
-        // Frames are stashed in `pending_rx` rather than being processed: we do not write data
-        // to the reassembler here, so `consumed_len` does not advance and no `MAX_DATA` is sent
-        // (flow-control credits are only updated when the application actually reads).
+        // Drain any frames left in pending_rx by a prior poll, then pull a fresh batch.
+        // Always call `poll_swap` even when pending_rx is non-empty so the stream-half waker
+        // is (re)registered; a stale waker would silently drop the next wake-up.
         let mut queue = core::mem::take(&mut self.pending_rx);
         let channel_closed = match self.stream_rx.poll_swap(cx) {
             Poll::Ready(Ok(mut fresh)) => {
@@ -944,34 +937,98 @@ impl Inner {
             Poll::Pending => false,
         };
 
-        // Scan for terminal frames without modifying reader state. Leaving the frames in
-        // `pending_rx` preserves TCP semantics on the read path: data frames that preceded a
-        // Reset (or a FIN with preceding data) are still delivered to the application in order.
-        for entry in queue.iter() {
-            match &*entry {
+        // Process every frame directly into the reassembler (no app-buffer / interposer path).
+        // Writing to the reassembler buffers the data without advancing `consumed_len`, so no
+        // MAX_DATA credit is issued here — flow-control only advances when the application
+        // actually consumes bytes through `read_into`.
+        //
+        // Because data lands in the reassembler rather than being stashed back in `pending_rx`,
+        // the read path gets proper TCP semantics for free: when a Reset is found after
+        // preceding data, `poll_read_into_inner` sees `!reassembler.is_empty()` and defers
+        // the error, draining all buffered bytes to the application before surfacing the reset.
+        while let Some(entry) = queue.pop_front() {
+            self.status.on_received().ok();
+
+            match entry.into_inner() {
+                msg::Stream::Data {
+                    offset,
+                    peer_max_offset,
+                    mut payload,
+                    fin,
+                    blocked,
+                } => {
+                    self.peer_max_offset = self.peer_max_offset.max(peer_max_offset.as_u64());
+                    if blocked {
+                        self.on_blocked_signal(peer_max_offset.as_u64());
+                    }
+
+                    let Some(payload_end_offset) =
+                        offset.as_u64().checked_add(payload.len() as u64)
+                    else {
+                        return self.protocol_error();
+                    };
+
+                    if self.remote_max_data != VarInt::ZERO
+                        && payload_end_offset > self.remote_max_data.as_u64()
+                    {
+                        return self.queue_control_error();
+                    }
+
+                    let mut incremental = Incremental::new(offset);
+                    let mut reader = match incremental.with_storage(&mut payload, fin) {
+                        Ok(r) => r,
+                        Err(_) => return self.protocol_error(),
+                    };
+
+                    // Always write directly to the reassembler, skipping the Interposer /
+                    // app-buf path used by `poll_stream_rx`. This keeps data buffered in
+                    // the reassembler (not in the application buffer) so it can be drained
+                    // in order by `read_into`.
+                    if self.reassembler.write_reader(&mut reader).is_err() {
+                        return self.protocol_error();
+                    }
+
+                    if self.reassembler.is_writing_complete() {
+                        return Poll::Ready(Ok(()));
+                    }
+                }
+                msg::Stream::Blocked {
+                    desired_offset,
+                    synthetic,
+                } => {
+                    let desired = desired_offset.as_u64();
+                    self.peer_max_offset = self.peer_max_offset.max(desired);
+                    if !synthetic {
+                        self.on_blocked_signal(desired);
+                    }
+                }
                 msg::Stream::Reset { error_code } => {
-                    let code = *error_code;
-                    let err: Error = code.into();
-                    self.pending_rx = queue;
-                    return Poll::Ready(Err(io::Error::new(err.io_error_kind(), err)));
+                    self.reset_error_code = Some(error_code);
+                    self.status.on_reset().ok();
+                    // Only clear the reassembler if it is already empty. If data was buffered
+                    // before the reset, leave it so the read path can drain it first.
+                    if self.reassembler.is_empty() {
+                        self.reassembler.reset();
+                    }
+                    let reset_error: Error = error_code.into();
+                    return Poll::Ready(Err(io::Error::new(
+                        reset_error.io_error_kind(),
+                        reset_error,
+                    )));
                 }
-                msg::Stream::Data { fin: true, .. } => {
-                    self.pending_rx = queue;
-                    return Poll::Ready(Ok(()));
+                msg::Stream::Debug { .. } => {
+                    // Debug frames carry no stream data; ignore in the liveness path.
                 }
-                _ => {}
             }
         }
 
         if channel_closed {
-            self.pending_rx = queue;
             return Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
                 "stream channel closed",
             )));
         }
 
-        self.pending_rx = queue;
         Poll::Pending
     }
 
