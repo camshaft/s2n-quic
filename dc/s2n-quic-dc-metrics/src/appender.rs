@@ -96,6 +96,11 @@ impl Builder {
         self
     }
 
+    pub fn with_max_files(mut self, max_files: usize) -> Self {
+        self.max_files = max_files;
+        self
+    }
+
     pub fn build(self) -> Result<MetricsWriter> {
         self.fs.create_dir(&self.base_path)?;
 
@@ -631,5 +636,30 @@ mod test {
                 PathBuf::from("/foo/bar/baz.2020-01-01-03"),
             ]
         );
+    }
+
+    #[test]
+    fn test_builder_threads_max_files() {
+        let dir = std::env::temp_dir().join("s2n-quic-dc-metrics-builder-max-files");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // The by-value `with_max_files` is chainable directly into `build`, which consumes self.
+        let writer = MetricsWriter::builder(
+            dir.clone(),
+            "svc".into(),
+            std::time::Duration::from_secs(3600),
+        )
+        .with_max_files(7)
+        .build()
+        .unwrap();
+        assert_eq!(writer.max_files, 7);
+
+        // The by-ref `max_files` configures the same field on a bound builder.
+        let mut builder =
+            MetricsWriter::builder(dir.clone(), "svc".into(), std::time::Duration::from_secs(3600));
+        builder.max_files(4);
+        assert_eq!(builder.build().unwrap().max_files, 4);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
