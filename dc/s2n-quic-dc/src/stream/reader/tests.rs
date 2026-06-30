@@ -2191,7 +2191,7 @@ fn peer_liveness_resolves_on_reset() {
 }
 
 /// A FIN-carrying data frame resolves `peer_liveness` with `Ok(())`.  Any
-/// preceding data bytes are preserved in `pending_rx` so the application can
+/// preceding data bytes are written into the reassembler so the application can
 /// drain them through `read_into` and then receive the clean EOF.
 #[test]
 fn peer_liveness_resolves_on_fin() {

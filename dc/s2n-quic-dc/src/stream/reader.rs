@@ -700,8 +700,8 @@ impl Reader {
     ///   connection died (idle timeout / transmission failure), or the stream
     ///   channel closed unexpectedly.
     ///
-    /// Flow control credits are **not** updated: this probe drains pending
-    /// frames into the local stash without copying them to an application
+    /// Flow control credits are **not** updated: this probe writes pending
+    /// frames into the reassembler without copying them to an application
     /// buffer, so `consumed_len` does not advance and no `MAX_DATA` is sent.
     ///
     /// # Task affinity (contract)
