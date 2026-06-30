@@ -127,14 +127,17 @@ impl<S: StatsdSink> Backend for StatsdBackend<S> {
     }
 
     fn record_bool(&mut self, info: &MetricInfo<'_>, true_count: u64, false_count: u64) {
-        // Bool counters always suppress the all-zero case (matching the querylog policy).
-        if (true_count, false_count) == (0, 0) {
-            return;
+        // Each side is its own counter, so apply the counter zero-suppression policy per side:
+        // a zero count is omitted unless sparse output is requested. (When both are zero this
+        // emits nothing under the normal policy, matching the all-zero suppression elsewhere.)
+        if true_count != 0 || self.include_sparse {
+            write!(self.begin_record(info.name, ".true:"), "{true_count}|c").unwrap();
+            self.end_record(info.aggregation);
         }
-        write!(self.begin_record(info.name, ".true:"), "{true_count}|c").unwrap();
-        self.end_record(info.aggregation);
-        write!(self.begin_record(info.name, ".false:"), "{false_count}|c").unwrap();
-        self.end_record(info.aggregation);
+        if false_count != 0 || self.include_sparse {
+            write!(self.begin_record(info.name, ".false:"), "{false_count}|c").unwrap();
+            self.end_record(info.aggregation);
+        }
     }
 
     fn record_histogram(&mut self, info: &MetricInfo<'_>, hist: Histogram<'_>) {
@@ -204,11 +207,11 @@ impl<S: StatsdSink> Backend for StatsdBackend<S> {
     }
 }
 
-/// Maps a native histogram bucket value to the integer StatsD reports.
+/// Maps a native histogram bucket value to the integer this backend reports.
 ///
-/// Histogram values arrive in their native recorded magnitude:
+/// Values are emitted as gauges in their native recorded magnitude:
 /// - time units (`Microsecond`/`Second`) are stored as **nanoseconds** (`record_duration` records
-///   `Duration::as_nanos`), and StatsD timers are nanosecond-based, so they pass through unchanged;
+///   `Duration::as_nanos`), and we report that nanosecond magnitude as-is;
 /// - `Count`/`Byte` are raw and pass through;
 /// - `Percent` is stored scaled by `FLOAT_INT_MULTIPLIER` (1000), so divide back to a whole percent.
 fn statsd_value(value: u64, unit: Unit) -> u64 {
@@ -233,9 +236,12 @@ fn write_name(out: &mut String, prefix: Option<&str>, name: &str) {
     write_sanitized(out, name);
 }
 
-/// Appends the `|#variant:{aggregation}` tag to `out`, if there is an aggregation.
+/// Appends the `|#variant:{aggregation}` tag to `out`, for a non-empty aggregation.
+///
+/// An empty (or `None`) aggregation produces no tag — emitting a bare `|#variant:` would be an
+/// invalid StatsD tag.
 fn write_tag(out: &mut String, aggregation: Option<&str>) {
-    if let Some(agg) = aggregation {
+    if let Some(agg) = aggregation.filter(|a| !a.is_empty()) {
         out.push_str("|#variant:");
         write_sanitized(out, agg);
     }
@@ -387,6 +393,8 @@ mod test {
         );
         backend.record_gauge(&info("q.depth", None, Unit::Count, MetricKind::Gauge), 7);
         backend.record_bool(&info("connect", None, Unit::Count, MetricKind::BoolCounter), 2, 1);
+        // An empty aggregation must NOT produce a bare `|#variant:` tag.
+        backend.record_counter(&info("empty.agg", Some(""), Unit::Count, MetricKind::Counter), 1);
         backend.report_end();
 
         let lines = sink.lines();
@@ -395,6 +403,7 @@ mod test {
         assert!(lines.contains(&"svc.q.depth:7|g".to_string()));
         assert!(lines.contains(&"svc.connect.true:2|c".to_string()));
         assert!(lines.contains(&"svc.connect.false:1|c".to_string()));
+        assert!(lines.contains(&"svc.empty.agg:1|c".to_string()), "got: {lines:?}");
     }
 
     fn line_value(lines: &[String], prefix: &str) -> u64 {
@@ -506,7 +515,7 @@ mod test {
 
     #[test]
     fn zero_values_suppressed_unless_sparse() {
-        // Non-sparse: a zero counter emits nothing.
+        // Non-sparse: a zero counter and an all-zero bool emit nothing.
         let sink = CaptureSink::default();
         let mut backend = StatsdBackend::new(sink.clone(), None);
         backend.report_start(&ReportOptions::new(false));
@@ -515,7 +524,7 @@ mod test {
         backend.report_end();
         assert!(sink.datagrams().is_empty());
 
-        // Sparse: the zero counter emits (bool all-zero is always suppressed).
+        // Sparse: zeros emit (counter and both bool sides).
         let sink = CaptureSink::default();
         let mut backend = StatsdBackend::new(sink.clone(), None);
         backend.report_start(&ReportOptions::new(true));
@@ -524,7 +533,24 @@ mod test {
         backend.report_end();
         let lines = sink.lines();
         assert!(lines.contains(&"c:0|c".to_string()));
-        assert!(!lines.iter().any(|l| l.starts_with("b.")));
+        assert!(lines.contains(&"b.true:0|c".to_string()));
+        assert!(lines.contains(&"b.false:0|c".to_string()));
+    }
+
+    #[test]
+    fn bool_suppresses_zero_side_unless_sparse() {
+        // Non-sparse: only the non-zero side emits (the zero side is omitted to avoid `:0|c` noise).
+        let sink = CaptureSink::default();
+        let mut backend = StatsdBackend::new(sink.clone(), None);
+        backend.report_start(&ReportOptions::new(false));
+        backend.record_bool(&info("connect", None, Unit::Count, MetricKind::BoolCounter), 5, 0);
+        backend.report_end();
+        let lines = sink.lines();
+        assert!(lines.contains(&"connect.true:5|c".to_string()));
+        assert!(
+            !lines.iter().any(|l| l.starts_with("connect.false")),
+            "zero false side should be suppressed: {lines:?}"
+        );
     }
 
     #[test]

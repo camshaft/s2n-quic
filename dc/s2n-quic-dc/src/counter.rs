@@ -309,27 +309,25 @@ impl s2n_quic_dc_metrics::Backend for TracingBackend {
 
 /// The set of backends a reporter drives, held across report intervals so each retains its buffers.
 ///
-/// It's simply a tuple of optional backends: the generic `(A, B)` and `Option<T>` [`Backend`]
-/// composition impls fan a single destructive `Registry::report` out to every active backend (in
-/// tuple order), so no bespoke fan-out type is needed. [`build_reporter_backends`] constructs it
-/// from the configured sinks.
-type ReporterBackends = (Option<TracingBackend>, Option<StatsdBackend<StatsdUdpConfig>>);
+/// A `Vec<Box<dyn Backend>>` of one entry per configured sink, in order. The generic
+/// `Vec<B>` / `Box<B>` [`Backend`] composition impls fan a single destructive `Registry::report`
+/// out to every backend, so no bespoke fan-out type is needed. Every configured sink is honored
+/// (duplicates included). [`build_reporter_backends`] constructs it from the configured sinks.
+type ReporterBackends = Vec<Box<dyn s2n_quic_dc_metrics::Backend + Send>>;
 
 fn build_reporter_backends(config: &[ReporterSink], prefix: Option<&str>) -> ReporterBackends {
-    let mut tracing = None;
-    let mut statsd = None;
-    for sink in config {
-        match sink {
-            ReporterSink::Tracing => tracing = Some(TracingBackend::new(prefix.map(str::to_string))),
-            ReporterSink::StatsdUdp(cfg) => {
-                statsd = Some(
+    config
+        .iter()
+        .map(|sink| -> Box<dyn s2n_quic_dc_metrics::Backend + Send> {
+            match sink {
+                ReporterSink::Tracing => Box::new(TracingBackend::new(prefix.map(str::to_string))),
+                ReporterSink::StatsdUdp(cfg) => Box::new(
                     StatsdBackend::new(cfg.clone(), prefix.map(str::to_string))
                         .with_max_payload_size(cfg.max_payload_size),
-                )
+                ),
             }
-        }
-    }
-    (tracing, statsd)
+        })
+        .collect()
 }
 
 fn report_once(
