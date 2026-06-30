@@ -327,6 +327,14 @@ impl std::fmt::Debug for Histogram<'_> {
 /// `report_end`. All methods take `&mut self` and use concrete argument types, so the trait is
 /// object-safe (`Box<dyn Backend>`).
 ///
+/// # Reuse across reports
+///
+/// A `Backend` is intended to be **long-lived and reused across many report passes** rather than
+/// constructed per report. `report_start` resets any per-report state while retaining allocated
+/// capacity (buffers, maps), so after a few intervals the working set settles and steady-state
+/// reporting performs no allocation. Implementations must therefore clear, not reallocate, in
+/// `report_start`.
+///
 /// # Re-entrancy
 ///
 /// `Registry::report` holds the registry's internal lock for the duration of the report pass, so a
@@ -335,6 +343,9 @@ impl std::fmt::Debug for Histogram<'_> {
 /// interaction outside the report pass.
 pub trait Backend {
     /// Called once at the start of a report pass, before any metric is visited.
+    ///
+    /// Implementations should reset per-report state here while retaining capacity, so the backend
+    /// can be reused across reports without reallocating (see the trait-level note on reuse).
     fn report_start(&mut self, options: &ReportOptions) {
         let _ = options;
     }
