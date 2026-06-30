@@ -87,10 +87,11 @@ impl Backend for QuerylogBackend {
     }
 
     fn record_gauge(&mut self, info: &MetricInfo<'_>, value: i64) {
-        // Gauges are zero-suppressed: a zero value is omitted entirely (historically via
-        // `NonZeroDisplay`). Today gauges flow through the callback path; this direct method is
-        // provided for structured callers and mirrors that zero-suppression rule.
-        if value == 0 {
+        // Today no metric reports through here — gauges flow through the callback path — so this is
+        // forward-looking. Honor the same suppression policy the rest of the backend uses: drop a
+        // zero when the metric is zero-suppressed (the historical gauge behavior, via
+        // `NonZeroDisplay`) or when sparse output is off; emit it otherwise.
+        if value == 0 && (info.zero_suppressed || !self.include_sparse) {
             return;
         }
         write!(self.begin_entry(info), "{value}").unwrap();
@@ -205,5 +206,40 @@ mod test {
 
         // Capacity is retained across the reset (clear, not reallocate).
         assert!(backend.output.capacity() >= cap_after_first);
+    }
+
+    /// `record_gauge` honors `zero_suppressed` + `include_sparse` rather than always dropping zero.
+    #[test]
+    fn gauge_zero_respects_suppression_and_sparse() {
+        let suppressed = {
+            let mut i = MetricInfo::new("g", None, crate::Unit::Count, MetricKind::Gauge);
+            i.zero_suppressed = true;
+            i
+        };
+        let plain = MetricInfo::new("g", None, crate::Unit::Count, MetricKind::Gauge);
+
+        // Zero-suppressed gauge: zero is always dropped.
+        let mut b = QuerylogBackend::new();
+        b.report_start(&ReportOptions::new(true));
+        b.record_gauge(&suppressed, 0);
+        assert_eq!(b.line(), "");
+
+        // Non-suppressed gauge, sparse on: zero emits.
+        let mut b = QuerylogBackend::new();
+        b.report_start(&ReportOptions::new(true));
+        b.record_gauge(&plain, 0);
+        assert_eq!(b.line(), "g=0");
+
+        // Non-suppressed gauge, sparse off: zero dropped.
+        let mut b = QuerylogBackend::new();
+        b.report_start(&ReportOptions::new(false));
+        b.record_gauge(&plain, 0);
+        assert_eq!(b.line(), "");
+
+        // Non-zero always emits.
+        let mut b = QuerylogBackend::new();
+        b.report_start(&ReportOptions::new(false));
+        b.record_gauge(&suppressed, 7);
+        assert_eq!(b.line(), "g=7");
     }
 }

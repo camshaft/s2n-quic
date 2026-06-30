@@ -213,15 +213,22 @@ impl<'a> Histogram<'a> {
 
     /// The representative value at the requested quantile in `0.0..=1.0`.
     ///
-    /// Uses the same `ceil(q * count)` cumulative-walk as the querylog formatter.
+    /// Uses a `ceil(q * count)` cumulative-walk. `quantile(0.0)` returns the minimum observed
+    /// bucket (first non-empty) and `quantile(1.0)` the maximum.
     pub fn quantile(&self, q: f64) -> u64 {
         let total = self.count();
         if total == 0 {
             return 0;
         }
-        let target = (q * total as f64).ceil() as u64;
+        // Target at least the first sample, so q=0.0 (ceil -> 0) resolves to the minimum observed
+        // bucket rather than bucket 0. Empty buckets are skipped so a leading run of zeros never
+        // satisfies the threshold.
+        let target = ((q * total as f64).ceil() as u64).max(1);
         let mut cumulative = 0u64;
         for (idx, count) in self.buckets.iter().enumerate() {
+            if *count == 0 {
+                continue;
+            }
             cumulative += *count;
             if cumulative >= target {
                 return self.representative_value(idx);
@@ -372,7 +379,10 @@ pub trait Backend {
     /// A single name may have multiple callbacks registered under it (e.g. one per worker); all of
     /// their values are passed together as one logical metric. Each value exposes both its native
     /// number ([`CallbackValue::as_f64`]) and its exact display form
-    /// ([`CallbackValue::fmt_querylog`]).
+    /// ([`CallbackValue::fmt_value`]).
+    ///
+    /// The `values` slice (and the references in it) borrows a temporary built for this call and is
+    /// valid only for its duration — backends must consume it here, not retain it.
     fn record_callback(&mut self, info: &MetricInfo<'_>, values: &[&dyn CallbackValue]);
 
     /// Called once after all metrics are visited. Backends flush batched output here.
@@ -740,5 +750,45 @@ mod test {
         assert_eq!(backend.histogram_sample_sum, 1);
         // cb=3, g=11 -> 14
         assert_eq!(backend.callback_sum, 14.0);
+    }
+
+    /// `quantile(0.0)` must return the minimum observed bucket, not bucket 0 when bucket 0 is empty.
+    #[test]
+    fn quantile_zero_is_min_not_bucket_zero() {
+        // Capture the borrowed Histogram view's quantile/min/max from a real Summary.
+        #[derive(Default)]
+        struct Capture {
+            q0: u64,
+            min: u64,
+            q1: u64,
+            max: u64,
+        }
+        impl Backend for Capture {
+            fn record_counter(&mut self, _: &MetricInfo<'_>, _: u64) {}
+            fn record_gauge(&mut self, _: &MetricInfo<'_>, _: i64) {}
+            fn record_bool(&mut self, _: &MetricInfo<'_>, _: u64, _: u64) {}
+            fn record_histogram(&mut self, _: &MetricInfo<'_>, hist: Histogram<'_>) {
+                self.q0 = hist.quantile(0.0);
+                self.min = hist.min();
+                self.q1 = hist.quantile(1.0);
+                self.max = hist.max();
+            }
+            fn record_callback(&mut self, _: &MetricInfo<'_>, _: &[&dyn CallbackValue]) {}
+        }
+
+        let registry = Registry::new();
+        let summary = registry.register_summary("h".into(), None, Unit::Count);
+        // All samples land well above bucket 0, so bucket 0 is empty.
+        summary.record_value(100);
+        summary.record_value(100);
+        summary.record_value(5000);
+
+        let mut cap = Capture::default();
+        registry.report(&mut cap);
+
+        // q0 must equal the minimum observed bucket (non-zero), not bucket 0's midpoint (0).
+        assert_eq!(cap.q0, cap.min);
+        assert!(cap.q0 > 0, "quantile(0.0) returned bucket 0 ({})", cap.q0);
+        assert_eq!(cap.q1, cap.max);
     }
 }
