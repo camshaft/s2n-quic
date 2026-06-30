@@ -188,7 +188,10 @@ impl StatsdUdpConfig {
 /// `Rate`-paced UDP sender task and forwards finished payload batches non-blockingly (dropping a
 /// batch if the queue is full, as before).
 impl StatsdSink for StatsdUdpConfig {
-    fn send_batch(&mut self, payloads: Vec<Vec<u8>>) {
+    fn send_batch<'a>(&mut self, payloads: impl Iterator<Item = &'a str>) {
+        // The datagrams borrow the backend's buffer and the sender task runs asynchronously, so
+        // copy each into an owned payload before queuing.
+        let payloads: Vec<Vec<u8>> = payloads.map(|d| d.as_bytes().to_vec()).collect();
         if payloads.is_empty() {
             return;
         }

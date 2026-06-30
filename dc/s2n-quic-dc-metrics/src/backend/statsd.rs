@@ -15,6 +15,7 @@ use crate::{
     backend::{Backend, CallbackValue, Histogram, MetricInfo, ReportOptions},
     Unit,
 };
+use std::fmt::Write as _;
 
 /// Percentiles emitted for histogram metrics.
 const HISTOGRAM_PERCENTILES: [u32; 4] = [50, 90, 95, 99];
@@ -22,28 +23,37 @@ const HISTOGRAM_PERCENTILES: [u32; 4] = [50, 90, 95, 99];
 /// Default maximum UDP payload size (bytes) for a single datagram.
 pub const DEFAULT_MAX_PAYLOAD_SIZE: usize = 1200;
 
-/// A transport for finished StatsD UDP payloads.
+/// A transport for finished StatsD UDP datagrams.
 ///
-/// The backend chunks lines into datagram-sized payloads and hands them off here in `report_end`.
-/// Implementations send them however they like (e.g. a rate-paced UDP socket). `send_batch` should
+/// The backend formats and chunks records into datagram-sized payloads and hands them off here in
+/// `report_end`, as an iterator of `&str` slices that borrow the backend's internal buffer.
+/// Implementations send them however they like (e.g. a rate-paced UDP socket); each `&str` is one
+/// ready-to-send datagram. The slices are only valid for the duration of the call, so an
+/// implementation that defers sending (e.g. queues to another task) must copy. `send_batch` should
 /// not block the reporting thread; drop or queue as appropriate.
 pub trait StatsdSink: Send {
-    /// Sends a batch of already-chunked UDP payloads.
-    fn send_batch(&mut self, payloads: Vec<Vec<u8>>);
+    /// Sends a batch of datagrams. Each item is one complete, newline-joined UDP payload.
+    fn send_batch<'a>(&mut self, payloads: impl Iterator<Item = &'a str>);
 }
 
 /// A [`Backend`] that encodes metrics as StatsD lines and forwards datagram payloads to a
 /// [`StatsdSink`].
 ///
-/// Reusable across reports: per-report line state is cleared in
-/// [`report_start`](Backend::report_start) while capacity is retained.
+/// Reusable across reports: per-report state is cleared in
+/// [`report_start`](Backend::report_start) while capacity is retained. All records for a report are
+/// written into a single `buffer`, separated by `\n`; `bounds` holds each record's end offset so
+/// chunking can yield datagrams as contiguous slices of `buffer` without copying.
 pub struct StatsdBackend<S> {
     sink: S,
     prefix: Option<String>,
     max_payload_size: usize,
     include_sparse: bool,
-    /// Accumulated lines for the in-progress report, flushed in `report_end`.
-    lines: Vec<String>,
+    /// All records for the in-progress report, `\n`-separated.
+    buffer: String,
+    /// End offset (exclusive) of each record in `buffer`. Record `i` spans
+    /// `[bounds[i-1] + 1, bounds[i])` (or `[0, bounds[0])` for `i == 0`); the byte at each
+    /// `bounds[i-1]` is the `\n` separator.
+    bounds: Vec<usize>,
 }
 
 impl<S> StatsdBackend<S> {
@@ -55,34 +65,44 @@ impl<S> StatsdBackend<S> {
             prefix,
             max_payload_size: DEFAULT_MAX_PAYLOAD_SIZE,
             include_sparse: false,
-            lines: Vec::new(),
+            buffer: String::new(),
+            bounds: Vec::new(),
         }
     }
 
-    /// Sets the maximum UDP payload size used when chunking lines into datagrams.
+    /// Sets the maximum UDP payload size used when chunking records into datagrams.
     pub fn with_max_payload_size(mut self, max_payload_size: usize) -> Self {
         self.max_payload_size = max_payload_size;
         self
     }
 
-    /// The fully-qualified, sanitized metric name (with the optional prefix applied).
-    fn metric_name(&self, name: &str) -> String {
-        with_prefix(name, self.prefix.as_deref())
+    /// Starts a new record: writes the `\n` separator (after the first) and the sanitized,
+    /// prefixed metric name plus `name_suffix`, returning the buffer for the caller to append the
+    /// value into. The matching [`end_record`](Self::end_record) records the boundary.
+    ///
+    /// Free-function-style field access (`&mut self.buffer` alongside `&self.prefix`) keeps the
+    /// borrows disjoint so we never allocate an intermediate name string.
+    fn begin_record(&mut self, name: &str, name_suffix: &str) -> &mut String {
+        if !self.buffer.is_empty() {
+            self.buffer.push('\n');
+        }
+        write_name(&mut self.buffer, self.prefix.as_deref(), name);
+        self.buffer.push_str(name_suffix);
+        &mut self.buffer
     }
 
-    /// The `|#variant:...` tag for an aggregation string, or empty when there is none.
-    fn variant_tag(aggregation: Option<&str>) -> String {
-        match aggregation {
-            Some(agg) => format!("|#variant:{}", sanitize(agg)),
-            None => String::new(),
-        }
+    /// Finishes the current record: appends the optional `|#variant:` tag and records the boundary.
+    fn end_record(&mut self, aggregation: Option<&str>) {
+        write_tag(&mut self.buffer, aggregation);
+        self.bounds.push(self.buffer.len());
     }
 }
 
 impl<S: StatsdSink> Backend for StatsdBackend<S> {
     fn report_start(&mut self, options: &ReportOptions) {
-        // Retain capacity across reports (the backend is long-lived).
-        self.lines.clear();
+        // Clear retains the allocated capacity (the backend is long-lived).
+        self.buffer.clear();
+        self.bounds.clear();
         self.include_sparse = options.include_sparse;
     }
 
@@ -92,9 +112,8 @@ impl<S: StatsdSink> Backend for StatsdBackend<S> {
         if value == 0 && !self.include_sparse {
             return;
         }
-        let metric = self.metric_name(info.name);
-        let tag = Self::variant_tag(info.aggregation);
-        self.lines.push(format!("{metric}:{value}|c{tag}"));
+        write!(self.begin_record(info.name, ":"), "{value}|c").unwrap();
+        self.end_record(info.aggregation);
     }
 
     fn record_gauge(&mut self, info: &MetricInfo<'_>, value: i64) {
@@ -103,9 +122,8 @@ impl<S: StatsdSink> Backend for StatsdBackend<S> {
         if value == 0 && (info.zero_suppressed || !self.include_sparse) {
             return;
         }
-        let metric = self.metric_name(info.name);
-        let tag = Self::variant_tag(info.aggregation);
-        self.lines.push(format!("{metric}:{value}|g{tag}"));
+        write!(self.begin_record(info.name, ":"), "{value}|g").unwrap();
+        self.end_record(info.aggregation);
     }
 
     fn record_bool(&mut self, info: &MetricInfo<'_>, true_count: u64, false_count: u64) {
@@ -113,35 +131,44 @@ impl<S: StatsdSink> Backend for StatsdBackend<S> {
         if (true_count, false_count) == (0, 0) {
             return;
         }
-        let metric = self.metric_name(info.name);
-        let tag = Self::variant_tag(info.aggregation);
-        self.lines
-            .push(format!("{metric}.true:{true_count}|c{tag}"));
-        self.lines
-            .push(format!("{metric}.false:{false_count}|c{tag}"));
+        write!(self.begin_record(info.name, ".true:"), "{true_count}|c").unwrap();
+        self.end_record(info.aggregation);
+        write!(self.begin_record(info.name, ".false:"), "{false_count}|c").unwrap();
+        self.end_record(info.aggregation);
     }
 
     fn record_histogram(&mut self, info: &MetricInfo<'_>, hist: Histogram<'_>) {
         if hist.count() == 0 {
             return;
         }
-        let metric = self.metric_name(info.name);
-        let tag = Self::variant_tag(info.aggregation);
         let unit = hist.unit();
 
         // Histogram bucket values are the native recorded magnitude: nanoseconds for time units
         // (record_duration stores `as_nanos`), bytes/counts as-is, and percents scaled by
         // FLOAT_INT_MULTIPLIER. `statsd_value` maps each to a sensible StatsD integer.
-        let count = hist.count();
-        self.lines.push(format!("{metric}.count:{count}|c{tag}"));
-        self.lines
-            .push(format!("{metric}.min:{}|g{tag}", statsd_value(hist.min(), unit)));
+        write!(self.begin_record(info.name, ".count:"), "{}|c", hist.count()).unwrap();
+        self.end_record(info.aggregation);
+        write!(
+            self.begin_record(info.name, ".min:"),
+            "{}|g",
+            statsd_value(hist.min(), unit)
+        )
+        .unwrap();
+        self.end_record(info.aggregation);
         for pct in HISTOGRAM_PERCENTILES {
             let value = statsd_value(hist.quantile(pct as f64 / 100.0), unit);
-            self.lines.push(format!("{metric}.p{pct}:{value}|g{tag}"));
+            // Write the name, then the `.p{pct}:` label and value directly into the buffer.
+            let out = self.begin_record(info.name, ".p");
+            write!(out, "{pct}:{value}|g").unwrap();
+            self.end_record(info.aggregation);
         }
-        self.lines
-            .push(format!("{metric}.max:{}|g{tag}", statsd_value(hist.max(), unit)));
+        write!(
+            self.begin_record(info.name, ".max:"),
+            "{}|g",
+            statsd_value(hist.max(), unit)
+        )
+        .unwrap();
+        self.end_record(info.aggregation);
     }
 
     fn record_callback(&mut self, info: &MetricInfo<'_>, values: &[&dyn CallbackValue]) {
@@ -162,19 +189,18 @@ impl<S: StatsdSink> Backend for StatsdBackend<S> {
         if sum == 0.0 && (info.zero_suppressed || !self.include_sparse) {
             return;
         }
-        let metric = self.metric_name(info.name);
-        let tag = Self::variant_tag(info.aggregation);
-        self.lines.push(format!("{metric}:{sum}|g{tag}"));
+        write!(self.begin_record(info.name, ":"), "{sum}|g").unwrap();
+        self.end_record(info.aggregation);
     }
 
     fn report_end(&mut self) {
-        if self.lines.is_empty() {
+        if self.bounds.is_empty() {
             return;
         }
-        let payloads = chunk_lines(&self.lines, self.max_payload_size);
-        if !payloads.is_empty() {
-            self.sink.send_batch(payloads);
-        }
+        // Chunk the records (delimited by `bounds`) into datagram-sized `&str` slices of `buffer`,
+        // and hand them to the sink without copying.
+        let chunks = Chunks::new(&self.buffer, &self.bounds, self.max_payload_size);
+        self.sink.send_batch(chunks);
     }
 }
 
@@ -192,74 +218,122 @@ fn statsd_value(value: u64, unit: Unit) -> u64 {
     }
 }
 
-/// Sanitizes a metric name for StatsD: `[a-zA-Z0-9_.-]` is preserved, `:` becomes `.`, everything
-/// else becomes `_`.
-fn sanitize(input: &str) -> String {
-    let mut output = String::with_capacity(input.len());
+/// Appends the sanitized, prefixed metric name to `out`.
+///
+/// Sanitization: `[a-zA-Z0-9_.-]` is preserved, `:` becomes `.`, everything else becomes `_`.
+fn write_name(out: &mut String, prefix: Option<&str>, name: &str) {
+    if let Some(prefix) = prefix.filter(|p| !p.is_empty()) {
+        let before = out.len();
+        write_sanitized(out, prefix);
+        // Only add the separating `.` if the prefix produced something.
+        if out.len() != before {
+            out.push('.');
+        }
+    }
+    write_sanitized(out, name);
+}
+
+/// Appends the `|#variant:{aggregation}` tag to `out`, if there is an aggregation.
+fn write_tag(out: &mut String, aggregation: Option<&str>) {
+    if let Some(agg) = aggregation {
+        out.push_str("|#variant:");
+        write_sanitized(out, agg);
+    }
+}
+
+/// Appends `input` to `out`, sanitized for StatsD (see [`write_name`]).
+fn write_sanitized(out: &mut String, input: &str) {
+    out.reserve(input.len());
     for c in input.chars() {
-        output.push(match c {
+        out.push(match c {
             'a'..='z' | 'A'..='Z' | '0'..='9' | '_' | '.' | '-' => c,
             ':' => '.',
             _ => '_',
         });
     }
-    output
 }
 
-fn with_prefix(name: &str, prefix: Option<&str>) -> String {
-    match prefix.filter(|p| !p.is_empty()) {
-        Some(prefix) => {
-            let prefix = sanitize(prefix);
-            if prefix.is_empty() {
-                sanitize(name)
-            } else {
-                format!("{prefix}.{}", sanitize(name))
-            }
-        }
-        None => sanitize(name),
-    }
-}
-
-/// Batches StatsD lines into newline-delimited UDP payloads up to `max_payload_size`.
+/// Iterator over datagram-sized `&str` slices of a record buffer.
 ///
-/// Lines longer than `max_payload_size` are dropped (they cannot fit a datagram). A
-/// `max_payload_size` of 0 drops everything.
-fn chunk_lines(lines: &[String], max_payload_size: usize) -> Vec<Vec<u8>> {
-    if max_payload_size == 0 {
-        return Vec::new();
+/// Records are already `\n`-separated in `buffer` and delimited by `bounds` (each entry is a
+/// record's end offset). A datagram is a maximal run of whole records whose byte length fits in
+/// `max_payload_size`; because records are contiguous and newline-joined in `buffer`, each datagram
+/// is just a sub-slice of `buffer` — no copying. Records longer than `max_payload_size` (which
+/// cannot fit a datagram) are skipped.
+struct Chunks<'a> {
+    buffer: &'a str,
+    bounds: &'a [usize],
+    max_payload_size: usize,
+    /// Index into `bounds` of the next record to consider.
+    next: usize,
+}
+
+impl<'a> Chunks<'a> {
+    fn new(buffer: &'a str, bounds: &'a [usize], max_payload_size: usize) -> Self {
+        Self {
+            buffer,
+            bounds,
+            max_payload_size,
+            next: 0,
+        }
     }
 
-    let mut payloads = Vec::new();
-    let mut current: Vec<u8> = Vec::new();
-
-    for line in lines {
-        let bytes = line.as_bytes();
-        if bytes.len() > max_payload_size {
-            // Cannot fit in a single datagram; skip.
-            continue;
-        }
-
-        let required = if current.is_empty() {
-            bytes.len()
-        } else {
-            current.len() + 1 + bytes.len()
-        };
-
-        if required > max_payload_size && !current.is_empty() {
-            payloads.push(std::mem::take(&mut current));
-        }
-
-        if !current.is_empty() {
-            current.push(b'\n');
-        }
-        current.extend_from_slice(bytes);
+    /// The byte range `[start, end)` of record `i` in `buffer` (excluding its leading separator).
+    fn record_range(&self, i: usize) -> (usize, usize) {
+        // Record 0 starts at 0; record i (>0) starts one byte after the previous record's end
+        // (skipping the `\n` separator).
+        let start = if i == 0 { 0 } else { self.bounds[i - 1] + 1 };
+        (start, self.bounds[i])
     }
+}
 
-    if !current.is_empty() {
-        payloads.push(current);
+impl<'a> Iterator for Chunks<'a> {
+    type Item = &'a str;
+
+    fn next(&mut self) -> Option<&'a str> {
+        if self.max_payload_size == 0 {
+            return None;
+        }
+
+        // Skip records that can't fit a datagram on their own. This should not happen in practice:
+        // records are short (`prefix.name.suffix:value|c|#variant:agg`) against a ~1200 byte
+        // default, so an oversized record means a misconfiguration (tiny payload size or a
+        // pathologically long metric name). Such records are silently dropped — like the previous
+        // implementation, which also dropped them (it surfaced a dropped-count the reporter logged;
+        // that diagnostic is not reproduced here to keep this crate free of a logging dependency).
+        while self.next < self.bounds.len() {
+            let (start, end) = self.record_range(self.next);
+            if end - start <= self.max_payload_size {
+                break;
+            }
+            self.next += 1;
+        }
+        if self.next >= self.bounds.len() {
+            return None;
+        }
+
+        // Greedily extend the datagram with whole records (joined by their existing `\n`) while it
+        // fits. `datagram_start` is the first record's start; the datagram spans to the last
+        // included record's end.
+        let (datagram_start, mut datagram_end) = self.record_range(self.next);
+        self.next += 1;
+        while self.next < self.bounds.len() {
+            let (start, end) = self.record_range(self.next);
+            if end - start > self.max_payload_size {
+                // This record can't fit anywhere; let the next iteration's skip-loop drop it.
+                break;
+            }
+            // Including it means spanning from datagram_start..end, which absorbs the `\n` at
+            // `datagram_end` (== start - 1) for free.
+            if end - datagram_start > self.max_payload_size {
+                break;
+            }
+            datagram_end = end;
+            self.next += 1;
+        }
+
+        Some(&self.buffer[datagram_start..datagram_end])
     }
-
-    payloads
 }
 
 #[cfg(test)]
@@ -269,30 +343,30 @@ mod test {
     use std::sync::{Arc, Mutex};
 
     #[derive(Clone, Default)]
-    struct CaptureSink(Arc<Mutex<Vec<Vec<u8>>>>);
+    struct CaptureSink(Arc<Mutex<Vec<String>>>);
 
     impl CaptureSink {
-        fn payloads(&self) -> Vec<Vec<u8>> {
+        /// The datagrams sent, each a complete newline-joined UDP payload.
+        fn datagrams(&self) -> Vec<String> {
             self.0.lock().unwrap().clone()
         }
 
+        /// All individual records across all datagrams.
         fn lines(&self) -> Vec<String> {
-            self.payloads()
+            self.datagrams()
                 .iter()
-                .flat_map(|p| {
-                    String::from_utf8(p.clone())
-                        .unwrap()
-                        .split('\n')
-                        .map(str::to_string)
-                        .collect::<Vec<_>>()
-                })
+                .flat_map(|d| d.split('\n').map(str::to_string).collect::<Vec<_>>())
                 .collect()
         }
     }
 
     impl StatsdSink for CaptureSink {
-        fn send_batch(&mut self, payloads: Vec<Vec<u8>>) {
-            self.0.lock().unwrap().extend(payloads);
+        fn send_batch<'a>(&mut self, payloads: impl Iterator<Item = &'a str>) {
+            // Copy the borrowed slices into owned Strings (the slices are only valid for the call).
+            self.0
+                .lock()
+                .unwrap()
+                .extend(payloads.map(str::to_string));
         }
     }
 
@@ -390,24 +464,44 @@ mod test {
         let hist = Histogram::new(&buckets, &cfg, Unit::Count);
         backend.record_histogram(&info("h", None, Unit::Count, MetricKind::Histogram), hist);
         backend.report_end();
-        assert!(sink.payloads().is_empty());
+        assert!(sink.datagrams().is_empty());
     }
 
+    /// Drives the `Chunks` iterator directly over a hand-built buffer + bounds, exercising packing,
+    /// the oversized-record skip, and the zero-size case.
     #[test]
-    fn chunking_splits_and_drops_oversized() {
-        let lines = vec!["aaaa".to_string(), "bbbb".to_string(), "toolong".to_string()];
-        // max 9 fits "aaaa\nbbbb" (9 bytes); "toolong" (7) fits alone in a new payload.
-        let payloads = chunk_lines(&lines, 9);
-        assert_eq!(payloads.len(), 2);
-        assert_eq!(payloads[0], b"aaaa\nbbbb");
-        assert_eq!(payloads[1], b"toolong");
+    fn chunks_pack_records_and_skip_oversized() {
+        // Three records "aaaa", "bbbb", "toolong" laid out newline-separated as the backend would.
+        // Offsets: aaaa=0..4, '\n'@4, bbbb=5..9, '\n'@9, toolong=10..17. Bounds are record ends.
+        let buffer = "aaaa\nbbbb\ntoolong";
+        let bounds = vec![4usize, 9, 17];
 
-        // a line longer than the limit is dropped
-        let payloads = chunk_lines(&["waytoolongline".to_string()], 5);
-        assert!(payloads.is_empty());
+        // max 9 fits "aaaa\nbbbb" (9 bytes); "toolong" (7) fits alone in the next datagram.
+        let chunks: Vec<&str> = Chunks::new(buffer, &bounds, 9).collect();
+        assert_eq!(chunks, vec!["aaaa\nbbbb", "toolong"]);
 
-        // zero size drops everything
-        assert!(chunk_lines(&lines, 0).is_empty());
+        // A record longer than the limit is skipped entirely.
+        let buffer2 = "waytoolongline";
+        let bounds2 = vec![14usize];
+        assert_eq!(Chunks::new(buffer2, &bounds2, 5).count(), 0);
+
+        // Zero size drops everything.
+        assert_eq!(Chunks::new(buffer, &bounds, 0).count(), 0);
+
+        // Each record alone when the limit only fits one at a time.
+        let chunks: Vec<&str> = Chunks::new(buffer, &bounds, 7).collect();
+        assert_eq!(chunks, vec!["aaaa", "bbbb", "toolong"]);
+
+        // A huge limit packs everything into one datagram (separators included).
+        let chunks: Vec<&str> = Chunks::new(buffer, &bounds, 1000).collect();
+        assert_eq!(chunks, vec!["aaaa\nbbbb\ntoolong"]);
+
+        // An oversized record in the middle is skipped while neighbors still pack.
+        // "aa"=0..2, '\n'@2, "huge"=3..7, '\n'@7, "bb"=8..10
+        let buffer = "aa\nhuge\nbb";
+        let bounds = vec![2usize, 7, 10];
+        let chunks: Vec<&str> = Chunks::new(buffer, &bounds, 3).collect();
+        assert_eq!(chunks, vec!["aa", "bb"]);
     }
 
     #[test]
@@ -419,7 +513,7 @@ mod test {
         backend.record_counter(&info("c", None, Unit::Count, MetricKind::Counter), 0);
         backend.record_bool(&info("b", None, Unit::Count, MetricKind::BoolCounter), 0, 0);
         backend.report_end();
-        assert!(sink.payloads().is_empty());
+        assert!(sink.datagrams().is_empty());
 
         // Sparse: the zero counter emits (bool all-zero is always suppressed).
         let sink = CaptureSink::default();
