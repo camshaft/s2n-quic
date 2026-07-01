@@ -494,11 +494,18 @@ mod tests {
             sender.send(()).expect("channel send failed");
         });
 
+        // The channel receive proves the parked worker woke and ran the spawned task: a sleeping
+        // worker cannot poll, so the send only happens after the spawn woke it.
         receiver.recv_timeout(Duration::from_secs(1)).unwrap();
-        let awake = wait_until(Duration::from_secs(1), || {
-            !handle.heartbeat.sleeping.load(Ordering::Relaxed)
+
+        // Confirm the worker actually left the park and drove a poll cycle. The heartbeat counter
+        // is monotonic and only advances inside `poll`, so this is a stable signal — unlike reading
+        // the transient `sleeping` flag, which the worker clears and re-sets around the (instant)
+        // task and a fast machine can miss.
+        let progressed = wait_until(Duration::from_secs(1), || {
+            handle.heartbeat.counter.load(Ordering::Relaxed) > 0
         });
-        assert!(awake);
+        assert!(progressed);
         drop(handle);
         worker.join().unwrap();
     }
