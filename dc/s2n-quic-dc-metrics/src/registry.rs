@@ -91,6 +91,34 @@ impl RegistryInner {
         backend.report_end();
     }
 
+    /// Snapshots the shape of every registered metric without touching its value. See
+    /// [`Registry::descriptors`].
+    ///
+    /// Unlike [`report`](Self::report), this reads no per-CPU pages, invokes no callbacks, and
+    /// drains nothing: it walks the metric map and copies each entry's static metadata. The kind and
+    /// unit are derived identically to the report path, so a descriptor describes exactly the
+    /// [`MetricInfo`] a backend would see for that metric.
+    pub fn descriptors(&self) -> Vec<MetricDescriptor> {
+        self.metrics
+            .iter()
+            .map(|(key, entry)| {
+                let (kind, unit) = match &entry.value {
+                    MetricValue::Counter(_) => (MetricKind::Counter, Unit::Count),
+                    MetricValue::Summary(s) => (MetricKind::Histogram, s.display_unit()),
+                    MetricValue::BoolCounter(_) => (MetricKind::BoolCounter, Unit::Count),
+                    MetricValue::ValueList(c) => (MetricKind::CallbackScalar, c.unit()),
+                };
+                MetricDescriptor {
+                    name: key.name.clone(),
+                    aggregation: key.aggregation.clone(),
+                    kind,
+                    unit,
+                    sparsity: entry.sparsity,
+                }
+            })
+            .collect()
+    }
+
     /// Folds any buffered per-CPU pages into the aggregate without draining or reporting. See
     /// [`Registry::absorb`].
     pub fn absorb(&self) {
@@ -558,6 +586,27 @@ impl Registry {
             .absorb();
     }
 
+    /// Returns a [`MetricDescriptor`] for every metric registered so far, in the registry's stable
+    /// `(name, aggregation)` order, without recording, draining, or invoking any callback.
+    ///
+    /// This is the introspection counterpart to [`report`](Self::report): where a report observes
+    /// metric *values*, this observes their *shape* — the exact name a backend emits (prefix
+    /// already applied), the aggregation/variant string, the [`MetricKind`], the display [`Unit`],
+    /// and the [`Sparsity`] policy. It lets a consumer enumerate the full catalog of what has been
+    /// registered — to document it, validate it against an expected set, export a schema, or drive
+    /// code generation — without scraping a reported line and without perturbing any value.
+    ///
+    /// Because a metric only appears once it has been registered, call this after the endpoint (or
+    /// whatever owns the metrics) has performed its registrations. Nominal metrics that share a name
+    /// across variants appear as one descriptor per `(name, aggregation)` pair, mirroring how they
+    /// are stored and reported.
+    pub fn descriptors(&self) -> Vec<MetricDescriptor> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .descriptors()
+    }
+
     /// Returns `true` if the registry is open
     pub fn is_open(&self) -> bool {
         self.inner.lock().is_ok_and(|inner| inner.is_open)
@@ -654,6 +703,45 @@ impl<'a> MetricBuilder<'a> {
             self.sparsity,
             callback,
         );
+    }
+}
+
+/// A read-only description of one registered metric, produced by [`Registry::descriptors`].
+///
+/// This is the static shape a backend sees for the metric — its emitted name (with any child
+/// prefix already applied), aggregation/variant string, [`MetricKind`], display [`Unit`], and
+/// [`Sparsity`] — captured without recording or draining any value. It exists so the set of
+/// registered metrics can be inspected (documented, validated, exported as a schema, or used to
+/// drive code generation) independently of any reported value.
+///
+/// `#[non_exhaustive]`: further shape metadata (e.g. structured variant data) may be added, so this
+/// is constructed only by the crate and matched with a `..` rest pattern by consumers.
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub struct MetricDescriptor {
+    /// The emitted metric name (e.g. `rx.data`), including any [`child`](Registry::child) prefix.
+    pub name: Arc<str>,
+    /// The aggregation/variant string, if any (e.g. `Variant|ect0`, `Task|foo`).
+    pub aggregation: Option<Arc<str>>,
+    /// The kind of metric a backend would record it as.
+    pub kind: MetricKind,
+    /// The display unit.
+    pub unit: Unit,
+    /// The per-metric sparse policy.
+    pub sparsity: Sparsity,
+}
+
+impl MetricDescriptor {
+    /// The variant name for a nominal metric, i.e. the part after `Variant|` in the aggregation
+    /// (`Variant|ect0` yields `ect0`), or `None` for a non-nominal metric or a differently-tagged
+    /// aggregation (`Task|`, `Runtime|`).
+    ///
+    /// Nominal metrics share one `name` across several variants; this recovers the per-variant
+    /// discriminator a structured catalog keys on.
+    pub fn variant(&self) -> Option<&str> {
+        self.aggregation
+            .as_deref()
+            .and_then(|a| a.strip_prefix("Variant|"))
     }
 }
 
@@ -896,6 +984,116 @@ mod test {
             .increment(2);
 
         assert_eq!(registry.take_current_metrics_line(), "a.b.m=1,n=2");
+    }
+
+    /// `descriptors` snapshots the shape of every registered metric — name (prefix applied),
+    /// aggregation, kind, unit, sparsity — in stable `(name, aggregation)` order, without recording
+    /// or draining any value and without invoking callbacks.
+    #[test]
+    fn descriptors_snapshots_every_metric_shape() {
+        let registry = Registry::new();
+
+        let counter = registry.register_counter("rx.data".into(), None);
+        registry.register_counter("rx.ecn".into(), Some("Variant|ect0".into()));
+        registry.register_counter("rx.ecn".into(), Some("Variant|ect1".into()));
+        registry.register_bool("connect".into(), None);
+        registry.register_summary("rx.decrypt_time".into(), None, Unit::Microsecond);
+
+        // Snapshotting a descriptor must never invoke the callback; a report is what evaluates it.
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls_cb = calls.clone();
+        registry
+            .metric("q.depth")
+            .sparse()
+            .list_callback(Unit::Byte, move || {
+                calls_cb.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                0i64
+            });
+
+        // Record into a metric first: descriptors describe shape, not value, and must not drain it.
+        counter.increment(42);
+
+        let descriptors = registry.descriptors();
+        let shapes: Vec<_> = descriptors
+            .iter()
+            .map(|d| (&*d.name, d.variant(), d.kind, d.unit, d.sparsity))
+            .collect();
+
+        assert_eq!(
+            shapes,
+            vec![
+                (
+                    "connect",
+                    None,
+                    MetricKind::BoolCounter,
+                    Unit::Count,
+                    Sparsity::Inherit
+                ),
+                (
+                    "q.depth",
+                    None,
+                    MetricKind::CallbackScalar,
+                    Unit::Byte,
+                    Sparsity::AlwaysSparse
+                ),
+                (
+                    "rx.data",
+                    None,
+                    MetricKind::Counter,
+                    Unit::Count,
+                    Sparsity::Inherit
+                ),
+                (
+                    "rx.decrypt_time",
+                    None,
+                    MetricKind::Histogram,
+                    Unit::Microsecond,
+                    Sparsity::Inherit
+                ),
+                (
+                    "rx.ecn",
+                    Some("ect0"),
+                    MetricKind::Counter,
+                    Unit::Count,
+                    Sparsity::Inherit
+                ),
+                (
+                    "rx.ecn",
+                    Some("ect1"),
+                    MetricKind::Counter,
+                    Unit::Count,
+                    Sparsity::Inherit
+                ),
+            ]
+        );
+
+        // Snapshotting the shape never evaluated the callback.
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 0);
+
+        // Introspection is non-destructive: rx.data retains its 42 in a subsequent sparse report.
+        // (The all-zero bool and the sparse zero gauge are dropped even under a sparse report.)
+        assert_eq!(
+            registry.take_current_metrics_line(),
+            "rx.data=42,rx.decrypt_time=0 us,rx.ecn=0 Variant|ect0,rx.ecn=0 Variant|ect1"
+        );
+    }
+
+    /// A child registry's prefix is applied to the descriptor name, exactly as it is to the emitted
+    /// name — so a generated catalog matches what the backend emits.
+    #[test]
+    fn descriptors_apply_child_prefix() {
+        let parent = Registry::new();
+        parent.register_counter("rx.data".into(), None);
+        parent
+            .child("myapp")
+            .register_counter("tx.data".into(), None);
+
+        let names: Vec<_> = parent
+            .descriptors()
+            .iter()
+            .map(|d| d.name.to_string())
+            .collect();
+        assert_eq!(names, vec!["myapp.tx.data", "rx.data"]);
     }
 
     /// The builder's `aggregation` flows through to the reported line.
