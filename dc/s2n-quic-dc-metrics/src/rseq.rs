@@ -14,12 +14,22 @@ use std::{
 #[cfg(target_os = "linux")]
 use std::{cell::Cell, ffi::CStr, ptr::NonNull};
 
-// Sized so the whole `Page` is exactly 64 KiB (a power of two): 8192 u64-sized words, minus one
-// each for the trailing `length` and `next` fields. Keeping the allocation power-of-two-sized
-// avoids the dead alignment padding an over-a-boundary struct would carry (the page previously
-// spilled past 64 KiB when the intrusive-stack `next` field was added) and keeps it friendly to the
-// allocator's size classes.
-const SLOTS: usize = 1024 * 8 - 2;
+/// The fixed size of a whole [`Page`], including the trailing `length` and `next` fields. A power
+/// of two keeps it friendly to the allocator's size classes and free of the dead alignment padding
+/// an over-a-boundary struct would carry (the page spilled past this when the intrusive-stack
+/// `next` field was added).
+const PAGE_SIZE: usize = 64 * 1024;
+
+/// Number of event slots per [`Page`], derived so `slots` plus the trailing `length` and `next`
+/// fields fill [`PAGE_SIZE`] exactly. `next` is a pointer, so its width — and hence the slot count —
+/// varies by target; we fix the *page size* and let the slot count adapt, rather than the reverse
+/// (which would leave a 32-bit page over- or under-sized). Integer division floors, so on a target
+/// whose pointer is narrower than a `u64` the few leftover bytes become padding the `align(128)`
+/// rounding would absorb anyway.
+const SLOTS: usize = (PAGE_SIZE
+    - std::mem::size_of::<AtomicU64>()
+    - std::mem::size_of::<*mut Page>())
+    / std::mem::size_of::<u64>();
 
 #[repr(C, align(128))]
 struct Page {
@@ -29,9 +39,9 @@ struct Page {
     next: *mut Page,
 }
 
-// Lock in the exact 64 KiB page size so a future field addition can't silently reintroduce the
-// alignment padding (adjust `SLOTS` to compensate instead).
-const _: () = assert!(std::mem::size_of::<Page>() == 64 * 1024);
+// Lock in the exact page size so a future field addition can't silently push the struct over a
+// boundary and reintroduce alignment padding (adjust the slot derivation to compensate instead).
+const _: () = assert!(std::mem::size_of::<Page>() == PAGE_SIZE);
 
 #[cfg(target_os = "linux")]
 impl Page {
