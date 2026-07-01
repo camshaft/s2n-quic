@@ -22,13 +22,15 @@ use std::{
     },
 };
 
-#[cfg(feature = "arrow")]
+#[cfg(any(test, feature = "arrow"))]
 mod arrow;
+mod prometheus;
 mod querylog;
 mod statsd;
 
-#[cfg(feature = "arrow")]
+#[cfg(any(test, feature = "arrow"))]
 pub use arrow::{schema as arrow_schema, ArrowBackend};
+pub use prometheus::{PrometheusBackend, PrometheusHandle};
 pub use querylog::QuerylogBackend;
 pub use statsd::{StatsdBackend, StatsdSink, DEFAULT_MAX_PAYLOAD_SIZE};
 
@@ -761,8 +763,10 @@ mod test {
 
     #[test]
     fn vec_of_backends_fans_out_to_every_entry() {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        use std::sync::Arc;
+        use std::sync::{
+            atomic::{AtomicU64, Ordering},
+            Arc,
+        };
 
         // A backend that adds every counter value into a shared tally, so we can confirm each Vec
         // entry was invoked (no silent overwrite).

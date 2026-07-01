@@ -38,4 +38,5 @@ path = "benches/main.rs"
 harness = false
 
 [dev-dependencies]
+arrow = { version = "54", default-features = false }
 criterion = "0.8"
