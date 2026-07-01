@@ -104,14 +104,31 @@ impl PrometheusBackend {
         )
     }
 
-    /// Looks up (or creates) the family for `info`, sanitizing the name and applying the prefix.
+    /// The sanitized, prefixed family name for `info`.
+    fn family_name(&self, info: &MetricInfo<'_>) -> String {
+        let mut name = String::new();
+        write_name(&mut name, self.prefix.as_deref(), info.name);
+        name
+    }
+
+    /// Whether a series is already retained under `name`/`key`.
+    ///
+    /// Used to decide suppression *without* materializing the family: `Registry::report` visits
+    /// every registered metric every interval (zeros included), so inserting on the suppressed path
+    /// would grow `families` to hold every metric name forever, defeating zero-suppression.
+    fn series_present(&self, name: &str, key: &str) -> bool {
+        self.families
+            .get(name)
+            .is_some_and(|f| f.series.contains_key(key))
+    }
+
+    /// Looks up (or creates) the family for the given sanitized `name`.
     ///
     /// The unit and kind are taken from the first record for a given name; a name is assumed to have
     /// a single kind across all its aggregations (as every call site registers it), matching the
-    /// per-family `# TYPE` requirement of the exposition format.
-    fn family_mut(&mut self, info: &MetricInfo<'_>) -> &mut Family {
-        let mut name = String::new();
-        write_name(&mut name, self.prefix.as_deref(), info.name);
+    /// per-family `# TYPE` requirement of the exposition format. Call only once the record has been
+    /// decided to be retained, so a suppressed metric never inserts an empty family.
+    fn family_or_insert(&mut self, name: String, info: &MetricInfo<'_>) -> &mut Family {
         self.families.entry(name).or_insert_with(|| Family {
             kind: info.kind,
             unit: info.unit,
@@ -154,11 +171,14 @@ impl Backend for PrometheusBackend {
         // retained and keeps rendering its cumulative total, even when a later delta is zero, so the
         // time series has no gaps.
         let key = info.aggregation.unwrap_or("");
-        let include_sparse = self.include_sparse;
-        let family = self.family_mut(info);
-        if value == 0 && !include_sparse && !family.series.contains_key(key) {
+        let name = self.family_name(info);
+        // Suppress a counter that has never been non-zero, without materializing its family (see
+        // `series_present`): the registry re-visits every metric each interval, so inserting here
+        // would leak an empty family per zero-only metric.
+        if value == 0 && !self.include_sparse && !self.series_present(&name, key) {
             return;
         }
+        let family = self.family_or_insert(name, info);
         match family
             .series
             .entry(key.to_string())
@@ -170,26 +190,28 @@ impl Backend for PrometheusBackend {
     }
 
     fn record_gauge(&mut self, info: &MetricInfo<'_>, value: i64) {
-        if value == 0 && (info.zero_suppressed || !self.include_sparse) {
-            let key = info.aggregation.unwrap_or("");
-            if !self.family_mut(info).series.contains_key(key) {
-                return;
-            }
+        let key = info.aggregation.unwrap_or("");
+        let name = self.family_name(info);
+        if value == 0
+            && (info.zero_suppressed || !self.include_sparse)
+            && !self.series_present(&name, key)
+        {
+            return;
         }
-        let key = info.aggregation.unwrap_or("").to_string();
-        let family = self.family_mut(info);
+        let key = key.to_string();
+        let family = self.family_or_insert(name, info);
         *family.series.entry(key).or_insert(Series::Gauge(0.0)) = Series::Gauge(value as f64);
     }
 
     fn record_bool(&mut self, info: &MetricInfo<'_>, true_count: u64, false_count: u64) {
         // One counter family with a `result` label per side; each side accumulates like a counter.
-        let include_sparse = self.include_sparse;
+        let name = self.family_name(info);
         for (label, delta) in [("true", true_count), ("false", false_count)] {
             let key = bool_key(info.aggregation, label);
-            let family = self.family_mut(info);
-            if delta == 0 && !include_sparse && !family.series.contains_key(&key) {
+            if delta == 0 && !self.include_sparse && !self.series_present(&name, &key) {
                 continue;
             }
+            let family = self.family_or_insert(name.clone(), info);
             match family.series.entry(key).or_insert(Series::Counter(0)) {
                 Series::Counter(total) => *total += delta,
                 _ => unreachable!("bool family has non-counter series"),
@@ -200,12 +222,12 @@ impl Backend for PrometheusBackend {
     fn record_histogram(&mut self, info: &MetricInfo<'_>, hist: Histogram<'_>) {
         let key = info.aggregation.unwrap_or("");
         let unit = info.unit;
-        let include_sparse = self.include_sparse;
-        let family = self.family_mut(info);
-        if hist.count() == 0 && !include_sparse && !family.series.contains_key(key) {
+        let name = self.family_name(info);
+        if hist.count() == 0 && !self.include_sparse && !self.series_present(&name, key) {
             return;
         }
         let bounds = default_buckets(unit);
+        let family = self.family_or_insert(name, info);
         let series = family
             .series
             .entry(key.to_string())
@@ -237,14 +259,16 @@ impl Backend for PrometheusBackend {
             return;
         }
         let sum: f64 = values.iter().map(|v| v.as_f64()).sum();
-        if sum == 0.0 && (info.zero_suppressed || !self.include_sparse) {
-            let key = info.aggregation.unwrap_or("");
-            if !self.family_mut(info).series.contains_key(key) {
-                return;
-            }
+        let key = info.aggregation.unwrap_or("");
+        let name = self.family_name(info);
+        if sum == 0.0
+            && (info.zero_suppressed || !self.include_sparse)
+            && !self.series_present(&name, key)
+        {
+            return;
         }
-        let key = info.aggregation.unwrap_or("").to_string();
-        let family = self.family_mut(info);
+        let key = key.to_string();
+        let family = self.family_or_insert(name, info);
         *family.series.entry(key).or_insert(Series::Gauge(0.0)) = Series::Gauge(sum);
     }
 
@@ -496,16 +520,22 @@ fn fmt_f64(v: f64) -> String {
 /// Appends the sanitized, prefixed metric name to `out`.
 ///
 /// Sanitization keeps `[a-zA-Z0-9_:]` and maps everything else to `_`, matching the Prometheus
-/// metric-name grammar. A prefix, when non-empty, is joined to the name with `_`.
+/// metric-name grammar. A prefix, when non-empty, is joined to the name with `_`. The Prometheus
+/// grammar additionally forbids a leading digit (`[a-zA-Z_:][a-zA-Z0-9_:]*`), so a name that would
+/// begin with a digit is prefixed with `_`.
 fn write_name(out: &mut String, prefix: Option<&str>, name: &str) {
+    let start = out.len();
     if let Some(prefix) = prefix.filter(|p| !p.is_empty()) {
-        let before = out.len();
         write_sanitized_name(out, prefix);
-        if out.len() != before {
+        if out.len() != start {
             out.push('_');
         }
     }
     write_sanitized_name(out, name);
+    // A metric name must not start with a digit; guard the first character we wrote.
+    if out[start..].starts_with(|c: char| c.is_ascii_digit()) {
+        out.insert(start, '_');
+    }
 }
 
 /// Appends `input` to `out`, sanitized for a Prometheus metric name.
@@ -530,8 +560,12 @@ fn sanitize_label_name(input: &str) -> String {
             _ => '_',
         });
     }
-    // A label must not start with a digit.
-    if out.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+    // An empty input (e.g. an aggregation like `|value`) would emit an invalid `="value"` label;
+    // fall back to a generic name. A label also must not start with a digit.
+    if out.is_empty() {
+        return "aggregation".to_string();
+    }
+    if out.starts_with(|c: char| c.is_ascii_digit()) {
         out.insert(0, '_');
     }
     out
@@ -832,5 +866,70 @@ mod test {
         backend.record_counter(&info("c", None, Unit::Count, MetricKind::Counter), 1);
         backend.report_end();
         assert!(!handle.render().is_empty());
+    }
+
+    /// A suppressed (never-non-zero) metric must not leave an empty family behind: the registry
+    /// re-visits every metric each interval, so a leaked family per zero-only metric would grow
+    /// unbounded and defeat zero-suppression.
+    #[test]
+    fn suppressed_metric_does_not_retain_family() {
+        let (mut backend, handle) = PrometheusBackend::new(None);
+        // Many intervals of an always-zero counter under the normal (non-sparse) policy.
+        for _ in 0..5 {
+            backend.report_start(&ReportOptions::new(false));
+            backend.record_counter(&info("z", None, Unit::Count, MetricKind::Counter), 0);
+            backend.record_gauge(&info("g", None, Unit::Count, MetricKind::Gauge), 0);
+            backend.record_bool(&info("b", None, Unit::Count, MetricKind::BoolCounter), 0, 0);
+            backend.report_end();
+        }
+        // Nothing retained, nothing rendered.
+        assert!(
+            backend.families.is_empty(),
+            "leaked families: {:?}",
+            backend.families.keys().collect::<Vec<_>>()
+        );
+        assert_eq!(handle.render(), "");
+    }
+
+    /// A metric name (or prefix) that would begin with a digit must be prefixed with `_` so the
+    /// exposition identifier is valid.
+    #[test]
+    fn leading_digit_name_is_escaped() {
+        let (mut backend, handle) = PrometheusBackend::new(None);
+        backend.report_start(&ReportOptions::default());
+        backend.record_counter(&info("5xx", None, Unit::Count, MetricKind::Counter), 1);
+        backend.report_end();
+        let rendered = handle.render();
+        assert!(rendered.contains("# TYPE _5xx counter"), "{rendered}");
+        assert!(lines(&rendered).contains(&"_5xx 1"), "{rendered}");
+
+        // A digit-leading prefix is likewise guarded.
+        let (mut backend, handle) = PrometheusBackend::new(Some("9svc".into()));
+        backend.report_start(&ReportOptions::default());
+        backend.record_counter(&info("ok", None, Unit::Count, MetricKind::Counter), 1);
+        backend.report_end();
+        assert!(
+            lines(&handle.render()).contains(&"_9svc_ok 1"),
+            "{}",
+            handle.render()
+        );
+    }
+
+    /// An aggregation whose label-name half is empty (e.g. `|value`) must not emit an invalid
+    /// `="value"` label; it falls back to the generic `aggregation` name.
+    #[test]
+    fn empty_label_name_falls_back_to_generic() {
+        let (mut backend, handle) = PrometheusBackend::new(None);
+        backend.report_start(&ReportOptions::default());
+        backend.record_counter(
+            &info("m", Some("|value"), Unit::Count, MetricKind::Counter),
+            1,
+        );
+        backend.report_end();
+        assert!(
+            lines(&handle.render()).contains(&"m{aggregation=\"value\"} 1"),
+            "{}",
+            handle.render()
+        );
     }
 }
