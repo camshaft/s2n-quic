@@ -25,8 +25,14 @@ use std::{
 mod querylog;
 mod statsd;
 
+#[cfg(feature = "otel")]
+mod otel;
+
 pub use querylog::QuerylogBackend;
 pub use statsd::{StatsdBackend, StatsdSink, DEFAULT_MAX_PAYLOAD_SIZE};
+
+#[cfg(feature = "otel")]
+pub use otel::{OtlpBackend, OtlpSink};
 
 mod sealed {
     pub trait Sealed {}
