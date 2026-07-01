@@ -614,8 +614,7 @@ mod test {
     /// and the label columns follow the base columns in the schema.
     #[test]
     fn labels_add_constant_dictionary_columns() {
-        use arrow::array::DictionaryArray;
-        use arrow::datatypes::Int32Type;
+        use arrow::{array::DictionaryArray, datatypes::Int32Type};
 
         let registry = Registry::new();
         registry.register_counter("c".into(), None).increment(1);

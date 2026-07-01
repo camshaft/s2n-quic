@@ -26,10 +26,9 @@ const PAGE_SIZE: usize = 64 * 1024;
 /// (which would leave a 32-bit page over- or under-sized). Integer division floors, so on a target
 /// whose pointer is narrower than a `u64` the few leftover bytes become padding the `align(128)`
 /// rounding would absorb anyway.
-const SLOTS: usize = (PAGE_SIZE
-    - std::mem::size_of::<AtomicU64>()
-    - std::mem::size_of::<*mut Page>())
-    / std::mem::size_of::<u64>();
+const SLOTS: usize =
+    (PAGE_SIZE - std::mem::size_of::<AtomicU64>() - std::mem::size_of::<*mut Page>())
+        / std::mem::size_of::<u64>();
 
 #[repr(C, align(128))]
 struct Page {

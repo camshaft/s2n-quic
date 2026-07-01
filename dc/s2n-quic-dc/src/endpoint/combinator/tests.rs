@@ -316,16 +316,15 @@ fn try_send_pick_two_with_rr(
         rejected_counters.into();
     let mut senders_map: crate::endpoint::id::IdMap<crate::endpoint::id::LocalSenderId, _> =
         std::mem::take(senders).into();
-    let result =
-        PickTwo::<TestItem, TestReceiver<TestItem>, TestSender>::try_send_pick_two(
-            value,
-            &mut senders_map,
-            rng,
-            round_robin_idx,
-            &pick_counters_map,
-            &rejected_counters_map,
-            &score_delta,
-        );
+    let result = PickTwo::<TestItem, TestReceiver<TestItem>, TestSender>::try_send_pick_two(
+        value,
+        &mut senders_map,
+        rng,
+        round_robin_idx,
+        &pick_counters_map,
+        &rejected_counters_map,
+        &score_delta,
+    );
     *senders = senders_map.into_iter().map(|(_, v)| v).collect();
     result
 }

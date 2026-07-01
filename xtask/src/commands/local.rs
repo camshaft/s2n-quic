@@ -345,11 +345,7 @@ impl Local {
                     args.push("--frame-trace-interval".to_string());
                     args.push(secs.to_string());
                 }
-                args.extend([
-                    "client".to_string(),
-                    "--config".to_string(),
-                    config_path,
-                ]);
+                args.extend(["client".to_string(), "--config".to_string(), config_path]);
                 for addr in &server_addresses {
                     args.push("--server-addr".to_string());
                     args.push(addr.to_string());

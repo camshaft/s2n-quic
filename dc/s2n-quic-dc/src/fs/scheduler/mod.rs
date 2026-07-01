@@ -40,12 +40,7 @@ mod registrar;
 
 use crate::{
     counter::Registry,
-    fs::{
-        backend::Backend,
-        config::DeviceConfig,
-        device::Device,
-        op::IoOp,
-    },
+    fs::{backend::Backend, config::DeviceConfig, device::Device, op::IoOp},
     intrusive::Entry,
     runtime::Spawner,
     socket::channel::intrusive::sync as sync_chan,
@@ -186,7 +181,10 @@ impl DeviceRegistry {
         // Register each pool's gauges and collect them for the registrar (one distributor per pool).
         let mut pools = Vec::new();
         for (pool_idx, pool) in device.pools.all().enumerate() {
-            pool.register_gauges(&inner.registry, &format!("fs.credit.{label}.pool{pool_idx}"));
+            pool.register_gauges(
+                &inner.registry,
+                &format!("fs.credit.{label}.pool{pool_idx}"),
+            );
             pools.push(pool.clone());
         }
 

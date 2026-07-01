@@ -353,7 +353,11 @@ mod tests {
     /// Build a device registry, then register one device lazily — exercising the post-construction
     /// registration path the production setup uses. Returns the registry and the `Arc<Device>` to
     /// submit against (submit is now a method on the device itself).
-    fn build(spawn: &mut Local, registry: &Registry, capacity: u64) -> (DeviceRegistry, Arc<Device>) {
+    fn build(
+        spawn: &mut Local,
+        registry: &Registry,
+        capacity: u64,
+    ) -> (DeviceRegistry, Arc<Device>) {
         let reg = DeviceRegistry::new(SyscallBackend::default(), spawn, registry, clock());
         let device = reg.register_device("test", &byte_device(capacity)).unwrap();
         (reg, device)
@@ -418,22 +422,14 @@ mod tests {
 
                 let payload =
                     bytes::Bytes::from_static(b"the quick brown fox jumps over the lazy dog");
-                let n = dev.write(
-                        fd.clone(),
-                        0,
-                        payload.clone(),
-                        TierPriority::Medium,
-                    )
+                let n = dev
+                    .write(fd.clone(), 0, payload.clone(), TierPriority::Medium)
                     .await
                     .unwrap();
                 assert_eq!(n, payload.len());
 
-                let buf = dev.read(
-                        fd.clone(),
-                        0,
-                        payload.len() as u32,
-                        TierPriority::High,
-                    )
+                let buf = dev
+                    .read(fd.clone(), 0, payload.len() as u32, TierPriority::High)
                     .await
                     .unwrap();
                 assert_eq!(
@@ -488,7 +484,8 @@ mod tests {
                             let data = bytes::Bytes::from(vec![(w & 0xff) as u8; 256]);
                             // Each write is 256 bytes; with 4 KiB capacity at most 16 can be admitted
                             // at once, so the rest park on credit (never on a thread).
-                            if dev.write(fd.clone(), off, data, TierPriority::Medium)
+                            if dev
+                                .write(fd.clone(), off, data, TierPriority::Medium)
                                 .await
                                 .is_ok()
                             {
@@ -525,9 +522,7 @@ mod tests {
 
             // fd -1 is never valid: the pread fails with EBADF and must surface as Err promptly.
             let bad = crate::fs::op::Fd::new(Arc::new(BadFd));
-            let result = dev
-                .read(bad, 0, 4096, TierPriority::Medium)
-                .await;
+            let result = dev.read(bad, 0, 4096, TierPriority::Medium).await;
             assert!(result.is_err(), "read on a bad fd must fail, not hang");
 
             // Conservation holds on the failure path too.
@@ -766,7 +761,8 @@ mod tests {
             // them onto the surrounding `LocalSet`.
             let mut spawn = Local::new(0);
             let registry = Registry::default();
-            let reg = DeviceRegistry::new(SyscallBackend::default(), &mut spawn, &registry, clock());
+            let reg =
+                DeviceRegistry::new(SyscallBackend::default(), &mut spawn, &registry, clock());
             let dev = reg
                 .register_device("test", &byte_device(1 << 20).with_lane_count(4))
                 .unwrap();
@@ -784,7 +780,8 @@ mod tests {
                     for i in 0..per_task {
                         let off = (t as u64 * per_task + i) * 4096;
                         let data = bytes::Bytes::from(vec![(t & 0xff) as u8; 256]);
-                        if dev.write(fd.clone(), off, data, TierPriority::Medium)
+                        if dev
+                            .write(fd.clone(), off, data, TierPriority::Medium)
                             .await
                             .is_ok()
                         {

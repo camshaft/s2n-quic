@@ -920,33 +920,21 @@ mod tests {
         run_local(|mut spawn, registry| {
             let path = path.clone();
             async move {
-                let scheduler = DeviceRegistry::new(
-                        UringBackend::default(),
-                        &mut spawn,
-                        &registry,
-                        clock(),
-                    );
+                let scheduler =
+                    DeviceRegistry::new(UringBackend::default(), &mut spawn, &registry, clock());
                 let dev = scheduler
                     .register_device("test", &byte_device(1 << 20))
                     .unwrap();
 
                 let payload = bytes::Bytes::from_static(b"io_uring round trip payload");
-                let n = dev.write(
-                        fd.clone(),
-                        0,
-                        payload.clone(),
-                        TierPriority::Medium,
-                    )
+                let n = dev
+                    .write(fd.clone(), 0, payload.clone(), TierPriority::Medium)
                     .await
                     .unwrap();
                 assert_eq!(n, payload.len());
 
-                let buf = dev.read(
-                        fd.clone(),
-                        0,
-                        payload.len() as u32,
-                        TierPriority::High,
-                    )
+                let buf = dev
+                    .read(fd.clone(), 0, payload.len() as u32, TierPriority::High)
                     .await
                     .unwrap();
                 assert_eq!(&buf[..], &payload[..]);
@@ -977,12 +965,8 @@ mod tests {
         run_local(|mut spawn, registry| {
             let path = path.clone();
             async move {
-                let scheduler = DeviceRegistry::new(
-                        UringBackend::default(),
-                        &mut spawn,
-                        &registry,
-                        clock(),
-                    );
+                let scheduler =
+                    DeviceRegistry::new(UringBackend::default(), &mut spawn, &registry, clock());
                 let dev = scheduler
                     .register_device("test", &byte_device(4096))
                     .unwrap();
@@ -996,7 +980,8 @@ mod tests {
                         for i in 0..4u64 {
                             let off = (w * 4 + i) * 512;
                             let data = bytes::Bytes::from(vec![(w & 0xff) as u8; 256]);
-                            if dev.write(fd.clone(), off, data, TierPriority::Medium)
+                            if dev
+                                .write(fd.clone(), off, data, TierPriority::Medium)
                                 .await
                                 .is_ok()
                             {
@@ -1030,12 +1015,8 @@ mod tests {
     #[test]
     fn uring_bad_fd_fails() {
         run_local(|mut spawn, registry| async move {
-            let scheduler = DeviceRegistry::new(
-                    UringBackend::default(),
-                    &mut spawn,
-                    &registry,
-                    clock(),
-                );
+            let scheduler =
+                DeviceRegistry::new(UringBackend::default(), &mut spawn, &registry, clock());
             let dev = scheduler
                 .register_device("test", &byte_device(1 << 16))
                 .unwrap();
@@ -1047,9 +1028,7 @@ mod tests {
                 }
             }
             let bad = crate::fs::op::Fd::new(Arc::new(BadFd));
-            let result = dev
-                .read(bad, 0, 4096, TierPriority::Medium)
-                .await;
+            let result = dev.read(bad, 0, 4096, TierPriority::Medium).await;
             assert!(result.is_err(), "bad fd read must fail, not hang");
             for pool in dev.pools.all() {
                 assert_eq!(pool.debug_free_total(), pool.debug_capacity() as i64);
@@ -1082,19 +1061,16 @@ mod tests {
         run_local(|mut spawn, registry| {
             let path = path.clone();
             async move {
-                let scheduler = DeviceRegistry::new(
-                        UringBackend::default(),
-                        &mut spawn,
-                        &registry,
-                        clock(),
-                    );
+                let scheduler =
+                    DeviceRegistry::new(UringBackend::default(), &mut spawn, &registry, clock());
                 let dev = scheduler
                     .register_device("test", &byte_device(1 << 20))
                     .unwrap();
                 // Let the ring thread reach its idle `submit_and_wait` park before we submit, so this
                 // exercises the producer-wakes-idle-ring path rather than a busy ring.
                 tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-                let buf = dev.read(
+                let buf = dev
+                    .read(
                         fd.clone(),
                         0,
                         b"dual-wait payload".len() as u32,
@@ -1131,30 +1107,17 @@ mod tests {
             let path = path.clone();
             async move {
                 // No devices at construction; register one lazily afterwards.
-                let scheduler = DeviceRegistry::new(
-                        UringBackend::default(),
-                        &mut spawn,
-                        &registry,
-                        clock(),
-                    );
+                let scheduler =
+                    DeviceRegistry::new(UringBackend::default(), &mut spawn, &registry, clock());
                 let dev = scheduler
                     .register_device("lazy", &byte_device(1 << 20))
                     .expect("lazy registration");
                 let payload = bytes::Bytes::from_static(b"lazily registered device");
-                dev.write(
-                    fd.clone(),
-                    0,
-                    payload.clone(),
-                    TierPriority::Medium,
-                )
-                .await
-                .unwrap();
-                let buf = dev.read(
-                        fd.clone(),
-                        0,
-                        payload.len() as u32,
-                        TierPriority::High,
-                    )
+                dev.write(fd.clone(), 0, payload.clone(), TierPriority::Medium)
+                    .await
+                    .unwrap();
+                let buf = dev
+                    .read(fd.clone(), 0, payload.len() as u32, TierPriority::High)
                     .await
                     .unwrap();
                 assert_eq!(&buf[..], &payload[..]);
@@ -1191,12 +1154,8 @@ mod tests {
         run_local(|mut spawn, registry| {
             let path = path.clone();
             async move {
-                let scheduler = DeviceRegistry::new(
-                        UringBackend::default(),
-                        &mut spawn,
-                        &registry,
-                        clock(),
-                    );
+                let scheduler =
+                    DeviceRegistry::new(UringBackend::default(), &mut spawn, &registry, clock());
                 let dev = scheduler
                     .register_device("test", &byte_device(1 << 20))
                     .unwrap();

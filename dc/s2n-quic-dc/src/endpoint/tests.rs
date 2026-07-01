@@ -1001,10 +1001,10 @@ fn frame_trace_captures_app_and_packet_lifecycle() {
             // with FIN on both sides plus the handle drops at end of stream exercises each: the
             // server bound the stream, data was pushed into reader slots, the reader reached the
             // window-growth logic, the writer framed a FIN, and both handles dropped.
-            use backbeat::Event as _;
             use crate::endpoint::frame_trace::{
                 FinPath, HandleDrop, MaxDataStall, ServerBind, SlotPush,
             };
+            use backbeat::Event as _;
             for (name, id) in [
                 ("ServerBind", ServerBind::ID.get()),
                 ("SlotPush", SlotPush::ID.get()),
@@ -1145,7 +1145,7 @@ fn emit_debug_returns_dump_id_for_app_correlation() {
                         let d = core::mem::offset_of!(AppStreamBind, dump_id);
                         let r = core::mem::offset_of!(AppStreamBind, request_id);
                         // `zerocopy::IntoBytes` writes integers in native-endian, so read them back
-                        // the same way (not `from_le_bytes`, which would mis-parse on big-endian).
+                        // the same way (not `from_le_bytes`, which would misparse on big-endian).
                         let read = |off: usize| {
                             view.fields
                                 .get(off..off + 8)
