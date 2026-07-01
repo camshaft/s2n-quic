@@ -23,12 +23,14 @@
 //!
 //! # Reuse
 //!
-//! Like every [`Backend`], this is meant to be long-lived: [`report_start`](Backend::report_start)
-//! clears the accumulated rows while retaining builder capacity, and [`finish`](Self::finish)
-//! produces the batch for the just-completed report (also resetting for the next). Set the
-//! per-report timestamp with [`set_timestamp`](Self::set_timestamp) before each report; it is
-//! stamped onto every row so the crate never needs a wall-clock source of its own (which also keeps
-//! it deterministic under simulation).
+//! Like every [`Backend`], this is meant to be long-lived. The intended flow is to drain each
+//! report with [`finish`](Self::finish), which produces the batch and resets the builders (while
+//! retaining their capacity) for the next report. As a safety net, [`report_start`](Backend::report_start)
+//! also discards any un-`finish`ed rows, so a caller that defers or forgets `finish` gets a dropped
+//! partial rather than two reports mixed into one batch. Set the per-report timestamp with
+//! [`set_timestamp`](Self::set_timestamp) before each report; it is stamped onto every row so the
+//! crate never needs a wall-clock source of its own (which also keeps it deterministic under
+//! simulation).
 
 use crate::{
     backend::{Backend, CallbackValue, Histogram, MetricInfo, ReportOptions},
@@ -255,10 +257,19 @@ impl ArrowBackend {
 
 impl Backend for ArrowBackend {
     fn report_start(&mut self, _options: &ReportOptions) {
-        // `finish` already resets the builders; nothing to clear here. (We accept every value the
-        // registry hands us regardless of `include_sparse` — a tabular time series wants gap-free
-        // rows, and the null-vs-zero distinction is preserved in the columns, so downstream queries
-        // can filter zeros themselves rather than the backend dropping them irreversibly.)
+        // Per the `Backend` contract, `report_start` is the per-report reset hook. In the normal
+        // flow the caller drains each report with `finish` (which already resets the builders), so
+        // `rows` is 0 here and this is a no-op that retains capacity. But if a caller defers or
+        // forgets `finish`, resetting here prevents the next report's rows from being appended onto
+        // the stale ones — a mixed batch is worse than a dropped partial. `finish` drains the
+        // builders and we discard its batch, keeping the retained-capacity property.
+        if self.rows != 0 {
+            let _ = self.finish();
+        }
+
+        // Note: we intentionally ignore `include_sparse`. A tabular time series wants gap-free rows,
+        // and the null-vs-zero distinction is preserved in the columns, so downstream queries can
+        // filter zeros themselves rather than the backend dropping them irreversibly.
     }
 
     fn record_counter(&mut self, info: &MetricInfo<'_>, value: u64) {
@@ -459,5 +470,26 @@ mod test {
         let gauge = col(&batch, "gauge").as_any().downcast_ref::<Int64Array>().unwrap();
         assert_eq!(gauge.value(0), -5);
         assert!(col(&batch, "counter").is_null(0));
+    }
+
+    /// If a caller forgets `finish` between reports, `report_start` must discard the stale partial
+    /// rather than let the next report's rows be appended onto it (producing a mixed batch).
+    #[test]
+    fn report_start_discards_unfinished_rows() {
+        let registry = Registry::new();
+        registry.register_counter("c".into(), None).increment(1);
+
+        let mut backend = ArrowBackend::new();
+        // First report — but the caller "forgets" to call finish().
+        registry.report(&mut backend);
+        assert_eq!(backend.rows(), 1);
+
+        // Second report begins: report_start drops the un-finished first report.
+        registry.report(&mut backend);
+        let batch = backend.finish();
+
+        // Exactly one report's worth of rows (the counter drained to 0 on the first report), not
+        // two reports mixed together.
+        assert_eq!(batch.num_rows(), 1);
     }
 }
