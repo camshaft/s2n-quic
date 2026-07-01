@@ -14,7 +14,12 @@ use std::{
 #[cfg(target_os = "linux")]
 use std::{cell::Cell, ffi::CStr, ptr::NonNull};
 
-const SLOTS: usize = 1024 * 8 - 1;
+// Sized so the whole `Page` is exactly 64 KiB (a power of two): 8192 u64-sized words, minus one
+// each for the trailing `length` and `next` fields. Keeping the allocation power-of-two-sized
+// avoids the dead alignment padding an over-a-boundary struct would carry (the page previously
+// spilled past 64 KiB when the intrusive-stack `next` field was added) and keeps it friendly to the
+// allocator's size classes.
+const SLOTS: usize = 1024 * 8 - 2;
 
 #[repr(C, align(128))]
 struct Page {
@@ -23,6 +28,10 @@ struct Page {
     length: AtomicU64,
     next: *mut Page,
 }
+
+// Lock in the exact 64 KiB page size so a future field addition can't silently reintroduce the
+// alignment padding (adjust `SLOTS` to compensate instead).
+const _: () = assert!(std::mem::size_of::<Page>() == 64 * 1024);
 
 #[cfg(target_os = "linux")]
 impl Page {

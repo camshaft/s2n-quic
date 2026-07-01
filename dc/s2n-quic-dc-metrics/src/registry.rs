@@ -87,6 +87,17 @@ impl RegistryInner {
         backend.report_end();
     }
 
+    /// Folds any buffered per-CPU pages into the aggregate without draining or reporting. See
+    /// [`Registry::absorb`].
+    pub fn absorb(&self) {
+        if !self.is_open {
+            return;
+        }
+
+        self.counters.steal_pages();
+        self.histograms.steal_pages();
+    }
+
     pub fn try_take_current_metrics_line(&mut self, include_sparse: bool) -> Option<String> {
         if !self.is_open {
             return None;
@@ -383,6 +394,34 @@ impl Registry {
             .report(options, backend);
     }
 
+    /// Compacts buffered per-CPU metric pages into the aggregate, without draining or reporting.
+    ///
+    /// Recording is a two-layer process. On the hot path, each CPU fills a fixed-size page of raw
+    /// events; when a page fills (or a CPU goes idle) it is set aside, and folding those pages into
+    /// the compact per-metric aggregate (a counter's running sum, a summary's bucket array) only
+    /// happens when something steals them. Normally the only stealer is [`report`](Self::report),
+    /// so between reports the set-aside pages accumulate: at a high event rate and a long report
+    /// interval that is a large, growing buffer, and the eventual report pays to fold all of it at
+    /// once.
+    ///
+    /// `absorb` performs just the fold. Calling it on a short interval (e.g. every second) while
+    /// reporting on a longer one (e.g. every ten seconds) keeps the outstanding page buffer bounded
+    /// to roughly one absorb interval and makes each report cheap, without changing what a report
+    /// observes: the fold is purely additive and the per-metric drain still happens only in
+    /// `report`, so the reported values are identical to never having absorbed. Callback/gauge
+    /// metrics are evaluated lazily at report time and are unaffected.
+    ///
+    /// This is a no-op on a closed registry. It takes the same internal locks as `report`, so a
+    /// background absorb may briefly contend with a concurrent report. Like `report`, this is
+    /// designed to be driven by the caller on its own schedule rather than by an internal timer, so
+    /// the crate needs no wall-clock source of its own.
+    pub fn absorb(&self) {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .absorb();
+    }
+
     /// Returns `true` if the registry is open
     pub fn is_open(&self) -> bool {
         self.inner.lock().is_ok_and(|inner| inner.is_open)
@@ -499,6 +538,44 @@ mod test {
             line3,
             "q.depth=5,rx.data=0,rx.decrypt_time=0 us,rx.ecn=0 Variant|ect0,rx.ecn=0 Variant|ect1,workers=4"
         );
+    }
+
+    /// `absorb` folds buffered events into the aggregate without draining, so intervening absorbs
+    /// don't change what the eventual report observes: the value spans every increment since the
+    /// last report, regardless of how many times it was compacted in between.
+    #[test]
+    fn absorb_is_additive_and_non_draining() {
+        let registry = Registry::new();
+        let counter = registry.register_counter("a".into(), None);
+        let summary = registry.register_summary("h".into(), None, Unit::Count);
+
+        // Record, compact, record more, compact again -- all before a single report.
+        counter.increment(3);
+        summary.record_value(10);
+        registry.absorb();
+        counter.increment(4);
+        summary.record_value(20);
+        registry.absorb();
+        // A redundant absorb with nothing new buffered is a harmless no-op.
+        registry.absorb();
+
+        // The report sees the full span across both intervals (3 + 4 = 7, two histogram samples),
+        // identical to never having absorbed.
+        let line = registry.take_current_metrics_line();
+        assert_eq!(line, "a=7,h=10*1+20*1");
+
+        // The report drained; absorbing again finds nothing and the next report is zeroed.
+        registry.absorb();
+        assert_eq!(registry.take_current_metrics_line(), "a=0,h=0");
+    }
+
+    /// `absorb` on a closed registry is a no-op and does not panic.
+    #[test]
+    fn absorb_closed_registry_is_noop() {
+        let registry = Registry::new();
+        registry.register_counter("a".into(), None).increment(1);
+        registry.close();
+        registry.absorb();
     }
 
     /// With `include_sparse`, drained counters and histograms still emit their zero.
