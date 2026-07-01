@@ -48,6 +48,17 @@ fn quic_handshake_over_bach_net() {
     let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let done_check = done.clone();
 
+    // Unlike every other `sim()` test — which runs only the deterministic dc protocol — this one
+    // drives a real QUIC/TLS handshake through the full s2n-quic stack. That output is not
+    // reproducible across platforms: the negotiated TLS backend produces different-sized handshake
+    // records, which changes how the ClientHello/Certificate flights packetize and therefore the
+    // sim-time each event lands on. The captured logs (which encode those timestamps) matched on
+    // macOS but diverged on the Linux CI runner, failing the snapshot assertion. There is nothing
+    // to gain from snapshotting a real-crypto handshake's log timing, so skip the snapshot here; the
+    // test still fully validates the handshake via the `assert_eq!` echo round-trip and the
+    // `done_check` completion flag below.
+    let _no_snapshots = crate::testing::without_snapshots();
+
     sim(|| {
         // ── Server — group "server" ──────────────────────────────────────
         async move {
