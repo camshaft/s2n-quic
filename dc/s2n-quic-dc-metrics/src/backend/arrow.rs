@@ -562,7 +562,8 @@ mod test {
     fn native_gauge_column() {
         let mut backend = ArrowBackend::new();
         backend.report_start(&ReportOptions::default());
-        let info = MetricInfo::new("q.depth", None, Unit::Count, MetricKind::Gauge);
+        let name: Arc<str> = Arc::from("q.depth");
+        let info = MetricInfo::new(&name, None, Unit::Count, MetricKind::Gauge);
         backend.record_gauge(&info, -5);
         let batch = backend.finish();
 

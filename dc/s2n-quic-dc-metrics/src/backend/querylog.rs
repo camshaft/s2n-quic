@@ -169,12 +169,14 @@ impl Backend for QuerylogBackend {
 mod test {
     use super::*;
     use crate::backend::MetricKind;
+    use std::sync::Arc;
 
     /// `Default` and `new()` must behave identically — in particular, neither may emit a leading
     /// separator on the first entry.
     #[test]
     fn default_matches_new_no_leading_comma() {
-        let info = MetricInfo::new("a", None, crate::Unit::Count, MetricKind::Counter);
+        let name: Arc<str> = Arc::from("a");
+        let info = MetricInfo::new(&name, None, crate::Unit::Count, MetricKind::Counter);
 
         let mut from_new = QuerylogBackend::new();
         from_new.record_counter(&info, 5);
@@ -189,7 +191,8 @@ mod test {
     /// no leading separator) while retaining its buffer capacity.
     #[test]
     fn reuse_clears_output_and_retains_capacity() {
-        let info = MetricInfo::new("a", None, crate::Unit::Count, MetricKind::Counter);
+        let name: Arc<str> = Arc::from("a");
+        let info = MetricInfo::new(&name, None, crate::Unit::Count, MetricKind::Counter);
         let opts = ReportOptions::default();
 
         let mut backend = QuerylogBackend::new();
@@ -211,12 +214,13 @@ mod test {
     /// `record_gauge` honors `zero_suppressed` + `include_sparse` rather than always dropping zero.
     #[test]
     fn gauge_zero_respects_suppression_and_sparse() {
+        let name: Arc<str> = Arc::from("g");
         let suppressed = {
-            let mut i = MetricInfo::new("g", None, crate::Unit::Count, MetricKind::Gauge);
+            let mut i = MetricInfo::new(&name, None, crate::Unit::Count, MetricKind::Gauge);
             i.zero_suppressed = true;
             i
         };
-        let plain = MetricInfo::new("g", None, crate::Unit::Count, MetricKind::Gauge);
+        let plain = MetricInfo::new(&name, None, crate::Unit::Count, MetricKind::Gauge);
 
         // Zero-suppressed gauge: zero is always dropped.
         let mut b = QuerylogBackend::new();
