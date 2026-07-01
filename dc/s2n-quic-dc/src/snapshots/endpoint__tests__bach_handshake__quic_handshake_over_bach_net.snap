@@ -1,8 +1,0 @@
----
-source: dc/s2n-quic-dc/src/testing.rs
-assertion_line: 352
-expression: logs
----
-0:00:00.001000000 [client]  INFO client: connected, handshake complete
-0:00:00.001500000 [server]  INFO server: connection accepted, handshake complete
-0:00:00.002000000 [client]  INFO quic_handshake_over_bach_net passed
