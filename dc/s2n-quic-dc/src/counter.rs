@@ -2166,8 +2166,20 @@ impl Registry {
     }
 
     pub fn new() -> Self {
+        Self::with_inner(s2n_quic_dc_metrics::Registry::new())
+    }
+
+    /// Wraps an existing [`s2n_quic_dc_metrics::Registry`] instead of allocating a fresh one.
+    ///
+    /// The `inner` registry is what a [reporter](Self::spawn_reporter_with_config) actually drains,
+    /// so an application that already owns a process-wide metrics registry can pass it here to have
+    /// this endpoint record into it — its metrics then flow through the application's existing
+    /// reporter alongside everything else, rather than needing a dedicated one. The wrapper-level
+    /// metadata (queue gauges, topology, metric descriptions) always starts empty; it tracks only
+    /// what is registered through this handle.
+    pub fn with_inner(inner: s2n_quic_dc_metrics::Registry) -> Self {
         Self {
-            inner: s2n_quic_dc_metrics::Registry::new(),
+            inner,
             queue_gauges: Arc::new(Mutex::new(HashMap::new())),
             queue_metadata: Arc::new(Mutex::new(HashMap::new())),
             queue_endpoint_metadata: Arc::new(Mutex::new(HashMap::new())),
