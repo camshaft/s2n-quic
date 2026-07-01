@@ -125,15 +125,25 @@ pub fn schema() -> SchemaRef {
         .clone()
 }
 
+/// A precomputed constant label column source: the immutable 1-entry values dictionary, built once
+/// in [`ArrowBackend::with_labels`] and cloned (refcount bump) into every batch.
+struct Label {
+    /// The 1-entry `StringArray` dictionary holding the constant label value.
+    values: ArrayRef,
+}
+
 /// A [`Backend`] that accumulates native metric values into an [`arrow::RecordBatch`].
 ///
 /// See the [module docs](self) for the schema and the accumulate/finish contract.
 pub struct ArrowBackend {
     timestamp: f64,
 
-    /// Constant `(name, value)` labels appended as one dictionary column per label to every batch
-    /// (e.g. `("host", "box-01")`). Fixed for the backend's lifetime, so `schema` is precomputed.
-    labels: Vec<(String, String)>,
+    /// Constant labels appended as one dictionary column per label to every batch (e.g.
+    /// `("host", "box-01")`). Fixed for the backend's lifetime, so both the `schema` and each
+    /// label's 1-entry values dictionary are precomputed here and only cheaply reused per `finish`:
+    /// the immutable `values` `Arc` is cloned (a refcount bump) and paired with a fresh all-zero
+    /// keys buffer sized to the report's row count.
+    labels: Vec<Label>,
     /// Full schema including the label columns, computed once from `labels`.
     schema: SchemaRef,
 
@@ -202,14 +212,20 @@ impl ArrowBackend {
         mut self,
         labels: impl IntoIterator<Item = (String, String)>,
     ) -> Self {
-        self.labels = labels.into_iter().collect();
-
-        // Precompute the full schema: base fields + one dictionary column per label, in order.
+        // Precompute the full schema (base fields + one dictionary column per label, in order) and
+        // each label's immutable 1-entry values dictionary, so `finish` only clones an `Arc` and
+        // builds the row-length keys buffer.
         let mut fields: Vec<Field> = schema().fields().iter().map(|f| (**f).clone()).collect();
-        for (name, _) in &self.labels {
-            // Non-nullable: every row always carries the constant label value.
-            fields.push(Field::new(name, label_data_type(), false));
-        }
+        self.labels = labels
+            .into_iter()
+            .map(|(name, value)| {
+                // Non-nullable: every row always carries the constant label value.
+                fields.push(Field::new(&name, label_data_type(), false));
+                Label {
+                    values: Arc::new(StringArray::from(vec![value])),
+                }
+            })
+            .collect();
         self.schema = Arc::new(Schema::new(fields));
         self
     }
@@ -256,13 +272,12 @@ impl ArrowBackend {
             Arc::new(self.hist_buckets.finish()),
         ];
 
-        // Append one constant dictionary column per label. A constant column needs no builder loop:
-        // the keys are all-zero (every row points at the single dictionary entry) and the values
-        // dictionary holds the label value once.
-        for (_, value) in &self.labels {
+        // Append one constant dictionary column per label. A constant column needs no builder loop
+        // (and no per-row hashmap dedup): the values dictionary was built once in `with_labels` and
+        // is cloned here, and the keys are all-zero — every row points at that single entry.
+        for label in &self.labels {
             let keys = Int32Array::from(vec![0; rows]);
-            let values = Arc::new(StringArray::from(vec![value.as_str()])) as ArrayRef;
-            let dict = DictionaryArray::<Int32Type>::try_new(keys, values)
+            let dict = DictionaryArray::<Int32Type>::try_new(keys, label.values.clone())
                 .expect("constant label dictionary is well-formed");
             columns.push(Arc::new(dict));
         }
