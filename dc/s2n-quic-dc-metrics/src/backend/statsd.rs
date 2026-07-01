@@ -157,6 +157,12 @@ impl<S: StatsdSink> Backend for StatsdBackend<S> {
         // (record_duration stores `as_nanos`), bytes/counts as-is, and percents scaled by
         // FLOAT_INT_MULTIPLIER. `statsd_value` maps each to a sensible StatsD integer.
         for (value, count) in hist.buckets() {
+            // `buckets()` only yields non-empty buckets, so `count >= 1`; guard anyway so the
+            // sample-rate division stays self-contained and can never produce `@inf` if that
+            // contract ever changes.
+            if count == 0 {
+                continue;
+            }
             let v = statsd_value(value, unit);
             // Sample-rate weight: this single sample represents `count` observations.
             let weight = 1.0 / count as f64;
