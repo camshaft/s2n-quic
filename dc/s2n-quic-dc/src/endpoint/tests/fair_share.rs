@@ -1264,7 +1264,7 @@ fn run_msg_reset_recv_conservation(
                     idx += 1;
                     // Cancel 2 of every 3 readers mid-stream; the rest drain fully. A cancelled
                     // reader abandons whatever QueueMsg segments are mid-flight.
-                    let cancel = stream_idx % 3 != 0;
+                    let cancel = !stream_idx.is_multiple_of(3);
                     async move {
                         let mut rx = Data::new(body_len);
                         let mut read_total = 0u64;
@@ -1632,7 +1632,7 @@ fn run_loss_read_stall(
             let mut pkt = 0u64;
             bach::net::monitor::on_packet_sent(move |_packet| {
                 pkt += 1;
-                if drop_one_in > 0 && pkt % drop_one_in == 0 {
+                if drop_one_in > 0 && pkt.is_multiple_of(drop_one_in) {
                     return bach::net::monitor::Command::Drop;
                 }
                 bach::net::monitor::Command::Pass
@@ -1806,7 +1806,7 @@ fn run_full_stew(
             let mut pkt = 0u64;
             bach::net::monitor::on_packet_sent(move |_packet| {
                 pkt += 1;
-                if drop_one_in > 0 && pkt % drop_one_in == 0 {
+                if drop_one_in > 0 && pkt.is_multiple_of(drop_one_in) {
                     return bach::net::monitor::Command::Drop;
                 }
                 bach::net::monitor::Command::Pass

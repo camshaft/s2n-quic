@@ -2103,6 +2103,7 @@ impl Inner {
             // window and local credit allow. Requiring the whole `segment_size` to fit the window
             // up front (the old `remote_budget < segment_size` break) is what forced segments to be
             // clamped to the window/credit and blew out the receiver's msg_id count.
+            #[allow(clippy::nonminimal_bool)]
             if !is_resuming
                 && !(is_first && force_first)
                 && (remote_budget as usize) < chunk_size as usize

@@ -26,8 +26,17 @@ pub use wake::AutoWake;
 mod imp {
     pub use loom::sync::{
         atomic::{AtomicI64, AtomicU32, AtomicU64, AtomicUsize, Ordering},
-        Arc, Mutex, MutexGuard, RwLock,
+        Mutex, MutexGuard, RwLock,
     };
+
+    // `Arc` is deliberately NOT swapped for `loom::sync::Arc`. Loom's `Arc` shim is a minimal subset
+    // of `std::sync::Arc` (no `Weak`/`downgrade`, no `From<&str>`, no `Arc<[T]>::from(Vec)`, no
+    // arbitrary-self-type methods), so swapping it crate-wide breaks the large body of non-model code
+    // that relies on those APIs (the `fs` scheduler, credit-pool gauges, etc.). None of the loom
+    // models use `Arc` as a synchronization edge — every shared state they exercise lives behind the
+    // loom-instrumented atomics/mutex above, and model threads are explicitly joined — so std `Arc`
+    // is sound here and loses no coverage.
+    pub use std::sync::Arc;
 
     #[inline(always)]
     pub fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {

@@ -6,6 +6,7 @@ mod coop;
 pub(crate) mod metrics;
 mod reader;
 pub mod server;
+#[allow(clippy::module_inception)]
 mod stream;
 mod writer;
 

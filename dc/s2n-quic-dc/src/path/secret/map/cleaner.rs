@@ -104,6 +104,12 @@ impl Drop for Cleaner {
     }
 }
 
+impl Default for Cleaner {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Cleaner {
     pub fn new() -> Cleaner {
         Cleaner {

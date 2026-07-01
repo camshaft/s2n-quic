@@ -2568,14 +2568,14 @@ impl Registry {
     /// of zero is suppressed from the metrics output (same as [`register_gauge`]).
     ///
     /// [`register_gauge`]: Self::register_gauge
-    pub fn register_gauge_callback<F>(&self, label: impl core::fmt::Display, mut f: F)
+    pub fn register_gauge_callback<F>(&self, label: impl core::fmt::Display, f: F)
     where
         F: FnMut() -> i64 + 'static + Send,
     {
         let label = label.to_string();
         self.register_metric_metadata(&label, None, MetricKind::Gauge, None, "");
         self.inner
-            .register_list_callback_zero_suppressed(label, None, Unit::Count, move || f());
+            .register_list_callback_zero_suppressed(label, None, Unit::Count, f);
     }
 
     pub fn register_nominal_gauge(

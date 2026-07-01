@@ -41,6 +41,7 @@ pub const MAX_QUEUE_MSG_HEADER_OVERHEAD: u16 = 152;
 
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(clippy::enum_variant_names)]
 pub enum Priority {
     QueueReset = 0,
     QueueControl = 1,

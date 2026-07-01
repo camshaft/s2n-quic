@@ -70,6 +70,16 @@ where
     subscriber: Option<S>,
 }
 
+impl<C, S> Default for StateBuilder<C, S>
+where
+    C: 'static + time::Clock + Sync + Send,
+    S: event::Subscriber,
+{
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl<C, S> StateBuilder<C, S>
 where
     C: 'static + time::Clock + Sync + Send,
@@ -1022,9 +1032,7 @@ where
         packet: &control::QueueReset,
         out: &mut [u8],
     ) -> Option<usize> {
-        let Some(entry) = self.ids.get(packet.credentials.id) else {
-            return None;
-        };
+        let entry = self.ids.get(packet.credentials.id)?;
         let len = packet.encode(s2n_codec::EncoderBuffer::new(out), &entry.control_sealer());
         Some(len)
     }

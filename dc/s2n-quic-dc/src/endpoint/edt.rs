@@ -24,6 +24,10 @@ impl Local {
         self.edts.len()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     pub fn advance(&mut self, sender_idx: LocalSenderId, now: Timestamp, byte_cost: u64) {
         if sender_idx.as_usize() >= self.edts.len() {
             return;

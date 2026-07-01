@@ -948,7 +948,7 @@ fn frame_trace_captures_app_and_packet_lifecycle() {
                 .expect("connect failed");
 
             {
-                let (mut reader, mut writer) = stream.split();
+                let (reader, writer) = stream.split();
                 let mut ping = Bytes::from_static(b"ping");
                 writer
                     .write_all_from_fin(&mut ping)
@@ -1004,7 +1004,6 @@ fn frame_trace_captures_app_and_packet_lifecycle() {
             use crate::endpoint::frame_trace::{
                 FinPath, HandleDrop, MaxDataStall, ServerBind, SlotPush,
             };
-            use backbeat::Event as _;
             for (name, id) in [
                 ("ServerBind", ServerBind::ID.get()),
                 ("SlotPush", SlotPush::ID.get()),
@@ -1048,8 +1047,6 @@ struct AppStreamBind {
 /// frames of the stream by `dump_id`. Proves the app↔dc bridge without any dc-internal plumbing.
 #[test]
 fn emit_debug_returns_dump_id_for_app_correlation() {
-    use backbeat::Event as _;
-
     sim(|| {
         let acceptor_id = VarInt::from_u8(1);
 

@@ -107,10 +107,12 @@ impl<T> Receiver<T> for TestReceiver<T> {
     fn on_consumed(&mut self, _bytes: u64) {}
 }
 
-pub fn entry_channel<T>() -> (
+type EntryChannel<T> = (
     EntryBoxSender<T, unsync::Sender<crate::intrusive::EntryAdapter<T>>>,
     unsync::Receiver<crate::intrusive::EntryAdapter<T>>,
-) {
+);
+
+pub fn entry_channel<T>() -> EntryChannel<T> {
     let (tx, rx) = unsync::new::<T>();
     (EntryBoxSender::new(tx), rx)
 }
@@ -208,16 +210,16 @@ pub async fn test_entry_at(addr: impl bach::net::ToSocketAddrs) -> Arc<PathSecre
         .expect("address resolution failed")
         .next()
         .expect("lookup_host returned empty iterator");
-    let pse = PathSecretEntry::builder(addr).build(None);
-    pse
+
+    PathSecretEntry::builder(addr).build(None)
 }
 
 pub fn test_entry() -> Arc<PathSecretEntry> {
     let addr: SocketAddr = "127.0.0.1:4433".parse().unwrap();
-    let pse = PathSecretEntry::builder(addr)
+
+    PathSecretEntry::builder(addr)
         .socket_sender_count(8)
-        .build(None);
-    pse
+        .build(None)
 }
 
 /// Creates a minimal QueueData frame for testing pipeline plumbing.

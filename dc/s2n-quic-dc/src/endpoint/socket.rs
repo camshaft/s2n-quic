@@ -7,6 +7,12 @@ use std::{ffi::CString, io, net::SocketAddr};
 
 const DEFAULT_BUFFER_SIZE: usize = 200 * 1024 * 1024;
 
+/// Send/recv socket pair produced by [`Config::busy_poll`].
+type BusyPollSockets = (
+    Vec<GsoSocket<BusyPoll<std::net::UdpSocket>>>,
+    Vec<BusyPoll<std::net::UdpSocket>>,
+);
+
 /// Per-socket bind configuration.
 #[derive(Clone, Debug)]
 pub struct BindAddress {
@@ -138,12 +144,7 @@ impl Config {
         Ok((send_sockets, recv_sockets))
     }
 
-    pub fn busy_poll(
-        &self,
-    ) -> io::Result<(
-        Vec<GsoSocket<BusyPoll<std::net::UdpSocket>>>,
-        Vec<BusyPoll<std::net::UdpSocket>>,
-    )> {
+    pub fn busy_poll(&self) -> io::Result<BusyPollSockets> {
         let (send_sockets, recv_sockets) = self.create()?;
         let send_sockets = send_sockets
             .into_iter()

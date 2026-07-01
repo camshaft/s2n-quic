@@ -221,6 +221,7 @@ impl SyncReuseHandle {
         pool.alloc_with_recycler(&self.recycle_weak)
     }
 
+    #[allow(dead_code)]
     #[inline]
     pub(crate) fn local_pool(&self) -> Rc<RefCell<List<RecycleAdapter<SyncRecycler>>>> {
         self.local_pool.clone()

@@ -408,6 +408,7 @@ struct Inner {
     ///   * the window the reader advertises before any demand hint arrives (cold start), and
     ///   * the base unit of the streaming-headroom runway (`window_size * growth_ratio`) and the
     ///     `window_size / 2` hysteresis at which a consumed-driven top-up fires.
+    ///
     /// The advertised window itself tracks the writer's hinted demand (`peer_max_offset`); see the
     /// module-level "Window sizing" docs.
     window_size: u64,

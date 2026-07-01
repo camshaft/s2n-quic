@@ -8,11 +8,7 @@ use crate::{
 };
 use s2n_quic::{provider::tls::Provider, server::Name};
 use s2n_quic_core::{crypto::tls::testing::certificates, time::StdClock};
-use std::{
-    cell::Cell,
-    sync::{atomic::AtomicUsize, OnceLock},
-    time::Duration,
-};
+use std::{cell::Cell, sync::OnceLock, time::Duration};
 
 #[cfg(any(test, feature = "testing"))]
 use std::sync::{Arc, Mutex};
@@ -80,8 +76,6 @@ thread_local! {
     static SNAPSHOT_BUFFER: Cell<Option<Arc<Mutex<Vec<u8>>>>> = const { Cell::new(None) };
 }
 
-static SNAPSHOT_MODE_DEPTH: AtomicUsize = AtomicUsize::new(0);
-
 struct TracingDisabledGuard;
 
 impl TracingDisabledGuard {
@@ -130,24 +124,6 @@ pub struct WithoutTracingGuard {
 /// the previous state.
 pub struct WithoutSnapshotsGuard {
     _depth: SnapshotDisabledGuard,
-}
-
-#[cfg(test)]
-struct SnapshotModeGuard;
-
-#[cfg(test)]
-impl SnapshotModeGuard {
-    fn enter() -> Self {
-        SNAPSHOT_MODE_DEPTH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        Self
-    }
-}
-
-#[cfg(test)]
-impl Drop for SnapshotModeGuard {
-    fn drop(&mut self) {
-        SNAPSHOT_MODE_DEPTH.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-    }
 }
 
 #[doc(hidden)]
@@ -343,7 +319,6 @@ fn run_sim_with_snapshot(f: impl FnOnce()) {
 
     let buffer = Arc::new(Mutex::new(Vec::new()));
     SNAPSHOT_BUFFER.with(|cell| cell.set(Some(buffer.clone())));
-    let _snapshot_mode_guard = SnapshotModeGuard::enter();
 
     run_sim(f);
 

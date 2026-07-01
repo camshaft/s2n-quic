@@ -241,7 +241,7 @@ pub struct IoOpEvent {
 }
 
 const _: () = assert!(
-    core::mem::size_of::<IoOpEvent>() % 8 == 0,
+    core::mem::size_of::<IoOpEvent>().is_multiple_of(8),
     "IoOpEvent must be 8-byte aligned with no trailing implicit padding"
 );
 
