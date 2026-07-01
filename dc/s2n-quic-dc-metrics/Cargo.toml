@@ -9,7 +9,19 @@ rust-version = "1.88"
 license = "Apache-2.0"
 autobenches = false
 
+[features]
+# Opt-in OTLP protobuf export backend. Off by default: `prost` is an additional dependency and
+# most consumers only need the querylog/statsd backends. Enabling this pulls in `prost` and unlocks
+# `backend::OtlpBackend`, which encodes metrics into `ExportMetricsServiceRequest` protobuf
+# payloads that the caller transmits (HTTP, gRPC, etc.) via an `OtlpSink`.
+otel = ["dep:prost"]
+
 [dependencies]
+# Protobuf encoding for the OTLP metrics backend (opt-in: `--features otel`).
+# Only the runtime is needed — the derive macros ship in the same crate, so no separate
+# `prost-build` or code-gen step is required. The hand-written proto structs live in
+# `backend/otel.rs` and match the OTLP metrics wire format exactly.
+prost = { version = "0.13", optional = true }
 futures-util = "0.3.26"
 serde_json = "1"
 histogram = "0.11.3"
