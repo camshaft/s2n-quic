@@ -70,10 +70,7 @@ pub fn complete(mut op: Entry<IoOp>) {
     // Terminal flight-recorder sighting. Recorded BEFORE `release_credits` so the row still carries the
     // op's `cost`. Whether the receiver is still alive decides Completed/Failed vs. Orphaned — checked
     // here (the sender is taken below, but `completion` is still present).
-    let orphaned = op
-        .completion
-        .as_ref()
-        .is_some_and(|s| !s.receiver_alive());
+    let orphaned = op.completion.as_ref().is_some_and(|s| !s.receiver_alive());
     crate::fs::trace::completed(&op, orphaned);
 
     // 2. Release the borrowed credit back to the op's own device pool — exactly once. The op carries

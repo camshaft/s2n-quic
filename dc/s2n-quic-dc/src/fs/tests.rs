@@ -1324,7 +1324,10 @@ fn trace_groups_materialize_ops_under_one_stream_id() {
                 count >= 6,
                 "stream id {sid} must group every block's ops (>= 6 rows); saw {count}"
             );
-            info!(stream_id = sid, count, "materialize ops grouped under one stream id");
+            info!(
+                stream_id = sid,
+                count, "materialize ops grouped under one stream id"
+            );
         }
         .primary()
         .spawn();

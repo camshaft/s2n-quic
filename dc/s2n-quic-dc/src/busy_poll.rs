@@ -442,7 +442,6 @@ impl Tasks {
         heartbeat.current_task.store(-1, Ordering::Relaxed);
         heartbeat.counter.fetch_add(1, Ordering::Relaxed);
     }
-
 }
 
 #[cfg(test)]

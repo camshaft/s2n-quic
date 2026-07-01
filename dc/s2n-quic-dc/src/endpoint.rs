@@ -292,7 +292,14 @@ where
 {
     use crate::socket::recv::uring;
     let reuse = crate::socket::pool::SyncReuseRing::new();
-    match uring::spawn(idx, socket, uring::DEFAULT_RING_DEPTH, recv_pool, reuse, router) {
+    match uring::spawn(
+        idx,
+        socket,
+        uring::DEFAULT_RING_DEPTH,
+        recv_pool,
+        reuse,
+        router,
+    ) {
         Ok(ring) => {
             rings.push(ring);
             Ok(())

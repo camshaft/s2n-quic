@@ -2551,12 +2551,10 @@ impl Registry {
         let metric_id = self.register_metric_metadata(&label, None, MetricKind::Gauge, None, "");
         let inner = Arc::new(AtomicI64::new(0));
         let inner_clone = inner.clone();
-        self.inner.register_list_callback_zero_suppressed(
-            label,
-            None,
-            Unit::Count,
-            move || inner_clone.load(Ordering::Relaxed),
-        );
+        self.inner
+            .register_list_callback_zero_suppressed(label, None, Unit::Count, move || {
+                inner_clone.load(Ordering::Relaxed)
+            });
         self.gauge_handle(inner, metric_id)
     }
 
@@ -3027,13 +3025,17 @@ mod tests {
     #[test]
     fn statsd_backend_drops_batch_when_queue_full() {
         let registry = s2n_quic_dc_metrics::Registry::new();
-        registry.register_counter("rx.data".into(), None).increment(1);
+        registry
+            .register_counter("rx.data".into(), None)
+            .increment(1);
 
         // queue depth 1: the first report fills it, the second is dropped.
         let (mut backends, mut rx) = backends_with_statsd(None, 1);
 
         report_once(&registry, true, &mut backends);
-        registry.register_counter("rx.data".into(), None).increment(1);
+        registry
+            .register_counter("rx.data".into(), None)
+            .increment(1);
         report_once(&registry, true, &mut backends);
 
         assert!(rx.try_recv().is_ok());
@@ -3043,7 +3045,9 @@ mod tests {
     #[test]
     fn tracing_and_statsd_fan_out_from_one_report() {
         let registry = s2n_quic_dc_metrics::Registry::new();
-        registry.register_counter("rx.data".into(), None).increment(3);
+        registry
+            .register_counter("rx.data".into(), None)
+            .increment(3);
 
         let (tx, mut rx) = mpsc::channel(4);
         let cfg = StatsdUdpConfig::new("127.0.0.1:8125".parse().unwrap(), tx);

@@ -81,11 +81,8 @@ pub(super) struct Registration {
 /// This is itself a single `!Send` future spawned once on the worker by `DeviceRegistry::new`. It
 /// never resolves until the channel closes and every spawned future has ended; dropping the task
 /// tears everything down (including the backend, which joins its lane threads).
-pub(super) async fn registrar<B, Clk>(
-    backend: B,
-    rx: sync_chan::Receiver<Registration>,
-    clock: Clk,
-) where
+pub(super) async fn registrar<B, Clk>(backend: B, rx: sync_chan::Receiver<Registration>, clock: Clk)
+where
     B: Backend,
     Clk: precision::Clock + Clone + 'static,
 {

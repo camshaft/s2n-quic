@@ -555,7 +555,9 @@ pub(crate) fn lane_closed(op: &IoOp) {
 /// [`BackendStart`](IoLifecycle::BackendStart) — the backend began executing the op.
 #[inline]
 pub(crate) fn backend_start(op: &IoOp) {
-    crate::fs::dbg::on_enabled(|| emit_op(op, IoLifecycle::BackendStart, 0, ErrorKindCode::None, 0));
+    crate::fs::dbg::on_enabled(|| {
+        emit_op(op, IoLifecycle::BackendStart, 0, ErrorKindCode::None, 0)
+    });
 }
 
 /// [`BackendDone`](IoLifecycle::BackendDone) — the backend finished executing the op. Carries the

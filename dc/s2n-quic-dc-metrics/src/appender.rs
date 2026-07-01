@@ -655,8 +655,11 @@ mod test {
         assert_eq!(writer.max_files, 7);
 
         // The by-ref `max_files` configures the same field on a bound builder.
-        let mut builder =
-            MetricsWriter::builder(dir.clone(), "svc".into(), std::time::Duration::from_secs(3600));
+        let mut builder = MetricsWriter::builder(
+            dir.clone(),
+            "svc".into(),
+            std::time::Duration::from_secs(3600),
+        );
         builder.max_files(4);
         assert_eq!(builder.build().unwrap().max_files, 4);
 

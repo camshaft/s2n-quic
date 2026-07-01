@@ -9,6 +9,8 @@ check-filename = true
 [default.extend-words]
 # msg_controllen is a standard POSIX field name in msghdr struct
 controllen = "controllen"
+# "256ths" fixed-point units (e.g. read_256ths / write_256ths) split to "ths"
+ths = "ths"
 # ECN Capable Transport
 ect = "ect"
 # num_rational uses "numer" as short for "numerator"
