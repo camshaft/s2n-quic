@@ -17,9 +17,6 @@ use crate::{
 };
 use std::fmt::Write as _;
 
-/// Percentiles emitted for histogram metrics.
-const HISTOGRAM_PERCENTILES: [u32; 4] = [50, 90, 95, 99];
-
 /// Default maximum UDP payload size (bytes) for a single datagram.
 pub const DEFAULT_MAX_PAYLOAD_SIZE: usize = 1200;
 
@@ -146,32 +143,33 @@ impl<S: StatsdSink> Backend for StatsdBackend<S> {
         }
         let unit = hist.unit();
 
-        // Histogram bucket values are the native recorded magnitude: nanoseconds for time units
+        // Emit the raw distribution as DogStatsD histogram (`|h`) samples under the single base
+        // metric name, one line per non-empty bucket. Each line carries a sample-rate weight of
+        // `1/count`, so the bucket's representative value stands in for `count` observations. The
+        // StatsD agent aggregates these into the base metric and computes percentiles server-side,
+        // which lets per-host distributions roll up correctly across a fleet. Pre-computing
+        // percentiles client-side and emitting them as separate `.count/.min/.pNN/.max` gauges
+        // (the earlier encoding) produced distinct metric names — breaking dashboards that query
+        // the base name with a server-side percentile statistic — and yielded per-host percentiles
+        // that cannot be aggregated across hosts.
+        //
+        // Bucket values are the native recorded magnitude: nanoseconds for time units
         // (record_duration stores `as_nanos`), bytes/counts as-is, and percents scaled by
         // FLOAT_INT_MULTIPLIER. `statsd_value` maps each to a sensible StatsD integer.
-        write!(self.begin_record(info.name, ".count:"), "{}|c", hist.count()).unwrap();
-        self.end_record(info.aggregation);
-        write!(
-            self.begin_record(info.name, ".min:"),
-            "{}|g",
-            statsd_value(hist.min(), unit)
-        )
-        .unwrap();
-        self.end_record(info.aggregation);
-        for pct in HISTOGRAM_PERCENTILES {
-            let value = statsd_value(hist.quantile(pct as f64 / 100.0), unit);
-            // Write the name, then the `.p{pct}:` label and value directly into the buffer.
-            let out = self.begin_record(info.name, ".p");
-            write!(out, "{pct}:{value}|g").unwrap();
+        for (value, count) in hist.buckets() {
+            // `buckets()` only yields non-empty buckets, so `count >= 1`; guard anyway so the
+            // sample-rate division stays self-contained and can never produce `@inf` if that
+            // contract ever changes.
+            if count == 0 {
+                continue;
+            }
+            let v = statsd_value(value, unit);
+            // Sample-rate weight: this single sample represents `count` observations.
+            let weight = 1.0 / count as f64;
+            let out = self.begin_record(info.name, ":");
+            write!(out, "{v}|h|@{weight}").unwrap();
             self.end_record(info.aggregation);
         }
-        write!(
-            self.begin_record(info.name, ".max:"),
-            "{}|g",
-            statsd_value(hist.max(), unit)
-        )
-        .unwrap();
-        self.end_record(info.aggregation);
     }
 
     fn record_callback(&mut self, info: &MetricInfo<'_>, values: &[&dyn CallbackValue]) {
@@ -369,14 +367,16 @@ mod test {
     impl StatsdSink for CaptureSink {
         fn send_batch<'a>(&mut self, payloads: impl Iterator<Item = &'a str>) {
             // Copy the borrowed slices into owned Strings (the slices are only valid for the call).
-            self.0
-                .lock()
-                .unwrap()
-                .extend(payloads.map(str::to_string));
+            self.0.lock().unwrap().extend(payloads.map(str::to_string));
         }
     }
 
-    fn info<'a>(name: &'a str, agg: Option<&'a str>, unit: Unit, kind: MetricKind) -> MetricInfo<'a> {
+    fn info<'a>(
+        name: &'a str,
+        agg: Option<&'a str>,
+        unit: Unit,
+        kind: MetricKind,
+    ) -> MetricInfo<'a> {
         MetricInfo::new(name, agg, unit, kind)
     }
 
@@ -386,15 +386,25 @@ mod test {
         let mut backend = StatsdBackend::new(sink.clone(), Some("svc".into()));
 
         backend.report_start(&ReportOptions::default());
-        backend.record_counter(&info("rx.data", None, Unit::Count, MetricKind::Counter), 255);
+        backend.record_counter(
+            &info("rx.data", None, Unit::Count, MetricKind::Counter),
+            255,
+        );
         backend.record_counter(
             &info("rx.ecn", Some("ect0"), Unit::Count, MetricKind::Counter),
             500,
         );
         backend.record_gauge(&info("q.depth", None, Unit::Count, MetricKind::Gauge), 7);
-        backend.record_bool(&info("connect", None, Unit::Count, MetricKind::BoolCounter), 2, 1);
+        backend.record_bool(
+            &info("connect", None, Unit::Count, MetricKind::BoolCounter),
+            2,
+            1,
+        );
         // An empty aggregation must NOT produce a bare `|#variant:` tag.
-        backend.record_counter(&info("empty.agg", Some(""), Unit::Count, MetricKind::Counter), 1);
+        backend.record_counter(
+            &info("empty.agg", Some(""), Unit::Count, MetricKind::Counter),
+            1,
+        );
         backend.report_end();
 
         let lines = sink.lines();
@@ -403,11 +413,18 @@ mod test {
         assert!(lines.contains(&"svc.q.depth:7|g".to_string()));
         assert!(lines.contains(&"svc.connect.true:2|c".to_string()));
         assert!(lines.contains(&"svc.connect.false:1|c".to_string()));
-        assert!(lines.contains(&"svc.empty.agg:1|c".to_string()), "got: {lines:?}");
+        assert!(
+            lines.contains(&"svc.empty.agg:1|c".to_string()),
+            "got: {lines:?}"
+        );
     }
 
-    fn line_value(lines: &[String], prefix: &str) -> u64 {
-        let line = lines.iter().find(|l| l.starts_with(prefix)).expect(prefix);
+    /// Parses the `{value}` out of a DogStatsD histogram line of the form `prefix{value}|h|@{w}`.
+    fn hist_value(line: &str, prefix: &str) -> u64 {
+        assert!(
+            line.starts_with(prefix),
+            "line {line:?} lacks prefix {prefix:?}"
+        );
         line[prefix.len()..line.find('|').unwrap()].parse().unwrap()
     }
 
@@ -427,21 +444,43 @@ mod test {
         let mut backend = StatsdBackend::new(sink.clone(), Some("svc".into()));
         registry.report(&mut backend);
 
-        let lines = sink.lines();
-        assert!(lines.contains(&"svc.task.time.count:3|c|#variant:d.0".to_string()));
+        // The distribution is emitted as one `|h` sample per non-empty bucket under the base name,
+        // each carrying a `@{1/count}` sample-rate weight, with the aggregation tag preserved. Two
+        // samples landed in the 5us bucket and one in the 10us bucket.
+        let lines: Vec<String> = sink
+            .lines()
+            .into_iter()
+            .filter(|l| l.starts_with("svc.task.time:"))
+            .collect();
+        assert_eq!(lines.len(), 2, "one line per non-empty bucket: {lines:?}");
+        for line in &lines {
+            assert!(
+                line.ends_with("|#variant:d.0"),
+                "aggregation tag missing: {line}"
+            );
+        }
 
         // The histogram view reports nanosecond bucket midpoints directly; statsd must pass them
-        // through unchanged. min is the 5us bucket (~5000ns, within the ~0.78% bucket error), and
-        // critically nowhere near 5_000_000.
-        let min = line_value(&lines, "svc.task.time.min:");
-        assert!((5000..5100).contains(&min), "min should be ~5000ns, got {min}");
-        let max = line_value(&lines, "svc.task.time.max:");
-        assert!((10000..10100).contains(&max), "max should be ~10000ns, got {max}");
-        // p50/p99 present and within the observed [5000, 10100) range.
-        let p50 = line_value(&lines, "svc.task.time.p50:");
-        let p99 = line_value(&lines, "svc.task.time.p99:");
-        assert!((5000..10100).contains(&p50), "p50 out of range: {p50}");
-        assert!((5000..10100).contains(&p99), "p99 out of range: {p99}");
+        // through unchanged. The two buckets are ~5000ns (weight 0.5, two samples) and ~10000ns
+        // (weight 1, one sample) — critically nowhere near 5_000_000.
+        let five = lines
+            .iter()
+            .find(|l| l.contains("|@0.5"))
+            .expect("5us bucket with weight 0.5");
+        let five_ns = hist_value(five, "svc.task.time:");
+        assert!(
+            (5000..5100).contains(&five_ns),
+            "5us bucket should be ~5000ns, got {five_ns}"
+        );
+        let ten = lines
+            .iter()
+            .find(|l| l.contains("|@1|"))
+            .expect("10us bucket with weight 1");
+        let ten_ns = hist_value(ten, "svc.task.time:");
+        assert!(
+            (10000..10100).contains(&ten_ns),
+            "10us bucket should be ~10000ns, got {ten_ns}"
+        );
     }
 
     #[test]
@@ -457,9 +496,17 @@ mod test {
         registry.report(&mut backend);
 
         let lines = sink.lines();
-        let min = line_value(&lines, "ratio.min:");
+        let line = lines
+            .iter()
+            .find(|l| l.starts_with("ratio:"))
+            .expect("ratio histogram line");
+        let value = hist_value(line, "ratio:");
         // ~50 (within bucket error), definitely not 50_000.
-        assert!((49..=51).contains(&min), "percent should be ~50, got {min}");
+        assert!(
+            (49..=51).contains(&value),
+            "percent should be ~50, got {value}"
+        );
+        assert!(line.contains("|h|@"), "should be a `|h` sample: {line}");
     }
 
     #[test]
@@ -543,7 +590,11 @@ mod test {
         let sink = CaptureSink::default();
         let mut backend = StatsdBackend::new(sink.clone(), None);
         backend.report_start(&ReportOptions::new(false));
-        backend.record_bool(&info("connect", None, Unit::Count, MetricKind::BoolCounter), 5, 0);
+        backend.record_bool(
+            &info("connect", None, Unit::Count, MetricKind::BoolCounter),
+            5,
+            0,
+        );
         backend.report_end();
         let lines = sink.lines();
         assert!(lines.contains(&"connect.true:5|c".to_string()));
