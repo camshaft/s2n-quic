@@ -335,6 +335,13 @@ where
 
 /// Configuration for the stream pipeline.
 pub struct Config {
+    /// Counter registry the endpoint records all of its metrics against.
+    ///
+    /// Passed in (rather than created internally) so an application can share one registry across
+    /// the endpoint, the [`fs`](crate::fs) IO scheduler, and its own instrumentation — a single
+    /// reporter then samples everything. Pass [`crate::counter::Registry::default()`] for a private
+    /// registry when no sharing is needed.
+    pub counters: crate::counter::Registry,
     /// Worker layout — maps pipeline roles to spawner thread indices.
     pub layout: WorkerLayout,
     /// Which backend drives the recv sockets (io_uring vs. cooperative syscall busy-poll).
@@ -424,10 +431,8 @@ where
     UpsSocket: crate::socket::send::Socket + Send + 'static,
     R: crate::runtime::Runtime,
 {
-    use crate::counter::Registry as CounterRegistry;
-
     let num_recv_dispatch = config.layout.recv_dispatch.len();
-    let counter_registry = CounterRegistry::default();
+    let counter_registry = config.counters.clone();
 
     let send_sockets: IdMap<_, _> = LocalSendSocketId::range(send_sockets.len())
         .zip(send_sockets)
@@ -511,6 +516,9 @@ where
     use crate::socket::channel::intrusive;
 
     let Config {
+        // The registry is already extracted and threaded through as `counter_registry`; drop the
+        // duplicate handle in the config here so the destructuring stays exhaustive.
+        counters: _,
         layout,
         recv_backend,
         send_pool,

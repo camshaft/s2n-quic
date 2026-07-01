@@ -443,6 +443,7 @@ pub fn setup_sim_endpoint(
         Arc::new(bach::net::UdpSocket::new(&send_bind_opts).expect("failed to bind UPS socket"));
 
     let endpoint_config = Config {
+        counters: crate::counter::Registry::default(),
         layout,
         // Sim sockets are in-process bach sockets without a real OS fd, so io_uring cannot drive them;
         // pin the syscall recv path explicitly (Auto would resolve to the same thing on a host with

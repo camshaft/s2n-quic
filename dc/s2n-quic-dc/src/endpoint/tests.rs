@@ -52,6 +52,7 @@ fn topology_snapshot_uses_dc_tester_layout() {
 
     let topology = runtime::inspector::endpoint_topology(
         Config {
+            counters: crate::counter::Registry::default(),
             layout,
             recv_backend: crate::endpoint::RecvBackend::Syscall,
             send_pool: Pool::new(u16::MAX),
