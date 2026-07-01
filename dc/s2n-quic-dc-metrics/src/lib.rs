@@ -17,11 +17,12 @@ pub mod format;
 
 pub use appender::MetricsWriter;
 pub use backend::{
-    Backend, CallbackValue, Histogram, MetricInfo, MetricKind, ReportOptions, Toggle, ToggleHandle,
+    Backend, CallbackValue, Histogram, MetricInfo, MetricKind, ReportOptions, Sparsity, Toggle,
+    ToggleHandle,
 };
 pub use bool_counter::BoolCounter;
 pub use counter::Counter;
-pub use registry::Registry;
+pub use registry::{MetricBuilder, Registry};
 pub use summary::{logging_util_float_to_integer, Summary, SummaryInner};
 
 pub use runtime::TaskMonitor;

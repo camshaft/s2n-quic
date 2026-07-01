@@ -14,9 +14,6 @@ pub(crate) trait ValueList {
     /// Invokes the callbacks and reports their values to `backend` as a single logical metric.
     fn report(&mut self, info: &MetricInfo<'_>, backend: &mut dyn Backend);
 
-    /// Whether this metric suppresses a zero value (e.g. a gauge).
-    fn zero_suppressed(&self) -> bool;
-
     /// The display unit for this metric.
     fn unit(&self) -> Unit;
 
@@ -24,12 +21,11 @@ pub(crate) trait ValueList {
     fn as_any(&mut self) -> &mut dyn Any;
 }
 
-/// The storage backing a callback-list metric: the callbacks, the display unit, and whether a
-/// zero value should be suppressed from output.
+/// The storage backing a callback-list metric: the callbacks and their display unit. The
+/// zero-emission policy lives on the registry entry (see [`crate::backend::Sparsity`]).
 pub(crate) struct CallbackList<F> {
     pub(crate) callbacks: Vec<F>,
     pub(crate) unit: Unit,
-    pub(crate) zero_suppressed: bool,
 }
 
 impl<V, F> ValueList for CallbackList<F>
@@ -41,12 +37,9 @@ where
         // Invoke every callback once (they may be stateful, e.g. delta counters) and materialize the
         // values so we can hand the backend a slice of trait objects.
         let values: Vec<V> = self.callbacks.iter_mut().map(|cb| cb()).collect();
-        let refs: Vec<&dyn CallbackValue> = values.iter().map(|v| v as &dyn CallbackValue).collect();
+        let refs: Vec<&dyn CallbackValue> =
+            values.iter().map(|v| v as &dyn CallbackValue).collect();
         backend.record_callback(info, &refs);
-    }
-
-    fn zero_suppressed(&self) -> bool {
-        self.zero_suppressed
     }
 
     fn unit(&self) -> Unit {

@@ -46,8 +46,8 @@ use crate::{
 };
 use arrow::{
     array::{
-        ArrayRef, BooleanBuilder, DictionaryArray, Float64Builder, Int32Array, Int64Builder,
-        ListBuilder, MapBuilder, RecordBatch, StringArray, StringBuilder, UInt64Builder,
+        ArrayRef, DictionaryArray, Float64Builder, Int32Array, Int64Builder, ListBuilder,
+        MapBuilder, RecordBatch, StringArray, StringBuilder, UInt64Builder,
     },
     datatypes::{DataType, Field, Int32Type, Schema, SchemaRef},
 };
@@ -101,7 +101,7 @@ pub fn schema() -> SchemaRef {
                 Field::new("kind", DataType::Utf8, false),
                 Field::new("unit", DataType::Utf8, false),
                 Field::new("aggregation", DataType::Utf8, true),
-                Field::new("zero_suppressed", DataType::Boolean, false),
+                Field::new("sparsity", DataType::Utf8, false),
                 // ── per-kind value columns (all nullable; exactly one group is set per row) ──
                 Field::new("counter", DataType::UInt64, true),
                 Field::new("gauge", DataType::Int64, true),
@@ -119,7 +119,11 @@ pub fn schema() -> SchemaRef {
                 // from `hist_buckets` (min/max = min/max key; quantiles = cumulative-count walk),
                 // so baking them in would just be a lossy, convention-encoding denormalization.
                 Field::new("hist_count", DataType::UInt64, true),
-                Field::new("hist_buckets", DataType::Map(Arc::new(bucket_entries), false), true),
+                Field::new(
+                    "hist_buckets",
+                    DataType::Map(Arc::new(bucket_entries), false),
+                    true,
+                ),
             ]))
         })
         .clone()
@@ -152,7 +156,7 @@ pub struct ArrowBackend {
     kind: StringBuilder,
     unit: StringBuilder,
     aggregation: StringBuilder,
-    zero_suppressed: BooleanBuilder,
+    sparsity: StringBuilder,
 
     counter: UInt64Builder,
     gauge: Int64Builder,
@@ -182,7 +186,7 @@ impl ArrowBackend {
             kind: StringBuilder::new(),
             unit: StringBuilder::new(),
             aggregation: StringBuilder::new(),
-            zero_suppressed: BooleanBuilder::new(),
+            sparsity: StringBuilder::new(),
             counter: UInt64Builder::new(),
             gauge: Int64Builder::new(),
             bool_true: UInt64Builder::new(),
@@ -208,10 +212,7 @@ impl ArrowBackend {
     /// follow the base columns in order, so the schema is stable. A label whose name collides with a
     /// base column is still appended as a separate column (Arrow permits duplicate field names);
     /// avoid base names like `name`/`kind`/`unit` to keep queries unambiguous.
-    pub fn with_labels(
-        mut self,
-        labels: impl IntoIterator<Item = (String, String)>,
-    ) -> Self {
+    pub fn with_labels(mut self, labels: impl IntoIterator<Item = (String, String)>) -> Self {
         // Precompute the full schema (base fields + one dictionary column per label, in order) and
         // each label's immutable 1-entry values dictionary, so `finish` only clones an `Arc` and
         // builds the row-length keys buffer.
@@ -262,7 +263,7 @@ impl ArrowBackend {
             Arc::new(self.kind.finish()),
             Arc::new(self.unit.finish()),
             Arc::new(self.aggregation.finish()),
-            Arc::new(self.zero_suppressed.finish()),
+            Arc::new(self.sparsity.finish()),
             Arc::new(self.counter.finish()),
             Arc::new(self.gauge.finish()),
             Arc::new(self.bool_true.finish()),
@@ -283,8 +284,7 @@ impl ArrowBackend {
         }
 
         self.rows = 0;
-        RecordBatch::try_new(self.schema.clone(), columns)
-            .expect("schema mismatch in ArrowBackend")
+        RecordBatch::try_new(self.schema.clone(), columns).expect("schema mismatch in ArrowBackend")
     }
 
     /// Appends the identity columns shared by every row. Each `record_*` then fills its value
@@ -296,7 +296,7 @@ impl ArrowBackend {
         self.kind.append_value(kind);
         self.unit.append_value(unit_str(info.unit));
         self.aggregation.append_option(info.aggregation);
-        self.zero_suppressed.append_value(info.zero_suppressed);
+        self.sparsity.append_value(info.sparsity.as_str());
     }
 
     /// Fills the value columns for a row, given each column's value (`None` → null). Centralizing
@@ -422,7 +422,10 @@ mod test {
     }
 
     fn u64_at(batch: &RecordBatch, name: &str, row: usize) -> Option<u64> {
-        let arr = col(batch, name).as_any().downcast_ref::<UInt64Array>().unwrap();
+        let arr = col(batch, name)
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
         arr.is_valid(row).then(|| arr.value(row))
     }
 
@@ -461,7 +464,10 @@ mod test {
             .unwrap();
 
         // Every row is stamped with the report timestamp.
-        let ts = col(&batch, "ts").as_any().downcast_ref::<Float64Array>().unwrap();
+        let ts = col(&batch, "ts")
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
         for row in 0..batch.num_rows() {
             assert_eq!(ts.value(row), 123.5);
         }
@@ -502,7 +508,10 @@ mod test {
             .downcast_ref::<MapArray>()
             .unwrap();
         assert!(buckets.is_valid(hist_row));
-        assert!(buckets.value(hist_row).len() >= 1, "at least one non-empty bucket");
+        assert!(
+            buckets.value(hist_row).len() >= 1,
+            "at least one non-empty bucket"
+        );
 
         // The additive callback exposes its value list (not a scalar sum).
         let cb_row = (0..batch.num_rows())
@@ -519,15 +528,19 @@ mod test {
         assert_eq!(values.value(0), 3.0);
 
         // The zero-suppressed gauge callback still emits its row (the backend keeps zeros); its
-        // metadata bit is preserved.
+        // sparse policy is preserved as the `sparsity` column.
         let g_row = (0..batch.num_rows())
             .find(|&r| names.value(r) == "g")
             .expect("gauge callback row");
-        let zero_suppressed = col(&batch, "zero_suppressed")
+        let sparsity = col(&batch, "sparsity")
             .as_any()
-            .downcast_ref::<arrow::array::BooleanArray>()
+            .downcast_ref::<StringArray>()
             .unwrap();
-        assert!(zero_suppressed.value(g_row));
+        assert_eq!(sparsity.value(g_row), "sparse");
+        // The always-on callback (`cb`) is dense.
+        assert_eq!(sparsity.value(cb_row), "dense");
+        // A plain counter inherits the report policy.
+        assert_eq!(sparsity.value(counter_row), "inherit");
     }
 
     /// `finish` resets the builders, so a second report is independent (and an empty report yields a
@@ -568,7 +581,10 @@ mod test {
         let batch = backend.finish();
 
         assert_eq!(batch.num_rows(), 1);
-        let gauge = col(&batch, "gauge").as_any().downcast_ref::<Int64Array>().unwrap();
+        let gauge = col(&batch, "gauge")
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
         assert_eq!(gauge.value(0), -5);
         assert!(col(&batch, "counter").is_null(0));
     }
@@ -626,7 +642,11 @@ mod test {
             .as_any()
             .downcast_ref::<DictionaryArray<Int32Type>>()
             .unwrap();
-        let host_values = host.values().as_any().downcast_ref::<StringArray>().unwrap();
+        let host_values = host
+            .values()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
         for row in 0..batch.num_rows() {
             assert_eq!(host_values.value(host.keys().value(row) as usize), "box-01");
         }

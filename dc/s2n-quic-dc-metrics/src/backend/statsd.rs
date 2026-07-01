@@ -104,9 +104,9 @@ impl<S: StatsdSink> Backend for StatsdBackend<S> {
     }
 
     fn record_counter(&mut self, info: &MetricInfo<'_>, value: u64) {
-        // Suppress zeros unless sparse output is requested, so steady-state reporting isn't flooded
-        // with `:0|c` lines (matching the querylog policy).
-        if value == 0 && !self.include_sparse {
+        // Suppress zeros unless the metric's sparse policy (or the report) opts into emitting them,
+        // so steady-state reporting isn't flooded with `:0|c` lines (matching the querylog policy).
+        if value == 0 && !info.emit_zero(self.include_sparse) {
             return;
         }
         write!(self.begin_record(info.name, ":"), "{value}|c").unwrap();
@@ -114,9 +114,8 @@ impl<S: StatsdSink> Backend for StatsdBackend<S> {
     }
 
     fn record_gauge(&mut self, info: &MetricInfo<'_>, value: i64) {
-        // Honor the zero-suppression policy: drop a zero when the metric is zero-suppressed or when
-        // sparse output is off.
-        if value == 0 && (info.zero_suppressed || !self.include_sparse) {
+        // Honor the metric's sparse policy: drop a zero unless the metric (or report) opts in.
+        if value == 0 && !info.emit_zero(self.include_sparse) {
             return;
         }
         write!(self.begin_record(info.name, ":"), "{value}|g").unwrap();
@@ -125,13 +124,14 @@ impl<S: StatsdSink> Backend for StatsdBackend<S> {
 
     fn record_bool(&mut self, info: &MetricInfo<'_>, true_count: u64, false_count: u64) {
         // Each side is its own counter, so apply the counter zero-suppression policy per side:
-        // a zero count is omitted unless sparse output is requested. (When both are zero this
-        // emits nothing under the normal policy, matching the all-zero suppression elsewhere.)
-        if true_count != 0 || self.include_sparse {
+        // a zero count is omitted unless the metric's sparse policy opts in. (When both are zero
+        // this emits nothing under the normal policy, matching the all-zero suppression elsewhere.)
+        let emit_zero = info.emit_zero(self.include_sparse);
+        if true_count != 0 || emit_zero {
             write!(self.begin_record(info.name, ".true:"), "{true_count}|c").unwrap();
             self.end_record(info.aggregation);
         }
-        if false_count != 0 || self.include_sparse {
+        if false_count != 0 || emit_zero {
             write!(self.begin_record(info.name, ".false:"), "{false_count}|c").unwrap();
             self.end_record(info.aggregation);
         }
@@ -186,8 +186,8 @@ impl<S: StatsdSink> Backend for StatsdBackend<S> {
             return;
         }
         let sum: f64 = values.iter().map(|v| v.as_f64()).sum();
-        // Honor the zero-suppression policy, as for gauges.
-        if sum == 0.0 && (info.zero_suppressed || !self.include_sparse) {
+        // Honor the metric's sparse policy, as for gauges.
+        if sum == 0.0 && !info.emit_zero(self.include_sparse) {
             return;
         }
         write!(self.begin_record(info.name, ":"), "{sum}|g").unwrap();
@@ -610,6 +610,44 @@ mod test {
         backend.report_end();
         let lines = sink.lines();
         assert!(lines.contains(&"c:0|c".to_string()));
+        assert!(lines.contains(&"b.true:0|c".to_string()));
+        assert!(lines.contains(&"b.false:0|c".to_string()));
+    }
+
+    #[test]
+    fn per_metric_sparsity_overrides_report_policy() {
+        use crate::backend::Sparsity;
+
+        // Under a non-sparse report, an `AlwaysDense` counter still emits its zero, while an
+        // `AlwaysSparse` counter is dropped even though the report is (report-wide) non-sparse.
+        let sink = CaptureSink::default();
+        let mut backend = StatsdBackend::new(sink.clone(), None);
+        backend.report_start(&ReportOptions::new(false));
+
+        let dense_name = arc("dense");
+        let mut dense = info(&dense_name, None, Unit::Count, MetricKind::Counter);
+        dense.sparsity = Sparsity::AlwaysDense;
+        backend.record_counter(&dense, 0);
+
+        let sparse_name = arc("sparse");
+        let mut sparse = info(&sparse_name, None, Unit::Count, MetricKind::Counter);
+        sparse.sparsity = Sparsity::AlwaysSparse;
+        backend.record_counter(&sparse, 0);
+
+        backend.report_end();
+        let lines = sink.lines();
+        assert_eq!(lines, vec!["dense:0|c".to_string()]);
+
+        // And an `AlwaysDense` all-zero bool emits both sides regardless of the report policy.
+        let sink = CaptureSink::default();
+        let mut backend = StatsdBackend::new(sink.clone(), None);
+        backend.report_start(&ReportOptions::new(false));
+        let b_name = arc("b");
+        let mut b = info(&b_name, None, Unit::Count, MetricKind::BoolCounter);
+        b.sparsity = Sparsity::AlwaysDense;
+        backend.record_bool(&b, 0, 0);
+        backend.report_end();
+        let lines = sink.lines();
         assert!(lines.contains(&"b.true:0|c".to_string()));
         assert!(lines.contains(&"b.false:0|c".to_string()));
     }
