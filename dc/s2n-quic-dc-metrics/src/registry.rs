@@ -54,8 +54,8 @@ impl RegistryInner {
         backend.report_start(options);
 
         for (key, value) in self.metrics.iter_mut() {
-            let name = key.name.as_str();
-            let aggregation = key.aggregation.as_deref();
+            let name = &key.name;
+            let aggregation = key.aggregation.as_ref();
             match value {
                 MetricValue::Counter(c) => {
                     let info = MetricInfo::new(name, aggregation, Unit::Count, MetricKind::Counter);
@@ -143,6 +143,9 @@ impl Registry {
     /// then reuse the returned type.
     #[track_caller]
     pub fn register_counter(&self, metric: String, aggregation: Option<String>) -> Counter {
+        let metric: Arc<str> = metric.into();
+        let aggregation: Option<Arc<str>> = aggregation.map(Into::into);
+
         let mut inner = self.inner.lock().unwrap();
         let inner = &mut *inner;
 
@@ -174,6 +177,9 @@ impl Registry {
         aggregation: Option<String>,
         display_unit: Unit,
     ) -> Summary {
+        let metric: Arc<str> = metric.into();
+        let aggregation: Option<Arc<str>> = aggregation.map(Into::into);
+
         let mut inner = self.inner.lock().unwrap();
         let inner = &mut *inner;
 
@@ -202,6 +208,9 @@ impl Registry {
     /// then reuse the returned type.
     #[track_caller]
     pub fn register_bool(&self, metric: String, aggregation: Option<String>) -> BoolCounter {
+        let metric: Arc<str> = metric.into();
+        let aggregation: Option<Arc<str>> = aggregation.map(Into::into);
+
         let mut inner = self.inner.lock().unwrap();
         let inner = &mut *inner;
 
@@ -277,6 +286,9 @@ impl Registry {
         V: crate::backend::CallbackValue,
         F: FnMut() -> V + 'static + Send,
     {
+        let metric: Arc<str> = metric.into();
+        let aggregation: Option<Arc<str>> = aggregation.map(Into::into);
+
         let mut inner = self.inner.lock().unwrap();
 
         let entry = inner.metrics.entry(MetricKey {
@@ -448,8 +460,8 @@ impl Default for Registry {
 /// two class/instance dimensions.
 #[derive(PartialEq, Eq, Hash, PartialOrd, Ord)]
 struct MetricKey {
-    name: String,
-    aggregation: Option<String>,
+    name: Arc<str>,
+    aggregation: Option<Arc<str>>,
 }
 
 /// This represents metric state. Note that a single metric may collect many different values

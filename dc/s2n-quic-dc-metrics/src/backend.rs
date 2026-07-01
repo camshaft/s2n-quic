@@ -111,16 +111,22 @@ pub enum MetricKind {
 }
 
 /// Metadata describing a single metric, passed by shared reference to every `record_*` call.
+///
+/// `name` and `aggregation` are borrowed as `&Arc<str>` rather than `&str` so a backend that caches
+/// per-metric state across reports (e.g. the Prometheus backend, which holds long-lived series
+/// keyed by name) can `clone` the `Arc` into its own map with only a refcount bump, instead of
+/// re-allocating the string on every report. Backends that only need a `&str` get one for free via
+/// deref coercion (`info.name` where a `&str` is expected).
 #[derive(Clone, Copy, Debug)]
 #[non_exhaustive]
 pub struct MetricInfo<'a> {
-    /// The metric name (e.g. `rx.data`).
-    pub name: &'a str,
+    /// The metric name (e.g. `rx.data`), shared with the registry's key so it can be cheaply cloned.
+    pub name: &'a Arc<str>,
     /// The aggregation/variant string, if any (e.g. `Variant|prefix-x`, `Task|foo`, `Runtime|bar`).
     ///
     /// This is the raw historical convention string; a later phase replaces it with structured
     /// variant data.
-    pub aggregation: Option<&'a str>,
+    pub aggregation: Option<&'a Arc<str>>,
     /// The display unit for this metric.
     pub unit: Unit,
     /// The kind of metric.
@@ -133,7 +139,12 @@ pub struct MetricInfo<'a> {
 
 impl<'a> MetricInfo<'a> {
     /// Constructs a `MetricInfo`, defaulting `zero_suppressed` to `false`.
-    pub fn new(name: &'a str, aggregation: Option<&'a str>, unit: Unit, kind: MetricKind) -> Self {
+    pub fn new(
+        name: &'a Arc<str>,
+        aggregation: Option<&'a Arc<str>>,
+        unit: Unit,
+        kind: MetricKind,
+    ) -> Self {
         Self {
             name,
             aggregation,

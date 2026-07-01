@@ -15,7 +15,7 @@ use crate::{
     backend::{Backend, CallbackValue, Histogram, MetricInfo, ReportOptions},
     Unit,
 };
-use std::fmt::Write as _;
+use std::{fmt::Write as _, sync::Arc};
 
 /// Default maximum UDP payload size (bytes) for a single datagram.
 pub const DEFAULT_MAX_PAYLOAD_SIZE: usize = 1200;
@@ -89,8 +89,8 @@ impl<S> StatsdBackend<S> {
     }
 
     /// Finishes the current record: appends the optional `|#variant:` tag and records the boundary.
-    fn end_record(&mut self, aggregation: Option<&str>) {
-        write_tag(&mut self.buffer, aggregation);
+    fn end_record(&mut self, aggregation: Option<&Arc<str>>) {
+        write_tag(&mut self.buffer, aggregation.map(|a| a.as_ref()));
         self.bounds.push(self.buffer.len());
     }
 }
@@ -371,9 +371,15 @@ mod test {
         }
     }
 
+    /// Builds an `Arc<str>` for a test metric name/aggregation. The returned value lives to the end
+    /// of the enclosing statement, which is long enough for the borrow taken by [`info`].
+    fn arc(s: &str) -> Arc<str> {
+        Arc::from(s)
+    }
+
     fn info<'a>(
-        name: &'a str,
-        agg: Option<&'a str>,
+        name: &'a Arc<str>,
+        agg: Option<&'a Arc<str>>,
         unit: Unit,
         kind: MetricKind,
     ) -> MetricInfo<'a> {
@@ -387,22 +393,35 @@ mod test {
 
         backend.report_start(&ReportOptions::default());
         backend.record_counter(
-            &info("rx.data", None, Unit::Count, MetricKind::Counter),
+            &info(&arc("rx.data"), None, Unit::Count, MetricKind::Counter),
             255,
         );
         backend.record_counter(
-            &info("rx.ecn", Some("ect0"), Unit::Count, MetricKind::Counter),
+            &info(
+                &arc("rx.ecn"),
+                Some(&arc("ect0")),
+                Unit::Count,
+                MetricKind::Counter,
+            ),
             500,
         );
-        backend.record_gauge(&info("q.depth", None, Unit::Count, MetricKind::Gauge), 7);
+        backend.record_gauge(
+            &info(&arc("q.depth"), None, Unit::Count, MetricKind::Gauge),
+            7,
+        );
         backend.record_bool(
-            &info("connect", None, Unit::Count, MetricKind::BoolCounter),
+            &info(&arc("connect"), None, Unit::Count, MetricKind::BoolCounter),
             2,
             1,
         );
         // An empty aggregation must NOT produce a bare `|#variant:` tag.
         backend.record_counter(
-            &info("empty.agg", Some(""), Unit::Count, MetricKind::Counter),
+            &info(
+                &arc("empty.agg"),
+                Some(&arc("")),
+                Unit::Count,
+                MetricKind::Counter,
+            ),
             1,
         );
         backend.report_end();
@@ -518,7 +537,10 @@ mod test {
         let buckets = [0u64; 8];
         let cfg = crate::summary::bucket::Config::new(7, 64);
         let hist = Histogram::new(&buckets, &cfg, Unit::Count);
-        backend.record_histogram(&info("h", None, Unit::Count, MetricKind::Histogram), hist);
+        backend.record_histogram(
+            &info(&arc("h"), None, Unit::Count, MetricKind::Histogram),
+            hist,
+        );
         backend.report_end();
         assert!(sink.datagrams().is_empty());
     }
@@ -566,8 +588,12 @@ mod test {
         let sink = CaptureSink::default();
         let mut backend = StatsdBackend::new(sink.clone(), None);
         backend.report_start(&ReportOptions::new(false));
-        backend.record_counter(&info("c", None, Unit::Count, MetricKind::Counter), 0);
-        backend.record_bool(&info("b", None, Unit::Count, MetricKind::BoolCounter), 0, 0);
+        backend.record_counter(&info(&arc("c"), None, Unit::Count, MetricKind::Counter), 0);
+        backend.record_bool(
+            &info(&arc("b"), None, Unit::Count, MetricKind::BoolCounter),
+            0,
+            0,
+        );
         backend.report_end();
         assert!(sink.datagrams().is_empty());
 
@@ -575,8 +601,12 @@ mod test {
         let sink = CaptureSink::default();
         let mut backend = StatsdBackend::new(sink.clone(), None);
         backend.report_start(&ReportOptions::new(true));
-        backend.record_counter(&info("c", None, Unit::Count, MetricKind::Counter), 0);
-        backend.record_bool(&info("b", None, Unit::Count, MetricKind::BoolCounter), 0, 0);
+        backend.record_counter(&info(&arc("c"), None, Unit::Count, MetricKind::Counter), 0);
+        backend.record_bool(
+            &info(&arc("b"), None, Unit::Count, MetricKind::BoolCounter),
+            0,
+            0,
+        );
         backend.report_end();
         let lines = sink.lines();
         assert!(lines.contains(&"c:0|c".to_string()));
@@ -591,7 +621,7 @@ mod test {
         let mut backend = StatsdBackend::new(sink.clone(), None);
         backend.report_start(&ReportOptions::new(false));
         backend.record_bool(
-            &info("connect", None, Unit::Count, MetricKind::BoolCounter),
+            &info(&arc("connect"), None, Unit::Count, MetricKind::BoolCounter),
             5,
             0,
         );
@@ -613,7 +643,12 @@ mod test {
         let b: u64 = 4;
         let values: [&dyn CallbackValue; 2] = [&a, &b];
         backend.record_callback(
-            &info("workers", None, Unit::Count, MetricKind::CallbackScalar),
+            &info(
+                &arc("workers"),
+                None,
+                Unit::Count,
+                MetricKind::CallbackScalar,
+            ),
             &values,
         );
         backend.report_end();
