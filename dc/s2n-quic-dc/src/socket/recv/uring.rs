@@ -649,12 +649,15 @@ mod tests {
         time::Duration,
     };
 
+    /// Captured segments: each entry is `(payload bytes, source port)`.
+    type CapturedSegments = Arc<Mutex<Vec<(Vec<u8>, u16)>>>;
+
     /// A `Router` that captures each received segment's payload + peer address into a shared vec, so a
     /// test can assert exactly what the ring delivered. It overrides `on_segment` to bypass packet
     /// decoding (the test sends arbitrary bytes, not real dc packets).
     #[derive(Clone)]
     struct CaptureRouter {
-        received: Arc<Mutex<Vec<(Vec<u8>, u16)>>>,
+        received: CapturedSegments,
     }
 
     impl Router for CaptureRouter {
