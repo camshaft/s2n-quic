@@ -21,6 +21,14 @@
 //! gauge, both bool sides, every callback value (not their sum), the full native bucket map — is
 //! preserved.
 //!
+//! # Labels
+//!
+//! Applications add their own dimensions (host, region, run id, ...) via
+//! [`with_labels`](ArrowBackend::with_labels): each becomes an extra dictionary-encoded column on
+//! every row, so a glob query over the produced files can filter/group on it directly. This is
+//! preferred over file-level schema metadata, which query engines do not project as a queryable
+//! column across a glob.
+//!
 //! # Reuse
 //!
 //! Like every [`Backend`], this is meant to be long-lived. The intended flow is to drain each
@@ -38,15 +46,34 @@ use crate::{
 };
 use arrow::{
     array::{
-        ArrayRef, BooleanBuilder, Float64Builder, Int64Builder, ListBuilder, MapBuilder,
-        RecordBatch, StringBuilder, UInt64Builder,
+        ArrayRef, BooleanBuilder, DictionaryArray, Float64Builder, Int32Array, Int64Builder,
+        ListBuilder, MapBuilder, RecordBatch, StringArray, StringBuilder, UInt64Builder,
     },
-    datatypes::{DataType, Field, Schema, SchemaRef},
+    datatypes::{DataType, Field, Int32Type, Schema, SchemaRef},
 };
 use std::sync::{Arc, OnceLock};
 
-/// The clean, convention-free Arrow schema produced by [`ArrowBackend`]. Cached so repeated
-/// [`finish`](ArrowBackend::finish) calls reuse one `SchemaRef`.
+/// The Arrow `DataType` of a label column: a dictionary-encoded UTF-8 string.
+///
+/// Labels are constant for a backend's lifetime, so every row repeats the same value. A plain
+/// `Utf8` column would store that string N times; dictionary encoding stores the string once (in a
+/// 1-entry values dictionary) plus an N-entry `Int32` keys buffer of all-zeros. This both shrinks
+/// the in-memory batch and maps 1:1 onto Parquet's own dictionary encoding, so the write is a near
+/// direct handoff. The dictionary is a physical encoding detail scoped below the logical value:
+/// readers (e.g. DuckDB over a glob of files, each with its own local dictionary) decode to the
+/// logical string before anything sees it, so cross-file queries behave identically to a plain
+/// string column. The one caveat is in-memory Arrow-to-Arrow concat, which must unify dictionaries
+/// — not a concern for the write-Parquet-then-query path, but worth knowing if a consumer streams
+/// these batches over IPC/Flight and concatenates them.
+fn label_data_type() -> DataType {
+    DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8))
+}
+
+/// The clean, convention-free base Arrow schema (no [labels](ArrowBackend::with_labels)) produced by
+/// [`ArrowBackend`]. Cached so repeated calls reuse one `SchemaRef`.
+///
+/// A labeled backend appends one dictionary column per label after these fields; use
+/// [`ArrowBackend::schema`] to get the full schema (including labels) for constructing a writer.
 pub fn schema() -> SchemaRef {
     static SCHEMA: OnceLock<SchemaRef> = OnceLock::new();
     SCHEMA
@@ -104,6 +131,12 @@ pub fn schema() -> SchemaRef {
 pub struct ArrowBackend {
     timestamp: f64,
 
+    /// Constant `(name, value)` labels appended as one dictionary column per label to every batch
+    /// (e.g. `("host", "box-01")`). Fixed for the backend's lifetime, so `schema` is precomputed.
+    labels: Vec<(String, String)>,
+    /// Full schema including the label columns, computed once from `labels`.
+    schema: SchemaRef,
+
     ts: Float64Builder,
     name: StringBuilder,
     kind: StringBuilder,
@@ -132,6 +165,8 @@ impl ArrowBackend {
     pub fn new() -> Self {
         Self {
             timestamp: 0.0,
+            labels: Vec::new(),
+            schema: schema(),
             ts: Float64Builder::new(),
             name: StringBuilder::new(),
             kind: StringBuilder::new(),
@@ -147,6 +182,42 @@ impl ArrowBackend {
             hist_buckets: MapBuilder::new(None, UInt64Builder::new(), UInt64Builder::new()),
             rows: 0,
         }
+    }
+
+    /// Attaches constant `(name, value)` labels, each emitted as an extra column on every row of
+    /// every batch this backend produces (e.g. `("host", "box-01")`, `("region", "us-east-1")`).
+    ///
+    /// This is the recommended way for an application to add its own dimensions — host, region,
+    /// run id, etc. — so that a glob query over the resulting Parquet files can filter/group on them
+    /// with no per-file manipulation (unlike file-level schema metadata, which is not projected as a
+    /// queryable column). Label columns are dictionary-encoded (see [`label_data_type`]), so the
+    /// repeated constant value costs little in memory and maps directly onto Parquet's dictionary
+    /// encoding.
+    ///
+    /// Labels are fixed for the backend's lifetime; call this once at construction. Label columns
+    /// follow the base columns in order, so the schema is stable. A label whose name collides with a
+    /// base column is still appended as a separate column (Arrow permits duplicate field names);
+    /// avoid base names like `name`/`kind`/`unit` to keep queries unambiguous.
+    pub fn with_labels(
+        mut self,
+        labels: impl IntoIterator<Item = (String, String)>,
+    ) -> Self {
+        self.labels = labels.into_iter().collect();
+
+        // Precompute the full schema: base fields + one dictionary column per label, in order.
+        let mut fields: Vec<Field> = schema().fields().iter().map(|f| (**f).clone()).collect();
+        for (name, _) in &self.labels {
+            // Non-nullable: every row always carries the constant label value.
+            fields.push(Field::new(name, label_data_type(), false));
+        }
+        self.schema = Arc::new(Schema::new(fields));
+        self
+    }
+
+    /// The full schema of the batches this backend produces, including any
+    /// [labels](Self::with_labels). Use this to construct the downstream writer.
+    pub fn schema(&self) -> SchemaRef {
+        self.schema.clone()
     }
 
     /// The timestamp (unix-epoch seconds, fractional) stamped onto every row of the current report.
@@ -168,7 +239,8 @@ impl ArrowBackend {
     /// `finish` is independent of [`report_start`](Backend::report_start): call it once after each
     /// report pass to obtain that report's batch.
     pub fn finish(&mut self) -> RecordBatch {
-        let columns: Vec<ArrayRef> = vec![
+        let rows = self.rows;
+        let mut columns: Vec<ArrayRef> = vec![
             Arc::new(self.ts.finish()),
             Arc::new(self.name.finish()),
             Arc::new(self.kind.finish()),
@@ -183,8 +255,21 @@ impl ArrowBackend {
             Arc::new(self.hist_count.finish()),
             Arc::new(self.hist_buckets.finish()),
         ];
+
+        // Append one constant dictionary column per label. A constant column needs no builder loop:
+        // the keys are all-zero (every row points at the single dictionary entry) and the values
+        // dictionary holds the label value once.
+        for (_, value) in &self.labels {
+            let keys = Int32Array::from(vec![0; rows]);
+            let values = Arc::new(StringArray::from(vec![value.as_str()])) as ArrayRef;
+            let dict = DictionaryArray::<Int32Type>::try_new(keys, values)
+                .expect("constant label dictionary is well-formed");
+            columns.push(Arc::new(dict));
+        }
+
         self.rows = 0;
-        RecordBatch::try_new(schema(), columns).expect("schema mismatch in ArrowBackend")
+        RecordBatch::try_new(self.schema.clone(), columns)
+            .expect("schema mismatch in ArrowBackend")
     }
 
     /// Appends the identity columns shared by every row. Each `record_*` then fills its value
@@ -491,5 +576,47 @@ mod test {
         // Exactly one report's worth of rows (the counter drained to 0 on the first report), not
         // two reports mixed together.
         assert_eq!(batch.num_rows(), 1);
+    }
+
+    /// `with_labels` adds a dictionary column per label, carrying its constant value on every row,
+    /// and the label columns follow the base columns in the schema.
+    #[test]
+    fn labels_add_constant_dictionary_columns() {
+        use arrow::array::DictionaryArray;
+        use arrow::datatypes::Int32Type;
+
+        let registry = Registry::new();
+        registry.register_counter("c".into(), None).increment(1);
+        registry.register_counter("d".into(), None).increment(2);
+
+        let mut backend = ArrowBackend::new().with_labels([
+            ("host".to_string(), "box-01".to_string()),
+            ("region".to_string(), "us-east-1".to_string()),
+        ]);
+        registry.report(&mut backend);
+        let batch = backend.finish();
+
+        assert_eq!(batch.num_rows(), 2);
+
+        // Label columns follow the base columns and are dictionary-typed.
+        assert_eq!(batch.schema(), backend.schema());
+        assert_eq!(
+            batch.schema().field_with_name("host").unwrap().data_type(),
+            &label_data_type()
+        );
+
+        // Every row carries the constant label value (decoded through the dictionary).
+        let host = col(&batch, "host")
+            .as_any()
+            .downcast_ref::<DictionaryArray<Int32Type>>()
+            .unwrap();
+        let host_values = host.values().as_any().downcast_ref::<StringArray>().unwrap();
+        for row in 0..batch.num_rows() {
+            assert_eq!(host_values.value(host.keys().value(row) as usize), "box-01");
+        }
+
+        // A no-label backend keeps the base schema exactly.
+        let plain = ArrowBackend::new();
+        assert_eq!(plain.schema(), schema());
     }
 }
