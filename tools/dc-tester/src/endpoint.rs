@@ -105,6 +105,9 @@ pub fn create(
     };
 
     let endpoint_config = endpoint::Config {
+        // One registry for everything: workloads register their timers on `endpoint.counters`
+        // (a clone of this handle) and `main` spawns the reporter that drains it.
+        counters: s2n_quic_dc::counter::Registry::default(),
         layout,
         recv_backend: config.recv_backend(),
         send_pool,

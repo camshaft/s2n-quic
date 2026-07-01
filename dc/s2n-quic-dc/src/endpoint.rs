@@ -337,10 +337,11 @@ where
 pub struct Config {
     /// Counter registry the endpoint records all of its metrics against.
     ///
-    /// Passed in (rather than created internally) so an application can share one registry across
-    /// the endpoint, the [`fs`](crate::fs) IO scheduler, and its own instrumentation — a single
-    /// reporter then samples everything. Pass [`crate::counter::Registry::default()`] for a private
-    /// registry when no sharing is needed.
+    /// [`Registry`](crate::counter::Registry) is a handle: cloning it yields another handle onto the
+    /// same underlying storage. To share one registry across the endpoint, the [`fs`](crate::fs) IO
+    /// scheduler, and an application's own instrumentation, keep a clone and pass another clone here
+    /// — a single reporter draining any of the clones then samples everything. Pass
+    /// [`crate::counter::Registry::default()`] for a private registry when no sharing is needed.
     pub counters: crate::counter::Registry,
     /// Worker layout — maps pipeline roles to spawner thread indices.
     pub layout: WorkerLayout,
