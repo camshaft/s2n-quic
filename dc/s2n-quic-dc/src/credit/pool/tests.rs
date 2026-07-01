@@ -31,6 +31,20 @@ crate::assert_slot_at_offset_zero!(TestAlloc);
 
 static DROP_COUNT: AtomicUsize = AtomicUsize::new(0);
 
+/// Serializes the tests that assert against the global [`DROP_COUNT`]. Each such test does
+/// `store(0)` then later asserts an exact count, so two running in parallel (as `cargo test` /
+/// `llvm-cov` do by default) clobber each other's counter. Holding this lock for the test body
+/// makes that store→assert window exclusive. Returns a guard the caller binds for the test's
+/// lifetime; the counter is reset here under the lock.
+#[must_use]
+fn drop_count_guard() -> std::sync::MutexGuard<'static, ()> {
+    static DROP_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // Recover from a poisoned lock: a panicking test elsewhere must not cascade-fail the rest.
+    let guard = DROP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    DROP_COUNT.store(0, Ordering::Relaxed);
+    guard
+}
+
 unsafe fn drop_test_alloc(ptr: NonNull<Slot>) {
     DROP_COUNT.fetch_add(1, Ordering::Relaxed);
     let ptr = ptr.cast::<TestAlloc>();
@@ -505,7 +519,7 @@ fn priority_ordering() {
 
 #[test]
 fn drop_while_linked() {
-    DROP_COUNT.store(0, Ordering::Relaxed);
+    let _drop_guard = drop_count_guard();
 
     let mut h = Harness::new(cfg(0, 100));
 
@@ -529,7 +543,7 @@ fn drop_while_linked() {
 
 #[test]
 fn drop_while_idle() {
-    DROP_COUNT.store(0, Ordering::Relaxed);
+    let _drop_guard = drop_count_guard();
 
     let slot = alloc_test_slot();
     let slot_ref = unsafe { &*slot.as_ptr() };
@@ -541,7 +555,7 @@ fn drop_while_idle() {
 
 #[test]
 fn dead_entry_skipped_in_distribution() {
-    DROP_COUNT.store(0, Ordering::Relaxed);
+    let _drop_guard = drop_count_guard();
 
     let mut h = Harness::new(cfg(0, 100));
 
@@ -577,6 +591,11 @@ fn dead_entry_skipped_in_distribution() {
 
 #[test]
 fn mixed_alive_and_dead_in_distribution() {
+    // Held for the whole body: this test resets `DROP_COUNT` mid-way (after the abandon, before the
+    // release) and asserts an exact count, so it must not run concurrently with the other
+    // DROP_COUNT tests. The explicit reset below is the meaningful one for this test's window.
+    let _drop_guard = drop_count_guard();
+
     let mut h = Harness::new(cfg(0, 1000));
 
     let slots: Vec<_> = (0..5).map(|_| alloc_test_slot()).collect();
@@ -697,7 +716,7 @@ fn pool_drop_signals_closed() {
 fn abandon_then_pool_drop_frees_dead_slot() {
     // Covers the SlotPtr::drop DEAD branch: a slot abandoned (rc=DEAD) before pool shutdown must be
     // freed by the close path, not closed/woken.
-    DROP_COUNT.store(0, Ordering::Relaxed);
+    let _drop_guard = drop_count_guard();
 
     let counter = Arc::new(WakeCounter::default());
     let waker = Waker::from(counter.clone());
@@ -985,6 +1004,12 @@ fn carry_releases_when_queue_drains() {
     //
     // Conservation-honest: the 30 the test releases is first acquired (drained to in-flight), so the
     // release is real returning bytes, not credit conjured past `capacity`.
+    //
+    // This test abandons slots (→ the shared `drop_test_alloc` bumps the global `DROP_COUNT`), so it
+    // holds the same lock as the tests that assert on that counter, to keep their store→assert
+    // windows exclusive. It does not read the counter itself.
+    let _drop_guard = drop_count_guard();
+
     let mut h = Harness::new(cfg(30, 100));
 
     let drain_slot = alloc_test_slot();
@@ -1137,6 +1162,11 @@ fn poll_acquire_after_distributor_drop_signals_closed() {
 fn budget_exhaustion_with_dead_reaps() {
     // Mix dead and live slots so reclaimed_avail > 0 and budget runs out mid-walk. Conservation
     // (no over-commit) and no-snipe (available <= 0 with live parkers) must both hold.
+    //
+    // Abandons slots (→ shared `drop_test_alloc` bumps the global `DROP_COUNT`), so hold the same
+    // lock as the counter-asserting tests to keep their windows exclusive. Does not read it.
+    let _drop_guard = drop_count_guard();
+
     let mut h = Harness::new(cfg(0, 100));
 
     let counters: Vec<_> = (0..6).map(|_| Arc::new(WakeCounter::default())).collect();

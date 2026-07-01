@@ -483,7 +483,12 @@ jobs:
         run: curl -LsSf https://github.com/taiki-e/cargo-llvm-cov/releases/latest/download/cargo-llvm-cov-x86_64-unknown-linux-gnu.tar.gz | tar xzf - -C ~/.cargo/bin
 
       - name: Run cargo llvm-cov
-        run: cargo llvm-cov --html --no-fail-fast -p s2n-quic-core -p s2n-quic-dc --all-features
+        # NOT `--all-features`: the `loom` feature swaps `crate::sync` to loom's instrumented
+        # atomics/mutex, which panic when constructed outside a `loom::model()` block. That is
+        # correct for the dedicated loom-dc job but breaks every ordinary test that builds a
+        # sync-using type (e.g. a credit `Pool`). loom is a test harness, not a product feature, so
+        # its lines don't need coverage — enumerate the product features instead and omit `loom`.
+        run: cargo llvm-cov --html --no-fail-fast -p s2n-quic-core -p s2n-quic-dc --features "tokio,testing,bolero-generator,tracing,metric-tracing,queue-dbg,io-dbg"
 
       - name: Upload coverage report artifact
         if: ${{ always() }}
