@@ -38,6 +38,7 @@ use crate::{
     Unit,
 };
 use std::{
+    borrow::Cow,
     collections::BTreeMap,
     fmt::Write as _,
     sync::{Arc, Mutex},
@@ -51,10 +52,17 @@ use std::{
 /// is the whole point), so nothing is cleared in [`report_start`](Backend::report_start) beyond
 /// per-report options.
 pub struct PrometheusBackend {
-    /// Authoritative cumulative state, keyed by sanitized metric name.
-    families: BTreeMap<String, Family>,
+    /// Authoritative cumulative state, keyed by the sanitized (display) metric name.
+    families: BTreeMap<Arc<str>, Family>,
+    /// Cache of raw metric name (the registry's shared `Arc<str>`) -> sanitized display name, so the
+    /// sanitize+allocate conversion runs once per distinct name instead of every report. Populated
+    /// freely (bounded by the fixed set of registered names); interning a name does not emit it.
+    name_cache: BTreeMap<Arc<str>, Arc<str>>,
     /// Optional prefix prepended to every metric name (joined with `_`).
     prefix: Option<String>,
+    /// Shared empty-aggregation sentinel, cloned (refcount bump) to build series keys for metrics
+    /// with no aggregation, avoiding a fresh allocation per record.
+    empty: Arc<str>,
     /// The rendered exposition text most recently published for scraping.
     published: Arc<Mutex<Arc<str>>>,
     include_sparse: bool,
@@ -96,7 +104,9 @@ impl PrometheusBackend {
         (
             Self {
                 families: BTreeMap::new(),
+                name_cache: BTreeMap::new(),
                 prefix,
+                empty: Arc::from(""),
                 published,
                 include_sparse: false,
             },
@@ -104,19 +114,29 @@ impl PrometheusBackend {
         )
     }
 
-    /// The sanitized, prefixed family name for `info`.
-    fn family_name(&self, info: &MetricInfo<'_>) -> String {
-        let mut name = String::new();
-        write_name(&mut name, self.prefix.as_deref(), info.name);
-        name
+    /// The sanitized, prefixed display name for `info`, as a shared `Arc<str>`.
+    ///
+    /// Cached on the registry's raw name handle: the sanitize+allocate work runs once per distinct
+    /// metric name, and thereafter every report just clones an `Arc` (a refcount bump). The
+    /// registry hands us the *same* `Arc<str>` for a given metric each report (see `MetricInfo`),
+    /// so the cache key is stable and cheap to look up.
+    fn display_name(&mut self, info: &MetricInfo<'_>) -> Arc<str> {
+        if let Some(name) = self.name_cache.get(info.name) {
+            return name.clone();
+        }
+        let mut sanitized = String::new();
+        write_name(&mut sanitized, self.prefix.as_deref(), info.name);
+        let sanitized: Arc<str> = Arc::from(sanitized);
+        self.name_cache.insert(info.name.clone(), sanitized.clone());
+        sanitized
     }
 
-    /// Whether a series is already retained under `name`/`key`.
+    /// Whether a series is already retained under the display `name`/`key`.
     ///
     /// Used to decide suppression *without* materializing the family: `Registry::report` visits
     /// every registered metric every interval (zeros included), so inserting on the suppressed path
     /// would grow `families` to hold every metric name forever, defeating zero-suppression.
-    fn series_present(&self, name: &str, key: &str) -> bool {
+    fn series_present(&self, name: &Arc<str>, key: &SeriesKey) -> bool {
         self.families
             .get(name)
             .is_some_and(|f| f.series.contains_key(key))
@@ -128,12 +148,24 @@ impl PrometheusBackend {
     /// a single kind across all its aggregations (as every call site registers it), matching the
     /// per-family `# TYPE` requirement of the exposition format. Call only once the record has been
     /// decided to be retained, so a suppressed metric never inserts an empty family.
-    fn family_or_insert(&mut self, name: String, info: &MetricInfo<'_>) -> &mut Family {
+    fn family_or_insert(&mut self, name: Arc<str>, info: &MetricInfo<'_>) -> &mut Family {
         self.families.entry(name).or_insert_with(|| Family {
             kind: info.kind,
             unit: info.unit,
             series: BTreeMap::new(),
         })
+    }
+
+    /// The series key for `info` and an optional bool side.
+    ///
+    /// Shares the registry's aggregation `Arc<str>` (a refcount bump, not a fresh allocation);
+    /// metrics with no aggregation reuse the shared [`empty`](Self::empty) sentinel.
+    fn series_key(&self, info: &MetricInfo<'_>, side: Option<BoolSide>) -> SeriesKey {
+        let aggregation = match info.aggregation {
+            Some(agg) => agg.clone(),
+            None => self.empty.clone(),
+        };
+        SeriesKey { aggregation, side }
     }
 
     /// Renders the full cumulative state into the Prometheus text exposition format.
@@ -144,9 +176,11 @@ impl PrometheusBackend {
                 continue;
             }
             writeln!(out, "# TYPE {name} {}", family.prom_type()).unwrap();
-            for (aggregation, series) in &family.series {
-                let labels = parse_labels(aggregation);
-                series.encode(&mut out, name, &labels, family.unit);
+            for entry in family.series.values() {
+                // Labels were parsed once when the series was created; reuse them here.
+                entry
+                    .state
+                    .encode(&mut out, name, &entry.labels, family.unit);
             }
         }
         out
@@ -170,49 +204,44 @@ impl Backend for PrometheusBackend {
         // Skip a counter that has never been non-zero (avoids clutter). Once a series exists it is
         // retained and keeps rendering its cumulative total, even when a later delta is zero, so the
         // time series has no gaps.
-        let key = info.aggregation.unwrap_or("");
-        let name = self.family_name(info);
+        let name = self.display_name(info);
+        let key = self.series_key(info, None);
         // Suppress a counter that has never been non-zero, without materializing its family (see
         // `series_present`): the registry re-visits every metric each interval, so inserting here
         // would leak an empty family per zero-only metric.
-        if value == 0 && !self.include_sparse && !self.series_present(&name, key) {
+        if value == 0 && !self.include_sparse && !self.series_present(&name, &key) {
             return;
         }
         let family = self.family_or_insert(name, info);
-        match family
-            .series
-            .entry(key.to_string())
-            .or_insert(Series::Counter(0))
-        {
+        match &mut family.entry(key).state {
             Series::Counter(total) => *total += value,
             _ => unreachable!("counter family has non-counter series"),
         }
     }
 
     fn record_gauge(&mut self, info: &MetricInfo<'_>, value: i64) {
-        let key = info.aggregation.unwrap_or("");
-        let name = self.family_name(info);
+        let name = self.display_name(info);
+        let key = self.series_key(info, None);
         if value == 0
             && (info.zero_suppressed || !self.include_sparse)
-            && !self.series_present(&name, key)
+            && !self.series_present(&name, &key)
         {
             return;
         }
-        let key = key.to_string();
         let family = self.family_or_insert(name, info);
-        *family.series.entry(key).or_insert(Series::Gauge(0.0)) = Series::Gauge(value as f64);
+        family.entry(key).state = Series::Gauge(value as f64);
     }
 
     fn record_bool(&mut self, info: &MetricInfo<'_>, true_count: u64, false_count: u64) {
         // One counter family with a `result` label per side; each side accumulates like a counter.
-        let name = self.family_name(info);
-        for (label, delta) in [("true", true_count), ("false", false_count)] {
-            let key = bool_key(info.aggregation, label);
+        let name = self.display_name(info);
+        for (side, delta) in [(BoolSide::True, true_count), (BoolSide::False, false_count)] {
+            let key = self.series_key(info, Some(side));
             if delta == 0 && !self.include_sparse && !self.series_present(&name, &key) {
                 continue;
             }
             let family = self.family_or_insert(name.clone(), info);
-            match family.series.entry(key).or_insert(Series::Counter(0)) {
+            match &mut family.entry(key).state {
                 Series::Counter(total) => *total += delta,
                 _ => unreachable!("bool family has non-counter series"),
             }
@@ -220,18 +249,17 @@ impl Backend for PrometheusBackend {
     }
 
     fn record_histogram(&mut self, info: &MetricInfo<'_>, hist: Histogram<'_>) {
-        let key = info.aggregation.unwrap_or("");
         let unit = info.unit;
-        let name = self.family_name(info);
-        if hist.count() == 0 && !self.include_sparse && !self.series_present(&name, key) {
+        let name = self.display_name(info);
+        let key = self.series_key(info, None);
+        if hist.count() == 0 && !self.include_sparse && !self.series_present(&name, &key) {
             return;
         }
         let bounds = default_buckets(unit);
         let family = self.family_or_insert(name, info);
-        let series = family
-            .series
-            .entry(key.to_string())
-            .or_insert_with(|| Series::Histogram(HistState::new(bounds.len())));
+        let series = &mut family
+            .entry_with(key, || Series::Histogram(HistState::new(bounds.len())))
+            .state;
         let Series::Histogram(state) = series else {
             unreachable!("histogram family has non-histogram series");
         };
@@ -259,17 +287,16 @@ impl Backend for PrometheusBackend {
             return;
         }
         let sum: f64 = values.iter().map(|v| v.as_f64()).sum();
-        let key = info.aggregation.unwrap_or("");
-        let name = self.family_name(info);
+        let name = self.display_name(info);
+        let key = self.series_key(info, None);
         if sum == 0.0
             && (info.zero_suppressed || !self.include_sparse)
-            && !self.series_present(&name, key)
+            && !self.series_present(&name, &key)
         {
             return;
         }
-        let key = key.to_string();
         let family = self.family_or_insert(name, info);
-        *family.series.entry(key).or_insert(Series::Gauge(0.0)) = Series::Gauge(sum);
+        family.entry(key).state = Series::Gauge(sum);
     }
 
     fn report_end(&mut self) {
@@ -281,9 +308,8 @@ impl Backend for PrometheusBackend {
 struct Family {
     kind: MetricKind,
     unit: Unit,
-    /// Series keyed by their raw aggregation string (`""` for none); for bool counters the key also
-    /// carries the `result` side (see [`bool_key`]).
-    series: BTreeMap<String, Series>,
+    /// Series keyed by their [`SeriesKey`] (aggregation `Arc<str>` + optional bool side).
+    series: BTreeMap<SeriesKey, SeriesEntry>,
 }
 
 impl Family {
@@ -295,6 +321,81 @@ impl Family {
             MetricKind::Histogram => "histogram",
         }
     }
+
+    /// Looks up (or creates, defaulting to a zeroed [`Series`] matching the family kind) the entry
+    /// for `key`. The label set is parsed once, when the entry is first created.
+    fn entry(&mut self, key: SeriesKey) -> &mut SeriesEntry {
+        let kind = self.kind;
+        self.entry_with(key, || Series::zeroed(kind))
+    }
+
+    /// Like [`entry`](Self::entry) but with an explicit initializer (used for histograms, whose
+    /// zeroed state needs the bucket count).
+    fn entry_with(&mut self, key: SeriesKey, init: impl FnOnce() -> Series) -> &mut SeriesEntry {
+        self.series
+            .entry(key)
+            .or_insert_with_key(|key| SeriesEntry {
+                labels: key.labels(),
+                state: init(),
+            })
+    }
+}
+
+/// A series' cached labels plus its cumulative state.
+struct SeriesEntry {
+    /// Labels derived from the key's aggregation/side, parsed once at creation and reused every
+    /// report (label parsing is otherwise pure overhead on the encode path).
+    labels: Vec<(Cow<'static, str>, Arc<str>)>,
+    state: Series,
+}
+
+/// Which side of a bool counter a series represents.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum BoolSide {
+    True,
+    False,
+}
+
+impl BoolSide {
+    fn as_str(self) -> &'static str {
+        match self {
+            BoolSide::True => "true",
+            BoolSide::False => "false",
+        }
+    }
+}
+
+/// Identifies a series within a family: the raw aggregation (shared with the registry) plus, for
+/// bool counters, which `result` side it is.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct SeriesKey {
+    aggregation: Arc<str>,
+    side: Option<BoolSide>,
+}
+
+impl SeriesKey {
+    /// Parses this key into ordered `(label_name, label_value)` pairs.
+    ///
+    /// The bool `result` side comes first, then the aggregation convention: `Kind|value` ->
+    /// `{kind="value"}`, a bare non-empty string -> `{aggregation="value"}`, and an empty string ->
+    /// no label. Label names are static (`result`/`aggregation`) or derived from the aggregation's
+    /// kind; label values share the aggregation `Arc<str>` where possible.
+    fn labels(&self) -> Vec<(Cow<'static, str>, Arc<str>)> {
+        let mut labels = Vec::new();
+        if let Some(side) = self.side {
+            labels.push((Cow::Borrowed("result"), Arc::from(side.as_str())));
+        }
+        let agg = &*self.aggregation;
+        if !agg.is_empty() {
+            match agg.split_once('|') {
+                Some((kind, value)) => {
+                    labels.push((Cow::Owned(sanitize_label_name(kind)), Arc::from(value)));
+                }
+                None => labels.push((Cow::Borrowed("aggregation"), self.aggregation.clone())),
+            }
+        }
+        labels
+    }
 }
 
 /// The cumulative state of a single Prometheus series.
@@ -305,6 +406,19 @@ enum Series {
     Gauge(f64),
     /// Cumulative classic-histogram state.
     Histogram(HistState),
+}
+
+impl Series {
+    /// A zeroed series matching the family kind. Histograms are created via `entry_with` instead
+    /// (they need the bucket count), so this maps `Histogram` kinds to a zero-bucket placeholder
+    /// that is never actually used for that kind.
+    fn zeroed(kind: MetricKind) -> Self {
+        match kind {
+            MetricKind::Counter | MetricKind::BoolCounter => Series::Counter(0),
+            MetricKind::Gauge | MetricKind::CallbackScalar => Series::Gauge(0.0),
+            MetricKind::Histogram => Series::Histogram(HistState::new(0)),
+        }
+    }
 }
 
 /// Cumulative classic-histogram state: per-`le`-slot observation counts (the last slot is `+Inf`),
@@ -330,7 +444,13 @@ impl HistState {
 
 impl Series {
     /// Appends this series' sample line(s) to `out`.
-    fn encode(&self, out: &mut String, name: &str, labels: &[(String, String)], unit: Unit) {
+    fn encode(
+        &self,
+        out: &mut String,
+        name: &str,
+        labels: &[(Cow<'static, str>, Arc<str>)],
+        unit: Unit,
+    ) {
         match self {
             Series::Counter(v) => {
                 write_series(out, name, labels, &[]);
@@ -370,7 +490,12 @@ impl Series {
 ///
 /// `base` are the aggregation-derived labels; `extra` are per-sample labels (`le`, `result`) that
 /// are appended after them. When both are empty, no `{}` is written.
-fn write_series(out: &mut String, name: &str, base: &[(String, String)], extra: &[(&str, &str)]) {
+fn write_series(
+    out: &mut String,
+    name: &str,
+    base: &[(Cow<'static, str>, Arc<str>)],
+    extra: &[(&str, &str)],
+) {
     out.push_str(name);
     if base.is_empty() && extra.is_empty() {
         return;
@@ -396,46 +521,6 @@ fn write_label(out: &mut String, first: &mut bool, key: &str, value: &str) {
     out.push_str("=\"");
     write_escaped_value(out, value);
     out.push('"');
-}
-
-/// Composite series key for one side of a bool counter, so the two sides are distinct series under
-/// the same family but keep the aggregation for label rendering. Encoded as `result=<side>` prefixed
-/// onto the raw aggregation; [`parse_labels`] recovers both.
-fn bool_key(aggregation: Option<&str>, side: &str) -> String {
-    match aggregation.filter(|a| !a.is_empty()) {
-        Some(agg) => format!("result={side}\u{1f}{agg}"),
-        None => format!("result={side}"),
-    }
-}
-
-/// Parses a series key into ordered `(label_name, label_value)` pairs.
-///
-/// Handles the [`bool_key`] `result=<side>` prefix (delimited by an ASCII unit separator) and the
-/// aggregation convention: `Kind|value` -> `{kind="value"}`, a bare non-empty string ->
-/// `{aggregation="value"}`, and an empty string -> no labels.
-fn parse_labels(key: &str) -> Vec<(String, String)> {
-    let mut labels = Vec::new();
-    let aggregation = if let Some(rest) = key.strip_prefix("result=") {
-        // `result=<side>` optionally followed by `\u{1f}<aggregation>`.
-        let (side, agg) = match rest.split_once('\u{1f}') {
-            Some((side, agg)) => (side, agg),
-            None => (rest, ""),
-        };
-        labels.push(("result".to_string(), side.to_string()));
-        agg
-    } else {
-        key
-    };
-
-    if !aggregation.is_empty() {
-        match aggregation.split_once('|') {
-            Some((kind, value)) => {
-                labels.push((sanitize_label_name(kind), value.to_string()));
-            }
-            None => labels.push(("aggregation".to_string(), aggregation.to_string())),
-        }
-    }
-    labels
 }
 
 /// Default `le` bucket boundaries for a unit, in the reported (converted) magnitude.
@@ -588,9 +673,15 @@ fn write_escaped_value(out: &mut String, value: &str) {
 mod test {
     use super::*;
 
+    /// Builds an `Arc<str>` for a test metric name/aggregation. The returned value lives to the end
+    /// of the enclosing statement, which is long enough for the borrow taken by [`info`].
+    fn arc(s: &str) -> Arc<str> {
+        Arc::from(s)
+    }
+
     fn info<'a>(
-        name: &'a str,
-        agg: Option<&'a str>,
+        name: &'a Arc<str>,
+        agg: Option<&'a Arc<str>>,
         unit: Unit,
         kind: MetricKind,
     ) -> MetricInfo<'a> {
@@ -608,13 +699,19 @@ mod test {
 
         // First report: delta 7.
         backend.report_start(&ReportOptions::default());
-        backend.record_counter(&info("rx.data", None, Unit::Count, MetricKind::Counter), 7);
+        backend.record_counter(
+            &info(&arc("rx.data"), None, Unit::Count, MetricKind::Counter),
+            7,
+        );
         backend.report_end();
         assert!(lines(&handle.render()).contains(&"svc_rx_data 7"));
 
         // Second report: delta 5 -> cumulative 12 (proves accumulation, not last-write).
         backend.report_start(&ReportOptions::default());
-        backend.record_counter(&info("rx.data", None, Unit::Count, MetricKind::Counter), 5);
+        backend.record_counter(
+            &info(&arc("rx.data"), None, Unit::Count, MetricKind::Counter),
+            5,
+        );
         backend.report_end();
         let rendered = handle.render();
         assert!(lines(&rendered).contains(&"svc_rx_data 12"), "{rendered}");
@@ -630,12 +727,12 @@ mod test {
     fn zero_counter_delta_retains_existing_series() {
         let (mut backend, handle) = PrometheusBackend::new(None);
         backend.report_start(&ReportOptions::default());
-        backend.record_counter(&info("c", None, Unit::Count, MetricKind::Counter), 4);
+        backend.record_counter(&info(&arc("c"), None, Unit::Count, MetricKind::Counter), 4);
         backend.report_end();
 
         // A zero delta must not drop the series; the cumulative total stays and keeps rendering.
         backend.report_start(&ReportOptions::default());
-        backend.record_counter(&info("c", None, Unit::Count, MetricKind::Counter), 0);
+        backend.record_counter(&info(&arc("c"), None, Unit::Count, MetricKind::Counter), 0);
         backend.report_end();
         assert!(lines(&handle.render()).contains(&"c 4"));
     }
@@ -644,13 +741,13 @@ mod test {
     fn never_nonzero_counter_is_suppressed_unless_sparse() {
         let (mut backend, handle) = PrometheusBackend::new(None);
         backend.report_start(&ReportOptions::new(false));
-        backend.record_counter(&info("c", None, Unit::Count, MetricKind::Counter), 0);
+        backend.record_counter(&info(&arc("c"), None, Unit::Count, MetricKind::Counter), 0);
         backend.report_end();
         assert_eq!(handle.render(), "");
 
         // Sparse keeps it.
         backend.report_start(&ReportOptions::new(true));
-        backend.record_counter(&info("c", None, Unit::Count, MetricKind::Counter), 0);
+        backend.record_counter(&info(&arc("c"), None, Unit::Count, MetricKind::Counter), 0);
         backend.report_end();
         assert!(lines(&handle.render()).contains(&"c 0"));
     }
@@ -661,8 +758,8 @@ mod test {
         backend.report_start(&ReportOptions::default());
         backend.record_counter(
             &info(
-                "rx.ecn",
-                Some("Variant|ect0"),
+                &arc("rx.ecn"),
+                Some(&arc("Variant|ect0")),
                 Unit::Count,
                 MetricKind::Counter,
             ),
@@ -670,8 +767,8 @@ mod test {
         );
         backend.record_counter(
             &info(
-                "rx.ecn",
-                Some("Variant|ce"),
+                &arc("rx.ecn"),
+                Some(&arc("Variant|ce")),
                 Unit::Count,
                 MetricKind::Counter,
             ),
@@ -696,7 +793,12 @@ mod test {
         let (mut backend, handle) = PrometheusBackend::new(None);
         backend.report_start(&ReportOptions::default());
         backend.record_counter(
-            &info("m", Some("misc"), Unit::Count, MetricKind::Counter),
+            &info(
+                &arc("m"),
+                Some(&arc("misc")),
+                Unit::Count,
+                MetricKind::Counter,
+            ),
             1,
         );
         backend.report_end();
@@ -707,13 +809,19 @@ mod test {
     fn gauge_is_last_write_wins() {
         let (mut backend, handle) = PrometheusBackend::new(None);
         backend.report_start(&ReportOptions::default());
-        backend.record_gauge(&info("q.depth", None, Unit::Count, MetricKind::Gauge), 7);
+        backend.record_gauge(
+            &info(&arc("q.depth"), None, Unit::Count, MetricKind::Gauge),
+            7,
+        );
         backend.report_end();
         assert!(lines(&handle.render()).contains(&"q_depth 7"));
 
         // A later report overwrites (does not accumulate).
         backend.report_start(&ReportOptions::default());
-        backend.record_gauge(&info("q.depth", None, Unit::Count, MetricKind::Gauge), 3);
+        backend.record_gauge(
+            &info(&arc("q.depth"), None, Unit::Count, MetricKind::Gauge),
+            3,
+        );
         backend.report_end();
         let rendered = handle.render();
         assert!(lines(&rendered).contains(&"q_depth 3"), "{rendered}");
@@ -725,7 +833,7 @@ mod test {
         let (mut backend, handle) = PrometheusBackend::new(None);
         backend.report_start(&ReportOptions::default());
         backend.record_bool(
-            &info("connect", None, Unit::Count, MetricKind::BoolCounter),
+            &info(&arc("connect"), None, Unit::Count, MetricKind::BoolCounter),
             2,
             1,
         );
@@ -733,7 +841,7 @@ mod test {
 
         backend.report_start(&ReportOptions::default());
         backend.record_bool(
-            &info("connect", None, Unit::Count, MetricKind::BoolCounter),
+            &info(&arc("connect"), None, Unit::Count, MetricKind::BoolCounter),
             3,
             0,
         );
@@ -759,7 +867,12 @@ mod test {
         let b: u64 = 4;
         let values: [&dyn CallbackValue; 2] = [&a, &b];
         backend.record_callback(
-            &info("workers", None, Unit::Count, MetricKind::CallbackScalar),
+            &info(
+                &arc("workers"),
+                None,
+                Unit::Count,
+                MetricKind::CallbackScalar,
+            ),
             &values,
         );
         backend.report_end();
@@ -834,8 +947,8 @@ mod test {
         backend.report_start(&ReportOptions::default());
         backend.record_counter(
             &info(
-                "m",
-                Some("Variant|a\"b\\c"),
+                &arc("m"),
+                Some(&arc("Variant|a\"b\\c")),
                 Unit::Count,
                 MetricKind::Counter,
             ),
@@ -863,7 +976,7 @@ mod test {
         // Before any report the handle is empty.
         assert_eq!(handle.render(), "");
         backend.report_start(&ReportOptions::default());
-        backend.record_counter(&info("c", None, Unit::Count, MetricKind::Counter), 1);
+        backend.record_counter(&info(&arc("c"), None, Unit::Count, MetricKind::Counter), 1);
         backend.report_end();
         assert!(!handle.render().is_empty());
     }
@@ -877,9 +990,13 @@ mod test {
         // Many intervals of an always-zero counter under the normal (non-sparse) policy.
         for _ in 0..5 {
             backend.report_start(&ReportOptions::new(false));
-            backend.record_counter(&info("z", None, Unit::Count, MetricKind::Counter), 0);
-            backend.record_gauge(&info("g", None, Unit::Count, MetricKind::Gauge), 0);
-            backend.record_bool(&info("b", None, Unit::Count, MetricKind::BoolCounter), 0, 0);
+            backend.record_counter(&info(&arc("z"), None, Unit::Count, MetricKind::Counter), 0);
+            backend.record_gauge(&info(&arc("g"), None, Unit::Count, MetricKind::Gauge), 0);
+            backend.record_bool(
+                &info(&arc("b"), None, Unit::Count, MetricKind::BoolCounter),
+                0,
+                0,
+            );
             backend.report_end();
         }
         // Nothing retained, nothing rendered.
@@ -897,7 +1014,10 @@ mod test {
     fn leading_digit_name_is_escaped() {
         let (mut backend, handle) = PrometheusBackend::new(None);
         backend.report_start(&ReportOptions::default());
-        backend.record_counter(&info("5xx", None, Unit::Count, MetricKind::Counter), 1);
+        backend.record_counter(
+            &info(&arc("5xx"), None, Unit::Count, MetricKind::Counter),
+            1,
+        );
         backend.report_end();
         let rendered = handle.render();
         assert!(rendered.contains("# TYPE _5xx counter"), "{rendered}");
@@ -906,7 +1026,7 @@ mod test {
         // A digit-leading prefix is likewise guarded.
         let (mut backend, handle) = PrometheusBackend::new(Some("9svc".into()));
         backend.report_start(&ReportOptions::default());
-        backend.record_counter(&info("ok", None, Unit::Count, MetricKind::Counter), 1);
+        backend.record_counter(&info(&arc("ok"), None, Unit::Count, MetricKind::Counter), 1);
         backend.report_end();
         assert!(
             lines(&handle.render()).contains(&"_9svc_ok 1"),
@@ -922,7 +1042,12 @@ mod test {
         let (mut backend, handle) = PrometheusBackend::new(None);
         backend.report_start(&ReportOptions::default());
         backend.record_counter(
-            &info("m", Some("|value"), Unit::Count, MetricKind::Counter),
+            &info(
+                &arc("m"),
+                Some(&arc("|value")),
+                Unit::Count,
+                MetricKind::Counter,
+            ),
             1,
         );
         backend.report_end();
@@ -931,5 +1056,32 @@ mod test {
             "{}",
             handle.render()
         );
+    }
+
+    /// The display-name conversion is memoized on the registry's shared name handle: the same raw
+    /// `Arc<str>` reported across many intervals sanitizes once, and later reports clone the cached
+    /// `Arc` rather than re-sanitizing. Proven by the cache holding a single entry and the cached
+    /// value pointer-identical to what a repeated `display_name` returns.
+    #[test]
+    fn display_name_is_cached_across_reports() {
+        let (mut backend, _handle) = PrometheusBackend::new(Some("svc".into()));
+        // The registry hands the *same* Arc<str> for a metric each report; model that with one arc.
+        let name = arc("rx.data");
+
+        for _ in 0..3 {
+            backend.report_start(&ReportOptions::default());
+            backend.record_counter(&info(&name, None, Unit::Count, MetricKind::Counter), 1);
+            backend.report_end();
+        }
+
+        // Only one cache entry despite three reports, and it is keyed on the raw name.
+        assert_eq!(backend.name_cache.len(), 1);
+        let cached = backend.name_cache.get(&name).expect("name cached").clone();
+        assert_eq!(&*cached, "svc_rx_data");
+
+        // A subsequent lookup returns the *same allocation* (pointer identity), i.e. a refcount
+        // bump, not a fresh sanitize+alloc.
+        let again = backend.display_name(&info(&name, None, Unit::Count, MetricKind::Counter));
+        assert!(Arc::ptr_eq(&cached, &again), "display_name re-allocated");
     }
 }
