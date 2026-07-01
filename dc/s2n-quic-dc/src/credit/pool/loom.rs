@@ -538,6 +538,7 @@ fn newcomer_cannot_snipe() {
 ///     ours-then-pool-freed, and no grant was observed.
 ///   * grant wins the CAS (slot → APP): abandon's CAS fails, and its `Acquire` load
 ///     synchronizes-with grant's `Release` CAS, so the `granted` read sees exactly `amount`.
+///
 /// Either way the app must never see a partial/garbage value, and pool credit must be conserved.
 #[test]
 fn grant_races_abandon_reads_exact_granted() {

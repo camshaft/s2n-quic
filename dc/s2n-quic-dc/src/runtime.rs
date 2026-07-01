@@ -405,10 +405,15 @@ pub mod inspector {
     };
     use core::pin::Pin;
     use std::{
+        cell::RefCell,
         future::Future,
         net::{IpAddr, Ipv4Addr, SocketAddr},
-        sync::{Arc, Mutex},
+        rc::Rc,
     };
+
+    /// Shared store of spawned (but never executed) futures. The inspector runtime is
+    /// single-threaded and its futures are `!Send`, so an `Rc<RefCell<..>>` is sufficient.
+    type SpawnedFutures = Rc<RefCell<Vec<Pin<Box<dyn Future<Output = ()> + 'static>>>>>;
 
     /// Inspector runtime for topology introspection.
     ///
@@ -417,7 +422,7 @@ pub mod inspector {
     pub struct Handle {
         worker_count: usize,
         clock: Clock,
-        futures: Arc<Mutex<Vec<Pin<Box<dyn Future<Output = ()> + 'static>>>>>,
+        futures: SpawnedFutures,
     }
 
     /// Simple clock for inspector runtime.
@@ -432,7 +437,7 @@ pub mod inspector {
 
     pub struct Local {
         worker_id: usize,
-        futures: Arc<Mutex<Vec<Pin<Box<dyn Future<Output = ()> + 'static>>>>>,
+        futures: SpawnedFutures,
     }
 
     #[derive(Clone, Copy)]
@@ -450,7 +455,7 @@ pub mod inspector {
             Self {
                 worker_count: worker_count.max(1),
                 clock: Clock,
-                futures: Arc::new(Mutex::new(Vec::new())),
+                futures: Rc::new(RefCell::new(Vec::new())),
             }
         }
 
@@ -459,18 +464,12 @@ pub mod inspector {
         where
             F: Future<Output = ()> + 'static,
         {
-            self.futures
-                .lock()
-                .expect("inspector future lock poisoned")
-                .push(Box::pin(future));
+            self.futures.borrow_mut().push(Box::pin(future));
         }
 
         /// Get the number of futures currently held.
         pub fn future_count(&self) -> usize {
-            self.futures
-                .lock()
-                .expect("inspector future lock poisoned")
-                .len()
+            self.futures.borrow().len()
         }
     }
 
@@ -514,10 +513,7 @@ pub mod inspector {
         where
             F: Future<Output = ()> + 'static,
         {
-            self.futures
-                .lock()
-                .expect("inspector future lock poisoned")
-                .push(Box::pin(future));
+            self.futures.borrow_mut().push(Box::pin(future));
         }
 
         fn worker_id(&self) -> usize {

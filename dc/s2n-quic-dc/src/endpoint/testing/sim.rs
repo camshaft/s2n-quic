@@ -565,7 +565,8 @@ pub fn connect(
     // `insert_fake_path_pair` stamps each entry's `peer_data_addrs` at construction
     // (the full recv-socket list the other side advertises), so both the local entry
     // and the peer's server-side entry can already resolve a send destination.
-    let entry = if local_addr == peer_addr {
+
+    if local_addr == peer_addr {
         local_map
             .get_by_id(&ids.local)
             .expect("client entry just inserted by insert_fake_path_pair")
@@ -573,9 +574,7 @@ pub fn connect(
         local_map
             .get_raw(peer_addr)
             .expect("path-secret entry just inserted by insert_fake_path_pair")
-    };
-
-    entry
+    }
 }
 
 // ── insert_fake_path_pair ─────────────────────────────────────────────────────

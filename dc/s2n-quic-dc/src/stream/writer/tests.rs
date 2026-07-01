@@ -704,7 +704,8 @@ fn server_writer_respects_peer_recv_window_not_connection_window() {
         const CONNECTION_WINDOW: u32 = 8 * 1024 * 1024;
         const PEER_RECV_WINDOW: u32 = 64 * 1024;
 
-        let mut params = s2n_quic_core::dc::testing::TEST_APPLICATION_PARAMS.clone();
+        let params_template = s2n_quic_core::dc::testing::TEST_APPLICATION_PARAMS;
+        let mut params = params_template.clone();
         params.remote_max_data = VarInt::from_u32(CONNECTION_WINDOW);
         params.local_send_max_data = VarInt::from_u32(CONNECTION_WINDOW);
         // The peer's reader advertises and enforces this; it is the only true bound on the writer.

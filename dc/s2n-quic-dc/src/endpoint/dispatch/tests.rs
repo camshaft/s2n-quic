@@ -124,7 +124,6 @@ fn sealed_queue_msg_packet_geometry(
             addr.set(peer.into());
             Ok::<_, core::convert::Infallible>(encoded_len)
         })
-        .ok()
         .expect("fill_with");
     let mut filled = segments.take_filled();
 
@@ -133,7 +132,7 @@ fn sealed_queue_msg_packet_geometry(
         let decode_buf = DecoderBufferMut::new(&mut filled[..]);
         datagram::decoder::Meta::decode(&decode_buf, (), TAG_LEN).expect("meta decode")
     };
-    let packet = meta.with_storage(filled).ok().expect("with_storage");
+    let packet = meta.with_storage(filled).expect("with_storage");
     let decrypt_len = packet.decrypt_into_len();
 
     (packet, opener, decrypt_len)
@@ -174,7 +173,7 @@ fn bound_server_view(queue_id: VarInt, binding_id: VarInt) -> recv::QueueView {
     let result = server.bind_for_msg(queue_id, binding_id, &entry, &mut freed_batch_tx);
     let crate::queue::BindResult::NewBinding {
         stream, control, ..
-    } = result.ok().expect("slot must bind for the test setup")
+    } = result.expect("slot must bind for the test setup")
     else {
         panic!("expected NewBinding for a fresh slot");
     };

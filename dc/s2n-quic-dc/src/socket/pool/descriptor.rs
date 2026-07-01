@@ -834,9 +834,7 @@ impl<R: Recycler> Filled<R> {
     /// and copying the payload bytes. This is safe because the copy gets its own
     /// exclusive memory region.
     pub fn deep_copy(&self) -> Option<Self> {
-        let Some(unfilled) = Unfilled::<R>::new(self.len) else {
-            return None;
-        };
+        let unfilled = Unfilled::<R>::new(self.len)?;
         let payload = self.payload();
         let result = unfilled.fill_with(|addr, _cmsg, mut iov| {
             iov[..payload.len()].copy_from_slice(payload);

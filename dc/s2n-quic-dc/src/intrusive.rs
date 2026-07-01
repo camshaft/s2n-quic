@@ -418,7 +418,7 @@ impl<A: Adapter> List<A> {
     /// Push an entry to the back of the list
     pub fn push_back(&mut self, ptr: A::Pointer) {
         let raw = A::into_raw(ptr);
-        let new_tail = unsafe { NonNull::new_unchecked(raw as *mut A::Value) };
+        let new_tail = unsafe { NonNull::new_unchecked(raw) };
         let self_ref = unsafe { NonNull::new_unchecked(new_tail.as_ptr() as *mut ()) };
 
         unsafe {
@@ -452,7 +452,7 @@ impl<A: Adapter> List<A> {
     /// Push an entry to the front of the list
     pub fn push_front(&mut self, ptr: A::Pointer) {
         let raw = A::into_raw(ptr);
-        let new_head = unsafe { NonNull::new_unchecked(raw as *mut A::Value) };
+        let new_head = unsafe { NonNull::new_unchecked(raw) };
         let self_ref = unsafe { NonNull::new_unchecked(new_head.as_ptr() as *mut ()) };
 
         unsafe {
@@ -1249,6 +1249,7 @@ mod tests {
         }
     }
 
+    #[allow(clippy::arc_with_non_send_sync)]
     fn arc_node(value: u64) -> std::sync::Arc<ArcNode> {
         std::sync::Arc::new(ArcNode {
             links: Links::new(),

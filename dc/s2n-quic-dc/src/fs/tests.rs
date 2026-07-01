@@ -311,7 +311,7 @@ fn drop_future_while_parked_on_credit_conserves_and_recovers() {
             {
                 let mut fut = core::pin::pin!(dev.read(fd(), 4096, 4096, TierPriority::Medium));
                 poll_parks(fut.as_mut());
-                drop(fut);
+                // `fut` (and its buffer) drops at the end of this block, abandoning the slot.
             }
 
             // Occupant completes and releases its credit; the abandoned waiter slot is reclaimed by
@@ -369,8 +369,8 @@ fn drop_future_with_op_in_flight_conserves_and_recovers() {
                         .any(|p| p.debug_free_total() < p.debug_capacity() as i64),
                     "precondition: op should hold credit (enqueued, in flight) before the drop"
                 );
-                // Drop with the op in flight: the buffer rides the op, not the future.
-                drop(fut);
+                // Drop with the op in flight (at end of block): the buffer rides the op, not the
+                // future.
             }
 
             // The in-flight op completes downstream; its credit is released before the completion is
@@ -863,7 +863,7 @@ fn materialize_mixes_resident_and_device_blocks() {
                 // The delivered `ByteVec` is chunked; copy to a contiguous view for byte assertions.
                 let buf = chunk.expect("block failed").copy_to_bytes();
                 assert_eq!(buf.len(), 1024, "block {delivered} wrong len");
-                if delivered % 2 == 0 {
+                if delivered.is_multiple_of(2) {
                     // Device read: bach fills byte j = (offset + j) & 0xff, offset = delivered*1024.
                     let offset = delivered * 1024;
                     for (j, b) in buf.iter().enumerate() {

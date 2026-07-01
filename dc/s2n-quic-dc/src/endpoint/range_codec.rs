@@ -36,14 +36,14 @@ pub fn encode<E: Encoder>(
     for range in ranges {
         let (start, end) = range.into_inner();
 
-        if prev_smallest.is_none() {
-            let first_range = largest - start;
-            buffer.encode(&first_range);
-        } else {
-            let gap = prev_smallest.unwrap() - end - VarInt::from_u8(2);
+        if let Some(prev) = prev_smallest {
+            let gap = prev - end - VarInt::from_u8(2);
             let range_len = end - start;
             buffer.encode(&gap);
             buffer.encode(&range_len);
+        } else {
+            let first_range = largest - start;
+            buffer.encode(&first_range);
         }
 
         prev_smallest = Some(start);
@@ -72,13 +72,13 @@ pub fn encode_partial<E: Encoder>(
     while let Some(range) = ranges.peek() {
         let (start, end) = (*range.start(), *range.end());
 
-        let cost = if prev_smallest.is_none() {
-            let first_range = largest - start;
-            first_range.encoding_size()
-        } else {
-            let gap = prev_smallest.unwrap() - end - VarInt::from_u8(2);
+        let cost = if let Some(prev) = prev_smallest {
+            let gap = prev - end - VarInt::from_u8(2);
             let range_len = end - start;
             gap.encoding_size() + range_len.encoding_size()
+        } else {
+            let first_range = largest - start;
+            first_range.encoding_size()
         };
 
         if bytes_written + cost > budget {
@@ -88,14 +88,14 @@ pub fn encode_partial<E: Encoder>(
         // Consume the range now that we know it fits
         let _ = ranges.next();
 
-        if prev_smallest.is_none() {
-            let first_range = largest - start;
-            buffer.encode(&first_range);
-        } else {
-            let gap = prev_smallest.unwrap() - end - VarInt::from_u8(2);
+        if let Some(prev) = prev_smallest {
+            let gap = prev - end - VarInt::from_u8(2);
             let range_len = end - start;
             buffer.encode(&gap);
             buffer.encode(&range_len);
+        } else {
+            let first_range = largest - start;
+            buffer.encode(&first_range);
         }
 
         bytes_written += cost;

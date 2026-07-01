@@ -329,22 +329,17 @@ impl Map {
         let mut discarded_bytes: usize = 0;
         let mut tail_time_sent = None;
 
-        loop {
-            match self.inner.remove(pn) {
-                Some(packet) => {
-                    self.inflight_gauge.dequeue();
-                    if let Some(tx_info) = &packet.transmission_info {
-                        discarded_bytes += tx_info.sent_bytes as usize;
-                    }
-                    if let Some(next_pn) = packet.probed_to {
-                        pn = next_pn;
-                    } else {
-                        tail_time_sent = packet.transmission_info.as_ref().map(|i| i.time_sent);
-                        frames = packet.frames;
-                        break;
-                    }
-                }
-                None => break,
+        while let Some(packet) = self.inner.remove(pn) {
+            self.inflight_gauge.dequeue();
+            if let Some(tx_info) = &packet.transmission_info {
+                discarded_bytes += tx_info.sent_bytes as usize;
+            }
+            if let Some(next_pn) = packet.probed_to {
+                pn = next_pn;
+            } else {
+                tail_time_sent = packet.transmission_info.as_ref().map(|i| i.time_sent);
+                frames = packet.frames;
+                break;
             }
         }
 

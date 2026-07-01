@@ -444,7 +444,7 @@ fn builder_reader_model_test() {
                         let mut dest = BytesMut::with_capacity(cap);
                         let mut limited = dest.with_write_limit(cap);
                         let chunk = builder.partial_copy_into(&mut limited).unwrap();
-                        drop(limited);
+                        let _ = limited;
 
                         // The dest should have been filled up to capacity (or all data)
                         let expected_written = cap.min(oracle.len());

@@ -398,6 +398,7 @@ pub(crate) fn process_ack<Clk, Rand>(
     // If the tx wheel entry is now stale (scheduling reason removed by the ACK), clear
     // target_time so the wheel treats it as expired on next tick rather than firing the
     // invariant. The assembler handles stale pops gracefully (produces zero segments).
+    #[allow(clippy::nonminimal_bool)]
     if context.tx_wheel.is_scheduled()
         && !context.has_pending_acks()
         && !context.pto.probe_state.is_requested()
@@ -487,6 +488,19 @@ fn starts_new_loss_burst(prev_lost_pn: Option<VarInt>, pn: VarInt) -> bool {
     prev_lost_pn.is_none_or(|prev| pn.checked_sub(prev) != Some(VarInt::from_u8(1)))
 }
 
+/// QueueDbg marker that met a fate during loss detection. Tuple:
+/// (dump_id, queue_pair, binding_id, pn, fate, enqueued_at, time_sent), where fate is
+/// "lost" / "cancelled" / "ttl_exhausted" and the two timestamps drive the sojourn dump.
+type LostDbgEntry = (
+    VarInt,
+    crate::packet::datagram::QueuePair,
+    VarInt,
+    VarInt,
+    &'static str,
+    Option<crate::time::precision::Timestamp>,
+    Option<crate::time::precision::Timestamp>,
+);
+
 /// Detect lost packets using QUIC PN-threshold and time-threshold algorithms.
 ///
 /// Packets sent before `max_acked_pn` are declared lost when either:
@@ -545,15 +559,7 @@ fn detect_loss<Rand>(
     // `context.inflight` releases (see the ACK path for the same pattern). Empty (unallocated) in
     // production. Tuple: (dump_id, queue_pair, binding_id, pn, fate, enqueued_at, time_sent), where
     // fate is "lost" / "cancelled" / "ttl_exhausted" and the two timestamps drive the sojourn dump.
-    let mut lost_dbg: Vec<(
-        VarInt,
-        crate::packet::datagram::QueuePair,
-        VarInt,
-        VarInt,
-        &'static str,
-        Option<crate::time::precision::Timestamp>,
-        Option<crate::time::precision::Timestamp>,
-    )> = Vec::new();
+    let mut lost_dbg: Vec<LostDbgEntry> = Vec::new();
 
     for (num, mut packet) in context.inflight.remove_range(range) {
         let tx_info = packet.transmission_info.take().unwrap();
@@ -782,10 +788,10 @@ mod tests {
 
     fn make_path_secret_entry() -> Arc<PathSecretEntry> {
         let peer: std::net::SocketAddr = "127.0.0.1:9999".parse().unwrap();
-        let entry = PathSecretEntry::builder(peer)
+
+        PathSecretEntry::builder(peer)
             .socket_sender_count(1)
-            .build(None);
-        entry
+            .build(None)
     }
 
     fn make_context(entry: &Arc<PathSecretEntry>) -> send::Context {
