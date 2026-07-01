@@ -9,7 +9,16 @@ rust-version = "1.88"
 license = "Apache-2.0"
 autobenches = false
 
+[features]
+# Opt-in Arrow export backend. Off by default: `arrow` is a heavy dependency and most consumers
+# only need the querylog/statsd backends. Enabling this pulls in `arrow` and unlocks
+# `backend::ArrowBackend`, which accumulates records into an `arrow::RecordBatch` that the caller
+# serializes to Parquet (owning the writer + file rotation itself).
+arrow = ["dep:arrow"]
+
 [dependencies]
+# Kept at the same major version `xtask` uses so the produced schema/RecordBatch interoperate.
+arrow = { version = "54", default-features = false, optional = true }
 futures-util = "0.3.26"
 serde_json = "1"
 histogram = "0.11.3"
