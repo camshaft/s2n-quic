@@ -10,9 +10,9 @@ use crate::backend::{Backend, CallbackValue, Histogram, MetricInfo, ReportOption
 ///
 /// This is the backward-compatibility anchor -- it reproduces byte-for-byte the string previously
 /// built by `Registry::try_take_current_metrics_line`. It also owns the sparse/zero emit policy:
-/// counters and histograms honor [`ReportOptions::include_sparse`], while gauges, bool counters, and
-/// any [`MetricInfo::zero_suppressed`] callback drop zeros regardless (matching historical
-/// behavior).
+/// each metric's zero is emitted per its [`MetricInfo::sparsity`] resolved against
+/// [`ReportOptions::include_sparse`] (see [`MetricInfo::emit_zero`]), with all-zero bool counters
+/// dropped unless explicitly [`Sparsity::AlwaysDense`](crate::backend::Sparsity::AlwaysDense).
 ///
 /// Reuse it across reports: [`report_start`](Backend::report_start) clears the line buffer while
 /// keeping its capacity, so a backend held by a long-lived reporter stops allocating once the
@@ -79,7 +79,7 @@ impl Backend for QuerylogBackend {
     }
 
     fn record_counter(&mut self, info: &MetricInfo<'_>, value: u64) {
-        if value == 0 && !self.include_sparse {
+        if value == 0 && !info.emit_zero(self.include_sparse) {
             return;
         }
         write!(self.begin_entry(info), "{value}").unwrap();
@@ -88,10 +88,9 @@ impl Backend for QuerylogBackend {
 
     fn record_gauge(&mut self, info: &MetricInfo<'_>, value: i64) {
         // Today no metric reports through here — gauges flow through the callback path — so this is
-        // forward-looking. Honor the same suppression policy the rest of the backend uses: drop a
-        // zero when the metric is zero-suppressed (the historical gauge behavior, via
-        // `NonZeroDisplay`) or when sparse output is off; emit it otherwise.
-        if value == 0 && (info.zero_suppressed || !self.include_sparse) {
+        // forward-looking. Honor the metric's sparse policy: drop a zero unless the metric (or the
+        // report) opts into emitting it.
+        if value == 0 && !info.emit_zero(self.include_sparse) {
             return;
         }
         write!(self.begin_entry(info), "{value}").unwrap();
@@ -99,9 +98,11 @@ impl Backend for QuerylogBackend {
     }
 
     fn record_bool(&mut self, info: &MetricInfo<'_>, true_count: u64, false_count: u64) {
-        // Bool counters always suppress the all-zero case (no `include_sparse` override),
-        // reproducing `BoolCounter::take_current`.
-        if (true_count, false_count) == (0, 0) {
+        // Bool counters suppress the all-zero case even under a sparse report (reproducing
+        // `BoolCounter::take_current`); only an explicit `AlwaysDense` override forces the zero out.
+        if (true_count, false_count) == (0, 0)
+            && info.sparsity != crate::backend::Sparsity::AlwaysDense
+        {
             return;
         }
         let out = self.begin_entry(info);
@@ -115,7 +116,7 @@ impl Backend for QuerylogBackend {
 
     fn record_histogram(&mut self, info: &MetricInfo<'_>, hist: Histogram<'_>) {
         let total_count = hist.count();
-        if total_count == 0 && !self.include_sparse {
+        if total_count == 0 && !info.emit_zero(self.include_sparse) {
             return;
         }
 
@@ -137,9 +138,9 @@ impl Backend for QuerylogBackend {
             return;
         }
 
-        // Zero-suppressed metrics (gauges) drop an all-zero value entirely, reproducing the
-        // `NonZeroDisplay` empty-string behavior. Decide this up front with a cheap value-only
-        // pre-pass (no formatting) so we can write directly into the output once committed.
+        // Sparse metrics (gauges) drop an all-zero value entirely, reproducing the `NonZeroDisplay`
+        // empty-string behavior. Decide this up front with a cheap value-only pre-pass (no
+        // formatting) so we can write directly into the output once committed.
         //
         // The historical code suppressed each zero value *individually* (a `NonZeroDisplay(0)`
         // rendered empty while the `+` separator still advanced), so a hypothetical mixed list
@@ -147,7 +148,7 @@ impl Backend for QuerylogBackend {
         // only differ when two or more zero-suppressed callbacks share one (name, aggregation),
         // which no call site does — every gauge registers under a distinct key — and the old
         // per-value form was malformed (leading `+`) anyway.
-        if info.zero_suppressed && values.iter().all(|v| v.as_f64() == 0.0) {
+        if !info.emit_zero(self.include_sparse) && values.iter().all(|v| v.as_f64() == 0.0) {
             return;
         }
 
@@ -211,34 +212,48 @@ mod test {
         assert!(backend.output.capacity() >= cap_after_first);
     }
 
-    /// `record_gauge` honors `zero_suppressed` + `include_sparse` rather than always dropping zero.
+    /// `record_gauge` resolves the metric's [`Sparsity`] against `include_sparse` rather than always
+    /// dropping zero.
     #[test]
     fn gauge_zero_respects_suppression_and_sparse() {
+        use crate::backend::Sparsity;
+
         let name: Arc<str> = Arc::from("g");
         let suppressed = {
             let mut i = MetricInfo::new(&name, None, crate::Unit::Count, MetricKind::Gauge);
-            i.zero_suppressed = true;
+            i.sparsity = Sparsity::AlwaysSparse;
             i
         };
         let plain = MetricInfo::new(&name, None, crate::Unit::Count, MetricKind::Gauge);
+        let dense = {
+            let mut i = MetricInfo::new(&name, None, crate::Unit::Count, MetricKind::Gauge);
+            i.sparsity = Sparsity::AlwaysDense;
+            i
+        };
 
-        // Zero-suppressed gauge: zero is always dropped.
+        // AlwaysSparse gauge: zero is always dropped, even under a sparse report.
         let mut b = QuerylogBackend::new();
         b.report_start(&ReportOptions::new(true));
         b.record_gauge(&suppressed, 0);
         assert_eq!(b.line(), "");
 
-        // Non-suppressed gauge, sparse on: zero emits.
+        // Inherit gauge, sparse on: zero emits.
         let mut b = QuerylogBackend::new();
         b.report_start(&ReportOptions::new(true));
         b.record_gauge(&plain, 0);
         assert_eq!(b.line(), "g=0");
 
-        // Non-suppressed gauge, sparse off: zero dropped.
+        // Inherit gauge, sparse off: zero dropped.
         let mut b = QuerylogBackend::new();
         b.report_start(&ReportOptions::new(false));
         b.record_gauge(&plain, 0);
         assert_eq!(b.line(), "");
+
+        // AlwaysDense gauge, sparse off: zero still emits.
+        let mut b = QuerylogBackend::new();
+        b.report_start(&ReportOptions::new(false));
+        b.record_gauge(&dense, 0);
+        assert_eq!(b.line(), "g=0");
 
         // Non-zero always emits.
         let mut b = QuerylogBackend::new();

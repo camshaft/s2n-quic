@@ -7,7 +7,7 @@ use std::{
 };
 
 use crate::{
-    backend::{Backend, MetricInfo, MetricKind, QuerylogBackend, ReportOptions},
+    backend::{Backend, MetricInfo, MetricKind, QuerylogBackend, ReportOptions, Sparsity},
     rseq::Channels,
     BoolCounter, Counter, Summary, Unit,
 };
@@ -26,7 +26,7 @@ pub struct Registry {
 pub(crate) struct RegistryInner {
     // Use a BTreeMap so that we automatically get consistent ordering of the reported metrics.
     // Consistent ordering makes it easier to analyze them locally visually or with ad-hoc scripts.
-    metrics: BTreeMap<MetricKey, MetricValue>,
+    metrics: BTreeMap<MetricKey, MetricEntry>,
 
     counters: Arc<Channels<crate::counter::SharedCounter>>,
     histograms: Arc<Channels<crate::summary::SharedSummary>>,
@@ -53,33 +53,29 @@ impl RegistryInner {
 
         backend.report_start(options);
 
-        for (key, value) in self.metrics.iter_mut() {
+        for (key, entry) in self.metrics.iter_mut() {
             let name = &key.name;
             let aggregation = key.aggregation.as_ref();
-            match value {
+            let sparsity = entry.sparsity;
+            let info = |unit, kind| {
+                let mut info = MetricInfo::new(name, aggregation, unit, kind);
+                info.sparsity = sparsity;
+                info
+            };
+            match &mut entry.value {
                 MetricValue::Counter(c) => {
-                    let info = MetricInfo::new(name, aggregation, Unit::Count, MetricKind::Counter);
-                    c.report(&info, backend);
+                    c.report(&info(Unit::Count, MetricKind::Counter), backend);
                 }
                 MetricValue::Summary(s) => {
-                    let info =
-                        MetricInfo::new(name, aggregation, s.display_unit(), MetricKind::Histogram);
-                    s.report(&info, backend);
+                    let unit = s.display_unit();
+                    s.report(&info(unit, MetricKind::Histogram), backend);
                 }
                 MetricValue::BoolCounter(b) => {
-                    let info =
-                        MetricInfo::new(name, aggregation, Unit::Count, MetricKind::BoolCounter);
-                    b.report(&info, backend);
+                    b.report(&info(Unit::Count, MetricKind::BoolCounter), backend);
                 }
                 MetricValue::ValueList(c) => {
-                    let mut info = MetricInfo::new(
-                        name,
-                        aggregation,
-                        c.unit(),
-                        MetricKind::CallbackScalar,
-                    );
-                    info.zero_suppressed = c.zero_suppressed();
-                    c.report(&info, backend);
+                    let unit = c.unit();
+                    c.report(&info(unit, MetricKind::CallbackScalar), backend);
                 }
             }
         }
@@ -143,9 +139,20 @@ impl Registry {
     /// then reuse the returned type.
     #[track_caller]
     pub fn register_counter(&self, metric: String, aggregation: Option<String>) -> Counter {
-        let metric: Arc<str> = metric.into();
-        let aggregation: Option<Arc<str>> = aggregation.map(Into::into);
+        self.register_counter_inner(
+            metric.into(),
+            aggregation.map(Into::into),
+            Sparsity::Inherit,
+        )
+    }
 
+    #[track_caller]
+    fn register_counter_inner(
+        &self,
+        metric: Arc<str>,
+        aggregation: Option<Arc<str>>,
+        sparsity: Sparsity,
+    ) -> Counter {
         let mut inner = self.inner.lock().unwrap();
         let inner = &mut *inner;
 
@@ -155,9 +162,13 @@ impl Registry {
                 name: metric.clone(),
                 aggregation: aggregation.clone(),
             })
-            .or_insert_with(|| MetricValue::Counter(Counter::new(inner.counters.clone())));
+            .or_insert_with(|| MetricEntry {
+                value: MetricValue::Counter(Counter::new(inner.counters.clone())),
+                sparsity,
+            });
 
-        if let MetricValue::Counter(c) = &*entry {
+        assert_sparsity(entry, sparsity, &metric, &aggregation);
+        if let MetricValue::Counter(c) = &entry.value {
             c.clone()
         } else {
             panic!(
@@ -177,9 +188,22 @@ impl Registry {
         aggregation: Option<String>,
         display_unit: Unit,
     ) -> Summary {
-        let metric: Arc<str> = metric.into();
-        let aggregation: Option<Arc<str>> = aggregation.map(Into::into);
+        self.register_summary_inner(
+            metric.into(),
+            aggregation.map(Into::into),
+            display_unit,
+            Sparsity::Inherit,
+        )
+    }
 
+    #[track_caller]
+    fn register_summary_inner(
+        &self,
+        metric: Arc<str>,
+        aggregation: Option<Arc<str>>,
+        display_unit: Unit,
+        sparsity: Sparsity,
+    ) -> Summary {
         let mut inner = self.inner.lock().unwrap();
         let inner = &mut *inner;
 
@@ -189,11 +213,13 @@ impl Registry {
                 name: metric.clone(),
                 aggregation: aggregation.clone(),
             })
-            .or_insert_with(|| {
-                MetricValue::Summary(Summary::new(inner.histograms.clone(), display_unit))
+            .or_insert_with(|| MetricEntry {
+                value: MetricValue::Summary(Summary::new(inner.histograms.clone(), display_unit)),
+                sparsity,
             });
 
-        if let MetricValue::Summary(s) = &*entry {
+        assert_sparsity(entry, sparsity, &metric, &aggregation);
+        if let MetricValue::Summary(s) = &entry.value {
             s.clone()
         } else {
             panic!(
@@ -208,9 +234,20 @@ impl Registry {
     /// then reuse the returned type.
     #[track_caller]
     pub fn register_bool(&self, metric: String, aggregation: Option<String>) -> BoolCounter {
-        let metric: Arc<str> = metric.into();
-        let aggregation: Option<Arc<str>> = aggregation.map(Into::into);
+        self.register_bool_inner(
+            metric.into(),
+            aggregation.map(Into::into),
+            Sparsity::Inherit,
+        )
+    }
 
+    #[track_caller]
+    fn register_bool_inner(
+        &self,
+        metric: Arc<str>,
+        aggregation: Option<Arc<str>>,
+        sparsity: Sparsity,
+    ) -> BoolCounter {
         let mut inner = self.inner.lock().unwrap();
         let inner = &mut *inner;
 
@@ -220,9 +257,13 @@ impl Registry {
                 name: metric.clone(),
                 aggregation: aggregation.clone(),
             })
-            .or_insert_with(|| MetricValue::BoolCounter(BoolCounter::new(inner.counters.clone())));
+            .or_insert_with(|| MetricEntry {
+                value: MetricValue::BoolCounter(BoolCounter::new(inner.counters.clone())),
+                sparsity,
+            });
 
-        if let MetricValue::BoolCounter(b) = &*entry {
+        assert_sparsity(entry, sparsity, &metric, &aggregation);
+        if let MetricValue::BoolCounter(b) = &entry.value {
             b.clone()
         } else {
             panic!(
@@ -255,7 +296,16 @@ impl Registry {
         V: crate::backend::CallbackValue,
         F: FnMut() -> V + 'static + Send,
     {
-        self.register_list_callback_inner(metric, aggregation, unit, false, callback);
+        // Documented contract: a zero value is always reported. That is `AlwaysDense`, not
+        // `Inherit` — historically only the querylog backend honored this (statsd/prometheus gated
+        // it on `include_sparse`); pinning it here makes every backend consistent.
+        self.register_list_callback_inner(
+            metric.into(),
+            aggregation.map(Into::into),
+            unit,
+            Sparsity::AlwaysDense,
+            callback,
+        );
     }
 
     /// Like [`register_list_callback`](Self::register_list_callback), but a zero value is suppressed
@@ -271,24 +321,27 @@ impl Registry {
         V: crate::backend::CallbackValue,
         F: FnMut() -> V + 'static + Send,
     {
-        self.register_list_callback_inner(metric, aggregation, unit, true, callback);
+        self.register_list_callback_inner(
+            metric.into(),
+            aggregation.map(Into::into),
+            unit,
+            Sparsity::AlwaysSparse,
+            callback,
+        );
     }
 
     #[track_caller]
     fn register_list_callback_inner<V, F>(
         &self,
-        metric: String,
-        aggregation: Option<String>,
+        metric: Arc<str>,
+        aggregation: Option<Arc<str>>,
         unit: Unit,
-        zero_suppressed: bool,
+        sparsity: Sparsity,
         callback: F,
     ) where
         V: crate::backend::CallbackValue,
         F: FnMut() -> V + 'static + Send,
     {
-        let metric: Arc<str> = metric.into();
-        let aggregation: Option<Arc<str>> = aggregation.map(Into::into);
-
         let mut inner = self.inner.lock().unwrap();
 
         let entry = inner.metrics.entry(MetricKey {
@@ -298,22 +351,26 @@ impl Registry {
 
         match entry {
             std::collections::btree_map::Entry::Vacant(v) => {
-                v.insert(MetricValue::ValueList(Box::new(
-                    crate::callback::CallbackList {
+                v.insert(MetricEntry {
+                    value: MetricValue::ValueList(Box::new(crate::callback::CallbackList {
                         callbacks: vec![callback],
                         unit,
-                        zero_suppressed,
-                    },
-                )));
+                    })),
+                    sparsity,
+                });
             }
             std::collections::btree_map::Entry::Occupied(mut o) => {
-                if let MetricValue::ValueList(previous) = o.get_mut() {
+                assert_eq!(
+                    o.get().sparsity,
+                    sparsity,
+                    "Callback metric name={metric:?}, aggregation={aggregation:?} already registered with different sparsity"
+                );
+                if let MetricValue::ValueList(previous) = &mut o.get_mut().value {
                     if let Some(previous) = previous
                         .as_any()
                         .downcast_mut::<crate::callback::CallbackList<F>>()
                     {
                         assert_eq!(previous.unit, unit);
-                        assert_eq!(previous.zero_suppressed, zero_suppressed);
                         previous.callbacks.push(callback);
                     } else {
                         panic!(
@@ -326,6 +383,23 @@ impl Registry {
                     )
                 }
             }
+        }
+    }
+
+    /// Begins registering a metric with an explicit per-metric [`Sparsity`] override.
+    ///
+    /// The returned [`MetricBuilder`] collects the aggregation and sparsity, then a terminal method
+    /// ([`counter`](MetricBuilder::counter), [`summary`](MetricBuilder::summary),
+    /// [`bool`](MetricBuilder::bool), or the callback variants) actually registers it. This is the
+    /// way to opt a metric into [`Sparsity::AlwaysDense`] (emit even a zero every interval) or
+    /// [`Sparsity::AlwaysSparse`] (never emit a zero); the plain `register_*` methods default to
+    /// [`Sparsity::Inherit`].
+    pub fn metric(&self, name: impl Into<Arc<str>>) -> MetricBuilder<'_> {
+        MetricBuilder {
+            registry: self,
+            name: name.into(),
+            aggregation: None,
+            sparsity: Sparsity::Inherit,
         }
     }
 
@@ -456,12 +530,112 @@ impl Default for Registry {
     }
 }
 
+/// Builder for registering a metric with an explicit [`Sparsity`] override.
+///
+/// Created by [`Registry::metric`]. Set the optional aggregation and sparsity, then call a terminal
+/// method to register (and return the handle for) the metric of the desired kind.
+#[must_use = "the metric is only registered once a terminal method (counter/summary/bool/...) is called"]
+pub struct MetricBuilder<'a> {
+    registry: &'a Registry,
+    name: Arc<str>,
+    aggregation: Option<Arc<str>>,
+    sparsity: Sparsity,
+}
+
+impl<'a> MetricBuilder<'a> {
+    /// Sets the aggregation/variant string (e.g. `Variant|ect0`).
+    pub fn aggregation(mut self, aggregation: impl Into<Arc<str>>) -> Self {
+        self.aggregation = Some(aggregation.into());
+        self
+    }
+
+    /// Sets the per-metric [`Sparsity`] policy. Defaults to [`Sparsity::Inherit`].
+    pub fn sparsity(mut self, sparsity: Sparsity) -> Self {
+        self.sparsity = sparsity;
+        self
+    }
+
+    /// Shorthand for `.sparsity(Sparsity::AlwaysDense)`: always emit, even a zero.
+    pub fn dense(self) -> Self {
+        self.sparsity(Sparsity::AlwaysDense)
+    }
+
+    /// Shorthand for `.sparsity(Sparsity::AlwaysSparse)`: never emit a zero.
+    pub fn sparse(self) -> Self {
+        self.sparsity(Sparsity::AlwaysSparse)
+    }
+
+    /// Registers the metric as a [`Counter`].
+    #[track_caller]
+    pub fn counter(self) -> Counter {
+        self.registry
+            .register_counter_inner(self.name, self.aggregation, self.sparsity)
+    }
+
+    /// Registers the metric as a [`Summary`] with the given display unit.
+    #[track_caller]
+    pub fn summary(self, display_unit: Unit) -> Summary {
+        self.registry.register_summary_inner(
+            self.name,
+            self.aggregation,
+            display_unit,
+            self.sparsity,
+        )
+    }
+
+    /// Registers the metric as a [`BoolCounter`].
+    #[track_caller]
+    pub fn bool(self) -> BoolCounter {
+        self.registry
+            .register_bool_inner(self.name, self.aggregation, self.sparsity)
+    }
+
+    /// Registers the metric as a callback list (see [`Registry::register_list_callback`]).
+    #[track_caller]
+    pub fn list_callback<V, F>(self, unit: Unit, callback: F)
+    where
+        V: crate::backend::CallbackValue,
+        F: FnMut() -> V + 'static + Send,
+    {
+        self.registry.register_list_callback_inner(
+            self.name,
+            self.aggregation,
+            unit,
+            self.sparsity,
+            callback,
+        );
+    }
+}
+
 /// This represents a single entry in our emitted service log, with optional aggregation along the
 /// two class/instance dimensions.
 #[derive(PartialEq, Eq, Hash, PartialOrd, Ord)]
 struct MetricKey {
     name: Arc<str>,
     aggregation: Option<Arc<str>>,
+}
+
+/// A registered metric: its accumulating value plus the per-metric sparse policy applied to it at
+/// report time. The `sparsity` is fixed at first registration (subsequent registrations under the
+/// same key dedup to the existing entry and keep the original policy).
+struct MetricEntry {
+    value: MetricValue,
+    sparsity: Sparsity,
+}
+
+/// Asserts a repeat registration under an existing key requested the same [`Sparsity`], so a metric
+/// can't be silently registered with two conflicting policies.
+#[track_caller]
+fn assert_sparsity(
+    entry: &MetricEntry,
+    sparsity: Sparsity,
+    metric: &Arc<str>,
+    aggregation: &Option<Arc<str>>,
+) {
+    assert_eq!(
+        entry.sparsity, sparsity,
+        "metric name={metric:?}, aggregation={aggregation:?} already registered with different sparsity"
+    );
 }
 
 /// This represents metric state. Note that a single metric may collect many different values
@@ -597,9 +771,58 @@ mod test {
         registry.register_counter("a".into(), None);
         registry.register_summary("h".into(), None, Unit::Byte);
 
-        let line = registry
-            .try_take_current_metrics_line_sparse(true)
-            .unwrap();
+        let line = registry.try_take_current_metrics_line_sparse(true).unwrap();
         assert_eq!(line, "a=0,h=0 B");
+    }
+
+    /// The per-metric [`Sparsity`] override pins a metric's zero-emission independent of the report
+    /// policy: `AlwaysDense` emits a zero even under a sparse report, `AlwaysSparse` drops a zero
+    /// even under a dense one, and `Inherit` follows the report.
+    #[test]
+    fn per_metric_sparsity_overrides_report_policy() {
+        let registry = Registry::new();
+        registry.metric("dense").dense().counter();
+        registry.metric("sparse").sparse().counter();
+        registry.register_counter("inherit".into(), None);
+
+        // Sparse report: only the dense metric's zero survives.
+        assert_eq!(
+            registry
+                .try_take_current_metrics_line_sparse(false)
+                .unwrap(),
+            "dense=0"
+        );
+
+        // Dense report: the dense and inherit zeros survive; the sparse override still drops.
+        assert_eq!(
+            registry.try_take_current_metrics_line_sparse(true).unwrap(),
+            "dense=0,inherit=0"
+        );
+    }
+
+    /// Registering the same metric key twice with conflicting sparsity is a programming error.
+    #[test]
+    #[should_panic(expected = "different sparsity")]
+    fn conflicting_sparsity_panics() {
+        let registry = Registry::new();
+        registry.metric("a").dense().counter();
+        registry.metric("a").sparse().counter();
+    }
+
+    /// The builder's `aggregation` flows through to the reported line.
+    #[test]
+    fn builder_sets_aggregation() {
+        let registry = Registry::new();
+        registry
+            .metric("rx.ecn")
+            .aggregation("Variant|ect0")
+            .dense()
+            .counter();
+        assert_eq!(
+            registry
+                .try_take_current_metrics_line_sparse(false)
+                .unwrap(),
+            "rx.ecn=0 Variant|ect0"
+        );
     }
 }

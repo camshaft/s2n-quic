@@ -91,7 +91,8 @@ pub struct ReportOptions {
     ///
     /// Backends decide how to honor this. The querylog backend drops zeros (matching historical
     /// behavior) unless this is set; a parquet/otel backend may always keep them for gap-free time
-    /// series. See also [`MetricInfo::zero_suppressed`].
+    /// series. This is the report-wide default; an individual metric can override it in either
+    /// direction via [`MetricInfo::sparsity`].
     pub include_sparse: bool,
 }
 
@@ -99,6 +100,51 @@ impl ReportOptions {
     /// Options with `include_sparse` set to the given value.
     pub fn new(include_sparse: bool) -> Self {
         Self { include_sparse }
+    }
+}
+
+/// A per-metric override of the report-wide `include_sparse` policy.
+///
+/// A metric with no recorded value in an interval reports as a zero. Whether that zero is *emitted*
+/// is normally decided by [`ReportOptions::include_sparse`], but a metric can pin the decision:
+///
+/// * [`Inherit`](Sparsity::Inherit) — follow the report's `include_sparse` (the default).
+/// * [`AlwaysDense`](Sparsity::AlwaysDense) — always emit the zero, even under a sparse report.
+///   Use for always-on readings (e.g. worker count) that downstream expects every interval.
+/// * [`AlwaysSparse`](Sparsity::AlwaysSparse) — always drop the zero, even under a dense report.
+///   Use for gauge-style metrics (e.g. queue depth) where a zero is noise.
+///
+/// Backends consult this through [`emit_zero`](Sparsity::emit_zero); see [`MetricInfo::sparsity`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Default)]
+pub enum Sparsity {
+    /// Follow the report-wide [`ReportOptions::include_sparse`].
+    #[default]
+    Inherit,
+    /// Always emit a zero value, regardless of the report's `include_sparse`.
+    AlwaysDense,
+    /// Always suppress a zero value, regardless of the report's `include_sparse`.
+    AlwaysSparse,
+}
+
+impl Sparsity {
+    /// Whether a zero-valued metric should be emitted, resolving this override against the
+    /// report-wide `include_sparse` hint.
+    #[inline]
+    pub fn emit_zero(self, include_sparse: bool) -> bool {
+        match self {
+            Sparsity::Inherit => include_sparse,
+            Sparsity::AlwaysDense => true,
+            Sparsity::AlwaysSparse => false,
+        }
+    }
+
+    /// A short stable identifier, used by structured backends that record the policy as a column.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Sparsity::Inherit => "inherit",
+            Sparsity::AlwaysDense => "dense",
+            Sparsity::AlwaysSparse => "sparse",
+        }
     }
 }
 
@@ -133,14 +179,17 @@ pub struct MetricInfo<'a> {
     pub unit: Unit,
     /// The kind of metric.
     pub kind: MetricKind,
-    /// When `true`, a zero value for this metric should be suppressed by default (gauges, queue
-    /// depth). This replaces the previous `NonZeroDisplay` empty-string trick with an explicit bit,
-    /// so native backends can still choose to emit the real zero.
-    pub zero_suppressed: bool,
+    /// This metric's per-metric override of the report-wide sparse policy.
+    ///
+    /// Defaults to [`Sparsity::Inherit`] (follow [`ReportOptions::include_sparse`]).
+    /// [`Sparsity::AlwaysSparse`] reproduces the previous `zero_suppressed = true` behavior (drop a
+    /// zero regardless), and [`Sparsity::AlwaysDense`] forces a zero to be emitted. Backends decide
+    /// via [`Sparsity::emit_zero`].
+    pub sparsity: Sparsity,
 }
 
 impl<'a> MetricInfo<'a> {
-    /// Constructs a `MetricInfo`, defaulting `zero_suppressed` to `false`.
+    /// Constructs a `MetricInfo`, defaulting `sparsity` to [`Sparsity::Inherit`].
     pub fn new(
         name: &'a Arc<str>,
         aggregation: Option<&'a Arc<str>>,
@@ -152,8 +201,16 @@ impl<'a> MetricInfo<'a> {
             aggregation,
             unit,
             kind,
-            zero_suppressed: false,
+            sparsity: Sparsity::Inherit,
         }
+    }
+
+    /// Whether a zero value for this metric should be emitted under the given report-wide policy.
+    ///
+    /// Convenience for `self.sparsity.emit_zero(include_sparse)`, the check every backend performs.
+    #[inline]
+    pub fn emit_zero(&self, include_sparse: bool) -> bool {
+        self.sparsity.emit_zero(include_sparse)
     }
 }
 

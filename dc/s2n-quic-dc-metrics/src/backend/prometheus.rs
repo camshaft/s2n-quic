@@ -209,7 +209,7 @@ impl Backend for PrometheusBackend {
         // Suppress a counter that has never been non-zero, without materializing its family (see
         // `series_present`): the registry re-visits every metric each interval, so inserting here
         // would leak an empty family per zero-only metric.
-        if value == 0 && !self.include_sparse && !self.series_present(&name, &key) {
+        if value == 0 && !info.emit_zero(self.include_sparse) && !self.series_present(&name, &key) {
             return;
         }
         let family = self.family_or_insert(name, info);
@@ -222,10 +222,7 @@ impl Backend for PrometheusBackend {
     fn record_gauge(&mut self, info: &MetricInfo<'_>, value: i64) {
         let name = self.display_name(info);
         let key = self.series_key(info, None);
-        if value == 0
-            && (info.zero_suppressed || !self.include_sparse)
-            && !self.series_present(&name, &key)
-        {
+        if value == 0 && !info.emit_zero(self.include_sparse) && !self.series_present(&name, &key) {
             return;
         }
         let family = self.family_or_insert(name, info);
@@ -235,9 +232,10 @@ impl Backend for PrometheusBackend {
     fn record_bool(&mut self, info: &MetricInfo<'_>, true_count: u64, false_count: u64) {
         // One counter family with a `result` label per side; each side accumulates like a counter.
         let name = self.display_name(info);
+        let emit_zero = info.emit_zero(self.include_sparse);
         for (side, delta) in [(BoolSide::True, true_count), (BoolSide::False, false_count)] {
             let key = self.series_key(info, Some(side));
-            if delta == 0 && !self.include_sparse && !self.series_present(&name, &key) {
+            if delta == 0 && !emit_zero && !self.series_present(&name, &key) {
                 continue;
             }
             let family = self.family_or_insert(name.clone(), info);
@@ -252,7 +250,10 @@ impl Backend for PrometheusBackend {
         let unit = info.unit;
         let name = self.display_name(info);
         let key = self.series_key(info, None);
-        if hist.count() == 0 && !self.include_sparse && !self.series_present(&name, &key) {
+        if hist.count() == 0
+            && !info.emit_zero(self.include_sparse)
+            && !self.series_present(&name, &key)
+        {
             return;
         }
         let bounds = default_buckets(unit);
@@ -289,10 +290,7 @@ impl Backend for PrometheusBackend {
         let sum: f64 = values.iter().map(|v| v.as_f64()).sum();
         let name = self.display_name(info);
         let key = self.series_key(info, None);
-        if sum == 0.0
-            && (info.zero_suppressed || !self.include_sparse)
-            && !self.series_present(&name, &key)
-        {
+        if sum == 0.0 && !info.emit_zero(self.include_sparse) && !self.series_present(&name, &key) {
             return;
         }
         let family = self.family_or_insert(name, info);
