@@ -21,6 +21,14 @@ use crate::{
 #[derive(Clone)]
 pub struct Registry {
     inner: Arc<Mutex<RegistryInner>>,
+    /// Namespace prepended to the name of every metric registered through this handle.
+    ///
+    /// This is a per-handle property, *not* part of the shared [`RegistryInner`]: cloning a
+    /// `Registry` keeps the same prefix, but [`child`](Registry::child) produces a handle over the
+    /// same underlying storage with an extended prefix. It affects only the metric *name* recorded
+    /// into storage (and therefore what backends emit); the aggregation/variant dimension is left
+    /// untouched.
+    prefix: Option<Arc<str>>,
 }
 
 pub(crate) struct RegistryInner {
@@ -115,6 +123,44 @@ impl Registry {
                 task_monitors: HashMap::new(),
                 is_open: true,
             })),
+            prefix: None,
+        }
+    }
+
+    /// Returns a handle over the *same* underlying storage that prepends `prefix` to the name of
+    /// every metric registered through it.
+    ///
+    /// The prefix is joined to each metric name with a `.` (e.g. a child with prefix `myapp` turns
+    /// `rx.data` into `myapp.rx.data`), matching the dotted-namespace convention used for metric
+    /// names. An empty prefix yields a handle equivalent to this one.
+    ///
+    /// Children compose: calling `child` on a child concatenates the prefixes (`a` then `b`
+    /// produces `a.b.`). Because only the name is namespaced, metrics registered through the
+    /// child share the parent's counters/histograms storage and are reported together — a child is
+    /// purely a naming view, not a separate registry.
+    ///
+    /// This is the mechanism an application embedding the endpoint uses to keep the transport's
+    /// metrics in a namespace relative to its own: construct the endpoint with `registry.child(...)`
+    /// and every metric the endpoint registers — through any path — is prefixed.
+    pub fn child(&self, prefix: impl AsRef<str>) -> Registry {
+        let prefix = prefix.as_ref();
+        let prefix = match &self.prefix {
+            _ if prefix.is_empty() => self.prefix.clone(),
+            Some(existing) => Some(format!("{existing}.{prefix}").into()),
+            None => Some(prefix.into()),
+        };
+        Registry {
+            inner: self.inner.clone(),
+            prefix,
+        }
+    }
+
+    /// Applies this handle's [`prefix`](Self::prefix) to a metric name, returning the name unchanged
+    /// when no prefix is set (so the common, un-prefixed path allocates nothing extra).
+    fn prefixed_name(&self, metric: Arc<str>) -> Arc<str> {
+        match &self.prefix {
+            Some(prefix) => format!("{prefix}.{metric}").into(),
+            None => metric,
         }
     }
 
@@ -153,6 +199,7 @@ impl Registry {
         aggregation: Option<Arc<str>>,
         sparsity: Sparsity,
     ) -> Counter {
+        let metric = self.prefixed_name(metric);
         let mut inner = self.inner.lock().unwrap();
         let inner = &mut *inner;
 
@@ -204,6 +251,7 @@ impl Registry {
         display_unit: Unit,
         sparsity: Sparsity,
     ) -> Summary {
+        let metric = self.prefixed_name(metric);
         let mut inner = self.inner.lock().unwrap();
         let inner = &mut *inner;
 
@@ -248,6 +296,7 @@ impl Registry {
         aggregation: Option<Arc<str>>,
         sparsity: Sparsity,
     ) -> BoolCounter {
+        let metric = self.prefixed_name(metric);
         let mut inner = self.inner.lock().unwrap();
         let inner = &mut *inner;
 
@@ -342,6 +391,7 @@ impl Registry {
         V: crate::backend::CallbackValue,
         F: FnMut() -> V + 'static + Send,
     {
+        let metric = self.prefixed_name(metric);
         let mut inner = self.inner.lock().unwrap();
 
         let entry = inner.metrics.entry(MetricKey {
@@ -807,6 +857,45 @@ mod test {
         let registry = Registry::new();
         registry.metric("a").dense().counter();
         registry.metric("a").sparse().counter();
+    }
+
+    /// A child registry prefixes the emitted name of every metric registered through it, across
+    /// every registration path (plain register, the `metric(...)` builder, callbacks), while
+    /// leaving the aggregation/variant dimension untouched. Metrics registered on the parent keep
+    /// their bare names, and both report together because the child shares the parent's storage.
+    #[test]
+    fn child_prefixes_metric_names() {
+        let parent = Registry::new();
+        let child = parent.child("myapp");
+
+        parent.register_counter("rx.data".into(), None).increment(1);
+        child.register_counter("rx.data".into(), None).increment(2);
+        child
+            .register_counter("rx.ecn".into(), Some("Variant|ect0".into()))
+            .increment(3);
+        child.metric("built").counter().increment(4);
+        child.register_list_callback("cb".into(), None, Unit::Count, || 5usize);
+
+        let line = parent.take_current_metrics_line();
+        assert_eq!(
+            line,
+            "myapp.built=4,myapp.cb=5,myapp.rx.data=2,myapp.rx.ecn=3 Variant|ect0,rx.data=1"
+        );
+    }
+
+    /// Children compose: `child("a").child("b")` prefixes with `a.b`. An empty prefix is a no-op.
+    #[test]
+    fn child_prefixes_compose() {
+        let registry = Registry::new();
+        let nested = registry.child("a").child("b");
+        nested.register_counter("m".into(), None).increment(1);
+        // An empty prefix yields an equivalent handle (no extra segment).
+        registry
+            .child("")
+            .register_counter("n".into(), None)
+            .increment(2);
+
+        assert_eq!(registry.take_current_metrics_line(), "a.b.m=1,n=2");
     }
 
     /// The builder's `aggregation` flows through to the reported line.

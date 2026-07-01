@@ -2188,6 +2188,23 @@ impl Registry {
         }
     }
 
+    /// Wraps a [child](s2n_quic_dc_metrics::Registry::child) of this registry's underlying metrics
+    /// registry, so every metric registered through the returned handle has its emitted name
+    /// prefixed with `prefix`.
+    ///
+    /// This is how an application namespaces the transport's metrics relative to its own: the
+    /// prefix is prepended to the metric name the backends emit (e.g. `rx.data` becomes
+    /// `myapp.rx.data`), and because the child shares the parent's storage everything is reported
+    /// together. Only the emitted name changes — the wrapper-level metadata and topology labels
+    /// (used for tracing and graph rendering) keep the bare names, exactly as with the existing
+    /// [reporter-level prefix](ReporterConfig::prefix), which this composes with.
+    ///
+    /// The returned handle starts with fresh wrapper-level metadata, tracking only what is
+    /// registered through it (see [`with_inner`](Self::with_inner)).
+    pub fn child(&self, prefix: impl AsRef<str>) -> Self {
+        Self::with_inner(self.inner.child(prefix))
+    }
+
     /// Returns a snapshot of the runtime topology tracked by this registry.
     ///
     /// This includes all registered tasks, channels, and their bindings.
@@ -3055,6 +3072,31 @@ mod tests {
         // One destructive report feeds both backends; statsd receives a batch (tracing emits a log).
         report_once(&registry, false, &mut backends);
         assert!(rx.try_recv().is_ok());
+    }
+
+    #[test]
+    fn child_prefixes_emitted_metric_names() {
+        let inner = s2n_quic_dc_metrics::Registry::new();
+        let registry = Registry::with_inner(inner.clone());
+        let child = registry.child("myapp");
+
+        registry.register("rx.data").add(1);
+        child.register("rx.data").add(2);
+        // A metric registered through a queue-gauge clone of the child is namespaced too, since the
+        // child's inner registry threads through the clone.
+        child.register_queue_gauge("q.work").enqueue(1);
+
+        let line = inner
+            .try_take_current_metrics_line_sparse(true)
+            .expect("metrics were recorded");
+        assert!(line.contains("myapp.rx.data=2"), "got: {line}");
+        assert!(line.contains("myapp.q.work.enq"), "got: {line}");
+        assert!(line.contains("myapp.q.work.depth"), "got: {line}");
+        // The parent's own metric keeps its bare name.
+        assert!(
+            line.contains(",rx.data=1") || line.starts_with("rx.data=1"),
+            "got: {line}"
+        );
     }
 
     #[test]
