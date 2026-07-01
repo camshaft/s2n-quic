@@ -444,6 +444,9 @@ impl HistState {
 
 impl Series {
     /// Appends this series' sample line(s) to `out`.
+    ///
+    /// Everything is written straight into the shared `out` buffer — no per-sample temporary
+    /// strings for the `_bucket`/`_sum`/`_count` names, the `le` boundary, or float values.
     fn encode(
         &self,
         out: &mut String,
@@ -453,12 +456,14 @@ impl Series {
     ) {
         match self {
             Series::Counter(v) => {
-                write_series(out, name, labels, &[]);
+                write_series_header(out, name, "", labels, None);
                 writeln!(out, " {v}").unwrap();
             }
             Series::Gauge(v) => {
-                write_series(out, name, labels, &[]);
-                writeln!(out, " {}", fmt_f64(*v)).unwrap();
+                write_series_header(out, name, "", labels, None);
+                out.push(' ');
+                write_f64(out, *v);
+                out.push('\n');
             }
             Series::Histogram(state) => {
                 let bounds = default_buckets(unit);
@@ -466,38 +471,45 @@ impl Series {
                 let mut cumulative = 0u64;
                 for (i, &le) in bounds.iter().enumerate() {
                     cumulative += state.counts[i];
-                    write_series(
-                        out,
-                        &format!("{name}_bucket"),
-                        labels,
-                        &[("le", &fmt_f64(le))],
-                    );
+                    write_series_header(out, name, "_bucket", labels, Some(Le::Value(le)));
                     writeln!(out, " {cumulative}").unwrap();
                 }
                 // The `+Inf` bucket always equals the total observation count.
-                write_series(out, &format!("{name}_bucket"), labels, &[("le", "+Inf")]);
+                write_series_header(out, name, "_bucket", labels, Some(Le::Inf));
                 writeln!(out, " {}", state.count).unwrap();
-                write_series(out, &format!("{name}_sum"), labels, &[]);
-                writeln!(out, " {}", fmt_f64(state.sum)).unwrap();
-                write_series(out, &format!("{name}_count"), labels, &[]);
+                write_series_header(out, name, "_sum", labels, None);
+                out.push(' ');
+                write_f64(out, state.sum);
+                out.push('\n');
+                write_series_header(out, name, "_count", labels, None);
                 writeln!(out, " {}", state.count).unwrap();
             }
         }
     }
 }
 
-/// Writes `name{labels...}` (no trailing space or value) into `out`.
+/// The `le` label on a histogram bucket sample: either a boundary value or the `+Inf` overflow.
+enum Le {
+    Value(f64),
+    Inf,
+}
+
+/// Writes `name{suffix}{labels...,le="..."}` (no trailing space or value) into `out`.
 ///
-/// `base` are the aggregation-derived labels; `extra` are per-sample labels (`le`, `result`) that
-/// are appended after them. When both are empty, no `{}` is written.
-fn write_series(
+/// `name` and `suffix` (`""`, `_bucket`, `_sum`, `_count`) are written directly; `base` are the
+/// series' cached aggregation/result labels; `le`, when present, appends the histogram `le` label
+/// last. Everything goes straight into `out` — no intermediate allocations. When there are no
+/// labels at all, no `{}` is written.
+fn write_series_header(
     out: &mut String,
     name: &str,
+    suffix: &str,
     base: &[(Cow<'static, str>, Arc<str>)],
-    extra: &[(&str, &str)],
+    le: Option<Le>,
 ) {
     out.push_str(name);
-    if base.is_empty() && extra.is_empty() {
+    out.push_str(suffix);
+    if base.is_empty() && le.is_none() {
         return;
     }
     out.push('{');
@@ -505,8 +517,16 @@ fn write_series(
     for (k, v) in base {
         write_label(out, &mut first, k, v);
     }
-    for (k, v) in extra {
-        write_label(out, &mut first, k, v);
+    if let Some(le) = le {
+        if !first {
+            out.push(',');
+        }
+        out.push_str("le=\"");
+        match le {
+            Le::Value(v) => write_f64(out, v),
+            Le::Inf => out.push_str("+Inf"),
+        }
+        out.push('"');
     }
     out.push('}');
 }
@@ -584,21 +604,18 @@ fn to_reported(value: u64, unit: Unit) -> f64 {
     }
 }
 
-/// Formats an `f64` for the exposition format: integers render without a decimal point, and
-/// non-finite values map to the Prometheus spellings (`+Inf`, `-Inf`, `NaN`).
-fn fmt_f64(v: f64) -> String {
+/// Writes an `f64` to `out` in the exposition format: integers render without a decimal point, and
+/// non-finite values map to the Prometheus spellings (`+Inf`, `-Inf`, `NaN`). Writes directly into
+/// the shared output buffer — no intermediate `String`.
+fn write_f64(out: &mut String, v: f64) {
     if v.is_nan() {
-        "NaN".to_string()
+        out.push_str("NaN");
     } else if v.is_infinite() {
-        if v > 0.0 {
-            "+Inf".to_string()
-        } else {
-            "-Inf".to_string()
-        }
+        out.push_str(if v > 0.0 { "+Inf" } else { "-Inf" });
     } else if v.fract() == 0.0 && v.abs() < 1e15 {
-        format!("{}", v as i64)
+        write!(out, "{}", v as i64).unwrap();
     } else {
-        format!("{v}")
+        write!(out, "{v}").unwrap();
     }
 }
 
