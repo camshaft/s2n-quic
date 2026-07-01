@@ -22,9 +22,13 @@ use std::{
     },
 };
 
+#[cfg(feature = "arrow")]
+mod arrow;
 mod querylog;
 mod statsd;
 
+#[cfg(feature = "arrow")]
+pub use arrow::{schema as arrow_schema, ArrowBackend};
 pub use querylog::QuerylogBackend;
 pub use statsd::{StatsdBackend, StatsdSink, DEFAULT_MAX_PAYLOAD_SIZE};
 
