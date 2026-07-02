@@ -97,6 +97,10 @@ where
     counters.max_datagram_size.record_value(mtu as u64);
 
     let mut segment_size: u16 = 0;
+    // When true, `segment_size` was fixed to the MTU (not segment 1's actual encoded
+    // length) so that subsequent segments are zero-padded up to the MTU boundary and the
+    // GSO batch keeps growing. See the mode selection where `segment_size` is established.
+    let mut gso_pad_mode = false;
     let mut segments_written: u32 = 0;
     let mut sent_inflight_packet = false;
     // Sum of `flow_credits` admitted to the inflight map across every segment in this
@@ -533,9 +537,37 @@ where
 
             watermark = offset + encoded_len;
 
-            // First segment establishes GSO segment size
+            // The first segment establishes the GSO segment size and picks the batching mode.
+            //
+            // A GSO datagram is emitted as N wire packets each `segment_size` bytes wide
+            // (the last may be shorter); the kernel splits the `sendmsg` buffer at that fixed
+            // stride. So `segment_size` is both the per-packet target and the padding boundary
+            // that subsequent segments are zero-filled up to (see the `offset > watermark` fill).
+            //
+            // Two modes:
+            //
+            // - Pad mode (near-MTU): segment 1 encoded to within one data-frame header of the
+            //   MTU *and* more data is queued. This is a bulk data packet — one full data frame
+            //   fills a packet to `mtu - MAX_QUEUE_DATA_HEADER_OVERHEAD` at minimum. Fix
+            //   `segment_size = mtu` so every following full data packet fits the (conservative,
+            //   `VarInt::MAX`-PN) per-frame estimate, gets padded up to the MTU boundary, and the
+            //   batch keeps growing. The wasted pad is bounded by MAX_QUEUE_DATA_HEADER_OVERHEAD
+            //   (~1.3% at a 9000-byte MTU).
+            //
+            // - Tight mode (default): segment 1 is small (an ACK, control, or sub-MTU data
+            //   packet) or nothing else is queued. Lock `segment_size` to the actual encoded
+            //   length so small packets are never inflated to a full-MTU wire datagram, and let
+            //   the trailing `encoded_len < segment_size` check cap the batch as before.
             if segment_size == 0 {
-                segment_size = encoded_len as u16;
+                let near_mtu = encoded_len
+                    >= (mtu as usize)
+                        .saturating_sub(frame::MAX_QUEUE_DATA_HEADER_OVERHEAD as usize);
+                if near_mtu && context.has_pending_data() {
+                    segment_size = mtu;
+                    gso_pad_mode = true;
+                } else {
+                    segment_size = encoded_len as u16;
+                }
             }
 
             // Verify the is_ack_eliciting flag matches the actual frame list before
@@ -676,9 +708,22 @@ where
             // Advance to next segment boundary
             offset += segment_size as usize;
 
-            // Undersized segment must be last (GSO constraint)
-            if (encoded_len as u16) < segment_size {
-                break;
+            if gso_pad_mode {
+                // Pad mode: `segment_size == mtu`, so a full data packet's actual encode is
+                // always shorter than `segment_size` and gets zero-padded up to the boundary
+                // (handled by the `offset > watermark` fill at the top of the next iteration).
+                // The undersized-must-be-last rule therefore cannot terminate the batch here;
+                // instead stop when the data queue drains — the natural end of a bulk burst.
+                // The `max_segments` cap and the buffer-capacity check remain the other exits.
+                if !context.has_pending_data() {
+                    break;
+                }
+            } else {
+                // Tight mode: an undersized segment must be the last one (GSO requires every
+                // segment but the last to equal `segment_size`).
+                if (encoded_len as u16) < segment_size {
+                    break;
+                }
             }
         }
 

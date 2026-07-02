@@ -195,6 +195,10 @@ fn oracle(
     let mut segment_size = 0u16;
     let mut offset = 0usize;
     let mut next_idx = 0usize;
+    // Mirrors `gso_pad_mode` in `assemble()`: when segment 1 is a near-MTU data packet and
+    // more frames are queued, `segment_size` is fixed to the MTU and every non-final segment
+    // is zero-padded up to that boundary.
+    let mut pad_mode = false;
 
     while next_idx < frames.len() && packet_sizes.len() < max_segments {
         let remaining_total = segment::MAX_TOTAL as usize - offset.min(segment::MAX_TOTAL as usize);
@@ -251,14 +255,37 @@ fn oracle(
         let packet_len = (estimated - pn_saving) as u16;
         packet_sizes.push(packet_len);
 
+        // Segment 1 picks the mode (mirrors `assemble()`): a near-MTU data packet with more
+        // frames still queued fixes `segment_size` to the MTU (pad mode); otherwise lock it to
+        // the actual encoded length (tight mode).
         if segment_size == 0 {
-            segment_size = packet_len;
+            let near_mtu = (packet_len as usize)
+                >= (mtu as usize).saturating_sub(frame::MAX_QUEUE_DATA_HEADER_OVERHEAD as usize);
+            if near_mtu && next_idx < frames.len() {
+                segment_size = mtu;
+                pad_mode = true;
+            } else {
+                segment_size = packet_len;
+            }
         }
 
         offset += segment_size as usize;
 
-        if packet_len < segment_size {
+        // Tight mode only: an undersized segment must be the last one. Pad mode keeps going
+        // until the frames drain (outer `next_idx < frames.len()`) or a cap is hit.
+        if !pad_mode && packet_len < segment_size {
             break;
+        }
+    }
+
+    // In pad mode every non-final segment is zero-padded up to the MTU on the wire, so
+    // `Segments::sizes()` reports `segment_size` (== MTU) for all but the last segment. The
+    // final segment is never padded (padding of segment K happens at the start of iteration
+    // K+1, which never runs for the last), so it keeps its actual encoded length.
+    if pad_mode && packet_sizes.len() > 1 {
+        let last = packet_sizes.len() - 1;
+        for size in &mut packet_sizes[..last] {
+            *size = segment_size;
         }
     }
 
@@ -356,6 +383,193 @@ fn assemble_accounts_for_header_overhead() {
     );
 }
 
+/// Build a QueueData frame carrying a full bulk chunk — the writer sizes these at
+/// `mtu - MAX_QUEUE_DATA_HEADER_OVERHEAD`, which encodes to a near-MTU packet.
+fn full_data_frame(
+    entry: &Arc<PathSecretEntry>,
+    mtu: u16,
+    offset: u64,
+) -> crate::intrusive::Entry<Frame> {
+    let payload_len = (mtu - frame::MAX_QUEUE_DATA_HEADER_OVERHEAD) as usize;
+    Frame {
+        header: Header::QueueData {
+            queue_pair: crate::packet::datagram::QueuePair {
+                source_queue_id: VarInt::from_u8(1),
+                dest_queue_id: VarInt::from_u8(2),
+            },
+            binding_id: VarInt::from_u8(1),
+            offset: VarInt::new(offset).unwrap(),
+            largest_offset: VarInt::new(offset).unwrap(),
+            is_fin: false,
+            blocked: false,
+            dest_acceptor_id: None,
+            priority: crate::credit::Priority::default(),
+        },
+        payload: payload_vec(&vec![0x5a; payload_len]),
+        path_secret_entry: entry.clone(),
+        completion: None,
+        status: TransmissionStatus::default(),
+        ttl: DEFAULT_TTL,
+        enqueued_at: None,
+        flow_credits: 0,
+    }
+    .into()
+}
+
+/// Regression test for the GSO batching bug: a queue of full-MTU data frames must pack
+/// into a multi-segment GSO datagram, not one segment per `sendmsg`. Before the fix, the
+/// first segment locked `segment_size` to its own (slightly-under-MTU) encoded length, so
+/// the conservative estimate for segment 2 exceeded it and the batch terminated after one
+/// packet. With the fix, `segment_size` is pinned to the MTU and later segments are padded.
+#[test]
+fn assemble_batches_full_mtu_data_frames() {
+    // A modest MTU so several segments fit within `segment::MAX_TOTAL`. On non-Linux hosts
+    // MAX_TOTAL is only ~8953 (a large MTU would leave room for a single segment), whereas
+    // Linux allows ~65507 — 1400 keeps the batch multi-segment on both.
+    let mtu = 1400;
+    let registry = Registry::new();
+    let (mut context, entry) = make_context(mtu, &registry);
+    let clock = Clock::new(Duration::from_micros(1));
+    // Ask for a healthy batch; the effective cap is min(this, MAX_COUNT, send_quantum=10).
+    let gso = make_gso(8);
+    let pool = pool::Pool::new(u16::MAX);
+    let mut header_buf = Vec::new();
+    let mut cancelled = Queue::new();
+    let mut ack_completions = Queue::new();
+    let (mut freed_batch_tx, _freed_batch_rx) = crate::queue::freed_batch_channel();
+
+    // Enqueue more full chunks than the batch can hold so the loop is cap-bound, not
+    // data-bound — this is the "healthy" GSO exit the fix restores.
+    let mut offset = 0u64;
+    for _ in 0..32 {
+        let frame = full_data_frame(&entry, mtu, offset);
+        offset += frame.payload_len() as u64;
+        context.push_back_frame(frame);
+    }
+
+    let expected_segments = context.path_info(&gso).max_segments;
+    assert!(
+        expected_segments > 1,
+        "test precondition: effective GSO cap must exceed 1 (got {expected_segments})"
+    );
+
+    let counters = AssemblerCounters::new(&Registry::new());
+    let segments = assemble(
+        &mut context,
+        ImmediateQueueStatus::Empty,
+        &clock,
+        crate::endpoint::id::LocalSenderId::new(VarInt::from_u8(1)),
+        443,
+        &gso,
+        pool.alloc::<SyncRecycler>().expect("pool alloc failed"),
+        &mut header_buf,
+        &mut cancelled,
+        &mut ack_completions,
+        &mut freed_batch_tx,
+        &counters,
+        &crate::endpoint::counters::Send::new(
+            &crate::counter::Registry::default(),
+            crate::endpoint::id::LocalSenderId::from_index(0),
+        ),
+        &unused_credit_pool(),
+    )
+    .expect("frames should assemble");
+
+    let sizes = segments.sizes().collect::<Vec<_>>();
+    assert_eq!(
+        sizes.len(),
+        expected_segments,
+        "full-MTU data frames must fill the GSO batch to its cap, got sizes {sizes:?}"
+    );
+    // Padded (pad-mode) batch: every non-final segment is exactly the MTU on the wire.
+    for size in sizes.iter().take(sizes.len() - 1) {
+        assert_eq!(*size, mtu, "non-final segments are padded to the MTU");
+    }
+    assert_gso_invariants(&segments, mtu, expected_segments);
+}
+
+/// Guard for the padding decision: a batch that starts with a small (well-under-MTU) frame
+/// must stay in tight mode so it is not inflated to a full-MTU wire datagram. This is the
+/// case the near-MTU gate protects — ACK/control/sub-MTU packets keep their true size.
+#[test]
+fn assemble_does_not_pad_small_leading_frame() {
+    let mtu = 8927;
+    let registry = Registry::new();
+    let (mut context, entry) = make_context(mtu, &registry);
+    let clock = Clock::new(Duration::from_micros(1));
+    let gso = make_gso(8);
+    let pool = pool::Pool::new(u16::MAX);
+    let mut header_buf = Vec::new();
+    let mut cancelled = Queue::new();
+    let mut ack_completions = Queue::new();
+    let (mut freed_batch_tx, _freed_batch_rx) = crate::queue::freed_batch_channel();
+
+    // A single small control frame followed by full chunks. The small frame leads, so
+    // segment 1 is well under the MTU → tight mode → segment_size == its actual length.
+    context.push_back_frame(
+        Frame {
+            header: Header::QueueReset {
+                queue_pair: crate::packet::datagram::QueuePair {
+                    source_queue_id: VarInt::from_u8(1),
+                    dest_queue_id: VarInt::from_u8(1),
+                },
+                binding_id: VarInt::from_u8(1),
+                reset_target: ResetTarget::Both,
+                error_code: VarInt::from_u8(1),
+                init: None,
+            },
+            payload: ByteVec::new(),
+            path_secret_entry: entry.clone(),
+            completion: None,
+            status: TransmissionStatus::default(),
+            ttl: DEFAULT_TTL,
+            enqueued_at: None,
+            flow_credits: 0,
+        }
+        .into(),
+    );
+    // Higher-priority small frame drains first (see push order / priority sort); add data
+    // behind it so `has_pending_data()` is true at the mode-decision point.
+    let mut offset = 0u64;
+    for _ in 0..4 {
+        let frame = full_data_frame(&entry, mtu, offset);
+        offset += frame.payload_len() as u64;
+        context.push_back_frame(frame);
+    }
+
+    let counters = AssemblerCounters::new(&Registry::new());
+    let segments = assemble(
+        &mut context,
+        ImmediateQueueStatus::Empty,
+        &clock,
+        crate::endpoint::id::LocalSenderId::new(VarInt::from_u8(1)),
+        443,
+        &gso,
+        pool.alloc::<SyncRecycler>().expect("pool alloc failed"),
+        &mut header_buf,
+        &mut cancelled,
+        &mut ack_completions,
+        &mut freed_batch_tx,
+        &counters,
+        &crate::endpoint::counters::Send::new(
+            &crate::counter::Registry::default(),
+            crate::endpoint::id::LocalSenderId::from_index(0),
+        ),
+        &unused_credit_pool(),
+    )
+    .expect("frames should assemble");
+
+    let sizes = segments.sizes().collect::<Vec<_>>();
+    let first = sizes[0];
+    assert!(
+        first < mtu,
+        "small leading frame must not be padded to the MTU, got {first}"
+    );
+    // Tight mode: the QueueReset control frame is much smaller than a data packet. Whatever
+    // batches with it stays at that (small) segment size, never the MTU.
+    assert_gso_invariants(&segments, mtu, context.path_info(&gso).max_segments);
+}
+
 #[test]
 fn assemble_fuzz_respects_gso_invariants() {
     check!()
@@ -386,7 +600,12 @@ fn assemble_fuzz_respects_gso_invariants() {
             // Sort by priority to match the assembler's pending-queue drain order.
             frames.sort_by_key(|f| f.header.priority().as_index());
 
-            let max_segments = input.max_segments.min(segment::MAX_COUNT);
+            let clock = Clock::new(Duration::from_micros(1));
+            let gso = make_gso(input.max_segments.min(segment::MAX_COUNT));
+            // The assembler caps segments at `path_info().max_segments`, which mins the GSO
+            // limit with `send_quantum_segments` (derived from the CCA). Use that same effective
+            // value for the oracle so pad-mode batches — which can now reach the cap — match.
+            let max_segments = context.path_info(&gso).max_segments;
             let oracle = oracle(
                 &frames,
                 input.source_sender_id,
@@ -395,8 +614,6 @@ fn assemble_fuzz_respects_gso_invariants() {
                 input.mtu,
                 max_segments,
             );
-            let clock = Clock::new(Duration::from_micros(1));
-            let gso = make_gso(max_segments);
             let pool = pool::Pool::new(u16::MAX);
             let mut header_buf = Vec::new();
             let mut cancelled = Queue::new();
