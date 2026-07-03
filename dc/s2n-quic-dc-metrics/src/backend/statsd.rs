@@ -154,8 +154,10 @@ impl<S: StatsdSink> Backend for StatsdBackend<S> {
         // that cannot be aggregated across hosts.
         //
         // Bucket values are the native recorded magnitude: nanoseconds for time units
-        // (record_duration stores `as_nanos`), bytes/counts as-is, and percents scaled by
-        // FLOAT_INT_MULTIPLIER. `statsd_value` maps each to a sensible StatsD integer.
+        // (record_duration stores `as_nanos`), bytes/counts as-is. For an unscaled histogram
+        // `statsd_value` maps that to the reported integer; a fractional histogram stores `scale * v`
+        // and is de-scaled inline below (see the `scale != 1.0` branch) to emit a float sample.
+        let scale = hist.scale();
         for (value, count) in hist.buckets() {
             // `buckets()` only yields non-empty buckets, so `count >= 1`; guard anyway so the
             // sample-rate division stays self-contained and can never produce `@inf` if that
@@ -163,11 +165,19 @@ impl<S: StatsdSink> Backend for StatsdBackend<S> {
             if count == 0 {
                 continue;
             }
-            let v = statsd_value(value, unit);
             // Sample-rate weight: this single sample represents `count` observations.
             let weight = 1.0 / count as f64;
             let out = self.begin_record(info.name, ":");
-            write!(out, "{v}|h|@{weight}").unwrap();
+            // Unscaled: emit the exact integer magnitude (byte-identical to the historical encoding,
+            // and free of f64 precision loss on large nanosecond midpoints). Scaled: emit the
+            // de-scaled fractional value.
+            if scale == 1.0 {
+                let v = statsd_value(value, unit);
+                write!(out, "{v}|h|@{weight}").unwrap();
+            } else {
+                let v = value as f64 / scale;
+                write!(out, "{v}|h|@{weight}").unwrap();
+            }
             self.end_record(info.aggregation);
         }
     }
@@ -205,17 +215,18 @@ impl<S: StatsdSink> Backend for StatsdBackend<S> {
     }
 }
 
-/// Maps a native histogram bucket value to the integer this backend reports.
+/// Maps a native (unscaled) histogram bucket value to the integer this backend reports.
 ///
 /// Values are emitted as gauges in their native recorded magnitude:
 /// - time units (`Microsecond`/`Second`) are stored as **nanoseconds** (`record_duration` records
 ///   `Duration::as_nanos`), and we report that nanosecond magnitude as-is;
-/// - `Count`/`Byte` are raw and pass through;
-/// - `Percent` is stored scaled by `FLOAT_INT_MULTIPLIER` (1000), so divide back to a whole percent.
+/// - `Count`/`Byte`/`Percent` are raw and pass through.
+///
+/// Fractional histograms (scale != 1.0) don't route through here — the caller divides the scale out
+/// and emits a float directly.
 fn statsd_value(value: u64, unit: Unit) -> u64 {
     match unit {
-        Unit::Microsecond | Unit::Second | Unit::Count | Unit::Byte => value,
-        Unit::Percent => value / crate::summary::FLOAT_INT_MULTIPLIER_U64,
+        Unit::Microsecond | Unit::Second | Unit::Count | Unit::Byte | Unit::Percent => value,
     }
 }
 
@@ -503,12 +514,13 @@ mod test {
     }
 
     #[test]
-    fn histogram_percent_descaled() {
-        // Percent histogram values are stored x1000; statsd must divide back to whole percent.
+    fn histogram_scaled_ratio_descaled() {
+        // A fractional summary stores `round(scale * v)`; statsd must divide the scale back out and
+        // emit the fractional sample, not the raw stored magnitude.
         let registry = crate::Registry::new();
-        let summary = registry.register_summary("ratio".into(), None, Unit::Percent);
-        // logging_util_float_to_integer(50.0) == 50_000 stored.
-        summary.record_value(crate::logging_util_float_to_integer(50.0));
+        let summary = registry.metric("ratio").scale(1e6).summary(Unit::Count);
+        // Stored as round(0.25 * 1e6) = 250_000.
+        summary.record_f64(0.25);
 
         let sink = CaptureSink::default();
         let mut backend = StatsdBackend::new(sink.clone(), None);
@@ -519,11 +531,14 @@ mod test {
             .iter()
             .find(|l| l.starts_with("ratio:"))
             .expect("ratio histogram line");
-        let value = hist_value(line, "ratio:");
-        // ~50 (within bucket error), definitely not 50_000.
+        // Parse the float `{value}` out of `ratio:{value}|h|@{w}`.
+        let value: f64 = line["ratio:".len()..line.find('|').unwrap()]
+            .parse()
+            .unwrap();
+        // ~0.25 (within bucket relative error), definitely not 250000.
         assert!(
-            (49..=51).contains(&value),
-            "percent should be ~50, got {value}"
+            (0.249..=0.251).contains(&value),
+            "ratio should be ~0.25, got {value}"
         );
         assert!(line.contains("|h|@"), "should be a `|h` sample: {line}");
     }
@@ -536,7 +551,7 @@ mod test {
         // a zero-count histogram view
         let buckets = [0u64; 8];
         let cfg = crate::summary::bucket::Config::new(7, 64);
-        let hist = Histogram::new(&buckets, &cfg, Unit::Count);
+        let hist = Histogram::new(&buckets, &cfg, Unit::Count, 1.0);
         backend.record_histogram(
             &info(&arc("h"), None, Unit::Count, MetricKind::Histogram),
             hist,

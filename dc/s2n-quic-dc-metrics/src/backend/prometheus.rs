@@ -267,9 +267,10 @@ impl Backend for PrometheusBackend {
         // Fold this report's drained distribution into the cumulative per-bucket counts. Each
         // non-empty crate bucket contributes its `count` to the smallest `le` slot that covers its
         // representative value; the trailing slot is the `+Inf` overflow. The running sum uses the
-        // reported (unit-converted) value, matching the statsd backend's magnitude choice.
+        // reported (unit-converted, de-scaled) value, matching the statsd backend's magnitude choice.
+        let scale = hist.scale();
         for (value, count) in hist.buckets() {
-            let reported = to_reported(value, unit);
+            let reported = to_reported(value, unit) / scale;
             let slot = bounds
                 .iter()
                 .position(|&le| reported <= le)
@@ -589,16 +590,16 @@ fn default_buckets(unit: Unit) -> &'static [f64] {
     }
 }
 
-/// Converts a native histogram bucket value to its reported Prometheus magnitude.
+/// Converts a native histogram bucket value to its reported Prometheus magnitude, before the
+/// histogram's fixed-point [`scale`](crate::Summary::scale) is divided out by the caller.
 ///
 /// Mirrors the storage conventions the statsd backend documents: time units store nanoseconds (from
-/// `record_duration`) and are reported as seconds; `Count`/`Byte` are raw; `Percent` is stored
-/// scaled by `FLOAT_INT_MULTIPLIER` (1000) and is reported as a whole percentage.
+/// `record_duration`) and are reported as seconds; `Count`/`Byte`/`Percent` are raw. A fractional
+/// (scaled) histogram has its scale divided out by the caller after this conversion.
 fn to_reported(value: u64, unit: Unit) -> f64 {
     match unit {
         Unit::Microsecond | Unit::Second => value as f64 / 1_000_000_000.0,
-        Unit::Count | Unit::Byte => value as f64,
-        Unit::Percent => value as f64 / crate::summary::FLOAT_INT_MULTIPLIER_U64 as f64,
+        Unit::Count | Unit::Byte | Unit::Percent => value as f64,
     }
 }
 

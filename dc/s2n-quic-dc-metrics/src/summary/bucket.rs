@@ -129,11 +129,15 @@ impl Config {
     }
 
     /// Returns the grouping power that was used to create this configuration.
+    // Part of the imported h2histogram `Config` API; retained from the upstream source even though
+    // the crate's own recording path doesn't currently read it back.
+    #[allow(dead_code)]
     pub const fn grouping_power(&self) -> u8 {
         self.grouping_power
     }
 
     /// Returns the max value power that was used to create this configuration.
+    #[allow(dead_code)]
     pub const fn max_value_power(&self) -> u8 {
         self.max_value_power
     }

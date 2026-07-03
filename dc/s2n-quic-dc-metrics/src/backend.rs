@@ -224,20 +224,39 @@ pub struct Histogram<'a> {
     buckets: &'a [u64],
     config: &'a bucket::Config,
     unit: Unit,
+    /// The fixed-point [`scale`](crate::Summary::scale) the samples were recorded with. Bucket
+    /// representative values are integers `round(scale * v)`; a backend emitting a numeric value
+    /// divides by this to recover the fractional magnitude. `1.0` for a plain integer histogram.
+    scale: f64,
 }
 
 impl<'a> Histogram<'a> {
-    pub(crate) fn new(buckets: &'a [u64], config: &'a bucket::Config, unit: Unit) -> Self {
+    pub(crate) fn new(
+        buckets: &'a [u64],
+        config: &'a bucket::Config,
+        unit: Unit,
+        scale: f64,
+    ) -> Self {
         Self {
             buckets,
             config,
             unit,
+            scale,
         }
     }
 
     /// The display unit for this histogram.
     pub fn unit(&self) -> Unit {
         self.unit
+    }
+
+    /// The fixed-point [`scale`](crate::Summary::scale) the histogram's samples were recorded with.
+    ///
+    /// A scale of `1.0` is a plain integer histogram. For a larger scale the integer bucket values
+    /// returned by [`buckets`](Self::buckets)/[`quantile`](Self::quantile) are `round(scale * v)`;
+    /// [`representative_value_f64`](Self::representative_value_f64) divides that back out.
+    pub fn scale(&self) -> f64 {
+        self.scale
     }
 
     /// The total number of recorded samples.
@@ -257,11 +276,21 @@ impl<'a> Histogram<'a> {
             .map(move |(idx, count)| (self.representative_value(idx), *count))
     }
 
-    /// The representative (midpoint) value of bucket `idx`.
+    /// The representative (midpoint) value of bucket `idx`, in the histogram's fixed-point integer
+    /// space (i.e. `round(scale * v)`). For a scaled histogram use
+    /// [`representative_value_f64`](Self::representative_value_f64) to recover the fractional value.
     pub(crate) fn representative_value(&self, idx: usize) -> u64 {
         self.config
             .index_to_lower_bound(idx)
             .midpoint(self.config.index_to_upper_bound(idx))
+    }
+
+    /// The representative value of bucket `idx` with the fixed-point [`scale`](Self::scale) divided
+    /// back out, recovering the recorded magnitude as an `f64`.
+    ///
+    /// For an unscaled histogram (`scale == 1.0`) this is just the integer midpoint as an `f64`.
+    pub fn representative_value_f64(&self, idx: usize) -> f64 {
+        self.representative_value(idx) as f64 / self.scale
     }
 
     /// The lowest non-empty bucket's representative (midpoint) value, or 0 if empty.
@@ -331,7 +360,7 @@ impl<'a> Histogram<'a> {
     /// boundaries it emits the count accumulated since the last boundary at the current bucket's
     /// midpoint value (converted per unit).
     pub(crate) fn fmt_querylog_buckets(&self, out: &mut String, total_count: u64) {
-        use crate::summary::logging_util_integer_to_float;
+        use crate::summary::scale_decimals;
         use std::time::Duration;
 
         let quantiles = [
@@ -339,6 +368,10 @@ impl<'a> Histogram<'a> {
         ]
         .map(|q| (q * total_count as f64).ceil() as u64);
         let mut quantile_idx = 0;
+
+        // A scaled histogram (fractional samples) prints the de-scaled value with a fixed number of
+        // decimal places; an unscaled one prints the bare integer, byte-identically to before.
+        let decimals = scale_decimals(self.scale);
 
         // Prefix sum up to the current bucket.
         let mut partial_count = 0;
@@ -367,18 +400,19 @@ impl<'a> Histogram<'a> {
                     let count = since_last_write;
                     since_last_write = 0;
 
-                    let formatted_value = match self.unit {
+                    // Convert the stored (fixed-point) magnitude to the display unit. Time units are
+                    // stored as nanoseconds; scale (if any) is divided back out afterward.
+                    let unit_value = match self.unit {
                         Unit::Count | Unit::Byte | Unit::Percent => new_value,
                         Unit::Microsecond => Duration::from_nanos(new_value).as_micros() as u64,
                         Unit::Second => Duration::from_nanos(new_value).as_secs(),
                     };
 
-                    match self.unit {
-                        Unit::Percent => {
-                            let formatted_value = logging_util_integer_to_float(formatted_value);
-                            write!(out, "{formatted_value:.3}*{count}").unwrap();
-                        }
-                        _ => write!(out, "{formatted_value}*{count}").unwrap(),
+                    if self.scale == 1.0 {
+                        write!(out, "{unit_value}*{count}").unwrap();
+                    } else {
+                        let value = unit_value as f64 / self.scale;
+                        write!(out, "{value:.decimals$}*{count}").unwrap();
                     }
                 }
             }
