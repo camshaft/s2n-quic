@@ -215,12 +215,13 @@ impl<S: StatsdSink> Backend for StatsdBackend<S> {
     }
 }
 
-/// Formats an `f64` with at most 6 decimal places, trimming any trailing zeros.
+/// Formats an `f64` with at most 6 decimal places, trimming trailing zeros but always
+/// emitting at least one decimal place (e.g. `7.0`).
 ///
-/// This avoids the zero-padding produced by `{:.6}` (e.g. `7.000000`) while still bounding
-/// the output to at most 6 decimal places (e.g. `0.333333` for `1/3`). The implementation
-/// is allocation-free: it converts to a fixed-point integer, strips trailing zeros by integer
-/// division, then emits the result with a width-controlled format specifier.
+/// This bounds the output to at most 6 decimal places (e.g. `0.333333` for `1/3`) while
+/// ensuring the value is always formatted as a float (e.g. `7.0` rather than `7`). The
+/// implementation is allocation-free: it converts to a fixed-point integer, strips trailing
+/// zeros by integer division, then emits the result with a width-controlled format specifier.
 struct Trimmed(f64);
 
 impl fmt::Display for Trimmed {
@@ -235,7 +236,7 @@ impl fmt::Display for Trimmed {
             prec -= 1;
         }
         if prec == 0 {
-            write!(f, "{int_part}")
+            write!(f, "{int_part}.0")
         } else {
             write!(f, "{int_part}.{frac:0>width$}", width = prec)
         }
@@ -531,7 +532,7 @@ mod test {
         );
         let ten = lines
             .iter()
-            .find(|l| l.contains("|@1|"))
+            .find(|l| l.contains("|@1.0|"))
             .expect("10us bucket with weight 1");
         let ten_ns = hist_value(ten, "svc.task.time:");
         assert!(
@@ -732,7 +733,7 @@ mod test {
             &values,
         );
         backend.report_end();
-        assert!(sink.lines().contains(&"workers:7|g".to_string()));
+        assert!(sink.lines().contains(&"workers:7.0|g".to_string()));
     }
 
     #[test]
