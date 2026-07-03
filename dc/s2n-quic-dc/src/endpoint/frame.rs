@@ -45,17 +45,24 @@ pub const MAX_QUEUE_MSG_HEADER_OVERHEAD: u16 = 152;
 pub enum Priority {
     QueueReset = 0,
     QueueControl = 1,
-    QueueData = 2,
-    QueueInit = 3,
+    // `QueueInit` (new-binding establishment) outranks `QueueData` (bulk data on an
+    // already-established binding): frames drain lowest-index-first, so a numerically
+    // lower discriminant is a higher transmission priority. This prevents streams that
+    // are pushing a lot of data at once from starving out the init frames that would
+    // let new connections come up.
+    QueueInit = 2,
+    QueueData = 3,
 }
 
 impl Priority {
     pub const LEVELS: usize = 4;
+    // Kept aligned by discriminant with the physical priority-queue arrays: `ALL[i]` is
+    // the `Priority` whose `as_index()` is `i` (see `PriorityStorage::drain`).
     pub const ALL: [Self; Self::LEVELS] = [
         Self::QueueReset,
         Self::QueueControl,
-        Self::QueueData,
         Self::QueueInit,
+        Self::QueueData,
     ];
 
     #[inline]
