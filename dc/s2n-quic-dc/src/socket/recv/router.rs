@@ -55,8 +55,14 @@ pub trait Router {
             // further and correctly dispatch to the right place.
             Ok((packet, remaining)) => {
                 if cfg!(test) {
+                    // GSO pad-mode batches zero-pad each non-final segment up to the MTU
+                    // boundary (see `assemble()`); on GRO those pad bytes arrive as the
+                    // segment's tail. They are not part of the packet — the AEAD tag covers
+                    // only the real payload — so tolerate an all-zero remainder here. A
+                    // non-zero remainder still means two packets landed in one segment, which
+                    // we don't yet support and want to catch.
                     assert!(
-                        remaining.is_empty(),
+                        remaining.as_less_safe_slice().iter().all(|&b| b == 0),
                         "packet = {packet:?}, remaining = {remaining:?}"
                     );
                 }

@@ -437,7 +437,24 @@ pub fn setup_sim_endpoint(
     };
 
     let runtime = crate::runtime::bach::Handle::new(worker_count);
-    let gso = s2n_quic_platform::features::Gso::default();
+    // Pin the GSO segment cap so sim batching is platform-independent. With GSO batching in
+    // the assembler, the segments-per-datagram count follows the effective cap in
+    // `Context::path_info` = min(gso, MAX_COUNT, send_quantum_segments, MAX_TOTAL/mtu). Of
+    // these, `MAX_COUNT` and `MAX_TOTAL` are compile-time platform constants — Linux permits a
+    // ~64 KiB datagram (`MAX_TOTAL=65507`, `MAX_COUNT≈44`), other hosts ~9 KiB
+    // (`MAX_TOTAL≈8953`, `MAX_COUNT≈6`). `send_quantum_segments` is BBR-derived and identical
+    // across platforms under bach. So leaving GSO at its bach default (`MAX_BURST_PACKETS=10`)
+    // lets the platform `MAX_TOTAL` clamp bind at ~6 segments on macOS but ~10 on Linux, making
+    // `asm.segments` — and thus every trace snapshot — platform-dependent.
+    //
+    // Pinning GSO to 5 keeps it at or below the smallest platform's `MAX_TOTAL/mtu` floor for
+    // the sim MTUs in use (≈6 at the default 1500-byte MTU), so GSO is always the binding
+    // constraint and batch depth is identical everywhere. 5 (not lower) is deliberate: a cap of
+    // 4 throttles a heavy-loss recv-credit-advertise path enough to trip
+    // `fair_share::heavy_loss_read_pattern_no_stall`. bach has no real kernel GSO limit, so this
+    // only shapes assembler batching, not the simulated wire.
+    const SIM_GSO_SEGMENTS: usize = 5;
+    let gso = s2n_quic_platform::features::Gso::for_testing(SIM_GSO_SEGMENTS);
 
     let ups_socket =
         Arc::new(bach::net::UdpSocket::new(&send_bind_opts).expect("failed to bind UPS socket"));
