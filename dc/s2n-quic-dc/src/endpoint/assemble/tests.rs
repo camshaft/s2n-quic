@@ -196,9 +196,25 @@ fn oracle(
     let mut offset = 0usize;
     let mut next_idx = 0usize;
     // Mirrors `gso_pad_mode` in `assemble()`: when segment 1 is a near-MTU data packet and
-    // more frames are queued, `segment_size` is fixed to the MTU and every non-final segment
+    // more bulk data is queued, `segment_size` is fixed to the MTU and every non-final segment
     // is zero-padded up to that boundary.
     let mut pad_mode = false;
+
+    // Mirrors `Context::has_pending_stream_data()`: true when a QueueData/QueueInit-priority
+    // frame remains at or after `from`. The harness sorts `frames` by priority ascending
+    // (Reset, Control, Data, Init) and the assembler drains in that order, so all stream-data
+    // frames form a contiguous suffix. Precompute where it ends once (O(n)) so the per-segment
+    // check is O(1): stream data remains iff `from` is still before that boundary.
+    let stream_data_end = frames
+        .iter()
+        .rposition(|f| {
+            matches!(
+                f.header.priority(),
+                frame::Priority::QueueData | frame::Priority::QueueInit
+            )
+        })
+        .map_or(0, |i| i + 1);
+    let has_stream_data = |from: usize| from < stream_data_end;
 
     while next_idx < frames.len() && packet_sizes.len() < max_segments {
         let remaining_total = segment::MAX_TOTAL as usize - offset.min(segment::MAX_TOTAL as usize);
@@ -256,12 +272,12 @@ fn oracle(
         packet_sizes.push(packet_len);
 
         // Segment 1 picks the mode (mirrors `assemble()`): a near-MTU data packet with more
-        // frames still queued fixes `segment_size` to the MTU (pad mode); otherwise lock it to
-        // the actual encoded length (tight mode).
+        // bulk data still queued fixes `segment_size` to the MTU (pad mode); otherwise lock it
+        // to the actual encoded length (tight mode).
         if segment_size == 0 {
             let near_mtu = (packet_len as usize)
                 >= (mtu as usize).saturating_sub(frame::MAX_QUEUE_DATA_HEADER_OVERHEAD as usize);
-            if near_mtu && next_idx < frames.len() {
+            if near_mtu && has_stream_data(next_idx) {
                 segment_size = mtu;
                 pad_mode = true;
             } else {
@@ -272,8 +288,12 @@ fn oracle(
         offset += segment_size as usize;
 
         // Tight mode only: an undersized segment must be the last one. Pad mode keeps going
-        // until the frames drain (outer `next_idx < frames.len()`) or a cap is hit.
-        if !pad_mode && packet_len < segment_size {
+        // until the bulk-data queue drains (`has_stream_data`) or a cap is hit.
+        if pad_mode {
+            if !has_stream_data(next_idx) {
+                break;
+            }
+        } else if packet_len < segment_size {
             break;
         }
     }
@@ -390,7 +410,7 @@ fn full_data_frame(
     mtu: u16,
     offset: u64,
 ) -> crate::intrusive::Entry<Frame> {
-    let payload_len = (mtu - frame::MAX_QUEUE_DATA_HEADER_OVERHEAD) as usize;
+    let payload_len = mtu.saturating_sub(frame::MAX_QUEUE_DATA_HEADER_OVERHEAD) as usize;
     Frame {
         header: Header::QueueData {
             queue_pair: crate::packet::datagram::QueuePair {

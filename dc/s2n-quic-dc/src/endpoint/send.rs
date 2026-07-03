@@ -1036,6 +1036,17 @@ impl Context {
         self.queues.iter().any(|q| !q.is_empty())
     }
 
+    /// True when a frame carrying stream payload (`QueueData`/`QueueMsg`, including the
+    /// `QueueInit` variant) is queued. Unlike [`has_pending_data`](Self::has_pending_data),
+    /// this excludes the control/reset priorities so callers can reason specifically about
+    /// bulk data — e.g. GSO pad-mode batching, which should pad full data packets but leave
+    /// control/reset traffic in tight mode.
+    #[inline]
+    pub fn has_pending_stream_data(&self) -> bool {
+        !self.queues[Priority::QueueData.as_index()].is_empty()
+            || !self.queues[Priority::QueueInit.as_index()].is_empty()
+    }
+
     #[inline]
     pub fn can_send_pending_frames(&self) -> bool {
         self.cca.requires_fast_retransmission() || !self.cca.is_congestion_limited()

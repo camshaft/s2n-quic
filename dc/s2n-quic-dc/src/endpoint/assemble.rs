@@ -547,22 +547,24 @@ where
             // Two modes:
             //
             // - Pad mode (near-MTU): segment 1 encoded to within one data-frame header of the
-            //   MTU *and* more data is queued. This is a bulk data packet — one full data frame
-            //   fills a packet to `mtu - MAX_QUEUE_DATA_HEADER_OVERHEAD` at minimum. Fix
+            //   MTU *and* more bulk data is queued. This is a bulk data packet — one full data
+            //   frame fills a packet to `mtu - MAX_QUEUE_DATA_HEADER_OVERHEAD` at minimum. Fix
             //   `segment_size = mtu` so every following full data packet fits the (conservative,
             //   `VarInt::MAX`-PN) per-frame estimate, gets padded up to the MTU boundary, and the
             //   batch keeps growing. The wasted pad is bounded by MAX_QUEUE_DATA_HEADER_OVERHEAD
-            //   (~1.3% at a 9000-byte MTU).
+            //   (~1.3% at a 9000-byte MTU). Gated on `has_pending_stream_data()` (not any pending
+            //   frame) so a near-MTU control/reset burst can't trip pad mode and inflate the tail
+            //   with padding to carry a small control frame.
             //
             // - Tight mode (default): segment 1 is small (an ACK, control, or sub-MTU data
-            //   packet) or nothing else is queued. Lock `segment_size` to the actual encoded
+            //   packet) or no more bulk data is queued. Lock `segment_size` to the actual encoded
             //   length so small packets are never inflated to a full-MTU wire datagram, and let
             //   the trailing `encoded_len < segment_size` check cap the batch as before.
             if segment_size == 0 {
                 let near_mtu = encoded_len
                     >= (mtu as usize)
                         .saturating_sub(frame::MAX_QUEUE_DATA_HEADER_OVERHEAD as usize);
-                if near_mtu && context.has_pending_data() {
+                if near_mtu && context.has_pending_stream_data() {
                     segment_size = mtu;
                     gso_pad_mode = true;
                 } else {
@@ -713,9 +715,10 @@ where
                 // always shorter than `segment_size` and gets zero-padded up to the boundary
                 // (handled by the `offset > watermark` fill at the top of the next iteration).
                 // The undersized-must-be-last rule therefore cannot terminate the batch here;
-                // instead stop when the data queue drains — the natural end of a bulk burst.
+                // instead stop when the bulk-data queue drains — the natural end of a data
+                // burst — so we don't pad a segment just to append leftover control/reset work.
                 // The `max_segments` cap and the buffer-capacity check remain the other exits.
-                if !context.has_pending_data() {
+                if !context.has_pending_stream_data() {
                     break;
                 }
             } else {
