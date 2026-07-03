@@ -22,7 +22,7 @@ pub use backend::{
 };
 pub use bool_counter::BoolCounter;
 pub use counter::Counter;
-pub use registry::{MetricBuilder, Registry};
+pub use registry::{MetricBuilder, MetricDescriptor, Registry};
 pub use summary::Summary;
 
 pub use runtime::TaskMonitor;
