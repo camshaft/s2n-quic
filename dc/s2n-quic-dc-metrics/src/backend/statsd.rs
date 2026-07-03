@@ -220,14 +220,20 @@ impl<S: StatsdSink> Backend for StatsdBackend<S> {
 ///
 /// This bounds the output to at most 6 decimal places (e.g. `0.333333` for `1/3`) while
 /// ensuring the value is always formatted as a float (e.g. `7.0` rather than `7`). The
-/// implementation is allocation-free: it converts to a fixed-point integer, strips trailing
-/// zeros by integer division, then emits the result with a width-controlled format specifier.
+/// implementation is allocation-free: finite values are rounded into a fixed-point integer,
+/// trailing fractional zeros are stripped by integer division, and the result is emitted with a
+/// width-controlled format specifier.
 struct Trimmed(f64);
 
 impl fmt::Display for Trimmed {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if !self.0.is_finite() {
+            return write!(f, "{}", self.0);
+        }
+
         const SCALE: u64 = 1_000_000; // 10^6 → 6 decimal places max
-        let scaled = (self.0 * SCALE as f64).round() as u64;
+        let sign = if self.0.is_sign_negative() { "-" } else { "" };
+        let scaled = (self.0.abs() * SCALE as f64).round() as u64;
         let int_part = scaled / SCALE;
         let mut frac = scaled % SCALE;
         let mut prec = 6usize;
@@ -236,9 +242,9 @@ impl fmt::Display for Trimmed {
             prec -= 1;
         }
         if prec == 0 {
-            write!(f, "{int_part}.0")
+            write!(f, "{sign}{int_part}.0")
         } else {
-            write!(f, "{int_part}.{frac:0>width$}", width = prec)
+            write!(f, "{sign}{int_part}.{frac:0>width$}", width = prec)
         }
     }
 }
@@ -764,5 +770,18 @@ mod test {
             weight_str, "0.333333",
             "weight must be capped at 6 decimal places, not full f64 precision"
         );
+    }
+
+    #[test]
+    fn trimmed_preserves_sign_for_finite_values() {
+        assert_eq!(format!("{}", Trimmed(-7.0)), "-7.0");
+        assert_eq!(format!("{}", Trimmed(-0.3333333333333333)), "-0.333333");
+    }
+
+    #[test]
+    fn trimmed_preserves_non_finite_values() {
+        assert_eq!(format!("{}", Trimmed(f64::NAN)), "NaN");
+        assert_eq!(format!("{}", Trimmed(f64::INFINITY)), "inf");
+        assert_eq!(format!("{}", Trimmed(f64::NEG_INFINITY)), "-inf");
     }
 }
