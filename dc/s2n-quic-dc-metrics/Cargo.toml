@@ -26,6 +26,11 @@ tokio = { version = "1.25.0", default-features = false, features = ["rt", "rt-mu
 chrono = { version = "0.4.39", default-features = false, features = ["std", "now"] }
 libc = "0.2.170"
 crossbeam-queue = "0.3.12"
+# Provides a stable, lock-free 128-bit atomic (std's `AtomicU128` is still unstable). We use it for
+# a tagged (pointer, generation) CAS on the SPMC `empty_pages` stack to defeat the ABA hazard in
+# `pop`; it lowers to `cmpxchg16b` on x86_64 and `casp` (LSE) on aarch64 — the same instruction
+# family the rseq fast path already requires.
+portable-atomic = { version = "1", default-features = false }
 
 [lints.rust.unexpected_cfgs]
 level = "warn"

@@ -91,15 +91,20 @@ impl RegistryInner {
         backend.report_end();
     }
 
-    /// Folds any buffered per-CPU pages into the aggregate without draining or reporting. See
+    /// Folds the buffered *full pages* into the aggregate without draining or reporting. See
     /// [`Registry::absorb`].
+    ///
+    /// This deliberately compacts only the full-page buffer (the part that grows without bound
+    /// between reports), not the per-CPU pages — those are bounded to one page per CPU and are only
+    /// swept by [`report`](Self::report), which pays for the `membarrier` that makes reading them
+    /// sound. Folding is additive, so a later report still observes every event.
     pub fn absorb(&self) {
         if !self.is_open {
             return;
         }
 
-        self.counters.steal_pages();
-        self.histograms.steal_pages();
+        self.counters.absorb_full_pages();
+        self.histograms.absorb_full_pages();
     }
 
     pub fn try_take_current_metrics_line(&mut self, include_sparse: bool) -> Option<String> {

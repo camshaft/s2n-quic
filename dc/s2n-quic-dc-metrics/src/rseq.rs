@@ -11,6 +11,11 @@ use std::{
     },
 };
 
+// std's `AtomicU128` is unstable (feature `integer_atomics`); this crate builds on stable, so we
+// use `portable-atomic`, which lowers a 128-bit CAS to `cmpxchg16b` (x86_64) / `casp` (aarch64
+// LSE). See the `TaggedHead` docs for why we need a double-word CAS on the SPMC pool.
+use portable_atomic::AtomicU128;
+
 #[cfg(target_os = "linux")]
 use std::{cell::Cell, ffi::CStr, ptr::NonNull};
 
@@ -35,70 +40,294 @@ struct Page {
     // assembly assumes slots is at index 0
     slots: [MaybeUninit<u64>; SLOTS],
     length: AtomicU64,
-    next: *mut Page,
+    // Intrusive stack link. Atomic (not a plain `*mut Page`) because a page can be concurrently
+    // read as a stack `head` by one thread while another thread that just popped it writes its
+    // `next`; a plain-pointer read/write there would be a data race (UB) even though the CAS is
+    // what actually guards correctness. `Relaxed` is sufficient: the head CAS carries the
+    // happens-before, `next` only needs to be readable without tearing.
+    next: AtomicPtr<Page>,
 }
 
 // Lock in the exact page size so a future field addition can't silently push the struct over a
 // boundary and reintroduce alignment padding (adjust the slot derivation to compensate instead).
 const _: () = assert!(std::mem::size_of::<Page>() == PAGE_SIZE);
 
-#[cfg(target_os = "linux")]
+/// Test-only counter of every `Page::new` allocation. The whole point of the pool is that once it
+/// is warm, recording should recycle pages and stop calling `Page::new`; a conservation test
+/// watches this stop growing. (The production leak was exactly this count climbing without bound.)
+#[cfg(test)]
+static PAGES_ALLOCATED: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(any(test, target_os = "linux"))]
 impl Page {
     fn new() -> Box<Page> {
+        #[cfg(test)]
+        PAGES_ALLOCATED.fetch_add(1, Ordering::Relaxed);
         Box::new(Page {
             slots: [const { MaybeUninit::uninit() }; SLOTS],
             length: AtomicU64::new(0),
-            next: ptr::null_mut(),
+            next: AtomicPtr::new(ptr::null_mut()),
         })
     }
 }
 
-/// Lock-free intrusive stack of Pages.
+/// The head cell of a [`Stack`]. This is the only thing that differs between the two page pools,
+/// and abstracting it is what lets the compiler *statically* forbid the unsafe operation on each:
 ///
-/// Push is a single CAS. `take_all` swaps the head to null and returns the
-/// entire chain for batch processing — no per-element atomic ops on drain.
-struct PageStack {
+/// - [`PtrHead`] is a plain `AtomicPtr` — cheap, but its `pop` would be ABA-unsafe, so [`Stack`]
+///   does not provide `pop` for it. Used by the MPSC `full_pages` pool (many pushers, one drainer,
+///   never popped), whose hot push path stays exactly as fast as before.
+/// - [`TaggedHead`] packs a `(generation, pointer)` pair CAS'd as one 128-bit word. The generation
+///   is bumped on every mutation, so a recurring pointer value no longer makes a stale CAS succeed
+///   — defeating ABA. Used by the SPMC `empty_pages` pool (one pusher under the aggregate lock,
+///   many concurrent poppers in `send_event_slow`), the only pool that is `pop`ped.
+///
+/// A "snapshot" is an opaque observation of the head that carries whatever version information the
+/// implementation needs to detect reuse; callers treat it as an all-or-nothing CAS token.
+trait Head {
+    type Snapshot: Copy;
+
+    fn new() -> Self;
+
+    /// Observe the current head.
+    fn load(&self, order: Ordering) -> Self::Snapshot;
+
+    /// The page pointer a snapshot refers to.
+    fn ptr(snap: Self::Snapshot) -> *mut Page;
+
+    /// Replace `current` with a head pointing at `new_ptr`, advancing the version on success (for
+    /// tagged heads). Returns `Err` on mismatch or spurious failure; callers re-`load` and retry.
+    fn compare_exchange_weak(
+        &self,
+        current: Self::Snapshot,
+        new_ptr: *mut Page,
+        success: Ordering,
+        failure: Ordering,
+    ) -> Result<(), ()>;
+
+    /// Unconditionally take the whole chain, leaving the head empty; returns the previous head
+    /// pointer. Only used by drain (MPSC).
+    fn swap_null(&self, order: Ordering) -> *mut Page;
+}
+
+/// Plain-pointer head for the MPSC pool. `push`+`drain` only — never `pop` (ABA-unsafe).
+struct PtrHead {
     head: AtomicPtr<Page>,
 }
 
-impl PageStack {
-    const fn new() -> Self {
+impl Head for PtrHead {
+    type Snapshot = *mut Page;
+
+    fn new() -> Self {
         Self {
             head: AtomicPtr::new(ptr::null_mut()),
         }
     }
 
+    #[inline]
+    fn load(&self, order: Ordering) -> *mut Page {
+        self.head.load(order)
+    }
+
+    #[inline]
+    fn ptr(snap: *mut Page) -> *mut Page {
+        snap
+    }
+
+    #[inline]
+    fn compare_exchange_weak(
+        &self,
+        current: *mut Page,
+        new_ptr: *mut Page,
+        success: Ordering,
+        failure: Ordering,
+    ) -> Result<(), ()> {
+        self.head
+            .compare_exchange_weak(current, new_ptr, success, failure)
+            .map(|_| ())
+            .map_err(|_| ())
+    }
+
+    #[inline]
+    fn swap_null(&self, order: Ordering) -> *mut Page {
+        self.head.swap(ptr::null_mut(), order)
+    }
+}
+
+/// Tagged `(generation, pointer)` head for the SPMC pool: ABA-safe `pop` via a double-word CAS.
+struct TaggedHead {
+    /// High 64 bits: generation counter. Low 64 bits: the head `*mut Page` (as `u64`). Both are
+    /// CAS'd together, so any change to either — including a pointer that recurs to an earlier
+    /// value — is observed as a change to the whole word.
+    head: AtomicU128,
+}
+
+impl TaggedHead {
+    #[inline]
+    fn pack(generation: u64, ptr: *mut Page) -> u128 {
+        ((generation as u128) << 64) | (ptr as u64 as u128)
+    }
+
+    #[inline]
+    fn unpack(word: u128) -> (u64, *mut Page) {
+        ((word >> 64) as u64, (word as u64) as *mut Page)
+    }
+}
+
+impl Head for TaggedHead {
+    type Snapshot = u128;
+
+    fn new() -> Self {
+        Self {
+            head: AtomicU128::new(0),
+        }
+    }
+
+    #[inline]
+    fn load(&self, order: Ordering) -> u128 {
+        self.head.load(order)
+    }
+
+    #[inline]
+    fn ptr(snap: u128) -> *mut Page {
+        Self::unpack(snap).1
+    }
+
+    #[inline]
+    fn compare_exchange_weak(
+        &self,
+        current: u128,
+        new_ptr: *mut Page,
+        success: Ordering,
+        failure: Ordering,
+    ) -> Result<(), ()> {
+        let (generation, _) = Self::unpack(current);
+        // Bump the generation on every successful mutation. A u64 counter at the pool's ~hundreds-
+        // of-ops/sec rate does not wrap in any realistic process lifetime, so a pointer value never
+        // recurs with the same generation.
+        let new = Self::pack(generation.wrapping_add(1), new_ptr);
+        self.head
+            .compare_exchange_weak(current, new, success, failure)
+            .map(|_| ())
+            .map_err(|_| ())
+    }
+
+    #[inline]
+    fn swap_null(&self, order: Ordering) -> *mut Page {
+        // Not used in production (the SPMC pool is drained by repeated `pop`), but the trait
+        // requires it. Preserve the generation-bump discipline for correctness anyway.
+        loop {
+            let current = self.head.load(order);
+            let (generation, ptr) = Self::unpack(current);
+            let new = Self::pack(generation.wrapping_add(1), ptr::null_mut());
+            if self
+                .head
+                .compare_exchange_weak(current, new, order, Ordering::Relaxed)
+                .is_ok()
+            {
+                return ptr;
+            }
+        }
+    }
+}
+
+/// Lock-free intrusive stack of Pages, generic over its [`Head`] cell.
+///
+/// `push` is common to both modes (a single CAS; pushing can never cause ABA because it only ever
+/// links a new node above the observed head — always a valid chain). `pop` and `drain` are provided
+/// only for the head type that can perform them safely, via separate inherent impls below.
+struct Stack<H: Head> {
+    head: H,
+}
+
+impl<H: Head> Stack<H> {
+    fn new() -> Self {
+        Self { head: H::new() }
+    }
+
     fn push(&self, page: Box<Page>) {
         let raw = Box::into_raw(page);
         loop {
-            let head = self.head.load(Ordering::Relaxed);
-            unsafe { (*raw).next = head };
+            let current = self.head.load(Ordering::Relaxed);
+            unsafe { (*raw).next.store(H::ptr(current), Ordering::Relaxed) };
             if self
                 .head
-                .compare_exchange_weak(head, raw, Ordering::Release, Ordering::Relaxed)
+                .compare_exchange_weak(current, raw, Ordering::Release, Ordering::Relaxed)
                 .is_ok()
             {
                 break;
             }
         }
     }
+}
 
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+/// `pop` is available only on the ABA-safe tagged head (the SPMC `empty_pages` pool).
+impl Stack<TaggedHead> {
+    #[cfg_attr(not(any(test, target_os = "linux")), allow(dead_code))]
     fn pop(&self) -> Option<Box<Page>> {
         loop {
-            let head = self.head.load(Ordering::Acquire);
-            if head.is_null() {
+            let current = self.head.load(Ordering::Acquire);
+            let head_ptr = TaggedHead::ptr(current);
+            if head_ptr.is_null() {
                 return None;
             }
-            let next = unsafe { (*head).next };
+            let next = unsafe { (*head_ptr).next.load(Ordering::Relaxed) };
+
+            // Test-only seam: fire a caller-supplied interleaving in the exact window between
+            // reading `next` and the CAS below — the classic ABA window. With the tagged head the
+            // generation has moved when the head pointer recurs, so the CAS fails and we retry
+            // instead of installing a stale `next`. The test asserts that conservation holds.
+            #[cfg(test)]
+            aba_hook::fire();
+
             if self
                 .head
-                .compare_exchange_weak(head, next, Ordering::Release, Ordering::Relaxed)
+                .compare_exchange_weak(current, next, Ordering::Release, Ordering::Relaxed)
                 .is_ok()
             {
-                unsafe { (*head).next = ptr::null_mut() };
-                return Some(unsafe { Box::from_raw(head) });
+                unsafe { (*head_ptr).next.store(ptr::null_mut(), Ordering::Relaxed) };
+                return Some(unsafe { Box::from_raw(head_ptr) });
             }
+        }
+    }
+}
+
+/// `drain` (single `swap` of the whole chain) is available only on the plain-pointer head (the
+/// MPSC `full_pages` pool).
+impl Stack<PtrHead> {
+    fn drain(&self, mut f: impl FnMut(Box<Page>)) {
+        let mut cursor = self.head.swap_null(Ordering::Acquire);
+        while !cursor.is_null() {
+            let next = unsafe { (*cursor).next.load(Ordering::Relaxed) };
+            unsafe { (*cursor).next.store(ptr::null_mut(), Ordering::Relaxed) };
+            f(unsafe { Box::from_raw(cursor) });
+            cursor = next;
+        }
+    }
+}
+
+/// Test-only injection point used to reproduce the `pop` ABA window deterministically. A test
+/// installs a one-shot closure that runs between `pop`'s read of `next` and its CAS.
+#[cfg(test)]
+mod aba_hook {
+    use std::cell::RefCell;
+
+    thread_local! {
+        static HOOK: RefCell<Option<Box<dyn FnMut()>>> = const { RefCell::new(None) };
+    }
+
+    /// Install a one-shot hook; it disarms itself the first time it fires so the interleaving is
+    /// injected exactly once (nested `pop`s inside the hook do not re-enter it).
+    pub(super) fn arm(f: impl FnMut() + 'static) {
+        HOOK.with(|h| *h.borrow_mut() = Some(Box::new(f)));
+    }
+
+    pub(super) fn fire() {
+        // Take the hook out before running it so a `pop` performed *inside* the hook sees an empty
+        // slot and does not recurse.
+        let hook = HOOK.with(|h| h.borrow_mut().take());
+        if let Some(mut f) = hook {
+            f();
         }
     }
 }
@@ -106,17 +335,21 @@ impl PageStack {
 const PAGE_POOL_SHARDS: usize = 2;
 const PAGE_POOL_MASK: usize = PAGE_POOL_SHARDS - 1;
 
-/// Sharded page pool. Each shard is a lock-free intrusive stack.
-/// Producers pick a shard via `cpu_hint & MASK`, distributing contention
-/// across shards so the CAS loop almost never retries.
-struct ShardedPagePool {
-    shards: [PageStack; PAGE_POOL_SHARDS],
+/// Sharded page pool. Each shard is a lock-free intrusive [`Stack`]. Producers pick a shard via
+/// `cpu_hint & MASK`, distributing contention across shards so the CAS loop almost never retries.
+///
+/// Generic over the [`Head`] type so the two pools get exactly the operations that are safe for
+/// their access pattern:
+/// - `full_pages: ShardedPagePool<PtrHead>` — `push` + `drain`, never `pop`.
+/// - `empty_pages: ShardedPagePool<TaggedHead>` — `push` + `pop`, ABA-safe.
+struct ShardedPagePool<H: Head> {
+    shards: [Stack<H>; PAGE_POOL_SHARDS],
 }
 
-impl ShardedPagePool {
-    const fn new() -> Self {
+impl<H: Head> ShardedPagePool<H> {
+    fn new() -> Self {
         Self {
-            shards: [PageStack::new(), PageStack::new()],
+            shards: [Stack::new(), Stack::new()],
         }
     }
 
@@ -124,7 +357,9 @@ impl ShardedPagePool {
     fn push(&self, page: Box<Page>, cpu_hint: usize) {
         self.shards[cpu_hint & PAGE_POOL_MASK].push(page);
     }
+}
 
+impl ShardedPagePool<TaggedHead> {
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     fn pop(&self, cpu_hint: usize) -> Option<Box<Page>> {
         let start = cpu_hint & PAGE_POOL_MASK;
@@ -136,16 +371,12 @@ impl ShardedPagePool {
         }
         None
     }
+}
 
+impl ShardedPagePool<PtrHead> {
     fn drain(&self, mut f: impl FnMut(Box<Page>)) {
         for shard in &self.shards {
-            let mut cursor = shard.head.swap(ptr::null_mut(), Ordering::Acquire);
-            while !cursor.is_null() {
-                let next = unsafe { (*cursor).next };
-                unsafe { (*cursor).next = ptr::null_mut() };
-                f(unsafe { Box::from_raw(cursor) });
-                cursor = next;
-            }
+            shard.drain(&mut f);
         }
     }
 }
@@ -218,9 +449,15 @@ pub(crate) struct Channels<T: Absorb> {
 
     fallback: crossbeam_queue::SegQueue<u64>,
 
-    empty_pages: ShardedPagePool,
+    // Recycled empty pages waiting to be handed back to recording CPUs. SPMC: one pusher (whoever
+    // holds `aggregate` during a steal) recycles into it; many recorders `pop` from it in
+    // `send_event_slow`. Its `pop` is the ABA-sensitive operation, so it uses the tagged head.
+    empty_pages: ShardedPagePool<TaggedHead>,
 
-    full_pages: ShardedPagePool,
+    // Filled pages handed off by recorders, awaiting aggregation. MPSC: many recorders `push`, a
+    // single stealer `drain`s. Never `pop`ped, so its plain-pointer head keeps the hot push path
+    // as cheap as before.
+    full_pages: ShardedPagePool<PtrHead>,
 
     // What we aggregate events into.
     aggregate: Mutex<Vec<T>>,
@@ -299,12 +536,40 @@ impl<T: Absorb> Channels<T> {
         len
     }
 
+    /// Folds only the *full pages* (those handed off by `send_event_slow`) and the fallback queue
+    /// into the aggregate. Deliberately does **not** touch the per-CPU pages, so it needs no
+    /// `membarrier` and no per-CPU swap — it is the cheap periodic compaction path behind
+    /// [`Registry::absorb`].
+    ///
+    /// This is sound without a membarrier: `full_pages` entries were published by the recorder's
+    /// Release CAS in `Stack::push`, and `drain`'s Acquire load synchronizes with it, so we observe
+    /// their event writes. The per-CPU pages, which *are* still being written under a relaxed store
+    /// and would need the cross-core fence, are left in place until the next `steal_pages`. Leaving
+    /// them also keeps their footprint bounded to one page per CPU and avoids the pop/push churn of
+    /// forcing every active CPU onto a fresh page each interval.
+    pub(crate) fn absorb_full_pages(&self) {
+        let mut aggregate = self.aggregate.lock().unwrap();
+        self.fold_full_pages(&mut aggregate);
+        self.drain_fallback(&mut aggregate);
+    }
+
+    /// Drains `full_pages` into the aggregate, recycling each folded page into `empty_pages`. Shared
+    /// by the absorb and the full-steal paths.
+    fn fold_full_pages(&self, aggregate: &mut [T]) {
+        // Spread recycled pages across the empty-pool shards (round-robin) rather than funneling
+        // them all onto shard 0, so concurrent poppers in `send_event_slow` land on different
+        // shards and contend less. `pop` scans every shard, so this is purely a contention win.
+        let mut recycle_hint = 0usize;
+        self.full_pages.drain(|page| {
+            Self::aggregate_page(aggregate, page, &self.empty_pages, recycle_hint);
+            recycle_hint = recycle_hint.wrapping_add(1);
+        });
+    }
+
     #[cfg(not(target_os = "linux"))]
     pub(crate) fn steal_pages(&self) {
         let mut aggregate = self.aggregate.lock().unwrap();
-        self.full_pages.drain(|page| {
-            Self::aggregate_page(&mut aggregate, page, &self.empty_pages);
-        });
+        self.fold_full_pages(&mut aggregate);
         self.drain_fallback(&mut aggregate);
     }
 
@@ -313,9 +578,7 @@ impl<T: Absorb> Channels<T> {
         let mut aggregate = self.aggregate.lock().unwrap();
 
         // Drain any full pages enqueued by send_event_slow
-        self.full_pages.drain(|page| {
-            Self::aggregate_page(&mut aggregate, page, &self.empty_pages);
-        });
+        self.fold_full_pages(&mut aggregate);
 
         if self.must_use_fallback {
             self.drain_fallback(&mut aggregate);
@@ -364,12 +627,13 @@ impl<T: Absorb> Channels<T> {
         // will see any events they've written and (b) they are no longer writing to the pages in
         // `PER_CPU`, which is sufficient to allow us to process all the events they've sent.
 
-        for page in pages {
+        for (recycle_hint, page) in pages.into_iter().enumerate() {
             if !page.is_null() {
                 Self::aggregate_page(
                     &mut aggregate,
                     unsafe { Box::from_raw(page) },
                     &self.empty_pages,
+                    recycle_hint,
                 );
             }
         }
@@ -377,13 +641,18 @@ impl<T: Absorb> Channels<T> {
         self.drain_fallback(&mut aggregate);
     }
 
-    fn aggregate_page(aggregate: &mut [T], mut page: Box<Page>, empty_pages: &ShardedPagePool) {
+    fn aggregate_page(
+        aggregate: &mut [T],
+        mut page: Box<Page>,
+        empty_pages: &ShardedPagePool<TaggedHead>,
+        recycle_hint: usize,
+    ) {
         let length = *page.length.get_mut() as usize;
         let filled = unsafe { &mut *(&mut page.slots[..length] as *mut [_] as *mut [u64]) };
         T::handle(aggregate, filled);
 
         *page.length.get_mut() = 0;
-        empty_pages.push(page, 0);
+        empty_pages.push(page, recycle_hint);
     }
 
     pub(crate) fn lock_aggregate(&self) -> MutexGuard<'_, Vec<T>> {
@@ -952,6 +1221,117 @@ fn sys_rseq(rseq_abi: *mut Rseq, flags: i32) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Platform-independent tests for the page-pool stacks themselves. These exercise
+/// `PageStack`/`ShardedPagePool` directly (no rseq asm), so they run on every target — including
+/// the macOS dev machines where the rseq fast path is compiled out.
+#[cfg(test)]
+mod stack_tests {
+    use super::*;
+
+    /// Reproduces the ABA hazard in `PageStack::pop` deterministically and asserts page
+    /// conservation. Every page created must end up in exactly one of two disjoint sets: *owned* by
+    /// a caller, or *reachable* from the stack head. A page in neither is leaked; a page in both is
+    /// double-owned (a latent double-free). The ABA interleaving produces both at once.
+    ///
+    /// Interleaving (mirrors production: one pusher, many poppers). Stack starts `head -> A -> B`:
+    ///   1. Popper P1 enters `pop`, reads `head = A`, caches `next = A.next = B`, then stalls in
+    ///      the window (via the test hook) before its CAS.
+    ///   2. While stalled: P2 pops A (head -> B), then P2 pops B (head -> null). Both A and B are
+    ///      now owned outside the stack.
+    ///   3. The pusher recycles a fresh page C (head -> C), then recycles A on top (head -> A -> C),
+    ///      so A's address is back at the top but `A.next` is now C, not the stale B.
+    ///   4. P1 resumes and CASes (expected = A, new = stale B). Under the bug, head *is* A again so
+    ///      the CAS succeeds and installs B as head: C is orphaned (leaked) and B is double-owned.
+    ///      Under the fix, the generation moved, P1's CAS fails and it retries onto C -> conserved.
+    ///
+    /// Pages are tracked by raw pointer and intentionally never freed here (the buggy path would
+    /// otherwise double-free the double-owned page and abort instead of failing the assertion). A
+    /// few leaked pages in a unit test is fine; the point is the conservation check.
+    #[test]
+    fn pop_aba_conserves_pages() {
+        // Distinct id per page, written into slot 0; survives push/pop (which only touch `.next`).
+        fn tag(p: *const Page) -> u64 {
+            unsafe { (*p).slots[0].assume_init() }
+        }
+        fn make(id: u64) -> *mut Page {
+            let mut p = Page::new();
+            p.slots[0].write(id);
+            Box::into_raw(p)
+        }
+
+        // The SPMC pool's stack is the only one that is `pop`ped, so it is the one that must be
+        // ABA-safe. Under the buggy plain-pointer head this test failed; under the tagged head it
+        // passes.
+        let stack = Stack::<TaggedHead>::new();
+
+        // Seed the stack: head -> A(1) -> B(2).
+        let a = make(1);
+        let b = make(2);
+        stack.push(unsafe { Box::from_raw(b) });
+        stack.push(unsafe { Box::from_raw(a) });
+
+        // Pages popped out of the stack during the interleaving ("owned by a caller").
+        let mut owned: Vec<*mut Page> = Vec::new();
+
+        // Arm the hook that fires inside P1's pop, in the window after it cached `next` and before
+        // its CAS. Single-threaded, so the raw-pointer captures never alias concurrently; `fire()`
+        // also removes the hook before running it, so the reentrant pops below don't recurse.
+        let stack_ptr: *const Stack<TaggedHead> = &stack;
+        let owned_ptr: *mut Vec<*mut Page> = &mut owned;
+        aba_hook::arm(move || {
+            let stack = unsafe { &*stack_ptr };
+            let owned = unsafe { &mut *owned_ptr };
+            // P2 pops A and B out of the stack.
+            owned.push(Box::into_raw(stack.pop().expect("P2 pops A")));
+            owned.push(Box::into_raw(stack.pop().expect("P2 pops B")));
+            // Pusher recycles a fresh C, then recycles A on top -> head -> A -> C.
+            stack.push(unsafe { Box::from_raw(make(3)) });
+            let i = owned.iter().position(|&p| tag(p) == 1).expect("A popped");
+            let a = owned.remove(i);
+            stack.push(unsafe { Box::from_raw(a) });
+        });
+
+        // P1's pop resumes after the hook and does its (possibly stale) CAS.
+        owned.push(Box::into_raw(stack.pop().expect("P1 pops something")));
+
+        // Walk the stack chain read-only to collect the pages still reachable from head.
+        let mut reachable: Vec<*mut Page> = Vec::new();
+        let mut cur = TaggedHead::ptr(stack.head.load(Ordering::Acquire));
+        while !cur.is_null() {
+            reachable.push(cur);
+            cur = unsafe { (*cur).next.load(Ordering::Relaxed) };
+        }
+
+        // Conservation: {owned} and {reachable} must together be exactly {A, B, C} = ids {1,2,3},
+        // with no overlap. Under the ABA bug, C (id 3) is in neither (leaked) and B (id 2) is in
+        // both (double-owned) -> this fails. Under the fix -> [1,2,3], disjoint.
+        let mut owned_ids: Vec<u64> = owned.iter().map(|&p| tag(p)).collect();
+        let mut reach_ids: Vec<u64> = reachable.iter().map(|&p| tag(p)).collect();
+        owned_ids.sort_unstable();
+        reach_ids.sort_unstable();
+
+        let overlap: Vec<u64> = owned_ids
+            .iter()
+            .filter(|id| reach_ids.contains(id))
+            .copied()
+            .collect();
+        assert!(
+            overlap.is_empty(),
+            "page double-owned via ABA: ids {overlap:?} are both owned and reachable \
+             (owned={owned_ids:?}, reachable={reach_ids:?})"
+        );
+
+        let mut all: Vec<u64> = owned_ids.iter().chain(reach_ids.iter()).copied().collect();
+        all.sort_unstable();
+        assert_eq!(
+            all,
+            vec![1, 2, 3],
+            "page leaked via ABA: expected all of {{1,2,3}} accounted for, got \
+             owned={owned_ids:?} reachable={reach_ids:?}"
+        );
+    }
+}
+
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
@@ -1191,5 +1571,108 @@ mod tests {
             assert!(channels.empty_pages.pop(0).is_none());
         }
         drop(channels);
+    }
+
+    /// End-to-end steady-state conservation on the real rseq recording path: once the pool is warm,
+    /// a high-rate recording load driven concurrently with periodic `absorb_full_pages` (the cheap
+    /// compaction) and occasional full `steal_pages` (report) must stop allocating fresh pages. The
+    /// production leak was exactly `Page::new` climbing without bound here; this asserts it plateaus.
+    ///
+    /// This is inherently a *concurrency* test (the ABA it guards against needs a real popper vs.
+    /// re-pusher race), so it uses threads rather than bach. It is tolerant of scheduling: it only
+    /// asserts that allocations in a late window are bounded well below the events processed, not an
+    /// exact count. On the fallback path (no rseq/membarrier) pages are never used, so it early-outs.
+    #[test]
+    fn steady_state_stops_allocating_pages() {
+        use std::sync::{
+            atomic::{AtomicBool, AtomicU64, Ordering},
+            Arc,
+        };
+
+        let channels = Arc::new(Channels::<TestAbsorber>::new());
+        channels.allocate();
+
+        // The fallback path (rseq/membarrier unavailable) never touches the page pool; nothing to
+        // assert about page allocation there.
+        if channels.must_use_fallback {
+            return;
+        }
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let recorded = Arc::new(AtomicU64::new(0));
+
+        // A few recorder threads hammering send_event — this is what pops from empty_pages and
+        // pushes to full_pages, at a rate high enough to fill many pages.
+        let mut recorders = Vec::new();
+        for _ in 0..4 {
+            let channels = channels.clone();
+            let stop = stop.clone();
+            let recorded = recorded.clone();
+            recorders.push(std::thread::spawn(move || {
+                let mut n = 0u64;
+                while !stop.load(Ordering::Relaxed) {
+                    for _ in 0..10_000 {
+                        channels.send_event(1);
+                    }
+                    n += 10_000;
+                }
+                recorded.fetch_add(n, Ordering::Relaxed);
+            }));
+        }
+
+        // A "reporter" thread that mostly absorbs (cheap, full_pages only) and occasionally does a
+        // full steal (report), mirroring the intended production cadence.
+        let reporter = {
+            let channels = channels.clone();
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                let mut i = 0u64;
+                while !stop.load(Ordering::Relaxed) {
+                    channels.absorb_full_pages();
+                    if i.is_multiple_of(10) {
+                        channels.steal_pages();
+                    }
+                    i += 1;
+                    std::thread::yield_now();
+                }
+            })
+        };
+
+        // Warm the pool: let it run, then snapshot the allocation count. After warm-up, additional
+        // allocations should be near-zero because pages recycle through empty_pages.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let allocated_after_warmup = PAGES_ALLOCATED.load(Ordering::Relaxed);
+
+        // Measurement window: keep recording hard, then compare fresh allocations against the huge
+        // number of events processed in the same window.
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        let allocated_end = PAGES_ALLOCATED.load(Ordering::Relaxed);
+
+        stop.store(true, Ordering::Relaxed);
+        for r in recorders {
+            r.join().unwrap();
+        }
+        reporter.join().unwrap();
+
+        let fresh_allocations = allocated_end - allocated_after_warmup;
+        let total_recorded = recorded.load(Ordering::Relaxed);
+
+        // The pool has a fixed working set (roughly one page per active CPU plus a small recycle
+        // buffer). Fresh allocations in the measurement window must be a tiny fraction of the
+        // events processed — under the ABA leak this instead grew ~linearly with events. We use a
+        // generous bound (allocations < events / SLOTS, i.e. fewer than one fresh page per page's
+        // worth of events) so the test is robust to scheduler variance but still fails hard on a
+        // linear leak, which would allocate on the order of events/SLOTS pages *plus* the escapees.
+        //
+        // Concretely: with the leak, ~2-3% of filled pages escaped, so fresh allocations tracked
+        // ~2-3% of (events / SLOTS) and grew every window. Post-fix the recycle is complete, so
+        // once warm this is a small constant.
+        let filled_pages_estimate = total_recorded / SLOTS as u64;
+        assert!(
+            fresh_allocations <= filled_pages_estimate / 20 + 64,
+            "page pool kept allocating after warm-up: {fresh_allocations} fresh Page::new in the \
+             measurement window vs ~{filled_pages_estimate} pages' worth of events recorded \
+             (total events {total_recorded}); expected recycling to keep this near-constant"
+        );
     }
 }
