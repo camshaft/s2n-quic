@@ -231,7 +231,7 @@ impl fmt::Display for Trimmed {
         let int_part = scaled / SCALE;
         let mut frac = scaled % SCALE;
         let mut prec = 6usize;
-        while prec > 0 && frac % 10 == 0 {
+        while prec > 0 && frac.is_multiple_of(10) {
             frac /= 10;
             prec -= 1;
         }
@@ -742,8 +742,7 @@ mod test {
         // f64 precision: strict parsers such as the CloudWatch agent reject very long decimals.
         // weight for count=3 is 1/3 ≈ 0.333333 (not 0.3333333333333333).
         let registry = crate::Registry::new();
-        let summary =
-            registry.register_summary("h".into(), None, Unit::Microsecond);
+        let summary = registry.register_summary("h".into(), None, Unit::Microsecond);
         // Record three equal samples → one bucket with count=3 → weight=1/3.
         summary.record_duration(std::time::Duration::from_micros(5));
         summary.record_duration(std::time::Duration::from_micros(5));
