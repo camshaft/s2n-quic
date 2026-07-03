@@ -173,10 +173,10 @@ impl<S: StatsdSink> Backend for StatsdBackend<S> {
             // de-scaled fractional value.
             if scale == 1.0 {
                 let v = statsd_value(value, unit);
-                write!(out, "{v}|h|@{weight}").unwrap();
+                write!(out, "{v}|h|@{weight:.6}").unwrap();
             } else {
                 let v = value as f64 / scale;
-                write!(out, "{v}|h|@{weight}").unwrap();
+                write!(out, "{v:.6}|h|@{weight:.6}").unwrap();
             }
             self.end_record(info.aggregation);
         }
@@ -200,7 +200,7 @@ impl<S: StatsdSink> Backend for StatsdBackend<S> {
         if sum == 0.0 && !info.emit_zero(self.include_sparse) {
             return;
         }
-        write!(self.begin_record(info.name, ":"), "{sum}|g").unwrap();
+        write!(self.begin_record(info.name, ":"), "{sum:.6}|g").unwrap();
         self.end_record(info.aggregation);
     }
 
@@ -504,7 +504,7 @@ mod test {
         );
         let ten = lines
             .iter()
-            .find(|l| l.contains("|@1|"))
+            .find(|l| l.contains("|@1.000000|"))
             .expect("10us bucket with weight 1");
         let ten_ns = hist_value(ten, "svc.task.time:");
         assert!(
@@ -705,6 +705,37 @@ mod test {
             &values,
         );
         backend.report_end();
-        assert!(sink.lines().contains(&"workers:7|g".to_string()));
+        assert!(sink.lines().contains(&"workers:7.000000|g".to_string()));
+    }
+
+    #[test]
+    fn float_precision_is_limited_to_six_decimal_places() {
+        // Floats in StatsD lines (sample-rate weights and scaled values) must not carry the full
+        // f64 precision: strict parsers such as the CloudWatch agent reject very long decimals.
+        // weight for count=3 is 1/3 ≈ 0.333333 (not 0.3333333333333333).
+        let registry = crate::Registry::new();
+        let summary =
+            registry.register_summary("h".into(), None, Unit::Microsecond);
+        // Record three equal samples → one bucket with count=3 → weight=1/3.
+        summary.record_duration(std::time::Duration::from_micros(5));
+        summary.record_duration(std::time::Duration::from_micros(5));
+        summary.record_duration(std::time::Duration::from_micros(5));
+
+        let sink = CaptureSink::default();
+        let mut backend = StatsdBackend::new(sink.clone(), None);
+        registry.report(&mut backend);
+
+        let lines = sink.lines();
+        let hist_line = lines
+            .iter()
+            .find(|l| l.starts_with("h:"))
+            .expect("histogram line");
+        let at = hist_line.find("|@").expect("|@ in line");
+        let weight_str = &hist_line[at + 2..];
+        let weight_str = weight_str.split('|').next().unwrap();
+        assert_eq!(
+            weight_str, "0.333333",
+            "weight must be capped at 6 decimal places, not full f64 precision"
+        );
     }
 }
