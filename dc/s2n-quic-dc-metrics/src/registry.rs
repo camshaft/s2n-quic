@@ -256,6 +256,10 @@ impl Registry {
     ///
     /// This will deduplicate calls, but is somewhat expensive, so prefer to call just once and
     /// then reuse the returned type.
+    ///
+    /// The summary records integer samples ([`scale`](Summary::scale) `1.0`). To record fractional
+    /// values with [`Summary::record_f64`], register through the [`metric`](Self::metric) builder
+    /// with [`MetricBuilder::scale`].
     #[track_caller]
     pub fn register_summary(
         &self,
@@ -268,6 +272,7 @@ impl Registry {
             aggregation.map(Into::into),
             display_unit,
             Sparsity::Inherit,
+            1.0,
         )
     }
 
@@ -278,6 +283,7 @@ impl Registry {
         aggregation: Option<Arc<str>>,
         display_unit: Unit,
         sparsity: Sparsity,
+        scale: f64,
     ) -> Summary {
         let metric = self.prefixed_name(metric);
         let mut inner = self.inner.lock().unwrap();
@@ -290,12 +296,24 @@ impl Registry {
                 aggregation: aggregation.clone(),
             })
             .or_insert_with(|| MetricEntry {
-                value: MetricValue::Summary(Summary::new(inner.histograms.clone(), display_unit)),
+                value: MetricValue::Summary(Summary::new(
+                    inner.histograms.clone(),
+                    display_unit,
+                    scale,
+                )),
                 sparsity,
             });
 
         assert_sparsity(entry, sparsity, &metric, &aggregation);
         if let MetricValue::Summary(s) = &entry.value {
+            // A repeat registration dedups to the existing summary; its scale is fixed at first
+            // registration. Guard against a conflicting scale so a metric can't be silently
+            // registered with two different fixed-point resolutions.
+            assert_eq!(
+                s.scale(),
+                scale,
+                "summary metric name={metric:?}, aggregation={aggregation:?} already registered with a different scale"
+            );
             s.clone()
         } else {
             panic!(
@@ -478,6 +496,7 @@ impl Registry {
             name: name.into(),
             aggregation: None,
             sparsity: Sparsity::Inherit,
+            scale: 1.0,
         }
     }
 
@@ -639,6 +658,7 @@ pub struct MetricBuilder<'a> {
     name: Arc<str>,
     aggregation: Option<Arc<str>>,
     sparsity: Sparsity,
+    scale: f64,
 }
 
 impl<'a> MetricBuilder<'a> {
@@ -664,6 +684,27 @@ impl<'a> MetricBuilder<'a> {
         self.sparsity(Sparsity::AlwaysSparse)
     }
 
+    /// Sets the fixed-point [`scale`](Summary::scale) for a [`summary`](Self::summary) that records
+    /// fractional samples via [`Summary::record_f64`].
+    ///
+    /// A float sample `v` is stored as `round(scale * v)`, so `scale` sets the resolution: a value
+    /// of `10^d` keeps `d` fractional digits (the querylog line prints that many places), with a
+    /// resolution floor of `~0.5/scale` and a ceiling of `u64::MAX/scale`. Defaults to `1.0` (a
+    /// plain integer summary). Applies only to [`summary`](Self::summary); ignored by the other
+    /// terminal methods.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `scale` is not finite and positive.
+    pub fn scale(mut self, scale: f64) -> Self {
+        assert!(
+            scale.is_finite() && scale > 0.0,
+            "summary scale must be finite and positive, got {scale}"
+        );
+        self.scale = scale;
+        self
+    }
+
     /// Registers the metric as a [`Counter`].
     #[track_caller]
     pub fn counter(self) -> Counter {
@@ -671,7 +712,8 @@ impl<'a> MetricBuilder<'a> {
             .register_counter_inner(self.name, self.aggregation, self.sparsity)
     }
 
-    /// Registers the metric as a [`Summary`] with the given display unit.
+    /// Registers the metric as a [`Summary`] with the given display unit, at the configured
+    /// [`scale`](Self::scale) (default `1.0`).
     #[track_caller]
     pub fn summary(self, display_unit: Unit) -> Summary {
         self.registry.register_summary_inner(
@@ -679,6 +721,7 @@ impl<'a> MetricBuilder<'a> {
             self.aggregation,
             display_unit,
             self.sparsity,
+            self.scale,
         )
     }
 

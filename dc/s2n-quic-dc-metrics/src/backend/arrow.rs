@@ -124,6 +124,11 @@ pub fn schema() -> SchemaRef {
                     DataType::Map(Arc::new(bucket_entries), false),
                     true,
                 ),
+                // The fixed-point scale the histogram's samples were recorded with. The
+                // `hist_buckets` keys are the raw integer magnitude `round(scale * v)` (stored
+                // losslessly); divide a key by `hist_scale` to recover the recorded fractional
+                // value. `1.0` for a plain integer histogram; null for non-histogram rows.
+                Field::new("hist_scale", DataType::Float64, true),
             ]))
         })
         .clone()
@@ -165,6 +170,7 @@ pub struct ArrowBackend {
     callback: ListBuilder<Float64Builder>,
     hist_count: UInt64Builder,
     hist_buckets: MapBuilder<UInt64Builder, UInt64Builder>,
+    hist_scale: Float64Builder,
 
     rows: usize,
 }
@@ -194,6 +200,7 @@ impl ArrowBackend {
             callback: ListBuilder::new(Float64Builder::new()),
             hist_count: UInt64Builder::new(),
             hist_buckets: MapBuilder::new(None, UInt64Builder::new(), UInt64Builder::new()),
+            hist_scale: Float64Builder::new(),
             rows: 0,
         }
     }
@@ -271,6 +278,7 @@ impl ArrowBackend {
             Arc::new(self.callback.finish()),
             Arc::new(self.hist_count.finish()),
             Arc::new(self.hist_buckets.finish()),
+            Arc::new(self.hist_scale.finish()),
         ];
 
         // Append one constant dictionary column per label. A constant column needs no builder loop
@@ -332,7 +340,9 @@ impl ArrowBackend {
         match histogram {
             Some(hist) => {
                 // Store only the exact total count plus the raw non-empty buckets. min/p50/p99/max
-                // are reconstructable from the bucket map at query time (see `schema`).
+                // are reconstructable from the bucket map at query time (see `schema`). The bucket
+                // keys are the raw fixed-point magnitude; `hist_scale` records the divisor to
+                // recover fractional values (lossless — no float conversion in the stored keys).
                 self.hist_count.append_value(hist.count());
                 for (value, bucket_count) in hist.buckets() {
                     self.hist_buckets.keys().append_value(value);
@@ -341,6 +351,7 @@ impl ArrowBackend {
                 self.hist_buckets
                     .append(true)
                     .expect("map builder state inconsistent");
+                self.hist_scale.append_value(hist.scale());
             }
             None => {
                 self.hist_count.append_null();
@@ -348,6 +359,7 @@ impl ArrowBackend {
                 self.hist_buckets
                     .append(false)
                     .expect("map builder state inconsistent");
+                self.hist_scale.append_null();
             }
         }
 
@@ -653,5 +665,78 @@ mod test {
         // A no-label backend keeps the base schema exactly.
         let plain = ArrowBackend::new();
         assert_eq!(plain.schema(), schema());
+    }
+
+    /// A fractional (scaled) histogram stores the raw fixed-point bucket keys losslessly and records
+    /// the scale in `hist_scale`, so a query can recover the fractional value by dividing. An
+    /// unscaled histogram records `hist_scale = 1.0`.
+    #[test]
+    fn scaled_histogram_records_scale_and_raw_keys() {
+        use arrow::array::{Float64Array, MapArray, UInt64Array};
+
+        let registry = Registry::new();
+        // Scaled ratio: 0.25 stored as round(1e6 * 0.25) = 250_000.
+        let ratio = registry.metric("ratio").scale(1e6).summary(Unit::Count);
+        ratio.record_f64(0.25);
+        // Plain integer histogram for contrast.
+        registry
+            .register_summary("plain".into(), None, Unit::Count)
+            .record_value(7);
+
+        let mut backend = ArrowBackend::new();
+        registry.report_with(&ReportOptions::new(true), &mut backend);
+        let batch = backend.finish();
+
+        let names = col(&batch, "name")
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let scale = col(&batch, "hist_scale")
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        let buckets = col(&batch, "hist_buckets")
+            .as_any()
+            .downcast_ref::<MapArray>()
+            .unwrap();
+
+        let ratio_row = (0..batch.num_rows())
+            .find(|&r| names.value(r) == "ratio")
+            .expect("ratio row");
+        assert_eq!(scale.value(ratio_row), 1e6);
+        // The stored key is the raw fixed-point magnitude (~250_000), not the fractional value.
+        let entries = buckets.value(ratio_row);
+        let keys = entries
+            .column(0)
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
+        assert_eq!(keys.len(), 1);
+        let key = keys.value(0);
+        assert!(
+            (249_000..=251_000).contains(&key),
+            "raw key should be ~250000, got {key}"
+        );
+        // Recovering the fractional value divides by the recorded scale.
+        assert!((key as f64 / scale.value(ratio_row) - 0.25).abs() < 0.01);
+
+        // The plain histogram carries scale 1.0.
+        let plain_row = (0..batch.num_rows())
+            .find(|&r| names.value(r) == "plain")
+            .expect("plain row");
+        assert_eq!(scale.value(plain_row), 1.0);
+
+        // A non-histogram row has a null hist_scale.
+        registry.register_counter("c".into(), None).increment(1);
+        registry.report_with(&ReportOptions::new(true), &mut backend);
+        let batch = backend.finish();
+        let names = col(&batch, "name")
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let c_row = (0..batch.num_rows())
+            .find(|&r| names.value(r) == "c")
+            .expect("counter row");
+        assert!(col(&batch, "hist_scale").is_null(c_row));
     }
 }
