@@ -191,11 +191,18 @@ fn oracle(
     mtu: u16,
     max_segments: usize,
     buffer_capacity: usize,
+    congestion_window: usize,
 ) -> Oracle {
     let mut packet_sizes = Vec::new();
     let mut segment_size = 0u16;
     let mut offset = 0usize;
     let mut next_idx = 0usize;
+    // Mirrors the assembler's per-segment CWND gate. Data frames are only drained when
+    // `can_send_pending_frames()` is true, i.e. `!is_congestion_limited()`, i.e.
+    // `congestion_window - bytes_in_flight >= mtu`. Each emitted segment adds its actual encoded
+    // size to `bytes_in_flight`. The fuzz never ACKs, so `congestion_window` is the constant
+    // initial window — once it fills, the assembler stops mid-batch and leaves frames pending.
+    let mut bytes_in_flight = 0usize;
     // Mirrors `gso_pad_mode` in `assemble()`: when segment 1 is a near-MTU data packet and
     // more bulk data is queued, `segment_size` is fixed to the MTU and every non-final segment
     // is zero-padded up to that boundary.
@@ -203,9 +210,10 @@ fn oracle(
 
     // Mirrors `Context::has_pending_stream_data()`: true when a QueueData/QueueInit-priority
     // frame remains at or after `from`. The harness sorts `frames` by priority ascending
-    // (Reset, Control, Data, Init) and the assembler drains in that order, so all stream-data
-    // frames form a contiguous suffix. Precompute where it ends once (O(n)) so the per-segment
-    // check is O(1): stream data remains iff `from` is still before that boundary.
+    // (Reset, Control, then the two stream-data priorities Init and Data) and the assembler
+    // drains in that order, so all stream-data frames form a contiguous suffix. Precompute where
+    // it ends once (O(n)) so the per-segment check is O(1): stream data remains iff `from` is
+    // still before that boundary.
     let stream_data_end = frames
         .iter()
         .rposition(|f| {
@@ -235,6 +243,13 @@ fn oracle(
         };
 
         if max_segment_len == 0 {
+            break;
+        }
+
+        // CWND gate (mirrors `can_send_pending_frames()` / `!is_congestion_limited()`): a data
+        // segment is only started while at least one MTU of congestion window is available. No
+        // ACKs occur during a single `assemble`, so `congestion_window` is constant.
+        if congestion_window.saturating_sub(bytes_in_flight) < mtu as usize {
             break;
         }
 
@@ -280,6 +295,9 @@ fn oracle(
         );
         let packet_len = (estimated - pn_saving) as u16;
         packet_sizes.push(packet_len);
+        // `on_packet_sent` charges the actual encoded size (not the padded segment size) to
+        // `bytes_in_flight`.
+        bytes_in_flight += packet_len as usize;
 
         // Segment 1 picks the mode (mirrors `assemble()`): a near-MTU data packet with more
         // bulk data still queued fixes `segment_size` to the MTU (pad mode); otherwise lock it
@@ -639,6 +657,7 @@ fn assemble_fuzz_respects_gso_invariants() {
             // limit with `send_quantum_segments` (derived from the CCA). Use that same effective
             // value for the oracle so pad-mode batches — which can now reach the cap — match.
             let max_segments = context.path_info(&gso).max_segments;
+            let congestion_window = context.cca.congestion_window() as usize;
             let oracle = oracle(
                 &frames,
                 input.source_sender_id,
@@ -647,6 +666,7 @@ fn assemble_fuzz_respects_gso_invariants() {
                 input.mtu,
                 max_segments,
                 u16::MAX as usize,
+                congestion_window,
             );
             let pool = pool::Pool::new(u16::MAX);
             let mut header_buf = Vec::new();
@@ -685,6 +705,101 @@ fn assemble_fuzz_respects_gso_invariants() {
             assert_eq!(segments.sizes().collect::<Vec<_>>(), oracle.packet_sizes);
             assert_eq!(context.pending_count(), oracle.remaining_frames);
         });
+}
+
+/// Deterministic cross-check of the assembler against the oracle for bulk full-MTU data
+/// bursts, swept over MTU and frame count. This is the non-random companion to
+/// `assemble_fuzz_respects_gso_invariants`; it pins down the pad-mode batching path — where
+/// the initial congestion window fills mid-batch and the assembler stops, leaving frames
+/// pending — which only surfaces on platforms whose `MAX_TOTAL` admits deep batches. Keeping
+/// it deterministic guards that interaction on every host, not just where the fuzz happens to
+/// generate it.
+#[test]
+fn assemble_full_mtu_bursts_match_oracle() {
+    let ssid = VarInt::from_u8(1);
+    let scp = 443u16;
+    for mtu in [1200u16, 1300, 1400, 1500, 4000, 8000, 8950, 9000] {
+        for n_frames in 1..=48usize {
+            let registry = Registry::new();
+            let (mut context, entry) = make_context(mtu, &registry);
+            // Build n full-MTU data frames.
+            let frames: Vec<FrameInput> = (0..n_frames)
+                .map(|_| FrameInput {
+                    header: Header::QueueData {
+                        queue_pair: crate::packet::datagram::QueuePair {
+                            source_queue_id: VarInt::from_u8(1),
+                            dest_queue_id: VarInt::from_u8(2),
+                        },
+                        binding_id: VarInt::from_u8(1),
+                        offset: VarInt::ZERO,
+                        largest_offset: VarInt::ZERO,
+                        is_fin: false,
+                        blocked: false,
+                        dest_acceptor_id: None,
+                        priority: crate::credit::Priority::default(),
+                    },
+                    payload: vec![
+                        0x5a;
+                        mtu.saturating_sub(frame::MAX_QUEUE_DATA_HEADER_OVERHEAD) as usize
+                    ],
+                })
+                .collect();
+            let clock = Clock::new(Duration::from_micros(1));
+            let gso = make_gso(segment::MAX_COUNT);
+            let max_segments = context.path_info(&gso).max_segments;
+            let cwnd = context.cca.congestion_window() as usize;
+            let oracle = oracle(
+                &frames,
+                ssid,
+                scp,
+                &context.credentials,
+                mtu,
+                max_segments,
+                u16::MAX as usize,
+                cwnd,
+            );
+            let pool = pool::Pool::new(u16::MAX);
+            let mut header_buf = Vec::new();
+            let mut cancelled = Queue::new();
+            let mut ack_completions = Queue::new();
+            let (mut freed_batch_tx, _r) = crate::queue::freed_batch_channel();
+            for f in &frames {
+                context.push_back_frame(to_frame(f, &entry));
+            }
+            let counters = AssemblerCounters::new(&Registry::new());
+            let segments = assemble(
+                &mut context,
+                ImmediateQueueStatus::Empty,
+                &clock,
+                crate::endpoint::id::LocalSenderId::new(ssid),
+                scp,
+                &gso,
+                pool.alloc::<SyncRecycler>().expect("pool alloc"),
+                &mut header_buf,
+                &mut cancelled,
+                &mut ack_completions,
+                &mut freed_batch_tx,
+                &counters,
+                &crate::endpoint::counters::Send::new(
+                    &crate::counter::Registry::default(),
+                    crate::endpoint::id::LocalSenderId::from_index(0),
+                ),
+                &unused_credit_pool(),
+            );
+            let (got_sizes, got_pending) = match segments {
+                Some(s) => (s.sizes().collect::<Vec<_>>(), context.pending_count()),
+                None => (vec![], context.pending_count()),
+            };
+            assert_eq!(
+                (got_sizes.clone(), got_pending),
+                (oracle.packet_sizes.clone(), oracle.remaining_frames),
+                "assembler/oracle mismatch at mtu={mtu} n_frames={n_frames} max_segments={max_segments}\n  \
+                 assembler: sizes={got_sizes:?} pending={got_pending}\n  \
+                 oracle:    sizes={:?} pending={}",
+                oracle.packet_sizes, oracle.remaining_frames,
+            );
+        }
+    }
 }
 
 #[test]
