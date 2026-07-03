@@ -15,7 +15,7 @@ use crate::{
     backend::{Backend, CallbackValue, Histogram, MetricInfo, ReportOptions},
     Unit,
 };
-use std::{fmt::Write as _, sync::Arc};
+use std::{fmt, fmt::Write as _, sync::Arc};
 
 /// Default maximum UDP payload size (bytes) for a single datagram.
 pub const DEFAULT_MAX_PAYLOAD_SIZE: usize = 1200;
@@ -173,10 +173,10 @@ impl<S: StatsdSink> Backend for StatsdBackend<S> {
             // de-scaled fractional value.
             if scale == 1.0 {
                 let v = statsd_value(value, unit);
-                write!(out, "{v}|h|@{weight:.6}").unwrap();
+                write!(out, "{v}|h|@{}", Trimmed(weight)).unwrap();
             } else {
                 let v = value as f64 / scale;
-                write!(out, "{v:.6}|h|@{weight:.6}").unwrap();
+                write!(out, "{}|h|@{}", Trimmed(v), Trimmed(weight)).unwrap();
             }
             self.end_record(info.aggregation);
         }
@@ -200,7 +200,7 @@ impl<S: StatsdSink> Backend for StatsdBackend<S> {
         if sum == 0.0 && !info.emit_zero(self.include_sparse) {
             return;
         }
-        write!(self.begin_record(info.name, ":"), "{sum:.6}|g").unwrap();
+        write!(self.begin_record(info.name, ":"), "{}|g", Trimmed(sum)).unwrap();
         self.end_record(info.aggregation);
     }
 
@@ -212,6 +212,33 @@ impl<S: StatsdSink> Backend for StatsdBackend<S> {
         // and hand them to the sink without copying.
         let chunks = Chunks::new(&self.buffer, &self.bounds, self.max_payload_size);
         self.sink.send_batch(chunks);
+    }
+}
+
+/// Formats an `f64` with at most 6 decimal places, trimming any trailing zeros.
+///
+/// This avoids the zero-padding produced by `{:.6}` (e.g. `7.000000`) while still bounding
+/// the output to at most 6 decimal places (e.g. `0.333333` for `1/3`). The implementation
+/// is allocation-free: it converts to a fixed-point integer, strips trailing zeros by integer
+/// division, then emits the result with a width-controlled format specifier.
+struct Trimmed(f64);
+
+impl fmt::Display for Trimmed {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        const SCALE: u64 = 1_000_000; // 10^6 → 6 decimal places max
+        let scaled = (self.0 * SCALE as f64).round() as u64;
+        let int_part = scaled / SCALE;
+        let mut frac = scaled % SCALE;
+        let mut prec = 6usize;
+        while prec > 0 && frac % 10 == 0 {
+            frac /= 10;
+            prec -= 1;
+        }
+        if prec == 0 {
+            write!(f, "{int_part}")
+        } else {
+            write!(f, "{int_part}.{frac:0>width$}", width = prec)
+        }
     }
 }
 
@@ -504,7 +531,7 @@ mod test {
         );
         let ten = lines
             .iter()
-            .find(|l| l.contains("|@1.000000|"))
+            .find(|l| l.contains("|@1|"))
             .expect("10us bucket with weight 1");
         let ten_ns = hist_value(ten, "svc.task.time:");
         assert!(
@@ -705,7 +732,7 @@ mod test {
             &values,
         );
         backend.report_end();
-        assert!(sink.lines().contains(&"workers:7.000000|g".to_string()));
+        assert!(sink.lines().contains(&"workers:7|g".to_string()));
     }
 
     #[test]
