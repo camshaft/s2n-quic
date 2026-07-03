@@ -154,8 +154,9 @@ impl<S: StatsdSink> Backend for StatsdBackend<S> {
         // that cannot be aggregated across hosts.
         //
         // Bucket values are the native recorded magnitude: nanoseconds for time units
-        // (record_duration stores `as_nanos`), bytes/counts as-is. A fractional histogram stores
-        // `scale * v`, so `statsd_value` divides that back out (emitting a float sample).
+        // (record_duration stores `as_nanos`), bytes/counts as-is. For an unscaled histogram
+        // `statsd_value` maps that to the reported integer; a fractional histogram stores `scale * v`
+        // and is de-scaled inline below (see the `scale != 1.0` branch) to emit a float sample.
         let scale = hist.scale();
         for (value, count) in hist.buckets() {
             // `buckets()` only yields non-empty buckets, so `count >= 1`; guard anyway so the
@@ -531,7 +532,9 @@ mod test {
             .find(|l| l.starts_with("ratio:"))
             .expect("ratio histogram line");
         // Parse the float `{value}` out of `ratio:{value}|h|@{w}`.
-        let value: f64 = line["ratio:".len()..line.find('|').unwrap()].parse().unwrap();
+        let value: f64 = line["ratio:".len()..line.find('|').unwrap()]
+            .parse()
+            .unwrap();
         // ~0.25 (within bucket relative error), definitely not 250000.
         assert!(
             (0.249..=0.251).contains(&value),

@@ -293,7 +293,9 @@ mod test {
 
         let line = registry.take_current_metrics_line();
         // Format is `ratio={value:.6}*{count}` — one bucket, one sample.
-        let value: f64 = line["ratio=".len()..line.find('*').unwrap()].parse().unwrap();
+        let value: f64 = line["ratio=".len()..line.find('*').unwrap()]
+            .parse()
+            .unwrap();
         assert!(
             (0.249..=0.251).contains(&value),
             "expected ~0.25, got {value} (line {line:?})"
@@ -326,7 +328,9 @@ mod test {
         // NaN is dropped entirely: nothing recorded.
         summary.record_f64(f64::NAN);
         assert_eq!(
-            registry.try_take_current_metrics_line_sparse(false).unwrap(),
+            registry
+                .try_take_current_metrics_line_sparse(false)
+                .unwrap(),
             "",
             "NaN must not record a sample"
         );
