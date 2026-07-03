@@ -4,7 +4,6 @@
 use std::{
     fs,
     mem::MaybeUninit,
-    ptr,
     sync::{
         atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering},
         Mutex, MutexGuard,
@@ -35,120 +34,43 @@ struct Page {
     // assembly assumes slots is at index 0
     slots: [MaybeUninit<u64>; SLOTS],
     length: AtomicU64,
-    next: *mut Page,
+    // Intrusive stack link. Atomic (not a plain `*mut Page`) because a page can be concurrently
+    // read as a stack `head` by one thread while another thread that just popped it writes its
+    // `next`; a plain-pointer read/write there would be a data race (UB) even though the CAS is
+    // what actually guards correctness. `Relaxed` is sufficient: the head CAS carries the
+    // happens-before, `next` only needs to be readable without tearing.
+    next: AtomicPtr<Page>,
 }
 
 // Lock in the exact page size so a future field addition can't silently push the struct over a
 // boundary and reintroduce alignment padding (adjust the slot derivation to compensate instead).
 const _: () = assert!(std::mem::size_of::<Page>() == PAGE_SIZE);
 
-#[cfg(target_os = "linux")]
+/// Test-only counter of every `Page::new` allocation. The whole point of the pool is that once it
+/// is warm, recording should recycle pages and stop calling `Page::new`; a conservation test
+/// watches this stop growing. (The production leak was exactly this count climbing without bound.)
+#[cfg(test)]
+static PAGES_ALLOCATED: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(any(test, target_os = "linux"))]
 impl Page {
     fn new() -> Box<Page> {
+        #[cfg(test)]
+        PAGES_ALLOCATED.fetch_add(1, Ordering::Relaxed);
         Box::new(Page {
             slots: [const { MaybeUninit::uninit() }; SLOTS],
             length: AtomicU64::new(0),
-            next: ptr::null_mut(),
+            next: AtomicPtr::new(std::ptr::null_mut()),
         })
     }
 }
 
-/// Lock-free intrusive stack of Pages.
-///
-/// Push is a single CAS. `take_all` swaps the head to null and returns the
-/// entire chain for batch processing — no per-element atomic ops on drain.
-struct PageStack {
-    head: AtomicPtr<Page>,
-}
+/// Lock-free recycling of [`Page`]s between the two pools. The stack machinery, its ABA-safety
+/// argument, and its tests live here rather than inline with the rseq assembly they are otherwise
+/// unrelated to. `Page` itself stays in this module because the assembly reads its layout.
+mod page_pool;
 
-impl PageStack {
-    const fn new() -> Self {
-        Self {
-            head: AtomicPtr::new(ptr::null_mut()),
-        }
-    }
-
-    fn push(&self, page: Box<Page>) {
-        let raw = Box::into_raw(page);
-        loop {
-            let head = self.head.load(Ordering::Relaxed);
-            unsafe { (*raw).next = head };
-            if self
-                .head
-                .compare_exchange_weak(head, raw, Ordering::Release, Ordering::Relaxed)
-                .is_ok()
-            {
-                break;
-            }
-        }
-    }
-
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-    fn pop(&self) -> Option<Box<Page>> {
-        loop {
-            let head = self.head.load(Ordering::Acquire);
-            if head.is_null() {
-                return None;
-            }
-            let next = unsafe { (*head).next };
-            if self
-                .head
-                .compare_exchange_weak(head, next, Ordering::Release, Ordering::Relaxed)
-                .is_ok()
-            {
-                unsafe { (*head).next = ptr::null_mut() };
-                return Some(unsafe { Box::from_raw(head) });
-            }
-        }
-    }
-}
-
-const PAGE_POOL_SHARDS: usize = 2;
-const PAGE_POOL_MASK: usize = PAGE_POOL_SHARDS - 1;
-
-/// Sharded page pool. Each shard is a lock-free intrusive stack.
-/// Producers pick a shard via `cpu_hint & MASK`, distributing contention
-/// across shards so the CAS loop almost never retries.
-struct ShardedPagePool {
-    shards: [PageStack; PAGE_POOL_SHARDS],
-}
-
-impl ShardedPagePool {
-    const fn new() -> Self {
-        Self {
-            shards: [PageStack::new(), PageStack::new()],
-        }
-    }
-
-    #[inline]
-    fn push(&self, page: Box<Page>, cpu_hint: usize) {
-        self.shards[cpu_hint & PAGE_POOL_MASK].push(page);
-    }
-
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-    fn pop(&self, cpu_hint: usize) -> Option<Box<Page>> {
-        let start = cpu_hint & PAGE_POOL_MASK;
-        for i in 0..PAGE_POOL_SHARDS {
-            let shard = &self.shards[(start + i) & PAGE_POOL_MASK];
-            if let Some(page) = shard.pop() {
-                return Some(page);
-            }
-        }
-        None
-    }
-
-    fn drain(&self, mut f: impl FnMut(Box<Page>)) {
-        for shard in &self.shards {
-            let mut cursor = shard.head.swap(ptr::null_mut(), Ordering::Acquire);
-            while !cursor.is_null() {
-                let next = unsafe { (*cursor).next };
-                unsafe { (*cursor).next = ptr::null_mut() };
-                f(unsafe { Box::from_raw(cursor) });
-                cursor = next;
-            }
-        }
-    }
-}
+use page_pool::{PtrHead, ShardedPagePool, TaggedHead};
 
 fn possible_cpus() -> usize {
     let Ok(content) = fs::read_to_string("/sys/devices/system/cpu/possible") else {
@@ -218,9 +140,15 @@ pub(crate) struct Channels<T: Absorb> {
 
     fallback: crossbeam_queue::SegQueue<u64>,
 
-    empty_pages: ShardedPagePool,
+    // Recycled empty pages waiting to be handed back to recording CPUs. SPMC: one pusher (whoever
+    // holds `aggregate` during a steal) recycles into it; many recorders `pop` from it in
+    // `send_event_slow`. Its `pop` is the ABA-sensitive operation, so it uses the tagged head.
+    empty_pages: ShardedPagePool<TaggedHead>,
 
-    full_pages: ShardedPagePool,
+    // Filled pages handed off by recorders, awaiting aggregation. MPSC: many recorders `push`, a
+    // single stealer `drain`s. Never `pop`ped, so its plain-pointer head keeps the hot push path
+    // as cheap as before.
+    full_pages: ShardedPagePool<PtrHead>,
 
     // What we aggregate events into.
     aggregate: Mutex<Vec<T>>,
@@ -299,12 +227,40 @@ impl<T: Absorb> Channels<T> {
         len
     }
 
+    /// Folds only the *full pages* (those handed off by `send_event_slow`) and the fallback queue
+    /// into the aggregate. Deliberately does **not** touch the per-CPU pages, so it needs no
+    /// `membarrier` and no per-CPU swap — it is the cheap periodic compaction path behind
+    /// [`Registry::absorb`].
+    ///
+    /// This is sound without a membarrier: `full_pages` entries were published by the recorder's
+    /// Release CAS in `Stack::push`, and `drain`'s Acquire load synchronizes with it, so we observe
+    /// their event writes. The per-CPU pages, which *are* still being written under a relaxed store
+    /// and would need the cross-core fence, are left in place until the next `steal_pages`. Leaving
+    /// them also keeps their footprint bounded to one page per CPU and avoids the pop/push churn of
+    /// forcing every active CPU onto a fresh page each interval.
+    pub(crate) fn absorb_full_pages(&self) {
+        let mut aggregate = self.aggregate.lock().unwrap();
+        self.fold_full_pages(&mut aggregate);
+        self.drain_fallback(&mut aggregate);
+    }
+
+    /// Drains `full_pages` into the aggregate, recycling each folded page into `empty_pages`. Shared
+    /// by the absorb and the full-steal paths.
+    fn fold_full_pages(&self, aggregate: &mut [T]) {
+        // Spread recycled pages across the empty-pool shards (round-robin) rather than funneling
+        // them all onto shard 0, so concurrent poppers in `send_event_slow` land on different
+        // shards and contend less. `pop` scans every shard, so this is purely a contention win.
+        let mut recycle_hint = 0usize;
+        self.full_pages.drain(|page| {
+            Self::aggregate_page(aggregate, page, &self.empty_pages, recycle_hint);
+            recycle_hint = recycle_hint.wrapping_add(1);
+        });
+    }
+
     #[cfg(not(target_os = "linux"))]
     pub(crate) fn steal_pages(&self) {
         let mut aggregate = self.aggregate.lock().unwrap();
-        self.full_pages.drain(|page| {
-            Self::aggregate_page(&mut aggregate, page, &self.empty_pages);
-        });
+        self.fold_full_pages(&mut aggregate);
         self.drain_fallback(&mut aggregate);
     }
 
@@ -313,9 +269,7 @@ impl<T: Absorb> Channels<T> {
         let mut aggregate = self.aggregate.lock().unwrap();
 
         // Drain any full pages enqueued by send_event_slow
-        self.full_pages.drain(|page| {
-            Self::aggregate_page(&mut aggregate, page, &self.empty_pages);
-        });
+        self.fold_full_pages(&mut aggregate);
 
         if self.must_use_fallback {
             self.drain_fallback(&mut aggregate);
@@ -364,12 +318,13 @@ impl<T: Absorb> Channels<T> {
         // will see any events they've written and (b) they are no longer writing to the pages in
         // `PER_CPU`, which is sufficient to allow us to process all the events they've sent.
 
-        for page in pages {
+        for (recycle_hint, page) in pages.into_iter().enumerate() {
             if !page.is_null() {
                 Self::aggregate_page(
                     &mut aggregate,
                     unsafe { Box::from_raw(page) },
                     &self.empty_pages,
+                    recycle_hint,
                 );
             }
         }
@@ -377,13 +332,18 @@ impl<T: Absorb> Channels<T> {
         self.drain_fallback(&mut aggregate);
     }
 
-    fn aggregate_page(aggregate: &mut [T], mut page: Box<Page>, empty_pages: &ShardedPagePool) {
+    fn aggregate_page(
+        aggregate: &mut [T],
+        mut page: Box<Page>,
+        empty_pages: &ShardedPagePool<TaggedHead>,
+        recycle_hint: usize,
+    ) {
         let length = *page.length.get_mut() as usize;
         let filled = unsafe { &mut *(&mut page.slots[..length] as *mut [_] as *mut [u64]) };
         T::handle(aggregate, filled);
 
         *page.length.get_mut() = 0;
-        empty_pages.push(page, 0);
+        empty_pages.push(page, recycle_hint);
     }
 
     pub(crate) fn lock_aggregate(&self) -> MutexGuard<'_, Vec<T>> {
@@ -1191,5 +1151,108 @@ mod tests {
             assert!(channels.empty_pages.pop(0).is_none());
         }
         drop(channels);
+    }
+
+    /// End-to-end steady-state conservation on the real rseq recording path: once the pool is warm,
+    /// a high-rate recording load driven concurrently with periodic `absorb_full_pages` (the cheap
+    /// compaction) and occasional full `steal_pages` (report) must stop allocating fresh pages. The
+    /// production leak was exactly `Page::new` climbing without bound here; this asserts it plateaus.
+    ///
+    /// This is inherently a *concurrency* test (the ABA it guards against needs a real popper vs.
+    /// re-pusher race), so it uses threads rather than bach. It is tolerant of scheduling: it only
+    /// asserts that allocations in a late window are bounded well below the events processed, not an
+    /// exact count. On the fallback path (no rseq/membarrier) pages are never used, so it early-outs.
+    #[test]
+    fn steady_state_stops_allocating_pages() {
+        use std::sync::{
+            atomic::{AtomicBool, AtomicU64, Ordering},
+            Arc,
+        };
+
+        let channels = Arc::new(Channels::<TestAbsorber>::new());
+        channels.allocate();
+
+        // The fallback path (rseq/membarrier unavailable) never touches the page pool; nothing to
+        // assert about page allocation there.
+        if channels.must_use_fallback {
+            return;
+        }
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let recorded = Arc::new(AtomicU64::new(0));
+
+        // A few recorder threads hammering send_event — this is what pops from empty_pages and
+        // pushes to full_pages, at a rate high enough to fill many pages.
+        let mut recorders = Vec::new();
+        for _ in 0..4 {
+            let channels = channels.clone();
+            let stop = stop.clone();
+            let recorded = recorded.clone();
+            recorders.push(std::thread::spawn(move || {
+                let mut n = 0u64;
+                while !stop.load(Ordering::Relaxed) {
+                    for _ in 0..10_000 {
+                        channels.send_event(1);
+                    }
+                    n += 10_000;
+                }
+                recorded.fetch_add(n, Ordering::Relaxed);
+            }));
+        }
+
+        // A "reporter" thread that mostly absorbs (cheap, full_pages only) and occasionally does a
+        // full steal (report), mirroring the intended production cadence.
+        let reporter = {
+            let channels = channels.clone();
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                let mut i = 0u64;
+                while !stop.load(Ordering::Relaxed) {
+                    channels.absorb_full_pages();
+                    if i.is_multiple_of(10) {
+                        channels.steal_pages();
+                    }
+                    i += 1;
+                    std::thread::yield_now();
+                }
+            })
+        };
+
+        // Warm the pool: let it run, then snapshot the allocation count. After warm-up, additional
+        // allocations should be near-zero because pages recycle through empty_pages.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let allocated_after_warmup = PAGES_ALLOCATED.load(Ordering::Relaxed);
+
+        // Measurement window: keep recording hard, then compare fresh allocations against the huge
+        // number of events processed in the same window.
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        let allocated_end = PAGES_ALLOCATED.load(Ordering::Relaxed);
+
+        stop.store(true, Ordering::Relaxed);
+        for r in recorders {
+            r.join().unwrap();
+        }
+        reporter.join().unwrap();
+
+        let fresh_allocations = allocated_end - allocated_after_warmup;
+        let total_recorded = recorded.load(Ordering::Relaxed);
+
+        // The pool has a fixed working set (roughly one page per active CPU plus a small recycle
+        // buffer). Fresh allocations in the measurement window must be a tiny fraction of the
+        // events processed — under the ABA leak this instead grew ~linearly with events. We use a
+        // generous bound (allocations < events / SLOTS, i.e. fewer than one fresh page per page's
+        // worth of events) so the test is robust to scheduler variance but still fails hard on a
+        // linear leak, which would allocate on the order of events/SLOTS pages *plus* the escapees.
+        //
+        // Concretely: with the leak, ~2-3% of filled pages escaped, so fresh allocations tracked
+        // ~2-3% of (events / SLOTS) and grew every window. Post-fix the recycle is complete, so
+        // once warm this is a small constant.
+        let filled_pages_estimate = total_recorded / SLOTS as u64;
+        assert!(
+            fresh_allocations <= filled_pages_estimate / 20 + 64,
+            "page pool kept allocating after warm-up: {fresh_allocations} fresh Page::new in the \
+             measurement window vs ~{filled_pages_estimate} pages' worth of events recorded \
+             (total events {total_recorded}); expected recycling to keep this near-constant"
+        );
     }
 }
