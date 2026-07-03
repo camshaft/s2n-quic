@@ -28,9 +28,16 @@ libc = "0.2.170"
 crossbeam-queue = "0.3.12"
 # Provides a stable, lock-free 128-bit atomic (std's `AtomicU128` is still unstable). We use it for
 # a tagged (pointer, generation) CAS on the SPMC `empty_pages` stack to defeat the ABA hazard in
-# `pop`; it lowers to `cmpxchg16b` on x86_64 and `casp` (LSE) on aarch64 — the same instruction
+# `pop`. It lowers to a single `casp` (aarch64 LSE) / `cmpxchg16b` (x86_64) — the same instruction
 # family the rseq fast path already requires.
-portable-atomic = { version = "1", default-features = false }
+#
+# The default `fallback` feature is REQUIRED, not optional cruft: `AtomicU128` is only exported when
+# it is enabled, EXCEPT on targets whose 128-bit CAS is guaranteed by a compile-time `target_feature`
+# (e.g. x86_64 only lists `cmpxchg16b` when built with `-Ctarget-feature=+cmpxchg16b` or a `target-cpu`).
+# Stock `x86_64-unknown-linux-gnu` does not, so `default-features = false` makes `AtomicU128` vanish
+# there (`E0432 no AtomicU128 in the root`). With `fallback` on it is unconditionally available and
+# still lock-free on every CPU we run on.
+portable-atomic = "1"
 
 [lints.rust.unexpected_cfgs]
 level = "warn"
