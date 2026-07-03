@@ -266,7 +266,7 @@ impl tracing_subscriber::fmt::time::FormatTime for Uptime {
         if bach::is_active() {
             write!(
                 w,
-                "{} [{}]",
+                "{:#} [{}]",
                 bach::time::Instant::now(),
                 bach::group::current().name()
             )
