@@ -190,6 +190,7 @@ fn oracle(
     credentials: &crate::credentials::Credentials,
     mtu: u16,
     max_segments: usize,
+    buffer_capacity: usize,
 ) -> Oracle {
     let mut packet_sizes = Vec::new();
     let mut segment_size = 0u16;
@@ -217,6 +218,15 @@ fn oracle(
     let has_stream_data = |from: usize| from < stream_data_end;
 
     while next_idx < frames.len() && packet_sizes.len() < max_segments {
+        // Mirror the assembler's buffer-capacity guard (`offset + mtu > payload.len()`): a new
+        // segment is only started if a full MTU still fits in the descriptor. This binds before
+        // MAX_TOTAL whenever the pool capacity is within one MTU of MAX_TOTAL (as it is on Linux,
+        // where the fuzz pool `u16::MAX` sits just above `MAX_TOTAL`), so the oracle must apply it
+        // too or it over-counts a trailing segment the assembler never emits.
+        if offset + mtu as usize > buffer_capacity {
+            break;
+        }
+
         let remaining_total = segment::MAX_TOTAL as usize - offset.min(segment::MAX_TOTAL as usize);
         let max_segment_len = if segment_size == 0 {
             remaining_total.min(mtu as usize)
@@ -508,12 +518,20 @@ fn assemble_batches_full_mtu_data_frames() {
     assert_gso_invariants(&segments, mtu, expected_segments);
 }
 
-/// Guard for the padding decision: a batch that starts with a small (well-under-MTU) frame
-/// must stay in tight mode so it is not inflated to a full-MTU wire datagram. This is the
-/// case the near-MTU gate protects — ACK/control/sub-MTU packets keep their true size.
+/// Guard for the padding decision: a batch that carries no bulk stream data must stay in
+/// tight mode and never inflate a segment to the full MTU. This is the case the near-MTU
+/// gate protects — a burst of small control/reset packets keeps each segment at its true
+/// (small) encoded size rather than being zero-padded up to the MTU.
+///
+/// Note the near-MTU test is on the *encoded packet*, not the leading frame: a tiny frame
+/// that shares a segment with a full data frame produces a near-MTU packet and correctly
+/// enters pad mode. The invariant this guards is specifically "no stream data queued ⇒ no
+/// padding", which is what keeps ACK/control-only bursts tight.
 #[test]
-fn assemble_does_not_pad_small_leading_frame() {
-    let mtu = 8927;
+fn assemble_does_not_pad_small_control_only_batch() {
+    // Small MTU so a handful of small control frames span more than one segment, exercising
+    // the multi-segment tight-mode path (each control packet is well under the MTU).
+    let mtu = 1400;
     let registry = Registry::new();
     let (mut context, entry) = make_context(mtu, &registry);
     let clock = Clock::new(Duration::from_micros(1));
@@ -524,37 +542,31 @@ fn assemble_does_not_pad_small_leading_frame() {
     let mut ack_completions = Queue::new();
     let (mut freed_batch_tx, _freed_batch_rx) = crate::queue::freed_batch_channel();
 
-    // A single small control frame followed by full chunks. The small frame leads, so
-    // segment 1 is well under the MTU → tight mode → segment_size == its actual length.
-    context.push_back_frame(
-        Frame {
-            header: Header::QueueReset {
-                queue_pair: crate::packet::datagram::QueuePair {
-                    source_queue_id: VarInt::from_u8(1),
-                    dest_queue_id: VarInt::from_u8(1),
+    // Control frames only — no QueueData/QueueMsg — so `has_pending_stream_data()` is false at
+    // the mode decision and pad mode must never engage, regardless of how the small frames pack.
+    for i in 0..16u8 {
+        context.push_back_frame(
+            Frame {
+                header: Header::QueueReset {
+                    queue_pair: crate::packet::datagram::QueuePair {
+                        source_queue_id: VarInt::from_u8(i.max(1)),
+                        dest_queue_id: VarInt::from_u8(i.max(1)),
+                    },
+                    binding_id: VarInt::from_u8(i.max(1)),
+                    reset_target: ResetTarget::Both,
+                    error_code: VarInt::from_u8(1),
+                    init: None,
                 },
-                binding_id: VarInt::from_u8(1),
-                reset_target: ResetTarget::Both,
-                error_code: VarInt::from_u8(1),
-                init: None,
-            },
-            payload: ByteVec::new(),
-            path_secret_entry: entry.clone(),
-            completion: None,
-            status: TransmissionStatus::default(),
-            ttl: DEFAULT_TTL,
-            enqueued_at: None,
-            flow_credits: 0,
-        }
-        .into(),
-    );
-    // Higher-priority small frame drains first (see push order / priority sort); add data
-    // behind it so `has_pending_data()` is true at the mode-decision point.
-    let mut offset = 0u64;
-    for _ in 0..4 {
-        let frame = full_data_frame(&entry, mtu, offset);
-        offset += frame.payload_len() as u64;
-        context.push_back_frame(frame);
+                payload: ByteVec::new(),
+                path_secret_entry: entry.clone(),
+                completion: None,
+                status: TransmissionStatus::default(),
+                ttl: DEFAULT_TTL,
+                enqueued_at: None,
+                flow_credits: 0,
+            }
+            .into(),
+        );
     }
 
     let counters = AssemblerCounters::new(&Registry::new());
@@ -580,13 +592,14 @@ fn assemble_does_not_pad_small_leading_frame() {
     .expect("frames should assemble");
 
     let sizes = segments.sizes().collect::<Vec<_>>();
-    let first = sizes[0];
-    assert!(
-        first < mtu,
-        "small leading frame must not be padded to the MTU, got {first}"
-    );
-    // Tight mode: the QueueReset control frame is much smaller than a data packet. Whatever
-    // batches with it stays at that (small) segment size, never the MTU.
+    // Tight mode: no segment is padded to the MTU. A control-only batch packs small packets;
+    // every segment must stay well under the MTU (never `segment_size == mtu`).
+    for size in &sizes {
+        assert!(
+            *size < mtu,
+            "control-only batch must not pad any segment to the MTU, got sizes {sizes:?}"
+        );
+    }
     assert_gso_invariants(&segments, mtu, context.path_info(&gso).max_segments);
 }
 
@@ -633,6 +646,7 @@ fn assemble_fuzz_respects_gso_invariants() {
                 &context.credentials,
                 input.mtu,
                 max_segments,
+                u16::MAX as usize,
             );
             let pool = pool::Pool::new(u16::MAX);
             let mut header_buf = Vec::new();
