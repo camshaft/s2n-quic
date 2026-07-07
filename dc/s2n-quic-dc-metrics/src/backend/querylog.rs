@@ -82,7 +82,8 @@ impl Backend for QuerylogBackend {
         if value == 0 && !info.emit_zero(self.include_sparse) {
             return;
         }
-        write!(self.begin_entry(info), "{value}").unwrap();
+        let unit = info.unit.pmet_str();
+        write!(self.begin_entry(info), "{value}{unit}").unwrap();
         self.finish_entry(info);
     }
 

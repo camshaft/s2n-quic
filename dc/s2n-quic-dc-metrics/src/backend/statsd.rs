@@ -483,6 +483,24 @@ mod test {
         );
     }
 
+    /// A counter's unit is metadata: statsd doesn't render it. A `Unit::Byte` counter emits the same
+    /// `:{value}|c` line as a plain counter, with no spurious `|#variant:` tag (units are not
+    /// variants). This is the "backend doesn't emit units" case.
+    #[test]
+    fn counter_unit_is_ignored_by_statsd() {
+        let registry = crate::Registry::new();
+        registry
+            .register_counter_with_unit("rx.bytes".into(), None, Unit::Byte)
+            .increment(1500);
+
+        let sink = CaptureSink::default();
+        let mut backend = StatsdBackend::new(sink.clone(), None);
+        registry.report(&mut backend);
+
+        let lines = sink.lines();
+        assert_eq!(lines, vec!["rx.bytes:1500|c".to_string()]);
+    }
+
     /// Parses the `{value}` out of a DogStatsD histogram line of the form `prefix{value}|h|@{w}`.
     fn hist_value(line: &str, prefix: &str) -> u64 {
         assert!(

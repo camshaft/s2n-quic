@@ -1,7 +1,10 @@
 // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::rseq::{Absorb, Channels};
+use crate::{
+    rseq::{Absorb, Channels},
+    Unit,
+};
 use std::sync::Arc;
 
 /// A `Counter` can only be incremented.
@@ -12,12 +15,17 @@ use std::sync::Arc;
 pub struct Counter {
     channels: Arc<Channels<SharedCounter>>,
     counter: u32,
+    /// The display unit for this counter (e.g. [`Unit::Byte`]). Backends that surface units read it
+    /// off [`MetricInfo`](crate::MetricInfo); backends that don't (e.g. statsd) simply ignore it. It
+    /// is metadata that a counter carries regardless of whether any backend emits it.
+    unit: Unit,
 }
 
 impl std::fmt::Debug for Counter {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Counter")
             .field("counter", &self.counter)
+            .field("unit", &self.unit)
             .finish()
     }
 }
@@ -45,11 +53,17 @@ impl Absorb for SharedCounter {
 }
 
 impl Counter {
-    pub(crate) fn new(channels: Arc<Channels<SharedCounter>>) -> Counter {
+    pub(crate) fn new(channels: Arc<Channels<SharedCounter>>, unit: Unit) -> Counter {
         Counter {
             counter: channels.allocate(),
             channels,
+            unit,
         }
+    }
+
+    /// The display unit for this counter.
+    pub(crate) fn unit(&self) -> Unit {
+        self.unit
     }
 
     pub fn increment(&self, count: u64) {
@@ -102,6 +116,43 @@ fn check_u64_max() {
         registry.take_current_metrics_line(),
         format!("a={},b={}", u64::MAX, u32::MAX)
     );
+}
+
+#[test]
+fn unit_defaults_to_count_and_renders_no_suffix() {
+    let registry = crate::Registry::new();
+    // A plain counter is `Unit::Count`, whose display suffix is empty: output is byte-identical to
+    // a unit-less counter.
+    let a = registry.register_counter(String::from("a"), None);
+    a.increment(5);
+    assert_eq!(registry.take_current_metrics_line(), "a=5");
+}
+
+#[test]
+fn byte_unit_renders_querylog_suffix() {
+    let registry = crate::Registry::new();
+    // A byte counter carries `Unit::Byte`; the querylog line renders the ` B` suffix, exactly as a
+    // byte-unit summary does.
+    let bytes = registry.register_counter_with_unit(String::from("rx.bytes"), None, Unit::Byte);
+    bytes.increment(1500);
+    assert_eq!(registry.take_current_metrics_line(), "rx.bytes=1500 B");
+}
+
+#[test]
+fn unit_via_metric_builder() {
+    let registry = crate::Registry::new();
+    let bytes = registry.metric("tx.bytes").unit(Unit::Byte).counter();
+    bytes.increment(42);
+    assert_eq!(registry.take_current_metrics_line(), "tx.bytes=42 B");
+}
+
+#[test]
+#[should_panic(expected = "different unit")]
+fn conflicting_unit_panics() {
+    let registry = crate::Registry::new();
+    registry.register_counter_with_unit(String::from("a"), None, Unit::Byte);
+    // Re-registering the same key with a different unit is a programming error.
+    registry.register_counter_with_unit(String::from("a"), None, Unit::Count);
 }
 
 #[test]

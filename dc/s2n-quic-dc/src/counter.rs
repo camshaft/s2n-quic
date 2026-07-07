@@ -2368,8 +2368,13 @@ impl Registry {
         let label = label.to_string();
         let metric_id =
             self.register_metric_metadata(&label, None, MetricKind::Counter, Some("B"), "");
+        // Carry the byte unit as a real `Unit::Byte` rather than smuggling it through the
+        // aggregation/variant dimension. The querylog line still renders the trailing ` B` (via the
+        // unit's display suffix), while statsd no longer emits a spurious `|#variant:B` tag for what
+        // was never a variant.
         self.counter_handle(
-            self.inner.register_counter(label, Some("B".into())),
+            self.inner
+                .register_counter_with_unit(label, None, Unit::Byte),
             metric_id,
         )
     }
