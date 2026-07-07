@@ -19,9 +19,13 @@
 //!     pool for the workload's concurrency, or a credit leak the pacer is masking.
 //!
 //! All counters and gauges are constructed from a [`crate::counter::Registry`]. Use
-//! [`Counters::default`] when no registry is wired up — it registers against a default `Registry`
-//! that drops every emit on the floor (no overhead in the hot path beyond the Counter handle's
-//! own atomic increment).
+//! [`Counters::default`] when no registry is wired up — its values are never *reported* anywhere.
+//! Note this is not the same as zero-cost: recording still writes into the registry's rseq page
+//! pool, and those pages are only recycled when a reporter drains the registry. A `default()`
+//! registry has no reporter, so a **high-rate** producer against it (e.g. the credit
+//! [`Distributor`](crate::credit::Distributor)'s per-pass `distributor.passes`) leaks pages without
+//! bound. Only use `default()` for low-rate producers (tests, internal benchmarks); wire a real
+//! registry via [`Counters::new_with_prefix`] for anything a distributor drives.
 
 use crate::{
     counter::{Counter, Gauge, Registry},
@@ -160,8 +164,17 @@ impl Counters {
 
 impl Default for Counters {
     /// Construct a `Counters` against a default-initialized `Registry`. The registry is local to
-    /// this struct and never publishes anywhere — every emit is dropped on the floor. Use this
-    /// when no observability is wired up (tests, internal benchmarks).
+    /// this struct and never *publishes* anywhere — no reporter drains it, so its values go
+    /// nowhere. Use this only when no observability is wired up **and** the producer is low-rate
+    /// (tests, internal benchmarks).
+    ///
+    /// **Footgun:** "never published" is not "free." `Counter::increment` still writes each event
+    /// into the registry's rseq page pool, and those 64 KiB pages are recycled only when a reporter
+    /// drains the registry. With no reporter the page pool never refills, so a *high-rate* producer
+    /// against a `default()` registry mints a fresh page per event and leaks it — unbounded. The
+    /// credit [`Distributor`](crate::credit::Distributor) records `distributor.passes` on every
+    /// busy-poll pass (millions/sec), so a pool with a live distributor **must not** use
+    /// `default()`; wire a real registry via [`Counters::new_with_prefix`].
     fn default() -> Self {
         Self::new(&Registry::default())
     }

@@ -1333,3 +1333,54 @@ fn trace_groups_materialize_ops_under_one_stream_id() {
         .spawn();
     });
 }
+
+/// REGRESSION: a registered device's credit pool(s) must record their counters into the registry
+/// the scheduler was handed — **not** a private, undrained one.
+///
+/// `Device::new` used to build its pools with `Pool::new`, which substitutes `Counters::default()`
+/// (a private `Registry` no reporter ever drains). The always-spinning `Distributor::pass()` records
+/// `distributor.passes` into that registry millions of times/sec, and the rseq recorder mints a fresh
+/// 64 KiB `Page` per event that is only recycled when a reporter drains the registry — so an undrained
+/// registry leaks pages without bound (~GB/min per host → OOM). The fix wires the pools to the
+/// passed-in registry via `Pool::with_counters` under the same `fs.credit.{label}.pool{idx}` prefix
+/// the gauges use.
+///
+/// We drive one read through a device registered against a real registry, then drain that registry
+/// and assert the pool's acquire counter appears under the expected prefix. Before the fix the pool
+/// recorded into its private registry, so this counter would be absent from the drained line.
+#[test]
+fn device_credit_pool_records_into_passed_in_registry() {
+    let _no_snap = crate::testing::without_snapshots();
+    sim(|| {
+        let clock = Clock::default();
+        let backend = BachBackend::new(clock.clone(), Latency::default());
+        let mut spawn = bach_spawner();
+        let registry = Registry::new();
+        let scheduler = DeviceRegistry::new(backend, &mut spawn, &registry, clock);
+        let dev = scheduler.register_device("dev0", &iops_device(8)).unwrap();
+
+        async move {
+            let _scheduler = scheduler;
+            // A successful read takes the pool's fast-path acquire, bumping `acquire.fast_path` /
+            // `acquire.bytes` on the pool's counters.
+            dev.read(fd(), 0, 4096, TierPriority::Medium)
+                .await
+                .expect("read should complete");
+            10.ms().sleep().await;
+
+            // Drain the registry we handed the scheduler. The pool's acquire counter must be present
+            // under the device's gauge prefix — proving it recorded here, not into a private registry.
+            let line = registry
+                .take_current_metrics_line()
+                .expect("registry should have recorded at least one metric");
+            assert!(
+                line.contains("fs.credit.dev0.pool0.acquire.fast_path"),
+                "device pool must record its counters into the passed-in registry under \
+                 `fs.credit.dev0.pool0.*`; metrics line was: {line}"
+            );
+            info!("device credit pool records into the passed-in registry");
+        }
+        .primary()
+        .spawn();
+    });
+}
