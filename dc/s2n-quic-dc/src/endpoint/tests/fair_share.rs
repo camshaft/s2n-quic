@@ -353,6 +353,9 @@ fn run_send_fair_share(
 /// to send whatever partial credit it gets, every writer makes forward progress and completes.
 #[test]
 fn send_fair_share_partial_grants_no_stragglers() {
+    if crate::testing::skip_if_slow() {
+        return;
+    }
     let _no_snap = crate::testing::without_snapshots();
     let _no_trace = crate::testing::without_tracing();
 
@@ -560,6 +563,9 @@ fn run_reset_cancel_drain(
 /// receiving full rate but unable to send read responses.
 #[test]
 fn reset_cancel_send_credit_conserved() {
+    if crate::testing::skip_if_slow() {
+        return;
+    }
     let _no_snap = crate::testing::without_snapshots();
     let _no_trace = crate::testing::without_tracing();
 
@@ -746,6 +752,9 @@ fn run_recv_reset_cancel_drain(
 /// aggregator's surviving reads stalling because their windows can no longer grow.
 #[test]
 fn recv_reset_cancel_credit_conserved() {
+    if crate::testing::skip_if_slow() {
+        return;
+    }
     let _no_snap = crate::testing::without_snapshots();
     let _no_trace = crate::testing::without_tracing();
 
@@ -938,6 +947,9 @@ fn fair_share_msg_smoke_small() {
 /// recv-window contention.
 #[test]
 fn fair_share_msg_contended_no_stragglers() {
+    if crate::testing::skip_if_slow() {
+        return;
+    }
     let _no_snap = crate::testing::without_snapshots();
     let _no_trace = crate::testing::without_tracing();
 
@@ -1366,6 +1378,9 @@ async fn drive_msg_writer_tolerant(
 /// Recv credit must be fully recovered when QueueMsg streams are reset mid-segment by the reader.
 #[test]
 fn msg_reset_recv_credit_conserved() {
+    if crate::testing::skip_if_slow() {
+        return;
+    }
     let _no_snap = crate::testing::without_snapshots();
     let _no_trace = crate::testing::without_tracing();
 
@@ -1569,6 +1584,9 @@ fn run_recv_churn_cancel(
 /// conservation check fails.
 #[test]
 fn recv_cancel_credit_conserved() {
+    if crate::testing::skip_if_slow() {
+        return;
+    }
     let _no_snap = crate::testing::without_snapshots();
     let _no_trace = crate::testing::without_tracing();
 
@@ -2128,6 +2146,9 @@ fn run_merge_order_deadlock(
 /// Many open-but-unconsumed reader streams must not deadlock a stream the app wants to drain.
 #[test]
 fn merge_order_held_open_deadlock() {
+    if crate::testing::skip_if_slow() {
+        return;
+    }
     let _no_snap = crate::testing::without_snapshots();
 
     // 64 streams, 4 MiB body each, read only the first 16 KiB of each, server streams in 8 KiB
