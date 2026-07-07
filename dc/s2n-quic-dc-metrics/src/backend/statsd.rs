@@ -15,7 +15,7 @@ use crate::{
     backend::{Backend, CallbackValue, Histogram, MetricInfo, ReportOptions},
     Unit,
 };
-use std::{fmt::Write as _, sync::Arc};
+use std::{fmt, fmt::Write as _, sync::Arc};
 
 /// Default maximum UDP payload size (bytes) for a single datagram.
 pub const DEFAULT_MAX_PAYLOAD_SIZE: usize = 1200;
@@ -173,10 +173,10 @@ impl<S: StatsdSink> Backend for StatsdBackend<S> {
             // de-scaled fractional value.
             if scale == 1.0 {
                 let v = statsd_value(value, unit);
-                write!(out, "{v}|h|@{weight}").unwrap();
+                write!(out, "{v}|h|@{}", Trimmed(weight)).unwrap();
             } else {
                 let v = value as f64 / scale;
-                write!(out, "{v}|h|@{weight}").unwrap();
+                write!(out, "{}|h|@{}", Trimmed(v), Trimmed(weight)).unwrap();
             }
             self.end_record(info.aggregation);
         }
@@ -200,7 +200,7 @@ impl<S: StatsdSink> Backend for StatsdBackend<S> {
         if sum == 0.0 && !info.emit_zero(self.include_sparse) {
             return;
         }
-        write!(self.begin_record(info.name, ":"), "{sum}|g").unwrap();
+        write!(self.begin_record(info.name, ":"), "{}|g", Trimmed(sum)).unwrap();
         self.end_record(info.aggregation);
     }
 
@@ -212,6 +212,40 @@ impl<S: StatsdSink> Backend for StatsdBackend<S> {
         // and hand them to the sink without copying.
         let chunks = Chunks::new(&self.buffer, &self.bounds, self.max_payload_size);
         self.sink.send_batch(chunks);
+    }
+}
+
+/// Formats an `f64` with at most 6 decimal places, trimming trailing zeros but always
+/// emitting at least one decimal place (e.g. `7.0`).
+///
+/// This bounds the output to at most 6 decimal places (e.g. `0.333333` for `1/3`) while
+/// ensuring the value is always formatted as a float (e.g. `7.0` rather than `7`). The
+/// implementation is allocation-free: finite values are rounded into a fixed-point integer,
+/// trailing fractional zeros are stripped by integer division, and the result is emitted with a
+/// width-controlled format specifier.
+struct Trimmed(f64);
+
+impl fmt::Display for Trimmed {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if !self.0.is_finite() {
+            return write!(f, "{}", self.0);
+        }
+
+        const SCALE: u64 = 1_000_000; // 10^6 → 6 decimal places max
+        let sign = if self.0.is_sign_negative() { "-" } else { "" };
+        let scaled = (self.0.abs() * SCALE as f64).round() as u64;
+        let int_part = scaled / SCALE;
+        let mut frac = scaled % SCALE;
+        let mut prec = 6usize;
+        while prec > 0 && frac.is_multiple_of(10) {
+            frac /= 10;
+            prec -= 1;
+        }
+        if prec == 0 {
+            write!(f, "{sign}{int_part}.0")
+        } else {
+            write!(f, "{sign}{int_part}.{frac:0>width$}", width = prec)
+        }
     }
 }
 
@@ -504,7 +538,7 @@ mod test {
         );
         let ten = lines
             .iter()
-            .find(|l| l.contains("|@1|"))
+            .find(|l| l.contains("|@1.0|"))
             .expect("10us bucket with weight 1");
         let ten_ns = hist_value(ten, "svc.task.time:");
         assert!(
@@ -705,6 +739,49 @@ mod test {
             &values,
         );
         backend.report_end();
-        assert!(sink.lines().contains(&"workers:7|g".to_string()));
+        assert!(sink.lines().contains(&"workers:7.0|g".to_string()));
+    }
+
+    #[test]
+    fn float_precision_is_limited_to_six_decimal_places() {
+        // Floats in StatsD lines (sample-rate weights and scaled values) must not carry the full
+        // f64 precision: strict parsers such as the CloudWatch agent reject very long decimals.
+        // weight for count=3 is 1/3 ≈ 0.333333 (not 0.3333333333333333).
+        let registry = crate::Registry::new();
+        let summary = registry.register_summary("h".into(), None, Unit::Microsecond);
+        // Record three equal samples → one bucket with count=3 → weight=1/3.
+        summary.record_duration(std::time::Duration::from_micros(5));
+        summary.record_duration(std::time::Duration::from_micros(5));
+        summary.record_duration(std::time::Duration::from_micros(5));
+
+        let sink = CaptureSink::default();
+        let mut backend = StatsdBackend::new(sink.clone(), None);
+        registry.report(&mut backend);
+
+        let lines = sink.lines();
+        let hist_line = lines
+            .iter()
+            .find(|l| l.starts_with("h:"))
+            .expect("histogram line");
+        let at = hist_line.find("|@").expect("|@ in line");
+        let weight_str = &hist_line[at + 2..];
+        let weight_str = weight_str.split('|').next().unwrap();
+        assert_eq!(
+            weight_str, "0.333333",
+            "weight must be capped at 6 decimal places, not full f64 precision"
+        );
+    }
+
+    #[test]
+    fn trimmed_preserves_sign_for_finite_values() {
+        assert_eq!(format!("{}", Trimmed(-7.0)), "-7.0");
+        assert_eq!(format!("{}", Trimmed(-0.3333333333333333)), "-0.333333");
+    }
+
+    #[test]
+    fn trimmed_preserves_non_finite_values() {
+        assert_eq!(format!("{}", Trimmed(f64::NAN)), "NaN");
+        assert_eq!(format!("{}", Trimmed(f64::INFINITY)), "inf");
+        assert_eq!(format!("{}", Trimmed(f64::NEG_INFINITY)), "-inf");
     }
 }
