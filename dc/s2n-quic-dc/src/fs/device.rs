@@ -23,6 +23,7 @@
 //! the device's queue depth (which the credit pool capacity governs).
 
 use crate::{
+    credit::Counters,
     fs::{
         config::{CostModel, DeviceConfig, OpWeights, PoolMode},
         op::{CompletionReceiver, CompletionSender, Fd, IoBuf, IoKind, IoOp, IoStatus},
@@ -150,11 +151,26 @@ impl Device {
         clock: crate::time::DefaultClock,
     ) -> Self {
         let counters = crate::fs::counters::DeviceCounters::register(registry, &label);
+        // Wire each credit pool to the passed-in registry rather than the registry-less `Pool::new`.
+        // `Pool::new` substitutes `Counters::default()`, whose private `Registry` no reporter ever
+        // drains — and the always-spinning `Distributor::pass()` records `distributor.passes` into it
+        // at millions/sec. The rseq recorder mints a fresh 64 KiB `Page` per event and only recycles
+        // pages when a reporter drains the registry, so an undrained registry leaks pages without
+        // bound (~GB/min per host → OOM). Namespacing to `fs.credit.{label}.pool{idx}` matches the
+        // gauge prefix `register_device` already uses; the counter leaf names are disjoint from the
+        // gauge leaf names, so counters and gauges coexist cleanly under one subtree. This mirrors
+        // the send/recv credit pools in `endpoint.rs`.
+        let with_counters = |cfg, idx: usize| {
+            Pool::with_counters(
+                cfg,
+                Counters::new_with_prefix(registry, &format!("fs.credit.{label}.pool{idx}")),
+            )
+        };
         let (pools, read_capacity, write_capacity) = match &cfg.pool_mode {
             PoolMode::Shared(c) => {
                 let c = atomic_grant(*c);
                 (
-                    DevicePools::Shared(Arc::new(Pool::new(c))),
+                    DevicePools::Shared(Arc::new(with_counters(c, 0))),
                     c.capacity,
                     c.capacity,
                 )
@@ -163,8 +179,8 @@ impl Device {
                 let (read, write) = (atomic_grant(*read), atomic_grant(*write));
                 (
                     DevicePools::Split {
-                        read: Arc::new(Pool::new(read)),
-                        write: Arc::new(Pool::new(write)),
+                        read: Arc::new(with_counters(read, 0)),
+                        write: Arc::new(with_counters(write, 1)),
                     },
                     read.capacity,
                     write.capacity,
