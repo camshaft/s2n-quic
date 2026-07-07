@@ -72,7 +72,8 @@ impl RegistryInner {
             };
             match &mut entry.value {
                 MetricValue::Counter(c) => {
-                    c.report(&info(Unit::Count, MetricKind::Counter), backend);
+                    let unit = c.unit();
+                    c.report(&info(unit, MetricKind::Counter), backend);
                 }
                 MetricValue::Summary(s) => {
                     let unit = s.display_unit();
@@ -103,7 +104,7 @@ impl RegistryInner {
             .iter()
             .map(|(key, entry)| {
                 let (kind, unit) = match &entry.value {
-                    MetricValue::Counter(_) => (MetricKind::Counter, Unit::Count),
+                    MetricValue::Counter(c) => (MetricKind::Counter, c.unit()),
                     MetricValue::Summary(s) => (MetricKind::Histogram, s.display_unit()),
                     MetricValue::BoolCounter(_) => (MetricKind::BoolCounter, Unit::Count),
                     MetricValue::ValueList(c) => (MetricKind::CallbackScalar, c.unit()),
@@ -221,6 +222,30 @@ impl Registry {
         self.register_counter_inner(
             metric.into(),
             aggregation.map(Into::into),
+            Unit::Count,
+            Sparsity::Inherit,
+        )
+    }
+
+    /// Like [`register_counter`](Self::register_counter), but records the counter's display
+    /// [`Unit`].
+    ///
+    /// The unit is metadata a counter carries independent of any backend: it surfaces through
+    /// [`MetricInfo::unit`](crate::MetricInfo) at report time and through
+    /// [`MetricDescriptor::unit`] for introspection. A backend that renders units (e.g. the querylog
+    /// line's ` B` suffix) uses it; one that doesn't (e.g. statsd) simply ignores it. This is the
+    /// unit-carrying counterpart to [`register_summary`](Self::register_summary).
+    #[track_caller]
+    pub fn register_counter_with_unit(
+        &self,
+        metric: String,
+        aggregation: Option<String>,
+        unit: Unit,
+    ) -> Counter {
+        self.register_counter_inner(
+            metric.into(),
+            aggregation.map(Into::into),
+            unit,
             Sparsity::Inherit,
         )
     }
@@ -230,6 +255,7 @@ impl Registry {
         &self,
         metric: Arc<str>,
         aggregation: Option<Arc<str>>,
+        unit: Unit,
         sparsity: Sparsity,
     ) -> Counter {
         let metric = self.prefixed_name(metric);
@@ -243,12 +269,20 @@ impl Registry {
                 aggregation: aggregation.clone(),
             })
             .or_insert_with(|| MetricEntry {
-                value: MetricValue::Counter(Counter::new(inner.counters.clone())),
+                value: MetricValue::Counter(Counter::new(inner.counters.clone(), unit)),
                 sparsity,
             });
 
         assert_sparsity(entry, sparsity, &metric, &aggregation);
         if let MetricValue::Counter(c) = &entry.value {
+            // A repeat registration dedups to the existing counter; its unit is fixed at first
+            // registration. Guard against a conflicting unit so a metric can't be silently
+            // registered with two different display units.
+            assert_eq!(
+                c.unit(),
+                unit,
+                "counter metric name={metric:?}, aggregation={aggregation:?} already registered with a different unit"
+            );
             c.clone()
         } else {
             panic!(
@@ -502,6 +536,7 @@ impl Registry {
             aggregation: None,
             sparsity: Sparsity::Inherit,
             scale: 1.0,
+            unit: Unit::Count,
         }
     }
 
@@ -664,6 +699,7 @@ pub struct MetricBuilder<'a> {
     aggregation: Option<Arc<str>>,
     sparsity: Sparsity,
     scale: f64,
+    unit: Unit,
 }
 
 impl<'a> MetricBuilder<'a> {
@@ -676,6 +712,15 @@ impl<'a> MetricBuilder<'a> {
     /// Sets the per-metric [`Sparsity`] policy. Defaults to [`Sparsity::Inherit`].
     pub fn sparsity(mut self, sparsity: Sparsity) -> Self {
         self.sparsity = sparsity;
+        self
+    }
+
+    /// Sets the display [`Unit`] for a [`counter`](Self::counter). Defaults to [`Unit::Count`].
+    ///
+    /// Applies only to [`counter`](Self::counter); [`summary`](Self::summary) and the callback
+    /// variants take their unit as an explicit argument and ignore this.
+    pub fn unit(mut self, unit: Unit) -> Self {
+        self.unit = unit;
         self
     }
 
@@ -710,11 +755,12 @@ impl<'a> MetricBuilder<'a> {
         self
     }
 
-    /// Registers the metric as a [`Counter`].
+    /// Registers the metric as a [`Counter`] with the configured [`unit`](Self::unit) (default
+    /// [`Unit::Count`]).
     #[track_caller]
     pub fn counter(self) -> Counter {
         self.registry
-            .register_counter_inner(self.name, self.aggregation, self.sparsity)
+            .register_counter_inner(self.name, self.aggregation, self.unit, self.sparsity)
     }
 
     /// Registers the metric as a [`Summary`] with the given display unit, at the configured
@@ -1123,6 +1169,38 @@ mod test {
         assert_eq!(
             registry.take_current_metrics_line(),
             "rx.data=42,rx.decrypt_time=0 us,rx.ecn=0 Variant|ect0,rx.ecn=0 Variant|ect1"
+        );
+    }
+
+    /// A counter's display [`Unit`] flows through to both the reported querylog line and its
+    /// descriptor, while a plain (default `Unit::Count`) counter stays byte-identical.
+    #[test]
+    fn counter_unit_surfaces_in_report_and_descriptor() {
+        let registry = Registry::new();
+        let count = registry.register_counter("rx.pkts".into(), None);
+        let bytes = registry.register_counter_with_unit("rx.bytes".into(), None, Unit::Byte);
+
+        count.increment(3);
+        bytes.increment(1500);
+
+        // Descriptors report each counter's real unit (not a hardcoded `Count`).
+        let shapes: Vec<_> = registry
+            .descriptors()
+            .iter()
+            .map(|d| (d.name.to_string(), d.kind, d.unit))
+            .collect();
+        assert_eq!(
+            shapes,
+            vec![
+                ("rx.bytes".to_string(), MetricKind::Counter, Unit::Byte),
+                ("rx.pkts".to_string(), MetricKind::Counter, Unit::Count),
+            ]
+        );
+
+        // The querylog line renders the byte suffix but leaves the plain counter bare.
+        assert_eq!(
+            registry.take_current_metrics_line(),
+            "rx.bytes=1500 B,rx.pkts=3"
         );
     }
 
