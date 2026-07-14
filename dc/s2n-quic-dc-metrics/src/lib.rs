@@ -6,6 +6,7 @@ mod appender;
 mod bool_counter;
 mod callback;
 mod counter;
+mod gauge;
 mod registry;
 mod rseq;
 mod runtime;
@@ -22,6 +23,7 @@ pub use backend::{
 };
 pub use bool_counter::BoolCounter;
 pub use counter::Counter;
+pub use gauge::Gauge;
 pub use registry::{MetricBuilder, MetricDescriptor, Registry};
 pub use summary::Summary;
 

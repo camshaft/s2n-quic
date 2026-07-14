@@ -88,13 +88,13 @@ impl Backend for QuerylogBackend {
     }
 
     fn record_gauge(&mut self, info: &MetricInfo<'_>, value: i64) {
-        // Today no metric reports through here — gauges flow through the callback path — so this is
-        // forward-looking. Honor the metric's sparse policy: drop a zero unless the metric (or the
-        // report) opts into emitting it.
+        // Honor the metric's sparse policy: drop a zero unless the metric (or the report) opts into
+        // emitting it.
         if value == 0 && !info.emit_zero(self.include_sparse) {
             return;
         }
-        write!(self.begin_entry(info), "{value}").unwrap();
+        let unit = info.unit.pmet_str();
+        write!(self.begin_entry(info), "{value}{unit}").unwrap();
         self.finish_entry(info);
     }
 
@@ -261,5 +261,18 @@ mod test {
         b.report_start(&ReportOptions::new(false));
         b.record_gauge(&suppressed, 7);
         assert_eq!(b.line(), "g=7");
+    }
+
+    /// A byte-unit gauge renders the ` B` suffix on the querylog line, matching the callback path
+    /// (so a gauge migrated off callbacks stays byte-identical).
+    #[test]
+    fn gauge_emits_unit_suffix() {
+        let name: Arc<str> = Arc::from("mem");
+        let info = MetricInfo::new(&name, None, crate::Unit::Byte, MetricKind::Gauge);
+
+        let mut b = QuerylogBackend::new();
+        b.report_start(&ReportOptions::new(false));
+        b.record_gauge(&info, 4096);
+        assert_eq!(b.line(), "mem=4096 B");
     }
 }

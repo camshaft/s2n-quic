@@ -483,6 +483,27 @@ mod test {
         );
     }
 
+    /// A gauge value above the `u64::MAX/1e6` float ceiling reaches statsd as the exact integer
+    /// `{value}|g`, reported through a real `Registry`. A value routed through the callback path
+    /// would instead be summed to f64 and `Trimmed` into the constant 18446744073709.551615.
+    #[test]
+    fn native_gauge_emits_exact_large_integer() {
+        let registry = crate::Registry::new();
+        let gauge = registry.register_gauge("queue_depth".into(), None, Unit::Count);
+        gauge.set(1_783_972_929_737_661_674);
+
+        let sink = CaptureSink::default();
+        let mut backend = StatsdBackend::new(sink.clone(), None);
+        registry.report(&mut backend);
+
+        assert!(
+            sink.lines()
+                .contains(&"queue_depth:1783972929737661674|g".to_string()),
+            "got: {:?}",
+            sink.lines()
+        );
+    }
+
     /// A counter's unit is metadata: statsd doesn't render it. A `Unit::Byte` counter emits the same
     /// `:{value}|c` line as a plain counter, with no spurious `|#variant:` tag (units are not
     /// variants). This is the "backend doesn't emit units" case.
