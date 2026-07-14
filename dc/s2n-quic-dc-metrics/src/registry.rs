@@ -9,7 +9,7 @@ use std::{
 use crate::{
     backend::{Backend, MetricInfo, MetricKind, QuerylogBackend, ReportOptions, Sparsity},
     rseq::Channels,
-    BoolCounter, Counter, Summary, Unit,
+    BoolCounter, Counter, Gauge, Summary, Unit,
 };
 
 /// A `Registry` allows registering metrics for emission and can be asked to periodically emit
@@ -75,6 +75,10 @@ impl RegistryInner {
                     let unit = c.unit();
                     c.report(&info(unit, MetricKind::Counter), backend);
                 }
+                MetricValue::Gauge(g) => {
+                    let unit = g.unit();
+                    g.report(&info(unit, MetricKind::Gauge), backend);
+                }
                 MetricValue::Summary(s) => {
                     let unit = s.display_unit();
                     s.report(&info(unit, MetricKind::Histogram), backend);
@@ -105,6 +109,7 @@ impl RegistryInner {
             .map(|(key, entry)| {
                 let (kind, unit) = match &entry.value {
                     MetricValue::Counter(c) => (MetricKind::Counter, c.unit()),
+                    MetricValue::Gauge(g) => (MetricKind::Gauge, g.unit()),
                     MetricValue::Summary(s) => (MetricKind::Histogram, s.display_unit()),
                     MetricValue::BoolCounter(_) => (MetricKind::BoolCounter, Unit::Count),
                     MetricValue::ValueList(c) => (MetricKind::CallbackScalar, c.unit()),
@@ -287,6 +292,62 @@ impl Registry {
         } else {
             panic!(
                 "Non-counter metric name={metric:?}, aggregation={aggregation:?} already registered"
+            )
+        }
+    }
+
+    /// Registers a given metric (name, aggregation) with the recorder as a [`Gauge`].
+    ///
+    /// A gauge is a last-write-wins level reported as an exact `i64` (no float conversion), for
+    /// values that are set rather than accumulated (queue depth, a timestamp marker, a byte size).
+    /// This dedups on repeat calls; prefer to call once and reuse the returned handle.
+    #[track_caller]
+    pub fn register_gauge(&self, metric: String, aggregation: Option<String>, unit: Unit) -> Gauge {
+        self.register_gauge_inner(
+            metric.into(),
+            aggregation.map(Into::into),
+            unit,
+            Sparsity::Inherit,
+        )
+    }
+
+    #[track_caller]
+    fn register_gauge_inner(
+        &self,
+        metric: Arc<str>,
+        aggregation: Option<Arc<str>>,
+        unit: Unit,
+        sparsity: Sparsity,
+    ) -> Gauge {
+        let metric = self.prefixed_name(metric);
+        let mut inner = self.inner.lock().unwrap();
+        let inner = &mut *inner;
+
+        let entry = inner
+            .metrics
+            .entry(MetricKey {
+                name: metric.clone(),
+                aggregation: aggregation.clone(),
+            })
+            .or_insert_with(|| MetricEntry {
+                value: MetricValue::Gauge(Gauge::new(unit)),
+                sparsity,
+            });
+
+        assert_sparsity(entry, sparsity, &metric, &aggregation);
+        if let MetricValue::Gauge(g) = &entry.value {
+            // A repeat registration dedups to the existing gauge; its unit is fixed at first
+            // registration. Guard against a conflicting unit so a metric can't be silently
+            // registered with two different display units.
+            assert_eq!(
+                g.unit(),
+                unit,
+                "gauge metric name={metric:?}, aggregation={aggregation:?} already registered with a different unit"
+            );
+            g.clone()
+        } else {
+            panic!(
+                "Non-gauge metric name={metric:?}, aggregation={aggregation:?} already registered"
             )
         }
     }
@@ -763,6 +824,13 @@ impl<'a> MetricBuilder<'a> {
             .register_counter_inner(self.name, self.aggregation, self.unit, self.sparsity)
     }
 
+    /// Registers the metric as a [`Gauge`] with the given display unit.
+    #[track_caller]
+    pub fn gauge(self, unit: Unit) -> Gauge {
+        self.registry
+            .register_gauge_inner(self.name, self.aggregation, unit, self.sparsity)
+    }
+
     /// Registers the metric as a [`Summary`] with the given display unit, at the configured
     /// [`scale`](Self::scale) (default `1.0`).
     #[track_caller]
@@ -876,6 +944,7 @@ fn assert_sparsity(
 /// (FIXME: rename this to something else?)
 enum MetricValue {
     Counter(Counter),
+    Gauge(Gauge),
     Summary(Summary),
     BoolCounter(BoolCounter),
     ValueList(Box<dyn crate::callback::ValueList + Send>),
@@ -884,6 +953,36 @@ enum MetricValue {
 #[cfg(test)]
 mod test {
     use super::*;
+
+    /// A native gauge: repeat registration dedups to the same handle (last-write-wins), gauges are
+    /// live (not drained at report), and the per-metric sparsity governs zero emission — a dense
+    /// gauge emits its zero under a non-sparse report while a plain (Inherit) one is dropped.
+    #[test]
+    fn native_gauge_dedups_and_reports() {
+        let registry = Registry::new();
+
+        // Repeat registration returns a handle to the same underlying atomic.
+        let g1 = registry.register_gauge("depth".into(), None, Unit::Count);
+        let g2 = registry.register_gauge("depth".into(), None, Unit::Count);
+        g1.set(3);
+        g2.set(9); // last write wins
+        assert_eq!(registry.take_current_metrics_line(), "depth=9");
+
+        // Gauges are live readings, not drained: the value persists until the next `set`, so we set
+        // it to zero explicitly rather than expecting the prior report to have zeroed it.
+        g2.set(0);
+
+        // A dense gauge emits its zero even under a non-sparse report; the plain (Inherit) `depth`
+        // zero is dropped.
+        let dense = registry.metric("mem").dense().gauge(Unit::Count);
+        dense.set(0);
+        assert_eq!(
+            registry
+                .try_take_current_metrics_line_sparse(false)
+                .unwrap(),
+            "mem=0"
+        );
+    }
 
     /// Golden snapshot covering one of every metric kind plus the structural conventions (queue
     /// enq/drain/depth, nominal variant aggregation). This locks the exact querylog line format
