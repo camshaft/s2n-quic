@@ -64,13 +64,22 @@ impl RegistryInner {
         for (key, entry) in self.metrics.iter_mut() {
             let name = &key.name;
             let aggregation = key.aggregation.as_ref();
-            let sparsity = entry.sparsity;
+            // Destructure into disjoint field borrows so the metadata (sparsity, tags) can be read
+            // alongside the mutable `value` borrow the drain needs, without cloning the tag Arc.
+            let MetricEntry {
+                value,
+                sparsity,
+                tags,
+            } = entry;
+            let sparsity = *sparsity;
+            let tags = crate::MetricTags::new(tags);
             let info = |unit, kind| {
                 let mut info = MetricInfo::new(name, aggregation, unit, kind);
                 info.sparsity = sparsity;
+                info.tags = tags;
                 info
             };
-            match &mut entry.value {
+            match value {
                 MetricValue::Counter(c) => {
                     let unit = c.unit();
                     c.report(&info(unit, MetricKind::Counter), backend);
@@ -120,6 +129,7 @@ impl RegistryInner {
                     kind,
                     unit,
                     sparsity: entry.sparsity,
+                    tags: entry.tags.clone(),
                 }
             })
             .collect()
@@ -229,6 +239,7 @@ impl Registry {
             aggregation.map(Into::into),
             Unit::Count,
             Sparsity::Inherit,
+            crate::tags::empty_metric_tag_set(),
         )
     }
 
@@ -252,6 +263,7 @@ impl Registry {
             aggregation.map(Into::into),
             unit,
             Sparsity::Inherit,
+            crate::tags::empty_metric_tag_set(),
         )
     }
 
@@ -262,6 +274,7 @@ impl Registry {
         aggregation: Option<Arc<str>>,
         unit: Unit,
         sparsity: Sparsity,
+        tags: crate::MetricTagSet,
     ) -> Counter {
         let metric = self.prefixed_name(metric);
         let mut inner = self.inner.lock().unwrap();
@@ -276,9 +289,10 @@ impl Registry {
             .or_insert_with(|| MetricEntry {
                 value: MetricValue::Counter(Counter::new(inner.counters.clone(), unit)),
                 sparsity,
+                tags: tags.clone(),
             });
 
-        assert_sparsity(entry, sparsity, &metric, &aggregation);
+        assert_metadata(entry, sparsity, &tags, &metric, &aggregation);
         if let MetricValue::Counter(c) = &entry.value {
             // A repeat registration dedups to the existing counter; its unit is fixed at first
             // registration. Guard against a conflicting unit so a metric can't be silently
@@ -308,6 +322,7 @@ impl Registry {
             aggregation.map(Into::into),
             unit,
             Sparsity::Inherit,
+            crate::tags::empty_metric_tag_set(),
         )
     }
 
@@ -318,6 +333,7 @@ impl Registry {
         aggregation: Option<Arc<str>>,
         unit: Unit,
         sparsity: Sparsity,
+        tags: crate::MetricTagSet,
     ) -> Gauge {
         let metric = self.prefixed_name(metric);
         let mut inner = self.inner.lock().unwrap();
@@ -332,9 +348,10 @@ impl Registry {
             .or_insert_with(|| MetricEntry {
                 value: MetricValue::Gauge(Gauge::new(unit)),
                 sparsity,
+                tags: tags.clone(),
             });
 
-        assert_sparsity(entry, sparsity, &metric, &aggregation);
+        assert_metadata(entry, sparsity, &tags, &metric, &aggregation);
         if let MetricValue::Gauge(g) = &entry.value {
             // A repeat registration dedups to the existing gauge; its unit is fixed at first
             // registration. Guard against a conflicting unit so a metric can't be silently
@@ -373,6 +390,7 @@ impl Registry {
             display_unit,
             Sparsity::Inherit,
             1.0,
+            crate::tags::empty_metric_tag_set(),
         )
     }
 
@@ -384,6 +402,7 @@ impl Registry {
         display_unit: Unit,
         sparsity: Sparsity,
         scale: f64,
+        tags: crate::MetricTagSet,
     ) -> Summary {
         let metric = self.prefixed_name(metric);
         let mut inner = self.inner.lock().unwrap();
@@ -402,9 +421,10 @@ impl Registry {
                     scale,
                 )),
                 sparsity,
+                tags: tags.clone(),
             });
 
-        assert_sparsity(entry, sparsity, &metric, &aggregation);
+        assert_metadata(entry, sparsity, &tags, &metric, &aggregation);
         if let MetricValue::Summary(s) = &entry.value {
             // A repeat registration dedups to the existing summary; its scale is fixed at first
             // registration. Guard against a conflicting scale so a metric can't be silently
@@ -432,6 +452,7 @@ impl Registry {
             metric.into(),
             aggregation.map(Into::into),
             Sparsity::Inherit,
+            crate::tags::empty_metric_tag_set(),
         )
     }
 
@@ -441,6 +462,7 @@ impl Registry {
         metric: Arc<str>,
         aggregation: Option<Arc<str>>,
         sparsity: Sparsity,
+        tags: crate::MetricTagSet,
     ) -> BoolCounter {
         let metric = self.prefixed_name(metric);
         let mut inner = self.inner.lock().unwrap();
@@ -455,9 +477,10 @@ impl Registry {
             .or_insert_with(|| MetricEntry {
                 value: MetricValue::BoolCounter(BoolCounter::new(inner.counters.clone())),
                 sparsity,
+                tags: tags.clone(),
             });
 
-        assert_sparsity(entry, sparsity, &metric, &aggregation);
+        assert_metadata(entry, sparsity, &tags, &metric, &aggregation);
         if let MetricValue::BoolCounter(b) = &entry.value {
             b.clone()
         } else {
@@ -499,6 +522,7 @@ impl Registry {
             aggregation.map(Into::into),
             unit,
             Sparsity::AlwaysDense,
+            crate::tags::empty_metric_tag_set(),
             callback,
         );
     }
@@ -521,6 +545,7 @@ impl Registry {
             aggregation.map(Into::into),
             unit,
             Sparsity::AlwaysSparse,
+            crate::tags::empty_metric_tag_set(),
             callback,
         );
     }
@@ -532,6 +557,7 @@ impl Registry {
         aggregation: Option<Arc<str>>,
         unit: Unit,
         sparsity: Sparsity,
+        tags: crate::MetricTagSet,
         callback: F,
     ) where
         V: crate::backend::CallbackValue,
@@ -553,6 +579,7 @@ impl Registry {
                         unit,
                     })),
                     sparsity,
+                    tags,
                 });
             }
             std::collections::btree_map::Entry::Occupied(mut o) => {
@@ -560,6 +587,11 @@ impl Registry {
                     o.get().sparsity,
                     sparsity,
                     "Callback metric name={metric:?}, aggregation={aggregation:?} already registered with different sparsity"
+                );
+                assert_eq!(
+                    &o.get().tags,
+                    &tags,
+                    "Callback metric name={metric:?}, aggregation={aggregation:?} already registered with different tags"
                 );
                 if let MetricValue::ValueList(previous) = &mut o.get_mut().value {
                     if let Some(previous) = previous
@@ -598,6 +630,7 @@ impl Registry {
             sparsity: Sparsity::Inherit,
             scale: 1.0,
             unit: Unit::Count,
+            tags: Vec::new(),
         }
     }
 
@@ -761,12 +794,26 @@ pub struct MetricBuilder<'a> {
     sparsity: Sparsity,
     scale: f64,
     unit: Unit,
+    /// Accumulated [metadata tags](crate::MetricTags); finalized into a sorted
+    /// [`MetricTagSet`](crate::MetricTagSet) by the terminal method.
+    tags: Vec<(Arc<str>, Arc<str>)>,
 }
 
 impl<'a> MetricBuilder<'a> {
     /// Sets the aggregation/variant string (e.g. `Variant|ect0`).
     pub fn aggregation(mut self, aggregation: impl Into<Arc<str>>) -> Self {
         self.aggregation = Some(aggregation.into());
+        self
+    }
+
+    /// Attaches a `(key, value)` [metadata tag](crate::MetricTags) to the metric (repeatable).
+    ///
+    /// Tags are metadata a filtering policy matches on to route/filter/collapse — e.g.
+    /// `.tag("level", "debug")`. They are **not** emitted by existing backends and are distinct
+    /// from the [`aggregation`](Self::aggregation) wire dimension, so they add no cardinality.
+    /// Setting the same key twice keeps the last value.
+    pub fn tag(mut self, key: impl Into<Arc<str>>, value: impl Into<Arc<str>>) -> Self {
+        self.tags.push((key.into(), value.into()));
         self
     }
 
@@ -816,39 +863,59 @@ impl<'a> MetricBuilder<'a> {
         self
     }
 
+    /// Finalizes the accumulated builder tags into a [`MetricTagSet`](crate::MetricTagSet),
+    /// returning the shared empty set for the common untagged builder (no per-metric allocation).
+    fn finish_tags(tags: Vec<(Arc<str>, Arc<str>)>) -> crate::MetricTagSet {
+        if tags.is_empty() {
+            crate::tags::empty_metric_tag_set()
+        } else {
+            crate::tags::metric_tag_set(tags)
+        }
+    }
+
     /// Registers the metric as a [`Counter`] with the configured [`unit`](Self::unit) (default
     /// [`Unit::Count`]).
     #[track_caller]
     pub fn counter(self) -> Counter {
-        self.registry
-            .register_counter_inner(self.name, self.aggregation, self.unit, self.sparsity)
+        let tags = Self::finish_tags(self.tags);
+        self.registry.register_counter_inner(
+            self.name,
+            self.aggregation,
+            self.unit,
+            self.sparsity,
+            tags,
+        )
     }
 
     /// Registers the metric as a [`Gauge`] with the given display unit.
     #[track_caller]
     pub fn gauge(self, unit: Unit) -> Gauge {
+        let tags = Self::finish_tags(self.tags);
         self.registry
-            .register_gauge_inner(self.name, self.aggregation, unit, self.sparsity)
+            .register_gauge_inner(self.name, self.aggregation, unit, self.sparsity, tags)
     }
 
     /// Registers the metric as a [`Summary`] with the given display unit, at the configured
     /// [`scale`](Self::scale) (default `1.0`).
     #[track_caller]
     pub fn summary(self, display_unit: Unit) -> Summary {
+        let tags = Self::finish_tags(self.tags);
         self.registry.register_summary_inner(
             self.name,
             self.aggregation,
             display_unit,
             self.sparsity,
             self.scale,
+            tags,
         )
     }
 
     /// Registers the metric as a [`BoolCounter`].
     #[track_caller]
     pub fn bool(self) -> BoolCounter {
+        let tags = Self::finish_tags(self.tags);
         self.registry
-            .register_bool_inner(self.name, self.aggregation, self.sparsity)
+            .register_bool_inner(self.name, self.aggregation, self.sparsity, tags)
     }
 
     /// Registers the metric as a callback list (see [`Registry::register_list_callback`]).
@@ -858,11 +925,13 @@ impl<'a> MetricBuilder<'a> {
         V: crate::backend::CallbackValue,
         F: FnMut() -> V + 'static + Send,
     {
+        let tags = Self::finish_tags(self.tags);
         self.registry.register_list_callback_inner(
             self.name,
             self.aggregation,
             unit,
             self.sparsity,
+            tags,
             callback,
         );
     }
@@ -891,6 +960,10 @@ pub struct MetricDescriptor {
     pub unit: Unit,
     /// The per-metric sparse policy.
     pub sparsity: Sparsity,
+    /// The metric's [metadata tags](crate::MetricTags) — the same `(key, value)` pairs a backend
+    /// sees on [`MetricInfo::tags`](crate::MetricInfo), so a catalog/validation consumer sees what a
+    /// filtering policy would match on. Empty for an untagged metric.
+    pub tags: crate::MetricTagSet,
 }
 
 impl MetricDescriptor {
@@ -915,26 +988,37 @@ struct MetricKey {
     aggregation: Option<Arc<str>>,
 }
 
-/// A registered metric: its accumulating value plus the per-metric sparse policy applied to it at
-/// report time. The `sparsity` is fixed at first registration (subsequent registrations under the
-/// same key dedup to the existing entry and keep the original policy).
+/// A registered metric: its accumulating value plus per-metric metadata applied at report time.
+/// The `sparsity` and `tags` are fixed at first registration (subsequent registrations under the
+/// same key dedup to the existing entry and keep the original metadata).
+///
+/// `tags` are the metric's [metadata tags](crate::MetricTags) — `(key, value)` pairs a filtering
+/// policy matches on — and are deliberately **not** part of [`MetricKey`]: they do not affect dedup
+/// identity, storage, or report ordering. Empty (a zero-length shared slice) for the common
+/// untagged metric.
 struct MetricEntry {
     value: MetricValue,
     sparsity: Sparsity,
+    tags: crate::MetricTagSet,
 }
 
-/// Asserts a repeat registration under an existing key requested the same [`Sparsity`], so a metric
-/// can't be silently registered with two conflicting policies.
+/// Asserts a repeat registration under an existing key requested the same [`Sparsity`] and tag set,
+/// so a metric can't be silently registered with two conflicting sets of metadata.
 #[track_caller]
-fn assert_sparsity(
+fn assert_metadata(
     entry: &MetricEntry,
     sparsity: Sparsity,
+    tags: &crate::MetricTagSet,
     metric: &Arc<str>,
     aggregation: &Option<Arc<str>>,
 ) {
     assert_eq!(
         entry.sparsity, sparsity,
         "metric name={metric:?}, aggregation={aggregation:?} already registered with different sparsity"
+    );
+    assert_eq!(
+        &entry.tags, tags,
+        "metric name={metric:?}, aggregation={aggregation:?} already registered with different tags"
     );
 }
 
@@ -1301,6 +1385,85 @@ mod test {
             registry.take_current_metrics_line(),
             "rx.bytes=1500 B,rx.pkts=3"
         );
+    }
+
+    /// A metric's [metadata tags](crate::MetricTags) set via the builder flow through to the
+    /// `MetricInfo` a backend sees at report time, sorted by key — but are **not** rendered on the
+    /// querylog line (they are metadata, distinct from the emitted aggregation), so output stays
+    /// byte-identical to an untagged metric.
+    #[test]
+    fn metric_tags_reach_backend_but_are_not_emitted() {
+        use crate::backend::{Backend, CallbackValue, Histogram, MetricInfo, ReportOptions};
+
+        // Captures the tags observed for each recorded counter name.
+        #[derive(Default)]
+        struct TagCapture {
+            seen: Vec<(String, Vec<(String, String)>)>,
+        }
+        impl Backend for TagCapture {
+            fn record_counter(&mut self, info: &MetricInfo<'_>, _value: u64) {
+                let tags = info
+                    .tags
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect();
+                self.seen.push((info.name.to_string(), tags));
+            }
+            fn record_gauge(&mut self, _: &MetricInfo<'_>, _: i64) {}
+            fn record_bool(&mut self, _: &MetricInfo<'_>, _: u64, _: u64) {}
+            fn record_histogram(&mut self, _: &MetricInfo<'_>, _: Histogram<'_>) {}
+            fn record_callback(&mut self, _: &MetricInfo<'_>, _: &[&dyn CallbackValue]) {}
+        }
+
+        let registry = Registry::new();
+        let tagged = registry
+            .metric("rx.data")
+            .tag("level", "debug")
+            .tag("component", "tx")
+            .counter();
+        let untagged = registry.register_counter("rx.other".into(), None);
+        tagged.increment(5);
+        untagged.increment(9);
+
+        let mut capture = TagCapture::default();
+        registry.report_with(&ReportOptions::new(false), &mut capture);
+
+        // The tagged metric's tags reach the backend, sorted by key; the untagged one is empty.
+        assert_eq!(
+            capture.seen,
+            vec![
+                (
+                    "rx.data".to_string(),
+                    vec![
+                        ("component".to_string(), "tx".to_string()),
+                        ("level".to_string(), "debug".to_string()),
+                    ]
+                ),
+                ("rx.other".to_string(), vec![]),
+            ]
+        );
+
+        // Tags do not appear on the querylog line — byte-identical to plain counters.
+        let tagged2 = registry
+            .metric("rx.data")
+            .tag("level", "debug")
+            .tag("component", "tx")
+            .counter();
+        tagged2.increment(5);
+        registry
+            .register_counter("rx.other".into(), None)
+            .increment(9);
+        assert_eq!(registry.take_current_metrics_line(), "rx.data=5,rx.other=9");
+    }
+
+    /// Registering the same metric key twice with a conflicting tag set is a programming error,
+    /// mirroring the sparsity/unit guards.
+    #[test]
+    #[should_panic(expected = "different tags")]
+    fn conflicting_tags_panics() {
+        let registry = Registry::new();
+        registry.metric("a").tag("level", "debug").counter();
+        registry.metric("a").tag("level", "info").counter();
     }
 
     /// A child registry's prefix is applied to the descriptor name, exactly as it is to the emitted

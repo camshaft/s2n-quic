@@ -24,12 +24,14 @@ use std::{
 
 #[cfg(any(test, feature = "arrow"))]
 mod arrow;
+mod policy;
 mod prometheus;
 mod querylog;
 mod statsd;
 
 #[cfg(any(test, feature = "arrow"))]
 pub use arrow::{schema as arrow_schema, ArrowBackend};
+pub use policy::{Action, Filtered, Matcher, Policy};
 pub use prometheus::{PrometheusBackend, PrometheusHandle};
 pub use querylog::QuerylogBackend;
 pub use statsd::{StatsdBackend, StatsdSink, DEFAULT_MAX_PAYLOAD_SIZE};
@@ -149,7 +151,7 @@ impl Sparsity {
 }
 
 /// The kind of a metric being reported.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, PartialOrd, Ord, Hash)]
 pub enum MetricKind {
     Counter,
     Gauge,
@@ -186,10 +188,18 @@ pub struct MetricInfo<'a> {
     /// zero regardless), and [`Sparsity::AlwaysDense`] forces a zero to be emitted. Backends decide
     /// via [`Sparsity::emit_zero`].
     pub sparsity: Sparsity,
+    /// This metric's [metadata tags](crate::MetricTags) — `(key, value)` pairs attached at
+    /// registration (e.g. `level=debug`), **distinct from** the emitted [`aggregation`](Self::aggregation).
+    ///
+    /// Metadata-only: existing backends ignore this, so tags add no wire cardinality. A filtering
+    /// policy matches on them (to route/filter/collapse a metric), and a backend may opt in to
+    /// emit them. Empty for the common untagged metric.
+    pub tags: crate::MetricTags<'a>,
 }
 
 impl<'a> MetricInfo<'a> {
-    /// Constructs a `MetricInfo`, defaulting `sparsity` to [`Sparsity::Inherit`].
+    /// Constructs a `MetricInfo`, defaulting `sparsity` to [`Sparsity::Inherit`] and carrying no
+    /// [metadata tags](crate::MetricTags).
     pub fn new(
         name: &'a Arc<str>,
         aggregation: Option<&'a Arc<str>>,
@@ -202,6 +212,7 @@ impl<'a> MetricInfo<'a> {
             unit,
             kind,
             sparsity: Sparsity::Inherit,
+            tags: crate::MetricTags::empty(),
         }
     }
 
@@ -211,6 +222,21 @@ impl<'a> MetricInfo<'a> {
     #[inline]
     pub fn emit_zero(&self, include_sparse: bool) -> bool {
         self.sparsity.emit_zero(include_sparse)
+    }
+
+    /// This metric's *emitted* [`aggregation`](Self::aggregation) parsed into structured
+    /// [`AggregationTags`](crate::AggregationTags).
+    ///
+    /// The aggregation string is the raw `key|value` convention (`Variant|ect0`, `worker|send.5`,
+    /// or a bare keyless `send.5`); this exposes its individual `(key, value)` dimensions without a
+    /// backend having to re-implement the split. Parsing is borrowed and allocation-free. A metric
+    /// with no aggregation yields empty tags.
+    ///
+    /// Distinct from the [`tags`](Self::tags) metadata field: this parses the wire dimension, while
+    /// `tags` are registration metadata a policy matches on.
+    #[inline]
+    pub fn aggregation_tags(&self) -> crate::AggregationTags<'a> {
+        crate::AggregationTags::parse(self.aggregation.map(|a| a.as_ref()).unwrap_or(""))
     }
 }
 
@@ -262,6 +288,18 @@ impl<'a> Histogram<'a> {
     /// The total number of recorded samples.
     pub fn count(&self) -> u64 {
         self.buckets.iter().sum()
+    }
+
+    /// The raw per-bucket sample counts, in bucket-index order.
+    ///
+    /// This is the fixed-layout array underlying the view. Its length is the summary's total bucket
+    /// count (every summary shares [`crate::summary::CONFIG`]), so two histograms have identical
+    /// bucket layouts and can be summed element-wise. Exposed so an in-crate consumer that merges
+    /// several distributions (e.g. collapsing a per-worker histogram across workers) can sum the
+    /// arrays, then re-emit via [`Histogram::new`] with `crate::summary::CONFIG`. Lossless — no
+    /// quantile approximation.
+    pub(crate) fn raw_buckets(&self) -> &'a [u64] {
+        self.buckets
     }
 
     /// Iterates the non-empty buckets as `(representative_value, count)` pairs.

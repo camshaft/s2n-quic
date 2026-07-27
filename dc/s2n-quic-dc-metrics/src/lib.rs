@@ -11,6 +11,7 @@ mod registry;
 mod rseq;
 mod runtime;
 mod summary;
+mod tags;
 mod task;
 
 pub mod backend;
@@ -26,10 +27,11 @@ pub use counter::Counter;
 pub use gauge::Gauge;
 pub use registry::{MetricBuilder, MetricDescriptor, Registry};
 pub use summary::Summary;
+pub use tags::{AggregationTag, AggregationTags, MetricTagSet, MetricTags};
 
 pub use runtime::TaskMonitor;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, PartialOrd, Ord, Hash)]
 pub enum Unit {
     Count,
     Microsecond,
