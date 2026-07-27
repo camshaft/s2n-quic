@@ -128,7 +128,7 @@ impl Leaf {
     }
 }
 
-/// A predicate tree selecting the metrics a [`Rule`] applies to.
+/// A predicate tree selecting the metrics a [`Policy`] rule applies to.
 ///
 /// Built from leaf constructors ([`always`](Self::always), name
 /// [`name`](Self::name)/[`prefix`](Self::prefix)/[`glob`](Self::glob), tag
@@ -336,7 +336,7 @@ struct Rule {
 ///
 /// The highest-priority matching rule's [`Action`] applies (ties broken by later declaration), and
 /// an unmatched metric passes through unchanged. Convenience constructors default each rule's
-/// priority from its matcher shape (see the [module docs](self)); use
+/// priority from its matcher shape (see the module docs); use
 /// [`rule_with_priority`](Self::rule_with_priority) to pin it. Cloning a `Policy` copies its rule
 /// vector (each matcher's leaf strings are `Arc`, refcount-bumped; the tree nodes are copied) —
 /// cheap for typical rule counts, and a policy is normally built once and moved into a backend.
@@ -351,8 +351,11 @@ impl Policy {
         Policy::default()
     }
 
-    /// Adds a rule parsed from a text expression (see the [DSL grammar](dsl)), e.g.
+    /// Adds a rule parsed from a text expression, e.g.
     /// `"collapse worker where name ^= 'send.' and level = debug"`.
+    ///
+    /// The grammar is `<keep | drop | collapse KEY> [ where PREDICATE ]`, where `PREDICATE` combines
+    /// `name`/tag/`agg.KEY` leaves with `and`/`or`/`not` and parentheses.
     ///
     /// This is the config-file entry point: a deployment reads rule strings from TOML/JSON and adds
     /// them here. Priority is derived from the matcher shape, as with [`rule`](Self::rule).
@@ -372,11 +375,13 @@ impl Policy {
         let mut policy = Policy::new();
         for expr in exprs {
             let expr = expr.as_ref();
-            let trimmed = expr.trim();
+            // Trim only to decide blank/comment; parse the ORIGINAL string so a `ParsePolicyError`
+            // position still refers to an offset in the caller's line (the lexer skips whitespace).
+            let trimmed = expr.trim_start();
             if trimmed.is_empty() || trimmed.starts_with('#') {
                 continue;
             }
-            policy = policy.rule_expr(trimmed)?;
+            policy = policy.rule_expr(expr)?;
         }
         Ok(policy)
     }

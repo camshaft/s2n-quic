@@ -467,6 +467,10 @@ impl<'a> Parser<'a> {
             return self.err("expected `(` after `in`");
         }
         self.bump();
+        // Reject the empty list up front: after `(`, a `)` means no values were given.
+        if matches!(self.peek(), Some(Tok::RParen)) {
+            return self.err("`in (...)` needs at least one value");
+        }
         let mut values = Vec::new();
         loop {
             values.push(self.parse_value_word("a value")?);
@@ -480,9 +484,6 @@ impl<'a> Parser<'a> {
                 }
                 _ => return self.err("expected `,` or `)` in value list"),
             }
-        }
-        if values.is_empty() {
-            return self.err("`in (...)` needs at least one value");
         }
         Ok(values)
     }
@@ -763,6 +764,23 @@ mod test {
         // Trailing junk.
         let e = super::parse_rule("keep extra").unwrap_err();
         assert!(e.message.contains("trailing"), "{}", e.message);
+
+        // An empty `in ()` reports the intended message (not a generic "expected a value").
+        let e = super::parse_rule("drop where level in ()").unwrap_err();
+        assert!(e.message.contains("at least one value"), "{}", e.message);
+    }
+
+    /// `from_exprs` parses the original (untrimmed) expression, so an error position refers to an
+    /// offset in the caller's line, not a trimmed copy.
+    #[test]
+    fn from_exprs_error_position_is_in_original_line() {
+        // Leading whitespace + an error after it. The bad `=` operand (`and`, reserved) sits at a
+        // position that only lines up if the original, un-trimmed string was parsed.
+        let src = "    drop where name = and";
+        let err = Policy::from_exprs([src]).unwrap_err();
+        assert!(err.message.contains("reserved"), "{}", err.message);
+        // The reserved word `and` starts at byte 22 of the original (4 spaces + "drop where name = ").
+        assert_eq!(&src[err.position..], "and");
     }
 
     #[test]
