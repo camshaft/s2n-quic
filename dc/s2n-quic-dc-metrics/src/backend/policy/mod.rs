@@ -48,6 +48,9 @@ use std::{
     sync::Arc,
 };
 
+mod dsl;
+pub use dsl::ParsePolicyError;
+
 /// How a string (a metric name, or a tag value) is matched.
 #[derive(Clone, Debug)]
 enum StrMatch {
@@ -346,6 +349,41 @@ impl Policy {
     /// An empty policy: every metric passes through unchanged.
     pub fn new() -> Self {
         Policy::default()
+    }
+
+    /// Adds a rule parsed from a text expression (see the [DSL grammar](dsl)), e.g.
+    /// `"collapse worker where name ^= 'send.' and level = debug"`.
+    ///
+    /// This is the config-file entry point: a deployment reads rule strings from TOML/JSON and adds
+    /// them here. Priority is derived from the matcher shape, as with [`rule`](Self::rule).
+    pub fn rule_expr(self, expr: impl AsRef<str>) -> Result<Self, ParsePolicyError> {
+        let (matcher, action) = dsl::parse_rule(expr.as_ref())?;
+        Ok(self.rule(matcher, action))
+    }
+
+    /// Builds a policy from a sequence of rule expressions (one rule per item). Blank items and
+    /// lines whose first non-whitespace character is `#` are skipped (so a config can carry
+    /// comments). See [`rule_expr`](Self::rule_expr).
+    pub fn from_exprs<I, S>(exprs: I) -> Result<Self, ParsePolicyError>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let mut policy = Policy::new();
+        for expr in exprs {
+            let expr = expr.as_ref();
+            let trimmed = expr.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                continue;
+            }
+            policy = policy.rule_expr(trimmed)?;
+        }
+        Ok(policy)
+    }
+
+    /// The number of rules in this policy.
+    pub fn rule_count(&self) -> usize {
+        self.rules.len()
     }
 
     /// Adds a rule pairing `matcher` with `action`, with a priority defaulted from the matcher's
