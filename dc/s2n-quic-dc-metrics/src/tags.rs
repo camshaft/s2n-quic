@@ -229,8 +229,15 @@ impl<'a> MetricTags<'a> {
     }
 
     /// Clones this borrowed view into an owned [`MetricTagSet`] (the pairs are already sorted).
+    ///
+    /// The common untagged case returns the shared [`empty_metric_tag_set`] (a refcount bump, no
+    /// allocation); only a non-empty view allocates.
     pub fn to_set(&self) -> MetricTagSet {
-        Arc::from(self.pairs.to_vec().into_boxed_slice())
+        if self.pairs.is_empty() {
+            empty_metric_tag_set()
+        } else {
+            Arc::from(self.pairs.to_vec().into_boxed_slice())
+        }
     }
 }
 

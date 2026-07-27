@@ -416,10 +416,17 @@ struct Shape {
 
 impl Shape {
     fn of(info: &MetricInfo<'_>, scale: f64) -> Self {
+        // Scale only distinguishes histograms; pin it to 0 for every other kind so the sentinel is
+        // uniform regardless of what a caller passes, matching the documented contract.
+        let scale_bits = if matches!(info.kind, MetricKind::Histogram) {
+            scale.to_bits()
+        } else {
+            0
+        };
         Shape {
             kind: info.kind,
             unit: info.unit,
-            scale_bits: scale.to_bits(),
+            scale_bits,
         }
     }
 }
