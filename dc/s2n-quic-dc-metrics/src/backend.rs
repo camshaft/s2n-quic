@@ -31,7 +31,7 @@ mod statsd;
 
 #[cfg(any(test, feature = "arrow"))]
 pub use arrow::{schema as arrow_schema, ArrowBackend};
-pub use policy::{Action, Filtered, Matcher, Policy};
+pub use policy::{Action, Filtered, Matcher, ParsePolicyError, Policy};
 pub use prometheus::{PrometheusBackend, PrometheusHandle};
 pub use querylog::QuerylogBackend;
 pub use statsd::{StatsdBackend, StatsdSink, DEFAULT_MAX_PAYLOAD_SIZE};

@@ -53,9 +53,8 @@ pub struct AggregationTag<'a> {
 /// A borrowed, parsed view over an aggregation string's tags.
 ///
 /// Parsing is lazy (each [`iter`](Self::iter) call re-splits the borrowed string), so constructing
-/// an `AggregationTags` and reading it allocates nothing. This is the read path; to *produce* an
-/// aggregation string from tags use [`serialize`]. Distinct from [`MetricTags`], which is the
-/// stored *metadata* on a metric — see the [module docs](self).
+/// an `AggregationTags` and reading it allocates nothing. This is the read path. Distinct from
+/// [`MetricTags`], which is the stored *metadata* on a metric — see the module docs.
 #[derive(Clone, Copy, Debug)]
 pub struct AggregationTags<'a> {
     raw: &'a str,
@@ -143,8 +142,8 @@ pub(crate) fn serialize_arc<'a>(
     serialize(tags).map(Arc::from)
 }
 
-/// The stored representation of a metric's [metadata tags](self#metric-tags): a shared, sorted
-/// slice of `(key, value)` pairs.
+/// The stored representation of a metric's metadata tags: a shared, sorted slice of
+/// `(key, value)` pairs.
 ///
 /// Shared via `Arc` so cloning a metric's tags into [`MetricInfo`](crate::MetricInfo) every report
 /// is a refcount bump, and empty (the common untagged case) allocates nothing. Kept sorted by key
@@ -180,7 +179,7 @@ where
     Arc::from(pairs.into_boxed_slice())
 }
 
-/// A borrowed view over a metric's stored [metadata tags](self#metric-tags).
+/// A borrowed view over a metric's stored metadata tags.
 ///
 /// Cheap (`Copy`) and read-only; obtained from [`MetricInfo::tags`](crate::MetricInfo). Tags are
 /// kept sorted by key.
@@ -230,8 +229,8 @@ impl<'a> MetricTags<'a> {
 
     /// Clones this borrowed view into an owned [`MetricTagSet`] (the pairs are already sorted).
     ///
-    /// The common untagged case returns the shared [`empty_metric_tag_set`] (a refcount bump, no
-    /// allocation); only a non-empty view allocates.
+    /// The common untagged case returns the shared empty set (a refcount bump, no allocation);
+    /// only a non-empty view allocates.
     pub fn to_set(&self) -> MetricTagSet {
         if self.pairs.is_empty() {
             empty_metric_tag_set()
