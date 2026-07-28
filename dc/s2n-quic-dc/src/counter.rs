@@ -3,20 +3,30 @@
 
 use crate::tracing::*;
 use core::time::Duration;
-use s2n_quic_dc_metrics::backend::{QuerylogBackend, ReportOptions, StatsdBackend, StatsdSink};
+use s2n_quic_dc_metrics::backend::{QuerylogBackend, ReportOptions};
 use std::{
     collections::HashMap,
-    net::SocketAddr,
     sync::{
         atomic::{AtomicI64, Ordering},
         Arc, Mutex,
     },
     time::Instant,
 };
-use tokio::sync::mpsc;
 
 use s2n_quic_dc_metrics::Summary as RawSummary;
 pub use s2n_quic_dc_metrics::Unit;
+
+/// Builds the emitted aggregation for a nominal metric's variant.
+///
+/// Every nominal dimension is keyed as `Variant|<value>` — the single convention the querylog
+/// consumer expects, applied uniformly to semantic variants (`Variant|ect0`) and per-worker
+/// breakdowns (`Variant|send.5`) alike. Keeping one key means a downstream backend policy collapses
+/// a metric by targeting the `Variant` key, scoped by name/tag matchers; the querylog line carries a
+/// single aggregation per metric (it has no way to encode more than one). The dc-side
+/// [`MetricMetadata`] keeps the raw value for topology/trace display.
+fn variant_aggregation(variant: &str) -> String {
+    format!("Variant|{variant}")
+}
 
 /// Stable identifier for metric metadata tracked in [`Registry`].
 pub type MetricId = u64;
@@ -145,106 +155,6 @@ impl ReporterConfig {
 #[derive(Clone, Debug)]
 pub enum ReporterSink {
     Tracing,
-    StatsdUdp(StatsdUdpConfig),
-}
-
-#[derive(Clone, Debug)]
-pub struct StatsdUdpConfig {
-    pub addr: SocketAddr,
-    pub tx: mpsc::Sender<StatsdUdpPayloadBatch>,
-    pub max_payload_size: usize,
-}
-
-impl StatsdUdpConfig {
-    pub fn new(addr: SocketAddr, tx: mpsc::Sender<StatsdUdpPayloadBatch>) -> Self {
-        Self {
-            addr,
-            tx,
-            max_payload_size: s2n_quic_dc_metrics::backend::DEFAULT_MAX_PAYLOAD_SIZE,
-        }
-    }
-
-    /// Creates a `StatsdUdpConfig` and spawns a background task that sends batches over UDP.
-    ///
-    /// The task owns a single socket connected to `addr` and paces payloads using the provided
-    /// `Rate` to avoid overwhelming the local listener.
-    pub fn spawn(
-        socket: std::net::UdpSocket,
-        addr: SocketAddr,
-        queue_depth: usize,
-        rate: crate::socket::rate::Rate,
-    ) -> Self {
-        let (tx, rx) = mpsc::channel(queue_depth);
-        let config = Self::new(addr, tx);
-
-        tokio::spawn(statsd_udp_sender(socket, rx, rate));
-
-        config
-    }
-}
-
-/// `StatsdUdpConfig` is the dc-side transport for the metrics crate's
-/// [`StatsdBackend`](s2n_quic_dc_metrics::backend::StatsdBackend): it owns the bounded channel to a
-/// `Rate`-paced UDP sender task and forwards finished payload batches non-blockingly (dropping a
-/// batch if the queue is full, as before).
-impl StatsdSink for StatsdUdpConfig {
-    fn send_batch<'a>(&mut self, payloads: impl Iterator<Item = &'a str>) {
-        // The datagrams borrow the backend's buffer and the sender task runs asynchronously, so
-        // copy each into an owned payload before queuing.
-        let payloads: Vec<Vec<u8>> = payloads.map(|d| d.as_bytes().to_vec()).collect();
-        if payloads.is_empty() {
-            return;
-        }
-        let batch = StatsdUdpPayloadBatch {
-            addr: self.addr,
-            payloads,
-        };
-        match self.tx.try_send(batch) {
-            Ok(()) => {}
-            Err(mpsc::error::TrySendError::Full(_)) => {
-                warn!(addr = %self.addr, "statsd payload queue full; dropping batch");
-            }
-            Err(mpsc::error::TrySendError::Closed(_)) => {
-                warn!(addr = %self.addr, "statsd payload queue disconnected; dropping batch");
-            }
-        }
-    }
-}
-
-async fn statsd_udp_sender(
-    socket: std::net::UdpSocket,
-    mut rx: mpsc::Receiver<StatsdUdpPayloadBatch>,
-    rate: crate::socket::rate::Rate,
-) {
-    socket.set_nonblocking(true).ok();
-    let socket = match tokio::net::UdpSocket::from_std(socket) {
-        Ok(s) => s,
-        Err(e) => {
-            warn!(error = %e, "failed to convert statsd UDP socket to async");
-            return;
-        }
-    };
-
-    while let Some(batch) = rx.recv().await {
-        for payload in &batch.payloads {
-            let target_nanos = rate.nanos_for_bytes(payload.len() as u64);
-            let before = Instant::now();
-            if let Err(e) = socket.send_to(payload, batch.addr).await {
-                warn!(addr = %batch.addr, error = %e, "statsd UDP send failed");
-                break;
-            }
-            let elapsed = before.elapsed();
-            if let Some(remaining) = Duration::from_nanos(target_nanos).checked_sub(elapsed) {
-                tokio::time::sleep(remaining).await;
-            }
-        }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct StatsdUdpPayloadBatch {
-    pub addr: SocketAddr,
-    pub payloads: Vec<Vec<u8>>,
 }
 
 /// A [`Backend`](s2n_quic_dc_metrics::Backend) that emits the querylog line to tracing as
@@ -321,10 +231,6 @@ fn build_reporter_backends(config: &[ReporterSink], prefix: Option<&str>) -> Rep
         .map(|sink| -> Box<dyn s2n_quic_dc_metrics::Backend + Send> {
             match sink {
                 ReporterSink::Tracing => Box::new(TracingBackend::new(prefix.map(str::to_string))),
-                ReporterSink::StatsdUdp(cfg) => Box::new(
-                    StatsdBackend::new(cfg.clone(), prefix.map(str::to_string))
-                        .with_max_payload_size(cfg.max_payload_size),
-                ),
             }
         })
         .collect()
@@ -921,23 +827,30 @@ impl QueueGauge {
             .get(&self.key)
             .expect("queue registration metadata missing");
         let label = format!("{}.{}", registration.label, suffix);
-        let variant = match registration.variant.as_deref() {
-            Some(variant) => Some(format!("{variant}.{task_name}")),
-            None => Some(task_name.to_string()),
+        // A metric carries a single aggregation dimension. The endpoint counter takes the queue's
+        // own variant (e.g. the worker index), so it collapses together with the rest of that
+        // queue's metrics (`.enq`/`.drain`/`.depth`) under a downstream `collapse Variant`. The
+        // endpoint (sender vs receiver, and which task) is already encoded by the `.sender`/
+        // `.receiver` name suffix and kept in the endpoint metadata for display. A queue with no
+        // variant falls back to the task name as its dimension.
+        let (variant, agg) = match registration.variant.as_deref() {
+            Some(queue_variant) => (
+                queue_variant.to_string(),
+                Some(variant_aggregation(queue_variant)),
+            ),
+            None => (task_name.to_string(), Some(variant_aggregation(task_name))),
         };
         drop(registrations);
         let metric_id = self.registry.register_metric_metadata(
             &label,
-            variant.as_deref(),
+            Some(&variant),
             MetricKind::Counter,
             Some("count"),
             description,
         );
 
-        self.registry.counter_handle(
-            self.registry.inner.register_counter(label, variant),
-            metric_id,
-        )
+        self.registry
+            .counter_handle(self.registry.inner.register_counter(label, agg), metric_id)
     }
 
     pub fn sender(&self, task_name: impl core::fmt::Display) -> QueueSender {
@@ -2388,7 +2301,11 @@ impl Registry {
         let variant = variant.to_string();
         let metric_id =
             self.register_metric_metadata(&label, Some(&variant), MetricKind::Counter, None, "");
-        self.counter_handle(self.inner.register_counter(label, Some(variant)), metric_id)
+        self.counter_handle(
+            self.inner
+                .register_counter(label, Some(variant_aggregation(&variant))),
+            metric_id,
+        )
     }
 
     pub fn register_queue_gauge(&self, label: impl core::fmt::Display) -> QueueGauge {
@@ -2488,7 +2405,9 @@ impl Registry {
             return existing.clone();
         }
 
-        let variant_option = Some(variant.clone());
+        // Raw `variant` stays in the dc metadata (topology/trace display); the metrics crate records
+        // the keyed `Variant|<variant>` aggregation.
+        let variant_option = Some(variant_aggregation(&variant));
         let enqueued_id = self.register_metric_metadata(
             format!("{label}.enq"),
             Some(&variant),
@@ -2613,7 +2532,7 @@ impl Registry {
         let inner_clone = inner.clone();
         self.inner.register_list_callback_zero_suppressed(
             label,
-            Some(variant),
+            Some(variant_aggregation(&variant)),
             Unit::Count,
             move || inner_clone.load(Ordering::Relaxed),
         );
@@ -2648,7 +2567,9 @@ impl Registry {
             Self::unit_str(unit),
             "",
         );
-        let summary = self.inner.register_summary(label, Some(variant), unit);
+        let summary = self
+            .inner
+            .register_summary(label, Some(variant_aggregation(&variant)), unit);
         self.summary_handle(summary, metric_id)
     }
 
@@ -2723,8 +2644,11 @@ impl Registry {
             "",
         );
         self.timer_handle(
-            self.inner
-                .register_summary(label, Some(variant), Unit::Microsecond),
+            self.inner.register_summary(
+                label,
+                Some(variant_aggregation(&variant)),
+                Unit::Microsecond,
+            ),
             metric_id,
         )
     }
@@ -2763,14 +2687,17 @@ impl Registry {
                 .register_nominal_summary(drained_label, &variant, Unit::Count)
                 .with_description(Task::DRAINED_DESCRIPTION),
             time: self.timer_handle(
-                self.inner
-                    .register_summary(time_label, Some(variant.clone()), Unit::Microsecond),
+                self.inner.register_summary(
+                    time_label,
+                    Some(variant_aggregation(&variant)),
+                    Unit::Microsecond,
+                ),
                 time_id,
             ),
             next_poll_latency: self.timer_handle(
                 self.inner.register_summary(
                     next_poll_latency_label,
-                    Some(variant),
+                    Some(variant_aggregation(&variant)),
                     Unit::Microsecond,
                 ),
                 next_poll_latency_id,
@@ -3008,79 +2935,55 @@ where
 mod tests {
     use super::*;
 
-    /// Builds reporter backends with a statsd backend wired to a freshly-created `StatsdUdpConfig`,
-    /// returning the receiver so tests can inspect batches.
-    fn backends_with_statsd(
-        prefix: Option<&str>,
-        queue_depth: usize,
-    ) -> (ReporterBackends, mpsc::Receiver<StatsdUdpPayloadBatch>) {
-        let (tx, rx) = mpsc::channel(queue_depth);
-        let cfg = StatsdUdpConfig::new("127.0.0.1:8125".parse().unwrap(), tx);
-        let backends = build_reporter_backends(&[ReporterSink::StatsdUdp(cfg)], prefix);
-        (backends, rx)
-    }
-
+    /// Every nominal dimension is emitted as a single `Variant|<value>` aggregation on the querylog
+    /// line — the convention the querylog consumer expects for all variants — across counters,
+    /// summaries, timers, gauges, and queue-gauge/endpoint counters. dc-side metric metadata keeps
+    /// the raw value.
     #[test]
-    fn report_once_drains_destructively_into_statsd() {
-        let registry = s2n_quic_dc_metrics::Registry::new();
-        let counter = registry.register_counter("rx.data".into(), None);
-        counter.increment(7);
+    fn nominal_dimensions_emit_variant_key() {
+        let inner = s2n_quic_dc_metrics::Registry::new();
+        let registry = Registry::with_inner(inner.clone());
 
-        let (mut backends, mut rx) = backends_with_statsd(Some("svc"), 4);
-
-        report_once(&registry, false, &mut backends);
-        let batch = rx.try_recv().expect("a batch was sent");
-        let body = batch
-            .payloads
-            .iter()
-            .map(|p| String::from_utf8(p.clone()).unwrap())
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(body.contains("svc.rx.data:7|c"), "got: {body}");
-
-        // The take is destructive: the counter drained, so a second non-sparse report omits the
-        // zeroed counter, leaving nothing to send.
-        report_once(&registry, false, &mut backends);
-        assert!(rx.try_recv().is_err(), "no batch expected after drain");
-    }
-
-    #[test]
-    fn statsd_backend_drops_batch_when_queue_full() {
-        let registry = s2n_quic_dc_metrics::Registry::new();
+        // A semantic variant and a per-worker index both key as `Variant|...`.
+        registry.register_nominal("rx.ecn", "ect0").add(1);
+        registry.register_nominal("!send.lost", "send.5").add(1);
         registry
-            .register_counter("rx.data".into(), None)
-            .increment(1);
+            .register_nominal_summary("send.cwnd", "send.5", Unit::Byte)
+            .record_value(1000);
+        // A per-worker queue gauge + its endpoint counter.
+        let q = registry.register_queue_gauge_nominal("q.resolver", "send.worker.2");
+        q.enqueue(1);
+        let _sender = q.sender("task.context_resolver");
+        q.enqueue(1); // ensure the endpoint counter is exercised via a send below
+        q.sender("task.context_resolver"); // idempotent handle; drives .sender counter registration
 
-        // queue depth 1: the first report fills it, the second is dropped.
-        let (mut backends, mut rx) = backends_with_statsd(None, 1);
+        let line = inner
+            .try_take_current_metrics_line_sparse(true)
+            .expect("metrics were recorded");
 
-        report_once(&registry, true, &mut backends);
-        registry
-            .register_counter("rx.data".into(), None)
-            .increment(1);
-        report_once(&registry, true, &mut backends);
-
-        assert!(rx.try_recv().is_ok());
-        assert!(rx.try_recv().is_err());
-    }
-
-    #[test]
-    fn tracing_and_statsd_fan_out_from_one_report() {
-        let registry = s2n_quic_dc_metrics::Registry::new();
-        registry
-            .register_counter("rx.data".into(), None)
-            .increment(3);
-
-        let (tx, mut rx) = mpsc::channel(4);
-        let cfg = StatsdUdpConfig::new("127.0.0.1:8125".parse().unwrap(), tx);
-        let mut backends = build_reporter_backends(
-            &[ReporterSink::Tracing, ReporterSink::StatsdUdp(cfg)],
-            Some("svc"),
+        // Semantic + worker dimensions are both keyed `Variant|<value>` (no bare dims, no `worker|`).
+        assert!(line.contains("rx.ecn=1 Variant|ect0"), "got: {line}");
+        assert!(line.contains("!send.lost=1 Variant|send.5"), "got: {line}");
+        assert!(
+            line.contains("send.cwnd=") && line.contains("Variant|send.5"),
+            "got: {line}"
         );
-
-        // One destructive report feeds both backends; statsd receives a batch (tracing emits a log).
-        report_once(&registry, false, &mut backends);
-        assert!(rx.try_recv().is_ok());
+        assert!(
+            line.contains("q.resolver.enq=") && line.contains("Variant|send.worker.2"),
+            "got: {line}"
+        );
+        // The queue's endpoint counter carries the queue's worker variant (single dimension), so it
+        // collapses with the rest of that worker's queue metrics.
+        assert!(
+            line.contains("q.resolver.sender=") && line.contains("Variant|send.worker.2"),
+            "got: {line}"
+        );
+        // No bare (unkeyed) or `worker|`-keyed dimensions leak onto the line.
+        assert!(!line.contains("worker|"), "unexpected worker| key: {line}");
+        assert!(
+            !line.contains(" send.5") && !line.contains(" ect0,") && !line.contains(" ect0\n"),
+            "unexpected bare dimension: {line}"
+        );
     }
 
     #[test]
