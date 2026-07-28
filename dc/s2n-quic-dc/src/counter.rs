@@ -3,7 +3,6 @@
 
 use crate::tracing::*;
 use core::time::Duration;
-use s2n_quic_dc_metrics::backend::{QuerylogBackend, ReportOptions};
 use std::{
     collections::HashMap,
     sync::{
@@ -118,130 +117,34 @@ fn in_bach_sim() -> bool {
     }
 }
 
-#[derive(Clone, Debug)]
-pub enum SparseMode {
-    Never,
-    Always,
-    Once,
-    Every(u64),
-}
-
-#[derive(Clone, Debug)]
-pub struct ReporterConfig {
-    pub interval: Duration,
-    pub prefix: Option<String>,
-    pub include_sparse: bool,
-    pub sparse_mode: SparseMode,
-    pub sinks: Vec<ReporterSink>,
-    /// When `true`, OS-level networking statistics are collected from `/proc` once per interval
-    /// in the same background thread as the reporter, immediately before metrics are emitted.
-    /// Only supported on Linux; ignored on other platforms.
-    pub os_stats: bool,
-}
-
-impl ReporterConfig {
-    pub fn new(interval: Duration) -> Self {
-        Self {
-            interval,
-            prefix: None,
-            include_sparse: false,
-            sparse_mode: SparseMode::Never,
-            sinks: vec![ReporterSink::Tracing],
-            os_stats: false,
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-pub enum ReporterSink {
-    Tracing,
-}
-
-/// A [`Backend`](s2n_quic_dc_metrics::Backend) that emits the querylog line to tracing as
-/// `[METRICS]` (or `[METRICS:{prefix}]`).
+/// Spawns a background thread that periodically **drains** the metric registry's page pool without
+/// exporting anything.
 ///
-/// Wraps a reusable [`QuerylogBackend`]; the assembled line is emitted in `report_end`.
-struct TracingBackend {
-    inner: QuerylogBackend,
-    prefix: Option<String>,
-}
-
-impl TracingBackend {
-    fn new(prefix: Option<String>) -> Self {
-        Self {
-            inner: QuerylogBackend::new(),
-            prefix,
-        }
-    }
-}
-
-impl s2n_quic_dc_metrics::Backend for TracingBackend {
-    fn report_start(&mut self, options: &ReportOptions) {
-        self.inner.report_start(options);
-    }
-    fn record_counter(&mut self, info: &s2n_quic_dc_metrics::MetricInfo<'_>, value: u64) {
-        self.inner.record_counter(info, value);
-    }
-    fn record_gauge(&mut self, info: &s2n_quic_dc_metrics::MetricInfo<'_>, value: i64) {
-        self.inner.record_gauge(info, value);
-    }
-    fn record_bool(
-        &mut self,
-        info: &s2n_quic_dc_metrics::MetricInfo<'_>,
-        true_count: u64,
-        false_count: u64,
-    ) {
-        self.inner.record_bool(info, true_count, false_count);
-    }
-    fn record_histogram(
-        &mut self,
-        info: &s2n_quic_dc_metrics::MetricInfo<'_>,
-        hist: s2n_quic_dc_metrics::Histogram<'_>,
-    ) {
-        self.inner.record_histogram(info, hist);
-    }
-    fn record_callback(
-        &mut self,
-        info: &s2n_quic_dc_metrics::MetricInfo<'_>,
-        values: &[&dyn s2n_quic_dc_metrics::CallbackValue],
-    ) {
-        self.inner.record_callback(info, values);
-    }
-    fn report_end(&mut self) {
-        let raw = self.inner.line();
-        // bypass crate::tracing suppression - metrics must always be emitted
-        match self.prefix.as_deref().filter(|p| !p.is_empty()) {
-            Some(prefix) => ::tracing::info!("[METRICS:{prefix}] {raw}"),
-            None => ::tracing::info!("[METRICS] {raw}"),
-        }
-    }
-}
-
-/// The set of backends a reporter drives, held across report intervals so each retains its buffers.
+/// Recording accumulates into a per-CPU/full-page pool that only shrinks when something drives a
+/// report; with nothing draining it, the pool grows without bound (a real ~GB/min leak under load).
+/// A process that records dc metrics but installs no exporting reporter of its own (tests, ad-hoc
+/// binaries) can call this to keep the pool bounded. The drain is destructive but discards the
+/// values (reports into the no-op `()` backend), so it does not interfere with — and should not be
+/// run alongside — an exporting reporter over the same registry.
 ///
-/// A `Vec<Box<dyn Backend>>` of one entry per configured sink, in order. The generic
-/// `Vec<B>` / `Box<B>` [`Backend`] composition impls fan a single destructive `Registry::report`
-/// out to every backend, so no bespoke fan-out type is needed. Every configured sink is honored
-/// (duplicates included). [`build_reporter_backends`] constructs it from the configured sinks.
-type ReporterBackends = Vec<Box<dyn s2n_quic_dc_metrics::Backend + Send>>;
-
-fn build_reporter_backends(config: &[ReporterSink], prefix: Option<&str>) -> ReporterBackends {
-    config
-        .iter()
-        .map(|sink| -> Box<dyn s2n_quic_dc_metrics::Backend + Send> {
-            match sink {
-                ReporterSink::Tracing => Box::new(TracingBackend::new(prefix.map(str::to_string))),
+/// The loop exits when the registry is [closed](s2n_quic_dc_metrics::Registry::close). Errors
+/// spawning the thread are logged and otherwise ignored (the pool simply won't be drained).
+pub fn spawn_noop_drain_reporter(registry: &Registry, interval: Duration) {
+    let inner = registry.inner.clone();
+    if let Err(error) = std::thread::Builder::new()
+        .name("s2n-quic-dc-drain".into())
+        .spawn(move || loop {
+            std::thread::sleep(interval);
+            if !inner.is_open() {
+                break;
             }
+            // Destructive drain into the no-op backend: folds per-CPU pages back into the aggregate
+            // (bounding the pool) and discards the reported values.
+            inner.report(&mut ());
         })
-        .collect()
-}
-
-fn report_once(
-    inner: &s2n_quic_dc_metrics::Registry,
-    include_sparse: bool,
-    backends: &mut ReporterBackends,
-) {
-    inner.report_with(&ReportOptions::new(include_sparse), backends);
+    {
+        warn!(%error, "failed to spawn s2n-quic-dc drain reporter thread");
+    }
 }
 
 // ── Counter ─────────────────────────────────────────────────────────────────
@@ -2084,8 +1987,8 @@ impl Registry {
 
     /// Wraps an existing [`s2n_quic_dc_metrics::Registry`] instead of allocating a fresh one.
     ///
-    /// The `inner` registry is what a [reporter](Self::spawn_reporter_with_config) actually drains,
-    /// so an application that already owns a process-wide metrics registry can pass it here to have
+    /// The `inner` registry is what a reporter (see [`metrics`](Self::metrics)) actually drains, so
+    /// an application that already owns a process-wide metrics registry can pass it here to have
     /// this endpoint record into it — its metrics then flow through the application's existing
     /// reporter alongside everything else, rather than needing a dedicated one. The wrapper-level
     /// metadata (queue gauges, topology, metric descriptions) always starts empty; it tracks only
@@ -2109,8 +2012,8 @@ impl Registry {
     /// prefix is prepended to the metric name the backends emit (e.g. `rx.data` becomes
     /// `myapp.rx.data`), and because the child shares the parent's storage everything is reported
     /// together. Only the emitted name changes — the wrapper-level metadata and topology labels
-    /// (used for tracing and graph rendering) keep the bare names, exactly as with the existing
-    /// [reporter-level prefix](ReporterConfig::prefix), which this composes with.
+    /// (used for tracing and graph rendering) keep the bare names. This composes with any
+    /// reporter-level prefix the consumer applies when it emits the drained line.
     ///
     /// The returned handle starts with fresh wrapper-level metadata, tracking only what is
     /// registered through it (see [`with_inner`](Self::with_inner)).
@@ -2705,95 +2608,16 @@ impl Registry {
         }
     }
 
-    pub fn spawn_reporter(&self, interval: Duration) {
-        self.spawn_reporter_with_label(interval, "")
-    }
-
-    pub fn spawn_reporter_with_label(&self, interval: Duration, label: impl Into<String>) {
-        let label = label.into();
-        let mut config = ReporterConfig::new(interval);
-        if !label.is_empty() {
-            config.prefix = Some(label);
-        }
-        self.spawn_reporter_with_config(config);
-    }
-
-    pub fn spawn_reporter_with_config(&self, config: ReporterConfig) {
-        let inner = self.inner.clone();
-        let interval = config.interval;
-        let sparse_mode = config.sparse_mode.clone();
-        // Built once and held across intervals so each backend retains its buffers (the
-        // QuerylogBackend line buffer, the StatsdBackend record buffer), reaching a no-realloc
-        // steady state.
-        let mut backends = build_reporter_backends(&config.sinks, config.prefix.as_deref());
-
-        #[cfg(any(test, feature = "testing"))]
-        if bach::is_active() {
-            bach::spawn(report_loop(inner, sparse_mode, backends, move || {
-                bach::time::sleep(interval)
-            }));
-            return;
-        }
-
-        let os_collector = if config.os_stats {
-            Some(crate::endpoint::counters::os::Collector::new(self.clone()))
-        } else {
-            None
-        };
-
-        if let Err(error) = std::thread::Builder::new()
-            .name("s2n-quic-dc-reporter".into())
-            .spawn(move || {
-                let mut tick: u64 = 0;
-                let mut os_collector = os_collector;
-                loop {
-                    std::thread::sleep(interval);
-                    if !inner.is_open() {
-                        break;
-                    }
-                    if let Some(collector) = &mut os_collector {
-                        collector.record_delta();
-                    }
-                    let include_sparse = match &sparse_mode {
-                        SparseMode::Never => false,
-                        SparseMode::Always => true,
-                        SparseMode::Once => tick == 0,
-                        SparseMode::Every(n) => tick.is_multiple_of(*n),
-                    };
-                    report_once(&inner, include_sparse, &mut backends);
-                    tick += 1;
-                }
-            })
-        {
-            warn!(%error, "failed to spawn s2n-quic-dc reporter thread");
-        }
-    }
-}
-
-#[cfg(any(test, feature = "testing"))]
-async fn report_loop<F, Fut>(
-    inner: s2n_quic_dc_metrics::Registry,
-    sparse_mode: SparseMode,
-    mut backends: ReporterBackends,
-    sleep: F,
-) where
-    F: Fn() -> Fut,
-    Fut: core::future::Future<Output = ()>,
-{
-    let mut tick: u64 = 0;
-    loop {
-        sleep().await;
-        if !inner.is_open() {
-            break;
-        }
-        let include_sparse = match &sparse_mode {
-            SparseMode::Never => false,
-            SparseMode::Always => true,
-            SparseMode::Once => tick == 0,
-            SparseMode::Every(n) => tick.is_multiple_of(*n),
-        };
-        report_once(&inner, include_sparse, &mut backends);
-        tick += 1;
+    /// The underlying [`s2n_quic_dc_metrics::Registry`] this handle records into.
+    ///
+    /// This is the registry an exporting reporter drives: call
+    /// [`report_with`](s2n_quic_dc_metrics::Registry::report_with) on it to drain the metric pool
+    /// into a [`Backend`](s2n_quic_dc_metrics::Backend) each interval, and
+    /// [`is_open`](s2n_quic_dc_metrics::Registry::is_open) to stop when the endpoint shuts down. The
+    /// crate itself no longer ships a reporter — a consumer owns its own export loop (or uses
+    /// [`spawn_noop_drain_reporter`] purely to bound the pool).
+    pub fn metrics(&self) -> &s2n_quic_dc_metrics::Registry {
+        &self.inner
     }
 }
 

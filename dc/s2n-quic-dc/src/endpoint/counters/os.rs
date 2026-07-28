@@ -5,9 +5,9 @@
 //!
 //! This module snapshots `/proc` network stats and records per-interval
 //! deltas (for monotonic counters) and current values (for gauges) into the
-//! shared `counter::Registry`. It is driven by the reporter background thread
-//! via [`ReporterConfig::os_stats`][crate::counter::ReporterConfig]; the
-//! [`Collector`] is created automatically when that flag is set.
+//! shared `counter::Registry`. A [`Collector`] is created by a consumer's
+//! metrics reporter and its [`record_delta`][Collector::record_delta] driven
+//! once per report interval, before the registry is drained.
 
 #[cfg(target_os = "linux")]
 use std::collections::{hash_map::Entry, HashMap};
