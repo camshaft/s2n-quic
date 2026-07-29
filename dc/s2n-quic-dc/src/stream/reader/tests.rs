@@ -2306,7 +2306,7 @@ fn peer_liveness_resolves_on_peer_dead() {
 }
 
 /// `peer_liveness` must not update flow-control credits (remote_max_data) even
-/// when it drains queued frames into the local stash.  Only the application
+/// when it drains queued frames into the reassembler.  Only the application
 /// actually consuming bytes via `read_into` may advance the window.
 #[test]
 fn peer_liveness_does_not_update_flow_control() {
@@ -2331,8 +2331,9 @@ fn peer_liveness_does_not_update_flow_control() {
                 "remote_max_data should be at initial value before any interaction"
             );
 
-            // peer_liveness drains the queued data frame into pending_rx but must
-            // not call maybe_send_max_data, so the advertised window stays put.
+            // peer_liveness writes the queued data frame directly into the
+            // reassembler (pending_rx is left empty) but must not call
+            // maybe_send_max_data, so the advertised window stays put.
             let still_pending = core::future::poll_fn(|cx| {
                 Poll::Ready(reader.poll_peer_liveness(cx).is_pending())
             })

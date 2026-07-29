@@ -703,30 +703,38 @@ impl Reader {
     /// Flow control credits are **not** updated: this probe writes pending
     /// frames into the reassembler without copying them to an application
     /// buffer, so `consumed_len` does not advance and no `MAX_DATA` is sent.
+    /// The buffered bytes stay available to a later
+    /// [`poll_read_into`](Self::poll_read_into).
     ///
     /// # Task affinity (contract)
     ///
     /// This shares the reader's single stream-channel and completion-channel
-    /// waker slots with the read path. It MUST be polled from the same task
-    /// that calls [`poll_read_into`](Self::poll_read_into) — typically as one
-    /// branch of a `tokio::select!` alongside the consuming future. `&mut
-    /// Reader` enforces this: concurrent reads from another task are impossible
-    /// because both paths require `&mut self`.
+    /// waker slots with the read path, so it MUST be polled from the same task
+    /// that calls [`poll_read_into`](Self::poll_read_into). Both take `&mut
+    /// self`, so the probe and a read cannot be held as two separate futures in
+    /// a `tokio::select!` — that would require two simultaneous mutable borrows.
+    /// Race the probe against *non-reader* work instead (see
+    /// [`peer_liveness`](Self::peer_liveness)) and drain data with `read_into`
+    /// once the probe resolves or you are otherwise ready to read.
     pub fn poll_peer_liveness(&mut self, cx: &mut Context) -> Poll<io::Result<()>> {
         self.0.poll_peer_liveness(cx)
     }
 
     /// Awaitable form of [`poll_peer_liveness`](Self::poll_peer_liveness).
     ///
-    /// Resolves once the peer's write side has closed or an error is detected,
-    /// so a consumer can race it against the future that processes data:
+    /// Resolves once the peer's write side has closed or an error is detected.
+    /// Because it borrows `&mut self`, it cannot be raced against another method
+    /// on the same reader (such as [`read_into`](Self::read_into)) — both would
+    /// need `&mut self` at the same time. Race it against work that does not
+    /// touch the reader instead, e.g. handling a request while watching for the
+    /// peer to disappear:
     ///
     /// ```ignore
     /// tokio::select! {
     ///     biased;
-    ///     result = reader.read_into(&mut buf) => { /* handle data */ }
+    ///     response = handle_request(&request) => { /* peer still alive */ }
     ///     result = reader.peer_liveness() => match result {
-    ///         Ok(()) => { /* peer sent FIN; keep draining buffered data */ }
+    ///         Ok(()) => { /* peer sent FIN; drain remaining data with read_into */ }
     ///         Err(e) => return Err(e.into()),
     ///     },
     /// }
