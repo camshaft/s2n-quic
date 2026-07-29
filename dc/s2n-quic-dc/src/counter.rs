@@ -2246,7 +2246,10 @@ impl Registry {
             format!("{label}.depth"),
             None,
             Unit::Count,
-            move || depth_clone.load(Ordering::Relaxed),
+            // Floor the published value at 0: the internal counter can transiently read negative
+            // when dequeues outrun counted enqueues, and a negative gauge is rejected downstream.
+            // Only the emitted value is clamped; the internal atomic is left untouched.
+            move || depth_clone.load(Ordering::Relaxed).max(0),
         );
         let depth_id = self.register_metric_metadata(
             format!("{label}.depth"),
@@ -2341,7 +2344,10 @@ impl Registry {
             format!("{label}.depth"),
             variant_option.clone(),
             Unit::Count,
-            move || depth_clone.load(Ordering::Relaxed),
+            // Floor the published value at 0: the internal counter can transiently read negative
+            // when dequeues outrun counted enqueues, and a negative gauge is rejected downstream.
+            // Only the emitted value is clamped; the internal atomic is left untouched.
+            move || depth_clone.load(Ordering::Relaxed).max(0),
         );
         let depth_id = self.register_metric_metadata(
             format!("{label}.depth"),
@@ -2808,6 +2814,38 @@ mod tests {
             !line.contains(" send.5") && !line.contains(" ect0,") && !line.contains(" ect0\n"),
             "unexpected bare dimension: {line}"
         );
+    }
+
+    /// The internal depth counter can drift negative when dequeues outrun counted enqueues, but the
+    /// *published* gauge must never be negative (a negative value is rejected by some downstream
+    /// consumers, silencing the whole gauge). The report callback floors at 0, so an over-drained
+    /// depth publishes as a suppressed zero rather than a negative number.
+    #[test]
+    fn depth_gauge_floors_negative_at_zero() {
+        for variant in [None, Some("send.5")] {
+            let inner = s2n_quic_dc_metrics::Registry::new();
+            let registry = Registry::with_inner(inner.clone());
+
+            let q = match variant {
+                None => registry.register_queue_gauge("q.floor_test"),
+                Some(v) => registry.register_queue_gauge_nominal("q.floor_test", v),
+            };
+
+            // Drive the internal atomic negative: 1 counted enqueue, 3 dequeues.
+            q.enqueue(1);
+            q.dequeue_n(3);
+
+            let line = inner
+                .try_take_current_metrics_line_sparse(true)
+                .expect("metrics were recorded");
+
+            // The published depth is floored: a negative value never reaches the wire (it renders as
+            // `depth=-N` when the callback returns the raw atomic).
+            assert!(
+                !line.contains("depth=-"),
+                "negative depth published (variant {variant:?}): {line}"
+            );
+        }
     }
 
     #[test]
