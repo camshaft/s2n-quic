@@ -529,6 +529,14 @@ pub struct Filtered<B> {
     cache: HashMap<CacheKey, Decision>,
 }
 
+// SAFETY: the only `!Send` field is `cache`, whose keys are raw `*const u8`
+// ([`CacheKey`]) used purely as opaque hash-map keys — they are never
+// dereferenced. The pointers address `Arc<str>` allocations owned by the metric
+// registry, which outlives every report, so nothing thread-local or unsynchronized
+// is reachable through them. A `Filtered` is therefore safe to move across threads
+// exactly when its inner backend is.
+unsafe impl<B: Send> Send for Filtered<B> {}
+
 /// A metric's pointer identity: the data pointers of its name and (optional) aggregation `Arc<str>`.
 /// Stable across reports (the registry reuses the same allocations) and unique per registry entry,
 /// so it keys the resolution cache without cloning or hashing string content.
