@@ -2129,10 +2129,9 @@ fn peer_liveness_pending_while_peer_alive() {
             let (mut reader, mut pusher) = make_pair();
 
             // No signal yet: peer is still alive.
-            let pending = core::future::poll_fn(|cx| {
-                Poll::Ready(reader.poll_peer_liveness(cx).is_pending())
-            })
-            .await;
+            let pending =
+                core::future::poll_fn(|cx| Poll::Ready(reader.poll_peer_liveness(cx).is_pending()))
+                    .await;
             assert!(pending, "expected Pending while peer alive");
 
             // Non-terminal data frames don't resolve liveness.
@@ -2140,10 +2139,9 @@ fn peer_liveness_pending_while_peer_alive() {
             // Give the data a chance to land on the queue.
             bach::task::yield_now().await;
 
-            let still_pending = core::future::poll_fn(|cx| {
-                Poll::Ready(reader.poll_peer_liveness(cx).is_pending())
-            })
-            .await;
+            let still_pending =
+                core::future::poll_fn(|cx| Poll::Ready(reader.poll_peer_liveness(cx).is_pending()))
+                    .await;
             assert!(
                 still_pending,
                 "data frame without FIN must not resolve liveness"
@@ -2334,10 +2332,9 @@ fn peer_liveness_does_not_update_flow_control() {
             // peer_liveness writes the queued data frame directly into the
             // reassembler (pending_rx is left empty) but must not call
             // maybe_send_max_data, so the advertised window stays put.
-            let still_pending = core::future::poll_fn(|cx| {
-                Poll::Ready(reader.poll_peer_liveness(cx).is_pending())
-            })
-            .await;
+            let still_pending =
+                core::future::poll_fn(|cx| Poll::Ready(reader.poll_peer_liveness(cx).is_pending()))
+                    .await;
             assert!(still_pending, "expected Pending (data frame, no FIN)");
 
             let after = reader.0.remote_max_data;
