@@ -24,6 +24,8 @@ use std::{
 
 #[cfg(any(test, feature = "arrow"))]
 mod arrow;
+#[cfg(feature = "otel")]
+mod otel;
 mod policy;
 mod prometheus;
 mod querylog;
@@ -35,6 +37,9 @@ pub use policy::{Action, Filtered, Matcher, ParsePolicyError, Policy};
 pub use prometheus::{PrometheusBackend, PrometheusHandle};
 pub use querylog::QuerylogBackend;
 pub use statsd::{StatsdBackend, StatsdSink, DEFAULT_MAX_PAYLOAD_SIZE};
+
+#[cfg(feature = "otel")]
+pub use otel::{OtlpBackend, OtlpSink};
 
 mod sealed {
     pub trait Sealed {}
