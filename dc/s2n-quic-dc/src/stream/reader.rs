@@ -142,13 +142,14 @@ use crate::{
     stream::metrics::ReaderMetrics,
     tracing::{debug, trace},
 };
+use core::ops::ControlFlow;
 use s2n_quic_core::{
     buffer::{
         self,
         duplex::Interposer,
         reader::{storage::Infallible as _, Incremental},
         reassembler::Reassembler,
-        writer::{Storage as _, Writer as _},
+        writer::{storage::Empty, Storage as _, Writer as _},
     },
     ready,
     state::{event, is},
@@ -945,10 +946,16 @@ impl Inner {
             Poll::Pending => false,
         };
 
-        // Process every frame directly into the reassembler (no app-buffer / interposer path).
-        // Writing to the reassembler buffers the data without advancing `consumed_len`, so no
-        // MAX_DATA credit is issued here — flow-control only advances when the application
-        // actually consumes bytes through `read_into`.
+        // Process every frame through the shared per-frame body, but with an `Empty` writer
+        // buffer so payloads land in the reassembler instead of being copied to an application
+        // buffer. Because `consumed_len` does not advance, no MAX_DATA credit is issued here —
+        // flow-control only advances when the application consumes bytes through `read_into`.
+        //
+        // Unlike the read path this loop is NOT coop-gated: it drains the whole batch rather than
+        // re-stashing leftovers into `pending_rx`. Re-stashing and returning `Pending` would leave
+        // the remainder with no registered waker (the probe is often the only future polling the
+        // reader), so a standalone liveness poll could hang. Draining fully keeps the contract that
+        // every `Pending` return has a live channel waker from `poll_swap` above.
         //
         // Because data lands in the reassembler rather than being stashed back in `pending_rx`,
         // the read path gets proper TCP semantics for free: when a Reset is found after
@@ -957,76 +964,17 @@ impl Inner {
         while let Some(entry) = queue.pop_front() {
             self.status.on_received().ok();
 
-            match entry.into_inner() {
-                msg::Stream::Data {
-                    offset,
-                    peer_max_offset,
-                    mut payload,
-                    fin,
-                    blocked,
-                } => {
-                    self.peer_max_offset = self.peer_max_offset.max(peer_max_offset.as_u64());
-                    if blocked {
-                        self.on_blocked_signal(peer_max_offset.as_u64());
-                    }
+            if let ControlFlow::Break(poll) =
+                self.process_stream_frame(entry.into_inner(), &mut Empty)
+            {
+                return poll;
+            }
 
-                    let Some(payload_end_offset) =
-                        offset.as_u64().checked_add(payload.len() as u64)
-                    else {
-                        return self.protocol_error();
-                    };
-
-                    if self.remote_max_data != VarInt::ZERO
-                        && payload_end_offset > self.remote_max_data.as_u64()
-                    {
-                        return self.queue_control_error();
-                    }
-
-                    let mut incremental = Incremental::new(offset);
-                    let mut reader = match incremental.with_storage(&mut payload, fin) {
-                        Ok(r) => r,
-                        Err(_) => return self.protocol_error(),
-                    };
-
-                    // Always write directly to the reassembler, skipping the Interposer /
-                    // app-buf path used by `poll_stream_rx`. This keeps data buffered in
-                    // the reassembler (not in the application buffer) so it can be drained
-                    // in order by `read_into`.
-                    if self.reassembler.write_reader(&mut reader).is_err() {
-                        return self.protocol_error();
-                    }
-
-                    if self.reassembler.is_writing_complete() {
-                        return Poll::Ready(Ok(()));
-                    }
-                }
-                msg::Stream::Blocked {
-                    desired_offset,
-                    synthetic,
-                } => {
-                    let desired = desired_offset.as_u64();
-                    self.peer_max_offset = self.peer_max_offset.max(desired);
-                    if !synthetic {
-                        self.on_blocked_signal(desired);
-                    }
-                }
-                msg::Stream::Reset { error_code } => {
-                    self.reset_error_code = Some(error_code);
-                    self.status.on_reset().ok();
-                    // Only clear the reassembler if it is already empty. If data was buffered
-                    // before the reset, leave it so the read path can drain it first.
-                    if self.reassembler.is_empty() {
-                        self.reassembler.reset();
-                    }
-                    let reset_error: Error = error_code.into();
-                    return Poll::Ready(Err(io::Error::new(
-                        reset_error.io_error_kind(),
-                        reset_error,
-                    )));
-                }
-                msg::Stream::Debug { .. } => {
-                    // Debug frames carry no stream data; ignore in the liveness path.
-                }
+            // The FIN has landed (all peer data received). Report liveness resolved even though
+            // the application may not have consumed everything yet. The read path defers this to
+            // `poll_read_into_inner`, but here it is the terminal signal we probe for.
+            if self.reassembler.is_writing_complete() {
+                return Poll::Ready(Ok(()));
             }
         }
 
@@ -1270,172 +1218,206 @@ impl Inner {
             // transition. Idempotent once `Open`.
             self.status.on_received().ok();
 
-            match entry.into_inner() {
-                msg::Stream::Data {
-                    offset,
-                    peer_max_offset,
-                    mut payload,
-                    fin,
-                    blocked,
-                } => {
-                    // Track the writer's desired high watermark and, if it signaled it is
-                    // blocked, possibly grow the window. Done before the receive-window
-                    // check so a blocked signal still drives growth even on an empty frame.
-                    self.peer_max_offset = self.peer_max_offset.max(peer_max_offset.as_u64());
-                    if blocked {
-                        self.on_blocked_signal(peer_max_offset.as_u64());
-                    }
-
-                    let Some(payload_end_offset) =
-                        offset.as_u64().checked_add(payload.len() as u64)
-                    else {
-                        debug!(
-                            binding_id = self.stream_rx.binding_id().as_u64(),
-                            offset = offset.as_u64(),
-                            payload_len = payload.len(),
-                            "Incoming data offset overflowed"
-                        );
-                        return self.protocol_error();
-                    };
-
-                    // Server bootstrap special-case:
-                    // `remote_max_data == 0` is used for server-side
-                    // streams before initial validation/credit release.
-                    // In that state the first bytes are accepted without
-                    // hard receive-window enforcement; once credits are
-                    // advertised (`remote_max_data > 0`) the check below
-                    // is enforced for all subsequent packets.
-                    if self.remote_max_data != VarInt::ZERO
-                        && payload_end_offset > self.remote_max_data.as_u64()
-                    {
-                        debug!(
-                            binding_id = self.stream_rx.binding_id().as_u64(),
-                            offset = offset.as_u64(),
-                            payload_len = payload.len(),
-                            payload_end_offset,
-                            remote_max_data = self.remote_max_data.as_u64(),
-                            "Peer exceeded advertised receive window"
-                        );
-                        // Stream-layer drop (no wire Header here): the peer sent past the window
-                        // and we're about to reset the stream. Mirror the inbound routing
-                        // convention (dest = our local queue, source = peer's).
-                        crate::endpoint::frame_trace::reader_drop(
-                            self.dest_queue_id,
-                            self.stream_rx.queue_id(),
-                            self.stream_rx.binding_id(),
-                            offset.as_u64(),
-                            crate::endpoint::frame_trace::DropReason::WindowViolation,
-                            *self.path_secret_entry.id(),
-                        );
-                        return self.queue_control_error();
-                    }
-
-                    trace!(
-                        binding_id = self.stream_rx.binding_id().as_u64(),
-                        offset = offset.as_u64(),
-                        len = payload.len(),
-                        is_fin = fin,
-                        "Received data"
-                    );
-
-                    let mut incremental = Incremental::new(offset);
-                    let mut reader = match incremental.with_storage(&mut payload, fin) {
-                        Ok(r) => r,
-                        Err(err) => {
-                            debug!(
-                                binding_id = self.stream_rx.binding_id().as_u64(),
-                                ?err,
-                                "Invalid storage/fin combination"
-                            );
-                            return self.protocol_error();
-                        }
-                    };
-
-                    if let Err(err) = write_data_reader(&mut self.reassembler, &mut reader, app_buf)
-                    {
-                        debug!(
-                            binding_id = self.stream_rx.binding_id().as_u64(),
-                            ?err,
-                            "Failed to write to reassembler"
-                        );
-                        return self.protocol_error();
-                    }
-                }
-                msg::Stream::Blocked {
-                    desired_offset,
-                    synthetic,
-                } => {
-                    // Standalone blocked signal: no payload, just drives window growth. The
-                    // subsequent maybe_send_max_data in the caller emits the extension.
-                    let desired = desired_offset.as_u64();
-                    // Both signals record explicit demand the window will pursue directly. They
-                    // differ only in whether they ALSO ramp the streaming `growth_ratio` headroom:
-                    self.peer_max_offset = self.peer_max_offset.max(desired);
-                    if synthetic {
-                        // Receiver-generated for an oversized QueueMsg segment: the demand is known
-                        // and bounded (one message), not open-ended streaming. Recording it in
-                        // `peer_max_offset` (above) is sufficient — the window pursues it directly,
-                        // limited only by the pool. Do NOT ramp `growth_ratio`: there is no evidence
-                        // of a streaming writer outrunning our window, and ramping off a one-shot
-                        // message would inflate the window for every subsequent stream.
-                        trace!(
-                            binding_id = self.stream_rx.binding_id().as_u64(),
-                            desired_offset = desired,
-                            "Received synthetic blocked signal (oversized message)"
-                        );
-                    } else {
-                        // Real peer QueueDataBlocked: the writer is streaming and keeps hitting the
-                        // window edge, so ALSO grow the runway beyond its observed demand to stay
-                        // ahead of it.
-                        trace!(
-                            binding_id = self.stream_rx.binding_id().as_u64(),
-                            desired_offset = desired,
-                            "Received QueueDataBlocked"
-                        );
-                        self.on_blocked_signal(desired);
-                    }
-                }
-                msg::Stream::Reset { error_code } => {
-                    debug!(
-                        binding_id = self.stream_rx.binding_id().as_u64(),
-                        error_code = error_code.as_u64(),
-                        "Stream reset by peer"
-                    );
-                    self.reset_error_code = Some(error_code);
-                    self.status.on_reset().ok();
-                    // Only clear the reassembler immediately when it is
-                    // already empty.  If data was buffered before the
-                    // reset arrived, leave it intact so poll_read_into_inner
-                    // can drain it to the application first (TCP semantics:
-                    // data in the receive buffer before a RST is readable).
-                    if self.reassembler.is_empty() {
-                        self.reassembler.reset();
-                    }
-                    let reset_error: Error = error_code.into();
-                    return Poll::Ready(Err(io::Error::new(
-                        reset_error.io_error_kind(),
-                        reset_error,
-                    )));
-                }
-                msg::Stream::Debug {
-                    dump_id,
-                    peer_queue_pair,
-                    peer_binding_id,
-                    peer_cred_id,
-                } => {
-                    // Woken by a peer QueueDbg: dump our own state alongside the routing identity
-                    // the peer used, flagging any divergence. Advisory — consume no credit, return
-                    // no error, keep draining. `dump_state` itself is gated, so this is a no-op in
-                    // production (where the variant is never constructed anyway).
-                    self.dump_state(
-                        dump_id,
-                        Some((peer_queue_pair, peer_binding_id, peer_cred_id)),
-                    );
-                }
+            // Payloads are interposed into `app_buf` when the reassembler is empty and
+            // contiguous, otherwise buffered in the reassembler.
+            if let ControlFlow::Break(poll) = self.process_stream_frame(entry.into_inner(), app_buf)
+            {
+                return poll;
             }
         }
 
         Poll::Ready(Ok(()))
+    }
+
+    /// Applies a single stream-queue frame to the reader state, writing any payload through
+    /// `app_buf`.
+    ///
+    /// This is the shared per-frame body for both the read path
+    /// ([`poll_stream_rx`](Self::poll_stream_rx), which passes the application's buffer so
+    /// contiguous data is interposed directly to it) and the liveness probe
+    /// ([`poll_peer_liveness_inner`](Self::poll_peer_liveness_inner), which passes
+    /// [`writer::storage::Empty`](Empty) so every byte lands in the reassembler and no
+    /// application copy or `MAX_DATA` credit is issued). Sharing it keeps the two paths from
+    /// diverging on details that must stay identical — most importantly the receive-window
+    /// enforcement check.
+    ///
+    /// Returns [`ControlFlow::Continue`] to keep draining the batch, or [`ControlFlow::Break`]
+    /// carrying the [`Poll`] the caller must return: a `Reset` yields the reset error, and a
+    /// protocol / window violation yields the corresponding reset via
+    /// [`protocol_error`](Self::protocol_error) / [`queue_control_error`](Self::queue_control_error).
+    fn process_stream_frame<S>(
+        &mut self,
+        frame: msg::Stream,
+        app_buf: &mut S,
+    ) -> ControlFlow<Poll<io::Result<()>>>
+    where
+        S: buffer::writer::Storage + ?Sized,
+    {
+        match frame {
+            msg::Stream::Data {
+                offset,
+                peer_max_offset,
+                mut payload,
+                fin,
+                blocked,
+            } => {
+                // Track the writer's desired high watermark and, if it signaled it is
+                // blocked, possibly grow the window. Done before the receive-window
+                // check so a blocked signal still drives growth even on an empty frame.
+                self.peer_max_offset = self.peer_max_offset.max(peer_max_offset.as_u64());
+                if blocked {
+                    self.on_blocked_signal(peer_max_offset.as_u64());
+                }
+
+                let Some(payload_end_offset) = offset.as_u64().checked_add(payload.len() as u64)
+                else {
+                    debug!(
+                        binding_id = self.stream_rx.binding_id().as_u64(),
+                        offset = offset.as_u64(),
+                        payload_len = payload.len(),
+                        "Incoming data offset overflowed"
+                    );
+                    return ControlFlow::Break(self.protocol_error());
+                };
+
+                // Server bootstrap special-case:
+                // `remote_max_data == 0` is used for server-side
+                // streams before initial validation/credit release.
+                // In that state the first bytes are accepted without
+                // hard receive-window enforcement; once credits are
+                // advertised (`remote_max_data > 0`) the check below
+                // is enforced for all subsequent packets.
+                if self.remote_max_data != VarInt::ZERO
+                    && payload_end_offset > self.remote_max_data.as_u64()
+                {
+                    debug!(
+                        binding_id = self.stream_rx.binding_id().as_u64(),
+                        offset = offset.as_u64(),
+                        payload_len = payload.len(),
+                        payload_end_offset,
+                        remote_max_data = self.remote_max_data.as_u64(),
+                        "Peer exceeded advertised receive window"
+                    );
+                    // Stream-layer drop (no wire Header here): the peer sent past the window
+                    // and we're about to reset the stream. Mirror the inbound routing
+                    // convention (dest = our local queue, source = peer's).
+                    crate::endpoint::frame_trace::reader_drop(
+                        self.dest_queue_id,
+                        self.stream_rx.queue_id(),
+                        self.stream_rx.binding_id(),
+                        offset.as_u64(),
+                        crate::endpoint::frame_trace::DropReason::WindowViolation,
+                        *self.path_secret_entry.id(),
+                    );
+                    return ControlFlow::Break(self.queue_control_error());
+                }
+
+                trace!(
+                    binding_id = self.stream_rx.binding_id().as_u64(),
+                    offset = offset.as_u64(),
+                    len = payload.len(),
+                    is_fin = fin,
+                    "Received data"
+                );
+
+                let mut incremental = Incremental::new(offset);
+                let mut reader = match incremental.with_storage(&mut payload, fin) {
+                    Ok(r) => r,
+                    Err(err) => {
+                        debug!(
+                            binding_id = self.stream_rx.binding_id().as_u64(),
+                            ?err,
+                            "Invalid storage/fin combination"
+                        );
+                        return ControlFlow::Break(self.protocol_error());
+                    }
+                };
+
+                if let Err(err) = write_data_reader(&mut self.reassembler, &mut reader, app_buf) {
+                    debug!(
+                        binding_id = self.stream_rx.binding_id().as_u64(),
+                        ?err,
+                        "Failed to write to reassembler"
+                    );
+                    return ControlFlow::Break(self.protocol_error());
+                }
+
+                ControlFlow::Continue(())
+            }
+            msg::Stream::Blocked {
+                desired_offset,
+                synthetic,
+            } => {
+                // Standalone blocked signal: no payload, just drives window growth. The
+                // subsequent maybe_send_max_data in the caller emits the extension.
+                let desired = desired_offset.as_u64();
+                // Both signals record explicit demand the window will pursue directly. They
+                // differ only in whether they ALSO ramp the streaming `growth_ratio` headroom:
+                self.peer_max_offset = self.peer_max_offset.max(desired);
+                if synthetic {
+                    // Receiver-generated for an oversized QueueMsg segment: the demand is known
+                    // and bounded (one message), not open-ended streaming. Recording it in
+                    // `peer_max_offset` (above) is sufficient — the window pursues it directly,
+                    // limited only by the pool. Do NOT ramp `growth_ratio`: there is no evidence
+                    // of a streaming writer outrunning our window, and ramping off a one-shot
+                    // message would inflate the window for every subsequent stream.
+                    trace!(
+                        binding_id = self.stream_rx.binding_id().as_u64(),
+                        desired_offset = desired,
+                        "Received synthetic blocked signal (oversized message)"
+                    );
+                } else {
+                    // Real peer QueueDataBlocked: the writer is streaming and keeps hitting the
+                    // window edge, so ALSO grow the runway beyond its observed demand to stay
+                    // ahead of it.
+                    trace!(
+                        binding_id = self.stream_rx.binding_id().as_u64(),
+                        desired_offset = desired,
+                        "Received QueueDataBlocked"
+                    );
+                    self.on_blocked_signal(desired);
+                }
+                ControlFlow::Continue(())
+            }
+            msg::Stream::Reset { error_code } => {
+                debug!(
+                    binding_id = self.stream_rx.binding_id().as_u64(),
+                    error_code = error_code.as_u64(),
+                    "Stream reset by peer"
+                );
+                self.reset_error_code = Some(error_code);
+                self.status.on_reset().ok();
+                // Only clear the reassembler immediately when it is
+                // already empty.  If data was buffered before the
+                // reset arrived, leave it intact so poll_read_into_inner
+                // can drain it to the application first (TCP semantics:
+                // data in the receive buffer before a RST is readable).
+                if self.reassembler.is_empty() {
+                    self.reassembler.reset();
+                }
+                let reset_error: Error = error_code.into();
+                ControlFlow::Break(Poll::Ready(Err(io::Error::new(
+                    reset_error.io_error_kind(),
+                    reset_error,
+                ))))
+            }
+            msg::Stream::Debug {
+                dump_id,
+                peer_queue_pair,
+                peer_binding_id,
+                peer_cred_id,
+            } => {
+                // Woken by a peer QueueDbg: dump our own state alongside the routing identity
+                // the peer used, flagging any divergence. Advisory — consume no credit, return
+                // no error, keep draining. `dump_state` itself is gated, so this is a no-op in
+                // production (where the variant is never constructed anyway).
+                self.dump_state(
+                    dump_id,
+                    Some((peer_queue_pair, peer_binding_id, peer_cred_id)),
+                );
+                ControlFlow::Continue(())
+            }
+        }
     }
 
     fn protocol_error(&mut self) -> Poll<io::Result<()>> {
