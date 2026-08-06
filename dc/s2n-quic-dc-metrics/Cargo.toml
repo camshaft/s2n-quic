@@ -61,3 +61,4 @@ harness = false
 [dev-dependencies]
 arrow = { version = "54", default-features = false }
 criterion = "0.8"
+bolero = "0.13"
