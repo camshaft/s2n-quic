@@ -64,6 +64,27 @@ impl State {
         subscriber: Subscriber,
         builder: Builder<Event>,
     ) -> io::Result<Self> {
+        // Under bach there is no separate runtime: the client binds on the simulated network in the
+        // current scope and handshakes are driven directly by awaiting `connect` (the `runtime:
+        // None` path), the same way the deterministic-simulation harness already expects. This keeps
+        // the in-sim client on the exact production handshake code, minus the OS thread.
+        #[cfg(any(test, feature = "testing"))]
+        if bach::is_active() {
+            let client = io::Client::bind::<Provider, Subscriber, Event>(
+                addr,
+                map.clone(),
+                tls_materials_provider,
+                subscriber,
+                builder,
+            )?;
+            return Ok(Self {
+                map,
+                runtime: None,
+                local_addr: client.local_addr()?,
+                client,
+            });
+        }
+
         let (runtime, rt_guard) = make_runtime();
         let guard = runtime.enter();
         let client = io::Client::bind::<Provider, Subscriber, Event>(

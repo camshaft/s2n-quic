@@ -31,15 +31,26 @@ fn map(capacity: usize) -> Map {
 }
 
 fn map_sub(capacity: usize, sub: Arc<Subscriber>) -> Map {
+    // Use the builder's default eviction behavior.
+    map_sub_with_evict_inner(capacity, sub, None)
+}
+
+fn map_sub_with_evict(capacity: usize, sub: Arc<Subscriber>, evict: bool) -> Map {
+    map_sub_with_evict_inner(capacity, sub, Some(evict))
+}
+
+fn map_sub_with_evict_inner(capacity: usize, sub: Arc<Subscriber>, evict: Option<bool>) -> Map {
     let signer = stateless_reset::Signer::random();
 
-    let map = Map::builder()
+    let mut builder = Map::builder()
         .with_signer(signer)
         .with_capacity(capacity)
         .with_clock(NoopClock)
-        .with_subscriber(sub)
-        .build()
-        .unwrap();
+        .with_subscriber(sub);
+    if let Some(evict) = evict {
+        builder = builder.with_evict_on_unknown_path_secret(evict);
+    }
+    let map = builder.build().unwrap();
 
     // stop the cleaner thread to avoid any out of order events
     map.test_stop_cleaner();
@@ -64,7 +75,11 @@ fn insert_one() {
 #[test]
 fn control_packets() {
     let sub = sub();
-    let client = map_sub(10, sub.clone());
+    // This test exercises the full control-packet authentication matrix (Stale/ReplayDetected
+    // accept+reject) against a *persistent* entry. Eviction-on-`UnknownPathSecret` is the default,
+    // but here it would remove the entry on the first authenticated UnknownPathSecret and turn every
+    // subsequent packet into a "dropped" (no entry), so it is disabled to keep the entry alive.
+    let client = map_sub_with_evict(10, sub.clone(), false);
     let server = map_sub(10, sub);
 
     let client_addr = "127.0.0.1:1234".parse().unwrap();
