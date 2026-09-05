@@ -362,6 +362,10 @@ jobs:
           # We got a few globals that aren't cleaned up. Need to
           # determine if we should reenable this in the future.
           ASAN_OPTIONS: detect_leaks=false
+          # A handful of sim() tests run for tens of seconds each; under ASAN instrumentation the
+          # suite exceeds the runner's wall-clock. Skip them here — they still run in the plain
+          # `test` jobs. See `testing::skip_if_slow`.
+          S2N_SKIP_SLOW_TESTS: "1"
         run: |
           cargo test \
             -Zbuild-std \
@@ -488,6 +492,11 @@ jobs:
         # correct for the dedicated loom-dc job but breaks every ordinary test that builds a
         # sync-using type (e.g. a credit `Pool`). loom is a test harness, not a product feature, so
         # its lines don't need coverage — enumerate the product features instead and omit `loom`.
+        env:
+          # A handful of sim() tests run for tens of seconds each; under llvm-cov instrumentation the
+          # suite exceeds the runner's wall-clock. Skip them here — they still run in the plain
+          # `test` jobs. See `testing::skip_if_slow`.
+          S2N_SKIP_SLOW_TESTS: "1"
         run: cargo llvm-cov --html --no-fail-fast -p s2n-quic-core -p s2n-quic-dc --features "tokio,testing,bolero-generator,tracing,metric-tracing,queue-dbg,io-dbg"
 
       - name: Upload coverage report artifact
@@ -757,6 +766,12 @@ jobs:
       - uses: camshaft/rust-cache@v1
 
       - name: Run cargo insta test
+        env:
+          # A handful of sim() tests run for tens of seconds each; under the insta harness the suite
+          # exceeds the runner's wall-clock. Skip them here — they still run in the plain `test`
+          # jobs, and none of them assert a snapshot, so `--delete-unreferenced-snapshots` below is
+          # unaffected. See `testing::skip_if_slow`.
+          S2N_SKIP_SLOW_TESTS: "1"
         run: |
           cargo insta test --all --delete-unreferenced-snapshots
 
