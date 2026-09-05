@@ -9,7 +9,7 @@
 //! free function ([`from_stream`]) that drives both halves concurrently.
 
 use crate::stream::{MsgFlags, Stream};
-use core::future::Future;
+use core::{future::Future, task::Poll};
 use s2n_quic_core::buffer::{self, writer::Storage as _};
 use std::{future::poll_fn, io};
 
@@ -149,13 +149,30 @@ where
         }
     };
     let mut reader = core::pin::pin!(reader);
+    let mut reader_output = None;
 
     poll_fn(|cx| {
         if !writer_finished {
             writer_finished = writer.as_mut().poll(cx)?.is_ready();
         }
 
-        reader.as_mut().poll(cx)
+        // Drive the reader to completion, but CACHE its output rather than returning as soon as it
+        // is ready. Returning on reader-completion alone would drop the still-in-flight writer
+        // future here — deterministically truncating a request whose flush has not finished (e.g. a
+        // large request whose smaller response arrives before the request drains over the initial
+        // flow-control window). The RPC is only complete once BOTH halves finish: the request is
+        // fully sent (writer) AND the response is fully received (reader).
+        if reader_output.is_none() {
+            if let Poll::Ready(output) = reader.as_mut().poll(cx)? {
+                reader_output = Some(output);
+            }
+        }
+
+        if writer_finished && reader_output.is_some() {
+            Poll::Ready(Ok(reader_output.take().unwrap()))
+        } else {
+            Poll::Pending
+        }
     })
     .await
 }
