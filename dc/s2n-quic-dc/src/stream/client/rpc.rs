@@ -409,4 +409,87 @@ mod tests {
             .spawn();
         });
     }
+
+    /// PAIRED BACH TEST for PR #537 (from_stream drive-to-completion defense; operator merge-gate).
+    ///
+    /// A large request whose (small) response completes before the request finishes flushing:
+    /// without #537, from_stream's poll_fn returns on reader-done and DROPS the still-parked request
+    /// writer, so the peer receives a TRUNCATED request. With #537 (poll_fn returns only when
+    /// writer_finished AND reader-done) the writer is driven to completion and the peer gets the
+    /// full request. FAILS without #537, PASSES with it.
+    #[test]
+    fn from_stream_large_request_not_truncated_when_response_completes_first() {
+        let _guard = crate::testing::without_snapshots();
+        sim(|| {
+            let acceptor_id = VarInt::from_u8(1);
+            const REQ_LEN: usize = 64 * 1024;
+
+            async move {
+                let server = Server::new();
+                let mut acceptor = server
+                    .register_acceptor_channel(acceptor_id, 1)
+                    .expect("acceptor registration failed");
+                while let Some(stream) = acceptor.recv().await {
+                    async move {
+                        let (mut reader, mut writer) = stream.into_split();
+                        // Respond FIRST, before draining the request, so the client's response
+                        // reader completes while its large request is still flushing.
+                        let mut response = Bytes::from_static(b"pong");
+                        writer
+                            .write_all_from_fin(&mut response)
+                            .await
+                            .expect("server response");
+                        // Delay before draining the request: let the client's from_stream observe
+                        // reader-done (the response above) FIRST, while its large request is still
+                        // parked (no MAX_DATA granted yet). Without #537 that returns from_stream and
+                        // drops the parked request writer here => truncation. With #537 from_stream
+                        // keeps driving the writer, so once we start reading below the request
+                        // resumes and completes in full.
+                        50.ms().sleep().await;
+                        // Now drain the full request and assert it was NOT truncated.
+                        let mut request = BytesMut::with_capacity(REQ_LEN + 64);
+                        loop {
+                            match reader.read_into(&mut request).await {
+                                Ok(0) => break,
+                                Ok(_) => {}
+                                Err(e) => panic!(
+                                    "server request read errored: {e:?} — from_stream dropped the \
+                                     still-parked request writer when the response completed first \
+                                     (needs #537 drive-to-completion)"
+                                ),
+                            }
+                        }
+                        assert_eq!(
+                            request.len(),
+                            REQ_LEN,
+                            "server received a TRUNCATED request ({} of {REQ_LEN} bytes): from_stream \
+                             returned on reader-done and dropped the still-parked request writer. \
+                             #537 (drive both halves to completion) delivers the full request.",
+                            request.len(),
+                        );
+                    }
+                    .primary()
+                    .spawn();
+                }
+            }
+            .group("server")
+            .spawn();
+
+            async move {
+                let mut client = Client::new();
+                let stream = client
+                    .connect("server:0", acceptor_id)
+                    .await
+                    .expect("connect failed");
+                let request = Bytes::from(vec![0xABu8; REQ_LEN]);
+                let response = from_stream(stream, request, InMemoryResponse::from(Vec::<u8>::new()))
+                    .await
+                    .expect("rpc should succeed");
+                assert_eq!(&response[..], b"pong");
+            }
+            .group("client")
+            .primary()
+            .spawn();
+        });
+    }
 }
