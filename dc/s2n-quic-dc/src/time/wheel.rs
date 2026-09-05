@@ -433,8 +433,10 @@ where
             }
         }
 
-        // 2. Tick to current time and collect due entries
-        let now = self.timer.now();
+        // 2. Tick to current time and collect due entries. This runs every poll sweep and is
+        //    sweep-granular already, so it opts into the coarse (per-sweep cached) clock; see
+        //    `precision::Clock::coarse_now`. Default clocks (tokio/bach) return a fresh read.
+        let now = self.timer.coarse_now();
         let mut list = self.tick_to(now);
         self.pending_list.append(&mut list);
 
