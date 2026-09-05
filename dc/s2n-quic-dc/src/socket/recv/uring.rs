@@ -76,8 +76,9 @@ use std::{
     os::fd::RawFd,
     sync::{
         atomic::{AtomicBool, AtomicU16, Ordering},
-        Arc,
+        Arc, OnceLock,
     },
+    time::{Duration, Instant},
 };
 
 /// Default number of ring entries / provided buffers per recv ring. Sized to hold a large in-flight
@@ -92,6 +93,26 @@ const EVENTFD_TOKEN: u64 = u64::MAX;
 /// `user_data` for the multishot recv SQE. There is exactly one armed recv op per ring, so a single
 /// constant token suffices (the buffer is identified by the CQE's `bid`, not by `user_data`).
 const RECV_USER_DATA: u64 = 1;
+
+/// Busy-poll budget for the recv ring's completion wait. Before blocking in the kernel via
+/// `submit_and_wait(1)`, the ring thread spins on the (shared-memory, syscall-free) completion queue
+/// for up to this long; a completion arriving within the window is reaped immediately, avoiding the
+/// kernel thread-wakeup latency that otherwise dominates single-stream / bulk recv tail latency at
+/// non-saturated load. Only when the window elapses with no completion does the thread block
+/// (releasing the CPU and catching the eventfd teardown wake). This gives the io_uring recv path the
+/// busy-poll latency profile of the cooperative syscall recv path while keeping its batched multishot
+/// recv + provided buffers. Tunable via `DCQUIC_RECV_URING_SPIN_US` (microseconds); `0` disables the
+/// spin (pure blocking wait — the historical behavior). Default 10 us.
+fn recv_spin_budget() -> Duration {
+    static BUDGET: OnceLock<Duration> = OnceLock::new();
+    *BUDGET.get_or_init(|| {
+        let us = std::env::var("DCQUIC_RECV_URING_SPIN_US")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(10);
+        Duration::from_micros(us)
+    })
+}
 
 /// Probe whether io_uring can be set up in the current environment, returning the underlying
 /// `io_uring_setup(2)` error if not, so the caller can fall back to the syscall recv path and log
@@ -367,11 +388,44 @@ fn ring_loop<R: Router>(
             }
         }
 
-        match ring.submit_and_wait(1) {
-            Ok(_) => {}
-            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(err) => {
-                tracing::warn!(%err, "io_uring recv submit_and_wait error");
+        // Spin-then-block: busy-poll the completion queue (shared memory, no syscall) for a bounded
+        // window before blocking in the kernel, so a completion arriving under load is reaped without
+        // paying kernel thread-wakeup latency — the dominant single-stream / bulk recv tail cost at
+        // non-saturated load. When the window elapses with no completion, block in `submit_and_wait(1)`
+        // to release the CPU and catch the eventfd teardown wake. See [`recv_spin_budget`]
+        // (`DCQUIC_RECV_URING_SPIN_US`; `0` = block only, historical behavior).
+        let spin_budget = recv_spin_budget();
+        let mut have_completion = false;
+        if !spin_budget.is_zero() {
+            // Submit any pending SQEs (notably a re-armed recv) without waiting, then spin the CQ.
+            if let Err(err) = ring.submit() {
+                if err.kind() != std::io::ErrorKind::Interrupted {
+                    tracing::warn!(%err, "io_uring recv submit error");
+                }
+            }
+            let deadline = Instant::now() + spin_budget;
+            loop {
+                {
+                    let mut cq = ring.completion();
+                    cq.sync();
+                    if !cq.is_empty() {
+                        have_completion = true;
+                        break;
+                    }
+                }
+                if shutdown.closed.load(Ordering::Acquire) || Instant::now() >= deadline {
+                    break;
+                }
+                std::hint::spin_loop();
+            }
+        }
+        if !have_completion {
+            match ring.submit_and_wait(1) {
+                Ok(_) => {}
+                Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(err) => {
+                    tracing::warn!(%err, "io_uring recv submit_and_wait error");
+                }
             }
         }
 
