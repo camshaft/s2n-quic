@@ -582,6 +582,7 @@ async fn execute_single_message(
     response_size: u64,
     use_msg: bool,
 ) -> io::Result<(u64, u64)> {
+    let connect_start = Instant::now();
     let stream = client
         .connect(
             server_addr,
@@ -589,6 +590,7 @@ async fn execute_single_message(
             s2n_quic_dc::credit::Priority::default(),
         )
         .await?;
+    crate::latency::record_connect(connect_start.elapsed());
     send_recv(stream, request_size, response_size, use_msg).await
 }
 

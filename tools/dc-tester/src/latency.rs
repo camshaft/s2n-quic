@@ -17,16 +17,18 @@ use s2n_quic_dc::counter::{Registry, Timer};
 use std::{sync::OnceLock, time::Duration};
 
 struct RpcTimers {
+    connect: Timer,
     ttfb: Timer,
     ttlb: Timer,
 }
 
 static TIMERS: OnceLock<RpcTimers> = OnceLock::new();
 
-/// Register the `rpc.ttfb` / `rpc.ttlb` timers against the endpoint's metric registry. Call once,
-/// on the client, before workers start. Idempotent (a second call is ignored).
+/// Register the `rpc.connect` / `rpc.ttfb` / `rpc.ttlb` timers against the endpoint's metric
+/// registry. Call once, on the client, before workers start. Idempotent (a second call is ignored).
 pub fn init(counters: &Registry) {
     let _ = TIMERS.set(RpcTimers {
+        connect: counters.register_timer("rpc.connect"),
         ttfb: counters.register_timer("rpc.ttfb"),
         ttlb: counters.register_timer("rpc.ttlb"),
     });
@@ -39,5 +41,14 @@ pub fn record(ttfb: Duration, ttlb: Duration) {
     if let Some(t) = TIMERS.get() {
         t.ttfb.record(ttfb);
         t.ttlb.record(ttlb);
+    }
+}
+
+/// Record the per-request stream connect latency (the cost, per request, of opening a new stream —
+/// this is excluded from TTFB/TTLB, which start at the receive). No-op before [`init`].
+#[inline]
+pub fn record_connect(connect: Duration) {
+    if let Some(t) = TIMERS.get() {
+        t.connect.record(connect);
     }
 }
