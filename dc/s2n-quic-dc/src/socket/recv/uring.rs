@@ -329,6 +329,7 @@ fn ring_loop<R: Router>(
     mut reuse: SyncReuseRing,
     mut router: R,
     shutdown: Arc<Shutdown>,
+    spin_budget: Duration,
 ) {
     let depth = buf_ring.entries;
     let bgid = buf_ring.bgid;
@@ -394,7 +395,6 @@ fn ring_loop<R: Router>(
         // non-saturated load. When the window elapses with no completion, block in `submit_and_wait(1)`
         // to release the CPU and catch the eventfd teardown wake. See [`recv_spin_budget`]
         // (`DCQUIC_RECV_URING_SPIN_US`; `0` = block only, historical behavior).
-        let spin_budget = recv_spin_budget();
         let mut have_completion = false;
         if !spin_budget.is_zero() {
             // Submit any pending SQEs (notably a re-armed recv) without waiting, then spin the CQ.
@@ -636,6 +636,25 @@ where
     S: crate::socket::recv::Socket,
     R: Router + Send + 'static,
 {
+    spawn_with_budget(idx, socket, depth, pool, reuse, router, recv_spin_budget())
+}
+
+/// [`spawn`] with an explicit completion-spin budget, so tests can drive the ring on both the
+/// spin-then-block path (`spin_budget > 0`) and the pure blocking path (`spin_budget == 0`) without
+/// depending on the process-global env read in [`recv_spin_budget`].
+pub fn spawn_with_budget<S, R>(
+    idx: usize,
+    socket: S,
+    depth: u16,
+    pool: Pool,
+    reuse: SyncReuseRing,
+    router: R,
+    spin_budget: Duration,
+) -> Result<RecvRing, SpawnError<S, R>>
+where
+    S: crate::socket::recv::Socket,
+    R: Router + Send + 'static,
+{
     let Some(fd) = socket.raw_fd() else {
         // No real OS fd — io_uring cannot drive it. Hand both back for the syscall path.
         return Err(SpawnError::Recoverable(
@@ -679,7 +698,16 @@ where
             // it is dropped here when the loop returns (after the fd is no longer referenced by any
             // in-flight SQE — the loop tears the ring down before returning).
             let _socket = socket;
-            ring_loop(ring, buf_ring, fd, pool, reuse, router, ring_shutdown);
+            ring_loop(
+                ring,
+                buf_ring,
+                fd,
+                pool,
+                reuse,
+                router,
+                ring_shutdown,
+                spin_budget,
+            );
         });
     match join {
         Ok(join) => Ok(RecvRing {
@@ -731,11 +759,12 @@ mod tests {
     /// End-to-end through a real io_uring multishot recv ring: bind a loopback UDP socket, drive it
     /// with a ring, send datagrams from another socket, and verify each arrives with the correct
     /// payload and source address. Exercises the shared descriptor layout, the buffer ring, and
-    /// `RecvMsgOut` parsing on real hardware. Skipped (passes trivially) if io_uring is unavailable.
-    #[test]
-    fn uring_recv_roundtrip() {
+    /// `RecvMsgOut` parsing on real hardware. Parameterized by the completion-spin budget so both the
+    /// spin-then-block path (`> 0`) and the pure blocking path (`0`) are covered. Skipped (passes
+    /// trivially) if io_uring is unavailable.
+    fn roundtrip_with_spin(spin_budget: Duration) {
         if probe().is_err() {
-            eprintln!("io_uring unavailable; skipping uring_recv_roundtrip");
+            eprintln!("io_uring unavailable; skipping roundtrip_with_spin");
             return;
         }
 
@@ -751,7 +780,7 @@ mod tests {
 
         let pool = Pool::new(u16::MAX);
         let reuse = SyncReuseRing::new();
-        let ring = spawn(0, socket, 64, pool, reuse, router)
+        let ring = spawn_with_budget(0, socket, 64, pool, reuse, router, spin_budget)
             .unwrap_or_else(|_| panic!("recv ring spawn must succeed when io_uring is available"));
 
         // Give the ring thread a moment to register the buffer ring and arm the multishot recv.
@@ -787,5 +816,20 @@ mod tests {
             assert_eq!(&got[i].0, expected, "payload {i} bytes");
             assert_eq!(got[i].1, send_addr.port(), "payload {i} source port");
         }
+    }
+
+    /// Spin-then-block path (the default shape): a completion arriving within the spin window is
+    /// reaped without blocking. Guards that the busy-poll drain delivers every datagram — a
+    /// regression in the spin loop (dropped/misrouted completions, wrong re-arm) fails here.
+    #[test]
+    fn uring_recv_roundtrip_spin() {
+        roundtrip_with_spin(Duration::from_micros(50));
+    }
+
+    /// Pure blocking path (`spin_budget == 0`, the historical `submit_and_wait(1)`-only behavior).
+    /// Guards that disabling the spin still delivers every datagram, so the fallback stays correct.
+    #[test]
+    fn uring_recv_roundtrip_block() {
+        roundtrip_with_spin(Duration::ZERO);
     }
 }
