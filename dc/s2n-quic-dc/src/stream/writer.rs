@@ -340,6 +340,12 @@ struct Inner {
     status: Status,
     /// Reset error code if the stream was reset by the peer
     reset_error_code: Option<VarInt>,
+    /// True once a FIN has been requested by the application (a `write_msg`/`write_from` with
+    /// `is_fin`). Used at shutdown/drop to distinguish an INCOMPLETE fin-requested send (which must
+    /// reset, not clean-FIN, so the receiver errors instead of silently accepting a short message)
+    /// from a plain open stream being closed (which finishes gracefully). A COMPLETE fin'd send
+    /// advances to `FinSent`, so `fin_requested && InitSent` at teardown means "incomplete".
+    fin_requested: bool,
     /// Cooperative yield budget
     coop: Coop,
     /// Clock used to stamp `enqueued_at` on application-originated frames and to
@@ -446,6 +452,7 @@ impl Writer {
             remote_max_data,
             status: Status::Init,
             reset_error_code: None,
+            fin_requested: false,
             coop: Coop::default(),
             clock,
             metrics,
@@ -500,6 +507,7 @@ impl Writer {
             remote_max_data: VarInt::new(initial_remote_max_data).unwrap_or(VarInt::MAX),
             status: Status::Open,
             reset_error_code: None,
+            fin_requested: false,
             coop: Coop::default(),
             clock,
             metrics,
@@ -947,6 +955,13 @@ impl Inner {
             return Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()));
         }
 
+        // Record that a FIN was requested so shutdown/drop can tell an INCOMPLETE fin-requested
+        // send (must reset) from a plain open stream (finishes gracefully). Set before any early
+        // return below so a message that parks mid-flight still carries the intent.
+        if flags.is_fin {
+            self.fin_requested = true;
+        }
+
         self.poll_completions(cx)?;
         let _ = self.poll_remote_budget(cx)?;
 
@@ -986,6 +1001,17 @@ impl Inner {
                 self.status.on_init_sent().ok();
             }
             if buf.buffer_is_empty() {
+                // The whole message was sent in the init probe with its FIN, so advance the status
+                // to FinSent to match the wire. Without this the writer stays in InitSent even
+                // though the stream is fully sent+finished, and a later shutdown/drop would (a)
+                // emit a redundant second FIN, and (b) be indistinguishable from a genuinely
+                // INCOMPLETE fin-requested InitSent send (init probe of a large message parked
+                // mid-flight) — which is exactly the case that must RESET, not clean-FIN. Marking
+                // FinSent here keeps "InitSent + fin_requested at teardown" an unambiguous signal
+                // of an incomplete send.
+                if flags.is_fin {
+                    self.status.on_send_fin().ok();
+                }
                 return Poll::Ready(Ok(0));
             }
             return Poll::Pending;
@@ -1252,6 +1278,21 @@ impl Inner {
             self.trace_fin(crate::endpoint::frame_trace::FinOutcome::ShutdownSkipped);
             let error_code = error::SENDER_CANCELLED;
             let _ = self.send_reset_frame(error_code, ResetTarget::Stream);
+            self.status.on_shutdown().ok();
+            return Ok(());
+        }
+
+        if self.status.is_init_sent() && self.fin_requested {
+            // The init probe went out but a fin-requested message never completed (a large
+            // write_msg parked awaiting MAX_DATA, then torn down before the rest was sent). A
+            // COMPLETE fin'd send advances to FinSent (handled by the is_fin_sent branch above), so
+            // reaching here in InitSent with a FIN requested is unambiguously an INCOMPLETE send. A
+            // clean FIN here would let the receiver treat the partial prefix as end-of-stream and
+            // silently truncate; send a Reset instead so it surfaces an error. (A partial first
+            // segment already resets via `pending_chunk_index > 0` above; this covers the case
+            // where the init segment completed — pending_chunk_index == 0 — but the message did not.)
+            self.trace_fin(crate::endpoint::frame_trace::FinOutcome::ShutdownSkipped);
+            let _ = self.send_reset_frame(error::SENDER_CANCELLED, ResetTarget::Stream);
             self.status.on_shutdown().ok();
             return Ok(());
         }
