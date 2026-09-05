@@ -4612,3 +4612,261 @@ fn queue_msg_gap_exceeded_silent_drop_stalls_reader() {
          leaving a permanent stream hole"
     );
 }
+
+// ── COMMIT INTO PR #539 (transport primary: Inner::shutdown InitSent&&fin_requested => Reset) ──
+// Placement: dc/s2n-quic-dc/src/endpoint/tests.rs (top-level, alongside the other endpoint tests).
+// Requires imports already present in that file: Client, Server, sim, testing::ext::*, Data, VarInt,
+// Bytes/BytesMut, crate::stream::MsgFlags, bach::time::timeout, Duration.
+// FAIL->PASS (case 1, write_msg_fin_dropped_while_parked_truncates): WITHOUT #539 the receiver
+// SILENTLY completes at the ~init-probe offset (clean-FIN, errors=0 — lane B's production 8192B
+// symptom) => assertion fails. WITH #539 the incomplete fin-requested drop sends a Reset => the
+// receiver errors LOUDLY (ConnectionReset) instead of silently truncating => passes.
+// case 2 (small_complete_in_probe): GREEN both before/after — regression guard that #539's
+// fin_requested/on_send_fin gating does NOT reset a fully-delivered small message.
+// case 3 (full_delivery_when_driven_to_completion): GREEN both before/after — guards that the fix
+// does not regress full delivery (the earlier defer-fin attempt HUNG here; this fix must not).
+// (#[ignore] removed from case 1: runs green in the PR with the fix; run on the base commit to see
+// it fail.)
+
+/// PRIMARY GUARANTEE (endpoint loopback, case 1): dropping a writer while write_msg(is_fin) is
+/// still parked must NOT SILENTLY truncate — the receiver must get the full payload OR a loud error
+/// (Reset), never a clean EOF at a short length (errors=0). That silent clean-EOF is lane B's
+/// production symptom (a 64k message delivered as ~8KB, GET "success").
+///
+/// A small server recv window (<= one msg chunk) makes the init probe a single COMPLETE segment
+/// (pending_chunk_index == 0), so the drop takes Inner::shutdown's clean-FIN branch (send_fin_packet)
+/// — the SILENT mode. FAILS today (silent short EOF). PASSES once lane A's transport fix makes an
+/// incomplete fin-requested stream Reset instead of clean-FIN (the "no silent truncation" guarantee,
+/// per the operator; full delivery is the DEFENSE fix #537's job — write_msg parks inline so a
+/// dropped future's chunks 2..N are unrecoverable at the transport).
+#[test]
+fn write_msg_fin_dropped_while_parked_truncates() {
+    let _guard = crate::testing::without_snapshots();
+    sim(|| {
+        use crate::testing::ext::*;
+        use crate::endpoint::testing::sim::SimEndpointConfig;
+        let acceptor_id = VarInt::from_u8(1);
+        const PAYLOAD: usize = 64 * 1024;
+        // <= one msg chunk (msg_packet_size ~1320 in the sim), so the init probe is a single
+        // complete segment => drop hits the clean-FIN (silent) branch, not the partial-segment
+        // Reset branch.
+        const RECV_WINDOW: u32 = 1024;
+
+        // ── Server: small recv window + delay reading so the client's write_msg parks after the
+        //    (complete, single-chunk) init probe; then drain and assert it was not SILENTLY truncated.
+        async move {
+            let server = Server::with_config(
+                SimEndpointConfig::default().send_window(VarInt::from_u32(RECV_WINDOW)),
+            );
+            let mut acceptor = server
+                .register_acceptor_channel(acceptor_id, 8)
+                .expect("acceptor registration failed");
+            while let Some(stream) = acceptor.recv().await {
+                async move {
+                    let (mut reader, _writer) = stream.into_split();
+                    // Hold off reading so no MAX_DATA is granted while the client is writing.
+                    50.ms().sleep().await;
+                    let mut buf = BytesMut::with_capacity(PAYLOAD + 64);
+                    let mut clean_eof = false;
+                    loop {
+                        match reader.read_into(&mut buf).await {
+                            Ok(0) => {
+                                clean_eof = true;
+                                break;
+                            }
+                            Ok(_) => {}
+                            Err(e) => {
+                                info!(?e, "server read errored (LOUD — guarantee satisfied)");
+                                break;
+                            }
+                        }
+                    }
+                    // The guarantee is "no SILENT truncation": full delivery OR a loud error, never
+                    // a clean short EOF.
+                    let silently_truncated = clean_eof && buf.len() < PAYLOAD;
+                    assert!(
+                        !silently_truncated,
+                        "SILENT truncation: peer received {} of {PAYLOAD} bytes as a CLEAN EOF (no \
+                         error): a writer dropped while write_msg was parked emitted a clean FIN at \
+                         the init probe. The receiver must get the full payload OR a loud error, \
+                         never a silent short EOF.",
+                        buf.len(),
+                    );
+                }
+                .primary()
+                .spawn();
+            }
+        }
+        .group("server")
+        .spawn();
+
+        // ── Client: model from_stream abandoning a still-parked write_msg and returning (dropping
+        //    the writer).
+        async move {
+            // Configure the CLIENT with the small window too: the client writer's
+            // initial_remote_max_data is seeded from its OWN params.local_recv_max_data
+            // (writer.rs:410), so this is what caps the init probe to a single complete segment.
+            let mut client = Client::with_config(
+                SimEndpointConfig::default().send_window(VarInt::from_u32(RECV_WINDOW)),
+            );
+            let stream = client
+                .connect("server:0", acceptor_id)
+                .await
+                .expect("connect failed");
+            let (reader, mut writer) = stream.into_split();
+            let mut req = Data::new(PAYLOAD as u64);
+            // write_msg sends the init probe then parks (server is not draining yet). The timeout
+            // stands in for from_stream returning on reader-done and dropping the write.
+            let _ = timeout(
+                Duration::from_millis(20),
+                writer.write_msg(&mut req, crate::stream::MsgFlags { is_fin: true, is_wakeup: true }),
+            )
+            .await;
+            drop(writer);
+            drop(reader);
+            // Keep the client endpoint alive so its transport keeps ACKing the peer.
+            60.s().sleep().await;
+        }
+        .group("client")
+        .primary()
+        .spawn();
+    });
+}
+
+/// Companion (correct usage): the same large write_msg(is_fin=true) delivers the FULL payload when
+/// driven to completion (the reader drains and grants MAX_DATA) and then shut down. Pins the good
+/// path — and the operator's API guarantee once the drop/shutdown case is fixed.
+#[test]
+fn write_msg_fin_full_delivery_when_driven_to_completion() {
+    let _guard = crate::testing::without_snapshots();
+    sim(|| {
+        use crate::testing::ext::*;
+        let acceptor_id = VarInt::from_u8(1);
+        const PAYLOAD: usize = 64 * 1024;
+
+        async move {
+            let server = Server::new();
+            let mut acceptor = server
+                .register_acceptor_channel(acceptor_id, 8)
+                .expect("acceptor registration failed");
+            while let Some(stream) = acceptor.recv().await {
+                async move {
+                    let (mut reader, _writer) = stream.into_split();
+                    let mut buf = BytesMut::with_capacity(PAYLOAD + 64);
+                    loop {
+                        let n = reader.read_into(&mut buf).await.expect("server read");
+                        if n == 0 {
+                            break;
+                        }
+                    }
+                    assert_eq!(buf.len(), PAYLOAD, "peer must receive the full driven-to-completion payload");
+                }
+                .primary()
+                .spawn();
+            }
+        }
+        .group("server")
+        .spawn();
+
+        async move {
+            let mut client = Client::new();
+            let stream = client
+                .connect("server:0", acceptor_id)
+                .await
+                .expect("connect failed");
+            let (_reader, mut writer) = stream.into_split();
+            let mut req = Data::new(PAYLOAD as u64);
+            let written = timeout(
+                60.s(),
+                writer.write_msg(&mut req, crate::stream::MsgFlags { is_fin: true, is_wakeup: true }),
+            )
+            .await
+            .expect("write_msg should not hang when the reader drains")
+            .expect("write_msg should succeed");
+            assert_eq!(written, PAYLOAD, "write_msg should report the full payload length");
+            // Correct usage: shut down only AFTER the write completed.
+            writer.shutdown().expect("shutdown");
+            60.s().sleep().await;
+        }
+        .group("client")
+        .primary()
+        .spawn();
+    });
+}
+
+/// REGRESSION GUARD (endpoint loopback): a SMALL write_msg(is_fin=true) that fits entirely in the
+/// init probe is fully delivered even though the writer is then dropped — it must NOT be reset.
+///
+/// This pins the case lane A flagged: a COMPLETE small message sent in the init path ALSO lands in
+/// `InitSent` (the init-probe FIN does not transition to `FinSent`, writer.rs:1000), so it is
+/// indistinguishable from an INCOMPLETE large parked message by status alone. A naive
+/// "InitSent => Reset" hardening of Inner::shutdown would reset this fully-delivered small message
+/// = a correctness regression. This test stays GREEN today and MUST stay green after the transport
+/// fix (which must reset only the fin-requested-but-INCOMPLETE case, e.g. via complete-init-fin =>
+/// FinSent).
+#[test]
+fn write_msg_fin_small_complete_in_probe_delivers_full_despite_drop() {
+    let _guard = crate::testing::without_snapshots();
+    sim(|| {
+        use crate::testing::ext::*;
+        let acceptor_id = VarInt::from_u8(1);
+        // Small enough to be fully sent in the init probe (<= packet_size), so the write completes
+        // immediately and the writer sits in InitSent with the FIN already delivered.
+        const PAYLOAD: usize = 4096;
+
+        async move {
+            let server = Server::new();
+            let mut acceptor = server
+                .register_acceptor_channel(acceptor_id, 8)
+                .expect("acceptor registration failed");
+            while let Some(stream) = acceptor.recv().await {
+                async move {
+                    let (mut reader, _writer) = stream.into_split();
+                    let mut buf = BytesMut::with_capacity(PAYLOAD + 64);
+                    loop {
+                        match reader.read_into(&mut buf).await {
+                            Ok(0) => break,
+                            Ok(_) => {}
+                            Err(e) => panic!(
+                                "server read errored on a fully-delivered small message: {e:?} -- a \
+                                 complete small write_msg(is_fin) in the init probe was reset (the \
+                                 InitSent=>Reset regression)"
+                            ),
+                        }
+                    }
+                    assert_eq!(
+                        buf.len(),
+                        PAYLOAD,
+                        "small complete write_msg(is_fin) must be delivered in full despite the \
+                         writer being dropped afterwards"
+                    );
+                }
+                .primary()
+                .spawn();
+            }
+        }
+        .group("server")
+        .spawn();
+
+        async move {
+            let mut client = Client::new();
+            let stream = client
+                .connect("server:0", acceptor_id)
+                .await
+                .expect("connect failed");
+            let (_reader, mut writer) = stream.into_split();
+            let mut req = Data::new(PAYLOAD as u64);
+            let written = writer
+                .write_msg(&mut req, crate::stream::MsgFlags { is_fin: true, is_wakeup: true })
+                .await
+                .expect("small write_msg should complete in the init probe");
+            assert_eq!(written, PAYLOAD, "write_msg should report the full small length");
+            // Model from_stream returning and dropping the writer right after the (completed) write.
+            drop(writer);
+            60.s().sleep().await;
+        }
+        .group("client")
+        .primary()
+        .spawn();
+    });
+}
