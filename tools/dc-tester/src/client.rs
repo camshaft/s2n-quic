@@ -66,6 +66,10 @@ pub async fn run(
 
     let stats = crate::stats::Subscriber::spawn(std::time::Duration::from_secs(1));
 
+    // Register the client-side RPC latency timers (TTFB/TTLB) on the endpoint's metric registry so
+    // the standard [METRICS] reporter emits their percentiles alongside the transport counters.
+    crate::latency::init(&endpoint.counters);
+
     // Warm up path secrets by sending a ping to each server
     for &addr in &server_addrs {
         info!(%addr, "Warming up connection");
@@ -578,6 +582,7 @@ async fn execute_single_message(
     response_size: u64,
     use_msg: bool,
 ) -> io::Result<(u64, u64)> {
+    let connect_start = Instant::now();
     let stream = client
         .connect(
             server_addr,
@@ -585,6 +590,7 @@ async fn execute_single_message(
             s2n_quic_dc::credit::Priority::default(),
         )
         .await?;
+    crate::latency::record_connect(connect_start.elapsed());
     send_recv(stream, request_size, response_size, use_msg).await
 }
 
@@ -756,7 +762,12 @@ async fn send_recv(
     };
 
     let recv = async move {
+        // Measure client-observed response latency: TTFB = first response byte, TTLB = last byte,
+        // both from the start of the recv (per-request connect is excluded — it happens upstream in
+        // execute_single_message — so this is the transport RPC latency, comparable to pooled clients).
+        let start = Instant::now();
         let mut response = Data::new(response_size);
+        let mut ttfb: Option<Duration> = None;
         loop {
             let n = match tokio::time::timeout(
                 Duration::from_secs(10),
@@ -794,6 +805,9 @@ async fn send_recv(
             if n == 0 {
                 break;
             }
+            if ttfb.is_none() {
+                ttfb = Some(start.elapsed());
+            }
         }
 
         if !response.is_finished() {
@@ -803,6 +817,9 @@ async fn send_recv(
                 response.current_offset()
             )));
         }
+
+        let ttlb = start.elapsed();
+        crate::latency::record(ttfb.unwrap_or(ttlb), ttlb);
 
         io::Result::Ok(response_size)
     };

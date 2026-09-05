@@ -5,6 +5,7 @@ mod busy_poll;
 mod client;
 mod config;
 mod endpoint;
+mod latency;
 mod psk;
 mod reporter;
 mod server;
