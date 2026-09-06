@@ -189,7 +189,7 @@ impl FrameBatch {
     }
 
     #[inline]
-    fn push_with_cost(&mut self, frame: Entry<Frame>, frame_cost: u64) {
+    pub(crate) fn push_with_cost(&mut self, frame: Entry<Frame>, frame_cost: u64) {
         self.byte_cost = self.byte_cost.saturating_add(frame_cost);
         let idx = frame.priority().as_index();
         self.byte_costs[idx] = self.byte_costs[idx].saturating_add(frame_cost);
@@ -711,6 +711,57 @@ where
     let sender_id = LocalSenderId::from_index(idx);
 
     let mut batch = FrameBatch::new(frame);
+    batch.set_sender_id(sender_id);
+
+    match senders[sender_id].send(Entry::new(batch)) {
+        Ok(()) => Ok(()),
+        Err(value) => {
+            let leaked = value.total_flow_credits();
+            if leaked > 0 {
+                send_credit_pool.release(leaked);
+            }
+            Err(())
+        }
+    }
+}
+
+/// Batch variant of [`direct_spray`]: coalesces a homogeneous `Queue<Frame>` into ONE
+/// [`FrameBatch`] and round-robin-sprays it to a single send worker (matching the global path,
+/// where `PickTwo` routes a whole batch to one socket; the per-batch cursor advance keeps a
+/// stream's successive batches spread across sockets = multi-tuple). Bypasses the global
+/// `frame_dispatch` worker + pacing. Frames already carry their `flow_credits`.
+///
+/// On send failure (worker teardown) the batch's borrowed credit is released before dropping,
+/// mirroring [`PickTwo`]. Returns `Err(())` so the caller surfaces a closed-channel error; the
+/// frames drop at the routing layer exactly as `PickTwo` drops an undeliverable batch.
+#[allow(dead_code)]
+#[inline]
+pub(crate) fn direct_spray_batch<S>(
+    mut frames: crate::intrusive::Queue<Frame>,
+    senders: &mut IdMap<LocalSenderId, S>,
+    cursor: &mut usize,
+    send_credit_pool: &crate::credit::Pool,
+) -> Result<(), ()>
+where
+    S: UnboundedSender<Entry<FrameBatch>>,
+{
+    let len = senders.len();
+    if len == 0 {
+        debug_assert!(len > 0, "direct_spray_batch requires at least one send sender");
+        return Err(());
+    }
+    let Some(first) = frames.pop_front() else {
+        return Ok(()); // empty batch — nothing to send
+    };
+    let mut batch = FrameBatch::new(first);
+    while let Some(frame) = frames.pop_front() {
+        let cost = frame.byte_cost();
+        batch.push_with_cost(frame, cost);
+    }
+
+    let idx = *cursor % len;
+    *cursor = idx.wrapping_add(1);
+    let sender_id = LocalSenderId::from_index(idx);
     batch.set_sender_id(sender_id);
 
     match senders[sender_id].send(Entry::new(batch)) {
