@@ -68,7 +68,7 @@ pub const DEFAULT_DEAD_PEER_COOLDOWN: Duration = Duration::from_secs(30);
 /// The maximum length of a single packet
 pub const MAX_DATAGRAM_SIZE: usize = 1 << 15; // 32k
 
-type BatchSender =
+pub(crate) type BatchSender =
     GaugedSender<sync_queue::Sender<combinator::FrameBatch>, Entry<combinator::FrameBatch>>;
 type BatchReceiver = sync_queue::Receiver<combinator::FrameBatch>;
 type AckMsgReceiver = sync_queue::Receiver<msg::Sender>;

@@ -364,6 +364,17 @@ struct Inner {
     /// attached to a frame. Carry-over after a batch consumes less than was
     /// granted is released back to the pool.
     pending_credits: u64,
+    /// Adaptive dispatch (low-concurrency direct-submit path). When `Some`, this stream was opened
+    /// in DIRECT mode: it pushes each frame batch straight to a send worker (round-robin spray
+    /// across the sockets, via `rr_cursor`), bypassing the global `frame_dispatch` worker (w0) and
+    /// its pacing. `None` ⇒ the global path (through `frame_tx`). The choice is made once at open
+    /// (sticky per stream) so a stream's frames never split across paths (no reorder). Each direct
+    /// writer owns its own sender clones because `UnboundedSender::send` needs `&mut`.
+    direct_senders:
+        Option<crate::endpoint::id::IdMap<crate::endpoint::id::LocalSenderId, crate::endpoint::BatchSender>>,
+    /// Round-robin cursor over `direct_senders` — advances per batch so one stream still sprays
+    /// across all sockets (multi-tuple; one stream can saturate the link past EC2's per-flow cap).
+    rr_cursor: usize,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -459,6 +470,8 @@ impl Writer {
             priority,
             send_credit_pool,
             pending_credits: 0,
+            direct_senders: None,
+            rr_cursor: 0,
         }))
     }
 
@@ -514,6 +527,8 @@ impl Writer {
             priority,
             send_credit_pool,
             pending_credits: 0,
+            direct_senders: None,
+            rr_cursor: 0,
         }))
     }
 
@@ -2367,6 +2382,20 @@ impl Inner {
         // aggregation/credit/pacing/assembly. Pairs with the Outbound record at assembly so the
         // submit→wire latency is visible. PN is not assigned yet.
         crate::endpoint::frame_trace::app_send(&frame.header, *self.path_secret_entry.id());
+        // Adaptive dispatch: a direct-mode stream sprays straight to a send worker, skipping the
+        // global frame_dispatch hop. The frame already carries its borrowed `flow_credits`, so no
+        // credit is (re)acquired; on a closed send channel the helper releases that credit.
+        if let Some(senders) = &mut self.direct_senders {
+            return crate::endpoint::combinator::direct_spray(
+                Entry::new(frame),
+                senders,
+                &mut self.rr_cursor,
+                &self.send_credit_pool,
+            )
+            .map_err(|()| {
+                io::Error::new(io::ErrorKind::BrokenPipe, "direct send channel closed")
+            });
+        }
         self.frame_tx
             .send_batch(Entry::new(frame))
             .map_err(|mut returned| {
