@@ -52,6 +52,21 @@ const _: () = assert!(std::mem::size_of::<Page>() == PAGE_SIZE);
 #[cfg(test)]
 static PAGES_ALLOCATED: AtomicU64 = AtomicU64::new(0);
 
+/// Footgun detector for a recording registry with no reporter draining `registry.absorb()`.
+///
+/// `send_event_slow` self-heals by folding `full_pages` back into `empty_pages` when the pool is
+/// exhausted, so memory stays bounded even with no drainer — but that emergency fold only happens
+/// because nothing is draining proactively. If it fires *repeatedly*, a reporter is missing: the
+/// metrics are memory-safe but never EXPORTED (they aggregate and are dropped on registry teardown).
+/// The historical production incident was exactly this — an endpoint stood up a registry with no
+/// reporter. Warn once (loud, not silent) so the misconfiguration is caught; the fold keeps us safe
+/// either way. Process-wide + warn-once: a healthy reporter drains before the count accrues, so the
+/// warning only trips when a registry genuinely records without ever being drained.
+static SELF_HEAL_FOLDS: AtomicU64 = AtomicU64::new(0);
+static SELF_HEAL_WARNED: AtomicBool = AtomicBool::new(false);
+/// Enough repeated exhaustion-folds that a transient burst under a working reporter is ruled out.
+const SELF_HEAL_WARN_THRESHOLD: u64 = 256;
+
 #[cfg(any(test, target_os = "linux"))]
 impl Page {
     fn new() -> Box<Page> {
@@ -584,6 +599,20 @@ impl<T: Absorb> Channels<T> {
         let mut new_page = match self.empty_pages.pop(cpu_hint) {
             Some(page) => page,
             None => {
+                // Repeated self-heals mean no reporter is draining registry.absorb(): warn once so
+                // the reporter-less-registry footgun is loud instead of silent. The fold below still
+                // bounds memory either way.
+                let folds = SELF_HEAL_FOLDS.fetch_add(1, Ordering::Relaxed) + 1;
+                if folds == SELF_HEAL_WARN_THRESHOLD
+                    && !SELF_HEAL_WARNED.swap(true, Ordering::Relaxed)
+                {
+                    eprintln!(
+                        "dc-metrics: page pool self-healed {SELF_HEAL_WARN_THRESHOLD} times on \
+                         exhaustion — no reporter is draining registry.absorb(); metrics are \
+                         memory-bounded but NOT exported. Install a reporter that calls \
+                         registry.absorb() periodically to actually export metrics."
+                    );
+                }
                 self.absorb_full_pages();
                 self.empty_pages.pop(cpu_hint).unwrap_or_else(Page::new)
             }
