@@ -152,15 +152,19 @@ pub(crate) struct DirectDispatch {
     pub mode: DispatchMode,
     pub crossover: Crossover,
     pub backpressure: Backpressure,
-    /// Count of streams CURRENTLY on the direct path (endpoint-wide). This is the crossover's
-    /// backpressure signal in `Adaptive` mode: direct-submit skips the global batcher/pacer, so
-    /// many concurrent direct streams crater throughput (measured: r64k-c8 direct-only halved RX).
-    /// Bounding the number of concurrent direct streams bounds that harm — as the count rises
-    /// toward `direct_cap`, new streams increasingly fall back to the (batched, shaped) global path.
-    active_direct: AtomicUsize,
-    /// Soft cap on concurrent direct streams: the crossover ramps `active_direct/direct_cap` through
-    /// [`Crossover`], so the fraction of new streams taking direct decays smoothly to 0 as the cap
-    /// is approached (gradual, not a hard flip). Tunable via `DCQUIC_ADAPTIVE_DIRECT_CAP`.
+    /// Count of ALL streams currently active on this endpoint (every writer inc/dec, direct or not).
+    /// This is the crossover's signal in `Adaptive` mode. Measured: direct-submit skips the global
+    /// batcher/pacer, and a direct stream SHARES the 64 send sockets with the global streams, so
+    /// even ONE concurrent direct stream at c8 dents throughput ~21% and two collapse it. The harm
+    /// is not "how many are direct" but "is anything else running" — a direct stream only pays off
+    /// when it is SOLO. So direct is a solo-stream fast lane: gate on total concurrency, not on the
+    /// direct count. At c8 every stream has neighbors ⇒ all global (exact parity); at c1 the solo
+    /// stream goes direct ⇒ the hop-cut win.
+    active_total: AtomicUsize,
+    /// Solo threshold (concurrency scale) for the crossover ramp: `prior_active / direct_cap`.
+    /// Default 1 ⇒ direct only when `prior_active == 0` (strictly solo). Tunable via
+    /// `DCQUIC_ADAPTIVE_DIRECT_CAP` (a larger value permits direct at slightly higher concurrency,
+    /// trading a small high-conc dent for more low-conc coverage — an A/B knob).
     direct_cap: usize,
 }
 
@@ -170,28 +174,26 @@ impl DirectDispatch {
         self.senders.clone()
     }
 
-    /// Current number of streams on the direct path.
+    /// Register a newly-opened stream and return the number of OTHER streams that were already
+    /// active (the concurrency this stream is entering). Call once at open for EVERY adaptive-mode
+    /// writer; balanced by [`dec_total`](Self::dec_total) in the writer's Drop.
     #[inline]
-    pub fn active_direct(&self) -> usize {
-        self.active_direct.load(Ordering::Relaxed)
+    pub fn inc_total(&self) -> usize {
+        self.active_total.fetch_add(1, Ordering::Relaxed)
     }
 
-    /// Normalized crossover signal in `[0,1]`: `active_direct / direct_cap`.
+    /// Register a stream closing. Call once from the writer's Drop for every adaptive-mode writer.
     #[inline]
-    pub fn direct_pressure(&self) -> f64 {
-        (self.active_direct() as f64 / self.direct_cap.max(1) as f64).clamp(0.0, 1.0)
+    pub fn dec_total(&self) {
+        self.active_total.fetch_sub(1, Ordering::Relaxed);
     }
 
-    /// Register that a stream took the direct path (call once at open of a direct stream).
+    /// Normalized crossover signal for a stream entering at `prior_active` other streams:
+    /// `prior_active / direct_cap`. With the default cap of 1 this is 0.0 when solo and ≥1.0
+    /// otherwise, so the crossover picks direct only for a solo stream.
     #[inline]
-    pub fn inc_direct(&self) {
-        self.active_direct.fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// Register that a direct stream closed (call once from the direct writer's Drop).
-    #[inline]
-    pub fn dec_direct(&self) {
-        self.active_direct.fetch_sub(1, Ordering::Relaxed);
+    pub fn pressure_at(&self, prior_active: usize) -> f64 {
+        (prior_active as f64 / self.direct_cap.max(1) as f64).clamp(0.0, 1.0)
     }
 }
 
@@ -209,13 +211,13 @@ pub(crate) fn install(senders: IdMap<LocalSenderId, BatchSender>) {
         .ok()
         .and_then(|v| v.trim().parse::<usize>().ok())
         .filter(|&n| n > 0)
-        .unwrap_or(4);
+        .unwrap_or(1); // default: strictly solo (direct only when no other stream is active)
     let _ = DIRECT.set(Arc::new(DirectDispatch {
         senders,
         mode,
         crossover: Crossover::default(),
         backpressure: Backpressure::default(),
-        active_direct: AtomicUsize::new(0),
+        active_total: AtomicUsize::new(0),
         direct_cap,
     }));
 }

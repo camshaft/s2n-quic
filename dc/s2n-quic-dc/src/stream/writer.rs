@@ -419,24 +419,25 @@ fn open_direct_senders(
 {
     use crate::endpoint::adaptive::DispatchMode;
     let dd = crate::endpoint::adaptive::get()?;
+    // Register this stream in the endpoint-wide active count and learn how many OTHER streams are
+    // already running. EVERY adaptive-mode writer counts (direct or global); the writer's Drop
+    // decrements once (gated on adaptive being installed), so inc/dec stay balanced regardless of
+    // the path chosen.
+    let prior_active = dd.inc_total();
     let take_direct = match dd.mode {
         DispatchMode::Off => false,
         // Direct: unconditional (isolates the low-conc hop-cut win in A/B; not for high conc).
         DispatchMode::Direct => true,
         DispatchMode::Adaptive => {
-            // Per-stream sticky draw vs the crossover ramp on the ACTIVE-DIRECT-stream pressure:
-            // take direct with probability (1 - global_probability). Few direct streams ⇒ ~0 global
-            // ⇒ join the fast lane; as the count approaches direct_cap the ramp pushes new streams
-            // to the (batched, shaped) global path — bounding the un-batched direct load that
-            // craters throughput at concurrency (measured r64k-c8 direct-only collapse).
-            let p_global = dd.crossover.global_probability(dd.direct_pressure());
+            // Direct is a SOLO-stream fast lane: a direct stream shares the 64 send sockets with
+            // the global streams and skips batching, so even one direct stream dents throughput at
+            // concurrency (measured c8). Gate on TOTAL concurrency: with the default cap=1 the ramp
+            // yields global unless `prior_active == 0` (strictly solo). Per-stream sticky draw.
+            let p_global = dd.crossover.global_probability(dd.pressure_at(prior_active));
             crate::xorshift::Rng::new().next_f64() >= p_global
         }
     };
     if take_direct {
-        // Register on the direct path BEFORE cloning senders; the writer's Drop decrements iff its
-        // `direct_senders` ended up `Some`, so inc/dec stay balanced.
-        dd.inc_direct();
         Some(dd.clone_senders())
     } else {
         None
@@ -2476,12 +2477,12 @@ impl Inner {
 
 impl Drop for Writer {
     fn drop(&mut self) {
-        // Adaptive dispatch: balance the active-direct counter. A writer holds `direct_senders`
-        // iff it took the direct path at open (and incremented), so decrement here exactly once.
-        if self.0.direct_senders.is_some() {
-            if let Some(dd) = crate::endpoint::adaptive::get() {
-                dd.dec_direct();
-            }
+        // Adaptive dispatch: balance the endpoint-wide active-stream counter. EVERY adaptive-mode
+        // writer incremented it at open (via open_direct_senders), so decrement once here whenever
+        // adaptive is installed. `get()` is a process-global OnceLock (stable for the process), so
+        // inc at open and dec here are balanced.
+        if let Some(dd) = crate::endpoint::adaptive::get() {
+            dd.dec_total();
         }
         debug!(
             binding_id = self.0.control_rx.binding_id().as_u64(),
