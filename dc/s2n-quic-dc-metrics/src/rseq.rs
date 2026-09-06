@@ -571,7 +571,23 @@ impl<T: Absorb> Channels<T> {
     #[cfg_attr(target_arch = "aarch64", target_feature(enable = "lse"))]
     fn send_event_slow(&self, rseq_ptr: NonNull<Rseq>, serialized_event: u64) {
         let cpu_hint = unsafe { (*rseq_ptr.as_ptr()).cpu_id_start } as usize;
-        let mut new_page = self.empty_pages.pop(cpu_hint).unwrap_or_else(Page::new);
+        // Self-bounding: normally `empty_pages` is refilled by `absorb_full_pages` running off the
+        // reporter (`registry.absorb()`). A consumer that records without ever draining (e.g. an
+        // endpoint whose registry has no reporter installed) would otherwise never refill the pool,
+        // so every slow-path here would `Page::new` without bound — the recorded-but-unabsorbed
+        // pages pile up in `full_pages` and the process OOMs. Guard against that: when the pool is
+        // exhausted, fold `full_pages` back into `empty_pages` ourselves (recycling their memory —
+        // the same conservation the reporter would do) and retry, only allocating a fresh page if
+        // there is genuinely nothing to recycle. This is a cold backpressure path (fires only on
+        // exhaustion), so it adds no cost to the warm recycle path and preserves the crate's
+        // "recording must not grow memory without bound" invariant regardless of who drains.
+        let mut new_page = match self.empty_pages.pop(cpu_hint) {
+            Some(page) => page,
+            None => {
+                self.absorb_full_pages();
+                self.empty_pages.pop(cpu_hint).unwrap_or_else(Page::new)
+            }
+        };
 
         new_page.slots[0].write(serialized_event);
         new_page.length.store(1, Ordering::Relaxed);
@@ -1253,6 +1269,40 @@ mod tests {
             "page pool kept allocating after warm-up: {fresh_allocations} fresh Page::new in the \
              measurement window vs ~{filled_pages_estimate} pages' worth of events recorded \
              (total events {total_recorded}); expected recycling to keep this near-constant"
+        );
+    }
+
+    /// Regression for the `send_event_slow` OOM: a consumer that records but NEVER drains (its
+    /// registry has no reporter, so `registry.absorb()` / `absorb_full_pages` is never called) must
+    /// NOT grow page allocation without bound. Before the self-bounding fold-on-exhaustion,
+    /// `empty_pages` was never refilled, so every slow-path minted a fresh `Page` — a page per
+    /// ~`SLOTS` events, which OOM'd an idle endpoint at multiple GB/s. The fix folds `full_pages`
+    /// back into `empty_pages` on exhaustion, so allocation stays bounded with no external drainer.
+    #[test]
+    fn records_without_reporter_self_bound() {
+        let channels = Channels::<TestAbsorber>::new();
+        channels.allocate();
+        if channels.must_use_fallback {
+            return; // the fallback path never touches the page pool
+        }
+        let before = PAGES_ALLOCATED.load(Ordering::Relaxed);
+        // Record far more events than a bounded pool could hold if pages never recycled — and
+        // deliberately NEVER call absorb()/report (an endpoint whose registry has no reporter).
+        let n: u64 = 2_000_000;
+        for i in 0..n {
+            channels.send_event(i);
+        }
+        let allocated = PAGES_ALLOCATED
+            .load(Ordering::Relaxed)
+            .saturating_sub(before);
+        // Without the fix `allocated` tracks ~n/SLOTS (grows with events). With fold-on-exhaustion
+        // it stays a small multiple of the warm pool — assert far below the unbounded count.
+        let unbounded = n / SLOTS as u64;
+        assert!(
+            allocated < unbounded / 10 + 64,
+            "recording without a reporter must self-bound page allocation: {allocated} fresh \
+             Page::new for {n} events (unbounded would be ~{unbounded}); fold-on-exhaustion should \
+             recycle full_pages so the pool cannot grow without an external drainer"
         );
     }
 }
