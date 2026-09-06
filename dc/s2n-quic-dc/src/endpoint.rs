@@ -1384,7 +1384,7 @@ where
                 );
                 let recv_dispatch_idx = rd.recv_dispatch_idx;
                 let recv_cache = std::rc::Rc::new(std::cell::RefCell::new(
-                    crate::stream::endpoint::recv::Cache::new(recv_dispatch_idx),
+                    crate::stream::endpoint::recv::Cache::new(&counter_registry, recv_dispatch_idx),
                 ));
                 let (ack_burst_tx, ack_burst_rx) =
                     crate::socket::channel::intrusive::unsync::new_with_adapter::<
