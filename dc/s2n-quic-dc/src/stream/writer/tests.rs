@@ -3088,6 +3088,50 @@ fn send_data_yields_under_large_buffer() {
     });
 }
 
+#[test]
+fn send_data_large_slice_write_reassembles_byte_exact_with_single_fin() {
+    // Guards the single-allocation payload path (`SharedPayload` + `Builder::split`): a large,
+    // multi-frame `&[u8]` write must reassemble to the EXACT input bytes with contiguous offsets
+    // and exactly one FIN on the final frame — i.e. the refcounted `split` slices carve the one
+    // shared head buffer without tearing, duplicating, dropping, or reordering any byte. `&[u8]`
+    // reads as `Chunk::Slice`, so this drives the copy/`put_slice` path that the optimization
+    // changes (not the zero-copy `Bytes` path). Runs under the default single-allocation path.
+    let _guard = crate::testing::without_snapshots();
+    sim(|| {
+        let (mut writer, mut pusher) = make_server_pair();
+        writer.0.remote_max_data = VarInt::MAX;
+
+        let mtu = writer.0.packet_size as usize;
+        let budget = crate::stream::coop::BUDGET as usize;
+        // Several budgets' worth of MTU frames (so many split() slices come off one allocation)
+        // plus a short, non-MTU-aligned tail so the last chunk is a partial split.
+        let total = mtu * budget * 4 + 7;
+        let expected: Vec<u8> = (0..total).map(|i| (i % 251) as u8).collect();
+        let expected_recv = expected.clone();
+
+        async move {
+            let mut asm = PayloadAssembler::default();
+            let frames = pusher.recv_frames_until_fin().await;
+            asm.push_queue_data(&frames);
+            asm.assert_payload(&expected_recv);
+            asm.assert_fin_count(1);
+        }
+        .primary()
+        .spawn();
+
+        async move {
+            let mut payload: &[u8] = &expected;
+            let written = writer
+                .write_all_from_fin(&mut payload)
+                .await
+                .expect("write_all_from_fin should succeed");
+            assert_eq!(written, total, "every byte must be written");
+        }
+        .primary()
+        .spawn();
+    });
+}
+
 /// BUG REPRODUCTION: Client write_msg with a payload just above packet_size
 /// splits into a 2-chunk QueueMsg segment. During Init (force_first=true),
 /// only chunk 0 is sent. After MAX_DATA unblocks the writer, `send_msg` is
