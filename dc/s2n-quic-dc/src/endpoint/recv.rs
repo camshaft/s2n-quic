@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
+    counter::{Counter, Registry},
     credentials::{self, Credentials},
     endpoint::{
         id::{LocalSenderId, RecvDispatchWorkerId, RemoteSenderId},
@@ -447,13 +448,29 @@ impl core::hash::Hash for Key {
 pub(crate) struct Cache {
     pub senders: FxHashMap<Key, Rc<RefCell<Context>>>,
     pub worker_id: RecvDispatchWorkerId,
+    /// 1-entry last-hit front cache: the most recently resolved `(Key, Context)`. Consecutive packets
+    /// on a dispatch worker very often belong to the same sender (GRO/bursty per-flow arrival), so a
+    /// match here skips the `FxHash` of the ~24-byte key + the map probe. `senders` stays the source of
+    /// truth; `last` is cleared whenever its entry is removed / invalidated, and refreshed to the new
+    /// entry on a key-advance replace. Only the hash+probe is skipped — the key_id / replay / dedup
+    /// checks are unchanged.
+    last: Option<(Key, Rc<RefCell<Context>>)>,
+    /// Front-cache hit vs fall-through — the gate for whether the front cache pays off (a high
+    /// consecutive-same-key rate). `front_hit / (front_hit + front_miss)` is the front-cache hit rate.
+    front_hit: Counter,
+    front_miss: Counter,
 }
 
 impl Cache {
-    pub fn new(worker_id: RecvDispatchWorkerId) -> Self {
+    pub fn new(counters: &Registry, worker_id: RecvDispatchWorkerId) -> Self {
         Self {
             senders: FxHashMap::default(),
             worker_id,
+            last: None,
+            front_hit: counters
+                .register_nominal("rx.peer_cache.front_hit", format_args!("recv.{worker_id}")),
+            front_miss: counters
+                .register_nominal("rx.peer_cache.front_miss", format_args!("recv.{worker_id}")),
         }
     }
 
@@ -501,7 +518,33 @@ impl Cache {
             remote_sender_id,
         };
 
-        match self.senders.entry(key) {
+        // 1-entry last-hit front cache: on the common consecutive-same-sender run, serve the remembered
+        // Context directly and skip the FxHash + map probe. Only the hot-hit case (same key AND same
+        // key_id) is fast-pathed; anything else (a different key, or a key_id mismatch needing the
+        // stale/advance handling) falls through to the authoritative map below, which refreshes `last`.
+        let front = self
+            .last
+            .as_ref()
+            .and_then(|(k, ctx)| (*k == key).then(|| ctx.clone()));
+        if let Some(ctx) = front {
+            let cached_key_id = ctx.borrow().current_key_id;
+            if credentials.key_id == cached_key_id {
+                self.front_hit.add(1);
+                ctx.borrow().invariants();
+                let mut borrow = ctx.borrow_mut();
+                let ctx_ref = &mut *borrow;
+                let path_entry = ctx_ref.path_entry.clone();
+                let r = decrypt(&ctx_ref.opener, &mut ctx_ref.queue_view, &path_entry)
+                    .ok_or(CacheError::DecryptFailed)?;
+                drop(borrow);
+                return Ok((r, ctx, true));
+            }
+        }
+        self.front_miss.add(1);
+
+        // Authoritative map path. Each arm produces its `Result` (rather than early-returning) so the
+        // resolved entry can refresh the front cache once, below. `Key` is `Copy`, so it is reused here.
+        let result = match self.senders.entry(key) {
             hash_map::Entry::Occupied(mut entry) => {
                 let ctx = entry.get().clone();
                 let cached_key_id = ctx.borrow().current_key_id;
@@ -514,10 +557,8 @@ impl Cache {
                     let r = decrypt(&ctx_ref.opener, &mut ctx_ref.queue_view, &path_entry)
                         .ok_or(CacheError::DecryptFailed)?;
                     drop(borrow);
-                    return Ok((r, ctx, true));
-                }
-
-                if credentials.key_id < cached_key_id {
+                    Ok((r, ctx, true))
+                } else if credentials.key_id < cached_key_id {
                     // The incoming key_id is older than what we already have —
                     // this is a stale or replayed packet. Send a control error
                     // and reject.
@@ -533,80 +574,80 @@ impl Cache {
                     // If check_dedup somehow accepted it (shouldn't happen for
                     // an older key_id), still reject since we can't decrypt with
                     // the wrong opener.
-                    return Err(CacheError::ReplayDetected);
-                }
+                    Err(CacheError::ReplayDetected)
+                } else {
+                    // key_id > cached: the peer advanced (e.g. stale-key recovery).
+                    // Derive a fresh opener and decrypt before touching the cache.
+                    let (opener, path_entry) = path_secret_map
+                        .opener_for_credentials(
+                            credentials,
+                            Some(remote_sender_id.as_varint()),
+                            crate::path::secret::map::store::ControlResponse::ReturnBuffer {
+                                out: control_out,
+                            },
+                        )
+                        .ok_or(CacheError::PathSecretNotFound)?;
 
-                // key_id > cached: the peer advanced (e.g. stale-key recovery).
-                // Derive a fresh opener and decrypt before touching the cache.
-                let (opener, path_entry) = path_secret_map
-                    .opener_for_credentials(
-                        credentials,
-                        Some(remote_sender_id.as_varint()),
-                        crate::path::secret::map::store::ControlResponse::ReturnBuffer {
-                            out: control_out,
-                        },
-                    )
-                    .ok_or(CacheError::PathSecretNotFound)?;
-
-                let r = {
-                    let mut borrow = ctx.borrow_mut();
-                    let ctx_ref = &mut *borrow;
-                    decrypt(&opener, &mut ctx_ref.queue_view, &ctx_ref.path_entry)
-                        .ok_or(CacheError::DecryptFailed)?
-                };
-
-                path_secret_map
-                    .check_dedup(
-                        &path_entry,
-                        credentials,
-                        Some(remote_sender_id.as_varint()),
-                        control_out,
-                    )
-                    .map_err(|_| CacheError::ReplayDetected)?;
-
-                // Packet is authentic — replace the entry with a fresh context.
-                // Key advancement means the peer abandoned its old sender context
-                // (e.g., idle timeout recreation), so the old PN space is dead.
-                // Transfer queue_view since it's independent of PN space.
-                debug!(
-                    %credentials,
-                    %remote_sender_id,
-                    cached_key_id = cached_key_id.as_u64(),
-                    new_key_id = credentials.key_id.as_u64(),
-                    "recv cache key_id advanced — replacing entry"
-                );
-
-                let dest_sender_id = route.sender_id_for_ack(remote_sender_id);
-
-                // Take queue_view from old context — it was already used by decrypt
-                // and is independent of the PN space being replaced.
-                let queue_view = {
-                    let mut old = ctx.borrow_mut();
-                    let old_ref = &mut *old;
-                    // Replace with a dummy Client view; the old ctx is about to be dropped.
-                    let state = old_ref.path_entry.queue_state();
-                    let replacement = match state {
-                        QueueState::Client(s) => {
-                            QueueView::Client(queue::ClientDispatch::new(s.clone()))
-                        }
-                        QueueState::Server(s) => QueueView::Server(s.view()),
+                    let r = {
+                        let mut borrow = ctx.borrow_mut();
+                        let ctx_ref = &mut *borrow;
+                        decrypt(&opener, &mut ctx_ref.queue_view, &ctx_ref.path_entry)
+                            .ok_or(CacheError::DecryptFailed)?
                     };
-                    core::mem::replace(&mut old_ref.queue_view, replacement)
-                };
 
-                let new_ctx = Rc::new(RefCell::new(Context::new(
-                    path_entry,
-                    remote_sender_id,
-                    dest_sender_id,
-                    opener,
-                    credentials.key_id,
-                    clock.now(),
-                    queue_view,
-                )));
-                new_ctx.borrow().invariants();
-                entry.insert(new_ctx.clone());
+                    path_secret_map
+                        .check_dedup(
+                            &path_entry,
+                            credentials,
+                            Some(remote_sender_id.as_varint()),
+                            control_out,
+                        )
+                        .map_err(|_| CacheError::ReplayDetected)?;
 
-                Ok((r, new_ctx, false))
+                    // Packet is authentic — replace the entry with a fresh context.
+                    // Key advancement means the peer abandoned its old sender context
+                    // (e.g., idle timeout recreation), so the old PN space is dead.
+                    // Transfer queue_view since it's independent of PN space.
+                    debug!(
+                        %credentials,
+                        %remote_sender_id,
+                        cached_key_id = cached_key_id.as_u64(),
+                        new_key_id = credentials.key_id.as_u64(),
+                        "recv cache key_id advanced — replacing entry"
+                    );
+
+                    let dest_sender_id = route.sender_id_for_ack(remote_sender_id);
+
+                    // Take queue_view from old context — it was already used by decrypt
+                    // and is independent of the PN space being replaced.
+                    let queue_view = {
+                        let mut old = ctx.borrow_mut();
+                        let old_ref = &mut *old;
+                        // Replace with a dummy Client view; the old ctx is about to be dropped.
+                        let state = old_ref.path_entry.queue_state();
+                        let replacement = match state {
+                            QueueState::Client(s) => {
+                                QueueView::Client(queue::ClientDispatch::new(s.clone()))
+                            }
+                            QueueState::Server(s) => QueueView::Server(s.view()),
+                        };
+                        core::mem::replace(&mut old_ref.queue_view, replacement)
+                    };
+
+                    let new_ctx = Rc::new(RefCell::new(Context::new(
+                        path_entry,
+                        remote_sender_id,
+                        dest_sender_id,
+                        opener,
+                        credentials.key_id,
+                        clock.now(),
+                        queue_view,
+                    )));
+                    new_ctx.borrow().invariants();
+                    entry.insert(new_ctx.clone());
+
+                    Ok((r, new_ctx, false))
+                }
             }
             hash_map::Entry::Vacant(entry) => {
                 debug!(%credentials, %peer_addr, sender_id = %remote_sender_id, recv_worker_id = %self.worker_id, "deriving opener for credentials");
@@ -660,17 +701,33 @@ impl Cache {
                 entry.insert(ctx.clone());
                 Ok((r, ctx, false))
             }
+        };
+
+        // Refresh the front cache with the resolved entry so the next same-key packet hits it. Only on
+        // success; a rejected/failed lookup (or the `?` early-returns above) leaves `last` unchanged.
+        if let Ok((_, ctx, _)) = &result {
+            self.last = Some((key, ctx.clone()));
         }
+        result
     }
 
     pub fn remove(&mut self, key: &Key) {
         self.senders.remove(key);
+        // Drop the front-cache slot if it pointed at the removed entry, so a later lookup can't serve a
+        // Context that is no longer in the map.
+        if matches!(&self.last, Some((k, _)) if k == key) {
+            self.last = None;
+        }
     }
 
     pub fn invalidate_by_id(&mut self, id: &credentials::Id) {
         let before = self.senders.len();
         self.senders.retain(|key, _| key.id != *id);
         let removed = before - self.senders.len();
+        // Drop the front-cache slot if it belongs to the invalidated id.
+        if matches!(&self.last, Some((k, _)) if k.id == *id) {
+            self.last = None;
+        }
         debug!(%id, removed, worker_id = %self.worker_id, "invalidating recv contexts");
     }
 }

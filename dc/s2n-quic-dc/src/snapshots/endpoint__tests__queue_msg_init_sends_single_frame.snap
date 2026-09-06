@@ -1,5 +1,6 @@
 ---
 source: dc/s2n-quic-dc/src/testing.rs
+assertion_line: 332
 expression: logs
 ---
 0:00:00.000000000 [server] DEBUG s2n_quic_dc: capacity=50000
@@ -423,6 +424,7 @@ expression: logs
 0:00:00.000521000 [server] TRACE c#q.dispatch_rx.drain[recv.2]=1
 0:00:00.000521000 [server] TRACE g#q.dispatch_rx.depth[recv.2]=0
 0:00:00.000521000 [server] TRACE c#rx.data_pkt=1
+0:00:00.000521000 [server] TRACE c#rx.peer_cache.front_miss[recv.2]=1
 0:00:00.000521000 [server] DEBUG deriving opener for credentials credentials=0xfda2b021bc51ec6a354acc13cf843ec7:0 peer_addr=10.0.0.2:49158 sender_id=6 recv_worker_id=2
 0:00:00.000521000 [server] DEBUG s2n_quic_dc: credential_id=[253, 162, 176, 33, 188, 81, 236, 106, 53, 74, 204, 19, 207, 132, 62, 199] hit=true
 0:00:00.000521000 [server] DEBUG s2n_quic_dc: credential_id=[253, 162, 176, 33, 188, 81, 236, 106, 53, 74, 204, 19, 207, 132, 62, 199] age=520µs
@@ -560,6 +562,7 @@ expression: logs
 0:00:00.001021000 [client] TRACE c#q.dispatch_rx.drain[recv.2]=1
 0:00:00.001021000 [client] TRACE g#q.dispatch_rx.depth[recv.2]=0
 0:00:00.001021000 [client] TRACE c#rx.data_pkt=1
+0:00:00.001021000 [client] TRACE c#rx.peer_cache.front_miss[recv.2]=1
 0:00:00.001021000 [client] DEBUG deriving opener for credentials credentials=0x7da2b021bc51ec6a354acc13cf843ec7:0 peer_addr=10.0.0.1:49157 sender_id=6 recv_worker_id=2
 0:00:00.001021000 [client] DEBUG s2n_quic_dc: credential_id=[125, 162, 176, 33, 188, 81, 236, 106, 53, 74, 204, 19, 207, 132, 62, 199] hit=true
 0:00:00.001021000 [client] DEBUG s2n_quic_dc: credential_id=[125, 162, 176, 33, 188, 81, 236, 106, 53, 74, 204, 19, 207, 132, 62, 199] age=1.02ms
@@ -612,6 +615,7 @@ expression: logs
 0:00:00.001041000 [client] TRACE c#q.dispatch_rx.drain[recv.1]=1
 0:00:00.001041000 [client] TRACE g#q.dispatch_rx.depth[recv.1]=0
 0:00:00.001041000 [client] TRACE c#rx.data_pkt=1
+0:00:00.001041000 [client] TRACE c#rx.peer_cache.front_miss[recv.1]=1
 0:00:00.001041000 [client] DEBUG deriving opener for credentials credentials=0x7da2b021bc51ec6a354acc13cf843ec7:1 peer_addr=10.0.0.1:49158 sender_id=7 recv_worker_id=1
 0:00:00.001041000 [client] DEBUG s2n_quic_dc: credential_id=[125, 162, 176, 33, 188, 81, 236, 106, 53, 74, 204, 19, 207, 132, 62, 199] hit=true
 0:00:00.001041000 [client] DEBUG s2n_quic_dc: credential_id=[125, 162, 176, 33, 188, 81, 236, 106, 53, 74, 204, 19, 207, 132, 62, 199] age=1.04ms
@@ -1262,6 +1266,7 @@ expression: logs
 0:00:00.001541000 [server] TRACE c#q.dispatch_rx.drain[recv.1]=1
 0:00:00.001541000 [server] TRACE g#q.dispatch_rx.depth[recv.1]=0
 0:00:00.001541000 [server] TRACE c#rx.data_pkt=1
+0:00:00.001541000 [server] TRACE c#rx.peer_cache.front_miss[recv.1]=1
 0:00:00.001541000 [server] DEBUG deriving opener for credentials credentials=0xfda2b021bc51ec6a354acc13cf843ec7:1 peer_addr=10.0.0.2:49159 sender_id=7 recv_worker_id=1
 0:00:00.001541000 [server] DEBUG s2n_quic_dc: credential_id=[253, 162, 176, 33, 188, 81, 236, 106, 53, 74, 204, 19, 207, 132, 62, 199] hit=true
 0:00:00.001541000 [server] DEBUG s2n_quic_dc: credential_id=[253, 162, 176, 33, 188, 81, 236, 106, 53, 74, 204, 19, 207, 132, 62, 199] age=1.54ms
@@ -1279,6 +1284,7 @@ expression: logs
 0:00:00.001541000 [server] TRACE c#q.dispatch_rx.drain[recv.0]=1
 0:00:00.001541000 [server] TRACE g#q.dispatch_rx.depth[recv.0]=9
 0:00:00.001541000 [server] TRACE c#rx.data_pkt=1
+0:00:00.001541000 [server] TRACE c#rx.peer_cache.front_miss[recv.0]=1
 0:00:00.001541000 [server] DEBUG deriving opener for credentials credentials=0xfda2b021bc51ec6a354acc13cf843ec7:2 peer_addr=10.0.0.2:49152 sender_id=0 recv_worker_id=0
 0:00:00.001541000 [server] DEBUG s2n_quic_dc: credential_id=[253, 162, 176, 33, 188, 81, 236, 106, 53, 74, 204, 19, 207, 132, 62, 199] hit=true
 0:00:00.001541000 [server] DEBUG s2n_quic_dc: credential_id=[253, 162, 176, 33, 188, 81, 236, 106, 53, 74, 204, 19, 207, 132, 62, 199] age=1.54ms
@@ -1296,6 +1302,7 @@ expression: logs
 0:00:00.001541000 [server] TRACE c#q.dispatch_rx.drain[recv.0]=1
 0:00:00.001541000 [server] TRACE g#q.dispatch_rx.depth[recv.0]=8
 0:00:00.001541000 [server] TRACE c#rx.data_pkt=1
+0:00:00.001541000 [server] TRACE c#rx.peer_cache.front_hit[recv.0]=1
 0:00:00.001541000 [server] TRACE c#rx.peer_cache.hit=1
 0:00:00.001541000 [server] TRACE c#rx.ecn[ect0]=1
 0:00:00.001541000 [server] TRACE m#rx.packet_size=1320
@@ -1306,6 +1313,7 @@ expression: logs
 0:00:00.001541000 [server] TRACE c#q.dispatch_rx.drain[recv.0]=1
 0:00:00.001541000 [server] TRACE g#q.dispatch_rx.depth[recv.0]=7
 0:00:00.001541000 [server] TRACE c#rx.data_pkt=1
+0:00:00.001541000 [server] TRACE c#rx.peer_cache.front_hit[recv.0]=1
 0:00:00.001541000 [server] TRACE c#rx.peer_cache.hit=1
 0:00:00.001541000 [server] TRACE c#rx.ecn[ect0]=1
 0:00:00.001541000 [server] TRACE m#rx.packet_size=1320
@@ -1316,6 +1324,7 @@ expression: logs
 0:00:00.001541000 [server] TRACE c#q.dispatch_rx.drain[recv.0]=1
 0:00:00.001541000 [server] TRACE g#q.dispatch_rx.depth[recv.0]=6
 0:00:00.001541000 [server] TRACE c#rx.data_pkt=1
+0:00:00.001541000 [server] TRACE c#rx.peer_cache.front_hit[recv.0]=1
 0:00:00.001541000 [server] TRACE c#rx.peer_cache.hit=1
 0:00:00.001541000 [server] TRACE c#rx.ecn[ect0]=1
 0:00:00.001541000 [server] TRACE m#rx.packet_size=1320
@@ -1326,6 +1335,7 @@ expression: logs
 0:00:00.001541000 [server] TRACE c#q.dispatch_rx.drain[recv.0]=1
 0:00:00.001541000 [server] TRACE g#q.dispatch_rx.depth[recv.0]=5
 0:00:00.001541000 [server] TRACE c#rx.data_pkt=1
+0:00:00.001541000 [server] TRACE c#rx.peer_cache.front_hit[recv.0]=1
 0:00:00.001541000 [server] TRACE c#rx.peer_cache.hit=1
 0:00:00.001541000 [server] TRACE c#rx.ecn[ect0]=1
 0:00:00.001541000 [server] TRACE m#rx.packet_size=1320
@@ -1336,6 +1346,7 @@ expression: logs
 0:00:00.001541000 [server] TRACE c#q.dispatch_rx.drain[recv.0]=1
 0:00:00.001541000 [server] TRACE g#q.dispatch_rx.depth[recv.0]=4
 0:00:00.001541000 [server] TRACE c#rx.data_pkt=1
+0:00:00.001541000 [server] TRACE c#rx.peer_cache.front_hit[recv.0]=1
 0:00:00.001541000 [server] TRACE c#rx.peer_cache.hit=1
 0:00:00.001541000 [server] TRACE c#rx.ecn[ect0]=1
 0:00:00.001541000 [server] TRACE m#rx.packet_size=1320
@@ -1346,6 +1357,7 @@ expression: logs
 0:00:00.001541000 [server] TRACE c#q.dispatch_rx.drain[recv.0]=1
 0:00:00.001541000 [server] TRACE g#q.dispatch_rx.depth[recv.0]=3
 0:00:00.001541000 [server] TRACE c#rx.data_pkt=1
+0:00:00.001541000 [server] TRACE c#rx.peer_cache.front_hit[recv.0]=1
 0:00:00.001541000 [server] TRACE c#rx.peer_cache.hit=1
 0:00:00.001541000 [server] TRACE c#rx.ecn[ect0]=1
 0:00:00.001541000 [server] TRACE m#rx.packet_size=1320
@@ -1356,6 +1368,7 @@ expression: logs
 0:00:00.001541000 [server] TRACE c#q.dispatch_rx.drain[recv.0]=1
 0:00:00.001541000 [server] TRACE g#q.dispatch_rx.depth[recv.0]=2
 0:00:00.001541000 [server] TRACE c#rx.data_pkt=1
+0:00:00.001541000 [server] TRACE c#rx.peer_cache.front_hit[recv.0]=1
 0:00:00.001541000 [server] TRACE c#rx.peer_cache.hit=1
 0:00:00.001541000 [server] TRACE c#rx.ecn[ect0]=1
 0:00:00.001541000 [server] TRACE m#rx.packet_size=1320
@@ -1366,6 +1379,7 @@ expression: logs
 0:00:00.001541000 [server] TRACE c#q.dispatch_rx.drain[recv.0]=1
 0:00:00.001541000 [server] TRACE g#q.dispatch_rx.depth[recv.0]=1
 0:00:00.001541000 [server] TRACE c#rx.data_pkt=1
+0:00:00.001541000 [server] TRACE c#rx.peer_cache.front_hit[recv.0]=1
 0:00:00.001541000 [server] TRACE c#rx.peer_cache.hit=1
 0:00:00.001541000 [server] TRACE c#rx.ecn[ect0]=1
 0:00:00.001541000 [server] TRACE m#rx.packet_size=1320
@@ -1376,6 +1390,7 @@ expression: logs
 0:00:00.001541000 [server] TRACE c#q.dispatch_rx.drain[recv.0]=1
 0:00:00.001541000 [server] TRACE g#q.dispatch_rx.depth[recv.0]=0
 0:00:00.001541000 [server] TRACE c#rx.data_pkt=1
+0:00:00.001541000 [server] TRACE c#rx.peer_cache.front_hit[recv.0]=1
 0:00:00.001541000 [server] TRACE c#rx.peer_cache.hit=1
 0:00:00.001541000 [server] TRACE c#rx.ecn[ect0]=1
 0:00:00.001541000 [server] TRACE m#rx.packet_size=1320
@@ -1477,6 +1492,7 @@ expression: logs
 0:00:00.001561000 [server] TRACE c#q.dispatch_rx.drain[recv.0]=1
 0:00:00.001561000 [server] TRACE g#q.dispatch_rx.depth[recv.0]=2
 0:00:00.001561000 [server] TRACE c#rx.data_pkt=1
+0:00:00.001561000 [server] TRACE c#rx.peer_cache.front_miss[recv.0]=1
 0:00:00.001561000 [server] DEBUG deriving opener for credentials credentials=0xfda2b021bc51ec6a354acc13cf843ec7:3 peer_addr=10.0.0.2:49154 sender_id=2 recv_worker_id=0
 0:00:00.001561000 [server] DEBUG s2n_quic_dc: credential_id=[253, 162, 176, 33, 188, 81, 236, 106, 53, 74, 204, 19, 207, 132, 62, 199] hit=true
 0:00:00.001561000 [server] DEBUG s2n_quic_dc: credential_id=[253, 162, 176, 33, 188, 81, 236, 106, 53, 74, 204, 19, 207, 132, 62, 199] age=1.56ms
@@ -1491,6 +1507,7 @@ expression: logs
 0:00:00.001561000 [server] TRACE c#q.dispatch_rx.drain[recv.0]=1
 0:00:00.001561000 [server] TRACE g#q.dispatch_rx.depth[recv.0]=1
 0:00:00.001561000 [server] TRACE c#rx.data_pkt=1
+0:00:00.001561000 [server] TRACE c#rx.peer_cache.front_hit[recv.0]=1
 0:00:00.001561000 [server] TRACE c#rx.peer_cache.hit=1
 0:00:00.001561000 [server] TRACE c#rx.ecn[ect0]=1
 0:00:00.001561000 [server] TRACE m#rx.packet_size=1320
@@ -1501,6 +1518,7 @@ expression: logs
 0:00:00.001561000 [server] TRACE c#q.dispatch_rx.drain[recv.0]=1
 0:00:00.001561000 [server] TRACE g#q.dispatch_rx.depth[recv.0]=0
 0:00:00.001561000 [server] TRACE c#rx.data_pkt=1
+0:00:00.001561000 [server] TRACE c#rx.peer_cache.front_hit[recv.0]=1
 0:00:00.001561000 [server] TRACE c#rx.peer_cache.hit=1
 0:00:00.001561000 [server] TRACE c#rx.ecn[ect0]=1
 0:00:00.001561000 [server] TRACE m#rx.packet_size=856
@@ -1565,6 +1583,7 @@ expression: logs
 0:00:00.002041000 [client] TRACE c#q.dispatch_rx.drain[recv.0]=1
 0:00:00.002041000 [client] TRACE g#q.dispatch_rx.depth[recv.0]=0
 0:00:00.002041000 [client] TRACE c#rx.data_pkt=1
+0:00:00.002041000 [client] TRACE c#rx.peer_cache.front_miss[recv.0]=1
 0:00:00.002041000 [client] DEBUG deriving opener for credentials credentials=0x7da2b021bc51ec6a354acc13cf843ec7:2 peer_addr=10.0.0.1:4433 sender_id=0 recv_worker_id=0
 0:00:00.002041000 [client] DEBUG s2n_quic_dc: credential_id=[125, 162, 176, 33, 188, 81, 236, 106, 53, 74, 204, 19, 207, 132, 62, 199] hit=true
 0:00:00.002041000 [client] DEBUG s2n_quic_dc: credential_id=[125, 162, 176, 33, 188, 81, 236, 106, 53, 74, 204, 19, 207, 132, 62, 199] age=2.04ms
@@ -2145,6 +2164,7 @@ expression: logs
 0:00:00.002061000 [client] TRACE c#q.dispatch_rx.drain[recv.0]=1
 0:00:00.002061000 [client] TRACE g#q.dispatch_rx.depth[recv.0]=0
 0:00:00.002061000 [client] TRACE c#rx.data_pkt=1
+0:00:00.002061000 [client] TRACE c#rx.peer_cache.front_miss[recv.0]=1
 0:00:00.002061000 [client] DEBUG deriving opener for credentials credentials=0x7da2b021bc51ec6a354acc13cf843ec7:3 peer_addr=10.0.0.1:49153 sender_id=2 recv_worker_id=0
 0:00:00.002061000 [client] DEBUG s2n_quic_dc: credential_id=[125, 162, 176, 33, 188, 81, 236, 106, 53, 74, 204, 19, 207, 132, 62, 199] hit=true
 0:00:00.002061000 [client] DEBUG s2n_quic_dc: credential_id=[125, 162, 176, 33, 188, 81, 236, 106, 53, 74, 204, 19, 207, 132, 62, 199] age=2.06ms
@@ -2320,6 +2340,7 @@ expression: logs
 0:00:00.002541000 [server] TRACE c#q.dispatch_rx.drain[recv.0]=1
 0:00:00.002541000 [server] TRACE g#q.dispatch_rx.depth[recv.0]=19
 0:00:00.002541000 [server] TRACE c#rx.data_pkt=1
+0:00:00.002541000 [server] TRACE c#rx.peer_cache.front_miss[recv.0]=1
 0:00:00.002541000 [server] TRACE c#rx.peer_cache.hit=1
 0:00:00.002541000 [server] TRACE c#rx.ecn[ect0]=1
 0:00:00.002541000 [server] TRACE m#rx.packet_size=1320
@@ -2330,6 +2351,7 @@ expression: logs
 0:00:00.002541000 [server] TRACE c#q.dispatch_rx.drain[recv.0]=1
 0:00:00.002541000 [server] TRACE g#q.dispatch_rx.depth[recv.0]=18
 0:00:00.002541000 [server] TRACE c#rx.data_pkt=1
+0:00:00.002541000 [server] TRACE c#rx.peer_cache.front_hit[recv.0]=1
 0:00:00.002541000 [server] TRACE c#rx.peer_cache.hit=1
 0:00:00.002541000 [server] TRACE c#rx.ecn[ect0]=1
 0:00:00.002541000 [server] TRACE m#rx.packet_size=1320
@@ -2340,6 +2362,7 @@ expression: logs
 0:00:00.002541000 [server] TRACE c#q.dispatch_rx.drain[recv.0]=1
 0:00:00.002541000 [server] TRACE g#q.dispatch_rx.depth[recv.0]=17
 0:00:00.002541000 [server] TRACE c#rx.data_pkt=1
+0:00:00.002541000 [server] TRACE c#rx.peer_cache.front_hit[recv.0]=1
 0:00:00.002541000 [server] TRACE c#rx.peer_cache.hit=1
 0:00:00.002541000 [server] TRACE c#rx.ecn[ect0]=1
 0:00:00.002541000 [server] TRACE m#rx.packet_size=1320
@@ -2350,6 +2373,7 @@ expression: logs
 0:00:00.002541000 [server] TRACE c#q.dispatch_rx.drain[recv.0]=1
 0:00:00.002541000 [server] TRACE g#q.dispatch_rx.depth[recv.0]=16
 0:00:00.002541000 [server] TRACE c#rx.data_pkt=1
+0:00:00.002541000 [server] TRACE c#rx.peer_cache.front_hit[recv.0]=1
 0:00:00.002541000 [server] TRACE c#rx.peer_cache.hit=1
 0:00:00.002541000 [server] TRACE c#rx.ecn[ect0]=1
 0:00:00.002541000 [server] TRACE m#rx.packet_size=1320
@@ -2360,6 +2384,7 @@ expression: logs
 0:00:00.002541000 [server] TRACE c#q.dispatch_rx.drain[recv.0]=1
 0:00:00.002541000 [server] TRACE g#q.dispatch_rx.depth[recv.0]=15
 0:00:00.002541000 [server] TRACE c#rx.data_pkt=1
+0:00:00.002541000 [server] TRACE c#rx.peer_cache.front_hit[recv.0]=1
 0:00:00.002541000 [server] TRACE c#rx.peer_cache.hit=1
 0:00:00.002541000 [server] TRACE c#rx.ecn[ect0]=1
 0:00:00.002541000 [server] TRACE m#rx.packet_size=1320
@@ -2370,6 +2395,7 @@ expression: logs
 0:00:00.002541000 [server] TRACE c#q.dispatch_rx.drain[recv.0]=1
 0:00:00.002541000 [server] TRACE g#q.dispatch_rx.depth[recv.0]=14
 0:00:00.002541000 [server] TRACE c#rx.data_pkt=1
+0:00:00.002541000 [server] TRACE c#rx.peer_cache.front_hit[recv.0]=1
 0:00:00.002541000 [server] TRACE c#rx.peer_cache.hit=1
 0:00:00.002541000 [server] TRACE c#rx.ecn[ect0]=1
 0:00:00.002541000 [server] TRACE m#rx.packet_size=1320
@@ -2380,6 +2406,7 @@ expression: logs
 0:00:00.002541000 [server] TRACE c#q.dispatch_rx.drain[recv.0]=1
 0:00:00.002541000 [server] TRACE g#q.dispatch_rx.depth[recv.0]=13
 0:00:00.002541000 [server] TRACE c#rx.data_pkt=1
+0:00:00.002541000 [server] TRACE c#rx.peer_cache.front_hit[recv.0]=1
 0:00:00.002541000 [server] TRACE c#rx.peer_cache.hit=1
 0:00:00.002541000 [server] TRACE c#rx.ecn[ect0]=1
 0:00:00.002541000 [server] TRACE m#rx.packet_size=1320
@@ -2390,6 +2417,7 @@ expression: logs
 0:00:00.002541000 [server] TRACE c#q.dispatch_rx.drain[recv.0]=1
 0:00:00.002541000 [server] TRACE g#q.dispatch_rx.depth[recv.0]=12
 0:00:00.002541000 [server] TRACE c#rx.data_pkt=1
+0:00:00.002541000 [server] TRACE c#rx.peer_cache.front_hit[recv.0]=1
 0:00:00.002541000 [server] TRACE c#rx.peer_cache.hit=1
 0:00:00.002541000 [server] TRACE c#rx.ecn[ect0]=1
 0:00:00.002541000 [server] TRACE m#rx.packet_size=1320
@@ -2400,6 +2428,7 @@ expression: logs
 0:00:00.002541000 [server] TRACE c#q.dispatch_rx.drain[recv.0]=1
 0:00:00.002541000 [server] TRACE g#q.dispatch_rx.depth[recv.0]=11
 0:00:00.002541000 [server] TRACE c#rx.data_pkt=1
+0:00:00.002541000 [server] TRACE c#rx.peer_cache.front_hit[recv.0]=1
 0:00:00.002541000 [server] TRACE c#rx.peer_cache.hit=1
 0:00:00.002541000 [server] TRACE c#rx.ecn[ect0]=1
 0:00:00.002541000 [server] TRACE m#rx.packet_size=1320
@@ -2410,6 +2439,7 @@ expression: logs
 0:00:00.002541000 [server] TRACE c#q.dispatch_rx.drain[recv.0]=1
 0:00:00.002541000 [server] TRACE g#q.dispatch_rx.depth[recv.0]=10
 0:00:00.002541000 [server] TRACE c#rx.data_pkt=1
+0:00:00.002541000 [server] TRACE c#rx.peer_cache.front_hit[recv.0]=1
 0:00:00.002541000 [server] TRACE c#rx.peer_cache.hit=1
 0:00:00.002541000 [server] TRACE c#rx.ecn[ect0]=1
 0:00:00.002541000 [server] TRACE m#rx.packet_size=1320
@@ -2420,6 +2450,7 @@ expression: logs
 0:00:00.002541000 [server] TRACE c#q.dispatch_rx.drain[recv.0]=1
 0:00:00.002541000 [server] TRACE g#q.dispatch_rx.depth[recv.0]=9
 0:00:00.002541000 [server] TRACE c#rx.data_pkt=1
+0:00:00.002541000 [server] TRACE c#rx.peer_cache.front_hit[recv.0]=1
 0:00:00.002541000 [server] TRACE c#rx.peer_cache.hit=1
 0:00:00.002541000 [server] TRACE c#rx.ecn[ect0]=1
 0:00:00.002541000 [server] TRACE m#rx.packet_size=1320
@@ -2430,6 +2461,7 @@ expression: logs
 0:00:00.002541000 [server] TRACE c#q.dispatch_rx.drain[recv.0]=1
 0:00:00.002541000 [server] TRACE g#q.dispatch_rx.depth[recv.0]=8
 0:00:00.002541000 [server] TRACE c#rx.data_pkt=1
+0:00:00.002541000 [server] TRACE c#rx.peer_cache.front_hit[recv.0]=1
 0:00:00.002541000 [server] TRACE c#rx.peer_cache.hit=1
 0:00:00.002541000 [server] TRACE c#rx.ecn[ect0]=1
 0:00:00.002541000 [server] TRACE m#rx.packet_size=1320
@@ -2440,6 +2472,7 @@ expression: logs
 0:00:00.002541000 [server] TRACE c#q.dispatch_rx.drain[recv.0]=1
 0:00:00.002541000 [server] TRACE g#q.dispatch_rx.depth[recv.0]=7
 0:00:00.002541000 [server] TRACE c#rx.data_pkt=1
+0:00:00.002541000 [server] TRACE c#rx.peer_cache.front_hit[recv.0]=1
 0:00:00.002541000 [server] TRACE c#rx.peer_cache.hit=1
 0:00:00.002541000 [server] TRACE c#rx.ecn[ect0]=1
 0:00:00.002541000 [server] TRACE m#rx.packet_size=1320
@@ -2450,6 +2483,7 @@ expression: logs
 0:00:00.002541000 [server] TRACE c#q.dispatch_rx.drain[recv.0]=1
 0:00:00.002541000 [server] TRACE g#q.dispatch_rx.depth[recv.0]=6
 0:00:00.002541000 [server] TRACE c#rx.data_pkt=1
+0:00:00.002541000 [server] TRACE c#rx.peer_cache.front_hit[recv.0]=1
 0:00:00.002541000 [server] TRACE c#rx.peer_cache.hit=1
 0:00:00.002541000 [server] TRACE c#rx.ecn[ect0]=1
 0:00:00.002541000 [server] TRACE m#rx.packet_size=1320
@@ -2460,6 +2494,7 @@ expression: logs
 0:00:00.002541000 [server] TRACE c#q.dispatch_rx.drain[recv.0]=1
 0:00:00.002541000 [server] TRACE g#q.dispatch_rx.depth[recv.0]=5
 0:00:00.002541000 [server] TRACE c#rx.data_pkt=1
+0:00:00.002541000 [server] TRACE c#rx.peer_cache.front_hit[recv.0]=1
 0:00:00.002541000 [server] TRACE c#rx.peer_cache.hit=1
 0:00:00.002541000 [server] TRACE c#rx.ecn[ect0]=1
 0:00:00.002541000 [server] TRACE m#rx.packet_size=1320
@@ -2470,6 +2505,7 @@ expression: logs
 0:00:00.002541000 [server] TRACE c#q.dispatch_rx.drain[recv.0]=1
 0:00:00.002541000 [server] TRACE g#q.dispatch_rx.depth[recv.0]=4
 0:00:00.002541000 [server] TRACE c#rx.data_pkt=1
+0:00:00.002541000 [server] TRACE c#rx.peer_cache.front_hit[recv.0]=1
 0:00:00.002541000 [server] TRACE c#rx.peer_cache.hit=1
 0:00:00.002541000 [server] TRACE c#rx.ecn[ect0]=1
 0:00:00.002541000 [server] TRACE m#rx.packet_size=1320
@@ -2480,6 +2516,7 @@ expression: logs
 0:00:00.002541000 [server] TRACE c#q.dispatch_rx.drain[recv.0]=1
 0:00:00.002541000 [server] TRACE g#q.dispatch_rx.depth[recv.0]=3
 0:00:00.002541000 [server] TRACE c#rx.data_pkt=1
+0:00:00.002541000 [server] TRACE c#rx.peer_cache.front_hit[recv.0]=1
 0:00:00.002541000 [server] TRACE c#rx.peer_cache.hit=1
 0:00:00.002541000 [server] TRACE c#rx.ecn[ect0]=1
 0:00:00.002541000 [server] TRACE m#rx.packet_size=1320
@@ -2490,6 +2527,7 @@ expression: logs
 0:00:00.002541000 [server] TRACE c#q.dispatch_rx.drain[recv.0]=1
 0:00:00.002541000 [server] TRACE g#q.dispatch_rx.depth[recv.0]=2
 0:00:00.002541000 [server] TRACE c#rx.data_pkt=1
+0:00:00.002541000 [server] TRACE c#rx.peer_cache.front_hit[recv.0]=1
 0:00:00.002541000 [server] TRACE c#rx.peer_cache.hit=1
 0:00:00.002541000 [server] TRACE c#rx.ecn[ect0]=1
 0:00:00.002541000 [server] TRACE m#rx.packet_size=1320
@@ -2500,6 +2538,7 @@ expression: logs
 0:00:00.002541000 [server] TRACE c#q.dispatch_rx.drain[recv.0]=1
 0:00:00.002541000 [server] TRACE g#q.dispatch_rx.depth[recv.0]=1
 0:00:00.002541000 [server] TRACE c#rx.data_pkt=1
+0:00:00.002541000 [server] TRACE c#rx.peer_cache.front_hit[recv.0]=1
 0:00:00.002541000 [server] TRACE c#rx.peer_cache.hit=1
 0:00:00.002541000 [server] TRACE c#rx.ecn[ect0]=1
 0:00:00.002541000 [server] TRACE m#rx.packet_size=1320
@@ -2510,6 +2549,7 @@ expression: logs
 0:00:00.002541000 [server] TRACE c#q.dispatch_rx.drain[recv.0]=1
 0:00:00.002541000 [server] TRACE g#q.dispatch_rx.depth[recv.0]=0
 0:00:00.002541000 [server] TRACE c#rx.data_pkt=1
+0:00:00.002541000 [server] TRACE c#rx.peer_cache.front_hit[recv.0]=1
 0:00:00.002541000 [server] TRACE c#rx.peer_cache.hit=1
 0:00:00.002541000 [server] TRACE c#rx.ecn[ect0]=1
 0:00:00.002541000 [server] TRACE m#rx.packet_size=1320
@@ -2577,6 +2617,7 @@ expression: logs
 0:00:00.003041000 [client] TRACE c#q.dispatch_rx.drain[recv.0]=1
 0:00:00.003041000 [client] TRACE g#q.dispatch_rx.depth[recv.0]=0
 0:00:00.003041000 [client] TRACE c#rx.data_pkt=1
+0:00:00.003041000 [client] TRACE c#rx.peer_cache.front_miss[recv.0]=1
 0:00:00.003041000 [client] TRACE c#rx.peer_cache.hit=1
 0:00:00.003041000 [client] TRACE c#rx.ecn[ect0]=1
 0:00:00.003041000 [client] TRACE m#rx.packet_size=0
@@ -3265,6 +3306,7 @@ expression: logs
 0:00:00.003541000 [server] TRACE c#q.dispatch_rx.drain[recv.0]=1
 0:00:00.003541000 [server] TRACE g#q.dispatch_rx.depth[recv.0]=15
 0:00:00.003541000 [server] TRACE c#rx.data_pkt=1
+0:00:00.003541000 [server] TRACE c#rx.peer_cache.front_hit[recv.0]=1
 0:00:00.003541000 [server] TRACE c#rx.peer_cache.hit=1
 0:00:00.003541000 [server] TRACE c#rx.ecn[ect0]=1
 0:00:00.003541000 [server] TRACE m#rx.packet_size=1320
@@ -3275,6 +3317,7 @@ expression: logs
 0:00:00.003541000 [server] TRACE c#q.dispatch_rx.drain[recv.0]=1
 0:00:00.003541000 [server] TRACE g#q.dispatch_rx.depth[recv.0]=14
 0:00:00.003541000 [server] TRACE c#rx.data_pkt=1
+0:00:00.003541000 [server] TRACE c#rx.peer_cache.front_hit[recv.0]=1
 0:00:00.003541000 [server] TRACE c#rx.peer_cache.hit=1
 0:00:00.003541000 [server] TRACE c#rx.ecn[ect0]=1
 0:00:00.003541000 [server] TRACE m#rx.packet_size=1320
@@ -3285,6 +3328,7 @@ expression: logs
 0:00:00.003541000 [server] TRACE c#q.dispatch_rx.drain[recv.0]=1
 0:00:00.003541000 [server] TRACE g#q.dispatch_rx.depth[recv.0]=13
 0:00:00.003541000 [server] TRACE c#rx.data_pkt=1
+0:00:00.003541000 [server] TRACE c#rx.peer_cache.front_hit[recv.0]=1
 0:00:00.003541000 [server] TRACE c#rx.peer_cache.hit=1
 0:00:00.003541000 [server] TRACE c#rx.ecn[ect0]=1
 0:00:00.003541000 [server] TRACE m#rx.packet_size=1320
@@ -3295,6 +3339,7 @@ expression: logs
 0:00:00.003541000 [server] TRACE c#q.dispatch_rx.drain[recv.0]=1
 0:00:00.003541000 [server] TRACE g#q.dispatch_rx.depth[recv.0]=12
 0:00:00.003541000 [server] TRACE c#rx.data_pkt=1
+0:00:00.003541000 [server] TRACE c#rx.peer_cache.front_hit[recv.0]=1
 0:00:00.003541000 [server] TRACE c#rx.peer_cache.hit=1
 0:00:00.003541000 [server] TRACE c#rx.ecn[ect0]=1
 0:00:00.003541000 [server] TRACE m#rx.packet_size=1320
@@ -3305,6 +3350,7 @@ expression: logs
 0:00:00.003541000 [server] TRACE c#q.dispatch_rx.drain[recv.0]=1
 0:00:00.003541000 [server] TRACE g#q.dispatch_rx.depth[recv.0]=11
 0:00:00.003541000 [server] TRACE c#rx.data_pkt=1
+0:00:00.003541000 [server] TRACE c#rx.peer_cache.front_hit[recv.0]=1
 0:00:00.003541000 [server] TRACE c#rx.peer_cache.hit=1
 0:00:00.003541000 [server] TRACE c#rx.ecn[ect0]=1
 0:00:00.003541000 [server] TRACE m#rx.packet_size=1320
@@ -3315,6 +3361,7 @@ expression: logs
 0:00:00.003541000 [server] TRACE c#q.dispatch_rx.drain[recv.0]=1
 0:00:00.003541000 [server] TRACE g#q.dispatch_rx.depth[recv.0]=10
 0:00:00.003541000 [server] TRACE c#rx.data_pkt=1
+0:00:00.003541000 [server] TRACE c#rx.peer_cache.front_hit[recv.0]=1
 0:00:00.003541000 [server] TRACE c#rx.peer_cache.hit=1
 0:00:00.003541000 [server] TRACE c#rx.ecn[ect0]=1
 0:00:00.003541000 [server] TRACE m#rx.packet_size=1320
@@ -3325,6 +3372,7 @@ expression: logs
 0:00:00.003541000 [server] TRACE c#q.dispatch_rx.drain[recv.0]=1
 0:00:00.003541000 [server] TRACE g#q.dispatch_rx.depth[recv.0]=9
 0:00:00.003541000 [server] TRACE c#rx.data_pkt=1
+0:00:00.003541000 [server] TRACE c#rx.peer_cache.front_hit[recv.0]=1
 0:00:00.003541000 [server] TRACE c#rx.peer_cache.hit=1
 0:00:00.003541000 [server] TRACE c#rx.ecn[ect0]=1
 0:00:00.003541000 [server] TRACE m#rx.packet_size=1320
@@ -3335,6 +3383,7 @@ expression: logs
 0:00:00.003541000 [server] TRACE c#q.dispatch_rx.drain[recv.0]=1
 0:00:00.003541000 [server] TRACE g#q.dispatch_rx.depth[recv.0]=8
 0:00:00.003541000 [server] TRACE c#rx.data_pkt=1
+0:00:00.003541000 [server] TRACE c#rx.peer_cache.front_hit[recv.0]=1
 0:00:00.003541000 [server] TRACE c#rx.peer_cache.hit=1
 0:00:00.003541000 [server] TRACE c#rx.ecn[ect0]=1
 0:00:00.003541000 [server] TRACE m#rx.packet_size=1320
@@ -3345,6 +3394,7 @@ expression: logs
 0:00:00.003541000 [server] TRACE c#q.dispatch_rx.drain[recv.0]=1
 0:00:00.003541000 [server] TRACE g#q.dispatch_rx.depth[recv.0]=7
 0:00:00.003541000 [server] TRACE c#rx.data_pkt=1
+0:00:00.003541000 [server] TRACE c#rx.peer_cache.front_hit[recv.0]=1
 0:00:00.003541000 [server] TRACE c#rx.peer_cache.hit=1
 0:00:00.003541000 [server] TRACE c#rx.ecn[ect0]=1
 0:00:00.003541000 [server] TRACE m#rx.packet_size=1320
@@ -3355,6 +3405,7 @@ expression: logs
 0:00:00.003541000 [server] TRACE c#q.dispatch_rx.drain[recv.0]=1
 0:00:00.003541000 [server] TRACE g#q.dispatch_rx.depth[recv.0]=6
 0:00:00.003541000 [server] TRACE c#rx.data_pkt=1
+0:00:00.003541000 [server] TRACE c#rx.peer_cache.front_hit[recv.0]=1
 0:00:00.003541000 [server] TRACE c#rx.peer_cache.hit=1
 0:00:00.003541000 [server] TRACE c#rx.ecn[ect0]=1
 0:00:00.003541000 [server] TRACE m#rx.packet_size=1320
@@ -3365,6 +3416,7 @@ expression: logs
 0:00:00.003541000 [server] TRACE c#q.dispatch_rx.drain[recv.0]=1
 0:00:00.003541000 [server] TRACE g#q.dispatch_rx.depth[recv.0]=5
 0:00:00.003541000 [server] TRACE c#rx.data_pkt=1
+0:00:00.003541000 [server] TRACE c#rx.peer_cache.front_hit[recv.0]=1
 0:00:00.003541000 [server] TRACE c#rx.peer_cache.hit=1
 0:00:00.003541000 [server] TRACE c#rx.ecn[ect0]=1
 0:00:00.003541000 [server] TRACE m#rx.packet_size=1320
@@ -3375,6 +3427,7 @@ expression: logs
 0:00:00.003541000 [server] TRACE c#q.dispatch_rx.drain[recv.0]=1
 0:00:00.003541000 [server] TRACE g#q.dispatch_rx.depth[recv.0]=4
 0:00:00.003541000 [server] TRACE c#rx.data_pkt=1
+0:00:00.003541000 [server] TRACE c#rx.peer_cache.front_hit[recv.0]=1
 0:00:00.003541000 [server] TRACE c#rx.peer_cache.hit=1
 0:00:00.003541000 [server] TRACE c#rx.ecn[ect0]=1
 0:00:00.003541000 [server] TRACE m#rx.packet_size=1320
@@ -3385,6 +3438,7 @@ expression: logs
 0:00:00.003541000 [server] TRACE c#q.dispatch_rx.drain[recv.0]=1
 0:00:00.003541000 [server] TRACE g#q.dispatch_rx.depth[recv.0]=3
 0:00:00.003541000 [server] TRACE c#rx.data_pkt=1
+0:00:00.003541000 [server] TRACE c#rx.peer_cache.front_hit[recv.0]=1
 0:00:00.003541000 [server] TRACE c#rx.peer_cache.hit=1
 0:00:00.003541000 [server] TRACE c#rx.ecn[ect0]=1
 0:00:00.003541000 [server] TRACE m#rx.packet_size=1320
@@ -3395,6 +3449,7 @@ expression: logs
 0:00:00.003541000 [server] TRACE c#q.dispatch_rx.drain[recv.0]=1
 0:00:00.003541000 [server] TRACE g#q.dispatch_rx.depth[recv.0]=2
 0:00:00.003541000 [server] TRACE c#rx.data_pkt=1
+0:00:00.003541000 [server] TRACE c#rx.peer_cache.front_hit[recv.0]=1
 0:00:00.003541000 [server] TRACE c#rx.peer_cache.hit=1
 0:00:00.003541000 [server] TRACE c#rx.ecn[ect0]=1
 0:00:00.003541000 [server] TRACE m#rx.packet_size=1320
@@ -3405,6 +3460,7 @@ expression: logs
 0:00:00.003541000 [server] TRACE c#q.dispatch_rx.drain[recv.0]=1
 0:00:00.003541000 [server] TRACE g#q.dispatch_rx.depth[recv.0]=1
 0:00:00.003541000 [server] TRACE c#rx.data_pkt=1
+0:00:00.003541000 [server] TRACE c#rx.peer_cache.front_hit[recv.0]=1
 0:00:00.003541000 [server] TRACE c#rx.peer_cache.hit=1
 0:00:00.003541000 [server] TRACE c#rx.ecn[ect0]=1
 0:00:00.003541000 [server] TRACE m#rx.packet_size=1320
@@ -3415,6 +3471,7 @@ expression: logs
 0:00:00.003541000 [server] TRACE c#q.dispatch_rx.drain[recv.0]=1
 0:00:00.003541000 [server] TRACE g#q.dispatch_rx.depth[recv.0]=0
 0:00:00.003541000 [server] TRACE c#rx.data_pkt=1
+0:00:00.003541000 [server] TRACE c#rx.peer_cache.front_hit[recv.0]=1
 0:00:00.003541000 [server] TRACE c#rx.msg.segment_completed=1
 0:00:00.003541000 [server] TRACE m#rx.msg.segment_size=65536
 0:00:00.003541000 [server] TRACE m#rx.msg.chunks_per_segment=50
