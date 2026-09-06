@@ -1085,9 +1085,13 @@ pub(crate) struct SendSocketParts<Socket, Clk> {
     initial_tx_descriptor_allocs: usize,
 }
 
+// Batched dispatch: the `FanOutRouter` stages decoded datagrams per destination worker during a
+// receive-completion batch and splices each worker's queue in with one locked append + one wake
+// (see `worker::FanOutRouter::on_batch_complete`). The gauge counts `batch_len`, so queue-depth
+// accounting stays identical to the per-entry path (the paired receiver still dequeues per entry).
 type PacketSender = GaugedSender<
     sync_queue::Sender<packet::datagram::decoder::Packet<descriptor::Filled>>,
-    Entry<packet::datagram::decoder::Packet<descriptor::Filled>>,
+    crate::intrusive::Queue<packet::datagram::decoder::Packet<descriptor::Filled>>,
 >;
 type PacketReceiver = sync_queue::Receiver<packet::datagram::decoder::Packet<descriptor::Filled>>;
 

@@ -434,6 +434,12 @@ fn ring_loop<R: Router>(
                 to_replenish.push(bid);
             }
         }
+
+        // The whole completion batch has been routed (a single multishot/GRO wait can fan out to many
+        // segments). Flush any per-destination work the router staged during the drain — one locked
+        // splice + one wake per destination worker for the batch, instead of one per packet.
+        router.on_batch_complete();
+
         if saw_eventfd {
             shutdown.efd.drain();
         }
