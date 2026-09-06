@@ -424,6 +424,11 @@ fn open_direct_senders(
     // decrements once (gated on adaptive being installed), so inc/dec stay balanced regardless of
     // the path chosen.
     let prior_active = dd.inc_total();
+    // Rise-to-global FAST: any stream that opens with neighbors marks the endpoint busy for the
+    // hold window, so a momentary count dip under churn can't immediately re-enable direct.
+    if prior_active > dd.solo_threshold() {
+        dd.mark_busy();
+    }
     let take_direct = match dd.mode {
         DispatchMode::Off => false,
         // Direct: unconditional (isolates the low-conc hop-cut win in A/B; not for high conc).
@@ -431,10 +436,10 @@ fn open_direct_senders(
         DispatchMode::Adaptive => {
             // Direct is a SOLO-stream fast lane: a direct stream shares the 64 send sockets with
             // the global streams and skips batching, so even one direct stream dents throughput at
-            // concurrency (measured c8). Gate on TOTAL concurrency: with the default cap=1 the ramp
-            // yields global unless `prior_active == 0` (strictly solo). Per-stream sticky draw.
-            let p_global = dd.crossover.global_probability(dd.pressure_at(prior_active));
-            crate::xorshift::Rng::new().next_f64() >= p_global
+            // concurrency (measured c8/c16). Take direct only if the stream is solo AND the endpoint
+            // has been QUIET past the hold window (decay-to-direct slow) — the hysteresis that
+            // rejects per-RPC churn jitter. Sticky per stream.
+            prior_active <= dd.solo_threshold() && dd.is_quiet()
         }
     };
     if take_direct {

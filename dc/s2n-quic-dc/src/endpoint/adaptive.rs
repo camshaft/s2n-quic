@@ -28,7 +28,7 @@
 
 #![allow(dead_code)] // WIP prototype: wired to the writer datapath in the plumbing step.
 
-use core::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
 
 /// Dispatch mode, selected once at endpoint construction via `DCQUIC_ADAPTIVE_DISPATCH`.
 ///
@@ -161,11 +161,17 @@ pub(crate) struct DirectDispatch {
     /// direct count. At c8 every stream has neighbors ⇒ all global (exact parity); at c1 the solo
     /// stream goes direct ⇒ the hop-cut win.
     active_total: AtomicUsize,
-    /// Solo threshold (concurrency scale) for the crossover ramp: `prior_active / direct_cap`.
-    /// Default 1 ⇒ direct only when `prior_active == 0` (strictly solo). Tunable via
-    /// `DCQUIC_ADAPTIVE_DIRECT_CAP` (a larger value permits direct at slightly higher concurrency,
-    /// trading a small high-conc dent for more low-conc coverage — an A/B knob).
+    /// Solo threshold (concurrency scale). Default 1 ⇒ solo means `prior_active == 0`.
     direct_cap: usize,
+    /// HYSTERESIS ("rise to global fast, decay to direct slow"). An instantaneous solo check is too
+    /// jittery under per-RPC open/close churn (measured: c16 regressed worse than c8 because more
+    /// churn = more opens catch a transient count dip and sneak onto direct). So a stream goes direct
+    /// only if it is solo AND the endpoint has been quiet PAST `busy_until_nanos`. Any open that sees
+    /// neighbors pushes `busy_until` forward by `hold_nanos` (rise-fast); direct resumes only after a
+    /// sustained quiet window (decay-slow). Nanos are measured against `base`.
+    base: std::time::Instant,
+    busy_until_nanos: AtomicU64,
+    hold_nanos: u64,
 }
 
 impl DirectDispatch {
@@ -188,12 +194,29 @@ impl DirectDispatch {
         self.active_total.fetch_sub(1, Ordering::Relaxed);
     }
 
-    /// Normalized crossover signal for a stream entering at `prior_active` other streams:
-    /// `prior_active / direct_cap`. With the default cap of 1 this is 0.0 when solo and ≥1.0
-    /// otherwise, so the crossover picks direct only for a solo stream.
     #[inline]
-    pub fn pressure_at(&self, prior_active: usize) -> f64 {
-        (prior_active as f64 / self.direct_cap.max(1) as f64).clamp(0.0, 1.0)
+    fn now_nanos(&self) -> u64 {
+        self.base.elapsed().as_nanos() as u64
+    }
+
+    /// Mark the endpoint busy for the next `hold_nanos` (rise-to-global fast). Called when a stream
+    /// opens with neighbors already active. `fetch_max` so concurrent marks keep the latest deadline.
+    #[inline]
+    pub fn mark_busy(&self) {
+        let until = self.now_nanos().saturating_add(self.hold_nanos);
+        self.busy_until_nanos.fetch_max(until, Ordering::Relaxed);
+    }
+
+    /// True once the endpoint has been quiet past the last `busy_until` (decay-to-direct slow).
+    #[inline]
+    pub fn is_quiet(&self) -> bool {
+        self.now_nanos() >= self.busy_until_nanos.load(Ordering::Relaxed)
+    }
+
+    /// Solo threshold: how many OTHER active streams still count as "solo enough" for direct.
+    #[inline]
+    pub fn solo_threshold(&self) -> usize {
+        self.direct_cap.saturating_sub(1)
     }
 }
 
@@ -212,6 +235,14 @@ pub(crate) fn install(senders: IdMap<LocalSenderId, BatchSender>) {
         .and_then(|v| v.trim().parse::<usize>().ok())
         .filter(|&n| n > 0)
         .unwrap_or(1); // default: strictly solo (direct only when no other stream is active)
+    // Quiet window that must elapse after the endpoint was last busy before direct resumes
+    // (decay-to-direct slow). Default 1ms — long enough to bridge per-RPC open/close gaps at c8+
+    // so churn jitter can't leak streams onto direct, short vs a genuinely idle (solo) endpoint.
+    let hold_nanos = std::env::var("DCQUIC_ADAPTIVE_HOLD_US")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map(|us| us.saturating_mul(1000))
+        .unwrap_or(1_000_000);
     let _ = DIRECT.set(Arc::new(DirectDispatch {
         senders,
         mode,
@@ -219,6 +250,9 @@ pub(crate) fn install(senders: IdMap<LocalSenderId, BatchSender>) {
         backpressure: Backpressure::default(),
         active_total: AtomicUsize::new(0),
         direct_cap,
+        base: std::time::Instant::now(),
+        busy_until_nanos: AtomicU64::new(0),
+        hold_nanos,
     }));
 }
 
