@@ -155,7 +155,7 @@ pub struct FrameBatch {
 
 impl FrameBatch {
     #[inline]
-    fn new(first: Entry<Frame>) -> Self {
+    pub(crate) fn new(first: Entry<Frame>) -> Self {
         let frame_cost = first.byte_cost();
         let byte_cost = MAX_FRAME_BATCH_PACKET_OVERHEAD.saturating_add(frame_cost);
 
@@ -668,6 +668,60 @@ where
 
     fn on_consumed(&mut self, bytes: u64) {
         self.rx.on_consumed(bytes);
+    }
+}
+
+// ── Direct-submit spray (adaptive dispatch, low-concurrency path) ─────────────
+
+/// Round-robin direct-submit spray for the low-concurrency adaptive-dispatch path.
+///
+/// Wraps a single frame into a one-frame [`FrameBatch`], assigns the next send socket by a simple
+/// round-robin cursor, and pushes it straight to that send worker — bypassing the global
+/// `frame_dispatch` worker (w0) and its pacing (the ~30–70µs sweep-hop that has ~nil shaping value
+/// when the link is uncongested).
+///
+/// Multi-tuple spray is preserved: successive batches from the same stream fan out across ALL send
+/// sockets via the round-robin cursor, so one stream still saturates the link past EC2's per-flow
+/// (per-5-tuple) cap. This does NOT pin a stream to one worker/tuple. The frame already carries its
+/// borrowed `flow_credits` (set by the writer), so no credit is (re)acquired here.
+///
+/// On send failure (the chosen worker's receiver is gone — teardown) the batch's borrowed send-pool
+/// credit is returned to `send_credit_pool` before dropping, mirroring [`PickTwo`]'s teardown
+/// handling (a `Frame` has no credit-releasing `Drop`, so the release is explicit). Returns `Err`
+/// so the caller can surface a closed-channel error exactly as the global path does.
+// WIP: becomes live when the writer's direct-submit branch (adaptive dispatch, Step 2b) calls it.
+#[allow(dead_code)]
+#[inline]
+pub(crate) fn direct_spray<S>(
+    frame: Entry<Frame>,
+    senders: &mut IdMap<LocalSenderId, S>,
+    cursor: &mut usize,
+    send_credit_pool: &crate::credit::Pool,
+) -> Result<(), ()>
+where
+    S: UnboundedSender<Entry<FrameBatch>>,
+{
+    let len = senders.len();
+    debug_assert!(len > 0, "direct_spray requires at least one send sender");
+    if len == 0 {
+        return Err(());
+    }
+    let idx = *cursor % len;
+    *cursor = idx.wrapping_add(1);
+    let sender_id = LocalSenderId::from_index(idx);
+
+    let mut batch = FrameBatch::new(frame);
+    batch.set_sender_id(sender_id);
+
+    match senders[sender_id].send(Entry::new(batch)) {
+        Ok(()) => Ok(()),
+        Err(value) => {
+            let leaked = value.total_flow_credits();
+            if leaked > 0 {
+                send_credit_pool.release(leaked);
+            }
+            Err(())
+        }
     }
 }
 
