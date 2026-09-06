@@ -101,6 +101,55 @@ pub fn probe() -> std::io::Result<()> {
     IoUring::new(8).map(drop)
 }
 
+/// Build the recv ring, preferring the `SINGLE_ISSUER | DEFER_TASKRUN` (+ `COOP_TASKRUN` base) setup
+/// that matches this backend's single dedicated submit/wait/reap thread, and falling back to the
+/// default setup when the kernel does not support those flags.
+///
+/// Why these flags fit here: the ring is driven by exactly one thread that submits, blocks in
+/// `submit_and_wait`, and reaps completions. `SINGLE_ISSUER` lets the kernel drop submit-path locking
+/// it would otherwise need for multiple issuers. `DEFER_TASKRUN` (which requires `SINGLE_ISSUER` and
+/// the `COOP_TASKRUN` base) defers completion task-work to the explicit `io_uring_enter` the loop
+/// already blocks in, so under a high-rate multishot/GRO recv the kernel runs one batched task-run per
+/// wait instead of eager per-completion work + wakeups.
+///
+/// Kernel floor + fallback: these need newer kernels than the provided-buffer ring floor
+/// (`COOP_TASKRUN`/`DEFER_TASKRUN`: 5.19/6.1; `SINGLE_ISSUER`: 6.0). On an `io_uring_setup` rejection
+/// (older kernel) we fall back to the plain [`IoUring::new`] setup — behavior identical to before this
+/// change — and the caller's existing fall-back to the syscall recv path still applies if even that
+/// fails.
+///
+/// Issuer binding (the correctness crux): `SINGLE_ISSUER` locks the ring's submitter task to the task
+/// that *created* the ring, unless the ring is created **`R_DISABLED`** — in which case the submitter
+/// binds to the task that later *enables* it. This backend creates the ring on the parent thread (so
+/// setup failures stay [`SpawnError::Recoverable`]) but drives it from a dedicated recv thread, so a
+/// plain `SINGLE_ISSUER` ring would bind the issuer to the parent and every `submit_and_wait` on the
+/// recv thread would fail with `-EEXIST` (no completions delivered). We therefore add `R_DISABLED`
+/// here and enable the ring from the recv thread (see [`ring_loop`]'s [`Submitter::register_enable_rings`]
+/// call), which binds the issuer to the recv thread as required. Buffer-ring registration
+/// (`io_uring_register`) is permitted while the ring is disabled and does not bind the issuer.
+///
+/// Returns `(ring, needs_enable)`: `needs_enable` is `true` only for the optimized `R_DISABLED` ring,
+/// signalling the recv thread to enable it before first submit. The default-setup fallback ring is
+/// created already-enabled, so it needs no enable step.
+fn build_recv_ring(entries: u32) -> std::io::Result<(IoUring, bool)> {
+    match IoUring::builder()
+        .setup_single_issuer()
+        .setup_coop_taskrun()
+        .setup_defer_taskrun()
+        .setup_r_disabled()
+        .build(entries)
+    {
+        Ok(ring) => Ok((ring, true)),
+        Err(err) => {
+            tracing::debug!(
+                %err,
+                "recv ring: SINGLE_ISSUER|DEFER_TASKRUN setup unsupported; using default ring setup"
+            );
+            IoUring::new(entries).map(|ring| (ring, false))
+        }
+    }
+}
+
 /// The system page size, queried once via `sysconf(_SC_PAGESIZE)`. The buffer ring base must be
 /// aligned to this (not a hard-coded 4096) for `IORING_REGISTER_PBUF_RING` to succeed on kernels
 /// built with larger pages (commonly 16 KiB / 64 KiB on arm64).
@@ -303,12 +352,25 @@ fn build_eventfd_poll(efd: RawFd) -> squeue::Entry {
 fn ring_loop<R: Router>(
     mut ring: IoUring,
     mut buf_ring: BufRing,
+    needs_enable: bool,
     fd: RawFd,
     pool: Pool,
     mut reuse: SyncReuseRing,
     mut router: R,
     shutdown: Arc<Shutdown>,
 ) {
+    // If the ring was created `R_DISABLED` (the SINGLE_ISSUER|DEFER_TASKRUN setup — see
+    // `build_recv_ring`), enable it HERE, on the recv thread, before any submit. This is what binds the
+    // ring's single-issuer/submitter task to THIS thread; the parent thread only created + registered
+    // the (disabled) ring. If enabling fails we cannot recover on this thread (the socket/router were
+    // already committed here), so log and bail — the ring guard's drop still tears down cleanly.
+    if needs_enable {
+        if let Err(err) = ring.submitter().register_enable_rings() {
+            tracing::error!(%err, "recv ring: failed to enable R_DISABLED ring on recv thread");
+            return;
+        }
+    }
+
     let depth = buf_ring.entries;
     let bgid = buf_ring.bgid;
 
@@ -602,7 +664,7 @@ where
         Ok(efd) => efd,
         Err(err) => return Err(SpawnError::Recoverable(err, socket, router)),
     };
-    let ring = match IoUring::new(depth as u32) {
+    let (ring, needs_enable) = match build_recv_ring(depth as u32) {
         Ok(r) => r,
         Err(err) => return Err(SpawnError::Recoverable(err, socket, router)),
     };
@@ -625,7 +687,16 @@ where
             // it is dropped here when the loop returns (after the fd is no longer referenced by any
             // in-flight SQE — the loop tears the ring down before returning).
             let _socket = socket;
-            ring_loop(ring, buf_ring, fd, pool, reuse, router, ring_shutdown);
+            ring_loop(
+                ring,
+                buf_ring,
+                needs_enable,
+                fd,
+                pool,
+                reuse,
+                router,
+                ring_shutdown,
+            );
         });
     match join {
         Ok(join) => Ok(RecvRing {
@@ -648,6 +719,28 @@ mod tests {
         sync::{Arc, Mutex},
         time::Duration,
     };
+
+    /// The recv ring builds via [`build_recv_ring`] and is usable: on a kernel that supports the
+    /// optimized `SINGLE_ISSUER|DEFER_TASKRUN` setup it comes back `R_DISABLED` (`needs_enable`), and
+    /// enabling it from the issuer thread succeeds; on an older kernel it falls back to a plain,
+    /// already-enabled ring. Guards the new setup + enable path directly (the roundtrip test below
+    /// covers the full deliver-on-recv-thread flow). Skipped if io_uring is unavailable.
+    #[test]
+    fn recv_ring_build_and_enable() {
+        if probe().is_err() {
+            eprintln!("io_uring unavailable; skipping recv_ring_build_and_enable");
+            return;
+        }
+        let (ring, needs_enable) = build_recv_ring(64).expect("recv ring must build");
+        if needs_enable {
+            // The optimized ring is R_DISABLED; the issuer binds to whichever thread enables it. This
+            // test thread is that thread here, mirroring what `ring_loop` does on the recv thread.
+            ring.submitter().register_enable_rings().expect(
+                "enabling the R_DISABLED optimized ring must succeed on a supporting kernel",
+            );
+        }
+        drop(ring);
+    }
 
     /// Captured segments: each entry is `(payload bytes, source port)`.
     type CapturedSegments = Arc<Mutex<Vec<(Vec<u8>, u16)>>>;
