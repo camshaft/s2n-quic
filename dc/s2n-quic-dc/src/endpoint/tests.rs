@@ -4643,8 +4643,7 @@ fn queue_msg_gap_exceeded_silent_drop_stalls_reader() {
 fn write_msg_fin_dropped_while_parked_truncates() {
     let _guard = crate::testing::without_snapshots();
     sim(|| {
-        use crate::testing::ext::*;
-        use crate::endpoint::testing::sim::SimEndpointConfig;
+        use crate::{endpoint::testing::sim::SimEndpointConfig, testing::ext::*};
         let acceptor_id = VarInt::from_u8(1);
         const PAYLOAD: usize = 64 * 1024;
         // <= one msg chunk (msg_packet_size ~1320 in the sim), so the init probe is a single
@@ -4719,7 +4718,13 @@ fn write_msg_fin_dropped_while_parked_truncates() {
             // stands in for from_stream returning on reader-done and dropping the write.
             let _ = timeout(
                 Duration::from_millis(20),
-                writer.write_msg(&mut req, crate::stream::MsgFlags { is_fin: true, is_wakeup: true }),
+                writer.write_msg(
+                    &mut req,
+                    crate::stream::MsgFlags {
+                        is_fin: true,
+                        is_wakeup: true,
+                    },
+                ),
             )
             .await;
             drop(writer);
@@ -4759,7 +4764,11 @@ fn write_msg_fin_full_delivery_when_driven_to_completion() {
                             break;
                         }
                     }
-                    assert_eq!(buf.len(), PAYLOAD, "peer must receive the full driven-to-completion payload");
+                    assert_eq!(
+                        buf.len(),
+                        PAYLOAD,
+                        "peer must receive the full driven-to-completion payload"
+                    );
                 }
                 .primary()
                 .spawn();
@@ -4778,12 +4787,21 @@ fn write_msg_fin_full_delivery_when_driven_to_completion() {
             let mut req = Data::new(PAYLOAD as u64);
             let written = timeout(
                 60.s(),
-                writer.write_msg(&mut req, crate::stream::MsgFlags { is_fin: true, is_wakeup: true }),
+                writer.write_msg(
+                    &mut req,
+                    crate::stream::MsgFlags {
+                        is_fin: true,
+                        is_wakeup: true,
+                    },
+                ),
             )
             .await
             .expect("write_msg should not hang when the reader drains")
             .expect("write_msg should succeed");
-            assert_eq!(written, PAYLOAD, "write_msg should report the full payload length");
+            assert_eq!(
+                written, PAYLOAD,
+                "write_msg should report the full payload length"
+            );
             // Correct usage: shut down only AFTER the write completed.
             writer.shutdown().expect("shutdown");
             60.s().sleep().await;
@@ -4857,10 +4875,19 @@ fn write_msg_fin_small_complete_in_probe_delivers_full_despite_drop() {
             let (_reader, mut writer) = stream.into_split();
             let mut req = Data::new(PAYLOAD as u64);
             let written = writer
-                .write_msg(&mut req, crate::stream::MsgFlags { is_fin: true, is_wakeup: true })
+                .write_msg(
+                    &mut req,
+                    crate::stream::MsgFlags {
+                        is_fin: true,
+                        is_wakeup: true,
+                    },
+                )
                 .await
                 .expect("small write_msg should complete in the init probe");
-            assert_eq!(written, PAYLOAD, "write_msg should report the full small length");
+            assert_eq!(
+                written, PAYLOAD,
+                "write_msg should report the full small length"
+            );
             // Model from_stream returning and dropping the writer right after the (completed) write.
             drop(writer);
             60.s().sleep().await;
