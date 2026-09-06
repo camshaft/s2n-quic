@@ -22,12 +22,17 @@ struct Inner<T> {
 struct Shared<T> {
     /// True when the receiver is alive
     is_open: AtomicBool,
+    /// Lock-free "queue non-empty" hint (see AdapterShared::has_items). Set (Release) under the lock
+    /// on push/append, cleared under the lock when a drain/pop empties the queue. Lets poll_recv skip
+    /// the mutex-CAS on empty polls (the busy-poll spin-loop's common case).
+    has_items: AtomicBool,
     inner: Mutex<Inner<T>>,
 }
 
 pub fn new<T>() -> (Sender<T>, Receiver<T>) {
     let shared = Arc::new(Shared {
         is_open: AtomicBool::new(true),
+        has_items: AtomicBool::new(false),
         inner: Mutex::new(Inner {
             queue: intrusive::Queue::new(),
             recv_waker: None,
@@ -39,6 +44,7 @@ pub fn new<T>() -> (Sender<T>, Receiver<T>) {
         },
         Receiver {
             shared: ManuallyDrop::new(shared),
+            registered: None,
         },
     )
 }
@@ -276,6 +282,7 @@ impl<T> super::super::UnboundedSender<intrusive::Entry<T>> for Sender<T> {
 
         let mut guard = self.shared.inner.lock();
         guard.queue.push_back(value);
+        self.shared.has_items.store(true, Ordering::Release);
 
         // Wake the receiver if it's waiting
         if let Some(waker) = guard.recv_waker.take() {
@@ -300,6 +307,7 @@ impl<T> super::super::Sender<intrusive::Entry<T>> for Sender<T> {
         let mut guard = self.shared.inner.lock();
         let entry = unsafe { value.assume_init_read() };
         guard.queue.push_back(entry);
+        self.shared.has_items.store(true, Ordering::Release);
 
         // Wake the receiver if it's waiting
         if let Some(waker) = guard.recv_waker.take() {
@@ -322,6 +330,7 @@ impl<T> Sender<T> {
 
         let mut guard = self.shared.inner.lock();
         guard.queue.push_back(entry);
+        self.shared.has_items.store(true, Ordering::Release);
 
         // Wake the receiver if it's waiting
         if let Some(waker) = guard.recv_waker.take() {
@@ -349,6 +358,7 @@ impl<T> Sender<T> {
 
         let mut guard = self.shared.inner.lock();
         guard.queue.append(&mut batch);
+        self.shared.has_items.store(true, Ordering::Release);
 
         // Wake the receiver if it's waiting
         if let Some(waker) = guard.recv_waker.take() {
@@ -391,6 +401,9 @@ impl<T> super::super::Sender<intrusive::Queue<T>> for Sender<T> {
 
 pub struct Receiver<T> {
     shared: ManuallyDrop<Arc<Shared<T>>>,
+    /// Waker already published into the shared cell (see AdapterReceiver::registered) — lets an empty
+    /// poll with the same waker return Pending via the lock-free has_items load without re-locking.
+    registered: Option<core::task::Waker>,
 }
 
 impl<T> Drop for Receiver<T> {
@@ -424,9 +437,27 @@ impl<T> super::super::Receiver<intrusive::Entry<T>> for Receiver<T> {
             return Poll::Pending;
         }
 
+        // Lock-free fast path (see AdapterReceiver::poll_recv): empty + our waker already registered
+        // ⇒ skip the mutex CAS.
+        if !self.shared.has_items.load(Ordering::Acquire) {
+            if let Some(w) = &self.registered {
+                if w.will_wake(cx.waker()) {
+                    if Arc::strong_count(&self.shared) <= 1 {
+                        return Poll::Ready(None);
+                    }
+                    return Poll::Pending;
+                }
+            }
+        }
+
         let mut guard = self.shared.inner.lock();
 
         if let Some(entry) = guard.queue.pop_front() {
+            // pop_front leaves the queue possibly non-empty; only clear the hint once it's drained.
+            if guard.queue.is_empty() {
+                self.shared.has_items.store(false, Ordering::Release);
+            }
+            self.registered = None;
             budget.consume();
             return Poll::Ready(Some(entry));
         }
@@ -442,6 +473,7 @@ impl<T> super::super::Receiver<intrusive::Entry<T>> for Receiver<T> {
 
         // Queue is empty and senders still alive - register waker
         guard.recv_waker = Some(cx.waker().clone());
+        self.registered = Some(cx.waker().clone());
         Poll::Pending
     }
 
@@ -459,11 +491,25 @@ impl<T> super::super::Receiver<intrusive::Queue<T>> for Receiver<T> {
             return Poll::Pending;
         }
 
+        // Lock-free fast path (see AdapterReceiver::poll_recv).
+        if !self.shared.has_items.load(Ordering::Acquire) {
+            if let Some(w) = &self.registered {
+                if w.will_wake(cx.waker()) {
+                    if Arc::strong_count(&self.shared) <= 1 {
+                        return Poll::Ready(None);
+                    }
+                    return Poll::Pending;
+                }
+            }
+        }
+
         let mut guard = self.shared.inner.lock();
 
         if !guard.queue.is_empty() {
             // Drain all available entries into a batch
             let batch = core::mem::take(&mut guard.queue);
+            self.shared.has_items.store(false, Ordering::Release);
+            self.registered = None;
             budget.consume();
             return Poll::Ready(Some(batch));
         }
@@ -479,6 +525,7 @@ impl<T> super::super::Receiver<intrusive::Queue<T>> for Receiver<T> {
 
         // Queue is empty and senders still alive - register waker
         guard.recv_waker = Some(cx.waker().clone());
+        self.registered = Some(cx.waker().clone());
         Poll::Pending
     }
 
