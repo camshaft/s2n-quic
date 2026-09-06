@@ -277,7 +277,20 @@ where
     #[inline]
     pub fn new(inner: R, clock: &Clk, rate: Rate) -> Self {
         let target_bytes = u16::MAX as u64 - 3000;
-        let wait_nanos = rate.nanos_for_bytes(target_bytes);
+        // EXPERIMENT (env `DCQUIC_BATCH_WAIT_US`): override the batch-accumulation wait to A/B the
+        // low-concurrency latency vs throughput tradeoff. The wait timer is only reached when
+        // `inner` drains empty before the batch fills (i.e. LOW load) — at high concurrency the
+        // batch reaches `target_bytes` (Full) and returns without arming the timer. So a smaller
+        // wait cuts low-conc send-path latency (the ~6.8µs-per-frame accumulation hold measured in
+        // the c32 TTFB residual) while leaving high-conc batching intact. Unset ⇒ rate-derived
+        // default; "0" ⇒ emit immediately (the occupancy-adaptive low-conc fast path).
+        let wait_nanos = match std::env::var("DCQUIC_BATCH_WAIT_US")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+        {
+            Some(us) => us.saturating_mul(1000),
+            None => rate.nanos_for_bytes(target_bytes),
+        };
         Self {
             inner,
             buffered: None,

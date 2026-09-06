@@ -52,6 +52,12 @@ struct AdapterInner<A: intrusive::Adapter> {
 
 pub struct AdapterShared<A: intrusive::Adapter> {
     is_open: AtomicBool,
+    /// Lock-free "queue is non-empty" hint. Set (Release) under the lock on push, cleared under the
+    /// lock on drain. `poll_recv` reads it (Acquire) BEFORE taking the mutex, so an empty poll —
+    /// the overwhelmingly common case in the busy-poll spin-poll loop — costs a single relaxed
+    /// atomic load instead of a mutex lock/unlock (a ~26%-of-CPU CAS pair per the c32 flame). The
+    /// register-then-recheck-under-lock path closes the push/register race, so wakeups are never lost.
+    has_items: AtomicBool,
     inner: Mutex<AdapterInner<A>>,
 }
 
@@ -65,6 +71,9 @@ where
             return Err(value);
         }
         guard.queue.push_back(value);
+        // Publish non-emptiness before releasing the lock so a lock-free `poll_recv` fast-path load
+        // (Acquire) that observes `true` is guaranteed to see the enqueued item under the lock.
+        self.has_items.store(true, Ordering::Release);
         let has_waker = guard.recv_waker.is_some();
         if let Some(waker) = guard.recv_waker.take() {
             drop(guard);
@@ -83,6 +92,7 @@ where
 {
     let shared = Arc::new(AdapterShared {
         is_open: AtomicBool::new(true),
+        has_items: AtomicBool::new(false),
         inner: Mutex::new(AdapterInner {
             queue: intrusive::List::new(),
             recv_waker: None,
@@ -94,6 +104,7 @@ where
         },
         AdapterReceiver {
             shared: ManuallyDrop::new(shared),
+            registered: None,
         },
     )
 }
@@ -135,6 +146,10 @@ impl<A: intrusive::Adapter> Drop for AdapterSender<A> {
 
 pub struct AdapterReceiver<A: intrusive::Adapter> {
     shared: ManuallyDrop<Arc<AdapterShared<A>>>,
+    /// The waker this receiver has already published into the shared cell. Lets an empty poll with
+    /// the same waker (the steady state — and always so under busy-poll's noop waker) return
+    /// `Pending` via the lock-free `has_items` load without re-taking the mutex to re-register.
+    registered: Option<core::task::Waker>,
 }
 
 impl<A: intrusive::Adapter> Drop for AdapterReceiver<A> {
@@ -164,6 +179,7 @@ where
     pub fn drain_into(&mut self, list: &mut intrusive::List<A>) {
         let mut guard = self.shared.inner.lock();
         list.append(&mut guard.queue);
+        self.shared.has_items.store(false, Ordering::Release);
     }
 }
 
@@ -181,10 +197,31 @@ where
             return Poll::Pending;
         }
 
+        // Lock-free fast path: queue empty AND our waker already published ⇒ skip the mutex (a CAS
+        // lock/unlock pair). A push publishes `has_items=true` (Release) under the lock before
+        // releasing it, so observing `false` (Acquire) means no push has completed; and since our
+        // waker is already in the shared cell, any subsequent push will wake us. Push also always
+        // sets `has_items=true` BEFORE taking the waker, so a taken waker implies `has_items=true`,
+        // which forces the slow path below — no wakeup can be lost.
+        if !self.shared.has_items.load(Ordering::Acquire) {
+            if let Some(w) = &self.registered {
+                if w.will_wake(cx.waker()) {
+                    if Arc::strong_count(&self.shared) <= 1 {
+                        return Poll::Ready(None);
+                    }
+                    return Poll::Pending;
+                }
+            }
+        }
+
+        // Slow path: take the lock to drain, or to (re)register the waker and re-check under the
+        // lock (closing the push/register race).
         let mut guard = self.shared.inner.lock();
 
         if !guard.queue.is_empty() {
             let batch = core::mem::take(&mut guard.queue);
+            self.shared.has_items.store(false, Ordering::Release);
+            self.registered = None;
             budget.consume();
             return Poll::Ready(Some(batch));
         }
@@ -194,6 +231,7 @@ where
         }
 
         guard.recv_waker = Some(cx.waker().clone());
+        self.registered = Some(cx.waker().clone());
         Poll::Pending
     }
 
