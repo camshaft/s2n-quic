@@ -959,6 +959,10 @@ fn sys_rseq(rseq_abi: *mut Rseq, flags: i32) -> std::io::Result<()> {
 
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
+    // Serialize the tests that read the process-global `PAGES_ALLOCATED` counter (and any test that
+    // allocates pages concurrently), so one test's `Page::new`s can't inflate another's before/after
+    // delta under the parallel test harness.
+    static PAGE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     use super::*;
 
     // See comments in possible_cpus if this fails -- it's possible the failure just indicates we
@@ -982,6 +986,7 @@ mod tests {
 
     #[test]
     fn test_send_event_local() {
+        let _serial = PAGE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let mut channels = Channels::<TestAbsorber>::new();
 
         channels.allocate();
@@ -1014,6 +1019,7 @@ mod tests {
 
     #[test]
     fn test_send_event_overflow() {
+        let _serial = PAGE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let channels = Channels::<TestAbsorber>::new();
 
         channels.allocate();
@@ -1107,6 +1113,7 @@ mod tests {
     // `lse` enablement on aarch64
     #[allow(unused_unsafe)]
     fn check_send_slow_branches() {
+        let _serial = PAGE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         #[cfg(target_arch = "aarch64")]
         if !std::arch::is_aarch64_feature_detected!("lse") {
             return;
@@ -1209,6 +1216,7 @@ mod tests {
     /// exact count. On the fallback path (no rseq/membarrier) pages are never used, so it early-outs.
     #[test]
     fn steady_state_stops_allocating_pages() {
+        let _serial = PAGE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         use std::sync::{
             atomic::{AtomicBool, AtomicU64, Ordering},
             Arc,
@@ -1309,6 +1317,7 @@ mod tests {
     /// back into `empty_pages` on exhaustion, so allocation stays bounded with no external drainer.
     #[test]
     fn records_without_reporter_self_bound() {
+        let _serial = PAGE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let channels = Channels::<TestAbsorber>::new();
         channels.allocate();
         if channels.must_use_fallback {
