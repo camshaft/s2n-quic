@@ -300,6 +300,7 @@ fn build_eventfd_poll(efd: RawFd) -> squeue::Entry {
 /// [`spawn`] before this thread starts, so registration failures fall back cleanly), owns the socket
 /// fd and the bid→descriptor map, keeps the ring full of provided buffers, reaps recv completions into
 /// `Filled` segments, and routes them. Returns when `shutdown.closed` is observed.
+#[allow(clippy::too_many_arguments)]
 fn ring_loop<R: Router>(
     mut ring: IoUring,
     mut buf_ring: BufRing,
@@ -308,6 +309,11 @@ fn ring_loop<R: Router>(
     mut reuse: SyncReuseRing,
     mut router: R,
     shutdown: Arc<Shutdown>,
+    // Buffer-exhaustion instrumentation (the gate for whether the fixed ring depth is right): counts
+    // multishot re-arm events and ENOBUFS-class no-buffer completions. A ~0 rate at peak PPS means the
+    // depth is sufficient; a non-negligible rate means intake is stalling in the re-arm gap.
+    rearm_counter: crate::counter::Counter,
+    no_buffer_counter: crate::counter::Counter,
 ) {
     let depth = buf_ring.entries;
     let bgid = buf_ring.bgid;
@@ -389,8 +395,11 @@ fn ring_loop<R: Router>(
                 debug_assert_eq!(token, RECV_USER_DATA);
 
                 // The multishot recv is no longer armed once the kernel clears F_MORE — re-arm above.
+                // Count the transition: each re-arm is a gap where the socket has no outstanding recv,
+                // so a high rate at peak PPS is the exhaustion signal the depth is meant to prevent.
                 if !cqueue::more(cqe.flags()) {
                     recv_armed = false;
+                    rearm_counter.add(1);
                 }
 
                 let res = cqe.result();
@@ -399,6 +408,7 @@ fn ring_loop<R: Router>(
                     // (e.g. -ENOBUFS when the ring was momentarily empty): nothing to free, the
                     // re-arm + replenish below recovers. Non-negative with no buffer should not occur.
                     if res < 0 {
+                        no_buffer_counter.add(1);
                         tracing::trace!(errno = -res, "recv cqe error without buffer");
                     }
                     continue;
@@ -570,6 +580,7 @@ pub enum SpawnError<S, R> {
 /// whole lifetime (keeping the fd open), so the returned [`RecvRing`] need not — dropping the
 /// `RecvRing` signals the thread to stop and joins it, after which the socket is dropped on that
 /// thread. `socket` need only be `Send` (the ring thread is its sole accessor).
+#[allow(clippy::too_many_arguments)]
 pub fn spawn<S, R>(
     idx: usize,
     socket: S,
@@ -577,11 +588,19 @@ pub fn spawn<S, R>(
     pool: Pool,
     reuse: SyncReuseRing,
     router: R,
+    counters: &crate::counter::Registry,
 ) -> Result<RecvRing, SpawnError<S, R>>
 where
     S: crate::socket::recv::Socket,
     R: Router + Send + 'static,
 {
+    // Per-ring buffer-exhaustion counters (registered up front so they exist even if the ring never
+    // hits exhaustion). `rx.ring.rearm` / `rx.ring.no_buffer` are the gate for whether the fixed ring
+    // depth holds at peak PPS — read them under load before considering a depth change.
+    let rearm_counter = counters.register_nominal("rx.ring.rearm", format_args!("recv.{idx}"));
+    let no_buffer_counter =
+        counters.register_nominal("rx.ring.no_buffer", format_args!("recv.{idx}"));
+
     let Some(fd) = socket.raw_fd() else {
         // No real OS fd — io_uring cannot drive it. Hand both back for the syscall path.
         return Err(SpawnError::Recoverable(
@@ -625,7 +644,17 @@ where
             // it is dropped here when the loop returns (after the fd is no longer referenced by any
             // in-flight SQE — the loop tears the ring down before returning).
             let _socket = socket;
-            ring_loop(ring, buf_ring, fd, pool, reuse, router, ring_shutdown);
+            ring_loop(
+                ring,
+                buf_ring,
+                fd,
+                pool,
+                reuse,
+                router,
+                ring_shutdown,
+                rearm_counter,
+                no_buffer_counter,
+            );
         });
     match join {
         Ok(join) => Ok(RecvRing {
@@ -697,8 +726,16 @@ mod tests {
 
         let pool = Pool::new(u16::MAX);
         let reuse = SyncReuseRing::new();
-        let ring = spawn(0, socket, 64, pool, reuse, router)
-            .unwrap_or_else(|_| panic!("recv ring spawn must succeed when io_uring is available"));
+        let ring = spawn(
+            0,
+            socket,
+            64,
+            pool,
+            reuse,
+            router,
+            &crate::counter::Registry::default(),
+        )
+        .unwrap_or_else(|_| panic!("recv ring spawn must succeed when io_uring is available"));
 
         // Give the ring thread a moment to register the buffer ring and arm the multishot recv.
         std::thread::sleep(Duration::from_millis(50));
