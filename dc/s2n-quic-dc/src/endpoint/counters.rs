@@ -48,6 +48,14 @@ pub(crate) struct Dispatch {
     pub rx_peer_cache_miss: Counter,
     pub rx_peer_lookup_time: Timer,
     pub rx_decrypt_time: Timer,
+    /// Packets decrypted via the zero-copy fast path (single-QueueMsg scatter-decrypt straight into
+    /// the destination slot). Paired with [`rx_decrypt_slow`](Self::rx_decrypt_slow), this measures
+    /// the fast/slow decrypt split — the gate for whether pooling the slow-path decrypt buffer is
+    /// worth doing (a fast-path-dominated workload makes it a no-op).
+    pub rx_decrypt_fast: Counter,
+    /// Packets decrypted via the slow path, which allocates a per-packet buffer and decrypts into it
+    /// before dispatching frames. See [`rx_decrypt_fast`](Self::rx_decrypt_fast).
+    pub rx_decrypt_slow: Counter,
     pub rx_dispatch_time: Timer,
     pub rx_frames_per_packet: Summary,
     pub rx_packet_size: Summary,
@@ -121,6 +129,8 @@ impl Dispatch {
             rx_peer_cache_miss: counters.register("rx.peer_cache.miss"),
             rx_peer_lookup_time: counters.register_timer("rx.peer_lookup_time"),
             rx_decrypt_time: counters.register_timer("rx.decrypt_time"),
+            rx_decrypt_fast: counters.register("rx.decrypt.fast"),
+            rx_decrypt_slow: counters.register("rx.decrypt.slow"),
             rx_dispatch_time: counters.register_timer("rx.dispatch_time"),
             rx_frames_per_packet: counters.register_summary("rx.frames_per_packet", Unit::Count),
             rx_packet_size: counters.register_summary("rx.packet_size", Unit::Byte),
