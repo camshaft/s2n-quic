@@ -28,7 +28,7 @@
 
 #![allow(dead_code)] // WIP prototype: wired to the writer datapath in the plumbing step.
 
-use core::sync::atomic::{AtomicU8, Ordering};
+use core::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 
 /// Dispatch mode, selected once at endpoint construction via `DCQUIC_ADAPTIVE_DISPATCH`.
 ///
@@ -152,12 +152,46 @@ pub(crate) struct DirectDispatch {
     pub mode: DispatchMode,
     pub crossover: Crossover,
     pub backpressure: Backpressure,
+    /// Count of streams CURRENTLY on the direct path (endpoint-wide). This is the crossover's
+    /// backpressure signal in `Adaptive` mode: direct-submit skips the global batcher/pacer, so
+    /// many concurrent direct streams crater throughput (measured: r64k-c8 direct-only halved RX).
+    /// Bounding the number of concurrent direct streams bounds that harm — as the count rises
+    /// toward `direct_cap`, new streams increasingly fall back to the (batched, shaped) global path.
+    active_direct: AtomicUsize,
+    /// Soft cap on concurrent direct streams: the crossover ramps `active_direct/direct_cap` through
+    /// [`Crossover`], so the fraction of new streams taking direct decays smoothly to 0 as the cap
+    /// is approached (gradual, not a hard flip). Tunable via `DCQUIC_ADAPTIVE_DIRECT_CAP`.
+    direct_cap: usize,
 }
 
 impl DirectDispatch {
     /// Clone the sender template for a writer that has decided to take the direct path.
     pub fn clone_senders(&self) -> IdMap<LocalSenderId, BatchSender> {
         self.senders.clone()
+    }
+
+    /// Current number of streams on the direct path.
+    #[inline]
+    pub fn active_direct(&self) -> usize {
+        self.active_direct.load(Ordering::Relaxed)
+    }
+
+    /// Normalized crossover signal in `[0,1]`: `active_direct / direct_cap`.
+    #[inline]
+    pub fn direct_pressure(&self) -> f64 {
+        (self.active_direct() as f64 / self.direct_cap.max(1) as f64).clamp(0.0, 1.0)
+    }
+
+    /// Register that a stream took the direct path (call once at open of a direct stream).
+    #[inline]
+    pub fn inc_direct(&self) {
+        self.active_direct.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Register that a direct stream closed (call once from the direct writer's Drop).
+    #[inline]
+    pub fn dec_direct(&self) {
+        self.active_direct.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -171,11 +205,18 @@ pub(crate) fn install(senders: IdMap<LocalSenderId, BatchSender>) {
     if mode == DispatchMode::Off {
         return;
     }
+    let direct_cap = std::env::var("DCQUIC_ADAPTIVE_DIRECT_CAP")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(4);
     let _ = DIRECT.set(Arc::new(DirectDispatch {
         senders,
         mode,
         crossover: Crossover::default(),
         backpressure: Backpressure::default(),
+        active_direct: AtomicUsize::new(0),
+        direct_cap,
     }));
 }
 

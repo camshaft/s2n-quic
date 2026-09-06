@@ -421,16 +421,26 @@ fn open_direct_senders(
     let dd = crate::endpoint::adaptive::get()?;
     let take_direct = match dd.mode {
         DispatchMode::Off => false,
+        // Direct: unconditional (isolates the low-conc hop-cut win in A/B; not for high conc).
         DispatchMode::Direct => true,
         DispatchMode::Adaptive => {
-            // Per-stream sticky draw vs the hysteretic crossover ramp on the current backpressure
-            // signal: take direct with probability (1 - global_probability). With the backpressure
-            // gauge unfed (0.0) the ramp yields 0.0 global ⇒ always direct until the signal is wired.
-            let p_global = dd.crossover.global_probability(dd.backpressure.load());
+            // Per-stream sticky draw vs the crossover ramp on the ACTIVE-DIRECT-stream pressure:
+            // take direct with probability (1 - global_probability). Few direct streams ⇒ ~0 global
+            // ⇒ join the fast lane; as the count approaches direct_cap the ramp pushes new streams
+            // to the (batched, shaped) global path — bounding the un-batched direct load that
+            // craters throughput at concurrency (measured r64k-c8 direct-only collapse).
+            let p_global = dd.crossover.global_probability(dd.direct_pressure());
             crate::xorshift::Rng::new().next_f64() >= p_global
         }
     };
-    take_direct.then(|| dd.clone_senders())
+    if take_direct {
+        // Register on the direct path BEFORE cloning senders; the writer's Drop decrements iff its
+        // `direct_senders` ended up `Some`, so inc/dec stay balanced.
+        dd.inc_direct();
+        Some(dd.clone_senders())
+    } else {
+        None
+    }
 }
 
 impl Writer {
@@ -2466,6 +2476,13 @@ impl Inner {
 
 impl Drop for Writer {
     fn drop(&mut self) {
+        // Adaptive dispatch: balance the active-direct counter. A writer holds `direct_senders`
+        // iff it took the direct path at open (and incremented), so decrement here exactly once.
+        if self.0.direct_senders.is_some() {
+            if let Some(dd) = crate::endpoint::adaptive::get() {
+                dd.dec_direct();
+            }
+        }
         debug!(
             binding_id = self.0.control_rx.binding_id().as_u64(),
             status = ?self.0.status,
