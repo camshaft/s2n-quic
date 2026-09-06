@@ -35,6 +35,23 @@ struct SlotInner {
     drain_waker: Option<Waker>,
 }
 
+/// Whether the occupancy-gated inline-wake fast path is enabled (default on).
+/// Read once and cached; set `DCQUIC_INLINE_WAKE=0` to force the pure batched-drain path.
+fn inline_wake_enabled() -> bool {
+    static CACHED: AtomicUsize = AtomicUsize::new(2); // 2 = uninit, 0 = off, 1 = on
+    match CACHED.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let on = std::env::var("DCQUIC_INLINE_WAKE")
+                .map(|v| v != "0")
+                .unwrap_or(true);
+            CACHED.store(on as usize, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
 impl Slot {
     fn new() -> Self {
         Self {
@@ -46,15 +63,47 @@ impl Slot {
     }
 
     fn push(&self, waker: Waker) {
-        let notify = {
+        // Occupancy-gated adaptive wake (operator seq-346): at LOW occupancy — an otherwise-empty
+        // slot means a lone request, so there is nothing to amortize — fire the caller's waker
+        // INLINE and skip the drain-task sweep hop entirely (that hop is pure added latency at low
+        // load, and the busy-poll drain only re-polls on its next sweep since its own waker is a
+        // no-op). At higher occupancy — a backlog is already queued — keep the batched-drain path
+        // so the dispatch thread stays syscall-free while processing packets at line rate. This is
+        // self-adapting: the slot only fills between drains when the arrival rate is actually high,
+        // so the inline path is taken precisely in the un-amortized low-concurrency regime.
+        //
+        // Gated on `DCQUIC_INLINE_WAKE` (default on) so the behavior can be A/B'd against the pure
+        // batched path without a rebuild.
+        enum Fire {
+            Inline(Waker),
+            Drain(Waker),
+            None,
+        }
+        let fire = {
             let mut guard = self.inner.lock();
-            guard.wakers.push_back(waker);
-            guard.drain_waker.take()
+            if inline_wake_enabled() && guard.wakers.is_empty() {
+                // low-occupancy fast path: don't enqueue; fire the caller after dropping the lock
+                Fire::Inline(waker)
+            } else {
+                guard.wakers.push_back(waker);
+                match guard.drain_waker.take() {
+                    Some(w) => Fire::Drain(w),
+                    None => Fire::None,
+                }
+            }
         };
-        let has_notify = notify.is_some();
-        trace!(has_drain_waker = has_notify, "waker::Slot::push");
-        if let Some(w) = notify {
-            w.wake();
+        match fire {
+            Fire::Inline(w) => {
+                trace!("waker::Slot::push -> inline (low-occupancy)");
+                w.wake();
+            }
+            Fire::Drain(w) => {
+                trace!(has_drain_waker = true, "waker::Slot::push -> batched");
+                w.wake();
+            }
+            Fire::None => {
+                trace!(has_drain_waker = false, "waker::Slot::push -> batched");
+            }
         }
     }
 
