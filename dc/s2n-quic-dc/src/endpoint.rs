@@ -28,6 +28,7 @@ use s2n_quic_core::{time, varint::VarInt};
 use std::sync::{atomic::AtomicU64, Arc};
 
 pub(crate) mod ack;
+pub(crate) mod adaptive;
 pub(crate) mod assemble;
 pub(crate) mod combinator;
 pub mod counters;
