@@ -35,6 +35,11 @@ impl<Inner: Router> Router for WithMap<Inner> {
     }
 
     #[inline]
+    fn on_batch_complete(&mut self) {
+        self.inner.on_batch_complete();
+    }
+
+    #[inline]
     fn handle_control_packet(
         &mut self,
         remote_address: SocketAddress,
