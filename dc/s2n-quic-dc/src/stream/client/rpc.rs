@@ -482,9 +482,10 @@ mod tests {
                     .await
                     .expect("connect failed");
                 let request = Bytes::from(vec![0xABu8; REQ_LEN]);
-                let response = from_stream(stream, request, InMemoryResponse::from(Vec::<u8>::new()))
-                    .await
-                    .expect("rpc should succeed");
+                let response =
+                    from_stream(stream, request, InMemoryResponse::from(Vec::<u8>::new()))
+                        .await
+                        .expect("rpc should succeed");
                 assert_eq!(&response[..], b"pong");
             }
             .group("client")
