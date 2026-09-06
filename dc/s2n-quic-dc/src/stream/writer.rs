@@ -60,7 +60,7 @@
 //   multi-stream contention on shared pipeline resources.
 use super::coop::{self, Coop, HasCoop};
 use crate::{
-    byte_vec::ByteVec,
+    byte_vec::{Builder, ByteVec},
     endpoint::{
         error::{self, Error},
         frame::{
@@ -91,7 +91,10 @@ use std::{
     net::SocketAddr,
     pin::Pin,
     ptr::NonNull,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
     task::{Context, Poll},
 };
 
@@ -105,6 +108,60 @@ pub struct MsgFlags {
     /// writer's `blocked` bit, or via the synthetic/standalone blocked signals (see
     /// `queue/slot.rs` `push_msg` and `send_data_blocked_frame`).
     pub is_wakeup: bool,
+}
+
+/// Whether `send_data` backs a whole call's frame payloads with a single allocation (default on).
+///
+/// The naive per-frame path does `ByteVec::new()` + copy per MTU chunk, and `ByteVec::put_slice`
+/// is `Bytes::copy_from_slice` — a fresh heap allocation + memcpy for EVERY frame. A 1 MiB `&[u8]`
+/// / `AsyncWrite` `write_from` at a ~9 KiB MTU emits ~118 frames = ~118 allocs in one call. When
+/// on, one pre-sized [`Builder`] head buffer absorbs every chunk's slice bytes and each frame gets
+/// a refcounted `split` slice of it, so the call does ~1 allocation instead of ~N.
+///
+/// Set `DCQUIC_SHARED_PAYLOAD_ALLOC=0` to force the legacy per-frame path (for A/B without a
+/// rebuild). Read once and cached.
+fn shared_payload_enabled() -> bool {
+    static CACHED: AtomicUsize = AtomicUsize::new(2); // 2 = uninit, 0 = off, 1 = on
+    match CACHED.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let on = std::env::var("DCQUIC_SHARED_PAYLOAD_ALLOC")
+                .map(|v| v != "0")
+                .unwrap_or(true);
+            CACHED.store(on as usize, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+/// A payload-storage adapter that funnels one `send_data` call's per-frame copies into a single
+/// backing allocation (the wrapped [`Builder`]'s head buffer), handing each frame a refcounted
+/// `split` slice instead of minting a fresh `Bytes` per frame.
+///
+/// `SPECIALIZES_BYTES = true` mirrors [`ByteVec`] so `Bytes` sources are still MOVED zero-copy
+/// (`put_bytes`) rather than copied into the head — the existing large-`Bytes`-write fast path is
+/// preserved. Only the slice/copy path (`&[u8]` / `AsyncWrite` callers) changes: instead of one
+/// `Bytes::copy_from_slice` allocation per chunk, the bytes land in the shared, pre-sized head.
+struct SharedPayload<'a>(&'a mut Builder);
+
+impl Storage for SharedPayload<'_> {
+    const SPECIALIZES_BYTES: bool = true;
+
+    #[inline]
+    fn put_slice(&mut self, bytes: &[u8]) {
+        self.0.put_slice(bytes);
+    }
+
+    #[inline]
+    fn put_bytes(&mut self, bytes: bytes::Bytes) {
+        self.0.put_bytes(bytes);
+    }
+
+    #[inline]
+    fn remaining_capacity(&self) -> usize {
+        self.0.remaining_capacity()
+    }
 }
 
 /// The send half of an `s2n-quic-dc` stream.
@@ -1895,6 +1952,23 @@ impl Inner {
         // every frame shares the same reference point for sojourn measurement.
         let batch_enqueued_at = Some(self.clock.now());
 
+        // When single-allocation payloads are enabled, one `Builder` head buffer — pre-sized to the
+        // most this call could send — backs every frame, and `Builder::split` hands out refcounted
+        // slices of it (vs a fresh `Bytes::copy_from_slice` allocation per MTU chunk). Sizing to the
+        // send cap means the head is allocated exactly once: the total bytes framed this call never
+        // exceed it (`buffered_len` only drains; the budget/offset caps only shrink), so no chunk
+        // write re-allocates. Crucially `buf` is NOT pre-drained — each iteration still copies just
+        // one chunk and drains `buf` by that much, so the `is_last_chunk`/FIN detection below reads
+        // exactly the same `buf.buffer_is_empty()` as the legacy path.
+        let mut payload_builder = shared_payload_enabled().then(|| {
+            let send_cap = buf
+                .buffered_len()
+                .min(self.min_send_budget() as usize)
+                .min(self.remaining_offset_capacity())
+                .max(1);
+            Builder::new(send_cap)
+        });
+
         loop {
             if !need_fin_packet && buf.buffer_is_empty() {
                 break;
@@ -1940,11 +2014,28 @@ impl Inner {
                     .min(remaining_offset_capacity)
             };
 
-            let mut payload = ByteVec::new();
-            if chunk_len > 0 {
+            let payload = if chunk_len == 0 {
+                // Empty frame (standalone FIN) — no payload, no allocation.
+                ByteVec::new()
+            } else if let Some(builder) = payload_builder.as_mut() {
+                {
+                    // Copy this chunk into the shared head buffer (reborrow so `builder` stays
+                    // usable for the `split` below). `SharedPayload` keeps `Bytes` sources zero-copy.
+                    let mut sp = SharedPayload(&mut *builder);
+                    let mut writer = sp.with_write_limit(chunk_len);
+                    buf.infallible_copy_into(&mut writer);
+                }
+                // Hand this frame exactly the bytes just written, as a refcounted slice of the
+                // shared allocation. `split` leaves the head's spare capacity in place for the
+                // next chunk, so the whole call reuses one allocation.
+                builder.split()
+            } else {
+                // Legacy path: a fresh allocation per frame.
+                let mut payload = ByteVec::new();
                 let mut writer = payload.with_write_limit(chunk_len);
                 buf.infallible_copy_into(&mut writer);
-            }
+                payload
+            };
 
             let payload_len = payload.len();
             let offset = self.next_offset;
