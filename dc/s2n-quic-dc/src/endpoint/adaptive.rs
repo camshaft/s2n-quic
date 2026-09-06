@@ -132,6 +132,58 @@ impl Backpressure {
     }
 }
 
+// ── Endpoint-wide direct-dispatch context (prototype: process-global, single-endpoint) ───────
+//
+// PROTOTYPE SCOPING: the direct-submit datapath needs the endpoint's send-socket senders at the
+// writer, but those are built deep in endpoint setup and the writer-construction path threads no
+// carrier for them. For the env-gated measurement prototype we install the context in a process
+// `OnceLock` at endpoint build and the writer reads it lazily on first send. This is single-endpoint
+// only (one install per process) — acceptable for the A/B rig; a production version would thread a
+// per-endpoint handle through the dispatch path instead.
+
+use crate::endpoint::{id::IdMap, id::LocalSenderId, BatchSender};
+use std::sync::{Arc, OnceLock};
+
+/// Shared direct-dispatch context installed once at endpoint build when adaptive dispatch is on.
+pub(crate) struct DirectDispatch {
+    /// Template of the endpoint's send-socket senders. A direct-mode writer CLONES this into its
+    /// own owned map (each `UnboundedSender::send` needs `&mut`, so senders can't be shared).
+    senders: IdMap<LocalSenderId, BatchSender>,
+    pub mode: DispatchMode,
+    pub crossover: Crossover,
+    pub backpressure: Backpressure,
+}
+
+impl DirectDispatch {
+    /// Clone the sender template for a writer that has decided to take the direct path.
+    pub fn clone_senders(&self) -> IdMap<LocalSenderId, BatchSender> {
+        self.senders.clone()
+    }
+}
+
+static DIRECT: OnceLock<Arc<DirectDispatch>> = OnceLock::new();
+
+/// Install the process-global direct-dispatch context. Called once at endpoint build when
+/// `DispatchMode::from_env() != Off`. Idempotent-ish: a second install (e.g. a second endpoint in
+/// the same process) is ignored — the prototype supports one endpoint.
+pub(crate) fn install(senders: IdMap<LocalSenderId, BatchSender>) {
+    let mode = DispatchMode::from_env();
+    if mode == DispatchMode::Off {
+        return;
+    }
+    let _ = DIRECT.set(Arc::new(DirectDispatch {
+        senders,
+        mode,
+        crossover: Crossover::default(),
+        backpressure: Backpressure::default(),
+    }));
+}
+
+/// Fetch the installed context, if adaptive dispatch is enabled for this process.
+pub(crate) fn get() -> Option<&'static Arc<DirectDispatch>> {
+    DIRECT.get()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

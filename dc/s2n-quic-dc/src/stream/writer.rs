@@ -410,6 +410,29 @@ impl Status {
     }
 }
 
+/// Decide this stream's dispatch path ONCE at open (sticky). Returns the writer's own clone of the
+/// send-socket senders when the stream should take the DIRECT path (adaptive dispatch enabled +
+/// the per-stream draw picks direct), else `None` (global path through `frame_tx`). See
+/// [`crate::endpoint::adaptive`]. When adaptive dispatch is not installed (env unset), always `None`.
+fn open_direct_senders(
+) -> Option<crate::endpoint::id::IdMap<crate::endpoint::id::LocalSenderId, crate::endpoint::BatchSender>>
+{
+    use crate::endpoint::adaptive::DispatchMode;
+    let dd = crate::endpoint::adaptive::get()?;
+    let take_direct = match dd.mode {
+        DispatchMode::Off => false,
+        DispatchMode::Direct => true,
+        DispatchMode::Adaptive => {
+            // Per-stream sticky draw vs the hysteretic crossover ramp on the current backpressure
+            // signal: take direct with probability (1 - global_probability). With the backpressure
+            // gauge unfed (0.0) the ramp yields 0.0 global ⇒ always direct until the signal is wired.
+            let p_global = dd.crossover.global_probability(dd.backpressure.load());
+            crate::xorshift::Rng::new().next_f64() >= p_global
+        }
+    };
+    take_direct.then(|| dd.clone_senders())
+}
+
 impl Writer {
     pub(crate) fn new_client(
         frame_tx: SubmissionSender,
@@ -470,7 +493,7 @@ impl Writer {
             priority,
             send_credit_pool,
             pending_credits: 0,
-            direct_senders: None,
+            direct_senders: open_direct_senders(),
             rr_cursor: 0,
         }))
     }
@@ -527,7 +550,7 @@ impl Writer {
             priority,
             send_credit_pool,
             pending_credits: 0,
-            direct_senders: None,
+            direct_senders: open_direct_senders(),
             rr_cursor: 0,
         }))
     }
@@ -2412,6 +2435,20 @@ impl Inner {
     }
 
     fn send_batch(&mut self, queue: Queue<Frame>) -> io::Result<()> {
+        // Adaptive dispatch: a direct-mode stream coalesces the batch and sprays it straight to a
+        // send worker, bypassing the global frame_dispatch hop. Same batch-to-one-socket routing as
+        // the global path; the round-robin cursor keeps successive batches spread across sockets.
+        if let Some(senders) = &mut self.direct_senders {
+            return crate::endpoint::combinator::direct_spray_batch(
+                queue,
+                senders,
+                &mut self.rr_cursor,
+                &self.send_credit_pool,
+            )
+            .map_err(|()| {
+                io::Error::new(io::ErrorKind::BrokenPipe, "direct send channel closed")
+            });
+        }
         let priority = queue
             .iter()
             .next()

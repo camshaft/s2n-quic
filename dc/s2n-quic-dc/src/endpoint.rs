@@ -749,6 +749,12 @@ where
         .map(|(sender_id, &worker_idx)| (sender_id, worker_batch_txs[worker_idx].clone()))
         .collect();
 
+    // Adaptive dispatch (prototype, env-gated): install the process-global direct-dispatch context
+    // so DIRECT-mode stream writers can spray straight to these send workers, bypassing the global
+    // frame_dispatch hop. No-op unless DCQUIC_ADAPTIVE_DISPATCH is set (install() early-returns on
+    // Off); the clone is a one-time startup cost.
+    adaptive::install(socket_senders.clone());
+
     // ── Waker offload ─────────────────────────────────────────────────────────
     // One slot per producer (recv_dispatch + send workers + background peer-dead fanout task
     // + the two credit-pool distributors), partitioned across waker_drain workers.
