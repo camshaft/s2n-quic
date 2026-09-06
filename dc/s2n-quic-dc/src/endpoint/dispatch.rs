@@ -450,6 +450,7 @@ where
 
         // Fast path: single QueueMsg frame — decrypt directly into the slot buffer.
         if let Some(header) = single_queue_msg {
+            counters.rx_decrypt_fast.add(1);
             frame_trace::wire(
                 frame_trace::Lifecycle::InboundFastPath,
                 &header,
@@ -489,6 +490,7 @@ where
         }
 
         // Slow path: allocate BytesMut, decrypt into it, dispatch frames later.
+        counters.rx_decrypt_slow.add(1);
         let mut buf = BytesMut::with_capacity(decrypt_len);
         let written = packet
             .decrypt_into(opener, bytes::BufMut::chunk_mut(&mut buf))
