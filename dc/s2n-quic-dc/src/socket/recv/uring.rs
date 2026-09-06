@@ -320,8 +320,11 @@ fn ring_loop<R: Router>(
     let msg = recv_msghdr();
 
     // Fill the ring: allocate a descriptor per bid, publish its recv region, park it in the bid map.
+    // Drain the recycle channel once up front, then serve each bid from the thread-local free list —
+    // one recycle-channel lock for the whole fill pass instead of one per bid.
+    reuse.drain();
     for bid in 0..depth {
-        let Some(unfilled) = reuse.alloc_or_reuse(&pool) else {
+        let Some(unfilled) = reuse.take_one(&pool) else {
             // Pool exhausted at startup — provide what we have; the loop replenishes as CQEs free bids.
             break;
         };
@@ -441,8 +444,14 @@ fn ring_loop<R: Router>(
         // Replenish freed bids with fresh descriptors so the ring stays full. Pool exhaustion leaves a
         // bid empty (backpressure); a later pass retries it once descriptors recycle.
         if !to_replenish.is_empty() {
+            // Drain the cross-core recycle channel ONCE for the whole batch, then serve each freed bid
+            // from the thread-local free list — one recycle-channel mutex acquire per replenish pass
+            // instead of one per bid (the per-packet cross-core lock this idea removes). A bid that
+            // finds the local list momentarily empty still falls back to the allocator in `take_one`,
+            // preserving the exhaustion/backpressure path.
+            reuse.drain();
             for &bid in &to_replenish {
-                if let Some(unfilled) = reuse.alloc_or_reuse(&pool) {
+                if let Some(unfilled) = reuse.take_one(&pool) {
                     let (addr, len) = unfilled.recv_prefix_region();
                     // SAFETY: parked in `bid_map[bid]` for the kernel operation's duration.
                     unsafe { buf_ring.publish(addr, len, bid) };
