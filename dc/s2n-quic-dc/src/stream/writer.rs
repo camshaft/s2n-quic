@@ -608,6 +608,7 @@ impl Writer {
     where
         S: buffer::reader::storage::Infallible,
     {
+        self.0.gate_direct_by_declared_size(buf.buffered_len());
         core::future::poll_fn(|cx| self.poll_write_from(cx, buf, false)).await
     }
 
@@ -651,6 +652,7 @@ impl Writer {
     where
         S: buffer::reader::storage::Infallible,
     {
+        self.0.gate_direct_by_declared_size(buf.buffered_len());
         core::future::poll_fn(|cx| self.poll_write_from(cx, buf, true)).await
     }
 
@@ -696,6 +698,7 @@ impl Writer {
         S: buffer::reader::storage::Infallible,
     {
         let total = buf.buffered_len();
+        self.0.gate_direct_by_declared_size(total);
         core::future::poll_fn(|cx| {
             let slot = self.0.slot_ptr();
             self.0.poll_write_msg(cx, slot, buf, flags)
@@ -2427,6 +2430,23 @@ impl Inner {
             let max_bytes = crate::endpoint::adaptive::get()
                 .map_or(u64::MAX, |dd| dd.direct_max_bytes());
             if self.next_offset.as_u64() >= max_bytes {
+                self.direct_senders = None;
+            }
+        }
+    }
+
+    /// Declared-size gate: when a write DECLARES its size up front (`buf.buffered_len()` at the
+    /// write entry), a large response can leave the direct path BEFORE any frame is sent — so a
+    /// big transfer goes 100% through the global batched path (no direct fraction, no mid-stream
+    /// switch), giving true parity, while a small response (declared < threshold) stays direct and
+    /// keeps the hop-cut win. Complements the cumulative-bytes gate (which covers streaming writes
+    /// whose total isn't known up front).
+    #[inline]
+    fn gate_direct_by_declared_size(&mut self, declared: usize) {
+        if self.direct_senders.is_some() {
+            let max_bytes = crate::endpoint::adaptive::get()
+                .map_or(u64::MAX, |dd| dd.direct_max_bytes());
+            if declared as u64 >= max_bytes {
                 self.direct_senders = None;
             }
         }
