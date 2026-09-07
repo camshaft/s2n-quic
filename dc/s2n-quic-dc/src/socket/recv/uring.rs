@@ -93,12 +93,87 @@ const EVENTFD_TOKEN: u64 = u64::MAX;
 /// constant token suffices (the buffer is identified by the CQE's `bid`, not by `user_data`).
 const RECV_USER_DATA: u64 = 1;
 
-/// Probe whether io_uring can be set up in the current environment, returning the underlying
-/// `io_uring_setup(2)` error if not, so the caller can fall back to the syscall recv path and log
-/// *why* (ENOSYS = kernel < 5.1 / built without it; EPERM = `kernel.io_uring_disabled` sysctl or a
-/// seccomp filter; ENOMEM = `RLIMIT_MEMLOCK` too low). Creates and immediately drops a minimal ring.
+/// Probe whether the io_uring **recv path actually works** in the current environment, returning an
+/// error (so the caller falls back to the syscall recv path) if not.
+///
+/// A shallow "can we create a ring" check is **not** sufficient: on some kernels (observed on
+/// 6.18-aarch64) `io_uring_setup` AND the `IORING_REGISTER_PBUF_RING` registration both SUCCEED, yet a
+/// multishot `RecvMsg` armed on that buffer ring **never delivers a completion** — the recv worker then
+/// blocks forever in `submit_and_wait` and the endpoint never binds its data ports. Creating/registering
+/// therefore false-passes. This probe reproduces the exact hot path — register a buffer ring, arm a
+/// multishot `RecvMsg`, self-send one loopback datagram, and wait a bounded time for the recv CQE — so a
+/// kernel that does not deliver multishot-recv completions is caught here and degrades to syscall recv
+/// instead of hanging at startup. The no-completion failure is kernel-wide (not NIC-specific), so a
+/// loopback socket reproduces it and the probe needs no real NIC.
+///
+/// Any setup error (ring create, buffer-ring register, socket, arm, send) also returns `Err` — a
+/// conservative "cannot establish io_uring recv" that falls back to syscall.
 pub fn probe() -> std::io::Result<()> {
-    IoUring::new(8).map(drop)
+    use std::os::fd::AsRawFd;
+
+    const PROBE_BGID: u16 = 0;
+    const PROBE_ENTRIES: u16 = 2;
+    // Wait a bounded time for the recv completion. A working kernel delivers the loopback datagram's
+    // CQE in well under a millisecond; a kernel that never delivers multishot-recv completions times out.
+    let timeout = types::Timespec::new().sec(0).nsec(200_000_000);
+
+    let mut ring = IoUring::new(8)?;
+
+    // Loopback socket: the no-CQE bug is in the kernel io_uring recv path (reproduces on loopback), so
+    // no real NIC is required and the probe stays portable.
+    let sock = std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0))?;
+    let local = sock.local_addr()?;
+    let fd = sock.as_raw_fd();
+
+    // A single provided buffer for the multishot recv to land in: name + control prefix + a small
+    // payload. Kept alive (and dropped only after `ring`, below) for the duration of the kernel op.
+    let buf_len = RECV_NAME_LEN + descriptor::RECV_CONTROL_LEN + 64;
+    let mut buf = vec![0u8; buf_len];
+
+    // SAFETY: `ring` outlives the registration (the ring fd is closed by `drop(ring)` below, voiding the
+    // registration, before `buf_ring`/`buf` are freed).
+    let mut buf_ring = unsafe { BufRing::register(&ring, PROBE_ENTRIES, PROBE_BGID)? };
+    // SAFETY: `buf` stays valid and exclusively owned by the kernel until the op completes or the ring fd
+    // is closed; it is freed only after `drop(ring)`.
+    unsafe { buf_ring.publish(buf.as_mut_ptr(), buf_len as u32, 0) };
+    buf_ring.commit();
+
+    // Arm the multishot recv (the exact op that fails to complete on the broken kernel).
+    let msg = recv_msghdr();
+    {
+        let mut sq = ring.submission();
+        // SAFETY: `msg` and `fd` outlive the op; the SQE reads only their length fields / the fd.
+        unsafe { sq.push(&build_recv_sqe(fd, &msg, PROBE_BGID)) }
+            .map_err(|_| std::io::Error::other("io_uring probe: SQ full arming recv"))?;
+    }
+    ring.submit()?;
+
+    // Self-send one datagram so a functioning kernel produces the recv CQE.
+    sock.send_to(b"dcquic-uring-probe", local)?;
+
+    // Bounded wait for one completion. ETIME (timeout) is expected on a broken kernel; ignore the
+    // result and inspect the completion queue for the recv CQE directly.
+    let args = types::SubmitArgs::new().timespec(&timeout);
+    let _ = ring.submitter().submit_with_args(1, &args);
+
+    let recv_completed = ring
+        .completion()
+        .any(|cqe| cqe.user_data() == RECV_USER_DATA && cqe.result() >= 0);
+
+    // Close the ring fd first (voids the buffer-ring registration) before `buf_ring`/`buf` are freed.
+    drop(ring);
+    drop(buf_ring);
+    drop(buf);
+
+    if recv_completed {
+        Ok(())
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "io_uring multishot recv delivered no completion within the probe timeout; the kernel \
+             io_uring recv path is non-functional here — using the syscall recv backend",
+        ))
+    }
 }
 
 /// The system page size, queried once via `sysconf(_SC_PAGESIZE)`. The buffer ring base must be
@@ -648,6 +723,24 @@ mod tests {
         sync::{Arc, Mutex},
         time::Duration,
     };
+
+    /// The recv-path probe must be BOUNDED — it must never hang (that is its whole purpose: it exists so
+    /// a kernel whose io_uring multishot recv never completes falls back to syscall instead of blocking
+    /// the endpoint at startup). It must always return a clean `Result` well within its own timeout +
+    /// setup. On a functioning io_uring-recv kernel it returns `Ok`; on a broken one (e.g. 6.18-aarch64)
+    /// it returns `Err` and the caller degrades to syscall — either is valid, but it must TERMINATE.
+    #[test]
+    fn probe_is_bounded_and_returns() {
+        let start = std::time::Instant::now();
+        let result = probe();
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "recv probe must be bounded (never hang); took {elapsed:?}"
+        );
+        // Log which path this kernel takes (Ok = io_uring recv works here; Err = falls back to syscall).
+        eprintln!("recv::uring::probe() on this kernel = {result:?} (in {elapsed:?})");
+    }
 
     /// Captured segments: each entry is `(payload bytes, source port)`.
     type CapturedSegments = Arc<Mutex<Vec<(Vec<u8>, u16)>>>;
