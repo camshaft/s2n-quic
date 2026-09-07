@@ -442,6 +442,20 @@ where
     let num_recv_dispatch = config.layout.recv_dispatch.len();
     let counter_registry = config.counters.clone();
 
+    // Optional `[METRICS]` log-dump: when `DCQUIC_METRICS_LOG_MS` is a positive integer, spawn a
+    // reporter that periodically drains THIS endpoint's own counter registry and prints it as a
+    // `[METRICS]` line, for grep-based counter attribution when the external metrics export does not
+    // surface the endpoint's hot-path counters. Off by default (unset / 0 / unparsable). Because the
+    // drain is destructive, this must be the sole drainer of the registry — see `spawn_log_reporter`.
+    if let Some(interval) = std::env::var("DCQUIC_METRICS_LOG_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|&ms| ms > 0)
+        .map(core::time::Duration::from_millis)
+    {
+        crate::counter::spawn_log_reporter(&counter_registry, interval);
+    }
+
     let send_sockets: IdMap<_, _> = LocalSendSocketId::range(send_sockets.len())
         .zip(send_sockets)
         .map(|(key, socket)| {
