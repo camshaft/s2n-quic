@@ -554,6 +554,15 @@ impl<R: Recycler> Unfilled<R> {
         (ptr, total as u32)
     }
 
+    /// The payload base pointer (`base + payload_offset`), i.e. where the kernel lands the received
+    /// packet bytes. Returned as a raw `*const u8` for a read-only, no-copy use such as a software
+    /// prefetch of the payload head; `None` if the descriptor slot has been taken. Does not read or
+    /// require the region to be initialized.
+    #[inline]
+    pub(crate) fn payload_ptr(&self) -> Option<*const u8> {
+        self.desc.as_ref().map(|desc| desc.data().as_ptr() as *const u8)
+    }
+
     /// Fills the packet with the given callback, if the callback is successful
     #[inline]
     pub fn fill_with<F, E>(mut self, f: F) -> Result<Segments<R>, (Self, E)>
