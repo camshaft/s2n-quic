@@ -24,9 +24,31 @@ pub type PacketInfo = <BbrCongestionController as CongestionController>::PacketI
 /// prevented in BBR's pacer.
 pub const MAX_TX_PACING_DELAY: Duration = Duration::from_secs(1);
 
+/// Fixed "effectively unlimited" congestion window (1 GiB) used by the CCA-bypass experiment.
+/// Large enough to never limit an intra-DC flow, small enough to leave headroom in `u32` arithmetic.
+const CCA_BYPASS_CWND: u32 = 1 << 30;
+
+/// CCA-BYPASS EXPERIMENT (env `S2N_DC_CCA_BYPASS=1`): disable BBR pacing + cwnd limiting on the send
+/// path, to A/B whether congestion control is capping intra-datacenter throughput below line rate
+/// (the observed 64k ceiling). In an intra-DC fabric (high BW, ~60us RTT, low loss) BBR's bandwidth
+/// probing/pacing can under-shoot — especially with one stream sprayed across 64 5-tuples fragmenting
+/// its delivery-rate sampling — and pace the sender below line rate. This is a LOCATE-the-cap
+/// experiment (not a shipping default): if bypass lifts 64k throughput toward line rate, the fix is a
+/// DC-tuned CCA, not a naive disable. Read once at controller construction; default OFF = normal BBR.
+fn cca_bypass_enabled() -> bool {
+    std::env::var("S2N_DC_CCA_BYPASS")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
 #[derive(Clone, Debug)]
 pub struct Controller {
     controller: BbrCongestionController,
+    /// When true, [`cca_bypass_enabled`] was set: pacing + cwnd limiting are bypassed (see that fn).
+    /// A per-deployment A/B knob, default false. Correctness of the transport does not depend on the
+    /// CCA throttling — flow-control credits + the send budget still bound in-flight data — so bypass
+    /// only removes the BBR *throughput* throttle, not the safety limits.
+    bypass: bool,
 }
 
 impl Controller {
@@ -34,6 +56,7 @@ impl Controller {
     pub fn new(max_datagram_size: u16) -> Self {
         Self {
             controller: BbrCongestionController::new(max_datagram_size, Default::default()),
+            bypass: cca_bypass_enabled(),
         }
     }
 
@@ -135,6 +158,11 @@ impl Controller {
 
     #[inline]
     pub fn is_congestion_limited(&self) -> bool {
+        // CCA-bypass: never report congestion-limited so the sender is bounded only by flow credits +
+        // the send budget, not BBR's cwnd.
+        if self.bypass {
+            return false;
+        }
         self.controller.is_congestion_limited()
     }
 
@@ -145,6 +173,10 @@ impl Controller {
 
     #[inline]
     pub fn congestion_window(&self) -> u32 {
+        // CCA-bypass: a fixed, effectively-unlimited cwnd so BBR's window never caps in-flight bytes.
+        if self.bypass {
+            return CCA_BYPASS_CWND;
+        }
         self.controller.congestion_window()
     }
 
@@ -174,6 +206,10 @@ impl Controller {
     /// callers that hold a real clock avoid an unnecessary `now` read when the CCA has no EDT.
     #[inline]
     pub fn earliest_departure_time<C: Clock + ?Sized>(&self, clock: &C) -> Option<Timestamp> {
+        // CCA-bypass: no pacing delay — every packet may depart immediately (pacing disabled).
+        if self.bypass {
+            return None;
+        }
         self.controller
             .earliest_departure_time()
             .map(|edt| edt.min(clock.get_time() + MAX_TX_PACING_DELAY))
@@ -334,6 +370,42 @@ mod tests {
             "controller stuck in Startup under bursty app-limited traffic — without the #398 \
              estimator latch fix the app-limited tail never clears and poisons later bursts, so \
              the full-pipe estimator never runs"
+        );
+    }
+
+    /// CCA-bypass experiment: with bypass on, pacing is disabled (no earliest-departure-time), the
+    /// controller never reports congestion-limited, and it exposes the fixed large cwnd — so BBR
+    /// throttles nothing. The default (env-unset) controller is normal BBR (not the bypass cwnd). This
+    /// constructs the bypassed controller directly rather than via the env, so it is not flaky under
+    /// parallel env mutation.
+    #[test]
+    fn cca_bypass_disables_pacing_and_cwnd_limit() {
+        let mtu = s2n_quic_core::path::MINIMUM_MAX_DATAGRAM_SIZE;
+
+        // Default controller (env unset in tests) is normal BBR — not the bypass cwnd.
+        let normal = Controller::new(mtu);
+        assert_ne!(
+            normal.congestion_window(),
+            CCA_BYPASS_CWND,
+            "default controller must be normal BBR, not the bypass cwnd"
+        );
+
+        let bypass = Controller {
+            controller: BbrCongestionController::new(mtu, Default::default()),
+            bypass: true,
+        };
+        assert!(
+            !bypass.is_congestion_limited(),
+            "bypass must never report congestion-limited"
+        );
+        assert_eq!(
+            bypass.congestion_window(),
+            CCA_BYPASS_CWND,
+            "bypass must expose the fixed large cwnd"
+        );
+        assert!(
+            bypass.earliest_departure_time(&NoopClock).is_none(),
+            "bypass must disable pacing (no earliest-departure-time)"
         );
     }
 }
