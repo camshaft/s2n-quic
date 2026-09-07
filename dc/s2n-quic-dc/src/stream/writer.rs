@@ -364,6 +364,21 @@ struct Inner {
     /// attached to a frame. Carry-over after a batch consumes less than was
     /// granted is released back to the pool.
     pending_credits: u64,
+    /// Adaptive dispatch (low-concurrency direct-submit path). When `Some`, this stream was opened
+    /// in DIRECT mode: it pushes each frame batch straight to a send worker (round-robin spray
+    /// across the sockets, via `rr_cursor`), bypassing the global `frame_dispatch` worker (w0) and
+    /// its pacing. `None` ⇒ the global path (through `frame_tx`). The choice is made once at open
+    /// (sticky per stream) so a stream's frames never split across paths (no reorder). Each direct
+    /// writer owns its own sender clones because `UnboundedSender::send` needs `&mut`.
+    direct_senders: Option<
+        crate::endpoint::id::IdMap<
+            crate::endpoint::id::LocalSenderId,
+            crate::endpoint::BatchSender,
+        >,
+    >,
+    /// Round-robin cursor over `direct_senders` — advances per batch so one stream still sprays
+    /// across all sockets (multi-tuple; one stream can saturate the link past EC2's per-flow cap).
+    rr_cursor: usize,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -396,6 +411,45 @@ impl Status {
         on_confirmed(InitSent => Open);
         on_send_fin(InitSent | Open => FinSent);
         on_shutdown(Init | InitSent | Open | FinSent => Shutdown);
+    }
+}
+
+/// Decide this stream's dispatch path ONCE at open (sticky). Returns the writer's own clone of the
+/// send-socket senders when the stream should take the DIRECT path (adaptive dispatch enabled +
+/// the per-stream draw picks direct), else `None` (global path through `frame_tx`). See
+/// [`crate::endpoint::adaptive`]. When adaptive dispatch is not installed (env unset), always `None`.
+fn open_direct_senders() -> Option<
+    crate::endpoint::id::IdMap<crate::endpoint::id::LocalSenderId, crate::endpoint::BatchSender>,
+> {
+    use crate::endpoint::adaptive::DispatchMode;
+    let dd = crate::endpoint::adaptive::get()?;
+    // Register this stream in the endpoint-wide active count and learn how many OTHER streams are
+    // already running. EVERY adaptive-mode writer counts (direct or global); the writer's Drop
+    // decrements once (gated on adaptive being installed), so inc/dec stay balanced regardless of
+    // the path chosen.
+    let prior_active = dd.inc_total();
+    // Rise-to-global FAST: any stream that opens with neighbors marks the endpoint busy for the
+    // hold window, so a momentary count dip under churn can't immediately re-enable direct.
+    if prior_active > dd.solo_threshold() {
+        dd.mark_busy();
+    }
+    let take_direct = match dd.mode {
+        DispatchMode::Off => false,
+        // Direct: unconditional (isolates the low-conc hop-cut win in A/B; not for high conc).
+        DispatchMode::Direct => true,
+        DispatchMode::Adaptive => {
+            // Direct is a SOLO-stream fast lane: a direct stream shares the 64 send sockets with
+            // the global streams and skips batching, so even one direct stream dents throughput at
+            // concurrency (measured c8/c16). Take direct only if the stream is solo AND the endpoint
+            // has been QUIET past the hold window (decay-to-direct slow) — the hysteresis that
+            // rejects per-RPC churn jitter. Sticky per stream.
+            prior_active <= dd.solo_threshold() && dd.is_quiet()
+        }
+    };
+    if take_direct {
+        Some(dd.clone_senders())
+    } else {
+        None
     }
 }
 
@@ -459,6 +513,8 @@ impl Writer {
             priority,
             send_credit_pool,
             pending_credits: 0,
+            direct_senders: open_direct_senders(),
+            rr_cursor: 0,
         }))
     }
 
@@ -514,6 +570,8 @@ impl Writer {
             priority,
             send_credit_pool,
             pending_credits: 0,
+            direct_senders: open_direct_senders(),
+            rr_cursor: 0,
         }))
     }
 
@@ -554,6 +612,7 @@ impl Writer {
     where
         S: buffer::reader::storage::Infallible,
     {
+        self.0.gate_direct_by_declared_size(buf.buffered_len());
         core::future::poll_fn(|cx| self.poll_write_from(cx, buf, false)).await
     }
 
@@ -597,6 +656,7 @@ impl Writer {
     where
         S: buffer::reader::storage::Infallible,
     {
+        self.0.gate_direct_by_declared_size(buf.buffered_len());
         core::future::poll_fn(|cx| self.poll_write_from(cx, buf, true)).await
     }
 
@@ -642,6 +702,7 @@ impl Writer {
         S: buffer::reader::storage::Infallible,
     {
         let total = buf.buffered_len();
+        self.0.gate_direct_by_declared_size(total);
         core::future::poll_fn(|cx| {
             let slot = self.0.slot_ptr();
             self.0.poll_write_msg(cx, slot, buf, flags)
@@ -2362,11 +2423,57 @@ impl Inner {
         Ok(())
     }
 
+    /// Payload-size gate for adaptive dispatch: once a direct-mode stream's cumulative bytes
+    /// (`next_offset`) exceed the threshold, drop it off the direct path onto the global batched
+    /// path for the remainder of the stream. Large responses lose more from the skipped frame
+    /// coalescing than the w0 hop-cut saves (measured: 1MB regressed on direct). No-op once the
+    /// stream is already on the global path or adaptive isn't installed.
+    #[inline]
+    fn maybe_leave_direct_for_large_payload(&mut self) {
+        if self.direct_senders.is_some() {
+            let max_bytes =
+                crate::endpoint::adaptive::get().map_or(u64::MAX, |dd| dd.direct_max_bytes());
+            if self.next_offset.as_u64() >= max_bytes {
+                self.direct_senders = None;
+            }
+        }
+    }
+
+    /// Declared-size gate: when a write DECLARES its size up front (`buf.buffered_len()` at the
+    /// write entry), a large response can leave the direct path BEFORE any frame is sent — so a
+    /// big transfer goes 100% through the global batched path (no direct fraction, no mid-stream
+    /// switch), giving true parity, while a small response (declared < threshold) stays direct and
+    /// keeps the hop-cut win. Complements the cumulative-bytes gate (which covers streaming writes
+    /// whose total isn't known up front).
+    #[inline]
+    fn gate_direct_by_declared_size(&mut self, declared: usize) {
+        if self.direct_senders.is_some() {
+            let max_bytes =
+                crate::endpoint::adaptive::get().map_or(u64::MAX, |dd| dd.direct_max_bytes());
+            if declared as u64 >= max_bytes {
+                self.direct_senders = None;
+            }
+        }
+    }
+
     fn send_frame(&mut self, frame: Frame) -> io::Result<()> {
         // Application submitting a frame into the send pipeline — the first sighting, before
         // aggregation/credit/pacing/assembly. Pairs with the Outbound record at assembly so the
         // submit→wire latency is visible. PN is not assigned yet.
         crate::endpoint::frame_trace::app_send(&frame.header, *self.path_secret_entry.id());
+        self.maybe_leave_direct_for_large_payload();
+        // Adaptive dispatch: a direct-mode stream sprays straight to a send worker, skipping the
+        // global frame_dispatch hop. The frame already carries its borrowed `flow_credits`, so no
+        // credit is (re)acquired; on a closed send channel the helper releases that credit.
+        if let Some(senders) = &mut self.direct_senders {
+            return crate::endpoint::combinator::direct_spray(
+                Entry::new(frame),
+                senders,
+                &mut self.rr_cursor,
+                &self.send_credit_pool,
+            )
+            .map_err(|()| io::Error::new(io::ErrorKind::BrokenPipe, "direct send channel closed"));
+        }
         self.frame_tx
             .send_batch(Entry::new(frame))
             .map_err(|mut returned| {
@@ -2383,6 +2490,19 @@ impl Inner {
     }
 
     fn send_batch(&mut self, queue: Queue<Frame>) -> io::Result<()> {
+        self.maybe_leave_direct_for_large_payload();
+        // Adaptive dispatch: a direct-mode stream coalesces the batch and sprays it straight to a
+        // send worker, bypassing the global frame_dispatch hop. Same batch-to-one-socket routing as
+        // the global path; the round-robin cursor keeps successive batches spread across sockets.
+        if let Some(senders) = &mut self.direct_senders {
+            return crate::endpoint::combinator::direct_spray_batch(
+                queue,
+                senders,
+                &mut self.rr_cursor,
+                &self.send_credit_pool,
+            )
+            .map_err(|()| io::Error::new(io::ErrorKind::BrokenPipe, "direct send channel closed"));
+        }
         let priority = queue
             .iter()
             .next()
@@ -2400,6 +2520,13 @@ impl Inner {
 
 impl Drop for Writer {
     fn drop(&mut self) {
+        // Adaptive dispatch: balance the endpoint-wide active-stream counter. EVERY adaptive-mode
+        // writer incremented it at open (via open_direct_senders), so decrement once here whenever
+        // adaptive is installed. `get()` is a process-global OnceLock (stable for the process), so
+        // inc at open and dec here are balanced.
+        if let Some(dd) = crate::endpoint::adaptive::get() {
+            dd.dec_total();
+        }
         debug!(
             binding_id = self.0.control_rx.binding_id().as_u64(),
             status = ?self.0.status,
