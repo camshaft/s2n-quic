@@ -316,6 +316,11 @@ impl Runner {
         let mut tasks = Tasks::new();
         let mut spawns = Vec::with_capacity(16);
 
+        // Busy poll reads the clock on nearly every task/timer poll; capturing it once per task-list
+        // sweep (below) instead lets all polls in the sweep share one `clock_gettime` (perf showed
+        // ~18% of busy-poll CPU in `clock_gettime`). Read the gate once — it never changes.
+        let clock_cache = clock::clock_cache_enabled();
+
         struct AbortOnPanic;
 
         impl Drop for AbortOnPanic {
@@ -351,6 +356,11 @@ impl Runner {
                 core::mem::swap(&mut spawns, &mut guard.spawns);
             } else {
                 for _ in 0..ITERATIONS {
+                    // Refresh the per-thread clock cache once per sweep (sub-µs staleness); all the
+                    // timer `now()`/`poll_ready` reads in this sweep then hit the cache, not a syscall.
+                    if clock_cache {
+                        clock::refresh();
+                    }
                     tasks.poll(&mut cx, &heartbeat);
                 }
 
