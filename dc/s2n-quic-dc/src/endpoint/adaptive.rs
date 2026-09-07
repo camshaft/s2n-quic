@@ -172,6 +172,13 @@ pub(crate) struct DirectDispatch {
     base: std::time::Instant,
     busy_until_nanos: AtomicU64,
     hold_nanos: u64,
+    /// PAYLOAD-SIZE gate. The direct path skips the global frame coalescing, which is a net win for
+    /// small/medium responses (the w0 hop-cut dominates) but a LOSS for large ones (measured: 1MB
+    /// regressed — fuller batched packets matter more than the hop-cut). So a stream stays direct
+    /// only while its cumulative bytes are under this threshold; past it, it falls back to the
+    /// global batched path. Default 256 KiB (8k/64k stay direct, 1MB goes mostly global). Tunable
+    /// via `DCQUIC_ADAPTIVE_MAX_BYTES`.
+    direct_max_bytes: u64,
 }
 
 impl DirectDispatch {
@@ -218,6 +225,12 @@ impl DirectDispatch {
     pub fn solo_threshold(&self) -> usize {
         self.direct_cap.saturating_sub(1)
     }
+
+    /// Cumulative-byte ceiling past which a direct stream falls back to the global batched path.
+    #[inline]
+    pub fn direct_max_bytes(&self) -> u64 {
+        self.direct_max_bytes
+    }
 }
 
 static DIRECT: OnceLock<Arc<DirectDispatch>> = OnceLock::new();
@@ -253,6 +266,11 @@ pub(crate) fn install(senders: IdMap<LocalSenderId, BatchSender>) {
         base: std::time::Instant::now(),
         busy_until_nanos: AtomicU64::new(0),
         hold_nanos,
+        direct_max_bytes: std::env::var("DCQUIC_ADAPTIVE_MAX_BYTES")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(262_144), // 256 KiB
     }));
 }
 
