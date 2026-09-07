@@ -1485,8 +1485,17 @@ where
                 );
                 let ack_completion_gauge =
                     counter_registry.register_queue_gauge_nominal("q.dispatch", &variant);
+                // Batch-drain the ack-completion channel: one `poll_recv` takes the whole queued
+                // intrusive batch under a single sync-channel lock (via `FlattenQueue` over the
+                // `Receiver<Queue<..>>` batch drain), then yields entries from a cheap local queue.
+                // The producer (`combinator`) already sends whole `Queue<msg::Sender>` batches, so
+                // this amortizes the per-entry parking_lot lock/atomic (the `intrusive::sync`
+                // poll_recv CAS the transport flame attributes to the recv-side dequeue) over N
+                // completions instead of paying it per entry. `GaugedReceiver` stays per-entry so the
+                // `q.dispatch` gauge counts each completion exactly as before; budget stays per-entry
+                // (no starvation of the worker's other channels). Mirrors the vendored SPEC-1 change.
                 let ack_completion_rx = crate::counter::GaugedReceiver::new(
-                    rd.ack_completion_rx,
+                    crate::socket::channel::FlattenQueue::new(rd.ack_completion_rx),
                     ack_completion_gauge
                         .receiver("task.ack_completion")
                         .with_function("endpoint::Worker::spawn"),
