@@ -868,13 +868,36 @@ where
     // ── Recv dispatch queues ─────────────────────────────────────────────────
     // One dispatch queue per recv_dispatch worker. Recv IO tasks fan out to all of these
     // using a hash of (credentials.id, source_sender_id) for peer affinity.
+    //
+    // `DCQUIC_RECV_SHARDS=<n>` (rounded up to a power of two > 1) swaps each channel's single Mutex
+    // for the sharded (per-shard-lock) channel, cutting the sender/receiver lock contention on this
+    // hot path (the ~25% `poll_recv` Mutex). Unset / <= 1 keeps the single-Mutex baseline,
+    // byte-identical.
+    let recv_shards: Option<usize> = std::env::var("DCQUIC_RECV_SHARDS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n > 1)
+        .map(usize::next_power_of_two);
     let (dispatch_txs, dispatch_rxs): (
         IdMap<RecvDispatchWorkerId, PacketSender>,
         IdMap<RecvDispatchWorkerId, PacketReceiver>,
     ) = RecvDispatchWorkerId::range(num_recv_dispatch)
         .map(|id| {
-            let (tx, rx) =
-                intrusive::sync::new::<packet::datagram::decoder::Packet<descriptor::Filled>>();
+            let (tx, rx) = match recv_shards {
+                Some(shards) => {
+                    let (s, r) = crate::socket::channel::intrusive::sharded::new_with_adapter::<
+                        crate::intrusive::EntryAdapter<DispatchPacket>,
+                    >(shards);
+                    (PacketSenderInner::Sharded(s), PacketReceiver::Sharded(r))
+                }
+                None => {
+                    let (s, r) = crate::socket::channel::intrusive::sync::new::<DispatchPacket>();
+                    (
+                        PacketSenderInner::SingleMutex(s),
+                        PacketReceiver::SingleMutex(r),
+                    )
+                }
+            };
             let gauge = counter_registry
                 .register_queue_gauge_nominal("q.dispatch_rx", format_args!("recv.{id}"));
             ((id, GaugedSender::new(tx, gauge)), (id, rx))
@@ -1085,11 +1108,65 @@ pub(crate) struct SendSocketParts<Socket, Clk> {
     initial_tx_descriptor_allocs: usize,
 }
 
-type PacketSender = GaugedSender<
-    sync_queue::Sender<packet::datagram::decoder::Packet<descriptor::Filled>>,
-    Entry<packet::datagram::decoder::Packet<descriptor::Filled>>,
->;
-type PacketReceiver = sync_queue::Receiver<packet::datagram::decoder::Packet<descriptor::Filled>>;
+type DispatchPacket = packet::datagram::decoder::Packet<descriptor::Filled>;
+
+/// Inner recv-dispatch channel sender, env-selectable between the single-Mutex baseline and the
+/// sharded (per-shard-lock) channel. `DCQUIC_RECV_SHARDS=<n>` (power of two > 1) selects `Sharded`,
+/// which shards the lock the recv-dispatch worker and the recv-io fan-out contend on (the ~25%
+/// `poll_recv` Mutex). Default (unset / 1) = `SingleMutex`, byte-identical to before. Both accept a
+/// single `Entry<DispatchPacket>` per `send` (the sharded case rides the `Input for Entry` bridge).
+#[derive(Clone)]
+enum PacketSenderInner {
+    SingleMutex(sync_queue::Sender<DispatchPacket>),
+    Sharded(crate::socket::channel::intrusive::sharded::Sender<crate::intrusive::EntryAdapter<DispatchPacket>>),
+}
+
+impl UnboundedSender<Entry<DispatchPacket>> for PacketSenderInner {
+    #[inline]
+    fn send(&mut self, value: Entry<DispatchPacket>) -> Result<(), Entry<DispatchPacket>> {
+        match self {
+            Self::SingleMutex(s) => s.send(value),
+            Self::Sharded(s) => s.send(value),
+        }
+    }
+}
+
+/// Inner recv-dispatch channel receiver, matching [`PacketSenderInner`]. Both variants deliver
+/// whole-queue *batches* (`Receiver<Queue<DispatchPacket>>`); the surrounding
+/// [`GaugedQueueReceiver`](crate::counter::GaugedQueueReceiver) adapts that into the per-entry
+/// `Receiver<Entry<DispatchPacket>>` the recv pipeline consumes, so nothing downstream changes.
+enum PacketReceiver {
+    SingleMutex(sync_queue::Receiver<DispatchPacket>),
+    Sharded(crate::socket::channel::intrusive::sharded::Receiver<crate::intrusive::EntryAdapter<DispatchPacket>>),
+}
+
+impl crate::socket::channel::Receiver<crate::intrusive::Queue<DispatchPacket>> for PacketReceiver {
+    fn poll_recv(
+        &mut self,
+        cx: &mut core::task::Context<'_>,
+        budget: &mut crate::socket::channel::Budget,
+    ) -> core::task::Poll<Option<crate::intrusive::Queue<DispatchPacket>>> {
+        // The single-Mutex `Receiver<T>` implements BOTH `Receiver<Entry<T>>` and
+        // `Receiver<Queue<T>>`, so disambiguate to the batch (`Queue`) impl via UFCS.
+        match self {
+            Self::SingleMutex(r) => <sync_queue::Receiver<DispatchPacket> as crate::socket::channel::Receiver<
+                crate::intrusive::Queue<DispatchPacket>,
+            >>::poll_recv(r, cx, budget),
+            Self::Sharded(r) => r.poll_recv(cx, budget),
+        }
+    }
+
+    fn on_consumed(&mut self, bytes: u64) {
+        match self {
+            Self::SingleMutex(r) => <sync_queue::Receiver<DispatchPacket> as crate::socket::channel::Receiver<
+                crate::intrusive::Queue<DispatchPacket>,
+            >>::on_consumed(r, bytes),
+            Self::Sharded(r) => r.on_consumed(bytes),
+        }
+    }
+}
+
+type PacketSender = GaugedSender<PacketSenderInner, Entry<DispatchPacket>>;
 
 /// Ingredients for a recv IO worker (socket read + decode + fan-out).
 struct RecvSocketParts<Socket, Route, Inv> {
