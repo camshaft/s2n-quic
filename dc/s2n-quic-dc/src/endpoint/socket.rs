@@ -161,6 +161,11 @@ pub(crate) struct Metered<S> {
     ops: crate::counter::Counter,
     bytes: crate::counter::Counter,
     errors: crate::counter::Counter,
+    /// Recv-only: counts empty (`Poll::Pending`/`EAGAIN`) receive polls, i.e. a `poll_recv` that
+    /// found no datagram. `ops` counts the productive polls; together they give the empty:productive
+    /// poll ratio — how much of the busy-poll recvmsg rate is wasted empty spin. `None` on the send
+    /// path (`send_msg` never returns `Pending`).
+    empty: Option<crate::counter::Counter>,
 }
 
 impl<S: std::fmt::Debug> std::fmt::Debug for Metered<S> {
@@ -175,12 +180,14 @@ impl<S> Metered<S> {
         ops: crate::counter::Counter,
         bytes: crate::counter::Counter,
         errors: crate::counter::Counter,
+        empty: Option<crate::counter::Counter>,
     ) -> Self {
         Self {
             inner,
             ops,
             bytes,
             errors,
+            empty,
         }
     }
 }
@@ -233,7 +240,11 @@ impl<S: crate::socket::recv::Socket> crate::socket::recv::Socket for Metered<S> 
             core::task::Poll::Ready(Err(_)) => {
                 self.errors.add(1);
             }
-            core::task::Poll::Pending => {}
+            core::task::Poll::Pending => {
+                if let Some(empty) = &self.empty {
+                    empty.add(1);
+                }
+            }
         }
         result
     }
