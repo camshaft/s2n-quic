@@ -402,7 +402,7 @@ where
         }
 
         // Batch isn't full — arm timer and wait for more frames.
-        let now = self.timer.now();
+        let now = self.timer.coarse_now();
         let target = now + self.wait_duration;
         self.timer.update(target);
 
@@ -1092,7 +1092,7 @@ where
                 // (i.e. frames whose sender only subscribes to failures, not acks).
                 if matches!(frame.status, frame::TransmissionStatus::Acknowledged) {
                     if let Some(enqueued_at) = frame.enqueued_at {
-                        let completed_at = self.clock.now();
+                        let completed_at = self.clock.coarse_now();
                         // `QueueMaxData` frames are reader-originated (flow-control credit
                         // grants sent by the stream reader); all other application-level
                         // frames (`QueueData`, FIN, etc.) are writer-originated.

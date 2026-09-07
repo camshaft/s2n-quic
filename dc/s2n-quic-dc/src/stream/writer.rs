@@ -814,7 +814,7 @@ impl Inner {
             completion: Some(self.completion_rx.sender()),
             status: frame::TransmissionStatus::default(),
             ttl: DEFAULT_TTL,
-            enqueued_at: Some(self.clock.now()),
+            enqueued_at: Some(self.clock.coarse_now()),
             flow_credits: 0,
         };
         let _ = self.send_frame(frame);
@@ -1386,7 +1386,7 @@ impl Inner {
             completion: Some(self.completion_rx.sender()),
             status: frame::TransmissionStatus::default(),
             ttl: DEFAULT_TTL,
-            enqueued_at: Some(self.clock.now()),
+            enqueued_at: Some(self.clock.coarse_now()),
             flow_credits: 0,
         };
 
@@ -1408,7 +1408,7 @@ impl Inner {
 
                 // Snapshot current time once for all sojourn measurements in
                 // this completion batch (avoids repeated clock reads).
-                let completed_at = self.clock.now();
+                let completed_at = self.clock.coarse_now();
 
                 // The completion channel is `FailuresOnly`, so every frame delivered here is a
                 // failure — acked frames are dropped (and their sojourn recorded) endpoint-side
@@ -1641,7 +1641,7 @@ impl Inner {
             completion: Some(self.completion_rx.sender()),
             status: frame::TransmissionStatus::default(),
             ttl: DEFAULT_TTL,
-            enqueued_at: Some(self.clock.now()),
+            enqueued_at: Some(self.clock.coarse_now()),
             flow_credits,
         };
 
@@ -1762,7 +1762,7 @@ impl Inner {
             completion: Some(self.completion_rx.sender()),
             status: frame::TransmissionStatus::default(),
             ttl: DEFAULT_TTL,
-            enqueued_at: Some(self.clock.now()),
+            enqueued_at: Some(self.clock.coarse_now()),
             flow_credits: 0,
         };
         self.send_frame(frame)?;
@@ -1893,7 +1893,7 @@ impl Inner {
 
         // Capture enqueue time once for all frames in this send batch so that
         // every frame shares the same reference point for sojourn measurement.
-        let batch_enqueued_at = Some(self.clock.now());
+        let batch_enqueued_at = Some(self.clock.coarse_now());
 
         loop {
             if !need_fin_packet && buf.buffer_is_empty() {
@@ -2091,7 +2091,7 @@ impl Inner {
         };
         let max_segment_size = crate::queue::msg_entry::MAX_CHUNKS as usize * chunk_size as usize;
 
-        let batch_enqueued_at = Some(self.clock.now());
+        let batch_enqueued_at = Some(self.clock.coarse_now());
         let mut frames = Queue::new();
         let mut total_written = 0usize;
 

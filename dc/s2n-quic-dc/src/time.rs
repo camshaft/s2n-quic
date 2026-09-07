@@ -60,6 +60,19 @@ impl DefaultClock {
             DefaultClockKind::BusyPoll(c) => precision::Clock::now(c),
         }
     }
+
+    /// Coarse (per-sweep cached) current time; see [`precision::Clock::coarse_now`]. On busy-poll
+    /// threads this reuses the sweep-cached timestamp instead of a `clock_gettime` per call — the
+    /// hot pacing/sojourn reads use this to cut the per-sweep clock-read CPU (measured ~20%+ of the
+    /// server under load). Off busy-poll threads (bach/tests) it falls back to a fresh read.
+    #[inline]
+    pub fn coarse_now(&self) -> precision::Timestamp {
+        match &self.0 {
+            #[cfg(any(test, feature = "testing"))]
+            DefaultClockKind::Bach(c) => precision::Clock::coarse_now(c),
+            DefaultClockKind::BusyPoll(c) => precision::Clock::coarse_now(c),
+        }
+    }
 }
 
 impl time::Clock for DefaultClock {
