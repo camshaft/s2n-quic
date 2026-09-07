@@ -52,6 +52,23 @@ const DEFAULT_INITIAL_RTT: Duration = Duration::from_millis(1);
 
 const BUFFER_SIZE: usize = 16 * 1024;
 
+/// Per-stream recv window we advertise (`local_recv_max_data`), also the unbacked initial window a
+/// fresh stream's writer may fill before a pool-backed `MAX_DATA` grant. Defaults to the builder's
+/// value ([`DEFAULT_RECV_WINDOW`], 64 KiB) but can be overridden via `DCQUIC_RECV_WINDOW` (bytes)
+/// for measurement. This is the single-stream tail-latency lever: a 64 KiB response plus its framing
+/// overshoots a 64 KiB window by the framing bytes, so the tail of every 64 KiB stream blocks ~1 RTT
+/// waiting for the peer reader's first `MAX_DATA` grant. Raising the window lets the whole response
+/// go out in the first burst (at a per-peer unbacked-credit memory cost, which is why the default
+/// stays small — see [`DEFAULT_RECV_WINDOW`]). A point-to-point RPC load has no peer fan-out, so the
+/// small default only adds latency; #536 applied the same window bump to the dc-tester's own PSK
+/// path — this knob exposes it on the integrated library PSK path.
+fn recv_window(builder_recv_window: u64) -> u64 {
+    std::env::var("DCQUIC_RECV_WINDOW")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(builder_recv_window)
+}
+
 struct DcPathCapture;
 
 pub(crate) struct DcPathContext {
@@ -115,7 +132,7 @@ impl Server {
             .with_max_idle_timeout(builder.max_idle_timeout)?
             .with_data_window(builder.data_window)?
             .with_bidirectional_local_data_window(builder.data_window)?
-            .with_bidirectional_remote_data_window(builder.recv_window)?
+            .with_bidirectional_remote_data_window(recv_window(builder.recv_window))?
             .with_initial_round_trip_time(DEFAULT_INITIAL_RTT)?;
 
         let event = (
@@ -261,7 +278,7 @@ impl Client {
             .with_max_idle_timeout(builder.max_idle_timeout)?
             .with_data_window(builder.data_window)?
             .with_bidirectional_local_data_window(builder.data_window)?
-            .with_bidirectional_remote_data_window(builder.recv_window)?
+            .with_bidirectional_remote_data_window(recv_window(builder.recv_window))?
             .with_initial_round_trip_time(DEFAULT_INITIAL_RTT)?;
 
         let event = (
