@@ -747,7 +747,10 @@ where
 {
     let len = senders.len();
     if len == 0 {
-        debug_assert!(len > 0, "direct_spray_batch requires at least one send sender");
+        debug_assert!(
+            len > 0,
+            "direct_spray_batch requires at least one send sender"
+        );
         return Err(());
     }
     let Some(first) = frames.pop_front() else {

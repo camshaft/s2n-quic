@@ -370,8 +370,12 @@ struct Inner {
     /// its pacing. `None` ⇒ the global path (through `frame_tx`). The choice is made once at open
     /// (sticky per stream) so a stream's frames never split across paths (no reorder). Each direct
     /// writer owns its own sender clones because `UnboundedSender::send` needs `&mut`.
-    direct_senders:
-        Option<crate::endpoint::id::IdMap<crate::endpoint::id::LocalSenderId, crate::endpoint::BatchSender>>,
+    direct_senders: Option<
+        crate::endpoint::id::IdMap<
+            crate::endpoint::id::LocalSenderId,
+            crate::endpoint::BatchSender,
+        >,
+    >,
     /// Round-robin cursor over `direct_senders` — advances per batch so one stream still sprays
     /// across all sockets (multi-tuple; one stream can saturate the link past EC2's per-flow cap).
     rr_cursor: usize,
@@ -414,9 +418,9 @@ impl Status {
 /// send-socket senders when the stream should take the DIRECT path (adaptive dispatch enabled +
 /// the per-stream draw picks direct), else `None` (global path through `frame_tx`). See
 /// [`crate::endpoint::adaptive`]. When adaptive dispatch is not installed (env unset), always `None`.
-fn open_direct_senders(
-) -> Option<crate::endpoint::id::IdMap<crate::endpoint::id::LocalSenderId, crate::endpoint::BatchSender>>
-{
+fn open_direct_senders() -> Option<
+    crate::endpoint::id::IdMap<crate::endpoint::id::LocalSenderId, crate::endpoint::BatchSender>,
+> {
     use crate::endpoint::adaptive::DispatchMode;
     let dd = crate::endpoint::adaptive::get()?;
     // Register this stream in the endpoint-wide active count and learn how many OTHER streams are
@@ -2427,8 +2431,8 @@ impl Inner {
     #[inline]
     fn maybe_leave_direct_for_large_payload(&mut self) {
         if self.direct_senders.is_some() {
-            let max_bytes = crate::endpoint::adaptive::get()
-                .map_or(u64::MAX, |dd| dd.direct_max_bytes());
+            let max_bytes =
+                crate::endpoint::adaptive::get().map_or(u64::MAX, |dd| dd.direct_max_bytes());
             if self.next_offset.as_u64() >= max_bytes {
                 self.direct_senders = None;
             }
@@ -2444,8 +2448,8 @@ impl Inner {
     #[inline]
     fn gate_direct_by_declared_size(&mut self, declared: usize) {
         if self.direct_senders.is_some() {
-            let max_bytes = crate::endpoint::adaptive::get()
-                .map_or(u64::MAX, |dd| dd.direct_max_bytes());
+            let max_bytes =
+                crate::endpoint::adaptive::get().map_or(u64::MAX, |dd| dd.direct_max_bytes());
             if declared as u64 >= max_bytes {
                 self.direct_senders = None;
             }
@@ -2468,9 +2472,7 @@ impl Inner {
                 &mut self.rr_cursor,
                 &self.send_credit_pool,
             )
-            .map_err(|()| {
-                io::Error::new(io::ErrorKind::BrokenPipe, "direct send channel closed")
-            });
+            .map_err(|()| io::Error::new(io::ErrorKind::BrokenPipe, "direct send channel closed"));
         }
         self.frame_tx
             .send_batch(Entry::new(frame))
@@ -2499,9 +2501,7 @@ impl Inner {
                 &mut self.rr_cursor,
                 &self.send_credit_pool,
             )
-            .map_err(|()| {
-                io::Error::new(io::ErrorKind::BrokenPipe, "direct send channel closed")
-            });
+            .map_err(|()| io::Error::new(io::ErrorKind::BrokenPipe, "direct send channel closed"));
         }
         let priority = queue
             .iter()

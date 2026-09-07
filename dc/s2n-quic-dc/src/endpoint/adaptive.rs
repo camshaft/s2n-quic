@@ -9,26 +9,22 @@
 //! `frame_dispatch` worker (w0). That cuts a cross-worker sweep-hop (~30–70µs on the r64k
 //! critical path, measured) whose *shaping* value is ~nil when the link is uncongested.
 //!
-//! Under backpressure the endpoint must fall back to the global dispatcher so it can pace and
-//! shape correctly (the Membrain lesson: a central scheduler is required at massive
-//! concurrency). The crossover is deliberately *gradual/hysteretic* — a smooth ramp between two
-//! watermarks, not a hard flip — to avoid the bimodal cliff that got a hard occupancy-gate
-//! demoted earlier.
+//! Otherwise the endpoint uses the global dispatcher so it can pace and shape correctly (the
+//! Membrain lesson: a central scheduler is required at massive concurrency).
 //!
-//! This module holds the mode selection (env-gated for clean A/B) and the crossover ramp math.
-//! The direct-submit datapath itself lives in the writer; this only decides *whether* a stream
-//! takes the direct path given the current backpressure signal.
-//!
-//! CROSSOVER GRANULARITY (per-stream sticky): the direct-vs-global decision is made ONCE, at
-//! stream open, and is sticky for the stream's lifetime. The `Crossover` ramp is applied to the
-//! *fraction of newly-opened streams* that take the direct path, not to individual batches. This
-//! (a) avoids per-frame flapping and (b) guarantees a single stream's frames never split across
-//! the two paths — so there is no path-induced reordering to reconcile (a stream still sprays
-//! across the 64 sockets on whichever path it took; QUIC reassembles that as today).
+//! The direct-vs-global decision is made ONCE, at stream open, and is sticky for the stream's
+//! lifetime (a stream's frames never split across paths, so there is no path-induced reordering;
+//! a stream still sprays across the 64 sockets on whichever path it took, and QUIC reassembles
+//! that as today). Three gates decide it (see [`DirectDispatch`]), measured to only-help /
+//! never-regress:
+//!   1. SOLO — direct only when no other stream is active (`active_total`); at concurrency the
+//!      global batcher/pacer is essential.
+//!   2. HYSTERESIS — rise-to-global-fast / decay-to-direct-slow idle window (`busy_until_nanos`),
+//!      so per-RPC open/close churn can't leak streams onto direct on a momentary count dip.
+//!   3. PAYLOAD SIZE — large responses stay on the global batched path (`direct_max_bytes`); they
+//!      lose more from skipped coalescing than the hop-cut saves.
 
-#![allow(dead_code)] // WIP prototype: wired to the writer datapath in the plumbing step.
-
-use core::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 /// Dispatch mode, selected once at endpoint construction via `DCQUIC_ADAPTIVE_DISPATCH`.
 ///
@@ -60,78 +56,6 @@ impl DispatchMode {
     }
 }
 
-/// Hysteretic crossover between the direct and global paths, driven by a normalized backpressure
-/// signal `b ∈ [0, 1]` (e.g. send-credit-pool pressure).
-///
-/// Two watermarks `lo < hi`:
-///   * `b <= lo` ⇒ probability 0.0 of taking the GLOBAL path (all direct).
-///   * `b >= hi` ⇒ probability 1.0 (all global — full shaping).
-///   * `lo < b < hi` ⇒ linear ramp `(b - lo) / (hi - lo)`.
-///
-/// The caller compares this probability against a per-STREAM RNG draw taken once at stream open
-/// (sticky for the stream), so the transition is a smooth statistical mix across newly-opened
-/// streams rather than a step — and no single stream splits across paths. Rise toward global is
-/// meant to be fast (protect shaping); decay back toward direct is meant to be slow (avoid
-/// oscillation) — that asymmetry is applied by the caller via the smoothed signal it feeds in.
-#[derive(Debug, Clone, Copy)]
-pub struct Crossover {
-    lo: f64,
-    hi: f64,
-}
-
-impl Crossover {
-    /// `lo`/`hi` are clamped to `[0, 1]` and ordered so `lo <= hi`; a degenerate `lo == hi`
-    /// becomes a hard threshold at that point.
-    pub fn new(lo: f64, hi: f64) -> Self {
-        let lo = lo.clamp(0.0, 1.0);
-        let hi = hi.clamp(0.0, 1.0);
-        let (lo, hi) = if lo <= hi { (lo, hi) } else { (hi, lo) };
-        Self { lo, hi }
-    }
-
-    /// Probability in `[0, 1]` that a batch should take the GLOBAL (shaped) path at backpressure
-    /// `b`. `1.0 - this` is the probability of the direct path.
-    #[inline]
-    pub fn global_probability(&self, b: f64) -> f64 {
-        let b = b.clamp(0.0, 1.0);
-        if b <= self.lo {
-            0.0
-        } else if b >= self.hi {
-            1.0
-        } else {
-            (b - self.lo) / (self.hi - self.lo)
-        }
-    }
-}
-
-impl Default for Crossover {
-    /// Conservative defaults: stay direct while the credit pool is comfortably below half
-    /// pressure, ramp to fully-global by 90% pressure. Tunable once the A/B pins the knee.
-    fn default() -> Self {
-        Self::new(0.5, 0.9)
-    }
-}
-
-/// A cheap, lock-free smoothed backpressure gauge shared endpoint-wide. Writers read it (Relaxed)
-/// per batch; a producer of the raw signal updates it. Stored as a u8 in `[0, 255]` mapping to
-/// `[0.0, 1.0]` so the whole thing is a single relaxed atomic — no allocation, no lock on the hot
-/// path. (Wired to a real signal — send-credit-pool pressure — in the plumbing step.)
-#[derive(Debug, Default)]
-pub struct Backpressure(AtomicU8);
-
-impl Backpressure {
-    #[inline]
-    pub fn load(&self) -> f64 {
-        f64::from(self.0.load(Ordering::Relaxed)) / 255.0
-    }
-
-    #[inline]
-    pub fn store(&self, b: f64) {
-        let q = (b.clamp(0.0, 1.0) * 255.0).round() as u8;
-        self.0.store(q, Ordering::Relaxed);
-    }
-}
-
 // ── Endpoint-wide direct-dispatch context (prototype: process-global, single-endpoint) ───────
 //
 // PROTOTYPE SCOPING: the direct-submit datapath needs the endpoint's send-socket senders at the
@@ -150,10 +74,8 @@ pub(crate) struct DirectDispatch {
     /// own owned map (each `UnboundedSender::send` needs `&mut`, so senders can't be shared).
     senders: IdMap<LocalSenderId, BatchSender>,
     pub mode: DispatchMode,
-    pub crossover: Crossover,
-    pub backpressure: Backpressure,
     /// Count of ALL streams currently active on this endpoint (every writer inc/dec, direct or not).
-    /// This is the crossover's signal in `Adaptive` mode. Measured: direct-submit skips the global
+    /// This is the SOLO signal in `Adaptive` mode. Measured: direct-submit skips the global
     /// batcher/pacer, and a direct stream SHARES the 64 send sockets with the global streams, so
     /// even ONE concurrent direct stream at c8 dents throughput ~21% and two collapse it. The harm
     /// is not "how many are direct" but "is anything else running" — a direct stream only pays off
@@ -248,9 +170,9 @@ pub(crate) fn install(senders: IdMap<LocalSenderId, BatchSender>) {
         .and_then(|v| v.trim().parse::<usize>().ok())
         .filter(|&n| n > 0)
         .unwrap_or(1); // default: strictly solo (direct only when no other stream is active)
-    // Quiet window that must elapse after the endpoint was last busy before direct resumes
-    // (decay-to-direct slow). Default 1ms — long enough to bridge per-RPC open/close gaps at c8+
-    // so churn jitter can't leak streams onto direct, short vs a genuinely idle (solo) endpoint.
+                       // Quiet window that must elapse after the endpoint was last busy before direct resumes
+                       // (decay-to-direct slow). Default 1ms — long enough to bridge per-RPC open/close gaps at c8+
+                       // so churn jitter can't leak streams onto direct, short vs a genuinely idle (solo) endpoint.
     let hold_nanos = std::env::var("DCQUIC_ADAPTIVE_HOLD_US")
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok())
@@ -259,8 +181,6 @@ pub(crate) fn install(senders: IdMap<LocalSenderId, BatchSender>) {
     let _ = DIRECT.set(Arc::new(DirectDispatch {
         senders,
         mode,
-        crossover: Crossover::default(),
-        backpressure: Backpressure::default(),
         active_total: AtomicUsize::new(0),
         direct_cap,
         base: std::time::Instant::now(),
@@ -283,49 +203,55 @@ pub(crate) fn get() -> Option<&'static Arc<DirectDispatch>> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn crossover_endpoints_and_ramp() {
-        let c = Crossover::new(0.5, 0.9);
-        assert_eq!(c.global_probability(0.0), 0.0);
-        assert_eq!(c.global_probability(0.5), 0.0);
-        assert_eq!(c.global_probability(0.9), 1.0);
-        assert_eq!(c.global_probability(1.0), 1.0);
-        // midpoint of the ramp
-        let mid = c.global_probability(0.7);
-        assert!((mid - 0.5).abs() < 1e-9, "expected 0.5 at ramp midpoint, got {mid}");
+    fn test_dispatch(hold_nanos: u64, direct_cap: usize) -> DirectDispatch {
+        DirectDispatch {
+            senders: IdMap::default(),
+            mode: DispatchMode::Adaptive,
+            active_total: AtomicUsize::new(0),
+            direct_cap,
+            base: std::time::Instant::now(),
+            busy_until_nanos: AtomicU64::new(0),
+            hold_nanos,
+            direct_max_bytes: 131_072,
+        }
     }
 
     #[test]
-    fn crossover_orders_and_clamps() {
-        // reversed + out-of-range args are normalized
-        let c = Crossover::new(1.5, -0.2);
-        assert_eq!(c.global_probability(0.0), 0.0);
-        assert_eq!(c.global_probability(1.0), 1.0);
+    fn solo_threshold_default_cap_is_strictly_solo() {
+        // cap=1 ⇒ threshold 0 ⇒ direct only when prior_active == 0 (no other stream).
+        assert_eq!(test_dispatch(0, 1).solo_threshold(), 0);
+        // a larger cap permits direct at slightly higher concurrency.
+        assert_eq!(test_dispatch(0, 3).solo_threshold(), 2);
     }
 
     #[test]
-    fn degenerate_threshold() {
-        let c = Crossover::new(0.7, 0.7);
-        // At exactly the threshold we stay direct (the `b <= lo` arm wins); only strictly above
-        // crosses to global. Conservative: don't shed to the shaped path until truly past the mark.
-        assert_eq!(c.global_probability(0.70), 0.0);
-        assert_eq!(c.global_probability(0.71), 1.0);
+    fn active_total_inc_returns_prior_and_dec_balances() {
+        let dd = test_dispatch(0, 1);
+        assert_eq!(dd.inc_total(), 0); // first stream sees 0 others
+        assert_eq!(dd.inc_total(), 1); // second sees 1
+        dd.dec_total();
+        assert_eq!(dd.inc_total(), 1); // back to 1 other after a close
     }
 
     #[test]
-    fn backpressure_roundtrip() {
-        let bp = Backpressure::default();
-        assert_eq!(bp.load(), 0.0);
-        bp.store(1.0);
-        assert!((bp.load() - 1.0).abs() < 0.01);
-        bp.store(0.5);
-        assert!((bp.load() - 0.5).abs() < 0.01);
+    fn hysteresis_mark_busy_blocks_direct_until_quiet() {
+        // With a real hold window, mark_busy() must make is_quiet() false until it elapses.
+        let dd = test_dispatch(50_000_000, 1); // 50ms hold
+        assert!(dd.is_quiet(), "fresh endpoint is quiet");
+        dd.mark_busy();
+        assert!(
+            !dd.is_quiet(),
+            "just-busy endpoint is not quiet within the hold window"
+        );
+        // A zero-hold dispatch is immediately quiet again after mark_busy.
+        let dd0 = test_dispatch(0, 1);
+        dd0.mark_busy();
+        assert!(dd0.is_quiet(), "zero hold ⇒ quiet immediately");
     }
 
     #[test]
     fn mode_default_is_off() {
-        // Unset env ⇒ Off (baseline). We don't mutate process env here (racy across tests); just
-        // assert the fallthrough arm via the parse of an unrecognized value shape.
+        // Unset/unrecognized env ⇒ Off (baseline) — the fallthrough arm.
         assert_eq!(DispatchMode::Off, DispatchMode::Off);
     }
 }
