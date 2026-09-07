@@ -300,6 +300,7 @@ fn build_eventfd_poll(efd: RawFd) -> squeue::Entry {
 /// [`spawn`] before this thread starts, so registration failures fall back cleanly), owns the socket
 /// fd and the bid→descriptor map, keeps the ring full of provided buffers, reaps recv completions into
 /// `Filled` segments, and routes them. Returns when `shutdown.closed` is observed.
+#[allow(clippy::too_many_arguments)]
 fn ring_loop<R: Router>(
     mut ring: IoUring,
     mut buf_ring: BufRing,
@@ -308,7 +309,25 @@ fn ring_loop<R: Router>(
     mut reuse: SyncReuseRing,
     mut router: R,
     shutdown: Arc<Shutdown>,
+    napi_busy_poll_us: Option<u32>,
 ) {
+    // Latency knob (opt-in): register io_uring NAPI busy-poll on this recv ring so `submit_and_wait`
+    // polls the socket's NAPI queue directly during the wait, removing the NIC-IRQ -> softirq -> task-
+    // wake latency from the steady-state RX leg. Trades idle recv-thread CPU for lower p50/p99, so it is
+    // OFF by default and enabled per-deployment. Probe + fall back cleanly to the blocking wait when the
+    // kernel does not support it (needs >= 6.9); a failure here is non-fatal.
+    if let Some(us) = napi_busy_poll_us {
+        let mut napi = types::Napi::new()
+            .set_busy_poll_timeout(us)
+            .set_prefer_busy_poll(true);
+        match ring.submitter().register_napi(&mut napi) {
+            Ok(()) => tracing::debug!(busy_poll_us = us, "recv ring: NAPI busy-poll enabled"),
+            Err(err) => {
+                tracing::debug!(%err, "recv ring: NAPI busy-poll unsupported; using blocking wait")
+            }
+        }
+    }
+
     let depth = buf_ring.entries;
     let bgid = buf_ring.bgid;
 
@@ -570,6 +589,7 @@ pub enum SpawnError<S, R> {
 /// whole lifetime (keeping the fd open), so the returned [`RecvRing`] need not — dropping the
 /// `RecvRing` signals the thread to stop and joins it, after which the socket is dropped on that
 /// thread. `socket` need only be `Send` (the ring thread is its sole accessor).
+#[allow(clippy::too_many_arguments)]
 pub fn spawn<S, R>(
     idx: usize,
     socket: S,
@@ -577,6 +597,7 @@ pub fn spawn<S, R>(
     pool: Pool,
     reuse: SyncReuseRing,
     router: R,
+    napi_busy_poll_us: Option<u32>,
 ) -> Result<RecvRing, SpawnError<S, R>>
 where
     S: crate::socket::recv::Socket,
@@ -625,7 +646,16 @@ where
             // it is dropped here when the loop returns (after the fd is no longer referenced by any
             // in-flight SQE — the loop tears the ring down before returning).
             let _socket = socket;
-            ring_loop(ring, buf_ring, fd, pool, reuse, router, ring_shutdown);
+            ring_loop(
+                ring,
+                buf_ring,
+                fd,
+                pool,
+                reuse,
+                router,
+                ring_shutdown,
+                napi_busy_poll_us,
+            );
         });
     match join {
         Ok(join) => Ok(RecvRing {
@@ -697,7 +727,11 @@ mod tests {
 
         let pool = Pool::new(u16::MAX);
         let reuse = SyncReuseRing::new();
-        let ring = spawn(0, socket, 64, pool, reuse, router)
+        // Exercise the NAPI busy-poll path (Some) as well as delivery: on a supporting kernel/NIC the
+        // ring registers busy-poll; on loopback / older kernels it falls back cleanly to the blocking
+        // wait. Either way delivery must be unaffected — which the assertions below verify. (The
+        // default OFF path, `None`, is the unchanged skip-branch, covered by the cooperative sim tests.)
+        let ring = spawn(0, socket, 64, pool, reuse, router, Some(50))
             .unwrap_or_else(|_| panic!("recv ring spawn must succeed when io_uring is available"));
 
         // Give the ring thread a moment to register the buffer ring and arm the multishot recv.
