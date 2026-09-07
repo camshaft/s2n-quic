@@ -298,6 +298,40 @@ pub struct Runner {
     worker_id: usize,
 }
 
+/// Pin the calling busy-poll worker thread to a dedicated core when `DCQUIC_PIN_CORES` is enabled
+/// (`1`/`on`/`true`); otherwise a no-op (unset ⇒ current behavior). Worker `worker_id` pins to core
+/// `worker_id % nproc`. Env is parsed once (process-global). Best-effort: a failed `sched_setaffinity`
+/// is ignored (falls back to the scheduler's default placement).
+#[cfg(target_os = "linux")]
+fn pin_current_thread_to_core(worker_id: usize) {
+    use std::sync::OnceLock;
+    static PIN: OnceLock<bool> = OnceLock::new();
+    let enabled = *PIN.get_or_init(|| {
+        matches!(
+            std::env::var("DCQUIC_PIN_CORES")
+                .ok()
+                .as_deref()
+                .map(str::trim),
+            Some("1") | Some("on") | Some("true")
+        )
+    });
+    if !enabled {
+        return;
+    }
+    let ncpu = unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) };
+    if ncpu <= 0 {
+        return;
+    }
+    let core = worker_id % ncpu as usize;
+    unsafe {
+        let mut set: libc::cpu_set_t = std::mem::zeroed();
+        libc::CPU_ZERO(&mut set);
+        libc::CPU_SET(core, &mut set);
+        // pid 0 == the calling thread.
+        let _ = libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set);
+    }
+}
+
 impl Runner {
     pub fn run(self) {
         let shared = self.shared;
@@ -309,6 +343,14 @@ impl Runner {
             thread_dump::install_handler();
             let tid = unsafe { libc::syscall(libc::SYS_gettid) } as i32;
             heartbeat.tid.store(tid, Ordering::Release);
+            // Optional CPU pinning (env `DCQUIC_PIN_CORES`): pin each busy-poll worker to a
+            // dedicated core so the OS never migrates it. The busy-poll workers spin at ~100%; when
+            // more threads than cores contend (or the scheduler migrates a spinning thread), the
+            // per-sweep latency spikes show up as a p99/p999 TAIL (measured: 46 workers on 48 cores
+            // blew the r64k p999 to ~10ms). Pinning removes that migration/contention jitter.
+            // Off by default (unset ⇒ current behavior). Worker `worker_id` pins to core
+            // `worker_id % nproc`.
+            pin_current_thread_to_core(worker_id);
         }
 
         let waker = s2n_quic_core::task::waker::noop();
