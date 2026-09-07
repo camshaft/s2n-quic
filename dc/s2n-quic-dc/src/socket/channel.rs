@@ -514,6 +514,70 @@ where
     }
 }
 
+/// Selects between per-entry and whole-queue (batched) draining at construction.
+///
+/// The inner receiver must support BOTH per-entry draining
+/// ([`Receiver<Entry<T>>`]) and whole-queue draining ([`Receiver<Queue<T>>`]) —
+/// the sync intrusive channel receiver does. Both variants expose the same
+/// `Receiver<Entry<T>>` surface, so this can be dropped into an existing
+/// per-entry pipeline transparently:
+///
+/// - [`MaybeBatched::PerEntry`] forwards one entry per inner acquisition — one
+///   lock (or CAS) per entry. This is the prior, default behavior.
+/// - [`MaybeBatched::Batched`] takes the entire accumulated queue in a single
+///   inner acquisition and then yields its entries for free, amortizing the
+///   per-acquisition lock cost across the standing queue depth. When the drain
+///   is woken with a small standing queue (e.g. a mean depth of ~4-5 items),
+///   this collapses ~N locks into ~1 without adding any wait: the take-all
+///   grabs exactly what is already present, so per-item latency is unchanged.
+///
+/// The mode is chosen once at construction (typically from an env flag defaulting
+/// to off), so the default path is byte-for-byte the prior per-entry behavior.
+pub enum MaybeBatched<T, R> {
+    PerEntry(R),
+    Batched(FlattenQueue<T, R>),
+}
+
+impl<T, R> MaybeBatched<T, R>
+where
+    R: Receiver<crate::intrusive::Entry<T>> + Receiver<crate::intrusive::Queue<T>>,
+{
+    pub fn new(inner: R, batched: bool) -> Self {
+        if batched {
+            Self::Batched(FlattenQueue::new(inner))
+        } else {
+            Self::PerEntry(inner)
+        }
+    }
+}
+
+impl<T, R> Receiver<crate::intrusive::Entry<T>> for MaybeBatched<T, R>
+where
+    R: Receiver<crate::intrusive::Entry<T>> + Receiver<crate::intrusive::Queue<T>>,
+{
+    fn poll_recv(
+        &mut self,
+        cx: &mut task::Context<'_>,
+        budget: &mut Budget,
+    ) -> Poll<Option<crate::intrusive::Entry<T>>> {
+        match self {
+            Self::PerEntry(inner) => {
+                <R as Receiver<crate::intrusive::Entry<T>>>::poll_recv(inner, cx, budget)
+            }
+            Self::Batched(inner) => inner.poll_recv(cx, budget),
+        }
+    }
+
+    fn on_consumed(&mut self, bytes: u64) {
+        match self {
+            Self::PerEntry(inner) => {
+                <R as Receiver<crate::intrusive::Entry<T>>>::on_consumed(inner, bytes)
+            }
+            Self::Batched(inner) => inner.on_consumed(bytes),
+        }
+    }
+}
+
 /// Specialized version of `Flatten` for intrusive lists with adapters.
 /// This is useful for flattening List<A> into A::Pointer entries.
 pub struct FlattenList<A, R>

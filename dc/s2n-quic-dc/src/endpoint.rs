@@ -72,6 +72,23 @@ type BatchSender =
 type BatchReceiver = sync_queue::Receiver<combinator::FrameBatch>;
 type AckMsgReceiver = sync_queue::Receiver<msg::Sender>;
 
+/// Whether the ACK-completion drain should batch-drain its channel (take the
+/// whole standing queue per acquisition) instead of popping one entry per lock.
+///
+/// Off by default; enabled via `DCQUIC_ACK_BATCH_DRAIN=1` (also `true`/`on`/`yes`).
+/// This is a per-lock amortization lever: at a small standing queue depth
+/// (measured mean ~4-5 items on the ack-completion channel under load) the
+/// per-entry path pays one lock per item, so coalescing each drain into a single
+/// take-all collapses ~N locks into ~1 with no added wait. Read once and cached.
+fn ack_batch_drain_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("DCQUIC_ACK_BATCH_DRAIN")
+            .map(|v| matches!(v.as_str(), "1" | "true" | "on" | "yes"))
+            .unwrap_or(false)
+    })
+}
+
 pub struct Endpoint {
     /// Frame submission channel (writers submit frame inputs here)
     pub frame_tx: SubmissionSender,
@@ -1486,7 +1503,10 @@ where
                 let ack_completion_gauge =
                     counter_registry.register_queue_gauge_nominal("q.dispatch", &variant);
                 let ack_completion_rx = crate::counter::GaugedReceiver::new(
-                    rd.ack_completion_rx,
+                    crate::socket::channel::MaybeBatched::new(
+                        rd.ack_completion_rx,
+                        ack_batch_drain_enabled(),
+                    ),
                     ack_completion_gauge
                         .receiver("task.ack_completion")
                         .with_function("endpoint::Worker::spawn"),

@@ -554,6 +554,47 @@ fn flatten_empty_queue_skipped() {
     });
 }
 
+// ── MaybeBatched tests ─────────────────────────────────────────────
+
+/// The batched (take-all) and per-entry drain modes must be observationally
+/// identical: same entries, same order. Only the number of underlying lock
+/// acquisitions differs (one per batch vs one per entry).
+#[test]
+fn maybe_batched_yields_same_entries_in_both_modes() {
+    fn drain_all(batched: bool) -> Vec<u32> {
+        let (tx, rx) = super::intrusive::sync::new::<u32>();
+        for v in [10u32, 20, 30, 40] {
+            tx.send_entry(intrusive::Entry::new(v))
+                .map_err(|_| "send_entry failed")
+                .unwrap();
+        }
+        // Drop the sender so the drain terminates with `Ready(None)` once the
+        // queued entries are exhausted, rather than parking on `Pending`.
+        drop(tx);
+
+        let mut mb = MaybeBatched::new(rx, batched);
+        let mut cx = noop_cx();
+        let mut budget = Budget::new(usize::MAX);
+        let mut out = Vec::new();
+        loop {
+            match mb.poll_recv(&mut cx, &mut budget) {
+                Poll::Ready(Some(entry)) => out.push(*entry),
+                Poll::Ready(None) => break,
+                Poll::Pending => panic!("unexpected Pending: data is queued and sender is dropped"),
+            }
+        }
+        out
+    }
+
+    let per_entry = drain_all(false);
+    let batched = drain_all(true);
+    assert_eq!(per_entry, vec![10, 20, 30, 40]);
+    assert_eq!(
+        batched, per_entry,
+        "batched drain must yield identical entries in identical order to per-entry drain"
+    );
+}
+
 #[test]
 fn flatten_segments_does_not_drop_buffered_segment_when_budget_exhausted() {
     use std::net::{Ipv4Addr, SocketAddr};
