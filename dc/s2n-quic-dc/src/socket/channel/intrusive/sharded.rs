@@ -68,6 +68,27 @@ impl<A: intrusive::Adapter> Input<A, intrusive::List<A>> for intrusive::List<A> 
     }
 }
 
+/// A single [`Entry`] is a one-element input into the default `List` storage. This lets a per-entry
+/// producer (e.g. the recv-dispatch fan-out, which sends one decoded packet at a time via
+/// [`UnboundedSender::send`](super::super::UnboundedSender::send)) feed a sharded channel with no
+/// batching — the entry is pushed onto the selected shard's list. `is_empty` is always `false`: a
+/// single entry always carries work.
+///
+/// [`Entry`]: intrusive::Entry
+impl<T> Input<intrusive::EntryAdapter<T>, intrusive::List<intrusive::EntryAdapter<T>>>
+    for intrusive::Entry<T>
+{
+    #[inline(always)]
+    fn is_empty(&self) -> bool {
+        false
+    }
+
+    #[inline(always)]
+    fn append_to(self, storage: &mut intrusive::List<intrusive::EntryAdapter<T>>) {
+        storage.push_back(self);
+    }
+}
+
 struct Shard<A: intrusive::Adapter, Q: Storage<A>> {
     is_open: bool,
     queue: Q,
@@ -618,6 +639,27 @@ mod tests {
         assert_eq!(values(&list), vec![1, 2, 3]);
 
         assert!(matches!(rx.poll_recv(&mut cx, &mut budget), Poll::Pending));
+    }
+
+    #[test]
+    fn single_entry_send_via_input_bridge() {
+        // Exercises `impl Input for Entry`: a per-entry producer (e.g. the recv-dispatch fan-out)
+        // feeds the default List-storage sharded channel one `Entry` at a time via
+        // `UnboundedSender::send`, and the receiver drains them as batches. Round-robin shard
+        // selection may split the two entries across shards, so drain until Pending.
+        let (mut tx, mut rx) = new::<u32>(4);
+        register(&mut rx);
+        tx.send(Entry::new(1)).unwrap();
+        tx.send(Entry::new(2)).unwrap();
+
+        let mut cx = noop_cx();
+        let mut budget = Budget::new(8);
+        let mut got = Vec::new();
+        while let Poll::Ready(Some(batch)) = rx.poll_recv(&mut cx, &mut budget) {
+            got.extend(values(&batch));
+        }
+        got.sort_unstable();
+        assert_eq!(got, vec![1, 2]);
     }
 
     #[test]
