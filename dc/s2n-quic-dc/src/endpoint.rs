@@ -28,7 +28,6 @@ use s2n_quic_core::{time, varint::VarInt};
 use std::sync::{atomic::AtomicU64, Arc};
 
 pub(crate) mod ack;
-pub(crate) mod adaptive;
 pub(crate) mod assemble;
 pub(crate) mod combinator;
 pub mod counters;
@@ -68,7 +67,7 @@ pub const DEFAULT_DEAD_PEER_COOLDOWN: Duration = Duration::from_secs(30);
 /// The maximum length of a single packet
 pub const MAX_DATAGRAM_SIZE: usize = 1 << 15; // 32k
 
-pub(crate) type BatchSender =
+type BatchSender =
     GaugedSender<sync_queue::Sender<combinator::FrameBatch>, Entry<combinator::FrameBatch>>;
 type BatchReceiver = sync_queue::Receiver<combinator::FrameBatch>;
 type AckMsgReceiver = sync_queue::Receiver<msg::Sender>;
@@ -748,12 +747,6 @@ where
         .iter()
         .map(|(sender_id, &worker_idx)| (sender_id, worker_batch_txs[worker_idx].clone()))
         .collect();
-
-    // Adaptive dispatch (prototype, env-gated): install the process-global direct-dispatch context
-    // so DIRECT-mode stream writers can spray straight to these send workers, bypassing the global
-    // frame_dispatch hop. No-op unless DCQUIC_ADAPTIVE_DISPATCH is set (install() early-returns on
-    // Off); the clone is a one-time startup cost.
-    adaptive::install(socket_senders.clone());
 
     // ── Waker offload ─────────────────────────────────────────────────────────
     // One slot per producer (recv_dispatch + send workers + background peer-dead fanout task
