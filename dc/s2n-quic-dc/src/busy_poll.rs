@@ -4,6 +4,7 @@
 use crate::tracing::*;
 use parking_lot::{Condvar, Mutex};
 use std::{
+    cell::Cell,
     fmt,
     future::Future,
     ops,
@@ -14,11 +15,74 @@ use std::{
         Arc, Weak,
     },
     task::Context,
+    time::Duration,
 };
 
 pub mod clock;
 #[cfg(target_os = "linux")]
 pub mod thread_dump;
+
+thread_local! {
+    /// Monotonic count of "useful work" events observed on THIS busy-poll worker thread — a channel
+    /// item drained, or a datagram sent/received. The adaptive-backoff [`Runner`] snapshots it around
+    /// each poll to tell a productive poll from an empty spin. Bumped via [`note_work`] on the SUCCESS
+    /// arm of the recv/send hot paths only (never on the empty/EAGAIN path), so it costs nothing on the
+    /// wasteful empty spins it exists to detect, and its cost when idle is zero.
+    static WORK: Cell<u64> = const { Cell::new(0) };
+}
+
+/// Records one unit of useful work on the current worker thread (a channel drain, a socket
+/// recv/send). Called from the recv/send hot paths on their success arm. See [`WORK`].
+///
+/// Cheap unconditional `Cell` bump — no atomics, no branch on an enable flag. When adaptive backoff
+/// is OFF the [`Runner`] simply never reads the counter, so these bumps are semantically inert and
+/// fire only on real work events (well below the empty-poll rate), keeping the default path
+/// effectively byte-identical.
+#[inline]
+pub(crate) fn note_work() {
+    WORK.with(|w| w.set(w.get().wrapping_add(1)));
+}
+
+#[inline]
+fn work_count() -> u64 {
+    WORK.with(Cell::get)
+}
+
+/// Adaptive busy-poll backoff, configured from the environment. Default (both unset) = OFF, i.e. the
+/// previous unconditional 100%-spin baseline, byte-identical.
+///
+/// When `DCQUIC_BUSY_POLL_BACKOFF_K` is a positive integer K, a worker that polls K consecutive times
+/// without observing any [`note_work`] event sleeps for `DCQUIC_BUSY_POLL_BACKOFF_US` microseconds
+/// (default 10) before continuing. This trades a bounded, tunable idle-wakeup latency for a large cut
+/// in wasted empty-poll CPU and the per-poll channel-lock rate on idle workers — the dynamic
+/// scale-down of effective spinning threads. A worker doing real work resets its streak before
+/// reaching K, so busy flows keep hot-spinning; tune K so p50 stays flat.
+#[derive(Clone, Copy)]
+struct BackoffConfig {
+    empty_polls_before_sleep: u64,
+    sleep: Duration,
+}
+
+impl BackoffConfig {
+    fn from_env() -> Option<Self> {
+        Self::parse(
+            std::env::var("DCQUIC_BUSY_POLL_BACKOFF_K").ok().as_deref(),
+            std::env::var("DCQUIC_BUSY_POLL_BACKOFF_US").ok().as_deref(),
+        )
+    }
+
+    /// Pure parse of the two env values (extracted from [`from_env`] so it is testable without
+    /// mutating process-global env). `k` unset / unparsable / `0` ⇒ `None` (backoff OFF); `us`
+    /// unset / unparsable ⇒ the 10µs default.
+    fn parse(k: Option<&str>, us: Option<&str>) -> Option<Self> {
+        let empty_polls_before_sleep: u64 = k.and_then(|v| v.parse().ok()).filter(|&k| k > 0)?;
+        let us: u64 = us.and_then(|v| v.parse().ok()).unwrap_or(10);
+        Some(Self {
+            empty_polls_before_sleep,
+            sleep: Duration::from_micros(us),
+        })
+    }
+}
 
 #[derive(Clone)]
 pub struct Pool {
@@ -328,6 +392,12 @@ impl Runner {
 
         let _guard = AbortOnPanic;
 
+        // Adaptive busy-poll backoff config, read once (default OFF = always-spin). `empty_streak`
+        // persists across outer-loop iterations so a worker idle across several passes keeps backing
+        // off; it resets the moment a poll observes work.
+        let backoff = BackoffConfig::from_env();
+        let mut empty_streak: u64 = 0;
+
         loop {
             const ITERATIONS: usize = if cfg!(debug_assertions) {
                 10
@@ -350,8 +420,31 @@ impl Runner {
                 heartbeat.sleeping.store(false, Ordering::Release);
                 core::mem::swap(&mut spawns, &mut guard.spawns);
             } else {
-                for _ in 0..ITERATIONS {
-                    tasks.poll(&mut cx, &heartbeat);
+                match backoff {
+                    // Default: unconditional 100%-spin baseline (byte-identical to before).
+                    None => {
+                        for _ in 0..ITERATIONS {
+                            tasks.poll(&mut cx, &heartbeat);
+                        }
+                    }
+                    // Adaptive: sleep after `k` consecutive polls that observed no work, so an idle
+                    // worker stops burning CPU + taking the per-poll channel lock; a working worker
+                    // resets its streak and keeps hot-spinning.
+                    Some(cfg) => {
+                        for _ in 0..ITERATIONS {
+                            let before = work_count();
+                            tasks.poll(&mut cx, &heartbeat);
+                            if work_count() == before {
+                                empty_streak += 1;
+                                if empty_streak >= cfg.empty_polls_before_sleep {
+                                    std::thread::sleep(cfg.sleep);
+                                    empty_streak = 0;
+                                }
+                            } else {
+                                empty_streak = 0;
+                            }
+                        }
+                    }
                 }
 
                 // Yield to allow other threads (especially SCHED_OTHER threads like Tokio runtime)
@@ -477,6 +570,31 @@ mod tests {
 
         drop(handle);
         worker.join().unwrap();
+    }
+
+    #[test]
+    fn note_work_increments_thread_local() {
+        let start = work_count();
+        note_work();
+        note_work();
+        assert_eq!(work_count(), start + 2);
+    }
+
+    #[test]
+    fn backoff_config_parse() {
+        // Unset K ⇒ OFF (the default, byte-identical always-spin).
+        assert!(BackoffConfig::parse(None, None).is_none());
+        // Zero / unparsable K ⇒ OFF.
+        assert!(BackoffConfig::parse(Some("0"), None).is_none());
+        assert!(BackoffConfig::parse(Some("nope"), None).is_none());
+        // Positive K, default 10µs sleep when US unset/unparsable.
+        let cfg = BackoffConfig::parse(Some("1000"), None).expect("K>0 enables backoff");
+        assert_eq!(cfg.empty_polls_before_sleep, 1000);
+        assert_eq!(cfg.sleep, Duration::from_micros(10));
+        // Explicit US honored.
+        let cfg = BackoffConfig::parse(Some("500"), Some("25")).unwrap();
+        assert_eq!(cfg.empty_polls_before_sleep, 500);
+        assert_eq!(cfg.sleep, Duration::from_micros(25));
     }
 
     #[test]

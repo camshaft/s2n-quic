@@ -206,6 +206,7 @@ impl<S: crate::socket::send::Socket> crate::socket::send::Socket for Metered<S> 
             Ok(sent) => {
                 self.ops.add(1);
                 self.bytes.add(*sent as u64);
+                crate::busy_poll::note_work();
             }
             Err(_) => {
                 self.errors.add(1);
@@ -229,6 +230,7 @@ impl<S: crate::socket::recv::Socket> crate::socket::recv::Socket for Metered<S> 
             core::task::Poll::Ready(Ok(received)) => {
                 self.ops.add(1);
                 self.bytes.add(*received as u64);
+                crate::busy_poll::note_work();
             }
             core::task::Poll::Ready(Err(_)) => {
                 self.errors.add(1);
