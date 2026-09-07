@@ -65,7 +65,10 @@ impl DispatchMode {
 // only (one install per process) — acceptable for the A/B rig; a production version would thread a
 // per-endpoint handle through the dispatch path instead.
 
-use crate::endpoint::{id::IdMap, id::LocalSenderId, BatchSender};
+use crate::endpoint::{
+    id::{IdMap, LocalSenderId},
+    BatchSender,
+};
 use std::sync::{Arc, OnceLock};
 
 /// Shared direct-dispatch context installed once at endpoint build when adaptive dispatch is on.
