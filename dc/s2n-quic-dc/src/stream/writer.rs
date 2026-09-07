@@ -2416,11 +2416,28 @@ impl Inner {
         Ok(())
     }
 
+    /// Payload-size gate for adaptive dispatch: once a direct-mode stream's cumulative bytes
+    /// (`next_offset`) exceed the threshold, drop it off the direct path onto the global batched
+    /// path for the remainder of the stream. Large responses lose more from the skipped frame
+    /// coalescing than the w0 hop-cut saves (measured: 1MB regressed on direct). No-op once the
+    /// stream is already on the global path or adaptive isn't installed.
+    #[inline]
+    fn maybe_leave_direct_for_large_payload(&mut self) {
+        if self.direct_senders.is_some() {
+            let max_bytes = crate::endpoint::adaptive::get()
+                .map_or(u64::MAX, |dd| dd.direct_max_bytes());
+            if self.next_offset.as_u64() >= max_bytes {
+                self.direct_senders = None;
+            }
+        }
+    }
+
     fn send_frame(&mut self, frame: Frame) -> io::Result<()> {
         // Application submitting a frame into the send pipeline — the first sighting, before
         // aggregation/credit/pacing/assembly. Pairs with the Outbound record at assembly so the
         // submit→wire latency is visible. PN is not assigned yet.
         crate::endpoint::frame_trace::app_send(&frame.header, *self.path_secret_entry.id());
+        self.maybe_leave_direct_for_large_payload();
         // Adaptive dispatch: a direct-mode stream sprays straight to a send worker, skipping the
         // global frame_dispatch hop. The frame already carries its borrowed `flow_credits`, so no
         // credit is (re)acquired; on a closed send channel the helper releases that credit.
@@ -2451,6 +2468,7 @@ impl Inner {
     }
 
     fn send_batch(&mut self, queue: Queue<Frame>) -> io::Result<()> {
+        self.maybe_leave_direct_for_large_payload();
         // Adaptive dispatch: a direct-mode stream coalesces the batch and sprays it straight to a
         // send worker, bypassing the global frame_dispatch hop. Same batch-to-one-socket routing as
         // the global path; the round-robin cursor keeps successive batches spread across sockets.
