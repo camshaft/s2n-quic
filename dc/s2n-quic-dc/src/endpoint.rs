@@ -455,6 +455,8 @@ where
                 counter_registry.register_nominal("socket.tx.ops", format_args!("send.{key}")),
                 counter_registry.register_nominal("socket.tx.bytes", format_args!("send.{key}")),
                 counter_registry.register_nominal("!socket.tx.errors", format_args!("send.{key}")),
+                // Send has no empty-poll concept: `send_msg` returns `Ok`/`Err`, never `Pending`.
+                None,
             );
             (key, socket)
         })
@@ -473,6 +475,9 @@ where
                 counter_registry.register_nominal("socket.rx.ops", format_args!("recv.{key}")),
                 counter_registry.register_nominal("socket.rx.bytes", format_args!("recv.{key}")),
                 counter_registry.register_nominal("!socket.rx.errors", format_args!("recv.{key}")),
+                // Empty (`Poll::Pending`/`EAGAIN`) receive polls: `ops` vs `empty` gives the
+                // empty:productive poll ratio — the wasted-busy-poll-spin fraction of the recvmsg rate.
+                Some(counter_registry.register_nominal("socket.rx.empty", format_args!("recv.{key}"))),
             );
             (key, socket)
         })
