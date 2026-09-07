@@ -270,7 +270,7 @@ pub(crate) fn install(senders: IdMap<LocalSenderId, BatchSender>) {
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
             .filter(|&n| n > 0)
-            .unwrap_or(262_144), // 256 KiB
+            .unwrap_or(131_072), // 128 KiB (comfortably above 64k so it stays direct; large responses go global)
     }));
 }
 
