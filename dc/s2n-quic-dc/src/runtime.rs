@@ -318,6 +318,19 @@ pub mod tokio {
                                 let spawner = Local { worker_id };
                                 work(spawner);
                             }
+
+                            // All `Handle` clones (and thus every `WorkItem` sender) have been
+                            // dropped, so no more spawn requests will arrive. But the endpoint tasks
+                            // already spawned onto this LocalSet must keep running for the endpoint's
+                            // lifetime — the busy-poll pool's worker threads are self-sustaining
+                            // (`runner.run()` loops for the life of the process), and the tokio
+                            // runtime must match that contract. Returning here would drop the
+                            // LocalSet and cancel those tasks, which surfaces as a "frame channel
+                            // closed" the moment the endpoint is used. Keep driving the LocalSet so
+                            // the reactor continues to wake the (now readiness-registered) recv/send
+                            // workers. Process-lifetime, like busy-poll; graceful shutdown is a
+                            // follow-up.
+                            std::future::pending::<()>().await;
                         });
                     });
 

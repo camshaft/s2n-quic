@@ -15,11 +15,9 @@ use tracing::info;
 pub fn create(
     config: &EndpointConfig,
     bind_addr: SocketAddr,
-    pool: &busy_poll::Pool,
+    pool: Option<&busy_poll::Pool>,
     print_pipeline_dot: bool,
 ) -> io::Result<Arc<endpoint::Endpoint>> {
-    let runtime = runtime::busy_poll::Handle::new(pool.clone());
-
     // Bind the sockets first: the recv socket addresses are advertised to peers via the
     // path-secret map's `DcDataAddresses` transport parameter, so the map must be built
     // after the sockets exist and their bound addresses are known.
@@ -38,8 +36,52 @@ pub fn create(
         config.recv_io_workers,
         gso.clone(),
     );
-    let (send_sockets, recv_sockets) = socket_config.busy_poll()?;
 
+    // Select the runtime that drives the data plane. Both arms keep the busy-poll-shaped send +
+    // UPS sockets and differ only in the recv socket wrapper (tokio uses `AsyncFd` readiness) and
+    // the runtime `Handle` — everything else is shared in `finish`.
+    if config.use_tokio() {
+        let (send_sockets, recv_sockets) = socket_config.tokio()?;
+        let runtime = runtime::tokio::Handle::new(config.total_workers());
+        finish(
+            config,
+            gso,
+            bind_addr,
+            runtime,
+            send_sockets,
+            recv_sockets,
+            print_pipeline_dot,
+        )
+    } else {
+        let pool = pool.expect("busy-poll runtime requires a busy-poll worker pool");
+        let (send_sockets, recv_sockets) = socket_config.busy_poll()?;
+        let runtime = runtime::busy_poll::Handle::new(pool.clone());
+        finish(
+            config,
+            gso,
+            bind_addr,
+            runtime,
+            send_sockets,
+            recv_sockets,
+            print_pipeline_dot,
+        )
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finish<R, Rcv>(
+    config: &EndpointConfig,
+    gso: endpoint::Gso,
+    bind_addr: SocketAddr,
+    runtime: R,
+    send_sockets: Vec<s2n_quic_dc::socket::Gso<s2n_quic_dc::socket::BusyPoll<std::net::UdpSocket>>>,
+    recv_sockets: Vec<Rcv>,
+    print_pipeline_dot: bool,
+) -> io::Result<Arc<endpoint::Endpoint>>
+where
+    R: runtime::Runtime,
+    Rcv: s2n_quic_dc::socket::recv::Socket,
+{
     // The recv socket addresses are what peers should target with DC data packets.
     let data_addrs: Vec<SocketAddr> = recv_sockets
         .iter()

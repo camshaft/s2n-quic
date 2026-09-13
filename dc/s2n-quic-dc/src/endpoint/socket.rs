@@ -153,6 +153,30 @@ impl Config {
         let recv_sockets = recv_sockets.into_iter().map(BusyPoll).collect();
         Ok((send_sockets, recv_sockets))
     }
+
+    /// Send/recv socket pair for the tokio runtime: recv sockets register readiness with the tokio
+    /// reactor (see [`crate::socket::recv::socket::Tokio`]) so the recv worker parks on the reactor
+    /// instead of relying on the busy-poll spin. Send sockets keep the busy-poll shape — the send
+    /// path does not gate connection setup, so send-side readiness is a separate follow-up.
+    #[cfg(feature = "tokio")]
+    #[allow(clippy::type_complexity)]
+    pub fn tokio(
+        &self,
+    ) -> io::Result<(
+        Vec<GsoSocket<BusyPoll<std::net::UdpSocket>>>,
+        Vec<crate::socket::recv::Tokio<std::net::UdpSocket>>,
+    )> {
+        let (send_sockets, recv_sockets) = self.create()?;
+        let send_sockets = send_sockets
+            .into_iter()
+            .map(|GsoSocket(s, gso)| GsoSocket(BusyPoll(s), gso))
+            .collect();
+        let recv_sockets = recv_sockets
+            .into_iter()
+            .map(crate::socket::recv::Tokio::new)
+            .collect::<io::Result<Vec<_>>>()?;
+        Ok((send_sockets, recv_sockets))
+    }
 }
 
 /// Wraps a socket to count ops, bytes, and errors at the I/O boundary.

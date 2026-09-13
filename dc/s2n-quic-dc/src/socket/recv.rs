@@ -12,3 +12,6 @@ mod bach;
 pub mod uring;
 
 pub use socket::Socket;
+
+#[cfg(feature = "tokio")]
+pub use socket::Tokio;

@@ -55,6 +55,13 @@ pub struct EndpointConfig {
     /// busy-poll path). Case-insensitive; `io-uring`/`uring` also accepted.
     #[serde(default = "EndpointConfig::default_recv_backend")]
     pub recv_backend: String,
+
+    /// Async runtime that drives the endpoint's data plane: `"busy-poll"` (default — a pool of
+    /// polling worker threads, lowest latency, saturates CPU) or `"tokio"` (the dcQUIC tokio runtime,
+    /// which parks on the reactor instead of spinning — far less CPU, for latency-tolerant
+    /// deployments). Case-insensitive.
+    #[serde(default = "EndpointConfig::default_runtime")]
+    pub runtime: String,
 }
 
 impl EndpointConfig {
@@ -88,6 +95,16 @@ impl EndpointConfig {
 
     fn default_recv_backend() -> String {
         "auto".to_string()
+    }
+
+    fn default_runtime() -> String {
+        "busy-poll".to_string()
+    }
+
+    /// Whether the data plane should run on the dcQUIC tokio runtime (vs the busy-poll pool).
+    /// Unrecognized values fall back to busy-poll.
+    pub fn use_tokio(&self) -> bool {
+        matches!(self.runtime.trim().to_ascii_lowercase().as_str(), "tokio")
     }
 
     /// Parse [`recv_backend`](Self::recv_backend) into the endpoint enum. Unrecognized values fall
@@ -144,6 +161,7 @@ impl Default for EndpointConfig {
             bandwidth: Self::default_bandwidth(),
             submission_shards: Self::default_submission_shards(),
             recv_backend: Self::default_recv_backend(),
+            runtime: Self::default_runtime(),
         }
     }
 }
