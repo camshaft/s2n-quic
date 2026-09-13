@@ -579,10 +579,13 @@ pub fn spawn<S, R>(
     router: R,
 ) -> Result<RecvRing, SpawnError<S, R>>
 where
-    S: crate::socket::recv::Socket,
+    S: crate::socket::recv::BindOnWorker + Send + 'static,
     R: Router + Send + 'static,
 {
-    let Some(fd) = socket.raw_fd() else {
+    // io_uring drives the socket by its raw fd on the ring thread and never polls it via `recv::Socket`
+    // (it only owns the socket to keep the fd open), so an unbound recv socket is fine here — take the
+    // fd from `BindOnWorker` and skip readiness binding entirely (io_uring needs no tokio `AsyncFd`).
+    let Some(fd) = crate::socket::recv::BindOnWorker::raw_fd(&socket) else {
         // No real OS fd — io_uring cannot drive it. Hand both back for the syscall path.
         return Err(SpawnError::Recoverable(
             std::io::Error::from(std::io::ErrorKind::Unsupported),

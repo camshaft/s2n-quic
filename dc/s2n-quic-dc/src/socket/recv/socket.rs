@@ -54,6 +54,57 @@ impl<T: Socket + Sync> Socket for std::sync::Arc<T> {
     }
 }
 
+/// A recv socket that can be bound to the worker runtime that will poll it, at task-spawn time.
+///
+/// Endpoint recv tasks are spawned onto a per-worker runtime (see [`crate::runtime::tokio::Handle`]),
+/// not the runtime that constructs the endpoint. Tokio's readiness registration ([`AsyncFd`]) binds
+/// to whichever runtime is current when it is built, so building it at endpoint-setup time would bind
+/// it to the *caller* runtime and every readiness edge would cross runtimes to wake the worker task.
+/// Instead the endpoint carries an *unbound* recv socket through setup and calls [`bind_on_worker`]
+/// at the spawn site, which runs on the worker (its runtime is entered) — so the `AsyncFd` registers
+/// with the worker's own reactor and wakes are same-runtime.
+///
+/// Runtimes that need no per-runtime readiness registration — busy-poll (the executor re-polls every
+/// spin), the bach simulation, the inspector snapshot — use the blanket identity impl below, so the
+/// bind is a no-op move for them.
+///
+/// [`AsyncFd`]: tokio::io::unix::AsyncFd
+/// [`bind_on_worker`]: BindOnWorker::bind_on_worker
+pub trait BindOnWorker: crate::socket::LocalAddr {
+    /// The readiness-driven recv socket produced once bound.
+    type Bound: Socket;
+
+    /// The underlying OS receive descriptor, when backed by a real kernel UDP socket (mirrors
+    /// [`Socket::raw_fd`]). The io_uring recv backend adopts a socket by this fd *before* binding, so
+    /// it must be reachable on the unbound socket.
+    #[inline]
+    fn raw_fd(&self) -> Option<std::os::fd::RawFd> {
+        None
+    }
+
+    /// Bind to the current (worker) runtime and return the readiness-driven recv socket. Called once,
+    /// at task spawn, on the worker thread.
+    fn bind_on_worker(self) -> io::Result<Self::Bound>;
+}
+
+/// Identity binding for recv sockets that need no per-runtime readiness registration (busy-poll, the
+/// bach sim socket, the inspector snapshot socket). They already implement [`Socket`], so binding is
+/// a no-op move. The tokio path deliberately routes through the non-`Socket` [`Tokio`] unbound form
+/// (see `Config::tokio`) so it does not match this blanket impl.
+impl<T: Socket> BindOnWorker for T {
+    type Bound = T;
+
+    #[inline]
+    fn raw_fd(&self) -> Option<std::os::fd::RawFd> {
+        Socket::raw_fd(self)
+    }
+
+    #[inline]
+    fn bind_on_worker(self) -> io::Result<Self::Bound> {
+        Ok(self)
+    }
+}
+
 impl<T> Socket for BusyPoll<T>
 where
     T: udp::Socket,
@@ -201,5 +252,53 @@ where
                 Err(err) => return Err(err).into(),
             }
         }
+    }
+}
+
+/// The unbound tokio recv socket [`Config::tokio`](crate::endpoint::socket::Config::tokio) hands to
+/// the endpoint: it holds the raw UDP socket but defers the [`AsyncFd`](tokio::io::unix::AsyncFd)
+/// construction to [`BindOnWorker::bind_on_worker`], which runs on the worker so the `AsyncFd`
+/// registers with the worker's own reactor (same-runtime wakes — see [`BindOnWorker`]).
+///
+/// Deliberately does **not** implement [`Socket`] — it is not pollable until bound — so the blanket
+/// identity [`BindOnWorker`] impl does not apply to it and the tokio path builds a real [`Tokio`].
+#[cfg(feature = "tokio")]
+pub struct TokioUnbound<T>(T);
+
+#[cfg(feature = "tokio")]
+impl<T> TokioUnbound<T> {
+    /// Wrap a raw recv socket, deferring readiness registration until [`bind_on_worker`] runs on the
+    /// worker.
+    ///
+    /// [`bind_on_worker`]: BindOnWorker::bind_on_worker
+    #[inline]
+    pub fn new(inner: T) -> Self {
+        Self(inner)
+    }
+}
+
+#[cfg(feature = "tokio")]
+impl<T: udp::Socket> crate::socket::LocalAddr for TokioUnbound<T> {
+    #[inline]
+    fn local_addr(&self) -> io::Result<std::net::SocketAddr> {
+        self.0.local_addr()
+    }
+}
+
+#[cfg(feature = "tokio")]
+impl<T> BindOnWorker for TokioUnbound<T>
+where
+    T: udp::Socket + std::os::fd::AsRawFd,
+{
+    type Bound = Tokio<T>;
+
+    #[inline]
+    fn raw_fd(&self) -> Option<std::os::fd::RawFd> {
+        Some(std::os::fd::AsRawFd::as_raw_fd(&self.0))
+    }
+
+    #[inline]
+    fn bind_on_worker(self) -> io::Result<Self::Bound> {
+        Tokio::new(self.0)
     }
 }
