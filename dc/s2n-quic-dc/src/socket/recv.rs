@@ -11,7 +11,7 @@ mod bach;
 #[cfg(target_os = "linux")]
 pub mod uring;
 
-pub use socket::Socket;
+pub use socket::{BindOnWorker, Socket};
 
 #[cfg(feature = "tokio")]
-pub use socket::Tokio;
+pub use socket::{Tokio, TokioUnbound};

@@ -80,7 +80,9 @@ fn finish<R, Rcv>(
 ) -> io::Result<Arc<endpoint::Endpoint>>
 where
     R: runtime::Runtime,
-    Rcv: s2n_quic_dc::socket::recv::Socket,
+    // Recv sockets are carried unbound and bound to their worker's runtime at spawn (tokio registers
+    // its readiness `AsyncFd` on the worker's own reactor); see `s2n_quic_dc::socket::recv::BindOnWorker`.
+    Rcv: s2n_quic_dc::socket::recv::BindOnWorker + Send + 'static,
 {
     // The recv socket addresses are what peers should target with DC data packets.
     let data_addrs: Vec<SocketAddr> = recv_sockets

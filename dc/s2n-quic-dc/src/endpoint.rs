@@ -287,7 +287,7 @@ fn try_spawn_recv_ring<S, Router>(
     rings: &mut Vec<RecvRingHandle>,
 ) -> Result<(), (S, Router)>
 where
-    S: crate::socket::recv::Socket,
+    S: crate::socket::recv::BindOnWorker + Send + 'static,
     Router: crate::socket::recv::router::Router + Send + 'static,
 {
     use crate::socket::recv::uring;
@@ -334,7 +334,7 @@ fn try_spawn_recv_ring<S, Router>(
     _rings: &mut Vec<RecvRingHandle>,
 ) -> Result<(), (S, Router)>
 where
-    S: crate::socket::recv::Socket,
+    S: crate::socket::recv::BindOnWorker + Send + 'static,
     Router: crate::socket::recv::router::Router + Send + 'static,
 {
     Err((socket, router))
@@ -435,7 +435,7 @@ pub fn setup_endpoint<SendSocket, RecvSocket, UpsSocket, R>(
 ) -> Endpoint
 where
     SendSocket: crate::socket::send::Socket + Send + 'static,
-    RecvSocket: crate::socket::recv::Socket + Send + 'static,
+    RecvSocket: crate::socket::recv::BindOnWorker + Send + 'static,
     UpsSocket: crate::socket::send::Socket + Send + 'static,
     R: crate::runtime::Runtime,
 {
@@ -460,28 +460,18 @@ where
         })
         .collect();
 
+    // Recv sockets stay UNWRAPPED and unbound here (see `crate::socket::recv::BindOnWorker`). They
+    // are carried to the worker that will poll them and only there — on the worker, so tokio's
+    // readiness `AsyncFd` registers with the worker's own reactor rather than the setup runtime's —
+    // are they bound and wrapped (CachedAddr/Tracing/Metered) at the recv-task spawn site in
+    // `Worker::spawn`. Runtimes that need no readiness registration (busy-poll, bach) bind as identity.
     let recv_sockets: IdMap<_, _> = id::LocalRecvSocketId::range(recv_sockets.len())
         .zip(recv_sockets)
-        .map(|(key, socket)| {
-            let local_addr = socket
-                .local_addr()
-                .expect("recv socket must have a local address");
-            let socket = crate::socket::cached_addr::CachedAddr::new(socket, local_addr);
-            let socket = crate::socket::tracing::Tracing::new(socket, key);
-            let socket = socket::Metered::new(
-                socket,
-                counter_registry.register_nominal("socket.rx.ops", format_args!("recv.{key}")),
-                counter_registry.register_nominal("socket.rx.bytes", format_args!("recv.{key}")),
-                counter_registry.register_nominal("!socket.rx.errors", format_args!("recv.{key}")),
-            );
-            (key, socket)
-        })
         .collect();
 
     debug!(
         ?config.layout,
         ?send_sockets,
-        ?recv_sockets,
         "setting up endpoint"
     );
 
@@ -516,7 +506,7 @@ fn setup_endpoint_inner<SendSocket, RecvSocket, UpsSocket, R, RecvRoute>(
 ) -> Endpoint
 where
     SendSocket: crate::socket::send::Socket + Send + 'static,
-    RecvSocket: crate::socket::recv::Socket + Send + 'static,
+    RecvSocket: crate::socket::recv::BindOnWorker + Send + 'static,
     UpsSocket: crate::socket::send::Socket + Send + 'static,
     R: crate::runtime::Runtime,
     RecvRoute: routing::SenderRoute,
@@ -1191,7 +1181,7 @@ impl<SendSocket, RecvSocket, UpsSocket, Clk, AckSnd, Route, Inv>
     Worker<SendSocket, RecvSocket, UpsSocket, Clk, AckSnd, Route, Inv>
 where
     SendSocket: crate::socket::send::Socket + Send + 'static,
-    RecvSocket: crate::socket::recv::Socket + Send + 'static,
+    RecvSocket: crate::socket::recv::BindOnWorker + Send + 'static,
     UpsSocket: crate::socket::send::Socket + Send + 'static,
     Clk: time::Clock + precision::Clock + Clone + Send + 'static,
     AckSnd: UnboundedSender<Entry<msg::Sender>> + Clone + Send + 'static,
@@ -1360,7 +1350,28 @@ where
                     .as_ref()
                     .expect("recv socket workers should have a recycle pool")
                     .handle();
-                let rx = tasks::socket_recv(rs.socket, rs.recv_pool, recycle, rs.router);
+                // Bind the recv socket to THIS worker's runtime (tokio registers its readiness
+                // `AsyncFd` with the worker's own reactor here; other runtimes bind as identity), then
+                // apply the socket instrumentation stack. Both happen on the worker so the readiness
+                // registration is same-runtime — see `crate::socket::recv::BindOnWorker`.
+                let socket = rs
+                    .socket
+                    .bind_on_worker()
+                    .expect("bind recv socket to worker runtime");
+                let local_addr = crate::socket::LocalAddr::local_addr(&socket)
+                    .expect("recv socket must have a local address");
+                let socket = crate::socket::cached_addr::CachedAddr::new(socket, local_addr);
+                let socket = crate::socket::tracing::Tracing::new(socket, recv_idx);
+                let socket = socket::Metered::new(
+                    socket,
+                    counter_registry
+                        .register_nominal("socket.rx.ops", format_args!("recv.{recv_idx}")),
+                    counter_registry
+                        .register_nominal("socket.rx.bytes", format_args!("recv.{recv_idx}")),
+                    counter_registry
+                        .register_nominal("!socket.rx.errors", format_args!("recv.{recv_idx}")),
+                );
+                let rx = tasks::socket_recv(socket, rs.recv_pool, recycle, rs.router);
                 let task_counter = counter_registry
                     .register_nominal_task("task.socket_recv", &variant)
                     .with_registration_metadata(

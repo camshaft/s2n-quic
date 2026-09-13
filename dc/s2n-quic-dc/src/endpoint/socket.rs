@@ -154,9 +154,11 @@ impl Config {
         Ok((send_sockets, recv_sockets))
     }
 
-    /// Send/recv socket pair for the tokio runtime: recv sockets register readiness with the tokio
-    /// reactor (see [`crate::socket::recv::socket::Tokio`]) so the recv worker parks on the reactor
-    /// instead of relying on the busy-poll spin. Send sockets keep the busy-poll shape — the send
+    /// Send/recv socket pair for the tokio runtime. Recv sockets are returned *unbound*
+    /// ([`TokioUnbound`](crate::socket::recv::TokioUnbound)): the endpoint binds each to its worker's
+    /// runtime at task-spawn time (via [`BindOnWorker`](crate::socket::recv::BindOnWorker)), so the
+    /// readiness `AsyncFd` registers with the worker's own reactor and recv wakes are same-runtime
+    /// rather than crossing from the setup runtime. Send sockets keep the busy-poll shape — the send
     /// path does not gate connection setup, so send-side readiness is a separate follow-up.
     #[cfg(feature = "tokio")]
     #[allow(clippy::type_complexity)]
@@ -164,7 +166,7 @@ impl Config {
         &self,
     ) -> io::Result<(
         Vec<GsoSocket<BusyPoll<std::net::UdpSocket>>>,
-        Vec<crate::socket::recv::Tokio<std::net::UdpSocket>>,
+        Vec<crate::socket::recv::TokioUnbound<std::net::UdpSocket>>,
     )> {
         let (send_sockets, recv_sockets) = self.create()?;
         let send_sockets = send_sockets
@@ -173,8 +175,8 @@ impl Config {
             .collect();
         let recv_sockets = recv_sockets
             .into_iter()
-            .map(crate::socket::recv::Tokio::new)
-            .collect::<io::Result<Vec<_>>>()?;
+            .map(crate::socket::recv::TokioUnbound::new)
+            .collect();
         Ok((send_sockets, recv_sockets))
     }
 }
