@@ -136,12 +136,18 @@ fn main() -> std::io::Result<()> {
             spawn_frame_trace_dumper(secs);
         }
 
-        let spawner = busy_poll::create_pool(busy_poll_workers);
+        // The tokio runtime parks on the reactor, so it does not need (and must not spawn) the
+        // busy-poll worker pool — skipping it is what actually frees the CPU in tokio mode.
+        let pool = if config.endpoint.use_tokio() {
+            None
+        } else {
+            Some(busy_poll::create_pool(busy_poll_workers))
+        };
         let data_bind: SocketAddr = "[::]:0".parse().unwrap();
         let endpoint = endpoint::create(
             &config.endpoint,
             data_bind,
-            &spawner,
+            pool.as_ref(),
             cli.print_pipeline_dot,
         )?;
 
