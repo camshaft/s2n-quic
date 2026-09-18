@@ -186,6 +186,7 @@ where
         if !guard.queue.is_empty() {
             let batch = core::mem::take(&mut guard.queue);
             budget.consume();
+            crate::busy_poll::note_work();
             return Poll::Ready(Some(batch));
         }
 
@@ -390,6 +391,7 @@ impl<T> super::super::Receiver<intrusive::Entry<T>> for Receiver<T> {
 
         if let Some(entry) = guard.queue.pop_front() {
             budget.consume();
+            crate::busy_poll::note_work();
             return Poll::Ready(Some(entry));
         }
 
@@ -427,6 +429,7 @@ impl<T> super::super::Receiver<intrusive::Queue<T>> for Receiver<T> {
             // Drain all available entries into a batch
             let batch = core::mem::take(&mut guard.queue);
             budget.consume();
+            crate::busy_poll::note_work();
             return Poll::Ready(Some(batch));
         }
 
