@@ -356,6 +356,7 @@ fn setup_recv() -> (
     let registry = crate::counter::Registry::default();
     let clock = Clock::default();
     let recv_cache = Rc::new(RefCell::new(recv::Cache::new(
+        &crate::counter::Registry::default(),
         crate::endpoint::id::RecvDispatchWorkerId::new(0),
     )));
 
