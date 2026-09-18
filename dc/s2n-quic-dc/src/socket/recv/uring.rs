@@ -296,6 +296,19 @@ fn build_eventfd_poll(efd: RawFd) -> squeue::Entry {
         .user_data(EVENTFD_TOKEN)
 }
 
+/// Whether the RX ring drain should software-prefetch the NEXT completion's payload head while
+/// decoding+decrypting the current packet. Off by default (drain is byte-identical); enable with
+/// `DCQUIC_RX_PREFETCH=1` (also `true`/`on`/`yes`). A/B knob for the high-PPS memory-latency
+/// hypothesis; the prefetch is a hint (no correctness effect), read once and cached.
+fn rx_prefetch_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("DCQUIC_RX_PREFETCH")
+            .map(|v| matches!(v.as_str(), "1" | "true" | "on" | "yes"))
+            .unwrap_or(false)
+    })
+}
+
 /// The recv ring thread. Takes the already-created ring + registered buffer ring (built fallibly in
 /// [`spawn`] before this thread starts, so registration failures fall back cleanly), owns the socket
 /// fd and the bid→descriptor map, keeps the ring full of provided buffers, reaps recv completions into
@@ -351,6 +364,9 @@ fn ring_loop<R: Router>(
     // Scratch list of bids freed this reap pass, replenished after routing.
     let mut to_replenish: Vec<u16> = Vec::with_capacity(depth as usize);
 
+    // Read the RX-prefetch A/B toggle once for this ring thread (off => the drain is byte-identical).
+    let prefetch = rx_prefetch_enabled();
+
     loop {
         if shutdown.closed.load(Ordering::Acquire) {
             break;
@@ -380,7 +396,12 @@ fn ring_loop<R: Router>(
         {
             let mut cq = ring.completion();
             cq.sync();
-            for cqe in &mut cq {
+            // Peekable so we can look one completion ahead for the RX-prefetch hint. When `prefetch`
+            // is false the peek is never taken, so the drain yields the same completions in the same
+            // order as the plain iterator (peekable's internal one-ahead buffering is unobservable —
+            // `Entry` is `Copy`).
+            let mut cq_iter = (&mut cq).into_iter().peekable();
+            while let Some(cqe) = cq_iter.next() {
                 let token = cqe.user_data();
                 if token == EVENTFD_TOKEN {
                     saw_eventfd = true;
@@ -416,6 +437,33 @@ fn ring_loop<R: Router>(
                     drop(unfilled);
                     to_replenish.push(bid);
                     continue;
+                }
+
+                // Software-prefetch the NEXT completion's payload head while we decode+decrypt this
+                // one, cutting demand-load misses on the decrypt path at high PPS. Hint only, no
+                // correctness effect; off by default. Peek — do NOT consume — the next CQE, and only
+                // touch a still-parked descriptor.
+                if prefetch {
+                    if let Some(next) = cq_iter.peek() {
+                        if next.user_data() == RECV_USER_DATA {
+                            if let Some(next_bid) = cqueue::buffer_select(next.flags()) {
+                                if let Some(Some(next_unfilled)) = bid_map.get(next_bid as usize) {
+                                    if let Some(next_ptr) = next_unfilled.payload_ptr() {
+                                        #[cfg(target_arch = "x86_64")]
+                                        // SAFETY: `_mm_prefetch` is a pure hint — any address is safe,
+                                        // a faulting prefetch is silently dropped by hardware.
+                                        unsafe {
+                                            use core::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+                                            _mm_prefetch::<_MM_HINT_T0>(next_ptr as *const i8);
+                                            _mm_prefetch::<_MM_HINT_T0>(next_ptr.add(64) as *const i8);
+                                        }
+                                        #[cfg(not(target_arch = "x86_64"))]
+                                        let _ = next_ptr;
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
 
                 // Successful completion: the kernel wrote `[recvmsg_out | name | control | payload]`
