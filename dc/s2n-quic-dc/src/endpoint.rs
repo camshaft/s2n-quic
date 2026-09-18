@@ -163,6 +163,16 @@ pub struct Budgets {
     /// `!credit.<dir>.distributor.budget_exhausted` increments. Two distributors run
     /// (one per direction); they each get this budget independently.
     pub credit_distributor: usize,
+    /// Busy-poll scheduling priority for the recv-dispatch worker's `ack_completion` task
+    /// (lower = higher priority; `None` = parity with `packet_dispatch`). Giving `ack_completion`
+    /// priority over the heavy co-located `packet_dispatch` bounds ACK latency when the dispatch
+    /// queue spikes, cutting the p99 tail under high concurrency. Honored only by the busy-poll
+    /// executor (inert on tokio/bach).
+    pub ack_completion_priority: Option<u8>,
+    /// Busy-poll scheduling priority for the send worker's tx/pto timer-wheel drain tasks
+    /// (lower = higher priority; `None` = default). Prioritizing the wheel drains keeps send pacing
+    /// and tail-loss probes firing on time under load. Honored only by the busy-poll executor.
+    pub wheel_drain_priority: Option<u8>,
 }
 
 impl Default for Budgets {
@@ -185,6 +195,11 @@ impl Default for Budgets {
             ack_completion: tasks::DEFAULT_DISPATCH_BUDGET,
             invalidation: 1,
             credit_distributor: 256,
+            // Adopt the measured p99-tail win by default: prioritize ack_completion + the tx/pto
+            // wheel drains over bulk dispatch on the busy-poll executor (−30% p99 at 64 KiB / c64,
+            // +2.8% throughput, p50 flat; inert on tokio/bach). Set to `None` to opt out.
+            ack_completion_priority: Some(0),
+            wheel_drain_priority: Some(0),
         }
     }
 }
@@ -1515,10 +1530,14 @@ where
                         "Finalizes ACK send completions and retries stale acknowledgements",
                         "endpoint::Worker::spawn",
                     );
-                local.spawn_receiver_task(
+                // Give the latency-critical ack_completion task scheduling priority over the heavy
+                // co-located packet_dispatch on this worker (config: budgets.ack_completion_priority),
+                // bounding ACK latency when the dispatch queue spikes.
+                local.spawn_receiver_task_with_priority(
                     rx.drain_budgeted_metered(Some(budgets.ack_completion), task_counter.clone()),
                     Some(budgets.ack_completion),
                     task_counter,
+                    budgets.ack_completion_priority,
                 );
 
                 let rx = tasks::recv_invalidation(rd.invalidation_rx, recv_cache);

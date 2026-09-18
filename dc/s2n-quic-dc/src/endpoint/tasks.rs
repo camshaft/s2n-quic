@@ -547,7 +547,14 @@ pub fn send_worker<Socket, Clk, WakerSink, AckComp>(
             budgets.tx_wheel,
             task_counter.clone(),
         );
-        spawner.spawn_receiver_task(tx_wheel_task, Some(budgets.tx_wheel), task_counter);
+        // Prioritize the tx timer-wheel drain so send pacing fires on time under load
+        // (config: budgets.wheel_drain_priority; inert on tokio/bach).
+        spawner.spawn_receiver_task_with_priority(
+            tx_wheel_task,
+            Some(budgets.tx_wheel),
+            task_counter,
+            budgets.wheel_drain_priority,
+        );
     }
 
     {
@@ -594,10 +601,13 @@ pub fn send_worker<Socket, Clk, WakerSink, AckComp>(
                 "Handles probe-timeout expirations and wheel re-scheduling",
                 "endpoint::tasks::send_worker",
             );
-        spawner.spawn_receiver_task(
+        // Prioritize the PTO timer-wheel drain so tail-loss probes fire on time under load
+        // (config: budgets.wheel_drain_priority; inert on tokio/bach).
+        spawner.spawn_receiver_task_with_priority(
             rx.drain_budgeted_metered(Some(budgets.pto_wheel), task_counter.clone()),
             Some(budgets.pto_wheel),
             task_counter,
+            budgets.wheel_drain_priority,
         );
     }
 
