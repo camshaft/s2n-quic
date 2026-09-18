@@ -930,6 +930,21 @@ where
             &counter_registry,
         );
 
+        // Give the socket a chance to be its own packet source first (e.g. an AF_XDP `xsk` socket that
+        // batch-drains its own RX ring on a dedicated thread — implemented downstream). On `Ok(())` the
+        // source owns the socket + router and we're done; otherwise both are handed back and we fall
+        // through to the io_uring / cooperative recv path. The default `spawn_source` impl is a no-op
+        // (`Err`), so this is inert until a socket type overrides it.
+        let (socket, router) = match socket.spawn_source(
+            recv_socket_id.as_usize(),
+            recv_pool.clone(),
+            crate::socket::pool::SyncReuseRing::new(),
+            router,
+        ) {
+            Ok(()) => continue,
+            Err((socket, router)) => (socket, router),
+        };
+
         // Try io_uring first when enabled. On success the ring thread owns both socket and router; on
         // failure (uring disabled, no fd, or setup error) both are handed back so the syscall path can
         // use them — the router is built exactly once either way.
