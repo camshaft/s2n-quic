@@ -286,6 +286,7 @@ fn try_spawn_recv_ring<S, Router>(
     recv_pool: crate::socket::pool::Pool,
     router: Router,
     rings: &mut Vec<RecvRingHandle>,
+    counters: &crate::counter::Registry,
 ) -> Result<(), (S, Router)>
 where
     S: crate::socket::recv::Socket,
@@ -300,6 +301,7 @@ where
         recv_pool,
         reuse,
         router,
+        counters,
     ) {
         Ok(ring) => {
             rings.push(ring);
@@ -333,6 +335,7 @@ fn try_spawn_recv_ring<S, Router>(
     _recv_pool: crate::socket::pool::Pool,
     router: Router,
     _rings: &mut Vec<RecvRingHandle>,
+    _counters: &crate::counter::Registry,
 ) -> Result<(), (S, Router)>
 where
     S: crate::socket::recv::Socket,
@@ -957,6 +960,7 @@ where
                 recv_pool.clone(),
                 router,
                 &mut recv_rings,
+                &counter_registry,
             ) {
                 Ok(()) => continue,
                 Err((socket, router)) => (socket, router),
