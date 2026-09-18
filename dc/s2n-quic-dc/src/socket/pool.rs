@@ -266,18 +266,41 @@ impl SyncReuseRing {
         }
     }
 
-    /// Drains any recycled descriptors, then returns a reused descriptor or a freshly allocated one
-    /// (with this ring's recycler attached). Returns `None` only when the packet allocator is
-    /// exhausted — the recv backpressure signal.
+    /// Drain descriptors recycled by dispatch workers into the thread-local free list — a single
+    /// cross-core mutex acquire on the recycle channel.
+    ///
+    /// Hoist this out of a per-bid replenish loop and call it ONCE per pass, then serve each freed bid
+    /// with [`take_one`](Self::take_one): a batch that replenishes N bids then costs one recycle-channel
+    /// lock (one cross-core line transfer) instead of N. Descriptors recycled after this pass's drain
+    /// are simply picked up by the next pass's drain (no ordering requirement, nothing lost).
     #[inline]
-    pub fn alloc_or_reuse(&mut self, pool: &Pool) -> Option<Unfilled<SyncRecycler>> {
+    pub fn drain(&mut self) {
         self.recycle_rx.drain_into(&mut self.local_pool);
+    }
+
+    /// Return one descriptor WITHOUT touching the recycle channel: pop from the thread-local free list
+    /// (populated by [`drain`](Self::drain)), falling back to a fresh allocation with this ring's
+    /// recycler attached. Returns `None` only when the packet allocator is exhausted — the recv
+    /// backpressure signal (the caller leaves the bid empty for a later pass).
+    #[inline]
+    pub fn take_one(&mut self, pool: &Pool) -> Option<Unfilled<SyncRecycler>> {
         if let Some(recycled) = self.local_pool.pop_back() {
             return Some(Unfilled::<SyncRecycler>::from_recycled(
                 recycled.into_descriptor(),
             ));
         }
         pool.alloc_with_recycler(&self.recycle_weak)
+    }
+
+    /// Drains any recycled descriptors, then returns a reused descriptor or a freshly allocated one
+    /// (with this ring's recycler attached). Returns `None` only when the packet allocator is
+    /// exhausted — the recv backpressure signal. Equivalent to [`drain`](Self::drain) followed by
+    /// [`take_one`](Self::take_one); retained for single-shot callers that allocate one descriptor per
+    /// call, where draining once per allocation is already the right cadence.
+    #[inline]
+    pub fn alloc_or_reuse(&mut self, pool: &Pool) -> Option<Unfilled<SyncRecycler>> {
+        self.drain();
+        self.take_one(pool)
     }
 }
 
@@ -297,6 +320,48 @@ mod tests {
         collections::VecDeque,
         net::{Ipv4Addr, SocketAddr},
     };
+
+    /// Metric #1 for the recycle-drain-per-batch change: a single [`SyncReuseRing::drain`] captures a
+    /// whole batch of recycled descriptors, and each subsequent [`SyncReuseRing::take_one`] serves a
+    /// bid from the thread-local free list WITHOUT touching the cross-core recycle channel again — i.e.
+    /// one recycle-channel lock per replenish pass, not one per bid.
+    ///
+    /// Proven by address identity: descriptors recycle into the ring's channel (not the pool
+    /// allocator), so a `take_one` that returns a recycled region's address must have come from the
+    /// local free list the one drain populated — a fresh `pool` allocation would have a new address.
+    #[test]
+    fn one_drain_serves_a_replenish_batch_from_the_local_free_list() {
+        let pool = Pool::new(u16::MAX);
+        let mut ring = SyncReuseRing::new();
+
+        // Allocate a batch through the ring (fresh — the recycle channel starts empty), record each
+        // descriptor's stable region address, then drop them so they recycle into the ring's channel.
+        let n = 8usize;
+        let mut recycled_addrs = std::collections::HashSet::new();
+        {
+            let mut held = Vec::with_capacity(n);
+            for _ in 0..n {
+                let u = ring.alloc_or_reuse(&pool).expect("initial alloc");
+                recycled_addrs.insert(u.recv_prefix_region().0 as usize);
+                held.push(u);
+            }
+            // `held` drops here → all `n` descriptors recycle into the ring's recycle channel.
+        }
+
+        // ONE drain must capture the whole recycled batch; then each `take_one` serves from the local
+        // free list, never re-draining and never allocating fresh.
+        ring.drain();
+        let mut served = Vec::with_capacity(n);
+        for _ in 0..n {
+            let u = ring.take_one(&pool).expect("a reused descriptor");
+            assert!(
+                recycled_addrs.contains(&(u.recv_prefix_region().0 as usize)),
+                "take_one after a single drain must reuse a recycled descriptor — proving the one \
+                 drain captured the whole batch, not a per-bid drain"
+            );
+            served.push(u);
+        }
+    }
 
     #[derive(TypeGenerator, Debug)]
     enum Op {
