@@ -1306,19 +1306,28 @@ where
             return Poll::Ready(None);
         }
 
-        // Get next segment
-        let segment = ready!(self.inner.poll_recv(cx, budget));
-
-        match segment {
-            Some(segment) => {
-                let bytes = segment.len() as u64;
-                self.router.on_segment(segment);
-                // Notify upstream that we consumed this segment
-                self.inner.on_consumed(bytes);
-                Poll::Ready(Some(()))
+        // Get next segment. On `Pending` (burst drained / budget exhausted) or `None` (closed) the
+        // router must flush any work it staged this cycle before we park — otherwise a batching router
+        // would strand staged packets in its per-worker queues with no wake, since this cooperative
+        // path has no separate batch boundary. Flushing on every park keeps latency identical to the
+        // eager path; the coalescing win still applies whenever a burst delivered several segments.
+        let segment = match self.inner.poll_recv(cx, budget) {
+            Poll::Ready(Some(segment)) => segment,
+            Poll::Ready(None) => {
+                self.router.on_batch_complete();
+                return Poll::Ready(None);
             }
-            None => Poll::Ready(None),
-        }
+            Poll::Pending => {
+                self.router.on_batch_complete();
+                return Poll::Pending;
+            }
+        };
+
+        let bytes = segment.len() as u64;
+        self.router.on_segment(segment);
+        // Notify upstream that we consumed this segment
+        self.inner.on_consumed(bytes);
+        Poll::Ready(Some(()))
     }
 
     fn on_consumed(&mut self, _bytes: u64) {}

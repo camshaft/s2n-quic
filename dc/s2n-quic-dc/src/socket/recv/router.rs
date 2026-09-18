@@ -44,6 +44,16 @@ pub trait Router {
         16
     }
 
+    /// Signals the end of a receive-completion batch.
+    ///
+    /// A packet source (e.g. the io_uring ring thread) drains a whole batch of completions before
+    /// blocking again; the cooperative syscall path drains a burst of ready segments before parking.
+    /// Routers that stage per-destination work during [`on_segment`] flush it here — one locked splice
+    /// + one wake per destination per batch instead of one per packet. The default is a no-op, so a
+    /// router that dispatches eagerly per segment is unaffected.
+    #[inline]
+    fn on_batch_complete(&mut self) {}
+
     #[inline]
     fn on_segment(&mut self, mut segment: descriptor::Filled) {
         let remote_address = segment.remote_address().get();
