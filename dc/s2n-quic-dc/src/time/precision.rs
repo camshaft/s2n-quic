@@ -8,12 +8,28 @@ pub trait Clock: s2n_quic_core::time::Clock + Send + Sync + 'static {
 
     fn now(&self) -> Timestamp;
 
+    /// A coarse "now" for callers that poll on a fixed cadence and explicitly accept a possibly
+    /// stale reading (e.g. busy-poll timer-expiry checks, which are already sweep-granular).
+    ///
+    /// The default is a genuine fresh [`now`](Self::now) read — implementations that maintain a
+    /// cheaper cached clock override this. Callers that need an exact current time must use
+    /// [`now`](Self::now); this exists so a fresh-read caller never silently gets a stale value.
+    fn coarse_now(&self) -> Timestamp {
+        self.now()
+    }
+
     /// Creates a new timer from this clock.
     fn timer(&self) -> Self::Timer;
 }
 
 pub trait Timer: Send + 'static {
     fn now(&self) -> Timestamp;
+
+    /// Coarse counterpart to [`now`](Self::now); see [`Clock::coarse_now`]. Defaults to a fresh read.
+    fn coarse_now(&self) -> Timestamp {
+        self.now()
+    }
+
     fn sleep_until(&mut self, target: Timestamp) -> impl core::future::Future<Output = ()> + Send;
 
     /// Poll to see if the timer has expired.
