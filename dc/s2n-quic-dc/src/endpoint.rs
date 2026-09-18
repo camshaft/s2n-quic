@@ -278,6 +278,17 @@ type RecvRingHandle = core::convert::Infallible;
 /// `Err((socket, router))` — handing both back — when the socket has no real fd or the ring could not
 /// be created, so the caller falls back to the syscall recv path. Linux-only; the non-Linux build
 /// never calls this (`use_uring` is always false there).
+/// Optional recv-ring NAPI busy-poll budget in microseconds, opt-in via the
+/// `S2N_DC_RECV_NAPI_BUSY_POLL_US` env var for latency-priority deployments. Unset / unparseable / 0
+/// means OFF (the default blocking `submit_and_wait`). See [`uring::ring_loop`](crate::socket::recv::uring).
+#[cfg(target_os = "linux")]
+fn recv_napi_busy_poll_us() -> Option<u32> {
+    std::env::var("S2N_DC_RECV_NAPI_BUSY_POLL_US")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .filter(|&v| v > 0)
+}
+
 #[cfg(target_os = "linux")]
 fn try_spawn_recv_ring<S, Router>(
     idx: usize,
@@ -292,6 +303,10 @@ where
 {
     use crate::socket::recv::uring;
     let reuse = crate::socket::pool::SyncReuseRing::new();
+    // Latency-priority opt-in: S2N_DC_RECV_NAPI_BUSY_POLL_US=<micros> enables io_uring NAPI busy-poll on
+    // the recv ring (see uring::ring_loop). Unset = OFF (the default blocking wait); env-gated to match
+    // the repo's DCQUIC_* A/B-knob convention and keep the idle-CPU cost a deliberate per-deployment choice.
+    let napi_busy_poll_us = recv_napi_busy_poll_us();
     match uring::spawn(
         idx,
         socket,
@@ -299,6 +314,7 @@ where
         recv_pool,
         reuse,
         router,
+        napi_busy_poll_us,
     ) {
         Ok(ring) => {
             rings.push(ring);
