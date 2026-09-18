@@ -39,7 +39,8 @@ busy-poll datapath is not CPU-bound in the way the profile suggested (it spins a
   wheels *before* packet dispatch on the recv-dispatch worker.
 - **Measured delta:** 64 KiB objects at concurrency 64, 3 reps: **p99 1698 µs → 1190 µs (−30%)**,
   throughput **+2.8%** (no regression), p50 flat. A per-poll dispatch-budget follow-on is in progress.
-- **Status:** a standalone patch against this repo is being prepared (currently draft, pending review).
+- **Status:** PR #578 (draft, base `main`, pending review). Default-off; the measured delta above was
+  taken on an integration rig and the mechanism is ported here behavior-equivalently.
 
 ---
 
@@ -107,7 +108,7 @@ All transport PRs on this fork are **draft**, pending review; none are self-merg
 
 | PR | Change | Status |
 |----|--------|--------|
-| _pending_ | ACK/timer-wheel priority (§1.1) | **measured win**; draft PR to open |
+| #578 | ACK/timer-wheel priority (§1.1) | **measured win**; draft |
 | #535 | Per-sweep clock cache (§2) | falsified (CPU-only); landed as cleanup |
 | #560 | Lock-free channel has-items (§2) | falsified (null/regression); closed |
 | #568 | Busy-poll backoff (§2) | falsified; kept as documented negative |
