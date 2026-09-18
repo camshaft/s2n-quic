@@ -85,6 +85,34 @@ pub trait BindOnWorker: crate::socket::LocalAddr {
     /// Bind to the current (worker) runtime and return the readiness-driven recv socket. Called once,
     /// at task spawn, on the worker thread.
     fn bind_on_worker(self) -> io::Result<Self::Bound>;
+
+    /// If this (unbound) socket is backed by its own packet *source* — an external datapath that
+    /// batch-drains its own RX ring and routes on a dedicated thread (e.g. an AF_XDP `xsk` socket,
+    /// implemented downstream) — spawn that source here and return `Ok(())`; the endpoint then does
+    /// NOT drive the socket via the io_uring or cooperative `bind_on_worker` + `poll_recv` paths. The
+    /// source takes over routing into the dc pipeline via `router` (moved in) and uses `recv_pool` /
+    /// `reuse` for descriptor allocation — exactly like the io_uring recv ring, but for sockets that
+    /// have no OS fd for io_uring to drive.
+    ///
+    /// This runs in the endpoint recv-socket distribution loop (on the *unbound* socket, alongside the
+    /// io_uring `raw_fd` adoption), so a source datapath is a peer of the io_uring and cooperative
+    /// backends rather than something the bound `Socket` needs to know about. The default returns
+    /// `Err((self, router))` — not a source — so the caller proceeds with the standard recv path
+    /// (`recv_pool` / `reuse` are dropped).
+    #[inline]
+    fn spawn_source<R>(
+        self,
+        _idx: usize,
+        _recv_pool: crate::socket::pool::Pool,
+        _reuse: crate::socket::pool::SyncReuseRing,
+        router: R,
+    ) -> Result<(), (Self, R)>
+    where
+        Self: Sized,
+        R: crate::socket::recv::router::Router + Send + 'static,
+    {
+        Err((self, router))
+    }
 }
 
 /// Identity binding for recv sockets that need no per-runtime readiness registration (busy-poll, the
