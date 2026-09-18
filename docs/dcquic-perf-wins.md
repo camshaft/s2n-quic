@@ -22,8 +22,8 @@ Each patch carries a measurement status:
   hypothesis. Recorded honestly; retained default-off (harmless) or as a documented negative so the same
   idea is not re-attempted blind.
 
-Most levers were validated for *correctness* here; the integrated-service throughput/latency A/Bs run on
-a dedicated benchmark rig, so several deltas are marked pending until that rig run lands.
+Statuses reflect the latest rig outcome, not the original hypothesis: a lever that was later measured
+NULL on the integrated rig is moved to the REFUTED section even if the mechanism is sound.
 
 ---
 
@@ -51,22 +51,7 @@ a dedicated benchmark rig, so several deltas are marked pending until that rig r
 These are implemented, build clean, and pass the suite (plus the in-process structural checks noted).
 The end-to-end perf number is pending a rig A/B and is not claimed as a win until measured.
 
-### 2.1 Lock-free "has-items" fast path on channel `poll_recv`
-
-- **Hypothesis:** at 64 KiB / c32 the integrated flamegraph shows channel `poll_recv` at ~23% self —
-  the busy-poll loop takes and releases the channel `Mutex` on *every* poll, and most polls are on an
-  empty channel, so the empty-poll lock churn is the throughput cap.
-- **Mechanism:** a `has_items: AtomicBool` on the intrusive sync-channel `Shared`. The consumer reads it
-  `Acquire` *before* taking the mutex and returns `Pending` without locking on the common empty
-  busy-poll case; the producer stores `true` `Release` under the lock *before* taking the waker, so no
-  wakeup is lost. Extended to the `Entry<T>` channel.
-- **Delta:** builds + clippy + 17 channel/loom tests green (incl. the concurrent send/recv loom test that
-  guards against lost wakeups). Measured NULL on the bare channel micro-test (network-bound there);
-  the decisive integrated-rig re-profile — `poll_recv` self% drop + 64 KiB throughput/TPS rise — is
-  pending.
-- **PR:** #560 (base `perf-staging`; being retargeted to `main`).
-
-### 2.2 Lock-free per-endpoint waker set
+### 2.1 Lock-free per-endpoint waker set
 
 - **Hypothesis:** the wake/drain-path `Mutex<BitSet>` on the per-endpoint readiness set contributes to
   the c16+ TTFB p99 tail.
@@ -74,9 +59,9 @@ The end-to-end perf number is pending a rig A/B and is not claimed as a win unti
   segments; wake = `fetch_or`, drain = per-word `swap(0)`); a lock remains only on cold registration.
 - **Delta:** correctness + concurrency green (512-thread wake test, no lost wakeups). c16+ TTFB p99-tail
   A/B pending rig. Draft.
-- **PR:** #558 (base `perf-staging`; being retargeted to `main`).
+- **PR:** #558.
 
-### 2.3 Coalesce per-packet RX-dispatch wakes into one splice + wake per worker per batch
+### 2.2 Coalesce per-packet RX-dispatch wakes into one splice + wake per worker per batch
 
 - **Hypothesis:** dispatching each decoded datagram individually takes the destination worker's channel
   lock and wakes it per packet; under a recv-completion batch this is O(packets) locks/wakes.
@@ -84,9 +69,9 @@ The end-to-end perf number is pending a rig A/B and is not claimed as a win unti
   splice each worker channel with one locked append + one wake at end of batch.
 - **Delta:** in-process CONFIRMED — wakes/locks drop O(packets) → O(active-workers) per burst (no-op at
   batch ≈ 1); suite green (906 tests). Throughput + p50/p99 at concurrency pending rig.
-- **PR:** #543 (`camshaft/s2n-quic`; retarget to `main` if not already).
+- **PR:** #543.
 
-### 2.4 Drain the recv recycle channel once per replenish pass
+### 2.3 Drain the recv recycle channel once per replenish pass
 
 - **Hypothesis:** the cross-core recycle channel is locked per freed buffer descriptor during replenish,
   i.e. O(bids) channel locks per pass.
@@ -96,7 +81,7 @@ The end-to-end perf number is pending a rig A/B and is not claimed as a win unti
   descriptor-address identity; suite green. Throughput / cache-traffic at high PPS pending rig.
 - **PR:** #545.
 
-### 2.5 One-entry last-hit front cache on the RX peer-Context lookup
+### 2.4 One-entry last-hit front cache on the RX peer-Context lookup
 
 - **Hypothesis:** the RX per-packet peer-`Context` lookup (FxHash + hashmap probe) is redundant when
   consecutive packets share a peer.
@@ -107,7 +92,7 @@ The end-to-end perf number is pending a rig A/B and is not claimed as a win unti
   Per-packet CPU / throughput at high PPS pending rig.
 - **PR:** #548.
 
-### 2.6 Software-prefetch the next recv-completion payload during current-packet decrypt
+### 2.5 Software-prefetch the next recv-completion payload during current-packet decrypt
 
 - **Hypothesis:** the recv decrypt path stalls on load misses fetching each packet's payload; prefetching
   the next completion's payload during the current decrypt hides the miss.
@@ -117,7 +102,7 @@ The end-to-end perf number is pending a rig A/B and is not claimed as a win unti
   (NULL risk under DDIO; a no-op on aarch64). Default-off.
 - **PR:** #564.
 
-### 2.7 Build the recv io_uring with `SINGLE_ISSUER | DEFER_TASKRUN`
+### 2.6 Build the recv io_uring with `SINGLE_ISSUER | DEFER_TASKRUN`
 
 - **Hypothesis:** deferring completion task-run to the recv thread and asserting a single issuer cuts
   recv wakeup overhead on supported kernels.
@@ -128,7 +113,7 @@ The end-to-end perf number is pending a rig A/B and is not claimed as a win unti
   throughput/p99/wakeup-rate deltas pending rig.
 - **PR:** #544.
 
-### 2.8 Per-sweep clock cache on the busy-poll loop
+### 2.7 Per-sweep clock cache on the busy-poll loop
 
 - **Hypothesis:** the busy-poll loop reads the OS clock per timer poll; caching it once per sweep cuts
   `clock_gettime` off the hot path (the integrated flamegraph shows `clock_gettime` ~10% self at 64 KiB).
@@ -137,9 +122,9 @@ The end-to-end perf number is pending a rig A/B and is not claimed as a win unti
   EDT, sojourn stamps, and timer-expiry reads.
 - **Delta:** implemented (`DCQUIC_CLOCK_CACHE`); an earlier micro-test A/B was NULL (network-bound);
   busy-poll iters/sec + 64 KiB throughput A/B on the integrated rig pending.
-- **PR:** #535 (base `perf-staging`; retarget to `main`).
+- **PR:** #535.
 
-### 2.9 Opt-in io_uring NAPI busy-poll on the recv ring (latency knob)
+### 2.8 Opt-in io_uring NAPI busy-poll on the recv ring (latency knob)
 
 - **Hypothesis:** NIC-IRQ → softirq → wake adds recv latency; polling the socket NAPI queue in
   `submit_and_wait` removes it.
@@ -147,9 +132,9 @@ The end-to-end perf number is pending a rig A/B and is not claimed as a win unti
   default OFF.
 - **Delta:** correctness green (default OFF). p50/p99 latency A/B (c1/c16 × 8k/64k/1MB) pending rig.
   Draft.
-- **PR:** #553 (base `perf-staging`; retarget to `main`).
+- **PR:** #553.
 
-### 2.10 Advertised recv-window override (integrated path)
+### 2.9 Advertised recv-window override (integrated path)
 
 - **Hypothesis:** the integrated server/client advertise the 64 KiB default per-stream recv window and
   never received an earlier window bump, capping TTFB at c16.
@@ -157,9 +142,9 @@ The end-to-end perf number is pending a rig A/B and is not claimed as a win unti
   integrated `Server`+`Client` (`psk/io.rs` `with_bidirectional_remote_data_window`); default unchanged.
 - **Delta:** Step-1 confirmed in source (integrated advertises the 64 KiB default). Step-2 window-sweep
   A/B (64 KiB / c16 TTFB expected ≈ −1 RTT) pending rig.
-- **PR:** #559 (base `perf-staging`; retarget to `main`).
+- **PR:** #559.
 
-### 2.11 CCA-bypass experiment knob (cap localization)
+### 2.10 CCA-bypass experiment knob (cap localization)
 
 - **Hypothesis:** to *locate* the 64 KiB throughput cap, bypass the congestion controller so the transport
   is never cwnd/pacing-limited and observe the residual ceiling.
@@ -168,7 +153,7 @@ The end-to-end perf number is pending a rig A/B and is not claimed as a win unti
   shipping default.
 - **Delta:** correctness green (default OFF). 64 KiB (+1 MiB) throughput-toward-line-rate A/B pending
   rig. Draft.
-- **PR:** #554 (base `perf-staging`; retarget to `main`).
+- **PR:** #554.
 
 ---
 
@@ -192,6 +177,15 @@ Measurement-only, no behavior change; each unblocks the A/B for a companion leve
 Recorded honestly so the ideas are not re-attempted blind. Retained default-off or as a documented
 negative.
 
+- **Lock-free "has-items" fast path on channel `poll_recv`** — a `has_items: AtomicBool` on the intrusive
+  sync-channel `Shared`, read `Acquire` before locking so the consumer returns `Pending` without the
+  `Mutex` on an empty channel (the flamegraph showed `poll_recv` at ~23% self at 64 KiB / c32).
+  **REFUTED:** integrated-rig A/B (64 KiB, c16 + c64, incl. a `DCQUIC_BATCH_WAIT_US` sweep) measured a
+  comprehensive NULL / small regression (−1.5% TPS at c64, worse p50 at c16). Root cause: at 64 KiB load
+  the channels are rarely empty, so the empty-skip fast path almost never fires and the added per-poll
+  atomic load is net-negative; the ~23% `poll_recv` self is intrinsic dequeue/channel-hop work, not
+  empty-poll lock churn. Mechanism is sound but the premise does not hold on the integrated path. Not
+  landing. **PR #560 (closed).**
 - **Adaptive busy-poll backoff** (`DCQUIC_BUSY_POLL_BACKOFF_K`) — sleep after K consecutive no-work polls.
   **REFUTED:** an 8 KiB / c64 K-sweep was monotonically *worse* as the backoff sharpened (K-off p50
   335 µs / p99 657 → K=8 p50 395 µs / p99 721; throughput 177k → 151k). Parked to the idle-worker regime.
@@ -203,23 +197,23 @@ negative.
 
 ---
 
-## PR index & retarget status
+## PR index & status
 
-| PR | Patch | Base today | Target |
-|----|-------|-----------|--------|
-| _pending_ | ACK/timer-wheel priority (§1.1, **measured win**) | — | open atomic PR against `main` |
-| #560 | Lock-free channel has-items (§2.1) | perf-staging | retarget `main` |
-| #558 | Lock-free waker set (§2.2) | perf-staging | retarget `main` |
-| #543 | RX-dispatch wake coalescing (§2.3) | (staged) | ensure `main` |
-| #545 | Recycle-channel drain-per-pass (§2.4) | (staged) | ensure `main` |
-| #548 | RX peer-Context front cache (§2.5) | (staged) | ensure `main` |
-| #564 | RX payload prefetch (§2.6) | (staged) | ensure `main` |
-| #544 | recv ring SINGLE_ISSUER+DEFER_TASKRUN (§2.7) | (staged) | ensure `main` |
-| #535 | Per-sweep clock cache (§2.8) | perf-staging | retarget `main` |
-| #553 | NAPI busy-poll knob (§2.9) | perf-staging | retarget `main` |
-| #559 | Advertised recv-window override (§2.10) | perf-staging | retarget `main` |
-| #554 | CCA-bypass experiment knob (§2.11) | perf-staging | retarget `main` |
-| #546 | RX decrypt fast/slow counters (§3) | (staged) | ensure `main` |
-| #547 | RX ring exhaustion counters (§3) | (staged) | ensure `main` |
-| #565 | TX-assemble metrics gate (§3) | (staged) | ensure `main` |
-| #568 | Busy-poll backoff (§4, **refuted**) | (staged) | keep as documented negative |
+| PR | Patch | Base | State |
+|----|-------|------|-------|
+| _pending_ | ACK/timer-wheel priority (§1.1, **measured win**) | `main` | atomic PR to open (draft) |
+| #558 | Lock-free waker set (§2.1) | `main` | open (draft) |
+| #543 | RX-dispatch wake coalescing (§2.2) | `main` | open (draft) |
+| #545 | Recycle-channel drain-per-pass (§2.3) | `main` | open (draft) |
+| #548 | RX peer-Context front cache (§2.4) | `main` | open (draft) |
+| #564 | RX payload prefetch (§2.5) | `main` | open (draft) |
+| #544 | recv ring SINGLE_ISSUER+DEFER_TASKRUN (§2.6) | `main` | open (draft) |
+| #535 | Per-sweep clock cache (§2.7) | `main` | open (draft) |
+| #553 | NAPI busy-poll knob (§2.8) | `main` | open (draft) |
+| #559 | Advertised recv-window override (§2.9) | `main` | open (draft) |
+| #554 | CCA-bypass experiment knob (§2.10) | `main` | open (draft) |
+| #546 | RX decrypt fast/slow counters (§3) | `main` | open (draft) |
+| #547 | RX ring exhaustion counters (§3) | `main` | open (draft) |
+| #565 | TX-assemble metrics gate (§3) | `main` | open (draft) |
+| #560 | Lock-free channel has-items (§4, **refuted**) | perf-staging | closed (rig NULL) |
+| #568 | Busy-poll backoff (§4, **refuted**) | `main` | open (draft, documented negative) |
