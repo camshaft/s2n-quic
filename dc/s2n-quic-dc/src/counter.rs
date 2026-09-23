@@ -147,6 +147,45 @@ pub fn spawn_noop_drain_reporter(registry: &Registry, interval: Duration) {
     }
 }
 
+/// Spawns a background thread that periodically **drains** the metric registry and prints it as a
+/// single `[METRICS] <name>=<value>,...` line to stderr, for grep-based counter attribution when
+/// the normal metrics export path is unavailable.
+///
+/// It reports the *same* registry the counters increment, so the values are the real hot-path
+/// counts — it does not depend on any external export bridge (statsd/querylog/global). This is the
+/// fallback readout when those bridges do not surface the endpoint's own counters.
+///
+/// Uses `eprintln!` deliberately rather than `info!`: the crate's `info!`/`debug!`/`trace!` macros
+/// are compiled out (`if false`) without the `tracing` feature, so a metrics dump routed through
+/// them would be invisible in a normal build. This reporter must emit regardless of build features
+/// — it is an explicit, opt-in diagnostic line (the same `[METRICS]` shape earlier tooling emitted).
+///
+/// Like [`spawn_noop_drain_reporter`], the drain is DESTRUCTIVE (it folds + resets the per-CPU
+/// pages), so this must be the ONLY reporter draining `registry` in a run — do not pair it with a
+/// noop-drain or another exporter over the same registry, or the counts split between them.
+///
+/// The loop exits when the registry is [closed](s2n_quic_dc_metrics::Registry::close). Errors
+/// spawning the thread are logged and otherwise ignored (nothing is dumped).
+pub fn spawn_log_reporter(registry: &Registry, interval: Duration) {
+    let inner = registry.inner.clone();
+    if let Err(error) = std::thread::Builder::new()
+        .name("s2n-quic-dc-metrics-log".into())
+        .spawn(move || loop {
+            std::thread::sleep(interval);
+            if !inner.is_open() {
+                break;
+            }
+            // Zero-suppressed (`include_sparse = false`): only metrics with activity this interval,
+            // to keep the line grep-friendly. `None` when nothing was recorded — skip the line.
+            if let Some(line) = inner.try_take_current_metrics_line_sparse(false) {
+                eprintln!("[METRICS] {line}");
+            }
+        })
+    {
+        warn!(%error, "failed to spawn s2n-quic-dc metrics log reporter thread");
+    }
+}
+
 // ── Counter ─────────────────────────────────────────────────────────────────
 
 #[derive(Clone)]
