@@ -35,6 +35,35 @@ use std::{cell::RefCell, rc::Rc, sync::Arc};
 #[cfg(test)]
 mod tests;
 
+/// `DCQUIC_ACK_EVERY_N` (p7-071971): schedule an ACK only every N-th ack-eliciting packet — a
+/// delayed-ACK that reduces ACK-generation work on the recv-dispatch worker (fewer ack_burst /
+/// ack_completion cycles). Read once. Default 1 = ACK every ack-eliciting packet, byte-identical to
+/// before. Bounded by [`ack_max_delay`] so the sender's RTT/loss/BBR sampling gap stays small.
+fn ack_every_n() -> u32 {
+    static N: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("DCQUIC_ACK_EVERY_N")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .filter(|&n| n >= 1)
+            .unwrap_or(1)
+    })
+}
+
+/// Max time the oldest unacked packet may wait before an ACK is forced — the delayed-ACK floor for
+/// [`ack_every_n`], so a sub-N straggler is still acked promptly (bounds sender RTT/BBR sampling).
+/// `DCQUIC_ACK_MAX_DELAY_US`, default 200µs. Read once.
+fn ack_max_delay() -> core::time::Duration {
+    static D: std::sync::OnceLock<core::time::Duration> = std::sync::OnceLock::new();
+    *D.get_or_init(|| {
+        let us = std::env::var("DCQUIC_ACK_MAX_DELAY_US")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(200);
+        core::time::Duration::from_micros(us)
+    })
+}
+
 pub(crate) enum Error {
     PeerStateLookup {
         dest_addr: crate::msg::addr::Addr,
@@ -616,12 +645,20 @@ where
             counters.on_received_frame(&single_queue_msg.unwrap());
             counters.rx_frames_per_packet.record_value(1);
 
-            // QueueMsg is always ack-eliciting — drive the ACK state machine.
-            match peer.ack_state.on_ack_eliciting() {
-                Ok(()) | Err(s2n_quic_core::state::Error::NoOp { .. }) => {}
-                Err(s2n_quic_core::state::Error::InvalidTransition { .. }) => {
-                    counters.rx_ack_state_impossible.add(1);
-                    debug_assert!(false, "on_ack_eliciting transition failed");
+            // QueueMsg is always ack-eliciting — drive the ACK state machine, gated by ack-every-N
+            // (p7-071971). When suppressed, on_ack_eliciting is skipped so no ACK is scheduled; the
+            // packet's range still accumulates in ack_ranges for a cumulative later ACK.
+            if peer.ack_scheduling(
+                ack_every_n(),
+                ack_max_delay(),
+                crate::time::precision::Clock::now(clock),
+            ) {
+                match peer.ack_state.on_ack_eliciting() {
+                    Ok(()) | Err(s2n_quic_core::state::Error::NoOp { .. }) => {}
+                    Err(s2n_quic_core::state::Error::InvalidTransition { .. }) => {
+                        counters.rx_ack_state_impossible.add(1);
+                        debug_assert!(false, "on_ack_eliciting transition failed");
+                    }
                 }
             }
             if peer.ack_state.is_flushed_stale() {
@@ -732,11 +769,19 @@ where
 
     let mut enqueue_pending_ack = false;
     if is_ack_eliciting {
-        match peer.ack_state.on_ack_eliciting() {
-            Ok(()) | Err(s2n_quic_core::state::Error::NoOp { .. }) => {}
-            Err(s2n_quic_core::state::Error::InvalidTransition { .. }) => {
-                counters.rx_ack_state_impossible.add(1);
-                debug_assert!(false, "on_ack_eliciting transition failed");
+        // Gated by ack-every-N (p7-071971): suppress scheduling for sub-N packets (their range still
+        // accumulates in ack_ranges for a cumulative later ACK); force at the max-delay floor.
+        if peer.ack_scheduling(
+            ack_every_n(),
+            ack_max_delay(),
+            crate::time::precision::Clock::now(clock),
+        ) {
+            match peer.ack_state.on_ack_eliciting() {
+                Ok(()) | Err(s2n_quic_core::state::Error::NoOp { .. }) => {}
+                Err(s2n_quic_core::state::Error::InvalidTransition { .. }) => {
+                    counters.rx_ack_state_impossible.add(1);
+                    debug_assert!(false, "on_ack_eliciting transition failed");
+                }
             }
         }
 
