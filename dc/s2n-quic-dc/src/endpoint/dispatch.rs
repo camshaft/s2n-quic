@@ -35,6 +35,41 @@ use std::{cell::RefCell, rc::Rc, sync::Arc};
 #[cfg(test)]
 mod tests;
 
+/// Whether to skip sending EMPTY (no-`Waker`) [`AutoWake`]s to the waker-drain. Env-gated for a clean
+/// A/B; read once. Default OFF preserves the current unconditional send (byte-identical).
+///
+/// An empty `AutoWake` carries no `Waker`, so delivering it to the drain is a no-op — the per-frame
+/// channel push and the drain's poll of it are pure waste. Skipping it is safe: an un-sent empty
+/// `AutoWake` is simply dropped here, and dropping a `None`-inner `AutoWake` does nothing (its
+/// deferred-wake-on-drop only fires for a still-`Some` waker, which we never skip). At high packet
+/// rates the recv-dispatch path sends a waker per data frame, many of which are empty (no parked
+/// reader), so this cuts both the dispatch send cost and the waker-drain load.
+fn skip_empty_waker() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("DCQUIC_SKIP_EMPTY_WAKER")
+            .map(|v| matches!(v.as_str(), "1" | "true" | "on" | "yes"))
+            .unwrap_or(false)
+    })
+}
+
+/// Sends `waker` to the waker-drain `sink`, skipping the push for an empty `AutoWake` when
+/// [`skip_empty_waker`] is enabled (see it for why that is safe). Otherwise behaves exactly like the
+/// previous `let _ = sink.send(waker)`.
+#[inline]
+fn send_waker(sink: &mut impl channel::UnboundedSender<AutoWake>, waker: AutoWake) {
+    if should_send_waker(skip_empty_waker(), &waker) {
+        let _ = sink.send(waker);
+    }
+}
+
+/// Pure decision for [`send_waker`] (extracted so it is testable without the process-global env
+/// gate): always send unless we're skipping empties AND this `AutoWake` carries no `Waker`.
+#[inline]
+fn should_send_waker(skip_empty: bool, waker: &AutoWake) -> bool {
+    !skip_empty || waker.is_some()
+}
+
 pub(crate) enum Error {
     PeerStateLookup {
         dest_addr: crate::msg::addr::Addr,
@@ -612,7 +647,7 @@ where
     // Fast path: single QueueMsg already dispatched during decrypt — just send the waker.
     let payload_storage = match decrypt_result {
         DecryptResult::FastPath(waker) => {
-            let _ = waker_sink.send(waker);
+            send_waker(waker_sink, waker);
             counters.on_received_frame(&single_queue_msg.unwrap());
             counters.rx_frames_per_packet.record_value(1);
 
@@ -1113,7 +1148,7 @@ fn handle_queue_dbg(
             .into(),
         ) {
             Ok((waker, release_bytes)) => {
-                let _ = waker_sink.send(waker);
+                send_waker(waker_sink, waker);
                 // A diagnostic marker carries no payload, so there is nothing to release.
                 debug_assert_eq!(release_bytes, 0);
                 None
@@ -1133,7 +1168,7 @@ fn handle_queue_dbg(
             .into(),
         ) {
             Ok(waker) => {
-                let _ = waker_sink.send(waker);
+                send_waker(waker_sink, waker);
                 None
             }
             Err(err) => Some(queue_error_reason(&err)),
@@ -1301,7 +1336,7 @@ fn handle_queue_data(
                 waker.is_some(),
                 *peer.path_entry.id(),
             );
-            let _ = waker_sink.send(waker);
+            send_waker(waker_sink, waker);
             recv_credit_pool.release(release_bytes);
             counters.rx_data_ok.add(1);
             trace!(
@@ -1423,7 +1458,7 @@ fn handle_queue_msg(
                 let chunks = message_size.as_u64().div_ceil(chunk_size.as_u64().max(1));
                 counters.rx_msg_chunks_per_segment.record_value(chunks);
             }
-            let _ = waker_sink.send(waker);
+            send_waker(waker_sink, waker);
             recv_credit_pool.release(release_bytes);
             None
         }
@@ -1546,7 +1581,7 @@ fn handle_queue_msg_init(
             // channels anyway rather than relying on `AutoWake`'s drop-wake
             // failsafe — if `bind_for_msg` ever produces a live waker (e.g. to
             // wake a parked acceptor) it is routed, not merely dropped.
-            let _ = waker_sink.send(waker);
+            send_waker(waker_sink, waker);
             recv_credit_pool.release(release_bytes);
             let writer = Writer::new_server(
                 frame_tx.clone(),
@@ -1639,7 +1674,7 @@ fn handle_queue_msg_init(
             // waker/bytes through the proper channels rather than relying on
             // drop-wake — see the NewBinding arm. The push_msg below does the
             // real wake/release for this packet.
-            let _ = waker_sink.send(waker);
+            send_waker(waker_sink, waker);
             recv_credit_pool.release(release_bytes);
         }
         Err(_) => {
@@ -1831,7 +1866,7 @@ fn handle_queue_data_init(
                 }
             }
 
-            let _ = waker_sink.send(waker);
+            send_waker(waker_sink, waker);
             recv_credit_pool.release(release_bytes);
 
             debug!(
@@ -1845,7 +1880,7 @@ fn handle_queue_data_init(
             waker,
             release_bytes,
         }) => {
-            let _ = waker_sink.send(waker);
+            send_waker(waker_sink, waker);
             recv_credit_pool.release(release_bytes);
             counters.rx_data_ok.add(1);
             trace_server_bind(
@@ -1940,7 +1975,7 @@ fn handle_queue_control(
         .send_control(local_queue_id, binding_id, entry)
     {
         Ok(waker) => {
-            let _ = waker_sink.send(waker);
+            send_waker(waker_sink, waker);
             counters.rx_queue_control_ok.add(1);
             trace!(
                 binding_id = binding_id.as_u64(),
@@ -1993,7 +2028,7 @@ fn handle_queue_max_data(
         .send_control(local_queue_id, binding_id, entry)
     {
         Ok(waker) => {
-            let _ = waker_sink.send(waker);
+            send_waker(waker_sink, waker);
             counters.rx_queue_control_ok.add(1);
             trace!(
                 binding_id = binding_id.as_u64(),
@@ -2058,7 +2093,7 @@ fn handle_queue_data_blocked(
         .send_stream(local_queue_id, binding_id, entry)
     {
         Ok((waker, release_bytes)) => {
-            let _ = waker_sink.send(waker);
+            send_waker(waker_sink, waker);
             // A blocked signal carries no payload, so there is nothing to release; assert the
             // invariant rather than silently relying on it.
             debug_assert_eq!(release_bytes, 0);
@@ -2142,13 +2177,13 @@ fn handle_queue_reset(
                 peer.queue_view
                     .send_stream(dest_queue_id, binding_id, stream_entry)
             {
-                let _ = waker_sink.send(waker);
+                send_waker(waker_sink, waker);
             }
             if let Ok(waker) =
                 peer.queue_view
                     .send_control(dest_queue_id, binding_id, control_entry)
             {
-                let _ = waker_sink.send(waker);
+                send_waker(waker_sink, waker);
             }
             debug!(
                 binding_id = binding_id.as_u64(),
@@ -2164,7 +2199,7 @@ fn handle_queue_reset(
                 peer.queue_view
                     .send_stream(dest_queue_id, binding_id, stream_entry)
             {
-                let _ = waker_sink.send(waker);
+                send_waker(waker_sink, waker);
             }
             debug!(
                 binding_id = binding_id.as_u64(),
@@ -2180,7 +2215,7 @@ fn handle_queue_reset(
                 peer.queue_view
                     .send_control(dest_queue_id, binding_id, control_entry)
             {
-                let _ = waker_sink.send(waker);
+                send_waker(waker_sink, waker);
             }
             debug!(
                 binding_id = binding_id.as_u64(),
@@ -2346,7 +2381,7 @@ fn bind_for_reset(
                 }
             }
 
-            let _ = waker_sink.send(waker);
+            send_waker(waker_sink, waker);
             recv_credit_pool.release(release_bytes);
 
             debug!(
@@ -2368,7 +2403,7 @@ fn bind_for_reset(
             );
             // The init already bound the slot; nothing to create. Reset delivery
             // proceeds against the existing binding.
-            let _ = waker_sink.send(waker);
+            send_waker(waker_sink, waker);
             recv_credit_pool.release(release_bytes);
             trace!(
                 binding_id = binding_id.as_u64(),
