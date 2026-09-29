@@ -23,6 +23,13 @@ bolero = { git = "https://github.com/camshaft/bolero", rev = "71e5de0eceb043f3ed
 bolero-engine = { git = "https://github.com/camshaft/bolero", rev = "71e5de0eceb043f3eda2f62ccd02d2be2b398c44" }
 bolero-generator = { git = "https://github.com/camshaft/bolero", rev = "71e5de0eceb043f3eda2f62ccd02d2be2b398c44" }
 bolero-generator-derive = { git = "https://github.com/camshaft/bolero", rev = "71e5de0eceb043f3eda2f62ccd02d2be2b398c44" }
+# etude-bytevec provides the chunked byte buffer that s2n-quic-dc's `byte_vec` module now wraps
+# (replacing the vendored inline copy). The crate is published on crates.io at 0.1.0; we pin the
+# canonical camshaft/etude main rev here (bytevec lib code is byte-identical to the 0.1.0 release,
+# every later main commit being docs-only) so the fork tracks a durable, coordinated rev — matching
+# how bach/bolero are consumed above. etude-buffer/etude-ensure resolve as path-deps within this
+# git tree, so they need no separate patch entry.
+etude-bytevec = { git = "https://github.com/camshaft/etude", rev = "084a09a5870eb7f9b923bc42d042e93ac1c3da5a" }
 
 [profile.release-debug]
 inherits = "dev"

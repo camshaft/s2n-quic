@@ -22,7 +22,7 @@ testing = [
     "tracing-subscriber",
     "tracing",
 ]
-bolero-generator = ["dep:bolero-generator"]
+bolero-generator = ["dep:bolero-generator", "etude-bytevec/bolero-generator"]
 tracing = []
 tokio = ["tokio/io-util", "tokio/net", "tokio/rt-multi-thread", "tokio/time"]
 metric-tracing = []
@@ -54,6 +54,11 @@ bolero-generator = { version = "0.13", default-features = false, optional = true
 bytes = "1"
 cfg-if = "1.0"
 crossbeam-utils = { version = "0.8", default-features = false }
+# Backs the `byte_vec` module (chunked byte buffer). The fork-local `byte_vec` newtypes wrap
+# etude-bytevec's types and carry the s2n_quic_core buffer Storage bridge; the heavy buffer logic
+# lives in etude. Pinned via `[patch.crates-io]` at the workspace root to the canonical camshaft
+# rev (byte-identical to the 0.1.0 release).
+etude-bytevec = "0.1.0"
 libc = "0.2"
 num-rational = { version = "0.4", default-features = false }
 pin-project-lite = "0.2"
