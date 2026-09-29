@@ -252,11 +252,14 @@ impl Builder {
 
     /// Calls the provided function and prefixes the written data with a `u64` length
     pub fn write_with_len_prefix<F: FnOnce(&mut Self)>(&mut self, f: F) {
-        // flush any data we have buffered
+        // flush any data we have buffered so `chunks` holds everything written so far and the
+        // insertion point is a stable byte offset (not a chunk index — the backing rope may
+        // rechunk, so a chunk index would not survive the caller's writes below).
         self.flush();
 
-        // record the chunk index where to insert the length
-        let chunk_index = self.chunks.chunks().len();
+        // record the byte offset where the length prefix belongs (everything already buffered
+        // precedes it; the caller's write below goes after it)
+        let insert_at = self.chunks.len();
 
         // record the starting length
         let before_len = self.len();
@@ -270,18 +273,19 @@ impl Builder {
         // compute the amount of data written by the caller
         let written_len = (self.len() - before_len) as u64;
 
-        // write the length into the `head` buffer ensuring it stays in one chunk
-        let written_len_bytes = written_len.to_be_bytes();
-        if written_len_bytes.len() > self.head.spare_capacity_mut().len() {
-            self.flush_and_reserve(written_len_bytes.len());
-        }
-        self.head.put_slice(&written_len_bytes);
-
-        // insert the length chunk where we recorded initially
-        let len_chunk = self.head.split().freeze();
-        // make sure the length chunk is not torn
+        // build the length prefix as a single 8-byte chunk
+        let len_chunk = Bytes::copy_from_slice(&written_len.to_be_bytes());
         debug_assert_eq!(len_chunk.len(), 8);
-        self.chunks.insert(chunk_index, len_chunk);
+
+        // splice the prefix in at `insert_at`: front = [0, insert_at), tail = [insert_at, len);
+        // rebuild as front ++ len_chunk ++ tail
+        let mut front = self
+            .chunks
+            .split_to(insert_at)
+            .expect("insert_at is within the flushed chunk length");
+        front.push_back(len_chunk);
+        front.append(&mut self.chunks);
+        self.chunks = front;
     }
 
     /// Reserves buffer space for reading from a socket
