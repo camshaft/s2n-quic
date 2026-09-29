@@ -37,11 +37,15 @@ fn writer_storage_bridge_put_bytes() {
     assert_eq!(flatten(bv), b"chunk-achunk-b");
 }
 
+// Pin the writer-storage specialization invariant at compile time (the DC stack relies on
+// `put_bytes` being specialized rather than copied through `put_slice`).
+#[allow(clippy::assertions_on_constants)] // intentional: assert a const invariant of the impl
+const _: () = assert!(<ByteVec as writer::Storage>::SPECIALIZES_BYTES);
+
 #[test]
 fn writer_storage_remaining_capacity_is_unbounded() {
     let bv = ByteVec::new();
     assert!(bv.remaining_capacity() >= usize::MAX - 1);
-    assert!(<ByteVec as writer::Storage>::SPECIALIZES_BYTES);
 }
 
 #[test]
