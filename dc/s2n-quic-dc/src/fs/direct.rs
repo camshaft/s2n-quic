@@ -1,7 +1,7 @@
 // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Direct (unbuffered) file IO primitive — a port of Membrain's `core-fs-direct`.
+//! Direct (unbuffered) file IO primitive — a port of an existing direct-IO crate.
 //!
 //! Provides page-aligned buffer allocation and an [`O_DIRECT`](open_direct_file)/`F_NOCACHE` file
 //! handle with positional `read_at`/`write_at`/`sync`. The blocking-syscall backend

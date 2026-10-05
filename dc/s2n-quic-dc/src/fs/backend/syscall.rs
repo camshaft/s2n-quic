@@ -3,7 +3,7 @@
 
 //! Bounded blocking-syscall backend — the production deadlock fix.
 //!
-//! Storage IO done via `tokio::spawn_blocking` (the Membrain `core-fs-direct` `IoPool` pattern)
+//! Storage IO done via `tokio::spawn_blocking` (the `IoPool` pattern of an existing direct-IO crate)
 //! deadlocks: each pool spawns blocking threads with no global bound and no backpressure on thread
 //! spawn, so under load the pool exhausts and in-flight ops wait on ops that can never be scheduled.
 //!
