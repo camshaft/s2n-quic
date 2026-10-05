@@ -463,7 +463,7 @@ fn application_data_none_without_callback() {
 }
 
 /// The registered callback receives the request's `peer_info` and its returned
-/// `ApplicationData` is what the store yields. This is the hook Membrain uses to
+/// `ApplicationData` is what the store yields. This is the hook a storage service uses to
 /// compute negotiation at handshake time and stash the result on the `Entry`.
 #[test]
 fn application_data_callback_receives_peer_info_and_returns_data() {

@@ -825,7 +825,7 @@ fn materialize_delivers_in_order() {
     });
 }
 
-/// Mixed resident + device blocks (Membrain's case): a materialize stream interleaving in-memory
+/// Mixed resident + device blocks (the storage-service case): a materialize stream interleaving in-memory
 /// `Block::Resident(Bytes)` with on-disk `Block::Read(BlockRef)` must deliver them in FIFO order,
 /// with the resident bytes spliced in **verbatim** and **bypassing** the device (no credit consumed,
 /// no backend read). Odd indices are resident (filled with byte value `0xAA`); even indices are

@@ -144,8 +144,8 @@ mod tests {
         assert_eq!(metrics_line(Some(""), "a=1"), "[METRICS] a=1");
         // Non-empty prefix → `[METRICS:{prefix}] ...`.
         assert_eq!(
-            metrics_line(Some("membrain.storage"), "a=1"),
-            "[METRICS:membrain.storage] a=1"
+            metrics_line(Some("app.storage"), "a=1"),
+            "[METRICS:app.storage] a=1"
         );
         // An empty report line still frames (the tick emitted nothing but the marker is present).
         assert_eq!(metrics_line(None, ""), "[METRICS] ");

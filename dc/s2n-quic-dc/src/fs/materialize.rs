@@ -5,13 +5,13 @@
 //!
 //! [`MaterializeStream`] reads a logical object whose blocks scatter across devices and delivers the
 //! bytes in **FIFO order** even though the block reads complete out of order. It replaces the
-//! per-stream `futures::stream::iter(blocks).map(read).buffered(N)` island each Membrain
+//! per-stream `futures::stream::iter(blocks).map(read).buffered(N)` island each storage-service
 //! materialization spins up today (one `spawn_blocking` storm per stream, no coordination — the
 //! deadlock and the lost fairness).
 //!
 //! Each source item is a [`Block`]: a [`Read`](Block::Read) (a `BlockRef` fetched from a device,
 //! credit-gated) or a [`Resident`](Block::Resident) (already-in-memory [`ByteVec`] spliced into the
-//! stream in order, **bypassing** `prepare`/credit/device/backend). Membrain objects are a mix of
+//! stream in order, **bypassing** `prepare`/credit/device/backend). Storage-service objects are a mix of
 //! on-disk extents and cached/just-written data, so a stream interleaves both and the consumer sees
 //! one seamless ordered byte stream.
 //!
@@ -67,7 +67,7 @@ const MAX_RESIDENT_BLOCKS: usize = 256;
 /// One unit of a materialize stream: either a block to **read** from a device, or **resident** bytes
 /// the caller already holds in memory.
 ///
-/// Membrain materializes objects whose blocks are a mix of on-disk extents and in-memory (cached or
+/// A storage service materializes objects whose blocks are a mix of on-disk extents and in-memory (cached or
 /// just-written) data, delivered as one ordered stream. A [`Resident`](Block::Resident) block carries
 /// its bytes directly and is delivered in FIFO order **without** touching `prepare`, the credit pool,
 /// a device, or any backend — it bypasses the filesystem entirely, slotting into the reorder window
@@ -101,7 +101,7 @@ impl From<ByteVec> for Block {
 ///
 /// The source yields anything that converts into a [`Block`]: a [`BlockRef`] (read it from a device)
 /// or a [`Block::Resident`] (already-in-memory bytes spliced into the stream in order, bypassing the
-/// filesystem). Membrain interleaves both.
+/// filesystem). A storage service interleaves both.
 pub fn materialize<I>(blocks: I, priority: TierPriority) -> MaterializeStream<I::IntoIter>
 where
     I: IntoIterator,
@@ -111,7 +111,7 @@ where
 }
 
 /// Like [`materialize`] but issues **zero-copy `O_DIRECT`** reads into page-aligned buffers — the mode
-/// Membrain uses. Each *read* block's `offset` and `len` must be block-aligned (a misaligned block
+/// a storage service uses. Each *read* block's `offset` and `len` must be block-aligned (a misaligned block
 /// surfaces as an `InvalidInput` error in delivery order); resident blocks are unaffected by alignment.
 pub fn materialize_direct<I>(blocks: I, priority: TierPriority) -> MaterializeStream<I::IntoIter>
 where
@@ -166,7 +166,7 @@ pub struct MaterializeStream<I> {
     blocks: I,
     priority: TierPriority,
     /// Whether to issue zero-copy `O_DIRECT` reads (page-aligned [`AlignedBuf`]) instead of buffered
-    /// reads. Membrain uses `O_DIRECT`, so this is a first-class mode.
+    /// reads. A storage service uses `O_DIRECT`, so this is a first-class mode.
     ///
     /// [`AlignedBuf`]: crate::fs::direct::AlignedBuf
     direct: bool,
@@ -200,7 +200,7 @@ where
 {
     /// Build a materialize stream over `blocks`. Each block carries its own `Arc<Device>`, so the
     /// stream needs no registry handle — it submits against `block.device` directly. `direct` selects
-    /// zero-copy `O_DIRECT` reads (the Membrain mode) vs. buffered reads.
+    /// zero-copy `O_DIRECT` reads (the storage-service mode) vs. buffered reads.
     pub fn new(blocks: I, priority: TierPriority, direct: bool) -> Self {
         Self {
             blocks,
@@ -328,7 +328,7 @@ where
             // Resident bytes bypass the filesystem entirely: file them `Ready` straight into the
             // reorder window so they deliver in FIFO order alongside the device reads — no `prepare`,
             // no credit, no device, no backend. This is the in-memory / cached / just-written path
-            // Membrain interleaves with on-disk extents.
+            // A storage service interleaves with on-disk extents.
             let block = match item {
                 Block::Read(block) => block,
                 Block::Resident(bytes) => {
@@ -507,7 +507,7 @@ fn finish(buf: IoBuf, head_trim: u32, tail_trim: u32) -> ByteVec {
 /// `head`/`tail` were computed against the block's *requested* length. If the backend returned a
 /// **short** read (fewer bytes than requested — only possible at EOF, since a mid-file block is
 /// always fully present), `len` here is the short count: a `head` past the returned data yields an
-/// empty buffer and the tail trim is clamped. Panic-safe (every bound is clamped), and for Membrain's
+/// empty buffer and the tail trim is clamped. Panic-safe (every bound is clamped), and for a storage service's
 /// interior reads no trim/short-read interaction arises. `advance`/`truncate` are zero-copy (they
 /// adjust chunk boundaries, never memcpy).
 fn trim(mut bytes: ByteVec, head: usize, tail: usize) -> ByteVec {

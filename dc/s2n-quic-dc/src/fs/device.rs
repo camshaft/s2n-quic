@@ -463,7 +463,7 @@ impl Device {
     /// buffer is pinned in the in-flight slab until the CQE reaps it — so the write **must** run to
     /// completion; a caller that treated a post-enqueue drop as license to recycle the op's fixed disk
     /// offset would race a stale in-flight write against the new one across unordered lanes and tear it.
-    /// (See `spill-write-cancellation` in the Membrain design docs for that offset-reuse race.)
+    /// (See `spill-write-cancellation` in the original storage design docs for that offset-reuse race.)
     ///
     /// `is_direct` selects `O_DIRECT` validation: it must match the buffer eventually handed to
     /// [`submit`](Reservation::submit) (a direct op requires `offset`/`len` block-aligned, validated
