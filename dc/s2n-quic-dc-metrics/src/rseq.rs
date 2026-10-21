@@ -52,6 +52,21 @@ const _: () = assert!(std::mem::size_of::<Page>() == PAGE_SIZE);
 #[cfg(test)]
 static PAGES_ALLOCATED: AtomicU64 = AtomicU64::new(0);
 
+/// Footgun detector for a recording registry with no reporter draining `registry.absorb()`.
+///
+/// `send_event_slow` self-heals by folding `full_pages` back into `empty_pages` when the pool is
+/// exhausted, so memory stays bounded even with no drainer — but that emergency fold only happens
+/// because nothing is draining proactively. If it fires *repeatedly*, a reporter is missing: the
+/// metrics are memory-safe but never EXPORTED (they aggregate and are dropped on registry teardown).
+/// The historical production incident was exactly this — an endpoint stood up a registry with no
+/// reporter. Warn once (loud, not silent) so the misconfiguration is caught; the fold keeps us safe
+/// either way. Process-wide + warn-once: a healthy reporter drains before the count accrues, so the
+/// warning only trips when a registry genuinely records without ever being drained.
+static SELF_HEAL_FOLDS: AtomicU64 = AtomicU64::new(0);
+static SELF_HEAL_WARNED: AtomicBool = AtomicBool::new(false);
+/// Enough repeated exhaustion-folds that a transient burst under a working reporter is ruled out.
+const SELF_HEAL_WARN_THRESHOLD: u64 = 256;
+
 #[cfg(any(test, target_os = "linux"))]
 impl Page {
     fn new() -> Box<Page> {
@@ -571,7 +586,37 @@ impl<T: Absorb> Channels<T> {
     #[cfg_attr(target_arch = "aarch64", target_feature(enable = "lse"))]
     fn send_event_slow(&self, rseq_ptr: NonNull<Rseq>, serialized_event: u64) {
         let cpu_hint = unsafe { (*rseq_ptr.as_ptr()).cpu_id_start } as usize;
-        let mut new_page = self.empty_pages.pop(cpu_hint).unwrap_or_else(Page::new);
+        // Self-bounding: normally `empty_pages` is refilled by `absorb_full_pages` running off the
+        // reporter (`registry.absorb()`). A consumer that records without ever draining (e.g. an
+        // endpoint whose registry has no reporter installed) would otherwise never refill the pool,
+        // so every slow-path here would `Page::new` without bound — the recorded-but-unabsorbed
+        // pages pile up in `full_pages` and the process OOMs. Guard against that: when the pool is
+        // exhausted, fold `full_pages` back into `empty_pages` ourselves (recycling their memory —
+        // the same conservation the reporter would do) and retry, only allocating a fresh page if
+        // there is genuinely nothing to recycle. This is a cold backpressure path (fires only on
+        // exhaustion), so it adds no cost to the warm recycle path and preserves the crate's
+        // "recording must not grow memory without bound" invariant regardless of who drains.
+        let mut new_page = match self.empty_pages.pop(cpu_hint) {
+            Some(page) => page,
+            None => {
+                // Repeated self-heals mean no reporter is draining registry.absorb(): warn once so
+                // the reporter-less-registry footgun is loud instead of silent. The fold below still
+                // bounds memory either way.
+                let folds = SELF_HEAL_FOLDS.fetch_add(1, Ordering::Relaxed) + 1;
+                if folds == SELF_HEAL_WARN_THRESHOLD
+                    && !SELF_HEAL_WARNED.swap(true, Ordering::Relaxed)
+                {
+                    eprintln!(
+                        "dc-metrics: page pool self-healed {SELF_HEAL_WARN_THRESHOLD} times on \
+                         exhaustion — no reporter is draining registry.absorb(); metrics are \
+                         memory-bounded but NOT exported. Install a reporter that calls \
+                         registry.absorb() periodically to actually export metrics."
+                    );
+                }
+                self.absorb_full_pages();
+                self.empty_pages.pop(cpu_hint).unwrap_or_else(Page::new)
+            }
+        };
 
         new_page.slots[0].write(serialized_event);
         new_page.length.store(1, Ordering::Relaxed);
@@ -914,6 +959,10 @@ fn sys_rseq(rseq_abi: *mut Rseq, flags: i32) -> std::io::Result<()> {
 
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
+    // Serialize the tests that read the process-global `PAGES_ALLOCATED` counter (and any test that
+    // allocates pages concurrently), so one test's `Page::new`s can't inflate another's before/after
+    // delta under the parallel test harness.
+    static PAGE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     use super::*;
 
     // See comments in possible_cpus if this fails -- it's possible the failure just indicates we
@@ -937,6 +986,7 @@ mod tests {
 
     #[test]
     fn test_send_event_local() {
+        let _serial = PAGE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let mut channels = Channels::<TestAbsorber>::new();
 
         channels.allocate();
@@ -969,6 +1019,7 @@ mod tests {
 
     #[test]
     fn test_send_event_overflow() {
+        let _serial = PAGE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let channels = Channels::<TestAbsorber>::new();
 
         channels.allocate();
@@ -1062,6 +1113,7 @@ mod tests {
     // `lse` enablement on aarch64
     #[allow(unused_unsafe)]
     fn check_send_slow_branches() {
+        let _serial = PAGE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         #[cfg(target_arch = "aarch64")]
         if !std::arch::is_aarch64_feature_detected!("lse") {
             return;
@@ -1164,6 +1216,7 @@ mod tests {
     /// exact count. On the fallback path (no rseq/membarrier) pages are never used, so it early-outs.
     #[test]
     fn steady_state_stops_allocating_pages() {
+        let _serial = PAGE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         use std::sync::{
             atomic::{AtomicBool, AtomicU64, Ordering},
             Arc,
@@ -1253,6 +1306,41 @@ mod tests {
             "page pool kept allocating after warm-up: {fresh_allocations} fresh Page::new in the \
              measurement window vs ~{filled_pages_estimate} pages' worth of events recorded \
              (total events {total_recorded}); expected recycling to keep this near-constant"
+        );
+    }
+
+    /// Regression for the `send_event_slow` OOM: a consumer that records but NEVER drains (its
+    /// registry has no reporter, so `registry.absorb()` / `absorb_full_pages` is never called) must
+    /// NOT grow page allocation without bound. Before the self-bounding fold-on-exhaustion,
+    /// `empty_pages` was never refilled, so every slow-path minted a fresh `Page` — a page per
+    /// ~`SLOTS` events, which OOM'd an idle endpoint at multiple GB/s. The fix folds `full_pages`
+    /// back into `empty_pages` on exhaustion, so allocation stays bounded with no external drainer.
+    #[test]
+    fn records_without_reporter_self_bound() {
+        let _serial = PAGE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let channels = Channels::<TestAbsorber>::new();
+        channels.allocate();
+        if channels.must_use_fallback {
+            return; // the fallback path never touches the page pool
+        }
+        let before = PAGES_ALLOCATED.load(Ordering::Relaxed);
+        // Record far more events than a bounded pool could hold if pages never recycled — and
+        // deliberately NEVER call absorb()/report (an endpoint whose registry has no reporter).
+        let n: u64 = 2_000_000;
+        for i in 0..n {
+            channels.send_event(i);
+        }
+        let allocated = PAGES_ALLOCATED
+            .load(Ordering::Relaxed)
+            .saturating_sub(before);
+        // Without the fix `allocated` tracks ~n/SLOTS (grows with events). With fold-on-exhaustion
+        // it stays a small multiple of the warm pool — assert far below the unbounded count.
+        let unbounded = n / SLOTS as u64;
+        assert!(
+            allocated < unbounded / 10 + 64,
+            "recording without a reporter must self-bound page allocation: {allocated} fresh \
+             Page::new for {n} events (unbounded would be ~{unbounded}); fold-on-exhaustion should \
+             recycle full_pages so the pool cannot grow without an external drainer"
         );
     }
 }

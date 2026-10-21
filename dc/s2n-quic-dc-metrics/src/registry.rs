@@ -3,7 +3,12 @@
 
 use std::{
     collections::{BTreeMap, HashMap},
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex, Weak,
+    },
+    thread,
+    time::Duration,
 };
 
 use crate::{
@@ -29,6 +34,27 @@ pub struct Registry {
     /// into storage (and therefore what backends emit); the aggregation/variant dimension is left
     /// untouched.
     prefix: Option<Arc<str>>,
+}
+
+/// Handle for the background drain thread spawned by [`Registry::spawn_default_drain_reporter`].
+///
+/// Stops and joins the thread on drop, so the drainer's lifetime is tied to this handle — keep it
+/// alive for as long as the registry should be drained (typically the endpoint's lifetime).
+pub struct DrainReporter {
+    stop: Arc<AtomicBool>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+impl Drop for DrainReporter {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            // The thread wakes at most one `interval` after `stop` is set (it sleeps between
+            // drains); joining keeps teardown deterministic. A drain already in flight just
+            // finishes its `absorb`.
+            let _ = handle.join();
+        }
+    }
 }
 
 pub(crate) struct RegistryInner {
@@ -739,6 +765,52 @@ impl Registry {
             .absorb();
     }
 
+    /// Spawn a background thread that drains this registry every `interval` by calling
+    /// [`absorb`](Self::absorb), and return a handle that stops+joins the thread on drop.
+    ///
+    /// # When to use
+    ///
+    /// A `Registry` records into a per-CPU page pool that is only recycled when something drains it
+    /// (`absorb`/`report`). Draining is normally the job of the exporting reporter a consumer runs.
+    /// A consumer that stands up a registry but installs **no** reporter therefore never recycles
+    /// the pool — historically that leaked without bound (now bounded by the emergency fold in
+    /// `send_event_slow`, but the metrics still never get exported and the pool churns).
+    ///
+    /// This is the "always register a drainer" primitive: at the **root** registry, install either
+    /// the consumer's real exporting reporter **or**, when there is none, this default no-op drainer
+    /// — so there is a single uniform always-drained path and no reporter-less branch that can
+    /// silently misbehave. Install it **once at the root**; child handles ([`child`](Self::child))
+    /// share the same storage and need no drainer of their own.
+    ///
+    /// The thread holds only a [`Weak`] reference, so it does not keep the registry alive: once the
+    /// last owning `Registry` is dropped the next tick sees the upgrade fail and the thread exits.
+    /// Dropping the returned [`DrainReporter`] also stops it promptly.
+    #[must_use = "dropping the DrainReporter stops the drain thread; keep it alive for the registry's lifetime"]
+    pub fn spawn_default_drain_reporter(&self, interval: Duration) -> DrainReporter {
+        let weak: Weak<Mutex<RegistryInner>> = Arc::downgrade(&self.inner);
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_thread = stop.clone();
+        let handle = thread::Builder::new()
+            .name("dc-metrics-drain".into())
+            .spawn(move || {
+                while !stop_thread.load(Ordering::Relaxed) {
+                    thread::sleep(interval);
+                    match weak.upgrade() {
+                        // Registry still alive: recycle its page pool. `absorb` is itself a no-op
+                        // on a closed registry.
+                        Some(inner) => inner.lock().unwrap_or_else(|e| e.into_inner()).absorb(),
+                        // Registry dropped — nothing left to drain, exit.
+                        None => break,
+                    }
+                }
+            })
+            .expect("failed to spawn dc-metrics drain thread");
+        DrainReporter {
+            stop,
+            handle: Some(handle),
+        }
+    }
+
     /// Returns a [`MetricDescriptor`] for every metric registered so far, in the registry's stable
     /// `(name, aggregation)` order, without recording, draining, or invoking any callback.
     ///
@@ -1139,6 +1211,28 @@ mod test {
             line3,
             "q.depth=5,rx.data=0,rx.decrypt_time=0 us,rx.ecn=0 Variant|ect0,rx.ecn=0 Variant|ect1,workers=4"
         );
+    }
+
+    /// The default drain reporter runs `absorb` in the background so a registry with no exporting
+    /// reporter still recycles its pool — and its handle stops+joins the thread on drop. Verifies
+    /// the drainer runs without losing data (absorb is additive, so the eventual report still sees
+    /// every increment) and that dropping the handle tears the thread down cleanly (a leaked or
+    /// deadlocked thread would hang the join here).
+    #[test]
+    fn default_drain_reporter_drains_and_stops() {
+        let registry = Registry::new();
+        let counter = registry.register_counter("a".into(), None);
+        let reporter = registry.spawn_default_drain_reporter(Duration::from_millis(5));
+        counter.increment(7);
+        // Give the background drainer several intervals to fold the buffered events.
+        thread::sleep(Duration::from_millis(30));
+        counter.increment(4);
+        thread::sleep(Duration::from_millis(30));
+        // Stop the drainer: this joins the thread, so a leaked/deadlocked drainer hangs the test.
+        drop(reporter);
+        // absorb is additive, so the report still observes every increment (7 + 4) despite the
+        // background folds in between — the drainer recycled the pool without losing data.
+        assert_eq!(registry.take_current_metrics_line(), "a=11");
     }
 
     /// `absorb` folds buffered events into the aggregate without draining, so intervening absorbs
