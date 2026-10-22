@@ -453,3 +453,17 @@ fn slot_diag_reports_bound_vs_unallocated_state() {
         "an unbound slot must read back as unallocated with no receiver"
     );
 }
+
+#[test]
+fn should_send_waker_skips_only_empty_when_enabled() {
+    let empty = AutoWake::new(None);
+    let full = AutoWake::new(Some(s2n_quic_core::task::waker::noop()));
+
+    // Skip disabled (default): always send, regardless of waker presence.
+    assert!(should_send_waker(false, &empty));
+    assert!(should_send_waker(false, &full));
+
+    // Skip enabled: drop the empty (no-op) AutoWake, still send a real waker.
+    assert!(!should_send_waker(true, &empty));
+    assert!(should_send_waker(true, &full));
+}
