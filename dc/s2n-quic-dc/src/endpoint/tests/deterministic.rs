@@ -741,6 +741,9 @@ fn init_uniqueness_baseline() {
 /// second copy so the server acceptor sees each stream ID only once.
 #[test]
 fn init_uniqueness_all_duplicated() {
+    if crate::testing::skip_if_slow() {
+        return;
+    }
     const N: usize = 100_000;
     let actions = PacketActions {
         delays: vec![0; N],
@@ -897,6 +900,9 @@ fn ack_only_probe_does_not_create_ack_loop() {
 /// ID exactly once (no duplicates, none missing).
 #[test]
 fn init_uniqueness_fuzz() {
+    if crate::testing::skip_if_slow() {
+        return;
+    }
     bolero::check!()
         .with_type::<PacketActions>()
         .with_test_time(Duration::from_secs(30))
