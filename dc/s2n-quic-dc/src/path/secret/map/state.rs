@@ -1,7 +1,7 @@
 // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 use super::{
-    cleaner::Cleaner, stateless_reset, ApplicationData, ApplicationDataError, Entry, Store,
+    cleaner::Cleaner, stateless_reset, ApplicationData, ApplicationDataError, Entry, PeerKey, Store,
 };
 use crate::{
     credentials::{Credentials, Id},
@@ -19,7 +19,7 @@ use s2n_quic_core::{
     varint::VarInt,
 };
 use std::{
-    collections::VecDeque,
+    collections::{HashSet, VecDeque},
     hash::BuildHasher,
     mem::ManuallyDrop,
     net::SocketAddr,
@@ -55,6 +55,15 @@ impl std::fmt::Display for StateBuilderError {
 }
 
 impl std::error::Error for StateBuilderError {}
+
+/// Whether a path secret whose peer presented `key` may be cached under `keys`, the list of
+/// accepted keys: each one may where no list is set.
+fn accepts_peer_key(keys: Option<&HashSet<PeerKey>>, key: Option<&PeerKey>) -> bool {
+    match keys {
+        None => true,
+        Some(keys) => key.is_some_and(|key| keys.contains(key)),
+    }
+}
 
 pub struct StateBuilder<C, S>
 where
@@ -509,6 +518,10 @@ where
             >,
         >,
     >,
+
+    // The keys of the peers this map accepts, as `set_peer_keys` sets them. `None`, as built,
+    // accepts each peer the TLS provider accepts.
+    peer_keys: parking_lot::RwLock<Option<HashSet<PeerKey>>>,
 }
 
 // FIXME: Avoid the whole socket.
@@ -617,6 +630,7 @@ where
             advertised_peer_info,
             advertised_data_addrs,
             mk_application_data: RwLock::new(None),
+            peer_keys: Default::default(),
         };
 
         // Growing to double our maximum inserted entries should ensure that we never grow again, see:
@@ -689,6 +703,23 @@ where
         }
 
         (id_removed, peer_removed)
+    }
+
+    /// Evicts each entry `should_evict` selects, from the ID map and from both address maps.
+    fn evict_where(&self, should_evict: impl Fn(&Entry) -> bool) {
+        let mut evicted = Vec::new();
+        for table in [&self.ids.0, &self.client_peers.table, &self.server_peers.table] {
+            evicted.extend(
+                table
+                    .read()
+                    .iter()
+                    .filter(|entry| should_evict(entry))
+                    .cloned(),
+            );
+        }
+        for entry in evicted {
+            self.evict(&entry);
+        }
     }
 
     pub fn request_handshake(
@@ -828,6 +859,13 @@ where
     }
 
     fn on_new_path_secrets(&self, entry: Arc<Entry>) {
+        // Hold the list of accepted keys until the entry is in the maps, so that a removal of the
+        // peer's key either evicts this entry or runs first and keeps it out.
+        let peer_keys = self.peer_keys.read();
+        if !accepts_peer_key(peer_keys.as_ref(), entry.peer_key()) {
+            return;
+        }
+
         let id = *entry.id();
         let peer = entry.peer();
 
@@ -872,6 +910,14 @@ where
     }
 
     fn on_handshake_complete(&self, entry: Arc<Entry>) {
+        // As in `on_new_path_secrets`: the path secret of a peer whose key was removed while it
+        // handshook isn't cached.
+        let peer_keys = self.peer_keys.read();
+        if !accepts_peer_key(peer_keys.as_ref(), entry.peer_key()) {
+            self.evict(&entry);
+            return;
+        }
+
         let id = *entry.id();
         let peer = *entry.peer();
 
@@ -1413,6 +1459,55 @@ where
         } else {
             Ok(None)
         }
+    }
+
+    fn verify_peer_key(
+        &self,
+        tls: &dyn s2n_quic_core::crypto::tls::TlsSession,
+    ) -> Result<Option<PeerKey>, &'static str> {
+        let peer_keys = self.peer_keys.read();
+        let Some(peer_keys) = peer_keys.as_ref() else {
+            return Ok(None);
+        };
+
+        // The TLS provider has verified that the peer holds the private key of the first
+        // certificate of its chain.
+        let chain = tls
+            .peer_cert_chain_der()
+            .map_err(|_| "the peer didn't present a certificate chain")?;
+        let certificate = chain
+            .first()
+            .ok_or("the peer didn't present a certificate")?;
+        let key = PeerKey::from_certificate_der(certificate)
+            .ok_or("the peer's certificate can't be read")?;
+
+        if peer_keys.contains(&key) {
+            Ok(Some(key))
+        } else {
+            Err("the peer's key isn't in the list of accepted keys")
+        }
+    }
+
+    fn set_peer_keys(&self, keys: HashSet<PeerKey>) {
+        let mut peer_keys = self.peer_keys.write();
+        self.evict_where(|entry| !accepts_peer_key(Some(&keys), entry.peer_key()));
+        *peer_keys = Some(keys);
+    }
+
+    fn insert_peer_key(&self, key: PeerKey) -> bool {
+        self.peer_keys
+            .write()
+            .as_mut()
+            .is_some_and(|keys| keys.insert(key))
+    }
+
+    fn remove_peer_key(&self, key: &PeerKey) -> bool {
+        let mut peer_keys = self.peer_keys.write();
+        let removed = peer_keys.as_mut().is_some_and(|keys| keys.remove(key));
+        if removed {
+            self.evict_where(|entry| entry.peer_key() == Some(key));
+        }
+        removed
     }
 
     #[cfg(test)]
