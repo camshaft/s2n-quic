@@ -827,6 +827,25 @@ where
         let _ = self.evict(entry);
     }
 
+    fn evict_dead_and_silent_entry(&self, entry: &Arc<Entry>, silence: Duration) {
+        let (id_removed, peer_removed) = self.evict(entry);
+        if !id_removed && !peer_removed {
+            // A concurrent eviction, or the cleaner, removed the entry first.
+            return;
+        }
+        self.subscriber().on_path_secret_map_dead_and_silent_entry_evicted(
+            event::builder::PathSecretMapDeadAndSilentEntryEvicted {
+                peer_address: SocketAddress::from(*entry.peer()).into_event(),
+                credential_id: entry.id().into_event(),
+                age: self
+                    .clock
+                    .get_time()
+                    .saturating_duration_since(entry.creation_time()),
+                silence,
+            },
+        );
+    }
+
     fn contains(&self, peer: &SocketAddr) -> bool {
         self.client_peers.contains_key(peer) || self.server_peers.contains_key(peer)
     }
