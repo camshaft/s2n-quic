@@ -89,7 +89,7 @@ fn a_certificate_key_is_its_subject_public_key_info() {
 }
 
 #[test]
-fn bytes_that_arent_one_certificate_have_no_key() {
+fn bytes_other_than_one_certificate_have_no_key() {
     let der = certificates::CERT_DER;
 
     assert_eq!(PeerKey::from_certificate_der(&[]), None);
@@ -173,7 +173,7 @@ fn a_packet_on_a_removed_key_path_secret_is_refused() {
 }
 
 #[test]
-fn a_path_secret_of_a_key_the_list_doesnt_hold_isnt_cached() {
+fn a_path_secret_of_an_unlisted_key_is_not_cached() {
     let map = new_map();
     let a = key("a");
     map.set_peer_keys([a.clone()]);
@@ -200,7 +200,7 @@ fn a_path_secret_of_a_key_the_list_doesnt_hold_isnt_cached() {
 }
 
 #[test]
-fn setting_the_list_evicts_the_path_secrets_it_doesnt_hold() {
+fn setting_the_list_evicts_the_path_secrets_of_unlisted_keys() {
     let map = new_map();
 
     // A map without a list caches every path secret, with a key or without one.
