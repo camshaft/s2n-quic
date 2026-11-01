@@ -3,9 +3,12 @@
 
 use super::PeerKey;
 use crate::{
-    credentials::Id,
+    credentials::{Credentials, Id, KeyId},
     path::secret::{
-        map::{store::Store as _, Entry},
+        map::{
+            store::{ControlResponse, Store as _},
+            Entry,
+        },
         stateless_reset::Signer,
         Map,
     },
@@ -52,6 +55,17 @@ fn insert(
     let id = *entry.id();
     map.store.test_insert(entry);
     id
+}
+
+/// Opens a packet on `credentials`, as the receive path does, and returns whether the map opened
+/// it and the control packet the map answered it with.
+fn open(map: &Map, credentials: &Credentials) -> (bool, Vec<u8>) {
+    let mut out = Vec::new();
+    let control = ControlResponse::ReturnBuffer { out: &mut out };
+    let opened = map
+        .opener_for_credentials(credentials, None, control)
+        .is_some();
+    (opened, out)
 }
 
 #[test]
@@ -132,6 +146,30 @@ fn removing_a_key_evicts_its_cached_path_secrets() {
 
     // The list doesn't hold `a` any longer.
     assert!(!map.remove_peer_key(&a));
+}
+
+#[test]
+fn a_packet_on_a_removed_key_path_secret_is_refused() {
+    let map = new_map();
+    let a = key("a");
+    map.set_peer_keys([a.clone()]);
+    let id = insert(&map, addr(4001), endpoint::Type::Server, 0, Some(a.clone()));
+    let credentials = Credentials {
+        id,
+        key_id: KeyId::ZERO,
+    };
+
+    // While the key is listed, the map opens a packet on the path secret.
+    let (opened, control) = open(&map, &credentials);
+    assert!(opened);
+    assert!(control.is_empty());
+
+    // Once the key is removed, the map refuses the packet and answers it with an unknown path
+    // secret packet.
+    assert!(map.remove_peer_key(&a));
+    let (opened, control) = open(&map, &credentials);
+    assert!(!opened);
+    assert!(!control.is_empty());
 }
 
 #[test]
