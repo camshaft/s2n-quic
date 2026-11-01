@@ -144,9 +144,13 @@ impl Client {
                 self.endpoint.dead_peer_cooldown,
             )
         {
+            let silence = path_secret_entry.silence(
+                self.endpoint.clock.now(),
+                self.endpoint.path_secret_map.entry_age(&path_secret_entry),
+            );
             self.endpoint
                 .path_secret_map
-                .evict_entry(&path_secret_entry);
+                .evict_dead_and_silent_entry(&path_secret_entry, silence);
             // The handshake queue may still hold the success of the handshake that built the
             // evicted entry, and would return it without handshaking. Drop that hold, so the
             // next call handshakes and inserts a new entry.
