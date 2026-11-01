@@ -294,6 +294,12 @@ impl Client {
             .handshake(&self.client, &self.map, peer, reason, server_name)
             .await
     }
+
+    /// Lets the next handshake with `peer` start at once where its last one succeeded, as
+    /// `HandshakeQueue::remove_completed` says.
+    pub(super) fn forget_completed_handshake(&self, peer: SocketAddr) {
+        self.queue.remove_completed(peer);
+    }
 }
 
 #[cfg(test)]
@@ -394,6 +400,27 @@ impl HandshakeQueue {
         match inner.table.find_entry(peer_hash, |e| e.peer == entry.peer) {
             Ok(o) => {
                 if Arc::ptr_eq(o.get(), entry) {
+                    o.remove();
+                }
+            }
+            Err(_) => {
+                // no further action to take
+            }
+        }
+    }
+
+    /// Removes the peer's de-duplication entry where its handshake already finished with a
+    /// success, so the next handshake with the peer starts at once instead of returning that
+    /// success. An entry whose handshake is still running, or that holds a failure, stays: the
+    /// peer still gets one handshake at a time, and a failure keeps its backoff.
+    fn remove_completed(&self, peer: SocketAddr) {
+        let peer: SocketAddress = peer.into();
+        let peer_hash = self.hasher.hash_one(peer);
+        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let inner = &mut *guard;
+        match inner.table.find_entry(peer_hash, |e| e.peer == peer) {
+            Ok(o) => {
+                if matches!(o.get().handshaker.get(), Some(Ok(()))) {
                     o.remove();
                 }
             }
@@ -800,6 +827,38 @@ mod tests {
                 .by_reason[HandshakeReason::Periodic as usize]
                 .load(Ordering::Relaxed),
             1
+        );
+    }
+
+    /// A successful handshake's de-duplication entry is removed, so the next handshake with the
+    /// peer starts at once; a handshake still running, or a failed one, stays held.
+    #[test]
+    fn remove_completed_keeps_running_and_failed_handshakes() {
+        let queue = HandshakeQueue::new(Duration::from_secs(60));
+        let peer: SocketAddr = "127.0.0.1:3333".parse().unwrap();
+
+        let running = queue.allocate_entry(peer, HandshakeReason::User);
+        queue.remove_completed(peer);
+        assert!(
+            Arc::ptr_eq(&running, &queue.allocate_entry(peer, HandshakeReason::User)),
+            "a running handshake stays held"
+        );
+
+        let refused = HandshakeFailed(io::Error::from(io::ErrorKind::ConnectionRefused));
+        running.handshaker.set(Err(refused)).unwrap();
+        queue.remove_completed(peer);
+        assert!(
+            Arc::ptr_eq(&running, &queue.allocate_entry(peer, HandshakeReason::User)),
+            "a failed handshake stays held"
+        );
+
+        queue.remove_entry(&running);
+        let succeeded = queue.allocate_entry(peer, HandshakeReason::User);
+        succeeded.handshaker.set(Ok(())).unwrap();
+        queue.remove_completed(peer);
+        assert!(
+            !Arc::ptr_eq(&succeeded, &queue.allocate_entry(peer, HandshakeReason::User)),
+            "a successful handshake is no longer held"
         );
     }
 }

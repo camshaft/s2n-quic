@@ -541,3 +541,105 @@ fn entry_without_negotiation_has_no_application_data() {
     let entry = Entry::builder((Ipv4Addr::LOCALHOST, 1).into()).build(None);
     assert!(entry.application_data().is_none());
 }
+
+/// `Store::evict_entry` removes the entry it's given by its id, and removes the peer's
+/// address mapping only where that mapping still points at the entry. A newer entry for the
+/// same peer, such as one a concurrent handshake inserted, keeps the address. Each removal
+/// emits its eviction event to the map's subscriber.
+#[test]
+fn evict_entry_keeps_newer_entry_for_same_peer() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    let subscriber = Arc::new(testing::Subscriber::no_snapshot());
+    let map = State::builder()
+        .with_signer(stateless_reset::Signer::new(b"secret"))
+        .with_capacity(10)
+        .with_clock(Clock)
+        .with_subscriber(subscriber.clone())
+        .build_state()
+        .unwrap();
+    map.cleaner.stop();
+    let count = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
+
+    let older = fake_entry(0);
+    let newer = fake_entry(1);
+    assert_eq!(older.peer(), newer.peer());
+    assert_ne!(older.id(), newer.id());
+
+    map.test_insert(older.clone());
+    map.test_insert(newer.clone());
+
+    // The newer entry took the peer's address from the older one; both stay in the id map.
+    let by_addr = map.get_by_addr_untracked(newer.peer()).unwrap();
+    assert!(Arc::ptr_eq(&by_addr, &newer));
+    assert!(map.ids.contains_key(older.id()));
+    assert!(map.ids.contains_key(newer.id()));
+    assert_eq!(count(&subscriber.path_secret_map_entry_replaced), 1);
+    assert_eq!(count(&subscriber.path_secret_map_id_entry_evicted), 0);
+    assert_eq!(count(&subscriber.path_secret_map_address_entry_evicted), 0);
+
+    // Evicting the older entry removes it by its id and leaves the address to the newer one.
+    map.evict_entry(&older);
+
+    let by_addr = map.get_by_addr_untracked(newer.peer()).unwrap();
+    assert!(Arc::ptr_eq(&by_addr, &newer));
+    assert!(!map.ids.contains_key(older.id()));
+    assert!(map.ids.contains_key(newer.id()));
+    assert_eq!(count(&subscriber.path_secret_map_id_entry_evicted), 1);
+    assert_eq!(count(&subscriber.path_secret_map_address_entry_evicted), 0);
+
+    // Evicting the entry the address maps to removes the address mapping too.
+    map.evict_entry(&newer);
+
+    assert!(map.get_by_addr_untracked(newer.peer()).is_none());
+    assert!(!map.ids.contains_key(newer.id()));
+    assert_eq!(count(&subscriber.path_secret_map_id_entry_evicted), 2);
+    assert_eq!(count(&subscriber.path_secret_map_address_entry_evicted), 1);
+}
+
+/// `Store::evict_dead_and_silent_entry` evicts the entry as `Store::evict_entry` does and emits
+/// `PathSecretMapDeadAndSilentEntryEvicted` beside the eviction events, once, for the call that
+/// removes the entry. A later call for an entry the map no longer holds emits nothing.
+#[test]
+fn evict_dead_and_silent_entry_emits_its_own_event() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    let subscriber = Arc::new(testing::Subscriber::no_snapshot());
+    let map = State::builder()
+        .with_signer(stateless_reset::Signer::new(b"secret"))
+        .with_capacity(10)
+        .with_clock(Clock)
+        .with_subscriber(subscriber.clone())
+        .build_state()
+        .unwrap();
+    map.cleaner.stop();
+    let count = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
+
+    let entry = fake_entry(0);
+    map.test_insert(entry.clone());
+    assert_eq!(
+        count(&subscriber.path_secret_map_dead_and_silent_entry_evicted),
+        0
+    );
+
+    map.evict_dead_and_silent_entry(&entry, Duration::from_secs(30));
+
+    assert!(map.get_by_addr_untracked(entry.peer()).is_none());
+    assert!(!map.ids.contains_key(entry.id()));
+    assert_eq!(
+        count(&subscriber.path_secret_map_dead_and_silent_entry_evicted),
+        1
+    );
+    assert_eq!(count(&subscriber.path_secret_map_id_entry_evicted), 1);
+    assert_eq!(count(&subscriber.path_secret_map_address_entry_evicted), 1);
+
+    // The map no longer holds the entry, so this eviction removes nothing and emits nothing.
+    map.evict_dead_and_silent_entry(&entry, Duration::from_secs(30));
+
+    assert_eq!(
+        count(&subscriber.path_secret_map_dead_and_silent_entry_evicted),
+        1
+    );
+    assert_eq!(count(&subscriber.path_secret_map_id_entry_evicted), 1);
+    assert_eq!(count(&subscriber.path_secret_map_address_entry_evicted), 1);
+}

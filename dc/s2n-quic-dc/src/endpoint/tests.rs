@@ -2653,6 +2653,164 @@ fn zombie_flow_not_invalidated_when_path_has_other_activity() {
     );
 }
 
+/// Reproduces a client stuck on a healthy peer: a client whose cached path-secret entry for
+/// that peer stops getting any answer stays in the dead-peer loop for as long as it keeps that
+/// entry.
+///
+/// Only an authenticated packet from the peer clears the dead mark, and each flow opened on the
+/// entry goes unanswered and marks it again, so nothing on the client ever leaves the loop
+/// short of restarting the process.
+///
+/// The monitor drops every server->client packet while the client's map still holds the entry
+/// the first stream used, which models per-peer state that broke on the client while the server
+/// and every other path stayed healthy. A fresh path secret works. Once the dead-peer cooldown
+/// has passed and the entry has been silent for an idle timeout, the client must evict it and
+/// pair again, so a stream completes within a few idle timeouts.
+#[test]
+fn dead_and_silent_peer_entry_is_replaced() {
+    use crate::{credentials::Id, stream::endpoint::testing::sim::lookup_sim_map};
+    use std::{net::SocketAddr, sync::Mutex};
+
+    type Broken = Arc<Mutex<Option<(crate::path::secret::Map, SocketAddr, Id)>>>;
+
+    let _no_snap = crate::testing::without_snapshots();
+    let recovered = Arc::new(AtomicBool::new(false));
+    let recovered_inner = recovered.clone();
+
+    sim(|| {
+        let acceptor_id = VarInt::from_u8(1);
+        let broken: Broken = Arc::new(Mutex::new(None));
+
+        // Drop every server->client packet while the client still uses the broken entry.
+        {
+            let broken = broken.clone();
+            let mut server_host = MonitorHostAddr::new("server");
+            bach::net::monitor::on_packet_sent(move |packet| {
+                let guard = broken.lock().unwrap();
+                if let Some((client_map, server_addr, old_id)) = guard.as_ref() {
+                    let still_old = client_map
+                        .get_raw(*server_addr)
+                        .is_some_and(|entry| entry.id() == old_id);
+                    if still_old && server_host.is_packet_source(packet) {
+                        return bach::net::monitor::Command::Drop;
+                    }
+                }
+                bach::net::monitor::Command::Pass
+            });
+        }
+
+        // Server: echo each stream back.
+        async move {
+            let server = Server::new();
+            let mut acceptor = server
+                .register_acceptor_channel(acceptor_id, 64)
+                .expect("acceptor registration");
+
+            while let Some(stream) = acceptor.recv().await {
+                async move {
+                    let (mut reader, mut writer) = stream.into_split();
+                    let mut buf = BytesMut::with_capacity(16);
+                    loop {
+                        match reader.read_into(&mut buf).await {
+                            Ok(0) => break,
+                            Ok(_) => {}
+                            Err(_) => return,
+                        }
+                    }
+                    let mut echo = buf.freeze();
+                    let _ = writer.write_all_from_fin(&mut echo).await;
+                }
+                .spawn();
+            }
+        }
+        .group("server")
+        .spawn();
+
+        // Client (primary).
+        async move {
+            let mut client = Client::new();
+
+            // A first stream works and records the entry it used.
+            let stream = client
+                .connect(format!("server:{SERVER_PORT}"), acceptor_id)
+                .await
+                .expect("connect 1");
+            let (mut reader, mut writer) = stream.into_split();
+            let mut ping = Bytes::from_static(b"ping");
+            writer.write_all_from_fin(&mut ping).await.expect("write 1");
+            let mut buf = BytesMut::with_capacity(16);
+            loop {
+                if reader.read_into(&mut buf).await.expect("read 1") == 0 {
+                    break;
+                }
+            }
+            assert_eq!(&buf[..], b"ping");
+            drop(reader);
+            drop(writer);
+
+            let server_addr = bach::net::lookup_host(format!("server:{SERVER_PORT}"))
+                .await
+                .expect("lookup")
+                .next()
+                .expect("server addr");
+            let client_map = lookup_sim_map(client.data_addr()).expect("client map");
+            let old_id = *client_map
+                .get_raw(server_addr)
+                .expect("entry after the first stream")
+                .id();
+
+            // From here on, nothing the server sends on that entry reaches the client.
+            *broken.lock().unwrap() = Some((client_map.clone(), server_addr, old_id));
+
+            // Keep opening streams, as a busy caller would, for at least five minutes.
+            for _ in 0..300 {
+                let peer = format!("server:{SERVER_PORT}");
+                let connect = client.connect(peer, acceptor_id);
+                let Ok(Ok(stream)) = timeout(5.s(), connect).await else {
+                    // Refused in the dead-peer cooldown window, or still waiting for a queue slot.
+                    1.s().sleep().await;
+                    continue;
+                };
+                let (mut reader, mut writer) = stream.into_split();
+                let mut ping = Bytes::from_static(b"ping");
+                if !matches!(
+                    timeout(5.s(), writer.write_all_from_fin(&mut ping)).await,
+                    Ok(Ok(_))
+                ) {
+                    continue;
+                }
+                let mut buf = BytesMut::with_capacity(16);
+                let done = loop {
+                    match timeout(5.s(), reader.read_into(&mut buf)).await {
+                        Ok(Ok(0)) => break true,
+                        Ok(Ok(_)) => {}
+                        _ => break false,
+                    }
+                };
+                if done && &buf[..] == b"ping" {
+                    let new_id = *client_map
+                        .get_raw(server_addr)
+                        .expect("entry after recovery")
+                        .id();
+                    assert_ne!(new_id, old_id, "recovery must come from a fresh entry");
+                    recovered_inner.store(true, Ordering::Relaxed);
+                    break;
+                }
+            }
+        }
+        .group("client")
+        .primary()
+        .spawn();
+    });
+
+    assert!(
+        recovered.load(Ordering::Relaxed),
+        "the client never completed a stream to a healthy server after its cached entry stopped \
+         getting answers: the dead-peer mark is only cleared by a packet from the peer, so the \
+         client stays in the dead-cooldown loop for as long as it keeps the entry"
+    );
+}
+
 /// Reproduces a bug where QueueFree frames in-flight during peer-dead invalidation
 /// are silently dropped, permanently leaking peer queue slots.
 ///

@@ -262,6 +262,17 @@ impl Provider {
         Ok(HandshakeKind::Fresh)
     }
 
+    /// Lets the next handshake with `peer` start at once where its last one succeeded.
+    ///
+    /// After a successful handshake, the client holds that success for a random period, and a
+    /// handshake requested within it returns that success without handshaking. A caller that
+    /// evicted the peer's entry from the map calls this before it handshakes again, so that
+    /// handshake builds a new entry. A handshake still running, or a failure, stays held.
+    #[inline]
+    pub(crate) fn forget_completed_handshake(&self, peer: SocketAddr) {
+        self.state.client.forget_completed_handshake(peer);
+    }
+
     /// This forces a handshake with the given peer, ignoring whether there's already an entry or
     /// not.
     #[inline]
@@ -307,5 +318,90 @@ impl Provider {
 
     pub fn map(&self) -> &secret::Map {
         &self.state.map
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        path::secret::{stateless_reset::Signer, Map},
+        testing::{init_tracing, server_name, NoopSubscriber, TestTlsProvider},
+    };
+    use s2n_quic_core::time::StdClock;
+    use std::{io::ErrorKind, time::Duration};
+
+    fn test_map() -> Map {
+        Map::builder()
+            .with_signer(Signer::new(b"default"))
+            .with_capacity(50_000)
+            .with_clock(StdClock::default())
+            .with_subscriber(NoopSubscriber {})
+            .build()
+            .unwrap()
+    }
+
+    /// The order `stream::Client::connect` follows after it evicts a dead and silent entry, with
+    /// a real handshake. While the handshake queue still holds the success of the handshake that
+    /// built the evicted entry, the next handshake returns that success without handshaking, and
+    /// fails since the map has no entry. Once `forget_completed_handshake` drops the hold, the
+    /// next handshake builds a new entry.
+    #[tokio::test]
+    async fn forget_completed_handshake_lets_a_handshake_replace_an_evicted_entry() {
+        init_tracing();
+
+        let tls = TestTlsProvider {};
+        let server = crate::psk::server::Provider::builder()
+            .start(
+                "[::1]:0".parse().unwrap(),
+                tls.clone(),
+                NoopSubscriber {},
+                test_map(),
+            )
+            .await
+            .unwrap();
+        let server_addr = server.local_addr();
+
+        // A success hold far longer than the test, so the first handshake's success is still
+        // held when its entry is evicted.
+        let client = Provider::builder()
+            .with_success_jitter(Duration::from_secs(1_000_000))
+            .start(
+                "[::]:0".parse().unwrap(),
+                test_map(),
+                tls,
+                NoopSubscriber {},
+                server_name(),
+            )
+            .unwrap();
+
+        let (first, kind) = client
+            .handshake_with_entry(server_addr, server_name())
+            .await
+            .unwrap();
+        assert!(matches!(kind, HandshakeKind::Fresh));
+        let first = first.into_raw();
+        let first_id = *first.id();
+
+        client.map().evict_entry(&first);
+        assert!(!client.map().contains(&server_addr));
+
+        // Without `forget_completed_handshake`, the held success comes back without a
+        // handshake, and the map has no entry for the peer.
+        let error = client
+            .handshake_with_entry(server_addr, server_name())
+            .await
+            .map(|_| ())
+            .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::NotFound, "{error}");
+
+        client.forget_completed_handshake(server_addr);
+
+        let (second, kind) = client
+            .handshake_with_entry(server_addr, server_name())
+            .await
+            .unwrap();
+        assert!(matches!(kind, HandshakeKind::Fresh));
+        assert_ne!(*second.into_raw().id(), first_id);
     }
 }
