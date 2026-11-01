@@ -61,6 +61,7 @@ mod counter {
                 109usize => Self(path_secret_map_cleaner_cycled),
                 126usize => Self(path_secret_map_id_write_lock),
                 129usize => Self(path_secret_map_address_write_lock),
+                132usize => Self(path_secret_map_dead_and_silent_entry_evicted),
                 _ => unreachable!("invalid info: {info:?}"),
             }
         }
@@ -160,6 +161,8 @@ mod counter {
             fn path_secret_map_id_write_lock(value: u64);
             # [link_name = s2n_quic_dc__event__counter__path_secret_map_address_write_lock]
             fn path_secret_map_address_write_lock(value: u64);
+            # [link_name = s2n_quic_dc__event__counter__path_secret_map_dead_and_silent_entry_evicted]
+            fn path_secret_map_dead_and_silent_entry_evicted(value: u64);
         }
     );
     pub mod bool {
@@ -240,6 +243,9 @@ mod counter {
                     }
                     103usize => {
                         Self(path_secret_map_address_cache_accessed_hit__peer_address__protocol)
+                    }
+                    133usize => {
+                        Self(path_secret_map_dead_and_silent_entry_evicted__peer_address__protocol)
                     }
                     _ => unreachable!("invalid info: {info:?}"),
                 }
@@ -449,6 +455,12 @@ mod counter {
                     variant: u64,
                     variant_name: &info::Str,
                 );
+                # [link_name = s2n_quic_dc__event__counter__nominal__path_secret_map_dead_and_silent_entry_evicted__peer_address__protocol]
+                fn path_secret_map_dead_and_silent_entry_evicted__peer_address__protocol(
+                    value: u64,
+                    variant: u64,
+                    variant_name: &info::Str,
+                );
             }
         );
     }
@@ -517,6 +529,8 @@ mod measure {
                 128usize => Self(path_secret_map_id_write_lock__duration),
                 130usize => Self(path_secret_map_address_write_lock__acquire),
                 131usize => Self(path_secret_map_address_write_lock__duration),
+                134usize => Self(path_secret_map_dead_and_silent_entry_evicted__age),
+                135usize => Self(path_secret_map_dead_and_silent_entry_evicted__silence),
                 _ => unreachable!("invalid info: {info:?}"),
             }
         }
@@ -632,6 +646,10 @@ mod measure {
             fn path_secret_map_address_write_lock__acquire(value: u64);
             # [link_name = s2n_quic_dc__event__measure__path_secret_map_address_write_lock__duration]
             fn path_secret_map_address_write_lock__duration(value: u64);
+            # [link_name = s2n_quic_dc__event__measure__path_secret_map_dead_and_silent_entry_evicted__age]
+            fn path_secret_map_dead_and_silent_entry_evicted__age(value: u64);
+            # [link_name = s2n_quic_dc__event__measure__path_secret_map_dead_and_silent_entry_evicted__silence]
+            fn path_secret_map_dead_and_silent_entry_evicted__silence(value: u64);
         }
     );
 }
