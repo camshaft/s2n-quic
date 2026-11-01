@@ -682,7 +682,20 @@ where
     }
 
     // Auto-insert path secrets (idempotent: re-uses existing entry if present).
-    let path_secret_entry = connect(endpoint, peer_addr);
+    let mut path_secret_entry = connect(endpoint, peer_addr);
+
+    // Mirrors `stream::Client::connect`: an entry marked dead, past the dead-peer cooldown, whose
+    // peer hasn't answered for a whole idle timeout is evicted for a fresh path pair, in place of
+    // refusing flows on it forever. The simulation has no handshake queue, so it doesn't model
+    // the hold on a recent successful handshake that `stream::Client::connect` drops.
+    if path_secret_entry.is_dead_and_silent(
+        endpoint.clock.now(),
+        endpoint.path_secret_map.entry_age(&path_secret_entry),
+        endpoint.dead_peer_cooldown,
+    ) {
+        endpoint.path_secret_map.evict_entry(&path_secret_entry);
+        path_secret_entry = connect(endpoint, peer_addr);
+    }
 
     let now = endpoint.clock.now();
     if path_secret_entry.is_dead_during_cooldown(now, endpoint.dead_peer_cooldown) {
