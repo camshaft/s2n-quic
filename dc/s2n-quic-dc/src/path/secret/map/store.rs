@@ -41,6 +41,11 @@ pub trait Store: 'static + Send + Sync + time::Clock {
     /// Removes `entry` by its id, and by its peer's address where the address still maps to it.
     fn evict_entry(&self, entry: &Arc<Entry>);
 
+    /// Removes `entry` as `evict_entry` does, for an entry whose peer was marked dead and stayed
+    /// silent for `silence`, and emits `PathSecretMapDeadAndSilentEntryEvicted` where it removed
+    /// the entry.
+    fn evict_dead_and_silent_entry(&self, entry: &Arc<Entry>, silence: core::time::Duration);
+
     fn on_new_path_secrets(&self, entry: Arc<Entry>);
 
     fn on_handshake_complete(&self, entry: Arc<Entry>);
