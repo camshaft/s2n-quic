@@ -125,10 +125,39 @@ impl Client {
         priority: crate::credit::Priority,
     ) -> io::Result<Stream> {
         let handshake_start = Instant::now();
-        let (peer, handshake_kind) = self
+        let peer_addr = peer;
+        let (peer, mut handshake_kind) = self
             .psk
-            .handshake_with_entry(peer, self.server_name.clone())
+            .handshake_with_entry(peer_addr, self.server_name.clone())
             .await?;
+        let mut path_secret_entry = peer.into_raw();
+
+        // A cached entry whose peer was marked dead, past the dead-peer cooldown, and hasn't
+        // answered for a whole idle timeout can't recover by itself: only a packet from the peer
+        // clears the mark, and each flow we open on it goes unanswered and marks it again. Evict
+        // it and handshake again, so the peer gets fresh keys and queue state, in place of
+        // refusing flows until the process restarts.
+        if matches!(handshake_kind, crate::path::secret::HandshakeKind::Cached)
+            && path_secret_entry.is_dead_and_silent(
+                self.endpoint.clock.now(),
+                self.endpoint.path_secret_map.entry_age(&path_secret_entry),
+                self.endpoint.dead_peer_cooldown,
+            )
+        {
+            self.endpoint
+                .path_secret_map
+                .evict_entry(&path_secret_entry);
+            // The handshake queue may still hold the success of the handshake that built the
+            // evicted entry, and would return it without handshaking. Drop that hold, so the
+            // next call handshakes and inserts a new entry.
+            self.psk.forget_completed_handshake(peer_addr);
+            let (peer, kind) = self
+                .psk
+                .handshake_with_entry(peer_addr, self.server_name.clone())
+                .await?;
+            path_secret_entry = peer.into_raw();
+            handshake_kind = kind;
+        }
         let handshake_elapsed = handshake_start.elapsed();
         let handshake_timer = match handshake_kind {
             crate::path::secret::HandshakeKind::Cached => {
@@ -140,7 +169,6 @@ impl Client {
         };
         handshake_timer.record(handshake_elapsed);
 
-        let path_secret_entry = peer.into_raw();
         let now = self.endpoint.clock.now();
         if path_secret_entry.is_dead_during_cooldown(now, self.endpoint.dead_peer_cooldown) {
             return Err(io::Error::new(
