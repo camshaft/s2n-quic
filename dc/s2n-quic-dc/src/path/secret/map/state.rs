@@ -823,6 +823,10 @@ where
         self.server_peers.clear();
     }
 
+    fn evict_entry(&self, entry: &Arc<Entry>) {
+        let _ = self.evict(entry);
+    }
+
     fn contains(&self, peer: &SocketAddr) -> bool {
         self.client_peers.contains_key(peer) || self.server_peers.contains_key(peer)
     }
