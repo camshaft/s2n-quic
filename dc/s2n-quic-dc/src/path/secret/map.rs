@@ -128,6 +128,20 @@ impl Map {
         self.store.contains(peer)
     }
 
+    /// Removes `entry` from the map, by its id and by its peer's address where the address
+    /// still maps to it. A newer entry for the same peer, such as one a concurrent handshake
+    /// inserted, stays.
+    pub(crate) fn evict_entry(&self, entry: &Arc<Entry>) {
+        self.store.evict_entry(entry);
+    }
+
+    /// Returns the time since `entry` was created, read from this map's clock, which is the
+    /// clock the entry's creation time comes from.
+    pub(crate) fn entry_age(&self, entry: &Entry) -> core::time::Duration {
+        time::Clock::get_time(&*self.store)
+            .saturating_duration_since(entry.creation_time())
+    }
+
     pub fn register_request_handshake(
         &self,
         cb: Box<dyn Fn(SocketAddr, HandshakeReason) -> Option<JoinHandle<()>> + Send + Sync>,
@@ -502,5 +516,59 @@ impl Map {
         >,
     ) {
         self.store.register_make_application_data(cb);
+    }
+}
+
+#[cfg(test)]
+mod entry_age_tests {
+    use super::*;
+    use crate::path::secret::{receiver, schedule, sender};
+    use core::time::Duration;
+
+    /// `Map::entry_age` reads the map's clock, the clock the handshake path takes a new entry's
+    /// creation time from (`HandshakingPath` passes `store.get_time()` to `Entry`), so the age it
+    /// returns is the time that clock has advanced since the entry was created.
+    #[test]
+    fn entry_age_is_measured_on_the_map_clock() {
+        // The test clock starts far from the process's own clocks, so an age read from any
+        // other clock wouldn't equal the test clock's advance.
+        let clock = crate::time::testing::Clock::new(Duration::from_secs(1_000));
+        let map = Map::builder()
+            .with_signer(stateless_reset::Signer::random())
+            .with_capacity(10)
+            .with_clock(clock.clone())
+            .with_subscriber(crate::event::tracing::Subscriber::default())
+            .build()
+            .unwrap();
+        map.test_stop_cleaner();
+
+        let secret = schedule::Secret::new(
+            schedule::Ciphersuite::AES_GCM_128_SHA256,
+            dc::SUPPORTED_VERSIONS[0],
+            s2n_quic_core::endpoint::Type::Client,
+            &[1; 32],
+        );
+        let id = *secret.id();
+        // As the handshake path does, the entry's creation time is the time of the map's store.
+        let creation_time = s2n_quic_core::time::Clock::get_time(&*map.store);
+        let entry = Entry::new(
+            "127.0.0.1:4567".parse().unwrap(),
+            secret,
+            sender::State::new([0; control::TAG_LEN]),
+            receiver::State::new(),
+            dc::testing::TEST_APPLICATION_PARAMS,
+            creation_time,
+            None,
+        );
+        map.store.test_insert(Arc::new(entry));
+        let entry = map.get_by_id(&id).expect("the map holds the inserted entry");
+
+        assert_eq!(map.entry_age(&entry), Duration::ZERO);
+
+        clock.advance(Duration::from_secs(7));
+        assert_eq!(map.entry_age(&entry), Duration::from_secs(7));
+
+        clock.advance(Duration::from_millis(250));
+        assert_eq!(map.entry_age(&entry), Duration::from_millis(7_250));
     }
 }
