@@ -147,6 +147,26 @@ fn dead_and_silent_after_cooldown_and_one_idle_timeout() {
     );
 }
 
+/// `Entry::silence` counts from the peer's last authenticated packet, and from the entry's
+/// creation, given as its age, where that is more recent.
+#[test]
+fn silence_counts_from_last_packet_or_creation() {
+    let entry = test_entry_with_senders(0);
+    let t0: crate::time::precision::Timestamp =
+        (unsafe { Timestamp::from_duration(Duration::from_secs(1000)) }).into();
+    entry.touch_activity(t0);
+    let old = Duration::from_secs(3600);
+    let five = Duration::from_secs(5);
+
+    assert_eq!(entry.silence(t0, old), Duration::ZERO);
+    assert_eq!(entry.silence(t0 + five, old), five);
+    // An entry younger than the time since the packet counts its silence from its creation.
+    assert_eq!(
+        entry.silence(t0 + five, Duration::from_secs(2)),
+        Duration::from_secs(2)
+    );
+}
+
 #[test]
 fn allocates_sender_schedule_slots() {
     let entry = test_entry_with_senders(4);
