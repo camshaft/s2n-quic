@@ -14,7 +14,7 @@ use crate::event::{
 };
 #[allow(unused_imports)]
 use core::sync::atomic::{AtomicU64, Ordering};
-static INFO: &[Info; 132usize] = &[
+static INFO: &[Info; 136usize] = &[
     info::Builder {
         id: 0usize,
         name: Str::new("stream_write_key_updated\0"),
@@ -807,6 +807,30 @@ static INFO: &[Info; 132usize] = &[
         units: Units::Duration,
     }
     .build(),
+    info::Builder {
+        id: 132usize,
+        name: Str::new("path_secret_map_dead_and_silent_entry_evicted\0"),
+        units: Units::None,
+    }
+    .build(),
+    info::Builder {
+        id: 133usize,
+        name: Str::new("path_secret_map_dead_and_silent_entry_evicted.peer_address.protocol\0"),
+        units: Units::None,
+    }
+    .build(),
+    info::Builder {
+        id: 134usize,
+        name: Str::new("path_secret_map_dead_and_silent_entry_evicted.age\0"),
+        units: Units::Duration,
+    }
+    .build(),
+    info::Builder {
+        id: 135usize,
+        name: Str::new("path_secret_map_dead_and_silent_entry_evicted.silence\0"),
+        units: Units::Duration,
+    }
+    .build(),
 ];
 #[derive(Debug)]
 #[allow(dead_code)]
@@ -815,15 +839,15 @@ pub struct ConnectionContext {
 }
 pub struct Subscriber<R: Registry> {
     #[allow(dead_code)]
-    counters: Box<[R::Counter; 44usize]>,
+    counters: Box<[R::Counter; 45usize]>,
     #[allow(dead_code)]
     bool_counters: Box<[R::BoolCounter; 4usize]>,
     #[allow(dead_code)]
     nominal_counters: Box<[R::NominalCounter]>,
     #[allow(dead_code)]
-    nominal_counter_offsets: Box<[usize; 32usize]>,
+    nominal_counter_offsets: Box<[usize; 33usize]>,
     #[allow(dead_code)]
-    measures: Box<[R::Measure; 52usize]>,
+    measures: Box<[R::Measure; 54usize]>,
     #[allow(dead_code)]
     gauges: Box<[R::Gauge; 0usize]>,
     #[allow(dead_code)]
@@ -850,11 +874,11 @@ impl<R: Registry> Subscriber<R> {
     #[allow(unused_mut)]
     #[inline]
     pub fn new(registry: R) -> Self {
-        let mut counters = Vec::with_capacity(44usize);
+        let mut counters = Vec::with_capacity(45usize);
         let mut bool_counters = Vec::with_capacity(4usize);
-        let mut nominal_counters = Vec::with_capacity(32usize);
-        let mut nominal_counter_offsets = Vec::with_capacity(32usize);
-        let mut measures = Vec::with_capacity(52usize);
+        let mut nominal_counters = Vec::with_capacity(33usize);
+        let mut nominal_counter_offsets = Vec::with_capacity(33usize);
+        let mut measures = Vec::with_capacity(54usize);
         let mut gauges = Vec::with_capacity(0usize);
         let mut timers = Vec::with_capacity(0usize);
         let mut nominal_timers = Vec::with_capacity(0usize);
@@ -903,6 +927,7 @@ impl<R: Registry> Subscriber<R> {
         counters.push(registry.register_counter(&INFO[109usize]));
         counters.push(registry.register_counter(&INFO[126usize]));
         counters.push(registry.register_counter(&INFO[129usize]));
+        counters.push(registry.register_counter(&INFO[132usize]));
         bool_counters.push(registry.register_bool_counter(&INFO[5usize]));
         bool_counters.push(registry.register_bool_counter(&INFO[6usize]));
         bool_counters.push(registry.register_bool_counter(&INFO[101usize]));
@@ -1262,6 +1287,17 @@ impl<R: Registry> Subscriber<R> {
                 debug_assert_ne!(count, 0, "field type needs at least one variant");
                 nominal_counter_offsets.push(offset);
             }
+            {
+                let offset = nominal_counters.len();
+                let mut count = 0;
+                for variant in <SocketAddress as AsVariant>::VARIANTS.iter() {
+                    nominal_counters
+                        .push(registry.register_nominal_counter(&INFO[133usize], variant));
+                    count += 1;
+                }
+                debug_assert_ne!(count, 0, "field type needs at least one variant");
+                nominal_counter_offsets.push(offset);
+            }
         }
         measures.push(registry.register_measure(&INFO[11usize]));
         measures.push(registry.register_measure(&INFO[12usize]));
@@ -1315,6 +1351,8 @@ impl<R: Registry> Subscriber<R> {
         measures.push(registry.register_measure(&INFO[128usize]));
         measures.push(registry.register_measure(&INFO[130usize]));
         measures.push(registry.register_measure(&INFO[131usize]));
+        measures.push(registry.register_measure(&INFO[134usize]));
+        measures.push(registry.register_measure(&INFO[135usize]));
         {
             #[allow(unused_imports)]
             use api::*;
@@ -1393,6 +1431,7 @@ impl<R: Registry> Subscriber<R> {
                 41usize => (&INFO[109usize], entry),
                 42usize => (&INFO[126usize], entry),
                 43usize => (&INFO[129usize], entry),
+                44usize => (&INFO[132usize], entry),
                 _ => unsafe { core::hint::unreachable_unchecked() },
             })
     }
@@ -1627,6 +1666,12 @@ impl<R: Registry> Subscriber<R> {
                     let entries = &self.nominal_counters[offset..offset + variants.len()];
                     (&INFO[103usize], entries, variants)
                 }
+                32usize => {
+                    let offset = *entry;
+                    let variants = <SocketAddress as AsVariant>::VARIANTS;
+                    let entries = &self.nominal_counters[offset..offset + variants.len()];
+                    (&INFO[133usize], entries, variants)
+                }
                 _ => unsafe { core::hint::unreachable_unchecked() },
             })
     }
@@ -1697,6 +1742,8 @@ impl<R: Registry> Subscriber<R> {
                 49usize => (&INFO[128usize], entry),
                 50usize => (&INFO[130usize], entry),
                 51usize => (&INFO[131usize], entry),
+                52usize => (&INFO[134usize], entry),
+                53usize => (&INFO[135usize], entry),
                 _ => unsafe { core::hint::unreachable_unchecked() },
             })
     }
@@ -2358,6 +2405,21 @@ impl<R: Registry> event::Subscriber for Subscriber<R> {
         self.count(129usize, 43usize, 1usize);
         self.measure(130usize, 50usize, event.acquire);
         self.measure(131usize, 51usize, event.duration);
+        let _ = event;
+        let _ = meta;
+    }
+    #[inline]
+    fn on_path_secret_map_dead_and_silent_entry_evicted(
+        &self,
+        meta: &api::EndpointMeta,
+        event: &api::PathSecretMapDeadAndSilentEntryEvicted,
+    ) {
+        #[allow(unused_imports)]
+        use api::*;
+        self.count(132usize, 44usize, 1usize);
+        self.count_nominal(133usize, 32usize, &event.peer_address);
+        self.measure(134usize, 52usize, event.age);
+        self.measure(135usize, 53usize, event.silence);
         let _ = event;
         let _ = meta;
     }
