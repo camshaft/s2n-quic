@@ -241,3 +241,82 @@ fn pacing_delays_frames_beyond_burst() {
         .spawn();
     });
 }
+
+/// A data frame of a stream at `priority`, carrying `payload_size` bytes.
+fn stream_frame(
+    pse: &std::sync::Arc<crate::path::secret::map::Entry>,
+    priority: crate::credit::Priority,
+    payload_size: usize,
+) -> crate::intrusive::Entry<frame::Frame> {
+    let mut entry = test_frame_with_payload(pse, payload_size);
+    let frame::Header::QueueData { priority: slot, .. } = &mut entry.header else {
+        unreachable!("test_frame_with_payload builds a QueueData frame");
+    };
+    *slot = priority;
+    entry
+}
+
+/// A frame of a higher-priority stream that arrives behind a backlog in front of the pacer
+/// leaves frame dispatch ahead of that backlog.
+///
+/// `BACKLOG` lowest-priority frames, each filling a batch, are submitted first, and frame
+/// dispatch starts on them; a highest-priority frame is submitted behind them. In arrival order
+/// it would leave last. It leaves third at the latest: by the time it arrives, the pacer has sent
+/// at most one batch and holds at most one more until its pacing timer fires.
+#[test]
+fn higher_priority_frame_leaves_ahead_of_the_paced_backlog() {
+    use crate::credit::Priority;
+
+    const BACKLOG: usize = 8;
+    // A frame of this payload fills a batch on its own, so the pacer paces each one.
+    const LARGE_FRAME_SIZE: usize = u16::MAX as usize;
+
+    sim(|| {
+        let (mut frame_tx, mut rxs) = setup_with_rates(1, Rate::new(100.0));
+        let mut worker_rx = rxs.pop().unwrap();
+
+        async move {
+            let pse = crate::path::secret::map::Entry::builder("127.0.0.1:4433".parse().unwrap())
+                .socket_sender_count(1)
+                .build(None);
+            let mut input = PriorityInput::default();
+            for _ in 0..BACKLOG {
+                input.push(stream_frame(&pse, Priority::Background, LARGE_FRAME_SIZE));
+            }
+            frame_tx.send_batch(input).unwrap();
+
+            // Let frame dispatch start on the backlog before the higher-priority frame arrives.
+            bach::task::yield_now().await;
+
+            let mut input = PriorityInput::default();
+            input.push(stream_frame(&pse, Priority::Highest, 16));
+            frame_tx.send_batch(input).unwrap();
+        }
+        .primary()
+        .spawn();
+
+        async move {
+            let mut position = None;
+            for i in 0..=BACKLOG {
+                let batch = worker_rx.recv().await.unwrap();
+                let (queues, _) = batch.into_inner().into_queues();
+                if queues
+                    .iter()
+                    .flat_map(|queue| queue.iter())
+                    .any(|frame| frame.stream_priority() == Priority::Highest)
+                {
+                    position = Some(i);
+                }
+            }
+            let position = position.expect("the highest-priority frame must leave frame dispatch");
+            assert!(
+                position <= 2,
+                "the highest-priority frame left in batch {position} of {}; it must leave by the \
+                 third, behind at most the batch the pacer sent and the one it held",
+                BACKLOG + 1
+            );
+        }
+        .primary()
+        .spawn();
+    });
+}
