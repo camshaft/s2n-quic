@@ -1018,6 +1018,36 @@ pub mod api {
     impl Event for PathSecretMapAddressWriteLock {
         const NAME: &'static str = "path_secret_map:address_cache_write_lock";
     }
+    #[derive(Clone, Debug)]
+    #[non_exhaustive]
+    #[doc = " Emitted when an entry is evicted because its peer was marked dead and stayed silent"]
+    #[doc = ""]
+    #[doc = " The peer was marked dead, the dead-peer cooldown passed, and the peer did not send an"]
+    #[doc = " authenticated packet for at least one idle timeout. A client evicts such an entry to"]
+    #[doc = " handshake again, instead of refusing flows on it."]
+    pub struct PathSecretMapDeadAndSilentEntryEvicted<'a> {
+        pub peer_address: SocketAddress<'a>,
+        pub credential_id: &'a [u8],
+        #[doc = " Time since insertion of this entry"]
+        pub age: core::time::Duration,
+        #[doc = " Time since the last authenticated packet from the peer, or since insertion where the"]
+        #[doc = " peer has not sent one"]
+        pub silence: core::time::Duration,
+    }
+    #[cfg(any(test, feature = "testing"))]
+    impl<'a> crate::event::snapshot::Fmt for PathSecretMapDeadAndSilentEntryEvicted<'a> {
+        fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
+            let mut fmt = fmt.debug_struct("PathSecretMapDeadAndSilentEntryEvicted");
+            fmt.field("peer_address", &self.peer_address);
+            fmt.field("credential_id", &"[HIDDEN]");
+            fmt.field("age", &self.age);
+            fmt.field("silence", &self.silence);
+            fmt.finish()
+        }
+    }
+    impl<'a> Event for PathSecretMapDeadAndSilentEntryEvicted<'a> {
+        const NAME: &'static str = "path_secret_map:dead_and_silent_entry_evicted";
+    }
 }
 pub mod tracing {
     #![doc = r" This module contains event integration with [`tracing`](https://docs.rs/tracing)"]
@@ -1621,6 +1651,21 @@ pub mod tracing {
             let parent = self.parent(meta);
             let api::PathSecretMapAddressWriteLock { acquire, duration } = event;
             tracing :: event ! (target : "path_secret_map_address_write_lock" , parent : parent , tracing :: Level :: DEBUG , { acquire = tracing :: field :: debug (acquire) , duration = tracing :: field :: debug (duration) });
+        }
+        #[inline]
+        fn on_path_secret_map_dead_and_silent_entry_evicted(
+            &self,
+            meta: &api::EndpointMeta,
+            event: &api::PathSecretMapDeadAndSilentEntryEvicted,
+        ) {
+            let parent = self.parent(meta);
+            let api::PathSecretMapDeadAndSilentEntryEvicted {
+                peer_address,
+                credential_id,
+                age,
+                silence,
+            } = event;
+            tracing :: event ! (target : "path_secret_map_dead_and_silent_entry_evicted" , parent : parent , tracing :: Level :: DEBUG , { peer_address = tracing :: field :: debug (peer_address) , credential_id = tracing :: field :: debug (credential_id) , age = tracing :: field :: debug (age) , silence = tracing :: field :: debug (silence) });
         }
     }
 }
@@ -2644,6 +2689,40 @@ pub mod builder {
             }
         }
     }
+    #[derive(Clone, Debug)]
+    #[doc = " Emitted when an entry is evicted because its peer was marked dead and stayed silent"]
+    #[doc = ""]
+    #[doc = " The peer was marked dead, the dead-peer cooldown passed, and the peer did not send an"]
+    #[doc = " authenticated packet for at least one idle timeout. A client evicts such an entry to"]
+    #[doc = " handshake again, instead of refusing flows on it."]
+    pub struct PathSecretMapDeadAndSilentEntryEvicted<'a> {
+        pub peer_address: SocketAddress<'a>,
+        pub credential_id: &'a [u8],
+        #[doc = " Time since insertion of this entry"]
+        pub age: core::time::Duration,
+        #[doc = " Time since the last authenticated packet from the peer, or since insertion where the"]
+        #[doc = " peer has not sent one"]
+        pub silence: core::time::Duration,
+    }
+    impl<'a> IntoEvent<api::PathSecretMapDeadAndSilentEntryEvicted<'a>>
+        for PathSecretMapDeadAndSilentEntryEvicted<'a>
+    {
+        #[inline]
+        fn into_event(self) -> api::PathSecretMapDeadAndSilentEntryEvicted<'a> {
+            let PathSecretMapDeadAndSilentEntryEvicted {
+                peer_address,
+                credential_id,
+                age,
+                silence,
+            } = self;
+            api::PathSecretMapDeadAndSilentEntryEvicted {
+                peer_address: peer_address.into_event(),
+                credential_id: credential_id.into_event(),
+                age: age.into_event(),
+                silence: silence.into_event(),
+            }
+        }
+    }
 }
 pub use traits::*;
 mod traits {
@@ -3142,6 +3221,16 @@ mod traits {
             let _ = meta;
             let _ = event;
         }
+        #[doc = "Called when the `PathSecretMapDeadAndSilentEntryEvicted` event is triggered"]
+        #[inline]
+        fn on_path_secret_map_dead_and_silent_entry_evicted(
+            &self,
+            meta: &api::EndpointMeta,
+            event: &api::PathSecretMapDeadAndSilentEntryEvicted,
+        ) {
+            let _ = meta;
+            let _ = event;
+        }
         #[doc = r" Called for each event that relates to the endpoint and all connections"]
         #[inline]
         fn on_event<M: Meta, E: Event>(&self, meta: &M, event: &E) {
@@ -3550,6 +3639,15 @@ mod traits {
         ) {
             self.as_ref()
                 .on_path_secret_map_address_write_lock(meta, event);
+        }
+        #[inline]
+        fn on_path_secret_map_dead_and_silent_entry_evicted(
+            &self,
+            meta: &api::EndpointMeta,
+            event: &api::PathSecretMapDeadAndSilentEntryEvicted,
+        ) {
+            self.as_ref()
+                .on_path_secret_map_dead_and_silent_entry_evicted(meta, event);
         }
         #[inline]
         fn on_event<M: Meta, E: Event>(&self, meta: &M, event: &E) {
@@ -3979,6 +4077,15 @@ mod traits {
             (self.1).on_path_secret_map_address_write_lock(meta, event);
         }
         #[inline]
+        fn on_path_secret_map_dead_and_silent_entry_evicted(
+            &self,
+            meta: &api::EndpointMeta,
+            event: &api::PathSecretMapDeadAndSilentEntryEvicted,
+        ) {
+            (self.0).on_path_secret_map_dead_and_silent_entry_evicted(meta, event);
+            (self.1).on_path_secret_map_dead_and_silent_entry_evicted(meta, event);
+        }
+        #[inline]
         fn on_event<M: Meta, E: Event>(&self, meta: &M, event: &E) {
             self.0.on_event(meta, event);
             self.1.on_event(meta, event);
@@ -4130,6 +4237,11 @@ mod traits {
         fn on_path_secret_map_address_write_lock(
             &self,
             event: builder::PathSecretMapAddressWriteLock,
+        );
+        #[doc = "Publishes a `PathSecretMapDeadAndSilentEntryEvicted` event to the publisher's subscriber"]
+        fn on_path_secret_map_dead_and_silent_entry_evicted(
+            &self,
+            event: builder::PathSecretMapDeadAndSilentEntryEvicted,
         );
         #[doc = r" Returns the QUIC version, if any"]
         fn quic_version(&self) -> Option<u32>;
@@ -4495,6 +4607,16 @@ mod traits {
             self.subscriber.on_event(&self.meta, &event);
         }
         #[inline]
+        fn on_path_secret_map_dead_and_silent_entry_evicted(
+            &self,
+            event: builder::PathSecretMapDeadAndSilentEntryEvicted,
+        ) {
+            let event = event.into_event();
+            self.subscriber
+                .on_path_secret_map_dead_and_silent_entry_evicted(&self.meta, &event);
+            self.subscriber.on_event(&self.meta, &event);
+        }
+        #[inline]
         fn quic_version(&self) -> Option<u32> {
             self.quic_version
         }
@@ -4622,6 +4744,7 @@ pub mod testing {
             pub path_secret_map_cleaner_cycled: AtomicU64,
             pub path_secret_map_id_write_lock: AtomicU64,
             pub path_secret_map_address_write_lock: AtomicU64,
+            pub path_secret_map_dead_and_silent_entry_evicted: AtomicU64,
         }
         impl Drop for Subscriber {
             fn drop(&mut self) {
@@ -4695,6 +4818,7 @@ pub mod testing {
                     path_secret_map_cleaner_cycled: AtomicU64::new(0),
                     path_secret_map_id_write_lock: AtomicU64::new(0),
                     path_secret_map_address_write_lock: AtomicU64::new(0),
+                    path_secret_map_dead_and_silent_entry_evicted: AtomicU64::new(0),
                 }
             }
         }
@@ -5202,6 +5326,18 @@ pub mod testing {
                 let out = format!("{meta:?} {event:?}");
                 self.output.lock().unwrap().push(out);
             }
+            fn on_path_secret_map_dead_and_silent_entry_evicted(
+                &self,
+                meta: &api::EndpointMeta,
+                event: &api::PathSecretMapDeadAndSilentEntryEvicted,
+            ) {
+                self.path_secret_map_dead_and_silent_entry_evicted
+                    .fetch_add(1, Ordering::Relaxed);
+                let meta = crate::event::snapshot::Fmt::to_snapshot(meta);
+                let event = crate::event::snapshot::Fmt::to_snapshot(event);
+                let out = format!("{meta:?} {event:?}");
+                self.output.lock().unwrap().push(out);
+            }
         }
     }
     #[derive(Debug)]
@@ -5252,6 +5388,7 @@ pub mod testing {
         pub path_secret_map_cleaner_cycled: AtomicU64,
         pub path_secret_map_id_write_lock: AtomicU64,
         pub path_secret_map_address_write_lock: AtomicU64,
+        pub path_secret_map_dead_and_silent_entry_evicted: AtomicU64,
     }
     impl Drop for Subscriber {
         fn drop(&mut self) {
@@ -5327,6 +5464,7 @@ pub mod testing {
                 path_secret_map_cleaner_cycled: AtomicU64::new(0),
                 path_secret_map_id_write_lock: AtomicU64::new(0),
                 path_secret_map_address_write_lock: AtomicU64::new(0),
+                path_secret_map_dead_and_silent_entry_evicted: AtomicU64::new(0),
             }
         }
     }
@@ -5863,6 +6001,18 @@ pub mod testing {
             let out = format!("{meta:?} {event:?}");
             self.output.lock().unwrap().push(out);
         }
+        fn on_path_secret_map_dead_and_silent_entry_evicted(
+            &self,
+            meta: &api::EndpointMeta,
+            event: &api::PathSecretMapDeadAndSilentEntryEvicted,
+        ) {
+            self.path_secret_map_dead_and_silent_entry_evicted
+                .fetch_add(1, Ordering::Relaxed);
+            let meta = crate::event::snapshot::Fmt::to_snapshot(meta);
+            let event = crate::event::snapshot::Fmt::to_snapshot(event);
+            let out = format!("{meta:?} {event:?}");
+            self.output.lock().unwrap().push(out);
+        }
     }
     #[derive(Debug)]
     pub struct Publisher {
@@ -5912,6 +6062,7 @@ pub mod testing {
         pub path_secret_map_cleaner_cycled: AtomicU64,
         pub path_secret_map_id_write_lock: AtomicU64,
         pub path_secret_map_address_write_lock: AtomicU64,
+        pub path_secret_map_dead_and_silent_entry_evicted: AtomicU64,
     }
     impl Publisher {
         #[doc = r" Creates a publisher with snapshot assertions enabled"]
@@ -5977,6 +6128,7 @@ pub mod testing {
                 path_secret_map_cleaner_cycled: AtomicU64::new(0),
                 path_secret_map_id_write_lock: AtomicU64::new(0),
                 path_secret_map_address_write_lock: AtomicU64::new(0),
+                path_secret_map_dead_and_silent_entry_evicted: AtomicU64::new(0),
             }
         }
     }
@@ -6349,6 +6501,17 @@ pub mod testing {
             event: builder::PathSecretMapAddressWriteLock,
         ) {
             self.path_secret_map_address_write_lock
+                .fetch_add(1, Ordering::Relaxed);
+            let event = event.into_event();
+            let event = crate::event::snapshot::Fmt::to_snapshot(&event);
+            let out = format!("{event:?}");
+            self.output.lock().unwrap().push(out);
+        }
+        fn on_path_secret_map_dead_and_silent_entry_evicted(
+            &self,
+            event: builder::PathSecretMapDeadAndSilentEntryEvicted,
+        ) {
+            self.path_secret_map_dead_and_silent_entry_evicted
                 .fetch_add(1, Ordering::Relaxed);
             let event = event.into_event();
             let event = crate::event::snapshot::Fmt::to_snapshot(&event);

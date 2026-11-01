@@ -693,7 +693,13 @@ where
         endpoint.path_secret_map.entry_age(&path_secret_entry),
         endpoint.dead_peer_cooldown,
     ) {
-        endpoint.path_secret_map.evict_entry(&path_secret_entry);
+        let silence = path_secret_entry.silence(
+            endpoint.clock.now(),
+            endpoint.path_secret_map.entry_age(&path_secret_entry),
+        );
+        endpoint
+            .path_secret_map
+            .evict_dead_and_silent_entry(&path_secret_entry, silence);
         path_secret_entry = connect(endpoint, peer_addr);
     }
 

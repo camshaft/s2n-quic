@@ -131,8 +131,20 @@ impl Map {
     /// Removes `entry` from the map, by its id and by its peer's address where the address
     /// still maps to it. A newer entry for the same peer, such as one a concurrent handshake
     /// inserted, stays.
+    #[cfg(test)]
     pub(crate) fn evict_entry(&self, entry: &Arc<Entry>) {
         self.store.evict_entry(entry);
+    }
+
+    /// Removes `entry` from the map as `evict_entry` does, for an entry whose peer was marked
+    /// dead and stayed silent for `silence`, and emits `PathSecretMapDeadAndSilentEntryEvicted`
+    /// where it removed the entry. `silence` is the entry's `Entry::silence` at the eviction.
+    pub(crate) fn evict_dead_and_silent_entry(
+        &self,
+        entry: &Arc<Entry>,
+        silence: core::time::Duration,
+    ) {
+        self.store.evict_dead_and_silent_entry(entry, silence);
     }
 
     /// Returns the time since `entry` was created, read from this map's clock, which is the

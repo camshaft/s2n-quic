@@ -475,8 +475,15 @@ impl Entry {
         if !dead || self.is_dead_during_cooldown(now, cooldown) {
             return false;
         }
-        let since_last_packet = Duration::from_nanos(now.nanos_since(self.last_activity()));
-        since_last_packet.min(age) >= self.idle_timeout()
+        self.silence(now, age) >= self.idle_timeout()
+    }
+
+    /// Returns the time since the peer's last authenticated packet, or since the entry's creation
+    /// where the peer hasn't sent one yet. `age` is the time since the entry was created, read
+    /// from the clock of the map that holds it (`Map::entry_age`).
+    #[inline]
+    pub fn silence(&self, now: crate::time::precision::Timestamp, age: Duration) -> Duration {
+        Duration::from_nanos(now.nanos_since(self.last_activity())).min(age)
     }
 
     pub fn is_idle_expired(&self, now: crate::time::precision::Timestamp) -> bool {
