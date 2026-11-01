@@ -596,3 +596,50 @@ fn evict_entry_keeps_newer_entry_for_same_peer() {
     assert_eq!(count(&subscriber.path_secret_map_id_entry_evicted), 2);
     assert_eq!(count(&subscriber.path_secret_map_address_entry_evicted), 1);
 }
+
+/// `Store::evict_dead_and_silent_entry` evicts the entry as `Store::evict_entry` does and emits
+/// `PathSecretMapDeadAndSilentEntryEvicted` beside the eviction events, once, for the call that
+/// removes the entry. A later call for an entry the map no longer holds emits nothing.
+#[test]
+fn evict_dead_and_silent_entry_emits_its_own_event() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    let subscriber = Arc::new(testing::Subscriber::no_snapshot());
+    let map = State::builder()
+        .with_signer(stateless_reset::Signer::new(b"secret"))
+        .with_capacity(10)
+        .with_clock(Clock)
+        .with_subscriber(subscriber.clone())
+        .build_state()
+        .unwrap();
+    map.cleaner.stop();
+    let count = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
+
+    let entry = fake_entry(0);
+    map.test_insert(entry.clone());
+    assert_eq!(
+        count(&subscriber.path_secret_map_dead_and_silent_entry_evicted),
+        0
+    );
+
+    map.evict_dead_and_silent_entry(&entry, Duration::from_secs(30));
+
+    assert!(map.get_by_addr_untracked(entry.peer()).is_none());
+    assert!(!map.ids.contains_key(entry.id()));
+    assert_eq!(
+        count(&subscriber.path_secret_map_dead_and_silent_entry_evicted),
+        1
+    );
+    assert_eq!(count(&subscriber.path_secret_map_id_entry_evicted), 1);
+    assert_eq!(count(&subscriber.path_secret_map_address_entry_evicted), 1);
+
+    // The map no longer holds the entry, so this eviction removes nothing and emits nothing.
+    map.evict_dead_and_silent_entry(&entry, Duration::from_secs(30));
+
+    assert_eq!(
+        count(&subscriber.path_secret_map_dead_and_silent_entry_evicted),
+        1
+    );
+    assert_eq!(count(&subscriber.path_secret_map_id_entry_evicted), 1);
+    assert_eq!(count(&subscriber.path_secret_map_address_entry_evicted), 1);
+}
