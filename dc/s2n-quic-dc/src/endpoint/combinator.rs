@@ -421,6 +421,91 @@ where
     }
 }
 
+// ── StreamPriorityLane ────────────────────────────────────────────────────
+
+/// Orders one frame-class lane of frame dispatch by the priority of the stream that sent each
+/// frame.
+///
+/// The priority router hands each lane whole queues of frames in arrival order, and frame
+/// dispatch paces what it takes from the lanes at the endpoint's overall send rate, so under
+/// load the backlog waits here, in front of the pacer. Each poll moves every frame the lane has
+/// received into one queue per [`crate::credit::Priority`] level, then yields the oldest frame
+/// of the highest level that holds one. A frame of a higher-priority stream therefore goes
+/// ahead of every queued frame of a lower-priority stream, and frames of one level keep their
+/// arrival order.
+///
+/// Each yield is a queue of one frame, the input [`crate::counter::GaugedQueueReceiver`] reads,
+/// so its gauge still counts each frame as frame dispatch takes it.
+pub struct StreamPriorityLane<R> {
+    inner: R,
+    levels: [Queue<Frame>; crate::credit::Priority::LEVELS],
+    closed: bool,
+}
+
+impl<R> StreamPriorityLane<R> {
+    #[inline]
+    pub fn new(inner: R) -> Self {
+        Self {
+            inner,
+            levels: core::array::from_fn(|_| Queue::new()),
+            closed: false,
+        }
+    }
+
+    #[inline]
+    fn push(&mut self, frame: Entry<Frame>) {
+        let level = frame.stream_priority().as_u8() as usize;
+        self.levels[level].push_back(frame);
+    }
+
+    #[inline]
+    fn pop(&mut self) -> Option<Entry<Frame>> {
+        self.levels.iter_mut().find_map(|level| level.pop_front())
+    }
+}
+
+impl<R> Receiver<Queue<Frame>> for StreamPriorityLane<R>
+where
+    R: Receiver<Queue<Frame>>,
+{
+    fn poll_recv(
+        &mut self,
+        cx: &mut task::Context<'_>,
+        budget: &mut Budget,
+    ) -> Poll<Option<Queue<Frame>>> {
+        // Take whatever the lane holds now, so the choice below sees every frame that has
+        // arrived, a higher-priority frame behind a backlog of lower-priority ones among them.
+        if !self.closed {
+            match self.inner.poll_recv(cx, budget) {
+                Poll::Ready(Some(mut queue)) => {
+                    while let Some(frame) = queue.pop_front() {
+                        self.push(frame);
+                    }
+                }
+                Poll::Ready(None) => self.closed = true,
+                Poll::Pending => {}
+            }
+        }
+
+        if let Some(frame) = self.pop() {
+            let mut next = Queue::new();
+            next.push_back(frame);
+            return Poll::Ready(Some(next));
+        }
+
+        if self.closed {
+            Poll::Ready(None)
+        } else {
+            Poll::Pending
+        }
+    }
+
+    #[inline]
+    fn on_consumed(&mut self, bytes: u64) {
+        self.inner.on_consumed(bytes);
+    }
+}
+
 /// Items that receive a sender assignment from the pick-two router.
 pub trait AssignSender {
     fn set_sender_id(&mut self, id: LocalSenderId);
