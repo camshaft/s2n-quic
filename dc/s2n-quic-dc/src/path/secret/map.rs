@@ -561,7 +561,9 @@ mod entry_age_tests {
             None,
         );
         map.store.test_insert(Arc::new(entry));
-        let entry = map.get_by_id(&id).expect("the map holds the inserted entry");
+        let entry = map
+            .get_by_id(&id)
+            .expect("the map holds the inserted entry");
 
         assert_eq!(map.entry_age(&entry), Duration::ZERO);
 
