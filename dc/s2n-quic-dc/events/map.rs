@@ -454,3 +454,27 @@ struct PathSecretMapAddressWriteLock {
     #[measure("duration", Duration)]
     duration: core::time::Duration,
 }
+
+#[event("path_secret_map:dead_and_silent_entry_evicted")]
+#[subject(endpoint)]
+/// Emitted when an entry is evicted because its peer was marked dead and stayed silent
+///
+/// The peer was marked dead, the dead-peer cooldown passed, and the peer did not send an
+/// authenticated packet for at least one idle timeout. A client evicts such an entry to
+/// handshake again, instead of refusing flows on it.
+struct PathSecretMapDeadAndSilentEntryEvicted<'a> {
+    #[nominal_counter("peer_address.protocol")]
+    peer_address: SocketAddress<'a>,
+
+    #[snapshot("[HIDDEN]")]
+    credential_id: &'a [u8],
+
+    /// Time since insertion of this entry
+    #[measure("age", Duration)]
+    age: core::time::Duration,
+
+    /// Time since the last authenticated packet from the peer, or since insertion where the
+    /// peer has not sent one
+    #[measure("silence", Duration)]
+    silence: core::time::Duration,
+}
