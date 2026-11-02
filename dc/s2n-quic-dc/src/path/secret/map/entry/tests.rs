@@ -192,7 +192,7 @@ fn touch_activity_reports_a_dead_mark_two_workers_clear_at_once_to_one_of_them()
         (marked, reported)
     });
 
-    for (round, (marked, reported)) in marked.into_iter().zip(reported).enumerate() {
+    for (round, (marked, reported)) in (1..=ROUNDS).zip(marked.into_iter().zip(reported)) {
         assert!(marked, "round {round}: the mark takes effect");
         assert_eq!(reported, 1, "round {round}: one worker, and only one, reports the clear");
     }
