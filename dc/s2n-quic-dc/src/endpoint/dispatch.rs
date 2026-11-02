@@ -585,8 +585,10 @@ where
     }
     let mut peer = peer_rc.borrow_mut();
 
-    // Packet number deduplication
-    if peer.dedup_filter.on_packet_number(packet_number).is_err() {
+    // Packet number deduplication. A packet that passes it has opened and isn't a replay, so
+    // `on_opened_packet` counts it as use of the path secret for the map's eviction order, on a
+    // cache hit as on a miss.
+    if peer.on_opened_packet(packet_number).is_err() {
         record_packet_drop(
             packet_number,
             source_sender_id,
