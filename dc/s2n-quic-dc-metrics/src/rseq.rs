@@ -52,16 +52,48 @@ const _: () = assert!(std::mem::size_of::<Page>() == PAGE_SIZE);
 #[cfg(test)]
 static PAGES_ALLOCATED: AtomicU64 = AtomicU64::new(0);
 
+#[cfg(test)]
+thread_local! {
+    /// Test-only count of the [`Page`]s made on this thread, which a single-threaded test reads
+    /// without counting other tests' pages.
+    static PAGES_MADE_HERE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// Test-only count of the [`Page`]s dropped on this thread.
+    static PAGES_FREED_HERE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Test-only: the number of [`Page`]s made on this thread so far.
+#[cfg(all(test, target_os = "linux"))]
+fn pages_made_here() -> u64 {
+    PAGES_MADE_HERE.with(std::cell::Cell::get)
+}
+
+/// Test-only: the number of [`Page`]s dropped on this thread so far.
+#[cfg(test)]
+fn pages_freed_here() -> u64 {
+    PAGES_FREED_HERE.with(std::cell::Cell::get)
+}
+
 #[cfg(any(test, target_os = "linux"))]
 impl Page {
     fn new() -> Box<Page> {
         #[cfg(test)]
         PAGES_ALLOCATED.fetch_add(1, Ordering::Relaxed);
+        #[cfg(test)]
+        PAGES_MADE_HERE.with(|made| made.set(made.get() + 1));
         Box::new(Page {
             slots: [const { MaybeUninit::uninit() }; SLOTS],
             length: AtomicU64::new(0),
             next: AtomicPtr::new(std::ptr::null_mut()),
         })
+    }
+}
+
+/// Test-only: counts each dropped page for [`pages_freed_here`].
+#[cfg(test)]
+impl Drop for Page {
+    fn drop(&mut self) {
+        // `try_with`: a page can drop while this thread's locals are being torn down.
+        let _ = PAGES_FREED_HERE.try_with(|freed| freed.set(freed.get() + 1));
     }
 }
 
@@ -983,6 +1015,32 @@ mod tests {
 
         let count = channels.get_mut(0, |v| v.value);
         assert_eq!(count, total_events as u64);
+    }
+
+    /// Dropping a `Channels` frees every page it used. Its `Drop` folds each page into the
+    /// `empty_pages` pool, so a pool that dropped without freeing them leaked the pages of every
+    /// dropped registry: a `cargo test` process that makes a registry for each simulated endpoint
+    /// grew until its runner ran out of memory.
+    #[test]
+    fn dropping_channels_frees_their_pages() {
+        let made_before = pages_made_here();
+        let freed_before = pages_freed_here();
+
+        let channels = Channels::<TestAbsorber>::new();
+        channels.allocate();
+        // Fill a few pages, so the drop has full pages and per-CPU pages to free.
+        for _ in 0..SLOTS * 4 {
+            channels.send_event(0);
+        }
+        let uses_pages = !channels.must_use_fallback && !RSEQ_FAILED.load(Ordering::Relaxed);
+        drop(channels);
+
+        let made = pages_made_here() - made_before;
+        let freed = pages_freed_here() - freed_before;
+        if uses_pages {
+            assert!(made > 0, "the events didn't fill a page");
+        }
+        assert_eq!(freed, made, "the dropped Channels didn't free every page it made");
     }
 
     #[test]
