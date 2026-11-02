@@ -244,6 +244,10 @@ pub struct SimEndpointConfig {
     /// Overall send rate cap (Gbps).
     pub overall_send_rate: Rate,
 
+    /// Pacing rate of the UPS queue, which carries the UnknownPathSecret, ReplayDetected and
+    /// StaleKey responses.
+    pub ups_rate: Rate,
+
     /// Per-poll budgets.
     pub budgets: Budgets,
 
@@ -283,6 +287,7 @@ impl Default for SimEndpointConfig {
             num_recv_dispatch_workers: 4,
             submission_shards: 4,
             overall_send_rate: Rate::new(25.0),
+            ups_rate: Rate::new(0.001),
             budgets: Budgets::default(),
             mtu: 1500,
             send_window: None,
@@ -359,6 +364,7 @@ pub fn setup_sim_endpoint(
         num_recv_dispatch_workers,
         submission_shards,
         overall_send_rate,
+        ups_rate,
         budgets,
         mtu,
         send_window,
@@ -486,7 +492,7 @@ pub fn setup_sim_endpoint(
         overall_send_rate,
         budgets,
         submission_shards,
-        ups_rate: crate::socket::rate::Rate::new(0.001),
+        ups_rate,
         ups_dedup_capacity: 1024,
         ups_dedup_window: core::time::Duration::from_secs(1),
         dead_peer_cooldown,
@@ -958,6 +964,12 @@ impl Client {
     /// Returns the endpoint's send credit pool.
     pub fn send_credit_pool(&self) -> crate::sync::Arc<crate::credit::Pool> {
         self.endpoint.send_credit_pool.clone()
+    }
+
+    /// Returns the endpoint's counter registry, which holds its queues' gauges, such as the
+    /// depth of `q.ups`.
+    pub fn counters(&self) -> crate::counter::Registry {
+        self.endpoint.counters.clone()
     }
 
     /// Connect to a peer, returning a bidirectional [`Stream`].
