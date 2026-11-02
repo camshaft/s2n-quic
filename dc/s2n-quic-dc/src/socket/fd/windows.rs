@@ -708,7 +708,8 @@ mod tests {
         (len, addr, cmsg, payload)
     }
 
-    /// A datagram sent with `send` arrives whole at `recv`, which reports the sender's address.
+    /// A datagram sent with `send` arrives whole at `recv`, which reports the sender's address,
+    /// whether the send has no segment size or one longer than the datagram.
     #[test]
     fn send_and_recv_report_the_peer_address() {
         for local in ["127.0.0.1:0", "[::1]:0"] {
@@ -725,6 +726,26 @@ mod tests {
                 ExplicitCongestionNotification::NotEct,
                 &iov,
                 None,
+                0,
+            )
+            .unwrap();
+            assert_eq!(sent, payload.len());
+
+            let (len, from, cmsg, received) = recv_one(&b, 1500);
+            assert_eq!(len, payload.len());
+            assert_eq!(&received[..len], payload);
+            let from: SocketAddr = from.get().into();
+            assert_eq!(from, a.local_addr().unwrap());
+            assert_eq!(cmsg.segment_len(), 0);
+
+            // With a segment size longer than the payload, the payload goes out as one datagram
+            // without a segment size, whether or not the Windows build supports send segmentation.
+            let sent = send(
+                &a,
+                &to,
+                ExplicitCongestionNotification::NotEct,
+                &iov,
+                Some(1200),
                 0,
             )
             .unwrap();
