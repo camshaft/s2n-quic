@@ -7,7 +7,9 @@
 //! On expiry the callback re-checks PathSecretEntry.last_activity — if still idle, the
 //! context is evicted from the cache; if activity occurred, it is rescheduled.
 
-use super::helpers::{test_entry, test_frame, RecvContextBuilder, TestReceiverExt, WakeNowSender};
+use super::helpers::{
+    test_entry, test_frame, test_waker, RecvContextBuilder, TestReceiverExt, WakeNowSender,
+};
 use crate::{
     endpoint::{
         frame::{self, Frame},
@@ -40,6 +42,22 @@ fn setup_send() -> SetupSend {
 /// As `setup_send`, where `open` false closes the frame submission channel at once, so that it
 /// refuses each probe the drain submits.
 fn setup_send_with_frame_receiver(open: bool) -> SetupSend {
+    let (setup, frame_rx) = setup_send_and_frame_receiver();
+    if open {
+        async move {
+            let _frame_rx = frame_rx;
+            core::future::pending::<()>().await
+        }
+        .spawn();
+    } else {
+        drop(frame_rx);
+    }
+    setup
+}
+
+/// As `setup_send`, and returns the receiver of the frame submission channel, where the drain
+/// submits its probes of quiet paths, so that a test reads each probe it submits.
+fn setup_send_and_frame_receiver() -> (SetupSend, frame::SubmissionReceiver) {
     let registry = crate::counter::Registry::default();
     let clock = Clock::default();
     let send_caches: IdMap<LocalSendSocketId, _> = vec![Rc::new(RefCell::new(send::Cache::new(
@@ -61,15 +79,6 @@ fn setup_send_with_frame_receiver(open: bool) -> SetupSend {
     // The drain submits its probes of quiet paths here; nothing delivers them in these
     // tests, as for a peer that doesn't answer.
     let (frame_tx, frame_rx) = frame::submission_channel(1);
-    if open {
-        async move {
-            let _frame_rx = frame_rx;
-            core::future::pending::<()>().await
-        }
-        .spawn();
-    } else {
-        drop(frame_rx);
-    }
 
     tasks::send_idle_wheel_drain(
         idle_wheel_rx,
@@ -102,7 +111,7 @@ fn setup_send_with_frame_receiver(open: bool) -> SetupSend {
     );
     async move { peer_dead_broadcast_task.drain_budgeted(Some(32)).await }.spawn();
 
-    (send_caches, idle_wheel_tx, completed_rx, clock, registry)
+    ((send_caches, idle_wheel_tx, completed_rx, clock, registry), frame_rx)
 }
 
 #[test]
@@ -321,7 +330,7 @@ fn send_idle_wheel_no_inflight_does_not_mark_dead() {
 }
 
 /// Opens a stream on the client entry `pse`; it stays open until the returned receivers drop.
-fn open_stream(pse: &crate::path::secret::map::Entry) -> impl Sized {
+fn open_stream(pse: &crate::path::secret::map::Entry) -> crate::queue::AllocResult {
     let crate::path::secret::map::entry::QueueState::Client(state) = pse.queue_state() else {
         panic!("test_entry builds a client entry");
     };
@@ -338,11 +347,15 @@ fn open_stream(pse: &crate::path::secret::map::Entry) -> impl Sized {
 fn send_idle_wheel_marks_dead_a_peer_that_doesnt_answer_the_probe_of_an_open_stream() {
     let _guard = crate::testing::without_snapshots();
     sim(|| {
-        let (send_caches, mut idle_wheel_tx, _completed_rx, clock, _registry) = setup_send();
+        let ((send_caches, mut idle_wheel_tx, _completed_rx, clock, _registry), mut frame_rx) =
+            setup_send_and_frame_receiver();
 
         let pse = test_entry();
         pse.touch_activity(precision::Clock::now(&clock));
         let stream = open_stream(&pse);
+        // As the stream's writer does when it is made, so that the dead mark owes the peer a
+        // reset of the stream and resets it on this side.
+        stream.control.set_peer_queue_id(stream.dest_queue_id);
 
         let ctx = send_caches[LocalSendSocketId::new(0)]
             .borrow_mut()
@@ -374,6 +387,30 @@ fn send_idle_wheel_marks_dead_a_peer_that_doesnt_answer_the_probe_of_an_open_str
                 "the context should wait for the probe's answer"
             );
 
+            // The probe is one Ping frame for the peer, on the send worker's frame submission
+            // channel, and the stream isn't reset before the idle timeout.
+            let (waker, _wakes) = test_waker();
+            let mut cx = core::task::Context::from_waker(&waker);
+            let mut submitted = frame::PriorityStorage::default();
+            assert!(
+                matches!(
+                    frame_rx.poll_swap(&mut cx, &mut submitted),
+                    core::task::Poll::Ready(Some(()))
+                ),
+                "the probe should go out on the frame submission channel"
+            );
+            let probes: Vec<&Frame> = submitted.iter().collect();
+            assert_eq!(probes.len(), 1, "the quiet period should be probed once");
+            assert_eq!(probes[0].header, frame::Header::Ping);
+            assert!(
+                std::sync::Arc::ptr_eq(&probes[0].path_secret_entry, &pse),
+                "the probe should go to the quiet path's peer"
+            );
+            assert!(
+                matches!(stream.stream.try_recv(), Ok(None)),
+                "the stream shouldn't be reset before the idle timeout"
+            );
+
             // At the idle timeout, the unanswered probe marks the peer dead.
             (idle / 2).sleep().await;
             assert_eq!(
@@ -387,6 +424,28 @@ fn send_idle_wheel_marks_dead_a_peer_that_doesnt_answer_the_probe_of_an_open_str
             assert!(
                 pse.is_dead_during_cooldown(now, crate::endpoint::DEFAULT_DEAD_PEER_COOLDOWN),
                 "a peer that doesn't answer the probe of an open stream should be marked dead"
+            );
+
+            // Marking the peer dead resets the open stream with the idle timeout error.
+            let reset = stream
+                .stream
+                .try_recv()
+                .expect("a peer-dead reset leaves the stream's sender open")
+                .expect("marking the peer dead should reset the open stream");
+            assert!(
+                matches!(
+                    &*reset,
+                    crate::endpoint::msg::Stream::Reset { error_code }
+                        if *error_code == crate::endpoint::error::IDLE_TIMEOUT
+                ),
+                "the stream should be reset with the idle timeout error"
+            );
+
+            // The on-time check at the idle deadline doesn't probe the quiet period again.
+            let mut later = frame::PriorityStorage::default();
+            assert!(
+                matches!(frame_rx.poll_swap(&mut cx, &mut later), core::task::Poll::Pending),
+                "the quiet period should be probed once"
             );
             drop(stream);
         }
