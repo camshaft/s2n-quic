@@ -705,7 +705,10 @@ where
         (id_removed, peer_removed)
     }
 
-    /// Evicts each entry `should_evict` selects, from the ID map and from both address maps.
+    /// Evicts each entry `should_evict` selects, from the ID map and from both address maps, and
+    /// revokes it (see [`Entry::revoke`]), so that each stream open on it ends on both sides.
+    ///
+    /// Only a change of the list of accepted keys evicts this way.
     fn evict_where(&self, should_evict: impl Fn(&Entry) -> bool) {
         let mut evicted = Vec::new();
         for table in [&self.ids.0, &self.client_peers.table, &self.server_peers.table] {
@@ -718,6 +721,7 @@ where
             );
         }
         for entry in evicted {
+            entry.revoke();
             self.evict(&entry);
         }
     }
