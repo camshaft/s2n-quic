@@ -333,16 +333,23 @@ fn run_sim(f: impl FnOnce()) {
 
 /// CI diagnostic, not for merge: runs one sim at a time in the test process, and prints the
 /// process's resident memory before the sim, its peak during the sim, after the sim, and after
-/// `malloc_trim`, for each sim that moves it by 64 MiB or more.
+/// `malloc_trim`, for each sim that moves it by 64 MiB or more. It also counts the sim endpoints
+/// still alive after each sim, and empties the thread's sim registries after each sim.
 #[cfg(all(test, target_os = "linux"))]
 mod sim_rss {
     use std::{
         io::Write as _,
-        sync::{Mutex, MutexGuard},
+        sync::{
+            atomic::{AtomicU64, Ordering},
+            Mutex, MutexGuard,
+        },
         time::Instant,
     };
 
     static LOCK: Mutex<()> = Mutex::new(());
+
+    // The process's resident memory when the sim before this one ended.
+    static LAST_KB: AtomicU64 = AtomicU64::new(0);
 
     fn status_kb(key: &str) -> u64 {
         std::fs::read_to_string("/proc/self/status")
@@ -357,6 +364,7 @@ mod sim_rss {
     pub struct Guard {
         _lock: MutexGuard<'static, ()>,
         before_kb: u64,
+        gap_kb: u64,
         started: Instant,
     }
 
@@ -365,9 +373,13 @@ mod sim_rss {
             let lock = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             // Writing 5 resets VmHWM to the current VmRSS, so the peak read at the end is this sim's.
             let _ = std::fs::write("/proc/self/clear_refs", "5");
+            let before_kb = status_kb("VmRSS:");
             Self {
                 _lock: lock,
-                before_kb: status_kb("VmRSS:"),
+                before_kb,
+                // What the process's memory grew by between the end of the sim before this one
+                // and the start of this one, while other tests ran.
+                gap_kb: before_kb.saturating_sub(LAST_KB.load(Ordering::Relaxed)),
                 started: Instant::now(),
             }
         }
@@ -377,22 +389,35 @@ mod sim_rss {
         fn drop(&mut self) {
             let peak_kb = status_kb("VmHWM:");
             let after_kb = status_kb("VmRSS:");
+            let (made, alive) = crate::endpoint::testing::sim::live::counts();
             unsafe {
                 libc::malloc_trim(0);
             }
             let trimmed_kb = status_kb("VmRSS:");
+            // Empty this thread's sim registries, which hold each sim's path-secret maps until the
+            // test's thread exits, then read the memory and the live endpoints again.
+            let maps = crate::endpoint::testing::sim::clear_thread_registries();
+            unsafe {
+                libc::malloc_trim(0);
+            }
+            let cleared_kb = status_kb("VmRSS:");
+            let (_, alive_cleared) = crate::endpoint::testing::sim::live::counts();
+            LAST_KB.store(cleared_kb, Ordering::Relaxed);
             const MIB_64: u64 = 64 * 1024;
             let moved = peak_kb.saturating_sub(self.before_kb) >= MIB_64
                 || after_kb.saturating_sub(self.before_kb) >= MIB_64
-                || after_kb.saturating_sub(trimmed_kb) >= MIB_64;
+                || after_kb.saturating_sub(trimmed_kb) >= MIB_64
+                || trimmed_kb.saturating_sub(cleared_kb) >= MIB_64
+                || self.gap_kb >= MIB_64;
             if moved {
                 let name = std::thread::current()
                     .name()
                     .unwrap_or("unknown")
                     .to_string();
                 let line = format!(
-                    "[sim-rss] test={name} secs={:.1} before_kB={} peak_kB={peak_kb} after_kB={after_kb} trimmed_kB={trimmed_kb}\n",
+                    "[sim-rss] test={name} secs={:.1} gap_kB={} before_kB={} peak_kB={peak_kb} after_kB={after_kb} trimmed_kB={trimmed_kb} cleared_kB={cleared_kb} maps_cleared={maps} endpoints_made={made} endpoints_alive={alive} endpoints_alive_cleared={alive_cleared}\n",
                     self.started.elapsed().as_secs_f64(),
+                    self.gap_kb,
                     self.before_kb,
                 );
                 let _ = std::io::stderr().write_all(line.as_bytes());

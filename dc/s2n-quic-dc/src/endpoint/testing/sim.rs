@@ -83,6 +83,43 @@ thread_local! {
         RefCell::new(HashMap::new());
 }
 
+/// CI diagnostic, not for merge: keeps a weak handle on each sim endpoint's recv credit pool,
+/// which the endpoint and its tasks hold while they live, so a test can count the sim endpoints
+/// that are still alive after their sim ended.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) mod live {
+    use std::sync::{Arc, Mutex, Weak};
+
+    static POOLS: Mutex<Vec<Weak<crate::credit::Pool>>> = Mutex::new(Vec::new());
+
+    pub(crate) fn track(pool: &Arc<crate::credit::Pool>) {
+        POOLS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(Arc::downgrade(pool));
+    }
+
+    /// Returns how many sim endpoints this process made, and how many of them are still alive.
+    pub(crate) fn counts() -> (usize, usize) {
+        let pools = POOLS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let alive = pools.iter().filter(|pool| pool.strong_count() > 0).count();
+        (pools.len(), alive)
+    }
+}
+
+/// CI diagnostic, not for merge: empties this thread's sim registries, and returns how many
+/// path-secret map handles the map registry held.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn clear_thread_registries() -> usize {
+    let maps = SIM_MAP_REGISTRY
+        .with(|r| core::mem::take(&mut *r.borrow_mut()))
+        .len();
+    SIM_ADDR_REGISTRY.with(|r| r.borrow_mut().clear());
+    SIM_ENDPOINT_BY_GROUP.with(|r| r.borrow_mut().clear());
+    SIM_PARAMS_REGISTRY.with(|r| r.borrow_mut().clear());
+    maps
+}
+
 fn register_endpoint_map(data_addrs: &[SocketAddr], map: PathSecretMap, params: ApplicationParams) {
     SIM_MAP_REGISTRY.with(|r| {
         let mut reg = r.borrow_mut();
@@ -514,6 +551,10 @@ pub fn setup_sim_endpoint(
 
     // Register in the thread-local registry so `connect` can find it.
     register_endpoint_map(&endpoint.data_addrs, path_secret_map, params);
+
+    // CI diagnostic, not for merge: count this endpoint among the sim endpoints made.
+    #[cfg(all(test, target_os = "linux"))]
+    live::track(&endpoint.recv_credit_pool);
 
     endpoint
 }
