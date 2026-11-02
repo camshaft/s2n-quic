@@ -189,7 +189,9 @@ fn disable_connreset(socket: WinSock::SOCKET) -> Support {
 }
 
 /// Receives one message into `buffer`, and writes its source address into `addr` and its ECN bits
-/// and coalesced segment size into `cmsg`.
+/// and coalesced segment size into `cmsg`. A datagram longer than `buffer` fills `buffer` with its
+/// first bytes, the rest of it is dropped, and the call returns the length of `buffer`, as
+/// `recvmsg` does on Unix.
 #[inline]
 pub fn recv<T>(
     socket: &T,
@@ -231,14 +233,23 @@ where
     // and `len` is a writable `u32`. The call is synchronous, since it doesn't pass an `OVERLAPPED`.
     let res = unsafe { recvmsg(socket, &mut msg, &mut len, ptr::null_mut(), None) };
 
-    if res == WinSock::SOCKET_ERROR {
-        return Err(last_error());
-    }
+    let received: usize = if res == WinSock::SOCKET_ERROR {
+        let code = last_error_code();
+        // Winsock fills `buffer` with the first bytes of a datagram longer than it, drops the rest
+        // and fails the call with `WSAEMSGSIZE`, where `recvmsg` on Unix returns the bytes it
+        // filled: return the length of `buffer`, as the Unix layer does.
+        if code != WinSock::WSAEMSGSIZE as i32 {
+            return Err(io::Error::from_raw_os_error(code));
+        }
+        buffer.iter().map(|slice| slice.len()).sum()
+    } else {
+        len as usize
+    };
 
     addr.update_with_len(msg.namelen as usize);
     decode_control(&msg, cmsg);
 
-    Ok(len as usize)
+    Ok(received)
 }
 
 /// Sends `buffer` to `addr`, marked with `ecn`, as one datagram, or as datagrams of
@@ -770,6 +781,29 @@ mod tests {
 
         let (len, _from, _cmsg, _received) = recv_one(&b, 4000);
         assert_eq!(len, payload.len());
+    }
+
+    /// A datagram longer than the receive buffer comes back as its first bytes, with the length of
+    /// the buffer and the sender's address, as `recvmsg` returns it on Unix. The rest of it is
+    /// dropped: the next receive returns the next datagram.
+    #[test]
+    fn recv_returns_the_first_bytes_of_a_datagram_longer_than_the_buffer() {
+        let (a, b) = pair("127.0.0.1:0");
+        let to = b.local_addr().unwrap();
+        let payload: Vec<u8> = (0..3000u32).map(|i| i as u8).collect();
+        a.send_to(&payload, to).unwrap();
+
+        let (len, from, _cmsg, received) = recv_one(&b, 1500);
+        assert_eq!(len, 1500);
+        assert_eq!(&received[..], &payload[..1500]);
+        let from: SocketAddr = from.get().into();
+        assert_eq!(from, a.local_addr().unwrap());
+
+        let next = [9u8; 16];
+        a.send_to(&next, to).unwrap();
+        let (len, _from, _cmsg, received) = recv_one(&b, 1500);
+        assert_eq!(len, next.len());
+        assert_eq!(&received[..len], &next[..]);
     }
 
     /// The decoder reads an ECN and a coalesced-size message, as a receive lays them out.
