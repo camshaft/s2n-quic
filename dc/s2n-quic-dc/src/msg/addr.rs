@@ -2,11 +2,50 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use core::{fmt, mem::size_of};
+#[cfg(unix)]
 use libc::{msghdr, sockaddr_in, sockaddr_in6, AF_INET, AF_INET6};
 use s2n_quic_core::{
     assume,
     inet::{self, SocketAddress},
 };
+#[cfg(windows)]
+use sys::{sockaddr_in, sockaddr_in6, AF_INET, AF_INET6};
+
+/// The `SOCKADDR_IN` and `SOCKADDR_IN6` layouts of Windows' `ws2def.h` and `ws2ipdef.h`, with the
+/// field names that `libc` uses on Unix.
+#[cfg(windows)]
+#[allow(non_camel_case_types, dead_code)]
+mod sys {
+    pub const AF_INET: u16 = 2;
+    pub const AF_INET6: u16 = 23;
+
+    #[repr(C)]
+    pub struct in_addr {
+        pub s_addr: u32,
+    }
+
+    #[repr(C)]
+    pub struct sockaddr_in {
+        pub sin_family: u16,
+        pub sin_port: u16,
+        pub sin_addr: in_addr,
+        pub sin_zero: [u8; 8],
+    }
+
+    #[repr(C)]
+    pub struct in6_addr {
+        pub s6_addr: [u8; 16],
+    }
+
+    #[repr(C)]
+    pub struct sockaddr_in6 {
+        pub sin6_family: u16,
+        pub sin6_port: u16,
+        pub sin6_flowinfo: u32,
+        pub sin6_addr: in6_addr,
+        pub sin6_scope_id: u32,
+    }
+}
 
 const SIZE: usize = {
     let v4 = size_of::<sockaddr_in>();
@@ -114,23 +153,35 @@ impl Addr {
         }
     }
 
+    /// The address as a `sockaddr_in` or `sockaddr_in6`, for a send's message name.
     #[inline]
-    pub fn send_with_msg(&self, msg: &mut msghdr) {
-        msg.msg_name = self.msg_name.as_ptr() as *mut u8 as *mut _;
-        msg.msg_namelen = self.msg_namelen as _;
+    pub(crate) fn name_ptr(&self) -> *const u8 {
+        self.msg_name.as_ptr()
     }
 
+    /// The length of the `sockaddr` [`Self::name_ptr`] points to.
     #[inline]
-    pub fn recv_with_msg(&mut self, msg: &mut msghdr) {
-        msg.msg_name = self.msg_name.as_mut_ptr() as *mut _;
-        // use the max size, in case the length changes
-        msg.msg_namelen = self.msg_name.len() as _;
+    pub(crate) fn name_len(&self) -> usize {
+        self.msg_namelen as usize
     }
 
+    /// The buffer a receive writes its source address into.
     #[inline]
-    pub fn update_with_msg(&mut self, msg: &msghdr) {
-        debug_assert_eq!(self.msg_name.as_ptr(), msg.msg_name as *const u8);
-        match msg.msg_namelen as usize {
+    pub(crate) fn name_mut_ptr(&mut self) -> *mut u8 {
+        self.msg_name.as_mut_ptr()
+    }
+
+    /// The capacity of the buffer [`Self::name_mut_ptr`] points to: the largest `sockaddr` the
+    /// address holds.
+    #[inline]
+    pub(crate) fn name_capacity(&self) -> usize {
+        self.msg_name.len()
+    }
+
+    /// Takes the length of the `sockaddr` a receive wrote into [`Self::name_mut_ptr`].
+    #[inline]
+    pub(crate) fn update_with_len(&mut self, len: usize) {
+        match len {
             0 => {
                 // set the address to unspecified
                 self.set(SocketAddress::default());
@@ -143,6 +194,28 @@ impl Addr {
             }
             size => unreachable!("invalid address length {size}"),
         }
+    }
+
+    #[cfg(unix)]
+    #[inline]
+    pub fn send_with_msg(&self, msg: &mut msghdr) {
+        msg.msg_name = self.name_ptr() as *mut u8 as *mut _;
+        msg.msg_namelen = self.name_len() as _;
+    }
+
+    #[cfg(unix)]
+    #[inline]
+    pub fn recv_with_msg(&mut self, msg: &mut msghdr) {
+        msg.msg_name = self.name_mut_ptr() as *mut _;
+        // use the max size, in case the length changes
+        msg.msg_namelen = self.name_capacity() as _;
+    }
+
+    #[cfg(unix)]
+    #[inline]
+    pub fn update_with_msg(&mut self, msg: &msghdr) {
+        debug_assert_eq!(self.msg_name.as_ptr(), msg.msg_name as *const u8);
+        self.update_with_len(msg.msg_namelen as usize);
     }
 }
 
@@ -180,6 +253,22 @@ mod tests {
             let mut addr = Addr::new(addr);
             addr.set_port(port);
             assert_eq!(addr.get().port(), port);
+        });
+    }
+
+    /// A receive's name length round-trips through `update_with_len`: the length of an IPv4 or an
+    /// IPv6 `sockaddr` keeps the address, and 0 makes it unspecified.
+    #[test]
+    fn update_with_len_test() {
+        check!().with_type().cloned().for_each(|value| {
+            let mut addr = Addr::new(value);
+            let len = addr.name_len();
+            addr.update_with_len(len);
+            assert_eq!(addr.get(), value);
+            assert!(len <= addr.name_capacity());
+
+            addr.update_with_len(0);
+            assert_eq!(addr.get(), SocketAddress::default());
         });
     }
 }
