@@ -7,11 +7,12 @@ use crate::{
     credentials::{Credentials, Id},
     crypto,
     event::{self, EndpointPublisher as _, IntoEvent as _},
-    packet::{secret_control as control, Packet},
+    packet::{secret_control as control, Packet, WireVersion},
     path::secret::receiver,
     psk::io::HandshakeReason,
     tracing::*,
 };
+use s2n_codec::EncoderBuffer;
 use s2n_quic_core::{
     endpoint,
     inet::SocketAddress,
@@ -706,7 +707,9 @@ where
     }
 
     /// Evicts each entry `should_evict` selects, from the ID map and from both address maps, and
-    /// revokes it (see [`Entry::revoke`]), so that each stream open on it ends on both sides.
+    /// revokes it (see [`Entry::revoke`]), so that each stream open on it ends on both sides: the
+    /// map sends the peer an unknown path secret packet for each entry it revokes, which ends the
+    /// peer's halves without waiting for this endpoint's application to drop its own.
     ///
     /// Only a change of the list of accepted keys evicts this way.
     fn evict_where(&self, should_evict: impl Fn(&Entry) -> bool) {
@@ -721,9 +724,38 @@ where
             );
         }
         for entry in evicted {
-            entry.revoke();
+            // `evicted` holds an entry once for each table that holds it, and only the first
+            // revoke of an entry tells its peer.
+            if entry.revoke() {
+                self.send_revoked(&entry);
+            }
             self.evict(&entry);
         }
+    }
+
+    /// Sends the peer of a revoked entry an unknown path secret packet, as the map sends one in
+    /// answer to a packet on a path secret it doesn't hold, so that the peer ends each stream open
+    /// on the path secret at once (see `handle_unknown_path_secret_packet`), whether or not it
+    /// sends anything on it.
+    ///
+    /// The packet goes to the peer's first data address, where its endpoint receives control
+    /// packets, or to the address the path secret was set up with where the peer didn't advertise
+    /// a data address.
+    fn send_revoked(&self, entry: &Entry) {
+        let packet = control::UnknownPathSecret {
+            wire_version: WireVersion::ZERO,
+            credential_id: *entry.id(),
+            queue_id: None,
+        };
+        let stateless_reset = self.signer.sign(entry.id());
+        let mut buffer = [0u8; control::MAX_PACKET_SIZE];
+        let len = packet.encode(EncoderBuffer::new(&mut buffer), &stateless_reset);
+        let dst = entry
+            .peer_data_addrs()
+            .first()
+            .copied()
+            .unwrap_or(*entry.peer());
+        self.send_control_packet(&dst, &mut buffer[..len]);
     }
 
     pub fn request_handshake(
@@ -1183,6 +1215,12 @@ where
                 peer_address,
             },
         );
+
+        // The peer doesn't hold the path secret any longer, so no stream open on it can go on: end
+        // each one on this endpoint at once. The send path fails only the frames it sent and
+        // hasn't seen acknowledged, which doesn't end a reader, and the eviction below makes the
+        // map refuse the resets the peer sends as its own halves drop.
+        entry.reset_streams(crate::endpoint::error::PATH_SECRET_REJECTED);
 
         // FIXME: More actively schedule a new handshake.
         // See comment on requested_handshakes for details.
