@@ -102,6 +102,11 @@ pub struct Entry {
     /// Whether the map revoked the path secret because the peer's key was removed from its list
     /// of accepted keys (see [`Entry::revoke`]).
     revoked: AtomicBool,
+    /// How many answers of the peer the map counted on the path secret since it revoked it (see
+    /// [`Entry::on_revoked_refusal`]). A send context compares it with the count it saw at its
+    /// last transmission, and stops sending its resets on the path secret again once the peer
+    /// answered after that transmission.
+    revoked_refusals: AtomicU32,
 }
 
 /// Per-peer queue slot state, determined by role (derived from credential_id).
@@ -132,6 +137,7 @@ impl SizeOf for Entry {
             queue_state: _,
             peer_key,
             revoked: _,
+            revoked_refusals: _,
         } = self;
         creation_time.size()
             + peer.size()
@@ -152,6 +158,7 @@ impl SizeOf for Entry {
             + std::mem::size_of::<Option<PeerKey>>()
             + peer_key.as_ref().map_or(0, |key| key.as_spki_der().len())
             + std::mem::size_of::<AtomicBool>()
+            + std::mem::size_of::<AtomicU32>()
     }
 }
 
@@ -255,6 +262,7 @@ impl Entry {
             queue_state,
             peer_key: None,
             revoked: AtomicBool::new(false),
+            revoked_refusals: AtomicU32::new(0),
         }
     }
 
@@ -616,9 +624,10 @@ impl Entry {
     /// slots, which ends its reader and its writer with that error, and makes the receive path
     /// refuse each later packet on the path secret as one on an unknown path secret. The map then
     /// sends the peer an unknown path secret packet for it, which ends the peer's halves of those
-    /// streams (see [`Entry::reset_streams`]). A reader or a writer dropped on a revoked path
-    /// secret also sends the peer a reset with `PEER_KEY_REMOVED`, which ends the peer's half
-    /// where that packet didn't reach the peer.
+    /// streams (see [`Entry::reset_streams`]). Each reader and writer on a revoked path secret
+    /// also sends the peer a reset with `PEER_KEY_REMOVED`, once, as it hands the error to its
+    /// application or as it is dropped, which ends the peer's half where that packet didn't reach
+    /// the peer.
     pub(crate) fn revoke(&self) -> bool {
         if self.revoked.swap(true, Ordering::AcqRel) {
             return false;
@@ -645,6 +654,25 @@ impl Entry {
     #[inline]
     pub(crate) fn is_revoked(&self) -> bool {
         self.revoked.load(Ordering::Acquire)
+    }
+
+    /// Counts an answer of the peer on the revoked path secret: a packet of the peer that the map
+    /// refused on it, and answered as a packet on a path secret it doesn't hold, or, where the
+    /// peer evicted the path secret, the peer's own unknown path secret packet for it.
+    ///
+    /// The endpoint refuses the peer's acknowledgements on a revoked path secret, so it never sees
+    /// its resets there acknowledged. An answer of the peer that comes after a reset went out is
+    /// the event that stops the reset from going out again (see `assemble_probe`).
+    #[inline]
+    pub(crate) fn on_revoked_refusal(&self) {
+        self.revoked_refusals.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// How many answers of the peer the map counted on the revoked path secret (see
+    /// [`Entry::on_revoked_refusal`]). The count wraps, so compare it for equality alone.
+    #[inline]
+    pub(crate) fn revoked_refusals(&self) -> u32 {
+        self.revoked_refusals.load(Ordering::Acquire)
     }
 
     #[cfg(test)]
