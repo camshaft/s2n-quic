@@ -1178,7 +1178,9 @@ where
 /// [`frame::FailureReason::PeerDead`], and `peer_dead_tx` is notified only when the idle expiry
 /// also indicates an unresponsive peer: one that left packets unacknowledged, one that didn't
 /// answer a probe while a stream on its path is open, or one whose path has an open stream and
-/// an idle check that ran more than a wheel tick late.
+/// an idle check that ran more than a wheel tick late. Each stream whose frames such an expiry
+/// fails is owed a reset, which the receive path sends once a packet from the peer clears the
+/// dead mark (`Entry::owe_resets`).
 ///
 /// A context with no unacknowledged packet whose path has an open stream is probed with a Ping
 /// once in each quiet period, half an idle timeout into it, or at the idle deadline where its
@@ -1382,14 +1384,27 @@ pub async fn send_idle_wheel_drain<Clk, WakerSink, AckComp>(
                 // this side dead under the same rule, so a stream doesn't stay open on one side
                 // alone. Without any of these, both sides simply stopped talking (natural idle)
                 // and we must not mark dead.
-                let marked_dead = (has_inflight || probed || open_stream)
-                    && path_secret_entry.mark_dead_if_cooldown_elapsed(now, dead_peer_cooldown);
+                let unresponsive = has_inflight || probed || open_stream;
 
+                // Keep the stream of each frame the invalidation fails. Where the peer is
+                // unresponsive, it isn't told that this side reset its streams, and its end of
+                // each may wait on this side: record each before the dead mark, so that the
+                // packet that clears the mark finds it and resets the stream
+                // (`dispatch::process`).
+                let mut failed = FailedStreams {
+                    completed_tx: &mut completed_tx,
+                    streams: Vec::new(),
+                };
                 let result = send_caches[local_id].borrow_mut().invalidate(
                     &id,
                     frame::FailureReason::PeerDead,
-                    &mut completed_tx,
+                    &mut failed,
                 );
+                if unresponsive {
+                    path_secret_entry.owe_resets(failed.streams);
+                }
+                let marked_dead = unresponsive
+                    && path_secret_entry.mark_dead_if_cooldown_elapsed(now, dead_peer_cooldown);
 
                 if let Some((drained, discarded_bytes, pending_acks)) = result {
                     if !pending_acks.is_empty() {
@@ -1445,6 +1460,72 @@ fn send_idle_probe(
         context.borrow_mut().idle_probe_for = Some(last_activity.nanos);
     }
     accepted
+}
+
+/// Forwards each frame that a send context's invalidation fails to `completed_tx`, and keeps the
+/// stream it belongs to, so that the send idle wheel can owe the peer a reset of each stream
+/// (`Entry::owe_resets`).
+struct FailedStreams<'a, C> {
+    completed_tx: &'a mut C,
+    streams: Vec<crate::queue::OwedReset>,
+}
+
+impl<C> UnboundedSender<Entry<Frame>> for FailedStreams<'_, C>
+where
+    C: UnboundedSender<Entry<Frame>>,
+{
+    fn send(&mut self, frame: Entry<Frame>) -> Result<(), Entry<Frame>> {
+        if let Some(stream) = owed_reset_of(&frame.header) {
+            self.streams.push(stream);
+        }
+        self.completed_tx.send(frame)
+    }
+}
+
+/// The stream that a frame belongs to, as a reset of the stream routes: the frame's queue pair
+/// and binding. `None` for a frame of the path, and for `QueueDbg`, a diagnostic marker that
+/// doesn't carry stream state.
+fn owed_reset_of(header: &frame::Header) -> Option<crate::queue::OwedReset> {
+    use frame::Header;
+    match *header {
+        Header::QueueData {
+            queue_pair,
+            binding_id,
+            ..
+        }
+        | Header::QueueControl {
+            queue_pair,
+            binding_id,
+            ..
+        }
+        | Header::QueueMaxData {
+            queue_pair,
+            binding_id,
+            ..
+        }
+        | Header::QueueReset {
+            queue_pair,
+            binding_id,
+            ..
+        }
+        | Header::QueueMsg {
+            queue_pair,
+            binding_id,
+            ..
+        }
+        | Header::QueueDataBlocked {
+            queue_pair,
+            binding_id,
+            ..
+        } => Some(crate::queue::OwedReset {
+            queue_pair,
+            binding_id,
+        }),
+        Header::QueueFree { .. }
+        | Header::Ack { .. }
+        | Header::Ping
+        | Header::QueueDbg { .. } => None,
+    }
 }
 
 /// Drains the receive-side idle wheel for one receive worker.
