@@ -131,8 +131,35 @@ impl ServerState {
         });
     }
 
+    /// Push Reset into the slot of each of `streams` that still holds the stream's binding, as
+    /// [`Self::broadcast_reset`] does for every allocated slot.
+    ///
+    /// `streams` are the streams that [`Self::open_streams`] read as the dead mark recorded the
+    /// resets it owes the peer (`Entry::mark_dead_owing_resets`). A slot that read doesn't name,
+    /// one bound after it or one whose writer hadn't recorded the peer's queue yet, isn't reset,
+    /// and neither is a slot freed or bound again since: each stream the dead mark resets on this
+    /// side is owed a reset.
+    pub fn reset_streams(
+        &self,
+        streams: &[super::OwedReset],
+        error_code: VarInt,
+        waker_sink: &mut impl FnMut(AutoWake),
+    ) {
+        let mut view = SenderView::new();
+        for stream in streams {
+            let index = stream.queue_pair.source_queue_id.as_u64() as usize;
+            let Some(slot) = view.get(index, &self.pages) else {
+                continue;
+            };
+            let (sw, cw) = slot.reset_binding(stream.binding_id, error_code);
+            waker_sink(sw);
+            waker_sink(cw);
+        }
+    }
+
     /// The stream of each bound slot whose writer recorded the peer's queue, as a reset of it
-    /// that this side owes the peer routes: the streams that `broadcast_reset` resets.
+    /// that this side owes the peer routes. The dead mark resets these streams alone
+    /// ([`Self::reset_streams`]).
     pub fn open_streams(&self) -> Vec<super::OwedReset> {
         let mut streams = Vec::new();
         let mut view = SenderView::new();
@@ -757,5 +784,44 @@ mod tests {
             server.state.open_streams().is_empty(),
             "a freed slot doesn't hold a stream"
         );
+    }
+
+    /// `reset_streams` resets the slot of each stream it names while the slot holds that
+    /// stream's binding, and no other slot: one it doesn't name, as one bound after the dead mark
+    /// read the open streams, and one bound again since the binding it names.
+    #[test]
+    fn reset_streams_resets_each_named_stream_and_no_other() {
+        let (mut server, path_entry, mut tx, _rx) = test_server(10);
+        let mut receivers = Vec::new();
+        for (queue_id, binding_id) in [(0, 1), (1, 1), (2, 3)] {
+            let Ok(BindResult::NewBinding {
+                stream, control, ..
+            }) = server.bind_for_msg(v(queue_id), v(binding_id), &path_entry, &mut tx)
+            else {
+                panic!("expected NewBinding");
+            };
+            receivers.push((stream, control));
+        }
+        let named = |queue_id, binding_id| crate::queue::OwedReset {
+            queue_pair: crate::packet::datagram::QueuePair {
+                source_queue_id: v(queue_id),
+                dest_queue_id: v(8),
+            },
+            binding_id: v(binding_id),
+        };
+
+        // Slot 2 holds binding 3: the stream named with binding 2 is one it held before.
+        server
+            .state
+            .reset_streams(&[named(0, 1), named(2, 2)], v(42), &mut |_| {});
+
+        let mut depth = |queue_id| {
+            let diag = server.slot_diag(v(queue_id)).expect("the slot exists");
+            (diag.stream_depth, diag.control_depth)
+        };
+        assert_eq!(depth(0), (1, 1), "a named stream is reset");
+        assert_eq!(depth(1), (0, 0), "a stream it doesn't name isn't reset");
+        assert_eq!(depth(2), (0, 0), "a slot bound again since isn't reset");
+        drop(receivers);
     }
 }
