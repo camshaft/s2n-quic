@@ -13,7 +13,8 @@
 //! Each reader and writer on the revoked path secret also sends the peer a reset with
 //! `PEER_KEY_REMOVED` as it hands the error to its application, which ends the peer's halves
 //! where that packet is lost. The endpoint never sees those resets acknowledged, since it refuses
-//! the peer's acknowledgements, and stops sending them again once the peer answers after them.
+//! the peer's acknowledgements, and stops sending them, and each other frame on the path secret,
+//! again once the peer answers after them.
 
 use crate::{
     endpoint::error::Error,
@@ -53,6 +54,10 @@ const RESENDS_SETTLE: Duration = Duration::from_secs(1);
 /// How long the client counts the server's packets: it ends before the server drops its halves.
 const RESENDS_WINDOW: Duration = Duration::from_secs(6);
 
+/// How long the server waits once it wrote "world", for its endpoint to send it, before it
+/// removes the client's key, where [`Case::unacknowledged_data`] says so.
+const DATA_SENT: Duration = Duration::from_millis(100);
+
 fn client_key() -> PeerKey {
     PeerKey::from_spki_der(&b"client key"[..])
 }
@@ -71,13 +76,20 @@ struct Case {
     /// among them, so that only the resets of the server's halves can end the client's halves.
     drop_unknown_path_secrets: bool,
     /// Whether the client counts the server's packets once its halves ended, and checks that the
-    /// server doesn't send its resets again.
+    /// server doesn't send its resets, or any other frame on the path secret, again.
     count_resends: bool,
+    /// Whether the server writes "world" while the network drops the client's packets, just before
+    /// it removes the client's key, so that the frames of that write are still unacknowledged on
+    /// the revoked path secret beside the resets.
+    unacknowledged_data: bool,
 }
 
-/// The server's packets the client counts once its halves ended (see [`Case::count_resends`]).
+/// The network's state that both endpoints share: whether it drops the client's packets (see
+/// [`Case::unacknowledged_data`]), and how many of the server's packets the client counted once
+/// its halves ended (see [`Case::count_resends`]).
 #[derive(Default)]
 struct Resends {
+    drop_client: AtomicBool,
     counting: AtomicBool,
     packets: AtomicUsize,
 }
@@ -134,8 +146,9 @@ fn is_unknown_path_secret(packet: &monitor::Packet) -> bool {
 
 /// The server reads "hello", removes the client's key, checks that both of its halves end at once
 /// with `PeerKeyRemoved`, and holds them for [`SERVER_HOLD`], as an application that doesn't
-/// drop its halves on an error would.
-async fn server() {
+/// drop its halves on an error would. Where `case` says so, it first writes "world" while the
+/// network drops the client's packets, so the client's acknowledgements of it are lost.
+async fn server(case: Case, resends: Arc<Resends>) {
     let server = sim::Server::new();
     let mut acceptor = server
         .register_acceptor_channel(ACCEPTOR_ID, 8)
@@ -156,8 +169,23 @@ async fn server() {
     }
     assert_eq!(&buf[..], b"hello");
 
-    // Unpair the client: this evicts and revokes the stream's path secret.
+    if case.unacknowledged_data {
+        // The client gets "world", and the network drops its acknowledgements, so the write's
+        // frames are still unacknowledged on the path secret when the server removes the client's
+        // key.
+        resends.drop_client.store(true, Ordering::Relaxed);
+        let mut world = Bytes::from_static(b"world");
+        writer
+            .write_all_from(&mut world)
+            .await
+            .expect("a write before the removal");
+        DATA_SENT.sleep().await;
+    }
+
+    // Unpair the client: this evicts and revokes the stream's path secret. The server refuses
+    // each later packet of the client on it, so the network can pass them again.
     assert!(server_map.remove_peer_key(&client_key()));
+    resends.drop_client.store(false, Ordering::Relaxed);
     assert_eq!(server_map.secrets_len(), 0);
 
     // Both of the server's halves end at once, and no more data comes through the reader.
@@ -218,14 +246,27 @@ async fn client(case: Case, resends: Arc<Resends>) {
         .await
         .expect("a write before the removal");
 
-    // The client doesn't send anything more, so its reader can end only on what the server sends.
+    // The client doesn't send anything more, so its reader can end only on what the server sends,
+    // once it read the server's "world" where the server writes it.
     let mut buf = BytesMut::with_capacity(16);
-    let err = timeout(CLIENT_WAIT, reader.read_into(&mut buf))
-        .await
-        .expect("the client's reader ends while the server holds its halves")
-        .expect_err("a read after the removal");
+    let err = timeout(CLIENT_WAIT, async {
+        loop {
+            match reader.read_into(&mut buf).await {
+                Ok(0) => panic!("the server sent FIN"),
+                Ok(_) => continue,
+                Err(err) => break err,
+            }
+        }
+    })
+    .await
+    .expect("the client's reader ends while the server holds its halves");
     assert_reader_ended(&err, case);
-    assert!(buf.is_empty());
+    let read: &[u8] = if case.unacknowledged_data {
+        b"world"
+    } else {
+        b""
+    };
+    assert_eq!(&buf[..], read);
 
     let err = timeout(CLIENT_WAIT, writer.peer_cancellation())
         .await
@@ -242,10 +283,12 @@ async fn client(case: Case, resends: Arc<Resends>) {
     assert_eq!(client_map.secrets_len(), secrets);
 
     if case.count_resends {
-        // The client acknowledged the server's resets, and the server refused that
-        // acknowledgement, as it refuses each packet on the revoked path secret. The refusal
-        // stops the server from sending the resets again, so it sends nothing more while it holds
-        // its halves.
+        // The client answered the server's packets on the path secret: it acknowledged them, and
+        // the server refused each acknowledgement, as it refuses each packet on the revoked path
+        // secret, or, where the client evicted the path secret, it answered them with its own
+        // unknown path secret packets, which the server validated. Either answer stops the server
+        // from sending its resets, and each other frame on the path secret, again, so it sends
+        // nothing more while it holds its halves.
         RESENDS_SETTLE.sleep().await;
         resends.counting.store(true, Ordering::Relaxed);
         RESENDS_WINDOW.sleep().await;
@@ -257,21 +300,29 @@ async fn client(case: Case, resends: Arc<Resends>) {
 fn run(case: Case) {
     crate::testing::sim(move || {
         let resends = Arc::new(Resends::default());
-        if case.drop_unknown_path_secrets {
+        if case.drop_unknown_path_secrets || case.count_resends || case.unacknowledged_data {
             let resends = resends.clone();
+            let mut client_addr = MonitorHostAddr::new("client");
             let mut server_addr = MonitorHostAddr::new("server");
             monitor::on_packet_sent(move |packet| {
-                if is_unknown_path_secret(packet) {
+                let unknown_path_secret = is_unknown_path_secret(packet);
+                if case.drop_unknown_path_secrets && unknown_path_secret {
                     return monitor::Command::Drop;
                 }
+                let drop_client = resends.drop_client.load(Ordering::Relaxed);
+                if drop_client && client_addr.is_packet_source(packet) {
+                    return monitor::Command::Drop;
+                }
+                // The count leaves out the server's unknown path secret packets, which answer the
+                // client's packets on the path secret.
                 let counting = resends.counting.load(Ordering::Relaxed);
-                if counting && server_addr.is_packet_source(packet) {
+                if counting && !unknown_path_secret && server_addr.is_packet_source(packet) {
                     resends.packets.fetch_add(1, Ordering::Relaxed);
                 }
                 monitor::Command::Pass
             });
         }
-        server().group("server").spawn();
+        server(case, resends.clone()).group("server").spawn();
         client(case, resends).group("client").primary().spawn();
     });
 }
@@ -312,6 +363,33 @@ fn the_remover_stops_sending_its_resets_once_the_peer_answers() {
     run(Case {
         drop_unknown_path_secrets: true,
         count_resends: true,
+        ..Case::default()
+    });
+}
+
+/// A peer whose map evicts the path secret as it validates the unknown path secret packet answers
+/// each later packet of the endpoint that removed the key with its own unknown path secret
+/// packet. That endpoint validates the answer for the entry it revoked, and sends nothing more on
+/// the path secret once it did, where it would otherwise send its resets until it declares the
+/// peer dead.
+#[test]
+fn the_remover_stops_sending_its_resets_once_an_evicting_peer_answers() {
+    run(Case {
+        evict_on_unknown_path_secret: true,
+        count_resends: true,
+        ..Case::default()
+    });
+}
+
+/// Frames other than the resets on the revoked path secret, here the data of a write whose
+/// acknowledgements the network dropped before the removal, stop with the resets once the peer
+/// answers, where the peer doesn't evict the path secret.
+#[test]
+fn the_remover_stops_sending_its_other_frames_once_the_peer_answers() {
+    run(Case {
+        drop_unknown_path_secrets: true,
+        count_resends: true,
+        unacknowledged_data: true,
         ..Case::default()
     });
 }

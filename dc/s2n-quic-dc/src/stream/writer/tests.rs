@@ -3843,3 +3843,66 @@ impl crate::credit::WakerSink for TestWakerSink {
         }
     }
 }
+
+/// How many resets `frames` holds.
+fn reset_count(frames: &intrusive::Queue<Frame>) -> usize {
+    frames
+        .iter()
+        .filter(|frame| matches!(frame.header, Header::QueueReset { .. }))
+        .count()
+}
+
+/// On a revoked path secret, the writer sends the peer's reader its reset with `PEER_KEY_REMOVED`
+/// as the revoke's reset wakes it and it hands the error to the application, and its drop doesn't
+/// send that reset a second time.
+#[test]
+fn revoked_path_secret_reset_is_sent_once_across_cancellation_and_drop() {
+    sim(|| {
+        let (mut writer, mut pusher) = make_server_pair();
+        // The map revoked the stream's path secret (see `Entry::revoke`).
+        assert!(writer.0.path_secret_entry.revoke());
+        let (drop_tx, drop_rx) = tokio::sync::oneshot::channel::<()>();
+
+        async move {
+            // The revoke's reset, as `Entry::revoke` pushes it into the writer's control queue.
+            pusher.push_reset(error::PEER_KEY_REMOVED);
+            let frames = pusher
+                .recv_frames_timeout(1.s())
+                .await
+                .expect("the writer resets the peer's reader as it hands the error over");
+            assert_eq!(reset_count(&frames), 1, "expected exactly one reset frame");
+            let reset = frames
+                .iter()
+                .find(|frame| matches!(frame.header, Header::QueueReset { .. }))
+                .expect("a reset frame");
+            assert!(
+                matches!(
+                    reset.header,
+                    Header::QueueReset {
+                        reset_target: ResetTarget::Stream,
+                        error_code,
+                        ..
+                    } if error_code == error::PEER_KEY_REMOVED
+                ),
+                "expected the PEER_KEY_REMOVED reset of the peer's reader"
+            );
+
+            // The writer's drop doesn't send the reset again.
+            drop_tx.send(()).unwrap();
+            let resent = pusher.recv_frames_timeout(1.s()).await;
+            let resent = resent.as_ref().map_or(0, reset_count);
+            assert_eq!(resent, 0, "the writer's drop sent its reset again");
+        }
+        .primary()
+        .spawn();
+
+        async move {
+            let err = writer.peer_cancellation().await;
+            assert_eq!(err.kind(), io::ErrorKind::ConnectionReset);
+            drop_rx.await.expect("the endpoint task read the reset");
+            drop(writer);
+        }
+        .primary()
+        .spawn();
+    });
+}

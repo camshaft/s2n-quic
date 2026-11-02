@@ -526,8 +526,9 @@ where
 
     // Each entry the map revoked (see `Entry::revoke`), by its ID, while a stream or a frame still
     // holds it: the map no longer holds it in `ids`. It lets the map count the peer's answers on
-    // the path secret, which stop the endpoint's resets there (see `Entry::on_revoked_refusal`).
-    // `evict_where` drops the entries no one holds any longer.
+    // the path secret, which stop the endpoint's frames there (see `Entry::on_revoked_refusal`).
+    // `evict_where` and each cycle of the cleaner drop the entries no one holds any longer (see
+    // `State::drop_released_revoked`).
     revoked: parking_lot::RwLock<HashMap<Id, Weak<Entry>>>,
 }
 
@@ -750,6 +751,14 @@ where
         let mut kept = self.revoked.write();
         kept.retain(|_, entry| entry.strong_count() > 0);
         kept.extend(revoked);
+    }
+
+    /// Drops each entry of `revoked` that no stream or frame holds any longer. The cleaner calls
+    /// it on each of its cycles, so that the allocation of such an entry stays until the cleaner's
+    /// next cycle at most, and not until the next key removal.
+    pub(super) fn drop_released_revoked(&self) {
+        let mut kept = self.revoked.write();
+        kept.retain(|_, entry| entry.strong_count() > 0);
     }
 
     /// Sends the peer of a revoked entry an unknown path secret packet, as the map sends one in

@@ -604,7 +604,7 @@ pub(crate) struct Context {
     /// The entry's count of the peer's answers on the revoked path secret (see
     /// `Entry::on_revoked_refusal`) as it stood when this context last sent an ack-eliciting
     /// packet. Where the entry's count differs, the peer answered after that transmission, and a
-    /// probe stops sending the resets on the revoked path secret again.
+    /// probe stops sending the frames on the revoked path secret again.
     pub revoked_refusals_seen: u32,
     /// RTT sampler for ACK-only (read-heavy) sends.
     ///

@@ -2410,3 +2410,69 @@ fn peer_liveness_buffers_preceding_data_before_reset() {
         .spawn();
     });
 }
+
+/// How many resets `frames` holds.
+fn reset_count(frames: &intrusive::Queue<Frame>) -> usize {
+    frames
+        .iter()
+        .filter(|frame| matches!(frame.header, Header::QueueReset { .. }))
+        .count()
+}
+
+/// On a revoked path secret, the reader sends the peer's writer its reset with `PEER_KEY_REMOVED`
+/// as the revoke's reset wakes it and it hands the error to the application, and its drop doesn't
+/// send that reset a second time.
+#[test]
+fn revoked_path_secret_reset_is_sent_once_across_read_and_drop() {
+    sim(|| {
+        let (mut reader, mut pusher) = make_pair();
+        // The map revoked the stream's path secret (see `Entry::revoke`).
+        assert!(reader.0.path_secret_entry.revoke());
+        let (drop_tx, drop_rx) = tokio::sync::oneshot::channel::<()>();
+
+        async move {
+            // The revoke's reset, as `Entry::revoke` pushes it into the reader's queue.
+            pusher.push_reset(error::PEER_KEY_REMOVED);
+            let frames = pusher
+                .recv_frames_timeout(1.s())
+                .await
+                .expect("the reader resets the peer's writer as it hands the error over");
+            assert_eq!(reset_count(&frames), 1, "expected exactly one reset frame");
+            let reset = frames
+                .iter()
+                .find(|frame| matches!(frame.header, Header::QueueReset { .. }))
+                .expect("a reset frame");
+            assert!(
+                matches!(
+                    reset.header,
+                    Header::QueueReset {
+                        reset_target: ResetTarget::Control,
+                        error_code,
+                        ..
+                    } if error_code == error::PEER_KEY_REMOVED
+                ),
+                "expected the PEER_KEY_REMOVED reset of the peer's writer"
+            );
+
+            // The reader's drop doesn't send the reset again.
+            drop_tx.send(()).unwrap();
+            let resent = pusher.recv_frames_timeout(1.s()).await;
+            let resent = resent.as_ref().map_or(0, reset_count);
+            assert_eq!(resent, 0, "the reader's drop sent its reset again");
+        }
+        .primary()
+        .spawn();
+
+        async move {
+            let mut buf = BytesMut::with_capacity(32);
+            reader
+                .read_into(&mut buf)
+                .await
+                .expect_err("a read after the revoke's reset");
+            drop_rx.await.expect("the endpoint task read the reset");
+            drop(reader);
+        }
+        .primary()
+        .spawn();
+    });
+}

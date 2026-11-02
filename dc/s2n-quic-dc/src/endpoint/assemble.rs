@@ -968,12 +968,14 @@ fn assemble_probe(
     counters: &AssemblerCounters,
 ) -> ProbeResult {
     // The endpoint refuses the peer's acknowledgements on a revoked path secret (see
-    // `Entry::revoke`), so it never sees a reset there acknowledged. Once the peer answered after
-    // this context's last transmission, either the map answered the peer's packet as one on a
-    // path secret this endpoint doesn't hold, which ends each of the peer's streams on the path
-    // secret, or the peer evicted the path secret: drop the resets instead of sending them again
-    // until the peer is declared dead.
-    let stop_resets = context.path_secret_entry.is_revoked()
+    // `Entry::revoke`), so it never sees a frame it sent there acknowledged. Once the peer
+    // answered after this context's last transmission, either the map answered the peer's packet
+    // as one on a path secret this endpoint doesn't hold, which ends each of the peer's streams on
+    // the path secret, or the peer evicted the path secret. Each stream on a revoked path secret
+    // already ended on this endpoint as well, so drop every frame on it, such as a reset, a held
+    // writer's data or a reader's `MAX_DATA`, instead of sending it again until the peer is
+    // declared dead.
+    let stop_revoked = context.path_secret_entry.is_revoked()
         && context.path_secret_entry.revoked_refusals() != context.revoked_refusals_seen;
 
     while let Some((old_pn, mut probe_frames)) = context.inflight.take_oldest_for_probe() {
@@ -981,9 +983,7 @@ fn assemble_probe(
         let mut has_frame = false;
 
         while let Some(frame) = probe_frames.pop_front() {
-            if !frame.should_transmit()
-                || (stop_resets && matches!(frame.header, frame::Header::QueueReset { .. }))
-            {
+            if !frame.should_transmit() || stop_revoked {
                 let _ = cancelled.send(frame);
                 continue;
             }

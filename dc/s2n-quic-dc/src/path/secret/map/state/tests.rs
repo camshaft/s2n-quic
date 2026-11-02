@@ -541,3 +541,49 @@ fn entry_without_negotiation_has_no_application_data() {
     let entry = Entry::builder((Ipv4Addr::LOCALHOST, 1).into()).build(None);
     assert!(entry.application_data().is_none());
 }
+
+/// The cleaner drops a revoked entry that no stream or frame holds any longer on its next cycle,
+/// and keeps one that a stream still holds, without waiting for the next key removal.
+#[test]
+fn the_cleaner_drops_each_revoked_entry_that_nothing_holds() {
+    let map = State::builder()
+        .with_signer(stateless_reset::Signer::new(b"secret"))
+        .with_capacity(50)
+        .with_clock(Clock)
+        .with_subscriber(tracing::Subscriber::default())
+        .build_state()
+        .unwrap();
+    // The test runs each cycle of the cleaner itself.
+    map.cleaner.stop();
+
+    let key = PeerKey::from_spki_der(&b"peer key"[..]);
+    Store::set_peer_keys(&*map, HashSet::from([key.clone()]));
+    let keyed_entry = |port: u16| {
+        Entry::builder((Ipv4Addr::LOCALHOST, port).into())
+            .peer_key(Some(key.clone()))
+            .build(None)
+    };
+    let held = keyed_entry(1);
+    let released = keyed_entry(2);
+    let released_id = *released.id();
+    map.test_insert(held.clone());
+    map.test_insert(released);
+
+    // The removal revokes both entries, and keeps each by its ID; nothing holds the second any
+    // longer once the map evicted it.
+    assert!(Store::remove_peer_key(&*map, &key));
+    assert!(held.is_revoked());
+    assert_eq!(map.revoked.read().len(), 2);
+    assert!(Store::revoked_by_id(&*map, &released_id).is_none());
+
+    // The cleaner's next cycle drops the released entry and keeps the held one.
+    map.cleaner.clean(&map, 0);
+    assert_eq!(map.revoked.read().len(), 1);
+    assert!(!map.revoked.read().contains_key(&released_id));
+    assert!(Store::revoked_by_id(&*map, held.id()).is_some());
+
+    // Once the stream lets the held entry go, the next cycle drops it too.
+    drop(held);
+    map.cleaner.clean(&map, 0);
+    assert!(map.revoked.read().is_empty());
+}

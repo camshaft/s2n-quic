@@ -104,7 +104,7 @@ pub struct Entry {
     revoked: AtomicBool,
     /// How many answers of the peer the map counted on the path secret since it revoked it (see
     /// [`Entry::on_revoked_refusal`]). A send context compares it with the count it saw at its
-    /// last transmission, and stops sending its resets on the path secret again once the peer
+    /// last transmission, and stops sending its frames on the path secret again once the peer
     /// answered after that transmission.
     revoked_refusals: AtomicU32,
 }
@@ -661,8 +661,9 @@ impl Entry {
     /// peer evicted the path secret, the peer's own unknown path secret packet for it.
     ///
     /// The endpoint refuses the peer's acknowledgements on a revoked path secret, so it never sees
-    /// its resets there acknowledged. An answer of the peer that comes after a reset went out is
-    /// the event that stops the reset from going out again (see `assemble_probe`).
+    /// its frames there acknowledged, its resets among them. An answer of the peer that comes
+    /// after a frame went out is the event that stops the frames on the path secret from going
+    /// out again (see `assemble_probe`).
     #[inline]
     pub(crate) fn on_revoked_refusal(&self) {
         self.revoked_refusals.fetch_add(1, Ordering::AcqRel);
