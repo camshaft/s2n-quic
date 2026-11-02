@@ -117,14 +117,20 @@ fn control_packets() {
     ];
 
     for (secret, stateless_reset, credential_id) in attempts {
-        packet!(
-            control::UnknownPathSecret {
-                wire_version: WireVersion::ZERO,
-                credential_id,
-                queue_id: None,
-            },
-            &stateless_reset
-        );
+        // The client accepts an UnknownPathSecret tagged with its own entry's stateless-reset
+        // token and evicts that entry: each later packet would be dropped, and the eviction
+        // events' `age` would depend on the real clock that sets the entry's creation time.
+        // `state::tests::unknown_path_secret_evicts_client_entry_by_default` covers that case.
+        if stateless_reset != client_srt {
+            packet!(
+                control::UnknownPathSecret {
+                    wire_version: WireVersion::ZERO,
+                    credential_id,
+                    queue_id: None,
+                },
+                &stateless_reset
+            );
+        }
 
         packet!(
             control::StaleKey {
