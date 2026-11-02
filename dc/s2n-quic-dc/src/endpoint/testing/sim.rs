@@ -184,7 +184,11 @@ fn get_or_create_group_endpoint(config: SimEndpointConfig) -> Arc<Endpoint> {
                 return ep;
             }
         }
-        let path_secret_map = crate::path::secret::map::testing::new(50_000);
+        let path_secret_map =
+            crate::path::secret::map::testing::new_with_evict_on_unknown_path_secret(
+                50_000,
+                config.evict_on_unknown_path_secret,
+            );
         let acceptor_registry = acceptor::Registry::new();
         let ep = Arc::new(setup_sim_endpoint(
             config,
@@ -253,6 +257,10 @@ pub struct SimEndpointConfig {
 
     /// Send credit pool config. Defaults to [`crate::credit::Config::default`].
     pub send_credit_pool_config: crate::credit::Config,
+
+    /// Whether the endpoint's path secret map evicts a path secret on a validated unknown path
+    /// secret packet, as `with_evict_on_unknown_path_secret` sets it. False by default.
+    pub evict_on_unknown_path_secret: bool,
 }
 
 impl Default for SimEndpointConfig {
@@ -277,6 +285,7 @@ impl Default for SimEndpointConfig {
             dead_peer_cooldown: crate::stream::endpoint::DEFAULT_DEAD_PEER_COOLDOWN,
             recv_credit_pool_config: crate::credit::Config::default(),
             send_credit_pool_config: crate::credit::Config::default(),
+            evict_on_unknown_path_secret: false,
         }
     }
 }
@@ -304,6 +313,11 @@ impl SimEndpointConfig {
 
     pub fn send_credit_pool_config(mut self, config: crate::credit::Config) -> Self {
         self.send_credit_pool_config = config;
+        self
+    }
+
+    pub fn evict_on_unknown_path_secret(mut self, evict: bool) -> Self {
+        self.evict_on_unknown_path_secret = evict;
         self
     }
 
@@ -353,6 +367,8 @@ pub fn setup_sim_endpoint(
         dead_peer_cooldown,
         recv_credit_pool_config,
         send_credit_pool_config,
+        // The map is built before the endpoint, in `get_or_create_group_endpoint`.
+        evict_on_unknown_path_secret: _,
     } = config;
 
     assert!(
