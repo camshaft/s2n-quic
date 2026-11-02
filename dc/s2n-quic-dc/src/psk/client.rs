@@ -111,22 +111,23 @@ impl Provider {
         )?;
         let state = Arc::new(state);
 
-        // TODO re-enable this
-        let _ = server_name;
+        // The map asks for a handshake in the background: the cleaner's periodic rehandshake, an
+        // accepted UnknownPathSecret or ReplayDetected, and a client path the endpoint's send
+        // idle wheel marks dead.
         // Avoid holding onto the state unintentionally after it's no longer needed.
-        // let weak = Arc::downgrade(&state);
-        // map.register_request_handshake(Box::new(move |peer, reason| {
-        //     let state = weak.upgrade()?;
-        //     let runtime = state.runtime.as_ref().map(|v| &v.0)?;
-        //     let client = state.client.clone();
-        //     let server_name = server_name.clone();
-        //     Some(runtime.spawn(async move {
-        //         if let Err(HandshakeFailed { .. }) = client.connect(peer, reason, server_name).await
-        //         {
-        //             // failure has already been logged, no further action required.
-        //         }
-        //     }))
-        // }));
+        let weak = Arc::downgrade(&state);
+        map.register_request_handshake(Box::new(move |peer, reason| {
+            let state = weak.upgrade()?;
+            let runtime = state.runtime.as_ref().map(|v| &v.0)?;
+            let client = state.client.clone();
+            let server_name = server_name.clone();
+            Some(runtime.spawn(async move {
+                if let Err(HandshakeFailed { .. }) = client.connect(peer, reason, server_name).await
+                {
+                    // failure has already been logged, no further action required.
+                }
+            }))
+        }));
 
         Ok(Self { state })
     }
@@ -403,5 +404,44 @@ mod tests {
             .unwrap();
         assert!(matches!(kind, HandshakeKind::Fresh));
         assert_ne!(*second.into_raw().id(), first_id);
+    }
+
+    /// The provider registers a handshake request on its map, so a background request for a
+    /// peer, such as the one the endpoint makes for a client path it marks dead, handshakes with
+    /// the peer and inserts an entry for it.
+    #[tokio::test]
+    async fn map_request_handshake_handshakes_in_the_background() {
+        init_tracing();
+
+        let tls = TestTlsProvider {};
+        let server = crate::psk::server::Provider::builder()
+            .start(
+                "[::1]:0".parse().unwrap(),
+                tls.clone(),
+                NoopSubscriber {},
+                test_map(),
+            )
+            .await
+            .unwrap();
+        let server_addr = server.local_addr();
+
+        let client = Provider::builder()
+            .start(
+                "[::]:0".parse().unwrap(),
+                test_map(),
+                tls,
+                NoopSubscriber {},
+                server_name(),
+            )
+            .unwrap();
+        assert!(!client.map().contains(&server_addr));
+
+        let handshake = client
+            .map()
+            .request_handshake(server_addr, HandshakeReason::Remote)
+            .expect("the provider registers a handshake request on its map");
+        handshake.await.unwrap();
+
+        assert!(client.map().contains(&server_addr));
     }
 }
