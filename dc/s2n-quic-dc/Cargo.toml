@@ -69,7 +69,6 @@ s2n-quic = { version = "=1.76.0", path = "../../quic/s2n-quic", features = ["uns
 s2n-quic-core = { version = "=0.76.0", path = "../../quic/s2n-quic-core", default-features = false }
 s2n-quic-dc-metrics = { version = "=0.76.0", path = "../s2n-quic-dc-metrics" }
 s2n-quic-platform = { version = "=0.76.0", path = "../../quic/s2n-quic-platform" }
-s2n-tls = "0.3"
 hashbrown = "0.16"
 thiserror = "2"
 tokio = { version = "1.53.3", default-features = false, features = ["sync"] }
@@ -80,13 +79,23 @@ zerocopy = { version = "0.8", features = ["derive"] }
 zeroize = "1"
 parking_lot = "0.12"
 bitvec = { version = "1.0.1", default-features = false }
-nix = { version = "0.31.1", features = ["socket", "uio", "fs", "time"] }
 loom = { version = "0.7", features = ["checkpoint", "futures"], optional = true }
 
 # io_uring is Linux-only; the storage scheduler's uring backend (fs::backend::uring) is gated on
 # target_os = "linux" and absent on every other platform.
 [target.'cfg(target_os = "linux")'.dependencies]
 io-uring = "0.7"
+
+# POSIX-only: nix, and the s2n-tls C library, which doesn't build on Windows, where s2n-quic's default
+# TLS provider is rustls.
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.31.1", features = ["socket", "uio", "fs", "time"] }
+s2n-tls = "0.3"
+
+# The Winsock and file calls of the Windows socket layer (socket::fd::windows) and of the storage
+# backend's Windows file IO (fs::backend::syscall).
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Networking_WinSock", "Win32_Storage_FileSystem", "Win32_System_IO"] }
 
 [dev-dependencies]
 # Enable backbeat's `bach` feature for test builds so the flight recorder's timestamps come from
@@ -96,7 +105,6 @@ io-uring = "0.7"
 # `backbeat` dep. Mirrors how `bach` itself is both an optional dep and a dev-dependency here.
 backbeat = { version = "0.1", features = ["bach"] }
 bach = { version = "0.1.0", features = ["net", "net-monitor", "tokio-compat"] }
-s2n-tls-tokio = "0.3"
 bolero = "0.13"
 bolero-generator = "0.13"
 insta = "1"
@@ -106,6 +114,9 @@ s2n-quic-core = { path = "../../quic/s2n-quic-core", features = ["state-tracing"
 s2n-quic-platform = { path = "../../quic/s2n-quic-platform", features = ["testing"] }
 tokio = { version = "1", features = ["full", "test-util"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "registry"] }
+
+[target.'cfg(unix)'.dev-dependencies]
+s2n-tls-tokio = "0.3"
 
 [lints.rust.unexpected_cfgs]
 level = "warn"
