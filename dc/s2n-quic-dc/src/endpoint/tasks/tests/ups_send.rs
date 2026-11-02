@@ -12,6 +12,8 @@
 //! 4. Rejections for many credentials, or for two sender ids of one credential, leave one
 //!    response in the queue for each.
 //! 5. A response the queue refuses doesn't keep a later response with its key out.
+//! 6. Rejections of packets whose credential the path secret map doesn't hold leave one
+//!    UnknownPathSecret response in the queue for each credential and sender id.
 
 use super::helpers::test_entry;
 use crate::{
@@ -208,6 +210,29 @@ fn reject(
         sender_id,
         packet_number: VarInt::ZERO,
         control_out: encode_replay_detected(id, sender_id),
+    };
+    tasks::on_packet_dispatch_error(dispatch_counters, ups_tx, err);
+}
+
+/// Hands `on_packet_dispatch_error` the rejection of a packet from the peer's `sender_id` whose
+/// credential the path secret map doesn't hold, with its UnknownPathSecret response.
+fn reject_unknown(
+    dispatch_counters: &counters::Dispatch,
+    ups_tx: &mut impl UnboundedSender<Entry<ups::Response>>,
+    dest: SocketAddr,
+    id: Id,
+    sender_id: VarInt,
+) {
+    let mut dest_addr = Addr::default();
+    dest_addr.set(dest.into());
+    let err = dispatch::Error::PeerStateLookup {
+        dest_addr,
+        credentials: Credentials {
+            id,
+            key_id: VarInt::ZERO,
+        },
+        sender_id,
+        control_out: encode_ups_packet(id),
     };
     tasks::on_packet_dispatch_error(dispatch_counters, ups_tx, err);
 }
@@ -433,4 +458,27 @@ fn a_refused_response_does_not_hold_its_key() {
         0,
         "the refused response doesn't hold its key"
     );
+}
+
+/// Rejections of packets whose credential the path secret map doesn't hold leave one
+/// UnknownPathSecret response in the queue for each credential and sender id.
+#[test]
+fn unknown_credentials_queue_one_response_for_each_credential_and_sender_id() {
+    let registry = Registry::default();
+    let pending = new_pending(&registry);
+    let dispatch_counters = counters::Dispatch::new(&registry);
+    let (tx, _rx) = unsync::new::<ups::Response>();
+    let mut ups_tx = pending.sender(tx);
+    let dest = SocketAddr::from(([127, 0, 0, 1], 4433));
+    let ids = [Id::from([1; 16]), Id::from([2; 16])];
+    let sender_ids = [VarInt::from_u8(0), VarInt::from_u8(1)];
+
+    for _ in 0..BURST {
+        for id in ids {
+            for sender_id in sender_ids {
+                reject_unknown(&dispatch_counters, &mut ups_tx, dest, id, sender_id);
+            }
+        }
+    }
+    assert_eq!(pending.queued(), ids.len() * sender_ids.len());
 }
