@@ -1,6 +1,7 @@
 // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+use super::{ControlReceiver, StreamReceiver};
 use crate::{endpoint::msg, intrusive};
 use bytes::BytesMut;
 use core::task::{Context, RawWaker, RawWakerVTable, Waker};
@@ -24,6 +25,45 @@ pub fn make_control_entry() -> intrusive::Entry<msg::Control> {
     intrusive::Entry::new(msg::Control::Frames {
         payload: BytesMut::from(&[0][..]),
     })
+}
+
+/// Pops the next entry of each half of a slot, and asserts that each is a reset with
+/// `error_code`.
+#[track_caller]
+pub fn assert_next_is_reset(
+    stream: &StreamReceiver,
+    control: &ControlReceiver,
+    error_code: VarInt,
+) {
+    let entry = stream
+        .try_recv()
+        .expect("the stream half is open")
+        .expect("the stream half holds an entry");
+    match &*entry {
+        msg::Stream::Reset { error_code: code } => assert_eq!(*code, error_code),
+        _ => panic!("the stream half's next entry isn't a reset"),
+    }
+    let entry = control
+        .try_recv()
+        .expect("the control half is open")
+        .expect("the control half holds an entry");
+    match &*entry {
+        msg::Control::Reset { error_code: code } => assert_eq!(*code, error_code),
+        _ => panic!("the control half's next entry isn't a reset"),
+    }
+}
+
+/// Asserts that neither half of a slot holds an entry.
+#[track_caller]
+pub fn assert_empty(stream: &StreamReceiver, control: &ControlReceiver) {
+    assert!(
+        stream.try_recv().expect("the stream half is open").is_none(),
+        "the stream half holds an entry"
+    );
+    assert!(
+        control.try_recv().expect("the control half is open").is_none(),
+        "the control half holds an entry"
+    );
 }
 
 pub fn test_waker() -> (Waker, Arc<AtomicUsize>) {
