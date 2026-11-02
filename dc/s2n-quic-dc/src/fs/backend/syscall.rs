@@ -41,7 +41,6 @@ use crate::{
     socket::channel::{intrusive::sync as sync_chan, Map, ReceiverExt as _, UnboundedSender},
     sync::Arc,
 };
-use std::os::fd::RawFd;
 
 /// Run the op's syscall on its fd, stamping `status`.
 ///
@@ -120,8 +119,9 @@ fn execute(op: &mut Entry<IoOp>) {
 /// logical length to the total read. This is the no-memset path: a short read at EOF simply leaves a
 /// shorter buffer, never a zero-padded one, and a partial kernel read does not cost a pipeline
 /// resubmit.
+#[cfg(unix)]
 fn pread_exact(
-    fd: RawFd,
+    fd: crate::fs::op::RawFile,
     buf: &mut bytes::buf::UninitSlice,
     want: usize,
     offset: u64,
@@ -160,7 +160,8 @@ fn pread_exact(
 }
 
 /// Write all of `data` at `offset` via repeated `pwrite`. Retries `EINTR`/short writes.
-fn pwrite_all(fd: RawFd, data: &[u8], offset: u64) -> std::io::Result<()> {
+#[cfg(unix)]
+fn pwrite_all(fd: crate::fs::op::RawFile, data: &[u8], offset: u64) -> std::io::Result<()> {
     let mut written = 0usize;
     while written < data.len() {
         // SAFETY: `data[written..]` is a valid readable slice; `fd` is owned by the caller.
@@ -190,7 +191,8 @@ fn pwrite_all(fd: RawFd, data: &[u8], offset: u64) -> std::io::Result<()> {
     Ok(())
 }
 
-fn fsync(fd: RawFd, data_only: bool) -> std::io::Result<()> {
+#[cfg(unix)]
+fn fsync(fd: crate::fs::op::RawFile, data_only: bool) -> std::io::Result<()> {
     // `fdatasync` is Linux-only; on other platforms (macOS) fall back to a full `fsync`.
     #[cfg(target_os = "linux")]
     let ret = unsafe {
@@ -211,6 +213,114 @@ fn fsync(fd: RawFd, data_only: bool) -> std::io::Result<()> {
     } else {
         Ok(())
     }
+}
+
+// -- Raw positional file calls (Windows) ------------------------------------------
+
+/// Read up to `want` bytes into `buf`'s uninitialized spare capacity (no zero-fill), looping on
+/// partial reads until either `want` bytes are read or a read returns 0 (genuine EOF), as the Unix
+/// `pread_exact` does. `ReadFile` with an `OVERLAPPED` offset reads at that offset on a handle
+/// opened for synchronous IO, and only writes the destination.
+#[cfg(windows)]
+fn pread_exact(
+    fd: crate::fs::op::RawFile,
+    buf: &mut bytes::buf::UninitSlice,
+    want: usize,
+    offset: u64,
+) -> std::io::Result<usize> {
+    use windows_sys::Win32::{
+        Foundation::ERROR_HANDLE_EOF,
+        Storage::FileSystem::ReadFile,
+        System::IO::OVERLAPPED,
+    };
+
+    let want = want.min(buf.len());
+    let mut done = 0usize;
+    while done < want {
+        // The uninitialized destination region for the tail starting at `done`.
+        let dst = &mut buf[done..want];
+        let at = offset + done as u64;
+        let len = dst.len().min(u32::MAX as usize) as u32;
+
+        // SAFETY: an all-zero `OVERLAPPED` is valid; the offset's two halves are `Copy` fields of
+        // its union, written before the call reads them.
+        let mut overlapped: OVERLAPPED = unsafe { core::mem::zeroed() };
+        unsafe {
+            overlapped.Anonymous.Anonymous.Offset = at as u32;
+            overlapped.Anonymous.Anonymous.OffsetHigh = (at >> 32) as u32;
+        }
+
+        let mut read = 0u32;
+        // SAFETY: `dst` is a valid writable region of at least `len` bytes, which `ReadFile` only
+        // writes, and we return the count so the caller `set_len`s exactly the initialized prefix.
+        // `read` and `overlapped` are valid for the call. `fd` is owned by the caller.
+        let ok = unsafe { ReadFile(fd, dst.as_mut_ptr(), len, &mut read, &mut overlapped) };
+        if ok == 0 {
+            let err = std::io::Error::last_os_error();
+            // A read that starts at or past the end of the file fails with `ERROR_HANDLE_EOF`.
+            if err.raw_os_error() == Some(ERROR_HANDLE_EOF as i32) {
+                break;
+            }
+            if err.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(err);
+        }
+        done += read as usize;
+        if read == 0 {
+            break; // EOF: fewer than `want` bytes exist.
+        }
+    }
+    Ok(done)
+}
+
+/// Runs `f` on the file `fd` is the handle of, without taking ownership of the handle.
+#[cfg(windows)]
+fn with_file<R>(fd: crate::fs::op::RawFile, f: impl FnOnce(&std::fs::File) -> R) -> R {
+    use std::os::windows::io::FromRawHandle;
+
+    // SAFETY: the caller's op holds the file open for this call, and `ManuallyDrop` keeps this
+    // `File` from closing the handle when it goes out of scope.
+    let file = core::mem::ManuallyDrop::new(unsafe { std::fs::File::from_raw_handle(fd) });
+    f(&file)
+}
+
+/// Write all of `data` at `offset` via repeated positional writes. Retries interrupted and short
+/// writes.
+#[cfg(windows)]
+fn pwrite_all(fd: crate::fs::op::RawFile, data: &[u8], offset: u64) -> std::io::Result<()> {
+    use std::os::windows::fs::FileExt;
+
+    with_file(fd, |file| {
+        let mut written = 0usize;
+        while written < data.len() {
+            match file.seek_write(&data[written..], offset + written as u64) {
+                Ok(0) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::WriteZero,
+                        "seek_write returned 0",
+                    ))
+                }
+                Ok(n) => written += n,
+                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(err) => return Err(err),
+            }
+        }
+        Ok(())
+    })
+}
+
+/// Flush the file to the device. Windows has one flush, `FlushFileBuffers`, for data and metadata
+/// alike, so a data-only flush writes the metadata too.
+#[cfg(windows)]
+fn fsync(fd: crate::fs::op::RawFile, data_only: bool) -> std::io::Result<()> {
+    with_file(fd, |file| {
+        if data_only {
+            file.sync_data()
+        } else {
+            file.sync_all()
+        }
+    })
 }
 
 // ── Backend wiring ──────────────────────────────────────────────────────────
@@ -512,9 +622,17 @@ mod tests {
     fn bad_fd_read_fails_not_hangs() {
         // An `Fd` wrapping a never-valid descriptor (-1) — the `pread` fails with EBADF.
         struct BadFd;
+        #[cfg(unix)]
         impl std::os::fd::AsRawFd for BadFd {
             fn as_raw_fd(&self) -> std::os::fd::RawFd {
                 -1
+            }
+        }
+        // `INVALID_HANDLE_VALUE`: the `ReadFile` fails with `ERROR_INVALID_HANDLE`.
+        #[cfg(windows)]
+        impl std::os::windows::io::AsRawHandle for BadFd {
+            fn as_raw_handle(&self) -> std::os::windows::io::RawHandle {
+                -1isize as std::os::windows::io::RawHandle
             }
         }
         run_local(|mut spawn, registry| async move {
