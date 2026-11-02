@@ -11,8 +11,10 @@
 //!   marks its datagram with the same control message.
 //! - Batching: [`configure`] turns on receive coalescing (`UDP_RECV_MAX_COALESCED_SIZE`), the
 //!   counterpart of Linux's GRO: a receive reads the segment size of a coalesced message from its
-//!   `UDP_COALESCED_INFO` control message. A send of more than one segment sets its segment size
-//!   with a `UDP_SEND_MSG_SIZE` control message, the counterpart of Linux's GSO.
+//!   `UDP_COALESCED_INFO` control message. Where [`configure`] finds that the build takes send
+//!   segmentation, a send of more than one segment sets its segment size with a
+//!   `UDP_SEND_MSG_SIZE` control message, the counterpart of Linux's GSO; elsewhere it sends each
+//!   segment in a call of its own.
 //!
 //! A Windows build that doesn't support one of these options refuses it: [`configure`] returns a
 //! [`Support`] value for each option, and a send whose ECN marking the build refuses goes out
@@ -73,6 +75,9 @@ pub struct Features {
     /// An ICMP port unreachable for an earlier send doesn't fail the next receive with
     /// `WSAECONNRESET`, as it does by default on Windows.
     pub ignore_connreset: Support,
+    /// Send segmentation (`UDP_SEND_MSG_SIZE`), which sends several datagrams of one size in one
+    /// call. Where it is off, a send of several segments sends each segment in a call of its own.
+    pub send_segmentation: Support,
 }
 
 /// Sets the options this module's receives and sends read on `socket`, and returns which of them
@@ -98,10 +103,18 @@ pub fn configure<T: AsRaw + ?Sized>(socket: &T, recv_coalesced_size: u32) -> Fea
 
     let ignore_connreset = disable_connreset(socket);
 
+    // A Windows build that takes send segmentation answers a read of the option; one that doesn't
+    // refuses it.
+    let send_segmentation = get_option(socket, IPPROTO_UDP, UDP_SEND_MSG_SIZE);
+    if send_segmentation.is_enabled() {
+        SEND_SEGMENTATION.store(true, Ordering::Relaxed);
+    }
+
     Features {
         ecn,
         recv_coalescing,
         ignore_connreset,
+        send_segmentation,
     }
 }
 
@@ -114,6 +127,30 @@ fn set_option(socket: WinSock::SOCKET, level: i32, name: i32, value: u32) -> Sup
             name,
             ptr::addr_of!(value).cast(),
             mem::size_of::<u32>() as i32,
+        )
+    };
+
+    if res == WinSock::SOCKET_ERROR {
+        Support::Unsupported(last_error_code())
+    } else {
+        Support::Enabled
+    }
+}
+
+/// Reads an option of `socket`: `Enabled` where the Windows build answers the read, and
+/// `Unsupported` with its error where it refuses it.
+fn get_option(socket: WinSock::SOCKET, level: i32, name: i32) -> Support {
+    let mut value = 0u32;
+    let mut len = mem::size_of::<u32>() as i32;
+    // SAFETY: `value` is a writable `u32` for the length `len` states, and `len` is a writable
+    // `i32`.
+    let res = unsafe {
+        WinSock::getsockopt(
+            socket,
+            level,
+            name,
+            ptr::addr_of_mut!(value).cast(),
+            &mut len,
         )
     };
 
@@ -233,7 +270,102 @@ where
         None if buffer.len() > 1 => buffer[0].len() as u16,
         None => 0,
     };
+    let total: usize = buffer.iter().map(|slice| slice.len()).sum();
 
+    match send_plan(
+        total,
+        segment_size,
+        SEND_SEGMENTATION.load(Ordering::Relaxed),
+    ) {
+        SendPlan::One => send_one(socket, addr, ecn, buffer, 0, flags),
+        SendPlan::Segmented(size) => send_one(socket, addr, ecn, buffer, size, flags),
+        SendPlan::EachSegment(size) => send_segments(socket, addr, ecn, buffer, size, flags),
+    }
+}
+
+/// How [`send`] sends a message of `total` bytes whose segments are `segment_size` bytes each.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SendPlan {
+    /// One datagram, without a `UDP_SEND_MSG_SIZE` control message.
+    One,
+    /// Several datagrams of this size in one call, with a `UDP_SEND_MSG_SIZE` control message.
+    Segmented(u16),
+    /// Several datagrams of this size, one call each, where the Windows build doesn't take send
+    /// segmentation.
+    EachSegment(u16),
+}
+
+/// A message no longer than one segment goes out as one datagram, whatever `segmentation` says,
+/// so a Windows build that refuses `UDP_SEND_MSG_SIZE` still sends it.
+#[inline]
+fn send_plan(total: usize, segment_size: u16, segmentation: bool) -> SendPlan {
+    if segment_size == 0 || total <= segment_size as usize {
+        SendPlan::One
+    } else if segmentation {
+        SendPlan::Segmented(segment_size)
+    } else {
+        SendPlan::EachSegment(segment_size)
+    }
+}
+
+/// Sends `buffer` as datagrams of `segment_size` bytes each, one `WSASendMsg` call a datagram,
+/// the last datagram holding what is left. Where a datagram after the first fails to send, it
+/// returns the bytes the datagrams before it sent, and the rest of the message is lost.
+fn send_segments(
+    socket: WinSock::SOCKET,
+    addr: &Addr,
+    ecn: ExplicitCongestionNotification,
+    buffer: &[IoSlice],
+    segment_size: u16,
+    flags: Flags,
+) -> io::Result<usize> {
+    let segment_size = segment_size as usize;
+    let mut segment = Vec::with_capacity(buffer.len());
+    let mut sent = 0;
+    let mut slice = 0;
+    let mut offset = 0;
+
+    while slice < buffer.len() {
+        segment.clear();
+        let mut want = segment_size;
+        while want > 0 && slice < buffer.len() {
+            let rest = &buffer[slice][offset..];
+            let take = rest.len().min(want);
+            if take > 0 {
+                segment.push(IoSlice::new(&rest[..take]));
+            }
+            want -= take;
+            offset += take;
+            if offset == buffer[slice].len() {
+                slice += 1;
+                offset = 0;
+            }
+        }
+
+        if segment.is_empty() {
+            break;
+        }
+
+        match send_one(socket, addr, ecn, &segment, 0, flags) {
+            Ok(len) => sent += len,
+            Err(err) if sent == 0 => return Err(err),
+            Err(_) => break,
+        }
+    }
+
+    Ok(sent)
+}
+
+/// Sends `buffer` to `addr` in one `WSASendMsg` call, marked with `ecn`, with a
+/// `UDP_SEND_MSG_SIZE` control message of `segment_size` where it isn't 0.
+fn send_one(
+    socket: WinSock::SOCKET,
+    addr: &Addr,
+    ecn: ExplicitCongestionNotification,
+    buffer: &[IoSlice],
+    segment_size: u16,
+    flags: Flags,
+) -> io::Result<usize> {
     let mut mark = ecn != ExplicitCongestionNotification::NotEct
         && !SEND_ECN_REFUSED.load(Ordering::Relaxed);
 
@@ -343,6 +475,10 @@ where
 
 /// Set once a send's ECN control message is refused: later sends go out unmarked.
 static SEND_ECN_REFUSED: AtomicBool = AtomicBool::new(false);
+
+/// Set once [`configure`] finds that the Windows build takes send segmentation
+/// (`UDP_SEND_MSG_SIZE`): until then, a send of several segments sends each in a call of its own.
+static SEND_SEGMENTATION: AtomicBool = AtomicBool::new(false);
 
 /// `WSARecvMsg`, which Winsock hands out as an extension function of the socket's provider.
 static WSARECVMSG: OnceLock<WinSock::LPFN_WSARECVMSG> = OnceLock::new();
@@ -671,5 +807,48 @@ mod tests {
         assert!(encoder.push(IPPROTO_UDP, UDP_SEND_MSG_SIZE, 1200));
         assert!(!encoder.push(IPPROTO_UDP, UDP_SEND_MSG_SIZE, 1200));
         assert_eq!(encoder.len, N);
+    }
+
+    /// A message no longer than one segment goes out as one datagram without
+    /// `UDP_SEND_MSG_SIZE`, whether or not the build takes send segmentation, and a longer one
+    /// goes out segmented only where the build takes it.
+    #[test]
+    fn send_plan_segments_only_where_the_build_takes_it() {
+        for segmentation in [false, true] {
+            assert_eq!(send_plan(1200, 0, segmentation), SendPlan::One);
+            assert_eq!(send_plan(1200, 1200, segmentation), SendPlan::One);
+            assert_eq!(send_plan(1000, 1200, segmentation), SendPlan::One);
+        }
+        assert_eq!(send_plan(2400, 1200, true), SendPlan::Segmented(1200));
+        assert_eq!(send_plan(2400, 1200, false), SendPlan::EachSegment(1200));
+    }
+
+    /// Where the build doesn't take send segmentation, a message of several segments arrives as
+    /// one datagram for each segment, the last holding what is left, across the message's slices.
+    #[test]
+    fn send_segments_sends_one_datagram_a_segment() {
+        let (a, b) = pair("127.0.0.1:0");
+        let to = Addr::new(b.local_addr().unwrap().into());
+        let first = [1u8; 15];
+        let second = [2u8; 10];
+        let iov = [IoSlice::new(&first), IoSlice::new(&second)];
+
+        let socket = a.as_raw() as WinSock::SOCKET;
+        let sent = send_segments(
+            socket,
+            &to,
+            ExplicitCongestionNotification::NotEct,
+            &iov,
+            10,
+            0,
+        )
+        .unwrap();
+        assert_eq!(sent, 25);
+
+        let expected: [&[u8]; 3] = [&[1; 10], &[1, 1, 1, 1, 1, 2, 2, 2, 2, 2], &[2; 5]];
+        for want in expected {
+            let (len, _from, _cmsg, received) = recv_one(&b, 1500);
+            assert_eq!(&received[..len], want);
+        }
     }
 }
