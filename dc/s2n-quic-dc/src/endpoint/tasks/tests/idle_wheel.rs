@@ -431,6 +431,13 @@ fn send_idle_wheel_marks_dead_a_peer_that_doesnt_answer_the_probe_of_an_open_str
                 ),
                 "the stream should be reset with the idle timeout error"
             );
+
+            // The on-time check at the idle deadline doesn't probe the quiet period again.
+            let mut later = frame::PriorityStorage::default();
+            assert!(
+                matches!(frame_rx.poll_swap(&mut cx, &mut later), core::task::Poll::Pending),
+                "the quiet period should be probed once"
+            );
             drop(stream);
         }
         .primary()
