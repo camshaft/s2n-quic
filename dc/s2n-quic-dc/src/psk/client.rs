@@ -536,4 +536,62 @@ mod tests {
 
         assert!(client.map().contains(&server_addr));
     }
+
+    /// Many background requests for one peer share one handshake. The handshake queue runs one
+    /// handshake for a peer at a time and holds its success, so a burst of requests, such as one
+    /// for each ReplayDetected notice a client accepts, doesn't start a handshake for each
+    /// request.
+    #[tokio::test]
+    async fn repeated_background_requests_share_one_handshake() {
+        init_tracing();
+
+        let tls = TestTlsProvider {};
+        let server = crate::psk::server::Provider::builder()
+            .start(
+                "[::1]:0".parse().unwrap(),
+                tls.clone(),
+                NoopSubscriber {},
+                test_map(),
+            )
+            .await
+            .unwrap();
+        let server_addr = server.local_addr();
+
+        // With the cleaner stopped, an entry a second handshake replaced would stay in the map's
+        // list of secrets, and `secrets_len` would count it.
+        let map = test_map();
+        map.test_stop_cleaner();
+
+        // A success hold far longer than the test, so a request that comes after the handshake
+        // finished gets the held success and doesn't handshake again.
+        let client = Provider::builder()
+            .with_success_jitter(Duration::from_secs(1_000_000))
+            .start(
+                "[::]:0".parse().unwrap(),
+                map.clone(),
+                tls,
+                NoopSubscriber {},
+                server_name(),
+            )
+            .unwrap();
+
+        let handshakes: Vec<_> = (0..1_000)
+            .map(|_| {
+                client
+                    .map()
+                    .request_handshake(server_addr, HandshakeReason::Remote)
+                    .expect("the provider registers a handshake request on its map")
+            })
+            .collect();
+        for handshake in handshakes {
+            handshake.await.unwrap();
+        }
+
+        assert!(client.map().contains(&server_addr));
+        assert_eq!(
+            map.secrets_len(),
+            1,
+            "the requests shared one handshake, and none ran after it"
+        );
+    }
 }
