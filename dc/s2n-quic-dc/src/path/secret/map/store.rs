@@ -96,6 +96,14 @@ pub trait Store: 'static + Send + Sync + time::Clock {
         cb: Box<dyn Fn(SocketAddr, HandshakeReason) -> Option<JoinHandle<()>> + Send + Sync>,
     );
 
+    /// Asks the handshake client registered with `register_request_handshake`, where one is, to
+    /// handshake with `peer` in the background.
+    fn request_handshake(
+        &self,
+        peer: SocketAddr,
+        reason: HandshakeReason,
+    ) -> Option<JoinHandle<()>>;
+
     fn advertised_peer_info(&self) -> Option<bytes::Bytes>;
 
     fn advertised_data_addrs(&self) -> Option<bytes::Bytes>;
