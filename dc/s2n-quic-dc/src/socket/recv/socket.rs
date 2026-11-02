@@ -191,16 +191,22 @@ impl<T: std::os::fd::AsRawFd> Tokio<T> {
     ///
     /// Must be called from within a tokio runtime (endpoint setup runs under one) — the `AsyncFd`
     /// binds to that runtime's IO driver, which drives readiness for the fd thereafter.
+    ///
+    /// `inner` must own the fd its `as_raw_fd` returns and return that same fd on every call, as
+    /// `std::net::UdpSocket` does: the `AsyncFd` relies on that fd staying open until it drops.
     #[inline]
     pub fn new(inner: T) -> io::Result<Self> {
-        // Newer tokio releases deprecate `AsyncFd::with_interest` in favor of
-        // `AsyncFd::register_with_interest`, but this crate's `tokio = "1"` requirement also
-        // allows older releases that don't have `register_with_interest`.
-        #[allow(deprecated)]
-        let async_fd = tokio::io::unix::AsyncFd::with_interest(
-            FdRef(std::os::fd::AsRawFd::as_raw_fd(&inner)),
-            tokio::io::Interest::READABLE,
-        )?;
+        // SAFETY: `inner` owns the fd that `FdRef` holds, `Self` holds `inner` for as long as it
+        // lives, and this module doesn't close that fd or take `inner` out of `Self`. `async_fd`
+        // is declared before `inner`, so the `AsyncFd` drops, and deregisters the fd, before
+        // `inner` drops and closes it. The fd therefore stays open on the same file description
+        // for the whole life of the `AsyncFd`, and `FdRef::as_raw_fd` returns it on every call.
+        let async_fd = unsafe {
+            tokio::io::unix::AsyncFd::register_with_interest(
+                FdRef(std::os::fd::AsRawFd::as_raw_fd(&inner)),
+                tokio::io::Interest::READABLE,
+            )
+        }?;
         Ok(Self { inner, async_fd })
     }
 }
@@ -278,6 +284,8 @@ impl<T> TokioUnbound<T> {
     /// Wrap a raw recv socket, deferring readiness registration until [`bind_on_worker`] runs on the
     /// worker.
     ///
+    /// `inner` must meet the requirement on its fd that [`Tokio::new`] states.
+    ///
     /// [`bind_on_worker`]: BindOnWorker::bind_on_worker
     #[inline]
     pub fn new(inner: T) -> Self {
@@ -326,10 +334,13 @@ mod tests {
     ///
     /// On Linux the reactor is an epoll instance, which refuses to register an fd it already holds,
     /// so this returns an `AlreadyExists` error while another `AsyncFd` holds `fd`.
-    fn register(fd: RawFd) -> io::Result<()> {
-        // Allowed for the reason the comment in `Tokio::new` states.
-        #[allow(deprecated)]
-        let async_fd = AsyncFd::with_interest(FdRef(fd), Interest::READABLE)?;
+    ///
+    /// # Safety
+    ///
+    /// `fd` must stay open until this returns.
+    unsafe fn register(fd: RawFd) -> io::Result<()> {
+        // SAFETY: the caller keeps `fd` open until this returns, and `async_fd` drops first.
+        let async_fd = unsafe { AsyncFd::register_with_interest(FdRef(fd), Interest::READABLE) }?;
         drop(async_fd);
         Ok(())
     }
@@ -349,7 +360,8 @@ mod tests {
 
     impl Drop for RegisterOnDrop {
         fn drop(&mut self) {
-            let result = register(self.socket.as_raw_fd());
+            // SAFETY: `self.socket` closes its fd only after this `drop` returns.
+            let result = unsafe { register(self.socket.as_raw_fd()) };
             *self.registered.borrow_mut() = Some(result);
         }
     }
@@ -368,7 +380,8 @@ mod tests {
 
         // While `async_fd` holds the fd, the reactor refuses a second registration of it: this is
         // what `RegisterOnDrop` sees where it drops before `async_fd`.
-        let err = register(socket.inner.as_raw_fd()).unwrap_err();
+        // SAFETY: `socket` holds `inner`, which keeps its fd open until `socket` drops below.
+        let err = unsafe { register(socket.inner.as_raw_fd()) }.unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
         assert!(registered.borrow().is_none());
 
