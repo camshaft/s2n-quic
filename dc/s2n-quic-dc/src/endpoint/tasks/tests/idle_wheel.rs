@@ -791,6 +791,96 @@ fn send_idle_wheel_probes_an_invalidated_context_half_an_idle_timeout_in() {
     });
 }
 
+/// As `send_idle_wheel_probes_an_invalidated_context_whose_open_stream_is_checked_on_time`,
+/// where the peer answers the probe at the idle deadline. The answer moves the path entry's
+/// last activity, which the idle wheel reads for the invalidated context beside the context's
+/// own `last_peer_activity`, so the answer starts a new quiet period. The check half an idle
+/// timeout after the probe, which marks the peer dead where the probe goes unanswered, finds
+/// that period unprobed and doesn't mark the peer dead.
+#[test]
+fn send_idle_wheel_starts_a_new_quiet_period_once_an_invalidated_contexts_probe_is_answered() {
+    let _guard = crate::testing::without_snapshots();
+    sim(|| {
+        let (send_caches, mut idle_wheel_tx, _completed_rx, clock, _registry) = setup_send();
+
+        let pse = test_entry();
+        let start = precision::Clock::now(&clock);
+        pse.touch_activity(start);
+        let stream = open_stream(&pse);
+
+        let ctx = send_caches[LocalSendSocketId::new(0)]
+            .borrow_mut()
+            .get_or_insert(&pse, &clock)
+            .unwrap();
+        assert!(!ctx.borrow().inflight.has_inflight());
+
+        let idle = pse.idle_timeout();
+        ctx.borrow_mut().idle_wheel.target_time = Some(start + idle);
+        let _ = idle_wheel_tx.send(ctx.clone());
+
+        // A stale key invalidates the context with nothing to retransmit: the cache removes it,
+        // and it stays on the idle wheel.
+        let key_id = ctx.borrow().credentials.key_id;
+        let (mut retransmit_tx, _retransmit_rx) = unsync::new::<Frame>();
+        let removed = send_caches[LocalSendSocketId::new(0)]
+            .borrow_mut()
+            .invalidate_stale_key(
+                pse.id(),
+                LocalSenderId::from_index(0),
+                key_id,
+                &mut retransmit_tx,
+            );
+        assert!(removed.is_some(), "the cache should invalidate the context");
+        assert!(ctx.borrow().invalidated);
+        assert_eq!(
+            send_caches[LocalSendSocketId::new(0)]
+                .borrow()
+                .context_count(),
+            0,
+            "the cache should no longer hold the invalidated context"
+        );
+
+        let pse = pse.clone();
+        async move {
+            // At the idle deadline the check runs on time and probes the quiet path.
+            (idle + 3.s()).sleep().await;
+            assert!(
+                ctx.borrow().idle_probe_for.is_some(),
+                "the idle wheel should probe an invalidated context's quiet path at its deadline"
+            );
+            let now = precision::Clock::now(&Clock::default());
+            assert!(
+                !pse.is_dead_during_cooldown(now, crate::endpoint::DEFAULT_DEAD_PEER_COOLDOWN),
+                "an invalidated context checked on time should probe instead of marking dead"
+            );
+
+            // The peer answers: a packet from the peer moves the path entry's last activity, as
+            // the dispatch of each inbound packet that decrypts does.
+            pse.touch_activity(precision::Clock::now(&Clock::default()));
+            let answered = pse.last_activity();
+
+            // The check half an idle timeout after the probe, where an unanswered probe marks
+            // the peer dead, reads the answer as the start of a new quiet period and arms the
+            // next check for that period's probe, half an idle timeout after the answer. The
+            // assertions below run between those two checks.
+            (idle / 2 - 2.s()).sleep().await;
+            let now = precision::Clock::now(&Clock::default());
+            assert!(
+                !pse.is_dead_during_cooldown(now, crate::endpoint::DEFAULT_DEAD_PEER_COOLDOWN),
+                "a peer that answers the probe shouldn't be marked dead"
+            );
+            assert_ne!(
+                ctx.borrow().idle_probe_for,
+                Some(answered.nanos),
+                "the earlier probe shouldn't count for the quiet period the answer started"
+            );
+            drop(stream);
+        }
+        .primary()
+        .spawn();
+    });
+}
+
 /// When a recv context goes idle, the peer must NOT be marked dead. The recv side
 /// has no way to distinguish "peer stopped sending because it has nothing to say"
 /// from "peer is actually dead". Only the send side (via unacknowledged inflight
