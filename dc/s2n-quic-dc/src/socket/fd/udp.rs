@@ -1,19 +1,21 @@
 // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+use super::AsRaw;
+#[cfg(unix)]
 use super::{libc_call, Flags};
+#[cfg(unix)]
 use crate::msg::{
     addr::Addr,
     cmsg::{self, Encoder},
 };
+#[cfg(unix)]
 use s2n_quic_core::inet::ExplicitCongestionNotification;
-use std::{
-    io::{self, IoSlice, IoSliceMut},
-    net::SocketAddr,
-    os::fd::AsRawFd,
-};
+#[cfg(unix)]
+use std::io::{IoSlice, IoSliceMut};
+use std::{io, net::SocketAddr};
 
-pub trait Socket: 'static + AsRawFd + Send + Sync {
+pub trait Socket: 'static + AsRaw + Send + Sync {
     fn local_addr(&self) -> io::Result<SocketAddr>;
 }
 
@@ -58,10 +60,19 @@ impl<S: Socket> CachedAddr<S> {
     }
 }
 
-impl<S: Socket> AsRawFd for CachedAddr<S> {
+#[cfg(unix)]
+impl<S: Socket> std::os::fd::AsRawFd for CachedAddr<S> {
     #[inline]
     fn as_raw_fd(&self) -> std::os::unix::prelude::RawFd {
-        self.inner.as_raw_fd()
+        self.inner.as_raw()
+    }
+}
+
+#[cfg(windows)]
+impl<S: Socket> AsRaw for CachedAddr<S> {
+    #[inline]
+    fn as_raw(&self) -> super::Raw {
+        self.inner.as_raw()
     }
 }
 
@@ -74,6 +85,10 @@ impl<S: Socket> Socket for CachedAddr<S> {
 
 pub use super::peek;
 
+#[cfg(windows)]
+pub use super::windows::{recv, send};
+
+#[cfg(unix)]
 #[inline]
 pub fn recv<T>(
     fd: &T,
@@ -83,14 +98,15 @@ pub fn recv<T>(
     flags: Flags,
 ) -> io::Result<usize>
 where
-    T: AsRawFd,
+    T: AsRaw,
 {
     recv_msghdr(addr, cmsg, buffer, |msghdr| {
-        libc_call(|| unsafe { libc::recvmsg(fd.as_raw_fd(), msghdr, flags) as _ })
+        libc_call(|| unsafe { libc::recvmsg(fd.as_raw(), msghdr, flags) as _ })
     })
 }
 
 /// Constructs a msghdr for receiving
+#[cfg(unix)]
 #[inline]
 fn recv_msghdr(
     addr: &mut Addr,
@@ -123,6 +139,7 @@ fn recv_msghdr(
     Ok(len)
 }
 
+#[cfg(unix)]
 #[inline]
 pub fn send<T>(
     fd: &T,
@@ -133,14 +150,15 @@ pub fn send<T>(
     flags: Flags,
 ) -> io::Result<usize>
 where
-    T: AsRawFd,
+    T: AsRaw,
 {
     send_msghdr(addr, ecn, buffer, segment_size, |msghdr| {
-        libc_call(|| unsafe { libc::sendmsg(fd.as_raw_fd(), msghdr, flags) as _ })
+        libc_call(|| unsafe { libc::sendmsg(fd.as_raw(), msghdr, flags) as _ })
     })
 }
 
 /// Constructs a msghdr for sending
+#[cfg(unix)]
 #[inline]
 fn send_msghdr(
     addr: &Addr,
@@ -191,7 +209,7 @@ fn send_msghdr(
 }
 
 #[cfg(debug_assertions)]
-fn check_send_iovec<T>(segments: &[T])
+pub(super) fn check_send_iovec<T>(segments: &[T])
 where
     T: core::ops::Deref<Target = [u8]>,
 {
