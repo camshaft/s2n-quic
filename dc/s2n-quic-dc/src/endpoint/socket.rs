@@ -101,7 +101,7 @@ impl Config {
             opts.blocking = false;
             opts.recv_buffer = Some(self.recv_buffer);
             opts.send_buffer = Some(self.send_buffer);
-            let recv_socket = opts.build_udp()?;
+            let recv_socket = build_udp(&opts)?;
             let send_socket = recv_socket.try_clone()?;
 
             recv_sockets.push(recv_socket);
@@ -121,7 +121,7 @@ impl Config {
             opts.blocking = false;
             opts.recv_buffer = Some(self.recv_buffer);
             opts.send_buffer = Some(0);
-            recv_sockets.push(opts.build_udp()?);
+            recv_sockets.push(build_udp(&opts)?);
         }
 
         for bind_addr in self
@@ -136,7 +136,7 @@ impl Config {
             opts.blocking = false;
             opts.send_buffer = Some(self.send_buffer);
             opts.recv_buffer = Some(0);
-            let socket = opts.build_udp()?;
+            let socket = build_udp(&opts)?;
             let socket = GsoSocket(socket, self.gso.clone());
             send_sockets.push(socket);
         }
@@ -179,6 +179,25 @@ impl Config {
             .collect();
         Ok((send_sockets, recv_sockets))
     }
+}
+
+/// Builds a UDP socket from `opts`. On Windows it also sets the options the Windows socket layer
+/// reads: each datagram's ECN bits, and receive coalescing up to `u16::MAX` bytes, the counterpart
+/// of the GRO that `opts.gro` turns on for Linux, whose messages reach the same size.
+fn build_udp(opts: &Options) -> io::Result<std::net::UdpSocket> {
+    let socket = opts.build_udp()?;
+
+    #[cfg(windows)]
+    {
+        let features = crate::socket::fd::windows::configure(&socket, u16::MAX as u32);
+        crate::tracing::debug!(
+            local_addr = ?socket.local_addr(),
+            ?features,
+            "windows socket options"
+        );
+    }
+
+    Ok(socket)
 }
 
 /// Wraps a socket to count ops, bytes, and errors at the I/O boundary.
@@ -265,7 +284,7 @@ impl<S: crate::socket::recv::Socket> crate::socket::recv::Socket for Metered<S> 
     }
 
     #[inline]
-    fn raw_fd(&self) -> Option<std::os::fd::RawFd> {
+    fn raw_fd(&self) -> Option<crate::socket::fd::Raw> {
         self.inner.raw_fd()
     }
 }
