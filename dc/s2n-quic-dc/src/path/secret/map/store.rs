@@ -38,6 +38,9 @@ pub trait Store: 'static + Send + Sync + time::Clock {
 
     fn drop_state(&self);
 
+    /// Removes `entry` by its id, and by its peer's address where the address still maps to it.
+    fn evict_entry(&self, entry: &Arc<Entry>);
+
     fn on_new_path_secrets(&self, entry: Arc<Entry>);
 
     fn on_handshake_complete(&self, entry: Arc<Entry>);
@@ -92,6 +95,14 @@ pub trait Store: 'static + Send + Sync + time::Clock {
         &self,
         cb: Box<dyn Fn(SocketAddr, HandshakeReason) -> Option<JoinHandle<()>> + Send + Sync>,
     );
+
+    /// Asks the handshake client registered with `register_request_handshake`, where one is, to
+    /// handshake with `peer` in the background.
+    fn request_handshake(
+        &self,
+        peer: SocketAddr,
+        reason: HandshakeReason,
+    ) -> Option<JoinHandle<()>>;
 
     fn advertised_peer_info(&self) -> Option<bytes::Bytes>;
 

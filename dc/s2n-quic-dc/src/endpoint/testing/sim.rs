@@ -170,6 +170,18 @@ impl MonitorHostAddr {
     }
 }
 
+/// Returns the tag of the dc packet that a simulated datagram carries, decoded from the start of
+/// its payload, or `None` where the payload doesn't start with a packet tag.
+///
+/// Monitor filters use it to tell secret control packets, such as replay and stale-key notices,
+/// from stream packets by the packet's own tag, rather than by its size or its port.
+pub fn packet_tag(packet: &bach::net::monitor::Packet) -> Option<crate::packet::Tag> {
+    s2n_codec::DecoderBuffer::new(packet.transport.payload())
+        .decode::<crate::packet::Tag>()
+        .ok()
+        .map(|(tag, _remaining)| tag)
+}
+
 /// Returns the shared [`Endpoint`] for the current Bach group, creating it lazily.
 ///
 /// The config is used only on the first call for a given group (or after a
@@ -232,6 +244,10 @@ pub struct SimEndpointConfig {
     /// Overall send rate cap (Gbps).
     pub overall_send_rate: Rate,
 
+    /// Pacing rate of the UPS queue, which carries the UnknownPathSecret, ReplayDetected and
+    /// StaleKey responses.
+    pub ups_rate: Rate,
+
     /// Per-poll budgets.
     pub budgets: Budgets,
 
@@ -271,6 +287,7 @@ impl Default for SimEndpointConfig {
             num_recv_dispatch_workers: 4,
             submission_shards: 4,
             overall_send_rate: Rate::new(25.0),
+            ups_rate: Rate::new(0.001),
             budgets: Budgets::default(),
             mtu: 1500,
             send_window: None,
@@ -347,6 +364,7 @@ pub fn setup_sim_endpoint(
         num_recv_dispatch_workers,
         submission_shards,
         overall_send_rate,
+        ups_rate,
         budgets,
         mtu,
         send_window,
@@ -474,7 +492,7 @@ pub fn setup_sim_endpoint(
         overall_send_rate,
         budgets,
         submission_shards,
-        ups_rate: crate::socket::rate::Rate::new(0.001),
+        ups_rate,
         ups_dedup_capacity: 1024,
         ups_dedup_window: core::time::Duration::from_secs(1),
         dead_peer_cooldown,
@@ -682,7 +700,20 @@ where
     }
 
     // Auto-insert path secrets (idempotent: re-uses existing entry if present).
-    let path_secret_entry = connect(endpoint, peer_addr);
+    let mut path_secret_entry = connect(endpoint, peer_addr);
+
+    // Mirrors `stream::Client::connect`: an entry marked dead, past the dead-peer cooldown, whose
+    // peer hasn't answered for a whole idle timeout is evicted for a fresh path pair, in place of
+    // refusing flows on it forever. The simulation has no handshake queue, so it doesn't model
+    // the hold on a recent successful handshake that `stream::Client::connect` drops.
+    if path_secret_entry.is_dead_and_silent(
+        endpoint.clock.now(),
+        endpoint.path_secret_map.entry_age(&path_secret_entry),
+        endpoint.dead_peer_cooldown,
+    ) {
+        endpoint.path_secret_map.evict_entry(&path_secret_entry);
+        path_secret_entry = connect(endpoint, peer_addr);
+    }
 
     let now = endpoint.clock.now();
     if path_secret_entry.is_dead_during_cooldown(now, endpoint.dead_peer_cooldown) {
@@ -933,6 +964,12 @@ impl Client {
     /// Returns the endpoint's send credit pool.
     pub fn send_credit_pool(&self) -> crate::sync::Arc<crate::credit::Pool> {
         self.endpoint.send_credit_pool.clone()
+    }
+
+    /// Returns the endpoint's counter registry, which holds its queues' gauges, such as the
+    /// depth of `q.ups`.
+    pub fn counters(&self) -> crate::counter::Registry {
+        self.endpoint.counters.clone()
     }
 
     /// Connect to a peer, returning a bidirectional [`Stream`].

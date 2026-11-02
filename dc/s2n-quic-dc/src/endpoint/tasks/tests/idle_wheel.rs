@@ -33,7 +33,14 @@ type SetupSend = (
     crate::counter::Registry,
 );
 
+/// The peers a test's `peer_dead_broadcast` asked a background handshake for, in order.
+type Rehandshakes = Rc<RefCell<Vec<std::net::SocketAddr>>>;
+
 fn setup_send() -> SetupSend {
+    setup_send_recording(Rehandshakes::default())
+}
+
+fn setup_send_recording(rehandshakes: Rehandshakes) -> SetupSend {
     let registry = crate::counter::Registry::default();
     let clock = Clock::default();
     let send_caches: IdMap<LocalSendSocketId, _> = vec![Rc::new(RefCell::new(send::Cache::new(
@@ -80,6 +87,7 @@ fn setup_send() -> SetupSend {
             events: registry.register("test.peer_dead.events"),
             broadcasted: registry.register("test.peer_dead.broadcasted"),
         },
+        move |peer| rehandshakes.borrow_mut().push(peer),
     );
     async move { peer_dead_broadcast_task.drain_budgeted(Some(32)).await }.spawn();
 
@@ -672,6 +680,185 @@ fn send_idle_wheel_survives_indefinitely_with_periodic_path_activity() {
                     .context_count(),
                 0,
                 "context should expire after heartbeats stop"
+            );
+        }
+        .primary()
+        .spawn();
+    });
+}
+
+/// A peer marked dead on a client path, with a packet it never acknowledged, gets one background
+/// handshake asked for, from `peer_dead_broadcast`.
+#[test]
+fn send_idle_wheel_dead_mark_requests_a_rehandshake() {
+    let _guard = crate::testing::without_snapshots();
+    sim(|| {
+        let rehandshakes = Rehandshakes::default();
+        let (send_caches, mut idle_wheel_tx, _completed_rx, clock, _registry) =
+            setup_send_recording(rehandshakes.clone());
+
+        let pse = test_entry();
+        pse.touch_activity(precision::Clock::now(&clock));
+
+        let ctx = send_caches[LocalSendSocketId::new(0)]
+            .borrow_mut()
+            .get_or_insert(&pse, &clock)
+            .unwrap();
+
+        // A sent packet that the peer never acknowledges, so the idle expiry marks the peer
+        // dead.
+        {
+            let mut ctx = ctx.borrow_mut();
+            let now = clock.get_time();
+            let rtt = ctx.rtt_estimator;
+            let cc_info = ctx.cca.on_packet_sent(now, 200, false, &rtt);
+            let mut frames = Queue::new();
+            frames.push_back(test_frame(&pse));
+            let pn = PacketNumberSpace::Initial.new_packet_number(VarInt::ZERO);
+            ctx.inflight.insert(
+                pn,
+                Packet::new(
+                    frames,
+                    TransmissionInfo {
+                        cc_info,
+                        time_sent: now,
+                        sent_bytes: 200,
+                    },
+                ),
+            );
+            let timeout = ctx.path_secret_entry.idle_timeout();
+            ctx.idle_wheel.target_time = Some(precision::Clock::now(&clock) + timeout);
+        }
+        let _ = idle_wheel_tx.send(ctx);
+
+        async move {
+            // Sleep past the idle timeout, so the wheel expires the context and marks the peer
+            // dead, and the broadcast task reads the mark.
+            (pse.idle_timeout() + 2.s()).sleep().await;
+
+            let now = precision::Clock::now(&Clock::default());
+            assert!(
+                pse.is_dead_during_cooldown(now, crate::endpoint::DEFAULT_DEAD_PEER_COOLDOWN),
+                "the peer is marked dead after its packet waited an idle timeout"
+            );
+            assert_eq!(
+                rehandshakes.borrow().as_slice(),
+                &[*pse.peer()],
+                "the dead mark asks for one background handshake with the peer"
+            );
+        }
+        .primary()
+        .spawn();
+    });
+}
+
+/// A peer marked dead on a server path, with a packet it never acknowledged, has its streams
+/// reset and doesn't get a background handshake: only a client handshakes.
+#[test]
+fn send_idle_wheel_dead_mark_on_a_server_path_doesnt_request_a_rehandshake() {
+    let _guard = crate::testing::without_snapshots();
+    sim(|| {
+        let rehandshakes = Rehandshakes::default();
+        let (send_caches, mut idle_wheel_tx, _completed_rx, clock, _registry) =
+            setup_send_recording(rehandshakes.clone());
+
+        let pse = crate::path::secret::map::Entry::builder("127.0.0.1:4433".parse().unwrap())
+            .socket_sender_count(8)
+            .endpoint_type(s2n_quic_core::endpoint::Type::Server)
+            .build(None);
+        pse.touch_activity(precision::Clock::now(&clock));
+
+        let ctx = send_caches[LocalSendSocketId::new(0)]
+            .borrow_mut()
+            .get_or_insert(&pse, &clock)
+            .unwrap();
+
+        // A sent packet that the peer never acknowledges, so the idle expiry marks the peer
+        // dead.
+        {
+            let mut ctx = ctx.borrow_mut();
+            let now = clock.get_time();
+            let rtt = ctx.rtt_estimator;
+            let cc_info = ctx.cca.on_packet_sent(now, 200, false, &rtt);
+            let mut frames = Queue::new();
+            frames.push_back(test_frame(&pse));
+            let pn = PacketNumberSpace::Initial.new_packet_number(VarInt::ZERO);
+            ctx.inflight.insert(
+                pn,
+                Packet::new(
+                    frames,
+                    TransmissionInfo {
+                        cc_info,
+                        time_sent: now,
+                        sent_bytes: 200,
+                    },
+                ),
+            );
+            let timeout = ctx.path_secret_entry.idle_timeout();
+            ctx.idle_wheel.target_time = Some(precision::Clock::now(&clock) + timeout);
+        }
+        let _ = idle_wheel_tx.send(ctx);
+
+        async move {
+            // Sleep past the idle timeout, so the wheel expires the context and marks the peer
+            // dead, and the broadcast task reads the mark.
+            (pse.idle_timeout() + 2.s()).sleep().await;
+
+            let now = precision::Clock::now(&Clock::default());
+            assert!(
+                pse.is_dead_during_cooldown(now, crate::endpoint::DEFAULT_DEAD_PEER_COOLDOWN),
+                "the peer is marked dead after its packet waited an idle timeout"
+            );
+            assert!(
+                rehandshakes.borrow().is_empty(),
+                "a dead mark on a server path doesn't ask for a handshake"
+            );
+        }
+        .primary()
+        .spawn();
+    });
+}
+
+/// A send context that expires with no unacknowledged packet doesn't mark the peer dead, so it
+/// doesn't ask for a background handshake either.
+#[test]
+fn send_idle_wheel_expiry_without_inflight_doesnt_request_a_rehandshake() {
+    let _guard = crate::testing::without_snapshots();
+    sim(|| {
+        let rehandshakes = Rehandshakes::default();
+        let (send_caches, mut idle_wheel_tx, _completed_rx, clock, _registry) =
+            setup_send_recording(rehandshakes.clone());
+
+        let pse = test_entry();
+        pse.touch_activity(precision::Clock::now(&clock));
+
+        let ctx = send_caches[LocalSendSocketId::new(0)]
+            .borrow_mut()
+            .get_or_insert(&pse, &clock)
+            .unwrap();
+        assert!(!ctx.borrow().inflight.has_inflight());
+
+        {
+            let mut c = ctx.borrow_mut();
+            let timeout = c.path_secret_entry.idle_timeout();
+            c.idle_wheel.target_time = Some(precision::Clock::now(&clock) + timeout);
+        }
+        let _ = idle_wheel_tx.send(ctx);
+
+        let send_caches = send_caches.clone();
+        async move {
+            (pse.idle_timeout() + 2.s()).sleep().await;
+
+            assert_eq!(
+                send_caches[LocalSendSocketId::new(0)]
+                    .borrow()
+                    .context_count(),
+                0,
+                "the context expires after its idle timeout"
+            );
+            assert!(
+                rehandshakes.borrow().is_empty(),
+                "an expiry with no unacknowledged packet doesn't ask for a handshake"
             );
         }
         .primary()
