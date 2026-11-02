@@ -1040,7 +1040,10 @@ mod tests {
         if uses_pages {
             assert!(made > 0, "the events didn't fill a page");
         }
-        assert_eq!(freed, made, "the dropped Channels didn't free every page it made");
+        assert_eq!(
+            freed, made,
+            "the dropped Channels didn't free every page it made"
+        );
     }
 
     #[test]
