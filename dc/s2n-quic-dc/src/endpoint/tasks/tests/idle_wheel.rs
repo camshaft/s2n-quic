@@ -152,6 +152,12 @@ fn send_idle_wheel_expires_inactive_context() {
                 frame::TransmissionStatus::Failed(frame::FailureReason::PeerDead),
                 "frame should be marked Failed(PeerDead)"
             );
+
+            // The peer isn't marked dead, so it isn't owed a reset of the frame's stream.
+            assert!(
+                pse.take_owed_resets().is_empty(),
+                "a peer that isn't marked dead isn't owed a reset"
+            );
         }
         .primary()
         .spawn();
@@ -913,6 +919,209 @@ fn send_idle_wheel_defers_death_for_recent_inflight() {
         .primary()
         .spawn();
     });
+}
+
+/// A send context that expires with an unacknowledged packet marks its peer dead and fails the
+/// packet's frames. The peer isn't told that its streams were reset on this side, so the path
+/// owes it a reset of each stream whose frames failed, once: here two frames of one stream and
+/// one of another, beside a Ping, which belongs to no stream.
+#[test]
+fn send_idle_wheel_owes_a_reset_of_each_stream_whose_frames_it_fails_as_it_marks_the_peer_dead() {
+    let _guard = crate::testing::without_snapshots();
+    sim(|| {
+        let (send_caches, mut idle_wheel_tx, mut completed_rx, clock, _registry) = setup_send();
+
+        let pse = test_entry();
+        pse.touch_activity(precision::Clock::now(&clock));
+        let idle = pse.idle_timeout();
+
+        // `test_frame` is a QueueData frame of queue pair 1 to 2 and binding 1.
+        let data_stream = crate::queue::OwedReset {
+            queue_pair: crate::packet::datagram::QueuePair {
+                source_queue_id: VarInt::from_u8(1),
+                dest_queue_id: VarInt::from_u8(2),
+            },
+            binding_id: VarInt::from_u8(1),
+        };
+        let max_data_stream = crate::queue::OwedReset {
+            queue_pair: crate::packet::datagram::QueuePair {
+                source_queue_id: VarInt::from_u8(3),
+                dest_queue_id: VarInt::from_u8(4),
+            },
+            binding_id: VarInt::from_u8(2),
+        };
+        let with_header = |header: frame::Header| {
+            let mut frame = test_frame(&pse);
+            frame.header = header;
+            frame
+        };
+
+        let ctx = send_caches[LocalSendSocketId::new(0)]
+            .borrow_mut()
+            .get_or_insert(&pse, &clock)
+            .unwrap();
+        {
+            let mut ctx = ctx.borrow_mut();
+            let now = clock.get_time();
+            let rtt = ctx.rtt_estimator;
+            let cc_info = ctx.cca.on_packet_sent(now, 200, false, &rtt);
+            let mut frames = Queue::new();
+            frames.push_back(test_frame(&pse));
+            frames.push_back(test_frame(&pse));
+            frames.push_back(with_header(frame::Header::QueueMaxData {
+                queue_pair: max_data_stream.queue_pair,
+                binding_id: max_data_stream.binding_id,
+                maximum_data: VarInt::from_u32(1024),
+            }));
+            frames.push_back(with_header(frame::Header::Ping));
+            let pn = PacketNumberSpace::Initial.new_packet_number(VarInt::ZERO);
+            ctx.inflight.insert(
+                pn,
+                Packet::new(
+                    frames,
+                    TransmissionInfo {
+                        cc_info,
+                        time_sent: now,
+                        sent_bytes: 200,
+                    },
+                ),
+            );
+            ctx.idle_wheel.target_time = Some(precision::Clock::now(&clock) + idle);
+        }
+        let _ = idle_wheel_tx.send(ctx);
+
+        let send_caches = send_caches.clone();
+        async move {
+            // 3 s past the idle deadline, a margin over the wheel's one-second tick.
+            (idle + 3.s()).sleep().await;
+            assert_eq!(
+                send_caches[LocalSendSocketId::new(0)]
+                    .borrow()
+                    .context_count(),
+                0,
+                "context should be evicted after idle timeout"
+            );
+            let now = precision::Clock::now(&Clock::default());
+            assert!(
+                pse.is_dead_during_cooldown(now, crate::endpoint::DEFAULT_DEAD_PEER_COOLDOWN),
+                "a peer that left a packet unacknowledged should be marked dead"
+            );
+
+            // Each failed frame still reaches the completions.
+            for _ in 0..4 {
+                let frame: Entry<Frame> = TestReceiverExt::recv(&mut completed_rx)
+                    .await
+                    .expect("each failed frame should arrive on completed_rx");
+                assert_eq!(
+                    frame.status,
+                    frame::TransmissionStatus::Failed(frame::FailureReason::PeerDead),
+                    "each frame should be marked Failed(PeerDead)"
+                );
+            }
+
+            // Each of the two streams is owed one reset, and the Ping none.
+            let owed = pse.take_owed_resets();
+            assert_eq!(owed.len(), 2, "one reset for each stream: {owed:?}");
+            assert!(
+                owed.contains(&data_stream) && owed.contains(&max_data_stream),
+                "{owed:?}"
+            );
+        }
+        .primary()
+        .spawn();
+    });
+}
+
+/// The stream a failed frame belongs to, as the reset the send idle wheel owes routes it: each
+/// frame of a stream names the stream's queue pair and binding, and a frame of the path or a
+/// diagnostic marker names none.
+#[test]
+fn owed_reset_of_names_the_stream_of_each_stream_frame_and_none_of_any_other_frame() {
+    let queue_pair = crate::packet::datagram::QueuePair {
+        source_queue_id: VarInt::from_u8(1),
+        dest_queue_id: VarInt::from_u8(2),
+    };
+    let binding_id = VarInt::from_u8(3);
+    let stream = crate::queue::OwedReset {
+        queue_pair,
+        binding_id,
+    };
+
+    let stream_frames = [
+        frame::Header::QueueData {
+            queue_pair,
+            binding_id,
+            offset: VarInt::ZERO,
+            largest_offset: VarInt::ZERO,
+            is_fin: false,
+            blocked: false,
+            dest_acceptor_id: None,
+            priority: crate::credit::Priority::default(),
+        },
+        frame::Header::QueueControl {
+            queue_pair,
+            binding_id,
+        },
+        frame::Header::QueueMaxData {
+            queue_pair,
+            binding_id,
+            maximum_data: VarInt::ZERO,
+        },
+        frame::Header::QueueReset {
+            queue_pair,
+            binding_id,
+            reset_target: crate::packet::datagram::ResetTarget::Both,
+            error_code: VarInt::ZERO,
+            init: None,
+        },
+        frame::Header::QueueMsg {
+            queue_pair,
+            binding_id,
+            msg_id: VarInt::ZERO,
+            stream_offset: VarInt::ZERO,
+            largest_offset: VarInt::ZERO,
+            message_size: VarInt::ZERO,
+            chunk_size: VarInt::ZERO,
+            chunk_index: VarInt::ZERO,
+            is_fin: false,
+            is_wakeup: false,
+            blocked: false,
+            dest_acceptor_id: None,
+            priority: crate::credit::Priority::default(),
+        },
+        frame::Header::QueueDataBlocked {
+            queue_pair,
+            binding_id,
+            desired_offset: VarInt::ZERO,
+        },
+    ];
+    for header in &stream_frames {
+        assert_eq!(tasks::owed_reset_of(header), Some(stream), "{header:?}");
+    }
+
+    let other_frames = [
+        frame::Header::QueueFree {
+            free_request_id: VarInt::ZERO,
+            smallest_queue_id: VarInt::ZERO,
+        },
+        frame::Header::Ack {
+            dest_sender_id: VarInt::ZERO,
+            ack_delay: VarInt::ZERO,
+            largest_acknowledged: VarInt::ZERO,
+            ack_range: VarInt::ZERO,
+            ecn_counts: Default::default(),
+            is_ack_eliciting: false,
+        },
+        frame::Header::Ping,
+        frame::Header::QueueDbg {
+            dump_id: VarInt::ZERO,
+            queue_pair,
+            binding_id,
+        },
+    ];
+    for header in &other_frames {
+        assert_eq!(tasks::owed_reset_of(header), None, "{header:?}");
+    }
 }
 
 /// Gossip heartbeats arrive on the recv path and update PathSecretEntry::last_activity.

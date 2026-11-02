@@ -89,6 +89,54 @@ fn touch_activity_clears_dead_cooldown() {
     );
 }
 
+/// A packet that clears a dead mark hands over the resets the entry owes the peer for the streams
+/// whose frames failed when it found the peer unresponsive, each stream once; a packet that
+/// doesn't clear a mark hands over none.
+#[test]
+fn touch_activity_that_clears_a_dead_mark_hands_over_the_owed_resets() {
+    let entry = test_entry_with_senders(0);
+    let cooldown = crate::endpoint::DEFAULT_DEAD_PEER_COOLDOWN;
+    let t0: crate::time::precision::Timestamp =
+        (unsafe { Timestamp::from_duration(Duration::from_secs(100)) }).into();
+    let stream = |queue_id: u8, binding_id: u8| OwedReset {
+        queue_pair: crate::packet::datagram::QueuePair {
+            source_queue_id: VarInt::from_u8(queue_id),
+            dest_queue_id: VarInt::from_u8(queue_id + 1),
+        },
+        binding_id: VarInt::from_u8(binding_id),
+    };
+    let (a, b) = (stream(1, 1), stream(3, 2));
+
+    assert!(
+        !entry.touch_activity(t0),
+        "a packet clears nothing where the entry isn't marked dead"
+    );
+
+    // As the send idle wheel does: the streams are owed before the mark.
+    entry.owe_resets([a, b]);
+    entry.owe_resets([a]);
+    assert!(
+        entry.mark_dead_if_cooldown_elapsed(t0, cooldown),
+        "first mark should take effect"
+    );
+
+    let t1 = t0 + Duration::from_secs(1);
+    assert!(
+        entry.touch_activity(t1),
+        "the first packet after the mark clears it"
+    );
+    let owed = entry.take_owed_resets();
+    assert_eq!(owed.len(), 2, "each stream is owed once: {owed:?}");
+    assert!(owed.contains(&a) && owed.contains(&b), "{owed:?}");
+
+    let t2 = t1 + Duration::from_secs(1);
+    assert!(!entry.touch_activity(t2), "a later packet clears nothing");
+    assert!(
+        entry.take_owed_resets().is_empty(),
+        "the owed resets are handed over once"
+    );
+}
+
 #[test]
 fn allocates_sender_schedule_slots() {
     let entry = test_entry_with_senders(4);

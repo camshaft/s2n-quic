@@ -115,6 +115,9 @@ pub struct ClientState {
     /// While it isn't zero, a stream on this path may wait on the peer, so the send idle
     /// wheel probes the path while it is quiet (`send_idle_wheel_drain`).
     open_slots: AtomicUsize,
+    /// The resets this side owes the peer for the streams whose frames it failed when it marked
+    /// the peer dead (`path::secret::map::Entry::owe_resets`).
+    pub(crate) owed_resets: super::OwedResets,
 }
 
 impl ClientState {
@@ -126,6 +129,7 @@ impl ClientState {
             peer_free: sync::free_list::FreeList::new(max_peer_queues),
             initial_recv_window,
             open_slots: AtomicUsize::new(0),
+            owed_resets: Default::default(),
         }
     }
 
