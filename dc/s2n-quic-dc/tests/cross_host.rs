@@ -65,7 +65,7 @@ use std::{
     io::{self, BufRead, BufReader, Write},
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     path::Path,
-    process::{Command, Stdio},
+    process::{Child, Command, Stdio},
     rc::Rc,
     sync::Arc,
     time::{Duration, Instant},
@@ -77,8 +77,6 @@ const ECHO_ACCEPTOR: VarInt = VarInt::from_u8(1);
 const END_ACCEPTOR: VarInt = VarInt::from_u8(2);
 /// The server name of the handshake's test certificate.
 const SERVER_NAME: &str = "localhost";
-/// The start of the line in which the server end states its handshake address on stdout.
-const LISTENING: &str = "cross-host server listening on";
 
 /// The schedule `loopback` runs both ends under: the window from 1 s to 1.5 s passes without a
 /// fault, since the loopback interface doesn't lose packets or take its link down.
@@ -128,12 +126,14 @@ fn loopback() {
     let server_results = dir.join("server.jsonl");
     let client_results = dir.join("client.jsonl");
 
-    let mut server = end_command("server", &server_results)
-        .env("DC_CROSS_HOST_LISTEN", "127.0.0.1:0")
-        .stdout(Stdio::piped())
-        .spawn()
-        .expect("start the server end");
-    let mut output = BufReader::new(server.stdout.take().expect("the server end's stdout"));
+    let mut server = ServerEnd(
+        end_command("server", &server_results)
+            .env("DC_CROSS_HOST_LISTEN", "127.0.0.1:0")
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("start the server end"),
+    );
+    let mut output = BufReader::new(server.0.stdout.take().expect("the server end's stdout"));
     let peer = listening_addr(&mut output);
     // Copy the rest of the server's output to stderr, so that the server doesn't wait on a full
     // pipe.
@@ -144,12 +144,8 @@ fn loopback() {
         .envs(LOOPBACK_CLIENT)
         .status()
         .expect("run the client end");
-    if !client.success() {
-        let _ = server.kill();
-        let _ = server.wait();
-        panic!("the client end failed: {client}");
-    }
-    let server_status = server.wait().expect("wait for the server end");
+    assert!(client.success(), "the client end failed: {client}");
+    let server_status = server.0.wait().expect("wait for the server end");
     assert!(
         server_status.success(),
         "the server end failed: {server_status}"
@@ -212,16 +208,78 @@ fn end_command(role: &str, results: &Path) -> Command {
     command
 }
 
-/// Reads the server end's output up to the line that states its handshake address.
+/// The server end's child process. Dropping it kills and reaps the server, so that a test that
+/// fails after it starts the server, such as in the wait for its `listening` line, doesn't leave
+/// the server running.
+struct ServerEnd(Child);
+
+impl Drop for ServerEnd {
+    fn drop(&mut self) {
+        // Where the test has reaped the server already, `kill` doesn't signal any process and
+        // `wait` returns the status it reaped.
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// Dropping a `ServerEnd` kills the server end, which otherwise runs until a client ends its run:
+/// the server's stdout reaches its end only once the server has exited.
+#[test]
+fn dropping_the_server_end_kills_it() {
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("dc-cross-host-drop-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("the results directory");
+    let mut server = ServerEnd(
+        end_command("server", &dir.join("server.jsonl"))
+            .env("DC_CROSS_HOST_LISTEN", "127.0.0.1:0")
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("start the server end"),
+    );
+    let mut output = BufReader::new(server.0.stdout.take().expect("the server end's stdout"));
+    listening_addr(&mut output);
+    drop(server);
+    io::copy(&mut output, &mut io::sink()).expect("the server end's output");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Reads the server end's output up to its `listening` line, and returns the handshake address
+/// that line states. Where the test harness runs one test at a time, it writes
+/// `test cross_host_end ... ` before the test's output on the same line, so the server writes its
+/// JSON line after a line break, and this skips each line that isn't the server's JSON object.
 fn listening_addr(output: &mut impl BufRead) -> SocketAddr {
     let mut line = String::new();
     loop {
         line.clear();
         let len = output.read_line(&mut line).expect("the server end's output");
         assert!(len > 0, "the server end exited before it listened");
-        if let Some(addr) = line.trim().strip_prefix(LISTENING) {
-            return addr.trim().parse().expect("handshake address");
+        let value: Value = match serde_json::from_str(line.trim()) {
+            Ok(value) => value,
+            // A line of the test harness's output.
+            Err(_) => continue,
+        };
+        if value["event"] == "listening" {
+            let addr = value["handshake_addr"].as_str().expect("handshake address");
+            return addr.parse().expect("handshake address");
         }
+    }
+}
+
+/// `listening_addr` finds the server's `listening` line after the test harness's output, both where
+/// the harness runs tests in parallel and where it runs one test at a time, which leaves
+/// `test cross_host_end ... ` at the start of the line that the server's output follows.
+#[test]
+fn listening_addr_after_the_harness_output() {
+    let listening = json!({
+        "event": "listening",
+        "handshake_addr": "127.0.0.1:4433",
+        "data_addrs": ["127.0.0.1:4434"],
+    });
+    let expected: SocketAddr = "127.0.0.1:4433".parse().unwrap();
+    for harness in ["\nrunning 1 test\n", "\nrunning 1 test\ntest cross_host_end ... "] {
+        // The server end prints its line as `run_server` does.
+        let output = format!("{harness}\n{listening}\n");
+        assert_eq!(listening_addr(&mut output.as_bytes()), expected, "{output:?}");
     }
 }
 
@@ -270,13 +328,16 @@ async fn run_server(schedule: Schedule) {
         .register_acceptor(END_ACCEPTOR, acceptor::channel::Config::default())
         .expect("the end acceptor");
 
-    results.borrow_mut().write(json!({
+    let listening = json!({
         "event": "listening",
         "handshake_addr": handshake_addr.to_string(),
         "data_addrs": data_addrs,
-    }));
-    // `loopback` reads the handshake address from this line, since its server listens on port 0.
-    println!("{LISTENING} {handshake_addr}");
+    });
+    results.borrow_mut().write(listening.clone());
+    // `loopback` reads the handshake address from this line on stdout, since its server listens on
+    // port 0. The line break before it ends any line the test harness started, so that the JSON
+    // object is a line of its own.
+    println!("\n{listening}");
 
     let started = Instant::now();
     let mut echoes = tokio::task::JoinSet::new();
