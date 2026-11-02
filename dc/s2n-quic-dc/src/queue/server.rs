@@ -164,6 +164,9 @@ impl ServerView {
                 release_bytes,
             }),
             BindState::NewBinding(waker) => {
+                // A packet that passed the receive cache's check of the revoked flag can bind its
+                // slot after `revoke` reset the entry's slots (see `Entry::reset_if_revoked`).
+                path_entry.reset_if_revoked(slot);
                 let slot_ptr = slot.as_ptr();
                 let on_free = OnFree::Server {
                     path_entry: path_entry.clone(),
@@ -242,6 +245,9 @@ impl ServerView {
         // Slot is unallocated — bind it (tombstone re-checked under the lock).
         match slot.allocate_and_open(binding_id, self.state.initial_recv_window) {
             Ok(super::slot::AllocateOutcome::Allocated) => {
+                // As in `bind_and_send_stream`, the packet can bind after `revoke` reset the
+                // entry's slots.
+                path_entry.reset_if_revoked(slot);
                 let slot_ptr = slot.as_ptr();
                 let on_free = OnFree::Server {
                     path_entry: path_entry.clone(),
@@ -644,5 +650,53 @@ mod tests {
         let result =
             server.bind_and_send_stream(v(0), v(2), make_stream_entry(), &path_entry, &mut tx);
         assert!(matches!(result, Ok(BindResult::NewBinding { .. })));
+    }
+
+    /// The receivers of a new binding, where `result` holds one.
+    fn new_binding<E>(result: Result<BindResult, E>) -> (StreamReceiver, ControlReceiver) {
+        let Ok(BindResult::NewBinding {
+            stream, control, ..
+        }) = result
+        else {
+            panic!("expected NewBinding");
+        };
+        (stream, control)
+    }
+
+    /// `Entry::revoke` resets each slot bound before it, and a packet that passed the receive
+    /// cache's check of the revoked flag before `revoke` set it can bind a slot after `revoke`
+    /// visited it: that binding starts reset too, through either bind.
+    #[test]
+    fn bindings_made_before_and_after_revoke_are_reset() {
+        let (mut server, path_entry, mut tx, _rx) = test_server(10);
+        let code = crate::endpoint::error::PEER_KEY_REMOVED;
+
+        // Before the revoke, a data init's binding holds only its frame, and a msg init's holds
+        // nothing.
+        let result =
+            server.bind_and_send_stream(v(0), v(1), make_stream_entry(), &path_entry, &mut tx);
+        let (data_stream, data_control) = new_binding(result);
+        let frame = data_stream.try_recv().unwrap().expect("the init's frame");
+        assert!(matches!(&*frame, msg::Stream::Data { .. }));
+        assert_empty(&data_stream, &data_control);
+        let result = server.bind_for_msg(v(1), v(1), &path_entry, &mut tx);
+        let (msg_stream, msg_control) = new_binding(result);
+        assert_empty(&msg_stream, &msg_control);
+
+        path_entry.revoke();
+        assert_next_is_reset(&data_stream, &data_control, code);
+        assert_next_is_reset(&msg_stream, &msg_control, code);
+
+        // Packets that passed the receive cache's check before the revoke bind two more slots
+        // after it: each binding starts reset, after the data init's frame.
+        let result =
+            server.bind_and_send_stream(v(2), v(1), make_stream_entry(), &path_entry, &mut tx);
+        let (late_data_stream, late_data_control) = new_binding(result);
+        let frame = late_data_stream.try_recv().unwrap().expect("the init's frame");
+        assert!(matches!(&*frame, msg::Stream::Data { .. }));
+        assert_next_is_reset(&late_data_stream, &late_data_control, code);
+        let result = server.bind_for_msg(v(3), v(1), &path_entry, &mut tx);
+        let (late_msg_stream, late_msg_control) = new_binding(result);
+        assert_next_is_reset(&late_msg_stream, &late_msg_control, code);
     }
 }

@@ -70,7 +70,7 @@ impl StreamReceiver {
     }
 
     #[inline]
-    fn slot(&self) -> &Slot {
+    pub(crate) fn slot(&self) -> &Slot {
         // SAFETY: pinned allocation kept alive by the OnFree lifetime guard.
         unsafe { self.slot.as_ref() }
     }

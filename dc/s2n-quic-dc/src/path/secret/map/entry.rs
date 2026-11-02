@@ -636,6 +636,26 @@ impl Entry {
         self.revoked.load(Ordering::Acquire)
     }
 
+    /// Resets `slot`, which a stream just bound on this path secret, where the map revoked the
+    /// path secret, as [`Entry::revoke`] resets each slot it finds bound.
+    ///
+    /// `revoke` sets the revoked flag, then resets each bound slot under the slot's locks. A
+    /// packet that passed the receive path's check of the flag before `revoke` set it, or a
+    /// stream the application opened on the entry before the map evicted it, can bind a slot
+    /// after `revoke` visited it. Call this once the bind has taken the slot's locks. Where
+    /// `revoke` visited the slot after the bind, it found the binding and reset it, and where this
+    /// call reads the flag too, the slot holds two resets with the same code. Where `revoke`
+    /// visited the slot before the bind, or read the page table before the slot's page was added,
+    /// the bind took a lock after `revoke` released it, so this call reads the flag `revoke` set.
+    /// Either way the binding starts reset, as one made just before `revoke` does.
+    pub(crate) fn reset_if_revoked(&self, slot: &crate::queue::slot::Slot) {
+        if self.is_revoked() {
+            // The receivers of a binding made just now aren't handed out yet, so no reader or
+            // writer waits on the wake tokens.
+            let _ = slot.broadcast_reset(crate::endpoint::error::PEER_KEY_REMOVED);
+        }
+    }
+
     #[cfg(test)]
     pub fn reset_sender_counter(&self) {
         self.sender.reset_counter();
