@@ -689,10 +689,7 @@ fn decode_value(data: &[u8]) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{
-        net::{SocketAddr, UdpSocket},
-        time::Duration,
-    };
+    use std::net::{SocketAddr, UdpSocket};
 
     fn pair(addr: &str) -> (UdpSocket, UdpSocket) {
         let a = UdpSocket::bind(addr).unwrap();
@@ -963,9 +960,8 @@ mod tests {
     fn a_message_of_two_segments_arrives_as_two_datagrams() {
         for segment_size in [None, Some(600)] {
             let (a, b) = pair("127.0.0.1:0");
-            // `b` isn't configured: without receive coalescing, each datagram arrives on its own.
-            b.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-
+            // Only `a` is configured: without receive coalescing on `b`, each datagram arrives
+            // on its own.
             let features = configure(&a, u16::MAX as u32);
             let plan = send_plan(1200, 600, SEND_SEGMENTATION.load(Ordering::Relaxed));
             if features.send_segmentation.is_enabled() {
@@ -1003,7 +999,6 @@ mod tests {
     /// with the Windows default.
     #[test]
     fn a_port_unreachable_doesnt_fail_the_next_receive() {
-        let timeout = Some(Duration::from_secs(5));
         let not_ect = ExplicitCongestionNotification::NotEct;
         let payload = [3u8; 32];
         let iov = [IoSlice::new(&payload)];
@@ -1015,7 +1010,6 @@ mod tests {
         };
 
         let a = UdpSocket::bind("127.0.0.1:0").unwrap();
-        a.set_read_timeout(timeout).unwrap();
         let features = configure(&a, u16::MAX as u32);
         assert_eq!(features.ignore_connreset, Support::Enabled);
         send(&a, &closed, not_ect, &iov, None, 0).unwrap();
@@ -1024,7 +1018,6 @@ mod tests {
         // port fails the next receive. That socket sends after `a`, so by the time its receive
         // fails, the port unreachable for `a`'s earlier send has arrived too.
         let unconfigured = UdpSocket::bind("127.0.0.1:0").unwrap();
-        unconfigured.set_read_timeout(timeout).unwrap();
         send(&unconfigured, &closed, not_ect, &iov, None, 0).unwrap();
         let error = try_recv(&unconfigured, 1500).unwrap_err();
         assert_eq!(error.raw_os_error(), Some(WinSock::WSAECONNRESET as i32));
