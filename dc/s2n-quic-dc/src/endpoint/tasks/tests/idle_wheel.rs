@@ -499,6 +499,120 @@ fn send_idle_wheel_marks_dead_a_peer_that_doesnt_answer_the_probe_of_an_open_str
     });
 }
 
+/// The same quiet path with an open stream, whose probe's Ping is still unacknowledged at the
+/// idle timeout. The assembler puts a packet that carries Pings alone into the empty inflight map
+/// without restarting the idle clock, so the idle timeout of the probed quiet period decides, with
+/// `probed` and the unacknowledged Ping together: the dead mark counts as an unanswered probe, not
+/// as a dead mark on unacknowledged packets alone.
+#[test]
+fn send_idle_wheel_counts_an_unanswered_probe_whose_ping_is_still_unacknowledged() {
+    let _guard = crate::testing::without_snapshots();
+    sim(|| {
+        let (send_caches, mut idle_wheel_tx, _completed_rx, clock, registry) = setup_send();
+
+        let pse = test_entry();
+        pse.touch_activity(precision::Clock::now(&clock));
+        let stream = open_stream(&pse);
+
+        let ctx = send_caches[LocalSendSocketId::new(0)]
+            .borrow_mut()
+            .get_or_insert(&pse, &clock)
+            .unwrap();
+        assert!(!ctx.borrow().inflight.has_inflight());
+
+        let idle = pse.idle_timeout();
+        {
+            let mut c = ctx.borrow_mut();
+            c.idle_wheel.target_time = Some(precision::Clock::now(&clock) + idle / 2);
+        }
+        let _ = idle_wheel_tx.send(ctx.clone());
+
+        let send_caches = send_caches.clone();
+        let pse = pse.clone();
+        async move {
+            // Half an idle timeout in, the quiet path is probed.
+            (idle / 2 + 3.s()).sleep().await;
+            {
+                let ctx = ctx.borrow();
+                let last_activity = ctx.last_peer_activity.max(pse.last_activity());
+                assert_eq!(
+                    ctx.idle_probe_for,
+                    Some(last_activity.nanos),
+                    "the idle wheel should record its probe of the quiet period"
+                );
+            }
+
+            // The Ping goes out and isn't acknowledged: its packet, which carries the Ping alone,
+            // goes into the empty inflight map, and `last_peer_activity` stays as it was.
+            {
+                let mut ctx = ctx.borrow_mut();
+                let now = clock.get_time();
+                let rtt = ctx.rtt_estimator;
+                let cc_info = ctx.cca.on_packet_sent(now, 200, false, &rtt);
+                let mut frames = Queue::new();
+                frames.push_back(Entry::new(Frame {
+                    header: frame::Header::Ping,
+                    payload: crate::byte_vec::ByteVec::new(),
+                    path_secret_entry: pse.clone(),
+                    completion: None,
+                    status: frame::TransmissionStatus::default(),
+                    ttl: frame::DEFAULT_TTL,
+                    enqueued_at: None,
+                    flow_credits: 0,
+                }));
+                let pn = PacketNumberSpace::Initial.new_packet_number(VarInt::ZERO);
+                ctx.inflight.insert(
+                    pn,
+                    Packet::new(
+                        frames,
+                        TransmissionInfo {
+                            cc_info,
+                            time_sent: now,
+                            sent_bytes: 200,
+                        },
+                    ),
+                );
+                assert!(ctx.inflight.has_inflight());
+            }
+            assert_eq!(
+                send_caches[LocalSendSocketId::new(0)]
+                    .borrow()
+                    .context_count(),
+                1,
+                "the context should wait for the probe's answer"
+            );
+
+            // At the idle timeout, the unanswered probe marks the peer dead.
+            (idle / 2).sleep().await;
+            assert_eq!(
+                send_caches[LocalSendSocketId::new(0)]
+                    .borrow()
+                    .context_count(),
+                0,
+                "context should be evicted after idle timeout"
+            );
+            let now = precision::Clock::now(&Clock::default());
+            assert!(
+                pse.is_dead_during_cooldown(now, crate::endpoint::DEFAULT_DEAD_PEER_COOLDOWN),
+                "a peer that doesn't answer the probe of an open stream should be marked dead"
+            );
+            assert_eq!(
+                take_probe_counts(&registry),
+                ProbeCounts {
+                    sent: 1,
+                    refused: 0,
+                    dead_probe_unanswered: 1,
+                    dead_open_stream: 0,
+                },
+                "the dead mark counts as an unanswered probe while the Ping is unacknowledged"
+            );
+            drop(stream);
+        }
+        .primary()
+        .spawn();
+    });
+}
+
 /// The same quiet path with an open stream, whose idle check first runs more than a wheel tick
 /// after its idle deadline, as after this side was suspended: the peer marks this side dead
 /// under the same rule by then, so the idle wheel marks the peer dead at once, instead of probing
