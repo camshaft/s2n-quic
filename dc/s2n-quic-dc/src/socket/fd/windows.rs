@@ -320,8 +320,10 @@ fn send_plan(total: usize, segment_size: u16, segmentation: bool) -> SendPlan {
 }
 
 /// Sends `buffer` as datagrams of `segment_size` bytes each, one `WSASendMsg` call a datagram,
-/// the last datagram holding what is left. Where a datagram after the first fails to send, it
-/// returns the bytes the datagrams before it sent, and the rest of the message is lost.
+/// the last datagram holding what is left. It returns the first datagram's error where that
+/// datagram fails, and the message's whole length otherwise, since a caller reads a send as all
+/// or nothing, as one segmented `sendmsg` call is on Unix. Where a datagram after the first fails
+/// to send, that datagram and the rest of the message are lost, as UDP loses a datagram.
 fn send_segments(
     socket: WinSock::SOCKET,
     addr: &Addr,
@@ -331,6 +333,7 @@ fn send_segments(
     flags: Flags,
 ) -> io::Result<usize> {
     let segment_size = segment_size as usize;
+    let total: usize = buffer.iter().map(|slice| slice.len()).sum();
     let mut segment = Vec::with_capacity(buffer.len());
     let mut sent = 0;
     let mut slice = 0;
@@ -360,7 +363,7 @@ fn send_segments(
         match send_one(socket, addr, ecn, &segment, 0, flags) {
             Ok(len) => sent += len,
             Err(err) if sent == 0 => return Err(err),
-            Err(_) => break,
+            Err(_) => return Ok(total),
         }
     }
 
