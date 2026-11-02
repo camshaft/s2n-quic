@@ -52,6 +52,12 @@ pub trait Store: 'static + Send + Sync + time::Clock {
 
     fn get_by_id_tracked(&self, id: &Id) -> Option<Arc<Entry>>;
 
+    /// The entry the map revoked under `id` (see `Entry::revoke`), where a stream or a frame
+    /// still holds it: the map doesn't hold such an entry by its ID any longer.
+    fn revoked_by_id(&self, _id: &Id) -> Option<Arc<Entry>> {
+        None
+    }
+
     fn handle_unexpected_packet(&self, packet: &Packet, peer: &SocketAddr);
 
     fn sign_queue_reset_packet(
@@ -140,6 +146,12 @@ pub trait Store: 'static + Send + Sync + time::Clock {
         control: ControlResponse<'_>,
     ) -> Option<Arc<Entry>> {
         let Some(state) = self.get_by_id_tracked(&identity.id) else {
+            // A packet on a path secret this map revoked is refused as one on a path secret it
+            // doesn't hold, and counted on the entry as an answer of the peer, which stops the
+            // endpoint's resets there.
+            if let Some(entry) = self.revoked_by_id(&identity.id) {
+                entry.on_revoked_refusal();
+            }
             let packet = control::UnknownPathSecret {
                 wire_version: WireVersion::ZERO,
                 credential_id: identity.id,

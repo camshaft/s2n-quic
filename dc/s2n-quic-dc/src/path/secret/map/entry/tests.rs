@@ -49,8 +49,9 @@ fn entry_size() {
             // Includes per-entry sender scheduling storage metadata (Box<[AtomicU64]>), the
             // default one-element peer_data_addrs list (one std SocketAddr, 32 bytes), the
             // peer's key, which the default entry doesn't hold (an empty Option<PeerKey>, 16
-            // bytes), and whether the path secret was revoked (an AtomicBool, 1 byte).
-            354
+            // bytes), whether the path secret was revoked (an AtomicBool, 1 byte), and how many
+            // answers of the peer were counted since (an AtomicU32, 4 bytes).
+            358
         );
     }
 }

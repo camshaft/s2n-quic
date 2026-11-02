@@ -756,6 +756,11 @@ where
     if sent_inflight_packet {
         // Update PTO only when an inflight packet was created.
         context.pto.on_packet_sent(now);
+        // A probe on a revoked path secret compares the entry's count of the peer's answers with
+        // this one to tell whether the peer answered after this transmission.
+        if context.path_secret_entry.is_revoked() {
+            context.revoked_refusals_seen = context.path_secret_entry.revoked_refusals();
+        }
     }
 
     // Publish updated load score: both pending queue and CCA state may have changed.
@@ -962,12 +967,23 @@ fn assemble_probe(
     cancelled: &mut impl UnboundedSender<intrusive::Entry<Frame>>,
     counters: &AssemblerCounters,
 ) -> ProbeResult {
+    // The endpoint refuses the peer's acknowledgements on a revoked path secret (see
+    // `Entry::revoke`), so it never sees a reset there acknowledged. Once the peer answered after
+    // this context's last transmission, either the map answered the peer's packet as one on a
+    // path secret this endpoint doesn't hold, which ends each of the peer's streams on the path
+    // secret, or the peer evicted the path secret: drop the resets instead of sending them again
+    // until the peer is declared dead.
+    let stop_resets = context.path_secret_entry.is_revoked()
+        && context.path_secret_entry.revoked_refusals() != context.revoked_refusals_seen;
+
     while let Some((old_pn, mut probe_frames)) = context.inflight.take_oldest_for_probe() {
         let mut probe_metadata = *metadata;
         let mut has_frame = false;
 
         while let Some(frame) = probe_frames.pop_front() {
-            if !frame.should_transmit() {
+            if !frame.should_transmit()
+                || (stop_resets && matches!(frame.header, frame::Header::QueueReset { .. }))
+            {
                 let _ = cancelled.send(frame);
                 continue;
             }

@@ -20,7 +20,7 @@ use s2n_quic_core::{
     varint::VarInt,
 };
 use std::{
-    collections::{HashSet, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     hash::BuildHasher,
     mem::ManuallyDrop,
     net::SocketAddr,
@@ -523,6 +523,12 @@ where
     // The keys of the peers this map accepts, as `set_peer_keys` sets them. `None`, as built,
     // accepts each peer the TLS provider accepts.
     peer_keys: parking_lot::RwLock<Option<HashSet<PeerKey>>>,
+
+    // Each entry the map revoked (see `Entry::revoke`), by its ID, while a stream or a frame still
+    // holds it: the map no longer holds it in `ids`. It lets the map count the peer's answers on
+    // the path secret, which stop the endpoint's resets there (see `Entry::on_revoked_refusal`).
+    // `evict_where` drops the entries no one holds any longer.
+    revoked: parking_lot::RwLock<HashMap<Id, Weak<Entry>>>,
 }
 
 // FIXME: Avoid the whole socket.
@@ -632,6 +638,7 @@ where
             advertised_data_addrs,
             mk_application_data: RwLock::new(None),
             peer_keys: Default::default(),
+            revoked: Default::default(),
         };
 
         // Growing to double our maximum inserted entries should ensure that we never grow again, see:
@@ -723,14 +730,26 @@ where
                     .cloned(),
             );
         }
+        let mut revoked = Vec::new();
         for entry in evicted {
             // `evicted` holds an entry once for each table that holds it, and only the first
             // revoke of an entry tells its peer.
             if entry.revoke() {
                 self.send_revoked(&entry);
+                revoked.push((*entry.id(), Arc::downgrade(&entry)));
             }
             self.evict(&entry);
         }
+        self.keep_revoked(revoked);
+    }
+
+    /// Keeps each entry of `revoked`, which this map revoked, by its ID while a stream or a frame
+    /// still holds it (see [`Store::revoked_by_id`]), and drops each kept entry that none holds
+    /// any longer.
+    fn keep_revoked(&self, revoked: Vec<(Id, Weak<Entry>)>) {
+        let mut kept = self.revoked.write();
+        kept.retain(|_, entry| entry.strong_count() > 0);
+        kept.extend(revoked);
     }
 
     /// Sends the peer of a revoked entry an unknown path secret packet, as the map sends one in
@@ -1057,6 +1076,10 @@ where
         self.ids.get(*id)
     }
 
+    fn revoked_by_id(&self, id: &Id) -> Option<Arc<Entry>> {
+        self.revoked.read().get(id)?.upgrade()
+    }
+
     fn get_by_id_tracked(&self, id: &Id) -> Option<Arc<Entry>> {
         let result = self.ids.get(*id);
 
@@ -1185,6 +1208,23 @@ where
 
         // don't track access patterns here since it's not initiated by the local application
         let Some(entry) = self.get_by_id_untracked(&local_id) else {
+            // A path secret this map revoked (see `Entry::revoke`): a peer that evicted it
+            // answers this endpoint's resets on it as packets on a path secret it doesn't hold.
+            // The answer stops those resets, and the invalidation it starts drains the frames sent
+            // on the path secret.
+            if let Some(entry) = self.revoked_by_id(&local_id) {
+                if let Some(packet) = packet.authenticate(&entry.sender().stateless_reset) {
+                    entry.on_revoked_refusal();
+                    self.subscriber().on_unknown_path_secret_packet_accepted(
+                        event::builder::UnknownPathSecretPacketAccepted {
+                            credential_id: packet.credential_id.into_event(),
+                            peer_address,
+                        },
+                    );
+                    return Some(packet);
+                }
+            }
+
             self.subscriber().on_unknown_path_secret_packet_dropped(
                 event::builder::UnknownPathSecretPacketDropped {
                     credential_id: packet.credential_id().into_event(),
