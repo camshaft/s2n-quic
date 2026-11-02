@@ -110,14 +110,27 @@ fn stale_key_sent(sub: &Subscriber, secs: u64, address: &inet::SocketAddress, id
     sub.on_stale_key_packet_sent(&meta, &event);
 }
 
-fn replayed(sub: &Subscriber, secs: u64, id: &[u8]) {
+fn replayed(sub: &Subscriber, secs: u64, address: &inet::SocketAddress, id: &[u8]) {
     let meta = at(secs);
     let event = builder::ReplayDefinitelyDetected {
+        peer_address: address.into_event(),
         credential_id: id,
         key_id: 7,
     };
     let event: api::ReplayDefinitelyDetected = event.into_event();
     sub.on_replay_definitely_detected(&meta, &event);
+}
+
+fn potentially_replayed(sub: &Subscriber, secs: u64, address: &inet::SocketAddress, id: &[u8]) {
+    let meta = at(secs);
+    let event = builder::ReplayPotentiallyDetected {
+        peer_address: address.into_event(),
+        credential_id: id,
+        key_id: 7,
+        gap: 3,
+    };
+    let event: api::ReplayPotentiallyDetected = event.into_event();
+    sub.on_replay_potentially_detected(&meta, &event);
 }
 
 #[test]
@@ -178,24 +191,47 @@ fn each_kind_of_event_for_a_peer_is_throttled_on_its_own() {
 }
 
 #[test]
-fn a_replay_is_throttled_for_its_credential_id() {
+fn a_replay_is_throttled_for_its_peer() {
     let sub = Subscriber::new(INTERVAL);
     let lines = Capture::run(|| {
-        replayed(&sub, 0, &[1; 16]);
-        replayed(&sub, 0, &[2; 16]);
-        replayed(&sub, 1, &[1; 16]);
+        replayed(&sub, 0, &address(1), &[1; 16]);
+        replayed(&sub, 0, &address(2), &[2; 16]);
+        // A replay of another credential id of the first peer is held back with that peer's.
+        replayed(&sub, 1, &address(1), &[3; 16]);
     });
 
     assert_eq!(lines.len(), 2, "{lines:?}");
-    for (line, id) in lines.iter().zip(["01", "02"]) {
+    let expected = [("127.0.0.1:1", "01"), ("127.0.0.1:2", "02")];
+    for (line, (peer, id)) in lines.iter().zip(expected) {
         assert_eq!(
             line.field("kind"),
             "path_secret_map:replay_definitely_detected"
         );
-        assert_eq!(line.field("peer"), "unknown");
+        assert_eq!(line.field("peer"), peer);
         assert_eq!(line.field("credential_id"), id.repeat(16));
         assert_eq!(line.field("message"), "key_id=7");
     }
+}
+
+#[test]
+fn a_potential_replay_logs_its_peer() {
+    let sub = Subscriber::new(INTERVAL);
+    let peer = address(4433);
+    let lines = Capture::run(|| {
+        potentially_replayed(&sub, 0, &peer, &[1; 16]);
+        potentially_replayed(&sub, 1, &peer, &[1; 16]);
+    });
+
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    let line = &lines[0];
+    assert_eq!(line.level, ::tracing::Level::WARN);
+    assert_eq!(
+        line.field("kind"),
+        "path_secret_map:replay_potentially_detected"
+    );
+    assert_eq!(line.field("peer"), "127.0.0.1:4433");
+    assert_eq!(line.field("credential_id"), "01".repeat(16));
+    assert_eq!(line.field("message"), "key_id=7 gap=3");
 }
 
 #[test]
@@ -223,14 +259,14 @@ fn check(
 }
 
 fn peer_subject(port: u16) -> Subject {
-    Subject::Peer(SocketAddr::from(([127, 0, 0, 1], port)))
+    Subject(SocketAddr::from(([127, 0, 0, 1], port)))
 }
 
 #[test]
 fn an_entry_past_its_interval_is_dropped_with_its_held_back_count() {
     let throttle = Throttle::new(INTERVAL);
     let mut dropped = vec![];
-    let held = Subject::credential(&[1; 16]);
+    let held = peer_subject(0);
     assert_eq!(check(&throttle, held, 0, &mut dropped), Some(0));
     assert_eq!(check(&throttle, held, 1, &mut dropped), None);
 
@@ -243,7 +279,7 @@ fn an_entry_past_its_interval_is_dropped_with_its_held_back_count() {
 
     // Each entry's interval has passed by now, so the next event drops them all, and returns the
     // count the first one held back.
-    let next = Subject::credential(&[2; 16]);
+    let next = peer_subject(MIN_PRUNE_LEN as u16);
     assert_eq!(check(&throttle, next, 60, &mut dropped), Some(0));
     let expected = Dropped {
         subject: held,
@@ -272,29 +308,29 @@ fn log(throttle: &Throttle, subject: Subject, secs: u64) {
 #[test]
 fn a_dropped_entry_logs_its_held_back_count() {
     let throttle = Throttle::new(INTERVAL);
-    let held = Subject::credential(&[1; 16]);
+    let held = peer_subject(0);
     let lines = Capture::run(|| {
         log(&throttle, held, 0);
         log(&throttle, held, 1);
         for port in 1..MIN_PRUNE_LEN as u16 {
             log(&throttle, peer_subject(port), 0);
         }
-        log(&throttle, Subject::credential(&[2; 16]), 60);
+        log(&throttle, peer_subject(MIN_PRUNE_LEN as u16), 60);
     });
 
     // The first event of each entry, then the dropped entry's count, then the last event.
     assert_eq!(lines.len(), MIN_PRUNE_LEN + 2);
     let dropped = &lines[MIN_PRUNE_LEN];
     assert_eq!(dropped.level, ::tracing::Level::WARN);
-    assert_eq!(dropped.field("peer"), "unknown");
-    assert_eq!(dropped.field("credential_id"), "01".repeat(16));
+    assert_eq!(dropped.field("peer"), "127.0.0.1:0");
+    assert_eq!(dropped.field("credential_id"), "-");
     assert_eq!(dropped.field("held_back"), "1");
     assert_eq!(
         dropped.field("message"),
         "no later event of this kind for this peer"
     );
     let last = &lines[MIN_PRUNE_LEN + 1];
-    assert_eq!(last.field("credential_id"), "02".repeat(16));
+    assert_eq!(last.field("peer"), format!("127.0.0.1:{MIN_PRUNE_LEN}"));
     assert_eq!(last.field("held_back"), "0");
 }
 
