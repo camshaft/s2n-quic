@@ -502,6 +502,20 @@ impl Cache {
         };
 
         match self.senders.entry(key) {
+            // The map revoked this path secret because the peer's key was removed (see
+            // `Entry::revoke`), so its cached opener mustn't open another packet: drop the context
+            // and answer the packet as the map answers one on an unknown path secret.
+            hash_map::Entry::Occupied(entry) if entry.get().borrow().path_entry.is_revoked() => {
+                entry.remove();
+                let _ = path_secret_map.opener_for_credentials(
+                    credentials,
+                    Some(remote_sender_id.as_varint()),
+                    crate::path::secret::map::store::ControlResponse::ReturnBuffer {
+                        out: control_out,
+                    },
+                );
+                Err(CacheError::PathSecretNotFound)
+            }
             hash_map::Entry::Occupied(mut entry) => {
                 let ctx = entry.get().clone();
                 let cached_key_id = ctx.borrow().current_key_id;

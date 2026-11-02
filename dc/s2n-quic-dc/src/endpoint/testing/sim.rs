@@ -30,7 +30,7 @@ use crate::{
     acceptor,
     acceptor::channel as accept_channel,
     path::secret::{
-        map::{entry::QueueState, TestPairIds},
+        map::{entry::QueueState, PeerKey, TestPairIds},
         Map as PathSecretMap,
     },
     socket::{pool::Pool, rate::Rate},
@@ -615,6 +615,24 @@ pub fn insert_fake_path_pair(
     peer_map: &PathSecretMap,
     peer_addr: SocketAddr,
 ) -> TestPairIds {
+    insert_fake_path_pair_with_peer_keys(local_map, local_addr, None, peer_map, peer_addr, None)
+}
+
+/// Inserts a pair of matching fake path-secret entries, as [`insert_fake_path_pair`] does, where
+/// each entry records the key of the peer it was set up with, as a handshake on a map with a list
+/// of accepted keys records it (see [`PathSecretMap::set_peer_keys`]).
+///
+/// `local_peer_key` is the key of the endpoint at `peer_addr`, which `local_map`'s entry records;
+/// `peer_peer_key` is the key of the endpoint at `local_addr`, which `peer_map`'s entry records.
+/// Where a map has a list of accepted keys, it caches its entry only where the list holds the key.
+pub fn insert_fake_path_pair_with_peer_keys(
+    local_map: &PathSecretMap,
+    local_addr: SocketAddr,
+    local_peer_key: Option<PeerKey>,
+    peer_map: &PathSecretMap,
+    peer_addr: SocketAddr,
+    peer_peer_key: Option<PeerKey>,
+) -> TestPairIds {
     use crate::path::secret::map::Entry;
 
     // Each side's `peer_data_addrs` is the full recv-socket address list the *other*
@@ -623,14 +641,16 @@ pub fn insert_fake_path_pair(
     // the peer's addrs; the peer-side entry (keyed by local_addr) targets ours.
     let mut local_builder = Entry::builder(peer_addr)
         .local(local_addr)
-        .peer_data_addrs(lookup_peer_data_addrs(peer_addr));
+        .peer_data_addrs(lookup_peer_data_addrs(peer_addr))
+        .peer_key(local_peer_key);
     if let Some(params) = lookup_sim_params(local_addr) {
         local_builder = local_builder.params(params);
     }
 
     let mut peer_builder = Entry::builder(local_addr)
         .local(peer_addr)
-        .peer_data_addrs(lookup_peer_data_addrs(local_addr));
+        .peer_data_addrs(lookup_peer_data_addrs(local_addr))
+        .peer_key(peer_peer_key);
     if let Some(params) = lookup_sim_params(peer_addr) {
         peer_builder = peer_builder.params(params);
     }

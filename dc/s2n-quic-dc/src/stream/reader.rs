@@ -2121,6 +2121,14 @@ impl Drop for Reader {
                 binding_id = self.0.stream_rx.binding_id().as_u64(),
                 "Reader dropped during panic - sent QueueReset"
             );
+        } else if self.0.path_secret_entry.is_revoked() {
+            // The map revoked the stream's path secret because the peer's key was removed, which
+            // reset this reader. The peer still holds the path secret, so reset its writer too.
+            let _ = self.0.send_reset_frame(error::PEER_KEY_REMOVED, ResetTarget::Control);
+            debug!(
+                binding_id = self.0.stream_rx.binding_id().as_u64(),
+                "Reader dropped on a revoked path secret - sent QueueReset"
+            );
         } else if !self.0.reassembler.is_writing_complete() && !self.0.status.is_reset() {
             let error_code = error::STOP_SENDING;
             // STOP_SENDING must target the *writer* on the peer side, which
