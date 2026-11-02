@@ -1653,3 +1653,110 @@ fn send_idle_wheel_survives_indefinitely_with_periodic_path_activity() {
         .spawn();
     });
 }
+
+/// A quiet path with an open stream whose idle timeout is under two wheel ticks: the check half
+/// an idle timeout in runs within a tick of the idle deadline, so the idle wheel probes the peer
+/// there, and checks again a wheel tick later instead of within the same tick, where the check
+/// would mark the peer dead before it could answer. A peer that answers the probe is kept and its
+/// new quiet period is probed; once it stops answering, the unanswered probe marks it dead.
+#[test]
+fn send_idle_wheel_waits_a_tick_for_the_probe_answer_with_an_idle_timeout_under_two_ticks() {
+    let _guard = crate::testing::without_snapshots();
+    sim(|| {
+        let (send_caches, mut idle_wheel_tx, _completed_rx, clock, _registry) = setup_send();
+
+        let idle = core::time::Duration::from_millis(1500);
+        let mut params = s2n_quic_core::dc::testing::TEST_APPLICATION_PARAMS;
+        params.max_idle_timeout = core::num::NonZeroU32::new(idle.as_millis() as u32);
+        let pse = crate::path::secret::map::Entry::builder("127.0.0.1:4433".parse().unwrap())
+            .socket_sender_count(8)
+            .params(params)
+            .build(None);
+        assert_eq!(pse.idle_timeout(), idle);
+
+        let tick = crate::time::wheel::SECOND_GRANULARITY_NANOS;
+        let cooldown = crate::endpoint::DEFAULT_DEAD_PEER_COOLDOWN;
+        async move {
+            // Start 0.3 s into a wheel tick. The check armed half an idle timeout out, 0.75 s in,
+            // runs at the start of the next tick, 0.7 s in, which is within a tick of the idle
+            // deadline 1.5 s in.
+            let now = precision::Clock::now(&clock);
+            let to_next_tick = core::time::Duration::from_nanos(tick - now.nanos % tick);
+            (to_next_tick + core::time::Duration::from_millis(300)).sleep().await;
+            let start = precision::Clock::now(&clock);
+            pse.touch_activity(start);
+            let stream = open_stream(&pse);
+
+            let ctx = send_caches[LocalSendSocketId::new(0)]
+                .borrow_mut()
+                .get_or_insert(&pse, &clock)
+                .unwrap();
+            assert!(!ctx.borrow().inflight.has_inflight());
+            // As `wheel_interest` arms a context whose path has an open stream.
+            ctx.borrow_mut().idle_wheel.target_time = Some(start + idle / 2);
+            let _ = idle_wheel_tx.send(ctx.clone());
+
+            // 0.8 s in, the check 0.7 s in has probed the quiet path and waits for the answer.
+            core::time::Duration::from_millis(800).sleep().await;
+            assert_eq!(
+                ctx.borrow().idle_probe_for,
+                Some(start.nanos),
+                "the check within a tick of the idle deadline should probe the quiet path"
+            );
+            assert_eq!(
+                send_caches[LocalSendSocketId::new(0)]
+                    .borrow()
+                    .context_count(),
+                1,
+                "the context should wait a wheel tick for the probe's answer"
+            );
+            let answered_at = precision::Clock::now(&clock);
+            assert!(
+                !pse.is_dead_during_cooldown(answered_at, cooldown),
+                "the peer shouldn't be marked dead before it could answer the probe"
+            );
+
+            // The peer answers 0.8 s in. The next check, 1.7 s in, keeps the context and probes
+            // the new quiet period.
+            pse.touch_activity(answered_at);
+            let answered = pse.last_activity();
+            core::time::Duration::from_millis(1000).sleep().await;
+            assert_eq!(
+                send_caches[LocalSendSocketId::new(0)]
+                    .borrow()
+                    .context_count(),
+                1,
+                "a peer that answers the probe should be kept"
+            );
+            assert_eq!(
+                ctx.borrow().idle_probe_for,
+                Some(answered.nanos),
+                "the answer starts a new quiet period, which should be probed in turn"
+            );
+            let now = precision::Clock::now(&clock);
+            assert!(
+                !pse.is_dead_during_cooldown(now, cooldown),
+                "a peer that answers the probe shouldn't be marked dead"
+            );
+
+            // The peer doesn't answer the second probe: the check a tick later, 2.7 s in, marks
+            // it dead and evicts the context.
+            core::time::Duration::from_millis(1000).sleep().await;
+            assert_eq!(
+                send_caches[LocalSendSocketId::new(0)]
+                    .borrow()
+                    .context_count(),
+                0,
+                "the context should be evicted once the probe goes unanswered"
+            );
+            let now = precision::Clock::now(&clock);
+            assert!(
+                pse.is_dead_during_cooldown(now, cooldown),
+                "a peer that doesn't answer the probe should be marked dead"
+            );
+            drop(stream);
+        }
+        .primary()
+        .spawn();
+    });
+}

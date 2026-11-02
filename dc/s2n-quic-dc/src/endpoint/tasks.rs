@@ -1193,6 +1193,11 @@ where
 /// same rule by then. Probes go out on `frame_tx`, which refuses one only once its receiver has
 /// closed it, and a closed channel doesn't open again: a refused probe isn't recorded, and the
 /// context waits for its idle deadline, where the check tries the probe once more.
+///
+/// A probe sent within a wheel tick of the idle deadline, as where the check was armed for the
+/// deadline or the idle timeout is under two wheel ticks, is checked again half an idle timeout
+/// later, or a wheel tick later where that is longer, so that the peer has until the next tick
+/// at least to answer it.
 pub async fn send_idle_wheel_drain<Clk, WakerSink, AckComp>(
     rx: intrusive::unsync::Receiver<send::IdleWheelAdapter>,
     idle_wheel_tx: intrusive::unsync::Sender<send::IdleWheelAdapter>,
@@ -1284,10 +1289,13 @@ pub async fn send_idle_wheel_drain<Clk, WakerSink, AckComp>(
                 }
 
                 // An open stream whose quiet period wasn't probed yet, as where the path's first
-                // stream opened after its idle check was armed at the full idle timeout. Where the
-                // check runs on time, within a wheel tick of the idle deadline, probe the peer now
-                // and give the probe half an idle timeout to be answered before the idle timeout
-                // decides. Where it runs later than that, as after this side was suspended, the
+                // stream opened after its idle check was armed at the full idle timeout, or where
+                // the idle timeout is under two wheel ticks, so that the check half an idle
+                // timeout in can run within a tick of the deadline. Where the check runs on time,
+                // within a wheel tick of the idle deadline, probe the peer now and check again
+                // half an idle timeout later, or a wheel tick later where that is longer: a next
+                // check within this tick would run at once and mark the peer dead before it could
+                // answer. Where it runs later than that, as after this side was suspended, the
                 // peer has marked this side dead under the same rule by then: expire below. A
                 // probe the submission channel refuses here isn't tried again, since a closed
                 // channel doesn't open again: the idle timeout decides now, below.
@@ -1296,7 +1304,9 @@ pub async fn send_idle_wheel_drain<Clk, WakerSink, AckComp>(
                 let ctx = if wants_probe && !late {
                     drop(ctx);
                     if send_idle_probe(&context, last_activity, &mut frame_tx) {
-                        context.borrow_mut().idle_wheel.target_time = Some(now + idle_timeout / 2);
+                        let tick = wheel::SECOND_GRANULARITY_NANOS;
+                        let wait = (idle_timeout / 2).max(core::time::Duration::from_nanos(tick));
+                        context.borrow_mut().idle_wheel.target_time = Some(now + wait);
                         let _ = UnboundedSender::send(&mut idle_wheel_tx, context);
                         idle_rescheduled.add(1);
                         return;
