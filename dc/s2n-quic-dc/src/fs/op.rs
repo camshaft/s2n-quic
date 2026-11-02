@@ -50,7 +50,7 @@ pub type SharedFile = dyn AsRawHandle + Send + Sync;
 /// recycled, and the backend would `pread`/`pwrite` (or hand io_uring) a **stale or reused**
 /// descriptor. Worse for io_uring, the kernel holds the fd across the async op.
 ///
-/// `Fd` carries an `Arc<`[`SharedFile`]`>` — typically an `Arc<File>` — so the op pins the
+/// `Fd` carries an `Arc<`[`SharedFile`]`>`, typically an `Arc<File>`, so the op pins the
 /// file open until it completes and is dropped, exactly as it pins its [`Device`] and its buffer.
 /// Cloning is a cheap `Arc` bump; `as_raw()` yields the descriptor for the backend syscall/SQE, valid
 /// because the `Fd` (held by the op) outlives that call.
