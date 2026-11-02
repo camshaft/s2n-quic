@@ -608,6 +608,10 @@ pub(crate) struct Context {
     /// periodically makes an ACK-only packet ack-eliciting so that the peer
     /// responds and we can measure the round-trip time.
     pub rtt_tracker: AckRttTracker,
+    /// The quiet period the send idle wheel last probed with a Ping, by the nanoseconds of
+    /// its last peer activity: set by `send_idle_wheel_drain` when it probes a quiet path that
+    /// has an open stream, so that it probes each quiet period once.
+    pub idle_probe_for: Option<u64>,
 }
 
 impl crate::socket::channel::ByteCost for Context {
@@ -764,6 +768,7 @@ impl Context {
             last_peer_activity: clock.now(),
             invalidated: false,
             rtt_tracker: AckRttTracker::default(),
+            idle_probe_for: None,
         })
     }
 
@@ -925,6 +930,14 @@ impl Context {
 
         let idle_timeout = if !self.is_idle_scheduled() {
             let timeout = self.path_secret_entry.idle_timeout();
+            // A path with an open stream is first checked half an idle timeout from now, so
+            // that the idle wheel can probe it while it is quiet, before the idle timeout
+            // decides (`send_idle_wheel_drain`).
+            let timeout = if self.path_secret_entry.queue_state().has_open_stream() {
+                timeout / 2
+            } else {
+                timeout
+            };
             let target = clock.now() + timeout;
             self.idle_wheel.target_time = Some(target);
             true
