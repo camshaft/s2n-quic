@@ -201,12 +201,20 @@ fn loopback() {
 }
 
 /// A command that runs `cross_host_end` of this test binary as `role` under the loopback
-/// schedule, which appends its lines to `results`.
+/// schedule, which appends its lines to `results`. The end runs one test at a time, so libtest
+/// writes `test cross_host_end ... ` at the start of the line that the end's own output follows,
+/// as it does on a host with one CPU, and `listening_addr` reads the server's line after it.
 fn end_command(role: &str, results: &Path) -> Command {
     let exe = std::env::current_exe().expect("the test binary's path");
     let mut command = Command::new(exe);
     command
-        .args(["cross_host_end", "--exact", "--ignored", "--nocapture"])
+        .args([
+            "cross_host_end",
+            "--exact",
+            "--ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ])
         .env("DC_CROSS_HOST_ROLE", role)
         .env("DC_CROSS_HOST_RESULTS", results)
         .envs(LOOPBACK_SCHEDULE);
