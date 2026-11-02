@@ -626,6 +626,7 @@ pub fn send_worker<Socket, Clk, WakerSink, AckComp>(
             counter_registry.register("idle.send.expired"),
             counter_registry.register("idle.send.rescheduled"),
             counter_registry.register_nominal_timer("idle.send.lifetime", &variant),
+            IdleProbeCounters::new(&counter_registry),
             budgets.idle_wheel,
             task_counter.clone(),
         );
@@ -1192,7 +1193,8 @@ where
 /// was suspended, marks the peer dead without a probe: the peer marks this side dead under the
 /// same rule by then. Probes go out on `frame_tx`, which refuses one only once its receiver has
 /// closed it, and a closed channel doesn't open again: a refused probe isn't recorded, and the
-/// context waits for its idle deadline, where the check tries the probe once more.
+/// context waits for its idle deadline, where the check tries the probe once more. `probes`
+/// counts the probes, and the peers these rules mark dead.
 ///
 /// A probe sent within a wheel tick of the idle deadline, as where the check was armed for the
 /// deadline or the idle timeout is under two wheel ticks, is checked again half an idle timeout
@@ -1214,6 +1216,7 @@ pub async fn send_idle_wheel_drain<Clk, WakerSink, AckComp>(
     idle_expired: counter::Counter,
     idle_rescheduled: counter::Counter,
     idle_lifetime: counter::Timer,
+    probes: IdleProbeCounters,
     budget: usize,
     task_counter: counter::Task,
 ) where
@@ -1270,7 +1273,8 @@ pub async fn send_idle_wheel_drain<Clk, WakerSink, AckComp>(
                             // context waits for its idle deadline, which decides: the channel
                             // refuses only once its receiver has closed it, and a closed channel
                             // doesn't open again, so each try before the deadline is refused too.
-                            let _ = send_idle_probe(&context, last_activity, &mut frame_tx);
+                            let _ =
+                                send_idle_probe(&context, last_activity, &mut frame_tx, &probes);
                             context.borrow_mut().idle_wheel.target_time = Some(target);
                             let _ = UnboundedSender::send(&mut idle_wheel_tx, context);
                             idle_rescheduled.add(1);
@@ -1303,7 +1307,7 @@ pub async fn send_idle_wheel_drain<Clk, WakerSink, AckComp>(
                     >= wheel::SECOND_GRANULARITY_NANOS;
                 let ctx = if wants_probe && !late {
                     drop(ctx);
-                    if send_idle_probe(&context, last_activity, &mut frame_tx) {
+                    if send_idle_probe(&context, last_activity, &mut frame_tx, &probes) {
                         let tick = wheel::SECOND_GRANULARITY_NANOS;
                         let wait = (idle_timeout / 2).max(core::time::Duration::from_nanos(tick));
                         context.borrow_mut().idle_wheel.target_time = Some(now + wait);
@@ -1449,6 +1453,13 @@ pub async fn send_idle_wheel_drain<Clk, WakerSink, AckComp>(
                 }
 
                 if let Some(streams) = reset {
+                    // Count the dead marks of the quiet-path rules apart from the base's mark on
+                    // unacknowledged packets alone: an unanswered probe, then an open stream.
+                    if probed {
+                        probes.dead_probe_unanswered.add(1);
+                    } else if !has_inflight {
+                        probes.dead_open_stream.add(1);
+                    }
                     let _ = peer_dead_tx.send(Entry::new(PeerDead {
                         path_secret_entry,
                         streams,
@@ -1467,7 +1478,8 @@ pub async fn send_idle_wheel_drain<Clk, WakerSink, AckComp>(
 
 /// Submits a Ping to the peer of `context`, the send idle wheel's probe of a quiet path that has
 /// an open stream, and where the submission channel accepts it, records the quiet period it
-/// probes by its last peer activity. Returns whether the channel accepted the Ping.
+/// probes by its last peer activity. Counts the Ping in `probes`, as sent or as refused, and
+/// returns whether the channel accepted it.
 ///
 /// The Ping goes through the frame pipeline as any frame does, so it is transmitted,
 /// retransmitted after each probe timeout, and acknowledged as any packet is: an answer
@@ -1478,6 +1490,7 @@ fn send_idle_probe(
     context: &Rc<RefCell<send::Context>>,
     last_activity: precision::Timestamp,
     frame_tx: &mut frame::SubmissionSender,
+    probes: &IdleProbeCounters,
 ) -> bool {
     let path_secret_entry = context.borrow().path_secret_entry.clone();
     let probe = Frame {
@@ -1493,8 +1506,38 @@ fn send_idle_probe(
     let accepted = frame_tx.send_batch(Entry::new(probe)).is_ok();
     if accepted {
         context.borrow_mut().idle_probe_for = Some(last_activity.nanos);
+        probes.sent.add(1);
+    } else {
+        probes.refused.add(1);
     }
     accepted
+}
+
+/// Counts of the send idle wheel's probes of a quiet path that has an open stream, and of the
+/// peers it marks dead under the quiet-path rules instead of on unacknowledged packets alone.
+#[derive(Clone)]
+pub struct IdleProbeCounters {
+    /// Pings the frame submission channel accepted (`idle.send.probe_sent`).
+    pub sent: counter::Counter,
+    /// Pings the frame submission channel refused (`idle.send.probe_refused`).
+    pub refused: counter::Counter,
+    /// Peers marked dead at the idle timeout of a quiet period whose probe went out, whether or
+    /// not the Ping is still unacknowledged (`idle.send.dead_probe_unanswered`).
+    pub dead_probe_unanswered: counter::Counter,
+    /// Peers marked dead with nothing unacknowledged and no probe, on a path with an open stream
+    /// (`idle.send.dead_open_stream`).
+    pub dead_open_stream: counter::Counter,
+}
+
+impl IdleProbeCounters {
+    pub fn new(registry: &counter::Registry) -> Self {
+        Self {
+            sent: registry.register("idle.send.probe_sent"),
+            refused: registry.register("idle.send.probe_refused"),
+            dead_probe_unanswered: registry.register("idle.send.dead_probe_unanswered"),
+            dead_open_stream: registry.register("idle.send.dead_open_stream"),
+        }
+    }
 }
 
 /// Forwards each frame that a send context's invalidation fails to `completed_tx`, and keeps the

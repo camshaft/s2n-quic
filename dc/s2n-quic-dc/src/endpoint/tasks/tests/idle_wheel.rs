@@ -96,6 +96,7 @@ fn setup_send_and_frame_receiver() -> (SetupSend, frame::SubmissionReceiver) {
         registry.register("idle.send.expired"),
         registry.register("idle.send.rescheduled"),
         registry.register_nominal_timer("idle.send.lifetime", "send.0"),
+        tasks::IdleProbeCounters::new(&registry),
         32,
         registry.register_nominal_task("task.idle_wheel", "send.0"),
     )
@@ -112,6 +113,35 @@ fn setup_send_and_frame_receiver() -> (SetupSend, frame::SubmissionReceiver) {
     async move { peer_dead_broadcast_task.drain_budgeted(Some(32)).await }.spawn();
 
     ((send_caches, idle_wheel_tx, completed_rx, clock, registry), frame_rx)
+}
+
+/// The counts of the drain's probe counters, `tasks::IdleProbeCounters`.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ProbeCounts {
+    sent: u64,
+    refused: u64,
+    dead_probe_unanswered: u64,
+    dead_open_stream: u64,
+}
+
+/// Takes the registry's metrics line, which drains it, and reads the probe counters from it, each
+/// 0 where the line leaves the counter out. Each test takes the line once, at its end.
+fn take_probe_counts(registry: &crate::counter::Registry) -> ProbeCounts {
+    let line = registry.take_current_metrics_line().unwrap_or_default();
+    let count = |label: &str| -> u64 {
+        line.split([',', ' ', '\n'])
+            .find_map(|entry| entry.strip_prefix(label)?.strip_prefix('='))
+            .map_or(0, |value| {
+                let digits: String = value.chars().take_while(char::is_ascii_digit).collect();
+                digits.parse().expect("a counter's value is a whole number")
+            })
+    };
+    ProbeCounts {
+        sent: count("idle.send.probe_sent"),
+        refused: count("idle.send.probe_refused"),
+        dead_probe_unanswered: count("idle.send.dead_probe_unanswered"),
+        dead_open_stream: count("idle.send.dead_open_stream"),
+    }
 }
 
 #[test]
@@ -281,7 +311,7 @@ fn send_idle_wheel_expires_reader_only_queue_no_reset_without_inflight() {
 #[test]
 fn send_idle_wheel_no_inflight_does_not_mark_dead() {
     sim(|| {
-        let (send_caches, mut idle_wheel_tx, _completed_rx, clock, _registry) = setup_send();
+        let (send_caches, mut idle_wheel_tx, _completed_rx, clock, registry) = setup_send();
 
         let pse = test_entry();
         pse.touch_activity(precision::Clock::now(&clock));
@@ -323,6 +353,11 @@ fn send_idle_wheel_no_inflight_does_not_mark_dead() {
                 !pse.is_dead_during_cooldown(now, crate::endpoint::DEFAULT_DEAD_PEER_COOLDOWN),
                 "peer should NOT be marked dead when idle expires with no inflight packets"
             );
+            assert_eq!(
+                take_probe_counts(&registry),
+                ProbeCounts::default(),
+                "an idle path with nothing open or unacknowledged isn't probed or marked dead"
+            );
         }
         .primary()
         .spawn();
@@ -347,7 +382,7 @@ fn open_stream(pse: &crate::path::secret::map::Entry) -> crate::queue::AllocResu
 fn send_idle_wheel_marks_dead_a_peer_that_doesnt_answer_the_probe_of_an_open_stream() {
     let _guard = crate::testing::without_snapshots();
     sim(|| {
-        let ((send_caches, mut idle_wheel_tx, _completed_rx, clock, _registry), mut frame_rx) =
+        let ((send_caches, mut idle_wheel_tx, _completed_rx, clock, registry), mut frame_rx) =
             setup_send_and_frame_receiver();
 
         let pse = test_entry();
@@ -447,6 +482,16 @@ fn send_idle_wheel_marks_dead_a_peer_that_doesnt_answer_the_probe_of_an_open_str
                 matches!(frame_rx.poll_swap(&mut cx, &mut later), core::task::Poll::Pending),
                 "the quiet period should be probed once"
             );
+            assert_eq!(
+                take_probe_counts(&registry),
+                ProbeCounts {
+                    sent: 1,
+                    refused: 0,
+                    dead_probe_unanswered: 1,
+                    dead_open_stream: 0,
+                },
+                "one probe went out, and the peer was marked dead for not answering it"
+            );
             drop(stream);
         }
         .primary()
@@ -462,7 +507,7 @@ fn send_idle_wheel_marks_dead_a_peer_that_doesnt_answer_the_probe_of_an_open_str
 fn send_idle_wheel_marks_dead_an_open_stream_whose_idle_check_runs_late() {
     let _guard = crate::testing::without_snapshots();
     sim(|| {
-        let (send_caches, mut idle_wheel_tx, _completed_rx, clock, _registry) = setup_send();
+        let (send_caches, mut idle_wheel_tx, _completed_rx, clock, registry) = setup_send();
 
         let pse = test_entry();
         let start = precision::Clock::now(&clock);
@@ -501,6 +546,16 @@ fn send_idle_wheel_marks_dead_an_open_stream_whose_idle_check_runs_late() {
                 pse.is_dead_during_cooldown(now, crate::endpoint::DEFAULT_DEAD_PEER_COOLDOWN),
                 "an open stream whose idle check runs late should mark the peer dead"
             );
+            assert_eq!(
+                take_probe_counts(&registry),
+                ProbeCounts {
+                    sent: 0,
+                    refused: 0,
+                    dead_probe_unanswered: 0,
+                    dead_open_stream: 1,
+                },
+                "a late check marks the peer dead on the open stream without a probe"
+            );
             drop(stream);
         }
         .primary()
@@ -516,7 +571,7 @@ fn send_idle_wheel_marks_dead_an_open_stream_whose_idle_check_runs_late() {
 fn send_idle_wheel_probes_an_open_stream_whose_check_was_armed_at_the_full_idle_timeout() {
     let _guard = crate::testing::without_snapshots();
     sim(|| {
-        let (send_caches, mut idle_wheel_tx, _completed_rx, clock, _registry) = setup_send();
+        let (send_caches, mut idle_wheel_tx, _completed_rx, clock, registry) = setup_send();
 
         let pse = test_entry();
         let start = precision::Clock::now(&clock);
@@ -563,6 +618,16 @@ fn send_idle_wheel_probes_an_open_stream_whose_check_was_armed_at_the_full_idle_
             assert!(
                 pse.is_dead_during_cooldown(now, crate::endpoint::DEFAULT_DEAD_PEER_COOLDOWN),
                 "a peer that doesn't answer the probe should be marked dead"
+            );
+            assert_eq!(
+                take_probe_counts(&registry),
+                ProbeCounts {
+                    sent: 1,
+                    refused: 0,
+                    dead_probe_unanswered: 1,
+                    dead_open_stream: 0,
+                },
+                "the probe at the idle deadline went unanswered, so the peer was marked dead"
             );
             drop(stream);
         }
@@ -758,7 +823,7 @@ fn send_idle_wheel_marks_dead_a_peer_that_doesnt_answer_the_probe_after_its_stre
 fn send_idle_wheel_retries_a_probe_the_submission_channel_refuses() {
     let _guard = crate::testing::without_snapshots();
     sim(|| {
-        let (send_caches, mut idle_wheel_tx, _completed_rx, clock, _registry) =
+        let (send_caches, mut idle_wheel_tx, _completed_rx, clock, registry) =
             setup_send_with_frame_receiver(false);
 
         let pse = test_entry();
@@ -803,6 +868,19 @@ fn send_idle_wheel_retries_a_probe_the_submission_channel_refuses() {
                     .context_count(),
                 1,
                 "the context should be kept until its idle deadline"
+            );
+            let counts = take_probe_counts(&registry);
+            assert!(
+                counts.refused >= 1,
+                "a refused probe should be counted: {counts:?}"
+            );
+            assert_eq!(
+                ProbeCounts {
+                    refused: counts.refused,
+                    ..ProbeCounts::default()
+                },
+                counts,
+                "a refused probe isn't counted as sent, and the peer isn't marked dead"
             );
 
             // At the idle deadline, the probe is refused again, and the idle timeout decides at
@@ -1040,7 +1118,7 @@ fn recv_idle_wheel_reschedules_active_context() {
 fn send_idle_wheel_defers_death_for_recent_inflight() {
     let _guard = crate::testing::without_snapshots();
     sim(|| {
-        let (send_caches, mut idle_wheel_tx, _completed_rx, clock, _registry) = setup_send();
+        let (send_caches, mut idle_wheel_tx, _completed_rx, clock, registry) = setup_send();
 
         let pse = test_entry();
         pse.touch_activity(precision::Clock::now(&clock));
@@ -1123,6 +1201,11 @@ fn send_idle_wheel_defers_death_for_recent_inflight() {
             assert!(
                 pse.is_dead_during_cooldown(now, crate::endpoint::DEFAULT_DEAD_PEER_COOLDOWN),
                 "peer should be marked dead after inflight waited full idle_timeout"
+            );
+            assert_eq!(
+                take_probe_counts(&registry),
+                ProbeCounts::default(),
+                "unacknowledged packets alone don't count as a quiet-path dead mark"
             );
         }
         .primary()
