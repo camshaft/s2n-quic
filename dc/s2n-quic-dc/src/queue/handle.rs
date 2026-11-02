@@ -179,6 +179,14 @@ impl ControlReceiver {
         unsafe { self.slot.as_ref() }
     }
 
+    /// Records `peer_queue_id`, the queue the peer receives this stream's frames on, on the slot,
+    /// so that a reset of the stream that this side owes the peer routes there
+    /// ([`Slot::owed_reset`]).
+    #[inline]
+    pub(crate) fn set_peer_queue_id(&self, peer_queue_id: VarInt) {
+        self.slot().set_peer_queue_id(peer_queue_id);
+    }
+
     #[inline]
     pub fn try_recv(&self) -> Result<Option<intrusive::Entry<msg::Control>>, Closed> {
         self.slot().control.pop()
