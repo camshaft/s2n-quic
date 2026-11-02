@@ -138,8 +138,7 @@ impl Map {
     /// Returns the time since `entry` was created, read from this map's clock, which is the
     /// clock the entry's creation time comes from.
     pub(crate) fn entry_age(&self, entry: &Entry) -> core::time::Duration {
-        time::Clock::get_time(&*self.store)
-            .saturating_duration_since(entry.creation_time())
+        time::Clock::get_time(&*self.store).saturating_duration_since(entry.creation_time())
     }
 
     pub fn register_request_handshake(
@@ -577,7 +576,9 @@ mod entry_age_tests {
             .get_by_id(&id)
             .expect("the map holds the inserted entry");
 
-        assert_eq!(map.entry_age(&entry), Duration::ZERO);
+        // s2n-quic-core's `Timestamp::saturating_duration_since` rounds a zero difference
+        // up to 1us, since a `Timestamp` is never zero.
+        assert!(map.entry_age(&entry) <= Duration::from_micros(1));
 
         clock.advance(Duration::from_secs(7));
         assert_eq!(map.entry_age(&entry), Duration::from_secs(7));
