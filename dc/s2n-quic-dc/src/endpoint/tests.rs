@@ -2859,6 +2859,181 @@ fn queue_free_lost_on_peer_dead_invalidation() {
     });
 }
 
+/// Shows which condition decides whether a server acts on the replay notices a client sends it
+/// after the client loses its receive context for the server's key.
+///
+/// The setup follows `stale_key_detected_after_recv_cache_eviction`: the client's entry has a 1 s
+/// idle timeout and the server's an hour, so once the first stream is done, the client's receive
+/// idle wheel drops its receive context for the server's key id 0, while the server's send
+/// context keeps sealing with it. Each response is 256 KiB, so on the second stream the server
+/// sends many packets on key id 0 before the first notice reaches it. The client rejects each of
+/// them and answers each with a notice, since it doesn't deduplicate its notices.
+///
+/// The server acts on the first notice: it removes its send context and moves the context's
+/// frames to a new one, which seals with a newer key id, so the second stream completes. Every
+/// later notice rejects key id 0, which the server no longer seals with, and the server's send
+/// cache leaves its context as it is: it doesn't hold a context for the credential until the next
+/// send makes one, and that context seals with a newer key id. The test reads the server's counters
+/// for each outcome.
+#[test]
+fn replay_notices_after_recv_eviction_are_acted_on_once() {
+    use crate::{endpoint::testing::sim::lookup_sim_map, path::secret::map::Entry};
+    use s2n_quic_core::dc::testing::TEST_APPLICATION_PARAMS;
+    use std::{collections::HashMap, num::NonZeroU32, sync::Mutex};
+
+    const RESPONSE_LEN: u64 = 256 * 1024;
+
+    let _no_snap = crate::testing::without_snapshots();
+    let server_counters: Arc<Mutex<Option<crate::counter::Registry>>> = Default::default();
+    let server_counters_reader = server_counters.clone();
+    let totals: Arc<Mutex<Option<HashMap<String, u64>>>> = Default::default();
+    let totals_inner = totals.clone();
+
+    sim(|| {
+        let acceptor_id = VarInt::from_u8(1);
+
+        // Server: answer each stream with a 256 KiB response once its request ends.
+        async move {
+            let server = Server::new();
+            *server_counters.lock().unwrap() = Some(server.counters());
+            let mut acceptor = server
+                .register_acceptor_channel(acceptor_id, 8)
+                .expect("acceptor registration");
+
+            while let Some(stream) = acceptor.recv().await {
+                async move {
+                    let (mut reader, mut writer) = stream.into_split();
+                    let mut request = BytesMut::with_capacity(16);
+                    loop {
+                        match reader.read_into(&mut request).await {
+                            Ok(0) => break,
+                            Ok(_) => {}
+                            Err(_) => return,
+                        }
+                    }
+                    let mut response = Data::new(RESPONSE_LEN);
+                    let _ = writer.write_all_from_fin(&mut response).await;
+                }
+                .spawn();
+            }
+        }
+        .group("server")
+        .spawn();
+
+        // Client (primary).
+        async move {
+            let mut client = Client::new();
+            // Yield so the server group has a chance to bind its socket.
+            bach::task::yield_now().await;
+
+            let server_addr = bach::net::lookup_host(format!("server:{SERVER_PORT}"))
+                .await
+                .expect("lookup")
+                .next()
+                .expect("server addr");
+            let client_addr = client.data_addr();
+            let client_map = lookup_sim_map(client_addr).expect("client map");
+            let server_map = lookup_sim_map(server_addr).expect("server map");
+
+            // The client's entry expires its contexts after 1 s of silence. The server's entry
+            // keeps its send context, and the key id that context seals with, for the whole test.
+            let mut client_params = TEST_APPLICATION_PARAMS;
+            client_params.max_idle_timeout = NonZeroU32::new(1_000);
+            client_params.remote_max_data = client_params.local_recv_max_data;
+            let mut server_params = TEST_APPLICATION_PARAMS;
+            server_params.max_idle_timeout = NonZeroU32::new(3_600_000);
+            server_params.remote_max_data = server_params.local_recv_max_data;
+            client_map.test_insert_pair(
+                Entry::builder(server_addr)
+                    .local(client_addr)
+                    .params(client_params),
+                &server_map,
+                Entry::builder(client_addr)
+                    .local(server_addr)
+                    .params(server_params),
+            );
+
+            for stream_number in 1..=2 {
+                if stream_number == 2 {
+                    // After 3 s the client's receive idle wheel has dropped its receive context
+                    // for the server's key, while the server's send context still seals with it.
+                    3.s().sleep().await;
+                }
+                let stream = client
+                    .connect(format!("server:{SERVER_PORT}"), acceptor_id)
+                    .await
+                    .unwrap_or_else(|error| panic!("connect {stream_number}: {error}"));
+                let (mut reader, mut writer) = stream.into_split();
+                let mut request = Bytes::from_static(b"ping");
+                timeout(5.s(), writer.write_all_from_fin(&mut request))
+                    .await
+                    .unwrap_or_else(|_| panic!("write {stream_number} timed out"))
+                    .unwrap_or_else(|error| panic!("write {stream_number}: {error}"));
+                let mut response = Data::new(RESPONSE_LEN);
+                loop {
+                    let read = timeout(5.s(), reader.read_into(&mut response))
+                        .await
+                        .unwrap_or_else(|_| panic!("read {stream_number} timed out"))
+                        .unwrap_or_else(|error| panic!("read {stream_number}: {error}"));
+                    if read == 0 {
+                        break;
+                    }
+                }
+                assert!(
+                    response.is_finished(),
+                    "stream {stream_number} ended before its whole response"
+                );
+            }
+
+            // Let the notices still on their way reach the server, within the client's 1 s idle
+            // timeout, so that the client keeps its receive context for the server's new key.
+            500.ms().sleep().await;
+            let counters = server_counters_reader
+                .lock()
+                .unwrap()
+                .clone()
+                .expect("the server's counters");
+            *totals_inner.lock().unwrap() = Some(counters.take_counter_totals());
+        }
+        .group("client")
+        .primary()
+        .spawn();
+    });
+
+    let totals = totals
+        .lock()
+        .unwrap()
+        .take()
+        .expect("the client read the server's counters");
+    let count = |label: &str| totals.get(label).copied().unwrap_or(0);
+    let accepted = count("invalidation.validator.replay_detected.validated")
+        + count("invalidation.validator.stale_key.validated");
+    let routed = count("invalidation.stale_replay.events");
+    let acted = count("invalidation.stale_replay.contexts");
+    let no_context = count("send.stale_key.no_context");
+    let already_advanced = count("send.stale_key.already_advanced");
+    let outcomes = format!(
+        "the server accepted {accepted} notices, routed {routed} to its send cache, acted on \
+         {acted}, didn't find a context for {no_context}, and found a context with a newer key id \
+         for {already_advanced}"
+    );
+    info!("{outcomes}");
+
+    assert!(
+        accepted > 1,
+        "the server accepted fewer than two notices, so the test didn't reproduce many notices \
+         for one lost receive context: {outcomes}"
+    );
+    assert_eq!(routed, accepted, "each accepted notice reaches the send cache: {outcomes}");
+    assert_eq!(acted, 1, "the server acts on exactly one notice: {outcomes}");
+    assert_eq!(
+        no_context + already_advanced,
+        routed - acted,
+        "each other notice leaves the send cache as it is under one of the two conditions: \
+         {outcomes}"
+    );
+}
+
 #[test]
 fn stale_key_detected_after_recv_cache_eviction() {
     use crate::endpoint::testing::sim::{self, SERVER_PORT};
