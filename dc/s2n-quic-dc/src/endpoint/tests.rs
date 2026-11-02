@@ -2653,6 +2653,322 @@ fn zombie_flow_not_invalidated_when_path_has_other_activity() {
     );
 }
 
+/// Reproduces a client stuck on a healthy peer: a client whose cached path-secret entry for
+/// that peer stops getting any answer stays in the dead-peer loop for as long as it keeps that
+/// entry.
+///
+/// Only an authenticated packet from the peer clears the dead mark, and each flow opened on the
+/// entry goes unanswered and marks it again, so nothing on the client ever leaves the loop
+/// short of restarting the process.
+///
+/// The monitor drops every server->client packet while the client's map still holds the entry
+/// the first stream used, which models per-peer state that broke on the client while the server
+/// and every other path stayed healthy. A fresh path secret works. Once the dead-peer cooldown
+/// has passed and the entry has been silent for an idle timeout, the client must evict it and
+/// pair again, so a stream completes within a few idle timeouts.
+#[test]
+fn dead_and_silent_peer_entry_is_replaced() {
+    use crate::{credentials::Id, stream::endpoint::testing::sim::lookup_sim_map};
+    use std::{net::SocketAddr, sync::Mutex};
+
+    type Broken = Arc<Mutex<Option<(crate::path::secret::Map, SocketAddr, Id)>>>;
+
+    let _no_snap = crate::testing::without_snapshots();
+    let recovered = Arc::new(AtomicBool::new(false));
+    let recovered_inner = recovered.clone();
+    let cooldown_refusals = Arc::new(AtomicUsize::new(0));
+    let cooldown_refusals_inner = cooldown_refusals.clone();
+
+    sim(|| {
+        let acceptor_id = VarInt::from_u8(1);
+        let broken: Broken = Arc::new(Mutex::new(None));
+
+        // Drop every server->client packet while the client still uses the broken entry.
+        {
+            let broken = broken.clone();
+            let mut server_host = MonitorHostAddr::new("server");
+            bach::net::monitor::on_packet_sent(move |packet| {
+                let guard = broken.lock().unwrap();
+                if let Some((client_map, server_addr, old_id)) = guard.as_ref() {
+                    let still_old = client_map
+                        .get_raw(*server_addr)
+                        .is_some_and(|entry| entry.id() == old_id);
+                    if still_old && server_host.is_packet_source(packet) {
+                        return bach::net::monitor::Command::Drop;
+                    }
+                }
+                bach::net::monitor::Command::Pass
+            });
+        }
+
+        // Server: echo each stream back.
+        async move {
+            let server = Server::new();
+            let mut acceptor = server
+                .register_acceptor_channel(acceptor_id, 64)
+                .expect("acceptor registration");
+
+            while let Some(stream) = acceptor.recv().await {
+                async move {
+                    let (mut reader, mut writer) = stream.into_split();
+                    let mut buf = BytesMut::with_capacity(16);
+                    loop {
+                        match reader.read_into(&mut buf).await {
+                            Ok(0) => break,
+                            Ok(_) => {}
+                            Err(_) => return,
+                        }
+                    }
+                    let mut echo = buf.freeze();
+                    let _ = writer.write_all_from_fin(&mut echo).await;
+                }
+                .spawn();
+            }
+        }
+        .group("server")
+        .spawn();
+
+        // Client (primary).
+        async move {
+            let mut client = Client::new();
+
+            // A first stream works and records the entry it used.
+            let stream = client
+                .connect(format!("server:{SERVER_PORT}"), acceptor_id)
+                .await
+                .expect("connect 1");
+            let (mut reader, mut writer) = stream.into_split();
+            let mut ping = Bytes::from_static(b"ping");
+            writer.write_all_from_fin(&mut ping).await.expect("write 1");
+            let mut buf = BytesMut::with_capacity(16);
+            loop {
+                if reader.read_into(&mut buf).await.expect("read 1") == 0 {
+                    break;
+                }
+            }
+            assert_eq!(&buf[..], b"ping");
+            drop(reader);
+            drop(writer);
+
+            let server_addr = bach::net::lookup_host(format!("server:{SERVER_PORT}"))
+                .await
+                .expect("lookup")
+                .next()
+                .expect("server addr");
+            let client_map = lookup_sim_map(client.data_addr()).expect("client map");
+            let old_id = *client_map
+                .get_raw(server_addr)
+                .expect("entry after the first stream")
+                .id();
+
+            // From here on, nothing the server sends on that entry reaches the client.
+            *broken.lock().unwrap() = Some((client_map.clone(), server_addr, old_id));
+
+            // Keep opening streams, as a busy caller would, for at least five minutes.
+            for _ in 0..300 {
+                let peer = format!("server:{SERVER_PORT}");
+                let connect = client.connect(peer, acceptor_id);
+                let stream = match timeout(5.s(), connect).await {
+                    Ok(Ok(stream)) => stream,
+                    Ok(Err(error)) => {
+                        // Refused in the dead-peer cooldown window.
+                        if error.kind() == io::ErrorKind::TimedOut {
+                            cooldown_refusals_inner.fetch_add(1, Ordering::Relaxed);
+                        }
+                        1.s().sleep().await;
+                        continue;
+                    }
+                    Err(_) => {
+                        // Still waiting for a queue slot.
+                        1.s().sleep().await;
+                        continue;
+                    }
+                };
+                let (mut reader, mut writer) = stream.into_split();
+                let mut ping = Bytes::from_static(b"ping");
+                if !matches!(
+                    timeout(5.s(), writer.write_all_from_fin(&mut ping)).await,
+                    Ok(Ok(_))
+                ) {
+                    continue;
+                }
+                let mut buf = BytesMut::with_capacity(16);
+                let done = loop {
+                    match timeout(5.s(), reader.read_into(&mut buf)).await {
+                        Ok(Ok(0)) => break true,
+                        Ok(Ok(_)) => {}
+                        _ => break false,
+                    }
+                };
+                if done && &buf[..] == b"ping" {
+                    let new_id = *client_map
+                        .get_raw(server_addr)
+                        .expect("entry after recovery")
+                        .id();
+                    assert_ne!(new_id, old_id, "recovery must come from a fresh entry");
+                    recovered_inner.store(true, Ordering::Relaxed);
+                    break;
+                }
+            }
+        }
+        .group("client")
+        .primary()
+        .spawn();
+    });
+
+    // The monitor's drops leave the client's flows unanswered, so the send idle wheel marks the
+    // server dead, and connects are refused in the dead-peer cooldown window before the entry is
+    // evicted.
+    assert!(
+        cooldown_refusals.load(Ordering::Relaxed) > 0,
+        "no connect was refused in the dead-peer cooldown window, so the monitor's drops never \
+         made the client mark the server dead"
+    );
+    assert!(
+        recovered.load(Ordering::Relaxed),
+        "the client never completed a stream to a healthy server after its cached entry stopped \
+         getting answers: the dead-peer mark is only cleared by a packet from the peer, so the \
+         client stays in the dead-cooldown loop for as long as it keeps the entry"
+    );
+}
+
+/// A client path the send idle wheel marks dead asks the client's path-secret map for a
+/// handshake with the peer in the background, through the callback a handshake client
+/// registers on the map, so the peer gets a new path secret before a connect finds the entry
+/// dead and silent.
+///
+/// The monitor drops every server->client packet once the first stream has finished, so the
+/// second stream's packets go unacknowledged and the idle wheel marks the server dead.
+#[test]
+fn dead_peer_requests_a_background_rehandshake() {
+    use crate::{psk::io::HandshakeReason, stream::endpoint::testing::sim::lookup_sim_map};
+    use std::{net::SocketAddr, sync::Mutex};
+
+    type Requests = Arc<Mutex<Vec<(SocketAddr, HandshakeReason)>>>;
+
+    let _no_snap = crate::testing::without_snapshots();
+    let requests: Requests = Default::default();
+    let requests_inner = requests.clone();
+    let server_addr: Arc<Mutex<Option<SocketAddr>>> = Default::default();
+    let server_addr_inner = server_addr.clone();
+
+    sim(|| {
+        let acceptor_id = VarInt::from_u8(1);
+        let drop_server = Arc::new(AtomicBool::new(false));
+
+        // Drop every server->client packet once the first stream has finished.
+        {
+            let drop_server = drop_server.clone();
+            let mut server_host = MonitorHostAddr::new("server");
+            bach::net::monitor::on_packet_sent(move |packet| {
+                if drop_server.load(Ordering::Relaxed) && server_host.is_packet_source(packet) {
+                    return bach::net::monitor::Command::Drop;
+                }
+                bach::net::monitor::Command::Pass
+            });
+        }
+
+        // Server: echo each stream back.
+        async move {
+            let server = Server::new();
+            let mut acceptor = server
+                .register_acceptor_channel(acceptor_id, 64)
+                .expect("acceptor registration");
+
+            while let Some(stream) = acceptor.recv().await {
+                async move {
+                    let (mut reader, mut writer) = stream.into_split();
+                    let mut buf = BytesMut::with_capacity(16);
+                    loop {
+                        match reader.read_into(&mut buf).await {
+                            Ok(0) => break,
+                            Ok(_) => {}
+                            Err(_) => return,
+                        }
+                    }
+                    let mut echo = buf.freeze();
+                    let _ = writer.write_all_from_fin(&mut echo).await;
+                }
+                .spawn();
+            }
+        }
+        .group("server")
+        .spawn();
+
+        // Client (primary).
+        async move {
+            let mut client = Client::new();
+
+            // A first stream works, so the client holds an entry for the server.
+            let stream = client
+                .connect(format!("server:{SERVER_PORT}"), acceptor_id)
+                .await
+                .expect("connect 1");
+            let (mut reader, mut writer) = stream.into_split();
+            let mut ping = Bytes::from_static(b"ping");
+            writer.write_all_from_fin(&mut ping).await.expect("write 1");
+            let mut buf = BytesMut::with_capacity(16);
+            loop {
+                if reader.read_into(&mut buf).await.expect("read 1") == 0 {
+                    break;
+                }
+            }
+            assert_eq!(&buf[..], b"ping");
+            drop(reader);
+            drop(writer);
+
+            let addr = bach::net::lookup_host(format!("server:{SERVER_PORT}"))
+                .await
+                .expect("lookup")
+                .next()
+                .expect("server addr");
+            *server_addr_inner.lock().unwrap() = Some(addr);
+
+            // Record each background handshake the client's map asks for, in place of the
+            // handshake client that registers this callback outside the simulation.
+            let client_map = lookup_sim_map(client.data_addr()).expect("client map");
+            let requests = requests_inner.clone();
+            let record = move |peer: SocketAddr, reason: HandshakeReason| {
+                requests.lock().unwrap().push((peer, reason));
+                None::<tokio::task::JoinHandle<()>>
+            };
+            client_map.register_request_handshake(Box::new(record));
+
+            // From here on, nothing the server sends reaches the client.
+            drop_server.store(true, Ordering::Relaxed);
+
+            let stream = client
+                .connect(format!("server:{SERVER_PORT}"), acceptor_id)
+                .await
+                .expect("connect 2");
+            let (_reader, mut writer) = stream.into_split();
+            let mut ping = Bytes::from_static(b"ping");
+            let _ = timeout(5.s(), writer.write_all_from_fin(&mut ping)).await;
+
+            // Wait for the idle wheel to expire the stream's send context with its packets
+            // unacknowledged, which marks the server dead.
+            180.s().sleep().await;
+        }
+        .group("client")
+        .primary()
+        .spawn();
+    });
+
+    let server_addr = server_addr
+        .lock()
+        .unwrap()
+        .expect("the client looked up the server");
+    let requests = requests.lock().unwrap();
+    let is_remote_request = |(peer, reason): &(SocketAddr, HandshakeReason)| {
+        *peer == server_addr && matches!(reason, HandshakeReason::Remote)
+    };
+    assert!(
+        requests.iter().any(is_remote_request),
+        "the client didn't ask for a background handshake with the server it marked dead: \
+         {requests:?}"
+    );
+}
+
 /// Reproduces a bug where QueueFree frames in-flight during peer-dead invalidation
 /// are silently dropped, permanently leaking peer queue slots.
 ///
@@ -3009,6 +3325,499 @@ fn stale_key_detected_after_recv_cache_eviction() {
         .primary()
         .spawn();
     });
+}
+
+/// Reproduces a client that loses its receive context for a server's key while the server keeps
+/// sending on that key, with every notice that would recover it lost on the way.
+///
+/// The client's entry has a 1 s idle timeout and the server's an hour, so once the first stream
+/// is done, the client's receive idle wheel drops its receive context for the server's key, while
+/// the server keeps its send context and the key id it seals with. Each later packet from the
+/// server misses the client's receive cache, its key id is already in the client's replay window,
+/// and the client rejects it and answers with a replay or stale-key notice. The network monitor
+/// drops each such notice, in either direction, and passes every other packet. The server never
+/// moves to a new key, so the client rejects everything it sends: the client's flows go
+/// unanswered, its send idle wheel marks the server dead, and connects are refused in the
+/// dead-peer cooldown window. Only an entry for a new path secret gets the client out.
+///
+/// Each endpoint has one send socket, so the server holds one send context for the entry. With
+/// more, the server sends a later stream from a socket that has no context yet, that context seals
+/// with a new key id, and the client accepts it, so the client recovers on the old entry.
+#[test]
+fn recv_eviction_with_lost_replay_notices_recovers() {
+    use crate::{
+        endpoint::testing::sim::{lookup_sim_map, packet_tag, SimEndpointConfig},
+        packet::Tag,
+        path::secret::map::Entry,
+    };
+    use s2n_quic_core::dc::testing::TEST_APPLICATION_PARAMS;
+    use std::{num::NonZeroU32, sync::Mutex};
+
+    let _no_snap = crate::testing::without_snapshots();
+    let dropped_notices = Arc::new(AtomicUsize::new(0));
+    let dropped_notices_inner = dropped_notices.clone();
+    let cooldown_refusals = Arc::new(AtomicUsize::new(0));
+    let cooldown_refusals_inner = cooldown_refusals.clone();
+    // The time from the break to the first completed stream, and whether that stream used a new
+    // entry.
+    let recovered_after: Arc<Mutex<Option<(Duration, bool)>>> = Default::default();
+
+    // One send socket and one worker of each kind.
+    fn one_socket() -> SimEndpointConfig {
+        SimEndpointConfig {
+            num_send_sockets: 1,
+            num_recv_sockets: 1,
+            num_recv_io_workers: 1,
+            num_send_workers: 1,
+            num_recv_dispatch_workers: 1,
+            ..Default::default()
+        }
+    }
+    let recovered_after_inner = recovered_after.clone();
+
+    sim(|| {
+        let acceptor_id = VarInt::from_u8(1);
+
+        // Drop every replay and stale-key notice, decided by the packet's tag, and pass every
+        // other packet.
+        bach::net::monitor::on_packet_sent(move |packet| {
+            if matches!(
+                packet_tag(packet),
+                Some(Tag::ReplayDetected(_) | Tag::StaleKey(_))
+            ) {
+                dropped_notices_inner.fetch_add(1, Ordering::Relaxed);
+                return bach::net::monitor::Command::Drop;
+            }
+            bach::net::monitor::Command::Pass
+        });
+
+        // Server: echo each stream back.
+        async move {
+            let server = Server::with_config(one_socket());
+            let mut acceptor = server
+                .register_acceptor_channel(acceptor_id, 64)
+                .expect("acceptor registration");
+
+            while let Some(stream) = acceptor.recv().await {
+                async move {
+                    let (mut reader, mut writer) = stream.into_split();
+                    let mut buf = BytesMut::with_capacity(16);
+                    loop {
+                        match reader.read_into(&mut buf).await {
+                            Ok(0) => break,
+                            Ok(_) => {}
+                            Err(_) => return,
+                        }
+                    }
+                    let mut echo = buf.freeze();
+                    let _ = writer.write_all_from_fin(&mut echo).await;
+                }
+                .spawn();
+            }
+        }
+        .group("server")
+        .spawn();
+
+        // Client (primary).
+        async move {
+            let mut client = Client::with_config(one_socket());
+            // Yield so the server group has a chance to bind its socket.
+            bach::task::yield_now().await;
+
+            let server_addr = bach::net::lookup_host(format!("server:{SERVER_PORT}"))
+                .await
+                .expect("lookup")
+                .next()
+                .expect("server addr");
+            let client_addr = client.data_addr();
+            let client_map = lookup_sim_map(client_addr).expect("client map");
+            let server_map = lookup_sim_map(server_addr).expect("server map");
+
+            // The client's entry expires its contexts after 1 s of silence. The server's entry
+            // keeps its send context, and the key id that context seals with, for the whole test.
+            let mut client_params = TEST_APPLICATION_PARAMS;
+            client_params.max_idle_timeout = NonZeroU32::new(1_000);
+            client_params.remote_max_data = client_params.local_recv_max_data;
+            let mut server_params = TEST_APPLICATION_PARAMS;
+            server_params.max_idle_timeout = NonZeroU32::new(3_600_000);
+            server_params.remote_max_data = server_params.local_recv_max_data;
+            client_map.test_insert_pair(
+                Entry::builder(server_addr)
+                    .local(client_addr)
+                    .params(client_params),
+                &server_map,
+                Entry::builder(client_addr)
+                    .local(server_addr)
+                    .params(server_params),
+            );
+
+            // A first stream works on the inserted entry.
+            let stream = client
+                .connect(format!("server:{SERVER_PORT}"), acceptor_id)
+                .await
+                .expect("connect 1");
+            let (mut reader, mut writer) = stream.into_split();
+            let mut ping = Bytes::from_static(b"ping");
+            writer.write_all_from_fin(&mut ping).await.expect("write 1");
+            let mut buf = BytesMut::with_capacity(16);
+            loop {
+                if reader.read_into(&mut buf).await.expect("read 1") == 0 {
+                    break;
+                }
+            }
+            assert_eq!(&buf[..], b"ping");
+            drop(reader);
+            drop(writer);
+
+            let old_entry = client_map
+                .get_raw(server_addr)
+                .expect("entry after the first stream");
+            let old_id = *old_entry.id();
+
+            // After 3 s the client's receive idle wheel has dropped its receive context for the
+            // server's key, while the server's send context still seals with that key.
+            3.s().sleep().await;
+            let broke_at = client_map.entry_age(&old_entry);
+
+            // Keep opening streams, as a busy caller would, for at least five minutes.
+            for _ in 0..300 {
+                let peer = format!("server:{SERVER_PORT}");
+                let connect = client.connect(peer, acceptor_id);
+                let stream = match timeout(5.s(), connect).await {
+                    Ok(Ok(stream)) => stream,
+                    Ok(Err(error)) => {
+                        // Refused in the dead-peer cooldown window.
+                        if error.kind() == io::ErrorKind::TimedOut {
+                            cooldown_refusals_inner.fetch_add(1, Ordering::Relaxed);
+                        }
+                        1.s().sleep().await;
+                        continue;
+                    }
+                    Err(_) => {
+                        // Still waiting for a queue slot.
+                        1.s().sleep().await;
+                        continue;
+                    }
+                };
+                let (mut reader, mut writer) = stream.into_split();
+                let mut ping = Bytes::from_static(b"ping");
+                if !matches!(
+                    timeout(5.s(), writer.write_all_from_fin(&mut ping)).await,
+                    Ok(Ok(_))
+                ) {
+                    continue;
+                }
+                let mut buf = BytesMut::with_capacity(16);
+                let done = loop {
+                    match timeout(5.s(), reader.read_into(&mut buf)).await {
+                        Ok(Ok(0)) => break true,
+                        Ok(Ok(_)) => {}
+                        _ => break false,
+                    }
+                };
+                if done && &buf[..] == b"ping" {
+                    let new_id = *client_map
+                        .get_raw(server_addr)
+                        .expect("entry after recovery")
+                        .id();
+                    let elapsed = client_map.entry_age(&old_entry) - broke_at;
+                    *recovered_after_inner.lock().unwrap() = Some((elapsed, new_id != old_id));
+                    break;
+                }
+            }
+        }
+        .group("client")
+        .primary()
+        .spawn();
+    });
+
+    // The server's packets reached the client on the old key and the client answered them with
+    // notices, which the monitor dropped.
+    assert!(
+        dropped_notices.load(Ordering::Relaxed) > 0,
+        "the client never answered the server's packets with a replay or stale-key notice, so the \
+         test didn't reproduce the loss of the client's receive context"
+    );
+    // The client's flows went unanswered, so its send idle wheel marked the server dead.
+    assert!(
+        cooldown_refusals.load(Ordering::Relaxed) > 0,
+        "no connect was refused in the dead-peer cooldown window, so the client never marked the \
+         server dead"
+    );
+    let recovered_after = *recovered_after.lock().unwrap();
+    assert!(
+        recovered_after.is_some(),
+        "the client never completed a stream to a healthy server after it lost its receive \
+         context for the server's key and every replay and stale-key notice was dropped: only an \
+         authenticated packet clears the dead-peer mark, and the server keeps sealing with the \
+         key the client rejects, so the client stays in the dead-cooldown loop for as long as it \
+         keeps the entry"
+    );
+    let (recovered_after, fresh_entry) = recovered_after.unwrap();
+    assert!(
+        fresh_entry,
+        "a stream completed on the old entry, so the server moved off the key the client rejects \
+         without any notice: the test didn't reproduce the client's stuck state"
+    );
+    let bound = crate::stream::endpoint::DEFAULT_IDLE_TIMEOUT * 3;
+    assert!(
+        recovered_after <= bound,
+        "the client completed a stream {recovered_after:?} after it lost its receive context, \
+         later than three idle timeouts ({bound:?})"
+    );
+}
+
+/// Reproduces a burst of the server's packets on a key that the client's receive cache dropped,
+/// with the client's UPS pacer far slower than the rejections arrive, and checks that the
+/// client's UPS queue holds at most one notice for each of the server's sender ids.
+///
+/// As in `recv_eviction_with_lost_replay_notices_recovers`, the client's entry has a 1 s idle
+/// timeout and the server's an hour, so once the first stream is done, the client's receive
+/// idle wheel drops its receive context for the server's key, while the server keeps its send
+/// context and the key id it seals with. The server answers the next stream with 64 KiB on that
+/// key, and the client rejects each of its packets and answers with a replay or stale-key
+/// notice. The client's pacer sends 200 bytes a second, about one notice each quarter second,
+/// with no burst allowance, so the rejections arrive far faster than it sends. The monitor
+/// passes every packet: the first notice moves the server to a new key, and the stream
+/// completes.
+///
+/// Each endpoint has one send socket, so each rejected packet carries the server's one
+/// credential and its one sender id. A task reads the depth of the client's `q.ups` queue each
+/// millisecond. Where each rejection queues a notice of its own, the depth grows with each
+/// rejection the pacer hasn't sent.
+#[test]
+fn burst_on_a_dropped_recv_key_queues_one_notice_per_sender_id() {
+    use crate::{
+        endpoint::testing::sim::{lookup_sim_map, packet_tag, SimEndpointConfig},
+        packet::Tag,
+        path::secret::map::Entry,
+        socket::rate::Rate,
+    };
+    use s2n_quic_core::dc::testing::TEST_APPLICATION_PARAMS;
+    use std::{num::NonZeroU32, sync::Mutex};
+
+    const RESPONSE_LEN: u64 = 64 * 1024;
+
+    let _no_snap = crate::testing::without_snapshots();
+    // The client's replay and stale-key notices sent since the client lost its receive context.
+    let notices = Arc::new(AtomicUsize::new(0));
+    let notices_inner = notices.clone();
+    // The server's packets sent since then and before the client's first notice: the server
+    // can't have moved to a new key by then, so the client rejects each of them.
+    let stale_packets = Arc::new(AtomicUsize::new(0));
+    let stale_packets_inner = stale_packets.clone();
+    // The most notices the client's UPS queue held at one time, read each millisecond.
+    let max_depth = Arc::new(AtomicUsize::new(0));
+    let max_depth_inner = max_depth.clone();
+    // Whether the stream after the break received its whole response.
+    let completed: Arc<Mutex<Option<bool>>> = Default::default();
+    let completed_inner = completed.clone();
+
+    // One send socket and one worker of each kind, so the server seals the next stream with the
+    // key the client dropped, from its one sender id.
+    fn one_socket() -> SimEndpointConfig {
+        SimEndpointConfig {
+            num_send_sockets: 1,
+            num_recv_sockets: 1,
+            num_recv_io_workers: 1,
+            num_send_workers: 1,
+            num_recv_dispatch_workers: 1,
+            ..Default::default()
+        }
+    }
+    // The server's sender ids that send on the dropped key: the client's queue may hold one
+    // notice for each of them.
+    let server_sender_ids = one_socket().num_send_sockets;
+
+    sim(|| {
+        let acceptor_id = VarInt::from_u8(1);
+        // Set once the client's receive context for the server's key is gone.
+        let broken = Arc::new(AtomicBool::new(false));
+
+        // Count the client's notices and the server's packets on the dropped key, and pass every
+        // packet.
+        {
+            let broken = broken.clone();
+            let mut client_host = MonitorHostAddr::new("client");
+            let mut server_host = MonitorHostAddr::new("server");
+            bach::net::monitor::on_packet_sent(move |packet| {
+                if !broken.load(Ordering::Relaxed) {
+                    return bach::net::monitor::Command::Pass;
+                }
+                let tag = packet_tag(packet);
+                if matches!(tag, Some(Tag::ReplayDetected(_) | Tag::StaleKey(_))) {
+                    if client_host.is_packet_source(packet) {
+                        notices_inner.fetch_add(1, Ordering::Relaxed);
+                    }
+                } else if matches!(tag, Some(Tag::Datagram(_)))
+                    && notices_inner.load(Ordering::Relaxed) == 0
+                    && server_host.is_packet_source(packet)
+                {
+                    stale_packets_inner.fetch_add(1, Ordering::Relaxed);
+                }
+                bach::net::monitor::Command::Pass
+            });
+        }
+
+        // Server: answer each stream with RESPONSE_LEN bytes once its request is in.
+        async move {
+            let server = Server::with_config(one_socket());
+            let mut acceptor = server
+                .register_acceptor_channel(acceptor_id, 8)
+                .expect("acceptor registration");
+
+            while let Some(stream) = acceptor.recv().await {
+                async move {
+                    let (mut reader, mut writer) = stream.into_split();
+                    let mut request = BytesMut::with_capacity(16);
+                    loop {
+                        match reader.read_into(&mut request).await {
+                            Ok(0) => break,
+                            Ok(_) => {}
+                            Err(_) => return,
+                        }
+                    }
+                    let mut response = Data::new(RESPONSE_LEN);
+                    let _ = writer.write_all_from_fin(&mut response).await;
+                }
+                .spawn();
+            }
+        }
+        .group("server")
+        .spawn();
+
+        // Client (primary).
+        async move {
+            // The client's UPS pacer sends 200 bytes a second, about one notice each quarter
+            // second, with no burst allowance.
+            let mut client = Client::with_config(SimEndpointConfig {
+                ups_rate: Rate::new(200.0 * 8.0 / 1e9).with_burst_bytes(0),
+                ..one_socket()
+            });
+            // Yield so the server group has a chance to bind its socket.
+            bach::task::yield_now().await;
+
+            let server_addr = bach::net::lookup_host(format!("server:{SERVER_PORT}"))
+                .await
+                .expect("lookup")
+                .next()
+                .expect("server addr");
+            let client_addr = client.data_addr();
+            let client_map = lookup_sim_map(client_addr).expect("client map");
+            let server_map = lookup_sim_map(server_addr).expect("server map");
+
+            // The client's entry expires its contexts after 1 s of silence. The server's entry
+            // keeps its send context, and the key id that context seals with, for the whole test.
+            let mut client_params = TEST_APPLICATION_PARAMS;
+            client_params.max_idle_timeout = NonZeroU32::new(1_000);
+            client_params.remote_max_data = client_params.local_recv_max_data;
+            let mut server_params = TEST_APPLICATION_PARAMS;
+            server_params.max_idle_timeout = NonZeroU32::new(3_600_000);
+            server_params.remote_max_data = server_params.local_recv_max_data;
+            client_map.test_insert_pair(
+                Entry::builder(server_addr)
+                    .local(client_addr)
+                    .params(client_params),
+                &server_map,
+                Entry::builder(client_addr)
+                    .local(server_addr)
+                    .params(server_params),
+            );
+
+            // A first stream works on the inserted entry.
+            let stream = client
+                .connect(format!("server:{SERVER_PORT}"), acceptor_id)
+                .await
+                .expect("connect 1");
+            let (mut reader, mut writer) = stream.into_split();
+            let mut ping = Bytes::from_static(b"ping");
+            writer.write_all_from_fin(&mut ping).await.expect("write 1");
+            let mut response = Data::new(RESPONSE_LEN);
+            loop {
+                if reader.read_into(&mut response).await.expect("read 1") == 0 {
+                    break;
+                }
+            }
+            assert!(response.is_finished(), "response 1 was cut");
+            drop(reader);
+            drop(writer);
+
+            // After 3 s the client's receive idle wheel has dropped its receive context for the
+            // server's key, while the server's send context still seals with that key.
+            3.s().sleep().await;
+            broken.store(true, Ordering::Relaxed);
+
+            // Read the depth of the client's UPS queue each millisecond until the next stream is
+            // done.
+            let ups_queue = client.counters().register_queue_gauge("q.ups");
+            let sampling = Arc::new(AtomicBool::new(true));
+            {
+                let sampling = sampling.clone();
+                async move {
+                    while sampling.load(Ordering::Relaxed) {
+                        let depth = ups_queue.depth.get().max(0) as usize;
+                        max_depth_inner.fetch_max(depth, Ordering::Relaxed);
+                        1.ms().sleep().await;
+                    }
+                }
+                .spawn();
+            }
+
+            // The server answers the next stream on the dropped key, and the client rejects each
+            // of its packets until the first notice moves the server to a new key.
+            let next = async {
+                let peer = format!("server:{SERVER_PORT}");
+                let stream = client.connect(peer, acceptor_id).await.ok()?;
+                let (mut reader, mut writer) = stream.into_split();
+                let mut ping = Bytes::from_static(b"ping");
+                writer.write_all_from_fin(&mut ping).await.ok()?;
+                let mut response = Data::new(RESPONSE_LEN);
+                loop {
+                    if reader.read_into(&mut response).await.ok()? == 0 {
+                        break;
+                    }
+                }
+                Some(response.is_finished())
+            };
+            let finished = timeout(10.s(), next).await.ok().flatten();
+            sampling.store(false, Ordering::Relaxed);
+            *completed_inner.lock().unwrap() = finished;
+        }
+        .group("client")
+        .primary()
+        .spawn();
+    });
+
+    // The server's packets reached the client on the dropped key, and the client answered them
+    // with notices.
+    let notices = notices.load(Ordering::Relaxed);
+    assert!(
+        notices > 0,
+        "the client never answered the server's packets with a replay or stale-key notice, so \
+         the test didn't reproduce the loss of the client's receive context"
+    );
+    // Before its first wait ends, the pacer removes at most two notices from the queue: the one
+    // it sends and the one it holds. Each later rejection waits in the queue.
+    let stale_packets = stale_packets.load(Ordering::Relaxed);
+    assert!(
+        stale_packets > server_sender_ids + 2,
+        "the server sent {stale_packets} packets on the dropped key before the client's first \
+         notice, too few for the queue to hold more than {server_sender_ids} notices behind the \
+         two its pacer removes first"
+    );
+    let max_depth = max_depth.load(Ordering::Relaxed);
+    assert!(
+        max_depth <= server_sender_ids,
+        "the client's UPS queue held {max_depth} notices at one time for the server's one \
+         credential and {server_sender_ids} sender id: each rejected packet queued a notice of \
+         its own"
+    );
+    let completed = *completed.lock().unwrap();
+    assert_eq!(
+        completed,
+        Some(true),
+        "the stream after the break didn't receive its whole response within 10 s"
+    );
 }
 
 // ── QueueMsg Integration Tests ─────────────────────────────────────────────

@@ -451,6 +451,34 @@ impl Entry {
         dead_at >= 0 && now_ms.saturating_sub(dead_at) < cooldown_ms
     }
 
+    /// Returns `true` when the entry is marked dead, the dead-peer `cooldown` has passed since the
+    /// mark, and the peer hasn't sent an authenticated packet for at least one idle timeout.
+    ///
+    /// Silence counts from the peer's last authenticated packet, or from the entry's creation
+    /// where the peer hasn't sent one yet. `age` is the time since the entry was created, read
+    /// from the clock of the map that holds it (`Map::entry_age`).
+    ///
+    /// Only an authenticated packet from the peer clears the dead mark
+    /// ([`touch_activity`](Self::touch_activity)), and every flow that goes unanswered marks it
+    /// again, so a peer whose cached path secret stops getting answers stays refused for as long
+    /// as the process keeps this entry. The callers that open flows treat this as the signal to
+    /// evict the entry and handshake again, which builds fresh keys, queue state and send and
+    /// receive contexts for the peer. Within the cooldown they keep refusing flows, as before.
+    #[inline]
+    pub fn is_dead_and_silent(
+        &self,
+        now: crate::time::precision::Timestamp,
+        age: Duration,
+        cooldown: Duration,
+    ) -> bool {
+        let dead = self.dead_at.load(Ordering::Acquire) >= 0;
+        if !dead || self.is_dead_during_cooldown(now, cooldown) {
+            return false;
+        }
+        let since_last_packet = Duration::from_nanos(now.nanos_since(self.last_activity()));
+        since_last_packet.min(age) >= self.idle_timeout()
+    }
+
     pub fn is_idle_expired(&self, now: crate::time::precision::Timestamp) -> bool {
         let last = self.last_activity();
         let elapsed = now.nanos_since(last);

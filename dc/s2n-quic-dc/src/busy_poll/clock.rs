@@ -28,6 +28,12 @@ impl Clock {
     pub fn new() -> Self {
         Self(epoch())
     }
+
+    /// A clock that counts from `start` in place of the process's shared epoch.
+    #[cfg(test)]
+    pub(crate) fn from_epoch(start: Instant) -> Self {
+        Self(start)
+    }
 }
 
 impl precision::Clock for Clock {
