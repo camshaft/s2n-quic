@@ -1654,6 +1654,7 @@ fn on_packet_dispatch_error(
         dispatch::Error::PeerStateLookup {
             dest_addr,
             credentials,
+            sender_id,
             control_out,
         } => {
             counters.rx_process_err_peer_lookup.add(1);
@@ -1661,6 +1662,11 @@ fn on_packet_dispatch_error(
                 let response = endpoint::ups::Response {
                     dest_addr,
                     packet: control_out,
+                    key: endpoint::ups::Key {
+                        credential_id: credentials.id,
+                        sender_id,
+                    },
+                    kind: endpoint::ups::Kind::UnknownPathSecret,
                 };
                 let _ = ups_tx.send(Entry::new(response));
             }
@@ -1694,14 +1700,23 @@ fn on_packet_dispatch_error(
         dispatch::Error::StaleKey {
             dest_addr,
             credentials,
+            sender_id,
             packet_number,
             control_out,
         } => {
             counters.rx_process_err_stale_key.add(1);
             if !control_out.is_empty() {
+                // In the endpoint `ups_tx` is a `ups::PendingSender`, which keeps one response
+                // in the queue for each credential and sender id, however many of the peer's
+                // packets on the key arrive before the pacer sends.
                 let response = endpoint::ups::Response {
                     dest_addr,
                     packet: control_out,
+                    key: endpoint::ups::Key {
+                        credential_id: credentials.id,
+                        sender_id,
+                    },
+                    kind: endpoint::ups::Kind::Rejection,
                 };
                 let _ = ups_tx.send(Entry::new(response));
             }
@@ -1826,14 +1841,25 @@ pub struct PeerDeadCounters {
     pub broadcasted: counter::Counter,
 }
 
-pub fn peer_dead_broadcast<R, WakerSink>(
+/// Resets the streams of each peer the send idle wheel marks dead, and, for a client path, asks
+/// for a handshake with the peer in the background through `request_rehandshake`.
+///
+/// The idle wheel marks a peer dead only when a send context expires with packets the peer never
+/// acknowledged, and a send context expires only once its path secret has also gone an idle
+/// timeout, to within the wheel's one-second tick, without a packet from the peer. A new
+/// handshake builds a new path secret and queue state for the peer, so the next connect uses
+/// them instead of the silent entry. `stream::Client::connect` still evicts a dead and silent
+/// entry on demand where no handshake has replaced it, such as after a failed one.
+pub fn peer_dead_broadcast<R, WakerSink, Rehandshake>(
     peer_dead_rx: R,
     mut waker_sink: WakerSink,
     counters: PeerDeadCounters,
+    mut request_rehandshake: Rehandshake,
 ) -> impl Receiver<()>
 where
     R: Receiver<Entry<PeerDead>>,
     WakerSink: UnboundedSender<crate::queue::AutoWake>,
+    Rehandshake: FnMut(std::net::SocketAddr),
 {
     use crate::{endpoint::error::IDLE_TIMEOUT, path::secret::map::entry::QueueState};
 
@@ -1846,6 +1872,8 @@ where
                 state.broadcast_reset(IDLE_TIMEOUT, &mut |aw| {
                     let _ = waker_sink.send(aw);
                 });
+                // Only a client handshakes, so only a client path asks for a new handshake.
+                request_rehandshake(*peer_dead.path_secret_entry.peer());
             }
             QueueState::Server(state) => {
                 state.broadcast_reset(IDLE_TIMEOUT, &mut |aw| {
