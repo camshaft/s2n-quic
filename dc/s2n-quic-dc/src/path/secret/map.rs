@@ -149,6 +149,18 @@ impl Map {
         self.store.register_request_handshake(cb);
     }
 
+    /// Asks the handshake client registered with
+    /// [`register_request_handshake`](Self::register_request_handshake), where one is, to
+    /// handshake with `peer` in the background, and returns that handshake's task. Returns `None`
+    /// where no client is registered, or where the client can't start the handshake.
+    pub(crate) fn request_handshake(
+        &self,
+        peer: SocketAddr,
+        reason: HandshakeReason,
+    ) -> Option<JoinHandle<()>> {
+        self.store.request_handshake(peer, reason)
+    }
+
     /// Get a clone of the local `DcPeerInfo` payload advertised to peers.
     pub fn advertised_peer_info(&self) -> Option<bytes::Bytes> {
         self.store.advertised_peer_info()
