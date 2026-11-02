@@ -21,7 +21,10 @@
 //! unmarked.
 
 use super::{AsRaw, Flags};
-use crate::msg::{addr::Addr, cmsg};
+use crate::{
+    msg::{addr::Addr, cmsg},
+    tracing::debug,
+};
 use core::{
     mem, ptr,
     sync::atomic::{AtomicBool, Ordering},
@@ -380,10 +383,12 @@ fn send_one(
     segment_size: u16,
     flags: Flags,
 ) -> io::Result<usize> {
-    let mut mark = ecn != ExplicitCongestionNotification::NotEct
+    let mark = ecn != ExplicitCongestionNotification::NotEct
         && !SEND_ECN_REFUSED.load(Ordering::Relaxed);
 
-    loop {
+    // One `WSASendMsg` call, with the ECN control message where `mark` is true: the bytes sent,
+    // or the Winsock error code.
+    let send_once = |mark: bool| -> Result<usize, i32> {
         let mut control = Control::<{ cmsg::ENCODER_LEN }>::default();
 
         let control_len = {
@@ -438,18 +443,75 @@ fn send_one(
             return Ok(sent as usize);
         }
 
-        let code = last_error_code();
+        Err(last_error_code())
+    };
 
-        // A Windows build that doesn't support ECN on sends refuses the control message with
-        // `WSAEINVAL`: send this datagram, and every later one, unmarked.
-        if mark && code == WinSock::WSAEINVAL as i32 {
-            SEND_ECN_REFUSED.store(true, Ordering::Relaxed);
-            mark = false;
-            continue;
-        }
+    send_with_ecn_fallback(mark, &SEND_ECN_REFUSED, send_once, |code| {
+        report_ecn_refused(socket, code)
+    })
+}
 
+/// Sends one datagram with `send_once`, which marks the datagram with its ECN control message
+/// where its argument is true, and returns the bytes sent or the Winsock error code.
+///
+/// A Windows build that doesn't support ECN on sends refuses the control message with
+/// `WSAEINVAL`, but a segmented send carries a `UDP_SEND_MSG_SIZE` message too, which the build
+/// can refuse with the same code. So a marked send that fails with `WSAEINVAL` goes out once more
+/// unmarked, and only where that send succeeds was the mark the message the build refused: then
+/// `refused` is set, so that later sends go out unmarked, and `on_refused` runs with the code,
+/// once, as `refused` changes from false to true. Every other failure, the unmarked resend's among
+/// them, returns its code and leaves `refused` as it is.
+#[inline]
+fn send_with_ecn_fallback(
+    mark: bool,
+    refused: &AtomicBool,
+    mut send_once: impl FnMut(bool) -> Result<usize, i32>,
+    on_refused: impl FnOnce(i32),
+) -> io::Result<usize> {
+    let code = match send_once(mark) {
+        Ok(sent) => return Ok(sent),
+        Err(code) => code,
+    };
+
+    if !mark || code != WinSock::WSAEINVAL as i32 {
         return Err(io::Error::from_raw_os_error(code));
     }
+
+    let sent = send_once(false).map_err(io::Error::from_raw_os_error)?;
+
+    if !refused.swap(true, Ordering::Relaxed) {
+        on_refused(code);
+    }
+
+    Ok(sent)
+}
+
+/// Records that the Windows build refused a send's ECN control message on `socket` with `code`,
+/// after which sends go out unmarked.
+#[cold]
+fn report_ecn_refused(socket: WinSock::SOCKET, code: i32) {
+    let local_addr = local_addr(socket);
+    debug!(
+        ?local_addr,
+        code,
+        "the Windows build refused a send's ECN marking; later sends go out unmarked"
+    );
+}
+
+/// The address `socket` is bound to.
+fn local_addr(socket: WinSock::SOCKET) -> io::Result<SocketAddress> {
+    let mut addr = Addr::default();
+    let mut len = addr.name_capacity() as i32;
+    // SAFETY: the name of `addr` is a writable buffer of `len` bytes, and `len` is a writable
+    // `i32`.
+    let res = unsafe { WinSock::getsockname(socket, addr.name_mut_ptr().cast(), &mut len) };
+
+    if res == WinSock::SOCKET_ERROR {
+        return Err(last_error());
+    }
+
+    addr.update_with_len(len as usize);
+    Ok(addr.get())
 }
 
 /// Returns the length of the next datagram without taking it off the socket.
@@ -487,7 +549,8 @@ where
     })
 }
 
-/// Set once a send's ECN control message is refused: later sends go out unmarked.
+/// Set once a marked send fails with `WSAEINVAL` and its unmarked resend succeeds: later sends
+/// go out unmarked.
 static SEND_ECN_REFUSED: AtomicBool = AtomicBool::new(false);
 
 /// Set once [`configure`] finds that the Windows build takes send segmentation
@@ -801,6 +864,137 @@ mod tests {
         if features.ecn.is_enabled() && !SEND_ECN_REFUSED.load(Ordering::Relaxed) {
             assert_eq!(cmsg.ecn(), ExplicitCongestionNotification::Ect0);
         }
+    }
+
+    const WSAEINVAL: i32 = WinSock::WSAEINVAL as i32;
+    const WSAENETUNREACH: i32 = WinSock::WSAENETUNREACH as i32;
+
+    /// Runs `send_with_ecn_fallback` over sends that answer `answers` in turn, with the flag
+    /// starting at `refused`, and returns its result, the mark of each send it made, the flag it
+    /// left, and each code it reported.
+    fn fallback(
+        mark: bool,
+        refused: bool,
+        answers: &[Result<usize, i32>],
+    ) -> (io::Result<usize>, Vec<bool>, bool, Vec<i32>) {
+        let flag = AtomicBool::new(refused);
+        let mut marks = vec![];
+        let mut reported = vec![];
+        let mut answers = answers.iter().copied();
+        let result = send_with_ecn_fallback(
+            mark,
+            &flag,
+            |mark| {
+                marks.push(mark);
+                answers.next().expect("a send past the answers")
+            },
+            |code| reported.push(code),
+        );
+        (result, marks, flag.load(Ordering::Relaxed), reported)
+    }
+
+    /// A marked send that fails with `WSAEINVAL` goes out again unmarked, and where that send
+    /// succeeds, the flag is set and the code reported.
+    #[test]
+    fn a_refused_mark_resends_unmarked_and_sets_the_flag() {
+        let (result, marks, refused, reported) = fallback(true, false, &[Err(WSAEINVAL), Ok(32)]);
+        assert_eq!(result.unwrap(), 32);
+        assert_eq!(marks, [true, false]);
+        assert!(refused);
+        assert_eq!(reported, [WSAEINVAL]);
+    }
+
+    /// Where the flag is set already, as by a send on another socket, a refused mark still goes
+    /// out again unmarked, and the refusal isn't reported a second time.
+    #[test]
+    fn a_refusal_is_reported_once() {
+        let (result, marks, refused, reported) = fallback(true, true, &[Err(WSAEINVAL), Ok(32)]);
+        assert_eq!(result.unwrap(), 32);
+        assert_eq!(marks, [true, false]);
+        assert!(refused);
+        assert!(reported.is_empty());
+    }
+
+    /// Where the unmarked resend fails too, as where the build refuses the send's
+    /// `UDP_SEND_MSG_SIZE` message, the mark wasn't the cause: the resend's code comes back and
+    /// the flag stays unset.
+    #[test]
+    fn a_failed_resend_returns_its_code_and_leaves_the_flag() {
+        for code in [WSAEINVAL, WSAENETUNREACH] {
+            let (result, marks, refused, reported) =
+                fallback(true, false, &[Err(WSAEINVAL), Err(code)]);
+            assert_eq!(result.unwrap_err().raw_os_error(), Some(code));
+            assert_eq!(marks, [true, false]);
+            assert!(!refused);
+            assert!(reported.is_empty());
+        }
+    }
+
+    /// A send that succeeds, `WSAEINVAL` on an unmarked send, and any other code each return
+    /// after one send, and leave the flag unset.
+    #[test]
+    fn every_other_outcome_sends_once() {
+        for mark in [true, false] {
+            let (result, marks, refused, reported) = fallback(mark, false, &[Ok(32)]);
+            assert_eq!(result.unwrap(), 32);
+            assert_eq!(marks, [mark]);
+            assert!(!refused);
+            assert!(reported.is_empty());
+        }
+
+        for (mark, code) in [(false, WSAEINVAL), (true, WSAENETUNREACH), (false, WSAENETUNREACH)] {
+            let (result, marks, refused, reported) = fallback(mark, false, &[Err(code)]);
+            assert_eq!(result.unwrap_err().raw_os_error(), Some(code));
+            assert_eq!(marks, [mark]);
+            assert!(!refused);
+            assert!(reported.is_empty());
+        }
+    }
+
+    /// `local_addr` reads the address a socket is bound to.
+    #[test]
+    fn local_addr_reads_the_bound_address() {
+        for local in ["127.0.0.1:0", "[::1]:0"] {
+            let socket = UdpSocket::bind(local).unwrap();
+            let expected: SocketAddress = socket.local_addr().unwrap().into();
+            let raw = socket.as_raw() as WinSock::SOCKET;
+            assert_eq!(local_addr(raw).unwrap(), expected);
+        }
+    }
+
+    /// The event of a refused mark holds the socket's local address and the error code.
+    #[test]
+    fn a_refusal_event_holds_the_local_address_and_the_code() {
+        #[derive(Clone, Default)]
+        struct Captured(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+        impl io::Write for Captured {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let local: SocketAddress = socket.local_addr().unwrap().into();
+        let raw = socket.as_raw() as WinSock::SOCKET;
+        let captured = Captured::default();
+        let writer = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(::tracing::Level::DEBUG)
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+
+        ::tracing::subscriber::with_default(subscriber, || report_ecn_refused(raw, WSAEINVAL));
+
+        let output = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+        assert!(output.contains(&format!("local_addr=Ok({local:?})")), "{output}");
+        assert!(output.contains(&format!("code={WSAEINVAL}")), "{output}");
     }
 
     /// `peek` reports the length of the next datagram and leaves it on the socket.
