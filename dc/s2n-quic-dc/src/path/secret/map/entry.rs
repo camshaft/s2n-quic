@@ -72,7 +72,8 @@ pub struct Entry {
     receiver: receiver::State,
     parameters: dc::ApplicationParams,
     // we store this as a u8 to allow the cleaner to separately "take" accessed for id and addr
-    // maps while not having two writes and wasting an extra byte of space.
+    // maps, and for a packet that authenticated, while not having two writes and wasting an extra
+    // byte of space.
     accessed: AtomicU8,
     application_data: Option<ApplicationData>,
     last_activity: AtomicU64,
@@ -384,6 +385,18 @@ impl Entry {
 
     pub fn take_accessed_addr(&self) -> bool {
         self.accessed.fetch_and(!0b01, Ordering::Relaxed) & 0b01 != 0
+    }
+
+    /// Records that a packet on this entry opened and passed the replay check. Callers set it
+    /// only after the packet has opened: a lookup by id sets the id bit before then, so a sender
+    /// that only knows the id can set that bit, and only a sender that holds the entry's secret
+    /// can set this one.
+    pub fn set_accessed_authenticated(&self) {
+        self.accessed.fetch_or(0b100, Ordering::Relaxed);
+    }
+
+    pub fn take_accessed_authenticated(&self) -> bool {
+        self.accessed.fetch_and(!0b100, Ordering::Relaxed) & 0b100 != 0
     }
 
     pub fn retire(&self, at_epoch: u64) {
