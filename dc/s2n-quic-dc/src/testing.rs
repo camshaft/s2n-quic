@@ -181,7 +181,8 @@ pub fn init_tracing() {
         // Arm the frame/packet flight recorder for the duration of the test process. `record` keeps
         // the enable out of its hot path (the application owns it; production uses `BACKBEAT_ENABLE`),
         // so the crate's own tests enable it here, once.
-        backbeat::global::enable();
+        // Experiment, not for merge: leave the flight recorder off, to compare the memory.
+        // backbeat::global::enable();
 
         let default_level = if std::env::var("CI").is_ok() {
             tracing::Level::INFO
