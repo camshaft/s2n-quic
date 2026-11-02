@@ -7,7 +7,9 @@
 //! On expiry the callback re-checks PathSecretEntry.last_activity — if still idle, the
 //! context is evicted from the cache; if activity occurred, it is rescheduled.
 
-use super::helpers::{test_entry, test_frame, RecvContextBuilder, TestReceiverExt, WakeNowSender};
+use super::helpers::{
+    test_entry, test_frame, test_waker, RecvContextBuilder, TestReceiverExt, WakeNowSender,
+};
 use crate::{
     endpoint::{
         frame::{self, Frame},
@@ -40,6 +42,22 @@ fn setup_send() -> SetupSend {
 /// As `setup_send`, where `open` false closes the frame submission channel at once, so that it
 /// refuses each probe the drain submits.
 fn setup_send_with_frame_receiver(open: bool) -> SetupSend {
+    let (setup, frame_rx) = setup_send_and_frame_receiver();
+    if open {
+        async move {
+            let _frame_rx = frame_rx;
+            core::future::pending::<()>().await
+        }
+        .spawn();
+    } else {
+        drop(frame_rx);
+    }
+    setup
+}
+
+/// As `setup_send`, and returns the receiver of the frame submission channel, where the drain
+/// submits its probes of quiet paths, so that a test reads each probe it submits.
+fn setup_send_and_frame_receiver() -> (SetupSend, frame::SubmissionReceiver) {
     let registry = crate::counter::Registry::default();
     let clock = Clock::default();
     let send_caches: IdMap<LocalSendSocketId, _> = vec![Rc::new(RefCell::new(send::Cache::new(
@@ -61,15 +79,6 @@ fn setup_send_with_frame_receiver(open: bool) -> SetupSend {
     // The drain submits its probes of quiet paths here; nothing delivers them in these
     // tests, as for a peer that doesn't answer.
     let (frame_tx, frame_rx) = frame::submission_channel(1);
-    if open {
-        async move {
-            let _frame_rx = frame_rx;
-            core::future::pending::<()>().await
-        }
-        .spawn();
-    } else {
-        drop(frame_rx);
-    }
 
     tasks::send_idle_wheel_drain(
         idle_wheel_rx,
@@ -102,7 +111,7 @@ fn setup_send_with_frame_receiver(open: bool) -> SetupSend {
     );
     async move { peer_dead_broadcast_task.drain_budgeted(Some(32)).await }.spawn();
 
-    (send_caches, idle_wheel_tx, completed_rx, clock, registry)
+    ((send_caches, idle_wheel_tx, completed_rx, clock, registry), frame_rx)
 }
 
 #[test]
@@ -658,7 +667,8 @@ fn send_context_with_an_open_stream_arms_its_idle_check_at_half_the_idle_timeout
 fn send_idle_wheel_probes_an_invalidated_context_whose_open_stream_is_checked_on_time() {
     let _guard = crate::testing::without_snapshots();
     sim(|| {
-        let (send_caches, mut idle_wheel_tx, _completed_rx, clock, _registry) = setup_send();
+        let ((send_caches, mut idle_wheel_tx, _completed_rx, clock, _registry), mut frame_rx) =
+            setup_send_and_frame_receiver();
 
         let pse = test_entry();
         let start = precision::Clock::now(&clock);
@@ -705,6 +715,26 @@ fn send_idle_wheel_probes_an_invalidated_context_whose_open_stream_is_checked_on
             assert!(
                 ctx.borrow().idle_probe_for.is_some(),
                 "the idle wheel should probe an invalidated context's quiet path at its deadline"
+            );
+
+            // The probe is one Ping frame for the invalidated context's path, on the send
+            // worker's frame submission channel, as a live context's probe is.
+            let (waker, _wakes) = test_waker();
+            let mut cx = core::task::Context::from_waker(&waker);
+            let mut submitted = frame::PriorityStorage::default();
+            assert!(
+                matches!(
+                    frame_rx.poll_swap(&mut cx, &mut submitted),
+                    core::task::Poll::Ready(Some(()))
+                ),
+                "the invalidated context's probe should go out on the frame submission channel"
+            );
+            let probes: Vec<&Frame> = submitted.iter().collect();
+            assert_eq!(probes.len(), 1, "the quiet period should be probed once");
+            assert_eq!(probes[0].header, frame::Header::Ping);
+            assert!(
+                std::sync::Arc::ptr_eq(&probes[0].path_secret_entry, &pse),
+                "the probe should carry the path's entry"
             );
             let now = precision::Clock::now(&Clock::default());
             assert!(
