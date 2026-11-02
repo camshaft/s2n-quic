@@ -89,3 +89,33 @@ impl<T> From<half::Error<T>> for Error<T> {
         }
     }
 }
+
+/// A stream reset that this side owes its peer, by the routing of the stream's frames: their
+/// queue pair as this side sends them, and the stream's binding.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct OwedReset {
+    pub queue_pair: crate::packet::datagram::QueuePair,
+    pub binding_id: s2n_quic_core::varint::VarInt,
+}
+
+/// The streams whose frames this side failed when it found its peer unresponsive and marked it
+/// dead, kept on the path's queue state. The peer isn't told that this side reset them, so its
+/// end of each may still wait on this side: each is reset once a packet from the peer clears the
+/// dead mark (`path::secret::map::Entry::touch_activity`). Each stream is kept once, so the set
+/// holds at most the streams whose frames failed.
+#[derive(Debug, Default)]
+pub struct OwedResets {
+    streams: std::sync::Mutex<std::collections::HashSet<OwedReset>>,
+}
+
+impl OwedResets {
+    /// Adds each of `resets` that isn't owed already.
+    pub fn record(&self, resets: impl IntoIterator<Item = OwedReset>) {
+        self.streams.lock().unwrap().extend(resets);
+    }
+
+    /// Takes every owed reset.
+    pub fn take(&self) -> Vec<OwedReset> {
+        self.streams.lock().unwrap().drain().collect()
+    }
+}
