@@ -598,6 +598,41 @@ pub struct QueueGauge {
     pub depth_distribution: Summary,
 }
 
+/// A [`QueueGauge`]'s metric handles, as [`Registry`] caches them by queue name. The cache leaves
+/// out the gauge's [`Registry`] handle: that handle holds the cache, so a cached gauge would keep
+/// its registry, and every metric registered through it, alive after the last other handle drops.
+#[derive(Clone)]
+struct CachedQueueGauge {
+    key: String,
+    throughput: Counter,
+    drain: Counter,
+    depth: Gauge,
+    depth_distribution: Summary,
+}
+
+impl CachedQueueGauge {
+    fn new(gauge: &QueueGauge) -> Self {
+        Self {
+            key: gauge.key.clone(),
+            throughput: gauge.throughput.clone(),
+            drain: gauge.drain.clone(),
+            depth: gauge.depth.clone(),
+            depth_distribution: gauge.depth_distribution.clone(),
+        }
+    }
+
+    fn gauge(&self, registry: &Registry) -> QueueGauge {
+        QueueGauge {
+            registry: registry.clone(),
+            key: self.key.clone(),
+            throughput: self.throughput.clone(),
+            drain: self.drain.clone(),
+            depth: self.depth.clone(),
+            depth_distribution: self.depth_distribution.clone(),
+        }
+    }
+}
+
 #[derive(Clone, Default)]
 struct QueueRegistrationMetadata {
     label: String,
@@ -1343,7 +1378,7 @@ impl ChannelBinding {
 #[derive(Clone, Default)]
 pub struct Registry {
     inner: s2n_quic_dc_metrics::Registry,
-    queue_gauges: Arc<Mutex<HashMap<String, QueueGauge>>>,
+    queue_gauges: Arc<Mutex<HashMap<String, CachedQueueGauge>>>,
     queue_metadata: Arc<Mutex<HashMap<String, QueueRegistrationMetadata>>>,
     queue_endpoint_metadata: Arc<Mutex<HashMap<MetricId, QueueEndpointMetadata>>>,
     metric_metadata: Arc<Mutex<HashMap<MetricId, MetricMetadata>>>,
@@ -2215,7 +2250,7 @@ impl Registry {
         let label = label.to_string();
         let mut gauges = self.queue_gauges.lock().unwrap();
         if let Some(existing) = gauges.get(&label) {
-            return existing.clone();
+            return existing.gauge(self);
         }
 
         let enqueued_id = self.register_metric_metadata(
@@ -2294,7 +2329,7 @@ impl Registry {
         });
         self.register_channel_topology(registration);
 
-        gauges.insert(label, gauge.clone());
+        gauges.insert(label, CachedQueueGauge::new(&gauge));
         gauge
     }
 
@@ -2308,7 +2343,7 @@ impl Registry {
         let key = format!("{label}.{variant}");
         let mut gauges = self.queue_gauges.lock().unwrap();
         if let Some(existing) = gauges.get(&key) {
-            return existing.clone();
+            return existing.gauge(self);
         }
 
         // Raw `variant` stays in the dc metadata (topology/trace display); the metrics crate records
@@ -2392,7 +2427,7 @@ impl Registry {
         });
         self.register_channel_topology(registration);
 
-        gauges.insert(key, gauge.clone());
+        gauges.insert(key, CachedQueueGauge::new(&gauge));
         gauge
     }
 
@@ -2764,6 +2799,21 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A registry and its queue gauges drop together. Each `QueueGauge` holds a handle on its
+    /// registry, so a registry that cached whole gauges by name held itself alive, with every
+    /// metric registered through it.
+    #[test]
+    fn registry_with_queue_gauges_drops() {
+        let registry = Registry::new();
+        let gauge = registry.register_queue_gauge("q.plain");
+        let nominal = registry.register_queue_gauge_nominal("q.nominal", "send.worker.1");
+        // A second registration of the same queue answers from the cache.
+        let cached = registry.register_queue_gauge("q.plain");
+        let alive = Arc::downgrade(&registry.queue_gauges);
+        drop((registry, gauge, nominal, cached));
+        assert!(alive.upgrade().is_none(), "a dropped registry stayed alive");
+    }
 
     /// Every nominal dimension is emitted as a single `Variant|<value>` aggregation on the querylog
     /// line — the convention the querylog consumer expects for all variants — across counters,
