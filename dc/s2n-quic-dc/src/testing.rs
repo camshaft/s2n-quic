@@ -181,8 +181,7 @@ pub fn init_tracing() {
         // Arm the frame/packet flight recorder for the duration of the test process. `record` keeps
         // the enable out of its hot path (the application owns it; production uses `BACKBEAT_ENABLE`),
         // so the crate's own tests enable it here, once.
-        // Experiment, not for merge: leave the flight recorder off, to compare the memory.
-        // backbeat::global::enable();
+        backbeat::global::enable();
 
         let default_level = if std::env::var("CI").is_ok() {
             tracing::Level::INFO
@@ -321,11 +320,85 @@ pub fn sim(f: impl FnOnce()) {
 }
 
 fn run_sim(f: impl FnOnce()) {
+    // CI diagnostic, not for merge: one sim at a time, with its memory printed after it ends.
+    #[cfg(all(test, target_os = "linux"))]
+    let _sim_rss = sim_rss::Guard::enter();
+
     // 1ms RTT
     let net_delay = Duration::from_micros(500);
     let queues = bach::environment::net::queue::Fixed::default().with_net_latency(net_delay);
     let mut rt = bach::environment::default::Runtime::new().with_net_queues(Some(Box::new(queues)));
     rt.run(f);
+}
+
+/// CI diagnostic, not for merge: runs one sim at a time in the test process, and prints the
+/// process's resident memory before the sim, its peak during the sim, after the sim, and after
+/// `malloc_trim`, for each sim that moves it by 64 MiB or more.
+#[cfg(all(test, target_os = "linux"))]
+mod sim_rss {
+    use std::{
+        io::Write as _,
+        sync::{Mutex, MutexGuard},
+        time::Instant,
+    };
+
+    static LOCK: Mutex<()> = Mutex::new(());
+
+    fn status_kb(key: &str) -> u64 {
+        std::fs::read_to_string("/proc/self/status")
+            .unwrap_or_default()
+            .lines()
+            .find(|line| line.starts_with(key))
+            .and_then(|line| line.split_whitespace().nth(1))
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0)
+    }
+
+    pub struct Guard {
+        _lock: MutexGuard<'static, ()>,
+        before_kb: u64,
+        started: Instant,
+    }
+
+    impl Guard {
+        pub fn enter() -> Self {
+            let lock = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            // Writing 5 resets VmHWM to the current VmRSS, so the peak read at the end is this sim's.
+            let _ = std::fs::write("/proc/self/clear_refs", "5");
+            Self {
+                _lock: lock,
+                before_kb: status_kb("VmRSS:"),
+                started: Instant::now(),
+            }
+        }
+    }
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            let peak_kb = status_kb("VmHWM:");
+            let after_kb = status_kb("VmRSS:");
+            unsafe {
+                libc::malloc_trim(0);
+            }
+            let trimmed_kb = status_kb("VmRSS:");
+            const MIB_64: u64 = 64 * 1024;
+            let moved = peak_kb.saturating_sub(self.before_kb) >= MIB_64
+                || after_kb.saturating_sub(self.before_kb) >= MIB_64
+                || after_kb.saturating_sub(trimmed_kb) >= MIB_64;
+            if moved {
+                let name = std::thread::current()
+                    .name()
+                    .unwrap_or("unknown")
+                    .to_string();
+                let line = format!(
+                    "[sim-rss] test={name} secs={:.1} before_kB={} peak_kB={peak_kb} after_kB={after_kb} trimmed_kB={trimmed_kb}\n",
+                    self.started.elapsed().as_secs_f64(),
+                    self.before_kb,
+                );
+                let _ = std::io::stderr().write_all(line.as_bytes());
+            }
+        }
+    }
 }
 
 #[cfg(test)]
