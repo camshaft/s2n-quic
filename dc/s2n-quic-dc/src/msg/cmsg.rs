@@ -1,10 +1,16 @@
 // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+#[cfg(unix)]
 use libc::msghdr;
-use s2n_quic_core::{ensure, inet::ExplicitCongestionNotification};
-use s2n_quic_platform::{features, message::cmsg};
+#[cfg(unix)]
+use s2n_quic_core::ensure;
+use s2n_quic_core::inet::ExplicitCongestionNotification;
+use s2n_quic_platform::features;
+#[cfg(unix)]
+use s2n_quic_platform::message::cmsg;
 
+#[cfg(unix)]
 pub use cmsg::*;
 
 pub const ENCODER_LEN: usize = {
@@ -26,6 +32,7 @@ pub struct Receiver {
 }
 
 impl Receiver {
+    #[cfg(unix)]
     #[inline]
     pub fn with_msg(&mut self, msg: &msghdr) {
         // assume we didn't get a GRO cmsg initially
