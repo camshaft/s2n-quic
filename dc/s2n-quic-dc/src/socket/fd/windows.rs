@@ -962,39 +962,64 @@ mod tests {
         }
     }
 
-    /// The event of a refused mark holds the socket's local address and the error code.
+    /// The event of a refused mark holds the socket's local address and the error code, read from
+    /// the event's fields by a layer that records them.
     #[test]
     fn a_refusal_event_holds_the_local_address_and_the_code() {
-        #[derive(Clone, Default)]
-        struct Captured(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        use tracing_subscriber::layer::{Context, SubscriberExt};
 
-        impl io::Write for Captured {
-            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-                self.0.lock().unwrap().extend_from_slice(buf);
-                Ok(buf.len())
+        /// The fields of an event that the test checks: `local_addr` in its `Debug` form, and
+        /// `code`.
+        #[derive(Debug, Default, PartialEq)]
+        struct Fields {
+            local_addr: Option<String>,
+            code: Option<i64>,
+        }
+
+        impl ::tracing::field::Visit for Fields {
+            fn record_debug(
+                &mut self,
+                field: &::tracing::field::Field,
+                value: &dyn std::fmt::Debug,
+            ) {
+                if field.name() == "local_addr" {
+                    self.local_addr = Some(format!("{value:?}"));
+                }
             }
 
-            fn flush(&mut self) -> io::Result<()> {
-                Ok(())
+            fn record_i64(&mut self, field: &::tracing::field::Field, value: i64) {
+                if field.name() == "code" {
+                    self.code = Some(value);
+                }
+            }
+        }
+
+        /// A layer that keeps the fields of each event it receives.
+        #[derive(Clone, Default)]
+        struct Recorder(std::sync::Arc<std::sync::Mutex<Vec<Fields>>>);
+
+        impl<S: ::tracing::Subscriber> tracing_subscriber::Layer<S> for Recorder {
+            fn on_event(&self, event: &::tracing::Event<'_>, _ctx: Context<'_, S>) {
+                let mut fields = Fields::default();
+                event.record(&mut fields);
+                self.0.lock().unwrap().push(fields);
             }
         }
 
         let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
         let local: SocketAddress = socket.local_addr().unwrap().into();
         let raw = socket.as_raw() as WinSock::SOCKET;
-        let captured = Captured::default();
-        let writer = captured.clone();
-        let subscriber = tracing_subscriber::fmt()
-            .with_max_level(::tracing::Level::DEBUG)
-            .with_ansi(false)
-            .with_writer(move || writer.clone())
-            .finish();
+        let recorder = Recorder::default();
+        let subscriber = tracing_subscriber::registry().with(recorder.clone());
 
         ::tracing::subscriber::with_default(subscriber, || report_ecn_refused(raw, WSAEINVAL));
 
-        let output = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
-        assert!(output.contains(&format!("local_addr=Ok({local:?})")), "{output}");
-        assert!(output.contains(&format!("code={WSAEINVAL}")), "{output}");
+        let expected_addr: io::Result<SocketAddress> = Ok(local);
+        let expected = Fields {
+            local_addr: Some(format!("{expected_addr:?}")),
+            code: Some(i64::from(WSAEINVAL)),
+        };
+        assert_eq!(*recorder.0.lock().unwrap(), [expected]);
     }
 
     /// `peek` reports the length of the next datagram and leaves it on the socket.
