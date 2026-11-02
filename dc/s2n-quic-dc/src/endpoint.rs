@@ -699,10 +699,15 @@ where
 
     // UPS channel: recv_dispatch workers → background (UnknownPathSecret responses)
     // It carries the ReplayDetected and StaleKey responses too, and `ups::Pending` keeps at most
-    // one response in it for each credential and peer sender id.
+    // one response in it for each credential and peer sender id, and at most the bytes the UPS
+    // pacer sends in one burst of UnknownPathSecret responses.
     let (ups_tx, ups_rx) = intrusive::sync::new::<ups::Response>();
     let ups_queue_gauge = counter_registry.register_queue_gauge("q.ups");
-    let ups_pending = ups::Pending::new(counter_registry.register("ups.pending_suppressed"));
+    let ups_pending = ups::Pending::new(
+        counter_registry.register("ups.pending_suppressed"),
+        counter_registry.register("ups.unknown_dropped"),
+        ups_rate.burst_bytes(),
+    );
     let ups_tx = ups_pending.sender(GaugedSender::new(ups_tx, ups_queue_gauge.clone()));
     let ups_rx = ups_pending.receiver(ups_rx);
 
