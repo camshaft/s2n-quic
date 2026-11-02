@@ -568,6 +568,196 @@ fn reconnection(records: &[Record], schedule: &Schedule) -> Value {
     })
 }
 
+/// Runs the client's assertion, `check`, and its reconnection line on chosen streams, under a
+/// schedule whose drop runs from 1 s to 1.5 s and under the same schedule without a drop, so that
+/// each of their branches runs where no link loses packets or goes down.
+#[test]
+fn client_assertion() {
+    let schedule = Schedule {
+        loss_percent: 0.0,
+        drop_start: Duration::from_millis(1000),
+        drop_len: Duration::from_millis(500),
+    };
+    let without_drop = Schedule {
+        drop_len: Duration::ZERO,
+        ..schedule
+    };
+    let (ok, failed) = (true, false);
+
+    assert_check_fails(&[], &schedule, "the client ran zero streams");
+    let completed = client_records(&[(0, 100, ok), (1500, 1600, ok), (1600, 1700, ok)]);
+    assert_check_passes(&completed, &schedule);
+    assert_check_passes(&completed, &without_drop);
+
+    // A failed stream that ended before the drop's start, or at it, fails the client.
+    let before_drop = client_records(&[
+        (0, 100, ok),
+        (500, 600, failed),
+        (1500, 1600, ok),
+        (1600, 1700, ok),
+    ]);
+    assert_check_fails(
+        &before_drop,
+        &schedule,
+        "stream 1 failed under the scheduled loss",
+    );
+    let at_drop_start = client_records(&[
+        (0, 100, ok),
+        (900, 1000, failed),
+        (1500, 1600, ok),
+        (1600, 1700, ok),
+    ]);
+    assert_check_fails(
+        &at_drop_start,
+        &schedule,
+        "stream 1 failed under the scheduled loss",
+    );
+
+    // Failed streams that ended inside the drop, or that started in it and waited past its end,
+    // don't fail the client, and the reconnection line counts them.
+    let inside_drop = client_records(&[
+        (0, 100, ok),
+        (900, 1100, failed),
+        (1100, 1300, failed),
+        (1300, 2300, failed),
+        (2300, 2400, ok),
+        (2400, 2500, ok),
+    ]);
+    assert_check_passes(&inside_drop, &schedule);
+    assert_eq!(
+        reconnection(&inside_drop, &schedule),
+        json!({
+            "event": "reconnect",
+            "reconnected": true,
+            "stream": 4,
+            "failed_streams": 3,
+            "reconnected_ms": 2400,
+            "after_drop_end_ms": 900,
+        })
+    );
+
+    // Where no stream that started at or after the drop's end completed, the reconnection line
+    // says that the client didn't reconnect, and the client fails, though a stream that started
+    // before the drop's end completed.
+    let not_reconnected = client_records(&[
+        (0, 100, ok),
+        (1100, 1300, failed),
+        (1300, 1450, ok),
+        (1450, 2450, failed),
+        (2450, 2500, failed),
+    ]);
+    assert_eq!(
+        reconnection(&not_reconnected, &schedule),
+        json!({
+            "event": "reconnect",
+            "reconnected": false,
+            "stream": null,
+            "failed_streams": 3,
+            "reconnected_ms": null,
+            "after_drop_end_ms": null,
+        })
+    );
+    assert_check_fails(
+        &not_reconnected,
+        &schedule,
+        "the client didn't complete a stream that started after the link drop ended",
+    );
+
+    // A failed stream after the reconnection fails the client.
+    let failed_after = client_records(&[
+        (0, 100, ok),
+        (1100, 1300, failed),
+        (1500, 1600, ok),
+        (1600, 1700, failed),
+        (1700, 1800, ok),
+    ]);
+    assert_check_fails(
+        &failed_after,
+        &schedule,
+        "stream 3 failed after the reconnection",
+    );
+
+    // A reconnection that is the client's last stream fails the client; this one starts at the
+    // drop's end.
+    let reconnected_last = client_records(&[
+        (0, 100, ok),
+        (100, 200, ok),
+        (1100, 1300, failed),
+        (1500, 1600, ok),
+    ]);
+    assert_check_fails(
+        &reconnected_last,
+        &schedule,
+        "the run ended at the reconnection",
+    );
+
+    // Without a drop, each failed stream fails the client, those the drop would cover too.
+    assert_check_fails(
+        &inside_drop,
+        &without_drop,
+        "stream 1 failed under the scheduled loss",
+    );
+    let failed_last = client_records(&[(0, 100, ok), (1500, 1600, ok), (1600, 1700, failed)]);
+    assert_check_fails(
+        &failed_last,
+        &without_drop,
+        "stream 2 failed under the scheduled loss",
+    );
+}
+
+/// The client's records of streams that ran one after the other, each with its start and end in
+/// milliseconds from the client's start and whether it completed.
+fn client_records(streams: &[(u64, u64, bool)]) -> Vec<Record> {
+    streams
+        .iter()
+        .zip(0..)
+        .map(|(&(start, end, completed), index)| Record {
+            index,
+            start: Duration::from_millis(start),
+            end: Duration::from_millis(end),
+            result: if completed {
+                Ok(16384)
+            } else {
+                Err(io::Error::from(io::ErrorKind::TimedOut))
+            },
+        })
+        .collect()
+}
+
+/// The message of the panic with which `check` fails on `records` under `schedule`, or `None`
+/// where `check` passes.
+fn check_failure(records: &[Record], schedule: &Schedule) -> Option<String> {
+    let run = std::panic::AssertUnwindSafe(|| check(records, schedule));
+    let payload = std::panic::catch_unwind(run).err()?;
+    let message = if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else if let Some(message) = payload.downcast_ref::<&str>() {
+        String::from(*message)
+    } else {
+        String::from("a panic without a message")
+    };
+    Some(message)
+}
+
+/// Asserts that `check` fails on `records` under `schedule` with a message that starts with
+/// `expected`, so that each case fails on the assertion it is for.
+fn assert_check_fails(records: &[Record], schedule: &Schedule, expected: &str) {
+    let Some(message) = check_failure(records, schedule) else {
+        panic!("check passed instead of failing with {expected:?}");
+    };
+    assert!(
+        message.starts_with(expected),
+        "check failed with {message:?}, not with {expected:?}"
+    );
+}
+
+/// Asserts that `check` passes on `records` under `schedule`.
+fn assert_check_passes(records: &[Record], schedule: &Schedule) {
+    if let Some(message) = check_failure(records, schedule) {
+        panic!("check failed with {message:?}");
+    }
+}
+
 /// One stream's outcome, with its times from the start of the end that ran it.
 struct Record {
     index: u64,
