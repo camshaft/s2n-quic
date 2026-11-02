@@ -3843,3 +3843,60 @@ impl crate::credit::WakerSink for TestWakerSink {
         }
     }
 }
+
+/// Each writer records the peer's queue of its stream on the stream's slot as it is made, the
+/// client's writer and the server's, so that a reset of the stream that this side owes the peer
+/// once it marks the peer dead routes there.
+#[test]
+fn a_new_writer_records_the_peer_queue_of_its_stream_on_its_slot() {
+    for ep_type in [endpoint::Type::Client, endpoint::Type::Server] {
+        let peer: SocketAddr = "127.0.0.1:4433".parse().unwrap();
+        let path_secret_entry = PathSecretEntry::builder(peer)
+            .endpoint_type(ep_type)
+            .build(None);
+        let state = std::sync::Arc::new(crate::queue::ClientState::new(VarInt::from_u16(100), 0));
+        let dest_queue_id = VarInt::from_u8(42);
+        let alloc = state.alloc_local(dest_queue_id).unwrap();
+        let route = crate::queue::OwedReset {
+            queue_pair: crate::packet::datagram::QueuePair {
+                source_queue_id: alloc.local_queue_id,
+                dest_queue_id,
+            },
+            binding_id: alloc.binding_id,
+        };
+        assert!(
+            state.open_streams().is_empty(),
+            "the peer's queue is recorded once the writer is made"
+        );
+
+        let (frame_tx, _frame_rx) = frame::submission_channel(1);
+        let send_credit_pool =
+            crate::sync::Arc::new(crate::credit::Pool::new(crate::credit::Config::default()));
+        let writer = match ep_type {
+            endpoint::Type::Client => Writer::new_client(
+                frame_tx,
+                path_secret_entry,
+                dest_queue_id,
+                VarInt::from_u8(7),
+                alloc.control,
+                crate::time::DefaultClock::default(),
+                test_writer_metrics(),
+                send_credit_pool,
+                crate::credit::Priority::default(),
+            ),
+            endpoint::Type::Server => Writer::new_server(
+                frame_tx,
+                path_secret_entry,
+                dest_queue_id,
+                VarInt::from_u8(7),
+                alloc.control,
+                crate::time::DefaultClock::default(),
+                test_writer_metrics(),
+                send_credit_pool,
+                crate::credit::Priority::default(),
+            ),
+        };
+        assert_eq!(state.open_streams(), vec![route], "{ep_type:?}");
+        drop((writer, alloc.stream));
+    }
+}
