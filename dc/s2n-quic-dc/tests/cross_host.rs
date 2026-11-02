@@ -56,13 +56,11 @@ use s2n_quic::{
 };
 use s2n_quic_core::{crypto::tls::testing::certificates, varint::VarInt};
 use s2n_quic_dc::{
-    acceptor,
-    credit,
+    acceptor, credit,
     endpoint::{self, Budgets, Endpoint, RecvBackend, WorkerLayout},
     event,
     path::secret::{stateless_reset::Signer, Map},
-    psk,
-    runtime,
+    psk, runtime,
     socket::{pool::Pool, rate::Rate, LocalAddr},
     stream::{self, Priority, Stream},
 };
@@ -272,7 +270,9 @@ fn listening_addr(output: &mut impl BufRead) -> SocketAddr {
     let mut line = String::new();
     loop {
         line.clear();
-        let len = output.read_line(&mut line).expect("the server end's output");
+        let len = output
+            .read_line(&mut line)
+            .expect("the server end's output");
         assert!(len > 0, "the server end exited before it listened");
         let value: Value = match serde_json::from_str(line.trim()) {
             Ok(value) => value,
@@ -297,10 +297,17 @@ fn listening_addr_after_the_harness_output() {
         "data_addrs": ["127.0.0.1:4434"],
     });
     let expected: SocketAddr = "127.0.0.1:4433".parse().unwrap();
-    for harness in ["\nrunning 1 test\n", "\nrunning 1 test\ntest cross_host_end ... "] {
+    for harness in [
+        "\nrunning 1 test\n",
+        "\nrunning 1 test\ntest cross_host_end ... ",
+    ] {
         // The server end prints its line as `run_server` does.
         let output = format!("{harness}\n{listening}\n");
-        assert_eq!(listening_addr(&mut output.as_bytes()), expected, "{output:?}");
+        assert_eq!(
+            listening_addr(&mut output.as_bytes()),
+            expected,
+            "{output:?}"
+        );
     }
 }
 
