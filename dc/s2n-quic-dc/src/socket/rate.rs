@@ -47,6 +47,12 @@ impl Rate {
         self.burst_nanos
     }
 
+    /// Returns the burst capacity in bytes: the most bytes whose pacing cost fits in the
+    /// bucket's capacity, which the pacer sends at once after an idle period.
+    pub fn burst_bytes(&self) -> u64 {
+        (self.burst_nanos as f64 / self.nanos_per_byte) as u64
+    }
+
     /// Returns this rate with a burst allowance of `bytes` in place of the 64 KiB default. A
     /// test passes 0 so that its pacer waits after each send, the first one included.
     #[cfg(test)]
@@ -104,5 +110,21 @@ impl TokenBucket {
     /// Returns the current token balance in nanoseconds.
     pub fn tokens_nanos(&self) -> i64 {
         self.tokens_nanos
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `burst_bytes` is the most bytes whose pacing cost fits in the bucket's capacity.
+    #[test]
+    fn burst_bytes_is_the_most_that_fits_in_the_burst() {
+        for gigabits_per_second in [0.5, 1.0, 8.0] {
+            let rate = Rate::new(gigabits_per_second);
+            let bytes = rate.burst_bytes();
+            assert!(rate.nanos_for_bytes(bytes) <= rate.burst_nanos());
+            assert!(rate.nanos_for_bytes(bytes + 1) > rate.burst_nanos());
+        }
     }
 }
