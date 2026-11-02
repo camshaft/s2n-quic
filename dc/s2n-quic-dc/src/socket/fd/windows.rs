@@ -806,6 +806,27 @@ mod tests {
         assert_eq!(&received[..len], &next[..]);
     }
 
+    /// A datagram longer than a receive buffer of several slices fills the slices in order with its
+    /// first bytes, and the call returns the sum of the slices' lengths.
+    #[test]
+    fn recv_fills_each_slice_in_order_for_a_datagram_longer_than_the_buffer() {
+        let (a, b) = pair("127.0.0.1:0");
+        let payload: Vec<u8> = (0..3000u32).map(|i| i as u8).collect();
+        a.send_to(&payload, b.local_addr().unwrap()).unwrap();
+
+        let mut first = [0u8; 1000];
+        let mut second = [0u8; 500];
+        let mut addr = Addr::default();
+        let mut cmsg = cmsg::Receiver::default();
+        let len = {
+            let mut iov = [IoSliceMut::new(&mut first), IoSliceMut::new(&mut second)];
+            recv(&b, &mut addr, &mut cmsg, &mut iov, 0).unwrap()
+        };
+        assert_eq!(len, 1500);
+        assert_eq!(&first[..], &payload[..1000]);
+        assert_eq!(&second[..], &payload[1000..1500]);
+    }
+
     /// The decoder reads an ECN and a coalesced-size message, as a receive lays them out.
     #[test]
     fn decode_reads_ecn_and_coalesced_size() {
