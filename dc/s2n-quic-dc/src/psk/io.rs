@@ -858,7 +858,10 @@ mod tests {
         succeeded.handshaker.set(Ok(())).unwrap();
         queue.remove_completed(peer);
         assert!(
-            !Arc::ptr_eq(&succeeded, &queue.allocate_entry(peer, HandshakeReason::User)),
+            !Arc::ptr_eq(
+                &succeeded,
+                &queue.allocate_entry(peer, HandshakeReason::User)
+            ),
             "a successful handshake is no longer held"
         );
     }
