@@ -1181,11 +1181,13 @@ where
 /// an idle check that ran more than a wheel tick late.
 ///
 /// A context with no unacknowledged packet whose path has an open stream is probed with a Ping
-/// once in each quiet period, half an idle timeout into it, or at the idle deadline where its
-/// check was armed for the deadline, so that a peer that is reachable answers before the idle
-/// timeout decides. A path with an open stream whose idle check runs late, as where this side
-/// was suspended, marks the peer dead without a probe: the peer marks this side dead under the
-/// same rule by then. Probes go out on `frame_tx`.
+/// once in each quiet period, half an idle timeout into it, or within a wheel tick of the idle
+/// deadline where its check was armed for the deadline or the idle timeout is under two wheel
+/// ticks, so that a peer that is reachable answers before the idle timeout decides: a probe
+/// within a tick of the deadline is checked again half an idle timeout later, or a wheel tick
+/// later where that is longer. A path with an open stream whose idle check runs late, as where
+/// this side was suspended, marks the peer dead without a probe: the peer marks this side dead
+/// under the same rule by then. Probes go out on `frame_tx`.
 pub async fn send_idle_wheel_drain<Clk, WakerSink, AckComp>(
     rx: intrusive::unsync::Receiver<send::IdleWheelAdapter>,
     idle_wheel_tx: intrusive::unsync::Sender<send::IdleWheelAdapter>,
@@ -1279,16 +1281,21 @@ pub async fn send_idle_wheel_drain<Clk, WakerSink, AckComp>(
                 }
 
                 // An open stream whose quiet period wasn't probed yet, as where the path's first
-                // stream opened after its idle check was armed at the full idle timeout. Where the
-                // check runs on time, within a wheel tick of the idle deadline, probe the peer now
-                // and give the probe half an idle timeout to be answered before the idle timeout
-                // decides. Where it runs later than that, as after this side was suspended, the
+                // stream opened after its idle check was armed at the full idle timeout, or where
+                // the idle timeout is under two wheel ticks, so that the check half an idle
+                // timeout in can run within a tick of the deadline. Where the check runs on time,
+                // within a wheel tick of the idle deadline, probe the peer now and check again
+                // half an idle timeout later, or a wheel tick later where that is longer: a next
+                // check within this tick would run at once and mark the peer dead before it could
+                // answer. Where it runs later than that, as after this side was suspended, the
                 // peer has marked this side dead under the same rule by then: expire below.
                 let late = now.nanos_since(last_activity + idle_timeout)
                     >= wheel::SECOND_GRANULARITY_NANOS;
                 if wants_probe && !late {
                     drop(ctx);
-                    let mut target = now + idle_timeout / 2;
+                    let wait = (idle_timeout / 2)
+                        .max(core::time::Duration::from_nanos(wheel::SECOND_GRANULARITY_NANOS));
+                    let mut target = now + wait;
                     if !send_idle_probe(&context, last_activity, &mut frame_tx) {
                         let tick = wheel::SECOND_GRANULARITY_NANOS;
                         target = now + core::time::Duration::from_nanos(tick);
