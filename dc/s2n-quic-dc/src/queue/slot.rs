@@ -124,6 +124,11 @@ pub(crate) struct StreamState {
     /// reconciliation already accounted for the full advertised window — any
     /// late-arriving (but in-window) bytes would otherwise be released twice.
     pub(crate) recv_finished: bool,
+    /// The peer's queue for the stream of the slot's current binding: where this side sends the
+    /// stream's frames, and so where a reset of the stream that this side owes the peer goes
+    /// ([`Slot::owed_reset`]). The stream's writer records it as it is made
+    /// ([`Slot::set_peer_queue_id`]), and each new binding clears it ([`Self::clear`]).
+    pub(crate) peer_queue_id: Option<VarInt>,
 }
 
 impl StreamState {
@@ -133,6 +138,7 @@ impl StreamState {
         self.synth_signal_offset = 0;
         self.max_received_offset = 0;
         self.recv_finished = false;
+        self.peer_queue_id = None;
         // initial_window_remaining is reset by the caller on bind because the
         // value comes from configuration that lives outside the slot.
     }
@@ -246,6 +252,7 @@ impl Slot {
                 max_received_offset: 0,
                 initial_window_remaining: 0,
                 recv_finished: false,
+                peer_queue_id: None,
             }),
             control: Half::new(),
         }
@@ -830,6 +837,34 @@ impl Slot {
         (stream_wake, control_wake)
     }
 
+    /// Records `peer_queue_id`, the peer's queue for the stream this slot holds: where this side
+    /// sends the stream's frames, which a reset of the stream that this side owes the peer routes
+    /// to ([`Self::owed_reset`]). The holder of one of the slot's receivers calls it, so the slot
+    /// holds that receiver's binding; the next binding clears the record.
+    pub(crate) fn set_peer_queue_id(&self, peer_queue_id: VarInt) {
+        self.stream.inner.lock().extra.peer_queue_id = Some(peer_queue_id);
+    }
+
+    /// The stream this slot holds, as a reset of it that this side owes the peer routes: from
+    /// this slot to the peer's queue, with the stream's binding. `None` for a slot that doesn't
+    /// hold a binding, and for one whose peer queue isn't recorded yet.
+    pub(crate) fn owed_reset(&self) -> Option<super::OwedReset> {
+        let s = self.stream.inner.lock();
+        // The binding is written with both half locks held, so the stream lock is enough to read
+        // it together with the peer queue recorded for it.
+        let raw = self.binding_id.load(Ordering::Relaxed);
+        if raw & UNALLOCATED_BIT != 0 {
+            return None;
+        }
+        Some(super::OwedReset {
+            queue_pair: crate::packet::datagram::QueuePair {
+                source_queue_id: self.queue_id(),
+                dest_queue_id: s.extra.peer_queue_id?,
+            },
+            binding_id: VarInt::new(raw).ok()?,
+        })
+    }
+
     // ── Internal helpers ──────────────────────────────────────────────────────
 
     /// Store `binding_id` and set `HAS_RECEIVER` on both halves while both
@@ -1141,6 +1176,40 @@ mod tests {
         simulate_receiver_drop(&slot);
         let result = slot.bind_and_push_stream(v(6), make_stream_entry(), 0);
         assert!(matches!(result, Ok((BindState::NewBinding(_), _))));
+    }
+
+    /// A slot names the stream it holds, as a reset of it that this side owes the peer routes,
+    /// once the stream's writer records the peer's queue: it names none while it doesn't hold a
+    /// binding or before the record, and none once it is freed or bound again.
+    #[test]
+    fn owed_reset_names_the_held_stream_once_its_peer_queue_is_recorded() {
+        let slot = Slot::with_queue_id(v(3));
+        assert_eq!(slot.owed_reset(), None, "an unallocated slot doesn't hold a stream");
+
+        slot.allocate_and_open(v(5), 0).unwrap();
+        assert_eq!(slot.owed_reset(), None, "the peer's queue isn't recorded yet");
+
+        slot.set_peer_queue_id(v(9));
+        assert_eq!(
+            slot.owed_reset(),
+            Some(crate::queue::OwedReset {
+                queue_pair: crate::packet::datagram::QueuePair {
+                    source_queue_id: v(3),
+                    dest_queue_id: v(9),
+                },
+                binding_id: v(5),
+            })
+        );
+
+        simulate_receiver_drop(&slot);
+        assert_eq!(slot.owed_reset(), None, "a freed slot doesn't hold a stream");
+
+        slot.allocate_and_open(v(6), 0).unwrap();
+        assert_eq!(
+            slot.owed_reset(),
+            None,
+            "a new binding clears the peer's queue of the one before it"
+        );
     }
 
     // ── allocate_and_open tombstone re-validation (the `bind_for_msg` path) ──
