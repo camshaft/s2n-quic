@@ -31,6 +31,9 @@ pub(crate) struct Dispatch {
     pub rx_reset_both: Counter,
     pub rx_reset_stream: Counter,
     pub rx_reset_control: Counter,
+    // Resets sent to a peer whose packet cleared the dead mark: one for each stream whose frames
+    // this side failed when it marked the peer dead.
+    pub rx_dead_mark_owed_resets: Counter,
 
     pub queue_accepted: Counter,
 
@@ -103,6 +106,7 @@ impl Dispatch {
             rx_reset_both: counters.register("rx.reset.both"),
             rx_reset_stream: counters.register("rx.reset.stream"),
             rx_reset_control: counters.register("rx.reset.control"),
+            rx_dead_mark_owed_resets: counters.register("rx.dead_mark.owed_resets"),
 
             queue_accepted: counters.register("queue.accepted"),
 
@@ -207,6 +211,8 @@ pub(crate) struct Send {
     pub inflight_drain_expire: Counter,
     pub inflight_leaked_on_invalidate: Summary,
     pub probe_no_response: Counter,
+    // Streams the send idle wheel records as owed a reset as it finds the peer unresponsive.
+    pub idle_owed_resets: Counter,
     pub tx_probe_backoff: Summary,
     // Probe-shell benefit accounting. `shell_acked` counts ACKs that named a shell PN (an old
     // pre-probe packet number whose frames were retransmitted under a newer PN) — i.e. the peer
@@ -263,6 +269,7 @@ impl Send {
                 Unit::Byte,
             ),
             probe_no_response: counters.register_nominal("tx.probe.no_response", &v),
+            idle_owed_resets: counters.register_nominal("send.idle.owed_resets", &v),
             tx_probe_backoff: counters.register_nominal_summary(
                 "tx.probe.backoff",
                 &v,
@@ -373,6 +380,11 @@ impl Send {
     #[inline]
     pub fn on_probe_no_response(&self) {
         self.probe_no_response.add(1);
+    }
+
+    #[inline]
+    pub fn on_idle_owed_resets(&self, count: u64) {
+        self.idle_owed_resets.add(count);
     }
 
     #[inline]

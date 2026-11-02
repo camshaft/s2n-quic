@@ -124,6 +124,11 @@ pub(crate) struct StreamState {
     /// reconciliation already accounted for the full advertised window — any
     /// late-arriving (but in-window) bytes would otherwise be released twice.
     pub(crate) recv_finished: bool,
+    /// The peer's queue for the stream of the slot's current binding: where this side sends the
+    /// stream's frames, and so where a reset of the stream that this side owes the peer goes
+    /// ([`Slot::owed_reset`]). The stream's writer records it as it is made
+    /// ([`Slot::set_peer_queue_id`]), and each new binding clears it ([`Self::clear`]).
+    pub(crate) peer_queue_id: Option<VarInt>,
 }
 
 impl StreamState {
@@ -133,6 +138,7 @@ impl StreamState {
         self.synth_signal_offset = 0;
         self.max_received_offset = 0;
         self.recv_finished = false;
+        self.peer_queue_id = None;
         // initial_window_remaining is reset by the caller on bind because the
         // value comes from configuration that lives outside the slot.
     }
@@ -246,6 +252,7 @@ impl Slot {
                 max_received_offset: 0,
                 initial_window_remaining: 0,
                 recv_finished: false,
+                peer_queue_id: None,
             }),
             control: Half::new(),
         }
@@ -788,11 +795,33 @@ impl Slot {
     /// `HAS_SENDER` — this is a transient notification (peer-dead cooldown),
     /// not a permanent close.
     pub(crate) fn broadcast_reset(&self, error_code: VarInt) -> (half::AutoWake, half::AutoWake) {
+        self.reset_halves(None, error_code)
+    }
+
+    /// Push Reset into both halves, as [`Self::broadcast_reset`] does, where the slot still holds
+    /// `binding_id`: a slot freed since, or bound again, is left as it is, so that a reset of one
+    /// stream doesn't end a stream bound after it.
+    pub(crate) fn reset_binding(
+        &self,
+        binding_id: VarInt,
+        error_code: VarInt,
+    ) -> (half::AutoWake, half::AutoWake) {
+        self.reset_halves(Some(binding_id), error_code)
+    }
+
+    /// Pushes Reset into both halves of an allocated slot whose binding is `binding_id`, or of
+    /// any allocated slot where `binding_id` is `None`.
+    fn reset_halves(
+        &self,
+        binding_id: Option<VarInt>,
+        error_code: VarInt,
+    ) -> (half::AutoWake, half::AutoWake) {
         let mut s = self.stream.inner.lock();
         let mut c = self.control.inner.lock();
 
         let raw = self.binding_id.load(Ordering::Relaxed);
-        if raw & UNALLOCATED_BIT != 0 {
+        let other_binding = matches!(binding_id, Some(binding_id) if binding_id.as_u64() != raw);
+        if raw & UNALLOCATED_BIT != 0 || other_binding {
             return (half::AutoWake::default(), half::AutoWake::default());
         }
 
@@ -828,6 +857,34 @@ impl Slot {
         let stream_wake = self.stream.broadcast_close();
         let control_wake = self.control.broadcast_close();
         (stream_wake, control_wake)
+    }
+
+    /// Records `peer_queue_id`, the peer's queue for the stream this slot holds: where this side
+    /// sends the stream's frames, which a reset of the stream that this side owes the peer routes
+    /// to ([`Self::owed_reset`]). The holder of one of the slot's receivers calls it, so the slot
+    /// holds that receiver's binding; the next binding clears the record.
+    pub(crate) fn set_peer_queue_id(&self, peer_queue_id: VarInt) {
+        self.stream.inner.lock().extra.peer_queue_id = Some(peer_queue_id);
+    }
+
+    /// The stream this slot holds, as a reset of it that this side owes the peer routes: from
+    /// this slot to the peer's queue, with the stream's binding. `None` for a slot that doesn't
+    /// hold a binding, and for one whose peer queue isn't recorded yet.
+    pub(crate) fn owed_reset(&self) -> Option<super::OwedReset> {
+        let s = self.stream.inner.lock();
+        // The binding is written with both half locks held, so the stream lock is enough to read
+        // it together with the peer queue recorded for it.
+        let raw = self.binding_id.load(Ordering::Relaxed);
+        if raw & UNALLOCATED_BIT != 0 {
+            return None;
+        }
+        Some(super::OwedReset {
+            queue_pair: crate::packet::datagram::QueuePair {
+                source_queue_id: self.queue_id(),
+                dest_queue_id: s.extra.peer_queue_id?,
+            },
+            binding_id: VarInt::new(raw).ok()?,
+        })
     }
 
     // ── Internal helpers ──────────────────────────────────────────────────────
@@ -1141,6 +1198,76 @@ mod tests {
         simulate_receiver_drop(&slot);
         let result = slot.bind_and_push_stream(v(6), make_stream_entry(), 0);
         assert!(matches!(result, Ok((BindState::NewBinding(_), _))));
+    }
+
+    /// A slot names the stream it holds, as a reset of it that this side owes the peer routes,
+    /// once the stream's writer records the peer's queue: it names none while it doesn't hold a
+    /// binding or before the record, and none once it is freed or bound again.
+    #[test]
+    fn owed_reset_names_the_held_stream_once_its_peer_queue_is_recorded() {
+        let slot = Slot::with_queue_id(v(3));
+        assert_eq!(slot.owed_reset(), None, "an unallocated slot doesn't hold a stream");
+
+        slot.allocate_and_open(v(5), 0).unwrap();
+        assert_eq!(slot.owed_reset(), None, "the peer's queue isn't recorded yet");
+
+        slot.set_peer_queue_id(v(9));
+        assert_eq!(
+            slot.owed_reset(),
+            Some(crate::queue::OwedReset {
+                queue_pair: crate::packet::datagram::QueuePair {
+                    source_queue_id: v(3),
+                    dest_queue_id: v(9),
+                },
+                binding_id: v(5),
+            })
+        );
+
+        simulate_receiver_drop(&slot);
+        assert_eq!(slot.owed_reset(), None, "a freed slot doesn't hold a stream");
+
+        slot.allocate_and_open(v(6), 0).unwrap();
+        assert_eq!(
+            slot.owed_reset(),
+            None,
+            "a new binding clears the peer's queue of the one before it"
+        );
+    }
+
+    /// `reset_binding` pushes a Reset into both halves while the slot holds the binding it names,
+    /// and leaves the slot as it is for another binding, as once the slot is freed and bound again.
+    #[test]
+    fn reset_binding_resets_the_slot_only_while_it_holds_the_binding() {
+        let slot = Slot::with_queue_id(v(3));
+        slot.allocate_and_open(v(5), 0).unwrap();
+
+        slot.reset_binding(v(4), v(42));
+        assert_eq!(slot.stream.inner.lock().queue.len(), 0, "another binding");
+        assert_eq!(slot.control.inner.lock().queue.len(), 0, "another binding");
+
+        slot.reset_binding(v(5), v(42));
+        assert!(matches!(
+            slot.stream.inner.lock().queue.pop_front().map(|e| e.into_inner()),
+            Some(msg::Stream::Reset { error_code }) if error_code == v(42)
+        ));
+        assert!(matches!(
+            slot.control.inner.lock().queue.pop_front().map(|e| e.into_inner()),
+            Some(msg::Control::Reset { error_code }) if error_code == v(42)
+        ));
+
+        simulate_receiver_drop(&slot);
+        slot.allocate_and_open(v(6), 0).unwrap();
+        slot.reset_binding(v(5), v(42));
+        assert_eq!(
+            slot.stream.inner.lock().queue.len(),
+            0,
+            "a reset of the binding before doesn't end the stream bound after it"
+        );
+        assert_eq!(
+            slot.control.inner.lock().queue.len(),
+            0,
+            "a reset of the binding before doesn't end the stream bound after it"
+        );
     }
 
     // ── allocate_and_open tombstone re-validation (the `bind_for_msg` path) ──
@@ -1694,6 +1821,7 @@ mod tests {
             // every byte is accounted as pool-backed.
             initial_window_remaining: 0,
             recv_finished: false,
+            peer_queue_id: None,
         };
 
         // The reader advertised (and therefore acquired) only 10 bytes of pool credit. A peer that
@@ -1728,6 +1856,7 @@ mod tests {
             max_received_offset: 0,
             initial_window_remaining: 4,
             recv_finished: false,
+            peer_queue_id: None,
         };
 
         // Advertised window comfortably above what arrives. First 4 bytes are unbacked (release 0),

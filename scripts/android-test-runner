@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+#
+# Cargo's target runner for the Android emulator: copies a test binary to the emulator, runs it there
+# with the arguments cargo passes, and exits with the binary's status.
+#
+# The mobile CI job sets CARGO_TARGET_X86_64_LINUX_ANDROID_RUNNER to this script while the emulator runs.
+
+set -euo pipefail
+
+bin="$1"
+shift
+
+dest="/data/local/tmp/$(basename "$bin")"
+adb push "$bin" "$dest" > /dev/null
+adb shell chmod 755 "$dest"
+
+args=""
+for arg in "$@"; do
+  args+=" $(printf '%q' "$arg")"
+done
+
+adb shell "cd /data/local/tmp && RUST_BACKTRACE=1 $dest$args"

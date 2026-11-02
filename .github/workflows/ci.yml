@@ -294,6 +294,108 @@ jobs:
         run: |
           cargo nextest run -p s2n-quic-core -p s2n-quic-dc
 
+  mobile:
+    # Builds s2n-quic-dc for iOS and Android devices, and runs its tests on an iOS simulator and an
+    # Android emulator. The device targets are built only: the tests run on the simulator and
+    # emulator targets that GitHub's runners can host.
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            target: aarch64-apple-ios
+            run: build
+          - os: macos-latest
+            target: aarch64-apple-ios-sim
+            run: test
+          - os: ubuntu-latest
+            target: aarch64-linux-android
+            run: build
+          - os: ubuntu-latest
+            target: x86_64-linux-android
+            run: test
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          lfs: true
+          submodules: true
+
+      - name: Install rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup override set stable
+          rustup target add ${{ matrix.target }}
+
+      - uses: camshaft/rust-cache@v1
+        with:
+          key: dc-mobile-${{ matrix.target }}
+
+      - name: Set tool versions
+        id: versions
+        if: ${{ contains(matrix.target, 'android') }}
+        run: |
+          echo "cargo_ndk=3.5.4" >> "$GITHUB_OUTPUT"
+
+      - name: Set the Android NDK
+        if: ${{ contains(matrix.target, 'android') }}
+        run: echo "ANDROID_NDK_HOME=$ANDROID_NDK_LATEST_HOME" >> "$GITHUB_ENV"
+
+      - name: Cache cargo-ndk binary
+        id: cache-cargo-ndk
+        if: ${{ contains(matrix.target, 'android') }}
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cargo-ndk
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-ndk-${{ steps.versions.outputs.cargo_ndk }}
+
+      - name: Install cargo-ndk
+        if: ${{ contains(matrix.target, 'android') && steps.cache-cargo-ndk.outputs.cache-hit != 'true' }}
+        run: cargo install cargo-ndk --locked --version "${{ steps.versions.outputs.cargo_ndk }}"
+
+      - name: Build for an iOS device
+        if: ${{ matrix.run == 'build' && contains(matrix.target, 'apple-ios') }}
+        run: cargo build -p s2n-quic-dc --target ${{ matrix.target }}
+
+      - name: Build for an Android device
+        if: ${{ matrix.run == 'build' && contains(matrix.target, 'android') }}
+        run: cargo ndk --target ${{ matrix.target }} --platform 26 build -p s2n-quic-dc
+
+      - name: Boot an iOS simulator
+        if: ${{ matrix.run == 'test' && contains(matrix.target, 'apple-ios') }}
+        run: |
+          runtimes=$(xcrun simctl list runtimes iOS -j)
+          runtime=$(echo "$runtimes" | jq -r '[.runtimes[] | select(.isAvailable)] | last | .identifier')
+          device=$(echo "$runtimes" | jq -r '[.runtimes[] | select(.isAvailable)] | last | [.supportedDeviceTypes[] | select(.productFamily == "iPhone")] | last | .identifier')
+          udid=$(xcrun simctl create dc-ci "$device" "$runtime")
+          xcrun simctl bootstatus "$udid" -b
+
+      - name: Run the tests on the iOS simulator
+        if: ${{ matrix.run == 'test' && contains(matrix.target, 'apple-ios') }}
+        env:
+          # cargo runs each test binary in the booted simulator
+          CARGO_TARGET_AARCH64_APPLE_IOS_SIM_RUNNER: xcrun simctl spawn booted
+        run: cargo test -p s2n-quic-dc --target ${{ matrix.target }} --no-fail-fast
+
+      - name: Enable KVM for the Android emulator
+        if: ${{ matrix.run == 'test' && contains(matrix.target, 'android') }}
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Run the tests on the Android emulator
+        if: ${{ matrix.run == 'test' && contains(matrix.target, 'android') }}
+        uses: reactivecircus/android-emulator-runner@v2
+        env:
+          # cargo pushes each test binary to the emulator and runs it there
+          CARGO_TARGET_X86_64_LINUX_ANDROID_RUNNER: bash ${{ github.workspace }}/scripts/android-test-runner
+        with:
+          api-level: 30
+          arch: x86_64
+          script: cargo ndk --target ${{ matrix.target }} --platform 26 test -p s2n-quic-dc --no-fail-fast
+
   cachegrind:
     runs-on: ubuntu-latest
     timeout-minutes: 30

@@ -432,6 +432,10 @@ impl Writer {
         let initial_remote_max_data = parameters.local_recv_max_data.as_u64();
         let remote_max_data = VarInt::ZERO;
 
+        // Record the queue the peer receives this stream's frames on, on the slot, so that a reset
+        // this side owes the peer once it marks the peer dead routes there (`Slot::owed_reset`).
+        control_rx.set_peer_queue_id(dest_queue_id);
+
         Self(WriterAllocPtr::new(Inner {
             frame_tx,
             completion_rx,
@@ -486,6 +490,9 @@ impl Writer {
         // starts in `Open` and seeds its `remote_max_data` from this so its very first burst stays
         // within the window the peer's reader advertises for free.
         let initial_remote_max_data = parameters.local_recv_max_data.as_u64();
+
+        // See `new_client`: where a reset this side owes the peer routes.
+        control_rx.set_peer_queue_id(dest_queue_id);
 
         Self(WriterAllocPtr::new(Inner {
             frame_tx,
