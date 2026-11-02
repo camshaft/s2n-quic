@@ -453,3 +453,237 @@ fn slot_diag_reports_bound_vs_unallocated_state() {
         "an unbound slot must read back as unallocated with no receiver"
     );
 }
+
+/// Drops each value it's sent. The rejections the tests below check return from `process` before
+/// it sends anything on its channels.
+struct Discard;
+
+impl<T> channel::UnboundedSender<T> for Discard {
+    fn send(&mut self, _value: T) -> Result<(), T> {
+        Ok(())
+    }
+}
+
+/// A single QueueMsg frame, routed at an unallocated queue, sealed under `key_id` by the client
+/// entry for `peer`, with `source_sender_id` as the sender id in its routing info. Its credential
+/// id is the client's `peer_id`, the id of the server entry for `peer`, so a path secret map that
+/// holds that server entry finds the packet's credential and opens the packet. Returns the packet
+/// and its credentials.
+fn sealed_client_packet(
+    peer: SocketAddr,
+    key_id: VarInt,
+    source_sender_id: VarInt,
+) -> (
+    datagram::decoder::Packet<crate::socket::pool::descriptor::Filled>,
+    Credentials,
+) {
+    let sealer_entry = PathSecretEntry::builder(peer)
+        .endpoint_type(endpoint::Type::Client)
+        .build(None);
+    let sealer = sealer_entry.secret().application_sealer(key_id);
+    let credentials = Credentials {
+        id: sealer_entry.secret().peer_id(),
+        key_id,
+    };
+
+    let payload = b"queue-msg-payload".to_vec();
+    let payload_len = VarInt::new(payload.len() as u64).unwrap();
+    let header = Header::QueueMsg {
+        queue_pair: QueuePair {
+            source_queue_id: VarInt::from_u8(7),
+            dest_queue_id: VarInt::ZERO,
+        },
+        binding_id: VarInt::from_u8(1),
+        msg_id: VarInt::ZERO,
+        stream_offset: VarInt::ZERO,
+        largest_offset: payload_len,
+        message_size: payload_len,
+        chunk_size: payload_len,
+        chunk_index: VarInt::ZERO,
+        is_fin: true,
+        is_wakeup: true,
+        blocked: false,
+        dest_acceptor_id: None,
+        priority: crate::credit::Priority::default(),
+    };
+
+    let mut header_buf = vec![0u8; header.metadata_len(payload.len())];
+    {
+        let mut enc = s2n_codec::EncoderBuffer::new(&mut header_buf);
+        enc.encode(&header);
+        enc.encode(&payload_len);
+    }
+
+    let mut buf = vec![0u8; 65536];
+    let mut header_reader = &header_buf[..];
+    let mut payload_reader = &payload[..];
+    let encoded_len = datagram::encoder::encode(
+        s2n_codec::EncoderBuffer::new(&mut buf),
+        443,
+        datagram::RoutingInfo::SenderId { source_sender_id },
+        Some(VarInt::ZERO),
+        VarInt::try_from(header_buf.len() as u64).unwrap(),
+        &mut header_reader,
+        payload_len,
+        &mut payload_reader,
+        &sealer,
+        &credentials,
+    );
+    assert!(encoded_len > 0);
+
+    let pool = pool::Pool::new(u16::MAX);
+    let unfilled = pool.alloc::<SyncRecycler>().expect("pool alloc");
+    let segments = unfilled
+        .fill_with(|addr, _cmsg, mut iov| {
+            iov[..encoded_len].copy_from_slice(&buf[..encoded_len]);
+            addr.set(peer.into());
+            Ok::<_, core::convert::Infallible>(encoded_len)
+        })
+        .expect("fill_with");
+    let mut filled = segments.take_filled();
+
+    let meta = {
+        let decode_buf = DecoderBufferMut::new(&mut filled[..]);
+        datagram::decoder::Meta::decode(&decode_buf, (), TAG_LEN).expect("meta decode")
+    };
+    let packet = meta.with_storage(filled).expect("with_storage");
+
+    (packet, credentials)
+}
+
+/// Runs `process` on `packet` with an empty receive cache, so that `process` looks up the
+/// packet's credential in `path_secret_map` and, where the map holds it, checks the packet's key
+/// id against the receiver's replay window.
+fn process_uncached(
+    packet: datagram::decoder::Packet<crate::socket::pool::descriptor::Filled>,
+    path_secret_map: &PathSecretMap,
+) -> Result<(), Error> {
+    let mut harness = FastPathHarness::new();
+    let mut recv_cache = recv::Cache::new(crate::endpoint::id::RecvDispatchWorkerId::new(0));
+    let clock = crate::time::testing::Clock::new(Duration::from_secs(1));
+    let route = <routing::ModuloRoute as routing::SenderRoute>::new(1);
+    process(
+        Entry::new(packet),
+        &mut recv_cache,
+        &mut Discard,
+        &mut Discard,
+        path_secret_map,
+        &mut harness.acceptor_registry,
+        &mut harness.frame_tx,
+        &mut Discard,
+        &mut harness.freed_batch_tx,
+        &clock,
+        &harness.counters,
+        &route,
+        &mut Discard,
+        &harness.stream_clock,
+        &harness.reader_metrics,
+        &harness.writer_metrics,
+        &harness.send_credit_pool,
+        &harness.recv_credit_pool,
+    )
+}
+
+/// The variant of `result`, for an assertion's message: `Error` doesn't implement `Debug`.
+fn outcome(result: &Result<(), Error>) -> &'static str {
+    match result {
+        Ok(()) => "Ok",
+        Err(Error::PeerStateLookup { .. }) => "PeerStateLookup",
+        Err(Error::Decryption { .. }) => "Decryption",
+        Err(Error::Duplicate { .. }) => "Duplicate",
+        Err(Error::StaleKey { .. }) => "StaleKey",
+        Err(Error::MissingSenderId) => "MissingSenderId",
+    }
+}
+
+/// The peer's sender ids of the packets each test below sends. Neither is 0, and they differ, so
+/// an error whose `sender_id` is any one constant doesn't match both packets.
+const SOURCE_SENDER_IDS: [u8; 2] = [3, 9];
+
+/// `process` rejects a packet whose credential the path secret map doesn't hold as
+/// `PeerStateLookup`, with the packet's credentials and the sender id the packet came from.
+/// `ups::Pending` keys the UnknownPathSecret response by those two, so the response for one sender
+/// id doesn't keep the response for another sender id out of the queue.
+#[test]
+fn peer_state_lookup_carries_the_rejected_packets_sender_id() {
+    let path_secret_map = crate::path::secret::map::testing::new(16);
+    let peer: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+
+    for source_sender_id in SOURCE_SENDER_IDS.map(VarInt::from_u8) {
+        let (packet, credentials) = sealed_client_packet(peer, VarInt::ZERO, source_sender_id);
+        assert!(
+            path_secret_map.get_by_id(&credentials.id).is_none(),
+            "the map must not hold the packet's credential"
+        );
+
+        let result = process_uncached(packet, &path_secret_map);
+        let got = outcome(&result);
+        let Err(Error::PeerStateLookup {
+            credentials: rejected,
+            sender_id,
+            ..
+        }) = result
+        else {
+            panic!(
+                "a packet whose credential the map doesn't hold must be rejected as \
+                 PeerStateLookup, not {got}"
+            );
+        };
+        assert_eq!(
+            rejected, credentials,
+            "PeerStateLookup must carry the rejected packet's credentials"
+        );
+        assert_eq!(
+            sender_id, source_sender_id,
+            "PeerStateLookup must carry the sender id of the rejected packet"
+        );
+    }
+}
+
+/// `process` rejects a packet whose key id the receiver has seen already as `StaleKey`, with the
+/// packet's credentials and the sender id the packet came from. `ups::Pending` keys the
+/// ReplayDetected response by those two, so the response for one sender id doesn't keep the
+/// response for another sender id out of the queue.
+#[test]
+fn stale_key_carries_the_rejected_packets_sender_id() {
+    let peer: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+
+    for source_sender_id in SOURCE_SENDER_IDS.map(VarInt::from_u8) {
+        let path_secret_map = crate::path::secret::map::testing::new(16);
+        path_secret_map.test_insert(peer, endpoint::Type::Server);
+        let (packet, credentials) = sealed_client_packet(peer, VarInt::ZERO, source_sender_id);
+        let entry = path_secret_map
+            .get_by_id(&credentials.id)
+            .expect("the map must hold the server entry for the packet's credential");
+
+        // The receiver sees the packet's key id once before the packet arrives, as it does for an
+        // earlier packet under the same key.
+        let first = path_secret_map.check_dedup(&entry, &credentials, None, &mut Vec::new());
+        assert!(
+            first.is_ok(),
+            "the receiver must accept the key id the first time it sees it"
+        );
+
+        let result = process_uncached(packet, &path_secret_map);
+        let got = outcome(&result);
+        let Err(Error::StaleKey {
+            credentials: rejected,
+            sender_id,
+            ..
+        }) = result
+        else {
+            panic!(
+                "a packet whose key id the receiver has seen already must be rejected as \
+                 StaleKey, not {got}"
+            );
+        };
+        assert_eq!(
+            rejected, credentials,
+            "StaleKey must carry the rejected packet's credentials"
+        );
+        assert_eq!(
+            sender_id, source_sender_id,
+            "StaleKey must carry the sender id of the rejected packet"
+        );
+    }
+}
