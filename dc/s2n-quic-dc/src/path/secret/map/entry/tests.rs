@@ -137,6 +137,67 @@ fn touch_activity_that_clears_a_dead_mark_hands_over_the_owed_resets() {
     );
 }
 
+/// Where two receive workers take packets from the peer at once, both may find the dead mark set,
+/// and only one of them may report that it cleared it, so that the owed resets are sent once.
+/// Each round marks the peer dead and then releases both workers together: each spins on the
+/// round counter, so the two call `touch_activity` at nearly the same moment. A clear that stores
+/// -1 after its load and returns `true`, instead of the swap, reports the mark twice in each round
+/// where both workers load it before either clears it.
+#[test]
+fn touch_activity_reports_a_dead_mark_two_workers_clear_at_once_to_one_of_them() {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Barrier,
+    };
+
+    const ROUNDS: usize = 1000;
+
+    let entry = test_entry_with_senders(0);
+    let cooldown = crate::endpoint::DEFAULT_DEAD_PEER_COOLDOWN;
+    let t0: crate::time::precision::Timestamp =
+        (unsafe { Timestamp::from_duration(Duration::from_secs(100)) }).into();
+    let t1 = t0 + Duration::from_secs(1);
+
+    // `start` holds the round the workers run, and `done` waits for both of them to return before
+    // the next round marks the peer dead again.
+    let start = AtomicUsize::new(0);
+    let done = Barrier::new(3);
+    let reports = AtomicUsize::new(0);
+
+    // The results are checked once every worker has returned, so that a failed round doesn't
+    // leave a worker waiting on a round that never starts.
+    let (marked, reported) = std::thread::scope(|scope| {
+        for _ in 0..2 {
+            scope.spawn(|| {
+                for round in 1..=ROUNDS {
+                    while start.load(Ordering::Acquire) != round {
+                        std::hint::spin_loop();
+                    }
+                    if entry.touch_activity(t1) {
+                        reports.fetch_add(1, Ordering::Relaxed);
+                    }
+                    done.wait();
+                }
+            });
+        }
+
+        let mut marked = Vec::with_capacity(ROUNDS);
+        let mut reported = Vec::with_capacity(ROUNDS);
+        for round in 1..=ROUNDS {
+            marked.push(entry.mark_dead_if_cooldown_elapsed(t0, cooldown));
+            start.store(round, Ordering::Release);
+            done.wait();
+            reported.push(reports.swap(0, Ordering::Relaxed));
+        }
+        (marked, reported)
+    });
+
+    for (round, (marked, reported)) in marked.into_iter().zip(reported).enumerate() {
+        assert!(marked, "round {round}: the mark takes effect");
+        assert_eq!(reported, 1, "round {round}: one worker, and only one, reports the clear");
+    }
+}
+
 #[test]
 fn allocates_sender_schedule_slots() {
     let entry = test_entry_with_senders(4);
