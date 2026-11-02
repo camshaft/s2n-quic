@@ -35,6 +35,10 @@ pub const SENDER_CANCELLED: VarInt = VarInt::from_u32(9);
 /// secret the stream runs on
 pub const PEER_KEY_REMOVED: VarInt = VarInt::from_u32(10);
 
+/// The peer answered the stream's path secret as one it doesn't hold, so no more packets of the
+/// stream reach it
+pub const PATH_SECRET_REJECTED: VarInt = VarInt::from_u32(11);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Error {
     AcceptorNotFound,
@@ -47,6 +51,7 @@ pub enum Error {
     IdleTimeout,
     SenderCancelled,
     PeerKeyRemoved,
+    PathSecretRejected,
     Unknown(VarInt),
 }
 
@@ -70,6 +75,7 @@ impl Error {
             Self::IdleTimeout => IDLE_TIMEOUT,
             Self::SenderCancelled => SENDER_CANCELLED,
             Self::PeerKeyRemoved => PEER_KEY_REMOVED,
+            Self::PathSecretRejected => PATH_SECRET_REJECTED,
             Self::Unknown(code) => code,
         }
     }
@@ -88,6 +94,7 @@ impl From<VarInt> for Error {
             IDLE_TIMEOUT => Self::IdleTimeout,
             SENDER_CANCELLED => Self::SenderCancelled,
             PEER_KEY_REMOVED => Self::PeerKeyRemoved,
+            PATH_SECRET_REJECTED => Self::PathSecretRejected,
             _ => Self::Unknown(code),
         }
     }
@@ -106,6 +113,7 @@ impl fmt::Display for Error {
             Self::IdleTimeout => write!(f, "peer idle timeout expired"),
             Self::SenderCancelled => write!(f, "sender cancelled mid-message"),
             Self::PeerKeyRemoved => write!(f, "peer key removed from the accepted keys"),
+            Self::PathSecretRejected => write!(f, "path secret rejected by peer"),
             Self::Unknown(code) => write!(f, "unknown error ({})", code.as_u64()),
         }
     }
