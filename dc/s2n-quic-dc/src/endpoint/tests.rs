@@ -3339,10 +3339,14 @@ fn stale_key_detected_after_recv_cache_eviction() {
 /// moves to a new key, so the client rejects everything it sends: the client's flows go
 /// unanswered, its send idle wheel marks the server dead, and connects are refused in the
 /// dead-peer cooldown window. Only an entry for a new path secret gets the client out.
+///
+/// Each endpoint has one send socket, so the server holds one send context for the entry. With
+/// more, the server sends a later stream from a socket that has no context yet, that context seals
+/// with a new key id, and the client accepts it, so the client recovers on the old entry.
 #[test]
 fn recv_eviction_with_lost_replay_notices_recovers() {
     use crate::{
-        endpoint::testing::sim::{lookup_sim_map, packet_tag},
+        endpoint::testing::sim::{lookup_sim_map, packet_tag, SimEndpointConfig},
         packet::Tag,
         path::secret::map::Entry,
     };
@@ -3354,7 +3358,21 @@ fn recv_eviction_with_lost_replay_notices_recovers() {
     let dropped_notices_inner = dropped_notices.clone();
     let cooldown_refusals = Arc::new(AtomicUsize::new(0));
     let cooldown_refusals_inner = cooldown_refusals.clone();
-    let recovered_after: Arc<Mutex<Option<Duration>>> = Default::default();
+    // The time from the break to the first completed stream, and whether that stream used a new
+    // entry.
+    let recovered_after: Arc<Mutex<Option<(Duration, bool)>>> = Default::default();
+
+    // One send socket and one worker of each kind.
+    fn one_socket() -> SimEndpointConfig {
+        SimEndpointConfig {
+            num_send_sockets: 1,
+            num_recv_sockets: 1,
+            num_recv_io_workers: 1,
+            num_send_workers: 1,
+            num_recv_dispatch_workers: 1,
+            ..Default::default()
+        }
+    }
     let recovered_after_inner = recovered_after.clone();
 
     sim(|| {
@@ -3375,7 +3393,7 @@ fn recv_eviction_with_lost_replay_notices_recovers() {
 
         // Server: echo each stream back.
         async move {
-            let server = Server::new();
+            let server = Server::with_config(one_socket());
             let mut acceptor = server
                 .register_acceptor_channel(acceptor_id, 64)
                 .expect("acceptor registration");
@@ -3402,7 +3420,7 @@ fn recv_eviction_with_lost_replay_notices_recovers() {
 
         // Client (primary).
         async move {
-            let mut client = Client::new();
+            let mut client = Client::with_config(one_socket());
             // Yield so the server group has a chance to bind its socket.
             bach::task::yield_now().await;
 
@@ -3502,9 +3520,8 @@ fn recv_eviction_with_lost_replay_notices_recovers() {
                         .get_raw(server_addr)
                         .expect("entry after recovery")
                         .id();
-                    assert_ne!(new_id, old_id, "recovery must come from a fresh entry");
                     let elapsed = client_map.entry_age(&old_entry) - broke_at;
-                    *recovered_after_inner.lock().unwrap() = Some(elapsed);
+                    *recovered_after_inner.lock().unwrap() = Some((elapsed, new_id != old_id));
                     break;
                 }
             }
@@ -3536,7 +3553,12 @@ fn recv_eviction_with_lost_replay_notices_recovers() {
          key the client rejects, so the client stays in the dead-cooldown loop for as long as it \
          keeps the entry"
     );
-    let recovered_after = recovered_after.unwrap();
+    let (recovered_after, fresh_entry) = recovered_after.unwrap();
+    assert!(
+        fresh_entry,
+        "a stream completed on the old entry, so the server moved off the key the client rejects \
+         without any notice: the test didn't reproduce the client's stuck state"
+    );
     let bound = crate::stream::endpoint::DEFAULT_IDLE_TIMEOUT * 3;
     assert!(
         recovered_after <= bound,
