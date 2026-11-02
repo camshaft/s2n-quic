@@ -151,10 +151,14 @@ pub fn init_tracing() {
     // make sure this only gets initialized once
     TRACING.call_once(|| {
         // CI diagnostic, not for merge: print this test process's memory every 2 s, straight to
-        // stderr so that the test harness doesn't capture it.
+        // stderr so that the test harness doesn't capture it, with the heap bytes that the test
+        // allocator counts as live. Each time the resident memory passes another 2 GiB, it also
+        // prints the code sites that hold the most live heap memory, from the allocator's samples.
         #[cfg(all(test, target_os = "linux"))]
         std::thread::spawn(|| {
             use std::io::Write as _;
+            // This thread's own allocations, such as the symbol reads of a report, aren't sampled.
+            heap::exclude_this_thread();
             fn field(text: &str, key: &str) -> String {
                 text.lines()
                     .find(|line| line.starts_with(key))
@@ -162,18 +166,31 @@ pub fn init_tracing() {
                     .unwrap_or("?")
                     .to_string()
             }
+            const STEP_KB: u64 = 2 * 1024 * 1024;
+            let mut next_report_kb = STEP_KB;
             loop {
                 let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
                 let meminfo = std::fs::read_to_string("/proc/meminfo").unwrap_or_default();
+                let rss = field(&status, "VmRSS:");
                 let line = format!(
-                    "[rss-monitor] VmRSS_kB={} VmHWM_kB={} Threads={} MemAvailable_kB={} MemTotal_kB={}\n",
-                    field(&status, "VmRSS:"),
+                    "[rss-monitor] VmRSS_kB={} VmHWM_kB={} live_kB={} Threads={} MemAvailable_kB={} MemTotal_kB={}\n",
+                    rss,
                     field(&status, "VmHWM:"),
+                    heap::live_kb(),
                     field(&status, "Threads:"),
                     field(&meminfo, "MemAvailable:"),
                     field(&meminfo, "MemTotal:"),
                 );
                 let _ = std::io::stderr().write_all(line.as_bytes());
+                if let Ok(rss_kb) = rss.parse::<u64>() {
+                    if rss_kb >= next_report_kb {
+                        while next_report_kb <= rss_kb {
+                            next_report_kb += STEP_KB;
+                        }
+                        let report = heap::report(rss_kb, 10);
+                        let _ = std::io::stderr().write_all(report.as_bytes());
+                    }
+                }
                 std::thread::sleep(Duration::from_secs(2));
             }
         });
@@ -333,8 +350,8 @@ fn run_sim(f: impl FnOnce()) {
 
 /// CI diagnostic, not for merge: runs one sim at a time in the test process, and prints the
 /// process's resident memory before the sim, its peak during the sim, after the sim, and after
-/// `malloc_trim`, for each sim that moves it by 64 MiB or more. It also counts the sim endpoints
-/// still alive after each sim, and empties the thread's sim registries after each sim.
+/// `malloc_trim`, for each sim that moves it by 64 MiB or more, with the heap bytes that the test
+/// allocator counts as live before and after the sim, and the sim endpoints still alive.
 #[cfg(all(test, target_os = "linux"))]
 mod sim_rss {
     use std::{
@@ -364,6 +381,7 @@ mod sim_rss {
     pub struct Guard {
         _lock: MutexGuard<'static, ()>,
         before_kb: u64,
+        live_before_kb: i64,
         gap_kb: u64,
         started: Instant,
     }
@@ -377,6 +395,7 @@ mod sim_rss {
             Self {
                 _lock: lock,
                 before_kb,
+                live_before_kb: super::heap::live_kb(),
                 // What the process's memory grew by between the end of the sim before this one
                 // and the start of this one, while other tests ran.
                 gap_kb: before_kb.saturating_sub(LAST_KB.load(Ordering::Relaxed)),
@@ -389,25 +408,17 @@ mod sim_rss {
         fn drop(&mut self) {
             let peak_kb = status_kb("VmHWM:");
             let after_kb = status_kb("VmRSS:");
+            let live_after_kb = super::heap::live_kb();
             let (made, alive) = crate::endpoint::testing::sim::live::counts();
             unsafe {
                 libc::malloc_trim(0);
             }
             let trimmed_kb = status_kb("VmRSS:");
-            // Empty this thread's sim registries, which hold each sim's path-secret maps until the
-            // test's thread exits, then read the memory and the live endpoints again.
-            let maps = crate::endpoint::testing::sim::clear_thread_registries();
-            unsafe {
-                libc::malloc_trim(0);
-            }
-            let cleared_kb = status_kb("VmRSS:");
-            let (_, alive_cleared) = crate::endpoint::testing::sim::live::counts();
-            LAST_KB.store(cleared_kb, Ordering::Relaxed);
+            LAST_KB.store(trimmed_kb, Ordering::Relaxed);
             const MIB_64: u64 = 64 * 1024;
             let moved = peak_kb.saturating_sub(self.before_kb) >= MIB_64
                 || after_kb.saturating_sub(self.before_kb) >= MIB_64
                 || after_kb.saturating_sub(trimmed_kb) >= MIB_64
-                || trimmed_kb.saturating_sub(cleared_kb) >= MIB_64
                 || self.gap_kb >= MIB_64;
             if moved {
                 let name = std::thread::current()
@@ -415,14 +426,338 @@ mod sim_rss {
                     .unwrap_or("unknown")
                     .to_string();
                 let line = format!(
-                    "[sim-rss] test={name} secs={:.1} gap_kB={} before_kB={} peak_kB={peak_kb} after_kB={after_kb} trimmed_kB={trimmed_kb} cleared_kB={cleared_kb} maps_cleared={maps} endpoints_made={made} endpoints_alive={alive} endpoints_alive_cleared={alive_cleared}\n",
+                    "[sim-rss] test={name} secs={:.1} gap_kB={} before_kB={} peak_kB={peak_kb} after_kB={after_kb} trimmed_kB={trimmed_kb} live_before_kB={} live_after_kB={live_after_kb} endpoints_made={made} endpoints_alive={alive}\n",
                     self.started.elapsed().as_secs_f64(),
                     self.gap_kb,
                     self.before_kb,
+                    self.live_before_kb,
                 );
                 let _ = std::io::stderr().write_all(line.as_bytes());
             }
         }
+    }
+}
+
+/// CI diagnostic, not for merge: a heap profiler for the crate's unit-test process on Linux.
+///
+/// Every allocation carries a header of 16 bytes, or of its alignment where that is larger, whose
+/// last 8 bytes hold the slot of its sample plus one, or 0 where it isn't sampled. The allocator
+/// counts the heap bytes that are live, and samples each allocation that crosses a further 32 MiB
+/// of bytes allocated, recording the return addresses of its stack. A sample ends when its
+/// allocation is freed or reallocated. Each sample stands for the 32 MiB it crossed, so the
+/// sampled bytes of a site estimate the live bytes it holds. Memory that C code allocates with
+/// `malloc` directly, such as the TLS libraries', isn't counted.
+#[cfg(all(test, target_os = "linux"))]
+mod heap {
+    use std::{
+        alloc::{GlobalAlloc, Layout, System},
+        cell::Cell,
+        collections::HashMap,
+        fmt::Write as _,
+        sync::{
+            atomic::{AtomicI64, AtomicU64, Ordering},
+            Mutex,
+        },
+    };
+
+    const PERIOD: u64 = 32 << 20;
+    const FRAMES: usize = 32;
+    const SLOTS: usize = 1 << 14;
+    const KEY_FRAMES: usize = 8;
+
+    static LIVE: AtomicI64 = AtomicI64::new(0);
+    static ALLOCATED: AtomicU64 = AtomicU64::new(0);
+
+    #[derive(Clone, Copy)]
+    struct Sample {
+        weight: u64,
+        size: usize,
+        frames: [usize; FRAMES],
+        len: usize,
+    }
+
+    struct Samples {
+        entries: [Option<Sample>; SLOTS],
+        next: usize,
+    }
+
+    impl Samples {
+        fn insert(&mut self, sample: Sample) -> Option<usize> {
+            for i in 0..SLOTS {
+                let slot = (self.next + i) % SLOTS;
+                if self.entries[slot].is_none() {
+                    self.entries[slot] = Some(sample);
+                    self.next = (slot + 1) % SLOTS;
+                    return Some(slot);
+                }
+            }
+            None
+        }
+    }
+
+    static SAMPLES: Mutex<Samples> = Mutex::new(Samples {
+        entries: [None; SLOTS],
+        next: 0,
+    });
+
+    thread_local! {
+        // Set while this thread records a sample, and on a thread that is excluded from sampling.
+        static BUSY: Cell<bool> = const { Cell::new(false) };
+    }
+
+    pub fn exclude_this_thread() {
+        BUSY.with(|busy| busy.set(true));
+    }
+
+    pub fn live_kb() -> i64 {
+        LIVE.load(Ordering::Relaxed) / 1024
+    }
+
+    fn header(layout: Layout) -> usize {
+        layout.align().max(16)
+    }
+
+    /// The last 8 bytes of the header of the allocation at `ptr`, which hold its sample's slot.
+    unsafe fn slot_word(ptr: *mut u8) -> *mut usize {
+        ptr.sub(8).cast()
+    }
+
+    unsafe fn begin(ptr: *mut u8, size: usize) {
+        slot_word(ptr).write_unaligned(0);
+        LIVE.fetch_add(size as i64, Ordering::Relaxed);
+        let before = ALLOCATED.fetch_add(size as u64, Ordering::Relaxed);
+        let crossed = (before + size as u64) / PERIOD - before / PERIOD;
+        if crossed == 0 {
+            return;
+        }
+        let Ok(was_busy) = BUSY.try_with(|busy| busy.replace(true)) else {
+            return;
+        };
+        if was_busy {
+            return;
+        }
+        let mut frames = [0usize; FRAMES];
+        let mut len = 0;
+        backtrace::trace_unsynchronized(|frame| {
+            frames[len] = frame.ip() as usize;
+            len += 1;
+            len < FRAMES
+        });
+        let sample = Sample {
+            weight: crossed * PERIOD,
+            size,
+            frames,
+            len,
+        };
+        let slot = SAMPLES
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(sample);
+        if let Some(slot) = slot {
+            slot_word(ptr).write_unaligned(slot + 1);
+        }
+        BUSY.with(|busy| busy.set(false));
+    }
+
+    unsafe fn end(ptr: *mut u8, size: usize) {
+        LIVE.fetch_sub(size as i64, Ordering::Relaxed);
+        let word = slot_word(ptr);
+        let slot = word.read_unaligned();
+        if slot == 0 {
+            return;
+        }
+        word.write_unaligned(0);
+        SAMPLES
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .entries[slot - 1] = None;
+    }
+
+    pub struct Tracking;
+
+    impl Tracking {
+        unsafe fn make(&self, layout: Layout, zeroed: bool) -> *mut u8 {
+            let hdr = header(layout);
+            let Some(size) = layout.size().checked_add(hdr) else {
+                return core::ptr::null_mut();
+            };
+            let Ok(full) = Layout::from_size_align(size, layout.align()) else {
+                return core::ptr::null_mut();
+            };
+            let base = if zeroed {
+                System.alloc_zeroed(full)
+            } else {
+                System.alloc(full)
+            };
+            if base.is_null() {
+                return base;
+            }
+            let ptr = base.add(hdr);
+            begin(ptr, layout.size());
+            ptr
+        }
+    }
+
+    unsafe impl GlobalAlloc for Tracking {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            self.make(layout, false)
+        }
+
+        unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+            self.make(layout, true)
+        }
+
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            end(ptr, layout.size());
+            let hdr = header(layout);
+            System.dealloc(
+                ptr.sub(hdr),
+                Layout::from_size_align_unchecked(layout.size() + hdr, layout.align()),
+            );
+        }
+
+        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+            let hdr = header(layout);
+            let Some(size) = new_size.checked_add(hdr) else {
+                return core::ptr::null_mut();
+            };
+            if Layout::from_size_align(size, layout.align()).is_err() {
+                return core::ptr::null_mut();
+            }
+            end(ptr, layout.size());
+            let base = System.realloc(
+                ptr.sub(hdr),
+                Layout::from_size_align_unchecked(layout.size() + hdr, layout.align()),
+                size,
+            );
+            if base.is_null() {
+                // The old allocation stays, and its sample has ended.
+                LIVE.fetch_add(layout.size() as i64, Ordering::Relaxed);
+                return base;
+            }
+            let ptr = base.add(hdr);
+            begin(ptr, new_size);
+            ptr
+        }
+    }
+
+    #[global_allocator]
+    static ALLOCATOR: Tracking = Tracking;
+
+    /// Whether a function is the allocator's, the profiler's or the standard library's, which a
+    /// site's frames leave out.
+    fn is_plumbing(name: &str) -> bool {
+        const PREFIXES: &[&str] = &[
+            "s2n_quic_dc::testing::heap",
+            "<s2n_quic_dc::testing::heap",
+            "backtrace::",
+            "__rust",
+            "__rdl",
+            "alloc::",
+            "<alloc::",
+            "core::",
+            "<core::",
+            "std::",
+            "<std::",
+            "hashbrown::",
+            "<hashbrown::",
+        ];
+        PREFIXES.iter().any(|prefix| name.starts_with(prefix))
+            || (name.starts_with('<')
+                && (name.contains(" as alloc::")
+                    || name.contains(" as core::")
+                    || name.contains(" as std::")))
+    }
+
+    /// The functions at `addr`, innermost first, each with the last parts of its file's path and
+    /// its line.
+    fn resolve(addr: usize) -> Vec<String> {
+        let mut names = Vec::new();
+        backtrace::resolve(addr as *mut core::ffi::c_void, |symbol| {
+            let mut text = match symbol.name() {
+                Some(name) => format!("{name:#}"),
+                None => "?".to_string(),
+            };
+            if let (Some(file), Some(line)) = (symbol.filename(), symbol.lineno()) {
+                let file = file.to_string_lossy();
+                let parts: Vec<&str> = file.rsplitn(4, '/').collect();
+                let short: Vec<&str> = parts.iter().take(3).rev().copied().collect();
+                let _ = write!(text, " ({}:{line})", short.join("/"));
+            }
+            if text.len() > 240 {
+                let mut end = 240;
+                while !text.is_char_boundary(end) {
+                    end -= 1;
+                }
+                text.truncate(end);
+            }
+            names.push(text);
+        });
+        if names.is_empty() {
+            names.push(format!("{addr:#x}"));
+        }
+        names
+    }
+
+    /// Groups the live samples by the first frames of their stacks that aren't plumbing, and
+    /// lists the `top` sites that hold the most sampled bytes.
+    pub fn report(rss_kb: u64, top: usize) -> String {
+        let samples: Vec<Sample> = SAMPLES
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .entries
+            .iter()
+            .flatten()
+            .copied()
+            .collect();
+        let mut names: HashMap<usize, Vec<String>> = HashMap::new();
+        // A site's sampled bytes, its count of samples, and the sum of their sizes.
+        let mut sites: HashMap<Vec<String>, (u64, u64, u64)> = HashMap::new();
+        for sample in &samples {
+            let mut key = Vec::new();
+            for (i, &ip) in sample.frames[..sample.len].iter().enumerate() {
+                // Each return address after the first frame's is one byte past its call.
+                let addr = if i == 0 { ip } else { ip.saturating_sub(1) };
+                let frame = names.entry(addr).or_insert_with(|| resolve(addr));
+                for name in frame.iter() {
+                    if key.len() < KEY_FRAMES && !is_plumbing(name) {
+                        key.push(name.clone());
+                    }
+                }
+                if key.len() == KEY_FRAMES {
+                    break;
+                }
+            }
+            let site = sites.entry(key).or_insert((0, 0, 0));
+            site.0 += sample.weight;
+            site.1 += 1;
+            site.2 += sample.size as u64;
+        }
+        let mut sites: Vec<_> = sites.into_iter().collect();
+        sites.sort_by(|a, b| (b.1).0.cmp(&(a.1).0));
+        let sampled: u64 = samples.iter().map(|sample| sample.weight).sum();
+        let mut out = String::new();
+        let _ = writeln!(
+            out,
+            "[heap-report] VmRSS_kB={rss_kb} live_kB={} sampled_live_kB={} samples={} sites={}",
+            live_kb(),
+            sampled / 1024,
+            samples.len(),
+            sites.len(),
+        );
+        for (rank, (frames, (bytes, count, sizes))) in sites.iter().take(top).enumerate() {
+            let _ = writeln!(
+                out,
+                "[heap-site] rank={} sampled_kB={} samples={count} mean_size_B={}",
+                rank + 1,
+                bytes / 1024,
+                sizes / (*count).max(1),
+            );
+            for frame in frames {
+                let _ = writeln!(out, "[heap-site]     {frame}");
+            }
+        }
+        out
     }
 }
 
