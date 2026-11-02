@@ -24,7 +24,13 @@
 //!   it.
 //! - `DC_CROSS_HOST_RUN_MS`, `DC_CROSS_HOST_STREAM_INTERVAL_MS` and `DC_CROSS_HOST_STREAM_BYTES`
 //!   (client): how long the client starts streams for, how often it starts one, and the length of
-//!   each request, which the server writes back.
+//!   each request, which the server writes back. Where the schedule has a drop, the run has to
+//!   outlast the drop's end by the crate's idle timeout and its dead-peer cooldown together
+//!   (`endpoint::DEFAULT_IDLE_TIMEOUT` and `endpoint::DEFAULT_DEAD_PEER_COOLDOWN`): a stream that
+//!   starts just before the drop ends can stay open until the idle timeout declares the peer dead,
+//!   the client's streams then fail until the cooldown ends, and the client needs a completed
+//!   stream that starts after the drop ends and one more after it. The client checks only that the
+//!   run ends after the drop does.
 //!
 //! The schedule's times count from the start of the client end. The client runs one stream at a
 //! time and asserts that each stream that ended before the drop started completed, that a stream
@@ -334,7 +340,11 @@ async fn run_client(schedule: Schedule, started: Instant) {
     assert!(size > 0, "DC_CROSS_HOST_STREAM_BYTES is zero");
     assert!(
         !schedule.has_drop() || run > schedule.drop_end(),
-        "the run ends before the link drop does"
+        "the run ends before the link drop does: DC_CROSS_HOST_RUN_MS has to outlast the drop's \
+         end by the idle timeout ({} ms) and the dead-peer cooldown ({} ms), so that a stream \
+         that starts after the drop ends completes and one more stream follows it",
+        ms(endpoint::DEFAULT_IDLE_TIMEOUT),
+        ms(endpoint::DEFAULT_DEAD_PEER_COOLDOWN)
     );
     let mut results = Results::open("client", schedule);
 
