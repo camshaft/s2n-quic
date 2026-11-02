@@ -144,16 +144,11 @@ impl Client {
                 self.endpoint.dead_peer_cooldown,
             )
         {
-            self.endpoint
-                .path_secret_map
-                .evict_entry(&path_secret_entry);
-            // The handshake queue may still hold the success of the handshake that built the
-            // evicted entry, and would return it without handshaking. Drop that hold, so the
-            // next call handshakes and inserts a new entry.
-            self.psk.forget_completed_handshake(peer_addr);
+            // Connects that find the same entry at once share one handshake, and a later one
+            // gets that handshake's entry, as `handshake_replacing` says.
             let (peer, kind) = self
                 .psk
-                .handshake_with_entry(peer_addr, self.server_name.clone())
+                .handshake_replacing(peer_addr, &path_secret_entry, self.server_name.clone())
                 .await?;
             path_secret_entry = peer.into_raw();
             handshake_kind = kind;
