@@ -565,8 +565,10 @@ fn send_idle_wheel_marks_dead_a_peer_that_doesnt_answer_the_probe_after_its_stre
 }
 
 /// A probe that the frame submission channel refuses, as once its receiver has closed it: the
-/// drain doesn't record a refused probe, and tries it again at the next wheel tick instead of
-/// waiting for the idle deadline on a probe that never went out.
+/// drain doesn't record a refused probe, and since a closed channel doesn't open again, it waits
+/// for the idle deadline instead of trying the probe again at each wheel tick. The check at the
+/// deadline tries the probe once more, and once it is refused again, the idle timeout decides:
+/// the context is evicted, and its open stream marks the peer dead.
 #[test]
 fn send_idle_wheel_retries_a_probe_the_submission_channel_refuses() {
     let _guard = crate::testing::without_snapshots();
@@ -593,9 +595,10 @@ fn send_idle_wheel_retries_a_probe_the_submission_channel_refuses() {
         let _ = idle_wheel_tx.send(ctx.clone());
 
         let send_caches = send_caches.clone();
+        let pse = pse.clone();
         async move {
             // Half an idle timeout in, the probe is refused: it isn't recorded, and the context
-            // is checked again at the next wheel tick instead of at the idle deadline.
+            // is checked again at its idle deadline instead of at the next wheel tick.
             (idle / 2 + 3.s()).sleep().await;
             assert!(
                 ctx.borrow().idle_probe_for.is_none(),
@@ -606,15 +609,42 @@ fn send_idle_wheel_retries_a_probe_the_submission_channel_refuses() {
                 ctx.borrow()
                     .idle_wheel
                     .target_time
-                    .is_some_and(|next_check| next_check.nanos < deadline.nanos),
-                "a refused probe should be tried again before the idle deadline"
+                    .is_some_and(|next_check| next_check.nanos == deadline.nanos),
+                "a refused probe should wait for the idle deadline"
             );
             assert_eq!(
                 send_caches[LocalSendSocketId::new(0)]
                     .borrow()
                     .context_count(),
                 1,
-                "the context should be kept while the probe is tried again"
+                "the context should be kept until its idle deadline"
+            );
+
+            // At the idle deadline, the probe is refused again, and the idle timeout decides at
+            // that check: the context isn't checked again a tick later.
+            (idle / 2).sleep().await;
+            assert!(
+                ctx.borrow().idle_probe_for.is_none(),
+                "a probe refused at the idle deadline shouldn't be recorded"
+            );
+            assert!(
+                ctx.borrow()
+                    .idle_wheel
+                    .target_time
+                    .is_some_and(|last_check| last_check.nanos == deadline.nanos),
+                "a probe refused at the idle deadline shouldn't reschedule the context"
+            );
+            assert_eq!(
+                send_caches[LocalSendSocketId::new(0)]
+                    .borrow()
+                    .context_count(),
+                0,
+                "the context should be evicted at the idle deadline"
+            );
+            let now = precision::Clock::now(&Clock::default());
+            assert!(
+                pse.is_dead_during_cooldown(now, crate::endpoint::DEFAULT_DEAD_PEER_COOLDOWN),
+                "the open stream should mark the peer dead at the idle deadline"
             );
             drop(stream);
         }
