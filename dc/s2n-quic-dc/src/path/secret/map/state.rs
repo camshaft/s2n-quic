@@ -109,7 +109,8 @@ where
 
     /// Sets whether a server entry is evicted when an UnknownPathSecret packet for it is
     /// accepted. A client entry is evicted on such a packet whatever this setting, so that the
-    /// client's next connect handshakes again.
+    /// client's next connect handshakes again once the handshake queue doesn't hold a recent
+    /// success for the peer.
     pub fn with_evict_on_unknown_path_secret(mut self, should_evict: bool) -> Self {
         self.should_evict_on_unknown_path_secret = should_evict;
         self
@@ -447,7 +448,8 @@ where
     socket_sender_count: AtomicUsize,
 
     // Determines if a server path secret is evicted upon receiving an UnknownPathSecret packet.
-    // A client path secret is always evicted then, so that its next connect handshakes again.
+    // A client path secret is always evicted then, so that its next connect handshakes again
+    // once the handshake queue doesn't hold a recent success for the peer.
     should_evict_on_unknown_path_secret: bool,
 
     // peers is the most recent entry originating from a locally *or* remote initiated handshake.
@@ -1145,7 +1147,8 @@ where
         // The peer no longer holds this entry. A client entry is evicted whatever the map's
         // setting: a client's connect reuses the entry `Map::get_tracked` returns, so a kept
         // entry would fail every connect until the process restarts, and an evicted one makes the
-        // next connect handshake again. `evict` keeps a newer entry for the same peer address.
+        // next connect handshake again once the handshake queue doesn't hold a recent success for
+        // the peer. `evict` keeps a newer entry for the same peer address.
         if self.should_evict_on_unknown_path_secret()
             || entry.id().endpoint_type() == endpoint::Type::Client
         {
