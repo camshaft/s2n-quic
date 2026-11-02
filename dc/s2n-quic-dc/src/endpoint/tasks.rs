@@ -1178,7 +1178,9 @@ where
 /// [`frame::FailureReason::PeerDead`], and `peer_dead_tx` is notified only when the idle expiry
 /// also indicates an unresponsive peer: one that left packets unacknowledged, one that didn't
 /// answer a probe while a stream on its path is open, or one whose path has an open stream and
-/// an idle check that ran more than a wheel tick late. Each stream that such an expiry resets on
+/// an idle check that ran more than a wheel tick late. The peer is marked dead too where its
+/// path has an open stream and `frame_tx` refused the probe at the idle deadline, as once the
+/// endpoint shuts down. Each stream that such an expiry resets on
 /// this side, each stream whose frames it fails and each stream open on the path, is owed a
 /// reset, which the receive path sends once a packet from the peer clears the dead mark
 /// (`Entry::mark_dead_owing_resets`).
@@ -1188,7 +1190,9 @@ where
 /// check was armed for the deadline, so that a peer that is reachable answers before the idle
 /// timeout decides. A path with an open stream whose idle check runs late, as where this side
 /// was suspended, marks the peer dead without a probe: the peer marks this side dead under the
-/// same rule by then. Probes go out on `frame_tx`.
+/// same rule by then. Probes go out on `frame_tx`, which refuses one only once its receiver has
+/// closed it, and a closed channel doesn't open again: a refused probe isn't recorded, and the
+/// context waits for its idle deadline, where the check tries the probe once more.
 pub async fn send_idle_wheel_drain<Clk, WakerSink, AckComp>(
     rx: intrusive::unsync::Receiver<send::IdleWheelAdapter>,
     idle_wheel_tx: intrusive::unsync::Sender<send::IdleWheelAdapter>,
@@ -1257,13 +1261,11 @@ pub async fn send_idle_wheel_drain<Clk, WakerSink, AckComp>(
                             target = probe_at;
                         } else if target.nanos_since(now) >= wheel::SECOND_GRANULARITY_NANOS {
                             drop(ctx);
-                            // A probe the submission channel refuses isn't recorded, and is tried
-                            // again at the next wheel tick, until the idle timeout falls within a
-                            // tick and decides.
-                            if !send_idle_probe(&context, last_activity, &mut frame_tx) {
-                                let tick = wheel::SECOND_GRANULARITY_NANOS;
-                                target = now + core::time::Duration::from_nanos(tick);
-                            }
+                            // A probe the submission channel refuses isn't recorded, and the
+                            // context waits for its idle deadline, which decides: the channel
+                            // refuses only once its receiver has closed it, and a closed channel
+                            // doesn't open again, so each try before the deadline is refused too.
+                            let _ = send_idle_probe(&context, last_activity, &mut frame_tx);
                             context.borrow_mut().idle_wheel.target_time = Some(target);
                             let _ = UnboundedSender::send(&mut idle_wheel_tx, context);
                             idle_rescheduled.add(1);
@@ -1286,21 +1288,23 @@ pub async fn send_idle_wheel_drain<Clk, WakerSink, AckComp>(
                 // check runs on time, within a wheel tick of the idle deadline, probe the peer now
                 // and give the probe half an idle timeout to be answered before the idle timeout
                 // decides. Where it runs later than that, as after this side was suspended, the
-                // peer has marked this side dead under the same rule by then: expire below.
+                // peer has marked this side dead under the same rule by then: expire below. A
+                // probe the submission channel refuses here isn't tried again, since a closed
+                // channel doesn't open again: the idle timeout decides now, below.
                 let late = now.nanos_since(last_activity + idle_timeout)
                     >= wheel::SECOND_GRANULARITY_NANOS;
-                if wants_probe && !late {
+                let ctx = if wants_probe && !late {
                     drop(ctx);
-                    let mut target = now + idle_timeout / 2;
-                    if !send_idle_probe(&context, last_activity, &mut frame_tx) {
-                        let tick = wheel::SECOND_GRANULARITY_NANOS;
-                        target = now + core::time::Duration::from_nanos(tick);
+                    if send_idle_probe(&context, last_activity, &mut frame_tx) {
+                        context.borrow_mut().idle_wheel.target_time = Some(now + idle_timeout / 2);
+                        let _ = UnboundedSender::send(&mut idle_wheel_tx, context);
+                        idle_rescheduled.add(1);
+                        return;
                     }
-                    context.borrow_mut().idle_wheel.target_time = Some(target);
-                    let _ = UnboundedSender::send(&mut idle_wheel_tx, context);
-                    idle_rescheduled.add(1);
-                    return;
-                }
+                    context.borrow()
+                } else {
+                    ctx
+                };
 
                 // Expired: either is_peer_idle fired, or the target landed on
                 // the current tick (within wheel granularity).
@@ -1381,10 +1385,11 @@ pub async fn send_idle_wheel_drain<Clk, WakerSink, AckComp>(
                 // has given up on the path: packets it never acknowledged, a probe of the quiet
                 // path it didn't answer (`probed`), or an open stream on a path whose idle check
                 // ran late, as after this side was suspended (`open_stream`: an open stream
-                // checked on time with no probe yet is probed above instead). The peer marks
-                // this side dead under the same rule, so a stream doesn't stay open on one side
-                // alone. Without any of these, both sides simply stopped talking (natural idle)
-                // and we must not mark dead.
+                // checked on time with no probe yet is probed above instead, and is marked dead
+                // here only where the submission channel refused that probe, as once the
+                // endpoint shuts down). The peer marks this side dead under the same rule, so a
+                // stream doesn't stay open on one side alone. Without any of these, both sides
+                // simply stopped talking (natural idle) and we must not mark dead.
                 let unresponsive = has_inflight || probed || open_stream;
 
                 // Keep the stream of each frame the invalidation fails. Where the peer is
