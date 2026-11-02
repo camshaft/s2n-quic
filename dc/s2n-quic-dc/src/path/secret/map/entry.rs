@@ -473,16 +473,20 @@ impl Entry {
     /// every MaxData update. The records come before the mark, so that a packet from the peer
     /// that arrives between the two doesn't find a mark to clear, and the packet that clears the
     /// mark finds every record. Returns how many of the streams weren't owed already, as
-    /// [`Self::owe_resets`] does, and whether it marked the entry dead.
+    /// [`Self::owe_resets`] does, and, where it marked the entry dead, the open streams it read:
+    /// the streams the dead mark resets on this side (`peer_dead_broadcast`), each of them owed a
+    /// reset. A stream that read doesn't name, one bound after it or one whose writer hadn't
+    /// recorded the peer's queue yet, isn't reset on this side, and so isn't owed.
     pub fn mark_dead_owing_resets(
         &self,
         now: crate::time::precision::Timestamp,
         cooldown: Duration,
         failed: impl IntoIterator<Item = OwedReset>,
-    ) -> (usize, bool) {
+    ) -> (usize, Option<Vec<OwedReset>>) {
         let open = self.queue_state.open_streams();
-        let recorded = self.owe_resets(failed.into_iter().chain(open));
-        (recorded, self.mark_dead_if_cooldown_elapsed(now, cooldown))
+        let recorded = self.owe_resets(failed.into_iter().chain(open.iter().copied()));
+        let marked = self.mark_dead_if_cooldown_elapsed(now, cooldown);
+        (recorded, marked.then_some(open))
     }
 
     pub fn last_activity(&self) -> crate::time::precision::Timestamp {
