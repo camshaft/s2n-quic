@@ -89,6 +89,64 @@ fn touch_activity_clears_dead_cooldown() {
     );
 }
 
+/// A dead mark asks for a fresh entry once the dead-peer cooldown has passed and the peer has
+/// been silent for a whole idle timeout. A mark within the cooldown, a shorter silence, a young
+/// entry that hasn't heard from the peer yet, or a packet from the peer doesn't.
+#[test]
+fn dead_and_silent_after_cooldown_and_one_idle_timeout() {
+    let entry = test_entry_with_senders(0);
+    let idle = entry.idle_timeout();
+    assert!(
+        idle >= Duration::from_secs(1),
+        "the cases below need an idle timeout of at least 1s"
+    );
+    let cooldown = idle / 4;
+    let old = idle * 10;
+    let ms = Duration::from_millis(1);
+
+    let t0: crate::time::precision::Timestamp =
+        (unsafe { Timestamp::from_duration(Duration::from_secs(1000)) }).into();
+    entry.touch_activity(t0);
+    assert!(
+        !entry.is_dead_and_silent(t0 + idle * 2, old, cooldown),
+        "never marked dead"
+    );
+
+    let marked = t0 + idle / 10;
+    assert!(entry.mark_dead_if_cooldown_elapsed(marked, cooldown));
+    assert!(
+        !entry.is_dead_and_silent(marked + cooldown - ms, old, cooldown),
+        "within the dead-peer cooldown"
+    );
+    assert!(
+        !entry.is_dead_and_silent(t0 + idle - ms, old, cooldown),
+        "past the cooldown, silent for less than an idle timeout"
+    );
+    assert!(
+        entry.is_dead_and_silent(t0 + idle, old, cooldown),
+        "past the cooldown, and silent for an idle timeout"
+    );
+
+    entry.touch_activity(t0 + idle + Duration::from_secs(1));
+    assert!(
+        !entry.is_dead_and_silent(t0 + idle * 3, old, cooldown),
+        "a packet from the peer clears the dead mark"
+    );
+
+    // An entry that hasn't received a packet yet counts its silence from its creation.
+    let fresh = test_entry_with_senders(0);
+    assert!(fresh.mark_dead_if_cooldown_elapsed(marked, cooldown));
+    let after_cooldown = marked + cooldown;
+    assert!(
+        !fresh.is_dead_and_silent(after_cooldown, idle - ms, cooldown),
+        "an untouched entry younger than an idle timeout"
+    );
+    assert!(
+        fresh.is_dead_and_silent(after_cooldown, idle, cooldown),
+        "an untouched entry as old as an idle timeout"
+    );
+}
+
 #[test]
 fn allocates_sender_schedule_slots() {
     let entry = test_entry_with_senders(4);
