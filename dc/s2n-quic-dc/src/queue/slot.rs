@@ -795,11 +795,33 @@ impl Slot {
     /// `HAS_SENDER` — this is a transient notification (peer-dead cooldown),
     /// not a permanent close.
     pub(crate) fn broadcast_reset(&self, error_code: VarInt) -> (half::AutoWake, half::AutoWake) {
+        self.reset_halves(None, error_code)
+    }
+
+    /// Push Reset into both halves, as [`Self::broadcast_reset`] does, where the slot still holds
+    /// `binding_id`: a slot freed since, or bound again, is left as it is, so that a reset of one
+    /// stream doesn't end a stream bound after it.
+    pub(crate) fn reset_binding(
+        &self,
+        binding_id: VarInt,
+        error_code: VarInt,
+    ) -> (half::AutoWake, half::AutoWake) {
+        self.reset_halves(Some(binding_id), error_code)
+    }
+
+    /// Pushes Reset into both halves of an allocated slot whose binding is `binding_id`, or of
+    /// any allocated slot where `binding_id` is `None`.
+    fn reset_halves(
+        &self,
+        binding_id: Option<VarInt>,
+        error_code: VarInt,
+    ) -> (half::AutoWake, half::AutoWake) {
         let mut s = self.stream.inner.lock();
         let mut c = self.control.inner.lock();
 
         let raw = self.binding_id.load(Ordering::Relaxed);
-        if raw & UNALLOCATED_BIT != 0 {
+        let other_binding = matches!(binding_id, Some(binding_id) if binding_id.as_u64() != raw);
+        if raw & UNALLOCATED_BIT != 0 || other_binding {
             return (half::AutoWake::default(), half::AutoWake::default());
         }
 
@@ -1209,6 +1231,42 @@ mod tests {
             slot.owed_reset(),
             None,
             "a new binding clears the peer's queue of the one before it"
+        );
+    }
+
+    /// `reset_binding` pushes a Reset into both halves while the slot holds the binding it names,
+    /// and leaves the slot as it is for another binding, as once the slot is freed and bound again.
+    #[test]
+    fn reset_binding_resets_the_slot_only_while_it_holds_the_binding() {
+        let slot = Slot::with_queue_id(v(3));
+        slot.allocate_and_open(v(5), 0).unwrap();
+
+        slot.reset_binding(v(4), v(42));
+        assert_eq!(slot.stream.inner.lock().queue.len(), 0, "another binding");
+        assert_eq!(slot.control.inner.lock().queue.len(), 0, "another binding");
+
+        slot.reset_binding(v(5), v(42));
+        assert!(matches!(
+            slot.stream.inner.lock().queue.pop_front().map(|e| e.into_inner()),
+            Some(msg::Stream::Reset { error_code }) if error_code == v(42)
+        ));
+        assert!(matches!(
+            slot.control.inner.lock().queue.pop_front().map(|e| e.into_inner()),
+            Some(msg::Control::Reset { error_code }) if error_code == v(42)
+        ));
+
+        simulate_receiver_drop(&slot);
+        slot.allocate_and_open(v(6), 0).unwrap();
+        slot.reset_binding(v(5), v(42));
+        assert_eq!(
+            slot.stream.inner.lock().queue.len(),
+            0,
+            "a reset of the binding before doesn't end the stream bound after it"
+        );
+        assert_eq!(
+            slot.control.inner.lock().queue.len(),
+            0,
+            "a reset of the binding before doesn't end the stream bound after it"
         );
     }
 

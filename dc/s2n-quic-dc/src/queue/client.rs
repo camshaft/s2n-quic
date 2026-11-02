@@ -182,8 +182,37 @@ impl ClientState {
             .wake_all(&mut |w| waker_sink(AutoWake::new(Some(w))));
     }
 
+    /// Push Reset into the slot of each of `streams` that still holds the stream's binding, and
+    /// wake blocked alloc waiters, as [`Self::broadcast_reset`] does for every allocated slot.
+    ///
+    /// `streams` are the streams that [`Self::open_streams`] read as the dead mark recorded the
+    /// resets it owes the peer (`Entry::mark_dead_owing_resets`). A slot that read doesn't name,
+    /// one bound after it or one whose writer hadn't recorded the peer's queue yet, isn't reset,
+    /// and neither is a slot freed or bound again since: each stream the dead mark resets on this
+    /// side is owed a reset.
+    pub fn reset_streams(
+        &self,
+        streams: &[super::OwedReset],
+        error_code: VarInt,
+        waker_sink: &mut impl FnMut(AutoWake),
+    ) {
+        let mut view = SenderView::new();
+        for stream in streams {
+            let index = stream.queue_pair.source_queue_id.as_u64() as usize;
+            let Some(slot) = view.get(index, &self.pages) else {
+                continue;
+            };
+            let (sw, cw) = slot.reset_binding(stream.binding_id, error_code);
+            waker_sink(sw);
+            waker_sink(cw);
+        }
+        self.peer_free
+            .wake_all(&mut |w| waker_sink(AutoWake::new(Some(w))));
+    }
+
     /// The stream of each allocated slot whose writer recorded the peer's queue, as a reset of it
-    /// that this side owes the peer routes: the streams that `broadcast_reset` resets.
+    /// that this side owes the peer routes. The dead mark resets these streams alone
+    /// ([`Self::reset_streams`]).
     pub fn open_streams(&self) -> Vec<super::OwedReset> {
         let mut streams = Vec::new();
         let mut view = SenderView::new();
@@ -534,5 +563,30 @@ mod tests {
         assert!(matches!(err, Err(Error::FutureBinding(_))));
 
         drop(result);
+    }
+
+    /// `reset_streams` wakes each alloc waiter that waits for a peer queue, as `broadcast_reset`
+    /// does, so that a caller blocked on a peer marked dead checks the dead mark again.
+    #[test]
+    fn reset_streams_wakes_blocked_alloc_waiters() {
+        struct Noop;
+        impl std::task::Wake for Noop {
+            fn wake(self: Arc<Self>) {}
+        }
+
+        let state = test_state(1);
+        let held = try_alloc(&state).expect("the one peer queue is free");
+        let waker = Waker::from(Arc::new(Noop));
+        let mut cx = Context::from_waker(&waker);
+        let mut waiter = None;
+        assert!(
+            state.peer_free.poll_alloc(&mut waiter, &mut cx).is_pending(),
+            "every peer queue is taken"
+        );
+
+        let mut woken = 0;
+        state.reset_streams(&[], v(42), &mut |wake| woken += wake.is_some() as usize);
+        assert_eq!(woken, 1, "the waiter is woken");
+        drop(held);
     }
 }
