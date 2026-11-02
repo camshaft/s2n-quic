@@ -23,11 +23,9 @@ pub async fn rx<S: Into<std::net::UdpSocket>, M: UnixMessage + Unpin>(
     let socket = socket.into();
     socket.set_nonblocking(true).unwrap();
 
-    // Newer tokio releases deprecate `AsyncFd::new` in favor of `AsyncFd::register`, but this
-    // crate's `tokio = "1"` requirement also allows older releases that don't have `register`.
-    // `AsyncFd` owns the socket here, so its file descriptor stays open while it's registered.
-    #[allow(deprecated)]
-    let socket = AsyncFd::new(socket).unwrap();
+    // SAFETY: the `AsyncFd` owns the socket, so the socket's file descriptor stays open, and
+    // `as_raw_fd` returns that same descriptor, until the `AsyncFd` drops.
+    let socket = unsafe { AsyncFd::register(socket) }.unwrap();
     let result = rx::Receiver::new(producer, socket, cooldown, stats).await;
     if let Some(err) = result {
         Err(err)
@@ -46,9 +44,8 @@ pub async fn tx<S: Into<std::net::UdpSocket>, M: UnixMessage + Unpin>(
     let socket = socket.into();
     socket.set_nonblocking(true).unwrap();
 
-    // See the comment in `rx` on why this uses the deprecated `AsyncFd::new`.
-    #[allow(deprecated)]
-    let socket = AsyncFd::new(socket).unwrap();
+    // SAFETY: see `rx`: the `AsyncFd` owns the socket for as long as it's registered.
+    let socket = unsafe { AsyncFd::register(socket) }.unwrap();
     let result = tx::Sender::new(consumer, socket, gso, cooldown, stats).await;
     if let Some(err) = result {
         Err(err)
