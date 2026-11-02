@@ -1424,10 +1424,16 @@ pub async fn send_idle_wheel_drain<Clk, WakerSink, AckComp>(
 /// probes by its last peer activity. Returns whether the channel accepted the Ping.
 ///
 /// The Ping goes through the frame pipeline as any frame does, so it is transmitted,
-/// retransmitted after each probe timeout, and acknowledged as any packet is: an answer
-/// refreshes the context's `last_peer_activity`, and a peer that doesn't answer leaves it
-/// unacknowledged until the idle timeout decides. The submission channel has no backpressure,
-/// so it refuses the Ping only once its receiver has closed it, as when the endpoint shuts down.
+/// retransmitted after each probe timeout, and acknowledged as any packet is, on the context
+/// that `context_resolver` takes from the send cache for the path. A peer that doesn't answer
+/// leaves the Ping unacknowledged until the idle timeout decides. An answer moves the path
+/// entry's last activity, which `send_idle_wheel_drain` reads beside the context's
+/// `last_peer_activity`, and its acknowledgement refreshes the `last_peer_activity` of the
+/// context that sent the Ping. For an invalidated context, which the cache no longer holds, that
+/// is the path's current context, or a new one the cache makes for the path, so the answer
+/// reaches the invalidated context through the path entry alone: its own `last_peer_activity`
+/// doesn't change. The submission channel has no backpressure, so it refuses the Ping only once
+/// its receiver has closed it, as when the endpoint shuts down.
 fn send_idle_probe(
     context: &Rc<RefCell<send::Context>>,
     last_activity: precision::Timestamp,
