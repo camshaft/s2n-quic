@@ -150,6 +150,34 @@ pub fn init_tracing() {
 
     // make sure this only gets initialized once
     TRACING.call_once(|| {
+        // CI diagnostic, not for merge: print this test process's memory every 2 s, straight to
+        // stderr so that the test harness doesn't capture it.
+        #[cfg(all(test, target_os = "linux"))]
+        std::thread::spawn(|| {
+            use std::io::Write as _;
+            fn field(text: &str, key: &str) -> String {
+                text.lines()
+                    .find(|line| line.starts_with(key))
+                    .and_then(|line| line.split_whitespace().nth(1))
+                    .unwrap_or("?")
+                    .to_string()
+            }
+            loop {
+                let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+                let meminfo = std::fs::read_to_string("/proc/meminfo").unwrap_or_default();
+                let line = format!(
+                    "[rss-monitor] VmRSS_kB={} VmHWM_kB={} Threads={} MemAvailable_kB={} MemTotal_kB={}\n",
+                    field(&status, "VmRSS:"),
+                    field(&status, "VmHWM:"),
+                    field(&status, "Threads:"),
+                    field(&meminfo, "MemAvailable:"),
+                    field(&meminfo, "MemTotal:"),
+                );
+                let _ = std::io::stderr().write_all(line.as_bytes());
+                std::thread::sleep(Duration::from_secs(2));
+            }
+        });
+
         // Arm the frame/packet flight recorder for the duration of the test process. `record` keeps
         // the enable out of its hot path (the application owns it; production uses `BACKBEAT_ENABLE`),
         // so the crate's own tests enable it here, once.
