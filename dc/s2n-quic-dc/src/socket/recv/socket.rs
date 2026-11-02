@@ -511,3 +511,44 @@ mod tests {
         );
     }
 }
+
+#[cfg(all(test, feature = "tokio", windows))]
+mod windows_tests {
+    use super::*;
+    use std::net::{SocketAddr, UdpSocket};
+
+    /// A Windows tokio recv socket returns `Pending` while no datagram has arrived, and once one
+    /// arrives the reactor wakes it, and `poll_recv` returns the datagram and its sender's address.
+    #[tokio::test]
+    async fn poll_recv_waits_for_a_datagram_and_returns_it() {
+        let receiver = UdpSocket::bind("127.0.0.1:0").unwrap();
+        receiver.set_nonblocking(true).unwrap();
+        let to = receiver.local_addr().unwrap();
+        let socket = Tokio::new(receiver).unwrap();
+        let sender = UdpSocket::bind("127.0.0.1:0").unwrap();
+
+        let mut addr = Addr::default();
+        let mut cmsg = cmsg::Receiver::default();
+        let mut data = [0u8; 64];
+
+        let first = core::future::poll_fn(|cx| {
+            let mut buffer = [IoSliceMut::new(&mut data)];
+            Poll::Ready(socket.poll_recv(cx, &mut addr, &mut cmsg, &mut buffer))
+        })
+        .await;
+        assert!(first.is_pending(), "nothing was sent yet: {first:?}");
+
+        let payload = b"hello from the tokio recv socket";
+        sender.send_to(payload, to).unwrap();
+
+        let len = core::future::poll_fn(|cx| {
+            let mut buffer = [IoSliceMut::new(&mut data)];
+            socket.poll_recv(cx, &mut addr, &mut cmsg, &mut buffer)
+        })
+        .await
+        .unwrap();
+        assert_eq!(&data[..len], payload);
+        let from: SocketAddr = addr.get().into();
+        assert_eq!(from, sender.local_addr().unwrap());
+    }
+}
