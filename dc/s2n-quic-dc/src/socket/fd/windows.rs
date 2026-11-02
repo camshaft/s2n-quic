@@ -1061,27 +1061,36 @@ mod tests {
         let payload = [3u8; 32];
         let iov = [IoSlice::new(&payload)];
 
-        // A loopback port that nothing listens on: the socket that held it is closed.
-        let closed = {
+        // A loopback port that nothing listens on once `holder` is closed. Each socket of the test
+        // binds while `holder` still holds that port, so none of them can take it.
+        let holder = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let closed_port = holder.local_addr().unwrap().port();
+        let closed = Addr::new(holder.local_addr().unwrap().into());
+        let bind_open = |name: &str| {
             let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
-            Addr::new(socket.local_addr().unwrap().into())
+            let port = socket.local_addr().unwrap().port();
+            assert_ne!(port, closed_port, "`{name}` holds the closed port");
+            socket
         };
+        let a = bind_open("a");
+        let unconfigured = bind_open("unconfigured");
+        let c = bind_open("c");
 
-        let a = UdpSocket::bind("127.0.0.1:0").unwrap();
         let features = configure(&a, u16::MAX as u32);
         assert_eq!(features.ignore_connreset, Support::Enabled);
+
+        // Close the port only once every socket of the test is bound.
+        drop(holder);
         send(&a, &closed, not_ect, &iov, None, 0).unwrap();
 
         // On a socket `configure` didn't set up, the port unreachable for a send to the closed
         // port fails the next receive. That socket sends after `a`, so by the time its receive
         // fails, the port unreachable for `a`'s earlier send has arrived too.
-        let unconfigured = UdpSocket::bind("127.0.0.1:0").unwrap();
         send(&unconfigured, &closed, not_ect, &iov, None, 0).unwrap();
         let error = try_recv(&unconfigured, 1500).unwrap_err();
         assert_eq!(error.raw_os_error(), Some(WinSock::WSAECONNRESET as i32));
 
         // `a`'s next receive returns the next datagram that arrives.
-        let c = UdpSocket::bind("127.0.0.1:0").unwrap();
         c.send_to(&payload, a.local_addr().unwrap()).unwrap();
         let (len, from, _cmsg, received) = recv_one(&a, u16::MAX as usize);
         assert_eq!(len, payload.len());
