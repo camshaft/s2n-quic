@@ -228,7 +228,13 @@ impl Future for ClientAllocFuture<'_> {
         match this.state.peer_free.poll_alloc(&mut this.waiter, cx) {
             Poll::Ready(Some(dest_queue_id)) => {
                 match this.state.alloc_local(dest_queue_id) {
-                    Some(result) => Poll::Ready(Some(result)),
+                    Some(result) => {
+                        // A stream the application opened on the entry before the map evicted
+                        // it can be allocated after `revoke` reset the entry's slots (see
+                        // `Entry::reset_if_revoked`).
+                        this.entry.reset_if_revoked(result.stream.slot());
+                        Poll::Ready(Some(result))
+                    }
                     // We popped a peer ID but couldn't pair it with a local slot
                     // (the local free list is closed/exhausted). Return the peer ID
                     // to the free list instead of dropping it on the floor —
@@ -485,5 +491,49 @@ mod tests {
         assert!(matches!(err, Err(Error::FutureBinding(_))));
 
         drop(result);
+    }
+
+    /// The client entry of a stream, as `Client::connect` reads it from the path secret map.
+    fn client_entry() -> Arc<Entry> {
+        use s2n_quic_core::dc;
+        let mut params = dc::testing::TEST_APPLICATION_PARAMS;
+        params.max_queues = v(10);
+        Entry::builder("127.0.0.1:4433".parse().unwrap())
+            .endpoint_type(s2n_quic_core::endpoint::Type::Client)
+            .params(params)
+            .build(None)
+    }
+
+    /// Allocates a stream on `entry`, as `Client::connect` does.
+    fn alloc_on(entry: &Entry) -> AllocResult {
+        use crate::path::secret::map::entry::QueueState;
+        let QueueState::Client(state) = entry.queue_state() else {
+            panic!("expected Client queue state");
+        };
+        let (waker, _wakes) = test_waker();
+        let mut cx = test_context(&waker);
+        let mut alloc = core::pin::pin!(state.alloc(entry, Duration::ZERO));
+        match alloc.as_mut().poll(&mut cx) {
+            Poll::Ready(Some(result)) => result,
+            _ => panic!("expected an allocation"),
+        }
+    }
+
+    /// `Entry::revoke` resets each stream allocated before it, and a stream the application opens
+    /// on an entry it read before the map evicted it can be allocated after `revoke` visited its
+    /// slot: that stream starts reset too.
+    #[test]
+    fn streams_allocated_before_and_after_revoke_are_reset() {
+        let entry = client_entry();
+        let code = crate::endpoint::error::PEER_KEY_REMOVED;
+
+        let before = alloc_on(&entry);
+        assert_empty(&before.stream, &before.control);
+
+        entry.revoke();
+        assert_next_is_reset(&before.stream, &before.control, code);
+
+        let after = alloc_on(&entry);
+        assert_next_is_reset(&after.stream, &after.control, code);
     }
 }
