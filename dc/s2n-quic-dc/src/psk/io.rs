@@ -295,10 +295,18 @@ impl Client {
             .await
     }
 
-    /// Lets the next handshake with `peer` start at once where its last one succeeded, as
-    /// `HandshakeQueue::remove_completed` says.
-    pub(super) fn forget_completed_handshake(&self, peer: SocketAddr) {
-        self.queue.remove_completed(peer);
+    /// Evicts `stale`, a cached entry for `peer` that the caller found dead and silent, and lets
+    /// the next handshake with `peer` start at once where its last one succeeded, unless the map
+    /// already holds a newer entry for `peer`, as `HandshakeQueue::remove_completed` says.
+    pub(super) fn evict_and_forget_completed(
+        &self,
+        peer: SocketAddr,
+        stale: &Arc<secret::map::Entry>,
+    ) {
+        let map = &self.map;
+        map.evict_entry(stale);
+        let has_newer_entry = || map.get_raw(peer).is_some();
+        self.queue.remove_completed(peer, has_newer_entry);
     }
 }
 
@@ -413,14 +421,20 @@ impl HandshakeQueue {
     /// success, so the next handshake with the peer starts at once instead of returning that
     /// success. An entry whose handshake is still running, or that holds a failure, stays: the
     /// peer still gets one handshake at a time, and a failure keeps its backoff.
-    fn remove_completed(&self, peer: SocketAddr) {
+    ///
+    /// A success also stays where `has_newer_entry` returns true, so a caller that finds the map
+    /// holding a newer entry for the peer, one a concurrent handshake inserted, doesn't drop that
+    /// handshake's hold. It's read after the handshake's result, under this queue's lock: a
+    /// handshake inserts its entry into the map before it records its success here, so a success
+    /// read here already has its entry in the map.
+    fn remove_completed(&self, peer: SocketAddr, has_newer_entry: impl FnOnce() -> bool) {
         let peer: SocketAddress = peer.into();
         let peer_hash = self.hasher.hash_one(peer);
         let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let inner = &mut *guard;
         match inner.table.find_entry(peer_hash, |e| e.peer == peer) {
             Ok(o) => {
-                if matches!(o.get().handshaker.get(), Some(Ok(()))) {
+                if matches!(o.get().handshaker.get(), Some(Ok(()))) && !has_newer_entry() {
                     o.remove();
                 }
             }
@@ -832,14 +846,15 @@ mod tests {
     }
 
     /// A successful handshake's de-duplication entry is removed, so the next handshake with the
-    /// peer starts at once; a handshake still running, or a failed one, stays held.
+    /// peer starts at once; a handshake still running, or a failed one, stays held, and so does
+    /// a success where the map holds a newer entry for the peer.
     #[test]
     fn remove_completed_keeps_running_and_failed_handshakes() {
         let queue = HandshakeQueue::new(Duration::from_secs(60));
         let peer: SocketAddr = "127.0.0.1:3333".parse().unwrap();
 
         let running = queue.allocate_entry(peer, HandshakeReason::User);
-        queue.remove_completed(peer);
+        queue.remove_completed(peer, || false);
         assert!(
             Arc::ptr_eq(&running, &queue.allocate_entry(peer, HandshakeReason::User)),
             "a running handshake stays held"
@@ -847,7 +862,7 @@ mod tests {
 
         let refused = HandshakeFailed(io::Error::from(io::ErrorKind::ConnectionRefused));
         running.handshaker.set(Err(refused)).unwrap();
-        queue.remove_completed(peer);
+        queue.remove_completed(peer, || false);
         assert!(
             Arc::ptr_eq(&running, &queue.allocate_entry(peer, HandshakeReason::User)),
             "a failed handshake stays held"
@@ -856,7 +871,15 @@ mod tests {
         queue.remove_entry(&running);
         let succeeded = queue.allocate_entry(peer, HandshakeReason::User);
         succeeded.handshaker.set(Ok(())).unwrap();
-        queue.remove_completed(peer);
+        queue.remove_completed(peer, || true);
+        assert!(
+            Arc::ptr_eq(
+                &succeeded,
+                &queue.allocate_entry(peer, HandshakeReason::User)
+            ),
+            "a success stays held where the map holds a newer entry for the peer"
+        );
+        queue.remove_completed(peer, || false);
         assert!(
             !Arc::ptr_eq(
                 &succeeded,
