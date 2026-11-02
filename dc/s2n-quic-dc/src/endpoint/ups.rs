@@ -13,6 +13,10 @@
 //! window. A peer that keeps sending on such a key gets each of its packets rejected, far
 //! faster than the background task's pacer sends, so [`Pending`] keeps at most one response
 //! in the queue for each credential and peer sender id.
+//!
+//! The sender of a packet whose credential the map doesn't hold chooses the credential and
+//! sender id of its UnknownPathSecret response, so [`Pending`] also keeps those responses in
+//! the queue within the bytes the pacer sends in one burst.
 
 use crate::{
     counter::{Counter, Registry},
@@ -36,6 +40,32 @@ pub struct Response {
     pub packet: Vec<u8>,
     /// The credential and peer sender id of the packet the response answers.
     pub key: Key,
+    /// Whether the path secret map holds the credential of the packet the response answers.
+    pub kind: Kind,
+}
+
+impl Response {
+    /// The bytes the response holds toward the bound on UnknownPathSecret responses in the
+    /// queue: its packet's for an UnknownPathSecret response, and none for another.
+    fn unknown_bytes(&self) -> u64 {
+        match self.kind {
+            Kind::UnknownPathSecret => self.packet.len() as u64,
+            Kind::Rejection => 0,
+        }
+    }
+}
+
+/// What the packet a response answers carried, which decides what bounds the responses of its
+/// kind in the queue.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kind {
+    /// An UnknownPathSecret response, to a packet whose credential the path secret map doesn't
+    /// hold. The packet's sender chooses its credential and sender id, so [`Pending`] bounds the
+    /// bytes of these responses in the queue by the pacer's burst.
+    UnknownPathSecret,
+    /// A ReplayDetected or StaleKey response, to a packet whose credential the map holds. The
+    /// map's entries and the peer's sender ids bound the keys of these responses.
+    Rejection,
 }
 
 impl ByteCost for Response {
@@ -68,7 +98,8 @@ pub struct Key {
     pub sender_id: VarInt,
 }
 
-/// The keys of the responses waiting in the UPS queue.
+/// The keys of the responses waiting in the UPS queue, and the bytes of the UnknownPathSecret
+/// responses among them.
 ///
 /// [`PendingSender`] queues a response only where no response with its key waits in the
 /// queue, and [`PendingReceiver`] takes the key out as the background task takes the response
@@ -76,19 +107,36 @@ pub struct Key {
 /// sender ids with a rejected packet bound its length, and the rejections don't. The first
 /// rejection after a response leaves the queue queues a new one, so the peer still receives a
 /// response for each key it keeps sending on.
+///
+/// The sender of a packet whose credential the path secret map doesn't hold chooses the key of
+/// its UnknownPathSecret response, so a sender of many distinct credential ids would still
+/// queue one response for each. [`PendingSender`] also drops an UnknownPathSecret response
+/// where the UnknownPathSecret responses waiting in the queue would hold more bytes with it
+/// than the pacer sends in one burst, and queues one whatever its size where none waits. A
+/// peer that keeps sending on a credential the map doesn't hold queues a new response once the
+/// queue has room for it.
 #[derive(Clone)]
 pub struct Pending {
-    keys: Arc<Mutex<HashSet<Key>>>,
+    state: Arc<Mutex<State>>,
     suppressed: Counter,
+    unknown_dropped: Counter,
 }
 
 impl Pending {
     /// `suppressed` counts the responses the sender drops because one with their key waits in
-    /// the queue.
-    pub fn new(suppressed: Counter) -> Self {
+    /// the queue, and `unknown_dropped` the UnknownPathSecret responses it drops because the
+    /// ones waiting would hold more than `unknown_capacity` bytes with it: the bytes the pacer
+    /// that sends the queue sends in one burst,
+    /// [`Rate::burst_bytes`](crate::socket::rate::Rate::burst_bytes).
+    pub fn new(suppressed: Counter, unknown_dropped: Counter, unknown_capacity: u64) -> Self {
         Self {
-            keys: Default::default(),
+            state: Arc::new(Mutex::new(State {
+                keys: Default::default(),
+                unknown_bytes: 0,
+                unknown_capacity,
+            })),
             suppressed,
+            unknown_dropped,
         }
     }
 
@@ -111,16 +159,72 @@ impl Pending {
     /// The number of keys with a response waiting in the queue.
     #[cfg(test)]
     pub fn queued(&self) -> usize {
-        self.keys().len()
+        self.state().keys.len()
     }
 
-    fn keys(&self) -> MutexGuard<'_, HashSet<Key>> {
-        // Each holder makes one insert or one remove, so the set is whole after a panic.
-        self.keys.lock().unwrap_or_else(|err| err.into_inner())
+    /// The bytes of the UnknownPathSecret responses waiting in the queue.
+    #[cfg(test)]
+    pub fn queued_unknown_bytes(&self) -> u64 {
+        self.state().unknown_bytes
+    }
+
+    fn state(&self) -> MutexGuard<'_, State> {
+        // Each holder makes one insert or one remove of a key, with its bytes, so the state is
+        // whole after a panic.
+        self.state.lock().unwrap_or_else(|err| err.into_inner())
     }
 }
 
-/// The sending end of the UPS queue, which drops a response whose key waits in the queue.
+/// The state behind the lock of [`Pending`].
+struct State {
+    /// The key of each response waiting in the queue.
+    keys: HashSet<Key>,
+    /// The bytes of the UnknownPathSecret responses waiting in the queue.
+    unknown_bytes: u64,
+    /// The most bytes of UnknownPathSecret responses the queue holds, unless one response alone
+    /// holds more.
+    unknown_capacity: u64,
+}
+
+/// Why [`PendingSender`] drops a response.
+enum Dropped {
+    /// A response with its key waits in the queue.
+    Waiting,
+    /// It is an UnknownPathSecret response, and the ones waiting in the queue would hold more
+    /// than `unknown_capacity` bytes with it.
+    Full,
+}
+
+impl State {
+    /// Takes in the key and the UnknownPathSecret bytes of a response the sender queues, or
+    /// answers why the sender drops it.
+    fn admit(&mut self, key: Key, unknown_bytes: u64) -> Result<(), Dropped> {
+        if self.keys.contains(&key) {
+            return Err(Dropped::Waiting);
+        }
+        // With no UnknownPathSecret response waiting, the queue takes one whatever its size, so
+        // a burst smaller than one response doesn't keep each of them out.
+        if unknown_bytes > 0
+            && self.unknown_bytes > 0
+            && self.unknown_bytes + unknown_bytes > self.unknown_capacity
+        {
+            return Err(Dropped::Full);
+        }
+        self.keys.insert(key);
+        self.unknown_bytes += unknown_bytes;
+        Ok(())
+    }
+
+    /// Takes out the key and the UnknownPathSecret bytes of a response that left the queue, or
+    /// that the queue refused.
+    fn release(&mut self, key: &Key, unknown_bytes: u64) {
+        self.keys.remove(key);
+        self.unknown_bytes = self.unknown_bytes.saturating_sub(unknown_bytes);
+    }
+}
+
+/// The sending end of the UPS queue, which drops a response whose key waits in the queue, and
+/// an UnknownPathSecret response past the pacer's burst.
 #[derive(Clone)]
 pub struct PendingSender<S> {
     inner: S,
@@ -133,22 +237,34 @@ where
 {
     fn send(&mut self, value: Entry<Response>) -> Result<(), Entry<Response>> {
         let key = value.key;
-        if !self.pending.keys().insert(key) {
-            // The response waiting in the queue tells the peer the same thing.
-            self.pending.suppressed.add(1);
-            return Ok(());
+        let unknown_bytes = value.unknown_bytes();
+        let admitted = self.pending.state().admit(key, unknown_bytes);
+        match admitted {
+            Ok(()) => {}
+            Err(Dropped::Waiting) => {
+                // The response waiting in the queue tells the peer the same thing.
+                self.pending.suppressed.add(1);
+                return Ok(());
+            }
+            Err(Dropped::Full) => {
+                // The UnknownPathSecret responses waiting in the queue go out first, and the
+                // peer's next packet on the credential queues a new one once there is room.
+                self.pending.unknown_dropped.add(1);
+                return Ok(());
+            }
         }
         let result = self.inner.send(value);
         if result.is_err() {
-            // The queue didn't take the response, so its key doesn't wait there.
-            self.pending.keys().remove(&key);
+            // The queue didn't take the response, so neither its key nor its bytes wait there.
+            self.pending.state().release(&key, unknown_bytes);
         }
         result
     }
 }
 
-/// The receiving end of the UPS queue, which takes the key of each response it yields out of
-/// [`Pending`], so the next rejection with that key queues a new response.
+/// The receiving end of the UPS queue, which takes the key of each response it yields, and its
+/// UnknownPathSecret bytes, out of [`Pending`], so the next rejection with that key queues a new
+/// response.
 pub struct PendingReceiver<R> {
     inner: R,
     pending: Pending,
@@ -165,7 +281,9 @@ where
     ) -> Poll<Option<Entry<Response>>> {
         let response = ready!(self.inner.poll_recv(cx, budget));
         if let Some(response) = &response {
-            self.pending.keys().remove(&response.key);
+            self.pending
+                .state()
+                .release(&response.key, response.unknown_bytes());
         }
         Poll::Ready(response)
     }

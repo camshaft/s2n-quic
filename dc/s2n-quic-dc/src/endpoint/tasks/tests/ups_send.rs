@@ -14,6 +14,9 @@
 //! 5. A response the queue refuses doesn't keep a later response with its key out.
 //! 6. Rejections of packets whose credential the path secret map doesn't hold leave one
 //!    UnknownPathSecret response in the queue for each credential and sender id.
+//! 7. Rejections of packets with many distinct credential ids that the map doesn't hold leave
+//!    UnknownPathSecret responses in the queue up to the bytes the pacer sends in one burst, and
+//!    a ReplayDetected response still queues past them.
 
 use super::helpers::test_entry;
 use crate::{
@@ -60,6 +63,7 @@ fn make_response(dest: SocketAddr, id: Id) -> Entry<ups::Response> {
             credential_id: id,
             sender_id: VarInt::ZERO,
         },
+        kind: ups::Kind::UnknownPathSecret,
     })
 }
 
@@ -238,7 +242,46 @@ fn reject_unknown(
 }
 
 fn new_pending(registry: &Registry) -> ups::Pending {
-    ups::Pending::new(registry.register("test.ups.pending_suppressed"))
+    ups::Pending::new(
+        registry.register("test.ups.pending_suppressed"),
+        registry.register("test.ups.unknown_dropped"),
+        unknown_capacity(),
+    )
+}
+
+/// The bytes of UnknownPathSecret responses [`new_pending`] lets the queue hold: the burst of the
+/// pacer `spawn_pipeline` runs.
+fn unknown_capacity() -> u64 {
+    crate::socket::rate::Rate::new(100.0).burst_bytes()
+}
+
+/// A credential id of its own for each `i`, which the path secret map doesn't hold.
+fn unknown_id(i: u64) -> Id {
+    let mut bytes = [0u8; 16];
+    bytes[..8].copy_from_slice(&i.to_be_bytes());
+    Id::from(bytes)
+}
+
+/// The bytes of the UnknownPathSecret response to a packet with any credential id.
+fn unknown_response_len() -> u64 {
+    encode_ups_packet(unknown_id(0)).len() as u64
+}
+
+/// Takes each response off the queue, as `ups_send` does, and counts them.
+fn spawn_drain<R>(rx: R) -> Rc<RefCell<usize>>
+where
+    R: Receiver<Entry<ups::Response>> + 'static,
+{
+    let drained = Rc::new(RefCell::new(0));
+    let count = drained.clone();
+    async move {
+        let rx = crate::socket::channel::Map::new(rx, move |_response: Entry<ups::Response>| {
+            *count.borrow_mut() += 1;
+        });
+        rx.drain_budgeted(Some(32)).await;
+    }
+    .spawn();
+    drained
 }
 
 async fn server_addr() -> SocketAddr {
@@ -458,6 +501,11 @@ fn a_refused_response_does_not_hold_its_key() {
         0,
         "the refused response doesn't hold its key"
     );
+    assert_eq!(
+        pending.queued_unknown_bytes(),
+        0,
+        "the refused response doesn't hold its bytes"
+    );
 }
 
 /// Rejections of packets whose credential the path secret map doesn't hold leave one
@@ -481,4 +529,147 @@ fn unknown_credentials_queue_one_response_for_each_credential_and_sender_id() {
         }
     }
     assert_eq!(pending.queued(), ids.len() * sender_ids.len());
+}
+
+/// A sender of many distinct credential ids that the path secret map doesn't hold chooses the
+/// key of each UnknownPathSecret response, so the keys don't bound the queue. The queue takes
+/// those responses up to the bytes the pacer sends in one burst, drops the rest, and takes a
+/// burst again once the background task has taken them off.
+#[test]
+fn a_burst_of_unknown_credentials_queues_up_to_the_pacers_burst() {
+    let _guard = crate::testing::without_snapshots();
+    sim(|| {
+        let registry = Registry::default();
+        let pending = new_pending(&registry);
+        let (tx, rx) = unsync::new::<ups::Response>();
+        let drained = spawn_drain(pending.receiver(rx));
+
+        async move {
+            let dest = SocketAddr::from(([127, 0, 0, 1], 4433));
+            let dispatch_counters = counters::Dispatch::new(&registry);
+            let mut ups_tx = pending.sender(tx);
+            let sender_id = VarInt::ZERO;
+            let len = unknown_response_len();
+            let fit = unknown_capacity() / len;
+            assert!(fit > 1, "the burst holds more than one response");
+
+            for i in 0..2 * fit {
+                let id = unknown_id(i);
+                reject_unknown(&dispatch_counters, &mut ups_tx, dest, id, sender_id);
+            }
+            assert_eq!(
+                pending.queued() as u64,
+                fit,
+                "the queue takes the responses that fit in the pacer's burst"
+            );
+            assert_eq!(pending.queued_unknown_bytes(), fit * len);
+
+            1.s().sleep().await;
+            assert_eq!(
+                *drained.borrow() as u64,
+                fit,
+                "the background task takes each queued response off the queue"
+            );
+            assert_eq!(pending.queued(), 0);
+            assert_eq!(pending.queued_unknown_bytes(), 0);
+
+            for i in 2 * fit..4 * fit {
+                let id = unknown_id(i);
+                reject_unknown(&dispatch_counters, &mut ups_tx, dest, id, sender_id);
+            }
+            assert_eq!(
+                pending.queued() as u64,
+                fit,
+                "once the queue is drained, it takes a burst of responses again"
+            );
+        }
+        .primary()
+        .spawn();
+    });
+}
+
+/// UnknownPathSecret responses that fill the pacer's burst don't keep a ReplayDetected response
+/// out: the path secret map's entries bound the keys of those, and the peer that holds the
+/// credential recovers its send contexts from them.
+#[test]
+fn unknown_credentials_past_the_burst_leave_room_for_rejections() {
+    let _guard = crate::testing::without_snapshots();
+    sim(|| {
+        let registry = Registry::default();
+        let pending = new_pending(&registry);
+        let (tx, rx) = unsync::new::<ups::Response>();
+
+        async move {
+            let _rx = rx;
+            let dest = SocketAddr::from(([127, 0, 0, 1], 4433));
+            let dispatch_counters = counters::Dispatch::new(&registry);
+            let mut ups_tx = pending.sender(tx);
+            let sender_id = VarInt::ZERO;
+            let len = unknown_response_len();
+            let fit = unknown_capacity() / len;
+
+            for i in 0..2 * fit {
+                let id = unknown_id(i);
+                reject_unknown(&dispatch_counters, &mut ups_tx, dest, id, sender_id);
+            }
+            assert_eq!(pending.queued() as u64, fit);
+
+            let id = Id::from(CREDENTIAL_BYTES);
+            reject(&dispatch_counters, &mut ups_tx, dest, id, sender_id);
+            assert_eq!(
+                pending.queued() as u64,
+                fit + 1,
+                "the ReplayDetected response queues past the burst"
+            );
+            assert_eq!(
+                pending.queued_unknown_bytes(),
+                fit * len,
+                "a ReplayDetected response doesn't count toward the burst"
+            );
+        }
+        .primary()
+        .spawn();
+    });
+}
+
+/// With no UnknownPathSecret response waiting, the queue takes one whatever its size, so a burst
+/// smaller than one response doesn't keep each of them out, and that one doesn't keep a
+/// ReplayDetected response out.
+#[test]
+fn a_burst_smaller_than_one_response_still_queues_one() {
+    let _guard = crate::testing::without_snapshots();
+    sim(|| {
+        let registry = Registry::default();
+        let pending = ups::Pending::new(
+            registry.register("test.ups.pending_suppressed"),
+            registry.register("test.ups.unknown_dropped"),
+            0,
+        );
+        let (tx, rx) = unsync::new::<ups::Response>();
+
+        async move {
+            let _rx = rx;
+            let dest = SocketAddr::from(([127, 0, 0, 1], 4433));
+            let dispatch_counters = counters::Dispatch::new(&registry);
+            let mut ups_tx = pending.sender(tx);
+            let sender_id = VarInt::ZERO;
+
+            for i in 0..BURST as u64 {
+                let id = unknown_id(i);
+                reject_unknown(&dispatch_counters, &mut ups_tx, dest, id, sender_id);
+            }
+            assert_eq!(pending.queued(), 1, "the queue takes one response");
+            assert_eq!(pending.queued_unknown_bytes(), unknown_response_len());
+
+            let id = Id::from(CREDENTIAL_BYTES);
+            reject(&dispatch_counters, &mut ups_tx, dest, id, sender_id);
+            assert_eq!(
+                pending.queued(),
+                2,
+                "the response past the burst doesn't keep a ReplayDetected response out"
+            );
+        }
+        .primary()
+        .spawn();
+    });
 }
