@@ -1043,6 +1043,102 @@ fn send_idle_wheel_owes_a_reset_of_each_stream_whose_frames_it_fails_as_it_marks
     });
 }
 
+/// A send context that expires with an unacknowledged packet marks its peer dead, and the dead
+/// mark resets each stream open on the path on this side. The path owes the peer a reset of each
+/// open stream too, though the context holds none of its frames: here the packet holds a Ping
+/// alone, and one stream is open, as an idle writer's is. The wheel counts the open stream on
+/// `send.idle.owed_resets`.
+#[test]
+fn send_idle_wheel_owes_a_reset_of_each_open_stream_as_it_marks_the_peer_dead() {
+    let _guard = crate::testing::without_snapshots();
+    sim(|| {
+        let (send_caches, mut idle_wheel_tx, mut completed_rx, clock, registry) = setup_send();
+
+        let pse = test_entry();
+        pse.touch_activity(precision::Clock::now(&clock));
+        let idle = pse.idle_timeout();
+
+        let crate::path::secret::map::entry::QueueState::Client(state) = pse.queue_state() else {
+            panic!("the test entry holds client queue state");
+        };
+        let open = state
+            .alloc_local(VarInt::from_u8(5))
+            .expect("a fresh client queue state allocates a slot");
+        // As the stream's writer does when it is made.
+        open.control.set_peer_queue_id(open.dest_queue_id);
+        let open_stream = crate::queue::OwedReset {
+            queue_pair: crate::packet::datagram::QueuePair {
+                source_queue_id: open.local_queue_id,
+                dest_queue_id: open.dest_queue_id,
+            },
+            binding_id: open.binding_id,
+        };
+
+        let ctx = send_caches[LocalSendSocketId::new(0)]
+            .borrow_mut()
+            .get_or_insert(&pse, &clock)
+            .unwrap();
+        {
+            let mut ctx = ctx.borrow_mut();
+            let now = clock.get_time();
+            let rtt = ctx.rtt_estimator;
+            let cc_info = ctx.cca.on_packet_sent(now, 200, false, &rtt);
+            let mut ping = test_frame(&pse);
+            ping.header = frame::Header::Ping;
+            let mut frames = Queue::new();
+            frames.push_back(ping);
+            let pn = PacketNumberSpace::Initial.new_packet_number(VarInt::ZERO);
+            ctx.inflight.insert(
+                pn,
+                Packet::new(
+                    frames,
+                    TransmissionInfo {
+                        cc_info,
+                        time_sent: now,
+                        sent_bytes: 200,
+                    },
+                ),
+            );
+            ctx.idle_wheel.target_time = Some(precision::Clock::now(&clock) + idle);
+        }
+        let _ = idle_wheel_tx.send(ctx);
+
+        async move {
+            // 3 s past the idle deadline, a margin over the wheel's one-second tick.
+            (idle + 3.s()).sleep().await;
+            let now = precision::Clock::now(&Clock::default());
+            assert!(
+                pse.is_dead_during_cooldown(now, crate::endpoint::DEFAULT_DEAD_PEER_COOLDOWN),
+                "a peer that left a packet unacknowledged should be marked dead"
+            );
+            let frame: Entry<Frame> = TestReceiverExt::recv(&mut completed_rx)
+                .await
+                .expect("the failed Ping should arrive on completed_rx");
+            assert_eq!(
+                frame.status,
+                frame::TransmissionStatus::Failed(frame::FailureReason::PeerDead),
+                "the Ping should be marked Failed(PeerDead)"
+            );
+
+            // The open stream is owed a reset, though the context held none of its frames.
+            assert_eq!(pse.take_owed_resets(), vec![open_stream]);
+
+            // The wheel counts the open stream once, as the set records it.
+            let metrics = registry
+                .take_current_metrics_line()
+                .expect("the registry is open");
+            let recorded = metrics
+                .split(',')
+                .find_map(|metric| metric.strip_prefix("send.idle.owed_resets="))
+                .and_then(|value| value.split(' ').next());
+            assert_eq!(recorded, Some("1"), "{metrics}");
+            drop(open);
+        }
+        .primary()
+        .spawn();
+    });
+}
+
 /// The stream a failed frame belongs to, as the reset the send idle wheel owes routes it: each
 /// frame of a stream names the stream's queue pair and binding, and a frame of the path or a
 /// diagnostic marker names none.
