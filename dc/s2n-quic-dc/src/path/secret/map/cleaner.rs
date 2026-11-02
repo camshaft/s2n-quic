@@ -207,6 +207,14 @@ impl Cleaner {
         // FIXME: add metrics for queue depth?
         // These are sort of equivalent to the ID map -- so maybe not worth it for now unless we
         // can get something more interesting out of it.
+
+        // The entries used since the previous cycle, in queue order: those a packet authenticated
+        // on, and those the local endpoint looked up by the peer's address to connect. After the
+        // pass they go to the back of the queue, behind the entries that weren't used, so that
+        // once the map is over capacity `on_new_path_secrets`, which evicts from the front,
+        // evicts an entry that wasn't used in the previous cycle before one that was.
+        let mut in_use = Vec::new();
+
         queue.retain(|entry| {
             let Some(entry) = entry.upgrade() else {
                 return false;
@@ -216,10 +224,16 @@ impl Cleaner {
                 id_entries_active += 1;
             }
 
+            // A lookup by id sets the id bit before the packet is opened, so any sender that
+            // knows the id can set it. Eviction order reads the bit a packet that authenticated
+            // sets instead.
+            let authenticated = entry.take_accessed_authenticated();
+
             // Avoid double counting by making sure we have unique peer IPs.
             // We clear/take the accessed bit regardless of whether we're going to count it to
             // preserve the property that every cleaner run snapshots last ~minute.
-            if entry.take_accessed_addr()
+            let accessed_addr = entry.take_accessed_addr();
+            if accessed_addr
                 && state
                     .cleaner_peer_seen
                     .insert_no_events(entry.clone())
@@ -251,14 +265,24 @@ impl Cleaner {
                     address_entries_retired += 1;
                 }
                 return false;
+                return false;
+            }
+
+            // A retired entry has a newer entry for its peer in the maps, so it stays with the
+            // unused entries even where packets on it still arrive.
+            if (authenticated || accessed_addr) && entry.retired_at().is_none() {
+                in_use.push(Arc::downgrade(&entry));
+                return false;
             }
 
             true
         });
 
+        // Each group keeps its queue order: the unused entries, then the ones in use.
+        queue.extend(in_use);
+
         // Avoid retaining entries for longer than expected.
         state.cleaner_peer_seen.clear();
-
         drop(queue);
         let handshake_lock_duration = state.clock.get_time().saturating_duration_since(in_lock);
 
