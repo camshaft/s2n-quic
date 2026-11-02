@@ -23,6 +23,10 @@ pub async fn rx<S: Into<std::net::UdpSocket>, M: UnixMessage + Unpin>(
     let socket = socket.into();
     socket.set_nonblocking(true).unwrap();
 
+    // Newer tokio releases deprecate `AsyncFd::new` in favor of `AsyncFd::register`, but this
+    // crate's `tokio = "1"` requirement also allows older releases that don't have `register`.
+    // `AsyncFd` owns the socket here, so its file descriptor stays open while it's registered.
+    #[allow(deprecated)]
     let socket = AsyncFd::new(socket).unwrap();
     let result = rx::Receiver::new(producer, socket, cooldown, stats).await;
     if let Some(err) = result {
@@ -42,6 +46,8 @@ pub async fn tx<S: Into<std::net::UdpSocket>, M: UnixMessage + Unpin>(
     let socket = socket.into();
     socket.set_nonblocking(true).unwrap();
 
+    // See the comment in `rx` on why this uses the deprecated `AsyncFd::new`.
+    #[allow(deprecated)]
     let socket = AsyncFd::new(socket).unwrap();
     let result = tx::Sender::new(consumer, socket, gso, cooldown, stats).await;
     if let Some(err) = result {
