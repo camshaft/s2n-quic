@@ -701,6 +701,93 @@ fn send_idle_wheel_retries_a_probe_the_submission_channel_refuses() {
     });
 }
 
+/// The quiet path with an open stream, whose peer is marked dead after the probe went out: at
+/// the idle timeout the dead-peer cooldown refuses the idle wheel's dead mark, so that mark
+/// counts in neither dead-mark counter, while the probe counts as sent.
+#[test]
+fn send_idle_wheel_doesnt_count_a_dead_mark_the_cooldown_refuses() {
+    let _guard = crate::testing::without_snapshots();
+    sim(|| {
+        let (send_caches, mut idle_wheel_tx, _completed_rx, clock, registry) = setup_send();
+
+        let pse = test_entry();
+        pse.touch_activity(precision::Clock::now(&clock));
+        let stream = open_stream(&pse);
+
+        let ctx = send_caches[LocalSendSocketId::new(0)]
+            .borrow_mut()
+            .get_or_insert(&pse, &clock)
+            .unwrap();
+        assert!(!ctx.borrow().inflight.has_inflight());
+
+        let idle = pse.idle_timeout();
+        let cooldown = crate::endpoint::DEFAULT_DEAD_PEER_COOLDOWN;
+        assert!(
+            idle / 2 < cooldown,
+            "a mark half an idle timeout in should still hold its cooldown at the idle timeout"
+        );
+        {
+            let mut c = ctx.borrow_mut();
+            c.idle_wheel.target_time = Some(precision::Clock::now(&clock) + idle / 2);
+        }
+        let _ = idle_wheel_tx.send(ctx.clone());
+
+        let send_caches = send_caches.clone();
+        let pse = pse.clone();
+        async move {
+            // Half an idle timeout in, the quiet path is probed and the context kept.
+            (idle / 2 + 3.s()).sleep().await;
+            assert!(
+                ctx.borrow().idle_probe_for.is_some(),
+                "the idle wheel should probe a quiet path with an open stream"
+            );
+
+            // Mark the peer dead now, so that the cooldown holds at the idle timeout.
+            let marked_at = precision::Clock::now(&Clock::default());
+            assert!(
+                pse.mark_dead_if_cooldown_elapsed(marked_at, cooldown),
+                "the peer shouldn't be marked dead before this mark"
+            );
+
+            // At the idle timeout the unanswered probe would mark the peer dead, and the
+            // cooldown refuses that mark.
+            (idle / 2).sleep().await;
+            assert_eq!(
+                send_caches[LocalSendSocketId::new(0)]
+                    .borrow()
+                    .context_count(),
+                0,
+                "context should be evicted after idle timeout"
+            );
+            let now = precision::Clock::now(&Clock::default());
+            assert!(
+                pse.is_dead_during_cooldown(now, cooldown),
+                "the earlier mark's cooldown should still hold"
+            );
+            assert_eq!(
+                take_probe_counts(&registry),
+                ProbeCounts {
+                    sent: 1,
+                    ..ProbeCounts::default()
+                },
+                "the probe went out, and the refused dead mark counts in neither dead count"
+            );
+
+            // Past the earlier mark's cooldown the peer isn't dead: the idle wheel's mark at the
+            // idle timeout didn't start a cooldown of its own.
+            (cooldown - idle / 2 + 1.s()).sleep().await;
+            let now = precision::Clock::now(&Clock::default());
+            assert!(
+                !pse.is_dead_during_cooldown(now, cooldown),
+                "the cooldown should have refused the idle wheel's dead mark"
+            );
+            drop(stream);
+        }
+        .primary()
+        .spawn();
+    });
+}
+
 /// A send context first arms its idle check half an idle timeout out while its path has an
 /// open stream, so that the idle wheel can probe the quiet path before the idle timeout
 /// decides, and a full idle timeout out otherwise.
