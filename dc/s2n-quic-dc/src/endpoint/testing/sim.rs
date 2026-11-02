@@ -885,6 +885,11 @@ impl Server {
         self.endpoint.recv_credit_pool.clone()
     }
 
+    /// Returns the endpoint's counter registry, from which tests read what the endpoint counted.
+    pub fn counters(&self) -> crate::counter::Registry {
+        self.endpoint.counters.clone()
+    }
+
     /// Register a channel-based acceptor for incoming streams.
     ///
     /// Returns an [`accept_channel::Receiver<Stream>`] that yields accepted streams.
