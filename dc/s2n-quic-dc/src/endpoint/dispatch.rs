@@ -605,7 +605,7 @@ where
     let received_at = crate::time::precision::Clock::now(clock);
     if peer.path_entry.touch_activity(received_at) {
         let owed = peer.path_entry.take_owed_resets();
-        send_owed_resets(&peer.path_entry, owed, frame_tx);
+        send_owed_resets(&peer.path_entry, owed, counters, frame_tx);
     }
     peer.ecn_counts.increment(ecn);
     counters.on_ecn(ecn);
@@ -1930,12 +1930,15 @@ fn send_reset(
 /// frames this side failed when it marked the peer dead, which the peer may still wait on. Each
 /// reset is routed by the stream's queue pair and binding, without init fields, so where the
 /// peer has freed or rebound the slot since, it drops the reset as unallocated or stale, and a
-/// late reset doesn't end a newer stream.
+/// late reset doesn't end a newer stream. Counts each reset the submission channel accepts on
+/// `rx.dead_mark.owed_resets`, and traces that count with the path's credentials id.
 fn send_owed_resets(
     path_secret_entry: &Arc<PathSecretEntry>,
     owed: Vec<crate::queue::OwedReset>,
+    counters: &counters::Dispatch,
     frame_tx: &mut SubmissionSender,
 ) {
+    let mut submitted = 0u64;
     for reset in owed {
         let frame = Frame {
             header: Header::QueueReset {
@@ -1953,8 +1956,18 @@ fn send_owed_resets(
             enqueued_at: None,
             flow_credits: 0,
         };
-        let _ = frame_tx.send_batch(Entry::new(frame));
+        if frame_tx.send_batch(Entry::new(frame)).is_ok() {
+            submitted += 1;
+        }
     }
+    if submitted > 0 {
+        counters.rx_dead_mark_owed_resets.add(submitted);
+    }
+    debug!(
+        credentials_id = %path_secret_entry.id(),
+        resets = submitted,
+        "dead mark cleared - owed resets submitted"
+    );
 }
 
 // ── QueueControl ───────────────────────────────────────────────────────────
