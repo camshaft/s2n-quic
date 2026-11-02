@@ -1365,6 +1365,7 @@ where
 
                 self.subscriber().on_replay_definitely_detected(
                     event::builder::ReplayDefinitelyDetected {
+                        peer_address: SocketAddress::from(*entry.peer()).into_event(),
                         credential_id: creds.id.into_event(),
                         key_id: key_id.into_event(),
                     },
@@ -1384,6 +1385,7 @@ where
 
                 self.subscriber().on_replay_potentially_detected(
                     event::builder::ReplayPotentiallyDetected {
+                        peer_address: SocketAddress::from(*entry.peer()).into_event(),
                         credential_id: creds.id.into_event(),
                         key_id: key_id.into_event(),
                         gap,
