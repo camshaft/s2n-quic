@@ -784,20 +784,36 @@ mod tests {
     }
 
     /// A datagram longer than the receive buffer comes back as its first bytes, with the length of
-    /// the buffer and the sender's address, as `recvmsg` returns it on Unix. The rest of it is
-    /// dropped: the next receive returns the next datagram.
+    /// the buffer, the sender's address and the control messages, as `recvmsg` returns it on Unix.
+    /// The rest of it is dropped: the next receive returns the next datagram.
     #[test]
     fn recv_returns_the_first_bytes_of_a_datagram_longer_than_the_buffer() {
         let (a, b) = pair("127.0.0.1:0");
+        let features = configure(&b, u16::MAX as u32);
         let to = b.local_addr().unwrap();
+        let addr = Addr::new(to.into());
         let payload: Vec<u8> = (0..3000u32).map(|i| i as u8).collect();
-        a.send_to(&payload, to).unwrap();
+        let iov = [IoSlice::new(&payload)];
+        let sent = send(
+            &a,
+            &addr,
+            ExplicitCongestionNotification::Ect0,
+            &iov,
+            None,
+            0,
+        )
+        .unwrap();
+        assert_eq!(sent, payload.len());
 
-        let (len, from, _cmsg, received) = recv_one(&b, 1500);
+        let (len, from, cmsg, received) = recv_one(&b, 1500);
         assert_eq!(len, 1500);
         assert_eq!(&received[..], &payload[..1500]);
         let from: SocketAddr = from.get().into();
         assert_eq!(from, a.local_addr().unwrap());
+        assert_eq!(cmsg.segment_len(), 0);
+        if features.ecn.is_enabled() && !SEND_ECN_REFUSED.load(Ordering::Relaxed) {
+            assert_eq!(cmsg.ecn(), ExplicitCongestionNotification::Ect0);
+        }
 
         let next = [9u8; 16];
         a.send_to(&next, to).unwrap();
