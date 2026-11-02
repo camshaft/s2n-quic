@@ -31,8 +31,13 @@
 //!   the client's streams then fail until the cooldown ends, and the client needs a completed
 //!   stream that starts after the drop ends and one more after it. The client checks only that the
 //!   run ends after the drop does. Past the run's end, the client starts streams until it has the
-//!   ones its assertion decides on: one stream, and where the schedule has a drop, two that start
-//!   at or after the drop's end, so that a setup that takes up the run doesn't end it before them.
+//!   ones its assertion decides on: one stream, and where the schedule has a drop, the
+//!   reconnection, the first stream that starts at or after the drop's end and completes, and one
+//!   more after it. Where no stream has reconnected, it stops once a stream has started at or
+//!   after the drop's end plus the idle timeout and the cooldown, since its assertion then fails.
+//!   A setup that takes up the run's margin doesn't end the run before the reconnection, as where
+//!   a stream that started before the drop's end waits out the idle timeout and the streams after
+//!   it fail until the cooldown ends.
 //!
 //! The schedule's times count from the start of the client end. The client runs one stream at a
 //! time and asserts that each stream that ended before the drop started completed, that a stream
@@ -573,21 +578,31 @@ fn reconnection(records: &[Record], schedule: &Schedule) -> Value {
 }
 
 /// Whether `records` holds the streams that `check` decides on: one stream, and where the
-/// schedule has a drop, two that started at or after the drop's end, which are the reconnection
-/// and one more where both completed. The client starts streams past its run until they're
-/// there, so that a setup that takes up the run, as on a sanitizer or coverage build, doesn't end
-/// the run before them. A stream that starts past the run starts after the drop's end, since the
-/// run ends after the drop does, so the client starts at most two streams past its run.
+/// schedule has a drop, the reconnection (`reconnect_stream`) and one more stream after it. The
+/// client starts streams past its run until they're there, so that a setup that takes up the run,
+/// as on a sanitizer or coverage build, doesn't end the run before them. A stream that started
+/// at or after the drop's end and failed isn't the reconnection, which covers a two-host run
+/// whose setup takes up its margin: a stream that started before the drop's end can wait out the
+/// idle timeout, and the streams after it fail until the dead-peer cooldown ends. Where no stream
+/// has reconnected, a stream that started at or after `reconnect_window_end` is enough too:
+/// `check` then fails the client, which didn't reconnect in that window, so the client doesn't
+/// start streams past its run without end.
 fn holds_checked_streams(records: &[Record], schedule: &Schedule) -> bool {
     if !schedule.has_drop() {
         return !records.is_empty();
     }
-    let drop_end = schedule.drop_end();
-    let after_drop = records
-        .iter()
-        .filter(|record| record.start >= drop_end)
-        .count();
-    after_drop >= 2
+    if let Some(reconnect) = reconnect_stream(records, schedule) {
+        return records.len() > reconnect.index as usize + 1;
+    }
+    let window_end = reconnect_window_end(schedule);
+    records.last().is_some_and(|last| last.start >= window_end)
+}
+
+/// The end of the window in which the client has to reconnect, from the client's start: the
+/// drop's end plus the idle timeout and the dead-peer cooldown, which the module doc sizes the
+/// client's run by.
+fn reconnect_window_end(schedule: &Schedule) -> Duration {
+    schedule.drop_end() + endpoint::DEFAULT_IDLE_TIMEOUT + endpoint::DEFAULT_DEAD_PEER_COOLDOWN
 }
 
 /// Runs the client's assertion, `check`, and its reconnection line on chosen streams, under a
@@ -748,16 +763,62 @@ fn checked_streams() {
     let one_failed = client_records(&[(0, 100, failed)]);
     assert!(holds_checked_streams(&one_failed, &without_drop));
 
-    // With a drop, a stream that started before the drop's end doesn't count, though it ended at
-    // the drop's end or after it, and two streams that started at or after the drop's end are
-    // enough, whatever their outcomes.
+    // With a drop, the reconnection and one more stream after it are enough, whatever the outcome
+    // of the one more. A stream that started before the drop's end isn't the reconnection, though
+    // it completed after the drop's end.
     assert!(!holds_checked_streams(&[], &schedule));
-    let before_end = client_records(&[(0, 100, ok), (1100, 1600, failed)]);
+    let before_end = client_records(&[(0, 100, ok), (1100, 1450, ok), (1450, 1550, ok)]);
     assert!(!holds_checked_streams(&before_end, &schedule));
-    let one_after = client_records(&[(1400, 1500, ok), (1500, 1600, failed)]);
-    assert!(!holds_checked_streams(&one_after, &schedule));
-    let two_after = client_records(&[(1500, 1600, failed), (1600, 1700, ok)]);
-    assert!(holds_checked_streams(&two_after, &schedule));
+    let reconnected_last = client_records(&[(1400, 1500, ok), (1500, 1600, ok)]);
+    assert!(!holds_checked_streams(&reconnected_last, &schedule));
+    let reconnected = client_records(&[(1400, 1500, ok), (1500, 1600, ok), (1600, 1700, failed)]);
+    assert!(holds_checked_streams(&reconnected, &schedule));
+
+    // A stream that started at or after the drop's end and failed isn't the reconnection: in a
+    // two-host run, a stream that started before the drop's end can wait out the idle timeout,
+    // and the streams after it fail until the dead-peer cooldown ends. The run goes on to the
+    // stream that reconnects and one more, which `check` passes.
+    let idle_end = 1400 + ms(endpoint::DEFAULT_IDLE_TIMEOUT);
+    let cooldown_end = idle_end + ms(endpoint::DEFAULT_DEAD_PEER_COOLDOWN);
+    let mut streams = vec![
+        (1400, idle_end, failed),
+        (idle_end, idle_end + 100, failed),
+        (idle_end + 100, idle_end + 200, failed),
+    ];
+    assert!(!holds_checked_streams(&client_records(&streams), &schedule));
+    streams.push((cooldown_end, cooldown_end + 100, ok));
+    assert!(!holds_checked_streams(&client_records(&streams), &schedule));
+    streams.push((cooldown_end + 100, cooldown_end + 200, ok));
+    let after_cooldown = client_records(&streams);
+    assert!(holds_checked_streams(&after_cooldown, &schedule));
+    assert_check_passes(&after_cooldown, &schedule);
+
+    // Where no stream has reconnected, a stream that started at or after `reconnect_window_end`
+    // ends the run, and `check` fails the client.
+    let window_end = ms(reconnect_window_end(&schedule));
+    let before_window_end = client_records(&[
+        (1500, window_end - 100, failed),
+        (window_end - 100, window_end, failed),
+    ]);
+    assert!(!holds_checked_streams(&before_window_end, &schedule));
+    let at_window_end = client_records(&[
+        (1500, window_end - 100, failed),
+        (window_end - 100, window_end, failed),
+        (window_end, window_end + 100, failed),
+    ]);
+    assert!(holds_checked_streams(&at_window_end, &schedule));
+    assert_check_fails(
+        &at_window_end,
+        &schedule,
+        "the client didn't complete a stream that started after the link drop ended",
+    );
+
+    // A stream that reconnects at that time or later doesn't end the run: one more follows it.
+    let reconnected_late = client_records(&[
+        (1500, window_end, failed),
+        (window_end, window_end + 100, ok),
+    ]);
+    assert!(!holds_checked_streams(&reconnected_late, &schedule));
 }
 
 /// The client's records of streams that ran one after the other, each with its start and end in
