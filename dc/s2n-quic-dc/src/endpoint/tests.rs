@@ -2811,6 +2811,143 @@ fn dead_and_silent_peer_entry_is_replaced() {
     );
 }
 
+/// A client path the send idle wheel marks dead asks the client's path-secret map for a
+/// handshake with the peer in the background, through the callback a handshake client
+/// registers on the map, so the peer gets a new path secret before a connect finds the entry
+/// dead and silent.
+///
+/// The monitor drops every server->client packet once the first stream has finished, so the
+/// second stream's packets go unacknowledged and the idle wheel marks the server dead.
+#[test]
+fn dead_peer_requests_a_background_rehandshake() {
+    use crate::{psk::io::HandshakeReason, stream::endpoint::testing::sim::lookup_sim_map};
+    use std::{net::SocketAddr, sync::Mutex};
+
+    type Requests = Arc<Mutex<Vec<(SocketAddr, HandshakeReason)>>>;
+
+    let _no_snap = crate::testing::without_snapshots();
+    let requests: Requests = Default::default();
+    let requests_inner = requests.clone();
+    let server_addr: Arc<Mutex<Option<SocketAddr>>> = Default::default();
+    let server_addr_inner = server_addr.clone();
+
+    sim(|| {
+        let acceptor_id = VarInt::from_u8(1);
+        let drop_server = Arc::new(AtomicBool::new(false));
+
+        // Drop every server->client packet once the first stream has finished.
+        {
+            let drop_server = drop_server.clone();
+            let mut server_host = MonitorHostAddr::new("server");
+            bach::net::monitor::on_packet_sent(move |packet| {
+                if drop_server.load(Ordering::Relaxed) && server_host.is_packet_source(packet) {
+                    return bach::net::monitor::Command::Drop;
+                }
+                bach::net::monitor::Command::Pass
+            });
+        }
+
+        // Server: echo each stream back.
+        async move {
+            let server = Server::new();
+            let mut acceptor = server
+                .register_acceptor_channel(acceptor_id, 64)
+                .expect("acceptor registration");
+
+            while let Some(stream) = acceptor.recv().await {
+                async move {
+                    let (mut reader, mut writer) = stream.into_split();
+                    let mut buf = BytesMut::with_capacity(16);
+                    loop {
+                        match reader.read_into(&mut buf).await {
+                            Ok(0) => break,
+                            Ok(_) => {}
+                            Err(_) => return,
+                        }
+                    }
+                    let mut echo = buf.freeze();
+                    let _ = writer.write_all_from_fin(&mut echo).await;
+                }
+                .spawn();
+            }
+        }
+        .group("server")
+        .spawn();
+
+        // Client (primary).
+        async move {
+            let mut client = Client::new();
+
+            // A first stream works, so the client holds an entry for the server.
+            let stream = client
+                .connect(format!("server:{SERVER_PORT}"), acceptor_id)
+                .await
+                .expect("connect 1");
+            let (mut reader, mut writer) = stream.into_split();
+            let mut ping = Bytes::from_static(b"ping");
+            writer.write_all_from_fin(&mut ping).await.expect("write 1");
+            let mut buf = BytesMut::with_capacity(16);
+            loop {
+                if reader.read_into(&mut buf).await.expect("read 1") == 0 {
+                    break;
+                }
+            }
+            assert_eq!(&buf[..], b"ping");
+            drop(reader);
+            drop(writer);
+
+            let addr = bach::net::lookup_host(format!("server:{SERVER_PORT}"))
+                .await
+                .expect("lookup")
+                .next()
+                .expect("server addr");
+            *server_addr_inner.lock().unwrap() = Some(addr);
+
+            // Record each background handshake the client's map asks for, in place of the
+            // handshake client that registers this callback outside the simulation.
+            let client_map = lookup_sim_map(client.data_addr()).expect("client map");
+            let requests = requests_inner.clone();
+            let record = move |peer: SocketAddr, reason: HandshakeReason| {
+                requests.lock().unwrap().push((peer, reason));
+                None::<tokio::task::JoinHandle<()>>
+            };
+            client_map.register_request_handshake(Box::new(record));
+
+            // From here on, nothing the server sends reaches the client.
+            drop_server.store(true, Ordering::Relaxed);
+
+            let stream = client
+                .connect(format!("server:{SERVER_PORT}"), acceptor_id)
+                .await
+                .expect("connect 2");
+            let (_reader, mut writer) = stream.into_split();
+            let mut ping = Bytes::from_static(b"ping");
+            let _ = timeout(5.s(), writer.write_all_from_fin(&mut ping)).await;
+
+            // Wait for the idle wheel to expire the stream's send context with its packets
+            // unacknowledged, which marks the server dead.
+            180.s().sleep().await;
+        }
+        .group("client")
+        .primary()
+        .spawn();
+    });
+
+    let server_addr = server_addr
+        .lock()
+        .unwrap()
+        .expect("the client looked up the server");
+    let requests = requests.lock().unwrap();
+    let is_remote_request = |(peer, reason): &(SocketAddr, HandshakeReason)| {
+        *peer == server_addr && matches!(reason, HandshakeReason::Remote)
+    };
+    assert!(
+        requests.iter().any(is_remote_request),
+        "the client didn't ask for a background handshake with the server it marked dead: \
+         {requests:?}"
+    );
+}
+
 /// Reproduces a bug where QueueFree frames in-flight during peer-dead invalidation
 /// are silently dropped, permanently leaking peer queue slots.
 ///
