@@ -788,7 +788,8 @@ mod tests {
 
     /// `reset_streams` resets the slot of each stream it names while the slot holds that
     /// stream's binding, and no other slot: one it doesn't name, as one bound after the dead mark
-    /// read the open streams, and one bound again since the binding it names.
+    /// read the open streams, and one that holds another binding than the one it names. It skips
+    /// a stream whose queue is past the page table's end.
     #[test]
     fn reset_streams_resets_each_named_stream_and_no_other() {
         let (mut server, path_entry, mut tx, _rx) = test_server(10);
@@ -810,10 +811,14 @@ mod tests {
             binding_id: v(binding_id),
         };
 
-        // Slot 2 holds binding 3: the stream named with binding 2 is one it held before.
-        server
-            .state
-            .reset_streams(&[named(0, 1), named(2, 2)], v(42), &mut |_| {});
+        // Slot 2 holds binding 3, and the call's stream for slot 2 has binding 2. No bind reaches
+        // queue 50, so the page table doesn't hold a slot for the call's stream at queue 50.
+        assert!(
+            server.slot_diag(v(50)).is_none(),
+            "queue 50 is past the page table's end"
+        );
+        let streams = [named(0, 1), named(2, 2), named(50, 1)];
+        server.state.reset_streams(&streams, v(42), &mut |_| {});
 
         let mut depth = |queue_id| {
             let diag = server.slot_diag(v(queue_id)).expect("the slot exists");
@@ -821,7 +826,15 @@ mod tests {
         };
         assert_eq!(depth(0), (1, 1), "a named stream is reset");
         assert_eq!(depth(1), (0, 0), "a stream it doesn't name isn't reset");
-        assert_eq!(depth(2), (0, 0), "a slot bound again since isn't reset");
+        assert_eq!(
+            depth(2),
+            (0, 0),
+            "a slot that holds another binding isn't reset"
+        );
+        assert!(
+            server.slot_diag(v(50)).is_none(),
+            "the call skips the stream past the page table's end and doesn't grow the table"
+        );
         drop(receivers);
     }
 }

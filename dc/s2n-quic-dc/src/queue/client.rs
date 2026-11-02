@@ -589,4 +589,33 @@ mod tests {
         assert_eq!(woken, 1, "the waiter is woken");
         drop(held);
     }
+
+    /// `reset_streams` skips a stream whose queue is past the page table's end: it doesn't
+    /// reset a slot for it or grow the table to it.
+    #[test]
+    fn reset_streams_skips_a_stream_past_the_page_table() {
+        let state = test_state(1);
+        // No alloc reaches queue 50, so the page table doesn't hold a slot for it.
+        assert!(
+            SenderView::new().get(50, &state.pages).is_none(),
+            "queue 50 is past the page table's end"
+        );
+        let past_end = crate::queue::OwedReset {
+            queue_pair: crate::packet::datagram::QueuePair {
+                source_queue_id: v(50),
+                dest_queue_id: v(0),
+            },
+            binding_id: v(1),
+        };
+
+        // Each stream whose slot the call finds passes a wake for each half to the sink, and no
+        // alloc waiter waits, so each wake would come from a slot.
+        let mut wakes = 0;
+        state.reset_streams(&[past_end], v(42), &mut |_| wakes += 1);
+        assert_eq!(wakes, 0, "the call doesn't reset a slot for the stream");
+        assert!(
+            SenderView::new().get(50, &state.pages).is_none(),
+            "the call doesn't grow the page table to the stream"
+        );
+    }
 }
