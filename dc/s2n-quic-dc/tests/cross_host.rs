@@ -78,17 +78,22 @@ const END_ACCEPTOR: VarInt = VarInt::from_u8(2);
 /// The server name of the handshake's test certificate.
 const SERVER_NAME: &str = "localhost";
 
-/// The schedule `loopback` runs both ends under: the window from 1 s to 1.5 s passes without a
-/// fault, since the loopback interface doesn't lose packets or take its link down.
+/// The schedule `loopback` runs both ends under: a link drop of 1 ms at the client end's start.
+/// The window passes without a fault, since the loopback interface doesn't lose packets or take
+/// its link down, so no stream waits out the idle timeout or the dead-peer cooldown and the run
+/// doesn't need to outlast the drop by them. The client's times count from before it builds its
+/// endpoint and makes its first handshake, so with the drop at the start, `check` needs only two
+/// streams anywhere in the run: the reconnection, the first stream that starts at or after 1 ms
+/// and completes, and one more. A drop later in the run would need streams after it, which a slow
+/// setup, as on a sanitizer or coverage build, can push past the run's end.
 const LOOPBACK_SCHEDULE: [(&str, &str); 3] = [
     ("DC_CROSS_HOST_LOSS_PERCENT", "0"),
-    ("DC_CROSS_HOST_DROP_START_MS", "1000"),
-    ("DC_CROSS_HOST_DROP_MS", "500"),
+    ("DC_CROSS_HOST_DROP_START_MS", "0"),
+    ("DC_CROSS_HOST_DROP_MS", "1"),
 ];
 /// The length of each request of the client end in `loopback`.
 const LOOPBACK_STREAM_BYTES: &str = "16384";
-/// The client end's run in `loopback`: a stream each 100 ms for 2.5 s, ten of them after the
-/// schedule's window.
+/// The client end's run in `loopback`: a stream each 100 ms for 2.5 s from the client end's start.
 const LOOPBACK_CLIENT: [(&str, &str); 3] = [
     ("DC_CROSS_HOST_RUN_MS", "2500"),
     ("DC_CROSS_HOST_STREAM_INTERVAL_MS", "100"),
@@ -153,7 +158,7 @@ fn loopback() {
     let copied = copy.join().expect("the output copy thread");
     copied.expect("the server end's output");
 
-    let schedule = json!({ "loss_percent": 0.0, "drop_start_ms": 1000, "drop_ms": 500 });
+    let schedule = json!({ "loss_percent": 0.0, "drop_start_ms": 0, "drop_ms": 1 });
 
     let client_lines = read_lines(&client_results);
     for line in &client_lines {
