@@ -12,6 +12,8 @@ use tokio::runtime::Runtime;
 use tokio_util::sync::DropGuard;
 
 mod builder;
+#[cfg(test)]
+mod unknown_path_secret_tests;
 
 pub use crate::path::secret::HandshakeKind;
 pub use builder::Builder;
