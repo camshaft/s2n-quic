@@ -170,6 +170,18 @@ impl MonitorHostAddr {
     }
 }
 
+/// Returns the tag of the dc packet that a simulated datagram carries, decoded from the start of
+/// its payload, or `None` where the payload doesn't start with a packet tag.
+///
+/// Monitor filters use it to tell secret control packets, such as replay and stale-key notices,
+/// from stream packets by the packet's own tag, rather than by its size or its port.
+pub fn packet_tag(packet: &bach::net::monitor::Packet) -> Option<crate::packet::Tag> {
+    s2n_codec::DecoderBuffer::new(packet.transport.payload())
+        .decode::<crate::packet::Tag>()
+        .ok()
+        .map(|(tag, _remaining)| tag)
+}
+
 /// Returns the shared [`Endpoint`] for the current Bach group, creating it lazily.
 ///
 /// The config is used only on the first call for a given group (or after a
