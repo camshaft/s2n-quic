@@ -178,3 +178,127 @@ fn sender_with_more_queued_bytes_has_higher_load_score() {
         "sender 0 has more bytes queued so should have a higher load score"
     );
 }
+
+/// The dead mark owes the peer a reset of each stream it resets on this side, each once: each
+/// stream whose frames the send idle wheel failed and each stream open on the path, which may
+/// have none of its frames in the send context. A stream whose slot was freed isn't open, and
+/// isn't owed.
+#[test]
+fn mark_dead_owing_resets_owes_each_failed_and_each_open_stream() {
+    let entry = test_entry_with_senders(0);
+    let cooldown = crate::endpoint::DEFAULT_DEAD_PEER_COOLDOWN;
+    let t0: crate::time::precision::Timestamp =
+        (unsafe { Timestamp::from_duration(Duration::from_secs(100)) }).into();
+
+    let QueueState::Client(state) = entry.queue_state() else {
+        panic!("a client entry holds client queue state");
+    };
+    let open = state
+        .alloc_local(VarInt::from_u8(7))
+        .expect("a fresh client queue state allocates a slot");
+    // As the stream's writer does when it is made.
+    open.control.set_peer_queue_id(open.dest_queue_id);
+    let open_stream = OwedReset {
+        queue_pair: crate::packet::datagram::QueuePair {
+            source_queue_id: open.local_queue_id,
+            dest_queue_id: open.dest_queue_id,
+        },
+        binding_id: open.binding_id,
+    };
+    let failed_stream = OwedReset {
+        queue_pair: crate::packet::datagram::QueuePair {
+            source_queue_id: VarInt::from_u8(9),
+            dest_queue_id: VarInt::from_u8(10),
+        },
+        binding_id: VarInt::from_u8(9),
+    };
+
+    // The open stream's frames failed too: it is owed once all the same.
+    assert!(
+        entry.mark_dead_owing_resets(t0, cooldown, [failed_stream, open_stream]),
+        "first mark should take effect"
+    );
+    let t1 = t0 + Duration::from_secs(1);
+    assert!(
+        entry.touch_activity(t1),
+        "the first packet after the mark clears it"
+    );
+    let owed = entry.take_owed_resets();
+    assert_eq!(owed.len(), 2, "each stream is owed once: {owed:?}");
+    assert!(
+        owed.contains(&failed_stream) && owed.contains(&open_stream),
+        "{owed:?}"
+    );
+
+    // A stream open on the path is owed though none of its frames failed.
+    let t2 = t1 + Duration::from_secs(1);
+    let marked = entry.mark_dead_owing_resets(t2, cooldown, core::iter::empty());
+    assert!(marked, "the next mark should take effect");
+    let t3 = t2 + Duration::from_secs(1);
+    assert!(
+        entry.touch_activity(t3),
+        "the first packet after the next mark clears it"
+    );
+    assert_eq!(entry.take_owed_resets(), vec![open_stream]);
+
+    // Once the stream's receivers are dropped, its slot is freed and the stream isn't owed.
+    drop(open);
+    let t4 = t3 + Duration::from_secs(1);
+    let marked = entry.mark_dead_owing_resets(t4, cooldown, core::iter::empty());
+    assert!(marked, "the next mark should take effect");
+    let t5 = t4 + Duration::from_secs(1);
+    assert!(
+        entry.touch_activity(t5),
+        "the first packet after the next mark clears it"
+    );
+    assert!(
+        entry.take_owed_resets().is_empty(),
+        "a freed slot doesn't hold a stream"
+    );
+}
+
+/// The send idle wheel records the resets it owes before it marks the peer dead
+/// ([`Entry::mark_dead_owing_resets`]), so that a packet from the peer that arrives between the
+/// two writes doesn't clear the mark and take an empty set. In each round one thread marks the
+/// entry dead owing a reset of one stream, while another thread touches the entry's activity,
+/// as a receive worker does for each packet, until a touch clears the mark: the touch that
+/// clears it finds the reset. With the two writes the other way round, a touch between them
+/// clears the mark before the reset is recorded, and some round fails.
+#[test]
+fn the_packet_that_clears_a_dead_mark_finds_the_resets_owed_before_it() {
+    const ROUNDS: usize = 500;
+    let entry = Arc::new(test_entry_with_senders(0));
+    let t0: crate::time::precision::Timestamp =
+        (unsafe { Timestamp::from_duration(Duration::from_secs(100)) }).into();
+    let stream = OwedReset {
+        queue_pair: crate::packet::datagram::QueuePair {
+            source_queue_id: VarInt::from_u8(1),
+            dest_queue_id: VarInt::from_u8(2),
+        },
+        binding_id: VarInt::from_u8(1),
+    };
+    let barrier = Arc::new(std::sync::Barrier::new(2));
+
+    let marker = {
+        let entry = entry.clone();
+        let barrier = barrier.clone();
+        std::thread::spawn(move || {
+            for _ in 0..ROUNDS {
+                barrier.wait();
+                // No cooldown, so that each round marks the entry again.
+                entry.mark_dead_owing_resets(t0, Duration::ZERO, [stream]);
+                barrier.wait();
+            }
+        })
+    };
+
+    for round in 0..ROUNDS {
+        barrier.wait();
+        while !entry.touch_activity(t0) {
+            core::hint::spin_loop();
+        }
+        assert_eq!(entry.take_owed_resets(), vec![stream], "round {round}");
+        barrier.wait();
+    }
+    marker.join().unwrap();
+}
