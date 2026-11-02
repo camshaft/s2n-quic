@@ -189,6 +189,10 @@ impl<T: std::os::fd::AsRawFd> Tokio<T> {
     /// binds to that runtime's IO driver, which drives readiness for the fd thereafter.
     #[inline]
     pub fn new(inner: T) -> io::Result<Self> {
+        // Newer tokio releases deprecate `AsyncFd::with_interest` in favor of
+        // `AsyncFd::register_with_interest`, but this crate's `tokio = "1"` requirement also
+        // allows older releases that don't have `register_with_interest`.
+        #[allow(deprecated)]
         let async_fd = tokio::io::unix::AsyncFd::with_interest(
             FdRef(std::os::fd::AsRawFd::as_raw_fd(&inner)),
             tokio::io::Interest::READABLE,
