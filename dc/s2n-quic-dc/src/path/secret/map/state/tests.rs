@@ -430,6 +430,58 @@ fn unknown_path_secret_evicts_client_entry_by_default() {
     }
 }
 
+/// An accepted UnknownPathSecret for an older client entry, with the map's setting off, evicts
+/// that entry by its id and leaves the peer's address to a newer entry for the same peer, such
+/// as one a handshake that finished meanwhile inserted: `State::evict` removes the address
+/// mapping only where it still points at the evicted entry.
+#[test]
+fn unknown_path_secret_eviction_keeps_newer_client_entry_for_same_peer() {
+    let map = State::builder()
+        .with_signer(stateless_reset::Signer::new(b"secret"))
+        .with_capacity(5)
+        .with_evict_on_unknown_path_secret(false)
+        .with_clock(Clock)
+        .with_subscriber(tracing::Subscriber::default())
+        .build_state()
+        .unwrap();
+    map.cleaner.stop();
+
+    let older = fake_entry(0);
+    let newer = fake_entry(1);
+    assert_eq!(older.peer(), newer.peer());
+    assert_ne!(older.id(), newer.id());
+    assert_eq!(
+        older.id().endpoint_type(),
+        s2n_quic_core::endpoint::Type::Client
+    );
+
+    map.test_insert(older.clone());
+    map.test_insert(newer.clone());
+
+    // The newer entry took the peer's address from the older one; both stay in the id map.
+    let by_addr = map.get_by_addr_untracked(newer.peer()).unwrap();
+    assert!(Arc::ptr_eq(&by_addr, &newer));
+    assert!(map.ids.contains_key(older.id()));
+    assert!(map.ids.contains_key(newer.id()));
+
+    // The peer's UnknownPathSecret for the older entry: its peer_id on the wire, tagged with
+    // its stateless-reset token.
+    let packet = crate::packet::secret_control::unknown_path_secret::Packet::new_for_test(
+        older.id().for_peer(),
+        &older.sender().stateless_reset,
+    );
+    let accepted = map
+        .handle_unknown_path_secret_packet(&packet, &"127.0.0.1:1234".parse().unwrap())
+        .is_some();
+    assert!(accepted);
+
+    // The older entry is evicted by its id; the newer entry keeps its id and the address.
+    assert!(!map.ids.contains_key(older.id()), "{:?}", map.ids);
+    assert!(map.ids.contains_key(newer.id()), "{:?}", map.ids);
+    let by_addr = map.get_by_addr_untracked(newer.peer()).unwrap();
+    assert!(Arc::ptr_eq(&by_addr, &newer));
+}
+
 #[test]
 fn unknown_path_secret_evicts() {
     let signer = stateless_reset::Signer::new(b"secret");
