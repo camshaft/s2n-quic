@@ -98,8 +98,9 @@ const LOOPBACK_STREAM_BYTES: &str = "16384";
 /// and a stream each 100 ms. The client's times count from before it builds its endpoint and makes
 /// its first handshake, and its second stream starts 100 ms after its first, so the run holds at
 /// most its first stream, whatever its setup takes. The client starts each later stream because
-/// `holds_checked_streams` asks for two that start at or after the drop's end, the reconnection
-/// and one more, so `loopback` passes or fails on the streams' outcomes alone.
+/// `holds_checked_streams` asks for the reconnection and one more stream after it, so `loopback`
+/// passes or fails on the streams' outcomes alone; where no stream reconnects, the client runs
+/// until a stream starts at or after the drop's end plus the idle timeout and the cooldown.
 const LOOPBACK_CLIENT: [(&str, &str); 3] = [
     ("DC_CROSS_HOST_RUN_MS", "2"),
     ("DC_CROSS_HOST_STREAM_INTERVAL_MS", "100"),
