@@ -240,9 +240,16 @@ fn iops_device(queue_depth: u64) -> DeviceConfig {
 /// synthetically and never issues a real syscall, so the descriptor is never dereferenced.
 fn fd() -> crate::fs::op::Fd {
     struct DummyFd;
+    #[cfg(unix)]
     impl std::os::fd::AsRawFd for DummyFd {
         fn as_raw_fd(&self) -> std::os::fd::RawFd {
             7
+        }
+    }
+    #[cfg(windows)]
+    impl std::os::windows::io::AsRawHandle for DummyFd {
+        fn as_raw_handle(&self) -> std::os::windows::io::RawHandle {
+            7usize as std::os::windows::io::RawHandle
         }
     }
     crate::fs::op::Fd::new(Arc::new(DummyFd))
